@@ -24,12 +24,25 @@
 //!   `is_full()`; the manager (2.9) decides when to create the next
 //!   segment.
 
+use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::wal::record::WalRecord;
+
+/// `RWF_DSYNC` value from Linux UAPI (`include/uapi/linux/fs.h`).
+/// Defined locally for portability across libc versions.
+const RWF_DSYNC: i32 = 0x2;
+
+/// Test-only counter: every call to `flush_durable` bumps this. Used by the
+/// 2.8 group-commit batching test to verify that N concurrent appends are
+/// coalesced into a small number of fsyncs.
+#[cfg(test)]
+pub static FLUSH_DURABLE_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 // ---------------------------------------------------------------------------
 // Constants.
@@ -110,6 +123,9 @@ fn compute_segment_header_crc(header: &WalSegmentHeaderRaw) -> u32 {
 pub enum WalSegmentError {
     #[error("WAL segment io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("short write: wanted {wanted} bytes, got {got}")]
+    ShortWrite { wanted: usize, got: usize },
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +245,7 @@ impl WalSegment {
     /// Drain the in-memory buffer to the file via `write_all`.
     ///
     /// **No fsync.** Records are in the page cache, not on stable storage.
-    /// Crash durability lands in sub-task 2.8.
+    /// Crash durability lands via [`Self::flush_durable`].
     ///
     /// Idempotent on an empty buffer (no-op, returns `Ok`).
     pub fn flush(&mut self) -> Result<(), WalSegmentError> {
@@ -240,6 +256,68 @@ impl WalSegment {
         self.bytes_on_disk += self.write_buf.len();
         self.write_buf.clear();
         Ok(())
+    }
+
+    /// Drain the in-memory buffer to the file *durably* via
+    /// `pwritev2(RWF_DSYNC)`. The kernel guarantees the data is on stable
+    /// storage before returning.
+    ///
+    /// Uses an explicit file offset (`HEADER_LEN + bytes_on_disk`) rather
+    /// than the file's seek cursor, so it composes cleanly with the
+    /// non-durable [`Self::flush`] above. The cursor is updated post-write
+    /// to keep both paths interoperable (otherwise a subsequent
+    /// `flush` would write at a stale cursor).
+    ///
+    /// Spec deviation: this path uses synchronous `pwritev2` rather than
+    /// the spec's prescribed `io_uring` (SD-2.8-2 in `docs/spec-deviations.md`).
+    /// Functional behavior is equivalent; only the submission shape differs.
+    pub fn flush_durable(&mut self) -> Result<(), WalSegmentError> {
+        if self.write_buf.is_empty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        FLUSH_DURABLE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let fd = self.file.as_raw_fd();
+        let offset =
+            i64::try_from(WAL_SEGMENT_HEADER_LEN + self.bytes_on_disk).expect("offset fits in i64");
+        let wanted = self.write_buf.len();
+        let iov = libc::iovec {
+            iov_base: self.write_buf.as_ptr() as *mut c_void,
+            iov_len: wanted,
+        };
+        // SAFETY: `fd` is owned by `self.file` and valid for the duration of
+        // this call. `iov` points at `self.write_buf`, which lives until the
+        // end of this function. iovcnt=1 matches the single iovec. The
+        // RWF_DSYNC flag (0x2) is documented in Linux UAPI fs.h.
+        let n = unsafe { libc::pwritev2(fd, &iov, 1, offset, RWF_DSYNC) };
+        if n < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let got = n as usize;
+        if got != wanted {
+            return Err(WalSegmentError::ShortWrite { wanted, got });
+        }
+
+        // Keep the file's seek cursor in sync with `bytes_on_disk` so a
+        // future call to `flush` (cursor-based) doesn't overwrite the
+        // durably-written region. Best-effort; failure is non-fatal because
+        // the durable write already succeeded.
+        use std::io::Seek;
+        let _ = self
+            .file
+            .seek(std::io::SeekFrom::Start((offset as u64) + got as u64));
+
+        self.bytes_on_disk += got;
+        self.write_buf.clear();
+        Ok(())
+    }
+
+    /// Number of bytes currently buffered (not yet flushed). The
+    /// `GroupCommitter` uses this to decide when to fire a size-based flush.
+    #[must_use]
+    pub fn write_buf_len(&self) -> usize {
+        self.write_buf.len()
     }
 }
 
@@ -318,6 +396,7 @@ mod tests {
             WalSegmentError::Io(io_err) => {
                 assert_eq!(io_err.kind(), io::ErrorKind::AlreadyExists);
             }
+            other => panic!("expected Io(AlreadyExists), got {other:?}"),
         }
     }
 

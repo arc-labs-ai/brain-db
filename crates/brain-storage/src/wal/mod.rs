@@ -5,12 +5,14 @@
 //! record-level framing only; segment writer/reader/recovery land in
 //! subsequent sub-tasks (2.6–2.10).
 
+pub mod group_commit;
 pub mod kinds;
 pub mod payload;
 pub mod reader;
 pub mod record;
 pub mod segment;
 
+pub use group_commit::{AppendHandle, CommitError, GroupCommitConfig, GroupCommitter};
 pub use kinds::{WalRecordKind, ALL_KINDS};
 pub use payload::{
     CheckpointBeginPayload, CheckpointEndPayload, ConsolidatePayload, EdgePayload,
