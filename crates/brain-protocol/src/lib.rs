@@ -16,9 +16,11 @@
 pub mod crc;
 pub mod error;
 pub mod header;
+pub mod opcode;
 
 pub use error::ProtocolError;
 pub use header::{Header, VERSION};
+pub use opcode::Opcode;
 
 /// Frame magic bytes. Identifies a Brain frame on the wire.
 pub const MAGIC: [u8; 4] = *b"BRN0";
@@ -28,37 +30,6 @@ pub const HEADER_SIZE: usize = 32;
 
 /// Maximum payload size (16 MiB - 1), enforced by the 24-bit length field.
 pub const MAX_PAYLOAD_BYTES: usize = (1 << 24) - 1;
-
-/// Wire-protocol opcodes. Numeric values are stable per
-/// `spec/03_wire_protocol/05_opcodes.md`. Do NOT renumber.
-///
-/// Note: this is a partial set; Task 1.3 replaces it with the full table.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum Opcode {
-    // Cognitive primitives.
-    Encode = 0x01,
-    Recall = 0x02,
-    Plan = 0x03,
-    Reason = 0x04,
-    Forget = 0x05,
-    // Graph operations.
-    Link = 0x10,
-    Unlink = 0x11,
-    // Transactions.
-    TxnBegin = 0x20,
-    TxnCommit = 0x21,
-    TxnAbort = 0x22,
-    // Streaming.
-    Subscribe = 0x30,
-    Next = 0x31,
-    Complete = 0x32,
-    // Admin.
-    AdminStats = 0x40,
-    AdminHealth = 0x41,
-    // Errors / system.
-    Error = 0xF0,
-}
 
 #[cfg(test)]
 mod tests {

@@ -24,4 +24,7 @@ pub enum ProtocolError {
     /// A reserved header field was non-zero.
     #[error("reserved field non-zero")]
     ReservedFieldNonZero,
+    /// An opcode byte didn't match any known opcode.
+    #[error("unknown opcode: 0x{0:02X}")]
+    UnknownOpcode(u8),
 }

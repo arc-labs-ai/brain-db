@@ -131,9 +131,9 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - Property test: every value in `0..=255` either maps to an opcode or returns the same `UnknownOpcode` error.
 
 **Done when:**
-- [ ] All opcodes from spec §05 are present with matching numbers.
-- [ ] `from_u8` is exhaustive and tested.
-- [ ] Predicate helpers exist if the spec distinguishes request/response/admin.
+- [x] All opcodes from spec §05 are present with matching numbers.
+- [x] `from_u8` is exhaustive and tested.
+- [x] Predicate helpers exist if the spec distinguishes request/response/admin.
 
 **Pitfalls:**
 - Don't renumber opcodes. The spec pins them.
