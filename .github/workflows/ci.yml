@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Opt in to Node.js 24 for JavaScript actions ahead of GitHub's forced
+  # cutover on 2026-06-02. Removes the deprecation warning from each job.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build-and-test:
