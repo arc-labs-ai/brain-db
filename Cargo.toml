@@ -25,8 +25,8 @@ exclude = ["fuzz"]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
-license = "TBD"
-repository = "https://github.com/<org>/brain"
+license = "Apache-2.0"
+repository = "https://github.com/brain-db-io/brain-db"
 
 # Centralize dependency versions here. Crates inherit with `dep.workspace = true`.
 [workspace.dependencies]
