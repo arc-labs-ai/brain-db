@@ -213,19 +213,22 @@ Implement the durable storage layer: a memory-mapped vector arena, a write-ahead
 
 ---
 
-### Task 2.9 — `Wal` public type
+### Task 2.9 — `Wal` public type ✅
 
-**Reads:** `spec/05_storage_arena_wal/07_write_path.md`
+**Reads:** `spec/05_storage_arena_wal/07_write_path.md` §§3, 4, 13–15; `04_wal_overview.md` §§3, 4; `06_wal_durability.md` §7 (rollover protocol).
 
-**Writes:** `crates/brain-storage/src/wal/mod.rs`
+**Writes:** `crates/brain-storage/src/wal/wal.rs` (and `wal/mod.rs` re-exports + a new entry in `docs/spec-deviations.md`).
 
-**What to build:**
-- `pub struct Wal { ... }` — single public handle composing segment writer + group commit + reader.
-- `pub async fn append(&self, record: WalRecord) -> Result<Lsn>` — returns the LSN once durable.
-- `pub fn reader(&self) -> WalReader`.
+**Architecture:** `Wal` owns the directory, a monotonic LSN counter, and the active `GroupCommitter` (which in turn owns the active `WalSegment`). `append` allocates the next LSN, rolls over to a fresh segment if needed, enqueues to the committer, blocks until durable. `reader()` produces a `WalReader` whose segment list is fixed at `open()` time but whose contents are read at iteration time.
+
+**Spec deviation SD-2.9-1**: synchronous `append(&mut self, record)` instead of phase-doc's `async fn append(&self, record)`. Carries forward SD-2.8-2 (no async runtime yet); `&mut self` matches spec §07 §15's single-writer-per-shard discipline at the type level. Logged in `docs/spec-deviations.md`.
+
+**Rollover** follows spec §06 §7 step-by-step: drain current commit → drop old segment → `WalSegment::create_new` for the new segment (its 4 KB header is written and `msync`'d as part of `create_new` from 2.6) → `fsync` the parent directory so the new file's directory entry is durable → restart `GroupCommitter` on the new segment.
+
+**`fsync_dir` helper** opens the directory `O_RDONLY`, calls `libc::fsync`, closes. Each `unsafe` block has a `// SAFETY:` comment.
 
 **Done when:**
-- [ ] End-to-end: write through `Wal::append` → read via `wal.reader()` returns the record.
+- [x] End-to-end: 100 records via `Wal::append` → `wal.reader()` returns all 100 in LSN order (`hundred_records_round_trip_through_wal`). Plus 11 other tests covering create paths (3), LSN allocation (2), rollover (3 — including `RecordExceedsSegmentLimit` for an oversized record), reader semantics (1), shutdown (1), and Drop without explicit shutdown (1).
 
 ---
 

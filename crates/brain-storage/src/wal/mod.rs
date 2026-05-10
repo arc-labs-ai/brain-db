@@ -11,6 +11,8 @@ pub mod payload;
 pub mod reader;
 pub mod record;
 pub mod segment;
+#[allow(clippy::module_inception)]
+pub mod wal;
 
 pub use group_commit::{AppendHandle, CommitError, GroupCommitConfig, GroupCommitter};
 pub use kinds::{WalRecordKind, ALL_KINDS};
@@ -29,3 +31,4 @@ pub use segment::{
     WalSegment, WalSegmentError, WAL_SEGMENT_FORMAT_VERSION_V1,
     WAL_SEGMENT_HEADER_CRC_COVERAGE_END, WAL_SEGMENT_HEADER_LEN, WAL_SEGMENT_MAGIC,
 };
+pub use wal::{Wal, WalConfig, WalError};

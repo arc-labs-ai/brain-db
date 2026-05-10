@@ -75,3 +75,13 @@ The spec wins in general (per `CLAUDE.md` §2 and `AUTONOMY.md` §2); the entrie
 - **Reason:** Glommio hasn't been wired into `brain-storage`. Pulling it in for 2.8 alone would mean adding the runtime, picking an executor model, and coupling the committer to it — all before the rest of the system (request handler, server) is ready to live on Glommio.
 - **Plan reference:** `.claude/plans/phase-02-task-08.md` §3.2.
 - **Reconcile by:** Phase 9 — replace the committer thread with a Glommio coroutine using `io_uring`. The `GroupCommitter` public API (`append → AppendHandle::wait`) is shaped so the swap is local.
+
+---
+
+## SD-2.9-1: Synchronous `Wal::append(&mut self, ...)` instead of `async fn append(&self, ...)`
+
+- **Spec / phase doc:** phase-02 sub-task 2.9 prescribes `pub async fn append(&self, record: WalRecord) -> Result<Lsn>`. Spec §07 §3 implies an async writer task.
+- **Implementation:** synchronous `pub fn append(&mut self, record: WalRecord) -> Result<Lsn, WalError>`.
+- **Reason:** carries forward SD-2.8-2 — there's no async runtime in `brain-storage` yet. The `&mut self` change (rather than `&self` + interior mutability) reflects spec §07 §15's single-writer-per-shard discipline at the type level: the borrow checker enforces that there's only one active writer.
+- **Plan reference:** `.claude/plans/phase-02-task-09.md` §3.1.
+- **Reconcile by:** Phase 9, alongside SD-2.8-2. Becomes `pub async fn append(&self, record) -> Result<Lsn>` once the writer runs as a Glommio coroutine and the committer is `&self`-safe via the runtime's task-local guarantees.
