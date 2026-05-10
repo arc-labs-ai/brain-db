@@ -97,9 +97,7 @@ impl MemoryId {
     #[must_use]
     pub const fn pack(shard: ShardId, slot: SlotIndex, version: SlotVersion) -> Self {
         let slot_56 = slot & ((1u64 << 56) - 1);
-        let raw = (slot_56 as u128)
-            | ((version as u128) << 56)
-            | ((shard as u128) << 72);
+        let raw = (slot_56 as u128) | ((version as u128) << 56) | ((shard as u128) << 72);
         Self(raw)
     }
 
