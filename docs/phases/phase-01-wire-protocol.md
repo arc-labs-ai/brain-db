@@ -221,8 +221,8 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - For each error variant: it has a `code()` matching the spec.
 
 **Done when:**
-- [ ] Every variant in spec §10 is represented.
-- [ ] `From<ProtocolError>` for `brain_core::Error` (via `Internal` or `InvalidArgument` as appropriate).
+- [x] Every variant in spec §10 is represented.
+- [x] `From<ProtocolError>` for `brain_core::Error` (via `Internal` or `InvalidArgument` as appropriate).
 
 **Pitfalls:**
 - Don't conflate transport errors (TCP reset) with protocol errors. Transport handling is Phase 9.
