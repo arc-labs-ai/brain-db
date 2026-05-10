@@ -1,3 +1,9 @@
+<div align="center">
+
+<img src="assets/banner.svg" alt="brain — a cognitive substrate for AI agents" width="640">
+
+</div>
+
 # Brain
 
 > A cognitive substrate for AI agents — a database where the primitives are *cognitive operations* (encode, recall, plan, reason, forget) instead of tables, documents, or vectors.
@@ -521,7 +527,7 @@ Three top-level docs work together:
 ### Quick start
 
 ```bash
-git clone <url> brain && cd brain
+git clone https://github.com/brain-db-io/brain-db.git brain && cd brain
 just verify                      # cargo build + test + clippy + fmt + skills
 git tag phase-0-complete         # if not already tagged
 
@@ -551,4 +557,8 @@ The pre-tool-use hooks in `.claude/hooks/` provide a safety net: even with permi
 
 ## License
 
-Apache-2.0 (or as configured by the project owner). Spec, plans, and skills are the same.
+[Apache-2.0](LICENSE). Source code, spec, plans, and skills are all under the same license.
+
+By submitting a pull request, you agree that your contribution is licensed under the Apache-2.0 terms (per Apache-2.0 §5 — "Submission of Contributions"). The Apache-2.0 patent grant applies; see [LICENSE](LICENSE) for details.
+
+Repository: <https://github.com/brain-db-io/brain-db>

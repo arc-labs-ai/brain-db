@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  brain — logo mark.
+  A central substrate node surrounded by a hex-arranged ring of memory
+  nodes, connected by graph edges. Mono-color so it works on light or
+  dark backgrounds; inherits `currentColor` so callers can recolor via
+  CSS or the surrounding text color.
+
+  Geometry: outer canvas 300×300, ring radius 100 around centre (150,150).
+  Outer node radius 14, central node radius 26.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300" width="300" height="300" role="img" aria-label="brain logo">
+  <title>brain</title>
+
+  <!-- Edges: every outer node connects to the centre, plus the outer
+       ring is closed (each node connects to its two neighbours). The
+       resulting silhouette suggests the memory graph. -->
+  <g fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" opacity="0.75">
+    <!-- spokes (centre → ring) -->
+    <line x1="150" y1="150" x2="150" y2="50"/>
+    <line x1="150" y1="150" x2="237" y2="100"/>
+    <line x1="150" y1="150" x2="237" y2="200"/>
+    <line x1="150" y1="150" x2="150" y2="250"/>
+    <line x1="150" y1="150" x2="63" y2="200"/>
+    <line x1="150" y1="150" x2="63" y2="100"/>
+
+    <!-- ring -->
+    <line x1="150" y1="50"  x2="237" y2="100"/>
+    <line x1="237" y1="100" x2="237" y2="200"/>
+    <line x1="237" y1="200" x2="150" y2="250"/>
+    <line x1="150" y1="250" x2="63"  y2="200"/>
+    <line x1="63"  y1="200" x2="63"  y2="100"/>
+    <line x1="63"  y1="100" x2="150" y2="50"/>
+  </g>
+
+  <!-- Outer memory nodes: six of them on the hex ring. -->
+  <g fill="currentColor">
+    <circle cx="150" cy="50"  r="14"/>
+    <circle cx="237" cy="100" r="14"/>
+    <circle cx="237" cy="200" r="14"/>
+    <circle cx="150" cy="250" r="14"/>
+    <circle cx="63"  cy="200" r="14"/>
+    <circle cx="63"  cy="100" r="14"/>
+  </g>
+
+  <!-- Central substrate node, slightly larger so the eye lands here. -->
+  <circle cx="150" cy="150" r="26" fill="currentColor"/>
+  <!-- Inner aperture in the centre, suggesting the cognitive primitives
+       radiating out (encode/recall/plan/reason/forget). -->
+  <circle cx="150" cy="150" r="10" fill="white"/>
+</svg>
