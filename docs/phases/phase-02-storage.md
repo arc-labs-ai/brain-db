@@ -124,21 +124,26 @@ Implement the durable storage layer: a memory-mapped vector arena, a write-ahead
 
 ---
 
-### Task 2.5 — Slot allocator with free list and version bumping
+### Task 2.5 — Slot allocator with free list and version bumping ✅
 
-**Reads:** `spec/05_storage_arena_wal/02_arena_layout.md` + `spec/02_data_model/03_identifiers.md`
+**Reads:** `spec/05_storage_arena_wal/01_arena_overview.md` §10, `02_arena_layout.md` §3.2 + §8, `07_write_path.md` §2, `03_arena_growth.md` §2, `spec/02_data_model/03_identifiers.md` §2.
 
-**Writes:** `crates/brain-storage/src/arena/allocator.rs`
+**Writes:** `crates/brain-storage/src/arena/allocator.rs` (and `arena/mod.rs`)
 
-**What to build:**
-- `pub struct SlotAllocator { ... }` — owns the free list and the next-fresh-slot pointer.
-- `fn alloc(&mut self) -> SlotIndex` — pops free list, else returns next-fresh.
-- `fn free(&mut self, idx: SlotIndex)` — pushes onto free list and bumps the slot's version field.
-- `fn version_of(&self, idx: SlotIndex) -> SlotVersion`.
+**Design note:** original phase-doc sketch had `free()` bumping the version. Spec §05/07 §56 puts the bump at *alloc* time (`new_version = current + 1`). End-to-end behavior is the same ("alloc/free/alloc returns version+1") but the spec reading has a nice property: a crashed encode between `alloc` and WAL fsync doesn't burn a version, because the on-disk version is only updated when the encoder finalizes the slot. Plan §3.1 captures the rationale.
+
+**What was built:**
+- `SlotAllocator { free_list: Vec<u64>, next_fresh: u64, capacity: u64 }`. LIFO free list (spec §05/07 §1 "pop the head").
+- `empty(capacity)` — fresh-arena constructor.
+- `rebuild_from_arena(arena)` — O(N) two-pass classifier: pass 1 finds `next_fresh` = `max_used_idx + 1` (`OCCUPIED || PENDING_WRITE || slot_version > 0`); pass 2 adds every non-`OCCUPIED` slot below `next_fresh` to the free list (including never-used slots that happen to sit below the boundary — without this they'd be permanently lost).
+- `alloc(arena)` — pops free_list or takes `next_fresh`; re-checks free-list slot is still free (spec §05/07 §1); computes `new_version = current + 1` with saturation handling per spec §05/02 §8; sets `PENDING_WRITE` on disk per spec §05/07 §48; returns `(idx, new_version)`.
+- `free(arena, idx)` — clears all flags on disk (spec §05/02 §3.2 "After reclaim, both bits become 0"), refreshes CRC, pushes onto free list. Does not bump version.
+- `version_of(arena, idx)`, `on_capacity_grow(new_capacity)` (panics on shrink per spec §05/03 §8).
+- Saturation handling: both `alloc` and `free` return `*Retired` errors when version is at `u32::MAX`.
 
 **Done when:**
-- [ ] alloc/free/alloc returns the same slot but with version+1.
-- [ ] Property test: a sequence of alloc/free operations leaves `total_slots == fresh_alloc_count` invariant.
+- [x] alloc/free/alloc returns the same slot but with version+1 — `alloc_free_alloc_returns_same_idx_with_version_plus_one` and `version_progression_across_many_cycles` cover this.
+- [x] Property test: a sequence of alloc/free operations leaves the structural invariant `used_count() + free_count() == next_fresh` true at every step.
 
 ---
 
