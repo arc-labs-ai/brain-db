@@ -317,37 +317,26 @@ The user gets to do other work. Claude does the substrate. The contract is the b
 
 ## 21. The planning step
 
-Before implementation begins, Claude writes a plan and pauses for user confirmation. The plan is:
+**Every sub-task** — and every phase transition — begins with a plan, surfaced for user approval before any implementation. There is no "trivial enough to skip" carve-out: even a one-function helper or doc-only change goes through the gate. The friction is the point — the plan forces Claude to read the spec, name the design choices, and surface ambiguity before code exists, which is cheaper than discovering them mid-implementation.
 
-1. **Always required** for a new **phase** (any phase-NN-*.md transition). Write `.claude/plans/phase-NN.md`.
-2. **Required** for a **substantial sub-task** — one that:
-   - Introduces a new dependency, framework, or library.
-   - Touches multiple crates or alters cross-crate boundaries.
-   - Implements a non-trivial algorithm (CRC layout, allocator, codec, etc.).
-   - Spans more than ~200 lines of new code.
-   Write `.claude/plans/phase-NN-task-MM.md`.
-3. **Skippable** for **trivial sub-tasks** — a constant pin, a one-function helper, a doc-only change. Surface a one-line "I'm doing X, then committing" and proceed without a plan file.
+The fixed sequence:
+
+1. **Read the spec.** Open every spec file the sub-task depends on, end to end. Cross-reference any `*_open_questions.md` for the area.
+2. **Research where appropriate.** For new frameworks/libraries/algorithms, search the web for current best practices, version pins, breaking-change notes. Capture URLs and the relevant excerpt. Skip only when the work is purely internal wiring.
+3. **Write the plan** to `.claude/plans/phase-NN-task-MM.md` (or `.claude/plans/phase-NN.md` for a phase transition).
+4. **Stop and wait.** Print `PLAN READY: see .claude/plans/<file>.md — confirm to proceed.` and end the turn. Claude does not write code, run cargo, or otherwise act on the plan until the user confirms ("go" / "approved" / "confirmed") or supplies revisions.
+5. **Iterate if asked.** If the user requests changes, update the plan file, re-surface, and wait again. Plans are durable artifacts — keep the file even after approval; do not delete on the next plan.
 
 ### What the plan must cover
 
 - **Scope**: what the sub-task does, what it does NOT do, and where it fits in the phase.
 - **Spec references**: the spec files read, with section anchors. Quote any constraints that bind the design.
-- **External validation** (when relevant): for new frameworks/libraries/algorithms, search the web for current best practices, version pins, breaking-change notes. Capture URLs and the relevant excerpt — "rkyv 0.7 docs say X". Skip when the work is purely internal wiring.
+- **External validation** (when relevant): see step 2 above.
 - **Architecture sketch**: the types/modules introduced, how they compose, what the public surface looks like.
 - **Trade-offs considered**: 2–4 alternative designs and why the chosen one wins.
 - **Risks / open questions**: what could go wrong; what the spec leaves ambiguous (cross-reference any `*_open_questions.md`).
 - **Test plan**: which tests prove correctness; which `Done when` items each maps to.
 - **Estimated commit shape**: one commit or 2–3? What goes where?
-
-### The confirmation gate
-
-After writing the plan, Claude prints:
-
-```
-PLAN READY: see .claude/plans/<file>.md — confirm to proceed.
-```
-
-and stops. Claude does not write code until the user confirms (a "go" / "approved" / "confirmed" or specific revisions). If the user requests changes, Claude updates the plan and re-surfaces.
 
 ### Plan files are durable
 
