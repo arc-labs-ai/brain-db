@@ -147,20 +147,24 @@ Implement the durable storage layer: a memory-mapped vector arena, a write-ahead
 
 ---
 
-### Task 2.6 — WAL segment writer (no fsync yet)
+### Task 2.6 — WAL segment writer (no fsync yet) ✅
 
-**Reads:** `spec/05_storage_arena_wal/04_wal_overview.md`, `spec/05_storage_arena_wal/05_wal_records.md`
+**Reads:** `spec/05_storage_arena_wal/04_wal_overview.md`, `spec/05_storage_arena_wal/05_wal_records.md` §1 (segment header) + §17 (record packing)
 
-**Writes:** `crates/brain-storage/src/wal/segment.rs`
+**Writes:** `crates/brain-storage/src/wal/segment.rs` (and `wal/mod.rs` re-exports)
 
-**What to build:**
-- `pub struct WalSegment { file: File, offset: u64, segment_id: u64 }`
-- `fn append(&mut self, record: &WalRecord) -> Result<()>` — writes bytes (no sync).
-- `fn flush(&mut self)` — calls `write_all`, no sync.
-- Segment rollover at `WAL_SEGMENT_SIZE_BYTES`.
+**What was built:**
+- `WalSegment` — owns one `*.wal` file, owns an in-memory `Vec<u8>` write buffer.
+- `create_new(path, segment_seq, starting_lsn, shard_uuid)` — `O_EXCL` (refuses to clobber); writes the 4 KB segment header synchronously with magic `"BWAL"`, format_version, shard_uuid, segment_seq, starting_lsn, created_at_unix_nanos, header_crc32c, reserved.
+- `append_record(&WalRecord)` — uses 2.1's `WalRecord::encode_into` to push bytes into the in-memory buffer. No disk I/O.
+- `flush()` — drains the buffer to the file via `File::write_all`. **No fsync** (deferred to 2.8 with `pwritev2(RWF_DSYNC)` and group commit).
+- `size_bytes()` — `WAL_SEGMENT_HEADER_LEN + bytes_on_disk + buffered`. Lets the manager in 2.9 decide rollover.
+- `is_full()` — `size_bytes() >= WAL_SEGMENT_SIZE_BYTES`.
+- Segment header CRC covers `[0..48]` — unambiguous (no `u64` cut mid-field, unlike the slot / arena-header / WAL-record CRCs from earlier sub-tasks).
+- `#[repr(C)]` `bytemuck::Pod` `WalSegmentHeaderRaw` with `const _: () = { assert!(size_of/align_of/offset_of) };` enforcing every field offset at compile time.
 
 **Done when:**
-- [ ] Records can be written and read back via `WalReader` (next task).
+- [x] Records can be written and read back via `WalReader` (next task) — tested via `records_round_trip_through_disk` and `mixed_append_flush_sequence_preserves_order` (read raw bytes after flush and decode via `WalRecord::decode_one`; WalReader from 2.7 just wraps this pattern).
 
 ---
 

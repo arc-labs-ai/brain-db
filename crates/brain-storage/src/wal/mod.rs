@@ -8,6 +8,7 @@
 pub mod kinds;
 pub mod payload;
 pub mod record;
+pub mod segment;
 
 pub use kinds::{WalRecordKind, ALL_KINDS};
 pub use payload::{
@@ -19,4 +20,8 @@ pub use payload::{
 };
 pub use record::{
     DecodeOutcome, Lsn, WalRecord, WalRecordError, FOOTER_LEN, HEADER_LEN, MAX_PAYLOAD,
+};
+pub use segment::{
+    WalSegment, WalSegmentError, WAL_SEGMENT_FORMAT_VERSION_V1,
+    WAL_SEGMENT_HEADER_CRC_COVERAGE_END, WAL_SEGMENT_HEADER_LEN, WAL_SEGMENT_MAGIC,
 };
