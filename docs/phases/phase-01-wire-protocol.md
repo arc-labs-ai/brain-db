@@ -102,12 +102,12 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - `header_crc_excludes_self`: hashing the header bytes minus the CRC field gives the value that's stored in the CRC field.
 
 **Done when:**
-- [ ] Functions are pure, public, documented.
-- [ ] Tests pin specific CRC values, not just "round-trips."
+- [x] Functions are pure, public, documented.
+- [x] Tests pin specific CRC values, not just "round-trips."
 
 **Pitfalls:**
 - CRC32C ≠ CRC32. Confirm `crc32c` crate is the iSCSI variant (it is).
-- `crc32c::crc32c` returns u32, not bytes. Convert with `to_le_bytes` for serialization.
+- `crc32c::crc32c` returns u32, not bytes. Convert with `to_be_bytes` for serialization (spec §03/03 §8 — both CRC fields are big-endian on the wire). *(Earlier draft of this doc said `to_le_bytes`; corrected against spec.)*
 
 ---
 

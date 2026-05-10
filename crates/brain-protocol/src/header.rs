@@ -10,6 +10,7 @@
 
 use bytemuck::{Pod, Zeroable};
 
+use crate::crc::header_crc;
 use crate::error::ProtocolError;
 use crate::{MAGIC, MAX_PAYLOAD_BYTES};
 
@@ -138,7 +139,7 @@ fn compute_header_crc(h: &Header) -> u32 {
     let mut buf = [0u8; 28];
     buf[..8].copy_from_slice(&bytes[..8]);
     buf[8..].copy_from_slice(&bytes[12..32]);
-    crc32c::crc32c(&buf)
+    header_crc(&buf)
 }
 
 #[cfg(test)]
