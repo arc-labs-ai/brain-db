@@ -2,6 +2,9 @@ edition = "2021"
 max_width = 100
 use_field_init_shorthand = true
 use_try_shorthand = true
-imports_granularity = "Crate"
-group_imports = "StdExternalCrate"
 reorder_imports = true
+
+# Note: `imports_granularity = "Crate"` and `group_imports = "StdExternalCrate"`
+# are nightly-only and produced 25+ noise warnings under stable rustfmt in CI.
+# Run `cargo +nightly fmt` locally if you want the grouped/granular import style;
+# CI runs stable so we omit them here.
