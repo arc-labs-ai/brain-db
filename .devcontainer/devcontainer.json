@@ -1,0 +1,59 @@
+{
+  "name": "brain-dev",
+
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/brain,type=bind,consistency=cached",
+  "workspaceFolder": "/workspaces/brain",
+
+  // Persistent named volumes for cargo registry and target dir so a fresh
+  // container start doesn't re-download dependencies. See README.md
+  // "Development environment" for the rationale.
+  // Only mount the cargo *cache* subdirectories — not the whole CARGO_HOME.
+  // CARGO_HOME/bin contains image-baked tools (just, cargo-fuzz, cargo-audit);
+  // a volume on the parent would shadow them.
+  "mounts": [
+    "source=brain-cargo-registry,target=/usr/local/cargo/registry,type=volume",
+    "source=brain-cargo-git,target=/usr/local/cargo/git,type=volume",
+    "source=brain-target-cache,target=/workspaces/brain/target,type=volume"
+  ],
+
+  "remoteEnv": {
+    "RUST_BACKTRACE": "1"
+  },
+
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  // Editor integration. devcontainer.json is the lingua franca across
+  // VS Code, Cursor, JetBrains, and GitHub Codespaces; these settings
+  // are read by VS Code / Cursor and silently ignored elsewhere.
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb",
+        "ms-vscode.makefile-tools"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.cargo.allTargets": true,
+        "files.watcherExclude": {
+          "**/target/**": true
+        }
+      }
+    }
+  },
+
+  // Future: Phase 9 needs `io_uring` syscalls. To unblock then, either:
+  //   - switch macOS users to OrbStack (permissive seccomp), or
+  //   - add `"runArgs": ["--security-opt", "seccomp=.devcontainer/seccomp.json"]`
+  //     pointing at a profile that allows io_uring_setup/enter/register.
+  // Not needed for Phase 2 — see README.md "Container runtime notes".
+
+  "remoteUser": "root"
+}
