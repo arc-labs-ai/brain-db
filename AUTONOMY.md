@@ -16,11 +16,16 @@ LOOP:
      - git status, git log -5
      - last commit's tag (phase-N-task-M-complete or similar)
      - check ROADMAP.md and the active docs/phases/phase-NN-*.md
-  
+
   2. Decide the next sub-task:
      - The lowest-numbered sub-task in the current phase that isn't ✓ done
      - Open its phase doc; re-read its "Reads" list
-  
+
+  2a. Plan first (see §21):
+     - For a new phase OR a substantial sub-task, write a plan to
+       `.claude/plans/phase-NN[-task-MM].md` and STOP for user confirmation.
+     - For trivial sub-tasks, surface a one-line summary and proceed.
+
   3. Implement the sub-task:
      - Read the listed spec sections in full
      - Write the listed code files
@@ -309,3 +314,41 @@ This contract exists so the user can run Claude Code, walk away, and trust that 
 - **Spec-faithful**: the implementation tracks the design, always.
 
 The user gets to do other work. Claude does the substrate. The contract is the bridge.
+
+## 21. The planning step
+
+Before implementation begins, Claude writes a plan and pauses for user confirmation. The plan is:
+
+1. **Always required** for a new **phase** (any phase-NN-*.md transition). Write `.claude/plans/phase-NN.md`.
+2. **Required** for a **substantial sub-task** — one that:
+   - Introduces a new dependency, framework, or library.
+   - Touches multiple crates or alters cross-crate boundaries.
+   - Implements a non-trivial algorithm (CRC layout, allocator, codec, etc.).
+   - Spans more than ~200 lines of new code.
+   Write `.claude/plans/phase-NN-task-MM.md`.
+3. **Skippable** for **trivial sub-tasks** — a constant pin, a one-function helper, a doc-only change. Surface a one-line "I'm doing X, then committing" and proceed without a plan file.
+
+### What the plan must cover
+
+- **Scope**: what the sub-task does, what it does NOT do, and where it fits in the phase.
+- **Spec references**: the spec files read, with section anchors. Quote any constraints that bind the design.
+- **External validation** (when relevant): for new frameworks/libraries/algorithms, search the web for current best practices, version pins, breaking-change notes. Capture URLs and the relevant excerpt — "rkyv 0.7 docs say X". Skip when the work is purely internal wiring.
+- **Architecture sketch**: the types/modules introduced, how they compose, what the public surface looks like.
+- **Trade-offs considered**: 2–4 alternative designs and why the chosen one wins.
+- **Risks / open questions**: what could go wrong; what the spec leaves ambiguous (cross-reference any `*_open_questions.md`).
+- **Test plan**: which tests prove correctness; which `Done when` items each maps to.
+- **Estimated commit shape**: one commit or 2–3? What goes where?
+
+### The confirmation gate
+
+After writing the plan, Claude prints:
+
+```
+PLAN READY: see .claude/plans/<file>.md — confirm to proceed.
+```
+
+and stops. Claude does not write code until the user confirms (a "go" / "approved" / "confirmed" or specific revisions). If the user requests changes, Claude updates the plan and re-surfaces.
+
+### Plan files are durable
+
+Plan files stay in the repo. They serve as durable design artifacts, complementing commit messages. Treat them like ADRs: future-Claude reads them to understand why a phase was built the way it was.
