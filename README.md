@@ -143,16 +143,16 @@ sequenceDiagram
     App->>SDK: encode("Alex said the deadline...")
     SDK->>SDK: build ENCODE_REQ frame<br/>(rkyv payload + 32B header + CRC)
     SDK->>Conn: TCP write (single frame, EOS)
-    Conn->>Conn: validate frame; lookup shard<br/>by agent → shard_id
+    Conn->>Conn: validate frame, lookup shard<br/>by agent then shard_id
     Conn->>Shard: enqueue(EncodeRequest)
     Shard->>Embed: embed(text)
-    Embed-->>Shard: [f32; 384] L2-normalized
-    Shard->>Shard: idempotency: dedup on RequestId
+    Embed-->>Shard: f32 vector dim 384, L2-normalized
+    Shard->>Shard: idempotency, dedup on RequestId
     Shard->>WAL: append(EncodeMemory record)
     WAL->>WAL: pwritev2(RWF_DSYNC)<br/>group commit
     WAL-->>Shard: Lsn (durable)
-    Shard->>Arena: write slot(version, vector, metadata)<br/>+ slot CRC
-    Shard->>Meta: redb txn:<br/>memory + edges + idempotency entry
+    Shard->>Arena: write slot(version, vector, metadata)<br/>plus slot CRC
+    Shard->>Meta: redb txn,<br/>memory plus edges plus idempotency
     Meta-->>Shard: txn committed
     Shard->>Index: insert(memory_id, vector)
     Shard-->>Conn: ENCODE_RESP(memory_id, salience, was_dedup)
