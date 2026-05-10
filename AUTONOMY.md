@@ -144,11 +144,23 @@ git tag phase-1-complete-recovery  # if from CONTEXT.md recovery
 
 ## 6. Branching strategy
 
-Default: work on `main`. Single-developer mode.
+Three long-lived branches:
 
-Exception: experimental work that may not pan out goes on a branch named `experiment/<topic>`. If it works out, rebase onto `main` and merge. If not, delete the branch.
+- **`main`** — release/stable. Only advances when a phase is fully complete and signed off; `phase-N-complete` tags live here.
+- **`dev`** — integration. Feature branches merge into `dev` first; this is where cross-feature interactions are exercised before promotion.
+- **`feature/<topic>`** — where day-to-day work happens. One branch per phase or per major sub-system (e.g. `feature/brain-protocol`).
 
-No long-running feature branches. Each phase is a sequence of small commits on `main`, ending with a tag.
+Flow per sub-task:
+
+1. Be on the relevant `feature/<topic>` branch (create it from `dev` if it doesn't exist).
+2. Commit each sub-task on the feature branch using the format from §5.
+3. When a sub-system / phase milestone is reached, fast-forward or `--no-ff` merge `feature/<topic>` → `dev`. Run the verify suite on `dev`.
+4. At a phase boundary (all sub-tasks `[x]`, exit checklist green): merge `dev` → `main`, then tag `phase-N-complete` on `main`.
+5. Long-running feature branches stay alive across sub-tasks but should be merged forward to `dev` at least once per phase to avoid drift.
+
+Exception: experimental work that may not pan out goes on `experiment/<topic>` and doesn't have to merge. If it pans out, promote it to a `feature/<topic>` and follow the standard flow.
+
+Never commit directly to `main` or `dev` — those are merge-only.
 
 ## 7. What "done" means for a sub-task
 
