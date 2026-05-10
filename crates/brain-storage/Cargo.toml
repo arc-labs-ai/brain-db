@@ -17,5 +17,6 @@ tracing.workspace = true
 crossbeam-channel.workspace = true
 
 [dev-dependencies]
+brain-core = { path = "../brain-core" }
 proptest.workspace = true
 tempfile.workspace = true

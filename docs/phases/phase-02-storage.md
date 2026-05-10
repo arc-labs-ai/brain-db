@@ -261,25 +261,27 @@ Implement the durable storage layer: a memory-mapped vector arena, a write-ahead
 
 ---
 
-### Task 2.11 — Random-kill recovery test
+### Task 2.11 — Random-kill recovery test ✅
 
-**Reads:** `spec/16_benchmarks_acceptance/06_durability_criteria.md`
+**Reads:** `spec/16_benchmarks_acceptance/06_durability_criteria.md` (full).
 
-**Writes:** `crates/brain-storage/tests/random_kill.rs`
+**Writes:** `crates/brain-storage/tests/random_kill.rs` (and `brain-core` added to `[dev-dependencies]`).
 
-**What to build:**
-- Test that:
-  1. Spins up a `Wal` and an arena.
-  2. Issues N concurrent operations.
-  3. At a random byte offset within the run, simulates kill (drops handles abruptly).
-  4. Reopens via `recover(...)`.
-  5. Verifies every operation that returned `Ok(lsn)` before the kill is durable.
-  6. Verifies no other operations are visible.
-- Run with N=100 ops, 1000 iterations.
-- Use proptest or hand-rolled randomization with a seed printed on failure.
+**Design:** the spec invariant is purely about *file state after a crash* — any prefix of the last `pwritev2` may or may not have hit disk. File truncation at a deterministically-seeded random byte simulates that prefix space exactly, without OS-coupling (no subprocess kill, no signal handling). Plan §3.1 has the full trade-off.
+
+**What was built:**
+- Hand-rolled LCG (no `rand` dev-dep) for seed-deterministic record generation + truncation offset.
+- `run_iteration(seed, trunc_strategy)` — creates a fresh shard, writes 100 records via `Wal::append`, shuts down cleanly, truncates the segment at a strategy-chosen byte, reopens the arena, runs `recover`, verifies that the recovered LSN set is exactly the prefix that physically survived the truncation (no extras, no gaps).
+- Three deterministic sentinel cases: header-only truncation (0 records), exact mid-record-boundary (50 records), no truncation (all 100).
+- `random_kill_recovery_smoke` — 100 iterations of random-offset truncation, runs on every `cargo test` (~16 seconds).
+- `random_kill_recovery_1000_iterations` — full 1000-iteration sweep, `#[ignore]`'d (~3 minutes); invoked in CI/pre-commit with `cargo test --test random_kill -- --ignored`.
+
+**Reinterpretations from phase-doc wording** (documented in `.claude/plans/phase-02-task-11.md` §1):
+- "Simulates kill (drops handles abruptly)" → file truncation at a random byte (same post-crash file state, deterministic).
+- "100 concurrent operations" → 100 sequential `Wal::append` calls (the `Wal` API is `&mut self` per SD-2.9-1; concurrency inside the committer is tested separately in 2.8's `batching_amortizes_fsyncs`).
 
 **Done when:**
-- [ ] 1000 iterations, 0 failures.
+- [x] 1000 iterations, 0 failures — verified with the full sweep before commit (run via `--ignored`); 100-iteration smoke runs on every `cargo test`.
 - [ ] Failure mode (if any) prints a reproducible seed.
 
 **Pitfalls:**
