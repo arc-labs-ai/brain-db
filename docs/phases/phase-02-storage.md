@@ -94,26 +94,33 @@ Implement the durable storage layer: a memory-mapped vector arena, a write-ahead
 
 ---
 
-### Task 2.4 — Arena file: open, mmap, grow
+### Task 2.4 — Arena file: open, mmap, grow ✅
 
-**Reads:** `spec/05_storage_arena_wal/03_arena_growth.md`
+**Reads:** `spec/05_storage_arena_wal/{01,02,03}*.md`, `spec/01_system_architecture/05_hardware.md` §1.1
 
-**Writes:** `crates/brain-storage/src/arena/file.rs`
+**Writes:** `crates/brain-storage/src/arena/file.rs` (and `arena/mod.rs`)
 
-**What to build:**
-- `pub struct ArenaFile { mmap: MmapMut, file: File, capacity_slots: usize }`
-- `fn open(path, initial_capacity_slots) -> Result<Self>` — creates if missing, mmaps.
-- `fn slot(&self, idx: SlotIndex) -> &Slot` and `slot_mut`.
-- `fn grow(&mut self, new_capacity_slots) -> Result<()>` — resizes file, remaps. Spec defines the growth policy (e.g. doubling).
+**What was built** (corrected against spec — original sketch used `MmapMut` from `memmap2`, which doesn't expose `mremap`):
+- `ArenaFile` — owns one shard's `arena.bin`. Hand-rolled mmap region (`NonNull<u8>` + `file_size` + `capacity_slots`). Hand-rolled because `memmap2` would force the spec's *fallback* growth path (§05/03 §5) instead of the prescribed `mremap(MREMAP_MAYMOVE)` primary path (§05/03 §4).
+- `open(path, shard_uuid, initial_capacity_slots)` — creates a new arena (`fallocate` → mmap → header init → `msync(MS_SYNC, header_page)`) or validates an existing one (magic → CRC → format/dim/size → uuid → file-size consistency, in spec §05/02 §11 order).
+- `slot(&self, idx) -> &Slot` and `slot_mut(&mut self, idx) -> &mut Slot` — pointer arithmetic into the mmap; single-writer enforced by the borrow checker.
+- `grow_to(&mut self, new_capacity_slots)` — `fallocate` → `mremap(MREMAP_MAYMOVE)` → header update (capacity + last_grow_at + CRC) → `msync(MS_SYNC, header_page)`. No-op on equal capacity; `ShrinkRequested` error on shrink (spec §05/03 §8: "The arena does not shrink in v1").
+- `Drop` calls `munmap`. `madvise(MADV_RANDOM | MADV_DONTDUMP)` per spec §01/05 §1.1 (non-fatal; logs at warn).
+- Header CRC covers bytes `[0..80]` — same `[0..N]`-cuts-a-u64 typo pattern as the slot CRC (spec literal `[0..76]` would split `last_grow_at`); see `.claude/plans/phase-02-task-04.md` §3.1.
+- `HeaderRaw` is `#[repr(C)]` `bytemuck::Pod`, with a `const _: () = { assert!(...); };` block enforcing every field offset and the 4096-byte total at compile time.
+- `Send + Sync` impls justified inline (single-owner mmap; reads through `&self`, writes through `&mut self`).
 
 **Done when:**
-- [ ] Open + read + write + grow + reopen → all data preserved.
-- [ ] Concurrent reads of disjoint slots compile (by passing through a shared handle).
+- [x] Open + read + write + grow + reopen → all data preserved.
+- [x] Concurrent reads of disjoint slots compile (by passing through a shared handle) — proven by `two_slot_refs_coexist_through_shared_self` test.
 
 **Pitfalls:**
-- `unsafe` is required here. Each block needs a `// SAFETY:` comment.
-- mmap remap: use `mremap(2)` with `MAY_MOVE` (Linux-only; spec §05/03 pins this). On remap failure, halt the shard with `Corruption` (invariant #7).
-- Don't store `&mut Slot` borrows across calls that might grow the arena — they'd dangle.
+- `unsafe` is required here. Each block carries a `// SAFETY:` comment with the smallest scope that compiles.
+- **Use-after-munmap**: error paths in `open_existing` were initially calling `munmap` then reading `header_view.field` — caught by SIGSEGV under cargo test parallel runner. Fix: snapshot every header field into locals before any path that might munmap.
+- mmap remap: `mremap(MREMAP_MAYMOVE)`; the kernel may relocate, which is fine because `&mut self` prevents any concurrent borrows.
+- Don't store `&mut Slot` borrows across calls that might grow the arena — `&mut self` borrow of `ArenaFile` enforces this at the type level.
+
+**New deps:** `libc = "0.2"` (workspace pin) — direct usage of `mmap`, `mremap`, `munmap`, `fallocate`, `msync`, `madvise`. `tracing.workspace = true` for non-fatal `madvise` failures.
 
 ---
 

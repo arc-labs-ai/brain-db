@@ -70,6 +70,9 @@ uuid = { version = "1.7", features = ["v7", "serde"] }
 thiserror = "1"
 anyhow = "1"
 
+# Syscalls (mmap/mremap/munmap/fallocate/msync/madvise — used by brain-storage).
+libc = "0.2"
+
 # Logging / tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

@@ -174,9 +174,11 @@ dependencies = [
  "brain-core",
  "bytemuck",
  "crc32c",
+ "libc",
  "proptest",
  "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
