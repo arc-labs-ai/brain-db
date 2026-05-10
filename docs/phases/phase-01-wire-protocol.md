@@ -302,8 +302,8 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - Negotiation: compatible versions succeed; incompatible fail with `UnsupportedVersion`.
 
 **Done when:**
-- [ ] Hello messages round-trip.
-- [ ] Negotiation logic matches the spec's compatibility matrix.
+- [x] Hello messages round-trip. *(All four — HELLO, WELCOME, AUTH, AUTH_OK — round-trip through rkyv. Phase doc said "ClientHello/ServerHello" but spec §03/06 names the four messages explicitly; spec wins.)*
+- [x] Negotiation logic matches the spec's compatibility matrix.
 
 ---
 

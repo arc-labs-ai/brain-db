@@ -20,6 +20,7 @@
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::error::ProtocolError;
+use crate::handshake::{AuthPayload, HelloPayload};
 use crate::opcode::Opcode;
 use crate::rkyv_codec::{from_rkyv_bytes, to_rkyv_bytes};
 
@@ -480,6 +481,10 @@ pub struct AdminListTombstonedRequest {
 /// trailing raw section, not by this enum.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RequestBody {
+    /// Spec §06 §2 — opening handshake frame (connection-level, stream 0).
+    Hello(HelloPayload),
+    /// Spec §06 §4 — authentication frame following WELCOME.
+    Auth(AuthPayload),
     Encode(EncodeRequest),
     EncodeVectorDirect(EncodeVectorDirectRequest),
     Recall(RecallRequest),
@@ -512,6 +517,8 @@ impl RequestBody {
     #[must_use]
     pub fn opcode(&self) -> Opcode {
         match self {
+            Self::Hello(_) => Opcode::Hello,
+            Self::Auth(_) => Opcode::Auth,
             Self::Encode(_) => Opcode::EncodeReq,
             Self::EncodeVectorDirect(_) => Opcode::EncodeVectorDirectReq,
             Self::Recall(_) => Opcode::RecallReq,
@@ -546,6 +553,8 @@ impl RequestBody {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         match self {
+            Self::Hello(r) => to_rkyv_bytes(r),
+            Self::Auth(r) => to_rkyv_bytes(r),
             Self::Encode(r) => to_rkyv_bytes(r),
             Self::EncodeVectorDirect(r) => to_rkyv_bytes(r),
             Self::Recall(r) => to_rkyv_bytes(r),
@@ -579,6 +588,8 @@ impl RequestBody {
     /// don't carry a request body (responses, error frames).
     pub fn decode(opcode: Opcode, bytes: &[u8]) -> Result<Self, ProtocolError> {
         Ok(match opcode {
+            Opcode::Hello => Self::Hello(from_rkyv_bytes(bytes)?),
+            Opcode::Auth => Self::Auth(from_rkyv_bytes(bytes)?),
             Opcode::EncodeReq => Self::Encode(from_rkyv_bytes(bytes)?),
             Opcode::EncodeVectorDirectReq => Self::EncodeVectorDirect(from_rkyv_bytes(bytes)?),
             Opcode::RecallReq => Self::Recall(from_rkyv_bytes(bytes)?),
@@ -875,6 +886,48 @@ mod tests {
                 limit: 100,
             },
         ));
+    }
+
+    #[test]
+    fn handshake_request_bodies_round_trip() {
+        use crate::handshake::{
+            AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload, MtlsClaim,
+        };
+
+        for body in [
+            RequestBody::Hello(HelloPayload {
+                client_id: "brain-rust-sdk/0.5.0".into(),
+                supported_versions: vec![1],
+                capabilities: HelloCapabilities {
+                    streaming: true,
+                    compression_zstd: false,
+                    server_push: false,
+                },
+                client_session_token: None,
+            }),
+            RequestBody::Auth(AuthPayload {
+                method: AuthMethod::Token,
+                agent_id: sample_uuid(11),
+                credentials: AuthCredentials::Token(b"opaque".to_vec()),
+            }),
+            RequestBody::Auth(AuthPayload {
+                method: AuthMethod::Mtls,
+                agent_id: sample_uuid(12),
+                credentials: AuthCredentials::Mtls(MtlsClaim {
+                    cert_fingerprint: [9u8; 32],
+                    asserted_subject: "CN=client".into(),
+                }),
+            }),
+            RequestBody::Auth(AuthPayload {
+                method: AuthMethod::None,
+                agent_id: sample_uuid(13),
+                credentials: AuthCredentials::None,
+            }),
+        ] {
+            let bytes = body.encode();
+            let decoded = RequestBody::decode(body.opcode(), &bytes).unwrap();
+            assert_eq!(decoded, body);
+        }
     }
 
     #[test]

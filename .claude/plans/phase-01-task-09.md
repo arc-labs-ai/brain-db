@@ -1,6 +1,6 @@
 # Plan: Phase 1 — Task 1.9, Handshake
 
-**Status:** awaiting-confirmation
+**Status:** approved (implemented)
 **Date:** 2026-05-10
 **Author:** Claude (autonomous)
 **Estimated commits:** 1

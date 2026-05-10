@@ -16,6 +16,7 @@
 pub mod crc;
 pub mod error;
 pub mod frame;
+pub mod handshake;
 pub mod header;
 pub mod opcode;
 pub mod request;

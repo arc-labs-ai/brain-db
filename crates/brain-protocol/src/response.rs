@@ -27,6 +27,7 @@
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::error::{ErrorCategory, ErrorCode, ProtocolError};
+use crate::handshake::{AuthOkPayload, WelcomePayload};
 use crate::opcode::Opcode;
 use crate::request::{EdgeKindWire, ForgetMode, MemoryKindWire, WireMemoryId, WireUuid};
 use crate::rkyv_codec::{from_rkyv_bytes, to_rkyv_bytes};
@@ -797,6 +798,10 @@ pub struct ErrorDetails {
 /// not part of the rkyv-encoded bytes this module produces.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResponseBody {
+    /// Spec §06 §3 — server reply to HELLO (connection-level, stream 0).
+    Welcome(WelcomePayload),
+    /// Spec §06 §5 — server confirmation of authentication.
+    AuthOk(AuthOkPayload),
     Encode(EncodeResponse),
     EncodeVectorDirect(EncodeResponse),
     Recall(RecallResponseFrame),
@@ -829,6 +834,8 @@ impl ResponseBody {
     #[must_use]
     pub fn opcode(&self) -> Opcode {
         match self {
+            Self::Welcome(_) => Opcode::Welcome,
+            Self::AuthOk(_) => Opcode::AuthOk,
             Self::Encode(_) => Opcode::EncodeResp,
             Self::EncodeVectorDirect(_) => Opcode::EncodeVectorDirectResp,
             Self::Recall(_) => Opcode::RecallResp,
@@ -878,6 +885,8 @@ impl ResponseBody {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         match self {
+            Self::Welcome(r) => to_rkyv_bytes(r),
+            Self::AuthOk(r) => to_rkyv_bytes(r),
             Self::Encode(r) | Self::EncodeVectorDirect(r) => to_rkyv_bytes(r),
             Self::Recall(r) => to_rkyv_bytes(r),
             Self::Plan(r) => to_rkyv_bytes(r),
@@ -910,6 +919,8 @@ impl ResponseBody {
     /// response body (request opcodes).
     pub fn decode(opcode: Opcode, bytes: &[u8]) -> Result<Self, ProtocolError> {
         Ok(match opcode {
+            Opcode::Welcome => Self::Welcome(from_rkyv_bytes(bytes)?),
+            Opcode::AuthOk => Self::AuthOk(from_rkyv_bytes(bytes)?),
             Opcode::EncodeResp => Self::Encode(from_rkyv_bytes(bytes)?),
             Opcode::EncodeVectorDirectResp => Self::EncodeVectorDirect(from_rkyv_bytes(bytes)?),
             Opcode::RecallResp => Self::Recall(from_rkyv_bytes(bytes)?),
@@ -1364,6 +1375,50 @@ mod tests {
         let garbage = vec![0xAAu8; 64];
         let err = ResponseBody::decode(Opcode::EncodeResp, &garbage).unwrap_err();
         assert!(matches!(err, ProtocolError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn handshake_response_bodies_round_trip() {
+        use crate::handshake::{
+            AgentPermissions, AuthMethod, AuthOkPayload, HelloCapabilities, ServerFeatures,
+            WelcomePayload,
+        };
+
+        let welcome = ResponseBody::Welcome(WelcomePayload {
+            server_id: "brain-server/0.5.0".into(),
+            chosen_version: 1,
+            session_id: sample_uuid(20),
+            capabilities: HelloCapabilities {
+                streaming: true,
+                compression_zstd: false,
+                server_push: false,
+            },
+            server_features: ServerFeatures {
+                max_payload_size: 16 * 1024 * 1024 - 1,
+                max_concurrent_streams: 1024,
+                idle_timeout_seconds: 300,
+                auth_methods: vec![AuthMethod::Token, AuthMethod::None],
+            },
+        });
+        let auth_ok = ResponseBody::AuthOk(AuthOkPayload {
+            agent_id: sample_uuid(21),
+            bound_shard_id: 5,
+            permissions: AgentPermissions {
+                can_encode: true,
+                can_recall: true,
+                can_plan: true,
+                can_reason: true,
+                can_forget: true,
+                can_admin: false,
+            },
+            server_time_unix_nanos: 1_700_000_000_000_000_000,
+        });
+
+        for body in [welcome, auth_ok] {
+            let bytes = body.encode();
+            let decoded = ResponseBody::decode(body.opcode(), &bytes).unwrap();
+            assert_eq!(decoded, body);
+        }
     }
 
     #[test]
