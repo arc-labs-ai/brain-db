@@ -27,12 +27,15 @@ if [[ ! -d "$skills_dir" ]]; then
     exit 0
 fi
 
-# Helper: extract a single-line value for `key:` from a YAML frontmatter block.
+# Helper: extract a single-line value for `key:` from the SKILL.md
+# frontmatter (the block between the *first* two `---` lines, not any
+# `---` separators that appear later in the body).
 # Returns empty string if not found.
 extract_scalar() {
     local file="$1" key="$2"
     awk -v key="$key" '
-        /^---$/ { in_fm = !in_fm; next }
+        NR == 1 && /^---$/ { in_fm = 1; next }
+        in_fm && /^---$/ { exit }
         in_fm && $0 ~ "^"key":[[:space:]]" {
             sub("^"key":[[:space:]]*", "")
             sub("[[:space:]]*$", "")
@@ -46,7 +49,8 @@ extract_scalar() {
 extract_spec_refs() {
     local file="$1"
     awk '
-        /^---$/ { in_fm = !in_fm; next }
+        NR == 1 && /^---$/ { in_fm = 1; next }
+        in_fm && /^---$/ { exit }
         in_fm && /^spec-refs:[[:space:]]*$/ { in_list = 1; next }
         in_fm && in_list && /^[[:space:]]*-[[:space:]]/ {
             sub(/^[[:space:]]*-[[:space:]]*/, "")
