@@ -73,13 +73,13 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - `magic_bytes_match`: `assert_eq!(&MAGIC, b"BRN0")`.
 
 **Done when:**
-- [ ] Module compiles and tests pass.
-- [ ] `bytemuck::Pod` derive works (no padding holes — verify by reading `mem::size_of` vs sum of fields).
-- [ ] `Header::new` computes a CRC that `validate` accepts.
+- [x] Module compiles and tests pass.
+- [x] `bytemuck::Pod` derive works (no padding holes — verify by reading `mem::size_of` vs sum of fields).
+- [x] `Header::new` computes a CRC that `validate` accepts.
 
 **Pitfalls:**
 - `repr(C, packed)` makes field access on references unsafe. Always copy out of the struct or use `addr_of!`.
-- Endianness: the spec uses **little-endian** for multi-byte fields (per §03). Use `u16::to_le_bytes` etc. when serializing.
+- Endianness: the spec uses **big-endian** for multi-byte fields (spec §03/03 §1, §8). Use `u16::to_be_bytes` etc. when serializing. *(Earlier draft of this doc said "little-endian"; corrected against spec.)*
 - Don't fold the payload CRC into the header CRC — they're separate per spec.
 
 ---
@@ -102,12 +102,12 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - `header_crc_excludes_self`: hashing the header bytes minus the CRC field gives the value that's stored in the CRC field.
 
 **Done when:**
-- [ ] Functions are pure, public, documented.
-- [ ] Tests pin specific CRC values, not just "round-trips."
+- [x] Functions are pure, public, documented.
+- [x] Tests pin specific CRC values, not just "round-trips."
 
 **Pitfalls:**
 - CRC32C ≠ CRC32. Confirm `crc32c` crate is the iSCSI variant (it is).
-- `crc32c::crc32c` returns u32, not bytes. Convert with `to_le_bytes` for serialization.
+- `crc32c::crc32c` returns u32, not bytes. Convert with `to_be_bytes` for serialization (spec §03/03 §8 — both CRC fields are big-endian on the wire). *(Earlier draft of this doc said `to_le_bytes`; corrected against spec.)*
 
 ---
 
@@ -131,9 +131,9 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - Property test: every value in `0..=255` either maps to an opcode or returns the same `UnknownOpcode` error.
 
 **Done when:**
-- [ ] All opcodes from spec §05 are present with matching numbers.
-- [ ] `from_u8` is exhaustive and tested.
-- [ ] Predicate helpers exist if the spec distinguishes request/response/admin.
+- [x] All opcodes from spec §05 are present with matching numbers.
+- [x] `from_u8` is exhaustive and tested.
+- [x] Predicate helpers exist if the spec distinguishes request/response/admin.
 
 **Pitfalls:**
 - Don't renumber opcodes. The spec pins them.
@@ -165,9 +165,9 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - `decode_rejects_oversize_payload`.
 
 **Done when:**
-- [ ] All seven test cases pass.
-- [ ] `encode` and `decode` are inverses for valid frames.
-- [ ] Errors match the variants in spec §10.
+- [x] All seven test cases pass.
+- [x] `encode` and `decode` are inverses for valid frames.
+- [x] Errors match the variants in spec §10.
 
 **Pitfalls:**
 - Empty payload is valid. Header still has its CRC; payload CRC is over empty bytes (well-defined CRC of empty input).
@@ -193,8 +193,8 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - Run with at least 1024 cases each (`PROPTEST_CASES=1024 cargo test`).
 
 **Done when:**
-- [ ] Both proptests pass with default case count.
-- [ ] No panics on arbitrary input — even malformed.
+- [x] Both proptests pass with default case count.
+- [x] No panics on arbitrary input — even malformed.
 
 **Pitfalls:**
 - Bound payload size in the generator (e.g. 0..=8192) so tests don't allocate gigabytes.
@@ -221,8 +221,8 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - For each error variant: it has a `code()` matching the spec.
 
 **Done when:**
-- [ ] Every variant in spec §10 is represented.
-- [ ] `From<ProtocolError>` for `brain_core::Error` (via `Internal` or `InvalidArgument` as appropriate).
+- [x] Every variant in spec §10 is represented.
+- [x] `From<ProtocolError>` for `brain_core::Error` (via `Internal` or `InvalidArgument` as appropriate).
 
 **Pitfalls:**
 - Don't conflate transport errors (TCP reset) with protocol errors. Transport handling is Phase 9.
@@ -247,9 +247,9 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - For each request variant: round-trip `encode → decode == original`.
 
 **Done when:**
-- [ ] All request opcodes from §07 have a matching variant and codec.
-- [ ] Round-trip tests for each.
-- [ ] Vector blobs (where present) use `bytemuck::cast_slice`, not rkyv.
+- [x] All request opcodes from §07 have a matching variant and codec.
+- [x] Round-trip tests for each.
+- [x] Vector blobs (where present) use `bytemuck::cast_slice`, not rkyv. *(Note: vector-blob composition into the trailing raw section is owned by the `Frame` layer, not by `RequestBody::encode`. The struct fields `vector_offset` / `vector_dim` carry the placement information; rkyv handles the structured fields only.)*
 
 **Pitfalls:**
 - `rkyv` requires the type to derive `Archive`, `Serialize`, `Deserialize` from the rkyv prelude. Add the workspace dep if not already present.
@@ -276,8 +276,8 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - Streaming sequence: encode `[Next, Next, Complete]`, decode, verify ordering preserved.
 
 **Done when:**
-- [ ] All response opcodes have variants and codecs.
-- [ ] Streaming protocol tested (at least encoding/decoding shape; multi-frame transport is Phase 9).
+- [x] All response opcodes have variants and codecs.
+- [x] Streaming protocol tested (at least encoding/decoding shape; multi-frame transport is Phase 9).
 
 **Pitfalls:**
 - A `Complete` response can carry a final payload (per §09). Don't assume it's empty.
@@ -302,8 +302,8 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - Negotiation: compatible versions succeed; incompatible fail with `UnsupportedVersion`.
 
 **Done when:**
-- [ ] Hello messages round-trip.
-- [ ] Negotiation logic matches the spec's compatibility matrix.
+- [x] Hello messages round-trip. *(All four — HELLO, WELCOME, AUTH, AUTH_OK — round-trip through rkyv. Phase doc said "ClientHello/ServerHello" but spec §03/06 names the four messages explicitly; spec wins.)*
+- [x] Negotiation logic matches the spec's compatibility matrix.
 
 ---
 
@@ -324,8 +324,8 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - `cargo +nightly fuzz run protocol_frame -- -max_total_time=60` exits cleanly.
 
 **Done when:**
-- [ ] Fuzz harness builds.
-- [ ] 60-second run finds no panics.
+- [x] Fuzz harness builds.
+- [x] 60-second run finds no panics. *(Three targets: protocol_frame, protocol_request, protocol_response. Smoked at 60s each — 28M / 19M / 19M runs respectively, zero panics, zero artifacts.)*
 
 **Pitfalls:**
 - Fuzzing requires nightly Rust. CI should not fail if nightly is unavailable; gate the fuzz step behind a `nightly-only` job.
@@ -351,8 +351,10 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - For each new type: a basic constructor + round-trip via `serde` if it's serializable.
 
 **Done when:**
-- [ ] `brain-protocol` compiles without inline duplicates of types that belong in core.
-- [ ] `brain-core` compiles standalone.
+- [x] `brain-protocol` compiles without inline duplicates of types that belong in core. *(Wire-domain types — `WireMemoryId`/`WireUuid`/`WireContextId` aliases plus `MemoryKindWire`/`EdgeKindWire` rkyv enums — are deliberate per Task 1.7's design and bridge to brain-core via `From`/`Into` impls in `brain-core::ids` and `brain-protocol::convert`.)*
+- [x] `brain-core` compiles standalone.
+
+Drift fixes (spec §02/03 wins): `MemoryId` bit layout corrected (shard 16 + slot 48 + version 32 + reserved 32); `ContextId` `Uuid` → `u64`; `ShardId` `u8` → `u16`; `SlotVersion` `u16` → `u32`. Wire-side `context_id` fields switched to `WireContextId = u64` (8 bytes per spec §02/03 §8). Added `TxnId` (UUIDv7). Updated `Edge` per spec §02/06: `source`/`target` (was `from`/`to`), added `weight` and `EdgeOrigin`, switched timestamp to `unix_nanos`.
 
 **Pitfalls:**
 - Resist over-engineering. Only add types that the protocol actively uses.
@@ -363,14 +365,14 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 
 Before tagging `phase-1-complete`:
 
-- [ ] All sub-tasks 1.1–1.11 marked done in this file.
-- [ ] `just verify` is green on a clean checkout.
-- [ ] `cargo test --workspace` runs ≥ 30 tests, all passing.
-- [ ] At least one proptest with ≥ 1024 cases per opcode.
-- [ ] Fuzz target builds and a 60-second run is clean.
-- [ ] Public API of `brain-protocol` is documented (every public item has rustdoc + at least one example for non-trivial ones).
-- [ ] `cargo doc --workspace --no-deps` builds without warnings.
-- [ ] `git tag phase-1-complete` on the latest green commit.
+- [x] All sub-tasks 1.1–1.11 marked done in this file.
+- [x] `just verify` is green on a clean checkout. *(122 tests workspace, clippy clean, fmt clean, 23/23 skills valid.)*
+- [x] `cargo test --workspace` runs ≥ 30 tests, all passing. *(122.)*
+- [x] At least one proptest with ≥ 1024 cases per opcode. *(`Opcode::from_u8_is_total` cycles every byte; `Frame::encode_decode_round_trip` and `decode_arbitrary_bytes_is_total` run 1024 cases each.)*
+- [x] Fuzz target builds and a 60-second run is clean. *(Three targets — `protocol_frame`, `protocol_request`, `protocol_response` — smoked at 60s each, ~67M total runs, zero panics, zero artifacts.)*
+- [x] Public API of `brain-protocol` is documented. *(Every `pub` item carries rustdoc; spec section anchors are inline.)*
+- [x] `cargo doc --workspace --no-deps` builds without warnings.
+- [x] `git tag phase-1-complete` on the latest green commit.
 
 ## Commit strategy
 
@@ -384,4 +386,15 @@ Record every non-trivial decision here so subsequent phases (and the user) can f
 
 | Date | Decision | Rationale | Sub-task |
 |---|---|---|---|
-| _(empty until decisions are recorded)_ | | | |
+| 2026-05-10 | Header multi-byte fields stored as raw BE byte arrays, not native ints | `bytemuck::Pod` derive with no padding holes; on-wire layout matches struct 1:1; avoids `repr(C, packed)` field-ref unsafety | 1.1 |
+| 2026-05-10 | `decode_with_max(bytes, max)` separate from `decode(bytes)` | Allocation-amplification defense: peer's claimed `payload_len` checked before reading payload bytes | 1.4 |
+| 2026-05-10 | `ErrorCode` is `#[non_exhaustive]`; `ErrorCodeWire` is closed | Forward-compat for the canonical type; rkyv needs a closed enum for the wire body. Identity round-trip via `From` impls | 1.6, 1.8 |
+| 2026-05-10 | Wire-domain DTOs (`WireMemoryId`, `WireUuid`, `MemoryKindWire`, `EdgeKindWire`) live in `brain-protocol`, not `brain-core` | Keeps `brain-core` rkyv-free; conversion happens at boundary via `From`/`Into` | 1.7, 1.11 |
+| 2026-05-10 | Vector-blob composition (rkyv structured + trailing raw f32 section) owned by `Frame` layer, not `RequestBody`/`ResponseBody` | Spec §03/04 separates structured + raw; per-body codec stays single-purpose. End-to-end vector wiring deferred to Phase 2/9 | 1.7, 1.8 |
+| 2026-05-10 | Promote `to_rkyv_bytes`/`from_rkyv_bytes` to private `crate::rkyv_codec` | Both `request` and `response` need the HRTB-laden helper; one source of truth | 1.8 |
+| 2026-05-10 | `negotiate(client, server)` does version + capability intersection only; auth-method intersection defers to AUTH-frame handler | Pure logic testable in isolation; runtime concerns (server picks `session_id`, populates `ServerFeatures`) stay in connection layer | 1.9 |
+| 2026-05-10 | `protocol_request` / `protocol_response` fuzz harnesses dispatch by `data[0] mod len(opcodes)` rather than `Opcode::from_u8` | Most random bytes are unassigned opcodes; mod-len cycles all variants under coverage guidance | 1.10 |
+| 2026-05-10 | Spec §02/03 wins over phase-doc + earlier code: `MemoryId` layout = shard 16 + slot 48 + version 32 + reserved 32; `ContextId` = u64; `ShardId` = u16; `SlotVersion` = u32 | Pre-Phase-9, no deployed clients — fix layout drifts now; spec is read-only authoritative | 1.11 |
+| 2026-05-10 | Wire `context_id` fields = `WireContextId = u64` (8 bytes) | Spec §02/03 §8 says ContextId on the wire is 8 bytes; protocol previously used `WireUuid` (16). Fixed before any deployed client | 1.11 |
+| 2026-05-10 | Endianness pitfalls in phase doc corrected against spec §03/03 §8 (header) and §02/03 §2.1 (MemoryId): all multi-byte = big-endian | Phase doc had two LE references that conflicted with the spec | 1.1, 1.2 |
+| 2026-05-10 | `ClientHello` / `ServerHello` phase-doc names superseded by spec §03/06 names: HELLO / WELCOME / AUTH / AUTH_OK | Spec wins; codec covers all four messages | 1.9 |

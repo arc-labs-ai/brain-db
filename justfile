@@ -36,8 +36,12 @@ fmt-check:
 fmt:
     cargo fmt --all
 
+# Validate .claude/skills/ frontmatter and references.
+check-skills:
+    @./scripts/check-skills.sh
+
 # The full verification suite — what CI runs.
-verify: fmt-check build clippy test
+verify: fmt-check build clippy test check-skills
 
 # Auto-fix what's fixable.
 fix:

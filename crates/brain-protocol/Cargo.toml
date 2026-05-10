@@ -12,6 +12,8 @@ brain-core = { path = "../brain-core" }
 crc32c.workspace = true
 thiserror.workspace = true
 bytemuck.workspace = true
+rkyv.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

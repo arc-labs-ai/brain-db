@@ -18,5 +18,19 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "protocol_request"
+path = "fuzz_targets/protocol_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_response"
+path = "fuzz_targets/protocol_response.rs"
+test = false
+doc = false
+bench = false
+
 # Fuzz targets are built outside the workspace.
 [workspace]
