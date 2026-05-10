@@ -13,6 +13,7 @@
 )]
 #![forbid(unsafe_code)]
 
+pub mod convert;
 pub mod crc;
 pub mod error;
 pub mod frame;

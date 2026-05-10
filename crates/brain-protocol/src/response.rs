@@ -29,7 +29,9 @@ use rkyv::{Archive, Deserialize, Serialize};
 use crate::error::{ErrorCategory, ErrorCode, ProtocolError};
 use crate::handshake::{AuthOkPayload, WelcomePayload};
 use crate::opcode::Opcode;
-use crate::request::{EdgeKindWire, ForgetMode, MemoryKindWire, WireMemoryId, WireUuid};
+use crate::request::{
+    EdgeKindWire, ForgetMode, MemoryKindWire, WireContextId, WireMemoryId, WireUuid,
+};
 use crate::rkyv_codec::{from_rkyv_bytes, to_rkyv_bytes};
 
 // ---------------------------------------------------------------------------
@@ -419,7 +421,7 @@ pub struct MemoryResult {
     pub confidence: f32,
     pub salience: f32,
     pub kind: MemoryKindWire,
-    pub context_id: WireUuid,
+    pub context_id: WireContextId,
     pub created_at_unix_nanos: u64,
     pub last_accessed_at_unix_nanos: u64,
     pub vector_offset: u32,
@@ -500,7 +502,7 @@ pub struct ForgetResponse {
 pub struct SubscriptionEvent {
     pub event_type: EventType,
     pub memory_id: WireMemoryId,
-    pub context_id: WireUuid,
+    pub context_id: WireContextId,
     pub text: String,
     pub kind: MemoryKindWire,
     pub salience: f32,
@@ -628,7 +630,7 @@ pub struct SalienceHistogram {
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub struct ContextStats {
-    pub context_id: WireUuid,
+    pub context_id: WireContextId,
     pub name: String,
     pub memory_count: u64,
     pub last_encoded_at_unix_nanos: u64,
@@ -710,7 +712,7 @@ pub struct MigrationProgress {
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub struct AdminCreateContextResponse {
-    pub context_id: WireUuid,
+    pub context_id: WireContextId,
     pub name: String,
 }
 
@@ -719,7 +721,7 @@ pub struct AdminCreateContextResponse {
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub struct AdminRenameContextResponse {
-    pub context_id: WireUuid,
+    pub context_id: WireContextId,
     pub new_name: String,
     pub old_name: String,
 }
@@ -730,8 +732,8 @@ pub struct AdminRenameContextResponse {
 #[archive_attr(derive(Debug))]
 pub struct AdminMoveMemoryResponse {
     pub memory_id: WireMemoryId,
-    pub new_context_id: WireUuid,
-    pub old_context_id: WireUuid,
+    pub new_context_id: WireContextId,
+    pub old_context_id: WireContextId,
 }
 
 /// Spec §08 §23.
@@ -1006,7 +1008,7 @@ mod tests {
                 confidence: 0.85,
                 salience: 0.5,
                 kind: MemoryKindWire::Episodic,
-                context_id: sample_uuid(1),
+                context_id: 1_u64,
                 created_at_unix_nanos: 1_700_000_000_000_000_000,
                 last_accessed_at_unix_nanos: 1_700_000_001_000_000_000,
                 vector_offset: 0,
@@ -1087,7 +1089,7 @@ mod tests {
         round_trip(ResponseBody::SubscribeEvent(SubscriptionEvent {
             event_type: EventType::Encoded,
             memory_id: sample_memory_id(),
-            context_id: sample_uuid(2),
+            context_id: 2_u64,
             text: "new memory".into(),
             kind: MemoryKindWire::Episodic,
             salience: 0.5,
@@ -1166,7 +1168,7 @@ mod tests {
                 arena_used_bytes: 1024 * 1024,
             }]),
             per_context: Some(vec![ContextStats {
-                context_id: sample_uuid(4),
+                context_id: 4_u64,
                 name: "default".into(),
                 memory_count: 100,
                 last_encoded_at_unix_nanos: 1,
@@ -1232,21 +1234,21 @@ mod tests {
         ));
         round_trip(ResponseBody::AdminCreateContext(
             AdminCreateContextResponse {
-                context_id: sample_uuid(6),
+                context_id: 6_u64,
                 name: "personal".into(),
             },
         ));
         round_trip(ResponseBody::AdminRenameContext(
             AdminRenameContextResponse {
-                context_id: sample_uuid(7),
+                context_id: 7_u64,
                 new_name: "renamed".into(),
                 old_name: "original".into(),
             },
         ));
         round_trip(ResponseBody::AdminMoveMemory(AdminMoveMemoryResponse {
             memory_id: sample_memory_id(),
-            new_context_id: sample_uuid(8),
-            old_context_id: sample_uuid(9),
+            new_context_id: 8_u64,
+            old_context_id: 9_u64,
         }));
         round_trip(ResponseBody::AdminReclassify(AdminReclassifyResponse {
             memory_id: sample_memory_id(),
@@ -1351,7 +1353,7 @@ mod tests {
             ResponseBody::SubscribeEvent(SubscriptionEvent {
                 event_type: EventType::Encoded,
                 memory_id: 0,
-                context_id: [0; 16],
+                context_id: 0,
                 text: String::new(),
                 kind: MemoryKindWire::Episodic,
                 salience: 0.0,

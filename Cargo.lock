@@ -136,6 +136,7 @@ dependencies = [
  "proptest",
  "rkyv",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]

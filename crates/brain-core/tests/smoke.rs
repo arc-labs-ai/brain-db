@@ -4,17 +4,21 @@
 //! test that the public surface is reachable and behaves sanely.
 
 use brain_core::{
-    AgentId, ContextId, Edge, EdgeKind, Error, Memory, MemoryId, MemoryKind, RequestId, Salience,
+    AgentId, ContextId, Edge, EdgeKind, EdgeOrigin, Error, Memory, MemoryId, MemoryKind, RequestId,
+    Salience, TxnId,
 };
 
 #[test]
 fn public_types_construct() {
     let _ = AgentId::new();
-    let _ = ContextId::new();
+    let _ = ContextId::DEFAULT;
+    let _ = ContextId(42);
     let _ = RequestId::new();
+    let _ = TxnId::new();
     let _ = Salience::new(0.7);
     let _ = MemoryKind::Episodic;
     let _ = EdgeKind::Caused;
+    let _ = EdgeOrigin::Explicit;
 }
 
 #[test]
@@ -30,7 +34,7 @@ fn memory_can_be_constructed() {
     let m = Memory {
         id: MemoryId::pack(0, 1, 0),
         agent: AgentId::new(),
-        context: ContextId::new(),
+        context: ContextId(0),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),
         text: Some("hello".into()),
@@ -44,13 +48,15 @@ fn memory_can_be_constructed() {
 #[test]
 fn edges_carry_kind_and_endpoints() {
     let e = Edge {
-        from: MemoryId::pack(0, 1, 0),
-        to: MemoryId::pack(0, 2, 0),
+        source: MemoryId::pack(0, 1, 0),
+        target: MemoryId::pack(0, 2, 0),
         kind: EdgeKind::FollowedBy,
-        created_at_unix_ms: 0,
+        weight: 1.0,
+        origin: EdgeOrigin::Explicit,
+        created_at_unix_nanos: 0,
     };
     assert_eq!(e.kind, EdgeKind::FollowedBy);
-    assert_ne!(e.from, e.to);
+    assert_ne!(e.source, e.target);
 }
 
 #[test]

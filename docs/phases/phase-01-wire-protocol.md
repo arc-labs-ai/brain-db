@@ -351,8 +351,10 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - For each new type: a basic constructor + round-trip via `serde` if it's serializable.
 
 **Done when:**
-- [ ] `brain-protocol` compiles without inline duplicates of types that belong in core.
-- [ ] `brain-core` compiles standalone.
+- [x] `brain-protocol` compiles without inline duplicates of types that belong in core. *(Wire-domain types — `WireMemoryId`/`WireUuid`/`WireContextId` aliases plus `MemoryKindWire`/`EdgeKindWire` rkyv enums — are deliberate per Task 1.7's design and bridge to brain-core via `From`/`Into` impls in `brain-core::ids` and `brain-protocol::convert`.)*
+- [x] `brain-core` compiles standalone.
+
+Drift fixes (spec §02/03 wins): `MemoryId` bit layout corrected (shard 16 + slot 48 + version 32 + reserved 32); `ContextId` `Uuid` → `u64`; `ShardId` `u8` → `u16`; `SlotVersion` `u16` → `u32`. Wire-side `context_id` fields switched to `WireContextId = u64` (8 bytes per spec §02/03 §8). Added `TxnId` (UUIDv7). Updated `Edge` per spec §02/06: `source`/`target` (was `from`/`to`), added `weight` and `EdgeOrigin`, switched timestamp to `unix_nanos`.
 
 **Pitfalls:**
 - Resist over-engineering. Only add types that the protocol actively uses.

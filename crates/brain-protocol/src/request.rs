@@ -28,12 +28,15 @@ use crate::rkyv_codec::{from_rkyv_bytes, to_rkyv_bytes};
 // Helper aliases for spec-domain primitive types as carried on the wire.
 // ---------------------------------------------------------------------------
 
-/// 16-byte UUID-shaped identifier (`AgentId`, `ContextId`, `RequestId`,
-/// `TxnId`). Matches the on-the-wire byte layout described in spec §07.
+/// 16-byte UUID-shaped identifier (`AgentId`, `RequestId`, `TxnId`).
+/// Matches the on-the-wire byte layout described in spec §07.
 pub type WireUuid = [u8; 16];
 
-/// Packed `MemoryId` per spec §02/03 (4 bytes shard / 56 bits slot /
-/// 16 bits version / 48 bits reserved, all rolled into a `u128`).
+/// Wire-side `ContextId` (spec §02/03 §4 + §8 — 8 bytes / `u64`).
+pub type WireContextId = u64;
+
+/// Packed `MemoryId` per spec §02/03 §2.1 (shard 16 + slot 48 +
+/// version 32 + reserved 32, all rolled into a `u128`).
 pub type WireMemoryId = u128;
 
 // ---------------------------------------------------------------------------
@@ -165,7 +168,7 @@ pub enum CheckScope {
 #[archive_attr(derive(Debug))]
 pub struct EncodeRequest {
     pub text: String,
-    pub context_id: WireUuid,
+    pub context_id: WireContextId,
     pub kind: MemoryKindWire,
     pub salience_hint: f32,
     pub edges: Vec<EdgeRequest>,
@@ -193,7 +196,7 @@ pub struct EncodeVectorDirectRequest {
     pub vector_offset: u32,
     pub vector_dim: u16,
     pub model_fingerprint: [u8; 16],
-    pub context_id: WireUuid,
+    pub context_id: WireContextId,
     pub kind: MemoryKindWire,
     pub salience_hint: f32,
     pub edges: Vec<EdgeRequest>,
@@ -211,7 +214,7 @@ pub struct RecallRequest {
     pub cue_vector_dim: u16,
     pub top_k: u32,
     pub confidence_threshold: f32,
-    pub context_filter: Option<Vec<WireUuid>>,
+    pub context_filter: Option<Vec<WireContextId>>,
     pub age_bound_unix_nanos: Option<u64>,
     pub kind_filter: Option<Vec<MemoryKindWire>>,
     pub salience_floor: f32,
@@ -230,7 +233,7 @@ pub struct PlanRequest {
     pub goal: PlanState,
     pub budget: PlanBudget,
     pub strategy_hint: Option<PlanStrategy>,
-    pub context_filter: Option<Vec<WireUuid>>,
+    pub context_filter: Option<Vec<WireContextId>>,
     pub request_id: Option<WireUuid>,
 }
 
@@ -252,7 +255,7 @@ pub struct ReasonRequest {
     pub observation: ObservationInput,
     pub depth: u32,
     pub confidence_threshold: f32,
-    pub context_filter: Option<Vec<WireUuid>>,
+    pub context_filter: Option<Vec<WireContextId>>,
     pub max_inferences: u32,
     pub budget_wall_time_ms: u32,
     pub request_id: Option<WireUuid>,
@@ -285,7 +288,7 @@ pub struct SubscribeRequest {
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub struct SubscriptionFilter {
-    pub contexts: Option<Vec<WireUuid>>,
+    pub contexts: Option<Vec<WireContextId>>,
     pub kinds: Option<Vec<MemoryKindWire>>,
     pub similar_to: Option<SimilarityFilter>,
 }
@@ -439,7 +442,7 @@ pub struct AdminCreateContextRequest {
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub struct AdminRenameContextRequest {
-    pub context_id: WireUuid,
+    pub context_id: WireContextId,
     pub new_name: String,
 }
 
@@ -449,7 +452,7 @@ pub struct AdminRenameContextRequest {
 #[archive_attr(derive(Debug))]
 pub struct AdminMoveMemoryRequest {
     pub memory_id: WireMemoryId,
-    pub new_context_id: WireUuid,
+    pub new_context_id: WireContextId,
 }
 
 /// Spec §07/24.
@@ -466,7 +469,7 @@ pub struct AdminReclassifyRequest {
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub struct AdminListTombstonedRequest {
-    pub context_id: Option<WireUuid>,
+    pub context_id: Option<WireContextId>,
     pub max_age_seconds: u32,
     pub limit: u32,
 }
@@ -656,7 +659,7 @@ mod tests {
     fn encode_round_trips() {
         round_trip(RequestBody::Encode(EncodeRequest {
             text: "hello brain".into(),
-            context_id: sample_uuid(1),
+            context_id: 1_u64,
             kind: MemoryKindWire::Episodic,
             salience_hint: 0.25,
             edges: vec![EdgeRequest {
@@ -677,7 +680,7 @@ mod tests {
             vector_offset: 200,
             vector_dim: 384,
             model_fingerprint: sample_uuid(4),
-            context_id: sample_uuid(5),
+            context_id: 5_u64,
             kind: MemoryKindWire::Semantic,
             salience_hint: 0.5,
             edges: vec![],
@@ -694,7 +697,7 @@ mod tests {
             cue_vector_dim: 0,
             top_k: 10,
             confidence_threshold: 0.3,
-            context_filter: Some(vec![sample_uuid(1), sample_uuid(2)]),
+            context_filter: Some(vec![1_u64, 2_u64]),
             age_bound_unix_nanos: Some(1_700_000_000_000_000_000),
             kind_filter: Some(vec![MemoryKindWire::Episodic, MemoryKindWire::Semantic]),
             salience_floor: 0.1,
@@ -764,7 +767,7 @@ mod tests {
     fn subscribe_round_trips() {
         round_trip(RequestBody::Subscribe(SubscribeRequest {
             filter: SubscriptionFilter {
-                contexts: Some(vec![sample_uuid(9)]),
+                contexts: Some(vec![9_u64]),
                 kinds: None,
                 similar_to: Some(SimilarityFilter {
                     reference_memory_id: sample_memory_id(),
@@ -868,12 +871,12 @@ mod tests {
             request_id: sample_uuid(14),
         }));
         round_trip(RequestBody::AdminRenameContext(AdminRenameContextRequest {
-            context_id: sample_uuid(15),
+            context_id: 15_u64,
             new_name: "renamed".into(),
         }));
         round_trip(RequestBody::AdminMoveMemory(AdminMoveMemoryRequest {
             memory_id: sample_memory_id(),
-            new_context_id: sample_uuid(16),
+            new_context_id: 16_u64,
         }));
         round_trip(RequestBody::AdminReclassify(AdminReclassifyRequest {
             memory_id: sample_memory_id(),
@@ -881,7 +884,7 @@ mod tests {
         }));
         round_trip(RequestBody::AdminListTombstoned(
             AdminListTombstonedRequest {
-                context_id: Some(sample_uuid(17)),
+                context_id: Some(17_u64),
                 max_age_seconds: 3600,
                 limit: 100,
             },

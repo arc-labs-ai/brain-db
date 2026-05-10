@@ -18,7 +18,9 @@ pub mod error;
 pub mod ids;
 pub mod memory;
 
-pub use edge::{Edge, EdgeKind};
+pub use edge::{Edge, EdgeKind, EdgeOrigin};
 pub use error::{Error, Result};
-pub use ids::{AgentId, ContextId, MemoryId, RequestId, ShardId, SlotIndex, SlotVersion};
+pub use ids::{
+    AgentId, ContextId, MemoryId, RequestId, ShardId, SlotIndex, SlotVersion, TxnId, MAX_SLOT_INDEX,
+};
 pub use memory::{Memory, MemoryKind, Salience};
