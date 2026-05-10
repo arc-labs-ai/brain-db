@@ -1,0 +1,12 @@
+[package]
+name = "brain-ops"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cognitive operations: encode, recall, plan, reason, forget."
+
+[dependencies]
+brain-core = { path = "../brain-core" }
+thiserror.workspace = true

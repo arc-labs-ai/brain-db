@@ -1,0 +1,52 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code local overrides (don't commit personal settings)
+.claude/settings.local.json
+.claude/.session-state/
+
+# Brain runtime data
+/data/
+/snapshots/
+*.wal
+*.arena
+*.redb
+
+# Benchmarks
+/criterion/
+/perf.data
+/perf.data.old
+/flamegraph.svg
+
+# Profiling
+/profile.pb
+
+# Logs
+*.log
+/logs/
+
+# Fuzz
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+
+# Build artifacts
+*.tar.gz
+*.zip
+
+# Editor temp files
+.envrc

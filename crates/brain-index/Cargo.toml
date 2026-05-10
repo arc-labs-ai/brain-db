@@ -1,0 +1,12 @@
+[package]
+name = "brain-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ANN (HNSW) index integration for Brain."
+
+[dependencies]
+brain-core = { path = "../brain-core" }
+thiserror.workspace = true

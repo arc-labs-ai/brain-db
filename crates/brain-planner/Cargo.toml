@@ -1,0 +1,12 @@
+[package]
+name = "brain-planner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Query planner and executor for Brain."
+
+[dependencies]
+brain-core = { path = "../brain-core" }
+thiserror.workspace = true

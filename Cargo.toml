@@ -1,0 +1,101 @@
+# Workspace root for the Brain cognitive substrate.
+#
+# Individual crates live under crates/. Add new members both here and in
+# the relevant CLAUDE.md / ROADMAP.md sections.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/brain-core",
+    "crates/brain-protocol",
+    "crates/brain-storage",
+    "crates/brain-metadata",
+    "crates/brain-index",
+    "crates/brain-embed",
+    "crates/brain-planner",
+    "crates/brain-ops",
+    "crates/brain-workers",
+    "crates/brain-server",
+    "crates/brain-sdk-rust",
+    "crates/brain-cli",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "TBD"
+repository = "https://github.com/<org>/brain"
+
+# Centralize dependency versions here. Crates inherit with `dep.workspace = true`.
+[workspace.dependencies]
+# Async / runtime
+glommio = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal"] }
+
+# Serialization
+rkyv = { version = "0.7", features = ["validation"] }
+bytemuck = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Storage / indexing
+redb = "2"
+hnsw_rs = "0.3"
+
+# Embeddings (pure-Rust)
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+tokenizers = "0.21"
+
+# Math / SIMD
+matrixmultiply = "0.3"
+wide = "0.7"
+
+# Concurrency primitives
+arc-swap = "1"
+crossbeam-epoch = "0.9"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+# Hashing / IDs
+blake3 = "1"
+crc32c = "0.6"
+uuid = { version = "1.7", features = ["v7", "serde"] }
+
+# Errors
+thiserror = "1"
+anyhow = "1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+opentelemetry = "0.24"
+
+# Time
+time = { version = "0.3", features = ["serde", "formatting"] }
+
+# Testing
+proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+debug = 1          # keep symbols for profiling
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+debug = 1
+lto = "thin"
+codegen-units = 1

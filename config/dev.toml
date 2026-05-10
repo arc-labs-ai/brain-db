@@ -1,0 +1,55 @@
+# Brain — development configuration.
+# This file is read by `brain-server --config config/dev.toml`.
+# Schema is defined in spec/01_system_architecture/.
+
+[server]
+listen_addr = "127.0.0.1:9090"
+metrics_addr = "127.0.0.1:9091"
+admin_addr = "127.0.0.1:9092"
+
+[storage]
+data_dir = "./data"
+shard_count = 4
+
+[shard]
+arena_capacity_bytes = "1GiB"
+wal_segment_size_bytes = "256MiB"
+wal_retention_segments = 4
+
+[hnsw]
+m = 16
+ef_construction = 200
+ef_search = 64
+
+[embedder]
+model = "bge-small-en-v1.5"
+cache_size = 10000
+batch_size = 32
+batch_window_ms = 5
+
+[workers]
+decay_interval_sec = 3600
+consolidation_interval_sec = 600
+hnsw_maintenance_interval_sec = 1800
+idempotency_cleanup_interval_sec = 3600
+slot_reclamation_interval_sec = 3600
+wal_retention_interval_sec = 600
+edge_scrub_interval_sec = 86400
+counter_reconciliation_interval_sec = 86400
+statistics_update_interval_sec = 60
+embedder_cache_eviction_interval_sec = 300
+snapshot_interval_sec = 21600
+
+[logging]
+level = "info"
+output = "stdout"
+format = "json"
+
+[tracing]
+enabled = false
+sampler = "ratio"
+sample_ratio = 0.01
+
+[auth]
+# Dev mode: no auth. Set this for production.
+mode = "none"

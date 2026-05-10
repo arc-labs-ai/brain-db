@@ -1,0 +1,29 @@
+[package]
+name = "brain-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Brain cognitive substrate server."
+
+[[bin]]
+name = "brain-server"
+path = "src/main.rs"
+
+[dependencies]
+brain-core = { path = "../brain-core" }
+brain-protocol = { path = "../brain-protocol" }
+brain-storage = { path = "../brain-storage" }
+brain-metadata = { path = "../brain-metadata" }
+brain-index = { path = "../brain-index" }
+brain-embed = { path = "../brain-embed" }
+brain-planner = { path = "../brain-planner" }
+brain-ops = { path = "../brain-ops" }
+brain-workers = { path = "../brain-workers" }
+
+anyhow.workspace = true
+serde.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
