@@ -324,8 +324,8 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - `cargo +nightly fuzz run protocol_frame -- -max_total_time=60` exits cleanly.
 
 **Done when:**
-- [ ] Fuzz harness builds.
-- [ ] 60-second run finds no panics.
+- [x] Fuzz harness builds.
+- [x] 60-second run finds no panics. *(Three targets: protocol_frame, protocol_request, protocol_response. Smoked at 60s each — 28M / 19M / 19M runs respectively, zero panics, zero artifacts.)*
 
 **Pitfalls:**
 - Fuzzing requires nightly Rust. CI should not fail if nightly is unavailable; gate the fuzz step behind a `nightly-only` job.
