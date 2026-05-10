@@ -37,6 +37,14 @@ compile_error!(
      Build inside the dev container — see README.md \"Development environment\"."
 );
 
+#[cfg(not(target_endian = "little"))]
+compile_error!(
+    "brain-storage requires a little-endian target. Storage on disk is LE \
+     (spec §05/02 §2); we rely on native-order memory access through \
+     bytemuck::Pod, which would silently produce wrong files on a BE host."
+);
+
+pub mod arena;
 pub mod wal;
 
 /// Slot size in bytes, per `spec/05_storage_arena_wal/02_arena_layout.md`.

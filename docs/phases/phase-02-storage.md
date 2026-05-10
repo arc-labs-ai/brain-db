@@ -71,27 +71,26 @@ Implement the durable storage layer: a memory-mapped vector arena, a write-ahead
 
 ---
 
-### Task 2.3 — Arena slot byte layout
+### Task 2.3 — Arena slot byte layout ✅
 
 **Reads:** `spec/05_storage_arena_wal/02_arena_layout.md`
 
-**Writes:** `crates/brain-storage/src/arena/slot.rs`
+**Writes:** `crates/brain-storage/src/arena/slot.rs` (and `arena/mod.rs`)
 
-**What to build:**
-- `#[repr(C)] struct Slot { vector: [f32; 384], metadata: SlotMeta, padding: [u8; N], crc: u32 }` — exact layout per spec, total 1600 bytes, 64-byte aligned.
-- (Or 1536 if dimensions differ — confirm with spec; current default is 384 for BGE-small.)
-- `SlotMeta` carries: agent_id (16B), context_id (16B), kind (1B), salience (4B), flags (1B), reserved bytes.
-- `Slot::compute_crc(&self) -> u32` — CRC over all bytes except the CRC field.
-- `Slot::is_valid(&self) -> bool`.
+**What was built** (corrected against spec §05/02 §3.2 — the original sketch in this phase doc named the wrong fields):
+- `#[repr(C, align(64))] struct Slot { vector: [f32; 384], metadata: SlotMeta }` — exactly 1600 bytes, 64-byte aligned, no implicit padding.
+- `SlotMeta` (64 bytes, `#[repr(C)]`) carries the spec's bookkeeping: `slot_version`, `flags`, `embedding_model_fp_short`, `created_at_unix_nanos`, `last_modified_at_unix_nanos`, `metadata_crc32c`, and a 20-byte reserved tail. **Agent/context/kind/salience are NOT in the slot — those live in the metadata store (redb), not the arena.**
+- `metadata_crc32c` lives *inside* SlotMeta at metadata-offset 40 (slot-offset 1576), not as a trailing field on the slot. CRC covers `vector || metadata[0..40]`. (Spec §3.2's literal "[0..36]" splits `last_modified_at` mid-field; we treat that as a typo and cover `[0..40]`. See `.claude/plans/phase-02-task-03.md` §3.1.)
+- `Slot::compute_crc / refresh_crc / is_valid` plus flag accessors (`is_occupied`, `is_tombstoned`, `is_pending_write`, `is_hard_forgotten`, `set_flag`).
 
 **Done when:**
-- [ ] `assert_eq!(size_of::<Slot>(), SLOT_SIZE_BYTES)`.
-- [ ] `align_of::<Slot>() == 64`.
-- [ ] CRC verifies for a roundtripped slot.
+- [x] `assert_eq!(size_of::<Slot>(), SLOT_SIZE_BYTES)` — checked at compile time and runtime.
+- [x] `align_of::<Slot>() == 64` — checked at compile time and runtime.
+- [x] CRC verifies for a roundtripped slot — plus corruption tests for vector and covered metadata, stability tests for uncovered metadata, and a property test sweeping the uncovered region.
 
 **Pitfalls:**
-- Padding must be explicit (named field) to satisfy `bytemuck::Pod`. No implicit holes.
-- Check the vector dimension against the spec: BGE-small is 384, but the slot is sized for forward-compatibility with larger models. If dim < 384·4 = 1536, the rest is reserved.
+- Padding must be explicit (named field) to satisfy `bytemuck::Pod`. No implicit holes. Verified by `const _: () = { assert!(size_of::<...>() == ...); assert!(offset_of!(...) == ...); };` static blocks.
+- Vector dimension is 384 (BGE-small) for v1; vector occupies bytes 0..1536. The slot is *not* oversized for larger models — the v1 file format pins 1600 bytes per spec §05/02 §3.
 
 ---
 
