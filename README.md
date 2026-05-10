@@ -151,30 +151,94 @@ In autonomous mode, Claude executes the loop in [`AUTONOMY.md`](AUTONOMY.md) §1
 
 The pre-tool-use hooks in `.claude/hooks/` provide a safety net: even with permissions skipped, Claude cannot `rm -rf /`, `git push --force`, `cargo publish`, edit files in `spec/`, or run `sudo`. Edit the hooks to adjust.
 
-## Building and testing
+## Development environment
 
 **Linux x86_64 / aarch64, kernel ≥ 5.15.** Brain depends on `io_uring`, `O_DIRECT`, `pwritev2(RWF_DSYNC)`, and a few Linux-only `madvise` / `fallocate` flags — see `spec/01_system_architecture/05_hardware.md` §1.1 for why we chose a single-platform backend over portable shims.
 
-| Crate | Linux | macOS / Windows |
-|---|---|---|
-| `brain-core`, `brain-protocol`, `brain-cli`, `brain-sdk-rust` | ✓ build + test | ✓ build + test (no I/O / runtime) |
-| `brain-storage`, `brain-server`, `brain-workers`, `brain-index` (post-persist), `brain-embed` (post-wiring) | ✓ build + test | ✗ `compile_error!` — use a Linux container |
+### What compiles where
 
-For non-Linux dev hosts, **see [`DEV_SETUP.md`](DEV_SETUP.md)** for Docker / OrbStack / Colima / Lima / cross-compile recipes. CI (`.github/workflows/ci.yml`) runs everything on `ubuntu-latest` and is the authoritative test gate.
+| Crate | Linux | macOS / Windows native |
+|---|---|---|
+| `brain-core` | ✓ | ✓ (pure value types) |
+| `brain-protocol` | ✓ | ✓ (codec only) |
+| `brain-cli` | ✓ | ✓ (no runtime dep yet) |
+| `brain-sdk-rust` | ✓ | ✓ (client-side) |
+| `brain-storage` | ✓ | ✗ — `compile_error!` |
+| `brain-metadata` | ✓ | ✗ once redb is wired with `O_DIRECT`-aware paths (Phase 3) |
+| `brain-index` | ✓ | ✗ once HNSW persistence lands (Phase 4) |
+| `brain-embed` | ✓ | ✗ once candle wiring lands (Phase 5) |
+| `brain-planner` | ✓ | ✓ (pure logic) |
+| `brain-ops` | ✓ | △ partial — wires runtime crates |
+| `brain-workers` | ✓ | ✗ — runs on Glommio |
+| `brain-server` | ✓ | ✗ — Glommio + Tokio runtime |
+
+CI (`.github/workflows/ci.yml`) runs everything on `ubuntu-latest` and is the authoritative test gate.
+
+### Native Linux
 
 ```bash
-# Native Linux:
+rustup toolchain install stable
+rustup component add rustfmt clippy
 just verify
-
-# Per-crate test (anywhere brain-core/brain-protocol compile):
-cargo test -p brain-protocol
-
-# Run the server (Linux only):
-cargo run --bin brain-server -- --config config/dev.toml
-
-# CLI (cross-platform):
-cargo run --bin brain-cli -- stats
 ```
+
+### macOS / Windows — dev container (recommended)
+
+The repo ships a `.devcontainer/` config. With Docker, OrbStack, or Colima running:
+
+```bash
+just shell        # builds the image on first run, drops you into bash
+# inside the container:
+just verify
+```
+
+Editor integration: VS Code, Cursor, JetBrains, and GitHub Codespaces auto-detect `.devcontainer/devcontainer.json`. Use "Reopen in Container."
+
+#### Container runtime notes
+
+| Runtime | macOS recommendation |
+|---|---|
+| **OrbStack** | Recommended on Apple Silicon. Permissive seccomp; works with `io_uring` (relevant from Phase 9). |
+| **Docker Desktop** | Works for Phase 2 (`pwritev2`/`mmap`/`mremap` aren't blocked). Phase 9 will need a custom seccomp profile or `--security-opt seccomp=unconfined` since 4.42+ blocks `io_uring`. |
+| **Colima** | Works similarly to Docker Desktop; uses Lima/QEMU. |
+
+#### Container caveats
+
+- **`O_DIRECT` against bind-mounted source.** macOS-hosted Docker mounts via VirtioFS / 9P; these may not support `O_DIRECT`. Storage tests should write under `/tmp` (tmpfs) or a named-volume path inside the container — not `/workspaces/brain` (the bind mount).
+- **First build is slow** (downloads ~100 crates). Persistent named volumes (`brain-cargo-cache`, `brain-target-cache`) keep the cache across container restarts.
+- **`io_uring` in Docker Desktop 4.42+** is blocked by default seccomp. Doesn't bite Phase 2; will need attention in Phase 9.
+
+### macOS / Windows — cross-compile-only
+
+Validates compilation without running. Pair with the dev container (or CI) for actual tests.
+
+```bash
+rustup target add x86_64-unknown-linux-gnu
+brew install lld   # or: cargo install --locked cargo-zigbuild
+
+# .cargo/config.toml (gitignored):
+# [target.x86_64-unknown-linux-gnu]
+# linker = "x86_64-linux-gnu-gcc"   # or "ld.lld"
+
+cargo check --workspace --target x86_64-unknown-linux-gnu
+```
+
+### Common commands
+
+```bash
+just verify                              # full verify: fmt + build + clippy + test + check-skills
+cargo test -p brain-protocol             # per-crate test (cross-platform crates)
+cargo run --bin brain-server -- --config config/dev.toml   # Linux only
+cargo run --bin brain-cli -- stats       # cross-platform
+cargo +nightly fuzz run protocol_frame -- -max_total_time=60   # nightly + Linux
+```
+
+### When something doesn't work
+
+- **`liburing-sys` link error on macOS native:** expected. Use the dev container.
+- **`compile_error!` mentioning README.md:** the friendly Linux gate; switch to the container.
+- **`io_uring_setup: Function not implemented`:** kernel too old or seccomp restricted; check host kernel and container runtime.
+- **`O_DIRECT` returns `EINVAL`:** the filesystem under the test path doesn't support direct I/O; use `/tmp` or a named volume.
 
 ## Implementation status
 

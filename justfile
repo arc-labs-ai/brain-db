@@ -40,6 +40,19 @@ fmt:
 check-skills:
     @./scripts/check-skills.sh
 
+# Build (if needed) the Linux dev container and drop into a bash shell.
+shell:
+    @docker build -t brain-dev:latest -f .devcontainer/Dockerfile .
+    @docker run --rm -it \
+        -v "$(pwd)":/workspaces/brain \
+        -v brain-cargo-registry:/usr/local/cargo/registry \
+        -v brain-cargo-git:/usr/local/cargo/git \
+        -v brain-target-cache:/workspaces/brain/target \
+        -w /workspaces/brain \
+        -e RUST_BACKTRACE=1 \
+        brain-dev:latest \
+        bash
+
 # The full verification suite — what CI runs.
 verify: fmt-check build clippy test check-skills
 
