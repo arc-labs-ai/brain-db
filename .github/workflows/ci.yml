@@ -24,6 +24,9 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      - name: Skill conventions lint
+        run: ./scripts/check-skills.sh
+
       - name: Build (workspace)
         run: cargo build --workspace --all-targets
 
@@ -35,6 +38,11 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Cargo doc (warnings as errors)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
 
   miri:
     name: Miri (storage layer)

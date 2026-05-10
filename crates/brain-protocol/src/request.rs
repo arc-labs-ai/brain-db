@@ -17,6 +17,14 @@
 //!
 //! [rkyv]: https://docs.rs/rkyv/0.7
 
+// `PlanState` and `ObservationInput` use `By*` variant naming that mirrors
+// the spec's discriminator phrasing. rkyv's `Archive` derive generates a
+// parallel `ArchivedPlanState` whose variant names are inherited; clippy
+// 1.95+ flags both the source and the macro-generated copy and the
+// per-item `#[allow]` doesn't always reach the macro expansion path. The
+// module-level allow covers both without spreading attribute noise.
+#![allow(clippy::enum_variant_names)]
+
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::error::ProtocolError;
@@ -97,10 +105,11 @@ pub enum PlanStrategy {
 
 /// Spec §07/4 — plan endpoint specification. Variant names mirror the
 /// spec's `ByMemoryId` / `ByText` / `ByVector` discriminator naming.
+/// (See the crate-level `#![allow(clippy::enum_variant_names)]` for why
+/// the per-item allow isn't enough.)
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
-#[allow(clippy::enum_variant_names)]
 pub enum PlanState {
     ByMemoryId(WireMemoryId),
     ByText(String),
