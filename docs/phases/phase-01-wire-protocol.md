@@ -247,9 +247,9 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - For each request variant: round-trip `encode → decode == original`.
 
 **Done when:**
-- [ ] All request opcodes from §07 have a matching variant and codec.
-- [ ] Round-trip tests for each.
-- [ ] Vector blobs (where present) use `bytemuck::cast_slice`, not rkyv.
+- [x] All request opcodes from §07 have a matching variant and codec.
+- [x] Round-trip tests for each.
+- [x] Vector blobs (where present) use `bytemuck::cast_slice`, not rkyv. *(Note: vector-blob composition into the trailing raw section is owned by the `Frame` layer, not by `RequestBody::encode`. The struct fields `vector_offset` / `vector_dim` carry the placement information; rkyv handles the structured fields only.)*
 
 **Pitfalls:**
 - `rkyv` requires the type to derive `Archive`, `Serialize`, `Deserialize` from the rkyv prelude. Add the workspace dep if not already present.
