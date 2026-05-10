@@ -151,21 +151,28 @@ In autonomous mode, Claude executes the loop in [`AUTONOMY.md`](AUTONOMY.md) §1
 
 The pre-tool-use hooks in `.claude/hooks/` provide a safety net: even with permissions skipped, Claude cannot `rm -rf /`, `git push --force`, `cargo publish`, edit files in `spec/`, or run `sudo`. Edit the hooks to adjust.
 
-## Building manually
+## Building and testing
 
-Once `crates/` is populated:
+**Linux x86_64 / aarch64, kernel ≥ 5.15.** Brain depends on `io_uring`, `O_DIRECT`, `pwritev2(RWF_DSYNC)`, and a few Linux-only `madvise` / `fallocate` flags — see `spec/01_system_architecture/05_hardware.md` §1.1 for why we chose a single-platform backend over portable shims.
+
+| Crate | Linux | macOS / Windows |
+|---|---|---|
+| `brain-core`, `brain-protocol`, `brain-cli`, `brain-sdk-rust` | ✓ build + test | ✓ build + test (no I/O / runtime) |
+| `brain-storage`, `brain-server`, `brain-workers`, `brain-index` (post-persist), `brain-embed` (post-wiring) | ✓ build + test | ✗ `compile_error!` — use a Linux container |
+
+For non-Linux dev hosts, **see [`DEV_SETUP.md`](DEV_SETUP.md)** for Docker / OrbStack / Colima / Lima / cross-compile recipes. CI (`.github/workflows/ci.yml`) runs everything on `ubuntu-latest` and is the authoritative test gate.
 
 ```bash
-# Build everything
-cargo build --workspace --release
+# Native Linux:
+just verify
 
-# Run tests
-cargo test --workspace
+# Per-crate test (anywhere brain-core/brain-protocol compile):
+cargo test -p brain-protocol
 
-# Run the substrate
+# Run the server (Linux only):
 cargo run --bin brain-server -- --config config/dev.toml
 
-# CLI
+# CLI (cross-platform):
 cargo run --bin brain-cli -- stats
 ```
 

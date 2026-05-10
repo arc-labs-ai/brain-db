@@ -352,3 +352,25 @@ and stops. Claude does not write code until the user confirms (a "go" / "approve
 ### Plan files are durable
 
 Plan files stay in the repo. They serve as durable design artifacts, complementing commit messages. Treat them like ADRs: future-Claude reads them to understand why a phase was built the way it was.
+
+## 22. Platform
+
+Brain is **Linux-only**, kernel ≥ 5.15. Spec §01/05 §1.1 lists the Linux-specific facilities Brain depends on (`io_uring`, `O_DIRECT`, `pwritev2(RWF_DSYNC)`, `madvise(MADV_RANDOM/MADV_DONTDUMP)`, `fallocate(FALLOC_FL_KEEP_SIZE)`) and the explicit decision to *not* abstract them: "for a system whose value proposition is latency, a single optimized backend is better than a portable one."
+
+Operationally:
+
+- Crates that touch the runtime, storage, ANN persistence, or any libc syscall (`brain-storage`, `brain-server`, `brain-workers`, `brain-index` once it persists, `brain-embed` once it lands) MUST gate their entire crate behind `#[cfg(target_os = "linux")]`. On non-Linux the crate emits a `compile_error!` with a friendly message pointing to `DEV_SETUP.md`.
+- Cross-platform crates (the data-model + wire-protocol layer): `brain-core`, `brain-protocol`. These compile on darwin/Windows for SDK consumers but their tests run on Linux too.
+- Tests for runtime/storage code MUST run on Linux. CI gates this; local dev on non-Linux uses a Linux container (Docker / OrbStack / Lima — see `DEV_SETUP.md`).
+- Glommio, `liburing-sys`, and similar Linux-only crates may be unconditional dependencies of platform-gated crates. They may *not* leak into `brain-core` or `brain-protocol`.
+
+Spec changes to platform stance require user direction (per §2). The current stance is locked in through `spec/01_system_architecture/05_hardware.md` §1.1 — read it before considering "should we be portable here?"
+
+### Implications for autonomous Claude
+
+When Claude is running on a non-Linux host (e.g. darwin):
+
+- `cargo build --workspace` and `cargo test --workspace` will fail at link time on Linux-only crates. This is expected, not a bug.
+- The verify loop (§4) is satisfied via the project-provided Linux dev container. `DEV_SETUP.md` documents the entry point.
+- For fast feedback before a container test cycle, `cargo check --target x86_64-unknown-linux-gnu` (with the target installed) validates compilation without running.
+- If neither container nor cross-target is available: STOP and surface (§3). Don't try to make Linux code "work" on the local OS by adding portability shims — that violates this section.
