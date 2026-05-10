@@ -129,6 +129,9 @@ impl Frame {
 
 #[cfg(test)]
 mod tests {
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
     use super::*;
     use crate::MAGIC;
 
@@ -268,5 +271,54 @@ mod tests {
         let bytes = frame.encode();
         let (decoded, _) = Frame::decode(&bytes).expect("encode reseals stale CRCs");
         assert_eq!(decoded.payload, frame.payload);
+    }
+
+    proptest! {
+        /// Round-trip property: any well-formed `Frame::new(...).encode()`
+        /// must decode back to a frame with the same opcode, flags, stream
+        /// id, and payload. Payloads bounded at 8 KiB to keep test runtime
+        /// reasonable (spec hard cap is 16 MiB - 1).
+        #[test]
+        fn encode_decode_round_trip(
+            opcode in any::<u8>(),
+            flags in any::<u16>(),
+            stream_id in any::<u32>(),
+            payload in vec(any::<u8>(), 0..=8192usize),
+        ) {
+            let original = Frame::new(opcode, flags, stream_id, payload.clone());
+            let bytes = original.encode();
+            let (decoded, rest) = Frame::decode(&bytes)
+                .expect("Frame::new+encode must always produce a decodable frame");
+            prop_assert!(rest.is_empty());
+            prop_assert_eq!(decoded.header.opcode, opcode);
+            prop_assert_eq!(decoded.header.flags_u16(), flags);
+            prop_assert_eq!(decoded.header.stream_id_u32(), stream_id);
+            prop_assert_eq!(decoded.header.payload_len_u32() as usize, payload.len());
+            prop_assert_eq!(decoded.payload, payload);
+        }
+
+        /// Robustness property: `Frame::decode` MUST NOT panic on arbitrary
+        /// input. It either returns a structured `ProtocolError`, or
+        /// succeeds — and if it succeeds, the consumed prefix must
+        /// re-encode to itself (the decoder accepted only canonical bytes).
+        ///
+        /// Spec §03/11 §1: validation is layered and deterministic — so an
+        /// adversary feeding garbage cannot cause UB or panics.
+        #[test]
+        fn decode_arbitrary_bytes_is_total(
+            bytes in vec(any::<u8>(), 0..=8192usize),
+        ) {
+            match Frame::decode(&bytes) {
+                Ok((frame, rest)) => {
+                    let consumed = bytes.len() - rest.len();
+                    let reencoded = frame.encode();
+                    prop_assert_eq!(reencoded.as_slice(), &bytes[..consumed]);
+                }
+                Err(_) => {
+                    // Any structured error variant is acceptable; the
+                    // contract is just "no panic, return a Result".
+                }
+            }
+        }
     }
 }

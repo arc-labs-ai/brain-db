@@ -193,8 +193,8 @@ Each sub-task is a single commit. The "Reads" listed are required reading before
 - Run with at least 1024 cases each (`PROPTEST_CASES=1024 cargo test`).
 
 **Done when:**
-- [ ] Both proptests pass with default case count.
-- [ ] No panics on arbitrary input — even malformed.
+- [x] Both proptests pass with default case count.
+- [x] No panics on arbitrary input — even malformed.
 
 **Pitfalls:**
 - Bound payload size in the generator (e.g. 0..=8192) so tests don't allocate gigabytes.
