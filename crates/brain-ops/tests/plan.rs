@@ -143,6 +143,7 @@ fn plan_request(start: MemoryId, goal: MemoryId, max_depth: u32) -> PlanRequest 
         strategy_hint: None,
         context_filter: None,
         request_id: None,
+        txn_id: None,
     }
 }
 

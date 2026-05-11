@@ -4,7 +4,11 @@
 //! later sub-task that needs new shared state (txn store in 7.9,
 //! subscribe broadcast in 7.10) adds a field non-breakingly.
 
+use std::sync::Arc;
+
 use brain_planner::{ExecutorContext, PlannerContext};
+
+use crate::txn::TxnStore;
 
 #[derive(Clone)]
 pub struct OpsContext {
@@ -14,7 +18,9 @@ pub struct OpsContext {
     /// Planner-side config + budgets. Defaults are fine for v1; the
     /// builder is here so the server can override budgets at startup.
     pub planner_ctx: PlannerContext,
-    // 7.9 will add: pub txn_store: Arc<Mutex<TxnStore>>,
+    /// Per-process transaction registry. Active txns hold their
+    /// buffered ops here until COMMIT / ABORT (sub-task 7.9).
+    pub txn_store: Arc<TxnStore>,
     // 7.10 will add: pub subscribe_tx: broadcast::Sender<SubscribeEvent>,
 }
 
@@ -24,12 +30,19 @@ impl OpsContext {
         Self {
             executor,
             planner_ctx: PlannerContext::default(),
+            txn_store: Arc::new(TxnStore::new()),
         }
     }
 
     #[must_use]
     pub fn with_planner_context(mut self, planner_ctx: PlannerContext) -> Self {
         self.planner_ctx = planner_ctx;
+        self
+    }
+
+    #[must_use]
+    pub fn with_txn_store(mut self, store: Arc<TxnStore>) -> Self {
+        self.txn_store = store;
         self
     }
 }

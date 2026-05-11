@@ -100,6 +100,7 @@ fn recall_req(cue: &str, top_k: u32) -> RecallRequest {
         include_vectors: false,
         include_edges: false,
         request_id: None,
+        txn_id: None,
     }
 }
 

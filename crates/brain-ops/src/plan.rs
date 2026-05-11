@@ -14,10 +14,12 @@ use brain_protocol::response::{
 
 use crate::context::OpsContext;
 use crate::error::OpError;
+use crate::txn_lens::build_executor_with_lens;
 
 pub async fn handle_plan(req: PlanRequest, ctx: &OpsContext) -> Result<PlanResponseFrame, OpError> {
     let plan = plan_path_inner(&req, &ctx.planner_ctx)?;
-    let result = execute_path(plan, &ctx.executor).await?;
+    let exec_ctx = build_executor_with_lens(ctx, req.txn_id)?;
+    let result = execute_path(plan, &exec_ctx).await?;
 
     let wire_status = to_wire_status(result.status);
 

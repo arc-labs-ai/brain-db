@@ -29,6 +29,7 @@ pub mod context;
 pub mod dispatch;
 pub mod error;
 pub mod idempotency;
+pub mod txn_lens;
 pub mod writer;
 
 // Per-op handler modules. 7.1 ships stubs; 7.3-7.10 replace each.
@@ -45,6 +46,7 @@ pub use brain_planner::PlannerContext;
 pub use context::OpsContext;
 pub use dispatch::dispatch;
 pub use error::{ErrorCode, OpError};
+pub use txn::{TxnState, TxnStore};
 pub use writer::RealWriterHandle;
 
 #[cfg(test)]
@@ -215,6 +217,35 @@ mod tests {
                 Box<
                     dyn std::future::Future<
                             Output = Result<brain_planner::UnlinkAck, PlannerWriterError>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(
+                    async move { Err(PlannerWriterError::Internal("unused in 7.1 tests".into())) },
+                )
+            }
+            fn reserve_memory_id<'a>(
+                &'a self,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<brain_core::MemoryId, PlannerWriterError>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(
+                    async move { Err(PlannerWriterError::Internal("unused in 7.1 tests".into())) },
+                )
+            }
+            fn submit_batch<'a>(
+                &'a self,
+                _: brain_planner::TxnBatch,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<brain_planner::TxnBatchAck, PlannerWriterError>,
                         > + Send
                         + 'a,
                 >,

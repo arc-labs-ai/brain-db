@@ -44,7 +44,7 @@ use brain_metadata::tables::idempotency::{IdempotencyEntry, IDEMPOTENCY_TABLE};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_planner::{
     EdgeOutcome, EncodeAck, EncodeOp, ForgetAck, ForgetOp, ForgetOutcome, LinkAck, LinkOp,
-    SharedMetadataDb, UnlinkAck, UnlinkOp, WriterError, WriterHandle,
+    SharedMetadataDb, TxnBatch, TxnBatchAck, UnlinkAck, UnlinkOp, WriterError, WriterHandle,
 };
 use parking_lot::Mutex;
 use redb::ReadableTable;
@@ -152,6 +152,23 @@ impl WriterHandle for RealWriterHandle {
         op: UnlinkOp,
     ) -> Pin<Box<dyn Future<Output = Result<UnlinkAck, WriterError>> + Send + 'a>> {
         Box::pin(async move { do_unlink(self, op) })
+    }
+
+    fn reserve_memory_id<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<MemoryId, WriterError>> + Send + 'a>> {
+        Box::pin(async move {
+            let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
+            Ok(MemoryId::pack(0, slot, 1))
+        })
+    }
+
+    fn submit_batch<'a>(
+        &'a self,
+        batch: brain_planner::TxnBatch,
+    ) -> Pin<Box<dyn Future<Output = Result<brain_planner::TxnBatchAck, WriterError>> + Send + 'a>>
+    {
+        Box::pin(async move { do_submit_batch(self, batch) })
     }
 }
 
@@ -793,6 +810,338 @@ fn hex_short(bytes: &[u8; 16]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+// ---------------------------------------------------------------------------
+// submit_batch — atomic apply of a TXN_COMMIT buffer.
+// ---------------------------------------------------------------------------
+
+fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatchAck, WriterError> {
+    use crate::idempotency::{
+        encode_encode_payload, encode_forget_payload, encode_link_payload, encode_unlink_payload,
+    };
+
+    let mut encode_acks: Vec<EncodeAck> = Vec::with_capacity(batch.memories.len());
+    let mut link_acks: Vec<LinkAck> = Vec::with_capacity(batch.links.len());
+    let mut unlink_acks: Vec<UnlinkAck> = Vec::with_capacity(batch.unlinks.len());
+    let mut forget_acks: Vec<ForgetAck> = Vec::with_capacity(batch.forgets.len());
+
+    // ── HNSW inserts queued post-wtxn so we can report failures
+    //    cleanly without leaving the index orphaned. ───────────────
+    let mut hnsw_inserts: Vec<(MemoryId, [f32; brain_embed::VECTOR_DIM])> = Vec::new();
+    let mut hnsw_tombstones: Vec<MemoryId> = Vec::new();
+
+    // Track in-batch creations so subsequent operations within the
+    // same batch can see them (e.g., LINK targeting a memory ENCODEd
+    // earlier in the same txn).
+    let mut batch_memory_ids: HashSet<MemoryId> = HashSet::new();
+
+    {
+        let mut db = writer.metadata.lock();
+        let wtxn = db
+            .write_txn()
+            .map_err(|e| WriterError::Internal(format!("batch write_txn: {e:?}")))?;
+        {
+            let mut memories_t = wtxn
+                .open_table(MEMORIES_TABLE)
+                .map_err(|e| WriterError::Internal(format!("batch open MEMORIES: {e:?}")))?;
+            let mut edges_out_t = wtxn
+                .open_table(EDGES_OUT_TABLE)
+                .map_err(|e| WriterError::Internal(format!("batch open EDGES_OUT: {e:?}")))?;
+            let mut edges_in_t = wtxn
+                .open_table(EDGES_IN_TABLE)
+                .map_err(|e| WriterError::Internal(format!("batch open EDGES_IN: {e:?}")))?;
+            let mut idem_t = wtxn
+                .open_table(IDEMPOTENCY_TABLE)
+                .map_err(|e| WriterError::Internal(format!("batch open IDEMPOTENCY: {e:?}")))?;
+
+            // 1. Memories + their inline edges.
+            for enc in &batch.memories {
+                // Compute edge outcomes against committed + in-batch ids.
+                let mut edge_outcomes: Vec<EdgeOutcome> = Vec::with_capacity(enc.edges.len());
+                for edge in &enc.edges {
+                    let exists = batch_memory_ids.contains(&edge.target)
+                        || memories_t
+                            .get(edge.target.to_be_bytes())
+                            .map_err(|e| {
+                                WriterError::Internal(format!("batch memories get: {e:?}"))
+                            })?
+                            .is_some();
+                    edge_outcomes.push(if exists {
+                        EdgeOutcome::Inserted
+                    } else {
+                        EdgeOutcome::TargetMissing
+                    });
+                }
+                let inserted_count = edge_outcomes
+                    .iter()
+                    .filter(|o| matches!(o, EdgeOutcome::Inserted))
+                    .count();
+
+                // Insert edges + bump target in-counts.
+                for (edge, outcome) in enc.edges.iter().zip(edge_outcomes.iter()) {
+                    if !matches!(outcome, EdgeOutcome::Inserted) {
+                        continue;
+                    }
+                    let data = EdgeData::new(
+                        edge.weight,
+                        origin::EXPLICIT,
+                        derived_by::CLIENT,
+                        enc.created_at_unix_nanos,
+                    );
+                    edge::link(
+                        &mut edges_out_t,
+                        &mut edges_in_t,
+                        enc.memory_id,
+                        edge.kind,
+                        edge.target,
+                        &data,
+                    )
+                    .map_err(|e| WriterError::Internal(format!("batch edge::link: {e:?}")))?;
+                    // Bump target's edges_in_count, but only if target
+                    // is a committed memory; in-batch targets handle
+                    // their own count below.
+                    if !batch_memory_ids.contains(&edge.target) {
+                        bump_edge_count(&mut memories_t, edge.target, false, 1)?;
+                    }
+                }
+
+                // Build the metadata row.
+                let mut meta = MemoryMetadata::new_active(
+                    enc.memory_id,
+                    writer.agent_id,
+                    enc.context_id,
+                    enc.memory_id.slot(),
+                    /* slot_version */ 1,
+                    enc.kind,
+                    enc.fingerprint,
+                    enc.salience_initial,
+                    enc.text.len() as u32,
+                    enc.created_at_unix_nanos,
+                );
+                meta.edges_out_count = u32::try_from(inserted_count).unwrap_or(u32::MAX);
+                // edges_in_count starts at 0 — any in-batch edge to this
+                // memory bumps it as part of *that* edge's loop below.
+                memories_t
+                    .insert(enc.memory_id.to_be_bytes(), meta)
+                    .map_err(|e| WriterError::Internal(format!("batch memories insert: {e:?}")))?;
+
+                // Idempotency entry.
+                let payload = encode_encode_payload(enc.memory_id, &edge_outcomes);
+                let entry = IdempotencyEntry::new(
+                    crate::idempotency::RESPONSE_KIND_ENCODE,
+                    Some(enc.memory_id.to_be_bytes()),
+                    payload,
+                    enc.request_hash,
+                    enc.created_at_unix_nanos,
+                );
+                idem_t
+                    .insert(<[u8; 16]>::from(enc.request_id), entry)
+                    .map_err(|e| {
+                        WriterError::Internal(format!("batch idempotency insert (encode): {e:?}"))
+                    })?;
+
+                batch_memory_ids.insert(enc.memory_id);
+                encode_acks.push(EncodeAck {
+                    memory_id: enc.memory_id,
+                    edge_results: edge_outcomes,
+                    replayed: false,
+                });
+                hnsw_inserts.push((enc.memory_id, enc.vector));
+
+                // Bump in-counts for any in-batch edges that target a
+                // memory already inserted in this batch.
+                // (Handled by reading the inserted row + writing back.)
+                for edge in &enc.edges {
+                    if !batch_memory_ids.contains(&edge.target) || edge.target == enc.memory_id {
+                        continue;
+                    }
+                    // The target was inserted earlier in this batch.
+                    bump_edge_count(&mut memories_t, edge.target, false, 1)?;
+                }
+            }
+
+            // 2. Top-level LINKs.
+            for link in &batch.links {
+                // Source/target must exist (committed or in-batch).
+                let src_exists = batch_memory_ids.contains(&link.source)
+                    || memories_t
+                        .get(link.source.to_be_bytes())
+                        .map_err(|e| WriterError::Internal(format!("batch get src: {e:?}")))?
+                        .is_some();
+                let tgt_exists = batch_memory_ids.contains(&link.target)
+                    || memories_t
+                        .get(link.target.to_be_bytes())
+                        .map_err(|e| WriterError::Internal(format!("batch get tgt: {e:?}")))?
+                        .is_some();
+                if !src_exists {
+                    return Err(WriterError::Internal(format!(
+                        "LINK source memory {} not found in batch",
+                        link.source.raw()
+                    )));
+                }
+                if !tgt_exists {
+                    return Err(WriterError::Internal(format!(
+                        "LINK target memory {} not found in batch",
+                        link.target.raw()
+                    )));
+                }
+                let key = (
+                    link.source.to_be_bytes(),
+                    link.kind as u8,
+                    link.target.to_be_bytes(),
+                );
+                let already_existed = edges_out_t
+                    .get(&key)
+                    .map_err(|e| WriterError::Internal(format!("batch get edge: {e:?}")))?
+                    .is_some();
+                let data = EdgeData::new(
+                    link.weight,
+                    origin::EXPLICIT,
+                    derived_by::CLIENT,
+                    link.created_at_unix_nanos,
+                );
+                edge::link(
+                    &mut edges_out_t,
+                    &mut edges_in_t,
+                    link.source,
+                    link.kind,
+                    link.target,
+                    &data,
+                )
+                .map_err(|e| WriterError::Internal(format!("batch link insert: {e:?}")))?;
+                if !already_existed {
+                    bump_edge_count(&mut memories_t, link.source, true, 1)?;
+                    bump_edge_count(&mut memories_t, link.target, false, 1)?;
+                }
+                let payload =
+                    encode_link_payload(link.weight, link.created_at_unix_nanos, already_existed);
+                let entry = IdempotencyEntry::new(
+                    crate::idempotency::RESPONSE_KIND_LINK,
+                    None,
+                    payload,
+                    link.request_hash,
+                    link.created_at_unix_nanos,
+                );
+                idem_t
+                    .insert(<[u8; 16]>::from(link.request_id), entry)
+                    .map_err(|e| {
+                        WriterError::Internal(format!("batch idem insert (link): {e:?}"))
+                    })?;
+                link_acks.push(LinkAck {
+                    source: link.source,
+                    target: link.target,
+                    kind: link.kind,
+                    weight: link.weight,
+                    created_at_unix_nanos: link.created_at_unix_nanos,
+                    already_existed,
+                    replayed: false,
+                });
+            }
+
+            // 3. UNLINKs.
+            for unlink in &batch.unlinks {
+                let removed = edge::unlink(
+                    &mut edges_out_t,
+                    &mut edges_in_t,
+                    unlink.source,
+                    unlink.kind,
+                    unlink.target,
+                )
+                .map_err(|e| WriterError::Internal(format!("batch unlink: {e:?}")))?;
+                if removed {
+                    bump_edge_count(&mut memories_t, unlink.source, true, -1)?;
+                    bump_edge_count(&mut memories_t, unlink.target, false, -1)?;
+                }
+                let payload = encode_unlink_payload(removed);
+                let entry = IdempotencyEntry::new(
+                    crate::idempotency::RESPONSE_KIND_UNLINK,
+                    None,
+                    payload,
+                    unlink.request_hash,
+                    unlink.created_at_unix_nanos,
+                );
+                idem_t
+                    .insert(<[u8; 16]>::from(unlink.request_id), entry)
+                    .map_err(|e| {
+                        WriterError::Internal(format!("batch idem insert (unlink): {e:?}"))
+                    })?;
+                unlink_acks.push(UnlinkAck {
+                    source: unlink.source,
+                    target: unlink.target,
+                    kind: unlink.kind,
+                    removed,
+                    replayed: false,
+                });
+            }
+
+            // 4. FORGETs.
+            for forget in &batch.forgets {
+                let exists = batch_memory_ids.contains(&forget.memory_id)
+                    || memories_t
+                        .get(forget.memory_id.to_be_bytes())
+                        .map_err(|e| WriterError::Internal(format!("batch get forget: {e:?}")))?
+                        .is_some();
+                let outcome = if !exists {
+                    ForgetOutcome::MemoryNotFound
+                } else if writer.tombstoned.lock().contains(&forget.memory_id) {
+                    ForgetOutcome::AlreadyTombstoned
+                } else {
+                    ForgetOutcome::Tombstoned
+                };
+                if matches!(outcome, ForgetOutcome::Tombstoned) {
+                    hnsw_tombstones.push(forget.memory_id);
+                }
+                let payload = encode_forget_payload(forget.memory_id, outcome);
+                let entry = IdempotencyEntry::new(
+                    crate::idempotency::RESPONSE_KIND_FORGET,
+                    Some(forget.memory_id.to_be_bytes()),
+                    payload,
+                    forget.request_hash,
+                    forget.created_at_unix_nanos,
+                );
+                idem_t
+                    .insert(<[u8; 16]>::from(forget.request_id), entry)
+                    .map_err(|e| {
+                        WriterError::Internal(format!("batch idem insert (forget): {e:?}"))
+                    })?;
+                forget_acks.push(ForgetAck {
+                    memory_id: forget.memory_id,
+                    outcome,
+                    replayed: false,
+                });
+            }
+        }
+        wtxn.commit()
+            .map_err(|e| WriterError::Internal(format!("batch commit: {e:?}")))?;
+    }
+
+    // Post-wtxn: HNSW. Failures here are logged; the redb state is
+    // already durable. Same hazard as the non-txn ENCODE path.
+    {
+        let mut hnsw = writer.hnsw_writer.lock();
+        for (id, vector) in &hnsw_inserts {
+            hnsw.insert(*id, vector)
+                .map_err(|e| WriterError::Internal(format!("batch hnsw insert: {e:?}")))?;
+        }
+        for id in &hnsw_tombstones {
+            hnsw.mark_tombstoned(*id)
+                .map_err(|e| WriterError::Internal(format!("batch hnsw tombstone: {e:?}")))?;
+        }
+    }
+    {
+        let mut tombstoned = writer.tombstoned.lock();
+        for id in &hnsw_tombstones {
+            tombstoned.insert(*id);
+        }
+    }
+
+    Ok(TxnBatchAck {
+        encodes: encode_acks,
+        links: link_acks,
+        unlinks: unlink_acks,
+        forgets: forget_acks,
+    })
 }
 
 // Silence unused-import warnings when EdgeKind is referenced only

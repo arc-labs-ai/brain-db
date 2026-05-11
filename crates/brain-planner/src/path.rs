@@ -163,6 +163,7 @@ mod tests {
             strategy_hint: None,
             context_filter: None,
             request_id: None,
+            txn_id: None,
         }
     }
 

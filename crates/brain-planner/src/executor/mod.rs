@@ -15,7 +15,7 @@ pub mod recall;
 pub mod result;
 pub mod writer;
 
-pub use context::{ExecutorContext, SharedMetadataDb};
+pub use context::{ExecutorContext, PendingMemorySnapshot, SharedMetadataDb, TxnSnapshot};
 pub use dispatch::{execute, ExecutionResult};
 pub use encode::execute_encode;
 pub use error::ExecError;
@@ -29,5 +29,6 @@ pub use result::{
 };
 pub use writer::{
     EdgeOutcome, EncodeAck, EncodeOp, EncodeOpEdge, ForgetAck, ForgetOp, ForgetOutcome, LinkAck,
-    LinkOp, UnlinkAck, UnlinkOp, WriterError, WriterHandle,
+    LinkOp, TxnBatch, TxnBatchAck, TxnEncode, TxnForget, TxnLink, TxnUnlink, UnlinkAck, UnlinkOp,
+    WriterError, WriterHandle,
 };

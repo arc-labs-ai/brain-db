@@ -84,6 +84,37 @@ impl WriterHandle for NoopWriter {
     > {
         Box::pin(async move { Err(WriterError::Internal("noop".into())) })
     }
+
+    fn reserve_memory_id<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<brain_core::MemoryId, WriterError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Err(WriterError::Internal(
+                "test writer: reserve_memory_id unused".into(),
+            ))
+        })
+    }
+
+    fn submit_batch<'a>(
+        &'a self,
+        _: brain_planner::TxnBatch,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<brain_planner::TxnBatchAck, WriterError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Err(WriterError::Internal(
+                "test writer: submit_batch unused".into(),
+            ))
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +201,7 @@ fn plan_request(start: MemoryId, goal: MemoryId, max_depth: u32) -> PlanRequest 
         strategy_hint: None,
         context_filter: None,
         request_id: None,
+        txn_id: None,
     }
 }
 

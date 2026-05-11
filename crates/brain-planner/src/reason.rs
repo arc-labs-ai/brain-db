@@ -184,6 +184,7 @@ mod tests {
             max_inferences: 5,
             budget_wall_time_ms: 100,
             request_id: None,
+            txn_id: None,
         }
     }
 

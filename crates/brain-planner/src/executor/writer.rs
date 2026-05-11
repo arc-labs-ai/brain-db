@@ -39,6 +39,24 @@ pub trait WriterHandle: Send + Sync {
         &'a self,
         op: UnlinkOp,
     ) -> Pin<Box<dyn Future<Output = Result<UnlinkAck, WriterError>> + Send + 'a>>;
+
+    /// Reserve a fresh `MemoryId` without writing anything. The
+    /// returned id may be used by the caller (e.g., a transaction's
+    /// pending buffer); if the caller never commits, the slot is
+    /// silently skipped — `next_slot` keeps advancing. Spec §09/08
+    /// §10 caps txns at 1000 ops, bounding the leak.
+    fn reserve_memory_id<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<MemoryId, WriterError>> + Send + 'a>>;
+
+    /// Apply a pre-built batch of buffered operations atomically.
+    /// Used by `TXN_COMMIT` — one redb write txn, all-or-nothing.
+    /// On any failure the wtxn is dropped (redb auto-rolls-back) and
+    /// the buffer is reported as not applied.
+    fn submit_batch<'a>(
+        &'a self,
+        batch: TxnBatch,
+    ) -> Pin<Box<dyn Future<Output = Result<TxnBatchAck, WriterError>> + Send + 'a>>;
 }
 
 /// Encode operation payload submitted to the writer. Carries
@@ -179,4 +197,77 @@ pub struct UnlinkAck {
     pub kind: EdgeKind,
     pub removed: bool,
     pub replayed: bool,
+}
+
+// ---------------------------------------------------------------------------
+// TxnBatch — buffered transaction payload for atomic apply.
+// ---------------------------------------------------------------------------
+
+/// A buffered transaction's payload, handed to `submit_batch` by the
+/// COMMIT path. Order matters: edges may reference memories created
+/// earlier in the same batch.
+#[derive(Debug, Clone, Default)]
+pub struct TxnBatch {
+    pub memories: Vec<TxnEncode>,
+    pub links: Vec<TxnLink>,
+    pub unlinks: Vec<TxnUnlink>,
+    pub forgets: Vec<TxnForget>,
+}
+
+/// A pre-allocated memory destined for commit. `memory_id` was
+/// returned by `reserve_memory_id` at buffer time; the apply path
+/// writes the metadata row + HNSW vector + idempotency entry atomically.
+#[derive(Debug, Clone)]
+pub struct TxnEncode {
+    pub memory_id: MemoryId,
+    pub request_id: RequestId,
+    pub request_hash: [u8; 32],
+    pub context_id: ContextId,
+    pub kind: MemoryKind,
+    pub text: String,
+    pub vector: [f32; brain_embed::VECTOR_DIM],
+    pub salience_initial: f32,
+    pub fingerprint: [u8; 16],
+    pub edges: Vec<EncodeOpEdge>,
+    pub created_at_unix_nanos: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TxnLink {
+    pub request_id: RequestId,
+    pub request_hash: [u8; 32],
+    pub source: MemoryId,
+    pub target: MemoryId,
+    pub kind: EdgeKind,
+    pub weight: f32,
+    pub created_at_unix_nanos: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TxnUnlink {
+    pub request_id: RequestId,
+    pub request_hash: [u8; 32],
+    pub source: MemoryId,
+    pub target: MemoryId,
+    pub kind: EdgeKind,
+    pub created_at_unix_nanos: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TxnForget {
+    pub request_id: RequestId,
+    pub request_hash: [u8; 32],
+    pub memory_id: MemoryId,
+    pub mode: brain_protocol::request::ForgetMode,
+    pub created_at_unix_nanos: u64,
+}
+
+/// Result of a successful `submit_batch`. Per-op acks come back in
+/// the same order as the corresponding `TxnBatch` field.
+#[derive(Debug, Clone)]
+pub struct TxnBatchAck {
+    pub encodes: Vec<EncodeAck>,
+    pub links: Vec<LinkAck>,
+    pub unlinks: Vec<UnlinkAck>,
+    pub forgets: Vec<ForgetAck>,
 }

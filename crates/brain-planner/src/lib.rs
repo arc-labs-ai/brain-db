@@ -48,8 +48,9 @@ pub use executor::{
     execute, execute_encode, execute_forget, execute_path, execute_reason, execute_recall,
     EdgeOutcome, EncodeAck, EncodeOp, EncodeOpEdge, EncodeResult, EvidenceItem, ExecError,
     ExecutionResult, ExecutorContext, ForgetAck, ForgetOp, ForgetOutcome, ForgetResult, LinkAck,
-    LinkOp, Path, PathResult, PlanStatus, ReasonResult, ReasonStatus, RecallHit, RecallResult,
-    SharedMetadataDb, UnlinkAck, UnlinkOp, WriterError, WriterHandle,
+    LinkOp, Path, PathResult, PendingMemorySnapshot, PlanStatus, ReasonResult, ReasonStatus,
+    RecallHit, RecallResult, SharedMetadataDb, TxnBatch, TxnBatchAck, TxnEncode, TxnForget,
+    TxnLink, TxnSnapshot, TxnUnlink, UnlinkAck, UnlinkOp, WriterError, WriterHandle,
 };
 pub use explain::explain;
 pub use forget::{plan_forget, plan_forget_inner};

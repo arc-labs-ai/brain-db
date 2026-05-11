@@ -13,6 +13,7 @@ use brain_protocol::response::{
 
 use crate::context::OpsContext;
 use crate::error::OpError;
+use crate::txn_lens::build_executor_with_lens;
 
 pub async fn handle_reason(
     req: ReasonRequest,
@@ -27,7 +28,8 @@ pub async fn handle_reason(
     };
 
     let plan = plan_reason_inner(&req, &ctx.planner_ctx)?;
-    let result = execute_reason(plan, &ctx.executor).await?;
+    let exec_ctx = build_executor_with_lens(ctx, req.txn_id)?;
+    let result = execute_reason(plan, &exec_ctx).await?;
 
     Ok(to_wire_frame(result, claim))
 }

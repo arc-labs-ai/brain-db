@@ -126,6 +126,7 @@ fn reason_req(observation: ObservationInput, depth: u32, max_inferences: u32) ->
         max_inferences,
         budget_wall_time_ms: 1000,
         request_id: None,
+        txn_id: None,
     }
 }
 

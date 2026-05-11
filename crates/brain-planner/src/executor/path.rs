@@ -243,7 +243,7 @@ fn run_bidirectional_bfs(
             }
 
             // Fetch neighbours along this direction.
-            let neighbours: Vec<(EdgeKind, MemoryId, f32)> = if is_forward {
+            let mut neighbours: Vec<(EdgeKind, MemoryId, f32)> = if is_forward {
                 list_edges_from(&edges_out, node, None)
                     .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?
                     .into_iter()
@@ -258,6 +258,28 @@ fn run_bidirectional_bfs(
                     .map(|(k, s, data)| (k, s, data.weight))
                     .collect()
             };
+
+            // Layer the txn snapshot on top: add pending links matching
+            // this direction; remove pending unlinks. Spec §09/08 §5.
+            if let Some(snap) = &ctx.txn {
+                if is_forward {
+                    for (src, kind, tgt, w) in &snap.pending_links {
+                        if *src == node && edge_kinds.contains(kind) {
+                            neighbours.push((*kind, *tgt, *w));
+                        }
+                    }
+                    neighbours.retain(|(k, t, _)| !snap.pending_unlinks.contains(&(node, *k, *t)));
+                } else {
+                    for (src, kind, tgt, w) in &snap.pending_links {
+                        if *tgt == node && edge_kinds.contains(kind) {
+                            neighbours.push((*kind, *src, *w));
+                        }
+                    }
+                    neighbours.retain(|(k, s, _)| !snap.pending_unlinks.contains(&(*s, *k, node)));
+                }
+                // Drop tombstoned neighbours.
+                neighbours.retain(|(_, other, _)| !snap.tombstoned.contains(other));
+            }
 
             for (kind, next, weight) in neighbours {
                 if visited.contains_key(&next) {
@@ -398,11 +420,23 @@ fn hydrate_paths(
         let mut sal = Vec::with_capacity(nodes.len());
         let text = vec![String::new(); nodes.len()];
         for &id in &nodes {
+            // Look up committed first; fall back to the txn snapshot
+            // (in-flight memory rows live there, not in redb yet).
             let row = table
                 .get(id.to_be_bytes())
-                .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?
-                .ok_or(ExecError::MemoryNotFound { memory_id: id })?;
-            sal.push(row.value().salience);
+                .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
+            let salience = if let Some(access) = row {
+                access.value().salience
+            } else if let Some(pending) = ctx
+                .txn
+                .as_ref()
+                .and_then(|snap| snap.pending_memories.get(&id))
+            {
+                pending.salience
+            } else {
+                return Err(ExecError::MemoryNotFound { memory_id: id });
+            };
+            sal.push(salience);
         }
         out.push(Path {
             nodes,

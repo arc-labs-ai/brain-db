@@ -242,6 +242,37 @@ impl WriterHandle for FakeWriterHandle {
     {
         Box::pin(async move { Err(WriterError::Internal("fake writer: unlink unused".into())) })
     }
+
+    fn reserve_memory_id<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<brain_core::MemoryId, WriterError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Err(WriterError::Internal(
+                "test writer: reserve_memory_id unused".into(),
+            ))
+        })
+    }
+
+    fn submit_batch<'a>(
+        &'a self,
+        _: brain_planner::TxnBatch,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<brain_planner::TxnBatchAck, WriterError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Err(WriterError::Internal(
+                "test writer: submit_batch unused".into(),
+            ))
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +345,7 @@ fn recall_request(cue: &str, top_k: u32) -> RecallRequest {
         include_vectors: false,
         include_edges: false,
         request_id: None,
+        txn_id: None,
     }
 }
 

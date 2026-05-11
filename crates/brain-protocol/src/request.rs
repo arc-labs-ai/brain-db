@@ -52,7 +52,7 @@ pub type WireMemoryId = u128;
 // ---------------------------------------------------------------------------
 
 /// Spec §02/02 — three durable kinds.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 #[repr(u8)]
@@ -258,6 +258,9 @@ pub struct RecallRequest {
     pub include_vectors: bool,
     pub include_edges: bool,
     pub request_id: Option<WireUuid>,
+    /// Spec §09/08 §5: when set, RECALL reads against a snapshot
+    /// that includes the txn's pending writes (read-your-writes).
+    pub txn_id: Option<WireUuid>,
 }
 
 /// Spec §07/4.
@@ -271,6 +274,7 @@ pub struct PlanRequest {
     pub strategy_hint: Option<PlanStrategy>,
     pub context_filter: Option<Vec<WireContextId>>,
     pub request_id: Option<WireUuid>,
+    pub txn_id: Option<WireUuid>,
 }
 
 /// Spec §07/4 — plan budget.
@@ -295,6 +299,7 @@ pub struct ReasonRequest {
     pub max_inferences: u32,
     pub budget_wall_time_ms: u32,
     pub request_id: Option<WireUuid>,
+    pub txn_id: Option<WireUuid>,
 }
 
 /// Spec §07/6.
@@ -749,6 +754,7 @@ mod tests {
             include_vectors: false,
             include_edges: true,
             request_id: Some(sample_uuid(7)),
+            txn_id: None,
         }));
     }
 
@@ -773,6 +779,7 @@ mod tests {
                 strategy_hint: Some(PlanStrategy::AStar),
                 context_filter: None,
                 request_id: None,
+                txn_id: None,
             }));
         }
     }
@@ -791,6 +798,7 @@ mod tests {
                 max_inferences: 50,
                 budget_wall_time_ms: 5_000,
                 request_id: None,
+                txn_id: None,
             }));
         }
     }

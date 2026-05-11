@@ -236,12 +236,23 @@ fn walk_outward(
             continue;
         }
 
-        let neighbours: Vec<(EdgeKind, MemoryId, f32)> = list_edges_from(&edges_out, node, None)
-            .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?
-            .into_iter()
-            .filter(|(k, _, _)| edge_kinds.contains(k))
-            .map(|(k, t, data)| (k, t, data.weight))
-            .collect();
+        let mut neighbours: Vec<(EdgeKind, MemoryId, f32)> =
+            list_edges_from(&edges_out, node, None)
+                .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?
+                .into_iter()
+                .filter(|(k, _, _)| edge_kinds.contains(k))
+                .map(|(k, t, data)| (k, t, data.weight))
+                .collect();
+
+        if let Some(snap) = &ctx.txn {
+            for (src, kind, tgt, w) in &snap.pending_links {
+                if *src == node && edge_kinds.contains(kind) {
+                    neighbours.push((*kind, *tgt, *w));
+                }
+            }
+            neighbours.retain(|(k, t, _)| !snap.pending_unlinks.contains(&(node, *k, *t)));
+            neighbours.retain(|(_, t, _)| !snap.tombstoned.contains(t));
+        }
 
         for (kind, next, weight) in neighbours {
             if visited.contains_key(&next) {
