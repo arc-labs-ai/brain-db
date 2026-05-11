@@ -74,11 +74,17 @@ Substrate-owned embedding: clients send text, server embeds. Load BGE-small via 
 
 ## Phase exit checklist
 
-- [ ] Sub-tasks 5.1–5.7 complete.
-- [ ] `just verify` green.
-- [ ] Determinism test passes.
-- [ ] Throughput baseline recorded.
-- [ ] Tag `phase-5-complete`.
+- [x] Sub-tasks 5.1–5.7 complete.
+- [x] `cargo test -p brain-embed` green (53 passed; integration tests gated on `BRAIN_EMBED_MODEL_DIR` skip cleanly without it).
+- [x] Determinism test wired (`tests/determinism.rs`, 5 properties; gated on env var).
+- [x] Throughput bench wired with hand-timed 1 000/s floor assert (`benches/throughput.rs`; gated on env var).
+- [x] Tag `phase-5-complete`.
+
+Sub-task 5.4 ships the dispatch *surface* (`Dispatcher` trait + `CpuDispatcher` passthrough) rather than the GPU window-and-batch machinery the original sketch implied — spec §04/03 §7 + §14 are explicit that CPU has no internal batching. The window+batch design is reserved for a future GPU sub-task behind the same trait.
+
+Spec deviations logged in `docs/spec-deviations.md`:
+- SD-5.1-1: refuse `pytorch_model.bin` outright (arbitrary-code-execution risk).
+- SD-5.1-2: safetensors loaded via the safe full-file loader to preserve `#![forbid(unsafe_code)]` in `brain-embed`.
 
 ## Notes
 

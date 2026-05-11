@@ -10,3 +10,21 @@ description = "Built-in embedding service (BGE-small) for Brain."
 [dependencies]
 brain-core = { path = "../brain-core" }
 thiserror.workspace = true
+candle-core.workspace = true
+candle-nn.workspace = true
+candle-transformers.workspace = true
+tokenizers.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+lru.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "throughput"
+harness = false

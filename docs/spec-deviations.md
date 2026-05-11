@@ -163,3 +163,24 @@ The spec wins in general (per `CLAUDE.md` §2 and `AUTONOMY.md` §2); the entrie
 - **What's not implemented:** the pending-insert buffer (§10), the epoch protocol (§5), the read-after-write hint (§11). Under RwLock these become no-ops — writes are immediately visible to subsequent readers because they commit before the write lock is released.
 - **Plan reference:** `.claude/plans/phase-04-task-08.md` §3.8.
 - **Reconcile by:** future Phase 11+ work — either (a) patch hnsw_rs upstream to expose a clone-aware mutation model that supports atomic publication, or (b) replace `hnsw_rs` with a custom HNSW that does. Both are significant efforts that conflict with Phase 4's ship-quickly goal.
+
+---
+
+## SD-5.1-1: Refuse `pytorch_model.bin` (pickle) outright
+
+- **Spec:** `spec/04_embedding_layer/03_inference.md` §11 says safetensors is the default and pickle (`.bin`) is allowed with a warning.
+- **Implementation:** `ModelHandle::load` refuses `pytorch_model.bin` outright — only `model.safetensors` is accepted. Missing safetensors → `EmbedError::WeightsMissing`; the loader logs whether a `.bin` is present alongside but never attempts to load it.
+- **Reason:** pickle is arbitrary-code-execution by design (the `pickle` loader runs Python opcodes including class instantiation and import). Brain is a substrate trusted with cognitive state; allowing a model file to execute arbitrary code at load time is incompatible with our threat model. The spec's "warn and load" path is a holdover from PyTorch ergonomics that doesn't apply here.
+- **Plan reference:** `.claude/plans/phase-05-task-01.md`.
+- **Reconcile by:** raise a spec PR amending §04/03 §11 to say "safetensors only; pickle refused" — Brain's threat model justifies the tightening.
+
+---
+
+## SD-5.1-2: Safetensors loaded via `candle_core::safetensors::load` (safe, full-file) instead of mmap
+
+- **Spec:** silent on the load mechanism; spec §04/03 §9 step 3 just says "load weights".
+- **Implementation:** `load_weights` calls `candle_core::safetensors::load(path, device)` which reads the full file into memory. We deliberately avoid `candle_core::safetensors::load_buffer` / `VarBuilder::from_mmaped_safetensors` because those are `unsafe`.
+- **Reason:** the `brain-embed` crate carries `#![forbid(unsafe_code)]`. The mmap loader's `unsafe` reflects the fact that the mmap-backed view aliases the file on disk, which is sound in practice but not language-level safe. Keeping `forbid(unsafe_code)` here makes the crate auditable as a non-unsafe surface.
+- **Cost:** a one-time ~130 MiB allocation at startup (BGE-small weights). Weights stay resident for the process lifetime regardless, so this is a startup cost, not a steady-state cost.
+- **Plan reference:** `.claude/plans/phase-05-task-01.md`.
+- **Reconcile by:** if startup memory pressure becomes an issue at large model sizes, opt into the mmap loader by lifting `forbid(unsafe_code)` in a single audited spot. No urgency at v1.
