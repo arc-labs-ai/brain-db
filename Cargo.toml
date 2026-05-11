@@ -42,7 +42,7 @@ serde_json = "1"
 toml = "0.8"
 
 # Storage / indexing
-redb = "2"
+redb = "4"
 hnsw_rs = "0.3"
 
 # Embeddings (pure-Rust)

@@ -29,10 +29,15 @@ Implement the `redb`-backed metadata store: agents, contexts, memory metadata, e
 
 ## Sub-tasks
 
-### Task 3.1 — Schema versioning header
-**Reads:** `spec/02_data_model/09_schema_evolution.md`
-**Writes:** `crates/brain-metadata/src/schema.rs`
-**Done when:** A `__schema_meta` table records `schema_version=1` and refuses to open mismatched versions.
+### Task 3.1 — Schema versioning header ✅
+**Reads:** `spec/02_data_model/09_schema_evolution.md`, `spec/07_metadata_graph/02_table_layout.md` §6.
+**Writes:** `crates/brain-metadata/Cargo.toml` (real deps), `crates/brain-metadata/src/lib.rs` (real skeleton), `crates/brain-metadata/src/schema.rs` (new). Also bumped workspace `redb = "2"` → `"4"` (v4.1.0 picked up).
+**What was built:**
+- `CURRENT_SCHEMA_VERSION: u32 = 1`, `SCHEMA_META_TABLE: TableDefinition<&str, u32>` keyed by `"schema_version"`.
+- `open_or_init_schema(&Database) -> Result<u32, SchemaError>`. Fresh DB → writes v1. Same version → returns it. Older version → returns it (placeholder for v1.1+ migration registry). Newer version → `SchemaVersionTooNew`.
+- **Single global version row instead of per-table versions.** Spec §07/02 §6 reads "each table has a format version"; we use one global row covering the whole metadata file. The 13 tables co-evolve from the same crate; per-table machinery (13× the open-time checks + migration registry entries) adds bookkeeping for no benefit at v1. Documented inline in the module doc.
+- Tests gated `#[cfg(all(test, not(miri)))]` for consistency with Phase 2 (redb uses mmap internally).
+**Done when:** [x] `__schema_meta` records `schema_version=1` and refuses to open mismatched versions — `future_version_refuses_to_open` covers the rejection path; `fresh_db_initializes_at_v1`, `reopen_reads_existing_version`, `idempotent_reinit_returns_same_version`, `table_present_but_row_missing_initializes_to_v1` cover the rest. 5 tests.
 
 ### Task 3.2 — Memory metadata table
 **Reads:** `spec/07_metadata_graph/03_memory_table.md`

@@ -107,7 +107,14 @@ name = "brain-metadata"
 version = "0.1.0"
 dependencies = [
  "brain-core",
+ "brain-storage",
+ "bytemuck",
+ "proptest",
+ "redb",
+ "rkyv",
+ "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -651,6 +658,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
 dependencies = [
  "rand_core",
+]
+
+[[package]]
+name = "redb"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
