@@ -1,8 +1,6 @@
-<div align="center">
-
-<img src="assets/banner.svg" alt="brain — a cognitive substrate for AI agents" width="640">
-
-</div>
+<p align="center">
+  <img src="assets/banner.svg" alt="brain — a cognitive substrate for AI agents" width="100%">
+</p>
 
 # Brain
 
