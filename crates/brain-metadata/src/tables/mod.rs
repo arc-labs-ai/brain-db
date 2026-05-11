@@ -4,4 +4,6 @@
 //! catalog (13 spec'd domain tables; one internal `__schema_meta` from
 //! [`crate::schema`]).
 
+pub mod agent;
+pub mod context;
 pub mod memory;

@@ -59,10 +59,21 @@ Implement the `redb`-backed metadata store: agents, contexts, memory metadata, e
 
 **Done when:** [x] Insert/get/scan-by-(agent, context)/delete round-trip tests pass. Plus update, missing-key, Option round-trip, flag manipulation, brain-core type round-trip, encoding stability. **9 tests.**
 
-### Task 3.3 — Agents and contexts tables
-**Reads:** `spec/07_metadata_graph/05_context_table.md`
-**Writes:** `crates/brain-metadata/src/tables/agent.rs`, `context.rs`
-**Done when:** Both tables CRUD-tested.
+### Task 3.3 — Agents and contexts tables ✅
+**Reads:** `spec/07_metadata_graph/05_context_table.md`, `02_table_layout.md` §12.
+**Writes:** `crates/brain-metadata/src/tables/agent.rs`, `tables/context.rs`.
+
+**What was built (4 of the 13 tables):**
+- `AGENTS_TABLE: TableDefinition<[u8; 16], AgentMetadata>` — `AgentMetadata` carries `display_name`, `created_at`, `last_active_at`, denormalized `memory_count`/`context_count`. v1 defers "configuration overrides" from spec §07/02 §12 (field-addition follow-up via spec §02/09 §2).
+- `CONTEXTS_TABLE: TableDefinition<u64, ContextMetadata>` — `ContextMetadata` per spec §07/05 §2.1 (8 fields including `Vec<String> tags`).
+- `CONTEXT_NAMES_TABLE: TableDefinition<(&[u8; 16], &str), u64>` — name index for agent-scoped lookup.
+- `AGENT_CONTEXTS_TABLE: TableDefinition<([u8; 16], u64), ()>` — agent→[context_ids] membership, supports prefix range scan.
+
+**Composite keys via redb v4's tuple `Key` impl.** Worked out of the box — no fallback to manual byte concatenation needed. Fixed-width agent_id prefix means range scans by agent are clean prefix scans.
+
+**Helper constants:** `RESERVED_NAME_PREFIX = "_"` and `DEFAULT_CONTEXT_NAME = "_default"` per spec §07/05 §6. Writer-task (Phase 9) enforces the reservation against client input; storage doesn't validate.
+
+**Done when:** [x] Both tables CRUD-tested. 10 tests covering agent insert/update/delete/typed-getter, context insert by ID, name-index lookup with hit/miss, agent-prefix range scan, cross-agent name isolation (spec §07/05 §13), and `Vec<String>` + `Option<String>` rkyv round-trip.
 
 ### Task 3.4 — Edge storage
 **Reads:** `spec/07_metadata_graph/04_edge_storage.md`
