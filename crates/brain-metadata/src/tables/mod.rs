@@ -9,3 +9,4 @@ pub mod context;
 pub mod edge;
 pub mod idempotency;
 pub mod memory;
+pub mod text;

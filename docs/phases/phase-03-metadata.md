@@ -105,10 +105,23 @@ Implement the `redb`-backed metadata store: agents, contexts, memory metadata, e
 
 **Done when:** [x] 11 tests covering CRUD, missing-key, update, `Option<MemoryId>` round-trip, 256-byte payload round-trip, `request_hash` byte compare, prune-removes-old, prune-keeps-fresh, prune-mixed (3-old + 2-fresh), prune-saturating (entry at `u64::MAX`), and `type_name` v1-marker guard. Total in brain-metadata: 47 tests.
 
-### Task 3.6 — Text blob storage
+### Task 3.6 — Text blob storage ✅
 **Reads:** `spec/07_metadata_graph/07_text_storage.md`
-**Writes:** `crates/brain-metadata/src/tables/text.rs`
-**Done when:** Memory's text field stored separately, fetched on demand. Optional compression per spec.
+**Writes:** `crates/brain-metadata/src/tables/text.rs` (new), `crates/brain-metadata/src/tables/mod.rs` (add `pub mod text;`).
+
+**What was built (1 more table — 9 of 13):**
+- `TEXTS_TABLE: TableDefinition<[u8; 16], &[u8]>` — keyed by `MemoryId::to_be_bytes()`, valued by redb's **built-in** `&[u8]` variable-length type. No rkyv wrapper: there's no struct to evolve, and routing reads through rkyv would add the alignment-copy workaround for zero benefit.
+- Whole file is one `pub const` plus tests — every other concern lives above this layer.
+
+**Out-of-scope, all deliberate (per spec):**
+- **UTF-8 validation** (spec §5) — wire layer (Phase 4).
+- **`max_text_bytes` size limit** (spec §4, §7) — wire layer.
+- **Immutability enforcement** (spec §8) — application invariant; ENCODE is the only insert path.
+- **Hard-forget secure-erase** (spec §9) — needs `FALLOC_FL_PUNCH_HOLE` below redb's API. Phase 8 worker territory.
+- **Same-transaction coupling with `memories`** (spec §15) — `MetadataDb` (sub-task 3.10) composes both inside one `begin_write()`.
+- **Compression** — the "Optional compression per spec" line in the phase doc's original `Done when` was a phase-doc artifact; spec §07/07 doesn't mention compression anywhere.
+
+**Done when:** [x] 8 tests covering CRUD, missing-key, overwrite-replaces-bytes, empty `b""` round-trip, 1 MB round-trip (the spec's default `max_text_bytes` ceiling), multi-byte UTF-8 round-trip including the `std::str::from_utf8` re-decode sanity, and iterate-all-entries. Total in brain-metadata: 55 tests.
 
 ### Task 3.7 — Tombstone table
 **Reads:** `spec/07_metadata_graph/02_table_layout.md`
