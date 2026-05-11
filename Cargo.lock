@@ -305,7 +305,17 @@ name = "brain-ops"
 version = "0.1.0"
 dependencies = [
  "brain-core",
+ "brain-embed",
+ "brain-index",
+ "brain-metadata",
+ "brain-planner",
+ "brain-protocol",
+ "parking_lot",
+ "tempfile",
  "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
