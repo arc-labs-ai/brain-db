@@ -123,10 +123,18 @@ Implement the `redb`-backed metadata store: agents, contexts, memory metadata, e
 
 **Done when:** [x] 8 tests covering CRUD, missing-key, overwrite-replaces-bytes, empty `b""` round-trip, 1 MB round-trip (the spec's default `max_text_bytes` ceiling), multi-byte UTF-8 round-trip including the `std::str::from_utf8` re-decode sanity, and iterate-all-entries. Total in brain-metadata: 55 tests.
 
-### Task 3.7 — Tombstone table
-**Reads:** `spec/07_metadata_graph/02_table_layout.md`
-**Writes:** `crates/brain-metadata/src/tables/tombstone.rs`
-**Done when:** Tombstone insertion records `(memory_id, tombstoned_at, grace_until)`. Slot reclamation reads from this.
+### Task 3.7 — `slot_versions` table ✅
+**Reads:** `spec/07_metadata_graph/02_table_layout.md` §13; `spec/05_storage_arena_wal/07_write_path.md` §2.3; `spec/02_data_model/03_identifiers.md` §2.1.
+**Writes:** `crates/brain-metadata/src/tables/slot_version.rs` (new), `crates/brain-metadata/src/tables/mod.rs` (add `pub mod slot_version;`).
+
+**Realignment.** The phase doc originally framed 3.7 as a "Tombstone table" with value `(memory_id, tombstoned_at, grace_until)`. **That table is not in the spec catalog (§07/02 §1).** Tombstone *state* lives as `flags & HARD_FORGOTTEN` + `forgot_at_unix_nanos` on the existing `memories` row from 3.2; the reclaim worker scans memories for `forgot_at + grace < now` per spec §09/06 §16. The actual reclaim-related table in the spec catalog is `slot_versions`, and that's what this sub-task implements. No new SD entry — the realignment is *to* the spec, not away from it.
+
+**What was built (1 more table — 10 of 13):**
+- `SLOT_VERSIONS_TABLE: TableDefinition<u64, u32>` — keyed by `slot_id` (48-bit logical, stored as `u64` per spec catalog), valued by 32-bit version. redb's built-in scalar `Value`s — no rkyv wrapper.
+- `increment(&mut Table, slot_id) -> Result<u32, SlotVersionError>` — read-modify-write inside the caller's redb transaction. Missing row → returns 1 (spec §05/07 §2.3: never-used slot starts at 1). Existing → returns N+1. `u32::MAX` → returns `SlotVersionError::Exhausted { slot_id }` and does **not** write (fail-stop; silent wrap would violate spec §02/03 §2.3's MemoryId-stability invariant).
+- `SlotVersionError` — `Storage(redb::StorageError)` + `Exhausted { slot_id }`. Derives only `Debug` + `thiserror::Error` (redb::StorageError doesn't impl Clone/Copy/PartialEq — same constraint hit in 3.4).
+
+**Done when:** [x] 8 tests covering missing→1, existing→N+1, monotonic across 10 calls, two-slot independence (3 + 5 increments), **u32::MAX overflow returns Exhausted with no wrap-to-zero** (catastrophic-failure pin), direct insert/get, range scan returns u64 keys in numerical order (50/100/200), and missing-get returns None. Total in brain-metadata: 63 tests.
 
 ### Task 3.8 — Counters and statistics
 **Reads:** `spec/07_metadata_graph/02_table_layout.md`
