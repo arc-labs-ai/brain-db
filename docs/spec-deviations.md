@@ -150,3 +150,16 @@ The spec wins in general (per `CLAUDE.md` §2 and `AUTONOMY.md` §2); the entrie
 - **Reason:** `hnsw_rs`'s `Hnsw<'b, ...>` lifetime parameter is for mmap-backed data borrowed from the `HnswIo`. In non-mmap mode (which we use), the returned graph owns all its data and the `'b` is artificial — but the public API doesn't expose that. Without the leak, `HnswIndex` would need to be lifetime-generic (`HnswIndex<'a, const D: usize>`), forcing the lifetime to thread through every caller. The leak is `~few hundred bytes per snapshot load`; loads are startup-time (one per shard per restart), so the leaked memory is bounded by shard count and reclaimed at process exit.
 - **Plan reference:** `.claude/plans/phase-04-task-05.md` §3.6 (and 4.5 mid-flight discovery).
 - **Reconcile by:** Phase 11+ alternatives — patch hnsw_rs to expose a `'static`-returning loader for non-mmap mode, or migrate `HnswIndex` to be lifetime-generic. Neither is urgent at v1 scale.
+
+---
+
+## SD-4.8-1: `Arc<RwLock<HnswIndex>>` instead of `ArcSwap<HnswState>` for shared access
+
+- **Spec:** `spec/06_ann_index/08_concurrency.md` §3 mandates lock-free reads via `ArcSwap<HnswState>`, with a pending-insert buffer (§10) that periodically rebuilds and publishes a new state.
+- **Implementation:** `Arc<parking_lot::RwLock<HnswIndex<D>>>`. Concurrent reads (multiple readers proceed in parallel through `RwLock::read()`), exclusive writes (writers acquire `RwLock::write()`, briefly blocking readers).
+- **Reason:** the spec's ArcSwap pattern requires the writer to periodically clone or rebuild the published HNSW state. `hnsw_rs::Hnsw<f32, DistCosine>` doesn't implement `Clone`, and at the spec's 1M-node target a deep clone would cost ~150 MB and seconds — far past the spec's 100 ms flush cadence (§10). The pattern as written presumes a custom HNSW where clone-and-swap is cheap; with hnsw_rs (mandated by CLAUDE.md §6), it isn't.
+- **Trade-off:** writes briefly block readers (~1–3 ms per insert at 1M nodes per spec §06/03 §4). At typical write-to-read ratios this is acceptable; the spec's lock-free reader was specifically for high write-throughput scenarios.
+- **Other parts preserved:** single-writer-per-shard (spec §06/08 §1) is enforced at the type level via the `(SharedHnsw, Writer)` pair: `SharedHnsw` is `Clone`, `Writer` is not. Only one `Writer` can exist per `SharedHnsw`. Inserts take `&mut self` on the `Writer`.
+- **What's not implemented:** the pending-insert buffer (§10), the epoch protocol (§5), the read-after-write hint (§11). Under RwLock these become no-ops — writes are immediately visible to subsequent readers because they commit before the write lock is released.
+- **Plan reference:** `.claude/plans/phase-04-task-08.md` §3.8.
+- **Reconcile by:** future Phase 11+ work — either (a) patch hnsw_rs upstream to expose a clone-aware mutation model that supports atomic publication, or (b) replace `hnsw_rs` with a custom HNSW that does. Both are significant efforts that conflict with Phase 4's ship-quickly goal.

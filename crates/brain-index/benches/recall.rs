@@ -116,7 +116,9 @@ fn ground_truth(
     sims.into_iter().take(k).map(|(id, _)| id).collect()
 }
 
-fn build_corpus() -> (Vec<[f32; VECTOR_DIM]>, Vec<(MemoryId, [f32; VECTOR_DIM])>) {
+type CorpusPair = (Vec<[f32; VECTOR_DIM]>, Vec<(MemoryId, [f32; VECTOR_DIM])>);
+
+fn build_corpus() -> CorpusPair {
     let mut rng = Xs::new(0xCAFE);
     let centers: Vec<[f32; VECTOR_DIM]> = (0..N_CLUSTERS)
         .map(|_| random_unit_vector(&mut rng))
