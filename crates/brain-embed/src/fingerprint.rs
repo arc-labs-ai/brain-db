@@ -65,6 +65,18 @@ pub fn compute_fingerprint(
         .expect("BLAKE3 output is at least 32 bytes")
 }
 
+/// Compute the BLAKE3-truncated-16 of a text string. The cache in
+/// `crate::cache` uses this as its key, per spec
+/// `04_embedding_layer/05_caching.md` §2 — 16 bytes are enough that
+/// collision probability at 10⁶ entries is ≈ 10⁻¹⁹.
+#[must_use]
+pub fn blake3_hash_text(text: &str) -> [u8; 16] {
+    let full = blake3::hash(text.as_bytes());
+    full.as_bytes()[..16]
+        .try_into()
+        .expect("BLAKE3 output is 32 bytes")
+}
+
 /// Compute the BLAKE3 of a file by streaming 64 KiB chunks. Avoids
 /// loading the full ~130 MiB weights file into memory.
 pub fn blake3_hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
@@ -146,6 +158,18 @@ mod tests {
             "fingerprint algorithm changed; recompute the expected value and ensure no stored \
              fingerprints rely on the old algorithm"
         );
+    }
+
+    #[test]
+    fn blake3_hash_text_deterministic_and_16_bytes() {
+        let a = blake3_hash_text("hello");
+        let b = blake3_hash_text("hello");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 16);
+        let c = blake3_hash_text("hellO"); // case sensitive
+        assert_ne!(a, c);
+        let d = blake3_hash_text("");
+        assert_ne!(a, d);
     }
 
     #[test]

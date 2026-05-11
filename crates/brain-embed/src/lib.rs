@@ -28,6 +28,7 @@
 )]
 #![forbid(unsafe_code)]
 
+pub mod cache;
 pub mod config;
 pub mod dispatcher;
 pub mod error;
@@ -36,10 +37,11 @@ pub mod forward;
 pub mod model;
 pub mod tokenize;
 
+pub use cache::{CacheStats, CachingDispatcher, DEFAULT_CACHE_SIZE};
 pub use config::EmbedderConfig;
 pub use dispatcher::{CpuDispatcher, Dispatcher};
 pub use error::EmbedError;
-pub use fingerprint::{blake3_hash_file, compute_fingerprint};
+pub use fingerprint::{blake3_hash_file, blake3_hash_text, compute_fingerprint};
 pub use forward::{embed_batch, embed_text, forward_pooled, l2_normalize_in_place, VECTOR_DIM};
 pub use model::ModelHandle;
 pub use tokenize::{encode_batch, encode_single, Tokenized, MAX_TOKEN_LENGTH};

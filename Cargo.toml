@@ -61,6 +61,9 @@ crossbeam-epoch = "0.9"
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
 
+# Caches
+lru = "0.12"
+
 # Hashing / IDs
 blake3 = "1"
 crc32c = "0.6"
