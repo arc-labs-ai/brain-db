@@ -2,7 +2,7 @@
 //! wraps these into the wire `ResponseBody` variants; for Phase 6
 //! they're the integration-test assertion targets.
 
-use brain_core::{ContextId, MemoryId, MemoryKind};
+use brain_core::{ContextId, EdgeKind, MemoryId, MemoryKind};
 
 use super::writer::{EdgeOutcome, ForgetOutcome};
 
@@ -40,4 +40,34 @@ pub struct ForgetResult {
     pub memory_id: MemoryId,
     pub outcome: ForgetOutcome,
     pub replayed: bool,
+}
+
+/// Outcome of `execute_path`. Spec §09/04 §3 — multiple paths are
+/// computable, but the v1 wire frame carries only the top-1; this
+/// type preserves the full result for Phase 9's streaming chunker.
+#[derive(Debug, Clone)]
+pub struct PathResult {
+    pub paths: Vec<Path>,
+    pub status: PlanStatus,
+}
+
+/// One node-and-edge chain from a start memory to a goal memory.
+/// `edges[i]` is the edge that connects `nodes[i]` → `nodes[i + 1]`.
+#[derive(Debug, Clone)]
+pub struct Path {
+    pub nodes: Vec<MemoryId>,
+    pub edges: Vec<EdgeKind>,
+    pub score: f32,
+    pub node_salience: Vec<f32>,
+    pub node_text: Vec<String>,
+}
+
+/// Why `execute_path` returned. Mirrors the wire `PlanStatus` enum so
+/// the brain-ops handler can pass it through unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanStatus {
+    GoalReached,
+    BudgetExhausted,
+    NoPathFound,
+    Timeout,
 }

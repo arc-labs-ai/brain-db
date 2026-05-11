@@ -350,7 +350,10 @@ async fn dispatch_forget_returns_forget_variant() {
 }
 
 #[tokio::test]
-async fn dispatch_plan_variant_is_unsupported() {
+async fn dispatch_plan_variant_runs_bfs() {
+    // 7.5 wired the real PLAN executor. With ByText endpoints + an
+    // empty index, endpoint resolution returns an empty set →
+    // NoPathFound (not Unsupported, not an error).
     let fix = build_fixture();
     let req = PlanRequest {
         start: PlanState::ByText("origin".into()),
@@ -366,10 +369,11 @@ async fn dispatch_plan_variant_is_unsupported() {
     };
     let plan = plan_path(&req, &PlannerContext::default()).unwrap();
     match execute(plan, &fix.ctx).await {
-        Err(ExecError::Unsupported(msg)) => {
-            assert!(msg.contains("PLAN"), "expected PLAN message, got {msg}");
+        Ok(brain_planner::ExecutionResult::Plan(r)) => {
+            assert_eq!(r.status, brain_planner::PlanStatus::NoPathFound);
+            assert!(r.paths.is_empty());
         }
-        other => panic!("expected Unsupported, got {other:?}"),
+        other => panic!("expected ExecutionResult::Plan, got {other:?}"),
     }
 }
 
