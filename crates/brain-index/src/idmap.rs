@@ -114,6 +114,37 @@ impl IdMap {
             .get(&internal_id)
             .map(|bytes| MemoryId::from_be_bytes(*bytes))
     }
+
+    /// Iterate the forward mapping as `([u8; 16], u32)` pairs. Used by
+    /// snapshot persistence (sub-task 4.5) to serialise the map.
+    /// Order is unspecified — callers must not depend on it.
+    pub fn iter_forward(&self) -> impl Iterator<Item = ([u8; 16], u32)> + '_ {
+        self.forward.iter().map(|(k, v)| (*k, *v))
+    }
+
+    /// The internal allocator's next-id value. Used by snapshot
+    /// persistence to restore the counter on load.
+    #[must_use]
+    pub fn next_id(&self) -> u32 {
+        self.next_id
+    }
+
+    /// Re-construct an `IdMap` from a parsed snapshot's forward
+    /// entries + the recorded `next_id`. Reverse direction is rebuilt
+    /// here in O(N) so we don't have to serialise both directions.
+    pub fn from_snapshot(entries: Vec<([u8; 16], u32)>, next_id: u32) -> Self {
+        let mut forward = std::collections::HashMap::with_capacity(entries.len());
+        let mut reverse = std::collections::HashMap::with_capacity(entries.len());
+        for (key, id) in entries {
+            forward.insert(key, id);
+            reverse.insert(id, key);
+        }
+        Self {
+            forward,
+            reverse,
+            next_id,
+        }
+    }
 }
 
 #[cfg(test)]

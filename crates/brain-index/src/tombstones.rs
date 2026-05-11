@@ -90,6 +90,22 @@ impl TombstoneBitmap {
     pub fn count(&self) -> usize {
         self.count
     }
+
+    /// Raw bitmap words. Used by snapshot persistence (sub-task 4.5)
+    /// to serialise the bitmap byte-for-byte.
+    #[must_use]
+    pub fn raw_words(&self) -> &[u64] {
+        &self.bits
+    }
+
+    /// Re-construct a `TombstoneBitmap` from a parsed snapshot. The
+    /// `count` is taken verbatim from the snapshot rather than
+    /// re-summed; this is correct because the caller validated the
+    /// snapshot's BLAKE3 footer.
+    #[must_use]
+    pub fn from_snapshot(words: Vec<u64>, count: usize) -> Self {
+        Self { bits: words, count }
+    }
 }
 
 /// Split `id` into `(word_index, bit_index_within_word)`.

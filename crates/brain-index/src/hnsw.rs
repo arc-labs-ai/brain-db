@@ -29,12 +29,18 @@
 //! - **Rebuild from external iterator** — sub-task 4.6.
 //! - **Concurrency wrapper** (`ArcSwap` + pending buffer) — sub-task 4.8.
 
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
 use brain_core::MemoryId;
-use hnsw_rs::prelude::{DistCosine, Hnsw, Neighbour};
+use hnsw_rs::api::AnnT;
+use hnsw_rs::prelude::{DistCosine, Hnsw, HnswIo, Neighbour};
 use thiserror::Error;
 
 use crate::idmap::{IdMap, IdMapError};
 use crate::params::{IndexParams, IndexParamsError, DEFAULT_CAPACITY_HINT, MAX_LAYER};
+use crate::persistence::{self, Body, BodyError, Header, HeaderError, FOOTER_LEN, HEADER_LEN};
 use crate::tombstones::TombstoneBitmap;
 
 /// Default over-fetch multiplier for post-filter search. Spec §09 §2.
@@ -86,6 +92,61 @@ pub enum HnswError {
     /// rather than this error — query paths are fail-soft.
     #[error("memory_id not found in id_map: {memory_id_bytes:?}")]
     MemoryIdNotFound { memory_id_bytes: [u8; 16] },
+
+    // ---- 4.5 snapshot errors ----------------------------------------
+    #[error("snapshot I/O error: {0}")]
+    SnapshotIo(#[from] std::io::Error),
+
+    #[error("snapshot magic mismatch: expected BHN0, got {0:?}")]
+    SnapshotBadMagic([u8; 4]),
+
+    #[error("snapshot format_version {0} not supported by this binary")]
+    SnapshotUnsupportedVersion(u32),
+
+    #[error("snapshot shard_uuid mismatch: expected {expected:?}, got {got:?}")]
+    SnapshotShardMismatch { expected: [u8; 16], got: [u8; 16] },
+
+    #[error("snapshot vector dim mismatch: expected {expected}, got {got}")]
+    SnapshotDimMismatch { expected: usize, got: u32 },
+
+    #[error("snapshot header CRC mismatch: expected {expected:08x}, got {got:08x}")]
+    SnapshotBadHeaderCrc { expected: u32, got: u32 },
+
+    #[error("snapshot BLAKE3 footer mismatch: file corrupted")]
+    SnapshotBadFooter,
+
+    #[error("snapshot truncated: expected at least {expected} bytes, got {got}")]
+    SnapshotTruncated { expected: usize, got: usize },
+
+    #[error("snapshot body malformed: {0}")]
+    SnapshotBadBody(&'static str),
+
+    #[error("hnsw_rs load failed: {0}")]
+    HnswLoadFailed(String),
+}
+
+impl From<HeaderError> for HnswError {
+    fn from(e: HeaderError) -> Self {
+        match e {
+            HeaderError::Truncated { expected, got } => {
+                HnswError::SnapshotTruncated { expected, got }
+            }
+            HeaderError::BadMagic(m) => HnswError::SnapshotBadMagic(m),
+            HeaderError::UnsupportedVersion(v) => HnswError::SnapshotUnsupportedVersion(v),
+            HeaderError::BadCrc { expected, got } => {
+                HnswError::SnapshotBadHeaderCrc { expected, got }
+            }
+        }
+    }
+}
+
+impl From<BodyError> for HnswError {
+    fn from(e: BodyError) -> Self {
+        match e {
+            BodyError::Truncated => HnswError::SnapshotBadBody("truncated mid-section"),
+            BodyError::TrailingBytes(_) => HnswError::SnapshotBadBody("trailing bytes after body"),
+        }
+    }
 }
 
 impl From<IdMapError> for HnswError {
@@ -322,6 +383,193 @@ impl<const D: usize> HnswIndex<D> {
     fn resolve_ef(&self, k: usize, override_ef: Option<usize>) -> usize {
         let base = override_ef.unwrap_or(self.params.ef_search);
         base.max(k).min(self.params.ef_search_max)
+    }
+
+    /// Save this index as a snapshot in `dir` under `basename`. Writes
+    /// three files: `<basename>.hnsw.graph`, `<basename>.hnsw.data`
+    /// (hnsw_rs's serialisation), and `<basename>.brain` (our wrapper
+    /// with id_map + tombstones + integrity footer).
+    ///
+    /// Per spec `§06/06`, the snapshot is an *optional* fast-restart
+    /// artifact — the arena + metadata remain the source of truth.
+    /// Spec `§06/06 §5.3` mandates corruption detection: if any of the
+    /// three files is missing or invalid at load time, the caller
+    /// falls back to a full `rebuild` from arena + metadata (sub-task
+    /// 4.6).
+    ///
+    /// The `.brain` file is written **last**, so its presence is the
+    /// marker for "snapshot complete."
+    pub fn save_snapshot(
+        &self,
+        dir: &Path,
+        basename: &str,
+        taken_at_lsn: u64,
+        shard_uuid: [u8; 16],
+    ) -> Result<(), HnswError> {
+        fs::create_dir_all(dir)?;
+
+        // 1. Remove any stale snapshot files at this basename so
+        //    hnsw_rs's overwrite-avoidance doesn't pick a random
+        //    suffix.
+        for ext in [".hnsw.graph", ".hnsw.data", ".brain"] {
+            let p = dir.join(format!("{basename}{ext}"));
+            if p.exists() {
+                fs::remove_file(&p)?;
+            }
+        }
+
+        // 2. hnsw_rs writes the two `.hnsw.*` files. Skip on empty
+        //    index — hnsw_rs's `file_dump` errors on zero nodes; the
+        //    `.brain` file alone carries enough state to restore
+        //    (loader notices `graph_node_count == 0` and constructs a
+        //    fresh empty inner).
+        if !self.is_empty() {
+            self.inner
+                .file_dump(dir, basename)
+                .map_err(|e| HnswError::HnswLoadFailed(format!("file_dump: {e}")))?;
+        }
+
+        // 3. Build the `.brain` body bytes.
+        let header = Header::new::<D>(
+            shard_uuid,
+            taken_at_lsn,
+            self.id_map.len() as u64,
+            self.params,
+        );
+        let header_bytes = header.encode();
+        let body = Body::encode(&self.id_map, self.id_map.next_id(), &self.tombstones);
+
+        let mut file_bytes = Vec::with_capacity(HEADER_LEN + body.bytes.len() + FOOTER_LEN);
+        file_bytes.extend_from_slice(&header_bytes);
+        file_bytes.extend_from_slice(&body.bytes);
+        let footer = persistence::compute_footer(&file_bytes);
+        file_bytes.extend_from_slice(&footer);
+
+        // 4. Atomic write of the `.brain` file: tempfile + rename.
+        let final_path = dir.join(format!("{basename}.brain"));
+        let tmp_path: PathBuf = dir.join(format!("{basename}.brain.tmp"));
+        {
+            let mut f = fs::File::create(&tmp_path)?;
+            f.write_all(&file_bytes)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp_path, &final_path)?;
+        // fsync the directory so the rename is durable.
+        if let Ok(dir_handle) = fs::File::open(dir) {
+            let _ = dir_handle.sync_all();
+        }
+
+        tracing::info!(
+            dir = %dir.display(),
+            basename,
+            graph_node_count = self.id_map.len(),
+            taken_at_lsn,
+            "saved HNSW snapshot",
+        );
+        Ok(())
+    }
+
+    /// Load an index from a snapshot. Validates magic, format version,
+    /// shard_uuid, header CRC, BLAKE3 footer, and the body's
+    /// structural integrity. Rebuilds the id_map's reverse direction
+    /// from the forward direction.
+    ///
+    /// Returns the loaded `(HnswIndex, taken_at_lsn)`. Callers (Phase
+    /// 8 maintenance worker) compare the LSN against the metadata
+    /// store's `durable_lsn` to detect stale snapshots per spec
+    /// `§06/06 §5.3`.
+    pub fn load_snapshot(
+        dir: &Path,
+        basename: &str,
+        expected_shard_uuid: [u8; 16],
+    ) -> Result<(Self, u64), HnswError> {
+        // 1. Read and validate `.brain`.
+        let brain_path = dir.join(format!("{basename}.brain"));
+        let file_bytes = persistence::read_brain_file(&brain_path)?;
+
+        // 2. Verify the BLAKE3 footer.
+        if !persistence::verify_footer(&file_bytes) {
+            return Err(HnswError::SnapshotBadFooter);
+        }
+        if file_bytes.len() < HEADER_LEN + FOOTER_LEN {
+            return Err(HnswError::SnapshotTruncated {
+                expected: HEADER_LEN + FOOTER_LEN,
+                got: file_bytes.len(),
+            });
+        }
+
+        // 3. Parse the header.
+        let header = Header::parse(&file_bytes[..HEADER_LEN])?;
+        if header.shard_uuid != expected_shard_uuid {
+            return Err(HnswError::SnapshotShardMismatch {
+                expected: expected_shard_uuid,
+                got: header.shard_uuid,
+            });
+        }
+        if header.vector_dim as usize != D {
+            return Err(HnswError::SnapshotDimMismatch {
+                expected: D,
+                got: header.vector_dim,
+            });
+        }
+
+        // 4. Parse the body (between header and footer).
+        let body_start = HEADER_LEN;
+        let body_end = file_bytes.len() - FOOTER_LEN;
+        let parsed_body = persistence::ParsedBody::parse(&file_bytes[body_start..body_end])?;
+
+        // 5. Load the hnsw_rs graph from `<basename>.hnsw.*`, or
+        //    construct a fresh empty inner if the snapshot recorded
+        //    zero nodes (saved-empty case — hnsw_rs's `file_dump`
+        //    errors on empty graphs, so we omit the `.hnsw.*` files
+        //    on save and reconstruct here).
+        //
+        // For the non-empty path: `HnswIo::load_hnsw_with_dist` returns
+        // a `Hnsw<'b, T, D>` whose lifetime `'b` is tied to the
+        // `HnswIo`'s `'a` (with `'a: 'b`). We hold `Hnsw<'static, ...>`
+        // to keep `HnswIndex` lifetime-free. In non-mmap mode the
+        // returned graph owns all its data — the `'b` lifetime is
+        // artificial — but the API doesn't expose that. We `Box::leak`
+        // the `HnswIo` so the borrow is `'static`. Per-load overhead:
+        // the `HnswIo` is a small struct (PathBuf + String +
+        // ReloadOptions), and snapshot loads are startup-time (one per
+        // shard per restart), so the leak is bounded by the shard count.
+        let inner: Hnsw<'static, f32, DistCosine> = if header.graph_node_count == 0 {
+            Hnsw::<f32, DistCosine>::new(
+                header.m as usize,
+                DEFAULT_CAPACITY_HINT,
+                MAX_LAYER,
+                header.ef_construction as usize,
+                DistCosine,
+            )
+        } else {
+            let io: &'static HnswIo = Box::leak(Box::new(HnswIo::new(dir, basename)));
+            io.load_hnsw_with_dist(DistCosine)
+                .map_err(|e| HnswError::HnswLoadFailed(format!("{e}")))?
+        };
+
+        // 6. Reconstruct id_map + tombstones from parsed body.
+        let id_map = IdMap::from_snapshot(parsed_body.id_map_entries, parsed_body.next_internal_id);
+        let tombstones = TombstoneBitmap::from_snapshot(
+            parsed_body.tombstone_words,
+            parsed_body.tombstone_set_count as usize,
+        );
+
+        // 7. Build the IndexParams back from the header.
+        let params = IndexParams {
+            m: header.m as usize,
+            ef_construction: header.ef_construction as usize,
+            ef_search: header.ef_search as usize,
+            ef_search_max: header.ef_search_max as usize,
+        };
+
+        let idx = Self {
+            inner,
+            params,
+            id_map,
+            tombstones,
+        };
+        Ok((idx, header.taken_at_lsn))
     }
 }
 
@@ -681,5 +929,191 @@ mod tests {
         assert!(results[0].1 > 1.0 - 1e-5);
         assert_eq!(results[1].0, mid(1));
         assert!(results[1].1.abs() < 1e-5);
+    }
+
+    // ----- 4.5-specific tests --------------------------------------------
+
+    const TEST_UUID: [u8; 16] = [0xCD; 16];
+
+    fn populated_index() -> HnswIndex<4> {
+        let mut idx = HnswIndex::<4>::new(params_d4()).unwrap();
+        idx.insert(mid(1), &vec4(1.0, 0.0, 0.0, 0.0)).unwrap();
+        idx.insert(mid(2), &vec4(0.0, 1.0, 0.0, 0.0)).unwrap();
+        idx.insert(mid(3), &vec4(0.0, 0.0, 1.0, 0.0)).unwrap();
+        idx
+    }
+
+    #[test]
+    fn round_trip_empty_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = HnswIndex::<4>::new(params_d4()).unwrap();
+        idx.save_snapshot(dir.path(), "test", 42, TEST_UUID)
+            .unwrap();
+
+        let (loaded, lsn) = HnswIndex::<4>::load_snapshot(dir.path(), "test", TEST_UUID).unwrap();
+        assert_eq!(loaded.len(), 0);
+        assert!(loaded.is_empty());
+        assert_eq!(lsn, 42);
+    }
+
+    #[test]
+    fn round_trip_with_memories() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = populated_index();
+        let q = vec4(1.0, 0.0, 0.0, 0.0);
+        let pre = idx.search_active(&q, 3, None);
+
+        idx.save_snapshot(dir.path(), "snap", 100, TEST_UUID)
+            .unwrap();
+        let (loaded, _) = HnswIndex::<4>::load_snapshot(dir.path(), "snap", TEST_UUID).unwrap();
+
+        assert_eq!(loaded.len(), 3);
+        let post = loaded.search_active(&q, 3, None);
+        assert_eq!(pre.len(), post.len());
+        for (a, b) in pre.iter().zip(post.iter()) {
+            assert_eq!(a.0, b.0, "MemoryId mismatch after round trip");
+            assert!(
+                (a.1 - b.1).abs() < 1e-5,
+                "similarity mismatch {} vs {}",
+                a.1,
+                b.1
+            );
+        }
+    }
+
+    #[test]
+    fn round_trip_with_tombstones() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = populated_index();
+        idx.mark_tombstoned(mid(1)).unwrap();
+        idx.mark_tombstoned(mid(3)).unwrap();
+        assert_eq!(idx.tombstone_count(), 2);
+
+        idx.save_snapshot(dir.path(), "t", 0, TEST_UUID).unwrap();
+        let (loaded, _) = HnswIndex::<4>::load_snapshot(dir.path(), "t", TEST_UUID).unwrap();
+
+        assert!(loaded.is_tombstoned(mid(1)));
+        assert!(!loaded.is_tombstoned(mid(2)));
+        assert!(loaded.is_tombstoned(mid(3)));
+        assert_eq!(loaded.tombstone_count(), 2);
+    }
+
+    #[test]
+    fn round_trip_preserves_next_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = HnswIndex::<4>::new(params_d4()).unwrap();
+        for i in 1..=5u64 {
+            idx.insert(mid(i), &vec4(i as f32, 0.0, 0.0, 0.0)).unwrap();
+        }
+        idx.save_snapshot(dir.path(), "n", 0, TEST_UUID).unwrap();
+
+        let (mut loaded, _) = HnswIndex::<4>::load_snapshot(dir.path(), "n", TEST_UUID).unwrap();
+        // Next insert should succeed without colliding with id 0..=4.
+        loaded
+            .insert(mid(99), &vec4(99.0, 0.0, 0.0, 0.0))
+            .expect("insert after load should succeed");
+        assert_eq!(loaded.len(), 6);
+    }
+
+    #[test]
+    fn load_returns_taken_at_lsn() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = populated_index();
+        idx.save_snapshot(dir.path(), "lsn", 0xDEAD_BEEF, TEST_UUID)
+            .unwrap();
+        let (_, lsn) = HnswIndex::<4>::load_snapshot(dir.path(), "lsn", TEST_UUID).unwrap();
+        assert_eq!(lsn, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn load_rejects_wrong_shard_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = populated_index();
+        idx.save_snapshot(dir.path(), "s", 0, TEST_UUID).unwrap();
+        let wrong = [0x01; 16];
+        match HnswIndex::<4>::load_snapshot(dir.path(), "s", wrong) {
+            Err(HnswError::SnapshotShardMismatch { expected, got }) => {
+                assert_eq!(expected, wrong);
+                assert_eq!(got, TEST_UUID);
+            }
+            Err(e) => panic!("expected SnapshotShardMismatch, got error {e}"),
+            Ok(_) => panic!("expected SnapshotShardMismatch, got Ok"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_wrong_dim() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = populated_index(); // HnswIndex<4>
+        idx.save_snapshot(dir.path(), "d", 0, TEST_UUID).unwrap();
+        // Attempt to load as HnswIndex<8>.
+        match HnswIndex::<8>::load_snapshot(dir.path(), "d", TEST_UUID) {
+            Err(HnswError::SnapshotDimMismatch {
+                expected: 8,
+                got: 4,
+            }) => {}
+            Err(e) => panic!("expected SnapshotDimMismatch, got error {e}"),
+            Ok(_) => panic!("expected SnapshotDimMismatch, got Ok"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_corrupted_brain_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = populated_index();
+        idx.save_snapshot(dir.path(), "c", 0, TEST_UUID).unwrap();
+
+        // Flip a byte near the end of the .brain file (inside the
+        // footer hash).
+        let path = dir.path().join("c.brain");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        match HnswIndex::<4>::load_snapshot(dir.path(), "c", TEST_UUID) {
+            Err(HnswError::SnapshotBadFooter) => {}
+            Err(e) => panic!("expected SnapshotBadFooter, got error {e}"),
+            Ok(_) => panic!("expected SnapshotBadFooter, got Ok"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_missing_hnsw_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = populated_index();
+        idx.save_snapshot(dir.path(), "m", 0, TEST_UUID).unwrap();
+        // Delete the hnsw graph file to simulate partial / corrupt snapshot.
+        std::fs::remove_file(dir.path().join("m.hnsw.graph")).unwrap();
+
+        match HnswIndex::<4>::load_snapshot(dir.path(), "m", TEST_UUID) {
+            Err(HnswError::HnswLoadFailed(_)) => {}
+            Err(e) => panic!("expected HnswLoadFailed, got error {e}"),
+            Ok(_) => panic!("expected HnswLoadFailed, got Ok"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_unsupported_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = populated_index();
+        idx.save_snapshot(dir.path(), "v", 0, TEST_UUID).unwrap();
+        // Tamper: bump format_version to 99 and recompute header CRC
+        // + BLAKE3 footer so that only the version check fires.
+        let path = dir.path().join("v.brain");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4..8].copy_from_slice(&99u32.to_le_bytes());
+        let new_header_crc = crc32c::crc32c(&bytes[..60]);
+        bytes[60..64].copy_from_slice(&new_header_crc.to_le_bytes());
+        let split = bytes.len() - 8;
+        let footer = crate::persistence::compute_footer(&bytes[..split]);
+        bytes[split..].copy_from_slice(&footer);
+        std::fs::write(&path, &bytes).unwrap();
+
+        match HnswIndex::<4>::load_snapshot(dir.path(), "v", TEST_UUID) {
+            Err(HnswError::SnapshotUnsupportedVersion(99)) => {}
+            Err(e) => panic!("expected SnapshotUnsupportedVersion(99), got error {e}"),
+            Ok(_) => panic!("expected SnapshotUnsupportedVersion(99), got Ok"),
+        }
     }
 }

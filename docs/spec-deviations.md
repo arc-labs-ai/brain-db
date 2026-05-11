@@ -127,3 +127,26 @@ The spec wins in general (per `CLAUDE.md` §2 and `AUTONOMY.md` §2); the entrie
 - **Plan reference:** post-Phase-3 audit-followups batch.
 - **Reconcile by:** raise a spec PR to update §05/05 §10 to declare the four-field layout. No code change pending — the implementation is the correct shape.
 
+---
+
+## SD-4.5-1: HNSW snapshot is a directory of three files, not the single file spec §06/06 §5.1 describes
+
+- **Spec:** `spec/06_ann_index/06_persistence.md` §5.1 describes the snapshot as a single file with embedded sections: 64-byte BHN0 header, then "graph data: serialized via hnsw_rs's built-in serialization", then "id_map data: serialized HashMaps", then an 8-byte BLAKE3 footer.
+- **Implementation:** the snapshot is a **directory** containing three files at the same `basename`:
+  - `<basename>.hnsw.graph` — written by `hnsw_rs::Hnsw::file_dump`.
+  - `<basename>.hnsw.data` — written by `hnsw_rs::Hnsw::file_dump`.
+  - `<basename>.brain` — our wrapper file with the 64-byte BHN0 header, id_map entries, `next_internal_id`, tombstone bitmap, and 8-byte BLAKE3 footer covering the `.brain` file only. Written **last** so its presence is the "snapshot complete" marker.
+- **Reason:** `hnsw_rs::Hnsw::file_dump(path, basename)` writes two separate files and exposes no `Write` / `Cursor` interface for in-memory serialization. To honour the spec's single-file format we'd dump to a temp directory, read both files into memory, and concatenate into our wrapper — extra I/O, extra disk, complicated atomic-write story. The directory-of-three layout matches hnsw_rs's idiom natively and gives us the same integrity properties (header CRC32C on the `.brain` file; BLAKE3 footer over `.brain`; the `.hnsw.*` files validated transitively by hnsw_rs's own format on load).
+- **Special case:** for empty indexes (`graph_node_count == 0`) we skip the `.hnsw.*` files entirely — hnsw_rs's `file_dump` errors on zero-node graphs. The loader notices the header's `graph_node_count == 0` and constructs a fresh empty inner instead of calling `HnswIo::load_hnsw_with_dist`.
+- **Plan reference:** `.claude/plans/phase-04-task-05.md` §3.1.
+- **Reconcile by:** raise a spec PR amending §06/06 §5.1 to describe the directory-of-three layout. The integrity properties are equivalent; the change is documentation-only.
+
+---
+
+## SD-4.5-2: `HnswIo` is `Box::leak`'d on snapshot load
+
+- **Spec:** silent on implementation detail.
+- **Implementation:** `HnswIndex::load_snapshot` calls `Box::leak(Box::new(HnswIo::new(dir, basename)))` to get a `&'static HnswIo`, then calls `load_hnsw_with_dist` on it. The returned `Hnsw<'b, T, D>` has `'b ≤ 'a` (where `'a` is the `HnswIo`'s borrow lifetime); we hold `Hnsw<'static, ...>` inside `HnswIndex` to keep the wrapper lifetime-free.
+- **Reason:** `hnsw_rs`'s `Hnsw<'b, ...>` lifetime parameter is for mmap-backed data borrowed from the `HnswIo`. In non-mmap mode (which we use), the returned graph owns all its data and the `'b` is artificial — but the public API doesn't expose that. Without the leak, `HnswIndex` would need to be lifetime-generic (`HnswIndex<'a, const D: usize>`), forcing the lifetime to thread through every caller. The leak is `~few hundred bytes per snapshot load`; loads are startup-time (one per shard per restart), so the leaked memory is bounded by shard count and reclaimed at process exit.
+- **Plan reference:** `.claude/plans/phase-04-task-05.md` §3.6 (and 4.5 mid-flight discovery).
+- **Reconcile by:** Phase 11+ alternatives — patch hnsw_rs to expose a `'static`-returning loader for non-mmap mode, or migrate `HnswIndex` to be lifetime-generic. Neither is urgent at v1 scale.

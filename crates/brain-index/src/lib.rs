@@ -30,6 +30,7 @@
 pub mod hnsw;
 pub mod idmap;
 pub mod params;
+pub mod persistence;
 pub mod tombstones;
 
 pub use hnsw::{HnswError, HnswIndex};
