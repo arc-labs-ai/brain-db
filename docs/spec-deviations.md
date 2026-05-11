@@ -85,3 +85,45 @@ The spec wins in general (per `CLAUDE.md` §2 and `AUTONOMY.md` §2); the entrie
 - **Reason:** carries forward SD-2.8-2 — there's no async runtime in `brain-storage` yet. The `&mut self` change (rather than `&self` + interior mutability) reflects spec §07 §15's single-writer-per-shard discipline at the type level: the borrow checker enforces that there's only one active writer.
 - **Plan reference:** `.claude/plans/phase-02-task-09.md` §3.1.
 - **Reconcile by:** Phase 9, alongside SD-2.8-2. Becomes `pub async fn append(&self, record) -> Result<Lsn>` once the writer runs as a Glommio coroutine and the committer is `&self`-safe via the runtime's task-local guarantees.
+
+---
+
+## SD-3.5-1: `IdempotencyEntry` adds a `request_hash` field beyond spec §2's struct listing
+
+- **Spec:** `spec/07_metadata_graph/06_idempotency.md` §2 lists four fields on `IdempotencyEntry`: `response_kind`, `memory_id`, `response_payload`, `created_at`.
+- **Implementation:** stores those four plus a fifth field `request_hash: [u8; 32]` (BLAKE3 over the canonical request form).
+- **Reason:** spec §5 mandates a conflict-detection check that compares "a hash of the canonical form of the request" against the stored entry on retry. The response payload alone isn't reversible into the canonical request (responses include server-generated `MemoryId`s, encoded responses, etc.), so the hash must be stored alongside. 32 bytes per row is negligible against the ~50 B/row figure spec §7 uses for capacity planning (dominated by `response_payload`). Storing the hash also keeps the storage layer decision-free: the Phase 9 handler computes it from the canonical request bytes; storage just keeps the bytes.
+- **Plan reference:** `.claude/plans/phase-03-task-05.md` §3.1.
+- **Reconcile by:** raising a spec PR to add `request_hash: [u8; 32]` to the `IdempotencyEntry` struct listing in §07/06 §2. No code change pending — the implementation is the correct shape; the spec text under-specifies it.
+
+---
+
+## SD-3.11-1: `MetadataSink::apply` signature extended with `timestamp_ns: u64`
+
+- **Spec:** `spec/05_storage_arena_wal/08_recovery.md` describes the sink-callback contract conceptually but doesn't pin a specific Rust signature.
+- **Implementation:** `apply(&mut self, lsn: u64, payload: &WalPayload)` → `apply(&mut self, lsn: u64, timestamp_ns: u64, payload: &WalPayload)`. brain-storage's `MetadataSink` trait, `InMemoryMetadataSink::apply`, and the recovery dispatch all updated. brain-metadata's real sink uses the timestamp to populate `CheckpointMeta.completed_at_unix_nanos` on `CheckpointEnd` (and is forward-compatible with future variants that need it — UpdateKind / UpdateContext / others audit-trail timestamps).
+- **Reason:** the WAL record carries `timestamp_ns` already; threading it through `apply` means sinks don't have to buffer a parallel record-header stream just to populate audit/observability timestamps. The alternative was extending each payload that needs a timestamp (CheckpointEndPayload, then any future variant), which would duplicate the record-level timestamp inside every variant.
+- **Plan reference:** `.claude/plans/phase-03-task-11.md` §1.1.
+- **Reconcile by:** none needed — internal API. Recorded so a future spec/§05/08 amendment can pin the signature.
+
+---
+
+## SD-3.11-2: Reclaim's memory-row cleanup is O(N) scan during recovery
+
+- **Spec:** `spec/07_metadata_graph/02_table_layout.md` §13 describes the `slot_versions` table for "lazy reclaim" but doesn't specify how the corresponding `memories` row is located when only a `(slot_id, old_version)` pair is on hand.
+- **Implementation:** `ReclaimPayload` carries `slot_id` + `old_version` + `new_version` but **not** the original `MemoryId`. To delete the memory row + its text, the sink scans `memories` looking for a row whose `slot_id` and `slot_version` match. O(N) per reclaim where N is the number of memory rows in the shard.
+- **Reason:** the wire/worker layer that emits Reclaim has the `MemoryId` in scope; carrying it forward in the payload would make the storage-layer reclaim path O(1). v1 accepts the cost because (a) reclaims are rare during recovery (only after grace expiry), (b) live ops shouldn't go through this apply path (the writer task composes the same operations with the MemoryId already known), (c) extending `ReclaimPayload` requires a brain-storage WAL-payload change which we've already done once this phase (SD-3.11-1) and prefer to batch.
+- **Plan reference:** `.claude/plans/phase-03-task-11.md` §3.6.
+- **Reconcile by:** extend `ReclaimPayload` with `memory_id: MemoryId` in a future Phase 2 amendment; the sink then deletes by key in O(1) instead of scanning. Tracked as a follow-up.
+- **Status:** **Reconciled** by SD-3.11-3 (audit-followups-1 batch). `ReclaimPayload` now carries `memory_id`; the sink uses an O(1) primary-key delete.
+
+---
+
+## SD-3.11-3: `ReclaimPayload` carries `memory_id` beyond spec §05/05 §10's three-field listing
+
+- **Spec:** `spec/05_storage_arena_wal/05_wal_records.md` §10 declares `struct ReclaimRecord { slot_id, old_version, new_version }` — three fields.
+- **Implementation:** adds a fourth field `memory_id: MemoryId`, encoded after `new_version`. On-disk layout is `slot_id (u64) | old_version (u32) | new_version (u32) | memory_id (16 B)`.
+- **Reason:** closes SD-3.11-2. The metadata sink needs the row's primary key (`MemoryId.to_be_bytes()`) to delete the `memories` and `texts` rows during recovery. Without `memory_id` in the payload, the sink scans the entire `memories` table looking for a row matching `(slot_id, slot_version)` — O(N) per reclaim. Adding the field is 16 bytes per Reclaim record (a rare record type during recovery; routine but bounded during live ops).
+- **Plan reference:** post-Phase-3 audit-followups batch.
+- **Reconcile by:** raise a spec PR to update §05/05 §10 to declare the four-field layout. No code change pending — the implementation is the correct shape.
+

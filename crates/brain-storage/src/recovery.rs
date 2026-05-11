@@ -50,15 +50,25 @@ use crate::wal::record::WalRecord;
 /// (`brain-metadata` in Phase 3).
 ///
 /// The recovery driver feeds every applied record to the sink. The sink
-/// is responsible for idempotency — `apply(lsn, payload)` may be called
-/// more than once with the same `lsn` if recovery re-runs.
+/// is responsible for idempotency — `apply(lsn, timestamp_ns, payload)`
+/// may be called more than once with the same `lsn` if recovery re-runs.
 pub trait MetadataSink {
     /// The LSN through which the sink's state is durable. Recovery skips
     /// records whose `lsn <= durable_lsn()`. Returns 0 for a fresh sink.
     fn durable_lsn(&self) -> u64;
 
     /// Apply one record. Must be idempotent on `lsn`.
-    fn apply(&mut self, lsn: u64, payload: &WalPayload) -> Result<(), MetadataSinkError>;
+    ///
+    /// `timestamp_ns` is the WAL record's wall-clock timestamp (unix
+    /// nanos), threaded through so sinks can populate timestamped
+    /// metadata rows (e.g. `CheckpointMeta.completed_at_unix_nanos`)
+    /// without buffering record state externally.
+    fn apply(
+        &mut self,
+        lsn: u64,
+        timestamp_ns: u64,
+        payload: &WalPayload,
+    ) -> Result<(), MetadataSinkError>;
 }
 
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
@@ -115,7 +125,12 @@ impl MetadataSink for InMemoryMetadataSink {
         self.durable_lsn
     }
 
-    fn apply(&mut self, lsn: u64, payload: &WalPayload) -> Result<(), MetadataSinkError> {
+    fn apply(
+        &mut self,
+        lsn: u64,
+        _timestamp_ns: u64,
+        payload: &WalPayload,
+    ) -> Result<(), MetadataSinkError> {
         // BTreeMap::insert overwrites — idempotent on (lsn, payload).
         self.by_lsn.insert(lsn, payload.clone());
         // CHECKPOINT_END advances `durable_lsn`. The defensive `max`
@@ -282,7 +297,7 @@ fn apply(
     payload: &WalPayload,
 ) -> Result<(), RecoveryError> {
     apply_to_arena(arena, record, payload)?;
-    sink.apply(record.lsn.raw(), payload)
+    sink.apply(record.lsn.raw(), record.timestamp_ns, payload)
         .map_err(|source| RecoveryError::SinkError {
             lsn: record.lsn.raw(),
             source,
@@ -532,6 +547,7 @@ mod tests {
             slot_id: slot,
             old_version: old_v,
             new_version: new_v,
+            memory_id: brain_core::MemoryId::pack(1, slot, old_v),
         };
         WalRecord::from_typed(
             Lsn(0),

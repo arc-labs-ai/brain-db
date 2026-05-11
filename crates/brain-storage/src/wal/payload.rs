@@ -114,11 +114,23 @@ pub enum SalienceReason {
     Explicit = 2,
 }
 
+/// Reclaim payload.
+///
+/// Spec §05/05 §10 lists three fields (`slot_id`, `old_version`,
+/// `new_version`); we add `memory_id` so the metadata sink can delete the
+/// reclaimed memory's row by primary key in O(1) instead of scanning the
+/// `memories` table. See `docs/spec-deviations.md` SD-3.11-3 (which
+/// supersedes the deferred reconciliation in SD-3.11-2).
+///
+/// On-disk layout: `slot_id` (u64) → `old_version` (u32) → `new_version`
+/// (u32) → `memory_id` (16 B). Spec ordering preserved; new field appended
+/// so that a future spec amendment can declare the layout authoritative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReclaimPayload {
     pub slot_id: u64,
     pub old_version: u32,
     pub new_version: u32,
+    pub memory_id: MemoryId,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -707,6 +719,7 @@ fn encode_reclaim(p: &ReclaimPayload, out: &mut Vec<u8>) {
     put_u64_le(out, p.slot_id);
     put_u32_le(out, p.old_version);
     put_u32_le(out, p.new_version);
+    put_memory_id(out, p.memory_id);
 }
 
 fn decode_reclaim(r: &mut Reader<'_>) -> Result<ReclaimPayload, WalPayloadError> {
@@ -714,6 +727,7 @@ fn decode_reclaim(r: &mut Reader<'_>) -> Result<ReclaimPayload, WalPayloadError>
         slot_id: r.u64_le()?,
         old_version: r.u32_le()?,
         new_version: r.u32_le()?,
+        memory_id: r.memory_id()?,
     })
 }
 
@@ -948,6 +962,7 @@ mod tests {
                 slot_id: 0xDEAD_BEEF,
                 old_version: 3,
                 new_version: 4,
+                memory_id: mid(0xDEAD_BEEF),
             }),
             WalPayload::Consolidate(ConsolidatePayload {
                 new_memory_id: mid(20),
