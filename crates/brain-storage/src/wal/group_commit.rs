@@ -354,7 +354,9 @@ fn handle_submission(
 // Tests.
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+// Tests spawn the committer thread + open WAL segment files. Gated under
+// miri; see `.claude/plans/phase-02-miri.md`.
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use crate::wal::kinds::WalRecordKind;

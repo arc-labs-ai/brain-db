@@ -334,7 +334,9 @@ impl core::fmt::Debug for WalSegment {
     }
 }
 
-#[cfg(test)]
+// Tests open files + call pwritev2 — not shimmed by miri. Gated; see
+// `.claude/plans/phase-02-miri.md`.
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use crate::wal::kinds::WalRecordKind;

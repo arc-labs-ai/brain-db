@@ -131,7 +131,9 @@ fn unix_nanos_now() -> u64 {
 // Tests.
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+// Tests instantiate `Wal` + `ArenaFile`. Gated under miri; see
+// `.claude/plans/phase-02-miri.md`.
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use crate::arena::file::{ArenaFile, MSYNC_ALL_CALLS};

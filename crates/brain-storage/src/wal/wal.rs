@@ -353,7 +353,9 @@ fn fsync_dir(dir: &Path) -> Result<(), WalError> {
 // Tests.
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+// Tests instantiate `Wal` end-to-end (file I/O + thread). Gated under
+// miri; see `.claude/plans/phase-02-miri.md`.
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use crate::wal::kinds::WalRecordKind;

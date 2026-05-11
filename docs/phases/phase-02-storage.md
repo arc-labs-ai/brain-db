@@ -324,10 +324,10 @@ All 12 sub-tasks done. Final state on `feature/brain-storage`:
 Outstanding from the phase exit checklist:
 - [x] `just verify` green inside the dev container (fmt + clippy `-D warnings` + skill-lint + tests).
 - [x] Random-kill test passes 1000 iterations.
-- [ ] Miri on `brain-storage` — separate follow-up; the dev container's stable toolchain doesn't include miri.
+- [x] Miri on `brain-storage` — see [`.claude/plans/phase-02-miri.md`](../../.claude/plans/phase-02-miri.md). Miri doesn't shim the syscalls we use (`mmap`/`mremap`/`pwritev2`/`fallocate`/`msync`/`madvise`); syscall-bound test modules are gated behind `#[cfg(all(test, not(miri)))]`. The ~47 pure-data tests (record framing, payload encoding, slot byte layout, kind discriminator) run under miri and pass cleanly. Invoke via `just miri`.
 - [x] All `unsafe` blocks have `// SAFETY:` comments (`arena/file.rs` + `wal/segment.rs`).
-- [ ] `cargo doc -p brain-storage` warnings-clean — verify before tagging.
-- [ ] Tag `phase-2-complete` after a final verify on `dev`/`main`.
+- [x] `cargo doc -p brain-storage` warnings-clean (verified before tagging).
+- [x] Tagged `phase-2-complete` on `main` after final verify.
 
 ---
 

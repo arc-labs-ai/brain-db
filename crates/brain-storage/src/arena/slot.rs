@@ -366,6 +366,11 @@ mod tests {
 
     // ----- Property test: CRC stability under uncovered-region mutation ---
 
+    // proptest's failure-persistence loader calls `std::env::current_dir`,
+    // which miri's default isolation mode disallows. Gate the proptest
+    // block (the rest of this module's tests are pure-data and run under
+    // miri). See `.claude/plans/phase-02-miri.md`.
+    #[cfg(not(miri))]
     proptest! {
         #[test]
         fn crc_invariant_under_uncovered_mutations(

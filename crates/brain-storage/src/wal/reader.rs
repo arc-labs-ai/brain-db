@@ -454,7 +454,9 @@ fn read_first_n_bytes(path: &Path, n: usize) -> std::io::Result<Vec<u8>> {
 // Tests.
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+// Tests open WAL segment files. Gated under miri; see
+// `.claude/plans/phase-02-miri.md`.
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use crate::wal::kinds::WalRecordKind;

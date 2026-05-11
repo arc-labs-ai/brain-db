@@ -251,7 +251,9 @@ impl SlotAllocator {
     }
 }
 
-#[cfg(test)]
+// Tests open an `ArenaFile` (syscalls). Gated behind `not(miri)`; see
+// `.claude/plans/phase-02-miri.md`.
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use crate::arena::slot::flags;

@@ -652,7 +652,11 @@ fn compute_header_crc(header: &HeaderRaw) -> u32 {
 // Tests.
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+// Tests in this module open files and call mmap/mremap/msync/fallocate/
+// pwritev2 — none of which miri shims. Gated behind `not(miri)` so the
+// crate compiles + runs under miri (the syscall-free tests in other
+// modules still run). See `.claude/plans/phase-02-miri.md`.
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use crate::arena::slot::flags;

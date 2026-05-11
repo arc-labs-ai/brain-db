@@ -438,7 +438,9 @@ fn check_vector_dim(vector: &[f32], lsn: u64) -> Result<(), RecoveryError> {
 // Tests.
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+// Tests instantiate `ArenaFile` + `Wal` (full file I/O). Gated under
+// miri; see `.claude/plans/phase-02-miri.md`.
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use crate::arena::file::ArenaFile;

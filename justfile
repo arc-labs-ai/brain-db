@@ -56,6 +56,13 @@ shell:
 # The full verification suite — what CI runs.
 verify: fmt-check build clippy test check-skills
 
+# Run miri on brain-storage's lib tests. Miri doesn't shim our syscalls
+# (mmap/mremap/pwritev2/...), so syscall-bound tests are gated under
+# `cfg(not(miri))`; the ~47 pure-data tests run. See
+# .claude/plans/phase-02-miri.md for scope.
+miri:
+    cargo +nightly miri test -p brain-storage --lib
+
 # Auto-fix what's fixable.
 fix:
     cargo fmt --all
