@@ -59,4 +59,15 @@ pub enum EmbedError {
     /// construction time, not during the forward pass.
     #[error("tensor build failed: {0}")]
     TensorBuild(String),
+
+    /// The forward pass returned a pathological vector: NaN, Inf, or
+    /// a near-zero norm. Spec §04/04 §4 + §8 + §9 mandate rejection.
+    #[error("numeric failure in embedding output: {0}")]
+    NumericFailure(String),
+
+    /// Model output dimension did not match `VECTOR_DIM` (384 for v1).
+    /// Almost always means the operator pointed `model_path` at a
+    /// non-BGE-small model.
+    #[error("model output dim mismatch: expected {expected}, got {got}")]
+    OutputDimMismatch { expected: usize, got: usize },
 }
