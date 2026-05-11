@@ -217,6 +217,7 @@ dependencies = [
  "crc32c",
  "criterion",
  "hnsw_rs",
+ "parking_lot",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
