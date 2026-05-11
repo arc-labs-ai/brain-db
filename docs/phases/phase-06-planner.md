@@ -77,7 +77,15 @@ A logical plan tree, cost model, and pull-based executor that drives the lower l
 
 ## Phase exit checklist
 
-- [ ] All sub-tasks complete.
-- [ ] `just verify` green.
-- [ ] Each operation type (encode/recall/plan/reason/forget) has at least one end-to-end planner test.
-- [ ] Tag `phase-6-complete`.
+- [x] All sub-tasks complete.
+- [x] `cargo test -p brain-planner` green (101 tests passing in the Linux dev container).
+- [x] Each operation type has at least one end-to-end planner test (recall/encode/forget end-to-end via the executor; PLAN + REASON planner shape tests; the dispatch smoke test exercises three ops through one fixture).
+- [x] Tag `phase-6-complete`.
+
+Phase 6 ships **single-shard, single-memory** planning + execution. Cross-shard fan-out and bulk / filter targets need a wire bump and land later (Phase 12 sharding for cross-shard, future wire schema for bulk / filter).
+
+PLAN and REASON ship the **planner side only** — `plan_path` and `plan_reason` build full plans with depth bounds, edge-kind filters, and cost estimates, but `execute(Plan|Reason)` returns `ExecError::Unsupported("…— Phase 7")`. Bidirectional-BFS edge traversal needs the cognitive-ops scaffolding that lands with Phase 7 alongside `LINK` / `UNLINK`.
+
+The `WriterHandle` trait introduced in 6.4 is the design slot the real channel-fed group-commit writer (spec §08/08 §10) plugs into in Phase 8 / Phase 9. Phase 6 ships test-only `FakeWriterHandle` impls that drive the test `MetadataDb` + `SharedHnsw` synchronously without WAL — enough to exercise the interface but not the durability story.
+
+The 6.8 plan inspection ships as `Display` (not `Debug`) — the derive-generated `Debug` is preserved for test panic messages. Phase 9's `ADMIN_EXPLAIN_PLAN` opcode just wraps `format!("{plan}")`.
