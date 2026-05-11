@@ -10,3 +10,16 @@ description = "ANN (HNSW) index integration for Brain."
 [dependencies]
 brain-core = { path = "../brain-core" }
 thiserror.workspace = true
+hnsw_rs.workspace = true
+tracing.workspace = true
+blake3.workspace = true
+crc32c.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "recall"
+harness = false
