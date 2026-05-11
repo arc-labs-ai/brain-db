@@ -1,0 +1,252 @@
+//! `model_fingerprints` table: per-shard registry of seen embedding-model
+//! fingerprints.
+//!
+//! See `spec/04_embedding_layer/07_fingerprinting.md` §8 (table shape +
+//! purpose) and `spec/07_metadata_graph/02_table_layout.md` §1 row 10.
+//!
+//! ## Why fingerprint
+//!
+//! Spec §04/07 §1: vectors from different models live in different
+//! geometric spaces; comparing across them is noise. The substrate
+//! tags every memory with the 16-byte fingerprint of the model that
+//! produced its vector (a truncated BLAKE3 over the model's
+//! config/tokenizer/weights — see §04/07 §3) and refuses to compare
+//! across fingerprints.
+//!
+//! This table records every fingerprint the shard has ever seen, plus
+//! the human-readable model name, when it was first seen, and the
+//! memory count for that fingerprint (denormalised; reconciled by the
+//! Phase 8 maintenance worker).
+//!
+//! ## What lives here
+//!
+//! - [`MODEL_FINGERPRINTS_TABLE`] — `fingerprint_bytes: [u8; 16]` →
+//!   [`ModelInfo`].
+//! - [`ModelInfo`] — rkyv-derived value carrying `model_name`,
+//!   `seen_at_unix_nanos`, `memory_count_at_fingerprint`.
+//!
+//! ## What does NOT live here
+//!
+//! - **Auto-registration on first-seen fingerprint** (spec §04/07 §5)
+//!   — wire layer composes ENCODE → insert-if-absent. Phase 4.
+//! - **`ADMIN_REGISTER_MODEL` opcode** (spec §04/07 §11) — Phase 9.
+//! - **`memory_count_at_fingerprint` maintenance** — Phase 8 worker
+//!   reconciles by scanning `memories`.
+//! - **`UnknownModel` rejection** on `ENCODE_VECTOR_DIRECT` — wire layer.
+
+use redb::TableDefinition;
+
+/// The `model_fingerprints` table. Key is the 16-byte fingerprint
+/// (spec §04/07 §2: `ModelFingerprint = [u8; 16]`, a BLAKE3 truncation
+/// over the model's config/tokenizer/weights + substrate-specific
+/// fields like `vector_dim` and `normalize`).
+pub const MODEL_FINGERPRINTS_TABLE: TableDefinition<'static, [u8; 16], ModelInfo> =
+    TableDefinition::new("model_fingerprints");
+
+/// Per-fingerprint metadata row. Spec §04/07 §8.
+///
+/// - `model_name` — human-readable label (e.g., `"bge-small-en-v1.5"`).
+///   Spec §04/07 §14: this is *content-addressed* via the fingerprint;
+///   the name is for human convenience (logs, ADMIN_STATS).
+/// - `seen_at_unix_nanos` — when the substrate first inserted this row.
+///   Spec field is `seen_at`; we follow the established 3.x convention
+///   of suffixing time fields with `_unix_nanos`.
+/// - `memory_count_at_fingerprint` — denormalised. The wire layer
+///   may bump it on each ENCODE; the maintenance worker reconciles by
+///   scanning `memories` (Phase 8).
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct ModelInfo {
+    pub model_name: String,
+    pub seen_at_unix_nanos: u64,
+    pub memory_count_at_fingerprint: u64,
+}
+
+impl ModelInfo {
+    #[must_use]
+    pub fn new(model_name: String, seen_at_unix_nanos: u64) -> Self {
+        Self {
+            model_name,
+            seen_at_unix_nanos,
+            memory_count_at_fingerprint: 0,
+        }
+    }
+}
+
+impl redb::Value for ModelInfo {
+    type SelfType<'a> = ModelInfo;
+    type AsBytes<'a> = Vec<u8>;
+
+    fn fixed_width() -> Option<usize> {
+        None
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+    where
+        Self: 'a,
+    {
+        // rkyv 0.7's validation includes alignment; redb returns bytes
+        // at arbitrary alignment, so copy into an AlignedVec first.
+        let mut buf = rkyv::AlignedVec::with_capacity(data.len());
+        buf.extend_from_slice(data);
+        rkyv::from_bytes::<ModelInfo>(&buf)
+            .expect("ModelInfo bytes failed rkyv validation; redb file is corrupt")
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
+    where
+        Self: 'a,
+        Self: 'b,
+    {
+        rkyv::to_bytes::<_, 256>(value)
+            .expect("ModelInfo is rkyv-serializable")
+            .into_vec()
+    }
+
+    fn type_name() -> redb::TypeName {
+        redb::TypeName::new("brain_metadata::ModelInfo::v1")
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod tests {
+    use super::*;
+    use redb::{Database, ReadableDatabase};
+
+    fn fp(byte: u8) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[0] = 0xFE;
+        b[15] = byte;
+        b
+    }
+
+    fn fresh_db(dir: &tempfile::TempDir) -> Database {
+        Database::create(dir.path().join("test.redb")).expect("create redb")
+    }
+
+    #[test]
+    fn insert_and_get_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        let key = fp(1);
+        let info = ModelInfo::new("bge-small-en-v1.5".to_string(), 1_700_000_000_000_000_000);
+
+        let wtxn = db.begin_write().unwrap();
+        {
+            let mut t = wtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
+            t.insert(&key, &info).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
+        let got = t.get(&key).unwrap().unwrap().value();
+        assert_eq!(got, info);
+        assert_eq!(got.model_name, "bge-small-en-v1.5");
+        assert_eq!(got.memory_count_at_fingerprint, 0);
+    }
+
+    #[test]
+    fn model_info_with_long_name_round_trips() {
+        // Exercises rkyv's variable-length String path (and the
+        // AlignedVec copy in from_bytes).
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        let key = fp(2);
+        let info = ModelInfo::new(
+            "really-quite-long-model-name-with-org-prefix/and-version-suffix-v2.7.1-aligned"
+                .to_string(),
+            1_700_000_000_000_000_000,
+        );
+
+        let wtxn = db.begin_write().unwrap();
+        {
+            let mut t = wtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
+            t.insert(&key, &info).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
+        let got = t.get(&key).unwrap().unwrap().value();
+        assert_eq!(got.model_name.len(), info.model_name.len());
+        assert_eq!(got, info);
+    }
+
+    #[test]
+    fn update_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        let key = fp(3);
+
+        let wtxn = db.begin_write().unwrap();
+        {
+            let mut t = wtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
+            t.insert(
+                &key,
+                &ModelInfo::new("bge-small".to_string(), 1_700_000_000_000_000_000),
+            )
+            .unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let mut updated = ModelInfo::new("bge-small".to_string(), 1_700_000_000_000_000_000);
+        updated.memory_count_at_fingerprint = 42_000;
+
+        let wtxn = db.begin_write().unwrap();
+        {
+            let mut t = wtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
+            t.insert(&key, &updated).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
+        let got = t.get(&key).unwrap().unwrap().value();
+        assert_eq!(got.memory_count_at_fingerprint, 42_000);
+    }
+
+    #[test]
+    fn missing_key_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        let wtxn = db.begin_write().unwrap();
+        {
+            let _t = wtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
+        assert!(t.get(&fp(99)).unwrap().is_none());
+    }
+
+    #[test]
+    fn multiple_fingerprints_coexist() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+
+        let info_a = ModelInfo::new("model-a".to_string(), 1_000);
+        let info_b = ModelInfo::new("model-b".to_string(), 2_000);
+
+        let wtxn = db.begin_write().unwrap();
+        {
+            let mut t = wtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
+            t.insert(&fp(10), &info_a).unwrap();
+            t.insert(&fp(20), &info_b).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
+        assert_eq!(t.get(&fp(10)).unwrap().unwrap().value(), info_a);
+        assert_eq!(t.get(&fp(20)).unwrap().unwrap().value(), info_b);
+    }
+
+    #[test]
+    fn type_name_includes_v1() {
+        let name = <ModelInfo as redb::Value>::type_name();
+        let s = format!("{name:?}");
+        assert!(s.contains("v1"), "type_name missing v1 marker: {s}");
+    }
+}

@@ -1,6 +1,9 @@
 //! # brain-metadata
 //!
-//! redb-backed metadata: agents, contexts, memory metadata, edges, idempotency table, and the durable LSN checkpoint.
+//! redb-backed metadata store: agents, contexts, memory metadata, edges,
+//! idempotency table, and the durable LSN checkpoint. Phase 2's
+//! [`brain_storage::recovery::MetadataSink`] trait gets its real impl
+//! here (sub-task 3.11).
 //!
 //! See `spec/07_metadata_graph/` for the authoritative design.
 
@@ -11,15 +14,9 @@
 )]
 #![forbid(unsafe_code)]
 
-/// Crate-level marker. Placeholder until implementation begins.
-pub const SPEC_REFERENCE: &str = "spec/07_metadata_graph/";
+pub mod db;
+pub mod schema;
+pub mod sink;
+pub mod tables;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spec_reference_is_set() {
-        assert!(SPEC_REFERENCE.starts_with("spec/"));
-    }
-}
+pub use db::{MetadataDb, MetadataDbError};

@@ -24,7 +24,7 @@ exclude = ["fuzz"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.78"
+rust-version = "1.95"
 license = "Apache-2.0"
 repository = "https://github.com/brain-db-io/brain-db"
 
@@ -42,7 +42,7 @@ serde_json = "1"
 toml = "0.8"
 
 # Storage / indexing
-redb = "2"
+redb = "4"
 hnsw_rs = "0.3"
 
 # Embeddings (pure-Rust)

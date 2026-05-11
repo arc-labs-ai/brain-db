@@ -20,3 +20,8 @@ crossbeam-channel.workspace = true
 brain-core = { path = "../brain-core" }
 proptest.workspace = true
 tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "crc32c"
+harness = false
