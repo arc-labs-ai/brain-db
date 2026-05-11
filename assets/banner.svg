@@ -1,14 +1,52 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  brain — README banner. Mono-color (currentColor); 1200×300.
-  Mark on the left, name + tagline on the right.
+  brain — README banner. 1200×300.
+  White panel with a subtle dotted background, dark mark + wordmark.
+  Reads cleanly on both GitHub light and dark themes because the panel
+  carries its own background; we don't rely on the surrounding theme.
 -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" width="1200" height="300" role="img" aria-label="brain — a cognitive substrate for AI agents">
   <title>brain — a cognitive substrate for AI agents</title>
 
-  <!-- Mark, scaled to 240×240 and offset so its centre lands at (150,150) -->
+  <defs>
+    <!-- Dotted background pattern — 24×24 grid, 1.2 px radius.
+         Slightly cooler grey so it doesn't fight the gradient hues. -->
+    <pattern id="dots" x="0" y="0" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="12" cy="12" r="1.2" fill="#cbd5e1" fill-opacity="0.7"/>
+    </pattern>
+
+    <!-- Diagonal linear gradient: visibly tinted from top-left indigo
+         through a white midpoint into a bottom-right cyan. Stops sit
+         at 200-level Tailwind hues — visible without overpowering the
+         mark + wordmark. -->
+    <linearGradient id="panel-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"   stop-color="#c7d2fe"/>  <!-- indigo-300 -->
+      <stop offset="45%"  stop-color="#ffffff"/>
+      <stop offset="55%"  stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#a5f3fc"/>  <!-- cyan-300 -->
+    </linearGradient>
+
+    <!-- A second, perpendicular gradient: warm peach top-right, fading
+         to nothing across the diagonal. Adds depth without changing
+         the centre — this is the trick most modern OSS banners use. -->
+    <linearGradient id="panel-accent" x1="1" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#fbcfe8" stop-opacity="0.55"/>  <!-- pink-200 -->
+      <stop offset="40%"  stop-color="#fbcfe8" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#fbcfe8" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Layered panel: base diagonal → warm accent → dot pattern →
+       crisp 1 px border. Order matters; dots ride on top so the
+       gradient reads through the grid. -->
+  <rect x="0" y="0" width="1200" height="300" rx="24" ry="24" fill="url(#panel-bg)"/>
+  <rect x="0" y="0" width="1200" height="300" rx="24" ry="24" fill="url(#panel-accent)"/>
+  <rect x="0" y="0" width="1200" height="300" rx="24" ry="24" fill="url(#dots)"/>
+  <rect x="0.5" y="0.5" width="1199" height="299" rx="24" ry="24" fill="none" stroke="#e5e7eb" stroke-width="1"/>
+
+  <!-- Mark, scaled to 240×240 and offset so its centre lands at (150,150). -->
   <g transform="translate(30, 30) scale(0.8)">
-    <g fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" opacity="0.75">
+    <g fill="none" stroke="#111827" stroke-width="3" stroke-linecap="round" opacity="0.85">
       <line x1="150" y1="150" x2="150" y2="50"/>
       <line x1="150" y1="150" x2="237" y2="100"/>
       <line x1="150" y1="150" x2="237" y2="200"/>
@@ -22,7 +60,7 @@
       <line x1="63"  y1="200" x2="63"  y2="100"/>
       <line x1="63"  y1="100" x2="150" y2="50"/>
     </g>
-    <g fill="currentColor">
+    <g fill="#111827">
       <circle cx="150" cy="50"  r="14"/>
       <circle cx="237" cy="100" r="14"/>
       <circle cx="237" cy="200" r="14"/>
@@ -30,15 +68,15 @@
       <circle cx="63"  cy="200" r="14"/>
       <circle cx="63"  cy="100" r="14"/>
     </g>
-    <circle cx="150" cy="150" r="26" fill="currentColor"/>
-    <circle cx="150" cy="150" r="10" fill="white"/>
+    <circle cx="150" cy="150" r="26" fill="#111827"/>
+    <circle cx="150" cy="150" r="10" fill="#ffffff"/>
   </g>
 
   <!-- Wordmark + tagline. Inline font-family stack so this renders cleanly
        on GitHub regardless of installed fonts. -->
-  <g font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, system-ui, sans-serif" fill="currentColor">
-    <text x="290" y="170" font-size="120" font-weight="700" letter-spacing="-4">brain</text>
-    <text x="294" y="222" font-size="32" font-weight="400" opacity="0.75">a cognitive substrate for AI agents</text>
-    <text x="294" y="262" font-size="22" font-weight="400" opacity="0.5" font-style="italic">memory · recall · plan · reason · forget</text>
+  <g font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, system-ui, sans-serif">
+    <text x="290" y="170" font-size="120" font-weight="700" letter-spacing="-4" fill="#111827">brain</text>
+    <text x="294" y="222" font-size="32" font-weight="400" fill="#4b5563">a cognitive substrate for AI agents</text>
+    <text x="294" y="262" font-size="22" font-weight="400" fill="#9ca3af" font-style="italic">memory · recall · plan · reason · forget</text>
   </g>
 </svg>
