@@ -37,6 +37,12 @@ use crate::idmap::{IdMap, IdMapError};
 use crate::params::{IndexParams, IndexParamsError, DEFAULT_CAPACITY_HINT, MAX_LAYER};
 use crate::tombstones::TombstoneBitmap;
 
+/// Default over-fetch multiplier for post-filter search. Spec §09 §2.
+/// Initial fetch is `k * OVER_FACTOR`; the bailout loop escalates by
+/// doubling on each retry, bounded by the index size (no point asking
+/// hnsw_rs for more candidates than exist).
+const OVER_FACTOR: usize = 2;
+
 /// HNSW index parameterised by vector dimension `D`. Wraps
 /// `hnsw_rs::Hnsw<f32, DistCosine>` with Brain's parameter discipline.
 ///
@@ -130,40 +136,125 @@ impl<const D: usize> HnswIndex<D> {
         Ok(())
     }
 
-    /// Search for the `k` nearest neighbours of `query`. Returns
-    /// `(MemoryId, distance)` tuples sorted ascending by distance
-    /// (best match first).
+    /// Search for the `k` nearest neighbours of `query`, post-filtered
+    /// by `filter`. Returns `(MemoryId, similarity)` tuples **sorted
+    /// descending by similarity** (best match first).
     ///
-    /// `ef` overrides the per-query search width:
+    /// **Similarity, not distance.** Per spec §04 §1, results carry
+    /// `similarity = 1.0 - distance`, in `[-1, 1]`: 1.0 = identical,
+    /// 0 = orthogonal, -1 = opposite (for L2-normalised input).
+    ///
+    /// **Tombstoned memories are always excluded** (spec §06/05 §2);
+    /// the tombstone filter is implicit and applies regardless of
+    /// `filter`'s return value.
+    ///
+    /// **Over-fetch + bailout retry** (spec §09 §2 + §7). The search
+    /// initially requests `k * OVER_FACTOR` candidates from hnsw_rs.
+    /// If fewer than `k` survive the filter chain, the loop scales up:
+    /// first the fetch multiplier (capped at `OVER_FACTOR_CAP`), then
+    /// `ef` doubles up to `params.ef_search_max`. If even that doesn't
+    /// gather `k`, returns fewer-than-`k` results (per spec §09 §7).
+    ///
+    /// `ef` argument overrides the per-query search width:
     /// - `None` → uses `params.ef_search`.
     /// - `Some(v)` → clamped to `[k, params.ef_search_max]` per
-    ///   `spec/06_ann_index/02_parameters.md` §5 (`ef = max(K, default)`)
-    ///   and §8 (the `ef_search_max` cap).
-    ///
-    /// If hnsw_rs returns an internal id not present in this index's
-    /// id_map (defensive — should never happen in practice), the
-    /// corresponding result is dropped with a `tracing::warn!`.
+    ///   `spec/06_ann_index/02_parameters.md` §5 + §8.
     #[must_use]
-    pub fn search(&self, query: &[f32; D], k: usize, ef: Option<usize>) -> Vec<(MemoryId, f32)> {
-        let ef = self.resolve_ef(k, ef);
-        let neighbours: Vec<Neighbour> = self.inner.search(query.as_slice(), k, ef);
-        neighbours
-            .into_iter()
-            .filter_map(|n| {
-                let internal_id = u32::try_from(n.d_id).ok()?;
-                match self.id_map.lookup_reverse(internal_id) {
-                    Some(memory_id) => Some((memory_id, n.distance)),
-                    None => {
-                        tracing::warn!(
-                            internal_id,
-                            "hnsw_rs returned an internal id with no MemoryId mapping; \
-                             dropping result"
-                        );
-                        None
-                    }
+    pub fn search<F>(
+        &self,
+        query: &[f32; D],
+        k: usize,
+        ef: Option<usize>,
+        filter: F,
+    ) -> Vec<(MemoryId, f32)>
+    where
+        F: Fn(MemoryId) -> bool,
+    {
+        // Empty index: nothing to search.
+        if k == 0 || self.is_empty() {
+            return Vec::new();
+        }
+
+        let total_nodes = self.len();
+        let mut ef = self.resolve_ef(k, ef);
+        let mut fetch_multiplier = OVER_FACTOR;
+        let mut results: Vec<(MemoryId, f32)> = Vec::with_capacity(k);
+
+        loop {
+            results.clear();
+            let fetch_k = k.saturating_mul(fetch_multiplier).min(total_nodes);
+            let neighbours: Vec<Neighbour> = self.inner.search(query.as_slice(), fetch_k, ef);
+
+            for n in neighbours {
+                if results.len() >= k {
+                    break;
                 }
-            })
-            .collect()
+                let Ok(internal_id) = u32::try_from(n.d_id) else {
+                    continue;
+                };
+                // Implicit tombstone filter (spec §06/05 §2).
+                if self.tombstones.is_set(internal_id) {
+                    continue;
+                }
+                let Some(memory_id) = self.id_map.lookup_reverse(internal_id) else {
+                    tracing::warn!(
+                        internal_id,
+                        "hnsw_rs returned an internal id with no MemoryId mapping; dropping",
+                    );
+                    continue;
+                };
+                if !filter(memory_id) {
+                    continue;
+                }
+                let similarity = 1.0 - n.distance;
+                results.push((memory_id, similarity));
+            }
+
+            if results.len() >= k {
+                break;
+            }
+
+            // Bailout escalation (spec §09 §7). Grow both axes:
+            // - fetch_multiplier doubles, bounded by total_nodes.
+            // - ef doubles, bounded by params.ef_search_max.
+            // Stop when both are saturated.
+            let fetch_saturated = fetch_k >= total_nodes;
+            let ef_saturated = ef >= self.params.ef_search_max;
+            if fetch_saturated && ef_saturated {
+                tracing::debug!(
+                    requested_k = k,
+                    returned = results.len(),
+                    "search bailout exhausted; returning partial results",
+                );
+                break;
+            }
+            if !fetch_saturated {
+                fetch_multiplier = fetch_multiplier.saturating_mul(2);
+            }
+            if !ef_saturated {
+                ef = ef.saturating_mul(2).min(self.params.ef_search_max);
+            }
+        }
+
+        // hnsw_rs returns ascending by distance → ascending = best first
+        // for similarity (since similarity = 1 - distance, higher
+        // similarity = lower distance). The output of the loop above
+        // preserves hnsw_rs's order, which is "best similarity first"
+        // (descending by similarity). No additional sort needed.
+        results
+    }
+
+    /// Convenience: search with no extra filter (tombstoned memories
+    /// are still excluded — the tombstone filter is always implicit).
+    /// Equivalent to `search(query, k, ef, |_| true)`.
+    #[must_use]
+    pub fn search_active(
+        &self,
+        query: &[f32; D],
+        k: usize,
+        ef: Option<usize>,
+    ) -> Vec<(MemoryId, f32)> {
+        self.search(query, k, ef, |_| true)
     }
 
     /// Does this index hold a vector for `memory_id`?
@@ -289,12 +380,13 @@ mod tests {
         let v = vec4(0.5, 0.5, 0.5, 0.5);
         let id = mid(42);
         idx.insert(id, &v).unwrap();
-        let results = idx.search(&v, 1, None);
+        let results = idx.search_active(&v, 1, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, id);
+        // Similarity for identical vectors is ~1.0 (= 1 - distance 0).
         assert!(
-            results[0].1.abs() < 1e-5,
-            "expected ~0 distance, got {}",
+            results[0].1 > 1.0 - 1e-5,
+            "expected similarity ~1.0, got {}",
             results[0].1
         );
     }
@@ -308,12 +400,12 @@ mod tests {
                 .unwrap();
         }
         let q = vec4(1.0, 2.0, 3.0, 4.0);
-        let results = idx.search(&q, 3, None);
+        let results = idx.search_active(&q, 3, None);
         assert!(results.len() <= 3, "got {} results", results.len());
     }
 
     #[test]
-    fn search_results_are_sorted_ascending() {
+    fn search_results_are_sorted_descending_by_similarity() {
         let mut idx = HnswIndex::<4>::new(params_d4()).unwrap();
         idx.insert(mid(1), &vec4(1.0, 0.1, 0.0, 0.0)).unwrap();
         idx.insert(mid(2), &vec4(0.9, 0.5, 0.0, 0.0)).unwrap();
@@ -321,11 +413,12 @@ mod tests {
         idx.insert(mid(4), &vec4(0.1, 1.0, 0.0, 0.0)).unwrap();
         idx.insert(mid(5), &vec4(0.0, 0.0, 1.0, 1.0)).unwrap();
         let q = vec4(1.0, 0.0, 0.0, 0.0);
-        let results = idx.search(&q, 5, None);
+        let results = idx.search_active(&q, 5, None);
+        // Similarities should be non-increasing (best match first).
         for w in results.windows(2) {
             assert!(
-                w[0].1 <= w[1].1 + 1e-6,
-                "distances out of order: {} > {}",
+                w[0].1 >= w[1].1 - 1e-6,
+                "similarities out of order: {} < {}",
                 w[0].1,
                 w[1].1
             );
@@ -339,9 +432,9 @@ mod tests {
         idx.insert(mid(2), &vec4(0.0, 1.0, 0.0, 0.0)).unwrap();
         let q = vec4(1.0, 0.0, 0.0, 0.0);
         // 9999 well above ef_search_max=500; clamps inside resolve_ef.
-        let results = idx.search(&q, 2, Some(9999));
+        let results = idx.search_active(&q, 2, Some(9999));
         assert!(results.len() <= 2);
-        // Top hit is mid(1) (closer to the query).
+        // Top hit is mid(1) (most similar to the query).
         assert_eq!(results[0].0, mid(1));
     }
 
@@ -349,7 +442,7 @@ mod tests {
     fn empty_index_search_returns_empty() {
         let idx = HnswIndex::<4>::new(params_d4()).unwrap();
         let q = vec4(1.0, 0.0, 0.0, 0.0);
-        let results = idx.search(&q, 5, None);
+        let results = idx.search_active(&q, 5, None);
         assert!(results.is_empty());
     }
 
@@ -388,7 +481,7 @@ mod tests {
         let mut idx = HnswIndex::<4>::new(params_d4()).unwrap();
         idx.insert(mid(100), &vec4(1.0, 0.0, 0.0, 0.0)).unwrap();
         idx.insert(mid(200), &vec4(0.0, 1.0, 0.0, 0.0)).unwrap();
-        let results = idx.search(&vec4(1.0, 0.1, 0.0, 0.0), 2, None);
+        let results = idx.search_active(&vec4(1.0, 0.1, 0.0, 0.0), 2, None);
         let ids: Vec<MemoryId> = results.iter().map(|(id, _)| *id).collect();
         assert!(
             ids.contains(&mid(100)),
@@ -457,5 +550,136 @@ mod tests {
         assert!(idx.is_tombstoned(mid(1)));
         assert!(idx.is_tombstoned(mid(2)));
         assert!(!idx.is_tombstoned(mid(3)));
+    }
+
+    // ----- 4.4-specific tests --------------------------------------------
+
+    #[test]
+    fn tombstoned_memories_excluded_from_search() {
+        let mut idx = HnswIndex::<4>::new(params_d4()).unwrap();
+        idx.insert(mid(1), &vec4(1.0, 0.0, 0.0, 0.0)).unwrap();
+        idx.insert(mid(2), &vec4(0.9, 0.1, 0.0, 0.0)).unwrap();
+        idx.insert(mid(3), &vec4(0.8, 0.2, 0.0, 0.0)).unwrap();
+        idx.mark_tombstoned(mid(2)).unwrap();
+        let results = idx.search_active(&vec4(1.0, 0.0, 0.0, 0.0), 5, None);
+        let ids: Vec<MemoryId> = results.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&mid(1)));
+        assert!(ids.contains(&mid(3)));
+        assert!(
+            !ids.contains(&mid(2)),
+            "tombstoned mid(2) leaked into results: {ids:?}"
+        );
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn custom_filter_excludes() {
+        let mut idx = HnswIndex::<4>::new(params_d4()).unwrap();
+        // Insert mid(1)..=mid(5); a filter keeping only even slot ids
+        // returns mid(2) and mid(4) only.
+        for i in 1..=5u64 {
+            let f = i as f32;
+            idx.insert(mid(i), &vec4(f, 0.5, 0.0, 0.0)).unwrap();
+        }
+        let q = vec4(3.0, 0.5, 0.0, 0.0);
+        let results = idx.search(&q, 5, None, |m| m.slot() % 2 == 0);
+        let ids: Vec<u64> = results.iter().map(|(id, _)| id.slot()).collect();
+        for slot in &ids {
+            assert!(slot % 2 == 0, "filter let odd slot {slot} through");
+        }
+        assert!(!ids.is_empty(), "expected at least one even-slot result");
+    }
+
+    #[test]
+    fn filter_composition_with_tombstones() {
+        // Both filters apply: tombstone filter (implicit) AND user filter.
+        let mut idx = HnswIndex::<4>::new(params_d4()).unwrap();
+        idx.insert(mid(1), &vec4(1.0, 0.0, 0.0, 0.0)).unwrap();
+        idx.insert(mid(2), &vec4(0.9, 0.1, 0.0, 0.0)).unwrap();
+        idx.insert(mid(3), &vec4(0.8, 0.2, 0.0, 0.0)).unwrap();
+        idx.insert(mid(4), &vec4(0.7, 0.3, 0.0, 0.0)).unwrap();
+        // mid(1) tombstoned; user filter drops mid(2).
+        idx.mark_tombstoned(mid(1)).unwrap();
+        let results = idx.search(&vec4(1.0, 0.0, 0.0, 0.0), 5, None, |m| m != mid(2));
+        let ids: Vec<MemoryId> = results.iter().map(|(id, _)| *id).collect();
+        assert!(!ids.contains(&mid(1)), "tombstoned mid(1) leaked");
+        assert!(!ids.contains(&mid(2)), "filtered mid(2) leaked");
+        assert!(ids.contains(&mid(3)));
+        assert!(ids.contains(&mid(4)));
+    }
+
+    #[test]
+    fn search_active_excludes_tombstones() {
+        let mut idx = HnswIndex::<4>::new(params_d4()).unwrap();
+        idx.insert(mid(1), &vec4(1.0, 0.0, 0.0, 0.0)).unwrap();
+        idx.mark_tombstoned(mid(1)).unwrap();
+        let results = idx.search_active(&vec4(1.0, 0.0, 0.0, 0.0), 5, None);
+        assert!(
+            results.is_empty(),
+            "search_active should exclude tombstoned mid(1), got {results:?}"
+        );
+    }
+
+    #[test]
+    fn bailout_returns_partial_results_when_filter_drops_most() {
+        // Insert 20 vectors; mark 18 tombstoned. The remaining 2
+        // should still come back when k=2 even though the implicit
+        // filter drops 90%.
+        let mut idx = HnswIndex::<4>::new(params_d4()).unwrap();
+        for i in 1..=20u64 {
+            let f = i as f32;
+            idx.insert(mid(i), &vec4(f, 0.5, 0.0, 0.0)).unwrap();
+        }
+        for i in 1..=18u64 {
+            idx.mark_tombstoned(mid(i)).unwrap();
+        }
+        let results = idx.search_active(&vec4(10.0, 0.5, 0.0, 0.0), 2, None);
+        // Should return both surviving memories (mid(19), mid(20)) —
+        // the bailout retry should find them even though only 2 of
+        // 20 candidates pass the implicit tombstone filter.
+        assert_eq!(results.len(), 2, "got {results:?}");
+        let ids: Vec<u64> = results.iter().map(|(m, _)| m.slot()).collect();
+        for slot in &ids {
+            assert!(*slot == 19 || *slot == 20, "unexpected slot {slot}");
+        }
+    }
+
+    #[test]
+    fn always_false_filter_returns_empty_no_infinite_loop() {
+        // Pathological filter: rejects everything. Bailout must
+        // terminate; returns empty.
+        let mut idx = HnswIndex::<4>::new(params_d4()).unwrap();
+        for i in 1..=10u64 {
+            let f = i as f32;
+            idx.insert(mid(i), &vec4(f, 0.5, 0.0, 0.0)).unwrap();
+        }
+        let results = idx.search(&vec4(5.0, 0.5, 0.0, 0.0), 5, None, |_| false);
+        assert!(results.is_empty(), "always-false filter must return []");
+    }
+
+    #[test]
+    fn similarity_score_in_unit_range() {
+        // For L2-normalised input vectors, cosine similarity is in
+        // [-1, 1]. Spot-check that the values look sensible.
+        let mut idx = HnswIndex::<4>::new(params_d4()).unwrap();
+        // Insert one orthogonal vector to query.
+        idx.insert(mid(1), &vec4(0.0, 1.0, 0.0, 0.0)).unwrap();
+        // Insert one identical vector to query.
+        idx.insert(mid(2), &vec4(1.0, 0.0, 0.0, 0.0)).unwrap();
+        let q = vec4(1.0, 0.0, 0.0, 0.0);
+        let results = idx.search_active(&q, 2, None);
+        assert_eq!(results.len(), 2);
+        for (id, sim) in &results {
+            assert!(
+                (-1.001..=1.001).contains(sim),
+                "similarity for {id:?} = {sim} outside [-1, 1]"
+            );
+        }
+        // The identical match (mid(2)) should be first; similarity ~1.
+        // The orthogonal one (mid(1)) should be second; similarity ~0.
+        assert_eq!(results[0].0, mid(2));
+        assert!(results[0].1 > 1.0 - 1e-5);
+        assert_eq!(results[1].0, mid(1));
+        assert!(results[1].1.abs() < 1e-5);
     }
 }
