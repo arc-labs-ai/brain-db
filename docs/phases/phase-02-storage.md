@@ -290,19 +290,44 @@ Implement the durable storage layer: a memory-mapped vector arena, a write-ahead
 
 ---
 
-### Task 2.12 — Checkpoint writer
+### Task 2.12 — Checkpoint writer ✅
 
-**Reads:** `spec/05_storage_arena_wal/09_checkpointing.md`
+**Reads:** `spec/05_storage_arena_wal/09_checkpointing.md` §§2, 3, 11, 12.
 
-**Writes:** `crates/brain-storage/src/wal/checkpoint.rs`
+**Writes:** `crates/brain-storage/src/wal/checkpoint.rs` (and small extensions to `arena/file.rs` + `recovery.rs`).
 
-**What to build:**
-- `pub fn write_checkpoint(wal: &Wal, durable_lsn: Lsn, arena_size: u64)` — writes a `WalRecordKind::Checkpoint` record.
-- Recovery reads the latest checkpoint to fix the start LSN.
+**What was built:**
+- `write_checkpoint(wal, arena, plan) -> Result<CheckpointReport>` — implements spec §09 §3 (BEGIN → `msync` arena → END). Free function; takes `&mut Wal` and `&ArenaFile`.
+- `CheckpointPlan { checkpoint_id, target_lsn: Option<u64> }`; `None` → `wal.next_lsn() - 1`.
+- `CheckpointReport { checkpoint_id, durable_lsn, lsn_begin, lsn_end, arena_capacity_at_checkpoint, started_at, completed_at }`.
+- `ArenaFile::msync_all(&self)` — `msync(MS_SYNC)` over the whole mmap region (new pub method; 2.4's `grow_to` previously only msynced the header page).
+- `InMemoryMetadataSink::apply` extended to advance `durable_lsn = max(durable_lsn, p.durable_lsn)` on `CheckpointEnd`. The redb sink in Phase 3 will do the equivalent in its own metadata store.
+
+**Design call:** the sink doesn't receive a runtime notification — it learns the new `durable_lsn` via `apply(CheckpointEnd)` during the next `recover`. Keeps the WAL authoritative; a BEGIN-without-END crash leaves the previous checkpoint as the recovery target (spec §09 §12.1) with no additional code paths.
 
 **Done when:**
-- [ ] Checkpoint written → recovery starts from `durable_lsn + 1`.
-- [ ] Multiple checkpoints: recovery uses the latest.
+- [x] Checkpoint written → recovery starts from `durable_lsn + 1` — `checkpoint_advances_recovery_start_point` (run recover twice; second pass skips the 10 pre-checkpoint records).
+- [x] Multiple checkpoints: recovery uses the latest — `multiple_checkpoints_recovery_uses_latest` (sink's `durable_lsn` ends at the latest checkpoint's target).
+- [x] Plus 8 other tests: mechanics, idempotency across multiple recover runs, BEGIN-without-END no-op, `msync_all` is invoked (via `MSYNC_ALL_CALLS` counter), `msync_all` smoke, record-kind sanity.
+
+---
+
+## Phase 2 — complete ✅
+
+All 12 sub-tasks done. Final state on `feature/brain-storage`:
+
+- 155 unit tests + 4 integration tests (1 ignored — the 1000-iter sweep).
+- Random-kill sweep (1000 iterations) passes cleanly in ~197 seconds.
+- 8 spec deviations logged in `docs/spec-deviations.md`, all with reconciliation paths.
+- 12 plan files in `.claude/plans/phase-02-task-NN.md` documenting the design rationale per sub-task.
+
+Outstanding from the phase exit checklist:
+- [x] `just verify` green inside the dev container (fmt + clippy `-D warnings` + skill-lint + tests).
+- [x] Random-kill test passes 1000 iterations.
+- [ ] Miri on `brain-storage` — separate follow-up; the dev container's stable toolchain doesn't include miri.
+- [x] All `unsafe` blocks have `// SAFETY:` comments (`arena/file.rs` + `wal/segment.rs`).
+- [ ] `cargo doc -p brain-storage` warnings-clean — verify before tagging.
+- [ ] Tag `phase-2-complete` after a final verify on `dev`/`main`.
 
 ---
 

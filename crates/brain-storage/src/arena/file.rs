@@ -66,6 +66,12 @@ pub const HEADER_CRC_COVERAGE_END: usize = 80;
 /// Default initial capacity for a fresh arena (spec §05/02 §9).
 pub const DEFAULT_INITIAL_CAPACITY_SLOTS: u64 = 1024;
 
+/// Test-only counter: every call to `ArenaFile::msync_all` bumps this.
+/// Used by the 2.12 checkpoint test to verify the syscall fires between
+/// `CHECKPOINT_BEGIN` and `CHECKPOINT_END`.
+#[cfg(test)]
+pub static MSYNC_ALL_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Header struct mirroring spec §05/02 §2 byte-for-byte. `#[repr(C)]`,
 /// no implicit padding (verified by `bytemuck::Pod` derive and the
 /// const-asserts below).
@@ -415,6 +421,39 @@ impl ArenaFile {
     #[must_use]
     pub fn shard_uuid(&self) -> [u8; 16] {
         self.shard_uuid
+    }
+
+    /// `msync(MS_SYNC)` the entire mmap region.
+    ///
+    /// Blocks until all dirty pages in `[0, file_size)` are durable. Called
+    /// by the checkpoint writer (spec §05/09 §3 step 3) to ensure every
+    /// arena write made before the checkpoint reaches stable storage
+    /// before `CHECKPOINT_END` is appended to the WAL.
+    ///
+    /// `&self` rather than `&mut self`: the syscall doesn't need exclusive
+    /// access (the kernel handles synchronization), and spec §05/09 §3
+    /// step 2's "no in-flight writes during checkpoint" guarantee is
+    /// enforced at the caller layer (`&mut Wal` for the surrounding
+    /// `CHECKPOINT_BEGIN`/`END` appends).
+    pub fn msync_all(&self) -> std::io::Result<()> {
+        #[cfg(test)]
+        MSYNC_ALL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        // SAFETY: `base` is a valid mmap returned by `mmap_rw`, of length
+        // `file_size`. `MS_SYNC` is the spec-prescribed flag (§05/09 §3
+        // step 3 + §05/03 §13). No concurrent unmap is possible because
+        // `Drop` requires owned `self`.
+        let rc = unsafe {
+            libc::msync(
+                self.base.as_ptr() as *mut c_void,
+                self.file_size,
+                libc::MS_SYNC,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// Read a slot.

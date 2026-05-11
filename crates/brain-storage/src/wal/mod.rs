@@ -5,6 +5,7 @@
 //! record-level framing only; segment writer/reader/recovery land in
 //! subsequent sub-tasks (2.6–2.10).
 
+pub mod checkpoint;
 pub mod group_commit;
 pub mod kinds;
 pub mod payload;

@@ -118,6 +118,12 @@ impl MetadataSink for InMemoryMetadataSink {
     fn apply(&mut self, lsn: u64, payload: &WalPayload) -> Result<(), MetadataSinkError> {
         // BTreeMap::insert overwrites — idempotent on (lsn, payload).
         self.by_lsn.insert(lsn, payload.clone());
+        // CHECKPOINT_END advances `durable_lsn`. The defensive `max`
+        // guards against out-of-order replay (recovery iterates in LSN
+        // order today, but a future caller might not).
+        if let WalPayload::CheckpointEnd(p) = payload {
+            self.durable_lsn = self.durable_lsn.max(p.durable_lsn);
+        }
         Ok(())
     }
 }
