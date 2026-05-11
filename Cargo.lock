@@ -315,6 +315,7 @@ dependencies = [
  "brain-core",
  "brain-protocol",
  "thiserror 1.0.69",
+ "tracing",
  "uuid",
 ]
 

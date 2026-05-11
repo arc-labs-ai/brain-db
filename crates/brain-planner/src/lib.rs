@@ -28,6 +28,7 @@
 
 pub mod config;
 pub mod context;
+pub mod cost;
 pub mod error;
 pub mod plan;
 pub mod stats;
