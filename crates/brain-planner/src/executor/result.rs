@@ -71,3 +71,38 @@ pub enum PlanStatus {
     NoPathFound,
     Timeout,
 }
+
+/// Outcome of `execute_reason`. Spec §09/05 §3 — supporting +
+/// contradicting evidence with an aggregate confidence.
+#[derive(Debug, Clone)]
+pub struct ReasonResult {
+    pub base_memories: Vec<MemoryId>,
+    pub supporting: Vec<EvidenceItem>,
+    pub contradicting: Vec<EvidenceItem>,
+    /// `(sum_s - sum_c) / (sum_s + sum_c)`; in `[-1, 1]`; `0` when the
+    /// denominator is zero (spec §09/05 §6).
+    pub confidence: f32,
+    pub status: ReasonStatus,
+}
+
+/// One piece of evidence the executor found. Spec §09/05 §3.
+#[derive(Debug, Clone)]
+pub struct EvidenceItem {
+    pub memory_id: MemoryId,
+    /// `base_similarity × decay(distance)`; in `[0, 1]`.
+    pub score: f32,
+    /// Edges traversed from the base set to this item; empty for
+    /// direct-similarity (distance = 0) evidence.
+    pub edge_path: Vec<EdgeKind>,
+    /// Hops from the base set; `0` for direct-similarity items.
+    pub distance: usize,
+}
+
+/// Why `execute_reason` returned. Mirrors the wire enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasonStatus {
+    Complete,
+    BudgetExhausted,
+    DepthLimitReached,
+    Cancelled,
+}

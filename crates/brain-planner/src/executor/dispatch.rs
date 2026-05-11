@@ -18,20 +18,19 @@ use super::encode::execute_encode;
 use super::error::ExecError;
 use super::forget::execute_forget;
 use super::path::execute_path;
+use super::reason::execute_reason;
 use super::recall::execute_recall;
-use super::result::{EncodeResult, ForgetResult, PathResult, RecallResult};
+use super::result::{EncodeResult, ForgetResult, PathResult, ReasonResult, RecallResult};
 
 /// Rust-side union of per-operation results. Phase 9's server maps
 /// each variant to the corresponding wire `ResponseBody`.
-///
-/// REASON still returns `ExecError::Unsupported`; sub-task 7.6
-/// adds its variant.
 #[derive(Debug, Clone)]
 pub enum ExecutionResult {
     Recall(RecallResult),
     Encode(EncodeResult),
     Forget(ForgetResult),
     Plan(PathResult),
+    Reason(ReasonResult),
 }
 
 /// Top-level dispatch. Routes an `ExecutionPlan` to its matching
@@ -57,6 +56,9 @@ pub async fn execute(
             let _span = tracing::info_span!("execute", op = "plan").entered();
             execute_path(p, ctx).await.map(ExecutionResult::Plan)
         }
-        ExecutionPlan::Reason(_) => Err(ExecError::Unsupported("REASON execution — Phase 7")),
+        ExecutionPlan::Reason(p) => {
+            let _span = tracing::info_span!("execute", op = "reason").entered();
+            execute_reason(p, ctx).await.map(ExecutionResult::Reason)
+        }
     }
 }

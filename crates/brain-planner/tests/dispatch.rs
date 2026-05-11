@@ -378,12 +378,15 @@ async fn dispatch_plan_variant_runs_bfs() {
 }
 
 #[tokio::test]
-async fn dispatch_reason_variant_is_unsupported() {
+async fn dispatch_reason_variant_runs_evidence_walk() {
+    // 7.6 wired the real REASON executor. With ByText observation +
+    // an empty index, base resolution returns an empty set →
+    // confidence 0 + ReasonStatus::Complete.
     let fix = build_fixture();
     let req = ReasonRequest {
         observation: ObservationInput::ByText("hello".into()),
         depth: 3,
-        confidence_threshold: 0.5,
+        confidence_threshold: 0.0,
         context_filter: None,
         max_inferences: 5,
         budget_wall_time_ms: 100,
@@ -391,10 +394,13 @@ async fn dispatch_reason_variant_is_unsupported() {
     };
     let plan = plan_reason(&req, &PlannerContext::default()).unwrap();
     match execute(plan, &fix.ctx).await {
-        Err(ExecError::Unsupported(msg)) => {
-            assert!(msg.contains("REASON"), "expected REASON message, got {msg}");
+        Ok(brain_planner::ExecutionResult::Reason(r)) => {
+            assert!(r.supporting.is_empty());
+            assert!(r.contradicting.is_empty());
+            assert_eq!(r.confidence, 0.0);
+            assert_eq!(r.status, brain_planner::ReasonStatus::Complete);
         }
-        other => panic!("expected Unsupported, got {other:?}"),
+        other => panic!("expected ExecutionResult::Reason, got {other:?}"),
     }
 }
 

@@ -10,6 +10,7 @@ pub mod encode;
 pub mod error;
 pub mod forget;
 pub mod path;
+pub mod reason;
 pub mod recall;
 pub mod result;
 pub mod writer;
@@ -20,9 +21,11 @@ pub use encode::execute_encode;
 pub use error::ExecError;
 pub use forget::execute_forget;
 pub use path::execute_path;
+pub use reason::execute_reason;
 pub use recall::execute_recall;
 pub use result::{
-    EncodeResult, ForgetResult, Path, PathResult, PlanStatus, RecallHit, RecallResult,
+    EncodeResult, EvidenceItem, ForgetResult, Path, PathResult, PlanStatus, ReasonResult,
+    ReasonStatus, RecallHit, RecallResult,
 };
 pub use writer::{
     EdgeOutcome, EncodeAck, EncodeOp, EncodeOpEdge, ForgetAck, ForgetOp, ForgetOutcome,
