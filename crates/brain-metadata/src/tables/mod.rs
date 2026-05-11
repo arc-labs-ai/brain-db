@@ -6,4 +6,5 @@
 
 pub mod agent;
 pub mod context;
+pub mod edge;
 pub mod memory;

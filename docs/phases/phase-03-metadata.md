@@ -75,10 +75,21 @@ Implement the `redb`-backed metadata store: agents, contexts, memory metadata, e
 
 **Done when:** [x] Both tables CRUD-tested. 10 tests covering agent insert/update/delete/typed-getter, context insert by ID, name-index lookup with hit/miss, agent-prefix range scan, cross-agent name isolation (spec §07/05 §13), and `Vec<String>` + `Option<String>` rkyv round-trip.
 
-### Task 3.4 — Edge storage
-**Reads:** `spec/07_metadata_graph/04_edge_storage.md`
-**Writes:** `crates/brain-metadata/src/tables/edge.rs`
-**Done when:** LINK / UNLINK / list-edges-from / list-edges-to all work; symmetric edges stored both directions.
+### Task 3.4 — Edge storage ✅
+**Reads:** `spec/07_metadata_graph/04_edge_storage.md`, `spec/02_data_model/06_edges.md`.
+**Writes:** `crates/brain-metadata/src/tables/edge.rs`.
+
+**What was built (2 more tables — 7 of 13):**
+- `EDGES_OUT_TABLE: TableDefinition<EdgeKey, EdgeData>` keyed by `(source, kind, target)`.
+- `EDGES_IN_TABLE: TableDefinition<EdgeKey, EdgeData>` keyed by `(target, kind, source)`.
+- `EdgeData` (rkyv: weight, origin, derived_by, created_at, annotation).
+- `link` / `unlink` / `list_edges_from` / `list_edges_to` helpers — take pre-opened table handles to avoid redb's "table already open" error.
+- **Symmetric edge handling.** `SimilarTo` and `Contradicts` write 4 rows (direct + reverse-index + mirror + mirror-reverse). Self-symmetric edges skip the mirror (would be redundant).
+- Byte-mapping constant modules: `origin::{EXPLICIT, AUTO_DERIVED}` and `derived_by::{CLIENT, CONSOLIDATION_WORKER, SIMILARITY_WORKER}`.
+
+**Done when:** [x] LINK / UNLINK / list-edges-from / list-edges-to all work; symmetric edges stored both directions. 12 tests covering EdgeData round-trip, asymmetric and symmetric link/unlink, self-symmetric (2 rows not 4), range queries with and without kind filter on both tables, list-edges-to picking up symmetric mirror, and update-via-relink.
+
+**Mid-flight bug found and fixed across all tables.** rkyv 0.7's `from_bytes` requires 8-byte-aligned input; redb returns bytes at arbitrary alignment. `MemoryMetadata`'s 3.2 tests happened to pass by luck of alignment; `EdgeData` failed deterministically with `Underaligned { expected_align: 8, actual_align: 1 }`. Fix: copy into `rkyv::AlignedVec` before `from_bytes` in each `redb::Value` impl. Applied to `MemoryMetadata`, `AgentMetadata`, `ContextMetadata`, and `EdgeData` (preemptive).
 
 ### Task 3.5 — Idempotency table with TTL
 **Reads:** `spec/07_metadata_graph/06_idempotency.md`

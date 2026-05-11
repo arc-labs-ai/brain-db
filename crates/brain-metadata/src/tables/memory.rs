@@ -239,10 +239,14 @@ impl redb::Value for MemoryMetadata {
     where
         Self: 'a,
     {
-        // `#[archive(check_bytes)]` enables validation. Corrupt bytes in
-        // redb indicate the file is broken (much bigger problem than a
-        // single row), so panicking is the right failure mode.
-        rkyv::from_bytes::<MemoryMetadata>(data)
+        // `#[archive(check_bytes)]` enables validation, which includes an
+        // alignment check; redb returns bytes at arbitrary alignment, so
+        // we copy into an AlignedVec first. Corrupt bytes here indicate
+        // a broken redb file (much bigger problem than a single row),
+        // so panic is the right failure mode.
+        let mut buf = rkyv::AlignedVec::with_capacity(data.len());
+        buf.extend_from_slice(data);
+        rkyv::from_bytes::<MemoryMetadata>(&buf)
             .expect("MemoryMetadata bytes failed rkyv validation; redb file is corrupt")
     }
 

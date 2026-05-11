@@ -107,7 +107,11 @@ impl redb::Value for ContextMetadata {
     where
         Self: 'a,
     {
-        rkyv::from_bytes::<ContextMetadata>(data)
+        // rkyv 0.7's validation includes alignment; redb returns bytes
+        // at arbitrary alignment, so copy into an AlignedVec first.
+        let mut buf = rkyv::AlignedVec::with_capacity(data.len());
+        buf.extend_from_slice(data);
+        rkyv::from_bytes::<ContextMetadata>(&buf)
             .expect("ContextMetadata bytes failed rkyv validation; redb file is corrupt")
     }
 
