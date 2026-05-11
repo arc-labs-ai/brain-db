@@ -115,4 +115,15 @@ The spec wins in general (per `CLAUDE.md` §2 and `AUTONOMY.md` §2); the entrie
 - **Reason:** the wire/worker layer that emits Reclaim has the `MemoryId` in scope; carrying it forward in the payload would make the storage-layer reclaim path O(1). v1 accepts the cost because (a) reclaims are rare during recovery (only after grace expiry), (b) live ops shouldn't go through this apply path (the writer task composes the same operations with the MemoryId already known), (c) extending `ReclaimPayload` requires a brain-storage WAL-payload change which we've already done once this phase (SD-3.11-1) and prefer to batch.
 - **Plan reference:** `.claude/plans/phase-03-task-11.md` §3.6.
 - **Reconcile by:** extend `ReclaimPayload` with `memory_id: MemoryId` in a future Phase 2 amendment; the sink then deletes by key in O(1) instead of scanning. Tracked as a follow-up.
+- **Status:** **Reconciled** by SD-3.11-3 (audit-followups-1 batch). `ReclaimPayload` now carries `memory_id`; the sink uses an O(1) primary-key delete.
+
+---
+
+## SD-3.11-3: `ReclaimPayload` carries `memory_id` beyond spec §05/05 §10's three-field listing
+
+- **Spec:** `spec/05_storage_arena_wal/05_wal_records.md` §10 declares `struct ReclaimRecord { slot_id, old_version, new_version }` — three fields.
+- **Implementation:** adds a fourth field `memory_id: MemoryId`, encoded after `new_version`. On-disk layout is `slot_id (u64) | old_version (u32) | new_version (u32) | memory_id (16 B)`.
+- **Reason:** closes SD-3.11-2. The metadata sink needs the row's primary key (`MemoryId.to_be_bytes()`) to delete the `memories` and `texts` rows during recovery. Without `memory_id` in the payload, the sink scans the entire `memories` table looking for a row matching `(slot_id, slot_version)` — O(N) per reclaim. Adding the field is 16 bytes per Reclaim record (a rare record type during recovery; routine but bounded during live ops).
+- **Plan reference:** post-Phase-3 audit-followups batch.
+- **Reconcile by:** raise a spec PR to update §05/05 §10 to declare the four-field layout. No code change pending — the implementation is the correct shape.
 

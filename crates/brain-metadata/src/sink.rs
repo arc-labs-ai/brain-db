@@ -295,29 +295,17 @@ impl MetadataDb {
     fn apply_reclaim(&mut self, lsn: u64, p: &ReclaimPayload) -> Result<(), MetadataSinkError> {
         let wtxn = self.db.begin_write().map_err(transient)?;
         {
-            // SD-3.11-2: ReclaimPayload carries slot_id + old_version
-            // but not memory_id. We scan `memories` to find the row,
-            // then delete it + its text. O(N) per reclaim — acceptable
-            // for recovery, painful for live; future Phase 2 amendment
-            // should add memory_id to ReclaimPayload.
-            let mut victim_keys: Vec<[u8; 16]> = Vec::new();
-            {
-                let t = wtxn.open_table(MEMORIES_TABLE).map_err(transient)?;
-                for entry in t.iter().map_err(transient)? {
-                    let (k, v) = entry.map_err(transient)?;
-                    let m = v.value();
-                    if m.slot_id == p.slot_id && m.slot_version == p.old_version {
-                        victim_keys.push(k.value());
-                    }
-                }
-            }
+            // O(1) delete: `ReclaimPayload.memory_id` carries the row's
+            // primary key directly (SD-3.11-3 supersedes the deferred
+            // SD-3.11-2 scan path).
+            let key = p.memory_id.to_be_bytes();
             {
                 let mut mems = wtxn.open_table(MEMORIES_TABLE).map_err(transient)?;
+                mems.remove(&key).map_err(transient)?;
+            }
+            {
                 let mut texts = wtxn.open_table(TEXTS_TABLE).map_err(transient)?;
-                for key in &victim_keys {
-                    mems.remove(key).map_err(transient)?;
-                    texts.remove(key).map_err(transient)?;
-                }
+                texts.remove(&key).map_err(transient)?;
             }
 
             // Advance slot_versions to the WAL's recorded new_version.
@@ -908,9 +896,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MetadataDb::open(db_path(&dir)).unwrap();
         let enc = sample_encode(5, 5);
-        let slot_id = enc.memory_id.slot();
-        let old_version = enc.memory_id.version();
-        let key = enc.memory_id.to_be_bytes();
+        let memory_id = enc.memory_id;
+        let slot_id = memory_id.slot();
+        let old_version = memory_id.version();
+        let key = memory_id.to_be_bytes();
         db.apply(1, TS, &WalPayload::Encode(enc)).unwrap();
         db.apply(
             2,
@@ -919,6 +908,7 @@ mod tests {
                 slot_id,
                 old_version,
                 new_version: old_version + 1,
+                memory_id,
             }),
         )
         .unwrap();

@@ -547,6 +547,7 @@ mod tests {
             slot_id: slot,
             old_version: old_v,
             new_version: new_v,
+            memory_id: brain_core::MemoryId::pack(1, slot, old_v),
         };
         WalRecord::from_typed(
             Lsn(0),

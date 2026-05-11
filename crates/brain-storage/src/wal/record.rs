@@ -505,6 +505,7 @@ mod tests {
             slot_id: 0xCAFE,
             old_version: 7,
             new_version: 8,
+            memory_id: brain_core::MemoryId::pack(1, 0xCAFE, 7),
         });
         let record = WalRecord::from_typed(Lsn(1), 0, 1234, 0xAA, &payload);
         assert_eq!(record.kind, WalRecordKind::Reclaim);
