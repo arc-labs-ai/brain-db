@@ -35,6 +35,7 @@ use thiserror::Error;
 
 use crate::idmap::{IdMap, IdMapError};
 use crate::params::{IndexParams, IndexParamsError, DEFAULT_CAPACITY_HINT, MAX_LAYER};
+use crate::tombstones::TombstoneBitmap;
 
 /// HNSW index parameterised by vector dimension `D`. Wraps
 /// `hnsw_rs::Hnsw<f32, DistCosine>` with Brain's parameter discipline.
@@ -47,6 +48,7 @@ pub struct HnswIndex<const D: usize> {
     inner: Hnsw<'static, f32, DistCosine>,
     params: IndexParams,
     id_map: IdMap,
+    tombstones: TombstoneBitmap,
 }
 
 /// Errors from [`HnswIndex`] construction and operations.
@@ -69,6 +71,15 @@ pub enum HnswError {
     /// practice; the check is defensive.
     #[error("id_map exhausted: u32::MAX internal ids allocated")]
     IdMapExhausted,
+
+    /// State-changing operation referenced a `MemoryId` not present in
+    /// the id_map. Spec `§06/05` calls re-tombstoning known memories;
+    /// an unknown id is a caller bug.
+    ///
+    /// Note: the read-only [`HnswIndex::is_tombstoned`] returns `false`
+    /// rather than this error — query paths are fail-soft.
+    #[error("memory_id not found in id_map: {memory_id_bytes:?}")]
+    MemoryIdNotFound { memory_id_bytes: [u8; 16] },
 }
 
 impl From<IdMapError> for HnswError {
@@ -101,6 +112,7 @@ impl<const D: usize> HnswIndex<D> {
             inner,
             params,
             id_map: IdMap::new(),
+            tombstones: TombstoneBitmap::new(),
         })
     }
 
@@ -158,6 +170,40 @@ impl<const D: usize> HnswIndex<D> {
     #[must_use]
     pub fn contains(&self, memory_id: MemoryId) -> bool {
         self.id_map.contains(memory_id)
+    }
+
+    /// Mark `memory_id` as tombstoned. The node stays in the graph
+    /// (spec `§06/05 §2`); search filtering at sub-task 4.4 drops
+    /// tombstoned candidates from results.
+    ///
+    /// Returns [`HnswError::MemoryIdNotFound`] if `memory_id` isn't in
+    /// the id_map.
+    pub fn mark_tombstoned(&mut self, memory_id: MemoryId) -> Result<(), HnswError> {
+        let internal_id =
+            self.id_map
+                .lookup_forward(memory_id)
+                .ok_or(HnswError::MemoryIdNotFound {
+                    memory_id_bytes: memory_id.to_be_bytes(),
+                })?;
+        self.tombstones.set(internal_id);
+        Ok(())
+    }
+
+    /// Is `memory_id` tombstoned? Returns `false` for unknown ids —
+    /// query paths are fail-soft.
+    #[must_use]
+    pub fn is_tombstoned(&self, memory_id: MemoryId) -> bool {
+        match self.id_map.lookup_forward(memory_id) {
+            Some(id) => self.tombstones.is_set(id),
+            None => false,
+        }
+    }
+
+    /// Running count of tombstoned memories in this index. O(1) per
+    /// spec `§06/05 §13`'s `tombstone_ratio` metric expectation.
+    #[must_use]
+    pub fn tombstone_count(&self) -> usize {
+        self.tombstones.count()
     }
 
     /// Number of vectors inserted. Cheap.
@@ -363,5 +409,53 @@ mod tests {
         idx.insert(mid(7), &vec4(1.0, 0.0, 0.0, 0.0)).unwrap();
         assert!(idx.contains(mid(7)));
         assert!(!idx.contains(mid(8)));
+    }
+
+    // ----- 4.3-specific tests --------------------------------------------
+
+    #[test]
+    fn mark_tombstoned_consults_idmap() {
+        let mut idx = HnswIndex::<4>::new(params_d4()).unwrap();
+        idx.insert(mid(1), &vec4(1.0, 0.0, 0.0, 0.0)).unwrap();
+        assert!(!idx.is_tombstoned(mid(1)));
+        idx.mark_tombstoned(mid(1)).unwrap();
+        assert!(idx.is_tombstoned(mid(1)));
+        assert_eq!(idx.tombstone_count(), 1);
+    }
+
+    #[test]
+    fn mark_tombstoned_unknown_returns_error() {
+        let mut idx = HnswIndex::<4>::new(params_d4()).unwrap();
+        match idx.mark_tombstoned(mid(999)) {
+            Err(HnswError::MemoryIdNotFound { memory_id_bytes }) => {
+                assert_eq!(memory_id_bytes, mid(999).to_be_bytes());
+            }
+            Err(e) => panic!("wrong error: {e}"),
+            Ok(()) => panic!("expected MemoryIdNotFound"),
+        }
+        assert_eq!(idx.tombstone_count(), 0);
+    }
+
+    #[test]
+    fn is_tombstoned_unknown_returns_false() {
+        // Query path is fail-soft: unknown MemoryId is not an error.
+        let idx = HnswIndex::<4>::new(params_d4()).unwrap();
+        assert!(!idx.is_tombstoned(mid(999)));
+    }
+
+    #[test]
+    fn tombstone_count_pin() {
+        let mut idx = HnswIndex::<4>::new(params_d4()).unwrap();
+        idx.insert(mid(1), &vec4(1.0, 0.0, 0.0, 0.0)).unwrap();
+        idx.insert(mid(2), &vec4(0.0, 1.0, 0.0, 0.0)).unwrap();
+        idx.insert(mid(3), &vec4(0.0, 0.0, 1.0, 0.0)).unwrap();
+        assert_eq!(idx.tombstone_count(), 0);
+        idx.mark_tombstoned(mid(1)).unwrap();
+        idx.mark_tombstoned(mid(2)).unwrap();
+        assert_eq!(idx.tombstone_count(), 2);
+        // mid(3) untouched.
+        assert!(idx.is_tombstoned(mid(1)));
+        assert!(idx.is_tombstoned(mid(2)));
+        assert!(!idx.is_tombstoned(mid(3)));
     }
 }

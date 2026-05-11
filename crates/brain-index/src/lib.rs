@@ -30,7 +30,9 @@
 pub mod hnsw;
 pub mod idmap;
 pub mod params;
+pub mod tombstones;
 
 pub use hnsw::{HnswError, HnswIndex};
 pub use idmap::{IdMap, IdMapError};
 pub use params::{IndexParams, IndexParamsError, MAX_LAYER, VECTOR_DIM};
+pub use tombstones::TombstoneBitmap;
