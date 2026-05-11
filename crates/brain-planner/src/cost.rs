@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn coefficients_match_spec_ranges() {
         // Spec §07 §2 ranges; we pick mid-points where ranges exist.
-        assert!(EMBED_CACHE_HIT_MS < 0.01);
+        const _CACHE_HIT_BELOW_HUNDREDTH: () = assert!(EMBED_CACHE_HIT_MS < 0.01);
         assert!((5.0..=10.0).contains(&EMBED_CACHE_MISS_MS));
         assert!((0.5..=2.0).contains(&HNSW_INSERT_MS));
         assert!((0.0..=0.5).contains(&WAL_FSYNC_GROUP_MS));

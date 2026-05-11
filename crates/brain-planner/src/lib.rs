@@ -30,12 +30,15 @@ pub mod config;
 pub mod context;
 pub mod cost;
 pub mod error;
+pub mod executor;
 pub mod plan;
+pub mod recall;
 pub mod stats;
 
 pub use config::PlannerConfig;
 pub use context::PlannerContext;
 pub use error::PlanError;
+pub use executor::{execute_recall, ExecError, ExecutorContext, RecallHit, RecallResult};
 pub use plan::{
     AnnSearchStep, ApplyStep, ContextResolutionStep, EdgeSpec, EdgeStep, EmbeddingStep, EncodePlan,
     EncodeResponseStep, ExecutionPlan, FilterRule, FilterStage, FilterStep, ForgetPlan,
@@ -43,6 +46,7 @@ pub use plan::{
     ResponseStep, ShardId, ShardSearchStep, SlotAllocationStep, SortKey, TextFetchStep,
     WalAppendStep,
 };
+pub use recall::{plan_recall, plan_recall_inner};
 pub use stats::ShardStats;
 
 /// Compile-time guard: every plan type must be `Send + Sync` so the

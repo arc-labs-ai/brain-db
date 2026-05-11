@@ -76,6 +76,7 @@ pub struct CachingDispatcher<D: Dispatcher> {
     inner: D,
     /// `None` when `cache_size = 0` — cache disabled, pure passthrough
     /// per spec `04/05 §13`.
+    #[allow(clippy::type_complexity)]
     state: Option<Arc<Mutex<LruCache<[u8; 16], CachedEmbedding>>>>,
     hits: AtomicU64,
     misses: AtomicU64,
