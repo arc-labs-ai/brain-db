@@ -4,7 +4,7 @@
 
 use brain_core::{ContextId, MemoryId, MemoryKind};
 
-use super::writer::EdgeOutcome;
+use super::writer::{EdgeOutcome, ForgetOutcome};
 
 #[derive(Debug, Clone)]
 pub struct RecallResult {
@@ -32,5 +32,12 @@ pub struct EncodeResult {
     pub edge_results: Vec<EdgeOutcome>,
     /// `true` when the writer replayed a cached idempotency entry;
     /// `false` for a fresh write. Spec §08/04 §4.
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ForgetResult {
+    pub memory_id: MemoryId,
+    pub outcome: ForgetOutcome,
     pub replayed: bool,
 }

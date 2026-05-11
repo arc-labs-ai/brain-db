@@ -24,7 +24,8 @@ use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
 use brain_planner::{
     execute_recall, plan_recall, plan_recall_inner, EncodeAck, EncodeOp, ExecutionPlan,
-    ExecutorContext, PlannerContext, SharedMetadataDb, WriterError, WriterHandle,
+    ExecutorContext, ForgetAck, ForgetOp, PlannerContext, SharedMetadataDb, WriterError,
+    WriterHandle,
 };
 use brain_protocol::request::{MemoryKindWire, RecallRequest};
 use uuid::Uuid;
@@ -94,6 +95,19 @@ impl WriterHandle for NoopWriter {
         _op: EncodeOp,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<EncodeAck, WriterError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            Err(WriterError::Internal(
+                "noop writer used in recall test".into(),
+            ))
+        })
+    }
+
+    fn submit_forget<'a>(
+        &'a self,
+        _op: ForgetOp,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ForgetAck, WriterError>> + Send + 'a>,
     > {
         Box::pin(async move {
             Err(WriterError::Internal(

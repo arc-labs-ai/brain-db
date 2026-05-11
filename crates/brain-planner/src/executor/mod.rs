@@ -7,6 +7,7 @@
 pub mod context;
 pub mod encode;
 pub mod error;
+pub mod forget;
 pub mod recall;
 pub mod result;
 pub mod writer;
@@ -14,6 +15,10 @@ pub mod writer;
 pub use context::{ExecutorContext, SharedMetadataDb};
 pub use encode::execute_encode;
 pub use error::ExecError;
+pub use forget::execute_forget;
 pub use recall::execute_recall;
-pub use result::{EncodeResult, RecallHit, RecallResult};
-pub use writer::{EdgeOutcome, EncodeAck, EncodeOp, EncodeOpEdge, WriterError, WriterHandle};
+pub use result::{EncodeResult, ForgetResult, RecallHit, RecallResult};
+pub use writer::{
+    EdgeOutcome, EncodeAck, EncodeOp, EncodeOpEdge, ForgetAck, ForgetOp, ForgetOutcome,
+    WriterError, WriterHandle,
+};

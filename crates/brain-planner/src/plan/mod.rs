@@ -17,7 +17,7 @@ pub use encode::{
     ApplyStep, ContextResolutionStep, EdgeStep, EncodePlan, EncodeResponseStep,
     IdempotencyCheckStep, SlotAllocationStep, WalAppendStep,
 };
-pub use forget::ForgetPlan;
+pub use forget::{ForgetApplyStep, ForgetPlan, ForgetResponseStep, ForgetWalStep};
 pub use path::{
     default_plan_edge_kinds, EvidenceResponseStep, PathPlan, ScoringStep, TraversalStep,
 };

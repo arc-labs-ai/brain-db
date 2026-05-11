@@ -21,7 +21,8 @@ use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
 use brain_planner::{
     execute_encode, execute_recall, plan_encode, plan_recall, EdgeOutcome, EncodeAck, EncodeOp,
-    ExecutionPlan, ExecutorContext, PlannerContext, SharedMetadataDb, WriterError, WriterHandle,
+    ExecutionPlan, ExecutorContext, ForgetAck, ForgetOp, ForgetOutcome, PlannerContext,
+    SharedMetadataDb, WriterError, WriterHandle,
 };
 use brain_protocol::request::{EncodeRequest, MemoryKindWire, RecallRequest};
 use parking_lot::Mutex;
@@ -88,8 +89,13 @@ struct FakeWriterState {
     next_slot: u64,
     metadata: SharedMetadataDb,
     hnsw_writer: HnswWriter<VECTOR_DIM>,
-    /// Idempotency replay table; spec §08/04 §4.
+    /// Encode-side idempotency replay table; spec §08/04 §4.
     seen: HashMap<RequestId, EncodeAck>,
+    /// Forget-side idempotency replay table; spec §08/06 §7.
+    forget_seen: HashMap<RequestId, ForgetAck>,
+    /// Memories we've already tombstoned via FORGET. Lets the next
+    /// submit return `AlreadyTombstoned` for the same memory_id.
+    tombstoned: std::collections::HashSet<brain_core::MemoryId>,
 }
 
 impl FakeWriterHandle {
@@ -100,6 +106,8 @@ impl FakeWriterHandle {
                 metadata,
                 hnsw_writer,
                 seen: HashMap::new(),
+                forget_seen: HashMap::new(),
+                tombstoned: std::collections::HashSet::new(),
             }),
             submit_count: AtomicU64::new(0),
         }
@@ -195,6 +203,69 @@ impl WriterHandle for FakeWriterHandle {
                 replayed: false,
             };
             state.seen.insert(op.request_id, ack.clone());
+            Ok(ack)
+        })
+    }
+
+    fn submit_forget<'a>(
+        &'a self,
+        op: ForgetOp,
+    ) -> Pin<Box<dyn Future<Output = Result<ForgetAck, WriterError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.submit_count.fetch_add(1, Ordering::Relaxed);
+            let mut state = self.inner.lock();
+
+            // Idempotency replay.
+            if let Some(cached) = state.forget_seen.get(&op.request_id) {
+                let mut replayed = *cached;
+                replayed.replayed = true;
+                return Ok(replayed);
+            }
+
+            // Already tombstoned by an earlier FORGET for the same id?
+            if state.tombstoned.contains(&op.memory_id) {
+                let ack = ForgetAck {
+                    memory_id: op.memory_id,
+                    outcome: ForgetOutcome::AlreadyTombstoned,
+                    replayed: false,
+                };
+                state.forget_seen.insert(op.request_id, ack);
+                return Ok(ack);
+            }
+
+            // Look up the memory in metadata.
+            let exists = state
+                .metadata
+                .lock()
+                .read_txn()
+                .ok()
+                .and_then(|t| t.open_table(MEMORIES_TABLE).ok())
+                .and_then(|tbl| tbl.get(op.memory_id.to_be_bytes()).ok().flatten())
+                .is_some();
+
+            if !exists {
+                let ack = ForgetAck {
+                    memory_id: op.memory_id,
+                    outcome: ForgetOutcome::MemoryNotFound,
+                    replayed: false,
+                };
+                state.forget_seen.insert(op.request_id, ack);
+                return Ok(ack);
+            }
+
+            // Tombstone in HNSW so recall skips this memory.
+            state
+                .hnsw_writer
+                .mark_tombstoned(op.memory_id)
+                .map_err(|e| WriterError::Internal(format!("hnsw mark_tombstoned: {e:?}")))?;
+            state.tombstoned.insert(op.memory_id);
+
+            let ack = ForgetAck {
+                memory_id: op.memory_id,
+                outcome: ForgetOutcome::Tombstoned,
+                replayed: false,
+            };
+            state.forget_seen.insert(op.request_id, ack);
             Ok(ack)
         })
     }

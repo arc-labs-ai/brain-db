@@ -32,6 +32,7 @@ pub mod cost;
 pub mod encode;
 pub mod error;
 pub mod executor;
+pub mod forget;
 pub mod path;
 pub mod plan;
 pub mod reason;
@@ -43,18 +44,20 @@ pub use context::PlannerContext;
 pub use encode::{plan_encode, plan_encode_inner, MAX_TEXT_BYTES};
 pub use error::PlanError;
 pub use executor::{
-    execute_encode, execute_recall, EdgeOutcome, EncodeAck, EncodeOp, EncodeOpEdge, EncodeResult,
-    ExecError, ExecutorContext, RecallHit, RecallResult, SharedMetadataDb, WriterError,
-    WriterHandle,
+    execute_encode, execute_forget, execute_recall, EdgeOutcome, EncodeAck, EncodeOp, EncodeOpEdge,
+    EncodeResult, ExecError, ExecutorContext, ForgetAck, ForgetOp, ForgetOutcome, ForgetResult,
+    RecallHit, RecallResult, SharedMetadataDb, WriterError, WriterHandle,
 };
+pub use forget::{plan_forget, plan_forget_inner};
 pub use path::{plan_path, plan_path_inner};
 pub use plan::{
     default_contradicts_edge_kinds, default_plan_edge_kinds, default_supports_edge_kinds,
     AggregationStep, AnnSearchStep, ApplyStep, ContextResolutionStep, EdgeSpec, EdgeStep,
     EmbeddingStep, EncodePlan, EncodeResponseStep, EvidenceResponseStep, ExecutionPlan, FilterRule,
-    FilterStage, FilterStep, ForgetPlan, IdempotencyCheckStep, MergeStep, MetadataLookupStep,
-    PathPlan, ReasonPlan, RecallPlan, RecallSubStep, ResponseStep, ScoringStep, ShardId,
-    ShardSearchStep, SlotAllocationStep, SortKey, TextFetchStep, TraversalStep, WalAppendStep,
+    FilterStage, FilterStep, ForgetApplyStep, ForgetPlan, ForgetResponseStep, ForgetWalStep,
+    IdempotencyCheckStep, MergeStep, MetadataLookupStep, PathPlan, ReasonPlan, RecallPlan,
+    RecallSubStep, ResponseStep, ScoringStep, ShardId, ShardSearchStep, SlotAllocationStep,
+    SortKey, TextFetchStep, TraversalStep, WalAppendStep,
 };
 pub use reason::{plan_reason, plan_reason_inner};
 pub use recall::{plan_recall, plan_recall_inner};

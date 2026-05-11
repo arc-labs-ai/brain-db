@@ -11,6 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use brain_core::{ContextId, EdgeKind, MemoryId, MemoryKind, RequestId};
+use brain_protocol::request::ForgetMode;
 use thiserror::Error;
 
 /// Per-shard write surface.
@@ -23,6 +24,11 @@ pub trait WriterHandle: Send + Sync {
         &'a self,
         op: EncodeOp,
     ) -> Pin<Box<dyn Future<Output = Result<EncodeAck, WriterError>> + Send + 'a>>;
+
+    fn submit_forget<'a>(
+        &'a self,
+        op: ForgetOp,
+    ) -> Pin<Box<dyn Future<Output = Result<ForgetAck, WriterError>> + Send + 'a>>;
 }
 
 /// Encode operation payload submitted to the writer. Carries
@@ -81,4 +87,35 @@ pub enum WriterError {
     Overloaded,
     #[error("writer internal error: {0}")]
     Internal(String),
+}
+
+/// Forget operation payload. Spec §08/06 §1.
+#[derive(Debug, Clone, Copy)]
+pub struct ForgetOp {
+    pub request_id: RequestId,
+    pub memory_id: MemoryId,
+    pub mode: ForgetMode,
+}
+
+/// Per-memory outcome. Spec §08/06 §10's per-memory error tolerance:
+/// missing / already-tombstoned memories aren't errors — they're
+/// reported and life goes on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgetOutcome {
+    /// The memory was active; we set the tombstone.
+    Tombstoned,
+    /// The memory was already tombstoned by an earlier FORGET. No-op.
+    AlreadyTombstoned,
+    /// The memory_id has no live row in metadata. Spec §08/06 §10
+    /// logs and returns this; not an error.
+    MemoryNotFound,
+}
+
+/// Writer's ack for a FORGET. Spec §08/06 §11.
+#[derive(Debug, Clone, Copy)]
+pub struct ForgetAck {
+    pub memory_id: MemoryId,
+    pub outcome: ForgetOutcome,
+    /// `true` iff this ack came from a replayed idempotency entry.
+    pub replayed: bool,
 }
