@@ -85,3 +85,13 @@ The spec wins in general (per `CLAUDE.md` §2 and `AUTONOMY.md` §2); the entrie
 - **Reason:** carries forward SD-2.8-2 — there's no async runtime in `brain-storage` yet. The `&mut self` change (rather than `&self` + interior mutability) reflects spec §07 §15's single-writer-per-shard discipline at the type level: the borrow checker enforces that there's only one active writer.
 - **Plan reference:** `.claude/plans/phase-02-task-09.md` §3.1.
 - **Reconcile by:** Phase 9, alongside SD-2.8-2. Becomes `pub async fn append(&self, record) -> Result<Lsn>` once the writer runs as a Glommio coroutine and the committer is `&self`-safe via the runtime's task-local guarantees.
+
+---
+
+## SD-3.5-1: `IdempotencyEntry` adds a `request_hash` field beyond spec §2's struct listing
+
+- **Spec:** `spec/07_metadata_graph/06_idempotency.md` §2 lists four fields on `IdempotencyEntry`: `response_kind`, `memory_id`, `response_payload`, `created_at`.
+- **Implementation:** stores those four plus a fifth field `request_hash: [u8; 32]` (BLAKE3 over the canonical request form).
+- **Reason:** spec §5 mandates a conflict-detection check that compares "a hash of the canonical form of the request" against the stored entry on retry. The response payload alone isn't reversible into the canonical request (responses include server-generated `MemoryId`s, encoded responses, etc.), so the hash must be stored alongside. 32 bytes per row is negligible against the ~50 B/row figure spec §7 uses for capacity planning (dominated by `response_payload`). Storing the hash also keeps the storage layer decision-free: the Phase 9 handler computes it from the canonical request bytes; storage just keeps the bytes.
+- **Plan reference:** `.claude/plans/phase-03-task-05.md` §3.1.
+- **Reconcile by:** raising a spec PR to add `request_hash: [u8; 32]` to the `IdempotencyEntry` struct listing in §07/06 §2. No code change pending — the implementation is the correct shape; the spec text under-specifies it.

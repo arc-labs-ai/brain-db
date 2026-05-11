@@ -91,10 +91,19 @@ Implement the `redb`-backed metadata store: agents, contexts, memory metadata, e
 
 **Mid-flight bug found and fixed across all tables.** rkyv 0.7's `from_bytes` requires 8-byte-aligned input; redb returns bytes at arbitrary alignment. `MemoryMetadata`'s 3.2 tests happened to pass by luck of alignment; `EdgeData` failed deterministically with `Underaligned { expected_align: 8, actual_align: 1 }`. Fix: copy into `rkyv::AlignedVec` before `from_bytes` in each `redb::Value` impl. Applied to `MemoryMetadata`, `AgentMetadata`, `ContextMetadata`, and `EdgeData` (preemptive).
 
-### Task 3.5 — Idempotency table with TTL
+### Task 3.5 — Idempotency table with TTL ✅
 **Reads:** `spec/07_metadata_graph/06_idempotency.md`
-**Writes:** `crates/brain-metadata/src/tables/idempotency.rs`
-**Done when:** RequestId → cached response with insert-time; expiry sweep removes entries > 24h old.
+**Writes:** `crates/brain-metadata/src/tables/idempotency.rs` (new), `crates/brain-metadata/src/tables/mod.rs` (add `pub mod idempotency;`), `docs/spec-deviations.md` (SD-3.5-1).
+
+**What was built (1 more table — 8 of 13):**
+- `IDEMPOTENCY_TABLE: TableDefinition<[u8; 16], IdempotencyEntry>` — keyed by `RequestId::to_be_bytes()` (16-byte UUIDv7).
+- `IdempotencyEntry` — rkyv-derived: `response_kind: u8`, `memory_id_bytes: Option<[u8; 16]>`, `response_payload: Vec<u8>`, `request_hash: [u8; 32]`, `created_at_unix_nanos: u64`. The fifth field (`request_hash`) is **SD-3.5-1** — needed for spec §5's conflict detection in O(1) byte compare; canonical-request bytes aren't reversible from the response payload.
+- `response_kind` byte module: `UNKNOWN=0, ENCODE=1, FORGET=2, LINK=3, UNLINK=4, UPDATE_KIND=5, UPDATE_CONTEXT=6, TXN_BEGIN=7, TXN_COMMIT=8` per spec §17. Same 4th-occurrence-of-u8-mapping pattern; still deferred to the brain-core promotion bundle.
+- `DEFAULT_TTL_NANOS = 24h` per spec §6.
+- `prune_expired(table, now_unix_nanos, ttl_nanos) -> Result<u64, StorageError>` — pure function; collects victims via `iter()`, then `remove`s. Saturating arithmetic on `created_at + ttl_nanos` so `u64::MAX` doesn't wrap.
+- `IdempotencyEntry::memory_id()` typed getter at the API boundary.
+
+**Done when:** [x] 11 tests covering CRUD, missing-key, update, `Option<MemoryId>` round-trip, 256-byte payload round-trip, `request_hash` byte compare, prune-removes-old, prune-keeps-fresh, prune-mixed (3-old + 2-fresh), prune-saturating (entry at `u64::MAX`), and `type_name` v1-marker guard. Total in brain-metadata: 47 tests.
 
 ### Task 3.6 — Text blob storage
 **Reads:** `spec/07_metadata_graph/07_text_storage.md`

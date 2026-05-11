@@ -7,4 +7,5 @@
 pub mod agent;
 pub mod context;
 pub mod edge;
+pub mod idempotency;
 pub mod memory;
