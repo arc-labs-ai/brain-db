@@ -136,10 +136,19 @@ Implement the `redb`-backed metadata store: agents, contexts, memory metadata, e
 
 **Done when:** [x] 8 tests covering missing→1, existing→N+1, monotonic across 10 calls, two-slot independence (3 + 5 increments), **u32::MAX overflow returns Exhausted with no wrap-to-zero** (catastrophic-failure pin), direct insert/get, range scan returns u64 keys in numerical order (50/100/200), and missing-get returns None. Total in brain-metadata: 63 tests.
 
-### Task 3.8 — Counters and statistics
-**Reads:** `spec/07_metadata_graph/02_table_layout.md`
-**Writes:** `crates/brain-metadata/src/tables/counters.rs`
-**Done when:** Per-shard counters (memory count, edge count, etc.) reconcile from full scans.
+### Task 3.8 — `model_fingerprints` + `next_lsn` tables ✅
+**Reads:** `spec/04_embedding_layer/07_fingerprinting.md` §8 (model_fingerprints shape); `spec/07_metadata_graph/02_table_layout.md` §1 rows 10, 12 + §7 (singleton convention).
+**Writes:** `crates/brain-metadata/src/tables/model_fingerprint.rs` (new), `crates/brain-metadata/src/tables/next_lsn.rs` (new), `crates/brain-metadata/src/tables/mod.rs` (add both modules).
+
+**Realignment.** The phase doc originally titled 3.8 "Counters and statistics" with `Done when: Per-shard counters (memory count, edge count, etc.) reconcile from full scans.` That's not a stored table — it's a derivation, and the denormalized count fields it would feed (`AgentMetadata.memory_count`, `ContextMetadata.memory_count`) already exist on row types from 3.3. The spec catalog has two unaccounted-for tables in Phase 3's budget: `model_fingerprints` and `next_lsn`. 3.8 bundles both. Reconcile-from-scans logic, when needed, lands in `MetadataDb` (3.10) or Phase 8 worker — not as a storage primitive. No new SD entry (realignment is *to* the spec).
+
+**What was built (2 more tables — 12 of 13):**
+- `MODEL_FINGERPRINTS_TABLE: TableDefinition<[u8; 16], ModelInfo>` — keyed by the 16-byte fingerprint (spec §04/07 §2: BLAKE3 truncation over the model's config/tokenizer/weights/substrate-config). `ModelInfo { model_name: String, seen_at_unix_nanos: u64, memory_count_at_fingerprint: u64 }`, rkyv-derived with the established `::v1` type_name + AlignedVec workaround. `ModelInfo::new` constructor.
+- `NEXT_LSN_TABLE: TableDefinition<(), u64>` — singleton per spec §07/02 §7. No helper functions; `t.insert(&(), &v)` / `t.get(&())` is what the spec prescribes.
+
+**Done when:** [x] 10 tests across both files. model_fingerprint (6): insert/get, long `String` variable-length round-trip (exercises the AlignedVec fix), update-overwrites, missing-key, multiple-fingerprints-coexist, type_name v1 marker. next_lsn (4): singleton CRUD round-trip, update-overwrites, missing returns None, `()` key sanity (guards spec §07/02 §7's prescription). Total in brain-metadata: 73 tests.
+
+**Mid-flight observation.** `ReadableTable` import is needed for `.get()` on `&mut Table` (write txns, e.g. inside `unit_key_round_trips`) but **not** on `ReadOnlyTable` from read txns (inherent method in redb v4). Updated next_lsn.rs's test imports accordingly; model_fingerprint.rs's tests only read via ReadOnlyTable and don't need it. Clippy caught the unused import.
 
 ### Task 3.9 — Checkpoint table
 **Reads:** `spec/07_metadata_graph/02_table_layout.md`, `spec/05_storage_arena_wal/09_checkpointing.md`
