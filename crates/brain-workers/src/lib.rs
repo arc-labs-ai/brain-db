@@ -34,6 +34,7 @@ pub mod metrics;
 pub mod scheduler;
 pub mod slot_reclaim;
 pub mod summarizer;
+pub mod wal_retention;
 pub mod worker;
 
 pub use access_boost::{boosted_salience, AccessBoostWorker, DEFAULT_BOOST_FACTOR, MAX_SALIENCE};
@@ -58,4 +59,8 @@ pub use metrics::{Snapshot as MetricsSnapshot, WorkerMetrics};
 pub use scheduler::{WorkerHandle, WorkerScheduler};
 pub use slot_reclaim::{SlotReclamationWorker, DEFAULT_FORGET_GRACE};
 pub use summarizer::{DisabledSummarizer, Summarizer, SummarizerError};
+pub use wal_retention::{
+    decide_deletions, CheckpointDesc, DisabledWalRetentionSource, SegmentDesc, WalRetentionSource,
+    WalRetentionSourceError, WalRetentionWorker,
+};
 pub use worker::{drive_batch, Worker};
