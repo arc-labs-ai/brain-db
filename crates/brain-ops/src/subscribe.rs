@@ -462,11 +462,3 @@ pub async fn handle_unsubscribe(
 // ---------------------------------------------------------------------------
 // Send/Sync guards.
 // ---------------------------------------------------------------------------
-
-const _: fn() = || {
-    fn require<T: Send + Sync>() {}
-    require::<EventBus>();
-    require::<SubscriptionRegistry>();
-    require::<EventEnvelope>();
-    require::<ParsedFilter>();
-};

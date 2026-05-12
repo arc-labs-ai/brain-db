@@ -106,7 +106,7 @@ impl Worker for StatisticsUpdateWorker {
     fn run_cycle<'a>(
         &'a self,
         ctx: &'a WorkerContext,
-    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + 'a>> {
         Box::pin(do_stats_cycle(self, ctx))
     }
 }
@@ -186,10 +186,3 @@ fn now_unix_nanos() -> u64 {
         .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
-
-// Compile-time Send + Sync guard.
-const _: fn() = || {
-    fn require<T: Send + Sync>() {}
-    require::<StatisticsUpdateWorker>();
-    require::<Stats>();
-};

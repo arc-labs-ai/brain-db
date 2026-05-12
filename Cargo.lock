@@ -447,6 +447,8 @@ dependencies = [
  "brain-ops",
  "brain-planner",
  "brain-protocol",
+ "futures-lite 2.6.1",
+ "glommio",
  "parking_lot",
  "redb",
  "tempfile",

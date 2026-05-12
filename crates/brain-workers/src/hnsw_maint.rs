@@ -111,9 +111,8 @@ pub enum RebuildSourceError {
 }
 
 /// Future returned by [`RebuildSource::snapshot_vectors`].
-pub type SnapshotFuture<'a, const D: usize> = Pin<
-    Box<dyn Future<Output = Result<Vec<(MemoryId, [f32; D])>, RebuildSourceError>> + Send + 'a>,
->;
+pub type SnapshotFuture<'a, const D: usize> =
+    Pin<Box<dyn Future<Output = Result<Vec<(MemoryId, [f32; D])>, RebuildSourceError>> + 'a>>;
 
 /// Produces a snapshot of active `(MemoryId, vector)` pairs to feed
 /// into `HnswIndex::rebuild`. Production deployments inject an
@@ -178,7 +177,7 @@ impl Worker for HnswMaintenanceWorker {
     fn run_cycle<'a>(
         &'a self,
         ctx: &'a WorkerContext,
-    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + 'a>> {
         Box::pin(do_maintenance_cycle(self, ctx))
     }
 }
@@ -243,10 +242,3 @@ async fn do_maintenance_cycle(
         }
     }
 }
-
-// Compile-time Send + Sync guards.
-const _: fn() = || {
-    fn require<T: Send + Sync>() {}
-    require::<HnswMaintenanceWorker>();
-    require::<DisabledRebuildSource>();
-};

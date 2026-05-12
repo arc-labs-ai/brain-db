@@ -89,7 +89,7 @@ impl Worker for AccessBoostWorker {
     fn run_cycle<'a>(
         &'a self,
         ctx: &'a WorkerContext,
-    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + 'a>> {
         Box::pin(do_boost_cycle(self, ctx))
     }
 }
@@ -187,9 +187,3 @@ async fn do_boost_cycle(
 
     Ok(applied)
 }
-
-// Compile-time Send + Sync guard.
-const _: fn() = || {
-    fn require<T: Send + Sync>() {}
-    require::<AccessBoostWorker>();
-};

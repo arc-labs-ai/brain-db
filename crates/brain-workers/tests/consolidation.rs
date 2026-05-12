@@ -1,3 +1,4 @@
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
 //! Consolidation worker integration tests (sub-task 8.4). Spec §11/03.
 
 use std::future::Future;
@@ -128,8 +129,11 @@ async fn run_cycle(
     worker: &ConsolidationWorker,
     ops: Arc<OpsContext>,
 ) -> Result<usize, brain_workers::WorkerError> {
-    let (_tx, rx) = tokio::sync::watch::channel(false);
-    let wctx = WorkerContext { ops, shutdown: rx };
+    let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wctx = WorkerContext {
+        ops,
+        shutdown: shutdown_flag.clone(),
+    };
     worker.run_cycle(&wctx).await
 }
 
@@ -139,7 +143,7 @@ impl Summarizer for EchoSummarizer {
     fn summarize<'a>(
         &'a self,
         memories: &'a [&'a str],
-    ) -> Pin<Box<dyn Future<Output = Result<String, SummarizerError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<String, SummarizerError>> + 'a>> {
         Box::pin(async move { Ok(format!("[{}]", memories.join("|"))) })
     }
 }
@@ -148,18 +152,22 @@ impl Summarizer for EchoSummarizer {
 // Summarizer (2).
 // ===========================================================================
 
-#[tokio::test]
-async fn disabled_summarizer_returns_disabled_error() {
-    let s = DisabledSummarizer;
-    let r = s.summarize(&["a", "b"]).await;
-    assert!(matches!(r, Err(SummarizerError::Disabled)));
+#[test]
+fn disabled_summarizer_returns_disabled_error() {
+    glommio_run(|| async {
+        let s = DisabledSummarizer;
+        let r = s.summarize(&["a", "b"]).await;
+        assert!(matches!(r, Err(SummarizerError::Disabled)));
+    });
 }
 
-#[tokio::test]
-async fn echo_summarizer_returns_joined_input() {
-    let s = EchoSummarizer;
-    let r = s.summarize(&["one", "two"]).await.unwrap();
-    assert_eq!(r, "[one|two]");
+#[test]
+fn echo_summarizer_returns_joined_input() {
+    glommio_run(|| async {
+        let s = EchoSummarizer;
+        let r = s.summarize(&["one", "two"]).await.unwrap();
+        assert_eq!(r, "[one|two]");
+    });
 }
 
 // ===========================================================================
@@ -287,379 +295,416 @@ fn different_source_sets_produce_different_request_ids() {
 // Cycle behaviour (7).
 // ===========================================================================
 
-#[tokio::test]
-async fn disabled_summarizer_produces_no_consolidations() {
-    let fix = build_fixture();
-    let now = now_unix_nanos();
-    for slot in 1..=10 {
-        seed_memory(
-            &fix.metadata,
-            slot,
-            1,
-            MemoryKind::Episodic,
-            0.5,
-            now,
-            None,
-            None,
-        );
-    }
-    let worker = ConsolidationWorker::new(Arc::new(DisabledSummarizer)).with_min_cluster_size(5);
-    let processed = run_cycle(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 0);
+#[test]
+fn disabled_summarizer_produces_no_consolidations() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        for slot in 1..=10 {
+            seed_memory(
+                &fix.metadata,
+                slot,
+                1,
+                MemoryKind::Episodic,
+                0.5,
+                now,
+                None,
+                None,
+            );
+        }
+        let worker =
+            ConsolidationWorker::new(Arc::new(DisabledSummarizer)).with_min_cluster_size(5);
+        let processed = run_cycle(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 0);
+    });
 }
 
-#[tokio::test]
-async fn cluster_of_five_episodics_produces_one_consolidated() {
-    let fix = build_fixture();
-    let now = now_unix_nanos();
-    for slot in 1..=5 {
-        seed_memory(
-            &fix.metadata,
-            slot,
-            1,
-            MemoryKind::Episodic,
-            0.5,
-            now,
-            None,
-            None,
-        );
-    }
-    let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer)).with_min_cluster_size(5);
-    let processed = run_cycle(&worker, fix.ctx.clone()).await.unwrap();
-    assert_eq!(processed, 1, "one Consolidated memory must be created");
+#[test]
+fn cluster_of_five_episodics_produces_one_consolidated() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        for slot in 1..=5 {
+            seed_memory(
+                &fix.metadata,
+                slot,
+                1,
+                MemoryKind::Episodic,
+                0.5,
+                now,
+                None,
+                None,
+            );
+        }
+        let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer)).with_min_cluster_size(5);
+        let processed = run_cycle(&worker, fix.ctx.clone()).await.unwrap();
+        assert_eq!(processed, 1, "one Consolidated memory must be created");
 
-    // Walk MEMORIES_TABLE to find the Consolidated one.
-    let db = fix.metadata.lock();
-    let rtxn = db.read_txn().unwrap();
-    let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
-    let consolidated: Vec<_> = table
-        .iter()
-        .unwrap()
-        .filter_map(|e| {
-            let (_, v) = e.unwrap();
-            let m = v.value();
-            if m.kind().ok()? == MemoryKind::Consolidated {
-                Some(m)
-            } else {
-                None
-            }
-        })
-        .collect();
-    assert_eq!(consolidated.len(), 1);
-}
-
-#[tokio::test]
-async fn consolidated_has_derived_from_edges_to_each_source() {
-    let fix = build_fixture();
-    let now = now_unix_nanos();
-    let mut source_ids = Vec::new();
-    for slot in 1..=5 {
-        source_ids.push(seed_memory(
-            &fix.metadata,
-            slot,
-            1,
-            MemoryKind::Episodic,
-            0.5,
-            now,
-            None,
-            None,
-        ));
-    }
-    let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer)).with_min_cluster_size(5);
-    run_cycle(&worker, fix.ctx.clone()).await.unwrap();
-
-    // Find the Consolidated id.
-    let consolidated_id = {
+        // Walk MEMORIES_TABLE to find the Consolidated one.
         let db = fix.metadata.lock();
         let rtxn = db.read_txn().unwrap();
         let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
-        let mut id = None;
-        for entry in table.iter().unwrap() {
-            let (_, v) = entry.unwrap();
-            let m = v.value();
-            if m.kind().ok() == Some(MemoryKind::Consolidated) {
-                id = Some(m.memory_id());
-                break;
-            }
+        let consolidated: Vec<_> = table
+            .iter()
+            .unwrap()
+            .filter_map(|e| {
+                let (_, v) = e.unwrap();
+                let m = v.value();
+                if m.kind().ok()? == MemoryKind::Consolidated {
+                    Some(m)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(consolidated.len(), 1);
+    });
+}
+
+#[test]
+fn consolidated_has_derived_from_edges_to_each_source() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        let mut source_ids = Vec::new();
+        for slot in 1..=5 {
+            source_ids.push(seed_memory(
+                &fix.metadata,
+                slot,
+                1,
+                MemoryKind::Episodic,
+                0.5,
+                now,
+                None,
+                None,
+            ));
         }
-        id.expect("Consolidated must exist")
-    };
+        let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer)).with_min_cluster_size(5);
+        run_cycle(&worker, fix.ctx.clone()).await.unwrap();
 
-    // Walk EDGES_OUT for the consolidated id with kind=DerivedFrom.
-    let db = fix.metadata.lock();
-    let rtxn = db.read_txn().unwrap();
-    let edges = rtxn.open_table(EDGES_OUT_TABLE).unwrap();
-    let key_lo = (
-        consolidated_id.to_be_bytes(),
-        EdgeKind::DerivedFrom as u8,
-        [0u8; 16],
-    );
-    let key_hi = (
-        consolidated_id.to_be_bytes(),
-        EdgeKind::DerivedFrom as u8,
-        [0xFFu8; 16],
-    );
-    let mut found_targets = std::collections::HashSet::new();
-    for entry in edges.range(key_lo..=key_hi).unwrap() {
-        let (key, _) = entry.unwrap();
-        let (_, _kind, tgt) = key.value();
-        found_targets.insert(MemoryId::from_be_bytes(tgt));
-    }
-    assert_eq!(found_targets.len(), 5);
-    for id in &source_ids {
-        assert!(found_targets.contains(id));
-    }
-}
-
-#[tokio::test]
-async fn sources_are_stamped_with_consolidated_at() {
-    let fix = build_fixture();
-    let now = now_unix_nanos();
-    let mut ids = Vec::new();
-    for slot in 1..=5 {
-        ids.push(seed_memory(
-            &fix.metadata,
-            slot,
-            1,
-            MemoryKind::Episodic,
-            0.5,
-            now,
-            None,
-            None,
-        ));
-    }
-    let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer)).with_min_cluster_size(5);
-    run_cycle(&worker, fix.ctx).await.unwrap();
-    for id in ids {
-        let m = read_meta(&fix.metadata, id).unwrap();
-        assert!(
-            m.consolidated_at_unix_nanos.is_some(),
-            "source {id:?} must be stamped"
-        );
-    }
-}
-
-#[tokio::test]
-async fn already_consolidated_sources_are_skipped() {
-    let fix = build_fixture();
-    let now = now_unix_nanos();
-    // Seed 5 — but one is already stamped; the worker should skip
-    // the cluster (any source already-consolidated → skip per spec §11).
-    for slot in 1..=5 {
-        let stamp = if slot == 1 {
-            Some(now - 1_000_000)
-        } else {
-            None
+        // Find the Consolidated id.
+        let consolidated_id = {
+            let db = fix.metadata.lock();
+            let rtxn = db.read_txn().unwrap();
+            let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
+            let mut id = None;
+            for entry in table.iter().unwrap() {
+                let (_, v) = entry.unwrap();
+                let m = v.value();
+                if m.kind().ok() == Some(MemoryKind::Consolidated) {
+                    id = Some(m.memory_id());
+                    break;
+                }
+            }
+            id.expect("Consolidated must exist")
         };
-        seed_memory(
-            &fix.metadata,
-            slot,
-            1,
-            MemoryKind::Episodic,
-            0.5,
-            now,
-            stamp,
-            None,
+
+        // Walk EDGES_OUT for the consolidated id with kind=DerivedFrom.
+        let db = fix.metadata.lock();
+        let rtxn = db.read_txn().unwrap();
+        let edges = rtxn.open_table(EDGES_OUT_TABLE).unwrap();
+        let key_lo = (
+            consolidated_id.to_be_bytes(),
+            EdgeKind::DerivedFrom as u8,
+            [0u8; 16],
         );
-    }
-    let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer)).with_min_cluster_size(5);
-    // The already-stamped row is filtered out *before* the
-    // any-already-consolidated check (it doesn't appear as a
-    // candidate at all). The remaining 4 are below min_cluster_size,
-    // so nothing happens. Either way: 0 consolidations.
-    let processed = run_cycle(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 0);
+        let key_hi = (
+            consolidated_id.to_be_bytes(),
+            EdgeKind::DerivedFrom as u8,
+            [0xFFu8; 16],
+        );
+        let mut found_targets = std::collections::HashSet::new();
+        for entry in edges.range(key_lo..=key_hi).unwrap() {
+            let (key, _) = entry.unwrap();
+            let (_, _kind, tgt) = key.value();
+            found_targets.insert(MemoryId::from_be_bytes(tgt));
+        }
+        assert_eq!(found_targets.len(), 5);
+        for id in &source_ids {
+            assert!(found_targets.contains(id));
+        }
+    });
 }
 
-#[tokio::test]
-async fn cross_context_memories_do_not_cluster() {
-    let fix = build_fixture();
-    let now = now_unix_nanos();
-    // 5 in context 1, 5 in context 2.
-    for slot in 1..=5 {
-        seed_memory(
-            &fix.metadata,
-            slot,
-            1,
-            MemoryKind::Episodic,
-            0.5,
-            now,
-            None,
-            None,
-        );
-    }
-    for slot in 6..=10 {
-        seed_memory(
-            &fix.metadata,
-            slot,
-            2,
-            MemoryKind::Episodic,
-            0.5,
-            now,
-            None,
-            None,
-        );
-    }
-    let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer)).with_min_cluster_size(5);
-    let processed = run_cycle(&worker, fix.ctx).await.unwrap();
-    assert_eq!(
-        processed, 2,
-        "exactly one Consolidated per context, both eligible"
-    );
+#[test]
+fn sources_are_stamped_with_consolidated_at() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        let mut ids = Vec::new();
+        for slot in 1..=5 {
+            ids.push(seed_memory(
+                &fix.metadata,
+                slot,
+                1,
+                MemoryKind::Episodic,
+                0.5,
+                now,
+                None,
+                None,
+            ));
+        }
+        let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer)).with_min_cluster_size(5);
+        run_cycle(&worker, fix.ctx).await.unwrap();
+        for id in ids {
+            let m = read_meta(&fix.metadata, id).unwrap();
+            assert!(
+                m.consolidated_at_unix_nanos.is_some(),
+                "source {id:?} must be stamped"
+            );
+        }
+    });
 }
 
-#[tokio::test]
-async fn non_episodic_memories_are_excluded() {
-    let fix = build_fixture();
-    let now = now_unix_nanos();
-    // 4 Episodics + 1 Semantic → Episodics alone fall below
-    // min_cluster_size=5 → no consolidation.
-    for slot in 1..=4 {
-        seed_memory(
-            &fix.metadata,
-            slot,
-            1,
-            MemoryKind::Episodic,
-            0.5,
-            now,
-            None,
-            None,
-        );
-    }
-    seed_memory(
-        &fix.metadata,
-        5,
-        1,
-        MemoryKind::Semantic,
-        0.5,
-        now,
-        None,
-        None,
-    );
-    let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer)).with_min_cluster_size(5);
-    let processed = run_cycle(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 0);
+#[test]
+fn already_consolidated_sources_are_skipped() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        // Seed 5 — but one is already stamped; the worker should skip
+        // the cluster (any source already-consolidated → skip per spec §11).
+        for slot in 1..=5 {
+            let stamp = if slot == 1 {
+                Some(now - 1_000_000)
+            } else {
+                None
+            };
+            seed_memory(
+                &fix.metadata,
+                slot,
+                1,
+                MemoryKind::Episodic,
+                0.5,
+                now,
+                stamp,
+                None,
+            );
+        }
+        let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer)).with_min_cluster_size(5);
+        // The already-stamped row is filtered out *before* the
+        // any-already-consolidated check (it doesn't appear as a
+        // candidate at all). The remaining 4 are below min_cluster_size,
+        // so nothing happens. Either way: 0 consolidations.
+        let processed = run_cycle(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 0);
+    });
 }
 
-#[tokio::test]
-async fn tombstoned_memories_are_excluded() {
-    let fix = build_fixture();
-    let now = now_unix_nanos();
-    // 4 active + 1 tombstoned → below min_cluster_size.
-    for slot in 1..=4 {
-        seed_memory(
-            &fix.metadata,
-            slot,
-            1,
-            MemoryKind::Episodic,
-            0.5,
-            now,
-            None,
-            None,
+#[test]
+fn cross_context_memories_do_not_cluster() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        // 5 in context 1, 5 in context 2.
+        for slot in 1..=5 {
+            seed_memory(
+                &fix.metadata,
+                slot,
+                1,
+                MemoryKind::Episodic,
+                0.5,
+                now,
+                None,
+                None,
+            );
+        }
+        for slot in 6..=10 {
+            seed_memory(
+                &fix.metadata,
+                slot,
+                2,
+                MemoryKind::Episodic,
+                0.5,
+                now,
+                None,
+                None,
+            );
+        }
+        let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer)).with_min_cluster_size(5);
+        let processed = run_cycle(&worker, fix.ctx).await.unwrap();
+        assert_eq!(
+            processed, 2,
+            "exactly one Consolidated per context, both eligible"
         );
-    }
-    seed_memory(
-        &fix.metadata,
-        5,
-        1,
-        MemoryKind::Episodic,
-        0.5,
-        now,
-        None,
-        Some(now), // tombstoned
-    );
-    let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer)).with_min_cluster_size(5);
-    let processed = run_cycle(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 0);
+    });
 }
 
-#[tokio::test]
-async fn second_cycle_is_idempotent() {
-    let fix = build_fixture();
-    let now = now_unix_nanos();
-    for slot in 1..=5 {
+#[test]
+fn non_episodic_memories_are_excluded() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        // 4 Episodics + 1 Semantic → Episodics alone fall below
+        // min_cluster_size=5 → no consolidation.
+        for slot in 1..=4 {
+            seed_memory(
+                &fix.metadata,
+                slot,
+                1,
+                MemoryKind::Episodic,
+                0.5,
+                now,
+                None,
+                None,
+            );
+        }
         seed_memory(
             &fix.metadata,
-            slot,
+            5,
             1,
-            MemoryKind::Episodic,
+            MemoryKind::Semantic,
             0.5,
             now,
             None,
             None,
         );
-    }
-    let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer)).with_min_cluster_size(5);
-    let first = run_cycle(&worker, fix.ctx.clone()).await.unwrap();
-    assert_eq!(first, 1);
-    let second = run_cycle(&worker, fix.ctx).await.unwrap();
-    assert_eq!(
-        second, 0,
-        "sources are stamped; second cycle finds no candidates"
-    );
+        let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer)).with_min_cluster_size(5);
+        let processed = run_cycle(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 0);
+    });
+}
+
+#[test]
+fn tombstoned_memories_are_excluded() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        // 4 active + 1 tombstoned → below min_cluster_size.
+        for slot in 1..=4 {
+            seed_memory(
+                &fix.metadata,
+                slot,
+                1,
+                MemoryKind::Episodic,
+                0.5,
+                now,
+                None,
+                None,
+            );
+        }
+        seed_memory(
+            &fix.metadata,
+            5,
+            1,
+            MemoryKind::Episodic,
+            0.5,
+            now,
+            None,
+            Some(now), // tombstoned
+        );
+        let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer)).with_min_cluster_size(5);
+        let processed = run_cycle(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 0);
+    });
+}
+
+#[test]
+fn second_cycle_is_idempotent() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        for slot in 1..=5 {
+            seed_memory(
+                &fix.metadata,
+                slot,
+                1,
+                MemoryKind::Episodic,
+                0.5,
+                now,
+                None,
+                None,
+            );
+        }
+        let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer)).with_min_cluster_size(5);
+        let first = run_cycle(&worker, fix.ctx.clone()).await.unwrap();
+        assert_eq!(first, 1);
+        let second = run_cycle(&worker, fix.ctx).await.unwrap();
+        assert_eq!(
+            second, 0,
+            "sources are stamped; second cycle finds no candidates"
+        );
+    });
 }
 
 // ===========================================================================
 // Worker integration (2).
 // ===========================================================================
 
-#[tokio::test]
-async fn worker_registers_with_correct_kind_and_default_cadence() {
-    let fix = build_fixture();
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(
-            Arc::new(ConsolidationWorker::new(Arc::new(DisabledSummarizer))),
-            fix.ctx,
-        )
-        .unwrap();
-    let cfg = sched.config(WorkerKind::Consolidation.name()).unwrap();
-    assert_eq!(cfg.interval, Duration::from_secs(300));
-    sched.shutdown().await.unwrap();
+#[test]
+fn worker_registers_with_correct_kind_and_default_cadence() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(
+                Arc::new(ConsolidationWorker::new(Arc::new(DisabledSummarizer))),
+                fix.ctx,
+            )
+            .unwrap();
+        let cfg = sched.config(WorkerKind::Consolidation.name()).unwrap();
+        assert_eq!(cfg.interval, Duration::from_secs(300));
+        sched.shutdown().await.unwrap();
+    });
 }
 
-#[tokio::test]
-async fn disabled_worker_via_config_does_not_run() {
-    let fix = build_fixture();
-    let now = now_unix_nanos();
-    for slot in 1..=5 {
-        seed_memory(
-            &fix.metadata,
-            slot,
-            1,
-            MemoryKind::Episodic,
-            0.5,
-            now,
-            None,
-            None,
-        );
-    }
-    let cfg = WorkerConfig {
-        enabled: false,
-        interval: Duration::from_millis(20),
-        batch_size: 100,
-        max_runtime: Duration::from_secs(60),
-    };
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(
-            Arc::new(
-                ConsolidationWorker::new(Arc::new(EchoSummarizer))
-                    .with_config(cfg)
-                    .with_min_cluster_size(5),
-            ),
-            fix.ctx.clone(),
-        )
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    sched.shutdown().await.unwrap();
+#[test]
+fn disabled_worker_via_config_does_not_run() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        for slot in 1..=5 {
+            seed_memory(
+                &fix.metadata,
+                slot,
+                1,
+                MemoryKind::Episodic,
+                0.5,
+                now,
+                None,
+                None,
+            );
+        }
+        let cfg = WorkerConfig {
+            enabled: false,
+            interval: Duration::from_millis(20),
+            batch_size: 100,
+            max_runtime: Duration::from_secs(60),
+        };
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(
+                Arc::new(
+                    ConsolidationWorker::new(Arc::new(EchoSummarizer))
+                        .with_config(cfg)
+                        .with_min_cluster_size(5),
+                ),
+                fix.ctx.clone(),
+            )
+            .unwrap();
+        glommio::timer::sleep(Duration::from_millis(200)).await;
+        sched.shutdown().await.unwrap();
 
-    let db = fix.metadata.lock();
-    let rtxn = db.read_txn().unwrap();
-    let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
-    let any_consolidated = table.iter().unwrap().any(|e| {
-        let (_, v) = e.unwrap();
-        v.value().kind().ok() == Some(MemoryKind::Consolidated)
+        let db = fix.metadata.lock();
+        let rtxn = db.read_txn().unwrap();
+        let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
+        let any_consolidated = table.iter().unwrap().any(|e| {
+            let (_, v) = e.unwrap();
+            v.value().kind().ok() == Some(MemoryKind::Consolidated)
+        });
+        assert!(!any_consolidated);
     });
-    assert!(!any_consolidated);
+}
+
+fn glommio_run<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + 'static,
+    T: Send + 'static,
+{
+    glommio::LocalExecutorBuilder::default()
+        .name("worker-test")
+        .spawn(move || async move { f().await })
+        .expect("spawn glommio test executor")
+        .join()
+        .expect("test executor join")
 }

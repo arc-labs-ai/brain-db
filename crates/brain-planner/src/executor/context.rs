@@ -96,9 +96,7 @@ impl ExecutorContext {
     }
 }
 
-// Compile-time guard: the context must be Send + Sync so executor
-// tasks can carry it across .await boundaries.
-const _: fn() = || {
-    fn require<T: Send + Sync>() {}
-    require::<ExecutorContext>();
-};
+// After sub-task 9.7 (audit §4) ExecutorContext is intentionally
+// `!Send + !Sync`: WriterHandle is per-shard (single-writer-per-shard
+// per spec §10/02). Phase 9's per-shard Glommio executor is the
+// containment boundary; no cross-thread sharing is required.

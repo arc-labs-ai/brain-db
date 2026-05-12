@@ -1,3 +1,4 @@
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
 //! HNSW maintenance worker integration tests (sub-task 8.5). Spec §11/04.
 
 use std::sync::Arc;
@@ -81,8 +82,11 @@ async fn run_one(
     worker: &HnswMaintenanceWorker,
     ops: Arc<OpsContext>,
 ) -> Result<usize, brain_workers::WorkerError> {
-    let (_tx, rx) = tokio::sync::watch::channel(false);
-    let wctx = WorkerContext { ops, shutdown: rx };
+    let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wctx = WorkerContext {
+        ops,
+        shutdown: shutdown_flag.clone(),
+    };
     worker.run_cycle(&wctx).await
 }
 
@@ -168,221 +172,258 @@ fn custom_thresholds_honoured() {
 // Stats collection (2).
 // ===========================================================================
 
-#[tokio::test]
-async fn cycle_observes_zero_tombstones_initially() {
-    let fix = build_fixture();
-    let worker = HnswMaintenanceWorker::new(Arc::new(DisabledRebuildSource));
-    let processed = run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 0);
-    assert_eq!(fix.index.tombstone_count(), 0);
+#[test]
+fn cycle_observes_zero_tombstones_initially() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let worker = HnswMaintenanceWorker::new(Arc::new(DisabledRebuildSource));
+        let processed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 0);
+        assert_eq!(fix.index.tombstone_count(), 0);
+    });
 }
 
-#[tokio::test]
-async fn cycle_reports_tombstone_after_forget_and_attempts_rebuild() {
-    // Build an index with 4 entries and tombstone 2 → 50% > 30% →
-    // FullRebuild. With DisabledRebuildSource, the rebuild is a
-    // logged no-op (processed=0); the tombstones remain.
-    let fix = build_fixture();
-    let (_other, mut writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
-    let _ = (_other, &mut writer); // sink unused
-                                   // We need to mutate the live index. The fixture's `index` is a
-                                   // reader; the writer side is owned by RealWriterHandle. Reach
-                                   // through it: insert and mark_tombstoned via the shared mutex.
-                                   // Easiest path: build a fresh (shared, writer) and rebuild into
-                                   // the live index. But for this test we just want to observe
-                                   // tombstone_count > 0 from the worker — we can swap a populated
-                                   // index in directly.
-    let (replacement_reader, mut replacement_writer) =
-        SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
-    for slot in 1..=4u64 {
-        replacement_writer
-            .insert(make_id(slot), &make_vector(slot))
-            .unwrap();
-    }
-    replacement_writer.mark_tombstoned(make_id(1)).unwrap();
-    replacement_writer.mark_tombstoned(make_id(2)).unwrap();
-    // Take ownership of the new HnswIndex by re-creating with the
-    // worker-side `swap` API. We can do this by reading what we have
-    // through the new reader's params and rebuild — but simplest is
-    // to construct an `HnswIndex` directly and call swap on the
-    // fixture's index.
-    let params = fix.index.params();
-    let source: Vec<_> = (1..=4u64)
-        .map(|slot| (make_id(slot), make_vector(slot)))
-        .collect();
-    let (mut new_idx, _r) =
-        brain_index::HnswIndex::<{ VECTOR_DIM }>::rebuild(params, source).unwrap();
-    new_idx.mark_tombstoned(make_id(1)).unwrap();
-    new_idx.mark_tombstoned(make_id(2)).unwrap();
-    fix.index.swap(new_idx);
-    let _ = replacement_reader; // not used; exists to keep the writer alive
+#[test]
+fn cycle_reports_tombstone_after_forget_and_attempts_rebuild() {
+    glommio_run(|| async {
+        // Build an index with 4 entries and tombstone 2 → 50% > 30% →
+        // FullRebuild. With DisabledRebuildSource, the rebuild is a
+        // logged no-op (processed=0); the tombstones remain.
+        let fix = build_fixture();
+        let (_other, mut writer) =
+            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+        let _ = (_other, &mut writer); // sink unused
+                                       // We need to mutate the live index. The fixture's `index` is a
+                                       // reader; the writer side is owned by RealWriterHandle. Reach
+                                       // through it: insert and mark_tombstoned via the shared mutex.
+                                       // Easiest path: build a fresh (shared, writer) and rebuild into
+                                       // the live index. But for this test we just want to observe
+                                       // tombstone_count > 0 from the worker — we can swap a populated
+                                       // index in directly.
+        let (replacement_reader, mut replacement_writer) =
+            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+        for slot in 1..=4u64 {
+            replacement_writer
+                .insert(make_id(slot), &make_vector(slot))
+                .unwrap();
+        }
+        replacement_writer.mark_tombstoned(make_id(1)).unwrap();
+        replacement_writer.mark_tombstoned(make_id(2)).unwrap();
+        // Take ownership of the new HnswIndex by re-creating with the
+        // worker-side `swap` API. We can do this by reading what we have
+        // through the new reader's params and rebuild — but simplest is
+        // to construct an `HnswIndex` directly and call swap on the
+        // fixture's index.
+        let params = fix.index.params();
+        let source: Vec<_> = (1..=4u64)
+            .map(|slot| (make_id(slot), make_vector(slot)))
+            .collect();
+        let (mut new_idx, _r) =
+            brain_index::HnswIndex::<{ VECTOR_DIM }>::rebuild(params, source).unwrap();
+        new_idx.mark_tombstoned(make_id(1)).unwrap();
+        new_idx.mark_tombstoned(make_id(2)).unwrap();
+        fix.index.swap(new_idx);
+        let _ = replacement_reader; // not used; exists to keep the writer alive
 
-    assert_eq!(fix.index.len(), 4);
-    assert_eq!(fix.index.tombstone_count(), 2);
+        assert_eq!(fix.index.len(), 4);
+        assert_eq!(fix.index.tombstone_count(), 2);
 
-    let worker = HnswMaintenanceWorker::new(Arc::new(DisabledRebuildSource));
-    let processed = run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 0, "disabled source can't rebuild");
-    assert_eq!(
-        fix.index.tombstone_count(),
-        2,
-        "tombstones remain after disabled-source cycle"
-    );
+        let worker = HnswMaintenanceWorker::new(Arc::new(DisabledRebuildSource));
+        let processed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 0, "disabled source can't rebuild");
+        assert_eq!(
+            fix.index.tombstone_count(),
+            2,
+            "tombstones remain after disabled-source cycle"
+        );
+    });
 }
 
 // ===========================================================================
 // Rebuild source (3).
 // ===========================================================================
 
-#[tokio::test]
-async fn disabled_source_returns_disabled_error() {
-    let s = DisabledRebuildSource;
-    let r: Result<Vec<(MemoryId, [f32; VECTOR_DIM])>, _> =
-        <DisabledRebuildSource as RebuildSource<{ VECTOR_DIM }>>::snapshot_vectors(&s).await;
-    assert!(matches!(r, Err(RebuildSourceError::Disabled)));
+#[test]
+fn disabled_source_returns_disabled_error() {
+    glommio_run(|| async {
+        let s = DisabledRebuildSource;
+        let r: Result<Vec<(MemoryId, [f32; VECTOR_DIM])>, _> =
+            <DisabledRebuildSource as RebuildSource<{ VECTOR_DIM }>>::snapshot_vectors(&s).await;
+        assert!(matches!(r, Err(RebuildSourceError::Disabled)));
+    });
 }
 
-#[tokio::test]
-async fn stub_source_returns_provided_vectors() {
-    let stub = StubRebuildSource {
-        vectors: vec![(make_id(1), make_vector(1)), (make_id(2), make_vector(2))],
-    };
-    let r = <StubRebuildSource as RebuildSource<{ VECTOR_DIM }>>::snapshot_vectors(&stub)
-        .await
-        .unwrap();
-    assert_eq!(r.len(), 2);
+#[test]
+fn stub_source_returns_provided_vectors() {
+    glommio_run(|| async {
+        let stub = StubRebuildSource {
+            vectors: vec![(make_id(1), make_vector(1)), (make_id(2), make_vector(2))],
+        };
+        let r = <StubRebuildSource as RebuildSource<{ VECTOR_DIM }>>::snapshot_vectors(&stub)
+            .await
+            .unwrap();
+        assert_eq!(r.len(), 2);
+    });
 }
 
-#[tokio::test]
-async fn failed_source_propagates_error_as_worker_error() {
-    let fix = build_fixture();
-    // Force a FullRebuild action with low thresholds.
-    let (params, _w) = (fix.index.params(), ()); // shadowing to avoid unused warning
-    let _ = params;
-    let source: Vec<_> = (1..=4u64)
-        .map(|slot| (make_id(slot), make_vector(slot)))
-        .collect();
-    let (mut new_idx, _r) =
-        brain_index::HnswIndex::<{ VECTOR_DIM }>::rebuild(fix.index.params(), source).unwrap();
-    new_idx.mark_tombstoned(make_id(1)).unwrap();
-    new_idx.mark_tombstoned(make_id(2)).unwrap();
-    fix.index.swap(new_idx);
+#[test]
+fn failed_source_propagates_error_as_worker_error() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        // Force a FullRebuild action with low thresholds.
+        let (params, _w) = (fix.index.params(), ()); // shadowing to avoid unused warning
+        let _ = params;
+        let source: Vec<_> = (1..=4u64)
+            .map(|slot| (make_id(slot), make_vector(slot)))
+            .collect();
+        let (mut new_idx, _r) =
+            brain_index::HnswIndex::<{ VECTOR_DIM }>::rebuild(fix.index.params(), source).unwrap();
+        new_idx.mark_tombstoned(make_id(1)).unwrap();
+        new_idx.mark_tombstoned(make_id(2)).unwrap();
+        fix.index.swap(new_idx);
 
-    let worker = HnswMaintenanceWorker::new(Arc::new(FailingRebuildSource));
-    let res = run_one(&worker, fix.ctx).await;
-    assert!(
-        matches!(res, Err(brain_workers::WorkerError::Ops(_))),
-        "failing source must surface as WorkerError::Ops, got {res:?}"
-    );
+        let worker = HnswMaintenanceWorker::new(Arc::new(FailingRebuildSource));
+        let res = run_one(&worker, fix.ctx).await;
+        assert!(
+            matches!(res, Err(brain_workers::WorkerError::Ops(_))),
+            "failing source must surface as WorkerError::Ops, got {res:?}"
+        );
+    });
 }
 
 // ===========================================================================
 // Cycle (3).
 // ===========================================================================
 
-#[tokio::test]
-async fn cycle_with_no_action_returns_zero() {
-    let fix = build_fixture();
-    let worker = HnswMaintenanceWorker::new(Arc::new(DisabledRebuildSource));
-    assert_eq!(run_one(&worker, fix.ctx).await.unwrap(), 0);
+#[test]
+fn cycle_with_no_action_returns_zero() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let worker = HnswMaintenanceWorker::new(Arc::new(DisabledRebuildSource));
+        assert_eq!(run_one(&worker, fix.ctx).await.unwrap(), 0);
+    });
 }
 
-#[tokio::test]
-async fn full_rebuild_via_stub_source_swaps_index_and_returns_one() {
-    let fix = build_fixture();
-    // Seed 4 entries + 2 tombstones → 50% ratio → FullRebuild.
-    let source: Vec<_> = (1..=4u64)
-        .map(|slot| (make_id(slot), make_vector(slot)))
-        .collect();
-    let (mut new_idx, _r) =
-        brain_index::HnswIndex::<{ VECTOR_DIM }>::rebuild(fix.index.params(), source).unwrap();
-    new_idx.mark_tombstoned(make_id(1)).unwrap();
-    new_idx.mark_tombstoned(make_id(2)).unwrap();
-    fix.index.swap(new_idx);
-    assert_eq!(fix.index.tombstone_count(), 2);
+#[test]
+fn full_rebuild_via_stub_source_swaps_index_and_returns_one() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        // Seed 4 entries + 2 tombstones → 50% ratio → FullRebuild.
+        let source: Vec<_> = (1..=4u64)
+            .map(|slot| (make_id(slot), make_vector(slot)))
+            .collect();
+        let (mut new_idx, _r) =
+            brain_index::HnswIndex::<{ VECTOR_DIM }>::rebuild(fix.index.params(), source).unwrap();
+        new_idx.mark_tombstoned(make_id(1)).unwrap();
+        new_idx.mark_tombstoned(make_id(2)).unwrap();
+        fix.index.swap(new_idx);
+        assert_eq!(fix.index.tombstone_count(), 2);
 
-    // Stub returns only the 2 active ids so the rebuilt index has
-    // zero tombstones.
-    let stub = StubRebuildSource {
-        vectors: vec![(make_id(3), make_vector(3)), (make_id(4), make_vector(4))],
-    };
-    let worker = HnswMaintenanceWorker::new(Arc::new(stub));
-    let processed = run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 1, "FullRebuild + stub source → 1 rebuild");
+        // Stub returns only the 2 active ids so the rebuilt index has
+        // zero tombstones.
+        let stub = StubRebuildSource {
+            vectors: vec![(make_id(3), make_vector(3)), (make_id(4), make_vector(4))],
+        };
+        let worker = HnswMaintenanceWorker::new(Arc::new(stub));
+        let processed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 1, "FullRebuild + stub source → 1 rebuild");
 
-    assert_eq!(fix.index.len(), 2);
-    assert_eq!(fix.index.tombstone_count(), 0);
-    assert!(fix.index.contains(make_id(3)));
-    assert!(fix.index.contains(make_id(4)));
+        assert_eq!(fix.index.len(), 2);
+        assert_eq!(fix.index.tombstone_count(), 0);
+        assert!(fix.index.contains(make_id(3)));
+        assert!(fix.index.contains(make_id(4)));
+    });
 }
 
-#[tokio::test]
-async fn disabled_source_with_rebuild_needed_returns_zero_no_swap() {
-    let fix = build_fixture();
-    // Force FullRebuild action.
-    let source: Vec<_> = (1..=4u64)
-        .map(|slot| (make_id(slot), make_vector(slot)))
-        .collect();
-    let (mut new_idx, _r) =
-        brain_index::HnswIndex::<{ VECTOR_DIM }>::rebuild(fix.index.params(), source).unwrap();
-    new_idx.mark_tombstoned(make_id(1)).unwrap();
-    new_idx.mark_tombstoned(make_id(2)).unwrap();
-    fix.index.swap(new_idx);
-    let pre_count = fix.index.tombstone_count();
-    assert_eq!(pre_count, 2);
+#[test]
+fn disabled_source_with_rebuild_needed_returns_zero_no_swap() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        // Force FullRebuild action.
+        let source: Vec<_> = (1..=4u64)
+            .map(|slot| (make_id(slot), make_vector(slot)))
+            .collect();
+        let (mut new_idx, _r) =
+            brain_index::HnswIndex::<{ VECTOR_DIM }>::rebuild(fix.index.params(), source).unwrap();
+        new_idx.mark_tombstoned(make_id(1)).unwrap();
+        new_idx.mark_tombstoned(make_id(2)).unwrap();
+        fix.index.swap(new_idx);
+        let pre_count = fix.index.tombstone_count();
+        assert_eq!(pre_count, 2);
 
-    let worker = HnswMaintenanceWorker::new(Arc::new(DisabledRebuildSource));
-    let processed = run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 0);
-    assert_eq!(
-        fix.index.tombstone_count(),
-        pre_count,
-        "disabled source must not swap the index"
-    );
+        let worker = HnswMaintenanceWorker::new(Arc::new(DisabledRebuildSource));
+        let processed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 0);
+        assert_eq!(
+            fix.index.tombstone_count(),
+            pre_count,
+            "disabled source must not swap the index"
+        );
+    });
 }
 
 // ===========================================================================
 // Worker integration (2).
 // ===========================================================================
 
-#[tokio::test]
-async fn worker_registers_with_correct_kind_and_default_cadence() {
-    let fix = build_fixture();
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(
-            Arc::new(HnswMaintenanceWorker::new(Arc::new(DisabledRebuildSource))),
-            fix.ctx,
-        )
-        .unwrap();
-    let cfg = sched.config(WorkerKind::HnswMaintenance.name()).unwrap();
-    assert_eq!(cfg.interval, Duration::from_secs(300));
-    sched.shutdown().await.unwrap();
+#[test]
+fn worker_registers_with_correct_kind_and_default_cadence() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(
+                Arc::new(HnswMaintenanceWorker::new(Arc::new(DisabledRebuildSource))),
+                fix.ctx,
+            )
+            .unwrap();
+        let cfg = sched.config(WorkerKind::HnswMaintenance.name()).unwrap();
+        assert_eq!(cfg.interval, Duration::from_secs(300));
+        sched.shutdown().await.unwrap();
+    });
 }
 
-#[tokio::test]
-async fn disabled_worker_via_config_does_not_run() {
-    let fix = build_fixture();
-    let cfg = WorkerConfig {
-        enabled: false,
-        interval: Duration::from_millis(20),
-        batch_size: 1,
-        max_runtime: Duration::from_secs(1),
-    };
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(
-            Arc::new(HnswMaintenanceWorker::new(Arc::new(DisabledRebuildSource)).with_config(cfg)),
-            fix.ctx,
-        )
-        .unwrap();
-    let metrics = sched.metrics(WorkerKind::HnswMaintenance.name()).unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    sched.shutdown().await.unwrap();
-    assert_eq!(
-        metrics
-            .cycles_total
-            .load(std::sync::atomic::Ordering::Relaxed),
-        0
-    );
+#[test]
+fn disabled_worker_via_config_does_not_run() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let cfg = WorkerConfig {
+            enabled: false,
+            interval: Duration::from_millis(20),
+            batch_size: 1,
+            max_runtime: Duration::from_secs(1),
+        };
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(
+                Arc::new(
+                    HnswMaintenanceWorker::new(Arc::new(DisabledRebuildSource)).with_config(cfg),
+                ),
+                fix.ctx,
+            )
+            .unwrap();
+        let metrics = sched.metrics(WorkerKind::HnswMaintenance.name()).unwrap();
+        glommio::timer::sleep(Duration::from_millis(150)).await;
+        sched.shutdown().await.unwrap();
+        assert_eq!(
+            metrics
+                .cycles_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    });
+}
+
+fn glommio_run<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + 'static,
+    T: Send + 'static,
+{
+    glommio::LocalExecutorBuilder::default()
+        .name("worker-test")
+        .spawn(move || async move { f().await })
+        .expect("spawn glommio test executor")
+        .join()
+        .expect("test executor join")
 }

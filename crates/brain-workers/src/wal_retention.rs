@@ -96,13 +96,12 @@ pub enum WalRetentionSourceError {
 }
 
 pub type CheckpointFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<CheckpointDesc, WalRetentionSourceError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<CheckpointDesc, WalRetentionSourceError>> + 'a>>;
 
 pub type SegmentListFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Vec<SegmentDesc>, WalRetentionSourceError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<Vec<SegmentDesc>, WalRetentionSourceError>> + 'a>>;
 
-pub type DeleteFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<(), WalRetentionSourceError>> + Send + 'a>>;
+pub type DeleteFuture<'a> = Pin<Box<dyn Future<Output = Result<(), WalRetentionSourceError>> + 'a>>;
 
 /// Pluggable seam for the WAL retention worker. Production
 /// deployments inject an impl backed by `brain_storage::Wal` (Phase
@@ -180,7 +179,7 @@ impl Worker for WalRetentionWorker {
     fn run_cycle<'a>(
         &'a self,
         ctx: &'a WorkerContext,
-    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + 'a>> {
         Box::pin(do_retention_cycle(self, ctx))
     }
 }
@@ -243,7 +242,7 @@ async fn do_retention_cycle(
                 return Err(WorkerError::Ops(format!("wal delete: {e}")));
             }
         }
-        tokio::task::yield_now().await;
+        glommio::executor().yield_if_needed().await;
     }
 
     trace!(
@@ -254,10 +253,3 @@ async fn do_retention_cycle(
     );
     Ok(deleted)
 }
-
-// Compile-time guards.
-const _: fn() = || {
-    fn require<T: Send + Sync>() {}
-    require::<WalRetentionWorker>();
-    require::<DisabledWalRetentionSource>();
-};

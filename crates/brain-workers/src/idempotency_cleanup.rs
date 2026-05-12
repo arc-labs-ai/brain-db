@@ -77,7 +77,7 @@ impl Worker for IdempotencyCleanupWorker {
     fn run_cycle<'a>(
         &'a self,
         ctx: &'a WorkerContext,
-    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + 'a>> {
         Box::pin(do_cleanup_cycle(self, ctx))
     }
 }
@@ -127,7 +127,7 @@ async fn do_cleanup_cycle(
         }
         // Yield between batches so we don't monopolise the mutex.
         // CLAUDE.md §9 guard: only `await` here, outside the lock.
-        tokio::task::yield_now().await;
+        glommio::executor().yield_if_needed().await;
     }
 
     trace!(
@@ -144,9 +144,3 @@ fn now_unix_nanos() -> u64 {
         .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
-
-// Compile-time Send + Sync guard.
-const _: fn() = || {
-    fn require<T: Send + Sync>() {}
-    require::<IdempotencyCleanupWorker>();
-};

@@ -11,7 +11,6 @@
 //! plan in `.claude/plans/phase-07-task-09.md` for the full design.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use brain_core::{EdgeKind, MemoryId};
@@ -486,7 +485,6 @@ pub use self::{
     BufferedEncode as PendingMemory, BufferedForget as PendingForget, BufferedLink as PendingLink,
     BufferedUnlink as PendingUnlink,
 };
-pub type SharedTxnStore = Arc<TxnStore>;
 
 #[must_use]
 pub fn now_unix_nanos_pub() -> u64 {

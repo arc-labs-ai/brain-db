@@ -136,11 +136,6 @@ impl RealWriterHandle {
     }
 }
 
-const _: fn() = || {
-    fn require<T: Send + Sync>() {}
-    require::<RealWriterHandle>();
-};
-
 fn now_unix_nanos() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -152,34 +147,34 @@ impl WriterHandle for RealWriterHandle {
     fn submit_encode<'a>(
         &'a self,
         op: EncodeOp,
-    ) -> Pin<Box<dyn Future<Output = Result<EncodeAck, WriterError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<EncodeAck, WriterError>> + 'a>> {
         Box::pin(async move { do_encode(self, op) })
     }
 
     fn submit_forget<'a>(
         &'a self,
         op: ForgetOp,
-    ) -> Pin<Box<dyn Future<Output = Result<ForgetAck, WriterError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<ForgetAck, WriterError>> + 'a>> {
         Box::pin(async move { do_forget(self, op) })
     }
 
     fn submit_link<'a>(
         &'a self,
         op: LinkOp,
-    ) -> Pin<Box<dyn Future<Output = Result<LinkAck, WriterError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<LinkAck, WriterError>> + 'a>> {
         Box::pin(async move { do_link(self, op) })
     }
 
     fn submit_unlink<'a>(
         &'a self,
         op: UnlinkOp,
-    ) -> Pin<Box<dyn Future<Output = Result<UnlinkAck, WriterError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<UnlinkAck, WriterError>> + 'a>> {
         Box::pin(async move { do_unlink(self, op) })
     }
 
     fn reserve_memory_id<'a>(
         &'a self,
-    ) -> Pin<Box<dyn Future<Output = Result<MemoryId, WriterError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<MemoryId, WriterError>> + 'a>> {
         Box::pin(async move {
             let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
             Ok(MemoryId::pack(0, slot, 1))
@@ -189,8 +184,7 @@ impl WriterHandle for RealWriterHandle {
     fn submit_batch<'a>(
         &'a self,
         batch: brain_planner::TxnBatch,
-    ) -> Pin<Box<dyn Future<Output = Result<brain_planner::TxnBatchAck, WriterError>> + Send + 'a>>
-    {
+    ) -> Pin<Box<dyn Future<Output = Result<brain_planner::TxnBatchAck, WriterError>> + 'a>> {
         Box::pin(async move { do_submit_batch(self, batch) })
     }
 }

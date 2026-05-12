@@ -1,3 +1,4 @@
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
 //! Decay worker integration tests (sub-task 8.2). Spec §11/02.
 
 use std::sync::atomic::Ordering;
@@ -118,10 +119,10 @@ async fn run_one_cycle(
     worker: &DecayWorker,
     ctx: Arc<OpsContext>,
 ) -> Result<usize, brain_workers::WorkerError> {
-    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let wctx = WorkerContext {
         ops: ctx,
-        shutdown: rx,
+        shutdown: shutdown_flag.clone(),
     };
     worker.run_cycle(&wctx).await
 }
@@ -182,215 +183,245 @@ fn half_life_days_matches_constants() {
 // Cycle behaviour (6).
 // ===========================================================================
 
-#[tokio::test]
-async fn cycle_decays_one_memory_when_past_threshold() {
-    let fix = build_fixture();
-    let id = seed_memory(
-        &fix.metadata,
-        1,
-        1.0,
-        MemoryKind::Episodic,
-        now_unix_nanos() - 30 * NANOS_PER_DAY,
-    );
-    let worker = DecayWorker::new();
-    let processed = run_one_cycle(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 1);
-    let new_sal = read_salience(&fix.metadata, id);
-    assert!(
-        (new_sal - 0.5).abs() < 1e-3,
-        "expected ~0.5 after 30d Episodic, got {new_sal}"
-    );
-}
-
-#[tokio::test]
-async fn cycle_skips_minor_changes_under_threshold() {
-    let fix = build_fixture();
-    // 1 minute old — decay is far below 0.001 threshold.
-    let one_minute_nanos: u64 = 60 * 1_000_000_000;
-    let id = seed_memory(
-        &fix.metadata,
-        1,
-        1.0,
-        MemoryKind::Episodic,
-        now_unix_nanos() - one_minute_nanos,
-    );
-    let worker = DecayWorker::new();
-    let processed = run_one_cycle(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 0, "minor-change cycle must not write");
-    let s = read_salience(&fix.metadata, id);
-    assert_eq!(s, 1.0, "salience must be untouched");
-}
-
-#[tokio::test]
-async fn cycle_respects_batch_size() {
-    let fix = build_fixture();
-    let now = now_unix_nanos();
-    // Seed 50 memories all 30 days old — all want a write.
-    for slot in 1..=50 {
-        seed_memory(
+#[test]
+fn cycle_decays_one_memory_when_past_threshold() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let id = seed_memory(
             &fix.metadata,
-            slot,
+            1,
             1.0,
             MemoryKind::Episodic,
-            now - 30 * NANOS_PER_DAY,
+            now_unix_nanos() - 30 * NANOS_PER_DAY,
         );
-    }
-    let cfg = WorkerConfig {
-        enabled: true,
-        interval: Duration::from_secs(1),
-        batch_size: 10,
-        max_runtime: Duration::from_secs(60),
-    };
-    let worker = DecayWorker::new().with_config(cfg);
-    let processed = run_one_cycle(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 10, "batch_size=10 must bound the write count");
-}
-
-#[tokio::test]
-async fn cycle_advances_cursor_across_invocations() {
-    let fix = build_fixture();
-    let now = now_unix_nanos();
-    for slot in 1..=30 {
-        seed_memory(
-            &fix.metadata,
-            slot,
-            1.0,
-            MemoryKind::Episodic,
-            now - 30 * NANOS_PER_DAY,
-        );
-    }
-    let cfg = WorkerConfig {
-        enabled: true,
-        interval: Duration::from_secs(1),
-        batch_size: 10,
-        max_runtime: Duration::from_secs(60),
-    };
-    let worker = DecayWorker::new().with_config(cfg);
-
-    let p1 = run_one_cycle(&worker, fix.ctx.clone()).await.unwrap();
-    let p2 = run_one_cycle(&worker, fix.ctx.clone()).await.unwrap();
-    let p3 = run_one_cycle(&worker, fix.ctx.clone()).await.unwrap();
-    assert_eq!(p1 + p2 + p3, 30, "three cycles cover all 30 memories");
-
-    // Every memory must now be ~0.5 — proves no gaps, no duplicates.
-    for slot in 1..=30 {
-        let s = read_salience(&fix.metadata, make_id(slot));
+        let worker = DecayWorker::new();
+        let processed = run_one_cycle(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 1);
+        let new_sal = read_salience(&fix.metadata, id);
         assert!(
-            (s - 0.5).abs() < 1e-3,
-            "slot {slot} salience {s} not decayed"
+            (new_sal - 0.5).abs() < 1e-3,
+            "expected ~0.5 after 30d Episodic, got {new_sal}"
         );
-    }
+    });
 }
 
-#[tokio::test]
-async fn cycle_wraps_cursor_after_full_pass() {
-    let fix = build_fixture();
-    let now = now_unix_nanos();
-    for slot in 1..=5 {
-        seed_memory(
+#[test]
+fn cycle_skips_minor_changes_under_threshold() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        // 1 minute old — decay is far below 0.001 threshold.
+        let one_minute_nanos: u64 = 60 * 1_000_000_000;
+        let id = seed_memory(
             &fix.metadata,
-            slot,
+            1,
             1.0,
             MemoryKind::Episodic,
-            now - 30 * NANOS_PER_DAY,
+            now_unix_nanos() - one_minute_nanos,
         );
-    }
-    let cfg = WorkerConfig {
-        enabled: true,
-        interval: Duration::from_secs(1),
-        batch_size: 10, // larger than table → one cycle reaches end
-        max_runtime: Duration::from_secs(60),
-    };
-    let worker = DecayWorker::new().with_config(cfg);
-
-    // First cycle decays all 5 to ~0.5 and the cursor wraps to None.
-    let p1 = run_one_cycle(&worker, fix.ctx.clone()).await.unwrap();
-    assert_eq!(p1, 5);
-
-    // Second cycle re-scans from the start; deltas are below threshold
-    // (salience already ~0.5, new compute ~0.5) → 0 writes, idempotent.
-    let p2 = run_one_cycle(&worker, fix.ctx.clone()).await.unwrap();
-    assert_eq!(p2, 0, "re-decay of already-decayed memories must be no-op");
+        let worker = DecayWorker::new();
+        let processed = run_one_cycle(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 0, "minor-change cycle must not write");
+        let s = read_salience(&fix.metadata, id);
+        assert_eq!(s, 1.0, "salience must be untouched");
+    });
 }
 
-#[tokio::test]
-async fn cycle_processed_count_feeds_scheduler_metrics() {
-    let fix = build_fixture();
-    let now = now_unix_nanos();
-    for slot in 1..=3 {
-        seed_memory(
-            &fix.metadata,
-            slot,
-            1.0,
-            MemoryKind::Semantic,
-            now - 365 * NANOS_PER_DAY,
-        );
-    }
-    let mut sched = WorkerScheduler::new();
-    let cfg = WorkerConfig {
-        enabled: true,
-        interval: Duration::from_millis(20),
-        batch_size: 100,
-        max_runtime: Duration::from_secs(60),
-    };
-    sched
-        .register(Arc::new(DecayWorker::new().with_config(cfg)), fix.ctx)
-        .unwrap();
-    let metrics = sched.metrics(WorkerKind::Decay.name()).unwrap();
-    // Wait for the worker's first cycle to run.
-    let deadline = std::time::Instant::now() + Duration::from_millis(500);
-    while std::time::Instant::now() < deadline {
-        if metrics.cycles_total.load(Ordering::Relaxed) >= 1 {
-            break;
+#[test]
+fn cycle_respects_batch_size() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        // Seed 50 memories all 30 days old — all want a write.
+        for slot in 1..=50 {
+            seed_memory(
+                &fix.metadata,
+                slot,
+                1.0,
+                MemoryKind::Episodic,
+                now - 30 * NANOS_PER_DAY,
+            );
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    sched.shutdown().await.unwrap();
-    let processed = metrics.processed_total.load(Ordering::Relaxed);
-    assert!(processed >= 3, "expected >=3 processed, got {processed}");
+        let cfg = WorkerConfig {
+            enabled: true,
+            interval: Duration::from_secs(1),
+            batch_size: 10,
+            max_runtime: Duration::from_secs(60),
+        };
+        let worker = DecayWorker::new().with_config(cfg);
+        let processed = run_one_cycle(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 10, "batch_size=10 must bound the write count");
+    });
+}
+
+#[test]
+fn cycle_advances_cursor_across_invocations() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        for slot in 1..=30 {
+            seed_memory(
+                &fix.metadata,
+                slot,
+                1.0,
+                MemoryKind::Episodic,
+                now - 30 * NANOS_PER_DAY,
+            );
+        }
+        let cfg = WorkerConfig {
+            enabled: true,
+            interval: Duration::from_secs(1),
+            batch_size: 10,
+            max_runtime: Duration::from_secs(60),
+        };
+        let worker = DecayWorker::new().with_config(cfg);
+
+        let p1 = run_one_cycle(&worker, fix.ctx.clone()).await.unwrap();
+        let p2 = run_one_cycle(&worker, fix.ctx.clone()).await.unwrap();
+        let p3 = run_one_cycle(&worker, fix.ctx.clone()).await.unwrap();
+        assert_eq!(p1 + p2 + p3, 30, "three cycles cover all 30 memories");
+
+        // Every memory must now be ~0.5 — proves no gaps, no duplicates.
+        for slot in 1..=30 {
+            let s = read_salience(&fix.metadata, make_id(slot));
+            assert!(
+                (s - 0.5).abs() < 1e-3,
+                "slot {slot} salience {s} not decayed"
+            );
+        }
+    });
+}
+
+#[test]
+fn cycle_wraps_cursor_after_full_pass() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        for slot in 1..=5 {
+            seed_memory(
+                &fix.metadata,
+                slot,
+                1.0,
+                MemoryKind::Episodic,
+                now - 30 * NANOS_PER_DAY,
+            );
+        }
+        let cfg = WorkerConfig {
+            enabled: true,
+            interval: Duration::from_secs(1),
+            batch_size: 10, // larger than table → one cycle reaches end
+            max_runtime: Duration::from_secs(60),
+        };
+        let worker = DecayWorker::new().with_config(cfg);
+
+        // First cycle decays all 5 to ~0.5 and the cursor wraps to None.
+        let p1 = run_one_cycle(&worker, fix.ctx.clone()).await.unwrap();
+        assert_eq!(p1, 5);
+
+        // Second cycle re-scans from the start; deltas are below threshold
+        // (salience already ~0.5, new compute ~0.5) → 0 writes, idempotent.
+        let p2 = run_one_cycle(&worker, fix.ctx.clone()).await.unwrap();
+        assert_eq!(p2, 0, "re-decay of already-decayed memories must be no-op");
+    });
+}
+
+#[test]
+fn cycle_processed_count_feeds_scheduler_metrics() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        for slot in 1..=3 {
+            seed_memory(
+                &fix.metadata,
+                slot,
+                1.0,
+                MemoryKind::Semantic,
+                now - 365 * NANOS_PER_DAY,
+            );
+        }
+        let mut sched = WorkerScheduler::new();
+        let cfg = WorkerConfig {
+            enabled: true,
+            interval: Duration::from_millis(20),
+            batch_size: 100,
+            max_runtime: Duration::from_secs(60),
+        };
+        sched
+            .register(Arc::new(DecayWorker::new().with_config(cfg)), fix.ctx)
+            .unwrap();
+        let metrics = sched.metrics(WorkerKind::Decay.name()).unwrap();
+        // Wait for the worker's first cycle to run.
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            if metrics.cycles_total.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+            glommio::timer::sleep(Duration::from_millis(5)).await;
+        }
+        sched.shutdown().await.unwrap();
+        let processed = metrics.processed_total.load(Ordering::Relaxed);
+        assert!(processed >= 3, "expected >=3 processed, got {processed}");
+    });
 }
 
 // ===========================================================================
 // Worker integration (2).
 // ===========================================================================
 
-#[tokio::test]
-async fn worker_registers_with_correct_kind_and_default_interval() {
-    let fix = build_fixture();
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(Arc::new(DecayWorker::new()), fix.ctx)
-        .unwrap();
-    assert_eq!(sched.names(), vec!["decay"]);
-    let cfg = sched.config("decay").unwrap();
-    assert_eq!(cfg.interval, Duration::from_secs(3600));
-    assert!(cfg.enabled);
-    sched.shutdown().await.unwrap();
+#[test]
+fn worker_registers_with_correct_kind_and_default_interval() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(Arc::new(DecayWorker::new()), fix.ctx)
+            .unwrap();
+        assert_eq!(sched.names(), vec!["decay"]);
+        let cfg = sched.config("decay").unwrap();
+        assert_eq!(cfg.interval, Duration::from_secs(3600));
+        assert!(cfg.enabled);
+        sched.shutdown().await.unwrap();
+    });
 }
 
-#[tokio::test]
-async fn disabled_decay_worker_does_not_modify_salience() {
-    let fix = build_fixture();
-    let now = now_unix_nanos();
-    let id = seed_memory(
-        &fix.metadata,
-        1,
-        1.0,
-        MemoryKind::Episodic,
-        now - 30 * NANOS_PER_DAY,
-    );
-    let cfg = WorkerConfig {
-        enabled: false,
-        interval: Duration::from_millis(20),
-        batch_size: 100,
-        max_runtime: Duration::from_secs(1),
-    };
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(Arc::new(DecayWorker::new().with_config(cfg)), fix.ctx)
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    sched.shutdown().await.unwrap();
-    let s = read_salience(&fix.metadata, id);
-    assert_eq!(s, 1.0, "disabled worker must not write");
+#[test]
+fn disabled_decay_worker_does_not_modify_salience() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        let id = seed_memory(
+            &fix.metadata,
+            1,
+            1.0,
+            MemoryKind::Episodic,
+            now - 30 * NANOS_PER_DAY,
+        );
+        let cfg = WorkerConfig {
+            enabled: false,
+            interval: Duration::from_millis(20),
+            batch_size: 100,
+            max_runtime: Duration::from_secs(1),
+        };
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(Arc::new(DecayWorker::new().with_config(cfg)), fix.ctx)
+            .unwrap();
+        glommio::timer::sleep(Duration::from_millis(150)).await;
+        sched.shutdown().await.unwrap();
+        let s = read_salience(&fix.metadata, id);
+        assert_eq!(s, 1.0, "disabled worker must not write");
+    });
+}
+
+fn glommio_run<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + 'static,
+    T: Send + 'static,
+{
+    glommio::LocalExecutorBuilder::default()
+        .name("worker-test")
+        .spawn(move || async move { f().await })
+        .expect("spawn glommio test executor")
+        .join()
+        .expect("test executor join")
 }

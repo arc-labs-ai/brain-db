@@ -79,7 +79,7 @@ impl Worker for EdgeScrubWorker {
     fn run_cycle<'a>(
         &'a self,
         ctx: &'a WorkerContext,
-    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + 'a>> {
         Box::pin(do_scrub_cycle(self, ctx))
     }
 }
@@ -145,7 +145,7 @@ async fn do_scrub_cycle(
     }
 
     // Yield between phases (mutex never held across .await).
-    tokio::task::yield_now().await;
+    glommio::executor().yield_if_needed().await;
 
     // ── Phase C: full pass over EDGES_IN; catch orphans where the
     //    source is dead. ──────────────────────────────────────────
@@ -361,12 +361,6 @@ fn bump_edge_key(key: EdgeKey) -> EdgeKey {
     }
     (s, k, t)
 }
-
-// Compile-time Send + Sync guard.
-const _: fn() = || {
-    fn require<T: Send + Sync>() {}
-    require::<EdgeScrubWorker>();
-};
 
 #[cfg(test)]
 mod unit {

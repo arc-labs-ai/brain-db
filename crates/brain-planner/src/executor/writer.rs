@@ -16,29 +16,35 @@ use thiserror::Error;
 
 /// Per-shard write surface.
 ///
-/// Object-safe via `Pin<Box<dyn Future>>` — `Arc<dyn WriterHandle>`
-/// is what the executor holds. Bare `async fn` in traits in Rust 1.95
-/// can't yet be used through `dyn`, so we hand-roll the return type.
-pub trait WriterHandle: Send + Sync {
+/// Object-safe via `Pin<Box<dyn Future>>` — `Rc<dyn WriterHandle>`
+/// is what the per-shard executor holds. Bare `async fn` in traits in
+/// Rust 1.95 can't yet be used through `dyn`, so we hand-roll the return
+/// type.
+///
+/// **`!Send + !Sync`** per the audit (`docs/phases/phase-09-glommio-port.md`
+/// §4). Phase 9 enforces single-writer-per-shard (spec §10/02) by living
+/// on one Glommio executor — no cross-thread sharing — so `Send + Sync` on
+/// the trait would be misleading + over-constraining for concrete impls.
+pub trait WriterHandle {
     fn submit_encode<'a>(
         &'a self,
         op: EncodeOp,
-    ) -> Pin<Box<dyn Future<Output = Result<EncodeAck, WriterError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<EncodeAck, WriterError>> + 'a>>;
 
     fn submit_forget<'a>(
         &'a self,
         op: ForgetOp,
-    ) -> Pin<Box<dyn Future<Output = Result<ForgetAck, WriterError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<ForgetAck, WriterError>> + 'a>>;
 
     fn submit_link<'a>(
         &'a self,
         op: LinkOp,
-    ) -> Pin<Box<dyn Future<Output = Result<LinkAck, WriterError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<LinkAck, WriterError>> + 'a>>;
 
     fn submit_unlink<'a>(
         &'a self,
         op: UnlinkOp,
-    ) -> Pin<Box<dyn Future<Output = Result<UnlinkAck, WriterError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<UnlinkAck, WriterError>> + 'a>>;
 
     /// Reserve a fresh `MemoryId` without writing anything. The
     /// returned id may be used by the caller (e.g., a transaction's
@@ -47,7 +53,7 @@ pub trait WriterHandle: Send + Sync {
     /// §10 caps txns at 1000 ops, bounding the leak.
     fn reserve_memory_id<'a>(
         &'a self,
-    ) -> Pin<Box<dyn Future<Output = Result<MemoryId, WriterError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<MemoryId, WriterError>> + 'a>>;
 
     /// Apply a pre-built batch of buffered operations atomically.
     /// Used by `TXN_COMMIT` — one redb write txn, all-or-nothing.
@@ -56,7 +62,7 @@ pub trait WriterHandle: Send + Sync {
     fn submit_batch<'a>(
         &'a self,
         batch: TxnBatch,
-    ) -> Pin<Box<dyn Future<Output = Result<TxnBatchAck, WriterError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<TxnBatchAck, WriterError>> + 'a>>;
 }
 
 /// Encode operation payload submitted to the writer. Carries

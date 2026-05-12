@@ -63,6 +63,24 @@ macOS still compiles brain-server (shard module cfg-gated).
 
 > **Scaffold only.** Real arena/WAL/metadata/HNSW/workers land in 9.5–9.7.
 
+### Task 9.7a — WriterHandle Send drop + WorkerScheduler Glommio port  [x]
+> Sub-task 9.7 originally planned a 9.7a/b/c split. The dependency cascade
+> made the split non-viable (audit §4 + §6 are one change). This commit
+> drops Send + Sync from `brain_planner::WriterHandle`, ports
+> `brain_workers::WorkerScheduler` from tokio to Glommio, and updates
+> every cascading site. `brain-server`'s per-shard OpsContext wire-up
+> moves to a follow-up sub-task (was the original 9.7c).
+
+**Reads:** audit `docs/phases/phase-09-glommio-port.md` §4 + §6 + §8.2 + §8.5.
+**Writes:** `crates/brain-planner/src/executor/{writer,context}.rs`;
+  `crates/brain-ops/src/{writer,lib,context,subscribe,access_buffer,txn}.rs`;
+  `crates/brain-workers/src/{worker,context,scheduler,*}.rs` + every test
+  file migrated to a `glommio_run` harness; `+ Send` stripped from test
+  fixtures' WriterHandle impls.
+**Done when:** `WriterHandle` is `!Send + !Sync`; `WorkerScheduler` runs
+on Glommio (no `tokio::spawn`); `WorkerContext.shutdown` is
+`Arc<AtomicBool>` not `tokio::sync::watch`; 992 tests green in container.
+
 ### Task 9.6 — Real WAL hookup  [x]
 **Reads:** `spec/05_storage_arena_wal/06_wal_durability.md` §1, §11; `spec/05_storage_arena_wal/08_recovery.md` §§1–7; `spec/12_sharding_clustering/01_shard_model.md` §1–§5.
 **Writes:** `crates/brain-storage/src/wal/{segment,wal}.rs` (new `open_for_append` + `open_existing`); `crates/brain-server/src/shard.rs` (Wal field, recovery on spawn, `AppendWalRecord` handler); `crates/brain-server/tests/shard.rs` (4 new integration tests).

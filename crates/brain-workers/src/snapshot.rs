@@ -111,11 +111,10 @@ pub enum SnapshotSourceError {
 }
 
 pub type TakeFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<SnapshotId, SnapshotSourceError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<SnapshotId, SnapshotSourceError>> + 'a>>;
 pub type ListFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Vec<SnapshotDesc>, SnapshotSourceError>> + Send + 'a>>;
-pub type DeleteFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<(), SnapshotSourceError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<Vec<SnapshotDesc>, SnapshotSourceError>> + 'a>>;
+pub type DeleteFuture<'a> = Pin<Box<dyn Future<Output = Result<(), SnapshotSourceError>> + 'a>>;
 
 pub trait SnapshotSource: Send + Sync + 'static {
     fn take_snapshot(&self) -> TakeFuture<'_>;
@@ -189,7 +188,7 @@ impl Worker for SnapshotWorker {
     fn run_cycle<'a>(
         &'a self,
         ctx: &'a WorkerContext,
-    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + 'a>> {
         Box::pin(do_snapshot_cycle(self, ctx))
     }
 }
@@ -251,10 +250,3 @@ fn now_unix_nanos() -> u64 {
         .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
-
-// Compile-time guards.
-const _: fn() = || {
-    fn require<T: Send + Sync>() {}
-    require::<SnapshotWorker>();
-    require::<DisabledSnapshotSource>();
-};

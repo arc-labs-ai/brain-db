@@ -1,3 +1,4 @@
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
 //! Access-boost worker integration tests (sub-task 8.3). Spec §11/02 §7.
 
 use std::sync::atomic::Ordering;
@@ -114,8 +115,11 @@ async fn run_cycle(
     worker: &AccessBoostWorker,
     ops: Arc<OpsContext>,
 ) -> Result<usize, brain_workers::WorkerError> {
-    let (_tx, rx) = tokio::sync::watch::channel(false);
-    let wctx = WorkerContext { ops, shutdown: rx };
+    let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wctx = WorkerContext {
+        ops,
+        shutdown: shutdown_flag.clone(),
+    };
     worker.run_cycle(&wctx).await
 }
 
@@ -188,253 +192,284 @@ fn drain_empties_buffer() {
 // Cycle (5).
 // ===========================================================================
 
-#[tokio::test]
-async fn cycle_boosts_one_recorded_memory() {
-    let fix = build_fixture();
-    let id = seed_memory(&fix.metadata, 1, 0.5);
-    fix.ctx.access_buffer.record(id);
+#[test]
+fn cycle_boosts_one_recorded_memory() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let id = seed_memory(&fix.metadata, 1, 0.5);
+        fix.ctx.access_buffer.record(id);
 
-    let worker = AccessBoostWorker::new();
-    let processed = run_cycle(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 1);
-    let m = read_meta(&fix.metadata, id).unwrap();
-    assert!(
-        (m.salience - 0.55).abs() < 1e-3,
-        "expected ~0.55, got {}",
-        m.salience
-    );
+        let worker = AccessBoostWorker::new();
+        let processed = run_cycle(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 1);
+        let m = read_meta(&fix.metadata, id).unwrap();
+        assert!(
+            (m.salience - 0.55).abs() < 1e-3,
+            "expected ~0.55, got {}",
+            m.salience
+        );
+    });
 }
 
-#[tokio::test]
-async fn cycle_caps_at_one() {
-    let fix = build_fixture();
-    let id = seed_memory(&fix.metadata, 1, 0.95);
-    fix.ctx.access_buffer.record(id);
+#[test]
+fn cycle_caps_at_one() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let id = seed_memory(&fix.metadata, 1, 0.95);
+        fix.ctx.access_buffer.record(id);
 
-    let worker = AccessBoostWorker::new();
-    let processed = run_cycle(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 1);
-    let m = read_meta(&fix.metadata, id).unwrap();
-    assert!((m.salience - 1.0).abs() < 1e-6, "got {}", m.salience);
+        let worker = AccessBoostWorker::new();
+        let processed = run_cycle(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 1);
+        let m = read_meta(&fix.metadata, id).unwrap();
+        assert!((m.salience - 1.0).abs() < 1e-6, "got {}", m.salience);
+    });
 }
 
-#[tokio::test]
-async fn cycle_skips_missing_memory() {
-    let fix = build_fixture();
-    fix.ctx.access_buffer.record(make_id(9999));
+#[test]
+fn cycle_skips_missing_memory() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        fix.ctx.access_buffer.record(make_id(9999));
 
-    let worker = AccessBoostWorker::new();
-    let processed = run_cycle(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 0, "missing memory must be silently skipped");
+        let worker = AccessBoostWorker::new();
+        let processed = run_cycle(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 0, "missing memory must be silently skipped");
+    });
 }
 
-#[tokio::test]
-async fn cycle_increments_access_count() {
-    let fix = build_fixture();
-    let id = seed_memory(&fix.metadata, 1, 0.5);
+#[test]
+fn cycle_increments_access_count() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let id = seed_memory(&fix.metadata, 1, 0.5);
 
-    fix.ctx.access_buffer.record(id);
-    let worker = AccessBoostWorker::new();
-    run_cycle(&worker, fix.ctx.clone()).await.unwrap();
-    let m1 = read_meta(&fix.metadata, id).unwrap();
-    assert_eq!(m1.access_count, 1);
+        fix.ctx.access_buffer.record(id);
+        let worker = AccessBoostWorker::new();
+        run_cycle(&worker, fix.ctx.clone()).await.unwrap();
+        let m1 = read_meta(&fix.metadata, id).unwrap();
+        assert_eq!(m1.access_count, 1);
 
-    fix.ctx.access_buffer.record(id);
-    run_cycle(&worker, fix.ctx).await.unwrap();
-    let m2 = read_meta(&fix.metadata, id).unwrap();
-    assert_eq!(m2.access_count, 2);
+        fix.ctx.access_buffer.record(id);
+        run_cycle(&worker, fix.ctx).await.unwrap();
+        let m2 = read_meta(&fix.metadata, id).unwrap();
+        assert_eq!(m2.access_count, 2);
+    });
 }
 
-#[tokio::test]
-async fn cycle_requeues_overflow_when_batch_too_small() {
-    let fix = build_fixture();
-    // 15 memories seeded; we record all of them.
-    for slot in 1..=15 {
-        seed_memory(&fix.metadata, slot, 0.5);
-        fix.ctx.access_buffer.record(make_id(slot));
-    }
-    assert_eq!(fix.ctx.access_buffer.len(), 15);
+#[test]
+fn cycle_requeues_overflow_when_batch_too_small() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        // 15 memories seeded; we record all of them.
+        for slot in 1..=15 {
+            seed_memory(&fix.metadata, slot, 0.5);
+            fix.ctx.access_buffer.record(make_id(slot));
+        }
+        assert_eq!(fix.ctx.access_buffer.len(), 15);
 
-    let cfg = WorkerConfig {
-        enabled: true,
-        interval: Duration::from_secs(1),
-        batch_size: 10,
-        max_runtime: Duration::from_secs(60),
-    };
-    let worker = AccessBoostWorker::new().with_config(cfg);
-    let processed = run_cycle(&worker, fix.ctx.clone()).await.unwrap();
-    assert_eq!(processed, 10, "first cycle boosts 10 of 15");
-    assert_eq!(
-        fix.ctx.access_buffer.len(),
-        5,
-        "remaining 5 must be re-queued"
-    );
+        let cfg = WorkerConfig {
+            enabled: true,
+            interval: Duration::from_secs(1),
+            batch_size: 10,
+            max_runtime: Duration::from_secs(60),
+        };
+        let worker = AccessBoostWorker::new().with_config(cfg);
+        let processed = run_cycle(&worker, fix.ctx.clone()).await.unwrap();
+        assert_eq!(processed, 10, "first cycle boosts 10 of 15");
+        assert_eq!(
+            fix.ctx.access_buffer.len(),
+            5,
+            "remaining 5 must be re-queued"
+        );
+    });
 }
 
-#[tokio::test]
-async fn empty_buffer_cycle_is_noop() {
-    let fix = build_fixture();
-    let worker = AccessBoostWorker::new();
-    let processed = run_cycle(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 0);
+#[test]
+fn empty_buffer_cycle_is_noop() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let worker = AccessBoostWorker::new();
+        let processed = run_cycle(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 0);
+    });
 }
 
 // ===========================================================================
 // Worker integration (1).
 // ===========================================================================
 
-#[tokio::test]
-async fn worker_registers_with_correct_kind_and_default_cadence() {
-    let fix = build_fixture();
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(Arc::new(AccessBoostWorker::new()), fix.ctx)
-        .unwrap();
-    let cfg = sched.config(WorkerKind::AccessBoost.name()).unwrap();
-    assert_eq!(cfg.interval, Duration::from_secs(10));
-    assert!(cfg.enabled);
-    sched.shutdown().await.unwrap();
+#[test]
+fn worker_registers_with_correct_kind_and_default_cadence() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(Arc::new(AccessBoostWorker::new()), fix.ctx)
+            .unwrap();
+        let cfg = sched.config(WorkerKind::AccessBoost.name()).unwrap();
+        assert_eq!(cfg.interval, Duration::from_secs(10));
+        assert!(cfg.enabled);
+        sched.shutdown().await.unwrap();
+    });
 }
 
 // ===========================================================================
 // Cross-handler integration: RECALL fills buffer, boost worker applies.
 // ===========================================================================
 
-#[tokio::test]
-async fn recall_fills_buffer_then_boost_worker_applies() {
-    use brain_ops::dispatch;
-    use brain_protocol::request::{EncodeRequest, MemoryKindWire, RecallRequest, RequestBody};
-    use brain_protocol::response::ResponseBody;
+#[test]
+fn recall_fills_buffer_then_boost_worker_applies() {
+    glommio_run(|| async {
+        use brain_ops::dispatch;
+        use brain_protocol::request::{EncodeRequest, MemoryKindWire, RecallRequest, RequestBody};
+        use brain_protocol::response::ResponseBody;
 
-    // Build a fixture with a real MockDispatcher so encode/recall
-    // actually produce vectors.
-    struct MockDispatcher;
-    impl Dispatcher for MockDispatcher {
-        fn embed(&self, text: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
-            let mut v = [0.0f32; VECTOR_DIM];
-            for (i, b) in text.as_bytes().iter().enumerate() {
-                v[i % VECTOR_DIM] += f32::from(*b) / 255.0;
+        // Build a fixture with a real MockDispatcher so encode/recall
+        // actually produce vectors.
+        struct MockDispatcher;
+        impl Dispatcher for MockDispatcher {
+            fn embed(&self, text: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+                let mut v = [0.0f32; VECTOR_DIM];
+                for (i, b) in text.as_bytes().iter().enumerate() {
+                    v[i % VECTOR_DIM] += f32::from(*b) / 255.0;
+                }
+                Ok(v)
             }
-            Ok(v)
+            fn embed_batch(&self, texts: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn fingerprint(&self) -> [u8; 16] {
+                [0xAB; 16]
+            }
         }
-        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
-            texts.iter().map(|t| self.embed(t)).collect()
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("metadata.redb");
+        let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
+        let (shared, hnsw_writer) =
+            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+        let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
+        let executor = ExecutorContext::new(
+            Arc::new(MockDispatcher) as Arc<dyn Dispatcher>,
+            shared,
+            metadata.clone(),
+            writer as Arc<dyn WriterHandle>,
+        );
+        let ctx = Arc::new(OpsContext::new(executor));
+
+        // Encode two memories.
+        let encode_req = |rid: [u8; 16], text: &str| EncodeRequest {
+            text: text.into(),
+            context_id: 1,
+            kind: MemoryKindWire::Episodic,
+            salience_hint: 0.5,
+            edges: vec![],
+            request_id: rid,
+            txn_id: None,
+            deduplicate: false,
+        };
+        let _ = dispatch(RequestBody::Encode(encode_req([1; 16], "alpha")), &ctx)
+            .await
+            .unwrap();
+        let _ = dispatch(RequestBody::Encode(encode_req([2; 16], "beta")), &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ctx.access_buffer.len(),
+            0,
+            "encode must not fill the buffer"
+        );
+
+        // RECALL fills the buffer.
+        let recall = RecallRequest {
+            cue_text: "alpha".into(),
+            cue_vector_offset: 0,
+            cue_vector_dim: 0,
+            top_k: 5,
+            confidence_threshold: 0.0,
+            context_filter: None,
+            age_bound_unix_nanos: None,
+            kind_filter: None,
+            salience_floor: 0.0,
+            strategy_hint: None,
+            include_vectors: false,
+            include_edges: false,
+            request_id: None,
+            txn_id: None,
+        };
+        let resp = dispatch(RequestBody::Recall(recall), &ctx).await.unwrap();
+        let n_results = match resp {
+            ResponseBody::Recall(r) => r.results.len(),
+            _ => unreachable!(),
+        };
+        assert!(n_results >= 1);
+        assert_eq!(
+            ctx.access_buffer.len(),
+            n_results,
+            "RECALL must record every returned hit"
+        );
+
+        // Run the boost worker via scheduler.
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(
+                Arc::new(AccessBoostWorker::new().with_config(WorkerConfig {
+                    enabled: true,
+                    interval: Duration::from_millis(20),
+                    batch_size: 100,
+                    max_runtime: Duration::from_secs(1),
+                })),
+                ctx,
+            )
+            .unwrap();
+        let metrics = sched.metrics(WorkerKind::AccessBoost.name()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            if metrics.processed_total.load(Ordering::Relaxed) >= n_results as u64 {
+                break;
+            }
+            glommio::timer::sleep(Duration::from_millis(5)).await;
         }
-        fn fingerprint(&self) -> [u8; 16] {
-            [0xAB; 16]
+        sched.shutdown().await.unwrap();
+
+        let processed = metrics.processed_total.load(Ordering::Relaxed);
+        assert!(
+            processed >= n_results as u64,
+            "expected at least {n_results} boosts, got {processed}"
+        );
+
+        // Confirm the boosted salience landed on at least one row.
+        let alpha = read_meta(&metadata, make_id(1));
+        // memory_id assignment depends on writer; can't pin slot=1 here.
+        // Instead: scan all memories and require at least one has salience > 0.5.
+        let db = metadata.lock();
+        let rtxn = db.read_txn().unwrap();
+        let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
+        let mut any_boosted = false;
+        for entry in table.iter().unwrap() {
+            let (_, v) = entry.unwrap();
+            if v.value().salience > 0.5 {
+                any_boosted = true;
+                break;
+            }
         }
-    }
+        assert!(any_boosted, "at least one memory must show salience > 0.5");
+        let _ = alpha;
+    });
+}
 
-    let tempdir = tempfile::tempdir().unwrap();
-    let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
-    let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
-    let executor = ExecutorContext::new(
-        Arc::new(MockDispatcher) as Arc<dyn Dispatcher>,
-        shared,
-        metadata.clone(),
-        writer as Arc<dyn WriterHandle>,
-    );
-    let ctx = Arc::new(OpsContext::new(executor));
-
-    // Encode two memories.
-    let encode_req = |rid: [u8; 16], text: &str| EncodeRequest {
-        text: text.into(),
-        context_id: 1,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: vec![],
-        request_id: rid,
-        txn_id: None,
-        deduplicate: false,
-    };
-    let _ = dispatch(RequestBody::Encode(encode_req([1; 16], "alpha")), &ctx)
-        .await
-        .unwrap();
-    let _ = dispatch(RequestBody::Encode(encode_req([2; 16], "beta")), &ctx)
-        .await
-        .unwrap();
-
-    assert_eq!(
-        ctx.access_buffer.len(),
-        0,
-        "encode must not fill the buffer"
-    );
-
-    // RECALL fills the buffer.
-    let recall = RecallRequest {
-        cue_text: "alpha".into(),
-        cue_vector_offset: 0,
-        cue_vector_dim: 0,
-        top_k: 5,
-        confidence_threshold: 0.0,
-        context_filter: None,
-        age_bound_unix_nanos: None,
-        kind_filter: None,
-        salience_floor: 0.0,
-        strategy_hint: None,
-        include_vectors: false,
-        include_edges: false,
-        request_id: None,
-        txn_id: None,
-    };
-    let resp = dispatch(RequestBody::Recall(recall), &ctx).await.unwrap();
-    let n_results = match resp {
-        ResponseBody::Recall(r) => r.results.len(),
-        _ => unreachable!(),
-    };
-    assert!(n_results >= 1);
-    assert_eq!(
-        ctx.access_buffer.len(),
-        n_results,
-        "RECALL must record every returned hit"
-    );
-
-    // Run the boost worker via scheduler.
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(
-            Arc::new(AccessBoostWorker::new().with_config(WorkerConfig {
-                enabled: true,
-                interval: Duration::from_millis(20),
-                batch_size: 100,
-                max_runtime: Duration::from_secs(1),
-            })),
-            ctx,
-        )
-        .unwrap();
-    let metrics = sched.metrics(WorkerKind::AccessBoost.name()).unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_millis(500);
-    while std::time::Instant::now() < deadline {
-        if metrics.processed_total.load(Ordering::Relaxed) >= n_results as u64 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    sched.shutdown().await.unwrap();
-
-    let processed = metrics.processed_total.load(Ordering::Relaxed);
-    assert!(
-        processed >= n_results as u64,
-        "expected at least {n_results} boosts, got {processed}"
-    );
-
-    // Confirm the boosted salience landed on at least one row.
-    let alpha = read_meta(&metadata, make_id(1));
-    // memory_id assignment depends on writer; can't pin slot=1 here.
-    // Instead: scan all memories and require at least one has salience > 0.5.
-    let db = metadata.lock();
-    let rtxn = db.read_txn().unwrap();
-    let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
-    let mut any_boosted = false;
-    for entry in table.iter().unwrap() {
-        let (_, v) = entry.unwrap();
-        if v.value().salience > 0.5 {
-            any_boosted = true;
-            break;
-        }
-    }
-    assert!(any_boosted, "at least one memory must show salience > 0.5");
-    let _ = alpha;
+fn glommio_run<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + 'static,
+    T: Send + 'static,
+{
+    glommio::LocalExecutorBuilder::default()
+        .name("worker-test")
+        .spawn(move || async move { f().await })
+        .expect("spawn glommio test executor")
+        .join()
+        .expect("test executor join")
 }

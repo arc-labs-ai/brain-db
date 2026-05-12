@@ -68,7 +68,7 @@ impl Worker for CounterReconcileWorker {
     fn run_cycle<'a>(
         &'a self,
         ctx: &'a WorkerContext,
-    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + 'a>> {
         Box::pin(do_reconcile_cycle(self, ctx))
     }
 }
@@ -257,12 +257,6 @@ fn bump_be_u128(mut bytes: [u8; 16]) -> [u8; 16] {
     }
     [0xFFu8; 16]
 }
-
-// Compile-time Send + Sync guard.
-const _: fn() = || {
-    fn require<T: Send + Sync>() {}
-    require::<CounterReconcileWorker>();
-};
 
 // Silence unused-import in some build configs.
 #[allow(dead_code)]

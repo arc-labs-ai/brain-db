@@ -127,7 +127,7 @@ impl Worker for DecayWorker {
     fn run_cycle<'a>(
         &'a self,
         ctx: &'a WorkerContext,
-    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + 'a>> {
         Box::pin(do_decay_cycle(self, ctx))
     }
 }
@@ -202,7 +202,7 @@ async fn do_decay_cycle(worker: &DecayWorker, ctx: &WorkerContext) -> Result<usi
     // Yield between read and write phases (spec §11/01 §6 yield
     // discipline). We can't yield mid-scan because the read txn holds
     // a parking_lot MutexGuard; the scan is bounded by max_runtime.
-    tokio::task::yield_now().await;
+    glommio::executor().yield_if_needed().await;
 
     // ── Write phase: apply updates atomically in one wtxn. ───────
     let n_updates = updates.len();
@@ -273,12 +273,6 @@ fn bump_be_u128(mut bytes: [u8; 16]) -> [u8; 16] {
     }
     [0xFF; 16]
 }
-
-// Compile-time Send + Sync guard.
-const _: fn() = || {
-    fn require<T: Send + Sync>() {}
-    require::<DecayWorker>();
-};
 
 #[cfg(test)]
 mod unit {

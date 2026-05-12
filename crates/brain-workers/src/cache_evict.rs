@@ -43,8 +43,7 @@ pub enum CacheEvictionError {
     Failed(String),
 }
 
-pub type PruneFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<usize, CacheEvictionError>> + Send + 'a>>;
+pub type PruneFuture<'a> = Pin<Box<dyn Future<Output = Result<usize, CacheEvictionError>> + 'a>>;
 
 /// Pluggable seam. Production deployments inject an impl backed by
 /// `brain_embed::CachingDispatcher::prune_older_than` (Phase 9). v1
@@ -109,7 +108,7 @@ impl Worker for CacheEvictionWorker {
     fn run_cycle<'a>(
         &'a self,
         ctx: &'a WorkerContext,
-    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + 'a>> {
         Box::pin(do_evict_cycle(self, ctx))
     }
 }
@@ -137,10 +136,3 @@ async fn do_evict_cycle(
         Err(CacheEvictionError::Failed(e)) => Err(WorkerError::Ops(format!("cache prune: {e}"))),
     }
 }
-
-// Compile-time guards.
-const _: fn() = || {
-    fn require<T: Send + Sync>() {}
-    require::<CacheEvictionWorker>();
-    require::<DisabledCacheEvictionSource>();
-};
