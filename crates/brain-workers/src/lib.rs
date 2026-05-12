@@ -22,6 +22,7 @@
 )]
 #![forbid(unsafe_code)]
 
+pub mod access_boost;
 pub mod config;
 pub mod context;
 pub mod decay;
@@ -30,6 +31,7 @@ pub mod metrics;
 pub mod scheduler;
 pub mod worker;
 
+pub use access_boost::{boosted_salience, AccessBoostWorker, DEFAULT_BOOST_FACTOR, MAX_SALIENCE};
 pub use config::{WorkerConfig, WorkerKind};
 pub use context::WorkerContext;
 pub use decay::{

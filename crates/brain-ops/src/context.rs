@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use brain_planner::{ExecutorContext, PlannerContext};
 
+use crate::access_buffer::AccessBuffer;
 use crate::subscribe::{EventBus, SubscriptionRegistry};
 use crate::txn::TxnStore;
 
@@ -39,6 +40,10 @@ pub struct OpsContext {
     /// One-shot dispatcher poll window for `handle_subscribe`. Tests
     /// override this to keep the timeout-path test fast.
     pub subscribe_poll_window: Duration,
+    /// Recently-accessed memory ids (sub-task 8.3). RECALL pushes
+    /// every returned hit's id here; the AccessBoostWorker drains
+    /// the buffer on its 10 s cycle and applies a salience bump.
+    pub access_buffer: Arc<AccessBuffer>,
 }
 
 impl OpsContext {
@@ -53,6 +58,7 @@ impl OpsContext {
             events,
             subscriptions,
             subscribe_poll_window: DEFAULT_SUBSCRIBE_POLL_WINDOW,
+            access_buffer: Arc::new(AccessBuffer::default()),
         }
     }
 
@@ -85,6 +91,14 @@ impl OpsContext {
     pub fn with_event_bus(mut self, events: Arc<EventBus>) -> Self {
         self.subscriptions = Arc::new(SubscriptionRegistry::new(events.clone()));
         self.events = events;
+        self
+    }
+
+    /// Replace the access buffer. Tests use this to inject a
+    /// small-capacity buffer for overflow exercises.
+    #[must_use]
+    pub fn with_access_buffer(mut self, buffer: Arc<AccessBuffer>) -> Self {
+        self.access_buffer = buffer;
         self
     }
 }

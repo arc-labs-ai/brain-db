@@ -25,6 +25,7 @@
 )]
 #![forbid(unsafe_code)]
 
+pub mod access_buffer;
 pub mod context;
 pub mod dispatch;
 pub mod error;
@@ -42,6 +43,7 @@ pub mod recall;
 pub mod subscribe;
 pub mod txn;
 
+pub use access_buffer::{AccessBuffer, DEFAULT_ACCESS_BUFFER_CAPACITY};
 pub use brain_planner::PlannerContext;
 pub use context::OpsContext;
 pub use dispatch::dispatch;

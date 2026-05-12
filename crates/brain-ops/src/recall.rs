@@ -60,6 +60,13 @@ pub async fn handle_recall(
     }
     hits.truncate(req.top_k as usize);
 
+    // Sub-task 8.3 — record returned hits in the access-boost buffer.
+    // Spec §11/02 §7, §16: every memory returned by RECALL is a
+    // candidate for the next boost cycle.
+    for h in &hits {
+        ctx.access_buffer.record(h.memory_id);
+    }
+
     let results: Vec<MemoryResult> = hits.into_iter().map(hit_to_wire).collect();
     let cumulative_count = u32::try_from(results.len()).unwrap_or(u32::MAX);
 
