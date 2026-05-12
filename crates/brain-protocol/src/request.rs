@@ -52,7 +52,7 @@ pub type WireMemoryId = u128;
 // ---------------------------------------------------------------------------
 
 /// Spec §02/02 — three durable kinds.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 #[repr(u8)]
@@ -123,6 +123,33 @@ pub enum PlanState {
 pub enum ObservationInput {
     ByMemoryId(WireMemoryId),
     ByText(String),
+}
+
+/// Spec §07/6 — `LINK_REQ` body. Creates an edge between two memories.
+#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub struct LinkRequest {
+    pub source: WireMemoryId,
+    pub target: WireMemoryId,
+    pub kind: EdgeKindWire,
+    /// `[0, 1]` for most kinds; `[-1, 1]` for `Contradicts` (spec §09/07 §2).
+    pub weight: f32,
+    pub request_id: WireUuid,
+    pub txn_id: Option<WireUuid>,
+}
+
+/// Spec §07/6 — `UNLINK_REQ` body. Removes an edge identified by the
+/// `(source, kind, target)` triple.
+#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub struct UnlinkRequest {
+    pub source: WireMemoryId,
+    pub target: WireMemoryId,
+    pub kind: EdgeKindWire,
+    pub request_id: WireUuid,
+    pub txn_id: Option<WireUuid>,
 }
 
 /// Spec §07/6 — soft tombstone vs. hard erase.
@@ -231,6 +258,9 @@ pub struct RecallRequest {
     pub include_vectors: bool,
     pub include_edges: bool,
     pub request_id: Option<WireUuid>,
+    /// Spec §09/08 §5: when set, RECALL reads against a snapshot
+    /// that includes the txn's pending writes (read-your-writes).
+    pub txn_id: Option<WireUuid>,
 }
 
 /// Spec §07/4.
@@ -244,6 +274,7 @@ pub struct PlanRequest {
     pub strategy_hint: Option<PlanStrategy>,
     pub context_filter: Option<Vec<WireContextId>>,
     pub request_id: Option<WireUuid>,
+    pub txn_id: Option<WireUuid>,
 }
 
 /// Spec §07/4 — plan budget.
@@ -268,6 +299,7 @@ pub struct ReasonRequest {
     pub max_inferences: u32,
     pub budget_wall_time_ms: u32,
     pub request_id: Option<WireUuid>,
+    pub txn_id: Option<WireUuid>,
 }
 
 /// Spec §07/6.
@@ -503,6 +535,8 @@ pub enum RequestBody {
     Plan(PlanRequest),
     Reason(ReasonRequest),
     Forget(ForgetRequest),
+    Link(LinkRequest),
+    Unlink(UnlinkRequest),
     Subscribe(SubscribeRequest),
     Unsubscribe(UnsubscribeRequest),
     TxnBegin(TxnBeginRequest),
@@ -537,6 +571,8 @@ impl RequestBody {
             Self::Plan(_) => Opcode::PlanReq,
             Self::Reason(_) => Opcode::ReasonReq,
             Self::Forget(_) => Opcode::ForgetReq,
+            Self::Link(_) => Opcode::LinkReq,
+            Self::Unlink(_) => Opcode::UnlinkReq,
             Self::Subscribe(_) => Opcode::SubscribeReq,
             Self::Unsubscribe(_) => Opcode::UnsubscribeReq,
             Self::TxnBegin(_) => Opcode::TxnBegin,
@@ -573,6 +609,8 @@ impl RequestBody {
             Self::Plan(r) => to_rkyv_bytes(r),
             Self::Reason(r) => to_rkyv_bytes(r),
             Self::Forget(r) => to_rkyv_bytes(r),
+            Self::Link(r) => to_rkyv_bytes(r),
+            Self::Unlink(r) => to_rkyv_bytes(r),
             Self::Subscribe(r) => to_rkyv_bytes(r),
             Self::Unsubscribe(r) => to_rkyv_bytes(r),
             Self::TxnBegin(r) => to_rkyv_bytes(r),
@@ -608,6 +646,8 @@ impl RequestBody {
             Opcode::PlanReq => Self::Plan(from_rkyv_bytes(bytes)?),
             Opcode::ReasonReq => Self::Reason(from_rkyv_bytes(bytes)?),
             Opcode::ForgetReq => Self::Forget(from_rkyv_bytes(bytes)?),
+            Opcode::LinkReq => Self::Link(from_rkyv_bytes(bytes)?),
+            Opcode::UnlinkReq => Self::Unlink(from_rkyv_bytes(bytes)?),
             Opcode::SubscribeReq => Self::Subscribe(from_rkyv_bytes(bytes)?),
             Opcode::UnsubscribeReq => Self::Unsubscribe(from_rkyv_bytes(bytes)?),
             Opcode::TxnBegin => Self::TxnBegin(from_rkyv_bytes(bytes)?),
@@ -714,6 +754,7 @@ mod tests {
             include_vectors: false,
             include_edges: true,
             request_id: Some(sample_uuid(7)),
+            txn_id: None,
         }));
     }
 
@@ -738,6 +779,7 @@ mod tests {
                 strategy_hint: Some(PlanStrategy::AStar),
                 context_filter: None,
                 request_id: None,
+                txn_id: None,
             }));
         }
     }
@@ -756,6 +798,7 @@ mod tests {
                 max_inferences: 50,
                 budget_wall_time_ms: 5_000,
                 request_id: None,
+                txn_id: None,
             }));
         }
     }

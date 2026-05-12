@@ -495,6 +495,34 @@ pub struct ForgetResponse {
     pub edges_removed: u32,
 }
 
+/// Spec §09/07 §3 — `LINK_RESP` body.
+#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub struct LinkResponse {
+    pub source: WireMemoryId,
+    pub target: WireMemoryId,
+    pub kind: EdgeKindWire,
+    pub weight: f32,
+    pub created_at_unix_nanos: u64,
+    /// `true` if this edge already existed (LINK is overwriting weight),
+    /// `false` if newly created.
+    pub already_existed: bool,
+}
+
+/// Spec §09/07 §5 — `UNLINK_RESP` body.
+#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub struct UnlinkResponse {
+    pub source: WireMemoryId,
+    pub target: WireMemoryId,
+    pub kind: EdgeKindWire,
+    /// `true` if the edge existed and was removed; `false` if it
+    /// didn't exist (UNLINK is idempotent — non-existent = no-op).
+    pub removed: bool,
+}
+
 /// Spec §08 §7 — push event for a subscription.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[archive(check_bytes)]
@@ -810,6 +838,8 @@ pub enum ResponseBody {
     Plan(PlanResponseFrame),
     Reason(ReasonResponseFrame),
     Forget(ForgetResponse),
+    Link(LinkResponse),
+    Unlink(UnlinkResponse),
     SubscribeEvent(SubscriptionEvent),
     Unsubscribe(UnsubscribeResponse),
     TxnBegin(TxnBeginResponse),
@@ -844,6 +874,8 @@ impl ResponseBody {
             Self::Plan(_) => Opcode::PlanResp,
             Self::Reason(_) => Opcode::ReasonResp,
             Self::Forget(_) => Opcode::ForgetResp,
+            Self::Link(_) => Opcode::LinkResp,
+            Self::Unlink(_) => Opcode::UnlinkResp,
             Self::SubscribeEvent(_) => Opcode::SubscribeEvent,
             Self::Unsubscribe(_) => Opcode::UnsubscribeResp,
             Self::TxnBegin(_) => Opcode::TxnBeginResp,
@@ -894,6 +926,8 @@ impl ResponseBody {
             Self::Plan(r) => to_rkyv_bytes(r),
             Self::Reason(r) => to_rkyv_bytes(r),
             Self::Forget(r) => to_rkyv_bytes(r),
+            Self::Link(r) => to_rkyv_bytes(r),
+            Self::Unlink(r) => to_rkyv_bytes(r),
             Self::SubscribeEvent(r) => to_rkyv_bytes(r),
             Self::Unsubscribe(r) => to_rkyv_bytes(r),
             Self::TxnBegin(r) => to_rkyv_bytes(r),
@@ -929,6 +963,8 @@ impl ResponseBody {
             Opcode::PlanResp => Self::Plan(from_rkyv_bytes(bytes)?),
             Opcode::ReasonResp => Self::Reason(from_rkyv_bytes(bytes)?),
             Opcode::ForgetResp => Self::Forget(from_rkyv_bytes(bytes)?),
+            Opcode::LinkResp => Self::Link(from_rkyv_bytes(bytes)?),
+            Opcode::UnlinkResp => Self::Unlink(from_rkyv_bytes(bytes)?),
             Opcode::SubscribeEvent => Self::SubscribeEvent(from_rkyv_bytes(bytes)?),
             Opcode::UnsubscribeResp => Self::Unsubscribe(from_rkyv_bytes(bytes)?),
             Opcode::TxnBeginResp => Self::TxnBegin(from_rkyv_bytes(bytes)?),

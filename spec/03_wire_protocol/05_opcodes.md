@@ -32,6 +32,10 @@ The opcode is a single byte in the frame header. Server-bound opcodes (client �
 | 0xA3 | `REASON_RESP` | S → C | Reason result (streaming) |
 | 0x24 | `FORGET_REQ` | C → S | Forget a memory |
 | 0xA4 | `FORGET_RESP` | S → C | Forget result (acknowledgment) |
+| 0x25 | `LINK_REQ` | C → S | Create an edge between two memories |
+| 0xA5 | `LINK_RESP` | S → C | Link acknowledgment |
+| 0x26 | `UNLINK_REQ` | C → S | Remove an edge between two memories |
+| 0xA6 | `UNLINK_RESP` | S → C | Unlink acknowledgment |
 | 0x2A | `ENCODE_VECTOR_DIRECT_REQ` | C → S | Power-user encode with pre-supplied vector |
 | 0xAA | `ENCODE_VECTOR_DIRECT_RESP` | S → C | (Same response shape as ENCODE_RESP) |
 

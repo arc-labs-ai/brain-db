@@ -21,8 +21,8 @@ use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
 use brain_planner::{
     execute, plan_encode, plan_forget, plan_path, plan_reason, plan_recall, EncodeAck, EncodeOp,
-    ExecError, ExecutionResult, ExecutorContext, ForgetAck, ForgetOp, ForgetOutcome,
-    PlannerContext, SharedMetadataDb, WriterError, WriterHandle,
+    ExecutionResult, ExecutorContext, ForgetAck, ForgetOp, ForgetOutcome, PlannerContext,
+    SharedMetadataDb, WriterError, WriterHandle,
 };
 use brain_protocol::request::{
     EncodeRequest, ForgetMode, ForgetRequest, MemoryKindWire, ObservationInput, PlanBudget,
@@ -212,6 +212,53 @@ impl WriterHandle for FakeWriterHandle {
             Ok(ack)
         })
     }
+
+    fn submit_link<'a>(
+        &'a self,
+        _: brain_planner::LinkOp,
+    ) -> Pin<Box<dyn Future<Output = Result<brain_planner::LinkAck, WriterError>> + Send + 'a>>
+    {
+        Box::pin(async move { Err(WriterError::Internal("fake writer: link unused".into())) })
+    }
+
+    fn submit_unlink<'a>(
+        &'a self,
+        _: brain_planner::UnlinkOp,
+    ) -> Pin<Box<dyn Future<Output = Result<brain_planner::UnlinkAck, WriterError>> + Send + 'a>>
+    {
+        Box::pin(async move { Err(WriterError::Internal("fake writer: unlink unused".into())) })
+    }
+
+    fn reserve_memory_id<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<brain_core::MemoryId, WriterError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Err(WriterError::Internal(
+                "test writer: reserve_memory_id unused".into(),
+            ))
+        })
+    }
+
+    fn submit_batch<'a>(
+        &'a self,
+        _: brain_planner::TxnBatch,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<brain_planner::TxnBatchAck, WriterError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Err(WriterError::Internal(
+                "test writer: submit_batch unused".into(),
+            ))
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +317,7 @@ fn recall_request(cue: &str, top_k: u32) -> RecallRequest {
         include_vectors: false,
         include_edges: false,
         request_id: None,
+        txn_id: None,
     }
 }
 
@@ -350,7 +398,10 @@ async fn dispatch_forget_returns_forget_variant() {
 }
 
 #[tokio::test]
-async fn dispatch_plan_variant_is_unsupported() {
+async fn dispatch_plan_variant_runs_bfs() {
+    // 7.5 wired the real PLAN executor. With ByText endpoints + an
+    // empty index, endpoint resolution returns an empty set →
+    // NoPathFound (not Unsupported, not an error).
     let fix = build_fixture();
     let req = PlanRequest {
         start: PlanState::ByText("origin".into()),
@@ -363,34 +414,43 @@ async fn dispatch_plan_variant_is_unsupported() {
         strategy_hint: None,
         context_filter: None,
         request_id: None,
+        txn_id: None,
     };
     let plan = plan_path(&req, &PlannerContext::default()).unwrap();
     match execute(plan, &fix.ctx).await {
-        Err(ExecError::Unsupported(msg)) => {
-            assert!(msg.contains("PLAN"), "expected PLAN message, got {msg}");
+        Ok(brain_planner::ExecutionResult::Plan(r)) => {
+            assert_eq!(r.status, brain_planner::PlanStatus::NoPathFound);
+            assert!(r.paths.is_empty());
         }
-        other => panic!("expected Unsupported, got {other:?}"),
+        other => panic!("expected ExecutionResult::Plan, got {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn dispatch_reason_variant_is_unsupported() {
+async fn dispatch_reason_variant_runs_evidence_walk() {
+    // 7.6 wired the real REASON executor. With ByText observation +
+    // an empty index, base resolution returns an empty set →
+    // confidence 0 + ReasonStatus::Complete.
     let fix = build_fixture();
     let req = ReasonRequest {
         observation: ObservationInput::ByText("hello".into()),
         depth: 3,
-        confidence_threshold: 0.5,
+        confidence_threshold: 0.0,
         context_filter: None,
         max_inferences: 5,
         budget_wall_time_ms: 100,
         request_id: None,
+        txn_id: None,
     };
     let plan = plan_reason(&req, &PlannerContext::default()).unwrap();
     match execute(plan, &fix.ctx).await {
-        Err(ExecError::Unsupported(msg)) => {
-            assert!(msg.contains("REASON"), "expected REASON message, got {msg}");
+        Ok(brain_planner::ExecutionResult::Reason(r)) => {
+            assert!(r.supporting.is_empty());
+            assert!(r.contradicting.is_empty());
+            assert_eq!(r.confidence, 0.0);
+            assert_eq!(r.status, brain_planner::ReasonStatus::Complete);
         }
-        other => panic!("expected Unsupported, got {other:?}"),
+        other => panic!("expected ExecutionResult::Reason, got {other:?}"),
     }
 }
 

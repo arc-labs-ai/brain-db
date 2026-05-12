@@ -179,6 +179,7 @@ mod tests {
             include_vectors: false,
             include_edges: false,
             request_id: None,
+            txn_id: None,
         }
     }
 

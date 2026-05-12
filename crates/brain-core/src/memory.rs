@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{AgentId, ContextId, MemoryId};
 
 /// Three durable kinds, per `spec/02_data_model/02_memory_entity.md`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum MemoryKind {
     /// Default. 30-day half-life. Created by clients via `ENCODE`.
     Episodic,

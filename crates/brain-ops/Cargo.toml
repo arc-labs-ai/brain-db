@@ -9,4 +9,20 @@ description = "Cognitive operations: encode, recall, plan, reason, forget."
 
 [dependencies]
 brain-core = { path = "../brain-core" }
+brain-protocol = { path = "../brain-protocol" }
+brain-planner = { path = "../brain-planner" }
+brain-embed = { path = "../brain-embed" }
+brain-index = { path = "../brain-index" }
+brain-metadata = { path = "../brain-metadata" }
+redb.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+blake3.workspace = true
+uuid.workspace = true
+tokio = { version = "1", features = ["sync", "time"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+uuid.workspace = true
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }

@@ -29,6 +29,34 @@ pub trait WriterHandle: Send + Sync {
         &'a self,
         op: ForgetOp,
     ) -> Pin<Box<dyn Future<Output = Result<ForgetAck, WriterError>> + Send + 'a>>;
+
+    fn submit_link<'a>(
+        &'a self,
+        op: LinkOp,
+    ) -> Pin<Box<dyn Future<Output = Result<LinkAck, WriterError>> + Send + 'a>>;
+
+    fn submit_unlink<'a>(
+        &'a self,
+        op: UnlinkOp,
+    ) -> Pin<Box<dyn Future<Output = Result<UnlinkAck, WriterError>> + Send + 'a>>;
+
+    /// Reserve a fresh `MemoryId` without writing anything. The
+    /// returned id may be used by the caller (e.g., a transaction's
+    /// pending buffer); if the caller never commits, the slot is
+    /// silently skipped — `next_slot` keeps advancing. Spec §09/08
+    /// §10 caps txns at 1000 ops, bounding the leak.
+    fn reserve_memory_id<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<MemoryId, WriterError>> + Send + 'a>>;
+
+    /// Apply a pre-built batch of buffered operations atomically.
+    /// Used by `TXN_COMMIT` — one redb write txn, all-or-nothing.
+    /// On any failure the wtxn is dropped (redb auto-rolls-back) and
+    /// the buffer is reported as not applied.
+    fn submit_batch<'a>(
+        &'a self,
+        batch: TxnBatch,
+    ) -> Pin<Box<dyn Future<Output = Result<TxnBatchAck, WriterError>> + Send + 'a>>;
 }
 
 /// Encode operation payload submitted to the writer. Carries
@@ -85,6 +113,11 @@ pub enum WriterError {
     /// Spec §08/08 §14: queue over its max length → reject + retry.
     #[error("writer queue overloaded")]
     Overloaded,
+    /// Spec §07/06 §5 — duplicate `request_id` with a different
+    /// `request_hash`. Client retries should carry the same params;
+    /// a hash mismatch indicates a client bug or RequestId reuse.
+    #[error("idempotency conflict: {0}")]
+    Conflict(String),
     #[error("writer internal error: {0}")]
     Internal(String),
 }
@@ -118,4 +151,123 @@ pub struct ForgetAck {
     pub outcome: ForgetOutcome,
     /// `true` iff this ack came from a replayed idempotency entry.
     pub replayed: bool,
+}
+
+/// LINK operation payload. Spec §09/07.
+#[derive(Debug, Clone, Copy)]
+pub struct LinkOp {
+    pub request_id: RequestId,
+    pub source: MemoryId,
+    pub target: MemoryId,
+    pub kind: EdgeKind,
+    /// `[0, 1]` for most kinds; `[-1, 1]` for `Contradicts`.
+    pub weight: f32,
+}
+
+/// Writer's ack for a LINK. Spec §09/07 §3.
+#[derive(Debug, Clone, Copy)]
+pub struct LinkAck {
+    pub source: MemoryId,
+    pub target: MemoryId,
+    pub kind: EdgeKind,
+    pub weight: f32,
+    pub created_at_unix_nanos: u64,
+    /// `true` when the edge already existed (LINK is overwriting weight);
+    /// `false` for a brand-new edge.
+    pub already_existed: bool,
+    /// `true` iff this ack came from a replayed idempotency entry.
+    pub replayed: bool,
+}
+
+/// UNLINK operation payload. Spec §09/07 §4-§5.
+#[derive(Debug, Clone, Copy)]
+pub struct UnlinkOp {
+    pub request_id: RequestId,
+    pub source: MemoryId,
+    pub target: MemoryId,
+    pub kind: EdgeKind,
+}
+
+/// Writer's ack for an UNLINK. Spec §09/07 §5: non-existent edge →
+/// `removed: false`, no error (idempotent).
+#[derive(Debug, Clone, Copy)]
+pub struct UnlinkAck {
+    pub source: MemoryId,
+    pub target: MemoryId,
+    pub kind: EdgeKind,
+    pub removed: bool,
+    pub replayed: bool,
+}
+
+// ---------------------------------------------------------------------------
+// TxnBatch — buffered transaction payload for atomic apply.
+// ---------------------------------------------------------------------------
+
+/// A buffered transaction's payload, handed to `submit_batch` by the
+/// COMMIT path. Order matters: edges may reference memories created
+/// earlier in the same batch.
+#[derive(Debug, Clone, Default)]
+pub struct TxnBatch {
+    pub memories: Vec<TxnEncode>,
+    pub links: Vec<TxnLink>,
+    pub unlinks: Vec<TxnUnlink>,
+    pub forgets: Vec<TxnForget>,
+}
+
+/// A pre-allocated memory destined for commit. `memory_id` was
+/// returned by `reserve_memory_id` at buffer time; the apply path
+/// writes the metadata row + HNSW vector + idempotency entry atomically.
+#[derive(Debug, Clone)]
+pub struct TxnEncode {
+    pub memory_id: MemoryId,
+    pub request_id: RequestId,
+    pub request_hash: [u8; 32],
+    pub context_id: ContextId,
+    pub kind: MemoryKind,
+    pub text: String,
+    pub vector: [f32; brain_embed::VECTOR_DIM],
+    pub salience_initial: f32,
+    pub fingerprint: [u8; 16],
+    pub edges: Vec<EncodeOpEdge>,
+    pub created_at_unix_nanos: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TxnLink {
+    pub request_id: RequestId,
+    pub request_hash: [u8; 32],
+    pub source: MemoryId,
+    pub target: MemoryId,
+    pub kind: EdgeKind,
+    pub weight: f32,
+    pub created_at_unix_nanos: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TxnUnlink {
+    pub request_id: RequestId,
+    pub request_hash: [u8; 32],
+    pub source: MemoryId,
+    pub target: MemoryId,
+    pub kind: EdgeKind,
+    pub created_at_unix_nanos: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TxnForget {
+    pub request_id: RequestId,
+    pub request_hash: [u8; 32],
+    pub memory_id: MemoryId,
+    pub mode: brain_protocol::request::ForgetMode,
+    pub created_at_unix_nanos: u64,
+}
+
+/// Result of a successful `submit_batch`. Per-op acks come back in
+/// the same order as the corresponding `TxnBatch` field.
+#[derive(Debug, Clone)]
+pub struct TxnBatchAck {
+    pub encodes: Vec<EncodeAck>,
+    pub links: Vec<LinkAck>,
+    pub unlinks: Vec<UnlinkAck>,
+    pub forgets: Vec<ForgetAck>,
 }

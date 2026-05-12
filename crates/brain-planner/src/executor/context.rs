@@ -8,9 +8,11 @@
 //! (write side). Future sub-tasks may add `arena: Arc<Arena>` if a
 //! caller needs raw arena access — current executors don't.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use brain_embed::Dispatcher;
+use brain_core::{ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_embed::{Dispatcher, VECTOR_DIM};
 use brain_index::SharedHnsw;
 use brain_metadata::MetadataDb;
 use parking_lot::Mutex;
@@ -26,6 +28,36 @@ use super::writer::WriterHandle;
 /// writes once the lock is released.
 pub type SharedMetadataDb = Arc<Mutex<MetadataDb>>;
 
+/// Read-your-writes snapshot of an in-flight transaction. Spec
+/// §09/08 §5: RECALL/PLAN/REASON within a txn must see the buffer's
+/// pending writes layered on top of committed state. brain-ops
+/// builds this from its `TxnBuffer` and attaches it to a cloned
+/// `ExecutorContext` for the duration of the request.
+#[derive(Clone, Debug, Default)]
+pub struct TxnSnapshot {
+    /// Pending edges added by the txn: `(source, kind, target, weight)`.
+    pub pending_links: Vec<(MemoryId, EdgeKind, MemoryId, f32)>,
+    /// Edges the txn has removed (canonical triple).
+    pub pending_unlinks: HashSet<(MemoryId, EdgeKind, MemoryId)>,
+    /// Pending memories created in the txn: vector + salience + kind +
+    /// context + created_at. Used for the RECALL lens (cosine over
+    /// pending vectors) and for REASON's base-resolution (a base
+    /// memory id might point at a pending row).
+    pub pending_memories: HashMap<MemoryId, PendingMemorySnapshot>,
+    /// Memories tombstoned by an in-txn FORGET. Dropped from lens
+    /// outputs in RECALL/PLAN/REASON.
+    pub tombstoned: HashSet<MemoryId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingMemorySnapshot {
+    pub vector: [f32; VECTOR_DIM],
+    pub salience: f32,
+    pub kind: MemoryKind,
+    pub context_id: ContextId,
+    pub created_at_unix_nanos: u64,
+}
+
 /// Executor-side context. Cheap to clone (every field is `Arc` or
 /// already cheap-clone like `SharedHnsw`).
 #[derive(Clone)]
@@ -34,6 +66,10 @@ pub struct ExecutorContext {
     pub index: SharedHnsw<384>,
     pub metadata: SharedMetadataDb,
     pub writer: Arc<dyn WriterHandle>,
+    /// `Some` only inside the request scope of a txn-flagged op. Carries
+    /// the in-flight buffer so the executor's edge / memory lookups can
+    /// layer pending state on committed state.
+    pub txn: Option<Arc<TxnSnapshot>>,
 }
 
 impl ExecutorContext {
@@ -49,7 +85,14 @@ impl ExecutorContext {
             index,
             metadata,
             writer,
+            txn: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_txn(mut self, snapshot: Arc<TxnSnapshot>) -> Self {
+        self.txn = Some(snapshot);
+        self
     }
 }
 

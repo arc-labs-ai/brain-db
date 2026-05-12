@@ -1,0 +1,321 @@
+//! Integration tests for `handle_recall` (sub-task 7.4).
+//!
+//! Drives the full pipeline:
+//!   dispatcher → handle_recall → plan_recall_inner → execute_recall
+//!   → wire RecallResponseFrame
+//!
+//! Pre-populates the index by calling ENCODE through the dispatcher
+//! first, then runs RECALL against it.
+
+use std::sync::Arc;
+
+use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
+use brain_index::{IndexParams, SharedHnsw};
+use brain_metadata::MetadataDb;
+use brain_ops::{dispatch, ErrorCode, OpError, OpsContext, RealWriterHandle};
+use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
+use brain_protocol::request::{EncodeRequest, MemoryKindWire, RecallRequest, RequestBody};
+use brain_protocol::response::{EncodeResponse, RecallResponseFrame, ResponseBody};
+use parking_lot::Mutex;
+
+// ---------------------------------------------------------------------------
+// Mock dispatcher: text-driven deterministic vectors.
+// ---------------------------------------------------------------------------
+
+struct MockDispatcher;
+
+impl Dispatcher for MockDispatcher {
+    fn embed(&self, text: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+        let mut v = [0.0f32; VECTOR_DIM];
+        for (i, byte) in text.as_bytes().iter().enumerate() {
+            v[i % VECTOR_DIM] += f32::from(*byte) / 255.0;
+        }
+        Ok(v)
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+        texts.iter().map(|t| self.embed(t)).collect()
+    }
+
+    fn fingerprint(&self) -> [u8; 16] {
+        [0xAB; 16]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fixture.
+// ---------------------------------------------------------------------------
+
+struct Fixture {
+    ctx: OpsContext,
+    _tempdir: tempfile::TempDir,
+}
+
+fn build_fixture() -> Fixture {
+    build_fixture_with_embedder(Arc::new(MockDispatcher) as Arc<dyn Dispatcher>)
+}
+
+fn build_fixture_with_embedder(embedder: Arc<dyn Dispatcher>) -> Fixture {
+    let tempdir = tempfile::tempdir().unwrap();
+    let db_path = tempdir.path().join("metadata.redb");
+    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
+
+    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
+
+    let executor =
+        ExecutorContext::new(embedder, shared, metadata, writer as Arc<dyn WriterHandle>);
+
+    Fixture {
+        ctx: OpsContext::new(executor),
+        _tempdir: tempdir,
+    }
+}
+
+fn encode_req(request_id: [u8; 16], text: &str, kind: MemoryKindWire) -> EncodeRequest {
+    EncodeRequest {
+        text: text.into(),
+        context_id: 42,
+        kind,
+        salience_hint: 0.5,
+        edges: vec![],
+        request_id,
+        txn_id: None,
+        deduplicate: false,
+    }
+}
+
+fn recall_req(cue: &str, top_k: u32) -> RecallRequest {
+    RecallRequest {
+        cue_text: cue.into(),
+        cue_vector_offset: 0,
+        cue_vector_dim: 0,
+        top_k,
+        confidence_threshold: 0.0,
+        context_filter: None,
+        age_bound_unix_nanos: None,
+        kind_filter: None,
+        salience_floor: 0.0,
+        strategy_hint: None,
+        include_vectors: false,
+        include_edges: false,
+        request_id: None,
+        txn_id: None,
+    }
+}
+
+async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str, kind: MemoryKindWire) -> u128 {
+    let req = encode_req(request_id, text, kind);
+    match dispatch(RequestBody::Encode(req), &fix.ctx).await.unwrap() {
+        ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
+        other => panic!("expected Encode response, got {other:?}"),
+    }
+}
+
+fn unwrap_recall_resp(body: ResponseBody) -> RecallResponseFrame {
+    match body {
+        ResponseBody::Recall(r) => r,
+        other => panic!("expected ResponseBody::Recall, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 1. Full pipeline.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn recall_full_pipeline_returns_top_k() {
+    let fix = build_fixture();
+    encode(&fix, [1; 16], "alpha", MemoryKindWire::Episodic).await;
+    encode(&fix, [2; 16], "beta", MemoryKindWire::Episodic).await;
+    encode(&fix, [3; 16], "gamma", MemoryKindWire::Episodic).await;
+
+    let frame = unwrap_recall_resp(
+        dispatch(RequestBody::Recall(recall_req("alpha", 2)), &fix.ctx)
+            .await
+            .unwrap(),
+    );
+    assert!(frame.is_final);
+    assert_eq!(frame.results.len(), 2, "k=2 → exactly 2 results");
+    assert_eq!(frame.cumulative_count, 2);
+    // Sorted by score descending.
+    assert!(
+        frame.results[0].similarity_score >= frame.results[1].similarity_score,
+        "results must be sorted by score desc"
+    );
+    // Fields plumbed through.
+    let top = &frame.results[0];
+    assert_ne!(top.memory_id, 0);
+    assert_eq!(top.context_id, 42);
+    assert_eq!(top.kind, MemoryKindWire::Episodic);
+    assert!((top.salience - 0.5).abs() < 1e-6);
+    assert_eq!(
+        top.confidence, top.similarity_score,
+        "v1: confidence == similarity"
+    );
+    assert_eq!(
+        top.last_accessed_at_unix_nanos, top.created_at_unix_nanos,
+        "v1: last_accessed mirrors created_at"
+    );
+    assert_eq!(top.vector_offset, 0);
+    assert_eq!(top.vector_dim, 0);
+    assert!(top.edges.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// 2. Empty index → empty frame.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn recall_empty_index_returns_empty_frame() {
+    let fix = build_fixture();
+    let frame = unwrap_recall_resp(
+        dispatch(RequestBody::Recall(recall_req("nothing", 10)), &fix.ctx)
+            .await
+            .unwrap(),
+    );
+    assert!(frame.results.is_empty());
+    assert!(frame.is_final);
+    assert_eq!(frame.cumulative_count, 0);
+    assert!(frame.estimated_remaining.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// 3. K-truncation.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn recall_k_truncation() {
+    let fix = build_fixture();
+    for i in 0..5u8 {
+        let mut req_id = [0u8; 16];
+        req_id[0] = 0x10 + i;
+        let text = format!("doc-{i}");
+        encode(&fix, req_id, &text, MemoryKindWire::Episodic).await;
+    }
+    let frame = unwrap_recall_resp(
+        dispatch(RequestBody::Recall(recall_req("doc-2", 3)), &fix.ctx)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(frame.results.len(), 3, "k=3 → exactly 3 results");
+}
+
+// ---------------------------------------------------------------------------
+// 4. Kind filter.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn recall_kind_filter_rejects_off_kind_hits() {
+    let fix = build_fixture();
+    encode(&fix, [20; 16], "ep-a", MemoryKindWire::Episodic).await;
+    encode(&fix, [21; 16], "ep-b", MemoryKindWire::Episodic).await;
+    encode(&fix, [22; 16], "sem-a", MemoryKindWire::Semantic).await;
+    encode(&fix, [23; 16], "sem-b", MemoryKindWire::Semantic).await;
+
+    let mut req = recall_req("ep-a", 10);
+    req.kind_filter = Some(vec![MemoryKindWire::Semantic]);
+    let frame = unwrap_recall_resp(dispatch(RequestBody::Recall(req), &fix.ctx).await.unwrap());
+
+    assert!(
+        !frame.results.is_empty(),
+        "the semantic memories must be in candidates"
+    );
+    for r in &frame.results {
+        assert_eq!(r.kind, MemoryKindWire::Semantic);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5. Confidence floor.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn recall_confidence_floor_drops_low_score_hits() {
+    let fix = build_fixture();
+    encode(&fix, [30; 16], "alpha", MemoryKindWire::Episodic).await;
+    encode(
+        &fix,
+        [31; 16],
+        "completely-different-cue",
+        MemoryKindWire::Episodic,
+    )
+    .await;
+
+    let mut req = recall_req("totally-unrelated-query-xyz", 10);
+    // 0.999 is so strict that the unrelated cue should drop everything.
+    req.confidence_threshold = 0.999;
+    let frame = unwrap_recall_resp(dispatch(RequestBody::Recall(req), &fix.ctx).await.unwrap());
+    for r in &frame.results {
+        assert!(
+            r.similarity_score >= 0.999,
+            "every result must clear the floor; got {}",
+            r.similarity_score
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6. Invalid top_k → planner rejects.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn recall_invalid_top_k_returns_plan_error() {
+    let fix = build_fixture();
+    let req = recall_req("anything", 0);
+    let err = dispatch(RequestBody::Recall(req), &fix.ctx)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, OpError::PlanError(_)),
+        "top_k=0 is a planner validation failure, got {err:?}"
+    );
+    assert_eq!(err.error_code(), ErrorCode::InvalidRequest);
+}
+
+// ---------------------------------------------------------------------------
+// 7. Real-embedder gated test. Skips when env var is unset.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn recall_with_real_embedder_end_to_end() {
+    let Ok(model_dir) = std::env::var("BRAIN_EMBED_MODEL_DIR") else {
+        eprintln!("BRAIN_EMBED_MODEL_DIR unset; skipping BGE end-to-end test");
+        return;
+    };
+
+    let model_dir = std::path::PathBuf::from(model_dir);
+    let handle = brain_embed::ModelHandle::load(&brain_embed::EmbedderConfig::new(model_dir))
+        .expect("BGE model loads");
+    let dispatcher = brain_embed::CpuDispatcher::new(handle);
+    let fix = build_fixture_with_embedder(Arc::new(dispatcher) as Arc<dyn Dispatcher>);
+
+    let cats_id = encode(
+        &fix,
+        [0x70; 16],
+        "the cat sat on the mat",
+        MemoryKindWire::Episodic,
+    )
+    .await;
+    let _physics_id = encode(
+        &fix,
+        [0x71; 16],
+        "quantum entanglement collapses on observation",
+        MemoryKindWire::Episodic,
+    )
+    .await;
+
+    let frame = unwrap_recall_resp(
+        dispatch(
+            RequestBody::Recall(recall_req("a cat resting on a rug", 2)),
+            &fix.ctx,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(frame.results.len(), 2);
+    assert_eq!(
+        frame.results[0].memory_id, cats_id,
+        "the cat memory must rank higher than the physics memory"
+    );
+}
