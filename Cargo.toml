@@ -34,7 +34,8 @@ repository = "https://github.com/brain-db-io/brain-db"
 glommio = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal"] }
 # Runtime-agnostic mpsc (used at the Tokio↔Glommio shard boundary, spec §01/04).
-flume = { version = "0.11", default-features = false, features = ["async"] }
+flume = { version = "0.11", default-features = false, features = ["async", "select"] }
+futures-lite = "2"
 
 # Serialization
 rkyv = { version = "0.7", features = ["validation"] }

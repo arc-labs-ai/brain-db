@@ -483,7 +483,8 @@ mod tests {
     }
 
     /// Build one segment with the given records (LSNs must be contiguous and
-    /// start at `starting_lsn`).
+    /// start at `starting_lsn`). Wraps Glommio for the async WAL ops; returns
+    /// when the segment is closed.
     fn write_segment(
         dir: &Path,
         seq: u64,
@@ -492,11 +493,17 @@ mod tests {
         records: &[WalRecord],
     ) {
         let path = segment_path(dir, seq);
-        let mut seg = WalSegment::create_new(&path, seq, starting_lsn, shard_uuid).unwrap();
-        for r in records {
-            seg.append_record(r).unwrap();
-        }
-        seg.flush().unwrap();
+        let records: Vec<WalRecord> = records.to_vec();
+        crate::wal::segment::glommio_run(move || async move {
+            let mut seg = WalSegment::create_new(&path, seq, starting_lsn, shard_uuid)
+                .await
+                .unwrap();
+            for r in &records {
+                seg.append_record(r).unwrap();
+            }
+            seg.flush().await.unwrap();
+            seg.close().await.unwrap();
+        });
     }
 
     // ----- Open ---------------------------------------------------------
@@ -844,8 +851,13 @@ mod tests {
         // Create a segment with header.segment_seq = 5, then rename the
         // file to look like seq 0.
         let path_5 = segment_path(dir.path(), 5);
-        let _seg = WalSegment::create_new(&path_5, 5, 1, uuid(1)).unwrap();
-        drop(_seg);
+        let path_5_c = path_5.clone();
+        crate::wal::segment::glommio_run(move || async move {
+            let seg = WalSegment::create_new(&path_5_c, 5, 1, uuid(1))
+                .await
+                .unwrap();
+            seg.close().await.unwrap();
+        });
         let path_0 = segment_path(dir.path(), 0);
         std::fs::rename(&path_5, &path_0).unwrap();
 

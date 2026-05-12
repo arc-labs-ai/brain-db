@@ -19,3 +19,5 @@ tracing.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+# Hosts the async WAL writer in integration tests (sub-task 9.6a port).
+glommio.workspace = true

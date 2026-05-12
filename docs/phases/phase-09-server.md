@@ -63,6 +63,11 @@ macOS still compiles brain-server (shard module cfg-gated).
 
 > **Scaffold only.** Real arena/WAL/metadata/HNSW/workers land in 9.5–9.7.
 
+### Task 9.6a — WAL io_uring port  [x]
+**Reads:** `spec/05_storage_arena_wal/06_wal_durability.md`, `docs/spec-deviations.md` SD-2.8-2/SD-2.9-1.
+**Writes:** `crates/brain-storage/src/wal/{segment,group_commit,wal,checkpoint,reader,recovery}.rs`, `crates/brain-storage/tests/random_kill.rs`, `crates/brain-metadata/tests/recovery_integration.rs`.
+**Done when:** WAL writes go through Glommio io_uring (`BufferedFile::write_at` + `fdatasync`); committer is a `spawn_local` coroutine on the shard executor; `Wal::append` is `async fn(&self)`. SD-2.8-2 + SD-2.9-1 reconciled; new SD-2.8-2-b documents the two-syscall fsync.
+
 ### Task 9.5 — Real arena hookup  [x]
 **Reads:** `spec/05_storage_arena_wal/02_arena_layout.md`, `spec/12_sharding_clustering/01_shard_model.md` §1–§5.
 **Writes:** `crates/brain-server/src/shard.rs`, `crates/brain-server/tests/shard.rs`.

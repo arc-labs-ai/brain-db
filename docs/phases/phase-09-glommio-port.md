@@ -381,7 +381,7 @@ enforced by the type system; the grep is the next-best thing.
 | §6.3 Worker yields tokio→glommio | TODO | 9.7 |
 | §8.1 EventBus topology decision | LOCKED | 9.11 |
 | §8.2 Shutdown signal: `Rc<Cell<bool>>` | LOCKED | 9.7 / 9.14 |
-| §8.3 WAL group commit (io_uring port) | LOCKED | 9.6a |
+| §8.3 WAL group commit (io_uring port) | **done** (9.6a) | 9.6a |
 | §8.4 Embedder ownership | LOCKED | 9.7 |
 | §8.5 `+ Send` assertion drops | TODO | 9.7 |
 | CI grep guard | TODO | 9.18 |

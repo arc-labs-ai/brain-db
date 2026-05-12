@@ -126,22 +126,42 @@ fn pre_create_arena(arena_path: &Path, shard_uuid: [u8; 16]) {
     // Drop closes the file via munmap.
 }
 
-/// Write N records via `Wal::append`. Returns each record's encoded size,
-/// in order — recovery's `expected_count` for a truncation offset is then
-/// computed by walking these lengths from `WAL_SEGMENT_HEADER_LEN`.
+/// Write N records via `Wal::append`. Returns each record's encoded size and
+/// the updated RNG state.
+///
+/// After sub-task 9.6a, `Wal::*` are async and live on Glommio. We host them
+/// on a fresh `LocalExecutor` per call — short-lived, no pinning needed for
+/// correctness (the executor stays on the spawning thread's lifetime).
 fn write_records(
     wal_dir: &Path,
     shard_uuid: [u8; 16],
     rng: &mut u64,
 ) -> Result<Vec<usize>, String> {
-    let mut wal = Wal::create(wal_dir, shard_uuid).map_err(|e| format!("Wal::create: {e}"))?;
-    let mut lens = Vec::with_capacity(N_RECORDS as usize);
-    for slot in 0..N_RECORDS {
-        let r = gen_record(rng, slot);
-        lens.push(r.encoded_len());
-        wal.append(r).map_err(|e| format!("Wal::append: {e}"))?;
-    }
-    wal.shutdown().map_err(|e| format!("Wal::shutdown: {e}"))?;
+    let mut rng_state = *rng;
+    let wal_dir_buf = wal_dir.to_path_buf();
+    let (lens, new_rng) = glommio::LocalExecutorBuilder::default()
+        .name("random-kill-wal")
+        .spawn(move || async move {
+            let wal = Wal::create(&wal_dir_buf, shard_uuid)
+                .await
+                .map_err(|e| format!("Wal::create: {e}"))?;
+            let mut lens = Vec::with_capacity(N_RECORDS as usize);
+            for slot in 0..N_RECORDS {
+                let r = gen_record(&mut rng_state, slot);
+                lens.push(r.encoded_len());
+                wal.append(r)
+                    .await
+                    .map_err(|e| format!("Wal::append: {e}"))?;
+            }
+            wal.shutdown()
+                .await
+                .map_err(|e| format!("Wal::shutdown: {e}"))?;
+            Ok::<_, String>((lens, rng_state))
+        })
+        .map_err(|e| format!("LocalExecutorBuilder::spawn: {e}"))?
+        .join()
+        .map_err(|e| format!("executor join: {e}"))??;
+    *rng = new_rng;
     Ok(lens)
 }
 

@@ -74,8 +74,8 @@ pub enum CheckpointError {
 /// caller receives [`CheckpointError::Msync`]. The next recovery sees a
 /// `CHECKPOINT_BEGIN` without a matching `END` and ignores it (spec
 /// §09 §12.1) — the previous checkpoint stays valid.
-pub fn write_checkpoint(
-    wal: &mut Wal,
+pub async fn write_checkpoint(
+    wal: &Wal,
     arena: &ArenaFile,
     plan: CheckpointPlan,
 ) -> Result<CheckpointReport, CheckpointError> {
@@ -92,7 +92,7 @@ pub fn write_checkpoint(
         started_at_unix_nanos,
     });
     let begin_record = WalRecord::from_typed(Lsn(0), 0, started_at_unix_nanos, 0, &begin_payload);
-    let lsn_begin = wal.append(begin_record)?.raw();
+    let lsn_begin = wal.append(begin_record).await?.raw();
 
     // Step 3: msync arena.
     arena
@@ -106,7 +106,7 @@ pub fn write_checkpoint(
         arena_capacity,
     });
     let end_record = WalRecord::from_typed(Lsn(0), 0, unix_nanos_now(), 0, &end_payload);
-    let lsn_end = wal.append(end_record)?.raw();
+    let lsn_end = wal.append(end_record).await?.raw();
 
     let completed_at_unix_nanos = unix_nanos_now();
     Ok(CheckpointReport {
@@ -139,28 +139,32 @@ mod tests {
     use crate::arena::file::{ArenaFile, MSYNC_ALL_CALLS};
     use crate::recovery::{recover, InMemoryMetadataSink, MetadataSink};
     use crate::wal::kinds::WalRecordKind;
+    use crate::wal::payload::EncodePayload;
     use crate::wal::record::WalRecord;
-    use crate::wal::segment::WalSegment;
+    use crate::wal::segment::{glommio_run, WalSegment};
     use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, RequestId};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
 
     fn uuid(byte: u8) -> [u8; 16] {
         [byte; 16]
     }
 
+    /// Open an arena and WAL on glommio for the test body. After the
+    /// body finishes (or panics), shuts down the WAL and returns the arena
+    /// (mmap stays alive across the executor handoff because `ArenaFile`
+    /// is Send and we drop it on the test thread).
     fn fresh_arena(dir: &tempfile::TempDir, capacity: u64) -> ArenaFile {
         ArenaFile::open(dir.path().join("arena.bin"), uuid(1), capacity).unwrap()
     }
 
-    fn fresh_wal_dir(parent: &tempfile::TempDir) -> PathBuf {
-        let p = parent.path().join("wal");
+    fn fresh_wal_dir(parent: &Path) -> PathBuf {
+        let p = parent.join("wal");
         std::fs::create_dir_all(&p).unwrap();
         p
     }
 
     fn encode_record(slot: u64) -> WalRecord {
-        use crate::wal::payload::EncodePayload;
         let memory_id = MemoryId::pack(1, slot, 1);
         let p = EncodePayload {
             memory_id,
@@ -188,72 +192,83 @@ mod tests {
     #[test]
     fn write_checkpoint_on_fresh_wal() {
         let dir = tempfile::tempdir().unwrap();
-        let wal_dir = fresh_wal_dir(&dir);
-        let arena = fresh_arena(&dir, 16);
-        let mut wal = Wal::create(&wal_dir, uuid(1)).unwrap();
-
-        let report = write_checkpoint(
-            &mut wal,
-            &arena,
-            CheckpointPlan {
-                checkpoint_id: 1,
-                target_lsn: None,
-            },
-        )
-        .unwrap();
-
+        let wal_dir = fresh_wal_dir(dir.path());
+        let arena_path = dir.path().join("arena.bin");
+        let arena = ArenaFile::open(&arena_path, uuid(1), 16).unwrap();
+        let report = glommio_run(move || async move {
+            let wal = Wal::create(&wal_dir, uuid(1)).await.unwrap();
+            let r = write_checkpoint(
+                &wal,
+                &arena,
+                CheckpointPlan {
+                    checkpoint_id: 1,
+                    target_lsn: None,
+                },
+            )
+            .await
+            .unwrap();
+            wal.shutdown().await.unwrap();
+            r
+        });
         assert_eq!(report.checkpoint_id, 1);
         assert_eq!(report.durable_lsn, 0);
         assert_eq!(report.lsn_begin, 1);
         assert_eq!(report.lsn_end, 2);
         assert_eq!(report.arena_capacity_at_checkpoint, 16);
-        wal.shutdown().unwrap();
     }
 
     #[test]
     fn target_lsn_defaults_to_last_written() {
         let dir = tempfile::tempdir().unwrap();
-        let wal_dir = fresh_wal_dir(&dir);
-        let arena = fresh_arena(&dir, 32);
-        let mut wal = Wal::create(&wal_dir, uuid(1)).unwrap();
-        for slot in 0..10 {
-            wal.append(encode_record(slot)).unwrap();
-        }
-        let report = write_checkpoint(
-            &mut wal,
-            &arena,
-            CheckpointPlan {
-                checkpoint_id: 7,
-                target_lsn: None,
-            },
-        )
-        .unwrap();
+        let wal_dir = fresh_wal_dir(dir.path());
+        let arena = ArenaFile::open(dir.path().join("arena.bin"), uuid(1), 32).unwrap();
+        let report = glommio_run(move || async move {
+            let wal = Wal::create(&wal_dir, uuid(1)).await.unwrap();
+            for slot in 0..10 {
+                wal.append(encode_record(slot)).await.unwrap();
+            }
+            let r = write_checkpoint(
+                &wal,
+                &arena,
+                CheckpointPlan {
+                    checkpoint_id: 7,
+                    target_lsn: None,
+                },
+            )
+            .await
+            .unwrap();
+            wal.shutdown().await.unwrap();
+            r
+        });
         assert_eq!(report.durable_lsn, 10);
         assert_eq!(report.lsn_begin, 11);
         assert_eq!(report.lsn_end, 12);
-        wal.shutdown().unwrap();
     }
 
     #[test]
     fn explicit_target_lsn_is_honored() {
         let dir = tempfile::tempdir().unwrap();
-        let wal_dir = fresh_wal_dir(&dir);
-        let arena = fresh_arena(&dir, 32);
-        let mut wal = Wal::create(&wal_dir, uuid(1)).unwrap();
-        for slot in 0..10 {
-            wal.append(encode_record(slot)).unwrap();
-        }
-        let report = write_checkpoint(
-            &mut wal,
-            &arena,
-            CheckpointPlan {
-                checkpoint_id: 7,
-                target_lsn: Some(5),
-            },
-        )
-        .unwrap();
+        let wal_dir = fresh_wal_dir(dir.path());
+        let arena = ArenaFile::open(dir.path().join("arena.bin"), uuid(1), 32).unwrap();
+        let report = glommio_run(move || async move {
+            let wal = Wal::create(&wal_dir, uuid(1)).await.unwrap();
+            for slot in 0..10 {
+                wal.append(encode_record(slot)).await.unwrap();
+            }
+            let r = write_checkpoint(
+                &wal,
+                &arena,
+                CheckpointPlan {
+                    checkpoint_id: 7,
+                    target_lsn: Some(5),
+                },
+            )
+            .await
+            .unwrap();
+            wal.shutdown().await.unwrap();
+            r
+        });
         assert_eq!(report.durable_lsn, 5);
-        wal.shutdown().unwrap();
     }
 
     // ----- Recovery integration (phase doc done-when) --------------------
@@ -261,118 +276,115 @@ mod tests {
     #[test]
     fn checkpoint_advances_recovery_start_point() {
         let dir = tempfile::tempdir().unwrap();
-        let wal_dir = fresh_wal_dir(&dir);
-        let arena = fresh_arena(&dir, 32);
-        let mut wal = Wal::create(&wal_dir, uuid(1)).unwrap();
-        for slot in 0..10 {
-            wal.append(encode_record(slot)).unwrap();
-        }
-        let _report = write_checkpoint(
-            &mut wal,
-            &arena,
-            CheckpointPlan {
-                checkpoint_id: 1,
-                target_lsn: None,
-            },
-        )
-        .unwrap();
-        wal.shutdown().unwrap();
-        drop(arena);
+        let wal_dir = fresh_wal_dir(dir.path());
+        let wal_dir_c = wal_dir.clone();
+        let arena = ArenaFile::open(dir.path().join("arena.bin"), uuid(1), 32).unwrap();
+        glommio_run(move || async move {
+            let wal = Wal::create(&wal_dir_c, uuid(1)).await.unwrap();
+            for slot in 0..10 {
+                wal.append(encode_record(slot)).await.unwrap();
+            }
+            write_checkpoint(
+                &wal,
+                &arena,
+                CheckpointPlan {
+                    checkpoint_id: 1,
+                    target_lsn: None,
+                },
+            )
+            .await
+            .unwrap();
+            wal.shutdown().await.unwrap();
+        });
 
         // First recovery on a fresh sink — replays everything; the sink
         // ends with durable_lsn=10 from the CHECKPOINT_END payload.
         let mut arena = fresh_arena(&dir, 32);
         let mut sink = InMemoryMetadataSink::new();
         let (report1, _) = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap();
-        // 10 encode records + BEGIN + END = 12 records replayed.
         assert_eq!(report1.records_replayed, 12);
         assert_eq!(sink.durable_lsn(), 10);
 
-        // Second recovery on the same sink — records 1..=10 skipped;
-        // BEGIN (lsn 11) and END (lsn 12) are above durable_lsn so
-        // still applied.
         let mut arena = fresh_arena(&dir, 32);
         let (report2, _) = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap();
         assert_eq!(report2.records_skipped, 10);
-        assert_eq!(report2.records_replayed, 2); // BEGIN + END
+        assert_eq!(report2.records_replayed, 2);
         assert_eq!(sink.durable_lsn(), 10);
     }
 
     #[test]
     fn multiple_checkpoints_recovery_uses_latest() {
         let dir = tempfile::tempdir().unwrap();
-        let wal_dir = fresh_wal_dir(&dir);
-        let arena = fresh_arena(&dir, 32);
-        let mut wal = Wal::create(&wal_dir, uuid(1)).unwrap();
+        let wal_dir = fresh_wal_dir(dir.path());
+        let wal_dir_c = wal_dir.clone();
+        let arena = ArenaFile::open(dir.path().join("arena.bin"), uuid(1), 32).unwrap();
+        glommio_run(move || async move {
+            let wal = Wal::create(&wal_dir_c, uuid(1)).await.unwrap();
+            for slot in 0..10 {
+                wal.append(encode_record(slot)).await.unwrap();
+            }
+            write_checkpoint(
+                &wal,
+                &arena,
+                CheckpointPlan {
+                    checkpoint_id: 1,
+                    target_lsn: None,
+                },
+            )
+            .await
+            .unwrap();
+            for slot in 10..20 {
+                wal.append(encode_record(slot)).await.unwrap();
+            }
+            write_checkpoint(
+                &wal,
+                &arena,
+                CheckpointPlan {
+                    checkpoint_id: 2,
+                    target_lsn: None,
+                },
+            )
+            .await
+            .unwrap();
+            wal.shutdown().await.unwrap();
+        });
 
-        // Records 1..=10
-        for slot in 0..10 {
-            wal.append(encode_record(slot)).unwrap();
-        }
-        // Checkpoint @ durable_lsn=10 (consumes LSNs 11 and 12).
-        write_checkpoint(
-            &mut wal,
-            &arena,
-            CheckpointPlan {
-                checkpoint_id: 1,
-                target_lsn: None,
-            },
-        )
-        .unwrap();
-        // Records 13..=22 (10 more)
-        for slot in 10..20 {
-            wal.append(encode_record(slot)).unwrap();
-        }
-        // Checkpoint @ durable_lsn=22 (consumes LSNs 23 and 24).
-        write_checkpoint(
-            &mut wal,
-            &arena,
-            CheckpointPlan {
-                checkpoint_id: 2,
-                target_lsn: None,
-            },
-        )
-        .unwrap();
-        wal.shutdown().unwrap();
-        drop(arena);
-
-        // Recover; sink should end with durable_lsn=22.
         let mut arena = fresh_arena(&dir, 32);
         let mut sink = InMemoryMetadataSink::new();
         let _ = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap();
         assert_eq!(sink.durable_lsn(), 22);
 
-        // Run recovery again — the latest checkpoint's durable_lsn is
-        // honored; records 1..=22 are skipped.
         let mut arena = fresh_arena(&dir, 32);
         let (report, _) = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap();
         assert_eq!(report.records_skipped, 22);
-        assert_eq!(report.records_replayed, 2); // the second BEGIN/END
+        assert_eq!(report.records_replayed, 2);
         assert_eq!(sink.durable_lsn(), 22);
     }
 
     #[test]
     fn recovery_is_idempotent_across_multiple_runs() {
         let dir = tempfile::tempdir().unwrap();
-        let wal_dir = fresh_wal_dir(&dir);
-        let arena = fresh_arena(&dir, 32);
-        let mut wal = Wal::create(&wal_dir, uuid(1)).unwrap();
-        for slot in 0..5 {
-            wal.append(encode_record(slot)).unwrap();
-        }
-        write_checkpoint(
-            &mut wal,
-            &arena,
-            CheckpointPlan {
-                checkpoint_id: 1,
-                target_lsn: None,
-            },
-        )
-        .unwrap();
-        wal.shutdown().unwrap();
-        drop(arena);
+        let wal_dir = fresh_wal_dir(dir.path());
+        let wal_dir_c = wal_dir.clone();
+        let arena = ArenaFile::open(dir.path().join("arena.bin"), uuid(1), 32).unwrap();
+        glommio_run(move || async move {
+            let wal = Wal::create(&wal_dir_c, uuid(1)).await.unwrap();
+            for slot in 0..5 {
+                wal.append(encode_record(slot)).await.unwrap();
+            }
+            write_checkpoint(
+                &wal,
+                &arena,
+                CheckpointPlan {
+                    checkpoint_id: 1,
+                    target_lsn: None,
+                },
+            )
+            .await
+            .unwrap();
+            wal.shutdown().await.unwrap();
+        });
 
-        // Run recover three times. Capture each report.
         let mut sink = InMemoryMetadataSink::new();
         let mut reports = Vec::new();
         for _ in 0..3 {
@@ -380,8 +392,6 @@ mod tests {
             let (r, _) = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap();
             reports.push(r);
         }
-        // The second and third should be identical (durable_lsn stable
-        // after the first pass).
         assert_eq!(reports[1].records_replayed, reports[2].records_replayed);
         assert_eq!(reports[1].records_skipped, reports[2].records_skipped);
         assert_eq!(sink.durable_lsn(), 5);
@@ -391,66 +401,65 @@ mod tests {
 
     #[test]
     fn begin_without_end_does_not_advance_durable_lsn() {
-        // Simulate a crash between CHECKPOINT_BEGIN and CHECKPOINT_END by
-        // appending only a BEGIN record manually to the WAL.
         let dir = tempfile::tempdir().unwrap();
-        let wal_dir = fresh_wal_dir(&dir);
-        std::fs::create_dir_all(&wal_dir).unwrap();
+        let wal_dir = fresh_wal_dir(dir.path());
         let seg_path = wal_dir.join("0000000000.wal");
-        let mut seg = WalSegment::create_new(&seg_path, 0, 1, uuid(1)).unwrap();
-
-        // 3 encode records (LSNs 1, 2, 3).
-        for slot in 0..3u64 {
-            let mut r = encode_record(slot);
-            r.lsn = Lsn(slot + 1);
-            seg.append_record(&r).unwrap();
-        }
-        // CHECKPOINT_BEGIN at LSN 4 — no matching END.
-        let begin = WalRecord::from_typed(
-            Lsn(4),
-            0,
-            1_700_000_000_000_000_000,
-            0,
-            &WalPayload::CheckpointBegin(CheckpointBeginPayload {
-                checkpoint_id: 1,
-                started_at_unix_nanos: 1_700_000_000_000_000_000,
-            }),
-        );
-        seg.append_record(&begin).unwrap();
-        seg.flush().unwrap();
-        drop(seg);
+        let seg_path_c = seg_path.clone();
+        glommio_run(move || async move {
+            let mut seg = WalSegment::create_new(&seg_path_c, 0, 1, uuid(1))
+                .await
+                .unwrap();
+            for slot in 0..3u64 {
+                let mut r = encode_record(slot);
+                r.lsn = Lsn(slot + 1);
+                seg.append_record(&r).unwrap();
+            }
+            let begin = WalRecord::from_typed(
+                Lsn(4),
+                0,
+                1_700_000_000_000_000_000,
+                0,
+                &WalPayload::CheckpointBegin(CheckpointBeginPayload {
+                    checkpoint_id: 1,
+                    started_at_unix_nanos: 1_700_000_000_000_000_000,
+                }),
+            );
+            seg.append_record(&begin).unwrap();
+            seg.flush().await.unwrap();
+            seg.close().await.unwrap();
+        });
 
         let mut arena = fresh_arena(&dir, 16);
         let mut sink = InMemoryMetadataSink::new();
         let _ = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap();
-        // Sink saw BEGIN but no END → durable_lsn unchanged.
         assert_eq!(sink.durable_lsn(), 0);
     }
 
     #[test]
     fn write_checkpoint_msyncs_the_arena() {
-        // Verifies (via the test-only counter) that msync_all is invoked
-        // between BEGIN and END.
         MSYNC_ALL_CALLS.store(0, Ordering::SeqCst);
         let dir = tempfile::tempdir().unwrap();
-        let wal_dir = fresh_wal_dir(&dir);
-        let arena = fresh_arena(&dir, 16);
-        let mut wal = Wal::create(&wal_dir, uuid(1)).unwrap();
-        write_checkpoint(
-            &mut wal,
-            &arena,
-            CheckpointPlan {
-                checkpoint_id: 1,
-                target_lsn: None,
-            },
-        )
-        .unwrap();
+        let wal_dir = fresh_wal_dir(dir.path());
+        let arena = ArenaFile::open(dir.path().join("arena.bin"), uuid(1), 16).unwrap();
+        glommio_run(move || async move {
+            let wal = Wal::create(&wal_dir, uuid(1)).await.unwrap();
+            write_checkpoint(
+                &wal,
+                &arena,
+                CheckpointPlan {
+                    checkpoint_id: 1,
+                    target_lsn: None,
+                },
+            )
+            .await
+            .unwrap();
+            wal.shutdown().await.unwrap();
+        });
         let count = MSYNC_ALL_CALLS.load(Ordering::SeqCst);
         assert!(
             count >= 1,
             "expected at least one msync_all call, got {count}"
         );
-        wal.shutdown().unwrap();
     }
 
     // ----- Smoke ---------------------------------------------------------
@@ -464,23 +473,25 @@ mod tests {
 
     #[test]
     fn record_kinds_are_checkpoint_records() {
-        // Sanity: the records the writer produces have the expected kinds.
         let dir = tempfile::tempdir().unwrap();
-        let wal_dir = fresh_wal_dir(&dir);
-        let arena = fresh_arena(&dir, 16);
-        let mut wal = Wal::create(&wal_dir, uuid(1)).unwrap();
-        write_checkpoint(
-            &mut wal,
-            &arena,
-            CheckpointPlan {
-                checkpoint_id: 1,
-                target_lsn: None,
-            },
-        )
-        .unwrap();
-        wal.shutdown().unwrap();
+        let wal_dir = fresh_wal_dir(dir.path());
+        let wal_dir_c = wal_dir.clone();
+        let arena = ArenaFile::open(dir.path().join("arena.bin"), uuid(1), 16).unwrap();
+        glommio_run(move || async move {
+            let wal = Wal::create(&wal_dir_c, uuid(1)).await.unwrap();
+            write_checkpoint(
+                &wal,
+                &arena,
+                CheckpointPlan {
+                    checkpoint_id: 1,
+                    target_lsn: None,
+                },
+            )
+            .await
+            .unwrap();
+            wal.shutdown().await.unwrap();
+        });
 
-        // Read back via WalReader; expect [CheckpointBegin, CheckpointEnd].
         let reader = crate::wal::reader::WalReader::open(&wal_dir, uuid(1)).unwrap();
         let kinds: Vec<WalRecordKind> = reader.map(|r| r.unwrap().kind).collect();
         assert_eq!(
