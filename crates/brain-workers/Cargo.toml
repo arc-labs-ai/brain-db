@@ -9,7 +9,10 @@ description = "Background workers for Brain (decay, consolidation, GC, etc.)."
 
 [dependencies]
 brain-core = { path = "../brain-core" }
+brain-metadata = { path = "../brain-metadata" }
 brain-ops = { path = "../brain-ops" }
+parking_lot.workspace = true
+redb.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }

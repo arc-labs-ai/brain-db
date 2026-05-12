@@ -24,6 +24,7 @@
 
 pub mod config;
 pub mod context;
+pub mod decay;
 pub mod error;
 pub mod metrics;
 pub mod scheduler;
@@ -31,6 +32,10 @@ pub mod worker;
 
 pub use config::{WorkerConfig, WorkerKind};
 pub use context::WorkerContext;
+pub use decay::{
+    decayed_salience, half_life_days, DecayWorker, CONSOLIDATED_HALF_LIFE_DAYS,
+    EPISODIC_HALF_LIFE_DAYS, MIN_DELTA_FOR_WRITE, SEMANTIC_HALF_LIFE_DAYS,
+};
 pub use error::WorkerError;
 pub use metrics::{Snapshot as MetricsSnapshot, WorkerMetrics};
 pub use scheduler::{WorkerHandle, WorkerScheduler};

@@ -406,6 +406,7 @@ dependencies = [
  "brain-planner",
  "brain-protocol",
  "parking_lot",
+ "redb",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
