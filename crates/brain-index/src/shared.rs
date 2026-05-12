@@ -169,6 +169,22 @@ impl<const D: usize> SharedHnsw<D> {
         let guard = self.inner.read();
         guard.save_snapshot(dir, basename, taken_at_lsn, shard_uuid)
     }
+
+    /// Atomically replace the inner index with `new`. Used by the
+    /// HNSW maintenance worker (sub-task 8.5) when a full rebuild
+    /// completes; spec §11/04 §5 describes the operation as an
+    /// "ArcSwap" — our `Arc<RwLock<HnswIndex>>` realises the same
+    /// semantics: readers complete on the old index, the brief
+    /// write-lock acquisition is microsecond-scale, new reads see
+    /// the replacement.
+    ///
+    /// **Discipline**: only one task should call `swap` at a time.
+    /// The scheduler's single-worker-per-name guarantee (sub-task
+    /// 8.1) is what enforces this at runtime.
+    pub fn swap(&self, new: HnswIndex<D>) {
+        let mut guard = self.inner.write();
+        *guard = new;
+    }
 }
 
 impl<const D: usize> Writer<D> {

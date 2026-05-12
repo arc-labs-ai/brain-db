@@ -10,6 +10,7 @@ description = "Background workers for Brain (decay, consolidation, GC, etc.)."
 [dependencies]
 brain-core = { path = "../brain-core" }
 brain-embed = { path = "../brain-embed" }
+brain-index = { path = "../brain-index" }
 brain-metadata = { path = "../brain-metadata" }
 brain-ops = { path = "../brain-ops" }
 brain-planner = { path = "../brain-planner" }

@@ -28,6 +28,7 @@ pub mod consolidation;
 pub mod context;
 pub mod decay;
 pub mod error;
+pub mod hnsw_maint;
 pub mod metrics;
 pub mod scheduler;
 pub mod summarizer;
@@ -46,6 +47,10 @@ pub use decay::{
     EPISODIC_HALF_LIFE_DAYS, MIN_DELTA_FOR_WRITE, SEMANTIC_HALF_LIFE_DAYS,
 };
 pub use error::WorkerError;
+pub use hnsw_maint::{
+    decide_action, Action, DisabledRebuildSource, HnswMaintenanceWorker, IndexStats, RebuildSource,
+    RebuildSourceError, RebuildThresholds,
+};
 pub use metrics::{Snapshot as MetricsSnapshot, WorkerMetrics};
 pub use scheduler::{WorkerHandle, WorkerScheduler};
 pub use summarizer::{DisabledSummarizer, Summarizer, SummarizerError};
