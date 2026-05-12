@@ -199,6 +199,47 @@ pub fn prune_expired(
     Ok(count)
 }
 
+/// Like [`prune_expired`] but stops after collecting `max` expired
+/// keys for deletion. Returns `(deleted_count, scanned_to_end)` where
+/// `scanned_to_end` is `true` iff the iterator completed without
+/// hitting the `max` cap.
+///
+/// The Phase 8 idempotency-cleanup worker (sub-task 8.6) uses this
+/// to spec §11/05 §3's "1000 per txn, multiple iterations" pattern
+/// without blocking the writer for too long on a large initial
+/// sweep.
+pub fn prune_expired_bounded(
+    table: &mut Table<'_, [u8; 16], IdempotencyEntry>,
+    now_unix_nanos: u64,
+    ttl_nanos: u64,
+    max: usize,
+) -> Result<(u64, bool), redb::StorageError> {
+    use redb::ReadableTable;
+
+    if max == 0 {
+        return Ok((0, false));
+    }
+
+    let mut victims: Vec<[u8; 16]> = Vec::with_capacity(max.min(1024));
+    let mut scanned_to_end = true;
+    for entry in table.iter()? {
+        let (key, value) = entry?;
+        if value.value().is_expired(now_unix_nanos, ttl_nanos) {
+            victims.push(key.value());
+            if victims.len() >= max {
+                scanned_to_end = false;
+                break;
+            }
+        }
+    }
+
+    let count = victims.len() as u64;
+    for key in &victims {
+        table.remove(key)?;
+    }
+    Ok((count, scanned_to_end))
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
@@ -501,6 +542,83 @@ mod tests {
         let rtxn = db.begin_read().unwrap();
         let t = rtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
         assert!(t.get(&rid(1)).unwrap().is_some());
+    }
+
+    // ----- prune_expired_bounded -----------------------------------------
+
+    #[test]
+    fn prune_expired_bounded_empty_table_returns_zero_scanned_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        let now = T0 + 100 * HOUR_NS;
+        let ttl = 24 * HOUR_NS;
+
+        let wtxn = db.begin_write().unwrap();
+        let (deleted, scanned_to_end) = {
+            let mut t = wtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
+            prune_expired_bounded(&mut t, now, ttl, 100).unwrap()
+        };
+        wtxn.commit().unwrap();
+        assert_eq!(deleted, 0);
+        assert!(scanned_to_end);
+    }
+
+    #[test]
+    fn prune_expired_bounded_caps_at_max_and_reports_not_scanned_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        let now = T0 + 100 * HOUR_NS;
+        let ttl = 24 * HOUR_NS;
+
+        // Seed 50 expired entries (created 50h ago each).
+        let wtxn = db.begin_write().unwrap();
+        {
+            let mut t = wtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
+            for i in 0..50u8 {
+                t.insert(rid(i), sample(i, T0 + 50 * HOUR_NS)).unwrap();
+            }
+        }
+        wtxn.commit().unwrap();
+
+        let wtxn = db.begin_write().unwrap();
+        let (deleted, scanned_to_end) = {
+            let mut t = wtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
+            prune_expired_bounded(&mut t, now, ttl, 10).unwrap()
+        };
+        wtxn.commit().unwrap();
+        assert_eq!(deleted, 10);
+        assert!(!scanned_to_end);
+
+        // 40 still in table.
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
+        assert_eq!(t.iter().unwrap().count(), 40);
+    }
+
+    #[test]
+    fn prune_expired_bounded_returns_scanned_to_end_when_all_consumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        let now = T0 + 100 * HOUR_NS;
+        let ttl = 24 * HOUR_NS;
+
+        let wtxn = db.begin_write().unwrap();
+        {
+            let mut t = wtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
+            for i in 0..50u8 {
+                t.insert(rid(i), sample(i, T0 + 50 * HOUR_NS)).unwrap();
+            }
+        }
+        wtxn.commit().unwrap();
+
+        let wtxn = db.begin_write().unwrap();
+        let (deleted, scanned_to_end) = {
+            let mut t = wtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
+            prune_expired_bounded(&mut t, now, ttl, 1000).unwrap()
+        };
+        wtxn.commit().unwrap();
+        assert_eq!(deleted, 50);
+        assert!(scanned_to_end);
     }
 
     // ----- Type-name guard ----------------------------------------------

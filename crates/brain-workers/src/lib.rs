@@ -29,6 +29,7 @@ pub mod context;
 pub mod decay;
 pub mod error;
 pub mod hnsw_maint;
+pub mod idempotency_cleanup;
 pub mod metrics;
 pub mod scheduler;
 pub mod summarizer;
@@ -51,6 +52,7 @@ pub use hnsw_maint::{
     decide_action, Action, DisabledRebuildSource, HnswMaintenanceWorker, IndexStats, RebuildSource,
     RebuildSourceError, RebuildThresholds,
 };
+pub use idempotency_cleanup::{IdempotencyCleanupWorker, DEFAULT_IDEMPOTENCY_TTL};
 pub use metrics::{Snapshot as MetricsSnapshot, WorkerMetrics};
 pub use scheduler::{WorkerHandle, WorkerScheduler};
 pub use summarizer::{DisabledSummarizer, Summarizer, SummarizerError};
