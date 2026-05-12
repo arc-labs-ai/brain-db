@@ -477,6 +477,6 @@ mod tests {
         let mut value: toml::Value = toml::from_str("[a]\nb = 1\n").unwrap();
         set_path(&mut value, &["c".into(), "d".into(), "e".into()], "true");
         // "true" coerces to a Boolean.
-        assert_eq!(value["c"]["d"]["e"].as_bool().unwrap(), true);
+        assert!(value["c"]["d"]["e"].as_bool().unwrap());
     }
 }

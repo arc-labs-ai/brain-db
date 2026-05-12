@@ -10,6 +10,9 @@
 mod config;
 #[allow(dead_code)] // consumed by the frame dispatcher in sub-task 9.10.
 mod routing;
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // consumed by the connection layer in sub-task 9.9.
+mod shard;
 
 use std::env;
 use std::path::PathBuf;

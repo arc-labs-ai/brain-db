@@ -53,13 +53,15 @@ surfaced.
 > shard executor scaffold is now **9.4**. See the orientation for the
 > updated 18-sub-task projection.
 
-### Task 9.2′ (was 9.2 in doc; now part of 9.4) — Shard executor (Glommio)
-**Reads:** `spec/01_system_architecture/05_hardware.md`
-**Writes:** `crates/brain-server/src/shard.rs`
-**What to build:**
-- One `LocalExecutor` per shard, pinned to a CPU.
-- The shard owns its `Arena`, `Wal`, `MetadataDb`, `HnswIndex`.
-- Channels (mpsc) accept incoming requests from the connection layer.
+### Task 9.4 — Shard scaffold (Glommio LocalExecutor + channel boundary)  [x]
+**Reads:** `spec/01_system_architecture/05_hardware.md`, audit §7/§8.2
+**Writes:** `crates/brain-server/src/shard.rs`, `crates/brain-server/tests/shard.rs`
+**Done when:** A Glommio `LocalExecutor` per shard, on its own OS thread,
+drains a flume request channel, replies to stub `Ping` requests, and is
+joinable on shutdown. `ShardHandle: Send + Sync`. Linux-gated;
+macOS still compiles brain-server (shard module cfg-gated).
+
+> **Scaffold only.** Real arena/WAL/metadata/HNSW/workers land in 9.5–9.7.
 
 ### Task 9.3 — Connection layer (Tokio)
 **Reads:** `spec/01_system_architecture/04_layers.md`
