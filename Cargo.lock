@@ -363,16 +363,9 @@ name = "brain-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "brain-core",
- "brain-embed",
- "brain-index",
- "brain-metadata",
- "brain-ops",
- "brain-planner",
- "brain-protocol",
- "brain-storage",
- "brain-workers",
  "serde",
+ "tempfile",
+ "thiserror 1.0.69",
  "toml",
  "tracing",
  "tracing-subscriber",

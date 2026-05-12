@@ -12,18 +12,17 @@ name = "brain-server"
 path = "src/main.rs"
 
 [dependencies]
-brain-core = { path = "../brain-core" }
-brain-protocol = { path = "../brain-protocol" }
-brain-storage = { path = "../brain-storage" }
-brain-metadata = { path = "../brain-metadata" }
-brain-index = { path = "../brain-index" }
-brain-embed = { path = "../brain-embed" }
-brain-planner = { path = "../brain-planner" }
-brain-ops = { path = "../brain-ops" }
-brain-workers = { path = "../brain-workers" }
+# Brain crate dependencies are added in later Phase 9 sub-tasks as each one
+# is wired in (e.g. 9.3 routing → brain-protocol; 9.4 shards → brain-storage;
+# 9.5 metadata → brain-metadata, ...). Keeping the import set minimal here so
+# this crate compiles on non-Linux hosts during 9.1 (config-only work).
 
 anyhow.workspace = true
 serde.workspace = true
+thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

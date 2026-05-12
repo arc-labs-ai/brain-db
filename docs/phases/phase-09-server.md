@@ -35,7 +35,7 @@ A runnable substrate. TCP connection layer (Tokio) accepts clients; per-shard Gl
 
 ## Sub-tasks
 
-### Task 9.1 — Config loading
+### Task 9.1 — Config loading  [x]
 **Reads:** `config/dev.toml`
 **Writes:** `crates/brain-server/src/config.rs`
 **Done when:** Config struct deserializes from TOML; env var overrides supported; missing required fields produce clear errors.
