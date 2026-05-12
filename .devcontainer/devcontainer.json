@@ -22,8 +22,25 @@
   ],
 
   "remoteEnv": {
-    "RUST_BACKTRACE": "1"
+    "RUST_BACKTRACE": "1",
+    // Phase 9: candle's `gemm-f16` requires the fullfp16 target feature on
+    // aarch64 Linux; without it the build fails with "instruction requires:
+    // fullfp16". On x86_64 Linux this flag is a no-op.
+    "RUSTFLAGS": "-C target-feature=+fp16",
+    "CARGO_TERM_COLOR": "always",
+    // Cap parallel compile jobs to avoid the OOM-killer (signal 9) on the
+    // linker when many crates link concurrently in an 8–12 GB Docker
+    // Desktop VM. 2 is conservative; bump if your container has 16+ GB.
+    "CARGO_BUILD_JOBS": "2"
   },
+
+  // Phase 9 unlock: io_uring (Glommio executor) needs both the memlock
+  // rlimit raised and seccomp permissions for io_uring_setup/enter/register.
+  // Spec §01/05 §1.3.
+  "runArgs": [
+    "--ulimit", "memlock=-1",
+    "--security-opt", "seccomp=unconfined"
+  ],
 
   "postCreateCommand": "bash .devcontainer/post-create.sh",
 
@@ -49,11 +66,12 @@
     }
   },
 
-  // Future: Phase 9 needs `io_uring` syscalls. To unblock then, either:
-  //   - switch macOS users to OrbStack (permissive seccomp), or
-  //   - add `"runArgs": ["--security-opt", "seccomp=.devcontainer/seccomp.json"]`
-  //     pointing at a profile that allows io_uring_setup/enter/register.
-  // Not needed for Phase 2 — see README.md "Container runtime notes".
+  // Phase 9 unlocks (memlock + seccomp + RUSTFLAGS) are baked in above.
+  // VS Code / Cursor "Reopen in Container" picks these up automatically.
+  // Bare `devcontainer` CLI:
+  //   devcontainer up --workspace-folder .
+  //   devcontainer exec --workspace-folder . cargo test --workspace --tests --lib
+  // (Install via `npm install -g @devcontainers/cli` if missing.)
 
   "remoteUser": "root"
 }

@@ -41,6 +41,10 @@ check-skills:
     @./scripts/check-skills.sh
 
 # Build (if needed) the Linux dev container and drop into a bash shell.
+# One-shot interactive container — for ad-hoc poking. For ongoing dev
+# (running tests, clippy, fmt under Linux), prefer `just docker-up` +
+# `just docker <cmd>` — keeps a persistent container so each cargo
+# invocation reuses incremental build state.
 shell:
     @docker build -t brain-dev:latest -f .devcontainer/Dockerfile .
     @docker run --rm -it \
@@ -52,6 +56,75 @@ shell:
         -e RUST_BACKTRACE=1 \
         brain-dev:latest \
         bash
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Linux dev container (headless) — `.devcontainer/devcontainer.json` is the
+# single source of truth. Mounts (cargo registry / git / target), runArgs
+# (memlock + seccomp for io_uring), remoteEnv (RUSTFLAGS + RUST_BACKTRACE +
+# CARGO_TERM_COLOR), and the postCreateCommand all live there. VS Code /
+# Cursor "Reopen in Container" reads the same file.
+#
+# CLI install:  npm install -g @devcontainers/cli
+#
+# `devcontainer up` is idempotent — on subsequent runs it re-attaches to the
+# existing container (label-matched by workspace folder); postCreateCommand
+# does NOT re-fire. Incremental builds work across invocations because
+# /workspaces/brain/target is a named volume.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Bring the dev container up (idempotent). Use after a fresh clone, after
+# Docker Desktop restart, or any time you want to ensure it's running.
+docker-up:
+    @devcontainer up --workspace-folder .
+
+# Stop the dev container; cached volumes (cargo registry, target/) preserved.
+docker-stop:
+    @docker ps -q --filter "label=devcontainer.local_folder={{justfile_directory()}}" | xargs -r docker stop >/dev/null
+    @echo "container stopped (volumes preserved)"
+
+# Remove the dev container entirely (volumes still preserved).
+# Use this if the container drifts into a bad state; `docker-up` recreates.
+docker-down:
+    @docker ps -aq --filter "label=devcontainer.local_folder={{justfile_directory()}}" | xargs -r docker rm -f >/dev/null
+    @echo "container removed (volumes preserved)"
+
+# Full rebuild: nuke container + cache, re-run the Dockerfile. Use after
+# editing .devcontainer/Dockerfile or devcontainer.json's `mounts`/`runArgs`.
+docker-rebuild:
+    @devcontainer up --workspace-folder . --remove-existing-container --build-no-cache
+
+# Drop into an interactive shell inside the running container.
+docker-shell:
+    @devcontainer up --workspace-folder . >/dev/null
+    @devcontainer exec --workspace-folder . bash
+
+# Exec an arbitrary command. Auto-starts the container.
+# Example: just docker cargo test -p brain-storage --tests --lib
+docker *CMD:
+    @devcontainer up --workspace-folder . >/dev/null
+    @devcontainer exec --workspace-folder . {{CMD}}
+
+# Linux verify suite (the gate for committing Linux-touching code).
+# Plain `cargo test` excludes benches by default — criterion benches
+# build a 100k-vector HNSW index and hang on ARM Linux emulation,
+# so we deliberately don't pass `--all-targets` to `test`.
+# Clippy DOES use `--all-targets` because it just type-checks benches
+# (no execution), which we want covered.
+docker-verify:
+    @devcontainer up --workspace-folder . >/dev/null
+    @devcontainer exec --workspace-folder . cargo fmt --all -- --check
+    @devcontainer exec --workspace-folder . cargo test --workspace
+    @devcontainer exec --workspace-folder . cargo clippy --workspace --all-targets -- -D warnings
+
+# Linux tests, scoped. Example: just docker-test -p brain-storage -p brain-server
+docker-test *ARGS:
+    @devcontainer up --workspace-folder . >/dev/null
+    @devcontainer exec --workspace-folder . cargo test {{ARGS}}
+
+# Linux clippy.
+docker-clippy:
+    @devcontainer up --workspace-folder . >/dev/null
+    @devcontainer exec --workspace-folder . cargo clippy --workspace --all-targets -- -D warnings
 
 # The full verification suite — what CI runs.
 verify: fmt-check build clippy test check-skills
