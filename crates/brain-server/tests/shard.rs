@@ -392,6 +392,60 @@ async fn wal_persists_across_restart() {
 }
 
 // ---------------------------------------------------------------------------
+// 9.7b — Per-shard OpsContext + workers wired in
+// ---------------------------------------------------------------------------
+
+/// Spawn → full OpsContext stack constructed (metadata + hnsw + writer +
+/// ops + scheduler with 12 workers) → ping → alloc → append → drop →
+/// joiner.join. Asserts no panic; smoke-checks the wire-up end-to-end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shard_constructs_full_ops_stack() {
+    let dir = TempDir::new().unwrap();
+    let (handle, joiner) = spawn_shard(0, ShardSpawnConfig::new(dir.path())).expect("spawn");
+    handle.ping().await.expect("ping");
+    let (slot, _ver) = handle.alloc_slot().await.expect("alloc");
+    assert_eq!(slot, 0);
+    handle
+        .append_wal_record(encode_record(0, 1))
+        .await
+        .expect("append");
+    drop(handle);
+    tokio::task::spawn_blocking(move || joiner.join())
+        .await
+        .expect("blocking join")
+        .expect("join");
+
+    // metadata.redb is present + has been touched by recovery (writes
+    // happen on next_lsn bookkeeping).
+    assert!(dir.path().join("0").join("metadata.redb").is_file());
+}
+
+/// Spawn → drop immediately → joiner.join. Exercises the scheduler's
+/// shutdown drain (12 workers terminate cleanly within the 5s budget).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shard_shutdown_drains_workers_cleanly() {
+    let dir = TempDir::new().unwrap();
+    let (handle, joiner) = spawn_shard(0, ShardSpawnConfig::new(dir.path())).expect("spawn");
+    handle
+        .ping()
+        .await
+        .expect("ping (verifies workers started)");
+    drop(handle);
+    let start = std::time::Instant::now();
+    tokio::task::spawn_blocking(move || joiner.join())
+        .await
+        .expect("blocking join")
+        .expect("join");
+    let elapsed = start.elapsed();
+    // Workers default to long intervals; shutdown should return promptly
+    // once the flag is set + each task's next sleep yields.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "shutdown took {elapsed:?}, expected < 10s"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Error-type plumbing sanity
 // ---------------------------------------------------------------------------
 

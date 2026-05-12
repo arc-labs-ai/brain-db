@@ -63,6 +63,17 @@ macOS still compiles brain-server (shard module cfg-gated).
 
 > **Scaffold only.** Real arena/WAL/metadata/HNSW/workers land in 9.5–9.7.
 
+### Task 9.7b — Per-shard OpsContext + workers wired in  [x]
+**Reads:** plan `phase-09-task-07b.md`, audit §5.3 + §6 + §8.2.
+**Writes:** `crates/brain-server/Cargo.toml` (6 new Linux deps + parking_lot),
+  `crates/brain-server/src/shard.rs` (full per-shard stack inside the
+  Glommio closure + 12-worker registration + shutdown drain),
+  `crates/brain-server/tests/shard.rs` (2 smoke tests).
+**Done when:** `spawn_shard` constructs `MetadataDb` → `recover()` (real
+sink) → `SharedHnsw` → `NopDispatcher` → `RealWriterHandle` →
+`ExecutorContext` → `OpsContext` → `Wal` → `WorkerScheduler` registering
+all 12 Phase-8 workers. Shutdown drains scheduler → WAL → arena msync.
+
 ### Task 9.7a — WriterHandle Send drop + WorkerScheduler Glommio port  [x]
 > Sub-task 9.7 originally planned a 9.7a/b/c split. The dependency cascade
 > made the split non-viable (audit §4 + §6 are one change). This commit

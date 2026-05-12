@@ -37,17 +37,36 @@
 //! §8.2 defers the in-shard `Rc<Cell<bool>>` shutdown flag to 9.7.
 
 #![cfg(target_os = "linux")]
+// OpsContext is intentionally `!Send + !Sync` post-9.7 (audit §4). The
+// per-shard Glommio executor is the containment boundary; `Arc<OpsContext>`
+// is used in the shard's main loop without crossing threads.
+#![allow(clippy::arc_with_non_send_sync)]
 
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use brain_core::{ShardId, SlotVersion};
+use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
+use brain_index::{IndexParams, SharedHnsw};
+use brain_metadata::MetadataDb;
+use brain_ops::{OpsContext, RealWriterHandle};
+use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_storage::arena::{
     AllocError, ArenaFile, ArenaOpenError, SlotAllocator, DEFAULT_INITIAL_CAPACITY_SLOTS,
 };
-use brain_storage::recovery::{recover, InMemoryMetadataSink, RecoveryError};
+use brain_storage::recovery::{recover, RecoveryError};
 use brain_storage::wal::{Wal, WalConfig, WalError, WalRecord};
+use brain_workers::{
+    AccessBoostWorker, CacheEvictionWorker, ConsolidationWorker, CounterReconcileWorker,
+    DecayWorker, DisabledCacheEvictionSource, DisabledRebuildSource, DisabledSnapshotSource,
+    DisabledSummarizer, DisabledWalRetentionSource, EdgeScrubWorker, HnswMaintenanceWorker,
+    IdempotencyCleanupWorker, SlotReclamationWorker, SnapshotWorker, StatisticsUpdateWorker,
+    WalRetentionWorker, WorkerScheduler,
+};
 use flume::{Receiver, Sender};
 use glommio::{ExecutorJoinHandle, LocalExecutorBuilder, Placement};
+use parking_lot::Mutex;
 use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
@@ -140,6 +159,9 @@ pub enum ShardError {
 
     #[error("WAL init failed: {0}")]
     WalInit(#[from] WalError),
+
+    #[error("metadata open failed: {0}")]
+    MetadataOpen(#[from] brain_metadata::MetadataDbError),
 }
 
 impl ShardError {
@@ -294,6 +316,71 @@ struct Shard {
     /// before awaiting `shutdown_in_place` — the borrow checker would
     /// otherwise prevent calling `&mut self`-incompatible async methods.
     wal: Option<Wal>,
+    /// Per-shard OpsContext — embedder, index, metadata, writer.
+    /// Constructed inside the executor in sub-task 9.7b.
+    #[allow(dead_code)] // consumed by the frame dispatcher in sub-task 9.10
+    ops: Arc<OpsContext>,
+    /// Per-shard worker scheduler. `Option` so shutdown can `.take()`.
+    scheduler: Option<WorkerScheduler>,
+}
+
+/// Stub dispatcher used until 9.10 wires the config-driven CpuDispatcher.
+/// Returns zero vectors + an all-zero fingerprint — sufficient for the
+/// 9.7b smoke tests (which don't exercise encode/recall correctness).
+struct NopDispatcher;
+
+impl Dispatcher for NopDispatcher {
+    fn embed(&self, _: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+        Ok([0.0; VECTOR_DIM])
+    }
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+        Ok(vec![[0.0; VECTOR_DIM]; texts.len()])
+    }
+    fn fingerprint(&self) -> [u8; 16] {
+        [0; 16]
+    }
+}
+
+/// Register every Phase-8 worker against `scheduler`. Phase-8 seams
+/// (Summarizer, RebuildSource, CacheEvictionSource, WalRetentionSource,
+/// SnapshotSource) use the `Disabled*` defaults — real adapters land in
+/// 9.8 / 9.15.
+fn register_phase8_workers(
+    scheduler: &mut WorkerScheduler,
+    ops: Arc<OpsContext>,
+) -> Result<(), brain_workers::WorkerError> {
+    scheduler.register(Arc::new(AccessBoostWorker::new()), ops.clone())?;
+    scheduler.register(Arc::new(DecayWorker::new()), ops.clone())?;
+    scheduler.register(
+        Arc::new(ConsolidationWorker::new(Arc::new(DisabledSummarizer))),
+        ops.clone(),
+    )?;
+    scheduler.register(
+        Arc::new(HnswMaintenanceWorker::new(Arc::new(DisabledRebuildSource))),
+        ops.clone(),
+    )?;
+    scheduler.register(Arc::new(IdempotencyCleanupWorker::new()), ops.clone())?;
+    scheduler.register(Arc::new(EdgeScrubWorker::new()), ops.clone())?;
+    scheduler.register(Arc::new(SlotReclamationWorker::new()), ops.clone())?;
+    scheduler.register(Arc::new(StatisticsUpdateWorker::new()), ops.clone())?;
+    scheduler.register(Arc::new(CounterReconcileWorker::new()), ops.clone())?;
+    scheduler.register(
+        Arc::new(CacheEvictionWorker::new(Arc::new(
+            DisabledCacheEvictionSource,
+        ))),
+        ops.clone(),
+    )?;
+    scheduler.register(
+        Arc::new(WalRetentionWorker::new(Arc::new(
+            DisabledWalRetentionSource,
+        ))),
+        ops.clone(),
+    )?;
+    scheduler.register(
+        Arc::new(SnapshotWorker::new(Arc::new(DisabledSnapshotSource))),
+        ops,
+    )?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -324,12 +411,14 @@ pub fn spawn_shard(
         "arena opened"
     );
 
-    // ---- 4. WAL directory + recovery (sync; sub-task 9.6) ------------------
+    // ---- 4. MetadataDb open + WAL recovery against the real sink ----------
     //
     // Per the audit, `recover()` is sync (mmap-based, reads only — io_uring
-    // brings nothing). The metadata sink is a throw-away `InMemoryMetadataSink`
-    // here; 9.7 swaps in the redb-backed `MetadataDb` and reuses this same
-    // recovery path. After 9.6 we only consume `report.next_lsn`.
+    // brings nothing). Sub-task 9.7b replaces 9.6's InMemoryMetadataSink
+    // stand-in with the durable redb-backed MetadataDb.
+    let metadata_path = dir.join("metadata.redb");
+    let mut metadata_db = MetadataDb::open(&metadata_path)?;
+
     let wal_dir = dir.join("wal");
     std::fs::create_dir_all(&wal_dir).map_err(|e| ShardError::dir_create(wal_dir.clone(), e))?;
     let segments_present = wal_dir
@@ -345,8 +434,7 @@ pub fn spawn_shard(
         });
     let next_lsn_after_recovery: u64;
     let allocator = if segments_present {
-        let mut sink = InMemoryMetadataSink::new();
-        let (report, alloc) = recover(&mut arena, &wal_dir, shard_uuid, &mut sink)?;
+        let (report, alloc) = recover(&mut arena, &wal_dir, shard_uuid, &mut metadata_db)?;
         info!(
             shard_id,
             records_replayed = report.records_replayed,
@@ -361,8 +449,9 @@ pub fn spawn_shard(
         next_lsn_after_recovery = 1;
         SlotAllocator::rebuild_from_arena(&arena)
     };
+    let metadata: SharedMetadataDb = Arc::new(Mutex::new(metadata_db));
 
-    // ---- 5. Spawn the Glommio executor + create-or-open the WAL inside it -
+    // ---- 5. Spawn the Glommio executor + build the rest of the stack -----
     let (tx, rx) = flume::bounded::<ShardRequest>(cfg.channel_capacity);
     let placement = match cfg.pin_cpu {
         Some(cpu) => Placement::Fixed(cpu),
@@ -373,6 +462,20 @@ pub fn spawn_shard(
     let join_handle = LocalExecutorBuilder::new(placement)
         .name(&format!("brain-shard-{shard_id}"))
         .spawn(move || async move {
+            // Build per-shard HNSW; tombstones rebuilt by HnswMaintenanceWorker.
+            let (hnsw_shared, hnsw_writer) =
+                SharedHnsw::<{ VECTOR_DIM }>::new(IndexParams::default_v1())
+                    .expect("SharedHnsw::new");
+            // Stub dispatcher — 9.10's frame dispatcher swaps in a real CpuDispatcher.
+            let dispatcher: Arc<dyn Dispatcher> = Arc::new(NopDispatcher);
+            // Per-shard writer wraps metadata + hnsw_writer.
+            let writer: Arc<dyn WriterHandle> =
+                Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
+            let executor_ctx =
+                ExecutorContext::new(dispatcher, hnsw_shared, metadata.clone(), writer);
+            let ops = Arc::new(OpsContext::new(executor_ctx));
+
+            // Open or create the WAL.
             let wal = if segments_present {
                 Wal::open_existing(
                     &wal_dir_for_executor,
@@ -387,11 +490,23 @@ pub fn spawn_shard(
                     .await
                     .expect("Wal::create_with_config")
             };
+
+            // Spawn the per-shard scheduler + register all 12 Phase-8 workers.
+            let mut scheduler = WorkerScheduler::new();
+            register_phase8_workers(&mut scheduler, ops.clone()).expect("register Phase-8 workers");
+            info!(
+                shard_id,
+                workers = scheduler.len(),
+                "per-shard scheduler online"
+            );
+
             let shard = Shard {
                 shard_id,
                 arena,
                 allocator,
                 wal: Some(wal),
+                ops,
+                scheduler: Some(scheduler),
             };
             shard_main_loop(shard, rx).await;
         })
@@ -455,8 +570,18 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
             }
         }
     }
-    // Clean shutdown: drain WAL committer (sends pending fsync acks) then
-    // close, then msync the arena.
+    // Clean shutdown: drain worker scheduler → WAL committer → arena msync.
+    // Order matters: workers may have in-flight WAL appends; let them drain
+    // before closing the WAL so the fsync acks land.
+    if let Some(scheduler) = shard.scheduler.take() {
+        if let Err(e) = scheduler.shutdown().await {
+            warn!(
+                shard_id = shard.shard_id,
+                error = %e,
+                "scheduler shutdown failed"
+            );
+        }
+    }
     if let Some(wal) = shard.wal.take() {
         if let Err(e) = wal.shutdown().await {
             warn!(
