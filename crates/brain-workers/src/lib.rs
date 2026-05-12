@@ -26,6 +26,7 @@ pub mod access_boost;
 pub mod config;
 pub mod consolidation;
 pub mod context;
+pub mod counter_reconcile;
 pub mod decay;
 pub mod edge_scrub;
 pub mod error;
@@ -46,6 +47,7 @@ pub use consolidation::{
     DEFAULT_SIMILARITY_THRESHOLD,
 };
 pub use context::WorkerContext;
+pub use counter_reconcile::CounterReconcileWorker;
 pub use decay::{
     decayed_salience, half_life_days, DecayWorker, CONSOLIDATED_HALF_LIFE_DAYS,
     EPISODIC_HALF_LIFE_DAYS, MIN_DELTA_FOR_WRITE, SEMANTIC_HALF_LIFE_DAYS,
