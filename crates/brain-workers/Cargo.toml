@@ -9,4 +9,18 @@ description = "Background workers for Brain (decay, consolidation, GC, etc.)."
 
 [dependencies]
 brain-core = { path = "../brain-core" }
+brain-ops = { path = "../brain-ops" }
 thiserror.workspace = true
+tracing.workspace = true
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+
+[dev-dependencies]
+brain-embed = { path = "../brain-embed" }
+brain-index = { path = "../brain-index" }
+brain-metadata = { path = "../brain-metadata" }
+brain-planner = { path = "../brain-planner" }
+brain-protocol = { path = "../brain-protocol" }
+parking_lot.workspace = true
+tempfile.workspace = true
+uuid.workspace = true
+tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros"] }

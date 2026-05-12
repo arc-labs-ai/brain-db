@@ -1,6 +1,17 @@
 //! # brain-workers
 //!
-//! The 12 background workers: decay, access boost, consolidation, HNSW maintenance, idempotency cleanup, slot reclamation, WAL retention, edge scrub, counter reconciliation, statistics, embedder cache eviction, and snapshots.
+//! Background-worker infrastructure plus the 12 concrete workers
+//! (sub-tasks 8.2 – 8.13). v1 runs on the default tokio runtime;
+//! Phase 9 swaps in the Glommio shard executor without changing the
+//! trait surface.
+//!
+//! Sub-task 8.1 ships the infrastructure only:
+//! - [`Worker`] trait + [`WorkerKind`].
+//! - [`WorkerConfig`] with spec §11/01 §11 defaults.
+//! - [`WorkerContext`] (handle bag + shutdown signal).
+//! - [`WorkerMetrics`] (spec §11/01 §15).
+//! - [`WorkerScheduler`] + [`WorkerHandle`].
+//! - [`drive_batch`] helper for spec §11/01 §5 / §6 cycle structure.
 //!
 //! See `spec/11_background_workers/` for the authoritative design.
 
@@ -11,15 +22,16 @@
 )]
 #![forbid(unsafe_code)]
 
-/// Crate-level marker. Placeholder until implementation begins.
-pub const SPEC_REFERENCE: &str = "spec/11_background_workers/";
+pub mod config;
+pub mod context;
+pub mod error;
+pub mod metrics;
+pub mod scheduler;
+pub mod worker;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spec_reference_is_set() {
-        assert!(SPEC_REFERENCE.starts_with("spec/"));
-    }
-}
+pub use config::{WorkerConfig, WorkerKind};
+pub use context::WorkerContext;
+pub use error::WorkerError;
+pub use metrics::{Snapshot as MetricsSnapshot, WorkerMetrics};
+pub use scheduler::{WorkerHandle, WorkerScheduler};
+pub use worker::{drive_batch, Worker};
