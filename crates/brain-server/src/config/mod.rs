@@ -9,13 +9,13 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 // ----------------------------------------------------------------------------
 // Top-level Config
 // ----------------------------------------------------------------------------
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
@@ -38,7 +38,7 @@ pub struct Config {
     pub summarizer: SummarizerConfig,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub listen_addr: SocketAddr,
@@ -48,7 +48,7 @@ pub struct ServerConfig {
     pub tls: TlsConfig,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     #[serde(default)]
@@ -59,14 +59,14 @@ pub struct TlsConfig {
     pub key: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     pub data_dir: PathBuf,
     pub shard_count: usize,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ShardConfig {
     #[serde(deserialize_with = "deserialize_human_bytes")]
@@ -76,7 +76,7 @@ pub struct ShardConfig {
     pub wal_retention_segments: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HnswConfig {
     pub m: usize,
@@ -84,7 +84,7 @@ pub struct HnswConfig {
     pub ef_search: usize,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EmbedderConfig {
     pub model: String,
@@ -93,7 +93,7 @@ pub struct EmbedderConfig {
     pub batch_window_ms: u32,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkersConfig {
     pub decay_interval_sec: Option<u64>,
@@ -109,7 +109,7 @@ pub struct WorkersConfig {
     pub snapshot_interval_sec: Option<u64>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     pub level: String,
@@ -127,7 +127,7 @@ impl Default for LoggingConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TracingConfig {
     #[serde(default)]
@@ -138,7 +138,7 @@ pub struct TracingConfig {
     pub sample_ratio: f64,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     pub mode: AuthMode,
@@ -152,7 +152,7 @@ impl Default for AuthConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMode {
     None,
@@ -163,7 +163,7 @@ pub enum AuthMode {
 // Summarizer (sub-task 9.15)
 // ----------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SummarizerBackend {
     /// Spec §11/03 §6 default: consolidation worker is a no-op.
@@ -175,7 +175,7 @@ pub enum SummarizerBackend {
     Ollama,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SummarizerConfig {
     /// Which backend to use. Defaults to `disabled`.
@@ -433,6 +433,47 @@ impl Config {
         })?;
         cfg.validate_post()?;
         Ok(cfg)
+    }
+
+    /// Minimal valid `Config` used by integration tests that need to
+    /// construct an [`AdminState`](crate::admin::AdminState) without
+    /// reading a TOML file. Numeric defaults mirror `config/dev.toml`.
+    #[doc(hidden)]
+    #[allow(dead_code)] // referenced by integration tests via #[path] mounts.
+    pub fn for_tests() -> Self {
+        Self {
+            server: ServerConfig {
+                listen_addr: "127.0.0.1:0".parse().expect("addr"),
+                metrics_addr: "127.0.0.1:0".parse().expect("addr"),
+                admin_addr: "127.0.0.1:0".parse().expect("addr"),
+                tls: TlsConfig::default(),
+            },
+            storage: StorageConfig {
+                data_dir: PathBuf::from("/tmp/brain-test"),
+                shard_count: 1,
+            },
+            shard: ShardConfig {
+                arena_capacity_bytes: 1u64 << 20,
+                wal_segment_size_bytes: 1u64 << 20,
+                wal_retention_segments: 4,
+            },
+            hnsw: HnswConfig {
+                m: 16,
+                ef_construction: 64,
+                ef_search: 64,
+            },
+            embedder: EmbedderConfig {
+                model: "test".into(),
+                cache_size: 1,
+                batch_size: 1,
+                batch_window_ms: 1,
+            },
+            workers: WorkersConfig::default(),
+            logging: LoggingConfig::default(),
+            tracing: TracingConfig::default(),
+            auth: AuthConfig::default(),
+            summarizer: SummarizerConfig::default(),
+        }
     }
 
     fn validate_post(&self) -> Result<(), ConfigError> {

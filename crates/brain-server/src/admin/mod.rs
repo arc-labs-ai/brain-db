@@ -26,6 +26,15 @@
 
 #![cfg(target_os = "linux")]
 
+mod agent;
+mod audit;
+mod config_route;
+mod diagnostics;
+mod rebuild;
+mod shard_route;
+mod snapshot;
+mod worker;
+
 use std::fmt::Write as _;
 use std::io;
 use std::net::SocketAddr;
@@ -37,6 +46,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tracing::{debug, info, warn};
 
+use crate::config::Config;
 use crate::connection::{ConnectionMetrics, ShutdownSignal};
 use crate::shard::ShardHandle;
 
@@ -75,10 +85,18 @@ pub struct AdminState {
     pub build_info: BuildInfo,
     pub shards: Arc<Vec<ShardHandle>>,
     pub connections: Arc<ConnectionMetrics>,
+    /// Sub-task 10.11: read-only view of the loaded config, surfaced
+    /// by `GET /v1/config`. Cloning is cheap (Arc bump); writes go
+    /// through the future live-reload pathway.
+    pub config: Arc<Config>,
 }
 
 impl AdminState {
-    pub fn new(shards: Arc<Vec<ShardHandle>>, connections: Arc<ConnectionMetrics>) -> Self {
+    pub fn new(
+        shards: Arc<Vec<ShardHandle>>,
+        connections: Arc<ConnectionMetrics>,
+        config: Arc<Config>,
+    ) -> Self {
         let started_at_unix_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -89,6 +107,7 @@ impl AdminState {
             build_info: BuildInfo::from_env(),
             shards,
             connections,
+            config,
         }
     }
 }
@@ -200,8 +219,39 @@ async fn serve_request(stream: TcpStream, state: Arc<AdminState>) -> io::Result<
         }
     }
 
-    let (method, path) = parse_request_line(&request_line);
+    let (method, path_with_query) = parse_request_line(&request_line);
+    let (path, query) = split_path_query(path_with_query);
     let mut stream = reader.into_inner();
+
+    // Snapshot routes (POST / GET / DELETE on /v1/snapshots[*]) —
+    // sub-task 10.9. Falls through if no match.
+    if let Some(res) = snapshot::dispatch(&mut stream, method, path, query, &state).await {
+        return res;
+    }
+    // POST /v1/rebuild-ann — sub-task 10.10.
+    if let Some(res) = rebuild::dispatch(&mut stream, method, path, query, &state).await {
+        return res;
+    }
+    // 10.11 routes: worker, config, audit, agent, shard.
+    if let Some(res) = worker::dispatch(&mut stream, method, path, query, &state).await {
+        return res;
+    }
+    if let Some(res) = config_route::dispatch(&mut stream, method, path, query, &state).await {
+        return res;
+    }
+    if let Some(res) = audit::dispatch(&mut stream, method, path, query, &state).await {
+        return res;
+    }
+    if let Some(res) = agent::dispatch(&mut stream, method, path, query, &state).await {
+        return res;
+    }
+    if let Some(res) = shard_route::dispatch(&mut stream, method, path, query, &state).await {
+        return res;
+    }
+    if let Some(res) = diagnostics::dispatch(&mut stream, method, path, query, &state).await {
+        return res;
+    }
+
     if method != "GET" {
         return write_response(
             &mut stream,
@@ -237,6 +287,16 @@ async fn serve_request(stream: TcpStream, state: Arc<AdminState>) -> io::Result<
             )
             .await
         }
+    }
+}
+
+/// Split `/path?query` into `("/path", "query")`. No URL decoding;
+/// the snapshot routes only need keyed numeric values which don't
+/// require it.
+fn split_path_query(s: &str) -> (&str, &str) {
+    match s.find('?') {
+        Some(i) => (&s[..i], &s[i + 1..]),
+        None => (s, ""),
     }
 }
 
@@ -278,7 +338,33 @@ where
     Ok(bytes_read)
 }
 
-async fn write_response<W>(
+/// Uniform 501 body for routes whose CLI surface is wired (10.11)
+/// but whose server-side primitive lands in a later phase.
+/// Shape: `{"error":"not_implemented","deferred_to":<slug>,"detail":<text>}`.
+pub(super) async fn write_not_implemented<W>(
+    stream: &mut W,
+    deferred_to: &str,
+    detail: &str,
+) -> io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    // No JSON-escape: the slug/detail values are all controlled by
+    // us (admin code), never reflected from user input.
+    let body = format!(
+        "{{\"error\":\"not_implemented\",\"deferred_to\":\"{deferred_to}\",\"detail\":\"{detail}\"}}\n",
+    );
+    write_response(
+        stream,
+        501,
+        "Not Implemented",
+        "application/json; charset=utf-8",
+        &body,
+    )
+    .await
+}
+
+pub(super) async fn write_response<W>(
     stream: &mut W,
     code: u16,
     reason: &str,

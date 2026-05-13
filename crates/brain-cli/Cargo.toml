@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "Admin CLI for the Brain cognitive substrate."
 
+[lib]
+name = "brain_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "brain-cli"
 path = "src/main.rs"
@@ -16,3 +20,10 @@ brain-core = { path = "../brain-core" }
 brain-sdk-rust = { path = "../brain-sdk-rust" }
 
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# Mock HTTP server for the integration tests.
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread"] }
+tempfile.workspace = true

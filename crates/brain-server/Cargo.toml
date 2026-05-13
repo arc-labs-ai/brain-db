@@ -16,8 +16,8 @@ default = []
 # Sub-task 9.15 — feature-gated LLM summarizers. Both pull `reqwest`
 # (with rustls-tls, reusing 9.9's vendored stack). Default off: the
 # substrate works without consolidation per spec §11/03 §6.
-summarizer-openai = ["reqwest", "serde_json"]
-summarizer-ollama = ["reqwest", "serde_json"]
+summarizer-openai = ["reqwest"]
+summarizer-ollama = ["reqwest"]
 
 [dependencies]
 # Brain crate dependencies are added in later Phase 9 sub-tasks as each one
@@ -32,7 +32,7 @@ blake3.workspace = true
 flume.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
-serde_json = { workspace = true, optional = true }
+serde_json.workspace = true
 reqwest = { workspace = true, optional = true }
 thiserror.workspace = true
 toml.workspace = true
@@ -67,7 +67,11 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
 
 # Connection layer integration tests need to drive a TLS client.
+# 10.13 e2e tests drive the in-process harness via the real
+# Rust SDK + CLI library API.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tokio-rustls.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
+brain-sdk-rust = { path = "../brain-sdk-rust" }
+brain-cli = { path = "../brain-cli" }

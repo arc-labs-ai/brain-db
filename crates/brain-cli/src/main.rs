@@ -1,43 +1,120 @@
 //! # brain-cli
 //!
 //! Admin CLI for the Brain substrate. See
-//! `spec/14_observability_ops/06_admin_ops.md` for the command surface.
-//!
-//! Currently a placeholder; sub-commands are stubbed out and print a
-//! "not yet implemented" notice.
+//! `spec/14_observability_ops/06_admin_ops.md` for the full
+//! command surface. 10.8 implements `health` and `stats`; the
+//! other commands land in 10.9–10.12.
 
 #![allow(clippy::missing_errors_doc)]
 
 use std::env;
 use std::process::ExitCode;
 
+use brain_cli::cli::{parse, Command};
+use brain_cli::commands::diagnostics::{debug_snapshot, profile};
+use brain_cli::commands::snapshot::SnapshotAction;
+use brain_cli::commands::{agent, audit, config, health, rebuild, shard, snapshot, stats, worker};
+
 const NAME: &str = env!("CARGO_PKG_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
-
-    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
-        print_help();
-        return ExitCode::SUCCESS;
-    }
-
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("{NAME} {VERSION}");
-        return ExitCode::SUCCESS;
-    }
-
-    let cmd = args[0].as_str();
-    match cmd {
-        "stats" | "health" | "info" | "snapshot" | "rebuild-ann" | "worker" | "config"
-        | "audit" | "agent" | "shard" | "profile" | "debug-snapshot" => {
-            eprintln!("brain-cli {cmd}: not yet implemented");
-            eprintln!("see spec/14_observability_ops/06_admin_ops.md for the spec'd surface.");
-            ExitCode::from(2)
-        }
-        other => {
-            eprintln!("unknown command: {other}");
+    let argv: Vec<String> = env::args().skip(1).collect();
+    let args = match parse(argv) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: {e}");
             print_help();
+            return ExitCode::from(2);
+        }
+    };
+
+    match args.command {
+        Command::Help => {
+            print_help();
+            ExitCode::SUCCESS
+        }
+        Command::Version => {
+            println!("{NAME} {VERSION}");
+            ExitCode::SUCCESS
+        }
+        Command::Health => match health::run(&args.server, args.output) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
+        Command::Stats => match stats::run(&args.server, args.output) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
+        Command::RebuildAnn { shard } => match rebuild::run(&args.server, shard, args.output) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
+        Command::Snapshot(action) => {
+            let result = match action {
+                SnapshotAction::Create { shard } => {
+                    snapshot::create::run(&args.server, shard, args.output)
+                }
+                SnapshotAction::List => snapshot::list::run(&args.server, args.output),
+                SnapshotAction::Delete { id, shard } => {
+                    snapshot::delete::run(&args.server, id, shard, args.output)
+                }
+                SnapshotAction::Restore { id } => {
+                    snapshot::restore::run(&args.server, id, args.output)
+                }
+            };
+            run_result(result)
+        }
+        Command::Worker(action) => run_result(worker::run(&args.server, &action, args.output)),
+        Command::Config(action) => run_result(config::run(&args.server, &action, args.output)),
+        Command::Audit(action) => run_result(audit::run(&args.server, &action, args.output)),
+        Command::Agent(action) => run_result(agent::run(&args.server, &action, args.output)),
+        Command::Shard(action) => run_result(shard::run(&args.server, &action, args.output)),
+        Command::Profile {
+            shard,
+            duration_secs,
+            output_path,
+        } => run_result(profile::run(
+            &args.server,
+            shard,
+            duration_secs,
+            output_path.as_deref(),
+        )),
+        Command::DebugSnapshot { shard, output_path } => run_result(debug_snapshot::run(
+            &args.server,
+            shard,
+            output_path.as_deref(),
+            args.output,
+        )),
+    }
+}
+
+fn run_result(result: anyhow::Result<String>) -> ExitCode {
+    match result {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
             ExitCode::from(2)
         }
     }
@@ -49,27 +126,38 @@ fn print_help() {
 Admin CLI for the Brain substrate.
 
 USAGE:
-    brain-cli <COMMAND> [ARGS]
+    brain-cli [OPTIONS] <COMMAND>
 
 COMMANDS:
-    stats           Show substrate statistics
-    health          Health check across shards
-    info            Build and runtime info
-    snapshot        Create / list / restore snapshots
-    rebuild-ann     Trigger an HNSW rebuild
-    worker          Manage background workers
-    config          Get / set / reload configuration
-    audit           Query the audit log
-    agent           List or modify agents
-    shard           List or modify shards
-    profile         Capture a CPU profile
-    debug-snapshot  Capture a runtime debug snapshot
+    health                                    Probe /healthz
+    stats                                     Snapshot /metrics counters
+    snapshot create|list|delete|restore       Snapshot family
+    rebuild-ann [--shard N]                   Rebuild HNSW for a shard
+    worker list|stop|start|run-now            Worker control (some deferred)
+    config get|reload|set                     Read/write config (some deferred)
+    audit query|export                        Audit log (deferred)
+    agent list|stats|delete                   Agent operations (deferred)
+    shard list|create|delete                  Shard operations (create/delete deferred)
+    profile [--duration-secs N] [--value P]   CPU profile (deferred)
+    debug-snapshot [--value PATH]             Runtime snapshot (partial schema)
 
 OPTIONS:
-    --version, -V   Print version
-    --help, -h      Print this help
+    --server <host:port>      Admin endpoint (default 127.0.0.1:9091)
+    --output <json|table>     Output format (default table)
+    --token <value>           Admin token (parsed; auth wiring lands later)
+    --shard <N>               Target a specific shard
+    --name <worker>           Worker name (decay, consolidation, …)
+    --key <dotted.path>       Config key
+    --value <v>               Config value (for `config set`)
+    --since|--until|--agent   Audit query filters
+    --logical-id <N>          Shard create
+    --confirm                 Required for destructive commands
+    --duration-secs <N>       Profile capture duration (default 30)
+    --value <PATH>            Output-file path (debug-snapshot, profile)
+    --version, -V             Print version
+    --help, -h                Print this help
 
-See spec/14_observability_ops/06_admin_ops.md for full surface.
+See spec/14_observability_ops/06_admin_ops.md for the full surface.
 "
     );
 }

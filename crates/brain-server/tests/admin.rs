@@ -18,6 +18,9 @@ use tokio::net::TcpStream;
 #[path = "../src/admin/mod.rs"]
 mod admin;
 #[allow(dead_code)]
+#[path = "../src/config/mod.rs"]
+mod config;
+#[allow(dead_code)]
 #[path = "../src/network/connection.rs"]
 mod connection;
 #[path = "../src/network/dispatch.rs"]
@@ -78,7 +81,11 @@ impl Bringup {
 async fn start_admin_only() -> Bringup {
     let (trigger, signal) = ShutdownSignal::channel();
     let connections = Arc::new(ConnectionMetrics::default());
-    let state = Arc::new(AdminState::new(Arc::new(Vec::new()), connections));
+    let state = Arc::new(AdminState::new(
+        Arc::new(Vec::new()),
+        connections,
+        Arc::new(config::Config::for_tests()),
+    ));
     let admin = AdminServer::new("127.0.0.1:0".parse().unwrap(), state, signal);
     let bound = admin.bind().expect("bind admin");
     let admin_addr = bound.local_addr();
@@ -136,7 +143,11 @@ async fn start_admin_with_shards(n_shards: usize) -> Bringup {
     let conn_addr = bound_listener.local_addr();
     let listener_handle = tokio::spawn(async move { bound_listener.serve().await });
 
-    let state = Arc::new(AdminState::new(shards, connections));
+    let state = Arc::new(AdminState::new(
+        shards,
+        connections,
+        Arc::new(config::Config::for_tests()),
+    ));
     let admin = AdminServer::new("127.0.0.1:0".parse().unwrap(), state, signal);
     let bound_admin = admin.bind().expect("bind admin");
     let admin_addr = bound_admin.local_addr();

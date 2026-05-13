@@ -204,6 +204,7 @@ mod linux_main {
             let admin_state = Arc::new(crate::admin::AdminState::new(
                 topology.shards.clone(),
                 connection_metrics.clone(),
+                Arc::new(cfg.clone()),
             ));
             let admin = crate::admin::AdminServer::new(
                 cfg.server.metrics_addr,
