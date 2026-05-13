@@ -75,6 +75,19 @@ pub enum ClientError {
         /// Human-readable detail from the server.
         message: String,
     },
+
+    /// Spec §13/04 §10 — the retry loop gave up after exhausting
+    /// `max_attempts` (or `total_timeout`). Carries the most
+    /// recent underlying error for diagnostics.
+    #[error("retry exhausted after {attempts} attempt(s) in {total_duration:?}: {last_error}")]
+    RetryExhausted {
+        /// The error from the final failed attempt.
+        last_error: Box<ClientError>,
+        /// How many attempts were made.
+        attempts: u32,
+        /// Wall-clock time the whole chain consumed.
+        total_duration: std::time::Duration,
+    },
 }
 
 impl ClientError {
@@ -85,6 +98,7 @@ impl ClientError {
     pub fn code(&self) -> Option<u16> {
         match self {
             Self::Server { code, .. } => Some(*code),
+            Self::RetryExhausted { last_error, .. } => last_error.code(),
             _ => None,
         }
     }

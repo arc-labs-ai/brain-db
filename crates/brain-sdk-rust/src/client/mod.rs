@@ -10,6 +10,7 @@
 //! txn / subscribe) land in 10.5+ and will dispatch through
 //! `pool.acquire().await?` once per call.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -19,10 +20,11 @@ use crate::config::ClientConfig;
 use crate::error::ClientError;
 use crate::pool::{Pool, PoolConfig, PoolGuard};
 use crate::proto::handshake::NegotiatedSession;
+use crate::retry::{retry_with_backoff, DefaultJitter, JitterSource};
 
 /// User-facing async client. Cheap to clone (it's just an
-/// `Arc<Pool>` under the hood).
-#[derive(Clone, Debug)]
+/// `Arc<Pool>` + an `Arc<dyn JitterSource>` under the hood).
+#[derive(Clone)]
 pub struct Client {
     pool: Arc<Pool>,
     /// Cached for [`Client::agent_id`]. Always equals the agent
@@ -31,6 +33,19 @@ pub struct Client {
     /// Cached for [`Client::config`]. Equals the `ClientConfig`
     /// the pool was built with.
     config: ClientConfig,
+    /// Shared jitter source. One LCG per client; cloning the
+    /// `Client` shares it (Arc).
+    jitter: Arc<dyn JitterSource>,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("pool", &self.pool)
+            .field("agent_id", &self.agent_id)
+            .field("config", &self.config)
+            .finish()
+    }
 }
 
 impl Client {
@@ -66,6 +81,7 @@ impl Client {
             pool,
             agent_id,
             config,
+            jitter: Arc::new(DefaultJitter::default()),
         })
     }
 
@@ -79,6 +95,7 @@ impl Client {
             pool,
             agent_id,
             config,
+            jitter: Arc::new(DefaultJitter::default()),
         }
     }
 
@@ -107,6 +124,22 @@ impl Client {
     #[allow(dead_code)] // Consumed by op methods in 10.5.
     pub async fn acquire(&self) -> Result<PoolGuard, ClientError> {
         self.pool.acquire().await
+    }
+
+    /// Run `op` through the client's retry policy (spec §13/04).
+    /// Each attempt re-invokes `op`. Returns
+    /// [`ClientError::RetryExhausted`] once `max_attempts` /
+    /// `total_timeout` is hit; the original error for the first
+    /// non-retryable failure.
+    ///
+    /// 10.5+ wraps every op method with this helper.
+    #[allow(dead_code)] // Consumed by op methods in 10.5.
+    pub(crate) async fn run_op<F, Fut, T>(&self, op: F) -> Result<T, ClientError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, ClientError>>,
+    {
+        retry_with_backoff(op, &self.config.retry, self.jitter.as_ref()).await
     }
 
     /// Snapshot the negotiated session from one of the pool's

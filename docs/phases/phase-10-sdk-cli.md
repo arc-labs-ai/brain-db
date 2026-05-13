@@ -61,10 +61,22 @@ Other-language SDKs (Python, TypeScript, Go) are deferred to v1.x.
   blocks-then-succeeds, Overloaded, reaper, close, 10.1 compat).
   docker-verify green.
 
-### Task 10.3 — Retry with exponential backoff + jitter
-**Reads:** `spec/13_sdk_design/04_retries.md`
-**Writes:** `crates/brain-sdk-rust/src/retry.rs`
-**Done when:** Retries on `Overloaded` / network errors with exponential backoff capped at spec max; jitter applied; max attempts respected.
+### Task 10.3 — Retry with exponential backoff + jitter  [x]
+**Reads:** `spec/13_sdk_design/04_retries.md` §1, §2, §5, §6, §10,
+  §13. Plan `.claude/plans/phase-10-task-03.md`.
+**Writes:** `crates/brain-sdk-rust/src/retry/`
+  (`mod.rs`, `config.rs` RetryConfig + presets, `runner.rs`
+  retry_with_backoff + compute_delay + LCG-based JitterSource).
+  `ClientConfig.retry: RetryConfig` replaces the 10.1 placeholder
+  fields. `ClientError::RetryExhausted` variant added.
+  `Client::run_op` (`pub(crate)`) wraps any async op through the
+  policy — 10.5 will use it on every op method.
+**Done when:** Exponential backoff with ±10% jitter respects
+  spec §6 defaults (max=3, initial=100ms, factor=2.0, cap=30s);
+  total_timeout aborts the loop early per spec §13;
+  non-retryable errors short-circuit; first-attempt successes
+  bypass the retry path. 31/31 tests pass (22 lib unit + 9
+  integration). docker-verify green.
 
 ### Task 10.4 — Auto-generated UUIDv7 RequestIds
 **Reads:** `spec/13_sdk_design/04_retries.md`
