@@ -14,16 +14,17 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use brain_core::AgentId;
+use brain_core::{AgentId, RequestId};
 
 use crate::config::ClientConfig;
 use crate::error::ClientError;
 use crate::pool::{Pool, PoolConfig, PoolGuard};
 use crate::proto::handshake::NegotiatedSession;
+use crate::request_id::{DefaultRequestIdSource, RequestIdSource};
 use crate::retry::{retry_with_backoff, DefaultJitter, JitterSource};
 
-/// User-facing async client. Cheap to clone (it's just an
-/// `Arc<Pool>` + an `Arc<dyn JitterSource>` under the hood).
+/// User-facing async client. Cheap to clone (it's just a handful
+/// of `Arc`s under the hood).
 #[derive(Clone)]
 pub struct Client {
     pool: Arc<Pool>,
@@ -36,6 +37,9 @@ pub struct Client {
     /// Shared jitter source. One LCG per client; cloning the
     /// `Client` shares it (Arc).
     jitter: Arc<dyn JitterSource>,
+    /// Shared `RequestId` generator. Cloned `Client`s share the
+    /// same source so concurrent op calls still see distinct ids.
+    req_id_source: Arc<dyn RequestIdSource>,
 }
 
 impl std::fmt::Debug for Client {
@@ -82,6 +86,7 @@ impl Client {
             agent_id,
             config,
             jitter: Arc::new(DefaultJitter::default()),
+            req_id_source: Arc::new(DefaultRequestIdSource),
         })
     }
 
@@ -96,6 +101,7 @@ impl Client {
             agent_id,
             config,
             jitter: Arc::new(DefaultJitter::default()),
+            req_id_source: Arc::new(DefaultRequestIdSource),
         }
     }
 
@@ -124,6 +130,17 @@ impl Client {
     #[allow(dead_code)] // Consumed by op methods in 10.5.
     pub async fn acquire(&self) -> Result<PoolGuard, ClientError> {
         self.pool.acquire().await
+    }
+
+    /// Mint a fresh [`RequestId`] (UUIDv7 by default). Spec
+    /// §13/04 §3: state-mutating ops (ENCODE / FORGET / LINK /
+    /// UNLINK / TXN_COMMIT) need one; 10.5's op-method builders
+    /// call this when the caller didn't supply one. Retries
+    /// **reuse the same id** so the server's 24-hour
+    /// idempotency cache deduplicates.
+    #[must_use]
+    pub fn next_request_id(&self) -> RequestId {
+        self.req_id_source.next()
     }
 
     /// Run `op` through the client's retry policy (spec §13/04).
@@ -203,5 +220,45 @@ impl Client {
         drop(guard);
         self.pool.close();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn next_request_id_is_fresh_per_call() {
+        // Build a Client without touching the network: skip
+        // connection setup by constructing the inner state
+        // directly. The pool is never used here.
+        let addr: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        let agent_id = AgentId::new();
+        let config = ClientConfig::default().with_pool(PoolConfig::single());
+        let client = Client::new_lazy(addr, agent_id, config);
+
+        let a = client.next_request_id();
+        let b = client.next_request_id();
+        let c = client.next_request_id();
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+    }
+
+    #[tokio::test]
+    async fn cloned_client_shares_request_id_source() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        let agent_id = AgentId::new();
+        let config = ClientConfig::default().with_pool(PoolConfig::single());
+        let c1 = Client::new_lazy(addr, agent_id, config);
+        let c2 = c1.clone();
+
+        // Two clones, alternating calls → all ids distinct.
+        let a = c1.next_request_id();
+        let b = c2.next_request_id();
+        let c = c1.next_request_id();
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
     }
 }

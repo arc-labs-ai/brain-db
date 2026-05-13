@@ -78,10 +78,19 @@ Other-language SDKs (Python, TypeScript, Go) are deferred to v1.x.
   bypass the retry path. 31/31 tests pass (22 lib unit + 9
   integration). docker-verify green.
 
-### Task 10.4 — Auto-generated UUIDv7 RequestIds
-**Reads:** `spec/13_sdk_design/04_retries.md`
-**Writes:** integrated into `Client`
-**Done when:** Every write op gets a fresh RequestId by default; user can override per-call.
+### Task 10.4 — Auto-generated UUIDv7 RequestIds  [x]
+**Reads:** `spec/13_sdk_design/04_retries.md` §3, §15.
+  Plan `.claude/plans/phase-10-task-04.md`.
+**Writes:** `crates/brain-sdk-rust/src/request_id/mod.rs` —
+  `RequestIdSource` trait + `DefaultRequestIdSource` (production,
+  wraps `RequestId::new()` = UUIDv7) + `FixedRequestIdSource`
+  (test-only canned sequence). `Client` carries
+  `Arc<dyn RequestIdSource>` and exposes `Client::next_request_id()`.
+  `brain_core::RequestId` re-exported from the SDK root.
+**Done when:** Per-call ids are fresh UUIDv7s; cloned `Client`s
+  share the same source so concurrent ops see distinct ids; the
+  retry-reuses-same-id contract is documented for 10.5. 36/36
+  tests pass (27 lib unit + 9 integration). docker-verify green.
 
 ### Task 10.5 — All op methods on `Client`
 **Reads:** `spec/13_sdk_design/02_core_api.md`
