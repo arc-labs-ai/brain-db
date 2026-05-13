@@ -343,13 +343,29 @@ under `<data_dir>/<shard_id>/`; persists UUID across restarts; stub
   contradicting (matches `search_active`'s silent-filter behavior
   for ByText endpoints).
 
-### Task 9.10 — End-to-end smoke test
-**Writes:** `crates/brain-server/tests/e2e.rs`
-**What to build:**
-- Test spins up the server in-process (or via subprocess).
-- Uses `brain-sdk-rust` to drive: encode → recall → forget → recall.
-- Verifies expected results.
-**Done when:** Smoke passes reliably.
+### Task 9.17 — End-to-end smoke test  [x]
+> Was numbered 9.10 in this phase doc originally; orientation §11
+> renumbered. The "uses `brain-sdk-rust`" original framing was
+> rescoped — see plan §1 — because brain-sdk-rust is a placeholder
+> (Phase 13) and the shard scaffold uses `NopDispatcher`
+> (zero-vector embeddings, no content-correctness assertions
+> possible).
+
+**Reads:** plan `phase-09-task-17.md`.
+**Writes:** `crates/brain-server/tests/e2e.rs` (new — 4 wire-smoke
+  tests using the in-process scaffold pattern from
+  `tests/dispatch.rs` / `tests/admin.rs`).
+**Done when:** the test binary spins up shards + listener + admin
+  server on `127.0.0.1:0`, drives an in-process client through:
+  - `encode_recall_forget_recall_round_trip` — full lifecycle wire
+    shapes (HELLO → AUTH → ENCODE → RECALL → FORGET → RECALL → BYE).
+  - `repeated_encode_recall_is_stable` — 100 round-trips don't
+    leak, deadlock, or panic.
+  - `metrics_endpoint_reflects_traffic` — `/metrics` shows
+    `brain_connections_total >= 2` after two clients connect.
+  - `bye_and_shutdown_drain_cleanly` — BYE + `server.stop()` →
+    `graceful_shutdown_shards` within the default 30 s budget.
+  All 4 pass; full workspace verify still green.
 
 ## Phase exit checklist
 
