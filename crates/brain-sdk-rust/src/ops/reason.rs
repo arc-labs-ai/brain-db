@@ -97,7 +97,7 @@ impl<'a> ReasonBuilder<'a> {
         let client = self.client.clone();
 
         client
-            .run_op(|| {
+            .run_op("reason", || {
                 let client = client.clone();
                 let observation = observation.clone();
                 let context_filter = context_filter.clone();

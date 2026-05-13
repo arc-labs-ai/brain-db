@@ -61,7 +61,7 @@ impl<'a> ForgetBuilder<'a> {
         let client = self.client.clone();
 
         client
-            .run_op(|| {
+            .run_op("forget", || {
                 let client = client.clone();
                 async move {
                     let body = RequestBody::Forget(ForgetRequest {

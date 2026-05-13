@@ -60,7 +60,7 @@ impl<'a> UnlinkBuilder<'a> {
         let client = self.client.clone();
 
         client
-            .run_op(|| {
+            .run_op("unlink", || {
                 let client = client.clone();
                 async move {
                     let body = RequestBody::Unlink(UnlinkRequest {

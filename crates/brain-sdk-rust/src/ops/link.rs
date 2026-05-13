@@ -69,7 +69,7 @@ impl<'a> LinkBuilder<'a> {
         let client = self.client.clone();
 
         client
-            .run_op(|| {
+            .run_op("link", || {
                 let client = client.clone();
                 async move {
                     let body = RequestBody::Link(LinkRequest {

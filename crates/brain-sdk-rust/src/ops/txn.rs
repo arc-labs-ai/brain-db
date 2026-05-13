@@ -26,7 +26,7 @@ pub(crate) async fn txn_begin(
     let txn_id_bytes: [u8; 16] = *Uuid::now_v7().as_bytes();
     let client_inner = client.clone();
     client
-        .run_op(|| {
+        .run_op("txn_begin", || {
             let client = client_inner.clone();
             async move {
                 let body = RequestBody::TxnBegin(TxnBeginRequest {
@@ -57,7 +57,7 @@ pub(crate) async fn txn_commit(
 ) -> Result<TxnCommitResponse, ClientError> {
     let client_inner = client.clone();
     client
-        .run_op(|| {
+        .run_op("txn_commit", || {
             let client = client_inner.clone();
             async move {
                 let body = RequestBody::TxnCommit(TxnCommitRequest { txn_id });
@@ -89,7 +89,7 @@ pub(crate) async fn txn_abort(
 ) -> Result<TxnAbortResponse, ClientError> {
     let client_inner = client.clone();
     client
-        .run_op(|| {
+        .run_op("txn_abort", || {
             let client = client_inner.clone();
             async move {
                 let body = RequestBody::TxnAbort(TxnAbortRequest { txn_id });

@@ -127,7 +127,7 @@ impl<'a> RecallBuilder<'a> {
         let client = self.client.clone();
 
         client
-            .run_op(|| {
+            .run_op("recall", || {
                 let client = client.clone();
                 let cue_text = cue_text.clone();
                 let context_filter = context_filter.clone();

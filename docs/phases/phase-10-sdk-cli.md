@@ -136,10 +136,28 @@ Other-language SDKs (Python, TypeScript, Go) are deferred to v1.x.
   shard fan-out (v2), `STREAM_CLOSE` on drop (the SDK
   drop-and-pool path is best-effort).
 
-### Task 10.7 — SDK observability
-**Reads:** `spec/13_sdk_design/07_observability.md`
-**Writes:** `crates/brain-sdk-rust/src/tracing.rs`
-**Done when:** `tracing` spans on every call; OpenTelemetry-compatible attributes.
+### Task 10.7 — SDK observability  [x]
+**Reads:** `spec/13_sdk_design/07_observability.md` §1, §2, §3,
+  §6, §17. Plan `.claude/plans/phase-10-task-07.md`.
+**Writes:** `crates/brain-sdk-rust/src/observability/`
+  (folder-per-concern: `mod.rs`, `attributes.rs` OTel-style
+  attribute keys, `metrics.rs` `MetricsState` + atomic counters
+  + `MetricsSnapshot`). `Client` gains an
+  `Arc<MetricsState>` field, exposes `metrics_snapshot()`. The
+  `run_op` helper takes an op_name parameter, records per-op
+  request totals, retries, errors, and the in-flight gauge,
+  and emits `tracing::warn!` on retries / `tracing::error!`
+  on terminal failures.
+**Done when:** `Client::metrics_snapshot()` returns a
+  point-in-time view of the counters; cloned clients share
+  state. Spans + retry/error tracing emit. Direct
+  `prometheus_client` / OTLP integrations stay deferred to
+  application choice. 50/50 tests pass (32 lib unit + 18
+  integration). docker-verify green.
+  Deferred: per-request `.trace(true)` opt-in dump, audit-log
+  mode, hooks, stream metrics, circuit-breaker metrics,
+  `client.debug_snapshot()` (10.12), custom default tags,
+  histogram/percentile surfaces.
 
 ### Task 10.8 — `brain-cli stats` and `health`
 **Reads:** `spec/14_observability_ops/06_admin_ops.md`

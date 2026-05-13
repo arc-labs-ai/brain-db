@@ -88,7 +88,7 @@ impl<'a> PlanBuilder<'a> {
         let client = self.client.clone();
 
         client
-            .run_op(|| {
+            .run_op("plan", || {
                 let client = client.clone();
                 let start = start.clone();
                 let goal = goal.clone();

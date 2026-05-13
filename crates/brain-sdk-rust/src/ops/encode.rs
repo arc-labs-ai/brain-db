@@ -120,7 +120,7 @@ impl<'a> EncodeBuilder<'a> {
         let client = self.client.clone();
 
         client
-            .run_op(|| {
+            .run_op("encode", || {
                 let client = client.clone();
                 let text = text.clone();
                 let edges = edges.clone();

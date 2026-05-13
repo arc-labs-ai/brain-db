@@ -20,6 +20,7 @@ use brain_protocol::response::{TxnAbortResponse, TxnBeginResponse, TxnCommitResp
 
 use crate::config::ClientConfig;
 use crate::error::ClientError;
+use crate::observability::{MetricsSnapshot, MetricsState};
 use crate::ops::{
     txn::{txn_abort, txn_begin, txn_commit, DEFAULT_TXN_TIMEOUT_SECONDS},
     EncodeBuilder, ForgetBuilder, LinkBuilder, PlanBuilder, ReasonBuilder, RecallBuilder,
@@ -47,6 +48,9 @@ pub struct Client {
     /// Shared `RequestId` generator. Cloned `Client`s share the
     /// same source so concurrent op calls still see distinct ids.
     req_id_source: Arc<dyn RequestIdSource>,
+    /// Shared metrics state. Snapshots from any cloned client
+    /// reflect every op anywhere in the process. Spec §13/07.
+    pub(crate) metrics: Arc<MetricsState>,
 }
 
 impl std::fmt::Debug for Client {
@@ -94,6 +98,7 @@ impl Client {
             config,
             jitter: Arc::new(DefaultJitter::default()),
             req_id_source: Arc::new(DefaultRequestIdSource),
+            metrics: Arc::new(MetricsState::default()),
         })
     }
 
@@ -109,6 +114,7 @@ impl Client {
             config,
             jitter: Arc::new(DefaultJitter::default()),
             req_id_source: Arc::new(DefaultRequestIdSource),
+            metrics: Arc::new(MetricsState::default()),
         }
     }
 
@@ -148,6 +154,18 @@ impl Client {
     #[must_use]
     pub fn next_request_id(&self) -> RequestId {
         self.req_id_source.next()
+    }
+
+    /// Point-in-time snapshot of the SDK's internal counters
+    /// (request totals, retry totals, in-flight gauge, per-op
+    /// breakdown). Spec §13/07.
+    ///
+    /// All counters are monotonically increasing across the
+    /// process lifetime; callers compute deltas between
+    /// snapshots.
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     // ---- Cognitive operations (spec §13/02 §3-§11) ----
@@ -243,14 +261,47 @@ impl Client {
     /// `total_timeout` is hit; the original error for the first
     /// non-retryable failure.
     ///
+    /// `op_name` is an `observability::attributes::OP_*` constant
+    /// — used for the metrics breakdown and span attribute.
+    ///
     /// 10.5+ wraps every op method with this helper.
     #[allow(dead_code)] // Consumed by op methods in 10.5.
-    pub(crate) async fn run_op<F, Fut, T>(&self, op: F) -> Result<T, ClientError>
+    pub(crate) async fn run_op<F, Fut, T>(
+        &self,
+        op_name: &'static str,
+        mut op: F,
+    ) -> Result<T, ClientError>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, ClientError>>,
     {
-        retry_with_backoff(op, &self.config.retry, self.jitter.as_ref()).await
+        let _in_flight = self.metrics.begin_request(op_name);
+        let metrics = self.metrics.clone();
+        let mut attempt: u32 = 0;
+        let wrapped = || {
+            attempt += 1;
+            if attempt > 1 {
+                metrics.record_retry(op_name);
+                tracing::warn!(
+                    target: "brain_sdk_rust",
+                    op = op_name,
+                    attempt,
+                    "retry attempt"
+                );
+            }
+            op()
+        };
+        let result = retry_with_backoff(wrapped, &self.config.retry, self.jitter.as_ref()).await;
+        if let Err(e) = &result {
+            self.metrics.record_error(op_name);
+            tracing::error!(
+                target: "brain_sdk_rust",
+                op = op_name,
+                error = %e,
+                "op failed"
+            );
+        }
+        result
     }
 
     /// Snapshot the negotiated session from one of the pool's
