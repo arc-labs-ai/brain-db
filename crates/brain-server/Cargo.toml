@@ -35,6 +35,7 @@ uuid.workspace = true
 # (config, routing).
 [target.'cfg(target_os = "linux")'.dependencies]
 glommio.workspace = true
+brain-protocol = { path = "../brain-protocol" }
 brain-storage = { path = "../brain-storage" }
 brain-metadata = { path = "../brain-metadata" }
 brain-index = { path = "../brain-index" }
@@ -43,6 +44,19 @@ brain-planner = { path = "../brain-planner" }
 brain-ops = { path = "../brain-ops" }
 brain-workers = { path = "../brain-workers" }
 
+# Connection layer (sub-task 9.9): Tokio TCP + optional rustls TLS.
+tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+socket2.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+
+# Connection layer integration tests need to drive a TLS client.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tokio-rustls.workspace = true
+rustls.workspace = true
+rcgen.workspace = true

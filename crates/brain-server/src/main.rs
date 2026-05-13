@@ -3,19 +3,25 @@
 //! Entry point for the Brain cognitive substrate.
 //!
 //! See `spec/01_system_architecture/` for the layering and request lifecycle.
-//! Phase 9 status: config loads; runtime / shards land in subsequent sub-tasks.
+//! Phase 9 status: as of 9.9 the Tokio connection layer accepts TCP/TLS and
+//! routes each accepted stream through a per-connection task; the frame
+//! dispatcher lands in 9.10.
 
 #![allow(clippy::missing_errors_doc)]
 
 mod config;
+#[cfg(target_os = "linux")]
+mod connection;
 #[allow(dead_code)] // consumed by the frame dispatcher in sub-task 9.10.
 mod routing;
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // consumed by the connection layer in sub-task 9.9.
+#[allow(dead_code)] // consumed by the connection layer in sub-task 9.10.
 mod shard;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // adapters wired into the per-shard scheduler in 9.8.
 mod shard_adapters;
+#[cfg(target_os = "linux")]
+mod tls;
 
 use std::env;
 use std::path::PathBuf;
@@ -68,10 +74,138 @@ fn main() -> ExitCode {
         data_dir = %cfg.storage.data_dir.display(),
         "brain-server starting"
     );
-    tracing::warn!("Phase 9 stub: config loaded but runtime not yet wired (sub-tasks 9.2+)");
-    tracing::info!("brain-server exiting cleanly");
 
-    ExitCode::SUCCESS
+    #[cfg(target_os = "linux")]
+    {
+        linux_main::run(cfg)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        tracing::warn!(
+            "non-Linux host: brain-server is a stub (Glommio + io_uring require Linux). \
+             Config loaded; runtime not started."
+        );
+        tracing::info!("brain-server exiting cleanly");
+        ExitCode::SUCCESS
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Linux runtime: Tokio multi-thread + ConnectionListener.
+// Shards land in 9.10's frame dispatcher; 9.9 just opens the listener.
+// ----------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod linux_main {
+    use std::process::ExitCode;
+    use std::sync::Arc;
+
+    use super::config::Config;
+    use crate::connection::{
+        ConnectionLimits, ConnectionListener, ShutdownSignal, ShutdownTrigger,
+    };
+    use crate::shard::ShardHandle;
+
+    pub fn run(cfg: Config) -> ExitCode {
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("brain-conn")
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to build Tokio runtime");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        runtime.block_on(async move {
+            let (trigger, signal) = ShutdownSignal::channel();
+            spawn_signal_listener(trigger);
+
+            // 9.10 will spawn the per-shard Glommio executors here and
+            // pass the resulting `Vec<ShardHandle>` into the listener.
+            // 9.9 ships only the connection plumbing; the shard handles
+            // vector is empty for now.
+            let shards: Arc<Vec<ShardHandle>> = Arc::new(Vec::new());
+
+            let tls = match build_tls(&cfg) {
+                Ok(t) => t,
+                Err(rc) => return rc,
+            };
+
+            let listener = ConnectionListener::new(
+                cfg.server.listen_addr,
+                tls,
+                shards,
+                ConnectionLimits::default(),
+                signal,
+            );
+            let bound = match listener.bind() {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to bind connection listener");
+                    return ExitCode::FAILURE;
+                }
+            };
+            tracing::info!(addr = %bound.local_addr(), "brain-server listening");
+
+            match bound.serve().await {
+                Ok(addr) => {
+                    tracing::info!(addr = %addr, "connection listener exited cleanly");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "connection listener failed");
+                    ExitCode::FAILURE
+                }
+            }
+        })
+    }
+
+    fn spawn_signal_listener(trigger: ShutdownTrigger) {
+        tokio::spawn(async move {
+            // 9.14 will own the full SIGINT/SIGTERM lifecycle; 9.9 wires
+            // a minimal ctrl-c handler so a developer can shut the
+            // server down cleanly from a terminal.
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                tracing::error!(error = %e, "ctrl_c handler installation failed");
+                return;
+            }
+            tracing::info!("ctrl-c received; signalling shutdown");
+            trigger.signal();
+        });
+    }
+
+    fn build_tls(
+        cfg: &Config,
+    ) -> Result<Option<std::sync::Arc<tokio_rustls::rustls::ServerConfig>>, ExitCode> {
+        if !cfg.server.tls.enabled {
+            return Ok(None);
+        }
+        let cert = match cfg.server.tls.cert.as_ref() {
+            Some(p) => p,
+            None => {
+                tracing::error!("server.tls.enabled = true but server.tls.cert is unset");
+                return Err(ExitCode::FAILURE);
+            }
+        };
+        let key = match cfg.server.tls.key.as_ref() {
+            Some(p) => p,
+            None => {
+                tracing::error!("server.tls.enabled = true but server.tls.key is unset");
+                return Err(ExitCode::FAILURE);
+            }
+        };
+        match crate::tls::load_server_tls_config(cert, key) {
+            Ok(cfg) => Ok(Some(cfg)),
+            Err(e) => {
+                tracing::error!(error = %e, "TLS config load failed");
+                Err(ExitCode::FAILURE)
+            }
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------

@@ -132,13 +132,31 @@ on Glommio (no `tokio::spawn`); `WorkerContext.shutdown` is
 under `<data_dir>/<shard_id>/`; persists UUID across restarts; stub
 `AllocSlot` op returns sequential `(idx, version)` pairs from the executor.
 
-### Task 9.3 — Connection layer (Tokio)
-**Reads:** `spec/01_system_architecture/04_layers.md`
-**Writes:** `crates/brain-server/src/connection.rs`
-**What to build:**
-- TCP listener (configurable port).
-- Optional TLS via `rustls`.
-- Per-connection task: read frames from socket, dispatch to shard, send responses back.
+### Task 9.9 — Connection layer (Tokio + optional rustls)  [x]
+> Was originally numbered 9.3 in this phase doc; the orientation
+> (`.claude/plans/phase-09.md` §11) renumbered after routing landed
+> early as 9.3.
+
+**Reads:** plan `phase-09-task-09.md`, `spec/01_system_architecture/04_layers.md` (L1),
+  `spec/03_wire_protocol/02_transport.md` (TCP + TLS),
+  `spec/03_wire_protocol/03_frame_header.md` (frame layout),
+  audit `docs/phases/phase-09-glommio-port.md` §7 (Tokio side locked).
+**Writes:** `Cargo.toml` (workspace deps: tokio-rustls, rustls, rustls-pemfile, rcgen, socket2);
+  `crates/brain-server/Cargo.toml` (Linux deps: tokio + rustls stack + socket2 + rcgen dev-dep);
+  `crates/brain-server/src/connection.rs` (new — `ConnectionListener` two-step
+  `new`/`bind`/`serve`, `ShutdownSignal` over `tokio::sync::watch`, per-connection
+  task with frame I/O helpers and TCP option setup);
+  `crates/brain-server/src/tls.rs` (new — `load_server_tls_config` w/ aws-lc-rs
+  provider install, TLS 1.3 only, ALPN `brain/1`);
+  `crates/brain-server/src/main.rs` (Linux async main built around
+  `tokio::runtime::Builder::new_multi_thread`, non-Linux stays sync stub);
+  `crates/brain-server/tests/connection.rs` (new — 6 integration tests).
+**Done when:** `ConnectionListener::new(addr, tls, shards, limits, signal).bind()?.serve().await`
+  binds + accepts on Linux; SO_REUSEADDR / TCP_NODELAY / SO_KEEPALIVE applied
+  per spec §03/02 §1.2; optional rustls TLS 1.3 with `brain/1` ALPN; per-frame
+  read timeout enforced; well-formed frames receive `ERROR(BadFrame)` then
+  close (9.10 plugs in the real dispatcher); ctrl-c → ShutdownTrigger →
+  serve() exits cleanly; 6 connection tests + workspace verify green.
 
 ### Task 9.4 — Frame dispatcher
 **Reads:** `spec/01_system_architecture/04_layers.md`
