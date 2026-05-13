@@ -598,7 +598,7 @@ pub fn spawn_shard(
             let writer: Arc<dyn WriterHandle> =
                 Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
             let executor_ctx =
-                ExecutorContext::new(dispatcher, hnsw_shared, metadata.clone(), writer);
+                ExecutorContext::new(dispatcher, hnsw_shared.clone(), metadata.clone(), writer);
             let ops = Arc::new(OpsContext::new(executor_ctx));
 
             // Spawn the per-shard fanout task: drains the in-process
@@ -674,6 +674,7 @@ pub fn spawn_shard(
                 arena_cell.clone(),
                 wal_cell.clone(),
                 metadata.clone(),
+                hnsw_shared.clone(),
             ));
             // CacheEvictionSource stays Disabled* until 9.10 wires the
             // real CachingDispatcher per shard.

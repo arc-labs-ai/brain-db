@@ -34,6 +34,8 @@ use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use brain_core::{MemoryId, ShardId};
+use brain_embed::VECTOR_DIM;
+use brain_index::SharedHnsw;
 use brain_planner::SharedMetadataDb;
 use brain_storage::arena::ArenaFile;
 use brain_storage::wal::payload::{CheckpointBeginPayload, CheckpointEndPayload, WalPayload};
@@ -221,13 +223,15 @@ impl WalRetentionSource for WalDirRetentionSource {
 ///   <data_dir>/<shard_id>/snapshots/<snapshot_id>/
 ///     arena.bin       (copy of the arena at checkpoint time)
 ///     metadata.redb   (copy of the redb file under read txn)
+///     hnsw.{graph,data,brain}   (SharedHnsw::save_snapshot output)
 ///     manifest.toml   ({ shard_uuid, durable_lsn, taken_at, ... })
-///     # hnsw.snapshot  — TODO(9.12), no HnswIndex::save_snapshot yet
 /// ```
 ///
 /// `take_snapshot` runs the spec §05/09 §3 procedure (CHECKPOINT_BEGIN →
-/// msync arena → CHECKPOINT_END), then *copies* the on-disk files into
-/// the snapshot directory. HNSW save is deferred to 9.12.
+/// msync arena → CHECKPOINT_END), copies the on-disk arena + metadata
+/// files, then asks the per-shard `SharedHnsw` to write its snapshot
+/// triple (`hnsw.graph` / `hnsw.data` / `hnsw.brain` per SD-4.5-1)
+/// into the same directory.
 pub(crate) struct ShardSnapshotSource {
     shard_uuid: [u8; 16],
     snapshots_root: PathBuf,
@@ -236,10 +240,12 @@ pub(crate) struct ShardSnapshotSource {
     arena: Rc<RefCell<ArenaFile>>,
     wal: Rc<RefCell<Option<Wal>>>,
     metadata: SharedMetadataDb,
+    hnsw: SharedHnsw<{ VECTOR_DIM }>,
     next_checkpoint_id: RefCell<u64>,
 }
 
 impl ShardSnapshotSource {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         shard_uuid: [u8; 16],
         snapshots_root: PathBuf,
@@ -248,6 +254,7 @@ impl ShardSnapshotSource {
         arena: Rc<RefCell<ArenaFile>>,
         wal: Rc<RefCell<Option<Wal>>>,
         metadata: SharedMetadataDb,
+        hnsw: SharedHnsw<{ VECTOR_DIM }>,
     ) -> Self {
         Self {
             shard_uuid,
@@ -257,6 +264,7 @@ impl ShardSnapshotSource {
             arena,
             wal,
             metadata,
+            hnsw,
             next_checkpoint_id: RefCell::new(1),
         }
     }
@@ -386,7 +394,18 @@ impl SnapshotSource for ShardSnapshotSource {
                 })?;
             }
 
-            // 7. Manifest.
+            // 7. HNSW snapshot (graph + data + brain wrapper). Writes
+            //    three files under `dir` with basename "hnsw"; per
+            //    SD-4.5-1, `hnsw_rs::file_dump` is a 2-file format and
+            //    the wrapper carries shard_uuid + durable_lsn + the
+            //    BLAKE3 footer.
+            let durable_lsn_for_hnsw =
+                brain_storage::recovery::MetadataSink::durable_lsn(&*self.metadata.lock());
+            self.hnsw
+                .save_snapshot(&dir, "hnsw", durable_lsn_for_hnsw, self.shard_uuid)
+                .map_err(|e| SnapshotSourceError::Failed(format!("hnsw save_snapshot: {e}")))?;
+
+            // 8. Manifest.
             let durable_lsn =
                 brain_storage::recovery::MetadataSink::durable_lsn(&*self.metadata.lock());
             let manifest = format!(
@@ -696,6 +715,11 @@ mod tests {
                     .expect("Wal::create_with_config");
                 let wal_cell = Rc::new(RefCell::new(Some(wal)));
 
+                let (hnsw_shared, _hnsw_writer) = brain_index::SharedHnsw::<{ VECTOR_DIM }>::new(
+                    brain_index::IndexParams::default_v1(),
+                )
+                .expect("SharedHnsw::new");
+
                 let src = ShardSnapshotSource::new(
                     uuid,
                     snapshots_root_cloned.clone(),
@@ -704,6 +728,7 @@ mod tests {
                     arena_cell,
                     wal_cell.clone(),
                     metadata,
+                    hnsw_shared,
                 );
 
                 let id = src.take_snapshot().await.expect("take_snapshot");
