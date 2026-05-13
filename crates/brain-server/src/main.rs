@@ -124,8 +124,11 @@ mod linux_main {
         };
         let shards = Arc::new(shards);
 
+        // Sub-task 9.12: publish the routing table via `ArcSwap` so a
+        // future admin RPC can hot-reload it without restarting
+        // connections. Spec §10/05 §4 / §12/02 §2.
         let routing = match RoutingTable::new(cfg.storage.shard_count as u16, HashMap::new()) {
-            Ok(t) => Arc::new(t),
+            Ok(t) => Arc::new(arc_swap::ArcSwap::from_pointee(t)),
             Err(e) => {
                 tracing::error!(error = %e, "RoutingTable construction failed");
                 return ExitCode::FAILURE;

@@ -194,3 +194,16 @@ The spec wins in general (per `CLAUDE.md` §2 and `AUTONOMY.md` §2); the entrie
 - **Cost:** a one-time ~130 MiB allocation at startup (BGE-small weights). Weights stay resident for the process lifetime regardless, so this is a startup cost, not a steady-state cost.
 - **Plan reference:** `.claude/plans/phase-05-task-01.md`.
 - **Reconcile by:** if startup memory pressure becomes an issue at large model sizes, opt into the mmap loader by lifting `forbid(unsafe_code)` in a single audited spot. No urgency at v1.
+
+---
+
+## SD-10.6-1: `crossbeam-epoch` is intentionally unused by first-party code in v1
+
+- **Spec:** `spec/10_concurrency_epochs/06_crossbeam_epoch.md` prescribes `crossbeam-epoch` for HNSW node management during incremental cleanup (§2), lock-free slot free lists (§4), and other lock-free structures within a shard (§2). The spec assumes Brain ships a custom HNSW and other internal lock-free data structures.
+- **Implementation:** Brain pins `crossbeam-epoch = "0.9"` in `Cargo.toml`'s workspace block but no first-party crate imports it. The dependency stays so future sub-tasks can pull it in without a cargo-resolution churn.
+- **Reason — single-writer-per-shard removes the need:** spec §10/02 mandates a single-writer-per-shard discipline. Inside a shard's Glommio executor (sub-task 9.4, §01/05), there are no concurrent writers to coordinate. Readers either (a) don't share state with the writer (separate Glommio tasks own their data) or (b) coordinate via `Arc` refcount semantics through `SharedHnsw`'s `Arc<RwLock<HnswIndex>>` per SD-4.8-1. The audit's §10/06 §5 even acknowledges this: "with single-writer-per-shard, much of crossbeam-epoch's complexity goes unused".
+- **Reason — HNSW node management lives in `hnsw_rs`:** the one spec use case that would have required crossbeam-epoch directly is HNSW node-level reclamation. With `hnsw_rs` mandated by CLAUDE.md §6, that reclamation is the crate's internal responsibility — `hnsw_rs` ships its own strategy (mostly arena-allocated `Box`es behind the layer abstraction; no exposed epochs surface). Reaching past the `hnsw_rs` API to manage its internals would be a layering violation.
+- **Reason — slot free lists don't need lock-free machinery:** `SlotAllocator` (sub-task 2.6) uses a plain `Vec`-backed free list. The writer is the only mutator (single-writer-per-shard); allocator/free are interleaved synchronously, so no CAS loop or epoch tracking is required. Spec §10/06 §5 explicitly notes "(In Brain, the writer-per-shard discipline obviates the CAS loop)".
+- **What's not implemented:** None of the spec's named use cases — HNSW node management (lives in `hnsw_rs`), slot free lists (plain `Vec`), other lock-free shard-internal structures (none today).
+- **Plan reference:** `.claude/plans/phase-09-task-12.md`.
+- **Reconcile by:** Phase 12+ — when replication, parallel HNSW workers, or cross-shard reclamation are added, the epoch-based reclamation surface may genuinely be needed. The dependency stays in `Cargo.toml` so the introduction is a single `use crossbeam_epoch::…` away.

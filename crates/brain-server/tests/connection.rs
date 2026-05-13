@@ -71,9 +71,9 @@ impl Server {
 fn empty_topology() -> Topology {
     Topology {
         shards: Arc::new(Vec::<ShardHandle>::new()),
-        routing: Arc::new(
+        routing: Arc::new(arc_swap::ArcSwap::from_pointee(
             RoutingTable::new(1, std::collections::HashMap::new()).expect("routing table"),
-        ),
+        )),
         server_caps: Arc::new(ServerCapabilities::v1_default(
             "brain-server/test",
             vec![AuthMethod::None],

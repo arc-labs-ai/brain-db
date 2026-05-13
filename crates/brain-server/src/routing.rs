@@ -249,4 +249,33 @@ mod tests {
         let id = MemoryId::pack(11, SlotIndex::from(42u64), 1);
         assert_eq!(shard_for_memory(id), 11);
     }
+
+    /// Sub-task 9.12: the `RoutingTable` is published via `ArcSwap`
+    /// in production (`Topology.routing`). This test confirms a
+    /// follow-up `store()` is visible to a fresh `load_full()`
+    /// without restarting the server (spec §10/05 §4).
+    #[test]
+    fn arc_swap_publishes_a_new_routing_table_atomically() {
+        use arc_swap::ArcSwap;
+        use std::sync::Arc;
+
+        let initial = RoutingTable::new(2, HashMap::new()).unwrap();
+        let swap = Arc::new(ArcSwap::from_pointee(initial));
+        let pre = swap.load_full();
+        assert_eq!(pre.shard_count(), 2);
+
+        // A "cluster reconfiguration" doubles the shard count.
+        let updated = RoutingTable::new(8, HashMap::new()).unwrap();
+        swap.store(Arc::new(updated));
+
+        let post = swap.load_full();
+        assert_eq!(post.shard_count(), 8);
+
+        // The previously-acquired `pre` Arc still observes the old
+        // table — readers in flight see a coherent snapshot until
+        // they drop their Arc. Spec §10/05 §5 "the reader's
+        // load_full() returns an Arc; while held, the Arc keeps the
+        // state alive".
+        assert_eq!(pre.shard_count(), 2);
+    }
 }

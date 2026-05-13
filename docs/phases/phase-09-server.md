@@ -225,15 +225,28 @@ under `<data_dir>/<shard_id>/`; persists UUID across restarts; stub
 - `agent_id_to_shard(agent_id, num_shards) -> ShardId` via BLAKE3.
 - `MemoryId.shard()` shortcuts routing for ops that already have a memory ID.
 
-### Task 9.6 — `ArcSwap` shared state
-**Reads:** `spec/10_concurrency_epochs/05_arc_swap.md`
-**Writes:** `crates/brain-server/src/state.rs`
-**Done when:** HNSW index and other read-mostly state is published via ArcSwap; readers don't block on writer.
+### Task 9.12 — ArcSwap shared state + crossbeam-epoch reclamation  [x]
+> Was numbered 9.6 + 9.7 in this phase doc originally; orientation §11
+> renumbered to 9.12 as the consolidated sub-task.
 
-### Task 9.7 — `crossbeam-epoch` for deferred reclamation
-**Reads:** `spec/10_concurrency_epochs/06_crossbeam_epoch.md`
-**Writes:** integrated into storage/index modules
-**Done when:** Memory freed in writer is safely reclaimed only after readers done. No use-after-free in stress tests.
+**Reads:** plan `phase-09-task-12.md`,
+  `spec/10_concurrency_epochs/05_arc_swap.md`,
+  `spec/10_concurrency_epochs/06_crossbeam_epoch.md`,
+  `docs/spec-deviations.md` SD-4.8-1 (HNSW RwLock fallback, locked).
+**Writes:** `crates/brain-server/Cargo.toml` (add `arc-swap`);
+  `crates/brain-server/src/dispatch.rs` (`Topology.routing` becomes
+  `Arc<ArcSwap<RoutingTable>>`, `dispatch_frame` uses `load_full()`);
+  `crates/brain-server/src/main.rs` (construct via
+  `ArcSwap::from_pointee`); `crates/brain-server/src/routing.rs` (new
+  unit test); test scaffolds in `tests/{connection,dispatch,subscribe}.rs`;
+  `docs/spec-deviations.md` (new **SD-10.6-1** documenting why
+  first-party code intentionally doesn't use `crossbeam-epoch` under
+  single-writer-per-shard).
+**Done when:** `Topology.routing` is an `Arc<ArcSwap<RoutingTable>>`;
+  reads use `load_full()`; a follow-up `store()` is visible to a
+  fresh `shard_for_agent` call (unit test);
+  `crossbeam-epoch` non-use is documented as SD-10.6-1; ArcSwap
+  use for HNSW remains deferred via SD-4.8-1.
 
 ### Task 9.8 — Health and metrics endpoints
 **Reads:** `spec/14_observability_ops/01_metrics.md`

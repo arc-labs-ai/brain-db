@@ -78,10 +78,17 @@ impl ConnState {
 }
 
 /// Read-only handles a connection task uses: the shard pool + routing.
+///
+/// `routing` is wrapped in [`ArcSwap`] so future cluster
+/// reconfiguration (admin RPC + gossip, post-Phase-9) can publish a
+/// new `RoutingTable` atomically — without restarting connections
+/// (spec §10/05 §4, §12/02 §2). Readers call `routing.load_full()`
+/// per request; the refcount bump is ~50 ns and invisible next to
+/// the agent-id hash + shard lookup.
 #[derive(Clone)]
 pub struct Topology {
     pub shards: Arc<Vec<ShardHandle>>,
-    pub routing: Arc<RoutingTable>,
+    pub routing: Arc<arc_swap::ArcSwap<RoutingTable>>,
     pub server_caps: Arc<ServerCapabilities>,
 }
 
@@ -233,8 +240,8 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
 
     // Route + dispatch. Memory-bearing requests route to the memory's
     // shard; everything else lands on the agent's bound shard.
-    let target_shard =
-        pick_target_shard(&req, bound_shard, &topology.routing).unwrap_or(bound_shard);
+    let routing = topology.routing.load_full();
+    let target_shard = pick_target_shard(&req, bound_shard, &routing).unwrap_or(bound_shard);
     let _ = agent; // reserved for spec §09/01 §12 cross-checks in 9.11+.
 
     Action::OpDispatch(OpDispatch {
@@ -334,7 +341,10 @@ fn on_auth(frame: Frame, state: &mut ConnState, topology: &Topology) -> Action {
     }
 
     let agent = AgentId(uuid::Uuid::from_bytes(auth.agent_id));
-    let bound_shard = topology.routing.shard_for_agent(agent);
+    // Refcount-bump load. The published table may swap between AUTH
+    // and a later request; both observers see a coherent snapshot.
+    let routing = topology.routing.load_full();
+    let bound_shard = routing.shard_for_agent(agent);
     let permissions = AgentPermissions {
         can_encode: true,
         can_recall: true,
@@ -584,7 +594,9 @@ mod tests {
     fn test_topology() -> Topology {
         Topology {
             shards: Arc::new(Vec::new()),
-            routing: Arc::new(RoutingTable::new(1, std::collections::HashMap::new()).unwrap()),
+            routing: Arc::new(arc_swap::ArcSwap::from_pointee(
+                RoutingTable::new(1, std::collections::HashMap::new()).unwrap(),
+            )),
             server_caps: Arc::new(ServerCapabilities::v1_default(
                 "brain-server/test",
                 vec![AuthMethod::None],

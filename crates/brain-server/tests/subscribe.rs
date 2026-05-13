@@ -82,8 +82,9 @@ async fn start_with_shards(n_shards: usize) -> Server {
         handles.push(h);
         joiners.push(Some(j));
     }
-    let routing =
-        Arc::new(RoutingTable::new(n_shards as u16, std::collections::HashMap::new()).unwrap());
+    let routing = Arc::new(arc_swap::ArcSwap::from_pointee(
+        RoutingTable::new(n_shards as u16, std::collections::HashMap::new()).unwrap(),
+    ));
     let topology = Topology {
         shards: Arc::new(handles.clone()),
         routing,
