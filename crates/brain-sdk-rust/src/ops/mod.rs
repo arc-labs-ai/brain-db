@@ -14,9 +14,12 @@ pub mod link;
 pub mod plan;
 pub mod reason;
 pub mod recall;
+pub mod stream;
 pub mod subscribe;
 pub mod txn;
 pub mod unlink;
+
+pub use stream::FrameStream;
 
 pub use encode::EncodeBuilder;
 pub use forget::ForgetBuilder;

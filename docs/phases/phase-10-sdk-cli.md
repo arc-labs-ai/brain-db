@@ -114,10 +114,27 @@ Other-language SDKs (Python, TypeScript, Go) are deferred to v1.x.
   ADMIN ops (10.8+), per-op retry overrides, cancellation
   tokens, `retry_after` honoring.
 
-### Task 10.6 — Streaming via async iterators
-**Reads:** `spec/13_sdk_design/05_streams.md`
-**Writes:** `crates/brain-sdk-rust/src/stream.rs`
-**Done when:** `subscribe(...)` returns `impl Stream<Item = Memory>`; backpressure works.
+### Task 10.6 — Streaming via async iterators  [x]
+**Reads:** `spec/13_sdk_design/05_streams.md` §1-§3, §5, §10-§12.
+  Plan `.claude/plans/phase-10-task-06.md`.
+**Writes:** `crates/brain-sdk-rust/src/ops/stream.rs` —
+  generic `FrameStream<T>` impls `futures_lite::Stream`; owns
+  the `PoolGuard` for lifetime so back-pressure is
+  demand-driven (one socket read per `.next()` poll).
+  `RecallBuilder`, `PlanBuilder`, `ReasonBuilder`,
+  `SubscribeBuilder` gain `.send_stream() -> FrameStream<…>`
+  alongside the 10.5 `.send()` / `.collect()` forms.
+**Done when:** `subscribe().send_stream()` and the three
+  cognitive streamers yield items one-at-a-time, drop releases
+  the connection, ERROR frames surface via the stream as
+  `Some(Err(ClientError::Server))`, EOS terminates the stream
+  with `Ready(None)`. 48/48 tests pass (27 lib unit + 21
+  integration including new `ops_recall_stream.rs` and
+  `ops_subscribe_stream.rs`). docker-verify green.
+  Deferred: reconnect/resume (11.x), keep-alive on streams
+  (server-side prerequisite), stream metrics (10.7), multi-
+  shard fan-out (v2), `STREAM_CLOSE` on drop (the SDK
+  drop-and-pool path is best-effort).
 
 ### Task 10.7 — SDK observability
 **Reads:** `spec/13_sdk_design/07_observability.md`

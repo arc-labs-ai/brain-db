@@ -12,6 +12,8 @@ use brain_protocol::{Frame, RequestBody, ResponseBody};
 use crate::client::Client;
 use crate::error::ClientError;
 use crate::ops::common::{send_and_collect_until_eos, DEFAULT_STREAM_FRAME_CAP, FLAG_EOS};
+use crate::ops::stream::FrameStream;
+use crate::proto::frames::write_frame;
 
 pub struct RecallBuilder<'a> {
     client: &'a Client,
@@ -182,5 +184,58 @@ impl<'a> RecallBuilder<'a> {
                 }
             })
             .await
+    }
+
+    /// Open the recall and return a `Stream` that yields one
+    /// `MemoryResult` per `.next().await`. Demand-driven —
+    /// reads happen only when the caller polls. Useful for
+    /// large `top_k` where the Vec form would buffer too much.
+    ///
+    /// Unlike `send`, this does **not** retry on transient
+    /// errors: the response is opened once.
+    pub async fn send_stream(self) -> Result<FrameStream<MemoryResult>, ClientError> {
+        let request_id = Some(
+            self.request_id
+                .unwrap_or_else(|| self.client.next_request_id()),
+        );
+        let request_id_bytes: Option<[u8; 16]> = request_id.map(Into::into);
+        let body = RequestBody::Recall(RecallRequest {
+            cue_text: self.cue_text,
+            cue_vector_offset: 0,
+            cue_vector_dim: 0,
+            top_k: self.top_k,
+            confidence_threshold: self.confidence_threshold,
+            context_filter: self.context_filter,
+            age_bound_unix_nanos: self.age_bound_unix_nanos,
+            kind_filter: self.kind_filter,
+            salience_floor: self.salience_floor,
+            strategy_hint: self.strategy_hint,
+            include_vectors: self.include_vectors,
+            include_edges: self.include_edges,
+            request_id: request_id_bytes,
+            txn_id: self.txn_id,
+        });
+        let mut guard = self.client.acquire().await?;
+        let stream_id = guard.next_stream_id();
+        let frame = Frame::new(
+            Opcode::RecallReq.as_u8(),
+            FLAG_EOS,
+            stream_id,
+            body.encode(),
+        );
+        write_frame(guard.stream_mut(), &frame).await?;
+
+        let decoder: crate::ops::stream::StreamDecoder<MemoryResult> =
+            Box::new(
+                |payload| match ResponseBody::decode(Opcode::RecallResp, payload)? {
+                    ResponseBody::Recall(RecallResponseFrame { results, .. }) => Ok(results),
+                    _ => Err(ClientError::Protocol(
+                        brain_protocol::error::ProtocolError::BadFrame(
+                            "RecallResp opcode but body variant didn't match".into(),
+                        ),
+                    )),
+                },
+            );
+        Ok(FrameStream::new(guard, Opcode::RecallResp, decoder))
     }
 }

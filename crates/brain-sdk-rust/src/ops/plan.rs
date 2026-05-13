@@ -11,6 +11,8 @@ use brain_protocol::{Frame, RequestBody, ResponseBody};
 use crate::client::Client;
 use crate::error::ClientError;
 use crate::ops::common::{send_and_collect_until_eos, DEFAULT_STREAM_FRAME_CAP, FLAG_EOS};
+use crate::ops::stream::FrameStream;
+use crate::proto::frames::write_frame;
 
 pub struct PlanBuilder<'a> {
     client: &'a Client,
@@ -131,5 +133,40 @@ impl<'a> PlanBuilder<'a> {
                 }
             })
             .await
+    }
+
+    /// Streaming form — yields one `PlanStep` per `.next().await`.
+    pub async fn send_stream(self) -> Result<FrameStream<PlanStep>, ClientError> {
+        let request_id = Some(
+            self.request_id
+                .unwrap_or_else(|| self.client.next_request_id()),
+        );
+        let request_id_bytes: Option<[u8; 16]> = request_id.map(Into::into);
+        let body = RequestBody::Plan(PlanRequest {
+            start: self.start,
+            goal: self.goal,
+            budget: self.budget,
+            strategy_hint: self.strategy_hint,
+            context_filter: self.context_filter,
+            request_id: request_id_bytes,
+            txn_id: self.txn_id,
+        });
+        let mut guard = self.client.acquire().await?;
+        let stream_id = guard.next_stream_id();
+        let frame = Frame::new(Opcode::PlanReq.as_u8(), FLAG_EOS, stream_id, body.encode());
+        write_frame(guard.stream_mut(), &frame).await?;
+
+        let decoder: crate::ops::stream::StreamDecoder<PlanStep> =
+            Box::new(
+                |payload| match ResponseBody::decode(Opcode::PlanResp, payload)? {
+                    ResponseBody::Plan(PlanResponseFrame { steps, .. }) => Ok(steps),
+                    _ => Err(ClientError::Protocol(
+                        brain_protocol::error::ProtocolError::BadFrame(
+                            "PlanResp opcode but body variant didn't match".into(),
+                        ),
+                    )),
+                },
+            );
+        Ok(FrameStream::new(guard, Opcode::PlanResp, decoder))
     }
 }

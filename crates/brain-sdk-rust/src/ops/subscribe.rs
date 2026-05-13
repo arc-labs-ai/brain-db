@@ -14,6 +14,7 @@ use brain_protocol::{Frame, RequestBody, ResponseBody};
 use crate::client::Client;
 use crate::error::ClientError;
 use crate::ops::common::{map_error_frame, DEFAULT_STREAM_FRAME_CAP, FLAG_EOS};
+use crate::ops::stream::FrameStream;
 use crate::proto::frames::{read_one_frame, write_frame};
 
 pub struct SubscribeBuilder<'a> {
@@ -140,5 +141,50 @@ impl<'a> SubscribeBuilder<'a> {
             }
         }
         Ok(events)
+    }
+
+    /// Open the subscription and return an unbounded
+    /// `Stream<Item = Result<SubscriptionEvent, ClientError>>`.
+    /// Demand-driven — each `.next().await` reads one event off
+    /// the wire. The stream holds a `PoolGuard` for its lifetime;
+    /// drop it to release the connection back to the pool.
+    ///
+    /// SUBSCRIBE streams do NOT retry on transient errors;
+    /// resume semantics (spec §13/05 §8) require server-side
+    /// support beyond v1. Surface errors to the caller.
+    pub async fn send_stream(self) -> Result<FrameStream<SubscriptionEvent>, ClientError> {
+        let filter = SubscriptionFilter {
+            contexts: self.contexts,
+            kinds: self.kinds,
+            similar_to: self.similar_to,
+        };
+        let body = RequestBody::Subscribe(SubscribeRequest {
+            filter,
+            include_history: self.include_history,
+            from_lsn: self.from_lsn,
+            max_inflight: self.max_inflight,
+        });
+        let mut guard = self.client.acquire().await?;
+        let stream_id = guard.next_stream_id();
+        let frame = Frame::new(
+            Opcode::SubscribeReq.as_u8(),
+            FLAG_EOS,
+            stream_id,
+            body.encode(),
+        );
+        write_frame(guard.stream_mut(), &frame).await?;
+
+        let decoder: crate::ops::stream::StreamDecoder<SubscriptionEvent> =
+            Box::new(
+                |payload| match ResponseBody::decode(Opcode::SubscribeEvent, payload)? {
+                    ResponseBody::SubscribeEvent(ev) => Ok(vec![ev]),
+                    _ => Err(ClientError::Protocol(
+                        brain_protocol::error::ProtocolError::BadFrame(
+                            "SubscribeEvent opcode but body variant didn't match".into(),
+                        ),
+                    )),
+                },
+            );
+        Ok(FrameStream::new(guard, Opcode::SubscribeEvent, decoder))
     }
 }
