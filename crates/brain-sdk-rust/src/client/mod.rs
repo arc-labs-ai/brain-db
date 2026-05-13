@@ -14,10 +14,17 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use brain_core::{AgentId, RequestId};
+use brain_core::{AgentId, MemoryId, RequestId};
+use brain_protocol::request::{EdgeKindWire, ObservationInput, PlanState};
+use brain_protocol::response::{TxnAbortResponse, TxnBeginResponse, TxnCommitResponse};
 
 use crate::config::ClientConfig;
 use crate::error::ClientError;
+use crate::ops::{
+    txn::{txn_abort, txn_begin, txn_commit, DEFAULT_TXN_TIMEOUT_SECONDS},
+    EncodeBuilder, ForgetBuilder, LinkBuilder, PlanBuilder, ReasonBuilder, RecallBuilder,
+    SubscribeBuilder, UnlinkBuilder,
+};
 use crate::pool::{Pool, PoolConfig, PoolGuard};
 use crate::proto::handshake::NegotiatedSession;
 use crate::request_id::{DefaultRequestIdSource, RequestIdSource};
@@ -141,6 +148,93 @@ impl Client {
     #[must_use]
     pub fn next_request_id(&self) -> RequestId {
         self.req_id_source.next()
+    }
+
+    // ---- Cognitive operations (spec §13/02 §3-§11) ----
+
+    /// ENCODE a memory. Returns an [`EncodeBuilder`]; chain
+    /// optional fields and call `.send().await`.
+    #[must_use]
+    pub fn encode(&self, text: impl Into<String>) -> EncodeBuilder<'_> {
+        EncodeBuilder::new(self, text)
+    }
+
+    /// RECALL similar memories by cue text. Returns a
+    /// [`RecallBuilder`]; chain knobs (top_k, filters) and call
+    /// `.send().await` to collect results into a `Vec`.
+    #[must_use]
+    pub fn recall(&self, cue: impl Into<String>) -> RecallBuilder<'_> {
+        RecallBuilder::new(self, cue)
+    }
+
+    /// PLAN a path from `start` to `goal`. 10.5 ships the
+    /// Vec-collecting form; 10.6 adds an async-iterator surface.
+    #[must_use]
+    pub fn plan(&self, start: PlanState, goal: PlanState) -> PlanBuilder<'_> {
+        PlanBuilder::new(self, start, goal)
+    }
+
+    /// REASON about an observation.
+    #[must_use]
+    pub fn reason(&self, observation: ObservationInput) -> ReasonBuilder<'_> {
+        ReasonBuilder::new(self, observation)
+    }
+
+    /// FORGET a memory. Single-id mode only in 10.5; batch /
+    /// filter modes are deferred (spec §13/02 §7).
+    #[must_use]
+    pub fn forget(&self, memory_id: MemoryId) -> ForgetBuilder<'_> {
+        ForgetBuilder::new(self, memory_id)
+    }
+
+    /// LINK two memories with an edge of `kind` and weight 1.0
+    /// by default.
+    #[must_use]
+    pub fn link(&self, source: MemoryId, kind: EdgeKindWire, target: MemoryId) -> LinkBuilder<'_> {
+        LinkBuilder::new(self, source, kind, target)
+    }
+
+    /// UNLINK two memories identified by `(source, kind, target)`.
+    #[must_use]
+    pub fn unlink(
+        &self,
+        source: MemoryId,
+        kind: EdgeKindWire,
+        target: MemoryId,
+    ) -> UnlinkBuilder<'_> {
+        UnlinkBuilder::new(self, source, kind, target)
+    }
+
+    /// SUBSCRIBE to change events. 10.5 ships a `collect(N)`
+    /// helper; 10.6 adds the streaming iterator.
+    #[must_use]
+    pub fn subscribe(&self) -> SubscribeBuilder<'_> {
+        SubscribeBuilder::new(self)
+    }
+
+    /// Open a transaction. Returns the `TxnBeginResponse`
+    /// (carries the `txn_id` that subsequent ops attach via
+    /// `.txn(id)`). Spec §07/9.
+    pub async fn txn_begin(&self) -> Result<TxnBeginResponse, ClientError> {
+        txn_begin(self, DEFAULT_TXN_TIMEOUT_SECONDS).await
+    }
+
+    /// Open a transaction with a custom timeout (in seconds).
+    pub async fn txn_begin_with_timeout(
+        &self,
+        timeout_seconds: u32,
+    ) -> Result<TxnBeginResponse, ClientError> {
+        txn_begin(self, timeout_seconds).await
+    }
+
+    /// Commit the transaction. Spec §07/10.
+    pub async fn txn_commit(&self, txn_id: [u8; 16]) -> Result<TxnCommitResponse, ClientError> {
+        txn_commit(self, txn_id).await
+    }
+
+    /// Abort the transaction. Spec §07/11.
+    pub async fn txn_abort(&self, txn_id: [u8; 16]) -> Result<TxnAbortResponse, ClientError> {
+        txn_abort(self, txn_id).await
     }
 
     /// Run `op` through the client's retry policy (spec §13/04).

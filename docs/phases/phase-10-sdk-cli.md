@@ -92,10 +92,27 @@ Other-language SDKs (Python, TypeScript, Go) are deferred to v1.x.
   retry-reuses-same-id contract is documented for 10.5. 36/36
   tests pass (27 lib unit + 9 integration). docker-verify green.
 
-### Task 10.5 — All op methods on `Client`
-**Reads:** `spec/13_sdk_design/02_core_api.md`
-**Writes:** `crates/brain-sdk-rust/src/ops.rs`
-**Done when:** `client.encode(...)`, `recall(...)`, `plan(...)`, `reason(...)`, `forget(...)`, `link(...)`, `unlink(...)`, `txn(...)`, `subscribe(...)` all work.
+### Task 10.5 — All op methods on `Client`  [x]
+**Reads:** `spec/13_sdk_design/02_core_api.md` §3-§11. Plan
+  `.claude/plans/phase-10-task-05.md`.
+**Writes:** `crates/brain-sdk-rust/src/ops/` (folder-per-concern:
+  `common.rs` + 9 op files: `encode/recall/plan/reason/forget/`
+  `link/unlink/subscribe/txn.rs`). `Client` gains 11 methods
+  (encode, recall, plan, reason, forget, link, unlink,
+  subscribe, txn_begin, txn_commit, txn_abort). Shared mock
+  fixture in `tests/common/mod.rs`.
+**Done when:** Every op method exists, builds a typed request,
+  goes through `Client::run_op` (retries on retryable errors
+  with the same auto-minted `RequestId`), reads the response,
+  and returns the typed result. Streaming ops collect into
+  `Vec<T>` for now — 10.6 adds the async-iterator surface.
+  ERROR-frame mapping wired (`ClientError::Server`). All op
+  tests pass; pre-10.5 tests still pass. docker-verify green.
+
+  Deferred: ENCODE_VECTOR_DIRECT, async-iterator streaming
+  (10.6), nested `txn.encode(...)` sugar, FORGET batch/filter,
+  ADMIN ops (10.8+), per-op retry overrides, cancellation
+  tokens, `retry_after` honoring.
 
 ### Task 10.6 — Streaming via async iterators
 **Reads:** `spec/13_sdk_design/05_streams.md`

@@ -35,15 +35,20 @@
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod ops;
 pub mod pool;
 pub mod proto;
 pub mod request_id;
 pub mod retry;
 
-pub use brain_core::RequestId;
+pub use brain_core::{MemoryId, RequestId};
 pub use client::Client;
 pub use config::{AuthMethod, ClientConfig};
 pub use error::ClientError;
+pub use ops::{
+    EncodeBuilder, ForgetBuilder, LinkBuilder, PlanBuilder, ReasonBuilder, RecallBuilder,
+    SubscribeBuilder, UnlinkBuilder,
+};
 pub use pool::{Connection, Pool, PoolConfig, PoolGuard};
 pub use proto::handshake::{ClientIdentity, NegotiatedSession};
 pub use request_id::{DefaultRequestIdSource, RequestIdSource};
