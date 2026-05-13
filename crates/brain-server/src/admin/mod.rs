@@ -26,6 +26,7 @@
 
 #![cfg(target_os = "linux")]
 
+mod rebuild;
 mod snapshot;
 
 use std::fmt::Write as _;
@@ -209,6 +210,10 @@ async fn serve_request(stream: TcpStream, state: Arc<AdminState>) -> io::Result<
     // Snapshot routes (POST / GET / DELETE on /v1/snapshots[*]) —
     // sub-task 10.9. Falls through if no match.
     if let Some(res) = snapshot::dispatch(&mut stream, method, path, query, &state).await {
+        return res;
+    }
+    // POST /v1/rebuild-ann — sub-task 10.10.
+    if let Some(res) = rebuild::dispatch(&mut stream, method, path, query, &state).await {
         return res;
     }
 

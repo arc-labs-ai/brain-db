@@ -39,6 +39,10 @@ pub enum Command {
     /// Sub-task 10.9 — snapshot family. The sub-action + args are
     /// validated by [`crate::commands::snapshot::SnapshotAction::parse`].
     Snapshot(crate::commands::snapshot::SnapshotAction),
+    /// Sub-task 10.10 — `rebuild-ann [--shard N]`.
+    RebuildAnn {
+        shard: usize,
+    },
 }
 
 /// Parse a `Vec<String>` (typically `env::args().skip(1).collect()`).
@@ -106,6 +110,7 @@ pub fn parse(argv: Vec<String>) -> Result<Args> {
             let action = SnapshotAction::parse(&rest, shard)?;
             Command::Snapshot(action)
         }
+        Some("rebuild-ann") => Command::RebuildAnn { shard },
         Some(other) => return Err(anyhow!("unknown subcommand `{other}`")),
     };
 

@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 use brain_cli::cli::{parse, Command};
 use brain_cli::commands::snapshot::SnapshotAction;
-use brain_cli::commands::{health, snapshot, stats};
+use brain_cli::commands::{health, rebuild, snapshot, stats};
 
 const NAME: &str = env!("CARGO_PKG_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -48,6 +48,16 @@ fn main() -> ExitCode {
             }
         },
         Command::Stats => match stats::run(&args.server, args.output) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
+        Command::RebuildAnn { shard } => match rebuild::run(&args.server, shard, args.output) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS

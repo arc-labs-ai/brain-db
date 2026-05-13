@@ -136,6 +136,11 @@ pub(crate) enum ShardRequest {
         id: u64,
         reply_tx: Sender<Result<(), String>>,
     },
+    /// Trigger an immediate HNSW rebuild on this shard.
+    /// Sub-task 10.10.
+    RebuildHnsw {
+        reply_tx: Sender<Result<RebuildReport, String>>,
+    },
 }
 
 /// Owned snapshot descriptor surfaced through `ShardHandle`. Mirrors
@@ -146,6 +151,15 @@ pub struct SnapshotInfo {
     pub id: u64,
     pub taken_at_unix_nanos: u64,
     pub size_bytes: u64,
+}
+
+/// Report returned by `rebuild-ann`. Sub-task 10.10.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RebuildReport {
+    /// Number of entries in the new index after rebuild.
+    pub entries: usize,
+    /// Wall-clock duration of the rebuild, in milliseconds.
+    pub elapsed_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +410,21 @@ impl ShardHandle {
             .map_err(ShardError::Snapshot)
     }
 
+    /// Trigger an immediate full HNSW rebuild. Returns the new
+    /// entry count + elapsed time. Spec §14/06 §4; sub-task 10.10.
+    pub async fn rebuild_hnsw(&self) -> Result<RebuildReport, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::RebuildHnsw { reply_tx })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?
+            .map_err(ShardError::Snapshot)
+    }
+
     /// Dispatch a fully-decoded wire request through the shard's
     /// `OpsContext`. Returns the wire `ResponseBody` (variant chosen by
     /// `brain_ops::dispatch`). Added in 9.10 as the frame-dispatcher's
@@ -519,6 +548,12 @@ struct Shard {
     /// Snapshot source for the admin HTTP routes (sub-task 10.9).
     /// Cloned from the same `Arc` the `SnapshotWorker` holds.
     snapshot_source: Arc<dyn SnapshotSource>,
+    /// Rebuild source for the admin `rebuild-ann` route (sub-task
+    /// 10.10). Same `Arc` the `HnswMaintenanceWorker` holds.
+    rebuild_source: Arc<dyn RebuildSource<{ VECTOR_DIM }>>,
+    /// The shared HNSW handle. `rebuild-ann` swaps a freshly-
+    /// rebuilt index in via `SharedHnsw::swap()`.
+    hnsw_shared: SharedHnsw<{ VECTOR_DIM }>,
 }
 
 /// Stub dispatcher used until 9.10 wires the config-driven CpuDispatcher.
@@ -736,6 +771,8 @@ pub fn spawn_shard(
             let rebuild_source: Arc<dyn RebuildSource<{ VECTOR_DIM }>> = Arc::new(
                 ArenaRebuildSource::<{ VECTOR_DIM }>::new(shard_id, arena_cell.clone()),
             );
+            // Keep a clone for the admin `rebuild-ann` route (10.10).
+            let rebuild_source_for_shard = rebuild_source.clone();
             let wal_retention_source: Arc<dyn WalRetentionSource> =
                 Arc::new(WalDirRetentionSource::new(
                     wal_dir_for_executor.clone(),
@@ -783,6 +820,8 @@ pub fn spawn_shard(
                 ops,
                 scheduler: Some(scheduler),
                 snapshot_source,
+                rebuild_source: rebuild_source_for_shard,
+                hnsw_shared,
             };
             shard_main_loop(shard, rx).await;
         })
@@ -893,6 +932,32 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     warn!(
                         shard_id = shard.shard_id,
                         "DeleteSnapshot reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::RebuildHnsw { reply_tx } => {
+                let start = std::time::Instant::now();
+                let result = match shard.rebuild_source.snapshot_vectors().await {
+                    Ok(vectors) => {
+                        let params = shard.hnsw_shared.params();
+                        match brain_index::HnswIndex::<{ VECTOR_DIM }>::rebuild(params, vectors) {
+                            Ok((new_idx, _report)) => {
+                                let entries = new_idx.len();
+                                shard.hnsw_shared.swap(new_idx);
+                                Ok(RebuildReport {
+                                    entries,
+                                    elapsed_ms: start.elapsed().as_millis() as u64,
+                                })
+                            }
+                            Err(e) => Err(format!("rebuild: {e:?}")),
+                        }
+                    }
+                    Err(e) => Err(format!("rebuild source: {e}")),
+                };
+                if reply_tx.send_async(result).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "RebuildHnsw reply dropped (caller gone)"
                     );
                 }
             }

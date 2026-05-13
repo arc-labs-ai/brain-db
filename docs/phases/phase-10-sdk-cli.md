@@ -199,9 +199,27 @@ Other-language SDKs (Python, TypeScript, Go) are deferred to v1.x.
   Deferred: auth tokens on admin HTTP, TLS, wire-protocol
   admin ops, dry-run mode, job-id tracking, online restore.
 
-### Task 10.10 — `brain-cli rebuild-ann`
-**Writes:** `crates/brain-cli/src/rebuild.rs`
-**Done when:** Triggers an immediate rebuild via admin API; reports progress.
+### Task 10.10 — `brain-cli rebuild-ann`  [x]
+**Reads:** `spec/14_observability_ops/06_admin_ops.md` §4. Plan
+  `.claude/plans/phase-10-task-10.md`.
+**Writes:**
+  - Server: `crates/brain-server/src/admin/rebuild.rs` — new
+    `POST /v1/rebuild-ann[?shard=N]` HTTP handler. New
+    `ShardRequest::RebuildHnsw` variant + `RebuildReport` +
+    `ShardHandle::rebuild_hnsw()` method + main-loop arm. `Shard`
+    struct gains `rebuild_source` + `hnsw_shared` fields.
+  - CLI: `crates/brain-cli/src/commands/rebuild.rs` —
+    `rebuild::run` POSTs the endpoint, renders the report.
+    `Command::RebuildAnn { shard }` + argv routing.
+**Done when:** `brain-cli rebuild-ann [--shard N]` triggers an
+  immediate full HNSW rebuild and prints the new entry count +
+  elapsed time. Synchronous in v1 (HTTP request blocks until
+  rebuild completes); async + `rebuild-ann-status` follow-up is
+  a v2 / Phase-11 sub-task once job-id infrastructure exists.
+  Reuses the existing `ArenaRebuildSource` and `SharedHnsw::swap`
+  atomicity (SD-4.8-1). 37 brain-cli tests pass. docker-verify
+  green. Deferred: rebuild-ann-status, async dispatch, cross-
+  shard "rebuild all", dry-run, auth.
 
 ### Task 10.11 — `brain-cli worker`, `config`, `audit`, `agent`, `shard`
 **Writes:** `crates/brain-cli/src/{worker,config,audit,agent,shard}.rs`
