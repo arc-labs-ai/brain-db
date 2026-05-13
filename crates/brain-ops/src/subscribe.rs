@@ -215,7 +215,10 @@ impl ParsedFilter {
     }
 }
 
-fn parse_filter(req: &SubscribeRequest) -> Result<ParsedFilter, OpError> {
+/// Parse the wire `SubscribeRequest` into a registry-side
+/// [`ParsedFilter`]. Made public in 9.11 so `brain-server`'s
+/// connection-layer registry can reuse the same shape.
+pub fn parse_filter(req: &SubscribeRequest) -> Result<ParsedFilter, OpError> {
     if req.filter.similar_to.is_some() {
         return Err(OpError::NotYetImplemented(
             "SUBSCRIBE: similar_to filter — Phase 9",

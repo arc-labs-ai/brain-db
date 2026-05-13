@@ -98,6 +98,16 @@ pub struct Topology {
 pub(crate) enum Action {
     Inline(Frame),
     OpDispatch(OpDispatch),
+    /// Open a new SUBSCRIBE stream (sub-task 9.11). The connection
+    /// loop registers the subscription, spawns the per-sub task, and
+    /// emits an opening empty SUBSCRIBE_EVENT frame on the same
+    /// stream so the client sees the stream is open.
+    Subscribe(SubscribeStart),
+    /// Cancel an active subscription via UNSUBSCRIBE_REQ or
+    /// CANCEL_STREAM. The connection loop pulls the matching entry
+    /// out of the registry, sends the ack on the request's stream,
+    /// and the per-sub task emits its own final EOS.
+    CancelSubscribe(CancelSubscribe),
     CloseWith(Frame),
     Close,
     Nothing,
@@ -107,6 +117,25 @@ pub(crate) struct OpDispatch {
     pub(crate) stream_id: u32,
     pub(crate) req: RequestBody,
     pub(crate) target_shard: u16,
+}
+
+pub(crate) struct SubscribeStart {
+    /// Stream id the SUBSCRIBE_REQ rode in on (and where SUBSCRIPTION_
+    /// EVENT frames flow out).
+    pub(crate) stream_id: u32,
+    pub(crate) req: brain_protocol::request::SubscribeRequest,
+    pub(crate) target_shard: u16,
+}
+
+pub(crate) enum CancelSubscribe {
+    Unsubscribe {
+        request_stream_id: u32,
+        req: brain_protocol::request::UnsubscribeRequest,
+    },
+    CancelStream {
+        request_stream_id: u32,
+        req: brain_protocol::request::CancelStreamRequest,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +202,33 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
                 &e.to_string(),
             ));
         }
+    };
+
+    // SUBSCRIBE / UNSUBSCRIBE / CANCEL_STREAM (sub-task 9.11) bypass
+    // the shard-dispatch path: they mutate the connection-layer
+    // SubscriptionRegistry rather than fanning a request to brain_ops.
+    let stream_id = frame.header.stream_id_u32();
+    let req = match req {
+        RequestBody::Subscribe(sub_req) => {
+            return Action::Subscribe(SubscribeStart {
+                stream_id,
+                req: sub_req,
+                target_shard: bound_shard,
+            });
+        }
+        RequestBody::Unsubscribe(un_req) => {
+            return Action::CancelSubscribe(CancelSubscribe::Unsubscribe {
+                request_stream_id: stream_id,
+                req: un_req,
+            });
+        }
+        RequestBody::CancelStream(c_req) => {
+            return Action::CancelSubscribe(CancelSubscribe::CancelStream {
+                request_stream_id: stream_id,
+                req: c_req,
+            });
+        }
+        other => other,
     };
 
     // Route + dispatch. Memory-bearing requests route to the memory's

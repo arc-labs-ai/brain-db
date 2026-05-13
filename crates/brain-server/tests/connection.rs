@@ -34,6 +34,8 @@ mod shard;
 #[allow(dead_code)]
 #[path = "../src/shard_adapters.rs"]
 mod shard_adapters;
+#[path = "../src/subscribe.rs"]
+mod subscribe;
 #[path = "../src/tls.rs"]
 mod tls;
 

@@ -61,6 +61,7 @@ use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
 use brain_ops::error::OpError;
+use brain_ops::subscribe::EventEnvelope;
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::request::RequestBody;
@@ -221,12 +222,28 @@ pub enum ShardOpError {
 pub struct ShardHandle {
     shard_id: ShardId,
     tx: Sender<ShardRequest>,
+    /// Cross-shard event-feed (sub-task 9.11). The shard's
+    /// `fanout_task` drains `OpsContext::events` (brain-ops's
+    /// in-process broadcast bus) and publishes each envelope through
+    /// this channel. The connection layer's `SubscriptionRegistry`
+    /// owns the single Receiver clone; per-subscription tasks
+    /// observe events via a connection-side `tokio::sync::broadcast`
+    /// bridge fed from this Receiver.
+    events: Receiver<EventEnvelope>,
 }
 
 impl ShardHandle {
     #[must_use]
     pub fn shard_id(&self) -> ShardId {
         self.shard_id
+    }
+
+    /// Per-shard event feed. Cloning the Receiver shares the underlying
+    /// queue (flume Receivers are SPMC-safe); the connection layer
+    /// typically clones once and bridges into a tokio `broadcast`.
+    #[must_use]
+    pub fn events(&self) -> Receiver<EventEnvelope> {
+        self.events.clone()
     }
 
     /// Round-trip Ping. Returns once the shard has replied.
@@ -516,6 +533,10 @@ pub fn spawn_shard(
 
     // ---- 5. Spawn the Glommio executor + build the rest of the stack -----
     let (tx, rx) = flume::bounded::<ShardRequest>(cfg.channel_capacity);
+    // 9.11 cross-shard event feed. The Glommio closure spawns a
+    // fanout_task that drains `ops.events` into this channel; the
+    // connection layer reads the Receiver via `ShardHandle::events()`.
+    let (events_tx, events_rx) = flume::bounded::<EventEnvelope>(1024);
     let placement = match cfg.pin_cpu {
         Some(cpu) => Placement::Fixed(cpu),
         None => Placement::Unbound,
@@ -540,6 +561,39 @@ pub fn spawn_shard(
             let executor_ctx =
                 ExecutorContext::new(dispatcher, hnsw_shared, metadata.clone(), writer);
             let ops = Arc::new(OpsContext::new(executor_ctx));
+
+            // Spawn the per-shard fanout task: drains the in-process
+            // broadcast EventBus (`ops.events`) into the cross-shard
+            // flume Sender we set up before entering the closure. The
+            // connection layer reads the matching Receiver via
+            // `ShardHandle::events()`. Spec audit §8.1.
+            //
+            // `tokio::sync::broadcast::Receiver` is runtime-agnostic
+            // (atomics + Waker, no tokio I/O); polling its `recv()`
+            // future inside Glommio is sound. `Lagged` is treated as
+            // a transient skip — slow subscribers see gaps, not
+            // crashes (spec §17.4).
+            {
+                let event_bus = ops.events.clone();
+                let events_tx = events_tx.clone();
+                glommio::spawn_local(async move {
+                    let mut rx = event_bus.receiver();
+                    loop {
+                        match rx.recv().await {
+                            Ok(env) => {
+                                if events_tx.send_async(env).await.is_err() {
+                                    // Connection layer dropped the Receiver
+                                    // (e.g. server shutting down).
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                })
+                .detach();
+            }
 
             // Open or create the WAL.
             let wal = if segments_present {
@@ -615,7 +669,11 @@ pub fn spawn_shard(
             shard_main_loop(shard, rx).await;
         })
         .map_err(|e| ShardError::Spawn(e.to_string()))?;
-    let handle = ShardHandle { shard_id, tx };
+    let handle = ShardHandle {
+        shard_id,
+        tx,
+        events: events_rx,
+    };
     let joiner = ShardJoiner {
         shard_id,
         handle: Some(join_handle),

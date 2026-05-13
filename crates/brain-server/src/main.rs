@@ -22,6 +22,8 @@ mod shard;
 #[allow(dead_code)] // adapters wired into the per-shard scheduler in 9.8.
 mod shard_adapters;
 #[cfg(target_os = "linux")]
+mod subscribe;
+#[cfg(target_os = "linux")]
 mod tls;
 
 use std::env;

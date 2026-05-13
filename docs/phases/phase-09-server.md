@@ -189,6 +189,32 @@ under `<data_dir>/<shard_id>/`; persists UUID across restarts; stub
   `routing.shard_for_agent(agent_id)`; 39 brain-server tests pass
   (+10 dispatch integration tests on top of 9.9's 35).
 
+### Task 9.11 — Cross-shard SUBSCRIBE fan-out  [x]
+**Reads:** plan `phase-09-task-11.md`, `spec/09_cognitive_operations/09_subscribe.md`,
+  `spec/03_wire_protocol/05_opcodes.md` §1.3, `spec/03_wire_protocol/09_streaming.md`,
+  audit `docs/phases/phase-09-glommio-port.md` §8.1.
+**Writes:** `crates/brain-server/src/subscribe.rs` (new — `ShardEventHub`,
+  `SubscriptionRegistry`, per-sub task);
+  `crates/brain-server/src/shard.rs` (`ShardHandle::events()` flume
+  Receiver; Glommio closure spawns a `fanout_task` draining
+  `OpsContext::events`);
+  `crates/brain-server/src/dispatch.rs` (`Action::Subscribe` /
+  `Action::CancelSubscribe` variants, dispatch_frame routes SUBSCRIBE
+  / UNSUBSCRIBE / CANCEL_STREAM through registry);
+  `crates/brain-server/src/connection.rs` (`ShardEventHub` field on
+  `ConnectionListener`; per-conn `SubscriptionRegistry` in
+  `serve_connection`; new helpers);
+  `crates/brain-ops/src/{lib,subscribe}.rs` (`parse_filter` made
+  public);
+  `crates/brain-server/tests/subscribe.rs` (new — 5 integration tests).
+**Done when:** Clients can SUBSCRIBE post-AUTH and receive
+  SUBSCRIBE_EVENT frames on the chosen stream; UNSUBSCRIBE +
+  CANCEL_STREAM both emit acks on their own stream + a final EOS on
+  the subscription stream; `from_lsn` rejected as `LsnTooOld`;
+  duplicate stream_id rejected; 5 subscribe integration tests pass on
+  top of 9.9/9.10's existing wire tests. Audit §8.1 status row →
+  **done**.
+
 ### Task 9.5 — Cross-shard routing  [x]
 > Landed early as **sub-task 9.3** per the orientation's renumbering.
 > See `crates/brain-server/src/routing.rs`.

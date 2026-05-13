@@ -50,7 +50,12 @@ use tracing::{debug, info, warn};
 pub use crate::dispatch::Topology;
 
 use crate::dispatch::{
-    build_server_ping_frame, dispatch_frame, run_op_dispatch, Action, ConnState, IdleTimer, Tick,
+    build_server_ping_frame, dispatch_frame, run_op_dispatch, Action, CancelSubscribe, ConnState,
+    IdleTimer, SubscribeStart, Tick,
+};
+use crate::subscribe::{
+    build_cancel_stream_ack_frame, build_unsubscribe_response_frame, ShardEventHub,
+    SubscriptionRegistry,
 };
 
 // ---------------------------------------------------------------------------
@@ -148,6 +153,12 @@ pub struct ConnectionListener {
     listen_addr: SocketAddr,
     tls: Option<Arc<ServerConfig>>,
     topology: Topology,
+    /// Cross-shard event hub (sub-task 9.11). Built once per listener
+    /// at construction time; spawns one bridge task per shard that
+    /// drains the shard's per-process flume Receiver into a
+    /// `broadcast::Sender`. Per-connection `SubscriptionRegistry`s
+    /// subscribe to the right shard's broadcast.
+    event_hub: ShardEventHub,
     limits: ConnectionLimits,
     shutdown: ShutdownSignal,
 }
@@ -159,6 +170,7 @@ pub struct BoundConnectionListener {
     local_addr: SocketAddr,
     tls: Option<Arc<ServerConfig>>,
     topology: Topology,
+    event_hub: ShardEventHub,
     limits: ConnectionLimits,
     shutdown: ShutdownSignal,
 }
@@ -171,10 +183,16 @@ impl ConnectionListener {
         limits: ConnectionLimits,
         shutdown: ShutdownSignal,
     ) -> Self {
+        // Spawn the per-shard event bridge tasks now so every
+        // connection sees the same hub. The bridges live for the
+        // lifetime of the process (or until the shards' flume
+        // Receivers return Err — i.e., shard shutdown).
+        let event_hub = ShardEventHub::spawn(&topology.shards);
         Self {
             listen_addr,
             tls,
             topology,
+            event_hub,
             limits,
             shutdown,
         }
@@ -196,6 +214,7 @@ impl ConnectionListener {
             local_addr,
             tls: self.tls,
             topology: self.topology,
+            event_hub: self.event_hub,
             limits: self.limits,
             shutdown: self.shutdown,
         })
@@ -244,18 +263,25 @@ impl BoundConnectionListener {
                     let shutdown = self.shutdown.clone();
                     let limits = self.limits.clone();
                     let topology = self.topology.clone();
+                    let event_hub = self.event_hub.clone();
                     tokio::spawn(async move {
                         let result = match acceptor {
                             Some(acceptor) => match acceptor.accept(stream).await {
                                 Ok(tls_stream) => {
-                                    serve_connection(tls_stream, topology, limits, shutdown).await
+                                    serve_connection(
+                                        tls_stream, topology, event_hub, limits, shutdown,
+                                    )
+                                    .await
                                 }
                                 Err(e) => {
                                     debug!(peer = %peer, error = %e, "TLS handshake failed");
                                     return;
                                 }
                             },
-                            None => serve_connection(stream, topology, limits, shutdown).await,
+                            None => {
+                                serve_connection(stream, topology, event_hub, limits, shutdown)
+                                    .await
+                            }
                         };
                         if let Err(e) = result {
                             debug!(peer = %peer, error = %e, "connection ended");
@@ -291,6 +317,7 @@ impl BoundConnectionListener {
 pub(crate) async fn serve_connection<S>(
     stream: S,
     topology: Topology,
+    event_hub: ShardEventHub,
     limits: ConnectionLimits,
     shutdown: ShutdownSignal,
 ) -> io::Result<()>
@@ -301,12 +328,18 @@ where
     let (frame_tx, frame_rx) = flume::bounded::<OutgoingFrame>(limits.outgoing_capacity);
     let writer = tokio::spawn(writer_loop(write_half, frame_rx));
 
+    // Sub-task 9.11: each connection gets its own SubscriptionRegistry.
+    // It reuses the listener-wide `ShardEventHub` to subscribe to per-
+    // shard broadcasts.
+    let subscriptions = Arc::new(SubscriptionRegistry::new(event_hub));
+
     let result = receiver_loop(
         &mut read_half,
         &topology,
         &limits,
         shutdown,
         frame_tx.clone(),
+        subscriptions,
     )
     .await;
 
@@ -323,9 +356,9 @@ where
 // One outgoing frame: bytes pre-encoded, with an optional "close after
 // this frame" hint that lets the writer loop tear down on the right
 // frame (BYE, fatal ERROR).
-struct OutgoingFrame {
-    bytes: Vec<u8>,
-    close_after: bool,
+pub(crate) struct OutgoingFrame {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) close_after: bool,
 }
 
 async fn writer_loop<W>(mut write: W, rx: flume::Receiver<OutgoingFrame>)
@@ -353,6 +386,7 @@ async fn receiver_loop<R>(
     limits: &ConnectionLimits,
     mut shutdown: ShutdownSignal,
     frame_tx: flume::Sender<OutgoingFrame>,
+    subscriptions: Arc<SubscriptionRegistry>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -433,6 +467,22 @@ where
                                     }).await;
                                 });
                             }
+                            Action::Subscribe(start) => {
+                                handle_subscribe_start(
+                                    start,
+                                    &subscriptions,
+                                    &frame_tx,
+                                )
+                                .await;
+                            }
+                            Action::CancelSubscribe(c) => {
+                                handle_cancel_subscribe(
+                                    c,
+                                    &subscriptions,
+                                    &frame_tx,
+                                )
+                                .await;
+                            }
                             Action::CloseWith(frame) => {
                                 let _ = frame_tx.send_async(OutgoingFrame {
                                     bytes: frame.encode(),
@@ -483,6 +533,78 @@ fn build_close_error_frame_with_category(
         retry_after_ms: None,
     });
     Frame::new(Opcode::Error.as_u8(), 0, 0, body.encode())
+}
+
+// ---------------------------------------------------------------------------
+// SUBSCRIBE / UNSUBSCRIBE / CANCEL_STREAM helpers (sub-task 9.11)
+// ---------------------------------------------------------------------------
+
+async fn handle_subscribe_start(
+    start: SubscribeStart,
+    subscriptions: &Arc<SubscriptionRegistry>,
+    frame_tx: &flume::Sender<OutgoingFrame>,
+) {
+    let SubscribeStart {
+        stream_id,
+        req,
+        target_shard,
+    } = start;
+    match subscriptions.start(stream_id, target_shard, &req, frame_tx.clone()) {
+        Ok(_) => {
+            // Subscription established. Per-sub task is running; it
+            // will start emitting SUBSCRIBE_EVENT frames as events
+            // arrive. 9.11 doesn't send a synchronous opener frame
+            // (the wire protocol doesn't require one); the client
+            // observes the first event when it lands.
+        }
+        Err(e) => {
+            let frame = e.to_error_frame(stream_id);
+            let _ = frame_tx
+                .send_async(OutgoingFrame {
+                    bytes: frame.encode(),
+                    close_after: false,
+                })
+                .await;
+        }
+    }
+}
+
+async fn handle_cancel_subscribe(
+    c: CancelSubscribe,
+    subscriptions: &Arc<SubscriptionRegistry>,
+    frame_tx: &flume::Sender<OutgoingFrame>,
+) {
+    let (request_stream_id, target_stream_id, reply_frame) = match c {
+        CancelSubscribe::Unsubscribe {
+            request_stream_id,
+            req,
+        } => {
+            let target = req.target_stream_id;
+            let final_lsn = subscriptions.cancel(target).unwrap_or(0);
+            let frame = build_unsubscribe_response_frame(request_stream_id, &req, final_lsn);
+            (request_stream_id, target, frame)
+        }
+        CancelSubscribe::CancelStream {
+            request_stream_id,
+            req,
+        } => {
+            let target = req.target_stream_id;
+            subscriptions.cancel(target);
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            let frame = build_cancel_stream_ack_frame(request_stream_id, &req, now_ns);
+            (request_stream_id, target, frame)
+        }
+    };
+    let _ = (request_stream_id, target_stream_id);
+    let _ = frame_tx
+        .send_async(OutgoingFrame {
+            bytes: reply_frame.encode(),
+            close_after: false,
+        })
+        .await;
 }
 
 // ---------------------------------------------------------------------------
