@@ -24,6 +24,8 @@ mod shard;
 #[allow(dead_code)] // adapters wired into the per-shard scheduler in 9.8.
 mod shard_adapters;
 #[cfg(target_os = "linux")]
+mod shutdown;
+#[cfg(target_os = "linux")]
 mod subscribe;
 #[cfg(target_os = "linux")]
 mod tls;
@@ -144,6 +146,12 @@ mod linux_main {
             vec![AuthMethod::None],
         ));
 
+        // Keep an extra `Arc<Vec<ShardHandle>>` clone outside the
+        // runtime so sub-task 9.14's `graceful_shutdown_shards` can
+        // drop it (and thereby close every shard's request channel)
+        // after the connection + admin servers have exited.
+        let shards_for_drain = shards.clone();
+
         let topology = Topology {
             shards,
             routing,
@@ -213,31 +221,69 @@ mod linux_main {
             };
             tracing::info!(addr = %bound.local_addr(), "brain-server listening");
 
-            let serve_rc = match bound.serve().await {
-                Ok(addr) => {
-                    tracing::info!(addr = %addr, "connection listener exited cleanly");
+            // Sub-task 9.14: spawn the listener as a JoinHandle so we
+            // can `await` it deterministically, then drain the admin
+            // server with a bounded budget. Both servers observe the
+            // same `ShutdownSignal` clone, so a single SIGINT/SIGTERM
+            // brings them both down.
+            let listener_handle = tokio::spawn(async move { bound.serve().await });
+
+            let serve_rc = match listener_handle.await {
+                Ok(Ok(addr)) => {
+                    tracing::info!(addr = %addr, "connection listener drained");
                     ExitCode::SUCCESS
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::error!(error = %e, "connection listener failed");
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "connection listener task panicked");
                     ExitCode::FAILURE
                 }
             };
 
-            // Await the admin server's exit too; both observe the
-            // same shutdown signal, so this completes promptly.
-            let _ = admin_handle.await;
-            serve_rc
+            // Bounded wait for the admin server to observe the same
+            // signal and exit. 2s is generous — the accept loop's
+            // shutdown arm resolves immediately.
+            let admin_rc =
+                match tokio::time::timeout(std::time::Duration::from_secs(2), admin_handle).await {
+                    Ok(Ok(Ok(_))) => ExitCode::SUCCESS,
+                    Ok(Ok(Err(e))) => {
+                        tracing::error!(error = %e, "admin server failed");
+                        ExitCode::FAILURE
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, "admin server task panicked");
+                        ExitCode::FAILURE
+                    }
+                    Err(_) => {
+                        tracing::error!("admin server drain timed out");
+                        ExitCode::FAILURE
+                    }
+                };
+
+            if serve_rc == ExitCode::SUCCESS {
+                admin_rc
+            } else {
+                serve_rc
+            }
         });
 
-        // Drain shard executors. 9.14 layers a structured shutdown over
-        // this; 9.10 just joins to keep the binary clean.
-        for joiner in joiners {
-            if let Err(e) = joiner.join() {
-                tracing::warn!(error = %e, "shard joiner failed");
-            }
+        // Phase B (outside the Tokio runtime): close every shard's
+        // request channel, then join each `ShardJoiner` with a per-
+        // shard timeout. Sub-task 9.14.
+        let shard_rc = crate::shutdown::graceful_shutdown_shards(
+            shards_for_drain,
+            joiners,
+            crate::shutdown::DEFAULT_SHARD_DRAIN_BUDGET,
+        );
+
+        if rc == ExitCode::SUCCESS {
+            shard_rc
+        } else {
+            rc
         }
-        rc
     }
 
     /// Spawn one shard per `cfg.storage.shard_count`. Returns the
@@ -266,14 +312,41 @@ mod linux_main {
 
     fn spawn_signal_listener(trigger: ShutdownTrigger) {
         tokio::spawn(async move {
-            // 9.14 will own the full SIGINT/SIGTERM lifecycle; 9.9 wires
-            // a minimal ctrl-c handler so a developer can shut the
-            // server down cleanly from a terminal.
-            if let Err(e) = tokio::signal::ctrl_c().await {
-                tracing::error!(error = %e, "ctrl_c handler installation failed");
-                return;
+            // Sub-task 9.14: handle both SIGINT (ctrl-c) and SIGTERM.
+            // SIGTERM is what process supervisors (systemd, k8s, docker
+            // stop) send first; SIGKILL follows if we don't exit fast.
+            // We install SIGTERM via tokio::signal::unix; if that
+            // fails (rare — restricted containers / non-Linux
+            // libc), fall back to SIGINT-only.
+            use tokio::signal::unix::{signal, SignalKind};
+            let sigterm_result = signal(SignalKind::terminate());
+            match sigterm_result {
+                Ok(mut sigterm) => {
+                    tokio::select! {
+                        r = tokio::signal::ctrl_c() => {
+                            if let Err(e) = r {
+                                tracing::error!(error = %e, "ctrl_c handler failed");
+                            } else {
+                                tracing::info!("SIGINT received; signalling shutdown");
+                            }
+                        }
+                        _ = sigterm.recv() => {
+                            tracing::info!("SIGTERM received; signalling shutdown");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "SIGTERM handler install failed; SIGINT-only",
+                    );
+                    if let Err(e) = tokio::signal::ctrl_c().await {
+                        tracing::error!(error = %e, "ctrl_c handler failed");
+                    } else {
+                        tracing::info!("SIGINT received; signalling shutdown");
+                    }
+                }
             }
-            tracing::info!("ctrl-c received; signalling shutdown");
             trigger.signal();
         });
     }

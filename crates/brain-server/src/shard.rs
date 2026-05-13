@@ -374,6 +374,13 @@ pub struct ShardJoiner {
 }
 
 impl ShardJoiner {
+    /// The shard this joiner belongs to. Used by sub-task 9.14's
+    /// `graceful_shutdown_shards` for per-shard timeout logging.
+    #[must_use]
+    pub fn shard_id(&self) -> ShardId {
+        self.shard_id
+    }
+
     /// Block the current thread until the shard's executor exits.
     pub fn join(mut self) -> Result<(), ShardError> {
         let Some(h) = self.handle.take() else {

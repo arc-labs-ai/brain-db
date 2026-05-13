@@ -277,10 +277,31 @@ under `<data_dir>/<shard_id>/`; persists UUID across restarts; stub
   hand-rolled HTTP parser rejects non-GET and unknown paths with
   400; 5 integration tests pass.
 
-### Task 9.9 — Graceful shutdown
-**Reads:** `spec/01_system_architecture/04_layers.md` (if present)
-**Writes:** `crates/brain-server/src/shutdown.rs`
-**Done when:** SIGINT/SIGTERM triggers: stop accepting; drain in-flight; flush WAL; close storage; exit clean.
+### Task 9.14 — Graceful shutdown  [x]
+> Was numbered 9.9 in the phase doc originally; orientation §11
+> renumbered to 9.14.
+
+**Reads:** plan `phase-09-task-14.md`,
+  `spec/01_system_architecture/04_layers.md`,
+  audit `docs/phases/phase-09-glommio-port.md` §8.2.
+**Writes:** `crates/brain-server/src/shutdown.rs` (new —
+  `graceful_shutdown_shards` with per-shard timed `join()`);
+  `crates/brain-server/src/main.rs` (`spawn_signal_listener`
+  handles SIGINT *and* SIGTERM via `tokio::signal::unix`; falls
+  back to SIGINT-only if SIGTERM install fails;
+  `linux_main::run` keeps a `shards_for_drain` clone, spawns the
+  listener as a `JoinHandle`, awaits listener + admin under a
+  2 s drain bound, then calls
+  `graceful_shutdown_shards(..., DEFAULT_SHARD_DRAIN_BUDGET=30s)`);
+  `crates/brain-server/src/shard.rs` (`ShardJoiner::shard_id()`
+  accessor); `crates/brain-server/tests/shutdown.rs` (new — 3
+  integration tests).
+**Done when:** SIGINT *and* SIGTERM fire the same `ShutdownSignal`;
+  exit ordering is deterministic (accept loops exit → tasks drain
+  → shards close → joiners run with a per-shard timeout);
+  `ExitCode::FAILURE` surfaces if any drain phase times out
+  (observability-friendly); 3 integration tests pass + all prior
+  wire tests still pass.
 
 ### Task 9.10 — End-to-end smoke test
 **Writes:** `crates/brain-server/tests/e2e.rs`
