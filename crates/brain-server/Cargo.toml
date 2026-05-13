@@ -11,6 +11,14 @@ description = "The Brain cognitive substrate server."
 name = "brain-server"
 path = "src/main.rs"
 
+[features]
+default = []
+# Sub-task 9.15 — feature-gated LLM summarizers. Both pull `reqwest`
+# (with rustls-tls, reusing 9.9's vendored stack). Default off: the
+# substrate works without consolidation per spec §11/03 §6.
+summarizer-openai = ["reqwest", "serde_json"]
+summarizer-ollama = ["reqwest", "serde_json"]
+
 [dependencies]
 # Brain crate dependencies are added in later Phase 9 sub-tasks as each one
 # is wired in (e.g. 9.4 shards → brain-storage; 9.5 metadata → brain-metadata,
@@ -24,6 +32,8 @@ blake3.workspace = true
 flume.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
+serde_json = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true

@@ -303,6 +303,30 @@ under `<data_dir>/<shard_id>/`; persists UUID across restarts; stub
   (observability-friendly); 3 integration tests pass + all prior
   wire tests still pass.
 
+### Task 9.15 — OpenAI / Ollama Summarizer adapter (feature-gated)  [x]
+**Reads:** plan `phase-09-task-15.md`,
+  `spec/11_background_workers/03_consolidation.md` §6, §7,
+  `spec/11_background_workers/09_failure_modes.md` §6.
+**Writes:** `crates/brain-server/src/llm/{mod,prompt,bridge,openai,ollama,factory}.rs`
+  (new module tree); `crates/brain-server/src/config.rs`
+  (`SummarizerConfig` + `SummarizerBackend`); `config/dev.toml`
+  (new `[summarizer] backend = "disabled"` section);
+  `crates/brain-server/Cargo.toml` (`summarizer-openai` +
+  `summarizer-ollama` Cargo features; optional `reqwest` +
+  `serde_json` deps); workspace `Cargo.toml` (`reqwest` 0.12 with
+  rustls-tls); `crates/brain-server/src/shard.rs`
+  (`ShardSpawnConfig.summarizer`; `register_phase8_workers` takes
+  `Arc<dyn Summarizer>`); `crates/brain-server/src/main.rs`
+  (`build_summarizer(&cfg)` once at startup, cloned into each shard);
+  `crates/brain-server/tests/summarizer.rs` (new — 6 mock-server
+  integration tests).
+**Done when:** `cfg.summarizer.backend = "openai"` /  `"ollama"`
+  constructs a real `Arc<dyn Summarizer>` backed by a shared
+  bridge Tokio runtime (avoids the Glommio↔Tokio reactor collision);
+  default `disabled` keeps `DisabledSummarizer`; feature-gated tests
+  exercise round-trip + 4xx error mapping against a hand-rolled
+  mock HTTP server.
+
 ### Task 9.10 — End-to-end smoke test
 **Writes:** `crates/brain-server/tests/e2e.rs`
 **What to build:**

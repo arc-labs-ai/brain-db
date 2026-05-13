@@ -79,7 +79,8 @@ use brain_workers::{
     AccessBoostWorker, CacheEvictionWorker, ConsolidationWorker, CounterReconcileWorker,
     DecayWorker, DisabledCacheEvictionSource, DisabledSummarizer, EdgeScrubWorker,
     HnswMaintenanceWorker, IdempotencyCleanupWorker, MetricsSnapshot, SlotReclamationWorker,
-    SnapshotWorker, StatisticsUpdateWorker, WalRetentionWorker, WorkerKind, WorkerScheduler,
+    SnapshotWorker, StatisticsUpdateWorker, Summarizer, WalRetentionWorker, WorkerKind,
+    WorkerScheduler,
 };
 
 use crate::shard_adapters::{ArenaRebuildSource, ShardSnapshotSource, WalDirRetentionSource};
@@ -124,7 +125,10 @@ pub(crate) enum ShardRequest {
 // Spawn config
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+/// `Debug` was dropped in 9.15 — `Arc<dyn Summarizer>` doesn't
+/// implement `Debug`. Tests that previously printed the spawn
+/// config can format individual fields directly.
+#[derive(Clone)]
 pub struct ShardSpawnConfig {
     pub channel_capacity: usize,
     pub pin_cpu: Option<usize>,
@@ -135,6 +139,11 @@ pub struct ShardSpawnConfig {
     pub arena_initial_capacity_slots: u64,
     /// WAL configuration (group commit window, segment size limit, ...).
     pub wal_config: WalConfig,
+    /// Consolidation worker's Summarizer (sub-task 9.15). Defaults to
+    /// [`DisabledSummarizer`] so existing tests + non-LLM deployments
+    /// keep working. `main.rs::linux_main::run` injects an LLM-backed
+    /// impl when `cfg.summarizer.backend != Disabled`.
+    pub summarizer: Arc<dyn Summarizer>,
 }
 
 impl ShardSpawnConfig {
@@ -147,6 +156,7 @@ impl ShardSpawnConfig {
             data_dir: data_dir.into(),
             arena_initial_capacity_slots: DEFAULT_INITIAL_CAPACITY_SLOTS,
             wal_config: WalConfig::default(),
+            summarizer: Arc::new(DisabledSummarizer),
         }
     }
 }
@@ -455,9 +465,9 @@ impl Dispatcher for NopDispatcher {
 /// Register every Phase-8 worker against `scheduler`. Sub-task 9.8
 /// plugs in real adapters for `RebuildSource`, `WalRetentionSource`,
 /// and `SnapshotSource`. `CacheEvictionSource` stays `Disabled*` until
-/// 9.10 wires a real `CachingDispatcher` per shard. The
-/// [`brain_workers::Summarizer`] seam stays `DisabledSummarizer` until
-/// 9.15 (OpenAI/Ollama adapter).
+/// 9.10 wires a real `CachingDispatcher` per shard. Sub-task 9.15
+/// surfaces the `Summarizer` parameter so `main.rs` can inject an
+/// OpenAI / Ollama adapter when configured.
 fn register_phase8_workers(
     scheduler: &mut WorkerScheduler,
     ops: Arc<OpsContext>,
@@ -465,13 +475,11 @@ fn register_phase8_workers(
     wal_retention_source: Arc<dyn WalRetentionSource>,
     snapshot_source: Arc<dyn SnapshotSource>,
     cache_eviction_source: Arc<dyn CacheEvictionSource>,
+    summarizer: Arc<dyn Summarizer>,
 ) -> Result<(), brain_workers::WorkerError> {
     scheduler.register(Arc::new(AccessBoostWorker::new()), ops.clone())?;
     scheduler.register(Arc::new(DecayWorker::new()), ops.clone())?;
-    scheduler.register(
-        Arc::new(ConsolidationWorker::new(Arc::new(DisabledSummarizer))),
-        ops.clone(),
-    )?;
+    scheduler.register(Arc::new(ConsolidationWorker::new(summarizer)), ops.clone())?;
     scheduler.register(
         Arc::new(HnswMaintenanceWorker::new(rebuild_source)),
         ops.clone(),
@@ -572,6 +580,7 @@ pub fn spawn_shard(
         None => Placement::Unbound,
     };
     let wal_config = cfg.wal_config;
+    let summarizer = cfg.summarizer;
     let wal_dir_for_executor = wal_dir.clone();
     let arena_path_for_executor = arena_path.clone();
     let metadata_path_for_executor = metadata_path.clone();
@@ -680,6 +689,7 @@ pub fn spawn_shard(
                 wal_retention_source,
                 snapshot_source,
                 cache_eviction_source,
+                summarizer,
             )
             .expect("register Phase-8 workers");
             info!(

@@ -31,6 +31,11 @@ pub struct Config {
     pub tracing: TracingConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    /// Sub-task 9.15. Defaulted so existing `dev.toml` files keep
+    /// working (consolidation remains disabled until an LLM backend
+    /// is wired).
+    #[serde(default)]
+    pub summarizer: SummarizerConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -152,6 +157,97 @@ impl Default for AuthConfig {
 pub enum AuthMode {
     None,
     ApiKey,
+}
+
+// ----------------------------------------------------------------------------
+// Summarizer (sub-task 9.15)
+// ----------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SummarizerBackend {
+    /// Spec §11/03 §6 default: consolidation worker is a no-op.
+    Disabled,
+    /// Chat Completions over HTTPS. Requires `summarizer-openai` feature.
+    Openai,
+    /// Ollama's `/api/generate` over plain HTTP. Requires
+    /// `summarizer-ollama` feature.
+    Ollama,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SummarizerConfig {
+    /// Which backend to use. Defaults to `disabled`.
+    #[serde(default = "default_backend")]
+    pub backend: SummarizerBackend,
+    /// HTTP request timeout (seconds). Applied to every LLM round-trip.
+    #[serde(default = "default_request_timeout_sec")]
+    pub request_timeout_sec: u32,
+    /// Soft cap on summary length. Translates to roughly
+    /// `max_summary_chars / 4` tokens on the OpenAI side. Ollama
+    /// ignores it (no spec-level token cap).
+    #[serde(default = "default_max_summary_chars")]
+    pub max_summary_chars: u32,
+
+    // OpenAI-specific knobs. Read only when `backend == Openai`.
+    #[serde(default = "default_openai_api_base")]
+    pub openai_api_base: String,
+    /// Name of the env var holding the API key. We never store the
+    /// key itself in TOML — operators set the env var.
+    #[serde(default)]
+    pub openai_api_key_env: Option<String>,
+    #[serde(default = "default_openai_model")]
+    pub openai_model: String,
+    #[serde(default = "default_temperature")]
+    pub openai_temperature: f32,
+
+    // Ollama-specific knobs.
+    #[serde(default = "default_ollama_base")]
+    pub ollama_base: String,
+    #[serde(default = "default_ollama_model")]
+    pub ollama_model: String,
+}
+
+impl Default for SummarizerConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_backend(),
+            request_timeout_sec: default_request_timeout_sec(),
+            max_summary_chars: default_max_summary_chars(),
+            openai_api_base: default_openai_api_base(),
+            openai_api_key_env: None,
+            openai_model: default_openai_model(),
+            openai_temperature: default_temperature(),
+            ollama_base: default_ollama_base(),
+            ollama_model: default_ollama_model(),
+        }
+    }
+}
+
+fn default_backend() -> SummarizerBackend {
+    SummarizerBackend::Disabled
+}
+fn default_request_timeout_sec() -> u32 {
+    30
+}
+fn default_max_summary_chars() -> u32 {
+    4096
+}
+fn default_openai_api_base() -> String {
+    "https://api.openai.com/v1".to_owned()
+}
+fn default_openai_model() -> String {
+    "gpt-4o-mini".to_owned()
+}
+fn default_temperature() -> f32 {
+    0.3
+}
+fn default_ollama_base() -> String {
+    "http://localhost:11434".to_owned()
+}
+fn default_ollama_model() -> String {
+    "llama3.1:8b".to_owned()
 }
 
 // ----------------------------------------------------------------------------

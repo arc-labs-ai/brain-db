@@ -53,3 +53,17 @@ sample_ratio = 0.01
 [auth]
 # Dev mode: no auth. Set this for production.
 mode = "none"
+
+[summarizer]
+# Sub-task 9.15. Consolidation worker stays a no-op until an LLM
+# backend is wired. Set to "openai" (build with --features
+# summarizer-openai) or "ollama" (--features summarizer-ollama).
+backend = "disabled"
+request_timeout_sec = 30
+max_summary_chars = 4096
+# OpenAI knobs — only used when backend = "openai".
+# openai_api_key_env = "OPENAI_API_KEY"
+# openai_model = "gpt-4o-mini"
+# Ollama knobs — only used when backend = "ollama".
+# ollama_base = "http://localhost:11434"
+# ollama_model = "llama3.1:8b"

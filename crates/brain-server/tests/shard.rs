@@ -85,11 +85,8 @@ async fn drop_last_handle_lets_joiner_complete() {
 async fn pin_to_invalid_cpu_errors() {
     let dir = TempDir::new().unwrap();
     let cfg = ShardSpawnConfig {
-        channel_capacity: 1024,
         pin_cpu: Some(usize::MAX),
-        data_dir: dir.path().to_owned(),
-        arena_initial_capacity_slots: 1024,
-        wal_config: Default::default(),
+        ..ShardSpawnConfig::new(dir.path().to_owned())
     };
     match spawn_shard(4, cfg) {
         Ok(_) => panic!("spawn should fail for invalid CPU id usize::MAX"),

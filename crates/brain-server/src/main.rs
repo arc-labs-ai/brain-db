@@ -16,6 +16,8 @@ mod config;
 mod connection;
 #[cfg(target_os = "linux")]
 mod dispatch;
+#[cfg(target_os = "linux")]
+mod llm;
 mod routing;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // consumed by the connection layer in sub-task 9.10.
@@ -119,10 +121,22 @@ mod linux_main {
     use crate::shard::{spawn_shard, ShardHandle, ShardJoiner, ShardSpawnConfig};
 
     pub fn run(cfg: Config) -> ExitCode {
+        // Sub-task 9.15: build the configured Summarizer (default
+        // `DisabledSummarizer`). Construction happens once and the
+        // resulting `Arc<dyn Summarizer>` is cloned into each shard's
+        // `ShardSpawnConfig` so all shards share one bridge runtime.
+        let summarizer = match crate::llm::factory::build_summarizer(&cfg) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "summarizer construction failed");
+                return ExitCode::FAILURE;
+            }
+        };
+
         // Sub-task 9.10: spawn one Glommio shard per `cfg.storage.shard_count`,
         // then build a `Topology` (shards + `RoutingTable` + `ServerCapabilities`)
         // and feed it into the `ConnectionListener`.
-        let (shards, joiners) = match spawn_shards(&cfg) {
+        let (shards, joiners) = match spawn_shards(&cfg, &summarizer) {
             Ok(pair) => pair,
             Err(rc) => return rc,
         };
@@ -289,11 +303,15 @@ mod linux_main {
     /// Spawn one shard per `cfg.storage.shard_count`. Returns the
     /// cloneable `Vec<ShardHandle>` for the listener + the `Vec<ShardJoiner>`
     /// to await on shutdown.
-    fn spawn_shards(cfg: &Config) -> Result<(Vec<ShardHandle>, Vec<ShardJoiner>), ExitCode> {
+    fn spawn_shards(
+        cfg: &Config,
+        summarizer: &Arc<dyn brain_workers::Summarizer>,
+    ) -> Result<(Vec<ShardHandle>, Vec<ShardJoiner>), ExitCode> {
         let mut handles = Vec::with_capacity(cfg.storage.shard_count);
         let mut joiners = Vec::with_capacity(cfg.storage.shard_count);
         for shard_id in 0..cfg.storage.shard_count {
-            let spawn_cfg = ShardSpawnConfig::new(cfg.storage.data_dir.clone());
+            let mut spawn_cfg = ShardSpawnConfig::new(cfg.storage.data_dir.clone());
+            spawn_cfg.summarizer = summarizer.clone();
             match spawn_shard(shard_id as u16, spawn_cfg) {
                 Ok((h, j)) => {
                     handles.push(h);
