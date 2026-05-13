@@ -11,6 +11,7 @@ use std::env;
 use std::process::ExitCode;
 
 use brain_cli::cli::{parse, Command};
+use brain_cli::commands::diagnostics::{debug_snapshot, profile};
 use brain_cli::commands::snapshot::SnapshotAction;
 use brain_cli::commands::{agent, audit, config, health, rebuild, shard, snapshot, stats, worker};
 
@@ -87,6 +88,22 @@ fn main() -> ExitCode {
         Command::Audit(action) => run_result(audit::run(&args.server, &action, args.output)),
         Command::Agent(action) => run_result(agent::run(&args.server, &action, args.output)),
         Command::Shard(action) => run_result(shard::run(&args.server, &action, args.output)),
+        Command::Profile {
+            shard,
+            duration_secs,
+            output_path,
+        } => run_result(profile::run(
+            &args.server,
+            shard,
+            duration_secs,
+            output_path.as_deref(),
+        )),
+        Command::DebugSnapshot { shard, output_path } => run_result(debug_snapshot::run(
+            &args.server,
+            shard,
+            output_path.as_deref(),
+            args.output,
+        )),
     }
 }
 
@@ -121,6 +138,8 @@ COMMANDS:
     audit query|export                        Audit log (deferred)
     agent list|stats|delete                   Agent operations (deferred)
     shard list|create|delete                  Shard operations (create/delete deferred)
+    profile [--duration-secs N] [--value P]   CPU profile (deferred)
+    debug-snapshot [--value PATH]             Runtime snapshot (partial schema)
 
 OPTIONS:
     --server <host:port>      Admin endpoint (default 127.0.0.1:9091)
@@ -133,10 +152,10 @@ OPTIONS:
     --since|--until|--agent   Audit query filters
     --logical-id <N>          Shard create
     --confirm                 Required for destructive commands
+    --duration-secs <N>       Profile capture duration (default 30)
+    --value <PATH>            Output-file path (debug-snapshot, profile)
     --version, -V             Print version
     --help, -h                Print this help
-
-10.12 will add: profile, debug-snapshot.
 
 See spec/14_observability_ops/06_admin_ops.md for the full surface.
 "

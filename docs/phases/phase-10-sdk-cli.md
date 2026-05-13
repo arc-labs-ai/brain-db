@@ -241,9 +241,21 @@ for the rest. CLI surfaces the marker uniformly and exits non-zero.
 - `phase-12/shard-create` and `phase-12/shard-delete` — cluster
   expansion / decommission.
 
-### Task 10.12 — `brain-cli profile`, `debug-snapshot`
-**Writes:** `crates/brain-cli/src/diagnostics.rs`
-**Done when:** Profile capture works (pprof format); debug snapshot writes JSON.
+### Task 10.12 — `brain-cli profile`, `debug-snapshot` [x]
+**Writes:** `crates/brain-cli/src/commands/diagnostics/`,
+`crates/brain-server/src/admin/diagnostics.rs`,
+`crates/brain-cli/tests/diagnostics.rs`.
+**Done when:** `debug-snapshot --shard N [--value PATH]` returns JSON
+from the admin server (v1 partial schema: workers populated;
+`partial:true` + `deferred[]` lists missing fields). `profile`
+returns the structured 501 marker. 6 new tests; `just docker-verify`
+green.
+**Deferred (per 501 marker / `deferred[]`):**
+- `phase-11/glommio-profiler` — real CPU profile capture for the
+  shard executor (operators use `perf` against the server PID today).
+- `active_tasks`, `pending_requests`, `recent_errors`,
+  `in_memory_state_summary` in `debug-snapshot` — future phases pop
+  entries from `deferred[]` as primitives land.
 
 ### Task 10.13 — SDK + CLI integration tests
 **Writes:** `tests/cli_e2e.rs` and `tests/sdk_e2e.rs` (workspace-level fixture project)

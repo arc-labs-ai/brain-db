@@ -29,6 +29,7 @@
 mod agent;
 mod audit;
 mod config_route;
+mod diagnostics;
 mod rebuild;
 mod shard_route;
 mod snapshot;
@@ -245,6 +246,9 @@ async fn serve_request(stream: TcpStream, state: Arc<AdminState>) -> io::Result<
         return res;
     }
     if let Some(res) = shard_route::dispatch(&mut stream, method, path, query, &state).await {
+        return res;
+    }
+    if let Some(res) = diagnostics::dispatch(&mut stream, method, path, query, &state).await {
         return res;
     }
 

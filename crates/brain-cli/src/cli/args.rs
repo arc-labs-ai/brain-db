@@ -44,6 +44,8 @@ pub struct FamilyFlags {
     pub agent: Option<String>,
     pub logical_id: Option<u16>,
     pub confirm: bool,
+    /// Sub-task 10.12 — `profile --duration-secs N`. Defaults to 30.
+    pub duration_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +68,17 @@ pub enum Command {
     Audit(crate::commands::audit::AuditAction),
     Agent(crate::commands::agent::AgentAction),
     Shard(crate::commands::shard::ShardAction),
+    /// Sub-task 10.12 — `profile --shard N [--duration-secs D] [--value PATH]`.
+    Profile {
+        shard: usize,
+        duration_secs: u32,
+        output_path: Option<String>,
+    },
+    /// Sub-task 10.12 — `debug-snapshot --shard N [--value PATH]`.
+    DebugSnapshot {
+        shard: usize,
+        output_path: Option<String>,
+    },
 }
 
 /// Parse a `Vec<String>` (typically `env::args().skip(1).collect()`).
@@ -152,6 +165,14 @@ pub fn parse(argv: Vec<String>) -> Result<Args> {
             "--confirm" => {
                 family.confirm = true;
             }
+            "--duration-secs" => {
+                i += 1;
+                let v = take_value("--duration-secs", &argv, i)?;
+                family.duration_secs = Some(
+                    v.parse::<u32>()
+                        .map_err(|e| anyhow!("invalid --duration-secs `{v}`: {e}"))?,
+                );
+            }
             other if other.starts_with("--") => {
                 return Err(anyhow!("unknown flag `{other}`"));
             }
@@ -191,6 +212,15 @@ pub fn parse(argv: Vec<String>) -> Result<Args> {
             use crate::commands::shard::ShardAction;
             Command::Shard(ShardAction::parse(&positional[1..], &family)?)
         }
+        Some("profile") => Command::Profile {
+            shard,
+            duration_secs: family.duration_secs.unwrap_or(30),
+            output_path: family.value.clone(),
+        },
+        Some("debug-snapshot") => Command::DebugSnapshot {
+            shard,
+            output_path: family.value.clone(),
+        },
         Some(other) => return Err(anyhow!("unknown subcommand `{other}`")),
     };
 

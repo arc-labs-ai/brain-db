@@ -26,3 +26,4 @@ serde_json.workspace = true
 [dev-dependencies]
 # Mock HTTP server for the integration tests.
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread"] }
+tempfile.workspace = true
