@@ -9,4 +9,8 @@ description = "Rust SDK for Brain clients."
 
 [dependencies]
 brain-core = { path = "../brain-core" }
+brain-protocol = { path = "../brain-protocol" }
 thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time", "sync"] }
+tracing.workspace = true
+uuid = { workspace = true, features = ["v7"] }

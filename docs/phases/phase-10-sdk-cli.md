@@ -30,10 +30,19 @@ Other-language SDKs (Python, TypeScript, Go) are deferred to v1.x.
 
 ## Sub-tasks
 
-### Task 10.1 — `Client` skeleton
-**Reads:** `spec/13_sdk_design/02_core_api.md`
-**Writes:** `crates/brain-sdk-rust/src/client.rs`
-**Done when:** `Client::connect(url).await?` returns a usable client; tests connect to a running server.
+### Task 10.1 — `Client` skeleton  [x]
+**Reads:** `spec/13_sdk_design/02_core_api.md`, `03_connection.md`,
+  `spec/03_wire_protocol/06_handshake.md`. Plan
+  `.claude/plans/phase-10-task-01.md`.
+**Writes:** `crates/brain-sdk-rust/src/{client,config,error,proto}/`
+  (folder-per-concern; only `lib.rs` at src root). Integration
+  test `tests/handshake.rs` uses a hand-rolled mock server (no
+  cross-crate dep on brain-server).
+**Done when:** `Client::connect(addr).await?` opens TCP, drives
+  spec §03/06 handshake (HELLO → WELCOME → AUTH → AUTH_OK), and
+  returns a usable client. `Client::bye(self)` performs the
+  spec §03/05 §1.1 echo-and-close. 8/8 tests pass (6 unit +
+  2 integration); docker-verify green.
 
 ### Task 10.2 — Connection pool
 **Reads:** `spec/13_sdk_design/03_connection.md`
