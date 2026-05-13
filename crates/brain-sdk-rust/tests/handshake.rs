@@ -171,7 +171,11 @@ async fn connects_completes_handshake() {
         .await
         .expect("connect should succeed");
 
-    let session = client.session();
+    let session = client
+        .session()
+        .await
+        .expect("session")
+        .expect("non-empty session");
     assert_eq!(
         session.welcome.chosen_version,
         brain_protocol::header::VERSION

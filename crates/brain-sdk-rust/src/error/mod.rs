@@ -43,6 +43,26 @@ pub enum ClientError {
     #[error("connection closed")]
     Closed,
 
+    /// The pool is at `max_connections`, no connection was freed
+    /// within `acquire_timeout`, and the request couldn't be
+    /// served. Distinct from a server-side overload (spec §13/03
+    /// §13).
+    #[error("client overloaded: {detail}")]
+    Overloaded {
+        /// Human-readable context (cap value, timeout duration).
+        detail: String,
+    },
+
+    /// The client/pool has been closed; further requests are
+    /// rejected.
+    #[error("pool closed")]
+    PoolClosed,
+
+    /// Catch-all for internal invariant failures (task join
+    /// errors, etc.). Should be rare.
+    #[error("internal error: {0}")]
+    Internal(String),
+
     /// Server returned an ERROR frame. The string carries the
     /// server's diagnostic message; consult [`code`] to dispatch
     /// programmatically.
@@ -72,11 +92,14 @@ impl ClientError {
     /// Whether retrying the same request is safe.
     ///
     /// Per spec §13/04 §3, retryable failures are: `Overloaded`,
-    /// transient network errors. 10.1 returns conservatively
-    /// `false`; 10.3 refines this with the full mapping.
+    /// transient network errors. 10.2 adds `Overloaded`; 10.3
+    /// refines this with the full mapping.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Connect(_) | Self::Io(_))
+        matches!(
+            self,
+            Self::Connect(_) | Self::Io(_) | Self::Overloaded { .. }
+        )
     }
 }
 

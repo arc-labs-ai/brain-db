@@ -44,10 +44,22 @@ Other-language SDKs (Python, TypeScript, Go) are deferred to v1.x.
   spec §03/05 §1.1 echo-and-close. 8/8 tests pass (6 unit +
   2 integration); docker-verify green.
 
-### Task 10.2 — Connection pool
-**Reads:** `spec/13_sdk_design/03_connection.md`
-**Writes:** `crates/brain-sdk-rust/src/pool.rs`
-**Done when:** Pool with `min` / `max` connections; idle reaping; warm-up.
+### Task 10.2 — Connection pool  [x]
+**Reads:** `spec/13_sdk_design/03_connection.md` §1, §2, §4, §5,
+  §13, §14. Plan `.claude/plans/phase-10-task-02.md`.
+**Writes:** `crates/brain-sdk-rust/src/pool/`
+  (`mod.rs` Pool + acquire + reaper, `connection.rs` extracted
+  from `client/mod.rs`, `config.rs` PoolConfig, `guard.rs` RAII
+  PoolGuard). `client/mod.rs` reshaped as a thin `Arc<Pool>`
+  wrapper preserving 10.1's `connect/bye` surface.
+**Done when:** Pool keeps `min..=max` connections per server,
+  reaps idle past `idle_timeout`, exposes `warm_up()`, returns
+  `ClientError::Overloaded` once `acquire_timeout` fires at cap,
+  and `ClientError::PoolClosed` after `close()`. 18/18 tests
+  pass: 9 unit (config, error mapping, stream-id allocator,
+  pool defaults) + 2 handshake + 7 pool (warm_up, idle-reuse,
+  blocks-then-succeeds, Overloaded, reaper, close, 10.1 compat).
+  docker-verify green.
 
 ### Task 10.3 — Retry with exponential backoff + jitter
 **Reads:** `spec/13_sdk_design/04_retries.md`

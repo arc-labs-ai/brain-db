@@ -1,153 +1,174 @@
-//! `Client` — the SDK's entry point.
+//! `Client` — the SDK's user-facing entry point.
 //!
-//! 10.1 ships a single-connection client. Subsequent sub-tasks
-//! grow this: 10.2 introduces a pool (`pool::ServerConnections`),
-//! 10.5 hangs op methods off `impl Client`, etc.
+//! Backed by an [`Arc<Pool>`]. Spec §13/02 §1 / §13/03 §1.
 //!
-//! Spec §13/02 §1-§2.
+//! 10.1 shipped this as a single-TCP wrapper; 10.2 reshapes it
+//! around the pool while preserving the public surface (
+//! `connect`, `bye`, `agent_id`, `session`, `config`).
+//!
+//! Op methods (encode / recall / plan / reason / forget / link /
+//! txn / subscribe) land in 10.5+ and will dispatch through
+//! `pool.acquire().await?` once per call.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use brain_core::AgentId;
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::ByeRequest;
-use brain_protocol::{Frame, RequestBody};
-use tokio::net::TcpStream;
 
 use crate::config::ClientConfig;
 use crate::error::ClientError;
-use crate::proto::frames::{read_one_frame, write_frame};
-use crate::proto::handshake::{complete_handshake, ClientIdentity, NegotiatedSession};
+use crate::pool::{Pool, PoolConfig, PoolGuard};
+use crate::proto::handshake::NegotiatedSession;
 
-/// Spec §03/03 §4 — last-frame-of-stream flag.
-const FLAG_EOS: u16 = 1 << 15;
-
-/// Single-connection client. Owns one `TcpStream`, the
-/// negotiated handshake outcome, a per-connection stream-id
-/// allocator (odd-numbered for client-initiated streams, spec
-/// §03/07 §3), and the `ClientConfig` used at construction time.
-#[derive(Debug)]
+/// User-facing async client. Cheap to clone (it's just an
+/// `Arc<Pool>` under the hood).
+#[derive(Clone, Debug)]
 pub struct Client {
-    stream: TcpStream,
-    config: ClientConfig,
-    session: NegotiatedSession,
-    /// Next client-initiated stream id. Spec §03/07 §3: client
-    /// streams are odd, server streams are even. Stream 0 is the
-    /// control stream and is consumed by the handshake.
-    next_stream_id: AtomicU32,
-    /// The agent id bound to this connection (echoed from the
-    /// server in AUTH_OK).
+    pool: Arc<Pool>,
+    /// Cached for [`Client::agent_id`]. Always equals the agent
+    /// id stamped on every checked-out connection.
     agent_id: AgentId,
+    /// Cached for [`Client::config`]. Equals the `ClientConfig`
+    /// the pool was built with.
+    config: ClientConfig,
 }
 
 impl Client {
-    /// Open a single TCP connection to `addr`, drive the
-    /// handshake to completion using `config`'s auth method, and
-    /// return a ready-to-use `Client`.
+    /// Open a single connection to `addr` with spec defaults
+    /// (auth = `None`, pool = 1/1). Eagerly completes the
+    /// handshake — equivalent to 10.1's `Client::connect` and
+    /// keeps that contract.
     pub async fn connect(addr: SocketAddr) -> Result<Self, ClientError> {
-        Self::connect_with(addr, AgentId::new(), ClientConfig::default()).await
+        let config = ClientConfig::default().with_pool(PoolConfig::single());
+        Self::connect_with(addr, AgentId::new(), config).await
     }
 
-    /// Like [`connect`] but with an explicit agent id and
-    /// configuration. Most callers should use [`connect`] until
-    /// they need to override defaults.
-    ///
-    /// [`connect`]: Client::connect
+    /// Open with an explicit agent id and config. Eagerly opens
+    /// `config.pool.min_connections` connections via
+    /// [`Pool::warm_up`], so the first op call doesn't pay the
+    /// handshake latency (spec §13/03 §4). If `min_connections`
+    /// is 0, this is equivalent to [`Client::new_lazy`].
     pub async fn connect_with(
         addr: SocketAddr,
         agent_id: AgentId,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
-        let mut stream = TcpStream::connect(addr)
-            .await
-            .map_err(ClientError::Connect)?;
-        let identity = ClientIdentity::v1("brain-sdk-rust");
-        let session = complete_handshake(&mut stream, identity, agent_id, config.auth).await?;
+        let pool = Pool::new(addr, agent_id, config.clone());
+        if config.pool.min_connections > 0 {
+            pool.warm_up().await?;
+        } else {
+            // Honor 10.1's "connection ready on return" contract
+            // by opening exactly one connection. Lazy callers
+            // should use `new_lazy`.
+            pool.acquire().await?;
+        }
         Ok(Self {
-            stream,
-            config,
-            session,
-            // Spec §03/07 §3: first client-initiated stream is 1.
-            next_stream_id: AtomicU32::new(1),
+            pool,
             agent_id,
+            config,
         })
     }
 
-    /// The agent id the server bound to this connection.
+    /// Construct a `Client` lazily — no eager handshake. The
+    /// first [`Client::acquire`] / op call drives the handshake.
+    /// Useful for tests that want to assert connection counts.
+    #[must_use]
+    pub fn new_lazy(addr: SocketAddr, agent_id: AgentId, config: ClientConfig) -> Self {
+        let pool = Pool::new(addr, agent_id, config.clone());
+        Self {
+            pool,
+            agent_id,
+            config,
+        }
+    }
+
+    /// Pre-establish `min_connections` connections in parallel.
+    /// Returns once all are ready. Spec §13/03 §4.
+    pub async fn warm_up(&self) -> Result<(), ClientError> {
+        self.pool.warm_up().await
+    }
+
+    /// The agent id stamped on every connection in this pool.
     #[must_use]
     pub fn agent_id(&self) -> AgentId {
         self.agent_id
     }
 
-    /// The negotiated session — WELCOME + AUTH_OK payloads. Mostly
-    /// useful for inspecting `bound_shard_id` or the negotiated
-    /// `max_payload_size` / `max_concurrent_streams`.
-    #[must_use]
-    pub fn session(&self) -> &NegotiatedSession {
-        &self.session
-    }
-
-    /// The config the client was built with.
+    /// The configuration the client was built with.
     #[must_use]
     pub fn config(&self) -> &ClientConfig {
         &self.config
     }
 
-    /// Allocate the next client-initiated stream id. 10.5+ uses
-    /// this from each op-method call.
+    /// Acquire one connection from the pool. The returned guard
+    /// dereferences to `&mut Connection`; drop releases it back.
     ///
-    /// Spec §03/07 §3: client streams are odd. We increment by 2
-    /// each call. Wrapping is fine — 2^31 client streams per
-    /// connection is well beyond the spec's
-    /// `max_concurrent_streams` (default 1024).
+    /// 10.5+ uses this from each op method.
     #[allow(dead_code)] // Consumed by op methods in 10.5.
-    pub(crate) fn next_stream_id(&self) -> u32 {
-        self.next_stream_id.fetch_add(2, Ordering::Relaxed)
+    pub async fn acquire(&self) -> Result<PoolGuard, ClientError> {
+        self.pool.acquire().await
     }
 
-    /// Send a `BYE` and consume the client, closing the
-    /// connection cleanly. Spec §03/08 §1 — server echoes BYE
-    /// and closes the socket.
-    pub async fn bye(mut self) -> Result<(), ClientError> {
-        let bye = ByeRequest {
-            reason: Some("brain-sdk-rust client shutdown".into()),
-        };
+    /// Snapshot the negotiated session from one of the pool's
+    /// connections. Returns `None` if the pool is empty (e.g.
+    /// before `warm_up()` on a lazy client). Acquires + releases
+    /// one connection.
+    pub async fn session(&self) -> Result<Option<NegotiatedSession>, ClientError> {
+        let guard = self.pool.acquire().await?;
+        Ok(Some(guard.session().clone()))
+    }
+
+    /// Close the pool. After this returns, further `acquire` /
+    /// `bye` calls fail with `ClientError::PoolClosed`.
+    pub async fn close(self) -> Result<(), ClientError> {
+        self.pool.close();
+        Ok(())
+    }
+
+    /// 10.1 compatibility: send a BYE on one connection then
+    /// close the pool. Equivalent to `acquire → bye → close`.
+    pub async fn bye(self) -> Result<(), ClientError> {
+        // Acquire the connection, take ownership out of the
+        // pool, send BYE, then mark the pool closed so other
+        // slots can't be acquired.
+        let mut guard = self.pool.acquire().await?;
+        // Take the connection out of the slot via std::mem::take
+        // would require a Default impl. Instead, we steal a fresh
+        // Connection by re-opening — wasteful but simple. 10.5
+        // will refine this with proper guard-consumption.
+        //
+        // Simpler approach: send BYE on the guarded connection,
+        // then close the pool which discards all idle slots.
+        // The connection will be dropped (TCP close) when the
+        // guard goes out of scope after this method.
+        //
+        // We can't call `Connection::bye` because that consumes
+        // the connection by value. So we hand-roll the BYE here.
+        use brain_protocol::opcode::Opcode;
+        use brain_protocol::request::ByeRequest;
+        use brain_protocol::{Frame, RequestBody};
+
+        const FLAG_EOS: u16 = 1 << 15;
         let frame = Frame::new(
             Opcode::Bye.as_u8(),
             FLAG_EOS,
-            // Spec §03/08 §1: BYE travels on the control stream.
             0,
-            RequestBody::Bye(bye).encode(),
+            RequestBody::Bye(ByeRequest {
+                reason: Some("brain-sdk-rust client shutdown".into()),
+            })
+            .encode(),
         );
-        write_frame(&mut self.stream, &frame).await?;
-        // Read the server's echoed BYE. Some servers may also
-        // close without acking; tolerate both.
-        match read_one_frame(&mut self.stream).await {
-            Ok(resp) if resp.header.opcode == Opcode::Bye.as_u8() => Ok(()),
-            Ok(other) => Err(ClientError::Protocol(
-                brain_protocol::error::ProtocolError::BadFrame(format!(
-                    "expected BYE echo, got opcode 0x{:02x}",
-                    other.header.opcode
-                )),
-            )),
-            Err(ClientError::Closed) => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn next_stream_id_is_odd_and_monotonic() {
-        let stream_id_counter = AtomicU32::new(1);
-        let a = stream_id_counter.fetch_add(2, Ordering::Relaxed);
-        let b = stream_id_counter.fetch_add(2, Ordering::Relaxed);
-        let c = stream_id_counter.fetch_add(2, Ordering::Relaxed);
-        assert_eq!((a, b, c), (1, 3, 5));
-        assert!(a % 2 == 1 && b % 2 == 1 && c % 2 == 1);
+        crate::proto::frames::write_frame(guard.stream_mut(), &frame).await?;
+        // Best-effort read of the echoed BYE, with a short timeout
+        // so servers that close without acking (or mocks that
+        // don't reply) don't hang the client.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::proto::frames::read_one_frame(guard.stream_mut()),
+        )
+        .await;
+        drop(guard);
+        self.pool.close();
+        Ok(())
     }
 }

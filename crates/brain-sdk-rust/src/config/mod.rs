@@ -8,6 +8,8 @@ use std::time::Duration;
 
 pub use brain_protocol::handshake::AuthMethod;
 
+use crate::pool::PoolConfig;
+
 /// Spec §13/02 §14 default request timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Spec §13/02 §14 default retry attempts. 10.3 wires the actual
@@ -33,6 +35,8 @@ pub struct ClientConfig {
     pub retries: u32,
     /// Initial backoff before the first retry. 10.3 enforces it.
     pub backoff_initial: Duration,
+    /// Connection-pool sizing + idle reaping. See [`PoolConfig`].
+    pub pool: PoolConfig,
 }
 
 impl Default for ClientConfig {
@@ -42,6 +46,7 @@ impl Default for ClientConfig {
             timeout: DEFAULT_TIMEOUT,
             retries: DEFAULT_RETRIES,
             backoff_initial: DEFAULT_BACKOFF_INITIAL,
+            pool: PoolConfig::default(),
         }
     }
 }
@@ -78,6 +83,13 @@ impl ClientConfig {
     #[must_use]
     pub fn with_backoff_initial(mut self, backoff_initial: Duration) -> Self {
         self.backoff_initial = backoff_initial;
+        self
+    }
+
+    /// Override the pool configuration.
+    #[must_use]
+    pub fn with_pool(mut self, pool: PoolConfig) -> Self {
+        self.pool = pool;
         self
     }
 }

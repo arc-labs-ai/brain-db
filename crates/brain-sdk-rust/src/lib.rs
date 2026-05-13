@@ -35,9 +35,11 @@
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod pool;
 pub mod proto;
 
 pub use client::Client;
 pub use config::{AuthMethod, ClientConfig};
 pub use error::ClientError;
+pub use pool::{Connection, Pool, PoolConfig, PoolGuard};
 pub use proto::handshake::{ClientIdentity, NegotiatedSession};

@@ -436,6 +436,7 @@ version = "0.1.0"
 dependencies = [
  "brain-core",
  "brain-protocol",
+ "parking_lot",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
