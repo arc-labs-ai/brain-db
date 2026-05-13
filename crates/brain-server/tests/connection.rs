@@ -10,20 +10,24 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use brain_protocol::error::ErrorCode;
 use brain_protocol::opcode::Opcode;
-use brain_protocol::response::{ErrorCodeWire, ResponseBody};
 use brain_protocol::Frame;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 // shard.rs uses `crate::shard_adapters::…`. connection.rs uses
-// `crate::shard::ShardHandle`. Pull all four source files into the
-// test binary so `crate::` resolves the same as in main.rs. The
-// connection tests don't exercise shard/shard_adapters surface;
-// silence dead-code noise from this perspective.
+// `crate::dispatch::…`. Pull every source file the connection layer
+// reaches into the test binary so `crate::` resolves the same as in
+// main.rs. The connection tests don't exercise the shard / adapter /
+// dispatch surface directly; silence dead-code noise.
+#[allow(dead_code)]
 #[path = "../src/connection.rs"]
 mod connection;
+#[path = "../src/dispatch.rs"]
+mod dispatch;
+#[allow(dead_code)]
+#[path = "../src/routing.rs"]
+mod routing;
 #[allow(dead_code)]
 #[path = "../src/shard.rs"]
 mod shard;
@@ -33,7 +37,9 @@ mod shard_adapters;
 #[path = "../src/tls.rs"]
 mod tls;
 
-use connection::{ConnectionLimits, ConnectionListener, ShutdownSignal, ShutdownTrigger};
+use brain_protocol::handshake::{AuthMethod, ServerCapabilities};
+use connection::{ConnectionLimits, ConnectionListener, ShutdownSignal, ShutdownTrigger, Topology};
+use routing::RoutingTable;
 use shard::ShardHandle;
 use tls::load_server_tls_config;
 
@@ -60,6 +66,19 @@ impl Server {
     }
 }
 
+fn empty_topology() -> Topology {
+    Topology {
+        shards: Arc::new(Vec::<ShardHandle>::new()),
+        routing: Arc::new(
+            RoutingTable::new(1, std::collections::HashMap::new()).expect("routing table"),
+        ),
+        server_caps: Arc::new(ServerCapabilities::v1_default(
+            "brain-server/test",
+            vec![AuthMethod::None],
+        )),
+    }
+}
+
 async fn start(
     tls: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
     limits: ConnectionLimits,
@@ -68,7 +87,7 @@ async fn start(
     let listener = ConnectionListener::new(
         "127.0.0.1:0".parse().unwrap(),
         tls,
-        Arc::new(Vec::<ShardHandle>::new()),
+        empty_topology(),
         limits,
         signal,
     );
@@ -97,33 +116,29 @@ async fn bind_and_accept_succeeds() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn well_formed_frame_gets_error_response_and_close() {
+async fn ping_works_pre_handshake_and_keeps_connection_alive() {
+    // PING is a stream_id=0 control frame; spec §03/06 doesn't gate it
+    // behind AUTH_OK. The frame dispatcher (9.10) replies with PONG and
+    // resets the idle timer. After the reply, the connection stays
+    // open — the handshake-deadline timer kicks in eventually, but
+    // a follow-up PING within the auth_timeout works.
     let server = start(None, ConnectionLimits::default()).await;
 
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    // Wire-shape-valid PING frame. 9.9 stub responds with ERROR.
-    let frame = Frame::new(Opcode::Ping.as_u8(), 0, 0, Vec::new());
+    let ping = brain_protocol::request::PingRequest {
+        client_timestamp_unix_nanos: 1234,
+    };
+    let body = brain_protocol::request::RequestBody::Ping(ping);
+    let frame = Frame::new(Opcode::Ping.as_u8(), 1 << 15, 0, body.encode());
     client.write_all(&frame.encode()).await.expect("send");
     client.flush().await.expect("flush");
 
     let resp = read_one_frame(&mut client).await.expect("read response");
-    assert_eq!(resp.header.opcode, Opcode::Error.as_u8());
-    let body = ResponseBody::decode(Opcode::Error, &resp.payload).expect("decode error");
-    let err = match body {
-        ResponseBody::Error(e) => e,
-        other => panic!("expected Error body, got {other:?}"),
-    };
-    assert_eq!(err.code, ErrorCodeWire::from(ErrorCode::BadFrame));
-    assert!(
-        err.message.contains("9.10") || err.message.to_lowercase().contains("dispatch"),
-        "error message should reference dispatcher: {:?}",
-        err.message
+    assert_eq!(
+        resp.header.opcode,
+        Opcode::Pong.as_u8(),
+        "PING should return PONG, not ERROR"
     );
-
-    // Server closed: subsequent read returns EOF.
-    let mut sink = [0u8; 1];
-    let n = client.read(&mut sink).await.expect("read EOF");
-    assert_eq!(n, 0, "expected EOF after error frame");
 
     server.stop().await;
 }
@@ -158,8 +173,8 @@ async fn bad_magic_closes_connection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_timeout_closes_silent_connection() {
     let limits = ConnectionLimits {
-        max_payload_bytes: brain_protocol::MAX_PAYLOAD_BYTES as u32,
         read_timeout: Duration::from_millis(150),
+        ..ConnectionLimits::default()
     };
     let server = start(None, limits).await;
 

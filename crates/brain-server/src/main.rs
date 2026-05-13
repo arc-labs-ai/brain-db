@@ -12,7 +12,8 @@
 mod config;
 #[cfg(target_os = "linux")]
 mod connection;
-#[allow(dead_code)] // consumed by the frame dispatcher in sub-task 9.10.
+#[cfg(target_os = "linux")]
+mod dispatch;
 mod routing;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // consumed by the connection layer in sub-task 9.10.
@@ -98,16 +99,50 @@ fn main() -> ExitCode {
 
 #[cfg(target_os = "linux")]
 mod linux_main {
+    use std::collections::HashMap;
     use std::process::ExitCode;
     use std::sync::Arc;
 
+    use brain_protocol::handshake::{AuthMethod, ServerCapabilities};
+
     use super::config::Config;
     use crate::connection::{
-        ConnectionLimits, ConnectionListener, ShutdownSignal, ShutdownTrigger,
+        ConnectionLimits, ConnectionListener, ShutdownSignal, ShutdownTrigger, Topology,
     };
-    use crate::shard::ShardHandle;
+    use crate::routing::RoutingTable;
+    use crate::shard::{spawn_shard, ShardHandle, ShardJoiner, ShardSpawnConfig};
 
     pub fn run(cfg: Config) -> ExitCode {
+        // Sub-task 9.10: spawn one Glommio shard per `cfg.storage.shard_count`,
+        // then build a `Topology` (shards + `RoutingTable` + `ServerCapabilities`)
+        // and feed it into the `ConnectionListener`.
+        let (shards, joiners) = match spawn_shards(&cfg) {
+            Ok(pair) => pair,
+            Err(rc) => return rc,
+        };
+        let shards = Arc::new(shards);
+
+        let routing = match RoutingTable::new(cfg.storage.shard_count as u16, HashMap::new()) {
+            Ok(t) => Arc::new(t),
+            Err(e) => {
+                tracing::error!(error = %e, "RoutingTable construction failed");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        // v1 dev policy: accept `AuthMethod::None`. Real auth backends
+        // (token / mTLS) land post-Phase-9.
+        let server_caps = Arc::new(ServerCapabilities::v1_default(
+            format!("brain-server/{}", env!("CARGO_PKG_VERSION")),
+            vec![AuthMethod::None],
+        ));
+
+        let topology = Topology {
+            shards,
+            routing,
+            server_caps,
+        };
+
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("brain-conn")
@@ -120,15 +155,9 @@ mod linux_main {
             }
         };
 
-        runtime.block_on(async move {
+        let rc = runtime.block_on(async move {
             let (trigger, signal) = ShutdownSignal::channel();
             spawn_signal_listener(trigger);
-
-            // 9.10 will spawn the per-shard Glommio executors here and
-            // pass the resulting `Vec<ShardHandle>` into the listener.
-            // 9.9 ships only the connection plumbing; the shard handles
-            // vector is empty for now.
-            let shards: Arc<Vec<ShardHandle>> = Arc::new(Vec::new());
 
             let tls = match build_tls(&cfg) {
                 Ok(t) => t,
@@ -138,7 +167,7 @@ mod linux_main {
             let listener = ConnectionListener::new(
                 cfg.server.listen_addr,
                 tls,
-                shards,
+                topology,
                 ConnectionLimits::default(),
                 signal,
             );
@@ -161,7 +190,40 @@ mod linux_main {
                     ExitCode::FAILURE
                 }
             }
-        })
+        });
+
+        // Drain shard executors. 9.14 layers a structured shutdown over
+        // this; 9.10 just joins to keep the binary clean.
+        for joiner in joiners {
+            if let Err(e) = joiner.join() {
+                tracing::warn!(error = %e, "shard joiner failed");
+            }
+        }
+        rc
+    }
+
+    /// Spawn one shard per `cfg.storage.shard_count`. Returns the
+    /// cloneable `Vec<ShardHandle>` for the listener + the `Vec<ShardJoiner>`
+    /// to await on shutdown.
+    fn spawn_shards(cfg: &Config) -> Result<(Vec<ShardHandle>, Vec<ShardJoiner>), ExitCode> {
+        let mut handles = Vec::with_capacity(cfg.storage.shard_count);
+        let mut joiners = Vec::with_capacity(cfg.storage.shard_count);
+        for shard_id in 0..cfg.storage.shard_count {
+            let spawn_cfg = ShardSpawnConfig::new(cfg.storage.data_dir.clone());
+            match spawn_shard(shard_id as u16, spawn_cfg) {
+                Ok((h, j)) => {
+                    handles.push(h);
+                    joiners.push(j);
+                }
+                Err(e) => {
+                    tracing::error!(shard_id, error = %e, "failed to spawn shard");
+                    // Best-effort: drop the handles we have; ShardJoiners
+                    // will warn on drop without `join()` (9.14 cleans up).
+                    return Err(ExitCode::FAILURE);
+                }
+            }
+        }
+        Ok((handles, joiners))
     }
 
     fn spawn_signal_listener(trigger: ShutdownTrigger) {

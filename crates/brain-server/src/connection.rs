@@ -40,14 +40,18 @@ use brain_protocol::opcode::Opcode;
 use brain_protocol::response::{ErrorCategoryWire, ErrorCodeWire, ErrorResponse, ResponseBody};
 use brain_protocol::{Frame, HEADER_SIZE, MAX_PAYLOAD_BYTES};
 use socket2::{SockRef, TcpKeepalive};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::watch;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
-use crate::shard::ShardHandle;
+pub use crate::dispatch::Topology;
+
+use crate::dispatch::{
+    build_server_ping_frame, dispatch_frame, run_op_dispatch, Action, ConnState, IdleTimer, Tick,
+};
 
 // ---------------------------------------------------------------------------
 // Shutdown signal
@@ -112,6 +116,16 @@ pub struct ConnectionLimits {
     /// are kept; the deadline is enforced per `read_one_frame` call. A
     /// connection that goes silent mid-frame is closed.
     pub read_timeout: Duration,
+    /// Spec §03/06 §6.3 — interval before AUTH must arrive after WELCOME.
+    pub auth_timeout: Duration,
+    /// Spec §03/02 §6.1 — idle window before the server emits SERVER_PING.
+    pub idle_timeout: Duration,
+    /// Spec §03/02 §6.1 — window for CLIENT_PONG to arrive after SERVER_PING.
+    pub ping_timeout: Duration,
+    /// Outgoing-frame channel capacity. Bounds memory under sustained
+    /// load; if the writer can't keep up, sub-tasks back-pressure on
+    /// `send_async` and the read loop naturally slows down.
+    pub outgoing_capacity: usize,
 }
 
 impl Default for ConnectionLimits {
@@ -119,6 +133,10 @@ impl Default for ConnectionLimits {
         Self {
             max_payload_bytes: MAX_PAYLOAD_BYTES as u32,
             read_timeout: Duration::from_secs(30),
+            auth_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(300),
+            ping_timeout: Duration::from_secs(30),
+            outgoing_capacity: 256,
         }
     }
 }
@@ -129,7 +147,7 @@ impl Default for ConnectionLimits {
 pub struct ConnectionListener {
     listen_addr: SocketAddr,
     tls: Option<Arc<ServerConfig>>,
-    shards: Arc<Vec<ShardHandle>>,
+    topology: Topology,
     limits: ConnectionLimits,
     shutdown: ShutdownSignal,
 }
@@ -140,8 +158,7 @@ pub struct BoundConnectionListener {
     listener: TcpListener,
     local_addr: SocketAddr,
     tls: Option<Arc<ServerConfig>>,
-    #[allow(dead_code)] // wired into the dispatcher in 9.10
-    shards: Arc<Vec<ShardHandle>>,
+    topology: Topology,
     limits: ConnectionLimits,
     shutdown: ShutdownSignal,
 }
@@ -150,14 +167,14 @@ impl ConnectionListener {
     pub fn new(
         listen_addr: SocketAddr,
         tls: Option<Arc<ServerConfig>>,
-        shards: Arc<Vec<ShardHandle>>,
+        topology: Topology,
         limits: ConnectionLimits,
         shutdown: ShutdownSignal,
     ) -> Self {
         Self {
             listen_addr,
             tls,
-            shards,
+            topology,
             limits,
             shutdown,
         }
@@ -178,7 +195,7 @@ impl ConnectionListener {
             listener,
             local_addr,
             tls: self.tls,
-            shards: self.shards,
+            topology: self.topology,
             limits: self.limits,
             shutdown: self.shutdown,
         })
@@ -226,18 +243,19 @@ impl BoundConnectionListener {
                     let acceptor = acceptor.clone();
                     let shutdown = self.shutdown.clone();
                     let limits = self.limits.clone();
+                    let topology = self.topology.clone();
                     tokio::spawn(async move {
                         let result = match acceptor {
                             Some(acceptor) => match acceptor.accept(stream).await {
                                 Ok(tls_stream) => {
-                                    serve_connection(tls_stream, limits, shutdown).await
+                                    serve_connection(tls_stream, topology, limits, shutdown).await
                                 }
                                 Err(e) => {
                                     debug!(peer = %peer, error = %e, "TLS handshake failed");
                                     return;
                                 }
                             },
-                            None => serve_connection(stream, limits, shutdown).await,
+                            None => serve_connection(stream, topology, limits, shutdown).await,
                         };
                         if let Err(e) = result {
                             debug!(peer = %peer, error = %e, "connection ended");
@@ -253,53 +271,192 @@ impl BoundConnectionListener {
 // Per-connection task
 // ---------------------------------------------------------------------------
 
-/// One connection's lifetime. Stub body for 9.9: any well-formed frame
-/// is answered with `ERROR(BadFrame, "9.10 not yet wired")` and the
-/// connection is closed. Decode failures emit a matching ERROR frame
-/// and close. 9.10 replaces the inner match with the real dispatcher.
+/// One connection's lifetime (sub-task 9.10). Splits the stream into
+/// reader + writer halves and runs three loops:
+///
+/// 1. **Reader** — pulls frames from the socket, decides via
+///    [`crate::dispatch::dispatch_frame`] whether to handle inline,
+///    spawn a per-op dispatch sub-task, or close. Drives the idle /
+///    auth timer in the same `select!`.
+/// 2. **Writer** — drains a per-connection `flume` queue and writes
+///    bytes to the socket.
+/// 3. **Op sub-tasks** — `tokio::spawn`-ed per data-plane request;
+///    await the shard reply, encode the response frame, push it into
+///    the writer queue.
+///
+/// The Tokio↔Glommio boundary lives in `ShardHandle::dispatch_op`
+/// (which sends through a `flume::Sender<ShardRequest>`). The
+/// per-connection task is fully Tokio-side; only the shard handler
+/// runs inside Glommio.
 pub(crate) async fn serve_connection<S>(
-    mut stream: S,
+    stream: S,
+    topology: Topology,
     limits: ConnectionLimits,
-    mut shutdown: ShutdownSignal,
+    shutdown: ShutdownSignal,
 ) -> io::Result<()>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    // 9.9: the stub closes after exactly one frame, so this `loop {}`
-    // never iterates. 9.10's real dispatcher keeps the loop and stops
-    // returning early on the success arm, at which point the iteration
-    // is meaningful. Keeping the structure now avoids a churn-only diff
-    // in 9.10.
-    #[allow(clippy::never_loop)]
+    let (mut read_half, write_half) = split(stream);
+    let (frame_tx, frame_rx) = flume::bounded::<OutgoingFrame>(limits.outgoing_capacity);
+    let writer = tokio::spawn(writer_loop(write_half, frame_rx));
+
+    let result = receiver_loop(
+        &mut read_half,
+        &topology,
+        &limits,
+        shutdown,
+        frame_tx.clone(),
+    )
+    .await;
+
+    // Dropping the last frame_tx closes the writer queue → writer_loop
+    // returns. (The op-dispatch sub-tasks each cloned the sender; we
+    // can't await them here because we'd block shutdown. They drop
+    // their senders as they complete, and the writer task awaits its
+    // own channel close cooperatively.)
+    drop(frame_tx);
+    let _ = writer.await;
+    result
+}
+
+// One outgoing frame: bytes pre-encoded, with an optional "close after
+// this frame" hint that lets the writer loop tear down on the right
+// frame (BYE, fatal ERROR).
+struct OutgoingFrame {
+    bytes: Vec<u8>,
+    close_after: bool,
+}
+
+async fn writer_loop<W>(mut write: W, rx: flume::Receiver<OutgoingFrame>)
+where
+    W: AsyncWrite + Unpin,
+{
+    while let Ok(out) = rx.recv_async().await {
+        if let Err(e) = write.write_all(&out.bytes).await {
+            debug!(error = %e, "writer flush failed");
+            break;
+        }
+        if let Err(e) = write.flush().await {
+            debug!(error = %e, "writer flush failed");
+            break;
+        }
+        if out.close_after {
+            break;
+        }
+    }
+}
+
+async fn receiver_loop<R>(
+    read: &mut R,
+    topology: &Topology,
+    limits: &ConnectionLimits,
+    mut shutdown: ShutdownSignal,
+    frame_tx: flume::Sender<OutgoingFrame>,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut state = ConnState::new();
+    let mut idle = IdleTimer::new(limits.idle_timeout, limits.ping_timeout);
+    let mut handshake_deadline = Some(tokio::time::Instant::now() + limits.auth_timeout);
+
     loop {
+        // Compute the next deadline: handshake timeout while pre-AUTH,
+        // idle / ping timeout post-AUTH.
+        let next_deadline = match handshake_deadline {
+            Some(d) => d,
+            None => idle.next_deadline(),
+        };
+
         tokio::select! {
             biased;
-            () = shutdown.recv() => {
-                return Ok(());
-            }
-            result = read_one_frame(&mut stream, limits.max_payload_bytes, limits.read_timeout) => {
-                match result {
-                    Ok(_frame) => {
-                        // 9.9 stub: accept the frame as wire-valid,
-                        // refuse to do anything with it, close.
-                        write_error_frame(
-                            &mut stream,
-                            ErrorCode::BadFrame,
-                            ErrorCategory::Protocol,
-                            "frame dispatcher not wired (sub-task 9.10)",
-                        )
-                        .await?;
+            () = shutdown.recv() => return Ok(()),
+            _ = tokio::time::sleep_until(next_deadline) => {
+                if handshake_deadline.is_some() {
+                    // Spec §03/06 §6.3 — auth timeout before AUTH_OK.
+                    let frame = build_close_error_frame(
+                        ErrorCode::Unauthenticated,
+                        "handshake timeout (no AUTH within auth_timeout)",
+                    );
+                    let _ = frame_tx.send_async(OutgoingFrame {
+                        bytes: frame.encode(),
+                        close_after: true,
+                    }).await;
+                    return Ok(());
+                }
+                match idle.fire() {
+                    Tick::SendPing => {
+                        let frame = build_server_ping_frame();
+                        if frame_tx.send_async(OutgoingFrame {
+                            bytes: frame.encode(),
+                            close_after: false,
+                        }).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Tick::Close => {
+                        // SERVER_PING went unanswered past ping_timeout.
                         return Ok(());
+                    }
+                }
+            }
+            result = read_one_frame(read, limits.max_payload_bytes, limits.read_timeout) => {
+                idle.on_frame_received();
+                match result {
+                    Ok(frame) => {
+                        let action = dispatch_frame(frame, &mut state, topology);
+                        // Once handshake is complete, drop the auth deadline.
+                        if matches!(
+                            state.phase,
+                            crate::dispatch::ConnPhase::Established { .. }
+                        ) {
+                            handshake_deadline = None;
+                        }
+                        match action {
+                            Action::Inline(frame) => {
+                                if frame_tx.send_async(OutgoingFrame {
+                                    bytes: frame.encode(),
+                                    close_after: false,
+                                }).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            Action::OpDispatch(op) => {
+                                let shards = topology.shards.clone();
+                                let tx = frame_tx.clone();
+                                tokio::spawn(async move {
+                                    let frame = run_op_dispatch(op, shards).await;
+                                    let _ = tx.send_async(OutgoingFrame {
+                                        bytes: frame.encode(),
+                                        close_after: false,
+                                    }).await;
+                                });
+                            }
+                            Action::CloseWith(frame) => {
+                                let _ = frame_tx.send_async(OutgoingFrame {
+                                    bytes: frame.encode(),
+                                    close_after: true,
+                                }).await;
+                                return Ok(());
+                            }
+                            Action::Close => return Ok(()),
+                            Action::Nothing => {}
+                        }
                     }
                     Err(FrameReadError::Eof) => return Ok(()),
                     Err(FrameReadError::Protocol(code, category, detail)) => {
-                        let _ = write_error_frame(&mut stream, code, category, &detail).await;
+                        let frame = build_close_error_frame_with_category(code, category, &detail);
+                        let _ = frame_tx.send_async(OutgoingFrame {
+                            bytes: frame.encode(),
+                            close_after: true,
+                        }).await;
                         return Ok(());
                     }
                     Err(FrameReadError::Timeout) => {
-                        // Per-frame deadline expired. Treat like EOF —
-                        // close quietly; 9.10's idle PING is the proper
-                        // application-level keepalive.
+                        // Per-frame read budget expired. Close quietly;
+                        // the idle/SERVER_PING path is for application-
+                        // level keepalive.
                         return Ok(());
                     }
                     Err(FrameReadError::Io(e)) => return Err(e),
@@ -307,6 +464,25 @@ where
             }
         }
     }
+}
+
+fn build_close_error_frame(code: ErrorCode, message: &str) -> Frame {
+    build_close_error_frame_with_category(code, code.category(), message)
+}
+
+fn build_close_error_frame_with_category(
+    code: ErrorCode,
+    category: ErrorCategory,
+    message: &str,
+) -> Frame {
+    let body = ResponseBody::Error(ErrorResponse {
+        code: ErrorCodeWire::from(code),
+        category: ErrorCategoryWire::from(category),
+        message: message.to_owned(),
+        details: None,
+        retry_after_ms: None,
+    });
+    Frame::new(Opcode::Error.as_u8(), 0, 0, body.encode())
 }
 
 // ---------------------------------------------------------------------------
@@ -392,31 +568,6 @@ where
     })?;
     debug_assert!(rest.is_empty(), "frame should consume the whole buffer");
     Ok(frame)
-}
-
-async fn write_error_frame<S>(
-    stream: &mut S,
-    code: ErrorCode,
-    category: ErrorCategory,
-    message: &str,
-) -> io::Result<()>
-where
-    S: tokio::io::AsyncWrite + Unpin,
-{
-    let body = ResponseBody::Error(ErrorResponse {
-        code: ErrorCodeWire::from(code),
-        category: ErrorCategoryWire::from(category),
-        message: message.to_owned(),
-        details: None,
-        retry_after_ms: None,
-    });
-    let payload = body.encode();
-    // stream_id = 0 — connection-level error (spec §03/03 §3.5).
-    let frame = Frame::new(Opcode::Error.as_u8(), 0, 0, payload);
-    let bytes = frame.encode();
-    stream.write_all(&bytes).await?;
-    stream.flush().await?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -13,8 +13,12 @@ use tempfile::TempDir;
 
 // shard.rs uses `crate::shard_adapters::…`; pull both source files into
 // the test binary so that `crate::` resolves the same as in main.rs.
+// The 9.10 `dispatch_op` surface is used only by `tests/dispatch.rs`;
+// silence the dead-code lint from this binary's perspective.
+#[allow(dead_code)]
 #[path = "../src/shard.rs"]
 mod shard;
+#[allow(dead_code)]
 #[path = "../src/shard_adapters.rs"]
 mod shard_adapters;
 

@@ -60,8 +60,11 @@ use brain_core::{ShardId, SlotVersion};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
+use brain_ops::error::OpError;
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
+use brain_protocol::request::RequestBody;
+use brain_protocol::response::ResponseBody;
 use brain_storage::arena::{
     AllocError, ArenaFile, ArenaOpenError, SlotAllocator, DEFAULT_INITIAL_CAPACITY_SLOTS,
 };
@@ -94,6 +97,13 @@ pub(crate) enum ShardRequest {
     /// Allocate a fresh slot. Returns `(slot_idx, slot_version)`.
     AllocSlot {
         reply_tx: Sender<Result<(u64, SlotVersion), ShardOpError>>,
+    },
+    /// Dispatch a wire `RequestBody` through `brain_ops::dispatch` and
+    /// return the resulting `ResponseBody`. Added in 9.10 — the
+    /// frame-dispatcher's primary boundary primitive.
+    DispatchOp {
+        req: Box<RequestBody>,
+        reply_tx: Sender<Result<ResponseBody, OpError>>,
     },
     /// Append a pre-built record to the WAL. Returns the durable LSN.
     /// Stub op for 9.6 — 9.7's `RealWriterHandle` wraps the real
@@ -262,6 +272,26 @@ impl ShardHandle {
             .map_err(|_| AppendWalError::ShardDisconnected)?
             .map_err(AppendWalError::Op)
     }
+
+    /// Dispatch a fully-decoded wire request through the shard's
+    /// `OpsContext`. Returns the wire `ResponseBody` (variant chosen by
+    /// `brain_ops::dispatch`). Added in 9.10 as the frame-dispatcher's
+    /// boundary primitive.
+    pub async fn dispatch_op(&self, req: RequestBody) -> Result<ResponseBody, DispatchError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::DispatchOp {
+                req: Box::new(req),
+                reply_tx,
+            })
+            .await
+            .map_err(|_| DispatchError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| DispatchError::ShardDisconnected)?
+            .map_err(DispatchError::Op)
+    }
 }
 
 /// Caller-facing error for [`ShardHandle::alloc_slot`]. Either the shard
@@ -281,6 +311,17 @@ pub enum AppendWalError {
     ShardDisconnected,
     #[error(transparent)]
     Op(#[from] ShardOpError),
+}
+
+/// Caller-facing error for [`ShardHandle::dispatch_op`]. Either the
+/// shard's request channel is closed (lifecycle) or `brain_ops::dispatch`
+/// returned a structured `OpError` (op-time).
+#[derive(Debug, thiserror::Error)]
+pub enum DispatchError {
+    #[error("shard has shut down or is unreachable")]
+    ShardDisconnected,
+    #[error(transparent)]
+    Op(#[from] OpError),
 }
 
 /// One-shot ownership of the shard's OS thread. Returned alongside
@@ -616,6 +657,22 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     warn!(
                         shard_id = shard.shard_id,
                         "AllocSlot reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::DispatchOp { req, reply_tx } => {
+                // `brain_ops::dispatch` is async and runs entirely
+                // within the per-shard Glommio executor: it touches
+                // `OpsContext` (which is !Send post-9.7a) and yields
+                // through Glommio-aware I/O. Awaiting here is sound —
+                // the main loop is single-threaded and processes one
+                // request at a time, the same shape as
+                // `AppendWalRecord`.
+                let out = brain_ops::dispatch::dispatch(*req, &shard.ops).await;
+                if reply_tx.send_async(out).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "DispatchOp reply dropped (caller gone)"
                     );
                 }
             }

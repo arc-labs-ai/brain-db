@@ -77,6 +77,7 @@ impl RoutingTable {
     }
 
     #[must_use]
+    #[allow(dead_code)] // surface for diagnostics / future 9.13 admin
     pub fn shard_count(&self) -> u16 {
         self.shard_count
     }

@@ -158,10 +158,36 @@ under `<data_dir>/<shard_id>/`; persists UUID across restarts; stub
   close (9.10 plugs in the real dispatcher); ctrl-c → ShutdownTrigger →
   serve() exits cleanly; 6 connection tests + workspace verify green.
 
-### Task 9.4 — Frame dispatcher
-**Reads:** `spec/01_system_architecture/04_layers.md`
-**Writes:** `crates/brain-server/src/dispatch.rs`
-**Done when:** Frame → opcode → shard (via routing) → handler → response. Errors mapped to wire error frames.
+### Task 9.10 — Frame dispatcher (Tokio↔Glommio boundary)  [x]
+> Was originally numbered 9.4 in this phase doc; orientation §11
+> renumbered after routing landed early as 9.3.
+
+**Reads:** plan `phase-09-task-10.md`, `spec/01_system_architecture/04_layers.md`,
+  `spec/03_wire_protocol/05_opcodes.md`, `spec/03_wire_protocol/06_handshake.md`,
+  `spec/03_wire_protocol/07_request_frames.md` + `08_response_frames.md`,
+  `spec/03_wire_protocol/09_streaming.md` §1–§5,
+  `spec/12_sharding_clustering/02_routing.md`,
+  audit `docs/phases/phase-09-glommio-port.md` §7.
+**Writes:** `crates/brain-server/src/dispatch.rs` (new — `ConnPhase` state
+  machine, handshake / PING / BYE handlers, `Topology`, op routing,
+  `IdleTimer` + `Tick`, OpError→wire mapping);
+  `crates/brain-server/src/connection.rs` (rewritten `serve_connection`
+  with reader/writer split via `tokio::io::split`, per-conn flume queue,
+  `tokio::spawn`-ed op sub-tasks; handshake deadline + idle timer arms);
+  `crates/brain-server/src/shard.rs` (`ShardRequest::DispatchOp`,
+  `ShardHandle::dispatch_op`, `DispatchError`);
+  `crates/brain-server/src/main.rs` (Linux path now spawns N shards,
+  builds `RoutingTable` + `ServerCapabilities` + `Topology`, joins
+  shards on shutdown);
+  `crates/brain-server/tests/dispatch.rs` (new — 10 integration tests).
+**Done when:** TCP/TLS clients can complete HELLO/WELCOME/AUTH/AUTH_OK,
+  send ENCODE / FORGET / RECALL / PLAN / REASON / LINK / UNLINK /
+  TXN_* opcodes and receive a wire-shaped response (single-frame EOS
+  in 9.10; multi-frame streaming is 9.11); PING→PONG, BYE→BYE, and
+  idle SERVER_PING all work; per-frame and handshake timeouts fire;
+  ops routed via `MemoryId.shard()` (where applicable) or
+  `routing.shard_for_agent(agent_id)`; 39 brain-server tests pass
+  (+10 dispatch integration tests on top of 9.9's 35).
 
 ### Task 9.5 — Cross-shard routing  [x]
 > Landed early as **sub-task 9.3** per the orientation's renumbering.
