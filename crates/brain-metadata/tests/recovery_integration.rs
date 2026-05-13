@@ -70,8 +70,22 @@ impl Env {
         }
     }
 
-    fn open_wal(&self) -> Wal {
-        Wal::create(&self.wal_dir, SHARD_UUID).expect("create wal")
+    /// Write `records` to a fresh WAL in this env, then cleanly shut down.
+    /// Hosts the async WAL ops on a per-call Glommio executor.
+    fn write_wal_records(&self, records: Vec<WalRecord>) {
+        let wal_dir = self.wal_dir.clone();
+        glommio::LocalExecutorBuilder::default()
+            .name("metadata-test-wal")
+            .spawn(move || async move {
+                let wal = Wal::create(&wal_dir, SHARD_UUID).await.expect("create wal");
+                for r in records {
+                    wal.append(r).await.expect("append");
+                }
+                wal.shutdown().await.expect("shutdown");
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 
     fn open_meta(&self) -> MetadataDb {
@@ -141,13 +155,10 @@ fn scenario_a_basic_write_then_recover() {
     let p1 = encode_payload(1, 1);
     let p2 = encode_payload(2, 2);
 
-    {
-        let mut wal = env.open_wal();
-        wal.append(record(WalPayload::Encode(p1.clone()), T0))
-            .unwrap();
-        wal.append(record(WalPayload::Encode(p2.clone()), T0 + 1))
-            .unwrap();
-        wal.append(record(
+    env.write_wal_records(vec![
+        record(WalPayload::Encode(p1.clone()), T0),
+        record(WalPayload::Encode(p2.clone()), T0 + 1),
+        record(
             WalPayload::Link(LinkPayload {
                 source: id1,
                 target: id2,
@@ -156,10 +167,8 @@ fn scenario_a_basic_write_then_recover() {
                 origin: EdgeOrigin::Explicit,
             }),
             T0 + 2,
-        ))
-        .unwrap();
-        wal.shutdown().unwrap();
-    }
+        ),
+    ]);
 
     // Crash + recover.
     let mut arena = env.open_arena();
@@ -211,38 +220,27 @@ fn scenario_a_basic_write_then_recover() {
 fn scenario_b_checkpoint_shortens_replay() {
     let env = Env::new();
 
-    {
-        let mut wal = env.open_wal();
-        // LSN 1, 2: encodes
-        wal.append(record(WalPayload::Encode(encode_payload(1, 1)), T0))
-            .unwrap();
-        wal.append(record(WalPayload::Encode(encode_payload(2, 2)), T0 + 1))
-            .unwrap();
-        // LSN 3, 4: checkpoint (durable_lsn = 4)
-        wal.append(record(
+    env.write_wal_records(vec![
+        record(WalPayload::Encode(encode_payload(1, 1)), T0),
+        record(WalPayload::Encode(encode_payload(2, 2)), T0 + 1),
+        record(
             WalPayload::CheckpointBegin(CheckpointBeginPayload {
                 checkpoint_id: 1,
                 started_at_unix_nanos: T0 + 2,
             }),
             T0 + 2,
-        ))
-        .unwrap();
-        wal.append(record(
+        ),
+        record(
             WalPayload::CheckpointEnd(CheckpointEndPayload {
                 checkpoint_id: 1,
                 durable_lsn: 4,
                 arena_capacity: 1024,
             }),
             T0 + 3,
-        ))
-        .unwrap();
-        // LSN 5, 6: post-checkpoint encodes
-        wal.append(record(WalPayload::Encode(encode_payload(3, 3)), T0 + 4))
-            .unwrap();
-        wal.append(record(WalPayload::Encode(encode_payload(4, 4)), T0 + 5))
-            .unwrap();
-        wal.shutdown().unwrap();
-    }
+        ),
+        record(WalPayload::Encode(encode_payload(3, 3)), T0 + 4),
+        record(WalPayload::Encode(encode_payload(4, 4)), T0 + 5),
+    ]);
 
     // First recover: durable_lsn=0, all 6 records applied.
     {
@@ -300,52 +298,39 @@ fn scenario_c_txn_commit_vs_abort() {
     let txn_a = tid(1);
     let txn_b = tid(2);
 
-    {
-        let mut wal = env.open_wal();
-        wal.append(record(WalPayload::Encode(p_outside.clone()), T0))
-            .unwrap();
-
+    env.write_wal_records(vec![
+        record(WalPayload::Encode(p_outside.clone()), T0),
         // Committed bracket.
-        wal.append(record(
+        record(
             WalPayload::TxnBegin(TxnBeginPayload {
                 txn_id: txn_a,
                 expected_record_count: 2,
             }),
             T0 + 1,
-        ))
-        .unwrap();
-        wal.append(record(WalPayload::Encode(p_committed_a.clone()), T0 + 2))
-            .unwrap();
-        wal.append(record(WalPayload::Encode(p_committed_b.clone()), T0 + 3))
-            .unwrap();
-        wal.append(record(
+        ),
+        record(WalPayload::Encode(p_committed_a.clone()), T0 + 2),
+        record(WalPayload::Encode(p_committed_b.clone()), T0 + 3),
+        record(
             WalPayload::TxnCommit(TxnCommitPayload { txn_id: txn_a }),
             T0 + 4,
-        ))
-        .unwrap();
-
+        ),
         // Aborted bracket.
-        wal.append(record(
+        record(
             WalPayload::TxnBegin(TxnBeginPayload {
                 txn_id: txn_b,
                 expected_record_count: 1,
             }),
             T0 + 5,
-        ))
-        .unwrap();
-        wal.append(record(WalPayload::Encode(p_aborted.clone()), T0 + 6))
-            .unwrap();
-        wal.append(record(
+        ),
+        record(WalPayload::Encode(p_aborted.clone()), T0 + 6),
+        record(
             WalPayload::TxnAbort(TxnAbortPayload {
                 txn_id: txn_b,
                 reason_code: 0,
             }),
             T0 + 7,
-        ))
-        .unwrap();
-
-        wal.shutdown().unwrap();
-    }
+        ),
+    ]);
 
     let mut arena = env.open_arena();
     let mut meta = env.open_meta();
@@ -377,21 +362,17 @@ fn scenario_d_orphan_txn_at_tail() {
     let mut p_inside = encode_payload(7, 7);
     p_inside.memory_id = id_inside;
 
-    {
-        let mut wal = env.open_wal();
-        wal.append(record(
+    // No commit / abort — simulates a crash mid-txn.
+    env.write_wal_records(vec![
+        record(
             WalPayload::TxnBegin(TxnBeginPayload {
                 txn_id: tid(9),
                 expected_record_count: 1,
             }),
             T0,
-        ))
-        .unwrap();
-        wal.append(record(WalPayload::Encode(p_inside.clone()), T0 + 1))
-            .unwrap();
-        // No commit / abort — simulates a crash mid-txn.
-        wal.shutdown().unwrap();
-    }
+        ),
+        record(WalPayload::Encode(p_inside.clone()), T0 + 1),
+    ]);
 
     let mut arena = env.open_arena();
     let mut meta = env.open_meta();
@@ -419,17 +400,11 @@ fn scenario_d_orphan_txn_at_tail() {
 fn scenario_e_recover_is_idempotent() {
     let env = Env::new();
 
-    {
-        let mut wal = env.open_wal();
-        for i in 1..=3u64 {
-            wal.append(record(
-                WalPayload::Encode(encode_payload(i, i as u8)),
-                T0 + i,
-            ))
-            .unwrap();
-        }
-        wal.shutdown().unwrap();
-    }
+    env.write_wal_records(
+        (1..=3u64)
+            .map(|i| record(WalPayload::Encode(encode_payload(i, i as u8)), T0 + i))
+            .collect(),
+    );
 
     let mut arena = env.open_arena();
     let mut meta = env.open_meta();
@@ -475,27 +450,23 @@ fn scenario_e_recover_is_idempotent() {
 fn scenario_f_durable_lsn_survives_reopen() {
     let env = Env::new();
 
-    {
-        let mut wal = env.open_wal();
-        wal.append(record(
+    env.write_wal_records(vec![
+        record(
             WalPayload::CheckpointBegin(CheckpointBeginPayload {
                 checkpoint_id: 5,
                 started_at_unix_nanos: T0,
             }),
             T0,
-        ))
-        .unwrap();
-        wal.append(record(
+        ),
+        record(
             WalPayload::CheckpointEnd(CheckpointEndPayload {
                 checkpoint_id: 5,
                 durable_lsn: 17,
                 arena_capacity: 1024,
             }),
             T0 + 1,
-        ))
-        .unwrap();
-        wal.shutdown().unwrap();
-    }
+        ),
+    ]);
 
     {
         let mut arena = env.open_arena();
@@ -561,83 +532,118 @@ fn run_iteration(seed: u64) {
     let mut encoded_slots: Vec<u64> = Vec::new();
     let mut next_slot: u64 = 1;
 
-    {
-        let mut wal = env.open_wal();
-        for i in 0..n_records {
-            let ts = T0 + i;
-            let pick = rng.range(10);
-            match pick {
-                // 60%: encode
-                0..=5 => {
-                    let slot = next_slot;
-                    next_slot += 1;
-                    encoded_slots.push(slot);
-                    wal.append(record(
-                        WalPayload::Encode(encode_payload(slot, slot as u8 ^ (seed as u8))),
-                        ts,
-                    ))
-                    .unwrap();
-                }
-                // 20%: link (between two existing memories if any)
-                6..=7 => {
-                    if encoded_slots.len() >= 2 {
-                        let a = encoded_slots[(rng.range(encoded_slots.len() as u64)) as usize];
-                        let b = encoded_slots[(rng.range(encoded_slots.len() as u64)) as usize];
-                        if a != b {
-                            wal.append(record(
-                                WalPayload::Link(LinkPayload {
-                                    source: mid(a, 1),
-                                    target: mid(b, 1),
-                                    edge_kind: EdgeKind::Caused,
-                                    weight: 0.5,
-                                    origin: EdgeOrigin::Explicit,
-                                }),
-                                ts,
-                            ))
-                            .unwrap();
-                        }
+    // Pre-build the full ops sequence with the RNG, so we can move it into
+    // the Glommio executor (records computed up-front; the executor just
+    // appends them in order).
+    enum Op {
+        Encode(u64),
+        Link(u64, u64),
+        Forget(u64),
+        Checkpoint(u64),
+    }
+    let mut ops: Vec<(u64, Op)> = Vec::with_capacity(n_records as usize);
+    for i in 0..n_records {
+        let ts = T0 + i;
+        let pick = rng.range(10);
+        match pick {
+            0..=5 => {
+                let slot = next_slot;
+                next_slot += 1;
+                encoded_slots.push(slot);
+                ops.push((ts, Op::Encode(slot)));
+            }
+            6..=7 => {
+                if encoded_slots.len() >= 2 {
+                    let a = encoded_slots[(rng.range(encoded_slots.len() as u64)) as usize];
+                    let b = encoded_slots[(rng.range(encoded_slots.len() as u64)) as usize];
+                    if a != b {
+                        ops.push((ts, Op::Link(a, b)));
                     }
                 }
-                // 10%: forget
-                8 => {
-                    if let Some(&slot) = encoded_slots.first() {
+            }
+            8 => {
+                if let Some(&slot) = encoded_slots.first() {
+                    ops.push((ts, Op::Forget(slot)));
+                }
+            }
+            _ => {
+                ops.push((ts, Op::Checkpoint(i + 1)));
+            }
+        }
+    }
+
+    let wal_dir = env.wal_dir.clone();
+    let seed_byte = seed as u8;
+    glommio::LocalExecutorBuilder::default()
+        .name("scenario-g-wal")
+        .spawn(move || async move {
+            let wal = Wal::create(&wal_dir, SHARD_UUID).await.expect("create");
+            for (ts, op) in ops {
+                match op {
+                    Op::Encode(slot) => {
+                        wal.append(record(
+                            WalPayload::Encode(encode_payload(slot, slot as u8 ^ seed_byte)),
+                            ts,
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    Op::Link(a, b) => {
+                        wal.append(record(
+                            WalPayload::Link(LinkPayload {
+                                source: mid(a, 1),
+                                target: mid(b, 1),
+                                edge_kind: EdgeKind::Caused,
+                                weight: 0.5,
+                                origin: EdgeOrigin::Explicit,
+                            }),
+                            ts,
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    Op::Forget(slot) => {
                         wal.append(record(
                             WalPayload::Forget(ForgetPayload {
                                 memory_id: mid(slot, 1),
-                                request_id: rid(seed as u8 ^ 0xFF),
+                                request_id: rid(seed_byte ^ 0xFF),
                                 mode: ForgetMode::Soft,
                                 reason: ForgetReason::ClientRequest,
                             }),
                             ts,
                         ))
+                        .await
+                        .unwrap();
+                    }
+                    Op::Checkpoint(cid) => {
+                        wal.append(record(
+                            WalPayload::CheckpointBegin(CheckpointBeginPayload {
+                                checkpoint_id: cid,
+                                started_at_unix_nanos: ts,
+                            }),
+                            ts,
+                        ))
+                        .await
+                        .unwrap();
+                        let durable_lsn = wal.next_lsn().saturating_sub(1);
+                        wal.append(record(
+                            WalPayload::CheckpointEnd(CheckpointEndPayload {
+                                checkpoint_id: cid,
+                                durable_lsn,
+                                arena_capacity: 1024,
+                            }),
+                            ts + 1,
+                        ))
+                        .await
                         .unwrap();
                     }
                 }
-                // 10%: checkpoint pair
-                _ => {
-                    let cid = i + 1;
-                    wal.append(record(
-                        WalPayload::CheckpointBegin(CheckpointBeginPayload {
-                            checkpoint_id: cid,
-                            started_at_unix_nanos: ts,
-                        }),
-                        ts,
-                    ))
-                    .unwrap();
-                    wal.append(record(
-                        WalPayload::CheckpointEnd(CheckpointEndPayload {
-                            checkpoint_id: cid,
-                            durable_lsn: wal.next_lsn().saturating_sub(1),
-                            arena_capacity: 1024,
-                        }),
-                        ts + 1,
-                    ))
-                    .unwrap();
-                }
             }
-        }
-        wal.shutdown().unwrap();
-    }
+            wal.shutdown().await.unwrap();
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
 
     // Recover.
     {

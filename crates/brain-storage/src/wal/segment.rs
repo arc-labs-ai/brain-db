@@ -7,39 +7,33 @@
 //! (`spec §05/05 §1`) followed by `WalRecord`s packed back-to-back
 //! (`spec §05/05 §17`).
 //!
+//! ## I/O model (sub-task 9.6a)
+//!
+//! Backed by `glommio::io::BufferedFile`: all open/write/fsync ops go through
+//! io_uring on the shard's executor. Durability is `write_at` + `fdatasync`
+//! (two io_uring syscalls) — see `docs/spec-deviations.md` SD-2.8-2-b for
+//! the rationale vs. the spec's single `pwritev2(RWF_DSYNC)` syscall.
+//!
 //! ## What's *not* in this layer
 //!
-//! - **No fsync.** `flush` calls `File::write_all` only. Per phase doc 2.6,
-//!   durability lands in sub-task 2.8 with `pwritev2(RWF_DSYNC)` and group
-//!   commit. Records written here survive a normal process exit but not a
-//!   kernel panic / power loss.
-//! - **No `fallocate` / `O_DIRECT`** — also 2.8.
-//! - **No reader / open-existing.** The recovery path that finds the tail
-//!   of a crashed segment is sub-task 2.10; iterating records is
-//!   `WalReader` in 2.7.
+//! - **No `O_DIRECT`** — see SD-2.8-1 (still open).
+//! - **No reader / open-existing.** The recovery path is `WalReader`
+//!   (sub-task 2.7); it reads via `mmap` and stays sync.
 //! - **No LSN allocation.** Records arrive with their `lsn` field already
-//!   set by the caller. LSN allocation that spans segment rollovers lives
-//!   in the `Wal` public type (sub-task 2.9).
+//!   set by the caller. LSN allocation lives in `Wal`.
 //! - **No rollover decision.** The segment exposes `size_bytes()` and
-//!   `is_full()`; the manager (2.9) decides when to create the next
-//!   segment.
+//!   `is_full()`; `Wal` decides when to create the next segment.
 
-use std::ffi::c_void;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use glommio::io::{BufferedFile, OpenOptions};
+
 use crate::wal::record::WalRecord;
 
-/// `RWF_DSYNC` value from Linux UAPI (`include/uapi/linux/fs.h`).
-/// Defined locally for portability across libc versions.
-const RWF_DSYNC: i32 = 0x2;
-
-/// Test-only counter: every call to `flush_durable` bumps this. Used by the
-/// 2.8 group-commit batching test to verify that N concurrent appends are
-/// coalesced into a small number of fsyncs.
+/// Test-only counter: every successful call to `flush_durable` bumps this.
+/// Used by the 2.8 group-commit batching test to verify that N concurrent
+/// appends are coalesced into a small number of fsyncs.
 #[cfg(test)]
 pub static FLUSH_DURABLE_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -58,11 +52,6 @@ pub const WAL_SEGMENT_MAGIC: [u8; 4] = *b"BWAL";
 pub const WAL_SEGMENT_FORMAT_VERSION_V1: u32 = 1;
 
 /// End of the CRC-covered region within the segment header.
-///
-/// Unlike the slot CRC (`[0..40]` after typo-reading), the arena header CRC
-/// (`[0..80]` after typo-reading), and the WAL record CRC (header + payload),
-/// the segment header CRC's coverage is unambiguous: every field before
-/// `header_crc32c` itself ends exactly at offset 48.
 pub const WAL_SEGMENT_HEADER_CRC_COVERAGE_END: usize = 48;
 
 // ---------------------------------------------------------------------------
@@ -87,8 +76,7 @@ struct WalSegmentHeaderRaw {
 unsafe impl bytemuck::Zeroable for WalSegmentHeaderRaw {}
 unsafe impl bytemuck::Pod for WalSegmentHeaderRaw {}
 
-// Layout invariants enforced at compile time. Any future field reorder that
-// introduces padding fails to build.
+// Layout invariants enforced at compile time.
 const _: () = {
     use core::mem::{align_of, offset_of, size_of};
     assert!(size_of::<WalSegmentHeaderRaw>() == WAL_SEGMENT_HEADER_LEN);
@@ -128,13 +116,22 @@ pub enum WalSegmentError {
     ShortWrite { wanted: usize, got: usize },
 }
 
+impl<T> From<glommio::GlommioError<T>> for WalSegmentError {
+    fn from(e: glommio::GlommioError<T>) -> Self {
+        Self::Io(e.into())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WalSegment.
 // ---------------------------------------------------------------------------
 
 /// One append-only `*.wal` segment file.
+///
+/// `!Send` / `!Sync` via `BufferedFile` — must live on the executor that
+/// opened it. Spec §10/02 single-writer-per-shard is preserved by construction.
 pub struct WalSegment {
-    file: File,
+    file: BufferedFile,
     path: PathBuf,
     segment_seq: u64,
     starting_lsn: u64,
@@ -149,20 +146,24 @@ pub struct WalSegment {
 impl WalSegment {
     /// Create a new segment file at `path` with a fresh 4 KB header.
     ///
-    /// Refuses to clobber: returns an `io::ErrorKind::AlreadyExists` error
-    /// if the file already exists.
-    pub fn create_new(
+    /// Refuses to clobber if the file exists (returns `io::ErrorKind::AlreadyExists`).
+    /// Must be called from inside a Glommio executor.
+    pub async fn create_new(
         path: impl AsRef<Path>,
         segment_seq: u64,
         starting_lsn: u64,
         shard_uuid: [u8; 16],
     ) -> Result<Self, WalSegmentError> {
         let path = path.as_ref().to_path_buf();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
+
+        if path.exists() {
+            return Err(WalSegmentError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("segment file already exists at {}", path.display()),
+            )));
+        }
+
+        let file = BufferedFile::create(&path).await?;
 
         // Build the header, compute CRC, write the 4 KB block.
         let mut header = WalSegmentHeaderRaw {
@@ -177,12 +178,17 @@ impl WalSegment {
         };
         header.header_crc32c = compute_segment_header_crc(&header);
 
-        // SAFETY: `WalSegmentHeaderRaw` is `Pod`; bytes_of yields a slice
-        // exactly `WAL_SEGMENT_HEADER_LEN` long.
-        let header_bytes = bytemuck::bytes_of(&header);
+        // BufferedFile::write_at takes the buffer by value (io_uring keeps it
+        // for the duration of the operation). Make a fresh Vec for the header.
+        let header_bytes = bytemuck::bytes_of(&header).to_vec();
         debug_assert_eq!(header_bytes.len(), WAL_SEGMENT_HEADER_LEN);
-        file.write_all(header_bytes)?;
-        // Cursor is now at offset 4096, ready for record appends.
+        let wanted = header_bytes.len();
+        let got = file.write_at(header_bytes, 0).await?;
+        if got != wanted {
+            return Err(WalSegmentError::ShortWrite { wanted, got });
+        }
+        // Durable header (spec §05/06 §7 step 3).
+        file.fdatasync().await?;
 
         Ok(Self {
             file,
@@ -223,93 +229,67 @@ impl WalSegment {
     }
 
     /// True iff appending another record would push the segment beyond
-    /// `WAL_SEGMENT_SIZE_BYTES`. The manager (sub-task 2.9) uses this to
-    /// decide rollover.
+    /// `WAL_SEGMENT_SIZE_BYTES`.
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.size_bytes() >= crate::WAL_SEGMENT_SIZE_BYTES
     }
 
     /// Append a record's bytes to the in-memory buffer. Returns the number
-    /// of bytes the record contributed.
-    ///
-    /// Does *not* hit disk. The caller (or the manager in 2.9) calls
-    /// `flush` to drain the buffer; durability happens later in 2.8 with
-    /// `pwritev2(RWF_DSYNC)`.
+    /// of bytes the record contributed. Pure in-memory; does *not* touch disk.
     pub fn append_record(&mut self, record: &WalRecord) -> Result<usize, WalSegmentError> {
         let before = self.write_buf.len();
         record.encode_into(&mut self.write_buf);
         Ok(self.write_buf.len() - before)
     }
 
-    /// Drain the in-memory buffer to the file via `write_all`.
-    ///
-    /// **No fsync.** Records are in the page cache, not on stable storage.
-    /// Crash durability lands via [`Self::flush_durable`].
-    ///
-    /// Idempotent on an empty buffer (no-op, returns `Ok`).
-    pub fn flush(&mut self) -> Result<(), WalSegmentError> {
+    /// Drain the in-memory buffer to the file via `write_at` (no fsync).
+    /// Records are in the kernel's page cache, not on stable storage.
+    /// Idempotent on an empty buffer.
+    pub async fn flush(&mut self) -> Result<(), WalSegmentError> {
         if self.write_buf.is_empty() {
             return Ok(());
         }
-        self.file.write_all(&self.write_buf)?;
-        self.bytes_on_disk += self.write_buf.len();
-        self.write_buf.clear();
-        Ok(())
-    }
-
-    /// Drain the in-memory buffer to the file *durably* via
-    /// `pwritev2(RWF_DSYNC)`. The kernel guarantees the data is on stable
-    /// storage before returning.
-    ///
-    /// Uses an explicit file offset (`HEADER_LEN + bytes_on_disk`) rather
-    /// than the file's seek cursor, so it composes cleanly with the
-    /// non-durable [`Self::flush`] above. The cursor is updated post-write
-    /// to keep both paths interoperable (otherwise a subsequent
-    /// `flush` would write at a stale cursor).
-    ///
-    /// Spec deviation: this path uses synchronous `pwritev2` rather than
-    /// the spec's prescribed `io_uring` (SD-2.8-2 in `docs/spec-deviations.md`).
-    /// Functional behavior is equivalent; only the submission shape differs.
-    pub fn flush_durable(&mut self) -> Result<(), WalSegmentError> {
-        if self.write_buf.is_empty() {
-            return Ok(());
-        }
-        #[cfg(test)]
-        FLUSH_DURABLE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-        let fd = self.file.as_raw_fd();
-        let offset =
-            i64::try_from(WAL_SEGMENT_HEADER_LEN + self.bytes_on_disk).expect("offset fits in i64");
-        let wanted = self.write_buf.len();
-        let iov = libc::iovec {
-            iov_base: self.write_buf.as_ptr() as *mut c_void,
-            iov_len: wanted,
-        };
-        // SAFETY: `fd` is owned by `self.file` and valid for the duration of
-        // this call. `iov` points at `self.write_buf`, which lives until the
-        // end of this function. iovcnt=1 matches the single iovec. The
-        // RWF_DSYNC flag (0x2) is documented in Linux UAPI fs.h.
-        let n = unsafe { libc::pwritev2(fd, &iov, 1, offset, RWF_DSYNC) };
-        if n < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        let got = n as usize;
+        let offset = (WAL_SEGMENT_HEADER_LEN + self.bytes_on_disk) as u64;
+        let buf = std::mem::take(&mut self.write_buf);
+        let wanted = buf.len();
+        let got = self.file.write_at(buf, offset).await?;
         if got != wanted {
             return Err(WalSegmentError::ShortWrite { wanted, got });
         }
+        self.bytes_on_disk += got;
+        Ok(())
+    }
 
-        // Keep the file's seek cursor in sync with `bytes_on_disk` so a
-        // future call to `flush` (cursor-based) doesn't overwrite the
-        // durably-written region. Best-effort; failure is non-fatal because
-        // the durable write already succeeded.
-        use std::io::Seek;
-        let _ = self
-            .file
-            .seek(std::io::SeekFrom::Start((offset as u64) + got as u64));
+    /// Drain the in-memory buffer to the file **durably** via `write_at` +
+    /// `fdatasync` (both via io_uring). The kernel guarantees the data is on
+    /// stable storage before returning.
+    ///
+    /// Idempotent on an empty buffer.
+    ///
+    /// **Spec deviation (SD-2.8-2-b):** two-syscall fsync vs. the spec's
+    /// single `pwritev2(RWF_DSYNC)`. Glommio's typed BufferedFile API does
+    /// not expose `RWF_DSYNC`; the equivalent is `write_at` + `fdatasync`.
+    /// Same durability guarantee; one extra syscall per batch.
+    pub async fn flush_durable(&mut self) -> Result<(), WalSegmentError> {
+        if self.write_buf.is_empty() {
+            return Ok(());
+        }
+
+        let offset = (WAL_SEGMENT_HEADER_LEN + self.bytes_on_disk) as u64;
+        let buf = std::mem::take(&mut self.write_buf);
+        let wanted = buf.len();
+        let got = self.file.write_at(buf, offset).await?;
+        if got != wanted {
+            return Err(WalSegmentError::ShortWrite { wanted, got });
+        }
+        self.file.fdatasync().await?;
 
         self.bytes_on_disk += got;
-        self.write_buf.clear();
+
+        #[cfg(test)]
+        FLUSH_DURABLE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
         Ok(())
     }
 
@@ -318,6 +298,52 @@ impl WalSegment {
     #[must_use]
     pub fn write_buf_len(&self) -> usize {
         self.write_buf.len()
+    }
+
+    /// Close the underlying file. Best-effort fdatasync of any pending
+    /// kernel-side writeback. Called on drop / on rollover.
+    pub async fn close(self) -> Result<(), WalSegmentError> {
+        self.file.close().await?;
+        Ok(())
+    }
+
+    /// Open an existing segment file for append. The caller is responsible
+    /// for header validation — typically by calling `WalReader::open` first
+    /// (which validates every segment's header on the caller thread).
+    ///
+    /// `bytes_on_disk` is derived from the file's on-disk size at open
+    /// time (`file_size - HEADER_LEN`). The caller is responsible for
+    /// ensuring the file's contents up to that point are CRC-valid records
+    /// (typically by running [`crate::recovery::recover`] first).
+    ///
+    /// Used by [`crate::wal::wal::Wal::open_existing`] when resuming a
+    /// shard after a clean shutdown or crash.
+    pub async fn open_for_append(
+        path: impl AsRef<Path>,
+        shard_uuid: [u8; 16],
+        segment_seq: u64,
+        starting_lsn: u64,
+        bytes_on_disk: usize,
+    ) -> Result<Self, WalSegmentError> {
+        let path = path.as_ref().to_path_buf();
+        // BufferedFile::open is read-only (`OpenOptions::new().read(true)`).
+        // We need read+write to append durably, so go through OpenOptions
+        // directly. This matches BufferedFile::create's mode but without
+        // O_CREAT/O_TRUNC.
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .buffered_open(&path)
+            .await?;
+        Ok(Self {
+            file,
+            path,
+            segment_seq,
+            starting_lsn,
+            shard_uuid,
+            write_buf: Vec::new(),
+            bytes_on_disk,
+        })
     }
 }
 
@@ -334,14 +360,40 @@ impl core::fmt::Debug for WalSegment {
     }
 }
 
-// Tests open files + call pwritev2 — not shimmed by miri. Gated; see
-// `.claude/plans/phase-02-miri.md`.
+// ---------------------------------------------------------------------------
+// Test harness helpers.
+// ---------------------------------------------------------------------------
+
+/// Run an async closure inside a fresh Glommio `LocalExecutor`. Convenience
+/// wrapper for tests in this crate. Equivalent to:
+///
+/// ```ignore
+/// LocalExecutorBuilder::default().spawn(|| async move { f().await }).unwrap().join().unwrap()
+/// ```
+#[cfg(test)]
+pub fn glommio_run<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + 'static,
+    T: Send + 'static,
+{
+    glommio::LocalExecutorBuilder::default()
+        .name("wal-test")
+        .spawn(move || async move { f().await })
+        .expect("spawn glommio test executor")
+        .join()
+        .expect("test executor returned")
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+// ---------------------------------------------------------------------------
+
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use crate::wal::kinds::WalRecordKind;
     use crate::wal::record::{DecodeOutcome, Lsn, WalRecord};
-    use std::io;
 
     fn uuid(byte: u8) -> [u8; 16] {
         [byte; 16]
@@ -362,27 +414,26 @@ mod tests {
     fn create_new_writes_valid_header() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("0000000000.wal");
-        let seg = WalSegment::create_new(&path, 0, 1, uuid(7)).unwrap();
-        assert_eq!(seg.segment_seq(), 0);
-        assert_eq!(seg.starting_lsn(), 1);
-        assert_eq!(seg.shard_uuid(), uuid(7));
+        let p = path.clone();
+        glommio_run(move || async move {
+            let seg = WalSegment::create_new(&p, 0, 1, uuid(7)).await.unwrap();
+            assert_eq!(seg.segment_seq(), 0);
+            assert_eq!(seg.starting_lsn(), 1);
+            assert_eq!(seg.shard_uuid(), uuid(7));
+            seg.close().await.unwrap();
+        });
 
-        // The file is exactly the header size: 4096 bytes.
         let metadata = std::fs::metadata(&path).unwrap();
         assert_eq!(metadata.len(), WAL_SEGMENT_HEADER_LEN as u64);
 
-        // Read the header back; verify field-by-field.
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[0..4], &WAL_SEGMENT_MAGIC);
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
         assert_eq!(&bytes[8..24], &uuid(7));
         assert_eq!(u64::from_le_bytes(bytes[24..32].try_into().unwrap()), 0);
         assert_eq!(u64::from_le_bytes(bytes[32..40].try_into().unwrap()), 1);
-
-        // Reserved tail (offsets 52..4096) is all zero.
         assert!(bytes[52..4096].iter().all(|&b| b == 0));
 
-        // CRC verifies over [0..48].
         let stored_crc = u32::from_le_bytes(bytes[48..52].try_into().unwrap());
         let computed = crc32c::crc32c(&bytes[0..WAL_SEGMENT_HEADER_CRC_COVERAGE_END]);
         assert_eq!(stored_crc, computed);
@@ -392,67 +443,81 @@ mod tests {
     fn create_new_refuses_to_clobber() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("0000000000.wal");
-        let _seg = WalSegment::create_new(&path, 0, 1, uuid(1)).unwrap();
-        let err = WalSegment::create_new(&path, 0, 1, uuid(1)).unwrap_err();
-        match err {
-            WalSegmentError::Io(io_err) => {
-                assert_eq!(io_err.kind(), io::ErrorKind::AlreadyExists);
+        let p = path.clone();
+        glommio_run(move || async move {
+            let s = WalSegment::create_new(&p, 0, 1, uuid(1)).await.unwrap();
+            s.close().await.unwrap();
+            let err = WalSegment::create_new(&p, 0, 1, uuid(1))
+                .await
+                .expect_err("must refuse to clobber");
+            match err {
+                WalSegmentError::Io(io_err) => {
+                    assert_eq!(io_err.kind(), std::io::ErrorKind::AlreadyExists);
+                }
+                other => panic!("expected Io(AlreadyExists), got {other:?}"),
             }
-            other => panic!("expected Io(AlreadyExists), got {other:?}"),
-        }
+        });
     }
 
     #[test]
     fn append_does_not_touch_disk_until_flush() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("0000000000.wal");
-        let mut seg = WalSegment::create_new(&path, 0, 1, uuid(1)).unwrap();
-
-        let rec = sample(1, WalRecordKind::Encode, vec![0xAA; 32]);
-        let appended = seg.append_record(&rec).unwrap();
-        assert_eq!(appended, rec.encoded_len());
-
-        // File on disk is still just the header.
+        let p = path.clone();
+        let r = sample(1, WalRecordKind::Encode, vec![0xAA; 32]);
+        let r_len = r.encoded_len();
+        glommio_run(move || async move {
+            let mut seg = WalSegment::create_new(&p, 0, 1, uuid(1)).await.unwrap();
+            let appended = seg.append_record(&r).unwrap();
+            assert_eq!(appended, r_len);
+            assert_eq!(seg.size_bytes(), WAL_SEGMENT_HEADER_LEN + r_len);
+            seg.close().await.unwrap();
+        });
         let on_disk = std::fs::metadata(&path).unwrap().len();
         assert_eq!(on_disk, WAL_SEGMENT_HEADER_LEN as u64);
-
-        // size_bytes() includes the buffered record.
-        assert_eq!(seg.size_bytes(), WAL_SEGMENT_HEADER_LEN + rec.encoded_len());
     }
 
     #[test]
     fn flush_on_empty_buffer_is_noop() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("0000000000.wal");
-        let mut seg = WalSegment::create_new(&path, 0, 1, uuid(1)).unwrap();
-        seg.flush().unwrap();
-        seg.flush().unwrap();
+        let p = path.clone();
+        glommio_run(move || async move {
+            let mut seg = WalSegment::create_new(&p, 0, 1, uuid(1)).await.unwrap();
+            seg.flush().await.unwrap();
+            seg.flush().await.unwrap();
+            assert_eq!(seg.size_bytes(), WAL_SEGMENT_HEADER_LEN);
+            seg.close().await.unwrap();
+        });
         let on_disk = std::fs::metadata(&path).unwrap().len();
         assert_eq!(on_disk, WAL_SEGMENT_HEADER_LEN as u64);
-        assert_eq!(seg.size_bytes(), WAL_SEGMENT_HEADER_LEN);
     }
 
     #[test]
     fn records_round_trip_through_disk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("0000000000.wal");
-        let mut seg = WalSegment::create_new(&path, 0, 1, uuid(2)).unwrap();
-
+        let p = path.clone();
         let r1 = sample(1, WalRecordKind::Encode, vec![1; 16]);
         let r2 = sample(2, WalRecordKind::Forget, vec![2; 8]);
         let r3 = sample(3, WalRecordKind::Link, vec![3; 38]);
-        seg.append_record(&r1).unwrap();
-        seg.append_record(&r2).unwrap();
-        seg.append_record(&r3).unwrap();
-        seg.flush().unwrap();
+        let r1c = r1.clone();
+        let r2c = r2.clone();
+        let r3c = r3.clone();
+        glommio_run(move || async move {
+            let mut seg = WalSegment::create_new(&p, 0, 1, uuid(2)).await.unwrap();
+            seg.append_record(&r1c).unwrap();
+            seg.append_record(&r2c).unwrap();
+            seg.append_record(&r3c).unwrap();
+            seg.flush().await.unwrap();
+            seg.close().await.unwrap();
+        });
 
-        // File size = header + sum of encoded record lengths.
         let expected_size =
             WAL_SEGMENT_HEADER_LEN + r1.encoded_len() + r2.encoded_len() + r3.encoded_len();
         let on_disk = std::fs::metadata(&path).unwrap().len() as usize;
         assert_eq!(on_disk, expected_size);
 
-        // Read raw bytes and decode every record using WalRecord::decode_one.
         let bytes = std::fs::read(&path).unwrap();
         let mut cursor = WAL_SEGMENT_HEADER_LEN;
         for expected in [&r1, &r2, &r3] {
@@ -472,17 +537,22 @@ mod tests {
     fn mixed_append_flush_sequence_preserves_order() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("0000000000.wal");
-        let mut seg = WalSegment::create_new(&path, 0, 1, uuid(3)).unwrap();
-
+        let p = path.clone();
         let r1 = sample(1, WalRecordKind::Encode, vec![1; 4]);
         let r2 = sample(2, WalRecordKind::Encode, vec![2; 4]);
         let r3 = sample(3, WalRecordKind::Encode, vec![3; 4]);
-
-        seg.append_record(&r1).unwrap();
-        seg.flush().unwrap();
-        seg.append_record(&r2).unwrap();
-        seg.append_record(&r3).unwrap();
-        seg.flush().unwrap();
+        let r1c = r1.clone();
+        let r2c = r2.clone();
+        let r3c = r3.clone();
+        glommio_run(move || async move {
+            let mut seg = WalSegment::create_new(&p, 0, 1, uuid(3)).await.unwrap();
+            seg.append_record(&r1c).unwrap();
+            seg.flush().await.unwrap();
+            seg.append_record(&r2c).unwrap();
+            seg.append_record(&r3c).unwrap();
+            seg.flush().await.unwrap();
+            seg.close().await.unwrap();
+        });
 
         let bytes = std::fs::read(&path).unwrap();
         let mut cursor = WAL_SEGMENT_HEADER_LEN;
@@ -502,37 +572,36 @@ mod tests {
     fn size_bytes_accounts_for_buffered_and_on_disk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("0000000000.wal");
-        let mut seg = WalSegment::create_new(&path, 0, 1, uuid(4)).unwrap();
+        let p = path.clone();
         let r1 = sample(1, WalRecordKind::Encode, vec![0; 100]);
         let r2 = sample(2, WalRecordKind::Encode, vec![0; 50]);
-
-        seg.append_record(&r1).unwrap();
-        // Buffered, not on disk.
-        assert_eq!(seg.size_bytes(), WAL_SEGMENT_HEADER_LEN + r1.encoded_len());
-        seg.flush().unwrap();
-        // Same total, now all on disk.
-        assert_eq!(seg.size_bytes(), WAL_SEGMENT_HEADER_LEN + r1.encoded_len());
-
-        seg.append_record(&r2).unwrap();
-        // Total = header + r1 (on disk) + r2 (buffered).
-        assert_eq!(
-            seg.size_bytes(),
-            WAL_SEGMENT_HEADER_LEN + r1.encoded_len() + r2.encoded_len()
-        );
+        let r1_len = r1.encoded_len();
+        let r2_len = r2.encoded_len();
+        glommio_run(move || async move {
+            let mut seg = WalSegment::create_new(&p, 0, 1, uuid(4)).await.unwrap();
+            seg.append_record(&r1).unwrap();
+            assert_eq!(seg.size_bytes(), WAL_SEGMENT_HEADER_LEN + r1_len);
+            seg.flush().await.unwrap();
+            assert_eq!(seg.size_bytes(), WAL_SEGMENT_HEADER_LEN + r1_len);
+            seg.append_record(&r2).unwrap();
+            assert_eq!(seg.size_bytes(), WAL_SEGMENT_HEADER_LEN + r1_len + r2_len);
+            seg.close().await.unwrap();
+        });
     }
 
     #[test]
     fn is_full_reflects_size_bytes() {
-        // Pure math regression: is_full() == (size_bytes() >= WAL_SEGMENT_SIZE_BYTES).
-        // We can't realistically grow a segment to 256 MiB in a unit test,
-        // but we can confirm a fresh segment isn't full.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("0000000000.wal");
-        let seg = WalSegment::create_new(&path, 0, 1, uuid(5)).unwrap();
-        assert!(!seg.is_full());
-        assert_eq!(
-            seg.is_full(),
-            seg.size_bytes() >= crate::WAL_SEGMENT_SIZE_BYTES
-        );
+        let p = path.clone();
+        glommio_run(move || async move {
+            let seg = WalSegment::create_new(&p, 0, 1, uuid(5)).await.unwrap();
+            assert!(!seg.is_full());
+            assert_eq!(
+                seg.is_full(),
+                seg.size_bytes() >= crate::WAL_SEGMENT_SIZE_BYTES
+            );
+            seg.close().await.unwrap();
+        });
     }
 }

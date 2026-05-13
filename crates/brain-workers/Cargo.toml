@@ -20,7 +20,9 @@ redb.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+# After sub-task 9.7: per-shard scheduler runs on Glommio.
+glommio.workspace = true
+futures-lite.workspace = true
 
 [dev-dependencies]
 brain-embed = { path = "../brain-embed" }

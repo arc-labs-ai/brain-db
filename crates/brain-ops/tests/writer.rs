@@ -299,26 +299,25 @@ async fn forget_memory_not_found() {
 // Concurrency.
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_encodes_get_distinct_memory_ids() {
+// After sub-task 9.7 (audit §4) `WriterHandle` is `!Send + !Sync`; the
+// single-writer-per-shard invariant (spec §10/02) is enforced by the
+// per-shard Glommio executor, not by cross-thread sharing. The original
+// concurrent variant of this test (`tokio::spawn` × 8) is no longer
+// expressible — replaced with a sequential variant that still proves
+// distinct MemoryIds.
+#[tokio::test]
+async fn sequential_encodes_get_distinct_memory_ids() {
     let fix = build_fixture();
     let writer = Arc::clone(&fix.writer);
 
-    let mut handles = Vec::new();
-    for i in 0..8u8 {
-        let w = Arc::clone(&writer);
-        handles.push(tokio::spawn(async move {
-            let mut req_id = [0u8; 16];
-            req_id[0] = 0xA0 + i;
-            w.submit_encode(make_encode_op(req_id, "concurrent"))
-                .await
-                .unwrap()
-        }));
-    }
-
     let mut memory_ids = Vec::with_capacity(8);
-    for h in handles {
-        let ack = h.await.unwrap();
+    for i in 0..8u8 {
+        let mut req_id = [0u8; 16];
+        req_id[0] = 0xA0 + i;
+        let ack = writer
+            .submit_encode(make_encode_op(req_id, "sequential"))
+            .await
+            .unwrap();
         memory_ids.push(ack.memory_id);
     }
     memory_ids.sort();

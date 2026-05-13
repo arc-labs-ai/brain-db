@@ -1,3 +1,4 @@
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
 //! Slot reclamation worker tests (sub-task 8.7). Spec §11/06.
 
 use std::sync::Arc;
@@ -167,8 +168,11 @@ async fn run_one(
     worker: &SlotReclamationWorker,
     ops: Arc<OpsContext>,
 ) -> Result<usize, brain_workers::WorkerError> {
-    let (_tx, rx) = tokio::sync::watch::channel(false);
-    let wctx = WorkerContext { ops, shutdown: rx };
+    let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wctx = WorkerContext {
+        ops,
+        shutdown: shutdown_flag.clone(),
+    };
     worker.run_cycle(&wctx).await
 }
 
@@ -176,259 +180,299 @@ async fn run_one(
 // Cycle behaviour (8).
 // ===========================================================================
 
-#[tokio::test]
-async fn tombstoned_past_grace_is_reclaimed() {
-    let fix = build_fixture();
-    let id = seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 8 * DAY_NS));
-    let worker = SlotReclamationWorker::new(); // 7-day default grace
-    let processed = run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 1);
-    assert!(!memory_exists(&fix.metadata, id));
+#[test]
+fn tombstoned_past_grace_is_reclaimed() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let id = seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 8 * DAY_NS));
+        let worker = SlotReclamationWorker::new(); // 7-day default grace
+        let processed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 1);
+        assert!(!memory_exists(&fix.metadata, id));
+    });
 }
 
-#[tokio::test]
-async fn tombstoned_within_grace_is_kept() {
-    let fix = build_fixture();
-    let id = seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 3 * DAY_NS));
-    let worker = SlotReclamationWorker::new();
-    let processed = run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 0);
-    assert!(memory_exists(&fix.metadata, id));
+#[test]
+fn tombstoned_within_grace_is_kept() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let id = seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 3 * DAY_NS));
+        let worker = SlotReclamationWorker::new();
+        let processed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 0);
+        assert!(memory_exists(&fix.metadata, id));
+    });
 }
 
-#[tokio::test]
-async fn active_memory_never_reclaimed() {
-    let fix = build_fixture();
-    let id = seed_memory(&fix.metadata, 1, None);
-    let worker = SlotReclamationWorker::new();
-    let processed = run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 0);
-    assert!(memory_exists(&fix.metadata, id));
+#[test]
+fn active_memory_never_reclaimed() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let id = seed_memory(&fix.metadata, 1, None);
+        let worker = SlotReclamationWorker::new();
+        let processed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 0);
+        assert!(memory_exists(&fix.metadata, id));
+    });
 }
 
-#[tokio::test]
-async fn multiple_eligible_rows_all_reclaimed_within_batch_size() {
-    let fix = build_fixture();
-    for slot in 1..=5u64 {
-        seed_memory(&fix.metadata, slot, Some(now_unix_nanos() - 10 * DAY_NS));
-    }
-    assert_eq!(count_memories(&fix.metadata), 5);
-    let worker = SlotReclamationWorker::new();
-    let processed = run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 5);
-    assert_eq!(count_memories(&fix.metadata), 0);
+#[test]
+fn multiple_eligible_rows_all_reclaimed_within_batch_size() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        for slot in 1..=5u64 {
+            seed_memory(&fix.metadata, slot, Some(now_unix_nanos() - 10 * DAY_NS));
+        }
+        assert_eq!(count_memories(&fix.metadata), 5);
+        let worker = SlotReclamationWorker::new();
+        let processed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 5);
+        assert_eq!(count_memories(&fix.metadata), 0);
+    });
 }
 
-#[tokio::test]
-async fn batch_size_caps_per_cycle() {
-    let fix = build_fixture();
-    for slot in 1..=50u64 {
-        seed_memory(&fix.metadata, slot, Some(now_unix_nanos() - 10 * DAY_NS));
-    }
-    let cfg = WorkerConfig {
-        enabled: true,
-        interval: Duration::from_secs(60),
-        batch_size: 10,
-        max_runtime: Duration::from_secs(60),
-    };
-    let worker = SlotReclamationWorker::new().with_config(cfg);
-    let processed = run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(processed, 10);
-    assert_eq!(count_memories(&fix.metadata), 40);
+#[test]
+fn batch_size_caps_per_cycle() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        for slot in 1..=50u64 {
+            seed_memory(&fix.metadata, slot, Some(now_unix_nanos() - 10 * DAY_NS));
+        }
+        let cfg = WorkerConfig {
+            enabled: true,
+            interval: Duration::from_secs(60),
+            batch_size: 10,
+            max_runtime: Duration::from_secs(60),
+        };
+        let worker = SlotReclamationWorker::new().with_config(cfg);
+        let processed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 10);
+        assert_eq!(count_memories(&fix.metadata), 40);
+    });
 }
 
-#[tokio::test]
-async fn adjacent_out_edges_purged() {
-    let fix = build_fixture();
-    let doomed = seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 10 * DAY_NS));
-    let live = seed_memory(&fix.metadata, 2, None);
-    seed_edge(&fix.metadata, doomed, EdgeKind::FollowedBy, live);
-    assert_eq!(edges_out_count(&fix.metadata, doomed), 1);
+#[test]
+fn adjacent_out_edges_purged() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let doomed = seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 10 * DAY_NS));
+        let live = seed_memory(&fix.metadata, 2, None);
+        seed_edge(&fix.metadata, doomed, EdgeKind::FollowedBy, live);
+        assert_eq!(edges_out_count(&fix.metadata, doomed), 1);
 
-    let worker = SlotReclamationWorker::new();
-    run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(
-        edges_out_count(&fix.metadata, doomed),
-        0,
-        "EDGES_OUT for reclaimed source must be purged"
-    );
+        let worker = SlotReclamationWorker::new();
+        run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(
+            edges_out_count(&fix.metadata, doomed),
+            0,
+            "EDGES_OUT for reclaimed source must be purged"
+        );
+    });
 }
 
-#[tokio::test]
-async fn adjacent_in_edges_purged() {
-    let fix = build_fixture();
-    let doomed = seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 10 * DAY_NS));
-    let live = seed_memory(&fix.metadata, 2, None);
-    // Edge from live → doomed. EDGES_IN[doomed][..][live] holds.
-    seed_edge(&fix.metadata, live, EdgeKind::FollowedBy, doomed);
-    assert_eq!(edges_in_count(&fix.metadata, doomed), 1);
+#[test]
+fn adjacent_in_edges_purged() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let doomed = seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 10 * DAY_NS));
+        let live = seed_memory(&fix.metadata, 2, None);
+        // Edge from live → doomed. EDGES_IN[doomed][..][live] holds.
+        seed_edge(&fix.metadata, live, EdgeKind::FollowedBy, doomed);
+        assert_eq!(edges_in_count(&fix.metadata, doomed), 1);
 
-    let worker = SlotReclamationWorker::new();
-    run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(
-        edges_in_count(&fix.metadata, doomed),
-        0,
-        "EDGES_IN for reclaimed target must be purged"
-    );
+        let worker = SlotReclamationWorker::new();
+        run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(
+            edges_in_count(&fix.metadata, doomed),
+            0,
+            "EDGES_IN for reclaimed target must be purged"
+        );
+    });
 }
 
-#[tokio::test]
-async fn dangling_edges_other_direction_are_left_for_edge_scrub() {
-    let fix = build_fixture();
-    let doomed = seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 10 * DAY_NS));
-    let live = seed_memory(&fix.metadata, 2, None);
-    // Edge from live → doomed. After reclamation:
-    //   - EDGES_OUT[live][..][doomed] (source = live) MUST survive
-    //     — spec §6 leaves this for the edge-scrub worker.
-    //   - EDGES_IN[doomed][..][live] is purged (verified in test 7).
-    seed_edge(&fix.metadata, live, EdgeKind::FollowedBy, doomed);
-    assert_eq!(edges_out_count(&fix.metadata, live), 1);
+#[test]
+fn dangling_edges_other_direction_are_left_for_edge_scrub() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let doomed = seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 10 * DAY_NS));
+        let live = seed_memory(&fix.metadata, 2, None);
+        // Edge from live → doomed. After reclamation:
+        //   - EDGES_OUT[live][..][doomed] (source = live) MUST survive
+        //     — spec §6 leaves this for the edge-scrub worker.
+        //   - EDGES_IN[doomed][..][live] is purged (verified in test 7).
+        seed_edge(&fix.metadata, live, EdgeKind::FollowedBy, doomed);
+        assert_eq!(edges_out_count(&fix.metadata, live), 1);
 
-    let worker = SlotReclamationWorker::new();
-    run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(
-        edges_out_count(&fix.metadata, live),
-        1,
-        "dangling EDGES_OUT survives slot reclamation (edge scrub's job)"
-    );
+        let worker = SlotReclamationWorker::new();
+        run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(
+            edges_out_count(&fix.metadata, live),
+            1,
+            "dangling EDGES_OUT survives slot reclamation (edge scrub's job)"
+        );
+    });
 }
 
 // ===========================================================================
 // FORGET stamping integration (2).
 // ===========================================================================
 
-#[tokio::test]
-async fn forget_stamps_tombstoned_at_unix_nanos() {
-    let fix = build_fixture();
-    // Real ENCODE → real FORGET via dispatcher.
-    let encode = EncodeRequest {
-        text: "doomed".into(),
-        context_id: 1,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: vec![],
-        request_id: [1; 16],
-        txn_id: None,
-        deduplicate: false,
-    };
-    let memory_id = match dispatch(RequestBody::Encode(encode), &fix.ctx)
-        .await
-        .unwrap()
-    {
-        ResponseBody::Encode(r) => r.memory_id,
-        _ => unreachable!(),
-    };
-    let forget = ForgetRequest {
-        memory_id,
-        mode: ForgetMode::Soft,
-        request_id: [2; 16],
-        txn_id: None,
-    };
-    let _ = dispatch(RequestBody::Forget(forget), &fix.ctx)
-        .await
-        .unwrap();
+#[test]
+fn forget_stamps_tombstoned_at_unix_nanos() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        // Real ENCODE → real FORGET via dispatcher.
+        let encode = EncodeRequest {
+            text: "doomed".into(),
+            context_id: 1,
+            kind: MemoryKindWire::Episodic,
+            salience_hint: 0.5,
+            edges: vec![],
+            request_id: [1; 16],
+            txn_id: None,
+            deduplicate: false,
+        };
+        let memory_id = match dispatch(RequestBody::Encode(encode), &fix.ctx)
+            .await
+            .unwrap()
+        {
+            ResponseBody::Encode(r) => r.memory_id,
+            _ => unreachable!(),
+        };
+        let forget = ForgetRequest {
+            memory_id,
+            mode: ForgetMode::Soft,
+            request_id: [2; 16],
+            txn_id: None,
+        };
+        let _ = dispatch(RequestBody::Forget(forget), &fix.ctx)
+            .await
+            .unwrap();
 
-    let row = read_meta(&fix.metadata, MemoryId::from(memory_id)).unwrap();
-    assert!(
-        row.tombstoned_at_unix_nanos.is_some(),
-        "FORGET must stamp tombstoned_at"
-    );
+        let row = read_meta(&fix.metadata, MemoryId::from(memory_id)).unwrap();
+        assert!(
+            row.tombstoned_at_unix_nanos.is_some(),
+            "FORGET must stamp tombstoned_at"
+        );
+    });
 }
 
-#[tokio::test]
-async fn forget_replay_does_not_overwrite_stamp() {
-    let fix = build_fixture();
-    let encode = EncodeRequest {
-        text: "doomed-twice".into(),
-        context_id: 1,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: vec![],
-        request_id: [10; 16],
-        txn_id: None,
-        deduplicate: false,
-    };
-    let memory_id = match dispatch(RequestBody::Encode(encode), &fix.ctx)
-        .await
-        .unwrap()
-    {
-        ResponseBody::Encode(r) => r.memory_id,
-        _ => unreachable!(),
-    };
-    // Two FORGET calls with different request_ids → first stamps,
-    // second is AlreadyTombstoned (no metadata write).
-    for rid in [[11u8; 16], [12u8; 16]] {
-        let _ = dispatch(
-            RequestBody::Forget(ForgetRequest {
-                memory_id,
-                mode: ForgetMode::Soft,
-                request_id: rid,
-                txn_id: None,
-            }),
-            &fix.ctx,
-        )
-        .await
-        .unwrap();
-    }
-    let row = read_meta(&fix.metadata, MemoryId::from(memory_id)).unwrap();
-    let stamp = row.tombstoned_at_unix_nanos.unwrap();
-    // Wait briefly and re-check that the stamp didn't shift.
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    let row2 = read_meta(&fix.metadata, MemoryId::from(memory_id)).unwrap();
-    assert_eq!(row2.tombstoned_at_unix_nanos, Some(stamp));
+#[test]
+fn forget_replay_does_not_overwrite_stamp() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let encode = EncodeRequest {
+            text: "doomed-twice".into(),
+            context_id: 1,
+            kind: MemoryKindWire::Episodic,
+            salience_hint: 0.5,
+            edges: vec![],
+            request_id: [10; 16],
+            txn_id: None,
+            deduplicate: false,
+        };
+        let memory_id = match dispatch(RequestBody::Encode(encode), &fix.ctx)
+            .await
+            .unwrap()
+        {
+            ResponseBody::Encode(r) => r.memory_id,
+            _ => unreachable!(),
+        };
+        // Two FORGET calls with different request_ids → first stamps,
+        // second is AlreadyTombstoned (no metadata write).
+        for rid in [[11u8; 16], [12u8; 16]] {
+            let _ = dispatch(
+                RequestBody::Forget(ForgetRequest {
+                    memory_id,
+                    mode: ForgetMode::Soft,
+                    request_id: rid,
+                    txn_id: None,
+                }),
+                &fix.ctx,
+            )
+            .await
+            .unwrap();
+        }
+        let row = read_meta(&fix.metadata, MemoryId::from(memory_id)).unwrap();
+        let stamp = row.tombstoned_at_unix_nanos.unwrap();
+        // Wait briefly and re-check that the stamp didn't shift.
+        glommio::timer::sleep(Duration::from_millis(10)).await;
+        let row2 = read_meta(&fix.metadata, MemoryId::from(memory_id)).unwrap();
+        assert_eq!(row2.tombstoned_at_unix_nanos, Some(stamp));
+    });
 }
 
 // ===========================================================================
 // Worker integration (3).
 // ===========================================================================
 
-#[tokio::test]
-async fn worker_registers_with_correct_kind_and_default_cadence() {
-    let fix = build_fixture();
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(Arc::new(SlotReclamationWorker::new()), fix.ctx)
-        .unwrap();
-    let cfg = sched.config(WorkerKind::SlotReclamation.name()).unwrap();
-    assert_eq!(cfg.interval, Duration::from_secs(600));
-    sched.shutdown().await.unwrap();
+#[test]
+fn worker_registers_with_correct_kind_and_default_cadence() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(Arc::new(SlotReclamationWorker::new()), fix.ctx)
+            .unwrap();
+        let cfg = sched.config(WorkerKind::SlotReclamation.name()).unwrap();
+        assert_eq!(cfg.interval, Duration::from_secs(600));
+        sched.shutdown().await.unwrap();
+    });
 }
 
-#[tokio::test]
-async fn disabled_worker_via_config_does_not_reclaim() {
-    let fix = build_fixture();
-    seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 10 * DAY_NS));
-    let cfg = WorkerConfig {
-        enabled: false,
-        interval: Duration::from_millis(20),
-        batch_size: 100,
-        max_runtime: Duration::from_secs(1),
-    };
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(
-            Arc::new(SlotReclamationWorker::new().with_config(cfg)),
-            fix.ctx.clone(),
-        )
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    sched.shutdown().await.unwrap();
-    assert_eq!(count_memories(&fix.metadata), 1);
+#[test]
+fn disabled_worker_via_config_does_not_reclaim() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 10 * DAY_NS));
+        let cfg = WorkerConfig {
+            enabled: false,
+            interval: Duration::from_millis(20),
+            batch_size: 100,
+            max_runtime: Duration::from_secs(1),
+        };
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(
+                Arc::new(SlotReclamationWorker::new().with_config(cfg)),
+                fix.ctx.clone(),
+            )
+            .unwrap();
+        glommio::timer::sleep(Duration::from_millis(150)).await;
+        sched.shutdown().await.unwrap();
+        assert_eq!(count_memories(&fix.metadata), 1);
+    });
 }
 
-#[tokio::test]
-async fn custom_grace_period_honoured() {
-    let fix = build_fixture();
-    // 2-day-old tombstone — under default 7d grace, kept.
-    let id = seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 2 * DAY_NS));
-    let default = SlotReclamationWorker::new();
-    let processed = run_one(&default, fix.ctx.clone()).await.unwrap();
-    assert_eq!(processed, 0);
-    assert!(memory_exists(&fix.metadata, id));
+#[test]
+fn custom_grace_period_honoured() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        // 2-day-old tombstone — under default 7d grace, kept.
+        let id = seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 2 * DAY_NS));
+        let default = SlotReclamationWorker::new();
+        let processed = run_one(&default, fix.ctx.clone()).await.unwrap();
+        assert_eq!(processed, 0);
+        assert!(memory_exists(&fix.metadata, id));
 
-    // Drop grace to 1 day; now eligible.
-    let short = SlotReclamationWorker::new().with_grace_period(Duration::from_secs(24 * 3600));
-    let processed = run_one(&short, fix.ctx).await.unwrap();
-    assert_eq!(processed, 1);
-    assert!(!memory_exists(&fix.metadata, id));
+        // Drop grace to 1 day; now eligible.
+        let short = SlotReclamationWorker::new().with_grace_period(Duration::from_secs(24 * 3600));
+        let processed = run_one(&short, fix.ctx).await.unwrap();
+        assert_eq!(processed, 1);
+        assert!(!memory_exists(&fix.metadata, id));
+    });
+}
+
+fn glommio_run<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + 'static,
+    T: Send + 'static,
+{
+    glommio::LocalExecutorBuilder::default()
+        .name("worker-test")
+        .spawn(move || async move { f().await })
+        .expect("spawn glommio test executor")
+        .join()
+        .expect("test executor join")
 }

@@ -93,9 +93,8 @@ impl WriterHandle for NoopWriter {
     fn submit_encode<'a>(
         &'a self,
         _op: EncodeOp,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<EncodeAck, WriterError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<EncodeAck, WriterError>> + 'a>>
+    {
         Box::pin(async move {
             Err(WriterError::Internal(
                 "noop writer used in recall test".into(),
@@ -106,9 +105,8 @@ impl WriterHandle for NoopWriter {
     fn submit_forget<'a>(
         &'a self,
         _op: ForgetOp,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ForgetAck, WriterError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ForgetAck, WriterError>> + 'a>>
+    {
         Box::pin(async move {
             Err(WriterError::Internal(
                 "noop writer used in recall test".into(),
@@ -120,11 +118,7 @@ impl WriterHandle for NoopWriter {
         &'a self,
         _: brain_planner::LinkOp,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<brain_planner::LinkAck, WriterError>>
-                + Send
-                + 'a,
-        >,
+        Box<dyn std::future::Future<Output = Result<brain_planner::LinkAck, WriterError>> + 'a>,
     > {
         Box::pin(async move {
             Err(WriterError::Internal(
@@ -137,11 +131,7 @@ impl WriterHandle for NoopWriter {
         &'a self,
         _: brain_planner::UnlinkOp,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<brain_planner::UnlinkAck, WriterError>>
-                + Send
-                + 'a,
-        >,
+        Box<dyn std::future::Future<Output = Result<brain_planner::UnlinkAck, WriterError>> + 'a>,
     > {
         Box::pin(async move {
             Err(WriterError::Internal(
@@ -153,9 +143,7 @@ impl WriterHandle for NoopWriter {
     fn reserve_memory_id<'a>(
         &'a self,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<brain_core::MemoryId, WriterError>> + Send + 'a,
-        >,
+        Box<dyn std::future::Future<Output = Result<brain_core::MemoryId, WriterError>> + 'a>,
     > {
         Box::pin(async move {
             Err(WriterError::Internal(
@@ -168,11 +156,7 @@ impl WriterHandle for NoopWriter {
         &'a self,
         _: brain_planner::TxnBatch,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<brain_planner::TxnBatchAck, WriterError>>
-                + Send
-                + 'a,
-        >,
+        Box<dyn std::future::Future<Output = Result<brain_planner::TxnBatchAck, WriterError>> + 'a>,
     > {
         Box::pin(async move {
             Err(WriterError::Internal(

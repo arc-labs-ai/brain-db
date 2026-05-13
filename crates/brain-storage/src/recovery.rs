@@ -559,12 +559,16 @@ mod tests {
     }
 
     /// Write records via the full `Wal` (LSN allocation + group commit).
+    /// Hosts the async ops on a per-call Glommio executor.
     fn write_via_wal(wal_dir: &Path, records: Vec<WalRecord>) {
-        let mut wal = Wal::create(wal_dir, uuid(1)).unwrap();
-        for r in records {
-            wal.append(r).unwrap();
-        }
-        wal.shutdown().unwrap();
+        let wal_dir = wal_dir.to_owned();
+        crate::wal::segment::glommio_run(move || async move {
+            let wal = Wal::create(&wal_dir, uuid(1)).await.unwrap();
+            for r in records {
+                wal.append(r).await.unwrap();
+            }
+            wal.shutdown().await.unwrap();
+        });
     }
 
     /// Bypass `Wal` and write records directly into segment 0. Used for
@@ -572,11 +576,17 @@ mod tests {
     fn write_via_segment(wal_dir: &Path, records: &[WalRecord]) {
         std::fs::create_dir_all(wal_dir).unwrap();
         let seg_path = wal_dir.join("0000000000.wal");
-        let mut seg = WalSegment::create_new(&seg_path, 0, 1, uuid(1)).unwrap();
-        for r in records {
-            seg.append_record(r).unwrap();
-        }
-        seg.flush().unwrap();
+        let records: Vec<WalRecord> = records.to_vec();
+        crate::wal::segment::glommio_run(move || async move {
+            let mut seg = WalSegment::create_new(&seg_path, 0, 1, uuid(1))
+                .await
+                .unwrap();
+            for r in &records {
+                seg.append_record(r).unwrap();
+            }
+            seg.flush().await.unwrap();
+            seg.close().await.unwrap();
+        });
     }
 
     // ----- Empty cases --------------------------------------------------

@@ -1,3 +1,4 @@
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
 //! Phase 8 no-regression smoke gate (sub-task 8.14).
 //!
 //! Goal: catch a worker implementation that catastrophically starves
@@ -244,83 +245,103 @@ fn register_all_workers(sched: &mut WorkerScheduler, ctx: Arc<OpsContext>) {
 // Main regression gate (1).
 // ===========================================================================
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn workers_active_do_not_catastrophically_degrade_foreground_latency() {
-    let fix = build_fixture();
+#[test]
+fn workers_active_do_not_catastrophically_degrade_foreground_latency() {
+    glommio_run(|| async {
+        let fix = build_fixture();
 
-    // Seed 30 memories so RECALL has something to search.
-    for slot in 1..=30u32 {
-        encode_one(&fix.ctx, slot, &format!("seed-{slot}")).await;
-    }
+        // Seed 30 memories so RECALL has something to search.
+        for slot in 1..=30u32 {
+            encode_one(&fix.ctx, slot, &format!("seed-{slot}")).await;
+        }
 
-    // Baseline: 100 (encode + recall) pairs without any worker.
-    let baseline = measure_latencies(&fix, 100, 10_000).await;
-    let baseline_median = median(&baseline);
+        // Baseline: 100 (encode + recall) pairs without any worker.
+        let baseline = measure_latencies(&fix, 100, 10_000).await;
+        let baseline_median = median(&baseline);
 
-    // Register every worker. Each ticks every 20ms with batch_size=100
-    // so they overlap the measurement window.
-    let mut sched = WorkerScheduler::new();
-    register_all_workers(&mut sched, fix.ctx.clone());
-    // Give the scheduler a moment to kick off at least one cycle of each.
-    tokio::time::sleep(Duration::from_millis(40)).await;
+        // Register every worker. Each ticks every 20ms with batch_size=100
+        // so they overlap the measurement window.
+        let mut sched = WorkerScheduler::new();
+        register_all_workers(&mut sched, fix.ctx.clone());
+        // Give the scheduler a moment to kick off at least one cycle of each.
+        glommio::timer::sleep(Duration::from_millis(40)).await;
 
-    // Workers-on: 100 more pairs.
-    let with_workers = measure_latencies(&fix, 100, 20_000).await;
-    let with_workers_median = median(&with_workers);
+        // Workers-on: 100 more pairs.
+        let with_workers = measure_latencies(&fix, 100, 20_000).await;
+        let with_workers_median = median(&with_workers);
 
-    // Sanity: at least one worker actually ran during the window.
-    let names = sched.names();
-    let mut any_cycle = false;
-    for name in &names {
-        if let Some(m) = sched.metrics(name) {
-            if m.cycles_total.load(Ordering::Relaxed) >= 1 {
-                any_cycle = true;
-                break;
+        // Sanity: at least one worker actually ran during the window.
+        let names = sched.names();
+        let mut any_cycle = false;
+        for name in &names {
+            if let Some(m) = sched.metrics(name) {
+                if m.cycles_total.load(Ordering::Relaxed) >= 1 {
+                    any_cycle = true;
+                    break;
+                }
             }
         }
-    }
 
-    sched.shutdown().await.unwrap();
+        sched.shutdown().await.unwrap();
 
-    assert!(
-        any_cycle,
-        "expected at least one worker cycle to complete during the measurement window"
-    );
+        assert!(
+            any_cycle,
+            "expected at least one worker cycle to complete during the measurement window"
+        );
 
-    // Generous bound: workers_median ≤ 5× baseline_median, with a
-    // floor at 5ms so very-fast baselines (microsecond-scale) don't
-    // produce nonsense thresholds.
-    let max_allowed = (baseline_median * 5).max(Duration::from_millis(5));
-    assert!(
-        with_workers_median <= max_allowed,
-        "regression: baseline median {:?}, with workers {:?} (allowed up to {:?})",
-        baseline_median,
-        with_workers_median,
-        max_allowed,
-    );
+        // Generous bound: workers_median ≤ 5× baseline_median, with a
+        // floor at 5ms so very-fast baselines (microsecond-scale) don't
+        // produce nonsense thresholds.
+        let max_allowed = (baseline_median * 5).max(Duration::from_millis(5));
+        assert!(
+            with_workers_median <= max_allowed,
+            "regression: baseline median {:?}, with workers {:?} (allowed up to {:?})",
+            baseline_median,
+            with_workers_median,
+            max_allowed,
+        );
+    });
 }
 
 // ===========================================================================
 // Sanity (2).
 // ===========================================================================
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn measure_latencies_returns_sample_count() {
-    let fix = build_fixture();
-    let samples = measure_latencies(&fix, 5, 1).await;
-    assert_eq!(samples.len(), 10, "5 (encode+recall) pairs → 10 samples");
+#[test]
+fn measure_latencies_returns_sample_count() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let samples = measure_latencies(&fix, 5, 1).await;
+        assert_eq!(samples.len(), 10, "5 (encode+recall) pairs → 10 samples");
+    });
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn baseline_runs_in_reasonable_time() {
-    let fix = build_fixture();
-    let start = Instant::now();
-    let _ = measure_latencies(&fix, 100, 1).await;
-    let elapsed = start.elapsed();
-    // 100 encode+recall pairs. 30s is wildly generous; we just want
-    // to catch infinite-loop regressions.
-    assert!(
-        elapsed < Duration::from_secs(30),
-        "baseline 100-op workload took {elapsed:?}, exceeded 30s sanity bound"
-    );
+#[test]
+fn baseline_runs_in_reasonable_time() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let start = Instant::now();
+        let _ = measure_latencies(&fix, 100, 1).await;
+        let elapsed = start.elapsed();
+        // 100 encode+recall pairs. 30s is wildly generous; we just want
+        // to catch infinite-loop regressions.
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "baseline 100-op workload took {elapsed:?}, exceeded 30s sanity bound"
+        );
+    });
+}
+
+fn glommio_run<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + 'static,
+    T: Send + 'static,
+{
+    glommio::LocalExecutorBuilder::default()
+        .name("worker-test")
+        .spawn(move || async move { f().await })
+        .expect("spawn glommio test executor")
+        .join()
+        .expect("test executor join")
 }

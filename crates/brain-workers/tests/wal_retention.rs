@@ -1,3 +1,4 @@
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
 //! WAL retention worker tests (sub-task 8.8). Spec §11/07.
 
 use std::sync::Arc;
@@ -52,8 +53,11 @@ async fn run_one(
     worker: &WalRetentionWorker,
     ops: Arc<OpsContext>,
 ) -> Result<usize, brain_workers::WorkerError> {
-    let (_tx, rx) = tokio::sync::watch::channel(false);
-    let wctx = WorkerContext { ops, shutdown: rx };
+    let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wctx = WorkerContext {
+        ops,
+        shutdown: shutdown_flag.clone(),
+    };
     worker.run_cycle(&wctx).await
 }
 
@@ -199,162 +203,196 @@ impl WalRetentionSource for FailingListSource {
 // Source surface (3).
 // ===========================================================================
 
-#[tokio::test]
-async fn disabled_source_returns_disabled_on_every_method() {
-    let s = DisabledWalRetentionSource;
-    assert!(matches!(
-        s.current_checkpoint().await,
-        Err(WalRetentionSourceError::Disabled)
-    ));
-    assert!(matches!(
-        s.list_segments().await,
-        Err(WalRetentionSourceError::Disabled)
-    ));
-    assert!(matches!(
-        s.delete_segment(42).await,
-        Err(WalRetentionSourceError::Disabled)
-    ));
+#[test]
+fn disabled_source_returns_disabled_on_every_method() {
+    glommio_run(|| async {
+        let s = DisabledWalRetentionSource;
+        assert!(matches!(
+            s.current_checkpoint().await,
+            Err(WalRetentionSourceError::Disabled)
+        ));
+        assert!(matches!(
+            s.list_segments().await,
+            Err(WalRetentionSourceError::Disabled)
+        ));
+        assert!(matches!(
+            s.delete_segment(42).await,
+            Err(WalRetentionSourceError::Disabled)
+        ));
+    });
 }
 
-#[tokio::test]
-async fn stub_source_returns_provided_data() {
-    let stub = StubSource {
-        checkpoint: CheckpointDesc { durable_lsn: 2000 },
-        segments: Mutex::new(vec![seg(1, 0, 500), seg(2, 500, 1500)]),
-        deleted: Arc::new(Mutex::new(Vec::new())),
-    };
-    let cp = stub.current_checkpoint().await.unwrap();
-    assert_eq!(cp.durable_lsn, 2000);
-    let segs = stub.list_segments().await.unwrap();
-    assert_eq!(segs.len(), 2);
-    stub.delete_segment(1).await.unwrap();
-    assert_eq!(*stub.deleted.lock(), vec![1]);
-    assert_eq!(stub.segments.lock().len(), 1);
+#[test]
+fn stub_source_returns_provided_data() {
+    glommio_run(|| async {
+        let stub = StubSource {
+            checkpoint: CheckpointDesc { durable_lsn: 2000 },
+            segments: Mutex::new(vec![seg(1, 0, 500), seg(2, 500, 1500)]),
+            deleted: Arc::new(Mutex::new(Vec::new())),
+        };
+        let cp = stub.current_checkpoint().await.unwrap();
+        assert_eq!(cp.durable_lsn, 2000);
+        let segs = stub.list_segments().await.unwrap();
+        assert_eq!(segs.len(), 2);
+        stub.delete_segment(1).await.unwrap();
+        assert_eq!(*stub.deleted.lock(), vec![1]);
+        assert_eq!(stub.segments.lock().len(), 1);
+    });
 }
 
-#[tokio::test]
-async fn rejecting_source_makes_worker_skip_deletion() {
-    let (ops, _td) = make_ops_context();
-    let worker = WalRetentionWorker::new(Arc::new(RejectingSource));
-    let processed = run_one(&worker, ops).await.unwrap();
-    assert_eq!(processed, 0);
+#[test]
+fn rejecting_source_makes_worker_skip_deletion() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let worker = WalRetentionWorker::new(Arc::new(RejectingSource));
+        let processed = run_one(&worker, ops).await.unwrap();
+        assert_eq!(processed, 0);
+    });
 }
 
 // ===========================================================================
 // Cycle (4).
 // ===========================================================================
 
-#[tokio::test]
-async fn cycle_with_disabled_source_returns_zero() {
-    let (ops, _td) = make_ops_context();
-    let worker = WalRetentionWorker::new(Arc::new(DisabledWalRetentionSource));
-    let processed = run_one(&worker, ops).await.unwrap();
-    assert_eq!(processed, 0);
+#[test]
+fn cycle_with_disabled_source_returns_zero() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let worker = WalRetentionWorker::new(Arc::new(DisabledWalRetentionSource));
+        let processed = run_one(&worker, ops).await.unwrap();
+        assert_eq!(processed, 0);
+    });
 }
 
-#[tokio::test]
-async fn stub_source_with_eligible_segments_deletes_and_reports_count() {
-    let (ops, _td) = make_ops_context();
-    let deleted = Arc::new(Mutex::new(Vec::new()));
-    let stub = StubSource {
-        checkpoint: CheckpointDesc { durable_lsn: 1000 },
-        segments: Mutex::new(vec![seg(1, 0, 500), seg(2, 500, 800), seg(3, 800, 1500)]),
-        deleted: deleted.clone(),
-    };
-    let worker = WalRetentionWorker::new(Arc::new(stub));
-    let processed = run_one(&worker, ops).await.unwrap();
-    assert_eq!(processed, 2, "segments 1 and 2 below cutoff=1000");
-    let mut deleted_sorted = deleted.lock().clone();
-    deleted_sorted.sort();
-    assert_eq!(deleted_sorted, vec![1, 2]);
+#[test]
+fn stub_source_with_eligible_segments_deletes_and_reports_count() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        let stub = StubSource {
+            checkpoint: CheckpointDesc { durable_lsn: 1000 },
+            segments: Mutex::new(vec![seg(1, 0, 500), seg(2, 500, 800), seg(3, 800, 1500)]),
+            deleted: deleted.clone(),
+        };
+        let worker = WalRetentionWorker::new(Arc::new(stub));
+        let processed = run_one(&worker, ops).await.unwrap();
+        assert_eq!(processed, 2, "segments 1 and 2 below cutoff=1000");
+        let mut deleted_sorted = deleted.lock().clone();
+        deleted_sorted.sort();
+        assert_eq!(deleted_sorted, vec![1, 2]);
+    });
 }
 
-#[tokio::test]
-async fn stub_source_with_no_eligible_segments_returns_zero() {
-    let (ops, _td) = make_ops_context();
-    let stub = StubSource {
-        checkpoint: CheckpointDesc { durable_lsn: 100 },
-        segments: Mutex::new(vec![seg(1, 100, 500)]),
-        deleted: Arc::new(Mutex::new(Vec::new())),
-    };
-    let worker = WalRetentionWorker::new(Arc::new(stub));
-    let processed = run_one(&worker, ops).await.unwrap();
-    assert_eq!(processed, 0);
+#[test]
+fn stub_source_with_no_eligible_segments_returns_zero() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let stub = StubSource {
+            checkpoint: CheckpointDesc { durable_lsn: 100 },
+            segments: Mutex::new(vec![seg(1, 100, 500)]),
+            deleted: Arc::new(Mutex::new(Vec::new())),
+        };
+        let worker = WalRetentionWorker::new(Arc::new(stub));
+        let processed = run_one(&worker, ops).await.unwrap();
+        assert_eq!(processed, 0);
+    });
 }
 
-#[tokio::test]
-async fn failed_list_source_propagates_as_worker_error() {
-    let (ops, _td) = make_ops_context();
-    let worker = WalRetentionWorker::new(Arc::new(FailingListSource));
-    let r = run_one(&worker, ops).await;
-    assert!(
-        matches!(r, Err(brain_workers::WorkerError::Ops(_))),
-        "Failed must surface, got {r:?}"
-    );
+#[test]
+fn failed_list_source_propagates_as_worker_error() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let worker = WalRetentionWorker::new(Arc::new(FailingListSource));
+        let r = run_one(&worker, ops).await;
+        assert!(
+            matches!(r, Err(brain_workers::WorkerError::Ops(_))),
+            "Failed must surface, got {r:?}"
+        );
+    });
 }
 
 // ===========================================================================
 // Worker integration (3).
 // ===========================================================================
 
-#[tokio::test]
-async fn worker_registers_with_correct_kind_and_default_cadence() {
-    let (ops, _td) = make_ops_context();
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(
-            Arc::new(WalRetentionWorker::new(Arc::new(
-                DisabledWalRetentionSource,
-            ))),
-            ops,
-        )
-        .unwrap();
-    let cfg = sched.config(WorkerKind::WalRetention.name()).unwrap();
-    assert_eq!(cfg.interval, Duration::from_secs(60));
-    sched.shutdown().await.unwrap();
+#[test]
+fn worker_registers_with_correct_kind_and_default_cadence() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(
+                Arc::new(WalRetentionWorker::new(Arc::new(
+                    DisabledWalRetentionSource,
+                ))),
+                ops,
+            )
+            .unwrap();
+        let cfg = sched.config(WorkerKind::WalRetention.name()).unwrap();
+        assert_eq!(cfg.interval, Duration::from_secs(60));
+        sched.shutdown().await.unwrap();
+    });
 }
 
-#[tokio::test]
-async fn disabled_worker_via_config_does_not_run() {
-    let (ops, _td) = make_ops_context();
-    let stub = StubSource {
-        checkpoint: CheckpointDesc { durable_lsn: 1000 },
-        segments: Mutex::new(vec![seg(1, 0, 500)]),
-        deleted: Arc::new(Mutex::new(Vec::new())),
-    };
-    let deleted_ref = stub.deleted.clone();
-    let cfg = WorkerConfig {
-        enabled: false,
-        interval: Duration::from_millis(20),
-        batch_size: 100,
-        max_runtime: Duration::from_secs(1),
-    };
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(
-            Arc::new(WalRetentionWorker::new(Arc::new(stub)).with_config(cfg)),
-            ops,
-        )
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    sched.shutdown().await.unwrap();
-    assert_eq!(
-        deleted_ref.lock().len(),
-        0,
-        "disabled worker must not call delete"
-    );
+#[test]
+fn disabled_worker_via_config_does_not_run() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let stub = StubSource {
+            checkpoint: CheckpointDesc { durable_lsn: 1000 },
+            segments: Mutex::new(vec![seg(1, 0, 500)]),
+            deleted: Arc::new(Mutex::new(Vec::new())),
+        };
+        let deleted_ref = stub.deleted.clone();
+        let cfg = WorkerConfig {
+            enabled: false,
+            interval: Duration::from_millis(20),
+            batch_size: 100,
+            max_runtime: Duration::from_secs(1),
+        };
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(
+                Arc::new(WalRetentionWorker::new(Arc::new(stub)).with_config(cfg)),
+                ops,
+            )
+            .unwrap();
+        glommio::timer::sleep(Duration::from_millis(150)).await;
+        sched.shutdown().await.unwrap();
+        assert_eq!(
+            deleted_ref.lock().len(),
+            0,
+            "disabled worker must not call delete"
+        );
+    });
 }
 
-#[tokio::test]
-async fn retention_buffer_keeps_segments_under_cutoff() {
-    let (ops, _td) = make_ops_context();
-    let stub = StubSource {
-        checkpoint: CheckpointDesc { durable_lsn: 1000 },
-        segments: Mutex::new(vec![seg(1, 0, 500), seg(2, 500, 800)]),
-        deleted: Arc::new(Mutex::new(Vec::new())),
-    };
-    let worker = WalRetentionWorker::new(Arc::new(stub)).with_retention_extra_lsns(400); // cutoff = 600
-    let processed = run_one(&worker, ops).await.unwrap();
-    // seg 1 (last=500) < 600 → deletable; seg 2 (last=800) not.
-    assert_eq!(processed, 1);
+#[test]
+fn retention_buffer_keeps_segments_under_cutoff() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let stub = StubSource {
+            checkpoint: CheckpointDesc { durable_lsn: 1000 },
+            segments: Mutex::new(vec![seg(1, 0, 500), seg(2, 500, 800)]),
+            deleted: Arc::new(Mutex::new(Vec::new())),
+        };
+        let worker = WalRetentionWorker::new(Arc::new(stub)).with_retention_extra_lsns(400); // cutoff = 600
+        let processed = run_one(&worker, ops).await.unwrap();
+        // seg 1 (last=500) < 600 → deletable; seg 2 (last=800) not.
+        assert_eq!(processed, 1);
+    });
+}
+
+fn glommio_run<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + 'static,
+    T: Send + 'static,
+{
+    glommio::LocalExecutorBuilder::default()
+        .name("worker-test")
+        .spawn(move || async move { f().await })
+        .expect("spawn glommio test executor")
+        .join()
+        .expect("test executor join")
 }

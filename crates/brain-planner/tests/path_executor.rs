@@ -47,28 +47,22 @@ impl WriterHandle for NoopWriter {
     fn submit_encode<'a>(
         &'a self,
         _: EncodeOp,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<EncodeAck, WriterError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<EncodeAck, WriterError>> + 'a>>
+    {
         Box::pin(async move { Err(WriterError::Internal("noop".into())) })
     }
     fn submit_forget<'a>(
         &'a self,
         _: ForgetOp,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ForgetAck, WriterError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ForgetAck, WriterError>> + 'a>>
+    {
         Box::pin(async move { Err(WriterError::Internal("noop".into())) })
     }
     fn submit_link<'a>(
         &'a self,
         _: brain_planner::LinkOp,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<brain_planner::LinkAck, WriterError>>
-                + Send
-                + 'a,
-        >,
+        Box<dyn std::future::Future<Output = Result<brain_planner::LinkAck, WriterError>> + 'a>,
     > {
         Box::pin(async move { Err(WriterError::Internal("noop".into())) })
     }
@@ -76,11 +70,7 @@ impl WriterHandle for NoopWriter {
         &'a self,
         _: brain_planner::UnlinkOp,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<brain_planner::UnlinkAck, WriterError>>
-                + Send
-                + 'a,
-        >,
+        Box<dyn std::future::Future<Output = Result<brain_planner::UnlinkAck, WriterError>> + 'a>,
     > {
         Box::pin(async move { Err(WriterError::Internal("noop".into())) })
     }
@@ -88,9 +78,7 @@ impl WriterHandle for NoopWriter {
     fn reserve_memory_id<'a>(
         &'a self,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<brain_core::MemoryId, WriterError>> + Send + 'a,
-        >,
+        Box<dyn std::future::Future<Output = Result<brain_core::MemoryId, WriterError>> + 'a>,
     > {
         Box::pin(async move {
             Err(WriterError::Internal(
@@ -103,11 +91,7 @@ impl WriterHandle for NoopWriter {
         &'a self,
         _: brain_planner::TxnBatch,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<brain_planner::TxnBatchAck, WriterError>>
-                + Send
-                + 'a,
-        >,
+        Box<dyn std::future::Future<Output = Result<brain_planner::TxnBatchAck, WriterError>> + 'a>,
     > {
         Box::pin(async move {
             Err(WriterError::Internal(
@@ -279,4 +263,94 @@ async fn bfs_self_loop_guard_trivial_zero_length() {
     assert_eq!(result.paths.len(), 1);
     assert_eq!(result.paths[0].nodes, vec![fix.ids[0]]);
     assert!(result.paths[0].edges.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 6. Sub-task 9.16 — spec §16/01 §12 tombstone filter.
+// ---------------------------------------------------------------------------
+//
+// The build_fixture above creates metadata + edges but doesn't
+// populate the HNSW; `ctx.index.is_tombstoned(...)` returns false
+// for unknown ids. The tests below add a tiny HNSW writer step
+// (insert + mark_tombstoned) to exercise the real filter path.
+
+fn populate_hnsw_and_tombstone(fix: &Fixture, insert: &[MemoryId], tombstone: &[MemoryId]) {
+    // SharedHnsw construction in build_fixture drops the Writer.
+    // We can rebuild a fresh (reader, writer) pair, then swap the
+    // shared reader's inner index in place via the `swap` method —
+    // but that's heavyweight. Simpler: build_fixture's internal
+    // `SharedHnsw::new` returned a writer that was discarded. For
+    // these tombstone tests we use a separate fixture builder
+    // (`build_fixture_with_writer`) so the writer survives.
+    //
+    // Falling back to the swap-trick avoids changing build_fixture's
+    // signature.
+    use brain_index::HnswIndex;
+    let params = fix.ctx.index.params();
+    let mut hnsw = HnswIndex::<VECTOR_DIM>::new(params).expect("HnswIndex::new");
+    let v = [0.1_f32; VECTOR_DIM];
+    for id in insert {
+        hnsw.insert(*id, &v).expect("hnsw insert");
+    }
+    for id in tombstone {
+        hnsw.mark_tombstoned(*id).expect("hnsw tombstone");
+    }
+    fix.ctx.index.swap(hnsw);
+}
+
+/// `FORGET m; PLAN through a chain that includes m` excludes `m`
+/// (spec §16/01 §12 acceptance test).
+#[tokio::test]
+async fn plan_excludes_tombstoned_chain_member() {
+    // a -> b -> c plus a detour a -> d -> c.
+    let fix = build_fixture(
+        4,
+        &[
+            (0, EdgeKind::FollowedBy, 1), // a -> b
+            (1, EdgeKind::FollowedBy, 2), // b -> c
+            (0, EdgeKind::FollowedBy, 3), // a -> d
+            (3, EdgeKind::FollowedBy, 2), // d -> c
+        ],
+    );
+    populate_hnsw_and_tombstone(
+        &fix,
+        &fix.ids,      // a, b, c, d all in HNSW
+        &[fix.ids[1]], // tombstone b
+    );
+
+    let result = run(&fix, plan_request(fix.ids[0], fix.ids[2], 3)).await;
+    assert_eq!(result.status, PlanStatus::GoalReached);
+    assert!(!result.paths.is_empty());
+    // Every returned path must avoid the tombstoned `b`.
+    for p in &result.paths {
+        assert!(
+            !p.nodes.contains(&fix.ids[1]),
+            "path traversed tombstoned node b: {:?}",
+            p.nodes
+        );
+    }
+}
+
+/// A tombstoned start memory yields an empty endpoint set; the BFS
+/// short-circuits to `NoPathFound`.
+#[tokio::test]
+async fn plan_silently_skips_tombstoned_start() {
+    let fix = build_fixture(2, &[(0, EdgeKind::Caused, 1)]);
+    populate_hnsw_and_tombstone(&fix, &fix.ids, &[fix.ids[0]]);
+
+    let result = run(&fix, plan_request(fix.ids[0], fix.ids[1], 2)).await;
+    assert_eq!(result.status, PlanStatus::NoPathFound);
+    assert!(result.paths.is_empty());
+}
+
+/// A tombstoned goal memory yields an empty endpoint set; the BFS
+/// short-circuits to `NoPathFound`.
+#[tokio::test]
+async fn plan_silently_skips_tombstoned_goal() {
+    let fix = build_fixture(2, &[(0, EdgeKind::Caused, 1)]);
+    populate_hnsw_and_tombstone(&fix, &fix.ids, &[fix.ids[1]]);
+
+    let result = run(&fix, plan_request(fix.ids[0], fix.ids[1], 2)).await;
+    assert_eq!(result.status, PlanStatus::NoPathFound);
+    assert!(result.paths.is_empty());
 }

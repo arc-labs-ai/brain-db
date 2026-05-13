@@ -1,8 +1,15 @@
-//! `OpsContext` — the handle bag handlers consume.
+//! `OpsContext` — the per-shard handle bag handlers consume.
 //!
 //! Thin wrapper over `brain_planner::ExecutorContext` for v1. Each
 //! later sub-task that needs new shared state (txn store in 7.9,
 //! subscribe broadcast in 7.10) adds a field non-breakingly.
+//!
+//! After sub-task 9.7 (audit §4) `OpsContext` is transitively `!Send`
+//! because `ExecutorContext` holds `Arc<dyn WriterHandle>` and
+//! `WriterHandle` is no longer `Send + Sync`. The interior `Arc<...>`
+//! fields are kept (vs the audit's suggested `Rc<...>` swap) to avoid
+//! gratuitous test churn — single-threaded usage is enforced by the
+//! per-shard Glommio executor, not by the field types.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,24 +32,17 @@ pub struct OpsContext {
     /// Planner-side config + budgets. Defaults are fine for v1; the
     /// builder is here so the server can override budgets at startup.
     pub planner_ctx: PlannerContext,
-    /// Per-process transaction registry. Active txns hold their
-    /// buffered ops here until COMMIT / ABORT (sub-task 7.9).
+    /// Per-shard transaction registry.
     pub txn_store: Arc<TxnStore>,
-    /// In-process change-feed bus (sub-task 7.10). The real writer
-    /// publishes here after every successful commit; subscribers
-    /// receive matching events.
+    /// Per-shard change-feed bus. Cross-shard fan-out is the
+    /// connection layer's job (9.11).
     pub events: Arc<EventBus>,
-    /// Registry of active subscriptions (sub-task 7.10). Phase 9's
-    /// connection task will call `events.receiver()` /
-    /// `subscriptions.register(...)` to drive the long-lived stream
-    /// directly; the dispatcher path uses the same surface.
+    /// Per-shard subscription registry.
     pub subscriptions: Arc<SubscriptionRegistry>,
     /// One-shot dispatcher poll window for `handle_subscribe`. Tests
     /// override this to keep the timeout-path test fast.
     pub subscribe_poll_window: Duration,
-    /// Recently-accessed memory ids (sub-task 8.3). RECALL pushes
-    /// every returned hit's id here; the AccessBoostWorker drains
-    /// the buffer on its 10 s cycle and applies a salience bump.
+    /// Recently-accessed memory ids (sub-task 8.3).
     pub access_buffer: Arc<AccessBuffer>,
 }
 
@@ -102,10 +102,3 @@ impl OpsContext {
         self
     }
 }
-
-// Compile-time guard: the context must be Send + Sync so handlers
-// can run on any executor task.
-const _: fn() = || {
-    fn require<T: Send + Sync>() {}
-    require::<OpsContext>();
-};

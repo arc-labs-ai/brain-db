@@ -151,6 +151,13 @@ fn resolve_base(
     match &plan.observation {
         ObservationInput::ByMemoryId(raw) => {
             let id = MemoryId::from(*raw);
+            // Sub-task 9.16: spec §16/01 §12 — a tombstoned seed
+            // returns an empty base. The downstream BFS short-
+            // circuits to an empty result set, matching
+            // `search_active`'s silent-filter for ByText seeds.
+            if ctx.index.is_tombstoned(id) {
+                return Ok((HashMap::new(), Vec::new()));
+            }
             let mut map = HashMap::with_capacity(1);
             map.insert(id, 1.0_f32);
             Ok((map, vec![id]))
@@ -243,6 +250,12 @@ fn walk_outward(
                 .filter(|(k, _, _)| edge_kinds.contains(k))
                 .map(|(k, t, data)| (k, t, data.weight))
                 .collect();
+
+        // Sub-task 9.16: drop committed tombstoned memories from
+        // REASON traversals (spec §16/01 §12). Outside an active txn
+        // this is the only filter; inside one, the snap retain below
+        // layers in-flight tombstones on top.
+        neighbours.retain(|(_, t, _)| !ctx.index.is_tombstoned(*t));
 
         if let Some(snap) = &ctx.txn {
             for (src, kind, tgt, w) in &snap.pending_links {

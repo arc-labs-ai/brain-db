@@ -23,7 +23,7 @@ const YIELD_EVERY: usize = 50;
 /// We use `&self` with interior mutability where needed; the writer
 /// trait in `brain-planner` follows the same convention, and it avoids
 /// having the scheduler own an exclusive lock on every worker.
-pub trait Worker: Send + Sync + 'static {
+pub trait Worker: 'static {
     /// Stable display name (matches `WorkerKind::name`).
     fn name(&self) -> &'static str;
 
@@ -43,7 +43,7 @@ pub trait Worker: Send + Sync + 'static {
     fn run_cycle<'a>(
         &'a self,
         ctx: &'a WorkerContext,
-    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + 'a>>;
 }
 
 /// Spec §11/01 §5: drive a stream of work-units, bounded by batch
@@ -82,7 +82,7 @@ where
             false => break,
         }
         if processed % YIELD_EVERY == 0 {
-            tokio::task::yield_now().await;
+            glommio::executor().yield_if_needed().await;
         }
     }
     Ok(processed)

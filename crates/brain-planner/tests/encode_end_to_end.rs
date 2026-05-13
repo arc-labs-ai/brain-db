@@ -121,7 +121,7 @@ impl WriterHandle for FakeWriterHandle {
     fn submit_encode<'a>(
         &'a self,
         op: EncodeOp,
-    ) -> Pin<Box<dyn Future<Output = Result<EncodeAck, WriterError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<EncodeAck, WriterError>> + 'a>> {
         Box::pin(async move {
             self.submit_count.fetch_add(1, Ordering::Relaxed);
             let mut state = self.inner.lock();
@@ -210,7 +210,7 @@ impl WriterHandle for FakeWriterHandle {
     fn submit_forget<'a>(
         &'a self,
         op: ForgetOp,
-    ) -> Pin<Box<dyn Future<Output = Result<ForgetAck, WriterError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<ForgetAck, WriterError>> + 'a>> {
         Box::pin(async move {
             self.submit_count.fetch_add(1, Ordering::Relaxed);
             let mut state = self.inner.lock();
@@ -273,25 +273,21 @@ impl WriterHandle for FakeWriterHandle {
     fn submit_link<'a>(
         &'a self,
         _: brain_planner::LinkOp,
-    ) -> Pin<Box<dyn Future<Output = Result<brain_planner::LinkAck, WriterError>> + Send + 'a>>
-    {
+    ) -> Pin<Box<dyn Future<Output = Result<brain_planner::LinkAck, WriterError>> + 'a>> {
         Box::pin(async move { Err(WriterError::Internal("fake writer: link unused".into())) })
     }
 
     fn submit_unlink<'a>(
         &'a self,
         _: brain_planner::UnlinkOp,
-    ) -> Pin<Box<dyn Future<Output = Result<brain_planner::UnlinkAck, WriterError>> + Send + 'a>>
-    {
+    ) -> Pin<Box<dyn Future<Output = Result<brain_planner::UnlinkAck, WriterError>> + 'a>> {
         Box::pin(async move { Err(WriterError::Internal("fake writer: unlink unused".into())) })
     }
 
     fn reserve_memory_id<'a>(
         &'a self,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<brain_core::MemoryId, WriterError>> + Send + 'a,
-        >,
+        Box<dyn std::future::Future<Output = Result<brain_core::MemoryId, WriterError>> + 'a>,
     > {
         Box::pin(async move {
             Err(WriterError::Internal(
@@ -304,11 +300,7 @@ impl WriterHandle for FakeWriterHandle {
         &'a self,
         _: brain_planner::TxnBatch,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<brain_planner::TxnBatchAck, WriterError>>
-                + Send
-                + 'a,
-        >,
+        Box<dyn std::future::Future<Output = Result<brain_planner::TxnBatchAck, WriterError>> + 'a>,
     > {
         Box::pin(async move {
             Err(WriterError::Internal(

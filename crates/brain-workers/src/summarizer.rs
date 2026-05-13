@@ -32,7 +32,7 @@ pub trait Summarizer: Send + Sync + 'static {
     fn summarize<'a>(
         &'a self,
         memories: &'a [&'a str],
-    ) -> Pin<Box<dyn Future<Output = Result<String, SummarizerError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<String, SummarizerError>> + 'a>>;
 }
 
 /// The substrate-default summarizer. Always returns
@@ -44,13 +44,7 @@ impl Summarizer for DisabledSummarizer {
     fn summarize<'a>(
         &'a self,
         _memories: &'a [&'a str],
-    ) -> Pin<Box<dyn Future<Output = Result<String, SummarizerError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<String, SummarizerError>> + 'a>> {
         Box::pin(async { Err(SummarizerError::Disabled) })
     }
 }
-
-// Compile-time Send + Sync guard.
-const _: fn() = || {
-    fn require<T: Send + Sync>() {}
-    require::<DisabledSummarizer>();
-};

@@ -30,30 +30,24 @@ pub mod context;
 pub mod dispatch;
 pub mod error;
 pub mod idempotency;
+pub mod ops;
 pub mod txn_lens;
-pub mod writer;
 
-// Per-op handler modules. 7.1 ships stubs; 7.3-7.10 replace each.
-pub mod encode;
-pub mod forget;
-pub mod link;
-pub mod plan;
-pub mod reason;
-pub mod recall;
-pub mod subscribe;
-pub mod txn;
+// Module-level re-exports preserve `brain_ops::<op>::*` paths so
+// external callers (brain-server, brain-planner) don't churn.
+pub use ops::{encode, forget, link, plan, reason, recall, subscribe, txn, writer};
 
 pub use access_buffer::{AccessBuffer, DEFAULT_ACCESS_BUFFER_CAPACITY};
 pub use brain_planner::PlannerContext;
 pub use context::OpsContext;
 pub use dispatch::dispatch;
 pub use error::{ErrorCode, OpError};
-pub use subscribe::{
-    EventBus, EventEnvelope, LsnAllocator, ParsedFilter, SubscriptionHandle, SubscriptionRegistry,
-    DEFAULT_EVENT_CHANNEL_CAPACITY,
+pub use ops::subscribe::{
+    parse_filter, EventBus, EventEnvelope, LsnAllocator, ParsedFilter, SubscriptionHandle,
+    SubscriptionRegistry, DEFAULT_EVENT_CHANNEL_CAPACITY,
 };
-pub use txn::{TxnState, TxnStore};
-pub use writer::RealWriterHandle;
+pub use ops::txn::{TxnState, TxnStore};
+pub use ops::writer::RealWriterHandle;
 
 #[cfg(test)]
 mod tests {
@@ -177,11 +171,7 @@ mod tests {
                 &'a self,
                 _op: EncodeOp,
             ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Result<EncodeAck, PlannerWriterError>>
-                        + Send
-                        + 'a,
-                >,
+                Box<dyn std::future::Future<Output = Result<EncodeAck, PlannerWriterError>> + 'a>,
             > {
                 Box::pin(
                     async move { Err(PlannerWriterError::Internal("unused in 7.1 tests".into())) },
@@ -191,11 +181,7 @@ mod tests {
                 &'a self,
                 _op: ForgetOp,
             ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Result<ForgetAck, PlannerWriterError>>
-                        + Send
-                        + 'a,
-                >,
+                Box<dyn std::future::Future<Output = Result<ForgetAck, PlannerWriterError>> + 'a>,
             > {
                 Box::pin(
                     async move { Err(PlannerWriterError::Internal("unused in 7.1 tests".into())) },
@@ -208,8 +194,7 @@ mod tests {
                 Box<
                     dyn std::future::Future<
                             Output = Result<brain_planner::LinkAck, PlannerWriterError>,
-                        > + Send
-                        + 'a,
+                        > + 'a,
                 >,
             > {
                 Box::pin(
@@ -223,8 +208,7 @@ mod tests {
                 Box<
                     dyn std::future::Future<
                             Output = Result<brain_planner::UnlinkAck, PlannerWriterError>,
-                        > + Send
-                        + 'a,
+                        > + 'a,
                 >,
             > {
                 Box::pin(
@@ -237,8 +221,7 @@ mod tests {
                 Box<
                     dyn std::future::Future<
                             Output = Result<brain_core::MemoryId, PlannerWriterError>,
-                        > + Send
-                        + 'a,
+                        > + 'a,
                 >,
             > {
                 Box::pin(
@@ -252,8 +235,7 @@ mod tests {
                 Box<
                     dyn std::future::Future<
                             Output = Result<brain_planner::TxnBatchAck, PlannerWriterError>,
-                        > + Send
-                        + 'a,
+                        > + 'a,
                 >,
             > {
                 Box::pin(
@@ -321,11 +303,5 @@ mod tests {
             Err(OpError::NotYetImplemented(msg)) => assert!(msg.contains("admin")),
             other => panic!("expected NotYetImplemented, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn ops_context_is_send_sync() {
-        fn require<T: Send + Sync>() {}
-        require::<OpsContext>();
     }
 }

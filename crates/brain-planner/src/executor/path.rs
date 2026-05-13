@@ -97,8 +97,18 @@ fn resolve_endpoint(
 ) -> Result<HashSet<MemoryId>, ExecError> {
     match state {
         PlanState::ByMemoryId(raw) => {
+            let id = MemoryId::from(*raw);
+            // Sub-task 9.16: spec §16/01 §12 — tombstoned memories
+            // aren't visible unless explicitly requested. A
+            // tombstoned start / goal returns an empty endpoint
+            // set; `execute_path` short-circuits to `NoPathFound`.
+            // Matches `search_active`'s silent-filter behavior for
+            // ByText endpoints.
+            if ctx.index.is_tombstoned(id) {
+                return Ok(HashSet::new());
+            }
             let mut s = HashSet::with_capacity(1);
-            s.insert(MemoryId::from(*raw));
+            s.insert(id);
             Ok(s)
         }
         PlanState::ByText(text) => {
@@ -259,6 +269,13 @@ fn run_bidirectional_bfs(
                     .collect()
             };
 
+            // Sub-task 9.16: drop committed tombstoned memories from
+            // PLAN traversals (spec §16/01 §12). Outside an active
+            // txn this is the only filter; inside one, the
+            // `snap.tombstoned` retain below layers in-flight
+            // tombstones on top.
+            neighbours.retain(|(_, other, _)| !ctx.index.is_tombstoned(*other));
+
             // Layer the txn snapshot on top: add pending links matching
             // this direction; remove pending unlinks. Spec §09/08 §5.
             if let Some(snap) = &ctx.txn {
@@ -277,7 +294,8 @@ fn run_bidirectional_bfs(
                     }
                     neighbours.retain(|(k, s, _)| !snap.pending_unlinks.contains(&(*s, *k, node)));
                 }
-                // Drop tombstoned neighbours.
+                // Drop in-flight tombstones (committed ones already
+                // dropped above).
                 neighbours.retain(|(_, other, _)| !snap.tombstoned.contains(other));
             }
 

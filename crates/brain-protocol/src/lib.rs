@@ -21,7 +21,9 @@ pub mod handshake;
 pub mod header;
 pub mod opcode;
 pub mod request;
+pub mod requests;
 pub mod response;
+pub mod responses;
 mod rkyv_codec;
 
 pub use error::{ErrorCategory, ErrorCode, ProtocolError};

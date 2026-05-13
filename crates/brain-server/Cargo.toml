@@ -11,8 +11,41 @@ description = "The Brain cognitive substrate server."
 name = "brain-server"
 path = "src/main.rs"
 
+[features]
+default = []
+# Sub-task 9.15 — feature-gated LLM summarizers. Both pull `reqwest`
+# (with rustls-tls, reusing 9.9's vendored stack). Default off: the
+# substrate works without consolidation per spec §11/03 §6.
+summarizer-openai = ["reqwest", "serde_json"]
+summarizer-ollama = ["reqwest", "serde_json"]
+
 [dependencies]
+# Brain crate dependencies are added in later Phase 9 sub-tasks as each one
+# is wired in (e.g. 9.4 shards → brain-storage; 9.5 metadata → brain-metadata,
+# ...). Keeping the import set minimal so this crate compiles on non-Linux
+# hosts during the pure-rust sub-tasks.
 brain-core = { path = "../brain-core" }
+
+anyhow.workspace = true
+arc-swap.workspace = true
+blake3.workspace = true
+flume.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+thiserror.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+# Glommio + the brain-* crates that pull Linux-only deps (io_uring, mmap,
+# candle, redb) live behind the target gate. The shard module is cfg-gated
+# so this crate still compiles on macOS / Windows for non-shard work
+# (config, routing).
+[target.'cfg(target_os = "linux")'.dependencies]
+glommio.workspace = true
 brain-protocol = { path = "../brain-protocol" }
 brain-storage = { path = "../brain-storage" }
 brain-metadata = { path = "../brain-metadata" }
@@ -22,8 +55,19 @@ brain-planner = { path = "../brain-planner" }
 brain-ops = { path = "../brain-ops" }
 brain-workers = { path = "../brain-workers" }
 
-anyhow.workspace = true
-serde.workspace = true
-toml.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
+# Connection layer (sub-task 9.9): Tokio TCP + optional rustls TLS.
+tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+socket2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+
+# Connection layer integration tests need to drive a TLS client.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tokio-rustls.workspace = true
+rustls.workspace = true
+rcgen.workspace = true

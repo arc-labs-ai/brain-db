@@ -1,3 +1,4 @@
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
 //! Edge scrub worker tests (sub-task 8.9). Spec §11/08 §1.
 
 use std::sync::atomic::Ordering;
@@ -134,8 +135,11 @@ async fn run_one(
     worker: &EdgeScrubWorker,
     ops: Arc<OpsContext>,
 ) -> Result<usize, brain_workers::WorkerError> {
-    let (_tx, rx) = tokio::sync::watch::channel(false);
-    let wctx = WorkerContext { ops, shutdown: rx };
+    let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wctx = WorkerContext {
+        ops,
+        shutdown: shutdown_flag.clone(),
+    };
     worker.run_cycle(&wctx).await
 }
 
@@ -143,262 +147,300 @@ async fn run_one(
 // Cycle behaviour (8).
 // ===========================================================================
 
-#[tokio::test]
-async fn live_to_live_edge_is_kept() {
-    let fix = build_fixture();
-    let a = seed_memory(&fix.metadata, 1);
-    let b = seed_memory(&fix.metadata, 2);
-    seed_edge_raw(&fix.metadata, a, EdgeKind::FollowedBy, b);
+#[test]
+fn live_to_live_edge_is_kept() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let a = seed_memory(&fix.metadata, 1);
+        let b = seed_memory(&fix.metadata, 2);
+        seed_edge_raw(&fix.metadata, a, EdgeKind::FollowedBy, b);
 
-    let worker = EdgeScrubWorker::new();
-    let removed = run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(removed, 0);
-    assert_eq!(count_edges_out(&fix.metadata), 1);
-    assert_eq!(count_edges_in(&fix.metadata), 1);
+        let worker = EdgeScrubWorker::new();
+        let removed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(count_edges_out(&fix.metadata), 1);
+        assert_eq!(count_edges_in(&fix.metadata), 1);
+    });
 }
 
-#[tokio::test]
-async fn edge_to_dead_target_removed_from_out() {
-    let fix = build_fixture();
-    let alive = seed_memory(&fix.metadata, 1);
-    let dead = make_id(99); // never seeded
-    seed_edge_raw(&fix.metadata, alive, EdgeKind::FollowedBy, dead);
-    assert_eq!(count_edges_out(&fix.metadata), 1);
+#[test]
+fn edge_to_dead_target_removed_from_out() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let alive = seed_memory(&fix.metadata, 1);
+        let dead = make_id(99); // never seeded
+        seed_edge_raw(&fix.metadata, alive, EdgeKind::FollowedBy, dead);
+        assert_eq!(count_edges_out(&fix.metadata), 1);
 
-    let worker = EdgeScrubWorker::new();
-    let removed = run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(removed, 1);
-    assert_eq!(count_edges_out(&fix.metadata), 0);
+        let worker = EdgeScrubWorker::new();
+        let removed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(count_edges_out(&fix.metadata), 0);
+    });
 }
 
-#[tokio::test]
-async fn edge_to_dead_target_mirror_in_also_removed() {
-    let fix = build_fixture();
-    let alive = seed_memory(&fix.metadata, 1);
-    let dead = make_id(99);
-    seed_edge_raw(&fix.metadata, alive, EdgeKind::Caused, dead);
-    assert_eq!(count_edges_in(&fix.metadata), 1);
+#[test]
+fn edge_to_dead_target_mirror_in_also_removed() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let alive = seed_memory(&fix.metadata, 1);
+        let dead = make_id(99);
+        seed_edge_raw(&fix.metadata, alive, EdgeKind::Caused, dead);
+        assert_eq!(count_edges_in(&fix.metadata), 1);
 
-    let worker = EdgeScrubWorker::new();
-    run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(count_edges_in(&fix.metadata), 0);
+        let worker = EdgeScrubWorker::new();
+        run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(count_edges_in(&fix.metadata), 0);
+    });
 }
 
-#[tokio::test]
-async fn edge_from_dead_source_removed_from_in() {
-    let fix = build_fixture();
-    let alive_tgt = seed_memory(&fix.metadata, 1);
-    let dead_src = make_id(99);
-    // Seed BOTH tables directly (simulating slot reclamation that
-    // removed EDGES_OUT[dead_src,*,*] + EDGES_IN[dead_src,*,*]
-    // but left mirror EDGES_IN[alive_tgt, K, dead_src] dangling
-    // — wait, the mirror is in EDGES_OUT[dead_src, K, alive_tgt]
-    // which slot reclamation removes. The surviving dangling row
-    // is EDGES_IN[alive_tgt, K, dead_src] — exactly what we want).
-    seed_edge_raw(&fix.metadata, dead_src, EdgeKind::FollowedBy, alive_tgt);
-    // Simulate post-reclamation: remove dead_src's MEMORIES row plus
-    // the EDGES_OUT[dead_src,*,*] entry.
-    {
-        let mut db = fix.metadata.lock();
-        let wtxn = db.write_txn().unwrap();
+#[test]
+fn edge_from_dead_source_removed_from_in() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let alive_tgt = seed_memory(&fix.metadata, 1);
+        let dead_src = make_id(99);
+        // Seed BOTH tables directly (simulating slot reclamation that
+        // removed EDGES_OUT[dead_src,*,*] + EDGES_IN[dead_src,*,*]
+        // but left mirror EDGES_IN[alive_tgt, K, dead_src] dangling
+        // — wait, the mirror is in EDGES_OUT[dead_src, K, alive_tgt]
+        // which slot reclamation removes. The surviving dangling row
+        // is EDGES_IN[alive_tgt, K, dead_src] — exactly what we want).
+        seed_edge_raw(&fix.metadata, dead_src, EdgeKind::FollowedBy, alive_tgt);
+        // Simulate post-reclamation: remove dead_src's MEMORIES row plus
+        // the EDGES_OUT[dead_src,*,*] entry.
         {
-            let mut out = wtxn.open_table(EDGES_OUT_TABLE).unwrap();
-            out.remove(&(
-                dead_src.to_be_bytes(),
-                EdgeKind::FollowedBy as u8,
-                alive_tgt.to_be_bytes(),
-            ))
-            .unwrap();
+            let mut db = fix.metadata.lock();
+            let wtxn = db.write_txn().unwrap();
+            {
+                let mut out = wtxn.open_table(EDGES_OUT_TABLE).unwrap();
+                out.remove(&(
+                    dead_src.to_be_bytes(),
+                    EdgeKind::FollowedBy as u8,
+                    alive_tgt.to_be_bytes(),
+                ))
+                .unwrap();
+            }
+            wtxn.commit().unwrap();
         }
-        wtxn.commit().unwrap();
-    }
-    assert_eq!(count_edges_out(&fix.metadata), 0);
-    assert_eq!(count_edges_in(&fix.metadata), 1);
+        assert_eq!(count_edges_out(&fix.metadata), 0);
+        assert_eq!(count_edges_in(&fix.metadata), 1);
 
-    let worker = EdgeScrubWorker::new();
-    let removed = run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(
-        removed, 1,
-        "dangling EDGES_IN[alive, K, dead] must be scrubbed"
-    );
-    assert_eq!(count_edges_in(&fix.metadata), 0);
+        let worker = EdgeScrubWorker::new();
+        let removed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(
+            removed, 1,
+            "dangling EDGES_IN[alive, K, dead] must be scrubbed"
+        );
+        assert_eq!(count_edges_in(&fix.metadata), 0);
+    });
 }
 
-#[tokio::test]
-async fn both_endpoints_dead_edge_removed() {
-    let fix = build_fixture();
-    let dead1 = make_id(99);
-    let dead2 = make_id(100);
-    seed_edge_raw(&fix.metadata, dead1, EdgeKind::FollowedBy, dead2);
+#[test]
+fn both_endpoints_dead_edge_removed() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let dead1 = make_id(99);
+        let dead2 = make_id(100);
+        seed_edge_raw(&fix.metadata, dead1, EdgeKind::FollowedBy, dead2);
 
-    let worker = EdgeScrubWorker::new();
-    let removed = run_one(&worker, fix.ctx).await.unwrap();
-    assert!(
-        removed >= 1,
-        "both-dead edge must be scrubbed, got {removed}"
-    );
-    assert_eq!(count_edges_out(&fix.metadata), 0);
-    assert_eq!(count_edges_in(&fix.metadata), 0);
+        let worker = EdgeScrubWorker::new();
+        let removed = run_one(&worker, fix.ctx).await.unwrap();
+        assert!(
+            removed >= 1,
+            "both-dead edge must be scrubbed, got {removed}"
+        );
+        assert_eq!(count_edges_out(&fix.metadata), 0);
+        assert_eq!(count_edges_in(&fix.metadata), 0);
+    });
 }
 
-#[tokio::test]
-async fn batch_size_caps_per_cycle() {
-    let fix = build_fixture();
-    let alive = seed_memory(&fix.metadata, 1);
-    // 30 distinct dead targets.
-    for slot in 100..130u64 {
-        seed_edge_raw(&fix.metadata, alive, EdgeKind::FollowedBy, make_id(slot));
-    }
-    assert_eq!(count_edges_out(&fix.metadata), 30);
-
-    let cfg = WorkerConfig {
-        enabled: true,
-        interval: Duration::from_secs(60),
-        batch_size: 10,
-        max_runtime: Duration::from_secs(60),
-    };
-    let worker = EdgeScrubWorker::new().with_config(cfg);
-    let removed = run_one(&worker, fix.ctx).await.unwrap();
-    // EDGES_OUT phase removes 10 (capped by batch_size); the EDGES_IN
-    // phase also runs and may catch additional mirrors. Bound the
-    // total at batch_size×2.
-    assert!(
-        (10..=20).contains(&removed),
-        "expected 10..=20 removals, got {removed}"
-    );
-    let remaining = count_edges_out(&fix.metadata);
-    assert!(
-        remaining < 30,
-        "some edges must remain after capped cycle (got {remaining})"
-    );
-}
-
-#[tokio::test]
-async fn cursor_advances_across_cycles() {
-    let fix = build_fixture();
-    let alive = seed_memory(&fix.metadata, 1);
-    for slot in 100..130u64 {
-        seed_edge_raw(&fix.metadata, alive, EdgeKind::FollowedBy, make_id(slot));
-    }
-    let cfg = WorkerConfig {
-        enabled: true,
-        interval: Duration::from_secs(60),
-        batch_size: 10,
-        max_runtime: Duration::from_secs(60),
-    };
-    let worker = EdgeScrubWorker::new().with_config(cfg);
-
-    let mut total = 0;
-    for _ in 0..6 {
-        total += run_one(&worker, fix.ctx.clone()).await.unwrap();
-        if count_edges_out(&fix.metadata) == 0 {
-            break;
+#[test]
+fn batch_size_caps_per_cycle() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let alive = seed_memory(&fix.metadata, 1);
+        // 30 distinct dead targets.
+        for slot in 100..130u64 {
+            seed_edge_raw(&fix.metadata, alive, EdgeKind::FollowedBy, make_id(slot));
         }
-    }
-    let _ = total;
-    assert_eq!(count_edges_out(&fix.metadata), 0, "all orphans removed");
-    assert_eq!(count_edges_in(&fix.metadata), 0);
+        assert_eq!(count_edges_out(&fix.metadata), 30);
+
+        let cfg = WorkerConfig {
+            enabled: true,
+            interval: Duration::from_secs(60),
+            batch_size: 10,
+            max_runtime: Duration::from_secs(60),
+        };
+        let worker = EdgeScrubWorker::new().with_config(cfg);
+        let removed = run_one(&worker, fix.ctx).await.unwrap();
+        // EDGES_OUT phase removes 10 (capped by batch_size); the EDGES_IN
+        // phase also runs and may catch additional mirrors. Bound the
+        // total at batch_size×2.
+        assert!(
+            (10..=20).contains(&removed),
+            "expected 10..=20 removals, got {removed}"
+        );
+        let remaining = count_edges_out(&fix.metadata);
+        assert!(
+            remaining < 30,
+            "some edges must remain after capped cycle (got {remaining})"
+        );
+    });
 }
 
-#[tokio::test]
-async fn mixed_live_and_orphan_only_orphans_removed() {
-    let fix = build_fixture();
-    let a = seed_memory(&fix.metadata, 1);
-    let b = seed_memory(&fix.metadata, 2);
-    let dead = make_id(99);
-    seed_edge_raw(&fix.metadata, a, EdgeKind::FollowedBy, b);
-    seed_edge_raw(&fix.metadata, a, EdgeKind::FollowedBy, dead);
-    seed_edge_raw(&fix.metadata, b, EdgeKind::Caused, a);
+#[test]
+fn cursor_advances_across_cycles() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let alive = seed_memory(&fix.metadata, 1);
+        for slot in 100..130u64 {
+            seed_edge_raw(&fix.metadata, alive, EdgeKind::FollowedBy, make_id(slot));
+        }
+        let cfg = WorkerConfig {
+            enabled: true,
+            interval: Duration::from_secs(60),
+            batch_size: 10,
+            max_runtime: Duration::from_secs(60),
+        };
+        let worker = EdgeScrubWorker::new().with_config(cfg);
 
-    let worker = EdgeScrubWorker::new();
-    run_one(&worker, fix.ctx).await.unwrap();
-    // Live↔live edges keep their pair (in + out).
-    assert_eq!(count_edges_out(&fix.metadata), 2);
-    assert_eq!(count_edges_in(&fix.metadata), 2);
+        let mut total = 0;
+        for _ in 0..6 {
+            total += run_one(&worker, fix.ctx.clone()).await.unwrap();
+            if count_edges_out(&fix.metadata) == 0 {
+                break;
+            }
+        }
+        let _ = total;
+        assert_eq!(count_edges_out(&fix.metadata), 0, "all orphans removed");
+        assert_eq!(count_edges_in(&fix.metadata), 0);
+    });
+}
+
+#[test]
+fn mixed_live_and_orphan_only_orphans_removed() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let a = seed_memory(&fix.metadata, 1);
+        let b = seed_memory(&fix.metadata, 2);
+        let dead = make_id(99);
+        seed_edge_raw(&fix.metadata, a, EdgeKind::FollowedBy, b);
+        seed_edge_raw(&fix.metadata, a, EdgeKind::FollowedBy, dead);
+        seed_edge_raw(&fix.metadata, b, EdgeKind::Caused, a);
+
+        let worker = EdgeScrubWorker::new();
+        run_one(&worker, fix.ctx).await.unwrap();
+        // Live↔live edges keep their pair (in + out).
+        assert_eq!(count_edges_out(&fix.metadata), 2);
+        assert_eq!(count_edges_in(&fix.metadata), 2);
+    });
 }
 
 // ===========================================================================
 // Worker integration (3).
 // ===========================================================================
 
-#[tokio::test]
-async fn worker_registers_with_correct_kind_and_default_cadence() {
-    let fix = build_fixture();
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(Arc::new(EdgeScrubWorker::new()), fix.ctx)
-        .unwrap();
-    let cfg = sched.config(WorkerKind::EdgeScrub.name()).unwrap();
-    assert_eq!(cfg.interval, Duration::from_secs(1800));
-    sched.shutdown().await.unwrap();
+#[test]
+fn worker_registers_with_correct_kind_and_default_cadence() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(Arc::new(EdgeScrubWorker::new()), fix.ctx)
+            .unwrap();
+        let cfg = sched.config(WorkerKind::EdgeScrub.name()).unwrap();
+        assert_eq!(cfg.interval, Duration::from_secs(1800));
+        sched.shutdown().await.unwrap();
+    });
 }
 
-#[tokio::test]
-async fn disabled_worker_via_config_does_not_scrub() {
-    let fix = build_fixture();
-    let alive = seed_memory(&fix.metadata, 1);
-    let dead = make_id(99);
-    seed_edge_raw(&fix.metadata, alive, EdgeKind::FollowedBy, dead);
-    let cfg = WorkerConfig {
-        enabled: false,
-        interval: Duration::from_millis(20),
-        batch_size: 100,
-        max_runtime: Duration::from_secs(1),
-    };
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(Arc::new(EdgeScrubWorker::new().with_config(cfg)), fix.ctx)
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    sched.shutdown().await.unwrap();
-    assert_eq!(
-        count_edges_out(&fix.metadata),
-        1,
-        "disabled worker must not touch edges"
-    );
+#[test]
+fn disabled_worker_via_config_does_not_scrub() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let alive = seed_memory(&fix.metadata, 1);
+        let dead = make_id(99);
+        seed_edge_raw(&fix.metadata, alive, EdgeKind::FollowedBy, dead);
+        let cfg = WorkerConfig {
+            enabled: false,
+            interval: Duration::from_millis(20),
+            batch_size: 100,
+            max_runtime: Duration::from_secs(1),
+        };
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(Arc::new(EdgeScrubWorker::new().with_config(cfg)), fix.ctx)
+            .unwrap();
+        glommio::timer::sleep(Duration::from_millis(150)).await;
+        sched.shutdown().await.unwrap();
+        assert_eq!(
+            count_edges_out(&fix.metadata),
+            1,
+            "disabled worker must not touch edges"
+        );
+    });
 }
 
-#[tokio::test]
-async fn cycle_processed_count_feeds_metrics() {
-    let fix = build_fixture();
-    let alive = seed_memory(&fix.metadata, 1);
-    for slot in 100..103u64 {
-        seed_edge_raw(&fix.metadata, alive, EdgeKind::FollowedBy, make_id(slot));
-    }
-    let cfg = WorkerConfig {
-        enabled: true,
-        interval: Duration::from_millis(20),
-        batch_size: 100,
-        max_runtime: Duration::from_secs(1),
-    };
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(Arc::new(EdgeScrubWorker::new().with_config(cfg)), fix.ctx)
-        .unwrap();
-    let metrics = sched.metrics(WorkerKind::EdgeScrub.name()).unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_millis(500);
-    while std::time::Instant::now() < deadline {
-        if metrics.processed_total.load(Ordering::Relaxed) >= 3 {
-            break;
+#[test]
+fn cycle_processed_count_feeds_metrics() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let alive = seed_memory(&fix.metadata, 1);
+        for slot in 100..103u64 {
+            seed_edge_raw(&fix.metadata, alive, EdgeKind::FollowedBy, make_id(slot));
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    sched.shutdown().await.unwrap();
-    assert!(
-        metrics.processed_total.load(Ordering::Relaxed) >= 3,
-        "expected ≥3 processed, got {}",
-        metrics.processed_total.load(Ordering::Relaxed)
-    );
+        let cfg = WorkerConfig {
+            enabled: true,
+            interval: Duration::from_millis(20),
+            batch_size: 100,
+            max_runtime: Duration::from_secs(1),
+        };
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(Arc::new(EdgeScrubWorker::new().with_config(cfg)), fix.ctx)
+            .unwrap();
+        let metrics = sched.metrics(WorkerKind::EdgeScrub.name()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            if metrics.processed_total.load(Ordering::Relaxed) >= 3 {
+                break;
+            }
+            glommio::timer::sleep(Duration::from_millis(5)).await;
+        }
+        sched.shutdown().await.unwrap();
+        assert!(
+            metrics.processed_total.load(Ordering::Relaxed) >= 3,
+            "expected ≥3 processed, got {}",
+            metrics.processed_total.load(Ordering::Relaxed)
+        );
+    });
 }
 
 // ===========================================================================
 // Edge cases (1).
 // ===========================================================================
 
-#[tokio::test]
-async fn empty_edge_tables_cycle_is_noop() {
-    let fix = build_fixture();
-    let worker = EdgeScrubWorker::new();
-    let removed = run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(removed, 0);
+#[test]
+fn empty_edge_tables_cycle_is_noop() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let worker = EdgeScrubWorker::new();
+        let removed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(removed, 0);
+    });
+}
+
+fn glommio_run<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + 'static,
+    T: Send + 'static,
+{
+    glommio::LocalExecutorBuilder::default()
+        .name("worker-test")
+        .spawn(move || async move { f().await })
+        .expect("spawn glommio test executor")
+        .join()
+        .expect("test executor join")
 }

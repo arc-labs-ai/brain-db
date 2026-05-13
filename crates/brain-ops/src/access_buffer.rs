@@ -98,7 +98,3 @@ impl Default for AccessBuffer {
 }
 
 // Send + Sync via the mutex; explicit guard for the public surface.
-const _: fn() = || {
-    fn require<T: Send + Sync>() {}
-    require::<AccessBuffer>();
-};

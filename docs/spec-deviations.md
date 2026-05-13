@@ -73,8 +73,18 @@ The spec wins in general (per `CLAUDE.md` §2 and `AUTONOMY.md` §2); the entrie
 - **Spec:** `spec/05_storage_arena_wal/06_wal_durability.md` §2.3 prescribes `io_uring` (Glommio).
 - **Implementation:** synchronous `pwritev2(RWF_DSYNC)` from a dedicated OS thread per `GroupCommitter`.
 - **Reason:** Glommio hasn't been wired into `brain-storage`. Pulling it in for 2.8 alone would mean adding the runtime, picking an executor model, and coupling the committer to it — all before the rest of the system (request handler, server) is ready to live on Glommio.
-- **Plan reference:** `.claude/plans/phase-02-task-08.md` §3.2.
-- **Reconcile by:** Phase 9 — replace the committer thread with a Glommio coroutine using `io_uring`. The `GroupCommitter` public API (`append → AppendHandle::wait`) is shaped so the swap is local.
+- **Plan reference:** `.claude/plans/phase-02-task-08.md` §3.2; `.claude/plans/phase-09-task-06a.md`.
+- **Status:** **Reconciled** in sub-task 9.6a. `GroupCommitter` now runs as a `glommio::spawn_local` coroutine on the shard's executor; `WalSegment` uses `glommio::io::BufferedFile` with `write_at` + `fdatasync` (both io_uring). The dedicated OS thread + `crossbeam_channel` are gone; flume is the runtime-agnostic mpsc primitive.
+
+---
+
+## SD-2.8-2-b: Two-syscall fsync (`write_at` + `fdatasync`) instead of single `pwritev2(RWF_DSYNC)`
+
+- **Spec:** `spec/05_storage_arena_wal/06_wal_durability.md` §2.2 prescribes the durable write as a single `pwritev2` syscall with the `RWF_DSYNC` flag (write + fdatasync atomically).
+- **Implementation (post-9.6a):** `BufferedFile::write_at(buf, pos).await` followed by `BufferedFile::fdatasync().await` — two io_uring syscalls per batch.
+- **Reason:** Glommio's typed `BufferedFile` API doesn't expose `RWF_DSYNC` on `write_at`. The two-syscall equivalent preserves the durability guarantee (the kernel returns from `fdatasync` only when the prior writes are on stable storage) at the cost of one extra syscall per group-commit batch. At 10K commits/sec the overhead is ~100 µs/sec aggregate; negligible.
+- **Plan reference:** `.claude/plans/phase-09-task-06a.md` §2.
+- **Reconcile by:** v2 if benchmarks demand it — would require dropping into raw io_uring submission (`io_uring_prep_writev2` with `RWF_DSYNC` in the flags field). Glommio doesn't expose a stable public API for that today.
 
 ---
 
@@ -83,8 +93,8 @@ The spec wins in general (per `CLAUDE.md` §2 and `AUTONOMY.md` §2); the entrie
 - **Spec / phase doc:** phase-02 sub-task 2.9 prescribes `pub async fn append(&self, record: WalRecord) -> Result<Lsn>`. Spec §07 §3 implies an async writer task.
 - **Implementation:** synchronous `pub fn append(&mut self, record: WalRecord) -> Result<Lsn, WalError>`.
 - **Reason:** carries forward SD-2.8-2 — there's no async runtime in `brain-storage` yet. The `&mut self` change (rather than `&self` + interior mutability) reflects spec §07 §15's single-writer-per-shard discipline at the type level: the borrow checker enforces that there's only one active writer.
-- **Plan reference:** `.claude/plans/phase-02-task-09.md` §3.1.
-- **Reconcile by:** Phase 9, alongside SD-2.8-2. Becomes `pub async fn append(&self, record) -> Result<Lsn>` once the writer runs as a Glommio coroutine and the committer is `&self`-safe via the runtime's task-local guarantees.
+- **Plan reference:** `.claude/plans/phase-02-task-09.md` §3.1; `.claude/plans/phase-09-task-06a.md`.
+- **Status:** **Reconciled** in sub-task 9.6a. `Wal::append` is `async fn(&self, …)`; interior mutability via `RefCell<WalInner>` (single-threaded Glommio executor — no cross-thread access). Spec §07 §15 single-writer-per-shard now enforced by *living on one executor*, not by `&mut self`. Invariant: never hold `borrow_mut()` across `.await` — documented inline.
 
 ---
 
@@ -184,3 +194,16 @@ The spec wins in general (per `CLAUDE.md` §2 and `AUTONOMY.md` §2); the entrie
 - **Cost:** a one-time ~130 MiB allocation at startup (BGE-small weights). Weights stay resident for the process lifetime regardless, so this is a startup cost, not a steady-state cost.
 - **Plan reference:** `.claude/plans/phase-05-task-01.md`.
 - **Reconcile by:** if startup memory pressure becomes an issue at large model sizes, opt into the mmap loader by lifting `forbid(unsafe_code)` in a single audited spot. No urgency at v1.
+
+---
+
+## SD-10.6-1: `crossbeam-epoch` is intentionally unused by first-party code in v1
+
+- **Spec:** `spec/10_concurrency_epochs/06_crossbeam_epoch.md` prescribes `crossbeam-epoch` for HNSW node management during incremental cleanup (§2), lock-free slot free lists (§4), and other lock-free structures within a shard (§2). The spec assumes Brain ships a custom HNSW and other internal lock-free data structures.
+- **Implementation:** Brain pins `crossbeam-epoch = "0.9"` in `Cargo.toml`'s workspace block but no first-party crate imports it. The dependency stays so future sub-tasks can pull it in without a cargo-resolution churn.
+- **Reason — single-writer-per-shard removes the need:** spec §10/02 mandates a single-writer-per-shard discipline. Inside a shard's Glommio executor (sub-task 9.4, §01/05), there are no concurrent writers to coordinate. Readers either (a) don't share state with the writer (separate Glommio tasks own their data) or (b) coordinate via `Arc` refcount semantics through `SharedHnsw`'s `Arc<RwLock<HnswIndex>>` per SD-4.8-1. The audit's §10/06 §5 even acknowledges this: "with single-writer-per-shard, much of crossbeam-epoch's complexity goes unused".
+- **Reason — HNSW node management lives in `hnsw_rs`:** the one spec use case that would have required crossbeam-epoch directly is HNSW node-level reclamation. With `hnsw_rs` mandated by CLAUDE.md §6, that reclamation is the crate's internal responsibility — `hnsw_rs` ships its own strategy (mostly arena-allocated `Box`es behind the layer abstraction; no exposed epochs surface). Reaching past the `hnsw_rs` API to manage its internals would be a layering violation.
+- **Reason — slot free lists don't need lock-free machinery:** `SlotAllocator` (sub-task 2.6) uses a plain `Vec`-backed free list. The writer is the only mutator (single-writer-per-shard); allocator/free are interleaved synchronously, so no CAS loop or epoch tracking is required. Spec §10/06 §5 explicitly notes "(In Brain, the writer-per-shard discipline obviates the CAS loop)".
+- **What's not implemented:** None of the spec's named use cases — HNSW node management (lives in `hnsw_rs`), slot free lists (plain `Vec`), other lock-free shard-internal structures (none today).
+- **Plan reference:** `.claude/plans/phase-09-task-12.md`.
+- **Reconcile by:** Phase 12+ — when replication, parallel HNSW workers, or cross-shard reclamation are added, the epoch-based reclamation surface may genuinely be needed. The dependency stays in `Cargo.toml` so the introduction is a single `use crossbeam_epoch::…` away.

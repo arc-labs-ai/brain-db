@@ -1,3 +1,4 @@
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
 //! Snapshot worker tests (sub-task 8.13). Spec §11/08 §6.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,8 +56,11 @@ async fn run_one(
     worker: &SnapshotWorker,
     ops: Arc<OpsContext>,
 ) -> Result<usize, brain_workers::WorkerError> {
-    let (_tx, rx) = tokio::sync::watch::channel(false);
-    let wctx = WorkerContext { ops, shutdown: rx };
+    let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wctx = WorkerContext {
+        ops,
+        shutdown: shutdown_flag.clone(),
+    };
     worker.run_cycle(&wctx).await
 }
 
@@ -219,143 +223,173 @@ impl SnapshotSource for FailingSource {
 // Source surface (3).
 // ===========================================================================
 
-#[tokio::test]
-async fn disabled_source_returns_disabled_on_every_method() {
-    let s = DisabledSnapshotSource;
-    assert!(matches!(
-        s.take_snapshot().await,
-        Err(SnapshotSourceError::Disabled)
-    ));
-    assert!(matches!(
-        s.list_snapshots().await,
-        Err(SnapshotSourceError::Disabled)
-    ));
-    assert!(matches!(
-        s.delete_snapshot(SnapshotId(1)).await,
-        Err(SnapshotSourceError::Disabled)
-    ));
+#[test]
+fn disabled_source_returns_disabled_on_every_method() {
+    glommio_run(|| async {
+        let s = DisabledSnapshotSource;
+        assert!(matches!(
+            s.take_snapshot().await,
+            Err(SnapshotSourceError::Disabled)
+        ));
+        assert!(matches!(
+            s.list_snapshots().await,
+            Err(SnapshotSourceError::Disabled)
+        ));
+        assert!(matches!(
+            s.delete_snapshot(SnapshotId(1)).await,
+            Err(SnapshotSourceError::Disabled)
+        ));
+    });
 }
 
-#[tokio::test]
-async fn stub_source_take_returns_monotonic_id() {
-    let stub = StubSource::new();
-    let a = stub.take_snapshot().await.unwrap();
-    let b = stub.take_snapshot().await.unwrap();
-    assert!(b.0 > a.0);
-    assert_eq!(stub.list_snapshots().await.unwrap().len(), 2);
+#[test]
+fn stub_source_take_returns_monotonic_id() {
+    glommio_run(|| async {
+        let stub = StubSource::new();
+        let a = stub.take_snapshot().await.unwrap();
+        let b = stub.take_snapshot().await.unwrap();
+        assert!(b.0 > a.0);
+        assert_eq!(stub.list_snapshots().await.unwrap().len(), 2);
+    });
 }
 
-#[tokio::test]
-async fn failed_source_propagates_as_worker_error() {
-    let (ops, _td) = make_ops_context();
-    let mut cfg = WorkerConfig::defaults_for(WorkerKind::Snapshot);
-    cfg.enabled = true;
-    let worker = SnapshotWorker::new(Arc::new(FailingSource)).with_config(cfg);
-    let r = run_one(&worker, ops).await;
-    assert!(
-        matches!(r, Err(brain_workers::WorkerError::Ops(_))),
-        "Failed must surface, got {r:?}"
-    );
+#[test]
+fn failed_source_propagates_as_worker_error() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let mut cfg = WorkerConfig::defaults_for(WorkerKind::Snapshot);
+        cfg.enabled = true;
+        let worker = SnapshotWorker::new(Arc::new(FailingSource)).with_config(cfg);
+        let r = run_one(&worker, ops).await;
+        assert!(
+            matches!(r, Err(brain_workers::WorkerError::Ops(_))),
+            "Failed must surface, got {r:?}"
+        );
+    });
 }
 
 // ===========================================================================
 // Cycle (3).
 // ===========================================================================
 
-#[tokio::test]
-async fn disabled_worker_via_config_does_not_take() {
-    let (ops, _td) = make_ops_context();
-    let stub = StubSource::new();
-    let deleted = stub.deleted.clone();
-    let snaps = stub as Arc<dyn SnapshotSource>;
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(
-            Arc::new(SnapshotWorker::new(snaps).with_config(WorkerConfig {
-                enabled: false,
-                interval: Duration::from_millis(20),
-                batch_size: 1,
-                max_runtime: Duration::from_secs(1),
-            })),
-            ops,
-        )
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    sched.shutdown().await.unwrap();
-    assert!(
-        deleted.lock().is_empty(),
-        "disabled worker must not delete anything"
-    );
+#[test]
+fn disabled_worker_via_config_does_not_take() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let stub = StubSource::new();
+        let deleted = stub.deleted.clone();
+        let snaps = stub as Arc<dyn SnapshotSource>;
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(
+                Arc::new(SnapshotWorker::new(snaps).with_config(WorkerConfig {
+                    enabled: false,
+                    interval: Duration::from_millis(20),
+                    batch_size: 1,
+                    max_runtime: Duration::from_secs(1),
+                })),
+                ops,
+            )
+            .unwrap();
+        glommio::timer::sleep(Duration::from_millis(150)).await;
+        sched.shutdown().await.unwrap();
+        assert!(
+            deleted.lock().is_empty(),
+            "disabled worker must not delete anything"
+        );
+    });
 }
 
-#[tokio::test]
-async fn enabled_worker_takes_snapshot_and_reports_count() {
-    let (ops, _td) = make_ops_context();
-    let stub = StubSource::new();
-    let snaps = stub.clone();
-    let mut cfg = WorkerConfig::defaults_for(WorkerKind::Snapshot);
-    cfg.enabled = true;
-    let worker = SnapshotWorker::new(snaps as Arc<dyn SnapshotSource>).with_config(cfg);
-    let processed = run_one(&worker, ops).await.unwrap();
-    assert_eq!(processed, 1, "took 1 new snapshot, no retention deletions");
-    assert_eq!(stub.snapshots.lock().len(), 1);
+#[test]
+fn enabled_worker_takes_snapshot_and_reports_count() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let stub = StubSource::new();
+        let snaps = stub.clone();
+        let mut cfg = WorkerConfig::defaults_for(WorkerKind::Snapshot);
+        cfg.enabled = true;
+        let worker = SnapshotWorker::new(snaps as Arc<dyn SnapshotSource>).with_config(cfg);
+        let processed = run_one(&worker, ops).await.unwrap();
+        assert_eq!(processed, 1, "took 1 new snapshot, no retention deletions");
+        assert_eq!(stub.snapshots.lock().len(), 1);
+    });
 }
 
-#[tokio::test]
-async fn enabled_worker_deletes_old_snapshots_per_retention() {
-    let (ops, _td) = make_ops_context();
-    let stub = StubSource::new();
-    // Pre-seed 9 old snapshots.
-    {
-        let now = now_unix_nanos();
-        let mut g = stub.snapshots.lock();
-        for i in 1..=9u64 {
-            g.push(SnapshotDesc {
-                id: SnapshotId(100 + i),
-                taken_at_unix_nanos: now.saturating_sub(i * DAY_NS),
-                size_bytes: 0,
-            });
+#[test]
+fn enabled_worker_deletes_old_snapshots_per_retention() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let stub = StubSource::new();
+        // Pre-seed 9 old snapshots.
+        {
+            let now = now_unix_nanos();
+            let mut g = stub.snapshots.lock();
+            for i in 1..=9u64 {
+                g.push(SnapshotDesc {
+                    id: SnapshotId(100 + i),
+                    taken_at_unix_nanos: now.saturating_sub(i * DAY_NS),
+                    size_bytes: 0,
+                });
+            }
+            stub.next_id.store(110, Ordering::Relaxed);
         }
-        stub.next_id.store(110, Ordering::Relaxed);
-    }
-    let snaps = stub.clone();
-    let mut cfg = WorkerConfig::defaults_for(WorkerKind::Snapshot);
-    cfg.enabled = true;
-    let worker = SnapshotWorker::new(snaps as Arc<dyn SnapshotSource>)
-        .with_config(cfg)
-        .with_retention(RetentionPolicy {
-            max_count: 7,
-            max_age: Duration::from_secs(365 * 24 * 3600),
-        });
-    // Cycle: takes 1 new (total 10), retention drops 3 → processed = 4.
-    let processed = run_one(&worker, ops).await.unwrap();
-    assert_eq!(processed, 4);
-    assert_eq!(stub.snapshots.lock().len(), 7);
-    assert_eq!(stub.deleted.lock().len(), 3);
+        let snaps = stub.clone();
+        let mut cfg = WorkerConfig::defaults_for(WorkerKind::Snapshot);
+        cfg.enabled = true;
+        let worker = SnapshotWorker::new(snaps as Arc<dyn SnapshotSource>)
+            .with_config(cfg)
+            .with_retention(RetentionPolicy {
+                max_count: 7,
+                max_age: Duration::from_secs(365 * 24 * 3600),
+            });
+        // Cycle: takes 1 new (total 10), retention drops 3 → processed = 4.
+        let processed = run_one(&worker, ops).await.unwrap();
+        assert_eq!(processed, 4);
+        assert_eq!(stub.snapshots.lock().len(), 7);
+        assert_eq!(stub.deleted.lock().len(), 3);
+    });
 }
 
 // ===========================================================================
 // Worker integration (2).
 // ===========================================================================
 
-#[tokio::test]
-async fn worker_registers_with_correct_kind_and_default_cadence_disabled() {
-    let (ops, _td) = make_ops_context();
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(
-            Arc::new(SnapshotWorker::new(Arc::new(DisabledSnapshotSource))),
-            ops,
-        )
-        .unwrap();
-    let cfg = sched.config(WorkerKind::Snapshot.name()).unwrap();
-    assert_eq!(cfg.interval, Duration::from_secs(3600));
-    assert!(!cfg.enabled, "spec §6.2 — Snapshot defaults to disabled");
-    sched.shutdown().await.unwrap();
+#[test]
+fn worker_registers_with_correct_kind_and_default_cadence_disabled() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(
+                Arc::new(SnapshotWorker::new(Arc::new(DisabledSnapshotSource))),
+                ops,
+            )
+            .unwrap();
+        let cfg = sched.config(WorkerKind::Snapshot.name()).unwrap();
+        assert_eq!(cfg.interval, Duration::from_secs(3600));
+        assert!(!cfg.enabled, "spec §6.2 — Snapshot defaults to disabled");
+        sched.shutdown().await.unwrap();
+    });
 }
 
-#[tokio::test]
-async fn default_config_has_enabled_false_per_spec() {
-    let cfg = WorkerConfig::defaults_for(WorkerKind::Snapshot);
-    assert!(!cfg.enabled);
+#[test]
+fn default_config_has_enabled_false_per_spec() {
+    glommio_run(|| async {
+        let cfg = WorkerConfig::defaults_for(WorkerKind::Snapshot);
+        assert!(!cfg.enabled);
+    });
+}
+
+fn glommio_run<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + 'static,
+    T: Send + 'static,
+{
+    glommio::LocalExecutorBuilder::default()
+        .name("worker-test")
+        .spawn(move || async move { f().await })
+        .expect("spawn glommio test executor")
+        .join()
+        .expect("test executor join")
 }

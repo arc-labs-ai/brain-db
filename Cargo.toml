@@ -32,7 +32,19 @@ repository = "https://github.com/brain-db-io/brain-db"
 [workspace.dependencies]
 # Async / runtime
 glommio = "0.9"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "sync"] }
+# rustls 0.23 bundles `aws-lc-rs` as its default crypto provider; we
+# install it at startup. tls12 stays off — spec §03/02 §2.2 mandates
+# TLS 1.3 only; we also restrict via `ServerConfig::with_protocol_versions`.
+rustls = { version = "0.23", default-features = false, features = ["std", "logging", "aws-lc-rs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
+socket2 = { version = "0.5", features = ["all"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Runtime-agnostic mpsc (used at the Tokio↔Glommio shard boundary, spec §01/04).
+flume = { version = "0.11", default-features = false, features = ["async", "select"] }
+futures-lite = "2"
 
 # Serialization
 rkyv = { version = "0.7", features = ["validation"] }

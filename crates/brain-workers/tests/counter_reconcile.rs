@@ -1,3 +1,4 @@
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
 //! Counter reconciliation worker tests (sub-task 8.10). Spec §11/08 §2.
 
 use std::sync::Arc;
@@ -135,8 +136,11 @@ async fn run_one(
     worker: &CounterReconcileWorker,
     ops: Arc<OpsContext>,
 ) -> Result<usize, brain_workers::WorkerError> {
-    let (_tx, rx) = tokio::sync::watch::channel(false);
-    let wctx = WorkerContext { ops, shutdown: rx };
+    let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wctx = WorkerContext {
+        ops,
+        shutdown: shutdown_flag.clone(),
+    };
     worker.run_cycle(&wctx).await
 }
 
@@ -153,162 +157,196 @@ fn batchy_config(batch_size: usize) -> WorkerConfig {
 // Cycle behaviour (7).
 // ===========================================================================
 
-#[tokio::test]
-async fn correctly_stamped_memory_needs_no_fix() {
-    let fix = build_fixture();
-    // a will have 1 incoming, 0 outgoing. b will have 1 outgoing, 0
-    // incoming. Edge points b → a.
-    let a = seed_memory_with_counts(&fix.metadata, 1, 0, 1);
-    let b = seed_memory_with_counts(&fix.metadata, 2, 1, 0);
-    seed_edge_raw(&fix.metadata, b, EdgeKind::FollowedBy, a);
+#[test]
+fn correctly_stamped_memory_needs_no_fix() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        // a will have 1 incoming, 0 outgoing. b will have 1 outgoing, 0
+        // incoming. Edge points b → a.
+        let a = seed_memory_with_counts(&fix.metadata, 1, 0, 1);
+        let b = seed_memory_with_counts(&fix.metadata, 2, 1, 0);
+        seed_edge_raw(&fix.metadata, b, EdgeKind::FollowedBy, a);
 
-    let worker = CounterReconcileWorker::new().with_config(batchy_config(100));
-    let fixed = run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(fixed, 0);
-    assert_eq!(read_counts(&fix.metadata, a), (0, 1));
-    assert_eq!(read_counts(&fix.metadata, b), (1, 0));
+        let worker = CounterReconcileWorker::new().with_config(batchy_config(100));
+        let fixed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(fixed, 0);
+        assert_eq!(read_counts(&fix.metadata, a), (0, 1));
+        assert_eq!(read_counts(&fix.metadata, b), (1, 0));
+    });
 }
 
-#[tokio::test]
-async fn under_counted_out_is_fixed() {
-    let fix = build_fixture();
-    let a = seed_memory_with_counts(&fix.metadata, 1, 0, 0); // stored=0
-    let b = seed_memory_with_counts(&fix.metadata, 2, 0, 0);
-    let c = seed_memory_with_counts(&fix.metadata, 3, 0, 0);
-    seed_edge_raw(&fix.metadata, a, EdgeKind::FollowedBy, b);
-    seed_edge_raw(&fix.metadata, a, EdgeKind::Caused, c);
-    // a has 2 real outgoing but stored=0 → mismatch.
+#[test]
+fn under_counted_out_is_fixed() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let a = seed_memory_with_counts(&fix.metadata, 1, 0, 0); // stored=0
+        let b = seed_memory_with_counts(&fix.metadata, 2, 0, 0);
+        let c = seed_memory_with_counts(&fix.metadata, 3, 0, 0);
+        seed_edge_raw(&fix.metadata, a, EdgeKind::FollowedBy, b);
+        seed_edge_raw(&fix.metadata, a, EdgeKind::Caused, c);
+        // a has 2 real outgoing but stored=0 → mismatch.
 
-    let worker = CounterReconcileWorker::new().with_config(batchy_config(100));
-    let fixed = run_one(&worker, fix.ctx).await.unwrap();
-    assert!(fixed >= 1);
-    assert_eq!(read_counts(&fix.metadata, a).0, 2);
+        let worker = CounterReconcileWorker::new().with_config(batchy_config(100));
+        let fixed = run_one(&worker, fix.ctx).await.unwrap();
+        assert!(fixed >= 1);
+        assert_eq!(read_counts(&fix.metadata, a).0, 2);
+    });
 }
 
-#[tokio::test]
-async fn over_counted_in_is_fixed() {
-    let fix = build_fixture();
-    let a = seed_memory_with_counts(&fix.metadata, 1, 0, 0);
-    let b = seed_memory_with_counts(&fix.metadata, 2, 0, 5); // claims 5 in, has 1
-    seed_edge_raw(&fix.metadata, a, EdgeKind::FollowedBy, b);
+#[test]
+fn over_counted_in_is_fixed() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let a = seed_memory_with_counts(&fix.metadata, 1, 0, 0);
+        let b = seed_memory_with_counts(&fix.metadata, 2, 0, 5); // claims 5 in, has 1
+        seed_edge_raw(&fix.metadata, a, EdgeKind::FollowedBy, b);
 
-    let worker = CounterReconcileWorker::new().with_config(batchy_config(100));
-    let fixed = run_one(&worker, fix.ctx).await.unwrap();
-    assert!(fixed >= 1);
-    assert_eq!(read_counts(&fix.metadata, b).1, 1);
+        let worker = CounterReconcileWorker::new().with_config(batchy_config(100));
+        let fixed = run_one(&worker, fix.ctx).await.unwrap();
+        assert!(fixed >= 1);
+        assert_eq!(read_counts(&fix.metadata, b).1, 1);
+    });
 }
 
-#[tokio::test]
-async fn mixed_drift_both_directions_fixed_in_one_cycle() {
-    let fix = build_fixture();
-    let a = seed_memory_with_counts(&fix.metadata, 1, 7, 0); // stored 7 out, real 1
-    let b = seed_memory_with_counts(&fix.metadata, 2, 0, 9); // stored 9 in, real 1
-    seed_edge_raw(&fix.metadata, a, EdgeKind::FollowedBy, b);
+#[test]
+fn mixed_drift_both_directions_fixed_in_one_cycle() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let a = seed_memory_with_counts(&fix.metadata, 1, 7, 0); // stored 7 out, real 1
+        let b = seed_memory_with_counts(&fix.metadata, 2, 0, 9); // stored 9 in, real 1
+        seed_edge_raw(&fix.metadata, a, EdgeKind::FollowedBy, b);
 
-    let worker = CounterReconcileWorker::new().with_config(batchy_config(100));
-    run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(read_counts(&fix.metadata, a), (1, 0));
-    assert_eq!(read_counts(&fix.metadata, b), (0, 1));
+        let worker = CounterReconcileWorker::new().with_config(batchy_config(100));
+        run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(read_counts(&fix.metadata, a), (1, 0));
+        assert_eq!(read_counts(&fix.metadata, b), (0, 1));
+    });
 }
 
-#[tokio::test]
-async fn multiple_memories_reconciled_in_one_cycle() {
-    let fix = build_fixture();
-    // 5 memories, each has 1 real outgoing edge to the next, all
-    // stored with edges_out_count=0.
-    let ids: Vec<MemoryId> = (1..=5)
-        .map(|slot| seed_memory_with_counts(&fix.metadata, slot, 0, 0))
-        .collect();
-    for w in ids.windows(2) {
-        seed_edge_raw(&fix.metadata, w[0], EdgeKind::FollowedBy, w[1]);
-    }
-    let worker = CounterReconcileWorker::new().with_config(batchy_config(100));
-    let fixed = run_one(&worker, fix.ctx).await.unwrap();
-    assert!(fixed >= 4); // ids[0..4] need fixing; ids[1..5] need in-fix too
-    for (i, id) in ids.iter().enumerate().take(4) {
-        assert_eq!(read_counts(&fix.metadata, *id).0, 1, "id[{i}] out");
-    }
-    for (i, id) in ids.iter().enumerate().skip(1) {
-        assert_eq!(read_counts(&fix.metadata, *id).1, 1, "id[{i}] in");
-    }
+#[test]
+fn multiple_memories_reconciled_in_one_cycle() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        // 5 memories, each has 1 real outgoing edge to the next, all
+        // stored with edges_out_count=0.
+        let ids: Vec<MemoryId> = (1..=5)
+            .map(|slot| seed_memory_with_counts(&fix.metadata, slot, 0, 0))
+            .collect();
+        for w in ids.windows(2) {
+            seed_edge_raw(&fix.metadata, w[0], EdgeKind::FollowedBy, w[1]);
+        }
+        let worker = CounterReconcileWorker::new().with_config(batchy_config(100));
+        let fixed = run_one(&worker, fix.ctx).await.unwrap();
+        assert!(fixed >= 4); // ids[0..4] need fixing; ids[1..5] need in-fix too
+        for (i, id) in ids.iter().enumerate().take(4) {
+            assert_eq!(read_counts(&fix.metadata, *id).0, 1, "id[{i}] out");
+        }
+        for (i, id) in ids.iter().enumerate().skip(1) {
+            assert_eq!(read_counts(&fix.metadata, *id).1, 1, "id[{i}] in");
+        }
+    });
 }
 
-#[tokio::test]
-async fn batch_size_caps_per_cycle() {
-    let fix = build_fixture();
-    // 20 memories all with drift; batch_size=5 → at most 5 fixed.
-    for slot in 1..=20u64 {
-        let id = seed_memory_with_counts(&fix.metadata, slot, 99, 99);
-        // No real edges → reality is (0, 0); stored is (99, 99) → drift.
-        let _ = id;
-    }
-    let worker = CounterReconcileWorker::new().with_config(batchy_config(5));
-    let fixed = run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(fixed, 5);
+#[test]
+fn batch_size_caps_per_cycle() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        // 20 memories all with drift; batch_size=5 → at most 5 fixed.
+        for slot in 1..=20u64 {
+            let id = seed_memory_with_counts(&fix.metadata, slot, 99, 99);
+            // No real edges → reality is (0, 0); stored is (99, 99) → drift.
+            let _ = id;
+        }
+        let worker = CounterReconcileWorker::new().with_config(batchy_config(5));
+        let fixed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(fixed, 5);
+    });
 }
 
-#[tokio::test]
-async fn cursor_advances_across_cycles() {
-    let fix = build_fixture();
-    for slot in 1..=12u64 {
-        seed_memory_with_counts(&fix.metadata, slot, 7, 7);
-    }
-    let worker = CounterReconcileWorker::new().with_config(batchy_config(5));
-    let c1 = run_one(&worker, fix.ctx.clone()).await.unwrap();
-    let c2 = run_one(&worker, fix.ctx.clone()).await.unwrap();
-    let c3 = run_one(&worker, fix.ctx.clone()).await.unwrap();
-    assert_eq!(c1 + c2 + c3, 12, "all 12 fixed across cycles");
-    for slot in 1..=12u64 {
-        assert_eq!(read_counts(&fix.metadata, make_id(slot)), (0, 0));
-    }
+#[test]
+fn cursor_advances_across_cycles() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        for slot in 1..=12u64 {
+            seed_memory_with_counts(&fix.metadata, slot, 7, 7);
+        }
+        let worker = CounterReconcileWorker::new().with_config(batchy_config(5));
+        let c1 = run_one(&worker, fix.ctx.clone()).await.unwrap();
+        let c2 = run_one(&worker, fix.ctx.clone()).await.unwrap();
+        let c3 = run_one(&worker, fix.ctx.clone()).await.unwrap();
+        assert_eq!(c1 + c2 + c3, 12, "all 12 fixed across cycles");
+        for slot in 1..=12u64 {
+            assert_eq!(read_counts(&fix.metadata, make_id(slot)), (0, 0));
+        }
+    });
 }
 
 // ===========================================================================
 // Worker integration (2).
 // ===========================================================================
 
-#[tokio::test]
-async fn worker_registers_with_correct_kind_and_default_cadence() {
-    let fix = build_fixture();
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(Arc::new(CounterReconcileWorker::new()), fix.ctx)
-        .unwrap();
-    let cfg = sched.config(WorkerKind::CounterReconcile.name()).unwrap();
-    assert_eq!(cfg.interval, Duration::from_secs(3600));
-    sched.shutdown().await.unwrap();
+#[test]
+fn worker_registers_with_correct_kind_and_default_cadence() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(Arc::new(CounterReconcileWorker::new()), fix.ctx)
+            .unwrap();
+        let cfg = sched.config(WorkerKind::CounterReconcile.name()).unwrap();
+        assert_eq!(cfg.interval, Duration::from_secs(3600));
+        sched.shutdown().await.unwrap();
+    });
 }
 
-#[tokio::test]
-async fn disabled_worker_via_config_does_not_fix() {
-    let fix = build_fixture();
-    seed_memory_with_counts(&fix.metadata, 1, 99, 99); // drift
-    let cfg = WorkerConfig {
-        enabled: false,
-        interval: Duration::from_millis(20),
-        batch_size: 100,
-        max_runtime: Duration::from_secs(1),
-    };
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(
-            Arc::new(CounterReconcileWorker::new().with_config(cfg)),
-            fix.ctx,
-        )
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    sched.shutdown().await.unwrap();
-    assert_eq!(read_counts(&fix.metadata, make_id(1)), (99, 99));
+#[test]
+fn disabled_worker_via_config_does_not_fix() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        seed_memory_with_counts(&fix.metadata, 1, 99, 99); // drift
+        let cfg = WorkerConfig {
+            enabled: false,
+            interval: Duration::from_millis(20),
+            batch_size: 100,
+            max_runtime: Duration::from_secs(1),
+        };
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(
+                Arc::new(CounterReconcileWorker::new().with_config(cfg)),
+                fix.ctx,
+            )
+            .unwrap();
+        glommio::timer::sleep(Duration::from_millis(150)).await;
+        sched.shutdown().await.unwrap();
+        assert_eq!(read_counts(&fix.metadata, make_id(1)), (99, 99));
+    });
 }
 
 // ===========================================================================
 // Edge cases (1).
 // ===========================================================================
 
-#[tokio::test]
-async fn empty_memories_table_cycle_is_noop() {
-    let fix = build_fixture();
-    let worker = CounterReconcileWorker::new();
-    let fixed = run_one(&worker, fix.ctx).await.unwrap();
-    assert_eq!(fixed, 0);
+#[test]
+fn empty_memories_table_cycle_is_noop() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let worker = CounterReconcileWorker::new();
+        let fixed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(fixed, 0);
+    });
+}
+
+fn glommio_run<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + 'static,
+    T: Send + 'static,
+{
+    glommio::LocalExecutorBuilder::default()
+        .name("worker-test")
+        .spawn(move || async move { f().await })
+        .expect("spawn glommio test executor")
+        .join()
+        .expect("test executor join")
 }

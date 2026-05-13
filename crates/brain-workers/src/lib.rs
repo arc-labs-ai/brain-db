@@ -22,61 +22,62 @@
 )]
 #![forbid(unsafe_code)]
 
-pub mod access_boost;
-pub mod cache_evict;
 pub mod config;
-pub mod consolidation;
 pub mod context;
-pub mod counter_reconcile;
-pub mod decay;
-pub mod edge_scrub;
 pub mod error;
-pub mod hnsw_maint;
-pub mod idempotency_cleanup;
 pub mod metrics;
 pub mod scheduler;
-pub mod slot_reclaim;
-pub mod snapshot;
-pub mod statistics;
 pub mod summarizer;
-pub mod wal_retention;
 pub mod worker;
+pub mod workers;
 
-pub use access_boost::{boosted_salience, AccessBoostWorker, DEFAULT_BOOST_FACTOR, MAX_SALIENCE};
-pub use cache_evict::{
-    CacheEvictionError, CacheEvictionSource, CacheEvictionWorker, DisabledCacheEvictionSource,
-    DEFAULT_CACHE_MAX_AGE,
-};
 pub use config::{WorkerConfig, WorkerKind};
-pub use consolidation::{
+pub use context::WorkerContext;
+pub use error::WorkerError;
+pub use metrics::{Snapshot as MetricsSnapshot, WorkerMetrics};
+pub use scheduler::{WorkerHandle, WorkerScheduler};
+pub use summarizer::{DisabledSummarizer, Summarizer, SummarizerError};
+pub use worker::{drive_batch, Worker};
+
+// Module-level re-exports preserve the pre-refactor public paths
+// (`brain_workers::<worker>::<Type>`) so external callers don't churn.
+pub use workers::{
+    access_boost, cache_evict, consolidation, counter_reconcile, decay, edge_scrub, hnsw_maint,
+    idempotency_cleanup, slot_reclaim, snapshot, statistics, wal_retention,
+};
+
+pub use workers::access_boost::{
+    boosted_salience, AccessBoostWorker, DEFAULT_BOOST_FACTOR, MAX_SALIENCE,
+};
+pub use workers::cache_evict::{
+    CacheEvictionError, CacheEvictionSource, CacheEvictionWorker, DisabledCacheEvictionSource,
+    PruneFuture, DEFAULT_CACHE_MAX_AGE,
+};
+pub use workers::consolidation::{
     cluster_by_similarity, cosine, deterministic_request_id, ClusterCandidate, ConsolidationWorker,
     DEFAULT_INITIAL_SALIENCE, DEFAULT_MIN_CLUSTER_SIZE, DEFAULT_RECENCY_WINDOW,
     DEFAULT_SIMILARITY_THRESHOLD,
 };
-pub use context::WorkerContext;
-pub use counter_reconcile::CounterReconcileWorker;
-pub use decay::{
+pub use workers::counter_reconcile::CounterReconcileWorker;
+pub use workers::decay::{
     decayed_salience, half_life_days, DecayWorker, CONSOLIDATED_HALF_LIFE_DAYS,
     EPISODIC_HALF_LIFE_DAYS, MIN_DELTA_FOR_WRITE, SEMANTIC_HALF_LIFE_DAYS,
 };
-pub use edge_scrub::EdgeScrubWorker;
-pub use error::WorkerError;
-pub use hnsw_maint::{
+pub use workers::edge_scrub::EdgeScrubWorker;
+pub use workers::hnsw_maint::{
     decide_action, Action, DisabledRebuildSource, HnswMaintenanceWorker, IndexStats, RebuildSource,
-    RebuildSourceError, RebuildThresholds,
+    RebuildSourceError, RebuildThresholds, SnapshotFuture as RebuildSnapshotFuture,
 };
-pub use idempotency_cleanup::{IdempotencyCleanupWorker, DEFAULT_IDEMPOTENCY_TTL};
-pub use metrics::{Snapshot as MetricsSnapshot, WorkerMetrics};
-pub use scheduler::{WorkerHandle, WorkerScheduler};
-pub use slot_reclaim::{SlotReclamationWorker, DEFAULT_FORGET_GRACE};
-pub use snapshot::{
-    decide_retention, DisabledSnapshotSource, RetentionPolicy, SnapshotDesc, SnapshotId,
-    SnapshotSource, SnapshotSourceError, SnapshotWorker,
+pub use workers::idempotency_cleanup::{IdempotencyCleanupWorker, DEFAULT_IDEMPOTENCY_TTL};
+pub use workers::slot_reclaim::{SlotReclamationWorker, DEFAULT_FORGET_GRACE};
+pub use workers::snapshot::{
+    decide_retention, DeleteFuture as SnapshotDeleteFuture, DisabledSnapshotSource,
+    ListFuture as SnapshotListFuture, RetentionPolicy, SnapshotDesc, SnapshotId, SnapshotSource,
+    SnapshotSourceError, SnapshotWorker, TakeFuture as SnapshotTakeFuture,
 };
-pub use statistics::{StatisticsUpdateWorker, Stats};
-pub use summarizer::{DisabledSummarizer, Summarizer, SummarizerError};
-pub use wal_retention::{
-    decide_deletions, CheckpointDesc, DisabledWalRetentionSource, SegmentDesc, WalRetentionSource,
+pub use workers::statistics::{StatisticsUpdateWorker, Stats};
+pub use workers::wal_retention::{
+    decide_deletions, CheckpointDesc, CheckpointFuture, DeleteFuture as WalDeleteFuture,
+    DisabledWalRetentionSource, SegmentDesc, SegmentListFuture, WalRetentionSource,
     WalRetentionSourceError, WalRetentionWorker,
 };
-pub use worker::{drive_batch, Worker};

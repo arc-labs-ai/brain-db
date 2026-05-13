@@ -1,3 +1,4 @@
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
 //! Embedder cache eviction worker tests (sub-task 8.12). Spec §11/08 §4.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,8 +53,11 @@ async fn run_one(
     worker: &CacheEvictionWorker,
     ops: Arc<OpsContext>,
 ) -> Result<usize, brain_workers::WorkerError> {
-    let (_tx, rx) = tokio::sync::watch::channel(false);
-    let wctx = WorkerContext { ops, shutdown: rx };
+    let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wctx = WorkerContext {
+        ops,
+        shutdown: shutdown_flag.clone(),
+    };
     worker.run_cycle(&wctx).await
 }
 
@@ -87,138 +91,171 @@ impl CacheEvictionSource for FailingSource {
 // Source surface (3).
 // ===========================================================================
 
-#[tokio::test]
-async fn disabled_source_returns_disabled() {
-    let s = DisabledCacheEvictionSource;
-    let r = s.prune_older_than(Duration::from_secs(60)).await;
-    assert!(matches!(r, Err(CacheEvictionError::Disabled)));
+#[test]
+fn disabled_source_returns_disabled() {
+    glommio_run(|| async {
+        let s = DisabledCacheEvictionSource;
+        let r = s.prune_older_than(Duration::from_secs(60)).await;
+        assert!(matches!(r, Err(CacheEvictionError::Disabled)));
+    });
 }
 
-#[tokio::test]
-async fn stub_source_returns_provided_count() {
-    let stub = StubSource {
-        returns: 42,
-        last_max_age: Arc::new(Mutex::new(None)),
-        calls: AtomicU64::new(0),
-    };
-    let r = stub
-        .prune_older_than(Duration::from_secs(60))
-        .await
-        .unwrap();
-    assert_eq!(r, 42);
+#[test]
+fn stub_source_returns_provided_count() {
+    glommio_run(|| async {
+        let stub = StubSource {
+            returns: 42,
+            last_max_age: Arc::new(Mutex::new(None)),
+            calls: AtomicU64::new(0),
+        };
+        let r = stub
+            .prune_older_than(Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(r, 42);
+    });
 }
 
-#[tokio::test]
-async fn failed_source_propagates_as_worker_error() {
-    let (ops, _td) = make_ops_context();
-    let worker = CacheEvictionWorker::new(Arc::new(FailingSource));
-    let r = run_one(&worker, ops).await;
-    assert!(
-        matches!(r, Err(brain_workers::WorkerError::Ops(_))),
-        "Failed must surface, got {r:?}"
-    );
+#[test]
+fn failed_source_propagates_as_worker_error() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let worker = CacheEvictionWorker::new(Arc::new(FailingSource));
+        let r = run_one(&worker, ops).await;
+        assert!(
+            matches!(r, Err(brain_workers::WorkerError::Ops(_))),
+            "Failed must surface, got {r:?}"
+        );
+    });
 }
 
 // ===========================================================================
 // Cycle (3).
 // ===========================================================================
 
-#[tokio::test]
-async fn cycle_with_disabled_source_returns_zero() {
-    let (ops, _td) = make_ops_context();
-    let worker = CacheEvictionWorker::new(Arc::new(DisabledCacheEvictionSource));
-    let processed = run_one(&worker, ops).await.unwrap();
-    assert_eq!(processed, 0);
+#[test]
+fn cycle_with_disabled_source_returns_zero() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let worker = CacheEvictionWorker::new(Arc::new(DisabledCacheEvictionSource));
+        let processed = run_one(&worker, ops).await.unwrap();
+        assert_eq!(processed, 0);
+    });
 }
 
-#[tokio::test]
-async fn cycle_returns_source_count() {
-    let (ops, _td) = make_ops_context();
-    let stub = StubSource {
-        returns: 12,
-        last_max_age: Arc::new(Mutex::new(None)),
-        calls: AtomicU64::new(0),
-    };
-    let worker = CacheEvictionWorker::new(Arc::new(stub));
-    let processed = run_one(&worker, ops).await.unwrap();
-    assert_eq!(processed, 12);
+#[test]
+fn cycle_returns_source_count() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let stub = StubSource {
+            returns: 12,
+            last_max_age: Arc::new(Mutex::new(None)),
+            calls: AtomicU64::new(0),
+        };
+        let worker = CacheEvictionWorker::new(Arc::new(stub));
+        let processed = run_one(&worker, ops).await.unwrap();
+        assert_eq!(processed, 12);
+    });
 }
 
-#[tokio::test]
-async fn cycle_calls_source_with_default_max_age() {
-    let (ops, _td) = make_ops_context();
-    let last = Arc::new(Mutex::new(None));
-    let stub = StubSource {
-        returns: 0,
-        last_max_age: last.clone(),
-        calls: AtomicU64::new(0),
-    };
-    let worker = CacheEvictionWorker::new(Arc::new(stub));
-    run_one(&worker, ops).await.unwrap();
-    assert_eq!(*last.lock(), Some(DEFAULT_CACHE_MAX_AGE));
+#[test]
+fn cycle_calls_source_with_default_max_age() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let last = Arc::new(Mutex::new(None));
+        let stub = StubSource {
+            returns: 0,
+            last_max_age: last.clone(),
+            calls: AtomicU64::new(0),
+        };
+        let worker = CacheEvictionWorker::new(Arc::new(stub));
+        run_one(&worker, ops).await.unwrap();
+        assert_eq!(*last.lock(), Some(DEFAULT_CACHE_MAX_AGE));
+    });
 }
 
 // ===========================================================================
 // Worker integration (3).
 // ===========================================================================
 
-#[tokio::test]
-async fn worker_registers_with_correct_kind_and_default_cadence() {
-    let (ops, _td) = make_ops_context();
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(
-            Arc::new(CacheEvictionWorker::new(Arc::new(
-                DisabledCacheEvictionSource,
-            ))),
-            ops,
-        )
-        .unwrap();
-    let cfg = sched.config(WorkerKind::EmbedderCacheEvict.name()).unwrap();
-    assert_eq!(cfg.interval, Duration::from_secs(60));
-    sched.shutdown().await.unwrap();
+#[test]
+fn worker_registers_with_correct_kind_and_default_cadence() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(
+                Arc::new(CacheEvictionWorker::new(Arc::new(
+                    DisabledCacheEvictionSource,
+                ))),
+                ops,
+            )
+            .unwrap();
+        let cfg = sched.config(WorkerKind::EmbedderCacheEvict.name()).unwrap();
+        assert_eq!(cfg.interval, Duration::from_secs(60));
+        sched.shutdown().await.unwrap();
+    });
 }
 
-#[tokio::test]
-async fn disabled_worker_via_config_does_not_run() {
-    let (ops, _td) = make_ops_context();
-    let last = Arc::new(Mutex::new(None));
-    let stub = StubSource {
-        returns: 5,
-        last_max_age: last.clone(),
-        calls: AtomicU64::new(0),
-    };
-    let cfg = WorkerConfig {
-        enabled: false,
-        interval: Duration::from_millis(20),
-        batch_size: 100,
-        max_runtime: Duration::from_secs(1),
-    };
-    let mut sched = WorkerScheduler::new();
-    sched
-        .register(
-            Arc::new(CacheEvictionWorker::new(Arc::new(stub)).with_config(cfg)),
-            ops,
-        )
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    sched.shutdown().await.unwrap();
-    assert!(
-        last.lock().is_none(),
-        "disabled worker must not invoke source"
-    );
+#[test]
+fn disabled_worker_via_config_does_not_run() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let last = Arc::new(Mutex::new(None));
+        let stub = StubSource {
+            returns: 5,
+            last_max_age: last.clone(),
+            calls: AtomicU64::new(0),
+        };
+        let cfg = WorkerConfig {
+            enabled: false,
+            interval: Duration::from_millis(20),
+            batch_size: 100,
+            max_runtime: Duration::from_secs(1),
+        };
+        let mut sched = WorkerScheduler::new();
+        sched
+            .register(
+                Arc::new(CacheEvictionWorker::new(Arc::new(stub)).with_config(cfg)),
+                ops,
+            )
+            .unwrap();
+        glommio::timer::sleep(Duration::from_millis(150)).await;
+        sched.shutdown().await.unwrap();
+        assert!(
+            last.lock().is_none(),
+            "disabled worker must not invoke source"
+        );
+    });
 }
 
-#[tokio::test]
-async fn custom_max_age_honoured() {
-    let (ops, _td) = make_ops_context();
-    let last = Arc::new(Mutex::new(None));
-    let stub = StubSource {
-        returns: 0,
-        last_max_age: last.clone(),
-        calls: AtomicU64::new(0),
-    };
-    let worker = CacheEvictionWorker::new(Arc::new(stub)).with_max_age(Duration::from_secs(3600));
-    run_one(&worker, ops).await.unwrap();
-    assert_eq!(*last.lock(), Some(Duration::from_secs(3600)));
+#[test]
+fn custom_max_age_honoured() {
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let last = Arc::new(Mutex::new(None));
+        let stub = StubSource {
+            returns: 0,
+            last_max_age: last.clone(),
+            calls: AtomicU64::new(0),
+        };
+        let worker =
+            CacheEvictionWorker::new(Arc::new(stub)).with_max_age(Duration::from_secs(3600));
+        run_one(&worker, ops).await.unwrap();
+        assert_eq!(*last.lock(), Some(Duration::from_secs(3600)));
+    });
+}
+
+fn glommio_run<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + 'static,
+    T: Send + 'static,
+{
+    glommio::LocalExecutorBuilder::default()
+        .name("worker-test")
+        .spawn(move || async move { f().await })
+        .expect("spawn glommio test executor")
+        .join()
+        .expect("test executor join")
 }
