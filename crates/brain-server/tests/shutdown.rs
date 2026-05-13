@@ -14,12 +14,9 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 #[allow(dead_code)]
-#[path = "../src/shard.rs"]
+#[path = "../src/shard/mod.rs"]
 mod shard;
-#[allow(dead_code)]
-#[path = "../src/shard_adapters.rs"]
-mod shard_adapters;
-#[path = "../src/shutdown.rs"]
+#[path = "../src/bootstrap/shutdown.rs"]
 mod shutdown;
 
 use shard::{spawn_shard, ShardHandle, ShardJoiner, ShardSpawnConfig};

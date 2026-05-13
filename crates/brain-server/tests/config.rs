@@ -10,7 +10,7 @@ use std::path::PathBuf;
 // Re-export the binary's internal modules under a regular crate path.
 // brain-server is a [[bin]] target without a library, so we pull the
 // config module in as source via a small inline crate stub.
-#[path = "../src/config.rs"]
+#[path = "../src/config/mod.rs"]
 mod config;
 
 use config::{AuthMode, Config, ConfigError, LoggingConfig};

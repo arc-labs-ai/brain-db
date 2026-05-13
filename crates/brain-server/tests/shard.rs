@@ -16,11 +16,8 @@ use tempfile::TempDir;
 // The 9.10 `dispatch_op` surface is used only by `tests/dispatch.rs`;
 // silence the dead-code lint from this binary's perspective.
 #[allow(dead_code)]
-#[path = "../src/shard.rs"]
+#[path = "../src/shard/mod.rs"]
 mod shard;
-#[allow(dead_code)]
-#[path = "../src/shard_adapters.rs"]
-mod shard_adapters;
 
 use shard::{
     spawn_shard, AllocSlotError, AppendWalError, ShardError, ShardHandle, ShardOpError,

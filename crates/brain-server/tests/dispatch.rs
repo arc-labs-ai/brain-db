@@ -32,23 +32,20 @@ use tokio::net::TcpStream;
 // Pull every brain-server source the connection layer reaches into the
 // test binary so `crate::` resolves the same as in main.rs.
 #[allow(dead_code)]
-#[path = "../src/connection.rs"]
+#[path = "../src/network/connection.rs"]
 mod connection;
-#[path = "../src/dispatch.rs"]
+#[path = "../src/network/dispatch.rs"]
 mod dispatch;
 #[allow(dead_code)]
-#[path = "../src/routing.rs"]
+#[path = "../src/network/routing.rs"]
 mod routing;
 #[allow(dead_code)]
-#[path = "../src/shard.rs"]
+#[path = "../src/shard/mod.rs"]
 mod shard;
-#[allow(dead_code)]
-#[path = "../src/shard_adapters.rs"]
-mod shard_adapters;
-#[path = "../src/subscribe.rs"]
+#[path = "../src/network/subscribe.rs"]
 mod subscribe;
 #[allow(dead_code)]
-#[path = "../src/tls.rs"]
+#[path = "../src/bootstrap/tls.rs"]
 mod tls;
 
 use connection::{ConnectionLimits, ConnectionListener, ShutdownSignal, ShutdownTrigger, Topology};

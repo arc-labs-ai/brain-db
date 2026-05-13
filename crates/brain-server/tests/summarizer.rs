@@ -20,7 +20,7 @@ use brain_workers::SummarizerError;
 // as in main.rs. Each test binary owns its own compilation; we
 // only need the pieces the summarizer adapters touch.
 #[allow(dead_code)]
-#[path = "../src/config.rs"]
+#[path = "../src/config/mod.rs"]
 mod config;
 #[path = "../src/llm/mod.rs"]
 mod llm;

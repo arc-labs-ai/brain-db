@@ -51,26 +51,23 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 #[allow(dead_code)]
-#[path = "../src/admin.rs"]
+#[path = "../src/admin/mod.rs"]
 mod admin;
 #[allow(dead_code)]
-#[path = "../src/connection.rs"]
+#[path = "../src/network/connection.rs"]
 mod connection;
-#[path = "../src/dispatch.rs"]
+#[path = "../src/network/dispatch.rs"]
 mod dispatch;
 #[allow(dead_code)]
-#[path = "../src/routing.rs"]
+#[path = "../src/network/routing.rs"]
 mod routing;
 #[allow(dead_code)]
-#[path = "../src/shard.rs"]
+#[path = "../src/shard/mod.rs"]
 mod shard;
-#[allow(dead_code)]
-#[path = "../src/shard_adapters.rs"]
-mod shard_adapters;
-#[path = "../src/subscribe.rs"]
+#[path = "../src/network/subscribe.rs"]
 mod subscribe;
 #[allow(dead_code)]
-#[path = "../src/tls.rs"]
+#[path = "../src/bootstrap/tls.rs"]
 mod tls;
 
 use admin::{AdminServer, AdminState};

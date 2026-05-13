@@ -51,6 +51,8 @@
 // rejects the per-shard refactor en masse.
 #![allow(clippy::await_holding_refcell_ref)]
 
+pub mod adapters;
+
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -83,7 +85,7 @@ use brain_workers::{
     WorkerScheduler,
 };
 
-use crate::shard_adapters::{ArenaRebuildSource, ShardSnapshotSource, WalDirRetentionSource};
+use self::adapters::{ArenaRebuildSource, ShardSnapshotSource, WalDirRetentionSource};
 use flume::{Receiver, Sender};
 use glommio::{ExecutorJoinHandle, LocalExecutorBuilder, Placement};
 use parking_lot::Mutex;

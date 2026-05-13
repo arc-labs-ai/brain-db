@@ -11,26 +11,29 @@
 
 #[cfg(target_os = "linux")]
 mod admin;
+mod bootstrap;
 mod config;
 #[cfg(target_os = "linux")]
-mod connection;
-#[cfg(target_os = "linux")]
-mod dispatch;
-#[cfg(target_os = "linux")]
 mod llm;
-mod routing;
+#[cfg(target_os = "linux")]
+mod network;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // consumed by the connection layer in sub-task 9.10.
 mod shard;
+
+// Crate-root aliases. The folder reorg moved each module into a
+// thematic sub-module (`bootstrap::tls`, `network::connection`, …),
+// but every file references its peers by the historical top-level
+// name (`crate::tls`, `crate::connection`, …). Re-exporting at the
+// crate root preserves those paths and matches the way integration
+// tests load source files via `#[path]` + `mod xxx;`.
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // adapters wired into the per-shard scheduler in 9.8.
-mod shard_adapters;
+use bootstrap::{shutdown, tls};
 #[cfg(target_os = "linux")]
-mod shutdown;
+use network::{connection, dispatch, routing, subscribe};
 #[cfg(target_os = "linux")]
-mod subscribe;
-#[cfg(target_os = "linux")]
-mod tls;
+#[allow(unused_imports)] // re-export kept for symmetry; binary doesn't reach it directly
+use shard::adapters as shard_adapters;
 
 use std::env;
 use std::path::PathBuf;
