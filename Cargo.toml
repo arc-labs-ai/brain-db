@@ -58,7 +58,7 @@ http-body-util = "0.1"
 hyper = { version = "1.5", default-features = false }
 hyper-util = { version = "0.1", default-features = false }
 # WebSocket framing + masking + close-handshake (used in M6).
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["handshake", "connect", "stream"] }
 # M4: Stream trait (used by sse::SseStream and body::stream). transitively
 # pulled by tokio already; declared here for hygiene.
 futures-core = "0.3"

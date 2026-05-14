@@ -1,6 +1,7 @@
 //! WebSocket server (RFC 6455).
 //!
-//! M6 ships server-side only; the client lands in M7. The HTTP/1.1
+//! M6 ships server-side ([`accept`]); M7 adds the matching client
+//! ([`connect`] / [`ConnectBuilder`]). The HTTP/1.1
 //! `Upgrade: websocket` handshake is handled inside this module; the
 //! frame protocol below the upgrade is driven by
 //! [`tokio-tungstenite`] (~3 kLOC of audited RFC 6455 conformance).
@@ -29,10 +30,12 @@
 //! dep on `tungstenite`.
 
 mod accept_key;
+mod client;
 mod server;
 mod upgrade;
 
 pub use accept_key::derive as derive_accept_key;
+pub use client::{connect, ConnectBuilder, Connected};
 pub use server::{accept, OnUpgrade};
 
 // Re-exports so consumers don't pull tungstenite directly.
