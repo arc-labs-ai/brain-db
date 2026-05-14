@@ -170,17 +170,31 @@ For autonomous-mode operating rules, see [`AUTONOMY.md`](AUTONOMY.md).
 
 ---
 
-## Phase 11 — Observability, Benchmarks, Acceptance
+## Phase 11 — `brain-http` (foundation HTTP/WS/SSE layer)
+
+**One-line:** Brain-owned HTTP transport on hyper 1.x — replaces hand-rolled admin/CLI HTTP, adds WebSocket + SSE.
+
+**Detailed plan:** [`docs/phases/phase-11-brain-http.md`](docs/phases/phase-11-brain-http.md)
+
+**Crates touched:** new `brain-http`; migrations in `brain-server`, `brain-cli`.
+
+**Sub-tasks:** 8.
+
+**Exit:** admin hand-roll deleted; SSE + WebSocket working end-to-end; tag `phase-11-complete`.
+
+---
+
+## Phase 12 — Observability, Benchmarks, Acceptance
 
 **One-line:** Production-ready: metrics, logs, tracing, dashboards, alerts, benchmarks, chaos suite, the v1 gate.
 
-**Detailed plan:** [`docs/phases/phase-11-observability.md`](docs/phases/phase-11-observability.md)
+**Detailed plan:** [`docs/phases/phase-12-observability.md`](docs/phases/phase-12-observability.md)
 
 **Crates touched:** all (instrumentation), plus `dashboards/`, `alerts/`, `benches/`, `tests/chaos/`.
 
 **Sub-tasks:** 12.
 
-**Exit:** all 10 acceptance gates pass; soak test recorded; tag `phase-11-complete` and `v1.0.0`.
+**Exit:** all 10 acceptance gates pass; soak test recorded; tag `phase-12-complete` and `v1.0.0`.
 
 ---
 
@@ -193,7 +207,8 @@ Phase N+1 doesn't start before Phase N is exited and tagged. The dependencies ar
 - Phase 4's `HnswIndex` requires Phase 2's slot reads and Phase 3's tombstone state.
 - Phase 7 wires Phases 2-6 together.
 - Phase 9 wires everything.
-- Phase 11 instruments everything.
+- Phase 11 provides the HTTP substrate Phase 12 instruments on.
+- Phase 12 instruments everything.
 
 Skipping ahead means stubbing types you'll have to revisit. Don't.
 

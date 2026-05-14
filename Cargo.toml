@@ -18,6 +18,7 @@ members = [
     "crates/brain-server",
     "crates/brain-sdk-rust",
     "crates/brain-cli",
+    "crates/brain-http",
 ]
 exclude = ["fuzz"]
 
@@ -45,6 +46,19 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # Runtime-agnostic mpsc (used at the Tokio↔Glommio shard boundary, spec §01/04).
 flume = { version = "0.11", default-features = false, features = ["async", "select"] }
 futures-lite = "2"
+
+# HTTP stack (Phase 11 — brain-http). hyper handles HTTP/1.1 wire codec,
+# keep-alive, chunked transfer, body backpressure. http / http-body /
+# http-body-util are the version-neutral vocabulary so HTTP/2 can slot
+# in later via a feature flag without touching handlers.
+bytes = "1"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1.5", default-features = false }
+hyper-util = { version = "0.1", default-features = false }
+# WebSocket framing + masking + close-handshake (used in M6).
+tokio-tungstenite = { version = "0.21", default-features = false }
 
 # Serialization
 rkyv = { version = "0.7", features = ["validation"] }

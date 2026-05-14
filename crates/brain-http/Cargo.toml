@@ -1,0 +1,48 @@
+[package]
+name = "brain-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP/1.1, WebSocket, and SSE transport for the Brain substrate."
+
+[features]
+default = ["server"]
+# Server-side accept loop + Router + Connection + graceful shutdown.
+# Lands in M2; M1 only adds the foundation types.
+server = ["dep:tokio", "dep:hyper-util", "hyper/server", "hyper/http1"]
+# HTTP client. M5 decides whether to expose one or keep brain-cli
+# hand-rolled.
+client = ["dep:tokio", "hyper/client", "hyper/http1"]
+# WebSocket via tokio-tungstenite — M6/M7.
+ws = ["dep:tokio-tungstenite", "dep:tokio"]
+# Server-Sent Events — M4.
+sse = ["dep:tokio"]
+# TLS termination at the server (rustls). Optional.
+tls = ["dep:tokio-rustls", "server"]
+
+[dependencies]
+brain-core = { path = "../brain-core" }
+
+# Wire stack — see workspace Cargo.toml comments for rationale.
+hyper = { workspace = true }
+hyper-util = { workspace = true, optional = true, features = ["tokio", "server-graceful"] }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+
+# Runtime + observability.
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+# Feature-gated.
+tokio-tungstenite = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "time"] }
+anyhow = { workspace = true }
+http-body-util = { workspace = true }
