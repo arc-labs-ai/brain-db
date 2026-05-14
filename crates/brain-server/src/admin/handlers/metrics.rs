@@ -22,7 +22,8 @@ pub async fn handle(
     _req: Request<Incoming>,
     state: Arc<AdminState>,
 ) -> brain_http::Result<Response<ResponseBody>> {
-    let body = format::format(&state).await;
+    let snap = state.metrics_snapshot();
+    let body = format::format(&snap).await;
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("content-type", HDR_PROMETHEUS)

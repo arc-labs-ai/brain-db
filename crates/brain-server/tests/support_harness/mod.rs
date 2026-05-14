@@ -87,6 +87,8 @@ pub async fn start(n_shards: usize) -> Server {
     let routing = Arc::new(arc_swap::ArcSwap::from_pointee(
         RoutingTable::new(n_shards as u16, std::collections::HashMap::new()).unwrap(),
     ));
+    let request_metrics = Arc::new(crate::metrics::request::RequestMetrics::new());
+
     let topology = Topology {
         shards: shards.clone(),
         routing,
@@ -94,6 +96,7 @@ pub async fn start(n_shards: usize) -> Server {
             "brain-server/e2e",
             vec![AuthMethod::None],
         )),
+        request_metrics: request_metrics.clone(),
     };
 
     let connections = Arc::new(ConnectionMetrics::default());
@@ -115,6 +118,7 @@ pub async fn start(n_shards: usize) -> Server {
         shards,
         connections,
         Arc::new(config::Config::for_tests()),
+        request_metrics,
     ));
     let admin = AdminServer::new("127.0.0.1:0".parse().unwrap(), admin_state, signal);
     let bound_admin = admin.bind().await.expect("bind admin");

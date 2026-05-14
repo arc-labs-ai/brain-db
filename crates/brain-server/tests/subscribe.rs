@@ -25,6 +25,8 @@ use tokio::net::TcpStream;
 mod connection;
 #[path = "../src/network/dispatch.rs"]
 mod dispatch;
+#[path = "../src/metrics/mod.rs"]
+mod metrics;
 #[allow(dead_code)]
 #[path = "../src/network/routing.rs"]
 mod routing;
@@ -89,6 +91,7 @@ async fn start_with_shards(n_shards: usize) -> Server {
             "brain-server/test",
             vec![AuthMethod::None],
         )),
+        request_metrics: Arc::new(metrics::request::RequestMetrics::new()),
     };
 
     let (trigger, signal) = ShutdownSignal::channel();

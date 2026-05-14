@@ -25,6 +25,8 @@ use tokio::net::TcpStream;
 mod connection;
 #[path = "../src/network/dispatch.rs"]
 mod dispatch;
+#[path = "../src/metrics/mod.rs"]
+mod metrics;
 #[allow(dead_code)]
 #[path = "../src/network/routing.rs"]
 mod routing;
@@ -75,6 +77,7 @@ fn empty_topology() -> Topology {
             "brain-server/test",
             vec![AuthMethod::None],
         )),
+        request_metrics: Arc::new(metrics::request::RequestMetrics::new()),
     }
 }
 

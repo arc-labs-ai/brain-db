@@ -496,9 +496,27 @@ where
                             }
                             Action::OpDispatch(op) => {
                                 let shards = topology.shards.clone();
+                                let request_metrics = topology.request_metrics.clone();
                                 let tx = frame_tx.clone();
+                                let op_idx = crate::metrics::request::op_index(&op.req);
                                 tokio::spawn(async move {
+                                    // RAII timer: bumps in-flight on
+                                    // construction; records duration
+                                    // + status on `record(...)`. If
+                                    // the dispatch panics or is
+                                    // cancelled, drop records as
+                                    // Timeout.
+                                    let timer = op_idx.map(|idx| {
+                                        crate::metrics::request::RequestTimer::start(
+                                            request_metrics.clone(),
+                                            idx,
+                                        )
+                                    });
                                     let frame = run_op_dispatch(op, shards).await;
+                                    if let Some(timer) = timer {
+                                        let status = response_status(&frame);
+                                        timer.record(status);
+                                    }
                                     let _ = tx.send_async(OutgoingFrame {
                                         bytes: frame.encode(),
                                         close_after: false,
@@ -556,6 +574,18 @@ where
 
 fn build_close_error_frame(code: ErrorCode, message: &str) -> Frame {
     build_close_error_frame_with_category(code, code.category(), message)
+}
+
+/// Map a finished response frame to a [`request::Status`] for
+/// metrics. Looks at the wire opcode only — `0xFF` (Error) becomes
+/// `Status::Error`; anything else is `Status::Success`. The
+/// in-flight gauge / drop-without-record path handles `Timeout`.
+fn response_status(frame: &Frame) -> crate::metrics::request::Status {
+    if frame.header.opcode == Opcode::Error.as_u8() {
+        crate::metrics::request::Status::Error
+    } else {
+        crate::metrics::request::Status::Success
+    }
 }
 
 fn build_close_error_frame_with_category(

@@ -47,9 +47,9 @@
 //!   `phase-12/glommio-reactor-metrics`.
 
 #![cfg(target_os = "linux")]
-// 12.1a lands the primitives ahead of their call sites. 12.1b/c
-// (request, connection, resource metrics) consume the surface and
-// retire this allow.
+// Gauge accessors and a few exposition helpers are scaffolding that
+// 12.1c (connection-extended / process metrics) lights up. The
+// blanket allow retires when that lands.
 #![allow(dead_code)]
 
 pub mod counter;
@@ -57,3 +57,4 @@ pub mod exposition;
 pub mod format;
 pub mod gauge;
 pub mod histogram;
+pub mod request;

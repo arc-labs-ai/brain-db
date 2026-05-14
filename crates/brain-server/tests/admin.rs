@@ -87,6 +87,7 @@ async fn start_admin_only() -> Bringup {
         Arc::new(Vec::new()),
         connections,
         Arc::new(config::Config::for_tests()),
+        Arc::new(metrics::request::RequestMetrics::new()),
     ));
     let admin = AdminServer::new("127.0.0.1:0".parse().unwrap(), state, signal);
     let bound = admin.bind().await.expect("bind admin");
@@ -122,6 +123,7 @@ async fn start_admin_with_shards(n_shards: usize) -> Bringup {
     let routing = Arc::new(arc_swap::ArcSwap::from_pointee(
         RoutingTable::new(n_shards as u16, std::collections::HashMap::new()).unwrap(),
     ));
+    let request_metrics = Arc::new(metrics::request::RequestMetrics::new());
     let topology = Topology {
         shards: shards.clone(),
         routing,
@@ -129,6 +131,7 @@ async fn start_admin_with_shards(n_shards: usize) -> Bringup {
             "brain-server/test",
             vec![AuthMethod::None],
         )),
+        request_metrics: request_metrics.clone(),
     };
     let connections = Arc::new(ConnectionMetrics::default());
 
@@ -149,6 +152,7 @@ async fn start_admin_with_shards(n_shards: usize) -> Bringup {
         shards,
         connections,
         Arc::new(config::Config::for_tests()),
+        request_metrics,
     ));
     let admin = AdminServer::new("127.0.0.1:0".parse().unwrap(), state, signal);
     let bound_admin = admin.bind().await.expect("bind admin");

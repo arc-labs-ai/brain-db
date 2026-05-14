@@ -90,6 +90,9 @@ pub struct Topology {
     pub shards: Arc<Vec<ShardHandle>>,
     pub routing: Arc<arc_swap::ArcSwap<RoutingTable>>,
     pub server_caps: Arc<ServerCapabilities>,
+    /// Per-operation request metrics (12.1b). Shared with the admin
+    /// exposition path via `AdminState::request_metrics`.
+    pub request_metrics: Arc<crate::metrics::request::RequestMetrics>,
 }
 
 // ---------------------------------------------------------------------------
@@ -601,6 +604,7 @@ mod tests {
                 "brain-server/test",
                 vec![AuthMethod::None],
             )),
+            request_metrics: Arc::new(crate::metrics::request::RequestMetrics::new()),
         }
     }
 

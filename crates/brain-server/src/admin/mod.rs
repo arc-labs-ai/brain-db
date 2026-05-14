@@ -32,28 +32,22 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::connection::{ConnectionMetrics, ShutdownSignal};
+use crate::metrics::format::{BuildInfo, Snapshot as MetricsSnapshot};
+use crate::metrics::request::RequestMetrics;
 use crate::shard::ShardHandle;
 
 // ---------------------------------------------------------------------------
 // AdminState
 // ---------------------------------------------------------------------------
 
-/// Static build information, populated from `env!` at compile time.
-#[derive(Clone, Copy, Debug)]
-pub struct BuildInfo {
-    pub version: &'static str,
-    pub git_commit: &'static str,
-}
-
-impl BuildInfo {
-    pub fn from_env() -> Self {
-        Self {
-            version: env!("CARGO_PKG_VERSION"),
-            // No vergen wired up yet; surface the literal in v1 and
-            // upgrade to `env!("VERGEN_GIT_SHA")` when the build script
-            // is added.
-            git_commit: "unknown",
-        }
+/// Build the canonical [`BuildInfo`] from `env!` at compile time.
+pub fn build_info_from_env() -> BuildInfo {
+    BuildInfo {
+        version: env!("CARGO_PKG_VERSION"),
+        // No vergen wired up yet; surface the literal in v1 and
+        // upgrade to `env!("VERGEN_GIT_SHA")` when the build script
+        // is added.
+        git_commit: "unknown",
     }
 }
 
@@ -69,6 +63,9 @@ pub struct AdminState {
     /// Sub-task 10.11: read-only view of the loaded config, surfaced
     /// by `GET /v1/config`.
     pub config: Arc<Config>,
+    /// 12.1b: per-op request counters / histograms / in-flight gauges.
+    /// Same instance shared with `Topology::request_metrics`.
+    pub request_metrics: Arc<RequestMetrics>,
 }
 
 impl AdminState {
@@ -76,6 +73,7 @@ impl AdminState {
         shards: Arc<Vec<ShardHandle>>,
         connections: Arc<ConnectionMetrics>,
         config: Arc<Config>,
+        request_metrics: Arc<RequestMetrics>,
     ) -> Self {
         let started_at_unix_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -84,10 +82,24 @@ impl AdminState {
         Self {
             started_at: Instant::now(),
             started_at_unix_secs,
-            build_info: BuildInfo::from_env(),
+            build_info: build_info_from_env(),
             shards,
             connections,
             config,
+            request_metrics,
+        }
+    }
+
+    /// Borrow-only view consumed by `crate::metrics::format::format`.
+    /// Cheap; clones nothing.
+    pub fn metrics_snapshot(&self) -> MetricsSnapshot<'_> {
+        MetricsSnapshot {
+            build_info: self.build_info,
+            started_at: self.started_at,
+            started_at_unix_secs: self.started_at_unix_secs,
+            shards: self.shards.as_slice(),
+            connections: self.connections.as_ref(),
+            request_metrics: self.request_metrics.as_ref(),
         }
     }
 }

@@ -171,10 +171,13 @@ mod linux_main {
         // after the connection + admin servers have exited.
         let shards_for_drain = shards.clone();
 
+        let request_metrics = Arc::new(crate::metrics::request::RequestMetrics::new());
+
         let topology = Topology {
             shards,
             routing,
             server_caps,
+            request_metrics: request_metrics.clone(),
         };
 
         let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -207,6 +210,7 @@ mod linux_main {
                 topology.shards.clone(),
                 connection_metrics.clone(),
                 Arc::new(cfg.clone()),
+                request_metrics.clone(),
             ));
             let admin = crate::admin::AdminServer::new(
                 cfg.server.metrics_addr,
