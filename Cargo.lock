@@ -438,6 +438,7 @@ dependencies = [
 name = "brain-sdk-rust"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "brain-core",
  "brain-protocol",
  "futures-lite 2.6.1",
