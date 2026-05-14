@@ -63,6 +63,8 @@ pub mod server;
 pub mod sse;
 #[cfg(feature = "server")]
 pub mod tcp;
+#[cfg(feature = "ws")]
+pub mod ws;
 
 // Re-exports — the surface every handler uses.
 pub use error::{Error, Result};

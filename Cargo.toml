@@ -58,7 +58,7 @@ http-body-util = "0.1"
 hyper = { version = "1.5", default-features = false }
 hyper-util = { version = "0.1", default-features = false }
 # WebSocket framing + masking + close-handshake (used in M6).
-tokio-tungstenite = { version = "0.21", default-features = false }
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["handshake"] }
 # M4: Stream trait (used by sse::SseStream and body::stream). transitively
 # pulled by tokio already; declared here for hygiene.
 futures-core = "0.3"
@@ -68,6 +68,12 @@ pin-project-lite = "0.2"
 # tokio adapters: ReceiverStream/UnboundedReceiverStream — used by
 # tests and by application producers that wire bounded mpsc to SSE.
 tokio-stream = "0.1"
+# M6: WebSocket Sec-WebSocket-Accept derivation per RFC 6455 §4.2.2.
+sha1 = "0.10"
+base64 = "0.22"
+# M6 tests: drive the WebSocket protocol from the futures-side `Sink`
+# and `Stream` traits.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # Serialization
 rkyv = { version = "0.7", features = ["validation"] }

@@ -1,9 +1,19 @@
 //! Accept loop + graceful drain.
 //!
 //! Loops on `listener.accept()`, races against the shutdown signal,
-//! and tracks every spawned per-connection task via
-//! [`hyper_util::server::graceful::GracefulShutdown`] so the loop
-//! can wait for them to drain after the signal fires.
+//! and tracks every spawned per-connection task in a
+//! [`tokio::task::JoinSet`]. On shutdown we wait for the set to
+//! drain with a 30 s cap; beyond that we abort stragglers.
+//!
+//! ## Why a `JoinSet` instead of `hyper_util::server::graceful::GracefulShutdown`?
+//!
+//! `GracefulShutdown::watch` requires the connection type to
+//! implement `GracefulConnection`. `hyper-util` 0.1 implements that
+//! trait for `http1::Connection<I, S>` but **not** for
+//! `http1::UpgradeableConnection<I, S>` (the variant returned by
+//! `.with_upgrades()`). Brain-http needs upgrades for WebSocket
+//! (M6), so every connection is upgradeable. We track tasks
+//! ourselves and best-effort drain on shutdown.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -13,8 +23,8 @@ use std::time::Duration;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use crate::body::ResponseBody;
@@ -43,11 +53,21 @@ pub async fn run(
     bind_config: Arc<BindConfig>,
     shutdown: ShutdownSignal,
 ) -> crate::Result<()> {
-    let graceful = GracefulShutdown::new();
+    let mut tasks: JoinSet<()> = JoinSet::new();
     let local_addr: SocketAddr = listener.local_addr()?;
     info!(addr = %local_addr, "brain-http accepting");
 
     loop {
+        // Reap finished tasks opportunistically so the JoinSet doesn't
+        // grow without bound on long-running servers.
+        while let Some(res) = tasks.try_join_next() {
+            if let Err(e) = res {
+                if !e.is_cancelled() {
+                    warn!(error = %e, "connection task panicked");
+                }
+            }
+        }
+
         tokio::select! {
             biased;
             () = shutdown.wait() => {
@@ -83,14 +103,23 @@ pub async fn run(
                     fut
                 });
 
+                // `.with_upgrades()` keeps the connection alive past
+                // a `101 Switching Protocols` response so the
+                // application can drive the upgraded protocol (e.g.
+                // WebSocket via `crate::ws::accept`). Costs nothing
+                // for plain HTTP responses.
                 let conn = http1::Builder::new()
                     .max_buf_size(limits.max_header_bytes.max(8 * 1024))
                     .keep_alive(true)
-                    .serve_connection(TokioIo::new(stream), service);
+                    .serve_connection(TokioIo::new(stream), service)
+                    .with_upgrades();
 
-                let watched = graceful.watch(conn);
-                tokio::spawn(async move {
-                    if let Err(e) = watched.await {
+                tasks.spawn(async move {
+                    if let Err(e) = conn.await {
+                        // Many errors here are benign — clients close
+                        // mid-request, browsers send malformed
+                        // pipelined requests, etc. Log at debug
+                        // through `warn` once you've added a filter.
                         warn!(peer = %peer, error = %e, "connection task ended with error");
                     }
                 });
@@ -98,9 +127,15 @@ pub async fn run(
         }
     }
 
-    match tokio::time::timeout(DEFAULT_DRAIN_TIMEOUT, graceful.shutdown()).await {
+    // Drain: wait up to DEFAULT_DRAIN_TIMEOUT for in-flight
+    // connections to finish naturally, then abort any stragglers.
+    let drain = async { while tasks.join_next().await.is_some() {} };
+    match tokio::time::timeout(DEFAULT_DRAIN_TIMEOUT, drain).await {
         Ok(()) => info!(addr = %local_addr, "brain-http drained cleanly"),
-        Err(_) => warn!(addr = %local_addr, "brain-http drain timed out; abandoning stragglers"),
+        Err(_) => {
+            warn!(addr = %local_addr, "brain-http drain timed out; aborting stragglers");
+            tasks.shutdown().await;
+        }
     }
     Ok(())
 }
