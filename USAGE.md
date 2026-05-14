@@ -569,57 +569,114 @@ Wait for the `listening` log line before proceeding.
 ### Run the built-in example (terminal 2)
 
 A complete working example lives at
-`crates/brain-sdk-rust/examples/store_and_recall.rs`. It encodes
-five memories, recalls by cue text, demonstrates a transaction, and
-forgets a throwaway memory.
+`crates/brain-sdk-rust/examples/store_and_recall.rs`. It runs 8
+phases against the live server:
+
+```
+Phase 1  ENCODE     30 memories across 8 domains
+Phase 2  LINK       8 typed edges building a knowledge graph
+Phase 3  TRANSACTION atomic cross-domain pair (quantum computing)
+Phase 4  DEDUP      re-encode an existing memory, server deduplicates
+Phase 5  RECALL     8 queries with different cues and domains
+Phase 6  FORGET     soft tombstone + hard zero-wipe
+Phase 7  DURABILITY post-write recall to confirm WAL persistence
+Phase 8  METRICS    SDK request/error counters
+```
 
 ```
 cargo run --example store_and_recall -p brain-sdk-rust
 ```
 
-Expected output:
+Abridged expected output (ids and scores vary per run):
 
 ```
 Connecting to Brain at 127.0.0.1:9090 ...
 Connected.
 
-=== ENCODE ===
-  STORED  id=0x00010000000000010000000100000001  deduped=false  text=The attention mechanism in transformers was introduced in...
-  STORED  id=0x00010000000000020000000100000001  deduped=false  text=BERT uses bidirectional training of transformers for lan...
-  STORED  id=0x00010000000000030000000100000001  deduped=false  text=GPT-3 demonstrated few-shot learning with 175 billion p...
-  STORED  id=0x00010000000000040000000100000001  deduped=false  text=The softmax function converts raw scores into a probabil...
-  STORED  id=0x00010000000000050000000100000001  deduped=false  text=Backpropagation computes gradients by the chain rule.
+──────────────────────────────────────────────────────────────────────
+  PHASE 1 · ENCODE — 30 memories across 8 domains
+──────────────────────────────────────────────────────────────────────
 
-=== RECALL (cue: 'transformer architecture') ===
-  [0] score=0.9121  kind=Semantic  id=0x00010000000000010000000100000001
-       The attention mechanism in transformers was introduced in 'Attention is All You Need' (2017).
-  [1] score=0.8843  kind=Semantic  id=0x00010000000000020000000100000001
-       BERT uses bidirectional training of transformers for language understanding.
-  [2] score=0.7234  kind=Episodic  id=0x00010000000000030000000100000001
-       GPT-3 demonstrated few-shot learning with 175 billion parameters.
+  [ML / AI  context=1]
+    + attention mechanism  id=0x00010000000000010000000100000001
+    + BERT                 id=0x00010000000000020000000100000001
+    + transformer parallel id=0x00010000000000030000000100000001
+    + GPT decoder-only     id=0x00010000000000040000000100000001
+    + gradient momentum    id=0x00010000000000050000000100000001
 
-=== RECALL (semantic only, top 2) ===
-  score=0.8102  The softmax function converts raw scores into a probability distribution.
-  score=0.7899  Backpropagation computes gradients by the chain rule.
+  [Physics  context=2]
+    + special relativity    id=0x00010000000000060000000100000001
+    ...
 
-=== FORGET ===
-  Encoded throwaway id=0x00010000000000060000000100000001
-  Forgotten id=0x00010000000000060000000100000001  edges_removed=0
+  [Software Engineering  context=6]
+    + CAP theorem           id=0x...
+    + ACID properties       id=0x...
+    + event sourcing        id=0x...
+    + 2PC                   id=0x...
 
-=== TRANSACTION ===
-  Transaction started txn_id=[...]
-  Pending A=0x00010000000000070000000100000001  B=0x00010000000000080000000100000001
-  Committed.
+  30 memories encoded across 8 domains.
 
-=== SDK METRICS ===
-  requests_total      = 10
+──────────────────────────────────────────────────────────────────────
+  PHASE 2 · LINK — build the knowledge graph
+──────────────────────────────────────────────────────────────────────
+  BERT  --[DerivedFrom]--> attention mechanism  (w=0.95)
+  GPT   --[DerivedFrom]--> transformer parallel  (w=0.90)
+  CRISPR --[Supports]--> mRNA vaccines  (w=0.70)
+  CAP   --[References]--> ACID  (w=0.80)
+  2PC   --[DerivedFrom]--> ACID  (w=0.85)
+  EventSourcing --[Contradicts]--> ACID (mutable-state assumption)  (w=0.60)
+  Kant  --[SimilarTo]--> Descartes  (w=0.65)
+  Penicillin --[Caused(chain)]--> modern vaccine research  (w=0.55)
+
+  8 edges added.
+
+──────────────────────────────────────────────────────────────────────
+  PHASE 3 · TRANSACTION — atomic cross-domain pair
+──────────────────────────────────────────────────────────────────────
+  Transaction id=[31 4a ...]
+  Committed:
+    quantum computing (physics)  id=0x...
+    Shor's algorithm (software)  id=0x...
+  Shor's algo --[DerivedFrom]--> quantum computing  (w=0.92)
+
+──────────────────────────────────────────────────────────────────────
+  PHASE 5 · RECALL — 8 queries, different cues and domains
+──────────────────────────────────────────────────────────────────────
+  Q1 'transformer neural network architecture' — 5 result(s):
+    [0] 0.9243  [Semantic]  A transformer encoder processes all input tokens in parallel...
+    [1] 0.9101  [Semantic]  The attention mechanism allows neural networks to focus on...
+    [2] 0.8876  [Semantic]  GPT models use a decoder-only transformer trained with...
+
+  Q6 'distributed database consistency guarantees atomicity' — 4 result(s):
+    [0] 0.9312  [Semantic]  ACID properties — atomicity, consistency, isolation, durability...
+    [1] 0.9101  [Semantic]  The CAP theorem (Brewer, 2000) proves that a distributed...
+    [2] 0.8654  [Semantic]  Two-phase commit (2PC) coordinates distributed transactions...
+    [3] 0.8201  [Semantic]  Event sourcing persists state as an immutable, append-only log...
+
+──────────────────────────────────────────────────────────────────────
+  PHASE 8 · SDK METRICS — point-in-time snapshot
+──────────────────────────────────────────────────────────────────────
+  requests_total      = 51
   errors_total        = 0
+  retries_total       = 0
+  encode.requests     = 32
+  encode.errors       = 0
+  recall.requests     = 9
+  forget.requests     = 2
 
-Done. Connection closed.
+──────────────────────────────────────────────────────────────────────
+  Done. Session closed.
+  To inspect the server state, run in another terminal:
+    just cli --output json debug-snapshot --shard 0 | jq .
+    just cli --output json worker list
+    curl http://127.0.0.1:9091/metrics | grep brain_
+──────────────────────────────────────────────────────────────────────
 ```
 
-Similarity scores and memory IDs will differ on each run. Scores
-above 0.7 indicate strong relevance; below 0.5 indicates low signal.
+Scores above 0.85 indicate strong semantic relevance. Scores below
+0.60 may appear when the HNSW index is still warming up after the
+first encode batch — re-running recall after a few seconds gives
+more stable results.
 
 ### Write your own quick script
 
