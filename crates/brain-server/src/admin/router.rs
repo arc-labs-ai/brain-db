@@ -7,16 +7,15 @@
 
 use std::sync::Arc;
 
-use brain_http::body::{full, ResponseBody};
+use brain_http::body::ResponseBody;
 use brain_http::router::Router;
-use bytes::Bytes;
-use http::{Method, Request, Response, StatusCode};
+use http::{Method, Request, Response};
 use hyper::body::Incoming;
 
-use crate::admin::{
-    agent, audit, config_route, diagnostics, metrics, rebuild, shard_route, snapshot, worker,
-    AdminState,
+use crate::admin::handlers::{
+    agent, audit, config, diagnostics, healthz, metrics, rebuild, shard, snapshot, worker,
 };
+use crate::admin::AdminState;
 
 /// Construct the admin router with every Phase-9-and-later route
 /// registered. The returned `Router<Incoming>` is ready to hand to
@@ -25,13 +24,7 @@ pub fn build(state: Arc<AdminState>) -> Router<Incoming> {
     let r = Router::new();
 
     // ──────── /healthz — string OK, no state ───────────────────────────
-    let r = r.get("/healthz", |_req: Request<Incoming>| async move {
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "text/plain; charset=utf-8")
-            .body(full(Bytes::from_static(b"ok\n")))
-            .expect("static response always builds"))
-    });
+    let r = r.get("/healthz", healthz::handle);
 
     // ──────── /metrics — Prometheus text exposition ────────────────────
     let r = with_state(r, Method::GET, "/metrics", state.clone(), metrics::handle);
@@ -80,27 +73,15 @@ pub fn build(state: Arc<AdminState>) -> Router<Incoming> {
     );
 
     // ──────── /v1/config ───────────────────────────────────────────────
-    let r = with_state(
-        r,
-        Method::GET,
-        "/v1/config",
-        state.clone(),
-        config_route::get,
-    );
+    let r = with_state(r, Method::GET, "/v1/config", state.clone(), config::get);
     let r = with_state(
         r,
         Method::POST,
         "/v1/config/reload",
         state.clone(),
-        config_route::reload,
+        config::reload,
     );
-    let r = with_state(
-        r,
-        Method::POST,
-        "/v1/config",
-        state.clone(),
-        config_route::set,
-    );
+    let r = with_state(r, Method::POST, "/v1/config", state.clone(), config::set);
 
     // ──────── /v1/audit ────────────────────────────────────────────────
     let r = with_state(r, Method::GET, "/v1/audit", state.clone(), audit::query);
@@ -127,26 +108,14 @@ pub fn build(state: Arc<AdminState>) -> Router<Incoming> {
     );
 
     // ──────── /v1/shards ───────────────────────────────────────────────
-    let r = with_state(
-        r,
-        Method::GET,
-        "/v1/shards",
-        state.clone(),
-        shard_route::list,
-    );
-    let r = with_state(
-        r,
-        Method::POST,
-        "/v1/shards",
-        state.clone(),
-        shard_route::create,
-    );
+    let r = with_state(r, Method::GET, "/v1/shards", state.clone(), shard::list);
+    let r = with_state(r, Method::POST, "/v1/shards", state.clone(), shard::create);
     let r = with_state_prefix(
         r,
         Method::DELETE,
         "/v1/shards/",
         state.clone(),
-        shard_route::delete,
+        shard::delete,
     );
 
     // ──────── /v1/diagnostics ──────────────────────────────────────────

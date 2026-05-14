@@ -17,17 +17,10 @@
 
 #![cfg(target_os = "linux")]
 
-mod agent;
-mod audit;
-mod config_route;
-mod diagnostics;
-mod metrics;
-mod rebuild;
+mod handlers;
+mod query;
 mod router;
-mod shard_route;
-mod snapshot;
 mod util;
-mod worker;
 
 use std::io;
 use std::net::SocketAddr;

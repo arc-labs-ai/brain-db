@@ -1,6 +1,7 @@
-//! Admin HTTP handlers for `agent` (spec §14/06 §10; sub-task 10.11).
+//! `/v1/agents/{id}` prefix handler — dispatches on method.
 //!
-//! All routes deferred — agent_id secondary index doesn't exist yet.
+//! - `GET` → per-agent stats (501; needs agent_id secondary index).
+//! - `DELETE` → cascade-delete (501).
 
 use std::sync::Arc;
 
@@ -11,18 +12,6 @@ use hyper::body::Incoming;
 use crate::admin::util::{not_implemented, text_response};
 use crate::admin::AdminState;
 
-/// `GET /v1/agents` handler — deferred.
-pub async fn list(
-    _req: Request<Incoming>,
-    _state: Arc<AdminState>,
-) -> brain_http::Result<Response<ResponseBody>> {
-    Ok(not_implemented(
-        "phase-11/agent-index",
-        "agent list (needs agent_id secondary index)",
-    ))
-}
-
-/// `/v1/agents/{id}` prefix handler — internally dispatches on method.
 pub async fn by_id(
     req: Request<Incoming>,
     _state: Arc<AdminState>,

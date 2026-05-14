@@ -12,6 +12,7 @@ use http::{Request, Response, StatusCode};
 use hyper::body::Incoming;
 use tracing::warn;
 
+use crate::admin::query;
 use crate::admin::util::{json_response, text_response};
 use crate::admin::AdminState;
 
@@ -19,8 +20,8 @@ pub async fn handle(
     req: Request<Incoming>,
     state: Arc<AdminState>,
 ) -> brain_http::Result<Response<ResponseBody>> {
-    let query = req.uri().query().unwrap_or("").to_owned();
-    let shard_id = match parse_shard(&query) {
+    let query_str = req.uri().query().unwrap_or("").to_owned();
+    let shard_id = match query::shard_required(&query_str) {
         Ok(id) => id,
         Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &format!("{msg}\n"))),
     };
@@ -43,39 +44,5 @@ pub async fn handle(
                 &format!("{e}\n"),
             ))
         }
-    }
-}
-
-fn parse_shard(query: &str) -> Result<usize, String> {
-    if query.is_empty() {
-        return Ok(0);
-    }
-    for kv in query.split('&') {
-        if let Some(rest) = kv.strip_prefix("shard=") {
-            return rest
-                .parse::<usize>()
-                .map_err(|e| format!("invalid shard: {e}"));
-        }
-    }
-    Ok(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_shard_default() {
-        assert_eq!(parse_shard("").unwrap(), 0);
-    }
-
-    #[test]
-    fn parse_shard_explicit() {
-        assert_eq!(parse_shard("shard=3").unwrap(), 3);
-    }
-
-    #[test]
-    fn parse_shard_rejects_garbage() {
-        assert!(parse_shard("shard=abc").is_err());
     }
 }
