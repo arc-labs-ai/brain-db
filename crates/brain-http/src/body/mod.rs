@@ -14,7 +14,10 @@ pub use http_body_util::combinators::BoxBody;
 pub use http_body_util::{BodyExt, Empty, Full, StreamBody};
 
 mod limits;
+mod stream;
+
 pub use limits::{read_to_bytes, MAX_BODY_BYTES};
+pub use stream::stream;
 
 use bytes::Bytes;
 

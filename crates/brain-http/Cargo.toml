@@ -8,7 +8,7 @@ repository.workspace = true
 description = "HTTP/1.1, WebSocket, and SSE transport for the Brain substrate."
 
 [features]
-default = ["server"]
+default = ["server", "sse"]
 # Server-side accept loop + Router + Connection + graceful shutdown.
 # Lands in M2; M1 only adds the foundation types.
 server = ["dep:tokio", "dep:hyper-util", "dep:socket2", "hyper/server", "hyper/http1"]
@@ -17,7 +17,9 @@ server = ["dep:tokio", "dep:hyper-util", "dep:socket2", "hyper/server", "hyper/h
 client = ["dep:tokio", "hyper/client", "hyper/http1"]
 # WebSocket via tokio-tungstenite — M6/M7.
 ws = ["dep:tokio-tungstenite", "dep:tokio"]
-# Server-Sent Events — M4.
+# Server-Sent Events — M4. Streaming bodies are part of `server`
+# already; `sse` toggles the higher-level SseEvent / SseStream
+# helpers in `sse/`.
 sse = ["dep:tokio"]
 # TLS termination at the server (rustls). Optional.
 tls = ["dep:tokio-rustls", "server"]
@@ -32,6 +34,9 @@ http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
+# M4: streaming body + SSE.
+futures-core = { workspace = true }
+pin-project-lite = { workspace = true }
 
 # Runtime + observability.
 tokio = { workspace = true, optional = true }
@@ -44,6 +49,7 @@ tokio-tungstenite = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "time", "sync"] }
+tokio-stream = { workspace = true }
 anyhow = { workspace = true }
 http-body-util = { workspace = true }

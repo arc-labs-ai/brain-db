@@ -57,6 +57,8 @@ pub mod service;
 pub mod router;
 #[cfg(feature = "server")]
 pub mod server;
+#[cfg(feature = "sse")]
+pub mod sse;
 #[cfg(feature = "server")]
 pub mod tcp;
 
