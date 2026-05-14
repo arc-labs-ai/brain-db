@@ -16,6 +16,8 @@ mod config;
 #[cfg(target_os = "linux")]
 mod llm;
 #[cfg(target_os = "linux")]
+mod metrics;
+#[cfg(target_os = "linux")]
 mod network;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // consumed by the connection layer in sub-task 9.10.

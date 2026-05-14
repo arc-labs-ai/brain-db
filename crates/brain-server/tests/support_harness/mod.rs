@@ -22,6 +22,7 @@
 //! #[allow(dead_code)] #[path = "../src/config/mod.rs"]     mod config;
 //! #[allow(dead_code)] #[path = "../src/network/connection.rs"] mod connection;
 //! #[path = "../src/network/dispatch.rs"]                   mod dispatch;
+//! #[path = "../src/metrics/mod.rs"]                       mod metrics;
 //! #[allow(dead_code)] #[path = "../src/network/routing.rs"] mod routing;
 //! #[allow(dead_code)] #[path = "../src/shard/mod.rs"]      mod shard;
 //! #[path = "../src/network/subscribe.rs"]                  mod subscribe;

@@ -19,6 +19,8 @@ mod config;
 mod connection;
 #[path = "../src/network/dispatch.rs"]
 mod dispatch;
+#[path = "../src/metrics/mod.rs"]
+mod metrics;
 #[allow(dead_code)]
 #[path = "../src/network/routing.rs"]
 mod routing;
