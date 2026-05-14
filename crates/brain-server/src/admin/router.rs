@@ -1,0 +1,203 @@
+//! Build the admin HTTP router from an [`AdminState`].
+//!
+//! One free function: [`build`] — register every admin route in
+//! order. `with_state` and `with_state_prefix` hide the `Arc::clone`
+//! boilerplate that state injection requires when the router has no
+//! typed extractors.
+
+use std::sync::Arc;
+
+use brain_http::body::{full, ResponseBody};
+use brain_http::router::Router;
+use bytes::Bytes;
+use http::{Method, Request, Response, StatusCode};
+use hyper::body::Incoming;
+
+use crate::admin::{
+    agent, audit, config_route, diagnostics, metrics, rebuild, shard_route, snapshot, worker,
+    AdminState,
+};
+
+/// Construct the admin router with every Phase-9-and-later route
+/// registered. The returned `Router<Incoming>` is ready to hand to
+/// `brain_http::server::HttpServer::router`.
+pub fn build(state: Arc<AdminState>) -> Router<Incoming> {
+    let r = Router::new();
+
+    // ──────── /healthz — string OK, no state ───────────────────────────
+    let r = r.get("/healthz", |_req: Request<Incoming>| async move {
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/plain; charset=utf-8")
+            .body(full(Bytes::from_static(b"ok\n")))
+            .expect("static response always builds"))
+    });
+
+    // ──────── /metrics — Prometheus text exposition ────────────────────
+    let r = with_state(r, Method::GET, "/metrics", state.clone(), metrics::handle);
+
+    // ──────── Snapshot family (POST / GET / DELETE) ────────────────────
+    // One handler dispatches on (method, path) internally.
+    let r = with_state_prefix(
+        r,
+        Method::POST,
+        "/v1/snapshots",
+        state.clone(),
+        snapshot::handle,
+    );
+    let r = with_state_prefix(
+        r,
+        Method::GET,
+        "/v1/snapshots",
+        state.clone(),
+        snapshot::handle,
+    );
+    let r = with_state_prefix(
+        r,
+        Method::DELETE,
+        "/v1/snapshots/",
+        state.clone(),
+        snapshot::handle,
+    );
+
+    // ──────── /v1/rebuild-ann ──────────────────────────────────────────
+    let r = with_state(
+        r,
+        Method::POST,
+        "/v1/rebuild-ann",
+        state.clone(),
+        rebuild::handle,
+    );
+
+    // ──────── /v1/workers ──────────────────────────────────────────────
+    let r = with_state(r, Method::GET, "/v1/workers", state.clone(), worker::list);
+    let r = with_state_prefix(
+        r,
+        Method::POST,
+        "/v1/workers/",
+        state.clone(),
+        worker::control,
+    );
+
+    // ──────── /v1/config ───────────────────────────────────────────────
+    let r = with_state(
+        r,
+        Method::GET,
+        "/v1/config",
+        state.clone(),
+        config_route::get,
+    );
+    let r = with_state(
+        r,
+        Method::POST,
+        "/v1/config/reload",
+        state.clone(),
+        config_route::reload,
+    );
+    let r = with_state(
+        r,
+        Method::POST,
+        "/v1/config",
+        state.clone(),
+        config_route::set,
+    );
+
+    // ──────── /v1/audit ────────────────────────────────────────────────
+    let r = with_state(r, Method::GET, "/v1/audit", state.clone(), audit::query);
+    let r = with_state(
+        r,
+        Method::GET,
+        "/v1/audit/export",
+        state.clone(),
+        audit::export,
+    );
+
+    // ──────── /v1/agents ───────────────────────────────────────────────
+    let r = with_state(r, Method::GET, "/v1/agents", state.clone(), agent::list);
+    // /v1/agents/{id} prefix handler dispatches GET vs DELETE internally.
+    // brain-http's match_route(MethodMismatch) handles wrong method;
+    // we register both methods on the same prefix so they hit `by_id`.
+    let r = with_state_prefix(r, Method::GET, "/v1/agents/", state.clone(), agent::by_id);
+    let r = with_state_prefix(
+        r,
+        Method::DELETE,
+        "/v1/agents/",
+        state.clone(),
+        agent::by_id,
+    );
+
+    // ──────── /v1/shards ───────────────────────────────────────────────
+    let r = with_state(
+        r,
+        Method::GET,
+        "/v1/shards",
+        state.clone(),
+        shard_route::list,
+    );
+    let r = with_state(
+        r,
+        Method::POST,
+        "/v1/shards",
+        state.clone(),
+        shard_route::create,
+    );
+    let r = with_state_prefix(
+        r,
+        Method::DELETE,
+        "/v1/shards/",
+        state.clone(),
+        shard_route::delete,
+    );
+
+    // ──────── /v1/diagnostics ──────────────────────────────────────────
+    let r = with_state(
+        r,
+        Method::POST,
+        "/v1/diagnostics/profile",
+        state.clone(),
+        diagnostics::profile,
+    );
+    with_state(
+        r,
+        Method::GET,
+        "/v1/diagnostics/debug-snapshot",
+        state,
+        diagnostics::debug_snapshot,
+    )
+}
+
+/// Register an exact-match route bound to an `Arc<AdminState>`.
+fn with_state<F, Fut>(
+    r: Router<Incoming>,
+    method: Method,
+    path: &'static str,
+    state: Arc<AdminState>,
+    handler: F,
+) -> Router<Incoming>
+where
+    F: Fn(Request<Incoming>, Arc<AdminState>) -> Fut + Send + Sync + Copy + 'static,
+    Fut: std::future::Future<Output = brain_http::Result<Response<ResponseBody>>> + Send + 'static,
+{
+    r.route(method, path, move |req| {
+        let s = state.clone();
+        handler(req, s)
+    })
+}
+
+/// Register a prefix-match route bound to an `Arc<AdminState>`.
+fn with_state_prefix<F, Fut>(
+    r: Router<Incoming>,
+    method: Method,
+    prefix: &'static str,
+    state: Arc<AdminState>,
+    handler: F,
+) -> Router<Incoming>
+where
+    F: Fn(Request<Incoming>, Arc<AdminState>) -> Fut + Send + Sync + Copy + 'static,
+    Fut: std::future::Future<Output = brain_http::Result<Response<ResponseBody>>> + Send + 'static,
+{
+    r.route_prefix(method, prefix, move |req| {
+        let s = state.clone();
+        handler(req, s)
+    })
+}

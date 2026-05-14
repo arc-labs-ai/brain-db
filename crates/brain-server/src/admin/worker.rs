@@ -4,20 +4,21 @@
 //! - `GET /v1/workers[?shard=N]` → 200 +
 //!   `{"workers":[{shard,name,cycles,processed,errors,last_run_unix}]}`
 //! - `POST /v1/workers/{name}/{stop|start|run-now}` → 501
-//!   (worker control plane is deferred; spec §14/06 §6 calls for
-//!   pause/resume/trigger but the Scheduler has no such hooks today.)
+//!
+//! Worker control plane is deferred; spec §14/06 §6 calls for
+//! pause/resume/trigger but the Scheduler has no such hooks today.
 
 use std::fmt::Write as _;
-use std::io;
 use std::sync::Arc;
 
-use tokio::io::AsyncWrite;
+use brain_http::body::ResponseBody;
+use http::{Method, Request, Response, StatusCode};
+use hyper::body::Incoming;
 use tracing::warn;
 
-use super::{write_not_implemented, write_response, AdminState};
+use crate::admin::util::{json_response, not_implemented, text_response};
+use crate::admin::AdminState;
 
-const HDR_JSON: &str = "application/json; charset=utf-8";
-const HDR_TEXT: &str = "text/plain; charset=utf-8";
 const KNOWN_WORKERS: &[&str] = &[
     "decay",
     "access_boost",
@@ -34,38 +35,15 @@ const KNOWN_WORKERS: &[&str] = &[
 ];
 const KNOWN_ACTIONS: &[&str] = &["stop", "start", "run-now"];
 
-pub async fn dispatch<W>(
-    stream: &mut W,
-    method: &str,
-    path: &str,
-    query: &str,
-    state: &Arc<AdminState>,
-) -> Option<io::Result<()>>
-where
-    W: AsyncWrite + Unpin,
-{
-    if method == "GET" && path == "/v1/workers" {
-        return Some(handle_list(stream, query, state).await);
-    }
-    if method == "POST" {
-        if let Some(rest) = path.strip_prefix("/v1/workers/") {
-            // Expect `<name>/<action>` with no further segments.
-            let mut parts = rest.splitn(2, '/');
-            let name = parts.next().unwrap_or("");
-            let action = parts.next().unwrap_or("");
-            return Some(handle_control(stream, name, action).await);
-        }
-    }
-    None
-}
-
-async fn handle_list<W>(stream: &mut W, query: &str, state: &Arc<AdminState>) -> io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let shard_filter = match parse_shard(query) {
+/// `GET /v1/workers` handler.
+pub async fn list(
+    req: Request<Incoming>,
+    state: Arc<AdminState>,
+) -> brain_http::Result<Response<ResponseBody>> {
+    let query = req.uri().query().unwrap_or("").to_owned();
+    let shard_filter = match parse_shard(&query) {
         Ok(s) => s,
-        Err(msg) => return write_response(stream, 400, "Bad Request", HDR_TEXT, &msg).await,
+        Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &msg)),
     };
     let mut body = String::with_capacity(512);
     body.push_str("{\"workers\":[");
@@ -101,39 +79,47 @@ where
         }
     }
     body.push_str("]}\n");
-    write_response(stream, 200, "OK", HDR_JSON, &body).await
+    Ok(json_response(StatusCode::OK, body))
 }
 
-async fn handle_control<W>(stream: &mut W, name: &str, action: &str) -> io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
+/// `POST /v1/workers/{name}/{action}` handler — prefix-registered.
+pub async fn control(
+    req: Request<Incoming>,
+    _state: Arc<AdminState>,
+) -> brain_http::Result<Response<ResponseBody>> {
+    if req.method() != Method::POST {
+        return Ok(text_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed\n",
+        ));
+    }
+    let path = req.uri().path();
+    let Some(rest) = path.strip_prefix("/v1/workers/") else {
+        return Ok(text_response(
+            StatusCode::NOT_FOUND,
+            "worker route not found\n",
+        ));
+    };
+    let mut parts = rest.splitn(2, '/');
+    let name = parts.next().unwrap_or("");
+    let action = parts.next().unwrap_or("");
+
     if !KNOWN_WORKERS.contains(&name) {
-        return write_response(
-            stream,
-            400,
-            "Bad Request",
-            HDR_TEXT,
+        return Ok(text_response(
+            StatusCode::BAD_REQUEST,
             &format!("unknown worker `{name}`\n"),
-        )
-        .await;
+        ));
     }
     if !KNOWN_ACTIONS.contains(&action) {
-        return write_response(
-            stream,
-            400,
-            "Bad Request",
-            HDR_TEXT,
+        return Ok(text_response(
+            StatusCode::BAD_REQUEST,
             &format!("unknown worker action `{action}`\n"),
-        )
-        .await;
+        ));
     }
-    write_not_implemented(
-        stream,
+    Ok(not_implemented(
         "phase-11/scheduler-control",
         "live worker pause/resume/trigger",
-    )
-    .await
+    ))
 }
 
 fn parse_shard(query: &str) -> Result<Option<usize>, String> {

@@ -5,63 +5,27 @@
 //! - `POST /v1/rebuild-ann[?shard=N]` → 201 +
 //!   `{"entries":N,"elapsed_ms":N,"shard":N}`
 
-use std::io;
 use std::sync::Arc;
 
-use tokio::io::AsyncWrite;
+use brain_http::body::ResponseBody;
+use http::{Request, Response, StatusCode};
+use hyper::body::Incoming;
 use tracing::warn;
 
-use super::{write_response, AdminState};
+use crate::admin::util::{json_response, text_response};
+use crate::admin::AdminState;
 
-const HDR_JSON: &str = "application/json; charset=utf-8";
-
-/// Try to dispatch a `/v1/rebuild-ann` request. Returns
-/// `Some(...)` once handled.
-pub async fn dispatch<W>(
-    stream: &mut W,
-    method: &str,
-    path: &str,
-    query: &str,
-    state: &Arc<AdminState>,
-) -> Option<io::Result<()>>
-where
-    W: AsyncWrite + Unpin,
-{
-    if method == "POST" && path == "/v1/rebuild-ann" {
-        return Some(handle_rebuild(stream, query, state).await);
-    }
-    None
-}
-
-async fn handle_rebuild<W>(stream: &mut W, query: &str, state: &Arc<AdminState>) -> io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let shard_id = match parse_shard(query) {
+pub async fn handle(
+    req: Request<Incoming>,
+    state: Arc<AdminState>,
+) -> brain_http::Result<Response<ResponseBody>> {
+    let query = req.uri().query().unwrap_or("").to_owned();
+    let shard_id = match parse_shard(&query) {
         Ok(id) => id,
-        Err(msg) => {
-            return write_response(
-                stream,
-                400,
-                "Bad Request",
-                "text/plain; charset=utf-8",
-                &format!("{msg}\n"),
-            )
-            .await;
-        }
+        Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &format!("{msg}\n"))),
     };
-    let shard = match state.shards.get(shard_id) {
-        Some(s) => s,
-        None => {
-            return write_response(
-                stream,
-                404,
-                "Not Found",
-                "text/plain; charset=utf-8",
-                "shard out of range\n",
-            )
-            .await;
-        }
+    let Some(shard) = state.shards.get(shard_id) else {
+        return Ok(text_response(StatusCode::NOT_FOUND, "shard out of range\n"));
     };
     match shard.rebuild_hnsw().await {
         Ok(report) => {
@@ -70,23 +34,18 @@ where
                 e = report.entries,
                 ms = report.elapsed_ms
             );
-            write_response(stream, 201, "Created", HDR_JSON, &body).await
+            Ok(json_response(StatusCode::CREATED, body))
         }
         Err(e) => {
             warn!(error = %e, "rebuild-ann failed");
-            write_response(
-                stream,
-                500,
-                "Internal Server Error",
-                "text/plain; charset=utf-8",
+            Ok(text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("{e}\n"),
-            )
-            .await
+            ))
         }
     }
 }
 
-/// Parse `?shard=N` from a query string. Defaults to `0`.
 fn parse_shard(query: &str) -> Result<usize, String> {
     if query.is_empty() {
         return Ok(0);

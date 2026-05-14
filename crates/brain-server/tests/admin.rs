@@ -87,7 +87,7 @@ async fn start_admin_only() -> Bringup {
         Arc::new(config::Config::for_tests()),
     ));
     let admin = AdminServer::new("127.0.0.1:0".parse().unwrap(), state, signal);
-    let bound = admin.bind().expect("bind admin");
+    let bound = admin.bind().await.expect("bind admin");
     let admin_addr = bound.local_addr();
     let admin_handle = tokio::spawn(async move { bound.serve().await });
 
@@ -149,7 +149,7 @@ async fn start_admin_with_shards(n_shards: usize) -> Bringup {
         Arc::new(config::Config::for_tests()),
     ));
     let admin = AdminServer::new("127.0.0.1:0".parse().unwrap(), state, signal);
-    let bound_admin = admin.bind().expect("bind admin");
+    let bound_admin = admin.bind().await.expect("bind admin");
     let admin_addr = bound_admin.local_addr();
     let admin_handle = tokio::spawn(async move { bound_admin.serve().await });
 
@@ -277,9 +277,14 @@ async fn metrics_emits_worker_counters() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bad_path_returns_400() {
+async fn unknown_path_returns_404() {
+    // Wire-behaviour delta from Phase 11 M3: pre-M3 the hand-rolled
+    // admin server returned 400 for unknown paths; brain-http's
+    // Router returns 404 (correct per RFC 9110 §15.5.5). External
+    // scrapers and brain-cli are unaffected — they don't hit
+    // unknown paths.
     let server = start_admin_only().await;
     let (code, _body) = http_get(server.admin_addr, "/unknown").await;
-    assert_eq!(code, 400);
+    assert_eq!(code, 404);
     server.stop().await;
 }

@@ -1,102 +1,80 @@
 //! Admin HTTP handlers for `config` (spec §14/06 §7; sub-task 10.11).
 //!
 //! Routes:
-//! - `GET /v1/config[?key=a.b.c]` → 200 + JSON (whole config or
-//!   subtree).
+//! - `GET /v1/config[?key=a.b.c]` → 200 + JSON (whole config or subtree).
 //! - `POST /v1/config/reload` → 501 (no live-reload pathway yet).
 //! - `POST /v1/config?key=…` → 501 (no editable in-memory store).
 //!
-//! ## Key walk
-//!
-//! Spec uses dotted paths like `workers.decay.interval`. We
-//! serialize the config to a `serde_json::Value`, walk by segment,
-//! and return whatever is at that subtree (object/scalar/array).
+//! Spec uses dotted paths like `workers.decay.interval`. We serialize
+//! the config to a `serde_json::Value`, walk by segment, and return
+//! whatever is at that subtree (object/scalar/array).
 
-use std::io;
 use std::sync::Arc;
 
-use tokio::io::AsyncWrite;
+use brain_http::body::ResponseBody;
+use http::{Request, Response, StatusCode};
+use hyper::body::Incoming;
 use tracing::warn;
 
-use super::{write_not_implemented, write_response, AdminState};
+use crate::admin::util::{json_response, not_implemented, text_response};
+use crate::admin::AdminState;
 
-const HDR_JSON: &str = "application/json; charset=utf-8";
-const HDR_TEXT: &str = "text/plain; charset=utf-8";
-
-pub async fn dispatch<W>(
-    stream: &mut W,
-    method: &str,
-    path: &str,
-    query: &str,
-    state: &Arc<AdminState>,
-) -> Option<io::Result<()>>
-where
-    W: AsyncWrite + Unpin,
-{
-    match (method, path) {
-        ("GET", "/v1/config") => Some(handle_get(stream, query, state).await),
-        ("POST", "/v1/config/reload") => Some(
-            write_not_implemented(
-                stream,
-                "phase-11/live-config-reload",
-                "live config reload from disk",
-            )
-            .await,
-        ),
-        ("POST", "/v1/config") => Some(
-            write_not_implemented(
-                stream,
-                "phase-11/runtime-config-set",
-                "runtime mutation of config keys",
-            )
-            .await,
-        ),
-        _ => None,
-    }
-}
-
-async fn handle_get<W>(stream: &mut W, query: &str, state: &Arc<AdminState>) -> io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let key = parse_key(query);
+/// `GET /v1/config[?key=...]` handler.
+pub async fn get(
+    req: Request<Incoming>,
+    state: Arc<AdminState>,
+) -> brain_http::Result<Response<ResponseBody>> {
+    let query = req.uri().query().unwrap_or("").to_owned();
+    let key = parse_key(&query).map(|s| s.to_owned());
     let cfg_json = match serde_json::to_value(state.config.as_ref()) {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "config serialize failed");
-            return write_response(
-                stream,
-                500,
-                "Internal Server Error",
-                HDR_TEXT,
+            return Ok(text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
                 "config serialize failed\n",
-            )
-            .await;
+            ));
         }
     };
-    let value = match key {
+    let value = match key.as_deref() {
         None => cfg_json,
         Some(path) => match walk(&cfg_json, path) {
             Some(v) => v.clone(),
             None => {
-                return write_response(
-                    stream,
-                    404,
-                    "Not Found",
-                    HDR_TEXT,
+                return Ok(text_response(
+                    StatusCode::NOT_FOUND,
                     &format!("unknown config key `{path}`\n"),
-                )
-                .await;
+                ));
             }
         },
     };
     let body = match serde_json::to_string(&value) {
         Ok(s) => s + "\n",
-        Err(_) => {
-            return write_response(stream, 500, "Internal Server Error", HDR_TEXT, "encode\n").await
-        }
+        Err(_) => return Ok(text_response(StatusCode::INTERNAL_SERVER_ERROR, "encode\n")),
     };
-    write_response(stream, 200, "OK", HDR_JSON, &body).await
+    Ok(json_response(StatusCode::OK, body))
+}
+
+/// `POST /v1/config/reload` handler — deferred.
+pub async fn reload(
+    _req: Request<Incoming>,
+    _state: Arc<AdminState>,
+) -> brain_http::Result<Response<ResponseBody>> {
+    Ok(not_implemented(
+        "phase-11/live-config-reload",
+        "live config reload from disk",
+    ))
+}
+
+/// `POST /v1/config?key=…` handler — deferred.
+pub async fn set(
+    _req: Request<Incoming>,
+    _state: Arc<AdminState>,
+) -> brain_http::Result<Response<ResponseBody>> {
+    Ok(not_implemented(
+        "phase-11/runtime-config-set",
+        "runtime mutation of config keys",
+    ))
 }
 
 fn parse_key(query: &str) -> Option<&str> {

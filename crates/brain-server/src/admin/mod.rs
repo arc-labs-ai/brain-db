@@ -1,28 +1,19 @@
-//! Admin / observability HTTP server (sub-task 9.13).
+//! Admin / observability HTTP server.
+//!
+//! Built on `brain-http` (hyper 1.x) as of Phase 11 M3. Replaces the
+//! hand-rolled HTTP/1.1 parser + writeln-chain that lived here through
+//! Phase 10.
 //!
 //! Spec §14/01. Binds a separate listener on `cfg.server.metrics_addr`
 //! (default `127.0.0.1:9091`) and serves:
 //!
 //! - `GET /healthz` → `200 OK\nok`
 //! - `GET /metrics` → Prometheus text-format exposition
-//! - everything else → `400 Bad Request`
-//!
-//! ## Why hand-rolled HTTP?
-//!
-//! The endpoint surface is two static paths. Pulling in `hyper` /
-//! `axum` would add ~50 deps for two `GET` handlers. The spec's
-//! Prometheus text format is a few `format!`s away; a registry crate
-//! (`prometheus`, `metrics-exporter-prometheus`) doesn't save code
-//! at the v1 metric count.
-//!
-//! ## Scope
-//!
-//! v1 emits only metrics that are *already counted* somewhere
-//! first-party (workers, connections, build info). Spec §14/01 lists
-//! ~50 metric families; the per-op latency histograms, storage
-//! gauges, HNSW health gauges, and embedder metrics need
-//! instrumentation that lands in later sub-tasks. See
-//! `.claude/plans/phase-09-task-13.md` §1 for the survey.
+//! - `/v1/snapshots`, `/v1/rebuild-ann`, `/v1/workers`, `/v1/config`,
+//!   `/v1/audit`, `/v1/agents`, `/v1/shards`, `/v1/diagnostics/*`
+//!   — see the per-family handler modules.
+//! - unknown paths → `404 Not Found` (was `400 Bad Request` pre-M3
+//!   — wire-behaviour delta documented in the M3 commit message).
 
 #![cfg(target_os = "linux")]
 
@@ -30,28 +21,25 @@ mod agent;
 mod audit;
 mod config_route;
 mod diagnostics;
+mod metrics;
 mod rebuild;
+mod router;
 mod shard_route;
 mod snapshot;
+mod util;
 mod worker;
 
-use std::fmt::Write as _;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tracing::{debug, info, warn};
+use brain_http::server::{BoundServer, HttpServer, ShutdownHandle};
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::connection::{ConnectionMetrics, ShutdownSignal};
 use crate::shard::ShardHandle;
-
-const HTTP_REQUEST_LINE_MAX: usize = 8 * 1024;
-const HTTP_HEADER_BLOCK_MAX: usize = 8 * 1024;
 
 // ---------------------------------------------------------------------------
 // AdminState
@@ -86,8 +74,7 @@ pub struct AdminState {
     pub shards: Arc<Vec<ShardHandle>>,
     pub connections: Arc<ConnectionMetrics>,
     /// Sub-task 10.11: read-only view of the loaded config, surfaced
-    /// by `GET /v1/config`. Cloning is cheap (Arc bump); writes go
-    /// through the future live-reload pathway.
+    /// by `GET /v1/config`.
     pub config: Arc<Config>,
 }
 
@@ -116,16 +103,21 @@ impl AdminState {
 // AdminServer
 // ---------------------------------------------------------------------------
 
+/// Pre-bind admin server descriptor. Call [`Self::bind`] to acquire
+/// the TCP listener, then [`BoundAdminServer::serve`] to enter the
+/// accept loop.
 pub struct AdminServer {
     listen_addr: SocketAddr,
     state: Arc<AdminState>,
     shutdown: ShutdownSignal,
 }
 
+/// Admin server with its TCP listener already bound. Holds the
+/// brain-http `BoundServer` plus the brain-server side shutdown
+/// signal we bridge on `serve`.
 pub struct BoundAdminServer {
-    listener: TcpListener,
+    bound: BoundServer,
     local_addr: SocketAddr,
-    state: Arc<AdminState>,
     shutdown: ShutdownSignal,
 }
 
@@ -138,412 +130,72 @@ impl AdminServer {
         }
     }
 
-    /// Bind the admin HTTP socket. Mirrors `ConnectionListener::bind`
-    /// for ergonomic ephemeral binding in tests.
-    pub fn bind(self) -> io::Result<BoundAdminServer> {
-        let listener = bind_listener(self.listen_addr)?;
-        let local_addr = listener.local_addr()?;
+    /// Bind the admin HTTP socket. `async` since brain-http's
+    /// listener bind sits behind an `async fn` (matches the underlying
+    /// tokio TCP listener API).
+    pub async fn bind(self) -> io::Result<BoundAdminServer> {
+        let router = router::build(self.state.clone());
+        let bound = HttpServer::bind(self.listen_addr)
+            .router(router)
+            .listen()
+            .await
+            .map_err(|e| match e {
+                brain_http::Error::Io(io_err) => io_err,
+                other => io::Error::other(format!("brain-http bind: {other}")),
+            })?;
+        let local_addr = bound.local_addr()?;
         info!(addr = %local_addr, "admin server bound");
         Ok(BoundAdminServer {
-            listener,
+            bound,
             local_addr,
-            state: self.state,
             shutdown: self.shutdown,
         })
     }
 }
 
 impl BoundAdminServer {
+    /// The address the listener is bound to. Cheap accessor for tests
+    /// that bind on port 0.
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
+    /// Run the accept loop until the brain-server shutdown signal
+    /// fires, then drain in-flight connections via brain-http's
+    /// graceful shutdown (30 s cap). Returns the bound local address
+    /// — same shape as the pre-M3 API.
     pub async fn serve(mut self) -> io::Result<SocketAddr> {
         let local_addr = self.local_addr;
         info!(addr = %local_addr, "admin server accepting");
-        loop {
-            tokio::select! {
-                biased;
-                () = self.shutdown.recv() => {
-                    info!(addr = %local_addr, "admin server shutdown signalled");
-                    return Ok(local_addr);
-                }
-                accepted = self.listener.accept() => {
-                    let (stream, peer) = match accepted {
-                        Ok(p) => p,
-                        Err(e) => {
-                            warn!(error = %e, "admin accept failed");
-                            continue;
-                        }
-                    };
-                    let state = self.state.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = serve_request(stream, state).await {
-                            debug!(peer = %peer, error = %e, "admin request ended");
-                        }
-                    });
-                }
+
+        // Bridge: brain-server::ShutdownSignal → brain-http::ShutdownHandle.
+        // When the project-wide shutdown fires, trigger brain-http's
+        // accept loop to stop and drain.
+        let (http_handle, run_fut) = self.bound.into_runner();
+        let bridge_handle: ShutdownHandle = http_handle;
+        let bridge_task = tokio::spawn(async move {
+            self.shutdown.recv().await;
+            bridge_handle.shutdown();
+        });
+
+        // Drive the accept loop. Map errors back to io::Error for the
+        // existing return-type contract.
+        let result = run_fut.await;
+        // Ensure the bridge task is cleaned up even if shutdown
+        // happened by another path (e.g. fatal I/O error in accept).
+        bridge_task.abort();
+
+        match result {
+            Ok(()) => {
+                info!(addr = %local_addr, "admin server shutdown complete");
+                Ok(local_addr)
+            }
+            Err(brain_http::Error::Io(e)) => Err(e),
+            Err(other) => {
+                warn!(addr = %local_addr, error = %other, "admin server exited with error");
+                Err(io::Error::other(format!("brain-http run: {other}")))
             }
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Minimal HTTP/1.1 request handler
-// ---------------------------------------------------------------------------
-
-async fn serve_request(stream: TcpStream, state: Arc<AdminState>) -> io::Result<()> {
-    let mut reader = BufReader::new(stream);
-
-    // Request line: `METHOD SP PATH SP VERSION CRLF`.
-    let mut request_line = String::new();
-    let n = read_line(&mut reader, &mut request_line, HTTP_REQUEST_LINE_MAX).await?;
-    if n == 0 {
-        return Ok(());
-    }
-
-    // Header block (we don't care about most headers; just drain until
-    // CRLFCRLF or the bound).
-    let mut header_bytes = 0usize;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let read = read_line(&mut reader, &mut line, HTTP_HEADER_BLOCK_MAX - header_bytes).await?;
-        if read == 0 {
-            break;
-        }
-        header_bytes += read;
-        if line.trim_end_matches(['\r', '\n']).is_empty() {
-            break;
-        }
-    }
-
-    let (method, path_with_query) = parse_request_line(&request_line);
-    let (path, query) = split_path_query(path_with_query);
-    let mut stream = reader.into_inner();
-
-    // Snapshot routes (POST / GET / DELETE on /v1/snapshots[*]) —
-    // sub-task 10.9. Falls through if no match.
-    if let Some(res) = snapshot::dispatch(&mut stream, method, path, query, &state).await {
-        return res;
-    }
-    // POST /v1/rebuild-ann — sub-task 10.10.
-    if let Some(res) = rebuild::dispatch(&mut stream, method, path, query, &state).await {
-        return res;
-    }
-    // 10.11 routes: worker, config, audit, agent, shard.
-    if let Some(res) = worker::dispatch(&mut stream, method, path, query, &state).await {
-        return res;
-    }
-    if let Some(res) = config_route::dispatch(&mut stream, method, path, query, &state).await {
-        return res;
-    }
-    if let Some(res) = audit::dispatch(&mut stream, method, path, query, &state).await {
-        return res;
-    }
-    if let Some(res) = agent::dispatch(&mut stream, method, path, query, &state).await {
-        return res;
-    }
-    if let Some(res) = shard_route::dispatch(&mut stream, method, path, query, &state).await {
-        return res;
-    }
-    if let Some(res) = diagnostics::dispatch(&mut stream, method, path, query, &state).await {
-        return res;
-    }
-
-    if method != "GET" {
-        return write_response(
-            &mut stream,
-            400,
-            "Bad Request",
-            "text/plain; charset=utf-8",
-            "bad method\n",
-        )
-        .await;
-    }
-    match path {
-        "/healthz" => {
-            write_response(&mut stream, 200, "OK", "text/plain; charset=utf-8", "ok\n").await
-        }
-        "/metrics" => {
-            let body = format_metrics(&state).await;
-            write_response(
-                &mut stream,
-                200,
-                "OK",
-                "text/plain; version=0.0.4; charset=utf-8",
-                &body,
-            )
-            .await
-        }
-        _ => {
-            write_response(
-                &mut stream,
-                400,
-                "Bad Request",
-                "text/plain; charset=utf-8",
-                "unknown path\n",
-            )
-            .await
-        }
-    }
-}
-
-/// Split `/path?query` into `("/path", "query")`. No URL decoding;
-/// the snapshot routes only need keyed numeric values which don't
-/// require it.
-fn split_path_query(s: &str) -> (&str, &str) {
-    match s.find('?') {
-        Some(i) => (&s[..i], &s[i + 1..]),
-        None => (s, ""),
-    }
-}
-
-fn parse_request_line(line: &str) -> (&str, &str) {
-    // `GET /metrics HTTP/1.1\r\n` → ("GET", "/metrics")
-    let trimmed = line.trim_end_matches(['\r', '\n']);
-    let mut parts = trimmed.split(' ');
-    let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("/");
-    (method, path)
-}
-
-async fn read_line<R>(reader: &mut R, buf: &mut String, max: usize) -> io::Result<usize>
-where
-    R: tokio::io::AsyncBufRead + Unpin,
-{
-    if max == 0 {
-        return Ok(0);
-    }
-    let mut bytes_read = 0usize;
-    loop {
-        let mut byte = [0u8; 1];
-        let n = reader.read(&mut byte).await?;
-        if n == 0 {
-            break;
-        }
-        bytes_read += 1;
-        if bytes_read > max {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "header line too long",
-            ));
-        }
-        buf.push(byte[0] as char);
-        if byte[0] == b'\n' {
-            break;
-        }
-    }
-    Ok(bytes_read)
-}
-
-/// Uniform 501 body for routes whose CLI surface is wired (10.11)
-/// but whose server-side primitive lands in a later phase.
-/// Shape: `{"error":"not_implemented","deferred_to":<slug>,"detail":<text>}`.
-pub(super) async fn write_not_implemented<W>(
-    stream: &mut W,
-    deferred_to: &str,
-    detail: &str,
-) -> io::Result<()>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    // No JSON-escape: the slug/detail values are all controlled by
-    // us (admin code), never reflected from user input.
-    let body = format!(
-        "{{\"error\":\"not_implemented\",\"deferred_to\":\"{deferred_to}\",\"detail\":\"{detail}\"}}\n",
-    );
-    write_response(
-        stream,
-        501,
-        "Not Implemented",
-        "application/json; charset=utf-8",
-        &body,
-    )
-    .await
-}
-
-pub(super) async fn write_response<W>(
-    stream: &mut W,
-    code: u16,
-    reason: &str,
-    content_type: &str,
-    body: &str,
-) -> io::Result<()>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let response = format!(
-        "HTTP/1.1 {code} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n{body}",
-        len = body.len(),
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.flush().await?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Metrics body builder
-// ---------------------------------------------------------------------------
-
-async fn format_metrics(state: &AdminState) -> String {
-    let mut s = String::with_capacity(2048);
-
-    // Static + scalars.
-    let uptime_secs = state.started_at.elapsed().as_secs();
-    writeln!(&mut s, "# HELP brain_build_info Build information.").unwrap();
-    writeln!(&mut s, "# TYPE brain_build_info gauge").unwrap();
-    writeln!(
-        &mut s,
-        "brain_build_info{{version=\"{v}\",git_commit=\"{g}\"}} 1",
-        v = state.build_info.version,
-        g = state.build_info.git_commit,
-    )
-    .unwrap();
-
-    writeln!(
-        &mut s,
-        "# HELP brain_up Server liveness; 1 if accepting requests."
-    )
-    .unwrap();
-    writeln!(&mut s, "# TYPE brain_up gauge").unwrap();
-    writeln!(&mut s, "brain_up 1").unwrap();
-
-    writeln!(
-        &mut s,
-        "# HELP brain_shards_total Number of configured shards."
-    )
-    .unwrap();
-    writeln!(&mut s, "# TYPE brain_shards_total gauge").unwrap();
-    writeln!(&mut s, "brain_shards_total {}", state.shards.len()).unwrap();
-
-    writeln!(
-        &mut s,
-        "# HELP brain_connections_active Currently in-flight client connections."
-    )
-    .unwrap();
-    writeln!(&mut s, "# TYPE brain_connections_active gauge").unwrap();
-    writeln!(
-        &mut s,
-        "brain_connections_active {}",
-        state.connections.active.load(Ordering::Relaxed),
-    )
-    .unwrap();
-
-    writeln!(
-        &mut s,
-        "# HELP brain_connections_total Total accepted client connections since startup."
-    )
-    .unwrap();
-    writeln!(&mut s, "# TYPE brain_connections_total counter").unwrap();
-    writeln!(
-        &mut s,
-        "brain_connections_total {}",
-        state.connections.total.load(Ordering::Relaxed),
-    )
-    .unwrap();
-
-    writeln!(
-        &mut s,
-        "# HELP process_uptime_seconds Process uptime since admin server start."
-    )
-    .unwrap();
-    writeln!(&mut s, "# TYPE process_uptime_seconds counter").unwrap();
-    writeln!(&mut s, "process_uptime_seconds {uptime_secs}").unwrap();
-
-    writeln!(
-        &mut s,
-        "# HELP process_start_time_seconds Unix timestamp of process start (seconds)."
-    )
-    .unwrap();
-    writeln!(&mut s, "# TYPE process_start_time_seconds gauge").unwrap();
-    writeln!(
-        &mut s,
-        "process_start_time_seconds {}",
-        state.started_at_unix_secs
-    )
-    .unwrap();
-
-    // Per-worker counters from each shard's scheduler.
-    writeln!(
-        &mut s,
-        "# HELP brain_worker_cycles_total Worker cycles completed."
-    )
-    .unwrap();
-    writeln!(&mut s, "# TYPE brain_worker_cycles_total counter").unwrap();
-    writeln!(
-        &mut s,
-        "# HELP brain_worker_processed_total Items processed by the worker."
-    )
-    .unwrap();
-    writeln!(&mut s, "# TYPE brain_worker_processed_total counter").unwrap();
-    writeln!(
-        &mut s,
-        "# HELP brain_worker_errors_total Worker cycle errors."
-    )
-    .unwrap();
-    writeln!(&mut s, "# TYPE brain_worker_errors_total counter").unwrap();
-    writeln!(
-        &mut s,
-        "# HELP brain_worker_last_run_unixtime Unix-time of the worker's last cycle."
-    )
-    .unwrap();
-    writeln!(&mut s, "# TYPE brain_worker_last_run_unixtime gauge").unwrap();
-
-    for shard in state.shards.iter() {
-        let shard_id = shard.shard_id();
-        match shard.scheduler_snapshot().await {
-            Ok(snapshot) => {
-                let mut workers = snapshot;
-                workers.sort_by_key(|(name, _, _)| *name);
-                for (name, _kind, snap) in workers {
-                    writeln!(
-                        &mut s,
-                        "brain_worker_cycles_total{{shard=\"{shard_id}\",worker=\"{name}\"}} {}",
-                        snap.cycles_total
-                    )
-                    .unwrap();
-                    writeln!(
-                        &mut s,
-                        "brain_worker_processed_total{{shard=\"{shard_id}\",worker=\"{name}\"}} {}",
-                        snap.processed_total
-                    )
-                    .unwrap();
-                    writeln!(
-                        &mut s,
-                        "brain_worker_errors_total{{shard=\"{shard_id}\",worker=\"{name}\"}} {}",
-                        snap.errors_total
-                    )
-                    .unwrap();
-                    writeln!(
-                        &mut s,
-                        "brain_worker_last_run_unixtime{{shard=\"{shard_id}\",worker=\"{name}\"}} {}",
-                        snap.last_run_unix_secs
-                    )
-                    .unwrap();
-                }
-            }
-            Err(e) => {
-                warn!(shard_id, error = %e, "scheduler_snapshot failed");
-            }
-        }
-    }
-
-    s
-}
-
-// ---------------------------------------------------------------------------
-// Socket setup
-// ---------------------------------------------------------------------------
-
-fn bind_listener(addr: SocketAddr) -> io::Result<TcpListener> {
-    let socket = if addr.is_ipv4() {
-        TcpSocket::new_v4()?
-    } else {
-        TcpSocket::new_v6()?
-    };
-    socket.set_reuseaddr(true)?;
-    socket.bind(addr)?;
-    socket.listen(128)
 }

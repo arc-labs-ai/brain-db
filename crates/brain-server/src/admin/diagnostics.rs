@@ -10,17 +10,16 @@
 //!   flags missing fields in `deferred[]` per the plan §1.
 
 use std::fmt::Write as _;
-use std::io;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::io::AsyncWrite;
+use brain_http::body::ResponseBody;
+use http::{Request, Response, StatusCode};
+use hyper::body::Incoming;
 use tracing::warn;
 
-use super::{write_not_implemented, write_response, AdminState};
-
-const HDR_JSON: &str = "application/json; charset=utf-8";
-const HDR_TEXT: &str = "text/plain; charset=utf-8";
+use crate::admin::util::{json_response, not_implemented, text_response};
+use crate::admin::AdminState;
 
 /// v1 always reports these spec'd fields as not yet populated. As
 /// primitives land (active task registry, dispatch queue depth,
@@ -33,50 +32,29 @@ const DEFERRED_FIELDS: &[&str] = &[
     "in_memory_state_summary",
 ];
 
-pub async fn dispatch<W>(
-    stream: &mut W,
-    method: &str,
-    path: &str,
-    query: &str,
-    state: &Arc<AdminState>,
-) -> Option<io::Result<()>>
-where
-    W: AsyncWrite + Unpin,
-{
-    match (method, path) {
-        ("POST", "/v1/diagnostics/profile") => Some(
-            write_not_implemented(
-                stream,
-                "phase-11/glommio-profiler",
-                "in-process CPU profiler for the shard's Glommio executor",
-            )
-            .await,
-        ),
-        ("GET", "/v1/diagnostics/debug-snapshot") => {
-            Some(handle_debug_snapshot(stream, query, state).await)
-        }
-        _ => None,
-    }
+/// `POST /v1/diagnostics/profile` handler — deferred.
+pub async fn profile(
+    _req: Request<Incoming>,
+    _state: Arc<AdminState>,
+) -> brain_http::Result<Response<ResponseBody>> {
+    Ok(not_implemented(
+        "phase-11/glommio-profiler",
+        "in-process CPU profiler for the shard's Glommio executor",
+    ))
 }
 
-async fn handle_debug_snapshot<W>(
-    stream: &mut W,
-    query: &str,
-    state: &Arc<AdminState>,
-) -> io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let shard_id = match parse_shard(query) {
+/// `GET /v1/diagnostics/debug-snapshot` handler.
+pub async fn debug_snapshot(
+    req: Request<Incoming>,
+    state: Arc<AdminState>,
+) -> brain_http::Result<Response<ResponseBody>> {
+    let query = req.uri().query().unwrap_or("").to_owned();
+    let shard_id = match parse_shard(&query) {
         Ok(id) => id,
-        Err(msg) => return write_response(stream, 400, "Bad Request", HDR_TEXT, &msg).await,
+        Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &msg)),
     };
-    let shard = match state.shards.get(shard_id) {
-        Some(s) => s,
-        None => {
-            return write_response(stream, 404, "Not Found", HDR_TEXT, "shard out of range\n")
-                .await;
-        }
+    let Some(shard) = state.shards.get(shard_id) else {
+        return Ok(text_response(StatusCode::NOT_FOUND, "shard out of range\n"));
     };
     let captured_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -120,7 +98,7 @@ where
         }
     }
     body.push_str("]}\n");
-    write_response(stream, 200, "OK", HDR_JSON, &body).await
+    Ok(json_response(StatusCode::OK, body))
 }
 
 fn parse_shard(query: &str) -> Result<usize, String> {

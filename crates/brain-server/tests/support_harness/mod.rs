@@ -116,7 +116,7 @@ pub async fn start(n_shards: usize) -> Server {
         Arc::new(config::Config::for_tests()),
     ));
     let admin = AdminServer::new("127.0.0.1:0".parse().unwrap(), admin_state, signal);
-    let bound_admin = admin.bind().expect("bind admin");
+    let bound_admin = admin.bind().await.expect("bind admin");
     let admin_addr = bound_admin.local_addr();
     let admin_handle = tokio::spawn(async move { bound_admin.serve().await });
 

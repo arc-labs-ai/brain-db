@@ -54,6 +54,14 @@ brain-embed = { path = "../brain-embed" }
 brain-planner = { path = "../brain-planner" }
 brain-ops = { path = "../brain-ops" }
 brain-workers = { path = "../brain-workers" }
+# Phase 11 M3: admin server is built on brain-http (hyper-based).
+brain-http = { path = "../brain-http", features = ["server"] }
+# Hyper types referenced directly from admin handlers + the metrics
+# exposition path.
+hyper = { workspace = true, features = ["http1", "server"] }
+http = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
 
 # Connection layer (sub-task 9.9): Tokio TCP + optional rustls TLS.
 tokio.workspace = true
@@ -64,7 +72,12 @@ socket2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = [
+  "rt",
+  "rt-multi-thread",
+  "macros",
+  "time",
+] }
 
 # Connection layer integration tests need to drive a TLS client.
 # 10.13 e2e tests drive the in-process harness via the real

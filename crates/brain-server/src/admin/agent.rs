@@ -1,60 +1,44 @@
 //! Admin HTTP handlers for `agent` (spec §14/06 §10; sub-task 10.11).
 //!
-//! All routes deferred — the agent_id secondary index doesn't exist
-//! yet (would need a redb scan keyed by agent + cascade delete +
-//! audit entry). Each route returns a structured 501 so the CLI can
-//! surface a uniform deferral message.
+//! All routes deferred — agent_id secondary index doesn't exist yet.
 
-use std::io;
 use std::sync::Arc;
 
-use tokio::io::AsyncWrite;
+use brain_http::body::ResponseBody;
+use http::{Method, Request, Response, StatusCode};
+use hyper::body::Incoming;
 
-use super::{write_not_implemented, AdminState};
+use crate::admin::util::{not_implemented, text_response};
+use crate::admin::AdminState;
 
-pub async fn dispatch<W>(
-    stream: &mut W,
-    method: &str,
-    path: &str,
-    _query: &str,
-    _state: &Arc<AdminState>,
-) -> Option<io::Result<()>>
-where
-    W: AsyncWrite + Unpin,
-{
-    if path == "/v1/agents" {
-        return Some(match method {
-            "GET" => {
-                write_not_implemented(
-                    stream,
-                    "phase-11/agent-index",
-                    "agent list (needs agent_id secondary index)",
-                )
-                .await
-            }
-            _ => return None,
-        });
+/// `GET /v1/agents` handler — deferred.
+pub async fn list(
+    _req: Request<Incoming>,
+    _state: Arc<AdminState>,
+) -> brain_http::Result<Response<ResponseBody>> {
+    Ok(not_implemented(
+        "phase-11/agent-index",
+        "agent list (needs agent_id secondary index)",
+    ))
+}
+
+/// `/v1/agents/{id}` prefix handler — internally dispatches on method.
+pub async fn by_id(
+    req: Request<Incoming>,
+    _state: Arc<AdminState>,
+) -> brain_http::Result<Response<ResponseBody>> {
+    match req.method() {
+        m if m == Method::GET => Ok(not_implemented(
+            "phase-11/agent-index",
+            "per-agent stats (needs agent_id secondary index)",
+        )),
+        m if m == Method::DELETE => Ok(not_implemented(
+            "phase-11/agent-cascade-delete",
+            "agent cascade delete (memories + edges + contexts)",
+        )),
+        _ => Ok(text_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed\n",
+        )),
     }
-    if let Some(_id) = path.strip_prefix("/v1/agents/") {
-        return Some(match method {
-            "GET" => {
-                write_not_implemented(
-                    stream,
-                    "phase-11/agent-index",
-                    "per-agent stats (needs agent_id secondary index)",
-                )
-                .await
-            }
-            "DELETE" => {
-                write_not_implemented(
-                    stream,
-                    "phase-11/agent-cascade-delete",
-                    "agent cascade delete (memories + edges + contexts)",
-                )
-                .await
-            }
-            _ => return None,
-        });
-    }
-    None
 }

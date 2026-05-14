@@ -1,35 +1,34 @@
 //! Admin HTTP handlers for `audit` (spec §14/06 §8; sub-task 10.11).
 //!
-//! Routes (both deferred — no audit-log primitive exists yet):
-//! - `GET /v1/audit?...` → 501
-//! - `GET /v1/audit/export` → 501
+//! Both deferred — no audit-log primitive exists yet.
 
-use std::io;
 use std::sync::Arc;
 
-use tokio::io::AsyncWrite;
+use brain_http::body::ResponseBody;
+use http::{Request, Response};
+use hyper::body::Incoming;
 
-use super::{write_not_implemented, AdminState};
+use crate::admin::util::not_implemented;
+use crate::admin::AdminState;
 
-pub async fn dispatch<W>(
-    stream: &mut W,
-    method: &str,
-    path: &str,
-    _query: &str,
-    _state: &Arc<AdminState>,
-) -> Option<io::Result<()>>
-where
-    W: AsyncWrite + Unpin,
-{
-    match (method, path) {
-        ("GET", "/v1/audit") | ("GET", "/v1/audit/export") => Some(
-            write_not_implemented(
-                stream,
-                "phase-11/audit-log",
-                "audit-log query and export pathway",
-            )
-            .await,
-        ),
-        _ => None,
-    }
+/// `GET /v1/audit?...` handler — deferred.
+pub async fn query(
+    _req: Request<Incoming>,
+    _state: Arc<AdminState>,
+) -> brain_http::Result<Response<ResponseBody>> {
+    Ok(not_implemented(
+        "phase-11/audit-log",
+        "audit-log query and export pathway",
+    ))
+}
+
+/// `GET /v1/audit/export` handler — deferred.
+pub async fn export(
+    _req: Request<Incoming>,
+    _state: Arc<AdminState>,
+) -> brain_http::Result<Response<ResponseBody>> {
+    Ok(not_implemented(
+        "phase-11/audit-log",
+        "audit-log query and export pathway",
+    ))
 }

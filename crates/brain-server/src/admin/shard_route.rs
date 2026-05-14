@@ -9,51 +9,20 @@
 //! `crate::shard` already exists at the workspace level.
 
 use std::fmt::Write as _;
-use std::io;
 use std::sync::Arc;
 
-use tokio::io::AsyncWrite;
+use brain_http::body::ResponseBody;
+use http::{Request, Response, StatusCode};
+use hyper::body::Incoming;
 
-use super::{write_not_implemented, write_response, AdminState};
+use crate::admin::util::{json_response, not_implemented};
+use crate::admin::AdminState;
 
-const HDR_JSON: &str = "application/json; charset=utf-8";
-
-pub async fn dispatch<W>(
-    stream: &mut W,
-    method: &str,
-    path: &str,
-    _query: &str,
-    state: &Arc<AdminState>,
-) -> Option<io::Result<()>>
-where
-    W: AsyncWrite + Unpin,
-{
-    match (method, path) {
-        ("GET", "/v1/shards") => Some(handle_list(stream, state).await),
-        ("POST", "/v1/shards") => Some(
-            write_not_implemented(
-                stream,
-                "phase-12/shard-create",
-                "cluster expansion via online shard creation",
-            )
-            .await,
-        ),
-        ("DELETE", p) if p.starts_with("/v1/shards/") => Some(
-            write_not_implemented(
-                stream,
-                "phase-12/shard-delete",
-                "cluster decommission via online shard delete",
-            )
-            .await,
-        ),
-        _ => None,
-    }
-}
-
-async fn handle_list<W>(stream: &mut W, state: &Arc<AdminState>) -> io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
+/// `GET /v1/shards` handler.
+pub async fn list(
+    _req: Request<Incoming>,
+    state: Arc<AdminState>,
+) -> brain_http::Result<Response<ResponseBody>> {
     let mut body = String::with_capacity(64);
     body.push_str("{\"shards\":[");
     for (i, shard) in state.shards.iter().enumerate() {
@@ -68,5 +37,27 @@ where
         .expect("string write");
     }
     body.push_str("]}\n");
-    write_response(stream, 200, "OK", HDR_JSON, &body).await
+    Ok(json_response(StatusCode::OK, body))
+}
+
+/// `POST /v1/shards` handler — deferred.
+pub async fn create(
+    _req: Request<Incoming>,
+    _state: Arc<AdminState>,
+) -> brain_http::Result<Response<ResponseBody>> {
+    Ok(not_implemented(
+        "phase-12/shard-create",
+        "cluster expansion via online shard creation",
+    ))
+}
+
+/// `DELETE /v1/shards/{idx}` handler — deferred.
+pub async fn delete(
+    _req: Request<Incoming>,
+    _state: Arc<AdminState>,
+) -> brain_http::Result<Response<ResponseBody>> {
+    Ok(not_implemented(
+        "phase-12/shard-delete",
+        "cluster decommission via online shard delete",
+    ))
 }

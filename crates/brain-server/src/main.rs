@@ -211,7 +211,7 @@ mod linux_main {
                 admin_state,
                 signal.clone(),
             );
-            let admin_handle = match admin.bind() {
+            let admin_handle = match admin.bind().await {
                 Ok(bound) => {
                     tracing::info!(addr = %bound.local_addr(), "admin server listening");
                     tokio::spawn(async move { bound.serve().await })
