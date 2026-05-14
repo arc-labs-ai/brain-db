@@ -258,16 +258,22 @@ milestone. Plan-first per [`AUTONOMY.md`](../../AUTONOMY.md) §21.
   50 ms of emit (proves flush discipline); reconnect test verifies
   `Last-Event-ID` carries through.
 
-### M5 — HTTP client decision
+### M5 — HTTP client decision ✅
 **Reads:** `crates/brain-cli/src/http/mod.rs`.
-**Writes:** EITHER (a) keep the existing 200-LOC blocking client in
-  `brain-cli::http` and document that brain-http does NOT expose a
-  client in v1; OR (b) add a thin async client wrapper around
-  `hyper-util::client::legacy::Client`. Default recommendation: (a)
-  — the existing hand-roll works and the SDK doesn't currently need
-  async HTTP. Revisit when there's a concrete need.
-**Done when:** decision documented in `client/mod.rs` rustdoc; no
-  churn if we choose (a).
+**Decision (shipped):** path (a) — `brain-cli::http` stays as-is
+  (~200 LOC blocking GET/POST/DELETE, zero external deps,
+  well-tested via the admin integration suites). brain-http does
+  NOT expose a client in v1.
+**Writes:** `crates/brain-http/src/client/mod.rs` — a pure-rustdoc
+  module that documents the deferral, the three trigger conditions
+  for revisiting (Phase 12 OTLP push / new outbound consumer /
+  `reqwest` summarizer dep audit), and the natural shape when a
+  client is added (`hyper_util::client::legacy::Client` over a
+  feature-gated `Connect` impl, with a blocking facade wrapping a
+  Tokio runtime).
+**Done when:** decision documented; `brain-cli::http` unchanged;
+  the `client` feature flag stays declared (it's the future
+  on-switch) but compiles to a docs-only module.
 
 ### M6 — WebSocket server (Upgrade + tokio-tungstenite)
 **Reads:** RFC 6455; `tokio-tungstenite` docs; hyper `Upgrade` example.

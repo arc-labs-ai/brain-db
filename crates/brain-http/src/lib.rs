@@ -53,6 +53,8 @@ pub mod error;
 pub mod observability;
 pub mod service;
 
+#[cfg(feature = "client")]
+pub mod client;
 #[cfg(feature = "server")]
 pub mod router;
 #[cfg(feature = "server")]
