@@ -62,6 +62,12 @@ pub enum EntityOpError {
         name: String,
         existing: EntityId,
     },
+
+    /// Sub-task 16.4: trigram index write/read failure. Forwarded from
+    /// [`crate::trigram_ops::TrigramOpError`] when entity_put / update /
+    /// tombstone touches the trigram index transactionally.
+    #[error("trigram op: {0}")]
+    TrigramOp(#[from] crate::trigram_ops::TrigramOpError),
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +238,17 @@ pub fn entity_put(
         }
     }
 
+    // Sub-task 16.4: trigram index. Union of canonical_name + every
+    // alias contributes to the entity's trigram set.
+    let trigrams =
+        crate::trigram_ops::trigrams_of_components(&entity.canonical_name, &entity.aliases);
+    crate::trigram_ops::index_entity_trigrams(
+        wtxn,
+        entity.entity_type,
+        entity.id,
+        &trigrams,
+    )?;
+
     Ok(())
 }
 
@@ -316,6 +333,26 @@ pub fn entity_update(
             )?;
         }
     }
+
+    // Sub-task 16.4: trigram delta. The entity's old trigram set is
+    // derived from current.canonical_name + current.aliases; the new
+    // set from next.canonical_name + next.aliases. Remove `old - new`,
+    // add `new - old`.
+    let old_trigrams =
+        crate::trigram_ops::trigrams_of_components(&current.canonical_name, &current.aliases);
+    let new_trigrams =
+        crate::trigram_ops::trigrams_of_components(&next.canonical_name, &next.aliases);
+    let to_remove: std::collections::HashSet<[u8; 3]> =
+        old_trigrams.difference(&new_trigrams).copied().collect();
+    let to_add: std::collections::HashSet<[u8; 3]> =
+        new_trigrams.difference(&old_trigrams).copied().collect();
+    crate::trigram_ops::remove_entity_trigrams(
+        wtxn,
+        current.entity_type(),
+        current.entity_id(),
+        &to_remove,
+    )?;
+    crate::trigram_ops::index_entity_trigrams(wtxn, next.entity_type, next.id, &to_add)?;
 
     // Write back primary row.
     let mut m: EntityMetadata = (&next).into();
@@ -407,6 +444,18 @@ pub fn entity_tombstone(
             let na = normalize_name(alias);
             t.remove(&(current.entity_type_id, na.as_str(), current.entity_id_bytes))?;
         }
+    }
+    // Sub-task 16.4: tear down trigram index (one row per trigram in
+    // the entity's union set).
+    {
+        let trigrams =
+            crate::trigram_ops::trigrams_of_components(&current.canonical_name, &current.aliases);
+        crate::trigram_ops::remove_entity_trigrams(
+            wtxn,
+            current.entity_type(),
+            current.entity_id(),
+            &trigrams,
+        )?;
     }
     // Update primary row with tombstone flag + timestamp.
     let mut next = current;
@@ -890,5 +939,116 @@ mod tests {
         let projects = entity_list_by_type(&rtxn, EntityTypeId(7)).unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].canonical_name, "ProjectOne");
+    }
+
+    // ----- 16.4 trigram integration -------------------------------------
+
+    #[test]
+    fn entity_put_writes_trigrams() {
+        use crate::trigram_ops::{extract_trigrams, lookup_candidates_by_trigram};
+        let dir = TempDir::new().unwrap();
+        let mut db = fresh_db(&dir);
+        let e = person_entity("Priya Patel");
+        let id = e.id;
+
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, &e).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        // Every trigram of the normalized canonical_name resolves back
+        // to the inserted EntityId.
+        for tg in extract_trigrams("priya patel") {
+            let cands = lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, tg).unwrap();
+            assert!(
+                cands.contains(&id),
+                "trigram {tg:?} not in index for inserted entity"
+            );
+        }
+    }
+
+    #[test]
+    fn entity_put_aliases_contribute_trigrams() {
+        use crate::trigram_ops::lookup_candidates_by_trigram;
+        let dir = TempDir::new().unwrap();
+        let mut db = fresh_db(&dir);
+        let mut e = person_entity("X"); // canonical "X" — short trigrams only
+        e.aliases.push("Priya Patel".into()); // adds rich trigrams
+        let id = e.id;
+
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, &e).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        // "pri" comes only from the alias.
+        let cands =
+            lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, *b"pri").unwrap();
+        assert!(cands.contains(&id));
+    }
+
+    #[test]
+    fn entity_rename_updates_trigrams() {
+        use crate::trigram_ops::lookup_candidates_by_trigram;
+        let dir = TempDir::new().unwrap();
+        let mut db = fresh_db(&dir);
+        let e = person_entity("Alpha");
+        let id = e.id;
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_put(&wtxn, &e).unwrap();
+            wtxn.commit().unwrap();
+        }
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_rename(&wtxn, id, "Bravo".into(), LATER).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        // "bra" present (new canonical).
+        assert!(
+            lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, *b"bra")
+                .unwrap()
+                .contains(&id)
+        );
+        // "alp" — old canonical_name moves into aliases on rename, so
+        // its trigrams stay indexed. (See 16.2's rename semantics —
+        // old name preserved as alias for resolver continuity.)
+        assert!(
+            lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, *b"alp")
+                .unwrap()
+                .contains(&id),
+            "alpha trigrams should remain (moved to aliases on rename)"
+        );
+    }
+
+    #[test]
+    fn entity_tombstone_removes_trigrams() {
+        use crate::trigram_ops::lookup_candidates_by_trigram;
+        let dir = TempDir::new().unwrap();
+        let mut db = fresh_db(&dir);
+        let mut e = person_entity("Priya Patel");
+        e.aliases.push("Priya".into());
+        let id = e.id;
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_put(&wtxn, &e).unwrap();
+            wtxn.commit().unwrap();
+        }
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_tombstone(&wtxn, id, LATER).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.read_txn().unwrap();
+        // No trigram of the original entity surfaces it.
+        for tg in [*b"pri", *b"riy", *b"pat", *b"tel"] {
+            let cands = lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, tg).unwrap();
+            assert!(
+                !cands.contains(&id),
+                "tombstoned entity surfaced via trigram {tg:?}"
+            );
+        }
     }
 }

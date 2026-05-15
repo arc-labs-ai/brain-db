@@ -40,9 +40,13 @@ pub const ENTITY_ALIASES_TABLE: TableDefinition<
 > = TableDefinition::new("entity_aliases");
 
 /// `(entity_type_id, trigram, EntityId.to_bytes())` → `()`.
+///
+/// Trigrams are fixed 3-byte windows (pg_trgm-style, byte-level) per
+/// spec §18/02. 15.1 declared this with `&'static str` for the trigram
+/// component; sub-task 16.4 corrected the key shape to `[u8; 3]`.
 pub const ENTITY_TRIGRAMS_TABLE: TableDefinition<
     'static,
-    (u32, &'static str, [u8; 16]),
+    (u32, [u8; 3], [u8; 16]),
     (),
 > = TableDefinition::new("entity_trigrams");
 
@@ -400,7 +404,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
         let id = EntityId::new();
-        let key = (1u32, "pri", id.to_bytes());
+        // 16.4: trigram component is `[u8; 3]` (spec §18/02), not `&str`.
+        let key = (1u32, *b"pri", id.to_bytes());
 
         let wtxn = db.begin_write().unwrap();
         {
