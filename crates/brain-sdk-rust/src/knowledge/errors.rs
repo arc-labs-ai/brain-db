@@ -10,7 +10,7 @@
 //!
 //! ```no_run
 //! # use brain_sdk_rust::{Client, ClientError, Person};
-//! # use brain_sdk_rust::knowledge::errors::EntityErrorKind;
+//! # use brain_sdk_rust::knowledge::errors::{ClientErrorEntityExt, EntityErrorKind};
 //! # async fn ex(client: Client, id: brain_sdk_rust::EntityId) -> Result<(), ClientError> {
 //! match client.entity::<Person>().rename(id, "Alice Cooper").await {
 //!     Ok(_) => {},

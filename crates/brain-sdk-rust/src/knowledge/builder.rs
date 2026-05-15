@@ -303,6 +303,27 @@ where
 // EntityUpdateBuilder.
 // ---------------------------------------------------------------------------
 
+/// Builder for `ENTITY_UPDATE` (full-replace semantics at the wire
+/// layer per spec §28/01 §5.1).
+///
+/// **Field-by-field semantics in 16.8:**
+///
+/// - `canonical_name`, `aliases`: if unset on the builder, the
+///   builder fetches the current entity via GET and inherits.
+/// - `attributes`: same — if unset, GET-and-inherit. If set via
+///   [`Self::attributes`], that block replaces the existing
+///   attributes wholesale.
+/// - The typed setters ([`Self::with`], `with_email` / `with_role` /
+///   etc. for [`Person`]) **replace** rather than patch: calling
+///   `.with_email("x")` starts from `T::Attributes::default()` then
+///   sets email — other fields go to None. Use [`Self::attributes`]
+///   with a complete struct for full control, or use the dedicated
+///   [`EntityClient::rename`] for name-only changes.
+///
+/// Full attribute-merge semantics (per-field patching that preserves
+/// untouched fields) land in phase 19 alongside the
+/// `#[derive(BrainEntity)]` macro, which can introspect schema-
+/// declared fields to know which slots exist.
 pub struct EntityUpdateBuilder<'a, T: BrainEntityType> {
     client: &'a Client,
     entity_id: EntityId,
