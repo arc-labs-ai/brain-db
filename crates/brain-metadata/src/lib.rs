@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod db;
+pub mod entity_merge_ops;
 pub mod entity_ops;
 pub mod llm_cache;
 pub mod schema;
