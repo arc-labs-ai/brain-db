@@ -149,5 +149,16 @@ pub async fn dispatch(req: RequestBody, ctx: &OpsContext) -> Result<ResponseBody
         RequestBody::EntityTombstone(r) => crate::knowledge_entity::handle_entity_tombstone(r, ctx)
             .await
             .map(ResponseBody::EntityTombstone),
+
+        // Statement ops — wire opcodes landed in 17.6; handlers in 17.7.
+        RequestBody::StatementCreate(_)
+        | RequestBody::StatementGet(_)
+        | RequestBody::StatementSupersede(_)
+        | RequestBody::StatementTombstone(_)
+        | RequestBody::StatementRetract(_)
+        | RequestBody::StatementHistory(_)
+        | RequestBody::StatementList(_) => {
+            Err(OpError::NotYetImplemented("statement op — Phase 17.7"))
+        }
     }
 }

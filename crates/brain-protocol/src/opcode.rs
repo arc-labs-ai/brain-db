@@ -130,6 +130,22 @@ pub enum Opcode {
     EntityListResp = 0x01B7,
     EntityTombstoneReq = 0x0138,
     EntityTombstoneResp = 0x01B8,
+
+    // §28 statement operations (0x0140-0x014F low-byte range) — phase 17.6.
+    StatementCreateReq = 0x0140,
+    StatementCreateResp = 0x01C0,
+    StatementGetReq = 0x0141,
+    StatementGetResp = 0x01C1,
+    StatementSupersedeReq = 0x0142,
+    StatementSupersedeResp = 0x01C2,
+    StatementTombstoneReq = 0x0143,
+    StatementTombstoneResp = 0x01C3,
+    StatementRetractReq = 0x0144,
+    StatementRetractResp = 0x01C4,
+    StatementHistoryReq = 0x0145,
+    StatementHistoryResp = 0x01C5,
+    StatementListReq = 0x0146,
+    StatementListResp = 0x01C6,
 }
 
 impl Opcode {
@@ -222,6 +238,22 @@ impl Opcode {
             0x01B7 => Self::EntityListResp,
             0x0138 => Self::EntityTombstoneReq,
             0x01B8 => Self::EntityTombstoneResp,
+
+            // §28 statement operations (phase 17.6).
+            0x0140 => Self::StatementCreateReq,
+            0x01C0 => Self::StatementCreateResp,
+            0x0141 => Self::StatementGetReq,
+            0x01C1 => Self::StatementGetResp,
+            0x0142 => Self::StatementSupersedeReq,
+            0x01C2 => Self::StatementSupersedeResp,
+            0x0143 => Self::StatementTombstoneReq,
+            0x01C3 => Self::StatementTombstoneResp,
+            0x0144 => Self::StatementRetractReq,
+            0x01C4 => Self::StatementRetractResp,
+            0x0145 => Self::StatementHistoryReq,
+            0x01C5 => Self::StatementHistoryResp,
+            0x0146 => Self::StatementListReq,
+            0x01C6 => Self::StatementListResp,
 
             other => return Err(ProtocolError::UnknownOpcode(other)),
         })

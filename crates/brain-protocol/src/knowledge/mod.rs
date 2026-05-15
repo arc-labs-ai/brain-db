@@ -16,6 +16,8 @@
 pub mod entity_req;
 pub mod entity_resp;
 pub mod events;
+pub mod statement_req;
+pub mod statement_resp;
 
 pub use entity_req::{
     EntityCreateRequest, EntityGetRequest, EntityListRequest, EntityMergeRequest,
@@ -32,4 +34,17 @@ pub use events::{
     EntityUnmergedEvent, EntityUpdatedEvent, ExtractionCompletedEvent, ExtractionFailedEvent,
     KnowledgeEventPayload, RelationCreatedEvent, RelationSupersededEvent, SchemaUpdatedEvent,
     StatementCreatedEvent, StatementSupersededEvent, StatementTombstonedEvent,
+};
+pub use statement_req::{
+    EvidenceRefWire, StatementCreateRequest, StatementGetRequest, StatementHistoryRequest,
+    StatementKindWire, StatementListRequest, StatementObjectWire, StatementRetractRequest,
+    StatementSupersedeRequest, StatementTombstoneRequest, StatementValueWire,
+};
+pub use statement_resp::{
+    evidence_ref_from_wire, evidence_ref_to_wire, statement_kind_from_wire,
+    statement_kind_to_wire, statement_object_from_wire, statement_object_to_wire,
+    statement_value_from_wire, statement_value_to_wire, StatementCreateResponse,
+    StatementGetResponse, StatementHistoryResponseFrame, StatementListResponseFrame,
+    StatementRetractResponse, StatementSupersedeResponse, StatementTombstoneResponse,
+    StatementView, WireToStatementError,
 };

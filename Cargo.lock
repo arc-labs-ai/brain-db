@@ -482,6 +482,7 @@ dependencies = [
  "criterion",
  "proptest",
  "rkyv",
+ "smallvec",
  "thiserror 1.0.69",
  "uuid",
 ]

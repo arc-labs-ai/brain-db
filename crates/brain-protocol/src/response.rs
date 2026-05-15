@@ -88,6 +88,17 @@ pub enum ResponseBody {
     EntityList(crate::knowledge::EntityListResponseFrame),
     EntityTombstone(crate::knowledge::EntityTombstoneResponse),
 
+    // Statement ops (phase 17.6). Spec §28/06.
+    StatementCreate(crate::knowledge::StatementCreateResponse),
+    StatementGet(crate::knowledge::StatementGetResponse),
+    StatementSupersede(crate::knowledge::StatementSupersedeResponse),
+    StatementTombstone(crate::knowledge::StatementTombstoneResponse),
+    StatementRetract(crate::knowledge::StatementRetractResponse),
+    /// Single-frame snapshot in v1; phase 23 splits into streaming.
+    StatementHistory(crate::knowledge::StatementHistoryResponseFrame),
+    /// Single-frame snapshot in v1; phase 23 splits into streaming.
+    StatementList(crate::knowledge::StatementListResponseFrame),
+
     Error(ErrorResponse),
 }
 
@@ -133,6 +144,13 @@ impl ResponseBody {
             Self::EntityResolve(_) => Opcode::EntityResolveResp,
             Self::EntityList(_) => Opcode::EntityListResp,
             Self::EntityTombstone(_) => Opcode::EntityTombstoneResp,
+            Self::StatementCreate(_) => Opcode::StatementCreateResp,
+            Self::StatementGet(_) => Opcode::StatementGetResp,
+            Self::StatementSupersede(_) => Opcode::StatementSupersedeResp,
+            Self::StatementTombstone(_) => Opcode::StatementTombstoneResp,
+            Self::StatementRetract(_) => Opcode::StatementRetractResp,
+            Self::StatementHistory(_) => Opcode::StatementHistoryResp,
+            Self::StatementList(_) => Opcode::StatementListResp,
             Self::Error(_) => Opcode::Error,
         }
     }
@@ -149,6 +167,8 @@ impl ResponseBody {
             Self::Reason(r) => Some(r.is_final),
             Self::AdminMigrateEmbeddings(r) => Some(r.is_final),
             Self::AdminListTombstoned(r) => Some(r.is_final),
+            Self::StatementHistory(r) => Some(r.is_final),
+            Self::StatementList(r) => Some(r.is_final),
             _ => None,
         }
     }
@@ -194,6 +214,13 @@ impl ResponseBody {
             Self::EntityResolve(r) => to_rkyv_bytes(r),
             Self::EntityList(r) => to_rkyv_bytes(r),
             Self::EntityTombstone(r) => to_rkyv_bytes(r),
+            Self::StatementCreate(r) => to_rkyv_bytes(r),
+            Self::StatementGet(r) => to_rkyv_bytes(r),
+            Self::StatementSupersede(r) => to_rkyv_bytes(r),
+            Self::StatementTombstone(r) => to_rkyv_bytes(r),
+            Self::StatementRetract(r) => to_rkyv_bytes(r),
+            Self::StatementHistory(r) => to_rkyv_bytes(r),
+            Self::StatementList(r) => to_rkyv_bytes(r),
             Self::Error(r) => to_rkyv_bytes(r),
         }
     }
@@ -242,6 +269,13 @@ impl ResponseBody {
             Opcode::EntityResolveResp => Self::EntityResolve(from_rkyv_bytes(bytes)?),
             Opcode::EntityListResp => Self::EntityList(from_rkyv_bytes(bytes)?),
             Opcode::EntityTombstoneResp => Self::EntityTombstone(from_rkyv_bytes(bytes)?),
+            Opcode::StatementCreateResp => Self::StatementCreate(from_rkyv_bytes(bytes)?),
+            Opcode::StatementGetResp => Self::StatementGet(from_rkyv_bytes(bytes)?),
+            Opcode::StatementSupersedeResp => Self::StatementSupersede(from_rkyv_bytes(bytes)?),
+            Opcode::StatementTombstoneResp => Self::StatementTombstone(from_rkyv_bytes(bytes)?),
+            Opcode::StatementRetractResp => Self::StatementRetract(from_rkyv_bytes(bytes)?),
+            Opcode::StatementHistoryResp => Self::StatementHistory(from_rkyv_bytes(bytes)?),
+            Opcode::StatementListResp => Self::StatementList(from_rkyv_bytes(bytes)?),
             Opcode::Error => Self::Error(from_rkyv_bytes(bytes)?),
             other => return Err(ProtocolError::UnknownOpcode(other.as_u16())),
         })

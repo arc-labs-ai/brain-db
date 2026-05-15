@@ -100,6 +100,15 @@ pub enum RequestBody {
     EntityResolve(crate::knowledge::EntityResolveRequest),
     EntityList(crate::knowledge::EntityListRequest),
     EntityTombstone(crate::knowledge::EntityTombstoneRequest),
+
+    // Statement ops (phase 17.6). Spec §28/06.
+    StatementCreate(crate::knowledge::StatementCreateRequest),
+    StatementGet(crate::knowledge::StatementGetRequest),
+    StatementSupersede(crate::knowledge::StatementSupersedeRequest),
+    StatementTombstone(crate::knowledge::StatementTombstoneRequest),
+    StatementRetract(crate::knowledge::StatementRetractRequest),
+    StatementHistory(crate::knowledge::StatementHistoryRequest),
+    StatementList(crate::knowledge::StatementListRequest),
 }
 
 impl RequestBody {
@@ -145,6 +154,13 @@ impl RequestBody {
             Self::EntityResolve(_) => Opcode::EntityResolveReq,
             Self::EntityList(_) => Opcode::EntityListReq,
             Self::EntityTombstone(_) => Opcode::EntityTombstoneReq,
+            Self::StatementCreate(_) => Opcode::StatementCreateReq,
+            Self::StatementGet(_) => Opcode::StatementGetReq,
+            Self::StatementSupersede(_) => Opcode::StatementSupersedeReq,
+            Self::StatementTombstone(_) => Opcode::StatementTombstoneReq,
+            Self::StatementRetract(_) => Opcode::StatementRetractReq,
+            Self::StatementHistory(_) => Opcode::StatementHistoryReq,
+            Self::StatementList(_) => Opcode::StatementListReq,
         }
     }
 
@@ -192,6 +208,13 @@ impl RequestBody {
             Self::EntityResolve(r) => to_rkyv_bytes(r),
             Self::EntityList(r) => to_rkyv_bytes(r),
             Self::EntityTombstone(r) => to_rkyv_bytes(r),
+            Self::StatementCreate(r) => to_rkyv_bytes(r),
+            Self::StatementGet(r) => to_rkyv_bytes(r),
+            Self::StatementSupersede(r) => to_rkyv_bytes(r),
+            Self::StatementTombstone(r) => to_rkyv_bytes(r),
+            Self::StatementRetract(r) => to_rkyv_bytes(r),
+            Self::StatementHistory(r) => to_rkyv_bytes(r),
+            Self::StatementList(r) => to_rkyv_bytes(r),
         }
     }
 
@@ -240,6 +263,13 @@ impl RequestBody {
             Opcode::EntityResolveReq => Self::EntityResolve(from_rkyv_bytes(bytes)?),
             Opcode::EntityListReq => Self::EntityList(from_rkyv_bytes(bytes)?),
             Opcode::EntityTombstoneReq => Self::EntityTombstone(from_rkyv_bytes(bytes)?),
+            Opcode::StatementCreateReq => Self::StatementCreate(from_rkyv_bytes(bytes)?),
+            Opcode::StatementGetReq => Self::StatementGet(from_rkyv_bytes(bytes)?),
+            Opcode::StatementSupersedeReq => Self::StatementSupersede(from_rkyv_bytes(bytes)?),
+            Opcode::StatementTombstoneReq => Self::StatementTombstone(from_rkyv_bytes(bytes)?),
+            Opcode::StatementRetractReq => Self::StatementRetract(from_rkyv_bytes(bytes)?),
+            Opcode::StatementHistoryReq => Self::StatementHistory(from_rkyv_bytes(bytes)?),
+            Opcode::StatementListReq => Self::StatementList(from_rkyv_bytes(bytes)?),
             other => return Err(ProtocolError::UnknownOpcode(other.as_u16())),
         })
     }
