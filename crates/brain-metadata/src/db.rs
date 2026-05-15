@@ -37,10 +37,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use redb::{Database, ReadTransaction, ReadableDatabase, TransactionError, WriteTransaction};
+use redb::{
+    Database, ReadTransaction, ReadableDatabase, ReadableTable, TransactionError, WriteTransaction,
+};
 
 use crate::schema::{open_or_init_schema, SchemaError};
 use crate::tables::checkpoint::{latest as latest_checkpoint, CHECKPOINTS_TABLE};
+use crate::tables::knowledge::entity_type::{EntityTypeDefinition, ENTITY_TYPES_TABLE};
+use brain_core::EntityType;
 
 /// Public type wrapping the redb metadata file. Single ownership per
 /// shard; the borrow checker enforces single-writer via `&mut self` on
@@ -61,6 +65,56 @@ pub struct MetadataDb {
     /// entry surviving across a restart is implicitly discarded
     /// (spec §05/09 §12.1: incomplete checkpoint is ignored).
     pub(crate) pending_checkpoints: HashMap<u64, u64>,
+}
+
+/// Seed the built-in entity types if the registry is empty.
+///
+/// Sub-task 16.1. Inserts a `Person` row with `EntityTypeId(1)` when
+/// no entity types exist yet. Idempotent: if any row is present (test
+/// fixture, prior open, or phase-19 user upload), this is a no-op.
+fn seed_builtin_entity_types(db: &Database) -> Result<(), MetadataDbError> {
+    // Cheap empty-check in a read txn; only escalate to a write txn
+    // if we actually need to seed.
+    let registry_is_empty = {
+        let rtxn = db.begin_read()?;
+        match rtxn.open_table(ENTITY_TYPES_TABLE) {
+            Ok(t) => t
+                .first()
+                .map_err(|e| MetadataDbError::Schema(SchemaError::Storage(e)))?
+                .is_none(),
+            // Table not yet materialized → counts as empty; will be
+            // created by the write txn below.
+            Err(redb::TableError::TableDoesNotExist(_)) => true,
+            Err(e) => return Err(MetadataDbError::Schema(SchemaError::from(e))),
+        }
+    };
+    if !registry_is_empty {
+        return Ok(());
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let person = EntityType::person(now);
+    let row = EntityTypeDefinition::new(
+        person.id,
+        person.name,
+        person.attribute_schema_blob,
+        person.created_at_unix_nanos,
+    );
+
+    let wtxn = db.begin_write()?;
+    {
+        let mut t = wtxn
+            .open_table(ENTITY_TYPES_TABLE)
+            .map_err(|e| MetadataDbError::Schema(SchemaError::from(e)))?;
+        t.insert(&row.entity_type_id, &row)
+            .map_err(|e| MetadataDbError::Schema(SchemaError::Storage(e)))?;
+    }
+    wtxn.commit()
+        .map_err(|e| MetadataDbError::Schema(SchemaError::Commit(e)))?;
+    Ok(())
 }
 
 /// Errors returned by [`MetadataDb::open`].
@@ -107,6 +161,13 @@ impl MetadataDb {
                 Err(e) => return Err(MetadataDbError::Schema(SchemaError::from(e))),
             }
         };
+
+        // Sub-task 16.1: seed a built-in `Person` `EntityTypeDefinition`
+        // if the registry is empty. Phase 19's `SCHEMA_UPLOAD` owns the
+        // registry once user-declared types arrive; user types start at
+        // EntityTypeId(2)+ so this slot stays stable. Idempotent — any
+        // pre-existing row (test fixture or prior open) skips the seed.
+        seed_builtin_entity_types(&db)?;
 
         Ok(Self {
             db,
@@ -380,5 +441,81 @@ mod tests {
         let path = db_path(&dir);
         let db = MetadataDb::open(&path).unwrap();
         assert_eq!(db.path(), path.as_path());
+    }
+
+    // -----------------------------------------------------------------
+    // Sub-task 16.1: Person bootstrap.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn person_entity_type_seeded_on_fresh_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(db_path(&dir)).unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
+        let mut rows = 0u32;
+        let mut saw_person = false;
+        for entry in t.iter().unwrap() {
+            let (_k, v) = entry.unwrap();
+            let def = v.value();
+            rows += 1;
+            if def.id() == EntityType::PERSON_ID && def.name == EntityType::PERSON_NAME {
+                saw_person = true;
+            }
+        }
+        assert_eq!(rows, 1, "fresh open should seed exactly one entity type");
+        assert!(saw_person, "the seeded row must be the Person row");
+    }
+
+    #[test]
+    fn person_seed_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+
+        // First open seeds.
+        drop(MetadataDb::open(&path).unwrap());
+        // Second open must NOT add another row.
+        let db = MetadataDb::open(&path).unwrap();
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
+        let rows: usize = t.iter().unwrap().count();
+        assert_eq!(rows, 1, "re-open must not duplicate the Person seed");
+    }
+
+    #[test]
+    fn person_seed_skipped_when_registry_nonempty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+
+        // Pre-seed a NON-Person type with id=42 before opening
+        // MetadataDb.
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let wtxn = db.begin_write().unwrap();
+            {
+                let mut t = wtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
+                let row = EntityTypeDefinition::new(
+                    brain_core::EntityTypeId(42),
+                    "Project".into(),
+                    Vec::new(),
+                    1_700_000_000_000_000_000,
+                );
+                t.insert(&42u32, &row).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        // Open. seed_builtin_entity_types should detect non-empty
+        // registry and skip the Person insert.
+        let db = MetadataDb::open(&path).unwrap();
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
+        let rows: Vec<u32> = t
+            .iter()
+            .unwrap()
+            .map(|e| e.unwrap().0.value())
+            .collect();
+        assert_eq!(rows, vec![42], "Person seed must skip when registry has rows");
     }
 }

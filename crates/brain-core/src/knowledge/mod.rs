@@ -14,11 +14,15 @@
 //! Phase 15.1 — types and identifiers only. Behavior follows in later
 //! phases.
 
+pub mod entity;
 pub mod ids;
 pub mod kinds;
+pub mod resolver;
 
+pub use entity::{Entity, EntityAttributes, EntityType};
 pub use ids::{
     AuditId, EntityId, EntityTypeId, EvidenceOverflowId, ExtractorId, MergeId, PredicateId,
     RelationId, RelationTypeId, StatementId,
 };
 pub use kinds::{Cardinality, ExtractorKind, StatementKind};
+pub use resolver::{ResolutionOutcome, ResolverConfig, ResolverTier, TypeConstraint};

@@ -25,7 +25,9 @@ pub use ids::{
     AgentId, ContextId, MemoryId, RequestId, ShardId, SlotIndex, SlotVersion, TxnId, MAX_SLOT_INDEX,
 };
 pub use knowledge::{
-    AuditId, Cardinality, EntityId, EntityTypeId, EvidenceOverflowId, ExtractorId, ExtractorKind,
-    MergeId, PredicateId, RelationId, RelationTypeId, StatementId, StatementKind,
+    AuditId, Cardinality, Entity, EntityAttributes, EntityId, EntityType, EntityTypeId,
+    EvidenceOverflowId, ExtractorId, ExtractorKind, MergeId, PredicateId, RelationId,
+    RelationTypeId, ResolutionOutcome, ResolverConfig, ResolverTier, StatementId, StatementKind,
+    TypeConstraint,
 };
 pub use memory::{Memory, MemoryKind, Salience};

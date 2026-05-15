@@ -13,7 +13,7 @@
 //! and the typed CRUD around these tables.
 
 use crate::impl_redb_rkyv_value;
-use brain_core::{EntityId, EntityTypeId};
+use brain_core::{Entity, EntityAttributes, EntityId, EntityTypeId};
 use redb::TableDefinition;
 
 // ---------------------------------------------------------------------------
@@ -72,9 +72,12 @@ pub mod mention_context {
 // Value structs.
 // ---------------------------------------------------------------------------
 
-/// Primary entity record (spec §18 §"Entity record schema"). Free-form
-/// fields (`aliases`, `attributes`) are stored as opaque rkyv blobs in
-/// 15.1; phase 16 + phase 19 define the typed shapes.
+/// Primary entity record (spec §18 §"Entity record schema").
+///
+/// Sub-task 16.1 promoted `aliases` from an opaque `Vec<u8>` blob to a
+/// typed `Vec<String>` and bumped `type_name` to `::v2`. `attributes`
+/// remains an opaque blob until phase 19's schema DSL defines the
+/// typed `Value` union.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 pub struct EntityMetadata {
@@ -82,8 +85,9 @@ pub struct EntityMetadata {
     pub entity_type_id: u32,
     pub canonical_name: String,
     pub normalized_name: String,
-    /// rkyv-encoded `Vec<String>`; bounded length per spec §18.
-    pub aliases_blob: Vec<u8>,
+    /// Spec §18/00 caps the alias list at 32 by default; not enforced
+    /// at this layer (CRUD in 16.2 enforces).
+    pub aliases: Vec<String>,
     /// rkyv-encoded `BTreeMap<String, Value>` (Value union resolves in phase 19).
     pub attributes_blob: Vec<u8>,
     pub mention_count: u32,
@@ -110,7 +114,7 @@ impl EntityMetadata {
             entity_type_id: entity_type_id.raw(),
             canonical_name,
             normalized_name,
-            aliases_blob: Vec::new(),
+            aliases: Vec::new(),
             attributes_blob: Vec::new(),
             mention_count: 0,
             created_at_unix_nanos,
@@ -135,9 +139,58 @@ impl EntityMetadata {
     pub fn merged_into(&self) -> Option<EntityId> {
         self.merged_into_bytes.map(EntityId::from)
     }
+
+    /// Append an alias to this entity (no dedup or normalization;
+    /// callers should pre-normalize). The on-rename caller in 16.2
+    /// uses this to move an old canonical_name into the alias list.
+    pub fn add_alias(&mut self, alias: String) {
+        self.aliases.push(alias);
+    }
 }
 
-impl_redb_rkyv_value!(EntityMetadata, "brain_metadata::EntityMetadata::v1");
+impl_redb_rkyv_value!(EntityMetadata, "brain_metadata::EntityMetadata::v2");
+
+// ---------------------------------------------------------------------------
+// brain-core ↔ brain-metadata boundary conversions (sub-task 16.1).
+// ---------------------------------------------------------------------------
+
+impl From<&Entity> for EntityMetadata {
+    fn from(e: &Entity) -> Self {
+        Self {
+            entity_id_bytes: e.id.to_bytes(),
+            entity_type_id: e.entity_type.raw(),
+            canonical_name: e.canonical_name.clone(),
+            normalized_name: e.normalized_name.clone(),
+            aliases: e.aliases.clone(),
+            attributes_blob: e.attributes.as_bytes().to_vec(),
+            mention_count: e.mention_count,
+            created_at_unix_nanos: e.created_at_unix_nanos,
+            updated_at_unix_nanos: e.updated_at_unix_nanos,
+            merged_into_bytes: e.merged_into.map(EntityId::to_bytes),
+            embedding_version: e.embedding_version,
+            flags: e.flags,
+        }
+    }
+}
+
+impl From<&EntityMetadata> for Entity {
+    fn from(m: &EntityMetadata) -> Self {
+        Self {
+            id: m.entity_id(),
+            entity_type: m.entity_type(),
+            canonical_name: m.canonical_name.clone(),
+            normalized_name: m.normalized_name.clone(),
+            aliases: m.aliases.clone(),
+            attributes: EntityAttributes(m.attributes_blob.clone()),
+            mention_count: m.mention_count,
+            created_at_unix_nanos: m.created_at_unix_nanos,
+            updated_at_unix_nanos: m.updated_at_unix_nanos,
+            merged_into: m.merged_into(),
+            embedding_version: m.embedding_version,
+            flags: m.flags,
+        }
+    }
+}
 
 /// Per-mention metadata: how an entity appears in a given memory.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
@@ -204,6 +257,72 @@ mod tests {
         let got = t.get(&key).unwrap().unwrap().value();
         assert_eq!(got, e);
         assert_eq!(got.entity_id(), id);
+    }
+
+    #[test]
+    fn aliases_round_trip() {
+        // Sub-task 16.1: aliases moved from `Vec<u8>` blob to
+        // `Vec<String>`. Verify the typed field round-trips through
+        // rkyv + redb.
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        let id = EntityId::new();
+        let mut e = EntityMetadata::new_active(
+            id,
+            EntityTypeId::from(1),
+            "Priya Patel".into(),
+            "priya patel".into(),
+            1_700_000_000_000_000_000,
+        );
+        e.add_alias("priya".into());
+        e.add_alias("p. patel".into());
+        e.add_alias("priya p.".into());
+        let key = e.entity_id_bytes;
+
+        let wtxn = db.begin_write().unwrap();
+        {
+            let mut t = wtxn.open_table(ENTITIES_TABLE).unwrap();
+            t.insert(&key, &e).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(ENTITIES_TABLE).unwrap();
+        let got = t.get(&key).unwrap().unwrap().value();
+        assert_eq!(got.aliases.len(), 3);
+        assert_eq!(got.aliases[0], "priya");
+        assert_eq!(got.aliases[1], "p. patel");
+        assert_eq!(got.aliases[2], "priya p.");
+    }
+
+    #[test]
+    fn entity_round_trip_through_brain_core() {
+        // Sub-task 16.1: `From<&Entity> for EntityMetadata` and the
+        // reverse must preserve every field. Build a fully-populated
+        // `brain_core::Entity`, convert to `EntityMetadata`, convert
+        // back, assert equality.
+        use brain_core::{Entity, EntityAttributes};
+        let id = EntityId::new();
+        let merged_into = EntityId::new();
+        let mut e = Entity::new_active(
+            id,
+            EntityTypeId::from(1),
+            "Priya Patel".into(),
+            "priya patel".into(),
+            1_700_000_000_000_000_000,
+        );
+        e.aliases.push("priya".into());
+        e.aliases.push("p. patel".into());
+        e.attributes = EntityAttributes::from(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        e.mention_count = 7;
+        e.updated_at_unix_nanos = 1_700_000_000_000_000_500;
+        e.merged_into = Some(merged_into);
+        e.embedding_version = 3;
+        e.flags = 0b0001;
+
+        let m: EntityMetadata = (&e).into();
+        let back: Entity = (&m).into();
+        assert_eq!(back, e);
     }
 
     #[test]
