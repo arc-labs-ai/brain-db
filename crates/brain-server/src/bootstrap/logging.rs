@@ -29,11 +29,16 @@
 
 #![cfg(target_os = "linux")]
 
+use opentelemetry_sdk::trace::TracerProvider;
 use tracing::info;
 use tracing_subscriber::fmt;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
+use tracing_subscriber::{EnvFilter, Registry};
 
-use crate::config::LoggingConfig;
+use crate::config::{LoggingConfig, TracingConfig};
+
+use super::tracing as otel;
 
 /// Resolved log format — one of `compact`, `json`. Unrecognised
 /// strings fall back to `Compact` with a warning at install time.
@@ -79,28 +84,50 @@ pub fn init_pre_config() {
     let _ = fmt().with_env_filter(filter).with_target(true).try_init();
 }
 
-/// Re-install or update the subscriber from `[logging]`. Honors the
-/// `format` knob:
+/// Re-install or update the subscriber from `[logging]` + `[tracing]`.
 ///
-/// - `compact` → text formatter (dev-friendly).
-/// - `json` → JSON formatter (one object per line, spec §14/02 §1).
+/// Composes three layers:
+/// - `EnvFilter` (env-driven level filter).
+/// - Format layer (compact or JSON per §14/02 §1).
+/// - Optional OpenTelemetry layer (§14/03; built by
+///   `bootstrap::tracing::build` when `[tracing] enabled = true`).
 ///
-/// Logs an `info` event with the resolved format + level so operators
-/// can confirm the wiring.
-pub fn reinit_from_config(logging: &LoggingConfig) {
+/// Returns the `TracerProvider` when the OTel pipeline installed —
+/// callers must keep it alive (drop on shutdown to flush). Returns
+/// `None` when tracing is disabled or the OTel exporter failed to
+/// build (failure is logged via `warn!`, not propagated; spec §14/03
+/// §17 mandates "no-trace fallback").
+#[must_use = "drop the returned TracerProvider on shutdown to flush spans"]
+pub fn reinit_from_config(
+    logging: &LoggingConfig,
+    tracing_cfg: &TracingConfig,
+) -> Option<TracerProvider> {
     let (format, warn) = LogFormat::parse(&logging.format);
     let filter = build_filter(logging.level.as_str());
 
+    let (otel_layer, provider) = match otel::build(tracing_cfg) {
+        Ok(Some(built)) => (Some(built.layer), Some(built.provider)),
+        Ok(None) => (None, None),
+        Err(e) => {
+            tracing::warn!(error = %e, "OTel layer build failed; tracing disabled");
+            (None, None)
+        }
+    };
+
+    // Compose layers per format. OTel layer is attached first so its
+    // `S = Registry` parameter matches; filter + fmt layers (generic
+    // over `S`) wrap around it.
     let installed = match format {
-        LogFormat::Compact => fmt()
-            .with_env_filter(filter)
-            .with_target(true)
+        LogFormat::Compact => Registry::default()
+            .with(otel_layer)
+            .with(filter)
+            .with(fmt::layer().with_target(true))
             .try_init()
             .is_ok(),
-        LogFormat::Json => fmt()
-            .with_env_filter(filter)
-            .with_target(true)
-            .json()
+        LogFormat::Json => Registry::default()
+            .with(otel_layer)
+            .with(filter)
+            .with(fmt::layer().with_target(true).json())
             .try_init()
             .is_ok(),
     };
@@ -112,9 +139,11 @@ pub fn reinit_from_config(logging: &LoggingConfig) {
         format = ?format,
         level = %logging.level,
         output = %logging.output,
+        otel_enabled = provider.is_some(),
         installed,
         "logging subscriber configured"
     );
+    provider
 }
 
 #[cfg(test)]

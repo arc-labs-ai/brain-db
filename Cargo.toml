@@ -120,7 +120,24 @@ libc = "0.2"
 # Logging / tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# OpenTelemetry stack — spec §14/03 §1 mandates OTel for distributed
+# tracing. Version matrix for opentelemetry 0.24:
+#   opentelemetry_sdk      = 0.24
+#   opentelemetry-otlp     = 0.17   (own version scheme)
+#   opentelemetry-semantic-conventions = 0.16
+#   tracing-opentelemetry  = 0.25
+# Pinning explicitly because cross-crate version mismatches in this
+# stack are the #1 reported papercut.
 opentelemetry = "0.24"
+opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.17", default-features = false, features = [
+    "trace",
+    "http-proto",
+    "reqwest-client",
+    "reqwest-rustls",
+] }
+opentelemetry-semantic-conventions = "0.16"
+tracing-opentelemetry = "0.25"
 
 # Time
 time = { version = "0.3", features = ["serde", "formatting"] }

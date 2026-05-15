@@ -8,3 +8,5 @@ pub mod logging;
 pub mod shutdown;
 #[cfg(target_os = "linux")]
 pub mod tls;
+#[cfg(target_os = "linux")]
+pub mod tracing;

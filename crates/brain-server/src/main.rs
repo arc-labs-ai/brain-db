@@ -81,7 +81,7 @@ fn main() -> ExitCode {
     };
 
     #[cfg(target_os = "linux")]
-    logging::reinit_from_config(&cfg.logging);
+    let _tracer_provider = logging::reinit_from_config(&cfg.logging, &cfg.tracing);
 
     tracing::info!(
         version = %VERSION,

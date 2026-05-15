@@ -130,12 +130,31 @@ impl Default for LoggingConfig {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TracingConfig {
+    /// Master switch. When false, no spans are exported regardless of
+    /// other fields. Default `false` so spec §14/03 §17 "no-trace
+    /// fallback" is honoured out of the box.
     #[serde(default)]
     pub enabled: bool,
+    /// Sampler name: `always_on`, `always_off`, `ratio`, `parent_based`.
+    /// Default `always_off`.
     #[serde(default)]
     pub sampler: String,
+    /// Used only when `sampler == "ratio"`. Clamped to `[0.0, 1.0]`.
     #[serde(default)]
     pub sample_ratio: f64,
+    /// OTLP/HTTP endpoint of the upstream collector. Empty means
+    /// "no endpoint configured" — tracing degrades to a stdout
+    /// exporter if `enabled = true` and this is empty.
+    #[serde(default)]
+    pub endpoint: String,
+    /// Service-name attribute attached to every span (OTel
+    /// `service.name`). Defaults to `brain-server`.
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+}
+
+fn default_service_name() -> String {
+    "brain-server".to_string()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

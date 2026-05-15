@@ -46,7 +46,7 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::watch;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, Instrument as _};
 
 pub use crate::dispatch::Topology;
 
@@ -499,29 +499,41 @@ where
                                 let request_metrics = topology.request_metrics.clone();
                                 let tx = frame_tx.clone();
                                 let op_idx = crate::metrics::request::op_index(&op.req);
-                                tokio::spawn(async move {
-                                    // RAII timer: bumps in-flight on
-                                    // construction; records duration
-                                    // + status on `record(...)`. If
-                                    // the dispatch panics or is
-                                    // cancelled, drop records as
-                                    // Timeout.
-                                    let timer = op_idx.map(|idx| {
-                                        crate::metrics::request::RequestTimer::start(
-                                            request_metrics.clone(),
-                                            idx,
-                                        )
-                                    });
-                                    let frame = run_op_dispatch(op, shards).await;
-                                    if let Some(timer) = timer {
-                                        let status = response_status(&frame);
-                                        timer.record(status);
+                                let op_label = op_idx
+                                    .and_then(|i| crate::metrics::request::OP_LABELS.get(i))
+                                    .copied()
+                                    .unwrap_or("unknown");
+                                let stream_id = op.stream_id;
+                                let target_shard = op.target_shard;
+                                // 12.3 — request-level span. Spec §14/03 §3 instruments each
+                                // request; child spans inside the shard (brain.encode →
+                                // brain.embed → brain.hnsw.insert) attach to this parent.
+                                let span = tracing::info_span!(
+                                    "brain.request",
+                                    op = op_label,
+                                    stream_id,
+                                    target_shard,
+                                );
+                                tokio::spawn(
+                                    async move {
+                                        let timer = op_idx.map(|idx| {
+                                            crate::metrics::request::RequestTimer::start(
+                                                request_metrics.clone(),
+                                                idx,
+                                            )
+                                        });
+                                        let frame = run_op_dispatch(op, shards).await;
+                                        if let Some(timer) = timer {
+                                            let status = response_status(&frame);
+                                            timer.record(status);
+                                        }
+                                        let _ = tx.send_async(OutgoingFrame {
+                                            bytes: frame.encode(),
+                                            close_after: false,
+                                        }).await;
                                     }
-                                    let _ = tx.send_async(OutgoingFrame {
-                                        bytes: frame.encode(),
-                                        close_after: false,
-                                    }).await;
-                                });
+                                    .instrument(span),
+                                );
                             }
                             Action::Subscribe(start) => {
                                 handle_subscribe_start(
