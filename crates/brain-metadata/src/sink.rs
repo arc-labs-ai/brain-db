@@ -87,6 +87,14 @@ impl MetadataSink for MetadataDb {
                 // are no-ops here.
                 self.bump_next_lsn(lsn)
             }
+            WalPayload::Knowledge(_) => {
+                // Knowledge-layer records (spec §26) — substrate sink
+                // ignores these. Phases 16+ supply their own sinks for
+                // entity / statement / relation / schema / audit
+                // hydration. We still advance the LSN watermark so
+                // checkpointing is correct.
+                self.bump_next_lsn(lsn)
+            }
         }
     }
 }

@@ -343,9 +343,9 @@ impl Client {
         use brain_protocol::request::ByeRequest;
         use brain_protocol::{Frame, RequestBody};
 
-        const FLAG_EOS: u16 = 1 << 15;
+        const FLAG_EOS: u8 = 1 << 7;
         let frame = Frame::new(
-            Opcode::Bye.as_u8(),
+            Opcode::Bye.as_u16(),
             FLAG_EOS,
             0,
             RequestBody::Bye(ByeRequest {

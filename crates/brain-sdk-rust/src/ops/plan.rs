@@ -106,7 +106,7 @@ impl<'a> PlanBuilder<'a> {
                     let mut guard = client.acquire().await?;
                     let stream_id = guard.next_stream_id();
                     let frame =
-                        Frame::new(Opcode::PlanReq.as_u8(), FLAG_EOS, stream_id, body.encode());
+                        Frame::new(Opcode::PlanReq.as_u16(), FLAG_EOS, stream_id, body.encode());
                     let frames = send_and_collect_until_eos(
                         &mut guard,
                         frame,
@@ -153,7 +153,7 @@ impl<'a> PlanBuilder<'a> {
         });
         let mut guard = self.client.acquire().await?;
         let stream_id = guard.next_stream_id();
-        let frame = Frame::new(Opcode::PlanReq.as_u8(), FLAG_EOS, stream_id, body.encode());
+        let frame = Frame::new(Opcode::PlanReq.as_u16(), FLAG_EOS, stream_id, body.encode());
         write_frame(guard.stream_mut(), &frame).await?;
 
         let decoder: crate::ops::stream::StreamDecoder<PlanStep> =

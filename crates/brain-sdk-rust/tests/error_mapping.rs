@@ -12,7 +12,7 @@ use brain_sdk_rust::{Client, ClientConfig, ClientError, RetryConfig};
 async fn error_frame_maps_to_client_error_server() {
     let (addr, _server) = common::spawn_mock_server(|mut socket| async move {
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode, Opcode::EncodeReq.as_u8());
+        assert_eq!(frame.header.opcode_u16(), Opcode::EncodeReq.as_u16());
         let _ = RequestBody::decode(Opcode::EncodeReq, &frame.payload).expect("decode");
 
         let err = ErrorResponse {
@@ -24,7 +24,7 @@ async fn error_frame_maps_to_client_error_server() {
         };
         common::write_frame(
             &mut socket,
-            Opcode::Error.as_u8(),
+            Opcode::Error.as_u16(),
             frame.header.stream_id_u32(),
             ResponseBody::Error(err).encode(),
             true,

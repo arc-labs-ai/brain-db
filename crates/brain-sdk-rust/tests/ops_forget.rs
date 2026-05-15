@@ -14,7 +14,7 @@ async fn forget_round_trip() {
     let mid_raw = mid.raw();
     let (addr, _server) = common::spawn_mock_server(move |mut socket| async move {
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode, Opcode::ForgetReq.as_u8());
+        assert_eq!(frame.header.opcode_u16(), Opcode::ForgetReq.as_u16());
         let body = RequestBody::decode(Opcode::ForgetReq, &frame.payload).expect("decode");
         let req = match body {
             RequestBody::Forget(r) => r,
@@ -29,7 +29,7 @@ async fn forget_round_trip() {
         };
         common::write_frame(
             &mut socket,
-            Opcode::ForgetResp.as_u8(),
+            Opcode::ForgetResp.as_u16(),
             frame.header.stream_id_u32(),
             ResponseBody::Forget(resp).encode(),
             true,

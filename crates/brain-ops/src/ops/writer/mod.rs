@@ -643,6 +643,7 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
             salience: ev.salience,
             timestamp_unix_nanos: ev.timestamp_unix_nanos,
             text: ev.text,
+            knowledge_payload: None,
         });
     }
 

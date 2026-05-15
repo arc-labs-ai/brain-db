@@ -680,7 +680,7 @@ where
                                 }).await;
                                 // BYE handler routes here; other CloseWith
                                 // arms (BadOpcode etc.) are protocol errors.
-                                let reason = if frame.header.opcode == Opcode::Bye.as_u8() {
+                                let reason = if frame.header.opcode_u16() == Opcode::Bye.as_u16() {
                                     CloseReason::Bye
                                 } else {
                                     CloseReason::ProtocolError
@@ -734,7 +734,7 @@ fn build_close_error_frame(code: ErrorCode, message: &str) -> Frame {
 /// `Status::Error`; anything else is `Status::Success`. The
 /// in-flight gauge / drop-without-record path handles `Timeout`.
 fn response_status(frame: &Frame) -> crate::metrics::request::Status {
-    if frame.header.opcode == Opcode::Error.as_u8() {
+    if frame.header.opcode_u16() == Opcode::Error.as_u16() {
         crate::metrics::request::Status::Error
     } else {
         crate::metrics::request::Status::Success
@@ -753,7 +753,7 @@ fn build_close_error_frame_with_category(
         details: None,
         retry_after_ms: None,
     });
-    Frame::new(Opcode::Error.as_u8(), 0, 0, body.encode())
+    Frame::new(Opcode::Error.as_u16(), 0, 0, body.encode())
 }
 
 // ---------------------------------------------------------------------------

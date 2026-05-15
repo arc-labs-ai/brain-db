@@ -518,4 +518,41 @@ mod tests {
         assert_eq!(back, record);
         assert_eq!(back.typed_payload().unwrap(), payload);
     }
+
+    #[test]
+    fn knowledge_payload_round_trips_through_framing() {
+        // Sub-task 15.2: a knowledge-layer record carries an opaque body
+        // through the full framing layer (header + payload + footer +
+        // CRC). The framing is byte-identical to substrate records; only
+        // the `record_type` byte and body interpretation differ.
+        use crate::wal::payload::{KnowledgeRecord, WalPayload};
+
+        // One example per discriminant boundary in the knowledge block.
+        for kind in [
+            WalRecordKind::EntityCreate,
+            WalRecordKind::StatementCreate,
+            WalRecordKind::RelationCreate,
+            WalRecordKind::SchemaUpdate,
+            WalRecordKind::Audit,
+        ] {
+            let body: Vec<u8> = (0..48u8).map(|i| i.wrapping_mul(kind.as_u8())).collect();
+            let payload = WalPayload::Knowledge(KnowledgeRecord::new(kind, body.clone()));
+            let record = WalRecord::from_typed(Lsn(7), 0, 9999, 0xBB, &payload);
+            assert_eq!(record.kind, kind);
+
+            let buf = record.encode();
+            let DecodeOutcome::Record { record: back, .. } = WalRecord::decode_one(&buf).unwrap()
+            else {
+                panic!("expected Record for {kind:?}");
+            };
+            assert_eq!(back, record);
+            match back.typed_payload().unwrap() {
+                WalPayload::Knowledge(r) => {
+                    assert_eq!(r.kind, kind);
+                    assert_eq!(r.body, body);
+                }
+                other => panic!("expected Knowledge, got {other:?}"),
+            }
+        }
+    }
 }

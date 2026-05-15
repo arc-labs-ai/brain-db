@@ -12,7 +12,7 @@ async fn txn_begin_then_commit() {
     let (addr, _server) = common::spawn_mock_server(|mut socket| async move {
         // BEGIN
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode, Opcode::TxnBegin.as_u8());
+        assert_eq!(frame.header.opcode_u16(), Opcode::TxnBegin.as_u16());
         let body = RequestBody::decode(Opcode::TxnBegin, &frame.payload).expect("decode");
         let begin_req = match body {
             RequestBody::TxnBegin(r) => r,
@@ -26,7 +26,7 @@ async fn txn_begin_then_commit() {
         };
         common::write_frame(
             &mut socket,
-            Opcode::TxnBeginResp.as_u8(),
+            Opcode::TxnBeginResp.as_u16(),
             frame.header.stream_id_u32(),
             ResponseBody::TxnBegin(resp).encode(),
             true,
@@ -35,7 +35,7 @@ async fn txn_begin_then_commit() {
 
         // COMMIT
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode, Opcode::TxnCommit.as_u8());
+        assert_eq!(frame.header.opcode_u16(), Opcode::TxnCommit.as_u16());
         let body = RequestBody::decode(Opcode::TxnCommit, &frame.payload).expect("decode");
         let commit_req = match body {
             RequestBody::TxnCommit(r) => r,
@@ -49,7 +49,7 @@ async fn txn_begin_then_commit() {
         };
         common::write_frame(
             &mut socket,
-            Opcode::TxnCommitResp.as_u8(),
+            Opcode::TxnCommitResp.as_u16(),
             frame.header.stream_id_u32(),
             ResponseBody::TxnCommit(resp).encode(),
             true,
@@ -77,7 +77,7 @@ async fn txn_begin_then_abort() {
         let txn_id = begin_req.txn_id;
         common::write_frame(
             &mut socket,
-            Opcode::TxnBeginResp.as_u8(),
+            Opcode::TxnBeginResp.as_u16(),
             frame.header.stream_id_u32(),
             ResponseBody::TxnBegin(TxnBeginResponse {
                 txn_id,
@@ -90,10 +90,10 @@ async fn txn_begin_then_abort() {
         .await;
 
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode, Opcode::TxnAbort.as_u8());
+        assert_eq!(frame.header.opcode_u16(), Opcode::TxnAbort.as_u16());
         common::write_frame(
             &mut socket,
-            Opcode::TxnAbortResp.as_u8(),
+            Opcode::TxnAbortResp.as_u16(),
             frame.header.stream_id_u32(),
             ResponseBody::TxnAbort(TxnAbortResponse {
                 txn_id,

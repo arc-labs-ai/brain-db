@@ -25,7 +25,7 @@ use brain_sdk_rust::{Client, ClientConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-const FLAG_EOS: u16 = 1 << 15;
+const FLAG_EOS: u8 = 1 << 7;
 
 /// Bind a mock server to a random port. Returns the bound address
 /// and a `JoinHandle` running the canned HELLO→AUTH_OK→BYE script.
@@ -45,8 +45,8 @@ async fn run_canned_script(socket: &mut TcpStream) {
     // ---- HELLO ----------------------------------------------------
     let hello_frame = read_frame(socket).await;
     assert_eq!(
-        hello_frame.header.opcode,
-        Opcode::Hello.as_u8(),
+        hello_frame.header.opcode_u16(),
+        Opcode::Hello.as_u16(),
         "expected HELLO"
     );
 
@@ -69,7 +69,7 @@ async fn run_canned_script(socket: &mut TcpStream) {
     };
     write_frame(
         socket,
-        Opcode::Welcome.as_u8(),
+        Opcode::Welcome.as_u16(),
         0,
         ResponseBody::Welcome(welcome).encode(),
     )
@@ -78,8 +78,8 @@ async fn run_canned_script(socket: &mut TcpStream) {
     // ---- AUTH -----------------------------------------------------
     let auth_frame = read_frame(socket).await;
     assert_eq!(
-        auth_frame.header.opcode,
-        Opcode::Auth.as_u8(),
+        auth_frame.header.opcode_u16(),
+        Opcode::Auth.as_u16(),
         "expected AUTH"
     );
     let auth_body = RequestBody::decode(Opcode::Auth, &auth_frame.payload).expect("decode AUTH");
@@ -104,7 +104,7 @@ async fn run_canned_script(socket: &mut TcpStream) {
     };
     write_frame(
         socket,
-        Opcode::AuthOk.as_u8(),
+        Opcode::AuthOk.as_u16(),
         0,
         ResponseBody::AuthOk(auth_ok).encode(),
     )
@@ -117,12 +117,12 @@ async fn run_canned_script(socket: &mut TcpStream) {
     // request payload (matches brain-server's `on_bye`).
     if let Some(frame) = read_frame_opt(socket).await {
         assert_eq!(
-            frame.header.opcode,
-            Opcode::Bye.as_u8(),
+            frame.header.opcode_u16(),
+            Opcode::Bye.as_u16(),
             "post-AUTH expected BYE, got 0x{:02x}",
-            frame.header.opcode
+            frame.header.opcode_u16()
         );
-        write_frame(socket, Opcode::Bye.as_u8(), 0, frame.payload).await;
+        write_frame(socket, Opcode::Bye.as_u16(), 0, frame.payload).await;
     }
 }
 
@@ -152,7 +152,7 @@ async fn read_frame_opt(socket: &mut TcpStream) -> Option<Frame> {
     Some(frame)
 }
 
-async fn write_frame(socket: &mut TcpStream, opcode: u8, stream_id: u32, payload: Vec<u8>) {
+async fn write_frame(socket: &mut TcpStream, opcode: u16, stream_id: u32, payload: Vec<u8>) {
     let frame = Frame::new(opcode, FLAG_EOS, stream_id, payload);
     socket.write_all(&frame.encode()).await.expect("write");
     socket.flush().await.expect("flush");

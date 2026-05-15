@@ -74,6 +74,20 @@ pub enum ResponseBody {
     AdminMoveMemory(AdminMoveMemoryResponse),
     AdminReclassify(AdminReclassifyResponse),
     AdminListTombstoned(AdminListTombstonedResponseFrame),
+
+    // Knowledge namespace (spec §28/00).
+    EntityCreate(crate::knowledge::EntityCreateResponse),
+    EntityGet(crate::knowledge::EntityGetResponse),
+    EntityUpdate(crate::knowledge::EntityUpdateResponse),
+    EntityRename(crate::knowledge::EntityRenameResponse),
+    EntityMerge(crate::knowledge::EntityMergeResponse),
+    EntityUnmerge(crate::knowledge::EntityUnmergeResponse),
+    EntityResolve(crate::knowledge::EntityResolveResponse),
+    /// Streaming response — per-item or tail. Wire opcode is the same
+    /// (`0x01B7`); the body's `is_final()` discriminates.
+    EntityList(crate::knowledge::EntityListResponseFrame),
+    EntityTombstone(crate::knowledge::EntityTombstoneResponse),
+
     Error(ErrorResponse),
 }
 
@@ -110,6 +124,15 @@ impl ResponseBody {
             Self::AdminMoveMemory(_) => Opcode::AdminMoveMemoryResp,
             Self::AdminReclassify(_) => Opcode::AdminReclassifyResp,
             Self::AdminListTombstoned(_) => Opcode::AdminListTombstonedResp,
+            Self::EntityCreate(_) => Opcode::EntityCreateResp,
+            Self::EntityGet(_) => Opcode::EntityGetResp,
+            Self::EntityUpdate(_) => Opcode::EntityUpdateResp,
+            Self::EntityRename(_) => Opcode::EntityRenameResp,
+            Self::EntityMerge(_) => Opcode::EntityMergeResp,
+            Self::EntityUnmerge(_) => Opcode::EntityUnmergeResp,
+            Self::EntityResolve(_) => Opcode::EntityResolveResp,
+            Self::EntityList(_) => Opcode::EntityListResp,
+            Self::EntityTombstone(_) => Opcode::EntityTombstoneResp,
             Self::Error(_) => Opcode::Error,
         }
     }
@@ -162,6 +185,15 @@ impl ResponseBody {
             Self::AdminMoveMemory(r) => to_rkyv_bytes(r),
             Self::AdminReclassify(r) => to_rkyv_bytes(r),
             Self::AdminListTombstoned(r) => to_rkyv_bytes(r),
+            Self::EntityCreate(r) => to_rkyv_bytes(r),
+            Self::EntityGet(r) => to_rkyv_bytes(r),
+            Self::EntityUpdate(r) => to_rkyv_bytes(r),
+            Self::EntityRename(r) => to_rkyv_bytes(r),
+            Self::EntityMerge(r) => to_rkyv_bytes(r),
+            Self::EntityUnmerge(r) => to_rkyv_bytes(r),
+            Self::EntityResolve(r) => to_rkyv_bytes(r),
+            Self::EntityList(r) => to_rkyv_bytes(r),
+            Self::EntityTombstone(r) => to_rkyv_bytes(r),
             Self::Error(r) => to_rkyv_bytes(r),
         }
     }
@@ -201,8 +233,17 @@ impl ResponseBody {
             Opcode::AdminMoveMemoryResp => Self::AdminMoveMemory(from_rkyv_bytes(bytes)?),
             Opcode::AdminReclassifyResp => Self::AdminReclassify(from_rkyv_bytes(bytes)?),
             Opcode::AdminListTombstonedResp => Self::AdminListTombstoned(from_rkyv_bytes(bytes)?),
+            Opcode::EntityCreateResp => Self::EntityCreate(from_rkyv_bytes(bytes)?),
+            Opcode::EntityGetResp => Self::EntityGet(from_rkyv_bytes(bytes)?),
+            Opcode::EntityUpdateResp => Self::EntityUpdate(from_rkyv_bytes(bytes)?),
+            Opcode::EntityRenameResp => Self::EntityRename(from_rkyv_bytes(bytes)?),
+            Opcode::EntityMergeResp => Self::EntityMerge(from_rkyv_bytes(bytes)?),
+            Opcode::EntityUnmergeResp => Self::EntityUnmerge(from_rkyv_bytes(bytes)?),
+            Opcode::EntityResolveResp => Self::EntityResolve(from_rkyv_bytes(bytes)?),
+            Opcode::EntityListResp => Self::EntityList(from_rkyv_bytes(bytes)?),
+            Opcode::EntityTombstoneResp => Self::EntityTombstone(from_rkyv_bytes(bytes)?),
             Opcode::Error => Self::Error(from_rkyv_bytes(bytes)?),
-            other => return Err(ProtocolError::UnknownOpcode(other.as_u8())),
+            other => return Err(ProtocolError::UnknownOpcode(other.as_u16())),
         })
     }
 }
@@ -349,6 +390,7 @@ mod tests {
             salience: 0.5,
             timestamp_unix_nanos: 1_700_000_000_000_000_000,
             lsn: 1234,
+            knowledge_payload: None,
         }));
     }
 
@@ -613,6 +655,7 @@ mod tests {
                 salience: 0.0,
                 timestamp_unix_nanos: 0,
                 lsn: 0,
+                knowledge_payload: None,
             })
             .is_final(),
             None

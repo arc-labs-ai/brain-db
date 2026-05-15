@@ -54,16 +54,40 @@ pub enum ReasonStatus {
     Cancelled = 3,
 }
 
-/// Spec §08 §7 — `SubscriptionEvent::EventType`.
+/// Spec §03/08 §7 — `SubscriptionEvent::EventType`.
+///
+/// Phase 16.7 extended this enum with the 14 knowledge-layer event
+/// variants ([`Self::EntityCreated`] through [`Self::SchemaUpdated`]).
+/// For knowledge events the substrate fields on `SubscriptionEvent`
+/// (`memory_id`, `context_id`, `kind`, `salience`, `text`) are
+/// zero-filled and `knowledge_payload` carries the typed body. See
+/// `spec/28_knowledge_wire_protocol/02_subscribe_events.md`.
 #[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 #[repr(u8)]
 pub enum EventType {
+    // Substrate events.
     Encoded = 0,
     Forgotten = 1,
     Reclaimed = 2,
     KindChanged = 3,
+
+    // Knowledge-layer events (§28/02). knowledge_payload is populated.
+    EntityCreated = 16,
+    EntityUpdated = 17,
+    EntityRenamed = 18,
+    EntityMerged = 19,
+    EntityUnmerged = 20,
+    EntityTombstoned = 21,
+    StatementCreated = 22,
+    StatementSuperseded = 23,
+    StatementTombstoned = 24,
+    RelationCreated = 25,
+    RelationSuperseded = 26,
+    ExtractionCompleted = 27,
+    ExtractionFailed = 28,
+    SchemaUpdated = 29,
 }
 
 /// Spec §08 §18 — `IntegrityIssue::IntegrityIssueType`.

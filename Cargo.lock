@@ -350,6 +350,7 @@ dependencies = [
  "proptest",
  "serde",
  "thiserror 1.0.69",
+ "tracing",
  "uuid",
 ]
 
@@ -422,6 +423,7 @@ dependencies = [
  "brain-core",
  "brain-storage",
  "bytemuck",
+ "criterion",
  "glommio",
  "proptest",
  "redb",
@@ -491,6 +493,7 @@ dependencies = [
  "brain-protocol",
  "futures-lite 2.6.1",
  "parking_lot",
+ "rkyv",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -528,6 +531,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "rcgen",
+ "redb",
  "reqwest",
  "rustls",
  "rustls-pemfile",

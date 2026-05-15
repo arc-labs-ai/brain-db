@@ -156,7 +156,7 @@ pub(crate) enum CancelSubscribe {
 /// `state` for handshake / phase transitions. Pure aside from
 /// `SystemTime::now()` in PONG and AUTH_OK.
 pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Topology) -> Action {
-    let opcode = match Opcode::from_u8(frame.header.opcode) {
+    let opcode = match Opcode::from_u16(frame.header.opcode_u16()) {
         Ok(o) => o,
         Err(_) => {
             // Per spec §03/11 §2.6: unknown opcodes return BadOpcode and
@@ -428,7 +428,7 @@ fn on_bye(frame: Frame) -> Action {
     // Echo a BYE back, then close. The protocol uses the same `Bye`
     // opcode for both directions (spec §03/05 §1.1), so we hand-build
     // the frame rather than going through `ResponseBody`.
-    let reply = Frame::new(Opcode::Bye.as_u8(), FLAG_EOS, 0, frame.payload.clone());
+    let reply = Frame::new(Opcode::Bye.as_u16(), FLAG_EOS, 0, frame.payload.clone());
     Action::CloseWith(reply)
 }
 
@@ -507,10 +507,10 @@ pub(crate) fn build_server_ping_frame() -> Frame {
 // Frame builders
 // ---------------------------------------------------------------------------
 
-const FLAG_EOS: u16 = 1 << 15;
+const FLAG_EOS: u8 = 1 << 7;
 
 fn build_response_frame(stream_id: u32, eos: bool, body: ResponseBody) -> Frame {
-    let opcode = body.opcode().as_u8();
+    let opcode = body.opcode().as_u16();
     let flags = if eos { FLAG_EOS } else { 0 };
     let payload = body.encode();
     Frame::new(opcode, flags, stream_id, payload)
@@ -648,7 +648,7 @@ mod tests {
             },
             client_session_token: None,
         };
-        Frame::new(Opcode::Hello.as_u8(), FLAG_EOS, 0, hello.encode())
+        Frame::new(Opcode::Hello.as_u16(), FLAG_EOS, 0, hello.encode())
     }
 
     #[test]
@@ -658,7 +658,7 @@ mod tests {
         let action = dispatch_frame(build_hello_frame(), &mut state, &topo);
         match action {
             Action::Inline(f) => {
-                assert_eq!(f.header.opcode, Opcode::Welcome.as_u8());
+                assert_eq!(f.header.opcode_u16(), Opcode::Welcome.as_u16());
                 assert!(matches!(state.phase, ConnPhase::AwaitingAuth));
                 assert_eq!(state.negotiated_version, 1);
                 assert_ne!(state.session_id, [0u8; 16]);
@@ -683,11 +683,11 @@ mod tests {
             txn_id: None,
             deduplicate: false,
         });
-        let frame = Frame::new(Opcode::EncodeReq.as_u8(), FLAG_EOS, 1, body.encode());
+        let frame = Frame::new(Opcode::EncodeReq.as_u16(), FLAG_EOS, 1, body.encode());
         let action = dispatch_frame(frame, &mut state, &topo);
         match action {
             Action::Inline(f) => {
-                assert_eq!(f.header.opcode, Opcode::Error.as_u8());
+                assert_eq!(f.header.opcode_u16(), Opcode::Error.as_u16());
             }
             _ => panic!("expected Inline(ERROR)"),
         }
@@ -707,9 +707,9 @@ mod tests {
             },
             client_session_token: None,
         };
-        let frame = Frame::new(Opcode::Hello.as_u8(), FLAG_EOS, 0, bad.encode());
+        let frame = Frame::new(Opcode::Hello.as_u16(), FLAG_EOS, 0, bad.encode());
         match dispatch_frame(frame, &mut state, &topo) {
-            Action::CloseWith(f) => assert_eq!(f.header.opcode, Opcode::Error.as_u8()),
+            Action::CloseWith(f) => assert_eq!(f.header.opcode_u16(), Opcode::Error.as_u16()),
             _ => panic!("expected CloseWith(ERROR)"),
         }
     }
@@ -720,11 +720,11 @@ mod tests {
             client_timestamp_unix_nanos: 42,
         };
         let body = RequestBody::Ping(payload);
-        let frame = Frame::new(Opcode::Ping.as_u8(), FLAG_EOS, 0, body.encode());
+        let frame = Frame::new(Opcode::Ping.as_u16(), FLAG_EOS, 0, body.encode());
         let mut state = ConnState::new();
         let topo = test_topology();
         match dispatch_frame(frame, &mut state, &topo) {
-            Action::Inline(f) => assert_eq!(f.header.opcode, Opcode::Pong.as_u8()),
+            Action::Inline(f) => assert_eq!(f.header.opcode_u16(), Opcode::Pong.as_u16()),
             _ => panic!("expected Inline(PONG)"),
         }
     }
@@ -735,12 +735,12 @@ mod tests {
     fn connection_level_opcode_rejects_nonzero_stream() {
         // HELLO payload is valid; the only violation is stream_id=1.
         let hello = build_hello_frame();
-        let frame = Frame::new(Opcode::Hello.as_u8(), FLAG_EOS, 1, hello.payload);
+        let frame = Frame::new(Opcode::Hello.as_u16(), FLAG_EOS, 1, hello.payload);
         let mut state = ConnState::new();
         let topo = test_topology();
         match dispatch_frame(frame, &mut state, &topo) {
             Action::Inline(reply) => {
-                assert_eq!(reply.header.opcode, Opcode::Error.as_u8());
+                assert_eq!(reply.header.opcode_u16(), Opcode::Error.as_u16());
                 assert_eq!(reply.header.stream_id_u32(), 1);
             }
             _ => panic!("expected Inline(ERROR) on bad-stream HELLO"),
@@ -752,12 +752,12 @@ mod tests {
     fn op_stream_must_be_odd() {
         // EncodeReq on stream_id = 2 (even). The op is client-bound
         // (`is_request() == true`, `is_connection_level() == false`).
-        let frame = Frame::new(Opcode::EncodeReq.as_u8(), FLAG_EOS, 2, Vec::new());
+        let frame = Frame::new(Opcode::EncodeReq.as_u16(), FLAG_EOS, 2, Vec::new());
         let mut state = ConnState::new();
         let topo = test_topology();
         match dispatch_frame(frame, &mut state, &topo) {
             Action::Inline(reply) => {
-                assert_eq!(reply.header.opcode, Opcode::Error.as_u8());
+                assert_eq!(reply.header.opcode_u16(), Opcode::Error.as_u16());
                 assert_eq!(reply.header.stream_id_u32(), 2);
             }
             _ => panic!("expected Inline(ERROR) on even op stream_id"),
@@ -767,12 +767,12 @@ mod tests {
     /// F-2: client op on stream_id = 0 is BadFrame.
     #[test]
     fn op_stream_must_be_nonzero() {
-        let frame = Frame::new(Opcode::EncodeReq.as_u8(), FLAG_EOS, 0, Vec::new());
+        let frame = Frame::new(Opcode::EncodeReq.as_u16(), FLAG_EOS, 0, Vec::new());
         let mut state = ConnState::new();
         let topo = test_topology();
         match dispatch_frame(frame, &mut state, &topo) {
             Action::Inline(reply) => {
-                assert_eq!(reply.header.opcode, Opcode::Error.as_u8());
+                assert_eq!(reply.header.opcode_u16(), Opcode::Error.as_u16());
             }
             _ => panic!("expected Inline(ERROR) on stream_id=0 op"),
         }
@@ -789,8 +789,8 @@ mod tests {
         match dispatch_frame(frame, &mut state, &topo) {
             Action::Inline(reply) => {
                 assert_eq!(
-                    reply.header.opcode,
-                    Opcode::Error.as_u8(),
+                    reply.header.opcode_u16(),
+                    Opcode::Error.as_u16(),
                     "expected an Error frame"
                 );
                 assert_eq!(

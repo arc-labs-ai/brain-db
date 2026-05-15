@@ -11,6 +11,8 @@ The latency targets Brain v1 must meet, on the reference hardware, with the refe
 
 ## 2. The targets (single-shard)
 
+### 2.1 Substrate (cognitive primitives)
+
 | Operation | p50 | p95 | p99 | p99.9 |
 |---|---|---|---|---|
 | ENCODE | 8 ms | 15 ms | 25 ms | 50 ms |
@@ -23,6 +25,33 @@ The latency targets Brain v1 must meet, on the reference hardware, with the refe
 | UNLINK | 2 ms | 5 ms | 10 ms | 20 ms |
 
 These are MUST targets for v1.
+
+### 2.2 Knowledge layer — entity operations (phase 16)
+
+Measured at 100K entities per shard. Phase-16 perf gate; substrate workload assumptions in §1 apply.
+
+| Operation | p50 | p95 | p99 | p99.9 |
+|---|---|---|---|---|
+| ENTITY_CREATE | 1 ms | 3 ms | 5 ms | 10 ms |
+| ENTITY_GET | 0.5 ms | 1 ms | 2 ms | 5 ms |
+| ENTITY_UPDATE | 1 ms | 3 ms | 5 ms | 10 ms |
+| ENTITY_RENAME | 1 ms | 3 ms | 5 ms | 10 ms |
+| ENTITY_MERGE | 5 ms | 15 ms | 25 ms | 50 ms |
+| ENTITY_UNMERGE | 5 ms | 15 ms | 25 ms | 50 ms |
+| ENTITY_TOMBSTONE | 1 ms | 3 ms | 5 ms | 10 ms |
+| ENTITY_LIST (limit=100, prefix filter) | 2 ms | 5 ms | 10 ms | 20 ms |
+| ENTITY_RESOLVE (tier 1 — exact / alias) | 0.5 ms | 1 ms | 2 ms | 5 ms |
+| ENTITY_RESOLVE (tier 2 — trigram fuzzy) | 5 ms | 15 ms | 30 ms | 60 ms |
+
+### 2.3 Knowledge layer — deferred targets
+
+- **ENTITY_RESOLVE (tier 3 — embedding HNSW)** lands when the entity HNSW is wired into the resolver (phase 21). Target placeholder per the phase-16 doc: p50 ≤ 5 ms at 100K, ≤ 50 ms at 1M. Final numbers set in phase 21.
+- **ENTITY_RESOLVE (tier 4 — LLM)** lands in phase 21 with the LLM extractor. Latency is gated by the model + cache hit-rate; target is "tail under 1 s with cache warm, queued under 5 s cold."
+- **Statement / relation / query** opcodes — separate phases (17 / 18 / 22-23) and separate target rows.
+
+### 2.4 Phase-16 perf gate
+
+The phase-16 acceptance gate (sub-task 16.9) verifies §2.2 targets at 100K entities on the dev workstation. Production-reference numbers (16-core / 64 GB / NVMe per §1) are revalidated in phase 14's CI suite.
 
 ## 3. The breakdown
 

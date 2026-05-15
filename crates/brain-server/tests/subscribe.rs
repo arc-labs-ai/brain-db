@@ -50,7 +50,7 @@ use shard::{spawn_shard, ShardHandle, ShardJoiner, ShardSpawnConfig};
 // Scaffold (mirrors tests/dispatch.rs)
 // ---------------------------------------------------------------------------
 
-const FLAG_EOS: u16 = 1 << 15;
+const FLAG_EOS: u8 = 1 << 7;
 
 struct Server {
     addr: SocketAddr,
@@ -170,7 +170,7 @@ async fn complete_handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
     send_frame(
         client,
         Frame::new(
-            Opcode::Hello.as_u8(),
+            Opcode::Hello.as_u16(),
             FLAG_EOS,
             0,
             RequestBody::Hello(hello).encode(),
@@ -187,7 +187,7 @@ async fn complete_handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
     send_frame(
         client,
         Frame::new(
-            Opcode::Auth.as_u8(),
+            Opcode::Auth.as_u16(),
             FLAG_EOS,
             0,
             RequestBody::Auth(auth).encode(),
@@ -262,7 +262,7 @@ async fn subscribe_receives_encode_events() {
     send_frame(
         &mut sub_client,
         Frame::new(
-            Opcode::SubscribeReq.as_u8(),
+            Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             sub_stream,
             RequestBody::Subscribe(subscribe_request(open_filter())).encode(),
@@ -276,7 +276,7 @@ async fn subscribe_receives_encode_events() {
     send_frame(
         &mut writer_client,
         Frame::new(
-            Opcode::EncodeReq.as_u8(),
+            Opcode::EncodeReq.as_u16(),
             FLAG_EOS,
             1,
             RequestBody::Encode(encode_request("hello", MemoryKindWire::Episodic)).encode(),
@@ -298,10 +298,10 @@ async fn subscribe_receives_encode_events() {
     let event = read_event_within(&mut sub_client, Duration::from_secs(2)).await;
     if let Some(frame) = event {
         assert!(
-            frame.header.opcode == Opcode::SubscribeEvent.as_u8()
-                || frame.header.opcode == Opcode::Error.as_u8(),
+            frame.header.opcode_u16() == Opcode::SubscribeEvent.as_u16()
+                || frame.header.opcode_u16() == Opcode::Error.as_u16(),
             "unexpected opcode 0x{:02x}",
-            frame.header.opcode
+            frame.header.opcode_u16()
         );
     }
     // (Even if no event arrives, the test passes; the smoke is that
@@ -321,7 +321,7 @@ async fn unsubscribe_emits_final_eos_and_response() {
     send_frame(
         &mut client,
         Frame::new(
-            Opcode::SubscribeReq.as_u8(),
+            Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             sub_stream,
             RequestBody::Subscribe(subscribe_request(open_filter())).encode(),
@@ -335,7 +335,7 @@ async fn unsubscribe_emits_final_eos_and_response() {
     send_frame(
         &mut client,
         Frame::new(
-            Opcode::UnsubscribeReq.as_u8(),
+            Opcode::UnsubscribeReq.as_u16(),
             FLAG_EOS,
             unsub_stream,
             RequestBody::Unsubscribe(UnsubscribeRequest {
@@ -354,10 +354,10 @@ async fn unsubscribe_emits_final_eos_and_response() {
     for _ in 0..2 {
         match read_event_within(&mut client, Duration::from_secs(2)).await {
             Some(frame) => {
-                if frame.header.opcode == Opcode::UnsubscribeResp.as_u8() {
+                if frame.header.opcode_u16() == Opcode::UnsubscribeResp.as_u16() {
                     saw_unsub = true;
-                } else if frame.header.opcode == Opcode::SubscribeEvent.as_u8()
-                    && frame.header.flags_u16() & FLAG_EOS != 0
+                } else if frame.header.opcode_u16() == Opcode::SubscribeEvent.as_u16()
+                    && frame.header.flags_u8() & FLAG_EOS != 0
                 {
                     saw_final_eos = true;
                 }
@@ -382,7 +382,7 @@ async fn cancel_stream_terminates_subscription() {
     send_frame(
         &mut client,
         Frame::new(
-            Opcode::SubscribeReq.as_u8(),
+            Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             sub_stream,
             RequestBody::Subscribe(subscribe_request(open_filter())).encode(),
@@ -395,7 +395,7 @@ async fn cancel_stream_terminates_subscription() {
     send_frame(
         &mut client,
         Frame::new(
-            Opcode::CancelStream.as_u8(),
+            Opcode::CancelStream.as_u16(),
             FLAG_EOS,
             cancel_stream,
             RequestBody::CancelStream(CancelStreamRequest {
@@ -412,10 +412,10 @@ async fn cancel_stream_terminates_subscription() {
     for _ in 0..2 {
         match read_event_within(&mut client, Duration::from_secs(2)).await {
             Some(frame) => {
-                if frame.header.opcode == Opcode::CancelStreamAck.as_u8() {
+                if frame.header.opcode_u16() == Opcode::CancelStreamAck.as_u16() {
                     saw_ack = true;
-                } else if frame.header.opcode == Opcode::SubscribeEvent.as_u8()
-                    && frame.header.flags_u16() & FLAG_EOS != 0
+                } else if frame.header.opcode_u16() == Opcode::SubscribeEvent.as_u16()
+                    && frame.header.flags_u8() & FLAG_EOS != 0
                 {
                     saw_final_eos = true;
                 }
@@ -446,7 +446,7 @@ async fn subscribe_rejects_from_lsn() {
     send_frame(
         &mut client,
         Frame::new(
-            Opcode::SubscribeReq.as_u8(),
+            Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             sub_stream,
             RequestBody::Subscribe(req).encode(),
@@ -457,7 +457,7 @@ async fn subscribe_rejects_from_lsn() {
     let resp = read_event_within(&mut client, Duration::from_secs(2))
         .await
         .expect("error frame");
-    assert_eq!(resp.header.opcode, Opcode::Error.as_u8());
+    assert_eq!(resp.header.opcode_u16(), Opcode::Error.as_u16());
     let body = ResponseBody::decode(Opcode::Error, &resp.payload).expect("decode");
     match body {
         ResponseBody::Error(e) => {
@@ -488,7 +488,7 @@ async fn double_subscribe_with_same_stream_id_errors() {
     send_frame(
         &mut client,
         Frame::new(
-            Opcode::SubscribeReq.as_u8(),
+            Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             sub_stream,
             req.clone(),
@@ -499,14 +499,14 @@ async fn double_subscribe_with_same_stream_id_errors() {
 
     send_frame(
         &mut client,
-        Frame::new(Opcode::SubscribeReq.as_u8(), FLAG_EOS, sub_stream, req),
+        Frame::new(Opcode::SubscribeReq.as_u16(), FLAG_EOS, sub_stream, req),
     )
     .await;
 
     let resp = read_event_within(&mut client, Duration::from_secs(2))
         .await
         .expect("error frame");
-    assert_eq!(resp.header.opcode, Opcode::Error.as_u8());
+    assert_eq!(resp.header.opcode_u16(), Opcode::Error.as_u16());
 
     server.stop().await;
 }

@@ -12,7 +12,7 @@ use brain_sdk_rust::Client;
 async fn encode_round_trip() {
     let (addr, _server) = common::spawn_mock_server(|mut socket| async move {
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode, Opcode::EncodeReq.as_u8());
+        assert_eq!(frame.header.opcode_u16(), Opcode::EncodeReq.as_u16());
         let body = RequestBody::decode(Opcode::EncodeReq, &frame.payload).expect("decode");
         let req = match body {
             RequestBody::Encode(r) => r,
@@ -29,7 +29,7 @@ async fn encode_round_trip() {
         };
         common::write_frame(
             &mut socket,
-            Opcode::EncodeResp.as_u8(),
+            Opcode::EncodeResp.as_u16(),
             frame.header.stream_id_u32(),
             ResponseBody::Encode(resp).encode(),
             true,

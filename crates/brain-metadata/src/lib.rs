@@ -15,8 +15,22 @@
 #![forbid(unsafe_code)]
 
 pub mod db;
+pub mod entity_merge_ops;
+pub mod entity_ops;
+pub mod llm_cache;
 pub mod schema;
 pub mod sink;
 pub mod tables;
+pub mod trigram_ops;
 
 pub use db::{MetadataDb, MetadataDbError};
+pub use entity_ops::{
+    entity_add_alias, entity_get, entity_list_by_type, entity_lookup_by_alias,
+    entity_lookup_by_canonical_name, entity_put, entity_remove_alias, entity_rename,
+    entity_tombstone, entity_update, normalize_name, EntityOpError,
+};
+pub use llm_cache::{LlmCacheDb, LlmCacheError, LlmResponse};
+pub use trigram_ops::{
+    candidates_for_query, extract_trigrams, index_entity_trigrams, jaccard,
+    lookup_candidates_by_trigram, remove_entity_trigrams, trigrams_of_entity, TrigramOpError,
+};

@@ -115,7 +115,7 @@ impl<'a> ReasonBuilder<'a> {
                     let mut guard = client.acquire().await?;
                     let stream_id = guard.next_stream_id();
                     let frame = Frame::new(
-                        Opcode::ReasonReq.as_u8(),
+                        Opcode::ReasonReq.as_u16(),
                         FLAG_EOS,
                         stream_id,
                         body.encode(),
@@ -169,7 +169,7 @@ impl<'a> ReasonBuilder<'a> {
         let mut guard = self.client.acquire().await?;
         let stream_id = guard.next_stream_id();
         let frame = Frame::new(
-            Opcode::ReasonReq.as_u8(),
+            Opcode::ReasonReq.as_u16(),
             FLAG_EOS,
             stream_id,
             body.encode(),

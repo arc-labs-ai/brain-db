@@ -33,6 +33,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,7 +57,10 @@ pub struct Server {
     pub admin_handle: tokio::task::JoinHandle<std::io::Result<SocketAddr>>,
     pub handles: Vec<ShardHandle>,
     pub joiners: Vec<Option<ShardJoiner>>,
-    pub _data_dir: TempDir,
+    /// `Some` when [`start`] owns the data dir (auto-cleanup on `stop`);
+    /// `None` when [`start_in`] was used and the caller holds the
+    /// `TempDir` (so the data dir survives `stop` for inspection).
+    pub _data_dir: Option<TempDir>,
 }
 
 impl Server {
@@ -75,10 +79,19 @@ impl Server {
 
 pub async fn start(n_shards: usize) -> Server {
     let data_dir = TempDir::new().expect("tmp");
+    let mut server = start_in(data_dir.path(), n_shards).await;
+    server._data_dir = Some(data_dir);
+    server
+}
+
+/// Same as [`start`] but uses a caller-supplied data directory. The
+/// caller owns the directory's lifetime — useful when a test wants to
+/// inspect on-disk state after `Server::stop()` returns.
+pub async fn start_in(data_dir: &Path, n_shards: usize) -> Server {
     let mut handles = Vec::with_capacity(n_shards);
     let mut joiners = Vec::with_capacity(n_shards);
     for shard_id in 0..n_shards {
-        let cfg = ShardSpawnConfig::new(data_dir.path());
+        let cfg = ShardSpawnConfig::new(data_dir);
         let (h, j) = spawn_shard(shard_id as u16, cfg).expect("spawn shard");
         handles.push(h);
         joiners.push(Some(j));
@@ -133,6 +146,6 @@ pub async fn start(n_shards: usize) -> Server {
         admin_handle,
         handles,
         joiners,
-        _data_dir: data_dir,
+        _data_dir: None,
     }
 }

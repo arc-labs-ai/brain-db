@@ -35,7 +35,9 @@ pub mod txn_lens;
 
 // Module-level re-exports preserve `brain_ops::<op>::*` paths so
 // external callers (brain-server, brain-planner) don't churn.
-pub use ops::{encode, forget, link, plan, reason, recall, subscribe, txn, writer};
+pub use ops::{
+    encode, forget, knowledge_entity, link, plan, reason, recall, subscribe, txn, writer,
+};
 
 pub use access_buffer::{AccessBuffer, DEFAULT_ACCESS_BUFFER_CAPACITY};
 pub use brain_planner::PlannerContext;

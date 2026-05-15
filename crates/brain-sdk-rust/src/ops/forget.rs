@@ -73,7 +73,7 @@ impl<'a> ForgetBuilder<'a> {
                     let mut guard = client.acquire().await?;
                     let stream_id = guard.next_stream_id();
                     let frame = Frame::new(
-                        Opcode::ForgetReq.as_u8(),
+                        Opcode::ForgetReq.as_u16(),
                         FLAG_EOS,
                         stream_id,
                         body.encode(),

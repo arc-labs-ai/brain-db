@@ -19,6 +19,7 @@ pub mod error;
 pub mod frame;
 pub mod handshake;
 pub mod header;
+pub mod knowledge;
 pub mod opcode;
 pub mod request;
 pub mod requests;

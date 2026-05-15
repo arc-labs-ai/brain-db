@@ -23,6 +23,7 @@ fn event(idx: u64) -> SubscriptionEvent {
         salience: 0.5,
         timestamp_unix_nanos: idx * 1_000_000_000,
         text: String::new(),
+        knowledge_payload: None,
     }
 }
 
@@ -30,7 +31,7 @@ fn event(idx: u64) -> SubscriptionEvent {
 async fn subscribe_stream_yields_events_then_stops_when_dropped() {
     let (addr, _server) = common::spawn_mock_server(|mut socket| async move {
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode, Opcode::SubscribeReq.as_u8());
+        assert_eq!(frame.header.opcode_u16(), Opcode::SubscribeReq.as_u16());
         let _ = RequestBody::decode(Opcode::SubscribeReq, &frame.payload).expect("decode");
         let sid = frame.header.stream_id_u32();
 
@@ -39,7 +40,7 @@ async fn subscribe_stream_yields_events_then_stops_when_dropped() {
         for i in 0..5 {
             common::write_frame(
                 &mut socket,
-                Opcode::SubscribeEvent.as_u8(),
+                Opcode::SubscribeEvent.as_u16(),
                 sid,
                 ResponseBody::SubscribeEvent(event(i)).encode(),
                 false,

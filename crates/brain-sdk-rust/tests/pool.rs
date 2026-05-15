@@ -19,7 +19,7 @@ use brain_sdk_rust::{Client, ClientConfig, ClientError, Pool, PoolConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-const FLAG_EOS: u16 = 1 << 15;
+const FLAG_EOS: u8 = 1 << 7;
 
 // ---------------------------------------------------------------------------
 // Mock server
@@ -58,7 +58,7 @@ async fn run_handshake_then_idle(socket: &mut TcpStream, counter: &AtomicUsize) 
         Some(f) => f,
         None => return,
     };
-    if hello_frame.header.opcode != Opcode::Hello.as_u8() {
+    if hello_frame.header.opcode_u16() != Opcode::Hello.as_u16() {
         return;
     }
 
@@ -81,7 +81,7 @@ async fn run_handshake_then_idle(socket: &mut TcpStream, counter: &AtomicUsize) 
     };
     write_frame(
         socket,
-        Opcode::Welcome.as_u8(),
+        Opcode::Welcome.as_u16(),
         0,
         ResponseBody::Welcome(welcome).encode(),
     )
@@ -92,7 +92,7 @@ async fn run_handshake_then_idle(socket: &mut TcpStream, counter: &AtomicUsize) 
         Some(f) => f,
         None => return,
     };
-    if auth_frame.header.opcode != Opcode::Auth.as_u8() {
+    if auth_frame.header.opcode_u16() != Opcode::Auth.as_u16() {
         return;
     }
     let auth_body = match RequestBody::decode(Opcode::Auth, &auth_frame.payload) {
@@ -120,7 +120,7 @@ async fn run_handshake_then_idle(socket: &mut TcpStream, counter: &AtomicUsize) 
     };
     write_frame(
         socket,
-        Opcode::AuthOk.as_u8(),
+        Opcode::AuthOk.as_u16(),
         0,
         ResponseBody::AuthOk(auth_ok).encode(),
     )
@@ -129,10 +129,10 @@ async fn run_handshake_then_idle(socket: &mut TcpStream, counter: &AtomicUsize) 
 
     // ---- Echo BYE / drain until client disconnects ----------------
     while let Some(frame) = read_frame_opt(socket).await {
-        if frame.header.opcode == Opcode::Bye.as_u8() {
+        if frame.header.opcode_u16() == Opcode::Bye.as_u16() {
             // Match brain-server's on_bye: same opcode in both
             // directions, payload echoed verbatim.
-            write_frame(socket, Opcode::Bye.as_u8(), 0, frame.payload).await;
+            write_frame(socket, Opcode::Bye.as_u16(), 0, frame.payload).await;
             return;
         }
         // Drop other frames silently in this mock.
@@ -163,7 +163,7 @@ async fn read_frame_opt(socket: &mut TcpStream) -> Option<Frame> {
     Some(frame)
 }
 
-async fn write_frame(socket: &mut TcpStream, opcode: u8, stream_id: u32, payload: Vec<u8>) {
+async fn write_frame(socket: &mut TcpStream, opcode: u16, stream_id: u32, payload: Vec<u8>) {
     let frame = Frame::new(opcode, FLAG_EOS, stream_id, payload);
     let _ = socket.write_all(&frame.encode()).await;
     let _ = socket.flush().await;

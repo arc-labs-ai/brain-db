@@ -327,6 +327,17 @@ fn apply_to_arena(
         | WalPayload::TxnBegin(_)
         | WalPayload::TxnCommit(_)
         | WalPayload::TxnAbort(_) => Ok(()),
+        // Knowledge-layer records: substrate apply-paths ignore these.
+        // Phases 16+ hydrate knowledge state via their own sinks. Sub-task 15.2.
+        WalPayload::Knowledge(r) => {
+            tracing::trace!(
+                kind = ?r.kind,
+                body_len = r.body.len(),
+                lsn = record.lsn.raw(),
+                "recovery: skipping knowledge-layer record (substrate arena unaffected)"
+            );
+            Ok(())
+        }
     }
 }
 
@@ -922,5 +933,66 @@ mod tests {
         assert_eq!(encode_record(0).kind, WalRecordKind::Encode);
         assert_eq!(forget_record(0, 1).kind, WalRecordKind::Forget);
         assert_eq!(reclaim_record(0, 0, 1).kind, WalRecordKind::Reclaim);
+    }
+
+    // ----- Knowledge-layer (sub-task 15.2) ------------------------------
+
+    /// Build a knowledge-layer record with an arbitrary opaque body. Used
+    /// by `recovery_skips_knowledge_records` to interleave knowledge
+    /// frames between substrate ones.
+    fn knowledge_record(kind: WalRecordKind, body: Vec<u8>) -> WalRecord {
+        use crate::wal::payload::KnowledgeRecord;
+        WalRecord::from_typed(
+            Lsn(0),
+            0,
+            1_700_000_000_000_000_002,
+            0xBEEF,
+            &WalPayload::Knowledge(KnowledgeRecord::new(kind, body)),
+        )
+    }
+
+    #[test]
+    fn recovery_replays_knowledge_records_without_touching_arena() {
+        // A WAL containing substrate + knowledge + substrate records.
+        // Recovery treats the knowledge frame as a no-op for the
+        // substrate apply-paths (arena + substrate sink) but still
+        // advances the LSN counter — `records_replayed` includes it.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = fresh_wal_dir(&dir);
+        let records = vec![
+            encode_record(0),
+            knowledge_record(WalRecordKind::EntityCreate, vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            encode_record(1),
+            knowledge_record(WalRecordKind::SchemaUpdate, vec![]),
+            knowledge_record(WalRecordKind::Audit, vec![1, 2, 3, 4, 5]),
+            encode_record(2),
+        ];
+        write_via_wal(&wal_dir, records);
+
+        let mut arena = fresh_arena(&dir, 16);
+        let mut sink = InMemoryMetadataSink::new();
+        let (report, _alloc) = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap();
+
+        // All 6 records counted as replayed (knowledge no-ops still
+        // advance the LSN watermark).
+        assert_eq!(report.records_replayed, 6);
+        assert_eq!(report.records_skipped, 0);
+        assert_eq!(report.records_discarded, 0);
+
+        // Substrate slots 0/1/2 are populated by the Encode records.
+        for slot in 0..3u64 {
+            let s = arena.slot(slot);
+            assert!(s.is_occupied(), "slot {slot} should be occupied");
+            assert_eq!(s.metadata.slot_version, 1);
+        }
+
+        // The knowledge frames passed through the sink (so checkpoint
+        // logic sees them) but as opaque payloads.
+        let applied = sink.applied();
+        let knowledge_count = applied
+            .values()
+            .filter(|p| matches!(p, WalPayload::Knowledge(_)))
+            .count();
+        assert_eq!(knowledge_count, 3);
     }
 }

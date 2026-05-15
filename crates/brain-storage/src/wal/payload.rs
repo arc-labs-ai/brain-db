@@ -198,6 +198,38 @@ pub struct MigrateEmbeddingPayload {
 
 use crate::wal::kinds::WalRecordKind;
 
+/// Opaque knowledge-layer WAL record (sub-task 15.2).
+///
+/// The body is the rkyv-encoded record produced by phase 16+ writers
+/// (entity / statement / relation / schema / audit). For the framing
+/// layer it is an opaque blob: the WAL records, reads, and recovery
+/// transports it unchanged. The substrate apply-paths ignore these
+/// records; knowledge-state hydration is a phase-16+ concern with its
+/// own sink.
+///
+/// Body size is bounded by the frame header's `payload_len` (3 bytes
+/// per spec §05/05), i.e. ~16 MiB — same envelope as substrate
+/// payloads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KnowledgeRecord {
+    pub kind: WalRecordKind,
+    pub body: Vec<u8>,
+}
+
+impl KnowledgeRecord {
+    /// Construct a knowledge record. The `kind` MUST satisfy
+    /// `kind.is_knowledge()`; passing a substrate kind is a programmer
+    /// error and panics in debug builds.
+    #[must_use]
+    pub fn new(kind: WalRecordKind, body: Vec<u8>) -> Self {
+        debug_assert!(
+            kind.is_knowledge(),
+            "KnowledgeRecord requires a knowledge-layer kind (0x10..=0x50); got {kind:?}"
+        );
+        Self { kind, body }
+    }
+}
+
 /// Typed WAL payload, one variant per spec'd record kind.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WalPayload {
@@ -216,6 +248,10 @@ pub enum WalPayload {
     TxnCommit(TxnCommitPayload),
     TxnAbort(TxnAbortPayload),
     MigrateEmbedding(MigrateEmbeddingPayload),
+    /// Knowledge-layer record carried as an opaque body. The typed body
+    /// schemas land in phases 16–21; the framing layer transports them
+    /// unchanged.
+    Knowledge(KnowledgeRecord),
 }
 
 impl WalPayload {
@@ -238,6 +274,7 @@ impl WalPayload {
             Self::TxnCommit(_) => WalRecordKind::TxnCommit,
             Self::TxnAbort(_) => WalRecordKind::TxnAbort,
             Self::MigrateEmbedding(_) => WalRecordKind::MigrateEmbedding,
+            Self::Knowledge(r) => r.kind,
         }
     }
 
@@ -261,6 +298,7 @@ impl WalPayload {
             Self::TxnCommit(p) => encode_txn_commit(p, &mut out),
             Self::TxnAbort(p) => encode_txn_abort(p, &mut out),
             Self::MigrateEmbedding(p) => encode_migrate_embedding(p, &mut out),
+            Self::Knowledge(r) => out.extend_from_slice(&r.body),
         }
         out
     }
@@ -291,6 +329,24 @@ impl WalPayload {
             WalRecordKind::TxnAbort => Self::TxnAbort(decode_txn_abort(&mut r)?),
             WalRecordKind::MigrateEmbedding => {
                 Self::MigrateEmbedding(decode_migrate_embedding(&mut r)?)
+            }
+            // Knowledge layer (spec §26). Bodies are opaque to the
+            // framing layer; phases 16+ supply typed parsers via their
+            // own sinks. We early-return so the trailing-bytes check
+            // below doesn't fire (the entire payload IS the body).
+            WalRecordKind::EntityCreate
+            | WalRecordKind::EntityUpdate
+            | WalRecordKind::EntityMerge
+            | WalRecordKind::EntityTombstone
+            | WalRecordKind::StatementCreate
+            | WalRecordKind::StatementSupersede
+            | WalRecordKind::StatementTombstone
+            | WalRecordKind::RelationCreate
+            | WalRecordKind::RelationSupersede
+            | WalRecordKind::RelationTombstone
+            | WalRecordKind::SchemaUpdate
+            | WalRecordKind::Audit => {
+                return Ok(Self::Knowledge(KnowledgeRecord::new(kind, bytes.to_vec())));
             }
         };
         if !r.is_at_end() {
@@ -1198,5 +1254,81 @@ mod tests {
             let back = WalPayload::decode(kind, &bytes).unwrap();
             assert_eq!(back.kind(), kind);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Knowledge-layer (sub-task 15.2).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn knowledge_record_round_trip() {
+        for kind in [
+            WalRecordKind::EntityCreate,
+            WalRecordKind::EntityUpdate,
+            WalRecordKind::EntityMerge,
+            WalRecordKind::EntityTombstone,
+            WalRecordKind::StatementCreate,
+            WalRecordKind::StatementSupersede,
+            WalRecordKind::StatementTombstone,
+            WalRecordKind::RelationCreate,
+            WalRecordKind::RelationSupersede,
+            WalRecordKind::RelationTombstone,
+            WalRecordKind::SchemaUpdate,
+            WalRecordKind::Audit,
+        ] {
+            let body: Vec<u8> = (0..32u8).map(|i| i ^ kind.as_u8()).collect();
+            let payload = WalPayload::Knowledge(KnowledgeRecord::new(kind, body.clone()));
+            assert_eq!(payload.kind(), kind);
+            let bytes = payload.encode_to_bytes();
+            assert_eq!(bytes, body, "encode is identity for knowledge bodies");
+            let decoded = WalPayload::decode(kind, &bytes).expect("decode knowledge");
+            match decoded {
+                WalPayload::Knowledge(r) => {
+                    assert_eq!(r.kind, kind);
+                    assert_eq!(r.body, body);
+                }
+                other => panic!("expected Knowledge, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn knowledge_decode_empty_body_is_ok() {
+        // An empty body is a legal opaque payload (a tombstone marker,
+        // for instance, may carry no fields).
+        let payload =
+            WalPayload::decode(WalRecordKind::EntityTombstone, &[]).expect("empty body decodes");
+        match payload {
+            WalPayload::Knowledge(r) => {
+                assert_eq!(r.kind, WalRecordKind::EntityTombstone);
+                assert!(r.body.is_empty());
+            }
+            other => panic!("expected Knowledge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn knowledge_decode_skips_trailing_bytes_check() {
+        // For substrate kinds, trailing bytes after the structured tail
+        // are an error. For knowledge kinds the entire payload IS the
+        // body — no such check applies. Verify by feeding garbage.
+        let body = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
+        let decoded =
+            WalPayload::decode(WalRecordKind::SchemaUpdate, &body).expect("knowledge accepts any bytes");
+        if let WalPayload::Knowledge(r) = decoded {
+            assert_eq!(r.body, body);
+        } else {
+            panic!("expected Knowledge");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "KnowledgeRecord requires a knowledge-layer kind")]
+    fn knowledge_record_rejects_substrate_kind_in_debug() {
+        // Debug-only invariant: constructing a KnowledgeRecord with a
+        // substrate kind panics. (In release builds the debug_assert is
+        // elided; that's intentional — callers are not expected to feed
+        // adversarial kinds.)
+        let _ = KnowledgeRecord::new(WalRecordKind::Encode, vec![]);
     }
 }

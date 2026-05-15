@@ -77,7 +77,7 @@ mod support_harness;
 
 use support_harness::start;
 
-const FLAG_EOS: u16 = 1 << 15;
+const FLAG_EOS: u8 = 1 << 7;
 
 // Bringup scaffold (Server, start) lives in tests/support_harness/mod.rs.
 
@@ -131,7 +131,7 @@ async fn complete_handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
     send_frame(
         client,
         Frame::new(
-            Opcode::Hello.as_u8(),
+            Opcode::Hello.as_u16(),
             FLAG_EOS,
             0,
             RequestBody::Hello(hello).encode(),
@@ -139,7 +139,7 @@ async fn complete_handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
     )
     .await;
     let welcome = read_one_frame(client).await.expect("WELCOME");
-    assert_eq!(welcome.header.opcode, Opcode::Welcome.as_u8());
+    assert_eq!(welcome.header.opcode_u16(), Opcode::Welcome.as_u16());
 
     let auth = AuthPayload {
         method: AuthMethod::None,
@@ -149,7 +149,7 @@ async fn complete_handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
     send_frame(
         client,
         Frame::new(
-            Opcode::Auth.as_u8(),
+            Opcode::Auth.as_u16(),
             FLAG_EOS,
             0,
             RequestBody::Auth(auth).encode(),
@@ -157,7 +157,7 @@ async fn complete_handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
     )
     .await;
     let auth_ok = read_one_frame(client).await.expect("AUTH_OK");
-    assert_eq!(auth_ok.header.opcode, Opcode::AuthOk.as_u8());
+    assert_eq!(auth_ok.header.opcode_u16(), Opcode::AuthOk.as_u16());
 }
 
 /// Send an `ENCODE_REQ` and read the response. Returns
@@ -167,7 +167,7 @@ async fn encode_round_trip(
     client: &mut TcpStream,
     stream_id: u32,
     text: &str,
-) -> (u8, Option<u128>) {
+) -> (u16, Option<u128>) {
     let req = EncodeRequest {
         text: text.into(),
         context_id: 0,
@@ -181,7 +181,7 @@ async fn encode_round_trip(
     send_frame(
         client,
         Frame::new(
-            Opcode::EncodeReq.as_u8(),
+            Opcode::EncodeReq.as_u16(),
             FLAG_EOS,
             stream_id,
             RequestBody::Encode(req).encode(),
@@ -189,8 +189,8 @@ async fn encode_round_trip(
     )
     .await;
     let resp = read_one_frame(client).await.expect("ENCODE response");
-    let opcode = resp.header.opcode;
-    let memory_id = if opcode == Opcode::EncodeResp.as_u8() {
+    let opcode = resp.header.opcode_u16();
+    let memory_id = if opcode == Opcode::EncodeResp.as_u16() {
         match ResponseBody::decode(Opcode::EncodeResp, &resp.payload).ok() {
             Some(ResponseBody::Encode(r)) => Some(r.memory_id),
             _ => None,
@@ -201,7 +201,7 @@ async fn encode_round_trip(
     (opcode, memory_id)
 }
 
-async fn recall_round_trip(client: &mut TcpStream, stream_id: u32, cue: &str) -> u8 {
+async fn recall_round_trip(client: &mut TcpStream, stream_id: u32, cue: &str) -> u16 {
     let req = RecallRequest {
         cue_text: cue.into(),
         cue_vector_offset: 0,
@@ -221,7 +221,7 @@ async fn recall_round_trip(client: &mut TcpStream, stream_id: u32, cue: &str) ->
     send_frame(
         client,
         Frame::new(
-            Opcode::RecallReq.as_u8(),
+            Opcode::RecallReq.as_u16(),
             FLAG_EOS,
             stream_id,
             RequestBody::Recall(req).encode(),
@@ -231,13 +231,13 @@ async fn recall_round_trip(client: &mut TcpStream, stream_id: u32, cue: &str) ->
     let resp = read_one_frame(client).await.expect("RECALL response");
     // EOS must be set (single-frame EOS in v1 per 9.10).
     assert!(
-        resp.header.flags_u16() & FLAG_EOS != 0,
+        resp.header.flags_u8() & FLAG_EOS != 0,
         "RECALL response must carry EOS in v1"
     );
-    resp.header.opcode
+    resp.header.opcode_u16()
 }
 
-async fn forget_round_trip(client: &mut TcpStream, stream_id: u32, memory_id: u128) -> u8 {
+async fn forget_round_trip(client: &mut TcpStream, stream_id: u32, memory_id: u128) -> u16 {
     let req = ForgetRequest {
         memory_id,
         mode: ForgetMode::Soft,
@@ -247,7 +247,7 @@ async fn forget_round_trip(client: &mut TcpStream, stream_id: u32, memory_id: u1
     send_frame(
         client,
         Frame::new(
-            Opcode::ForgetReq.as_u8(),
+            Opcode::ForgetReq.as_u16(),
             FLAG_EOS,
             stream_id,
             RequestBody::Forget(req).encode(),
@@ -255,14 +255,14 @@ async fn forget_round_trip(client: &mut TcpStream, stream_id: u32, memory_id: u1
     )
     .await;
     let resp = read_one_frame(client).await.expect("FORGET response");
-    resp.header.opcode
+    resp.header.opcode_u16()
 }
 
 async fn bye_round_trip(client: &mut TcpStream) {
     send_frame(
         client,
         Frame::new(
-            Opcode::Bye.as_u8(),
+            Opcode::Bye.as_u16(),
             FLAG_EOS,
             0,
             RequestBody::Bye(ByeRequest {
@@ -273,7 +273,7 @@ async fn bye_round_trip(client: &mut TcpStream) {
     )
     .await;
     let resp = read_one_frame(client).await.expect("BYE response");
-    assert_eq!(resp.header.opcode, Opcode::Bye.as_u8());
+    assert_eq!(resp.header.opcode_u16(), Opcode::Bye.as_u16());
     // Server closes after BYE.
     let mut sink = [0u8; 1];
     let n = client.read(&mut sink).await.expect("EOF read");
@@ -319,14 +319,14 @@ async fn encode_recall_forget_recall_round_trip() {
     // end-to-end). Both are valid wire shapes.
     let (encode_op, encode_id) = encode_round_trip(&mut client, 1, "the cat sat on the mat").await;
     assert!(
-        encode_op == Opcode::EncodeResp.as_u8() || encode_op == Opcode::Error.as_u8(),
+        encode_op == Opcode::EncodeResp.as_u16() || encode_op == Opcode::Error.as_u16(),
         "ENCODE returned unexpected opcode 0x{encode_op:02x}"
     );
 
     // Step 2: RECALL. Single-frame EOS response per 9.10.
     let recall_op = recall_round_trip(&mut client, 3, "cat").await;
     assert!(
-        recall_op == Opcode::RecallResp.as_u8() || recall_op == Opcode::Error.as_u8(),
+        recall_op == Opcode::RecallResp.as_u16() || recall_op == Opcode::Error.as_u16(),
         "RECALL returned unexpected opcode 0x{recall_op:02x}"
     );
 
@@ -336,7 +336,7 @@ async fn encode_recall_forget_recall_round_trip() {
     if let Some(memory_id) = encode_id {
         let forget_op = forget_round_trip(&mut client, 5, memory_id).await;
         assert!(
-            forget_op == Opcode::ForgetResp.as_u8() || forget_op == Opcode::Error.as_u8(),
+            forget_op == Opcode::ForgetResp.as_u16() || forget_op == Opcode::Error.as_u16(),
             "FORGET returned unexpected opcode 0x{forget_op:02x}"
         );
     }
@@ -346,7 +346,7 @@ async fn encode_recall_forget_recall_round_trip() {
     // assert wire shape.
     let recall_op2 = recall_round_trip(&mut client, 7, "cat").await;
     assert!(
-        recall_op2 == Opcode::RecallResp.as_u8() || recall_op2 == Opcode::Error.as_u8(),
+        recall_op2 == Opcode::RecallResp.as_u16() || recall_op2 == Opcode::Error.as_u16(),
         "second RECALL returned unexpected opcode 0x{recall_op2:02x}"
     );
 
@@ -373,12 +373,12 @@ async fn repeated_encode_recall_is_stable() {
         let rec_stream = (i * 4 + 3) % 1024;
         let (encode_op, _) = encode_round_trip(&mut client, enc_stream, "stable").await;
         assert!(
-            encode_op == Opcode::EncodeResp.as_u8() || encode_op == Opcode::Error.as_u8(),
+            encode_op == Opcode::EncodeResp.as_u16() || encode_op == Opcode::Error.as_u16(),
             "iter {i} ENCODE 0x{encode_op:02x}"
         );
         let recall_op = recall_round_trip(&mut client, rec_stream, "stable").await;
         assert!(
-            recall_op == Opcode::RecallResp.as_u8() || recall_op == Opcode::Error.as_u8(),
+            recall_op == Opcode::RecallResp.as_u16() || recall_op == Opcode::Error.as_u16(),
             "iter {i} RECALL 0x{recall_op:02x}"
         );
     }

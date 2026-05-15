@@ -138,7 +138,7 @@ impl<'a> EncodeBuilder<'a> {
                     let mut guard = client.acquire().await?;
                     let stream_id = guard.next_stream_id();
                     let frame = Frame::new(
-                        Opcode::EncodeReq.as_u8(),
+                        Opcode::EncodeReq.as_u16(),
                         FLAG_EOS,
                         stream_id,
                         body.encode(),

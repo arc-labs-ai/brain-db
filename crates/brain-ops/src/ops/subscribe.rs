@@ -100,6 +100,9 @@ pub struct EventEnvelope {
     /// Memory text — `Some` only if the publisher carries it
     /// (encode publishes the text; forget does not).
     pub text: Option<String>,
+    /// Typed knowledge-layer payload — `None` for substrate events,
+    /// `Some(_)` for the 14 knowledge event variants (phase 16.7+).
+    pub knowledge_payload: Option<brain_protocol::knowledge::KnowledgeEventPayload>,
 }
 
 impl EventEnvelope {
@@ -115,6 +118,7 @@ impl EventEnvelope {
             salience: self.salience,
             timestamp_unix_nanos: self.timestamp_unix_nanos,
             lsn: self.lsn,
+            knowledge_payload: self.knowledge_payload.clone(),
         }
     }
 }

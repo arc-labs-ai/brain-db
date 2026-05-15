@@ -254,9 +254,10 @@ pub enum ProtocolError {
     /// A reserved header field was non-zero.
     #[error("reserved field non-zero")]
     ReservedFieldNonZero,
-    /// An opcode byte didn't match any known opcode.
-    #[error("unknown opcode: 0x{0:02X}")]
-    UnknownOpcode(u8),
+    /// An opcode value didn't match any known opcode (per spec §03/05 +
+    /// §28/00). The u16 is the offending wire value.
+    #[error("unknown opcode: 0x{0:04X}")]
+    UnknownOpcode(u16),
     /// Input ran out before a full frame could be decoded.
     #[error("truncated frame: have {have} bytes, need {need}")]
     Truncated { have: usize, need: usize },
@@ -390,7 +391,7 @@ mod tests {
             ProtocolError::BadPayloadCrc,
             ProtocolError::OversizePayload { len: 100, max: 50 },
             ProtocolError::ReservedFieldNonZero,
-            ProtocolError::UnknownOpcode(0x77),
+            ProtocolError::UnknownOpcode(0x0077),
             ProtocolError::Truncated { have: 0, need: 32 },
             ProtocolError::BadFrame("x".into()),
             ProtocolError::BadFlagCombination("EOS+MPL".into()),
@@ -430,7 +431,7 @@ mod tests {
             ErrorCode::ReservedFieldNonZero
         );
         assert_eq!(
-            ProtocolError::UnknownOpcode(0x77).code(),
+            ProtocolError::UnknownOpcode(0x0077).code(),
             ErrorCode::BadOpcode
         );
         assert_eq!(

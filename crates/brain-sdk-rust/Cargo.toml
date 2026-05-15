@@ -12,6 +12,10 @@ brain-core = { path = "../brain-core" }
 brain-protocol = { path = "../brain-protocol" }
 futures-lite.workspace = true
 parking_lot.workspace = true
+# 16.8.1: SDK encodes / decodes typed attribute blobs (PersonAttributesWire) via
+# the same rkyv 0.7 used by brain-protocol. Same `check_bytes` validation on
+# decode as the wire layer.
+rkyv = { workspace = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time", "sync"] }
 tracing.workspace = true

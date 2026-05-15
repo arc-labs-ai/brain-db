@@ -145,23 +145,23 @@ impl<T: Unpin> Stream for FrameStream<T> {
                         Poll::Ready((guard, Ok(frame))) => {
                             // Validate opcode + EOS, decode, transition
                             // to Buffered.
-                            if frame.header.opcode == Opcode::Error.as_u8() {
+                            if frame.header.opcode_u16() == Opcode::Error.as_u16() {
                                 drop(guard);
                                 this.state = StreamState::Ended;
                                 return Poll::Ready(Some(Err(map_error_frame(&frame.payload))));
                             }
-                            if frame.header.opcode != this.expected_opcode.as_u8() {
+                            if frame.header.opcode_u16() != this.expected_opcode.as_u16() {
                                 drop(guard);
                                 this.state = StreamState::Ended;
                                 return Poll::Ready(Some(Err(ClientError::Protocol(
                                     ProtocolError::BadFrame(format!(
                                         "expected opcode 0x{:02x}, got 0x{:02x}",
-                                        this.expected_opcode.as_u8(),
-                                        frame.header.opcode
+                                        this.expected_opcode.as_u16(),
+                                        frame.header.opcode_u16()
                                     )),
                                 ))));
                             }
-                            let ended = u16::from_be_bytes(frame.header.flags) & FLAG_EOS != 0;
+                            let ended = frame.header.flags_u8() & FLAG_EOS != 0;
                             let items = match (this.decoder)(&frame.payload) {
                                 Ok(v) => v,
                                 Err(e) => {

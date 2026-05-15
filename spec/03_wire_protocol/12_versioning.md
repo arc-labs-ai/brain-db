@@ -2,6 +2,10 @@
 
 How wire-protocol versions are negotiated and what the compatibility commitments are. This file is the wire-protocol side of the versioning story; for the system-wide picture see [00.03 Versioning](../00_master_overview/03_versioning.md).
 
+## 0. Pre-v1.0 compatibility policy
+
+Prior to the `v1.0.0` tag, the wire protocol is allowed to change in incompatible ways without a `version`-field bump or handshake negotiation step. Phase 16.6a widened `opcode` from `u8` to `u16` and shrank `flags` from `u16` to `u8` (see [`03_frame_header.md`](03_frame_header.md) §1) under this policy. After v1.0 ships, all changes follow the formal versioning rules below.
+
 ## 1. Versions covered here
 
 The wire protocol carries a version field in every frame and a richer version exchange in the handshake. This file covers:

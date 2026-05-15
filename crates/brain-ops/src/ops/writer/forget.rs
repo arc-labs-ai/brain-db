@@ -189,6 +189,7 @@ fn record_and_return_forget(
                 salience: m.salience,
                 timestamp_unix_nanos: created_at,
                 text: None,
+            knowledge_payload: None,
             });
         }
     }

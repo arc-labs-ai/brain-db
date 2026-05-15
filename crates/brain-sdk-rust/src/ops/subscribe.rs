@@ -108,7 +108,7 @@ impl<'a> SubscribeBuilder<'a> {
         });
         let stream_id = guard.next_stream_id();
         let frame = Frame::new(
-            Opcode::SubscribeReq.as_u8(),
+            Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             stream_id,
             body.encode(),
@@ -118,14 +118,14 @@ impl<'a> SubscribeBuilder<'a> {
         let mut events = Vec::with_capacity(cap);
         while events.len() < cap {
             let resp = read_one_frame(guard.stream_mut()).await?;
-            if resp.header.opcode == Opcode::Error.as_u8() {
+            if resp.header.opcode_u16() == Opcode::Error.as_u16() {
                 return Err(map_error_frame(&resp.payload));
             }
-            if resp.header.opcode != Opcode::SubscribeEvent.as_u8() {
+            if resp.header.opcode_u16() != Opcode::SubscribeEvent.as_u16() {
                 return Err(ClientError::Protocol(
                     brain_protocol::error::ProtocolError::BadFrame(format!(
                         "expected SubscribeEvent, got 0x{:02x}",
-                        resp.header.opcode
+                        resp.header.opcode_u16()
                     )),
                 ));
             }
@@ -167,7 +167,7 @@ impl<'a> SubscribeBuilder<'a> {
         let mut guard = self.client.acquire().await?;
         let stream_id = guard.next_stream_id();
         let frame = Frame::new(
-            Opcode::SubscribeReq.as_u8(),
+            Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             stream_id,
             body.encode(),

@@ -135,14 +135,14 @@ async fn ping_works_pre_handshake_and_keeps_connection_alive() {
         client_timestamp_unix_nanos: 1234,
     };
     let body = brain_protocol::request::RequestBody::Ping(ping);
-    let frame = Frame::new(Opcode::Ping.as_u8(), 1 << 15, 0, body.encode());
+    let frame = Frame::new(Opcode::Ping.as_u16(), 1 << 15, 0, body.encode());
     client.write_all(&frame.encode()).await.expect("send");
     client.flush().await.expect("flush");
 
     let resp = read_one_frame(&mut client).await.expect("read response");
     assert_eq!(
-        resp.header.opcode,
-        Opcode::Pong.as_u8(),
+        resp.header.opcode_u16(),
+        Opcode::Pong.as_u16(),
         "PING should return PONG, not ERROR"
     );
 
@@ -168,7 +168,7 @@ async fn bad_magic_closes_connection() {
         let (frame, _) =
             Frame::decode_with_max(&buf[..n], brain_protocol::MAX_PAYLOAD_BYTES as u32)
                 .expect("response decodes");
-        assert_eq!(frame.header.opcode, Opcode::Error.as_u8());
+        assert_eq!(frame.header.opcode_u16(), Opcode::Error.as_u16());
     }
     let n2 = client.read(&mut buf).await.expect("read EOF");
     assert_eq!(n2, 0, "expected EOF after bad-magic close");
@@ -252,7 +252,7 @@ async fn tls_round_trip_smoke() {
     let mut tls_stream = connector.connect(dns, tcp).await.expect("tls handshake");
 
     // Send a valid PING — same shape as the plain-text test.
-    let frame = Frame::new(Opcode::Ping.as_u8(), 0, 0, Vec::new());
+    let frame = Frame::new(Opcode::Ping.as_u16(), 0, 0, Vec::new());
     tls_stream
         .write_all(&frame.encode())
         .await
@@ -262,7 +262,7 @@ async fn tls_round_trip_smoke() {
     let resp = read_one_frame(&mut tls_stream)
         .await
         .expect("read response over TLS");
-    assert_eq!(resp.header.opcode, Opcode::Error.as_u8());
+    assert_eq!(resp.header.opcode_u16(), Opcode::Error.as_u16());
 
     server.stop().await;
 }

@@ -29,7 +29,7 @@ fn mock_result(idx: u32, kind: MemoryKindWire) -> MemoryResult {
 async fn recall_collects_multi_frame_stream() {
     let (addr, _server) = common::spawn_mock_server(|mut socket| async move {
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode, Opcode::RecallReq.as_u8());
+        assert_eq!(frame.header.opcode_u16(), Opcode::RecallReq.as_u16());
         let body = RequestBody::decode(Opcode::RecallReq, &frame.payload).expect("decode");
         let req = match body {
             RequestBody::Recall(r) => r,
@@ -51,7 +51,7 @@ async fn recall_collects_multi_frame_stream() {
         };
         common::write_frame(
             &mut socket,
-            Opcode::RecallResp.as_u8(),
+            Opcode::RecallResp.as_u16(),
             sid,
             ResponseBody::Recall(r1).encode(),
             false,
@@ -66,7 +66,7 @@ async fn recall_collects_multi_frame_stream() {
         };
         common::write_frame(
             &mut socket,
-            Opcode::RecallResp.as_u8(),
+            Opcode::RecallResp.as_u16(),
             sid,
             ResponseBody::Recall(r2).encode(),
             true,

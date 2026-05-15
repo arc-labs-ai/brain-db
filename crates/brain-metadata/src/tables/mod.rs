@@ -9,6 +9,7 @@ pub mod checkpoint;
 pub mod context;
 pub mod edge;
 pub mod idempotency;
+pub mod knowledge;
 pub mod memory;
 pub mod model_fingerprint;
 pub mod next_lsn;

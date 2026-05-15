@@ -83,7 +83,7 @@ impl<'a> LinkBuilder<'a> {
                     let mut guard = client.acquire().await?;
                     let stream_id = guard.next_stream_id();
                     let frame =
-                        Frame::new(Opcode::LinkReq.as_u8(), FLAG_EOS, stream_id, body.encode());
+                        Frame::new(Opcode::LinkReq.as_u16(), FLAG_EOS, stream_id, body.encode());
                     let resp = send_and_read_one(&mut guard, frame, Opcode::LinkResp).await?;
                     match ResponseBody::decode(Opcode::LinkResp, &resp.payload)? {
                         ResponseBody::Link(r) => Ok(r),

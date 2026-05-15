@@ -20,7 +20,7 @@ async fn metrics_snapshot_records_request_and_op_breakdown() {
         };
         common::write_frame(
             &mut socket,
-            Opcode::EncodeResp.as_u8(),
+            Opcode::EncodeResp.as_u16(),
             frame.header.stream_id_u32(),
             ResponseBody::Encode(resp).encode(),
             true,

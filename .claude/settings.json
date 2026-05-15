@@ -94,10 +94,7 @@
       "Bash(apt-get:*)",
       "Bash(dpkg:*)",
       "Bash(npm publish:*)",
-      "Bash(pip install:*)",
-      "Edit(spec/**)",
-      "Write(spec/**)",
-      "MultiEdit(spec/**)"
+      "Bash(pip install:*)"
     ]
   },
   "hooks": {

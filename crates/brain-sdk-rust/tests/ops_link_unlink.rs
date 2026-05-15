@@ -15,7 +15,7 @@ async fn link_round_trip() {
     let tgt = MemoryId::pack(0, 2, 1);
     let (addr, _server) = common::spawn_mock_server(move |mut socket| async move {
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode, Opcode::LinkReq.as_u8());
+        assert_eq!(frame.header.opcode_u16(), Opcode::LinkReq.as_u16());
         let body = RequestBody::decode(Opcode::LinkReq, &frame.payload).expect("decode");
         let req = match body {
             RequestBody::Link(r) => r,
@@ -35,7 +35,7 @@ async fn link_round_trip() {
         };
         common::write_frame(
             &mut socket,
-            Opcode::LinkResp.as_u8(),
+            Opcode::LinkResp.as_u16(),
             frame.header.stream_id_u32(),
             ResponseBody::Link(resp).encode(),
             true,
@@ -62,7 +62,7 @@ async fn unlink_round_trip() {
     let tgt = MemoryId::pack(0, 4, 1);
     let (addr, _server) = common::spawn_mock_server(move |mut socket| async move {
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode, Opcode::UnlinkReq.as_u8());
+        assert_eq!(frame.header.opcode_u16(), Opcode::UnlinkReq.as_u16());
         let body = RequestBody::decode(Opcode::UnlinkReq, &frame.payload).expect("decode");
         let req = match body {
             RequestBody::Unlink(r) => r,
@@ -79,7 +79,7 @@ async fn unlink_round_trip() {
         };
         common::write_frame(
             &mut socket,
-            Opcode::UnlinkResp.as_u8(),
+            Opcode::UnlinkResp.as_u16(),
             frame.header.stream_id_u32(),
             ResponseBody::Unlink(resp).encode(),
             true,

@@ -18,7 +18,7 @@ use crate::pool::Connection;
 use crate::proto::frames::{read_one_frame, write_frame};
 
 /// Spec §03/03 §4 last-frame-of-stream flag.
-pub const FLAG_EOS: u16 = 1 << 15;
+pub const FLAG_EOS: u8 = 1 << 7;
 
 /// Send one request frame and read one response frame. The
 /// caller decodes the body. Maps `ERROR` opcode automatically.
@@ -29,14 +29,14 @@ pub async fn send_and_read_one(
 ) -> Result<Frame, ClientError> {
     write_frame(conn.stream_mut(), &request).await?;
     let resp = read_one_frame(conn.stream_mut()).await?;
-    if resp.header.opcode == Opcode::Error.as_u8() {
+    if resp.header.opcode_u16() == Opcode::Error.as_u16() {
         return Err(map_error_frame(&resp.payload));
     }
-    if resp.header.opcode != expected.as_u8() {
+    if resp.header.opcode_u16() != expected.as_u16() {
         return Err(ClientError::Protocol(ProtocolError::BadFrame(format!(
             "expected opcode 0x{:02x}, got 0x{:02x}",
-            expected.as_u8(),
-            resp.header.opcode
+            expected.as_u16(),
+            resp.header.opcode_u16()
         ))));
     }
     Ok(resp)
@@ -59,18 +59,17 @@ pub async fn send_and_collect_until_eos(
     let mut frames = Vec::with_capacity(8);
     loop {
         let resp = read_one_frame(conn.stream_mut()).await?;
-        if resp.header.opcode == Opcode::Error.as_u8() {
+        if resp.header.opcode_u16() == Opcode::Error.as_u16() {
             return Err(map_error_frame(&resp.payload));
         }
-        if resp.header.opcode != expected.as_u8() {
+        if resp.header.opcode_u16() != expected.as_u16() {
             return Err(ClientError::Protocol(ProtocolError::BadFrame(format!(
                 "expected opcode 0x{:02x}, got 0x{:02x}",
-                expected.as_u8(),
-                resp.header.opcode
+                expected.as_u16(),
+                resp.header.opcode_u16()
             ))));
         }
-        let flags = u16::from_be_bytes(resp.header.flags);
-        let is_final = flags & FLAG_EOS != 0;
+        let is_final = resp.header.flags_u8() & FLAG_EOS != 0;
         frames.push(resp);
         if is_final {
             break;

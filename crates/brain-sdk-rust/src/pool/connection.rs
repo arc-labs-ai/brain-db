@@ -22,7 +22,7 @@ use crate::proto::frames::{read_one_frame, write_frame};
 use crate::proto::handshake::{complete_handshake, ClientIdentity, NegotiatedSession};
 
 /// Spec §03/03 §4 — last-frame-of-stream flag.
-const FLAG_EOS: u16 = 1 << 15;
+const FLAG_EOS: u8 = 1 << 7;
 
 /// One TCP connection that has completed the handshake.
 ///
@@ -100,7 +100,7 @@ impl Connection {
             reason: Some("brain-sdk-rust connection close".into()),
         };
         let frame = Frame::new(
-            Opcode::Bye.as_u8(),
+            Opcode::Bye.as_u16(),
             FLAG_EOS,
             // Spec §03/08 §1: BYE travels on the control stream.
             0,
@@ -108,11 +108,11 @@ impl Connection {
         );
         write_frame(&mut self.stream, &frame).await?;
         match read_one_frame(&mut self.stream).await {
-            Ok(resp) if resp.header.opcode == Opcode::Bye.as_u8() => Ok(()),
+            Ok(resp) if resp.header.opcode_u16() == Opcode::Bye.as_u16() => Ok(()),
             Ok(other) => Err(ClientError::Protocol(
                 brain_protocol::error::ProtocolError::BadFrame(format!(
                     "expected BYE echo, got opcode 0x{:02x}",
-                    other.header.opcode
+                    other.header.opcode_u16()
                 )),
             )),
             Err(ClientError::Closed) => Ok(()),

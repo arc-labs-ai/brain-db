@@ -7,6 +7,22 @@
 //! native integers so the struct is trivially `bytemuck::Pod` and matches
 //! the on-wire layout byte-for-byte without endian conversion at cast
 //! boundaries.
+//!
+//! ## Phase 16.6a — u16 opcode
+//!
+//! The opcode field is `u16` (bytes 5-6, big-endian). The high byte is a
+//! **namespace**:
+//! - `0x00xx` — substrate (cognitive primitives + connection mgmt + admin),
+//!   spec §03/05.
+//! - `0x01xx` — knowledge layer (entities / statements / relations /
+//!   queries / schema), spec §28/00.
+//! - `0x02xx`–`0xFFxx` — reserved.
+//!
+//! Within a namespace the low byte's high bit selects direction (request
+//! vs response), matching the substrate's existing `0x2N → 0xAN`
+//! convention. Flags shrank from `u16` to `u8` — only three bits were ever
+//! used (EOS / MPL / CMP) and the rest stayed reserved. The freed byte
+//! holds the opcode's high byte.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -29,10 +45,11 @@ pub struct Header {
     pub magic: [u8; 4],
     /// Byte 4: protocol version.
     pub version: u8,
-    /// Byte 5: opcode (see spec §03/05).
-    pub opcode: u8,
-    /// Bytes 6–7: big-endian `u16` flags.
-    pub flags: [u8; 2],
+    /// Bytes 5–6: big-endian `u16` opcode (spec §03/05).
+    pub opcode: [u8; 2],
+    /// Byte 7: flags. Three bits are defined (EOS=0x80, MPL=0x40,
+    /// CMP=0x20); the remaining five are reserved and MUST be zero.
+    pub flags: u8,
     /// Bytes 8–11: big-endian CRC32C of the rest of the header
     /// (this field is treated as zero during computation).
     pub header_crc32c: [u8; 4],
@@ -54,6 +71,21 @@ const _: () = {
     assert!(core::mem::align_of::<Header>() == 1);
 };
 
+/// Bits in [`Header::flags`] that MUST be zero per spec §03/03 §2.
+///
+/// Defined flag bits (after the u16→u8 shrink, see module doc):
+/// - `0x80` — `EOS` (end of stream)
+/// - `0x40` — `MPL` (multi-payload)
+/// - `0x20` — `CMP` (compressed; reserved, not used in v1)
+///
+/// Bits `0x1F` (the low five) are reserved and rejected by [`Header::validate`].
+pub const FLAGS_RESERVED_MASK: u8 = 0b0001_1111;
+
+/// Bits in [`Header::flags`] that are allowed to be set (the complement of
+/// [`FLAGS_RESERVED_MASK`]). Convenience constant for callers that want to
+/// validate flags before constructing a header.
+pub const FLAGS_VALID_MASK: u8 = !FLAGS_RESERVED_MASK;
+
 impl PartialEq for Header {
     fn eq(&self, other: &Self) -> bool {
         let a: &[u8; 32] = bytemuck::cast_ref(self);
@@ -73,7 +105,7 @@ impl Header {
     /// Panics if `payload_len` exceeds [`MAX_PAYLOAD_BYTES`]. The 24-bit field
     /// physically cannot represent more; callers must split via multi-payload
     /// framing (spec §03/03 §6).
-    pub fn new(opcode: u8, flags: u16, stream_id: u32, payload_len: u32) -> Self {
+    pub fn new(opcode: u16, flags: u8, stream_id: u32, payload_len: u32) -> Self {
         assert!(
             (payload_len as usize) <= MAX_PAYLOAD_BYTES,
             "payload_len {payload_len} exceeds 24-bit max"
@@ -82,8 +114,8 @@ impl Header {
         let mut h = Self {
             magic: MAGIC,
             version: VERSION,
-            opcode,
-            flags: flags.to_be_bytes(),
+            opcode: opcode.to_be_bytes(),
+            flags,
             header_crc32c: [0; 4],
             stream_id: stream_id.to_be_bytes(),
             payload_len: [len_be[1], len_be[2], len_be[3]],
@@ -119,6 +151,9 @@ impl Header {
         if self.reserved_a != 0 || self.reserved_b != [0u8; 8] {
             return Err(ProtocolError::ReservedFieldNonZero);
         }
+        if self.flags & FLAGS_RESERVED_MASK != 0 {
+            return Err(ProtocolError::ReservedFieldNonZero);
+        }
         let len = self.payload_len_u32();
         if (len as usize) > MAX_PAYLOAD_BYTES {
             return Err(ProtocolError::OversizePayload {
@@ -147,11 +182,18 @@ impl Header {
         u32::from_be_bytes(self.stream_id)
     }
 
-    /// Decoded flags.
+    /// Decoded opcode (u16 big-endian on the wire).
     #[inline]
     #[must_use]
-    pub fn flags_u16(&self) -> u16 {
-        u16::from_be_bytes(self.flags)
+    pub fn opcode_u16(&self) -> u16 {
+        u16::from_be_bytes(self.opcode)
+    }
+
+    /// Decoded flags (u8 on the wire).
+    #[inline]
+    #[must_use]
+    pub fn flags_u8(&self) -> u8 {
+        self.flags
     }
 }
 
@@ -186,38 +228,57 @@ mod tests {
 
     #[test]
     fn new_then_validate_passes() {
-        let h = Header::new(0x10, 0x0000, 0, 0);
+        let h = Header::new(0x0010, 0, 0, 0);
         h.validate().expect("freshly built header validates");
     }
 
     #[test]
     fn payload_length_round_trips() {
-        let h = Header::new(0x21, 0x0000, 7, 12_345);
+        let h = Header::new(0x0021, 0, 7, 12_345);
         assert_eq!(h.payload_len_u32(), 12_345);
         assert_eq!(h.stream_id_u32(), 7);
+        assert_eq!(h.opcode_u16(), 0x0021);
         h.validate().unwrap();
     }
 
     #[test]
     fn payload_length_at_24bit_max_round_trips() {
         let max = MAX_PAYLOAD_BYTES as u32;
-        let h = Header::new(0x01, 0, 1, max);
+        let h = Header::new(0x0001, 0, 1, max);
         assert_eq!(h.payload_len_u32(), max);
         h.validate().unwrap();
     }
 
     #[test]
+    fn opcode_u16_round_trips_both_namespaces() {
+        // Substrate: ENCODE_REQ.
+        let h = Header::new(0x0020, 0, 1, 0);
+        assert_eq!(h.opcode_u16(), 0x0020);
+        // Knowledge: ENTITY_CREATE (spec §28).
+        let h = Header::new(0x0130, 0, 1, 0);
+        assert_eq!(h.opcode_u16(), 0x0130);
+        h.validate().unwrap();
+    }
+
+    #[test]
+    fn flags_byte_round_trips() {
+        // EOS (0x80) is the only bit set in most final frames.
+        let h = Header::new(0x00A1, 0x80, 7, 0);
+        assert_eq!(h.flags_u8(), 0x80);
+        h.validate().unwrap();
+    }
+
+    #[test]
     fn validate_rejects_bad_magic() {
-        let mut h = Header::new(0x10, 0, 0, 0);
+        let mut h = Header::new(0x0010, 0, 0, 0);
         h.magic = *b"XXXX";
         assert!(matches!(h.validate(), Err(ProtocolError::BadMagic)));
     }
 
     #[test]
     fn validate_rejects_bad_version() {
-        let mut h = Header::new(0x10, 0, 0, 0);
+        let mut h = Header::new(0x0010, 0, 0, 0);
         h.version = 99;
-        // Recompute CRC so the version check fires before the CRC check.
         h.header_crc32c = compute_header_crc(&h).to_be_bytes();
         assert!(matches!(
             h.validate(),
@@ -230,14 +291,14 @@ mod tests {
 
     #[test]
     fn validate_rejects_corrupted_crc() {
-        let mut h = Header::new(0x10, 0, 0, 0);
+        let mut h = Header::new(0x0010, 0, 0, 0);
         h.header_crc32c[0] ^= 0xFF;
         assert!(matches!(h.validate(), Err(ProtocolError::BadHeaderCrc)));
     }
 
     #[test]
     fn validate_rejects_nonzero_reserved_a() {
-        let mut h = Header::new(0x10, 0, 0, 0);
+        let mut h = Header::new(0x0010, 0, 0, 0);
         h.reserved_a = 1;
         h.header_crc32c = compute_header_crc(&h).to_be_bytes();
         assert!(matches!(
@@ -248,7 +309,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_nonzero_reserved_b() {
-        let mut h = Header::new(0x10, 0, 0, 0);
+        let mut h = Header::new(0x0010, 0, 0, 0);
         h.reserved_b[3] = 0xAB;
         h.header_crc32c = compute_header_crc(&h).to_be_bytes();
         assert!(matches!(
@@ -258,13 +319,44 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_reserved_flag_bits() {
+        // The low five bits (0x1F) are reserved in the u8 flags layout.
+        let mut h = Header::new(0x0010, 0b0000_0001, 0, 0);
+        h.header_crc32c = compute_header_crc(&h).to_be_bytes();
+        assert!(matches!(
+            h.validate(),
+            Err(ProtocolError::ReservedFieldNonZero)
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_defined_flag_bits() {
+        // EOS (0x80), MPL (0x40), CMP (0x20) are valid; the all-defined
+        // combination 0xE0 must validate.
+        let h = Header::new(0x0010, 0xE0, 0, 0);
+        h.validate().expect("defined flag combination accepted");
+    }
+
+    #[test]
     fn pod_roundtrip_via_byte_cast() {
-        let h = Header::new(0xA1, 0x8000, 7, 64);
+        let h = Header::new(0x00A1, 0x80, 7, 64);
         let bytes: [u8; 32] = bytemuck::cast(h);
         let h2: Header = bytemuck::cast(bytes);
         h2.validate().unwrap();
-        assert_eq!(h2.flags_u16(), 0x8000);
+        assert_eq!(h2.flags_u8(), 0x80);
         assert_eq!(h2.stream_id_u32(), 7);
         assert_eq!(h2.payload_len_u32(), 64);
+        assert_eq!(h2.opcode_u16(), 0x00A1);
+    }
+
+    #[test]
+    fn on_wire_byte_layout_matches_spec() {
+        // Spec §03/03 §1: bytes 5-6 = opcode (BE u16), byte 7 = flags (u8).
+        let h = Header::new(0x0130, 0x80, 0, 0);
+        let bytes: [u8; 32] = bytemuck::cast(h);
+        assert_eq!(bytes[4], 1, "version");
+        assert_eq!(bytes[5], 0x01, "opcode high byte (knowledge namespace)");
+        assert_eq!(bytes[6], 0x30, "opcode low byte (ENTITY_CREATE)");
+        assert_eq!(bytes[7], 0x80, "flags = EOS");
     }
 }

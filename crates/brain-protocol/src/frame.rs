@@ -33,7 +33,7 @@ impl Frame {
     /// Panics if `payload.len()` exceeds [`MAX_PAYLOAD_BYTES`]. Callers must
     /// split into multi-payload frames (spec §03/03 §6) before that point.
     #[must_use]
-    pub fn new(opcode: u8, flags: u16, stream_id: u32, payload: Vec<u8>) -> Self {
+    pub fn new(opcode: u16, flags: u8, stream_id: u32, payload: Vec<u8>) -> Self {
         assert!(
             payload.len() <= MAX_PAYLOAD_BYTES,
             "payload length {} exceeds 24-bit max",
@@ -136,7 +136,7 @@ mod tests {
     use crate::MAGIC;
 
     fn sample_frame() -> Frame {
-        Frame::new(0x21, 0x0000, 7, b"hello brain".to_vec())
+        Frame::new(0x0021, 0, 7, b"hello brain".to_vec())
     }
 
     #[test]
@@ -148,7 +148,7 @@ mod tests {
         let (decoded, rest) = Frame::decode(&bytes).expect("decode round-trip");
         assert!(rest.is_empty(), "decoder consumed exactly one frame");
         assert_eq!(decoded.payload, original.payload);
-        assert_eq!(decoded.header.opcode, original.header.opcode);
+        assert_eq!(decoded.header.opcode_u16(), original.header.opcode_u16());
         assert_eq!(decoded.header.stream_id_u32(), 7);
         assert_eq!(
             decoded.header.payload_len_u32() as usize,
@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn encode_then_decode_empty_payload() {
-        let frame = Frame::new(0x10, 0x0000, 0, Vec::new());
+        let frame = Frame::new(0x0010, 0, 0, Vec::new());
         let bytes = frame.encode();
         assert_eq!(bytes.len(), HEADER_SIZE);
         let (decoded, rest) = Frame::decode(&bytes).expect("decode empty");
@@ -252,7 +252,7 @@ mod tests {
         // A 100-byte payload is fine for the spec max but exceeds a smaller
         // negotiated limit of 50 bytes — decode_with_max rejects it before
         // touching the buffer.
-        let big = Frame::new(0x21, 0, 1, vec![0xAB; 100]);
+        let big = Frame::new(0x0021, 0, 1, vec![0xAB; 100]);
         let bytes = big.encode();
         let result = Frame::decode_with_max(&bytes, 50);
         assert!(matches!(
@@ -280,8 +280,11 @@ mod tests {
         /// reasonable (spec hard cap is 16 MiB - 1).
         #[test]
         fn encode_decode_round_trip(
-            opcode in any::<u8>(),
-            flags in any::<u16>(),
+            opcode in any::<u16>(),
+            // Reserved bits MUST be zero; restrict to the defined-flags mask.
+            flags in prop::sample::select(vec![
+                0u8, 0x80, 0x40, 0x20, 0xC0, 0xA0, 0x60, 0xE0,
+            ]),
             stream_id in any::<u32>(),
             payload in vec(any::<u8>(), 0..=8192usize),
         ) {
@@ -290,8 +293,8 @@ mod tests {
             let (decoded, rest) = Frame::decode(&bytes)
                 .expect("Frame::new+encode must always produce a decodable frame");
             prop_assert!(rest.is_empty());
-            prop_assert_eq!(decoded.header.opcode, opcode);
-            prop_assert_eq!(decoded.header.flags_u16(), flags);
+            prop_assert_eq!(decoded.header.opcode_u16(), opcode);
+            prop_assert_eq!(decoded.header.flags_u8(), flags);
             prop_assert_eq!(decoded.header.stream_id_u32(), stream_id);
             prop_assert_eq!(decoded.header.payload_len_u32() as usize, payload.len());
             prop_assert_eq!(decoded.payload, payload);

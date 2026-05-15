@@ -636,6 +636,7 @@ async fn lagged_subscriber_freezes_final_lsn_and_reports_overloaded() {
             salience: 0.5,
             timestamp_unix_nanos: 0,
             text: None,
+            knowledge_payload: None,
         });
     }
 

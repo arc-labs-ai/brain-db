@@ -248,6 +248,63 @@ Tests run in CI:
 
 This staged approach catches issues early without blocking development.
 
+## 21. Entity layer acceptance (phase 16)
+
+Phase-16 exit gate covers the knowledge layer's entity slice (statements, relations, queries arrive in later phases with their own acceptance entries).
+
+### 21.1 Unit tests
+
+```bash
+cargo test -p brain-core knowledge
+cargo test -p brain-metadata --lib
+cargo test -p brain-protocol --lib
+cargo test -p brain-sdk-rust --lib
+```
+
+Must include:
+
+- Resolver tier 1 (exact / alias), tier 2 (trigram fuzzy), tier 5 (created) outcome cases — phase 16.5.
+- Resolver adversarial-input cases (Unicode multi-byte, empty / whitespace-only candidates, very-long candidates, pathological trigram inputs like `"aaaaa..."`) — phase 16.9.
+- `MergeRecord` v2 round-trip (rkyv archive + commit/read) — phase 16.7.1.
+- `entity_merge_ops::merge_entity` + `unmerge_entity` pre-conditions and happy paths — phase 16.7.2.
+- `Person` attribute encode / decode round-trip — phase 16.8.1.
+- `ClientErrorEntityExt::entity_error` categorisation — phase 16.8.4.
+
+### 21.2 Integration tests
+
+```bash
+cargo test -p brain-server --test knowledge_entity_wire
+cargo test -p brain-server --test knowledge_entity_merge_wire
+cargo test -p brain-server --test knowledge_entities_phase_exit
+cargo test -p brain-server --test knowledge_compat
+cargo test -p brain-sdk-rust --test knowledge_entity
+```
+
+Required to pass:
+
+- Full lifecycle: create → get → update → rename → merge → unmerge → rename → list → tombstone (`knowledge_entities_phase_exit.rs`, 16.9.3).
+- All 9 wire opcodes end-to-end (`knowledge_entity_wire.rs` + `knowledge_entity_merge_wire.rs`).
+- SDK mock-server round-trips for every builder (`knowledge_entity.rs`).
+- Substrate-only mode regression (`knowledge_compat.rs`, 15.5) — knowledge tables stay empty when no schema is declared.
+
+### 21.3 Performance benches
+
+```bash
+cargo bench -p brain-metadata --bench entity_resolve
+```
+
+Targets per [§02 §2.2](02_latency_targets.md) at 100K entities:
+
+- `tier1_exact_lookup`: p50 ≤ 1 ms, p99 ≤ 2 ms.
+- `tier1_alias_lookup`: p50 ≤ 1 ms, p99 ≤ 2 ms.
+- `tier2_full_resolve`: p50 ≤ 5 ms, p99 ≤ 30 ms.
+
+Bench is **manual** in phase 16 (operator-run). CI integration with regression thresholds lands in phase 14.
+
+### 21.4 Cross-acceptance
+
+Verify that the substrate's existing acceptance suite (substrate phase 14) still passes after the knowledge layer was added — `cargo test --workspace` and the §2-§19 checks remain green.
+
 ---
 
 *Continue to [`09_open_questions.md`](09_open_questions.md) for unresolved questions.*

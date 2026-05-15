@@ -64,7 +64,7 @@ use tracing::{debug, warn};
 use crate::shard::ShardHandle;
 
 const SUBSCRIPTION_BROADCAST_CAPACITY: usize = 1024;
-const FLAG_EOS: u16 = 1 << 15;
+const FLAG_EOS: u8 = 1 << 7;
 
 // ---------------------------------------------------------------------------
 // ShardEventHub
@@ -276,7 +276,7 @@ impl OpError {
             details: None,
             retry_after_ms: None,
         });
-        Frame::new(Opcode::Error.as_u8(), FLAG_EOS, stream_id, body.encode())
+        Frame::new(Opcode::Error.as_u16(), FLAG_EOS, stream_id, body.encode())
     }
 }
 
@@ -356,7 +356,7 @@ fn build_subscription_event_frame(stream_id: u32, env: &EventEnvelope) -> Frame 
     let payload = ResponseBody::SubscribeEvent(env.to_wire()).encode();
     // Intermediate frames in an open-ended subscription don't carry
     // EOS — spec §03/09 §3.3.
-    Frame::new(Opcode::SubscribeEvent.as_u8(), 0, stream_id, payload)
+    Frame::new(Opcode::SubscribeEvent.as_u16(), 0, stream_id, payload)
 }
 
 fn empty_subscription_event_frame(stream_id: u32, last_lsn: u64) -> Frame {
@@ -371,9 +371,10 @@ fn empty_subscription_event_frame(stream_id: u32, last_lsn: u64) -> Frame {
         salience: 0.0,
         timestamp_unix_nanos: 0,
         lsn: last_lsn,
+        knowledge_payload: None,
     })
     .encode();
-    Frame::new(Opcode::SubscribeEvent.as_u8(), FLAG_EOS, stream_id, payload)
+    Frame::new(Opcode::SubscribeEvent.as_u16(), FLAG_EOS, stream_id, payload)
 }
 
 fn error_frame(stream_id: u32, code: ErrorCode, message: &str) -> Frame {
@@ -384,7 +385,7 @@ fn error_frame(stream_id: u32, code: ErrorCode, message: &str) -> Frame {
         details: None,
         retry_after_ms: None,
     });
-    Frame::new(Opcode::Error.as_u8(), FLAG_EOS, stream_id, body.encode())
+    Frame::new(Opcode::Error.as_u16(), FLAG_EOS, stream_id, body.encode())
 }
 
 // ---------------------------------------------------------------------------
@@ -401,7 +402,7 @@ pub fn build_unsubscribe_response_frame(
         final_lsn,
     });
     Frame::new(
-        Opcode::UnsubscribeResp.as_u8(),
+        Opcode::UnsubscribeResp.as_u16(),
         FLAG_EOS,
         request_stream_id,
         body.encode(),
@@ -418,7 +419,7 @@ pub fn build_cancel_stream_ack_frame(
         cancelled_at_unix_nanos: now_unix_nanos,
     });
     Frame::new(
-        Opcode::CancelStreamAck.as_u8(),
+        Opcode::CancelStreamAck.as_u16(),
         FLAG_EOS,
         request_stream_id,
         body.encode(),

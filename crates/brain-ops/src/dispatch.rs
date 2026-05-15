@@ -110,5 +110,44 @@ pub async fn dispatch(req: RequestBody, ctx: &OpsContext) -> Result<ResponseBody
         | RequestBody::AdminListTombstoned(_) => {
             Err(OpError::NotYetImplemented("admin op — Phase 8 / 9"))
         }
+
+        // -----------------------------------------------------------
+        // Knowledge layer — Phase 16+ (spec §28/00).
+        // -----------------------------------------------------------
+        RequestBody::EntityCreate(r) => crate::knowledge_entity::handle_entity_create(r, ctx)
+            .await
+            .map(ResponseBody::EntityCreate),
+
+        RequestBody::EntityGet(r) => crate::knowledge_entity::handle_entity_get(r, ctx)
+            .await
+            .map(ResponseBody::EntityGet),
+
+        RequestBody::EntityUpdate(r) => crate::knowledge_entity::handle_entity_update(r, ctx)
+            .await
+            .map(ResponseBody::EntityUpdate),
+
+        RequestBody::EntityRename(r) => crate::knowledge_entity::handle_entity_rename(r, ctx)
+            .await
+            .map(ResponseBody::EntityRename),
+
+        RequestBody::EntityMerge(r) => crate::knowledge_entity::handle_entity_merge(r, ctx)
+            .await
+            .map(ResponseBody::EntityMerge),
+
+        RequestBody::EntityUnmerge(r) => crate::knowledge_entity::handle_entity_unmerge(r, ctx)
+            .await
+            .map(ResponseBody::EntityUnmerge),
+
+        RequestBody::EntityResolve(r) => crate::knowledge_entity::handle_entity_resolve(r, ctx)
+            .await
+            .map(ResponseBody::EntityResolve),
+
+        RequestBody::EntityList(r) => crate::knowledge_entity::handle_entity_list(r, ctx)
+            .await
+            .map(ResponseBody::EntityList),
+
+        RequestBody::EntityTombstone(r) => crate::knowledge_entity::handle_entity_tombstone(r, ctx)
+            .await
+            .map(ResponseBody::EntityTombstone),
     }
 }

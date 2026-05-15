@@ -19,7 +19,7 @@ use super::frames::{read_one_frame, write_frame};
 
 /// Spec §03/03 §4 — last-frame-of-stream flag. The handshake
 /// frames all carry `flags = FLAG_EOS` per spec §03/06 §2.
-const FLAG_EOS: u16 = 1 << 15;
+const FLAG_EOS: u8 = 1 << 7;
 /// Spec §03/06 §2: handshake frames travel on the control stream
 /// (stream id 0).
 const HANDSHAKE_STREAM: u32 = 0;
@@ -84,7 +84,7 @@ where
         client_session_token: None,
     };
     let frame = Frame::new(
-        Opcode::Hello.as_u8(),
+        Opcode::Hello.as_u16(),
         FLAG_EOS,
         HANDSHAKE_STREAM,
         RequestBody::Hello(hello).encode(),
@@ -93,11 +93,11 @@ where
 
     // ---- WELCOME -------------------------------------------------
     let welcome_frame = read_one_frame(stream).await?;
-    if welcome_frame.header.opcode != Opcode::Welcome.as_u8() {
+    if welcome_frame.header.opcode_u16() != Opcode::Welcome.as_u16() {
         return Err(ClientError::Handshake(format!(
             "expected WELCOME (0x{:02x}), got opcode 0x{:02x}",
-            Opcode::Welcome.as_u8(),
-            welcome_frame.header.opcode
+            Opcode::Welcome.as_u16(),
+            welcome_frame.header.opcode_u16()
         )));
     }
     let welcome_body = ResponseBody::decode(Opcode::Welcome, &welcome_frame.payload)?;
@@ -128,7 +128,7 @@ where
         credentials,
     };
     let frame = Frame::new(
-        Opcode::Auth.as_u8(),
+        Opcode::Auth.as_u16(),
         FLAG_EOS,
         HANDSHAKE_STREAM,
         RequestBody::Auth(auth_payload).encode(),
@@ -137,7 +137,7 @@ where
 
     // ---- AUTH_OK / ERROR -----------------------------------------
     let auth_ok_frame = read_one_frame(stream).await?;
-    if auth_ok_frame.header.opcode == Opcode::Error.as_u8() {
+    if auth_ok_frame.header.opcode_u16() == Opcode::Error.as_u16() {
         // Best-effort decode of the ERROR payload for the message.
         let err_body = ResponseBody::decode(Opcode::Error, &auth_ok_frame.payload);
         let msg = match err_body {
@@ -146,11 +146,11 @@ where
         };
         return Err(ClientError::Auth(msg));
     }
-    if auth_ok_frame.header.opcode != Opcode::AuthOk.as_u8() {
+    if auth_ok_frame.header.opcode_u16() != Opcode::AuthOk.as_u16() {
         return Err(ClientError::Handshake(format!(
             "expected AUTH_OK (0x{:02x}), got opcode 0x{:02x}",
-            Opcode::AuthOk.as_u8(),
-            auth_ok_frame.header.opcode
+            Opcode::AuthOk.as_u16(),
+            auth_ok_frame.header.opcode_u16()
         )));
     }
     let auth_ok_body = ResponseBody::decode(Opcode::AuthOk, &auth_ok_frame.payload)?;

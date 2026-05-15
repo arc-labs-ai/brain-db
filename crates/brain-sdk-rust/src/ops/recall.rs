@@ -152,7 +152,7 @@ impl<'a> RecallBuilder<'a> {
                     let mut guard = client.acquire().await?;
                     let stream_id = guard.next_stream_id();
                     let frame = Frame::new(
-                        Opcode::RecallReq.as_u8(),
+                        Opcode::RecallReq.as_u16(),
                         FLAG_EOS,
                         stream_id,
                         body.encode(),
@@ -218,7 +218,7 @@ impl<'a> RecallBuilder<'a> {
         let mut guard = self.client.acquire().await?;
         let stream_id = guard.next_stream_id();
         let frame = Frame::new(
-            Opcode::RecallReq.as_u8(),
+            Opcode::RecallReq.as_u16(),
             FLAG_EOS,
             stream_id,
             body.encode(),

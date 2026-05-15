@@ -61,7 +61,7 @@ use shard::{spawn_shard, ShardHandle, ShardJoiner, ShardSpawnConfig};
 // Scaffold
 // ---------------------------------------------------------------------------
 
-const FLAG_EOS: u16 = 1 << 15;
+const FLAG_EOS: u8 = 1 << 7;
 
 struct Server {
     addr: SocketAddr,
@@ -187,7 +187,7 @@ async fn complete_handshake(
     send_frame(
         client,
         Frame::new(
-            Opcode::Hello.as_u8(),
+            Opcode::Hello.as_u16(),
             FLAG_EOS,
             0,
             RequestBody::Hello(hello).encode(),
@@ -195,7 +195,7 @@ async fn complete_handshake(
     )
     .await;
     let welcome_frame = read_one_frame(client).await.expect("read WELCOME");
-    assert_eq!(welcome_frame.header.opcode, Opcode::Welcome.as_u8());
+    assert_eq!(welcome_frame.header.opcode_u16(), Opcode::Welcome.as_u16());
     let welcome = match ResponseBody::decode(Opcode::Welcome, &welcome_frame.payload)
         .expect("decode welcome")
     {
@@ -211,7 +211,7 @@ async fn complete_handshake(
     send_frame(
         client,
         Frame::new(
-            Opcode::Auth.as_u8(),
+            Opcode::Auth.as_u16(),
             FLAG_EOS,
             0,
             RequestBody::Auth(auth).encode(),
@@ -219,7 +219,7 @@ async fn complete_handshake(
     )
     .await;
     let auth_ok_frame = read_one_frame(client).await.expect("read AUTH_OK");
-    assert_eq!(auth_ok_frame.header.opcode, Opcode::AuthOk.as_u8());
+    assert_eq!(auth_ok_frame.header.opcode_u16(), Opcode::AuthOk.as_u16());
     let auth_ok = match ResponseBody::decode(Opcode::AuthOk, &auth_ok_frame.payload)
         .expect("decode auth_ok")
     {
@@ -261,7 +261,7 @@ async fn hello_with_unsupported_version_errors_and_closes() {
     send_frame(
         &mut client,
         Frame::new(
-            Opcode::Hello.as_u8(),
+            Opcode::Hello.as_u16(),
             FLAG_EOS,
             0,
             RequestBody::Hello(hello).encode(),
@@ -269,7 +269,7 @@ async fn hello_with_unsupported_version_errors_and_closes() {
     )
     .await;
     let resp = read_one_frame(&mut client).await.expect("read response");
-    assert_eq!(resp.header.opcode, Opcode::Error.as_u8());
+    assert_eq!(resp.header.opcode_u16(), Opcode::Error.as_u16());
 
     // Connection should close.
     let mut buf = [0u8; 1];
@@ -298,7 +298,7 @@ async fn ops_before_auth_are_rejected() {
     send_frame(
         &mut client,
         Frame::new(
-            Opcode::Hello.as_u8(),
+            Opcode::Hello.as_u16(),
             FLAG_EOS,
             0,
             RequestBody::Hello(hello).encode(),
@@ -321,7 +321,7 @@ async fn ops_before_auth_are_rejected() {
     send_frame(
         &mut client,
         Frame::new(
-            Opcode::EncodeReq.as_u8(),
+            Opcode::EncodeReq.as_u16(),
             FLAG_EOS,
             1,
             RequestBody::Encode(encode).encode(),
@@ -329,7 +329,7 @@ async fn ops_before_auth_are_rejected() {
     )
     .await;
     let resp = read_one_frame(&mut client).await.expect("read error");
-    assert_eq!(resp.header.opcode, Opcode::Error.as_u8());
+    assert_eq!(resp.header.opcode_u16(), Opcode::Error.as_u16());
 
     server.stop().await;
 }
@@ -345,7 +345,7 @@ async fn ping_pong_with_timestamp() {
     send_frame(
         &mut client,
         Frame::new(
-            Opcode::Ping.as_u8(),
+            Opcode::Ping.as_u16(),
             FLAG_EOS,
             0,
             RequestBody::Ping(PingRequest {
@@ -356,7 +356,7 @@ async fn ping_pong_with_timestamp() {
     )
     .await;
     let resp = read_one_frame(&mut client).await.expect("read PONG");
-    assert_eq!(resp.header.opcode, Opcode::Pong.as_u8());
+    assert_eq!(resp.header.opcode_u16(), Opcode::Pong.as_u16());
     let pong = match ResponseBody::decode(Opcode::Pong, &resp.payload).expect("decode pong") {
         ResponseBody::Pong(p) => p,
         other => panic!("expected Pong, got {other:?}"),
@@ -381,7 +381,7 @@ async fn bye_echoes_and_closes() {
     send_frame(
         &mut client,
         Frame::new(
-            Opcode::Bye.as_u8(),
+            Opcode::Bye.as_u16(),
             FLAG_EOS,
             0,
             RequestBody::Bye(ByeRequest {
@@ -392,7 +392,7 @@ async fn bye_echoes_and_closes() {
     )
     .await;
     let resp = read_one_frame(&mut client).await.expect("read BYE");
-    assert_eq!(resp.header.opcode, Opcode::Bye.as_u8());
+    assert_eq!(resp.header.opcode_u16(), Opcode::Bye.as_u16());
 
     // Server closes after BYE.
     let mut buf = [0u8; 1];
@@ -410,16 +410,16 @@ async fn bad_opcode_errors_stream_not_connection() {
     complete_handshake(&mut client, agent_id).await;
 
     // Send a *response* opcode (client→server is disallowed) on stream 1.
-    let bogus = Frame::new(Opcode::EncodeResp.as_u8(), FLAG_EOS, 1, Vec::new());
+    let bogus = Frame::new(Opcode::EncodeResp.as_u16(), FLAG_EOS, 1, Vec::new());
     send_frame(&mut client, bogus).await;
     let resp = read_one_frame(&mut client).await.expect("read error");
-    assert_eq!(resp.header.opcode, Opcode::Error.as_u8());
+    assert_eq!(resp.header.opcode_u16(), Opcode::Error.as_u16());
 
     // Connection stays open — follow-up PING still works.
     send_frame(
         &mut client,
         Frame::new(
-            Opcode::Ping.as_u8(),
+            Opcode::Ping.as_u16(),
             FLAG_EOS,
             0,
             RequestBody::Ping(PingRequest {
@@ -430,7 +430,7 @@ async fn bad_opcode_errors_stream_not_connection() {
     )
     .await;
     let resp = read_one_frame(&mut client).await.expect("read PONG");
-    assert_eq!(resp.header.opcode, Opcode::Pong.as_u8());
+    assert_eq!(resp.header.opcode_u16(), Opcode::Pong.as_u16());
 
     server.stop().await;
 }
@@ -455,7 +455,7 @@ async fn encode_round_trips_through_shard() {
     send_frame(
         &mut client,
         Frame::new(
-            Opcode::EncodeReq.as_u8(),
+            Opcode::EncodeReq.as_u16(),
             FLAG_EOS,
             1,
             RequestBody::Encode(encode).encode(),
@@ -467,8 +467,8 @@ async fn encode_round_trips_through_shard() {
     // Either ENCODE_RESP with a memory_id or ERROR — depending on whether
     // the stub embedder + writer succeed end-to-end. Both validate the
     // boundary; assert one of the two.
-    let opcode = resp.header.opcode;
-    if opcode == Opcode::EncodeResp.as_u8() {
+    let opcode = resp.header.opcode_u16();
+    if opcode == Opcode::EncodeResp.as_u16() {
         let body =
             ResponseBody::decode(Opcode::EncodeResp, &resp.payload).expect("decode encode resp");
         let r: EncodeResponse = match body {
@@ -476,7 +476,7 @@ async fn encode_round_trips_through_shard() {
             other => panic!("expected EncodeResponse, got {other:?}"),
         };
         let _ = r; // memory_id may be NULL on the stub path; that's fine
-    } else if opcode == Opcode::Error.as_u8() {
+    } else if opcode == Opcode::Error.as_u16() {
         let body = ResponseBody::decode(Opcode::Error, &resp.payload).expect("decode error");
         let _err: ErrorResponse = match body {
             ResponseBody::Error(e) => e,
@@ -509,7 +509,7 @@ async fn forget_routes_by_memory_id() {
     send_frame(
         &mut client,
         Frame::new(
-            Opcode::ForgetReq.as_u8(),
+            Opcode::ForgetReq.as_u16(),
             FLAG_EOS,
             1,
             RequestBody::Forget(forget).encode(),
@@ -521,12 +521,12 @@ async fn forget_routes_by_memory_id() {
     // request reached *some* shard. The point of the test is to
     // exercise memory-id routing without timing out. The test fails if
     // the dispatcher panics or hangs.
-    let opcode = resp.header.opcode;
+    let opcode = resp.header.opcode_u16();
     assert!(
-        opcode == Opcode::ForgetResp.as_u8() || opcode == Opcode::Error.as_u8(),
+        opcode == Opcode::ForgetResp.as_u16() || opcode == Opcode::Error.as_u16(),
         "expected ForgetResp or Error, got 0x{opcode:02x}"
     );
-    if opcode == Opcode::ForgetResp.as_u8() {
+    if opcode == Opcode::ForgetResp.as_u16() {
         let _: ForgetResponse =
             match ResponseBody::decode(Opcode::ForgetResp, &resp.payload).unwrap() {
                 ResponseBody::Forget(r) => r,
@@ -563,7 +563,7 @@ async fn recall_returns_single_frame_eos_in_v1() {
     send_frame(
         &mut client,
         Frame::new(
-            Opcode::RecallReq.as_u8(),
+            Opcode::RecallReq.as_u16(),
             FLAG_EOS,
             1,
             RequestBody::Recall(recall).encode(),
@@ -571,15 +571,15 @@ async fn recall_returns_single_frame_eos_in_v1() {
     )
     .await;
     let resp = read_one_frame(&mut client).await.expect("read recall resp");
-    let opcode = resp.header.opcode;
+    let opcode = resp.header.opcode_u16();
     // 9.10 ships single-frame EOS responses for streaming ops. The
     // frame *header* has the EOS bit set regardless of body opcode.
     assert!(
-        opcode == Opcode::RecallResp.as_u8() || opcode == Opcode::Error.as_u8(),
+        opcode == Opcode::RecallResp.as_u16() || opcode == Opcode::Error.as_u16(),
         "expected RecallResp or Error, got 0x{opcode:02x}"
     );
     assert!(
-        resp.header.flags_u16() & FLAG_EOS != 0,
+        resp.header.flags_u8() & FLAG_EOS != 0,
         "response must carry EOS in v1"
     );
 
@@ -603,7 +603,7 @@ async fn server_ping_fires_after_idle_timeout() {
         .await
         .expect("server should send SERVER_PING within 3s")
         .expect("read SERVER_PING");
-    assert_eq!(resp.header.opcode, Opcode::ServerPing.as_u8());
+    assert_eq!(resp.header.opcode_u16(), Opcode::ServerPing.as_u16());
 
     server.stop().await;
 }

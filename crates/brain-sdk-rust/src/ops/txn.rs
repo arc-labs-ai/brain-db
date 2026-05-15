@@ -36,7 +36,7 @@ pub(crate) async fn txn_begin(
                 let mut guard = client.acquire().await?;
                 let stream_id = guard.next_stream_id();
                 let frame =
-                    Frame::new(Opcode::TxnBegin.as_u8(), FLAG_EOS, stream_id, body.encode());
+                    Frame::new(Opcode::TxnBegin.as_u16(), FLAG_EOS, stream_id, body.encode());
                 let resp = send_and_read_one(&mut guard, frame, Opcode::TxnBeginResp).await?;
                 match ResponseBody::decode(Opcode::TxnBeginResp, &resp.payload)? {
                     ResponseBody::TxnBegin(r) => Ok(r),
@@ -64,7 +64,7 @@ pub(crate) async fn txn_commit(
                 let mut guard = client.acquire().await?;
                 let stream_id = guard.next_stream_id();
                 let frame = Frame::new(
-                    Opcode::TxnCommit.as_u8(),
+                    Opcode::TxnCommit.as_u16(),
                     FLAG_EOS,
                     stream_id,
                     body.encode(),
@@ -96,7 +96,7 @@ pub(crate) async fn txn_abort(
                 let mut guard = client.acquire().await?;
                 let stream_id = guard.next_stream_id();
                 let frame =
-                    Frame::new(Opcode::TxnAbort.as_u8(), FLAG_EOS, stream_id, body.encode());
+                    Frame::new(Opcode::TxnAbort.as_u16(), FLAG_EOS, stream_id, body.encode());
                 let resp = send_and_read_one(&mut guard, frame, Opcode::TxnAbortResp).await?;
                 match ResponseBody::decode(Opcode::TxnAbortResp, &resp.payload)? {
                     ResponseBody::TxnAbort(r) => Ok(r),

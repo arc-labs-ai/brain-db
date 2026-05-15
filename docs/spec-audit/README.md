@@ -61,10 +61,16 @@ X" prose); the per-section audit pages filter visually.
 closed**, with scope, files touched, effort estimate, and a
 sequencing recommendation.
 
-**Headline: zero v1.0 blockers remaining.** F-1 closed via
-operator-run `sed`; F-2 / F-3 / F-7 / F-13 closed in commit
-`8b78de1`. The remaining open items are v1.x tightenings + v2
-wire amendments + future per-section audits.
+**Headline: zero substrate-v0.x blockers remaining.** F-1 closed
+via operator-run `sed`; F-2 / F-3 / F-7 / F-13 closed in commit
+`8b78de1`. The substrate is at `v0.9.x-substrate-rc` candidacy
+(Phase 14). The `v1.0.0` tag is now deferred to **Phase 24**,
+after the knowledge-layer phases (15–24) deliver entities,
+statements, relations, schema DSL, three-tier extractors, and
+hybrid retrieval. Knowledge-layer §17–§31 will be audited
+post-implementation (see [`pending.md`](pending.md)). The
+remaining open substrate findings are v1.x tightenings + v2
+wire amendments.
 
 ## Cross-references
 

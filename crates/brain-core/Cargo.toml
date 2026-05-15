@@ -11,6 +11,9 @@ description = "Shared types for the Brain cognitive substrate."
 thiserror.workspace = true
 uuid.workspace = true
 serde.workspace = true
+# 16.5: resolver emits a warn-level log when the tier-4 LLM stub is
+# enabled-but-skipped (phase 21 wires the real LLM extractor).
+tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

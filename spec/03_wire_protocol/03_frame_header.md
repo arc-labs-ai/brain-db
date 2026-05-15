@@ -2,6 +2,8 @@
 
 Every frame on the wire begins with a fixed 32-byte header. This file specifies its layout.
 
+> **Phase 16.6a (pre-v1.0):** the opcode is a big-endian `u16` (bytes 5–6) and `flags` shrank to a single byte (byte 7). The namespace byte (high byte of opcode) is `0x00` for substrate ops, `0x01` for knowledge-layer ops — see [`05_opcodes.md`](05_opcodes.md) and [`../28_knowledge_wire_protocol/00_purpose.md`](../28_knowledge_wire_protocol/00_purpose.md). This wire change is permitted under the pre-v1.0 compatibility policy (see [`12_versioning.md`](12_versioning.md)).
+
 ## 1. The 32-byte header
 
 ```
@@ -9,9 +11,9 @@ Every frame on the wire begins with a fixed 32-byte header. This file specifies 
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |              magic = "BRN0" (4 bytes)                         |
-+---------------+---------------+-------------------------------+
-|   version (8) |   opcode (8)  |          flags (16)           |
-+---------------+---------------+-------------------------------+
++---------------+-------------------------------+---------------+
+|   version (8) |          opcode (16)          |   flags (8)   |
++---------------+-------------------------------+---------------+
 |                  header_crc32c (32)                           |
 +---------------------------------------------------------------+
 |                     stream_id (32)                            |
@@ -34,8 +36,8 @@ Field-by-field:
 |---|---|---|---|
 | 0–3 | `magic` | 4 ASCII chars | Identifies a Brain frame: `"BRN0"` (0x42 0x52 0x4E 0x30) |
 | 4 | `version` | `u8` | Protocol version. Initially 1; bumps on incompatible changes. |
-| 5 | `opcode` | `u8` | The operation type. See [`05_opcodes.md`](05_opcodes.md). |
-| 6–7 | `flags` | `u16` | Frame-level flags (see §2). |
+| 5–6 | `opcode` | `u16` (big-endian) | The operation type. High byte = namespace (0x00 substrate, 0x01 knowledge); low byte = op index. See [`05_opcodes.md`](05_opcodes.md) and [`../28_knowledge_wire_protocol/00_purpose.md`](../28_knowledge_wire_protocol/00_purpose.md). |
+| 7 | `flags` | `u8` | Frame-level flags (see §2). |
 | 8–11 | `header_crc32c` | `u32` | CRC32C of bytes 0–7 plus bytes 12–31 (i.e., the rest of the header excluding this field, treated as zero during computation). |
 | 12–15 | `stream_id` | `u32` | The stream this frame belongs to (see [`09_streaming.md`](09_streaming.md)). |
 | 16–18 | `payload_len` | `u24` (24-bit big-endian) | Payload length in bytes; max 16,777,215 (16 MiB - 1). |
@@ -47,23 +49,25 @@ All multi-byte integers are **big-endian**.
 
 ## 2. Flags
 
-The 16-bit `flags` field encodes per-frame metadata:
+The 8-bit `flags` field encodes per-frame metadata:
 
 ```
-bit 15  14  13  12  11  10  9   8   7   6   5   4   3   2   1   0
-   +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
-   |EOS|MPL|CMP|...                                              ...|
-   +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+bit 7   6   5   4   3   2   1   0
+   +---+---+---+---+---+---+---+---+
+   |EOS|MPL|CMP|       reserved    |
+   +---+---+---+---+---+---+---+---+
 ```
 
 | Bit | Name | Meaning |
 |---|---|---|
-| 15 | `EOS` | End of stream — last frame of this stream. |
-| 14 | `MPL` | Multi-payload — payload spans multiple frames; concatenate to reconstruct. |
-| 13 | `CMP` | Compressed — payload is zstd-compressed. (Reserved; not used in v1.) |
-| 12-0 | reserved | Must be zero. |
+| 7 | `EOS` | End of stream — last frame of this stream. |
+| 6 | `MPL` | Multi-payload — payload spans multiple frames; concatenate to reconstruct. |
+| 5 | `CMP` | Compressed — payload is zstd-compressed. (Reserved; not used in v1.) |
+| 4-0 | reserved | Must be zero. |
 
 The flags `EOS` and `MPL` are mutually compatible: a multi-payload final frame has both. A single-frame final response has only `EOS`.
+
+(The pre-v1 design used a 16-bit `flags` with bits 12-0 reserved. Phase 16.6a shrank `flags` to `u8` and reclaimed the freed byte for the upper byte of `opcode`. Since no v1.0 release has shipped, this is not a backward-compatibility break — see [`12_versioning.md`](12_versioning.md).)
 
 ## 3. Field details
 
@@ -83,9 +87,17 @@ The version is checked at handshake time (the `HELLO` frame's negotiation). Once
 
 ### 3.3 opcode
 
-The operation type. See [`05_opcodes.md`](05_opcodes.md) for the full table.
+The operation type. See [`05_opcodes.md`](05_opcodes.md) for the full substrate table and [`../28_knowledge_wire_protocol/00_purpose.md`](../28_knowledge_wire_protocol/00_purpose.md) for the knowledge-layer table.
 
-Opcodes 0x00–0x7F are server-bound (client → server); 0x80–0xFF are client-bound (server → client).
+The opcode is a big-endian `u16` split into two bytes:
+
+- **High byte — namespace.**
+  - `0x00` — substrate (cognitive primitives, connection management, admin).
+  - `0x01` — knowledge layer (schema, entities, statements, relations, queries, extractors).
+  - `0x02`–`0xFF` — reserved for future namespaces.
+- **Low byte — operation index within the namespace.** Low byte `< 0x80` is server-bound (C → S, request); low byte `≥ 0x80` is client-bound (S → C, response). The direction rule applies independently within each namespace.
+
+Examples: `0x0020` is substrate `ENCODE_REQ`; `0x00A0` is substrate `ENCODE_RESP`; `0x0130` is knowledge `ENTITY_CREATE` (request); `0x01B0` is knowledge `ENTITY_CREATE_RESP`.
 
 ### 3.4 payload_len
 
@@ -188,8 +200,8 @@ This is rarely needed in practice. Most operations produce small frames; multi-p
 Field            Value
 magic            "BRN0"
 version          1
-opcode           0x10 (PING)
-flags            0x0000
+opcode           0x0010 (PING)
+flags            0x00
 header_crc32c    <computed>
 stream_id        0
 payload_len      0
@@ -206,8 +218,8 @@ reserved         0..0
 Field            Value
 magic            "BRN0"
 version          1
-opcode           0x21 (RECALL_REQ)
-flags            0x0000
+opcode           0x0021 (RECALL_REQ)
+flags            0x00
 header_crc32c    <computed>
 stream_id        7 (client-allocated, odd)
 payload_len      <size of rkyv-encoded RecallRequest>
@@ -224,8 +236,8 @@ Plus the rkyv-encoded RecallRequest payload. See [`07_request_frames.md`](07_req
 Field            Value
 magic            "BRN0"
 version          1
-opcode           0xA1 (RECALL_RESP)
-flags            0x0000  (not EOS yet)
+opcode           0x00A1 (RECALL_RESP)
+flags            0x00  (not EOS yet)
 header_crc32c    <computed>
 stream_id        7
 payload_len      <size of one MemoryResult>
@@ -240,8 +252,8 @@ reserved         0..0
 Field            Value
 magic            "BRN0"
 version          1
-opcode           0xA1 (RECALL_RESP)
-flags            0x8000  (EOS)
+opcode           0x00A1 (RECALL_RESP)
+flags            0x80  (EOS)
 header_crc32c    <computed>
 stream_id        7
 payload_len      0  (or final batch of results)
@@ -256,8 +268,8 @@ reserved         0..0
 |---|---|
 | `magic` | byte order (literal ASCII) |
 | `version` | single byte |
-| `opcode` | single byte |
-| `flags` | big-endian `u16` |
+| `opcode` | big-endian `u16` |
+| `flags` | single byte |
 | `header_crc32c` | big-endian `u32` |
 | `stream_id` | big-endian `u32` |
 | `payload_len` | big-endian `u24` |

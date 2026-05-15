@@ -27,6 +27,7 @@
 )]
 #![forbid(unsafe_code)]
 
+pub mod entity_hnsw;
 pub mod hnsw;
 pub mod idmap;
 pub mod params;
@@ -35,6 +36,9 @@ pub mod rebuild;
 pub mod shared;
 pub mod tombstones;
 
+pub use entity_hnsw::{
+    EntityHnswError, EntityHnswIndex, EntityHnswParams, RebuildReport as EntityRebuildReport,
+};
 pub use hnsw::{HnswError, HnswIndex};
 pub use idmap::{IdMap, IdMapError};
 pub use params::{IndexParams, IndexParamsError, MAX_LAYER, VECTOR_DIM};

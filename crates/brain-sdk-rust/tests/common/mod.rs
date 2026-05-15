@@ -23,7 +23,7 @@ use brain_protocol::{Frame, RequestBody, ResponseBody};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-pub const FLAG_EOS: u16 = 1 << 15;
+pub const FLAG_EOS: u8 = 1 << 7;
 
 /// Spawn a mock server. The `handler` runs once per accepted
 /// connection, after the handshake is complete.
@@ -50,7 +50,7 @@ pub async fn complete_handshake(socket: &mut TcpStream) -> bool {
     let Some(hello_frame) = read_frame_opt(socket).await else {
         return false;
     };
-    if hello_frame.header.opcode != Opcode::Hello.as_u8() {
+    if hello_frame.header.opcode_u16() != Opcode::Hello.as_u16() {
         return false;
     }
 
@@ -72,7 +72,7 @@ pub async fn complete_handshake(socket: &mut TcpStream) -> bool {
     };
     write_frame(
         socket,
-        Opcode::Welcome.as_u8(),
+        Opcode::Welcome.as_u16(),
         0,
         ResponseBody::Welcome(welcome).encode(),
         true,
@@ -82,7 +82,7 @@ pub async fn complete_handshake(socket: &mut TcpStream) -> bool {
     let Some(auth_frame) = read_frame_opt(socket).await else {
         return false;
     };
-    if auth_frame.header.opcode != Opcode::Auth.as_u8() {
+    if auth_frame.header.opcode_u16() != Opcode::Auth.as_u16() {
         return false;
     }
     let Ok(auth_body) = RequestBody::decode(Opcode::Auth, &auth_frame.payload) else {
@@ -108,7 +108,7 @@ pub async fn complete_handshake(socket: &mut TcpStream) -> bool {
     };
     write_frame(
         socket,
-        Opcode::AuthOk.as_u8(),
+        Opcode::AuthOk.as_u16(),
         0,
         ResponseBody::AuthOk(auth_ok).encode(),
         true,
@@ -150,7 +150,7 @@ pub async fn read_frame(socket: &mut TcpStream) -> Frame {
 /// Write a frame. `eos` controls the FLAG_EOS bit on the header.
 pub async fn write_frame(
     socket: &mut TcpStream,
-    opcode: u8,
+    opcode: u16,
     stream_id: u32,
     payload: Vec<u8>,
     eos: bool,

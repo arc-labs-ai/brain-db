@@ -363,3 +363,57 @@ When Claude is running on a non-Linux host (e.g. darwin):
 - The verify loop (§4) is satisfied via the project-provided Linux dev container. `README.md (Development environment)` documents the entry point.
 - For fast feedback before a container test cycle, `cargo check --target x86_64-unknown-linux-gnu` (with the target installed) validates compilation without running.
 - If neither container nor cross-target is available: STOP and surface (§3). Don't try to make Linux code "work" on the local OS by adding portability shims — that violates this section.
+
+---
+
+## 23. Knowledge-layer scope (phases 15–24)
+
+Brain v1.0 ships the substrate (phases 0–14) and the knowledge layer (phases 15–24). The rules in §1–§22 apply to both. The additions below are knowledge-layer specific.
+
+### Spec precedence at the boundary
+
+Knowledge-layer sections extend several substrate sections; where the spec sections overlap, the knowledge-layer section is authoritative:
+
+- §23 retrievers + §24 hybrid query extend §08 query planner.
+- §28 knowledge wire protocol extends §03 wire protocol.
+- §27 knowledge workers extends §11 background workers.
+- §29 knowledge SDK extends §13 SDK design.
+- `RECALL` (§09) gains hybrid behavior when a schema is declared (§24).
+
+### Stricter on extractor changes
+
+Modifying an extractor's behavior — new patterns, new prompt, new model — is a *versioned* change. Always:
+
+1. Bump `extractor.version`.
+2. Flag affected statements as stale (test for this).
+3. Test the migration plan it produces.
+
+Never edit an extractor in place without versioning. Stale detection in Phase 24 depends on it.
+
+### Cost discipline on LLM extractors
+
+For any work on LLM extractors (Phase 21 and beyond):
+
+- Default to *mock* LLM backends in tests.
+- Real-LLM tests are opt-in via `BRAIN_TEST_REAL_LLM=true`.
+- Never run real LLM in CI without explicit per-test opt-in.
+- Document expected token counts in extractor declarations.
+
+### Schema-optional behavior is binding
+
+A deployment without a schema runs the substrate as if phases 15–24 didn't exist. Every knowledge-layer phase MUST preserve this — sub-task 15.6 wires the regression test; every later phase keeps it green.
+
+This is not a "legacy mode" or "compatibility mode" — it is a real v1.0 deployment posture.
+
+### Acceptance gate is binding
+
+`spec/31_complete_acceptance/` is the bar for the `v1.0.0` tag. A phase that "feels done" but doesn't pass the relevant acceptance items is not done. Phase 24 wires the full functional + performance + storage + operational + schema-toggle suite.
+
+### Phase progression for knowledge layer
+
+Phases 16–22 may partially overlap once 15 is done (see DAG in `docs/phases/README.md`). Phase 23 strictly requires 17, 21, 22. Phase 24 is final.
+
+After each knowledge-layer phase:
+- Run that phase's tests.
+- Run the substrate regression suite (sections 00–16 acceptance, gated by Phase 14).
+- Update the phase doc with a "completed" timestamp and any deviations.

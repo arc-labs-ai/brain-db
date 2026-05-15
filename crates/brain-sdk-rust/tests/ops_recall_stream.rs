@@ -30,7 +30,7 @@ fn mock_result(idx: u32) -> MemoryResult {
 async fn recall_stream_yields_items_one_at_a_time() {
     let (addr, _server) = common::spawn_mock_server(|mut socket| async move {
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode, Opcode::RecallReq.as_u8());
+        assert_eq!(frame.header.opcode_u16(), Opcode::RecallReq.as_u16());
         let _ = RequestBody::decode(Opcode::RecallReq, &frame.payload).expect("decode");
         let sid = frame.header.stream_id_u32();
 
@@ -43,7 +43,7 @@ async fn recall_stream_yields_items_one_at_a_time() {
         };
         common::write_frame(
             &mut socket,
-            Opcode::RecallResp.as_u8(),
+            Opcode::RecallResp.as_u16(),
             sid,
             ResponseBody::Recall(r1).encode(),
             false,
@@ -58,7 +58,7 @@ async fn recall_stream_yields_items_one_at_a_time() {
         };
         common::write_frame(
             &mut socket,
-            Opcode::RecallResp.as_u8(),
+            Opcode::RecallResp.as_u16(),
             sid,
             ResponseBody::Recall(r2).encode(),
             false,
@@ -73,7 +73,7 @@ async fn recall_stream_yields_items_one_at_a_time() {
         };
         common::write_frame(
             &mut socket,
-            Opcode::RecallResp.as_u8(),
+            Opcode::RecallResp.as_u16(),
             sid,
             ResponseBody::Recall(r3).encode(),
             true,
