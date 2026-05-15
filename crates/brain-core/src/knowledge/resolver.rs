@@ -994,5 +994,241 @@ mod algorithm_tests {
         // Must be a valid str slice (no codepoint splitting).
         assert_eq!(truncated.chars().count(), 5);
     }
+
+    // ---------------------------------------------------------------------
+    // Phase 16.9.2 — adversarial / fuzz-style input cases.
+    //
+    // Per phase-16 pitfalls: "Fuzz the resolver with adversarial inputs
+    // (Unicode, very long strings, empty strings)." These are
+    // hand-curated unit-level cases that exercise the cleanup paths
+    // tier 1+2 take. True cargo-fuzz integration is phase 14 (protocol-
+    // fuzz suite).
+    // ---------------------------------------------------------------------
+
+    fn adv_vec_zeros() -> [f32; VECTOR_DIM] {
+        [0.0; VECTOR_DIM]
+    }
+
+    /// Adversarial tests focus on tier 1 + 2 robustness. Tier 3
+    /// (embedding) is configured-off so the mock embedder doesn't
+    /// need fixtures for every weird input.
+    fn adv_config() -> ResolverConfig {
+        ResolverConfig {
+            enable_embedding: false,
+            ..ResolverConfig::default()
+        }
+    }
+
+    #[test]
+    fn empty_candidate_does_not_resolve_no_matches() {
+        // Empty input — resolver returns Created (or NotFound when
+        // create disabled). Either way: no panic, no OOB, single
+        // outcome.
+        let m = MockBackend::new();
+        m.set_embedding("", adv_vec_zeros());
+        let out = resolve_entity(
+            &m,
+            &m,
+            &m,
+            "",
+            "",
+            Some(person()),
+            &adv_config(),
+        )
+        .unwrap();
+        // Tier 1 yields no canonical / alias hit; tier 2 has no
+        // trigrams (the empty-input split produces nothing); tier 3
+        // is configured-out by default in this test path. Tier 5
+        // (create) fires.
+        assert!(matches!(out, ResolutionOutcome::Created { .. }));
+    }
+
+    #[test]
+    fn whitespace_only_candidate_does_not_resolve_no_matches() {
+        let m = MockBackend::new();
+        m.set_embedding("", adv_vec_zeros());
+        let out = resolve_entity(
+            &m,
+            &m,
+            &m,
+            "   \t  \n  ",
+            "",
+            Some(person()),
+            &adv_config(),
+        )
+        .unwrap();
+        assert!(matches!(out, ResolutionOutcome::Created { .. }));
+    }
+
+    #[test]
+    fn very_long_candidate_does_not_panic() {
+        // 64 KiB of identical chars — well past any practical name.
+        // Resolver must process without OOM / panic.
+        let huge = "a".repeat(64 * 1024);
+        let m = MockBackend::new();
+        m.set_embedding(huge.as_str(), adv_vec_zeros());
+        let out = resolve_entity(
+            &m,
+            &m,
+            &m,
+            &huge,
+            "",
+            Some(person()),
+            &adv_config(),
+        )
+        .unwrap();
+        // No fixtures match; tier 5 fires.
+        assert!(matches!(out, ResolutionOutcome::Created { .. }));
+    }
+
+    #[test]
+    fn unicode_multibyte_candidate_normalises_correctly() {
+        // Multi-byte CJK + Latin mix. Resolver normalisation is byte-
+        // level pg_trgm; multi-byte windows may slice mid-codepoint
+        // but the tier-1 path uses the whole normalized string so
+        // round-trips correctly.
+        let m = MockBackend::new();
+        let id = EntityId::new();
+        m.set_canonical(person(), "山田 太郎", id);
+        m.set_embedding("山田 太郎", adv_vec_zeros());
+
+        let out = resolve_entity(
+            &m,
+            &m,
+            &m,
+            "山田 太郎",
+            "",
+            Some(person()),
+            &adv_config(),
+        )
+        .unwrap();
+        match out {
+            ResolutionOutcome::Resolved { entity, tier, .. } => {
+                assert_eq!(entity, id);
+                assert_eq!(tier, ResolverTier::Exact);
+            }
+            other => panic!("expected Resolved at tier 1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unicode_combining_marks_treated_byte_wise() {
+        // "café" can be NFC (4 chars) or NFD ("cafe" + combining
+        // acute = 5 chars). The resolver normalisation is byte-level
+        // lowercase + whitespace-collapse only — does NOT apply NFKC
+        // (per §28/09 Q6). So NFC and NFD forms are *different*
+        // entities for tier-1 purposes.
+        //
+        // Verifies we don't accidentally normalise unicode here; if a
+        // future phase adds NFKC, this test flips.
+        let m = MockBackend::new();
+        let nfc = "café"; // NFC: 4 chars / 5 bytes
+        let nfd = "cafe\u{0301}"; // NFD: 5 chars / 6 bytes
+        let id = EntityId::new();
+        m.set_canonical(person(), nfc, id);
+        m.set_embedding(nfd, adv_vec_zeros());
+
+        let out = resolve_entity(
+            &m,
+            &m,
+            &m,
+            nfd,
+            "",
+            Some(person()),
+            &adv_config(),
+        )
+        .unwrap();
+        // NFD candidate doesn't tier-1 match the NFC stored entity;
+        // tier 2 has no trigram fixture; tier 3 LLM disabled by
+        // default; tier 5 creates a new entity.
+        assert!(matches!(out, ResolutionOutcome::Created { .. }));
+    }
+
+    #[test]
+    fn emoji_in_candidate_does_not_panic() {
+        let m = MockBackend::new();
+        m.set_embedding("🚀 rocket", adv_vec_zeros());
+        let out = resolve_entity(
+            &m,
+            &m,
+            &m,
+            "🚀 rocket",
+            "",
+            Some(person()),
+            &adv_config(),
+        )
+        .unwrap();
+        // Emoji is a 4-byte codepoint; trigram windows slice mid-
+        // codepoint. We just want "no panic" + a sane outcome.
+        assert!(matches!(out, ResolutionOutcome::Created { .. }));
+    }
+
+    #[test]
+    fn pathological_repeated_chars_clamps_trigram_set() {
+        // "aaaaaaaaaa..." has very few unique trigrams; tier-2
+        // candidates is empty unless something was stored with the
+        // same pattern.
+        let huge_a = "a".repeat(10_000);
+        let m = MockBackend::new();
+        m.set_embedding(huge_a.as_str(), adv_vec_zeros());
+        let out = resolve_entity(
+            &m,
+            &m,
+            &m,
+            &huge_a,
+            "",
+            Some(person()),
+            &adv_config(),
+        )
+        .unwrap();
+        assert!(matches!(out, ResolutionOutcome::Created { .. }));
+    }
+
+    #[test]
+    fn mixed_case_and_whitespace_normalised_for_tier1() {
+        let m = MockBackend::new();
+        let id = EntityId::new();
+        m.set_canonical(person(), "Priya Patel", id);
+        m.set_embedding("  PrIyA   PaTeL  ", adv_vec_zeros());
+
+        let out = resolve_entity(
+            &m,
+            &m,
+            &m,
+            "  PrIyA   PaTeL  ",
+            "",
+            Some(person()),
+            &adv_config(),
+        )
+        .unwrap();
+        // Normalised form ("priya patel") matches tier-1 canonical.
+        match out {
+            ResolutionOutcome::Resolved { entity, tier, .. } => {
+                assert_eq!(entity, id);
+                assert_eq!(tier, ResolverTier::Exact);
+            }
+            other => panic!("expected Resolved at tier 1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tabs_and_newlines_normalised() {
+        let m = MockBackend::new();
+        let id = EntityId::new();
+        m.set_canonical(person(), "Foo Bar", id);
+        m.set_embedding("Foo\t\n  Bar", adv_vec_zeros());
+
+        let out = resolve_entity(
+            &m,
+            &m,
+            &m,
+            "Foo\t\n  Bar",
+            "",
+            Some(person()),
+            &adv_config(),
+        )
+        .unwrap();
+        assert!(matches!(out, ResolutionOutcome::Resolved { .. }));
+    }
 }
 
