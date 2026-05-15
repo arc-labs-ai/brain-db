@@ -141,6 +141,29 @@ pub(crate) enum ShardRequest {
     RebuildHnsw {
         reply_tx: Sender<Result<RebuildReport, String>>,
     },
+    /// Snapshot the HNSW index counts. Used by the admin `/metrics`
+    /// path to emit `brain_hnsw_*` families. Sub-task 12.8.
+    HnswSnapshot { reply_tx: Sender<HnswCounts> },
+}
+
+/// Counts surfaced by `ShardRequest::HnswSnapshot`. Pure data type so
+/// it crosses the Tokio↔Glommio boundary without further plumbing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HnswCounts {
+    pub node_count: u64,
+    pub tombstone_count: u64,
+}
+
+impl HnswCounts {
+    /// Tombstone ratio in `[0, 1]`. Returns 0 when `node_count == 0`.
+    #[must_use]
+    pub fn tombstone_ratio(self) -> f64 {
+        if self.node_count == 0 {
+            0.0
+        } else {
+            self.tombstone_count as f64 / self.node_count as f64
+        }
+    }
 }
 
 /// Owned snapshot descriptor surfaced through `ShardHandle`. Mirrors
@@ -408,6 +431,21 @@ impl ShardHandle {
             .await
             .map_err(|_| ShardError::ShardDisconnected)?
             .map_err(ShardError::Snapshot)
+    }
+
+    /// Snapshot the HNSW index counts for this shard. Used by the
+    /// admin `/metrics` exposition path (sub-task 12.8). Cheap; reads
+    /// two atomics inside the shard executor.
+    pub async fn hnsw_snapshot(&self) -> Result<HnswCounts, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::HnswSnapshot { reply_tx })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)
     }
 
     /// Trigger an immediate full HNSW rebuild. Returns the new
@@ -932,6 +970,18 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     warn!(
                         shard_id = shard.shard_id,
                         "DeleteSnapshot reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::HnswSnapshot { reply_tx } => {
+                let counts = HnswCounts {
+                    node_count: shard.hnsw_shared.len() as u64,
+                    tombstone_count: shard.hnsw_shared.tombstone_count() as u64,
+                };
+                if reply_tx.send_async(counts).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "HnswSnapshot reply dropped (caller gone)"
                     );
                 }
             }

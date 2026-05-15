@@ -61,6 +61,7 @@ pub async fn format(snap: &Snapshot<'_>) -> String {
     emit_process_uptime(&mut s, snap.started_at, snap.started_at_unix_secs);
     emit_process_resource(&mut s);
     emit_worker_counters(&mut s, snap.shards).await;
+    emit_hnsw_counts(&mut s, snap.shards).await;
     emit_request_metrics(&mut s, snap.request_metrics);
 
     s
@@ -297,6 +298,57 @@ async fn emit_worker_counters(out: &mut String, shards: &[ShardHandle]) {
             }
             Err(e) => {
                 warn!(shard_id, error = %e, "scheduler_snapshot failed");
+            }
+        }
+    }
+}
+
+/// 12.8: HNSW basic counters (node_count, tombstone_count,
+/// tombstone_ratio) per spec §14/01 §6. Sampled per-shard via
+/// `ShardHandle::hnsw_snapshot`. The richer §6 families
+/// (search_visits, recall_estimate, rebuild_*) stay deferred —
+/// tracker `phase-12/hnsw-sampling`.
+async fn emit_hnsw_counts(out: &mut String, shards: &[ShardHandle]) {
+    emit_header(
+        out,
+        "brain_hnsw_node_count",
+        "Active HNSW node count.",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_hnsw_tombstone_count",
+        "Tombstoned HNSW node count.",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_hnsw_tombstone_ratio",
+        "Tombstoned / active+tombstoned ratio (0..1).",
+        "gauge",
+    );
+    for shard in shards.iter() {
+        let shard_id = shard.shard_id();
+        match shard.hnsw_snapshot().await {
+            Ok(c) => {
+                let _ = writeln!(
+                    out,
+                    "brain_hnsw_node_count{{shard=\"{shard_id}\"}} {}",
+                    c.node_count
+                );
+                let _ = writeln!(
+                    out,
+                    "brain_hnsw_tombstone_count{{shard=\"{shard_id}\"}} {}",
+                    c.tombstone_count
+                );
+                let _ = writeln!(
+                    out,
+                    "brain_hnsw_tombstone_ratio{{shard=\"{shard_id}\"}} {}",
+                    c.tombstone_ratio()
+                );
+            }
+            Err(e) => {
+                warn!(shard_id, error = %e, "hnsw_snapshot failed");
             }
         }
     }

@@ -263,6 +263,26 @@ async fn metrics_emits_build_info_and_up() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metrics_emits_hnsw_counts() {
+    let server = start_admin_with_shards(1).await;
+    let (code, body) = http_get(server.admin_addr, "/metrics").await;
+    assert_eq!(code, 200);
+    assert!(
+        body.contains("brain_hnsw_node_count{shard=\"0\"}"),
+        "missing brain_hnsw_node_count; body:\n{body}"
+    );
+    assert!(
+        body.contains("brain_hnsw_tombstone_count{shard=\"0\"}"),
+        "missing brain_hnsw_tombstone_count"
+    );
+    assert!(
+        body.contains("brain_hnsw_tombstone_ratio{shard=\"0\"}"),
+        "missing brain_hnsw_tombstone_ratio"
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metrics_increments_connections_total_on_accept() {
     let server = start_admin_with_shards(1).await;
     let conn_addr = server.conn_addr.expect("conn_addr");
