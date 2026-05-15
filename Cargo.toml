@@ -105,6 +105,10 @@ parking_lot = "0.12"
 # Caches
 lru = "0.12"
 
+# Small-vector inline storage — used for evidence inline arrays
+# (≤ 8 entries) on Statement, see spec §19/05.
+smallvec = { version = "1", features = ["const_generics", "union", "serde"] }
+
 # Hashing / IDs
 blake3 = "1"
 crc32c = "0.6"

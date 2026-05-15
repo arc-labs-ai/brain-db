@@ -18,6 +18,7 @@ pub mod entity;
 pub mod ids;
 pub mod kinds;
 pub mod resolver;
+pub mod statement;
 pub mod trigrams;
 
 pub use entity::{Entity, EntityAttributes, EntityType};
@@ -29,5 +30,9 @@ pub use kinds::{Cardinality, ExtractorKind, StatementKind};
 pub use resolver::{
     resolve_entity, ResolutionOutcome, ResolverConfig, ResolverEmbedder, ResolverError,
     ResolverIndex, ResolverStorage, ResolverTier, TypeConstraint, VECTOR_DIM,
+};
+pub use statement::{
+    EvidenceEntry, EvidenceRef, Predicate, Statement, StatementObject, StatementValue,
+    SubjectRef, TombstoneReason, INLINE_EVIDENCE_CAP,
 };
 pub use trigrams::{extract_trigrams, jaccard};

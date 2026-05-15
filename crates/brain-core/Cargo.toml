@@ -14,6 +14,8 @@ serde.workspace = true
 # 16.5: resolver emits a warn-level log when the tier-4 LLM stub is
 # enabled-but-skipped (phase 21 wires the real LLM extractor).
 tracing.workspace = true
+# 17.2: SmallVec for inline evidence storage (≤ 8 entries) on Statement.
+smallvec.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
