@@ -16,11 +16,16 @@
 pub mod edge;
 pub mod error;
 pub mod ids;
+pub mod knowledge;
 pub mod memory;
 
 pub use edge::{Edge, EdgeKind, EdgeOrigin};
 pub use error::{Error, Result};
 pub use ids::{
     AgentId, ContextId, MemoryId, RequestId, ShardId, SlotIndex, SlotVersion, TxnId, MAX_SLOT_INDEX,
+};
+pub use knowledge::{
+    AuditId, Cardinality, EntityId, EntityTypeId, EvidenceOverflowId, ExtractorId, ExtractorKind,
+    MergeId, PredicateId, RelationId, RelationTypeId, StatementId, StatementKind,
 };
 pub use memory::{Memory, MemoryKind, Salience};

@@ -53,28 +53,21 @@ Add the knowledge-layer redb table definitions, new on-disk artifacts (tantivy d
 **Done when:** separate redb file per shard, opened on `Shard::open()`, two tables initialized.
 **Pitfalls:** Keep this file separate from `metadata.redb` to avoid bloating the hot metadata file with LLM blobs.
 
-### 15.5 knowledge-mode server config flag
-
-**Reads:** `spec/17_knowledge_model/00_purpose.md` (schema-optional behavior); `AUTONOMY.md` (substrate-only regression is binding).
-**Writes:** `crates/brain-server/src/config.rs`.
-**Done when:** `BRAIN_KNOWLEDGE_ENABLED=true` env var (default false); when false, knowledge tables exist but no knowledge-layer workers spawn; when true, knowledge-layer workers spawn (idle until schema declared).
-**Pitfalls:** Dont gate knowledge-layer wire opcodes on this flag; gate worker activation only.
-
-### 15.6 substrate-only mode regression test
+### 15.5 substrate-only mode regression test
 
 **Reads:** `spec/16_benchmarks_acceptance/`.
 **Writes:** `tests/knowledge_compat.rs`.
-**Done when:** all substrate acceptance tests pass when run with knowledge mode disabled. P50/P99 ENCODE and RECALL latencies within 110% of substrate-only baseline.
-**Pitfalls:** Run on substrate reference data; check tail latencies, not just averages.
+**Done when:** all substrate acceptance tests pass against a server with no schema declared (knowledge tables exist + empty; knowledge-layer workers, if any spawn in later phases, idle). P50/P99 ENCODE and RECALL latencies within 110% of substrate-only baseline.
+**Pitfalls:** Run on substrate reference data; check tail latencies, not just averages. Activation is by schema state (no `SCHEMA_UPLOAD` → no extraction work), **not** by an env flag — the knowledge layer is a core feature with no separate enable/disable toggle.
 
 ## Done-when (phase)
 
-- the binary boots against a data directories from substrate-only deployments.
+- The binary boots against existing substrate-only data directories.
 - All substrate acceptance tests pass.
-- knowledge-layer redb tables are empty.
-- knowledge-layer workers are not running (no schema).
-- WAL contains no knowledge-layer frames (no knowledge-layer writes happen).
+- Knowledge-layer redb tables exist and are empty.
+- WAL contains no knowledge-layer frames (no knowledge-layer writes happen until a schema is uploaded in later phases).
 - New disk artifact directories exist but are empty.
+- Knowledge layer is a core feature; activation is by schema state alone — there is no env-flag toggle.
 
 ## Pitfalls
 
