@@ -54,6 +54,31 @@ pub const ENTITY_MENTIONS_TABLE: TableDefinition<
 > = TableDefinition::new("entity_mentions");
 
 // ---------------------------------------------------------------------------
+// Status flags (sub-task 16.2).
+// ---------------------------------------------------------------------------
+
+/// Bits in [`EntityMetadata::flags`].
+///
+/// Reserved high bits are *zero* on new rows; setters mask only the
+/// documented bits via `flags |= MASK` / `flags &= !MASK` patterns.
+pub mod flags {
+    /// Bit 0: entity has been tombstoned. Secondary indexes
+    /// (`entity_by_canonical_name`, `entity_aliases`) are torn down on
+    /// tombstone so the resolver never sees the row again. The primary
+    /// row stays for audit + 16.7 unmerge.
+    pub const TOMBSTONED: u32 = 1 << 0;
+
+    /// Bit 1: entity has been merged into another. Redundant with
+    /// `merged_into_bytes.is_some()`; kept as a flag bit so
+    /// flag-scan filters in 16.5+ don't have to deref the option.
+    /// Set by 16.7; not used in 16.2.
+    pub const MERGED: u32 = 1 << 1;
+
+    /// Bits 2..=31 reserved.
+    pub const RESERVED_MASK: u32 = !(TOMBSTONED | MERGED);
+}
+
+// ---------------------------------------------------------------------------
 // Mention context discriminant.
 // ---------------------------------------------------------------------------
 
