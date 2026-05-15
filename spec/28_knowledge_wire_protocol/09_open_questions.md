@@ -127,3 +127,18 @@ Phase 16.6a. The opcode-width change in R1 / flags shrink in R2 are non-backward
 ### R4 — `STREAM_START` envelope (see Q10 above)
 
 Marked resolved here as well — substrate streaming is reused.
+
+---
+
+### Q13 — `ENTITY_LIST` cursor pagination + multi-frame streaming
+
+Phase 16.7.5 ships `ENTITY_LIST` as a **single-frame snapshot** with `limit` capped at 1000 (max ~2 MiB of `EntityView` payload, well within the 16 MiB frame budget). The wire shape (`EntityListResponseFrame`) supports streaming via `items + cumulative_count + is_final`, but only the `is_final = true` single-frame mode is wired.
+
+Deferred behaviors:
+
+- **Cursor resume.** Caller passes a non-empty `cursor` to fetch the next page. Wire-side rejects with `INVALID_ARGUMENT` until phase 23.
+- **Multi-frame streaming within a page.** The 1000-cap is comfortable for v1.0; sub-1k responses fit in one frame.
+
+**Target:** phase 23 (hybrid query router). The query router already needs streaming infrastructure for `QUERY` (`0x0160`), `RECALL_HYBRID` (`0x0163`), and `STATEMENT_LIST` (`0x0146`); `ENTITY_LIST` pagination piggybacks on that work rather than duplicating it in phase 16.
+
+**Status:** open. **Likely outcome:** phase 23 implementation.
