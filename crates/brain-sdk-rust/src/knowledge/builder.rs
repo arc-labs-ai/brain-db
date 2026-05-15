@@ -43,6 +43,7 @@ use brain_protocol::{Frame, RequestBody, ResponseBody};
 use crate::client::Client;
 use crate::error::ClientError;
 use crate::knowledge::entity::{BrainEntityType, EntityHandle, EntityHandleFromViewError};
+use crate::knowledge::errors::ClientErrorEntityExt;
 use crate::knowledge::Person;
 use crate::ops::common::{send_and_read_one, FLAG_EOS};
 
@@ -850,13 +851,10 @@ fn unexpected_body(expected: &str, body: ResponseBody) -> ClientError {
 }
 
 /// Returns `true` iff `err` is a server-side ENTITY_NOT_FOUND. Used
-/// by `get()` to translate "not found" into `Ok(None)`. The substrate
-/// strategy-B fallback maps `EntityNotFound` to substrate
-/// `MemoryNotFound` until §28 codes are first-classed in §03/10
-/// (tracked as Q1 in §28/09); for now we match the message prefix.
+/// by `get()` to translate "not found" into `Ok(None)`. Delegates to
+/// [`ClientErrorEntityExt`] which inspects the server's message
+/// (Strategy B per spec §28/03 §2). Strategy A migration is a
+/// follow-up tracked in §28/09 Q1.
 fn is_entity_not_found(err: &ClientError) -> bool {
-    match err {
-        ClientError::Server { message, .. } => message.contains("entity") && message.contains("not found"),
-        _ => false,
-    }
+    err.is_entity_not_found()
 }
