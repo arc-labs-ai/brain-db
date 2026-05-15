@@ -53,7 +53,7 @@ just docker-verify     # build + test + clippy inside the container
 
 The `just docker-*` recipes shell out to the same container that CI
 uses. Everything that compiles in the container compiles on a real
-Linux host. See [`USAGE.md`](../../USAGE.md) for the day-to-day
+Linux host. See [`docs/usage/`](../usage/) for the day-to-day
 inner loop.
 
 ## Smoke test
