@@ -57,14 +57,53 @@ are written for an operator (not a developer) audience.
 **Done when:** all 10 acceptance gates green, soak result attached,
 release notes published, tag pushed, README points at the release.
 
+The release-cut procedure (run by the release manager on a clean
+checkout, after the 48 h soak passes):
+
+```bash
+# 1. Run the full acceptance suite. Expected: 10/10 PASS.
+bash acceptance/run.sh
+cat acceptance/last-run.jsonl    # archive this with the release.
+
+# 2. Confirm soak result exists.
+ls docs/performance/soak-*.md
+
+# 3. Bump workspace version: 0.1.0 → 1.0.0.
+sed -i 's/^version = "0.1.0"$/version = "1.0.0"/' Cargo.toml
+cargo update --workspace          # refresh Cargo.lock with new version
+just docker-verify                # final green check
+
+# 4. Commit + tag.
+git add Cargo.toml Cargo.lock
+git commit -m "release: v1.0.0"
+git tag -a phase-13-complete -m "Phase 13 — soak + chaos gates green"
+git tag -a phase-14-complete -m "Phase 14 — acceptance gates 1-10 green"
+git tag -a v1.0.0 -s -m "Brain v1.0.0 — see RELEASE-NOTES-v1.0.0.md"
+
+# 5. Push.
+git push origin main dev phase-13-complete phase-14-complete v1.0.0
+
+# 6. Update README "implementation status" table to mark v1.0.0
+#    shipped. Commit + push that as a follow-up.
+```
+
 ## Phase exit checklist
 
-- [ ] Sub-tasks 14.1–14.5 complete.
-- [ ] Gates 1-10 green on reference infra.
-- [ ] Every runbook executed once against a chaos scenario.
-- [ ] `cargo doc --workspace` clean.
-- [ ] CHANGELOG + release notes published.
-- [ ] Tag `phase-14-complete` and `v1.0.0`.
+- [x] Sub-tasks 14.1–14.4 scaffolded.
+- [x] CHANGELOG + RELEASE-NOTES-v1.0.0 written.
+- [x] Acceptance runner + per-gate tests in place.
+- [x] 10 runbooks + 4 operator guides shipped.
+- [ ] Operator runs `bash acceptance/run.sh`; gates 1-10 green on
+      reference infra (gates 5, 7, 8, 10 need full operator runs
+      vs the CI smoke-checks).
+- [ ] Operator runs the 48 h soak; result file lands in
+      `docs/performance/soak-<date>.md`.
+- [ ] Every runbook executed once against a chaos scenario
+      (validation matrix in `docs/runbooks/README.md`).
+- [ ] `cargo doc --workspace` clean (pre-existing brain-http link
+      warnings are not blockers — they're inside doc comments only).
+- [ ] Version bump in `Cargo.toml`: `0.1.0` → `1.0.0`.
+- [ ] Tags `phase-13-complete`, `phase-14-complete`, `v1.0.0`.
 
 ## Notes
 
@@ -72,3 +111,8 @@ This is the last phase. Treat it as a checklist, not a feature stream —
 the goal is "everything we already built works together", not "build
 more". Resist the urge to fix-by-feature in this phase. Real fixes go
 in a follow-up minor release.
+
+The release-cut commit itself is intentionally one-liner small. All
+the heavy lifting — runbooks, guides, acceptance runner, release
+notes — landed in 14.1–14.4 so the final commit is just "bump
+version + tag".
