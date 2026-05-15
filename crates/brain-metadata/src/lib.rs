@@ -15,8 +15,10 @@
 #![forbid(unsafe_code)]
 
 pub mod db;
+pub mod llm_cache;
 pub mod schema;
 pub mod sink;
 pub mod tables;
 
 pub use db::{MetadataDb, MetadataDbError};
+pub use llm_cache::{LlmCacheDb, LlmCacheError, LlmResponse};

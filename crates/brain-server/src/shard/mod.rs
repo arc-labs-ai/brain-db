@@ -290,6 +290,9 @@ pub enum ShardError {
 
     #[error("metadata open failed: {0}")]
     MetadataOpen(#[from] brain_metadata::MetadataDbError),
+
+    #[error("LLM cache open failed: {0}")]
+    LlmCache(#[from] brain_metadata::LlmCacheError),
 }
 
 impl ShardError {
@@ -736,6 +739,12 @@ pub fn spawn_shard(
     // stand-in with the durable redb-backed MetadataDb.
     let metadata_path = paths.metadata_db();
     let mut metadata_db = MetadataDb::open(&metadata_path)?;
+
+    // Sub-task 15.4: open (or create) the LLM extractor cache file
+    // alongside metadata.redb. The file persists; the handle is dropped
+    // at function exit and phase 21 (LLM extractor) re-opens / threads
+    // it through the Glommio closure when it wires the cache writer.
+    let _llm_cache = brain_metadata::LlmCacheDb::open(paths.llm_cache_db())?;
 
     let wal_dir = paths.wal_dir();
     // `ensure_dirs` above already created wal_dir; this assertion documents
@@ -1316,8 +1325,8 @@ mod tests {
         assert!(paths.metadata_db().exists(), "metadata.redb should exist");
         assert!(paths.shard_uuid().exists(), "shard.uuid should exist");
 
-        // Knowledge-layer files are NOT created by spawn — owning
-        // modules open them on demand.
+        // entity.hnsw / statement.hnsw — NOT created by spawn; owning
+        // modules open them on demand in phases 16 / 17.
         assert!(
             !paths.entity_hnsw().exists(),
             "entity.hnsw is created by phase 16, not by spawn"
@@ -1326,9 +1335,11 @@ mod tests {
             !paths.statement_hnsw().exists(),
             "statement.hnsw is created by phase 17, not by spawn"
         );
+
+        // llm_cache.redb — IS created by spawn as of sub-task 15.4.
         assert!(
-            !paths.llm_cache_db().exists(),
-            "llm_cache.redb is created by sub-task 15.4, not by spawn"
+            paths.llm_cache_db().exists(),
+            "llm_cache.redb should be created by spawn (sub-task 15.4)"
         );
     }
 }
