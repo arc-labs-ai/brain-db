@@ -41,9 +41,11 @@ use redb::{
     Database, ReadTransaction, ReadableDatabase, ReadableTable, TransactionError, WriteTransaction,
 };
 
+use crate::predicate_ops::{predicate_intern, PredicateOpError};
 use crate::schema::{open_or_init_schema, SchemaError};
 use crate::tables::checkpoint::{latest as latest_checkpoint, CHECKPOINTS_TABLE};
 use crate::tables::knowledge::entity_type::{EntityTypeDefinition, ENTITY_TYPES_TABLE};
+use brain_core::knowledge::StatementKind;
 use brain_core::EntityType;
 
 /// Public type wrapping the redb metadata file. Single ownership per
@@ -117,6 +119,87 @@ fn seed_builtin_entity_types(db: &Database) -> Result<(), MetadataDbError> {
     Ok(())
 }
 
+/// Built-in predicates seeded at `MetadataDb::open` per spec §19/00
+/// §"Built-in predicates". User-declared predicates land via phase
+/// 19's `SCHEMA_UPLOAD`.
+///
+/// `(namespace, name, kind_constraint, object_type_constraint_byte,
+///  description)`.
+///
+/// `object_type_constraint_byte`: `0` = any / `1` = Entity / `2` =
+/// Value / `3` = Memory / `4` = Statement (matches
+/// `StatementObject::discriminant()` offset by 1).
+const BUILTIN_PREDICATES: &[(&str, &str, Option<StatementKind>, u8, &str)] = &[
+    (
+        "brain",
+        "is_a",
+        Some(StatementKind::Fact),
+        1, // Entity
+        "Subject is an instance of the object entity type.",
+    ),
+    (
+        "brain",
+        "has_name",
+        Some(StatementKind::Fact),
+        2, // Value
+        "Subject's canonical name as a text value.",
+    ),
+    (
+        "brain",
+        "mentions",
+        Some(StatementKind::Fact),
+        0, // any
+        "Generic mention — subject mentions object.",
+    ),
+    (
+        "brain",
+        "related_to",
+        Some(StatementKind::Fact),
+        1, // Entity
+        "Generic relation between subject entity and object entity.",
+    ),
+];
+
+/// Seed the built-in `brain:*` predicates idempotently. Sub-task 17.3.
+///
+/// Walks the [`BUILTIN_PREDICATES`] catalog; each entry is interned via
+/// [`predicate_intern`], which is itself idempotent when the row
+/// already matches and refuses to clobber when constraints differ.
+/// `seed_builtin_predicates` therefore leaves pre-existing rows alone
+/// (test fixtures, prior opens, future user schemas that import a
+/// `brain:*` predicate verbatim) and never overwrites diverging shapes.
+fn seed_builtin_predicates(db: &Database) -> Result<(), MetadataDbError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+
+    let wtxn = db.begin_write()?;
+    for (ns, name, kind_constraint, obj_type, desc) in BUILTIN_PREDICATES {
+        match predicate_intern(
+            &wtxn,
+            ns,
+            name,
+            *kind_constraint,
+            *obj_type,
+            /* schema_version */ 1,
+            desc,
+            now,
+        ) {
+            Ok(_) => {}
+            // AlreadyExists with diverging constraints: leave the
+            // pre-existing row alone — never overwrite a user/test
+            // shape. Spec §19/00 leaves the precedence question open;
+            // the conservative choice for v1 is to preserve.
+            Err(PredicateOpError::AlreadyExists { .. }) => {}
+            Err(e) => return Err(MetadataDbError::BuiltinPredicateSeed(e)),
+        }
+    }
+    wtxn.commit()
+        .map_err(|e| MetadataDbError::Schema(SchemaError::Commit(e)))?;
+    Ok(())
+}
+
 /// Errors returned by [`MetadataDb::open`].
 ///
 /// After open, read/write transaction errors propagate as their native
@@ -133,6 +216,10 @@ pub enum MetadataDbError {
 
     #[error("schema: {0}")]
     Schema(#[from] SchemaError),
+
+    /// Seeding a built-in predicate failed at `MetadataDb::open`.
+    #[error("built-in predicate seed: {0}")]
+    BuiltinPredicateSeed(PredicateOpError),
 }
 
 impl MetadataDb {
@@ -168,6 +255,13 @@ impl MetadataDb {
         // EntityTypeId(2)+ so this slot stays stable. Idempotent — any
         // pre-existing row (test fixture or prior open) skips the seed.
         seed_builtin_entity_types(&db)?;
+
+        // Sub-task 17.3: seed `brain:is_a` / `brain:has_name` /
+        // `brain:mentions` / `brain:related_to` predicates. Each
+        // intern is idempotent on identical constraints; diverging
+        // rows are preserved. Phase 19's `SCHEMA_UPLOAD` registers
+        // user predicates against this same registry.
+        seed_builtin_predicates(&db)?;
 
         Ok(Self {
             db,

@@ -18,6 +18,7 @@ pub mod db;
 pub mod entity_merge_ops;
 pub mod entity_ops;
 pub mod llm_cache;
+pub mod predicate_ops;
 pub mod schema;
 pub mod sink;
 pub mod tables;
@@ -30,6 +31,9 @@ pub use entity_ops::{
     entity_tombstone, entity_update, normalize_name, EntityOpError,
 };
 pub use llm_cache::{LlmCacheDb, LlmCacheError, LlmResponse};
+pub use predicate_ops::{
+    predicate_get, predicate_intern, predicate_list, predicate_lookup_by_qname, PredicateOpError,
+};
 pub use trigram_ops::{
     candidates_for_query, extract_trigrams, index_entity_trigrams, jaccard,
     lookup_candidates_by_trigram, remove_entity_trigrams, trigrams_of_entity, TrigramOpError,
