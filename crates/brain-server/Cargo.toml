@@ -93,3 +93,8 @@ rustls.workspace = true
 rcgen.workspace = true
 brain-sdk-rust = { path = "../brain-sdk-rust" }
 brain-cli = { path = "../brain-cli" }
+# 15.5 substrate-only regression test opens metadata.redb directly to
+# assert knowledge-layer tables stayed empty.
+redb.workspace = true
+brain-storage = { path = "../brain-storage" }
+tracing.workspace = true

@@ -528,6 +528,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "rcgen",
+ "redb",
  "reqwest",
  "rustls",
  "rustls-pemfile",
