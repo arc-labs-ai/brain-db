@@ -345,20 +345,25 @@ The 17-document specification is **complete** (~42K lines). Implementation is ph
 
 | Phase | Scope | Status |
 |---|---|---|
-| 0 | Workspace skeleton, CI | ✓ tagged `phase-0-complete` |
-| 1 | Wire protocol & core types | ✓ tagged `phase-1-complete` (122 tests, 3 fuzz targets, ~67M fuzz runs zero panics) |
-| 2 | Storage: arena + WAL + recovery | ☐ planning complete; starting |
-| 3 | Metadata + redb integration | ☐ |
-| 4 | ANN index (HNSW) | ☐ |
-| 5 | Embedding service | ☐ |
-| 6 | Query planner | ☐ |
-| 7 | Cognitive operations | ☐ |
-| 8 | Background workers | ☐ |
-| 9 | Server binary (Tokio + Glommio wiring) | ☐ |
-| 10 | SDK + admin CLI | ☐ |
-| 11 | Observability + benchmarks | ☐ |
+| 0 | Workspace skeleton, CI | ✓ `phase-0-complete` |
+| 1 | Wire protocol & core types | ✓ `phase-1-complete` |
+| 2 | Storage: arena + WAL + recovery | ✓ `phase-2-complete` |
+| 3 | Metadata + redb integration | ✓ `phase-3-complete` |
+| 4 | ANN index (HNSW) | ✓ `phase-4-complete` |
+| 5 | Embedding service | ✓ `phase-5-complete` |
+| 6 | Query planner | ✓ `phase-6-complete` |
+| 7 | Cognitive operations | ✓ `phase-7-complete` |
+| 8 | Background workers | ✓ `phase-8-complete` |
+| 9 | Server binary (Tokio + Glommio wiring) | ✓ `phase-9-complete` |
+| 10 | Rust SDK + admin CLI | ✓ `phase-10-complete` |
+| 11 | `brain-http` (HTTP/WS/SSE transport) | ✓ `phase-11-complete` |
+| 12 | Observability (metrics / logs / tracing / dashboards / alerts) | active |
+| 13 | Benchmarks & chaos | planned |
+| 14 | Acceptance & `v1.0.0` release | planned |
 
 See [`ROADMAP.md`](ROADMAP.md) for the high-level index and [`docs/phases/`](docs/phases/) for per-phase sub-task breakdowns. Per-phase plans (with web-validated external choices, trade-offs, risks, and test plans) are recorded in [`.claude/plans/`](.claude/plans/) as durable design ADRs.
+
+For operators running brain-server: [`docs/observability.md`](docs/observability.md) is the standalone guide to metrics, logs, tracing, dashboards, and alerts.
 
 ## Development environment
 
