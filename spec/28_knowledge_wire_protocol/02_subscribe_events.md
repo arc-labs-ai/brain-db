@@ -48,7 +48,7 @@ pub struct SubscriptionEvent {
 }
 ```
 
-The substrate's `SubscriptionEvent` (defined in [§07](../03_wire_protocol/07_request_frames.md)) is extended with the optional `knowledge_payload`. For substrate-emitted events the field is `None`; for knowledge-emitted events it carries the typed body.
+The substrate's `SubscriptionEvent` (defined in [`../03_wire_protocol/08_response_frames.md`](../03_wire_protocol/08_response_frames.md) §7) is extended with the optional `knowledge_payload`. For substrate-emitted events the field is `None`; for knowledge-emitted events it carries the typed body. The substrate's `EventType` enum is extended with the knowledge event variants (`EntityCreated` … `SchemaUpdated`) per the same section — wire-level extension applied in phase 16.7 under the pre-v1.0 compatibility policy.
 
 ## 3. `KnowledgeEventPayload` union
 
@@ -228,13 +228,15 @@ pub struct KnowledgeSubscriptionFilter {
 
 The server applies the filter at emission time (per [§03/07 §SubscribeRequest](../03_wire_protocol/07_request_frames.md) §"server-side filtering") — non-matching events are discarded before broadcast, not just at the subscriber's edge. This avoids amplifying high-volume events to uninterested subscribers.
 
-## 6. Phase 16.6c interim state
+## 6. Phase 16.6c interim state (resolved in 16.7)
 
-As of phase 16.6c (entity wire ops landed), the **emission path is not wired**. Handlers commit redb writes but do not call into `ctx.events.broadcast(...)`. This is intentional — phase 16.7 wires the emission path along with merge / unmerge / tombstone, so all entity event variants land together.
+As of phase 16.6c (entity wire ops landed), the emission path was **not wired** — handlers committed redb writes but did not call into `ctx.events.publish(...)`. Phase 16.7 closes this gap alongside merge / unmerge / tombstone, so all entity event variants land together:
 
-Subscribers that subscribe today receive substrate events only. The `KnowledgeEventPayload::None` invariant holds for all current emissions.
+- Substrate `EventEnvelope` gains an optional `knowledge_payload: Option<KnowledgeEventPayload>` field.
+- `ENTITY_CREATE` / `_UPDATE` / `_RENAME` handlers (16.6c) start emitting `EntityCreated` / `EntityUpdated` / `EntityRenamed` events post-commit.
+- `ENTITY_MERGE` / `_UNMERGE` / `_TOMBSTONE` handlers (16.7) emit their respective events.
 
-Tracked as an open item in [`./09_open_questions.md`](./09_open_questions.md): whether phase 16.7 should also retroactively emit `ENTITY_CREATED` for entities created via 16.6c's `ENTITY_CREATE` — leaning **no** (events are forward-only from their introduction).
+Per [`./09_open_questions.md`](./09_open_questions.md) Q4: there is **no retroactive emission** for entities created via 16.6c before 16.7 landed. Events are forward-only from their introduction.
 
 ## 7. Memory layer ↔ knowledge layer event correlation
 

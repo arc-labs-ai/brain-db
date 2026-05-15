@@ -4,6 +4,15 @@ Mechanics for `merge_entity(survivor, merged, confidence, actor)` — the operat
 
 This file specifies the **value-type / storage-level** mechanics. The wire shape and per-field validation are over there.
 
+## 0. Phase 16.7 scope note
+
+Phase 16.7 lands the merge / unmerge code at a phase-scoped subset of the full spec below:
+
+- **§5 steps 1-7, 10-15 are implemented in 16.7.** Aliases / attributes / mention_count fold; survivor / merged row updates; secondary-index teardown for merged; audit row write; event emission.
+- **§5 steps 8-9 (statements / relations re-routing) are deferred.** The statement and relation tables don't exist until phases 17 / 18. Phase 16.7 writes `statements_rerouted = 0` and `relations_rerouted = 0` into the audit. Phase 17 (when statements land) re-issues a sweep over `entity_merge_log` to re-route any statements whose subject / object referenced now-merged entities, and writes overflow lists. Phase 18 does the same for relations.
+
+A merge performed in 16.7 is **complete and unmerge-able** for its phase-scoped diff. When phases 17 / 18 land, they fix up the audit retroactively — the unmerge code path reads the post-fix-up audit (so an unmerge issued after phase 17 lands will correctly re-route any statements created against the survivor in the intervening window, including ones that referenced the merged entity before the merge).
+
 ## 1. Purpose
 
 A merge is the resolver's (or operator's) declaration that two entities refer to the same real-world thing. After merge:
@@ -44,21 +53,25 @@ Cross-type merges are forbidden in v1.0 — see [`../28_knowledge_wire_protocol/
 
 ## 4. Confidence-banded behavior
 
-The same opcode handles three operator-visible bands:
+The bands distinguish **system-initiated** merges (from the resolver's LLM tier in phase 21+) from **operator-initiated** merges (via the `ENTITY_MERGE` wire opcode):
 
-### 4.1 `confidence >= 0.95` — autonomous merge
+### 4.1 Operator-initiated (the only path in phase 16.7)
 
-The resolver may issue the merge without operator review. Audit row is written; `MERGED` event emitted. Operators see the merge after the fact.
+When `actor = Actor::Agent(_)` — the merge came from `ENTITY_MERGE` over the wire — the merge **applies immediately** at any confidence `>= 0.7`. The operator is making an explicit decision; there is no review queue (the operator IS the reviewer). Audit row written, `MERGED` event emitted.
 
-### 4.2 `0.7 <= confidence < 0.95` — review required
+`confidence < 0.7` is rejected as `INVALID_ARGUMENT` regardless of actor — extremely low confidence merges are caller bugs, not policy decisions.
 
-The merge is **not** applied. Instead, an audit row is written with `outcome = Pending` and the merge appears in `ADMIN_LIST_PENDING_RESOLUTIONS`. An operator confirms via `ADMIN_RESOLVE_AMBIGUITY` (the same opcode used for resolution ambiguities — the audit kind discriminates).
+### 4.2 System-initiated (phase 21+, when resolver's LLM tier suggests merges)
 
-Wire-side, this returns success with `audit_id` populated and an `ErrorDetails.message` noting "review required" — clients can poll the audit.
+When `actor = Actor::System` — the merge came from an internal worker (the LLM-tier resolver, phase 21):
 
-### 4.3 `confidence < 0.7` — rejected
+- `confidence >= 0.95`: **autonomous merge.** Audit row written; `MERGED` event emitted. Operators see the merge after the fact via `ADMIN_LIST_PENDING_RESOLUTIONS` audit history.
+- `0.7 <= confidence < 0.95`: **review required.** The merge is **not** applied. Instead, an audit row is written with `outcome = Pending` and the merge appears in `ADMIN_LIST_PENDING_RESOLUTIONS`. An operator confirms via `ADMIN_RESOLVE_AMBIGUITY` (audit kind discriminates merge-pending vs resolution-pending).
+- `confidence < 0.7`: not a merge candidate; the resolver shouldn't even surface it.
 
-Returns `INVALID_ARGUMENT`. Not a merge candidate.
+### 4.3 Phase 16.7 implementation
+
+Only §4.1 is wired in 16.7. The handler always sets `actor_kind = Agent` (from the connection's authenticated agent) and always applies the merge if §3 pre-conditions pass. The review-queue path lands when the LLM tier lands (phase 21+).
 
 ## 5. Mechanics (autonomous path)
 

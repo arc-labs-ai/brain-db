@@ -44,9 +44,66 @@ value: rkyv-serialized ResolutionAudit
 
 ### `entity_merge_log`
 ```
-key:   (timestamp: u64, merge_id: u128)
-value: MergeRecord { survivor, merged, confidence, actor, attributes_resolution }
+key:   (timestamp_unix_nanos: u64, merge_id: [u8; 16])
+value: MergeRecord
 ```
+
+`MergeRecord` carries the **complete diff** between pre-merge and post-merge state. Unmerge ([`./04_unmerge.md`](./04_unmerge.md)) replays this diff in reverse:
+
+```rust
+pub struct MergeRecord {
+    pub merge_id_bytes: [u8; 16],
+    pub survivor_bytes: [u8; 16],
+    pub merged_bytes: [u8; 16],
+
+    // Pre-merge / post-merge identity.
+    pub merged_at_unix_nanos: u64,
+    pub grace_period_until_unix_nanos: u64,
+    pub confidence: f32,
+    pub reason: String,                                // ≤ 4 KiB; operator-supplied
+    pub actor_kind: u8,                                // 0 = System, 1 = Agent
+    pub actor_agent_bytes: [u8; 16],                   // [0;16] when actor_kind=System
+
+    // Diffs against the survivor (replayed in reverse by unmerge).
+    pub aliases_added: Vec<String>,                    // aliases merged contributed to survivor
+    pub trigrams_added: Vec<[u8; 3]>,                  // trigrams contributed (derived from
+                                                       // aliases_added + merged.canonical_name)
+    pub attribute_conflicts: Vec<AttributeConflictRecord>,
+
+    // Re-routing counts (lists deferred to overflow rows when large).
+    pub statements_rerouted: u32,                      // phase 17+: populated by re-route step
+    pub relations_rerouted: u32,                       // phase 18+: populated by re-route step
+    pub mention_count_added: u32,                      // survivor.mention_count += this on merge
+
+    // Status.
+    pub finalized: u8,                                 // 0 = reversible, 1 = grace expired / unmerge invalid
+    pub unmerged_at_unix_nanos: u64,                   // 0 = still merged
+    pub unmerged_by_actor_kind: u8,                    // 0 if !unmerged
+    pub unmerged_by_agent_bytes: [u8; 16],             // [0;16] if !unmerged or actor=System
+}
+
+pub struct AttributeConflictRecord {
+    pub attribute_key: String,
+    pub survivor_value_blob: Vec<u8>,                  // rkyv-encoded original survivor value
+    pub merged_value_blob: Vec<u8>,                    // rkyv-encoded original merged value
+    pub policy: u8,                                    // 1=survivor_wins, 2=merged_wins,
+                                                       // 3=newest_wins, 4=concat_text, 5=reject_merge
+    pub outcome: u8,                                   // 1=KeptSurvivor, 2=ReplacedWithMerged,
+                                                       // 3=Concatenated
+}
+```
+
+**Phase scope:** the `statements_rerouted` / `relations_rerouted` **counts** are written from phase 16.7 onward (currently always `0` since statement/relation tables don't exist until phases 17/18). The per-statement / per-relation **lists** (needed for unmerge to know which rows to re-route back) live in a sibling `entity_merge_audit_overflow` table introduced in phase 17 when statements land:
+
+```
+ENTITY_MERGE_AUDIT_OVERFLOW
+key:   ([u8; 16] merge_id, u32 chunk_index)
+value: MergeAuditOverflow { rerouted_statement_ids: Vec<[u8; 16]>, rerouted_relation_ids: Vec<[u8; 16]> }
+```
+
+Pre-phase-17, the overflow table is declared but never written.
+
+**Versioning:** the `MergeRecord` rkyv shape introduced in phase 16.7 is `v2`. Phase 16.5 stubbed a `v1` shape with only `(survivor, merged, timestamps, confidence, finalized)`; no production deployments exist on `v1` so the migration is a straight replacement, not a rolling upgrade. See [`../../crates/brain-metadata/src/tables/knowledge/merge.rs`](../../crates/brain-metadata/src/tables/knowledge/merge.rs).
 
 ## Entity embedding HNSW
 

@@ -109,6 +109,43 @@ Is this sufficient? Or should there be a `ENTITY_RETRACT` opcode (analogous to `
 
 **Target:** post-v1.0. **Status:** deferred. Discussion may move to the compliance section once one exists.
 
+---
+
+### Q10 — Statement / relation re-routing deferral
+
+[`./03_merge.md`](./03_merge.md) §0 notes that statement / relation re-routing during merge is deferred to phases 17 / 18. Once those phases land, a **retroactive sweep** must re-route any rows that referenced now-merged entities and update the `entity_merge_log` audit overflow lists.
+
+Questions:
+
+- Does the sweep run **eagerly at phase-17 / 18 startup** (one-time pass over all existing merge_log rows), or **lazily** (audit overflow lists populated on next read)?
+- If eager: who owns the sweep — a one-shot migration helper, or the regular consolidation worker?
+- What happens if a merge issued in phase 16.7 is unmerged **after** phase 17 lands but **before** the sweep runs? The unmerge code path must handle a partially-populated audit gracefully.
+
+**Target:** phase 17. **Status:** open. **Likely outcome:** eager one-shot sweep at first startup of a phase-17 build against a phase-16-data db, gated by a "schema version" sentinel in the metadata.
+
+---
+
+### Q11 — Concurrent merge and re-route race
+
+Two operators issue `ENTITY_MERGE(A, B)` and `ENTITY_MERGE(B, C)` concurrently. The first commits then the second's pre-condition `merged.merged_into.is_none()` fails. Operator B's merge returns `ENTITY_MERGE_CONFLICT`.
+
+Is this the right UX? Alternative: silently chain the merge ((A → B → C) becomes (A → C) directly). Current spec: reject; operator retries with `(A, C)`.
+
+**Target:** phase 16.7. **Status:** open. **Likely outcome:** keep the rejection; the cleaner failure mode beats the silent chain.
+
+---
+
+### Q12 — Re-merging after grace expires
+
+After the merge's grace period expires (`finalized = 1`), can the same `(survivor, merged)` pair be re-merged?
+
+The merged entity's `merged_into` is still set, so the merge attempt would fail the `merged.merged_into.is_none()` pre-condition. Two options:
+
+(a) Reject — operator must manually create a new entity to merge with.
+(b) Allow — treat post-grace as a clean state; new merge audit row written.
+
+**Target:** phase 16.7. **Status:** open. **Likely outcome:** (a) — keep merges idempotent against their audit row.
+
 ## Resolved
 
 (none yet — §18 backfill is recent)

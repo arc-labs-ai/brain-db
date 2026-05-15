@@ -157,17 +157,43 @@ struct SubscriptionEvent {
     salience: f32,
     timestamp_unix_nanos: u64,
     lsn: u64,                                // log sequence number; for resumption
+    knowledge_payload: Option<KnowledgeEventPayload>,  // §28/02 §3
 }
 
 enum EventType {
+    // Substrate events
     Encoded,                                 // new memory created
     Forgotten,                               // memory forgotten
     Reclaimed,                               // slot reclaimed (rare; only seen with low filter sensitivity)
     KindChanged,                             // memory's kind changed
+
+    // Knowledge-layer events (§28/02). knowledge_payload is populated.
+    EntityCreated,
+    EntityUpdated,
+    EntityRenamed,
+    EntityMerged,
+    EntityUnmerged,
+    EntityTombstoned,
+    StatementCreated,
+    StatementSuperseded,
+    StatementTombstoned,
+    RelationCreated,
+    RelationSuperseded,
+    ExtractionCompleted,
+    ExtractionFailed,
+    SchemaUpdated,
 }
 ```
 
 When the subscription is unsubscribed, a final frame with EOS flag is sent. The final frame may carry no events; it just signals end-of-stream.
+
+### 7.1 Knowledge-layer events
+
+For substrate events (`Encoded`, `Forgotten`, `Reclaimed`, `KindChanged`), `knowledge_payload` is `None`. The substrate fields (`memory_id`, `context_id`, `kind`, `salience`, `text`) carry the event-specific data.
+
+For knowledge-layer events, the substrate fields are zero-filled where they don't apply (e.g. `memory_id = MemoryId::zero()` for `EntityCreated`), and the typed `KnowledgeEventPayload` carries the event-specific data. The payload's shape per event type is defined in [`../28_knowledge_wire_protocol/02_subscribe_events.md`](../28_knowledge_wire_protocol/02_subscribe_events.md) §3.
+
+The optional payload field is **forward-compatible** — pre-knowledge-layer SDKs that don't decode `knowledge_payload` silently drop knowledge events (or surface them as opaque `event_type` codes). The extension was made in phase 16.7 under the pre-v1.0 compatibility policy ([`12_versioning.md`](12_versioning.md) §0).
 
 ## 8. UNSUBSCRIBE_RESP (0xB1)
 
