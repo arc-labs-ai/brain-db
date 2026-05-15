@@ -43,15 +43,39 @@ Measured at 100K entities per shard. Phase-16 perf gate; substrate workload assu
 | ENTITY_RESOLVE (tier 1 — exact / alias) | 0.5 ms | 1 ms | 2 ms | 5 ms |
 | ENTITY_RESOLVE (tier 2 — trigram fuzzy) | 5 ms | 15 ms | 30 ms | 60 ms |
 
-### 2.3 Knowledge layer — deferred targets
+### 2.3 Knowledge layer — statement operations (phase 17)
+
+Measured at 1M statements per shard. Phase-17 perf gate; substrate workload assumptions in §1 apply.
+
+| Operation | p50 | p95 | p99 | p99.9 |
+|---|---|---|---|---|
+| STATEMENT_CREATE (Fact, 3 evidence) | 2 ms | 5 ms | 10 ms | 25 ms |
+| STATEMENT_CREATE (Preference, auto-supersede) | 3 ms | 8 ms | 15 ms | 30 ms |
+| STATEMENT_CREATE (Event) | 2 ms | 5 ms | 10 ms | 25 ms |
+| STATEMENT_GET | 0.5 ms | 1 ms | 2 ms | 5 ms |
+| STATEMENT_SUPERSEDE (explicit) | 3 ms | 8 ms | 15 ms | 30 ms |
+| STATEMENT_TOMBSTONE | 1 ms | 3 ms | 5 ms | 10 ms |
+| STATEMENT_RETRACT | 1 ms | 3 ms | 5 ms | 10 ms |
+| STATEMENT_HISTORY (chain ≤ 10 versions) | 1 ms | 3 ms | 5 ms | 10 ms |
+| STATEMENT_LIST (subject filter, current_only, ≤ 100 results) | 2 ms | 5 ms | 10 ms | 20 ms |
+| STATEMENT_LIST (predicate filter, ≤ 100 results) | 3 ms | 8 ms | 15 ms | 30 ms |
+| `statements_contradicting()` internal | 2 ms | 5 ms | 10 ms | 20 ms |
+
+CREATE numbers assume the inline evidence path (≤ 8 evidence entries) and ~7 secondary index writes per `statement_create` ([§19/03 §2](../19_statements/03_storage.md)). Overflow path adds ~5 ms per chunk for the overflow row write.
+
+### 2.4 Knowledge layer — deferred targets
 
 - **ENTITY_RESOLVE (tier 3 — embedding HNSW)** lands when the entity HNSW is wired into the resolver (phase 21). Target placeholder per the phase-16 doc: p50 ≤ 5 ms at 100K, ≤ 50 ms at 1M. Final numbers set in phase 21.
 - **ENTITY_RESOLVE (tier 4 — LLM)** lands in phase 21 with the LLM extractor. Latency is gated by the model + cache hit-rate; target is "tail under 1 s with cache warm, queued under 5 s cold."
-- **Statement / relation / query** opcodes — separate phases (17 / 18 / 22-23) and separate target rows.
+- **Statement HNSW semantic search** — phase 21 when the embedding worker populates the HNSW. Phase 17 writes / reads only; semantic search target lands with the worker.
+- **Relation / query / admin** opcodes — separate phases (18 / 22-23 / 22) and separate target rows.
 
-### 2.4 Phase-16 perf gate
+### 2.5 Phase perf gates
 
-The phase-16 acceptance gate (sub-task 16.9) verifies §2.2 targets at 100K entities on the dev workstation. Production-reference numbers (16-core / 64 GB / NVMe per §1) are revalidated in phase 14's CI suite.
+- **Phase 16 (sub-task 16.9)** — §2.2 entity targets at 100K entities.
+- **Phase 17 (sub-task 17.10)** — §2.3 statement targets at 1M statements.
+
+Phases verify on the dev workstation; production-reference numbers (16-core / 64 GB / NVMe per §1) are revalidated in phase 14's CI suite.
 
 ## 3. The breakdown
 
