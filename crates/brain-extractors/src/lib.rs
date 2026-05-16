@@ -13,18 +13,25 @@
 )]
 #![forbid(unsafe_code)]
 
+pub mod classifier;
 pub mod extractor;
 pub mod idempotency;
 pub mod item;
+pub mod labels;
 pub mod options;
 pub mod pattern;
 pub mod registry;
 
+pub use classifier::{
+    BertTokenClassifier, ClassifierConfig, ClassifierExtractor, ClassifierModel,
+    TokenClassification,
+};
 pub use extractor::{
     ExtractionContext, ExtractionResult, ExtractionStatus, Extractor, ExtractorError,
 };
 pub use idempotency::{hash_memory_text, IdempotencyKey};
 pub use item::{EntityMention, ExtractedItem, RelationMention, StatementMention};
+pub use labels::{decode_bio, load_labels_file, BioSpan};
 pub use options::ExtractorRunOptions;
 pub use pattern::{CompiledRegex, PatternExtractor};
 pub use registry::ExtractorRegistry;

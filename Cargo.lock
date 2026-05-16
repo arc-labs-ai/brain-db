@@ -382,10 +382,15 @@ dependencies = [
  "blake3",
  "brain-core",
  "brain-protocol",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
  "regex",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
+ "tokenizers",
  "tracing",
 ]
 

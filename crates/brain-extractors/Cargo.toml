@@ -14,8 +14,15 @@ blake3 = { workspace = true }
 thiserror.workspace = true
 tracing.workspace = true
 serde = { workspace = true }
+serde_json = { workspace = true }
 # 20.2: pattern extractor uses the regex crate's DFA matcher.
 regex = { workspace = true }
+# 20.3: classifier extractor loads operator-provided BERT NER weights
+# via candle (same crate set as brain-embed, phase 5).
+candle-core.workspace = true
+candle-nn.workspace = true
+candle-transformers.workspace = true
+tokenizers.workspace = true
 
 [dev-dependencies]
-serde_json = { workspace = true }
+tempfile = { workspace = true }
