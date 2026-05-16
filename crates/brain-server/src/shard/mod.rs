@@ -53,6 +53,7 @@
 
 pub mod adapters;
 pub mod llm_setup;
+pub mod tantivy_recovery;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -827,33 +828,32 @@ pub fn spawn_shard(
             let llm_deps = llm_setup::build_llm_deps(&shard_dir_for_executor);
             let llm_cache_for_ops = llm_deps.cache.clone();
 
-            // 22.1: open the per-shard tantivy indexes
+            // 22.1 + 22.7: open the per-shard tantivy indexes
             // (`memory_text.tantivy/` + `statements.tantivy/`)
-            // per spec §26/01 §6. Status arms feed the rebuild
-            // worker in 22.6; for now we log and continue —
-            // reads against an unhealthy index return
-            // `IndexUnavailable` at the retriever (22.5) layer.
+            // and honour any `IndexStatus::NeedsRebuild` arms by
+            // calling the 22.6 rebuild functions before the
+            // indexer workers start. See spec §26/01 §6.
+            // Recovery failures abort shard spawn — a shard with
+            // unrecoverable lexical indexes shouldn't accept
+            // reads.
             let tantivy_for_ops = match brain_index::TantivyShard::open(&shard_dir_for_executor) {
                 Ok(startup) => {
-                    if let brain_index::IndexStatus::NeedsRebuild { reason } =
-                        &startup.memory_status
-                    {
-                        tracing::warn!(
-                            target: "brain_server::shard",
-                            ?reason,
-                            "memory_text.tantivy needs rebuild (deferred to 22.6)",
-                        );
+                    let db_guard = metadata.lock();
+                    match crate::shard::tantivy_recovery::recover_tantivy_on_open(
+                        &shard_dir_for_executor,
+                        &*db_guard,
+                        startup,
+                    ) {
+                        Ok(shard) => Some(shard),
+                        Err(err) => {
+                            tracing::error!(
+                                target: "brain_server::shard",
+                                error = %err,
+                                "tantivy recovery failed; lexical retrieval unavailable",
+                            );
+                            None
+                        }
                     }
-                    if let brain_index::IndexStatus::NeedsRebuild { reason } =
-                        &startup.statements_status
-                    {
-                        tracing::warn!(
-                            target: "brain_server::shard",
-                            ?reason,
-                            "statements.tantivy needs rebuild (deferred to 22.6)",
-                        );
-                    }
-                    Some(startup.shard)
                 }
                 Err(err) => {
                     tracing::error!(
