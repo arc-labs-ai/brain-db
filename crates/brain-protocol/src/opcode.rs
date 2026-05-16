@@ -121,6 +121,14 @@ pub enum Opcode {
     SchemaValidateReq = 0x0123,
     SchemaValidateResp = 0x01A3,
 
+    // §28 extractor governance (0x0124-0x0126 low-byte range) — phase 20.8.
+    ExtractorListReq = 0x0124,
+    ExtractorListResp = 0x01A4,
+    ExtractorDisableReq = 0x0125,
+    ExtractorDisableResp = 0x01A5,
+    ExtractorEnableReq = 0x0126,
+    ExtractorEnableResp = 0x01A6,
+
     // §28 entity operations (0x0130-0x013F low-byte range)
     EntityCreateReq = 0x0130,
     EntityCreateResp = 0x01B0,
@@ -305,6 +313,13 @@ impl Opcode {
             0x01A2 => Self::SchemaListResp,
             0x0123 => Self::SchemaValidateReq,
             0x01A3 => Self::SchemaValidateResp,
+
+            0x0124 => Self::ExtractorListReq,
+            0x01A4 => Self::ExtractorListResp,
+            0x0125 => Self::ExtractorDisableReq,
+            0x01A5 => Self::ExtractorDisableResp,
+            0x0126 => Self::ExtractorEnableReq,
+            0x01A6 => Self::ExtractorEnableResp,
 
             other => return Err(ProtocolError::UnknownOpcode(other)),
         })

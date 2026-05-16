@@ -1,0 +1,36 @@
+[package]
+name = "brain-extractors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Extractor framework (pattern / classifier / llm) for the Brain knowledge layer."
+
+[dependencies]
+brain-core = { path = "../brain-core" }
+brain-protocol = { path = "../brain-protocol" }
+# 20.6: materialize loads `ExtractorDefinition` rows persisted by
+# brain-metadata::schema_apply.
+brain-metadata = { path = "../brain-metadata" }
+blake3 = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+# 20.2: pattern extractor uses the regex crate's DFA matcher.
+regex = { workspace = true }
+# 20.3: classifier extractor loads operator-provided BERT NER weights
+# via candle (same crate set as brain-embed, phase 5).
+candle-core.workspace = true
+candle-nn.workspace = true
+candle-transformers.workspace = true
+tokenizers.workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }
+criterion.workspace = true
+
+[[bench]]
+name = "pattern_extract"
+harness = false

@@ -1,5 +1,15 @@
 # Phase 20: Pattern + Classifier Extractors
 
+> **Status:** ✓ complete (with 20.7b classifier inference parked
+> as immediate follow-up). Superseded by the per-sub-task plans in
+> [`.claude/plans/phase-20*.md`](../../.claude/plans/) and the
+> "Phase 20" entry in [`ROADMAP.md`](../../ROADMAP.md).
+>
+> **Scope cut:** the candle forward pass for the bundled NER
+> classifier is parked as **phase 20.7b**. The framework path is
+> production-ready; operators provision `BRAIN_NER_MODEL_PATH` per
+> [`crates/brain-extractors/docs/bundled-ner.md`](../../crates/brain-extractors/docs/bundled-ner.md).
+
 ## Goal
 
 Implement the extractor framework, run pattern extractors synchronously on ENCODE, run classifier extractors near-foreground, write extraction audit logs, ship one built-in pattern extractor (`brain.entity_mentions`) and one built-in classifier (NER).

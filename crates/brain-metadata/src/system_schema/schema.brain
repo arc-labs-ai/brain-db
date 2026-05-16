@@ -85,3 +85,34 @@ define relation_type co_authored {
     symmetric: true
     description: "Generic symmetric ManyToMany relation; canonicalises from/to byte-wise."
 }
+
+# --- Built-in extractors -----------------------------------------
+#
+# Phase 20.7. These two register at MetadataDb::open (via the
+# system-schema bootstrap → schema_apply → extractor_intern path).
+# brain-server's shard spawn materialises them into the runtime
+# `ExtractorRegistry` so they fire on every ENCODE.
+#
+# Extractor IDs are stable across reopens because intern allocates
+# `max(existing) + 1`; on a fresh DB:
+#   entity_mentions → ExtractorId(1)
+#   basic_ner       → ExtractorId(2)
+
+define extractor entity_mentions {
+    kind: pattern
+    target: entity Person
+    patterns [
+        /\b([A-Z][a-z]+\s+[A-Z][a-z]+)\b/,
+        /\b([A-Z]\.\s*[A-Z][a-z]+)\b/
+    ]
+    confidence: 0.7
+}
+
+define extractor basic_ner {
+    kind: classifier
+    target: entity Person
+    model: "brain-basic-ner-v1"
+    feature_extraction: builtin
+    confidence_threshold: 0.6
+    trigger: on encode
+}

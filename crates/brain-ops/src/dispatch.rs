@@ -235,5 +235,22 @@ pub async fn dispatch(req: RequestBody, ctx: &OpsContext) -> Result<ResponseBody
         RequestBody::SchemaValidate(r) => crate::knowledge_schema::handle_schema_validate(r, ctx)
             .await
             .map(ResponseBody::SchemaValidate),
+
+        // Extractor governance ops — phase 20.8. Spec §28/05 §6-§7.
+        RequestBody::ExtractorList(r) => {
+            crate::knowledge_extractor::handle_extractor_list(r, ctx)
+                .await
+                .map(ResponseBody::ExtractorList)
+        }
+        RequestBody::ExtractorDisable(r) => {
+            crate::knowledge_extractor::handle_extractor_disable(r, ctx)
+                .await
+                .map(ResponseBody::ExtractorDisable)
+        }
+        RequestBody::ExtractorEnable(r) => {
+            crate::knowledge_extractor::handle_extractor_enable(r, ctx)
+                .await
+                .map(ResponseBody::ExtractorEnable)
+        }
     }
 }

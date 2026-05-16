@@ -376,6 +376,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "brain-extractors"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "brain-core",
+ "brain-metadata",
+ "brain-protocol",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "criterion",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokenizers",
+ "tracing",
+]
+
+[[package]]
 name = "brain-http"
 version = "0.1.0"
 dependencies = [
@@ -444,6 +465,7 @@ dependencies = [
  "blake3",
  "brain-core",
  "brain-embed",
+ "brain-extractors",
  "brain-index",
  "brain-metadata",
  "brain-planner",
@@ -522,6 +544,7 @@ dependencies = [
  "brain-cli",
  "brain-core",
  "brain-embed",
+ "brain-extractors",
  "brain-http",
  "brain-index",
  "brain-metadata",

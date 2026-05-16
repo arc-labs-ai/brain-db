@@ -124,6 +124,11 @@ pub enum RequestBody {
     SchemaGet(crate::knowledge::SchemaGetRequest),
     SchemaList(crate::knowledge::SchemaListRequest),
     SchemaValidate(crate::knowledge::SchemaValidateRequest),
+
+    // Extractor governance ops (phase 20.8). Spec §28/05 §6-§7.
+    ExtractorList(crate::knowledge::ExtractorListRequest),
+    ExtractorDisable(crate::knowledge::ExtractorDisableRequest),
+    ExtractorEnable(crate::knowledge::ExtractorEnableRequest),
 }
 
 impl RequestBody {
@@ -187,6 +192,9 @@ impl RequestBody {
             Self::SchemaGet(_) => Opcode::SchemaGetReq,
             Self::SchemaList(_) => Opcode::SchemaListReq,
             Self::SchemaValidate(_) => Opcode::SchemaValidateReq,
+            Self::ExtractorList(_) => Opcode::ExtractorListReq,
+            Self::ExtractorDisable(_) => Opcode::ExtractorDisableReq,
+            Self::ExtractorEnable(_) => Opcode::ExtractorEnableReq,
         }
     }
 
@@ -252,6 +260,9 @@ impl RequestBody {
             Self::SchemaGet(r) => to_rkyv_bytes(r),
             Self::SchemaList(r) => to_rkyv_bytes(r),
             Self::SchemaValidate(r) => to_rkyv_bytes(r),
+            Self::ExtractorList(r) => to_rkyv_bytes(r),
+            Self::ExtractorDisable(r) => to_rkyv_bytes(r),
+            Self::ExtractorEnable(r) => to_rkyv_bytes(r),
         }
     }
 
@@ -318,6 +329,9 @@ impl RequestBody {
             Opcode::SchemaGetReq => Self::SchemaGet(from_rkyv_bytes(bytes)?),
             Opcode::SchemaListReq => Self::SchemaList(from_rkyv_bytes(bytes)?),
             Opcode::SchemaValidateReq => Self::SchemaValidate(from_rkyv_bytes(bytes)?),
+            Opcode::ExtractorListReq => Self::ExtractorList(from_rkyv_bytes(bytes)?),
+            Opcode::ExtractorDisableReq => Self::ExtractorDisable(from_rkyv_bytes(bytes)?),
+            Opcode::ExtractorEnableReq => Self::ExtractorEnable(from_rkyv_bytes(bytes)?),
             other => return Err(ProtocolError::UnknownOpcode(other.as_u16())),
         })
     }

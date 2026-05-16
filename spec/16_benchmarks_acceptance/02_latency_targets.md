@@ -110,12 +110,36 @@ schemas (~500 definitions) take proportionally longer for the parse +
 validate pass. Persistence cost is dominated by the bulk of
 secondary writes (entity_types, predicates, relation_types entries).
 
-### 2.7 Phase perf gates
+### 2.7 Knowledge layer — extractor operations (phase 20)
+
+Measured at single-extractor dispatch over a 4 KiB memory body.
+Phase-20 perf gate; substrate workload in §1.
+
+| Operation | p50 | p95 | p99 | p99.9 |
+|---|---|---|---|---|
+| Pattern extractor (regex match + project) | 30 µs | 70 µs | 100 µs | 300 µs |
+| Classifier extractor (feature + inference) | 5 ms | 10 ms | 15 ms | 30 ms |
+| Audit-row write (primary + 3 indexes) | 200 µs | 600 µs | 1 ms | 2 ms |
+| `audit_by_memory` (limit 100) | 500 µs | 1 ms | 2 ms | 5 ms |
+| `audit_by_extractor` (limit 100) | 500 µs | 1 ms | 2 ms | 5 ms |
+
+Pattern numbers assume ≤ 6 patterns per extractor at typical
+specificity. Classifier numbers assume the bundled `brain.basic_ner`
+(small distilled BERT or rule-based fallback) — larger classifiers
+scale linearly with inference cost.
+
+ENCODE's overall P99 (§2.1, 20 ms) absorbs at most one classifier
+extractor synchronously per memory; additional classifier
+extractors dispatch through the near-foreground queue
+(§27/01 §3) and don't widen ENCODE's budget.
+
+### 2.8 Phase perf gates
 
 - **Phase 16 (sub-task 16.9)** — §2.2 entity targets at 100K entities.
 - **Phase 17 (sub-task 17.10)** — §2.3 statement targets at 1M statements.
 - **Phase 18 (sub-task 18.9)** — §2.4 relation targets at 1M relations.
 - **Phase 19 (sub-task 19.10b)** — §2.6 schema targets at 50 definitions.
+- **Phase 20 (sub-task 20.10)** — §2.7 extractor targets at single-extractor dispatch.
 
 Phases verify on the dev workstation; production-reference numbers (16-core / 64 GB / NVMe per §1) are revalidated in phase 14's CI suite.
 
