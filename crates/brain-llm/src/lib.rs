@@ -3,14 +3,15 @@
 //! LLM transport clients (Anthropic, OpenAI) for Brain's LLM
 //! extractor tier. Spec §22/09.
 //!
-//! Phase 21.1 lands:
+//! Phase 21.1 + 21.2 land:
 //! - `LlmClient` trait (object-safe, returns boxed future).
 //! - `LlmRequest` / `LlmResponse` / `LlmError`.
 //! - `AnthropicClient` (api.anthropic.com Messages API).
-//! - `ModelRouter` skeleton.
+//! - `OpenAIClient` (api.openai.com Chat Completions, with
+//!   structured-output mode for schema-validated requests).
+//! - `ModelRouter` with both providers wired.
 //!
-//! Phase 21.2 adds `OpenAIClient`. Phase 21.3 wires the LLM
-//! extractor in brain-extractors.
+//! Phase 21.3 wires the LLM extractor in brain-extractors.
 
 #![allow(
     clippy::module_name_repetitions,
@@ -22,11 +23,13 @@
 pub mod anthropic;
 pub mod client;
 pub mod error;
+pub mod openai;
 pub mod router;
 pub mod types;
 
 pub use anthropic::AnthropicClient;
 pub use client::LlmClient;
 pub use error::LlmError;
+pub use openai::OpenAIClient;
 pub use router::{ModelRouter, Provider};
 pub use types::{LlmMessage, LlmRequest, LlmResponse, LlmRole};
