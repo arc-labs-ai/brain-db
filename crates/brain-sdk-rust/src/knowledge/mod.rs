@@ -11,6 +11,7 @@
 pub mod builder;
 pub mod entity;
 pub mod errors;
+pub mod statement;
 
 pub use builder::{
     EntityClient, EntityCreateBuilder, EntityListBuilder, EntityMergeBuilder, EntityResolveBuilder,
@@ -19,4 +20,10 @@ pub use builder::{
 pub use entity::{
     BrainEntityType, EntityHandle, EntityHandleFromViewError, Person, PersonAttributes,
 };
-pub use errors::{ClientErrorEntityExt, EntityErrorKind};
+pub use errors::{
+    ClientErrorEntityExt, ClientErrorStatementExt, EntityErrorKind, StatementErrorKind,
+};
+pub use statement::{
+    EventBuilder, FactBuilder, PreferenceBuilder, StatementHandle, StatementListBuilder,
+    StatementsClient,
+};

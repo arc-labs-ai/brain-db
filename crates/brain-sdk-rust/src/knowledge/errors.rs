@@ -134,6 +134,109 @@ impl ClientErrorEntityExt for ClientError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Statement error inspection (17.8).
+// ---------------------------------------------------------------------------
+
+/// Statement error category, derived from substrate `ErrorCode` +
+/// message inspection. Mirrors [`EntityErrorKind`] but for the
+/// statement-layer opcodes (spec §28/06).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StatementErrorKind {
+    /// `STATEMENT_NOT_FOUND` (§28 0x40).
+    NotFound,
+    /// `STATEMENT_OBJECT_TYPE_MISMATCH` (§28 0x41) — the statement's
+    /// object variant violates the predicate's `object_type_constraint`.
+    ObjectTypeMismatch,
+    /// `STATEMENT_CONTRADICTS_EXISTING` (§28 0x42). In v1 this is
+    /// purely an audit signal: Fact create still succeeds even when
+    /// it contradicts, so this is reserved for future explicit-reject
+    /// modes.
+    ContradictsExisting,
+    /// `predicate {qname} not registered`. The statement references a
+    /// predicate that hasn't been registered via `SCHEMA_UPLOAD` (or
+    /// is built-in but referenced under the wrong qname).
+    PredicateUnknown,
+    /// The statement references a subject that doesn't exist on the
+    /// server.
+    SubjectUnknown,
+    /// Chain-state pre-condition failure (already superseded, already
+    /// tombstoned, kind/subject/predicate mismatch on supersede,
+    /// Event supersession).
+    ChainConflict,
+}
+
+/// Extension trait for inspecting statement-layer errors on a
+/// [`ClientError`]. Mirrors [`ClientErrorEntityExt`].
+pub trait ClientErrorStatementExt {
+    /// Returns the statement error category if the inner error matches
+    /// one of the spec §28/06 patterns; `None` otherwise.
+    fn statement_error(&self) -> Option<StatementErrorKind>;
+
+    fn is_statement_not_found(&self) -> bool {
+        self.statement_error() == Some(StatementErrorKind::NotFound)
+    }
+
+    fn is_statement_object_type_mismatch(&self) -> bool {
+        self.statement_error() == Some(StatementErrorKind::ObjectTypeMismatch)
+    }
+
+    fn is_statement_predicate_unknown(&self) -> bool {
+        self.statement_error() == Some(StatementErrorKind::PredicateUnknown)
+    }
+
+    fn is_statement_subject_unknown(&self) -> bool {
+        self.statement_error() == Some(StatementErrorKind::SubjectUnknown)
+    }
+
+    fn is_statement_chain_conflict(&self) -> bool {
+        self.statement_error() == Some(StatementErrorKind::ChainConflict)
+    }
+}
+
+impl ClientErrorStatementExt for ClientError {
+    fn statement_error(&self) -> Option<StatementErrorKind> {
+        let message = match self {
+            ClientError::Server { message, .. } => message,
+            _ => return None,
+        };
+        let lower = message.to_lowercase();
+
+        // Chain / state conflicts.
+        if lower.contains("already superseded")
+            || lower.contains("already tombstoned")
+            || lower.contains("events cannot be superseded")
+            || lower.contains("kind mismatch on supersede")
+            || lower.contains("subject must match on supersede")
+            || lower.contains("predicate must match on supersede")
+        {
+            return Some(StatementErrorKind::ChainConflict);
+        }
+
+        if lower.contains("contradict") {
+            return Some(StatementErrorKind::ContradictsExisting);
+        }
+
+        if lower.contains("object variant") || lower.contains("object_type_constraint") {
+            return Some(StatementErrorKind::ObjectTypeMismatch);
+        }
+
+        if lower.contains("unknown predicate") || lower.contains("predicate") && lower.contains("not registered") {
+            return Some(StatementErrorKind::PredicateUnknown);
+        }
+
+        if lower.contains("subject entity") && lower.contains("not found") {
+            return Some(StatementErrorKind::SubjectUnknown);
+        }
+
+        if lower.contains("statement") && lower.contains("not found") {
+            return Some(StatementErrorKind::NotFound);
+        }
+
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

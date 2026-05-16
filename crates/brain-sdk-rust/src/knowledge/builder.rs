@@ -89,7 +89,7 @@ where
         });
         match self
             .client
-            .send_entity_request(body, Opcode::EntityGetReq, Opcode::EntityGetResp)
+            .send_knowledge_request(body, Opcode::EntityGetReq, Opcode::EntityGetResp)
             .await
         {
             Ok(ResponseBody::EntityGet(r)) => {
@@ -124,7 +124,7 @@ where
         });
         let resp = self
             .client
-            .send_entity_request(body, Opcode::EntityRenameReq, Opcode::EntityRenameResp)
+            .send_knowledge_request(body, Opcode::EntityRenameReq, Opcode::EntityRenameResp)
             .await?;
         match resp {
             ResponseBody::EntityRename(r) => {
@@ -151,7 +151,7 @@ where
         });
         let resp = self
             .client
-            .send_entity_request(body, Opcode::EntityUnmergeReq, Opcode::EntityUnmergeResp)
+            .send_knowledge_request(body, Opcode::EntityUnmergeReq, Opcode::EntityUnmergeResp)
             .await?;
         match resp {
             ResponseBody::EntityUnmerge(r) => Ok(EntityId::from(r.restored_entity_id)),
@@ -188,7 +188,7 @@ where
         });
         let resp = self
             .client
-            .send_entity_request(body, Opcode::EntityTombstoneReq, Opcode::EntityTombstoneResp)
+            .send_knowledge_request(body, Opcode::EntityTombstoneReq, Opcode::EntityTombstoneResp)
             .await?;
         match resp {
             ResponseBody::EntityTombstone(r) => Ok(r.tombstoned_at_unix_nanos),
@@ -275,7 +275,7 @@ where
         });
         let resp = self
             .client
-            .send_entity_request(body, Opcode::EntityCreateReq, Opcode::EntityCreateResp)
+            .send_knowledge_request(body, Opcode::EntityCreateReq, Opcode::EntityCreateResp)
             .await?;
         let id = match resp {
             ResponseBody::EntityCreate(r) => EntityId::from(r.entity_id),
@@ -288,7 +288,7 @@ where
         });
         let resp = self
             .client
-            .send_entity_request(body, Opcode::EntityGetReq, Opcode::EntityGetResp)
+            .send_knowledge_request(body, Opcode::EntityGetReq, Opcode::EntityGetResp)
             .await?;
         match resp {
             ResponseBody::EntityGet(r) => {
@@ -392,7 +392,7 @@ where
             });
             match self
                 .client
-                .send_entity_request(body, Opcode::EntityGetReq, Opcode::EntityGetResp)
+                .send_knowledge_request(body, Opcode::EntityGetReq, Opcode::EntityGetResp)
                 .await
             {
                 Ok(ResponseBody::EntityGet(r)) => {
@@ -437,7 +437,7 @@ where
         });
         let resp = self
             .client
-            .send_entity_request(body, Opcode::EntityUpdateReq, Opcode::EntityUpdateResp)
+            .send_knowledge_request(body, Opcode::EntityUpdateReq, Opcode::EntityUpdateResp)
             .await?;
         match resp {
             ResponseBody::EntityUpdate(r) => {
@@ -507,7 +507,7 @@ where
         });
         let resp = self
             .client
-            .send_entity_request(body, Opcode::EntityMergeReq, Opcode::EntityMergeResp)
+            .send_knowledge_request(body, Opcode::EntityMergeReq, Opcode::EntityMergeResp)
             .await?;
         match resp {
             ResponseBody::EntityMerge(r) => Ok(MergeOutcome {
@@ -588,7 +588,7 @@ where
         });
         let resp = self
             .client
-            .send_entity_request(body, Opcode::EntityResolveReq, Opcode::EntityResolveResp)
+            .send_knowledge_request(body, Opcode::EntityResolveReq, Opcode::EntityResolveResp)
             .await?;
         let r = match resp {
             ResponseBody::EntityResolve(r) => r,
@@ -746,7 +746,7 @@ where
         });
         let resp = self
             .client
-            .send_entity_request(body, Opcode::EntityListReq, Opcode::EntityListResp)
+            .send_knowledge_request(body, Opcode::EntityListReq, Opcode::EntityListResp)
             .await?;
         let frame: EntityListResponseFrame = match resp {
             ResponseBody::EntityList(f) => f,
@@ -761,7 +761,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Client integration — send_entity_request internal helper.
+// Client integration — send_knowledge_request internal helper.
 // ---------------------------------------------------------------------------
 
 impl Client {
@@ -789,7 +789,7 @@ impl Client {
 
     /// Internal: send a knowledge entity request and read one
     /// response frame. Used by every builder above.
-    pub(crate) async fn send_entity_request(
+    pub(crate) async fn send_knowledge_request(
         &self,
         body: RequestBody,
         req_opcode: Opcode,

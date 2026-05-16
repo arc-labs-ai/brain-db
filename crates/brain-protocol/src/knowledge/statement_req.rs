@@ -43,6 +43,40 @@ pub enum StatementValueWire {
     Blob(Vec<u8>),
 }
 
+// `From` impls for ergonomic `.object_value(...)` setters on the SDK
+// builders (17.8). Local-type rule means these must live alongside
+// the enum definition.
+impl From<String> for StatementValueWire {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+impl From<&str> for StatementValueWire {
+    fn from(s: &str) -> Self {
+        Self::Text(s.to_string())
+    }
+}
+impl From<i64> for StatementValueWire {
+    fn from(i: i64) -> Self {
+        Self::Integer(i)
+    }
+}
+impl From<f64> for StatementValueWire {
+    fn from(f: f64) -> Self {
+        Self::Float(f)
+    }
+}
+impl From<bool> for StatementValueWire {
+    fn from(b: bool) -> Self {
+        Self::Bool(b)
+    }
+}
+impl From<Vec<u8>> for StatementValueWire {
+    fn from(b: Vec<u8>) -> Self {
+        Self::Blob(b)
+    }
+}
+
 /// Wire counterpart to `brain_core::knowledge::StatementObject`. Spec
 /// §28/06 §2.2.
 ///
