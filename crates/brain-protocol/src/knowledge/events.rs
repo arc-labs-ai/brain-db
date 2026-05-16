@@ -37,6 +37,7 @@ pub enum KnowledgeEventPayload {
     // Relation events (phase 18).
     RelationCreated(RelationCreatedEvent),
     RelationSuperseded(RelationSupersededEvent),
+    RelationTombstoned(RelationTombstonedEvent),
 
     // Extractor events (phase 22).
     ExtractionCompleted(ExtractionCompletedEvent),
@@ -161,6 +162,14 @@ pub struct RelationCreatedEvent {
 pub struct RelationSupersededEvent {
     pub old_relation_id: WireUuid,
     pub new_relation_id: WireUuid,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub struct RelationTombstonedEvent {
+    pub relation_id: WireUuid,
+    pub reason: String,
 }
 
 // ---------------------------------------------------------------------------

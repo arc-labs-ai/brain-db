@@ -34,8 +34,8 @@ pub use entity_resp::{
 pub use events::{
     EntityCreatedEvent, EntityMergedEvent, EntityRenamedEvent, EntityTombstonedEvent,
     EntityUnmergedEvent, EntityUpdatedEvent, ExtractionCompletedEvent, ExtractionFailedEvent,
-    KnowledgeEventPayload, RelationCreatedEvent, RelationSupersededEvent, SchemaUpdatedEvent,
-    StatementCreatedEvent, StatementSupersededEvent, StatementTombstonedEvent,
+    KnowledgeEventPayload, RelationCreatedEvent, RelationSupersededEvent, RelationTombstonedEvent,
+    SchemaUpdatedEvent, StatementCreatedEvent, StatementSupersededEvent, StatementTombstonedEvent,
 };
 pub use relation_req::{
     RelationCreateRequest, RelationGetRequest, RelationListFromRequest, RelationListToRequest,

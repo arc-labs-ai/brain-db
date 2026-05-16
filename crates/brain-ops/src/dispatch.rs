@@ -185,15 +185,39 @@ pub async fn dispatch(req: RequestBody, ctx: &OpsContext) -> Result<ResponseBody
                 .map(ResponseBody::StatementList)
         }
 
-        // Relation ops — wire opcodes landed in 18.6; handlers in 18.7.
-        RequestBody::RelationCreate(_)
-        | RequestBody::RelationGet(_)
-        | RequestBody::RelationSupersede(_)
-        | RequestBody::RelationTombstone(_)
-        | RequestBody::RelationListFrom(_)
-        | RequestBody::RelationListTo(_)
-        | RequestBody::RelationTraverse(_) => {
-            Err(OpError::NotYetImplemented("relation op — Phase 18.7"))
+        // Relation ops — phase 18.7. Spec §28/07.
+        RequestBody::RelationCreate(r) => {
+            crate::knowledge_relation::handle_relation_create(r, ctx)
+                .await
+                .map(ResponseBody::RelationCreate)
+        }
+        RequestBody::RelationGet(r) => crate::knowledge_relation::handle_relation_get(r, ctx)
+            .await
+            .map(ResponseBody::RelationGet),
+        RequestBody::RelationSupersede(r) => {
+            crate::knowledge_relation::handle_relation_supersede(r, ctx)
+                .await
+                .map(ResponseBody::RelationSupersede)
+        }
+        RequestBody::RelationTombstone(r) => {
+            crate::knowledge_relation::handle_relation_tombstone(r, ctx)
+                .await
+                .map(ResponseBody::RelationTombstone)
+        }
+        RequestBody::RelationListFrom(r) => {
+            crate::knowledge_relation::handle_relation_list_from(r, ctx)
+                .await
+                .map(ResponseBody::RelationListFrom)
+        }
+        RequestBody::RelationListTo(r) => {
+            crate::knowledge_relation::handle_relation_list_to(r, ctx)
+                .await
+                .map(ResponseBody::RelationListTo)
+        }
+        RequestBody::RelationTraverse(r) => {
+            crate::knowledge_relation::handle_relation_traverse(r, ctx)
+                .await
+                .map(ResponseBody::RelationTraverse)
         }
     }
 }
