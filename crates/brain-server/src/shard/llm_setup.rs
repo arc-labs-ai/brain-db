@@ -150,10 +150,7 @@ mod tests {
 
     impl EnvGuard {
         fn new(keys: &[&'static str]) -> Self {
-            let snapshot = keys
-                .iter()
-                .map(|k| (*k, std::env::var(k).ok()))
-                .collect();
+            let snapshot = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
             // Start from a clean slate.
             for k in keys {
                 std::env::remove_var(k);

@@ -25,6 +25,16 @@ tokio = { version = "1", features = ["sync", "time"] }
 # 17.7: SmallVec used when projecting overflow evidence back to inline
 # for StatementView responses.
 smallvec.workspace = true
+# 22.3 — bounded channel between the ENCODE / FORGET post-commit
+# hooks and the per-shard tantivy indexer drain task.
+flume = { workspace = true }
+# 22.3 — IndexWriter, PreparedCommit, Term, doc!() — used by
+# the text indexer worker.
+tantivy = { workspace = true }
+# 22.3 — `glommio::spawn_local` for the per-shard drain task.
+# Same Linux-only constraint as brain-storage.
+[target.'cfg(target_os = "linux")'.dependencies]
+glommio = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

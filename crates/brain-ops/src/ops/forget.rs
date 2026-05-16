@@ -8,6 +8,7 @@ use brain_protocol::response::ForgetResponse;
 use crate::context::OpsContext;
 use crate::error::OpError;
 use crate::idempotency::hash_forget_request;
+use crate::ops::text_indexer::MemoryTextOp;
 use crate::txn::{BufferedForget, BufferedReplay};
 
 pub async fn handle_forget(
@@ -26,6 +27,20 @@ pub async fn handle_forget(
         result.outcome,
         ForgetOutcome::AlreadyTombstoned | ForgetOutcome::MemoryNotFound
     );
+
+    // §27/02 §2: FORGET drops the memory_text index row.
+    // Dispatch only when the row could actually exist (i.e. we
+    // didn't no-op on a missing memory) — keeps the queue tight
+    // on idempotent FORGET retries.
+    if let Some(dispatcher) = ctx.memory_text_dispatcher.as_ref() {
+        if !matches!(result.outcome, ForgetOutcome::MemoryNotFound) {
+            dispatcher
+                .dispatch(MemoryTextOp::Forget {
+                    id: MemoryId::from(memory_id_wire),
+                })
+                .await;
+        }
+    }
 
     Ok(ForgetResponse {
         memory_id: memory_id_wire,

@@ -21,6 +21,7 @@ use brain_planner::{ExecutorContext, PlannerContext};
 use parking_lot::{Mutex, RwLock};
 
 use crate::access_buffer::AccessBuffer;
+use crate::ops::text_indexer::MemoryTextDispatcher;
 use crate::subscribe::{EventBus, SubscriptionRegistry};
 use crate::txn::TxnStore;
 
@@ -70,6 +71,11 @@ pub struct OpsContext {
     /// indexer workers (22.3 / 22.4) borrow through this field;
     /// substrate-only deployments leave it `None`.
     pub tantivy: Option<Arc<TantivyShard>>,
+    /// Memory text indexer dispatcher (phase 22.3). `None` for
+    /// substrate-only deployments and tests that don't spawn the
+    /// drain task. ENCODE / FORGET handlers check this slot
+    /// post-WAL-commit and enqueue an indexer op when present.
+    pub memory_text_dispatcher: Option<Arc<MemoryTextDispatcher>>,
 }
 
 impl OpsContext {
@@ -89,6 +95,7 @@ impl OpsContext {
             classifier_config: Arc::new(ClassifierConfig::unloaded()),
             llm_cache: None,
             tantivy: None,
+            memory_text_dispatcher: None,
         }
     }
 
@@ -167,6 +174,19 @@ impl OpsContext {
     #[must_use]
     pub fn with_tantivy(mut self, tantivy: Option<Arc<TantivyShard>>) -> Self {
         self.tantivy = tantivy;
+        self
+    }
+
+    /// Install (or clear) the memory text indexer dispatcher
+    /// (phase 22.3). The matching drain task is spawned
+    /// separately by the caller (server spawn path uses
+    /// `glommio::spawn_local`).
+    #[must_use]
+    pub fn with_memory_text_dispatcher(
+        mut self,
+        dispatcher: Option<Arc<MemoryTextDispatcher>>,
+    ) -> Self {
+        self.memory_text_dispatcher = dispatcher;
         self
     }
 }

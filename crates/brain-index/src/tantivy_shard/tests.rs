@@ -19,7 +19,7 @@ fn memory_text_schema_matches_spec() {
     let schema = memory_text_schema();
 
     let expected = &[
-        ("memory_id", "u64"),
+        ("memory_id", "bytes"),
         ("text", "text"),
         ("agent_id", "bytes"),
         ("kind", "u64"),

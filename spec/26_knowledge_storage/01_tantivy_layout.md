@@ -38,7 +38,7 @@ phase 22.5 + §23/02 §5 rely on the exact field set for filters.
 
 | Field | Type | Options |
 |---|---|---|
-| `memory_id` | `u64` | `STORED` only — surfaces in `RankedItem.id`. Not indexed. |
+| `memory_id` | bytes | `INDEXED | STORED` — 16 big-endian bytes of the packed u128 `MemoryId` (§02/03). Indexed so the 22.3 worker can `delete_term` by id (idempotent upsert + FORGET); stored so the retriever (§23/02) surfaces it in `RankedItem.id`. |
 | `text` | text | `TEXT` (tokenized + stemmed + indexed for BM25). Uses the custom analyzer from §23/02 §3. |
 | `agent_id` | bytes | `INDEXED | STORED` (16-byte UUID; indexed for exact-match filter; not tokenized). |
 | `kind` | u64 | `INT` indexed for filter (memory kind enum). |
@@ -48,7 +48,7 @@ phase 22.5 + §23/02 §5 rely on the exact field set for filters.
 
 | Field | Type | Options |
 |---|---|---|
-| `statement_id` | u128 | `STORED` only — surfaces in `RankedItem.id`. |
+| `statement_id` | bytes (u128) | `INDEXED | STORED` — 16 big-endian bytes of the u128 `StatementId`. Indexed so the 22.4 worker can `delete_term` by id (tombstone / supersede); stored so retrieval surfaces it in `RankedItem.id`. |
 | `subject_name` | text | `TEXT` with the §23/02 §3 analyzer; lets queries match the subject's canonical entity name. |
 | `predicate_name` | text | `STRING` (raw, untokenised text — exact match). The predicate's `name` field, not its u64 id — exact-id filters work via the same string. |
 | `predicate_id` | u64 | `INT` indexed for exact filter — alternative to `predicate_name` for downstream callers that already resolved the id. |

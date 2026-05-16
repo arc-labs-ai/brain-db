@@ -16,5 +16,6 @@ pub mod plan;
 pub mod reason;
 pub mod recall;
 pub mod subscribe;
+pub mod text_indexer;
 pub mod txn;
 pub mod writer;

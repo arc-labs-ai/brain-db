@@ -58,6 +58,12 @@ impl LexicalScope {
 }
 
 /// An open tantivy `Index` plus the scope it serves.
+///
+/// `tantivy::Index` is internally `Arc`-backed, so cloning is
+/// cheap and shares the same underlying tokenizer / directory
+/// references — required for the indexer worker (22.3 / 22.4)
+/// and the retriever (22.5) to hold independent handles.
+#[derive(Clone)]
 pub struct IndexHandle {
     pub index: Index,
     pub scope: LexicalScope,
@@ -129,7 +135,11 @@ pub enum TantivyShardError {
 #[must_use]
 pub fn memory_text_schema() -> Schema {
     let mut sb = Schema::builder();
-    sb.add_u64_field("memory_id", STORED);
+    // MemoryId is u128 (16 bytes big-endian, §02/03 packing);
+    // bytes field, INDEXED so the indexer worker (22.3) can
+    // delete_term by id on FORGET / re-Upsert, STORED so the
+    // retriever surfaces it in `RankedItem.id`.
+    sb.add_bytes_field("memory_id", INDEXED | STORED);
     sb.add_text_field("text", TEXT);
     // 16-byte agent UUID — bytes field, indexed for exact-match
     // filter (§23/02 §5) and stored so retrieval round-trips it.
@@ -143,9 +153,10 @@ pub fn memory_text_schema() -> Schema {
 #[must_use]
 pub fn statements_schema() -> Schema {
     let mut sb = Schema::builder();
-    // 16-byte u128 statement id; stored only — surfaces in
-    // RankedItem.id.
-    sb.add_bytes_field("statement_id", STORED);
+    // 16-byte u128 statement id; INDEXED so the indexer worker
+    // (22.4) can delete_term by id on tombstone / supersede,
+    // STORED so retrieval surfaces it in `RankedItem.id`.
+    sb.add_bytes_field("statement_id", INDEXED | STORED);
     sb.add_text_field("subject_name", TEXT);
     // predicate_name is a human-readable identifier (e.g.
     // "lives_in"); tantivy's STRING text option indexes the

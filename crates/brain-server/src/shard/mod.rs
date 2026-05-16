@@ -833,9 +833,7 @@ pub fn spawn_shard(
             // worker in 22.6; for now we log and continue —
             // reads against an unhealthy index return
             // `IndexUnavailable` at the retriever (22.5) layer.
-            let tantivy_for_ops = match brain_index::TantivyShard::open(
-                &shard_dir_for_executor,
-            ) {
+            let tantivy_for_ops = match brain_index::TantivyShard::open(&shard_dir_for_executor) {
                 Ok(startup) => {
                     if let brain_index::IndexStatus::NeedsRebuild { reason } =
                         &startup.memory_status
@@ -872,8 +870,8 @@ pub fn spawn_shard(
                 let rtxn = db_guard
                     .read_txn()
                     .expect("read_txn after MetadataDb::open");
-                let defs = brain_metadata::extractor_list(&rtxn)
-                    .expect("extractor_list at shard startup");
+                let defs =
+                    brain_metadata::extractor_list(&rtxn).expect("extractor_list at shard startup");
                 drop(rtxn);
                 drop(db_guard);
 
@@ -881,10 +879,8 @@ pub fn spawn_shard(
                 // here keeps the existing degraded-classifier
                 // behaviour intact. 21.5 only fills the LLM slots.
                 let materialize_deps = llm_deps.into_materialize_deps(None);
-                let (reg, errors) = brain_extractors::build_registry_from_definitions(
-                    &defs,
-                    &materialize_deps,
-                );
+                let (reg, errors) =
+                    brain_extractors::build_registry_from_definitions(&defs, &materialize_deps);
                 for (id, err) in errors {
                     tracing::warn!(
                         target: "brain_server::shard",
@@ -901,12 +897,41 @@ pub fn spawn_shard(
                 Err(_) => brain_extractors::ClassifierConfig::unloaded(),
             };
 
+            // 22.3: spawn the memory text indexer drain task and
+            // install its dispatcher in OpsContext. Substrate-only
+            // deployments (no tantivy handle) skip both.
+            let memory_text_dispatcher_for_ops =
+                if let Some(tantivy_shard) = tantivy_for_ops.as_ref() {
+                    let policy = brain_ops::ops::text_indexer::CommitPolicy::from_env();
+                    let (dispatcher, receiver) =
+                        brain_ops::ops::text_indexer::MemoryTextDispatcher::default_channel();
+                    if let Err(err) =
+                        brain_ops::ops::text_indexer::memory::spawn_memory_text_indexer_local(
+                            tantivy_shard.memory_text.clone(),
+                            receiver,
+                            policy,
+                        )
+                    {
+                        tracing::error!(
+                            target: "brain_server::shard",
+                            error = %err,
+                            "memory text indexer spawn failed; lexical writes unavailable",
+                        );
+                        None
+                    } else {
+                        Some(Arc::new(dispatcher))
+                    }
+                } else {
+                    None
+                };
+
             let ops = Arc::new(
                 OpsContext::new(executor_ctx)
                     .with_extractor_registry(extractor_registry)
                     .with_classifier_config(classifier_config)
                     .with_llm_cache(llm_cache_for_ops)
-                    .with_tantivy(tantivy_for_ops),
+                    .with_tantivy(tantivy_for_ops)
+                    .with_memory_text_dispatcher(memory_text_dispatcher_for_ops),
             );
 
             // Spawn the per-shard fanout task: drains the in-process
