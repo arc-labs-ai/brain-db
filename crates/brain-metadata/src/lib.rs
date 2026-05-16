@@ -19,6 +19,7 @@ pub mod db;
 pub mod entity_merge_ops;
 pub mod entity_ops;
 pub mod entity_type_ops;
+pub mod extractor_ops;
 pub mod llm_cache;
 pub mod predicate_ops;
 pub mod relation_ops;
@@ -61,6 +62,10 @@ pub use relation_type_ops::{
     RelationTypeOpError,
 };
 pub use entity_type_ops::{entity_type_intern, entity_type_lookup_by_name, EntityTypeOpError};
+pub use extractor_ops::{
+    extractor_get, extractor_intern, extractor_list, extractor_lookup_by_qname,
+    extractor_set_enabled, ExtractorOpError,
+};
 pub use schema_apply::{apply_schema_definitions, SchemaApplyError};
 pub use schema_store::{
     schema_active, schema_active_row, schema_get, schema_list, schema_namespaces, schema_upload,

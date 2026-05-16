@@ -1,47 +1,71 @@
-//! `extractors` table — active extractor declarations.
+//! `extractors` table — interned extractor registry.
 //!
-//! See `spec/22_extractors/00_purpose.md` (three-tier model:
-//! pattern → classifier → LLM) and `spec/21_schema_dsl/00_purpose.md`
-//! (extractor declaration syntax). The declaration body is an opaque
-//! blob in 15.1; phase 19 (schema DSL) defines the typed shape.
+//! Spec §22/00 (three-tier model) + §21/05 §1 (schema fan-out).
+//!
+//! Phase 15.1 declared a placeholder row. Phase 20.5 widens to the
+//! canonical pattern (namespace + name + qname index) matching
+//! [`crate::tables::knowledge::predicate::PredicateDefinition`] /
+//! [`crate::tables::knowledge::relation_type::RelationTypeDefinition`].
+//! Type tag bumped `::v1` → `::v2`; v1 hasn't shipped.
 
 use crate::impl_redb_rkyv_value;
 use brain_core::{ExtractorId, ExtractorKind};
 use redb::TableDefinition;
 
+/// `extractors` table. Key is `ExtractorId.raw()` (u32); value is
+/// [`ExtractorDefinition`].
 pub const EXTRACTORS_TABLE: TableDefinition<'static, u32, ExtractorDefinition> =
     TableDefinition::new("extractors");
 
+/// `extractors_by_qname` — secondary index for `"namespace:name"
+/// → ExtractorId`. Mirrors `predicates_by_qname`.
+pub const EXTRACTORS_BY_QNAME_TABLE: TableDefinition<'static, &str, u32> =
+    TableDefinition::new("extractors_by_qname");
+
+/// A registered extractor. `(namespace, name)` is unique within a
+/// deployment; uniqueness is enforced by
+/// [`EXTRACTORS_BY_QNAME_TABLE`] writes inside `extractor_intern`.
+///
+/// `kind`: `0` pattern, `1` classifier, `2` llm — matches
+/// [`brain_core::ExtractorKind::as_u8`].
+///
+/// `definition_blob`: `serde_json::to_vec(&ExtractorDef)` where
+/// `ExtractorDef` is the §19.2 AST. Opaque to brain-metadata;
+/// brain-extractors decodes it when materialising the runtime
+/// extractor at MetadataDb::open / `SCHEMA_UPLOAD` time.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 pub struct ExtractorDefinition {
     pub extractor_id: u32,
+    pub namespace: String,
     pub name: String,
-    pub version: u32,
-    /// Pattern / Classifier / Llm — see `brain_core::ExtractorKind`.
     pub kind: u8,
     pub enabled: u8,
+    pub schema_version: u32,
     pub definition_blob: Vec<u8>,
     pub created_at_unix_nanos: u64,
 }
 
 impl ExtractorDefinition {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: ExtractorId,
+        namespace: String,
         name: String,
-        version: u32,
         kind: ExtractorKind,
         enabled: bool,
+        schema_version: u32,
         definition_blob: Vec<u8>,
         created_at_unix_nanos: u64,
     ) -> Self {
         Self {
             extractor_id: id.raw(),
+            namespace,
             name,
-            version,
             kind: kind.as_u8(),
             enabled: u8::from(enabled),
+            schema_version,
             definition_blob,
             created_at_unix_nanos,
         }
@@ -52,6 +76,7 @@ impl ExtractorDefinition {
         ExtractorId::from(self.extractor_id)
     }
 
+    #[must_use]
     pub fn kind(&self) -> Option<ExtractorKind> {
         ExtractorKind::from_u8(self.kind)
     }
@@ -60,9 +85,15 @@ impl ExtractorDefinition {
     pub fn is_enabled(&self) -> bool {
         self.enabled != 0
     }
+
+    /// Canonical `"namespace:name"` qname.
+    #[must_use]
+    pub fn qname(&self) -> String {
+        format!("{}:{}", self.namespace, self.name)
+    }
 }
 
-impl_redb_rkyv_value!(ExtractorDefinition, "brain_metadata::ExtractorDefinition::v1");
+impl_redb_rkyv_value!(ExtractorDefinition, "brain_metadata::ExtractorDefinition::v2");
 
 #[cfg(all(test, not(miri)))]
 mod tests {
@@ -76,11 +107,12 @@ mod tests {
         let db = fresh_db(&dir);
         let ex = ExtractorDefinition::new(
             ExtractorId::from(11),
-            "brain.entity_mentions".into(),
-            1,
+            "acme".into(),
+            "person_mentions".into(),
             ExtractorKind::Pattern,
             true,
-            vec![],
+            1,
+            vec![1, 2, 3, 4],
             1_700_000_000_000_000_000,
         );
 
@@ -88,6 +120,10 @@ mod tests {
         {
             let mut t = wtxn.open_table(EXTRACTORS_TABLE).unwrap();
             t.insert(&ex.extractor_id, &ex).unwrap();
+        }
+        {
+            let mut t = wtxn.open_table(EXTRACTORS_BY_QNAME_TABLE).unwrap();
+            t.insert(&ex.qname().as_str(), &ex.extractor_id).unwrap();
         }
         wtxn.commit().unwrap();
 
@@ -97,5 +133,10 @@ mod tests {
         assert_eq!(got, ex);
         assert_eq!(got.kind(), Some(ExtractorKind::Pattern));
         assert!(got.is_enabled());
+        assert_eq!(got.qname(), "acme:person_mentions");
+
+        let idx = rtxn.open_table(EXTRACTORS_BY_QNAME_TABLE).unwrap();
+        let id_from_idx = idx.get(&"acme:person_mentions").unwrap().unwrap().value();
+        assert_eq!(id_from_idx, ex.extractor_id);
     }
 }
