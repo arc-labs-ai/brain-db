@@ -504,6 +504,7 @@ dependencies = [
  "futures-lite 2.6.1",
  "parking_lot",
  "rkyv",
+ "serde_json",
  "smallvec",
  "thiserror 1.0.69",
  "tokio",

@@ -12,6 +12,7 @@ pub mod builder;
 pub mod entity;
 pub mod errors;
 pub mod relation;
+pub mod schema;
 pub mod statement;
 
 pub use builder::{
@@ -28,6 +29,10 @@ pub use errors::{
 pub use relation::{
     RelationBuilder, RelationHandle, RelationListFromBuilder, RelationListToBuilder,
     RelationTraverseBuilder, RelationsClient, TraversalPath, TraversalStep, TraverseDirection,
+};
+pub use schema::{
+    print_schema, SchemaBuilder, SchemaClient, SchemaListEntry, SchemaListView,
+    SchemaUploadOutcome, SchemaValidateOutcome, SchemaValidationIssue, SchemaView,
 };
 pub use statement::{
     EventBuilder, FactBuilder, PreferenceBuilder, StatementHandle, StatementListBuilder,

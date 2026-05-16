@@ -23,6 +23,9 @@ uuid = { workspace = true, features = ["v7"] }
 # 17.8: SmallVec used by StatementHandle::from_view → brain-core
 # EvidenceRef projection (inline cap 8).
 smallvec.workspace = true
+# 19.8: serde_json used by the SchemaBuilder DSL printer when
+# emitting `examples:` / `schema:` JSON values for extractor fields.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 anyhow.workspace = true
