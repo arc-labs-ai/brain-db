@@ -20,10 +20,15 @@
 //! adds the statement side in this same module.
 
 pub mod memory;
+pub mod statement;
 
-pub use memory::{
-    spawn_memory_text_indexer_local, IndexerError, MemoryTextDispatcher, MemoryTextOp,
-};
+pub use memory::{MemoryTextDispatcher, MemoryTextOp};
+pub use statement::{StatementTextDispatcher, StatementTextOp};
+
+#[cfg(target_os = "linux")]
+pub use memory::spawn_memory_text_indexer_local;
+#[cfg(target_os = "linux")]
+pub use statement::spawn_statement_text_indexer_local;
 
 use std::time::Duration;
 

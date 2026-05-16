@@ -20,29 +20,29 @@
 //! Phase 17.7 handlers do **not** touch the statement HNSW (17.5);
 //! the embedding worker that populates it lives in phase 21.
 
-use brain_core::{EntityId, PredicateId, StatementId, StatementKind};
 use brain_core::knowledge::{Statement, TombstoneReason};
+use brain_core::{EntityId, PredicateId, StatementId, StatementKind};
 use brain_metadata::predicate_ops::{predicate_get, predicate_lookup_by_qname, PredicateOpError};
-use redb::ReadableTable;
 use brain_metadata::statement_ops::{
     evidence_overflow_load, statement_create, statement_get, statement_history, statement_list,
     statement_retract, statement_supersede, statement_tombstone, StatementListFilter,
     StatementOpError,
 };
 use brain_protocol::knowledge::{
-    statement_kind_from_wire, StatementCreateRequest, StatementCreateResponse,
-    StatementCreatedEvent, StatementGetRequest, StatementGetResponse,
+    statement_kind_from_wire, KnowledgeEventPayload, StatementCreateRequest,
+    StatementCreateResponse, StatementCreatedEvent, StatementGetRequest, StatementGetResponse,
     StatementHistoryRequest, StatementHistoryResponseFrame, StatementListRequest,
     StatementListResponseFrame, StatementRetractRequest, StatementRetractResponse,
     StatementSupersedeRequest, StatementSupersedeResponse, StatementSupersededEvent,
-    StatementTombstoneRequest, StatementTombstoneResponse, StatementTombstonedEvent,
-    StatementView, KnowledgeEventPayload,
+    StatementTombstoneRequest, StatementTombstoneResponse, StatementTombstonedEvent, StatementView,
 };
 use brain_protocol::response::EventType;
+use redb::ReadableTable;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
 use crate::ops::knowledge_entity::emit_knowledge_event;
+use crate::ops::text_indexer::{statement::upsert_op_from_statement, StatementTextOp};
 
 // 30 days, per spec §19. Used by STATEMENT_RETRACT for the
 // will_zero_at hint.
@@ -76,8 +76,8 @@ pub async fn handle_statement_create(
             .write_txn()
             .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
 
-        let predicate = predicate_lookup_by_qname_wtxn(&wtxn, namespace, name)?
-            .ok_or_else(|| {
+        let predicate =
+            predicate_lookup_by_qname_wtxn(&wtxn, namespace, name)?.ok_or_else(|| {
                 OpError::InvalidRequest(format!(
                     "unknown predicate {namespace:?}:{name:?}; declare it via SCHEMA_UPLOAD first"
                 ))
@@ -106,8 +106,8 @@ pub async fn handle_statement_create(
         };
 
         let statement_value = build_statement_from_create(&req, predicate.id, now, kind)?;
-        let created = statement_create(&wtxn, &statement_value, now)
-            .map_err(map_statement_op_error)?;
+        let created =
+            statement_create(&wtxn, &statement_value, now).map_err(map_statement_op_error)?;
         wtxn.commit()
             .map_err(|e| OpError::Internal(format!("commit: {e}")))?;
 
@@ -158,9 +158,24 @@ pub async fn handle_statement_create(
         );
     }
 
+    // §27/02 §3: statement text indexer dispatch.
+    // For auto-superseded Preferences we emit a Delete for the
+    // old id before the Upsert for the new one (mirroring §3's
+    // supersede = Delete + Upsert pattern).
+    if let Some(dispatcher) = ctx.statement_text_dispatcher.as_ref() {
+        if let Some(old_id) = auto_superseded {
+            dispatcher
+                .dispatch(StatementTextOp::Delete { id: old_id })
+                .await;
+        }
+        dispatch_upsert_for(ctx, created_id, dispatcher).await;
+    }
+
     Ok(StatementCreateResponse {
         statement_id: created_id.to_bytes(),
-        auto_superseded: auto_superseded.map(StatementId::to_bytes).unwrap_or([0u8; 16]),
+        auto_superseded: auto_superseded
+            .map(StatementId::to_bytes)
+            .unwrap_or([0u8; 16]),
         chain_root: chain_root.to_bytes(),
     })
 }
@@ -215,8 +230,7 @@ pub async fn handle_statement_supersede(
     ctx: &OpsContext,
 ) -> Result<StatementSupersedeResponse, OpError> {
     validate_predicate_qname(&req.new_statement.predicate)?;
-    if req.new_statement.confidence.is_nan()
-        || !(0.0..=1.0).contains(&req.new_statement.confidence)
+    if req.new_statement.confidence.is_nan() || !(0.0..=1.0).contains(&req.new_statement.confidence)
     {
         return Err(OpError::InvalidRequest(
             "confidence must be in [0, 1] and not NaN".into(),
@@ -234,11 +248,9 @@ pub async fn handle_statement_supersede(
             .write_txn()
             .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
 
-        let predicate = predicate_lookup_by_qname_wtxn(&wtxn, namespace, name)?
-            .ok_or_else(|| {
-                OpError::InvalidRequest(format!(
-                    "unknown predicate {namespace:?}:{name:?}"
-                ))
+        let predicate =
+            predicate_lookup_by_qname_wtxn(&wtxn, namespace, name)?.ok_or_else(|| {
+                OpError::InvalidRequest(format!("unknown predicate {namespace:?}:{name:?}"))
             })?;
 
         let new_statement =
@@ -268,6 +280,14 @@ pub async fn handle_statement_supersede(
         now,
     );
 
+    // §27/02 §3: Delete old + Upsert new.
+    if let Some(dispatcher) = ctx.statement_text_dispatcher.as_ref() {
+        dispatcher
+            .dispatch(StatementTextOp::Delete { id: old_id })
+            .await;
+        dispatch_upsert_for(ctx, new_id, dispatcher).await;
+    }
+
     Ok(StatementSupersedeResponse {
         new_statement_id: new_id.to_bytes(),
         chain_root: chain_root.to_bytes(),
@@ -284,7 +304,9 @@ pub async fn handle_statement_tombstone(
     ctx: &OpsContext,
 ) -> Result<StatementTombstoneResponse, OpError> {
     if req.reason_message.len() > REASON_MESSAGE_MAX {
-        return Err(OpError::InvalidRequest("reason_message exceeds 4 KiB".into()));
+        return Err(OpError::InvalidRequest(
+            "reason_message exceeds 4 KiB".into(),
+        ));
     }
     let reason = decode_tombstone_reason(req.reason)?;
     let id = StatementId::from(req.statement_id);
@@ -310,6 +332,10 @@ pub async fn handle_statement_tombstone(
         now,
     );
 
+    if let Some(dispatcher) = ctx.statement_text_dispatcher.as_ref() {
+        dispatcher.dispatch(StatementTextOp::Delete { id }).await;
+    }
+
     Ok(StatementTombstoneResponse {
         tombstoned_at_unix_nanos: now,
     })
@@ -324,7 +350,9 @@ pub async fn handle_statement_retract(
     ctx: &OpsContext,
 ) -> Result<StatementRetractResponse, OpError> {
     if req.reason_message.len() > REASON_MESSAGE_MAX {
-        return Err(OpError::InvalidRequest("reason_message exceeds 4 KiB".into()));
+        return Err(OpError::InvalidRequest(
+            "reason_message exceeds 4 KiB".into(),
+        ));
     }
     let reason = decode_tombstone_reason(req.reason)?;
     let id = StatementId::from(req.statement_id);
@@ -351,6 +379,13 @@ pub async fn handle_statement_retract(
         }),
         now,
     );
+
+    // Retract drops the row from the lexical index (the §19/06
+    // grace period only affects when the metadata is zeroed; the
+    // statement is invisible to retrieval immediately).
+    if let Some(dispatcher) = ctx.statement_text_dispatcher.as_ref() {
+        dispatcher.dispatch(StatementTextOp::Delete { id }).await;
+    }
 
     Ok(StatementRetractResponse {
         retracted_at_unix_nanos: now,
@@ -409,9 +444,7 @@ pub async fn handle_statement_list(
     ctx: &OpsContext,
 ) -> Result<StatementListResponseFrame, OpError> {
     if req.limit == 0 || req.limit > LIST_LIMIT_MAX {
-        return Err(OpError::InvalidRequest(
-            "limit must be in 1..=1000".into(),
-        ));
+        return Err(OpError::InvalidRequest("limit must be in 1..=1000".into()));
     }
     if !req.cursor.is_empty() {
         return Err(OpError::InvalidRequest(
@@ -515,7 +548,9 @@ pub async fn handle_statement_list(
 
 fn validate_predicate_qname(q: &str) -> Result<(), OpError> {
     if q.is_empty() {
-        return Err(OpError::InvalidRequest("predicate must be non-empty".into()));
+        return Err(OpError::InvalidRequest(
+            "predicate must be non-empty".into(),
+        ));
     }
     if q.len() > PREDICATE_QNAME_MAX {
         return Err(OpError::InvalidRequest(format!(
@@ -625,10 +660,7 @@ fn build_statement_from_create(
 /// resolving the `PredicateId` to its `"namespace:name"` canonical
 /// string. Inline-evidence overflow is resolved to inline form when
 /// possible (single-shot read).
-fn project_view(
-    rtxn: &redb::ReadTransaction,
-    s: &Statement,
-) -> Result<StatementView, OpError> {
+fn project_view(rtxn: &redb::ReadTransaction, s: &Statement) -> Result<StatementView, OpError> {
     let predicate = predicate_get(rtxn, s.predicate)
         .map_err(map_predicate_op_error)?
         .ok_or_else(|| {
@@ -656,7 +688,10 @@ fn project_view(
         let mut sv = smallvec::SmallVec::<
             [brain_core::knowledge::EvidenceEntry; brain_core::knowledge::INLINE_EVIDENCE_CAP],
         >::new();
-        for e in entries.into_iter().take(brain_core::knowledge::INLINE_EVIDENCE_CAP) {
+        for e in entries
+            .into_iter()
+            .take(brain_core::knowledge::INLINE_EVIDENCE_CAP)
+        {
             sv.push(e);
         }
         s.evidence = brain_core::knowledge::EvidenceRef::Inline(sv);
@@ -729,9 +764,9 @@ fn map_statement_op_error(err: StatementOpError) -> OpError {
             detail: format!("{id:?}"),
         },
         StatementOpError::InvalidArgument(s) => OpError::InvalidRequest(s.to_string()),
-        StatementOpError::AlreadySuperseded(id, by) => OpError::Conflict(format!(
-            "statement {id:?} already superseded by {by:?}"
-        )),
+        StatementOpError::AlreadySuperseded(id, by) => {
+            OpError::Conflict(format!("statement {id:?} already superseded by {by:?}"))
+        }
         StatementOpError::AlreadyTombstoned(id) => {
             OpError::Conflict(format!("statement {id:?} is tombstoned"))
         }
@@ -756,5 +791,65 @@ fn map_statement_op_error(err: StatementOpError) -> OpError {
         StatementOpError::EntityOp(e) => {
             OpError::Internal(format!("entity op forwarded from statement_ops: {e}"))
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 22.4 — text-indexer dispatch helpers.
+// ---------------------------------------------------------------------------
+
+/// Look up the just-committed statement by id, project it to a
+/// `StatementTextOp::Upsert`, and dispatch. Returns silently on
+/// any error — text-indexer drift is reported via shard metrics
+/// (§27/02 §8), not as a statement-op failure.
+async fn dispatch_upsert_for(
+    ctx: &OpsContext,
+    id: StatementId,
+    dispatcher: &crate::ops::text_indexer::StatementTextDispatcher,
+) {
+    let upsert_op = {
+        let db_guard = ctx.executor.metadata.lock();
+        let rtxn = match db_guard.read_txn() {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(
+                    target: "brain_ops::text_indexer",
+                    error = %err,
+                    "statement text indexer dispatch: read_txn failed",
+                );
+                return;
+            }
+        };
+        let statement = match statement_get(&rtxn, id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                tracing::warn!(
+                    target: "brain_ops::text_indexer",
+                    ?id,
+                    "statement vanished between commit and indexer dispatch",
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "brain_ops::text_indexer",
+                    error = %err,
+                    "statement_get during text-indexer dispatch failed",
+                );
+                return;
+            }
+        };
+        drop(rtxn);
+        upsert_op_from_statement(&statement, &*db_guard)
+    };
+
+    if let Some(op) = upsert_op {
+        dispatcher.dispatch(op).await;
+    } else {
+        tracing::debug!(
+            target: "brain_ops::text_indexer",
+            ?id,
+            "statement text indexer skip — Pending subject or missing metadata",
+        );
     }
 }

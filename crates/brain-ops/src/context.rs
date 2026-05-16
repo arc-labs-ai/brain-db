@@ -21,7 +21,7 @@ use brain_planner::{ExecutorContext, PlannerContext};
 use parking_lot::{Mutex, RwLock};
 
 use crate::access_buffer::AccessBuffer;
-use crate::ops::text_indexer::MemoryTextDispatcher;
+use crate::ops::text_indexer::{MemoryTextDispatcher, StatementTextDispatcher};
 use crate::subscribe::{EventBus, SubscriptionRegistry};
 use crate::txn::TxnStore;
 
@@ -76,6 +76,11 @@ pub struct OpsContext {
     /// drain task. ENCODE / FORGET handlers check this slot
     /// post-WAL-commit and enqueue an indexer op when present.
     pub memory_text_dispatcher: Option<Arc<MemoryTextDispatcher>>,
+    /// Statement text indexer dispatcher (phase 22.4). Wired
+    /// alongside `memory_text_dispatcher`; statement_create /
+    /// supersede / tombstone / retract handlers enqueue
+    /// Upsert / Delete events post-commit.
+    pub statement_text_dispatcher: Option<Arc<StatementTextDispatcher>>,
 }
 
 impl OpsContext {
@@ -96,6 +101,7 @@ impl OpsContext {
             llm_cache: None,
             tantivy: None,
             memory_text_dispatcher: None,
+            statement_text_dispatcher: None,
         }
     }
 
@@ -187,6 +193,18 @@ impl OpsContext {
         dispatcher: Option<Arc<MemoryTextDispatcher>>,
     ) -> Self {
         self.memory_text_dispatcher = dispatcher;
+        self
+    }
+
+    /// Install (or clear) the statement text indexer dispatcher
+    /// (phase 22.4). Server-spawn pairs this with the drain
+    /// task; tests pass `None`.
+    #[must_use]
+    pub fn with_statement_text_dispatcher(
+        mut self,
+        dispatcher: Option<Arc<StatementTextDispatcher>>,
+    ) -> Self {
+        self.statement_text_dispatcher = dispatcher;
         self
     }
 }

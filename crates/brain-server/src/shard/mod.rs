@@ -897,32 +897,57 @@ pub fn spawn_shard(
                 Err(_) => brain_extractors::ClassifierConfig::unloaded(),
             };
 
-            // 22.3: spawn the memory text indexer drain task and
-            // install its dispatcher in OpsContext. Substrate-only
-            // deployments (no tantivy handle) skip both.
-            let memory_text_dispatcher_for_ops =
+            // 22.3 + 22.4: spawn the per-shard text indexer drain
+            // tasks and install their dispatchers in OpsContext.
+            // Substrate-only deployments (no tantivy handle) skip
+            // both.
+            let (memory_text_dispatcher_for_ops, statement_text_dispatcher_for_ops) =
                 if let Some(tantivy_shard) = tantivy_for_ops.as_ref() {
                     let policy = brain_ops::ops::text_indexer::CommitPolicy::from_env();
-                    let (dispatcher, receiver) =
-                        brain_ops::ops::text_indexer::MemoryTextDispatcher::default_channel();
-                    if let Err(err) =
-                        brain_ops::ops::text_indexer::memory::spawn_memory_text_indexer_local(
+
+                    let memory_dispatcher = {
+                        let (dispatcher, receiver) =
+                            brain_ops::ops::text_indexer::MemoryTextDispatcher::default_channel();
+                        match brain_ops::ops::text_indexer::memory::spawn_memory_text_indexer_local(
                             tantivy_shard.memory_text.clone(),
                             receiver,
                             policy,
-                        )
-                    {
-                        tracing::error!(
-                            target: "brain_server::shard",
-                            error = %err,
-                            "memory text indexer spawn failed; lexical writes unavailable",
-                        );
-                        None
-                    } else {
-                        Some(Arc::new(dispatcher))
-                    }
+                        ) {
+                            Ok(()) => Some(Arc::new(dispatcher)),
+                            Err(err) => {
+                                tracing::error!(
+                                    target: "brain_server::shard",
+                                    error = %err,
+                                    "memory text indexer spawn failed; lexical writes unavailable",
+                                );
+                                None
+                            }
+                        }
+                    };
+
+                    let statement_dispatcher = {
+                        let (dispatcher, receiver) =
+                            brain_ops::ops::text_indexer::StatementTextDispatcher::default_channel();
+                        match brain_ops::ops::text_indexer::statement::spawn_statement_text_indexer_local(
+                            tantivy_shard.statements.clone(),
+                            receiver,
+                            policy,
+                        ) {
+                            Ok(()) => Some(Arc::new(dispatcher)),
+                            Err(err) => {
+                                tracing::error!(
+                                    target: "brain_server::shard",
+                                    error = %err,
+                                    "statement text indexer spawn failed; lexical writes unavailable",
+                                );
+                                None
+                            }
+                        }
+                    };
+
+                    (memory_dispatcher, statement_dispatcher)
                 } else {
-                    None
+                    (None, None)
                 };
 
             let ops = Arc::new(
@@ -931,7 +956,8 @@ pub fn spawn_shard(
                     .with_classifier_config(classifier_config)
                     .with_llm_cache(llm_cache_for_ops)
                     .with_tantivy(tantivy_for_ops)
-                    .with_memory_text_dispatcher(memory_text_dispatcher_for_ops),
+                    .with_memory_text_dispatcher(memory_text_dispatcher_for_ops)
+                    .with_statement_text_dispatcher(statement_text_dispatcher_for_ops),
             );
 
             // Spawn the per-shard fanout task: drains the in-process
