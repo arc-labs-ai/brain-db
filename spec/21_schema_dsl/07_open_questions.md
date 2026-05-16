@@ -210,4 +210,10 @@ phase 19.6 implementation.
 
 ## Resolved
 
-(Q12 by §06 §6.)
+- Q12 — System schema queryable via `SCHEMA_GET` (§06 §6).
+- **Extractor fan-out from `SchemaItem::Extractor`** — phase 19.7
+  deferred the `apply_schema_definitions` arm for extractors.
+  Phase 20.5 fleshes it out: user-declared `define extractor`
+  blocks register into the `EXTRACTORS_TABLE` at schema-apply
+  time. Built-in extractors load via the same path through the
+  system schema (phase 20.7). Spec: [`../22_extractors/`](../22_extractors/).
