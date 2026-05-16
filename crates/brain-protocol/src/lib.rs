@@ -26,6 +26,7 @@ pub mod requests;
 pub mod response;
 pub mod responses;
 mod rkyv_codec;
+pub mod schema;
 
 pub use error::{ErrorCategory, ErrorCode, ProtocolError};
 pub use frame::Frame;

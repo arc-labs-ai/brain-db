@@ -483,6 +483,8 @@ dependencies = [
  "criterion",
  "proptest",
  "rkyv",
+ "serde",
+ "serde_json",
  "smallvec",
  "thiserror 1.0.69",
  "uuid",
