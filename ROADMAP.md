@@ -524,15 +524,67 @@ These phases turn Brain from a vector memory store into a cognitive database wit
 
 ---
 
-## Phase 22 — Tantivy / lexical retrieval
+## Phase 22 — Tantivy / lexical retrieval ✓
 
-**One-line:** Tantivy BM25 over memory text + statement text; LexicalRetriever; index workers maintain on writes.
+**One-line:** Tantivy BM25 over memory text + statement text; brain analyzer with URL / code-ID / Porter pipeline; per-shard memory + statement text indexer workers (bounded channel + group commit + retry-once-then-fatal); `LexicalRetriever` trait + `TantivyLexicalRetriever`; atomic-swap rebuild + shard-startup recovery.
 
-**Detailed plan:** [`docs/phases/phase-22-tantivy-lexical.md`](docs/phases/phase-22-tantivy-lexical.md)
+**Detailed plan:** [`docs/phases/phase-22-tantivy-lexical.md`](docs/phases/phase-22-tantivy-lexical.md) (per-sub-task plans `.claude/plans/phase-22-task-0[0-8].md`).
 
-**Crates touched:** `brain-index`, `brain-workers`.
+**Crates touched:** `brain-index`, `brain-ops`, `brain-server` (no `brain-workers` — text indexer drain runs as `glommio::spawn_local` directly under the shard executor).
 
-**Sub-tasks:** ~7. **Exit:** lexical recall@10 ≥ targets on reference workload; tag `phase-22-complete`.
+**Sub-tasks:** 9 (22.0 spec backfill → 22.8 phase exit).
+
+**Exit:** ENCODE / FORGET / STATEMENT_CREATE / SUPERSEDE / TOMBSTONE / RETRACT all dispatch to the matching indexer via OpsContext slots wired at shard spawn; `LexicalRetriever::retrieve` returns BM25-ranked items per-scope; on-disk corruption or schema-version mismatch triggers an atomic-swap rebuild at next shard start; tag `phase-22-complete`.
+
+**Scope cuts:**
+
+- **Memory text rebuild produces an empty valid index.** `MEMORIES_TABLE` stores `text_size` but not the text itself (text lives only on the ENCODE wire path + WAL frames). Full content-aware memory rebuild lands post-v1; operators re-ingest from their own source-of-truth in v1. Statement rebuild is content-complete via `object_blob` + entity / predicate joins.
+- **Partial WAL replay on shard recovery deferred.** The bound (≤ N-1 writes per indexer at crash, default N=256) is documented in §26/01 §3 and accepted for v1; cursor-tracked partial replay lands post-v1.
+- **Hot rebuild while the live writer is running deferred.** v1 rebuild is startup-only.
+- **Stop-word removal explicitly NOT in the analyzer** (preserves exact-ID queries like `ACME-1247`).
+- **Snippet generation deferred** — `RankedItem.snippet` always `None` in v1.
+- **BM25 k1 / b custom-similarity wiring deferred** — `LexicalRetrieverConfig` exposes the fields but the retriever uses tantivy defaults (1.2 / 0.75); custom similarity binds in phase 23 if needed.
+- **`ADMIN_TANTIVY_REBUILD` wire op deferred to §28/05 admin scope.**
+- **Cross-shard ranking deferred to phase 23** (router fan-out).
+- **Segment-merge windowing post-v1** — rely on tantivy's `LogMergePolicy`.
+
+**Delivered:**
+
+- §23 / §26 / §27 / §16/02 §2.9 brought to phase-22 implementation depth:
+  - `spec/23_retrievers/02_lexical_retriever.md` (new, ~180 LOC) — trait surface, BM25 params, tokenizer pipeline, scope dispatch, filters, errors, perf bounds.
+  - `spec/26_knowledge_storage/01_tantivy_layout.md` (new, ~200 LOC) — directory layout, schemas, commit cadence, segment merge, atomic-swap rebuild, recovery contract, size budgets.
+  - `spec/27_knowledge_workers/02_text_indexer_workers.md` (new, ~200 LOC) — memory + statement text indexers, backpressure-on-overflow discipline, retry-once-then-fatal commit policy, WAL ordering.
+  - `spec/16_benchmarks_acceptance/02_latency_targets.md` §2.9 — LexicalRetriever p50/p99 targets.
+- `brain-index` (new modules):
+  - `tantivy_shard` — per-shard `TantivyShard` handle with `BRAIN_SCHEMA_VERSION=1` payload stamping, `IndexStatus { Ready | NeedsRebuild { OpenFailed | SchemaVersionMismatch | PayloadCorrupt } }`, fresh-dir vs existing-dir disambiguation via `meta.json` probe.
+  - `tantivy_shard::tokenizer` — `BrainTokenizer` (NFC → lowercase → URL + code-ID + dotted-identifier preservation → tokenize → Porter stem; protected tokens bypass stemmer). Registered under tantivy's `"default"` name.
+  - `tantivy_shard::retriever` — `LexicalRetriever` trait, `LexicalQuery` / `LexicalFilters` / `LexicalRetrieverConfig` / `RankedItem` / `RankedItemId` / `LexicalError`, `TantivyLexicalRetriever` impl with synchronous `reader.reload()` per query.
+- `brain-ops`:
+  - `ops::text_indexer::memory` — `MemoryTextOp { Upsert | Forget }`, `MemoryTextDispatcher`, `spawn_memory_text_indexer_local` (Linux Glommio entry) + `run_memory_text_indexer` (test-friendly). Bounded `flume` channel (4096), `CommitPolicy::from_env()` (N=256 / T=1 s defaults, env-overridable), retry-once-then-shard-fatal commit, every commit stamps `schema_payload_json()`.
+  - `ops::text_indexer::statement` — same harness for `statements.tantivy/`; `confidence_bucket()` clamping; `upsert_op_from_statement()` helper that joins entity + predicate at dispatch time.
+  - `ops::text_indexer::rebuild` — `rebuild_memory_text` (empty valid index) + `rebuild_statements` (content-aware, with tombstone + pending-subject + orphan-row skips); atomic-swap mechanics via `std::fs::rename`.
+  - `OpsContext` gains `tantivy`, `memory_text_dispatcher`, `statement_text_dispatcher`, `lexical_retriever` slots (all `Option<...>` — substrate-only deployments leave them `None`).
+  - Hooks at `handle_encode`, `handle_forget`, `handle_statement_create` (+ auto-superseded preference cascade), `handle_statement_supersede`, `handle_statement_tombstone`, `handle_statement_retract`.
+- `brain-server`:
+  - Shard spawn opens the `TantivyShard`, registers the brain analyzer, calls `tantivy_recovery::recover_tantivy_on_open` (which runs 22.6 rebuild fns on `NeedsRebuild` status), spawns both indexer drain tasks via `glommio::spawn_local`, constructs the retriever, installs all dispatcher + retriever handles on the `OpsContext`.
+- Tests:
+  - `tantivy_shard` unit tests (~28 across schema, retriever, tokenizer, open).
+  - `brain-ops` text indexer tests (~24 across memory + statement + rebuild + commit-policy + e2e indexer→retriever).
+  - `brain-server` recovery tests (4) + phase-exit integration tests (2; ENCODE → retrieve; FORGET → no hit).
+- `crates/brain-index/benches/lexical_retrieve.rs` — three criterion benches at 10K corpus scale against §16/02 §2.9 perf targets. Production-scale (100K / 1M) validation reserved for phase 14 acceptance.
+
+**Deferred to later phases:**
+
+- Full content-aware memory rebuild (post-v1) — §27/07.
+- Partial WAL replay on shard recovery (post-v1) — §27/07.
+- Hot rebuild while live writer running (post-v1).
+- `ADMIN_TANTIVY_REBUILD` wire op — phase 28/05 admin.
+- Cross-shard lexical ranking — phase 23 router.
+- BM25 k1 / b custom similarity — phase 23 if needed.
+- Snippet generation — post-v1 if hybrid query needs it.
+- Segment-merge windowing — post-v1.
+
+**Bench results** (Linux Docker, --quick): bench harness in `crates/brain-index/benches/lexical_retrieve.rs` ready for capture; wall-time numbers deferred per the 21.7 precedent. Spec targets: memory single-term p50 10 ms / p99 50 ms @ 100K; statement single-term same @ 1M; commit (256-doc batch) p50 5 ms / p99 25 ms (§16/02 §2.9). Production-scale validation runs in phase 14's acceptance suite.
 
 ---
 

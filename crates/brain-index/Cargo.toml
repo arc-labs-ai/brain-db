@@ -41,3 +41,7 @@ harness = false
 [[bench]]
 name = "insert"
 harness = false
+
+[[bench]]
+name = "lexical_retrieve"
+harness = false
