@@ -422,6 +422,7 @@ name = "brain-metadata"
 version = "0.1.0"
 dependencies = [
  "brain-core",
+ "brain-protocol",
  "brain-storage",
  "bytemuck",
  "criterion",
@@ -429,6 +430,7 @@ dependencies = [
  "proptest",
  "redb",
  "rkyv",
+ "serde_json",
  "smallvec",
  "tempfile",
  "thiserror 1.0.69",
