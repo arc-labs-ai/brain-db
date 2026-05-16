@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brain_extractors::{ClassifierConfig, ExtractorRegistry};
-use brain_index::TantivyShard;
+use brain_index::{LexicalRetriever, TantivyShard};
 use brain_metadata::LlmCacheDb;
 use brain_planner::{ExecutorContext, PlannerContext};
 use parking_lot::{Mutex, RwLock};
@@ -81,6 +81,11 @@ pub struct OpsContext {
     /// supersede / tombstone / retract handlers enqueue
     /// Upsert / Delete events post-commit.
     pub statement_text_dispatcher: Option<Arc<StatementTextDispatcher>>,
+    /// Per-shard lexical retriever (phase 22.5). Reads the
+    /// tantivy indexes maintained by the 22.3 + 22.4 workers.
+    /// Phase 23's hybrid query consumes this slot; substrate-
+    /// only deployments leave it `None`.
+    pub lexical_retriever: Option<Arc<dyn LexicalRetriever>>,
 }
 
 impl OpsContext {
@@ -102,6 +107,7 @@ impl OpsContext {
             tantivy: None,
             memory_text_dispatcher: None,
             statement_text_dispatcher: None,
+            lexical_retriever: None,
         }
     }
 
@@ -205,6 +211,14 @@ impl OpsContext {
         dispatcher: Option<Arc<StatementTextDispatcher>>,
     ) -> Self {
         self.statement_text_dispatcher = dispatcher;
+        self
+    }
+
+    /// Install (or clear) the lexical retriever (phase 22.5).
+    /// Phase 23's hybrid query path reads through this slot.
+    #[must_use]
+    pub fn with_lexical_retriever(mut self, retriever: Option<Arc<dyn LexicalRetriever>>) -> Self {
+        self.lexical_retriever = retriever;
         self
     }
 }

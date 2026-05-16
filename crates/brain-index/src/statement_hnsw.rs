@@ -288,10 +288,7 @@ impl StatementHnswIndex {
     /// Mark `statement_id` as tombstoned. Search results filter
     /// tombstoned entries out; the underlying HNSW graph is unaffected
     /// until [`Self::rebuild`].
-    pub fn mark_tombstoned(
-        &mut self,
-        statement_id: StatementId,
-    ) -> Result<(), StatementHnswError> {
+    pub fn mark_tombstoned(&mut self, statement_id: StatementId) -> Result<(), StatementHnswError> {
         let internal_id = self
             .reverse
             .get(&statement_id)
@@ -618,7 +615,11 @@ mod tests {
         let id = StatementId::new();
         let other = StatementId::new();
         let report = idx
-            .rebuild(vec![(id, one_hot(0)), (id, one_hot(1)), (other, one_hot(2))])
+            .rebuild(vec![
+                (id, one_hot(0)),
+                (id, one_hot(1)),
+                (other, one_hot(2)),
+            ])
             .unwrap();
         assert_eq!(report.inserted, 2);
         assert_eq!(report.duplicates_skipped, 1);

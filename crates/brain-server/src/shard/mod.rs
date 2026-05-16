@@ -950,6 +950,27 @@ pub fn spawn_shard(
                     (None, None)
                 };
 
+            // 22.5: per-shard lexical retriever. Constructed
+            // from the same TantivyShard the indexer workers
+            // write to; phase 23's hybrid query consumes it via
+            // `OpsContext.lexical_retriever`.
+            let lexical_retriever_for_ops = tantivy_for_ops.as_ref().and_then(|shard| {
+                match brain_index::TantivyLexicalRetriever::new(shard.clone()) {
+                    Ok(r) => {
+                        let arc: Arc<dyn brain_index::LexicalRetriever> = Arc::new(r);
+                        Some(arc)
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            target: "brain_server::shard",
+                            error = %err,
+                            "lexical retriever init failed; reads will return IndexUnavailable",
+                        );
+                        None
+                    }
+                }
+            });
+
             let ops = Arc::new(
                 OpsContext::new(executor_ctx)
                     .with_extractor_registry(extractor_registry)
@@ -957,7 +978,8 @@ pub fn spawn_shard(
                     .with_llm_cache(llm_cache_for_ops)
                     .with_tantivy(tantivy_for_ops)
                     .with_memory_text_dispatcher(memory_text_dispatcher_for_ops)
-                    .with_statement_text_dispatcher(statement_text_dispatcher_for_ops),
+                    .with_statement_text_dispatcher(statement_text_dispatcher_for_ops)
+                    .with_lexical_retriever(lexical_retriever_for_ops),
             );
 
             // Spawn the per-shard fanout task: drains the in-process

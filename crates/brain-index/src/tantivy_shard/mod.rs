@@ -22,8 +22,13 @@ use tantivy::schema::{Schema, FAST, INDEXED, STORED, STRING, TEXT};
 use tantivy::Index;
 use thiserror::Error;
 
+pub mod retriever;
 pub mod tokenizer;
 
+pub use retriever::{
+    LexicalError, LexicalFilters, LexicalQuery, LexicalRetriever, LexicalRetrieverConfig,
+    RankedItem, RankedItemId, TantivyLexicalRetriever,
+};
 pub use tokenizer::{build_analyzer, BrainTokenizer, BRAIN_TOKENIZER_NAME};
 
 /// Brain-side schema version stamped on the tantivy `IndexMeta::payload`.

@@ -290,3 +290,62 @@ async fn upsert_round_trips_metadata_fields() {
     // Suppress unused-path warning on macOS-non-linux builds
     let _ = Path::new(".");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn end_to_end_indexer_to_retriever() {
+    // 22.5 smoke: an Upsert via the dispatcher must surface
+    // through `TantivyLexicalRetriever::retrieve` against the
+    // same shard. Exercises the full write→reload→search path
+    // including the protected-token tokenizer.
+    use std::sync::Arc;
+
+    use brain_index::{
+        LexicalQuery, LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItemId,
+        TantivyLexicalRetriever, TantivyShard,
+    };
+
+    let dir = TempDir::new().expect("tempdir");
+    let startup = TantivyShard::open(dir.path()).expect("open");
+    let shard = startup.shard.clone();
+    let handle = shard.memory_text.clone();
+    let policy = CommitPolicy::new(1, Duration::from_secs(60));
+    let (dispatcher, join) = spawn_drain(handle, policy).await;
+
+    let id = MemoryId::pack(0, 5, 0);
+    dispatcher
+        .dispatch(MemoryTextOp::Upsert {
+            id,
+            text: "ticket ACME-1247 reproduces under load".into(),
+            agent: AgentId::new(),
+            kind: MemoryKind::Episodic,
+            created_at_unix_ms: 0,
+        })
+        .await;
+    drop(dispatcher);
+    join.await.expect("drain task");
+
+    let retriever = TantivyLexicalRetriever::new(shard).expect("retriever");
+    let result = retriever
+        .retrieve(
+            &LexicalQuery {
+                terms: vec!["acme-1247".into()],
+                ..Default::default()
+            },
+            LexicalScope::MemoryText,
+            &LexicalRetrieverConfig::default(),
+        )
+        .expect("retrieve");
+
+    assert_eq!(result.len(), 1, "indexed protected ID must surface");
+    if let RankedItemId::Memory(found) = result[0].id {
+        assert_eq!(found, id);
+    } else {
+        panic!("expected MemoryId");
+    }
+
+    // Borrow check — Arc<dyn LexicalRetriever> works.
+    let _: Arc<dyn LexicalRetriever> = Arc::new(
+        TantivyLexicalRetriever::new(TantivyShard::open(dir.path()).expect("reopen").shard)
+            .expect("retriever"),
+    );
+}

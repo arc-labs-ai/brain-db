@@ -42,18 +42,19 @@ pub use entity_hnsw::{
     EntityHnswError, EntityHnswIndex, EntityHnswParams, RebuildReport as EntityRebuildReport,
 };
 pub use hnsw::{HnswError, HnswIndex};
-pub use statement_hnsw::{
-    RebuildReport as StatementRebuildReport, StatementHnswError, StatementHnswIndex,
-    StatementHnswParams,
-};
 pub use idmap::{IdMap, IdMapError};
 pub use params::{IndexParams, IndexParamsError, MAX_LAYER, VECTOR_DIM};
 pub use rebuild::RebuildReport;
 pub use shared::{SharedHnsw, Writer};
+pub use statement_hnsw::{
+    RebuildReport as StatementRebuildReport, StatementHnswError, StatementHnswIndex,
+    StatementHnswParams,
+};
 pub use tantivy_shard::{
     build_analyzer, memory_text_schema, schema_payload_json, statements_schema, BrainSchemaPayload,
-    BrainTokenizer, IndexHandle, IndexStatus, LexicalScope, RebuildReason as TantivyRebuildReason,
-    TantivyShard, TantivyShardError, TantivyShardStartup, BRAIN_SCHEMA_VERSION,
-    BRAIN_TOKENIZER_NAME,
+    BrainTokenizer, IndexHandle, IndexStatus, LexicalError, LexicalFilters, LexicalQuery,
+    LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItem, RankedItemId,
+    RebuildReason as TantivyRebuildReason, TantivyLexicalRetriever, TantivyShard,
+    TantivyShardError, TantivyShardStartup, BRAIN_SCHEMA_VERSION, BRAIN_TOKENIZER_NAME,
 };
 pub use tombstones::TombstoneBitmap;
