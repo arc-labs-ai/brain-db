@@ -11,6 +11,7 @@
 pub mod builder;
 pub mod entity;
 pub mod errors;
+pub mod relation;
 pub mod statement;
 
 pub use builder::{
@@ -21,7 +22,12 @@ pub use entity::{
     BrainEntityType, EntityHandle, EntityHandleFromViewError, Person, PersonAttributes,
 };
 pub use errors::{
-    ClientErrorEntityExt, ClientErrorStatementExt, EntityErrorKind, StatementErrorKind,
+    ClientErrorEntityExt, ClientErrorRelationExt, ClientErrorStatementExt, EntityErrorKind,
+    RelationErrorKind, StatementErrorKind,
+};
+pub use relation::{
+    RelationBuilder, RelationHandle, RelationListFromBuilder, RelationListToBuilder,
+    RelationTraverseBuilder, RelationsClient, TraversalPath, TraversalStep, TraverseDirection,
 };
 pub use statement::{
     EventBuilder, FactBuilder, PreferenceBuilder, StatementHandle, StatementListBuilder,
