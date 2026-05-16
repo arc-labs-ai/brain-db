@@ -42,10 +42,12 @@ use redb::{
 };
 
 use crate::predicate_ops::{predicate_intern, PredicateOpError};
+use crate::relation_type_ops::{relation_type_intern, RelationTypeOpError};
 use crate::schema::{open_or_init_schema, SchemaError};
 use crate::tables::checkpoint::{latest as latest_checkpoint, CHECKPOINTS_TABLE};
 use crate::tables::knowledge::entity_type::{EntityTypeDefinition, ENTITY_TYPES_TABLE};
 use brain_core::knowledge::StatementKind;
+use brain_core::Cardinality;
 use brain_core::EntityType;
 
 /// Public type wrapping the redb metadata file. Single ownership per
@@ -186,6 +188,52 @@ const BUILTIN_PREDICATES: &[(&str, &str, Option<StatementKind>, u8, &str)] = &[
 /// `seed_builtin_predicates` therefore leaves pre-existing rows alone
 /// (test fixtures, prior opens, future user schemas that import a
 /// `brain:*` predicate verbatim) and never overwrites diverging shapes.
+/// Built-in relation types seeded at `MetadataDb::open` per spec
+/// §20/00 §"Built-in" + §29/00 phase-scope. Phase 18.3.
+///
+/// `(namespace, name, cardinality, is_symmetric, description)`.
+/// `from_type` / `to_type` are both `None` (any entity type).
+const BUILTIN_RELATION_TYPES: &[(&str, &str, Cardinality, bool, &str)] = &[(
+    "brain",
+    "related_to",
+    Cardinality::ManyToMany,
+    false,
+    "Generic relation between two entities.",
+)];
+
+/// Seed the built-in `brain:*` relation types idempotently. Mirrors
+/// `seed_builtin_predicates` (17.3). Pre-existing rows with
+/// diverging shapes are preserved — never overwritten.
+fn seed_builtin_relation_types(db: &Database) -> Result<(), MetadataDbError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+
+    let wtxn = db.begin_write()?;
+    for (ns, name, cardinality, is_symmetric, desc) in BUILTIN_RELATION_TYPES {
+        match relation_type_intern(
+            &wtxn,
+            ns,
+            name,
+            None,
+            None,
+            *cardinality,
+            *is_symmetric,
+            /* schema_version */ 1,
+            desc,
+            now,
+        ) {
+            Ok(_) => {}
+            Err(RelationTypeOpError::AlreadyExists { .. }) => {}
+            Err(e) => return Err(MetadataDbError::BuiltinRelationTypeSeed(e)),
+        }
+    }
+    wtxn.commit()
+        .map_err(|e| MetadataDbError::Schema(SchemaError::Commit(e)))?;
+    Ok(())
+}
+
 fn seed_builtin_predicates(db: &Database) -> Result<(), MetadataDbError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -238,6 +286,10 @@ pub enum MetadataDbError {
     /// Seeding a built-in predicate failed at `MetadataDb::open`.
     #[error("built-in predicate seed: {0}")]
     BuiltinPredicateSeed(PredicateOpError),
+
+    /// Seeding a built-in relation type failed at `MetadataDb::open`.
+    #[error("built-in relation type seed: {0}")]
+    BuiltinRelationTypeSeed(RelationTypeOpError),
 }
 
 impl MetadataDb {
@@ -280,6 +332,11 @@ impl MetadataDb {
         // rows are preserved. Phase 19's `SCHEMA_UPLOAD` registers
         // user predicates against this same registry.
         seed_builtin_predicates(&db)?;
+
+        // Sub-task 18.3: seed `brain:related_to` relation type
+        // (any→any ManyToMany asymmetric). Same idempotency
+        // semantics as predicate seeding.
+        seed_builtin_relation_types(&db)?;
 
         Ok(Self {
             db,
@@ -629,5 +686,41 @@ mod tests {
             .map(|e| e.unwrap().0.value())
             .collect();
         assert_eq!(rows, vec![42], "Person seed must skip when registry has rows");
+    }
+
+    // -----------------------------------------------------------------
+    // Sub-task 18.3: built-in relation type seeding.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn builtin_relation_types_seeded_on_fresh_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(db_path(&dir)).unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let got = crate::relation_type_ops::relation_type_lookup_by_qname(
+            &rtxn,
+            "brain",
+            "related_to",
+        )
+        .unwrap()
+        .expect("brain:related_to seeded");
+        assert_eq!(got.canonical(), "brain:related_to");
+        assert_eq!(got.cardinality, brain_core::Cardinality::ManyToMany);
+        assert!(!got.is_symmetric);
+        assert!(got.from_type.is_none());
+        assert!(got.to_type.is_none());
+    }
+
+    #[test]
+    fn builtin_relation_types_seed_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        drop(MetadataDb::open(&path).unwrap());
+        let db = MetadataDb::open(&path).unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let all = crate::relation_type_ops::relation_type_list(&rtxn, Some("brain")).unwrap();
+        assert_eq!(all.len(), 1, "re-open must not duplicate built-in seeds");
     }
 }

@@ -19,6 +19,7 @@ pub mod entity_merge_ops;
 pub mod entity_ops;
 pub mod llm_cache;
 pub mod predicate_ops;
+pub mod relation_type_ops;
 pub mod schema;
 pub mod sink;
 pub mod statement_ops;
@@ -34,6 +35,10 @@ pub use entity_ops::{
 pub use llm_cache::{LlmCacheDb, LlmCacheError, LlmResponse};
 pub use predicate_ops::{
     predicate_get, predicate_intern, predicate_list, predicate_lookup_by_qname, PredicateOpError,
+};
+pub use relation_type_ops::{
+    relation_type_get, relation_type_intern, relation_type_list, relation_type_lookup_by_qname,
+    RelationTypeOpError,
 };
 pub use statement_ops::{
     allocate_evidence_overflow, evidence_overflow_load, statement_create, statement_get,
