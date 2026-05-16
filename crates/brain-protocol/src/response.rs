@@ -118,6 +118,12 @@ pub enum ResponseBody {
     SchemaList(crate::knowledge::SchemaListResponseFrame),
     SchemaValidate(crate::knowledge::SchemaValidateResponse),
 
+    // Extractor governance ops (phase 20.8). Spec §28/05 §6-§7.
+    /// Single-frame snapshot in v1.
+    ExtractorList(crate::knowledge::ExtractorListResponseFrame),
+    ExtractorDisable(crate::knowledge::ExtractorDisableResponse),
+    ExtractorEnable(crate::knowledge::ExtractorEnableResponse),
+
     Error(ErrorResponse),
 }
 
@@ -181,6 +187,9 @@ impl ResponseBody {
             Self::SchemaGet(_) => Opcode::SchemaGetResp,
             Self::SchemaList(_) => Opcode::SchemaListResp,
             Self::SchemaValidate(_) => Opcode::SchemaValidateResp,
+            Self::ExtractorList(_) => Opcode::ExtractorListResp,
+            Self::ExtractorDisable(_) => Opcode::ExtractorDisableResp,
+            Self::ExtractorEnable(_) => Opcode::ExtractorEnableResp,
             Self::Error(_) => Opcode::Error,
         }
     }
@@ -203,6 +212,7 @@ impl ResponseBody {
             Self::RelationListTo(r) => Some(r.is_final),
             Self::RelationTraverse(r) => Some(r.is_final),
             Self::SchemaList(r) => Some(r.is_final),
+            Self::ExtractorList(r) => Some(r.is_final),
             _ => None,
         }
     }
@@ -266,6 +276,9 @@ impl ResponseBody {
             Self::SchemaGet(r) => to_rkyv_bytes(r),
             Self::SchemaList(r) => to_rkyv_bytes(r),
             Self::SchemaValidate(r) => to_rkyv_bytes(r),
+            Self::ExtractorList(r) => to_rkyv_bytes(r),
+            Self::ExtractorDisable(r) => to_rkyv_bytes(r),
+            Self::ExtractorEnable(r) => to_rkyv_bytes(r),
             Self::Error(r) => to_rkyv_bytes(r),
         }
     }
@@ -332,6 +345,9 @@ impl ResponseBody {
             Opcode::SchemaGetResp => Self::SchemaGet(from_rkyv_bytes(bytes)?),
             Opcode::SchemaListResp => Self::SchemaList(from_rkyv_bytes(bytes)?),
             Opcode::SchemaValidateResp => Self::SchemaValidate(from_rkyv_bytes(bytes)?),
+            Opcode::ExtractorListResp => Self::ExtractorList(from_rkyv_bytes(bytes)?),
+            Opcode::ExtractorDisableResp => Self::ExtractorDisable(from_rkyv_bytes(bytes)?),
+            Opcode::ExtractorEnableResp => Self::ExtractorEnable(from_rkyv_bytes(bytes)?),
             Opcode::Error => Self::Error(from_rkyv_bytes(bytes)?),
             other => return Err(ProtocolError::UnknownOpcode(other.as_u16())),
         })

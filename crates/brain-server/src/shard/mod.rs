@@ -810,7 +810,46 @@ pub fn spawn_shard(
                 Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
             let executor_ctx =
                 ExecutorContext::new(dispatcher, hnsw_shared.clone(), metadata.clone(), writer);
-            let ops = Arc::new(OpsContext::new(executor_ctx));
+
+            // Phase 20.7: materialise the persisted `EXTRACTORS_TABLE`
+            // rows (seeded by the system-schema bootstrap at
+            // MetadataDb::open) into a runtime ExtractorRegistry.
+            // The classifier model is unloaded in phase 20.7;
+            // operator-provided weights via BRAIN_NER_MODEL_PATH
+            // are wired in phase 20.7b.
+            let extractor_registry = {
+                let db_guard = metadata.lock();
+                let rtxn = db_guard
+                    .read_txn()
+                    .expect("read_txn after MetadataDb::open");
+                let defs = brain_metadata::extractor_list(&rtxn)
+                    .expect("extractor_list at shard startup");
+                drop(rtxn);
+                drop(db_guard);
+
+                let (reg, errors) =
+                    brain_extractors::build_registry_from_definitions(&defs, None);
+                for (id, err) in errors {
+                    tracing::warn!(
+                        target: "brain_server::shard",
+                        extractor_id = id.raw(),
+                        error = %err,
+                        "extractor materialise failed; skipping",
+                    );
+                }
+                reg
+            };
+
+            let classifier_config = match std::env::var("BRAIN_NER_MODEL_PATH") {
+                Ok(p) => brain_extractors::ClassifierConfig::with_model_path(p.into()),
+                Err(_) => brain_extractors::ClassifierConfig::unloaded(),
+            };
+
+            let ops = Arc::new(
+                OpsContext::new(executor_ctx)
+                    .with_extractor_registry(extractor_registry)
+                    .with_classifier_config(classifier_config),
+            );
 
             // Spawn the per-shard fanout task: drains the in-process
             // broadcast EventBus (`ops.events`) into the cross-shard

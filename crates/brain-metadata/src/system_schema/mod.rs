@@ -145,4 +145,89 @@ mod tests {
             .value();
         assert_eq!(row.name, "Person");
     }
+
+    #[test]
+    fn system_schema_seeds_two_builtin_extractors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.redb");
+        let db = Database::create(&path).unwrap();
+        seed_system_schema(&db).unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let all = crate::extractor_ops::extractor_list(&rtxn).unwrap();
+        assert_eq!(all.len(), 2);
+        let names: Vec<&str> = all.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"entity_mentions"));
+        assert!(names.contains(&"basic_ner"));
+        for ext in &all {
+            assert_eq!(ext.namespace, "brain");
+            assert!(ext.is_enabled());
+        }
+    }
+
+    #[test]
+    fn system_schema_extractor_ids_are_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.redb");
+        let db = Database::create(&path).unwrap();
+        seed_system_schema(&db).unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let entity_mentions = crate::extractor_ops::extractor_lookup_by_qname(
+            &rtxn,
+            "brain",
+            "entity_mentions",
+        )
+        .unwrap()
+        .expect("entity_mentions registered");
+        let basic_ner =
+            crate::extractor_ops::extractor_lookup_by_qname(&rtxn, "brain", "basic_ner")
+                .unwrap()
+                .expect("basic_ner registered");
+        assert_eq!(entity_mentions.id().raw(), 1);
+        assert_eq!(basic_ner.id().raw(), 2);
+    }
+
+    #[test]
+    fn system_schema_extractor_definitions_decode_via_serde() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.redb");
+        let db = Database::create(&path).unwrap();
+        seed_system_schema(&db).unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let row =
+            crate::extractor_ops::extractor_lookup_by_qname(&rtxn, "brain", "entity_mentions")
+                .unwrap()
+                .unwrap();
+        let ast: brain_protocol::schema::ExtractorDef =
+            serde_json::from_slice(&row.definition_blob).expect("decode AST");
+        assert_eq!(ast.name, "entity_mentions");
+        match ast.target {
+            brain_protocol::schema::ExtractorTarget::Entity { ref entity_type } => {
+                assert_eq!(entity_type, "Person");
+            }
+            other => panic!("expected Entity target, got {other:?}"),
+        }
+        let has_patterns = ast.fields.iter().any(|f| {
+            matches!(f, brain_protocol::schema::ExtractorField::Patterns(p) if p.len() == 2)
+        });
+        assert!(has_patterns);
+    }
+
+    #[test]
+    fn reopen_does_not_duplicate_builtin_extractors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.redb");
+        {
+            let db = Database::create(&path).unwrap();
+            seed_system_schema(&db).unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        seed_system_schema(&db).unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let all = crate::extractor_ops::extractor_list(&rtxn).unwrap();
+        assert_eq!(all.len(), 2, "reopen must not duplicate built-ins");
+    }
 }

@@ -13,6 +13,7 @@ members = [
     "crates/brain-index",
     "crates/brain-embed",
     "crates/brain-planner",
+    "crates/brain-extractors",
     "crates/brain-ops",
     "crates/brain-workers",
     "crates/brain-server",
@@ -84,6 +85,8 @@ toml = "0.8"
 # Schema DSL parser (phase 19.3) — PEG grammar for `schema.brain`.
 pest = "2.7"
 pest_derive = "2.7"
+# Pattern extractor (phase 20.2) — regex over memory text.
+regex = "1"
 
 # Storage / indexing
 redb = "4"

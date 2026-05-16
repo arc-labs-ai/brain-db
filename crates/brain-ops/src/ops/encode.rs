@@ -5,7 +5,7 @@
 //! `MemoryId`, push to the buffer, return a preview response. The
 //! actual redb + HNSW writes happen at TXN_COMMIT time.
 
-use brain_core::{ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{AgentId, ContextId, EdgeKind, Memory, MemoryId, MemoryKind, Salience};
 use brain_metadata::tables::memory::MemoryMetadata;
 use brain_planner::{execute_encode, plan_encode_inner, EdgeOutcome};
 use brain_protocol::request::EncodeRequest;
@@ -14,6 +14,7 @@ use brain_protocol::response::EncodeResponse;
 use crate::context::OpsContext;
 use crate::error::OpError;
 use crate::idempotency::hash_encode_request;
+use crate::ops::extractor_pipeline::run_extractor_pipeline;
 use crate::txn::{BufferedEdgeSpec, BufferedEncode, BufferedReplay};
 
 pub async fn handle_encode(
@@ -24,7 +25,7 @@ pub async fn handle_encode(
         return handle_encode_in_txn(req, txn_id, ctx).await;
     }
 
-    // Non-txn path: plan → execute → wire.
+    // Non-txn path: plan → execute → extractors (best-effort) → wire.
     let plan = plan_encode_inner(&req, &ctx.planner_ctx)?;
     let salience = plan.wal_append.salience_initial;
     let result = execute_encode(plan, &ctx.executor).await?;
@@ -33,6 +34,31 @@ pub async fn handle_encode(
         .iter()
         .filter(|o| matches!(o, EdgeOutcome::Inserted))
         .count() as u32;
+
+    // §22 + §27/01 — pattern extractors run synchronously after
+    // the WAL commit; classifier dispatches in the same call.
+    // Best-effort: errors are logged + audited, never propagated.
+    // Skip the pipeline on dedup replays (no new memory to extract
+    // from) and on memories the registry has no extractors for
+    // (the empty-snapshot fast path inside the pipeline handles
+    // the latter, but checking here avoids constructing a
+    // throwaway `Memory` value).
+    if !result.replayed {
+        let memory = Memory {
+            id: result.memory_id,
+            // No `agent_id` on the wire request — extractor audit
+            // doesn't need the actor; phase 22+ admin audit will
+            // join the connection-layer agent context.
+            agent: AgentId::new(),
+            context: ContextId::from(req.context_id),
+            kind: MemoryKind::from(req.kind),
+            salience: Salience::new(salience),
+            text: Some(req.text.clone()),
+            created_at_unix_ms: 0,
+            last_accessed_at_unix_ms: 0,
+        };
+        run_extractor_pipeline(ctx, &memory).await;
+    }
 
     Ok(EncodeResponse {
         memory_id: result.memory_id.into(),

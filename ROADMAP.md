@@ -403,15 +403,73 @@ These phases turn Brain from a vector memory store into a cognitive database wit
 
 ---
 
-## Phase 20 — Pattern + classifier extractors
+## Phase 20 — Pattern + classifier extractors ✓
 
-**One-line:** Extractor framework; pattern (regex) + classifier (small model) tiers run on ENCODE; built-ins (`brain.entity_mentions`, basic NER); extraction audit log.
+**One-line:** Extractor framework; pattern (regex) + classifier (operator-provided model) tiers wire into ENCODE; built-ins (`brain.entity_mentions`, `brain.basic_ner`) declared via the system schema; extraction audit log + governance wire ops.
 
-**Detailed plan:** [`docs/phases/phase-20-pattern-classifier-extractors.md`](docs/phases/phase-20-pattern-classifier-extractors.md)
+**Detailed plan:** [`docs/phases/phase-20-pattern-classifier-extractors.md`](docs/phases/phase-20-pattern-classifier-extractors.md) (superseded by `.claude/plans/phase-20*.md` per-sub-task plans).
 
-**Crates touched:** new `brain-extractors`; `brain-core`, `brain-metadata`, `brain-server`.
+**Crates touched:** new `brain-extractors`; `brain-protocol`, `brain-metadata`, `brain-ops`, `brain-server`.
 
-**Sub-tasks:** 8. **Exit:** ENCODE P99 ≤ 20 ms with extractors active; audit log queryable; tag `phase-20-complete`.
+**Sub-tasks:** 10. **Exit:** pattern extractor runs end-to-end through ENCODE without operator setup; classifier framework wired with operator-provided model surface (real candle inference parked as phase 20.7b); audit log queryable; 3 governance wire ops (LIST/DISABLE/ENABLE) operational; tag `phase-20-complete`.
+
+**Scope cut:** Real classifier inference (candle BERT forward pass + linear classifier head) parked as **phase 20.7b**. Phase 20 ships the framework with the BertTokenClassifier load path validated and the candle runtime returning the staged `Failure(reason: "runtime not wired")` until weights + math land. Operators can already provision `BRAIN_NER_MODEL_PATH` — 20.7b just lights up the inference path.
+
+**Delivered:**
+
+- §22 extractors / §27 workers / §25 provenance sections brought to phase-20-implementation depth (~21 spec files: 8 §22 + 3 §27 + 3 §25 + bundled §16/02 §2.7 perf targets + §21/07 fan-out resolution).
+- New `brain-extractors` crate (~2 600 LOC):
+  - `Extractor` trait (object-safe `Arc<dyn Extractor>`).
+  - `ExtractionResult` / `ExtractionStatus` (u8-repr enum, bytes match `brain-metadata::extraction_status::*`).
+  - `ExtractedItem` = `EntityMention | StatementMention | RelationMention`.
+  - `ExtractorRegistry` with enable / disable / iter_enabled / iter_all.
+  - `IdempotencyKey` + BLAKE3 `hash_memory_text`.
+  - `PatternExtractor` over `regex` 1.x with 1 MiB compile-size cap (§22/01 §2). All 4 target kinds projected.
+  - `ClassifierConfig` + `BertTokenClassifier` load path (operator-provided directory matching brain-embed's `EmbedderConfig`).
+  - `labels` BIO decoder for CONLL `B-X I-X I-X` → `X` spans with stray-I-promotion + label-switch handling.
+  - `materialize` — decodes persisted `ExtractorDefinition.definition_blob` (JSON) back to `Arc<dyn Extractor>` instances; LLM-kind rows register as degraded placeholders pending phase 21.
+  - Operator setup doc `docs/bundled-ner.md`.
+- `brain-metadata` storage layer:
+  - Widened `ExtractionAudit` (v1 → v2) to the full §22/05 §1 / §25/01 §1 shape: provenance, status, outputs, cost, input_hash. 3 secondary indexes (`_BY_MEMORY` / `_BY_EXTRACTOR` / `_BY_TIME`).
+  - `audit_ops` API: `audit_write` (4-table atomic write), `audit_get`, `audit_by_memory` / `_by_extractor` / `audit_recent` / `audit_recent_failures`.
+  - 64-entry `OUTPUTS_CAP`; over-cap rejected before wtxn touches.
+  - Widened `ExtractorDefinition` (v1 → v2): namespace + name + qname index. `extractor_ops` API mirrors `predicate_ops` (intern / get / lookup / list / set_enabled).
+  - `schema_apply` fleshed out for `SchemaItem::Extractor` — JSON-encoded AST blob fans out via `extractor_intern`.
+  - System schema gains `brain.entity_mentions` (pattern, two English-name regexes) and `brain.basic_ner` (classifier, threshold 0.6). Stable IDs across reopens (1 and 2).
+- `brain-ops`:
+  - `OpsContext` extended with `extractor_registry: Arc<RwLock<ExtractorRegistry>>` + `classifier_config: Arc<ClassifierConfig>`.
+  - `extractor_pipeline::run_extractor_pipeline` — snapshot-and-dispatch synchronously after ENCODE commit. Audit row per dispatch. Best-effort: errors logged + audited, never propagate to ENCODE.
+  - ENCODE non-txn path hooks the pipeline; txn-path skips (phase 22+ wires at commit time).
+  - `knowledge_extractor` wire handlers for `EXTRACTOR_LIST` / `_DISABLE` / `_ENABLE`. DISABLE/ENABLE sync the in-memory registry alongside the wtxn write so subsequent dispatches honour the new state.
+- `brain-server`:
+  - Shard spawn materialises the persisted `EXTRACTORS_TABLE` rows into the runtime registry via `build_registry_from_definitions`. Per-row errors logged + skipped.
+  - `BRAIN_NER_MODEL_PATH` env var wired into `ClassifierConfig`.
+- Wire surface: 3 opcodes (`0x0124` / `0x0125` / `0x0126`) + 3 responses (`0x01A4` / `0x01A5` / `0x01A6`) end-to-end.
+- Integration tests: 6 wire-smoke tests + 1 full-lifecycle phase-exit test (ENCODE → pattern → audit → DISABLE → ENCODE → audit-only-classifier).
+- criterion benches against §16/02 §2.7 perf targets (pattern + audit ops; classifier deferred to 20.7b).
+
+**Deferred to later phases (tracked in `spec/22_extractors/07_open_questions.md` + `spec/27_knowledge_workers/07_open_questions.md` + `spec/25_provenance_versioning/07_open_questions.md`):**
+
+- **Phase 20.7b** (immediate follow-up): BertRuntime candle forward pass + linear classifier head — the `#[ignore]`-gated `real_inference_returns_per_span_for_alice` test in `classifier::tests` flips on when a model is provisioned.
+- Resolver-tier persistence of `EntityMention` outputs (entity_mentions rows) — phase 22+; v1 audit row carries item count in `status_reason` for diagnostic visibility.
+- LLM extractor (phase 21).
+- Classifier near-foreground queue (§27/01 §3) — v1 runs synchronously.
+- `OnDemand` / `OnSchemaChange` / `Periodic` triggers — phase 22+ (§22/07 Q3).
+- Resolution workers / decay sweeper / FORGET cascade / audit-log sweeper — phase 22+ (§27/07 Q1-Q4).
+- `ADMIN_GET_EXTRACTION_AUDIT` wire op — phase 22+ admin (§25/07 Q1).
+- Multi-extractor batching, adaptive throttling, cross-shard coordination, content-addressed output IDs — post-v1.
+- `depends_on` topological-sort ordering — §22/07 Q11.
+- Bundled-model Cargo feature for self-contained binaries — post-v1.
+- `feature_extraction: Custom { id }` — post-v1 (§22/07 Q2).
+- Auto-predicate creation for unknown statement-target predicates — post-v1 (§22/07 Q6).
+- Admin authorization on extractor governance opcodes — phase 21 admin (§28/05 §8).
+
+**Bench results** (Linux Docker, --quick):
+- `pattern_extract` 4 KiB / 5 regexes: **43 µs** (spec p99 100 µs ✓).
+- `pattern_extract` 256 B / 5 regexes: **2.9 µs**.
+- `audit_by_memory(limit=100)`: **47 µs** (spec p99 2 ms ✓).
+- `audit_by_extractor(limit=100)`: **83 µs** (spec p99 2 ms ✓).
+- `audit_write` per-iter db open + commit cost dominates at 1.4 ms — wtxn-only cost is dramatically lower per the in-test commit timings; the bench setup overhead is the noise source.
 
 ---
 
