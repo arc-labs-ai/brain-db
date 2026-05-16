@@ -16,6 +16,8 @@
 pub mod entity_req;
 pub mod entity_resp;
 pub mod events;
+pub mod relation_req;
+pub mod relation_resp;
 pub mod statement_req;
 pub mod statement_resp;
 
@@ -34,6 +36,16 @@ pub use events::{
     EntityUnmergedEvent, EntityUpdatedEvent, ExtractionCompletedEvent, ExtractionFailedEvent,
     KnowledgeEventPayload, RelationCreatedEvent, RelationSupersededEvent, SchemaUpdatedEvent,
     StatementCreatedEvent, StatementSupersededEvent, StatementTombstonedEvent,
+};
+pub use relation_req::{
+    RelationCreateRequest, RelationGetRequest, RelationListFromRequest, RelationListToRequest,
+    RelationSupersedeRequest, RelationTombstoneRequest, RelationTraverseRequest,
+};
+pub use relation_resp::{
+    relation_type_canonical, RelationCreateResponse, RelationGetResponse,
+    RelationListFromResponseFrame, RelationListToResponseFrame, RelationSupersedeResponse,
+    RelationTombstoneResponse, RelationTraverseResponseFrame, RelationView, RelationWireError,
+    TraversalPathWire, TraversalStepWire,
 };
 pub use statement_req::{
     EvidenceRefWire, StatementCreateRequest, StatementGetRequest, StatementHistoryRequest,

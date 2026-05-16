@@ -109,6 +109,15 @@ pub enum RequestBody {
     StatementRetract(crate::knowledge::StatementRetractRequest),
     StatementHistory(crate::knowledge::StatementHistoryRequest),
     StatementList(crate::knowledge::StatementListRequest),
+
+    // Relation ops (phase 18.6). Spec §28/07.
+    RelationCreate(crate::knowledge::RelationCreateRequest),
+    RelationGet(crate::knowledge::RelationGetRequest),
+    RelationSupersede(crate::knowledge::RelationSupersedeRequest),
+    RelationTombstone(crate::knowledge::RelationTombstoneRequest),
+    RelationListFrom(crate::knowledge::RelationListFromRequest),
+    RelationListTo(crate::knowledge::RelationListToRequest),
+    RelationTraverse(crate::knowledge::RelationTraverseRequest),
 }
 
 impl RequestBody {
@@ -161,6 +170,13 @@ impl RequestBody {
             Self::StatementRetract(_) => Opcode::StatementRetractReq,
             Self::StatementHistory(_) => Opcode::StatementHistoryReq,
             Self::StatementList(_) => Opcode::StatementListReq,
+            Self::RelationCreate(_) => Opcode::RelationCreateReq,
+            Self::RelationGet(_) => Opcode::RelationGetReq,
+            Self::RelationSupersede(_) => Opcode::RelationSupersedeReq,
+            Self::RelationTombstone(_) => Opcode::RelationTombstoneReq,
+            Self::RelationListFrom(_) => Opcode::RelationListFromReq,
+            Self::RelationListTo(_) => Opcode::RelationListToReq,
+            Self::RelationTraverse(_) => Opcode::RelationTraverseReq,
         }
     }
 
@@ -215,6 +231,13 @@ impl RequestBody {
             Self::StatementRetract(r) => to_rkyv_bytes(r),
             Self::StatementHistory(r) => to_rkyv_bytes(r),
             Self::StatementList(r) => to_rkyv_bytes(r),
+            Self::RelationCreate(r) => to_rkyv_bytes(r),
+            Self::RelationGet(r) => to_rkyv_bytes(r),
+            Self::RelationSupersede(r) => to_rkyv_bytes(r),
+            Self::RelationTombstone(r) => to_rkyv_bytes(r),
+            Self::RelationListFrom(r) => to_rkyv_bytes(r),
+            Self::RelationListTo(r) => to_rkyv_bytes(r),
+            Self::RelationTraverse(r) => to_rkyv_bytes(r),
         }
     }
 
@@ -270,6 +293,13 @@ impl RequestBody {
             Opcode::StatementRetractReq => Self::StatementRetract(from_rkyv_bytes(bytes)?),
             Opcode::StatementHistoryReq => Self::StatementHistory(from_rkyv_bytes(bytes)?),
             Opcode::StatementListReq => Self::StatementList(from_rkyv_bytes(bytes)?),
+            Opcode::RelationCreateReq => Self::RelationCreate(from_rkyv_bytes(bytes)?),
+            Opcode::RelationGetReq => Self::RelationGet(from_rkyv_bytes(bytes)?),
+            Opcode::RelationSupersedeReq => Self::RelationSupersede(from_rkyv_bytes(bytes)?),
+            Opcode::RelationTombstoneReq => Self::RelationTombstone(from_rkyv_bytes(bytes)?),
+            Opcode::RelationListFromReq => Self::RelationListFrom(from_rkyv_bytes(bytes)?),
+            Opcode::RelationListToReq => Self::RelationListTo(from_rkyv_bytes(bytes)?),
+            Opcode::RelationTraverseReq => Self::RelationTraverse(from_rkyv_bytes(bytes)?),
             other => return Err(ProtocolError::UnknownOpcode(other.as_u16())),
         })
     }

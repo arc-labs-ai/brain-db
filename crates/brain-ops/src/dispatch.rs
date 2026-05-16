@@ -184,5 +184,16 @@ pub async fn dispatch(req: RequestBody, ctx: &OpsContext) -> Result<ResponseBody
                 .await
                 .map(ResponseBody::StatementList)
         }
+
+        // Relation ops — wire opcodes landed in 18.6; handlers in 18.7.
+        RequestBody::RelationCreate(_)
+        | RequestBody::RelationGet(_)
+        | RequestBody::RelationSupersede(_)
+        | RequestBody::RelationTombstone(_)
+        | RequestBody::RelationListFrom(_)
+        | RequestBody::RelationListTo(_)
+        | RequestBody::RelationTraverse(_) => {
+            Err(OpError::NotYetImplemented("relation op — Phase 18.7"))
+        }
     }
 }

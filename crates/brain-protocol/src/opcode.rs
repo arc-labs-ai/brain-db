@@ -146,6 +146,22 @@ pub enum Opcode {
     StatementHistoryResp = 0x01C5,
     StatementListReq = 0x0146,
     StatementListResp = 0x01C6,
+
+    // §28 relation operations (0x0150-0x015F low-byte range) — phase 18.6.
+    RelationCreateReq = 0x0150,
+    RelationCreateResp = 0x01D0,
+    RelationGetReq = 0x0151,
+    RelationGetResp = 0x01D1,
+    RelationSupersedeReq = 0x0152,
+    RelationSupersedeResp = 0x01D2,
+    RelationTombstoneReq = 0x0153,
+    RelationTombstoneResp = 0x01D3,
+    RelationListFromReq = 0x0154,
+    RelationListFromResp = 0x01D4,
+    RelationListToReq = 0x0155,
+    RelationListToResp = 0x01D5,
+    RelationTraverseReq = 0x0156,
+    RelationTraverseResp = 0x01D6,
 }
 
 impl Opcode {
@@ -254,6 +270,22 @@ impl Opcode {
             0x01C5 => Self::StatementHistoryResp,
             0x0146 => Self::StatementListReq,
             0x01C6 => Self::StatementListResp,
+
+            // §28 relation operations (phase 18.6).
+            0x0150 => Self::RelationCreateReq,
+            0x01D0 => Self::RelationCreateResp,
+            0x0151 => Self::RelationGetReq,
+            0x01D1 => Self::RelationGetResp,
+            0x0152 => Self::RelationSupersedeReq,
+            0x01D2 => Self::RelationSupersedeResp,
+            0x0153 => Self::RelationTombstoneReq,
+            0x01D3 => Self::RelationTombstoneResp,
+            0x0154 => Self::RelationListFromReq,
+            0x01D4 => Self::RelationListFromResp,
+            0x0155 => Self::RelationListToReq,
+            0x01D5 => Self::RelationListToResp,
+            0x0156 => Self::RelationTraverseReq,
+            0x01D6 => Self::RelationTraverseResp,
 
             other => return Err(ProtocolError::UnknownOpcode(other)),
         })
