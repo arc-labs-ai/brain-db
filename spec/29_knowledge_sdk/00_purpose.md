@@ -7,8 +7,8 @@ The SDK lands across multiple phases:
 | Phase | Scope | Status |
 |---|---|---|
 | 16.8 | Hand-written `Entity` helpers for the built-in `Person` type — all 9 entity opcodes (CREATE / GET / UPDATE / RENAME / MERGE / UNMERGE / RESOLVE / LIST / TOMBSTONE). No derive macro. | complete |
-| 17.8 | Statement helpers (Fact / Preference / Event builders) — `client.fact()` / `.preference()` / `.event()` / `.statements()`. Hand-written; no derive macro. | this phase |
-| 18.x | Relation helpers. | later |
+| 17.8 | Statement helpers (Fact / Preference / Event builders) — `client.fact()` / `.preference()` / `.event()` / `.statements()`. Hand-written; no derive macro. | complete |
+| 18.8 | Relation helpers — `client.relation::<T>()` / `.relations()` + traversal builder. Hand-written; derive macro deferred to phase 19. | this phase |
 | 19 | `BrainEntity` / `BrainRelation` / `BrainFact` derive macros + `SchemaBuilder` (depends on schema DSL). | later |
 | 22-23 | Fluent query builder + subscribe extensions. | later |
 

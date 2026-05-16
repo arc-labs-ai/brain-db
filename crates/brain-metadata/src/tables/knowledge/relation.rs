@@ -7,11 +7,14 @@
 //! - [`RELATIONS_BY_TO_TABLE`]        — incoming index keyed by `(to, type, is_current)`.
 //! - [`RELATIONS_BY_EVIDENCE_TABLE`]  — reverse: which relations derive from memory M.
 //!
-//! Phase 15.1 — types only. Phase 18 wires the typed CRUD, cardinality
-//! enforcement, symmetry, and traversal.
+//! Phase 15.1 — types only. Phase 18.4 widens `RelationMetadata` with
+//! `chain_root_bytes` (rkyv archive id bumped to v2; pre-v1.0, no
+//! migration) and adds projection helpers between this row shape and
+//! `brain_core::knowledge::Relation`.
 
 use crate::impl_redb_rkyv_value;
-use brain_core::{EntityId, RelationId, RelationTypeId};
+use brain_core::knowledge::Relation;
+use brain_core::{EntityId, ExtractorId, MemoryId, RelationId, RelationTypeId};
 use redb::TableDefinition;
 
 // ---------------------------------------------------------------------------
@@ -50,11 +53,11 @@ pub const RELATIONS_BY_EVIDENCE_TABLE: TableDefinition<
 #[archive(check_bytes)]
 pub struct RelationMetadata {
     pub relation_id_bytes: [u8; 16],
+    pub chain_root_bytes: [u8; 16],
     pub relation_type_id: u32,
     pub from_entity_bytes: [u8; 16],
     pub to_entity_bytes: [u8; 16],
-    /// rkyv-encoded properties map. Phase 19 (schema DSL) defines the
-    /// typed shape; for now opaque.
+    /// Phase 19 (schema DSL) defines the typed shape; for now opaque.
     pub properties_blob: Vec<u8>,
     pub version: u32,
     pub confidence: f32,
@@ -73,42 +76,13 @@ pub struct RelationMetadata {
 
 impl RelationMetadata {
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        relation_id: RelationId,
-        relation_type_id: RelationTypeId,
-        from_entity: EntityId,
-        to_entity: EntityId,
-        extractor_id: u32,
-        extracted_at_unix_nanos: u64,
-        confidence: f32,
-        is_symmetric: bool,
-    ) -> Self {
-        Self {
-            relation_id_bytes: relation_id.to_bytes(),
-            relation_type_id: relation_type_id.raw(),
-            from_entity_bytes: from_entity.to_bytes(),
-            to_entity_bytes: to_entity.to_bytes(),
-            properties_blob: Vec::new(),
-            version: 1,
-            confidence,
-            extractor_id,
-            extracted_at_unix_nanos,
-            valid_from_unix_nanos: None,
-            valid_to_unix_nanos: None,
-            superseded_by_bytes: None,
-            supersedes_bytes: None,
-            evidence_inline: Vec::new(),
-            tombstoned: 0,
-            tombstoned_at_unix_nanos: None,
-            is_current: 1,
-            is_symmetric: u8::from(is_symmetric),
-        }
+    pub fn relation_id(&self) -> RelationId {
+        RelationId::from(self.relation_id_bytes)
     }
 
     #[must_use]
-    pub fn relation_id(&self) -> RelationId {
-        RelationId::from(self.relation_id_bytes)
+    pub fn chain_root(&self) -> RelationId {
+        RelationId::from(self.chain_root_bytes)
     }
 
     #[must_use]
@@ -137,7 +111,73 @@ impl RelationMetadata {
     }
 }
 
-impl_redb_rkyv_value!(RelationMetadata, "brain_metadata::RelationMetadata::v1");
+impl_redb_rkyv_value!(RelationMetadata, "brain_metadata::RelationMetadata::v2");
+
+// ---------------------------------------------------------------------------
+// Projections — Relation (brain-core) ↔ RelationMetadata (rkyv row).
+// ---------------------------------------------------------------------------
+
+/// `Relation → RelationMetadata`. Derives the `is_current` byte from
+/// `superseded_by / tombstoned` only — validity-window timing is left
+/// to query-time per spec §20/03 §1.2.
+#[must_use]
+pub fn metadata_from_relation(r: &Relation) -> RelationMetadata {
+    let is_current = u8::from(!r.tombstoned && r.superseded_by.is_none());
+    let evidence_inline: Vec<[u8; 16]> = r.evidence.iter().map(|m| m.to_be_bytes()).collect();
+
+    RelationMetadata {
+        relation_id_bytes: r.id.to_bytes(),
+        chain_root_bytes: r.chain_root.to_bytes(),
+        relation_type_id: r.relation_type.raw(),
+        from_entity_bytes: r.from_entity.to_bytes(),
+        to_entity_bytes: r.to_entity.to_bytes(),
+        properties_blob: r.properties_blob.clone(),
+        version: r.version,
+        confidence: r.confidence,
+        extractor_id: r.extractor_id.raw(),
+        extracted_at_unix_nanos: r.extracted_at_unix_nanos,
+        valid_from_unix_nanos: r.valid_from_unix_nanos,
+        valid_to_unix_nanos: r.valid_to_unix_nanos,
+        superseded_by_bytes: r.superseded_by.map(RelationId::to_bytes),
+        supersedes_bytes: r.supersedes.map(RelationId::to_bytes),
+        evidence_inline,
+        tombstoned: u8::from(r.tombstoned),
+        tombstoned_at_unix_nanos: r.tombstoned_at_unix_nanos,
+        is_current,
+        is_symmetric: u8::from(r.is_symmetric),
+    }
+}
+
+/// `RelationMetadata → Relation`. Projects the rkyv row back to the
+/// brain-core value type.
+#[must_use]
+pub fn relation_from_metadata(m: &RelationMetadata) -> Relation {
+    let evidence: Vec<MemoryId> = m
+        .evidence_inline
+        .iter()
+        .map(|b| MemoryId::from_be_bytes(*b))
+        .collect();
+    Relation {
+        id: m.relation_id(),
+        relation_type: RelationTypeId::from(m.relation_type_id),
+        from_entity: m.from_entity(),
+        to_entity: m.to_entity(),
+        properties_blob: m.properties_blob.clone(),
+        confidence: m.confidence,
+        evidence,
+        extractor_id: ExtractorId::from(m.extractor_id),
+        extracted_at_unix_nanos: m.extracted_at_unix_nanos,
+        valid_from_unix_nanos: m.valid_from_unix_nanos,
+        valid_to_unix_nanos: m.valid_to_unix_nanos,
+        version: m.version,
+        superseded_by: m.superseded_by_bytes.map(RelationId::from),
+        supersedes: m.supersedes_bytes.map(RelationId::from),
+        chain_root: m.chain_root(),
+        tombstoned: m.is_tombstoned(),
+        tombstoned_at_unix_nanos: m.tombstoned_at_unix_nanos,
+        is_symmetric: m.is_symmetric(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests.
@@ -147,43 +187,50 @@ impl_redb_rkyv_value!(RelationMetadata, "brain_metadata::RelationMetadata::v1");
 mod tests {
     use super::*;
     use crate::tables::knowledge::fresh_db;
+    use brain_core::knowledge::Relation;
     use redb::ReadableDatabase;
 
+    fn sample_relation() -> Relation {
+        let id = RelationId::new();
+        Relation::new_root(
+            id,
+            RelationTypeId::from(3),
+            EntityId::new(),
+            EntityId::new(),
+            0.9,
+            vec![],
+            ExtractorId::from(0),
+            1_700_000_000_000_000_000,
+            false,
+        )
+    }
+
     #[test]
-    fn relations_round_trip() {
+    fn relations_round_trip_through_projection() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
-        let rel_id = RelationId::new();
-        let from = EntityId::new();
-        let to = EntityId::new();
-        let r = RelationMetadata::new(
-            rel_id,
-            RelationTypeId::from(3),
-            from,
-            to,
-            11,
-            1_700_000_000_000_000_000,
-            0.9,
-            false,
-        );
-        let key = r.relation_id_bytes;
+        let r = sample_relation();
+        let row = metadata_from_relation(&r);
+        let key = row.relation_id_bytes;
 
         let wtxn = db.begin_write().unwrap();
         {
             let mut t = wtxn.open_table(RELATIONS_TABLE).unwrap();
-            t.insert(&key, &r).unwrap();
+            t.insert(&key, &row).unwrap();
         }
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
         let t = rtxn.open_table(RELATIONS_TABLE).unwrap();
         let got = t.get(&key).unwrap().unwrap().value();
-        assert_eq!(got, r);
-        assert_eq!(got.relation_id(), rel_id);
-        assert_eq!(got.from_entity(), from);
-        assert_eq!(got.to_entity(), to);
+        assert_eq!(got, row);
+        assert_eq!(got.relation_id(), r.id);
+        assert_eq!(got.chain_root(), r.id);
         assert!(got.is_current());
         assert!(!got.is_symmetric());
+
+        let back = relation_from_metadata(&got);
+        assert_eq!(back, r);
     }
 
     #[test]

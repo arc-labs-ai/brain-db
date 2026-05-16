@@ -99,6 +99,18 @@ pub enum ResponseBody {
     /// Single-frame snapshot in v1; phase 23 splits into streaming.
     StatementList(crate::knowledge::StatementListResponseFrame),
 
+    // Relation ops (phase 18.6). Spec §28/07.
+    RelationCreate(crate::knowledge::RelationCreateResponse),
+    RelationGet(crate::knowledge::RelationGetResponse),
+    RelationSupersede(crate::knowledge::RelationSupersedeResponse),
+    RelationTombstone(crate::knowledge::RelationTombstoneResponse),
+    /// Single-frame snapshot in v1; phase 23 splits into streaming.
+    RelationListFrom(crate::knowledge::RelationListFromResponseFrame),
+    /// Single-frame snapshot in v1; phase 23 splits into streaming.
+    RelationListTo(crate::knowledge::RelationListToResponseFrame),
+    /// Single-frame snapshot in v1; phase 23 splits into streaming.
+    RelationTraverse(crate::knowledge::RelationTraverseResponseFrame),
+
     Error(ErrorResponse),
 }
 
@@ -151,6 +163,13 @@ impl ResponseBody {
             Self::StatementRetract(_) => Opcode::StatementRetractResp,
             Self::StatementHistory(_) => Opcode::StatementHistoryResp,
             Self::StatementList(_) => Opcode::StatementListResp,
+            Self::RelationCreate(_) => Opcode::RelationCreateResp,
+            Self::RelationGet(_) => Opcode::RelationGetResp,
+            Self::RelationSupersede(_) => Opcode::RelationSupersedeResp,
+            Self::RelationTombstone(_) => Opcode::RelationTombstoneResp,
+            Self::RelationListFrom(_) => Opcode::RelationListFromResp,
+            Self::RelationListTo(_) => Opcode::RelationListToResp,
+            Self::RelationTraverse(_) => Opcode::RelationTraverseResp,
             Self::Error(_) => Opcode::Error,
         }
     }
@@ -169,6 +188,9 @@ impl ResponseBody {
             Self::AdminListTombstoned(r) => Some(r.is_final),
             Self::StatementHistory(r) => Some(r.is_final),
             Self::StatementList(r) => Some(r.is_final),
+            Self::RelationListFrom(r) => Some(r.is_final),
+            Self::RelationListTo(r) => Some(r.is_final),
+            Self::RelationTraverse(r) => Some(r.is_final),
             _ => None,
         }
     }
@@ -221,6 +243,13 @@ impl ResponseBody {
             Self::StatementRetract(r) => to_rkyv_bytes(r),
             Self::StatementHistory(r) => to_rkyv_bytes(r),
             Self::StatementList(r) => to_rkyv_bytes(r),
+            Self::RelationCreate(r) => to_rkyv_bytes(r),
+            Self::RelationGet(r) => to_rkyv_bytes(r),
+            Self::RelationSupersede(r) => to_rkyv_bytes(r),
+            Self::RelationTombstone(r) => to_rkyv_bytes(r),
+            Self::RelationListFrom(r) => to_rkyv_bytes(r),
+            Self::RelationListTo(r) => to_rkyv_bytes(r),
+            Self::RelationTraverse(r) => to_rkyv_bytes(r),
             Self::Error(r) => to_rkyv_bytes(r),
         }
     }
@@ -276,6 +305,13 @@ impl ResponseBody {
             Opcode::StatementRetractResp => Self::StatementRetract(from_rkyv_bytes(bytes)?),
             Opcode::StatementHistoryResp => Self::StatementHistory(from_rkyv_bytes(bytes)?),
             Opcode::StatementListResp => Self::StatementList(from_rkyv_bytes(bytes)?),
+            Opcode::RelationCreateResp => Self::RelationCreate(from_rkyv_bytes(bytes)?),
+            Opcode::RelationGetResp => Self::RelationGet(from_rkyv_bytes(bytes)?),
+            Opcode::RelationSupersedeResp => Self::RelationSupersede(from_rkyv_bytes(bytes)?),
+            Opcode::RelationTombstoneResp => Self::RelationTombstone(from_rkyv_bytes(bytes)?),
+            Opcode::RelationListFromResp => Self::RelationListFrom(from_rkyv_bytes(bytes)?),
+            Opcode::RelationListToResp => Self::RelationListTo(from_rkyv_bytes(bytes)?),
+            Opcode::RelationTraverseResp => Self::RelationTraverse(from_rkyv_bytes(bytes)?),
             Opcode::Error => Self::Error(from_rkyv_bytes(bytes)?),
             other => return Err(ProtocolError::UnknownOpcode(other.as_u16())),
         })

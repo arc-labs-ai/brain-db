@@ -18,6 +18,7 @@ pub mod confidence;
 pub mod entity;
 pub mod ids;
 pub mod kinds;
+pub mod relation;
 pub mod resolver;
 pub mod statement;
 pub mod trigrams;
@@ -29,6 +30,7 @@ pub use ids::{
     RelationId, RelationTypeId, StatementId,
 };
 pub use kinds::{Cardinality, ExtractorKind, StatementKind};
+pub use relation::{canonical_pair, Relation, RelationType};
 pub use resolver::{
     resolve_entity, ResolutionOutcome, ResolverConfig, ResolverEmbedder, ResolverError,
     ResolverIndex, ResolverStorage, ResolverTier, TypeConstraint, VECTOR_DIM,

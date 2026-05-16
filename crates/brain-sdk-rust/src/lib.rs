@@ -81,18 +81,20 @@ pub mod proto;
 pub mod request_id;
 pub mod retry;
 
-pub use brain_core::{EntityId, MemoryId, RequestId, StatementId, StatementKind};
+pub use brain_core::{EntityId, MemoryId, RelationId, RequestId, StatementId, StatementKind};
 pub use brain_core::knowledge::TombstoneReason;
 pub use client::Client;
 pub use config::{AuthMethod, ClientConfig};
 pub use error::ClientError;
 pub use knowledge::{
-    BrainEntityType, ClientErrorEntityExt, ClientErrorStatementExt, EntityClient,
-    EntityCreateBuilder, EntityErrorKind, EntityHandle, EntityHandleFromViewError,
+    BrainEntityType, ClientErrorEntityExt, ClientErrorRelationExt, ClientErrorStatementExt,
+    EntityClient, EntityCreateBuilder, EntityErrorKind, EntityHandle, EntityHandleFromViewError,
     EntityListBuilder, EntityMergeBuilder, EntityResolveBuilder, EntityUpdateBuilder,
     EventBuilder, FactBuilder, MergeOutcome, Person, PersonAttributes, PreferenceBuilder,
-    ResolutionOutcome, StatementErrorKind, StatementHandle, StatementListBuilder,
-    StatementsClient,
+    RelationBuilder, RelationErrorKind, RelationHandle, RelationListFromBuilder,
+    RelationListToBuilder, RelationTraverseBuilder, RelationsClient, ResolutionOutcome,
+    StatementErrorKind, StatementHandle, StatementListBuilder, StatementsClient, TraversalPath,
+    TraversalStep, TraverseDirection,
 };
 pub use observability::{MetricsSnapshot, OpMetrics};
 pub use ops::{

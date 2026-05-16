@@ -63,17 +63,41 @@ Measured at 1M statements per shard. Phase-17 perf gate; substrate workload assu
 
 CREATE numbers assume the inline evidence path (≤ 8 evidence entries) and ~7 secondary index writes per `statement_create` ([§19/03 §2](../19_statements/03_storage.md)). Overflow path adds ~5 ms per chunk for the overflow row write.
 
-### 2.4 Knowledge layer — deferred targets
+### 2.4 Knowledge layer — relation operations (phase 18)
+
+Measured at 1M relations per shard. Phase-18 perf gate; substrate workload assumptions in §1 apply.
+
+| Operation | p50 | p95 | p99 | p99.9 |
+|---|---|---|---|---|
+| RELATION_CREATE (any cardinality, ≤ 5 evidence) | 3 ms | 8 ms | 15 ms | 30 ms |
+| RELATION_CREATE (ManyToOne auto-supersede) | 4 ms | 10 ms | 20 ms | 40 ms |
+| RELATION_GET | 0.5 ms | 1 ms | 2 ms | 5 ms |
+| RELATION_SUPERSEDE (explicit) | 4 ms | 10 ms | 20 ms | 40 ms |
+| RELATION_TOMBSTONE | 1 ms | 3 ms | 5 ms | 10 ms |
+| RELATION_LIST_FROM (entity + type filter, ≤ 100 results) | 2 ms | 5 ms | 10 ms | 20 ms |
+| RELATION_LIST_TO (entity + type filter, ≤ 100 results) | 2 ms | 5 ms | 10 ms | 20 ms |
+| RELATION_TRAVERSE (depth=1, default branching) | 5 ms | 12 ms | 25 ms | 50 ms |
+| RELATION_TRAVERSE (depth=2, default branching) | 15 ms | 30 ms | 50 ms | 100 ms |
+| RELATION_TRAVERSE (depth=3, default branching) | 30 ms | 60 ms | 100 ms | 200 ms |
+
+CREATE numbers assume inline evidence + 3–4 secondary index writes per `relation_create` (RELATIONS + BY_FROM + BY_TO + BY_EVIDENCE; ×2 directional writes if symmetric). Cardinality auto-supersede adds ~1 ms for the pre-create lookup + the old-row rewrite + index flip.
+
+TRAVERSE numbers assume default `max_branching_factor = 1000` per [§20/04](../20_relations/04_traversal.md) §4. Pathological super-nodes (single relation with > 1000 out-edges) truncate at the cap and emit a tracing::warn for operator visibility.
+
+### 2.5 Knowledge layer — deferred targets
 
 - **ENTITY_RESOLVE (tier 3 — embedding HNSW)** lands when the entity HNSW is wired into the resolver (phase 21). Target placeholder per the phase-16 doc: p50 ≤ 5 ms at 100K, ≤ 50 ms at 1M. Final numbers set in phase 21.
 - **ENTITY_RESOLVE (tier 4 — LLM)** lands in phase 21 with the LLM extractor. Latency is gated by the model + cache hit-rate; target is "tail under 1 s with cache warm, queued under 5 s cold."
 - **Statement HNSW semantic search** — phase 21 when the embedding worker populates the HNSW. Phase 17 writes / reads only; semantic search target lands with the worker.
-- **Relation / query / admin** opcodes — separate phases (18 / 22-23 / 22) and separate target rows.
+- **Cross-shard RELATION_TRAVERSE** — phase 23 query router. Phase 18 ships same-shard only.
+- **Query routing (RRF fusion across retrievers)** — phase 23.
+- **Admin / schema** opcodes — separate phases (19 / 22) and separate target rows.
 
-### 2.5 Phase perf gates
+### 2.6 Phase perf gates
 
 - **Phase 16 (sub-task 16.9)** — §2.2 entity targets at 100K entities.
 - **Phase 17 (sub-task 17.10)** — §2.3 statement targets at 1M statements.
+- **Phase 18 (sub-task 18.9)** — §2.4 relation targets at 1M relations.
 
 Phases verify on the dev workstation; production-reference numbers (16-core / 64 GB / NVMe per §1) are revalidated in phase 14's CI suite.
 

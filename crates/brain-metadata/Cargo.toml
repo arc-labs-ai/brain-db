@@ -33,3 +33,7 @@ harness = false
 [[bench]]
 name = "statement_ops"
 harness = false
+
+[[bench]]
+name = "relation_ops"
+harness = false

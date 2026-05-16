@@ -88,6 +88,9 @@ pub enum EventType {
     ExtractionCompleted = 27,
     ExtractionFailed = 28,
     SchemaUpdated = 29,
+    /// Phase 18.7. Appended after `SchemaUpdated` to preserve the
+    /// stable discriminants of prior variants.
+    RelationTombstoned = 30,
 }
 
 /// Spec §08 §18 — `IntegrityIssue::IntegrityIssueType`.

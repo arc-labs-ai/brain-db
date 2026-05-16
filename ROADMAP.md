@@ -320,15 +320,43 @@ These phases turn Brain from a vector memory store into a cognitive database wit
 
 ---
 
-## Phase 18 — Relation layer
+## Phase 18 — Relation layer ✓
 
-**One-line:** Relation table; cardinality enforcement; symmetric relations; 1–3 hop traversal.
+**One-line:** Relation table; relation-type registry with cardinality + symmetric flags; cardinality-driven auto-supersession; canonical symmetric ordering with dual-index population; iterative BFS traversal with cycle detection and depth/branching caps.
 
 **Detailed plan:** [`docs/phases/phase-18-relations.md`](docs/phases/phase-18-relations.md)
 
-**Crates touched:** `brain-core`, `brain-metadata`, `brain-protocol`, `brain-server`, `brain-sdk-rust`.
+**Crates touched:** `brain-core`, `brain-metadata`, `brain-protocol`, `brain-ops`, `brain-server`, `brain-sdk-rust`.
 
-**Sub-tasks:** 8. **Exit:** traverse + cardinality tests green; tag `phase-18-complete`.
+**Sub-tasks:** 10. **Exit:** all 4 cardinality variants work end-to-end via wire + SDK; symmetric relations dual-indexed; traverse terminates on cycles within depth/branching caps; tag `phase-18-complete`.
+
+**Delivered:**
+
+- §20 relations section brought to §03-depth (8 files; cardinality / symmetric / storage / traversal / evidence / open questions / references).
+- §28/07 relation frames already at §03-depth from phase 16; new opcodes wired end-to-end.
+- 7 relation wire opcodes (`0x0150–0x0156`) + responses (`0x01D0–0x01D6`) end-to-end through `brain-protocol`, `brain-ops`, `brain-server`.
+- `brain-core` value types: `Relation` (18 fields with `chain_root` + supersession), `RelationType` (with `cardinality`, `is_symmetric`, optional `from_type / to_type` constraints), `canonical_pair` helper for symmetric byte-wise ordering.
+- Relation-type registry + interning in `brain-metadata` with built-ins `brain:related_to` (ManyToMany asymmetric), `brain:reports_to` (ManyToOne), `brain:co_authored` (symmetric ManyToMany) seeded at `MetadataDb::open`.
+- `relation_ops`: CRUD + cardinality-driven auto-supersession (ManyToMany / ManyToOne / OneToMany / OneToOne) + symmetric canonicalisation + tombstone + chain history + filtered list (by_from / by_to with type filter). All operations atomic within one redb txn.
+- `relation_traversal`: iterative BFS with `DEFAULT_MAX_DEPTH = 3` (cap 5), `DEFAULT_MAX_BRANCHING = 1000` (cap 10_000), visited-set cycle detection, tracing::warn on truncation, `TraversalDirection` (Outgoing / Incoming / Both).
+- `RelationMetadata` rkyv shape widened with `chain_root_bytes`; archive id bumped to v2.
+- Hand-written relation SDK: `client.relation()` / `.relations()` with uniform `RelationHandle` + `TraversalPath` value types. Derive macros defer to phase 19.
+- Integration test suite: 11 wire-smoke tests + 6-step lifecycle test + 8 mock-server SDK tests + criterion bench against §16/02 §2.4 perf targets.
+- New event type: `RelationTombstoned` added to `EventType` enum + `KnowledgeEventPayload`. Created / Superseded events also wired through brain-ops handlers.
+
+**Deferred to later phases (tracked in `spec/20_relations/06_open_questions.md` + `spec/28/09_open_questions.md`):**
+
+- Cross-shard `RELATION_TRAVERSE` coordination — phase 23.
+- Streaming TRAVERSE response (per-frame) + cursor pagination on LIST_FROM / LIST_TO — phase 23.
+- Weight-aware shortest-path traversal — post-v1.0.
+- `RELATION_RETRACT` opcode (hard delete with grace period) — phase 22.
+- Entity-merge relation re-routing — phase 23 (or after phase 18 if scope allows).
+- `RelationCardinalityConflict` discrete event — phase 23.
+- Bulk-mode cardinality skip flag for extractor backfills — phase 22.
+- `relations_by_type` index for type-only admin queries — phase 22 if demanded.
+- Per-relation-type FORGET cascade configurability — phase 22.
+- `#[derive(BrainRelation)]` macro + typed `Relation<T>` SDK wrappers — phase 19.
+- Cardinality auto-supersede event emission (handler doesn't yet surface the inner supersede that `relation_create` performs) — phase 22.
 
 ---
 

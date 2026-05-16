@@ -237,6 +237,91 @@ impl ClientErrorStatementExt for ClientError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Relation error inspection (18.8).
+// ---------------------------------------------------------------------------
+
+/// Relation error category derived from substrate `ErrorCode` +
+/// message inspection. Mirrors `EntityErrorKind` / `StatementErrorKind`
+/// for the relation-layer opcodes (spec §28/07).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RelationErrorKind {
+    /// Relation row not found.
+    NotFound,
+    /// `relation_type` qname doesn't resolve in the registry.
+    RelationTypeUnknown,
+    /// `from` or `to` entity doesn't exist.
+    EndpointUnknown,
+    /// Cardinality auto-supersede couldn't proceed (multi-side
+    /// conflict on OneToOne, or violation in `relation_create`).
+    CardinalityViolation,
+    /// Chain-state pre-condition failure on supersede (already
+    /// superseded / tombstoned / type or endpoint mismatch).
+    ChainConflict,
+    /// Wire request used `EvidenceRefWire::Overflow` which relations
+    /// don't support in v1 (spec §20/05 §3).
+    EvidenceOverflowUnsupported,
+}
+
+/// Extension trait for inspecting relation-layer errors on a
+/// `ClientError`. Mirrors `ClientErrorStatementExt`.
+pub trait ClientErrorRelationExt {
+    fn relation_error(&self) -> Option<RelationErrorKind>;
+
+    fn is_relation_not_found(&self) -> bool {
+        self.relation_error() == Some(RelationErrorKind::NotFound)
+    }
+    fn is_relation_type_unknown(&self) -> bool {
+        self.relation_error() == Some(RelationErrorKind::RelationTypeUnknown)
+    }
+    fn is_relation_endpoint_unknown(&self) -> bool {
+        self.relation_error() == Some(RelationErrorKind::EndpointUnknown)
+    }
+    fn is_relation_cardinality_violation(&self) -> bool {
+        self.relation_error() == Some(RelationErrorKind::CardinalityViolation)
+    }
+    fn is_relation_chain_conflict(&self) -> bool {
+        self.relation_error() == Some(RelationErrorKind::ChainConflict)
+    }
+    fn is_relation_evidence_overflow_unsupported(&self) -> bool {
+        self.relation_error() == Some(RelationErrorKind::EvidenceOverflowUnsupported)
+    }
+}
+
+impl ClientErrorRelationExt for ClientError {
+    fn relation_error(&self) -> Option<RelationErrorKind> {
+        let message = match self {
+            ClientError::Server { message, .. } => message,
+            _ => return None,
+        };
+        let lower = message.to_lowercase();
+
+        if lower.contains("cardinality") {
+            return Some(RelationErrorKind::CardinalityViolation);
+        }
+        if lower.contains("already superseded")
+            || lower.contains("relation_type mismatch on supersede")
+            || lower.contains("endpoints must match")
+            || lower.contains("already tombstoned")
+        {
+            return Some(RelationErrorKind::ChainConflict);
+        }
+        if lower.contains("evidence overflow not supported") {
+            return Some(RelationErrorKind::EvidenceOverflowUnsupported);
+        }
+        if lower.contains("unknown relation_type") || lower.contains("unknown relation type") {
+            return Some(RelationErrorKind::RelationTypeUnknown);
+        }
+        if lower.contains("entity") && lower.contains("not found") {
+            return Some(RelationErrorKind::EndpointUnknown);
+        }
+        if lower.contains("relation") && lower.contains("not found") {
+            return Some(RelationErrorKind::NotFound);
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
