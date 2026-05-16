@@ -20,9 +20,11 @@
 //! adds the statement side in this same module.
 
 pub mod memory;
+pub mod rebuild;
 pub mod statement;
 
 pub use memory::{MemoryTextDispatcher, MemoryTextOp};
+pub use rebuild::{rebuild_memory_text, rebuild_statements, RebuildError, RebuildReport};
 pub use statement::{StatementTextDispatcher, StatementTextOp};
 
 #[cfg(target_os = "linux")]
