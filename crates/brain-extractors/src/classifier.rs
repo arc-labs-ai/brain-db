@@ -171,10 +171,11 @@ struct BertTokenClassifierInner {
     runtime: Option<Box<dyn BertRuntime>>,
 }
 
-/// Object-safe inner runtime surface. The candle-backed impl lives
-/// in `candle_runtime.rs` (phase 20.6 wires it; phase 20.3 ships the
-/// trait + the load path that produces an unwired `None`).
-trait BertRuntime: Send + Sync {
+/// Object-safe inner runtime surface. The candle-backed impl
+/// (`CandleBertRuntime`) lives in `candle_runtime.rs` and is
+/// wired into `BertTokenClassifier::load` from phase 20.7b
+/// onwards.
+pub(crate) trait BertRuntime: Send + Sync {
     fn predict(
         &self,
         text: &str,
@@ -235,21 +236,36 @@ impl BertTokenClassifier {
         // 6. Fingerprint (BLAKE3 over config.json + tokenizer.json + weights).
         let fingerprint_hex = compute_fingerprint(dir)?;
 
-        // 7. Candle-backed runtime construction is deferred to the
-        //    `candle_runtime` submodule that phase 20.6 lights up.
-        //    Phase 20.3 ships the load path that validates all
-        //    inputs but leaves `runtime = None`; this still passes
-        //    the framework path through to the `Failure` audit
-        //    row on every dispatch — operators see a clear error
-        //    until phase 20.6 wires the forward pass.
-        let runtime: Option<Box<dyn BertRuntime>> = None;
+        // 7. Construct the candle-backed runtime. Phase 20.7b
+        //    lights this up; the load path itself is what
+        //    actually fails when the safetensors blob doesn't
+        //    line up with a BertForTokenClassification layout.
+        let runtime: Option<Box<dyn BertRuntime>> = match crate::candle_runtime::CandleBertRuntime::load(
+            dir,
+            config.device.clone(),
+            config.dtype,
+            config.warmup_iters,
+            labels.len(),
+        ) {
+            Ok(rt) => Some(Box::new(rt)),
+            Err(e) => {
+                tracing::warn!(
+                    target: "brain_extractors::classifier",
+                    model_dir = %dir.display(),
+                    error = %e,
+                    "candle runtime load failed; classifier will run degraded",
+                );
+                None
+            }
+        };
 
         tracing::info!(
             target: "brain_extractors::classifier",
             model_dir = %dir.display(),
             num_labels = labels.len(),
             fingerprint = %fingerprint_hex,
-            "loaded classifier model directory (runtime wiring deferred to 20.6)",
+            runtime_wired = runtime.is_some(),
+            "loaded classifier model directory",
         );
 
         Ok(Self {
@@ -274,7 +290,7 @@ impl ClassifierModel for BertTokenClassifier {
         match self.inner.runtime.as_ref() {
             Some(rt) => rt.predict(text, self.inner.config.max_seq_len, &self.inner.labels),
             None => Err(ExtractorError::InferenceFailed {
-                reason: "BertTokenClassifier runtime not wired (phase 20.6)".into(),
+                reason: "BertTokenClassifier runtime not wired (model load failed)".into(),
             }),
         }
     }

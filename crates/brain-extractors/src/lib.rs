@@ -13,6 +13,7 @@
 )]
 #![forbid(unsafe_code)]
 
+mod candle_runtime;
 pub mod classifier;
 pub mod extractor;
 pub mod idempotency;
