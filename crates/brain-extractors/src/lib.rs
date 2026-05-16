@@ -18,6 +18,7 @@ pub mod extractor;
 pub mod idempotency;
 pub mod item;
 pub mod labels;
+pub mod materialize;
 pub mod options;
 pub mod pattern;
 pub mod registry;
@@ -32,6 +33,10 @@ pub use extractor::{
 pub use idempotency::{hash_memory_text, IdempotencyKey};
 pub use item::{EntityMention, ExtractedItem, RelationMention, StatementMention};
 pub use labels::{decode_bio, load_labels_file, BioSpan};
+pub use materialize::{
+    build_registry_from_definitions, materialize_classifier_extractor,
+    materialize_pattern_extractor,
+};
 pub use options::ExtractorRunOptions;
 pub use pattern::{CompiledRegex, PatternExtractor};
 pub use registry::ExtractorRegistry;

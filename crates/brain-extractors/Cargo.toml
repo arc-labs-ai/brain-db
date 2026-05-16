@@ -10,6 +10,9 @@ description = "Extractor framework (pattern / classifier / llm) for the Brain kn
 [dependencies]
 brain-core = { path = "../brain-core" }
 brain-protocol = { path = "../brain-protocol" }
+# 20.6: materialize loads `ExtractorDefinition` rows persisted by
+# brain-metadata::schema_apply.
+brain-metadata = { path = "../brain-metadata" }
 blake3 = { workspace = true }
 thiserror.workspace = true
 tracing.workspace = true

@@ -4,6 +4,7 @@
 //! lives at the crate root.
 
 pub mod encode;
+pub mod extractor_pipeline;
 pub mod forget;
 pub mod knowledge_entity;
 pub mod knowledge_relation;
