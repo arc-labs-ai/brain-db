@@ -20,6 +20,7 @@ pub mod entity_ops;
 pub mod llm_cache;
 pub mod predicate_ops;
 pub mod relation_ops;
+pub mod relation_traversal;
 pub mod relation_type_ops;
 pub mod schema;
 pub mod sink;
@@ -41,6 +42,10 @@ pub use relation_ops::{
     relation_create, relation_get, relation_history, relation_list_from, relation_list_to,
     relation_supersede, relation_tombstone, relations_with_evidence, RelationListFilter,
     RelationOpError,
+};
+pub use relation_traversal::{
+    traverse, TraversalConfig, TraversalDirection, TraversalPath, TraversalStep,
+    DEFAULT_MAX_BRANCHING, DEFAULT_MAX_DEPTH, MAX_BRANCHING, MAX_DEPTH, MAX_TOTAL_VISITED,
 };
 pub use relation_type_ops::{
     relation_type_get, relation_type_intern, relation_type_list, relation_type_lookup_by_qname,
