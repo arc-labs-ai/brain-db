@@ -827,8 +827,14 @@ pub fn spawn_shard(
                 drop(rtxn);
                 drop(db_guard);
 
-                let (reg, errors) =
-                    brain_extractors::build_registry_from_definitions(&defs, None);
+                // 21.4: LLM router + cache deps land in phase 21.5;
+                // until then the materializer registers LLM rows as
+                // degraded extractors via the default deps bundle.
+                let materialize_deps = brain_extractors::MaterializeDeps::default();
+                let (reg, errors) = brain_extractors::build_registry_from_definitions(
+                    &defs,
+                    &materialize_deps,
+                );
                 for (id, err) in errors {
                     tracing::warn!(
                         target: "brain_server::shard",

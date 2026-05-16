@@ -38,8 +38,8 @@ pub use item::{EntityMention, ExtractedItem, RelationMention, StatementMention};
 pub use labels::{decode_bio, load_labels_file, BioSpan};
 pub use llm::{estimate_cost, CostBudget, LlmExtractor, LlmExtractorInner, Pricing};
 pub use materialize::{
-    build_registry_from_definitions, materialize_classifier_extractor,
-    materialize_pattern_extractor,
+    build_registry_from_definitions, materialize_classifier_extractor, materialize_llm_extractor,
+    materialize_pattern_extractor, MaterializeDeps,
 };
 pub use options::ExtractorRunOptions;
 pub use pattern::{CompiledRegex, PatternExtractor};
