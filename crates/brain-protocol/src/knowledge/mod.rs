@@ -16,6 +16,8 @@
 pub mod entity_req;
 pub mod entity_resp;
 pub mod events;
+pub mod extractor_req;
+pub mod extractor_resp;
 pub mod relation_req;
 pub mod relation_resp;
 pub mod schema_req;
@@ -48,6 +50,13 @@ pub use relation_resp::{
     RelationListFromResponseFrame, RelationListToResponseFrame, RelationSupersedeResponse,
     RelationTombstoneResponse, RelationTraverseResponseFrame, RelationView, RelationWireError,
     TraversalPathWire, TraversalStepWire,
+};
+pub use extractor_req::{
+    ExtractorDisableRequest, ExtractorEnableRequest, ExtractorListRequest,
+};
+pub use extractor_resp::{
+    ExtractorDisableResponse, ExtractorEnableResponse, ExtractorListItem,
+    ExtractorListResponseFrame,
 };
 pub use schema_req::{
     SchemaGetRequest, SchemaListRequest, SchemaUploadRequest, SchemaValidateRequest,
