@@ -111,6 +111,16 @@ pub enum Opcode {
     // Other §28 opcodes land in phases 17-24.
     // ============================================================
 
+    // §28 schema operations (0x0120-0x0123 low-byte range) — phase 19.6.
+    SchemaUploadReq = 0x0120,
+    SchemaUploadResp = 0x01A0,
+    SchemaGetReq = 0x0121,
+    SchemaGetResp = 0x01A1,
+    SchemaListReq = 0x0122,
+    SchemaListResp = 0x01A2,
+    SchemaValidateReq = 0x0123,
+    SchemaValidateResp = 0x01A3,
+
     // §28 entity operations (0x0130-0x013F low-byte range)
     EntityCreateReq = 0x0130,
     EntityCreateResp = 0x01B0,
@@ -286,6 +296,15 @@ impl Opcode {
             0x01D5 => Self::RelationListToResp,
             0x0156 => Self::RelationTraverseReq,
             0x01D6 => Self::RelationTraverseResp,
+
+            0x0120 => Self::SchemaUploadReq,
+            0x01A0 => Self::SchemaUploadResp,
+            0x0121 => Self::SchemaGetReq,
+            0x01A1 => Self::SchemaGetResp,
+            0x0122 => Self::SchemaListReq,
+            0x01A2 => Self::SchemaListResp,
+            0x0123 => Self::SchemaValidateReq,
+            0x01A3 => Self::SchemaValidateResp,
 
             other => return Err(ProtocolError::UnknownOpcode(other)),
         })

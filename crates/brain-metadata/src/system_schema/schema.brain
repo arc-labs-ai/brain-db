@@ -1,0 +1,87 @@
+# Brain system schema. Loaded at MetadataDb::open via include_str!.
+#
+# Defines the built-in entity types, predicates, and relation types
+# the substrate uses for bootstrapping. Users CANNOT redefine
+# anything under the `brain:` namespace — the user-facing
+# `validate()` rejects it; this seed path uses
+# `validate_system_schema()` instead.
+#
+# Order matters: the intern fan-out allocates ids monotonically, so
+# Person == EntityTypeId(1), brain:is_a == PredicateId(1),
+# brain:related_to (relation type) == RelationTypeId(1), etc. Phase
+# 19.7 verifies these match the pre-19 hand-seeded ids.
+
+namespace brain
+
+# --- Entity types -------------------------------------------------
+
+define entity_type Person {
+    attributes {
+        email:    text optional unique
+        role:     text optional
+        team:     text optional
+        timezone: text optional
+    }
+}
+
+# --- Predicates ---------------------------------------------------
+
+define predicate is_a {
+    kind: Fact
+    object: Entity<Any>
+    description: "Subject is an instance of the object entity type."
+}
+
+define predicate has_name {
+    kind: Fact
+    object: Value<text>
+    description: "Subject's canonical name as a text value."
+}
+
+define predicate mentions {
+    kind: Fact
+    object: Any
+    description: "Generic mention — subject mentions object."
+}
+
+define predicate related_to {
+    kind: Fact
+    object: Entity<Any>
+    description: "Generic relation between subject entity and object entity."
+}
+
+define predicate prefers {
+    kind: Preference
+    object: Value<text>
+    description: "Generic Preference about the subject (any value)."
+}
+
+define predicate scheduled {
+    kind: Event
+    object: Any
+    description: "Generic Event scheduled at event_at_unix_nanos."
+}
+
+# --- Relation types -----------------------------------------------
+
+define relation_type related_to {
+    from: Any
+    to: Any
+    cardinality: many-to-many
+    description: "Generic relation between two entities."
+}
+
+define relation_type reports_to {
+    from: Any
+    to: Any
+    cardinality: many-to-one
+    description: "Generic ManyToOne relation; second create on same `from` auto-supersedes."
+}
+
+define relation_type co_authored {
+    from: Any
+    to: Any
+    cardinality: many-to-many
+    symmetric: true
+    description: "Generic symmetric ManyToMany relation; canonicalises from/to byte-wise."
+}

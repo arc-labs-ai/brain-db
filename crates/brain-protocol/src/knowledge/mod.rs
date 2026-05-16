@@ -18,6 +18,8 @@ pub mod entity_resp;
 pub mod events;
 pub mod relation_req;
 pub mod relation_resp;
+pub mod schema_req;
+pub mod schema_resp;
 pub mod statement_req;
 pub mod statement_resp;
 
@@ -46,6 +48,13 @@ pub use relation_resp::{
     RelationListFromResponseFrame, RelationListToResponseFrame, RelationSupersedeResponse,
     RelationTombstoneResponse, RelationTraverseResponseFrame, RelationView, RelationWireError,
     TraversalPathWire, TraversalStepWire,
+};
+pub use schema_req::{
+    SchemaGetRequest, SchemaListRequest, SchemaUploadRequest, SchemaValidateRequest,
+};
+pub use schema_resp::{
+    SchemaGetResponse, SchemaListItemWire, SchemaListResponseFrame, SchemaUploadResponse,
+    SchemaValidateResponse, SchemaValidationErrorWire,
 };
 pub use statement_req::{
     EvidenceRefWire, StatementCreateRequest, StatementGetRequest, StatementHistoryRequest,

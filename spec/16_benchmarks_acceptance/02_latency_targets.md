@@ -91,13 +91,31 @@ TRAVERSE numbers assume default `max_branching_factor = 1000` per [§20/04](../2
 - **Statement HNSW semantic search** — phase 21 when the embedding worker populates the HNSW. Phase 17 writes / reads only; semantic search target lands with the worker.
 - **Cross-shard RELATION_TRAVERSE** — phase 23 query router. Phase 18 ships same-shard only.
 - **Query routing (RRF fusion across retrievers)** — phase 23.
-- **Admin / schema** opcodes — separate phases (19 / 22) and separate target rows.
+- **Admin** opcodes — phase 22.
 
-### 2.6 Phase perf gates
+### 2.6 Knowledge layer — schema operations (phase 19)
+
+Measured at 50-definition schema documents (typical user-facing
+schema size). Phase-19 perf gate; substrate workload in §1.
+
+| Operation | p50 | p95 | p99 | p99.9 |
+|---|---|---|---|---|
+| SCHEMA_UPLOAD (parse + validate + persist) | 5 ms | 15 ms | 30 ms | 60 ms |
+| SCHEMA_VALIDATE (parse + validate only) | 3 ms | 10 ms | 20 ms | 40 ms |
+| SCHEMA_GET (by version) | 1 ms | 3 ms | 5 ms | 10 ms |
+| SCHEMA_LIST (per-namespace) | 2 ms | 5 ms | 10 ms | 20 ms |
+
+UPLOAD numbers assume small schemas (≤ 50 type definitions). Larger
+schemas (~500 definitions) take proportionally longer for the parse +
+validate pass. Persistence cost is dominated by the bulk of
+secondary writes (entity_types, predicates, relation_types entries).
+
+### 2.7 Phase perf gates
 
 - **Phase 16 (sub-task 16.9)** — §2.2 entity targets at 100K entities.
 - **Phase 17 (sub-task 17.10)** — §2.3 statement targets at 1M statements.
 - **Phase 18 (sub-task 18.9)** — §2.4 relation targets at 1M relations.
+- **Phase 19 (sub-task 19.10b)** — §2.6 schema targets at 50 definitions.
 
 Phases verify on the dev workstation; production-reference numbers (16-core / 64 GB / NVMe per §1) are revalidated in phase 14's CI suite.
 

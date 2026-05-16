@@ -81,6 +81,9 @@ bytemuck = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# Schema DSL parser (phase 19.3) — PEG grammar for `schema.brain`.
+pest = "2.7"
+pest_derive = "2.7"
 
 # Storage / indexing
 redb = "4"

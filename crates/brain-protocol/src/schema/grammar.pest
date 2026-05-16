@@ -1,0 +1,337 @@
+// Schema DSL grammar — spec §21/01.
+//
+// Pest 2.x. Whitespace + comments are implicit between tokens via
+// the silent WHITESPACE / COMMENT rules below. Strings, heredocs,
+// and regex literals do their own inner-character handling so the
+// silent rules don't leak inside them.
+
+// ────────────────────────────────────────────────────────────────────────
+// Top level
+// ────────────────────────────────────────────────────────────────────────
+
+schema       = { SOI ~ statement* ~ EOI }
+
+statement    = _{
+      namespace_decl
+    | use_decl
+    | entity_type_def
+    | predicate_def
+    | relation_type_def
+    | extractor_def
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Namespace + (parsed-and-discarded) `use`.
+// ────────────────────────────────────────────────────────────────────────
+
+namespace_decl = { "namespace" ~ identifier }
+
+use_decl       = { "use" ~ qualified_identifier }
+
+// ────────────────────────────────────────────────────────────────────────
+// Entity type
+// ────────────────────────────────────────────────────────────────────────
+
+entity_type_def = {
+    "define" ~ "entity_type" ~ identifier ~ "{" ~
+        attributes_block? ~
+    "}"
+}
+
+attributes_block = {
+    "attributes" ~ "{" ~ attribute_decl* ~ "}"
+}
+
+attribute_decl = {
+    identifier ~ ":" ~ attr_type ~ modifier*
+}
+
+attr_type = {
+      attr_type_simple
+    | attr_type_enum
+    | attr_type_ref
+}
+
+attr_type_simple = @{ "text" | "number" | "bool" | "date" | "timestamp" }
+
+attr_type_enum = { "enum" ~ "[" ~ identifier_list ~ "]" }
+
+attr_type_ref  = { "ref" ~ "<" ~ identifier ~ ">" }
+
+modifier = {
+      mod_required
+    | mod_optional
+    | mod_unique
+    | mod_indexed
+    | mod_default
+}
+
+mod_required = @{ "required" }
+mod_optional = @{ "optional" }
+mod_unique   = @{ "unique" }
+mod_indexed  = @{ "indexed" }
+mod_default  = { "default" ~ literal }
+
+identifier_list = { identifier ~ ("," ~ identifier)* ~ ","? }
+
+// ────────────────────────────────────────────────────────────────────────
+// Predicate
+// ────────────────────────────────────────────────────────────────────────
+
+predicate_def = {
+    "define" ~ "predicate" ~ identifier ~ "{" ~
+        predicate_field+ ~
+    "}"
+}
+
+predicate_field = _{
+      predicate_kind_field
+    | predicate_object_field
+    | predicate_description_field
+}
+
+predicate_kind_field        = { "kind" ~ ":" ~ statement_kind }
+predicate_object_field      = { "object" ~ ":" ~ object_type }
+predicate_description_field = { "description" ~ ":" ~ string_literal }
+
+statement_kind = @{ "Fact" | "Preference" | "Event" | "Any" }
+
+object_type = {
+      object_type_value
+    | object_type_entity
+    | object_type_memory
+    | object_type_statement
+    | object_type_any
+}
+
+object_type_value     = { "Value" ~ "<" ~ attr_type ~ ">" }
+object_type_entity    = { "Entity" ~ "<" ~ identifier ~ ">" }
+object_type_memory    = @{ "Memory" }
+object_type_statement = @{ "Statement" }
+object_type_any       = @{ "Any" }
+
+// ────────────────────────────────────────────────────────────────────────
+// Relation type
+// ────────────────────────────────────────────────────────────────────────
+
+relation_type_def = {
+    "define" ~ "relation_type" ~ identifier ~ "{" ~
+        relation_field+ ~
+    "}"
+}
+
+relation_field = _{
+      relation_from_field
+    | relation_to_field
+    | relation_cardinality_field
+    | relation_symmetric_field
+    | relation_properties_block
+    | relation_description_field
+}
+
+relation_from_field          = { "from" ~ ":" ~ identifier }
+relation_to_field            = { "to" ~ ":" ~ identifier }
+relation_cardinality_field   = { "cardinality" ~ ":" ~ cardinality }
+relation_symmetric_field     = { "symmetric" ~ ":" ~ bool_literal }
+relation_properties_block    = { "properties" ~ "{" ~ attribute_decl* ~ "}" }
+relation_description_field   = { "description" ~ ":" ~ string_literal }
+
+cardinality = @{ "one-to-one" | "one-to-many" | "many-to-one" | "many-to-many" }
+
+// ────────────────────────────────────────────────────────────────────────
+// Extractor
+// ────────────────────────────────────────────────────────────────────────
+
+extractor_def = {
+    "define" ~ "extractor" ~ identifier ~ "{" ~
+        extractor_field+ ~
+    "}"
+}
+
+extractor_field = _{
+      extractor_kind_field
+    | extractor_target_field
+    | extractor_patterns_field
+    | extractor_model_field
+    | extractor_feature_extraction_field
+    | extractor_prompt_field
+    | extractor_examples_field
+    | extractor_schema_field
+    | extractor_cache_field
+    | extractor_cache_ttl_field
+    | extractor_confidence_field
+    | extractor_confidence_threshold_field
+    | extractor_trigger_field
+    | extractor_cost_budget_field
+    | extractor_depends_on_field
+    | extractor_resolver_field
+}
+
+extractor_kind_field                 = { "kind" ~ ":" ~ extractor_kind }
+extractor_target_field               = { "target" ~ ":" ~ target_decl }
+extractor_patterns_field             = { "patterns" ~ "[" ~ (regex_literal ~ ","?)* ~ "]" }
+extractor_model_field                = { "model" ~ ":" ~ string_literal }
+extractor_feature_extraction_field   = { "feature_extraction" ~ ":" ~ (kw_builtin | identifier) }
+extractor_prompt_field               = { "prompt" ~ ":" ~ heredoc_or_string }
+extractor_examples_field             = { "examples" ~ ":" ~ json_array }
+extractor_schema_field               = { "schema" ~ ":" ~ json_object }
+extractor_cache_field                = { "cache" ~ ":" ~ cache_setting }
+extractor_cache_ttl_field            = { "cache_ttl" ~ ":" ~ duration_literal }
+extractor_confidence_field           = { "confidence" ~ ":" ~ number_literal }
+extractor_confidence_threshold_field = { "confidence_threshold" ~ ":" ~ number_literal }
+extractor_trigger_field              = { "trigger" ~ ":" ~ trigger_expr }
+extractor_cost_budget_field          = { "cost_budget" ~ ":" ~ cost_expr }
+extractor_depends_on_field           = { "depends_on" ~ ":" ~ "[" ~ identifier_list ~ "]" }
+extractor_resolver_field             = { "resolver" ~ "{" ~ resolver_body ~ "}" }
+
+kw_builtin = @{ "builtin" }
+
+extractor_kind = @{ "pattern" | "classifier" | "llm" }
+
+target_decl = {
+      target_entity_or_statement
+    | target_entity
+    | target_statement
+    | target_relation
+}
+
+target_entity              = { "entity" ~ identifier }
+target_statement           = { "statement" ~ statement_kind }
+target_relation            = { "relation" ~ identifier }
+target_entity_or_statement = @{ "entity_or_statement" }
+
+cache_setting = @{ "enabled" | "disabled" }
+
+resolver_body = { (!"}" ~ ANY)* }
+
+// ────────────────────────────────────────────────────────────────────────
+// Triggers + conditions
+// ────────────────────────────────────────────────────────────────────────
+
+trigger_expr = {
+      trigger_on_encode_where
+    | trigger_on_encode
+    | trigger_on_demand
+    | trigger_on_schema_change
+    | trigger_periodic
+}
+
+trigger_on_encode        = @{ "on" ~ WS ~ "encode" }
+trigger_on_encode_where  = { "on" ~ "encode" ~ "where" ~ condition_expr }
+trigger_on_demand        = @{ "on" ~ WS ~ "demand" }
+trigger_on_schema_change = @{ "on" ~ WS ~ "schema_change" }
+trigger_periodic         = { "periodic" ~ "at" ~ string_literal }
+
+WS = _{ (" " | "\t") }
+
+condition_expr   = { condition_atom ~ (condition_binop ~ condition_atom)* }
+condition_binop  = @{ "and" | "or" }
+
+condition_atom = {
+      condition_matches
+    | condition_paren
+    | condition_compare
+}
+
+condition_paren   = { "(" ~ condition_expr ~ ")" }
+condition_matches = { field_ref ~ "matches" ~ regex_literal }
+condition_compare = { field_ref ~ condition_op ~ condition_value }
+
+condition_op = @{ "<=" | ">=" | "!=" | "<" | ">" | "=" | "in" }
+
+condition_value = {
+      condition_value_list
+    | string_literal
+    | number_literal
+    | bool_literal
+    | identifier
+}
+
+condition_value_list = { "[" ~ condition_value ~ ("," ~ condition_value)* ~ ","? ~ "]" }
+
+field_ref = ${ identifier ~ ("." ~ identifier)* }
+
+// ────────────────────────────────────────────────────────────────────────
+// Literals
+// ────────────────────────────────────────────────────────────────────────
+
+literal = {
+      string_literal
+    | number_literal
+    | bool_literal
+}
+
+bool_literal   = @{ "true" | "false" }
+
+number_literal = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+
+string_literal = ${ "\"" ~ string_inner ~ "\"" }
+string_inner   = @{ string_char* }
+string_char    = {
+      "\\" ~ ANY
+    | !("\"" | "\\") ~ ANY
+}
+
+heredoc_or_string = {
+      heredoc_literal
+    | string_literal
+}
+
+heredoc_literal = ${ "\"\"\"" ~ heredoc_inner ~ "\"\"\"" }
+heredoc_inner   = @{ (!"\"\"\"" ~ ANY)* }
+
+regex_literal = ${ "/" ~ regex_inner ~ "/" }
+regex_inner   = @{ regex_char* }
+regex_char    = {
+      "\\" ~ ANY
+    | !("/" | "\n") ~ ANY
+}
+
+duration_literal = ${ ASCII_DIGIT+ ~ duration_unit }
+duration_unit    = @{ "s" | "m" | "h" | "d" }
+
+cost_expr = ${
+    "$" ~ cost_amount ~ WHITESPACE+ ~ "per" ~ WHITESPACE+ ~ cost_unit
+}
+cost_amount = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+cost_unit   = @{ "memory" | "request" | "day" }
+
+// JSON capture — raw with balanced braces / brackets. Decoded via
+// `serde_json` in the parser. Strings inside are JSON strings (we
+// have to skip braces inside string literals to balance correctly).
+
+json_object = ${ "{" ~ json_balanced_obj_body ~ "}" }
+json_array  = ${ "[" ~ json_balanced_arr_body ~ "]" }
+
+json_balanced_obj_body = @{ json_balanced_token* }
+json_balanced_arr_body = @{ json_balanced_token* }
+
+json_balanced_token = {
+      json_string
+    | json_nested_object
+    | json_nested_array
+    | (!("{" | "}" | "[" | "]" | "\"") ~ ANY)
+}
+
+json_nested_object = { "{" ~ json_balanced_obj_body ~ "}" }
+json_nested_array  = { "[" ~ json_balanced_arr_body ~ "]" }
+json_string        = ${ "\"" ~ json_string_inner ~ "\"" }
+json_string_inner  = @{ json_string_char* }
+json_string_char   = {
+      "\\" ~ ANY
+    | !("\"" | "\\") ~ ANY
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Identifiers
+// ────────────────────────────────────────────────────────────────────────
+
+identifier            = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+qualified_identifier  = ${ identifier ~ ("." ~ identifier)* }
+
+// ────────────────────────────────────────────────────────────────────────
+// Implicit whitespace + comments
+// ────────────────────────────────────────────────────────────────────────
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT    = _{ "#" ~ (!"\n" ~ ANY)* ~ ("\n" | EOI) }

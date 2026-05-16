@@ -17,14 +17,18 @@
 pub mod db;
 pub mod entity_merge_ops;
 pub mod entity_ops;
+pub mod entity_type_ops;
 pub mod llm_cache;
 pub mod predicate_ops;
 pub mod relation_ops;
 pub mod relation_traversal;
 pub mod relation_type_ops;
 pub mod schema;
+pub mod schema_apply;
+pub mod schema_store;
 pub mod sink;
 pub mod statement_ops;
+pub mod system_schema;
 pub mod tables;
 pub mod trigram_ops;
 
@@ -50,6 +54,16 @@ pub use relation_traversal::{
 pub use relation_type_ops::{
     relation_type_get, relation_type_intern, relation_type_list, relation_type_lookup_by_qname,
     RelationTypeOpError,
+};
+pub use entity_type_ops::{entity_type_intern, entity_type_lookup_by_name, EntityTypeOpError};
+pub use schema_apply::{apply_schema_definitions, SchemaApplyError};
+pub use schema_store::{
+    schema_active, schema_active_row, schema_get, schema_list, schema_namespaces, schema_upload,
+    SchemaStoreError,
+};
+pub use system_schema::{seed_system_schema, SystemSchemaError, SYSTEM_SCHEMA_SOURCE};
+pub use tables::knowledge::schema_version::{
+    SchemaVersionRow, SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE, VALIDATOR_VERSION,
 };
 pub use statement_ops::{
     allocate_evidence_overflow, evidence_overflow_load, statement_create, statement_get,

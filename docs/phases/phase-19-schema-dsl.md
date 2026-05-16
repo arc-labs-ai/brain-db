@@ -1,5 +1,14 @@
 # Phase 19: Schema DSL
 
+> **Status:** ✓ complete. Superseded by the per-sub-task plans in
+> [`.claude/plans/phase-19*.md`](../../.claude/plans/) and the
+> "Phase 19" entry in [`ROADMAP.md`](../../ROADMAP.md).
+>
+> **Scope cut:** migration plan computation was omitted per user
+> direction (no existing deployments to migrate). Tracked as
+> [`spec/21_schema_dsl/07_open_questions.md`](../../spec/21_schema_dsl/07_open_questions.md)
+> Q3.
+
 ## Goal
 
 Parse and validate the schema DSL. Implement schema upload, versioning, and migration semantics. Replace hardcoded test types with user-declared schemas.

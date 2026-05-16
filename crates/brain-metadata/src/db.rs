@@ -37,18 +37,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use redb::{
-    Database, ReadTransaction, ReadableDatabase, ReadableTable, TransactionError, WriteTransaction,
-};
+use redb::{Database, ReadTransaction, ReadableDatabase, TransactionError, WriteTransaction};
 
-use crate::predicate_ops::{predicate_intern, PredicateOpError};
-use crate::relation_type_ops::{relation_type_intern, RelationTypeOpError};
 use crate::schema::{open_or_init_schema, SchemaError};
+use crate::system_schema::{seed_system_schema, SystemSchemaError};
 use crate::tables::checkpoint::{latest as latest_checkpoint, CHECKPOINTS_TABLE};
-use crate::tables::knowledge::entity_type::{EntityTypeDefinition, ENTITY_TYPES_TABLE};
-use brain_core::knowledge::StatementKind;
-use brain_core::Cardinality;
-use brain_core::EntityType;
 
 /// Public type wrapping the redb metadata file. Single ownership per
 /// shard; the borrow checker enforces single-writer via `&mut self` on
@@ -71,219 +64,6 @@ pub struct MetadataDb {
     pub(crate) pending_checkpoints: HashMap<u64, u64>,
 }
 
-/// Seed the built-in entity types if the registry is empty.
-///
-/// Sub-task 16.1. Inserts a `Person` row with `EntityTypeId(1)` when
-/// no entity types exist yet. Idempotent: if any row is present (test
-/// fixture, prior open, or phase-19 user upload), this is a no-op.
-fn seed_builtin_entity_types(db: &Database) -> Result<(), MetadataDbError> {
-    // Cheap empty-check in a read txn; only escalate to a write txn
-    // if we actually need to seed.
-    let registry_is_empty = {
-        let rtxn = db.begin_read()?;
-        match rtxn.open_table(ENTITY_TYPES_TABLE) {
-            Ok(t) => t
-                .first()
-                .map_err(|e| MetadataDbError::Schema(SchemaError::Storage(e)))?
-                .is_none(),
-            // Table not yet materialized → counts as empty; will be
-            // created by the write txn below.
-            Err(redb::TableError::TableDoesNotExist(_)) => true,
-            Err(e) => return Err(MetadataDbError::Schema(SchemaError::from(e))),
-        }
-    };
-    if !registry_is_empty {
-        return Ok(());
-    }
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let person = EntityType::person(now);
-    let row = EntityTypeDefinition::new(
-        person.id,
-        person.name,
-        person.attribute_schema_blob,
-        person.created_at_unix_nanos,
-    );
-
-    let wtxn = db.begin_write()?;
-    {
-        let mut t = wtxn
-            .open_table(ENTITY_TYPES_TABLE)
-            .map_err(|e| MetadataDbError::Schema(SchemaError::from(e)))?;
-        t.insert(&row.entity_type_id, &row)
-            .map_err(|e| MetadataDbError::Schema(SchemaError::Storage(e)))?;
-    }
-    wtxn.commit()
-        .map_err(|e| MetadataDbError::Schema(SchemaError::Commit(e)))?;
-    Ok(())
-}
-
-/// Built-in predicates seeded at `MetadataDb::open` per spec §19/00
-/// §"Built-in predicates". User-declared predicates land via phase
-/// 19's `SCHEMA_UPLOAD`.
-///
-/// `(namespace, name, kind_constraint, object_type_constraint_byte,
-///  description)`.
-///
-/// `object_type_constraint_byte`: `0` = any / `1` = Entity / `2` =
-/// Value / `3` = Memory / `4` = Statement (matches
-/// `StatementObject::discriminant()` offset by 1).
-const BUILTIN_PREDICATES: &[(&str, &str, Option<StatementKind>, u8, &str)] = &[
-    (
-        "brain",
-        "is_a",
-        Some(StatementKind::Fact),
-        1, // Entity
-        "Subject is an instance of the object entity type.",
-    ),
-    (
-        "brain",
-        "has_name",
-        Some(StatementKind::Fact),
-        2, // Value
-        "Subject's canonical name as a text value.",
-    ),
-    (
-        "brain",
-        "mentions",
-        Some(StatementKind::Fact),
-        0, // any
-        "Generic mention — subject mentions object.",
-    ),
-    (
-        "brain",
-        "related_to",
-        Some(StatementKind::Fact),
-        1, // Entity
-        "Generic relation between subject entity and object entity.",
-    ),
-    // 17.10a — enable integration-test coverage of Preference / Event
-    // kinds without a SCHEMA_UPLOAD path (phase 19). Generic enough
-    // that users picking these qnames is unlikely; user schemas pick
-    // their own predicates in their own namespace.
-    (
-        "brain",
-        "prefers",
-        Some(StatementKind::Preference),
-        2, // Value
-        "Generic Preference about the subject (any value).",
-    ),
-    (
-        "brain",
-        "scheduled",
-        Some(StatementKind::Event),
-        0, // any object
-        "Generic Event scheduled at event_at_unix_nanos.",
-    ),
-];
-
-/// Seed the built-in `brain:*` predicates idempotently. Sub-task 17.3.
-///
-/// Walks the [`BUILTIN_PREDICATES`] catalog; each entry is interned via
-/// [`predicate_intern`], which is itself idempotent when the row
-/// already matches and refuses to clobber when constraints differ.
-/// `seed_builtin_predicates` therefore leaves pre-existing rows alone
-/// (test fixtures, prior opens, future user schemas that import a
-/// `brain:*` predicate verbatim) and never overwrites diverging shapes.
-/// Built-in relation types seeded at `MetadataDb::open` per spec
-/// §20/00 §"Built-in" + §29/00 phase-scope. Phase 18.3.
-///
-/// `(namespace, name, cardinality, is_symmetric, description)`.
-/// `from_type` / `to_type` are both `None` (any entity type).
-const BUILTIN_RELATION_TYPES: &[(&str, &str, Cardinality, bool, &str)] = &[
-    (
-        "brain",
-        "related_to",
-        Cardinality::ManyToMany,
-        false,
-        "Generic relation between two entities.",
-    ),
-    // 18.9a — enable integration-test coverage of cardinality and
-    // symmetric paths without a SCHEMA_UPLOAD path (phase 19).
-    (
-        "brain",
-        "reports_to",
-        Cardinality::ManyToOne,
-        false,
-        "Generic ManyToOne relation; second create on same `from` auto-supersedes.",
-    ),
-    (
-        "brain",
-        "co_authored",
-        Cardinality::ManyToMany,
-        true,
-        "Generic symmetric ManyToMany relation; canonicalises from/to byte-wise.",
-    ),
-];
-
-/// Seed the built-in `brain:*` relation types idempotently. Mirrors
-/// `seed_builtin_predicates` (17.3). Pre-existing rows with
-/// diverging shapes are preserved — never overwritten.
-fn seed_builtin_relation_types(db: &Database) -> Result<(), MetadataDbError> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-
-    let wtxn = db.begin_write()?;
-    for (ns, name, cardinality, is_symmetric, desc) in BUILTIN_RELATION_TYPES {
-        match relation_type_intern(
-            &wtxn,
-            ns,
-            name,
-            None,
-            None,
-            *cardinality,
-            *is_symmetric,
-            /* schema_version */ 1,
-            desc,
-            now,
-        ) {
-            Ok(_) => {}
-            Err(RelationTypeOpError::AlreadyExists { .. }) => {}
-            Err(e) => return Err(MetadataDbError::BuiltinRelationTypeSeed(e)),
-        }
-    }
-    wtxn.commit()
-        .map_err(|e| MetadataDbError::Schema(SchemaError::Commit(e)))?;
-    Ok(())
-}
-
-fn seed_builtin_predicates(db: &Database) -> Result<(), MetadataDbError> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-
-    let wtxn = db.begin_write()?;
-    for (ns, name, kind_constraint, obj_type, desc) in BUILTIN_PREDICATES {
-        match predicate_intern(
-            &wtxn,
-            ns,
-            name,
-            *kind_constraint,
-            *obj_type,
-            /* schema_version */ 1,
-            desc,
-            now,
-        ) {
-            Ok(_) => {}
-            // AlreadyExists with diverging constraints: leave the
-            // pre-existing row alone — never overwrite a user/test
-            // shape. Spec §19/00 leaves the precedence question open;
-            // the conservative choice for v1 is to preserve.
-            Err(PredicateOpError::AlreadyExists { .. }) => {}
-            Err(e) => return Err(MetadataDbError::BuiltinPredicateSeed(e)),
-        }
-    }
-    wtxn.commit()
-        .map_err(|e| MetadataDbError::Schema(SchemaError::Commit(e)))?;
-    Ok(())
-}
-
 /// Errors returned by [`MetadataDb::open`].
 ///
 /// After open, read/write transaction errors propagate as their native
@@ -301,13 +81,10 @@ pub enum MetadataDbError {
     #[error("schema: {0}")]
     Schema(#[from] SchemaError),
 
-    /// Seeding a built-in predicate failed at `MetadataDb::open`.
-    #[error("built-in predicate seed: {0}")]
-    BuiltinPredicateSeed(PredicateOpError),
-
-    /// Seeding a built-in relation type failed at `MetadataDb::open`.
-    #[error("built-in relation type seed: {0}")]
-    BuiltinRelationTypeSeed(RelationTypeOpError),
+    /// Phase 19.7 — system-schema seed failed at `MetadataDb::open`.
+    /// Replaces the per-builtin-kind variants from 16.1 / 17.3 / 18.3.
+    #[error("system schema seed: {0}")]
+    SystemSchemaSeed(#[from] SystemSchemaError),
 }
 
 impl MetadataDb {
@@ -337,24 +114,12 @@ impl MetadataDb {
             }
         };
 
-        // Sub-task 16.1: seed a built-in `Person` `EntityTypeDefinition`
-        // if the registry is empty. Phase 19's `SCHEMA_UPLOAD` owns the
-        // registry once user-declared types arrive; user types start at
-        // EntityTypeId(2)+ so this slot stays stable. Idempotent — any
-        // pre-existing row (test fixture or prior open) skips the seed.
-        seed_builtin_entity_types(&db)?;
-
-        // Sub-task 17.3: seed `brain:is_a` / `brain:has_name` /
-        // `brain:mentions` / `brain:related_to` predicates. Each
-        // intern is idempotent on identical constraints; diverging
-        // rows are preserved. Phase 19's `SCHEMA_UPLOAD` registers
-        // user predicates against this same registry.
-        seed_builtin_predicates(&db)?;
-
-        // Sub-task 18.3: seed `brain:related_to` relation type
-        // (any→any ManyToMany asymmetric). Same idempotency
-        // semantics as predicate seeding.
-        seed_builtin_relation_types(&db)?;
+        // Phase 19.7: replaces the three hand-seeded paths from
+        // 16.1 / 17.3 / 18.3 with a single parse-validate-apply over
+        // the embedded `system_schema/schema.brain` source. Idempotent
+        // — re-opens are no-ops because `schema_active("brain")`
+        // returns `Some(1)` on a previously-seeded DB.
+        seed_system_schema(&db)?;
 
         Ok(Self {
             db,
@@ -417,8 +182,10 @@ impl MetadataDb {
 mod tests {
     use super::*;
     use crate::schema::{CURRENT_SCHEMA_VERSION, SCHEMA_META_TABLE, SCHEMA_VERSION_KEY};
+    use crate::tables::knowledge::entity_type::{EntityTypeDefinition, ENTITY_TYPES_TABLE};
     use crate::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
-    use brain_core::{AgentId, ContextId, MemoryId, MemoryKind};
+    use brain_core::{AgentId, ContextId, EntityType, MemoryId, MemoryKind};
+    use redb::ReadableTable;
 
     fn db_path(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().join("metadata.redb")
@@ -671,12 +438,18 @@ mod tests {
     }
 
     #[test]
-    fn person_seed_skipped_when_registry_nonempty() {
+    fn system_schema_seed_skipped_when_brain_namespace_active() {
         let dir = tempfile::tempdir().unwrap();
         let path = db_path(&dir);
 
-        // Pre-seed a NON-Person type with id=42 before opening
-        // MetadataDb.
+        // First open seeds the system schema → schema_active("brain") = Some(1).
+        drop(MetadataDb::open(&path).unwrap());
+
+        // Inject a NON-Person type with id=42 between opens. This
+        // mimics a hypothetical user-namespace registration. Because
+        // schema_active("brain") is already set, the next open must
+        // NOT re-run the system schema seed (which would otherwise
+        // double-register the brain entity types).
         {
             let db = redb::Database::create(&path).unwrap();
             let wtxn = db.begin_write().unwrap();
@@ -693,8 +466,8 @@ mod tests {
             wtxn.commit().unwrap();
         }
 
-        // Open. seed_builtin_entity_types should detect non-empty
-        // registry and skip the Person insert.
+        // Re-open: seed must be a no-op. Phase 19.7 gates on
+        // `schema_active("brain")`, not on table emptiness.
         let db = MetadataDb::open(&path).unwrap();
         let rtxn = db.read_txn().unwrap();
         let t = rtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
@@ -703,7 +476,9 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().0.value())
             .collect();
-        assert_eq!(rows, vec![42], "Person seed must skip when registry has rows");
+        // Person from first seed (id=1) + injected Project (id=42).
+        // No second Person registration.
+        assert_eq!(rows, vec![1, 42], "second open must not re-seed");
     }
 
     // -----------------------------------------------------------------
@@ -739,6 +514,9 @@ mod tests {
 
         let rtxn = db.read_txn().unwrap();
         let all = crate::relation_type_ops::relation_type_list(&rtxn, Some("brain")).unwrap();
-        assert_eq!(all.len(), 1, "re-open must not duplicate built-in seeds");
+        // Phase 19.7: system schema seeds 3 brain relation types
+        // (`related_to`, `reports_to`, `co_authored`). Idempotent
+        // on reopen — count stays at 3, not 6.
+        assert_eq!(all.len(), 3, "re-open must not duplicate built-in seeds");
     }
 }

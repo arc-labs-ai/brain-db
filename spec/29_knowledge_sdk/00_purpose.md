@@ -8,8 +8,8 @@ The SDK lands across multiple phases:
 |---|---|---|
 | 16.8 | Hand-written `Entity` helpers for the built-in `Person` type — all 9 entity opcodes (CREATE / GET / UPDATE / RENAME / MERGE / UNMERGE / RESOLVE / LIST / TOMBSTONE). No derive macro. | complete |
 | 17.8 | Statement helpers (Fact / Preference / Event builders) — `client.fact()` / `.preference()` / `.event()` / `.statements()`. Hand-written; no derive macro. | complete |
-| 18.8 | Relation helpers — `client.relation::<T>()` / `.relations()` + traversal builder. Hand-written; derive macro deferred to phase 19. | this phase |
-| 19 | `BrainEntity` / `BrainRelation` / `BrainFact` derive macros + `SchemaBuilder` (depends on schema DSL). | later |
+| 18.8 | Relation helpers — `client.relation::<T>()` / `.relations()` + traversal builder. Hand-written; derive macro deferred to phase 19. | complete |
+| 19 | `BrainEntity` / `BrainRelation` / `BrainFact` derive macros + programmatic `SchemaBuilder` + `client.schema().upload() / .validate() / .get() / .list()` (depends on schema DSL). | this phase |
 | 22-23 | Fluent query builder + subscribe extensions. | later |
 
 The examples below show the **target** ergonomics (post-derive-macro). The 16.8 implementation provides the same opcode coverage via hand-written builders against the `Person` type defined in `brain_core::knowledge::EntityType::PERSON_ID`. Phase 19's derive macro generalises the surface to any user-declared type.

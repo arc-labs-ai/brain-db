@@ -10,6 +10,10 @@ description = "Metadata store (redb) and graph storage for Brain."
 [dependencies]
 brain-core = { path = "../brain-core" }
 brain-storage = { path = "../brain-storage" }
+# 19.5: schema_store accepts `ValidatedSchema` (brain-protocol) and
+# encodes the AST via serde_json into the schema_versions row.
+brain-protocol = { path = "../brain-protocol" }
+serde_json = { workspace = true }
 redb.workspace = true
 rkyv.workspace = true
 thiserror.workspace = true
@@ -36,4 +40,8 @@ harness = false
 
 [[bench]]
 name = "relation_ops"
+harness = false
+
+[[bench]]
+name = "schema_ops"
 harness = false

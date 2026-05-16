@@ -360,15 +360,46 @@ These phases turn Brain from a vector memory store into a cognitive database wit
 
 ---
 
-## Phase 19 — Schema DSL
+## Phase 19 — Schema DSL ✓
 
-**One-line:** Parser + validator + versioning + migration plan computation for the declarative schema language.
+**One-line:** Parser + validator + per-namespace versioning for the declarative schema language; system-schema bootstrap replaces hand-seeded built-ins; SDK schema builders.
 
-**Detailed plan:** [`docs/phases/phase-19-schema-dsl.md`](docs/phases/phase-19-schema-dsl.md)
+**Detailed plan:** [`docs/phases/phase-19-schema-dsl.md`](docs/phases/phase-19-schema-dsl.md) (superseded by `.claude/plans/phase-19*.md` per-sub-task plans).
 
-**Crates touched:** `brain-protocol`, `brain-metadata`, `brain-core`, `brain-server`, `brain-sdk-rust`.
+**Crates touched:** `brain-protocol`, `brain-metadata`, `brain-ops`, `brain-sdk-rust`, `brain-server`.
 
-**Sub-tasks:** 8. **Exit:** schema upload validates and versions correctly; subsequent entity ops respect declared types; tag `phase-19-complete`.
+**Sub-tasks:** 9. **Exit:** schema upload validates + versions per namespace; system schema seeds on first open; subsequent entity / predicate / relation registrations flow through the parse → validate → persist → intern fan-out; tag `phase-19-complete`.
+
+**Scope cut:** **No migration plan computation** per user direction (no existing deployments to migrate). Tracked as `spec/21_schema_dsl/07_open_questions.md` Q3.
+
+**Delivered:**
+
+- §21 schema-DSL section brought to §03-depth (9 files: ast / validator / namespaces / versioning / system_schema / open_questions / references).
+- §16/02 §2.6 schema-layer perf targets added (UPLOAD / VALIDATE / GET / LIST); phase-gate renumbered.
+- §29/00 SDK phase-scope flipped: 19.8 SchemaBuilder + client.schema() ✓.
+- 4 schema wire opcodes (`SCHEMA_UPLOAD` / `_GET` / `_LIST` / `_VALIDATE` at `0x0120-0x0123`, responses at `0x01A0-0x01A3`) end-to-end through `brain-protocol`, `brain-ops`, `brain-server`.
+- Schema AST in `brain-protocol::schema`: value-typed (serde, no rkyv) — `Schema`, `SchemaItem`, `EntityTypeDef`, `PredicateDef`, `RelationTypeDef`, `ExtractorDef` + supporting enums.
+- Pest 2.7 parser (`grammar.pest` + recursive-descent visitor) mirrors the §21/01 EBNF: namespaces, attribute modifiers, predicate kind/object, relation cardinality + symmetric + properties, extractor kind/target + 14 per-kind config fields, heredoc strings, regex literals, JSON capture for `examples:` / `schema:`, condition expressions with and/or/matches, comments + CRLF + trailing commas. `ParseError` carries 1-based line/col.
+- Static validator (`validate(&Schema)` + `validate_system_schema(&Schema)`): namespace + duplicates + type refs + predicate kind/object compatibility + cardinality/symmetric + attribute rules (`unique` not on Ref, default-type compat) + extractor required-field/range checks. `ValidatedSchema` newtype proves validation cleared. Accumulates all errors (no first-error short-circuit).
+- Per-namespace schema persistence in `brain-metadata::schema_store`: `(namespace, version)` → `SchemaVersionRow` (rkyv) + `namespace -> u32` active pointer. `schema_upload` is atomic — bumps version + writes row + active pointer + fans out into entity_type / predicate / relation_type intern paths.
+- System schema bootstrap (load-bearing): `brain-metadata/src/system_schema/schema.brain` is `include_str!`-embedded; parsed + validated + applied at `MetadataDb::open`. Replaces `BUILTIN_PREDICATES` / `BUILTIN_RELATION_TYPES` / `seed_builtin_entity_types` from 16.1 / 17.3 / 18.3 — every built-in registration now flows through the parser + validator + schema_upload, sharing code paths with user uploads. Built-in IDs (`Person == EntityTypeId(1)`, etc) preserved.
+- `SchemaUpdatedEvent.namespace` field added; emitted post-commit on UPLOAD.
+- SDK `client.schema()` entry with `.upload(&Schema)` / `.upload_text(text)` / `.validate(text)` / `.get(ns, v)` / `.list(ns)`; `SchemaBuilder::new(ns).entity_type(...).predicate(...).relation_type(...).build()` fluent assembler; canonical DSL printer for AST → text round-trip.
+- Integration test suite: 8 wire-smoke tests + 1 phase-exit lifecycle test + 6 mock-server SDK tests + schema_ops criterion bench (parse + validate + upload at 50-definition fixture, plus get / list).
+
+**Deferred to later phases (tracked in `spec/21_schema_dsl/07_open_questions.md`):**
+
+- Migration plan computation, schema diff / keep-re-extract-tombstone semantics — out of v1 scope; revisit in v1.1+ (§21/07 Q3).
+- `#[derive(BrainEntity)]` / `BrainFact` / `BrainPreference` / `BrainEvent` / `BrainRelation` proc macros — phase 19b or phase 21 (§21/07 Q13).
+- Multi-document schemas per namespace + `use other_ns;` cross-namespace imports — post-v1 (§21/07 Q2, Q6).
+- Source spans threaded through the AST → validator → wire — phase 19+ improvement (§21/07 Q4 / Q15).
+- Per-namespace entity-type ID space (`brain:Person` vs `acme:Person`) — needed once user entity types arrive (later sub-tasks).
+- Schema deletion / rollback (§21/07 Q9).
+- Validator-version migration when validator rules change (§21/07 Q10).
+- Binary-bootstrap migration when system schema content changes across binaries (§21/07 Q11).
+- Admin-only authorization for `0x0120-0x0123` (§21/07 Q15 / §28/05 §8) — phase 21 admin.
+- Stream-paginated `SCHEMA_LIST` — phase 23.
+- `EXTRACTOR_LIST` / `_DISABLE` / `_ENABLE` (`0x0124-0x0126`) — phase 20.
 
 ---
 

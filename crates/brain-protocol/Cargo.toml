@@ -16,6 +16,12 @@ rkyv.workspace = true
 uuid.workspace = true
 # 17.6: SmallVec used by Statement / EvidenceRef projections.
 smallvec.workspace = true
+# 19.2: serde + serde_json used by the value-typed schema AST (§21/02).
+serde = { workspace = true }
+serde_json = { workspace = true }
+# 19.3: pest-based parser for the schema DSL (§21/01).
+pest = { workspace = true }
+pest_derive = { workspace = true }
 
 [dev-dependencies]
 proptest.workspace = true
