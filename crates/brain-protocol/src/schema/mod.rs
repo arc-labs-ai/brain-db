@@ -7,6 +7,7 @@
 pub mod ast;
 pub mod parse_error;
 pub mod parser;
+pub mod validator;
 
 pub use ast::{
     AttrType, AttributeDecl, CacheConfig, CardinalityAst, ConditionExpr, ConditionOp,
@@ -16,3 +17,6 @@ pub use ast::{
 };
 pub use parse_error::ParseError;
 pub use parser::parse_schema;
+pub use validator::{
+    validate, SourceSpan, ValidatedSchema, ValidationError, ValidationErrorCode, ValidationErrors,
+};
