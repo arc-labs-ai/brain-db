@@ -133,13 +133,32 @@ extractor synchronously per memory; additional classifier
 extractors dispatch through the near-foreground queue
 (§27/01 §3) and don't widen ENCODE's budget.
 
-### 2.8 Phase perf gates
+### 2.8 Knowledge layer — LLM extractor (phase 21)
+
+LLM extractor latency is dominated by external API round-trip
+times. CI benches use mock HTTP servers; production deployments
+set their own SLOs and instrument via the audit table.
+
+| Operation | p50 | p99 |
+|---|---|---|
+| `LlmExtractor::predict` (cache hit) | 1 ms | 5 ms |
+| `LlmExtractor::predict` (cache miss, claude-haiku) | 600 ms | 3 s |
+| `LlmExtractor::predict` (cache miss, gpt-4o-mini) | 800 ms | 4 s |
+| Cost-budget skip path (no LLM call) | 200 µs | 1 ms |
+| `LlmCacheDb::get` round-trip | 300 µs | 1.5 ms |
+| `LlmCacheDb::put` round-trip | 800 µs | 3 ms |
+
+LLM extractors run on the background queue (§27/01 §3) and don't
+contribute to ENCODE's P99 budget.
+
+### 2.9 Phase perf gates
 
 - **Phase 16 (sub-task 16.9)** — §2.2 entity targets at 100K entities.
 - **Phase 17 (sub-task 17.10)** — §2.3 statement targets at 1M statements.
 - **Phase 18 (sub-task 18.9)** — §2.4 relation targets at 1M relations.
 - **Phase 19 (sub-task 19.10b)** — §2.6 schema targets at 50 definitions.
 - **Phase 20 (sub-task 20.10)** — §2.7 extractor targets at single-extractor dispatch.
+- **Phase 21 (sub-task 21.7)** — §2.8 LLM extractor targets at cache-hit + cost-budget skip + mock-API miss.
 
 Phases verify on the dev workstation; production-reference numbers (16-core / 64 GB / NVMe per §1) are revalidated in phase 14's CI suite.
 

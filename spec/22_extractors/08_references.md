@@ -54,8 +54,10 @@ Phase 20 implementation lives in:
 
 | Document | Purpose |
 |---|---|
-| [`../../.claude/plans/phase-20.md`](../../.claude/plans/phase-20.md) | Phase 20 master plan (this implementation). |
-| [`../../docs/phases/phase-20-pattern-classifier-extractors.md`](../../docs/phases/phase-20-pattern-classifier-extractors.md) | Phase 20 sub-task index (original; superseded by the .claude plan). |
+| [`../../.claude/plans/phase-20.md`](../../.claude/plans/phase-20.md) | Phase 20 master plan. |
+| [`../../.claude/plans/phase-21.md`](../../.claude/plans/phase-21.md) | Phase 21 LLM extractor master plan. |
+| [`../../docs/phases/phase-20-pattern-classifier-extractors.md`](../../docs/phases/phase-20-pattern-classifier-extractors.md) | Phase 20 sub-task index (original; superseded by the .claude plans). |
+| [`../../docs/phases/phase-21-llm-extractor.md`](../../docs/phases/phase-21-llm-extractor.md) | Phase 21 sub-task index. |
 
 ## §22 internal file map
 
@@ -72,3 +74,4 @@ For navigation:
 | [`./06_idempotency.md`](./06_idempotency.md) | Replay semantics + cache. |
 | [`./07_open_questions.md`](./07_open_questions.md) | Deferrals. |
 | [`./08_references.md`](./08_references.md) | This file. |
+| [`./09_llm_extractor.md`](./09_llm_extractor.md) | LLM tier: client trait, cache, retry, cost budget. |
