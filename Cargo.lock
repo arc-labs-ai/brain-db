@@ -448,6 +448,7 @@ dependencies = [
  "brain-protocol",
  "parking_lot",
  "redb",
+ "smallvec",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

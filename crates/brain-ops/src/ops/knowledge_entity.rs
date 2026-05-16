@@ -708,8 +708,9 @@ fn map_entity_merge_op_error(err: EntityMergeOpError) -> OpError {
 
 /// Emit a knowledge-layer event onto the EventBus. Substrate fields are
 /// zero-filled per spec §28/02 §2. Called post-commit by every entity
-/// handler that mutates state.
-fn emit_knowledge_event(
+/// handler that mutates state. Also reused by the statement handlers
+/// (17.7).
+pub(crate) fn emit_knowledge_event(
     ctx: &OpsContext,
     event_type: EventType,
     payload: KnowledgeEventPayload,

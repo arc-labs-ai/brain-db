@@ -6,6 +6,7 @@
 pub mod encode;
 pub mod forget;
 pub mod knowledge_entity;
+pub mod knowledge_statement;
 pub mod link;
 pub mod plan;
 pub mod reason;

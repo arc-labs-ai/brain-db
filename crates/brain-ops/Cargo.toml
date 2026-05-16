@@ -21,6 +21,9 @@ parking_lot.workspace = true
 blake3.workspace = true
 uuid.workspace = true
 tokio = { version = "1", features = ["sync", "time"] }
+# 17.7: SmallVec used when projecting overflow evidence back to inline
+# for StatementView responses.
+smallvec.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

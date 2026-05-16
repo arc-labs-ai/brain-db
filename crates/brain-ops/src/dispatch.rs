@@ -150,15 +150,39 @@ pub async fn dispatch(req: RequestBody, ctx: &OpsContext) -> Result<ResponseBody
             .await
             .map(ResponseBody::EntityTombstone),
 
-        // Statement ops — wire opcodes landed in 17.6; handlers in 17.7.
-        RequestBody::StatementCreate(_)
-        | RequestBody::StatementGet(_)
-        | RequestBody::StatementSupersede(_)
-        | RequestBody::StatementTombstone(_)
-        | RequestBody::StatementRetract(_)
-        | RequestBody::StatementHistory(_)
-        | RequestBody::StatementList(_) => {
-            Err(OpError::NotYetImplemented("statement op — Phase 17.7"))
+        // Statement ops — phase 17.7. Spec §28/06.
+        RequestBody::StatementCreate(r) => {
+            crate::knowledge_statement::handle_statement_create(r, ctx)
+                .await
+                .map(ResponseBody::StatementCreate)
+        }
+        RequestBody::StatementGet(r) => crate::knowledge_statement::handle_statement_get(r, ctx)
+            .await
+            .map(ResponseBody::StatementGet),
+        RequestBody::StatementSupersede(r) => {
+            crate::knowledge_statement::handle_statement_supersede(r, ctx)
+                .await
+                .map(ResponseBody::StatementSupersede)
+        }
+        RequestBody::StatementTombstone(r) => {
+            crate::knowledge_statement::handle_statement_tombstone(r, ctx)
+                .await
+                .map(ResponseBody::StatementTombstone)
+        }
+        RequestBody::StatementRetract(r) => {
+            crate::knowledge_statement::handle_statement_retract(r, ctx)
+                .await
+                .map(ResponseBody::StatementRetract)
+        }
+        RequestBody::StatementHistory(r) => {
+            crate::knowledge_statement::handle_statement_history(r, ctx)
+                .await
+                .map(ResponseBody::StatementHistory)
+        }
+        RequestBody::StatementList(r) => {
+            crate::knowledge_statement::handle_statement_list(r, ctx)
+                .await
+                .map(ResponseBody::StatementList)
         }
     }
 }
