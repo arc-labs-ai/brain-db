@@ -1,0 +1,19 @@
+[package]
+name = "brain-extractors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Extractor framework (pattern / classifier / llm) for the Brain knowledge layer."
+
+[dependencies]
+brain-core = { path = "../brain-core" }
+brain-protocol = { path = "../brain-protocol" }
+blake3 = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

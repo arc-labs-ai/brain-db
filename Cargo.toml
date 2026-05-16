@@ -13,6 +13,7 @@ members = [
     "crates/brain-index",
     "crates/brain-embed",
     "crates/brain-planner",
+    "crates/brain-extractors",
     "crates/brain-ops",
     "crates/brain-workers",
     "crates/brain-server",

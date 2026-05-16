@@ -376,6 +376,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "brain-extractors"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "brain-core",
+ "brain-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "brain-http"
 version = "0.1.0"
 dependencies = [
