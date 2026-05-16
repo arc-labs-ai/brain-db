@@ -158,6 +158,24 @@ const BUILTIN_PREDICATES: &[(&str, &str, Option<StatementKind>, u8, &str)] = &[
         1, // Entity
         "Generic relation between subject entity and object entity.",
     ),
+    // 17.10a — enable integration-test coverage of Preference / Event
+    // kinds without a SCHEMA_UPLOAD path (phase 19). Generic enough
+    // that users picking these qnames is unlikely; user schemas pick
+    // their own predicates in their own namespace.
+    (
+        "brain",
+        "prefers",
+        Some(StatementKind::Preference),
+        2, // Value
+        "Generic Preference about the subject (any value).",
+    ),
+    (
+        "brain",
+        "scheduled",
+        Some(StatementKind::Event),
+        0, // any object
+        "Generic Event scheduled at event_at_unix_nanos.",
+    ),
 ];
 
 /// Seed the built-in `brain:*` predicates idempotently. Sub-task 17.3.
