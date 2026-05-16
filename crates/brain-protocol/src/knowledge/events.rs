@@ -203,12 +203,15 @@ pub struct ExtractionFailedEvent {
 // Schema events — phase 19 (defined for forward compat).
 // ---------------------------------------------------------------------------
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub struct SchemaUpdatedEvent {
+    /// Namespace the new version belongs to (§21/04 / phase 19.5).
+    pub namespace: String,
     pub from_version: u32,
     pub to_version: u32,
+    /// Always `true` in v1 — no diff computed (§21/05 §3).
     pub backward_compatible: bool,
 }
 
@@ -316,6 +319,7 @@ mod tests {
     #[test]
     fn schema_event_round_trips() {
         roundtrip(KnowledgeEventPayload::SchemaUpdated(SchemaUpdatedEvent {
+            namespace: "acme".into(),
             from_version: 1,
             to_version: 2,
             backward_compatible: true,

@@ -183,6 +183,31 @@ hand-rolled recursive-descent, smaller dep tree.
 **Target:** phase 19.3 — chosen at implementation time. **Status:**
 provisional pest.
 
+---
+
+### Q15 — §28/05 wire spec vs §21/05 truth
+
+[`../28_knowledge_wire_protocol/05_schema_frames.md`](../28_knowledge_wire_protocol/05_schema_frames.md)
+was authored before this section's no-migration directive landed.
+Several §28/05 fields encode migration semantics that v1 doesn't
+implement:
+
+| §28/05 field | v1 behaviour |
+|---|---|
+| `SchemaUploadRequest.allow_breaking` | Accepted and ignored. |
+| `SchemaUploadResponse.backward_compatible` | Always `true`. |
+| `SchemaUploadResponse.migration_summary` | Replaced with `migration_summary_blob: Vec<u8>` (empty). |
+| `SchemaGetRequest.version_id` (no namespace) | Phase 19.6 extends with a `namespace: String` field. |
+| `SchemaUpdatedEvent` | Phase 19.6 adds `namespace: String`. |
+| `SchemaListRequest.cursor` | Accepted and ignored (single-frame v1). |
+| Admin authorization (§28/05 §8) | Open access in v1 — phase 21 admin adds auth. |
+
+When §28/05 is next edited, fold these resolutions back. None of
+the spec divergences alter the wire opcode table.
+
+**Target:** §28/05 cleanup pass post-v1. **Status:** resolved in
+phase 19.6 implementation.
+
 ## Resolved
 
 (Q12 by §06 §6.)

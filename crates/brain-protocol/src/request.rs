@@ -118,6 +118,12 @@ pub enum RequestBody {
     RelationListFrom(crate::knowledge::RelationListFromRequest),
     RelationListTo(crate::knowledge::RelationListToRequest),
     RelationTraverse(crate::knowledge::RelationTraverseRequest),
+
+    // Schema ops (phase 19.6). Spec §28/05.
+    SchemaUpload(crate::knowledge::SchemaUploadRequest),
+    SchemaGet(crate::knowledge::SchemaGetRequest),
+    SchemaList(crate::knowledge::SchemaListRequest),
+    SchemaValidate(crate::knowledge::SchemaValidateRequest),
 }
 
 impl RequestBody {
@@ -177,6 +183,10 @@ impl RequestBody {
             Self::RelationListFrom(_) => Opcode::RelationListFromReq,
             Self::RelationListTo(_) => Opcode::RelationListToReq,
             Self::RelationTraverse(_) => Opcode::RelationTraverseReq,
+            Self::SchemaUpload(_) => Opcode::SchemaUploadReq,
+            Self::SchemaGet(_) => Opcode::SchemaGetReq,
+            Self::SchemaList(_) => Opcode::SchemaListReq,
+            Self::SchemaValidate(_) => Opcode::SchemaValidateReq,
         }
     }
 
@@ -238,6 +248,10 @@ impl RequestBody {
             Self::RelationListFrom(r) => to_rkyv_bytes(r),
             Self::RelationListTo(r) => to_rkyv_bytes(r),
             Self::RelationTraverse(r) => to_rkyv_bytes(r),
+            Self::SchemaUpload(r) => to_rkyv_bytes(r),
+            Self::SchemaGet(r) => to_rkyv_bytes(r),
+            Self::SchemaList(r) => to_rkyv_bytes(r),
+            Self::SchemaValidate(r) => to_rkyv_bytes(r),
         }
     }
 
@@ -300,6 +314,10 @@ impl RequestBody {
             Opcode::RelationListFromReq => Self::RelationListFrom(from_rkyv_bytes(bytes)?),
             Opcode::RelationListToReq => Self::RelationListTo(from_rkyv_bytes(bytes)?),
             Opcode::RelationTraverseReq => Self::RelationTraverse(from_rkyv_bytes(bytes)?),
+            Opcode::SchemaUploadReq => Self::SchemaUpload(from_rkyv_bytes(bytes)?),
+            Opcode::SchemaGetReq => Self::SchemaGet(from_rkyv_bytes(bytes)?),
+            Opcode::SchemaListReq => Self::SchemaList(from_rkyv_bytes(bytes)?),
+            Opcode::SchemaValidateReq => Self::SchemaValidate(from_rkyv_bytes(bytes)?),
             other => return Err(ProtocolError::UnknownOpcode(other.as_u16())),
         })
     }

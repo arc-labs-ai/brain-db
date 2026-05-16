@@ -219,5 +219,21 @@ pub async fn dispatch(req: RequestBody, ctx: &OpsContext) -> Result<ResponseBody
                 .await
                 .map(ResponseBody::RelationTraverse)
         }
+
+        // Schema ops — phase 19.6. Spec §28/05.
+        RequestBody::SchemaUpload(r) => {
+            crate::knowledge_schema::handle_schema_upload(r, ctx)
+                .await
+                .map(ResponseBody::SchemaUpload)
+        }
+        RequestBody::SchemaGet(r) => crate::knowledge_schema::handle_schema_get(r, ctx)
+            .await
+            .map(ResponseBody::SchemaGet),
+        RequestBody::SchemaList(r) => crate::knowledge_schema::handle_schema_list(r, ctx)
+            .await
+            .map(ResponseBody::SchemaList),
+        RequestBody::SchemaValidate(r) => crate::knowledge_schema::handle_schema_validate(r, ctx)
+            .await
+            .map(ResponseBody::SchemaValidate),
     }
 }

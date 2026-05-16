@@ -111,6 +111,13 @@ pub enum ResponseBody {
     /// Single-frame snapshot in v1; phase 23 splits into streaming.
     RelationTraverse(crate::knowledge::RelationTraverseResponseFrame),
 
+    // Schema ops (phase 19.6). Spec §28/05.
+    SchemaUpload(crate::knowledge::SchemaUploadResponse),
+    SchemaGet(crate::knowledge::SchemaGetResponse),
+    /// Single-frame snapshot in v1; phase 23 may split into streaming.
+    SchemaList(crate::knowledge::SchemaListResponseFrame),
+    SchemaValidate(crate::knowledge::SchemaValidateResponse),
+
     Error(ErrorResponse),
 }
 
@@ -170,6 +177,10 @@ impl ResponseBody {
             Self::RelationListFrom(_) => Opcode::RelationListFromResp,
             Self::RelationListTo(_) => Opcode::RelationListToResp,
             Self::RelationTraverse(_) => Opcode::RelationTraverseResp,
+            Self::SchemaUpload(_) => Opcode::SchemaUploadResp,
+            Self::SchemaGet(_) => Opcode::SchemaGetResp,
+            Self::SchemaList(_) => Opcode::SchemaListResp,
+            Self::SchemaValidate(_) => Opcode::SchemaValidateResp,
             Self::Error(_) => Opcode::Error,
         }
     }
@@ -191,6 +202,7 @@ impl ResponseBody {
             Self::RelationListFrom(r) => Some(r.is_final),
             Self::RelationListTo(r) => Some(r.is_final),
             Self::RelationTraverse(r) => Some(r.is_final),
+            Self::SchemaList(r) => Some(r.is_final),
             _ => None,
         }
     }
@@ -250,6 +262,10 @@ impl ResponseBody {
             Self::RelationListFrom(r) => to_rkyv_bytes(r),
             Self::RelationListTo(r) => to_rkyv_bytes(r),
             Self::RelationTraverse(r) => to_rkyv_bytes(r),
+            Self::SchemaUpload(r) => to_rkyv_bytes(r),
+            Self::SchemaGet(r) => to_rkyv_bytes(r),
+            Self::SchemaList(r) => to_rkyv_bytes(r),
+            Self::SchemaValidate(r) => to_rkyv_bytes(r),
             Self::Error(r) => to_rkyv_bytes(r),
         }
     }
@@ -312,6 +328,10 @@ impl ResponseBody {
             Opcode::RelationListFromResp => Self::RelationListFrom(from_rkyv_bytes(bytes)?),
             Opcode::RelationListToResp => Self::RelationListTo(from_rkyv_bytes(bytes)?),
             Opcode::RelationTraverseResp => Self::RelationTraverse(from_rkyv_bytes(bytes)?),
+            Opcode::SchemaUploadResp => Self::SchemaUpload(from_rkyv_bytes(bytes)?),
+            Opcode::SchemaGetResp => Self::SchemaGet(from_rkyv_bytes(bytes)?),
+            Opcode::SchemaListResp => Self::SchemaList(from_rkyv_bytes(bytes)?),
+            Opcode::SchemaValidateResp => Self::SchemaValidate(from_rkyv_bytes(bytes)?),
             Opcode::Error => Self::Error(from_rkyv_bytes(bytes)?),
             other => return Err(ProtocolError::UnknownOpcode(other.as_u16())),
         })
