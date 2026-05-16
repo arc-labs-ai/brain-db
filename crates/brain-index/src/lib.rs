@@ -35,6 +35,7 @@ pub mod persistence;
 pub mod rebuild;
 pub mod shared;
 pub mod statement_hnsw;
+pub mod tantivy_shard;
 pub mod tombstones;
 
 pub use entity_hnsw::{
@@ -49,4 +50,9 @@ pub use idmap::{IdMap, IdMapError};
 pub use params::{IndexParams, IndexParamsError, MAX_LAYER, VECTOR_DIM};
 pub use rebuild::RebuildReport;
 pub use shared::{SharedHnsw, Writer};
+pub use tantivy_shard::{
+    memory_text_schema, schema_payload_json, statements_schema, BrainSchemaPayload, IndexHandle,
+    IndexStatus, LexicalScope, RebuildReason as TantivyRebuildReason, TantivyShard,
+    TantivyShardError, TantivyShardStartup, BRAIN_SCHEMA_VERSION,
+};
 pub use tombstones::TombstoneBitmap;

@@ -15,6 +15,13 @@ tracing.workspace = true
 blake3.workspace = true
 crc32c.workspace = true
 parking_lot.workspace = true
+# Phase 22.1 — lexical retrieval. tantivy provides the BM25
+# index used by the LexicalRetriever (§23/02) and laid out per
+# §26/01. Schema-version stamping uses serde_json on the
+# tantivy IndexMeta payload.
+tantivy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -827,6 +827,46 @@ pub fn spawn_shard(
             let llm_deps = llm_setup::build_llm_deps(&shard_dir_for_executor);
             let llm_cache_for_ops = llm_deps.cache.clone();
 
+            // 22.1: open the per-shard tantivy indexes
+            // (`memory_text.tantivy/` + `statements.tantivy/`)
+            // per spec §26/01 §6. Status arms feed the rebuild
+            // worker in 22.6; for now we log and continue —
+            // reads against an unhealthy index return
+            // `IndexUnavailable` at the retriever (22.5) layer.
+            let tantivy_for_ops = match brain_index::TantivyShard::open(
+                &shard_dir_for_executor,
+            ) {
+                Ok(startup) => {
+                    if let brain_index::IndexStatus::NeedsRebuild { reason } =
+                        &startup.memory_status
+                    {
+                        tracing::warn!(
+                            target: "brain_server::shard",
+                            ?reason,
+                            "memory_text.tantivy needs rebuild (deferred to 22.6)",
+                        );
+                    }
+                    if let brain_index::IndexStatus::NeedsRebuild { reason } =
+                        &startup.statements_status
+                    {
+                        tracing::warn!(
+                            target: "brain_server::shard",
+                            ?reason,
+                            "statements.tantivy needs rebuild (deferred to 22.6)",
+                        );
+                    }
+                    Some(startup.shard)
+                }
+                Err(err) => {
+                    tracing::error!(
+                        target: "brain_server::shard",
+                        error = %err,
+                        "TantivyShard::open failed; lexical retrieval unavailable for this shard",
+                    );
+                    None
+                }
+            };
+
             let extractor_registry = {
                 let db_guard = metadata.lock();
                 let rtxn = db_guard
@@ -865,7 +905,8 @@ pub fn spawn_shard(
                 OpsContext::new(executor_ctx)
                     .with_extractor_registry(extractor_registry)
                     .with_classifier_config(classifier_config)
-                    .with_llm_cache(llm_cache_for_ops),
+                    .with_llm_cache(llm_cache_for_ops)
+                    .with_tantivy(tantivy_for_ops),
             );
 
             // Spawn the per-shard fanout task: drains the in-process
@@ -1396,6 +1437,20 @@ mod tests {
         assert!(
             paths.llm_cache_db().exists(),
             "llm_cache.redb should be created by spawn (sub-task 15.4)"
+        );
+
+        // 22.1: spawn now opens the tantivy indexes via
+        // `TantivyShard::open`, which calls `Index::create_in_dir`
+        // on a fresh shard. The presence of `meta.json` is the
+        // observable proof that this happened (a bare mkdir from
+        // §15.3 leaves the directory empty).
+        assert!(
+            paths.memory_text_tantivy().join("meta.json").exists(),
+            "memory_text.tantivy/meta.json should exist after spawn (sub-task 22.1)"
+        );
+        assert!(
+            paths.statements_tantivy().join("meta.json").exists(),
+            "statements.tantivy/meta.json should exist after spawn (sub-task 22.1)"
         );
     }
 }

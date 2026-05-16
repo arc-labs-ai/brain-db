@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brain_extractors::{ClassifierConfig, ExtractorRegistry};
+use brain_index::TantivyShard;
 use brain_metadata::LlmCacheDb;
 use brain_planner::{ExecutorContext, PlannerContext};
 use parking_lot::{Mutex, RwLock};
@@ -63,6 +64,12 @@ pub struct OpsContext {
     /// the registry; later ops (RECALL provenance lookups, cache
     /// admin endpoints) can read through this field directly.
     pub llm_cache: Option<Arc<Mutex<LlmCacheDb>>>,
+    /// Per-shard tantivy index handle (phase 22.1). `None` until
+    /// the server's shard-spawn path wires it via
+    /// [`OpsContext::with_tantivy`]. The retriever (22.5) and
+    /// indexer workers (22.3 / 22.4) borrow through this field;
+    /// substrate-only deployments leave it `None`.
+    pub tantivy: Option<Arc<TantivyShard>>,
 }
 
 impl OpsContext {
@@ -81,6 +88,7 @@ impl OpsContext {
             extractor_registry: Arc::new(RwLock::new(ExtractorRegistry::new())),
             classifier_config: Arc::new(ClassifierConfig::unloaded()),
             llm_cache: None,
+            tantivy: None,
         }
     }
 
@@ -149,6 +157,16 @@ impl OpsContext {
     #[must_use]
     pub fn with_llm_cache(mut self, cache: Option<Arc<Mutex<LlmCacheDb>>>) -> Self {
         self.llm_cache = cache;
+        self
+    }
+
+    /// Install (or clear) the per-shard tantivy handle. Phase
+    /// 22.1 calls this once at shard startup with the
+    /// `TantivyShard` returned by `TantivyShard::open`. Tests
+    /// and substrate-only deployments pass `None`.
+    #[must_use]
+    pub fn with_tantivy(mut self, tantivy: Option<Arc<TantivyShard>>) -> Self {
+        self.tantivy = tantivy;
         self
     }
 }

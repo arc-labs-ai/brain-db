@@ -95,6 +95,11 @@ jsonschema = { version = "0.18", default-features = false }
 # Storage / indexing
 redb = "4"
 hnsw_rs = "0.3"
+# Phase 22.1 — lexical retrieval. We opt out of the default
+# `stopwords` feature because §23/02 §3 binds "no stop-word
+# removal in v1" (preserves exact-ID queries like ACME-1247);
+# `mmap` + `lz4-compression` + `stemmer` are kept.
+tantivy = { version = "0.26", default-features = false, features = ["mmap", "lz4-compression", "stemmer"] }
 
 # Embeddings (pure-Rust)
 candle-core = "0.8"

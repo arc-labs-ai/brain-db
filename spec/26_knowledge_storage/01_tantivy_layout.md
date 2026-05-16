@@ -40,7 +40,7 @@ phase 22.5 + §23/02 §5 rely on the exact field set for filters.
 |---|---|---|
 | `memory_id` | `u64` | `STORED` only — surfaces in `RankedItem.id`. Not indexed. |
 | `text` | text | `TEXT` (tokenized + stemmed + indexed for BM25). Uses the custom analyzer from §23/02 §3. |
-| `agent_id` | bytes | `STRING` (indexed for exact-match filter; not tokenized). |
+| `agent_id` | bytes | `INDEXED | STORED` (16-byte UUID; indexed for exact-match filter; not tokenized). |
 | `kind` | u64 | `INT` indexed for filter (memory kind enum). |
 | `created_at` | u64 | `INT` indexed; unix-ms epoch. Range queries supported. |
 
@@ -50,7 +50,7 @@ phase 22.5 + §23/02 §5 rely on the exact field set for filters.
 |---|---|---|
 | `statement_id` | u128 | `STORED` only — surfaces in `RankedItem.id`. |
 | `subject_name` | text | `TEXT` with the §23/02 §3 analyzer; lets queries match the subject's canonical entity name. |
-| `predicate_name` | bytes | `STRING` (exact match). The predicate's `name` field, not its u64 id — exact-id filters work via the same string. |
+| `predicate_name` | text | `STRING` (raw, untokenised text — exact match). The predicate's `name` field, not its u64 id — exact-id filters work via the same string. |
 | `predicate_id` | u64 | `INT` indexed for exact filter — alternative to `predicate_name` for downstream callers that already resolved the id. |
 | `object_text` | text | `TEXT` with the same analyzer. |
 | `kind` | u64 | `INT` indexed; statement kind (Fact / Preference / Event). |
