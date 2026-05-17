@@ -15,3 +15,4 @@ pub mod model_fingerprint;
 pub mod next_lsn;
 pub mod slot_version;
 pub mod text;
+pub mod worker_checkpoints;

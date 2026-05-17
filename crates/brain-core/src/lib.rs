@@ -18,6 +18,7 @@ pub mod error;
 pub mod ids;
 pub mod knowledge;
 pub mod memory;
+pub mod worker_state;
 
 pub use edge::{Edge, EdgeKind, EdgeOrigin};
 pub use error::{Error, Result};
@@ -31,3 +32,6 @@ pub use knowledge::{
     TypeConstraint,
 };
 pub use memory::{Memory, MemoryKind, Salience};
+pub use worker_state::{
+    BackfillId, BackfillProgress, BackfillRange, BackfillRequest, WorkerPriority,
+};

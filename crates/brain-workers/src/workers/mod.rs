@@ -2,6 +2,7 @@
 //! module here; the crate root re-exports the public surface.
 
 pub mod access_boost;
+pub mod backfill;
 pub mod cache_evict;
 pub mod consolidation;
 pub mod counter_reconcile;

@@ -21,6 +21,15 @@ pub enum WorkerKind {
     Statistics,
     EmbedderCacheEvict,
     Snapshot,
+    // Phase 24 — knowledge-layer workers.
+    Backfill,
+    ForgetCascade,
+    SchemaMigration,
+    SupersessionSweeper,
+    AuditLogSweeper,
+    LlmCacheSweeper,
+    StaleExtractionDetector,
+    EntityGc,
 }
 
 impl WorkerKind {
@@ -40,6 +49,14 @@ impl WorkerKind {
             Self::Statistics => "statistics",
             Self::EmbedderCacheEvict => "embedder_cache_evict",
             Self::Snapshot => "snapshot",
+            Self::Backfill => "backfill",
+            Self::ForgetCascade => "forget_cascade",
+            Self::SchemaMigration => "schema_migration",
+            Self::SupersessionSweeper => "supersession_sweeper",
+            Self::AuditLogSweeper => "audit_log_sweeper",
+            Self::LlmCacheSweeper => "llm_cache_sweeper",
+            Self::StaleExtractionDetector => "stale_extraction_detector",
+            Self::EntityGc => "entity_gc",
         }
     }
 }
@@ -79,6 +96,16 @@ impl WorkerConfig {
             WorkerKind::Statistics => (true, Duration::from_secs(300), 1, 5_000),
             WorkerKind::EmbedderCacheEvict => (true, Duration::from_secs(60), 5_000, 2_000),
             WorkerKind::Snapshot => (false, Duration::from_secs(3600), 1, 300_000),
+            // Phase 24 — knowledge workers.
+            // Backfill is admin-triggered; the loop ticks fast when work is pending.
+            WorkerKind::Backfill => (true, Duration::from_secs(1), 256, 20_000),
+            WorkerKind::ForgetCascade => (true, Duration::from_secs(1), 256, 10_000),
+            WorkerKind::SchemaMigration => (true, Duration::from_secs(1), 128, 30_000),
+            WorkerKind::SupersessionSweeper => (true, Duration::from_secs(86400), 256, 30_000),
+            WorkerKind::AuditLogSweeper => (true, Duration::from_secs(86400), 1024, 30_000),
+            WorkerKind::LlmCacheSweeper => (true, Duration::from_secs(3600), 1024, 10_000),
+            WorkerKind::StaleExtractionDetector => (true, Duration::from_secs(3600), 512, 10_000),
+            WorkerKind::EntityGc => (false, Duration::from_secs(86400), 256, 30_000),
         };
         Self {
             enabled,
