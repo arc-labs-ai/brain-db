@@ -522,6 +522,7 @@ dependencies = [
 name = "brain-ops"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "blake3",
  "brain-core",
  "brain-embed",

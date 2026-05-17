@@ -1,21 +1,68 @@
-//! RECALL handler (sub-task 7.4 + 7.9 transactional read-lens).
+//! RECALL handler.
 //!
-//! Without `txn_id`: plan + execute against committed state.
-//! With `txn_id`: execute against committed state, then layer the
-//! txn buffer on top (read-your-writes). Tombstones from in-txn
-//! FORGET drop matching hits; pending in-txn ENCODEs are scored
-//! linearly against the cue vector and merged into the result.
+//! Routing (spec §28/08 §5):
+//!
+//! - When the per-shard [`SchemaGate`] is `true` and no txn is
+//!   attached, route through the hybrid query engine
+//!   (phase 23.6–23.7). Memory hits are projected back onto the
+//!   substrate's `MemoryResult` with `contributing_retrievers` and
+//!   `fused_score` populated.
+//! - Otherwise (no schema, or a transaction is in progress), run the
+//!   substrate vector recall and leave the new fields empty / zero.
+//!
+//! Transactional read-your-writes only applies on the substrate path
+//! (spec §09/08 §5). The hybrid path falls back to substrate when a
+//! txn is set; full hybrid-in-txn semantics are deferred past v1.
+//!
+//! Substrate path notes (originally sub-task 7.4 + 7.9): plan +
+//! execute against committed state, layer the txn buffer on top for
+//! read-your-writes, sort, filter, truncate.
 
-use brain_core::MemoryId;
+use std::collections::HashSet;
+
+use brain_core::{ContextId, MemoryId};
+use brain_index::RankedItemId;
+use brain_metadata::tables::memory::MEMORIES_TABLE;
+use brain_planner::knowledge::executor::{
+    execute as hybrid_execute, ExecutionError, HybridExecutorContext, QueryResult,
+};
+use brain_planner::knowledge::planner::{plan as hybrid_plan, PlanError};
+use brain_planner::knowledge::router::{QueryRequest as PlannerQueryRequest, RetrieverSelection};
 use brain_planner::{execute_recall, plan_recall_inner, RecallHit};
-use brain_protocol::request::RecallRequest;
+use brain_protocol::request::{MemoryKindWire, RecallRequest};
 use brain_protocol::response::{MemoryResult, RecallResponseFrame};
+use brain_protocol::responses::types::RetrieverNameWire;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
 use crate::txn::BufferedEncode;
 
 pub async fn handle_recall(
+    req: RecallRequest,
+    ctx: &OpsContext,
+) -> Result<RecallResponseFrame, OpError> {
+    if ctx.schema_gate.is_declared() && req.txn_id.is_none() {
+        match hybrid_recall(&req, ctx).await {
+            Ok(frame) => return Ok(frame),
+            Err(OpError::Internal(msg)) if msg.contains("MissingRetriever") => {
+                tracing::warn!(
+                    target: "brain_ops::recall",
+                    %msg,
+                    "hybrid recall fell back to substrate (retriever slot empty)",
+                );
+                // Fall through to substrate path.
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    substrate_recall(req, ctx).await
+}
+
+// ---------------------------------------------------------------------------
+// Substrate path (the pre-23.11 logic, refactored out unchanged).
+// ---------------------------------------------------------------------------
+
+async fn substrate_recall(
     req: RecallRequest,
     ctx: &OpsContext,
 ) -> Result<RecallResponseFrame, OpError> {
@@ -178,5 +225,227 @@ fn hit_to_wire(hit: RecallHit) -> MemoryResult {
         vector_offset: 0,
         vector_dim: 0,
         edges: None,
+        // Substrate path — no hybrid metadata.
+        contributing_retrievers: Vec::new(),
+        fused_score: 0.0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid path.
+// ---------------------------------------------------------------------------
+
+async fn hybrid_recall(
+    req: &RecallRequest,
+    ctx: &OpsContext,
+) -> Result<RecallResponseFrame, OpError> {
+    let planner_req = build_planner_request(req);
+
+    let plan = hybrid_plan(&planner_req).map_err(map_plan_error)?;
+    let exec_ctx = HybridExecutorContext {
+        semantic: ctx.semantic_retriever.clone(),
+        lexical: ctx.lexical_retriever.clone(),
+        graph: ctx.graph_retriever.clone(),
+        metadata: ctx.executor.metadata.clone(),
+    };
+    let result = hybrid_execute(&plan, &planner_req, &exec_ctx).map_err(map_execution_error)?;
+
+    let memory_results = project_memory_results(&result, req, ctx)?;
+    let cumulative_count = u32::try_from(memory_results.len()).unwrap_or(u32::MAX);
+
+    for r in &memory_results {
+        ctx.access_buffer.record(MemoryId::from_raw(r.memory_id));
+    }
+
+    Ok(RecallResponseFrame {
+        results: memory_results,
+        is_final: true,
+        cumulative_count,
+        estimated_remaining: None,
+    })
+}
+
+fn build_planner_request(req: &RecallRequest) -> PlannerQueryRequest {
+    PlannerQueryRequest {
+        text: Some(req.cue_text.clone()),
+        entity_anchor: None,
+        // RECALL doesn't filter by statement kind; the hybrid
+        // planner uses an empty filter to mean "any kind". Substrate
+        // post-filters (kind / context / salience) re-apply below.
+        kind_filter: Vec::new(),
+        predicate_filter: Vec::new(),
+        time_filter: None,
+        confidence_min: if req.confidence_threshold > 0.0 {
+            Some(req.confidence_threshold)
+        } else {
+            None
+        },
+        include_tombstoned: false,
+        include_superseded: false,
+        limit: req.top_k,
+        retrievers: RetrieverSelection::Auto,
+        fusion_config: None,
+    }
+}
+
+fn project_memory_results(
+    result: &QueryResult,
+    req: &RecallRequest,
+    ctx: &OpsContext,
+) -> Result<Vec<MemoryResult>, OpError> {
+    // Pre-extract substrate post-filters from the request — the
+    // fused list is small (≤ planner top_n), so we iterate once
+    // collecting only Memory hits.
+    let kind_filter: Option<HashSet<MemoryKindWire>> = req
+        .kind_filter
+        .as_ref()
+        .map(|v| v.iter().copied().collect());
+    let context_filter: Option<HashSet<u64>> = req
+        .context_filter
+        .as_ref()
+        .map(|v| v.iter().copied().collect());
+
+    let metadata_guard = ctx.executor.metadata.lock();
+    let rtxn = metadata_guard
+        .read_txn()
+        .map_err(|e| OpError::Internal(format!("hybrid recall read_txn: {e}")))?;
+    let table = rtxn
+        .open_table(MEMORIES_TABLE)
+        .map_err(|e| OpError::Internal(format!("hybrid recall open MEMORIES_TABLE: {e}")))?;
+
+    let mut out: Vec<MemoryResult> = Vec::with_capacity(result.items.len());
+    for fused in &result.items {
+        let RankedItemId::Memory(memory_id) = fused.id else {
+            continue;
+        };
+
+        let row = match table.get(&memory_id.to_be_bytes()) {
+            Ok(Some(guard)) => guard.value(),
+            Ok(None) => continue, // Tombstoned between fusion and projection — drop.
+            Err(e) => {
+                return Err(OpError::Internal(format!(
+                    "hybrid recall MEMORIES_TABLE get: {e}",
+                )));
+            }
+        };
+
+        if row.is_tombstoned() {
+            continue;
+        }
+
+        let kind = match row.kind() {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+        let wire_kind: MemoryKindWire = kind.into();
+        if let Some(allowed) = &kind_filter {
+            if !allowed.contains(&wire_kind) {
+                continue;
+            }
+        }
+        if let Some(allowed) = &context_filter {
+            if !allowed.contains(&row.context().raw()) {
+                continue;
+            }
+        }
+        if row.salience < req.salience_floor {
+            continue;
+        }
+        if let Some(bound) = req.age_bound_unix_nanos {
+            if row.created_at_unix_nanos < bound {
+                continue;
+            }
+        }
+
+        out.push(MemoryResult {
+            memory_id: memory_id.raw(),
+            text: String::new(),
+            similarity_score: fused.fused_score as f32,
+            confidence: fused.fused_score as f32,
+            salience: row.salience,
+            kind: wire_kind,
+            context_id: ContextId(row.context_id).into(),
+            created_at_unix_nanos: row.created_at_unix_nanos,
+            last_accessed_at_unix_nanos: row.last_accessed_at_unix_nanos,
+            vector_offset: 0,
+            vector_dim: 0,
+            edges: None,
+            contributing_retrievers: fused
+                .contributing
+                .iter()
+                .map(|c| retriever_to_wire_name(c.retriever))
+                .collect(),
+            fused_score: fused.fused_score as f32,
+        });
+
+        if out.len() == req.top_k as usize {
+            break;
+        }
+    }
+
+    Ok(out)
+}
+
+fn map_plan_error(e: PlanError) -> OpError {
+    match e {
+        PlanError::NoSignal => {
+            // RECALL always provides cue_text, so this branch is
+            // unreachable in practice. Still: surface a clear error
+            // rather than panicking.
+            OpError::InvalidRequest("recall: cue produced no retrievable signal".into())
+        }
+    }
+}
+
+fn map_execution_error(e: ExecutionError) -> OpError {
+    match e {
+        ExecutionError::MissingRetriever(r) => {
+            // `handle_recall` intercepts this and falls back to
+            // substrate — the encoded marker "MissingRetriever"
+            // here is what that match arm pattern-matches on.
+            OpError::Internal(format!(
+                "MissingRetriever({r:?}); hybrid retriever slot empty",
+            ))
+        }
+        ExecutionError::Filter(inner) => OpError::Internal(format!("hybrid filter: {inner}")),
+    }
+}
+
+/// Translate the planner's `Retriever` directly to the substrate
+/// `RetrieverNameWire`. Avoids round-tripping through the knowledge
+/// namespace's wire enum (which would require chained `From`s on
+/// foreign types, an orphan-rule violation).
+fn retriever_to_wire_name(r: brain_planner::knowledge::router::Retriever) -> RetrieverNameWire {
+    use brain_planner::knowledge::router::Retriever as R;
+    match r {
+        R::Semantic => RetrieverNameWire::Semantic,
+        R::Lexical => RetrieverNameWire::Lexical,
+        R::Graph => RetrieverNameWire::Graph,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brain_planner::knowledge::router::Retriever;
+
+    #[test]
+    fn retriever_to_wire_name_matches_each_variant() {
+        assert_eq!(
+            retriever_to_wire_name(Retriever::Semantic),
+            RetrieverNameWire::Semantic
+        );
+        assert_eq!(
+            retriever_to_wire_name(Retriever::Lexical),
+            RetrieverNameWire::Lexical
+        );
+        assert_eq!(
+            retriever_to_wire_name(Retriever::Graph),
+            RetrieverNameWire::Graph
+        );
     }
 }

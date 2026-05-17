@@ -2,7 +2,7 @@
 
 use rkyv::{Archive, Deserialize, Serialize};
 
-use super::types::{InferenceKind, PlanStatus, ReasonStatus, TransitionKind};
+use super::types::{InferenceKind, PlanStatus, ReasonStatus, RetrieverNameWire, TransitionKind};
 use crate::request::{EdgeKindWire, MemoryKindWire, WireContextId, WireMemoryId};
 
 /// Spec §08 §1 `ENCODE_RESP`. Same shape used for §08 §2
@@ -45,6 +45,14 @@ pub struct MemoryResult {
     pub vector_offset: u32,
     pub vector_dim: u16,
     pub edges: Option<Vec<EdgeView>>,
+    /// Retrievers that surfaced this memory. Empty on substrate-only
+    /// deployments and inside transactions; populated when the server
+    /// routes RECALL through the hybrid engine (spec §28/08 §5).
+    pub contributing_retrievers: Vec<RetrieverNameWire>,
+    /// Post-RRF fused rank score. `0.0` on substrate-only deployments
+    /// and inside transactions; positive when hybrid retrieval ran
+    /// (spec §28/08 §5).
+    pub fused_score: f32,
 }
 
 /// Spec §08 §3.

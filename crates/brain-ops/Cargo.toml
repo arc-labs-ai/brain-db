@@ -19,6 +19,7 @@ redb.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
+arc-swap.workspace = true
 blake3.workspace = true
 uuid.workspace = true
 tokio = { version = "1", features = ["sync", "time"] }

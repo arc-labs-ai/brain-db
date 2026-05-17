@@ -31,6 +31,7 @@ pub mod dispatch;
 pub mod error;
 pub mod idempotency;
 pub mod ops;
+pub mod schema_gate;
 pub mod txn_lens;
 
 // Module-level re-exports preserve `brain_ops::<op>::*` paths so
@@ -52,6 +53,7 @@ pub use ops::subscribe::{
 };
 pub use ops::txn::{TxnState, TxnStore};
 pub use ops::writer::RealWriterHandle;
+pub use schema_gate::SchemaGate;
 
 #[cfg(test)]
 mod tests {

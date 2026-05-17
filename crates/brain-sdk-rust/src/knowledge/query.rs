@@ -130,6 +130,17 @@ impl From<Retriever> for RetrieverWire {
     }
 }
 
+impl From<brain_protocol::responses::types::RetrieverNameWire> for Retriever {
+    fn from(w: brain_protocol::responses::types::RetrieverNameWire) -> Self {
+        use brain_protocol::responses::types::RetrieverNameWire as W;
+        match w {
+            W::Semantic => Self::Semantic,
+            W::Lexical => Self::Lexical,
+            W::Graph => Self::Graph,
+        }
+    }
+}
+
 /// Which retrievers the planner is allowed to run. [`Self::auto`] lets
 /// the router pick from the rules in `§24/00 §"Routing rules"`.
 /// [`Self::explicit`] forces a specific set (validated at construction).

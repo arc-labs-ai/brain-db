@@ -991,6 +991,21 @@ pub fn spawn_shard(
                 }
             });
 
+            // 23.11: seed the per-shard schema-declared gate from
+            // the metadata DB. Spec §28/08 §1. Initial value is
+            // computed under the existing metadata lock.
+            let schema_gate = {
+                let metadata_guard = metadata.lock();
+                brain_ops::SchemaGate::initial(&metadata_guard).unwrap_or_else(|err| {
+                    tracing::error!(
+                        target: "brain_server::shard",
+                        error = %err,
+                        "schema_gate seed failed; defaulting to substrate-only path",
+                    );
+                    brain_ops::SchemaGate::default()
+                })
+            };
+
             let ops = Arc::new(
                 OpsContext::new(executor_ctx)
                     .with_extractor_registry(extractor_registry)
@@ -1001,7 +1016,8 @@ pub fn spawn_shard(
                     .with_statement_text_dispatcher(statement_text_dispatcher_for_ops)
                     .with_lexical_retriever(lexical_retriever_for_ops)
                     .with_semantic_retriever(semantic_retriever_for_ops)
-                    .with_graph_retriever(graph_retriever_for_ops),
+                    .with_graph_retriever(graph_retriever_for_ops)
+                    .with_schema_gate(schema_gate),
             );
 
             // Spawn the per-shard fanout task: drains the in-process

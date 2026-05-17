@@ -102,7 +102,13 @@ pub async fn handle_schema_upload(
         (new_version, from_version)
     };
 
-    // 5. Emit event post-commit.
+    // 5. Flip the per-shard schema-declared gate. Spec §28/08 §1:
+    //    "The cutover is the redb commit, not the response
+    //    emission." Subsequent RECALL frames on this shard route
+    //    through the hybrid engine.
+    ctx.schema_gate.set_declared(true);
+
+    // 6. Emit event post-commit.
     emit_knowledge_event(
         ctx,
         EventType::SchemaUpdated,

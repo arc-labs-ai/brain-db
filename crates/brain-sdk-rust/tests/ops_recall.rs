@@ -22,6 +22,8 @@ fn mock_result(idx: u32, kind: MemoryKindWire) -> MemoryResult {
         vector_offset: 0,
         vector_dim: 0,
         edges: None,
+        contributing_retrievers: Vec::new(),
+        fused_score: 0.0,
     }
 }
 

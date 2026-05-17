@@ -18,6 +18,39 @@ pub enum TransitionKind {
     Other(String),
 }
 
+// Bridge from the knowledge namespace's hybrid-query retriever
+// enum to the substrate response field. Lives here so the
+// substrate response module stays free of knowledge-namespace
+// imports beyond this single conversion.
+impl From<crate::knowledge::RetrieverWire> for RetrieverNameWire {
+    fn from(w: crate::knowledge::RetrieverWire) -> Self {
+        match w {
+            crate::knowledge::RetrieverWire::Semantic => Self::Semantic,
+            crate::knowledge::RetrieverWire::Lexical => Self::Lexical,
+            crate::knowledge::RetrieverWire::Graph => Self::Graph,
+        }
+    }
+}
+
+/// Spec §28/08 §5 — names the retriever family that surfaced a
+/// memory in a `MemoryResult`. Populated when the substrate
+/// `RECALL_REQ` routes through the hybrid query engine
+/// (schema-declared deployments).
+///
+/// This is a substrate-side wire enum. The knowledge namespace
+/// has its own `RetrieverWire` for hybrid-query opcodes;
+/// `From<RetrieverWire>` bridges the two so the substrate
+/// response type doesn't depend on the knowledge namespace.
+#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+#[repr(u8)]
+pub enum RetrieverNameWire {
+    Semantic = 0,
+    Lexical = 1,
+    Graph = 2,
+}
+
 /// Spec §08 §4 — `PlanResponseFrame::PlanStatus` (set on the final frame
 /// only).
 #[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]

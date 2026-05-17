@@ -22,6 +22,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::access_buffer::AccessBuffer;
 use crate::ops::text_indexer::{MemoryTextDispatcher, StatementTextDispatcher};
+use crate::schema_gate::SchemaGate;
 use crate::subscribe::{EventBus, SubscriptionRegistry};
 use crate::txn::TxnStore;
 
@@ -96,6 +97,11 @@ pub struct OpsContext {
     /// hybrid query consumes this slot alongside the lexical
     /// + semantic retrievers.
     pub graph_retriever: Option<Arc<dyn GraphRetriever>>,
+    /// Schema-declared gate (phase 23.11). Lock-free read on
+    /// the RECALL hot path; flipped to `true` by
+    /// `handle_schema_upload` after a successful commit. Spec
+    /// §28/08 §1.
+    pub schema_gate: SchemaGate,
 }
 
 impl OpsContext {
@@ -120,6 +126,7 @@ impl OpsContext {
             lexical_retriever: None,
             semantic_retriever: None,
             graph_retriever: None,
+            schema_gate: SchemaGate::default(),
         }
     }
 
@@ -250,6 +257,15 @@ impl OpsContext {
     #[must_use]
     pub fn with_graph_retriever(mut self, retriever: Option<Arc<dyn GraphRetriever>>) -> Self {
         self.graph_retriever = retriever;
+        self
+    }
+
+    /// Install the schema-declared gate (phase 23.11). The
+    /// server's per-shard spawn path seeds this from the
+    /// metadata DB at startup.
+    #[must_use]
+    pub fn with_schema_gate(mut self, gate: SchemaGate) -> Self {
+        self.schema_gate = gate;
         self
     }
 }
