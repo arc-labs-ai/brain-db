@@ -9,6 +9,7 @@ pub mod forget;
 pub mod graph_retriever;
 pub mod knowledge_entity;
 pub mod knowledge_extractor;
+pub mod knowledge_query;
 pub mod knowledge_relation;
 pub mod knowledge_schema;
 pub mod knowledge_statement;

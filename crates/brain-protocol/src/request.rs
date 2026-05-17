@@ -129,6 +129,12 @@ pub enum RequestBody {
     ExtractorList(crate::knowledge::ExtractorListRequest),
     ExtractorDisable(crate::knowledge::ExtractorDisableRequest),
     ExtractorEnable(crate::knowledge::ExtractorEnableRequest),
+
+    // Hybrid query ops (phase 23.9). Spec §28/04 + §24.
+    Query(crate::knowledge::QueryRequest),
+    QueryExplain(crate::knowledge::QueryExplainRequest),
+    QueryTrace(crate::knowledge::QueryTraceRequest),
+    RecallHybrid(crate::knowledge::RecallHybridRequest),
 }
 
 impl RequestBody {
@@ -195,6 +201,10 @@ impl RequestBody {
             Self::ExtractorList(_) => Opcode::ExtractorListReq,
             Self::ExtractorDisable(_) => Opcode::ExtractorDisableReq,
             Self::ExtractorEnable(_) => Opcode::ExtractorEnableReq,
+            Self::Query(_) => Opcode::QueryReq,
+            Self::QueryExplain(_) => Opcode::QueryExplainReq,
+            Self::QueryTrace(_) => Opcode::QueryTraceReq,
+            Self::RecallHybrid(_) => Opcode::RecallHybridReq,
         }
     }
 
@@ -263,6 +273,10 @@ impl RequestBody {
             Self::ExtractorList(r) => to_rkyv_bytes(r),
             Self::ExtractorDisable(r) => to_rkyv_bytes(r),
             Self::ExtractorEnable(r) => to_rkyv_bytes(r),
+            Self::Query(r) => to_rkyv_bytes(r),
+            Self::QueryExplain(r) => to_rkyv_bytes(r),
+            Self::QueryTrace(r) => to_rkyv_bytes(r),
+            Self::RecallHybrid(r) => to_rkyv_bytes(r),
         }
     }
 
@@ -332,6 +346,10 @@ impl RequestBody {
             Opcode::ExtractorListReq => Self::ExtractorList(from_rkyv_bytes(bytes)?),
             Opcode::ExtractorDisableReq => Self::ExtractorDisable(from_rkyv_bytes(bytes)?),
             Opcode::ExtractorEnableReq => Self::ExtractorEnable(from_rkyv_bytes(bytes)?),
+            Opcode::QueryReq => Self::Query(from_rkyv_bytes(bytes)?),
+            Opcode::QueryExplainReq => Self::QueryExplain(from_rkyv_bytes(bytes)?),
+            Opcode::QueryTraceReq => Self::QueryTrace(from_rkyv_bytes(bytes)?),
+            Opcode::RecallHybridReq => Self::RecallHybrid(from_rkyv_bytes(bytes)?),
             other => return Err(ProtocolError::UnknownOpcode(other.as_u16())),
         })
     }

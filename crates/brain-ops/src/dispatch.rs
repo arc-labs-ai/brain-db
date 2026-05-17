@@ -179,18 +179,14 @@ pub async fn dispatch(req: RequestBody, ctx: &OpsContext) -> Result<ResponseBody
                 .await
                 .map(ResponseBody::StatementHistory)
         }
-        RequestBody::StatementList(r) => {
-            crate::knowledge_statement::handle_statement_list(r, ctx)
-                .await
-                .map(ResponseBody::StatementList)
-        }
+        RequestBody::StatementList(r) => crate::knowledge_statement::handle_statement_list(r, ctx)
+            .await
+            .map(ResponseBody::StatementList),
 
         // Relation ops — phase 18.7. Spec §28/07.
-        RequestBody::RelationCreate(r) => {
-            crate::knowledge_relation::handle_relation_create(r, ctx)
-                .await
-                .map(ResponseBody::RelationCreate)
-        }
+        RequestBody::RelationCreate(r) => crate::knowledge_relation::handle_relation_create(r, ctx)
+            .await
+            .map(ResponseBody::RelationCreate),
         RequestBody::RelationGet(r) => crate::knowledge_relation::handle_relation_get(r, ctx)
             .await
             .map(ResponseBody::RelationGet),
@@ -221,11 +217,9 @@ pub async fn dispatch(req: RequestBody, ctx: &OpsContext) -> Result<ResponseBody
         }
 
         // Schema ops — phase 19.6. Spec §28/05.
-        RequestBody::SchemaUpload(r) => {
-            crate::knowledge_schema::handle_schema_upload(r, ctx)
-                .await
-                .map(ResponseBody::SchemaUpload)
-        }
+        RequestBody::SchemaUpload(r) => crate::knowledge_schema::handle_schema_upload(r, ctx)
+            .await
+            .map(ResponseBody::SchemaUpload),
         RequestBody::SchemaGet(r) => crate::knowledge_schema::handle_schema_get(r, ctx)
             .await
             .map(ResponseBody::SchemaGet),
@@ -237,11 +231,9 @@ pub async fn dispatch(req: RequestBody, ctx: &OpsContext) -> Result<ResponseBody
             .map(ResponseBody::SchemaValidate),
 
         // Extractor governance ops — phase 20.8. Spec §28/05 §6-§7.
-        RequestBody::ExtractorList(r) => {
-            crate::knowledge_extractor::handle_extractor_list(r, ctx)
-                .await
-                .map(ResponseBody::ExtractorList)
-        }
+        RequestBody::ExtractorList(r) => crate::knowledge_extractor::handle_extractor_list(r, ctx)
+            .await
+            .map(ResponseBody::ExtractorList),
         RequestBody::ExtractorDisable(r) => {
             crate::knowledge_extractor::handle_extractor_disable(r, ctx)
                 .await
@@ -252,5 +244,19 @@ pub async fn dispatch(req: RequestBody, ctx: &OpsContext) -> Result<ResponseBody
                 .await
                 .map(ResponseBody::ExtractorEnable)
         }
+
+        // Hybrid query ops — phase 23.9. Spec §24 + §28/04.
+        RequestBody::Query(r) => crate::knowledge_query::handle_query(r, ctx)
+            .await
+            .map(ResponseBody::Query),
+        RequestBody::QueryExplain(r) => crate::knowledge_query::handle_query_explain(r, ctx)
+            .await
+            .map(ResponseBody::QueryExplain),
+        RequestBody::QueryTrace(r) => crate::knowledge_query::handle_query_trace(r, ctx)
+            .await
+            .map(ResponseBody::QueryTrace),
+        RequestBody::RecallHybrid(r) => crate::knowledge_query::handle_recall_hybrid(r, ctx)
+            .await
+            .map(ResponseBody::RecallHybrid),
     }
 }

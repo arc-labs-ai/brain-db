@@ -180,6 +180,16 @@ pub enum Opcode {
     RelationListToResp = 0x01D5,
     RelationTraverseReq = 0x0156,
     RelationTraverseResp = 0x01D6,
+
+    // §28 hybrid query operations (0x0160-0x0163) — phase 23.9.
+    QueryReq = 0x0160,
+    QueryResp = 0x01E0,
+    QueryExplainReq = 0x0161,
+    QueryExplainResp = 0x01E1,
+    QueryTraceReq = 0x0162,
+    QueryTraceResp = 0x01E2,
+    RecallHybridReq = 0x0163,
+    RecallHybridResp = 0x01E3,
 }
 
 impl Opcode {
@@ -304,6 +314,15 @@ impl Opcode {
             0x01D5 => Self::RelationListToResp,
             0x0156 => Self::RelationTraverseReq,
             0x01D6 => Self::RelationTraverseResp,
+
+            0x0160 => Self::QueryReq,
+            0x01E0 => Self::QueryResp,
+            0x0161 => Self::QueryExplainReq,
+            0x01E1 => Self::QueryExplainResp,
+            0x0162 => Self::QueryTraceReq,
+            0x01E2 => Self::QueryTraceResp,
+            0x0163 => Self::RecallHybridReq,
+            0x01E3 => Self::RecallHybridResp,
 
             0x0120 => Self::SchemaUploadReq,
             0x01A0 => Self::SchemaUploadResp,

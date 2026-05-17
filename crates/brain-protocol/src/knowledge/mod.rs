@@ -18,6 +18,7 @@ pub mod entity_resp;
 pub mod events;
 pub mod extractor_req;
 pub mod extractor_resp;
+pub mod query;
 pub mod relation_req;
 pub mod relation_resp;
 pub mod schema_req;
@@ -41,6 +42,17 @@ pub use events::{
     KnowledgeEventPayload, RelationCreatedEvent, RelationSupersededEvent, RelationTombstonedEvent,
     SchemaUpdatedEvent, StatementCreatedEvent, StatementSupersededEvent, StatementTombstonedEvent,
 };
+pub use extractor_req::{ExtractorDisableRequest, ExtractorEnableRequest, ExtractorListRequest};
+pub use extractor_resp::{
+    ExtractorDisableResponse, ExtractorEnableResponse, ExtractorListItem,
+    ExtractorListResponseFrame,
+};
+pub use query::{
+    FusionConfigWire, ItemIdWire, MemoryHit, QueryExplainRequest, QueryExplainResponse,
+    QueryRequest, QueryResponse, QueryResultItem, QueryTraceRequest, QueryTraceResponse,
+    RecallHybridRequest, RecallHybridResponse, RetrieverContributionWire, RetrieverOutcomeWire,
+    RetrieverSelectionWire, RetrieverWire, TimeRangeWire,
+};
 pub use relation_req::{
     RelationCreateRequest, RelationGetRequest, RelationListFromRequest, RelationListToRequest,
     RelationSupersedeRequest, RelationTombstoneRequest, RelationTraverseRequest,
@@ -50,13 +62,6 @@ pub use relation_resp::{
     RelationListFromResponseFrame, RelationListToResponseFrame, RelationSupersedeResponse,
     RelationTombstoneResponse, RelationTraverseResponseFrame, RelationView, RelationWireError,
     TraversalPathWire, TraversalStepWire,
-};
-pub use extractor_req::{
-    ExtractorDisableRequest, ExtractorEnableRequest, ExtractorListRequest,
-};
-pub use extractor_resp::{
-    ExtractorDisableResponse, ExtractorEnableResponse, ExtractorListItem,
-    ExtractorListResponseFrame,
 };
 pub use schema_req::{
     SchemaGetRequest, SchemaListRequest, SchemaUploadRequest, SchemaValidateRequest,
@@ -71,10 +76,9 @@ pub use statement_req::{
     StatementSupersedeRequest, StatementTombstoneRequest, StatementValueWire,
 };
 pub use statement_resp::{
-    evidence_ref_from_wire, evidence_ref_to_wire, statement_kind_from_wire,
-    statement_kind_to_wire, statement_object_from_wire, statement_object_to_wire,
-    statement_value_from_wire, statement_value_to_wire, StatementCreateResponse,
-    StatementGetResponse, StatementHistoryResponseFrame, StatementListResponseFrame,
-    StatementRetractResponse, StatementSupersedeResponse, StatementTombstoneResponse,
-    StatementView, WireToStatementError,
+    evidence_ref_from_wire, evidence_ref_to_wire, statement_kind_from_wire, statement_kind_to_wire,
+    statement_object_from_wire, statement_object_to_wire, statement_value_from_wire,
+    statement_value_to_wire, StatementCreateResponse, StatementGetResponse,
+    StatementHistoryResponseFrame, StatementListResponseFrame, StatementRetractResponse,
+    StatementSupersedeResponse, StatementTombstoneResponse, StatementView, WireToStatementError,
 };
