@@ -7,4 +7,5 @@
 
 pub mod filters;
 pub mod fusion;
+pub mod planner;
 pub mod router;
