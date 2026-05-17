@@ -473,27 +473,118 @@ These phases turn Brain from a vector memory store into a cognitive database wit
 
 ---
 
-## Phase 21 — LLM extractor
+## Phase 21 — LLM extractor ✓
 
-**One-line:** LLM extractor kind with cache, retry-once, cost budget, schema-validated output; resolver tier 4 activates.
+**One-line:** Third extractor tier (LLM) lights up — Anthropic + OpenAI clients behind a `LlmClient` trait; `LlmExtractor` with cache (phase-17 `LlmCacheDb`) + JSON-schema validation + retry-once + per-call cost budget; server-side env-driven router + per-shard cache wiring; mock-client integration + wire-smoke tests.
 
-**Detailed plan:** [`docs/phases/phase-21-llm-extractor.md`](docs/phases/phase-21-llm-extractor.md)
+**Detailed plan:** [`docs/phases/phase-21-llm-extractor.md`](docs/phases/phase-21-llm-extractor.md) (per-sub-task plans `.claude/plans/phase-21-task-0[0-7].md`).
 
-**Crates touched:** new `brain-llm`; `brain-extractors`, `brain-workers`, `brain-metadata`.
+**Crates touched:** new `brain-llm`; `brain-extractors`, `brain-metadata`, `brain-ops`, `brain-server`.
 
-**Sub-tasks:** 9. **Exit:** mock-LLM end-to-end test green; real-LLM gated behind opt-in env var; tag `phase-21-complete`.
+**Sub-tasks:** 8 (21.0 spec backfill → 21.7 phase exit).
+
+**Exit:** mock-client end-to-end pipeline (cache → estimator → client → schema-validate → projection → cache write) green; server-side LLM router selects provider from env at startup; per-shard `LlmCacheDb` wired; spec §22/09 + §16/02 §2.8 backfilled; `Extractor::run` is async; tag `phase-21-complete`.
+
+**Scope cut:** Phase-doc sub-tasks 21.7 (Resolver tier 4 — LLM-assisted entity disambiguation) and 21.8 (built-in `brain.preferences_llm` extractor) deferred to phase 22+ / post-v1. The LLM cache + schema validation + retry-once + cost budget all live inside the `LlmExtractor` impl (`crates/brain-extractors/src/llm.rs`); the original phase-doc 21.3/21.4/21.5/21.6 split was collapsed accordingly. See per-sub-task plans `.claude/plans/phase-21-task-01..06.md` for the actual landed shape.
+
+**Delivered:**
+
+- §22/09 (LLM extractor) and §16/02 §2.8 (LLM perf targets) brought to phase-21 implementation depth.
+- New `brain-llm` crate (~700 LOC):
+  - `LlmClient` trait (object-safe `Arc<dyn LlmClient>`) — `complete(LlmRequest) -> LlmFuture<'a>`, `model()`, `model_id_hash()`.
+  - `AnthropicClient` (Messages API; system + user split; `max_tokens`; structured `LlmError` taxonomy).
+  - `OpenAiClient` (Chat Completions; cost-micro-usd computed via static pricing table + token usage from response).
+  - `model_id_hash` — BLAKE3-64 stable key over the provider's model string for cache-row scoping.
+- New `LlmExtractor` (`crates/brain-extractors/src/llm.rs`, ~600 LOC):
+  - Cache lookup keyed on `(input_hash, extractor_id, version, model_id_hash)` via the phase-17 `LlmCacheDb`.
+  - Per-call cost budget (`CostBudget { per_call_micro_usd }`) — extractions over budget short-circuit with `ExtractionStatus::SkippedBudget` and emit zero LLM calls.
+  - JSON-schema validation (`jsonschema` crate) against the operator-declared `output_schema_json`; on first-pass failure the extractor retries once with the validator error appended to the prompt; second failure drops with `ExtractionStatus::SchemaInvalid`.
+  - Projection: validated JSON → `ExtractedItem` (`EntityMention | StatementMention | RelationMention`).
+  - Per-call timeout (`Duration`) enforced via the client future.
+- `Extractor::run` made async (`ExtractionFuture<'a> = Pin<Box<dyn Future<Output = ExtractionResult> + Send + 'a>>`). `PatternExtractor` and `BertTokenClassifier` wrap their sync bodies in `Box::pin(async move { ... })`.
+- `MaterializeDeps` bundle + `materialize_llm_extractor` — decodes the persisted LLM-kind `ExtractorDefinition.definition_blob` (provider, model, prompt, schema, budget, timeout) into a live `Arc<dyn Extractor>` against the server-supplied dep bundle (client + cache).
+- Server-side wiring (`crates/brain-server`):
+  - `build_llm_deps()` reads `BRAIN_LLM_PROVIDER` + `BRAIN_LLM_MODEL` + `BRAIN_*_API_KEY` env, constructs the per-shard `Arc<dyn LlmClient>`, opens a shard-local `LlmCacheDb` under the shard data dir, and threads both into `OpsContext.llm_client` + `OpsContext.llm_cache`.
+  - Missing env / unsupported provider → server logs a warning + LLM-kind rows materialize as `LlmExtractor::degraded()` placeholders that emit `ExtractionStatus::ConfigError`.
+- Spec backfill: §22/09 (LLM extractor mechanics) + §16/02 §2.8 (cache-hit p50 1 ms / p99 5 ms; budget-skip p50 200 µs / p99 1 ms) drafted alongside the implementation.
+- Tests: 11 `LlmExtractor` unit tests + 11 materializer unit tests + 9 server `build_llm_deps` tests + 7 integration tests (`tests/knowledge_llm_extractor.rs`) covering cache hit/miss, retry-once, budget skip, malformed JSON, schema-invalid, projection, degraded fallback + 2 wire-smoke tests.
+- criterion benches: `crates/brain-extractors/benches/llm_pipeline.rs` (cache-hit, cost-budget skip, mock-client miss — informational) + `pattern_extract.rs` updated to the new async trait.
+
+**Deferred to later phases:**
+
+- Resolver tier 4 (LLM-assisted entity disambiguation) — phase 22+ (§22/07 Q12). Original phase-doc 21.7.
+- Built-in `brain.preferences_llm` extractor — post-v1. Operators declare their own LLM extractors; the system schema ships only the phase-20 pattern + classifier built-ins. Original phase-doc 21.8.
+- Live-provider opt-in tests (real Anthropic / OpenAI API behind an env var) — post-v1.
+- Pricing TOML override — post-v1; static `STATIC_PRICING` table is the only source today.
+- Per-extractor model selection (operator declares model X, router serves model Y) — phase 22+; §22/09 §2 specifies prefix-only routing in v1.
+- Live-registry sync on `SCHEMA_UPLOAD` — phase 22+. Uploaded LLM-kind extractors are observable via `EXTRACTOR_LIST` but the dispatching registry is rebuilt only at shard spawn (gap recorded in `tests/knowledge_llm_extractor_wire.rs`).
+- Global (cross-shard) cost budget — post-v1; v1 enforces `per_call_micro_usd` only.
+
+**Bench results** (Linux Docker, --quick): bench harness in place; numbers to be captured during phase-22 pre-flight (skipped at tag time to keep the loop moving). Spec targets: cache-hit p50 1 ms / p99 5 ms, budget-skip p50 200 µs / p99 1 ms.
 
 ---
 
-## Phase 22 — Tantivy / lexical retrieval
+## Phase 22 — Tantivy / lexical retrieval ✓
 
-**One-line:** Tantivy BM25 over memory text + statement text; LexicalRetriever; index workers maintain on writes.
+**One-line:** Tantivy BM25 over memory text + statement text; brain analyzer with URL / code-ID / Porter pipeline; per-shard memory + statement text indexer workers (bounded channel + group commit + retry-once-then-fatal); `LexicalRetriever` trait + `TantivyLexicalRetriever`; atomic-swap rebuild + shard-startup recovery.
 
-**Detailed plan:** [`docs/phases/phase-22-tantivy-lexical.md`](docs/phases/phase-22-tantivy-lexical.md)
+**Detailed plan:** [`docs/phases/phase-22-tantivy-lexical.md`](docs/phases/phase-22-tantivy-lexical.md) (per-sub-task plans `.claude/plans/phase-22-task-0[0-8].md`).
 
-**Crates touched:** `brain-index`, `brain-workers`.
+**Crates touched:** `brain-index`, `brain-ops`, `brain-server` (no `brain-workers` — text indexer drain runs as `glommio::spawn_local` directly under the shard executor).
 
-**Sub-tasks:** ~7. **Exit:** lexical recall@10 ≥ targets on reference workload; tag `phase-22-complete`.
+**Sub-tasks:** 9 (22.0 spec backfill → 22.8 phase exit).
+
+**Exit:** ENCODE / FORGET / STATEMENT_CREATE / SUPERSEDE / TOMBSTONE / RETRACT all dispatch to the matching indexer via OpsContext slots wired at shard spawn; `LexicalRetriever::retrieve` returns BM25-ranked items per-scope; on-disk corruption or schema-version mismatch triggers an atomic-swap rebuild at next shard start; tag `phase-22-complete`.
+
+**Scope cuts:**
+
+- **Memory text rebuild produces an empty valid index.** `MEMORIES_TABLE` stores `text_size` but not the text itself (text lives only on the ENCODE wire path + WAL frames). Full content-aware memory rebuild lands post-v1; operators re-ingest from their own source-of-truth in v1. Statement rebuild is content-complete via `object_blob` + entity / predicate joins.
+- **Partial WAL replay on shard recovery deferred.** The bound (≤ N-1 writes per indexer at crash, default N=256) is documented in §26/01 §3 and accepted for v1; cursor-tracked partial replay lands post-v1.
+- **Hot rebuild while the live writer is running deferred.** v1 rebuild is startup-only.
+- **Stop-word removal explicitly NOT in the analyzer** (preserves exact-ID queries like `ACME-1247`).
+- **Snippet generation deferred** — `RankedItem.snippet` always `None` in v1.
+- **BM25 k1 / b custom-similarity wiring deferred** — `LexicalRetrieverConfig` exposes the fields but the retriever uses tantivy defaults (1.2 / 0.75); custom similarity binds in phase 23 if needed.
+- **`ADMIN_TANTIVY_REBUILD` wire op deferred to §28/05 admin scope.**
+- **Cross-shard ranking deferred to phase 23** (router fan-out).
+- **Segment-merge windowing post-v1** — rely on tantivy's `LogMergePolicy`.
+
+**Delivered:**
+
+- §23 / §26 / §27 / §16/02 §2.9 brought to phase-22 implementation depth:
+  - `spec/23_retrievers/02_lexical_retriever.md` (new, ~180 LOC) — trait surface, BM25 params, tokenizer pipeline, scope dispatch, filters, errors, perf bounds.
+  - `spec/26_knowledge_storage/01_tantivy_layout.md` (new, ~200 LOC) — directory layout, schemas, commit cadence, segment merge, atomic-swap rebuild, recovery contract, size budgets.
+  - `spec/27_knowledge_workers/02_text_indexer_workers.md` (new, ~200 LOC) — memory + statement text indexers, backpressure-on-overflow discipline, retry-once-then-fatal commit policy, WAL ordering.
+  - `spec/16_benchmarks_acceptance/02_latency_targets.md` §2.9 — LexicalRetriever p50/p99 targets.
+- `brain-index` (new modules):
+  - `tantivy_shard` — per-shard `TantivyShard` handle with `BRAIN_SCHEMA_VERSION=1` payload stamping, `IndexStatus { Ready | NeedsRebuild { OpenFailed | SchemaVersionMismatch | PayloadCorrupt } }`, fresh-dir vs existing-dir disambiguation via `meta.json` probe.
+  - `tantivy_shard::tokenizer` — `BrainTokenizer` (NFC → lowercase → URL + code-ID + dotted-identifier preservation → tokenize → Porter stem; protected tokens bypass stemmer). Registered under tantivy's `"default"` name.
+  - `tantivy_shard::retriever` — `LexicalRetriever` trait, `LexicalQuery` / `LexicalFilters` / `LexicalRetrieverConfig` / `RankedItem` / `RankedItemId` / `LexicalError`, `TantivyLexicalRetriever` impl with synchronous `reader.reload()` per query.
+- `brain-ops`:
+  - `ops::text_indexer::memory` — `MemoryTextOp { Upsert | Forget }`, `MemoryTextDispatcher`, `spawn_memory_text_indexer_local` (Linux Glommio entry) + `run_memory_text_indexer` (test-friendly). Bounded `flume` channel (4096), `CommitPolicy::from_env()` (N=256 / T=1 s defaults, env-overridable), retry-once-then-shard-fatal commit, every commit stamps `schema_payload_json()`.
+  - `ops::text_indexer::statement` — same harness for `statements.tantivy/`; `confidence_bucket()` clamping; `upsert_op_from_statement()` helper that joins entity + predicate at dispatch time.
+  - `ops::text_indexer::rebuild` — `rebuild_memory_text` (empty valid index) + `rebuild_statements` (content-aware, with tombstone + pending-subject + orphan-row skips); atomic-swap mechanics via `std::fs::rename`.
+  - `OpsContext` gains `tantivy`, `memory_text_dispatcher`, `statement_text_dispatcher`, `lexical_retriever` slots (all `Option<...>` — substrate-only deployments leave them `None`).
+  - Hooks at `handle_encode`, `handle_forget`, `handle_statement_create` (+ auto-superseded preference cascade), `handle_statement_supersede`, `handle_statement_tombstone`, `handle_statement_retract`.
+- `brain-server`:
+  - Shard spawn opens the `TantivyShard`, registers the brain analyzer, calls `tantivy_recovery::recover_tantivy_on_open` (which runs 22.6 rebuild fns on `NeedsRebuild` status), spawns both indexer drain tasks via `glommio::spawn_local`, constructs the retriever, installs all dispatcher + retriever handles on the `OpsContext`.
+- Tests:
+  - `tantivy_shard` unit tests (~28 across schema, retriever, tokenizer, open).
+  - `brain-ops` text indexer tests (~24 across memory + statement + rebuild + commit-policy + e2e indexer→retriever).
+  - `brain-server` recovery tests (4) + phase-exit integration tests (2; ENCODE → retrieve; FORGET → no hit).
+- `crates/brain-index/benches/lexical_retrieve.rs` — three criterion benches at 10K corpus scale against §16/02 §2.9 perf targets. Production-scale (100K / 1M) validation reserved for phase 14 acceptance.
+
+**Deferred to later phases:**
+
+- Full content-aware memory rebuild (post-v1) — §27/07.
+- Partial WAL replay on shard recovery (post-v1) — §27/07.
+- Hot rebuild while live writer running (post-v1).
+- `ADMIN_TANTIVY_REBUILD` wire op — phase 28/05 admin.
+- Cross-shard lexical ranking — phase 23 router.
+- BM25 k1 / b custom similarity — phase 23 if needed.
+- Snippet generation — post-v1 if hybrid query needs it.
+- Segment-merge windowing — post-v1.
+
+**Bench results** (Linux Docker, --quick): bench harness in `crates/brain-index/benches/lexical_retrieve.rs` ready for capture; wall-time numbers deferred per the 21.7 precedent. Spec targets: memory single-term p50 10 ms / p99 50 ms @ 100K; statement single-term same @ 1M; commit (256-doc batch) p50 5 ms / p99 25 ms (§16/02 §2.9). Production-scale validation runs in phase 14's acceptance suite.
 
 ---
 

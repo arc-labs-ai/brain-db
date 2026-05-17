@@ -52,6 +52,8 @@
 #![allow(clippy::await_holding_refcell_ref)]
 
 pub mod adapters;
+pub mod llm_setup;
+pub mod tantivy_recovery;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -796,6 +798,9 @@ pub fn spawn_shard(
     let arena_path_for_executor = arena_path.clone();
     let metadata_path_for_executor = metadata_path.clone();
     let snapshots_root_for_executor = dir.join("snapshots");
+    // 21.5: the shard dir is also home to the per-shard LLM
+    // extractor response cache (`<shard_dir>/llm_cache.redb`).
+    let shard_dir_for_executor = dir.clone();
     let join_handle = LocalExecutorBuilder::new(placement)
         .name(&format!("brain-shard-{shard_id}"))
         .spawn(move || async move {
@@ -814,21 +819,68 @@ pub fn spawn_shard(
             // Phase 20.7: materialise the persisted `EXTRACTORS_TABLE`
             // rows (seeded by the system-schema bootstrap at
             // MetadataDb::open) into a runtime ExtractorRegistry.
-            // The classifier model is unloaded in phase 20.7;
-            // operator-provided weights via BRAIN_NER_MODEL_PATH
-            // are wired in phase 20.7b.
+            //
+            // Phase 21.5 lights up the LLM-tier deps the materializer
+            // needs: `ModelRouter` from env (ANTHROPIC_API_KEY /
+            // OPENAI_API_KEY) and the per-shard `llm_cache.redb`.
+            // Both slots default to `None` so substrate-only
+            // deployments stay unchanged.
+            let llm_deps = llm_setup::build_llm_deps(&shard_dir_for_executor);
+            let llm_cache_for_ops = llm_deps.cache.clone();
+
+            // 22.1 + 22.7: open the per-shard tantivy indexes
+            // (`memory_text.tantivy/` + `statements.tantivy/`)
+            // and honour any `IndexStatus::NeedsRebuild` arms by
+            // calling the 22.6 rebuild functions before the
+            // indexer workers start. See spec §26/01 §6.
+            // Recovery failures abort shard spawn — a shard with
+            // unrecoverable lexical indexes shouldn't accept
+            // reads.
+            let tantivy_for_ops = match brain_index::TantivyShard::open(&shard_dir_for_executor) {
+                Ok(startup) => {
+                    let db_guard = metadata.lock();
+                    match crate::shard::tantivy_recovery::recover_tantivy_on_open(
+                        &shard_dir_for_executor,
+                        &*db_guard,
+                        startup,
+                    ) {
+                        Ok(shard) => Some(shard),
+                        Err(err) => {
+                            tracing::error!(
+                                target: "brain_server::shard",
+                                error = %err,
+                                "tantivy recovery failed; lexical retrieval unavailable",
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(
+                        target: "brain_server::shard",
+                        error = %err,
+                        "TantivyShard::open failed; lexical retrieval unavailable for this shard",
+                    );
+                    None
+                }
+            };
+
             let extractor_registry = {
                 let db_guard = metadata.lock();
                 let rtxn = db_guard
                     .read_txn()
                     .expect("read_txn after MetadataDb::open");
-                let defs = brain_metadata::extractor_list(&rtxn)
-                    .expect("extractor_list at shard startup");
+                let defs =
+                    brain_metadata::extractor_list(&rtxn).expect("extractor_list at shard startup");
                 drop(rtxn);
                 drop(db_guard);
 
+                // Classifier model wiring lives in 20.7b — `None`
+                // here keeps the existing degraded-classifier
+                // behaviour intact. 21.5 only fills the LLM slots.
+                let materialize_deps = llm_deps.into_materialize_deps(None);
                 let (reg, errors) =
-                    brain_extractors::build_registry_from_definitions(&defs, None);
+                    brain_extractors::build_registry_from_definitions(&defs, &materialize_deps);
                 for (id, err) in errors {
                     tracing::warn!(
                         target: "brain_server::shard",
@@ -845,10 +897,89 @@ pub fn spawn_shard(
                 Err(_) => brain_extractors::ClassifierConfig::unloaded(),
             };
 
+            // 22.3 + 22.4: spawn the per-shard text indexer drain
+            // tasks and install their dispatchers in OpsContext.
+            // Substrate-only deployments (no tantivy handle) skip
+            // both.
+            let (memory_text_dispatcher_for_ops, statement_text_dispatcher_for_ops) =
+                if let Some(tantivy_shard) = tantivy_for_ops.as_ref() {
+                    let policy = brain_ops::ops::text_indexer::CommitPolicy::from_env();
+
+                    let memory_dispatcher = {
+                        let (dispatcher, receiver) =
+                            brain_ops::ops::text_indexer::MemoryTextDispatcher::default_channel();
+                        match brain_ops::ops::text_indexer::memory::spawn_memory_text_indexer_local(
+                            tantivy_shard.memory_text.clone(),
+                            receiver,
+                            policy,
+                        ) {
+                            Ok(()) => Some(Arc::new(dispatcher)),
+                            Err(err) => {
+                                tracing::error!(
+                                    target: "brain_server::shard",
+                                    error = %err,
+                                    "memory text indexer spawn failed; lexical writes unavailable",
+                                );
+                                None
+                            }
+                        }
+                    };
+
+                    let statement_dispatcher = {
+                        let (dispatcher, receiver) =
+                            brain_ops::ops::text_indexer::StatementTextDispatcher::default_channel();
+                        match brain_ops::ops::text_indexer::statement::spawn_statement_text_indexer_local(
+                            tantivy_shard.statements.clone(),
+                            receiver,
+                            policy,
+                        ) {
+                            Ok(()) => Some(Arc::new(dispatcher)),
+                            Err(err) => {
+                                tracing::error!(
+                                    target: "brain_server::shard",
+                                    error = %err,
+                                    "statement text indexer spawn failed; lexical writes unavailable",
+                                );
+                                None
+                            }
+                        }
+                    };
+
+                    (memory_dispatcher, statement_dispatcher)
+                } else {
+                    (None, None)
+                };
+
+            // 22.5: per-shard lexical retriever. Constructed
+            // from the same TantivyShard the indexer workers
+            // write to; phase 23's hybrid query consumes it via
+            // `OpsContext.lexical_retriever`.
+            let lexical_retriever_for_ops = tantivy_for_ops.as_ref().and_then(|shard| {
+                match brain_index::TantivyLexicalRetriever::new(shard.clone()) {
+                    Ok(r) => {
+                        let arc: Arc<dyn brain_index::LexicalRetriever> = Arc::new(r);
+                        Some(arc)
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            target: "brain_server::shard",
+                            error = %err,
+                            "lexical retriever init failed; reads will return IndexUnavailable",
+                        );
+                        None
+                    }
+                }
+            });
+
             let ops = Arc::new(
                 OpsContext::new(executor_ctx)
                     .with_extractor_registry(extractor_registry)
-                    .with_classifier_config(classifier_config),
+                    .with_classifier_config(classifier_config)
+                    .with_llm_cache(llm_cache_for_ops)
+                    .with_tantivy(tantivy_for_ops)
+                    .with_memory_text_dispatcher(memory_text_dispatcher_for_ops)
+                    .with_statement_text_dispatcher(statement_text_dispatcher_for_ops)
+                    .with_lexical_retriever(lexical_retriever_for_ops),
             );
 
             // Spawn the per-shard fanout task: drains the in-process
@@ -1379,6 +1510,20 @@ mod tests {
         assert!(
             paths.llm_cache_db().exists(),
             "llm_cache.redb should be created by spawn (sub-task 15.4)"
+        );
+
+        // 22.1: spawn now opens the tantivy indexes via
+        // `TantivyShard::open`, which calls `Index::create_in_dir`
+        // on a fresh shard. The presence of `meta.json` is the
+        // observable proof that this happened (a bare mkdir from
+        // §15.3 leaves the directory empty).
+        assert!(
+            paths.memory_text_tantivy().join("meta.json").exists(),
+            "memory_text.tantivy/meta.json should exist after spawn (sub-task 22.1)"
+        );
+        assert!(
+            paths.statements_tantivy().join("meta.json").exists(),
+            "statements.tantivy/meta.json should exist after spawn (sub-task 22.1)"
         );
     }
 }

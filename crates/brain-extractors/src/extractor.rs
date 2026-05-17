@@ -1,6 +1,9 @@
 //! `Extractor` trait + execution context + result types. Spec §22/01,
 //! §22/02, §22/05.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use brain_core::knowledge::ExtractorKind;
 use brain_core::ExtractorId;
 use brain_core::Memory;
@@ -12,19 +15,35 @@ use crate::registry::ExtractorRegistry;
 // Trait.
 // ---------------------------------------------------------------------------
 
+/// Boxed-future return type for [`Extractor::run`]. Pattern +
+/// classifier impls wrap their sync bodies via
+/// `Box::pin(async move { ... })`; LLM impls use the async path
+/// natively for HTTP calls.
+pub type ExtractionFuture<'a> =
+    Pin<Box<dyn Future<Output = ExtractionResult> + Send + 'a>>;
+
 /// Object-safe extractor interface. Pattern / classifier / LLM
-/// impls live in `pattern.rs`, `classifier.rs`, and (phase 21)
-/// `llm.rs`. The registry stores `Arc<dyn Extractor>`.
+/// impls live in `pattern.rs`, `classifier.rs`, and `llm.rs`.
+/// The registry stores `Arc<dyn Extractor>`.
+///
+/// `run` returns a boxed future to let LLM extractors call out
+/// to HTTP providers without blocking the executor thread. Sync
+/// impls trivially wrap their bodies in `Box::pin(async move
+/// { ... })`.
 pub trait Extractor: Send + Sync {
     fn id(&self) -> ExtractorId;
     fn kind(&self) -> ExtractorKind;
     /// Canonical qname, e.g. `"acme:person_mentions"`.
     fn name(&self) -> &str;
     fn extractor_version(&self) -> u32;
-    /// Run synchronously over `mem`. Returns a populated
-    /// [`ExtractionResult`] including `started_at` / `completed_at`
-    /// timestamps; the caller writes the audit row from these.
-    fn run(&self, ctx: &ExtractionContext<'_>, mem: &Memory) -> ExtractionResult;
+    /// Run over `mem`. Returns a populated [`ExtractionResult`]
+    /// including `started_at` / `completed_at` timestamps; the
+    /// caller writes the audit row from these.
+    fn run<'a>(
+        &'a self,
+        ctx: &'a ExtractionContext<'a>,
+        mem: &'a Memory,
+    ) -> ExtractionFuture<'a>;
 }
 
 // ---------------------------------------------------------------------------

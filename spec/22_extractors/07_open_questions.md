@@ -138,7 +138,66 @@ topological-sort with stable tie-breaking on `ExtractorId`.
 mentions a tier-4 LLM-assisted resolver. Phase 20 stops at tier 3.
 Tier 4 lands alongside phase 21's LLM tier.
 
-**Target:** phase 21. **Status:** deferred.
+**Target:** phase 21+. **Status:** deferred — phase 21 ships the
+LLM extractor but not LLM-driven resolver. Q12 lands separately
+once the LLM tier has live-traffic data.
+
+---
+
+### Q-llm-1 — Per-deployment global cost budget
+
+[`./09_llm_extractor.md`](./09_llm_extractor.md) §5 — phase 21
+ships per-call budget enforcement only. A per-deployment global
+budget (daily / weekly cap shared across shards) requires
+cross-shard coordination (atomic counter or central registry).
+
+**Target:** phase 22+ admin. **Status:** deferred.
+
+---
+
+### Q-llm-2 — Adaptive rate-limit retry
+
+[`./09_llm_extractor.md`](./09_llm_extractor.md) §9 — phase 21
+treats `LlmError::RateLimit { retry_after_ms }` as `Failure` and
+moves on. A more sophisticated impl backs off and retries
+within the worker queue.
+
+**Target:** post-v1. **Status:** deferred.
+
+---
+
+### Q-llm-3 — Proper tokenizer integration for cost estimation
+
+[`./09_llm_extractor.md`](./09_llm_extractor.md) §5 — phase 21
+uses `chars / 4` as a tokens proxy for the cost estimate. Real
+tokenizer integration (tiktoken for OpenAI; anthropic's tokenizer
+counter API for Claude) lands later.
+
+**Target:** phase 22+. **Status:** open. **Likely outcome:** plug
+in `tiktoken-rs` for OpenAI; HTTP probe for Anthropic.
+
+---
+
+### Q-llm-4 — Local LLM backends (llama.cpp / vLLM)
+
+[`./09_llm_extractor.md`](./09_llm_extractor.md) §2 — phase 21
+ships Anthropic + OpenAI HTTP transports only. Air-gapped
+deployments need a local backend.
+
+**Target:** post-v1. **Status:** deferred. **Likely shape:** a
+new `LocalClient` implementing the `LlmClient` trait against
+llama.cpp's HTTP server protocol.
+
+---
+
+### Q-llm-5 — `STATEMENT_ADD_EVIDENCE` for richer confidence
+
+[`../19_statements/05_evidence.md`](../19_statements/05_evidence.md)
+notes the wire op as phase 22. LLM extractors produce per-call
+confidence which would slot into per-evidence weighting via this
+op.
+
+**Target:** phase 22. **Status:** deferred.
 
 ## Resolved
 

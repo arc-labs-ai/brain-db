@@ -9,7 +9,9 @@ use brain_core::{ExtractorId, Memory};
 use brain_protocol::schema::{ExtractorTarget, StatementKindAst};
 use regex::{Regex, RegexBuilder};
 
-use crate::extractor::{ExtractionContext, ExtractionResult, Extractor, ExtractorError};
+use crate::extractor::{
+    ExtractionContext, ExtractionFuture, ExtractionResult, Extractor, ExtractorError,
+};
 use crate::item::{EntityMention, ExtractedItem, RelationMention, StatementMention};
 
 /// Conservative cap per spec §22/01 §2 — 1 MiB for compiled
@@ -157,39 +159,48 @@ impl Extractor for PatternExtractor {
         self.extractor_version
     }
 
-    fn run(&self, ctx: &ExtractionContext<'_>, mem: &Memory) -> ExtractionResult {
-        let start_ns = ctx.now_unix_nanos;
-        let mut items: Vec<ExtractedItem> = Vec::new();
-        let text = mem.text.as_deref().unwrap_or("");
-        for compiled in &self.patterns {
-            let re = &compiled.re;
-            for caps in re.captures_iter(text) {
-                // For Relation target, require two capture groups.
-                if let ExtractorTarget::Relation { relation_type } = &self.target {
-                    let (g1, g2) = match (caps.get(1), caps.get(2)) {
-                        (Some(a), Some(b)) => (a, b),
-                        _ => continue,
-                    };
-                    items.push(ExtractedItem::RelationMention(RelationMention {
-                        relation_type_qname: relation_type.clone(),
-                        subject_text: g1.as_str().to_string(),
-                        object_text: g2.as_str().to_string(),
-                        confidence: self.confidence,
-                        extractor_id: self.id.raw(),
-                        extractor_version: self.extractor_version,
-                    }));
-                    continue;
-                }
+    fn run<'a>(
+        &'a self,
+        ctx: &'a ExtractionContext<'a>,
+        mem: &'a Memory,
+    ) -> ExtractionFuture<'a> {
+        Box::pin(async move {
+            let start_ns = ctx.now_unix_nanos;
+            let mut items: Vec<ExtractedItem> = Vec::new();
+            let text = mem.text.as_deref().unwrap_or("");
+            for compiled in &self.patterns {
+                let re = &compiled.re;
+                for caps in re.captures_iter(text) {
+                    // For Relation target, require two capture groups.
+                    if let ExtractorTarget::Relation { relation_type } = &self.target {
+                        let (g1, g2) = match (caps.get(1), caps.get(2)) {
+                            (Some(a), Some(b)) => (a, b),
+                            _ => continue,
+                        };
+                        items.push(ExtractedItem::RelationMention(RelationMention {
+                            relation_type_qname: relation_type.clone(),
+                            subject_text: g1.as_str().to_string(),
+                            object_text: g2.as_str().to_string(),
+                            confidence: self.confidence,
+                            extractor_id: self.id.raw(),
+                            extractor_version: self.extractor_version,
+                        }));
+                        continue;
+                    }
 
-                // First capture group if present, else the whole match.
-                let span = caps.get(1).or_else(|| caps.get(0)).expect("at least one match");
-                let span_text = span.as_str().to_string();
-                if let Some(item) = self.project(span_text, span.start(), span.end()) {
-                    items.push(item);
+                    // First capture group if present, else the whole match.
+                    let span = caps
+                        .get(1)
+                        .or_else(|| caps.get(0))
+                        .expect("at least one match");
+                    let span_text = span.as_str().to_string();
+                    if let Some(item) = self.project(span_text, span.start(), span.end()) {
+                        items.push(item);
+                    }
                 }
             }
-        }
-        ExtractionResult::success(items, start_ns, ctx.now_unix_nanos)
+            ExtractionResult::success(items, start_ns, ctx.now_unix_nanos)
+        })
     }
 }
 
@@ -336,7 +347,7 @@ mod tests {
         let reg = ExtractorRegistry::new();
         let ext = build(entity_target(), &[r"\bAlice\b"], 0.7);
         let mem = memory("Alice met Alice");
-        let result = ext.run(&ctx(&reg), &mem);
+        let result = futures_lite::future::block_on(ext.run(&ctx(&reg), &mem));
         assert_eq!(result.items.len(), 2);
         for item in &result.items {
             let ExtractedItem::EntityMention(m) = item else {
@@ -365,7 +376,7 @@ mod tests {
         // Pattern with one capture group around the name.
         let ext = build(entity_target(), &[r"name=([A-Z][a-z]+)"], 0.8);
         let mem = memory("greeting name=Priya etc");
-        let result = ext.run(&ctx(&reg), &mem);
+        let result = futures_lite::future::block_on(ext.run(&ctx(&reg), &mem));
         assert_eq!(result.items.len(), 1);
         let ExtractedItem::EntityMention(m) = &result.items[0] else {
             panic!("expected EntityMention");
@@ -379,7 +390,7 @@ mod tests {
         let reg = ExtractorRegistry::new();
         let ext = build(entity_target(), &[r"\bZZZ\b"], 0.5);
         let mem = memory("nothing to see here");
-        let result = ext.run(&ctx(&reg), &mem);
+        let result = futures_lite::future::block_on(ext.run(&ctx(&reg), &mem));
         assert!(result.items.is_empty());
         assert_eq!(result.status, crate::extractor::ExtractionStatus::Success);
     }
@@ -393,7 +404,7 @@ mod tests {
         // Only one capture group → no items emitted.
         let ext = build(target, &[r"(\w+) reports"], 0.7);
         let mem = memory("Bob reports somewhere");
-        let result = ext.run(&ctx(&reg), &mem);
+        let result = futures_lite::future::block_on(ext.run(&ctx(&reg), &mem));
         assert!(
             result.items.is_empty(),
             "relation target with one group must skip the match"
@@ -408,7 +419,7 @@ mod tests {
         };
         let ext = build(target, &[r"(\w+) reports to (\w+)"], 0.9);
         let mem = memory("Bob reports to Priya");
-        let result = ext.run(&ctx(&reg), &mem);
+        let result = futures_lite::future::block_on(ext.run(&ctx(&reg), &mem));
         assert_eq!(result.items.len(), 1);
         let ExtractedItem::RelationMention(m) = &result.items[0] else {
             panic!("expected RelationMention");
@@ -424,7 +435,7 @@ mod tests {
         let reg = ExtractorRegistry::new();
         let ext = build(entity_target(), &[r"\bX\b"], 0.42);
         let mem = memory("X X X");
-        let result = ext.run(&ctx(&reg), &mem);
+        let result = futures_lite::future::block_on(ext.run(&ctx(&reg), &mem));
         for item in &result.items {
             assert!((item.confidence() - 0.42).abs() < 1e-6);
         }
@@ -435,7 +446,7 @@ mod tests {
         let reg = ExtractorRegistry::new();
         let ext = build(entity_target(), &[r"\bAlice\b"], 0.7);
         let mem = memory("Alice");
-        let result = ext.run(&ctx(&reg), &mem);
+        let result = futures_lite::future::block_on(ext.run(&ctx(&reg), &mem));
         let ExtractedItem::EntityMention(m) = &result.items[0] else {
             panic!()
         };
@@ -449,7 +460,7 @@ mod tests {
         let ext = build(entity_target(), &[r"\bPriya\b"], 0.7);
         // "☃" is 3 bytes in UTF-8; "Priya" starts at byte 4.
         let mem = memory("☃ Priya rocks");
-        let result = ext.run(&ctx(&reg), &mem);
+        let result = futures_lite::future::block_on(ext.run(&ctx(&reg), &mem));
         assert_eq!(result.items.len(), 1);
         let ExtractedItem::EntityMention(m) = &result.items[0] else {
             panic!()
@@ -469,7 +480,7 @@ mod tests {
         };
         let ext = build(target, &[r"important: (.+)$"], 0.6);
         let mem = memory("important: ship phase 20");
-        let result = ext.run(&ctx(&reg), &mem);
+        let result = futures_lite::future::block_on(ext.run(&ctx(&reg), &mem));
         assert_eq!(result.items.len(), 1);
         let ExtractedItem::StatementMention(m) = &result.items[0] else {
             panic!("expected StatementMention");

@@ -68,7 +68,7 @@ pub async fn run_extractor_pipeline(ctx: &OpsContext, memory: &Memory) {
             now_unix_nanos: now,
             registry: &empty_reg,
         };
-        let result = extractor.run(&ext_ctx, memory);
+        let result = extractor.run(&ext_ctx, memory).await;
 
         let status_byte = match result.status {
             ExtractionStatus::Success => extraction_status::SUCCESS,
@@ -164,7 +164,7 @@ mod tests {
         AgentId, ContextId, ExtractorId, MemoryId, MemoryKind, Salience,
     };
     use brain_extractors::{
-        EntityMention, ExtractedItem, ExtractionResult, ExtractorError,
+        EntityMention, ExtractedItem, ExtractionFuture, ExtractionResult, ExtractorError,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -188,25 +188,34 @@ mod tests {
         fn extractor_version(&self) -> u32 {
             1
         }
-        fn run(&self, _ctx: &ExtractionContext<'_>, _mem: &Memory) -> ExtractionResult {
+        fn run<'a>(
+            &'a self,
+            _ctx: &'a ExtractionContext<'a>,
+            _mem: &'a Memory,
+        ) -> ExtractionFuture<'a> {
             self.runs.fetch_add(1, Ordering::SeqCst);
-            if self.return_failure {
-                return ExtractionResult::failure("mock failure", 0, 0);
-            }
-            let items: Vec<ExtractedItem> = (0..self.emit_items)
-                .map(|i| {
-                    ExtractedItem::EntityMention(EntityMention {
-                        entity_type_qname: "brain:Person".into(),
-                        text: format!("name{i}"),
-                        start: 0,
-                        end: 0,
-                        confidence: 0.7,
-                        extractor_id: self.id.raw(),
-                        extractor_version: 1,
+            let emit = self.emit_items;
+            let id_raw = self.id.raw();
+            let fail = self.return_failure;
+            Box::pin(async move {
+                if fail {
+                    return ExtractionResult::failure("mock failure", 0, 0);
+                }
+                let items: Vec<ExtractedItem> = (0..emit)
+                    .map(|i| {
+                        ExtractedItem::EntityMention(EntityMention {
+                            entity_type_qname: "brain:Person".into(),
+                            text: format!("name{i}"),
+                            start: 0,
+                            end: 0,
+                            confidence: 0.7,
+                            extractor_id: id_raw,
+                            extractor_version: 1,
+                        })
                     })
-                })
-                .collect();
-            ExtractionResult::success(items, 0, 0)
+                    .collect();
+                ExtractionResult::success(items, 0, 0)
+            })
         }
     }
 

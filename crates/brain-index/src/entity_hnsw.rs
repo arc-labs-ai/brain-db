@@ -568,7 +568,11 @@ mod tests {
         // Rebuild with 3 fresh entities (the surviving ones — caller
         // pre-filters tombstoned).
         let fresh: Vec<EntityId> = (0..3).map(|_| EntityId::new()).collect();
-        let input: Vec<_> = fresh.iter().enumerate().map(|(i, id)| (*id, one_hot(i + 100))).collect();
+        let input: Vec<_> = fresh
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, one_hot(i + 100)))
+            .collect();
         let report = idx.rebuild(input).unwrap();
         assert_eq!(report.inserted, 3);
         assert_eq!(report.duplicates_skipped, 0);

@@ -26,11 +26,25 @@ candle-core.workspace = true
 candle-nn.workspace = true
 candle-transformers.workspace = true
 tokenizers.workspace = true
+# 21.3: LLM extractor depends on the transport clients + cache.
+brain-llm = { path = "../brain-llm" }
+# 21.3: validate the LLM response against the operator-declared
+# JSON schema before projection.
+jsonschema = { workspace = true }
+# 21.3: cache mutex (shared with the OpsContext wiring in 21.5).
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion.workspace = true
+# 21.3: Extractor::run is async; tests block on the future via
+# futures-lite::future::block_on.
+futures-lite.workspace = true
 
 [[bench]]
 name = "pattern_extract"
+harness = false
+
+[[bench]]
+name = "llm_pipeline"
 harness = false

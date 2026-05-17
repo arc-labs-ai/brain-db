@@ -55,6 +55,8 @@ brain-protocol = { path = "../brain-protocol" }
 brain-storage = { path = "../brain-storage" }
 brain-metadata = { path = "../brain-metadata" }
 brain-extractors = { path = "../brain-extractors" }
+# 21.5: shard startup builds the LLM model router + per-shard cache.
+brain-llm = { path = "../brain-llm" }
 brain-index = { path = "../brain-index" }
 brain-embed = { path = "../brain-embed" }
 brain-planner = { path = "../brain-planner" }

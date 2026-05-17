@@ -92,9 +92,78 @@ worker stays as a 1-line placeholder.
 
 **Target:** post-v1. **Status:** deferred.
 
+### Q9 — Full content-aware memory text rebuild
+
+[`../26_knowledge_storage/01_tantivy_layout.md`](../26_knowledge_storage/01_tantivy_layout.md)
+§5 specifies rebuild from authoritative redb tables. Phase 22.6
+discovered that `MEMORIES_TABLE` stores `text_size` but not the
+text itself (text lives only on the ENCODE wire path + WAL
+frames), so v1's `rebuild_memory_text` produces a valid empty
+index — operators re-ingest existing memories from their own
+source-of-truth. Full content-aware rebuild needs either a WAL
+scan or a parallel text-store table.
+
+**Target:** post-v1. **Status:** deferred.
+
+---
+
+### Q10 — Partial WAL replay on shard recovery
+
+[`./02_text_indexer_workers.md`](./02_text_indexer_workers.md)
+§6 describes WAL-based replay of unflushed writes at startup.
+Phase 22.7 implements only the full-rebuild path on
+`IndexStatus::NeedsRebuild`; for `Ready` indexes, the loss
+bound is ≤ N-1 writes per indexer at crash (default N=256 per
+§26/01 §3). Cursor-tracked partial replay (stamping
+`last_indexed_unix_ms` on the tantivy payload, scanning redb
+for rows beyond the cursor at startup) is a post-v1 improvement.
+
+**Target:** post-v1. **Status:** deferred.
+
+---
+
+### Q11 — Hot rebuild while live writer is running
+
+[`../26_knowledge_storage/01_tantivy_layout.md`](../26_knowledge_storage/01_tantivy_layout.md)
+§5's atomic-rename semantics allow in-flight readers to keep
+operating against the old index until they re-open. Phase 22.6
+implements startup-only rebuild — no coordination with a live
+`IndexWriter`. Hot rebuild (e.g. admin-triggered without
+restarting the shard) requires writer pause + drain coordination
+that the 22.3 / 22.4 drain loops don't yet support.
+
+**Target:** post-v1. **Status:** deferred.
+
+---
+
+### Q12 — Segment-merge windowing during low-traffic intervals
+
+[`../26_knowledge_storage/01_tantivy_layout.md`](../26_knowledge_storage/01_tantivy_layout.md)
+§4 calls out tantivy's segment merge as expensive and notes
+v1 relies on `LogMergePolicy` running as part of tantivy's
+background merger threads (governed by the shard's I/O budget).
+Operators that observe latency hits during merges may want to
+window merges into low-traffic intervals.
+
+**Target:** post-v1. **Status:** deferred.
+
+---
+
+### Q13 — Admin rebuild wire op (`ADMIN_TANTIVY_REBUILD`)
+
+Phase 22.6 lands the rebuild functions but the on-demand admin
+trigger (operator-facing wire op or CLI subcommand) is admin-
+surface scope.
+
+**Target:** §28/05 admin. **Status:** deferred.
+
 ## Resolved
 
 - Per-tier dispatch semantics (sync / near-foreground / background)
   — resolved in [`./01_extractor_workers.md`](./01_extractor_workers.md).
 - Worker overflow policy — `Drop + audit Skipped(queue full) +
   metric`, resolved in §27/01 §6.
+- Text-indexer overflow policy — `Backpressure on foreground` (not
+  drop). Resolved in [`./02_text_indexer_workers.md`](./02_text_indexer_workers.md)
+  §1 §6 with full justification (lexical recall is correctness, not
+  best-effort).

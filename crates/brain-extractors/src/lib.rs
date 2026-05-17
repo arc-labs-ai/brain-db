@@ -19,6 +19,7 @@ pub mod extractor;
 pub mod idempotency;
 pub mod item;
 pub mod labels;
+pub mod llm;
 pub mod materialize;
 pub mod options;
 pub mod pattern;
@@ -29,14 +30,16 @@ pub use classifier::{
     TokenClassification,
 };
 pub use extractor::{
-    ExtractionContext, ExtractionResult, ExtractionStatus, Extractor, ExtractorError,
+    ExtractionContext, ExtractionFuture, ExtractionResult, ExtractionStatus, Extractor,
+    ExtractorError,
 };
 pub use idempotency::{hash_memory_text, IdempotencyKey};
 pub use item::{EntityMention, ExtractedItem, RelationMention, StatementMention};
 pub use labels::{decode_bio, load_labels_file, BioSpan};
+pub use llm::{estimate_cost, CostBudget, LlmExtractor, LlmExtractorInner, Pricing};
 pub use materialize::{
-    build_registry_from_definitions, materialize_classifier_extractor,
-    materialize_pattern_extractor,
+    build_registry_from_definitions, materialize_classifier_extractor, materialize_llm_extractor,
+    materialize_pattern_extractor, MaterializeDeps,
 };
 pub use options::ExtractorRunOptions;
 pub use pattern::{CompiledRegex, PatternExtractor};

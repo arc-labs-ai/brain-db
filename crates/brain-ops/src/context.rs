@@ -15,10 +15,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brain_extractors::{ClassifierConfig, ExtractorRegistry};
+use brain_index::{LexicalRetriever, TantivyShard};
+use brain_metadata::LlmCacheDb;
 use brain_planner::{ExecutorContext, PlannerContext};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::access_buffer::AccessBuffer;
+use crate::ops::text_indexer::{MemoryTextDispatcher, StatementTextDispatcher};
 use crate::subscribe::{EventBus, SubscriptionRegistry};
 use crate::txn::TxnStore;
 
@@ -55,6 +58,34 @@ pub struct OpsContext {
     /// model path). Defaults to `unloaded`; operators wire
     /// `BRAIN_NER_MODEL_PATH` via `with_classifier_config`.
     pub classifier_config: Arc<ClassifierConfig>,
+    /// Per-shard LLM extractor response cache (spec §15.4 / §26).
+    /// `None` when no API keys are configured, the cache file
+    /// failed to open, or the deployment runs substrate-only.
+    /// LLM extractors thread this into their cache lookups via
+    /// the registry; later ops (RECALL provenance lookups, cache
+    /// admin endpoints) can read through this field directly.
+    pub llm_cache: Option<Arc<Mutex<LlmCacheDb>>>,
+    /// Per-shard tantivy index handle (phase 22.1). `None` until
+    /// the server's shard-spawn path wires it via
+    /// [`OpsContext::with_tantivy`]. The retriever (22.5) and
+    /// indexer workers (22.3 / 22.4) borrow through this field;
+    /// substrate-only deployments leave it `None`.
+    pub tantivy: Option<Arc<TantivyShard>>,
+    /// Memory text indexer dispatcher (phase 22.3). `None` for
+    /// substrate-only deployments and tests that don't spawn the
+    /// drain task. ENCODE / FORGET handlers check this slot
+    /// post-WAL-commit and enqueue an indexer op when present.
+    pub memory_text_dispatcher: Option<Arc<MemoryTextDispatcher>>,
+    /// Statement text indexer dispatcher (phase 22.4). Wired
+    /// alongside `memory_text_dispatcher`; statement_create /
+    /// supersede / tombstone / retract handlers enqueue
+    /// Upsert / Delete events post-commit.
+    pub statement_text_dispatcher: Option<Arc<StatementTextDispatcher>>,
+    /// Per-shard lexical retriever (phase 22.5). Reads the
+    /// tantivy indexes maintained by the 22.3 + 22.4 workers.
+    /// Phase 23's hybrid query consumes this slot; substrate-
+    /// only deployments leave it `None`.
+    pub lexical_retriever: Option<Arc<dyn LexicalRetriever>>,
 }
 
 impl OpsContext {
@@ -72,6 +103,11 @@ impl OpsContext {
             access_buffer: Arc::new(AccessBuffer::default()),
             extractor_registry: Arc::new(RwLock::new(ExtractorRegistry::new())),
             classifier_config: Arc::new(ClassifierConfig::unloaded()),
+            llm_cache: None,
+            tantivy: None,
+            memory_text_dispatcher: None,
+            statement_text_dispatcher: None,
+            lexical_retriever: None,
         }
     }
 
@@ -130,6 +166,59 @@ impl OpsContext {
     #[must_use]
     pub fn with_classifier_config(mut self, cfg: ClassifierConfig) -> Self {
         self.classifier_config = Arc::new(cfg);
+        self
+    }
+
+    /// Install (or clear) the per-shard LLM cache handle. Phase
+    /// 21.5 calls this once at shard startup with an open
+    /// `LlmCacheDb`; substrate-only deployments and tests pass
+    /// `None`.
+    #[must_use]
+    pub fn with_llm_cache(mut self, cache: Option<Arc<Mutex<LlmCacheDb>>>) -> Self {
+        self.llm_cache = cache;
+        self
+    }
+
+    /// Install (or clear) the per-shard tantivy handle. Phase
+    /// 22.1 calls this once at shard startup with the
+    /// `TantivyShard` returned by `TantivyShard::open`. Tests
+    /// and substrate-only deployments pass `None`.
+    #[must_use]
+    pub fn with_tantivy(mut self, tantivy: Option<Arc<TantivyShard>>) -> Self {
+        self.tantivy = tantivy;
+        self
+    }
+
+    /// Install (or clear) the memory text indexer dispatcher
+    /// (phase 22.3). The matching drain task is spawned
+    /// separately by the caller (server spawn path uses
+    /// `glommio::spawn_local`).
+    #[must_use]
+    pub fn with_memory_text_dispatcher(
+        mut self,
+        dispatcher: Option<Arc<MemoryTextDispatcher>>,
+    ) -> Self {
+        self.memory_text_dispatcher = dispatcher;
+        self
+    }
+
+    /// Install (or clear) the statement text indexer dispatcher
+    /// (phase 22.4). Server-spawn pairs this with the drain
+    /// task; tests pass `None`.
+    #[must_use]
+    pub fn with_statement_text_dispatcher(
+        mut self,
+        dispatcher: Option<Arc<StatementTextDispatcher>>,
+    ) -> Self {
+        self.statement_text_dispatcher = dispatcher;
+        self
+    }
+
+    /// Install (or clear) the lexical retriever (phase 22.5).
+    /// Phase 23's hybrid query path reads through this slot.
+    #[must_use]
+    pub fn with_lexical_retriever(mut self, retriever: Option<Arc<dyn LexicalRetriever>>) -> Self {
+        self.lexical_retriever = retriever;
         self
     }
 }

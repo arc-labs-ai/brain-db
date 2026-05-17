@@ -15,6 +15,7 @@ use crate::context::OpsContext;
 use crate::error::OpError;
 use crate::idempotency::hash_encode_request;
 use crate::ops::extractor_pipeline::run_extractor_pipeline;
+use crate::ops::text_indexer::MemoryTextOp;
 use crate::txn::{BufferedEdgeSpec, BufferedEncode, BufferedReplay};
 
 pub async fn handle_encode(
@@ -58,6 +59,25 @@ pub async fn handle_encode(
             last_accessed_at_unix_ms: 0,
         };
         run_extractor_pipeline(ctx, &memory).await;
+
+        // §27/02 §5: memory text indexer dispatches after the
+        // extractor pipeline. Backpressure on overflow per
+        // §27/02 §1 — the dispatcher awaits a free slot. No-op
+        // when the dispatcher slot is empty (substrate-only or
+        // test contexts).
+        if let Some(dispatcher) = ctx.memory_text_dispatcher.as_ref() {
+            if let Some(text) = memory.text.as_ref() {
+                dispatcher
+                    .dispatch(MemoryTextOp::Upsert {
+                        id: memory.id,
+                        text: text.clone(),
+                        agent: memory.agent,
+                        kind: memory.kind,
+                        created_at_unix_ms: memory.created_at_unix_ms,
+                    })
+                    .await;
+            }
+        }
     }
 
     Ok(EncodeResponse {

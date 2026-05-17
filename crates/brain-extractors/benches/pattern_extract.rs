@@ -11,6 +11,7 @@ use brain_core::{AgentId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, 
 use brain_extractors::{ExtractionContext, Extractor, ExtractorRegistry, PatternExtractor};
 use brain_protocol::schema::ExtractorTarget;
 use criterion::{black_box, criterion_group, Criterion};
+use futures_lite::future::block_on;
 
 const PATTERNS_TYPICAL: &[&str] = &[
     r"\b([A-Z][a-z]+\s+[A-Z][a-z]+)\b",
@@ -66,7 +67,7 @@ fn bench_pattern_extract(c: &mut Criterion) {
 
     c.bench_function("pattern_extract 4KiB / 5 regexes", |b| {
         b.iter(|| {
-            let r = ext.run(&ctx, black_box(&mem));
+            let r = block_on(ext.run(&ctx, black_box(&mem)));
             black_box(r);
         });
     });
@@ -84,7 +85,7 @@ fn bench_pattern_extract_short(c: &mut Criterion) {
 
     c.bench_function("pattern_extract 256B / 5 regexes", |b| {
         b.iter(|| {
-            let r = ext.run(&ctx, black_box(&mem));
+            let r = block_on(ext.run(&ctx, black_box(&mem)));
             black_box(r);
         });
     });
@@ -99,7 +100,7 @@ fn print_corpus_summary() {
         now_unix_nanos: 0,
         registry: &reg,
     };
-    let r = ext.run(&ctx, &mem);
+    let r = block_on(ext.run(&ctx, &mem));
     eprintln!(
         "pattern_extract bench setup: patterns={} text_bytes=4096 items_per_run={}",
         ext.patterns().len(),

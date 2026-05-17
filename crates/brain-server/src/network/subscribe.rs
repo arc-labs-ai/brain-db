@@ -374,7 +374,12 @@ fn empty_subscription_event_frame(stream_id: u32, last_lsn: u64) -> Frame {
         knowledge_payload: None,
     })
     .encode();
-    Frame::new(Opcode::SubscribeEvent.as_u16(), FLAG_EOS, stream_id, payload)
+    Frame::new(
+        Opcode::SubscribeEvent.as_u16(),
+        FLAG_EOS,
+        stream_id,
+        payload,
+    )
 }
 
 fn error_frame(stream_id: u32, code: ErrorCode, message: &str) -> Frame {

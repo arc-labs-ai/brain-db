@@ -90,7 +90,7 @@ impl ExtractorRegistry {
 mod tests {
     use super::*;
 
-    use crate::extractor::{ExtractionContext, ExtractionResult, Extractor};
+    use crate::extractor::{ExtractionContext, ExtractionFuture, ExtractionResult, Extractor};
     use brain_core::knowledge::ExtractorKind;
     use brain_core::Memory;
 
@@ -112,8 +112,12 @@ mod tests {
         fn extractor_version(&self) -> u32 {
             1
         }
-        fn run(&self, _ctx: &ExtractionContext<'_>, _mem: &Memory) -> ExtractionResult {
-            ExtractionResult::success(Vec::new(), 0, 0)
+        fn run<'a>(
+            &'a self,
+            _ctx: &'a ExtractionContext<'a>,
+            _mem: &'a Memory,
+        ) -> ExtractionFuture<'a> {
+            Box::pin(async { ExtractionResult::success(Vec::new(), 0, 0) })
         }
     }
 

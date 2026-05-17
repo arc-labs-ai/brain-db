@@ -50,7 +50,9 @@ use brain_core::{ExtractorId, Memory};
 use brain_protocol::schema::ExtractorTarget;
 use candle_core::{DType, Device, Tensor};
 
-use crate::extractor::{ExtractionContext, ExtractionResult, Extractor, ExtractorError};
+use crate::extractor::{
+    ExtractionContext, ExtractionFuture, ExtractionResult, Extractor, ExtractorError,
+};
 use crate::item::{EntityMention, ExtractedItem};
 
 const CONFIG_FILE: &str = "config.json";
@@ -443,33 +445,39 @@ impl Extractor for ClassifierExtractor {
         self.extractor_version
     }
 
-    fn run(&self, ctx: &ExtractionContext<'_>, mem: &Memory) -> ExtractionResult {
-        let at = ctx.now_unix_nanos;
-        let text = mem.text.as_deref().unwrap_or("");
+    fn run<'a>(
+        &'a self,
+        ctx: &'a ExtractionContext<'a>,
+        mem: &'a Memory,
+    ) -> ExtractionFuture<'a> {
+        Box::pin(async move {
+            let at = ctx.now_unix_nanos;
+            let text = mem.text.as_deref().unwrap_or("");
 
-        let Some(model) = self.model.as_ref() else {
-            let reason = self
-                .degraded_reason
-                .as_deref()
-                .unwrap_or("classifier model not loaded");
-            return ExtractionResult::failure(reason, at, at);
-        };
+            let Some(model) = self.model.as_ref() else {
+                let reason = self
+                    .degraded_reason
+                    .as_deref()
+                    .unwrap_or("classifier model not loaded");
+                return ExtractionResult::failure(reason, at, at);
+            };
 
-        let spans = match model.predict(text) {
-            Ok(s) => s,
-            Err(e) => return ExtractionResult::failure(e.to_string(), at, at),
-        };
+            let spans = match model.predict(text) {
+                Ok(s) => s,
+                Err(e) => return ExtractionResult::failure(e.to_string(), at, at),
+            };
 
-        let mut items = Vec::new();
-        for span in spans {
-            if span.confidence < self.confidence_threshold {
-                continue;
+            let mut items = Vec::new();
+            for span in spans {
+                if span.confidence < self.confidence_threshold {
+                    continue;
+                }
+                if let Some(item) = self.project(span) {
+                    items.push(item);
+                }
             }
-            if let Some(item) = self.project(span) {
-                items.push(item);
-            }
-        }
-        ExtractionResult::success(items, at, at)
+            ExtractionResult::success(items, at, at)
+        })
     }
 }
 
@@ -603,7 +611,7 @@ mod tests {
         let reg = ExtractorRegistry::new();
         let ext = degraded_ext();
         assert!(!ext.is_loaded());
-        let r = ext.run(&ctx(&reg), &memory("Alice met Bob"));
+        let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice met Bob")));
         assert_eq!(r.status, crate::extractor::ExtractionStatus::Failure);
         assert!(r.status_reason.contains("not loaded"));
     }
@@ -611,7 +619,7 @@ mod tests {
     #[test]
     fn degraded_extractor_returns_zero_items() {
         let reg = ExtractorRegistry::new();
-        let r = degraded_ext().run(&ctx(&reg), &memory("anything"));
+        let r = futures_lite::future::block_on(degraded_ext().run(&ctx(&reg), &memory("anything")));
         assert!(r.items.is_empty());
     }
 
