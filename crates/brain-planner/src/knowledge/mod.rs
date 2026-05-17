@@ -6,6 +6,7 @@
 //! polluting the substrate planner.
 
 pub mod executor;
+pub mod explain;
 pub mod filters;
 pub mod fusion;
 pub mod planner;
