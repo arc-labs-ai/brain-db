@@ -553,6 +553,7 @@ dependencies = [
  "brain-metadata",
  "brain-protocol",
  "parking_lot",
+ "regex",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

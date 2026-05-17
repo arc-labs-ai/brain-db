@@ -34,6 +34,7 @@ pub mod error;
 pub mod executor;
 pub mod explain;
 pub mod forget;
+pub mod knowledge;
 pub mod path;
 pub mod plan;
 pub mod reason;

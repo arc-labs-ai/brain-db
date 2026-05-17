@@ -16,6 +16,10 @@ brain-metadata = { path = "../brain-metadata" }
 thiserror.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
+# 23.3: query router classification heuristics use regex over
+# query text (exact-id detection, Title-Case mention probe,
+# temporal expression detection).
+regex = { workspace = true }
 
 [dev-dependencies]
 uuid.workspace = true
