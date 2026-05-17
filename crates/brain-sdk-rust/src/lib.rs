@@ -81,20 +81,22 @@ pub mod proto;
 pub mod request_id;
 pub mod retry;
 
-pub use brain_core::{EntityId, MemoryId, RelationId, RequestId, StatementId, StatementKind};
 pub use brain_core::knowledge::TombstoneReason;
+pub use brain_core::{EntityId, MemoryId, RelationId, RequestId, StatementId, StatementKind};
 pub use client::Client;
 pub use config::{AuthMethod, ClientConfig};
 pub use error::ClientError;
 pub use knowledge::{
     BrainEntityType, ClientErrorEntityExt, ClientErrorRelationExt, ClientErrorStatementExt,
     EntityClient, EntityCreateBuilder, EntityErrorKind, EntityHandle, EntityHandleFromViewError,
-    EntityListBuilder, EntityMergeBuilder, EntityResolveBuilder, EntityUpdateBuilder,
-    EventBuilder, FactBuilder, MergeOutcome, Person, PersonAttributes, PreferenceBuilder,
+    EntityListBuilder, EntityMergeBuilder, EntityResolveBuilder, EntityUpdateBuilder, EventBuilder,
+    ExplainResult, FactBuilder, FusionConfig, ItemKind, ItemRef, MergeOutcome, Person,
+    PersonAttributes, PreferenceBuilder, QueryBuilder, QueryBuilderError, QueryHit, QueryResult,
     RelationBuilder, RelationErrorKind, RelationHandle, RelationListFromBuilder,
-    RelationListToBuilder, RelationTraverseBuilder, RelationsClient, ResolutionOutcome,
-    StatementErrorKind, StatementHandle, StatementListBuilder, StatementsClient, TraversalPath,
-    TraversalStep, TraverseDirection,
+    RelationListToBuilder, RelationTraverseBuilder, RelationsClient, ResolutionOutcome, Retriever,
+    RetrieverContribution, RetrieverOutcome, RetrieverOutcomeStatus, RetrieverSelection,
+    StatementErrorKind, StatementHandle, StatementListBuilder, StatementsClient, TimeRange,
+    TraceResult, TraversalPath, TraversalStep, TraverseDirection,
 };
 pub use observability::{MetricsSnapshot, OpMetrics};
 pub use ops::{

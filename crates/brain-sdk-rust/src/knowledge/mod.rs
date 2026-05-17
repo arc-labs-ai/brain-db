@@ -11,6 +11,7 @@
 pub mod builder;
 pub mod entity;
 pub mod errors;
+pub mod query;
 pub mod relation;
 pub mod schema;
 pub mod statement;
@@ -25,6 +26,11 @@ pub use entity::{
 pub use errors::{
     ClientErrorEntityExt, ClientErrorRelationExt, ClientErrorStatementExt, EntityErrorKind,
     RelationErrorKind, StatementErrorKind,
+};
+pub use query::{
+    ExplainResult, FusionConfig, ItemKind, ItemRef, QueryBuilder, QueryBuilderError, QueryHit,
+    QueryResult, Retriever, RetrieverContribution, RetrieverOutcome, RetrieverOutcomeStatus,
+    RetrieverSelection, TimeRange, TraceResult, MAX_EXPLICIT_RETRIEVERS, MAX_QUERY_TEXT_BYTES,
 };
 pub use relation::{
     RelationBuilder, RelationHandle, RelationListFromBuilder, RelationListToBuilder,
