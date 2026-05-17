@@ -20,8 +20,8 @@
 //! or the relation embedding worker — both deferred per the §20
 //! open questions.
 
-use brain_core::{EntityId, RelationId, RelationTypeId};
 use brain_core::knowledge::Relation;
+use brain_core::{EntityId, RelationId, RelationTypeId};
 use brain_metadata::relation_ops::{
     relation_create, relation_get, relation_history, relation_list_from, relation_list_to,
     relation_supersede, relation_tombstone, RelationListFilter, RelationOpError,
@@ -76,16 +76,14 @@ pub async fn handle_relation_create(
             .write_txn()
             .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
 
-        let rt = relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?
-            .ok_or_else(|| {
-                OpError::InvalidRequest(format!(
-                    "unknown relation type {namespace:?}:{name:?}; declare via SCHEMA_UPLOAD first"
-                ))
-            })?;
+        let rt = relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?.ok_or_else(|| {
+            OpError::InvalidRequest(format!(
+                "unknown relation type {namespace:?}:{name:?}; declare via SCHEMA_UPLOAD first"
+            ))
+        })?;
 
         let relation = build_relation_from_create(&req, &rt, now)?;
-        let created = relation_create(&wtxn, &relation, now)
-            .map_err(map_relation_op_error)?;
+        let created = relation_create(&wtxn, &relation, now).map_err(map_relation_op_error)?;
         wtxn.commit()
             .map_err(|e| OpError::Internal(format!("commit: {e}")))?;
         (created, rt.canonical())
@@ -158,9 +156,7 @@ pub async fn handle_relation_supersede(
     ctx: &OpsContext,
 ) -> Result<RelationSupersedeResponse, OpError> {
     validate_qname(&req.new_relation.relation_type)?;
-    if req.new_relation.confidence.is_nan()
-        || !(0.0..=1.0).contains(&req.new_relation.confidence)
-    {
+    if req.new_relation.confidence.is_nan() || !(0.0..=1.0).contains(&req.new_relation.confidence) {
         return Err(OpError::InvalidRequest(
             "confidence must be in [0, 1] and not NaN".into(),
         ));
@@ -176,14 +172,13 @@ pub async fn handle_relation_supersede(
             .write_txn()
             .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
 
-        let rt = relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?
-            .ok_or_else(|| {
-                OpError::InvalidRequest(format!("unknown relation type {namespace:?}:{name:?}"))
-            })?;
+        let rt = relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?.ok_or_else(|| {
+            OpError::InvalidRequest(format!("unknown relation type {namespace:?}:{name:?}"))
+        })?;
 
         let new_relation = build_relation_from_create(&req.new_relation, &rt, now)?;
-        let new_id = relation_supersede(&wtxn, old_id, &new_relation, now)
-            .map_err(map_relation_op_error)?;
+        let new_id =
+            relation_supersede(&wtxn, old_id, &new_relation, now).map_err(map_relation_op_error)?;
         wtxn.commit()
             .map_err(|e| OpError::Internal(format!("commit: {e}")))?;
 
@@ -311,9 +306,7 @@ fn run_list(
     from_side: bool,
 ) -> Result<(Vec<RelationView>, u32), OpError> {
     if limit == 0 || limit > LIST_LIMIT_MAX {
-        return Err(OpError::InvalidRequest(
-            "limit must be in 1..=1000".into(),
-        ));
+        return Err(OpError::InvalidRequest("limit must be in 1..=1000".into()));
     }
     if !cursor.is_empty() {
         return Err(OpError::InvalidRequest(
@@ -480,9 +473,8 @@ fn validate_qname(q: &str) -> Result<(), OpError> {
 }
 
 fn split_qname(q: &str) -> Result<(&str, &str), OpError> {
-    q.split_once(':').ok_or_else(|| {
-        OpError::InvalidRequest("relation_type missing ':' separator".into())
-    })
+    q.split_once(':')
+        .ok_or_else(|| OpError::InvalidRequest("relation_type missing ':' separator".into()))
 }
 
 fn build_relation_from_create(
@@ -492,9 +484,8 @@ fn build_relation_from_create(
 ) -> Result<Relation, OpError> {
     use brain_protocol::knowledge::evidence_ref_from_wire;
 
-    let evidence = evidence_ref_from_wire(&req.evidence).map_err(|e| {
-        OpError::InvalidRequest(format!("evidence decode: {e}"))
-    })?;
+    let evidence = evidence_ref_from_wire(&req.evidence)
+        .map_err(|e| OpError::InvalidRequest(format!("evidence decode: {e}")))?;
     let memories: Vec<brain_core::MemoryId> = match evidence {
         brain_core::knowledge::EvidenceRef::Inline(entries) => {
             entries.iter().map(|e| e.memory_id).collect()
@@ -534,24 +525,16 @@ fn build_relation_from_create(
 
 /// Project a brain-core `Relation` to a wire `RelationView` by
 /// resolving the `RelationTypeId` to its canonical qname string.
-fn project_view(
-    rtxn: &redb::ReadTransaction,
-    r: &Relation,
-) -> Result<RelationView, OpError> {
+fn project_view(rtxn: &redb::ReadTransaction, r: &Relation) -> Result<RelationView, OpError> {
     let qname = type_qname(rtxn, r.relation_type)?;
     Ok(RelationView::from_relation(r, qname))
 }
 
-fn type_qname(
-    rtxn: &redb::ReadTransaction,
-    id: RelationTypeId,
-) -> Result<String, OpError> {
+fn type_qname(rtxn: &redb::ReadTransaction, id: RelationTypeId) -> Result<String, OpError> {
     let rt = relation_type_get(rtxn, id)
         .map_err(map_relation_type_op_error)?
         .ok_or_else(|| {
-            OpError::Internal(format!(
-                "relation references missing relation_type {id:?}"
-            ))
+            OpError::Internal(format!("relation references missing relation_type {id:?}"))
         })?;
     Ok(rt.canonical())
 }
@@ -593,11 +576,9 @@ fn map_relation_type_op_error(err: RelationTypeOpError) -> OpError {
         RelationTypeOpError::InvalidIdentifier { reason } => {
             OpError::InvalidRequest(format!("relation_type identifier: {reason}"))
         }
-        RelationTypeOpError::AlreadyExists { qname, existing_id } => {
-            OpError::Conflict(format!(
-                "relation_type {qname:?} already exists with id {existing_id:?}"
-            ))
-        }
+        RelationTypeOpError::AlreadyExists { qname, existing_id } => OpError::Conflict(format!(
+            "relation_type {qname:?} already exists with id {existing_id:?}"
+        )),
         RelationTypeOpError::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
         RelationTypeOpError::Table(e) => OpError::Internal(format!("redb table: {e}")),
     }
@@ -620,9 +601,9 @@ fn map_relation_op_error(err: RelationOpError) -> OpError {
             detail: format!("{id:?}"),
         },
         RelationOpError::InvalidArgument(s) => OpError::InvalidRequest(s.to_string()),
-        RelationOpError::AlreadySuperseded(id, by) => OpError::Conflict(format!(
-            "relation {id:?} already superseded by {by:?}"
-        )),
+        RelationOpError::AlreadySuperseded(id, by) => {
+            OpError::Conflict(format!("relation {id:?} already superseded by {by:?}"))
+        }
         RelationOpError::AlreadyTombstoned(id) => {
             OpError::Conflict(format!("relation {id:?} is tombstoned"))
         }
@@ -632,11 +613,12 @@ fn map_relation_op_error(err: RelationOpError) -> OpError {
         RelationOpError::EndpointMismatch => {
             OpError::InvalidRequest("endpoints must match on supersede".into())
         }
-        RelationOpError::CardinalityViolation { variant, conflicting } => {
-            OpError::Conflict(format!(
-                "cardinality {variant:?} violated; {conflicting} conflicting current relation(s)"
-            ))
-        }
+        RelationOpError::CardinalityViolation {
+            variant,
+            conflicting,
+        } => OpError::Conflict(format!(
+            "cardinality {variant:?} violated; {conflicting} conflicting current relation(s)"
+        )),
         RelationOpError::DecodeFailed => {
             OpError::Internal("relation row decode failed — possible corruption".into())
         }

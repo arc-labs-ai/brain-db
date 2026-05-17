@@ -66,7 +66,9 @@ pub async fn handle_schema_upload(
 
     // 3. Dry-run → don't persist.
     if req.dry_run {
-        let would_be = current_active(ctx, &namespace)?.unwrap_or(0).saturating_add(1);
+        let would_be = current_active(ctx, &namespace)?
+            .unwrap_or(0)
+            .saturating_add(1);
         return Ok(SchemaUploadResponse {
             namespace,
             schema_version: would_be,
@@ -93,8 +95,7 @@ pub async fn handle_schema_upload(
         let wtxn = db_guard
             .write_txn()
             .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
-        let new_version =
-            schema_upload(&wtxn, &validated, now).map_err(map_schema_store_error)?;
+        let new_version = schema_upload(&wtxn, &validated, now).map_err(map_schema_store_error)?;
         wtxn.commit()
             .map_err(|e| OpError::Internal(format!("commit: {e}")))?;
 
@@ -156,10 +157,7 @@ pub async fn handle_schema_get(
         .map_err(map_schema_store_error)?
         .ok_or_else(|| OpError::NotFound {
             what: "schema",
-            detail: format!(
-                "namespace={:?} version={resolved_version}",
-                req.namespace
-            ),
+            detail: format!("namespace={:?} version={resolved_version}", req.namespace),
         })?;
 
     Ok(SchemaGetResponse {
@@ -246,7 +244,9 @@ pub async fn handle_schema_validate(
     match validate(&schema) {
         Ok(v) => {
             let namespace = v.as_schema().namespace.clone();
-            let would_be = current_active(ctx, &namespace)?.unwrap_or(0).saturating_add(1);
+            let would_be = current_active(ctx, &namespace)?
+                .unwrap_or(0)
+                .saturating_add(1);
             Ok(SchemaValidateResponse {
                 namespace,
                 would_be_version: would_be,
@@ -290,9 +290,9 @@ fn current_active(ctx: &OpsContext, namespace: &str) -> Result<Option<u32>, OpEr
 
 fn map_schema_store_error(e: SchemaStoreError) -> OpError {
     match e {
-        SchemaStoreError::VersionOverflow { namespace } => {
-            OpError::Conflict(format!("schema_version overflow for namespace {namespace:?}"))
-        }
+        SchemaStoreError::VersionOverflow { namespace } => OpError::Conflict(format!(
+            "schema_version overflow for namespace {namespace:?}"
+        )),
         other => OpError::Internal(other.to_string()),
     }
 }

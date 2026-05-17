@@ -15,10 +15,10 @@
 //! Phase 16.6c handlers do **not** touch the entity HNSW (16.3) or
 //! emit subscription events. Both wire in later sub-tasks.
 
-use brain_core::{
-    Entity, EntityAttributes, EntityId, EntityTypeId, MemoryId,
+use brain_core::{Entity, EntityAttributes, EntityId, EntityTypeId, MemoryId};
+use brain_metadata::entity_merge_ops::{
+    merge_entity, unmerge_entity, EntityMergeOpError, MergeActor,
 };
-use brain_metadata::entity_merge_ops::{merge_entity, unmerge_entity, EntityMergeOpError, MergeActor};
 use brain_metadata::entity_ops::{
     entity_get, entity_list_by_type, entity_lookup_by_alias, entity_lookup_by_canonical_name,
     entity_put, entity_rename, entity_tombstone, entity_update, EntityOpError,
@@ -114,7 +114,10 @@ pub async fn handle_entity_get(
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
         entity_get(&rtxn, id).map_err(map_entity_op_error)?
     };
-    let entity = entity.ok_or_else(|| OpError::NotFound { what: "entity", detail: format!("{id:?}") })?;
+    let entity = entity.ok_or_else(|| OpError::NotFound {
+        what: "entity",
+        detail: format!("{id:?}"),
+    })?;
     Ok(EntityGetResponse {
         entity: entity_to_view(&entity),
     })
@@ -144,7 +147,10 @@ pub async fn handle_entity_update(
                 .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
             entity_get(&rtxn, id)
                 .map_err(map_entity_op_error)?
-                .ok_or_else(|| OpError::NotFound { what: "entity", detail: format!("{id:?}") })?
+                .ok_or_else(|| OpError::NotFound {
+                    what: "entity",
+                    detail: format!("{id:?}"),
+                })?
         };
         let mut next = current.clone();
         next.canonical_name = req.canonical_name.clone();
@@ -269,9 +275,7 @@ pub async fn handle_entity_merge(
     ctx: &OpsContext,
 ) -> Result<EntityMergeResponse, OpError> {
     if req.reason.len() > 4096 {
-        return Err(OpError::InvalidRequest(
-            "reason exceeds 4 KiB".into(),
-        ));
+        return Err(OpError::InvalidRequest("reason exceeds 4 KiB".into()));
     }
     let survivor = EntityId::from(req.survivor);
     let merged = EntityId::from(req.merged);
@@ -339,8 +343,8 @@ pub async fn handle_entity_unmerge(
         let wtxn = db_guard
             .write_txn()
             .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
-        let survivor =
-            unmerge_entity(&wtxn, merged, MergeActor::System, now).map_err(map_entity_merge_op_error)?;
+        let survivor = unmerge_entity(&wtxn, merged, MergeActor::System, now)
+            .map_err(map_entity_merge_op_error)?;
         wtxn.commit()
             .map_err(|e| OpError::Internal(format!("commit: {e}")))?;
         survivor
@@ -413,9 +417,7 @@ pub async fn handle_entity_list(
     ctx: &OpsContext,
 ) -> Result<EntityListResponseFrame, OpError> {
     if req.limit == 0 || req.limit > 1000 {
-        return Err(OpError::InvalidRequest(
-            "limit must be in 1..=1000".into(),
-        ));
+        return Err(OpError::InvalidRequest("limit must be in 1..=1000".into()));
     }
     if req.entity_type_id == 0 {
         return Err(OpError::InvalidRequest(
@@ -505,8 +507,7 @@ pub async fn handle_entity_resolve(
         ));
     }
     let type_id = EntityTypeId(req.entity_type_hint);
-    let candidate_norm =
-        brain_metadata::entity_ops::normalize_name(&req.candidate_name);
+    let candidate_norm = brain_metadata::entity_ops::normalize_name(&req.candidate_name);
 
     let db_guard = ctx.executor.metadata.lock();
     let rtxn = db_guard
@@ -528,8 +529,8 @@ pub async fn handle_entity_resolve(
     }
 
     // Tier 1b: alias match.
-    let alias_hits = entity_lookup_by_alias(&rtxn, type_id, &req.candidate_name)
-        .map_err(map_entity_op_error)?;
+    let alias_hits =
+        entity_lookup_by_alias(&rtxn, type_id, &req.candidate_name).map_err(map_entity_op_error)?;
     if alias_hits.len() == 1 {
         return Ok(EntityResolveResponse {
             outcome: ResolutionOutcomeWire::Resolved,
@@ -548,9 +549,7 @@ pub async fn handle_entity_resolve(
 
     let mut scored: Vec<(EntityId, f32)> = Vec::new();
     for cand_id in trigram_candidates {
-        if let Some(cand_entity) =
-            entity_get(&rtxn, cand_id).map_err(map_entity_op_error)?
-        {
+        if let Some(cand_entity) = entity_get(&rtxn, cand_id).map_err(map_entity_op_error)? {
             let cand_trigrams =
                 trigrams_of_components(&cand_entity.canonical_name, &cand_entity.aliases);
             let score = jaccard(&candidate_trigrams, &cand_trigrams);
@@ -648,7 +647,10 @@ fn entity_to_view(e: &Entity) -> EntityView {
 /// Internal for redb failures.
 fn map_entity_op_error(err: EntityOpError) -> OpError {
     match err {
-        EntityOpError::NotFound(id) => OpError::NotFound { what: "entity", detail: format!("{id:?}") },
+        EntityOpError::NotFound(id) => OpError::NotFound {
+            what: "entity",
+            detail: format!("{id:?}"),
+        },
         EntityOpError::UnknownEntityType(t) => {
             OpError::InvalidRequest(format!("unknown entity_type {t:?}"))
         }

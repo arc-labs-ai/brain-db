@@ -160,9 +160,7 @@ fn current_schema_version(_ctx: &OpsContext) -> u32 {
 mod tests {
     use super::*;
     use brain_core::knowledge::ExtractorKind;
-    use brain_core::{
-        AgentId, ContextId, ExtractorId, MemoryId, MemoryKind, Salience,
-    };
+    use brain_core::{AgentId, ContextId, ExtractorId, MemoryId, MemoryKind, Salience};
     use brain_extractors::{
         EntityMention, ExtractedItem, ExtractionFuture, ExtractionResult, ExtractorError,
     };

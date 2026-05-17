@@ -216,7 +216,7 @@ pub(super) fn do_encode(writer: &RealWriterHandle, op: EncodeOp) -> Result<Encod
         salience: op.salience_initial,
         timestamp_unix_nanos: created_at,
         text: Some(op.text.clone()),
-            knowledge_payload: None,
+        knowledge_payload: None,
     });
 
     Ok(EncodeAck {

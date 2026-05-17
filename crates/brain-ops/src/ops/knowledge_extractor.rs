@@ -83,11 +83,9 @@ pub async fn handle_extractor_disable(
             req.reason.len()
         )));
     }
-    set_enabled_inner(ctx, req.extractor_id, false).map(|previous| {
-        ExtractorDisableResponse {
-            previously_enabled: previous,
-            disabled_at_unix_nanos: crate::txn::now_unix_nanos_pub(),
-        }
+    set_enabled_inner(ctx, req.extractor_id, false).map(|previous| ExtractorDisableResponse {
+        previously_enabled: previous,
+        disabled_at_unix_nanos: crate::txn::now_unix_nanos_pub(),
     })
 }
 
@@ -144,8 +142,7 @@ fn set_enabled_inner(
         let wtxn = db_guard
             .write_txn()
             .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
-        let previous =
-            extractor_set_enabled(&wtxn, id, enabled).map_err(map_extractor_op_error)?;
+        let previous = extractor_set_enabled(&wtxn, id, enabled).map_err(map_extractor_op_error)?;
         wtxn.commit()
             .map_err(|e| OpError::Internal(format!("commit: {e}")))?;
         previous

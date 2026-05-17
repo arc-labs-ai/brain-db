@@ -810,6 +810,18 @@ pub fn spawn_shard(
                     .expect("SharedHnsw::new");
             // Stub dispatcher — 9.10's frame dispatcher swaps in a real CpuDispatcher.
             let dispatcher: Arc<dyn Dispatcher> = Arc::new(NopDispatcher);
+            // 23.1: per-shard semantic retriever. Reuses the
+            // executor's embedder + the shared memory HNSW
+            // reader; statement HNSW handle is None in v1.
+            let semantic_retriever_for_ops: Option<Arc<dyn brain_index::SemanticRetriever>> = {
+                let retriever = brain_ops::ops::semantic_retriever::BrainSemanticRetriever::new(
+                    dispatcher.clone(),
+                    hnsw_shared.clone(),
+                    None,
+                    metadata.clone(),
+                );
+                Some(Arc::new(retriever))
+            };
             // Per-shard writer wraps metadata + hnsw_writer.
             let writer: Arc<dyn WriterHandle> =
                 Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
@@ -979,7 +991,8 @@ pub fn spawn_shard(
                     .with_tantivy(tantivy_for_ops)
                     .with_memory_text_dispatcher(memory_text_dispatcher_for_ops)
                     .with_statement_text_dispatcher(statement_text_dispatcher_for_ops)
-                    .with_lexical_retriever(lexical_retriever_for_ops),
+                    .with_lexical_retriever(lexical_retriever_for_ops)
+                    .with_semantic_retriever(semantic_retriever_for_ops),
             );
 
             // Spawn the per-shard fanout task: drains the in-process

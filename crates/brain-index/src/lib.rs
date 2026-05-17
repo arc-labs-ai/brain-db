@@ -33,6 +33,7 @@ pub mod idmap;
 pub mod params;
 pub mod persistence;
 pub mod rebuild;
+pub mod semantic_retriever;
 pub mod shared;
 pub mod statement_hnsw;
 pub mod tantivy_shard;
@@ -45,6 +46,14 @@ pub use hnsw::{HnswError, HnswIndex};
 pub use idmap::{IdMap, IdMapError};
 pub use params::{IndexParams, IndexParamsError, MAX_LAYER, VECTOR_DIM};
 pub use rebuild::RebuildReport;
+pub use semantic_retriever::{
+    project_memory_hits, project_statement_hits,
+    validate_filters_for_scope as validate_semantic_filters, SemanticError, SemanticFilters,
+    SemanticFiltersConfigSlot, SemanticQuery, SemanticRetriever, SemanticRetrieverConfig,
+    SemanticScope, DEFAULT_EF_SEARCH as SEMANTIC_DEFAULT_EF_SEARCH,
+    DEFAULT_TIMEOUT_MS as SEMANTIC_DEFAULT_TIMEOUT_MS, DEFAULT_TOP_K as SEMANTIC_DEFAULT_TOP_K,
+    EF_SEARCH_MAX as SEMANTIC_EF_SEARCH_MAX, VECTOR_DIM as SEMANTIC_VECTOR_DIM,
+};
 pub use shared::{SharedHnsw, Writer};
 pub use statement_hnsw::{
     RebuildReport as StatementRebuildReport, StatementHnswError, StatementHnswIndex,

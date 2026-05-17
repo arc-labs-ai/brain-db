@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brain_extractors::{ClassifierConfig, ExtractorRegistry};
-use brain_index::{LexicalRetriever, TantivyShard};
+use brain_index::{LexicalRetriever, SemanticRetriever, TantivyShard};
 use brain_metadata::LlmCacheDb;
 use brain_planner::{ExecutorContext, PlannerContext};
 use parking_lot::{Mutex, RwLock};
@@ -86,6 +86,11 @@ pub struct OpsContext {
     /// Phase 23's hybrid query consumes this slot; substrate-
     /// only deployments leave it `None`.
     pub lexical_retriever: Option<Arc<dyn LexicalRetriever>>,
+    /// Per-shard semantic retriever (phase 23.1). Reads the
+    /// substrate memory HNSW + (when wired) the statement
+    /// HNSW. Phase 23's hybrid query consumes this slot
+    /// alongside [`lexical_retriever`].
+    pub semantic_retriever: Option<Arc<dyn SemanticRetriever>>,
 }
 
 impl OpsContext {
@@ -108,6 +113,7 @@ impl OpsContext {
             memory_text_dispatcher: None,
             statement_text_dispatcher: None,
             lexical_retriever: None,
+            semantic_retriever: None,
         }
     }
 
@@ -219,6 +225,17 @@ impl OpsContext {
     #[must_use]
     pub fn with_lexical_retriever(mut self, retriever: Option<Arc<dyn LexicalRetriever>>) -> Self {
         self.lexical_retriever = retriever;
+        self
+    }
+
+    /// Install (or clear) the semantic retriever (phase 23.1).
+    /// Phase 23's hybrid query path reads through this slot.
+    #[must_use]
+    pub fn with_semantic_retriever(
+        mut self,
+        retriever: Option<Arc<dyn SemanticRetriever>>,
+    ) -> Self {
+        self.semantic_retriever = retriever;
         self
     }
 }

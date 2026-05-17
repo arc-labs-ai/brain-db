@@ -15,6 +15,7 @@ pub mod link;
 pub mod plan;
 pub mod reason;
 pub mod recall;
+pub mod semantic_retriever;
 pub mod subscribe;
 pub mod text_indexer;
 pub mod txn;
