@@ -26,7 +26,7 @@ fn one_shot_encode_with_all_flags() {
     ]);
     match cli.subcommand {
         Some(Command::Encode(a)) => {
-            assert_eq!(a.text, "hello world");
+            assert_eq!(a.text.as_deref(), Some("hello world"));
             assert_eq!(a.context, Some(7));
             assert_eq!(a.kind, Some(KindArg::Semantic));
             assert_eq!(a.salience, Some(0.8));
@@ -178,7 +178,7 @@ fn repl_line_tokenises_and_parses() {
     let cli = Cli::try_parse_from(argv).expect("parse");
     match cli.subcommand {
         Some(Command::Encode(a)) => {
-            assert_eq!(a.text, "hello world");
+            assert_eq!(a.text.as_deref(), Some("hello world"));
             assert_eq!(a.context, Some(7));
         }
         other => panic!("expected Encode, got {other:?}"),

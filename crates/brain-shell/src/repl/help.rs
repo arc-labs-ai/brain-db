@@ -23,7 +23,10 @@ fn top_level() -> String {
     let mut s = String::new();
     s.push_str("Cognitive verbs:\n");
     s.push_str("  encode <TEXT> [--context N] [--kind ...] [--salience F] [--deduplicate]\n");
-    s.push_str("  recall <QUERY> [--top-k N] [--confidence F] [--filter-context N]... [--filter-kind K]...\n");
+    s.push_str("         [--edge KIND:ID]... [--request-id UUID] [--from-file PATH]\n");
+    s.push_str("         [--from-stdin] [--vector CSV] [--wait-for-extraction]\n");
+    s.push_str("  recall <QUERY> [--top-k N] [--confidence F] [--filter-context N]...\n");
+    s.push_str("         [--filter-kind K]... [--include-text] [--include-graph]\n");
     s.push_str("  plan <FROM> <TO> [--max-steps N] [--max-wall-time-ms N]\n");
     s.push_str("  reason <OBS> [--depth N] [--confidence F] [--max-inferences N]\n");
     s.push_str("  forget <ID> [--mode soft|hard]\n");
@@ -31,10 +34,20 @@ fn top_level() -> String {
     s.push_str("  unlink <SRC> <KIND> <TGT>\n");
     s.push_str("  txn begin | txn commit <ID> | txn abort <ID>\n");
     s.push_str("  subscribe [--context N]... [--kind K]... [--collect N]\n");
+    s.push_str("\nKnowledge browsing:\n");
+    s.push_str("  entity list [--type T] [--limit N] [--prefix STR]\n");
+    s.push_str("  entity show <id|name>\n");
+    s.push_str("  entity neighbors <id> [--depth N]\n");
+    s.push_str("  statement list [--subject E] [--predicate P] [--object E]\n");
+    s.push_str("  statement show <id>\n");
+    s.push_str("  relation list [--from E] [--to E] [--type T]\n");
+    s.push_str("  mention list --memory M | --entity E\n");
+    s.push_str("  extract status <memory_id>\n");
+    s.push_str("  extract backfill --memory <id> | --since <ts> | --all\n");
     s.push_str("\nMeta (session-only by default — `\\config set` persists):\n");
     s.push_str("  quit | exit | \\q                 exit the shell\n");
     s.push_str("  help [verb] | ? [verb] | \\?       show help\n");
-    s.push_str("  \\set output json|table           session-only output toggle\n");
+    s.push_str("  \\set output auto|table|wide|json|ndjson|yaml\n");
     s.push_str("  \\set context <N>                 session-only sticky --context\n");
     s.push_str("  \\unset txn                       drop the active transaction\n");
     s.push_str("  \\timing on|off                   per-op wall time\n");
@@ -49,6 +62,7 @@ fn top_level() -> String {
     s.push_str("  \\agent                           current binding (id + source)\n");
     s.push_str("  \\agent list                      named agents in config.toml\n");
     s.push_str("  \\agent show [<name>]             full record\n");
+    s.push_str("  \\agent use <name>                sticky-bind to <name> (reconnect)\n");
     s.push_str("  \\agent create <name> [--note T]  mint a fresh agent\n");
     s
 }

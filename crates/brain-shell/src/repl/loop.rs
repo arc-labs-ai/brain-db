@@ -26,7 +26,7 @@ pub async fn run(
     agent_id: AgentId,
     agent_source: AgentIdSource,
 ) -> anyhow::Result<()> {
-    let (mut ed, history_path) = editor::build()?;
+    let (mut ed, history_path) = editor::build(session.recent_ids.clone())?;
 
     println!(
         "brain shell — connected to {} as {}{}.",
@@ -138,6 +138,36 @@ async fn run_one(client: &Client, session: &mut Session, cmd: Command) {
                 .await
                 .map(|r| (op.to_string(), r))
         }
+        Command::Entity(sub) => {
+            let op = commands::entity::op_name(&sub).to_string();
+            commands::entity::run(client, session, sub)
+                .await
+                .map(|r| (op, r))
+        }
+        Command::Statement(sub) => {
+            let op = commands::statement::op_name(&sub).to_string();
+            commands::statement::run(client, session, sub)
+                .await
+                .map(|r| (op, r))
+        }
+        Command::Relation(sub) => {
+            let op = commands::relation::op_name(&sub).to_string();
+            commands::relation::run(client, session, sub)
+                .await
+                .map(|r| (op, r))
+        }
+        Command::Mention(sub) => {
+            let op = commands::mention::op_name(&sub).to_string();
+            commands::mention::run(client, session, sub)
+                .await
+                .map(|r| (op, r))
+        }
+        Command::Extract(sub) => {
+            let op = commands::extract::op_name(&sub).to_string();
+            commands::extract::run(client, session, sub)
+                .await
+                .map(|r| (op, r))
+        }
         Command::Config(_) | Command::Agent(_) => {
             // `\config …` / `\agent …` are handled by parse_meta; the
             // clap path only fires if someone typed the bare verbs
@@ -157,9 +187,13 @@ async fn run_one(client: &Client, session: &mut Session, cmd: Command) {
     match result {
         Ok((op, body)) => {
             let mut stdout = std::io::stdout();
-            if let Err(e) =
-                write_rendered(&mut stdout, &op, body.as_ref(), session.output, elapsed_ms)
-            {
+            if let Err(e) = write_rendered(
+                &mut stdout,
+                &op,
+                body.as_ref(),
+                session.output.clone(),
+                elapsed_ms,
+            ) {
                 eprintln!("output error: {e}");
             }
         }
@@ -187,7 +221,15 @@ fn inherits_active_txn(cmd: &Command) -> bool {
         Command::Link(a) => a.txn.is_none(),
         Command::Unlink(a) => a.txn.is_none(),
         Command::Forget(_) | Command::Plan(_) | Command::Reason(_) => true,
-        Command::Subscribe(_)
+        // Knowledge-layer browse + extract surfaces are read-only or
+        // admin-flavored; none of them implicitly bind to the active
+        // txn the way encode / link / unlink do.
+        Command::Entity(_)
+        | Command::Statement(_)
+        | Command::Relation(_)
+        | Command::Mention(_)
+        | Command::Extract(_)
+        | Command::Subscribe(_)
         | Command::Txn(_)
         | Command::Config(_)
         | Command::Agent(_)
@@ -254,8 +296,12 @@ fn parse_meta(line: &str) -> Option<Meta> {
         if parts.len() == 2 && parts[0] == "output" {
             let v = parts[1].to_ascii_lowercase();
             return match v.as_str() {
+                "auto" => Some(Meta::SetOutput(OutputFormatArg::Auto)),
                 "json" => Some(Meta::SetOutput(OutputFormatArg::Json)),
                 "table" => Some(Meta::SetOutput(OutputFormatArg::Table)),
+                "wide" => Some(Meta::SetOutput(OutputFormatArg::Wide)),
+                "ndjson" => Some(Meta::SetOutput(OutputFormatArg::Ndjson)),
+                "yaml" => Some(Meta::SetOutput(OutputFormatArg::Yaml)),
                 _ => Some(Meta::Unknown(v)),
             };
         }
@@ -355,8 +401,9 @@ async fn handle_meta(
             false
         }
         Meta::SetOutput(o) => {
+            let label = o.short_name();
             session.output = o;
-            println!("output = {:?}", o);
+            println!("output = {label}");
             false
         }
         Meta::SetContext(n) => {
@@ -377,11 +424,16 @@ async fn handle_meta(
         Meta::Connect(addr_str) => {
             match parse_server(&addr_str) {
                 Ok(addr) => {
-                    match connection::connect(addr, agent_id, Duration::from_secs(30)).await {
+                    // sticky_agent (set via `\agent use`) takes precedence over the
+                    // process-bound agent_id so the rebind actually changes the
+                    // wire identity on reconnect.
+                    let effective_agent = session.sticky_agent.unwrap_or(agent_id);
+                    match connection::connect(addr, effective_agent, Duration::from_secs(30)).await
+                    {
                         Ok(new_client) => {
                             *client = new_client;
                             session.server = addr;
-                            println!("connected to {addr}");
+                            println!("connected to {addr} as {}", effective_agent.0);
                         }
                         Err(e) => eprintln!("connect failed: {e}"),
                     }
@@ -391,7 +443,7 @@ async fn handle_meta(
             false
         }
         Meta::Agent => {
-            print_agent_info(session.output, agent_id, agent_source);
+            print_agent_info(&session.output, agent_id, agent_source);
             false
         }
         Meta::AgentSub(sub) => {
@@ -409,7 +461,7 @@ async fn handle_meta(
     }
 }
 
-fn handle_agent_sub(sub: AgentSub, session: &Session, agent_source: &AgentIdSource) {
+fn handle_agent_sub(sub: AgentSub, session: &mut Session, agent_source: &AgentIdSource) {
     let bound_name = source_name(agent_source);
     let (mut config, _note) = match Config::load_or_default() {
         Ok(p) => p,
@@ -459,13 +511,14 @@ fn handle_agent_sub(sub: AgentSub, session: &Session, agent_source: &AgentIdSour
                 }
             }
         }
-        AgentSub::Use(_) => {
-            // Rebind is intentionally tricky (it requires a fresh
-            // connection with the new agent id), and the user has
-            // session state (active_txn, recent_ids) that ought to
-            // be reset. Refuse here with a clean message pointing
-            // at `quit` + relaunch. Live rebinding is a future
-            // refinement, not load-bearing for this PR.
+        AgentSub::Use(name) => {
+            // Sticky-agent binding. Looks the name up in config, parses
+            // the UUID, stashes it on the session. The reconnect is the
+            // owner of the open Client and lives in the caller — here we
+            // refuse if there's an open transaction (its handle is tied
+            // to the current agent's connection), and otherwise stash
+            // the new id so a follow-up `\connect` (or process restart)
+            // picks it up.
             if session.active_txn.is_some() {
                 eprintln!(
                     "error: active transaction prevents agent rebind — \
@@ -473,10 +526,23 @@ fn handle_agent_sub(sub: AgentSub, session: &Session, agent_source: &AgentIdSour
                 );
                 return;
             }
-            eprintln!(
-                "live agent rebind is not yet supported — quit and relaunch \
-                 with `brain --agent <name>`"
-            );
+            let entry = match config.get_agent(&name) {
+                Ok(e) => e.clone(),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return;
+                }
+            };
+            match uuid::Uuid::parse_str(&entry.id) {
+                Ok(uuid) => {
+                    session.sticky_agent = Some(brain_core::AgentId(uuid));
+                    println!(
+                        "sticky agent set to '{name}' ({uuid}); reconnect via `\\connect <host:port>` \
+                         to bind the new id on the wire."
+                    );
+                }
+                Err(e) => eprintln!("error: agent '{name}' has malformed uuid: {e}"),
+            }
         }
         AgentSub::Create { name, note } => {
             match config.create_agent(&name, note.as_deref().unwrap_or("")) {
@@ -554,7 +620,11 @@ fn apply_setting_to_session(key: &str, value: &str, session: &mut Session) {
     match key {
         "output" => {
             session.output = match value {
+                "auto" => OutputFormatArg::Auto,
                 "json" => OutputFormatArg::Json,
+                "wide" => OutputFormatArg::Wide,
+                "ndjson" => OutputFormatArg::Ndjson,
+                "yaml" => OutputFormatArg::Yaml,
                 _ => OutputFormatArg::Table,
             };
         }
@@ -621,35 +691,36 @@ fn source_name(s: &AgentIdSource) -> Option<String> {
 }
 
 /// Render `\agent` (bare) — current binding summary.
-fn print_agent_info(output: OutputFormatArg, agent_id: AgentId, source: &AgentIdSource) {
-    match output {
-        OutputFormatArg::Table => {
-            println!("agent_id = {}", agent_id.0);
-            println!("source   = {}", source_label(source));
-            if let Some(name) = source_name(source) {
-                println!("name     = {name}");
-            }
+fn print_agent_info(output: &OutputFormatArg, agent_id: AgentId, source: &AgentIdSource) {
+    let human = matches!(
+        output,
+        OutputFormatArg::Auto | OutputFormatArg::Table | OutputFormatArg::Wide
+    );
+    if human {
+        println!("agent_id = {}", agent_id.0);
+        println!("source   = {}", source_label(source));
+        if let Some(name) = source_name(source) {
+            println!("name     = {name}");
         }
-        OutputFormatArg::Json => {
-            let kind = match source {
-                AgentIdSource::NamedFlag { .. } => "named-flag",
-                AgentIdSource::IdFlag => "id-flag",
-                AgentIdSource::NamedEnv { .. } => "named-env",
-                AgentIdSource::IdEnv => "id-env",
-                AgentIdSource::Ephemeral => "ephemeral",
-            };
-            let name = source_name(source);
-            let body = serde_json::json!({
-                "op": "agent",
-                "result": {
-                    "agent_id": agent_id.0.to_string(),
-                    "source": kind,
-                    "name": name,
-                },
-            });
-            println!("{body}");
-        }
+        return;
     }
+    let kind = match source {
+        AgentIdSource::NamedFlag { .. } => "named-flag",
+        AgentIdSource::IdFlag => "id-flag",
+        AgentIdSource::NamedEnv { .. } => "named-env",
+        AgentIdSource::IdEnv => "id-env",
+        AgentIdSource::Ephemeral => "ephemeral",
+    };
+    let name = source_name(source);
+    let body = serde_json::json!({
+        "op": "agent",
+        "result": {
+            "agent_id": agent_id.0.to_string(),
+            "source": kind,
+            "name": name,
+        },
+    });
+    println!("{body}");
 }
 
 #[cfg(test)]

@@ -44,13 +44,10 @@ fn recent_id_evicts_oldest_past_cap() {
     for i in 0..=(RECENT_ID_CAP as u128) {
         s.push_recent_id(MemoryId::from_raw(i));
     }
-    assert_eq!(s.recent_ids.len(), RECENT_ID_CAP);
-    // 0 should have been evicted; RECENT_ID_CAP should be at the front.
-    assert!(!s.recent_ids.iter().any(|x| *x == MemoryId::from_raw(0)));
-    assert_eq!(
-        *s.recent_ids.front().unwrap(),
-        MemoryId::from_raw(RECENT_ID_CAP as u128)
-    );
+    let snap = s.recent_ids_snapshot();
+    assert_eq!(snap.len(), RECENT_ID_CAP);
+    assert!(!snap.iter().any(|x| *x == MemoryId::from_raw(0)));
+    assert_eq!(snap[0], MemoryId::from_raw(RECENT_ID_CAP as u128));
 }
 
 #[test]
@@ -60,7 +57,11 @@ fn recent_id_dedup_promotes_to_front() {
     s.push_recent_id(MemoryId::from_raw(2));
     s.push_recent_id(MemoryId::from_raw(3));
     s.push_recent_id(MemoryId::from_raw(2));
-    let ids: Vec<u128> = s.recent_ids.iter().map(|m| m.raw()).collect();
+    let ids: Vec<u128> = s
+        .recent_ids_snapshot()
+        .into_iter()
+        .map(|m| m.raw())
+        .collect();
     assert_eq!(ids, vec![2, 3, 1]);
 }
 

@@ -1,7 +1,10 @@
 //! Persistent-history line editor wrapper.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
+use brain_core::MemoryId;
 use rustyline::config::Config;
 use rustyline::history::FileHistory;
 use rustyline::{Editor, Result as RlResult};
@@ -14,13 +17,17 @@ pub type ShellEditor = Editor<ShellHelper, FileHistory>;
 /// Build the editor and load history. The history file lives at
 /// `$XDG_DATA_HOME/brain/history` (or `~/.brain_history` on
 /// platforms without an XDG data dir).
-pub fn build() -> RlResult<(ShellEditor, PathBuf)> {
+///
+/// `recent_ids` is the shared id ring; the helper reads it for
+/// tab-completion of `MemoryId` arguments. The caller (REPL loop)
+/// owns the same `Arc` and pushes ids onto it as commands run.
+pub fn build(recent_ids: Arc<Mutex<VecDeque<MemoryId>>>) -> RlResult<(ShellEditor, PathBuf)> {
     let config = Config::builder()
         .auto_add_history(true)
         .max_history_size(10_000)?
         .build();
     let mut editor: ShellEditor = Editor::with_config(config)?;
-    editor.set_helper(Some(ShellHelper));
+    editor.set_helper(Some(ShellHelper::with_recent(recent_ids)));
 
     let path = history_path();
     if path.exists() {

@@ -5,7 +5,7 @@
 
 use brain_core::RequestId;
 use brain_protocol::opcode::Opcode;
-use brain_protocol::request::{MemoryKindWire, RecallRequest, RecallStrategy};
+use brain_protocol::request::{MemoryKindWire, RecallRequest};
 use brain_protocol::response::{MemoryResult, RecallResponseFrame};
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 
@@ -24,7 +24,6 @@ pub struct RecallBuilder<'a> {
     age_bound_unix_nanos: Option<u64>,
     kind_filter: Option<Vec<MemoryKindWire>>,
     salience_floor: f32,
-    strategy: Option<RecallStrategy>,
     include_vectors: bool,
     include_edges: bool,
     include_text: bool,
@@ -43,7 +42,6 @@ impl<'a> RecallBuilder<'a> {
             age_bound_unix_nanos: None,
             kind_filter: None,
             salience_floor: 0.0,
-            strategy: None,
             include_vectors: false,
             include_edges: false,
             include_text: false,
@@ -103,22 +101,6 @@ impl<'a> RecallBuilder<'a> {
         self
     }
 
-    /// Pick a recall strategy. `Auto` is the server default — the
-    /// substrate runs hybrid retrieval (semantic + lexical + graph
-    /// fused via RRF) unless inside a transaction.
-    ///
-    /// `SubstrateOnly` forces the raw HNSW vector path; useful for
-    /// benchmarks comparing hybrid against pure vector recall.
-    ///
-    /// `HybridOnly` forces hybrid; if a required retriever slot is
-    /// missing on this shard the server returns
-    /// `HybridUnavailable` rather than silently degrading.
-    #[must_use]
-    pub fn strategy(mut self, strategy: RecallStrategy) -> Self {
-        self.strategy = Some(strategy);
-        self
-    }
-
     #[must_use]
     pub fn request_id(mut self, id: RequestId) -> Self {
         self.request_id = Some(id);
@@ -147,7 +129,6 @@ impl<'a> RecallBuilder<'a> {
         let age_bound_unix_nanos = self.age_bound_unix_nanos;
         let kind_filter = self.kind_filter;
         let salience_floor = self.salience_floor;
-        let strategy = self.strategy;
         let include_vectors = self.include_vectors;
         let include_edges = self.include_edges;
         let include_text = self.include_text;
@@ -171,7 +152,6 @@ impl<'a> RecallBuilder<'a> {
                         age_bound_unix_nanos,
                         kind_filter,
                         salience_floor,
-                        strategy,
                         include_vectors,
                         include_edges,
                         include_text,
@@ -238,7 +218,6 @@ impl<'a> RecallBuilder<'a> {
             age_bound_unix_nanos: self.age_bound_unix_nanos,
             kind_filter: self.kind_filter,
             salience_floor: self.salience_floor,
-            strategy: self.strategy,
             include_vectors: self.include_vectors,
             include_edges: self.include_edges,
             include_text: self.include_text,

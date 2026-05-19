@@ -5,9 +5,12 @@ pub mod command;
 pub mod tokenize;
 
 pub use command::{
-    format_txn_id, parse_server, parse_txn_id, AgentCommand, Cli, Command, ConfigCommand,
-    EdgeKindArg, EncodeArgs, ForgetArgs, ForgetModeArg, GenerateCompletionArgs, GlobalOpts,
-    KindArg, LinkArgs, MemoryIdArg, OutputFormatArg, PlanArgs, ReasonArgs, RecallArgs,
-    SubscribeArgs, TxnArgs, TxnCommand, UnlinkArgs,
+    format_txn_id, parse_server, parse_txn_id, AgentCommand, Cli, ColorMode, Command,
+    ConfigCommand, EdgeKindArg, EdgeSpec, EncodeArgs, EntityCommand, EntityListArgs,
+    EntityNeighborsArgs, EntityShowArgs, ExtractBackfillArgs, ExtractCommand, ExtractStatusArgs,
+    ForgetArgs, ForgetModeArg, GenerateCompletionArgs, GlobalOpts, HyperlinkMode, KindArg,
+    LinkArgs, MemoryIdArg, MentionCommand, MentionListArgs, OutputFormatArg, PlanArgs, ReasonArgs,
+    RecallArgs, RelationCommand, RelationListArgs, StatementCommand, StatementListArgs,
+    StatementShowArgs, SubscribeArgs, TxnArgs, TxnCommand, UnlinkArgs,
 };
 pub use tokenize::{tokenize_line, TokenizeError};

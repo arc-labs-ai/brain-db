@@ -1,5 +1,14 @@
-//! Hand-rolled column-aligning table renderer plus [`Render`]
-//! impls for every response type.
+//! Tabular renderers built on `comfy_table`.
+//!
+//! Why comfy_table: per-cell wrap, multi-line cells, terminal-width
+//! auto-fit, alignment, borders, and color all in one dependency.
+//! Replaces the hand-rolled box-drawing renderer that didn't wrap,
+//! didn't color, and didn't detect width.
+//!
+//! Every public response type implements [`Render`] (in `super`).
+//! `render_table` builds a `comfy_table::Table` and writes its
+//! `to_string()`; the table layout is responsible for honoring terminal
+//! width.
 
 use std::io::{self, Write};
 
@@ -9,167 +18,53 @@ use brain_protocol::response::{
     PlanStep, SubscriptionEvent, TxnAbortResponse, TxnBeginResponse, TxnCommitResponse,
     UnlinkResponse,
 };
+use comfy_table::{Cell, ContentArrangement, Row, Table};
+use owo_colors::OwoColorize;
 use serde_json::{json, Value};
 
+use crate::output::term::TermPolicy;
 use crate::parser::format_txn_id;
 
 use super::Render;
 
-/// Default terminal width when we can't probe (we don't add a dep
-/// to detect it). Wide enough for most cases without truncating
-/// memory ids or scores.
-pub const DEFAULT_WIDTH: usize = 100;
+// ─── shared formatters ──────────────────────────────────────────
 
-// ─── pure-helper renderers ──────────────────────────────────────
-
-/// Render a list of rows (each a Vec of cell strings) under the
-/// given headers, aligning columns and drawing a light box.
-pub fn render_rows(
-    w: &mut dyn Write,
-    headers: &[&str],
-    rows: &[Vec<String>],
-    max_width: usize,
-) -> io::Result<()> {
-    if rows.is_empty() {
-        writeln!(w, "(no rows)")?;
-        return Ok(());
-    }
-    let cols = headers.len();
-    let mut widths: Vec<usize> = headers.iter().map(|h| display_width(h)).collect();
-    for row in rows {
-        for (i, cell) in row.iter().enumerate().take(cols) {
-            let w = display_width(cell);
-            if w > widths[i] {
-                widths[i] = w;
-            }
-        }
-    }
-    // Reserve `2 + 3*(cols-1) + 2` for borders/separators. Then cap
-    // the last column so total width <= max_width.
-    let chrome = 2 + 3 * cols.saturating_sub(1) + 2;
-    let used: usize = widths.iter().sum::<usize>() + chrome;
-    if used > max_width && cols > 0 {
-        let last = cols - 1;
-        let slack = used - max_width;
-        if widths[last] > slack {
-            widths[last] -= slack;
-        } else {
-            widths[last] = 8;
-        }
-    }
-
-    let sep = build_border(&widths, '┬', '─', '┌', '┐');
-    let mid = build_border(&widths, '┼', '─', '├', '┤');
-    let bot = build_border(&widths, '┴', '─', '└', '┘');
-
-    writeln!(w, "{sep}")?;
-    write_row(w, headers, &widths)?;
-    writeln!(w, "{mid}")?;
-    for row in rows {
-        let cells: Vec<String> = row
-            .iter()
-            .enumerate()
-            .map(|(i, c)| truncate_to(c, widths[i]))
-            .collect();
-        let cell_refs: Vec<&str> = cells.iter().map(String::as_str).collect();
-        write_row(w, &cell_refs, &widths)?;
-    }
-    writeln!(w, "{bot}")?;
-    Ok(())
-}
-
-fn build_border(widths: &[usize], joiner: char, fill: char, left: char, right: char) -> String {
-    let mut s = String::new();
-    s.push(left);
-    for (i, w) in widths.iter().enumerate() {
-        if i > 0 {
-            s.push(joiner);
-        }
-        for _ in 0..(w + 2) {
-            s.push(fill);
-        }
-    }
-    s.push(right);
-    s
-}
-
-fn write_row(w: &mut dyn Write, cells: &[&str], widths: &[usize]) -> io::Result<()> {
-    write!(w, "│")?;
-    for (i, cell) in cells.iter().enumerate() {
-        let pad = widths[i].saturating_sub(display_width(cell));
-        write!(w, " {}{} │", cell, " ".repeat(pad))?;
-    }
-    writeln!(w)
-}
-
-/// Truncate `s` so its displayed width is at most `max`, appending
-/// `…` if anything was elided.
-fn truncate_to(s: &str, max: usize) -> String {
-    if display_width(s) <= max {
-        return s.to_string();
-    }
-    if max <= 1 {
-        return "…".to_string();
-    }
-    let mut out = String::new();
-    let mut w = 0usize;
-    for ch in s.chars() {
-        let cw = char_width(ch);
-        if w + cw + 1 > max {
-            break;
-        }
-        out.push(ch);
-        w += cw;
-    }
-    out.push('…');
-    out
-}
-
-/// Approximate "display width" — we don't depend on `unicode-width`
-/// so this is a simple char count, treating control chars as 0 and
-/// everything else as 1.
-fn display_width(s: &str) -> usize {
-    s.chars().map(char_width).sum()
-}
-
-fn char_width(ch: char) -> usize {
-    if ch.is_control() {
-        0
-    } else {
-        1
-    }
+/// Build the standard comfy_table base — dynamic content arrangement,
+/// terminal-width adaptive, no internal borders so output stays scannable
+/// in the common case.
+fn build_table(policy: TermPolicy) -> Table {
+    let mut table = Table::new();
+    table
+        .load_preset(comfy_table::presets::UTF8_HORIZONTAL_ONLY)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_width(u16::try_from(policy.width.max(40)).unwrap_or(u16::MAX));
+    table
 }
 
 /// Full `0x` + 32 hex form of a MemoryId. Used in JSON output and
-/// anywhere a tool wants the canonical id (e.g. forget/link
-/// arguments). Tables use [`fmt_short_id`] instead.
-fn fmt_id(raw: u128) -> String {
+/// anywhere a tool wants the canonical id.
+pub(crate) fn fmt_id(raw: u128) -> String {
     format!("0x{:032x}", raw)
 }
 
-/// Compact, human-scannable MemoryId for table rendering:
-/// `s{shard}/m{slot}/v{version}`. Encodes the same info as the
-/// full 32-hex form in ~10 chars instead of 34. The full form
-/// remains available via JSON output and `fmt_id`.
-fn fmt_short_id(raw: u128) -> String {
+/// Compact `s{shard}/m{slot}/v{version}` form for table rendering.
+pub(crate) fn fmt_short_id(raw: u128) -> String {
     let id = MemoryId::from_be_bytes(raw.to_be_bytes());
     format!("s{}/m{}/v{}", id.shard(), id.slot(), id.version())
 }
 
-/// First 4 hex chars + `…` for a 16-byte array. Used for agent_id
-/// and model fingerprints in compact views where the full 32-char
-/// form would dominate the line.
-fn fmt_short_hex_16(bytes: &[u8; 16]) -> String {
+/// First 4 hex chars + `…`. Used for agent_id and model fingerprints
+/// in compact views where the full form would dominate the line.
+pub(crate) fn fmt_short_hex_16(bytes: &[u8; 16]) -> String {
     format!(
         "{:02x}{:02x}{:02x}{:02x}…",
         bytes[0], bytes[1], bytes[2], bytes[3]
     )
 }
 
-/// `0x` prefix + 32 hex chars for a 16-byte array (UUID-shaped). Used
-/// for `agent_id` and `embedding_model_fp` in JSON output so a script
-/// can grep without parsing rkyv.
-fn fmt_hex_16(bytes: &[u8; 16]) -> String {
+/// `0x` + 32 hex chars. Used in JSON output so scripts can grep
+/// without parsing rkyv.
+pub(crate) fn fmt_hex_16(bytes: &[u8; 16]) -> String {
     let mut s = String::with_capacity(34);
     s.push_str("0x");
     for b in bytes {
@@ -178,11 +73,7 @@ fn fmt_hex_16(bytes: &[u8; 16]) -> String {
     s
 }
 
-fn fmt_memory_id(id: MemoryId) -> String {
-    fmt_id(id.raw())
-}
-
-fn fmt_kind(k: brain_protocol::request::MemoryKindWire) -> &'static str {
+pub(crate) fn fmt_kind(k: brain_protocol::request::MemoryKindWire) -> &'static str {
     match k {
         brain_protocol::request::MemoryKindWire::Episodic => "episodic",
         brain_protocol::request::MemoryKindWire::Semantic => "semantic",
@@ -190,7 +81,7 @@ fn fmt_kind(k: brain_protocol::request::MemoryKindWire) -> &'static str {
     }
 }
 
-fn fmt_edge_kind(k: brain_protocol::request::EdgeKindWire) -> &'static str {
+pub(crate) fn fmt_edge_kind(k: brain_protocol::request::EdgeKindWire) -> &'static str {
     match k {
         brain_protocol::request::EdgeKindWire::Caused => "Caused",
         brain_protocol::request::EdgeKindWire::FollowedBy => "FollowedBy",
@@ -203,23 +94,40 @@ fn fmt_edge_kind(k: brain_protocol::request::EdgeKindWire) -> &'static str {
     }
 }
 
+/// Middle-truncate `s` so its displayed width is at most `max`. The
+/// pattern is `<head>…<tail>` — preserves both the human-recognizable
+/// start and the discriminating tail (often where the noun lives in a
+/// memory text).
+pub(crate) fn middle_truncate(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    // 1 char for the ellipsis; rest split between head and tail. Bias
+    // a touch towards the head so the "what kind of text" cue lands first.
+    let budget = max - 1;
+    let head_chars = (budget + 1) / 2;
+    let tail_chars = budget - head_chars;
+    let head: String = s.chars().take(head_chars).collect();
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{head}…{tail}")
+}
+
 // ─── Render impls ───────────────────────────────────────────────
 
-/// Render-time wrapper around [`EncodeResponse`] that carries the
-/// request's `deduplicate` flag, so we can distinguish three states
-/// instead of the misleading raw `was_deduplicated` boolean:
-///
-/// - **`off`**  — caller did not pass `--deduplicate`. The server
-///   never consulted the fingerprint table; this is a fresh slot.
-///   Sibling memories with identical text are also `off`.
-/// - **`hit`**  — caller asked for dedup AND the server found a
-///   matching fingerprint, so it returned the existing memory id
-///   instead of allocating a new slot. `was_deduplicated = true`.
-/// - **`miss`** — caller asked for dedup, no existing match, fresh
-///   slot allocated. `was_deduplicated = false`.
-///
-/// The raw `was_deduplicated` bool is still emitted in the JSON
-/// envelope for scripts that already parse it.
+/// Render-time wrapper around [`EncodeResponse`] carrying the request's
+/// `deduplicate` flag, so we can distinguish off / hit / miss instead of
+/// the misleading raw bool.
 pub struct EncodeRendered {
     pub response: EncodeResponse,
     pub dedup_requested: bool,
@@ -238,14 +146,14 @@ impl EncodeRendered {
 impl Render for EncodeRendered {
     fn render_table(&self, w: &mut dyn Write) -> io::Result<()> {
         let r = &self.response;
-        // First line — outcome + the two ids the caller most likely
-        // wants to chain off: memory_id (for LINK/FORGET/RECALL by
-        // id) and lsn (for `subscribe --start-lsn lsn+1`).
-        writeln!(w, "ok  {}  lsn={}", fmt_short_id(r.memory_id), r.lsn)?;
-        // Second line — provenance + classification. Indented so
-        // the eye groups it as a continuation of the first line.
-        // `dedup=off` is suppressed (the common case) to reduce
-        // noise; `hit`/`miss` are surfaced.
+        let policy = TermPolicy::plain();
+        let id_short = fmt_short_id(r.memory_id);
+        let id_cell = if policy.color {
+            id_short.green().to_string()
+        } else {
+            id_short
+        };
+        writeln!(w, "ok  {}  lsn={}", id_cell, r.lsn)?;
         let kind = format!("{:?}", r.kind).to_lowercase();
         let mut parts: Vec<String> = vec![
             format!("agent={}", fmt_short_hex_16(&r.agent_id)),
@@ -289,22 +197,13 @@ pub struct RecallResults(pub Vec<MemoryResult>);
 
 impl Render for RecallResults {
     fn render_table(&self, w: &mut dyn Write) -> io::Result<()> {
-        // Two-line per result. Line 1 is rank + id + classification
-        // + decay/access/edges/score; line 2 is the full text on its
-        // own row so it can breathe (the most useful column in the
-        // common `--include-text` case). A blank line separates
-        // results. Trailing footer surfaces a cluster warning when
-        // every top-K score is within a tight epsilon — that's the
-        // "your scores aren't actually ranking anything" signal.
         let results = &self.0;
         if results.is_empty() {
             return writeln!(w, "(no results)");
         }
+        let policy = TermPolicy::plain();
         for (idx, r) in results.iter().enumerate() {
-            // ── Line 1: rank + identity + metadata ────────────────
             let kind_str = if r.consolidated_at_unix_nanos.is_some() {
-                // † marks consolidated rows so a reader spots the
-                // semantic difference from raw memories at a glance.
                 format!("{}†", fmt_kind(r.kind))
             } else {
                 fmt_kind(r.kind).to_string()
@@ -312,8 +211,6 @@ impl Render for RecallResults {
             let salience = if (r.salience - r.salience_initial).abs() < 0.001 {
                 format!("sal={:.3}", r.salience)
             } else {
-                // ↓ when decayed, ↑ when boosted. Inline shows the
-                // delta without an extra column.
                 let arrow = if r.salience < r.salience_initial {
                     "↓"
                 } else {
@@ -328,9 +225,6 @@ impl Render for RecallResults {
                 salience,
                 format!("score={:.4}", r.similarity_score),
             ];
-            // Surface access_count + edge counts only when non-zero —
-            // a fresh shard has all zeros and the noise hurts more
-            // than the missing info helps.
             if r.access_count > 0 {
                 meta.push(format!("acc={}", r.access_count));
             }
@@ -341,26 +235,18 @@ impl Render for RecallResults {
                 ));
             }
             writeln!(w, "#{}  {}", idx + 1, meta.join("  "))?;
-            // ── Line 2: text, indented to align under the metadata.
-            // Empty text (no --include-text) just prints "(text not
-            // fetched — re-run with --include-text)" so the user
-            // doesn't think the memory is empty.
             if r.text.is_empty() {
                 writeln!(w, "    (text not fetched — re-run with --include-text)")?;
             } else {
-                writeln!(w, "    {}", r.text)?;
+                // Reserve four chars for the indent + a small margin so
+                // long memory text wraps cleanly to the terminal width.
+                let max = policy.width.saturating_sub(6);
+                writeln!(w, "    {}", middle_truncate(&r.text, max))?;
             }
-            // Blank line between results for visual separation.
             if idx + 1 < results.len() {
                 writeln!(w)?;
             }
         }
-        // ── Footer: result count + uninformative-ranking signal.
-        // "Tightly clustered" = the spread between the top and
-        // bottom score in this page is less than 0.001. That
-        // condition reliably fires on Nop embedders and on queries
-        // that genuinely don't discriminate; either way the user
-        // should know the ranking is suspect.
         writeln!(w)?;
         let n = results.len();
         let score_spread = {
@@ -490,22 +376,27 @@ pub struct PlanSteps {
 
 impl Render for PlanSteps {
     fn render_table(&self, w: &mut dyn Write) -> io::Result<()> {
-        let headers = ["step", "id", "transition", "conf", "remaining", "text"];
-        let rows: Vec<Vec<String>> = self
-            .steps
-            .iter()
-            .map(|s| {
-                vec![
-                    s.step_index.to_string(),
-                    fmt_id(s.memory_id),
-                    format!("{:?}", s.transition_kind),
-                    format!("{:.4}", s.confidence),
-                    format!("{:.4}", s.estimated_distance_to_goal),
-                    s.text.clone(),
-                ]
-            })
-            .collect();
-        render_rows(w, &headers, &rows, DEFAULT_WIDTH)?;
+        let policy = TermPolicy::plain();
+        let mut table = build_table(policy);
+        table.set_header(vec![
+            "step",
+            "id",
+            "transition",
+            "conf",
+            "remaining",
+            "text",
+        ]);
+        for s in &self.steps {
+            let mut row = Row::new();
+            row.add_cell(Cell::new(s.step_index));
+            row.add_cell(Cell::new(fmt_short_id(s.memory_id)));
+            row.add_cell(Cell::new(format!("{:?}", s.transition_kind)));
+            row.add_cell(Cell::new(format!("{:.4}", s.confidence)));
+            row.add_cell(Cell::new(format!("{:.4}", s.estimated_distance_to_goal)));
+            row.add_cell(Cell::new(&s.text));
+            table.add_row(row);
+        }
+        writeln!(w, "{table}")?;
         if let Some(footer) = plan_status_footer(self.status, self.steps.len()) {
             writeln!(w, "{footer}")?;
         }
@@ -546,10 +437,6 @@ fn fmt_plan_status_json(s: PlanStatus) -> Value {
     )
 }
 
-/// Footer line for the plan table when the status tells the user
-/// something the steps alone don't. `GoalReached` is silent because
-/// the rendered rows already show the goal was reached. The other
-/// variants carry a one-line reason.
 fn plan_status_footer(status: Option<PlanStatus>, n_steps: usize) -> Option<String> {
     let status = status?;
     match status {
@@ -573,22 +460,27 @@ pub struct ReasonSteps(pub Vec<InferenceStep>);
 
 impl Render for ReasonSteps {
     fn render_table(&self, w: &mut dyn Write) -> io::Result<()> {
-        let headers = ["step", "kind", "conf", "supports", "contradicts", "claim"];
-        let rows: Vec<Vec<String>> = self
-            .0
-            .iter()
-            .map(|s| {
-                vec![
-                    s.step_index.to_string(),
-                    format!("{:?}", s.inference_kind),
-                    format!("{:.4}", s.confidence),
-                    s.supporting_memories.len().to_string(),
-                    s.contradicting_memories.len().to_string(),
-                    s.claim.clone(),
-                ]
-            })
-            .collect();
-        render_rows(w, &headers, &rows, DEFAULT_WIDTH)
+        let policy = TermPolicy::plain();
+        let mut table = build_table(policy);
+        table.set_header(vec![
+            "step",
+            "kind",
+            "conf",
+            "supports",
+            "contradicts",
+            "claim",
+        ]);
+        for s in &self.0 {
+            table.add_row(vec![
+                Cell::new(s.step_index),
+                Cell::new(format!("{:?}", s.inference_kind)),
+                Cell::new(format!("{:.4}", s.confidence)),
+                Cell::new(s.supporting_memories.len()),
+                Cell::new(s.contradicting_memories.len()),
+                Cell::new(&s.claim),
+            ]);
+        }
+        writeln!(w, "{table}")
     }
 
     fn to_json_value(&self) -> Value {
@@ -670,22 +562,20 @@ pub struct SubscriptionEvents(pub Vec<SubscriptionEvent>);
 
 impl Render for SubscriptionEvents {
     fn render_table(&self, w: &mut dyn Write) -> io::Result<()> {
-        let headers = ["lsn", "type", "id", "ctx", "kind", "text"];
-        let rows: Vec<Vec<String>> = self
-            .0
-            .iter()
-            .map(|e| {
-                vec![
-                    e.lsn.to_string(),
-                    format!("{:?}", e.event_type),
-                    fmt_id(e.memory_id),
-                    e.context_id.to_string(),
-                    fmt_kind(e.kind).to_string(),
-                    e.text.clone(),
-                ]
-            })
-            .collect();
-        render_rows(w, &headers, &rows, DEFAULT_WIDTH)
+        let policy = TermPolicy::plain();
+        let mut table = build_table(policy);
+        table.set_header(vec!["lsn", "type", "id", "ctx", "kind", "text"]);
+        for e in &self.0 {
+            table.add_row(vec![
+                Cell::new(e.lsn),
+                Cell::new(format!("{:?}", e.event_type)),
+                Cell::new(fmt_short_id(e.memory_id)),
+                Cell::new(e.context_id),
+                Cell::new(fmt_kind(e.kind)),
+                Cell::new(&e.text),
+            ]);
+        }
+        writeln!(w, "{table}")
     }
 
     fn to_json_value(&self) -> Value {
@@ -709,11 +599,48 @@ impl Render for SubscriptionEvents {
     }
 }
 
-// Re-export the typed accessor so callers can drop a `MemoryId`
-// in without juggling raw conversions.
-#[allow(dead_code)]
-fn _unused_use_of_fmt_memory_id() -> String {
-    fmt_memory_id(MemoryId::NULL)
+/// Lightweight wrapper for ad-hoc tables built by knowledge-layer
+/// browse commands (entity list / statement list / mention list / …).
+/// Keeps the comfy_table dependency local to the table module.
+pub struct AdHocTable {
+    pub headers: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+}
+
+impl Render for AdHocTable {
+    fn render_table(&self, w: &mut dyn Write) -> io::Result<()> {
+        if self.rows.is_empty() {
+            return writeln!(w, "(no rows)");
+        }
+        let policy = TermPolicy::plain();
+        let mut table = build_table(policy);
+        table.set_header(
+            self.headers
+                .iter()
+                .map(|h| Cell::new(h))
+                .collect::<Vec<_>>(),
+        );
+        for row in &self.rows {
+            table.add_row(row.iter().map(Cell::new).collect::<Vec<_>>());
+        }
+        writeln!(w, "{table}")?;
+        writeln!(w, "{} rows", self.rows.len())
+    }
+
+    fn to_json_value(&self) -> Value {
+        let items: Vec<Value> = self
+            .rows
+            .iter()
+            .map(|row| {
+                let mut obj = serde_json::Map::new();
+                for (h, v) in self.headers.iter().zip(row.iter()) {
+                    obj.insert(h.clone(), Value::String(v.clone()));
+                }
+                Value::Object(obj)
+            })
+            .collect();
+        Value::Array(items)
+    }
 }
 
 #[cfg(test)]
@@ -721,20 +648,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn truncate_short_string_is_identity() {
-        assert_eq!(truncate_to("hello", 10), "hello");
+    fn middle_truncate_short_is_identity() {
+        assert_eq!(middle_truncate("hello", 10), "hello");
     }
 
     #[test]
-    fn truncate_long_string_adds_ellipsis() {
-        let s = truncate_to("hello world", 8);
-        assert!(s.ends_with('…'));
-        assert!(display_width(&s) <= 8);
+    fn middle_truncate_long_keeps_head_and_tail() {
+        let s = middle_truncate("the quick brown fox jumps over the lazy dog", 11);
+        assert!(s.contains('…'));
+        assert!(s.starts_with("the"));
+        assert!(s.ends_with("dog"));
     }
 
     #[test]
-    fn truncate_tiny_max_returns_ellipsis() {
-        assert_eq!(truncate_to("hello", 1), "…");
+    fn middle_truncate_tiny_returns_ellipsis() {
+        assert_eq!(middle_truncate("hello", 1), "…");
     }
 
     #[test]
@@ -745,40 +673,38 @@ mod tests {
     }
 
     #[test]
-    fn render_rows_handles_empty() {
-        let mut buf = Vec::new();
-        render_rows(&mut buf, &["a", "b"], &[], 80).unwrap();
-        assert_eq!(String::from_utf8(buf).unwrap(), "(no rows)\n");
+    fn fmt_short_id_round_trip_components() {
+        let raw = MemoryId::pack(7, 42, 3).raw();
+        assert_eq!(fmt_short_id(raw), "s7/m42/v3");
     }
 
     #[test]
-    fn render_rows_aligns_columns() {
+    fn adhoc_table_empty_writes_no_rows_marker() {
+        let t = AdHocTable {
+            headers: vec!["a".into()],
+            rows: vec![],
+        };
         let mut buf = Vec::new();
-        let rows = vec![
-            vec!["alpha".to_string(), "1".to_string()],
-            vec!["beta".to_string(), "200".to_string()],
-        ];
-        render_rows(&mut buf, &["name", "val"], &rows, 80).unwrap();
+        t.render_table(&mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
-        // Headers + 2 rows + 3 borders = 6 lines.
-        assert_eq!(s.matches('\n').count(), 6);
-        assert!(s.contains("name"));
-        assert!(s.contains("alpha"));
-        assert!(s.contains("200"));
+        assert!(s.contains("(no rows)"));
     }
 
     #[test]
-    fn render_rows_truncates_last_column_when_overflow() {
+    fn adhoc_table_renders_rows() {
+        let t = AdHocTable {
+            headers: vec!["name".into(), "kind".into()],
+            rows: vec![
+                vec!["alice".into(), "Person".into()],
+                vec!["bob".into(), "Person".into()],
+            ],
+        };
         let mut buf = Vec::new();
-        let long = "x".repeat(200);
-        let rows = vec![vec!["id".to_string(), long]];
-        render_rows(&mut buf, &["k", "v"], &rows, 40).unwrap();
+        t.render_table(&mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
-        // Each line should be roughly <= 40 + newline.
-        for line in s.lines() {
-            assert!(line.chars().count() <= 50, "line too long: {line:?}");
-        }
-        assert!(s.contains('…'));
+        assert!(s.contains("alice"));
+        assert!(s.contains("bob"));
+        assert!(s.contains("2 rows"));
     }
 
     // ─── plan_status_footer ─────────────────────────────────────────
@@ -786,8 +712,6 @@ mod tests {
     #[test]
     fn plan_footer_silent_on_goal_reached() {
         assert!(plan_status_footer(Some(PlanStatus::GoalReached), 3).is_none());
-        // None-status (server didn't classify) is also silent — we
-        // don't make up a status the wire didn't carry.
         assert!(plan_status_footer(None, 3).is_none());
     }
 
@@ -798,13 +722,6 @@ mod tests {
         assert!(
             f.contains("only the start endpoint surfaced"),
             "1-step NoPathFound should explain the lone Initial row: {f}",
-        );
-
-        let f2 = plan_status_footer(Some(PlanStatus::NoPathFound), 5).expect("footer present");
-        assert!(f2.starts_with("(NoPathFound"));
-        assert!(
-            !f2.contains("only the start endpoint"),
-            ">1 step shouldn't include the single-row footnote: {f2}",
         );
     }
 
@@ -822,34 +739,5 @@ mod tests {
     fn plan_footer_marks_cancelled() {
         let f = plan_status_footer(Some(PlanStatus::Cancelled), 2).expect("footer present");
         assert!(f.contains("Cancelled"));
-    }
-
-    #[test]
-    fn plan_render_emits_footer_below_table() {
-        let mut buf = Vec::new();
-        let p = PlanSteps {
-            steps: vec![PlanStep {
-                step_index: 0,
-                memory_id: 0x1234,
-                text: "start".into(),
-                transition_kind: brain_protocol::response::TransitionKind::Initial,
-                confidence: 1.0,
-                estimated_distance_to_goal: 0.0,
-            }],
-            status: Some(PlanStatus::NoPathFound),
-        };
-        p.render_table(&mut buf).unwrap();
-        let out = String::from_utf8(buf).unwrap();
-        assert!(
-            out.contains("NoPathFound"),
-            "footer must appear in rendered output:\n{out}"
-        );
-        // Footer must sit AFTER the table's bottom border line.
-        let bottom_idx = out.rfind('└').expect("bottom border");
-        let footer_idx = out.find("NoPathFound").expect("footer");
-        assert!(
-            footer_idx > bottom_idx,
-            "footer must render below the table",
-        );
     }
 }

@@ -3,11 +3,16 @@
 //! [`Render`] for the dispatch loop to format.
 
 pub mod encode;
+pub mod entity;
+pub mod extract;
 pub mod forget;
 pub mod link;
+pub mod mention;
 pub mod plan;
 pub mod reason;
 pub mod recall;
+pub mod relation;
+pub mod statement;
 pub mod subscribe;
 pub mod txn;
 pub mod unlink;

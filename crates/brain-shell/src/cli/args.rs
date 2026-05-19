@@ -1,7 +1,6 @@
 //! Top-level argv dispatch — picks between one-shot exec, REPL,
 //! and helper subcommands (config / agent / generate-completion).
 
-use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -101,18 +100,24 @@ pub async fn dispatch_argv(argv: Vec<String>) -> ExitCode {
     let timeout = Duration::from_secs(cli.global.timeout);
     let is_repl = matches!(cli.subcommand, None | Some(Command::Shell));
 
-    // Output format: per-invocation flag > persisted setting > heuristic.
-    let output_format = cli.global.output.unwrap_or_else(|| match settings.output {
-        Some(crate::cli::config::OutputPref::Json) => OutputFormatArg::Json,
-        Some(crate::cli::config::OutputPref::Table) => OutputFormatArg::Table,
-        None => {
-            if is_repl || std::io::stdout().is_terminal() {
-                OutputFormatArg::Table
-            } else {
-                OutputFormatArg::Json
+    // Output format: per-invocation flag > persisted setting > `Auto`.
+    // `Auto` resolves to table when stdout is a TTY, ndjson otherwise —
+    // the resolution happens at render time so it picks up redirects.
+    let output_format = cli
+        .global
+        .output
+        .clone()
+        .unwrap_or_else(|| match settings.output {
+            Some(crate::cli::config::OutputPref::Json) => OutputFormatArg::Json,
+            Some(crate::cli::config::OutputPref::Table) => OutputFormatArg::Table,
+            None => {
+                if is_repl {
+                    OutputFormatArg::Table
+                } else {
+                    OutputFormatArg::Auto
+                }
             }
-        }
-    });
+        });
 
     let client = match connection::connect(addr, agent_id, timeout).await {
         Ok(c) => c,
@@ -171,6 +176,36 @@ pub async fn dispatch_argv(argv: Vec<String>) -> ExitCode {
                     .await
                     .map(|r| (op.to_string(), r))
             }
+            Command::Entity(sub) => {
+                let op = commands::entity::op_name(&sub).to_string();
+                commands::entity::run(&client, &mut session, sub)
+                    .await
+                    .map(|r| (op, r))
+            }
+            Command::Statement(sub) => {
+                let op = commands::statement::op_name(&sub).to_string();
+                commands::statement::run(&client, &mut session, sub)
+                    .await
+                    .map(|r| (op, r))
+            }
+            Command::Relation(sub) => {
+                let op = commands::relation::op_name(&sub).to_string();
+                commands::relation::run(&client, &mut session, sub)
+                    .await
+                    .map(|r| (op, r))
+            }
+            Command::Mention(sub) => {
+                let op = commands::mention::op_name(&sub).to_string();
+                commands::mention::run(&client, &mut session, sub)
+                    .await
+                    .map(|r| (op, r))
+            }
+            Command::Extract(sub) => {
+                let op = commands::extract::op_name(&sub).to_string();
+                commands::extract::run(&client, &mut session, sub)
+                    .await
+                    .map(|r| (op, r))
+            }
             Command::Config(_)
             | Command::Agent(_)
             | Command::Shell
@@ -188,9 +223,13 @@ pub async fn dispatch_argv(argv: Vec<String>) -> ExitCode {
     match res {
         Ok((op, body)) => {
             let mut stdout = std::io::stdout();
-            if let Err(e) =
-                write_rendered(&mut stdout, &op, body.as_ref(), session.output, elapsed_ms)
-            {
+            if let Err(e) = write_rendered(
+                &mut stdout,
+                &op,
+                body.as_ref(),
+                session.output.clone(),
+                elapsed_ms,
+            ) {
                 eprintln!("output error: {e}");
                 return ExitCode::from(1);
             }
