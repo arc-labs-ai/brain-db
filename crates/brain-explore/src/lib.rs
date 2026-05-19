@@ -14,14 +14,17 @@ pub mod render;
 pub mod table;
 pub mod term;
 pub mod theme;
+#[cfg(feature = "tui")]
+pub mod tui;
 pub mod util;
 
 pub use format::{dispatch, OutputFormat, Render, RenderCtx};
 pub use render::{
-    AuditCard, EncodeRendered, EntityCard, GraphEnrichment, GraphNode, GraphTree, LinkRendered,
-    MemorySummary, ObjectRef, PlanSteps, ReasonSteps, RecallResults, RecallWithGraph, RelationCard,
-    RelationSummary, RenderableError, StatementCard, StatementSummary, SubscriptionEventRendered,
-    TxnAbortRendered, TxnBeginRendered, TxnCommitRendered, UnlinkRendered,
+    AdHocTable, AuditCard, EncodeRendered, EntityCard, GraphEnrichment, GraphNode, GraphTree,
+    LinkRendered, MemorySummary, ObjectRef, PlanSteps, ReasonSteps, RecallResults, RecallWithGraph,
+    RelationCard, RelationSummary, RenderableError, StatementCard, StatementSummary,
+    SubscriptionEventList, SubscriptionEventRendered, TxnAbortRendered, TxnBeginRendered,
+    TxnCommitRendered, UnlinkRendered,
 };
 pub use term::policy::TermPolicy;
 pub use theme::{Theme, Token};

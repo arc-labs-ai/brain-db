@@ -9,6 +9,7 @@
 //! and truncation behaviour so the two consumer binaries (brain-shell
 //! and brain-cli) render identically.
 
+pub mod adhoc;
 pub mod audit_card;
 pub mod encode;
 pub mod entity_card;
@@ -25,6 +26,7 @@ pub mod statement_card;
 pub mod subscribe;
 pub mod txn;
 
+pub use adhoc::AdHocTable;
 pub use audit_card::{AuditCard, TierOutcome};
 pub use encode::EncodeRendered;
 pub use entity_card::{EntityCard, MemorySummary, RelationSummary, StatementSummary};
@@ -39,7 +41,7 @@ pub use recall_with_graph::{
 };
 pub use relation_card::{EntityRef, RelationCard};
 pub use statement_card::{ObjectRef, StatementCard};
-pub use subscribe::SubscriptionEventRendered;
+pub use subscribe::{SubscriptionEventList, SubscriptionEventRendered};
 pub use txn::{TxnAbortRendered, TxnBeginRendered, TxnCommitRendered};
 
 use brain_core::MemoryId;

@@ -11,12 +11,22 @@ description = "Terminal UI/UX layer for Brain — rendering primitives and (late
 name = "brain_explore"
 path = "src/lib.rs"
 
+# The interactive explorer binary is reserved here so cargo claims the
+# target name today. The real TUI lands in a follow-up plan; until then
+# the binary is a placeholder that exits non-zero with a friendly note.
+# `required-features = ["tui"]` keeps a default build from compiling it
+# (and from pulling ratatui/crossterm into the dep graph).
+[[bin]]
+name = "brain-explore"
+path = "src/bin/brain-explore.rs"
+required-features = ["tui"]
+
 # The `tui` feature gates the interactive Ratatui explorer + its binary.
 # Both arrive in a later commit; the feature exists today so consumers can
 # already opt out of the not-yet-pulled-in ratatui/crossterm dep weight.
 [features]
 default = []
-tui = []
+tui = ["dep:ratatui", "dep:crossterm"]
 
 [dependencies]
 # brain-protocol is declared today even though no symbols are referenced
@@ -52,3 +62,10 @@ tracing = { workspace = true }
 # (graphemes) rather than `char`s — emoji like 🦀 and joined sequences stay
 # intact across the truncation boundary.
 unicode-segmentation = "1.12"
+
+# Ratatui split into ratatui-core + ratatui in 0.30; that's the minimum we
+# accept so the follow-up TUI plan can depend on ratatui-core for widget
+# crates if we ever extract them. Crossterm 0.28 matches the backend
+# ratatui 0.30 supports out of the box.
+ratatui = { version = "0.30", optional = true }
+crossterm = { version = "0.28", optional = true }
