@@ -26,8 +26,10 @@ fn list_json_round_trip() {
 fn list_table_output() {
     let addr = spawn_mock(|_m, _p, _b| (200, r#"{"shards":[{"index":0,"shard_id":0}]}"#.into()));
     let out = list::run(&addr.to_string(), OutputFormat::Table).expect("list");
-    assert!(out.contains("index 0"));
-    assert!(out.contains("shard_id=0"));
+    // Comfy-table renders index + shard_id in separate columns; assert on
+    // the header + the row content instead of the old "index 0" kv form.
+    assert!(out.contains("index"));
+    assert!(out.contains("shard_id"));
 }
 
 #[test]

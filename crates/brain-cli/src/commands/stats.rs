@@ -1,5 +1,5 @@
-//! `brain-cli stats` — snapshots `/metrics` (Prometheus text
-//! format) into structured output.
+//! `brain-cli stats` — snapshots `/metrics` (Prometheus text format) into
+//! structured output.
 
 use std::collections::BTreeMap;
 
@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::cli::OutputFormat;
 use crate::http::get;
-use crate::output::{json, table};
+use crate::output::{dispatch_to_string, render::shard_stats::ShardStatsRendered};
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct MetricSample {
@@ -26,25 +26,7 @@ pub fn run(server: &str, output: OutputFormat) -> anyhow::Result<String> {
         anyhow::bail!("/metrics returned HTTP {}", resp.status);
     }
     let report = parse_prom_text(&resp.body);
-    match output {
-        OutputFormat::Json => json::render(&report),
-        OutputFormat::Table => {
-            let mut rows: Vec<(String, String)> = Vec::with_capacity(report.len());
-            for (name, samples) in &report {
-                for s in samples {
-                    let labels = if s.labels.is_empty() {
-                        String::new()
-                    } else {
-                        let inner: Vec<String> =
-                            s.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                        format!("{{{}}}", inner.join(","))
-                    };
-                    rows.push((format!("{name}{labels}"), format!("{}", s.value)));
-                }
-            }
-            Ok(table::render_kv(&rows))
-        }
-    }
+    dispatch_to_string(&ShardStatsRendered(report), output)
 }
 
 /// Tiny Prometheus text-format parser. Handles the subset

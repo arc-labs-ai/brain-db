@@ -1,15 +1,14 @@
 //! `brain-cli rebuild-ann [--shard N]` — POST /v1/rebuild-ann.
 //!
 //! v1 is synchronous: the HTTP request blocks until the rebuild
-//! completes on the named shard. Spec §14/06 §4 calls for an
-//! async dispatch + `rebuild-ann-status` follow-up; that lands
-//! once we have at least one other long-running op to share
+//! completes on the named shard. An async dispatch + status follow-up
+//! lands once we have at least one other long-running op to share
 //! job-id infrastructure with.
 
 use serde::{Deserialize, Serialize};
 
 use crate::cli::OutputFormat;
-use crate::output::{json, table};
+use crate::output::{dispatch_to_string, render::shard_health::RebuildRendered};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RebuildReport {
@@ -22,18 +21,7 @@ pub fn run(server: &str, shard: usize, output: OutputFormat) -> anyhow::Result<S
     let body = post_no_body(server, &format!("/v1/rebuild-ann?shard={shard}"))?;
     let report: RebuildReport = serde_json::from_str(&body)
         .map_err(|e| anyhow::anyhow!("malformed RebuildReport JSON: {e}; body = {body}"))?;
-    render(&report, output)
-}
-
-fn render(r: &RebuildReport, output: OutputFormat) -> anyhow::Result<String> {
-    match output {
-        OutputFormat::Json => json::render(r),
-        OutputFormat::Table => Ok(table::render_kv(&[
-            ("shard".into(), r.shard.to_string()),
-            ("entries".into(), r.entries.to_string()),
-            ("elapsed_ms".into(), r.elapsed_ms.to_string()),
-        ])),
-    }
+    dispatch_to_string(&RebuildRendered(report), output)
 }
 
 /// Minimal blocking HTTP/1.1 POST with an empty body. Returns the
@@ -54,7 +42,7 @@ fn post_no_body(endpoint: &str, path: &str) -> anyhow::Result<String> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10))
         .map_err(|e| anyhow::anyhow!("connect {addr}: {e}"))?;
     // Rebuild can take a while on large shards; allow up to 5 minutes
-    // for the HTTP read. v2 will make this async with a status poll.
+    // for the HTTP read. A future async version will swap to a status poll.
     stream.set_read_timeout(Some(Duration::from_secs(300)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
 

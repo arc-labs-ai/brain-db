@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::OutputFormat;
 use crate::commands::extract::BackfillKind;
-use crate::output::{json, table};
+use crate::output::{dispatch_to_string, render::extract_status::ExtractStatusRendered};
 
 /// JSON shape returned by `POST /v1/extract/backfill`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,27 +23,13 @@ pub fn run(server: &str, kind: BackfillKind, output: OutputFormat) -> anyhow::Re
     let body = post_no_body(server, &format!("/v1/extract/backfill?{query}"))?;
     let report: BackfillReport = serde_json::from_str(&body)
         .map_err(|e| anyhow::anyhow!("malformed backfill JSON: {e}; body = {body}"))?;
-    render(&report, kind, output)
-}
-
-fn render(r: &BackfillReport, kind: BackfillKind, output: OutputFormat) -> anyhow::Result<String> {
-    match output {
-        OutputFormat::Json => json::render(r),
-        OutputFormat::Table => {
-            let selector = match kind {
-                BackfillKind::Memory(id) => format!("memory={id}"),
-                BackfillKind::Since(ts) => format!("since={ts}"),
-                BackfillKind::All => "all".into(),
-            };
-            let rows = vec![
-                ("selector".into(), selector),
-                ("shards".into(), r.shards.to_string()),
-                ("enqueued".into(), r.enqueued.to_string()),
-                ("skipped".into(), r.skipped.to_string()),
-            ];
-            Ok(table::render_kv(&rows))
-        }
-    }
+    dispatch_to_string(
+        &ExtractStatusRendered {
+            selector: kind,
+            report,
+        },
+        output,
+    )
 }
 
 /// Minimal blocking HTTP/1.1 POST with an empty body. Mirrors the

@@ -32,7 +32,9 @@ fn debug_snapshot_table_lists_deferred() {
     assert!(out.contains("partial"));
     assert!(out.contains("active_tasks"));
     assert!(out.contains("pending_requests"));
-    assert!(out.contains("worker decay"));
+    // Comfy-table renders the worker name in its own column rather than the
+    // old `worker <name>` kv format.
+    assert!(out.contains("decay"));
 }
 
 #[test]

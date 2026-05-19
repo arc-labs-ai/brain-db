@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::OutputFormat;
 use crate::http::get;
-use crate::output::{json, table};
+use crate::output::{dispatch_to_string, render::worker_status::WorkerStatusRendered};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerEntry {
@@ -36,27 +36,5 @@ pub fn run(server: &str, shard: Option<usize>, output: OutputFormat) -> anyhow::
     }
     let list: WorkerList = serde_json::from_str(&resp.body)
         .map_err(|e| anyhow::anyhow!("malformed worker list JSON: {e}; body = {}", resp.body))?;
-    render(&list, output)
-}
-
-fn render(list: &WorkerList, output: OutputFormat) -> anyhow::Result<String> {
-    match output {
-        OutputFormat::Json => json::render(list),
-        OutputFormat::Table => {
-            if list.workers.is_empty() {
-                return Ok("(no workers)\n".into());
-            }
-            let mut rows = Vec::with_capacity(list.workers.len());
-            for w in &list.workers {
-                rows.push((
-                    format!("shard {} / {}", w.shard, w.name),
-                    format!(
-                        "cycles={} processed={} errors={} last_run_unix={}",
-                        w.cycles, w.processed, w.errors, w.last_run_unix
-                    ),
-                ));
-            }
-            Ok(table::render_kv(&rows))
-        }
-    }
+    dispatch_to_string(&WorkerStatusRendered(list), output)
 }

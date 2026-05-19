@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::OutputFormat;
 use crate::http::get;
-use crate::output::{json, table};
+use crate::output::{dispatch_to_string, render::shard_stats::ShardListRendered};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardEntry {
@@ -28,27 +28,5 @@ pub fn run(server: &str, output: OutputFormat) -> anyhow::Result<String> {
     }
     let list: ShardList = serde_json::from_str(&resp.body)
         .map_err(|e| anyhow::anyhow!("malformed shard list JSON: {e}; body = {}", resp.body))?;
-    render(&list, output)
-}
-
-fn render(list: &ShardList, output: OutputFormat) -> anyhow::Result<String> {
-    match output {
-        OutputFormat::Json => json::render(list),
-        OutputFormat::Table => {
-            if list.shards.is_empty() {
-                return Ok("(no shards)\n".into());
-            }
-            let rows: Vec<(String, String)> = list
-                .shards
-                .iter()
-                .map(|s| {
-                    (
-                        format!("index {}", s.index),
-                        format!("shard_id={}", s.shard_id),
-                    )
-                })
-                .collect();
-            Ok(table::render_kv(&rows))
-        }
-    }
+    dispatch_to_string(&ShardListRendered(list), output)
 }

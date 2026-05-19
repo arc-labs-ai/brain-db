@@ -4,7 +4,7 @@
 use serde::Serialize;
 
 use crate::cli::OutputFormat;
-use crate::output::{json, table};
+use crate::output::{dispatch_to_string, render::snapshot::SnapshotDeleteRendered};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DeleteReport {
@@ -20,14 +20,7 @@ pub fn run(server: &str, id: u64, shard: usize, output: OutputFormat) -> anyhow:
         shard,
         status: "deleted".into(),
     };
-    match output {
-        OutputFormat::Json => json::render(&report),
-        OutputFormat::Table => Ok(table::render_kv(&[
-            ("id".into(), report.id.to_string()),
-            ("shard".into(), report.shard.to_string()),
-            ("status".into(), report.status),
-        ])),
-    }
+    dispatch_to_string(&SnapshotDeleteRendered(report), output)
 }
 
 fn delete_no_body(endpoint: &str, path: &str) -> anyhow::Result<()> {

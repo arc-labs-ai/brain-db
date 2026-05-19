@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::cli::OutputFormat;
-use crate::output::{json, table};
+use crate::output::{dispatch_to_string, render::snapshot::SnapshotCreateRendered};
 
 /// JSON shape returned by `POST /v1/snapshots`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,20 +19,7 @@ pub fn run(server: &str, shard: usize, output: OutputFormat) -> anyhow::Result<S
     let body = post_no_body(server, &format!("/v1/snapshots?shard={shard}"))?;
     let report: CreateReport = serde_json::from_str(&body)
         .map_err(|e| anyhow::anyhow!("malformed CreateReport JSON: {e}; body = {body}"))?;
-    render(&report, output)
-}
-
-fn render(r: &CreateReport, output: OutputFormat) -> anyhow::Result<String> {
-    match output {
-        OutputFormat::Json => json::render(r),
-        OutputFormat::Table => {
-            let rows = vec![
-                ("id".into(), r.id.to_string()),
-                ("shard".into(), r.shard.to_string()),
-            ];
-            Ok(table::render_kv(&rows))
-        }
-    }
+    dispatch_to_string(&SnapshotCreateRendered(report), output)
 }
 
 /// Minimal blocking HTTP/1.1 POST with an empty body. Returns the

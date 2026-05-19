@@ -1,16 +1,16 @@
 //! # brain-cli
 //!
-//! Admin CLI for the Brain substrate. See
-//! `spec/14_observability_ops/06_admin_ops.md` for the full
-//! command surface. 10.8 implements `health` and `stats`; the
-//! other commands land in 10.9–10.12.
+//! Admin CLI for the Brain substrate. See spec §14/06 for the full
+//! command surface. health + stats hit the public metrics listener; every
+//! other command lands on the admin listener.
 
 #![allow(clippy::missing_errors_doc)]
 
 use std::env;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
-use brain_cli::cli::{parse, Command};
+use brain_cli::cli::{parse, Command, OutputFormat};
 use brain_cli::commands::diagnostics::{debug_snapshot, profile};
 use brain_cli::commands::snapshot::SnapshotAction;
 use brain_cli::commands::{
@@ -31,6 +31,11 @@ fn main() -> ExitCode {
         }
     };
 
+    // Resolve `Auto` at the binary boundary so command modules (and their
+    // tests) see a concrete format and the dispatch helper they use never
+    // has to consult the TTY itself.
+    let output = resolve_format(args.output);
+
     match args.command {
         Command::Help => {
             print_help();
@@ -40,59 +45,27 @@ fn main() -> ExitCode {
             println!("{NAME} {VERSION}");
             ExitCode::SUCCESS
         }
-        // `health` + `stats` hit `/healthz` + `/metrics`, which live
-        // on the public listener (metrics_addr). Every other command
-        // hits `/v1/*` on the admin listener (server / admin_addr).
-        Command::Health => match health::run(&args.metrics_addr, args.output) {
-            Ok(out) => {
-                print!("{out}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::from(2)
-            }
-        },
-        Command::Stats => match stats::run(&args.metrics_addr, args.output) {
-            Ok(out) => {
-                print!("{out}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::from(2)
-            }
-        },
-        Command::RebuildAnn { shard } => match rebuild::run(&args.server, shard, args.output) {
-            Ok(out) => {
-                print!("{out}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::from(2)
-            }
-        },
+        Command::Health => run_result(health::run(&args.metrics_addr, output)),
+        Command::Stats => run_result(stats::run(&args.metrics_addr, output)),
+        Command::RebuildAnn { shard } => run_result(rebuild::run(&args.server, shard, output)),
         Command::Snapshot(action) => {
             let result = match action {
                 SnapshotAction::Create { shard } => {
-                    snapshot::create::run(&args.server, shard, args.output)
+                    snapshot::create::run(&args.server, shard, output)
                 }
-                SnapshotAction::List => snapshot::list::run(&args.server, args.output),
+                SnapshotAction::List => snapshot::list::run(&args.server, output),
                 SnapshotAction::Delete { id, shard } => {
-                    snapshot::delete::run(&args.server, id, shard, args.output)
+                    snapshot::delete::run(&args.server, id, shard, output)
                 }
-                SnapshotAction::Restore { id } => {
-                    snapshot::restore::run(&args.server, id, args.output)
-                }
+                SnapshotAction::Restore { id } => snapshot::restore::run(&args.server, id, output),
             };
             run_result(result)
         }
-        Command::Worker(action) => run_result(worker::run(&args.server, &action, args.output)),
-        Command::Config(action) => run_result(config::run(&args.server, &action, args.output)),
-        Command::Audit(action) => run_result(audit::run(&args.server, &action, args.output)),
-        Command::Agent(action) => run_result(agent::run(&args.server, &action, args.output)),
-        Command::Shard(action) => run_result(shard::run(&args.server, &action, args.output)),
+        Command::Worker(action) => run_result(worker::run(&args.server, &action, output)),
+        Command::Config(action) => run_result(config::run(&args.server, &action, output)),
+        Command::Audit(action) => run_result(audit::run(&args.server, &action, output)),
+        Command::Agent(action) => run_result(agent::run(&args.server, &action, output)),
+        Command::Shard(action) => run_result(shard::run(&args.server, &action, output)),
         Command::Profile {
             shard,
             duration_secs,
@@ -107,9 +80,25 @@ fn main() -> ExitCode {
             &args.server,
             shard,
             output_path.as_deref(),
-            args.output,
+            output,
         )),
-        Command::Extract(action) => run_result(extract::run(&args.server, &action, args.output)),
+        Command::Extract(action) => run_result(extract::run(&args.server, &action, output)),
+    }
+}
+
+/// Collapse `Auto` to a concrete format using stdout-TTY detection so
+/// the command modules render deterministically (table on a terminal,
+/// ndjson when piped — matches what kubectl/`gh` do).
+fn resolve_format(requested: OutputFormat) -> OutputFormat {
+    match requested {
+        OutputFormat::Auto => {
+            if std::io::stdout().is_terminal() {
+                OutputFormat::Table
+            } else {
+                OutputFormat::Ndjson
+            }
+        }
+        other => other,
     }
 }
 
@@ -156,7 +145,10 @@ OPTIONS:
     --metrics-addr <host:port>  Metrics endpoint — /healthz + /metrics,
                               used by `health` and `stats`
                               (default 127.0.0.1:9091)
-    --output <json|table>     Output format (default table)
+    -o, --output <FORMAT>     Output format: auto | table | wide | json |
+                              ndjson | yaml | jsonpath=<expr> (default auto)
+    --color <MODE>            Color policy: auto | always | never
+    --hyperlinks <MODE>       OSC 8 hyperlink policy: auto | always | never
     --token <value>           Admin token (parsed; auth wiring lands later)
     --shard <N>               Target a specific shard
     --name <worker>           Worker name (decay, consolidation, …)

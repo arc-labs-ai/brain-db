@@ -1,8 +1,11 @@
-//! Hand-rolled argv parsing. Tiny surface (1 main command + 4
-//! global flags); skipping `clap` keeps the CLI's dep footprint
-//! minimal. 10.9+ may switch when nested subcommands grow.
+//! Hand-rolled argv parsing. Tiny surface (1 main command + global flags);
+//! skipping `clap` keeps the CLI's dep footprint minimal. May switch when
+//! nested subcommands grow.
+
+use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
+use brain_explore::term::policy::{ColorMode, HyperlinkMode};
 
 /// Default admin endpoint — serves `/v1/*` routes. Loopback by
 /// default; matches `server.admin_addr` in `config/dev.toml`.
@@ -13,21 +16,10 @@ pub const DEFAULT_SERVER: &str = "127.0.0.1:9092";
 /// `health` and `stats` subcommands.
 pub const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9091";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputFormat {
-    Json,
-    Table,
-}
-
-impl OutputFormat {
-    pub fn parse(s: &str) -> Result<Self> {
-        match s {
-            "json" => Ok(Self::Json),
-            "table" => Ok(Self::Table),
-            other => Err(anyhow!("unknown --output `{other}`; use json | table")),
-        }
-    }
-}
+/// Public alias so callers say `brain_cli::cli::OutputFormat` rather
+/// than reaching across the workspace into `brain_explore`. Same enum;
+/// no conversion needed.
+pub use brain_explore::OutputFormat;
 
 #[derive(Debug, Clone)]
 pub struct Args {
@@ -38,14 +30,16 @@ pub struct Args {
     /// subcommands.
     pub metrics_addr: String,
     pub output: OutputFormat,
+    pub color: ColorMode,
+    pub hyperlinks: HyperlinkMode,
     pub token: Option<String>,
     pub command: Command,
 }
 
-/// Optional sub-flags consumed by the 10.11 command families. Each
-/// field is populated only if the operator passes the corresponding
-/// `--name`, `--key`, `--value`, … flag. Stored as a flat bag so the
-/// argv loop stays simple; family parsers pull what they need.
+/// Optional sub-flags consumed by the command families. Each field is
+/// populated only if the operator passes the corresponding `--name`,
+/// `--key`, `--value`, … flag. Stored as a flat bag so the argv loop
+/// stays simple; family parsers pull what they need.
 #[derive(Debug, Clone, Default)]
 pub struct FamilyFlags {
     pub name: Option<String>,
@@ -56,7 +50,7 @@ pub struct FamilyFlags {
     pub agent: Option<String>,
     pub logical_id: Option<u16>,
     pub confirm: bool,
-    /// Sub-task 10.12 — `profile --duration-secs N`. Defaults to 30.
+    /// `profile --duration-secs N`. Defaults to 30.
     pub duration_secs: Option<u32>,
 }
 
@@ -66,27 +60,27 @@ pub enum Command {
     Version,
     Health,
     Stats,
-    /// Sub-task 10.9 — snapshot family. The sub-action + args are
-    /// validated by [`crate::commands::snapshot::SnapshotAction::parse`].
+    /// Snapshot family. The sub-action + args are validated by
+    /// [`crate::commands::snapshot::SnapshotAction::parse`].
     Snapshot(crate::commands::snapshot::SnapshotAction),
-    /// Sub-task 10.10 — `rebuild-ann [--shard N]`.
+    /// `rebuild-ann [--shard N]`.
     RebuildAnn {
         shard: usize,
     },
-    /// Sub-task 10.11 — five new command families. Sub-actions live
-    /// in `crate::commands::<family>`.
+    /// Five command families. Sub-actions live in
+    /// `crate::commands::<family>`.
     Worker(crate::commands::worker::WorkerAction),
     Config(crate::commands::config::ConfigAction),
     Audit(crate::commands::audit::AuditAction),
     Agent(crate::commands::agent::AgentAction),
     Shard(crate::commands::shard::ShardAction),
-    /// Sub-task 10.12 — `profile --shard N [--duration-secs D] [--value PATH]`.
+    /// `profile --shard N [--duration-secs D] [--value PATH]`.
     Profile {
         shard: usize,
         duration_secs: u32,
         output_path: Option<String>,
     },
-    /// Sub-task 10.12 — `debug-snapshot --shard N [--value PATH]`.
+    /// `debug-snapshot --shard N [--value PATH]`.
     DebugSnapshot {
         shard: usize,
         output_path: Option<String>,
@@ -97,11 +91,35 @@ pub enum Command {
     Extract(crate::commands::extract::ExtractAction),
 }
 
+fn parse_color_mode(s: &str) -> Result<ColorMode> {
+    match s {
+        "auto" => Ok(ColorMode::Auto),
+        "always" => Ok(ColorMode::Always),
+        "never" => Ok(ColorMode::Never),
+        other => Err(anyhow!(
+            "unknown --color `{other}`; use auto | always | never"
+        )),
+    }
+}
+
+fn parse_hyperlink_mode(s: &str) -> Result<HyperlinkMode> {
+    match s {
+        "auto" => Ok(HyperlinkMode::Auto),
+        "always" => Ok(HyperlinkMode::Always),
+        "never" => Ok(HyperlinkMode::Never),
+        other => Err(anyhow!(
+            "unknown --hyperlinks `{other}`; use auto | always | never"
+        )),
+    }
+}
+
 /// Parse a `Vec<String>` (typically `env::args().skip(1).collect()`).
 pub fn parse(argv: Vec<String>) -> Result<Args> {
     let mut server = DEFAULT_SERVER.to_string();
     let mut metrics_addr = DEFAULT_METRICS_ADDR.to_string();
-    let mut output = OutputFormat::Table;
+    let mut output = OutputFormat::default();
+    let mut color = ColorMode::Auto;
+    let mut hyperlinks = HyperlinkMode::Auto;
     let mut token: Option<String> = None;
     let mut shard: usize = 0;
     let mut positional: Vec<String> = Vec::new();
@@ -116,6 +134,8 @@ pub fn parse(argv: Vec<String>) -> Result<Args> {
                     server,
                     metrics_addr,
                     output,
+                    color,
+                    hyperlinks,
                     token,
                     command: Command::Help,
                 })
@@ -125,6 +145,8 @@ pub fn parse(argv: Vec<String>) -> Result<Args> {
                     server,
                     metrics_addr,
                     output,
+                    color,
+                    hyperlinks,
                     token,
                     command: Command::Version,
                 })
@@ -137,9 +159,19 @@ pub fn parse(argv: Vec<String>) -> Result<Args> {
                 i += 1;
                 metrics_addr = take_value("--metrics-addr", &argv, i)?.to_string();
             }
-            "--output" => {
+            "--output" | "-o" => {
                 i += 1;
-                output = OutputFormat::parse(take_value("--output", &argv, i)?)?;
+                let v = take_value("--output", &argv, i)?;
+                output = OutputFormat::from_str(v)
+                    .map_err(|e| anyhow!("unknown --output `{v}`: {e}"))?;
+            }
+            "--color" => {
+                i += 1;
+                color = parse_color_mode(take_value("--color", &argv, i)?)?;
+            }
+            "--hyperlinks" => {
+                i += 1;
+                hyperlinks = parse_hyperlink_mode(take_value("--hyperlinks", &argv, i)?)?;
             }
             "--token" => {
                 i += 1;
@@ -152,7 +184,7 @@ pub fn parse(argv: Vec<String>) -> Result<Args> {
                     .parse::<usize>()
                     .map_err(|e| anyhow!("invalid --shard `{v}`: {e}"))?;
             }
-            // ----- 10.11 family flags --------------------------------
+            // ----- family flags --------------------------------
             "--name" => {
                 i += 1;
                 family.name = Some(take_value("--name", &argv, i)?.to_string());
@@ -255,6 +287,8 @@ pub fn parse(argv: Vec<String>) -> Result<Args> {
         server,
         metrics_addr,
         output,
+        color,
+        hyperlinks,
         token,
         command,
     })
@@ -279,7 +313,8 @@ mod tests {
         let a = parse_str(&["health"]).unwrap();
         assert_eq!(a.server, DEFAULT_SERVER);
         assert_eq!(a.metrics_addr, DEFAULT_METRICS_ADDR);
-        assert_eq!(a.output, OutputFormat::Table);
+        // Default output is Auto — TTY-aware at dispatch time.
+        assert_eq!(a.output, OutputFormat::Auto);
         assert!(a.token.is_none());
         assert_eq!(a.command, Command::Health);
     }
@@ -307,6 +342,32 @@ mod tests {
     }
 
     #[test]
+    fn short_o_flag_works() {
+        let a = parse_str(&["-o", "yaml", "stats"]).unwrap();
+        assert_eq!(a.output, OutputFormat::Yaml);
+    }
+
+    #[test]
+    fn ndjson_format() {
+        let a = parse_str(&["--output", "ndjson", "health"]).unwrap();
+        assert_eq!(a.output, OutputFormat::Ndjson);
+    }
+
+    #[test]
+    fn color_modes_parse() {
+        let a = parse_str(&["--color", "never", "health"]).unwrap();
+        assert_eq!(a.color, ColorMode::Never);
+        let a = parse_str(&["--color", "always", "health"]).unwrap();
+        assert_eq!(a.color, ColorMode::Always);
+    }
+
+    #[test]
+    fn hyperlinks_modes_parse() {
+        let a = parse_str(&["--hyperlinks", "never", "health"]).unwrap();
+        assert_eq!(a.hyperlinks, HyperlinkMode::Never);
+    }
+
+    #[test]
     fn unknown_subcommand_errors() {
         let err = parse_str(&["totally-fake"]).err().unwrap();
         assert!(err.to_string().contains("unknown subcommand"));
@@ -314,8 +375,14 @@ mod tests {
 
     #[test]
     fn unknown_output_errors() {
-        let err = parse_str(&["--output", "yaml", "stats"]).err().unwrap();
+        let err = parse_str(&["--output", "csv", "stats"]).err().unwrap();
         assert!(err.to_string().contains("unknown --output"));
+    }
+
+    #[test]
+    fn unknown_color_errors() {
+        let err = parse_str(&["--color", "rainbow", "stats"]).err().unwrap();
+        assert!(err.to_string().contains("unknown --color"));
     }
 
     #[test]

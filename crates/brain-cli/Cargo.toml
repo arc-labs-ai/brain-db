@@ -18,6 +18,9 @@ path = "src/main.rs"
 [dependencies]
 brain-core = { path = "../brain-core" }
 brain-sdk-rust = { path = "../brain-sdk-rust" }
+# Shared rendering layer. default-features = false drops the (future) tui
+# feature so the admin CLI stays free of the ratatui-full compile cost.
+brain-explore = { path = "../brain-explore", default-features = false }
 
 anyhow.workspace = true
 serde.workspace = true
