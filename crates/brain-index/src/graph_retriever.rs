@@ -7,7 +7,7 @@
 //! transitively pulls Linux-only `glommio`), and we keep
 //! `brain-index` native-buildable on macOS.
 
-use brain_core::{EntityId, RelationTypeId};
+use brain_core::{EntityId, MemoryId, NodeRef, RelationTypeId};
 
 /// Default top-k.
 pub const DEFAULT_TOP_K: usize = 64;
@@ -34,12 +34,41 @@ pub trait GraphRetriever: Send + Sync {
     ) -> Result<Vec<crate::RankedItem>, GraphError>;
 }
 
+/// Dual-mode anchor for graph traversal.
+///
+/// The graph retriever walks two different physical tables
+/// depending on which node it's anchored at:
+///
+/// - [`GraphAnchor::Entity`] — the typed knowledge graph
+///   (relations, predicates). Requires a declared schema for
+///   useful results; on schemaless deployments this anchor will
+///   simply find no entities.
+/// - [`GraphAnchor::Memory`] — the substrate memory graph
+///   (edges_out / edges_in). Works on every deployment; lights
+///   up the hybrid path's graph contribution even without a
+///   schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphAnchor {
+    Memory(MemoryId),
+    Entity(EntityId),
+}
+
+impl From<GraphAnchor> for NodeRef {
+    fn from(a: GraphAnchor) -> Self {
+        match a {
+            GraphAnchor::Memory(m) => NodeRef::Memory(m),
+            GraphAnchor::Entity(e) => NodeRef::Entity(e),
+        }
+    }
+}
+
 /// Per-query traversal spec (§23/04 §1).
 #[derive(Debug, Clone)]
 pub enum GraphQuery {
-    /// BFS from `anchor` outward up to `depth`.
+    /// BFS from `anchor` outward up to `depth`. Anchor may be
+    /// either a memory or an entity.
     Star {
-        anchor: EntityId,
+        anchor: GraphAnchor,
         depth: u8,
         direction: Direction,
         relation_types: Option<Vec<RelationTypeId>>,
@@ -52,7 +81,7 @@ pub enum GraphQuery {
         max_depth: u8,
     },
     /// Closed k-hop neighbourhood of `anchor`.
-    Subgraph { anchor: EntityId, depth: u8 },
+    Subgraph { anchor: GraphAnchor, depth: u8 },
 }
 
 impl GraphQuery {
@@ -66,13 +95,15 @@ impl GraphQuery {
         }
     }
 
-    /// Anchor entity (or `from` for `Path`) — used by the
-    /// router to resolve `merged_into` redirects.
+    /// Anchor (or `from` for `Path`) — used by the router to
+    /// resolve `merged_into` redirects on entity anchors. `Path`
+    /// is entity-only in v1 so wraps its `from` as
+    /// `GraphAnchor::Entity`.
     #[must_use]
-    pub fn anchor(&self) -> EntityId {
+    pub fn anchor(&self) -> GraphAnchor {
         match self {
             Self::Star { anchor, .. } | Self::Subgraph { anchor, .. } => *anchor,
-            Self::Path { from, .. } => *from,
+            Self::Path { from, .. } => GraphAnchor::Entity(*from),
         }
     }
 }
@@ -113,6 +144,13 @@ impl Default for GraphRetrieverConfig {
 pub enum GraphError {
     #[error("anchor entity not found: {0:?}")]
     AnchorNotFound(EntityId),
+    /// Memory-anchored graph walk was asked to start from a
+    /// `MemoryId` that doesn't exist (or has been tombstoned).
+    /// Distinct from `AnchorNotFound` so callers — particularly
+    /// the auto router that materialises anchors from semantic
+    /// top-K — can tell entity vs memory misses apart.
+    #[error("anchor memory not found: {0:?}")]
+    MemoryAnchorNotFound(MemoryId),
     #[error("max depth {got} exceeds hard cap {MAX_DEPTH_HARD_CAP}")]
     MaxDepthExceeded { got: u8 },
     #[error("index unavailable: {0}")]
@@ -158,7 +196,7 @@ mod tests {
     #[test]
     fn validate_rejects_depth_above_cap() {
         let q = GraphQuery::Star {
-            anchor: EntityId::new(),
+            anchor: GraphAnchor::Entity(EntityId::new()),
             depth: 6,
             direction: Direction::Outgoing,
             relation_types: None,
@@ -171,7 +209,7 @@ mod tests {
     #[test]
     fn validate_accepts_at_cap() {
         let q = GraphQuery::Star {
-            anchor: EntityId::new(),
+            anchor: GraphAnchor::Entity(EntityId::new()),
             depth: 5,
             direction: Direction::Outgoing,
             relation_types: None,
@@ -189,7 +227,7 @@ mod tests {
             to,
             max_depth: 3,
         };
-        assert_eq!(q.anchor(), from);
+        assert_eq!(q.anchor(), GraphAnchor::Entity(from));
         assert_eq!(q.depth(), 3);
     }
 }

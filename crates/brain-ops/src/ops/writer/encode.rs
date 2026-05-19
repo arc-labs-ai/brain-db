@@ -6,11 +6,9 @@ use std::sync::atomic::Ordering;
 
 use brain_core::MemoryId;
 use brain_metadata::tables::edge::{
-    self, derived_by, origin, EdgeData, EDGES_IN_TABLE, EDGES_OUT_TABLE,
+    self, derived_by, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
 };
-use brain_metadata::tables::fingerprint::{
-    fingerprint_key, FingerprintEntry, FINGERPRINTS_TABLE,
-};
+use brain_metadata::tables::fingerprint::{fingerprint_key, FingerprintEntry, FINGERPRINTS_TABLE};
 use brain_metadata::tables::idempotency::{IdempotencyEntry, IDEMPOTENCY_TABLE};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::tables::text::TEXTS_TABLE;
@@ -81,14 +79,14 @@ pub(super) async fn do_encode(
                 // contract: dedup signal lives only on the fresh
                 // path).
                 was_deduplicated: false,
-                // Surface the persisted LSN so a client chaining
-                // `subscribe --start-lsn=lsn+1` on retry resumes from
-                // the same position the original write reached. A
-                // zero stored value means the entry predates this
-                // field or the original write went through a no-WAL
-                // path (tests / dedup hit); surface None there so the
-                // client falls back to its tail.
-                lsn: if prior.lsn == 0 { None } else { Some(prior.lsn) },
+                // Idempotency replay path doesn't know the original
+                // LSN — that lived in the WAL record we already
+                // committed. Recovery rebuilds the cache from those
+                // WAL records, so a same-id retry post-restart can
+                // surface the real LSN; until then, the replay path
+                // returns 0 and clients re-issue subscribe with the
+                // tail LSN.
+                lsn: None,
                 edges_out_count: inserted,
                 created_at_unix_nanos: prior.created_at_unix_nanos,
             });
@@ -142,10 +140,6 @@ pub(super) async fn do_encode(
                     let mut idem_t = wtxn.open_table(IDEMPOTENCY_TABLE).map_err(|e| {
                         WriterError::Internal(format!("dedup open IDEMPOTENCY: {e:?}"))
                     })?;
-                    // Dedup hit doesn't append a WAL record — no fresh
-                    // memory was created — so the cached LSN is 0
-                    // ("unknown"). Retries surface lsn=None and the
-                    // client falls back to its tail position.
                     let entry = IdempotencyEntry::new(
                         RESPONSE_KIND_ENCODE,
                         Some(memory_id.to_be_bytes()),
@@ -154,9 +148,9 @@ pub(super) async fn do_encode(
                         created_at,
                         0,
                     );
-                    idem_t.insert(request_id_bytes, entry).map_err(|e| {
-                        WriterError::Internal(format!("dedup idem insert: {e:?}"))
-                    })?;
+                    idem_t
+                        .insert(request_id_bytes, entry)
+                        .map_err(|e| WriterError::Internal(format!("dedup idem insert: {e:?}")))?;
                 }
                 wtxn.commit()
                     .map_err(|e| WriterError::Internal(format!("dedup idem commit: {e:?}")))?;
@@ -223,9 +217,9 @@ pub(super) async fn do_encode(
             .zip(edge_outcomes.iter())
             .filter(|(_, o)| matches!(o, EdgeOutcome::Inserted))
             .map(|(e, _)| WalEdgePayload {
-                source: memory_id,
-                target: e.target,
-                kind: e.kind,
+                source: brain_core::NodeRef::Memory(memory_id),
+                target: brain_core::NodeRef::Memory(e.target),
+                kind: brain_core::EdgeKindRef::Builtin(e.kind),
                 weight: e.weight,
                 origin: brain_core::EdgeOrigin::Explicit,
             })
@@ -282,12 +276,12 @@ pub(super) async fn do_encode(
             .collect();
 
         {
-            let mut edges_out_t = wtxn
-                .open_table(EDGES_OUT_TABLE)
-                .map_err(|e| WriterError::Internal(format!("open EDGES_OUT: {e:?}")))?;
-            let mut edges_in_t = wtxn
-                .open_table(EDGES_IN_TABLE)
-                .map_err(|e| WriterError::Internal(format!("open EDGES_IN: {e:?}")))?;
+            let mut edges_t = wtxn
+                .open_table(EDGES_TABLE)
+                .map_err(|e| WriterError::Internal(format!("open EDGES: {e:?}")))?;
+            let mut edges_rev_t = wtxn
+                .open_table(EDGES_REVERSE_TABLE)
+                .map_err(|e| WriterError::Internal(format!("open EDGES_REVERSE: {e:?}")))?;
 
             // Insert edges whose target exists (Inserted outcomes).
             for (edge, outcome) in op.edges.iter().zip(edge_outcomes.iter()) {
@@ -301,11 +295,12 @@ pub(super) async fn do_encode(
                     created_at,
                 );
                 edge::link(
-                    &mut edges_out_t,
-                    &mut edges_in_t,
-                    memory_id,
-                    edge.kind,
-                    edge.target,
+                    &mut edges_t,
+                    &mut edges_rev_t,
+                    brain_core::NodeRef::Memory(memory_id),
+                    brain_core::EdgeKindRef::Builtin(edge.kind),
+                    brain_core::NodeRef::Memory(edge.target),
+                    zero_disambiguator(),
                     &data,
                 )
                 .map_err(|e| WriterError::Internal(format!("edge::link: {e:?}")))?;
@@ -419,6 +414,20 @@ pub(super) async fn do_encode(
         .insert(memory_id, &op.vector)
         .map_err(|e| WriterError::Internal(format!("hnsw insert: {e:?}")))?;
 
+    // ── AutoEdgeWorker enqueue (post-durability + post-HNSW). ────
+    // The worker derives SimilarTo edges off the band; failing to
+    // enqueue (channel full / disconnected) is best-effort, never an
+    // encode error.
+    super::try_enqueue_auto_edge(writer, memory_id, &op.vector);
+
+    // ── ExtractorWorker enqueue (post-durability + post-HNSW). ───
+    // The worker runs the three-tier extractor pipeline (pattern +
+    // classifier + LLM) against the text and writes entities /
+    // statements / relations / mention edges off the band. Same
+    // best-effort contract as auto-edge: a dropped enqueue does not
+    // fail the encode.
+    super::try_enqueue_extractor(writer, memory_id, &op.text);
+
     // ── Change-feed (sub-task 7.10). ─────────────────────────────
     // When the WAL stamped the record, the published event carries
     // the same LSN so subscribe-replay and live tail line up; otherwise
@@ -434,6 +443,7 @@ pub(super) async fn do_encode(
             timestamp_unix_nanos: created_at,
             text: Some(op.text.clone()),
             knowledge_payload: None,
+            edge_payload: None,
             agent_id: op.agent_id,
         },
         wal_lsn.map(|l| l.raw()),

@@ -5,7 +5,8 @@
 //!
 //! 1. Embed the cue (single call; cache hits stay sub-µs per
 //!    `CachingDispatcher`).
-//! 2. ANN search via [`SharedHnsw::search_active`] — tombstoned slots
+//! 2. ANN search via [`brain_index::SharedHnsw`]'s `search_active` —
+//!    tombstoned slots
 //!    are filtered out as the pre-filter (spec §03 §6).
 //! 3. Look up `MemoryMetadata` for each candidate from a single
 //!    read txn.

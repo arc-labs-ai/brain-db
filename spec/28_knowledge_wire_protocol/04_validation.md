@@ -122,15 +122,15 @@ Each later phase fills in the corresponding section. Placeholder rules to anchor
 ### 3.2 Statement ops (0x0140–0x0146)
 
 - `subject`, `object` (when `EntityRef`): must resolve to existing entity → `ENTITY_NOT_FOUND`.
-- `predicate`: must be declared in current schema → `STATEMENT_OBJECT_TYPE_MISMATCH`.
+- `predicate`: a `"namespace:name"` qname. Open-vocabulary in schemaless mode (interned on first use with `SchemaOrigin::ImplicitFromWrite`); strict mode rejects unknown qnames with `PredicateNotInSchema` (0x004B). Declared object-type constraints → `STATEMENT_OBJECT_TYPE_MISMATCH`.
 - `evidence_blob`: ≤ 64 KiB.
 - `confidence`: in `[0.0, 1.0]`.
 
 ### 3.3 Relation ops (0x0150–0x0156)
 
-- `relation_type`: must be declared → `INVALID_ARGUMENT`.
-- `from`, `to`: must be existing entities; types must match the relation's declared signature → `ENTITY_TYPE_MISMATCH`.
-- cardinality (`one_to_one` / `one_to_many` / etc.): enforced server-side → `RELATION_CARDINALITY_VIOLATION`.
+- `relation_type`: a `"namespace:name"` qname. Open-vocabulary in schemaless mode (interned on first use with `RelationTypeOrigin::ImplicitFromWrite`, default `cardinality: many_to_many`); strict mode rejects unknown qnames with `RelationTypeNotInSchema` (0x004C).
+- `from`, `to`: must be existing entities; for schema-declared types, endpoint entity types must match the relation's declared signature → `ENTITY_TYPE_MISMATCH`. Implicit types skip this check.
+- cardinality (`one_to_one` / `one_to_many` / etc.): enforced server-side on schema-declared types only → `CardinalityViolation` (0x0065).
 
 ### 3.4 Query ops (0x0160–0x0163)
 

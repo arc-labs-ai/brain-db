@@ -126,6 +126,10 @@ impl RecordingWalSink {
     pub fn len(&self) -> usize {
         self.appended.lock().len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.appended.lock().is_empty()
+    }
 }
 
 impl WalSink for RecordingWalSink {
@@ -183,10 +187,7 @@ impl WalSink for FailingWalSink {
 
 /// One in-flight append: the record to write + a one-shot channel for
 /// the reply.
-pub type WalAppendMessage = (
-    WalRecord,
-    flume::Sender<Result<Lsn, WalSinkError>>,
-);
+pub type WalAppendMessage = (WalRecord, flume::Sender<Result<Lsn, WalSinkError>>);
 
 /// Send-side handle the writer holds. The receiving end of the same
 /// channel is drained by a Glommio-local task on the shard executor;
@@ -360,9 +361,10 @@ mod tests {
         let (sink, rx) = channel_wal_sink_with_capacity(1);
         let sink_for_task = sink.clone();
         // Spawn an append BUT don't drain — it lands in the channel.
-        let first = tokio::spawn(async move {
-            sink_for_task.append(sample_record()).await.map(|l| l.raw())
-        });
+        let first =
+            tokio::spawn(
+                async move { sink_for_task.append(sample_record()).await.map(|l| l.raw()) },
+            );
         // Give it a moment to enqueue.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
@@ -372,15 +374,17 @@ mod tests {
         // (it'd mean send_async didn't actually backpressure).
         let sink_for_second = sink.clone();
         let second = tokio::spawn(async move {
-            sink_for_second.append(sample_record()).await.map(|l| l.raw())
+            sink_for_second
+                .append(sample_record())
+                .await
+                .map(|l| l.raw())
         });
-        let blocked = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            async { second.is_finished() },
-        )
+        let blocked = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            second.is_finished()
+        })
         .await;
         // The wrapper future itself completes instantly with is_finished()=false.
-        assert_eq!(blocked.unwrap(), false, "send_async should have backpressured");
+        assert!(!blocked.unwrap(), "send_async should have backpressured");
 
         // Drain both: pop two messages, reply with synthetic LSNs.
         for expected in 1..=2u64 {

@@ -54,10 +54,9 @@ mod tests {
     #[test]
     fn extract_pg_trgm_style_single_word() {
         let t = extract_trigrams("priya");
-        let expected: HashSet<[u8; 3]> =
-            [*b"  p", *b" pr", *b"pri", *b"riy", *b"iya", *b"ya "]
-                .into_iter()
-                .collect();
+        let expected: HashSet<[u8; 3]> = [*b"  p", *b" pr", *b"pri", *b"riy", *b"iya", *b"ya "]
+            .into_iter()
+            .collect();
         assert_eq!(t, expected);
     }
 

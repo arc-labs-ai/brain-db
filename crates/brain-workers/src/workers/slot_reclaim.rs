@@ -27,7 +27,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use brain_core::MemoryId;
-use brain_metadata::tables::edge::{EDGES_IN_TABLE, EDGES_OUT_TABLE};
+use brain_metadata::tables::edge::{EDGES_REVERSE_TABLE, EDGES_TABLE};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use redb::ReadableTable;
 use tracing::trace;
@@ -224,46 +224,53 @@ fn reclaim_one(
 /// dangling edges from other memories pointing to `id` are left for
 /// the edge-scrub worker.
 fn purge_adjacent_edges(wtxn: &redb::WriteTransaction, id: MemoryId) -> Result<(), WorkerError> {
-    let id_bytes = id.to_be_bytes();
-    let lo = (id_bytes, 0u8, [0u8; 16]);
-    let hi = (id_bytes, u8::MAX, [0xFFu8; 16]);
+    let prefix = brain_core::NodeRef::Memory(id).to_bytes();
+    // Range upper bound: prefix + saturated 0xFF tail covering every
+    // possible (kind, to, disambiguator) suffix.
+    let mut hi = prefix.to_vec();
+    hi.extend_from_slice(&[0xFFu8; brain_core::EdgeKindRef::MAX_BYTES + 17 + 16]);
 
-    // EDGES_OUT: source = id.
+    // Forward edges anchored at `id`.
     {
         let mut out = wtxn
-            .open_table(EDGES_OUT_TABLE)
-            .map_err(|e| WorkerError::Ops(format!("open EDGES_OUT: {e:?}")))?;
-        let victims: Vec<_> = out
-            .range(lo..=hi)
-            .map_err(|e| WorkerError::Ops(format!("EDGES_OUT range: {e:?}")))?
+            .open_table(EDGES_TABLE)
+            .map_err(|e| WorkerError::Ops(format!("open EDGES: {e:?}")))?;
+        let victims: Vec<Vec<u8>> = out
+            .range::<&[u8]>(prefix.as_slice()..=hi.as_slice())
+            .map_err(|e| WorkerError::Ops(format!("EDGES range: {e:?}")))?
             .map(|entry| match entry {
-                Ok((k, _)) => Ok(k.value()),
-                Err(e) => Err(WorkerError::Ops(format!("EDGES_OUT row: {e:?}"))),
+                Ok((k, _)) => Ok(k.value().to_vec()),
+                Err(e) => Err(WorkerError::Ops(format!("EDGES row: {e:?}"))),
             })
             .collect::<Result<Vec<_>, _>>()?;
         for k in victims {
-            out.remove(&k)
-                .map_err(|e| WorkerError::Ops(format!("EDGES_OUT remove: {e:?}")))?;
+            out.remove(k.as_slice())
+                .map_err(|e| WorkerError::Ops(format!("EDGES remove: {e:?}")))?;
         }
     }
 
-    // EDGES_IN: target = id (key is (target, kind, source)).
+    // Reverse rows anchored at `id`. The forward-table mirror lives
+    // on the OTHER memory's `(from=other, kind, to=id)` row — that
+    // row points AT the reclaimed slot but is keyed at `other`, not
+    // `id`. Leaving the forward mirror dangling matches the spec:
+    // slot reclamation only purges rows adjacent to the slot; the
+    // edge-scrub worker reaps dangling forward rows on its own
+    // schedule.
     {
-        let mut in_table = wtxn
-            .open_table(EDGES_IN_TABLE)
-            .map_err(|e| WorkerError::Ops(format!("open EDGES_IN: {e:?}")))?;
-        let victims: Vec<_> = in_table
-            .range(lo..=hi)
-            .map_err(|e| WorkerError::Ops(format!("EDGES_IN range: {e:?}")))?
+        let mut rev = wtxn
+            .open_table(EDGES_REVERSE_TABLE)
+            .map_err(|e| WorkerError::Ops(format!("open EDGES_REVERSE: {e:?}")))?;
+        let victims: Vec<Vec<u8>> = rev
+            .range::<&[u8]>(prefix.as_slice()..=hi.as_slice())
+            .map_err(|e| WorkerError::Ops(format!("EDGES_REVERSE range: {e:?}")))?
             .map(|entry| match entry {
-                Ok((k, _)) => Ok(k.value()),
-                Err(e) => Err(WorkerError::Ops(format!("EDGES_IN row: {e:?}"))),
+                Ok((k, _)) => Ok(k.value().to_vec()),
+                Err(e) => Err(WorkerError::Ops(format!("EDGES_REVERSE row: {e:?}"))),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        for k in victims {
-            in_table
-                .remove(&k)
-                .map_err(|e| WorkerError::Ops(format!("EDGES_IN remove: {e:?}")))?;
+        for k_bytes in victims {
+            rev.remove(k_bytes.as_slice())
+                .map_err(|e| WorkerError::Ops(format!("EDGES_REVERSE remove: {e:?}")))?;
         }
     }
 

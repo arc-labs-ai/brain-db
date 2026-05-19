@@ -15,7 +15,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use brain_core::MemoryId;
-use brain_metadata::tables::edge::{EDGES_IN_TABLE, EDGES_OUT_TABLE};
+use brain_metadata::tables::edge::{list_memory_edges_from, list_memory_edges_to};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use parking_lot::Mutex;
 use redb::ReadableTable;
@@ -171,12 +171,6 @@ fn collect_mismatches(
     let memories = rtxn
         .open_table(MEMORIES_TABLE)
         .map_err(|e| WorkerError::Ops(format!("open MEMORIES: {e:?}")))?;
-    let out_edges = rtxn
-        .open_table(EDGES_OUT_TABLE)
-        .map_err(|e| WorkerError::Ops(format!("open EDGES_OUT: {e:?}")))?;
-    let in_edges = rtxn
-        .open_table(EDGES_IN_TABLE)
-        .map_err(|e| WorkerError::Ops(format!("open EDGES_IN: {e:?}")))?;
 
     let from_key: [u8; 16] = match start_cursor {
         Some(id) => bump_be_u128(id.to_be_bytes()),
@@ -197,8 +191,12 @@ fn collect_mismatches(
         last_scanned = Some(id);
         let meta: MemoryMetadata = value.value();
 
-        let true_out = count_range(&out_edges, id)?;
-        let true_in = count_range(&in_edges, id)?;
+        let true_out = list_memory_edges_from(&rtxn, id, None)
+            .map(|v| v.len() as u64)
+            .map_err(|e| WorkerError::Ops(format!("edge from scan: {e:?}")))?;
+        let true_in = list_memory_edges_to(&rtxn, id, None)
+            .map(|v| v.len() as u64)
+            .map_err(|e| WorkerError::Ops(format!("edge to scan: {e:?}")))?;
         candidates_checked.push(id);
         if meta.edges_out_count as u64 != true_out || meta.edges_in_count as u64 != true_in {
             // Saturating cast — u32 truncation is acceptable; counts
@@ -224,27 +222,6 @@ fn collect_mismatches(
         last_scanned,
         scanned_to_end,
     })
-}
-
-/// Count rows in a (source, kind, target)-keyed edge table where the
-/// first 16 bytes match `id`. Works for both `EDGES_OUT` (counts
-/// outgoing from `id`) and `EDGES_IN` (counts incoming to `id`).
-fn count_range<T>(table: &T, id: MemoryId) -> Result<u64, WorkerError>
-where
-    T: ReadableTable<brain_metadata::tables::edge::EdgeKey, brain_metadata::tables::edge::EdgeData>,
-{
-    let id_bytes = id.to_be_bytes();
-    let lo = (id_bytes, 0u8, [0u8; 16]);
-    let hi = (id_bytes, u8::MAX, [0xFFu8; 16]);
-    let r = table
-        .range(lo..=hi)
-        .map_err(|e| WorkerError::Ops(format!("edge range: {e:?}")))?;
-    let mut n = 0u64;
-    for entry in r {
-        entry.map_err(|e| WorkerError::Ops(format!("edge row: {e:?}")))?;
-        n += 1;
-    }
-    Ok(n)
 }
 
 fn bump_be_u128(mut bytes: [u8; 16]) -> [u8; 16] {

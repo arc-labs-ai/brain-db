@@ -71,6 +71,20 @@ pub trait WriterHandle {
     fn agent_id(&self) -> brain_core::AgentId {
         brain_core::AgentId::default()
     }
+
+    /// Push `(memory_id, text)` onto the per-shard ExtractorWorker
+    /// channel for out-of-band re-extraction. Returns `true` iff the
+    /// enqueue landed (writer has a wired extractor channel and the
+    /// queue accepted the payload), `false` otherwise.
+    ///
+    /// Used by the admin `EXTRACT_BACKFILL` op — operators replay
+    /// existing memories through the three-tier extractor pipeline
+    /// after enabling the worker or uploading a new schema. The
+    /// default implementation drops on the floor so test fakes /
+    /// substrate-only writers keep working without overriding.
+    fn enqueue_for_extraction(&self, _memory_id: MemoryId, _text: &str) -> bool {
+        false
+    }
 }
 
 /// Encode operation payload submitted to the writer. Carries

@@ -130,7 +130,10 @@ fn entity_type_attributes() {
     assert_eq!(project.attributes[0].name, "slug");
     assert!(project.attributes[0].required);
     assert!(project.attributes[0].unique);
-    assert_eq!(project.attributes[2].default, Some(LiteralValue::Bool(true)));
+    assert_eq!(
+        project.attributes[2].default,
+        Some(LiteralValue::Bool(true))
+    );
 }
 
 #[test]

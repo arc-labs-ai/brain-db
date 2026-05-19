@@ -72,8 +72,8 @@ where
             .await
             .expect("payload");
     }
-    let (frame, rest) = Frame::decode_with_max(&buf, brain_protocol::MAX_PAYLOAD_BYTES as u32)
-        .expect("decode");
+    let (frame, rest) =
+        Frame::decode_with_max(&buf, brain_protocol::MAX_PAYLOAD_BYTES as u32).expect("decode");
     debug_assert!(rest.is_empty());
     frame
 }
@@ -164,11 +164,7 @@ fn rid() -> [u8; 16] {
     *uuid::Uuid::now_v7().as_bytes()
 }
 
-fn create_request(
-    relation_type: &str,
-    from: [u8; 16],
-    to: [u8; 16],
-) -> RelationCreateRequest {
+fn create_request(relation_type: &str, from: [u8; 16], to: [u8; 16]) -> RelationCreateRequest {
     RelationCreateRequest {
         relation_type: relation_type.into(),
         from_entity: from,
@@ -190,7 +186,9 @@ fn create_request(
 #[tokio::test(flavor = "current_thread")]
 async fn create_asymmetric_round_trips() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let a = make_entity(&mut client, 1, "A-asym").await;
@@ -235,7 +233,9 @@ async fn create_asymmetric_round_trips() {
 #[tokio::test(flavor = "current_thread")]
 async fn create_unknown_relation_type_returns_error() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
     let a = make_entity(&mut client, 1, "A-unk").await;
     let b = make_entity(&mut client, 3, "B-unk").await;
@@ -257,7 +257,9 @@ async fn create_unknown_relation_type_returns_error() {
 #[tokio::test(flavor = "current_thread")]
 async fn create_unknown_endpoint_returns_error() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let (op, body) = round_trip(
@@ -277,7 +279,9 @@ async fn create_unknown_endpoint_returns_error() {
 #[tokio::test(flavor = "current_thread")]
 async fn create_symmetric_canonicalises() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
     let a = make_entity(&mut client, 1, "A-sym").await;
     let b = make_entity(&mut client, 3, "B-sym").await;
@@ -320,7 +324,9 @@ async fn create_symmetric_canonicalises() {
 #[tokio::test(flavor = "current_thread")]
 async fn create_many_to_one_auto_supersedes() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
     let priya = make_entity(&mut client, 1, "priya").await;
     let alice = make_entity(&mut client, 3, "alice").await;
@@ -375,7 +381,9 @@ async fn create_many_to_one_auto_supersedes() {
 #[tokio::test(flavor = "current_thread")]
 async fn get_missing_returns_error() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let (op, body) = round_trip(
@@ -398,7 +406,9 @@ async fn get_missing_returns_error() {
 #[tokio::test(flavor = "current_thread")]
 async fn supersede_explicit_returns_new_id_and_version() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
     let a = make_entity(&mut client, 1, "a-sup").await;
     let b = make_entity(&mut client, 3, "b-sup").await;
@@ -439,7 +449,9 @@ async fn supersede_explicit_returns_new_id_and_version() {
 #[tokio::test(flavor = "current_thread")]
 async fn tombstone_flips_current_state() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
     let a = make_entity(&mut client, 1, "a-tomb").await;
     let b = make_entity(&mut client, 3, "b-tomb").await;
@@ -518,7 +530,9 @@ async fn tombstone_flips_current_state() {
 #[tokio::test(flavor = "current_thread")]
 async fn list_to_filters_by_type() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
     let a = make_entity(&mut client, 1, "a-lt").await;
     let b = make_entity(&mut client, 3, "b-lt").await;
@@ -566,7 +580,9 @@ async fn list_to_filters_by_type() {
 #[tokio::test(flavor = "current_thread")]
 async fn traverse_one_hop() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
     let a = make_entity(&mut client, 1, "a-tr1").await;
     let b = make_entity(&mut client, 3, "b-tr1").await;
@@ -609,7 +625,9 @@ async fn traverse_one_hop() {
 #[tokio::test(flavor = "current_thread")]
 async fn traverse_invalid_depth_returns_error() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
     let a = make_entity(&mut client, 1, "a-d").await;
 

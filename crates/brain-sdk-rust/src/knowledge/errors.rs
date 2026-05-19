@@ -221,7 +221,9 @@ impl ClientErrorStatementExt for ClientError {
             return Some(StatementErrorKind::ObjectTypeMismatch);
         }
 
-        if lower.contains("unknown predicate") || lower.contains("predicate") && lower.contains("not registered") {
+        if lower.contains("unknown predicate")
+            || lower.contains("predicate") && lower.contains("not registered")
+        {
             return Some(StatementErrorKind::PredicateUnknown);
         }
 
@@ -349,7 +351,9 @@ mod tests {
 
     #[test]
     fn detects_already_exists() {
-        let e = server_err("canonical_name \"Alice\" already exists for type EntityTypeId(1): EntityId(...)");
+        let e = server_err(
+            "canonical_name \"Alice\" already exists for type EntityTypeId(1): EntityId(...)",
+        );
         assert_eq!(e.entity_error(), Some(EntityErrorKind::AlreadyExists));
         assert!(e.is_entity_already_exists());
     }

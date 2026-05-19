@@ -215,7 +215,7 @@ fn recall_request(text: &str) -> RequestBody {
         age_bound_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
-        strategy_hint: None,
+        strategy: None,
         include_vectors: false,
         include_edges: false,
         include_text: false,
@@ -384,10 +384,7 @@ async fn recall_after_schema_routes_through_hybrid_pipeline() {
     match body {
         ResponseBody::Recall(r) => {
             assert!(r.is_final);
-            assert!(
-                !r.results.is_empty(),
-                "expected at least one hit, got 0",
-            );
+            assert!(!r.results.is_empty(), "expected at least one hit, got 0",);
             let first = &r.results[0];
             assert!(
                 !first.contributing_retrievers.is_empty(),

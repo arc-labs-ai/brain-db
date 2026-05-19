@@ -60,6 +60,10 @@ fn write_memory(
     writer.commit().expect("commit");
 }
 
+// Test helper that mirrors the underlying schema's field set; introducing a
+// builder struct would just shadow the same nine fields without improving
+// the test sites.
+#[allow(clippy::too_many_arguments)]
 fn write_statement(
     shard: &TantivyShard,
     id: StatementId,

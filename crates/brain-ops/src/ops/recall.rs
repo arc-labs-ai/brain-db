@@ -1,22 +1,23 @@
 //! RECALL handler.
 //!
-//! Routing (spec §28/08 §5):
+//! Hybrid retrieval (semantic + lexical + graph fused via RRF) is
+//! the default for every deployment. A schema upload no longer
+//! gates retrieval — it only narrows what STATEMENT_CREATE /
+//! RELATION_CREATE / predicate filters accept. RECALL routing
+//! looks at two inputs:
 //!
-//! - When the per-shard [`SchemaGate`] is `true` and no txn is
-//!   attached, route through the hybrid query engine
-//!   (phase 23.6–23.7). Memory hits are projected back onto the
-//!   substrate's `MemoryResult` with `contributing_retrievers` and
-//!   `fused_score` populated.
-//! - Otherwise (no schema, or a transaction is in progress), run the
-//!   substrate vector recall and leave the new fields empty / zero.
+//! 1. The wire `RecallStrategy` — `Auto` (default), `HybridOnly`,
+//!    or `SubstrateOnly`. Clients pick the escape hatch when
+//!    they need raw HNSW latency or want the hybrid path to fail
+//!    loud rather than silently degrade.
+//! 2. Whether a txn is attached. Transactional read-your-writes
+//!    only works on the substrate path (the hybrid retrievers
+//!    don't see the per-txn buffer), so a txn forces the
+//!    substrate route regardless of strategy.
 //!
-//! Transactional read-your-writes only applies on the substrate path
-//! (spec §09/08 §5). The hybrid path falls back to substrate when a
-//! txn is set; full hybrid-in-txn semantics are deferred past v1.
-//!
-//! Substrate path notes (originally sub-task 7.4 + 7.9): plan +
-//! execute against committed state, layer the txn buffer on top for
-//! read-your-writes, sort, filter, truncate.
+//! Substrate path: plan + execute against committed state, layer
+//! the txn buffer on top for read-your-writes, sort, filter,
+//! truncate.
 
 use std::collections::HashSet;
 
@@ -30,7 +31,7 @@ use brain_planner::knowledge::executor::{
 use brain_planner::knowledge::planner::{plan as hybrid_plan, PlanError};
 use brain_planner::knowledge::router::{QueryRequest as PlannerQueryRequest, RetrieverSelection};
 use brain_planner::{execute_recall, plan_recall_inner, RecallHit};
-use brain_protocol::request::{MemoryKindWire, RecallRequest};
+use brain_protocol::request::{MemoryKindWire, RecallRequest, RecallStrategy};
 use brain_protocol::response::{MemoryResult, RecallResponseFrame};
 use brain_protocol::responses::types::RetrieverNameWire;
 
@@ -42,21 +43,48 @@ pub async fn handle_recall(
     req: RecallRequest,
     ctx: &OpsContext,
 ) -> Result<RecallResponseFrame, OpError> {
-    if ctx.schema_gate.is_declared() && req.txn_id.is_none() {
-        match hybrid_recall(&req, ctx).await {
-            Ok(HybridRecallOutcome::Frame(frame)) => return Ok(frame),
+    let strategy = req.strategy.unwrap_or_default();
+
+    // Txn always forces substrate so read-your-writes works
+    // against the buffered ops. HybridOnly inside a txn is a
+    // contradiction the client can't satisfy; fail loud with a
+    // typed error rather than silently route to substrate.
+    if req.txn_id.is_some() {
+        if matches!(strategy, RecallStrategy::HybridOnly) {
+            return Err(OpError::HybridUnavailable(
+                "HybridOnly is incompatible with a transactional recall (txn requires substrate for read-your-writes)".into(),
+            ));
+        }
+        return substrate_recall(req, ctx).await;
+    }
+
+    match strategy {
+        RecallStrategy::SubstrateOnly => substrate_recall(req, ctx).await,
+        RecallStrategy::HybridOnly => {
+            // Caller wants hybrid or nothing. If a retriever slot
+            // is empty surface HybridUnavailable; never fall
+            // back to substrate.
+            match hybrid_recall(&req, ctx).await {
+                Ok(HybridRecallOutcome::Frame(frame)) => Ok(frame),
+                Ok(HybridRecallOutcome::FallbackToSubstrate { retriever }) => Err(
+                    OpError::HybridUnavailable(format!("retriever slot empty for {retriever:?}",)),
+                ),
+                Err(e) => Err(e),
+            }
+        }
+        RecallStrategy::Auto => match hybrid_recall(&req, ctx).await {
+            Ok(HybridRecallOutcome::Frame(frame)) => Ok(frame),
             Ok(HybridRecallOutcome::FallbackToSubstrate { retriever }) => {
                 tracing::warn!(
                     target: "brain_ops::recall",
                     ?retriever,
                     "hybrid recall fell back to substrate (retriever slot empty)",
                 );
-                // Fall through to substrate path.
+                substrate_recall(req, ctx).await
             }
-            Err(e) => return Err(e),
-        }
+            Err(e) => Err(e),
+        },
     }
-    substrate_recall(req, ctx).await
 }
 
 // ---------------------------------------------------------------------------

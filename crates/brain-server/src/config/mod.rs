@@ -107,6 +107,150 @@ pub struct WorkersConfig {
     pub statistics_update_interval_sec: Option<u64>,
     pub embedder_cache_eviction_interval_sec: Option<u64>,
     pub snapshot_interval_sec: Option<u64>,
+    /// Phase B: substrate auto-derived `SimilarTo` edges. Defaults
+    /// kick in when the section is omitted from TOML.
+    #[serde(default)]
+    pub auto_edge: AutoEdgeWorkerConfig,
+    /// Phase E: per-shard extractor pipeline worker. Drains the
+    /// writer's post-encode channel and runs the three-tier
+    /// extractor framework (pattern + classifier + LLM) before
+    /// writing entities / statements / relations / mention edges.
+    /// Section may be omitted; every field has a default.
+    #[serde(default)]
+    pub extractor: ExtractorWorkerConfig,
+}
+
+/// `[workers.auto_edge]` TOML section. Controls the substrate
+/// SimilarTo derivation worker (Phase B). Every field defaults so an
+/// existing `dev.toml` keeps working without edits.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AutoEdgeWorkerConfig {
+    /// Master switch. `false` skips registration entirely — encodes
+    /// see a None sender, the worker isn't spawned, the channel is
+    /// never created. Latency-sensitive deployments that don't want
+    /// auto-derived edges should flip this to `false`.
+    #[serde(default = "default_auto_edge_enabled")]
+    pub enabled: bool,
+    /// Scheduler tick in milliseconds. Smaller = faster encode → edge
+    /// visibility; larger = less worker overhead.
+    #[serde(default = "default_auto_edge_interval_ms")]
+    pub interval_ms: u64,
+    /// Max memories drained per cycle. Caps HNSW search bursts.
+    #[serde(default = "default_auto_edge_batch_size")]
+    pub batch_size: usize,
+    /// Cosine similarity floor. Neighbours below this don't get an
+    /// edge even if HNSW returned them.
+    #[serde(default = "default_auto_edge_similarity_threshold")]
+    pub similarity_threshold: f32,
+    /// Per-memory neighbour count. The worker fetches `top_k + 1`
+    /// from HNSW so the self-hit doesn't eat into the requested k.
+    #[serde(default = "default_auto_edge_top_k")]
+    pub top_k: usize,
+    /// HNSW `ef` override for the per-encode search.
+    #[serde(default = "default_auto_edge_ef_search")]
+    pub ef_search: usize,
+    /// Writer→worker queue depth. On overflow the writer drops the
+    /// enqueue with a warn; the encode itself never fails.
+    #[serde(default = "default_auto_edge_channel_capacity")]
+    pub channel_capacity: usize,
+}
+
+impl Default for AutoEdgeWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_auto_edge_enabled(),
+            interval_ms: default_auto_edge_interval_ms(),
+            batch_size: default_auto_edge_batch_size(),
+            similarity_threshold: default_auto_edge_similarity_threshold(),
+            top_k: default_auto_edge_top_k(),
+            ef_search: default_auto_edge_ef_search(),
+            channel_capacity: default_auto_edge_channel_capacity(),
+        }
+    }
+}
+
+fn default_auto_edge_enabled() -> bool {
+    true
+}
+fn default_auto_edge_interval_ms() -> u64 {
+    100
+}
+fn default_auto_edge_batch_size() -> usize {
+    256
+}
+fn default_auto_edge_similarity_threshold() -> f32 {
+    0.85
+}
+fn default_auto_edge_top_k() -> usize {
+    5
+}
+fn default_auto_edge_ef_search() -> usize {
+    64
+}
+fn default_auto_edge_channel_capacity() -> usize {
+    1024
+}
+
+/// `[workers.extractor]` TOML section. Defaults registered every
+/// shard. Omit the section to accept defaults; set `enabled = false`
+/// to skip worker registration entirely for substrate-only deployments.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExtractorWorkerConfig {
+    /// Master switch. `false` skips registration entirely.
+    #[serde(default = "default_extractor_enabled")]
+    pub enabled: bool,
+    /// Scheduler tick in milliseconds.
+    #[serde(default = "default_extractor_interval_ms")]
+    pub interval_ms: u64,
+    /// Max memories drained per cycle (caps pattern / classifier /
+    /// LLM work per scheduler tick).
+    #[serde(default = "default_extractor_drain_per_cycle")]
+    pub drain_per_cycle: usize,
+    /// Per-cycle LLM cost ceiling in dollar-micro-units (1e-6 USD).
+    #[serde(default = "default_extractor_llm_budget_micro_usd")]
+    pub llm_budget_per_cycle_micro_usd: u64,
+    /// Writer → worker queue depth. Overflow drops the enqueue with
+    /// a warn (encode itself never fails).
+    #[serde(default = "default_extractor_channel_capacity")]
+    pub channel_capacity: usize,
+    /// Skip memories that already carry a pipeline audit row. Set to
+    /// `false` only for re-extraction backfill scenarios.
+    #[serde(default = "default_extractor_skip_audited")]
+    pub skip_already_extracted: bool,
+}
+
+impl Default for ExtractorWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_extractor_enabled(),
+            interval_ms: default_extractor_interval_ms(),
+            drain_per_cycle: default_extractor_drain_per_cycle(),
+            llm_budget_per_cycle_micro_usd: default_extractor_llm_budget_micro_usd(),
+            channel_capacity: default_extractor_channel_capacity(),
+            skip_already_extracted: default_extractor_skip_audited(),
+        }
+    }
+}
+
+fn default_extractor_enabled() -> bool {
+    true
+}
+fn default_extractor_interval_ms() -> u64 {
+    1000
+}
+fn default_extractor_drain_per_cycle() -> usize {
+    32
+}
+fn default_extractor_llm_budget_micro_usd() -> u64 {
+    50_000
+}
+fn default_extractor_channel_capacity() -> usize {
+    1024
+}
+fn default_extractor_skip_audited() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

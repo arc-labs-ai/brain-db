@@ -23,11 +23,12 @@
 //! - `MemoryMetadata.edges_out_count` / `edges_in_count` aren't
 //!   maintained on Link/Unlink. Phase 8 worker reconciles.
 
-use brain_core::{AgentId, ContextId, EdgeKind, MemoryKind};
+use brain_core::{AgentId, ContextId, EdgeKind, EdgeKindRef, MemoryKind};
 use brain_storage::recovery::{MetadataSink, MetadataSinkError};
 use brain_storage::wal::payload::{
     ConsolidatePayload, EdgePayload, EncodePayload, ForgetPayload, LinkPayload,
-    MigrateEmbeddingPayload, ReclaimPayload, SalienceUpdate, UnlinkPayload, UpdateContextPayload,
+    MigrateEmbeddingPayload, ReclaimPayload, RelationLinkPayload, RelationSupersedePayload,
+    RelationTombstonePayload, SalienceUpdate, UnlinkPayload, UpdateContextPayload,
     UpdateKindPayload, UpdateSaliencePayload, WalPayload,
 };
 use redb::{ReadableTable, WriteTransaction};
@@ -35,11 +36,17 @@ use redb::{ReadableTable, WriteTransaction};
 use crate::db::MetadataDb;
 use crate::schema::CURRENT_SCHEMA_VERSION;
 use crate::tables::checkpoint::{CheckpointMeta, CHECKPOINTS_TABLE};
-use crate::tables::edge::{self, EdgeData, EdgeKey, EDGES_IN_TABLE, EDGES_OUT_TABLE};
+use crate::tables::edge::{
+    self, derived_by, origin, zero_disambiguator, EdgeData, EdgeKey, EDGES_REVERSE_TABLE,
+    EDGES_TABLE,
+};
 use crate::tables::fingerprint::{
     content_hash as fp_content_hash, fingerprint_key, FingerprintEntry, FINGERPRINTS_TABLE,
 };
 use crate::tables::idempotency::{response_kind, IdempotencyEntry, IDEMPOTENCY_TABLE};
+use crate::tables::knowledge::relation::{
+    RelationMetadata, RELATION_BY_EVIDENCE_TABLE, RELATION_METADATA_TABLE,
+};
 use crate::tables::memory::{flags, memory_kind_to_u8, MemoryMetadata, MEMORIES_TABLE};
 use crate::tables::model_fingerprint::{ModelInfo, MODEL_FINGERPRINTS_TABLE};
 use crate::tables::next_lsn::NEXT_LSN_TABLE;
@@ -87,13 +94,15 @@ impl MetadataSink for MetadataDb {
                 self.bump_next_lsn(lsn)
             }
             WalPayload::Knowledge(_) => {
-                // Knowledge-layer records (spec §26) — substrate sink
-                // ignores these. Phases 16+ supply their own sinks for
-                // entity / statement / relation / schema / audit
-                // hydration. We still advance the LSN watermark so
-                // checkpointing is correct.
+                // Knowledge-layer records — substrate sink ignores
+                // these. Later phases supply their own sinks for entity
+                // / statement / schema / audit hydration. We still
+                // advance the LSN watermark so checkpointing is correct.
                 self.bump_next_lsn(lsn)
             }
+            WalPayload::RelationLink(p) => self.apply_relation_link(lsn, timestamp_ns, p),
+            WalPayload::RelationSupersede(p) => self.apply_relation_supersede(lsn, timestamp_ns, p),
+            WalPayload::RelationTombstone(p) => self.apply_relation_tombstone(lsn, p),
         }
     }
 }
@@ -198,12 +207,20 @@ impl MetadataDb {
 
             // edges
             if !p.edges.is_empty() {
-                let mut out = wtxn.open_table(EDGES_OUT_TABLE).map_err(transient)?;
-                let mut in_ = wtxn.open_table(EDGES_IN_TABLE).map_err(transient)?;
+                let mut out = wtxn.open_table(EDGES_TABLE).map_err(transient)?;
+                let mut rev = wtxn.open_table(EDGES_REVERSE_TABLE).map_err(transient)?;
                 for e in &p.edges {
                     let data = edge_payload_to_data(e, timestamp_ns);
-                    edge::link(&mut out, &mut in_, e.source, e.kind, e.target, &data)
-                        .map_err(transient)?;
+                    edge::link(
+                        &mut out,
+                        &mut rev,
+                        e.source,
+                        e.kind,
+                        e.target,
+                        zero_disambiguator(),
+                        &data,
+                    )
+                    .map_err(transient)?;
                 }
             }
 
@@ -300,10 +317,18 @@ impl MetadataDb {
                 timestamp_ns,
             );
             {
-                let mut out = wtxn.open_table(EDGES_OUT_TABLE).map_err(transient)?;
-                let mut in_ = wtxn.open_table(EDGES_IN_TABLE).map_err(transient)?;
-                edge::link(&mut out, &mut in_, p.source, p.edge_kind, p.target, &data)
-                    .map_err(transient)?;
+                let mut out = wtxn.open_table(EDGES_TABLE).map_err(transient)?;
+                let mut rev = wtxn.open_table(EDGES_REVERSE_TABLE).map_err(transient)?;
+                edge::link(
+                    &mut out,
+                    &mut rev,
+                    p.source,
+                    p.edge_kind,
+                    p.target,
+                    zero_disambiguator(),
+                    &data,
+                )
+                .map_err(transient)?;
             }
 
             // No RequestId in LinkPayload, so no idempotency entry.
@@ -322,10 +347,111 @@ impl MetadataDb {
         let wtxn = self.db.begin_write().map_err(transient)?;
         {
             {
-                let mut out = wtxn.open_table(EDGES_OUT_TABLE).map_err(transient)?;
-                let mut in_ = wtxn.open_table(EDGES_IN_TABLE).map_err(transient)?;
-                edge::unlink(&mut out, &mut in_, p.source, p.edge_kind, p.target)
+                let mut out = wtxn.open_table(EDGES_TABLE).map_err(transient)?;
+                let mut rev = wtxn.open_table(EDGES_REVERSE_TABLE).map_err(transient)?;
+                edge::unlink(
+                    &mut out,
+                    &mut rev,
+                    p.source,
+                    p.edge_kind,
+                    p.target,
+                    zero_disambiguator(),
+                )
+                .map_err(transient)?;
+            }
+            self.bump_next_lsn_in_txn(&wtxn, lsn)?;
+        }
+        wtxn.commit().map_err(transient)?;
+        Ok(())
+    }
+
+    fn apply_relation_link(
+        &mut self,
+        lsn: u64,
+        timestamp_ns: u64,
+        p: &RelationLinkPayload,
+    ) -> Result<(), MetadataSinkError> {
+        let wtxn = self.db.begin_write().map_err(transient)?;
+        {
+            write_relation_link(&wtxn, p, timestamp_ns)?;
+            self.bump_next_lsn_in_txn(&wtxn, lsn)?;
+        }
+        wtxn.commit().map_err(transient)?;
+        Ok(())
+    }
+
+    fn apply_relation_supersede(
+        &mut self,
+        lsn: u64,
+        timestamp_ns: u64,
+        p: &RelationSupersedePayload,
+    ) -> Result<(), MetadataSinkError> {
+        let wtxn = self.db.begin_write().map_err(transient)?;
+        {
+            // Flip the old sidecar row first — is_current = 0,
+            // superseded_by = new id, valid_to defaults to the new
+            // relation's extracted_at when the old row didn't pin one
+            // explicitly. The edge row of the old relation stays in
+            // place; relation history walks the sidecar chain.
+            let old_key = p.old_relation_id.to_bytes();
+            let mut sidecar = wtxn
+                .open_table(RELATION_METADATA_TABLE)
+                .map_err(transient)?;
+            let mut old = sidecar
+                .get(&old_key)
+                .map_err(transient)?
+                .map(|g| g.value())
+                .ok_or_else(|| {
+                    MetadataSinkError::Corruption(format!(
+                        "relation_supersede: missing sidecar for {:?}",
+                        p.old_relation_id
+                    ))
+                })?;
+            old.superseded_by_bytes = Some(p.new.relation_id.to_bytes());
+            if old.valid_to_unix_nanos.is_none() {
+                old.valid_to_unix_nanos = Some(timestamp_ns);
+            }
+            old.is_current = 0;
+            sidecar.insert(&old_key, &old).map_err(transient)?;
+            drop(sidecar);
+
+            // Replay the new relation insert exactly as a fresh
+            // create. The WAL captured the post-supersession version /
+            // chain_root / supersedes inline so we just project it.
+            write_relation_link(&wtxn, &p.new, timestamp_ns)?;
+
+            self.bump_next_lsn_in_txn(&wtxn, lsn)?;
+        }
+        wtxn.commit().map_err(transient)?;
+        Ok(())
+    }
+
+    fn apply_relation_tombstone(
+        &mut self,
+        lsn: u64,
+        p: &RelationTombstonePayload,
+    ) -> Result<(), MetadataSinkError> {
+        let wtxn = self.db.begin_write().map_err(transient)?;
+        {
+            let key = p.relation_id.to_bytes();
+            {
+                let mut sidecar = wtxn
+                    .open_table(RELATION_METADATA_TABLE)
                     .map_err(transient)?;
+                let mut row = sidecar
+                    .get(&key)
+                    .map_err(transient)?
+                    .map(|g| g.value())
+                    .ok_or_else(|| {
+                        MetadataSinkError::Corruption(format!(
+                            "relation_tombstone: missing sidecar for {:?}",
+                            p.relation_id
+                        ))
+                    })?;
+                row.tombstoned = 1;
+                row.tombstoned_at_unix_nanos = Some(p.at_unix_nanos);
+                row.is_current = 0;
+                sidecar.insert(&key, &row).map_err(transient)?;
             }
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
         }
@@ -599,6 +725,127 @@ fn edge_payload_to_data(e: &EdgePayload, timestamp_ns: u64) -> EdgeData {
     )
 }
 
+/// Replay one [`RelationLinkPayload`] inside the caller's write txn.
+/// Writes:
+///   1. unified-edge row (and mirror for symmetric self-distinct
+///      typed relations),
+///   2. sidecar [`RelationMetadata`] keyed by the relation id,
+///   3. one row per evidence memory in `RELATION_BY_EVIDENCE_TABLE`.
+///
+/// Recovery never re-runs cardinality enforcement here — the live
+/// writer already enforced the rule before the WAL append; replay is
+/// pure projection. Caller commits.
+fn write_relation_link(
+    wtxn: &WriteTransaction,
+    p: &RelationLinkPayload,
+    now_unix_nanos: u64,
+) -> Result<(), MetadataSinkError> {
+    // Edge row(s). The auto-mirror split mirrors `relation_ops`:
+    // symmetric typed relations write the mirror explicitly here so
+    // the `is_symmetric` bit stays sidecar-local. Substrate auto-
+    // mirror in `edge::link` is reserved for Builtin kinds and never
+    // fires for Typed.
+    {
+        let mut edges = wtxn.open_table(EDGES_TABLE).map_err(transient)?;
+        let mut reverse = wtxn.open_table(EDGES_REVERSE_TABLE).map_err(transient)?;
+        let data = EdgeData::new(
+            1.0,
+            origin::AUTO_DERIVED,
+            derived_by::CLIENT,
+            now_unix_nanos,
+        );
+        let kind = EdgeKindRef::Typed(p.relation_type_id);
+        edge::link(
+            &mut edges,
+            &mut reverse,
+            p.from,
+            kind,
+            p.to,
+            p.relation_id.to_bytes(),
+            &data,
+        )
+        .map_err(transient)?;
+        if p.is_symmetric && p.from != p.to {
+            edge::link(
+                &mut edges,
+                &mut reverse,
+                p.to,
+                kind,
+                p.from,
+                p.relation_id.to_bytes(),
+                &data,
+            )
+            .map_err(transient)?;
+        }
+    }
+
+    // Sidecar. The WAL payload carries every field we need; the
+    // version starts at 1 for a non-supersede create and increments
+    // through the supersession chain. `is_current = 1` because a
+    // tombstone or supersede arrives as its own WAL record later.
+    let evidence_inline: Vec<[u8; 16]> = p.evidence.iter().map(|m| m.to_be_bytes()).collect();
+    let chain_root_bytes = if p.supersedes.is_some() {
+        p.chain_root.to_bytes()
+    } else {
+        // A root relation's chain_root equals its own id. The writer
+        // sets it that way and the WAL carries it verbatim, but we
+        // self-heal here when the payload's `chain_root` is left as
+        // the default sentinel.
+        if p.chain_root.to_bytes() == [0u8; 16] {
+            p.relation_id.to_bytes()
+        } else {
+            p.chain_root.to_bytes()
+        }
+    };
+    let version = match p.supersedes {
+        Some(_) => 2,
+        None => 1,
+    };
+    let meta = RelationMetadata {
+        from_tag: p.from.tag(),
+        from_bytes: p.from.id_bytes(),
+        to_tag: p.to.tag(),
+        to_bytes: p.to.id_bytes(),
+        relation_type_id: p.relation_type_id.raw(),
+        chain_root_bytes,
+        properties_blob: p.properties_blob.clone(),
+        version,
+        confidence: p.confidence,
+        extractor_id: p.extractor_id,
+        extracted_at_unix_nanos: now_unix_nanos,
+        valid_from_unix_nanos: p.valid_from_unix_nanos,
+        valid_to_unix_nanos: p.valid_to_unix_nanos,
+        superseded_by_bytes: None,
+        supersedes_bytes: p.supersedes.map(|r| r.to_bytes()),
+        evidence_inline,
+        tombstoned: 0,
+        tombstoned_at_unix_nanos: None,
+        is_current: 1,
+        is_symmetric: u8::from(p.is_symmetric),
+        flags: 0,
+    };
+    {
+        let mut t = wtxn
+            .open_table(RELATION_METADATA_TABLE)
+            .map_err(transient)?;
+        t.insert(&p.relation_id.to_bytes(), &meta)
+            .map_err(transient)?;
+    }
+
+    // Evidence reverse index.
+    {
+        let mut t = wtxn
+            .open_table(RELATION_BY_EVIDENCE_TABLE)
+            .map_err(transient)?;
+        for mem in &p.evidence {
+            t.insert(&(mem.to_be_bytes(), p.relation_id.to_bytes()), &())
+                .map_err(transient)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn update_one_salience(
     t: &mut redb::Table<'_, [u8; 16], MemoryMetadata>,
     u: &SalienceUpdate,
@@ -618,8 +865,7 @@ fn transient<E: std::fmt::Display>(e: E) -> MetadataSinkError {
 
 // ---------------------------------------------------------------------------
 // Suppress unused-import warning for types referenced only in the docs/
-// match arms above. (`EdgeKey` is conditionally referenced via the
-// edge::link signature; `EdgeKind` is used in payload conversion.)
+// match arms above.
 // ---------------------------------------------------------------------------
 
 const _: fn() = || {
@@ -792,18 +1038,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MetadataDb::open(db_path(&dir)).unwrap();
         let mut p = sample_encode(1, 1);
+        let mem_node = brain_core::NodeRef::Memory(p.memory_id);
         p.edges = vec![
             EdgePayload {
-                source: p.memory_id,
-                target: mid(2, 1),
-                kind: EdgeKind::Caused,
+                source: mem_node,
+                target: brain_core::NodeRef::Memory(mid(2, 1)),
+                kind: brain_core::EdgeKindRef::Builtin(EdgeKind::Caused),
                 weight: 0.8,
                 origin: EdgeOrigin::Explicit,
             },
             EdgePayload {
-                source: p.memory_id,
-                target: mid(3, 1),
-                kind: EdgeKind::SimilarTo,
+                source: mem_node,
+                target: brain_core::NodeRef::Memory(mid(3, 1)),
+                kind: brain_core::EdgeKindRef::Builtin(EdgeKind::SimilarTo),
                 weight: 0.6,
                 origin: EdgeOrigin::AutoDerived,
             },
@@ -811,8 +1058,8 @@ mod tests {
         db.apply(1, TS, &WalPayload::Encode(p)).unwrap();
 
         let rtxn = db.read_txn().unwrap();
-        let out = rtxn.open_table(EDGES_OUT_TABLE).unwrap();
-        // 1 Caused + 2 SimilarTo (direct + mirror) = 3 rows in edges_out.
+        let out = rtxn.open_table(EDGES_TABLE).unwrap();
+        // 1 Caused + 2 SimilarTo (direct + mirror) = 3 rows in EDGES_TABLE.
         let count: u64 = out.iter().unwrap().count() as u64;
         assert_eq!(count, 3);
     }
@@ -862,9 +1109,9 @@ mod tests {
             1,
             TS,
             &WalPayload::Link(LinkPayload {
-                source: mid(1, 1),
-                target: mid(2, 1),
-                edge_kind: EdgeKind::Caused,
+                source: brain_core::NodeRef::Memory(mid(1, 1)),
+                target: brain_core::NodeRef::Memory(mid(2, 1)),
+                edge_kind: brain_core::EdgeKindRef::Builtin(EdgeKind::Caused),
                 weight: 0.9,
                 origin: EdgeOrigin::Explicit,
             }),
@@ -872,25 +1119,25 @@ mod tests {
         .unwrap();
 
         let rtxn = db.read_txn().unwrap();
-        let out = rtxn.open_table(EDGES_OUT_TABLE).unwrap();
-        let in_ = rtxn.open_table(EDGES_IN_TABLE).unwrap();
+        let out = rtxn.open_table(EDGES_TABLE).unwrap();
+        let rev = rtxn.open_table(EDGES_REVERSE_TABLE).unwrap();
         assert_eq!(out.iter().unwrap().count(), 1);
-        assert_eq!(in_.iter().unwrap().count(), 1);
+        assert_eq!(rev.iter().unwrap().count(), 1);
     }
 
     #[test]
     fn unlink_removes_both_edges() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MetadataDb::open(db_path(&dir)).unwrap();
-        let src = mid(1, 1);
-        let tgt = mid(2, 1);
+        let src = brain_core::NodeRef::Memory(mid(1, 1));
+        let tgt = brain_core::NodeRef::Memory(mid(2, 1));
         db.apply(
             1,
             TS,
             &WalPayload::Link(LinkPayload {
                 source: src,
                 target: tgt,
-                edge_kind: EdgeKind::Caused,
+                edge_kind: brain_core::EdgeKindRef::Builtin(EdgeKind::Caused),
                 weight: 0.9,
                 origin: EdgeOrigin::Explicit,
             }),
@@ -902,7 +1149,7 @@ mod tests {
             &WalPayload::Unlink(UnlinkPayload {
                 source: src,
                 target: tgt,
-                edge_kind: EdgeKind::Caused,
+                edge_kind: brain_core::EdgeKindRef::Builtin(EdgeKind::Caused),
                 edge_seq: 0,
             }),
         )
@@ -910,7 +1157,7 @@ mod tests {
 
         let rtxn = db.read_txn().unwrap();
         assert_eq!(
-            rtxn.open_table(EDGES_OUT_TABLE)
+            rtxn.open_table(EDGES_TABLE)
                 .unwrap()
                 .iter()
                 .unwrap()
@@ -918,7 +1165,7 @@ mod tests {
             0
         );
         assert_eq!(
-            rtxn.open_table(EDGES_IN_TABLE)
+            rtxn.open_table(EDGES_REVERSE_TABLE)
                 .unwrap()
                 .iter()
                 .unwrap()
@@ -1269,5 +1516,197 @@ mod tests {
             .unwrap()
             .value();
         assert_eq!(v, 8);
+    }
+
+    // ---------- RelationLink / Supersede / Tombstone ----------
+
+    use brain_core::{EntityId, RelationId, RelationTypeId};
+    use brain_storage::wal::payload::{
+        RelationLinkPayload, RelationSupersedePayload, RelationTombstonePayload,
+    };
+
+    fn ent(byte: u8) -> EntityId {
+        let mut b = [0u8; 16];
+        b[15] = byte;
+        EntityId::from(b)
+    }
+
+    fn relid(byte: u8) -> RelationId {
+        let mut b = [0u8; 16];
+        b[0] = 0xA0;
+        b[15] = byte;
+        RelationId::from(b)
+    }
+
+    fn sample_relation_link(rid_byte: u8, from: u8, to: u8) -> RelationLinkPayload {
+        RelationLinkPayload {
+            relation_id: relid(rid_byte),
+            from: brain_core::NodeRef::Entity(ent(from)),
+            to: brain_core::NodeRef::Entity(ent(to)),
+            relation_type_id: RelationTypeId::from(101),
+            chain_root: relid(rid_byte),
+            confidence: 0.92,
+            valid_from_unix_nanos: Some(TS),
+            valid_to_unix_nanos: None,
+            supersedes: None,
+            evidence: vec![mid(50, 1), mid(51, 1)],
+            extractor_id: 7,
+            is_symmetric: false,
+            properties_blob: vec![1, 2, 3],
+            agent_id: aid(1),
+        }
+    }
+
+    #[test]
+    fn relation_link_writes_unified_edge_plus_sidecar_plus_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MetadataDb::open(db_path(&dir)).unwrap();
+        let p = sample_relation_link(1, 2, 3);
+        let rid_bytes = p.relation_id.to_bytes();
+        db.apply(1, TS, &WalPayload::RelationLink(p.clone()))
+            .unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        // Unified edge row.
+        let edges = rtxn.open_table(EDGES_TABLE).unwrap();
+        let edge_count = edges.iter().unwrap().count();
+        assert_eq!(edge_count, 1, "asymmetric typed relation: one edge row");
+        let reverse = rtxn.open_table(EDGES_REVERSE_TABLE).unwrap();
+        assert_eq!(reverse.iter().unwrap().count(), 1);
+
+        // Sidecar.
+        let sidecar = rtxn.open_table(RELATION_METADATA_TABLE).unwrap();
+        let meta = sidecar.get(&rid_bytes).unwrap().unwrap().value();
+        assert_eq!(meta.relation_type_id, 101);
+        assert!((meta.confidence - 0.92).abs() < 1e-6);
+        assert_eq!(meta.is_current, 1);
+        assert_eq!(meta.tombstoned, 0);
+        assert_eq!(meta.evidence_inline.len(), 2);
+
+        // Evidence reverse index — one row per evidence memory.
+        let by_ev = rtxn.open_table(RELATION_BY_EVIDENCE_TABLE).unwrap();
+        assert_eq!(by_ev.iter().unwrap().count(), 2);
+    }
+
+    #[test]
+    fn relation_link_symmetric_mirrors_unified_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MetadataDb::open(db_path(&dir)).unwrap();
+        let mut p = sample_relation_link(5, 7, 9);
+        p.is_symmetric = true;
+        db.apply(1, TS, &WalPayload::RelationLink(p.clone()))
+            .unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let edges = rtxn.open_table(EDGES_TABLE).unwrap();
+        // Symmetric typed: two rows (forward + mirror) in EDGES_TABLE.
+        // No substrate auto-mirror — relation_ops/sink mirrors
+        // explicitly so the `is_symmetric` bit stays sidecar-local.
+        assert_eq!(edges.iter().unwrap().count(), 2);
+    }
+
+    #[test]
+    fn relation_supersede_flips_old_and_inserts_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MetadataDb::open(db_path(&dir)).unwrap();
+        let old = sample_relation_link(1, 2, 3);
+        let old_id = old.relation_id;
+        db.apply(1, TS, &WalPayload::RelationLink(old.clone()))
+            .unwrap();
+
+        let mut new_p = sample_relation_link(2, 2, 4);
+        new_p.supersedes = Some(old_id);
+        new_p.chain_root = old_id;
+        let new_id = new_p.relation_id;
+        db.apply(
+            2,
+            TS + 1_000,
+            &WalPayload::RelationSupersede(RelationSupersedePayload {
+                old_relation_id: old_id,
+                new: new_p,
+            }),
+        )
+        .unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let sidecar = rtxn.open_table(RELATION_METADATA_TABLE).unwrap();
+        let old_meta = sidecar.get(&old_id.to_bytes()).unwrap().unwrap().value();
+        assert_eq!(old_meta.is_current, 0);
+        assert_eq!(old_meta.superseded_by_bytes, Some(new_id.to_bytes()));
+        assert_eq!(old_meta.valid_to_unix_nanos, Some(TS + 1_000));
+
+        let new_meta = sidecar.get(&new_id.to_bytes()).unwrap().unwrap().value();
+        assert_eq!(new_meta.is_current, 1);
+        assert_eq!(new_meta.supersedes_bytes, Some(old_id.to_bytes()));
+        assert_eq!(new_meta.chain_root_bytes, old_id.to_bytes());
+        assert_eq!(new_meta.version, 2);
+    }
+
+    #[test]
+    fn relation_tombstone_flips_sidecar_bits_but_keeps_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MetadataDb::open(db_path(&dir)).unwrap();
+        let p = sample_relation_link(1, 2, 3);
+        let rid_bytes = p.relation_id.to_bytes();
+        db.apply(1, TS, &WalPayload::RelationLink(p.clone()))
+            .unwrap();
+
+        db.apply(
+            2,
+            TS + 2_000,
+            &WalPayload::RelationTombstone(RelationTombstonePayload {
+                relation_id: p.relation_id,
+                reason: "test".into(),
+                at_unix_nanos: TS + 2_000,
+                agent_id: aid(9),
+            }),
+        )
+        .unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let sidecar = rtxn.open_table(RELATION_METADATA_TABLE).unwrap();
+        let meta = sidecar.get(&rid_bytes).unwrap().unwrap().value();
+        assert_eq!(meta.tombstoned, 1);
+        assert_eq!(meta.tombstoned_at_unix_nanos, Some(TS + 2_000));
+        assert_eq!(meta.is_current, 0);
+
+        // The edge row stays — tombstone is a sidecar property.
+        let edges = rtxn.open_table(EDGES_TABLE).unwrap();
+        assert_eq!(edges.iter().unwrap().count(), 1);
+    }
+
+    #[test]
+    fn relation_tombstone_for_missing_sidecar_errors_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MetadataDb::open(db_path(&dir)).unwrap();
+        // RELATION_METADATA_TABLE is created lazily on first write.
+        // Seed an unrelated relation so the table exists, then issue
+        // a tombstone against an id we never wrote.
+        db.apply(
+            1,
+            TS,
+            &WalPayload::RelationLink(sample_relation_link(1, 2, 3)),
+        )
+        .unwrap();
+
+        let err = db
+            .apply(
+                2,
+                TS + 1,
+                &WalPayload::RelationTombstone(RelationTombstonePayload {
+                    relation_id: relid(99),
+                    reason: "ghost".into(),
+                    at_unix_nanos: TS + 1,
+                    agent_id: aid(9),
+                }),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                brain_storage::recovery::MetadataSinkError::Corruption(_)
+            ),
+            "expected Corruption, got {err:?}"
+        );
     }
 }

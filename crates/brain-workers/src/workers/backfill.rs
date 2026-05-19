@@ -135,10 +135,7 @@ impl BackfillWorker {
     /// Process up to `cfg.batch_size` items from the in-flight
     /// request. Returns the number of items advanced (matches the
     /// `Worker::run_cycle` contract).
-    async fn drive_one_batch(
-        &self,
-        ctx: &WorkerContext,
-    ) -> Result<usize, WorkerError> {
+    async fn drive_one_batch(&self, ctx: &WorkerContext) -> Result<usize, WorkerError> {
         // Acquire current run (or dequeue a new one).
         let req = match self.state.current.lock().as_ref() {
             Some(r) => r.request.clone(),
@@ -174,14 +171,8 @@ impl BackfillWorker {
             // For each extractor in the request, walk the checkpoint.
             for ext_id in &req.extractor_ids {
                 let item_key = item_key_for(memory_id, ext_id.raw());
-                let outcome = self.process_item(
-                    ctx,
-                    memory_id,
-                    *ext_id,
-                    &item_key,
-                    req.dry_run,
-                    now_ns,
-                )?;
+                let outcome =
+                    self.process_item(ctx, memory_id, *ext_id, &item_key, req.dry_run, now_ns)?;
                 self.record_outcome(outcome);
                 items_processed += 1;
                 if items_processed >= self.config.batch_size {
@@ -201,7 +192,7 @@ impl BackfillWorker {
             .current
             .lock()
             .as_ref()
-            .map_or(false, |r| r.cancelled)
+            .is_some_and(|r| r.cancelled)
     }
 
     fn next_memory(
@@ -209,12 +200,7 @@ impl BackfillWorker {
         req: &BackfillRequest,
         ctx: &WorkerContext,
     ) -> Result<Option<MemoryId>, WorkerError> {
-        let cursor = self
-            .state
-            .current
-            .lock()
-            .as_ref()
-            .and_then(|r| r.cursor);
+        let cursor = self.state.current.lock().as_ref().and_then(|r| r.cursor);
         let lo: u128 = match (cursor, &req.memory_range) {
             (Some(c), _) => c.raw().saturating_add(1),
             (None, BackfillRange::All) => 0,
@@ -245,8 +231,7 @@ impl BackfillWorker {
             .range(memory_key_from(lo)..=memory_key_from(hi))
             .map_err(|e| WorkerError::Internal(format!("backfill range: {e}")))?;
         if let Some(entry) = iter.next() {
-            let (k, _) = entry
-                .map_err(|e| WorkerError::Internal(format!("backfill iter: {e}")))?;
+            let (k, _) = entry.map_err(|e| WorkerError::Internal(format!("backfill iter: {e}")))?;
             let key_bytes = k.value();
             let raw = u128::from_be_bytes(key_bytes);
             return Ok(Some(MemoryId::from_raw(raw)));

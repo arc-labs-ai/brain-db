@@ -41,9 +41,8 @@ use brain_core::knowledge::{
 };
 use brain_core::{EntityId, MemoryId, StatementId, StatementKind};
 use brain_protocol::knowledge::{
-    evidence_ref_from_wire, statement_object_from_wire, EvidenceRefWire,
-    StatementCreateRequest, StatementGetRequest, StatementHistoryRequest,
-    StatementKindWire, StatementListRequest,
+    evidence_ref_from_wire, statement_object_from_wire, EvidenceRefWire, StatementCreateRequest,
+    StatementGetRequest, StatementHistoryRequest, StatementKindWire, StatementListRequest,
     StatementListResponseFrame, StatementObjectWire, StatementRetractRequest,
     StatementSupersedeRequest, StatementTombstoneRequest, StatementValueWire, StatementView,
     WireToStatementError,
@@ -99,9 +98,11 @@ impl StatementHandle {
     /// onto the handle separately — the SDK never round-trips the id.
     pub fn from_view(view: StatementView) -> Result<Self, ClientError> {
         let predicate_qname = view.predicate.clone();
-        let s = view.to_statement(brain_core::PredicateId::from(0)).map_err(
-            |e: WireToStatementError| ClientError::Internal(format!("statement decode: {e}")),
-        )?;
+        let s = view
+            .to_statement(brain_core::PredicateId::from(0))
+            .map_err(|e: WireToStatementError| {
+                ClientError::Internal(format!("statement decode: {e}"))
+            })?;
         Ok(Self {
             id: s.id,
             kind: s.kind,
@@ -218,10 +219,11 @@ fn build_create_request_body(
         .clone()
         .ok_or_else(|| missing("predicate"))?;
     validate_predicate_qname(&predicate)?;
-    let object = shared
-        .object
-        .clone()
-        .ok_or_else(|| missing("object (set via .object_entity / .object_value / .object_memory / .object_statement)"))?;
+    let object = shared.object.clone().ok_or_else(|| {
+        missing(
+            "object (set via .object_entity / .object_value / .object_memory / .object_statement)",
+        )
+    })?;
     let confidence = shared.confidence.unwrap_or(0.5);
     validate_confidence(confidence)?;
     if shared.evidence.len() > INLINE_EVIDENCE_CAP {
@@ -453,13 +455,8 @@ impl<'a> PreferenceBuilder<'a> {
     }
 
     pub async fn create(self) -> Result<StatementHandle, ClientError> {
-        finish_create_or_supersede(
-            self.client,
-            &self.shared,
-            StatementKindWire::Preference,
-            0,
-        )
-        .await
+        finish_create_or_supersede(self.client, &self.shared, StatementKindWire::Preference, 0)
+            .await
     }
 }
 
@@ -489,14 +486,19 @@ impl<'a> EventBuilder<'a> {
     }
 
     pub async fn create(self) -> Result<StatementHandle, ClientError> {
-        let event_at = self.event_at_unix_nanos.ok_or_else(|| {
-            invalid("Event kind requires .event_at(unix_nanos) before .create()")
-        })?;
+        let event_at = self
+            .event_at_unix_nanos
+            .ok_or_else(|| invalid("Event kind requires .event_at(unix_nanos) before .create()"))?;
         if event_at == 0 {
             return Err(invalid("Event .event_at must be non-zero"));
         }
-        finish_create_or_supersede(self.client, &self.shared, StatementKindWire::Event, event_at)
-            .await
+        finish_create_or_supersede(
+            self.client,
+            &self.shared,
+            StatementKindWire::Event,
+            event_at,
+        )
+        .await
     }
 }
 
@@ -564,10 +566,7 @@ impl<'a> StatementsClient<'a> {
     /// be a chain root or any chain member per spec §19/01 §4.1.
     /// Returns the chain in version-ascending order; excludes
     /// tombstoned entries.
-    pub async fn history(
-        &self,
-        anchor: StatementId,
-    ) -> Result<Vec<StatementHandle>, ClientError> {
+    pub async fn history(&self, anchor: StatementId) -> Result<Vec<StatementHandle>, ClientError> {
         let body = RequestBody::StatementHistory(StatementHistoryRequest {
             anchor_id: anchor.to_bytes(),
             include_tombstoned: false,
@@ -957,7 +956,7 @@ mod tests {
         let _: StatementValueWire = "x".into();
         let _: StatementValueWire = String::from("x").into();
         let _: StatementValueWire = (-7i64).into();
-        let _: StatementValueWire = 3.14f64.into();
+        let _: StatementValueWire = 3.5f64.into();
         let _: StatementValueWire = true.into();
         let _: StatementValueWire = vec![0xDEu8, 0xAD].into();
     }

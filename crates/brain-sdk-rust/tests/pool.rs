@@ -436,7 +436,10 @@ async fn sdk_connection_has_so_keepalive_enabled() {
 
     sock_ref.set_keepalive(true).expect("set keepalive");
     let post = sock_ref.keepalive().expect("read keepalive after set");
-    assert!(post, "set_keepalive(true) must stick — kernel reports it enabled");
+    assert!(
+        post,
+        "set_keepalive(true) must stick — kernel reports it enabled"
+    );
     // Defensive: assert we observed a transition. If the platform
     // doesn't expose keepalive read, both `pre` and `post` will be
     // the same default and this is informational only.

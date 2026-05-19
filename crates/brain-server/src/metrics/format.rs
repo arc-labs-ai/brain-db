@@ -1,6 +1,6 @@
 //! Top-level Prometheus body assembler.
 //!
-//! [`format`] is the single entry point. Walks the supplied
+//! [`format()`] is the single entry point. Walks the supplied
 //! [`Snapshot`] and produces the full `/metrics` body in a stable
 //! order so dashboards / regex-based smoke tests stay deterministic.
 //!
@@ -33,7 +33,7 @@ pub struct BuildInfo {
 
 /// Loose-reference snapshot of everything the exposition reads.
 /// Built by callers (e.g. `admin::AdminState::metrics_snapshot`) and
-/// handed to [`format`]. Borrows everything to avoid clones on the
+/// handed to [`format()`]. Borrows everything to avoid clones on the
 /// scrape path.
 pub struct Snapshot<'a> {
     pub build_info: BuildInfo,
@@ -63,6 +63,8 @@ pub async fn format(snap: &Snapshot<'_>) -> String {
     emit_worker_counters(&mut s, snap.shards).await;
     emit_hnsw_counts(&mut s, snap.shards).await;
     emit_request_metrics(&mut s, snap.request_metrics);
+    emit_auto_edge_metrics(&mut s, snap.shards);
+    emit_extractor_metrics(&mut s, snap.shards);
 
     s
 }
@@ -373,6 +375,272 @@ async fn emit_hnsw_counts(out: &mut String, shards: &[ShardHandle]) {
             }
         }
     }
+}
+
+/// Phase B: per-shard AutoEdgeWorker metric family. Reads through
+/// the metric handle attached to each `ShardHandle`. Shards with the
+/// worker disabled emit no rows for that shard (no `0` placeholder —
+/// PromQL distinguishes `absent()` from `0`).
+fn emit_auto_edge_metrics(out: &mut String, shards: &[ShardHandle]) {
+    emit_header(
+        out,
+        "brain_auto_edge_drops_total",
+        "Encode-side enqueues dropped because the auto-edge channel was full.",
+        "counter",
+    );
+    for shard in shards {
+        if let Some(m) = shard.auto_edge_metrics() {
+            let labels = format!("{{shard=\"{}\"}}", shard.shard_id());
+            let _ = writeln!(
+                out,
+                "brain_auto_edge_drops_total{labels} {}",
+                m.snapshot().drops_total
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_auto_edge_edges_written_total",
+        "Logical SimilarTo edges persisted by the AutoEdgeWorker.",
+        "counter",
+    );
+    for shard in shards {
+        if let Some(m) = shard.auto_edge_metrics() {
+            let labels = format!("{{shard=\"{}\"}}", shard.shard_id());
+            let _ = writeln!(
+                out,
+                "brain_auto_edge_edges_written_total{labels} {}",
+                m.snapshot().edges_written_total
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_auto_edge_cycle_duration_seconds",
+        "Wall-clock duration of one AutoEdgeWorker cycle.",
+        "histogram",
+    );
+    for shard in shards {
+        if let Some(m) = shard.auto_edge_metrics() {
+            let inner = format!("shard=\"{}\"", shard.shard_id());
+            emit_worker_histogram(
+                out,
+                "brain_auto_edge_cycle_duration_seconds",
+                &inner,
+                &m.snapshot().cycle_duration_seconds,
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_auto_edge_neighbours_found_per_cycle",
+        "Above-threshold neighbours collected per AutoEdgeWorker cycle.",
+        "histogram",
+    );
+    for shard in shards {
+        if let Some(m) = shard.auto_edge_metrics() {
+            let inner = format!("shard=\"{}\"", shard.shard_id());
+            emit_worker_histogram(
+                out,
+                "brain_auto_edge_neighbours_found_per_cycle",
+                &inner,
+                &m.snapshot().neighbours_found_per_cycle,
+            );
+        }
+    }
+}
+
+/// Phase E: per-shard ExtractorWorker metric family. Same dispatch
+/// shape as [`emit_auto_edge_metrics`].
+fn emit_extractor_metrics(out: &mut String, shards: &[ShardHandle]) {
+    emit_header(
+        out,
+        "brain_extractor_drops_total",
+        "Encode-side enqueues dropped because the extractor channel was full.",
+        "counter",
+    );
+    for shard in shards {
+        if let Some(m) = shard.extractor_metrics() {
+            let labels = format!("{{shard=\"{}\"}}", shard.shard_id());
+            let _ = writeln!(
+                out,
+                "brain_extractor_drops_total{labels} {}",
+                m.snapshot().drops_total
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_extractor_schema_filtered_total",
+        "Items dropped because their predicate / relation_type isn't in the active schema.",
+        "counter",
+    );
+    for shard in shards {
+        if let Some(m) = shard.extractor_metrics() {
+            let snap = m.snapshot();
+            for (predicate, count) in snap.schema_filtered_total {
+                let labels = format!(
+                    "{{shard=\"{}\",predicate=\"{}\"}}",
+                    shard.shard_id(),
+                    escape_label(&predicate)
+                );
+                let _ = writeln!(out, "brain_extractor_schema_filtered_total{labels} {count}",);
+            }
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_extractor_items_written_total",
+        "Knowledge-layer rows persisted by the extractor worker, by item kind.",
+        "counter",
+    );
+    for shard in shards {
+        if let Some(m) = shard.extractor_metrics() {
+            let snap = m.snapshot();
+            for (i, label) in brain_ops::ITEM_KIND_LABELS.iter().enumerate() {
+                let labels = format!("{{shard=\"{}\",item_kind=\"{label}\"}}", shard.shard_id());
+                let _ = writeln!(
+                    out,
+                    "brain_extractor_items_written_total{labels} {}",
+                    snap.items_written_total[i]
+                );
+            }
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_extractor_llm_micro_usd_spent_total",
+        "LLM-tier spend reported by extractors, in dollar-micro-units (1e-6 USD).",
+        "counter",
+    );
+    for shard in shards {
+        if let Some(m) = shard.extractor_metrics() {
+            let labels = format!("{{shard=\"{}\"}}", shard.shard_id());
+            let _ = writeln!(
+                out,
+                "brain_extractor_llm_micro_usd_spent_total{labels} {}",
+                m.snapshot().llm_micro_usd_spent_total
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_extractor_cycle_duration_seconds",
+        "Wall-clock duration of one ExtractorWorker cycle.",
+        "histogram",
+    );
+    for shard in shards {
+        if let Some(m) = shard.extractor_metrics() {
+            let inner = format!("shard=\"{}\"", shard.shard_id());
+            emit_worker_histogram(
+                out,
+                "brain_extractor_cycle_duration_seconds",
+                &inner,
+                &m.snapshot().cycle_duration_seconds,
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_extractor_tier_runs_total",
+        "Per-tier outcome for each memory the extractor processed.",
+        "counter",
+    );
+    for shard in shards {
+        if let Some(m) = shard.extractor_metrics() {
+            let snap = m.snapshot();
+            for (tier_idx, tier) in brain_ops::TIER_LABELS.iter().enumerate() {
+                for (status_idx, status) in brain_ops::TIER_STATUS_LABELS.iter().enumerate() {
+                    let labels = format!(
+                        "{{shard=\"{}\",tier=\"{tier}\",status=\"{status}\"}}",
+                        shard.shard_id()
+                    );
+                    let idx = tier_idx * brain_ops::TIER_STATUS_LABELS.len() + status_idx;
+                    let _ = writeln!(
+                        out,
+                        "brain_extractor_tier_runs_total{labels} {}",
+                        snap.tier_runs_total[idx]
+                    );
+                }
+            }
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_extractor_resolver_outcome_total",
+        "Resolver tier that satisfied each entity mention.",
+        "counter",
+    );
+    for shard in shards {
+        if let Some(m) = shard.extractor_metrics() {
+            let snap = m.snapshot();
+            for (i, tier) in brain_ops::RESOLVER_OUTCOME_LABELS.iter().enumerate() {
+                let labels = format!("{{shard=\"{}\",tier=\"{tier}\"}}", shard.shard_id());
+                let _ = writeln!(
+                    out,
+                    "brain_extractor_resolver_outcome_total{labels} {}",
+                    snap.resolver_outcome_total[i]
+                );
+            }
+        }
+    }
+}
+
+/// Render a `WorkerHistogramSnapshot` in Prometheus text format with
+/// the supplied label prefix. Mirrors `Histogram::expose` but reads
+/// from the brain-ops snapshot type (the worker-side histogram lives
+/// outside `brain-server` to keep the dependency edge correct).
+fn emit_worker_histogram(
+    out: &mut String,
+    name: &str,
+    label_prefix: &str,
+    snap: &brain_ops::WorkerHistogramSnapshot,
+) {
+    for bucket in &snap.buckets {
+        let le = match bucket.le {
+            Some(v) => format!("{v}"),
+            None => "+Inf".to_string(),
+        };
+        let labels = if label_prefix.is_empty() {
+            format!("{{le=\"{le}\"}}")
+        } else {
+            format!("{{{label_prefix},le=\"{le}\"}}")
+        };
+        let _ = writeln!(out, "{name}_bucket{labels} {}", bucket.cumulative_count);
+    }
+    let bare_label = if label_prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{{{label_prefix}}}")
+    };
+    let _ = writeln!(out, "{name}_sum{bare_label} {}", snap.sum);
+    let _ = writeln!(out, "{name}_count{bare_label} {}", snap.count);
+}
+
+/// Escape a Prometheus label value. Only `\\`, `"`, and `\n` need
+/// escaping per the text-format spec; the predicate qnames the
+/// extractor emits are colon-namespaced ASCII in practice but we
+/// defend against the corner cases regardless.
+fn escape_label(value: &str) -> String {
+    let mut s = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => s.push_str("\\\\"),
+            '"' => s.push_str("\\\""),
+            '\n' => s.push_str("\\n"),
+            other => s.push(other),
+        }
+    }
+    s
 }
 
 /// 12.1b: per-op request counters / in-flight gauge / duration

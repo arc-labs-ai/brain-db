@@ -67,8 +67,12 @@ pub enum AttrType {
     Date,
     /// Unix nanoseconds.
     Timestamp,
-    Enum { variants: Vec<String> },
-    Ref { target: String },
+    Enum {
+        variants: Vec<String>,
+    },
+    Ref {
+        target: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -105,8 +109,12 @@ pub enum StatementKindAst {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ObjectTypeDecl {
-    Value { value_type: AttrType },
-    Entity { entity_type: String },
+    Value {
+        value_type: AttrType,
+    },
+    Entity {
+        entity_type: String,
+    },
     Memory,
     Statement,
     /// Surface form `Any`. Stored as `Value<Text>` at the storage layer.
@@ -230,6 +238,10 @@ pub struct CostExpr {
     pub unit: CostUnit,
 }
 
+// The `Per` prefix is intrinsic — these are rates ("per memory", "per request",
+// "per day") matching the DSL grammar verbatim; renaming to `Memory`/`Request`/
+// `Day` would change the meaning (a `Day` is a span, not a rate).
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CostUnit {
     PerMemory,
@@ -347,8 +359,7 @@ mod tests {
             },
             description: Some("user preference".into()),
         };
-        let back: PredicateDef =
-            serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        let back: PredicateDef = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
         assert_eq!(p, back);
     }
 
@@ -390,8 +401,7 @@ mod tests {
                 ExtractorField::Trigger(TriggerExpr::OnEncode),
             ],
         };
-        let back: ExtractorDef =
-            serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        let back: ExtractorDef = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(e, back);
     }
 
@@ -419,8 +429,7 @@ mod tests {
                 ExtractorField::ConfidenceThreshold(0.8),
             ],
         };
-        let back: ExtractorDef =
-            serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        let back: ExtractorDef = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(e, back);
     }
 

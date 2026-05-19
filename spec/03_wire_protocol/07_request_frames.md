@@ -81,11 +81,9 @@ struct RecallRequest {
 }
 
 enum RecallStrategy {
-    Auto,                // let the planner decide (recommended)
-    AnnOnly,
-    Attractor,
-    GraphWalk,
-    Hybrid,
+    Auto,                // server picks substrate-only vs hybrid (txn → always substrate)
+    SubstrateOnly,       // force HNSW vector search only
+    HybridOnly,          // require hybrid; HybridUnavailable (0x0083) if any required retriever is missing or request is in a txn
 }
 ```
 
@@ -97,7 +95,7 @@ Fields:
 - `age_bound_unix_nanos` — only return memories created after this time.
 - `kind_filter` — restrict to specific kinds. None means all kinds.
 - `salience_floor` — minimum salience for inclusion. Default 0.0.
-- `strategy_hint` — override the planner's strategy choice. `Auto` (default) lets the planner pick.
+- `strategy_hint` — override the planner's strategy choice. `Auto` (default) lets the server pick substrate-only vs hybrid; `SubstrateOnly` forces vector-only HNSW; `HybridOnly` requires the hybrid path and returns `HybridUnavailable` (0x0083) if any required retriever is missing or the request runs inside a transaction.
 - `include_vectors` — if true, response carries vector data. Default false (saves bandwidth).
 - `include_edges` — if true, response includes each result's outgoing edges. Default false.
 - `request_id` — optional; for tracing/logging only, not for idempotency.
@@ -130,7 +128,6 @@ enum PlanStrategy {
     Auto,
     AStar,
     Mcts,
-    AttractorRollout,
 }
 ```
 

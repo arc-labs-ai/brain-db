@@ -42,12 +42,16 @@ pub use worker::{drive_batch, Worker};
 // Module-level re-exports preserve the pre-refactor public paths
 // (`brain_workers::<worker>::<Type>`) so external callers don't churn.
 pub use workers::{
-    access_boost, cache_evict, consolidation, counter_reconcile, decay, edge_scrub, hnsw_maint,
-    idempotency_cleanup, slot_reclaim, snapshot, statistics, wal_retention,
+    access_boost, auto_edge, cache_evict, consolidation, counter_reconcile, decay, edge_scrub,
+    extractor, hnsw_maint, idempotency_cleanup, slot_reclaim, snapshot, statistics, wal_retention,
 };
 
 pub use workers::access_boost::{
     boosted_salience, AccessBoostWorker, DEFAULT_BOOST_FACTOR, MAX_SALIENCE,
+};
+pub use workers::auto_edge::{
+    AutoEdgeKnobs, AutoEdgeWorker, DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD, DEFAULT_EF_SEARCH,
+    DEFAULT_TOP_K,
 };
 pub use workers::cache_evict::{
     CacheEvictionError, CacheEvictionSource, CacheEvictionWorker, DisabledCacheEvictionSource,
@@ -55,8 +59,8 @@ pub use workers::cache_evict::{
 };
 pub use workers::consolidation::{
     cluster_by_similarity, cosine, deterministic_request_id, ClusterCandidate, ConsolidationWorker,
-    DEFAULT_INITIAL_SALIENCE, DEFAULT_MIN_CLUSTER_SIZE, DEFAULT_RECENCY_WINDOW,
-    DEFAULT_SIMILARITY_THRESHOLD,
+    DEFAULT_CONSOLIDATION_SIMILARITY_THRESHOLD, DEFAULT_INITIAL_SALIENCE, DEFAULT_MIN_CLUSTER_SIZE,
+    DEFAULT_RECENCY_WINDOW,
 };
 pub use workers::counter_reconcile::CounterReconcileWorker;
 pub use workers::decay::{
@@ -64,6 +68,10 @@ pub use workers::decay::{
     EPISODIC_HALF_LIFE_DAYS, MIN_DELTA_FOR_WRITE, SEMANTIC_HALF_LIFE_DAYS,
 };
 pub use workers::edge_scrub::EdgeScrubWorker;
+pub use workers::extractor::{
+    ExtractorKnobs, ExtractorWorker, DEFAULT_EXTRACTOR_DRAIN_PER_CYCLE,
+    DEFAULT_EXTRACTOR_LLM_BUDGET_MICRO_USD, DEFAULT_EXTRACTOR_SKIP_AUDITED,
+};
 pub use workers::hnsw_maint::{
     decide_action, Action, DisabledRebuildSource, HnswMaintenanceWorker, IndexStats, RebuildSource,
     RebuildSourceError, RebuildThresholds, SnapshotFuture as RebuildSnapshotFuture,

@@ -96,7 +96,14 @@ fn forget_req(memory_id: u128, request_id: [u8; 16]) -> ForgetRequest {
 
 async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str) -> u128 {
     let req = encode_req(request_id, text);
-    match dispatch(RequestBody::Encode(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap() {
+    match dispatch(
+        RequestBody::Encode(req),
+        brain_ops::RequestCaller::anonymous(),
+        &fix.ctx,
+    )
+    .await
+    .unwrap()
+    {
         ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
         other => panic!("expected Encode response, got {other:?}"),
     }
@@ -121,7 +128,9 @@ fn forget_full_pipeline_tombstones_memory() {
 
         let resp = unwrap_forget_resp(
             dispatch(
-                RequestBody::Forget(forget_req(memory_id, [2; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Forget(forget_req(memory_id, [2; 16])),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -144,7 +153,9 @@ fn forget_already_tombstoned_returns_flag() {
 
         let first = unwrap_forget_resp(
             dispatch(
-                RequestBody::Forget(forget_req(memory_id, [11; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Forget(forget_req(memory_id, [11; 16])),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -154,7 +165,9 @@ fn forget_already_tombstoned_returns_flag() {
         // Different RequestId targeting the same memory.
         let second = unwrap_forget_resp(
             dispatch(
-                RequestBody::Forget(forget_req(memory_id, [12; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Forget(forget_req(memory_id, [12; 16])),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -175,9 +188,13 @@ fn forget_memory_not_found_returns_flag_not_error() {
         let phantom: u128 = 0xDEAD_BEEF_DEAD_BEEF_0000_0000_0000_0000;
 
         let resp = unwrap_forget_resp(
-            dispatch(RequestBody::Forget(forget_req(phantom, [20; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-                .await
-                .unwrap(),
+            dispatch(
+                RequestBody::Forget(forget_req(phantom, [20; 16])),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
         );
         assert_eq!(resp.memory_id, phantom);
         assert!(resp.was_already_forgotten);
@@ -196,8 +213,24 @@ fn forget_idempotent_replay_returns_cached_response() {
         let memory_id = encode(&fix, [30; 16], "replay").await;
 
         let req = forget_req(memory_id, [31; 16]);
-        let first = unwrap_forget_resp(dispatch(RequestBody::Forget(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
-        let second = unwrap_forget_resp(dispatch(RequestBody::Forget(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
+        let first = unwrap_forget_resp(
+            dispatch(
+                RequestBody::Forget(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        let second = unwrap_forget_resp(
+            dispatch(
+                RequestBody::Forget(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
 
         // Replay returns the cached outcome: same was_already_forgotten,
         // same memory_id. (The writer's replay flag is internal — the
@@ -218,12 +251,20 @@ fn forget_idempotency_conflict_returns_error() {
         let a = encode(&fix, [40; 16], "first-target").await;
         let b = encode(&fix, [41; 16], "second-target").await;
 
-        let _ok = dispatch(RequestBody::Forget(forget_req(a, [42; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-            .await
-            .unwrap();
-        let err = dispatch(RequestBody::Forget(forget_req(b, [42; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-            .await
-            .unwrap_err();
+        let _ok = dispatch(
+            RequestBody::Forget(forget_req(a, [42; 16])),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
+        let err = dispatch(
+            RequestBody::Forget(forget_req(b, [42; 16])),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.error_code(), ErrorCode::Conflict);
         assert!(
             matches!(err, OpError::ExecError(_)),

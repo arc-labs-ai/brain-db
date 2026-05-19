@@ -245,7 +245,6 @@ fn upsert_round_trips_metadata_fields() {
 
         let schema = handle.index.schema();
         let stmt_id_field = schema.get_field("statement_id").expect("statement_id");
-        let bucket_field = schema.get_field("confidence_bucket").expect("bucket");
         let predicate_id_field = schema.get_field("predicate_id").expect("predicate_id");
         let reader = handle.index.reader().expect("reader");
         let searcher = reader.searcher();
@@ -268,15 +267,18 @@ fn upsert_round_trips_metadata_fields() {
         let stored_id = StatementId::from(stored_id_arr);
         assert_eq!(stored_id, id);
 
-        // confidence_bucket = floor(0.65 * 10) = 6
-        let bucket_value = doc
-            .get_first(bucket_field)
-            .and_then(|v| v.as_u64())
-            .expect("bucket stored");
-        // bucket field is INDEXED|FAST, not STORED — `get_first` returns
-        // `None` because nothing was stored. Skip the assertion by
-        // querying via the bucket field instead.
-        let _ = bucket_value;
+        // confidence_bucket is INDEXED|FAST but NOT STORED, so
+        // `get_first` would return None. Verify by querying the
+        // bucket field instead: floor(0.65 * 10) = 6.
+        let bucket_qp = QueryParser::for_index(
+            &handle.index,
+            vec![schema.get_field("confidence_bucket").expect("bucket")],
+        );
+        let bucket_q = bucket_qp.parse_query("6").expect("query bucket");
+        let bucket_hits = searcher
+            .search(&bucket_q, &TopDocs::with_limit(10).order_by_score())
+            .expect("search bucket");
+        assert_eq!(bucket_hits.len(), 1);
         // predicate_id similarly INDEXED-only; query confirms presence.
         let pid_qp = QueryParser::for_index(&handle.index, vec![predicate_id_field]);
         let pid_q = pid_qp.parse_query("7").expect("query predicate_id");

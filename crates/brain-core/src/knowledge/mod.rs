@@ -36,7 +36,7 @@ pub use resolver::{
     ResolverIndex, ResolverStorage, ResolverTier, TypeConstraint, VECTOR_DIM,
 };
 pub use statement::{
-    EvidenceEntry, EvidenceRef, Predicate, Statement, StatementObject, StatementValue,
-    SubjectRef, TombstoneReason, INLINE_EVIDENCE_CAP,
+    EvidenceEntry, EvidenceRef, Predicate, Statement, StatementObject, StatementValue, SubjectRef,
+    TombstoneReason, INLINE_EVIDENCE_CAP,
 };
 pub use trigrams::{extract_trigrams, jaccard};

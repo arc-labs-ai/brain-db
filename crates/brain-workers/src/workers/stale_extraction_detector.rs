@@ -55,8 +55,7 @@ impl StaleExtractionDetector {
         // `SCHEMA_ACTIVE_VERSIONS_TABLE`; for v1 we read the
         // single-namespace value (matches the typical
         // single-deployment-namespace case).
-        let current_version =
-            current_schema_version(&rtxn).unwrap_or(0);
+        let current_version = current_schema_version(&rtxn).unwrap_or(0);
         if current_version == 0 {
             return Ok(0);
         }

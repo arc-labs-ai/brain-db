@@ -14,8 +14,6 @@ The same glossary is hosted in [`../00_master_overview/01_glossary.md`](../00_ma
 
 **Arena.** The memory-mapped flat file holding the vectors for a shard. One slot per memory; fixed-size slots; mmap'd with `MAP_SHARED`. See [05. Storage: Arena & WAL](../05_storage_arena_wal/).
 
-**Attractor dynamics.** A `RECALL` execution strategy where the cue is treated as the initial state of an energy-descent process; stored memories are treated as attractors; the "recalled" memory is whichever attractor the dynamics converge to. Used for noisy or partial cues.
-
 **Background worker.** A process running on dedicated cores (not the request-serving cores) that performs maintenance work: decay, consolidation, HNSW maintenance, snapshots. See [11. Background Workers](../11_background_workers/).
 
 **bge-small-en-v1.5.** The embedding model Brain ships with. From BAAI's [FlagEmbedding](https://github.com/FlagOpen/FlagEmbedding) project. 384-dim `f32` vectors, 512-token context, English-only, MIT-licensed.

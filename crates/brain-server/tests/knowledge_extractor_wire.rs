@@ -207,12 +207,13 @@ async fn extractor_disable_then_list_excludes_disabled() {
     )
     .await;
     let entity_mentions_id = match body {
-        ResponseBody::ExtractorList(r) => r
-            .items
-            .iter()
-            .find(|i| i.name == "entity_mentions")
-            .expect("entity_mentions exists")
-            .extractor_id,
+        ResponseBody::ExtractorList(r) => {
+            r.items
+                .iter()
+                .find(|i| i.name == "entity_mentions")
+                .expect("entity_mentions exists")
+                .extractor_id
+        }
         _ => unreachable!(),
     };
 
@@ -264,8 +265,11 @@ async fn extractor_disable_then_list_excludes_disabled() {
     match body {
         ResponseBody::ExtractorList(r) => {
             assert_eq!(r.items.len(), 2);
-            let entity_mentions =
-                r.items.iter().find(|i| i.name == "entity_mentions").unwrap();
+            let entity_mentions = r
+                .items
+                .iter()
+                .find(|i| i.name == "entity_mentions")
+                .unwrap();
             assert!(!entity_mentions.enabled);
         }
         _ => unreachable!(),
@@ -292,7 +296,11 @@ async fn extractor_enable_after_disable_returns_previously_disabled() {
     .await;
     let id = match body {
         ResponseBody::ExtractorList(r) => {
-            r.items.iter().find(|i| i.name == "basic_ner").unwrap().extractor_id
+            r.items
+                .iter()
+                .find(|i| i.name == "basic_ner")
+                .unwrap()
+                .extractor_id
         }
         _ => unreachable!(),
     };

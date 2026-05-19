@@ -17,9 +17,9 @@
 //!
 //! # Module map
 //!
-//! - [`parser`]  — clap [`Cli`] + [`Command`] + tokeniser.
+//! - [`parser`]  — clap `Cli` + `Command` + tokeniser.
 //! - [`commands`] — one module per verb, all returning a uniform
-//!   [`output::Rendered`] envelope.
+//!   `output::Rendered` envelope.
 //! - [`connection`] — wrap [`brain_sdk_rust::Client`] with the
 //!   shell's defaults (timeout, retry, agent id).
 //! - [`session`] — REPL state across lines (active txn, sticky

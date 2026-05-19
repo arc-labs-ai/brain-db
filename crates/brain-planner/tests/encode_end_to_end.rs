@@ -515,7 +515,7 @@ async fn encode_then_recall_finds_it() {
         age_bound_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
-        strategy_hint: None,
+        strategy: None,
         include_vectors: false,
         include_edges: false,
         include_text: false,

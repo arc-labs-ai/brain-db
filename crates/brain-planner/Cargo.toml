@@ -33,7 +33,12 @@ uuid.workspace = true
 tempfile.workspace = true
 tokio = { version = "1", features = ["macros", "rt"] }
 criterion.workspace = true
+proptest.workspace = true
 
 [[bench]]
 name = "hybrid_query"
+harness = false
+
+[[bench]]
+name = "relation_traverse"
 harness = false

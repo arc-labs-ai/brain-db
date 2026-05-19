@@ -79,8 +79,8 @@ where
             .await
             .expect("payload");
     }
-    let (frame, rest) = Frame::decode_with_max(&buf, brain_protocol::MAX_PAYLOAD_BYTES as u32)
-        .expect("decode");
+    let (frame, rest) =
+        Frame::decode_with_max(&buf, brain_protocol::MAX_PAYLOAD_BYTES as u32).expect("decode");
     debug_assert!(rest.is_empty());
     frame
 }
@@ -135,14 +135,21 @@ async fn complete_handshake(client: &mut TcpStream) {
 
 /// Send one request frame, read one response. Returns the decoded
 /// response body alongside the wire opcode for sanity checks.
-async fn round_trip(client: &mut TcpStream, stream_id: u32, req: RequestBody) -> (u16, ResponseBody) {
+async fn round_trip(
+    client: &mut TcpStream,
+    stream_id: u32,
+    req: RequestBody,
+) -> (u16, ResponseBody) {
     let opcode = req.opcode().as_u16();
     let payload = req.encode();
     send_frame(client, Frame::new(opcode, FLAG_EOS, stream_id, payload)).await;
     let resp = read_one_frame(client).await;
     let resp_opcode = resp.header.opcode_u16();
-    let body = ResponseBody::decode(Opcode::from_u16(resp_opcode).expect("known opcode"), &resp.payload)
-        .expect("decode resp");
+    let body = ResponseBody::decode(
+        Opcode::from_u16(resp_opcode).expect("known opcode"),
+        &resp.payload,
+    )
+    .expect("decode resp");
     (resp_opcode, body)
 }
 
@@ -153,7 +160,9 @@ async fn round_trip(client: &mut TcpStream, stream_id: u32, req: RequestBody) ->
 #[tokio::test(flavor = "current_thread")]
 async fn entity_create_get_update_rename_lifecycle() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     // CREATE
@@ -169,7 +178,11 @@ async fn entity_create_get_update_rename_lifecycle() {
         }),
     )
     .await;
-    assert_eq!(create_opcode, Opcode::EntityCreateResp.as_u16(), "create resp opcode");
+    assert_eq!(
+        create_opcode,
+        Opcode::EntityCreateResp.as_u16(),
+        "create resp opcode"
+    );
     let entity_id = match body {
         ResponseBody::EntityCreate(r) => {
             assert_ne!(r.entity_id, [0u8; 16], "non-zero EntityId");
@@ -270,17 +283,25 @@ async fn entity_create_get_update_rename_lifecycle() {
 #[tokio::test(flavor = "current_thread")]
 async fn entity_get_missing_returns_error() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let bogus_id = *uuid::Uuid::now_v7().as_bytes();
     let (opcode, body) = round_trip(
         &mut client,
         1,
-        RequestBody::EntityGet(EntityGetRequest { entity_id: bogus_id }),
+        RequestBody::EntityGet(EntityGetRequest {
+            entity_id: bogus_id,
+        }),
     )
     .await;
-    assert_eq!(opcode, Opcode::Error.as_u16(), "missing entity surfaces ERROR");
+    assert_eq!(
+        opcode,
+        Opcode::Error.as_u16(),
+        "missing entity surfaces ERROR"
+    );
     match body {
         ResponseBody::Error(e) => {
             assert!(
@@ -299,7 +320,9 @@ async fn entity_get_missing_returns_error() {
 #[tokio::test(flavor = "current_thread")]
 async fn entity_create_unknown_type_returns_error() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let (opcode, body) = round_trip(
@@ -314,7 +337,11 @@ async fn entity_create_unknown_type_returns_error() {
         }),
     )
     .await;
-    assert_eq!(opcode, Opcode::Error.as_u16(), "unknown type surfaces ERROR");
+    assert_eq!(
+        opcode,
+        Opcode::Error.as_u16(),
+        "unknown type surfaces ERROR"
+    );
     match body {
         ResponseBody::Error(e) => {
             assert!(

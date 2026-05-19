@@ -12,7 +12,7 @@
 //!   `brain_planner::ExecutorContext`; later sub-tasks add fields).
 //! - [`OpError`] + [`ErrorCode`] — spec §09/01 §12 error taxonomy
 //!   with `error_code()` + `retryable()` mappings.
-//! - [`dispatch`] — top-level async entry; exhaustive `match` over
+//! - [`dispatch()`] — top-level async entry; exhaustive `match` over
 //!   `RequestBody`.
 //!
 //! Handler bodies (sub-tasks 7.3–7.10) are stubs returning
@@ -35,13 +35,14 @@ pub mod schema_gate;
 #[doc(hidden)]
 pub mod test_support;
 pub mod txn_lens;
+pub mod worker_metrics;
 
 // Module-level re-exports preserve `brain_ops::<op>::*` paths so
 // external callers (brain-server, brain-planner) don't churn.
 pub use ops::{
-    encode, extractor_pipeline, forget, knowledge_entity, knowledge_extractor, knowledge_query,
-    knowledge_relation, knowledge_schema, knowledge_statement, link, plan, reason, recall,
-    subscribe, txn, writer,
+    encode, extractor_pipeline, extractor_writes, forget, knowledge_entity, knowledge_extractor,
+    knowledge_query, knowledge_relation, knowledge_schema, knowledge_statement, link, plan, reason,
+    recall, subscribe, txn, writer,
 };
 
 pub use access_buffer::{AccessBuffer, DEFAULT_ACCESS_BUFFER_CAPACITY};
@@ -54,8 +55,14 @@ pub use ops::subscribe::{
     SubscriptionRegistry, DEFAULT_EVENT_CHANNEL_CAPACITY,
 };
 pub use ops::txn::{TxnState, TxnStore};
-pub use ops::writer::RealWriterHandle;
+pub use ops::writer::{AutoEdgeEnqueue, ExtractorEnqueue, RealWriterHandle};
 pub use schema_gate::SchemaGate;
+pub use worker_metrics::{
+    AutoEdgeMetrics, AutoEdgeMetricsSnapshot, ExtractorItemKind, ExtractorMetrics,
+    ExtractorMetricsSnapshot, ResolverOutcome, TierKind, TierStatus, WorkerBucketSnapshot,
+    WorkerHistogram, WorkerHistogramSnapshot, ITEM_KIND_LABELS, RESOLVER_OUTCOME_LABELS,
+    TIER_LABELS, TIER_STATUS_LABELS,
+};
 
 #[cfg(test)]
 mod tests {
@@ -93,6 +100,31 @@ mod tests {
             (OpError::TooManyMemories, ErrorCode::InvalidRequest),
             (OpError::TxnExpired, ErrorCode::TxnExpired),
             (OpError::TxnNotFound, ErrorCode::TxnNotFound),
+            (
+                OpError::PredicateNotInSchema {
+                    predicate: "acme:x".into(),
+                    namespace: "acme".into(),
+                    version: 1,
+                },
+                ErrorCode::PredicateNotInSchema,
+            ),
+            (
+                OpError::RelationTypeNotInSchema {
+                    type_name: "acme:knows".into(),
+                    namespace: "acme".into(),
+                    version: 1,
+                },
+                ErrorCode::RelationTypeNotInSchema,
+            ),
+            (
+                OpError::CardinalityViolation {
+                    relation_type: "acme:knows".into(),
+                    kind: "OneToOne",
+                    existing: 2,
+                    limit: 1,
+                },
+                ErrorCode::CardinalityViolation,
+            ),
             (
                 OpError::NotYetImplemented("anything"),
                 ErrorCode::InternalError,

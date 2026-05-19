@@ -109,7 +109,13 @@ pub struct QueryRequest {
     pub entity_anchor: Option<WireUuid>,
     /// StatementKind bytes (0=Fact / 1=Preference / 2=Event).
     pub kind_filter: Vec<u8>,
-    pub predicate_filter: Vec<u32>,
+    /// Predicate filter as canonical `"namespace:name"` qnames.
+    /// Schemaless deployments don't expose PredicateIds to clients —
+    /// the planner resolves qnames through the registry per request,
+    /// returning an empty result set for unknown qnames in
+    /// schemaless mode and a `PredicateNotInSchema` error in strict
+    /// mode.
+    pub predicate_filter: Vec<String>,
     pub time_filter: Option<TimeRangeWire>,
     pub confidence_min: Option<f32>,
     pub include_tombstoned: bool,
@@ -226,7 +232,7 @@ mod tests {
             text: "budget pushback".into(),
             entity_anchor: Some([7u8; 16]),
             kind_filter: vec![0, 1],
-            predicate_filter: vec![3, 4, 5],
+            predicate_filter: vec!["acme:role".into(), "acme:knows".into()],
             time_filter: Some(TimeRangeWire {
                 from_unix_ms: Some(100),
                 to_unix_ms: Some(900),

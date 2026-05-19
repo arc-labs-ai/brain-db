@@ -130,7 +130,7 @@ fn recover_rebuilds_statements_with_join() {
             pred,
             StatementObject::Value(StatementValue::Text("Bob".into())),
             0.7,
-            EvidenceRef::Inline(Default::default()),
+            EvidenceRef::default(),
             ExtractorId::from(0),
             0,
             1,

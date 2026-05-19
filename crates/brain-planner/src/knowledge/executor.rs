@@ -19,10 +19,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use brain_index::{
-    GraphQuery, GraphRetriever, GraphRetrieverConfig, LexicalFilters, LexicalQuery,
-    LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItem, SemanticFilters,
-    SemanticFiltersConfigSlot, SemanticQuery, SemanticRetriever, SemanticRetrieverConfig,
-    SemanticScope,
+    GraphAnchor, GraphQuery, GraphRetriever, GraphRetrieverConfig, LexicalFilters, LexicalQuery,
+    LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItem, RankedItemId,
+    SemanticFilters, SemanticFiltersConfigSlot, SemanticQuery, SemanticRetriever,
+    SemanticRetrieverConfig, SemanticScope,
 };
 use brain_metadata::MetadataDb;
 use parking_lot::Mutex;
@@ -30,7 +30,7 @@ use parking_lot::Mutex;
 use super::filters::{apply_filter_chain, FilterChainStats, FilterError};
 use super::fusion::{fuse_rrf, FusedItem};
 use super::planner::{PreFilter, QueryPlan, RetrieverConfig};
-use super::router::{QueryRequest, Retriever};
+use super::router::{GraphAnchorMode, QueryRequest, Retriever};
 
 // ---------------------------------------------------------------------------
 // Public types.
@@ -103,6 +103,14 @@ pub enum ExecutionError {
 
 /// Run a plan end-to-end. Returns the fused-then-filtered
 /// result plus metadata.
+///
+/// Most retrievers run independently. The one exception is the
+/// memory-anchor graph mode: when the schemaless hybrid path
+/// selects graph without an entity anchor, the executor must
+/// run semantic first and feed its top-K memory ids into the
+/// graph walk. We detect this up-front, run semantic eagerly,
+/// stash its output, and let the iteration loop reuse it
+/// instead of re-invoking.
 pub fn execute(
     plan: &QueryPlan,
     request: &QueryRequest,
@@ -114,9 +122,70 @@ pub fn execute(
     let mut outcomes: Vec<RetrieverOutcome> = Vec::new();
     let mut totals: Vec<(Retriever, usize)> = Vec::new();
 
+    // Pre-run semantic if graph depends on it. Without this the
+    // sequential loop would invoke graph with no anchors and
+    // either skip or error.
+    let needs_semantic_first = plan.retrievers.iter().any(|r| {
+        matches!(
+            &r.config,
+            RetrieverConfig::Graph {
+                anchor_mode: GraphAnchorMode::MemoryFromSemantic,
+                ..
+            }
+        )
+    });
+    let pre_semantic = if needs_semantic_first {
+        plan.retrievers
+            .iter()
+            .find(|r| r.retriever == Retriever::Semantic)
+            .cloned()
+    } else {
+        None
+    };
+    let mut cached_semantic: Option<Vec<RankedItem>> = None;
+    if let Some(sem) = &pre_semantic {
+        let started = Instant::now();
+        let invocation = invoke_retriever(sem, request, ctx, None);
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        match invocation {
+            Ok(items) => {
+                cached_semantic = Some(items);
+            }
+            Err(RetrieverInvocationError::Missing) => {
+                return Err(ExecutionError::MissingRetriever(Retriever::Semantic));
+            }
+            Err(_) => {
+                // Semantic failed or was skipped. Graph will
+                // then fall back to "no anchors" and skip
+                // itself — let the main loop handle the
+                // bookkeeping uniformly.
+                let _ = elapsed_ms;
+            }
+        }
+    }
+
     for planned in &plan.retrievers {
         let started = Instant::now();
-        let invocation = invoke_retriever(planned, request, ctx);
+        let pre_anchors = if planned.retriever == Retriever::Graph
+            && matches!(
+                &planned.config,
+                RetrieverConfig::Graph {
+                    anchor_mode: GraphAnchorMode::MemoryFromSemantic,
+                    ..
+                }
+            ) {
+            cached_semantic.as_deref()
+        } else {
+            None
+        };
+        let invocation = match (planned.retriever, cached_semantic.as_ref()) {
+            (Retriever::Semantic, Some(cached)) => {
+                // Reuse the pre-run semantic output rather than
+                // paying for the HNSW search twice.
+                Ok(cached.clone())
+            }
+            _ => invoke_retriever(planned, request, ctx, pre_anchors),
+        };
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         latencies.push((planned.retriever, elapsed_ms));
 
@@ -201,11 +270,12 @@ fn invoke_retriever(
     planned: &super::planner::PlannedRetriever,
     req: &QueryRequest,
     ctx: &HybridExecutorContext,
+    pre_anchors: Option<&[RankedItem]>,
 ) -> Result<Vec<RankedItem>, RetrieverInvocationError> {
     match planned.retriever {
         Retriever::Semantic => invoke_semantic(planned, req, ctx),
         Retriever::Lexical => invoke_lexical(planned, req, ctx),
-        Retriever::Graph => invoke_graph(planned, req, ctx),
+        Retriever::Graph => invoke_graph(planned, req, ctx, pre_anchors),
     }
 }
 
@@ -337,12 +407,10 @@ fn invoke_graph(
     planned: &super::planner::PlannedRetriever,
     req: &QueryRequest,
     ctx: &HybridExecutorContext,
+    pre_anchors: Option<&[RankedItem]>,
 ) -> Result<Vec<RankedItem>, RetrieverInvocationError> {
     let Some(handle) = ctx.graph.as_ref() else {
         return Err(RetrieverInvocationError::Missing);
-    };
-    let Some(anchor) = req.entity_anchor else {
-        return Err(RetrieverInvocationError::Skipped("no entity anchor"));
     };
     let RetrieverConfig::Graph {
         max_depth,
@@ -351,19 +419,13 @@ fn invoke_graph(
         relation_types,
         include_statements,
         timeout_ms,
+        anchor_mode,
+        anchor_top_k,
     } = &planned.config
     else {
         return Err(RetrieverInvocationError::Failure(
             "config mismatch (expected Graph)".into(),
         ));
-    };
-
-    let query = GraphQuery::Star {
-        anchor,
-        depth: *max_depth,
-        direction: *direction,
-        relation_types: relation_types.clone(),
-        include_statements: *include_statements,
     };
 
     let config = GraphRetrieverConfig {
@@ -373,9 +435,94 @@ fn invoke_graph(
         timeout_ms: *timeout_ms,
     };
 
-    handle
-        .retrieve(&query, &config)
-        .map_err(|e| RetrieverInvocationError::Failure(e.to_string()))
+    match anchor_mode {
+        GraphAnchorMode::Entity => {
+            let Some(anchor) = req.entity_anchor else {
+                return Err(RetrieverInvocationError::Skipped("no entity anchor"));
+            };
+            let query = GraphQuery::Star {
+                anchor: GraphAnchor::Entity(anchor),
+                depth: *max_depth,
+                direction: *direction,
+                relation_types: relation_types.clone(),
+                include_statements: *include_statements,
+            };
+            handle
+                .retrieve(&query, &config)
+                .map_err(|e| RetrieverInvocationError::Failure(e.to_string()))
+        }
+        GraphAnchorMode::MemoryFromSemantic => {
+            // Materialise anchors from semantic top-K. The
+            // executor runs semantic before us and stashes its
+            // output; `pre_anchors` is `None` if semantic was
+            // skipped or failed.
+            let Some(semantic_items) = pre_anchors else {
+                return Err(RetrieverInvocationError::Skipped(
+                    "memory-anchor graph requires semantic output",
+                ));
+            };
+            let cap = (*anchor_top_k) as usize;
+            let anchors: Vec<brain_core::MemoryId> = semantic_items
+                .iter()
+                .filter_map(|item| match item.id {
+                    RankedItemId::Memory(m) => Some(m),
+                    _ => None,
+                })
+                .take(cap)
+                .collect();
+            if anchors.is_empty() {
+                return Err(RetrieverInvocationError::Skipped(
+                    "no memory hits from semantic to anchor graph walk",
+                ));
+            }
+            // One walk per anchor; merged into a single Vec.
+            // Per-anchor rank stays meaningful because all hits
+            // are scored by `proximity_score(hop) * edge.weight`
+            // — no cross-anchor normalisation needed for RRF
+            // (fusion only cares about the per-retriever rank).
+            let mut merged: Vec<RankedItem> = Vec::new();
+            for anchor in anchors {
+                let query = GraphQuery::Star {
+                    anchor: GraphAnchor::Memory(anchor),
+                    depth: *max_depth,
+                    direction: *direction,
+                    relation_types: None,
+                    include_statements: false,
+                };
+                match handle.retrieve(&query, &config) {
+                    Ok(items) => merged.extend(items),
+                    Err(brain_index::GraphError::MemoryAnchorNotFound(_)) => {
+                        // The semantic anchor was tombstoned
+                        // between the HNSW hit and the graph
+                        // walk. Drop this one and continue —
+                        // other anchors may still produce hits.
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "brain_planner::executor",
+                            anchor = ?anchor,
+                            error = %e,
+                            "memory-anchor graph walk failed; continuing",
+                        );
+                    }
+                }
+            }
+            // Re-sort + re-rank the merged set so the per-
+            // retriever rank-1 spot is the strongest hit
+            // overall.
+            merged.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            merged.truncate(planned.top_n);
+            for (i, item) in merged.iter_mut().enumerate() {
+                item.rank = (i as u32) + 1;
+            }
+            Ok(merged)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

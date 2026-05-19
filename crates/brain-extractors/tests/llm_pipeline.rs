@@ -16,13 +16,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use brain_core::{
-    AgentId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience,
-};
+use brain_core::{AgentId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
 use brain_extractors::{
     extractor::{ExtractionContext, ExtractionStatus, Extractor},
-    hash_memory_text, CostBudget, ExtractedItem, ExtractionResult, ExtractorRegistry,
-    LlmExtractor, Pricing,
+    hash_memory_text, CostBudget, ExtractedItem, ExtractionResult, ExtractorRegistry, LlmExtractor,
+    Pricing,
 };
 use brain_llm::client::{model_id_hash, LlmFuture};
 use brain_llm::{LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse, LlmRole};

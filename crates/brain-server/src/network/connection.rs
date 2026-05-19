@@ -282,7 +282,8 @@ impl Drop for ConnectionGuard {
 
 /// Unbound listener config. Call [`ConnectionListener::bind`] to
 /// produce a [`BoundConnectionListener`] (which exposes
-/// [`BoundConnectionListener::local_addr`] before [`Self::serve`]).
+/// [`BoundConnectionListener::local_addr`] before
+/// [`BoundConnectionListener::serve`]).
 pub struct ConnectionListener {
     listen_addr: SocketAddr,
     tls: Option<Arc<ServerConfig>>,
@@ -733,7 +734,7 @@ fn build_close_error_frame(code: ErrorCode, message: &str) -> Frame {
     build_close_error_frame_with_category(code, code.category(), message)
 }
 
-/// Map a finished response frame to a [`request::Status`] for
+/// Map a finished response frame to a [`crate::metrics::request::Status`] for
 /// metrics. Looks at the wire opcode only — `0xFF` (Error) becomes
 /// `Status::Error`; anything else is `Status::Success`. The
 /// in-flight gauge / drop-without-record path handles `Timeout`.

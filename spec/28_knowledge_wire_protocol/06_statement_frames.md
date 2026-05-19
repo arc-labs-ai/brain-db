@@ -119,7 +119,7 @@ pub struct StatementCreateRequest {
 
 Semantics:
 
-1. Validate against predicate definition (kind, object type) — `STATEMENT_OBJECT_TYPE_MISMATCH` on mismatch.
+1. Resolve `predicate` (a `"namespace:name"` qname). If the namespace has no active schema, intern the qname with `SchemaOrigin::ImplicitFromWrite` on first use; the resulting statement row carries the `IMPLICIT_PREDICATE` flag. If a schema is active for the namespace, the qname must be declared — unknown qnames produce `PredicateNotInSchema` (0x004B). When a declared predicate carries kind / object-type constraints they are enforced — mismatches produce `STATEMENT_OBJECT_TYPE_MISMATCH` (0x41). Implicit predicates carry no constraints.
 2. Validate `subject` exists (or is a known Pending audit id).
 3. For `Preference` kind: if a current Preference with same `(subject, predicate)` exists, auto-supersede it (no separate `STATEMENT_SUPERSEDE` call required).
 4. Allocate `StatementId` (UUIDv7).
@@ -138,10 +138,11 @@ pub struct StatementCreateResponse {
 
 ### 3.3 Errors
 
-- `STATEMENT_OBJECT_TYPE_MISMATCH` (`0x41`) — object type violates predicate constraint.
+- `PredicateNotInSchema` (`0x004B`) — strict mode only; predicate qname is not declared in the active schema for the namespace.
+- `STATEMENT_OBJECT_TYPE_MISMATCH` (`0x41`) — object type violates a declared predicate's constraint (schema-declared predicates only).
 - `STATEMENT_CONTRADICTS_EXISTING` (`0x42`) — for Fact kind, an active contradictory Fact already exists; resolution requires explicit `STATEMENT_SUPERSEDE`. (Contradiction detection per [§19](../19_statements/00_purpose.md) §"Kind-specific contracts".)
 - `ENTITY_NOT_FOUND` (`0x30`) — `subject` doesn't exist.
-- `INVALID_ARGUMENT` — Event kind without `event_at`; Fact / Preference with `event_at`; confidence outside `[0, 1]`; predicate unknown.
+- `INVALID_ARGUMENT` — Event kind without `event_at`; Fact / Preference with `event_at`; confidence outside `[0, 1]`; malformed predicate qname.
 
 ### 3.4 Evidence cap
 

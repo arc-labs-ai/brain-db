@@ -23,7 +23,7 @@ Cross-links from §20 to the rest of the spec.
 |---|---|
 | [`../28_knowledge_wire_protocol/07_relation_frames.md`](../28_knowledge_wire_protocol/07_relation_frames.md) | Wire shape for every relation opcode — CREATE / GET / SUPERSEDE / TOMBSTONE / LIST_FROM / LIST_TO / TRAVERSE. |
 | [`../28_knowledge_wire_protocol/02_subscribe_events.md`](../28_knowledge_wire_protocol/02_subscribe_events.md) | `RelationCreated`, `RelationSuperseded`, `RelationTombstoned` event shapes. |
-| [`../28_knowledge_wire_protocol/03_errors.md`](../28_knowledge_wire_protocol/03_errors.md) | Error code mapping: `RELATION_NOT_FOUND`, `RELATION_TYPE_MISMATCH`, `RELATION_CARDINALITY_VIOLATION`. |
+| [`../28_knowledge_wire_protocol/03_errors.md`](../28_knowledge_wire_protocol/03_errors.md), [`../03_wire_protocol/10_errors.md`](../03_wire_protocol/10_errors.md) | Error code mapping: `RELATION_NOT_FOUND`, `RELATION_TYPE_MISMATCH`, `RelationTypeNotInSchema` (0x004C), `CardinalityViolation` (0x0065). |
 | [`../28_knowledge_wire_protocol/04_validation.md`](../28_knowledge_wire_protocol/04_validation.md) §4 | Field-level validation rules. |
 
 ## Substrate dependencies

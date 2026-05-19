@@ -20,7 +20,7 @@ pub const MAX_LAYER: usize = 16;
 /// uses this only to pre-size internal tables; it does not cap insert
 /// count, so undersizing is a perf hint rather than a correctness limit.
 /// `1024` keeps the small-test footprint tiny; production callers
-/// override via [`IndexParams::with_capacity_hint`] (added in 4.6 when
+/// override via a `with_capacity_hint` builder (added in 4.6 when
 /// rebuild needs it).
 pub const DEFAULT_CAPACITY_HINT: usize = 1024;
 

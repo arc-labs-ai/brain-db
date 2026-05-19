@@ -130,9 +130,7 @@ impl<'a> PlanBuilder<'a> {
                     for f in frames {
                         match ResponseBody::decode(Opcode::PlanResp, &f.payload)? {
                             ResponseBody::Plan(PlanResponseFrame {
-                                steps,
-                                plan_status,
-                                ..
+                                steps, plan_status, ..
                             }) => {
                                 out.extend(steps);
                                 // Spec: plan_status is only meaningful on
@@ -189,6 +187,11 @@ impl<'a> PlanBuilder<'a> {
                     )),
                 },
             );
-        Ok(FrameStream::new(guard, stream_id, Opcode::PlanResp, decoder))
+        Ok(FrameStream::new(
+            guard,
+            stream_id,
+            Opcode::PlanResp,
+            decoder,
+        ))
     }
 }

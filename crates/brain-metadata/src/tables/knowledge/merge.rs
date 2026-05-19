@@ -234,10 +234,7 @@ impl_redb_rkyv_value!(
     AttributeConflictRecord,
     "brain_metadata::AttributeConflictRecord::v1"
 );
-impl_redb_rkyv_value!(
-    MergeAuditOverflow,
-    "brain_metadata::MergeAuditOverflow::v1"
-);
+impl_redb_rkyv_value!(MergeAuditOverflow, "brain_metadata::MergeAuditOverflow::v1");
 
 // ---------------------------------------------------------------------------
 // Tests.
@@ -413,11 +410,7 @@ mod tests {
             .collect();
         assert_eq!(
             collected,
-            vec![
-                ts_base,
-                ts_base + 1_000_000_000,
-                ts_base + 2_000_000_000,
-            ]
+            vec![ts_base, ts_base + 1_000_000_000, ts_base + 2_000_000_000,]
         );
     }
 }

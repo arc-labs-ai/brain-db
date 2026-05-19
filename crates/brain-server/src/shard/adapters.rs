@@ -2,12 +2,12 @@
 //!
 //! Phase 8 shipped four pluggable "source" traits with `Disabled*` defaults:
 //!
-//! - [`RebuildSource`]: feeds `HnswMaintenanceWorker` the active
+//! - `RebuildSource`: feeds `HnswMaintenanceWorker` the active
 //!   `(MemoryId, vector)` pairs for full rebuild.
-//! - [`WalRetentionSource`]: tells `WalRetentionWorker` which segments
+//! - `WalRetentionSource`: tells `WalRetentionWorker` which segments
 //!   are past `durable_lsn` and removes them.
-//! - [`SnapshotSource`]: backs `SnapshotWorker`'s take / list / delete.
-//! - [`CacheEvictionSource`]: stays `Disabled*` until 9.10 wires a real
+//! - `SnapshotSource`: backs `SnapshotWorker`'s take / list / delete.
+//! - `CacheEvictionSource`: stays `Disabled*` until 9.10 wires a real
 //!   `CachingDispatcher` per shard.
 //!
 //! 9.7b registered all 12 Phase-8 workers against the per-shard

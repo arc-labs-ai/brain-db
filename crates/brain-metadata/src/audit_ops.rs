@@ -40,10 +40,7 @@ pub enum AuditOpError {
 ///
 /// Rejects `audit.outputs.len() > OUTPUTS_CAP` with
 /// `OutputsOverCap` before any write touches the txn.
-pub fn audit_write(
-    wtxn: &WriteTransaction,
-    audit: &ExtractionAudit,
-) -> Result<(), AuditOpError> {
+pub fn audit_write(wtxn: &WriteTransaction, audit: &ExtractionAudit) -> Result<(), AuditOpError> {
     if audit.outputs.len() > OUTPUTS_CAP {
         return Err(AuditOpError::OutputsOverCap {
             cap: OUTPUTS_CAP,
@@ -218,11 +215,7 @@ mod tests {
         Database::create(dir.path().join("test.redb")).unwrap()
     }
 
-    fn success_row(
-        memory: MemoryId,
-        extractor_id: u32,
-        started_at: u64,
-    ) -> ExtractionAudit {
+    fn success_row(memory: MemoryId, extractor_id: u32, started_at: u64) -> ExtractionAudit {
         ExtractionAudit::success(
             AuditId::new(),
             memory,
@@ -414,7 +407,9 @@ mod tests {
         let db = open_db(&dir);
         let rtxn = db.begin_read().unwrap();
         assert!(audit_get(&rtxn, AuditId::new()).unwrap().is_none());
-        assert!(audit_by_memory(&rtxn, MemoryId::pack(1, 0, 0), 10).unwrap().is_empty());
+        assert!(audit_by_memory(&rtxn, MemoryId::pack(1, 0, 0), 10)
+            .unwrap()
+            .is_empty());
         assert!(audit_by_extractor(&rtxn, 7, 10).unwrap().is_empty());
         assert!(audit_recent(&rtxn, 0, 10).unwrap().is_empty());
         assert!(audit_recent_failures(&rtxn, 0, 10).unwrap().is_empty());

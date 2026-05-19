@@ -44,8 +44,8 @@ pub use entity_hnsw::{
     EntityHnswError, EntityHnswIndex, EntityHnswParams, RebuildReport as EntityRebuildReport,
 };
 pub use graph_retriever::{
-    proximity_score, validate_depth as validate_graph_depth, Direction, GraphError, GraphQuery,
-    GraphRetriever, GraphRetrieverConfig, DEFAULT_DEPTH as GRAPH_DEFAULT_DEPTH,
+    proximity_score, validate_depth as validate_graph_depth, Direction, GraphAnchor, GraphError,
+    GraphQuery, GraphRetriever, GraphRetrieverConfig, DEFAULT_DEPTH as GRAPH_DEFAULT_DEPTH,
     DEFAULT_MAX_BRANCHING as GRAPH_DEFAULT_MAX_BRANCHING,
     DEFAULT_TIMEOUT_MS as GRAPH_DEFAULT_TIMEOUT_MS, DEFAULT_TOP_K as GRAPH_DEFAULT_TOP_K,
     MAX_DEPTH_HARD_CAP as GRAPH_MAX_DEPTH_HARD_CAP,

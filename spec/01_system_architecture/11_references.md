@@ -22,12 +22,6 @@ Where references appeared inline in earlier sections of this spec, they are repe
 
 - **Tony Plate, "Holographic Reduced Representations" (1995)** — circular convolution as the bind operation. Used in `REASON`.
 
-### Attractor dynamics and Hopfield networks
-
-- **John Hopfield, "Neural networks and physical systems with emergent collective computational abilities" (1982)** — content-addressable memory as energy-descent dynamics. The basis for Brain's attractor execution strategy.
-
-- **Hubert Ramsauer et al., "Hopfield Networks Is All You Need" (2020)** — modern Hopfield networks with exponential storage capacity. Influences Brain's attractor implementation.
-
 ---
 
 ## 2. ANN and HNSW

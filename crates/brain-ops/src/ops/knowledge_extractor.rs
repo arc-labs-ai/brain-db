@@ -5,7 +5,7 @@
 //!
 //! 1. Validates wire-layer input.
 //! 2. For LIST: opens an rtxn → `extractor_list(rtxn)` → filter
-//!    + project to `ExtractorListItem`. The persisted state is
+//!    then project to `ExtractorListItem`. The persisted state is
 //!    authoritative; the in-memory registry tracks it.
 //! 3. For DISABLE / ENABLE: opens a wtxn → `extractor_set_enabled`
 //!    → captures previous state → updates the in-memory registry

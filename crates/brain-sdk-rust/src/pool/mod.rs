@@ -230,9 +230,7 @@ impl Pool {
     ///     slot is marked `Closed` and the caller retries — the
     ///     next iteration of `acquire`'s loop will try_open_new and
     ///     get a fresh connection.
-    async fn try_take_idle(
-        self: &Arc<Self>,
-    ) -> Option<Result<PoolGuard, ClientError>> {
+    async fn try_take_idle(self: &Arc<Self>) -> Option<Result<PoolGuard, ClientError>> {
         // Step 1: synchronously pull the IdleConnection out and
         // mark the slot InUse. Release the lock immediately so the
         // (potentially-slow) reactivate await doesn't block other

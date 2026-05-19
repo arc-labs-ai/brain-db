@@ -147,7 +147,7 @@ fn recall_req(cue: &str, top_k: u32, txn: Option<[u8; 16]>) -> RecallRequest {
         age_bound_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
-        strategy_hint: None,
+        strategy: None,
         include_vectors: false,
         include_edges: false,
         include_text: false,
@@ -186,9 +186,13 @@ fn reason_req(base: u128, depth: u32, txn: Option<[u8; 16]>) -> ReasonRequest {
 }
 
 async fn encode(fix: &Fixture, rid: [u8; 16], text: &str, txn: Option<[u8; 16]>) -> u128 {
-    match dispatch(RequestBody::Encode(encode_req(rid, text, txn)), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-        .await
-        .unwrap()
+    match dispatch(
+        RequestBody::Encode(encode_req(rid, text, txn)),
+        brain_ops::RequestCaller::anonymous(),
+        &fix.ctx,
+    )
+    .await
+    .unwrap()
     {
         ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
         other => panic!("expected Encode, got {other:?}"),
@@ -257,7 +261,9 @@ async fn begin(fix: &Fixture, txn_id: [u8; 16], timeout_seconds: u32) -> TxnBegi
             RequestBody::TxnBegin(TxnBeginRequest {
                 txn_id,
                 timeout_seconds,
-            }), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            }),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap(),
@@ -267,7 +273,9 @@ async fn begin(fix: &Fixture, txn_id: [u8; 16], timeout_seconds: u32) -> TxnBegi
 async fn commit(fix: &Fixture, txn_id: [u8; 16]) -> TxnCommitResponse {
     unwrap_commit(
         dispatch(
-            RequestBody::TxnCommit(TxnCommitRequest { txn_id }), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::TxnCommit(TxnCommitRequest { txn_id }),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap(),
@@ -276,9 +284,13 @@ async fn commit(fix: &Fixture, txn_id: [u8; 16]) -> TxnCommitResponse {
 
 async fn abort(fix: &Fixture, txn_id: [u8; 16]) -> TxnAbortResponse {
     unwrap_abort(
-        dispatch(RequestBody::TxnAbort(TxnAbortRequest { txn_id }), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-            .await
-            .unwrap(),
+        dispatch(
+            RequestBody::TxnAbort(TxnAbortRequest { txn_id }),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap(),
     )
 }
 
@@ -322,7 +334,9 @@ fn expired_txn_swept_on_next_op() {
         std::thread::sleep(Duration::from_millis(1100));
         // Now an in-txn encode must fail with TxnExpired.
         let err = dispatch(
-            RequestBody::Encode(encode_req([99; 16], "x", Some(txn))), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::Encode(encode_req([99; 16], "x", Some(txn))),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap_err();
@@ -347,7 +361,9 @@ fn encode_in_txn_not_visible_outside() {
         // Non-txn RECALL must NOT see the pending memory.
         let frame = unwrap_recall(
             dispatch(
-                RequestBody::Recall(recall_req("secret", 10, None)), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Recall(recall_req("secret", 10, None)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -372,7 +388,9 @@ fn commit_makes_buffered_writes_visible() {
 
         let frame = unwrap_recall(
             dispatch(
-                RequestBody::Recall(recall_req("committed", 10, None)), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Recall(recall_req("committed", 10, None)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -395,7 +413,9 @@ fn abort_discards_buffered_writes() {
         // Memory must NOT be in non-txn RECALL after abort.
         let frame = unwrap_recall(
             dispatch(
-                RequestBody::Recall(recall_req("aborted", 10, None)), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Recall(recall_req("aborted", 10, None)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -453,7 +473,9 @@ fn recall_in_txn_sees_pending_encode() {
 
         let frame = unwrap_recall(
             dispatch(
-                RequestBody::Recall(recall_req("in-flight", 10, Some(txn))), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Recall(recall_req("in-flight", 10, Some(txn))),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -477,7 +499,9 @@ fn recall_in_txn_drops_pending_tombstone() {
         let txn = [61; 16];
         let _ = begin(&fix, txn, 60).await;
         let _ = dispatch(
-            RequestBody::Forget(forget_req(committed_mid, [62; 16], Some(txn))), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::Forget(forget_req(committed_mid, [62; 16], Some(txn))),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap();
@@ -485,7 +509,9 @@ fn recall_in_txn_drops_pending_tombstone() {
         // In-txn RECALL must NOT see the tombstoned memory.
         let in_txn = unwrap_recall(
             dispatch(
-                RequestBody::Recall(recall_req("doomed", 10, Some(txn))), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Recall(recall_req("doomed", 10, Some(txn))),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -495,7 +521,9 @@ fn recall_in_txn_drops_pending_tombstone() {
         // Non-txn RECALL still sees it (uncommitted abort below).
         let outside = unwrap_recall(
             dispatch(
-                RequestBody::Recall(recall_req("doomed", 10, None)), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Recall(recall_req("doomed", 10, None)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -533,18 +561,26 @@ fn plan_in_txn_traverses_pending_link() {
 
         // In-txn PLAN sees the pending link.
         let in_txn = unwrap_plan(
-            dispatch(RequestBody::Plan(plan_req(a, b, 3, Some(txn))), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-                .await
-                .unwrap(),
+            dispatch(
+                RequestBody::Plan(plan_req(a, b, 3, Some(txn))),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
         );
         assert_eq!(in_txn.plan_status, Some(WirePlanStatus::GoalReached));
         assert_eq!(in_txn.steps.len(), 2);
 
         // Non-txn PLAN doesn't.
         let outside = unwrap_plan(
-            dispatch(RequestBody::Plan(plan_req(a, b, 3, None)), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-                .await
-                .unwrap(),
+            dispatch(
+                RequestBody::Plan(plan_req(a, b, 3, None)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
         );
         assert_eq!(outside.plan_status, Some(WirePlanStatus::NoPathFound));
 
@@ -577,9 +613,13 @@ fn reason_in_txn_picks_up_pending_supports_edge() {
         .unwrap();
 
         let frame = unwrap_reason(
-            dispatch(RequestBody::Reason(reason_req(a, 2, Some(txn))), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-                .await
-                .unwrap(),
+            dispatch(
+                RequestBody::Reason(reason_req(a, 2, Some(txn))),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
         );
         let inf = &frame.inferences[0];
         assert!(
@@ -601,7 +641,9 @@ fn unlink_in_txn_hides_committed_edge() {
         // Commit a LINK outside the txn.
         let _ = unwrap_link(
             dispatch(
-                RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 1.0, [92; 16], None)), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 1.0, [92; 16], None)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -609,9 +651,13 @@ fn unlink_in_txn_hides_committed_edge() {
 
         // Non-txn PLAN finds it.
         let outside = unwrap_plan(
-            dispatch(RequestBody::Plan(plan_req(a, b, 3, None)), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-                .await
-                .unwrap(),
+            dispatch(
+                RequestBody::Plan(plan_req(a, b, 3, None)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
         );
         assert_eq!(outside.plan_status, Some(WirePlanStatus::GoalReached));
 
@@ -620,7 +666,9 @@ fn unlink_in_txn_hides_committed_edge() {
         let _ = begin(&fix, txn, 60).await;
         let u = unwrap_unlink(
             dispatch(
-                RequestBody::Unlink(unlink_req(a, b, EdgeKindWire::Caused, [94; 16], Some(txn))), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Unlink(unlink_req(a, b, EdgeKindWire::Caused, [94; 16], Some(txn))),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -628,18 +676,26 @@ fn unlink_in_txn_hides_committed_edge() {
         assert!(u.removed);
 
         let in_txn = unwrap_plan(
-            dispatch(RequestBody::Plan(plan_req(a, b, 3, Some(txn))), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-                .await
-                .unwrap(),
+            dispatch(
+                RequestBody::Plan(plan_req(a, b, 3, Some(txn))),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
         );
         assert_eq!(in_txn.plan_status, Some(WirePlanStatus::NoPathFound));
 
         // Abort restores the edge.
         let _ = abort(&fix, txn).await;
         let restored = unwrap_plan(
-            dispatch(RequestBody::Plan(plan_req(a, b, 3, None)), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-                .await
-                .unwrap(),
+            dispatch(
+                RequestBody::Plan(plan_req(a, b, 3, None)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
         );
         assert_eq!(restored.plan_status, Some(WirePlanStatus::GoalReached));
     })
@@ -656,7 +712,9 @@ fn op_with_unknown_txn_id_returns_txn_not_found() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let err = dispatch(
-            RequestBody::Encode(encode_req([100; 16], "x", Some([99; 16]))), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::Encode(encode_req([100; 16], "x", Some([99; 16]))),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap_err();
@@ -672,7 +730,9 @@ fn commit_with_unknown_txn_id_returns_txn_not_found() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let err = dispatch(
-            RequestBody::TxnCommit(TxnCommitRequest { txn_id: [88; 16] }), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::TxnCommit(TxnCommitRequest { txn_id: [88; 16] }),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap_err();
@@ -686,7 +746,9 @@ fn abort_with_unknown_txn_id_returns_txn_not_found() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let err = dispatch(
-            RequestBody::TxnAbort(TxnAbortRequest { txn_id: [89; 16] }), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::TxnAbort(TxnAbortRequest { txn_id: [89; 16] }),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap_err();
@@ -708,7 +770,9 @@ fn op_against_committed_txn_returns_txn_expired() {
         let _ = commit(&fix, txn).await;
 
         let err = dispatch(
-            RequestBody::Encode(encode_req([112; 16], "after", Some(txn))), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::Encode(encode_req([112; 16], "after", Some(txn))),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap_err();
@@ -725,12 +789,18 @@ fn commit_against_aborted_txn_returns_txn_expired() {
         let fix = build_fixture();
         let txn = [130; 16];
         let _ = begin(&fix, txn, 60).await;
-        let _ = dispatch(RequestBody::TxnAbort(TxnAbortRequest { txn_id: txn }), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-            .await
-            .unwrap();
+        let _ = dispatch(
+            RequestBody::TxnAbort(TxnAbortRequest { txn_id: txn }),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
 
         let err = dispatch(
-            RequestBody::TxnCommit(TxnCommitRequest { txn_id: txn }), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::TxnCommit(TxnCommitRequest { txn_id: txn }),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap_err();

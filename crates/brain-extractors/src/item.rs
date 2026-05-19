@@ -8,6 +8,11 @@
 use serde::{Deserialize, Serialize};
 
 /// Sum type covering all per-mention output kinds.
+// The `Mention` suffix is the domain noun — every payload here is a
+// span-level "mention" (vs. a resolved entity / statement / relation).
+// Stripping the suffix would conflate the variants with the underlying
+// resolved-form types of the same names elsewhere in `brain-core`.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ExtractedItem {
     EntityMention(EntityMention),

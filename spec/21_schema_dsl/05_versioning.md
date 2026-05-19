@@ -106,6 +106,39 @@ Phase 22+ may introduce diff-time enforcement. Per the project's
 no-migration v1 directive, this is **explicitly deferred** rather
 than partially implemented.
 
+### 3.5 Adoption of implicit definitions + flagging sweep
+
+When a `SCHEMA_UPLOAD` declares a predicate or relation-type
+qname that already exists in the registry with
+`SchemaOrigin::ImplicitFromWrite` /
+`RelationTypeOrigin::ImplicitFromWrite` (interned by a prior
+`STATEMENT_CREATE` / `RELATION_CREATE` in open-vocabulary mode),
+`schema_upload` adopts the existing id:
+
+- The `PredicateId` / `RelationTypeId` is **preserved** — no new
+  id is allocated.
+- The origin tag flips to `SchemaDeclared { version: new_version }`.
+- Schema-declared constraints (`kind_constraint`,
+  `object_type_constraint`, `from_type` / `to_type`,
+  `cardinality`) take effect for **subsequent** writes against
+  that id. Previously written rows are not retroactively
+  validated.
+
+After the upload commit, a one-pass **flagging sweep** runs over
+the namespace's `statements` and `relations` tables:
+
+- Rows whose `predicate` (statements) or `relation_type`
+  (relations) is **not present** in the new active schema gain the
+  `OUTSIDE_ACTIVE_SCHEMA` flag bit. Reads still return the rows
+  normally; admin tools surface the flag for cleanup decisions.
+- Rows whose definition is present clear the flag if previously
+  set (e.g. a later upload re-introduced a previously-removed
+  type).
+
+The sweep is **single-pass per namespace** and runs inside the
+post-commit worker, not the upload transaction itself — keeping
+the upload commit latency bounded.
+
 ## 4. Built-in versions
 
 The system schema (§06) ships at version `1` for the `brain:`

@@ -11,7 +11,7 @@ use crate::ids::MemoryId;
 /// Some kinds are inherently asymmetric (`Caused`, `FollowedBy`), some
 /// are symmetric (`SimilarTo`, `Contradicts`). The substrate stores all
 /// edges directionally; symmetric kinds are stored both ways.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum EdgeKind {
     /// `source` caused `target`.

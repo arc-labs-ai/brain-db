@@ -5,7 +5,7 @@ use std::num::ParseIntError;
 use std::str::FromStr;
 
 use brain_core::MemoryId;
-use brain_protocol::request::{EdgeKindWire, ForgetMode, MemoryKindWire};
+use brain_protocol::request::{EdgeKindWire, ForgetMode, MemoryKindWire, RecallStrategy};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
@@ -19,7 +19,7 @@ pub const DEFAULT_SERVER: &str = "127.0.0.1:9090";
     name = "brain",
     version,
     about = "Interactive shell for the Brain cognitive substrate.",
-    disable_help_subcommand = true,
+    disable_help_subcommand = true
 )]
 pub struct Cli {
     #[command(flatten)]
@@ -170,13 +170,19 @@ impl FromStr for MemoryIdArg {
         // Short form first: a leading `s` followed by a `/` is
         // unambiguous (decimal can't start with `s`, hex starts with
         // `0x`).
-        if let Some(stripped) = trimmed.strip_prefix('s').or_else(|| trimmed.strip_prefix('S')) {
+        if let Some(stripped) = trimmed
+            .strip_prefix('s')
+            .or_else(|| trimmed.strip_prefix('S'))
+        {
             if stripped.contains('/') {
                 return parse_short_form(stripped).map(MemoryIdArg);
             }
         }
 
-        let raw: u128 = if let Some(rest) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        let raw: u128 = if let Some(rest) = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+        {
             u128::from_str_radix(rest, 16).map_err(parse_int_err("hex"))?
         } else {
             trimmed.parse::<u128>().map_err(parse_int_err("decimal"))?
@@ -191,9 +197,13 @@ impl FromStr for MemoryIdArg {
 /// something it isn't.
 fn parse_short_form(body: &str) -> Result<MemoryId, String> {
     let mut parts = body.split('/');
-    let shard_str = parts.next().ok_or_else(|| short_form_err("missing shard"))?;
+    let shard_str = parts
+        .next()
+        .ok_or_else(|| short_form_err("missing shard"))?;
     let slot_str = parts.next().ok_or_else(|| short_form_err("missing slot"))?;
-    let version_str = parts.next().ok_or_else(|| short_form_err("missing version"))?;
+    let version_str = parts
+        .next()
+        .ok_or_else(|| short_form_err("missing version"))?;
     if parts.next().is_some() {
         return Err(short_form_err("too many components"));
     }
@@ -207,9 +217,15 @@ fn parse_short_form(body: &str) -> Result<MemoryId, String> {
         .or_else(|| version_str.strip_prefix('V'))
         .ok_or_else(|| short_form_err("version must start with 'v'"))?;
 
-    let shard: u16 = shard_str.parse().map_err(|e| short_form_err(&format!("shard: {e}")))?;
-    let slot: u64 = slot_str.parse().map_err(|e| short_form_err(&format!("slot: {e}")))?;
-    let version: u32 = version_str.parse().map_err(|e| short_form_err(&format!("version: {e}")))?;
+    let shard: u16 = shard_str
+        .parse()
+        .map_err(|e| short_form_err(&format!("shard: {e}")))?;
+    let slot: u64 = slot_str
+        .parse()
+        .map_err(|e| short_form_err(&format!("slot: {e}")))?;
+    let version: u32 = version_str
+        .parse()
+        .map_err(|e| short_form_err(&format!("version: {e}")))?;
 
     Ok(MemoryId::pack(shard, slot, version))
 }
@@ -288,6 +304,29 @@ impl ForgetModeArg {
     }
 }
 
+/// `RecallStrategy` clap shim. Substrate-side hybrid is the
+/// default; this flag is the client-side escape hatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RecallStrategyArg {
+    /// Server picks (hybrid unless inside a txn).
+    Auto,
+    /// Force raw HNSW; useful for benchmarks.
+    Substrate,
+    /// Require hybrid; fail loud if a retriever slot is empty.
+    Hybrid,
+}
+
+impl RecallStrategyArg {
+    #[must_use]
+    pub fn into_wire(self) -> RecallStrategy {
+        match self {
+            RecallStrategyArg::Auto => RecallStrategy::Auto,
+            RecallStrategyArg::Substrate => RecallStrategy::SubstrateOnly,
+            RecallStrategyArg::Hybrid => RecallStrategy::HybridOnly,
+        }
+    }
+}
+
 // ─── per-subcommand argument structs ────────────────────────────
 
 #[derive(Debug, Args, Clone)]
@@ -332,6 +371,12 @@ pub struct RecallArgs {
     /// Off by default; recall returns ids and scores only.
     #[arg(long = "include-text", default_value_t = false)]
     pub include_text: bool,
+    /// Override the recall strategy. Defaults to `auto`
+    /// (server-side hybrid). Use `substrate` to force raw HNSW
+    /// recall, `hybrid` to require hybrid (fails loud if a
+    /// retriever slot is missing).
+    #[arg(long, value_enum)]
+    pub strategy: Option<RecallStrategyArg>,
     /// Bind to an active transaction (hex bytes).
     #[arg(long)]
     pub txn: Option<String>,
@@ -499,7 +544,14 @@ mod tests {
 
     #[test]
     fn encode_one_shot_parses() {
-        let cli = parse(&["encode", "hello world", "--context", "7", "--salience", "0.8"]);
+        let cli = parse(&[
+            "encode",
+            "hello world",
+            "--context",
+            "7",
+            "--salience",
+            "0.8",
+        ]);
         match cli.subcommand {
             Some(Command::Encode(args)) => {
                 assert_eq!(args.text, "hello world");
@@ -531,6 +583,31 @@ mod tests {
                 assert_eq!(args.top_k, 5);
                 assert_eq!(args.filter_context, vec![1, 2]);
                 assert_eq!(args.filter_kind, vec![KindArg::Episodic, KindArg::Semantic]);
+            }
+            other => panic!("expected Recall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recall_accepts_strategy_flag() {
+        let cli = parse(&["recall", "cue", "--strategy", "substrate"]);
+        match cli.subcommand {
+            Some(Command::Recall(args)) => {
+                assert_eq!(args.strategy, Some(RecallStrategyArg::Substrate));
+            }
+            other => panic!("expected Recall, got {other:?}"),
+        }
+        let cli = parse(&["recall", "cue", "--strategy", "hybrid"]);
+        match cli.subcommand {
+            Some(Command::Recall(args)) => {
+                assert_eq!(args.strategy, Some(RecallStrategyArg::Hybrid));
+            }
+            other => panic!("expected Recall, got {other:?}"),
+        }
+        let cli = parse(&["recall", "cue"]);
+        match cli.subcommand {
+            Some(Command::Recall(args)) => {
+                assert_eq!(args.strategy, None);
             }
             other => panic!("expected Recall, got {other:?}"),
         }

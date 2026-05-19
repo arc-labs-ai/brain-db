@@ -11,8 +11,7 @@ use crate::error::LlmError;
 use crate::types::{LlmRequest, LlmResponse};
 
 /// Future returned by [`LlmClient::complete`].
-pub type LlmFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>>;
+pub type LlmFuture<'a> = Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>>;
 
 pub trait LlmClient: Send + Sync {
     /// Send the request to the provider and return the

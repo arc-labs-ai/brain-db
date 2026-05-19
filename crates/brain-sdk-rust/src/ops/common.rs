@@ -53,7 +53,7 @@ pub async fn send_and_read_one(
     request: Frame,
     expected: Opcode,
 ) -> Result<Frame, ClientError> {
-    let r = send_and_read_one_inner(&mut **guard, request, expected).await;
+    let r = send_and_read_one_inner(guard, request, expected).await;
     if let Err(ref e) = r {
         if is_connection_fatal(e) {
             guard.mark_failed();
@@ -98,7 +98,7 @@ pub async fn send_and_collect_until_eos(
     expected: Opcode,
     max_frames: usize,
 ) -> Result<Vec<Frame>, ClientError> {
-    let r = send_and_collect_until_eos_inner(&mut **guard, request, expected, max_frames).await;
+    let r = send_and_collect_until_eos_inner(guard, request, expected, max_frames).await;
     if let Err(ref e) = r {
         if is_connection_fatal(e) {
             guard.mark_failed();

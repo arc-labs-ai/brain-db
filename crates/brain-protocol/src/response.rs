@@ -541,6 +541,7 @@ mod tests {
             timestamp_unix_nanos: 1_700_000_000_000_000_000,
             lsn: 1234,
             knowledge_payload: None,
+            edge_payload: None,
         }));
     }
 
@@ -806,6 +807,7 @@ mod tests {
                 timestamp_unix_nanos: 0,
                 lsn: 0,
                 knowledge_payload: None,
+                edge_payload: None,
             })
             .is_final(),
             None

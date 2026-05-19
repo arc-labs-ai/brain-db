@@ -40,6 +40,54 @@ statistics_update_interval_sec = 60
 embedder_cache_eviction_interval_sec = 300
 snapshot_interval_sec = 21600
 
+# Phase B: per-shard AutoEdgeWorker. Drains the writer's post-encode
+# channel and writes `SimilarTo` edges between memories whose cosine
+# similarity is at least `similarity_threshold`. Every field below
+# defaults if the section is omitted; tune per deployment.
+[workers.auto_edge]
+# Master switch. Set to false to disable auto-edge derivation entirely
+# (no worker, no channel, no overhead).
+enabled = true
+# Scheduler tick. Smaller = faster encode → edge visibility; larger =
+# less worker CPU. 100 ms is the substrate latency-budget default.
+interval_ms = 100
+# Max memories drained per cycle. Caps HNSW search bursts.
+batch_size = 256
+# Cosine floor. Neighbours below this don't get an edge.
+similarity_threshold = 0.85
+# Neighbour count per memory (worker over-fetches by 1 to skip self).
+top_k = 5
+# HNSW `ef` override for the per-encode search.
+ef_search = 64
+# Writer→worker queue depth. Overflow drops the enqueue with a warn
+# (the encode itself never fails).
+channel_capacity = 1024
+
+# Phase E: per-shard ExtractorWorker. Drains the writer's post-encode
+# channel and runs the three-tier extractor pipeline (pattern + classifier
+# + LLM) against each memory's text. Outputs are resolved through the
+# entity resolver gauntlet and written as entities / statements /
+# relations / mention edges.
+[workers.extractor]
+# Master switch. `false` skips registration entirely — no channel, no
+# worker, encodes see a None sender.
+enabled = true
+# Scheduler tick. Extraction is heavier than auto-edge (LLM round-trip
+# dominates), so the default is 1s vs 100ms.
+interval_ms = 1000
+# Max memories drained per cycle. Caps pattern/classifier/LLM work per
+# tick.
+drain_per_cycle = 32
+# Per-cycle LLM cost ceiling in dollar-micro-units (1e-6 USD). The
+# framework's per-call CostBudget is the active enforcement surface in
+# v1; per-cycle accounting wires through here in a later iteration.
+llm_budget_per_cycle_micro_usd = 50000
+# Writer→worker queue depth. Overflow drops with a warn.
+channel_capacity = 1024
+# Skip memories that already have a pipeline audit row. Set to false
+# only for re-extraction backfill scenarios.
+skip_already_extracted = true
+
 [logging]
 level = "info"
 output = "stdout"

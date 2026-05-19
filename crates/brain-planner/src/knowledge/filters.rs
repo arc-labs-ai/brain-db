@@ -25,7 +25,7 @@ use brain_core::knowledge::StatementKind;
 use brain_core::{MemoryKind, PredicateId};
 use brain_index::RankedItemId;
 use brain_metadata::statement_ops::statement_get;
-use brain_metadata::tables::knowledge::relation::RELATIONS_TABLE;
+use brain_metadata::tables::knowledge::relation::RELATION_METADATA_TABLE;
 use brain_metadata::tables::memory::{flags as memory_flags, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
 use redb::ReadTransaction;
@@ -256,7 +256,7 @@ fn filter_tombstone(
     // make every query on a fresh shard return empty before
     // the first write.
     let memories_present = table_exists(rtxn, MEMORIES_TABLE)?;
-    let relations_present = table_exists(rtxn, RELATIONS_TABLE)?;
+    let relations_present = table_exists(rtxn, RELATION_METADATA_TABLE)?;
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         let keep = match item.id {
@@ -272,7 +272,7 @@ fn filter_tombstone(
                 !stmt.tombstoned
             }
             RankedItemId::Relation(id) => {
-                !relations_present || relation_tombstoned(rtxn, id)?.map_or(false, |t| !t)
+                !relations_present || relation_tombstoned(rtxn, id)?.is_some_and(|t| !t)
             }
             RankedItemId::Entity(_) => true,
         };
@@ -291,7 +291,7 @@ fn filter_supersession(
     if chain.include_superseded {
         return Ok(items);
     }
-    let relations_present = table_exists(rtxn, RELATIONS_TABLE)?;
+    let relations_present = table_exists(rtxn, RELATION_METADATA_TABLE)?;
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         let keep = match item.id {
@@ -304,7 +304,7 @@ fn filter_supersession(
                 stmt.superseded_by.is_none()
             }
             RankedItemId::Relation(id) => {
-                !relations_present || relation_superseded(rtxn, id)?.map_or(false, |x| !x)
+                !relations_present || relation_superseded(rtxn, id)?.is_some_and(|x| !x)
             }
             // Memory / Entity have no supersession concept.
             RankedItemId::Memory(_) | RankedItemId::Entity(_) => true,
@@ -393,10 +393,13 @@ fn open_memory_row(
     Ok(row)
 }
 
+/// `(valid_from_ms, valid_to_ms)`, both endpoints open-ended when `None`.
+type ValidityWindowMs = (Option<u64>, Option<u64>);
+
 fn relation_validity_ms(
     rtxn: &ReadTransaction,
     id: brain_core::RelationId,
-) -> Result<Option<(Option<u64>, Option<u64>)>, FilterError> {
+) -> Result<Option<ValidityWindowMs>, FilterError> {
     let row = open_relation_row(rtxn, id)?;
     Ok(row.map(|r| {
         (
@@ -439,12 +442,16 @@ fn open_relation_row(
     id: brain_core::RelationId,
 ) -> Result<Option<brain_metadata::tables::knowledge::relation::RelationMetadata>, FilterError> {
     // Same defensive pattern as `open_memory_row`: a fresh shard
-    // with no relations written has no on-disk RELATIONS_TABLE;
+    // with no relations written has no on-disk RELATION_METADATA_TABLE;
     // treat as "no such row" rather than panicking.
-    let table = match rtxn.open_table(RELATIONS_TABLE) {
+    let table = match rtxn.open_table(RELATION_METADATA_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(e) => return Err(FilterError::Metadata(format!("open RELATIONS_TABLE: {e}"))),
+        Err(e) => {
+            return Err(FilterError::Metadata(format!(
+                "open RELATION_METADATA_TABLE: {e}"
+            )))
+        }
     };
     let key = id.to_bytes();
     let row = table

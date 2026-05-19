@@ -65,7 +65,10 @@ pub struct RecallRequest {
     pub age_bound_unix_nanos: Option<u64>,
     pub kind_filter: Option<Vec<MemoryKindWire>>,
     pub salience_floor: f32,
-    pub strategy_hint: Option<RecallStrategy>,
+    /// Client-side recall strategy selector. `None` is treated as
+    /// `Auto`. See [`RecallStrategy`] for the semantics of each
+    /// variant.
+    pub strategy: Option<RecallStrategy>,
     pub include_vectors: bool,
     pub include_edges: bool,
     /// When set, each `MemoryResult` carries the memory's stored UTF-8

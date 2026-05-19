@@ -110,6 +110,111 @@ Labels: `shard`, `worker`.
 
 ---
 
+## AutoEdgeWorker (Phase B)
+
+Per-shard metrics for the post-ENCODE similarity-edge derivation
+pipeline. Rows are emitted only for shards that have the worker
+enabled (`[workers.auto_edge] enabled = true`).
+
+### `brain_auto_edge_drops_total` *(counter)*
+
+Labels: `shard`.
+
+> Encode-side enqueues dropped because the auto-edge channel was
+> full. Encode itself still succeeds; only the auto-edge derivation
+> is skipped.
+
+### `brain_auto_edge_edges_written_total` *(counter)*
+
+Labels: `shard`.
+
+> Logical `SimilarTo` edges the worker persisted. Excludes
+> auto-mirror rows (physical row count is `2 * this`).
+
+### `brain_auto_edge_cycle_duration_seconds` *(histogram, seconds)*
+
+Labels: `shard`.
+Buckets (seconds): `0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, +Inf`.
+
+> Wall-clock duration of one cycle. Observed once per cycle
+> (including empty cycles), so `_count` matches
+> `brain_worker_cycles_total{worker="auto_edge"}`.
+
+### `brain_auto_edge_neighbours_found_per_cycle` *(histogram, count)*
+
+Labels: `shard`.
+Buckets: `1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, +Inf`.
+
+> Above-threshold neighbours collected across the memories drained
+> in one cycle. Zero on empty cycles.
+
+---
+
+## ExtractorWorker (Phase E)
+
+Per-shard metrics for the three-tier extractor pipeline that turns
+encoded text into entities / statements / relations / mention edges.
+Emitted only for shards with `[workers.extractor] enabled = true`.
+
+### `brain_extractor_drops_total` *(counter)*
+
+Labels: `shard`.
+
+> Encode-side enqueues dropped because the extractor channel was
+> full. Encode still succeeds.
+
+### `brain_extractor_schema_filtered_total` *(counter)*
+
+Labels: `shard`, `predicate`.
+
+> Items dropped because the predicate or relation-type qname isn't
+> declared in the active schema for its namespace. `predicate`
+> cardinality is bounded by the operator's schema; in schemaless
+> deployments the metric stays empty.
+
+### `brain_extractor_items_written_total` *(counter)*
+
+Labels: `shard`, `item_kind`.
+`item_kind` ∈ `{entity, statement, relation, mention}`.
+
+> Knowledge-layer rows the worker persisted, by item kind.
+
+### `brain_extractor_llm_micro_usd_spent_total` *(counter)*
+
+Labels: `shard`.
+
+> Cumulative LLM-tier spend reported by extractors, in dollar
+> micro-units (1e-6 USD). Substrate-only and pattern-only
+> deployments leave this at zero.
+
+### `brain_extractor_cycle_duration_seconds` *(histogram, seconds)*
+
+Labels: `shard`.
+Buckets: same as `brain_auto_edge_cycle_duration_seconds`.
+
+> Wall-clock duration of one cycle. Observed once per cycle.
+
+### `brain_extractor_tier_runs_total` *(counter)*
+
+Labels: `shard`, `tier`, `status`.
+`tier` ∈ `{pattern, classifier, llm}`.
+`status` ∈ `{ran, skipped, failed}`.
+
+> Per-tier outcome bumped once per memory the worker processed.
+> Tiers that aren't registered for the deployment never bump (no
+> `ABSENT` row — distinguish via `absent()` in PromQL).
+
+### `brain_extractor_resolver_outcome_total` *(counter)*
+
+Labels: `shard`, `tier`.
+`tier` ∈ `{exact, alias, fuzzy, create}`.
+
+> Resolver tier that satisfied each entity mention. `create` is the
+> fall-through that minted a fresh `EntityId`; the other three are
+> cache-style hits against the entity registry.
+
+---
+
 ## HNSW index
 
 ### `brain_hnsw_node_count` *(gauge)*

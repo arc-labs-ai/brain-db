@@ -30,7 +30,7 @@ use std::time::SystemTime;
 
 use brain_core::MemoryId;
 use brain_metadata::cascade_ops::{
-    cascade_forget_to_statements, DEFAULT_CASCADE_CONFIDENCE_THRESHOLD,
+    cascade_forget_to_edges, cascade_forget_to_statements, DEFAULT_CASCADE_CONFIDENCE_THRESHOLD,
 };
 use parking_lot::Mutex;
 
@@ -145,6 +145,14 @@ impl ForgetCascadeWorker {
                 now_ns,
             )
             .map_err(|e| WorkerError::Internal(format!("cascade: {e}")))?;
+            // Phase C cascade: drop substrate / mention edges anchored
+            // at the forgotten memory and clean up typed-relation
+            // evidence in the same write txn. A single wtxn keeps the
+            // edge sweep, statement evidence rewrite, and relation
+            // tombstone atomic — a partial cascade would leak dangling
+            // edges past the FORGET visibility boundary.
+            let edge_summary = cascade_forget_to_edges(&wtxn, job.memory_id, now_ns)
+                .map_err(|e| WorkerError::Internal(format!("cascade edges: {e}")))?;
             wtxn.commit()
                 .map_err(|e| WorkerError::Internal(format!("cascade commit: {e}")))?;
             tracing::debug!(
@@ -154,6 +162,9 @@ impl ForgetCascadeWorker {
                 evidence_dropped = summary.evidence_dropped,
                 kept_stale = summary.kept_stale,
                 tombstoned = summary.tombstoned,
+                substrate_unlinked = edge_summary.substrate_unlinked,
+                relations_tombstoned = edge_summary.relations_tombstoned,
+                relations_evidence_dropped = edge_summary.relations_evidence_dropped,
                 "cascade applied",
             );
             processed += 1;

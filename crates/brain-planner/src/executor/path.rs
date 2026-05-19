@@ -19,9 +19,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use brain_core::{EdgeKind, MemoryId};
-use brain_metadata::tables::edge::{
-    list_edges_from, list_edges_to, EDGES_IN_TABLE, EDGES_OUT_TABLE,
-};
+use brain_metadata::tables::edge::{list_memory_edges_from, list_memory_edges_to};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_protocol::request::PlanState;
@@ -215,12 +213,8 @@ fn run_bidirectional_bfs(
     let rtxn = metadata_guard
         .read_txn()
         .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
-    let edges_out = rtxn
-        .open_table(EDGES_OUT_TABLE)
-        .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
-    let edges_in = rtxn
-        .open_table(EDGES_IN_TABLE)
-        .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
+    // No edge tables to open: the convenience helpers take the read
+    // txn directly and open the right table internally.
 
     // Alternate expansion of the smaller frontier until depth budget
     // is exhausted on both sides.
@@ -255,14 +249,14 @@ fn run_bidirectional_bfs(
 
             // Fetch neighbours along this direction.
             let mut neighbours: Vec<(EdgeKind, MemoryId, f32)> = if is_forward {
-                list_edges_from(&edges_out, node, None)
+                list_memory_edges_from(&rtxn, node, None)
                     .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?
                     .into_iter()
                     .filter(|(k, _, _)| edge_kinds.contains(k))
                     .map(|(k, t, data)| (k, t, data.weight))
                     .collect()
             } else {
-                list_edges_to(&edges_in, node, None)
+                list_memory_edges_to(&rtxn, node, None)
                     .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?
                     .into_iter()
                     .filter(|(k, _, _)| edge_kinds.contains(k))
@@ -474,9 +468,7 @@ fn hydrate_paths(
                 match tbl.get(id.to_be_bytes()) {
                     Ok(Some(g)) => std::str::from_utf8(g.value())
                         .map_err(|e| {
-                            ExecError::Internal(format!(
-                                "texts row for {id:?} is not UTF-8: {e}"
-                            ))
+                            ExecError::Internal(format!("texts row for {id:?} is not UTF-8: {e}"))
                         })?
                         .to_owned(),
                     Ok(None) => String::new(),

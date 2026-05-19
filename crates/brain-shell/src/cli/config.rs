@@ -135,7 +135,10 @@ pub enum ConfigError {
     },
 
     #[error("unknown setting key: {key}{hint}", hint = match suggestion { Some(s) => format!(". did you mean '{s}'?"), None => String::new() })]
-    UnknownKey { key: String, suggestion: Option<String> },
+    UnknownKey {
+        key: String,
+        suggestion: Option<String>,
+    },
 
     #[error("invalid value for {key}: {detail}")]
     InvalidValue { key: String, detail: String },
@@ -196,9 +199,7 @@ impl Config {
     }
 
     /// As above but takes the path explicitly — testing entry point.
-    pub fn load_or_default_at(
-        path: &Path,
-    ) -> Result<(Self, Option<MigrationNote>), ConfigError> {
+    pub fn load_or_default_at(path: &Path) -> Result<(Self, Option<MigrationNote>), ConfigError> {
         match fs::read_to_string(path) {
             Ok(contents) => {
                 let (file, note) = parse_or_migrate(&contents, path)?;
@@ -342,7 +343,7 @@ impl Config {
     }
 
     /// All known keys with their current values — for `config list`.
-    /// Stable ordering matches [`KNOWN_KEYS`].
+    /// Stable ordering matches the module-private `KNOWN_KEYS` array.
     pub fn list(&self) -> Vec<(&'static str, String)> {
         KNOWN_KEYS
             .iter()
@@ -396,12 +397,14 @@ impl Config {
 
     pub fn rename_agent(&mut self, old: &str, new: &str) -> Result<(), ConfigError> {
         validate_agent_name(new)?;
-        let entry = self.file.agents.remove(old).ok_or_else(|| {
-            ConfigError::AgentUnknown {
+        let entry = self
+            .file
+            .agents
+            .remove(old)
+            .ok_or_else(|| ConfigError::AgentUnknown {
                 name: old.to_owned(),
                 suggestion: closest_agent(old, &self.file.agents),
-            }
-        })?;
+            })?;
         if self.file.agents.contains_key(new) {
             // Restore the original entry before bailing so the
             // in-memory view stays consistent if the caller doesn't
@@ -510,11 +513,7 @@ fn backup_path_for(path: &Path) -> PathBuf {
         .format(&time::format_description::well_known::Iso8601::DEFAULT)
         .unwrap_or_else(|_| "unknown".into());
     // Compress to YYYYMMDDHHMMSS form for the suffix.
-    let compact: String = ts
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .take(14)
-        .collect();
+    let compact: String = ts.chars().filter(|c| c.is_ascii_digit()).take(14).collect();
     let stem = path
         .file_name()
         .map(|f| f.to_string_lossy().into_owned())
@@ -552,12 +551,10 @@ fn save_atomic(path: &Path, file: &ConfigFile) -> Result<(), ConfigError> {
             path: path.to_path_buf(),
             source: e,
         })?;
-    tmp.as_file()
-        .sync_all()
-        .map_err(|e| ConfigError::Write {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
+    tmp.as_file().sync_all().map_err(|e| ConfigError::Write {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -646,9 +643,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
         curr[0] = i;
         for j in 1..=m {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)
-                .min(curr[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -811,7 +806,10 @@ mod tests {
         let mut c = Config::load_or_default_at(&cfg_path(&t)).unwrap().0;
         c.create_agent("work", "").unwrap();
         let err = c.create_agent("work", "").unwrap_err();
-        assert!(matches!(err, ConfigError::AgentExists { .. }), "got {err:?}");
+        assert!(
+            matches!(err, ConfigError::AgentExists { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -831,7 +829,10 @@ mod tests {
         c.create_agent("a", "").unwrap();
         c.create_agent("b", "").unwrap();
         let err = c.rename_agent("a", "b").unwrap_err();
-        assert!(matches!(err, ConfigError::AgentExists { .. }), "got {err:?}");
+        assert!(
+            matches!(err, ConfigError::AgentExists { .. }),
+            "got {err:?}"
+        );
         assert!(c.get_agent("a").is_ok());
         assert!(c.get_agent("b").is_ok());
     }
@@ -866,7 +867,10 @@ mod tests {
         let t = TempDir::new().unwrap();
         let mut c = Config::load_or_default_at(&cfg_path(&t)).unwrap().0;
         let id = "019e3b00-0000-7000-8000-000000000001";
-        let e = c.import_agent("shared", id, "from teammate").unwrap().clone();
+        let e = c
+            .import_agent("shared", id, "from teammate")
+            .unwrap()
+            .clone();
         assert_eq!(e.id, id);
         assert_eq!(e.note, "from teammate");
     }
@@ -885,7 +889,10 @@ mod tests {
         let mut c = Config::load_or_default_at(&cfg_path(&t)).unwrap().0;
         for bad in ["", "has space", "has/slash", &"x".repeat(100)] {
             let err = c.create_agent(bad, "").unwrap_err();
-            assert!(matches!(err, ConfigError::AgentBadName { .. }), "got {err:?}");
+            assert!(
+                matches!(err, ConfigError::AgentBadName { .. }),
+                "got {err:?}"
+            );
         }
     }
 

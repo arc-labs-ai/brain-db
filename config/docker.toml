@@ -95,6 +95,28 @@ statistics_update_interval_sec     = 60
 embedder_cache_eviction_interval_sec = 300
 snapshot_interval_sec              = 21600
 
+# Phase B: per-shard AutoEdgeWorker. Derives SimilarTo edges from
+# HNSW knn after each ENCODE. Every field defaults if the section
+# is omitted; commented overrides shown for visibility.
+[workers.auto_edge]
+enabled              = true
+interval_ms          = 100
+batch_size           = 256
+similarity_threshold = 0.85
+top_k                = 5
+ef_search            = 64
+channel_capacity     = 1024
+
+# Phase E: per-shard ExtractorWorker. See dev.toml for full field
+# documentation.
+[workers.extractor]
+enabled                          = true
+interval_ms                      = 1000
+drain_per_cycle                  = 32
+llm_budget_per_cycle_micro_usd   = 50000
+channel_capacity                 = 1024
+skip_already_extracted           = true
+
 [summarizer]
 # Consolidation worker is a no-op until an LLM backend is wired.
 # Spec §11/03 §6. See docs/guides/configure.md "Summarizer" for

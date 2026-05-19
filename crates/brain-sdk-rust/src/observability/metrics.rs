@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
-/// Per-operation counters. Updated through
-/// [`MetricsState::record_*`].
+/// Per-operation counters. Updated through `MetricsState`'s
+/// `record_*` family of methods.
 #[derive(Debug, Default)]
 pub struct OpCounters {
     pub requests_total: AtomicU64,

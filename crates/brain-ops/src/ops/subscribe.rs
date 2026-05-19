@@ -46,7 +46,9 @@ use std::sync::Arc;
 
 use brain_core::{ContextId, MemoryId, MemoryKind};
 use brain_protocol::request::{SubscribeRequest, UnsubscribeRequest};
-use brain_protocol::response::{EventType, SubscriptionEvent, UnsubscribeResponse};
+use brain_protocol::response::{
+    EdgeEventPayload, EventType, SubscriptionEvent, UnsubscribeResponse,
+};
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
 
@@ -119,6 +121,9 @@ pub struct EventEnvelope {
     /// Typed knowledge-layer payload — `None` for substrate events,
     /// `Some(_)` for the 14 knowledge event variants (phase 16.7+).
     pub knowledge_payload: Option<brain_protocol::knowledge::KnowledgeEventPayload>,
+    /// Unified-edge change-feed payload — `Some(_)` when `event_type`
+    /// is `EdgeAdded`, `EdgeRemoved` or `EdgeSuperseded`. Phase C.
+    pub edge_payload: Option<EdgeEventPayload>,
     /// Agent the event was attributed to. Substrate writers stamp
     /// their bound agent; knowledge handlers stamp the auth-time
     /// agent the request ran under. Default (nil) for tests +
@@ -141,40 +146,74 @@ impl EventEnvelope {
             timestamp_unix_nanos: self.timestamp_unix_nanos,
             lsn: self.lsn,
             knowledge_payload: self.knowledge_payload.clone(),
+            edge_payload: self.edge_payload.clone(),
         }
     }
 
-    /// Project a durable WAL record back into an in-memory event
-    /// envelope. Subscribe-replay calls this for every record in the
-    /// `[from_lsn, current_tail)` range, applies the subscriber's
-    /// filter, and writes any matches as `SUBSCRIBE_EVENT` frames.
+    /// Project a durable WAL record back into zero-or-more in-memory
+    /// event envelopes. Subscribe-replay calls this for every record
+    /// in the `[from_lsn, current_tail)` range, applies the
+    /// subscriber's filter, and writes any matches as
+    /// `SUBSCRIBE_EVENT` frames.
     ///
-    /// Returns `None` for records that don't surface as subscribe
-    /// events (CheckpointBegin/End, TxnBegin/Commit/Abort,
+    /// One WAL record can produce more than one envelope: an `Encode`
+    /// with N attached edges emits one `Encoded` event plus N
+    /// `EdgeAdded` events at the same LSN. Replay frames each as a
+    /// separate `SUBSCRIBE_EVENT` so per-edge filters see them.
+    ///
+    /// Returns an empty `Vec` for records that don't surface as
+    /// subscribe events (CheckpointBegin/End, TxnBegin/Commit/Abort,
     /// MigrateEmbedding, UpdateSalience, Reclaim, Consolidate). The
     /// caller skips those LSNs silently.
     #[must_use]
-    pub fn from_wal_record(record: &brain_storage::wal::record::WalRecord) -> Option<Self> {
+    pub fn from_wal_record(record: &brain_storage::wal::record::WalRecord) -> Vec<Self> {
         use brain_protocol::knowledge::KnowledgeEventPayload;
         use brain_storage::wal::payload::WalPayload;
 
         let lsn = record.lsn.raw();
         let timestamp_unix_nanos = record.timestamp_ns;
-        let payload = record.typed_payload().ok()?;
+        let Ok(payload) = record.typed_payload() else {
+            return Vec::new();
+        };
         match payload {
-            WalPayload::Encode(p) => Some(Self {
-                lsn,
-                event_type: EventType::Encoded,
-                memory_id: p.memory_id,
-                context_id: p.context_id,
-                kind: p.kind,
-                salience: p.salience_initial,
-                timestamp_unix_nanos,
-                text: Some(p.text),
-                knowledge_payload: None,
-                agent_id: p.agent_id,
-            }),
-            WalPayload::Forget(p) => Some(Self {
+            WalPayload::Encode(p) => {
+                let mut out = Vec::with_capacity(1 + p.edges.len());
+                let agent_id = p.agent_id;
+                let context_id = p.context_id;
+                let kind = p.kind;
+                out.push(Self {
+                    lsn,
+                    event_type: EventType::Encoded,
+                    memory_id: p.memory_id,
+                    context_id,
+                    kind,
+                    salience: p.salience_initial,
+                    timestamp_unix_nanos,
+                    text: Some(p.text),
+                    knowledge_payload: None,
+                    edge_payload: None,
+                    agent_id,
+                });
+                for e in p.edges {
+                    out.push(Self {
+                        lsn,
+                        event_type: EventType::EdgeAdded,
+                        memory_id: MemoryId::NULL,
+                        context_id,
+                        kind: MemoryKind::Episodic,
+                        salience: 0.0,
+                        timestamp_unix_nanos,
+                        text: None,
+                        knowledge_payload: None,
+                        edge_payload: Some(edge_payload_to_event(
+                            e.source, e.target, e.kind, e.weight, None, None,
+                        )),
+                        agent_id,
+                    });
+                }
+                out
+            }
+            WalPayload::Forget(p) => vec![Self {
                 lsn,
                 event_type: EventType::Forgotten,
                 memory_id: p.memory_id,
@@ -189,15 +228,134 @@ impl EventEnvelope {
                 timestamp_unix_nanos,
                 text: None,
                 knowledge_payload: None,
+                edge_payload: None,
+                // ForgetPayload doesn't carry agent_id today; replay
+                // can't route through the per-agent allowlist for
+                // forgets. Live forgets stamp it via `writer.agent_id`.
+                agent_id: brain_core::AgentId::default(),
+            }],
+            WalPayload::Link(p) => vec![Self {
+                lsn,
+                event_type: EventType::EdgeAdded,
+                memory_id: MemoryId::NULL,
+                context_id: ContextId::default(),
+                kind: MemoryKind::Episodic,
+                salience: 0.0,
+                timestamp_unix_nanos,
+                text: None,
+                knowledge_payload: None,
+                edge_payload: Some(edge_payload_to_event(
+                    p.source,
+                    p.target,
+                    p.edge_kind,
+                    p.weight,
+                    None,
+                    None,
+                )),
+                // LinkPayload has no agent_id today; replay can't
+                // route to a per-agent allowlist. Live writes stamp
+                // via WalSink.
+                agent_id: brain_core::AgentId::default(),
+            }],
+            WalPayload::Unlink(p) => vec![Self {
+                lsn,
+                event_type: EventType::EdgeRemoved,
+                memory_id: MemoryId::NULL,
+                context_id: ContextId::default(),
+                kind: MemoryKind::Episodic,
+                salience: 0.0,
+                timestamp_unix_nanos,
+                text: None,
+                knowledge_payload: None,
+                edge_payload: Some(edge_payload_to_event(
+                    p.source,
+                    p.target,
+                    p.edge_kind,
+                    0.0,
+                    None,
+                    None,
+                )),
+                agent_id: brain_core::AgentId::default(),
+            }],
+            WalPayload::RelationLink(p) => vec![Self {
+                lsn,
+                event_type: EventType::EdgeAdded,
+                memory_id: MemoryId::NULL,
+                context_id: ContextId::default(),
+                kind: MemoryKind::Episodic,
+                salience: 0.0,
+                timestamp_unix_nanos,
+                text: None,
+                knowledge_payload: None,
+                edge_payload: Some(edge_payload_to_event(
+                    p.from,
+                    p.to,
+                    brain_core::EdgeKindRef::Typed(p.relation_type_id),
+                    1.0,
+                    Some(p.relation_id),
+                    None,
+                )),
                 agent_id: p.agent_id,
-            }),
+            }],
+            WalPayload::RelationSupersede(p) => vec![Self {
+                lsn,
+                event_type: EventType::EdgeSuperseded,
+                memory_id: MemoryId::NULL,
+                context_id: ContextId::default(),
+                kind: MemoryKind::Episodic,
+                salience: 0.0,
+                timestamp_unix_nanos,
+                text: None,
+                knowledge_payload: None,
+                edge_payload: Some(edge_payload_to_event(
+                    p.new.from,
+                    p.new.to,
+                    brain_core::EdgeKindRef::Typed(p.new.relation_type_id),
+                    1.0,
+                    Some(p.new.relation_id),
+                    Some(p.old_relation_id),
+                )),
+                agent_id: p.new.agent_id,
+            }],
+            WalPayload::RelationTombstone(p) => vec![Self {
+                lsn,
+                event_type: EventType::EdgeRemoved,
+                memory_id: MemoryId::NULL,
+                context_id: ContextId::default(),
+                kind: MemoryKind::Episodic,
+                salience: 0.0,
+                timestamp_unix_nanos,
+                text: None,
+                knowledge_payload: None,
+                // Tombstone replay doesn't reconstruct (from, to)
+                // endpoints — the WAL record only carries the
+                // relation_id; the sidecar lookup needed to recover
+                // the pair is out of scope for from_wal_record (no
+                // metadata handle available here). Subscribers that
+                // need the endpoints resolve via RECALL on the
+                // relation_id.
+                edge_payload: Some(EdgeEventPayload {
+                    from_kind: 0,
+                    from_id: [0u8; 16],
+                    to_kind: 0,
+                    to_id: [0u8; 16],
+                    edge_kind_tag: 2,
+                    edge_kind_byte: 0,
+                    relation_type_id: None,
+                    weight: 0.0,
+                    relation_id: Some(p.relation_id.to_bytes()),
+                    superseded_relation_id: None,
+                }),
+                agent_id: p.agent_id,
+            }],
             WalPayload::Knowledge(record) => {
                 // Decode the rkyv body back into the typed knowledge
                 // event so subscribers see the same shape as a live
                 // publish. Pair with `wal_kind_for_event` in
                 // `crate::ops::knowledge_entity`.
-                let payload: KnowledgeEventPayload =
-                    rkyv::from_bytes::<KnowledgeEventPayload>(&record.body).ok()?;
+                let Ok(payload) = rkyv::from_bytes::<KnowledgeEventPayload>(&record.body) else {
+                    return Vec::new();
+                };
                 let event_type = match &payload {
                     KnowledgeEventPayload::EntityCreated(_) => EventType::EntityCreated,
                     KnowledgeEventPayload::EntityUpdated(_) => EventType::EntityUpdated,
@@ -206,20 +364,16 @@ impl EventEnvelope {
                     KnowledgeEventPayload::EntityUnmerged(_) => EventType::EntityUnmerged,
                     KnowledgeEventPayload::EntityTombstoned(_) => EventType::EntityTombstoned,
                     KnowledgeEventPayload::StatementCreated(_) => EventType::StatementCreated,
-                    KnowledgeEventPayload::StatementSuperseded(_) => {
-                        EventType::StatementSuperseded
-                    }
-                    KnowledgeEventPayload::StatementTombstoned(_) => {
-                        EventType::StatementTombstoned
-                    }
+                    KnowledgeEventPayload::StatementSuperseded(_) => EventType::StatementSuperseded,
+                    KnowledgeEventPayload::StatementTombstoned(_) => EventType::StatementTombstoned,
                     KnowledgeEventPayload::RelationCreated(_) => EventType::RelationCreated,
                     KnowledgeEventPayload::RelationSuperseded(_) => EventType::RelationSuperseded,
                     KnowledgeEventPayload::RelationTombstoned(_) => EventType::RelationTombstoned,
                     KnowledgeEventPayload::SchemaUpdated(_) => EventType::SchemaUpdated,
                     KnowledgeEventPayload::ExtractionCompleted(_)
-                    | KnowledgeEventPayload::ExtractionFailed(_) => return None,
+                    | KnowledgeEventPayload::ExtractionFailed(_) => return Vec::new(),
                 };
-                Some(Self {
+                vec![Self {
                     lsn,
                     event_type,
                     memory_id: MemoryId::NULL,
@@ -229,13 +383,51 @@ impl EventEnvelope {
                     timestamp_unix_nanos,
                     text: None,
                     knowledge_payload: Some(payload),
-                    agent_id: record.agent_id,
-                })
+                    edge_payload: None,
+                    agent_id: brain_core::AgentId::default(),
+                }]
             }
-            // Link / Unlink don't emit subscribe events today (v1).
-            // TXN brackets / checkpoints / sweepers are durable-only.
-            _ => None,
+            // TXN brackets, checkpoints, salience updates, reclaims,
+            // consolidations, embedding migrations, kind/context
+            // updates are durable-only — no subscriber event today.
+            _ => Vec::new(),
         }
+    }
+}
+
+/// Project a [`brain_core::NodeRef`] + [`brain_core::EdgeKindRef`]
+/// pair plus optional relation ids into a wire [`EdgeEventPayload`].
+fn edge_payload_to_event(
+    from: brain_core::NodeRef,
+    to: brain_core::NodeRef,
+    kind: brain_core::EdgeKindRef,
+    weight: f32,
+    relation_id: Option<brain_core::RelationId>,
+    superseded: Option<brain_core::RelationId>,
+) -> EdgeEventPayload {
+    let (edge_kind_tag, edge_kind_byte, relation_type_id) = match kind {
+        brain_core::EdgeKindRef::Builtin(k) => (0u8, k as u8, None),
+        brain_core::EdgeKindRef::Mentions => (1u8, 0u8, None),
+        brain_core::EdgeKindRef::Typed(rt) => {
+            let raw = rt.raw();
+            // Stash the low byte in `edge_kind_byte` for cheap filter
+            // checks; the full id lives in `relation_type_id`.
+            #[allow(clippy::cast_possible_truncation)]
+            let low = (raw & 0xFF) as u8;
+            (2u8, low, Some(raw))
+        }
+    };
+    EdgeEventPayload {
+        from_kind: from.tag(),
+        from_id: from.id_bytes(),
+        to_kind: to.tag(),
+        to_id: to.id_bytes(),
+        edge_kind_tag,
+        edge_kind_byte,
+        relation_type_id,
+        weight,
+        relation_id: relation_id.map(|r| r.to_bytes()),
+        superseded_relation_id: superseded.map(|r| r.to_bytes()),
     }
 }
 
@@ -383,7 +575,12 @@ pub fn parse_filter(req: &SubscribeRequest) -> Result<ParsedFilter, OpError> {
         if v.is_empty() {
             None
         } else {
-            Some(v.iter().copied().map(brain_core::AgentId::from).collect::<HashSet<_>>())
+            Some(
+                v.iter()
+                    .copied()
+                    .map(brain_core::AgentId::from)
+                    .collect::<HashSet<_>>(),
+            )
         }
     });
     Ok(ParsedFilter {

@@ -160,7 +160,10 @@ fn fmt_short_id(raw: u128) -> String {
 /// and model fingerprints in compact views where the full 32-char
 /// form would dominate the line.
 fn fmt_short_hex_16(bytes: &[u8; 16]) -> String {
-    format!("{:02x}{:02x}{:02x}{:02x}…", bytes[0], bytes[1], bytes[2], bytes[3])
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}…",
+        bytes[0], bytes[1], bytes[2], bytes[3]
+    )
 }
 
 /// `0x` prefix + 32 hex chars for a 16-byte array (UUID-shaped). Used
@@ -316,10 +319,7 @@ impl Render for RecallResults {
                 } else {
                     "↑"
                 };
-                format!(
-                    "sal={:.3}{arrow}{:.3}",
-                    r.salience, r.salience_initial
-                )
+                format!("sal={:.3}{arrow}{:.3}", r.salience, r.salience_initial)
             };
             let mut meta: Vec<String> = vec![
                 fmt_short_id(r.memory_id),
@@ -556,11 +556,15 @@ fn plan_status_footer(status: Option<PlanStatus>, n_steps: usize) -> Option<Stri
         PlanStatus::GoalReached => None,
         PlanStatus::NoPathFound => Some(format!(
             "(NoPathFound — no path between the start and goal within the index{})",
-            if n_steps <= 1 { "; only the start endpoint surfaced" } else { "" },
+            if n_steps <= 1 {
+                "; only the start endpoint surfaced"
+            } else {
+                ""
+            },
         )),
-        PlanStatus::BudgetExhausted => Some(
-            "(BudgetExhausted — try a larger --max-steps or --max-wall-time-ms)".to_owned(),
-        ),
+        PlanStatus::BudgetExhausted => {
+            Some("(BudgetExhausted — try a larger --max-steps or --max-wall-time-ms)".to_owned())
+        }
         PlanStatus::Cancelled => Some("(Cancelled)".to_owned()),
     }
 }
@@ -828,8 +832,7 @@ mod tests {
                 step_index: 0,
                 memory_id: 0x1234,
                 text: "start".into(),
-                transition_kind:
-                    brain_protocol::response::TransitionKind::Initial,
+                transition_kind: brain_protocol::response::TransitionKind::Initial,
                 confidence: 1.0,
                 estimated_distance_to_goal: 0.0,
             }],
@@ -837,7 +840,10 @@ mod tests {
         };
         p.render_table(&mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("NoPathFound"), "footer must appear in rendered output:\n{out}");
+        assert!(
+            out.contains("NoPathFound"),
+            "footer must appear in rendered output:\n{out}"
+        );
         // Footer must sit AFTER the table's bottom border line.
         let bottom_idx = out.rfind('└').expect("bottom border");
         let footer_idx = out.find("NoPathFound").expect("footer");

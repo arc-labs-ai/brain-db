@@ -124,6 +124,9 @@ impl AdminState {
 // ---------------------------------------------------------------------------
 
 /// Which router this listener serves. See module docs.
+// `Public` and `Admin` are unused in the test build (tests construct
+// `Unified` listeners); they ship for production wiring.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 enum RouterKind {
     /// `/healthz` + `/metrics`.
@@ -166,6 +169,8 @@ pub struct BoundAdminServer {
 
 impl AdminServer {
     /// Public listener: `/healthz` + `/metrics` only.
+    // Unused in test builds (see [`RouterKind`]).
+    #[allow(dead_code)]
     pub fn public(
         listen_addr: SocketAddr,
         state: Arc<AdminState>,
@@ -180,7 +185,13 @@ impl AdminServer {
     }
 
     /// Admin listener: `/v1/*` only.
-    pub fn admin(listen_addr: SocketAddr, state: Arc<AdminState>, shutdown: ShutdownSignal) -> Self {
+    // Unused in test builds (see [`RouterKind`]).
+    #[allow(dead_code)]
+    pub fn admin(
+        listen_addr: SocketAddr,
+        state: Arc<AdminState>,
+        shutdown: ShutdownSignal,
+    ) -> Self {
         Self {
             listen_addr,
             state,

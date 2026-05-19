@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use brain_core::{EdgeKind, MemoryId};
-use brain_metadata::tables::edge::{list_edges_from, EDGES_OUT_TABLE};
+use brain_metadata::tables::edge::list_memory_edges_from;
 use brain_protocol::request::ObservationInput;
 
 use crate::plan::reason::ReasonPlan;
@@ -208,10 +208,6 @@ fn walk_outward(
     let rtxn = metadata_guard
         .read_txn()
         .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
-    let edges_out = rtxn
-        .open_table(EDGES_OUT_TABLE)
-        .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
-
     let mut visited: HashMap<MemoryId, Crumb> = HashMap::new();
     let mut queue: VecDeque<MemoryId> = VecDeque::new();
 
@@ -244,7 +240,7 @@ fn walk_outward(
         }
 
         let mut neighbours: Vec<(EdgeKind, MemoryId, f32)> =
-            list_edges_from(&edges_out, node, None)
+            list_memory_edges_from(&rtxn, node, None)
                 .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?
                 .into_iter()
                 .filter(|(k, _, _)| edge_kinds.contains(k))

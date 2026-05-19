@@ -305,6 +305,106 @@ fn empty_retriever_list_is_harmless() {
     assert!(approx_eq(fused[0].fused_score, 1.0 / 61.0));
 }
 
+// ---------------------------------------------------------------------------
+// Property test — RRF must be order-invariant in its outer retriever list.
+//
+// Callers can't be relied on to deliver retriever outputs in a canonical
+// order; if RRF ever depended on insertion order, the result set would
+// flicker under reordering. This catches the HashMap-iteration-order
+// pitfall by directly permuting `outputs` and asserting equality.
+// ---------------------------------------------------------------------------
+
+mod property {
+    use super::*;
+
+    use proptest::collection::vec as pvec;
+    use proptest::prelude::*;
+
+    /// Available retriever variants — keep all three so any pair
+    /// can land in a permutation.
+    const RETRIEVERS: [Retriever; 3] = [Retriever::Semantic, Retriever::Lexical, Retriever::Graph];
+
+    /// Build a small pool of `RankedItem`s with overlapping ids so
+    /// permutation can exercise the same-doc summation path.
+    fn build_outputs(
+        retriever_count: usize,
+        per_retriever_items: usize,
+    ) -> Vec<(Retriever, Vec<RankedItem>)> {
+        let mut out = Vec::with_capacity(retriever_count);
+        for &r in RETRIEVERS.iter().take(retriever_count) {
+            let mut items = Vec::with_capacity(per_retriever_items);
+            for j in 0..per_retriever_items {
+                // Ids drawn from a small pool (slot 0..=5) to force
+                // overlap across retrievers.
+                let slot = (j % 6) as u64;
+                items.push(memory_item(slot, (j as u32) + 1, 0.5));
+            }
+            out.push((r, items));
+        }
+        out
+    }
+
+    fn permute<T: Clone>(v: &[T], perm: &[usize]) -> Vec<T> {
+        perm.iter().map(|&i| v[i].clone()).collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn fusion_is_order_invariant_in_outer_list(
+            retriever_count in 1usize..=3,
+            per_retriever_items in 1usize..=20,
+            // The permutation generator yields a Vec<usize> over
+            // 0..3; we trim to retriever_count post-hoc.
+            perm_seed in pvec(0usize..3, 3),
+        ) {
+            let outputs = build_outputs(retriever_count, per_retriever_items);
+
+            // Derive a deterministic permutation of `0..retriever_count`
+            // from the seed.
+            let mut perm: Vec<usize> = (0..retriever_count).collect();
+            for (i, &seed) in perm_seed.iter().enumerate().take(retriever_count) {
+                let j = seed % retriever_count;
+                perm.swap(i, j);
+            }
+
+            let baseline = fuse_rrf(
+                &outputs,
+                DEFAULT_K,
+                &PerRetrieverWeights::default(),
+            );
+            let permuted_outputs = permute(&outputs, &perm);
+            let permuted = fuse_rrf(
+                &permuted_outputs,
+                DEFAULT_K,
+                &PerRetrieverWeights::default(),
+            );
+
+            prop_assert_eq!(
+                baseline.len(),
+                permuted.len(),
+                "permutation changed result cardinality",
+            );
+
+            // Element-wise: same id, same fused_score (tie-break must
+            // be deterministic — and id-only, never input-order).
+            for (a, b) in baseline.iter().zip(permuted.iter()) {
+                prop_assert_eq!(a.id, b.id, "ordering diverged on id");
+                prop_assert!(
+                    (a.fused_score - b.fused_score).abs() < 1e-12,
+                    "score diverged: {} vs {}",
+                    a.fused_score,
+                    b.fused_score,
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn mixed_id_variants_fuse_independently() {
     let outputs = vec![

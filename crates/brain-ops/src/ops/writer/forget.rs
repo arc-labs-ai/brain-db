@@ -263,6 +263,7 @@ async fn record_and_return_forget(
                     timestamp_unix_nanos: created_at,
                     text: None,
                     knowledge_payload: None,
+                    edge_payload: None,
                     agent_id: op.agent_id,
                 },
                 wal_lsn.map(|l| l.raw()),

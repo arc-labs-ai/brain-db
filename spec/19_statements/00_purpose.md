@@ -139,6 +139,22 @@ Namespacing prevents collisions across schemas. Two deployments using `prefers` 
 
 **User-declared predicates**: declared in the schema DSL. See `21_schema_dsl/`.
 
+### Predicate origin
+
+Every interned predicate carries a `SchemaOrigin` tag indicating how it entered the registry:
+
+```rust
+enum SchemaOrigin {
+    SchemaDeclared { version: u32 },        // declared by SCHEMA_UPLOAD; subject to strict validation
+    ImplicitFromWrite { first_seen_lsn: u64 }, // interned on first STATEMENT_CREATE in open-vocabulary mode
+}
+```
+
+- `SchemaDeclared`: the predicate was introduced by a `SCHEMA_UPLOAD` at the given version. Its `kind_constraint`, `object_type_constraint`, and supersession contract are enforced; unknown qnames sent in this namespace are rejected with `PredicateNotInSchema` (0x004B).
+- `ImplicitFromWrite`: the predicate was interned the first time a `STATEMENT_CREATE` named it in a namespace without an active schema. Implicit predicates have no kind or object-type constraint and never enforce supersession on writes. Statements written against an implicit predicate carry the `IMPLICIT_PREDICATE` flag for tooling visibility.
+
+When a `SCHEMA_UPLOAD` declares a predicate whose qname already exists with `ImplicitFromWrite`, the existing `PredicateId` is preserved and the origin flips to `SchemaDeclared{version}`. Previously written statements keep their stored ids; the post-upload flagging sweep marks rows whose predicate is not in the new active schema with `OUTSIDE_ACTIVE_SCHEMA`. See `21_schema_dsl/05_versioning.md`.
+
 **Object type constraint** lets the schema enforce that, e.g., `manages` always has an `Entity<Person>` as object:
 
 ```

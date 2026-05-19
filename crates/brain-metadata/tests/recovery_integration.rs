@@ -23,7 +23,7 @@ use brain_core::{
     AgentId, ContextId, EdgeKind, EdgeOrigin, MemoryId, MemoryKind, RequestId, TxnId,
 };
 use brain_metadata::tables::checkpoint::{latest as latest_checkpoint, CHECKPOINTS_TABLE};
-use brain_metadata::tables::edge::EDGES_OUT_TABLE;
+use brain_metadata::tables::edge::EDGES_TABLE;
 use brain_metadata::tables::idempotency::IDEMPOTENCY_TABLE;
 use brain_metadata::tables::memory::{flags, MEMORIES_TABLE};
 use brain_metadata::tables::model_fingerprint::MODEL_FINGERPRINTS_TABLE;
@@ -35,7 +35,8 @@ use brain_storage::arena::file::ArenaFile;
 use brain_storage::recovery::{recover, MetadataSink};
 use brain_storage::wal::payload::{
     CheckpointBeginPayload, CheckpointEndPayload, EncodePayload, ForgetMode, ForgetPayload,
-    ForgetReason, LinkPayload, TxnAbortPayload, TxnBeginPayload, TxnCommitPayload, WalPayload,
+    ForgetReason, LinkPayload, RelationLinkPayload, RelationSupersedePayload,
+    RelationTombstonePayload, TxnAbortPayload, TxnBeginPayload, TxnCommitPayload, WalPayload,
 };
 use brain_storage::wal::record::{Lsn, WalRecord};
 use brain_storage::wal::wal::Wal;
@@ -163,9 +164,9 @@ fn scenario_a_basic_write_then_recover() {
         record(WalPayload::Encode(p2.clone()), T0 + 1),
         record(
             WalPayload::Link(LinkPayload {
-                source: id1,
-                target: id2,
-                edge_kind: EdgeKind::Caused,
+                source: brain_core::NodeRef::Memory(id1),
+                target: brain_core::NodeRef::Memory(id2),
+                edge_kind: brain_core::EdgeKindRef::Builtin(EdgeKind::Caused),
                 weight: 0.9,
                 origin: EdgeOrigin::Explicit,
             }),
@@ -194,7 +195,7 @@ fn scenario_a_basic_write_then_recover() {
         p1.text.as_bytes()
     );
     // edges
-    let out = rtxn.open_table(EDGES_OUT_TABLE).unwrap();
+    let out = rtxn.open_table(EDGES_TABLE).unwrap();
     assert_eq!(out.iter().unwrap().count(), 1);
     // idempotency
     let idem = rtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
@@ -594,9 +595,9 @@ fn run_iteration(seed: u64) {
                     Op::Link(a, b) => {
                         wal.append(record(
                             WalPayload::Link(LinkPayload {
-                                source: mid(a, 1),
-                                target: mid(b, 1),
-                                edge_kind: EdgeKind::Caused,
+                                source: brain_core::NodeRef::Memory(mid(a, 1)),
+                                target: brain_core::NodeRef::Memory(mid(b, 1)),
+                                edge_kind: brain_core::EdgeKindRef::Builtin(EdgeKind::Caused),
                                 weight: 0.5,
                                 origin: EdgeOrigin::Explicit,
                             }),
@@ -705,4 +706,138 @@ fn run_iteration(seed: u64) {
     // re-tracking, but we can spot-check: at most one slot is the
     // first encoded one (the only target Forget can have picked).
     let _ = flags::HARD_FORGOTTEN; // reference to silence dead-code if unused
+}
+
+// ---------------------------------------------------------------------------
+// Scenario H — typed-relation create / supersede / tombstone replay.
+//
+// Exercises the Phase C unified-edge recovery dispatch. Old data dirs
+// can't open under the v2 schema, so this scenario writes a WAL with
+// three first-class relation records and verifies the rebuilt edge
+// rows + sidecar metadata match the live writer's projections.
+// ---------------------------------------------------------------------------
+
+fn relid(byte: u8) -> brain_core::RelationId {
+    let mut b = [0u8; 16];
+    b[0] = 0xA0;
+    b[15] = byte;
+    brain_core::RelationId::from(b)
+}
+
+fn ent(byte: u8) -> brain_core::EntityId {
+    let mut b = [0u8; 16];
+    b[15] = byte;
+    brain_core::EntityId::from(b)
+}
+
+fn relation_link_payload(
+    rid_byte: u8,
+    from: u8,
+    to: u8,
+    supersedes: Option<brain_core::RelationId>,
+    chain_root: brain_core::RelationId,
+    evidence: Vec<MemoryId>,
+) -> RelationLinkPayload {
+    RelationLinkPayload {
+        relation_id: relid(rid_byte),
+        from: brain_core::NodeRef::Entity(ent(from)),
+        to: brain_core::NodeRef::Entity(ent(to)),
+        relation_type_id: brain_core::RelationTypeId::from(7),
+        chain_root,
+        confidence: 0.88,
+        valid_from_unix_nanos: Some(T0),
+        valid_to_unix_nanos: None,
+        supersedes,
+        evidence,
+        extractor_id: 3,
+        is_symmetric: false,
+        properties_blob: vec![],
+        agent_id: aid(1),
+    }
+}
+
+#[test]
+fn scenario_h_relation_link_supersede_tombstone_replays() {
+    use brain_metadata::tables::knowledge::relation::{
+        RELATION_BY_EVIDENCE_TABLE, RELATION_METADATA_TABLE,
+    };
+
+    let env = Env::new();
+
+    let r1 = relid(1);
+    let r2 = relid(2);
+    let r3 = relid(3);
+
+    // r1: fresh create with one evidence memory.
+    let mem_a = MemoryId::pack(1, 50, 1);
+    let mem_b = MemoryId::pack(1, 51, 1);
+    let create_a = relation_link_payload(1, 2, 3, None, r1, vec![mem_a]);
+
+    // r2: supersedes r1, two evidence memories.
+    let create_b = relation_link_payload(2, 2, 4, Some(r1), r1, vec![mem_b, mem_a]);
+
+    // r3: fresh create that will be tombstoned at the end.
+    let create_c = relation_link_payload(3, 5, 6, None, r3, vec![]);
+
+    env.write_wal_records(vec![
+        record(WalPayload::RelationLink(create_a), T0),
+        record(
+            WalPayload::RelationSupersede(RelationSupersedePayload {
+                old_relation_id: r1,
+                new: create_b,
+            }),
+            T0 + 100,
+        ),
+        record(WalPayload::RelationLink(create_c), T0 + 200),
+        record(
+            WalPayload::RelationTombstone(RelationTombstonePayload {
+                relation_id: r3,
+                reason: "stale".into(),
+                at_unix_nanos: T0 + 300,
+                agent_id: aid(2),
+            }),
+            T0 + 300,
+        ),
+    ]);
+
+    let mut arena = env.open_arena();
+    let mut meta = env.open_meta();
+    let (report, _alloc) =
+        recover(&mut arena, &env.wal_dir, SHARD_UUID, &mut meta).expect("recover");
+    assert_eq!(report.records_replayed, 4);
+    assert_eq!(report.records_discarded, 0);
+
+    let rtxn = meta.read_txn().unwrap();
+
+    // Sidecar invariants.
+    let sidecar = rtxn.open_table(RELATION_METADATA_TABLE).unwrap();
+    let m_r1 = sidecar.get(&r1.to_bytes()).unwrap().unwrap().value();
+    assert_eq!(m_r1.is_current, 0, "r1 superseded ⇒ is_current=0");
+    assert_eq!(m_r1.superseded_by_bytes, Some(r2.to_bytes()));
+    // valid_to defaults to the supersede record's timestamp when not
+    // pinned explicitly by the writer.
+    assert_eq!(m_r1.valid_to_unix_nanos, Some(T0 + 100));
+
+    let m_r2 = sidecar.get(&r2.to_bytes()).unwrap().unwrap().value();
+    assert_eq!(m_r2.is_current, 1);
+    assert_eq!(m_r2.supersedes_bytes, Some(r1.to_bytes()));
+    assert_eq!(m_r2.chain_root_bytes, r1.to_bytes());
+    assert_eq!(m_r2.version, 2);
+    assert_eq!(m_r2.evidence_inline.len(), 2);
+
+    let m_r3 = sidecar.get(&r3.to_bytes()).unwrap().unwrap().value();
+    assert_eq!(m_r3.tombstoned, 1);
+    assert_eq!(m_r3.is_current, 0);
+    assert_eq!(m_r3.tombstoned_at_unix_nanos, Some(T0 + 300));
+
+    // Unified-edge rows: r1 and r2 each contribute one edge (asymmetric
+    // typed relation = single forward row + single reverse mirror).
+    // r3 is tombstoned but the edge row stays.
+    let edges = rtxn.open_table(EDGES_TABLE).unwrap();
+    assert_eq!(edges.iter().unwrap().count(), 3);
+
+    // Evidence reverse index: r1 cites mem_a (1 row); r2 cites mem_b
+    // + mem_a (2 rows); r3 cites nothing.
+    let by_ev = rtxn.open_table(RELATION_BY_EVIDENCE_TABLE).unwrap();
+    assert_eq!(by_ev.iter().unwrap().count(), 3);
 }

@@ -97,7 +97,7 @@ fn recall_req(cue: &str, top_k: u32) -> RecallRequest {
         age_bound_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
-        strategy_hint: None,
+        strategy: None,
         include_vectors: false,
         include_edges: false,
         include_text: false,
@@ -108,7 +108,14 @@ fn recall_req(cue: &str, top_k: u32) -> RecallRequest {
 
 async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str, kind: MemoryKindWire) -> u128 {
     let req = encode_req(request_id, text, kind);
-    match dispatch(RequestBody::Encode(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap() {
+    match dispatch(
+        RequestBody::Encode(req),
+        brain_ops::RequestCaller::anonymous(),
+        &fix.ctx,
+    )
+    .await
+    .unwrap()
+    {
         ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
         other => panic!("expected Encode response, got {other:?}"),
     }
@@ -134,9 +141,13 @@ fn recall_full_pipeline_returns_top_k() {
         encode(&fix, [3; 16], "gamma", MemoryKindWire::Episodic).await;
 
         let frame = unwrap_recall_resp(
-            dispatch(RequestBody::Recall(recall_req("alpha", 2)), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-                .await
-                .unwrap(),
+            dispatch(
+                RequestBody::Recall(recall_req("alpha", 2)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
         );
         assert!(frame.is_final);
         assert_eq!(frame.results.len(), 2, "k=2 → exactly 2 results");
@@ -175,9 +186,13 @@ fn recall_empty_index_returns_empty_frame() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let frame = unwrap_recall_resp(
-            dispatch(RequestBody::Recall(recall_req("nothing", 10)), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-                .await
-                .unwrap(),
+            dispatch(
+                RequestBody::Recall(recall_req("nothing", 10)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
         );
         assert!(frame.results.is_empty());
         assert!(frame.is_final);
@@ -201,9 +216,13 @@ fn recall_k_truncation() {
             encode(&fix, req_id, &text, MemoryKindWire::Episodic).await;
         }
         let frame = unwrap_recall_resp(
-            dispatch(RequestBody::Recall(recall_req("doc-2", 3)), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-                .await
-                .unwrap(),
+            dispatch(
+                RequestBody::Recall(recall_req("doc-2", 3)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
         );
         assert_eq!(frame.results.len(), 3, "k=3 → exactly 3 results");
     })
@@ -224,7 +243,15 @@ fn recall_kind_filter_rejects_off_kind_hits() {
 
         let mut req = recall_req("ep-a", 10);
         req.kind_filter = Some(vec![MemoryKindWire::Semantic]);
-        let frame = unwrap_recall_resp(dispatch(RequestBody::Recall(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
 
         assert!(
             !frame.results.is_empty(),
@@ -256,7 +283,15 @@ fn recall_confidence_floor_drops_low_score_hits() {
         let mut req = recall_req("totally-unrelated-query-xyz", 10);
         // 0.999 is so strict that the unrelated cue should drop everything.
         req.confidence_threshold = 0.999;
-        let frame = unwrap_recall_resp(dispatch(RequestBody::Recall(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
         for r in &frame.results {
             assert!(
                 r.similarity_score >= 0.999,
@@ -276,9 +311,13 @@ fn recall_invalid_top_k_returns_plan_error() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let req = recall_req("anything", 0);
-        let err = dispatch(RequestBody::Recall(req), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-            .await
-            .unwrap_err();
+        let err = dispatch(
+            RequestBody::Recall(req),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, OpError::PlanError(_)),
             "top_k=0 is a planner validation failure, got {err:?}"
@@ -300,7 +339,9 @@ fn recall_include_text_false_returns_empty_text_field() {
 
         let frame = unwrap_recall_resp(
             dispatch(
-                RequestBody::Recall(recall_req("alpha-text-rev0", 2)), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Recall(recall_req("alpha-text-rev0", 2)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -320,7 +361,7 @@ fn recall_include_text_false_returns_empty_text_field() {
 fn recall_include_text_true_returns_stored_text() {
     run_in_glommio(|| async {
         let fix = build_fixture();
-        let ids = vec![
+        let ids = [
             (
                 encode(&fix, [50; 16], "alpha-text-rev1", MemoryKindWire::Episodic).await,
                 "alpha-text-rev1",
@@ -338,8 +379,15 @@ fn recall_include_text_true_returns_stored_text() {
 
         let mut req = recall_req("alpha-text-rev1", 3);
         req.include_text = true;
-        let frame =
-            unwrap_recall_resp(dispatch(RequestBody::Recall(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
 
         assert_eq!(frame.results.len(), 3);
         for r in &frame.results {
@@ -349,6 +397,41 @@ fn recall_include_text_true_returns_stored_text() {
                 "include_text=true must return the exact UTF-8 we encoded",
             );
         }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// HybridOnly strategy errors when a retriever slot is missing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recall_hybrid_only_errors_when_retriever_missing() {
+    // The test fixture wires no semantic / lexical / graph
+    // retriever (all `Option<Arc<dyn …>>` start as `None`). A
+    // client asking for HybridOnly must see an explicit
+    // HybridUnavailable error, not silently degrade to
+    // substrate.
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        // Seed one memory so the substrate path isn't trivially
+        // empty — we want to be sure the error comes from the
+        // strategy guard, not from "nothing to recall".
+        encode(&fix, [9; 16], "anything", MemoryKindWire::Episodic).await;
+
+        let mut req = recall_req("anything", 5);
+        req.strategy = Some(brain_protocol::request::RecallStrategy::HybridOnly);
+        let err = dispatch(
+            RequestBody::Recall(req),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .expect_err("HybridOnly without retrievers must error");
+        assert!(
+            matches!(err, OpError::HybridUnavailable(_)),
+            "expected HybridUnavailable, got {err:?}",
+        );
+        assert_eq!(err.error_code(), ErrorCode::HybridUnavailable);
     })
 }
 
@@ -387,7 +470,9 @@ fn recall_with_real_embedder_end_to_end() {
 
         let frame = unwrap_recall_resp(
             dispatch(
-                RequestBody::Recall(recall_req("a cat resting on a rug", 2)), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Recall(recall_req("a cat resting on a rug", 2)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),

@@ -122,7 +122,13 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
             request_id,
             txn_id: None,
         };
-        let _ = dispatch(RequestBody::Link(req), brain_ops::RequestCaller::anonymous(), &ctx).await.unwrap();
+        let _ = dispatch(
+            RequestBody::Link(req),
+            brain_ops::RequestCaller::anonymous(),
+            &ctx,
+        )
+        .await
+        .unwrap();
     }
 
     Fixture {
@@ -164,7 +170,15 @@ fn plan_full_pipeline_returns_path() {
     run_in_glommio(|| async {
         let fix = build_fixture(3, &[(0, EdgeKind::Caused, 1), (1, EdgeKind::FollowedBy, 2)]).await;
         let req = plan_request(fix.ids[0], fix.ids[2], 4);
-        let frame = unwrap_plan_resp(dispatch(RequestBody::Plan(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
+        let frame = unwrap_plan_resp(
+            dispatch(
+                RequestBody::Plan(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
 
         assert!(frame.is_final);
         assert_eq!(frame.plan_status, Some(WirePlanStatus::GoalReached));
@@ -187,7 +201,15 @@ fn plan_no_path_returns_no_path_status() {
     run_in_glommio(|| async {
         let fix = build_fixture(3, &[(0, EdgeKind::Caused, 1)]).await;
         let req = plan_request(fix.ids[0], fix.ids[2], 4);
-        let frame = unwrap_plan_resp(dispatch(RequestBody::Plan(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
+        let frame = unwrap_plan_resp(
+            dispatch(
+                RequestBody::Plan(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
         assert!(frame.steps.is_empty());
         assert_eq!(frame.plan_status, Some(WirePlanStatus::NoPathFound));
     })
@@ -202,7 +224,15 @@ fn plan_step_transitions_map_correctly() {
     run_in_glommio(|| async {
         let fix = build_fixture(2, &[(0, EdgeKind::Caused, 1)]).await;
         let req = plan_request(fix.ids[0], fix.ids[1], 2);
-        let frame = unwrap_plan_resp(dispatch(RequestBody::Plan(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
+        let frame = unwrap_plan_resp(
+            dispatch(
+                RequestBody::Plan(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
         assert_eq!(frame.steps[0].transition_kind, TransitionKind::Initial);
         assert_eq!(frame.steps[1].transition_kind, TransitionKind::Causal);
     })
@@ -218,9 +248,13 @@ fn plan_invalid_budget_returns_plan_error() {
         let fix = build_fixture(2, &[(0, EdgeKind::Caused, 1)]).await;
         let mut req = plan_request(fix.ids[0], fix.ids[1], 0);
         req.budget.max_steps = 0;
-        let err = dispatch(RequestBody::Plan(req), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-            .await
-            .unwrap_err();
+        let err = dispatch(
+            RequestBody::Plan(req),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, OpError::PlanError(_)),
             "max_steps=0 must be a planner validation failure, got {err:?}"
@@ -240,7 +274,15 @@ fn plan_by_memory_id_skips_recall() {
         // Plan with ByMemoryId on both endpoints; even though the
         // dispatcher is a no-op, the executor should not need to embed.
         let req = plan_request(fix.ids[0], fix.ids[1], 2);
-        let frame = unwrap_plan_resp(dispatch(RequestBody::Plan(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
+        let frame = unwrap_plan_resp(
+            dispatch(
+                RequestBody::Plan(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
         assert_eq!(frame.plan_status, Some(WirePlanStatus::GoalReached));
         assert_eq!(frame.steps.len(), 2);
         let id0: u128 = fix.ids[0].into();

@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use brain_metadata::schema_store::schema_namespaces;
+use brain_metadata::system_schema::SYSTEM_SCHEMA_NAMESPACE;
 use brain_metadata::MetadataDb;
 
 use crate::error::OpError;
@@ -44,15 +45,20 @@ impl SchemaGate {
     }
 
     /// Read the per-shard `schema_namespaces` list and return a
-    /// gate seeded from it — `true` iff at least one namespace has
-    /// an active schema version.
+    /// gate seeded from it — `true` iff at least one *user-declared*
+    /// namespace has an active schema version. The reserved
+    /// `brain` namespace (seeded at `MetadataDb::open`) is excluded
+    /// because the gate's purpose is to detect that the operator
+    /// has uploaded a real schema and the hybrid path should
+    /// activate.
     pub fn initial(metadata: &MetadataDb) -> Result<Self, OpError> {
         let rtxn = metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("schema_gate read_txn: {e}")))?;
         let namespaces = schema_namespaces(&rtxn)
             .map_err(|e| OpError::Internal(format!("schema_gate query: {e}")))?;
-        Ok(Self::new(!namespaces.is_empty()))
+        let user_declared = namespaces.iter().any(|n| n != SYSTEM_SCHEMA_NAMESPACE);
+        Ok(Self::new(user_declared))
     }
 
     /// Lock-free read. Used on the RECALL hot path.

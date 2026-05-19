@@ -187,7 +187,12 @@ impl<'a> SubscribeBuilder<'a> {
                     )),
                 },
             );
-        Ok(FrameStream::new(guard, stream_id, Opcode::SubscribeEvent, decoder))
+        Ok(FrameStream::new(
+            guard,
+            stream_id,
+            Opcode::SubscribeEvent,
+            decoder,
+        ))
     }
 }
 

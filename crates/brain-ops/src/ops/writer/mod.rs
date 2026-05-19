@@ -39,7 +39,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind, ShardId};
 use brain_index::Writer as HnswWriter;
 use brain_metadata::tables::edge::{
-    self, derived_by, origin, EdgeData, EDGES_IN_TABLE, EDGES_OUT_TABLE,
+    self, derived_by, origin, zero_disambiguator, EdgeData, EdgeKey, EDGES_REVERSE_TABLE,
+    EDGES_TABLE,
 };
 use brain_metadata::tables::idempotency::{IdempotencyEntry, IDEMPOTENCY_TABLE};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
@@ -95,7 +96,48 @@ pub struct RealWriterHandle {
     /// "redb-first, EventBus mints LSN" path used by unit tests that
     /// don't spin up a shard.
     wal_sink: Option<Arc<dyn wal_sink::WalSink>>,
+    /// Optional non-blocking sender feeding the per-shard
+    /// AutoEdgeWorker. Each successful ENCODE enqueues
+    /// `(memory_id, vector)` post-fsync + post-commit + post-HNSW; the
+    /// worker drains the channel and writes SimilarTo edges back into
+    /// the unified edge tables. `None` means the worker isn't wired
+    /// (substrate-only test fixtures); enqueue becomes a no-op.
+    auto_edge_tx: Option<flume::Sender<AutoEdgeEnqueue>>,
+    /// Optional non-blocking sender feeding the per-shard
+    /// ExtractorWorker. Each successful ENCODE enqueues
+    /// `(memory_id, text)` post-WAL-fsync + post-commit + post-HNSW;
+    /// the worker drains the channel and runs the three-tier
+    /// extractor pipeline against the text. `None` means the worker
+    /// isn't wired (substrate-only test fixtures); enqueue becomes
+    /// a no-op. The `Arc<str>` keeps the payload cheap to push and
+    /// avoids the worker re-reading text from the metadata DB on a
+    /// hot path.
+    extractor_tx: Option<flume::Sender<ExtractorEnqueue>>,
+    /// Shared metric handle for the AutoEdgeWorker family. When
+    /// wired (production), `try_enqueue_auto_edge` bumps `drops_total`
+    /// on `Full`. The worker holds the same `Arc` and publishes
+    /// edges-written / cycle-duration / neighbours-found into it.
+    /// `None` in test fixtures that don't care about observability.
+    auto_edge_metrics: Option<Arc<crate::worker_metrics::AutoEdgeMetrics>>,
+    /// Companion to [`Self::auto_edge_metrics`] for the extractor
+    /// pipeline. Writer bumps `drops_total`; worker publishes the
+    /// rest.
+    extractor_metrics: Option<Arc<crate::worker_metrics::ExtractorMetrics>>,
 }
+
+/// What the writer pushes into the AutoEdgeWorker's channel after a
+/// successful ENCODE. The vector is carried inline so the worker can
+/// run `HNSW.search_active` without re-reading from arena or HNSW (the
+/// HNSW reader has no public vector accessor, and arena reads would
+/// require crossing the storage boundary into the worker).
+pub type AutoEdgeEnqueue = (brain_core::MemoryId, [f32; brain_embed::VECTOR_DIM]);
+
+/// What the writer pushes into the ExtractorWorker's channel after a
+/// successful ENCODE. Text travels inline as an `Arc<str>` so the
+/// worker can clone cheaply across cycles without re-reading the
+/// row from redb (which would re-cross the metadata lock on the
+/// extractor's hot path).
+pub type ExtractorEnqueue = (brain_core::MemoryId, std::sync::Arc<str>);
 
 impl RealWriterHandle {
     #[must_use]
@@ -111,8 +153,8 @@ impl RealWriterHandle {
             if let Ok(wtxn) = db.write_txn() {
                 let _ = wtxn.open_table(MEMORIES_TABLE);
                 let _ = wtxn.open_table(IDEMPOTENCY_TABLE);
-                let _ = wtxn.open_table(EDGES_OUT_TABLE);
-                let _ = wtxn.open_table(EDGES_IN_TABLE);
+                let _ = wtxn.open_table(EDGES_TABLE);
+                let _ = wtxn.open_table(EDGES_REVERSE_TABLE);
                 let _ = wtxn.commit();
             }
         }
@@ -125,6 +167,10 @@ impl RealWriterHandle {
             shard_id: 0,
             events: None,
             wal_sink: None,
+            auto_edge_tx: None,
+            extractor_tx: None,
+            auto_edge_metrics: None,
+            extractor_metrics: None,
         }
     }
 
@@ -164,6 +210,70 @@ impl RealWriterHandle {
         self
     }
 
+    /// Wire the AutoEdgeWorker's feed channel. After this call every
+    /// successful ENCODE enqueues `(memory_id, vector)` into the
+    /// channel post-fsync + post-commit + post-HNSW. Without this call
+    /// the enqueue path is a no-op and no auto-derived edges are
+    /// produced — operators using a substrate-only deployment skip
+    /// this step.
+    ///
+    /// The channel must be bounded; on `Full` the writer logs a warn
+    /// and drops the enqueue (encode still succeeds — auto-edges are
+    /// best-effort). On `Disconnected` the writer logs at debug and
+    /// continues.
+    pub fn set_auto_edge_sender(&mut self, sender: flume::Sender<AutoEdgeEnqueue>) {
+        self.auto_edge_tx = Some(sender);
+    }
+
+    /// Accessor for the auto-edge sender so the encode + batch paths
+    /// can call `try_send` without re-borrowing the whole writer.
+    pub(super) fn auto_edge_sender(&self) -> Option<&flume::Sender<AutoEdgeEnqueue>> {
+        self.auto_edge_tx.as_ref()
+    }
+
+    /// Wire the ExtractorWorker's feed channel. After this call every
+    /// successful ENCODE enqueues `(memory_id, text)` post-fsync +
+    /// post-commit + post-HNSW. Without this call the enqueue path is
+    /// a no-op and no auto-extraction happens — operators running a
+    /// substrate-only deployment skip this step.
+    ///
+    /// Channel must be bounded; on `Full` the writer logs a warn and
+    /// drops the enqueue (encode still succeeds — extraction is best-
+    /// effort). On `Disconnected` the writer logs at debug.
+    pub fn set_extractor_sender(&mut self, sender: flume::Sender<ExtractorEnqueue>) {
+        self.extractor_tx = Some(sender);
+    }
+
+    /// Accessor for the extractor sender so the encode + batch paths
+    /// can call `try_send` without re-borrowing the whole writer.
+    pub(super) fn extractor_sender(&self) -> Option<&flume::Sender<ExtractorEnqueue>> {
+        self.extractor_tx.as_ref()
+    }
+
+    /// Install the shared `AutoEdgeMetrics` handle. The same `Arc`
+    /// must be threaded to the matching `AutoEdgeWorker` so both
+    /// sides see the same counters. Drop counters become visible to
+    /// `/metrics` as soon as this is wired.
+    pub fn set_auto_edge_metrics(&mut self, metrics: Arc<crate::worker_metrics::AutoEdgeMetrics>) {
+        self.auto_edge_metrics = Some(metrics);
+    }
+
+    pub(super) fn auto_edge_metrics(&self) -> Option<&Arc<crate::worker_metrics::AutoEdgeMetrics>> {
+        self.auto_edge_metrics.as_ref()
+    }
+
+    /// Install the shared `ExtractorMetrics` handle. Same semantics
+    /// as [`Self::set_auto_edge_metrics`].
+    pub fn set_extractor_metrics(&mut self, metrics: Arc<crate::worker_metrics::ExtractorMetrics>) {
+        self.extractor_metrics = Some(metrics);
+    }
+
+    pub(super) fn extractor_metrics(
+        &self,
+    ) -> Option<&Arc<crate::worker_metrics::ExtractorMetrics>> {
+        self.extractor_metrics.as_ref()
+    }
+
     /// Publish an event. When a WAL sink is wired, callers pass
     /// `Some(lsn)` so the envelope carries the WAL-assigned LSN
     /// instead of the bus's internal allocator stamp.
@@ -180,7 +290,6 @@ impl RealWriterHandle {
             }
         }
     }
-
 }
 
 fn now_unix_nanos() -> u64 {
@@ -237,6 +346,30 @@ impl WriterHandle for RealWriterHandle {
 
     fn agent_id(&self) -> AgentId {
         self.agent_id
+    }
+
+    fn enqueue_for_extraction(&self, memory_id: MemoryId, text: &str) -> bool {
+        let Some(sender) = self.extractor_sender() else {
+            return false;
+        };
+        let payload: ExtractorEnqueue = (memory_id, std::sync::Arc::from(text));
+        match sender.try_send(payload) {
+            Ok(()) => true,
+            Err(flume::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    memory_id = ?memory_id,
+                    "extract_backfill: extractor channel full; dropping enqueue"
+                );
+                false
+            }
+            Err(flume::TrySendError::Disconnected(_)) => {
+                tracing::debug!(
+                    memory_id = ?memory_id,
+                    "extract_backfill: extractor worker disconnected"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -344,10 +477,8 @@ async fn do_submit_batch(
     if let Some(sink) = &writer.wal_sink {
         let agent_bytes: [u8; 16] = writer.agent_id.into();
         let agent_id_lo64 = u64::from_be_bytes(agent_bytes[8..16].try_into().unwrap());
-        let stage_count = batch.memories.len()
-            + batch.links.len()
-            + batch.unlinks.len()
-            + batch.forgets.len();
+        let stage_count =
+            batch.memories.len() + batch.links.len() + batch.unlinks.len() + batch.forgets.len();
         let begin_ts = now_unix_nanos();
         let begin = WalPayload::TxnBegin(WalTxnBeginPayload {
             txn_id,
@@ -380,9 +511,9 @@ async fn do_submit_batch(
                 .edges
                 .iter()
                 .map(|e| WalEdgePayload {
-                    source: enc.memory_id,
-                    target: e.target,
-                    kind: e.kind,
+                    source: brain_core::NodeRef::Memory(enc.memory_id),
+                    target: brain_core::NodeRef::Memory(e.target),
+                    kind: brain_core::EdgeKindRef::Builtin(e.kind),
                     weight: e.weight,
                     origin: brain_core::EdgeOrigin::Explicit,
                 })
@@ -416,9 +547,9 @@ async fn do_submit_batch(
         }
         for link in &batch.links {
             let payload = WalPayload::Link(WalLinkPayload {
-                source: link.source,
-                target: link.target,
-                edge_kind: link.kind,
+                source: brain_core::NodeRef::Memory(link.source),
+                target: brain_core::NodeRef::Memory(link.target),
+                edge_kind: brain_core::EdgeKindRef::Builtin(link.kind),
                 weight: link.weight,
                 origin: brain_core::EdgeOrigin::Explicit,
             });
@@ -436,9 +567,9 @@ async fn do_submit_batch(
         }
         for unlink in &batch.unlinks {
             let payload = WalPayload::Unlink(WalUnlinkPayload {
-                source: unlink.source,
-                target: unlink.target,
-                edge_kind: unlink.kind,
+                source: brain_core::NodeRef::Memory(unlink.source),
+                target: brain_core::NodeRef::Memory(unlink.target),
+                edge_kind: brain_core::EdgeKindRef::Builtin(unlink.kind),
                 edge_seq: 0,
             });
             let lsn = sink
@@ -553,12 +684,12 @@ async fn do_submit_batch(
             let mut memories_t = wtxn
                 .open_table(MEMORIES_TABLE)
                 .map_err(|e| WriterError::Internal(format!("batch open MEMORIES: {e:?}")))?;
-            let mut edges_out_t = wtxn
-                .open_table(EDGES_OUT_TABLE)
-                .map_err(|e| WriterError::Internal(format!("batch open EDGES_OUT: {e:?}")))?;
-            let mut edges_in_t = wtxn
-                .open_table(EDGES_IN_TABLE)
-                .map_err(|e| WriterError::Internal(format!("batch open EDGES_IN: {e:?}")))?;
+            let mut edges_t = wtxn
+                .open_table(EDGES_TABLE)
+                .map_err(|e| WriterError::Internal(format!("batch open EDGES: {e:?}")))?;
+            let mut edges_rev_t = wtxn
+                .open_table(EDGES_REVERSE_TABLE)
+                .map_err(|e| WriterError::Internal(format!("batch open EDGES_REVERSE: {e:?}")))?;
             let mut idem_t = wtxn
                 .open_table(IDEMPOTENCY_TABLE)
                 .map_err(|e| WriterError::Internal(format!("batch open IDEMPOTENCY: {e:?}")))?;
@@ -598,11 +729,12 @@ async fn do_submit_batch(
                         enc.created_at_unix_nanos,
                     );
                     edge::link(
-                        &mut edges_out_t,
-                        &mut edges_in_t,
-                        enc.memory_id,
-                        edge.kind,
-                        edge.target,
+                        &mut edges_t,
+                        &mut edges_rev_t,
+                        brain_core::NodeRef::Memory(enc.memory_id),
+                        brain_core::EdgeKindRef::Builtin(edge.kind),
+                        brain_core::NodeRef::Memory(edge.target),
+                        zero_disambiguator(),
                         &data,
                     )
                     .map_err(|e| WriterError::Internal(format!("batch edge::link: {e:?}")))?;
@@ -651,7 +783,11 @@ async fn do_submit_batch(
                     payload,
                     enc.request_hash,
                     enc.created_at_unix_nanos,
-                    wal_lsn_for_encode.get(enc_idx).copied().flatten().unwrap_or(0),
+                    wal_lsn_for_encode
+                        .get(enc_idx)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(0),
                 );
                 idem_t
                     .insert(<[u8; 16]>::from(enc.request_id), entry)
@@ -726,13 +862,15 @@ async fn do_submit_batch(
                         link.target.raw()
                     )));
                 }
-                let key = (
-                    link.source.to_be_bytes(),
-                    link.kind as u8,
-                    link.target.to_be_bytes(),
-                );
-                let already_existed = edges_out_t
-                    .get(&key)
+                let key = EdgeKey {
+                    from: brain_core::NodeRef::Memory(link.source),
+                    kind: brain_core::EdgeKindRef::Builtin(link.kind),
+                    to: brain_core::NodeRef::Memory(link.target),
+                    disambiguator: zero_disambiguator(),
+                }
+                .encode();
+                let already_existed = edges_t
+                    .get(key.as_slice())
                     .map_err(|e| WriterError::Internal(format!("batch get edge: {e:?}")))?
                     .is_some();
                 let data = EdgeData::new(
@@ -742,11 +880,12 @@ async fn do_submit_batch(
                     link.created_at_unix_nanos,
                 );
                 edge::link(
-                    &mut edges_out_t,
-                    &mut edges_in_t,
-                    link.source,
-                    link.kind,
-                    link.target,
+                    &mut edges_t,
+                    &mut edges_rev_t,
+                    brain_core::NodeRef::Memory(link.source),
+                    brain_core::EdgeKindRef::Builtin(link.kind),
+                    brain_core::NodeRef::Memory(link.target),
+                    zero_disambiguator(),
                     &data,
                 )
                 .map_err(|e| WriterError::Internal(format!("batch link insert: {e:?}")))?;
@@ -762,7 +901,11 @@ async fn do_submit_batch(
                     payload,
                     link.request_hash,
                     link.created_at_unix_nanos,
-                    wal_lsn_for_link.get(link_idx).copied().flatten().unwrap_or(0),
+                    wal_lsn_for_link
+                        .get(link_idx)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(0),
                 );
                 idem_t
                     .insert(<[u8; 16]>::from(link.request_id), entry)
@@ -783,11 +926,12 @@ async fn do_submit_batch(
             // 3. UNLINKs.
             for (unlink_idx, unlink) in batch.unlinks.iter().enumerate() {
                 let removed = edge::unlink(
-                    &mut edges_out_t,
-                    &mut edges_in_t,
-                    unlink.source,
-                    unlink.kind,
-                    unlink.target,
+                    &mut edges_t,
+                    &mut edges_rev_t,
+                    brain_core::NodeRef::Memory(unlink.source),
+                    brain_core::EdgeKindRef::Builtin(unlink.kind),
+                    brain_core::NodeRef::Memory(unlink.target),
+                    zero_disambiguator(),
                 )
                 .map_err(|e| WriterError::Internal(format!("batch unlink: {e:?}")))?;
                 if removed {
@@ -801,7 +945,11 @@ async fn do_submit_batch(
                     payload,
                     unlink.request_hash,
                     unlink.created_at_unix_nanos,
-                    wal_lsn_for_unlink.get(unlink_idx).copied().flatten().unwrap_or(0),
+                    wal_lsn_for_unlink
+                        .get(unlink_idx)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(0),
                 );
                 idem_t
                     .insert(<[u8; 16]>::from(unlink.request_id), entry)
@@ -882,7 +1030,11 @@ async fn do_submit_batch(
                     payload,
                     forget.request_hash,
                     forget.created_at_unix_nanos,
-                    wal_lsn_for_forget.get(forget_idx).copied().flatten().unwrap_or(0),
+                    wal_lsn_for_forget
+                        .get(forget_idx)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(0),
                 );
                 idem_t
                     .insert(<[u8; 16]>::from(forget.request_id), entry)
@@ -913,6 +1065,18 @@ async fn do_submit_batch(
                 .map_err(|e| WriterError::Internal(format!("batch hnsw tombstone: {e:?}")))?;
         }
     }
+    // Auto-edge enqueue once HNSW catches up to redb — the worker
+    // searches the same shared index after this point and would see
+    // the new memory by id.
+    for (id, vector) in &hnsw_inserts {
+        try_enqueue_auto_edge(writer, *id, vector);
+    }
+    // Extractor enqueue mirrors the auto-edge enqueue: post-durability,
+    // post-HNSW, and one push per memory in the batch. The text comes
+    // straight from the batch entry — no metadata re-read.
+    for enc in &batch.memories {
+        try_enqueue_extractor(writer, enc.memory_id, &enc.text);
+    }
     {
         let mut tombstoned = writer.tombstoned.lock();
         for id in &hnsw_tombstones {
@@ -935,6 +1099,7 @@ async fn do_submit_batch(
                 timestamp_unix_nanos: ev.timestamp_unix_nanos,
                 text: ev.text,
                 knowledge_payload: None,
+                edge_payload: None,
                 agent_id: ev.agent_id,
             },
             ev.wal_lsn,
@@ -949,7 +1114,80 @@ async fn do_submit_batch(
     })
 }
 
+/// Enqueue `(memory_id, vector)` onto the AutoEdgeWorker channel if
+/// one is wired. Non-blocking; full channel logs a warn and drops
+/// (encode succeeds without auto-edges). Disconnected channel logs at
+/// debug. This is the single enqueue point both the single-encode and
+/// TXN batch paths route through.
+pub(super) fn try_enqueue_auto_edge(
+    writer: &RealWriterHandle,
+    memory_id: MemoryId,
+    vector: &[f32; brain_embed::VECTOR_DIM],
+) {
+    let Some(sender) = writer.auto_edge_sender() else {
+        return;
+    };
+    match sender.try_send((memory_id, *vector)) {
+        Ok(()) => {
+            tracing::trace!(
+                memory_id = ?memory_id,
+                "auto_edge enqueue"
+            );
+        }
+        Err(flume::TrySendError::Full(_)) => {
+            if let Some(m) = writer.auto_edge_metrics() {
+                m.inc_drop();
+            }
+            tracing::warn!(
+                memory_id = ?memory_id,
+                "auto_edge channel full; dropping enqueue"
+            );
+        }
+        Err(flume::TrySendError::Disconnected(_)) => {
+            tracing::debug!(
+                memory_id = ?memory_id,
+                "auto_edge worker disconnected; encode continues"
+            );
+        }
+    }
+}
+
 // Silence unused-import warnings when EdgeKind is referenced only
 // inside conditional code paths.
 #[allow(dead_code)]
 fn _kind_use(_: EdgeKind) {}
+
+/// Enqueue `(memory_id, text)` onto the ExtractorWorker channel if
+/// one is wired. Non-blocking; full channel logs a warn and drops
+/// (encode succeeds without extraction). Disconnected channel logs
+/// at debug. This is the single enqueue point both the single-encode
+/// and TXN batch paths route through.
+pub(super) fn try_enqueue_extractor(writer: &RealWriterHandle, memory_id: MemoryId, text: &str) {
+    let Some(sender) = writer.extractor_sender() else {
+        return;
+    };
+    let payload: ExtractorEnqueue = (memory_id, std::sync::Arc::from(text));
+    match sender.try_send(payload) {
+        Ok(()) => {
+            tracing::trace!(
+                memory_id = ?memory_id,
+                "extractor enqueue"
+            );
+        }
+        Err(flume::TrySendError::Full(_)) => {
+            if let Some(m) = writer.extractor_metrics() {
+                m.inc_drop();
+            }
+            tracing::warn!(
+                memory_id = ?memory_id,
+                "extractor channel full; dropping enqueue"
+            );
+        }
+        Err(flume::TrySendError::Disconnected(_)) => {
+            tracing::debug!(
+                memory_id = ?memory_id,
+                "extractor worker disconnected; encode continues"
+            );
+        }
+    }
+}

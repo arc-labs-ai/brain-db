@@ -96,7 +96,10 @@ impl WorkerCheckpointRow {
     }
 }
 
-impl_redb_rkyv_value!(WorkerCheckpointRow, "brain_metadata::WorkerCheckpointRow::v1");
+impl_redb_rkyv_value!(
+    WorkerCheckpointRow,
+    "brain_metadata::WorkerCheckpointRow::v1"
+);
 
 // ---------------------------------------------------------------------------
 // Pure ops over a transaction.

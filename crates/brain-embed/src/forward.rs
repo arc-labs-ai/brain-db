@@ -56,7 +56,7 @@ pub fn l2_normalize_in_place(v: &mut [f32; VECTOR_DIM]) -> f32 {
 /// L2-normalise per row, return one unit vector per batch row.
 ///
 /// Rejects rows whose output contains NaN/Inf or whose pre-normalisation
-/// norm is below [`ZERO_NORM_EPS`] (spec §04/04 §8–§9).
+/// norm is below the configured zero-norm threshold (spec §04/04 §8–§9).
 pub fn forward_pooled(
     handle: &ModelHandle,
     tokens: &Tokenized,

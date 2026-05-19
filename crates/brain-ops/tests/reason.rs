@@ -108,7 +108,13 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
             request_id,
             txn_id: None,
         };
-        let _ = dispatch(RequestBody::Link(req), brain_ops::RequestCaller::anonymous(), &ctx).await.unwrap();
+        let _ = dispatch(
+            RequestBody::Link(req),
+            brain_ops::RequestCaller::anonymous(),
+            &ctx,
+        )
+        .await
+        .unwrap();
     }
 
     Fixture {
@@ -155,7 +161,15 @@ fn reason_full_pipeline_emits_one_inference() {
         )
         .await;
         let req = reason_req(ObservationInput::ByMemoryId(fix.ids[0].into()), 2, 10);
-        let frame = unwrap_reason(dispatch(RequestBody::Reason(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
+        let frame = unwrap_reason(
+            dispatch(
+                RequestBody::Reason(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
 
         assert!(frame.is_final);
         assert_eq!(frame.reason_status, Some(WireReasonStatus::Complete));
@@ -181,7 +195,15 @@ fn reason_isolated_base_returns_only_self() {
     run_in_glommio(|| async {
         let fix = build_fixture(1, &[]).await;
         let req = reason_req(ObservationInput::ByMemoryId(fix.ids[0].into()), 2, 10);
-        let frame = unwrap_reason(dispatch(RequestBody::Reason(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
+        let frame = unwrap_reason(
+            dispatch(
+                RequestBody::Reason(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
         let inf = &frame.inferences[0];
         assert_eq!(inf.supporting_memories.len(), 1);
         assert!(inf.contradicting_memories.is_empty());
@@ -200,9 +222,13 @@ fn reason_invalid_depth_returns_plan_error() {
     run_in_glommio(|| async {
         let fix = build_fixture(1, &[]).await;
         let req = reason_req(ObservationInput::ByMemoryId(fix.ids[0].into()), 0, 5);
-        let err = dispatch(RequestBody::Reason(req), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-            .await
-            .unwrap_err();
+        let err = dispatch(
+            RequestBody::Reason(req),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, OpError::PlanError(_)),
             "depth=0 must be a planner validation failure, got {err:?}"
@@ -220,7 +246,15 @@ fn reason_kind_categorisation_uses_evidence_accumulation() {
     run_in_glommio(|| async {
         let fix = build_fixture(2, &[(0, EdgeKind::Supports, 1)]).await;
         let req = reason_req(ObservationInput::ByMemoryId(fix.ids[0].into()), 2, 10);
-        let frame = unwrap_reason(dispatch(RequestBody::Reason(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
+        let frame = unwrap_reason(
+            dispatch(
+                RequestBody::Reason(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
         assert_eq!(
             frame.inferences[0].inference_kind,
             InferenceKind::EvidenceAccumulation
@@ -237,7 +271,15 @@ fn reason_by_text_preserves_claim() {
     run_in_glommio(|| async {
         let fix = build_fixture(1, &[]).await;
         let req = reason_req(ObservationInput::ByText("is the sky blue?".into()), 2, 5);
-        let frame = unwrap_reason(dispatch(RequestBody::Reason(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
+        let frame = unwrap_reason(
+            dispatch(
+                RequestBody::Reason(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
         let inf = &frame.inferences[0];
         assert_eq!(inf.claim, "is the sky blue?");
         // Empty index + NopDispatcher → no base, no evidence.

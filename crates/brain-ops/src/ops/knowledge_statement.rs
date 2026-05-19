@@ -22,11 +22,17 @@
 
 use brain_core::knowledge::{Statement, TombstoneReason};
 use brain_core::{EntityId, PredicateId, StatementId, StatementKind};
-use brain_metadata::predicate_ops::{predicate_get, predicate_lookup_by_qname, PredicateOpError};
+use brain_metadata::predicate_ops::{
+    predicate_get, predicate_intern_or_get, predicate_lookup_by_qname, PredicateOpError,
+};
+use brain_metadata::schema_store::schema_active;
 use brain_metadata::statement_ops::{
     evidence_overflow_load, statement_create, statement_get, statement_history, statement_list,
     statement_retract, statement_supersede, statement_tombstone, StatementListFilter,
     StatementOpError,
+};
+use brain_metadata::tables::knowledge::statement::{
+    statement_flags, StatementMetadata, STATEMENTS_TABLE,
 };
 use brain_protocol::knowledge::{
     statement_kind_from_wire, KnowledgeEventPayload, StatementCreateRequest,
@@ -76,12 +82,47 @@ pub async fn handle_statement_create(
             .write_txn()
             .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
 
-        let predicate =
-            predicate_lookup_by_qname_wtxn(&wtxn, namespace, name)?.ok_or_else(|| {
-                OpError::InvalidRequest(format!(
-                    "unknown predicate {namespace:?}:{name:?}; declare it via SCHEMA_UPLOAD first"
-                ))
-            })?;
+        // Resolve the predicate. Schema-strict mode requires the
+        // predicate to be in the active schema vocabulary; schemaless
+        // mode interns unknown predicates on the spot. The "active
+        // schema version" lookup is per-namespace — the user can be
+        // schemaless in one namespace and strict in another.
+        let active_version = schema_active_in_wtxn(&wtxn, namespace)?;
+        let (predicate_id, implicit_predicate) = if let Some(version) = active_version {
+            // Strict: predicate qname MUST resolve to a row that's in
+            // the schema's vocabulary.
+            let pred =
+                predicate_lookup_by_qname_wtxn(&wtxn, namespace, name)?.ok_or_else(|| {
+                    OpError::PredicateNotInSchema {
+                        predicate: req.predicate.clone(),
+                        namespace: namespace.to_string(),
+                        version,
+                    }
+                })?;
+            let active = predicates_active_for_schema_wtxn(&wtxn, namespace, version)?;
+            if !active.contains(&pred.id) {
+                return Err(OpError::PredicateNotInSchema {
+                    predicate: req.predicate.clone(),
+                    namespace: namespace.to_string(),
+                    version,
+                });
+            }
+            (pred.id, false)
+        } else {
+            // Schemaless: intern on demand. If the row already exists
+            // (declared by a schema in some *other* namespace? unlikely
+            // — qname is namespaced), we still return its id.
+            let existing = predicate_lookup_by_qname_wtxn(&wtxn, namespace, name)?;
+            let (pid, implicit) = match existing {
+                Some(p) => (p.id, false),
+                None => {
+                    let pid = predicate_intern_or_get(&wtxn, namespace, name, 0, now)
+                        .map_err(map_predicate_op_error)?;
+                    (pid, true)
+                }
+            };
+            (pid, implicit)
+        };
 
         // Find a prior current Preference (informational — statement_create
         // will auto-supersede inside the same txn).
@@ -93,7 +134,7 @@ pub async fn handle_statement_create(
             let key = (
                 req.subject,
                 StatementKind::Preference.as_u8(),
-                predicate.id.raw(),
+                predicate_id.raw(),
                 1u8,
             );
             let raw: Option<[u8; 16]> = bys
@@ -105,9 +146,17 @@ pub async fn handle_statement_create(
             None
         };
 
-        let statement_value = build_statement_from_create(&req, predicate.id, now, kind)?;
+        let statement_value = build_statement_from_create(&req, predicate_id, now, kind)?;
         let created =
             statement_create(&wtxn, &statement_value, now).map_err(map_statement_op_error)?;
+
+        // Stamp the implicit-predicate flag on the newly-written row
+        // so downstream consumers can tell which rows the schema
+        // would later need to adopt or evict.
+        if implicit_predicate {
+            stamp_implicit_predicate_flag(&wtxn, created)?;
+        }
+
         wtxn.commit()
             .map_err(|e| OpError::Internal(format!("commit: {e}")))?;
 
@@ -142,7 +191,8 @@ pub async fn handle_statement_create(
             confidence: req.confidence,
         }),
         now,
-    ).await;
+    )
+    .await;
 
     // If a Preference was auto-superseded, also emit STATEMENT_SUPERSEDED.
     if let Some(old) = auto_superseded {
@@ -249,13 +299,37 @@ pub async fn handle_statement_supersede(
             .write_txn()
             .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
 
-        let predicate =
-            predicate_lookup_by_qname_wtxn(&wtxn, namespace, name)?.ok_or_else(|| {
-                OpError::InvalidRequest(format!("unknown predicate {namespace:?}:{name:?}"))
-            })?;
+        // Same dispatch as CREATE: strict-mode validation when the
+        // namespace has an active schema, otherwise intern on demand.
+        let active_version = schema_active_in_wtxn(&wtxn, namespace)?;
+        let predicate_id = if let Some(version) = active_version {
+            let pred =
+                predicate_lookup_by_qname_wtxn(&wtxn, namespace, name)?.ok_or_else(|| {
+                    OpError::PredicateNotInSchema {
+                        predicate: req.new_statement.predicate.clone(),
+                        namespace: namespace.to_string(),
+                        version,
+                    }
+                })?;
+            let active = predicates_active_for_schema_wtxn(&wtxn, namespace, version)?;
+            if !active.contains(&pred.id) {
+                return Err(OpError::PredicateNotInSchema {
+                    predicate: req.new_statement.predicate.clone(),
+                    namespace: namespace.to_string(),
+                    version,
+                });
+            }
+            pred.id
+        } else {
+            match predicate_lookup_by_qname_wtxn(&wtxn, namespace, name)? {
+                Some(p) => p.id,
+                None => predicate_intern_or_get(&wtxn, namespace, name, 0, now)
+                    .map_err(map_predicate_op_error)?,
+            }
+        };
 
         let new_statement =
-            build_statement_from_create(&req.new_statement, predicate.id, now, kind)?;
+            build_statement_from_create(&req.new_statement, predicate_id, now, kind)?;
         let new_id = statement_supersede(&wtxn, old_id, &new_statement, now)
             .map_err(map_statement_op_error)?;
         wtxn.commit()
@@ -279,7 +353,8 @@ pub async fn handle_statement_supersede(
             chain_root: chain_root.to_bytes(),
         }),
         now,
-    ).await;
+    )
+    .await;
 
     // §27/02 §3: Delete old + Upsert new.
     if let Some(dispatcher) = ctx.statement_text_dispatcher.as_ref() {
@@ -331,7 +406,8 @@ pub async fn handle_statement_tombstone(
             reason: req.reason_message,
         }),
         now,
-    ).await;
+    )
+    .await;
 
     if let Some(dispatcher) = ctx.statement_text_dispatcher.as_ref() {
         dispatcher.dispatch(StatementTextOp::Delete { id }).await;
@@ -379,7 +455,8 @@ pub async fn handle_statement_retract(
             reason: format!("retract: {}", req.reason_message),
         }),
         now,
-    ).await;
+    )
+    .await;
 
     // Retract drops the row from the lexical index (the §19/06
     // grace period only affects when the metadata is zeroed; the
@@ -476,17 +553,37 @@ pub async fn handle_statement_list(
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
 
         // Resolve optional predicate qname → PredicateId.
+        //
+        // Schemaless mode: an unknown qname must not be an error —
+        // it just yields an empty result set. Schema-strict mode:
+        // it must be a `PredicateNotInSchema` so clients can tell
+        // their vocabulary from a typo.
         let predicate = if req.predicate.is_empty() {
             None
         } else {
             validate_predicate_qname(&req.predicate)?;
             let (ns, name) = split_qname(&req.predicate)?;
-            let p = predicate_lookup_by_qname(&rtxn, ns, name)
-                .map_err(map_predicate_op_error)?
-                .ok_or_else(|| {
-                    OpError::InvalidRequest(format!("unknown predicate {ns:?}:{name:?}"))
-                })?;
-            Some(p.id)
+            let active_version = schema_active(&rtxn, ns)
+                .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
+            match predicate_lookup_by_qname(&rtxn, ns, name).map_err(map_predicate_op_error)? {
+                Some(p) => Some(p.id),
+                None => {
+                    if let Some(version) = active_version {
+                        return Err(OpError::PredicateNotInSchema {
+                            predicate: req.predicate.clone(),
+                            namespace: ns.to_string(),
+                            version,
+                        });
+                    }
+                    // Schemaless: no rows could match, so short-circuit.
+                    return Ok(StatementListResponseFrame {
+                        items: Vec::new(),
+                        next_cursor: Vec::new(),
+                        cumulative_count: 0,
+                        is_final: true,
+                    });
+                }
+            }
         };
 
         let filter = StatementListFilter {
@@ -582,7 +679,7 @@ fn decode_tombstone_reason(byte: u8) -> Result<TombstoneReason, OpError> {
 }
 
 /// Build a brain-core `Statement` from a wire `StatementCreateRequest`
-/// + the resolved `PredicateId`. Performs per-kind invariant checks
+/// and the resolved `PredicateId`. Performs per-kind invariant checks
 /// (Event requires event_at; Fact/Preference must not set event_at).
 fn build_statement_from_create(
     req: &StatementCreateRequest,
@@ -695,7 +792,7 @@ fn project_view(rtxn: &redb::ReadTransaction, s: &Statement) -> Result<Statement
         {
             sv.push(e);
         }
-        s.evidence = brain_core::knowledge::EvidenceRef::Inline(sv);
+        s.evidence = brain_core::knowledge::EvidenceRef::inline(sv);
     }
 
     Ok(StatementView::from_statement(&s, qname))
@@ -727,13 +824,15 @@ fn predicate_lookup_by_qname_wtxn(
         PredicateDefinition, PREDICATES_BY_QNAME_TABLE, PREDICATES_TABLE,
     };
     let q = format!("{namespace}:{name}");
-    let idx = wtxn
-        .open_table(PREDICATES_BY_QNAME_TABLE)
-        .map_err(|e| OpError::Internal(format!("open by_qname: {e}")))?;
-    let id_raw: Option<u32> = idx
-        .get(q.as_str())
-        .map_err(|e| OpError::Internal(format!("by_qname lookup: {e}")))?
-        .map(|g| g.value());
+    let id_raw: Option<u32> = {
+        let idx = wtxn
+            .open_table(PREDICATES_BY_QNAME_TABLE)
+            .map_err(|e| OpError::Internal(format!("open by_qname: {e}")))?;
+        let g = idx
+            .get(q.as_str())
+            .map_err(|e| OpError::Internal(format!("by_qname lookup: {e}")))?;
+        g.map(|guard| guard.value())
+    };
     let Some(id_raw) = id_raw else {
         return Ok(None);
     };
@@ -745,6 +844,94 @@ fn predicate_lookup_by_qname_wtxn(
         .map_err(|e| OpError::Internal(format!("predicates lookup: {e}")))?
         .map(|g| g.value());
     Ok(row.as_ref().map(PredicateDefinition::to_predicate))
+}
+
+/// Active schema version for `namespace` inside a write txn. `None`
+/// means schemaless — STATEMENT_CREATE and RELATION_CREATE skip
+/// vocabulary validation in that mode.
+fn schema_active_in_wtxn(
+    wtxn: &redb::WriteTransaction,
+    namespace: &str,
+) -> Result<Option<u32>, OpError> {
+    use brain_metadata::tables::knowledge::schema_version::SCHEMA_ACTIVE_VERSIONS_TABLE;
+    let active = match wtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(OpError::Internal(format!("open schema_active: {e}"))),
+    };
+    let g = active
+        .get(&namespace)
+        .map_err(|e| OpError::Internal(format!("schema_active lookup: {e}")))?;
+    Ok(g.map(|guard| guard.value()))
+}
+
+/// Wtxn-friendly mirror of
+/// `brain_metadata::predicate_ops::predicates_active_for_schema` —
+/// scans the `predicates` table for the slice that's currently in
+/// vocabulary for `namespace` at `version`.
+fn predicates_active_for_schema_wtxn(
+    wtxn: &redb::WriteTransaction,
+    namespace: &str,
+    version: u32,
+) -> Result<std::collections::HashSet<PredicateId>, OpError> {
+    use brain_metadata::tables::knowledge::predicate::{
+        PredicateDefinition, SchemaOrigin, PREDICATES_TABLE,
+    };
+    let t = wtxn
+        .open_table(PREDICATES_TABLE)
+        .map_err(|e| OpError::Internal(format!("open predicates: {e}")))?;
+    let mut out = std::collections::HashSet::new();
+    for entry in t
+        .iter()
+        .map_err(|e| OpError::Internal(format!("predicates iter: {e}")))?
+    {
+        let (k, v) = entry.map_err(|e| OpError::Internal(format!("predicates entry: {e}")))?;
+        let row: PredicateDefinition = v.value();
+        if row.namespace != namespace {
+            continue;
+        }
+        if let SchemaOrigin::SchemaDeclared { version: v_decl } = row.origin() {
+            if v_decl == version {
+                out.insert(PredicateId::from(k.value()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// OR the `IMPLICIT_PREDICATE` bit into the just-written statement
+/// row's flags. Called immediately after `statement_create` succeeds
+/// in schemaless mode so the row carries provenance forward.
+fn stamp_implicit_predicate_flag(
+    wtxn: &redb::WriteTransaction,
+    id: StatementId,
+) -> Result<(), OpError> {
+    let key = id.to_bytes();
+    let existing: Option<StatementMetadata> = {
+        let t = wtxn
+            .open_table(STATEMENTS_TABLE)
+            .map_err(|e| OpError::Internal(format!("open statements: {e}")))?;
+        let g = t
+            .get(&key)
+            .map_err(|e| OpError::Internal(format!("statement lookup: {e}")))?;
+        g.map(|guard| guard.value())
+    };
+    let Some(mut row) = existing else {
+        // statement_create just wrote this — should always be present.
+        // Treat absence as internal corruption so the wire layer can
+        // surface it via tracing.
+        return Err(OpError::Internal(format!(
+            "statement {id:?} missing after create"
+        )));
+    };
+    if row.set_flag(statement_flags::IMPLICIT_PREDICATE) {
+        let mut t = wtxn
+            .open_table(STATEMENTS_TABLE)
+            .map_err(|e| OpError::Internal(format!("open statements (write): {e}")))?;
+        t.insert(&key, &row)
+            .map_err(|e| OpError::Internal(format!("statement update: {e}")))?;
+    }
+    Ok(())
 }
 
 fn map_statement_op_error(err: StatementOpError) -> OpError {
@@ -841,7 +1028,7 @@ async fn dispatch_upsert_for(
             }
         };
         drop(rtxn);
-        upsert_op_from_statement(&statement, &*db_guard)
+        upsert_op_from_statement(&statement, &db_guard)
     };
 
     if let Some(op) = upsert_op {

@@ -86,7 +86,11 @@ impl AnthropicClient {
         Self::new(model, api_key.into(), base_url)
     }
 
-    fn new(model: impl Into<String>, api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
+    fn new(
+        model: impl Into<String>,
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
         let model_s = model.into();
         let hash = model_id_hash(&model_s);
         Self {
@@ -146,9 +150,11 @@ impl LlmClient for AnthropicClient {
             }
 
             let payload: AnthropicResponseBody =
-                resp.json().await.map_err(|e| LlmError::OutputDecodeFailed {
-                    reason: format!("anthropic response JSON decode: {e}"),
-                })?;
+                resp.json()
+                    .await
+                    .map_err(|e| LlmError::OutputDecodeFailed {
+                        reason: format!("anthropic response JSON decode: {e}"),
+                    })?;
 
             decode_anthropic_response(payload, &request)
         })
@@ -242,7 +248,7 @@ fn decode_anthropic_response(
     for block in &payload.content {
         if block.kind == "text" {
             if !content.is_empty() {
-                content.push_str("\n");
+                content.push('\n');
             }
             content.push_str(&block.text);
         }
@@ -299,11 +305,8 @@ mod tests {
 
     #[test]
     fn with_endpoint_sets_fields() {
-        let c = AnthropicClient::with_endpoint(
-            "claude-haiku-4-5",
-            "test-key",
-            "http://localhost:1234",
-        );
+        let c =
+            AnthropicClient::with_endpoint("claude-haiku-4-5", "test-key", "http://localhost:1234");
         assert_eq!(c.model(), "claude-haiku-4-5");
         assert_ne!(c.model_id_hash(), 0);
     }
@@ -459,7 +462,10 @@ mod tests {
     #[test]
     fn parse_retry_after_zero_on_unparseable_value() {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap());
+        headers.insert(
+            "retry-after",
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
         // We only support seconds form; HTTP-date form returns 0.
         assert_eq!(parse_retry_after(&headers), 0);
     }

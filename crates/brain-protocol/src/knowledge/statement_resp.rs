@@ -175,11 +175,9 @@ pub fn evidence_ref_from_wire(w: &EvidenceRefWire) -> Result<EvidenceRef, WireTo
                     extractor_id: ExtractorId::from(0),
                 });
             }
-            Ok(EvidenceRef::Inline(entries))
+            Ok(EvidenceRef::inline(entries))
         }
-        EvidenceRefWire::Overflow(id) => {
-            Ok(EvidenceRef::Overflow(EvidenceOverflowId::from(*id)))
-        }
+        EvidenceRefWire::Overflow(id) => Ok(EvidenceRef::Overflow(EvidenceOverflowId::from(*id))),
     }
 }
 
@@ -236,15 +234,15 @@ impl StatementView {
             valid_to_unix_nanos: s.valid_to_unix_nanos.unwrap_or(0),
             event_at_unix_nanos: s.event_at_unix_nanos.unwrap_or(0),
             version: s.version,
-            superseded_by: s.superseded_by.map(StatementId::to_bytes).unwrap_or([0u8; 16]),
+            superseded_by: s
+                .superseded_by
+                .map(StatementId::to_bytes)
+                .unwrap_or([0u8; 16]),
             supersedes: s.supersedes.map(StatementId::to_bytes).unwrap_or([0u8; 16]),
             chain_root: s.chain_root.to_bytes(),
             tombstoned: s.tombstoned,
             tombstoned_at_unix_nanos: s.tombstoned_at_unix_nanos.unwrap_or(0),
-            tombstone_reason: s
-                .tombstone_reason
-                .map(TombstoneReason::as_u8)
-                .unwrap_or(0),
+            tombstone_reason: s.tombstone_reason.map(TombstoneReason::as_u8).unwrap_or(0),
             flags,
         }
     }
@@ -425,7 +423,7 @@ mod tests {
             PredicateId::from(7),
             object,
             0.9,
-            EvidenceRef::Inline({
+            EvidenceRef::inline({
                 let mut sv = SmallVec::<[EvidenceEntry; INLINE_EVIDENCE_CAP]>::new();
                 sv.push(EvidenceEntry::from_parts(
                     mem(1),
@@ -534,10 +532,7 @@ mod tests {
 
     #[test]
     fn object_discriminants_stable() {
-        assert_eq!(
-            StatementObjectWire::EntityRef([0u8; 16]).discriminant(),
-            0
-        );
+        assert_eq!(StatementObjectWire::EntityRef([0u8; 16]).discriminant(), 0);
         assert_eq!(
             StatementObjectWire::Value(StatementValueWire::Bool(false)).discriminant(),
             1

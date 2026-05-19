@@ -189,6 +189,8 @@ struct RecallRequestPayload {
 }
 ```
 
+`RecallStrategy` is encoded as a `u8` tag: `Auto = 0`, `SubstrateOnly = 1`, `HybridOnly = 2`. See [`07_request_frames.md`](07_request_frames.md) §3 for semantics.
+
 Followed by no raw vector data.
 
 A request with pre-supplied cue vector:

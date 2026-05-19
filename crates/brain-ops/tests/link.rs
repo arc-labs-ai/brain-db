@@ -14,7 +14,7 @@ use std::sync::Arc;
 use brain_core::{EdgeKind as CoreEdgeKind, MemoryId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
-use brain_metadata::tables::edge::EDGES_OUT_TABLE;
+use brain_metadata::tables::edge::edge_get;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::MetadataDb;
 use brain_ops::test_support::run_in_glommio;
@@ -122,7 +122,14 @@ fn unlink_req(
 
 async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str) -> u128 {
     let req = encode_req(request_id, text);
-    match dispatch(RequestBody::Encode(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap() {
+    match dispatch(
+        RequestBody::Encode(req),
+        brain_ops::RequestCaller::anonymous(),
+        &fix.ctx,
+    )
+    .await
+    .unwrap()
+    {
         ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
         other => panic!("expected Encode response, got {other:?}"),
     }
@@ -145,10 +152,15 @@ fn unwrap_unlink(body: ResponseBody) -> UnlinkResponse {
 fn edge_exists(fix: &Fixture, source: u128, kind: CoreEdgeKind, target: u128) -> bool {
     let db = fix.metadata.lock();
     let rtxn = db.read_txn().unwrap();
-    let table = rtxn.open_table(EDGES_OUT_TABLE).unwrap();
-    let s = MemoryId::from(source).to_be_bytes();
-    let t = MemoryId::from(target).to_be_bytes();
-    table.get(&(s, kind as u8, t)).unwrap().is_some()
+    edge_get(
+        &rtxn,
+        brain_core::NodeRef::Memory(MemoryId::from(source)),
+        brain_core::EdgeKindRef::Builtin(kind),
+        brain_core::NodeRef::Memory(MemoryId::from(target)),
+        brain_metadata::tables::edge::zero_disambiguator(),
+    )
+    .unwrap()
+    .is_some()
 }
 
 fn edge_counts(fix: &Fixture, memory_id: u128) -> (u32, u32) {
@@ -176,7 +188,9 @@ fn link_inserts_edge_and_bumps_counts() {
 
         let resp = unwrap_link(
             dispatch(
-                RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.7, [10; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.7, [10; 16])),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -205,8 +219,24 @@ fn link_replays_same_request_id() {
         let b = encode(&fix, [2; 16], "beta").await;
 
         let req = link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16]);
-        let first = unwrap_link(dispatch(RequestBody::Link(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
-        let second = unwrap_link(dispatch(RequestBody::Link(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
+        let first = unwrap_link(
+            dispatch(
+                RequestBody::Link(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        let second = unwrap_link(
+            dispatch(
+                RequestBody::Link(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
         assert_eq!(first.source, second.source);
         assert_eq!(first.target, second.target);
         assert!((first.weight - second.weight).abs() < 1e-6);
@@ -224,7 +254,9 @@ fn link_overwrite_with_new_request_id_marks_already_existed() {
 
         let r1 = unwrap_link(
             dispatch(
-                RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16])),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -234,7 +266,9 @@ fn link_overwrite_with_new_request_id_marks_already_existed() {
         // Second LINK with a NEW request_id overwrites weight; already_existed=true.
         let r2 = unwrap_link(
             dispatch(
-                RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.9, [11; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.9, [11; 16])),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -255,13 +289,17 @@ fn link_conflict_on_request_id_reuse_with_different_target() {
         let c = encode(&fix, [3; 16], "gamma").await;
 
         let _ = dispatch(
-            RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16])),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap();
 
         let err = dispatch(
-            RequestBody::Link(link_req(a, c, EdgeKindWire::Caused, 0.5, [10; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::Link(link_req(a, c, EdgeKindWire::Caused, 0.5, [10; 16])),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap_err();
@@ -277,7 +315,9 @@ fn link_missing_target_returns_not_found() {
         let phantom: u128 = 0xDEAD_BEEF_DEAD_BEEF_0000_0000_0000_0000;
 
         let err = dispatch(
-            RequestBody::Link(link_req(a, phantom, EdgeKindWire::Caused, 0.5, [10; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::Link(link_req(a, phantom, EdgeKindWire::Caused, 0.5, [10; 16])),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap_err();
@@ -294,7 +334,9 @@ fn link_invalid_weight_returns_invalid_request() {
         let b = encode(&fix, [2; 16], "beta").await;
 
         let err = dispatch(
-            RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 1.5, [10; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 1.5, [10; 16])),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap_err();
@@ -311,7 +353,9 @@ fn link_contradicts_allows_negative_weight() {
 
         let resp = unwrap_link(
             dispatch(
-                RequestBody::Link(link_req(a, b, EdgeKindWire::Contradicts, -0.7, [10; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Link(link_req(a, b, EdgeKindWire::Contradicts, -0.7, [10; 16])),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -331,7 +375,9 @@ fn unlink_removes_existing_edge_and_decrements_counts() {
         let a = encode(&fix, [1; 16], "alpha").await;
         let b = encode(&fix, [2; 16], "beta").await;
         let _ = dispatch(
-            RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16])),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap();
@@ -339,7 +385,9 @@ fn unlink_removes_existing_edge_and_decrements_counts() {
 
         let resp = unwrap_unlink(
             dispatch(
-                RequestBody::Unlink(unlink_req(a, b, EdgeKindWire::Caused, [20; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Unlink(unlink_req(a, b, EdgeKindWire::Caused, [20; 16])),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -362,7 +410,9 @@ fn unlink_non_existent_edge_returns_false_not_error() {
 
         let resp = unwrap_unlink(
             dispatch(
-                RequestBody::Unlink(unlink_req(a, b, EdgeKindWire::Caused, [20; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Unlink(unlink_req(a, b, EdgeKindWire::Caused, [20; 16])),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap(),
@@ -378,14 +428,32 @@ fn unlink_idempotent_replay() {
         let a = encode(&fix, [1; 16], "alpha").await;
         let b = encode(&fix, [2; 16], "beta").await;
         let _ = dispatch(
-            RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16])),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap();
 
         let req = unlink_req(a, b, EdgeKindWire::Caused, [20; 16]);
-        let first = unwrap_unlink(dispatch(RequestBody::Unlink(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
-        let second = unwrap_unlink(dispatch(RequestBody::Unlink(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
+        let first = unwrap_unlink(
+            dispatch(
+                RequestBody::Unlink(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        let second = unwrap_unlink(
+            dispatch(
+                RequestBody::Unlink(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
         assert!(first.removed);
         // Replay must return the same outcome; counts must not double-decrement.
         assert_eq!(first.removed, second.removed);
@@ -402,13 +470,17 @@ fn unlink_conflict_on_request_id_reuse_with_different_target() {
         let c = encode(&fix, [3; 16], "gamma").await;
 
         let _ = dispatch(
-            RequestBody::Unlink(unlink_req(a, b, EdgeKindWire::Caused, [20; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::Unlink(unlink_req(a, b, EdgeKindWire::Caused, [20; 16])),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap();
 
         let err = dispatch(
-            RequestBody::Unlink(unlink_req(a, c, EdgeKindWire::Caused, [20; 16])), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::Unlink(unlink_req(a, c, EdgeKindWire::Caused, [20; 16])),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap_err();
@@ -435,7 +507,14 @@ fn encode_inline_edges_actually_land_in_redb() {
             kind: EdgeKindWire::References,
             weight: 0.5,
         }];
-        let linker = match dispatch(RequestBody::Encode(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap() {
+        let linker = match dispatch(
+            RequestBody::Encode(req),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap()
+        {
             ResponseBody::Encode(r) => r.memory_id,
             other => panic!("got {other:?}"),
         };

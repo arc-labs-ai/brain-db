@@ -43,7 +43,7 @@ impl Session {
         }
     }
 
-    /// Build a session seeded from persisted [`Settings`]. The
+    /// Build a session seeded from persisted `Settings`. The
     /// caller has already merged `--output` overrides into
     /// `output`; we apply `sticky_context` and `timing` here so the
     /// REPL inherits the user's saved preferences. The `server`
@@ -162,7 +162,10 @@ mod tests {
         s.push_recent_id(MemoryId::from_raw(2));
         s.push_recent_id(MemoryId::from_raw(1));
         assert_eq!(s.recent_ids.len(), 2);
-        assert_eq!(*s.recent_ids.front().expect("non-empty"), MemoryId::from_raw(1));
+        assert_eq!(
+            *s.recent_ids.front().expect("non-empty"),
+            MemoryId::from_raw(1)
+        );
     }
 
     #[test]

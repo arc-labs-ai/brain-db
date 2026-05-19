@@ -234,7 +234,10 @@ impl WalReader {
         // Reset cursor state to point at the first retained segment.
         reader.current_idx = 0;
         reader.current = None;
-        reader.expected_next_lsn = reader.segments.first().map_or(start_lsn, |s| s.starting_lsn);
+        reader.expected_next_lsn = reader
+            .segments
+            .first()
+            .map_or(start_lsn, |s| s.starting_lsn);
         reader.last_decoded_lsn = None;
         reader.finished = reader.segments.is_empty();
 
@@ -960,7 +963,10 @@ mod tests {
         write_segment(dir.path(), 0, 1, uuid(1), &recs);
         let iter = WalReader::iter_from(dir.path(), uuid(1), 100).unwrap();
         let collected: Vec<_> = iter.collect();
-        assert!(collected.is_empty(), "expected empty replay, got {collected:?}");
+        assert!(
+            collected.is_empty(),
+            "expected empty replay, got {collected:?}"
+        );
     }
 
     // ----- Filename hygiene --------------------------------------------

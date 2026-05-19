@@ -10,8 +10,8 @@ use brain_embed::VECTOR_DIM;
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::MetadataDb;
-use brain_ops::test_support::run_in_glommio;
 use brain_ops::ops::writer::{FailingWalSink, RecordingWalSink, WalSink};
+use brain_ops::test_support::run_in_glommio;
 use brain_ops::RealWriterHandle;
 use brain_planner::{
     EncodeOp, ForgetOp, LinkOp, SharedMetadataDb, TxnBatch, TxnEncode, WriterError, WriterHandle,
@@ -27,10 +27,7 @@ fn fixture_with_sink(sink: Arc<dyn WalSink>) -> (Arc<RealWriterHandle>, SharedMe
     let db_path = dir.path().join("metadata.redb");
     let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
     let (_shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
-    let writer = Arc::new(
-        RealWriterHandle::new(metadata.clone(), hnsw_writer)
-            .with_wal_sink(sink),
-    );
+    let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer).with_wal_sink(sink));
     // Leak the tempdir so the DB lives as long as the test; the dir is
     // wiped by tempfile's Drop at scope end of the *test* via the
     // returned writer holding the DB file open.
@@ -230,9 +227,12 @@ fn link_appends_wal_before_redb_commit() {
         assert_eq!(recs[2].kind, WalRecordKind::Link);
         match WalPayload::decode(recs[2].kind, &recs[2].payload).unwrap() {
             WalPayload::Link(p) => {
-                assert_eq!(p.source, a.memory_id);
-                assert_eq!(p.target, b.memory_id);
-                assert_eq!(p.edge_kind, EdgeKind::Caused);
+                assert_eq!(p.source, brain_core::NodeRef::Memory(a.memory_id));
+                assert_eq!(p.target, brain_core::NodeRef::Memory(b.memory_id));
+                assert_eq!(
+                    p.edge_kind,
+                    brain_core::EdgeKindRef::Builtin(EdgeKind::Caused)
+                );
                 assert!((p.weight - 0.7).abs() < f32::EPSILON);
             }
             other => panic!("expected Link, got {other:?}"),

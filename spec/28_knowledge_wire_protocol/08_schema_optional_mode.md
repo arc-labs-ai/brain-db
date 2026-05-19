@@ -1,36 +1,32 @@
 # 28.08 Schema-Optional Mode
 
-The knowledge layer activates only when a schema has been declared. Without a schema, knowledge opcodes return a structured `SchemaNotDeclared` error. The substrate's cognitive primitives (the `0x00xx` opcode namespace) work normally either way.
+The knowledge opcodes accept traffic in both modes: with or without a declared schema. When no schema is declared, predicates and relation types are open-vocabulary — they are interned on first use with origin `ImplicitFromWrite` (see `19_statements/00_purpose.md` and `20_relations/00_purpose.md`). When a schema is declared, it acts as a **strict validator** for that namespace: unknown qnames are rejected with `PredicateNotInSchema` / `RelationTypeNotInSchema`, and declared cardinalities are enforced.
 
-This is a **deployment posture**, not a compatibility mode. A deployment that wants vector-substrate-only behavior simply never calls `SCHEMA_UPLOAD`. See [`./00_purpose.md`](./00_purpose.md) §"Schema-optional behavior" and [`../00_master_overview/02_doc_map.md`](../00_master_overview/02_doc_map.md).
+The substrate's cognitive primitives (the `0x00xx` opcode namespace) and the hybrid retrieval path are unaffected by schema state — hybrid is the default `RECALL` path for every deployment.
+
+Schemaless ("open-vocabulary") and schema-declared ("strict") are both **first-class deployment postures**. A deployment that wants vector-substrate-only behavior simply never calls the knowledge opcodes. See [`./00_purpose.md`](./00_purpose.md) §"Schema-optional behavior" and [`../00_master_overview/02_doc_map.md`](../00_master_overview/02_doc_map.md).
 
 ## 1. The schema declaration trigger
 
-A schema is "declared" when a successful (`dry_run = false`) `SCHEMA_UPLOAD` (`0x0120`) commits at least one schema version. The declaration is **per-deployment**, recorded in the `schemas` redb table; it persists across server restarts.
+A schema is "declared" when a successful (`dry_run = false`) `SCHEMA_UPLOAD` (`0x0120`) commits at least one schema version. The declaration is **per-namespace**, recorded in the `schemas` redb table; it persists across server restarts.
 
 State machine:
 
 ```
-[no schema] --SCHEMA_UPLOAD success--> [schema declared]
-[schema declared] --(no opcode reverses this)--> [schema declared]
+[open vocabulary] --SCHEMA_UPLOAD success--> [strict schema (version N)]
+[strict schema (version N)] --SCHEMA_UPLOAD success--> [strict schema (version N+1)]
 ```
 
 There is no `SCHEMA_DROP` opcode in v1.0. Removing a schema entirely requires operator action on the underlying redb file. Tracked in [`./09_open_questions.md`](./09_open_questions.md).
 
 ## 2. Gate behavior
 
-When a frame arrives with an opcode in the `0x01xx` namespace:
+Knowledge opcodes (`0x01xx` namespace) dispatch in both modes. Their per-opcode validation rules then branch on schema presence for the target namespace:
 
-```
-1. Decode opcode and body.
-2. If schema declared OR opcode == SCHEMA_UPLOAD:
-       dispatch normally.
-3. Else:
-       reply with ERROR frame, code=SchemaNotDeclared, category=Conflict,
-       message="operation requires a schema; call SCHEMA_UPLOAD first".
-```
+- **No schema declared**: predicate / relation-type qnames are interned on first use (`SchemaOrigin::ImplicitFromWrite`, `RelationTypeOrigin::ImplicitFromWrite`); no cardinality contract is enforced; `QUERY.predicate_filter` qnames that resolve to no known predicate produce an empty result set rather than an error.
+- **Schema declared for the namespace**: unknown predicate qname → `PredicateNotInSchema` (0x004B). Unknown relation type qname → `RelationTypeNotInSchema` (0x004C). Cardinality violations → `CardinalityViolation` (0x0065). Object-type mismatches → `STATEMENT_OBJECT_TYPE_MISMATCH` (0x41).
 
-`SCHEMA_UPLOAD` is the **only** knowledge opcode allowed before declaration. Even read-side ops (`SCHEMA_GET`, `EXTRACTOR_LIST`) error out — they have nothing to return.
+No opcode is gated out by schema absence. The legacy `SchemaNotDeclared` error remains reserved for explicit schema-introspection opcodes (`SCHEMA_GET` on a namespace that never had one) and is documented in [`./03_errors.md`](./03_errors.md).
 
 ## 3. Substrate opcodes are unaffected
 
@@ -39,7 +35,7 @@ Every opcode in the `0x00xx` namespace works in both modes:
 | Substrate opcode | Behavior in substrate-only mode |
 |---|---|
 | `ENCODE_REQ` | works normally; no extractor runs because none are registered |
-| `RECALL_REQ` | works normally; vector-only retrieval (no hybrid retriever) |
+| `RECALL_REQ` | works normally; runs the hybrid path (semantic + lexical + memory-edge graph) — hybrid is the default in both modes |
 | `PLAN_REQ`, `REASON_REQ`, `FORGET_REQ`, `LINK_REQ`, `UNLINK_REQ` | unchanged |
 | `SUBSCRIBE_REQ` | works; carries substrate events only (no knowledge events possible since none can be emitted) |
 | `ADMIN_*` | unchanged |
@@ -58,12 +54,14 @@ The cutover is the redb commit, not the response emission. The connection layer 
 
 ## 5. RECALL routing
 
-When a schema is declared, the substrate's `RECALL_REQ` (`0x0021`) opcode **transparently routes** through the hybrid retriever (semantic + lexical + graph with RRF fusion — phase 23). Clients see the same `RecallResponseFrame` shape with these additional fields populated:
+`RECALL_REQ` (`0x0021`) runs through the hybrid retriever (semantic + lexical + memory-edge graph, fused via RRF — phase 23) by default in every deployment. Clients always see these fields populated on `MemoryResult`:
 
-- `MemoryResult.contributing_retrievers: Vec<RetrieverNameWire>` — which retrievers ranked this memory (empty pre-schema, populated post-schema).
-- `MemoryResult.fused_score: f32` — the post-RRF rank score (0.0 pre-schema, ≥0.0 post-schema).
+- `contributing_retrievers: Vec<RetrieverNameWire>` — which retrievers ranked this memory.
+- `fused_score: f32` — the post-RRF rank score.
 
-These fields exist in the wire shape from v1.0 onward; pre-schema clients receive zeros and an empty vec. This is **forward-compatible** — old SDK builds work in both modes; new SDK builds get the metadata when present.
+Declaring a schema does not change the retrieval mode; it adds typed entity-anchored graph traversal as an additional path that the planner may select for the graph retriever. The `RecallResponseFrame` shape is identical in both modes.
+
+Clients that want to bypass the hybrid path can pass `RecallStrategy::SubstrateOnly`. Clients that require it can pass `RecallStrategy::HybridOnly`; if a required retriever is not currently servable, the server returns `HybridUnavailable` (0x0083). See [`../03_wire_protocol/07_request_frames.md`](../03_wire_protocol/07_request_frames.md).
 
 ## 6. Multi-shard schema state
 
@@ -98,8 +96,7 @@ pub struct WelcomeCapabilities {
 
 SDKs use this to decide:
 
-- whether to surface knowledge-namespace APIs at all (hide them if `!schema_declared`).
-- which schema version to encode against (pinning).
+- which schema version to encode typed knowledge calls against (pinning); typed derive-macro APIs that depend on declared predicates should be hidden when `!schema_declared`. Untyped (qname-based) knowledge calls and the cognitive primitives surface in both modes.
 
 The capability is **per-connection**; if a `SCHEMA_UPLOAD` commits mid-connection, existing connections continue with their original `schema_version` view (their `WELCOME`-bound snapshot) until reconnect.
 

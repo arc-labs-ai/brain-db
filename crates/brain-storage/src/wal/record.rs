@@ -529,10 +529,12 @@ mod tests {
         use crate::wal::payload::{KnowledgeRecord, WalPayload};
 
         // One example per discriminant boundary in the knowledge block.
+        // RelationCreate / RelationSupersede / RelationTombstone became
+        // first-class typed payloads in Phase C, so they are no longer
+        // valid kinds for an opaque-body KnowledgeRecord.
         for kind in [
             WalRecordKind::EntityCreate,
             WalRecordKind::StatementCreate,
-            WalRecordKind::RelationCreate,
             WalRecordKind::SchemaUpdate,
             WalRecordKind::Audit,
         ] {

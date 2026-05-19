@@ -431,7 +431,7 @@ mod tests {
             age_bound_unix_nanos: Some(1_700_000_000_000_000_000),
             kind_filter: Some(vec![MemoryKindWire::Episodic, MemoryKindWire::Semantic]),
             salience_floor: 0.1,
-            strategy_hint: Some(RecallStrategy::Hybrid),
+            strategy: Some(RecallStrategy::HybridOnly),
             include_vectors: false,
             include_edges: true,
             include_text: true,
@@ -705,5 +705,82 @@ mod tests {
         let garbage = vec![0xAAu8; 64];
         let err = RequestBody::decode(Opcode::EncodeReq, &garbage).unwrap_err();
         assert!(matches!(err, ProtocolError::MalformedPayload(_)));
+    }
+
+    // ----------------------------------------------------------------
+    // E5 — wire fuzz: arbitrary bytes fed to RecallReq decode must
+    // never panic. The wire path is the trust boundary; a panic here
+    // is a remote-DOS vector.
+    //
+    // We don't try to surgically corrupt the strategy byte (rkyv's
+    // archived layout is position-dependent and locating it
+    // reliably is fragile). The stronger property is "any bytes →
+    // never panic", which subsumes the bad-discriminant case along
+    // with every other malformed-payload variant.
+    // ----------------------------------------------------------------
+
+    use proptest::collection::vec as pvec;
+    use proptest::prelude::*;
+
+    proptest! {
+        // 256 cases — exhausts the byte-discriminant space many
+        // times over while staying well under 1 second wall-time.
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn arbitrary_bytes_decode_never_panics_recall(bytes in pvec(any::<u8>(), 0..=512)) {
+            // Catch UB-free: the function must return Result, never
+            // unwind. We don't care which Result variant — just
+            // that no panic escapes.
+            let _ = RequestBody::decode(Opcode::RecallReq, &bytes);
+        }
+
+        #[test]
+        fn arbitrary_bytes_decode_never_panics_encode(bytes in pvec(any::<u8>(), 0..=512)) {
+            let _ = RequestBody::decode(Opcode::EncodeReq, &bytes);
+        }
+    }
+
+    #[test]
+    fn out_of_range_strategy_byte_in_valid_encode_payload_errors_cleanly() {
+        // Encode a valid RecallRequest, then sweep the payload
+        // overwriting every byte in turn with an out-of-range
+        // discriminant. Most overwrites will land on non-
+        // discriminant bytes (length-prefix, padding, content);
+        // the ones that hit the strategy field exercise the
+        // bad-discriminant branch specifically. None must panic;
+        // all must return Result.
+        let body = RequestBody::Recall(RecallRequest {
+            cue_text: "x".into(),
+            cue_vector_offset: 0,
+            cue_vector_dim: 0,
+            top_k: 5,
+            confidence_threshold: 0.0,
+            context_filter: None,
+            age_bound_unix_nanos: None,
+            kind_filter: None,
+            salience_floor: 0.0,
+            strategy: Some(crate::requests::types::RecallStrategy::Auto),
+            include_vectors: false,
+            include_edges: false,
+            include_text: false,
+            request_id: Some([0u8; 16]),
+            txn_id: None,
+        });
+        let baseline = body.encode();
+        for i in 0..baseline.len() {
+            for malformed_byte in [99u8, 200u8, 255u8] {
+                let mut bytes = baseline.clone();
+                bytes[i] = malformed_byte;
+                // The call returns Result; the test passes as long
+                // as no panic escapes. A bad strategy discriminant
+                // surfaces as MalformedPayload; many other
+                // corruptions also surface that way.
+                let _ = RequestBody::decode(Opcode::RecallReq, &bytes);
+            }
+        }
     }
 }

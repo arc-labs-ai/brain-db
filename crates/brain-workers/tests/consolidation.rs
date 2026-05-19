@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
-use brain_metadata::tables::edge::EDGES_OUT_TABLE;
+use brain_metadata::tables::edge::list_memory_edges_from;
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
 use brain_ops::{OpsContext, RealWriterHandle};
@@ -399,26 +399,13 @@ fn consolidated_has_derived_from_edges_to_each_source() {
             id.expect("Consolidated must exist")
         };
 
-        // Walk EDGES_OUT for the consolidated id with kind=DerivedFrom.
+        // Walk outgoing DerivedFrom edges anchored at the consolidated id.
         let db = fix.metadata.lock();
         let rtxn = db.read_txn().unwrap();
-        let edges = rtxn.open_table(EDGES_OUT_TABLE).unwrap();
-        let key_lo = (
-            consolidated_id.to_be_bytes(),
-            EdgeKind::DerivedFrom as u8,
-            [0u8; 16],
-        );
-        let key_hi = (
-            consolidated_id.to_be_bytes(),
-            EdgeKind::DerivedFrom as u8,
-            [0xFFu8; 16],
-        );
-        let mut found_targets = std::collections::HashSet::new();
-        for entry in edges.range(key_lo..=key_hi).unwrap() {
-            let (key, _) = entry.unwrap();
-            let (_, _kind, tgt) = key.value();
-            found_targets.insert(MemoryId::from_be_bytes(tgt));
-        }
+        let rows =
+            list_memory_edges_from(&rtxn, consolidated_id, Some(EdgeKind::DerivedFrom)).unwrap();
+        let found_targets: std::collections::HashSet<MemoryId> =
+            rows.into_iter().map(|(_, tgt, _)| tgt).collect();
         assert_eq!(found_targets.len(), 5);
         for id in &source_ids {
             assert!(found_targets.contains(id));

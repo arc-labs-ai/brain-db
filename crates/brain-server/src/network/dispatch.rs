@@ -79,7 +79,7 @@ impl ConnState {
 
 /// Read-only handles a connection task uses: the shard pool + routing.
 ///
-/// `routing` is wrapped in [`ArcSwap`] so future cluster
+/// `routing` is wrapped in [`arc_swap::ArcSwap`] so future cluster
 /// reconfiguration (admin RPC + gossip, post-Phase-9) can publish a
 /// new `RoutingTable` atomically — without restarting connections
 /// (spec §10/05 §4, §12/02 §2). Readers call `routing.load_full()`
@@ -195,7 +195,7 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
                     "connection-level opcode requires stream_id = 0",
                 ));
             }
-        } else if stream_id == 0 || stream_id % 2 == 0 {
+        } else if stream_id == 0 || stream_id.is_multiple_of(2) {
             return Action::Inline(error_frame(
                 stream_id,
                 ErrorCode::BadFrame,
@@ -551,7 +551,17 @@ fn error_frame_from_op_error(stream_id: u32, e: &OpError) -> Frame {
         brain_ops::error::ErrorCode::Conflict => (ErrorCode::IdempotencyConflict, None),
         brain_ops::error::ErrorCode::TxnExpired => (ErrorCode::TransactionTimeout, None),
         brain_ops::error::ErrorCode::TxnNotFound => (ErrorCode::TxnNotFound, None),
+        brain_ops::error::ErrorCode::PredicateNotInSchema => {
+            (ErrorCode::PredicateNotInSchema, None)
+        }
+        brain_ops::error::ErrorCode::RelationTypeNotInSchema => {
+            (ErrorCode::RelationTypeNotInSchema, None)
+        }
+        brain_ops::error::ErrorCode::CardinalityViolation => {
+            (ErrorCode::CardinalityViolation, None)
+        }
         brain_ops::error::ErrorCode::Overloaded => (ErrorCode::Overloaded, Some(1000u32)),
+        brain_ops::error::ErrorCode::HybridUnavailable => (ErrorCode::ShardUnavailable, None),
         brain_ops::error::ErrorCode::InternalError => (ErrorCode::Internal, None),
     };
     let body = ResponseBody::Error(ErrorResponse {

@@ -236,16 +236,20 @@ mod tests {
 
     #[test]
     fn validate_rejects_wrong_scope_filter() {
-        let mut f = SemanticFilters::default();
-        f.statement_kind = Some(StatementKind::Fact);
+        let f = SemanticFilters {
+            statement_kind: Some(StatementKind::Fact),
+            ..Default::default()
+        };
         let err = validate_filters_for_scope(&f, SemanticScope::Memory).expect_err("rejects");
         assert!(matches!(err, SemanticError::QueryParseFailed(_)));
     }
 
     #[test]
     fn validate_allows_compatible_filter() {
-        let mut f = SemanticFilters::default();
-        f.memory_kind = Some(MemoryKind::Episodic);
+        let f = SemanticFilters {
+            memory_kind: Some(MemoryKind::Episodic),
+            ..Default::default()
+        };
         validate_filters_for_scope(&f, SemanticScope::Memory).expect("ok");
         validate_filters_for_scope(&f, SemanticScope::Both).expect("ok");
     }

@@ -127,7 +127,10 @@ mod linux_main {
         ConnectionLimits, ConnectionListener, ShutdownSignal, ShutdownTrigger, Topology,
     };
     use crate::routing::RoutingTable;
-    use crate::shard::{spawn_shard, ShardHandle, ShardJoiner, ShardSpawnConfig};
+    use crate::shard::{
+        spawn_shard, AutoEdgeSpawnConfig, ExtractorSpawnConfig, ShardHandle, ShardJoiner,
+        ShardSpawnConfig,
+    };
 
     pub fn run(cfg: Config) -> ExitCode {
         // Sub-task 9.15: build the configured Summarizer (default
@@ -294,9 +297,12 @@ mod linux_main {
             // Bounded wait for both HTTP listeners to observe the same
             // signal and exit. 2s is generous — the accept loop's
             // shutdown arm resolves immediately.
-            let admin_rc =
-                drain_http_listener("admin server", admin_handle, std::time::Duration::from_secs(2))
-                    .await;
+            let admin_rc = drain_http_listener(
+                "admin server",
+                admin_handle,
+                std::time::Duration::from_secs(2),
+            )
+            .await;
             let public_rc = drain_http_listener(
                 "metrics server",
                 public_handle,
@@ -338,6 +344,34 @@ mod linux_main {
         for shard_id in 0..cfg.storage.shard_count {
             let mut spawn_cfg = ShardSpawnConfig::new(cfg.storage.data_dir.clone());
             spawn_cfg.summarizer = summarizer.clone();
+            // Phase B: ferry the operator's `[workers.auto_edge]`
+            // overrides into the per-shard spawn config so the
+            // AutoEdgeWorker registers with the configured knobs
+            // (or stays unwired when disabled).
+            spawn_cfg.auto_edge = AutoEdgeSpawnConfig {
+                enabled: cfg.workers.auto_edge.enabled,
+                interval_ms: cfg.workers.auto_edge.interval_ms,
+                batch_size: cfg.workers.auto_edge.batch_size,
+                similarity_threshold: cfg.workers.auto_edge.similarity_threshold,
+                top_k: cfg.workers.auto_edge.top_k,
+                ef_search: cfg.workers.auto_edge.ef_search,
+                channel_capacity: cfg.workers.auto_edge.channel_capacity,
+            };
+            // Phase E: ferry the operator's `[workers.extractor]`
+            // overrides into the per-shard spawn config so the
+            // ExtractorWorker registers with the configured knobs (or
+            // stays unwired when disabled).
+            spawn_cfg.extractor = ExtractorSpawnConfig {
+                enabled: cfg.workers.extractor.enabled,
+                interval_ms: cfg.workers.extractor.interval_ms,
+                drain_per_cycle: cfg.workers.extractor.drain_per_cycle,
+                llm_budget_per_cycle_micro_usd: cfg
+                    .workers
+                    .extractor
+                    .llm_budget_per_cycle_micro_usd,
+                channel_capacity: cfg.workers.extractor.channel_capacity,
+                skip_already_extracted: cfg.workers.extractor.skip_already_extracted,
+            };
             match spawn_shard(shard_id as u16, spawn_cfg) {
                 Ok((h, j)) => {
                     handles.push(h);

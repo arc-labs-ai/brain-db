@@ -4,7 +4,8 @@ use brain_core::knowledge::StatementKind;
 use brain_core::EntityId;
 
 use super::{
-    route, OverrideKind, QueryRequest, Retriever, RetrieverSelection, TimeRange, MAX_RETRIEVERS,
+    route, GraphAnchorMode, OverrideKind, QueryRequest, Retriever, RetrieverSelection, TimeRange,
+    MAX_RETRIEVERS,
 };
 
 fn req_with_text(text: &str) -> QueryRequest {
@@ -82,11 +83,36 @@ fn lowercase_text_doesnt_trigger_all_caps_path() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rule_5_default_free_text_picks_semantic_and_lexical() {
+fn rule_5_default_free_text_picks_semantic_lexical_and_graph() {
     let d = route(&req_with_text("budget pushback"));
     assert_eq!(retriever_weight(&d, Retriever::Semantic), Some(1.0));
     assert_eq!(retriever_weight(&d, Retriever::Lexical), Some(1.0));
-    assert_eq!(retriever_weight(&d, Retriever::Graph), None);
+    // Graph rides along anchored at the semantic top-K — keeps
+    // substrate edges contributing on schemaless deployments.
+    assert_eq!(retriever_weight(&d, Retriever::Graph), Some(0.5));
+    assert_eq!(
+        d.graph_anchor_mode,
+        Some(GraphAnchorMode::MemoryFromSemantic)
+    );
+}
+
+#[test]
+fn entity_anchor_picks_entity_graph_mode() {
+    let req = QueryRequest {
+        entity_anchor: Some(EntityId::new()),
+        ..Default::default()
+    };
+    let d = route(&req);
+    assert_eq!(d.graph_anchor_mode, Some(GraphAnchorMode::Entity));
+}
+
+#[test]
+fn no_text_no_anchor_leaves_graph_anchor_unset() {
+    // The empty-text path can't select graph (no retrievers
+    // matched any rule); the router should report None.
+    let req = QueryRequest::default();
+    let d = route(&req);
+    assert_eq!(d.graph_anchor_mode, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -279,4 +305,43 @@ fn iso_date_triggers_temporal_expression() {
 fn last_n_days_triggers_temporal_expression() {
     let d = route(&req_with_text("meetings in the last 7 days"));
     assert!(d.features.contains_temporal_expression);
+}
+
+// ---------------------------------------------------------------------------
+// E1 — Empty cue text + entity anchor only.
+//
+// "Text + anchor" picks all three retrievers; "anchor only" must
+// drop lexical entirely because there's no text signal to lex on,
+// and skip semantic's text-dependent weight too.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn entity_anchor_without_text_selects_graph_and_semantic_only() {
+    let req = QueryRequest {
+        text: None,
+        entity_anchor: Some(EntityId::new()),
+        ..Default::default()
+    };
+    let d = route(&req);
+
+    assert_eq!(
+        retriever_weight(&d, Retriever::Graph),
+        Some(2.0),
+        "graph weight unchanged when text is absent",
+    );
+    assert_eq!(
+        retriever_weight(&d, Retriever::Semantic),
+        Some(1.0),
+        "semantic still rides along on the anchor",
+    );
+    assert_eq!(
+        retriever_weight(&d, Retriever::Lexical),
+        None,
+        "lexical requires text — must not be selected on anchor-only",
+    );
+    assert_eq!(
+        d.graph_anchor_mode,
+        Some(GraphAnchorMode::Entity),
+        "anchor present → entity graph mode (no semantic anchoring)",
+    );
 }

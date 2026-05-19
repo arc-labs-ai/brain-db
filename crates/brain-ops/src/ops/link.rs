@@ -162,12 +162,18 @@ async fn handle_link_in_txn(
             OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
         })?;
         let table = rtxn
-            .open_table(brain_metadata::tables::edge::EDGES_OUT_TABLE)
+            .open_table(brain_metadata::tables::edge::EDGES_TABLE)
             .map_err(|e| {
                 OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
             })?;
-        let key = (source.to_be_bytes(), kind as u8, target.to_be_bytes());
-        let committed_has = table.get(&key).ok().flatten().is_some();
+        let key = brain_metadata::tables::edge::EdgeKey {
+            from: brain_core::NodeRef::Memory(source),
+            kind: brain_core::EdgeKindRef::Builtin(kind),
+            to: brain_core::NodeRef::Memory(target),
+            disambiguator: brain_metadata::tables::edge::zero_disambiguator(),
+        }
+        .encode();
+        let committed_has = table.get(key.as_slice()).ok().flatten().is_some();
         let key_triple = (source, kind, target);
         let pending_has = ctx
             .txn_store
@@ -292,12 +298,18 @@ async fn handle_unlink_in_txn(
             OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
         })?;
         let table = rtxn
-            .open_table(brain_metadata::tables::edge::EDGES_OUT_TABLE)
+            .open_table(brain_metadata::tables::edge::EDGES_TABLE)
             .map_err(|e| {
                 OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
             })?;
-        let key = (source.to_be_bytes(), kind as u8, target.to_be_bytes());
-        table.get(&key).ok().flatten().is_some()
+        let key = brain_metadata::tables::edge::EdgeKey {
+            from: brain_core::NodeRef::Memory(source),
+            kind: brain_core::EdgeKindRef::Builtin(kind),
+            to: brain_core::NodeRef::Memory(target),
+            disambiguator: brain_metadata::tables::edge::zero_disambiguator(),
+        }
+        .encode();
+        table.get(key.as_slice()).ok().flatten().is_some()
     };
     let pending_has = ctx.txn_store.with_buffer(txn_id, |buf| {
         Ok(buf

@@ -11,9 +11,7 @@ use serde::{Deserialize, Serialize};
 /// Mutation rules differ by kind (Fact contradicts; Preference
 /// supersedes; Event is append-only). All three share one storage
 /// table with a `kind` discriminant column.
-#[derive(
-    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum StatementKind {
     Fact = 0,
@@ -39,9 +37,7 @@ impl StatementKind {
 }
 
 /// Relation cardinality (spec §20).
-#[derive(
-    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Cardinality {
     OneToOne = 0,
@@ -70,9 +66,7 @@ impl Cardinality {
 
 /// Extractor tier (spec §22). Tiered fallback: pattern → classifier →
 /// LLM. Each tier is cheaper than the next.
-#[derive(
-    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ExtractorKind {
     Pattern = 0,
@@ -103,7 +97,11 @@ mod tests {
 
     #[test]
     fn statement_kind_round_trip() {
-        for k in [StatementKind::Fact, StatementKind::Preference, StatementKind::Event] {
+        for k in [
+            StatementKind::Fact,
+            StatementKind::Preference,
+            StatementKind::Event,
+        ] {
             assert_eq!(StatementKind::from_u8(k.as_u8()), Some(k));
         }
         assert_eq!(StatementKind::from_u8(255), None);
@@ -124,7 +122,11 @@ mod tests {
 
     #[test]
     fn extractor_kind_round_trip() {
-        for k in [ExtractorKind::Pattern, ExtractorKind::Classifier, ExtractorKind::Llm] {
+        for k in [
+            ExtractorKind::Pattern,
+            ExtractorKind::Classifier,
+            ExtractorKind::Llm,
+        ] {
             assert_eq!(ExtractorKind::from_u8(k.as_u8()), Some(k));
         }
         assert_eq!(ExtractorKind::from_u8(3), None);

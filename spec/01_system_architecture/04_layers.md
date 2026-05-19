@@ -33,16 +33,16 @@ This file presents the layers in summary, with cross-references to the detail sp
 ┌──────────────────────────────────▼──────────────────────────────────┐
 │  L3 │ QUERY PLANNER                                                   │
 │     │   • Pure function: (op, query, stats) → execution plan          │
-│     │   • Strategy selection: ANN | attractor | graph | hybrid        │
+│     │   • Strategy selection: substrate-only | hybrid (default)        │
 │     │   • Plan caching for repeated query shapes                      │
 └──────────────────────────────────┬──────────────────────────────────┘
                                    │
 ┌──────────────────────────────────▼──────────────────────────────────┐
 │  L4 │ EXECUTION ENGINE                                                │
-│     │   ┌─────────┐ ┌────────────┐ ┌────────┐ ┌──────────────┐       │
-│     │   │ ANN     │ │ Attractor  │ │ Graph  │ │ VSA algebra  │       │
-│     │   │ (HNSW)  │ │ dynamics   │ │ walk   │ │ (bind/bundle)│       │
-│     │   └─────────┘ └────────────┘ └────────┘ └──────────────┘       │
+│     │   ┌─────────┐ ┌─────────┐ ┌────────┐ ┌──────────────┐          │
+│     │   │ ANN     │ │ Lexical │ │ Graph  │ │ VSA algebra  │          │
+│     │   │ (HNSW)  │ │(tantivy)│ │ walk   │ │ (bind/bundle)│          │
+│     │   └─────────┘ └─────────┘ └────────┘ └──────────────┘          │
 │     │   Lock-free read path. Single-writer-per-shard discipline.     │
 └──────────────────────────────────┬──────────────────────────────────┘
                                    │
@@ -161,12 +161,10 @@ The query planner is a **pure function** from `(operation, query parameters, cur
 
 For `RECALL`, the planner chooses among:
 
-- **ANN search** — the default for clean cues with high specificity.
-- **Attractor dynamics** — for noisy or partial cues; runs a Hopfield-style energy descent until convergence.
-- **Graph walk** — for structural queries ("find memories causally downstream of memory X").
-- **Hybrid** — runs ANN first for a candidate set, then re-ranks via attractor or graph.
+- **Hybrid** (default) — runs ANN, lexical (tantivy), and memory-edge graph retrievers in parallel and fuses ranks via RRF.
+- **Substrate-only** — pure ANN over the memory HNSW, no fusion. Selected for `RecallStrategy::SubstrateOnly`, inside transactions, or as the planner's fallback when a hybrid component is unavailable.
 
-For `PLAN`, the planner chooses among A*, MCTS, or attractor rollout. For `REASON`, the planner constructs an inference DAG.
+For `PLAN`, the planner chooses among A* and MCTS. For `REASON`, the planner constructs an inference DAG.
 
 ### Strategy selection inputs
 
@@ -201,15 +199,15 @@ The execution engine consists of four parallel implementations, one per executio
 
 Wraps the HNSW index. The hot loop is SIMD-accelerated dot products against candidate vectors. Reads are lock-free under [crossbeam-epoch](https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-epoch) reclamation; writes are funneled through a single writer per shard.
 
-The ANN executor handles the vast majority of `RECALL` operations. See [06. ANN Index](../06_ann_index/).
+The ANN executor is the substrate's vector arm of every `RECALL` (always contributes to the hybrid fusion; sole contributor when `SubstrateOnly` is forced). See [06. ANN Index](../06_ann_index/).
 
-#### Attractor executor
+#### Lexical executor
 
-Runs Hopfield-network-style dynamics over the vector space, with the cue as the initial state and stored memories as attractors. Used for noisy cues where simple similarity search would miss the right neighbor.
+Wraps the tantivy text index. Returns BM25-ranked memory ids for the cue's tokenized form. One of the three retrievers fused by the hybrid path.
 
 #### Graph executor
 
-Traverses the typed-edge graph in `redb`-backed metadata storage. Used during `PLAN`, `REASON`, and structural-query forms of `RECALL`.
+Traverses the typed-edge graph in `redb`-backed metadata storage. Used during `PLAN`, `REASON`, and as the third hybrid-RECALL retriever (memory-edge graph walks; entity-anchored graph traversal when a schema is declared).
 
 #### VSA algebra
 

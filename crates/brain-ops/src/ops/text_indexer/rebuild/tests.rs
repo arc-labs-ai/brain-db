@@ -67,7 +67,7 @@ fn create_statement(
         predicate,
         object,
         confidence,
-        EvidenceRef::Inline(Default::default()),
+        EvidenceRef::default(),
         ExtractorId::from(0),
         0,
         1,

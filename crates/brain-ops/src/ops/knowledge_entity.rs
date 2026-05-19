@@ -10,7 +10,8 @@
 //! 5. Commits the transaction.
 //! 6. Maps `EntityOpError` to `OpError` per spec §28's error codes
 //!    (mapped through the substrate ErrorCode taxonomy until §28 error
-//!    codes land as first-class — see [`map_entity_op_error`]).
+//!    codes land as first-class — see the module-private
+//!    `map_entity_op_error` helper).
 //!
 //! Phase 16.6c handlers do **not** touch the entity HNSW (16.3) or
 //! emit subscription events. Both wire in later sub-tasks.
@@ -91,7 +92,8 @@ pub async fn handle_entity_create(
             canonical_name: req.canonical_name,
         }),
         now,
-    ).await;
+    )
+    .await;
 
     Ok(EntityCreateResponse {
         entity_id: id.to_bytes(),
@@ -185,7 +187,8 @@ pub async fn handle_entity_update(
             embedding_version_changed: after.embedding_version > 0,
         }),
         now,
-    ).await;
+    )
+    .await;
 
     Ok(EntityUpdateResponse {
         entity: entity_to_view(&after),
@@ -259,7 +262,8 @@ pub async fn handle_entity_rename(
             old_moved_to_alias: req.move_to_alias,
         }),
         now,
-    ).await;
+    )
+    .await;
 
     Ok(EntityRenameResponse {
         entity: entity_to_view(&after),
@@ -320,7 +324,8 @@ pub async fn handle_entity_merge(
             relations_rerouted: 0,
         }),
         now,
-    ).await;
+    )
+    .await;
 
     Ok(EntityMergeResponse {
         audit_id: merge_id.to_bytes(),
@@ -362,7 +367,8 @@ pub async fn handle_entity_unmerge(
             audit_id: [0; 16],
         }),
         now,
-    ).await;
+    )
+    .await;
 
     Ok(EntityUnmergeResponse {
         restored_entity_id: merged.to_bytes(),
@@ -400,7 +406,8 @@ pub async fn handle_entity_tombstone(
             reason: req.reason,
         }),
         now,
-    ).await;
+    )
+    .await;
 
     Ok(EntityTombstoneResponse {
         tombstoned_at_unix_nanos: now,
@@ -742,12 +749,13 @@ pub(crate) async fn emit_knowledge_event(
             timestamp_unix_nanos,
             text: None,
             knowledge_payload: Some(payload),
+            edge_payload: None,
             agent_id,
         };
         let _ = ctx.events.publish(envelope);
         return;
     };
-    ctx.publish_knowledge(kind, agent_id, payload, move |lsn, payload| EventEnvelope {
+    ctx.publish_knowledge(kind, payload, move |lsn, payload| EventEnvelope {
         lsn,
         event_type,
         memory_id: MemoryId::NULL,
@@ -757,6 +765,7 @@ pub(crate) async fn emit_knowledge_event(
         timestamp_unix_nanos,
         text: None,
         knowledge_payload: Some(payload),
+        edge_payload: None,
         agent_id,
     })
     .await;

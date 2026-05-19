@@ -79,8 +79,8 @@ where
             .await
             .expect("payload");
     }
-    let (frame, rest) = Frame::decode_with_max(&buf, brain_protocol::MAX_PAYLOAD_BYTES as u32)
-        .expect("decode");
+    let (frame, rest) =
+        Frame::decode_with_max(&buf, brain_protocol::MAX_PAYLOAD_BYTES as u32).expect("decode");
     debug_assert!(rest.is_empty());
     frame
 }
@@ -151,11 +151,7 @@ async fn round_trip(
     (resp_opcode, body)
 }
 
-async fn make_entity(
-    client: &mut TcpStream,
-    stream_id: u32,
-    name: &str,
-) -> [u8; 16] {
+async fn make_entity(client: &mut TcpStream, stream_id: u32, name: &str) -> [u8; 16] {
     let (op, body) = round_trip(
         client,
         stream_id,
@@ -239,7 +235,9 @@ fn event_request(subject: [u8; 16], when: u64) -> StatementCreateRequest {
 #[tokio::test(flavor = "current_thread")]
 async fn create_fact_round_trips() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let priya = make_entity(&mut client, 1, "Priya").await;
@@ -292,7 +290,9 @@ async fn create_fact_round_trips() {
 #[tokio::test(flavor = "current_thread")]
 async fn create_preference_auto_supersedes() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let priya = make_entity(&mut client, 1, "Priya").await;
@@ -329,7 +329,9 @@ async fn create_preference_auto_supersedes() {
 #[tokio::test(flavor = "current_thread")]
 async fn create_event_requires_event_at() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let priya = make_entity(&mut client, 1, "Priya").await;
@@ -355,7 +357,9 @@ async fn create_event_requires_event_at() {
 #[tokio::test(flavor = "current_thread")]
 async fn create_unknown_predicate_returns_error() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let priya = make_entity(&mut client, 1, "Priya").await;
@@ -382,7 +386,9 @@ async fn create_unknown_predicate_returns_error() {
 #[tokio::test(flavor = "current_thread")]
 async fn get_missing_statement_returns_error() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let (op, body) = round_trip(
@@ -406,7 +412,9 @@ async fn get_missing_statement_returns_error() {
 #[tokio::test(flavor = "current_thread")]
 async fn supersede_returns_new_id_and_version() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let priya = make_entity(&mut client, 1, "Priya").await;
@@ -450,7 +458,9 @@ async fn supersede_returns_new_id_and_version() {
 #[tokio::test(flavor = "current_thread")]
 async fn tombstone_returns_timestamp() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let priya = make_entity(&mut client, 1, "Priya").await;
@@ -507,7 +517,9 @@ async fn tombstone_returns_timestamp() {
 #[tokio::test(flavor = "current_thread")]
 async fn retract_returns_will_zero_hint() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let priya = make_entity(&mut client, 1, "Priya").await;
@@ -549,7 +561,9 @@ async fn retract_returns_will_zero_hint() {
 #[tokio::test(flavor = "current_thread")]
 async fn history_returns_chain_in_version_order() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let priya = make_entity(&mut client, 1, "Priya").await;
@@ -614,7 +628,9 @@ async fn history_returns_chain_in_version_order() {
 #[tokio::test(flavor = "current_thread")]
 async fn list_subject_predicate_filter() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let priya = make_entity(&mut client, 1, "Priya").await;
@@ -663,7 +679,9 @@ async fn list_subject_predicate_filter() {
 #[tokio::test(flavor = "current_thread")]
 async fn list_limit_zero_returns_error() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let (op, body) = round_trip(

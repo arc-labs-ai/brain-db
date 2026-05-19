@@ -46,6 +46,46 @@ pub enum OpError {
     #[error("too many memories targeted by one request")]
     TooManyMemories,
 
+    /// Schema-strict mode: STATEMENT_CREATE / QUERY referenced a
+    /// predicate qname that the active schema version doesn't
+    /// declare. Schemaless deployments never raise this — unknown
+    /// qnames are interned on first use. Maps to wire
+    /// `PredicateNotInSchema`.
+    #[error(
+        "predicate {predicate:?} is not declared in schema namespace {namespace:?} v{version}"
+    )]
+    PredicateNotInSchema {
+        predicate: String,
+        namespace: String,
+        version: u32,
+    },
+
+    /// Schema-strict mode: RELATION_CREATE referenced a relation type
+    /// qname that the active schema version doesn't declare. Maps to
+    /// wire `RelationTypeNotInSchema`.
+    #[error(
+        "relation type {type_name:?} is not declared in schema namespace {namespace:?} v{version}"
+    )]
+    RelationTypeNotInSchema {
+        type_name: String,
+        namespace: String,
+        version: u32,
+    },
+
+    /// Schema-strict mode: RELATION_CREATE would have exceeded the
+    /// declared cardinality (OneToOne / OneToMany / ManyToOne).
+    /// Maps to wire `CardinalityViolation`. Implicit-from-write
+    /// relation types behave as ManyToMany and never trigger this.
+    #[error(
+        "cardinality {kind} on relation_type {relation_type:?} violated: {existing} existing current row(s) exceed limit {limit}"
+    )]
+    CardinalityViolation {
+        relation_type: String,
+        kind: &'static str,
+        existing: u32,
+        limit: u32,
+    },
+
     /// Transaction was Active and either ran past its deadline (the
     /// sweeper marked it Expired), or has already moved past Active
     /// (Committed / Aborted). Distinct from `TxnNotFound` — the id
@@ -76,6 +116,14 @@ pub enum OpError {
     #[error(transparent)]
     ExecError(#[from] ExecError),
 
+    /// Caller requested `RecallStrategy::HybridOnly` but the shard
+    /// is missing a retriever slot (semantic / lexical) needed for
+    /// the hybrid path. We surface this loud instead of silently
+    /// falling back so latency-critical clients that depend on
+    /// hybrid signal-fusion notice the degradation immediately.
+    #[error("hybrid retrieval unavailable on this shard: {0}")]
+    HybridUnavailable(String),
+
     /// Catch-all for internal bookkeeping. Spec §09/01 §12: maps to
     /// wire `InternalError`. Not retryable.
     #[error("internal error: {0}")]
@@ -97,7 +145,22 @@ pub enum ErrorCode {
     TxnExpired,
     /// Txn id never existed on this server.
     TxnNotFound,
+    /// Schema-strict mode rejected the request because the predicate
+    /// qname isn't in the active schema's vocabulary.
+    PredicateNotInSchema,
+    /// Schema-strict mode rejected the request because the relation
+    /// type qname isn't in the active schema's vocabulary.
+    RelationTypeNotInSchema,
+    /// Schema-declared cardinality constraint would be violated.
+    /// Distinct from generic `Conflict` so SDK clients can recognise
+    /// the constraint failure and surface a domain-specific message.
+    CardinalityViolation,
     Overloaded,
+    /// Hybrid retrieval is unavailable on this shard. Returned
+    /// only when the client explicitly requested
+    /// `RecallStrategy::HybridOnly`; auto-strategy callers fall
+    /// back transparently and never see this code.
+    HybridUnavailable,
     InternalError,
 }
 
@@ -111,9 +174,13 @@ impl OpError {
             Self::Conflict(_) => ErrorCode::Conflict,
             Self::TxnExpired => ErrorCode::TxnExpired,
             Self::TxnNotFound => ErrorCode::TxnNotFound,
+            Self::PredicateNotInSchema { .. } => ErrorCode::PredicateNotInSchema,
+            Self::RelationTypeNotInSchema { .. } => ErrorCode::RelationTypeNotInSchema,
+            Self::CardinalityViolation { .. } => ErrorCode::CardinalityViolation,
             Self::QuotaExceeded(_) => ErrorCode::QuotaExceeded,
             Self::Unauthorized(_) => ErrorCode::Unauthorized,
             Self::Overloaded(_) => ErrorCode::Overloaded,
+            Self::HybridUnavailable(_) => ErrorCode::HybridUnavailable,
             Self::NotYetImplemented(_) | Self::Internal(_) => ErrorCode::InternalError,
             Self::PlanError(p) => match p {
                 PlanError::QueryTooExpensive { .. } | PlanError::InvalidParameters { .. } => {

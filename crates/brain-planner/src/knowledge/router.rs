@@ -122,6 +122,29 @@ pub struct RoutingDecision {
     /// temporal predicate into the retrievers as a pre-filter
     /// rather than applying it post-fusion.
     pub temporal_pushdown: bool,
+    /// How the graph retriever (if any) anchors its walk.
+    /// `Entity` is the typed-knowledge mode (relations table);
+    /// `MemoryFromSemantic` tells the executor to materialise
+    /// the anchor set from semantic top-K and walk the substrate
+    /// edge tables. `None` when graph isn't selected.
+    pub graph_anchor_mode: Option<GraphAnchorMode>,
+}
+
+/// Where the graph retriever gets its starting nodes. The
+/// router picks the mode; the executor reads `graph_anchor_mode`
+/// to dispatch the right walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphAnchorMode {
+    /// Caller supplied an entity in `QueryRequest.entity_anchor`.
+    /// The graph walks the typed relations table from that
+    /// entity.
+    Entity,
+    /// No entity anchor but the request carries cue text. The
+    /// executor runs semantic first, takes its top-K memory
+    /// hits, and walks substrate edges from each. This keeps
+    /// graph contributing on schemaless deployments where no
+    /// `EntityId` is ever known.
+    MemoryFromSemantic,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -203,16 +226,21 @@ pub fn route(req: &QueryRequest) -> RoutingDecision {
                 }
             }
         }
-        let retrievers = seen
+        let retrievers: Vec<RetrieverInvocation> = seen
             .into_iter()
-            .map(|retriever| RetrieverInvocation { retriever, weight: 1.0 })
+            .map(|retriever| RetrieverInvocation {
+                retriever,
+                weight: 1.0,
+            })
             .collect();
         let temporal_pushdown = features.has_time_filter || features.contains_temporal_expression;
+        let graph_anchor_mode = pick_graph_anchor_mode(&retrievers, &features);
         return RoutingDecision {
             features,
             retrievers,
             override_kind: OverrideKind::Explicit,
             temporal_pushdown,
+            graph_anchor_mode,
         };
     }
 
@@ -236,9 +264,17 @@ pub fn route(req: &QueryRequest) -> RoutingDecision {
 
     // Rule 5: default — fires only if no other rule matched
     // AND the query has text.
+    //
+    // Schemaless deployments live here: no entity anchor, no
+    // exact-id signature. Hybrid is still the default — semantic
+    // + lexical fuse, and graph rides along anchored at the
+    // semantic top-K so substrate `SimilarTo` / `Caused` edges
+    // contribute. The executor materialises the anchor set after
+    // semantic runs.
     if weights.is_empty() && features.has_text {
         upsert_max(&mut weights, Retriever::Semantic, 1.0);
         upsert_max(&mut weights, Retriever::Lexical, 1.0);
+        upsert_max(&mut weights, Retriever::Graph, 0.5);
     }
 
     // Rules 3 + 4 add no retrievers — they signal the filter
@@ -255,16 +291,44 @@ pub fn route(req: &QueryRequest) -> RoutingDecision {
     });
     sorted.truncate(MAX_RETRIEVERS);
 
-    let retrievers = sorted
+    let retrievers: Vec<RetrieverInvocation> = sorted
         .into_iter()
         .map(|(retriever, weight)| RetrieverInvocation { retriever, weight })
         .collect();
 
+    let graph_anchor_mode = pick_graph_anchor_mode(&retrievers, &features);
     RoutingDecision {
         features,
         retrievers,
         override_kind: OverrideKind::Auto,
         temporal_pushdown,
+        graph_anchor_mode,
+    }
+}
+
+/// Decide which graph mode the executor should run. Entity mode
+/// when the request carried an entity anchor; memory-from-
+/// semantic when graph is selected without an anchor but with
+/// text (the schemaless hybrid path). `None` when graph isn't in
+/// the retriever set at all.
+fn pick_graph_anchor_mode(
+    retrievers: &[RetrieverInvocation],
+    features: &ClassificationFeatures,
+) -> Option<GraphAnchorMode> {
+    let has_graph = retrievers.iter().any(|r| r.retriever == Retriever::Graph);
+    if !has_graph {
+        return None;
+    }
+    if features.has_entity_anchor {
+        Some(GraphAnchorMode::Entity)
+    } else if features.has_text {
+        Some(GraphAnchorMode::MemoryFromSemantic)
+    } else {
+        // Graph selected with neither entity anchor nor text —
+        // shouldn't reach here under the current rules, but if
+        // it does the executor's Graph invocation will simply
+        // skip with "no anchor" rather than panic.
+        None
     }
 }
 

@@ -260,7 +260,7 @@ fn base_request(cue: &str, top_k: u32) -> RecallRequest {
         age_bound_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
-        strategy_hint: None,
+        strategy: None,
         include_vectors: false,
         include_edges: false,
         include_text: false,
@@ -523,18 +523,32 @@ async fn recall_include_text_mixed_present_and_missing_rows() {
 
     let mut req = base_request("cue", 3);
     req.include_text = true;
-    let result = execute_recall(unwrap_recall(plan_recall(&req, &PlannerContext::default()).unwrap()), &fix.ctx)
-        .await
-        .unwrap();
+    let result = execute_recall(
+        unwrap_recall(plan_recall(&req, &PlannerContext::default()).unwrap()),
+        &fix.ctx,
+    )
+    .await
+    .unwrap();
 
     let by_id: std::collections::HashMap<_, _> = result
         .hits
         .iter()
-        .map(|h| (h.memory_id, h.text.as_deref().unwrap_or("<none>").to_string()))
+        .map(|h| {
+            (
+                h.memory_id,
+                h.text.as_deref().unwrap_or("<none>").to_string(),
+            )
+        })
         .collect();
-    assert_eq!(by_id.get(&fix.memory_ids[0]).map(String::as_str), Some("zero-text"));
+    assert_eq!(
+        by_id.get(&fix.memory_ids[0]).map(String::as_str),
+        Some("zero-text")
+    );
     assert_eq!(by_id.get(&fix.memory_ids[1]).map(String::as_str), Some(""));
-    assert_eq!(by_id.get(&fix.memory_ids[2]).map(String::as_str), Some("two-text"));
+    assert_eq!(
+        by_id.get(&fix.memory_ids[2]).map(String::as_str),
+        Some("two-text")
+    );
 }
 
 #[tokio::test]
@@ -550,9 +564,12 @@ async fn recall_include_text_round_trips_unicode_bytes() {
 
     let mut req = base_request("cue", 1);
     req.include_text = true;
-    let result = execute_recall(unwrap_recall(plan_recall(&req, &PlannerContext::default()).unwrap()), &fix.ctx)
-        .await
-        .unwrap();
+    let result = execute_recall(
+        unwrap_recall(plan_recall(&req, &PlannerContext::default()).unwrap()),
+        &fix.ctx,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.hits.len(), 1);
     assert_eq!(result.hits[0].text.as_deref(), Some(stored));
@@ -571,9 +588,12 @@ async fn recall_include_text_with_empty_stored_text_returns_empty_string() {
 
     let mut req = base_request("cue", 1);
     req.include_text = true;
-    let result = execute_recall(unwrap_recall(plan_recall(&req, &PlannerContext::default()).unwrap()), &fix.ctx)
-        .await
-        .unwrap();
+    let result = execute_recall(
+        unwrap_recall(plan_recall(&req, &PlannerContext::default()).unwrap()),
+        &fix.ctx,
+    )
+    .await
+    .unwrap();
 
     // Some("") is the right shape — empty IS the stored value, not
     // "missing" (which would also yield Some("") here, but we want
@@ -606,9 +626,12 @@ async fn recall_include_text_with_invalid_utf8_in_texts_table_surfaces_internal_
 
     let mut req = base_request("cue", 1);
     req.include_text = true;
-    let err = execute_recall(unwrap_recall(plan_recall(&req, &PlannerContext::default()).unwrap()), &fix.ctx)
-        .await
-        .expect_err("corrupt UTF-8 must fail recall, not silently coerce");
+    let err = execute_recall(
+        unwrap_recall(plan_recall(&req, &PlannerContext::default()).unwrap()),
+        &fix.ctx,
+    )
+    .await
+    .expect_err("corrupt UTF-8 must fail recall, not silently coerce");
     let msg = format!("{err:?}");
     assert!(
         msg.contains("UTF-8") || msg.contains("utf8"),

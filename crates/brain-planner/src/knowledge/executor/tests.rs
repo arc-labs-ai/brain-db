@@ -195,7 +195,12 @@ fn executes_three_retrievers_and_fuses() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn skips_graph_when_no_anchor() {
+fn graph_runs_in_memory_mode_when_no_entity_anchor() {
+    // Text + no entity anchor → graph runs in
+    // MemoryFromSemantic mode, anchored at semantic top-K.
+    // The graph mock returns a hit regardless of input — we
+    // assert graph succeeded (not skipped) and its hit shows
+    // up in the fused result.
     let sem = MockSemantic {
         response: Arc::new(StdMutex::new(Ok(vec![ranked_memory(1, 1, 0.9)]))),
         delay: None,
@@ -223,11 +228,42 @@ fn skips_graph_when_no_anchor() {
 
     assert_eq!(
         outcome_status(&result.metadata, Retriever::Graph),
-        Some(RetrieverStatus::Skipped("no entity anchor"))
+        Some(RetrieverStatus::Success)
     );
-    // Semantic + Lexical produced one item each; same ids, so
-    // fused result has two entries.
-    assert_eq!(result.items.len(), 2);
+    // Semantic + Lexical + Graph each produced one hit with
+    // distinct ids → three fused entries.
+    assert_eq!(result.items.len(), 3);
+}
+
+#[test]
+fn memory_anchor_graph_skips_when_semantic_returns_nothing() {
+    // Semantic returns no hits → there are no memory anchors
+    // → graph in memory-anchor mode has nothing to walk from.
+    // Skipped, not failed: the absence of anchors is a
+    // signal, not an error.
+    let sem = MockSemantic {
+        response: Arc::new(StdMutex::new(Ok(Vec::new()))),
+        delay: None,
+    };
+    let gr = MockGraph {
+        response: Arc::new(StdMutex::new(Ok(vec![ranked_memory(3, 1, 0.9)]))),
+    };
+    let (_dir, ctx) = make_ctx(Some(sem), None, Some(gr));
+
+    let req = QueryRequest {
+        text: Some("budget".into()),
+        retrievers: RetrieverSelection::Explicit(vec![Retriever::Semantic, Retriever::Graph]),
+        ..Default::default()
+    };
+    let qp = plan(&req).expect("plan");
+    let result = execute(&qp, &req, &ctx).expect("execute");
+
+    assert_eq!(
+        outcome_status(&result.metadata, Retriever::Graph),
+        Some(RetrieverStatus::Skipped(
+            "no memory hits from semantic to anchor graph walk"
+        ))
+    );
 }
 
 #[test]
@@ -331,6 +367,68 @@ fn missing_retriever_handle_errors() {
         err,
         ExecutionError::MissingRetriever(Retriever::Semantic)
     ));
+}
+
+// CH2 — missing lexical handle on a hybrid plan fails loud rather
+// than silently degrading. This is the "fail loud" half of the
+// HybridOnly contract: if a deployment is misconfigured to skip
+// wiring the lexical retriever, the executor must surface that as
+// `MissingRetriever(Lexical)` instead of returning a semantic-only
+// result that looks hybrid to the caller.
+#[test]
+fn missing_lexical_handle_on_hybrid_plan_errors() {
+    let sem = MockSemantic {
+        response: Arc::new(StdMutex::new(Ok(vec![ranked_memory(1, 1, 0.9)]))),
+        delay: None,
+    };
+    // Semantic wired, lexical absent. Plan asks for both.
+    let (_dir, ctx) = make_ctx(Some(sem), None, None);
+
+    let req = QueryRequest {
+        text: Some("budget".into()),
+        retrievers: RetrieverSelection::Explicit(vec![Retriever::Semantic, Retriever::Lexical]),
+        ..Default::default()
+    };
+    let qp = plan(&req).expect("plan");
+    let err = execute(&qp, &req, &ctx).expect_err("missing lexical handle must error");
+    assert!(
+        matches!(err, ExecutionError::MissingRetriever(Retriever::Lexical)),
+        "expected MissingRetriever(Lexical), got {err:?}",
+    );
+}
+
+#[test]
+fn missing_graph_handle_on_hybrid_plan_errors() {
+    // Same fail-loud contract for the graph retriever. The hybrid
+    // path's planner selects all three retrievers for an
+    // entity-anchored query; with the graph handle absent the
+    // executor must error on the graph invocation instead of
+    // silently routing to semantic + lexical only.
+    let sem = MockSemantic {
+        response: Arc::new(StdMutex::new(Ok(vec![ranked_memory(1, 1, 0.9)]))),
+        delay: None,
+    };
+    let lex = MockLexical {
+        response: Arc::new(StdMutex::new(Ok(vec![ranked_memory(2, 1, 0.9)]))),
+    };
+    let (_dir, ctx) = make_ctx(Some(sem), Some(lex), None);
+
+    let req = QueryRequest {
+        text: Some("topic".into()),
+        entity_anchor: Some(EntityId::new()),
+        retrievers: RetrieverSelection::Explicit(vec![
+            Retriever::Semantic,
+            Retriever::Lexical,
+            Retriever::Graph,
+        ]),
+        ..Default::default()
+    };
+    let qp = plan(&req).expect("plan");
+    let err = execute(&qp, &req, &ctx).expect_err("missing graph handle must error");
+    assert!(
+        matches!(err, ExecutionError::MissingRetriever(Retriever::Graph)),
+        "expected MissingRetriever(Graph), got {err:?}",
+    );
 }
 
 // ---------------------------------------------------------------------------

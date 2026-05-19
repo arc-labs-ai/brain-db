@@ -129,6 +129,27 @@ docker-clippy:
 # The full verification suite — what CI runs.
 verify: fmt-check build clippy test check-skills
 
+# The production gate. Runs every check CI runs (`.github/workflows/ci.yml`)
+# locally in one command. Sequential link (`-j 1`) on the test sweep
+# matches CI's OOM-avoidance posture; if you have ≥ 16 GB free, drop
+# `-j 1` for faster local runs. Release-build smoke + doc build round
+# out the gates. The acceptance benches are not run here — they live
+# in the nightly perf workflow because they take 5–15 minutes each.
+prod-verify:
+    cargo fmt --all -- --check
+    cargo clippy --workspace --tests --all-features -- -D warnings
+    cargo test --workspace --all-targets --no-fail-fast -j 1
+    cargo test --workspace --doc
+    cargo doc --workspace --no-deps
+    cargo build --release --bin brain-server --bin brain-cli
+    ./scripts/check-skills.sh
+
+# Run the acceptance benches (asserted p50/p99 from spec §16/02).
+# Same gates the nightly-perf workflow runs.
+prod-bench:
+    cargo bench -p brain-planner --bench relation_traverse
+    cargo bench -p brain-index --bench recall
+
 # Run miri on brain-storage's lib tests. Miri doesn't shim our syscalls
 # (mmap/mremap/pwritev2/...), so syscall-bound tests are gated under
 # `cfg(not(miri))`; the ~47 pure-data tests run. See

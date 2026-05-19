@@ -299,21 +299,18 @@ impl LlmExtractor {
 
     fn project_one(&self, v: &Value) -> Option<ExtractedItem> {
         match &self.target {
-            ExtractorTarget::Entity { entity_type } => project_entity(
-                v,
-                entity_type,
-                self.id.raw(),
-                self.extractor_version,
-            ),
-            ExtractorTarget::Statement { kind } => {
-                project_statement(v, kind_to_byte(*kind), self.id.raw(), self.extractor_version)
+            ExtractorTarget::Entity { entity_type } => {
+                project_entity(v, entity_type, self.id.raw(), self.extractor_version)
             }
-            ExtractorTarget::Relation { relation_type } => project_relation(
+            ExtractorTarget::Statement { kind } => project_statement(
                 v,
-                relation_type,
+                kind_to_byte(*kind),
                 self.id.raw(),
                 self.extractor_version,
             ),
+            ExtractorTarget::Relation { relation_type } => {
+                project_relation(v, relation_type, self.id.raw(), self.extractor_version)
+            }
             ExtractorTarget::EntityOrStatement => {
                 if v.get("predicate").is_some() {
                     project_statement(v, 1, self.id.raw(), self.extractor_version)
@@ -467,8 +464,8 @@ fn cache_put(
 // ---------------------------------------------------------------------------
 
 fn validate_against(schema: &JSONSchema, content: &str) -> Result<Value, String> {
-    let parsed: Value = serde_json::from_str(content)
-        .map_err(|e| format!("response is not valid JSON: {e}"))?;
+    let parsed: Value =
+        serde_json::from_str(content).map_err(|e| format!("response is not valid JSON: {e}"))?;
     if let Err(mut errs) = schema.validate(&parsed) {
         let msg = match errs.next() {
             Some(e) => e.to_string(),
@@ -500,11 +497,7 @@ impl Extractor for LlmExtractor {
         self.extractor_version
     }
 
-    fn run<'a>(
-        &'a self,
-        ctx: &'a ExtractionContext<'a>,
-        mem: &'a Memory,
-    ) -> ExtractionFuture<'a> {
+    fn run<'a>(&'a self, ctx: &'a ExtractionContext<'a>, mem: &'a Memory) -> ExtractionFuture<'a> {
         Box::pin(async move {
             let started = ctx.now_unix_nanos;
             let Some(inner) = self.inner.as_ref() else {
@@ -530,8 +523,7 @@ impl Extractor for LlmExtractor {
                     extractor_version,
                     model_id_hash,
                 ) {
-                    return match decode_cached(&row.response_blob, inner.response_schema.as_ref())
-                    {
+                    return match decode_cached(&row.response_blob, inner.response_schema.as_ref()) {
                         Ok(parsed) => {
                             let items = self.project_value(&parsed);
                             ExtractionResult::success(items, started, started)
@@ -568,11 +560,7 @@ impl Extractor for LlmExtractor {
             let resp1 = match inner.client.complete(request.clone()).await {
                 Ok(r) => r,
                 Err(e) => {
-                    return ExtractionResult::failure(
-                        llm_error_reason(&e),
-                        started,
-                        started,
-                    );
+                    return ExtractionResult::failure(llm_error_reason(&e), started, started);
                 }
             };
 
@@ -817,13 +805,19 @@ mod tests {
             client,
             None,
             None,
-            Some(CostBudget { per_call_micro_usd: 1 }),
+            Some(CostBudget {
+                per_call_micro_usd: 1,
+            }),
         );
         let reg = ExtractorRegistry::new();
         let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice met Bob")));
         assert_eq!(r.status, ExtractionStatus::SkippedBudget);
         assert!(r.status_reason.contains("exceeds per-call budget"));
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "no LLM call when over budget");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no LLM call when over budget"
+        );
     }
 
     #[test]
@@ -876,10 +870,7 @@ mod tests {
         });
         let bad = ok_response("[\"plain string\"]", 50);
         let good = ok_response("[{\"name\":\"Alice\"}]", 50);
-        let client = Arc::new(MockClient::new(
-            "claude-haiku-4-5",
-            vec![Ok(bad), Ok(good)],
-        ));
+        let client = Arc::new(MockClient::new("claude-haiku-4-5", vec![Ok(bad), Ok(good)]));
         let calls = client.calls.clone();
         let ext = build_ext(client, None, Some(schema), None);
         let reg = ExtractorRegistry::new();
@@ -912,7 +903,9 @@ mod tests {
     fn rate_limit_error_surfaces_retry_after() {
         let client = Arc::new(MockClient::new(
             "claude-haiku-4-5",
-            vec![Err(LlmError::RateLimit { retry_after_ms: 1500 })],
+            vec![Err(LlmError::RateLimit {
+                retry_after_ms: 1500,
+            })],
         ));
         let ext = build_ext(client, None, None, None);
         let reg = ExtractorRegistry::new();
@@ -947,7 +940,11 @@ mod tests {
         let r = futures_lite::future::block_on(ext2.run(&ctx(&reg), &memory("Alice")));
         assert_eq!(r.status, ExtractionStatus::Success);
         assert_eq!(r.items.len(), 1);
-        assert_eq!(calls2.load(Ordering::SeqCst), 0, "cache hit: zero LLM calls");
+        assert_eq!(
+            calls2.load(Ordering::SeqCst),
+            0,
+            "cache hit: zero LLM calls"
+        );
     }
 
     #[test]

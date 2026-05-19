@@ -31,8 +31,15 @@ pub async fn run(
         b = b.context_filter(args.filter_context);
     }
     if !args.filter_kind.is_empty() {
-        let kinds = args.filter_kind.into_iter().map(|k| k.into_wire()).collect();
+        let kinds = args
+            .filter_kind
+            .into_iter()
+            .map(|k| k.into_wire())
+            .collect();
         b = b.kind_filter(kinds);
+    }
+    if let Some(s) = args.strategy {
+        b = b.strategy(s.into_wire());
     }
     if let Some(t) = txn {
         b = b.txn(t);

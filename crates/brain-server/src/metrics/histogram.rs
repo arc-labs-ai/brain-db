@@ -2,8 +2,8 @@
 //!
 //! Buckets are cumulative ("less-than-or-equal" semantics) — the
 //! standard Prometheus convention. The implicit `+Inf` bucket is
-//! always the last entry of [`Self::counts`], so a fully-stored
-//! histogram has `buckets.len() + 1` counts.
+//! always the last entry of the internal `counts` vector, so a
+//! fully-stored histogram has `buckets.len() + 1` counts.
 //!
 //! ## Why an integer sum
 //!

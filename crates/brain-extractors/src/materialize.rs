@@ -1,5 +1,6 @@
-//! Convert persisted [`brain_metadata::ExtractorDefinition`] rows
-//! into runtime `Arc<dyn Extractor>` instances. Spec §22 +
+//! Convert persisted
+//! [`brain_metadata::tables::knowledge::extractor::ExtractorDefinition`]
+//! rows into runtime `Arc<dyn Extractor>` instances. Spec §22 +
 //! §21/05 §1.
 //!
 //! Called once at server / shard startup to populate the
@@ -17,9 +18,7 @@ use brain_llm::ModelRouter;
 use brain_metadata::tables::knowledge::extractor::ExtractorDefinition;
 use brain_metadata::LlmCacheDb;
 use brain_protocol::schema::ast::{CacheConfig, CostExpr, CostUnit, DurationAst, DurationUnit};
-use brain_protocol::schema::{
-    ExtractorDef, ExtractorField, ExtractorKindAst, ExtractorTarget,
-};
+use brain_protocol::schema::{ExtractorDef, ExtractorField, ExtractorKindAst, ExtractorTarget};
 use parking_lot::Mutex;
 use serde_json::Value;
 
@@ -34,7 +33,7 @@ const DEFAULT_LLM_CONFIDENCE_THRESHOLD: f32 = 0.7;
 
 /// Bundle of optional dependencies the materializer needs to
 /// build the three extractor kinds. Phase 21.5 wires `model_router`
-/// + `llm_cache` at shard startup; before that, callers pass
+/// and `llm_cache` at shard startup; before that, callers pass
 /// [`MaterializeDeps::default()`] (every field `None`) and LLM
 /// rows register as degraded.
 #[derive(Clone, Default)]
@@ -51,10 +50,7 @@ pub fn materialize_pattern_extractor(
 ) -> Result<PatternExtractor, ExtractorError> {
     if def.kind() != Some(ExtractorKind::Pattern) {
         return Err(ExtractorError::OutputDecodeFailed {
-            reason: format!(
-                "definition kind byte {} is not Pattern",
-                def.kind
-            ),
+            reason: format!("definition kind byte {} is not Pattern", def.kind),
         });
     }
     let ast = decode_definition_blob(&def.definition_blob)?;
@@ -80,10 +76,7 @@ pub fn materialize_classifier_extractor(
 ) -> Result<ClassifierExtractor, ExtractorError> {
     if def.kind() != Some(ExtractorKind::Classifier) {
         return Err(ExtractorError::OutputDecodeFailed {
-            reason: format!(
-                "definition kind byte {} is not Classifier",
-                def.kind
-            ),
+            reason: format!("definition kind byte {} is not Classifier", def.kind),
         });
     }
     let ast = decode_definition_blob(&def.definition_blob)?;
@@ -217,8 +210,8 @@ pub fn materialize_llm_extractor(
         CacheConfig::Disabled => None,
         CacheConfig::Enabled => deps.llm_cache.clone(),
     };
-    let cache_ttl = extract_cache_ttl(&ast)
-        .unwrap_or_else(|| Duration::from_secs(DEFAULT_LLM_CACHE_TTL_SECS));
+    let cache_ttl =
+        extract_cache_ttl(&ast).unwrap_or_else(|| Duration::from_secs(DEFAULT_LLM_CACHE_TTL_SECS));
 
     let examples = extract_examples(&ast);
     let extractor = LlmExtractor::build(
@@ -771,10 +764,7 @@ mod tests {
 
     #[test]
     fn materialize_llm_missing_prompt_is_degraded() {
-        let blob = llm_ast(
-            "p",
-            vec![ExtractorField::Model("claude-haiku-4-5".into())],
-        );
+        let blob = llm_ast("p", vec![ExtractorField::Model("claude-haiku-4-5".into())]);
         let r = row(1, ExtractorKind::Llm, blob);
         let deps = MaterializeDeps {
             classifier_model: None,
@@ -915,8 +905,7 @@ mod tests {
                 ],
             ),
         );
-        let (reg, errs) =
-            build_registry_from_definitions(&[llm], &MaterializeDeps::default());
+        let (reg, errs) = build_registry_from_definitions(&[llm], &MaterializeDeps::default());
         assert!(errs.is_empty());
         assert_eq!(reg.iter_enabled().count(), 1);
         // Still registered as kind=Llm — degradation is internal state.

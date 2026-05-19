@@ -91,7 +91,7 @@ pub struct OpsContext {
     /// Per-shard semantic retriever (phase 23.1). Reads the
     /// substrate memory HNSW + (when wired) the statement
     /// HNSW. Phase 23's hybrid query consumes this slot
-    /// alongside [`lexical_retriever`].
+    /// alongside [`Self::lexical_retriever`].
     pub semantic_retriever: Option<Arc<dyn SemanticRetriever>>,
     /// Per-shard graph retriever (phase 23.2). Reads the
     /// entity / relation / statement redb tables. Phase 23's
@@ -104,8 +104,8 @@ pub struct OpsContext {
     /// §28/08 §1.
     pub schema_gate: SchemaGate,
     /// WAL append sink for the knowledge-layer subscribe-replay
-    /// pipeline. Knowledge handlers ([`crate::ops::knowledge_*`])
-    /// call [`OpsContext::publish_knowledge`] after their successful
+    /// pipeline. Knowledge handlers (the `crate::ops::knowledge_*`
+    /// modules) call [`OpsContext::publish_knowledge`] after their successful
     /// redb commit; that helper appends a `WalPayload::Knowledge`
     /// record carrying the rkyv-encoded
     /// [`brain_protocol::knowledge::KnowledgeEventPayload`] body, then
@@ -304,17 +304,11 @@ impl OpsContext {
     /// type so subscribe-replay can decode it back into the matching
     /// `KnowledgeEventPayload` variant.
     ///
-    /// `agent_id` stamps the WAL record so subscribe-replay can
-    /// route knowledge events through the per-agent `agents`
-    /// filter — without it, a multi-tenant subscriber would
-    /// silently drop every replayed knowledge event.
-    ///
     /// `make_envelope` builds the bus envelope from the assigned LSN.
     /// Most callers will just stamp `lsn` and clone their payload in.
     pub async fn publish_knowledge<F>(
         &self,
         kind: brain_storage::wal::kinds::WalRecordKind,
-        agent_id: brain_core::AgentId,
         payload: brain_protocol::knowledge::KnowledgeEventPayload,
         make_envelope: F,
     ) where
@@ -336,25 +330,14 @@ impl OpsContext {
                 }
             };
             let body_len = body.len();
-            let agent_bytes: [u8; 16] = agent_id.into();
-            let agent_id_lo64 = u64::from_be_bytes(
-                agent_bytes[8..16]
-                    .try_into()
-                    .expect("invariant: AgentId is 16 bytes"),
-            );
-            // Build through KnowledgeRecord so the payload bytes carry
-            // the agent_id prefix that subscribe-replay's `from_wal_record`
-            // decodes back into `EventEnvelope.agent_id`.
-            let typed = brain_storage::wal::payload::WalPayload::Knowledge(
-                brain_storage::wal::payload::KnowledgeRecord::new(kind, agent_id, body),
-            );
-            let record = brain_storage::wal::record::WalRecord::from_typed(
-                brain_storage::wal::record::Lsn(0),
-                0,
-                now_unix_nanos_ctx(),
-                agent_id_lo64,
-                &typed,
-            );
+            let record = brain_storage::wal::record::WalRecord {
+                lsn: brain_storage::wal::record::Lsn(0),
+                kind,
+                flags: 0,
+                timestamp_ns: now_unix_nanos_ctx(),
+                agent_id_lo64: 0,
+                payload: body,
+            };
             match sink.append(record).await {
                 Ok(lsn) => {
                     tracing::trace!(
@@ -380,6 +363,77 @@ impl OpsContext {
         } else {
             self.events.publish_prestamped(env);
         }
+    }
+}
+
+impl OpsContext {
+    /// Persist a batch of auto-derived `SimilarTo` edges in a single
+    /// redb write txn. Used by the AutoEdgeWorker (one wtxn per cycle
+    /// keeps the writer's lock window short even when the worker
+    /// drains hundreds of memories).
+    ///
+    /// Each pair becomes `(from, SimilarTo, to)` plus the auto-mirror
+    /// row that `brain_metadata::tables::edge::link` writes for
+    /// symmetric builtin kinds. Existing rows are overwritten with the
+    /// fresh `EdgeData` — this is what makes idempotent re-drive safe.
+    /// Self-edges (`from == to`) and duplicate pairs within `pairs` are
+    /// the caller's responsibility to filter; the helper writes
+    /// whatever it's handed.
+    ///
+    /// Returns the number of (logical) edges written. With the auto-
+    /// mirror, the physical row count in `EDGES_TABLE` is `2 *
+    /// returned` (each pair lands once forward and once mirrored).
+    pub fn write_auto_edges(
+        &self,
+        pairs: &[(brain_core::MemoryId, brain_core::MemoryId, f32)],
+    ) -> Result<usize, String> {
+        use brain_core::{EdgeKind, EdgeKindRef, NodeRef};
+        use brain_metadata::tables::edge::{
+            self, derived_by, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE,
+            EDGES_TABLE,
+        };
+
+        if pairs.is_empty() {
+            return Ok(0);
+        }
+
+        let now = now_unix_nanos_ctx();
+        let mut written = 0usize;
+        let metadata = self.executor.metadata.clone();
+        let mut db = metadata.lock();
+        let wtxn = db
+            .write_txn()
+            .map_err(|e| format!("auto_edges write_txn: {e:?}"))?;
+        {
+            let mut edges_t = wtxn
+                .open_table(EDGES_TABLE)
+                .map_err(|e| format!("auto_edges open EDGES: {e:?}"))?;
+            let mut edges_rev_t = wtxn
+                .open_table(EDGES_REVERSE_TABLE)
+                .map_err(|e| format!("auto_edges open EDGES_REVERSE: {e:?}"))?;
+            for (from, to, sim) in pairs {
+                let data = EdgeData::new(
+                    *sim,
+                    origin::AUTO_DERIVED,
+                    derived_by::SIMILARITY_WORKER,
+                    now,
+                );
+                edge::link(
+                    &mut edges_t,
+                    &mut edges_rev_t,
+                    NodeRef::Memory(*from),
+                    EdgeKindRef::Builtin(EdgeKind::SimilarTo),
+                    NodeRef::Memory(*to),
+                    zero_disambiguator(),
+                    &data,
+                )
+                .map_err(|e| format!("auto_edges link: {e:?}"))?;
+                written += 1;
+            }
+        }
+        wtxn.commit()
+            .map_err(|e| format!("auto_edges commit: {e:?}"))?;
+        Ok(written)
     }
 }
 

@@ -146,9 +146,11 @@ async fn round_trip(
     send_frame(client, Frame::new(opcode, FLAG_EOS, stream_id, payload)).await;
     let resp = read_one_frame(client).await;
     let resp_opcode = resp.header.opcode_u16();
-    let body =
-        ResponseBody::decode(Opcode::from_u16(resp_opcode).expect("known opcode"), &resp.payload)
-            .expect("decode resp");
+    let body = ResponseBody::decode(
+        Opcode::from_u16(resp_opcode).expect("known opcode"),
+        &resp.payload,
+    )
+    .expect("decode resp");
     (resp_opcode, body)
 }
 
@@ -183,7 +185,9 @@ async fn create_person(
 #[tokio::test(flavor = "current_thread")]
 async fn full_entity_lifecycle_create_merge_unmerge_rename_list_tombstone() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let mut stream = 1u32;
@@ -372,7 +376,10 @@ async fn full_entity_lifecycle_create_merge_unmerge_rename_list_tombstone() {
             let ids: std::collections::HashSet<[u8; 16]> =
                 frame.items.iter().map(|i| i.entity.entity_id).collect();
             assert!(ids.contains(&alice));
-            assert!(!ids.contains(&alyss), "Alyss hidden by include_tombstoned=false");
+            assert!(
+                !ids.contains(&alyss),
+                "Alyss hidden by include_tombstoned=false"
+            );
         }
         other => panic!("list expected, got {other:?}"),
     }

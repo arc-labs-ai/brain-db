@@ -1,6 +1,6 @@
 # 28.13 Query Wire Frames
 
-Request/response body schemas for `0x0160–0x0163` — the hybrid-query opcodes. These are the primary read API of the knowledge layer once a schema is declared.
+Request/response body schemas for `0x0160–0x0163` — the hybrid-query opcodes. These are the primary read API of the knowledge layer and accept traffic regardless of schema state.
 
 Cross-references:
 - [`../23_retrievers/00_purpose.md`](../23_retrievers/00_purpose.md) — three retrievers (semantic / lexical / graph) + RRF fusion.
@@ -20,7 +20,7 @@ Responses live at `0x01E0–0x01E3`.
 
 `QUERY` (`0x0160`) is the primary structured query opcode. `RECALL_HYBRID` (`0x0163`) is the simple-text fast path used by clients that just want hybrid text-only retrieval without an explicit query language.
 
-When a schema is declared, the substrate's `RECALL_REQ` (`0x0021`) also routes through the hybrid retriever transparently (see [`./08_schema_optional_mode.md`](./08_schema_optional_mode.md) §5). The wire response carries the same `RecallResponseFrame` shape with knowledge-layer fields populated.
+The substrate's `RECALL_REQ` (`0x0021`) runs the hybrid path by default in every deployment (see [`./08_schema_optional_mode.md`](./08_schema_optional_mode.md) §5). The wire response carries `contributing_retrievers` and `fused_score` populated whether or not a schema has been declared.
 
 ## 2. Shared types
 
@@ -42,7 +42,12 @@ pub struct QueryRequest {
 
 pub struct QueryFilters {
     pub entity_type_id: u32,                // 0 = no filter
-    pub predicate: String,                  // "" = no filter
+    /// Predicate filter as canonical `"namespace:name"` qnames.
+    /// Empty vec = no filter. The planner resolves each qname through
+    /// the predicate registry per request — unknown qnames produce an
+    /// empty result set in open-vocabulary mode and `PredicateNotInSchema`
+    /// (0x004B) when a schema is active for the namespace.
+    pub predicate_filter: Vec<String>,
     pub time_range_start_unix_nanos: u64,
     pub time_range_end_unix_nanos: u64,
     pub min_confidence: f32,
@@ -146,7 +151,9 @@ The substrate streaming model: per-frame, `EOS` on the tail. The tail body is a 
 
 - `QUERY_TIMEOUT` (substrate `Unavailable`) — wall budget exceeded. Tail frame carries whatever results were ready; clients see a partial result with `QueryResultTail.truncated_by = 2`.
 - `QUERY_OVER_BUDGET` (substrate `ResourceExhausted`) — per-shard memory or candidate-pool cap blown. Frame stream ends without an EOS tail; an `ERROR` frame closes the stream.
-- `SchemaNotDeclared` — schema-optional mode, returned before any result frame.
+- `PredicateNotInSchema` (0x004B) — strict mode only; `filters.predicate_filter` contains a qname not declared in the active schema.
+- `RelationTypeNotInSchema` (0x004C) — strict mode only; the DSL or graph step referenced an unknown relation type.
+- `HybridUnavailable` (0x0083) — a required retriever component is not currently servable (e.g. inside a transaction, during index rebuild).
 - `INVALID_ARGUMENT` — DSL parse failure, `top_k > 1000`, all retrievers disabled.
 
 ### 3.4 Cancellation
@@ -254,7 +261,7 @@ Same shape as `QUERY` (streamed `QueryResultItem` frames + `QueryResultTail`). C
 
 `RECALL_HYBRID` (`0x0163`) returns a mix of `MemoryResult`, `EntityView`, `StatementView`, `RelationView` — leveraging the entity / statement / relation indexes alongside the memory HNSW.
 
-Schema-declared deployments may use either; the substrate `RECALL_REQ` is the back-compat path. Schema-optional deployments can only use `RECALL_REQ`.
+Both deployment postures may use either: the substrate `RECALL_REQ` returns memory results from the hybrid path; `RECALL_HYBRID` additionally surfaces typed entity / statement / relation results that have been populated from prior knowledge writes (open-vocabulary or schema-declared).
 
 ### 6.4 Errors
 

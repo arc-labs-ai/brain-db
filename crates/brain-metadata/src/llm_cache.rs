@@ -154,8 +154,8 @@ pub enum LlmCacheError {
 /// Per-shard LLM extractor response cache.
 ///
 /// Mirrors [`crate::db::MetadataDb`]'s `&mut self` single-writer
-/// discipline: only one writer task per shard can call [`write_txn`].
-/// Many concurrent readers are allowed via [`read_txn`].
+/// discipline: only one writer task per shard can call `write_txn`.
+/// Many concurrent readers are allowed via `read_txn`.
 ///
 /// (`write_txn` is the imported method name; in Rust this section
 /// would link via `[`LlmCacheDb::write_txn`]` — keeping the prose
@@ -259,8 +259,12 @@ mod tests {
 
         // Tables exist — opening for read should not return TableDoesNotExist.
         let rtxn = db.read_txn().unwrap();
-        let _ = rtxn.open_table(LLM_RESPONSES_TABLE).expect("responses table exists");
-        let _ = rtxn.open_table(LLM_RESPONSE_TTL_TABLE).expect("ttl table exists");
+        let _ = rtxn
+            .open_table(LLM_RESPONSES_TABLE)
+            .expect("responses table exists");
+        let _ = rtxn
+            .open_table(LLM_RESPONSE_TTL_TABLE)
+            .expect("ttl table exists");
     }
 
     #[test]
@@ -285,7 +289,10 @@ mod tests {
         let db = LlmCacheDb::open(&path).expect("re-open");
         let rtxn = db.read_txn().unwrap();
         let t = rtxn.open_table(LLM_RESPONSES_TABLE).unwrap();
-        let got = t.get(&sample_key()).unwrap().expect("row present after re-open");
+        let got = t
+            .get(&sample_key())
+            .unwrap()
+            .expect("row present after re-open");
         assert_eq!(got.value(), sample_response());
     }
 

@@ -9,7 +9,7 @@
 //! - **Internal id is `u32`** (spec §06/03 §2). Saves ~80 MB at the
 //!   spec's 10M-memory per-shard ceiling vs `usize`. Cast to `usize`
 //!   at the hnsw_rs API boundary; overflow at `u32::MAX` returns
-//!   [`MemoryIdAlreadyInserted`]'s sibling [`IdMapError::Exhausted`].
+//!   [`IdMapError::Exhausted`] (sibling of `AlreadyInserted`).
 //! - **Forward key is `[u8; 16]`** (the MemoryId's wire-form bytes),
 //!   matching brain-metadata's table-key convention. Avoids any
 //!   coupling to MemoryId's internal `u128` hashing.

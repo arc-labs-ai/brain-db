@@ -91,6 +91,10 @@ pub enum Command {
         shard: usize,
         output_path: Option<String>,
     },
+    /// `extract --backfill --memory-id <id> | --since <ts> | --all`.
+    /// Re-enqueues existing memories for the three-tier extractor
+    /// pipeline (POST `/v1/extract/backfill`).
+    Extract(crate::commands::extract::ExtractAction),
 }
 
 /// Parse a `Vec<String>` (typically `env::args().skip(1).collect()`).
@@ -240,6 +244,10 @@ pub fn parse(argv: Vec<String>) -> Result<Args> {
             shard,
             output_path: family.value.clone(),
         },
+        Some("extract") => {
+            use crate::commands::extract::ExtractAction;
+            Command::Extract(ExtractAction::parse(&positional[1..], &family)?)
+        }
         Some(other) => return Err(anyhow!("unknown subcommand `{other}`")),
     };
 

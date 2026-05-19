@@ -68,11 +68,7 @@ async fn upload_text_round_trip() {
     .await;
 
     let client = Client::connect(addr).await.expect("connect");
-    let outcome = client
-        .schema()
-        .upload_text(ACME_V1)
-        .await
-        .expect("upload");
+    let outcome = client.schema().upload_text(ACME_V1).await.expect("upload");
     assert_eq!(outcome.namespace, "acme");
     assert_eq!(outcome.schema_version, Some(1));
     assert!(outcome.errors.is_empty());
@@ -193,7 +189,10 @@ async fn upload_validation_error_surfaces_as_none_version() {
 async fn validate_returns_would_be_version() {
     let (addr, _server) = common::spawn_mock_server(move |mut socket| async move {
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode_u16(), Opcode::SchemaValidateReq.as_u16());
+        assert_eq!(
+            frame.header.opcode_u16(),
+            Opcode::SchemaValidateReq.as_u16()
+        );
         common::write_frame(
             &mut socket,
             Opcode::SchemaValidateResp.as_u16(),
@@ -211,11 +210,7 @@ async fn validate_returns_would_be_version() {
     .await;
 
     let client = Client::connect(addr).await.expect("connect");
-    let outcome = client
-        .schema()
-        .validate(ACME_V1)
-        .await
-        .expect("validate");
+    let outcome = client.schema().validate(ACME_V1).await.expect("validate");
     assert_eq!(outcome.namespace, "acme");
     assert_eq!(outcome.would_be_version, 2);
     assert!(outcome.errors.is_empty());

@@ -8,8 +8,9 @@
 //!   on-heap data that runtime code mutates.
 //! - [`exposition`] — wire-format helpers shared by every emit site
 //!   (HELP / TYPE headers, labelled / labelless lines).
-//! - [`format`] — the entry point: walks the [`crate::admin::AdminState`]
-//!   and produces the full Prometheus body for `/metrics`.
+//! - [`mod@format`] — the entry point: walks the
+//!   [`crate::admin::AdminState`] and produces the full Prometheus
+//!   body for `/metrics`.
 //!
 //! ## Scope of 12.1a
 //!

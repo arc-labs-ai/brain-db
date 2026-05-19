@@ -82,6 +82,8 @@ A more specific error code accompanies each category. The complete table:
 | `TopKOutOfRange` | top_k exceeds limit |
 | `BudgetTooLarge` | Plan/reason budget exceeds limit |
 | `BadModelFingerprint` | Model fingerprint doesn't match a known model |
+| `PredicateNotInSchema` (0x004B) | Predicate qname is not declared in the active schema for this namespace. Returned in strict mode only. |
+| `RelationTypeNotInSchema` (0x004C) | Relation type qname is not declared in the active schema for this namespace. Returned in strict mode only. |
 
 ### 3.5 Not found (Category: `NotFound`)
 
@@ -102,6 +104,7 @@ A more specific error code accompanies each category. The complete table:
 | `TransactionTimeout` | Transaction timed out before commit |
 | `StreamIdInUse` | Tried to open a stream with an already-active stream_id |
 | `SubscriptionLsnTooOld` | Subscription resumption LSN is past WAL retention |
+| `CardinalityViolation` (0x0065) | RELATION_CREATE would violate the declared cardinality (`one_to_one` / `many_to_one` / `one_to_many`). The existing edge must be explicitly `RELATION_SUPERSEDE`d first. |
 
 ### 3.7 Resource exhausted (Category: `ResourceExhausted`)
 
@@ -133,6 +136,7 @@ A more specific error code accompanies each category. The complete table:
 | `Overloaded` | Server temporarily overloaded |
 | `Restarting` | Server is restarting (drain mode) |
 | `Maintenance` | Server is in maintenance mode |
+| `HybridUnavailable` (0x0083) | The request asked for `HybridOnly` (or implicit hybrid via the knowledge `QUERY` opcode) but a required retriever component (lexical index, statement HNSW, graph store) is not currently servable — for example inside a transaction, during index rebuild, or on a substrate-only deployment that has not initialised the optional retrievers. Clients may downgrade to `SubstrateOnly` or retry once the capability returns. |
 
 ## 4. ErrorDetails
 

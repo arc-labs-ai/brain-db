@@ -40,11 +40,7 @@ pub async fn run(
 /// no longer knows the id or it's no longer Active). Other errors
 /// (network, validation, …) leave the session untouched — the user
 /// can retry.
-fn clear_if_matches<T>(
-    session: &mut Session,
-    bytes: [u8; 16],
-    result: &Result<T, ClientError>,
-) {
+fn clear_if_matches<T>(session: &mut Session, bytes: [u8; 16], result: &Result<T, ClientError>) {
     if session.active_txn != Some(bytes) {
         return;
     }

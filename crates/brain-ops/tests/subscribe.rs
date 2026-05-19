@@ -226,7 +226,9 @@ fn lifecycle_unsubscribe_unknown_stream_id_returns_not_found() {
         let resp = dispatch(
             RequestBody::Unsubscribe(UnsubscribeRequest {
                 target_stream_id: 99,
-            }), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            }),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await;
         let err = resp.unwrap_err();
@@ -326,7 +328,9 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
             RequestBody::TxnBegin(TxnBeginRequest {
                 txn_id,
                 timeout_seconds: 60,
-            }), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            }),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap();
@@ -381,7 +385,9 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
 
         // COMMIT.
         dispatch(
-            RequestBody::TxnCommit(TxnCommitRequest { txn_id }), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::TxnCommit(TxnCommitRequest { txn_id }),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap();
@@ -411,7 +417,9 @@ fn publish_txn_abort_emits_nothing() {
             RequestBody::TxnBegin(TxnBeginRequest {
                 txn_id,
                 timeout_seconds: 60,
-            }), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            }),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap();
@@ -433,9 +441,13 @@ fn publish_txn_abort_emits_nothing() {
         .await
         .unwrap();
 
-        dispatch(RequestBody::TxnAbort(TxnAbortRequest { txn_id }), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-            .await
-            .unwrap();
+        dispatch(
+            RequestBody::TxnAbort(TxnAbortRequest { txn_id }),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
 
         assert!(
             try_recv(&mut rx, Duration::from_millis(100))
@@ -614,9 +626,13 @@ fn dispatcher_returns_first_matching_event() {
         )
         .await;
 
-        let resp = dispatch(RequestBody::Subscribe(sub_req(empty_filter())), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-            .await
-            .unwrap();
+        let resp = dispatch(
+            RequestBody::Subscribe(sub_req(empty_filter())),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
         let producer: Result<(), ()> = Ok(()); // placeholder — original future-handle unused below
         let event: SubscriptionEvent = match resp {
             ResponseBody::SubscribeEvent(e) => e,
@@ -633,9 +649,13 @@ fn dispatcher_returns_first_matching_event() {
 fn dispatcher_times_out_when_no_event_matches() {
     run_in_glommio(|| async {
         let fix = build_fixture();
-        let err = dispatch(RequestBody::Subscribe(sub_req(empty_filter())), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-            .await
-            .unwrap_err();
+        let err = dispatch(
+            RequestBody::Subscribe(sub_req(empty_filter())),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.error_code(), ErrorCode::Overloaded);
         assert!(err.retryable());
     })
@@ -647,9 +667,13 @@ fn dispatcher_with_from_lsn_returns_lsn_too_old() {
         let fix = build_fixture();
         let mut req = sub_req(empty_filter());
         req.from_lsn = Some(1);
-        let err = dispatch(RequestBody::Subscribe(req), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-            .await
-            .unwrap_err();
+        let err = dispatch(
+            RequestBody::Subscribe(req),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.error_code(), ErrorCode::NotFound);
     })
 }
@@ -686,6 +710,7 @@ fn lagged_subscriber_freezes_final_lsn_and_reports_overloaded() {
                 timestamp_unix_nanos: 0,
                 text: None,
                 knowledge_payload: None,
+                edge_payload: None,
                 agent_id: brain_core::AgentId::default(),
             });
         }
@@ -743,4 +768,215 @@ fn encode_then_forget_preserve_lsn_order() {
 fn registry_constructable_directly_from_bus() {
     let bus = Arc::new(EventBus::default());
     let _reg: SubscriptionRegistry = SubscriptionRegistry::new(bus);
+}
+
+// ---------------------------------------------------------------------------
+// from_wal_record — Phase C unified-edge change feed.
+// ---------------------------------------------------------------------------
+
+mod wal_record_projection {
+    use super::*;
+    use brain_core::{
+        AgentId, EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, NodeRef, RelationId, RelationTypeId,
+        RequestId,
+    };
+    use brain_storage::wal::payload::{
+        EdgePayload, EncodePayload, ForgetMode, ForgetPayload, ForgetReason, LinkPayload,
+        RelationLinkPayload, RelationSupersedePayload, RelationTombstonePayload, UnlinkPayload,
+        WalPayload,
+    };
+    use brain_storage::wal::record::{Lsn, WalRecord};
+
+    fn mid(slot: u64) -> MemoryId {
+        MemoryId::pack(1, slot, 1)
+    }
+
+    fn entid(byte: u8) -> EntityId {
+        let mut b = [0u8; 16];
+        b[15] = byte;
+        EntityId::from(b)
+    }
+
+    fn relid(byte: u8) -> RelationId {
+        let mut b = [0u8; 16];
+        b[0] = 0xA0;
+        b[15] = byte;
+        RelationId::from(b)
+    }
+
+    fn rec(p: WalPayload) -> WalRecord {
+        WalRecord::from_typed(Lsn(7), 0, 1_700_000_000_000_000_000, 0xCAFE, &p)
+    }
+
+    #[test]
+    fn link_payload_projects_to_edge_added_event() {
+        let r = rec(WalPayload::Link(LinkPayload {
+            source: NodeRef::Memory(mid(1)),
+            target: NodeRef::Memory(mid(2)),
+            edge_kind: EdgeKindRef::Builtin(EdgeKind::Caused),
+            weight: 0.7,
+            origin: EdgeOrigin::Explicit,
+        }));
+        let envs = EventEnvelope::from_wal_record(&r);
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].event_type, EventType::EdgeAdded);
+        let ep = envs[0].edge_payload.as_ref().expect("edge_payload");
+        assert_eq!(ep.edge_kind_tag, 0, "Builtin tag");
+        assert_eq!(ep.edge_kind_byte, EdgeKind::Caused as u8);
+        assert!((ep.weight - 0.7).abs() < 1e-6);
+        assert!(ep.relation_id.is_none());
+        assert!(ep.relation_type_id.is_none());
+        assert!(envs[0].knowledge_payload.is_none());
+    }
+
+    #[test]
+    fn unlink_payload_projects_to_edge_removed_event() {
+        let r = rec(WalPayload::Unlink(UnlinkPayload {
+            source: NodeRef::Memory(mid(1)),
+            target: NodeRef::Memory(mid(2)),
+            edge_kind: EdgeKindRef::Builtin(EdgeKind::SimilarTo),
+            edge_seq: 0,
+        }));
+        let envs = EventEnvelope::from_wal_record(&r);
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].event_type, EventType::EdgeRemoved);
+        let ep = envs[0].edge_payload.as_ref().unwrap();
+        assert_eq!(ep.edge_kind_tag, 0);
+        assert_eq!(ep.edge_kind_byte, EdgeKind::SimilarTo as u8);
+    }
+
+    #[test]
+    fn relation_link_projects_to_edge_added_with_relation_id() {
+        let p = RelationLinkPayload {
+            relation_id: relid(5),
+            from: NodeRef::Entity(entid(2)),
+            to: NodeRef::Entity(entid(3)),
+            relation_type_id: RelationTypeId::from(42),
+            chain_root: relid(5),
+            confidence: 0.9,
+            valid_from_unix_nanos: None,
+            valid_to_unix_nanos: None,
+            supersedes: None,
+            evidence: vec![],
+            extractor_id: 1,
+            is_symmetric: false,
+            properties_blob: vec![],
+            agent_id: AgentId::default(),
+        };
+        let r = rec(WalPayload::RelationLink(p));
+        let envs = EventEnvelope::from_wal_record(&r);
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].event_type, EventType::EdgeAdded);
+        let ep = envs[0].edge_payload.as_ref().unwrap();
+        assert_eq!(ep.edge_kind_tag, 2, "Typed tag");
+        assert_eq!(ep.relation_type_id, Some(42));
+        assert_eq!(ep.relation_id, Some(relid(5).to_bytes()));
+        assert!(ep.superseded_relation_id.is_none());
+    }
+
+    #[test]
+    fn relation_supersede_projects_to_edge_superseded() {
+        let new = RelationLinkPayload {
+            relation_id: relid(6),
+            from: NodeRef::Entity(entid(2)),
+            to: NodeRef::Entity(entid(4)),
+            relation_type_id: RelationTypeId::from(42),
+            chain_root: relid(5),
+            confidence: 0.9,
+            valid_from_unix_nanos: None,
+            valid_to_unix_nanos: None,
+            supersedes: Some(relid(5)),
+            evidence: vec![],
+            extractor_id: 1,
+            is_symmetric: false,
+            properties_blob: vec![],
+            agent_id: AgentId::default(),
+        };
+        let r = rec(WalPayload::RelationSupersede(RelationSupersedePayload {
+            old_relation_id: relid(5),
+            new,
+        }));
+        let envs = EventEnvelope::from_wal_record(&r);
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].event_type, EventType::EdgeSuperseded);
+        let ep = envs[0].edge_payload.as_ref().unwrap();
+        assert_eq!(ep.relation_id, Some(relid(6).to_bytes()));
+        assert_eq!(ep.superseded_relation_id, Some(relid(5).to_bytes()));
+    }
+
+    #[test]
+    fn relation_tombstone_projects_to_edge_removed_with_relation_id() {
+        let r = rec(WalPayload::RelationTombstone(RelationTombstonePayload {
+            relation_id: relid(7),
+            reason: "test".into(),
+            at_unix_nanos: 1,
+            agent_id: AgentId::default(),
+        }));
+        let envs = EventEnvelope::from_wal_record(&r);
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].event_type, EventType::EdgeRemoved);
+        let ep = envs[0].edge_payload.as_ref().unwrap();
+        assert_eq!(ep.relation_id, Some(relid(7).to_bytes()));
+    }
+
+    #[test]
+    fn encode_with_edges_emits_encoded_plus_one_edge_added_per_edge() {
+        let p = EncodePayload {
+            memory_id: mid(1),
+            request_id: RequestId::default(),
+            agent_id: AgentId::default(),
+            context_id: ContextId(0),
+            kind: MemoryKind::Episodic,
+            salience_initial: 0.5,
+            embedding_model_fp: [0xAB; 16],
+            text: "hello".into(),
+            vector: vec![0.0; VECTOR_DIM],
+            edges: vec![
+                EdgePayload {
+                    source: NodeRef::Memory(mid(1)),
+                    target: NodeRef::Memory(mid(2)),
+                    kind: EdgeKindRef::Builtin(EdgeKind::Caused),
+                    weight: 0.5,
+                    origin: EdgeOrigin::Explicit,
+                },
+                EdgePayload {
+                    source: NodeRef::Memory(mid(1)),
+                    target: NodeRef::Memory(mid(3)),
+                    kind: EdgeKindRef::Builtin(EdgeKind::SimilarTo),
+                    weight: 0.8,
+                    origin: EdgeOrigin::AutoDerived,
+                },
+            ],
+            request_hash: [0; 32],
+            response_payload: vec![],
+            deduplicate: false,
+        };
+        let r = rec(WalPayload::Encode(p));
+        let envs = EventEnvelope::from_wal_record(&r);
+        assert_eq!(envs.len(), 3, "1 Encoded + 2 EdgeAdded");
+        assert_eq!(envs[0].event_type, EventType::Encoded);
+        assert!(envs[0].edge_payload.is_none());
+        assert_eq!(envs[1].event_type, EventType::EdgeAdded);
+        assert_eq!(envs[2].event_type, EventType::EdgeAdded);
+        // All three envelopes share the LSN — replay frames them
+        // separately and the per-shard tail subscription stays in
+        // monotonic order.
+        assert_eq!(envs[0].lsn, envs[1].lsn);
+        assert_eq!(envs[1].lsn, envs[2].lsn);
+    }
+
+    #[test]
+    fn forget_still_projects_to_single_forgotten_envelope() {
+        let r = rec(WalPayload::Forget(ForgetPayload {
+            memory_id: mid(1),
+            request_id: RequestId::default(),
+            agent_id: AgentId::default(),
+            mode: ForgetMode::Soft,
+            reason: ForgetReason::ClientRequest,
+        }));
+        let envs = EventEnvelope::from_wal_record(&r);
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].event_type, EventType::Forgotten);
+        assert!(envs[0].edge_payload.is_none());
+    }
 }

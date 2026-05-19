@@ -13,7 +13,9 @@ use std::process::ExitCode;
 use brain_cli::cli::{parse, Command};
 use brain_cli::commands::diagnostics::{debug_snapshot, profile};
 use brain_cli::commands::snapshot::SnapshotAction;
-use brain_cli::commands::{agent, audit, config, health, rebuild, shard, snapshot, stats, worker};
+use brain_cli::commands::{
+    agent, audit, config, extract, health, rebuild, shard, snapshot, stats, worker,
+};
 
 const NAME: &str = env!("CARGO_PKG_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -107,6 +109,7 @@ fn main() -> ExitCode {
             output_path.as_deref(),
             args.output,
         )),
+        Command::Extract(action) => run_result(extract::run(&args.server, &action, args.output)),
     }
 }
 
@@ -143,6 +146,9 @@ COMMANDS:
     shard list|create|delete                  Shard operations (create/delete deferred)
     profile [--duration-secs N] [--value P]   CPU profile (deferred)
     debug-snapshot [--value PATH]             Runtime snapshot (partial schema)
+    extract --backfill (--memory-id N | --since TS | --all)
+                                              Re-enqueue memories through the
+                                              three-tier extractor pipeline
 
 OPTIONS:
     --server <host:port>      Admin endpoint — /v1/* routes

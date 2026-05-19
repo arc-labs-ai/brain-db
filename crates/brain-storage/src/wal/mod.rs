@@ -20,8 +20,9 @@ pub use kinds::{WalRecordKind, ALL_KINDS};
 pub use payload::{
     CheckpointBeginPayload, CheckpointEndPayload, ConsolidatePayload, EdgePayload,
     EmbeddingModelFp, EncodePayload, ForgetMode, ForgetPayload, ForgetReason, LinkPayload,
-    MigrateEmbeddingPayload, ReclaimPayload, SalienceReason, SalienceUpdate, TxnAbortPayload,
-    TxnBeginPayload, TxnCommitPayload, UnlinkPayload, UpdateContextPayload, UpdateKindPayload,
+    MigrateEmbeddingPayload, ReclaimPayload, RelationLinkPayload, RelationSupersedePayload,
+    RelationTombstonePayload, SalienceReason, SalienceUpdate, TxnAbortPayload, TxnBeginPayload,
+    TxnCommitPayload, UnlinkPayload, UpdateContextPayload, UpdateKindPayload,
     UpdateSaliencePayload, WalPayload, WalPayloadError, VECTOR_DIMS_MAX,
 };
 pub use reader::{SegmentInfo, WalReadError, WalReader};

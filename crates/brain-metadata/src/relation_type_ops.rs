@@ -6,13 +6,15 @@
 //! - `spec/26_knowledge_storage/00_purpose.md` — relation_types row
 //!   lives in the knowledge-storage catalog.
 
+use std::collections::HashSet;
+
 use brain_core::knowledge::RelationType;
 use brain_core::{Cardinality, EntityTypeId, RelationTypeId};
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
 use crate::tables::knowledge::relation_type::{
-    encode_entity_type_id, RelationTypeDefinition, RELATION_TYPES_BY_QNAME_TABLE,
-    RELATION_TYPES_TABLE,
+    encode_entity_type_id, RelationTypeDefinition, RelationTypeOrigin,
+    RELATION_TYPES_BY_QNAME_TABLE, RELATION_TYPES_TABLE,
 };
 
 // ---------------------------------------------------------------------------
@@ -141,6 +143,32 @@ pub fn relation_type_lookup_by_qname(
     Ok(row.as_ref().map(RelationTypeDefinition::to_relation_type))
 }
 
+/// Set of `RelationTypeId`s the active schema version of `namespace`
+/// declares. Companion to
+/// [`crate::predicate_ops::predicates_active_for_schema`].
+pub fn relation_types_active_for_schema(
+    rtxn: &ReadTransaction,
+    namespace: &str,
+    version: u32,
+) -> Result<HashSet<RelationTypeId>, RelationTypeOpError> {
+    validate_namespace(namespace)?;
+    let t = rtxn.open_table(RELATION_TYPES_TABLE)?;
+    let mut out = HashSet::new();
+    for entry in t.iter()? {
+        let (_, v) = entry?;
+        let row = v.value();
+        if row.namespace != namespace {
+            continue;
+        }
+        if let RelationTypeOrigin::SchemaDeclared { version: v_decl } = row.origin() {
+            if v_decl == version {
+                out.insert(RelationTypeId::from(row.relation_type_id));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// List relation types. `None` → all; `Some(ns)` → filtered.
 pub fn relation_type_list(
     rtxn: &ReadTransaction,
@@ -192,30 +220,94 @@ pub fn relation_type_intern(
 
     let q = qname(namespace, name);
 
-    // Idempotency probe.
-    {
+    // Idempotency / adoption probe — same three-case dispatch as
+    // `crate::predicate_ops::predicate_intern`: exact match returns
+    // existing id, implicit-from-write row gets adopted at the new
+    // schema_version, schema-declared row with diverging constraints
+    // errors.
+    let probed: Option<(u32, RelationTypeDefinition)> = {
         let idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
-        let existing_id: Option<u32> = idx.get(q.as_str())?.map(|g| g.value());
-        if let Some(id_raw) = existing_id {
-            let t = wtxn.open_table(RELATION_TYPES_TABLE)?;
-            let row: Option<RelationTypeDefinition> = t.get(&id_raw)?.map(|g| g.value());
-            let row = row.expect("qname index points to a missing row — file is corrupt");
-
-            let same = row.cardinality == cardinality.as_u8()
-                && (row.is_symmetric != 0) == is_symmetric
-                && row.from_entity_type_id == encode_entity_type_id(from_type)
-                && row.to_entity_type_id == encode_entity_type_id(to_type)
-                && row.schema_version == schema_version
-                && row.description == description;
-
-            if same {
-                return Ok(RelationTypeId::from(id_raw));
+        let id_raw: Option<u32> = idx.get(q.as_str())?.map(|g| g.value());
+        match id_raw {
+            None => None,
+            Some(id_raw) => {
+                let t = wtxn.open_table(RELATION_TYPES_TABLE)?;
+                let row = t
+                    .get(&id_raw)?
+                    .map(|g| g.value())
+                    .expect("qname index points to a missing row — file is corrupt");
+                Some((id_raw, row))
             }
-            return Err(RelationTypeOpError::AlreadyExists {
-                qname: q,
-                existing_id: RelationTypeId::from(id_raw),
-            });
         }
+    };
+    if let Some((id_raw, row)) = probed {
+        // Constraint-only equality (excludes schema_version) so an
+        // unchanged relation type carried forward into a new schema
+        // version is a no-op rather than a conflict.
+        let constraints_match = row.cardinality == cardinality.as_u8()
+            && (row.is_symmetric != 0) == is_symmetric
+            && row.from_entity_type_id == encode_entity_type_id(from_type)
+            && row.to_entity_type_id == encode_entity_type_id(to_type)
+            && row.description == description;
+
+        if constraints_match && row.schema_version == schema_version {
+            return Ok(RelationTypeId::from(id_raw));
+        }
+
+        // Constraints match but schema_version advanced — bump the
+        // row's version in-place. Existing id is reused so relations
+        // already pointing at it stay valid.
+        if constraints_match && row.origin().is_schema_declared() {
+            let rt = RelationType {
+                id: RelationTypeId::from(id_raw),
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                from_type,
+                to_type,
+                cardinality,
+                is_symmetric,
+                schema_version,
+                description: description.to_string(),
+            };
+            let new_row = RelationTypeDefinition::from_relation_type_with_origin(
+                &rt,
+                now_unix_nanos,
+                RelationTypeOrigin::SchemaDeclared {
+                    version: schema_version,
+                },
+            );
+            let mut t = wtxn.open_table(RELATION_TYPES_TABLE)?;
+            t.insert(&id_raw, &new_row)?;
+            return Ok(RelationTypeId::from(id_raw));
+        }
+
+        if !row.origin().is_schema_declared() {
+            let rt = RelationType {
+                id: RelationTypeId::from(id_raw),
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                from_type,
+                to_type,
+                cardinality,
+                is_symmetric,
+                schema_version,
+                description: description.to_string(),
+            };
+            let new_row = RelationTypeDefinition::from_relation_type_with_origin(
+                &rt,
+                now_unix_nanos,
+                RelationTypeOrigin::SchemaDeclared {
+                    version: schema_version,
+                },
+            );
+            let mut t = wtxn.open_table(RELATION_TYPES_TABLE)?;
+            t.insert(&id_raw, &new_row)?;
+            return Ok(RelationTypeId::from(id_raw));
+        }
+        return Err(RelationTypeOpError::AlreadyExists {
+            qname: q,
+            existing_id: RelationTypeId::from(id_raw),
+        });
     }
 
     // Fresh registration. Allocate id = max(existing) + 1.
@@ -254,6 +346,79 @@ pub fn relation_type_intern(
         idx.insert(q.as_str(), &row.relation_type_id)?;
     }
 
+    Ok(RelationTypeId::from(next_id_raw))
+}
+
+/// Open-vocabulary intern: look up `(namespace, name)` and return its
+/// `RelationTypeId` if present, else allocate a fresh row with
+/// [`RelationTypeOrigin::ImplicitFromWrite`] and
+/// [`Cardinality::ManyToMany`] (no constraint — schemaless callers
+/// have no cardinality contract).
+///
+/// Counterpart to
+/// [`crate::predicate_ops::predicate_intern_or_get`].
+pub fn relation_type_intern_or_get(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+    first_seen_lsn: u64,
+    now_unix_nanos: u64,
+) -> Result<RelationTypeId, RelationTypeOpError> {
+    validate_namespace(namespace)?;
+    validate_name(name)?;
+    let q = qname(namespace, name);
+
+    let existing_id: Option<u32> = {
+        let idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
+        let got = idx.get(q.as_str())?.map(|g| g.value());
+        got
+    };
+    if let Some(id_raw) = existing_id {
+        return Ok(RelationTypeId::from(id_raw));
+    }
+
+    let next_id_raw: u32 = {
+        let t = wtxn.open_table(RELATION_TYPES_TABLE)?;
+        let mut max: u32 = 0;
+        for entry in t.iter()? {
+            let (k, _) = entry?;
+            let id = k.value();
+            if id > max {
+                max = id;
+            }
+        }
+        max.checked_add(1).expect("RelationTypeId space exhausted")
+    };
+
+    let rt = RelationType {
+        id: RelationTypeId::from(next_id_raw),
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        from_type: None,
+        to_type: None,
+        // Schemaless writers don't pick a cardinality. ManyToMany is
+        // the only choice that doesn't risk an automatic supersession
+        // on a future create — the writer must call
+        // RELATION_SUPERSEDE explicitly to retire old edges.
+        cardinality: Cardinality::ManyToMany,
+        is_symmetric: false,
+        schema_version: 0,
+        description: String::new(),
+    };
+    let row = RelationTypeDefinition::from_relation_type_with_origin(
+        &rt,
+        now_unix_nanos,
+        RelationTypeOrigin::ImplicitFromWrite { first_seen_lsn },
+    );
+
+    {
+        let mut t = wtxn.open_table(RELATION_TYPES_TABLE)?;
+        t.insert(&row.relation_type_id, &row)?;
+    }
+    {
+        let mut idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
+        idx.insert(q.as_str(), &row.relation_type_id)?;
+    }
     Ok(RelationTypeId::from(next_id_raw))
 }
 
@@ -600,5 +765,146 @@ mod tests {
         let rt = relation_type_get(&rtxn, id).unwrap().unwrap();
         assert_eq!(rt.from_type, Some(EntityTypeId(1)));
         assert_eq!(rt.to_type, Some(EntityTypeId(1)));
+    }
+
+    // ----- Open-vocabulary intern path. -----
+
+    #[test]
+    fn relation_type_intern_or_get_allocates_then_returns_same_id() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let a = relation_type_intern_or_get(&wtxn, "acme", "knows", 0, 0).unwrap();
+        let b = relation_type_intern_or_get(&wtxn, "acme", "knows", 0, 0).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(a, b);
+
+        let rtxn = db.begin_read().unwrap();
+        let rt = relation_type_get(&rtxn, a).unwrap().unwrap();
+        // Implicit relation types default to ManyToMany.
+        assert_eq!(rt.cardinality, Cardinality::ManyToMany);
+        assert!(!rt.is_symmetric);
+        assert_eq!(rt.from_type, None);
+        assert_eq!(rt.to_type, None);
+    }
+
+    #[test]
+    fn relation_type_intern_or_get_marks_origin_implicit() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let id = relation_type_intern_or_get(&wtxn, "acme", "y", 42, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(RELATION_TYPES_TABLE).unwrap();
+        let row = t.get(&id.raw()).unwrap().unwrap().value();
+        assert_eq!(row.origin_tag, 1);
+        assert_eq!(row.origin_payload, 42);
+    }
+
+    #[test]
+    fn relation_type_intern_at_higher_version_with_same_constraints_bumps_version() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let v1_id = relation_type_intern(
+            &wtxn,
+            "acme",
+            "reports_to",
+            Some(EntityTypeId(1)),
+            Some(EntityTypeId(1)),
+            Cardinality::ManyToOne,
+            false,
+            1,
+            "org chart edge",
+            0,
+        )
+        .unwrap();
+        let v2_id = relation_type_intern(
+            &wtxn,
+            "acme",
+            "reports_to",
+            Some(EntityTypeId(1)),
+            Some(EntityTypeId(1)),
+            Cardinality::ManyToOne,
+            false,
+            2,
+            "org chart edge",
+            99,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(v1_id, v2_id, "id must be preserved across version bump");
+
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(RELATION_TYPES_TABLE).unwrap();
+        let row = t.get(&v1_id.raw()).unwrap().unwrap().value();
+        assert_eq!(row.schema_version, 2);
+        assert_eq!(
+            row.origin(),
+            RelationTypeOrigin::SchemaDeclared { version: 2 }
+        );
+
+        let all = relation_type_list(&rtxn, Some("acme")).unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn relation_type_intern_at_higher_version_with_different_constraints_errors() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let _ = relation_type_intern(
+            &wtxn,
+            "acme",
+            "reports_to",
+            Some(EntityTypeId(1)),
+            Some(EntityTypeId(1)),
+            Cardinality::ManyToOne,
+            false,
+            1,
+            "",
+            0,
+        )
+        .unwrap();
+        let err = relation_type_intern(
+            &wtxn,
+            "acme",
+            "reports_to",
+            Some(EntityTypeId(1)),
+            Some(EntityTypeId(1)),
+            Cardinality::OneToOne, // changed
+            false,
+            2,
+            "",
+            0,
+        )
+        .unwrap_err();
+        matches!(err, RelationTypeOpError::AlreadyExists { .. })
+            .then_some(())
+            .expect("expected AlreadyExists");
+    }
+
+    #[test]
+    fn relation_types_active_for_schema_excludes_implicit_rows() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let declared = relation_type_intern(
+            &wtxn,
+            "acme",
+            "in_schema",
+            None,
+            None,
+            Cardinality::ManyToOne,
+            false,
+            5,
+            "",
+            0,
+        )
+        .unwrap();
+        let implicit = relation_type_intern_or_get(&wtxn, "acme", "implicit", 0, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let active = relation_types_active_for_schema(&rtxn, "acme", 5).unwrap();
+        assert!(active.contains(&declared));
+        assert!(!active.contains(&implicit));
     }
 }

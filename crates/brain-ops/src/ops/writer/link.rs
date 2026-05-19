@@ -4,7 +4,8 @@
 //! same redb txn.
 
 use brain_metadata::tables::edge::{
-    self, derived_by, origin, EdgeData, EDGES_IN_TABLE, EDGES_OUT_TABLE,
+    self, derived_by, origin, zero_disambiguator, EdgeData, EdgeKey, EDGES_REVERSE_TABLE,
+    EDGES_TABLE,
 };
 use brain_metadata::tables::idempotency::{IdempotencyEntry, IDEMPOTENCY_TABLE};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
@@ -18,10 +19,7 @@ use crate::idempotency::{
 
 use super::{bump_edge_count, hex_short, now_unix_nanos, RealWriterHandle};
 
-pub(super) async fn do_link(
-    writer: &RealWriterHandle,
-    op: LinkOp,
-) -> Result<LinkAck, WriterError> {
+pub(super) async fn do_link(writer: &RealWriterHandle, op: LinkOp) -> Result<LinkAck, WriterError> {
     let request_hash = hash_link_request(&op);
     let request_id_bytes: [u8; 16] = op.request_id.into();
 
@@ -107,15 +105,17 @@ pub(super) async fn do_link(
             .read_txn()
             .map_err(|e| WriterError::Internal(format!("link edges read_txn: {e:?}")))?;
         let table = rtxn
-            .open_table(EDGES_OUT_TABLE)
-            .map_err(|e| WriterError::Internal(format!("link open EDGES_OUT: {e:?}")))?;
-        let key = (
-            op.source.to_be_bytes(),
-            op.kind as u8,
-            op.target.to_be_bytes(),
-        );
+            .open_table(EDGES_TABLE)
+            .map_err(|e| WriterError::Internal(format!("link open EDGES: {e:?}")))?;
+        let key = EdgeKey {
+            from: brain_core::NodeRef::Memory(op.source),
+            kind: brain_core::EdgeKindRef::Builtin(op.kind),
+            to: brain_core::NodeRef::Memory(op.target),
+            disambiguator: zero_disambiguator(),
+        }
+        .encode();
         table
-            .get(&key)
+            .get(key.as_slice())
             .map_err(|e| WriterError::Internal(format!("link edges get: {e:?}")))?
             .is_some()
     };
@@ -126,9 +126,9 @@ pub(super) async fn do_link(
     // log must reflect it for replay determinism.
     let wal_lsn: Option<Lsn> = if let Some(sink) = &writer.wal_sink {
         let record_payload = WalPayload::Link(WalLinkPayload {
-            source: op.source,
-            target: op.target,
-            edge_kind: op.kind,
+            source: brain_core::NodeRef::Memory(op.source),
+            target: brain_core::NodeRef::Memory(op.target),
+            edge_kind: brain_core::EdgeKindRef::Builtin(op.kind),
             weight: op.weight,
             origin: brain_core::EdgeOrigin::Explicit,
         });
@@ -149,6 +149,8 @@ pub(super) async fn do_link(
     } else {
         None
     };
+    let _ = wal_lsn; // LINK has no change-feed event in v1.
+
     // ── Apply: edge insert + count bumps + idempotency in one txn. ─
     {
         let mut db = writer.metadata.lock();
@@ -156,19 +158,20 @@ pub(super) async fn do_link(
             .write_txn()
             .map_err(|e| WriterError::Internal(format!("link write_txn: {e:?}")))?;
         {
-            let mut edges_out_t = wtxn
-                .open_table(EDGES_OUT_TABLE)
-                .map_err(|e| WriterError::Internal(format!("link open EDGES_OUT: {e:?}")))?;
-            let mut edges_in_t = wtxn
-                .open_table(EDGES_IN_TABLE)
-                .map_err(|e| WriterError::Internal(format!("link open EDGES_IN: {e:?}")))?;
+            let mut edges_t = wtxn
+                .open_table(EDGES_TABLE)
+                .map_err(|e| WriterError::Internal(format!("link open EDGES: {e:?}")))?;
+            let mut edges_rev_t = wtxn
+                .open_table(EDGES_REVERSE_TABLE)
+                .map_err(|e| WriterError::Internal(format!("link open EDGES_REVERSE: {e:?}")))?;
             let data = EdgeData::new(op.weight, origin::EXPLICIT, derived_by::CLIENT, created_at);
             edge::link(
-                &mut edges_out_t,
-                &mut edges_in_t,
-                op.source,
-                op.kind,
-                op.target,
+                &mut edges_t,
+                &mut edges_rev_t,
+                brain_core::NodeRef::Memory(op.source),
+                brain_core::EdgeKindRef::Builtin(op.kind),
+                brain_core::NodeRef::Memory(op.target),
+                zero_disambiguator(),
                 &data,
             )
             .map_err(|e| WriterError::Internal(format!("edge::link: {e:?}")))?;

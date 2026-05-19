@@ -5,13 +5,13 @@
 //! Brain doesn't bundle an LLM; this module hosts two feature-gated
 //! HTTP adapters:
 //!
-//! - [`openai::OpenAiSummarizer`] (feature `summarizer-openai`)
-//! - [`ollama::OllamaSummarizer`] (feature `summarizer-ollama`)
+//! - `openai::OpenAiSummarizer` (feature `summarizer-openai`)
+//! - `ollama::OllamaSummarizer` (feature `summarizer-ollama`)
 //!
 //! Both call out to an external HTTPS endpoint. To avoid running
 //! reqwest's async futures inside the per-shard Glommio executor
 //! (where Tokio's reactor isn't registered), the adapters share a
-//! dedicated bridge Tokio runtime ([`bridge::SummarizerBridge`]).
+//! dedicated bridge Tokio runtime (`bridge::SummarizerBridge`).
 //! Glommio-side callers post requests through a `flume` channel and
 //! await the response off the bridge's worker.
 //!

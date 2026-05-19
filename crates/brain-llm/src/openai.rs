@@ -126,9 +126,7 @@ impl LlmClient for OpenAIClient {
     fn complete<'a>(&'a self, request: LlmRequest) -> LlmFuture<'a> {
         Box::pin(async move {
             if self.api_key.is_empty() {
-                return Err(LlmError::Auth {
-                    provider: "openai",
-                });
+                return Err(LlmError::Auth { provider: "openai" });
             }
 
             let body = OpenAIRequestBody::from(&request);
@@ -164,9 +162,11 @@ impl LlmClient for OpenAIClient {
             }
 
             let payload: OpenAIResponseBody =
-                resp.json().await.map_err(|e| LlmError::OutputDecodeFailed {
-                    reason: format!("openai response JSON decode: {e}"),
-                })?;
+                resp.json()
+                    .await
+                    .map_err(|e| LlmError::OutputDecodeFailed {
+                        reason: format!("openai response JSON decode: {e}"),
+                    })?;
 
             decode_openai_response(payload)
         })
@@ -244,14 +244,17 @@ impl From<&LlmRequest> for OpenAIRequestBody {
             });
         }
 
-        let response_format = req.response_schema.as_ref().map(|schema| OpenAIResponseFormat {
-            kind: "json_schema",
-            json_schema: OpenAIJsonSchema {
-                name: STRUCTURED_OUTPUT_NAME,
-                strict: true,
-                schema: schema.clone(),
-            },
-        });
+        let response_format = req
+            .response_schema
+            .as_ref()
+            .map(|schema| OpenAIResponseFormat {
+                kind: "json_schema",
+                json_schema: OpenAIJsonSchema {
+                    name: STRUCTURED_OUTPUT_NAME,
+                    strict: true,
+                    schema: schema.clone(),
+                },
+            });
 
         Self {
             model: req.model.clone(),

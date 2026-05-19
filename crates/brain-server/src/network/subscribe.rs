@@ -93,7 +93,9 @@ impl SubscriptionMetrics {
         self.inner.started.fetch_add(1, Ordering::Relaxed);
     }
     fn record_lag(&self, skipped: u64) {
-        self.inner.dropped_due_to_lag.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .dropped_due_to_lag
+            .fetch_add(1, Ordering::Relaxed);
         self.inner
             .skipped_events_on_lag
             .fetch_add(skipped, Ordering::Relaxed);
@@ -353,19 +355,14 @@ impl SubscriptionRegistry {
             //
             // `from_lsn == 0` means "everything still in the WAL" —
             // not an error per plan §"Locked decisions".
-            let reader = brain_storage::wal::reader::WalReader::open(
-                &locator.dir,
-                locator.shard_uuid,
-            )
-            .map_err(|e| OpError::WalOpen(format!("{e}")))?;
+            let reader =
+                brain_storage::wal::reader::WalReader::open(&locator.dir, locator.shard_uuid)
+                    .map_err(|e| OpError::WalOpen(format!("{e}")))?;
             let oldest = reader.segments().first().map_or(1, |s| s.starting_lsn);
             if from_lsn > 0 && from_lsn < oldest {
                 return Err(OpError::LsnTooOld { oldest });
             }
-            Some(ReplayParams {
-                from_lsn,
-                locator,
-            })
+            Some(ReplayParams { from_lsn, locator })
         } else {
             None
         };
@@ -484,6 +481,9 @@ struct ReplayParams {
 // Per-subscription task
 // ---------------------------------------------------------------------------
 
+// Subscription task argument list mirrors the per-subscription owned
+// state. Bundling into a struct would just shadow the same fields.
+#[allow(clippy::too_many_arguments)]
 async fn run_subscription_task(
     stream_id: u32,
     target_shard: ShardId,
@@ -634,34 +634,32 @@ async fn replay_wal_segment(
     // tokio runtime doesn't stall on synchronous fs reads. The WAL
     // reader is sync; the only async edge is the frame send.
     let last_lsn = tokio::task::spawn_blocking(move || -> Result<u64, String> {
-        let iter = brain_storage::wal::reader::WalReader::iter_from(
-            &locator_dir,
-            locator_uuid,
-            from_lsn,
-        )
-        .map_err(|e| format!("WalReader::iter_from: {e}"))?;
+        let iter =
+            brain_storage::wal::reader::WalReader::iter_from(&locator_dir, locator_uuid, from_lsn)
+                .map_err(|e| format!("WalReader::iter_from: {e}"))?;
         let mut last = 0u64;
         for item in iter {
             let record = item.map_err(|e| format!("WAL read: {e}"))?;
             let lsn = record.lsn.raw();
-            let Some(env) = EventEnvelope::from_wal_record(&record) else {
-                continue;
-            };
-            if !filter.matches(&env) {
-                continue;
+            // One WAL record may surface multiple envelopes (e.g. an
+            // ENCODE with N edges emits Encoded + N EdgeAdded events).
+            for env in EventEnvelope::from_wal_record(&record) {
+                if !filter.matches(&env) {
+                    continue;
+                }
+                let frame = build_subscription_event_frame(stream_id, &env);
+                final_lsn.store(lsn, Ordering::SeqCst);
+                // Blocking send into the frame_tx; we're on a blocking
+                // pool, so this is fine. The async send variant
+                // requires a tokio context.
+                frame_tx
+                    .send(crate::connection::OutgoingFrame {
+                        bytes: frame.encode(),
+                        close_after: false,
+                    })
+                    .map_err(|_| "frame_tx dropped".to_string())?;
+                last = lsn;
             }
-            let frame = build_subscription_event_frame(stream_id, &env);
-            final_lsn.store(lsn, Ordering::SeqCst);
-            // Blocking send into the frame_tx; we're on a blocking
-            // pool, so this is fine. The async send variant requires
-            // a tokio context.
-            frame_tx
-                .send(crate::connection::OutgoingFrame {
-                    bytes: frame.encode(),
-                    close_after: false,
-                })
-                .map_err(|_| "frame_tx dropped".to_string())?;
-            last = lsn;
         }
         Ok(last)
     })
@@ -690,6 +688,7 @@ fn empty_subscription_event_frame(stream_id: u32, last_lsn: u64) -> Frame {
         timestamp_unix_nanos: 0,
         lsn: last_lsn,
         knowledge_payload: None,
+        edge_payload: None,
     })
     .encode();
     Frame::new(

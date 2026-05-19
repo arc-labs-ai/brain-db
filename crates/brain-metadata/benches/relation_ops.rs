@@ -124,8 +124,20 @@ fn bench_relation_create(c: &mut Criterion) {
         for (i, (s, o)) in extras.iter().enumerate() {
             let s_name = format!("crsubj_{i}");
             let o_name = format!("crobj_{i}");
-            let se = Entity::new_active(*s, EntityType::PERSON_ID, s_name.clone(), normalize_name(&s_name), now);
-            let oe = Entity::new_active(*o, EntityType::PERSON_ID, o_name.clone(), normalize_name(&o_name), now);
+            let se = Entity::new_active(
+                *s,
+                EntityType::PERSON_ID,
+                s_name.clone(),
+                normalize_name(&s_name),
+                now,
+            );
+            let oe = Entity::new_active(
+                *o,
+                EntityType::PERSON_ID,
+                o_name.clone(),
+                normalize_name(&o_name),
+                now,
+            );
             entity_put(&wtxn, &se).expect("se");
             entity_put(&wtxn, &oe).expect("oe");
         }
@@ -183,8 +195,7 @@ fn bench_relation_list_from(c: &mut Criterion) {
                 current_only: true,
                 limit: 10,
             };
-            let rows =
-                relation_list_from(&rtxn, subj, black_box(&filter)).expect("list_from");
+            let rows = relation_list_from(&rtxn, subj, black_box(&filter)).expect("list_from");
             black_box(rows);
         });
     });
@@ -223,7 +234,9 @@ fn bench_relation_traverse_depth_1(c: &mut Criterion) {
 fn print_corpus_summary() {
     let fixture = build_fixture(64);
     let rtxn = fixture.db.read_txn().expect("read_txn");
-    let any = relation_get(&rtxn, fixture.seeded[0].1).expect("get").is_some();
+    let any = relation_get(&rtxn, fixture.seeded[0].1)
+        .expect("get")
+        .is_some();
     eprintln!(
         "relation_ops bench setup: seeded={} sanity_get={}",
         fixture.seeded.len(),

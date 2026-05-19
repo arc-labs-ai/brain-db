@@ -52,7 +52,7 @@ use crate::worker::Worker;
 
 /// Spec §4 default — cosine similarity above which two memories are
 /// considered "in the same cluster". Tunable.
-pub const DEFAULT_SIMILARITY_THRESHOLD: f32 = 0.6;
+pub const DEFAULT_CONSOLIDATION_SIMILARITY_THRESHOLD: f32 = 0.6;
 
 /// Spec §4 default — minimum cluster size below which a group is
 /// dropped (singletons / pairs aren't worth consolidating).
@@ -206,7 +206,7 @@ impl ConsolidationWorker {
         Self {
             config: WorkerConfig::defaults_for(WorkerKind::Consolidation),
             summarizer,
-            similarity_threshold: DEFAULT_SIMILARITY_THRESHOLD,
+            similarity_threshold: DEFAULT_CONSOLIDATION_SIMILARITY_THRESHOLD,
             min_cluster_size: DEFAULT_MIN_CLUSTER_SIZE,
             recency_window: DEFAULT_RECENCY_WINDOW,
             initial_salience: DEFAULT_INITIAL_SALIENCE,

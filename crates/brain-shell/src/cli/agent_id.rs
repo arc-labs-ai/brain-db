@@ -195,9 +195,8 @@ fn load_config(
 }
 
 fn parse_id_or_fail(raw: &str) -> Result<AgentId, ResolveError> {
-    let uuid = Uuid::parse_str(raw).map_err(|e| {
-        ResolveError::Config(ConfigError::AgentBadId(e))
-    })?;
+    let uuid =
+        Uuid::parse_str(raw).map_err(|e| ResolveError::Config(ConfigError::AgentBadId(e)))?;
     Ok(AgentId(uuid))
 }
 
@@ -367,7 +366,10 @@ mod tests {
             Some(&path),
         )
         .unwrap_err();
-        assert!(matches!(err, ResolveError::UnknownNamed { .. }), "got {err:?}");
+        assert!(
+            matches!(err, ResolveError::UnknownNamed { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]

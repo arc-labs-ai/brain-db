@@ -1,28 +1,35 @@
-//! RECALL transparent-hybrid routing smoke (phase 23.11).
+//! Hybrid-default RECALL routing.
 //!
-//! Verifies the three branches of `handle_recall`'s routing table:
+//! Hybrid retrieval is the default for every deployment after
+//! the Phase A flip. These tests pin the four routing outcomes:
 //!
-//! 1. **No schema** — substrate vector path. `contributing_retrievers`
-//!    empty, `fused_score == 0.0`.
-//! 2. **Schema declared, no txn** — hybrid path. `contributing_retrievers`
-//!    reflects the auto router (`[Semantic]` for text-only on an
-//!    empty fixture), `fused_score >= 0.0`.
-//! 3. **Schema declared, inside txn** — substrate path, even though
-//!    the gate is set, because the hybrid + RYW lens isn't a v1
-//!    feature.
-//!
-//! The fixture has zero memories indexed, so `items` is always
-//! empty; we assert on the per-frame metadata fields only.
+//! 1. **Schemaless, default strategy** — hybrid runs. Encoded
+//!    memories show up with `contributing_retrievers` populated
+//!    by the semantic + lexical retrievers (graph contributes
+//!    when substrate edges are present) and `fused_score > 0`.
+//! 2. **Schema declared, default strategy** — hybrid runs (same
+//!    path, the schema is now strictness-only).
+//! 3. **Txn attached** — substrate path, no matter the strategy
+//!    or schema state, because hybrid retrievers can't see the
+//!    txn buffer.
+//! 4. **`SubstrateOnly` strategy** — substrate path, explicit
+//!    opt-out. `contributing_retrievers` empty, `fused_score 0`.
+//! 5. **`HybridOnly` strategy + missing retriever slot** —
+//!    surfaces `HybridUnavailable` instead of degrading.
 
 #![cfg(target_os = "linux")]
 
+use brain_protocol::error::ErrorCode;
 use brain_protocol::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
 use brain_protocol::knowledge::SchemaUploadRequest;
 use brain_protocol::opcode::Opcode;
-use brain_protocol::request::{RecallRequest, TxnBeginRequest};
+use brain_protocol::request::{
+    EncodeRequest, MemoryKindWire, RecallRequest, RecallStrategy, TxnBeginRequest,
+};
 use brain_protocol::response::{RecallResponseFrame, ResponseBody};
+use brain_protocol::responses::types::ErrorCodeWire;
 use brain_protocol::Frame;
 use brain_protocol::RequestBody;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -63,7 +70,7 @@ const ACME_V1: &str = "namespace acme\n\
                        define entity_type Foo { attributes {} }\n";
 
 // ---------------------------------------------------------------------------
-// Wire helpers (copied from sibling tests).
+// Wire helpers.
 // ---------------------------------------------------------------------------
 
 async fn read_one_frame<S>(stream: &mut S) -> Frame
@@ -154,9 +161,9 @@ async fn round_trip(
     (resp_opcode, body)
 }
 
-fn recall_request(txn_id: Option<[u8; 16]>) -> RecallRequest {
+fn recall_request(txn_id: Option<[u8; 16]>, strategy: Option<RecallStrategy>) -> RecallRequest {
     RecallRequest {
-        cue_text: "any cue".into(),
+        cue_text: "meeting preferences".into(),
         cue_vector_offset: 0,
         cue_vector_dim: 0,
         top_k: 5,
@@ -165,12 +172,43 @@ fn recall_request(txn_id: Option<[u8; 16]>) -> RecallRequest {
         age_bound_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
-        strategy_hint: None,
+        strategy,
         include_vectors: false,
         include_edges: false,
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id,
+    }
+}
+
+async fn encode_text(client: &mut TcpStream, stream_id: u32, text: &str) {
+    let req = EncodeRequest {
+        text: text.into(),
+        context_id: 0,
+        kind: MemoryKindWire::Episodic,
+        salience_hint: 0.5,
+        edges: Vec::new(),
+        request_id: *uuid::Uuid::now_v7().as_bytes(),
+        txn_id: None,
+        deduplicate: false,
+    };
+    let (opcode, body) = round_trip(client, stream_id, RequestBody::Encode(req)).await;
+    if opcode != Opcode::EncodeResp.as_u16() {
+        panic!("encode failed: opcode={opcode} body={body:?}");
+    }
+}
+
+async fn seed_fixture(client: &mut TcpStream) {
+    let phrases = [
+        "Priya prefers async meetings over standups",
+        "Async-first communication reduces context-switching",
+        "Standups are a sync ritual we should retire",
+        "Document driven design helps async teams",
+        "Team prefers structured documents over live calls",
+    ];
+    for (i, p) in phrases.iter().enumerate() {
+        // Client-initiated streams must be odd per spec.
+        encode_text(client, 101 + (i as u32) * 2, p).await;
     }
 }
 
@@ -187,27 +225,50 @@ fn assert_substrate(frame: &RecallResponseFrame) {
     }
 }
 
+fn assert_hybrid(frame: &RecallResponseFrame) {
+    assert!(!frame.results.is_empty(), "expected hybrid hits, got none");
+    let mut any_with_retrievers = false;
+    for r in &frame.results {
+        if !r.contributing_retrievers.is_empty() {
+            any_with_retrievers = true;
+            assert!(
+                r.fused_score > 0.0,
+                "hybrid hit reports retrievers but fused_score=0",
+            );
+        }
+    }
+    assert!(
+        any_with_retrievers,
+        "at least one hit must report contributing_retrievers on hybrid path",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "current_thread")]
-async fn recall_without_schema_uses_substrate_path() {
+async fn recall_without_schema_uses_hybrid_path() {
     let server = start(1).await;
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
         .expect("connect");
     complete_handshake(&mut client).await;
 
-    let (opcode, body) =
-        round_trip(&mut client, 1, RequestBody::Recall(recall_request(None))).await;
+    seed_fixture(&mut client).await;
+
+    let (opcode, body) = round_trip(
+        &mut client,
+        1,
+        RequestBody::Recall(recall_request(None, None)),
+    )
+    .await;
     assert_eq!(opcode, Opcode::RecallResp.as_u16());
     match body {
         ResponseBody::Recall(r) => {
             assert!(r.is_final);
-            // Empty fixture → no hits; substrate path leaves the
-            // new hybrid fields zero/empty on every MemoryResult.
-            assert_substrate(&r);
+            // No schema, no txn, default strategy → hybrid runs.
+            assert_hybrid(&r);
         }
         other => panic!("expected RecallResp, got {other:?}"),
     }
@@ -223,7 +284,6 @@ async fn recall_after_schema_upload_uses_hybrid_path() {
         .expect("connect");
     complete_handshake(&mut client).await;
 
-    // 1. Upload a trivial schema → flips the per-shard gate.
     let (opcode, _body) = round_trip(
         &mut client,
         1,
@@ -237,20 +297,19 @@ async fn recall_after_schema_upload_uses_hybrid_path() {
     .await;
     assert_eq!(opcode, Opcode::SchemaUploadResp.as_u16());
 
-    // 2. Recall — should now route through hybrid.
-    let (opcode, body) =
-        round_trip(&mut client, 3, RequestBody::Recall(recall_request(None))).await;
+    seed_fixture(&mut client).await;
+
+    let (opcode, body) = round_trip(
+        &mut client,
+        3,
+        RequestBody::Recall(recall_request(None, None)),
+    )
+    .await;
     assert_eq!(opcode, Opcode::RecallResp.as_u16());
     match body {
         ResponseBody::Recall(r) => {
-            // Empty fixture → no hits; the hybrid path still ran (we
-            // can't observe per-retriever outcomes from a substrate
-            // RECALL_RESP, but we know it took the hybrid branch
-            // because the gate is set + no txn). At minimum, the
-            // routing didn't error and the response shape is well-
-            // formed.
             assert!(r.is_final);
-            assert_eq!(r.cumulative_count, 0);
+            assert_hybrid(&r);
         }
         other => panic!("expected RecallResp, got {other:?}"),
     }
@@ -266,7 +325,6 @@ async fn recall_inside_txn_uses_substrate_path_even_with_schema() {
         .expect("connect");
     complete_handshake(&mut client).await;
 
-    // 1. Declare schema.
     let (opcode, _body) = round_trip(
         &mut client,
         1,
@@ -280,7 +338,8 @@ async fn recall_inside_txn_uses_substrate_path_even_with_schema() {
     .await;
     assert_eq!(opcode, Opcode::SchemaUploadResp.as_u16());
 
-    // 2. Open a transaction.
+    seed_fixture(&mut client).await;
+
     let txn_id = *uuid::Uuid::now_v7().as_bytes();
     let (opcode, _body) = round_trip(
         &mut client,
@@ -293,13 +352,10 @@ async fn recall_inside_txn_uses_substrate_path_even_with_schema() {
     .await;
     assert_eq!(opcode, Opcode::TxnBeginResp.as_u16());
 
-    // 3. Recall inside the txn — must NOT route through hybrid
-    //    (substrate path's read-your-writes is the only supported
-    //    behaviour for txn'd recalls in v1).
     let (opcode, body) = round_trip(
         &mut client,
         5,
-        RequestBody::Recall(recall_request(Some(txn_id))),
+        RequestBody::Recall(recall_request(Some(txn_id), None)),
     )
     .await;
     assert_eq!(opcode, Opcode::RecallResp.as_u16());
@@ -309,6 +365,254 @@ async fn recall_inside_txn_uses_substrate_path_even_with_schema() {
             assert_substrate(&r);
         }
         other => panic!("expected RecallResp, got {other:?}"),
+    }
+
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recall_substrate_only_strategy_skips_hybrid() {
+    let server = start(1).await;
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
+    complete_handshake(&mut client).await;
+
+    seed_fixture(&mut client).await;
+
+    let (opcode, body) = round_trip(
+        &mut client,
+        1,
+        RequestBody::Recall(recall_request(None, Some(RecallStrategy::SubstrateOnly))),
+    )
+    .await;
+    assert_eq!(opcode, Opcode::RecallResp.as_u16());
+    match body {
+        ResponseBody::Recall(r) => {
+            assert!(r.is_final);
+            // Even with a populated fixture, explicit
+            // SubstrateOnly must leave hybrid metadata empty.
+            assert_substrate(&r);
+        }
+        other => panic!("expected RecallResp, got {other:?}"),
+    }
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// E2 — cold-start safety. A hybrid recall against a server with zero
+// memories must return an empty result, not an error or a hang. tantivy
+// + HNSW have both historically returned errors on cold indexes; the
+// substrate path must surface this as an empty `RecallResp`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn recall_against_zero_memories_returns_empty_response() {
+    let server = start(1).await;
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
+    complete_handshake(&mut client).await;
+    // No seed_fixture: the shard has zero memories encoded.
+
+    let (opcode, body) = round_trip(
+        &mut client,
+        1,
+        RequestBody::Recall(recall_request(None, None)),
+    )
+    .await;
+    assert_eq!(opcode, Opcode::RecallResp.as_u16());
+    match body {
+        ResponseBody::Recall(r) => {
+            assert!(r.is_final, "cold-start hybrid must mark response final");
+            assert!(
+                r.results.is_empty(),
+                "zero-memory shard must return an empty result, got {} hits",
+                r.results.len(),
+            );
+        }
+        other => panic!("expected RecallResp, got {other:?}"),
+    }
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// E3 — Unicode cue text. Both the embedding tokenizer and the tantivy
+// analyser have historically truncated multibyte characters on byte
+// boundaries instead of code-point boundaries. Encode and recall round
+// trips with mixed scripts + emoji must succeed without panic and
+// produce non-error responses.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn unicode_cue_text_roundtrips_through_hybrid_recall() {
+    let server = start(1).await;
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
+    complete_handshake(&mut client).await;
+
+    let phrases = [
+        "Niraj met Александра in 北京",
+        "deploy day on Friday",
+        "اللقاء غدا",
+    ];
+    for (i, p) in phrases.iter().enumerate() {
+        encode_text(&mut client, 101 + (i as u32) * 2, p).await;
+    }
+
+    // Recall with one of the unicode strings as cue text. The
+    // response must be a `RecallResp` (not Error), regardless of
+    // hit count — the property under test is "no decode panic /
+    // no tokenizer crash", not relevance.
+    let mut req = recall_request(None, None);
+    req.cue_text = "Александра 北京".into();
+    let (opcode, body) = round_trip(&mut client, 1, RequestBody::Recall(req)).await;
+    assert_eq!(opcode, Opcode::RecallResp.as_u16());
+    match body {
+        ResponseBody::Recall(r) => {
+            assert!(r.is_final);
+        }
+        other => panic!("expected RecallResp, got {other:?}"),
+    }
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// P3 — SubstrateOnly invariant proptest. For varied request parameters,
+// every result returned by `SubstrateOnly` strategy must have
+// `contributing_retrievers.is_empty()` and `fused_score == 0.0`.
+// One shared server across iterations keeps wall time bounded; each
+// recall is idempotent given a fresh request_id, so reuse is safe.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn substrate_only_invariants_hold_across_request_shapes() {
+    use proptest::strategy::{Strategy, ValueTree};
+    use proptest::test_runner::{Config, TestRunner};
+
+    let server = start(1).await;
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
+    complete_handshake(&mut client).await;
+    seed_fixture(&mut client).await;
+
+    // 16 cases — heavy fixture (server + handshake reused via
+    // outer scope). We can't use TestRunner::run because its `Fn`
+    // closure forbids awaits; instead we manually draw value-trees
+    // from the strategy and await each round-trip inline.
+    let mut runner = TestRunner::new(Config {
+        cases: 16,
+        ..Config::default()
+    });
+    let strategy = (
+        proptest::collection::vec("[a-z]{1,8}", 1..=20),
+        1u32..=10,
+        proptest::num::f32::POSITIVE | proptest::num::f32::ZERO,
+    );
+    let bounded_strategy = strategy.prop_map(|(tokens, top_k, salience_raw)| {
+        let salience = if salience_raw.is_finite() {
+            salience_raw.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (tokens.join(" "), top_k, salience)
+    });
+
+    let mut sid: u32 = 1001;
+    let mut case_count: usize = 0;
+    for _ in 0..16 {
+        let tree = bounded_strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value tree");
+        let (cue, top_k, salience) = tree.current();
+        case_count += 1;
+        let mut req = recall_request(None, Some(RecallStrategy::SubstrateOnly));
+        req.cue_text = cue;
+        req.top_k = top_k;
+        req.salience_floor = salience;
+        let (opcode, body) = round_trip(&mut client, sid, RequestBody::Recall(req)).await;
+        sid += 2;
+        assert_eq!(
+            opcode,
+            Opcode::RecallResp.as_u16(),
+            "expected RecallResp; got opcode {opcode}",
+        );
+        match body {
+            ResponseBody::Recall(r) => {
+                for hit in &r.results {
+                    assert!(
+                        hit.contributing_retrievers.is_empty(),
+                        "SubstrateOnly leaked contributing_retrievers",
+                    );
+                    assert_eq!(hit.fused_score, 0.0, "SubstrateOnly leaked fused_score",);
+                }
+            }
+            other => panic!("expected RecallResp, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        case_count, 16,
+        "must execute exactly 16 proptest-drawn cases; ran {case_count}",
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recall_hybrid_only_errors_when_inside_txn() {
+    // The substrate path is the only one that can honour a txn's
+    // read-your-writes; HybridOnly + txn is a contradiction the
+    // client can't satisfy. The handler must surface
+    // HybridUnavailable rather than silently route to substrate.
+    let server = start(1).await;
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
+    complete_handshake(&mut client).await;
+
+    let txn_id = *uuid::Uuid::now_v7().as_bytes();
+    let (opcode, _body) = round_trip(
+        &mut client,
+        1,
+        RequestBody::TxnBegin(TxnBeginRequest {
+            txn_id,
+            timeout_seconds: 30,
+        }),
+    )
+    .await;
+    assert_eq!(opcode, Opcode::TxnBeginResp.as_u16());
+
+    let (opcode, body) = round_trip(
+        &mut client,
+        3,
+        RequestBody::Recall(recall_request(
+            Some(txn_id),
+            Some(RecallStrategy::HybridOnly),
+        )),
+    )
+    .await;
+    assert_eq!(opcode, Opcode::Error.as_u16());
+    match body {
+        ResponseBody::Error(e) => {
+            // Wire mapping: HybridUnavailable → ShardUnavailable.
+            assert_eq!(
+                e.code,
+                ErrorCodeWire::from(ErrorCode::ShardUnavailable),
+                "expected ShardUnavailable, got {:?}",
+                e.code,
+            );
+            assert!(
+                e.message.to_lowercase().contains("hybrid"),
+                "expected hybrid-related message, got {:?}",
+                e.message,
+            );
+        }
+        other => panic!("expected ErrorResp, got {other:?}"),
     }
 
     server.stop().await;

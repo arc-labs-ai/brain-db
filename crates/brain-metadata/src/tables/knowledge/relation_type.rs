@@ -5,8 +5,8 @@
 //! encoded as `u8` per the discriminant in `brain_core::Cardinality`.
 //!
 //! Phase 15.1 declared a minimal row (name + cardinality + symmetric
-//! + from/to + created_at). Phase 18.3 widens to match
-//! `brain_core::knowledge::RelationType` — adds namespace,
+//! plus from/to plus created_at). Phase 18.3 widens to match
+//! `brain_core::knowledge::RelationType`, adding namespace,
 //! schema_version, description, and a `relation_types_by_qname`
 //! lookup index. Archive id bumped to v2 (pre-v1.0; no migration).
 
@@ -35,6 +35,54 @@ pub const RELATION_TYPES_BY_QNAME_TABLE: TableDefinition<'static, &str, u32> =
 /// entity type allowed", else the `EntityTypeId.raw()` of the
 /// constrained type. Person seeds at `EntityTypeId(1)` per phase
 /// 16.1, so `0` is safe as a "no constraint" sentinel.
+/// Origin of a registered relation type. Mirrors
+/// [`crate::tables::knowledge::predicate::SchemaOrigin`]: tracks
+/// whether the row was authored by `SCHEMA_UPLOAD` (strict mode) or
+/// interned on demand from an open-vocabulary RELATION_CREATE.
+///
+/// Implicit-from-write rows carry `cardinality = ManyToMany` because
+/// the writer has no contract on duplicate cardinality — only a
+/// schema declaration commits the deployment to OneToOne /
+/// OneToMany / ManyToOne semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelationTypeOrigin {
+    SchemaDeclared { version: u32 },
+    ImplicitFromWrite { first_seen_lsn: u64 },
+}
+
+impl RelationTypeOrigin {
+    #[must_use]
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::SchemaDeclared { .. } => 0,
+            Self::ImplicitFromWrite { .. } => 1,
+        }
+    }
+    #[must_use]
+    pub fn payload(self) -> u64 {
+        match self {
+            Self::SchemaDeclared { version } => u64::from(version),
+            Self::ImplicitFromWrite { first_seen_lsn } => first_seen_lsn,
+        }
+    }
+    #[must_use]
+    pub fn decode(tag: u8, payload: u64) -> Self {
+        match tag {
+            1 => Self::ImplicitFromWrite {
+                first_seen_lsn: payload,
+            },
+            _ => Self::SchemaDeclared {
+                #[allow(clippy::cast_possible_truncation)]
+                version: payload as u32,
+            },
+        }
+    }
+    #[must_use]
+    pub fn is_schema_declared(self) -> bool {
+        matches!(self, Self::SchemaDeclared { .. })
+    }
+}
+
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 pub struct RelationTypeDefinition {
@@ -48,6 +96,8 @@ pub struct RelationTypeDefinition {
     pub schema_version: u32,
     pub description: String,
     pub created_at_unix_nanos: u64,
+    pub origin_tag: u8,
+    pub origin_payload: u64,
 }
 
 impl RelationTypeDefinition {
@@ -66,9 +116,24 @@ impl RelationTypeDefinition {
         self.is_symmetric != 0
     }
 
-    /// Build a redb row from the brain-core value type.
+    /// Build a redb row from the brain-core value type. Origin defaults
+    /// to `SchemaDeclared` at the relation type's `schema_version` —
+    /// `relation_type_intern_or_get` overrides with `ImplicitFromWrite`
+    /// for open-vocabulary writes.
     #[must_use]
     pub fn from_relation_type(r: &RelationType, created_at_unix_nanos: u64) -> Self {
+        let origin = RelationTypeOrigin::SchemaDeclared {
+            version: r.schema_version,
+        };
+        Self::from_relation_type_with_origin(r, created_at_unix_nanos, origin)
+    }
+
+    #[must_use]
+    pub fn from_relation_type_with_origin(
+        r: &RelationType,
+        created_at_unix_nanos: u64,
+        origin: RelationTypeOrigin,
+    ) -> Self {
         Self {
             relation_type_id: r.id.raw(),
             namespace: r.namespace.clone(),
@@ -80,7 +145,14 @@ impl RelationTypeDefinition {
             schema_version: r.schema_version,
             description: r.description.clone(),
             created_at_unix_nanos,
+            origin_tag: origin.tag(),
+            origin_payload: origin.payload(),
         }
+    }
+
+    #[must_use]
+    pub fn origin(&self) -> RelationTypeOrigin {
+        RelationTypeOrigin::decode(self.origin_tag, self.origin_payload)
     }
 
     /// Project to the brain-core value type. `created_at_unix_nanos`
@@ -118,7 +190,10 @@ pub fn encode_entity_type_id(t: Option<EntityTypeId>) -> u32 {
     t.map(|e| e.raw()).unwrap_or(0)
 }
 
-impl_redb_rkyv_value!(RelationTypeDefinition, "brain_metadata::RelationTypeDefinition::v2");
+impl_redb_rkyv_value!(
+    RelationTypeDefinition,
+    "brain_metadata::RelationTypeDefinition::v3"
+);
 
 #[cfg(all(test, not(miri)))]
 mod tests {

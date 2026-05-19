@@ -1,29 +1,41 @@
-//! Relation CRUD + cardinality-driven supersession + symmetric
-//! canonicalisation. Sub-task 18.4.
+//! Relation CRUD over the unified edge table + sidecar metadata.
 //!
-//! Free functions over `redb::{ReadTransaction, WriteTransaction}`,
-//! mirroring [`crate::statement_ops`] (17.4) and the entity-ops
-//! precedent.
+//! Phase C collapsed substrate edges and typed relations into one
+//! redb table pair. This module is the typed-relation writer
+//! plus reader projections on that pair:
 //!
-//! Spec refs:
-//! - `spec/20_relations/00_purpose.md` — schema + ops.
-//! - `spec/20_relations/01_cardinality.md` — supersession rules.
-//! - `spec/20_relations/02_symmetric.md` — canonical ordering + dual
-//!   indexing.
-//! - `spec/20_relations/03_storage.md` — per-op write paths.
-//! - `spec/20_relations/05_evidence.md` — flat evidence vec.
+//! - `relation_create` writes one row to
+//!   [`crate::tables::edge::EDGES_TABLE`] + its reverse, and one row
+//!   to [`RELATION_METADATA_TABLE`] (the sidecar) + 0..N rows to
+//!   [`RELATION_BY_EVIDENCE_TABLE`].
+//! - `relation_supersede` updates the old sidecar (`is_current = 0`,
+//!   `superseded_by = new_id`, `valid_to = now`) and inserts the new
+//!   relation. The edge row of the superseded relation stays — the
+//!   sidecar carries history.
+//! - `relation_tombstone` flips the sidecar `tombstoned` bit; the
+//!   edge row stays.
+//! - `relation_list_from` / `_to` walk the unified edge table
+//!   (`walk_outgoing` / `walk_incoming` filtered to `Typed`) and
+//!   project sidecar metadata back to [`Relation`].
+//! - `relation_get` is a sidecar point lookup keyed by `RelationId`.
+//! - Cardinality probes prefix-scan the unified table by
+//!   `(from, Typed(rel_type_id), *)` and filter on sidecar
+//!   `is_current = 1`.
 
 use brain_core::knowledge::{canonical_pair, Relation};
 use brain_core::{
-    Cardinality, EntityId, MemoryId, RelationId, RelationTypeId,
+    Cardinality, EdgeKindRef, EntityId, MemoryId, NodeRef, RelationId, RelationTypeId,
 };
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
 use crate::entity_ops::EntityOpError;
 use crate::relation_type_ops::RelationTypeOpError;
+use crate::tables::edge::{
+    self, derived_by, origin, EdgeData, EdgeKeyError, EdgeOpError, EDGES_REVERSE_TABLE, EDGES_TABLE,
+};
 use crate::tables::knowledge::relation::{
-    metadata_from_relation, relation_from_metadata, RelationMetadata,
-    RELATIONS_BY_EVIDENCE_TABLE, RELATIONS_BY_FROM_TABLE, RELATIONS_BY_TO_TABLE, RELATIONS_TABLE,
+    metadata_from_relation, relation_from_metadata, RelationMetadata, RELATION_BY_EVIDENCE_TABLE,
+    RELATION_METADATA_TABLE,
 };
 
 // ---------------------------------------------------------------------------
@@ -37,6 +49,12 @@ pub enum RelationOpError {
 
     #[error("redb table error: {0}")]
     Table(#[from] redb::TableError),
+
+    #[error("edge op error: {0}")]
+    EdgeOp(#[from] EdgeOpError),
+
+    #[error("edge key decode error: {0}")]
+    EdgeKey(#[from] EdgeKeyError),
 
     #[error("relation {0:?} not found")]
     NotFound(RelationId),
@@ -59,9 +77,7 @@ pub enum RelationOpError {
     #[error("relation {0:?} is tombstoned")]
     AlreadyTombstoned(RelationId),
 
-    #[error(
-        "relation type mismatch on supersede: old={old:?} new={new:?}"
-    )]
+    #[error("relation type mismatch on supersede: old={old:?} new={new:?}")]
     TypeMismatch {
         old: RelationTypeId,
         new: RelationTypeId,
@@ -77,9 +93,6 @@ pub enum RelationOpError {
         variant: Cardinality,
         conflicting: usize,
     },
-
-    #[error("metadata row decode failed — file may be corrupt")]
-    DecodeFailed,
 
     #[error("relation type op: {0}")]
     RelationTypeOp(#[from] RelationTypeOpError),
@@ -111,9 +124,9 @@ pub fn relation_get(
     rtxn: &ReadTransaction,
     id: RelationId,
 ) -> Result<Option<Relation>, RelationOpError> {
-    let t = rtxn.open_table(RELATIONS_TABLE)?;
+    let t = rtxn.open_table(RELATION_METADATA_TABLE)?;
     let row: Option<RelationMetadata> = t.get(&id.to_bytes())?.map(|g| g.value());
-    Ok(row.as_ref().map(relation_from_metadata))
+    Ok(row.as_ref().map(|m| relation_from_metadata(id, m)))
 }
 
 /// Walk a supersession chain. Anchor may be the chain root or any
@@ -122,56 +135,52 @@ pub fn relation_history(
     rtxn: &ReadTransaction,
     anchor: RelationId,
 ) -> Result<Vec<Relation>, RelationOpError> {
-    let t = rtxn.open_table(RELATIONS_TABLE)?;
+    let t = rtxn.open_table(RELATION_METADATA_TABLE)?;
     let anchor_row: Option<RelationMetadata> = t.get(&anchor.to_bytes())?.map(|g| g.value());
     let Some(anchor_row) = anchor_row else {
         return Err(RelationOpError::NotFound(anchor));
     };
     let chain_root_bytes = anchor_row.chain_root_bytes;
 
-    // Walk every row with this chain root. Linear scan because there's
-    // no chain-table-style secondary index for relations in v1; relation
-    // chains are typically short (1–3 entries) so cost is fine.
-    //
-    // TODO(phase 22+): add RELATION_CHAIN_TABLE if chain reads become
-    // hot.
+    // Linear scan: chains are short (1–3 entries typical). A
+    // chain-root secondary index can be added if this becomes hot.
     let mut chain = Vec::new();
     for entry in t.iter()? {
-        let (_, v) = entry?;
+        let (k, v) = entry?;
         let m = v.value();
         if m.chain_root_bytes == chain_root_bytes {
-            chain.push(relation_from_metadata(&m));
+            let id = RelationId::from(k.value());
+            chain.push(relation_from_metadata(id, &m));
         }
     }
     chain.sort_by_key(|r| r.version);
     Ok(chain)
 }
 
-/// List relations where `entity` appears as `from` (or, for
-/// symmetric relations, where the relation is dual-indexed under
-/// `entity` in `RELATIONS_BY_FROM`).
+/// List relations where `entity` is the `from` endpoint, optionally
+/// filtered by relation type and `current_only`.
 pub fn relation_list_from(
     rtxn: &ReadTransaction,
     entity: EntityId,
     filter: &RelationListFilter,
 ) -> Result<Vec<Relation>, RelationOpError> {
-    list_via_directional_index(rtxn, entity, filter, /* from_side */ true)
+    list_directional(rtxn, entity, filter, /* outgoing */ true)
 }
 
-/// List relations where `entity` appears as `to`.
+/// List relations where `entity` is the `to` endpoint.
 pub fn relation_list_to(
     rtxn: &ReadTransaction,
     entity: EntityId,
     filter: &RelationListFilter,
 ) -> Result<Vec<Relation>, RelationOpError> {
-    list_via_directional_index(rtxn, entity, filter, /* from_side */ false)
+    list_directional(rtxn, entity, filter, /* outgoing */ false)
 }
 
-fn list_via_directional_index(
+fn list_directional(
     rtxn: &ReadTransaction,
     entity: EntityId,
     filter: &RelationListFilter,
-    from_side: bool,
+    outgoing: bool,
 ) -> Result<Vec<Relation>, RelationOpError> {
     let cap = if filter.limit == 0 {
         DEFAULT_LIST_LIMIT
@@ -179,54 +188,48 @@ fn list_via_directional_index(
         filter.limit.min(DEFAULT_LIST_LIMIT)
     };
 
-    let idx = if from_side {
-        rtxn.open_table(RELATIONS_BY_FROM_TABLE)?
+    let kind_filter = filter.relation_type.map(EdgeKindRef::Typed);
+    let rows = if outgoing {
+        edge::walk_outgoing(rtxn, NodeRef::Entity(entity), kind_filter)?
     } else {
-        rtxn.open_table(RELATIONS_BY_TO_TABLE)?
+        edge::walk_incoming(rtxn, NodeRef::Entity(entity), kind_filter)?
     };
 
-    let mut ids: Vec<[u8; 16]> = Vec::new();
-    let lo = (entity.to_bytes(), 0u32, 0u8);
-    let hi = (entity.to_bytes(), u32::MAX, 1u8);
-    for entry in idx.range(lo..=hi)? {
-        let (k, v) = entry?;
-        let (_, k_type, k_current) = k.value();
-        if filter.current_only && k_current == 0 {
+    let sidecar = rtxn.open_table(RELATION_METADATA_TABLE)?;
+    let mut out = Vec::new();
+    for (kind, _other, disambiguator, _data) in rows {
+        // Only Typed edges represent typed relations; ignore
+        // substrate Builtin / Mentions edges that might also be
+        // anchored at this entity (none today, future-proof).
+        if !matches!(kind, EdgeKindRef::Typed(_)) {
+            continue;
+        }
+        let id = RelationId::from(disambiguator);
+        let Some(meta) = sidecar.get(&disambiguator)?.map(|g| g.value()) else {
+            continue;
+        };
+        if filter.current_only && !meta.is_current() {
             continue;
         }
         if let Some(want) = filter.relation_type {
-            if k_type != want.raw() {
+            if meta.relation_type_id != want.raw() {
                 continue;
             }
         }
-        ids.push(v.value());
-        if ids.len() >= cap {
+        out.push(relation_from_metadata(id, &meta));
+        if out.len() >= cap {
             break;
-        }
-    }
-
-    let t = rtxn.open_table(RELATIONS_TABLE)?;
-    let mut out = Vec::with_capacity(ids.len());
-    let mut seen: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
-    for rid in ids {
-        if !seen.insert(rid) {
-            continue;
-        }
-        let row: Option<RelationMetadata> = t.get(&rid)?.map(|g| g.value());
-        if let Some(m) = row {
-            out.push(relation_from_metadata(&m));
         }
     }
     Ok(out)
 }
 
 /// Returns ids of all relations that cite `memory_id` as evidence.
-/// Used by the FORGET cascade in spec §20/05 §5.
 pub fn relations_with_evidence(
     rtxn: &ReadTransaction,
     memory_id: MemoryId,
 ) -> Result<Vec<RelationId>, RelationOpError> {
-    let t = rtxn.open_table(RELATIONS_BY_EVIDENCE_TABLE)?;
+    let t = rtxn.open_table(RELATION_BY_EVIDENCE_TABLE)?;
     let mem_bytes = memory_id.to_be_bytes();
     let lo = (mem_bytes, [0u8; 16]);
     let hi = (mem_bytes, [0xFFu8; 16]);
@@ -247,15 +250,6 @@ pub fn relations_with_evidence(
 // ---------------------------------------------------------------------------
 
 /// Create a new relation.
-///
-/// 1. Validates `r.from_entity / r.to_entity` exist.
-/// 2. Validates `r.relation_type` is registered; pulls `Cardinality`
-///    + `is_symmetric` from the registry (callers may set
-///    `r.is_symmetric` from the registry first; this function
-///    re-reads it to enforce the source of truth).
-/// 3. Canonicalises `(from, to)` for symmetric relations.
-/// 4. Runs the cardinality auto-supersede probe per §20/01 §2.
-/// 5. Inserts primary + 1–2 BY_FROM + 1–2 BY_TO + evidence rows.
 pub fn relation_create(
     wtxn: &WriteTransaction,
     r: &Relation,
@@ -267,22 +261,17 @@ pub fn relation_create(
         ));
     }
 
-    // Endpoints exist.
     require_entity_exists(wtxn, r.from_entity)?;
     require_entity_exists(wtxn, r.to_entity)?;
-
-    // Relation type exists; pull authoritative cardinality + symmetry.
     let (cardinality, is_symmetric) = lookup_type(wtxn, r.relation_type)?;
 
-    // ID uniqueness.
     {
-        let t = wtxn.open_table(RELATIONS_TABLE)?;
+        let t = wtxn.open_table(RELATION_METADATA_TABLE)?;
         if t.get(&r.id.to_bytes())?.is_some() {
             return Err(RelationOpError::AlreadyExists(r.id));
         }
     }
 
-    // Canonicalise for symmetric.
     let mut to_insert = r.clone();
     to_insert.is_symmetric = is_symmetric;
     if is_symmetric {
@@ -291,19 +280,13 @@ pub fn relation_create(
         to_insert.to_entity = b;
     }
 
-    // Cardinality auto-supersession.
-    let conflicting =
-        find_cardinality_conflicts(wtxn, &to_insert, cardinality)?;
+    let conflicting = find_cardinality_conflicts(wtxn, &to_insert, cardinality)?;
     match conflicting.len() {
         0 => {
-            insert_new_relation(wtxn, &to_insert)?;
+            insert_new_relation(wtxn, &to_insert, now_unix_nanos)?;
             Ok(to_insert.id)
         }
-        1 => {
-            // Auto-supersede the single prior current.
-            let old_id = conflicting[0];
-            relation_supersede(wtxn, old_id, &to_insert, now_unix_nanos)
-        }
+        1 => relation_supersede(wtxn, conflicting[0], &to_insert, now_unix_nanos),
         _ => Err(RelationOpError::CardinalityViolation {
             variant: cardinality,
             conflicting: conflicting.len(),
@@ -311,12 +294,12 @@ pub fn relation_create(
     }
 }
 
-/// Supersede `old_id` with `new_relation`. Atomic two-step in `wtxn`.
+/// Supersede `old_id` with `new_relation`.
 pub fn relation_supersede(
     wtxn: &WriteTransaction,
     old_id: RelationId,
     new_relation: &Relation,
-    _now_unix_nanos: u64,
+    now_unix_nanos: u64,
 ) -> Result<RelationId, RelationOpError> {
     if new_relation.confidence.is_nan() || !(0.0..=1.0).contains(&new_relation.confidence) {
         return Err(RelationOpError::InvalidArgument(
@@ -324,13 +307,11 @@ pub fn relation_supersede(
         ));
     }
 
-    // Load old.
     let mut old = {
-        let t = wtxn.open_table(RELATIONS_TABLE)?;
-        let row: Option<RelationMetadata> = t.get(&old_id.to_bytes())?.map(|g| g.value());
+        let t = wtxn.open_table(RELATION_METADATA_TABLE)?;
+        let row = t.get(&old_id.to_bytes())?.map(|g| g.value());
         row.ok_or(RelationOpError::NotFound(old_id))?
     };
-
     if old.is_tombstoned() {
         return Err(RelationOpError::AlreadyTombstoned(old_id));
     }
@@ -346,26 +327,15 @@ pub fn relation_supersede(
             new: new_relation.relation_type,
         });
     }
-    // We deliberately do NOT require both endpoints to match here.
-    // Cardinality-based auto-supersede legitimately replaces a
-    // ManyToOne or OneToMany relation with one whose constrained
-    // side matches but whose other side differs (that's the whole
-    // point — adding a new value on the unconstrained side). The
-    // caller (`relation_create`'s cardinality-conflict probe) has
-    // already validated that the new relation satisfies the
-    // cardinality constraint, so re-checking endpoints here would
-    // reject valid supersessions.
-
-    // ID uniqueness on new.
     {
-        let t = wtxn.open_table(RELATIONS_TABLE)?;
+        let t = wtxn.open_table(RELATION_METADATA_TABLE)?;
         if t.get(&new_relation.id.to_bytes())?.is_some() {
             return Err(RelationOpError::AlreadyExists(new_relation.id));
         }
     }
 
     let chain_root_bytes = if old.supersedes_bytes.is_none() {
-        old.relation_id_bytes
+        old_id.to_bytes()
     } else {
         old.chain_root_bytes
     };
@@ -378,14 +348,6 @@ pub fn relation_supersede(
     new_to_insert.chain_root = RelationId::from(chain_root_bytes);
     new_to_insert.is_symmetric = old.is_symmetric();
 
-    // Capture old direction-index keys before mutation.
-    let old_from = old.from_entity_bytes;
-    let old_to = old.to_entity_bytes;
-    let old_type = old.relation_type_id;
-    let old_was_current = old.is_current != 0;
-    let old_is_symmetric = old.is_symmetric();
-
-    // Update old in place.
     old.superseded_by_bytes = Some(new_to_insert.id.to_bytes());
     if old.valid_to_unix_nanos.is_none() {
         old.valid_to_unix_nanos = Some(new_to_insert.extracted_at_unix_nanos);
@@ -393,52 +355,35 @@ pub fn relation_supersede(
     old.is_current = 0;
 
     {
-        let mut t = wtxn.open_table(RELATIONS_TABLE)?;
-        t.insert(&old.relation_id_bytes, &old)?;
+        let mut t = wtxn.open_table(RELATION_METADATA_TABLE)?;
+        t.insert(&old_id.to_bytes(), &old)?;
     }
 
-    // Flip BY_FROM + BY_TO is_current bits for old. For symmetric,
-    // both endpoints appear in BOTH indexes — flip all 4.
-    if old_was_current {
-        flip_is_current(wtxn, old_from, old_to, old_type, old_is_symmetric, old.relation_id_bytes)?;
-    }
-
-    // Insert new relation + all indexes.
-    insert_new_relation(wtxn, &new_to_insert)?;
-
+    insert_new_relation(wtxn, &new_to_insert, now_unix_nanos)?;
     Ok(new_to_insert.id)
 }
 
-/// Soft delete. Flips `is_current` in storage + directional indexes.
+/// Soft delete. Flips the sidecar `tombstoned` + `is_current` bits.
+/// The unified edge row stays — tombstone is a sidecar property.
 pub fn relation_tombstone(
     wtxn: &WriteTransaction,
     id: RelationId,
     now_unix_nanos: u64,
 ) -> Result<(), RelationOpError> {
     let mut row = {
-        let t = wtxn.open_table(RELATIONS_TABLE)?;
-        let r: Option<RelationMetadata> = t.get(&id.to_bytes())?.map(|g| g.value());
-        r.ok_or(RelationOpError::NotFound(id))?
+        let t = wtxn.open_table(RELATION_METADATA_TABLE)?;
+        let row = t.get(&id.to_bytes())?.map(|g| g.value());
+        row.ok_or(RelationOpError::NotFound(id))?
     };
     if row.is_tombstoned() {
         return Ok(());
     }
-    let was_current = row.is_current != 0;
-    let from = row.from_entity_bytes;
-    let to = row.to_entity_bytes;
-    let type_id = row.relation_type_id;
-    let was_symmetric = row.is_symmetric();
-
     row.tombstoned = 1;
     row.tombstoned_at_unix_nanos = Some(now_unix_nanos);
     row.is_current = 0;
-
     {
-        let mut t = wtxn.open_table(RELATIONS_TABLE)?;
-        t.insert(&row.relation_id_bytes, &row)?;
-    }
-    if was_current {
-        flip_is_current(wtxn, from, to, type_id, was_symmetric, row.relation_id_bytes)?;
+        let mut t = wtxn.open_table(RELATION_METADATA_TABLE)?;
+        t.insert(&id.to_bytes(), &row)?;
     }
     Ok(())
 }
@@ -447,10 +392,7 @@ pub fn relation_tombstone(
 // Internal helpers.
 // ---------------------------------------------------------------------------
 
-fn require_entity_exists(
-    wtxn: &WriteTransaction,
-    id: EntityId,
-) -> Result<(), RelationOpError> {
+fn require_entity_exists(wtxn: &WriteTransaction, id: EntityId) -> Result<(), RelationOpError> {
     use crate::tables::knowledge::entity::{EntityMetadata, ENTITIES_TABLE};
     let t = wtxn.open_table(ENTITIES_TABLE)?;
     let row: Option<EntityMetadata> = t.get(&id.to_bytes())?.map(|g| g.value());
@@ -464,9 +406,7 @@ fn lookup_type(
     wtxn: &WriteTransaction,
     id: RelationTypeId,
 ) -> Result<(Cardinality, bool), RelationOpError> {
-    use crate::tables::knowledge::relation_type::{
-        RelationTypeDefinition, RELATION_TYPES_TABLE,
-    };
+    use crate::tables::knowledge::relation_type::{RelationTypeDefinition, RELATION_TYPES_TABLE};
     let t = wtxn.open_table(RELATION_TYPES_TABLE)?;
     let row: Option<RelationTypeDefinition> = t.get(&id.raw())?.map(|g| g.value());
     let row = row.ok_or(RelationOpError::UnknownRelationType(id))?;
@@ -476,121 +416,157 @@ fn lookup_type(
     Ok((cardinality, row.is_symmetric != 0))
 }
 
-/// Pre-create cardinality probe per §20/01 §2. Returns ids of any
-/// existing current relations that conflict with the new one under
-/// the given cardinality. Caller decides how to react.
+/// Cardinality probe.
+///
+/// For each side covered by `cardinality`, walk every current Typed
+/// edge of `r.relation_type` anchored at that endpoint and collect
+/// the conflicting [`RelationId`]s. Caller resolves single-conflict
+/// → auto-supersede and multi-conflict → `CardinalityViolation`.
 fn find_cardinality_conflicts(
     wtxn: &WriteTransaction,
     r: &Relation,
     cardinality: Cardinality,
 ) -> Result<Vec<RelationId>, RelationOpError> {
-    let mut found = Vec::new();
+    let mut found: Vec<RelationId> = Vec::new();
 
-    let want_from_lookup = matches!(cardinality, Cardinality::ManyToOne | Cardinality::OneToOne);
-    let want_to_lookup = matches!(cardinality, Cardinality::OneToMany | Cardinality::OneToOne);
+    let want_from = matches!(cardinality, Cardinality::ManyToOne | Cardinality::OneToOne);
+    let want_to = matches!(cardinality, Cardinality::OneToMany | Cardinality::OneToOne);
 
-    if want_from_lookup {
-        let by_from = wtxn.open_table(RELATIONS_BY_FROM_TABLE)?;
-        let key = (r.from_entity.to_bytes(), r.relation_type.raw(), 1u8);
-        let bytes: Option<[u8; 16]> = by_from.get(&key)?.map(|g| g.value());
-        if let Some(b) = bytes {
-            let candidate = RelationId::from(b);
-            // For symmetric OneToOne, this might be the same relation
-            // we're trying to insert (won't be — id uniqueness check
-            // already passed). Add unconditionally.
-            if !found.contains(&candidate) {
-                found.push(candidate);
-            }
-        }
+    if want_from {
+        collect_typed_conflicts(
+            wtxn,
+            NodeRef::Entity(r.from_entity),
+            r.relation_type,
+            /* outgoing */ true,
+            r.id,
+            &mut found,
+        )?;
     }
-    if want_to_lookup {
-        let by_to = wtxn.open_table(RELATIONS_BY_TO_TABLE)?;
-        let key = (r.to_entity.to_bytes(), r.relation_type.raw(), 1u8);
-        let bytes: Option<[u8; 16]> = by_to.get(&key)?.map(|g| g.value());
-        if let Some(b) = bytes {
-            let candidate = RelationId::from(b);
-            if !found.contains(&candidate) {
-                found.push(candidate);
-            }
-        }
+    if want_to {
+        collect_typed_conflicts(
+            wtxn,
+            NodeRef::Entity(r.to_entity),
+            r.relation_type,
+            /* outgoing */ false,
+            r.id,
+            &mut found,
+        )?;
     }
     Ok(found)
 }
 
-/// Insert a fresh relation row + every secondary index.
-fn insert_new_relation(
+fn collect_typed_conflicts(
     wtxn: &WriteTransaction,
-    r: &Relation,
+    anchor: NodeRef,
+    rel_type: RelationTypeId,
+    outgoing: bool,
+    new_id: RelationId,
+    out: &mut Vec<RelationId>,
 ) -> Result<(), RelationOpError> {
-    let m = metadata_from_relation(r);
+    let kind_filter = Some(EdgeKindRef::Typed(rel_type));
+    // walk_outgoing / walk_incoming take a read transaction; reopen
+    // the relevant table on the write txn and range-scan directly.
+    let key_prefix = anchor.to_bytes().to_vec();
+    let mut prefix_with_kind = key_prefix.clone();
+    EdgeKindRef::Typed(rel_type).encode_into(&mut prefix_with_kind);
+    let mut hi = prefix_with_kind.clone();
+    hi.extend_from_slice(&[0xFF; 17 + 16]);
 
-    // Primary.
-    {
-        let mut t = wtxn.open_table(RELATIONS_TABLE)?;
-        t.insert(&m.relation_id_bytes, &m)?;
-    }
-
-    let type_id = m.relation_type_id;
-    let from = m.from_entity_bytes;
-    let to = m.to_entity_bytes;
-    let current = m.is_current;
-    let is_symmetric = m.is_symmetric();
-
-    // BY_FROM: always under `from`. For symmetric, also under `to`.
-    {
-        let mut t = wtxn.open_table(RELATIONS_BY_FROM_TABLE)?;
-        t.insert(&(from, type_id, current), &m.relation_id_bytes)?;
-        if is_symmetric {
-            t.insert(&(to, type_id, current), &m.relation_id_bytes)?;
+    let table = if outgoing {
+        wtxn.open_table(EDGES_TABLE)?
+    } else {
+        wtxn.open_table(EDGES_REVERSE_TABLE)?
+    };
+    let sidecar = wtxn.open_table(RELATION_METADATA_TABLE)?;
+    for entry in table.range::<&[u8]>(prefix_with_kind.as_slice()..=hi.as_slice())? {
+        let (k, _) = entry?;
+        let key = edge::EdgeKey::decode(k.value())?;
+        if key.from != anchor {
+            continue;
+        }
+        if !matches!(key.kind, EdgeKindRef::Typed(rt) if rt == rel_type) {
+            continue;
+        }
+        let candidate = RelationId::from(key.disambiguator);
+        if candidate == new_id {
+            continue;
+        }
+        let Some(meta) = sidecar.get(&key.disambiguator)?.map(|g| g.value()) else {
+            continue;
+        };
+        if meta.is_current() && !out.contains(&candidate) {
+            out.push(candidate);
         }
     }
-    // BY_TO: always under `to`. For symmetric, also under `from`.
-    {
-        let mut t = wtxn.open_table(RELATIONS_BY_TO_TABLE)?;
-        t.insert(&(to, type_id, current), &m.relation_id_bytes)?;
-        if is_symmetric {
-            t.insert(&(from, type_id, current), &m.relation_id_bytes)?;
-        }
-    }
-    // BY_EVIDENCE.
-    {
-        let mut t = wtxn.open_table(RELATIONS_BY_EVIDENCE_TABLE)?;
-        for mem in &r.evidence {
-            t.insert(&(mem.to_be_bytes(), m.relation_id_bytes), &())?;
-        }
-    }
-
+    // Suppress kind_filter unused warning — it's documentation that
+    // we expect typed edges here.
+    let _ = kind_filter;
     Ok(())
 }
 
-/// Flip `is_current` from 1 → 0 in BY_FROM and BY_TO. For symmetric,
-/// both endpoints appear in BOTH indexes — flip all 4 keys.
-fn flip_is_current(
+/// Insert a fresh relation row.
+///
+/// Writes:
+/// 1. one row to `EDGES_TABLE` + reverse mirror keyed by
+///    `(from, Typed(rt_id), to, RelationId.bytes)`
+/// 2. one row to `RELATION_METADATA_TABLE`
+/// 3. one row to `RELATION_BY_EVIDENCE_TABLE` per evidence MemoryId
+fn insert_new_relation(
     wtxn: &WriteTransaction,
-    from_bytes: [u8; 16],
-    to_bytes: [u8; 16],
-    type_id: u32,
-    is_symmetric: bool,
-    relation_id_bytes: [u8; 16],
+    r: &Relation,
+    now_unix_nanos: u64,
 ) -> Result<(), RelationOpError> {
+    // Edge row(s). Symmetric typed relations write the mirror
+    // explicitly here — `edge::link`'s auto-mirror is reserved for
+    // substrate `Builtin` kinds. Mirroring at the relation layer
+    // keeps the `is_symmetric` bit colocated with the rest of the
+    // sidecar metadata.
     {
-        let mut t = wtxn.open_table(RELATIONS_BY_FROM_TABLE)?;
-        t.remove(&(from_bytes, type_id, 1u8))?;
-        t.insert(&(from_bytes, type_id, 0u8), &relation_id_bytes)?;
-        if is_symmetric {
-            t.remove(&(to_bytes, type_id, 1u8))?;
-            t.insert(&(to_bytes, type_id, 0u8), &relation_id_bytes)?;
+        let mut edges = wtxn.open_table(EDGES_TABLE)?;
+        let mut reverse = wtxn.open_table(EDGES_REVERSE_TABLE)?;
+        let data = EdgeData::new(
+            1.0,
+            origin::AUTO_DERIVED,
+            derived_by::CLIENT,
+            now_unix_nanos,
+        );
+        edge::link(
+            &mut edges,
+            &mut reverse,
+            NodeRef::Entity(r.from_entity),
+            EdgeKindRef::Typed(r.relation_type),
+            NodeRef::Entity(r.to_entity),
+            r.id.to_bytes(),
+            &data,
+        )?;
+        if r.is_symmetric && r.from_entity != r.to_entity {
+            edge::link(
+                &mut edges,
+                &mut reverse,
+                NodeRef::Entity(r.to_entity),
+                EdgeKindRef::Typed(r.relation_type),
+                NodeRef::Entity(r.from_entity),
+                r.id.to_bytes(),
+                &data,
+            )?;
         }
     }
+
+    // Sidecar.
+    let m = metadata_from_relation(r);
     {
-        let mut t = wtxn.open_table(RELATIONS_BY_TO_TABLE)?;
-        t.remove(&(to_bytes, type_id, 1u8))?;
-        t.insert(&(to_bytes, type_id, 0u8), &relation_id_bytes)?;
-        if is_symmetric {
-            t.remove(&(from_bytes, type_id, 1u8))?;
-            t.insert(&(from_bytes, type_id, 0u8), &relation_id_bytes)?;
+        let mut t = wtxn.open_table(RELATION_METADATA_TABLE)?;
+        t.insert(&r.id.to_bytes(), &m)?;
+    }
+
+    // Evidence reverse index.
+    {
+        let mut t = wtxn.open_table(RELATION_BY_EVIDENCE_TABLE)?;
+        for mem in &r.evidence {
+            t.insert(&(mem.to_be_bytes(), r.id.to_bytes()), &())?;
         }
     }
+
     Ok(())
 }
 
@@ -615,7 +591,28 @@ mod tests {
     fn make_entity(db: &mut crate::MetadataDb, name: &str) -> EntityId {
         let id = EntityId::new();
         let n = normalize_name(name);
-        let e = Entity::new_active(id, EntityType::PERSON_ID, name.into(), n, 1_700_000_000_000_000_000);
+        let e = Entity::new_active(
+            id,
+            EntityType::PERSON_ID,
+            name.into(),
+            n,
+            1_700_000_000_000_000_000,
+        );
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, &e).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn make_entity_with(db: &mut crate::MetadataDb, id: EntityId, name: &str) -> EntityId {
+        let n = normalize_name(name);
+        let e = Entity::new_active(
+            id,
+            EntityType::PERSON_ID,
+            name.into(),
+            n,
+            1_700_000_000_000_000_000,
+        );
         let wtxn = db.write_txn().unwrap();
         entity_put(&wtxn, &e).unwrap();
         wtxn.commit().unwrap();
@@ -665,8 +662,6 @@ mod tests {
         )
     }
 
-    // ----- Create + projection -----
-
     #[test]
     fn create_asymmetric_round_trips() {
         let (_dir, mut db) = open_db();
@@ -693,7 +688,6 @@ mod tests {
         let _ = make_entity_with(&mut db, a, "a");
         let _ = make_entity_with(&mut db, b, "b");
         let t = intern_type(&mut db, "knows_sym", Cardinality::ManyToMany, true);
-        // Caller passes a, b but canonical is (b, a) since b < a.
         let r = fresh_rel(t, a, b, true);
 
         let wtxn = db.write_txn().unwrap();
@@ -705,42 +699,6 @@ mod tests {
         assert_eq!(got.from_entity, b);
         assert_eq!(got.to_entity, a);
         assert!(got.is_symmetric);
-    }
-
-    fn make_entity_with(db: &mut crate::MetadataDb, id: EntityId, name: &str) -> EntityId {
-        let n = normalize_name(name);
-        let e = Entity::new_active(id, EntityType::PERSON_ID, name.into(), n, 1_700_000_000_000_000_000);
-        let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, &e).unwrap();
-        wtxn.commit().unwrap();
-        id
-    }
-
-    #[test]
-    fn create_symmetric_indexes_both_sides() {
-        let (_dir, mut db) = open_db();
-        let a = make_entity(&mut db, "a-sym");
-        let b = make_entity(&mut db, "b-sym");
-        let t = intern_type(&mut db, "discussed_with", Cardinality::ManyToMany, true);
-        let r = fresh_rel(t, a, b, true);
-
-        let wtxn = db.write_txn().unwrap();
-        relation_create(&wtxn, &r, 0).unwrap();
-        wtxn.commit().unwrap();
-
-        let rtxn = db.read_txn().unwrap();
-        let filter = RelationListFilter {
-            relation_type: Some(t),
-            current_only: true,
-            ..Default::default()
-        };
-        // Query from a — finds the relation (dual-indexed).
-        let from_a = relation_list_from(&rtxn, a, &filter).unwrap();
-        assert_eq!(from_a.len(), 1);
-        // Query from b — also finds it (canonical_from is whichever
-        // came first byte-wise; the other endpoint is in BY_FROM too).
-        let from_b = relation_list_from(&rtxn, b, &filter).unwrap();
-        assert_eq!(from_b.len(), 1);
     }
 
     #[test]
@@ -762,9 +720,7 @@ mod tests {
         let r = fresh_rel(RelationTypeId::from(9999), a, b, false);
         let wtxn = db.write_txn().unwrap();
         let err = relation_create(&wtxn, &r, 0).unwrap_err();
-        matches!(err, RelationOpError::UnknownRelationType(_))
-            .then_some(())
-            .expect("expected UnknownRelationType");
+        assert!(matches!(err, RelationOpError::UnknownRelationType(_)));
     }
 
     #[test]
@@ -774,9 +730,7 @@ mod tests {
         let r = fresh_rel(t, EntityId::new(), EntityId::new(), false);
         let wtxn = db.write_txn().unwrap();
         let err = relation_create(&wtxn, &r, 0).unwrap_err();
-        matches!(err, RelationOpError::UnknownEntity(_))
-            .then_some(())
-            .expect("expected UnknownEntity");
+        assert!(matches!(err, RelationOpError::UnknownEntity(_)));
     }
 
     #[test]
@@ -792,7 +746,6 @@ mod tests {
         relation_create(&wtxn, &r1, 0).unwrap();
         wtxn.commit().unwrap();
 
-        // priya now reports to bob — auto-supersede r1.
         let r2 = fresh_rel(t, priya, bob, false);
         let wtxn = db.write_txn().unwrap();
         let result_id = relation_create(&wtxn, &r2, 1).unwrap();
@@ -812,7 +765,6 @@ mod tests {
         let (_dir, mut db) = open_db();
         let priya = make_entity(&mut db, "priya2");
         let acme = make_entity(&mut db, "acme");
-        let other_employer = make_entity(&mut db, "other-co");
         let t = intern_type(&mut db, "employed_by", Cardinality::OneToMany, false);
 
         let r1 = fresh_rel(t, priya, acme, false);
@@ -820,10 +772,6 @@ mod tests {
         relation_create(&wtxn, &r1, 0).unwrap();
         wtxn.commit().unwrap();
 
-        // Someone else now employed by acme — for OneToMany the
-        // constraint is on the `to` side: only one current relation
-        // can have acme as `to`. So the second create supersedes the
-        // first.
         let new_employee = make_entity(&mut db, "new-employee");
         let r2 = fresh_rel(t, new_employee, acme, false);
         let wtxn = db.write_txn().unwrap();
@@ -833,7 +781,6 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let g1 = relation_get(&rtxn, r1.id).unwrap().unwrap();
         assert_eq!(g1.superseded_by, Some(result_id));
-        let _ = other_employer; // suppress unused
     }
 
     #[test]
@@ -853,14 +800,12 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let g1 = relation_get(&rtxn, r1.id).unwrap().unwrap();
         let g2 = relation_get(&rtxn, r2.id).unwrap().unwrap();
-        assert!(g1.superseded_by.is_none(), "MM: no auto-supersede");
+        assert!(g1.superseded_by.is_none());
         assert!(g2.superseded_by.is_none());
     }
 
-    // ----- Tombstone -----
-
     #[test]
-    fn tombstone_flips_is_current_in_both_indexes() {
+    fn tombstone_drops_from_current_listing() {
         let (_dir, mut db) = open_db();
         let a = make_entity(&mut db, "ta");
         let b = make_entity(&mut db, "tb");
@@ -902,12 +847,10 @@ mod tests {
         relation_create(&wtxn, &r1, 0).unwrap();
         wtxn.commit().unwrap();
 
-        // Tombstone r1 — slot freed.
         let wtxn = db.write_txn().unwrap();
         relation_tombstone(&wtxn, r1.id, 1).unwrap();
         wtxn.commit().unwrap();
 
-        // r2 can now be created without auto-supersede.
         let r2 = fresh_rel(t, priya, bob, false);
         let wtxn = db.write_txn().unwrap();
         relation_create(&wtxn, &r2, 2).unwrap();
@@ -919,8 +862,6 @@ mod tests {
         assert!(g1.tombstoned);
         assert!(g2.supersedes.is_none(), "tombstoned slot frees cardinality");
     }
-
-    // ----- History -----
 
     #[test]
     fn history_walks_chain() {
@@ -953,8 +894,6 @@ mod tests {
         assert_eq!(chain[2].id, r3.id);
     }
 
-    // ----- List filters -----
-
     #[test]
     fn list_with_type_filter() {
         let (_dir, mut db) = open_db();
@@ -981,8 +920,6 @@ mod tests {
         assert_eq!(out[0].relation_type, t1);
     }
 
-    // ----- Reverse evidence index -----
-
     #[test]
     fn relations_with_evidence_returns_dependents() {
         let (_dir, mut db) = open_db();
@@ -1000,5 +937,24 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let deps = relations_with_evidence(&rtxn, mem).unwrap();
         assert_eq!(deps, vec![r.id]);
+    }
+
+    #[test]
+    fn relation_list_to_finds_incoming() {
+        let (_dir, mut db) = open_db();
+        let a = make_entity(&mut db, "lt-a");
+        let b = make_entity(&mut db, "lt-b");
+        let t = intern_type(&mut db, "lt_type", Cardinality::ManyToMany, false);
+
+        let r = fresh_rel(t, a, b, false);
+        let wtxn = db.write_txn().unwrap();
+        relation_create(&wtxn, &r, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let filter = RelationListFilter::default();
+        let to_b = relation_list_to(&rtxn, b, &filter).unwrap();
+        assert_eq!(to_b.len(), 1);
+        assert_eq!(to_b[0].id, r.id);
     }
 }

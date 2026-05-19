@@ -10,8 +10,8 @@
 //!
 //! Like the backfill worker (24.1), the actual re-extraction
 //! step is gated by the same v1 limitation: `MEMORIES_TABLE`
-//! doesn't carry `memory.text`. v1 scaffolds the queue + walk
-//! + checkpoint discipline; live re-extraction marks items
+//! doesn't carry `memory.text`. v1 scaffolds the queue, walk,
+//! and checkpoint discipline; live re-extraction marks items
 //! Failed with reason "memory text not persisted (v1 limitation)".
 //! Dry-run is fully functional for plan preview.
 //!
@@ -84,7 +84,7 @@ impl SchemaMigrationWorker {
 
     async fn drive_one_batch(&self, ctx: &WorkerContext) -> Result<usize, WorkerError> {
         // Dequeue if idle.
-        let _ = {
+        {
             let mut current = self.state.current.lock();
             if current.is_none() {
                 if let Some(plan) = self.state.pending.lock().pop_front() {
@@ -99,7 +99,7 @@ impl SchemaMigrationWorker {
                     return Ok(0);
                 }
             }
-        };
+        }
 
         let mut processed = 0usize;
         let now_ns = now_unix_nanos();

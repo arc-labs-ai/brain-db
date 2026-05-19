@@ -74,7 +74,7 @@ use brain_metadata::tables::knowledge::extractor::EXTRACTORS_TABLE;
 use brain_metadata::tables::knowledge::merge::MERGE_LOG_TABLE;
 use brain_metadata::tables::knowledge::predicate::PREDICATES_TABLE;
 use brain_metadata::tables::knowledge::relation::{
-    RELATIONS_BY_EVIDENCE_TABLE, RELATIONS_BY_FROM_TABLE, RELATIONS_BY_TO_TABLE, RELATIONS_TABLE,
+    RELATION_BY_EVIDENCE_TABLE, RELATION_METADATA_TABLE,
 };
 use brain_metadata::tables::knowledge::relation_type::RELATION_TYPES_TABLE;
 use brain_metadata::tables::knowledge::schema_version::SCHEMA_VERSIONS_TABLE;
@@ -164,28 +164,42 @@ async fn schema_off_substrate_round_trips_and_keeps_knowledge_dormant() {
     let rtxn = metadata.begin_read().expect("read txn");
 
     assert_table_empty(&rtxn, ENTITIES_TABLE, "entities");
-    assert_table_empty(&rtxn, ENTITY_BY_CANONICAL_NAME_TABLE, "entity_by_canonical_name");
+    assert_table_empty(
+        &rtxn,
+        ENTITY_BY_CANONICAL_NAME_TABLE,
+        "entity_by_canonical_name",
+    );
     assert_table_empty(&rtxn, ENTITY_ALIASES_TABLE, "entity_aliases");
     assert_table_empty(&rtxn, ENTITY_TRIGRAMS_TABLE, "entity_trigrams");
     assert_table_empty(&rtxn, ENTITY_MENTIONS_TABLE, "entity_mentions");
 
     assert_table_empty(&rtxn, STATEMENTS_TABLE, "statements");
     assert_table_empty(&rtxn, STATEMENTS_BY_SUBJECT_TABLE, "statements_by_subject");
-    assert_table_empty(&rtxn, STATEMENTS_BY_PREDICATE_TABLE, "statements_by_predicate");
+    assert_table_empty(
+        &rtxn,
+        STATEMENTS_BY_PREDICATE_TABLE,
+        "statements_by_predicate",
+    );
     assert_table_empty(
         &rtxn,
         STATEMENTS_BY_OBJECT_ENTITY_TABLE,
         "statements_by_object_entity",
     );
-    assert_table_empty(&rtxn, STATEMENTS_BY_EVENT_TIME_TABLE, "statements_by_event_time");
-    assert_table_empty(&rtxn, STATEMENTS_BY_EVIDENCE_TABLE, "statements_by_evidence");
+    assert_table_empty(
+        &rtxn,
+        STATEMENTS_BY_EVENT_TIME_TABLE,
+        "statements_by_event_time",
+    );
+    assert_table_empty(
+        &rtxn,
+        STATEMENTS_BY_EVIDENCE_TABLE,
+        "statements_by_evidence",
+    );
     assert_table_empty(&rtxn, STATEMENT_CHAIN_TABLE, "statement_chain");
     assert_table_empty(&rtxn, EVIDENCE_OVERFLOW_TABLE, "evidence_overflow");
 
-    assert_table_empty(&rtxn, RELATIONS_TABLE, "relations");
-    assert_table_empty(&rtxn, RELATIONS_BY_FROM_TABLE, "relations_by_from");
-    assert_table_empty(&rtxn, RELATIONS_BY_TO_TABLE, "relations_by_to");
-    assert_table_empty(&rtxn, RELATIONS_BY_EVIDENCE_TABLE, "relations_by_evidence");
+    assert_table_empty(&rtxn, RELATION_METADATA_TABLE, "relation_metadata");
+    assert_table_empty(&rtxn, RELATION_BY_EVIDENCE_TABLE, "relation_by_evidence");
 
     assert_table_empty(&rtxn, PREDICATES_TABLE, "predicates");
     assert_table_empty(&rtxn, ENTITY_TYPES_TABLE, "entity_types");
@@ -193,7 +207,11 @@ async fn schema_off_substrate_round_trips_and_keeps_knowledge_dormant() {
     assert_table_empty(&rtxn, EXTRACTORS_TABLE, "extractors");
     assert_table_empty(&rtxn, SCHEMA_VERSIONS_TABLE, "schema_versions");
     assert_table_empty(&rtxn, EXTRACTOR_AUDIT_TABLE, "extractor_audit");
-    assert_table_empty(&rtxn, ENTITY_RESOLUTION_AUDIT_TABLE, "entity_resolution_audit");
+    assert_table_empty(
+        &rtxn,
+        ENTITY_RESOLUTION_AUDIT_TABLE,
+        "entity_resolution_audit",
+    );
     assert_table_empty(&rtxn, MERGE_LOG_TABLE, "merge_log");
 
     drop(rtxn);

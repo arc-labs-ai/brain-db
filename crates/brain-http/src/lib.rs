@@ -4,10 +4,10 @@
 //! Brain cognitive substrate.
 //!
 //! Built on [`hyper`] 1.x as the wire substrate. The crate is
-//! **HTTP-version-neutral by construction**: the [`Service`] trait,
-//! [`Body`] trait, and `Request<B>` / `Response<B>` types all live
-//! above the version. HTTP/2 is one feature flag (`hyper/http2`)
-//! away when there is a concrete client that needs it.
+//! **HTTP-version-neutral by construction**: hyper's `Service` trait,
+//! `Body` trait, and `Request<B>` / `Response<B>` types all live above
+//! the version. HTTP/2 is one feature flag (`hyper/http2`) away when
+//! there is a concrete client that needs it.
 //!
 //! Architecture and milestone breakdown live in
 //! `docs/development/phases/phase-11-brain-http.md`.
@@ -34,7 +34,7 @@
 //! - `server` (default) — server accept loop, router, connection
 //!   handling. Lands in M2.
 //! - `client` — async HTTP client. M5.
-//! - `ws` — WebSocket via [`tokio-tungstenite`]. M6/M7.
+//! - `ws` — WebSocket via `tokio-tungstenite`. M6/M7.
 //! - `sse` — Server-Sent Events. M4.
 //! - `tls` — rustls termination at the server. Implies `server`.
 //!

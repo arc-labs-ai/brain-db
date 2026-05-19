@@ -1,5 +1,5 @@
-//! One module per verb. Each `run` borrows the SDK [`Client`],
-//! mutates the [`Session`] where appropriate, and returns a boxed
+//! One module per verb. Each `run` borrows the SDK `Client`,
+//! mutates the `Session` where appropriate, and returns a boxed
 //! [`Render`] for the dispatch loop to format.
 
 pub mod encode;
@@ -34,6 +34,5 @@ pub fn is_txn_terminal(err: &ClientError) -> bool {
     let Some(code) = err.code() else {
         return false;
     };
-    code == ErrorCodeWire::TxnNotFound as u16
-        || code == ErrorCodeWire::TransactionTimeout as u16
+    code == ErrorCodeWire::TxnNotFound as u16 || code == ErrorCodeWire::TransactionTimeout as u16
 }

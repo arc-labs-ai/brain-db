@@ -98,7 +98,10 @@ fn one_shot_link_with_edge_kind() {
 #[test]
 fn one_shot_txn_subcommands() {
     let begin = parse_argv(&["txn", "begin"]);
-    assert!(matches!(begin.subcommand, Some(Command::Txn(TxnCommand::Begin))));
+    assert!(matches!(
+        begin.subcommand,
+        Some(Command::Txn(TxnCommand::Begin))
+    ));
 
     let id = "00112233445566778899aabbccddeeff";
     let commit = parse_argv(&["txn", "commit", id]);
@@ -149,11 +152,7 @@ fn one_shot_subscribe_without_collect_is_streaming_mode() {
 
 #[test]
 fn one_shot_subscribe_streaming_with_filter() {
-    let cli = parse_argv(&[
-        "subscribe",
-        "--context", "7",
-        "--kind", "semantic",
-    ]);
+    let cli = parse_argv(&["subscribe", "--context", "7", "--kind", "semantic"]);
     match cli.subcommand {
         Some(Command::Subscribe(a)) => {
             assert_eq!(a.collect, None);

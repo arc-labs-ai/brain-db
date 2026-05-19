@@ -22,7 +22,7 @@ use http::{Method, Request, Response};
 use hyper::body::Incoming;
 
 use crate::admin::handlers::{
-    agent, audit, config, diagnostics, healthz, metrics, rebuild, shard, snapshot, worker,
+    agent, audit, config, diagnostics, extract, healthz, metrics, rebuild, shard, snapshot, worker,
 };
 use crate::admin::AdminState;
 
@@ -87,6 +87,15 @@ fn attach_v1_routes(r: Router<Incoming>, state: Arc<AdminState>) -> Router<Incom
         "/v1/rebuild-ann",
         state.clone(),
         rebuild::handle,
+    );
+
+    // ──────── /v1/extract/backfill ─────────────────────────────────────
+    let r = with_state(
+        r,
+        Method::POST,
+        "/v1/extract/backfill",
+        state.clone(),
+        extract::handle,
     );
 
     // ──────── /v1/workers ──────────────────────────────────────────────

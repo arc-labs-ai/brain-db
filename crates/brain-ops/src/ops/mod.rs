@@ -5,6 +5,7 @@
 
 pub mod encode;
 pub mod extractor_pipeline;
+pub mod extractor_writes;
 pub mod forget;
 pub mod graph_retriever;
 pub mod knowledge_entity;

@@ -246,10 +246,7 @@ impl<'c> SchemaClient<'c> {
     }
 
     /// List all versions for a namespace, newest first.
-    pub async fn list(
-        &self,
-        namespace: impl Into<String>,
-    ) -> Result<SchemaListView, ClientError> {
+    pub async fn list(&self, namespace: impl Into<String>) -> Result<SchemaListView, ClientError> {
         let body = RequestBody::SchemaList(SchemaListRequest {
             namespace: namespace.into(),
             limit: 0,
@@ -816,7 +813,9 @@ mod tests {
 
     #[test]
     fn print_round_trips_entity_type() {
-        let s = SchemaBuilder::new("acme").entity_type(person_entity()).build();
+        let s = SchemaBuilder::new("acme")
+            .entity_type(person_entity())
+            .build();
         let text = print_schema(&s).unwrap();
         let parsed = parse_schema(&text).expect("printed text re-parses");
         let validated = validate(&parsed).expect("printed text validates");
@@ -827,7 +826,9 @@ mod tests {
 
     #[test]
     fn print_round_trips_predicate() {
-        let s = SchemaBuilder::new("acme").predicate(prefers_predicate()).build();
+        let s = SchemaBuilder::new("acme")
+            .predicate(prefers_predicate())
+            .build();
         let text = print_schema(&s).unwrap();
         let parsed = parse_schema(&text).expect("printed text re-parses");
         let SchemaItem::Predicate(p) = &parsed.items[0] else {

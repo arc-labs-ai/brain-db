@@ -104,48 +104,67 @@ async fn run_one(client: &Client, session: &mut Session, cmd: Command) {
     let started = Instant::now();
     let inherited_active_txn = inherits_active_txn(&cmd);
     let result: Result<(String, Box<dyn crate::output::Render>), ClientError> = match cmd {
-        Command::Encode(a) => commands::encode::run(client, session, a).await.map(|r| ("encode".to_string(), r)),
-        Command::Recall(a) => commands::recall::run(client, session, a).await.map(|r| ("recall".to_string(), r)),
-        Command::Forget(a) => commands::forget::run(client, session, a).await.map(|r| ("forget".to_string(), r)),
-        Command::Link(a) => commands::link::run(client, session, a).await.map(|r| ("link".to_string(), r)),
-        Command::Unlink(a) => commands::unlink::run(client, session, a).await.map(|r| ("unlink".to_string(), r)),
-        Command::Plan(a) => commands::plan::run(client, session, a).await.map(|r| ("plan".to_string(), r)),
-        Command::Reason(a) => commands::reason::run(client, session, a).await.map(|r| ("reason".to_string(), r)),
-        Command::Subscribe(a) => commands::subscribe::run(client, session, a).await.map(|r| ("subscribe".to_string(), r)),
+        Command::Encode(a) => commands::encode::run(client, session, a)
+            .await
+            .map(|r| ("encode".to_string(), r)),
+        Command::Recall(a) => commands::recall::run(client, session, a)
+            .await
+            .map(|r| ("recall".to_string(), r)),
+        Command::Forget(a) => commands::forget::run(client, session, a)
+            .await
+            .map(|r| ("forget".to_string(), r)),
+        Command::Link(a) => commands::link::run(client, session, a)
+            .await
+            .map(|r| ("link".to_string(), r)),
+        Command::Unlink(a) => commands::unlink::run(client, session, a)
+            .await
+            .map(|r| ("unlink".to_string(), r)),
+        Command::Plan(a) => commands::plan::run(client, session, a)
+            .await
+            .map(|r| ("plan".to_string(), r)),
+        Command::Reason(a) => commands::reason::run(client, session, a)
+            .await
+            .map(|r| ("reason".to_string(), r)),
+        Command::Subscribe(a) => commands::subscribe::run(client, session, a)
+            .await
+            .map(|r| ("subscribe".to_string(), r)),
         Command::Txn(t) => {
             let op = match &t {
                 TxnCommand::Begin => "txn_begin",
                 TxnCommand::Commit { .. } => "txn_commit",
                 TxnCommand::Abort { .. } => "txn_abort",
             };
-            commands::txn::run(client, session, t).await.map(|r| (op.to_string(), r))
+            commands::txn::run(client, session, t)
+                .await
+                .map(|r| (op.to_string(), r))
         }
         Command::Config(_) | Command::Agent(_) => {
             // `\config …` / `\agent …` are handled by parse_meta; the
             // clap path only fires if someone typed the bare verbs
             // inside the REPL. Tell them to use the meta form.
-            eprintln!(
-                "use `\\config <subcommand>` or `\\agent <subcommand>` inside the REPL"
-            );
+            eprintln!("use `\\config <subcommand>` or `\\agent <subcommand>` inside the REPL");
             return;
         }
         Command::Shell | Command::GenerateCompletion(_) => unreachable!("filtered above"),
     };
     let elapsed = started.elapsed();
-    let elapsed_ms = if session.timing { Some(elapsed.as_millis()) } else { None };
+    let elapsed_ms = if session.timing {
+        Some(elapsed.as_millis())
+    } else {
+        None
+    };
 
     match result {
         Ok((op, body)) => {
             let mut stdout = std::io::stdout();
-            if let Err(e) = write_rendered(&mut stdout, &op, body.as_ref(), session.output, elapsed_ms)
+            if let Err(e) =
+                write_rendered(&mut stdout, &op, body.as_ref(), session.output, elapsed_ms)
             {
                 eprintln!("output error: {e}");
             }
         }
         Err(e) => {
-            if inherited_active_txn
-                && session.active_txn.is_some()
-                && commands::is_txn_terminal(&e)
+            if inherited_active_txn && session.active_txn.is_some() && commands::is_txn_terminal(&e)
             {
                 let stale = session.active_txn.take();
                 if let Some(bytes) = stale {
@@ -357,14 +376,16 @@ async fn handle_meta(
         }
         Meta::Connect(addr_str) => {
             match parse_server(&addr_str) {
-                Ok(addr) => match connection::connect(addr, agent_id, Duration::from_secs(30)).await {
-                    Ok(new_client) => {
-                        *client = new_client;
-                        session.server = addr;
-                        println!("connected to {addr}");
+                Ok(addr) => {
+                    match connection::connect(addr, agent_id, Duration::from_secs(30)).await {
+                        Ok(new_client) => {
+                            *client = new_client;
+                            session.server = addr;
+                            println!("connected to {addr}");
+                        }
+                        Err(e) => eprintln!("connect failed: {e}"),
                     }
-                    Err(e) => eprintln!("connect failed: {e}"),
-                },
+                }
                 Err(e) => eprintln!("{e}"),
             }
             false
@@ -403,9 +424,16 @@ fn handle_agent_sub(sub: AgentSub, session: &Session, agent_source: &AgentIdSour
                 println!("(no named agents — `\\agent create <name>` to add one)");
                 return;
             }
-            println!("{:<2} {:<16} {:<36} {:<20} NOTE", "", "NAME", "ID", "CREATED");
+            println!(
+                "{:<2} {:<16} {:<36} {:<20} NOTE",
+                "", "NAME", "ID", "CREATED"
+            );
             for (name, entry) in config.agents() {
-                let marker = if Some(name.as_str()) == bound_name.as_deref() { "*" } else { " " };
+                let marker = if Some(name.as_str()) == bound_name.as_deref() {
+                    "*"
+                } else {
+                    " "
+                };
                 println!(
                     "{marker:<2} {:<16} {:<36} {:<20} {}",
                     name, entry.id, entry.created_at, entry.note,
@@ -510,7 +538,9 @@ fn handle_config_sub(sub: ConfigSub, session: &mut Session) {
                     return;
                 }
             }
-            let status = std::process::Command::new(editor).arg(&config.path).status();
+            let status = std::process::Command::new(editor)
+                .arg(&config.path)
+                .status();
             match status {
                 Ok(s) if s.success() => {}
                 Ok(s) => eprintln!("editor exited with status {}", s.code().unwrap_or(-1)),
@@ -705,7 +735,10 @@ mod tests {
     #[test]
     fn source_suffix_describes_each_variant() {
         assert_eq!(source_suffix(&AgentIdSource::IdFlag), " (via --agent-id)");
-        assert_eq!(source_suffix(&AgentIdSource::IdEnv), " (via BRAIN_AGENT_ID)");
+        assert_eq!(
+            source_suffix(&AgentIdSource::IdEnv),
+            " (via BRAIN_AGENT_ID)"
+        );
         assert_eq!(source_suffix(&AgentIdSource::Ephemeral), " (ephemeral)");
         let p = PathBuf::from("/x/y");
         assert_eq!(

@@ -45,8 +45,8 @@ pub struct Connection {
 
 /// TCP keepalive parameters (Step 1 of the liveness work).
 ///
-/// The Linux defaults are useless for a database client (idle 7200 s
-/// + interval 75 s × 9 retries ≈ 2.25 h before detection of a dead
+/// The Linux defaults are useless for a database client (idle 7200 s,
+/// interval 75 s × 9 retries ≈ 2.25 h before detection of a dead
 /// peer). We pick aggressive but kind values:
 ///
 /// - **idle 30 s**  — start probing 30 s after the last byte.
@@ -212,7 +212,7 @@ impl Connection {
 
 /// One pool-slot's worth of connection state while sitting idle.
 /// Hold while the background pong task runs; consume via
-/// [`Self::into_active`] to take the stream back.
+/// `Self::into_active` (crate-private) to take the stream back.
 #[derive(Debug)]
 pub struct IdleConnection {
     /// Sender for "give the stream back." The background task awaits

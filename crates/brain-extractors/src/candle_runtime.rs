@@ -75,15 +75,15 @@ impl CandleBertRuntime {
         num_labels: usize,
     ) -> Result<Self, ExtractorError> {
         // 1. Config.
-        let config_bytes = std::fs::read(dir.join("config.json")).map_err(|e| {
-            ExtractorError::ModelNotFound {
+        let config_bytes =
+            std::fs::read(dir.join("config.json")).map_err(|e| ExtractorError::ModelNotFound {
                 id: format!("config.json read failed: {e}"),
+            })?;
+        let bert_config: BertConfig = serde_json::from_slice(&config_bytes).map_err(|e| {
+            ExtractorError::OutputDecodeFailed {
+                reason: format!("config.json parse failed: {e}"),
             }
         })?;
-        let bert_config: BertConfig =
-            serde_json::from_slice(&config_bytes).map_err(|e| ExtractorError::OutputDecodeFailed {
-                reason: format!("config.json parse failed: {e}"),
-            })?;
 
         // Cross-check: config.json's id2label / num_labels (when
         // present) MUST match the labels.txt the loader already
@@ -130,11 +130,12 @@ impl CandleBertRuntime {
         // 5. Classifier head — `classifier.weight` /
         //    `classifier.bias`. Linear: hidden_size → num_labels.
         let classifier_vb = vb_root.pp("classifier");
-        let classifier = candle_nn::linear(hidden_size, num_labels, classifier_vb).map_err(|e| {
-            ExtractorError::InferenceFailed {
-                reason: format!("classifier head load failed: {e}"),
-            }
-        })?;
+        let classifier =
+            candle_nn::linear(hidden_size, num_labels, classifier_vb).map_err(|e| {
+                ExtractorError::InferenceFailed {
+                    reason: format!("classifier head load failed: {e}"),
+                }
+            })?;
 
         let runtime = Self {
             model,
@@ -166,12 +167,11 @@ impl CandleBertRuntime {
                 reason: format!("warmup type_ids: {e}"),
             }
         })?;
-        let _ = self
-            .model
-            .forward(&ids, &type_ids, None)
-            .map_err(|e| ExtractorError::InferenceFailed {
+        let _ = self.model.forward(&ids, &type_ids, None).map_err(|e| {
+            ExtractorError::InferenceFailed {
                 reason: format!("warmup forward: {e}"),
-            })?;
+            }
+        })?;
         Ok(())
     }
 }
@@ -185,12 +185,11 @@ impl BertRuntime for CandleBertRuntime {
     ) -> Result<Vec<TokenClassification>, ExtractorError> {
         // 1. Tokenise. `encode(text, true)` adds special tokens
         //    ([CLS], [SEP]) — the standard NER training format.
-        let mut encoding =
-            self.tokenizer
-                .encode(text, true)
-                .map_err(|e| ExtractorError::FeatureExtractionFailed {
-                    reason: format!("tokenizer.encode: {e}"),
-                })?;
+        let mut encoding = self.tokenizer.encode(text, true).map_err(|e| {
+            ExtractorError::FeatureExtractionFailed {
+                reason: format!("tokenizer.encode: {e}"),
+            }
+        })?;
 
         // 2. Truncate to max_seq_len. The Encoding::truncate API
         //    keeps the bookkeeping (offsets, special tokens mask)
@@ -238,12 +237,12 @@ impl BertRuntime for CandleBertRuntime {
             })?;
 
         // 5. Linear head → (1, seq_len, num_labels).
-        let logits = self
-            .classifier
-            .forward(&hidden)
-            .map_err(|e| ExtractorError::InferenceFailed {
-                reason: format!("classifier head forward: {e}"),
-            })?;
+        let logits =
+            self.classifier
+                .forward(&hidden)
+                .map_err(|e| ExtractorError::InferenceFailed {
+                    reason: format!("classifier head forward: {e}"),
+                })?;
 
         // 6. Softmax over the last axis.
         let probs =
@@ -262,10 +261,7 @@ impl BertRuntime for CandleBertRuntime {
             })?;
         if probs_2d.len() != seq_len {
             return Err(ExtractorError::OutputDecodeFailed {
-                reason: format!(
-                    "probs row count {} != seq_len {seq_len}",
-                    probs_2d.len()
-                ),
+                reason: format!("probs row count {} != seq_len {seq_len}", probs_2d.len()),
             });
         }
 
@@ -280,10 +276,7 @@ impl BertRuntime for CandleBertRuntime {
                 continue;
             }
             let (best_idx, best_p) = argmax(row);
-            let label = labels
-                .get(best_idx)
-                .map(|s| s.as_str())
-                .unwrap_or("O");
+            let label = labels.get(best_idx).map(|s| s.as_str()).unwrap_or("O");
             tok_labels.push(label);
             tok_confs.push(best_p);
             tok_offsets.push(offsets[i]);
@@ -307,10 +300,7 @@ impl BertRuntime for CandleBertRuntime {
             if end_byte <= start_byte {
                 continue;
             }
-            let text_slice = text
-                .get(start_byte..end_byte)
-                .unwrap_or("")
-                .to_string();
+            let text_slice = text.get(start_byte..end_byte).unwrap_or("").to_string();
             out.push(TokenClassification {
                 label: span.label,
                 text: text_slice,

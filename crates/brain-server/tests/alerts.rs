@@ -41,8 +41,7 @@ fn rules_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
-        .join("docs")
-        .join("analytics")
+        .join("monitoring")
         .join("alerts")
         .join("brain-rules.yml")
 }

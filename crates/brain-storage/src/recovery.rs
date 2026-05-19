@@ -326,7 +326,10 @@ fn apply_to_arena(
         | WalPayload::CheckpointEnd(_)
         | WalPayload::TxnBegin(_)
         | WalPayload::TxnCommit(_)
-        | WalPayload::TxnAbort(_) => Ok(()),
+        | WalPayload::TxnAbort(_)
+        | WalPayload::RelationLink(_)
+        | WalPayload::RelationSupersede(_)
+        | WalPayload::RelationTombstone(_) => Ok(()),
         // Knowledge-layer records: substrate apply-paths ignore these.
         // Phases 16+ hydrate knowledge state via their own sinks. Sub-task 15.2.
         WalPayload::Knowledge(r) => {

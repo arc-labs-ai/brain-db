@@ -382,11 +382,11 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_accessor_returns_v1() {
+    fn schema_version_accessor_returns_current() {
         let dir = tempfile::tempdir().unwrap();
         let db = MetadataDb::open(db_path(&dir)).unwrap();
         assert_eq!(db.schema_version(), CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 1);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 2);
     }
 
     #[test]
@@ -471,11 +471,7 @@ mod tests {
         let db = MetadataDb::open(&path).unwrap();
         let rtxn = db.read_txn().unwrap();
         let t = rtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
-        let rows: Vec<u32> = t
-            .iter()
-            .unwrap()
-            .map(|e| e.unwrap().0.value())
-            .collect();
+        let rows: Vec<u32> = t.iter().unwrap().map(|e| e.unwrap().0.value()).collect();
         // Person from first seed (id=1) + injected Project (id=42).
         // No second Person registration.
         assert_eq!(rows, vec![1, 42], "second open must not re-seed");
@@ -491,13 +487,10 @@ mod tests {
         let db = MetadataDb::open(db_path(&dir)).unwrap();
 
         let rtxn = db.read_txn().unwrap();
-        let got = crate::relation_type_ops::relation_type_lookup_by_qname(
-            &rtxn,
-            "brain",
-            "related_to",
-        )
-        .unwrap()
-        .expect("brain:related_to seeded");
+        let got =
+            crate::relation_type_ops::relation_type_lookup_by_qname(&rtxn, "brain", "related_to")
+                .unwrap()
+                .expect("brain:related_to seeded");
         assert_eq!(got.canonical(), "brain:related_to");
         assert_eq!(got.cardinality, brain_core::Cardinality::ManyToMany);
         assert!(!got.is_symmetric);

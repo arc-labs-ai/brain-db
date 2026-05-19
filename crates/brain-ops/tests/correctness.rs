@@ -16,7 +16,7 @@ use std::sync::Arc;
 use brain_core::{AgentId, ContextId, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
-use brain_metadata::tables::edge::EDGES_OUT_TABLE;
+use brain_metadata::tables::edge::list_memory_edges_from;
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
 use brain_ops::test_support::run_in_glommio;
@@ -114,7 +114,14 @@ mod common {
     }
 
     pub(super) async fn encode_with(fix: &Fixture, req: EncodeRequest) -> u128 {
-        match dispatch(RequestBody::Encode(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap() {
+        match dispatch(
+            RequestBody::Encode(req),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap()
+        {
             ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
             other => panic!("expected Encode, got {other:?}"),
         }
@@ -138,14 +145,21 @@ mod common {
             age_bound_unix_nanos: None,
             kind_filter,
             salience_floor,
-            strategy_hint: None,
+            strategy: None,
             include_vectors: false,
             include_edges: false,
             include_text: false,
             request_id: None,
             txn_id: None,
         };
-        match dispatch(RequestBody::Recall(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap() {
+        match dispatch(
+            RequestBody::Recall(req),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap()
+        {
             ResponseBody::Recall(f) => f,
             other => panic!("expected Recall, got {other:?}"),
         }
@@ -158,7 +172,14 @@ mod common {
             request_id: rid,
             txn_id: None,
         };
-        match dispatch(RequestBody::Forget(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap() {
+        match dispatch(
+            RequestBody::Forget(req),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap()
+        {
             ResponseBody::Forget(r) => r,
             other => panic!("expected Forget, got {other:?}"),
         }
@@ -179,7 +200,14 @@ mod common {
             request_id: rid,
             txn_id: None,
         };
-        match dispatch(RequestBody::Link(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap() {
+        match dispatch(
+            RequestBody::Link(req),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap()
+        {
             ResponseBody::Link(l) => l,
             other => panic!("expected Link, got {other:?}"),
         }
@@ -199,7 +227,14 @@ mod common {
             request_id: rid,
             txn_id: None,
         };
-        match dispatch(RequestBody::Unlink(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap() {
+        match dispatch(
+            RequestBody::Unlink(req),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap()
+        {
             ResponseBody::Unlink(u) => u,
             other => panic!("expected Unlink, got {other:?}"),
         }
@@ -224,7 +259,14 @@ mod common {
             request_id: None,
             txn_id: None,
         };
-        match dispatch(RequestBody::Plan(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap() {
+        match dispatch(
+            RequestBody::Plan(req),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap()
+        {
             ResponseBody::Plan(p) => p,
             other => panic!("expected Plan, got {other:?}"),
         }
@@ -241,7 +283,14 @@ mod common {
             request_id: None,
             txn_id: None,
         };
-        match dispatch(RequestBody::Reason(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap() {
+        match dispatch(
+            RequestBody::Reason(req),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap()
+        {
             ResponseBody::Reason(r) => r,
             other => panic!("expected Reason, got {other:?}"),
         }
@@ -288,13 +337,9 @@ mod common {
     pub(super) fn edges_out_count(metadata: &SharedMetadataDb, src: MemoryId) -> usize {
         let db = metadata.lock();
         let rtxn = db.read_txn().unwrap();
-        let table = match rtxn.open_table(EDGES_OUT_TABLE) {
-            Ok(t) => t,
-            Err(_) => return 0,
-        };
-        let from = (src.to_be_bytes(), 0u8, [0u8; 16]);
-        let to = (src.to_be_bytes(), u8::MAX, [0xFF; 16]);
-        table.range(from..=to).map(|r| r.count()).unwrap_or(0)
+        list_memory_edges_from(&rtxn, src, None)
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 }
 
@@ -328,7 +373,7 @@ mod criterion_01_wire {
                     age_bound_unix_nanos: None,
                     kind_filter: None,
                     salience_floor: 0.0,
-                    strategy_hint: None,
+                    strategy: None,
                     include_vectors: false,
                     include_edges: false,
                     include_text: false,
@@ -740,7 +785,9 @@ mod criterion_08_idempotency {
             let rid = [0xBB; 16];
             let _ = common::encode(&fix, rid, "first").await;
             let err = dispatch(
-                RequestBody::Encode(common::encode_req(rid, "DIFFERENT")), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Encode(common::encode_req(rid, "DIFFERENT")),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap_err();
@@ -761,22 +808,30 @@ mod criterion_09_txn {
             RequestBody::TxnBegin(TxnBeginRequest {
                 txn_id,
                 timeout_seconds: 60,
-            }), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            }),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap();
     }
     async fn commit(fix: &common::Fixture, txn_id: [u8; 16]) {
         dispatch(
-            RequestBody::TxnCommit(TxnCommitRequest { txn_id }), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            RequestBody::TxnCommit(TxnCommitRequest { txn_id }),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
         )
         .await
         .unwrap();
     }
     async fn abort(fix: &common::Fixture, txn_id: [u8; 16]) {
-        dispatch(RequestBody::TxnAbort(TxnAbortRequest { txn_id }), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-            .await
-            .unwrap();
+        dispatch(
+            RequestBody::TxnAbort(TxnAbortRequest { txn_id }),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -1060,7 +1115,9 @@ mod criterion_17_error_codes {
             // 1. Conflict — encode with same RequestId, different text.
             let _ = common::encode(&fix, [1; 16], "original").await;
             let err = dispatch(
-                RequestBody::Encode(common::encode_req([1; 16], "DIFFERENT")), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                RequestBody::Encode(common::encode_req([1; 16], "DIFFERENT")),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap_err();
@@ -1069,9 +1126,13 @@ mod criterion_17_error_codes {
             // 2. InvalidRequest — Consolidated kind at ENCODE.
             let mut req = common::encode_req([2; 16], "bad");
             req.kind = MemoryKindWire::Consolidated;
-            let err = dispatch(RequestBody::Encode(req), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-                .await
-                .unwrap_err();
+            let err = dispatch(
+                RequestBody::Encode(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(err.error_code(), ErrorCode::InvalidRequest);
             assert!(matches!(err, OpError::PlanError(_)));
 
@@ -1089,16 +1150,22 @@ mod criterion_17_error_codes {
                 request_id: None,
                 txn_id: None,
             };
-            let err = dispatch(RequestBody::Plan(req), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-                .await
-                .unwrap_err();
+            let err = dispatch(
+                RequestBody::Plan(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(err.error_code(), ErrorCode::InvalidRequest);
 
             // 4. NotFound — UNSUBSCRIBE unknown stream.
             let err = dispatch(
                 RequestBody::Unsubscribe(UnsubscribeRequest {
                     target_stream_id: 9999,
-                }), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                }),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap_err();
@@ -1178,9 +1245,13 @@ mod criterion_20_no_surprises {
             // Drive an ENCODE that the planner rejects (Consolidated kind).
             let mut req = common::encode_req([1; 16], "should-not-land");
             req.kind = MemoryKindWire::Consolidated;
-            let err = dispatch(RequestBody::Encode(req), brain_ops::RequestCaller::anonymous(), &fix.ctx)
-                .await
-                .unwrap_err();
+            let err = dispatch(
+                RequestBody::Encode(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(err.error_code(), ErrorCode::InvalidRequest);
 
             // No row landed: the next ENCODE gets memory_id #1 (no gap).
@@ -1206,7 +1277,9 @@ mod criterion_20_no_surprises {
                     weight: 1.0,
                     request_id: [9; 16],
                     txn_id: None,
-                }), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+                }),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
             )
             .await
             .unwrap_err();

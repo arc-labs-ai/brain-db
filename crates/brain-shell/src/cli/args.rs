@@ -22,7 +22,11 @@ pub async fn dispatch_argv(argv: Vec<String>) -> ExitCode {
         Ok(cli) => cli,
         Err(e) => {
             let _ = e.print();
-            return if e.use_stderr() { ExitCode::from(2) } else { ExitCode::SUCCESS };
+            return if e.use_stderr() {
+                ExitCode::from(2)
+            } else {
+                ExitCode::SUCCESS
+            };
         }
     };
 
@@ -36,20 +40,22 @@ pub async fn dispatch_argv(argv: Vec<String>) -> ExitCode {
         return run_config(c);
     }
     if let Some(Command::Agent(a)) = cli.subcommand.clone() {
-        return run_agent(a, cli.global.agent.as_deref(), cli.global.agent_id.as_deref());
+        return run_agent(
+            a,
+            cli.global.agent.as_deref(),
+            cli.global.agent_id.as_deref(),
+        );
     }
 
     // ── agent + settings resolution ────────────────────────────────
-    let resolved = match agent_id::resolve(
-        cli.global.agent.as_deref(),
-        cli.global.agent_id.as_deref(),
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::from(2);
-        }
-    };
+    let resolved =
+        match agent_id::resolve(cli.global.agent.as_deref(), cli.global.agent_id.as_deref()) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
+        };
     if let Some(note) = &resolved.migration {
         eprint_migration_note(note);
     }
@@ -129,53 +135,62 @@ pub async fn dispatch_argv(argv: Vec<String>) -> ExitCode {
     let cmd = cli.subcommand.expect("invariant: is_repl handled above");
 
     let started = Instant::now();
-    let res: Result<(String, Box<dyn crate::output::Render>), brain_sdk_rust::ClientError> = match cmd
-    {
-        Command::Encode(a) => commands::encode::run(&client, &mut session, a)
-            .await
-            .map(|r| ("encode".to_string(), r)),
-        Command::Recall(a) => commands::recall::run(&client, &mut session, a)
-            .await
-            .map(|r| ("recall".to_string(), r)),
-        Command::Forget(a) => commands::forget::run(&client, &mut session, a)
-            .await
-            .map(|r| ("forget".to_string(), r)),
-        Command::Link(a) => commands::link::run(&client, &mut session, a)
-            .await
-            .map(|r| ("link".to_string(), r)),
-        Command::Unlink(a) => commands::unlink::run(&client, &mut session, a)
-            .await
-            .map(|r| ("unlink".to_string(), r)),
-        Command::Plan(a) => commands::plan::run(&client, &mut session, a)
-            .await
-            .map(|r| ("plan".to_string(), r)),
-        Command::Reason(a) => commands::reason::run(&client, &mut session, a)
-            .await
-            .map(|r| ("reason".to_string(), r)),
-        Command::Subscribe(a) => commands::subscribe::run(&client, &mut session, a)
-            .await
-            .map(|r| ("subscribe".to_string(), r)),
-        Command::Txn(t) => {
-            let op = match &t {
-                TxnCommand::Begin => "txn_begin",
-                TxnCommand::Commit { .. } => "txn_commit",
-                TxnCommand::Abort { .. } => "txn_abort",
-            };
-            commands::txn::run(&client, &mut session, t)
+    let res: Result<(String, Box<dyn crate::output::Render>), brain_sdk_rust::ClientError> =
+        match cmd {
+            Command::Encode(a) => commands::encode::run(&client, &mut session, a)
                 .await
-                .map(|r| (op.to_string(), r))
-        }
-        Command::Config(_) | Command::Agent(_) | Command::Shell | Command::GenerateCompletion(_) => {
-            unreachable!("filtered above")
-        }
-    };
+                .map(|r| ("encode".to_string(), r)),
+            Command::Recall(a) => commands::recall::run(&client, &mut session, a)
+                .await
+                .map(|r| ("recall".to_string(), r)),
+            Command::Forget(a) => commands::forget::run(&client, &mut session, a)
+                .await
+                .map(|r| ("forget".to_string(), r)),
+            Command::Link(a) => commands::link::run(&client, &mut session, a)
+                .await
+                .map(|r| ("link".to_string(), r)),
+            Command::Unlink(a) => commands::unlink::run(&client, &mut session, a)
+                .await
+                .map(|r| ("unlink".to_string(), r)),
+            Command::Plan(a) => commands::plan::run(&client, &mut session, a)
+                .await
+                .map(|r| ("plan".to_string(), r)),
+            Command::Reason(a) => commands::reason::run(&client, &mut session, a)
+                .await
+                .map(|r| ("reason".to_string(), r)),
+            Command::Subscribe(a) => commands::subscribe::run(&client, &mut session, a)
+                .await
+                .map(|r| ("subscribe".to_string(), r)),
+            Command::Txn(t) => {
+                let op = match &t {
+                    TxnCommand::Begin => "txn_begin",
+                    TxnCommand::Commit { .. } => "txn_commit",
+                    TxnCommand::Abort { .. } => "txn_abort",
+                };
+                commands::txn::run(&client, &mut session, t)
+                    .await
+                    .map(|r| (op.to_string(), r))
+            }
+            Command::Config(_)
+            | Command::Agent(_)
+            | Command::Shell
+            | Command::GenerateCompletion(_) => {
+                unreachable!("filtered above")
+            }
+        };
     let elapsed = started.elapsed();
-    let elapsed_ms = if session.timing { Some(elapsed.as_millis()) } else { None };
+    let elapsed_ms = if session.timing {
+        Some(elapsed.as_millis())
+    } else {
+        None
+    };
 
     match res {
         Ok((op, body)) => {
             let mut stdout = std::io::stdout();
-            if let Err(e) = write_rendered(&mut stdout, &op, body.as_ref(), session.output, elapsed_ms) {
+            if let Err(e) =
+                write_rendered(&mut stdout, &op, body.as_ref(), session.output, elapsed_ms)
+            {
                 eprintln!("output error: {e}");
                 return ExitCode::from(1);
             }
@@ -271,11 +286,7 @@ fn run_config(cmd: ConfigCommand) -> ExitCode {
 // brain agent <subcommand>
 // ---------------------------------------------------------------------------
 
-fn run_agent(
-    cmd: AgentCommand,
-    agent_flag: Option<&str>,
-    agent_id_flag: Option<&str>,
-) -> ExitCode {
+fn run_agent(cmd: AgentCommand, agent_flag: Option<&str>, agent_id_flag: Option<&str>) -> ExitCode {
     let (mut config, note) = match Config::load_or_default() {
         Ok(p) => p,
         Err(e) => {
@@ -293,7 +304,10 @@ fn run_agent(
                 println!("(no named agents — `brain agent create <name>` to add one)");
                 return ExitCode::SUCCESS;
             }
-            println!("{:<2} {:<16} {:<36} {:<20} NOTE", "", "NAME", "ID", "CREATED");
+            println!(
+                "{:<2} {:<16} {:<36} {:<20} NOTE",
+                "", "NAME", "ID", "CREATED"
+            );
             for (name, entry) in config.agents() {
                 let marker = if Some(name.as_str()) == bound_name.as_deref() {
                     "*"
@@ -331,25 +345,27 @@ fn run_agent(
                 }
             }
         }
-        AgentCommand::Create { name, note } => match config.create_agent(&name, note.as_deref().unwrap_or("")) {
-            Ok(entry) => {
-                let id = entry.id.clone();
-                match config.save() {
-                    Ok(()) => {
-                        println!("created agent '{name}' ({id})");
-                        ExitCode::SUCCESS
-                    }
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        ExitCode::from(1)
+        AgentCommand::Create { name, note } => {
+            match config.create_agent(&name, note.as_deref().unwrap_or("")) {
+                Ok(entry) => {
+                    let id = entry.id.clone();
+                    match config.save() {
+                        Ok(()) => {
+                            println!("created agent '{name}' ({id})");
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            ExitCode::from(1)
+                        }
                     }
                 }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::from(2)
+                }
             }
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::from(2)
-            }
-        },
+        }
         AgentCommand::Rename { old, new } => match config.rename_agent(&old, &new) {
             Ok(()) => match config.save() {
                 Ok(()) => {
@@ -415,10 +431,7 @@ fn run_agent(
 /// Name of the agent this invocation would bind to — for the `*`
 /// marker in `agent list`. Returns `None` when the binding is
 /// ephemeral or by raw id (no name to compare against).
-fn resolved_bound_name(
-    agent_flag: Option<&str>,
-    agent_id_flag: Option<&str>,
-) -> Option<String> {
+fn resolved_bound_name(agent_flag: Option<&str>, agent_id_flag: Option<&str>) -> Option<String> {
     if let Some(n) = agent_flag {
         return Some(n.to_owned());
     }
