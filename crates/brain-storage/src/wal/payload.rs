@@ -21,7 +21,8 @@
 //!   the `flags` bit at this layer.
 
 use brain_core::{
-    AgentId, ContextId, EdgeKind, EdgeOrigin, MemoryId, MemoryKind, RequestId, TxnId,
+    AgentId, ContextId, EdgeKindRef, EdgeKindRefError, EdgeOrigin, MemoryId, MemoryKind, NodeRef,
+    NodeRefError, RelationId, RelationTypeId, RequestId, TxnId,
 };
 
 /// Opaque 16-byte fingerprint of an embedding model (spec §05/05 §5).
@@ -44,13 +45,33 @@ pub struct EncodePayload {
     /// Empty `Vec` means "vector excluded" (spec's optional-include mode).
     pub vector: Vec<f32>,
     pub edges: Vec<EdgePayload>,
+    /// blake3 of the canonical request body. Recovery uses this to
+    /// repopulate the idempotency cache so a retry after restart with
+    /// the same `request_id` returns the original response if the
+    /// payload matches, and `Conflict` if it diverges.
+    pub request_hash: [u8; 32],
+    /// Bytes of the original encoded response (rkyv of EncodeResponse).
+    /// Recovery replays this verbatim on idempotency hit so the client
+    /// sees a byte-identical reply across restarts.
+    pub response_payload: Vec<u8>,
+    /// True if the originating ENCODE opted into content-hash
+    /// deduplication. Recovery uses this to know whether to insert a
+    /// FINGERPRINTS row (and stamp the memory's back-reference). False
+    /// for ordinary ENCODE writes — the dedup index stays untouched.
+    pub deduplicate: bool,
 }
 
+/// Inline edge attached to an ENCODE payload.
+///
+/// Endpoints widened from `MemoryId` to `NodeRef` and the label widened
+/// from `EdgeKind` to `EdgeKindRef` so a single ENCODE record can attach
+/// substrate edges, mention edges (`Memory →(mentions)→ Entity`), or
+/// typed-relation references in one shot.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EdgePayload {
-    pub source: MemoryId,
-    pub target: MemoryId,
-    pub kind: EdgeKind,
+    pub source: NodeRef,
+    pub target: NodeRef,
+    pub kind: EdgeKindRef,
     pub weight: f32,
     pub origin: EdgeOrigin,
 }
@@ -59,6 +80,12 @@ pub struct EdgePayload {
 pub struct ForgetPayload {
     pub memory_id: MemoryId,
     pub request_id: RequestId,
+    /// Agent the FORGET ran under. Carried in the WAL so subscribe-
+    /// replay can route Forgotten events through the same per-agent
+    /// allowlist that filters live publishes — without it, a
+    /// multi-tenant subscriber filtering by `agents` would silently
+    /// drop every replayed forget.
+    pub agent_id: AgentId,
     pub mode: ForgetMode,
     pub reason: ForgetReason,
 }
@@ -77,20 +104,29 @@ pub enum ForgetReason {
     Eviction = 1,
 }
 
+/// LINK WAL record.
+///
+/// Endpoints widened to `NodeRef` and the label widened to `EdgeKindRef`
+/// so the unified edge table can accept memory-to-memory, mention, and
+/// typed-relation edges through the same WAL kind.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LinkPayload {
-    pub source: MemoryId,
-    pub target: MemoryId,
-    pub edge_kind: EdgeKind,
+    pub source: NodeRef,
+    pub target: NodeRef,
+    pub edge_kind: EdgeKindRef,
     pub weight: f32,
     pub origin: EdgeOrigin,
 }
 
+/// UNLINK WAL record.
+///
+/// Endpoints widened to `NodeRef` and the label widened to `EdgeKindRef`
+/// so the unified edge table can resolve any edge kind by its key tuple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnlinkPayload {
-    pub source: MemoryId,
-    pub target: MemoryId,
-    pub edge_kind: EdgeKind,
+    pub source: NodeRef,
+    pub target: NodeRef,
+    pub edge_kind: EdgeKindRef,
     pub edge_seq: u32,
 }
 
@@ -193,6 +229,58 @@ pub struct MigrateEmbeddingPayload {
 }
 
 // ---------------------------------------------------------------------------
+// Typed-relation payloads (Phase C).
+//
+// First-class WAL representation for relation create / supersede /
+// tombstone. The sidecar metadata is carried inline so recovery can replay
+// the relation without re-reading any other table.
+// ---------------------------------------------------------------------------
+
+/// Typed-relation creation. Carries every sidecar field that is not in
+/// the unified edge row's `EdgeData`, so recovery rebuilds the sidecar
+/// deterministically without any extra read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationLinkPayload {
+    pub relation_id: RelationId,
+    pub from: NodeRef,
+    pub to: NodeRef,
+    pub relation_type_id: RelationTypeId,
+    pub chain_root: RelationId,
+    pub confidence: f32,
+    pub valid_from_unix_nanos: Option<u64>,
+    pub valid_to_unix_nanos: Option<u64>,
+    pub supersedes: Option<RelationId>,
+    pub evidence: Vec<MemoryId>,
+    pub extractor_id: u32,
+    pub is_symmetric: bool,
+    pub properties_blob: Vec<u8>,
+    /// Agent the relation create ran under. Subscribe-replay routes the
+    /// EdgeAdded event through the per-agent allowlist using this id;
+    /// without it, a multi-tenant subscriber would silently drop every
+    /// replayed relation create.
+    pub agent_id: AgentId,
+}
+
+/// Typed-relation supersession. Carries the id of the row being
+/// superseded and the full new relation inline so recovery can mark the
+/// sidecar `is_current = 0` on the old and write the new in one step.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationSupersedePayload {
+    pub old_relation_id: RelationId,
+    pub new: RelationLinkPayload,
+}
+
+/// Typed-relation tombstone. The edge row stays; the sidecar flips
+/// `tombstoned = 1`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationTombstonePayload {
+    pub relation_id: RelationId,
+    pub reason: String,
+    pub at_unix_nanos: u64,
+    pub agent_id: AgentId,
+}
+
+// ---------------------------------------------------------------------------
 // Top-level enum + dispatch.
 // ---------------------------------------------------------------------------
 
@@ -213,6 +301,13 @@ use crate::wal::kinds::WalRecordKind;
 #[derive(Debug, Clone, PartialEq)]
 pub struct KnowledgeRecord {
     pub kind: WalRecordKind,
+    /// Agent the knowledge mutation ran under. Carried in the WAL
+    /// alongside the opaque body so subscribe-replay can route
+    /// knowledge events through the per-agent `agents` filter the
+    /// same way it routes substrate events. Without it, a multi-
+    /// tenant subscriber would silently drop every replayed
+    /// knowledge event.
+    pub agent_id: AgentId,
     pub body: Vec<u8>,
 }
 
@@ -221,12 +316,16 @@ impl KnowledgeRecord {
     /// `kind.is_knowledge()`; passing a substrate kind is a programmer
     /// error and panics in debug builds.
     #[must_use]
-    pub fn new(kind: WalRecordKind, body: Vec<u8>) -> Self {
+    pub fn new(kind: WalRecordKind, agent_id: AgentId, body: Vec<u8>) -> Self {
         debug_assert!(
             kind.is_knowledge(),
             "KnowledgeRecord requires a knowledge-layer kind (0x10..=0x50); got {kind:?}"
         );
-        Self { kind, body }
+        Self {
+            kind,
+            agent_id,
+            body,
+        }
     }
 }
 
@@ -248,8 +347,17 @@ pub enum WalPayload {
     TxnCommit(TxnCommitPayload),
     TxnAbort(TxnAbortPayload),
     MigrateEmbedding(MigrateEmbeddingPayload),
-    /// Knowledge-layer record carried as an opaque body. The typed body
-    /// schemas land in phases 16–21; the framing layer transports them
+    /// Typed-relation create. Phase C made these first-class instead of
+    /// being carried as an opaque `Knowledge` body so recovery can
+    /// rebuild the unified edge row + sidecar atomically.
+    RelationLink(RelationLinkPayload),
+    /// Typed-relation supersession.
+    RelationSupersede(RelationSupersedePayload),
+    /// Typed-relation tombstone.
+    RelationTombstone(RelationTombstonePayload),
+    /// Knowledge-layer record carried as an opaque body. Used for the
+    /// entity / statement / schema / audit kinds whose typed body
+    /// schemas land in later phases; the framing layer transports them
     /// unchanged.
     Knowledge(KnowledgeRecord),
 }
@@ -274,6 +382,9 @@ impl WalPayload {
             Self::TxnCommit(_) => WalRecordKind::TxnCommit,
             Self::TxnAbort(_) => WalRecordKind::TxnAbort,
             Self::MigrateEmbedding(_) => WalRecordKind::MigrateEmbedding,
+            Self::RelationLink(_) => WalRecordKind::RelationCreate,
+            Self::RelationSupersede(_) => WalRecordKind::RelationSupersede,
+            Self::RelationTombstone(_) => WalRecordKind::RelationTombstone,
             Self::Knowledge(r) => r.kind,
         }
     }
@@ -298,7 +409,14 @@ impl WalPayload {
             Self::TxnCommit(p) => encode_txn_commit(p, &mut out),
             Self::TxnAbort(p) => encode_txn_abort(p, &mut out),
             Self::MigrateEmbedding(p) => encode_migrate_embedding(p, &mut out),
-            Self::Knowledge(r) => out.extend_from_slice(&r.body),
+            Self::RelationLink(p) => encode_relation_link(p, &mut out),
+            Self::RelationSupersede(p) => encode_relation_supersede(p, &mut out),
+            Self::RelationTombstone(p) => encode_relation_tombstone(p, &mut out),
+            Self::Knowledge(r) => {
+                // Layout: agent_id (16 B) || opaque body.
+                put_uuid_bytes(&mut out, r.agent_id.into());
+                out.extend_from_slice(&r.body);
+            }
         }
         out
     }
@@ -330,10 +448,22 @@ impl WalPayload {
             WalRecordKind::MigrateEmbedding => {
                 Self::MigrateEmbedding(decode_migrate_embedding(&mut r)?)
             }
-            // Knowledge layer (spec §26). Bodies are opaque to the
-            // framing layer; phases 16+ supply typed parsers via their
-            // own sinks. We early-return so the trailing-bytes check
-            // below doesn't fire (the entire payload IS the body).
+            // Typed-relation kinds are first-class (Phase C): they carry
+            // a fully-typed payload rather than an opaque body, so
+            // recovery can rebuild the unified edge row + sidecar in
+            // one step.
+            WalRecordKind::RelationCreate => Self::RelationLink(decode_relation_link(&mut r)?),
+            WalRecordKind::RelationSupersede => {
+                Self::RelationSupersede(decode_relation_supersede(&mut r)?)
+            }
+            WalRecordKind::RelationTombstone => {
+                Self::RelationTombstone(decode_relation_tombstone(&mut r)?)
+            }
+            // Remaining knowledge kinds keep the opaque body. Their
+            // typed schemas land in later phases; the framing layer
+            // transports them unchanged. We early-return so the
+            // trailing-bytes check below doesn't fire (the entire
+            // payload IS the body).
             WalRecordKind::EntityCreate
             | WalRecordKind::EntityUpdate
             | WalRecordKind::EntityMerge
@@ -341,12 +471,18 @@ impl WalPayload {
             | WalRecordKind::StatementCreate
             | WalRecordKind::StatementSupersede
             | WalRecordKind::StatementTombstone
-            | WalRecordKind::RelationCreate
-            | WalRecordKind::RelationSupersede
-            | WalRecordKind::RelationTombstone
             | WalRecordKind::SchemaUpdate
             | WalRecordKind::Audit => {
-                return Ok(Self::Knowledge(KnowledgeRecord::new(kind, bytes.to_vec())));
+                // Layout: agent_id (16 B) || opaque body. The body
+                // remains opaque to the framing layer; phases 16+
+                // supply typed parsers via their own sinks.
+                let agent_id: AgentId = r.array16()?.into();
+                let body = bytes[r.cursor..].to_vec();
+                return Ok(Self::Knowledge(KnowledgeRecord {
+                    kind,
+                    agent_id,
+                    body,
+                }));
             }
         };
         if !r.is_at_end() {
@@ -371,11 +507,20 @@ pub enum WalPayloadError {
     #[error("MemoryKind byte {0} is not in {{0, 1, 2}}")]
     BadMemoryKind(u8),
 
-    #[error("EdgeKind byte {0} is not in 0..=7")]
-    BadEdgeKind(u8),
-
     #[error("EdgeOrigin byte {0} is not in {{0, 1}}")]
     BadEdgeOrigin(u8),
+
+    #[error("NodeRef decode failed: {0}")]
+    BadNodeRef(NodeRefError),
+
+    #[error("EdgeKindRef decode failed: {0}")]
+    BadEdgeKindRef(EdgeKindRefError),
+
+    #[error("evidence_count {0} exceeds remaining payload bytes")]
+    BadEvidenceCount(u32),
+
+    #[error("Option<u64> tag byte {0} is not in {{0, 1}}")]
+    BadOptionTag(u8),
 
     #[error("ForgetMode byte {0} is not in {{0, 1}}")]
     BadForgetMode(u8),
@@ -403,7 +548,14 @@ pub enum WalPayloadError {
 
     #[error("edge_count {0} exceeds remaining payload bytes")]
     BadEdgeCount(u16),
+
+    #[error("blob_length {0} exceeds cap or remaining payload bytes")]
+    BadBlobLength(u32),
 }
+
+/// Cap on `response_payload` length (in bytes). 1 MiB is far past any
+/// rkyv-encoded substrate response; a larger value is corruption.
+pub const RESPONSE_BLOB_MAX: u32 = 1024 * 1024;
 
 /// Cap on `vector_dims` (in f32 elements). 4096 dims = 16 KiB vector — well
 /// past the largest production embedding model we expect to encounter. A
@@ -479,11 +631,36 @@ impl<'a> Reader<'a> {
     fn memory_id(&mut self) -> Result<MemoryId, WalPayloadError> {
         Ok(MemoryId::from_be_bytes(self.array16()?))
     }
+
+    fn node_ref(&mut self) -> Result<NodeRef, WalPayloadError> {
+        let bytes = self.take(NodeRef::BYTES)?;
+        let mut arr = [0u8; NodeRef::BYTES];
+        arr.copy_from_slice(bytes);
+        NodeRef::from_bytes(arr).map_err(WalPayloadError::BadNodeRef)
+    }
+
+    fn edge_kind_ref(&mut self) -> Result<EdgeKindRef, WalPayloadError> {
+        let remaining = &self.bytes[self.cursor..];
+        let (k, consumed) =
+            EdgeKindRef::decode_from(remaining).map_err(WalPayloadError::BadEdgeKindRef)?;
+        self.cursor += consumed;
+        Ok(k)
+    }
 }
 
 #[inline]
 fn put_memory_id(out: &mut Vec<u8>, id: MemoryId) {
     out.extend_from_slice(&id.to_be_bytes());
+}
+
+#[inline]
+fn put_node_ref(out: &mut Vec<u8>, n: NodeRef) {
+    out.extend_from_slice(&n.to_bytes());
+}
+
+#[inline]
+fn put_edge_kind_ref(out: &mut Vec<u8>, k: EdgeKindRef) {
+    k.encode_into(out);
 }
 
 #[inline]
@@ -558,6 +735,22 @@ fn read_text(r: &mut Reader<'_>) -> Result<String, WalPayloadError> {
         .map_err(|_| WalPayloadError::BadUtf8)
 }
 
+fn put_blob(out: &mut Vec<u8>, bytes: &[u8]) {
+    put_u32_le(
+        out,
+        u32::try_from(bytes.len()).expect("invariant: blob fits in u32"),
+    );
+    out.extend_from_slice(bytes);
+}
+
+fn read_blob(r: &mut Reader<'_>) -> Result<Vec<u8>, WalPayloadError> {
+    let len = r.u32_le()?;
+    if len > RESPONSE_BLOB_MAX || len as usize > r.remaining() {
+        return Err(WalPayloadError::BadBlobLength(len));
+    }
+    Ok(r.take(len as usize)?.to_vec())
+}
+
 // MemoryKind <-> u8 mapping. Mirrors brain_protocol::MemoryKindWire so the
 // wire and storage representations agree on the byte values, but kept local
 // to brain-storage so this crate doesn't depend on the protocol crate.
@@ -575,20 +768,6 @@ fn memory_kind_from_u8(b: u8) -> Result<MemoryKind, WalPayloadError> {
         1 => MemoryKind::Semantic,
         2 => MemoryKind::Consolidated,
         _ => return Err(WalPayloadError::BadMemoryKind(b)),
-    })
-}
-
-fn edge_kind_from_u8(b: u8) -> Result<EdgeKind, WalPayloadError> {
-    Ok(match b {
-        0 => EdgeKind::Caused,
-        1 => EdgeKind::FollowedBy,
-        2 => EdgeKind::DerivedFrom,
-        3 => EdgeKind::SimilarTo,
-        4 => EdgeKind::Contradicts,
-        5 => EdgeKind::Supports,
-        6 => EdgeKind::References,
-        7 => EdgeKind::PartOf,
-        _ => return Err(WalPayloadError::BadEdgeKind(b)),
     })
 }
 
@@ -642,12 +821,18 @@ fn encode_encode(p: &EncodePayload, out: &mut Vec<u8>) {
     let edge_count = u16::try_from(p.edges.len()).expect("invariant: edges len fits in u16");
     put_u16_le(out, edge_count);
     for e in &p.edges {
-        put_memory_id(out, e.source);
-        put_memory_id(out, e.target);
-        out.push(e.kind as u8);
+        // Edge layout (variable-length): 17 (source NodeRef) + 17 (target
+        // NodeRef) + (1..17) (kind EdgeKindRef) + 4 (weight LE) + 1
+        // (origin) = 40..56 bytes.
+        put_node_ref(out, e.source);
+        put_node_ref(out, e.target);
+        put_edge_kind_ref(out, e.kind);
         put_f32_le(out, e.weight);
         out.push(e.origin as u8);
     }
+    out.extend_from_slice(&p.request_hash);
+    put_blob(out, &p.response_payload);
+    out.push(u8::from(p.deduplicate));
 }
 
 fn decode_encode(r: &mut Reader<'_>) -> Result<EncodePayload, WalPayloadError> {
@@ -661,15 +846,18 @@ fn decode_encode(r: &mut Reader<'_>) -> Result<EncodePayload, WalPayloadError> {
     let text = read_text(r)?;
     let vector = read_vector(r)?;
     let edge_count = r.u16_le()?;
-    // 38 bytes per edge (16+16+1+4+1).
-    if edge_count as usize * 38 > r.remaining() {
+    // Edge size is variable now (40..56); the conservative lower bound
+    // is 40 bytes. We only reject when there is no possible way the
+    // remaining bytes can fit `edge_count` edges plus the fixed-size
+    // tail (32 request_hash + 4 blob_len + 1 dedup = 37 bytes).
+    if (edge_count as usize).saturating_mul(40).saturating_add(37) > r.remaining() {
         return Err(WalPayloadError::BadEdgeCount(edge_count));
     }
     let mut edges = Vec::with_capacity(edge_count as usize);
     for _ in 0..edge_count {
-        let source = r.memory_id()?;
-        let target = r.memory_id()?;
-        let edge_kind = edge_kind_from_u8(r.u8()?)?;
+        let source = r.node_ref()?;
+        let target = r.node_ref()?;
+        let edge_kind = r.edge_kind_ref()?;
         let weight = r.f32_le()?;
         let origin = edge_origin_from_u8(r.u8()?)?;
         edges.push(EdgePayload {
@@ -680,6 +868,14 @@ fn decode_encode(r: &mut Reader<'_>) -> Result<EncodePayload, WalPayloadError> {
             origin,
         });
     }
+    let request_hash = {
+        let b = r.take(32)?;
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(b);
+        arr
+    };
+    let response_payload = read_blob(r)?;
+    let deduplicate = r.u8()? != 0;
     Ok(EncodePayload {
         memory_id,
         request_id,
@@ -691,12 +887,16 @@ fn decode_encode(r: &mut Reader<'_>) -> Result<EncodePayload, WalPayloadError> {
         text,
         vector,
         edges,
+        request_hash,
+        response_payload,
+        deduplicate,
     })
 }
 
 fn encode_forget(p: &ForgetPayload, out: &mut Vec<u8>) {
     put_memory_id(out, p.memory_id);
     put_uuid_bytes(out, p.request_id.into());
+    put_uuid_bytes(out, p.agent_id.into());
     out.push(p.mode as u8);
     out.push(p.reason as u8);
 }
@@ -705,41 +905,46 @@ fn decode_forget(r: &mut Reader<'_>) -> Result<ForgetPayload, WalPayloadError> {
     Ok(ForgetPayload {
         memory_id: r.memory_id()?,
         request_id: r.array16()?.into(),
+        agent_id: r.array16()?.into(),
         mode: forget_mode_from_u8(r.u8()?)?,
         reason: forget_reason_from_u8(r.u8()?)?,
     })
 }
 
 fn encode_link(p: &LinkPayload, out: &mut Vec<u8>) {
-    put_memory_id(out, p.source);
-    put_memory_id(out, p.target);
-    out.push(p.edge_kind as u8);
+    // Layout: 17 (source NodeRef) + 17 (target NodeRef) + (1..17) (kind
+    // EdgeKindRef) + 4 (weight LE) + 1 (origin) = 40..56 bytes.
+    put_node_ref(out, p.source);
+    put_node_ref(out, p.target);
+    put_edge_kind_ref(out, p.edge_kind);
     put_f32_le(out, p.weight);
     out.push(p.origin as u8);
 }
 
 fn decode_link(r: &mut Reader<'_>) -> Result<LinkPayload, WalPayloadError> {
     Ok(LinkPayload {
-        source: r.memory_id()?,
-        target: r.memory_id()?,
-        edge_kind: edge_kind_from_u8(r.u8()?)?,
+        source: r.node_ref()?,
+        target: r.node_ref()?,
+        edge_kind: r.edge_kind_ref()?,
         weight: r.f32_le()?,
         origin: edge_origin_from_u8(r.u8()?)?,
     })
 }
 
 fn encode_unlink(p: &UnlinkPayload, out: &mut Vec<u8>) {
-    put_memory_id(out, p.source);
-    put_memory_id(out, p.target);
-    out.push(p.edge_kind as u8);
+    // Layout: 17 (source NodeRef) + 17 (target NodeRef) + (1..17) (kind
+    // EdgeKindRef) + 4 (edge_seq LE) = 39..55 bytes.
+    put_node_ref(out, p.source);
+    put_node_ref(out, p.target);
+    put_edge_kind_ref(out, p.edge_kind);
     put_u32_le(out, p.edge_seq);
 }
 
 fn decode_unlink(r: &mut Reader<'_>) -> Result<UnlinkPayload, WalPayloadError> {
     Ok(UnlinkPayload {
-        source: r.memory_id()?,
-        target: r.memory_id()?,
-        edge_kind: edge_kind_from_u8(r.u8()?)?,
+        source: r.node_ref()?,
+        target: r.node_ref()?,
+        edge_kind: r.edge_kind_ref()?,
         edge_seq: r.u32_le()?,
     })
 }
@@ -925,16 +1130,180 @@ fn decode_migrate_embedding(
 }
 
 // ---------------------------------------------------------------------------
+// Typed-relation helpers (Phase C).
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn put_option_u64(out: &mut Vec<u8>, v: Option<u64>) {
+    match v {
+        None => out.push(0),
+        Some(x) => {
+            out.push(1);
+            put_u64_le(out, x);
+        }
+    }
+}
+
+fn read_option_u64(r: &mut Reader<'_>) -> Result<Option<u64>, WalPayloadError> {
+    let tag = r.u8()?;
+    Ok(match tag {
+        0 => None,
+        1 => Some(r.u64_le()?),
+        _ => return Err(WalPayloadError::BadOptionTag(tag)),
+    })
+}
+
+#[inline]
+fn put_option_relation_id(out: &mut Vec<u8>, v: Option<RelationId>) {
+    match v {
+        None => out.push(0),
+        Some(id) => {
+            out.push(1);
+            out.extend_from_slice(&id.to_bytes());
+        }
+    }
+}
+
+fn read_option_relation_id(r: &mut Reader<'_>) -> Result<Option<RelationId>, WalPayloadError> {
+    let tag = r.u8()?;
+    Ok(match tag {
+        0 => None,
+        1 => Some(RelationId::from_bytes(r.array16()?)),
+        _ => return Err(WalPayloadError::BadOptionTag(tag)),
+    })
+}
+
+fn encode_relation_link(p: &RelationLinkPayload, out: &mut Vec<u8>) {
+    // Layout:
+    //   relation_id (16) || from NodeRef (17) || to NodeRef (17) ||
+    //   relation_type_id (4 LE) || chain_root (16) || confidence (4 LE) ||
+    //   valid_from Option<u64> (1 or 9) || valid_to Option<u64> (1 or 9) ||
+    //   supersedes Option<RelationId> (1 or 17) ||
+    //   evidence_count (4 LE) + evidence_ids (16 * N) ||
+    //   extractor_id (4 LE) || is_symmetric (1) ||
+    //   properties_blob (4 LE len + bytes) || agent_id (16).
+    out.extend_from_slice(&p.relation_id.to_bytes());
+    put_node_ref(out, p.from);
+    put_node_ref(out, p.to);
+    put_u32_le(out, p.relation_type_id.raw());
+    out.extend_from_slice(&p.chain_root.to_bytes());
+    put_f32_le(out, p.confidence);
+    put_option_u64(out, p.valid_from_unix_nanos);
+    put_option_u64(out, p.valid_to_unix_nanos);
+    put_option_relation_id(out, p.supersedes);
+    let ev_count = u32::try_from(p.evidence.len()).expect("invariant: evidence len fits in u32");
+    put_u32_le(out, ev_count);
+    for id in &p.evidence {
+        put_memory_id(out, *id);
+    }
+    put_u32_le(out, p.extractor_id);
+    out.push(u8::from(p.is_symmetric));
+    put_blob(out, &p.properties_blob);
+    put_uuid_bytes(out, p.agent_id.into());
+}
+
+fn decode_relation_link(r: &mut Reader<'_>) -> Result<RelationLinkPayload, WalPayloadError> {
+    let relation_id = RelationId::from_bytes(r.array16()?);
+    let from = r.node_ref()?;
+    let to = r.node_ref()?;
+    let relation_type_id = RelationTypeId::from(r.u32_le()?);
+    let chain_root = RelationId::from_bytes(r.array16()?);
+    let confidence = r.f32_le()?;
+    let valid_from_unix_nanos = read_option_u64(r)?;
+    let valid_to_unix_nanos = read_option_u64(r)?;
+    let supersedes = read_option_relation_id(r)?;
+    let ev_count = r.u32_le()?;
+    if (ev_count as usize).saturating_mul(16) > r.remaining() {
+        return Err(WalPayloadError::BadEvidenceCount(ev_count));
+    }
+    let mut evidence = Vec::with_capacity(ev_count as usize);
+    for _ in 0..ev_count {
+        evidence.push(r.memory_id()?);
+    }
+    let extractor_id = r.u32_le()?;
+    let is_symmetric = r.u8()? != 0;
+    let properties_blob = read_blob(r)?;
+    let agent_id: AgentId = r.array16()?.into();
+    Ok(RelationLinkPayload {
+        relation_id,
+        from,
+        to,
+        relation_type_id,
+        chain_root,
+        confidence,
+        valid_from_unix_nanos,
+        valid_to_unix_nanos,
+        supersedes,
+        evidence,
+        extractor_id,
+        is_symmetric,
+        properties_blob,
+        agent_id,
+    })
+}
+
+fn encode_relation_supersede(p: &RelationSupersedePayload, out: &mut Vec<u8>) {
+    // Layout: old_relation_id (16) || encoded RelationLinkPayload.
+    out.extend_from_slice(&p.old_relation_id.to_bytes());
+    encode_relation_link(&p.new, out);
+}
+
+fn decode_relation_supersede(
+    r: &mut Reader<'_>,
+) -> Result<RelationSupersedePayload, WalPayloadError> {
+    let old_relation_id = RelationId::from_bytes(r.array16()?);
+    let new = decode_relation_link(r)?;
+    Ok(RelationSupersedePayload {
+        old_relation_id,
+        new,
+    })
+}
+
+fn encode_relation_tombstone(p: &RelationTombstonePayload, out: &mut Vec<u8>) {
+    // Layout: relation_id (16) || reason (text) || at_unix_nanos (8 LE)
+    //   || agent_id (16).
+    out.extend_from_slice(&p.relation_id.to_bytes());
+    put_text(out, &p.reason);
+    put_u64_le(out, p.at_unix_nanos);
+    put_uuid_bytes(out, p.agent_id.into());
+}
+
+fn decode_relation_tombstone(
+    r: &mut Reader<'_>,
+) -> Result<RelationTombstonePayload, WalPayloadError> {
+    Ok(RelationTombstonePayload {
+        relation_id: RelationId::from_bytes(r.array16()?),
+        reason: read_text(r)?,
+        at_unix_nanos: r.u64_le()?,
+        agent_id: r.array16()?.into(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_core::{AgentId, EdgeKind, EdgeOrigin, MemoryId, RequestId, TxnId};
+    use brain_core::{
+        AgentId, EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, MemoryId, NodeRef, RelationId,
+        RelationTypeId, RequestId, TxnId,
+    };
+    use proptest::prelude::*;
 
     fn mid(n: u64) -> MemoryId {
         MemoryId::pack(1, n, 1)
+    }
+
+    fn mnode(n: u64) -> NodeRef {
+        NodeRef::Memory(mid(n))
+    }
+
+    fn enode(byte: u8) -> NodeRef {
+        let mut b = [0u8; 16];
+        b[15] = byte;
+        NodeRef::Entity(EntityId::from_bytes(b))
     }
 
     fn rid(byte: u8) -> RequestId {
@@ -953,6 +1322,16 @@ mod tests {
         let mut b = [0u8; 16];
         b[15] = byte;
         b.into()
+    }
+
+    fn relid(byte: u8) -> RelationId {
+        let mut b = [0u8; 16];
+        b[15] = byte;
+        RelationId::from_bytes(b)
+    }
+
+    fn rtype(byte: u8) -> RelationTypeId {
+        RelationTypeId::from(u32::from(byte))
     }
 
     fn fp(byte: u8) -> EmbeddingModelFp {
@@ -974,30 +1353,34 @@ mod tests {
                 text: "hello world".into(),
                 vector: (0..8).map(|i| i as f32 * 0.25).collect(),
                 edges: vec![EdgePayload {
-                    source: mid(7),
-                    target: mid(8),
-                    kind: EdgeKind::Caused,
+                    source: mnode(7),
+                    target: mnode(8),
+                    kind: EdgeKindRef::Builtin(EdgeKind::Caused),
                     weight: 0.9,
                     origin: EdgeOrigin::Explicit,
                 }],
+                request_hash: [0x11; 32],
+                response_payload: b"response-bytes".to_vec(),
+                deduplicate: true,
             }),
             WalPayload::Forget(ForgetPayload {
                 memory_id: mid(9),
                 request_id: rid(3),
+                agent_id: aid(4),
                 mode: ForgetMode::Hard,
                 reason: ForgetReason::Eviction,
             }),
             WalPayload::Link(LinkPayload {
-                source: mid(10),
-                target: mid(11),
-                edge_kind: EdgeKind::SimilarTo,
+                source: mnode(10),
+                target: mnode(11),
+                edge_kind: EdgeKindRef::Builtin(EdgeKind::SimilarTo),
                 weight: 0.42,
                 origin: EdgeOrigin::AutoDerived,
             }),
             WalPayload::Unlink(UnlinkPayload {
-                source: mid(12),
-                target: mid(13),
-                edge_kind: EdgeKind::PartOf,
+                source: mnode(12),
+                target: mnode(13),
+                edge_kind: EdgeKindRef::Builtin(EdgeKind::PartOf),
                 edge_seq: 7,
             }),
             WalPayload::UpdateSalience(UpdateSaliencePayload {
@@ -1059,15 +1442,46 @@ mod tests {
                 new_fingerprint: fp(0xDD),
                 new_vector: (0..6).map(|i| (i as f32) * 1.5).collect(),
             }),
+            WalPayload::RelationLink(sample_relation_link()),
+            WalPayload::RelationSupersede(RelationSupersedePayload {
+                old_relation_id: relid(0xA0),
+                new: sample_relation_link(),
+            }),
+            WalPayload::RelationTombstone(RelationTombstonePayload {
+                relation_id: relid(0xA2),
+                reason: "duplicate".into(),
+                at_unix_nanos: 1_800_000_000_000_000_000,
+                agent_id: aid(0xA3),
+            }),
         ]
+    }
+
+    fn sample_relation_link() -> RelationLinkPayload {
+        RelationLinkPayload {
+            relation_id: relid(0xB0),
+            from: enode(0xC0),
+            to: enode(0xC1),
+            relation_type_id: RelationTypeId::from(42),
+            chain_root: relid(0xB0),
+            confidence: 0.9,
+            valid_from_unix_nanos: Some(1_700_000_000_000_000_000),
+            valid_to_unix_nanos: None,
+            supersedes: Some(relid(0xAA)),
+            evidence: vec![mid(1), mid(2), mid(3)],
+            extractor_id: 7,
+            is_symmetric: false,
+            properties_blob: vec![1, 2, 3, 4, 5],
+            agent_id: aid(0xC5),
+        }
     }
 
     #[test]
     fn one_variant_per_spec_kind() {
-        // 15 spec'd kinds; the fixture function must hit every one.
+        // 15 substrate kinds + 3 typed-relation kinds = 18 first-class
+        // payload kinds. The fixture function must hit every one.
         let payloads = all_variants();
         let kinds: std::collections::HashSet<_> = payloads.iter().map(|p| p.kind()).collect();
-        assert_eq!(kinds.len(), 15);
+        assert_eq!(kinds.len(), 18);
     }
 
     #[test]
@@ -1137,33 +1551,40 @@ mod tests {
 
     #[test]
     fn bad_edge_kind_rejected() {
+        // Widened layout: 17 (source NodeRef) + 17 (target NodeRef) +
+        // EdgeKindRef tag at offset 34. For a Builtin label the kind
+        // byte sits at offset 35.
         let p = WalPayload::Link(LinkPayload {
-            source: mid(1),
-            target: mid(2),
-            edge_kind: EdgeKind::Caused,
+            source: mnode(1),
+            target: mnode(2),
+            edge_kind: EdgeKindRef::Builtin(EdgeKind::Caused),
             weight: 1.0,
             origin: EdgeOrigin::Explicit,
         });
         let mut bytes = p.encode_to_bytes();
-        // Layout: source(16) + target(16) + edge_kind(1) at offset 32.
-        bytes[32] = 99;
+        // Offset 34 = EdgeKindRef tag (0 = Builtin). Offset 35 = kind.
+        assert_eq!(bytes[34], 0, "Builtin tag");
+        bytes[35] = 99;
         assert_eq!(
             WalPayload::decode(WalRecordKind::Link, &bytes),
-            Err(WalPayloadError::BadEdgeKind(99))
+            Err(WalPayloadError::BadEdgeKindRef(
+                brain_core::EdgeKindRefError::InvalidEdgeKind(99)
+            ))
         );
     }
 
     #[test]
     fn bad_edge_origin_rejected() {
+        // Widened layout: 17 + 17 + 2 (Builtin EdgeKindRef) + 4 (weight)
+        // + 1 (origin) = 41 bytes. Origin is the last byte.
         let p = WalPayload::Link(LinkPayload {
-            source: mid(1),
-            target: mid(2),
-            edge_kind: EdgeKind::Caused,
+            source: mnode(1),
+            target: mnode(2),
+            edge_kind: EdgeKindRef::Builtin(EdgeKind::Caused),
             weight: 1.0,
             origin: EdgeOrigin::Explicit,
         });
         let mut bytes = p.encode_to_bytes();
-        // origin is the last byte (offset 37 in the 38-byte payload).
         let last = bytes.len() - 1;
         bytes[last] = 99;
         assert_eq!(
@@ -1187,6 +1608,9 @@ mod tests {
             text: "ab".into(),
             vector: vec![],
             edges: vec![],
+            request_hash: [0; 32],
+            response_payload: vec![],
+            deduplicate: false,
         });
         let mut bytes = p.encode_to_bytes();
         // Text starts after MemoryId(16) + RequestId(16) + AgentId(16)
@@ -1239,9 +1663,103 @@ mod tests {
             text: String::new(),
             vector: vec![],
             edges: vec![],
+            request_hash: [0; 32],
+            response_payload: vec![],
+            deduplicate: false,
         });
         let bytes = p.encode_to_bytes();
         assert_eq!(WalPayload::decode(p.kind(), &bytes).unwrap(), p);
+    }
+
+    #[test]
+    fn encode_payload_with_request_hash_round_trips() {
+        // request_hash is a 32-byte blake3 of the canonical request body;
+        // recovery needs it byte-identical so the idempotency cache can
+        // detect a same-id-different-params conflict.
+        let hash: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let p = WalPayload::Encode(EncodePayload {
+            memory_id: mid(1),
+            request_id: rid(0),
+            agent_id: aid(0),
+            context_id: ContextId(0),
+            kind: MemoryKind::Episodic,
+            salience_initial: 0.0,
+            embedding_model_fp: fp(0),
+            text: "hi".into(),
+            vector: vec![],
+            edges: vec![],
+            request_hash: hash,
+            response_payload: vec![],
+            deduplicate: false,
+        });
+        let bytes = p.encode_to_bytes();
+        match WalPayload::decode(WalRecordKind::Encode, &bytes).unwrap() {
+            WalPayload::Encode(decoded) => assert_eq!(decoded.request_hash, hash),
+            other => panic!("expected Encode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_payload_with_response_payload_round_trips() {
+        // response_payload is an rkyv blob; recovery replays it verbatim
+        // to a retried client.
+        let body: Vec<u8> = (0..256u16).map(|i| (i & 0xFF) as u8).collect();
+        let p = WalPayload::Encode(EncodePayload {
+            memory_id: mid(1),
+            request_id: rid(0),
+            agent_id: aid(0),
+            context_id: ContextId(0),
+            kind: MemoryKind::Episodic,
+            salience_initial: 0.0,
+            embedding_model_fp: fp(0),
+            text: "hi".into(),
+            vector: vec![],
+            edges: vec![],
+            request_hash: [0; 32],
+            response_payload: body.clone(),
+            deduplicate: false,
+        });
+        let bytes = p.encode_to_bytes();
+        match WalPayload::decode(WalRecordKind::Encode, &bytes).unwrap() {
+            WalPayload::Encode(decoded) => assert_eq!(decoded.response_payload, body),
+            other => panic!("expected Encode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_encode_payload_without_new_fields_errors_cleanly() {
+        // The hard-cut design means a WAL written by a pre-PR binary
+        // lacks the trailing request_hash + response_payload tail. A
+        // load attempt must fail loudly so operators see "wipe and
+        // restart," not silent zeros.
+        let p = WalPayload::Encode(EncodePayload {
+            memory_id: mid(1),
+            request_id: rid(0),
+            agent_id: aid(0),
+            context_id: ContextId(0),
+            kind: MemoryKind::Episodic,
+            salience_initial: 0.0,
+            embedding_model_fp: fp(0),
+            text: String::new(),
+            vector: vec![],
+            edges: vec![],
+            request_hash: [0; 32],
+            response_payload: vec![],
+            deduplicate: false,
+        });
+        let full = p.encode_to_bytes();
+        // Drop the 32-byte hash + 4-byte response_payload length + 1-byte
+        // deduplicate flag tail (37 bytes total) — what a pre-PR binary
+        // would have written. Any structured failure is acceptable; we
+        // only require that the decoder refuses (the exact variant may
+        // be Underrun, BadEdgeCount, or BadBlobLength depending on how
+        // the missing tail rolls into the next size-prefixed field).
+        let legacy_len = full.len() - 32 - 4 - 1;
+        let legacy = &full[..legacy_len];
+        assert!(
+            WalPayload::decode(WalRecordKind::Encode, legacy).is_err(),
+            "expected legacy-tail decode to fail",
+        );
     }
 
     #[test]
@@ -1262,6 +1780,9 @@ mod tests {
 
     #[test]
     fn knowledge_record_round_trip() {
+        // After Phase C, the three RelationCreate/Supersede/Tombstone
+        // kinds are first-class typed payloads — not opaque-body
+        // knowledge records — so they are excluded from this fixture.
         for kind in [
             WalRecordKind::EntityCreate,
             WalRecordKind::EntityUpdate,
@@ -1270,21 +1791,22 @@ mod tests {
             WalRecordKind::StatementCreate,
             WalRecordKind::StatementSupersede,
             WalRecordKind::StatementTombstone,
-            WalRecordKind::RelationCreate,
-            WalRecordKind::RelationSupersede,
-            WalRecordKind::RelationTombstone,
             WalRecordKind::SchemaUpdate,
             WalRecordKind::Audit,
         ] {
             let body: Vec<u8> = (0..32u8).map(|i| i ^ kind.as_u8()).collect();
-            let payload = WalPayload::Knowledge(KnowledgeRecord::new(kind, body.clone()));
+            let agent = aid(kind.as_u8());
+            let payload = WalPayload::Knowledge(KnowledgeRecord::new(kind, agent, body.clone()));
             assert_eq!(payload.kind(), kind);
             let bytes = payload.encode_to_bytes();
-            assert_eq!(bytes, body, "encode is identity for knowledge bodies");
+            // Layout: 16-byte agent_id, then the opaque body.
+            assert_eq!(bytes.len(), 16 + body.len());
+            assert_eq!(&bytes[16..], body.as_slice());
             let decoded = WalPayload::decode(kind, &bytes).expect("decode knowledge");
             match decoded {
                 WalPayload::Knowledge(r) => {
                     assert_eq!(r.kind, kind);
+                    assert_eq!(r.agent_id, agent);
                     assert_eq!(r.body, body);
                 }
                 other => panic!("expected Knowledge, got {other:?}"),
@@ -1293,14 +1815,39 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_agent_id_round_trips_through_encode_decode() {
+        // The new `agent_id` field must survive an encode_to_bytes →
+        // decode round-trip so subscribe-replay can route knowledge
+        // events through the per-agent `agents` filter.
+        let agent = aid(0x7F);
+        let body = b"opaque-rkyv-blob".to_vec();
+        let payload = WalPayload::Knowledge(KnowledgeRecord::new(
+            WalRecordKind::EntityCreate,
+            agent,
+            body.clone(),
+        ));
+        let bytes = payload.encode_to_bytes();
+        match WalPayload::decode(WalRecordKind::EntityCreate, &bytes).unwrap() {
+            WalPayload::Knowledge(r) => {
+                assert_eq!(r.agent_id, agent);
+                assert_eq!(r.body, body);
+            }
+            other => panic!("expected Knowledge, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn knowledge_decode_empty_body_is_ok() {
         // An empty body is a legal opaque payload (a tombstone marker,
-        // for instance, may carry no fields).
-        let payload =
-            WalPayload::decode(WalRecordKind::EntityTombstone, &[]).expect("empty body decodes");
+        // for instance, may carry no fields). The 16-byte agent_id
+        // prefix is still mandatory.
+        let agent_bytes = [0u8; 16];
+        let payload = WalPayload::decode(WalRecordKind::EntityTombstone, &agent_bytes)
+            .expect("empty body decodes");
         match payload {
             WalPayload::Knowledge(r) => {
                 assert_eq!(r.kind, WalRecordKind::EntityTombstone);
+                assert_eq!(r.agent_id, AgentId::from(agent_bytes));
                 assert!(r.body.is_empty());
             }
             other => panic!("expected Knowledge, got {other:?}"),
@@ -1308,15 +1855,29 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_decode_rejects_short_prefix() {
+        // Anything shorter than the 16-byte agent_id prefix must
+        // underrun rather than silently succeeding.
+        for n in 0..16 {
+            match WalPayload::decode(WalRecordKind::EntityTombstone, &vec![0u8; n]) {
+                Err(WalPayloadError::Underrun { .. }) => {}
+                other => panic!("expected Underrun for {n}-byte payload, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn knowledge_decode_skips_trailing_bytes_check() {
         // For substrate kinds, trailing bytes after the structured tail
-        // are an error. For knowledge kinds the entire payload IS the
-        // body — no such check applies. Verify by feeding garbage.
-        let body = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
-        let decoded =
-            WalPayload::decode(WalRecordKind::SchemaUpdate, &body).expect("knowledge accepts any bytes");
+        // are an error. For knowledge kinds the bytes following the
+        // 16-byte agent_id prefix are the opaque body — no such check
+        // applies. Verify by feeding garbage past the prefix.
+        let mut bytes = vec![0u8; 16];
+        bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE]);
+        let decoded = WalPayload::decode(WalRecordKind::SchemaUpdate, &bytes)
+            .expect("knowledge accepts any bytes after prefix");
         if let WalPayload::Knowledge(r) = decoded {
-            assert_eq!(r.body, body);
+            assert_eq!(r.body, bytes[16..].to_vec());
         } else {
             panic!("expected Knowledge");
         }
@@ -1329,6 +1890,428 @@ mod tests {
         // substrate kind panics. (In release builds the debug_assert is
         // elided; that's intentional — callers are not expected to feed
         // adversarial kinds.)
-        let _ = KnowledgeRecord::new(WalRecordKind::Encode, vec![]);
+        let _ = KnowledgeRecord::new(WalRecordKind::Encode, AgentId::default(), vec![]);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase C: NodeRef / EdgeKindRef widening + typed-relation payloads.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn widened_link_payload_round_trips_memory_to_memory() {
+        let p = WalPayload::Link(LinkPayload {
+            source: mnode(1),
+            target: mnode(2),
+            edge_kind: EdgeKindRef::Builtin(EdgeKind::SimilarTo),
+            weight: 0.5,
+            origin: EdgeOrigin::Explicit,
+        });
+        let bytes = p.encode_to_bytes();
+        // 17 + 17 + 2 + 4 + 1 = 41 bytes.
+        assert_eq!(bytes.len(), 41);
+        assert_eq!(WalPayload::decode(WalRecordKind::Link, &bytes).unwrap(), p);
+    }
+
+    #[test]
+    fn widened_link_payload_round_trips_memory_to_entity() {
+        let p = WalPayload::Link(LinkPayload {
+            source: mnode(7),
+            target: enode(0xAB),
+            edge_kind: EdgeKindRef::Mentions,
+            weight: 1.0,
+            origin: EdgeOrigin::AutoDerived,
+        });
+        let bytes = p.encode_to_bytes();
+        // 17 + 17 + 1 + 4 + 1 = 40 bytes (Mentions is the shortest kind).
+        assert_eq!(bytes.len(), 40);
+        assert_eq!(WalPayload::decode(WalRecordKind::Link, &bytes).unwrap(), p);
+    }
+
+    #[test]
+    fn widened_link_payload_round_trips_entity_to_entity() {
+        let p = WalPayload::Link(LinkPayload {
+            source: enode(0xAA),
+            target: enode(0xBB),
+            edge_kind: EdgeKindRef::Typed(rtype(0xCC)),
+            weight: 0.42,
+            origin: EdgeOrigin::Explicit,
+        });
+        let bytes = p.encode_to_bytes();
+        // 17 + 17 + 5 + 4 + 1 = 44 bytes (Typed kind = tag(1) + RelationTypeId(4)).
+        assert_eq!(bytes.len(), 44);
+        assert_eq!(WalPayload::decode(WalRecordKind::Link, &bytes).unwrap(), p);
+    }
+
+    #[test]
+    fn widened_edge_payload_in_encode_round_trips_all_node_combos() {
+        let cases = vec![
+            (mnode(1), mnode(2), EdgeKindRef::Builtin(EdgeKind::Caused)),
+            (mnode(1), enode(0x11), EdgeKindRef::Mentions),
+            (enode(0x20), enode(0x21), EdgeKindRef::Typed(rtype(0x22))),
+            (
+                enode(0x30),
+                mnode(99),
+                EdgeKindRef::Builtin(EdgeKind::References),
+            ),
+        ];
+        let edges: Vec<EdgePayload> = cases
+            .into_iter()
+            .map(|(source, target, kind)| EdgePayload {
+                source,
+                target,
+                kind,
+                weight: 0.5,
+                origin: EdgeOrigin::Explicit,
+            })
+            .collect();
+        let p = WalPayload::Encode(EncodePayload {
+            memory_id: mid(1),
+            request_id: rid(1),
+            agent_id: aid(1),
+            context_id: ContextId(0),
+            kind: MemoryKind::Episodic,
+            salience_initial: 0.5,
+            embedding_model_fp: fp(0),
+            text: "ENCODE".into(),
+            vector: vec![],
+            edges,
+            request_hash: [0; 32],
+            response_payload: vec![],
+            deduplicate: false,
+        });
+        let bytes = p.encode_to_bytes();
+        assert_eq!(
+            WalPayload::decode(WalRecordKind::Encode, &bytes).unwrap(),
+            p
+        );
+    }
+
+    #[test]
+    fn widened_unlink_payload_round_trips() {
+        for kind in [
+            EdgeKindRef::Builtin(EdgeKind::Caused),
+            EdgeKindRef::Mentions,
+            EdgeKindRef::Typed(rtype(0xDD)),
+        ] {
+            let p = WalPayload::Unlink(UnlinkPayload {
+                source: mnode(10),
+                target: enode(0x40),
+                edge_kind: kind,
+                edge_seq: 99,
+            });
+            let bytes = p.encode_to_bytes();
+            assert_eq!(
+                WalPayload::decode(WalRecordKind::Unlink, &bytes).unwrap(),
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn relation_link_payload_round_trips_full_metadata() {
+        let p = WalPayload::RelationLink(sample_relation_link());
+        let bytes = p.encode_to_bytes();
+        assert_eq!(
+            WalPayload::decode(WalRecordKind::RelationCreate, &bytes).unwrap(),
+            p
+        );
+    }
+
+    #[test]
+    fn relation_link_payload_round_trips_empty_evidence() {
+        let mut rl = sample_relation_link();
+        rl.evidence.clear();
+        rl.properties_blob.clear();
+        let p = WalPayload::RelationLink(rl);
+        let bytes = p.encode_to_bytes();
+        assert_eq!(
+            WalPayload::decode(WalRecordKind::RelationCreate, &bytes).unwrap(),
+            p
+        );
+    }
+
+    #[test]
+    fn relation_link_payload_round_trips_no_validity_window() {
+        let mut rl = sample_relation_link();
+        rl.valid_from_unix_nanos = None;
+        rl.valid_to_unix_nanos = None;
+        rl.supersedes = None;
+        let p = WalPayload::RelationLink(rl);
+        let bytes = p.encode_to_bytes();
+        assert_eq!(
+            WalPayload::decode(WalRecordKind::RelationCreate, &bytes).unwrap(),
+            p
+        );
+    }
+
+    #[test]
+    fn relation_supersede_payload_round_trips() {
+        let p = WalPayload::RelationSupersede(RelationSupersedePayload {
+            old_relation_id: relid(0x01),
+            new: sample_relation_link(),
+        });
+        let bytes = p.encode_to_bytes();
+        assert_eq!(
+            WalPayload::decode(WalRecordKind::RelationSupersede, &bytes).unwrap(),
+            p
+        );
+    }
+
+    #[test]
+    fn relation_tombstone_payload_round_trips() {
+        let p = WalPayload::RelationTombstone(RelationTombstonePayload {
+            relation_id: relid(0x02),
+            reason: "no longer holds".into(),
+            at_unix_nanos: 1_900_000_000_000_000_000,
+            agent_id: aid(0x03),
+        });
+        let bytes = p.encode_to_bytes();
+        assert_eq!(
+            WalPayload::decode(WalRecordKind::RelationTombstone, &bytes).unwrap(),
+            p
+        );
+    }
+
+    #[test]
+    fn v1_link_payload_bytes_rejected() {
+        // A pre-Phase-C LinkPayload was MemoryId-keyed:
+        //   source(16) + target(16) + edge_kind(1) + weight(4) + origin(1)
+        //   = 38 bytes.
+        // The widened decoder expects 17-byte NodeRef endpoints. Feeding
+        // the old 38-byte sequence must error so a v2 binary refuses
+        // pre-migration WAL bytes rather than silently misreading them.
+        let mut legacy = Vec::with_capacity(38);
+        legacy.extend_from_slice(&mid(1).to_be_bytes()); // 16 source
+        legacy.extend_from_slice(&mid(2).to_be_bytes()); // 16 target
+        legacy.push(EdgeKind::Caused as u8); // 1 edge_kind
+        legacy.extend_from_slice(&0.5f32.to_le_bytes()); // 4 weight
+        legacy.push(EdgeOrigin::Explicit as u8); // 1 origin
+        assert_eq!(legacy.len(), 38);
+
+        // The widened decoder reads 17 bytes for source NodeRef. The
+        // first byte of mid(1).to_be_bytes() is 0x00 (the shard high
+        // byte) — happens to match NodeRef::Memory's tag. The decoder
+        // therefore parses 17 bytes as a Memory NodeRef successfully,
+        // then attempts to read another 17 bytes for the target — at
+        // which point byte 17 is the low byte of the legacy source's
+        // version field; subsequent bytes drift. The decode will fail
+        // somewhere in the structured tail: either an underrun (because
+        // 38 < 40 minimum widened size), an unknown NodeRef tag, an
+        // invalid EdgeKindRef tag, or an invalid origin.
+        assert!(
+            WalPayload::decode(WalRecordKind::Link, &legacy).is_err(),
+            "v1 LinkPayload bytes must not decode as v2",
+        );
+    }
+
+    fn arb_node_ref() -> impl Strategy<Value = NodeRef> {
+        prop_oneof![
+            proptest::array::uniform16(any::<u8>())
+                .prop_map(|b| NodeRef::Memory(MemoryId::from_be_bytes(b))),
+            proptest::array::uniform16(any::<u8>())
+                .prop_map(|b| NodeRef::Entity(EntityId::from_bytes(b))),
+        ]
+    }
+
+    fn arb_edge_kind_ref() -> impl Strategy<Value = EdgeKindRef> {
+        prop_oneof![
+            (0u8..=7).prop_map(|b| {
+                let k = match b {
+                    0 => EdgeKind::Caused,
+                    1 => EdgeKind::FollowedBy,
+                    2 => EdgeKind::DerivedFrom,
+                    3 => EdgeKind::SimilarTo,
+                    4 => EdgeKind::Contradicts,
+                    5 => EdgeKind::Supports,
+                    6 => EdgeKind::References,
+                    _ => EdgeKind::PartOf,
+                };
+                EdgeKindRef::Builtin(k)
+            }),
+            Just(EdgeKindRef::Mentions),
+            any::<u32>().prop_map(|n| EdgeKindRef::Typed(RelationTypeId::from(n))),
+        ]
+    }
+
+    fn arb_edge_origin() -> impl Strategy<Value = EdgeOrigin> {
+        prop_oneof![Just(EdgeOrigin::Explicit), Just(EdgeOrigin::AutoDerived)]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, .. ProptestConfig::default() })]
+
+        #[test]
+        fn link_payload_round_trips_arbitrary(
+            source in arb_node_ref(),
+            target in arb_node_ref(),
+            edge_kind in arb_edge_kind_ref(),
+            weight in proptest::num::f32::NORMAL | proptest::num::f32::ZERO,
+            origin in arb_edge_origin(),
+        ) {
+            let p = WalPayload::Link(LinkPayload { source, target, edge_kind, weight, origin });
+            let bytes = p.encode_to_bytes();
+            prop_assert_eq!(WalPayload::decode(WalRecordKind::Link, &bytes).unwrap(), p);
+        }
+
+        #[test]
+        fn unlink_payload_round_trips_arbitrary(
+            source in arb_node_ref(),
+            target in arb_node_ref(),
+            edge_kind in arb_edge_kind_ref(),
+            edge_seq in any::<u32>(),
+        ) {
+            let p = WalPayload::Unlink(UnlinkPayload { source, target, edge_kind, edge_seq });
+            let bytes = p.encode_to_bytes();
+            prop_assert_eq!(WalPayload::decode(WalRecordKind::Unlink, &bytes).unwrap(), p);
+        }
+
+        #[test]
+        fn edge_payload_in_encode_round_trips_arbitrary(
+            edges in proptest::collection::vec(
+                (
+                    arb_node_ref(),
+                    arb_node_ref(),
+                    arb_edge_kind_ref(),
+                    proptest::num::f32::NORMAL | proptest::num::f32::ZERO,
+                    arb_edge_origin(),
+                )
+                    .prop_map(|(source, target, kind, weight, origin)| EdgePayload { source, target, kind, weight, origin }),
+                0..6,
+            ),
+        ) {
+            let p = WalPayload::Encode(EncodePayload {
+                memory_id: mid(1),
+                request_id: rid(0),
+                agent_id: aid(0),
+                context_id: ContextId(0),
+                kind: MemoryKind::Episodic,
+                salience_initial: 0.0,
+                embedding_model_fp: fp(0),
+                text: String::new(),
+                vector: vec![],
+                edges,
+                request_hash: [0; 32],
+                response_payload: vec![],
+                deduplicate: false,
+            });
+            let bytes = p.encode_to_bytes();
+            prop_assert_eq!(WalPayload::decode(WalRecordKind::Encode, &bytes).unwrap(), p);
+        }
+
+        #[test]
+        fn relation_link_round_trips_arbitrary(
+            from in arb_node_ref(),
+            to in arb_node_ref(),
+            confidence in proptest::num::f32::NORMAL | proptest::num::f32::ZERO,
+            valid_from in proptest::option::of(any::<u64>()),
+            valid_to in proptest::option::of(any::<u64>()),
+            evidence_ids in proptest::collection::vec(any::<u64>(), 0..8),
+            extractor_id in any::<u32>(),
+            is_symmetric in any::<bool>(),
+            properties_blob in proptest::collection::vec(any::<u8>(), 0..32),
+            relation_type_id in any::<u32>(),
+        ) {
+            let evidence: Vec<MemoryId> = evidence_ids.into_iter().map(mid).collect();
+            let rl = RelationLinkPayload {
+                relation_id: relid(0x01),
+                from,
+                to,
+                relation_type_id: RelationTypeId::from(relation_type_id),
+                chain_root: relid(0x02),
+                confidence,
+                valid_from_unix_nanos: valid_from,
+                valid_to_unix_nanos: valid_to,
+                supersedes: None,
+                evidence,
+                extractor_id,
+                is_symmetric,
+                properties_blob,
+                agent_id: aid(0x09),
+            };
+            let p = WalPayload::RelationLink(rl);
+            let bytes = p.encode_to_bytes();
+            prop_assert_eq!(WalPayload::decode(WalRecordKind::RelationCreate, &bytes).unwrap(), p);
+        }
+
+        /// `RelationSupersedePayload` carries an inline new
+        /// `RelationLinkPayload`; the codec must preserve every field
+        /// across the supersession boundary so recovery can flip the
+        /// sidecar deterministically.
+        #[test]
+        fn relation_supersede_round_trips_arbitrary(
+            from in arb_node_ref(),
+            to in arb_node_ref(),
+            evidence_ids in proptest::collection::vec(any::<u64>(), 0..4),
+            properties_blob in proptest::collection::vec(any::<u8>(), 0..16),
+            old_rid_byte in any::<u8>(),
+            new_rid_byte in any::<u8>(),
+        ) {
+            let mut new_link = sample_relation_link();
+            new_link.from = from;
+            new_link.to = to;
+            new_link.evidence = evidence_ids.into_iter().map(mid).collect();
+            new_link.properties_blob = properties_blob;
+            new_link.relation_id = relid(new_rid_byte);
+            let p = WalPayload::RelationSupersede(RelationSupersedePayload {
+                old_relation_id: relid(old_rid_byte),
+                new: new_link,
+            });
+            let bytes = p.encode_to_bytes();
+            prop_assert_eq!(
+                WalPayload::decode(WalRecordKind::RelationSupersede, &bytes).unwrap(),
+                p,
+            );
+        }
+
+        /// Tombstone carries a free-form reason string; the codec
+        /// must preserve arbitrary UTF-8 bytes.
+        #[test]
+        fn relation_tombstone_round_trips_arbitrary(
+            rid_byte in any::<u8>(),
+            reason in ".*",
+            at in any::<u64>(),
+            agent_byte in any::<u8>(),
+        ) {
+            let p = WalPayload::RelationTombstone(RelationTombstonePayload {
+                relation_id: relid(rid_byte),
+                reason,
+                at_unix_nanos: at,
+                agent_id: aid(agent_byte),
+            });
+            let bytes = p.encode_to_bytes();
+            prop_assert_eq!(
+                WalPayload::decode(WalRecordKind::RelationTombstone, &bytes).unwrap(),
+                p,
+            );
+        }
+    }
+
+    #[test]
+    fn forget_payload_agent_id_round_trips() {
+        // The new `agent_id` field on ForgetPayload must survive a
+        // full encode_to_bytes → decode round-trip so subscribe-
+        // replay can populate EventEnvelope.agent_id from a
+        // non-default value (the live-publish path already stamps
+        // it from the writer; replay used to fall back to nil and
+        // silently drop forgets for any `agents`-filtered
+        // subscriber).
+        let agent = aid(0x42);
+        let payload = WalPayload::Forget(ForgetPayload {
+            memory_id: mid(99),
+            request_id: rid(7),
+            agent_id: agent,
+            mode: ForgetMode::Hard,
+            reason: ForgetReason::ClientRequest,
+        });
+        let bytes = payload.encode_to_bytes();
+        match WalPayload::decode(WalRecordKind::Forget, &bytes).unwrap() {
+            WalPayload::Forget(p) => {
+                assert_eq!(p.agent_id, agent);
+                assert_eq!(p.memory_id, mid(99));
+                assert_eq!(p.mode, ForgetMode::Hard);
+                assert_eq!(p.reason, ForgetReason::ClientRequest);
+            }
+            other => panic!("expected Forget, got {other:?}"),
+        }
     }
 }

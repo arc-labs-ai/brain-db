@@ -196,4 +196,3 @@ pub fn scan_stale_statements(
     }
     Ok(summary)
 }
-

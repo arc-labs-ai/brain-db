@@ -17,6 +17,7 @@ use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
+use brain_ops::test_support::run_in_glommio;
 use brain_ops::{dispatch, ErrorCode, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::request::{
@@ -121,7 +122,13 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
             request_id,
             txn_id: None,
         };
-        let _ = dispatch(RequestBody::Link(req), &ctx).await.unwrap();
+        let _ = dispatch(
+            RequestBody::Link(req),
+            brain_ops::RequestCaller::anonymous(),
+            &ctx,
+        )
+        .await
+        .unwrap();
     }
 
     Fixture {
@@ -158,83 +165,129 @@ fn unwrap_plan_resp(body: ResponseBody) -> PlanResponseFrame {
 // 1. Full pipeline: 3 memories, A→B→C, PLAN returns 3 steps.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn plan_full_pipeline_returns_path() {
-    let fix = build_fixture(3, &[(0, EdgeKind::Caused, 1), (1, EdgeKind::FollowedBy, 2)]).await;
-    let req = plan_request(fix.ids[0], fix.ids[2], 4);
-    let frame = unwrap_plan_resp(dispatch(RequestBody::Plan(req), &fix.ctx).await.unwrap());
+#[test]
+fn plan_full_pipeline_returns_path() {
+    run_in_glommio(|| async {
+        let fix = build_fixture(3, &[(0, EdgeKind::Caused, 1), (1, EdgeKind::FollowedBy, 2)]).await;
+        let req = plan_request(fix.ids[0], fix.ids[2], 4);
+        let frame = unwrap_plan_resp(
+            dispatch(
+                RequestBody::Plan(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
 
-    assert!(frame.is_final);
-    assert_eq!(frame.plan_status, Some(WirePlanStatus::GoalReached));
-    assert_eq!(frame.steps.len(), 3);
-    assert_eq!(frame.steps[0].step_index, 0);
-    assert_eq!(frame.steps[0].transition_kind, TransitionKind::Initial);
-    assert_eq!(frame.steps[1].transition_kind, TransitionKind::Causal);
-    assert_eq!(frame.steps[2].transition_kind, TransitionKind::Temporal);
-    assert_eq!(frame.steps[0].estimated_distance_to_goal, 2.0);
-    assert_eq!(frame.steps[2].estimated_distance_to_goal, 0.0);
+        assert!(frame.is_final);
+        assert_eq!(frame.plan_status, Some(WirePlanStatus::GoalReached));
+        assert_eq!(frame.steps.len(), 3);
+        assert_eq!(frame.steps[0].step_index, 0);
+        assert_eq!(frame.steps[0].transition_kind, TransitionKind::Initial);
+        assert_eq!(frame.steps[1].transition_kind, TransitionKind::Causal);
+        assert_eq!(frame.steps[2].transition_kind, TransitionKind::Temporal);
+        assert_eq!(frame.steps[0].estimated_distance_to_goal, 2.0);
+        assert_eq!(frame.steps[2].estimated_distance_to_goal, 0.0);
+    })
 }
 
 // ---------------------------------------------------------------------------
 // 2. No path → empty steps + NoPathFound status.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn plan_no_path_returns_no_path_status() {
-    let fix = build_fixture(3, &[(0, EdgeKind::Caused, 1)]).await;
-    let req = plan_request(fix.ids[0], fix.ids[2], 4);
-    let frame = unwrap_plan_resp(dispatch(RequestBody::Plan(req), &fix.ctx).await.unwrap());
-    assert!(frame.steps.is_empty());
-    assert_eq!(frame.plan_status, Some(WirePlanStatus::NoPathFound));
+#[test]
+fn plan_no_path_returns_no_path_status() {
+    run_in_glommio(|| async {
+        let fix = build_fixture(3, &[(0, EdgeKind::Caused, 1)]).await;
+        let req = plan_request(fix.ids[0], fix.ids[2], 4);
+        let frame = unwrap_plan_resp(
+            dispatch(
+                RequestBody::Plan(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(frame.steps.is_empty());
+        assert_eq!(frame.plan_status, Some(WirePlanStatus::NoPathFound));
+    })
 }
 
 // ---------------------------------------------------------------------------
 // 3. Transition mapping: ensure CAUSED → Causal and FollowedBy → Temporal.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn plan_step_transitions_map_correctly() {
-    let fix = build_fixture(2, &[(0, EdgeKind::Caused, 1)]).await;
-    let req = plan_request(fix.ids[0], fix.ids[1], 2);
-    let frame = unwrap_plan_resp(dispatch(RequestBody::Plan(req), &fix.ctx).await.unwrap());
-    assert_eq!(frame.steps[0].transition_kind, TransitionKind::Initial);
-    assert_eq!(frame.steps[1].transition_kind, TransitionKind::Causal);
+#[test]
+fn plan_step_transitions_map_correctly() {
+    run_in_glommio(|| async {
+        let fix = build_fixture(2, &[(0, EdgeKind::Caused, 1)]).await;
+        let req = plan_request(fix.ids[0], fix.ids[1], 2);
+        let frame = unwrap_plan_resp(
+            dispatch(
+                RequestBody::Plan(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(frame.steps[0].transition_kind, TransitionKind::Initial);
+        assert_eq!(frame.steps[1].transition_kind, TransitionKind::Causal);
+    })
 }
 
 // ---------------------------------------------------------------------------
 // 4. Validation: max_steps=0 → planner rejects.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn plan_invalid_budget_returns_plan_error() {
-    let fix = build_fixture(2, &[(0, EdgeKind::Caused, 1)]).await;
-    let mut req = plan_request(fix.ids[0], fix.ids[1], 0);
-    req.budget.max_steps = 0;
-    let err = dispatch(RequestBody::Plan(req), &fix.ctx)
+#[test]
+fn plan_invalid_budget_returns_plan_error() {
+    run_in_glommio(|| async {
+        let fix = build_fixture(2, &[(0, EdgeKind::Caused, 1)]).await;
+        let mut req = plan_request(fix.ids[0], fix.ids[1], 0);
+        req.budget.max_steps = 0;
+        let err = dispatch(
+            RequestBody::Plan(req),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
         .await
         .unwrap_err();
-    assert!(
-        matches!(err, OpError::PlanError(_)),
-        "max_steps=0 must be a planner validation failure, got {err:?}"
-    );
-    assert_eq!(err.error_code(), ErrorCode::InvalidRequest);
+        assert!(
+            matches!(err, OpError::PlanError(_)),
+            "max_steps=0 must be a planner validation failure, got {err:?}"
+        );
+        assert_eq!(err.error_code(), ErrorCode::InvalidRequest);
+    })
 }
 
 // ---------------------------------------------------------------------------
 // 5. ByMemoryId endpoints work (no embed required).
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn plan_by_memory_id_skips_recall() {
-    let fix = build_fixture(2, &[(0, EdgeKind::Caused, 1)]).await;
-    // Plan with ByMemoryId on both endpoints; even though the
-    // dispatcher is a no-op, the executor should not need to embed.
-    let req = plan_request(fix.ids[0], fix.ids[1], 2);
-    let frame = unwrap_plan_resp(dispatch(RequestBody::Plan(req), &fix.ctx).await.unwrap());
-    assert_eq!(frame.plan_status, Some(WirePlanStatus::GoalReached));
-    assert_eq!(frame.steps.len(), 2);
-    let id0: u128 = fix.ids[0].into();
-    let id1: u128 = fix.ids[1].into();
-    assert_eq!(frame.steps[0].memory_id, id0);
-    assert_eq!(frame.steps[1].memory_id, id1);
+#[test]
+fn plan_by_memory_id_skips_recall() {
+    run_in_glommio(|| async {
+        let fix = build_fixture(2, &[(0, EdgeKind::Caused, 1)]).await;
+        // Plan with ByMemoryId on both endpoints; even though the
+        // dispatcher is a no-op, the executor should not need to embed.
+        let req = plan_request(fix.ids[0], fix.ids[1], 2);
+        let frame = unwrap_plan_resp(
+            dispatch(
+                RequestBody::Plan(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(frame.plan_status, Some(WirePlanStatus::GoalReached));
+        assert_eq!(frame.steps.len(), 2);
+        let id0: u128 = fix.ids[0].into();
+        let id1: u128 = fix.ids[1].into();
+        assert_eq!(frame.steps[0].memory_id, id0);
+        assert_eq!(frame.steps[1].memory_id, id1);
+    })
 }

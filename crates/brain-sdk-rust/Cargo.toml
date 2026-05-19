@@ -26,6 +26,11 @@ smallvec.workspace = true
 # 19.8: serde_json used by the SchemaBuilder DSL printer when
 # emitting `examples:` / `schema:` JSON values for extractor fields.
 serde_json = { workspace = true }
+# Pool keepalive (Step 1 of liveness work): set SO_KEEPALIVE +
+# TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT on the SDK's connect
+# path so the kernel detects half-broken peers within ~60 s,
+# independent of the SDK's app-level CLIENT_PONG.
+socket2 = { workspace = true }
 
 [dev-dependencies]
 anyhow.workspace = true

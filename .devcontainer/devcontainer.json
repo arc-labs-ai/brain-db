@@ -18,20 +18,29 @@
   "mounts": [
     "source=brain-cargo-registry,target=/usr/local/cargo/registry,type=volume",
     "source=brain-cargo-git,target=/usr/local/cargo/git,type=volume",
-    "source=brain-target-cache,target=/workspaces/brain/target,type=volume"
+    "source=brain-target-cache,target=/workspaces/brain/target,type=volume",
+    // Per-shard data files (arena.bin, metadata.redb, llm_cache.redb, …)
+    // need a filesystem that honors POSIX flock. OrbStack's `fakeowner`
+    // bind mount over macOS host does not — redb's `Database::create`
+    // sometimes hits a spurious `WouldBlock` on `try_lock()` and returns
+    // `DatabaseAlreadyOpen`, even though no other process holds the
+    // lock. Putting data/ on a named volume (Linux ext4) sidesteps this
+    // entirely. Production on bare Linux is unaffected.
+    "source=brain-data,target=/workspaces/brain/data,type=volume"
   ],
 
   "remoteEnv": {
     "RUST_BACKTRACE": "1",
-    // Phase 9: candle's `gemm-f16` requires the fullfp16 target feature on
-    // aarch64 Linux; without it the build fails with "instruction requires:
-    // fullfp16". On x86_64 Linux this flag is a no-op.
-    "RUSTFLAGS": "-C target-feature=+fp16",
     "CARGO_TERM_COLOR": "always",
     // Cap parallel compile jobs to avoid the OOM-killer (signal 9) on the
     // linker when many crates link concurrently in an 8–12 GB Docker
     // Desktop VM. 2 is conservative; bump if your container has 16+ GB.
     "CARGO_BUILD_JOBS": "2"
+
+    // target-cpu / fullfp16 handling lives in .cargo/config.toml as
+    // per-target rustflags so it scopes to aarch64-unknown-linux-gnu only.
+    // Don't add a RUSTFLAGS entry here — env vars OVERRIDE the per-target
+    // config and we lose the macOS-host vs Linux-container distinction.
   },
 
   // Phase 9 unlock: io_uring (Glommio executor) needs both the memlock
@@ -66,9 +75,9 @@
     }
   },
 
-  // Phase 9 unlocks (memlock + seccomp + RUSTFLAGS) are baked in above.
-  // VS Code / Cursor "Reopen in Container" picks these up automatically.
-  // Bare `devcontainer` CLI:
+  // Phase 9 unlocks (memlock + seccomp) are baked in above; aarch64 target
+  // tuning is in .cargo/config.toml. VS Code / Cursor "Reopen in Container"
+  // picks both up automatically. Bare `devcontainer` CLI:
   //   devcontainer up --workspace-folder .
   //   devcontainer exec --workspace-folder . cargo test --workspace --tests --lib
   // (Install via `npm install -g @devcontainers/cli` if missing.)

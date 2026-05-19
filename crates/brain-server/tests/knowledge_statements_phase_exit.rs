@@ -1,8 +1,8 @@
 //! Phase 17 exit integration test (sub-task 17.10a).
 //!
 //! Exercises the full statement lifecycle end-to-end over the wire:
-//! create Fact + contradiction → supersede Fact → create Preference
-//! + auto-supersede → list current → history → create Event →
+//! create Fact then contradiction → supersede Fact → create Preference
+//! then auto-supersede → list current → history → create Event →
 //! tombstone → retract.
 //!
 //! Companion to `knowledge_statement_wire.rs` (17.10a): individual
@@ -80,8 +80,8 @@ where
             .await
             .expect("payload");
     }
-    let (frame, rest) = Frame::decode_with_max(&buf, brain_protocol::MAX_PAYLOAD_BYTES as u32)
-        .expect("decode");
+    let (frame, rest) =
+        Frame::decode_with_max(&buf, brain_protocol::MAX_PAYLOAD_BYTES as u32).expect("decode");
     debug_assert!(rest.is_empty());
     frame
 }
@@ -229,7 +229,9 @@ fn event_req(subject: [u8; 16], when: u64) -> StatementCreateRequest {
 #[tokio::test(flavor = "current_thread")]
 async fn statement_lifecycle_end_to_end() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     // Step 1 — create the subject + two manager entities.

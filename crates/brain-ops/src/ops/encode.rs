@@ -82,9 +82,19 @@ pub async fn handle_encode(
 
     Ok(EncodeResponse {
         memory_id: result.memory_id.into(),
-        was_deduplicated: result.replayed,
+        // Fingerprint dedup hit (spec §07/07 §6) — NOT idempotency
+        // replay. Idempotency replay is transparent to the caller;
+        // see spec §09/02 §4 + §4a.
+        was_deduplicated: result.was_deduplicated,
         salience,
         auto_edges_added,
+        lsn: result.lsn.unwrap_or(0),
+        agent_id: ctx.executor.writer.agent_id().into(),
+        context_id: req.context_id,
+        kind: req.kind,
+        created_at_unix_nanos: result.created_at_unix_nanos,
+        edges_out_count: result.edges_out_count,
+        embedding_model_fp: ctx.executor.embedder.fingerprint(),
     })
 }
 
@@ -122,6 +132,9 @@ async fn handle_encode_in_txn(
                     weight: e.weight,
                 })
                 .collect(),
+            deduplicate: req.deduplicate,
+            content_hash: *blake3::hash(req.text.as_bytes()).as_bytes(),
+            agent_id: ctx.executor.caller_agent,
         };
         hash_encode_request(&op)
     };
@@ -153,9 +166,27 @@ async fn handle_encode_in_txn(
     if let Some((memory_id, auto_edges_added)) = replay {
         return Ok(EncodeResponse {
             memory_id: memory_id.into(),
-            was_deduplicated: true,
+            // Intra-txn request_id replay is idempotency, not
+            // dedup. Per spec §09/02 §4, idempotency replay is
+            // transparent to the caller — surface whatever the
+            // original response would have carried. The original
+            // was a buffered encode (no dedup hit possible during
+            // a txn in v1; in-txn dedup would require cross-encode
+            // coordination), so `false` is correct.
+            was_deduplicated: false,
             salience,
             auto_edges_added,
+            // Buffered ops aren't WAL'd until TXN_COMMIT; LSN is
+            // unknown at this point — the COMMIT-time ack carries
+            // it. Clients chaining subscribe-from-encode inside a
+            // txn must subscribe after COMMIT instead.
+            lsn: 0,
+            agent_id: ctx.executor.writer.agent_id().into(),
+            context_id: req.context_id,
+            kind: req.kind,
+            created_at_unix_nanos: 0,
+            edges_out_count: auto_edges_added,
+            embedding_model_fp: ctx.executor.embedder.fingerprint(),
         });
     }
 
@@ -258,6 +289,7 @@ async fn handle_encode_in_txn(
         request_id: req.request_id,
         request_hash,
         created_at_unix_nanos: created_at,
+        agent_id: ctx.executor.caller_agent,
     };
 
     ctx.txn_store.with_buffer(txn_id, |buf| {
@@ -278,6 +310,14 @@ async fn handle_encode_in_txn(
         was_deduplicated: false,
         salience,
         auto_edges_added,
+        // Buffered op — durable LSN lands at TXN_COMMIT.
+        lsn: 0,
+        agent_id: ctx.executor.writer.agent_id().into(),
+        context_id: req.context_id,
+        kind: req.kind,
+        created_at_unix_nanos: created_at,
+        edges_out_count: auto_edges_added,
+        embedding_model_fp: ctx.executor.embedder.fingerprint(),
     })
 }
 

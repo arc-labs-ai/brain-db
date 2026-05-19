@@ -60,7 +60,7 @@ pub struct RelationView {
 
 ```rust
 pub struct RelationCreateRequest {
-    pub relation_type: String,         // "namespace:name" — must be declared
+    pub relation_type: String,         // "namespace:name"; open-vocabulary in schemaless mode
     pub from_entity: WireUuid,
     pub to_entity: WireUuid,
     pub properties_blob: RelationPropertiesBlob,
@@ -75,10 +75,10 @@ pub struct RelationCreateRequest {
 
 Semantics:
 
-1. Validate `relation_type` exists in the schema. → `INVALID_ARGUMENT` otherwise.
+1. Resolve `relation_type` (a `"namespace:name"` qname). If the namespace has no active schema, intern the qname with `RelationTypeOrigin::ImplicitFromWrite` on first use; implicit types default to `cardinality: many_to_many` and carry no `from_type` / `to_type` constraint. If a schema is active for the namespace, the qname must be declared — unknown qnames produce `RelationTypeNotInSchema` (0x004C).
 2. Validate `from_entity` / `to_entity` exist. → `ENTITY_NOT_FOUND`.
-3. Validate **type-signature**: `from_entity.entity_type` and `to_entity.entity_type` match the relation's declared `from_type` / `to_type`. → `ENTITY_TYPE_MISMATCH`.
-4. Validate **cardinality** ([`../20_relations/00_purpose.md`](../20_relations/00_purpose.md) §"Cardinality"). For `one_to_one` / `one_to_many`, server checks existing edges before inserting. Violation → `RELATION_CARDINALITY_VIOLATION` (`0x50`).
+3. Validate **type-signature** (schema-declared types only): `from_entity.entity_type` and `to_entity.entity_type` match the relation's declared `from_type` / `to_type`. → `ENTITY_TYPE_MISMATCH`. Implicit types skip this check.
+4. Validate **cardinality** ([`../20_relations/00_purpose.md`](../20_relations/00_purpose.md) §"Cardinality"). Only schema-declared types carry an enforceable cardinality contract. For declared `one_to_one` / `one_to_many` / `many_to_one`, the server checks existing edges before inserting; violation → `CardinalityViolation` (0x0065). Implicit types are always `many_to_many` and never trigger this error.
 5. Allocate `RelationId` (UUIDv7).
 6. Write to `relations` + `relations_by_from` + `relations_by_to` indexes inside one redb transaction.
 7. Emit `RELATION_CREATED` event.
@@ -93,8 +93,10 @@ pub struct RelationCreateResponse {
 
 ### 3.3 Errors
 
-- `ENTITY_NOT_FOUND`, `ENTITY_TYPE_MISMATCH`, `RELATION_CARDINALITY_VIOLATION`.
-- `INVALID_ARGUMENT` — unknown `relation_type`, malformed `properties_blob`, confidence out of `[0, 1]`.
+- `RelationTypeNotInSchema` (`0x004C`) — strict mode only; relation type qname is not declared in the active schema for the namespace.
+- `ENTITY_NOT_FOUND`, `ENTITY_TYPE_MISMATCH`.
+- `CardinalityViolation` (`0x0065`) — write would violate the declared cardinality of a schema-declared relation type.
+- `INVALID_ARGUMENT` — malformed `relation_type` qname, malformed `properties_blob`, confidence out of `[0, 1]`.
 
 ## 4. RELATION_GET (0x0151)
 
@@ -229,4 +231,4 @@ Relation type declarations carry cardinality rules:
 | `many_to_one` | reject if `to_entity` already has an active relation of this type | symmetric |
 | `many_to_many` | no check | no check |
 
-Errors → `RELATION_CARDINALITY_VIOLATION` (`0x50`). `ErrorDetails.expected` carries the declared cardinality string; `ErrorDetails.actual` is empty.
+Errors → `CardinalityViolation` (`0x0065`). `ErrorDetails.expected` carries the declared cardinality string; `ErrorDetails.actual` is empty. Cardinality is enforced only on schema-declared relation types; implicit (open-vocabulary) types are always `many_to_many` and never trigger this error.

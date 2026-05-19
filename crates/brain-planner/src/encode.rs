@@ -88,6 +88,7 @@ pub fn plan_encode_inner(
             persistent_id: true,
         },
         estimated_cost_ms: estimated,
+        deduplicate: req.deduplicate,
     })
 }
 
@@ -111,7 +112,9 @@ fn validate(req: &EncodeRequest, config: &PlannerConfig) -> Result<(), PlanError
     if matches!(kind, MemoryKind::Consolidated) {
         return Err(PlanError::InvalidParameters {
             field: "kind",
-            reason: "Consolidated is worker-only (spec §08/04 §15)".to_string(),
+            reason: "consolidated memories are produced by background workers, \
+                     not by direct encode. Use --kind episodic or --kind semantic."
+                .to_string(),
         });
     }
     if !(0.0..=1.0).contains(&req.salience_hint) {
@@ -217,7 +220,12 @@ mod tests {
         match plan_encode(&r, &PlannerContext::default()) {
             Err(PlanError::InvalidParameters { field, reason }) => {
                 assert_eq!(field, "kind");
-                assert!(reason.contains("Consolidated"));
+                // The user-facing message intentionally avoids spec
+                // references — it says "consolidated memories are
+                // produced by background workers, not by direct
+                // encode" — so we match on the consistent lowercase
+                // marker word.
+                assert!(reason.contains("consolidated"));
             }
             other => panic!("expected InvalidParameters[kind], got {other:?}"),
         }

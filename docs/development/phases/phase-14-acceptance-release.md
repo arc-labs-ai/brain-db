@@ -71,7 +71,11 @@ ls docs/performance/soak-*.md
 # 3. Bump workspace version: 0.1.0 → 1.0.0.
 sed -i 's/^version = "0.1.0"$/version = "1.0.0"/' Cargo.toml
 cargo update --workspace          # refresh Cargo.lock with new version
-just docker-verify                # final green check
+cargo fmt --all -- --check        # final green check
+cargo build --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
+./scripts/check-skills.sh
 
 # 4. Commit + tag.
 git add Cargo.toml Cargo.lock

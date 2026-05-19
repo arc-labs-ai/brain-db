@@ -79,7 +79,7 @@ impl ConnState {
 
 /// Read-only handles a connection task uses: the shard pool + routing.
 ///
-/// `routing` is wrapped in [`ArcSwap`] so future cluster
+/// `routing` is wrapped in [`arc_swap::ArcSwap`] so future cluster
 /// reconfiguration (admin RPC + gossip, post-Phase-9) can publish a
 /// new `RoutingTable` atomically — without restarting connections
 /// (spec §10/05 §4, §12/02 §2). Readers call `routing.load_full()`
@@ -127,6 +127,14 @@ pub(crate) struct OpDispatch {
     pub(crate) stream_id: u32,
     pub(crate) req: RequestBody,
     pub(crate) target_shard: u16,
+    /// Authenticated agent from the connection's
+    /// `ConnPhase::Established.agent`. Threaded through to
+    /// `brain_ops::dispatch` so writer Ops carry per-request
+    /// identity instead of the per-shard default. Defaults to
+    /// `AgentId::default()` when the request rides through before
+    /// auth completes — handlers treat that as "anonymous /
+    /// substrate-wide."
+    pub(crate) caller_agent: AgentId,
 }
 
 pub(crate) struct SubscribeStart {
@@ -187,7 +195,7 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
                     "connection-level opcode requires stream_id = 0",
                 ));
             }
-        } else if stream_id == 0 || stream_id % 2 == 0 {
+        } else if stream_id == 0 || stream_id.is_multiple_of(2) {
             return Action::Inline(error_frame(
                 stream_id,
                 ErrorCode::BadFrame,
@@ -274,12 +282,16 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
     // shard; everything else lands on the agent's bound shard.
     let routing = topology.routing.load_full();
     let target_shard = pick_target_shard(&req, bound_shard, &routing).unwrap_or(bound_shard);
-    let _ = agent; // reserved for spec §09/01 §12 cross-checks in 9.11+.
 
     Action::OpDispatch(OpDispatch {
         stream_id: frame.header.stream_id_u32(),
         req,
         target_shard,
+        // Stamp the auth-time agent on every dispatched op so the
+        // writer's event publish carries it — closing the shared-
+        // shard cross-agent leak the `agents` subscribe filter
+        // needs to enforce.
+        caller_agent: agent,
     })
 }
 
@@ -455,7 +467,10 @@ pub(crate) async fn run_op_dispatch(op: OpDispatch, shards: Arc<Vec<ShardHandle>
             );
         }
     };
-    match shard.dispatch_op(op.req).await {
+    match shard
+        .dispatch_op(op.req, brain_ops::RequestCaller::new(op.caller_agent))
+        .await
+    {
         Ok(body) => {
             // 9.10 ships single-frame EOS responses. Multi-frame
             // streaming for RECALL / PLAN / REASON is 9.11.
@@ -534,7 +549,19 @@ fn error_frame_from_op_error(stream_id: u32, e: &OpError) -> Frame {
         brain_ops::error::ErrorCode::QuotaExceeded => (ErrorCode::RateLimited, None),
         brain_ops::error::ErrorCode::Unauthorized => (ErrorCode::PermissionDenied, None),
         brain_ops::error::ErrorCode::Conflict => (ErrorCode::IdempotencyConflict, None),
+        brain_ops::error::ErrorCode::TxnExpired => (ErrorCode::TransactionTimeout, None),
+        brain_ops::error::ErrorCode::TxnNotFound => (ErrorCode::TxnNotFound, None),
+        brain_ops::error::ErrorCode::PredicateNotInSchema => {
+            (ErrorCode::PredicateNotInSchema, None)
+        }
+        brain_ops::error::ErrorCode::RelationTypeNotInSchema => {
+            (ErrorCode::RelationTypeNotInSchema, None)
+        }
+        brain_ops::error::ErrorCode::CardinalityViolation => {
+            (ErrorCode::CardinalityViolation, None)
+        }
         brain_ops::error::ErrorCode::Overloaded => (ErrorCode::Overloaded, Some(1000u32)),
+        brain_ops::error::ErrorCode::HybridUnavailable => (ErrorCode::ShardUnavailable, None),
         brain_ops::error::ErrorCode::InternalError => (ErrorCode::Internal, None),
     };
     let body = ResponseBody::Error(ErrorResponse {

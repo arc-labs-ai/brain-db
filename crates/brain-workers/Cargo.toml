@@ -10,7 +10,9 @@ description = "Background workers for Brain (decay, consolidation, GC, etc.)."
 [dependencies]
 brain-core = { path = "../brain-core" }
 brain-embed = { path = "../brain-embed" }
+brain-extractors = { path = "../brain-extractors" }
 brain-index = { path = "../brain-index" }
+brain-llm = { path = "../brain-llm" }
 brain-metadata = { path = "../brain-metadata" }
 brain-ops = { path = "../brain-ops" }
 brain-planner = { path = "../brain-planner" }
@@ -36,3 +38,5 @@ parking_lot.workspace = true
 tempfile.workspace = true
 uuid.workspace = true
 tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros"] }
+proptest.workspace = true
+flume.workspace = true

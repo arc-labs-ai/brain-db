@@ -26,6 +26,7 @@ use brain_index::{
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::MetadataDb;
 use parking_lot::{Mutex, RwLock};
+use redb::TableError;
 
 /// Production `SemanticRetriever` impl.
 ///
@@ -79,9 +80,15 @@ impl BrainSemanticRetriever {
         let rtxn = db_guard
             .read_txn()
             .map_err(|e| SemanticError::Internal(format!("read_txn: {e}")))?;
-        let table = rtxn
-            .open_table(MEMORIES_TABLE)
-            .map_err(|e| SemanticError::Internal(format!("open MEMORIES_TABLE: {e}")))?;
+        // MEMORIES_TABLE is created lazily on first ENCODE. A query
+        // against a freshly opened shard with no memories yet
+        // should silently return an empty result, not surface an
+        // internal error.
+        let table = match rtxn.open_table(MEMORIES_TABLE) {
+            Ok(t) => t,
+            Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(SemanticError::Internal(format!("open MEMORIES_TABLE: {e}"))),
+        };
 
         let agent_filter = filters.agent_id.map(|a| -> [u8; 16] { a.into() });
         let kind_filter = filters.memory_kind.map(memory_kind_to_u8);

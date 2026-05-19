@@ -13,7 +13,9 @@ use std::sync::Arc;
 use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
-use brain_metadata::tables::edge::{link, EdgeData, EDGES_IN_TABLE, EDGES_OUT_TABLE};
+use brain_metadata::tables::edge::{
+    link, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
+};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
 use brain_planner::{
@@ -146,11 +148,20 @@ fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) -> Fixtu
         }
     }
     {
-        let mut out = wtxn.open_table(EDGES_OUT_TABLE).unwrap();
-        let mut inn = wtxn.open_table(EDGES_IN_TABLE).unwrap();
+        let mut out = wtxn.open_table(EDGES_TABLE).unwrap();
+        let mut rev = wtxn.open_table(EDGES_REVERSE_TABLE).unwrap();
         for (src, kind, tgt) in edges {
             let data = EdgeData::new(1.0, 0, 0, 1_700_000_000_000_000_000);
-            link(&mut out, &mut inn, ids[*src], *kind, ids[*tgt], &data).unwrap();
+            link(
+                &mut out,
+                &mut rev,
+                brain_core::NodeRef::Memory(ids[*src]),
+                brain_core::EdgeKindRef::Builtin(*kind),
+                brain_core::NodeRef::Memory(ids[*tgt]),
+                zero_disambiguator(),
+                &data,
+            )
+            .unwrap();
         }
     }
     wtxn.commit().unwrap();

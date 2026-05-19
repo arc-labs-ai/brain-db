@@ -554,9 +554,10 @@ async fn recall_returns_single_frame_eos_in_v1() {
         age_bound_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
-        strategy_hint: None,
+        strategy: None,
         include_vectors: false,
         include_edges: false,
+        include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id: None,
     };

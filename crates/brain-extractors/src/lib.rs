@@ -24,6 +24,7 @@ pub mod materialize;
 pub mod options;
 pub mod pattern;
 pub mod registry;
+pub mod resolver;
 
 pub use classifier::{
     BertTokenClassifier, ClassifierConfig, ClassifierExtractor, ClassifierModel,
@@ -44,3 +45,4 @@ pub use materialize::{
 pub use options::ExtractorRunOptions;
 pub use pattern::{CompiledRegex, PatternExtractor};
 pub use registry::ExtractorRegistry;
+pub use resolver::{resolve_or_create, Resolution, ResolutionTier, ResolverError};

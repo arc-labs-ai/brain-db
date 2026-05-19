@@ -56,16 +56,50 @@ The substrate validates:
 
 Invalid UTF-8 is rejected at validation.
 
-## 6. Text deduplication?
+## 6. Text deduplication
 
-Could the substrate deduplicate identical texts (multiple memories with the same content)?
+The substrate supports **opt-in fingerprint deduplication** at ENCODE time. When the caller passes `EncodeRequest.deduplicate = true`, the substrate consults a fingerprint index before allocating a new slot; on a hit, the existing `MemoryId` is returned and no new slot, WAL record, or HNSW node is created.
 
-In v1, no:
-- Per-memory storage means a single point of truth per memory.
-- Deduplication would require a refcount table, complicating reclaim.
-- Text deduplication is rare in practice (different memories tend to have different text, even if similar).
+### 6.1. Scope
 
-If a deployment has highly repetitive text (e.g., template-based agent outputs), an external dedup layer could be added before encoding.
+Fingerprint dedup is scoped per `(shard, agent_id, context_id)`. The same text encoded by:
+
+- the same agent in the same context → **dedup hit** (returns existing `MemoryId`).
+- the same agent in a *different* context → **no hit** (different memory, allocated fresh). This preserves the spec's original observation that the same utterance in different episodic contexts is semantically different.
+- a different agent → **no hit**. The fingerprint table is partitioned by `agent_id` for both privacy (one agent's encoded text never matches against another's index) and ownership clarity (each agent owns its own dedup index).
+
+Cross-shard dedup is not supported. The fingerprint table is per-shard, and routing already hashes the agent to a single shard, so all of that agent's memories live in one shard's table.
+
+### 6.2. Hash
+
+The fingerprint is `BLAKE3(canonical_utf8(text))[..32]` — the first 32 bytes of BLAKE3 over the UTF-8 byte representation of the text. Canonicalisation in v1 is a no-op (the bytes go in as-is); future spec revisions may add NFC normalisation if cross-platform consistency becomes a real concern.
+
+### 6.3. Tombstone semantics
+
+Dedup only hits **Active** memories. If the matching memory has been tombstoned (soft FORGET, hard FORGET, or worker-reclaimed), the dedup lookup misses and a fresh memory is allocated. Implementations are free to either:
+
+(a) check the memory's state on every lookup (simpler), or
+(b) evict the fingerprint entry on every FORGET / reclamation (faster lookup, more write paths to maintain).
+
+v1 chooses **(b)** — eviction on FORGET / reclamation — because the read path is the hot path. `do_forget` removes the matching `(agent_id, context_id, content_hash)` entry in the same write transaction as the tombstone.
+
+### 6.4. Default
+
+Dedup is **off by default**. Callers that want it must opt in explicitly. The default-off reflects the substrate's primitive: "one ENCODE call → one memory" is the simpler, more predictable model, and avoids silently merging memories whose distinct identity might matter to a downstream cognitive operation.
+
+### 6.5. Storage cost
+
+The fingerprint table adds, per Active memory under dedup, one row of `agent_id(16) + context_id(8) + content_hash(32) + memory_id(16) = 72 bytes`. At 1M Active memories per shard with 100% dedup-on, this is ~72 MiB of additional redb storage — comfortably within the spec's metadata-budget envelope.
+
+### 6.6. Refcount?
+
+Earlier drafts considered a refcount table (so a single stored text could back N memories). v1 rejects that: dedup hit means the *same MemoryId is returned*, not "a new MemoryId backed by shared storage." Two callers asking for dedup get the same `MemoryId`; there's no refcount because there's only ever one row.
+
+### 6.7. Use cases
+
+- Template-based agents that emit the same observation repeatedly.
+- Idempotent batch ingestion where the source already has stable content.
+- Caching layers that re-encode the same prompt during retries (request-level idempotency handles the explicit retry case; fingerprint dedup handles the case where the same content appears under a different `request_id`).
 
 ## 7. Text size limits
 

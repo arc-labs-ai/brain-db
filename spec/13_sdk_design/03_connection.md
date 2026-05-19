@@ -64,29 +64,92 @@ This establishes connections eagerly so the first real request is fast.
 
 ## 5. Idle connection management
 
-Idle connections:
+A pool connection that's not currently serving an op is **Idle**. Idle
+doesn't mean dormant — the SDK runs a per-Idle-slot background
+reader that owns the stream and:
 
-- Receive periodic keep-alive frames (default every 30 sec).
-- Are closed if idle for too long (default 5 min).
-- Are validated before reuse.
+1. Reads frames continuously.
+2. On `SERVER_PING` (the server's idle-detection probe per
+   [§03/02 §6.1](../03_wire_protocol/02_transport.md)):
+   builds a `CLIENT_PONG` echoing the server's timestamp, writes
+   it on the control stream (stream_id 0). Returns to step 1.
+3. On any other frame: logs and discards (Brain v1 doesn't issue
+   unsolicited server frames outside subscribe streams, which run
+   on their own connection).
+4. On `Io` / `Closed` / `Protocol` error: exits. The slot will
+   be marked closed on the next `acquire`, which triggers a fresh
+   handshake (see §6).
 
-Validation checks:
+When an op calls `acquire`, the background reader is cancelled, the
+stream is handed back via a oneshot channel, and the resulting
+active connection is returned to the caller. On `release`, the
+stream is re-wrapped and a fresh background reader spawned.
 
-- TCP socket is still open.
-- Last keep-alive ack was recent.
+### 5.1 Why a background reader
+
+Without it, an idle pool slot has nobody reading frames. The
+server's `SERVER_PING` sits in the kernel buffer; after
+`ping_timeout` the server closes the connection silently. The next
+op then hits EPIPE and recovers via §6 — correct but slow (one
+round-trip wasted + handshake re-pay). The background reader keeps
+idle connections genuinely alive so ops always run on a
+known-healthy socket.
+
+This matches the design space settled on by **gRPC**'s HTTP/2 PING
+responder and **NATS**'s PING/PONG protocol. Bidirectional
+`CLIENT_PING` (NATS-style, where the client also probes) is
+documented in
+[§03/02 §6.2](../03_wire_protocol/02_transport.md) but not required
+by v1 — the responder-only path satisfies the liveness contract;
+bidirectional probes are an optimisation for detecting *slow* (vs
+*dead*) servers.
+
+### 5.2 Reaper
+
+Independent of the background reader, the pool runs a reaper task
+that closes Idle slots whose `last_used` exceeds the pool's
+`idle_timeout` (default 5 min) — respecting `min_connections` as
+the floor. The reaper exists for pool-size hygiene; the background
+reader exists for server-side liveness. They don't interact.
 
 ## 6. Reconnection
 
-If a connection drops:
+The pool and the retry layer separate concerns:
 
-```
-1. The SDK detects via I/O error or keep-alive timeout.
-2. Outstanding requests on that connection fail with NetworkError.
-3. The connection is removed from the pool.
-4. On the next request, a new connection is established.
-```
+1. The SDK observes `Io` / `Closed` / `Protocol` on an op
+   (write or read).
+2. The op handler marks the pool slot **failed** before
+   propagating the error.
+3. The slot drops; the pool transitions it to `Closed` instead of
+   recycling the dead socket into the Idle list.
+4. The retry layer ([§13/04](04_retries.md)) gets the error,
+   classifies it as retryable, and calls `acquire` again.
+5. `acquire` finds no Idle slot (we just closed the only one);
+   `try_open_new` opens a fresh TCP + handshake under the
+   pool's `max` cap.
+6. The retry runs the op against the fresh connection. Succeeds.
 
-Outstanding requests are NOT auto-retried at this layer (see [13.04 Retries](04_retries.md)).
+Net effect: the user sees one extra ~50 ms of latency on the first
+op after a network disruption — the re-handshake cost. They never
+see the `NetworkError` unless retries are also exhausted.
+
+The pool itself does NOT retry — that would conflate two concerns
+(connection management vs op semantics). The retry layer's
+[§13/04 §2](04_retries.md) classifier decides what's retryable;
+the pool just ensures the next `acquire` returns a fresh
+connection when needed.
+
+### 6.1 The dead-slot-on-drop discipline
+
+The pool's `PoolGuard` exposes `mark_failed()`. Op handlers MUST
+call it before returning any of `Io`, `Closed`, or `Protocol` —
+the three error variants that mean "the socket is unusable from
+here on." On `Drop`, a failed guard transitions the slot to
+`Closed` (next `acquire` opens fresh); an unmarked guard returns
+the connection to `Idle` for reuse.
+
+Server-side errors (`Server { code, .. }`) do NOT mark the slot
+failed — the connection is healthy, just the op was rejected.
 
 ## 7. Server failover
 

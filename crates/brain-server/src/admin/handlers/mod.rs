@@ -6,12 +6,13 @@
 //! rebuild) are flat files inside `handlers/`.
 //!
 //! Each handler module is internal to `crate::admin` and consumed
-//! from [`crate::admin::router::build`].
+//! from the `crate::admin::router` family of `build_*` functions.
 
 pub mod agent;
 pub mod audit;
 pub mod config;
 pub mod diagnostics;
+pub mod extract;
 pub mod healthz;
 pub mod metrics;
 pub mod rebuild;

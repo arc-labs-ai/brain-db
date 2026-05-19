@@ -7,8 +7,8 @@
 //!
 //! Pest 2.7. Grammar lives in `grammar.pest`.
 
-use pest::Parser as _;
 use pest::iterators::Pair;
+use pest::Parser as _;
 
 use crate::schema::ast::{
     AttrType, AttributeDecl, CacheConfig, CardinalityAst, ConditionExpr, ConditionOp,
@@ -35,8 +35,10 @@ pub fn parse_schema(input: &str) -> Result<Schema, ParseError> {
         .next()
         .expect("Rule::schema always yields exactly one pair");
 
-    let mut schema = Schema::default();
-    schema.source = Some(input.to_string());
+    let mut schema = Schema {
+        source: Some(input.to_string()),
+        ..Schema::default()
+    };
 
     for inner in schema_pair.into_inner() {
         match inner.as_rule() {
@@ -469,11 +471,11 @@ fn parse_extractor_def(pair: Pair<'_, Rule>) -> Result<ExtractorDef, ParseError>
             Rule::extractor_feature_extraction_field => {
                 let token = child
                     .into_inner()
-                    .find(|p| {
-                        matches!(p.as_rule(), Rule::kw_builtin | Rule::identifier)
-                    })
+                    .find(|p| matches!(p.as_rule(), Rule::kw_builtin | Rule::identifier))
                     .expect("feature_extraction field has identifier|builtin");
-                fields.push(ExtractorField::FeatureExtraction(token.as_str().to_string()));
+                fields.push(ExtractorField::FeatureExtraction(
+                    token.as_str().to_string(),
+                ));
             }
             Rule::extractor_prompt_field => {
                 let p = child
@@ -523,7 +525,7 @@ fn parse_extractor_def(pair: Pair<'_, Rule>) -> Result<ExtractorDef, ParseError>
                     .expect("confidence field has number_literal");
                 let lc = n.line_col();
                 fields.push(ExtractorField::Confidence(
-                    parse_number_literal(n, lc)? as f32,
+                    parse_number_literal(n, lc)? as f32
                 ));
             }
             Rule::extractor_confidence_threshold_field => {
@@ -659,8 +661,7 @@ fn parse_condition_expr(pair: Pair<'_, Rule>) -> Result<ConditionExpr, ParseErro
         .next()
         .expect("condition_expr always has at least one atom");
     let mut left = parse_condition_atom(first)?;
-    loop {
-        let Some(op_pair) = iter.next() else { break };
+    while let Some(op_pair) = iter.next() {
         let op = op_pair.as_str();
         let right_pair = iter
             .next()
@@ -1065,8 +1066,14 @@ mod tests {
             ExtractorTarget::Entity { ref entity_type } if entity_type == "Person"
         ));
         // patterns and confidence preserved in source order.
-        let has_patterns = e.fields.iter().any(|f| matches!(f, ExtractorField::Patterns(p) if !p.is_empty()));
-        let has_conf = e.fields.iter().any(|f| matches!(f, ExtractorField::Confidence(_)));
+        let has_patterns = e
+            .fields
+            .iter()
+            .any(|f| matches!(f, ExtractorField::Patterns(p) if !p.is_empty()));
+        let has_conf = e
+            .fields
+            .iter()
+            .any(|f| matches!(f, ExtractorField::Confidence(_)));
         assert!(has_patterns);
         assert!(has_conf);
     }
@@ -1101,9 +1108,17 @@ mod tests {
                 kind: StatementKindAst::Preference
             }
         ));
-        assert!(e.fields.iter().any(|f| matches!(f, ExtractorField::Prompt(p) if p.contains("Extract user preferences."))));
-        assert!(e.fields.iter().any(|f| matches!(f, ExtractorField::Examples(_))));
-        assert!(e.fields.iter().any(|f| matches!(f, ExtractorField::Schema(_))));
+        assert!(e.fields.iter().any(
+            |f| matches!(f, ExtractorField::Prompt(p) if p.contains("Extract user preferences."))
+        ));
+        assert!(e
+            .fields
+            .iter()
+            .any(|f| matches!(f, ExtractorField::Examples(_))));
+        assert!(e
+            .fields
+            .iter()
+            .any(|f| matches!(f, ExtractorField::Schema(_))));
         assert!(e.fields.iter().any(|f| matches!(f, ExtractorField::CacheTtl(d) if d.amount == 24 && d.unit == DurationUnit::Hours)));
         assert!(e.fields.iter().any(|f| matches!(f, ExtractorField::CostBudget(c) if (c.amount - 0.10).abs() < 1e-9 && c.unit == CostUnit::PerMemory)));
     }

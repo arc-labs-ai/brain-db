@@ -1,35 +1,37 @@
 //! RECALL handler.
 //!
-//! Routing (spec §28/08 §5):
+//! Hybrid retrieval (semantic + lexical + graph fused via RRF) is
+//! the default for every deployment. A schema upload no longer
+//! gates retrieval — it only narrows what STATEMENT_CREATE /
+//! RELATION_CREATE / predicate filters accept. RECALL routing
+//! looks at two inputs:
 //!
-//! - When the per-shard [`SchemaGate`] is `true` and no txn is
-//!   attached, route through the hybrid query engine
-//!   (phase 23.6–23.7). Memory hits are projected back onto the
-//!   substrate's `MemoryResult` with `contributing_retrievers` and
-//!   `fused_score` populated.
-//! - Otherwise (no schema, or a transaction is in progress), run the
-//!   substrate vector recall and leave the new fields empty / zero.
+//! 1. The wire `RecallStrategy` — `Auto` (default), `HybridOnly`,
+//!    or `SubstrateOnly`. Clients pick the escape hatch when
+//!    they need raw HNSW latency or want the hybrid path to fail
+//!    loud rather than silently degrade.
+//! 2. Whether a txn is attached. Transactional read-your-writes
+//!    only works on the substrate path (the hybrid retrievers
+//!    don't see the per-txn buffer), so a txn forces the
+//!    substrate route regardless of strategy.
 //!
-//! Transactional read-your-writes only applies on the substrate path
-//! (spec §09/08 §5). The hybrid path falls back to substrate when a
-//! txn is set; full hybrid-in-txn semantics are deferred past v1.
-//!
-//! Substrate path notes (originally sub-task 7.4 + 7.9): plan +
-//! execute against committed state, layer the txn buffer on top for
-//! read-your-writes, sort, filter, truncate.
+//! Substrate path: plan + execute against committed state, layer
+//! the txn buffer on top for read-your-writes, sort, filter,
+//! truncate.
 
 use std::collections::HashSet;
 
 use brain_core::{ContextId, MemoryId};
 use brain_index::RankedItemId;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
+use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_planner::knowledge::executor::{
     execute as hybrid_execute, ExecutionError, HybridExecutorContext, QueryResult,
 };
 use brain_planner::knowledge::planner::{plan as hybrid_plan, PlanError};
 use brain_planner::knowledge::router::{QueryRequest as PlannerQueryRequest, RetrieverSelection};
 use brain_planner::{execute_recall, plan_recall_inner, RecallHit};
-use brain_protocol::request::{MemoryKindWire, RecallRequest};
+use brain_protocol::request::{MemoryKindWire, RecallRequest, RecallStrategy};
 use brain_protocol::response::{MemoryResult, RecallResponseFrame};
 use brain_protocol::responses::types::RetrieverNameWire;
 
@@ -41,21 +43,48 @@ pub async fn handle_recall(
     req: RecallRequest,
     ctx: &OpsContext,
 ) -> Result<RecallResponseFrame, OpError> {
-    if ctx.schema_gate.is_declared() && req.txn_id.is_none() {
-        match hybrid_recall(&req, ctx).await {
-            Ok(HybridRecallOutcome::Frame(frame)) => return Ok(frame),
+    let strategy = req.strategy.unwrap_or_default();
+
+    // Txn always forces substrate so read-your-writes works
+    // against the buffered ops. HybridOnly inside a txn is a
+    // contradiction the client can't satisfy; fail loud with a
+    // typed error rather than silently route to substrate.
+    if req.txn_id.is_some() {
+        if matches!(strategy, RecallStrategy::HybridOnly) {
+            return Err(OpError::HybridUnavailable(
+                "HybridOnly is incompatible with a transactional recall (txn requires substrate for read-your-writes)".into(),
+            ));
+        }
+        return substrate_recall(req, ctx).await;
+    }
+
+    match strategy {
+        RecallStrategy::SubstrateOnly => substrate_recall(req, ctx).await,
+        RecallStrategy::HybridOnly => {
+            // Caller wants hybrid or nothing. If a retriever slot
+            // is empty surface HybridUnavailable; never fall
+            // back to substrate.
+            match hybrid_recall(&req, ctx).await {
+                Ok(HybridRecallOutcome::Frame(frame)) => Ok(frame),
+                Ok(HybridRecallOutcome::FallbackToSubstrate { retriever }) => Err(
+                    OpError::HybridUnavailable(format!("retriever slot empty for {retriever:?}",)),
+                ),
+                Err(e) => Err(e),
+            }
+        }
+        RecallStrategy::Auto => match hybrid_recall(&req, ctx).await {
+            Ok(HybridRecallOutcome::Frame(frame)) => Ok(frame),
             Ok(HybridRecallOutcome::FallbackToSubstrate { retriever }) => {
                 tracing::warn!(
                     target: "brain_ops::recall",
                     ?retriever,
                     "hybrid recall fell back to substrate (retriever slot empty)",
                 );
-                // Fall through to substrate path.
+                substrate_recall(req, ctx).await
             }
-            Err(e) => return Err(e),
-        }
+            Err(e) => Err(e),
+        },
     }
-    substrate_recall(req, ctx).await
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +217,19 @@ fn merge_with_txn(
             salience: pending.salience_initial,
             created_at_unix_nanos: pending.created_at_unix_nanos,
             text: None,
+            // Pending (buffered) memories — no committed metadata
+            // yet, so decay/access/flags are all defaults.
+            salience_initial: pending.salience_initial,
+            access_count: 0,
+            flags: 0,
+            consolidated_at_unix_nanos: None,
+            edges_out_count: 0,
+            edges_in_count: 0,
+            last_accessed_at_unix_nanos: pending.created_at_unix_nanos,
+            // Buffered ops haven't been WAL'd yet — they get an LSN
+            // at TXN_COMMIT. Recall inside a txn sees them with
+            // encoded_at_lsn=0 (unknown until commit).
+            encoded_at_lsn: 0,
         });
     }
 
@@ -221,13 +263,24 @@ fn hit_to_wire(hit: RecallHit) -> MemoryResult {
         kind: hit.kind.into(),
         context_id: hit.context_id.into(),
         created_at_unix_nanos: hit.created_at_unix_nanos,
-        last_accessed_at_unix_nanos: hit.created_at_unix_nanos,
+        last_accessed_at_unix_nanos: hit.last_accessed_at_unix_nanos,
         vector_offset: 0,
         vector_dim: 0,
         edges: None,
         // Substrate path — no hybrid metadata.
         contributing_retrievers: Vec::new(),
         fused_score: 0.0,
+        salience_initial: hit.salience_initial,
+        access_count: hit.access_count,
+        // WAL position the row was originally encoded at. Stamped
+        // by the live writer (and recovery, on replay) onto
+        // `MemoryMetadata.encoded_at_lsn`. Clients chain
+        // `recall → subscribe --start-lsn lsn+1` off this.
+        lsn: hit.encoded_at_lsn,
+        flags: hit.flags,
+        consolidated_at_unix_nanos: hit.consolidated_at_unix_nanos,
+        edges_out_count: hit.edges_out_count,
+        edges_in_count: hit.edges_in_count,
     }
 }
 
@@ -334,6 +387,23 @@ fn project_memory_results(
     let table = rtxn
         .open_table(MEMORIES_TABLE)
         .map_err(|e| OpError::Internal(format!("hybrid recall open MEMORIES_TABLE: {e}")))?;
+    // Opening the texts table costs a redb seek; only do it when the
+    // caller asked for text, so the common ids-only path stays cheap.
+    // A shard that hasn't received an encode yet won't have a texts
+    // table — treat that as "no texts available" rather than 500.
+    let texts_table = if req.include_text {
+        match rtxn.open_table(TEXTS_TABLE) {
+            Ok(t) => Some(t),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => {
+                return Err(OpError::Internal(format!(
+                    "hybrid recall open TEXTS_TABLE: {e}"
+                )));
+            }
+        }
+    } else {
+        None
+    };
 
     let mut out: Vec<MemoryResult> = Vec::with_capacity(result.items.len());
     for fused in &result.items {
@@ -379,9 +449,29 @@ fn project_memory_results(
             }
         }
 
+        let text = if let Some(texts) = texts_table.as_ref() {
+            match texts.get(&memory_id.to_be_bytes()) {
+                Ok(Some(guard)) => std::str::from_utf8(guard.value())
+                    .map(str::to_owned)
+                    .map_err(|e| {
+                        OpError::Internal(format!(
+                            "hybrid recall TEXTS_TABLE non-UTF-8 for {memory_id:?}: {e}",
+                        ))
+                    })?,
+                Ok(None) => String::new(),
+                Err(e) => {
+                    return Err(OpError::Internal(format!(
+                        "hybrid recall TEXTS_TABLE get: {e}",
+                    )));
+                }
+            }
+        } else {
+            String::new()
+        };
+
         out.push(MemoryResult {
             memory_id: memory_id.raw(),
-            text: String::new(),
+            text,
             similarity_score: fused.fused_score as f32,
             confidence: fused.fused_score as f32,
             salience: row.salience,
@@ -398,6 +488,14 @@ fn project_memory_results(
                 .map(|c| retriever_to_wire_name(c.retriever))
                 .collect(),
             fused_score: fused.fused_score as f32,
+            salience_initial: row.salience_initial,
+            access_count: row.access_count,
+            // WAL position the row was originally encoded at.
+            lsn: row.encoded_at_lsn,
+            flags: row.flags,
+            consolidated_at_unix_nanos: row.consolidated_at_unix_nanos,
+            edges_out_count: row.edges_out_count,
+            edges_in_count: row.edges_in_count,
         });
 
         if out.len() == req.top_k as usize {

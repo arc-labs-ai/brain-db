@@ -17,17 +17,15 @@ mod common;
 use brain_protocol::knowledge::{
     EvidenceRefWire, StatementCreateResponse, StatementGetResponse, StatementHistoryRequest,
     StatementHistoryResponseFrame, StatementKindWire, StatementListResponseFrame,
-    StatementObjectWire, StatementRetractResponse, StatementTombstoneResponse,
-    StatementValueWire, StatementView,
+    StatementObjectWire, StatementRetractResponse, StatementTombstoneResponse, StatementValueWire,
+    StatementView,
 };
 use brain_protocol::opcode::Opcode;
 use brain_protocol::responses::error::ErrorResponse;
 use brain_protocol::responses::types::{ErrorCategoryWire, ErrorCodeWire};
 use brain_protocol::{RequestBody, ResponseBody};
 use brain_sdk_rust::knowledge::errors::{ClientErrorStatementExt, StatementErrorKind};
-use brain_sdk_rust::{
-    Client, EntityId, StatementId, StatementKind, TombstoneReason,
-};
+use brain_sdk_rust::{Client, EntityId, StatementId, StatementKind, TombstoneReason};
 
 fn sample_view(id: [u8; 16], predicate: &str, kind: StatementKindWire) -> StatementView {
     StatementView {
@@ -76,7 +74,10 @@ async fn fact_builder_round_trip() {
     let (addr, _server) = common::spawn_mock_server(move |mut socket| async move {
         // 1. STATEMENT_CREATE
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode_u16(), Opcode::StatementCreateReq.as_u16());
+        assert_eq!(
+            frame.header.opcode_u16(),
+            Opcode::StatementCreateReq.as_u16()
+        );
         let body = RequestBody::decode(Opcode::StatementCreateReq, &frame.payload).unwrap();
         match body {
             RequestBody::StatementCreate(r) => {
@@ -146,7 +147,10 @@ async fn preference_builder_auto_supersedes() {
     let (addr, _server) = common::spawn_mock_server(move |mut socket| async move {
         // CREATE → response reports auto_superseded = p1.
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode_u16(), Opcode::StatementCreateReq.as_u16());
+        assert_eq!(
+            frame.header.opcode_u16(),
+            Opcode::StatementCreateReq.as_u16()
+        );
         common::write_frame(
             &mut socket,
             Opcode::StatementCreateResp.as_u16(),
@@ -341,7 +345,11 @@ async fn statements_list_with_filter() {
             Opcode::StatementListResp.as_u16(),
             frame.header.stream_id_u32(),
             ResponseBody::StatementList(StatementListResponseFrame {
-                items: vec![sample_view(sid, "test:prefers", StatementKindWire::Preference)],
+                items: vec![sample_view(
+                    sid,
+                    "test:prefers",
+                    StatementKindWire::Preference,
+                )],
                 next_cursor: Vec::new(),
                 cumulative_count: 1,
                 is_final: true,
@@ -397,7 +405,11 @@ async fn statements_tombstone_returns_timestamp() {
     let client = Client::connect(addr).await.expect("connect");
     let ts = client
         .statements()
-        .tombstone(StatementId::from_bytes([50u8; 16]), TombstoneReason::UserRequest, "test")
+        .tombstone(
+            StatementId::from_bytes([50u8; 16]),
+            TombstoneReason::UserRequest,
+            "test",
+        )
         .await
         .expect("tombstone");
     assert!(ts > 0);
@@ -447,7 +459,10 @@ async fn statements_retract_returns_timestamp() {
 async fn predicate_unknown_surfaces_via_extension_trait() {
     let (addr, _server) = common::spawn_mock_server(move |mut socket| async move {
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode_u16(), Opcode::StatementCreateReq.as_u16());
+        assert_eq!(
+            frame.header.opcode_u16(),
+            Opcode::StatementCreateReq.as_u16()
+        );
         common::write_frame(
             &mut socket,
             Opcode::Error.as_u16(),

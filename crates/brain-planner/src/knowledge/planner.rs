@@ -23,8 +23,8 @@ use brain_index::Direction as GraphDirection;
 use super::filters::FilterChain;
 use super::fusion::DEFAULT_K;
 use super::router::{
-    route, PerRetrieverWeights, QueryRequest, Retriever, RetrieverSelection, RoutingDecision,
-    TimeRange,
+    route, GraphAnchorMode, PerRetrieverWeights, QueryRequest, Retriever, RetrieverSelection,
+    RoutingDecision, TimeRange,
 };
 
 // ---------------------------------------------------------------------------
@@ -53,6 +53,9 @@ const LEXICAL_DEFAULT_BM25_B: f32 = 0.75;
 const GRAPH_DEFAULT_MAX_DEPTH: u8 = 3;
 const GRAPH_DEFAULT_MAX_BRANCHING: u32 = 200;
 const PER_RETRIEVER_TIMEOUT_MS: u32 = 50;
+/// Memory-from-semantic anchor count. Small budget for the
+/// per-anchor walk fan-out so total graph cost stays sub-ms.
+const GRAPH_DEFAULT_MEMORY_ANCHOR_TOP_K: u8 = 3;
 
 // ---------------------------------------------------------------------------
 // Public types.
@@ -105,6 +108,16 @@ pub enum RetrieverConfig {
         relation_types: Option<Vec<RelationTypeId>>,
         include_statements: bool,
         timeout_ms: u32,
+        /// How the executor anchors the walk. Carried through
+        /// from `RoutingDecision::graph_anchor_mode`.
+        anchor_mode: GraphAnchorMode,
+        /// When `anchor_mode == MemoryFromSemantic`, the
+        /// executor walks from this many top semantic hits in
+        /// parallel. Defaults to 3 (mirrors the worked-example
+        /// budget in the Phase A design — small enough to keep
+        /// graph latency under a millisecond, large enough that
+        /// at least one anchor will have rich neighbourhood).
+        anchor_top_k: u8,
     },
 }
 
@@ -164,7 +177,7 @@ pub fn plan(req: &QueryRequest) -> Result<QueryPlan, PlanError> {
             retriever: inv.retriever,
             weight: inv.weight,
             top_n,
-            config: retriever_config_for(inv.retriever, req),
+            config: retriever_config_for(inv.retriever, req, &routing),
             pre_filter: pre_filter_for(req, inv.retriever, &routing),
         })
         .collect();
@@ -189,10 +202,14 @@ pub fn plan(req: &QueryRequest) -> Result<QueryPlan, PlanError> {
 
 fn top_n_for(limit: u32) -> usize {
     let from_limit = (limit as usize).saturating_mul(3);
-    from_limit.max(MIN_TOP_N).min(MAX_TOP_N)
+    from_limit.clamp(MIN_TOP_N, MAX_TOP_N)
 }
 
-fn retriever_config_for(retriever: Retriever, req: &QueryRequest) -> RetrieverConfig {
+fn retriever_config_for(
+    retriever: Retriever,
+    req: &QueryRequest,
+    routing: &RoutingDecision,
+) -> RetrieverConfig {
     let timeout_ms = PER_RETRIEVER_TIMEOUT_MS;
     match retriever {
         Retriever::Semantic => RetrieverConfig::Semantic {
@@ -207,16 +224,28 @@ fn retriever_config_for(retriever: Retriever, req: &QueryRequest) -> RetrieverCo
             timeout_ms,
         },
         Retriever::Graph => {
-            // Direction defaults to Outgoing unless the
-            // request carries one in a future extension.
             let _ = req;
+            // Default Outgoing for entity mode (typed relations
+            // are directional); Both for memory mode (substrate
+            // edges include symmetric SimilarTo / Contradicts).
+            let anchor_mode = routing.graph_anchor_mode.unwrap_or(GraphAnchorMode::Entity);
+            let direction = match anchor_mode {
+                GraphAnchorMode::Entity => GraphDirection::Outgoing,
+                GraphAnchorMode::MemoryFromSemantic => GraphDirection::Both,
+            };
+            // Memory-anchor walks include_statements is moot —
+            // there are no statements on the substrate edge
+            // table. Keep the field for entity mode.
+            let include_statements = matches!(anchor_mode, GraphAnchorMode::Entity);
             RetrieverConfig::Graph {
                 max_depth: GRAPH_DEFAULT_MAX_DEPTH,
                 max_branching: GRAPH_DEFAULT_MAX_BRANCHING,
-                direction: GraphDirection::Outgoing,
+                direction,
                 relation_types: None,
-                include_statements: true,
+                include_statements,
                 timeout_ms,
+                anchor_mode,
+                anchor_top_k: GRAPH_DEFAULT_MEMORY_ANCHOR_TOP_K,
             }
         }
     }

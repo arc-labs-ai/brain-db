@@ -80,10 +80,11 @@ use brain_workers::hnsw_maint::RebuildSource;
 use brain_workers::snapshot::SnapshotSource;
 use brain_workers::wal_retention::WalRetentionSource;
 use brain_workers::{
-    AccessBoostWorker, CacheEvictionWorker, ConsolidationWorker, CounterReconcileWorker,
-    DecayWorker, DisabledCacheEvictionSource, DisabledSummarizer, EdgeScrubWorker,
-    HnswMaintenanceWorker, IdempotencyCleanupWorker, MetricsSnapshot, SlotReclamationWorker,
-    SnapshotWorker, StatisticsUpdateWorker, Summarizer, WalRetentionWorker, WorkerKind,
+    AccessBoostWorker, AutoEdgeKnobs, AutoEdgeWorker, CacheEvictionWorker, ConsolidationWorker,
+    CounterReconcileWorker, DecayWorker, DisabledCacheEvictionSource, DisabledSummarizer,
+    EdgeScrubWorker, ExtractorKnobs, ExtractorWorker, HnswMaintenanceWorker,
+    IdempotencyCleanupWorker, MetricsSnapshot, SlotReclamationWorker, SnapshotWorker,
+    StatisticsUpdateWorker, Summarizer, WalRetentionWorker, WorkerConfig, WorkerKind,
     WorkerScheduler,
 };
 
@@ -107,8 +108,15 @@ pub(crate) enum ShardRequest {
     /// Dispatch a wire `RequestBody` through `brain_ops::dispatch` and
     /// return the resulting `ResponseBody`. Added in 9.10 — the
     /// frame-dispatcher's primary boundary primitive.
+    ///
+    /// `caller` carries the authenticated agent from the
+    /// connection's `ConnPhase::Established.agent`. The shard
+    /// passes it to `brain_ops::dispatch`, which stamps it onto
+    /// the per-request `ExecutorContext` so the writer-built Ops
+    /// know who they belong to.
     DispatchOp {
         req: Box<RequestBody>,
+        caller: brain_ops::RequestCaller,
         reply_tx: Sender<Result<ResponseBody, OpError>>,
     },
     /// Append a pre-built record to the WAL. Returns the durable LSN.
@@ -153,6 +161,27 @@ pub(crate) enum ShardRequest {
         action: WorkerAction,
         reply_tx: Sender<bool>,
     },
+    /// `EXTRACT_BACKFILL`: enqueue existing memories onto the
+    /// per-shard ExtractorWorker channel for re-extraction. Used by
+    /// `brain-cli extract --backfill` after a fresh schema upload or
+    /// after enabling the worker on a populated shard.
+    ExtractBackfill {
+        selector: brain_protocol::requests::admin::BackfillSelector,
+        reply_tx: Sender<Result<ExtractBackfillReport, String>>,
+    },
+}
+
+/// Per-shard counts surfaced by [`ShardRequest::ExtractBackfill`]. The
+/// admin handler sums these across every shard before replying to the
+/// CLI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExtractBackfillReport {
+    /// Memories the handler successfully pushed onto the queue.
+    pub enqueued: u64,
+    /// Memories considered but not enqueued — channel full, missing
+    /// text row, tombstoned, or (for `Memory(id)`) not found on this
+    /// shard.
+    pub skipped: u64,
 }
 
 /// F-13 action verbs for [`ShardRequest::WorkerControl`].
@@ -230,6 +259,66 @@ pub struct ShardSpawnConfig {
     /// keep working. `main.rs::linux_main::run` injects an LLM-backed
     /// impl when `cfg.summarizer.backend != Disabled`.
     pub summarizer: Arc<dyn Summarizer>,
+    /// Phase B: per-shard auto-edge worker knobs. Defaults registered
+    /// every shard with a 100 ms tick, top_k=5, threshold=0.85,
+    /// channel cap 1024. Set `enabled=false` to skip registration
+    /// entirely (no worker, no channel, encodes see a `None` sender).
+    pub auto_edge: AutoEdgeSpawnConfig,
+    /// Phase E: per-shard extractor pipeline knobs. Same shape as
+    /// `auto_edge` — `enabled=false` skips registration entirely.
+    pub extractor: ExtractorSpawnConfig,
+}
+
+/// Knobs ferried from `Config.workers.auto_edge` into the spawn path.
+/// Lives here (vs. server::config) so the shard crate doesn't have to
+/// depend on the parent server crate's TOML wrapper.
+#[derive(Clone, Debug)]
+pub struct AutoEdgeSpawnConfig {
+    pub enabled: bool,
+    pub interval_ms: u64,
+    pub batch_size: usize,
+    pub similarity_threshold: f32,
+    pub top_k: usize,
+    pub ef_search: usize,
+    pub channel_capacity: usize,
+}
+
+impl Default for AutoEdgeSpawnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_ms: 100,
+            batch_size: 256,
+            similarity_threshold: 0.85,
+            top_k: 5,
+            ef_search: 64,
+            channel_capacity: 1024,
+        }
+    }
+}
+
+/// Knobs ferried from `Config.workers.extractor` into the spawn path.
+#[derive(Clone, Debug)]
+pub struct ExtractorSpawnConfig {
+    pub enabled: bool,
+    pub interval_ms: u64,
+    pub drain_per_cycle: usize,
+    pub llm_budget_per_cycle_micro_usd: u64,
+    pub channel_capacity: usize,
+    pub skip_already_extracted: bool,
+}
+
+impl Default for ExtractorSpawnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_ms: 1000,
+            drain_per_cycle: 32,
+            llm_budget_per_cycle_micro_usd: 50_000,
+            channel_capacity: 1024,
+            skip_already_extracted: true,
+        }
+    }
 }
 
 impl ShardSpawnConfig {
@@ -243,6 +332,8 @@ impl ShardSpawnConfig {
             arena_initial_capacity_slots: DEFAULT_INITIAL_CAPACITY_SLOTS,
             wal_config: WalConfig::default(),
             summarizer: Arc::new(DisabledSummarizer),
+            auto_edge: AutoEdgeSpawnConfig::default(),
+            extractor: ExtractorSpawnConfig::default(),
         }
     }
 }
@@ -337,6 +428,23 @@ pub struct ShardHandle {
     /// observe events via a connection-side `tokio::sync::broadcast`
     /// bridge fed from this Receiver.
     events: Receiver<EventEnvelope>,
+    /// Absolute path to this shard's WAL directory. Surfaced so the
+    /// connection layer's subscribe-replay path (`run_subscription_task`'s
+    /// replay prologue) can open a [`brain_storage::wal::reader::WalReader`]
+    /// without round-tripping through the executor for every read.
+    wal_dir: std::path::PathBuf,
+    /// Shard UUID — required to validate WAL segment headers during
+    /// subscribe-replay. Same value that's stamped in every WAL
+    /// segment + arena slot.
+    shard_uuid: [u8; 16],
+    /// Phase B metrics shared with the writer + AutoEdgeWorker for
+    /// this shard. `None` when the worker is disabled in spawn
+    /// config. The `/metrics` exposition reads this directly (no
+    /// channel hop — the atomics are `Send + Sync` and the handle
+    /// itself is shared by `Arc`).
+    auto_edge_metrics: Option<Arc<brain_ops::AutoEdgeMetrics>>,
+    /// Phase E metrics. Same shape as [`Self::auto_edge_metrics`].
+    extractor_metrics: Option<Arc<brain_ops::ExtractorMetrics>>,
 }
 
 impl ShardHandle {
@@ -345,12 +453,41 @@ impl ShardHandle {
         self.shard_id
     }
 
+    /// Read-only handle to the Phase B (AutoEdgeWorker) metric
+    /// state for this shard. `None` when the worker was disabled in
+    /// spawn config (substrate-only deployments / tests).
+    #[must_use]
+    pub fn auto_edge_metrics(&self) -> Option<Arc<brain_ops::AutoEdgeMetrics>> {
+        self.auto_edge_metrics.clone()
+    }
+
+    /// Read-only handle to the Phase E (ExtractorWorker) metric
+    /// state for this shard.
+    #[must_use]
+    pub fn extractor_metrics(&self) -> Option<Arc<brain_ops::ExtractorMetrics>> {
+        self.extractor_metrics.clone()
+    }
+
     /// Per-shard event feed. Cloning the Receiver shares the underlying
     /// queue (flume Receivers are SPMC-safe); the connection layer
     /// typically clones once and bridges into a tokio `broadcast`.
     #[must_use]
     pub fn events(&self) -> Receiver<EventEnvelope> {
         self.events.clone()
+    }
+
+    /// Absolute path to this shard's WAL directory. The connection
+    /// layer's subscribe-replay opens a [`brain_storage::wal::reader::WalReader`]
+    /// from this path to project records into events.
+    #[must_use]
+    pub fn wal_dir(&self) -> std::path::PathBuf {
+        self.wal_dir.clone()
+    }
+
+    /// Shard UUID — used by the WAL reader to validate segment headers.
+    #[must_use]
+    pub fn shard_uuid(&self) -> [u8; 16] {
+        self.shard_uuid
     }
 
     /// Round-trip Ping. Returns once the shard has replied.
@@ -497,6 +634,32 @@ impl ShardHandle {
             .map_err(|_| ShardError::ShardDisconnected)
     }
 
+    /// Enqueue existing memories on this shard for re-extraction.
+    /// Spec §22/05 §4 (extractor backfill). Returns the count of
+    /// memories successfully pushed onto the per-shard ExtractorWorker
+    /// channel along with the count that were considered but skipped
+    /// (channel full, missing text row, tombstoned, not found).
+    ///
+    /// `Ok((0, 0))` for a `Memory(id)` selector whose id isn't on this
+    /// shard is the contract — the admin handler fans the call out to
+    /// every shard, and only the shard that owns the id will report a
+    /// hit.
+    pub async fn extract_backfill(
+        &self,
+        selector: brain_protocol::requests::admin::BackfillSelector,
+    ) -> Result<ExtractBackfillReport, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::ExtractBackfill { selector, reply_tx })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?
+            .map_err(ShardError::Snapshot)
+    }
+
     /// Trigger an immediate full HNSW rebuild. Returns the new
     /// entry count + elapsed time. Spec §14/06 §4; sub-task 10.10.
     pub async fn rebuild_hnsw(&self) -> Result<RebuildReport, ShardError> {
@@ -516,11 +679,23 @@ impl ShardHandle {
     /// `OpsContext`. Returns the wire `ResponseBody` (variant chosen by
     /// `brain_ops::dispatch`). Added in 9.10 as the frame-dispatcher's
     /// boundary primitive.
-    pub async fn dispatch_op(&self, req: RequestBody) -> Result<ResponseBody, DispatchError> {
+    ///
+    /// `caller` carries the authenticated agent from the
+    /// connection's `ConnPhase::Established.agent`. The shard
+    /// passes it through to `brain_ops::dispatch`, which stamps it
+    /// onto the per-request `ExecutorContext` so the writer-built
+    /// Ops know who they belong to — closing the multi-tenant leak
+    /// on shared shards.
+    pub async fn dispatch_op(
+        &self,
+        req: RequestBody,
+        caller: brain_ops::RequestCaller,
+    ) -> Result<ResponseBody, DispatchError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.tx
             .send_async(ShardRequest::DispatchOp {
                 req: Box::new(req),
+                caller,
                 reply_tx,
             })
             .await
@@ -794,6 +969,27 @@ pub fn spawn_shard(
     };
     let wal_config = cfg.wal_config;
     let summarizer = cfg.summarizer;
+    let auto_edge_spawn_cfg_for_closure = cfg.auto_edge.clone();
+    let extractor_spawn_cfg_for_closure = cfg.extractor.clone();
+    // Construct the Phase B / Phase E metric handles up-front so we
+    // can both stash them on `ShardHandle` (for /metrics exposition)
+    // and inject them into the writer + worker (so both sides bump
+    // the same atomics). `None` when the worker is disabled in
+    // spawn config — exposition simply skips that family.
+    let auto_edge_metrics_for_handle: Option<Arc<brain_ops::AutoEdgeMetrics>> =
+        if cfg.auto_edge.enabled {
+            Some(Arc::new(brain_ops::AutoEdgeMetrics::new()))
+        } else {
+            None
+        };
+    let extractor_metrics_for_handle: Option<Arc<brain_ops::ExtractorMetrics>> =
+        if cfg.extractor.enabled {
+            Some(Arc::new(brain_ops::ExtractorMetrics::new()))
+        } else {
+            None
+        };
+    let auto_edge_metrics_for_closure = auto_edge_metrics_for_handle.clone();
+    let extractor_metrics_for_closure = extractor_metrics_for_handle.clone();
     let wal_dir_for_executor = wal_dir.clone();
     let arena_path_for_executor = arena_path.clone();
     let metadata_path_for_executor = metadata_path.clone();
@@ -830,9 +1026,81 @@ pub fn spawn_shard(
                 );
                 Some(Arc::new(retriever))
             };
-            // Per-shard writer wraps metadata + hnsw_writer.
-            let writer: Arc<dyn WriterHandle> =
-                Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
+            // Per-shard writer wraps metadata + hnsw_writer. The
+            // shard_id stamp on `reserve_memory_id` is required —
+            // without it every MemoryId claims shard 0, and
+            // dispatch::shard_for_memory routes LINK / UNLINK /
+            // FORGET to shard 0 regardless of where the row lives.
+            //
+            // The shared `event_bus` is also handed to OpsContext
+            // below so the writer's commit-time publishes land on
+            // the same bus the SubscriptionRegistry listens on —
+            // without this link, SUBSCRIBE clients silently see
+            // zero events.
+            let event_bus = Arc::new(brain_ops::subscribe::EventBus::default());
+            // Wire the WAL sink. The sender lives on the writer
+            // (Send + Sync), the receiver is drained by a Glommio-
+            // local task spawned after the Wal is open (see "WAL
+            // drain task" below). Without this link the writer
+            // silently falls back to the legacy bus-stamped-LSN
+            // path and subscribe --start-lsn finds an empty log.
+            let (wal_sink, wal_drain_rx) = brain_ops::ops::writer::channel_wal_sink();
+            let wal_sink_for_ops: Arc<dyn brain_ops::ops::writer::WalSink> = wal_sink.clone();
+
+            // Phase B: per-shard AutoEdgeWorker channel. The sender
+            // lives on the writer; the worker (registered below in
+            // register_phase8_workers) drains the receiver every
+            // `interval_ms`. We construct the channel here so the
+            // writer can be stamped before being wrapped in
+            // `Arc<dyn WriterHandle>` (the trait surface intentionally
+            // doesn't expose the sender setter).
+            let auto_edge_spawn_cfg = auto_edge_spawn_cfg_for_closure.clone();
+            let auto_edge_channel = if auto_edge_spawn_cfg.enabled {
+                Some(flume::bounded::<brain_ops::AutoEdgeEnqueue>(
+                    auto_edge_spawn_cfg.channel_capacity.max(1),
+                ))
+            } else {
+                None
+            };
+            let (auto_edge_sender, auto_edge_receiver) = match &auto_edge_channel {
+                Some((tx, rx)) => (Some(tx.clone()), Some(rx.clone())),
+                None => (None, None),
+            };
+
+            // Phase E: per-shard ExtractorWorker channel. Same shape
+            // as auto-edge — disabled means no channel, no worker, no
+            // overhead. The writer stores the Sender; the Receiver
+            // moves into the worker we register below.
+            let extractor_spawn_cfg = extractor_spawn_cfg_for_closure.clone();
+            let extractor_channel = if extractor_spawn_cfg.enabled {
+                Some(flume::bounded::<brain_ops::ExtractorEnqueue>(
+                    extractor_spawn_cfg.channel_capacity.max(1),
+                ))
+            } else {
+                None
+            };
+            let (extractor_sender, extractor_receiver) = match &extractor_channel {
+                Some((tx, rx)) => (Some(tx.clone()), Some(rx.clone())),
+                None => (None, None),
+            };
+
+            let mut real_writer = RealWriterHandle::new(metadata.clone(), hnsw_writer)
+                .with_shard_id(shard_id)
+                .with_event_bus(event_bus.clone())
+                .with_wal_sink(wal_sink);
+            if let Some(tx) = auto_edge_sender {
+                real_writer.set_auto_edge_sender(tx);
+            }
+            if let Some(tx) = extractor_sender {
+                real_writer.set_extractor_sender(tx);
+            }
+            if let Some(m) = auto_edge_metrics_for_closure.clone() {
+                real_writer.set_auto_edge_metrics(m);
+            }
+            if let Some(m) = extractor_metrics_for_closure.clone() {
+                real_writer.set_extractor_metrics(m);
+            }
+            let writer: Arc<dyn WriterHandle> = Arc::new(real_writer);
             let executor_ctx =
                 ExecutorContext::new(dispatcher, hnsw_shared.clone(), metadata.clone(), writer);
 
@@ -861,7 +1129,7 @@ pub fn spawn_shard(
                     let db_guard = metadata.lock();
                     match crate::shard::tantivy_recovery::recover_tantivy_on_open(
                         &shard_dir_for_executor,
-                        &*db_guard,
+                        &db_guard,
                         startup,
                     ) {
                         Ok(shard) => Some(shard),
@@ -1008,6 +1276,7 @@ pub fn spawn_shard(
 
             let ops = Arc::new(
                 OpsContext::new(executor_ctx)
+                    .with_event_bus(event_bus.clone())
                     .with_extractor_registry(extractor_registry)
                     .with_classifier_config(classifier_config)
                     .with_llm_cache(llm_cache_for_ops)
@@ -1017,7 +1286,8 @@ pub fn spawn_shard(
                     .with_lexical_retriever(lexical_retriever_for_ops)
                     .with_semantic_retriever(semantic_retriever_for_ops)
                     .with_graph_retriever(graph_retriever_for_ops)
-                    .with_schema_gate(schema_gate),
+                    .with_schema_gate(schema_gate)
+                    .with_wal_sink(Some(wal_sink_for_ops)),
             );
 
             // Spawn the per-shard fanout task: drains the in-process
@@ -1075,6 +1345,37 @@ pub fn spawn_shard(
             let arena_cell = Rc::new(RefCell::new(arena));
             let wal_cell = Rc::new(RefCell::new(Some(wal)));
 
+            // WAL drain task: forwards every record the writer's
+            // `ChannelWalSink` enqueues to the real `Wal::append`,
+            // replying with the assigned LSN over the per-call
+            // oneshot. Lives on this executor so it can share the
+            // `Rc<RefCell<Option<Wal>>>` with the main loop's
+            // `AppendWalRecord` handler — both serialise on the
+            // RefCell, and single-threaded scheduling means a
+            // `.await` inside the drain task doesn't conflict with
+            // the main loop's borrow.
+            //
+            // The task ends when the sender (held inside the
+            // writer's `Arc<dyn WalSink>`) is dropped — which happens
+            // at shard shutdown when the `OpsContext` Arc count
+            // hits zero.
+            let wal_cell_for_drain = wal_cell.clone();
+            glommio::spawn_local(async move {
+                while let Ok((record, reply)) = wal_drain_rx.recv_async().await {
+                    let outcome = {
+                        let guard = wal_cell_for_drain.borrow();
+                        match guard.as_ref() {
+                            Some(wal) => wal.append(record).await.map_err(|e| {
+                                brain_ops::ops::writer::WalSinkError::Internal(format!("{e}"))
+                            }),
+                            None => Err(brain_ops::ops::writer::WalSinkError::Disconnected),
+                        }
+                    };
+                    let _ = reply.send(outcome);
+                }
+            })
+            .detach();
+
             // Build real Phase-8 adapters (sub-task 9.8).
             let rebuild_source: Arc<dyn RebuildSource<{ VECTOR_DIM }>> = Arc::new(
                 ArenaRebuildSource::<{ VECTOR_DIM }>::new(shard_id, arena_cell.clone()),
@@ -1114,6 +1415,69 @@ pub fn spawn_shard(
                 summarizer,
             )
             .expect("register Phase-8 workers");
+
+            // Phase B: register the AutoEdgeWorker when the channel was
+            // created above (i.e. when `cfg.auto_edge.enabled` is true).
+            // The worker drains the receiver feeding off post-commit
+            // encodes and writes `SimilarTo` edges back through the
+            // unified edge tables.
+            if let Some(rx) = auto_edge_receiver {
+                let worker_cfg = WorkerConfig {
+                    enabled: auto_edge_spawn_cfg.enabled,
+                    interval: std::time::Duration::from_millis(
+                        auto_edge_spawn_cfg.interval_ms.max(1),
+                    ),
+                    batch_size: auto_edge_spawn_cfg.batch_size,
+                    max_runtime: std::time::Duration::from_secs(5),
+                };
+                let knobs = AutoEdgeKnobs {
+                    top_k: auto_edge_spawn_cfg.top_k,
+                    similarity_threshold: auto_edge_spawn_cfg.similarity_threshold,
+                    ef_search: Some(auto_edge_spawn_cfg.ef_search),
+                };
+                let mut auto_edge_worker = AutoEdgeWorker::new(rx)
+                    .with_config(worker_cfg)
+                    .with_knobs(knobs);
+                if let Some(m) = auto_edge_metrics_for_closure.clone() {
+                    auto_edge_worker = auto_edge_worker.with_metrics(m);
+                }
+                scheduler
+                    .register(Arc::new(auto_edge_worker), ops.clone())
+                    .expect("register AutoEdgeWorker");
+            }
+
+            // Phase E: register the ExtractorWorker when its channel was
+            // created above (i.e. when `cfg.extractor.enabled` is true).
+            // The worker drains the writer's post-encode channel and
+            // runs the three-tier extractor pipeline against each
+            // memory's text, writing entities / statements / relations /
+            // mention edges through brain-metadata.
+            if let Some(rx) = extractor_receiver {
+                let worker_cfg = WorkerConfig {
+                    enabled: extractor_spawn_cfg.enabled,
+                    interval: std::time::Duration::from_millis(
+                        extractor_spawn_cfg.interval_ms.max(1),
+                    ),
+                    batch_size: extractor_spawn_cfg.drain_per_cycle,
+                    max_runtime: std::time::Duration::from_secs(5),
+                };
+                let knobs = ExtractorKnobs {
+                    drain_per_cycle: extractor_spawn_cfg.drain_per_cycle,
+                    llm_budget_per_cycle_micro_usd: extractor_spawn_cfg
+                        .llm_budget_per_cycle_micro_usd,
+                    skip_already_extracted: extractor_spawn_cfg.skip_already_extracted,
+                };
+                let mut extractor_worker = ExtractorWorker::new(rx)
+                    .with_config(worker_cfg)
+                    .with_knobs(knobs);
+                if let Some(m) = extractor_metrics_for_closure.clone() {
+                    extractor_worker = extractor_worker.with_metrics(m);
+                }
+                scheduler
+                    .register(Arc::new(extractor_worker), ops.clone())
+                    .expect("register ExtractorWorker");
+            }
+
             info!(
                 shard_id,
                 workers = scheduler.len(),
@@ -1138,6 +1502,10 @@ pub fn spawn_shard(
         shard_id,
         tx,
         events: events_rx,
+        wal_dir: wal_dir.clone(),
+        shard_uuid,
+        auto_edge_metrics: auto_edge_metrics_for_handle,
+        extractor_metrics: extractor_metrics_for_handle,
     };
     let joiner = ShardJoiner {
         shard_id,
@@ -1275,6 +1643,15 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     );
                 }
             }
+            ShardRequest::ExtractBackfill { selector, reply_tx } => {
+                let out = run_extract_backfill(&shard, selector);
+                if reply_tx.send_async(out).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "ExtractBackfill reply dropped (caller gone)"
+                    );
+                }
+            }
             ShardRequest::RebuildHnsw { reply_tx } => {
                 let start = std::time::Instant::now();
                 let result = match shard.rebuild_source.snapshot_vectors().await {
@@ -1301,7 +1678,11 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     );
                 }
             }
-            ShardRequest::DispatchOp { req, reply_tx } => {
+            ShardRequest::DispatchOp {
+                req,
+                caller,
+                reply_tx,
+            } => {
                 // `brain_ops::dispatch` is async and runs entirely
                 // within the per-shard Glommio executor: it touches
                 // `OpsContext` (which is !Send post-9.7a) and yields
@@ -1309,7 +1690,7 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                 // the main loop is single-threaded and processes one
                 // request at a time, the same shape as
                 // `AppendWalRecord`.
-                let out = brain_ops::dispatch::dispatch(*req, &shard.ops).await;
+                let out = brain_ops::dispatch::dispatch(*req, caller, &shard.ops).await;
                 if reply_tx.send_async(out).await.is_err() {
                     warn!(
                         shard_id = shard.shard_id,
@@ -1394,6 +1775,122 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
         shard_id = shard.shard_id,
         "shard main loop exiting (channel closed)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Extract-backfill helper
+// ---------------------------------------------------------------------------
+
+/// Walk the per-shard `memories` + `texts` redb tables and push each
+/// matching memory onto the `WriterHandle`'s extractor channel. Runs
+/// inside the shard executor; the metadata read txn is short-lived and
+/// dropped before each enqueue so the writer can take a separate
+/// `try_send`. No `.await` points — the whole sweep is synchronous
+/// against redb + the bounded flume queue.
+fn run_extract_backfill(
+    shard: &Shard,
+    selector: brain_protocol::requests::admin::BackfillSelector,
+) -> Result<ExtractBackfillReport, String> {
+    use brain_core::MemoryId;
+    use brain_metadata::tables::memory::MEMORIES_TABLE;
+    use brain_metadata::tables::text::TEXTS_TABLE;
+    use brain_protocol::requests::admin::BackfillSelector;
+    use redb::ReadableTable;
+
+    let mut report = ExtractBackfillReport::default();
+    let metadata = shard.ops.executor.metadata.clone();
+    let writer = shard.ops.executor.writer.clone();
+
+    let db = metadata.lock();
+    let rtxn = db
+        .read_txn()
+        .map_err(|e| format!("extract_backfill read_txn: {e}"))?;
+    let memories = rtxn
+        .open_table(MEMORIES_TABLE)
+        .map_err(|e| format!("open MEMORIES: {e}"))?;
+    let texts = rtxn
+        .open_table(TEXTS_TABLE)
+        .map_err(|e| format!("open TEXTS: {e}"))?;
+
+    // Closure: try to enqueue one memory by its 16-byte id.
+    let mut try_one = |key: [u8; 16]| -> Result<(), String> {
+        let Some(meta_guard) = memories
+            .get(&key)
+            .map_err(|e| format!("memories.get: {e}"))?
+        else {
+            // For `Memory(id)` callers we already know the id; for the
+            // table-scan path this never fires (we got the key from the
+            // iter). Count as skipped either way.
+            report.skipped = report.skipped.saturating_add(1);
+            return Ok(());
+        };
+        let row = meta_guard.value();
+        if !row.is_active() || row.is_hard_forgotten() {
+            report.skipped = report.skipped.saturating_add(1);
+            return Ok(());
+        }
+        let text_guard = texts.get(&key).map_err(|e| format!("texts.get: {e}"))?;
+        let Some(text_guard) = text_guard else {
+            report.skipped = report.skipped.saturating_add(1);
+            return Ok(());
+        };
+        let bytes = text_guard.value();
+        let text = match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_owned(),
+            Err(_) => {
+                report.skipped = report.skipped.saturating_add(1);
+                return Ok(());
+            }
+        };
+        let memory_id = MemoryId::from_be_bytes(key);
+        if writer.enqueue_for_extraction(memory_id, &text) {
+            report.enqueued = report.enqueued.saturating_add(1);
+        } else {
+            report.skipped = report.skipped.saturating_add(1);
+        }
+        Ok(())
+    };
+
+    match selector {
+        BackfillSelector::Memory(wire_id) => {
+            let memory_id: MemoryId = wire_id.into();
+            // Cheap shard-belongs check: skip without error when the id
+            // routes elsewhere. The admin handler fans out to every
+            // shard; only the owning shard reports a hit.
+            if memory_id.shard() != shard.shard_id {
+                return Ok(report);
+            }
+            try_one(memory_id.to_be_bytes())?;
+        }
+        BackfillSelector::Since { since_unix_nanos } => {
+            let cutoff_nanos = since_unix_nanos;
+            for entry in memories.iter().map_err(|e| format!("memories.iter: {e}"))? {
+                let (k, v) = entry.map_err(|e| format!("memories.entry: {e}"))?;
+                let key = k.value();
+                let row = v.value();
+                if row.created_at_unix_nanos < cutoff_nanos {
+                    continue;
+                }
+                if !row.is_active() || row.is_hard_forgotten() {
+                    continue;
+                }
+                try_one(key)?;
+            }
+        }
+        BackfillSelector::All => {
+            for entry in memories.iter().map_err(|e| format!("memories.iter: {e}"))? {
+                let (k, v) = entry.map_err(|e| format!("memories.entry: {e}"))?;
+                let key = k.value();
+                let row = v.value();
+                if !row.is_active() || row.is_hard_forgotten() {
+                    continue;
+                }
+                try_one(key)?;
+            }
+        }
+    }
+
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------

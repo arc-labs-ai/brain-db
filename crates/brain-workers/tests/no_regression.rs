@@ -89,7 +89,13 @@ async fn encode_one(ctx: &OpsContext, rid: u32, text: &str) {
         txn_id: None,
         deduplicate: false,
     };
-    let _ = dispatch(RequestBody::Encode(req), ctx).await.unwrap();
+    let _ = dispatch(
+        RequestBody::Encode(req),
+        brain_ops::RequestCaller::anonymous(),
+        ctx,
+    )
+    .await
+    .unwrap();
 }
 
 async fn recall_one(ctx: &OpsContext, cue: &str) -> usize {
@@ -103,13 +109,21 @@ async fn recall_one(ctx: &OpsContext, cue: &str) -> usize {
         age_bound_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
-        strategy_hint: None,
+        strategy: None,
         include_vectors: false,
         include_edges: false,
+        include_text: false,
         request_id: None,
         txn_id: None,
     };
-    match dispatch(RequestBody::Recall(req), ctx).await.unwrap() {
+    match dispatch(
+        RequestBody::Recall(req),
+        brain_ops::RequestCaller::anonymous(),
+        ctx,
+    )
+    .await
+    .unwrap()
+    {
         ResponseBody::Recall(r) => r.results.len(),
         _ => 0,
     }

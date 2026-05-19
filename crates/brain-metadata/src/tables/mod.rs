@@ -8,6 +8,8 @@ pub mod agent;
 pub mod checkpoint;
 pub mod context;
 pub mod edge;
+pub mod extractor_audit;
+pub mod fingerprint;
 pub mod idempotency;
 pub mod knowledge;
 pub mod memory;

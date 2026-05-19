@@ -326,7 +326,10 @@ fn apply_to_arena(
         | WalPayload::CheckpointEnd(_)
         | WalPayload::TxnBegin(_)
         | WalPayload::TxnCommit(_)
-        | WalPayload::TxnAbort(_) => Ok(()),
+        | WalPayload::TxnAbort(_)
+        | WalPayload::RelationLink(_)
+        | WalPayload::RelationSupersede(_)
+        | WalPayload::RelationTombstone(_) => Ok(()),
         // Knowledge-layer records: substrate apply-paths ignore these.
         // Phases 16+ hydrate knowledge state via their own sinks. Sub-task 15.2.
         WalPayload::Knowledge(r) => {
@@ -526,6 +529,9 @@ mod tests {
             text: "hello".to_string(),
             vector: vec![0.5; VECTOR_DIM],
             edges: vec![],
+            request_hash: [0; 32],
+            response_payload: vec![],
+            deduplicate: false,
         };
         WalRecord::from_typed(
             Lsn(0),
@@ -541,6 +547,7 @@ mod tests {
         let p = ForgetPayload {
             memory_id,
             request_id: rid(0),
+            agent_id: brain_core::AgentId::default(),
             mode: ForgetMode::Soft,
             reason: ForgetReason::ClientRequest,
         };
@@ -947,7 +954,11 @@ mod tests {
             0,
             1_700_000_000_000_000_002,
             0xBEEF,
-            &WalPayload::Knowledge(KnowledgeRecord::new(kind, body)),
+            &WalPayload::Knowledge(KnowledgeRecord::new(
+                kind,
+                brain_core::AgentId::default(),
+                body,
+            )),
         )
     }
 

@@ -17,7 +17,7 @@ use crate::cost;
 use crate::error::PlanError;
 use crate::plan::{
     AnnSearchStep, EmbeddingStep, ExecutionPlan, FilterRule, FilterStage, FilterStep, MergeStep,
-    MetadataLookupStep, RecallPlan, ResponseStep, ShardSearchStep, SortKey,
+    MetadataLookupStep, RecallPlan, ResponseStep, ShardSearchStep, SortKey, TextFetchStep,
 };
 
 /// Build the execution plan for a RECALL request.
@@ -85,11 +85,18 @@ pub fn plan_recall_inner(
             final_top: k,
             confidence_min,
         },
-        // `include_text` isn't on the wire shape yet; spec §03 §11
-        // anticipates it. Always `None` for now.
-        text_fetch: None,
+        // `memory_ids` is left empty here; the executor fills it from
+        // the surviving post-filter hits before issuing the batched read.
+        text_fetch: if req.include_text {
+            Some(TextFetchStep {
+                memory_ids: Vec::new(),
+                parallel: true,
+            })
+        } else {
+            None
+        },
         response: ResponseStep {
-            include_text: false,
+            include_text: req.include_text,
             include_metadata: req.include_edges,
         },
         estimated_cost_ms: estimated,
@@ -175,9 +182,10 @@ mod tests {
             age_bound_unix_nanos: None,
             kind_filter: None,
             salience_floor: 0.0,
-            strategy_hint: None,
+            strategy: None,
             include_vectors: false,
             include_edges: false,
+            include_text: false,
             request_id: None,
             txn_id: None,
         }
@@ -293,5 +301,27 @@ mod tests {
     fn estimated_cost_is_populated() {
         let plan = unwrap_recall(plan_recall(&base_request(), &ctx()).unwrap());
         assert!(plan.estimated_cost_ms > 0.0);
+    }
+
+    #[test]
+    fn include_text_false_omits_text_fetch_step() {
+        let plan = unwrap_recall(plan_recall(&base_request(), &ctx()).unwrap());
+        assert!(plan.text_fetch.is_none());
+        assert!(!plan.response.include_text);
+    }
+
+    #[test]
+    fn include_text_true_adds_text_fetch_step() {
+        let mut r = base_request();
+        r.include_text = true;
+        let plan = unwrap_recall(plan_recall(&r, &ctx()).unwrap());
+        let step = plan
+            .text_fetch
+            .as_ref()
+            .expect("include_text=true must add a TextFetchStep");
+        // memory_ids is filled in by the executor — empty at plan time.
+        assert!(step.memory_ids.is_empty());
+        assert!(step.parallel);
+        assert!(plan.response.include_text);
     }
 }

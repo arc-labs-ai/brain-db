@@ -17,6 +17,13 @@ async fn metrics_snapshot_records_request_and_op_breakdown() {
             was_deduplicated: false,
             salience: 0.5,
             auto_edges_added: 0,
+            lsn: 0,
+            agent_id: [0; 16],
+            context_id: 0,
+            kind: brain_protocol::request::MemoryKindWire::Episodic,
+            created_at_unix_nanos: 0,
+            edges_out_count: 0,
+            embedding_model_fp: [0; 16],
         };
         common::write_frame(
             &mut socket,

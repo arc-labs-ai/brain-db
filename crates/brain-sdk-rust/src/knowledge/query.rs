@@ -40,7 +40,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use brain_core::knowledge::StatementKind;
-use brain_core::{EntityId, MemoryId, PredicateId, RelationId, StatementId};
+use brain_core::{EntityId, MemoryId, RelationId, StatementId};
 use brain_protocol::error::ProtocolError;
 use brain_protocol::knowledge::{
     FusionConfigWire, ItemIdWire, QueryExplainRequest as WireExplainReq,
@@ -144,8 +144,9 @@ impl From<brain_protocol::responses::types::RetrieverNameWire> for Retriever {
 /// Which retrievers the planner is allowed to run. [`Self::auto`] lets
 /// the router pick from the rules in `§24/00 §"Routing rules"`.
 /// [`Self::explicit`] forces a specific set (validated at construction).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum RetrieverSelection {
+    #[default]
     Auto,
     Explicit(Vec<Retriever>),
 }
@@ -161,8 +162,15 @@ impl RetrieverSelection {
     /// - an empty list (the planner would treat it as no-signal);
     /// - more than [`MAX_EXPLICIT_RETRIEVERS`] entries counted
     ///   pre-deduplication (matches the server's wire-side cap).
+    ///
     /// Surviving duplicates are removed while preserving caller
     /// order before storage.
+    ///
+    /// # Errors
+    /// Returns [`QueryBuilderError::EmptyExplicitRetrievers`] if
+    /// `picks` yields nothing, or
+    /// [`QueryBuilderError::TooManyExplicitRetrievers`] if the input
+    /// exceeds [`MAX_EXPLICIT_RETRIEVERS`].
     pub fn explicit(picks: impl IntoIterator<Item = Retriever>) -> Result<Self, QueryBuilderError> {
         let raw: Vec<Retriever> = picks.into_iter().collect();
         if raw.is_empty() {
@@ -181,12 +189,6 @@ impl RetrieverSelection {
             }
         }
         Ok(Self::Explicit(out))
-    }
-}
-
-impl Default for RetrieverSelection {
-    fn default() -> Self {
-        Self::Auto
     }
 }
 
@@ -503,8 +505,8 @@ impl TimeRange {
     /// Open bounds always pass on that side.
     #[must_use]
     pub fn contains(&self, unix_ms: u64) -> bool {
-        let lo_ok = self.from_unix_ms.map_or(true, |lo| unix_ms >= lo);
-        let hi_ok = self.to_unix_ms.map_or(true, |hi| unix_ms <= hi);
+        let lo_ok = self.from_unix_ms.is_none_or(|lo| unix_ms >= lo);
+        let hi_ok = self.to_unix_ms.is_none_or(|hi| unix_ms <= hi);
         lo_ok && hi_ok
     }
 }
@@ -722,7 +724,7 @@ pub struct QueryBuilder<'a> {
     text: Option<String>,
     entity_anchor: Option<EntityId>,
     kind_filter: Vec<StatementKind>,
-    predicate_filter: Vec<PredicateId>,
+    predicate_filter: Vec<String>,
     time_filter: Option<TimeRange>,
     confidence_min: Option<f32>,
     include_tombstoned: bool,
@@ -780,10 +782,15 @@ impl<'a> QueryBuilder<'a> {
         self.of_kinds([kind])
     }
 
-    /// Filter by predicate IDs.
+    /// Filter by predicate qnames (canonical `"namespace:name"`).
+    ///
+    /// Schemaless clients pass qnames directly — they don't carry
+    /// PredicateIds. Schema-strict deployments still resolve through
+    /// the same wire path; an unknown qname surfaces as
+    /// `PredicateNotInSchema` from the server.
     #[must_use]
-    pub fn predicates(mut self, predicates: impl IntoIterator<Item = PredicateId>) -> Self {
-        self.predicate_filter = predicates.into_iter().collect();
+    pub fn predicates<S: Into<String>>(mut self, predicates: impl IntoIterator<Item = S>) -> Self {
+        self.predicate_filter = predicates.into_iter().map(Into::into).collect();
         self
     }
 
@@ -852,7 +859,7 @@ impl<'a> QueryBuilder<'a> {
     /// Terminal verb: run the query and return the hits +
     /// diagnostics.
     pub async fn execute(self) -> Result<QueryResult, ClientError> {
-        let wire = self.into_wire()?;
+        let wire = self.to_wire()?;
         let resp = self
             .client_ref()
             .send_knowledge_request(
@@ -870,7 +877,7 @@ impl<'a> QueryBuilder<'a> {
     /// Terminal verb: ask the planner for its plan as rendered text,
     /// without execution.
     pub async fn explain(self) -> Result<ExplainResult, ClientError> {
-        let wire = self.into_wire()?;
+        let wire = self.to_wire()?;
         let resp = self
             .client_ref()
             .send_knowledge_request(
@@ -889,7 +896,7 @@ impl<'a> QueryBuilder<'a> {
     /// concatenated with the per-retriever execution metrics, all
     /// as rendered text.
     pub async fn trace(self) -> Result<TraceResult, ClientError> {
-        let wire = self.into_wire()?;
+        let wire = self.to_wire()?;
         let resp = self
             .client_ref()
             .send_knowledge_request(
@@ -904,16 +911,16 @@ impl<'a> QueryBuilder<'a> {
         }
     }
 
-    /// Borrow the client. `self.client` is captured into `into_wire`
+    /// Borrow the client. `self.client` is captured into `to_wire`
     /// via the consuming `self`, so we need a single helper that
-    /// borrows after the move-of-`self`-into-`into_wire`.
+    /// borrows after the move-of-`self`-into-`to_wire`.
     fn client_ref(&self) -> &'a Client {
         self.client
     }
 
     /// Validate state and produce a wire-shape request. Consumes
     /// the builder.
-    fn into_wire(&self) -> Result<WireQueryRequest, ClientError> {
+    fn to_wire(&self) -> Result<WireQueryRequest, ClientError> {
         // No-signal guard: empty text + no anchor → reject.
         if self.text.is_none() && self.entity_anchor.is_none() {
             return Err(QueryBuilderError::NoSignal.into());
@@ -948,7 +955,7 @@ impl<'a> QueryBuilder<'a> {
             .copied()
             .map(statement_kind_to_byte)
             .collect();
-        let predicate_filter = self.predicate_filter.iter().map(|p| p.raw()).collect();
+        let predicate_filter = self.predicate_filter.clone();
         let entity_anchor = self.entity_anchor.map(EntityId::to_bytes);
         let time_filter = self.time_filter.map(TimeRangeWire::from);
         let retrievers = self.retrievers.clone().into();

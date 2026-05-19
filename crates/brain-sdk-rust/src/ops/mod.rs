@@ -24,7 +24,7 @@ pub use stream::FrameStream;
 pub use encode::EncodeBuilder;
 pub use forget::ForgetBuilder;
 pub use link::LinkBuilder;
-pub use plan::PlanBuilder;
+pub use plan::{PlanBuilder, PlanOutcome};
 pub use reason::ReasonBuilder;
 pub use recall::RecallBuilder;
 pub use subscribe::SubscribeBuilder;

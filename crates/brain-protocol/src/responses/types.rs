@@ -124,6 +124,18 @@ pub enum EventType {
     /// Phase 18.7. Appended after `SchemaUpdated` to preserve the
     /// stable discriminants of prior variants.
     RelationTombstoned = 30,
+
+    // Unified-edge change feed. Substrate Link / Unlink and typed-
+    // relation create / supersede / tombstone all flow through these
+    // three variants; the per-event `edge_payload` sidecar carries
+    // `from`, `to`, kind discriminator, relation id when applicable.
+    // The legacy `RelationCreated` / `RelationSuperseded` /
+    // `RelationTombstoned` codes stay around because pre-Phase-C
+    // knowledge writers still publish them via `knowledge_payload`;
+    // future writers all go through the unified edge codes below.
+    EdgeAdded = 31,
+    EdgeRemoved = 32,
+    EdgeSuperseded = 33,
 }
 
 /// Spec §08 §18 — `IntegrityIssue::IntegrityIssueType`.
@@ -244,6 +256,8 @@ pub enum ErrorCodeWire {
     TopKOutOfRange = 0x0048,
     BudgetTooLarge = 0x0049,
     BadModelFingerprint = 0x004A,
+    PredicateNotInSchema = 0x004B,
+    RelationTypeNotInSchema = 0x004C,
     // §3.5 Not found
     MemoryNotFound = 0x0050,
     ContextNotFound = 0x0051,
@@ -256,6 +270,7 @@ pub enum ErrorCodeWire {
     TransactionTimeout = 0x0062,
     StreamIdInUse = 0x0063,
     SubscriptionLsnTooOld = 0x0064,
+    CardinalityViolation = 0x0065,
     // §3.7 Resource exhausted
     OutOfSlots = 0x0070,
     OutOfDisk = 0x0071,
@@ -312,6 +327,8 @@ impl From<ErrorCode> for ErrorCodeWire {
             ErrorCode::TopKOutOfRange => Self::TopKOutOfRange,
             ErrorCode::BudgetTooLarge => Self::BudgetTooLarge,
             ErrorCode::BadModelFingerprint => Self::BadModelFingerprint,
+            ErrorCode::PredicateNotInSchema => Self::PredicateNotInSchema,
+            ErrorCode::RelationTypeNotInSchema => Self::RelationTypeNotInSchema,
             ErrorCode::MemoryNotFound => Self::MemoryNotFound,
             ErrorCode::ContextNotFound => Self::ContextNotFound,
             ErrorCode::SubscriptionNotFound => Self::SubscriptionNotFound,
@@ -322,6 +339,7 @@ impl From<ErrorCode> for ErrorCodeWire {
             ErrorCode::TransactionTimeout => Self::TransactionTimeout,
             ErrorCode::StreamIdInUse => Self::StreamIdInUse,
             ErrorCode::SubscriptionLsnTooOld => Self::SubscriptionLsnTooOld,
+            ErrorCode::CardinalityViolation => Self::CardinalityViolation,
             ErrorCode::OutOfSlots => Self::OutOfSlots,
             ErrorCode::OutOfDisk => Self::OutOfDisk,
             ErrorCode::OutOfMemory => Self::OutOfMemory,
@@ -377,6 +395,8 @@ impl From<ErrorCodeWire> for ErrorCode {
             ErrorCodeWire::TopKOutOfRange => Self::TopKOutOfRange,
             ErrorCodeWire::BudgetTooLarge => Self::BudgetTooLarge,
             ErrorCodeWire::BadModelFingerprint => Self::BadModelFingerprint,
+            ErrorCodeWire::PredicateNotInSchema => Self::PredicateNotInSchema,
+            ErrorCodeWire::RelationTypeNotInSchema => Self::RelationTypeNotInSchema,
             ErrorCodeWire::MemoryNotFound => Self::MemoryNotFound,
             ErrorCodeWire::ContextNotFound => Self::ContextNotFound,
             ErrorCodeWire::SubscriptionNotFound => Self::SubscriptionNotFound,
@@ -387,6 +407,7 @@ impl From<ErrorCodeWire> for ErrorCode {
             ErrorCodeWire::TransactionTimeout => Self::TransactionTimeout,
             ErrorCodeWire::StreamIdInUse => Self::StreamIdInUse,
             ErrorCodeWire::SubscriptionLsnTooOld => Self::SubscriptionLsnTooOld,
+            ErrorCodeWire::CardinalityViolation => Self::CardinalityViolation,
             ErrorCodeWire::OutOfSlots => Self::OutOfSlots,
             ErrorCodeWire::OutOfDisk => Self::OutOfDisk,
             ErrorCodeWire::OutOfMemory => Self::OutOfMemory,

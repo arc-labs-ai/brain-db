@@ -13,7 +13,9 @@ use std::process::ExitCode;
 use brain_cli::cli::{parse, Command};
 use brain_cli::commands::diagnostics::{debug_snapshot, profile};
 use brain_cli::commands::snapshot::SnapshotAction;
-use brain_cli::commands::{agent, audit, config, health, rebuild, shard, snapshot, stats, worker};
+use brain_cli::commands::{
+    agent, audit, config, extract, health, rebuild, shard, snapshot, stats, worker,
+};
 
 const NAME: &str = env!("CARGO_PKG_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -38,7 +40,10 @@ fn main() -> ExitCode {
             println!("{NAME} {VERSION}");
             ExitCode::SUCCESS
         }
-        Command::Health => match health::run(&args.server, args.output) {
+        // `health` + `stats` hit `/healthz` + `/metrics`, which live
+        // on the public listener (metrics_addr). Every other command
+        // hits `/v1/*` on the admin listener (server / admin_addr).
+        Command::Health => match health::run(&args.metrics_addr, args.output) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS
@@ -48,7 +53,7 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        Command::Stats => match stats::run(&args.server, args.output) {
+        Command::Stats => match stats::run(&args.metrics_addr, args.output) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS
@@ -104,6 +109,7 @@ fn main() -> ExitCode {
             output_path.as_deref(),
             args.output,
         )),
+        Command::Extract(action) => run_result(extract::run(&args.server, &action, args.output)),
     }
 }
 
@@ -140,9 +146,16 @@ COMMANDS:
     shard list|create|delete                  Shard operations (create/delete deferred)
     profile [--duration-secs N] [--value P]   CPU profile (deferred)
     debug-snapshot [--value PATH]             Runtime snapshot (partial schema)
+    extract --backfill (--memory-id N | --since TS | --all)
+                                              Re-enqueue memories through the
+                                              three-tier extractor pipeline
 
 OPTIONS:
-    --server <host:port>      Admin endpoint (default 127.0.0.1:9091)
+    --server <host:port>      Admin endpoint — /v1/* routes
+                              (default 127.0.0.1:9092)
+    --metrics-addr <host:port>  Metrics endpoint — /healthz + /metrics,
+                              used by `health` and `stats`
+                              (default 127.0.0.1:9091)
     --output <json|table>     Output format (default table)
     --token <value>           Admin token (parsed; auth wiring lands later)
     --shard <N>               Target a specific shard

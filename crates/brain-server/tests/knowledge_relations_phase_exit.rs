@@ -68,8 +68,8 @@ where
             .await
             .expect("payload");
     }
-    let (frame, rest) = Frame::decode_with_max(&buf, brain_protocol::MAX_PAYLOAD_BYTES as u32)
-        .expect("decode");
+    let (frame, rest) =
+        Frame::decode_with_max(&buf, brain_protocol::MAX_PAYLOAD_BYTES as u32).expect("decode");
     debug_assert!(rest.is_empty());
     frame
 }
@@ -181,7 +181,9 @@ fn create_req(relation_type: &str, from: [u8; 16], to: [u8; 16]) -> RelationCrea
 #[tokio::test(flavor = "current_thread")]
 async fn relation_lifecycle_end_to_end() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     // Step 1 — create three Person entities.
@@ -226,7 +228,11 @@ async fn relation_lifecycle_end_to_end() {
     match body {
         ResponseBody::RelationTraverse(r) => {
             assert_eq!(r.total_paths, 2, "expected 2 paths from A with depth 2");
-            let depths: Vec<u32> = r.paths.iter().map(|p| p.steps.last().unwrap().depth).collect();
+            let depths: Vec<u32> = r
+                .paths
+                .iter()
+                .map(|p| p.steps.last().unwrap().depth)
+                .collect();
             assert!(depths.contains(&1));
             assert!(depths.contains(&2));
         }

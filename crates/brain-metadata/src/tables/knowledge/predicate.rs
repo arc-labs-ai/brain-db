@@ -26,6 +26,70 @@ pub const PREDICATES_TABLE: TableDefinition<'static, u32, PredicateDefinition> =
 pub const PREDICATES_BY_QNAME_TABLE: TableDefinition<'static, &str, u32> =
     TableDefinition::new("predicates_by_qname");
 
+/// Origin of a registered predicate. Tracks whether the row was
+/// authored by an explicit `SCHEMA_UPLOAD` (strict mode) or interned
+/// on demand from an open-vocabulary write (schemaless mode).
+///
+/// Encoded as a single byte (`origin_byte` below) plus a payload word:
+/// for `SchemaDeclared(v)` the word holds the schema version; for
+/// `ImplicitFromWrite { first_seen_lsn }` it holds the LSN. Implicit
+/// rows still carry `schema_version = 0` in the legacy field so query
+/// code that filters by version naturally skips them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaOrigin {
+    /// Predicate was registered through `SCHEMA_UPLOAD` for the
+    /// referenced schema version.
+    SchemaDeclared { version: u32 },
+    /// Predicate was lazily interned because a STATEMENT_CREATE
+    /// referenced it without a schema being declared. The `lsn` is
+    /// captured at intern time so operator tooling can correlate
+    /// vocabulary growth with the write stream.
+    ImplicitFromWrite { first_seen_lsn: u64 },
+}
+
+impl SchemaOrigin {
+    /// Tag byte: 0 = SchemaDeclared, 1 = ImplicitFromWrite. Anything
+    /// else collapses to SchemaDeclared{0} on read for forwards-
+    /// compatibility — corrupt rows degrade gracefully rather than
+    /// vanish from query results.
+    #[must_use]
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::SchemaDeclared { .. } => 0,
+            Self::ImplicitFromWrite { .. } => 1,
+        }
+    }
+
+    #[must_use]
+    pub fn payload(self) -> u64 {
+        match self {
+            Self::SchemaDeclared { version } => u64::from(version),
+            Self::ImplicitFromWrite { first_seen_lsn } => first_seen_lsn,
+        }
+    }
+
+    #[must_use]
+    pub fn decode(tag: u8, payload: u64) -> Self {
+        match tag {
+            1 => Self::ImplicitFromWrite {
+                first_seen_lsn: payload,
+            },
+            // Tag 0 (and anything unknown — see doc above) is treated
+            // as SchemaDeclared.
+            _ => Self::SchemaDeclared {
+                #[allow(clippy::cast_possible_truncation)]
+                version: payload as u32,
+            },
+        }
+    }
+
+    /// Convenience: was this row authored by a SCHEMA_UPLOAD?
+    #[must_use]
+    pub fn is_schema_declared(self) -> bool {
+        matches!(self, Self::SchemaDeclared { .. })
+    }
+}
+
 /// A registered predicate. The `(namespace, name)` pair is logically
 /// unique within a deployment; uniqueness is enforced by
 /// [`PREDICATES_BY_QNAME_TABLE`] writes inside `predicate_intern`.
@@ -35,6 +99,10 @@ pub const PREDICATES_BY_QNAME_TABLE: TableDefinition<'static, &str, u32> =
 /// 1). `object_type_constraint_byte`: `0` means "any object type", else
 /// `1=Entity / 2=Value / 3=Memory / 4=Statement` (matches
 /// `StatementObject::discriminant()` offset by 1).
+///
+/// `origin_tag` + `origin_payload` encode the [`SchemaOrigin`].
+/// Implicit-from-write rows are how Brain supports open-vocabulary
+/// STATEMENT_CREATE without a schema declaration.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 pub struct PredicateDefinition {
@@ -46,6 +114,8 @@ pub struct PredicateDefinition {
     pub schema_version: u32,
     pub description: String,
     pub created_at_unix_nanos: u64,
+    pub origin_tag: u8,
+    pub origin_payload: u64,
 }
 
 impl PredicateDefinition {
@@ -54,9 +124,25 @@ impl PredicateDefinition {
         PredicateId::from(self.predicate_id)
     }
 
-    /// Build a redb row from the brain-core value type.
+    /// Build a redb row from the brain-core value type. The origin
+    /// defaults to `SchemaDeclared` at the predicate's `schema_version`
+    /// — the legacy entry point used by `predicate_intern` (schema-
+    /// driven). Open-vocabulary writes go through
+    /// [`Self::from_predicate_with_origin`].
     #[must_use]
     pub fn from_predicate(p: &Predicate, created_at_unix_nanos: u64) -> Self {
+        let origin = SchemaOrigin::SchemaDeclared {
+            version: p.schema_version,
+        };
+        Self::from_predicate_with_origin(p, created_at_unix_nanos, origin)
+    }
+
+    #[must_use]
+    pub fn from_predicate_with_origin(
+        p: &Predicate,
+        created_at_unix_nanos: u64,
+        origin: SchemaOrigin,
+    ) -> Self {
         Self {
             predicate_id: p.id.raw(),
             namespace: p.namespace.clone(),
@@ -66,7 +152,14 @@ impl PredicateDefinition {
             schema_version: p.schema_version,
             description: p.description.clone(),
             created_at_unix_nanos,
+            origin_tag: origin.tag(),
+            origin_payload: origin.payload(),
         }
+    }
+
+    #[must_use]
+    pub fn origin(&self) -> SchemaOrigin {
+        SchemaOrigin::decode(self.origin_tag, self.origin_payload)
     }
 
     /// Project to the brain-core value type. `created_at_unix_nanos`
@@ -108,7 +201,10 @@ pub fn encode_kind_constraint(k: Option<StatementKind>) -> u8 {
     }
 }
 
-impl_redb_rkyv_value!(PredicateDefinition, "brain_metadata::PredicateDefinition::v2");
+impl_redb_rkyv_value!(
+    PredicateDefinition,
+    "brain_metadata::PredicateDefinition::v3"
+);
 
 #[cfg(all(test, not(miri)))]
 mod tests {

@@ -1,7 +1,7 @@
 //! `Entity` value type — the brain-core public API for a knowledge-
 //! graph entity.
 //!
-//! Mirrors the substrate's [`crate::Memory`] / [`brain_metadata::tables::memory`]
+//! Mirrors the substrate's [`crate::Memory`] / `brain_metadata::tables::memory`
 //! split: `Entity` is the high-level value type (no I/O, no rkyv); the
 //! redb row lives in `brain-metadata::tables::knowledge::entity::EntityMetadata`.
 //! Conversion at the boundary is via `From` impls defined on the
@@ -23,9 +23,7 @@ use crate::knowledge::{EntityId, EntityTypeId};
 /// `BTreeMap<String, Value>` once phase 19's schema DSL lands). The
 /// newtype isolates callers from the encoding so phase 19 can add
 /// typed accessors without changing the public field type.
-#[derive(
-    Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct EntityAttributes(pub Vec<u8>);
 
 impl EntityAttributes {

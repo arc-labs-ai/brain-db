@@ -82,6 +82,12 @@ pub const DEFAULT_TTL_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000;
 ///   Phase 9 fills this; storage just keeps the bytes.
 /// - `created_at_unix_nanos` — insertion time. Drives the [`prune_expired`]
 ///   sweep.
+/// - `lsn` — WAL position of the durable record this entry caches. A
+///   zero value means "unknown" (no WAL sink wired at the time of the
+///   original write, or a legacy row written before this field
+///   existed). The encode-replay path surfaces this so clients chaining
+///   `subscribe --start-lsn=lsn+1` recover the correct tail position
+///   on retry.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 pub struct IdempotencyEntry {
@@ -90,6 +96,7 @@ pub struct IdempotencyEntry {
     pub response_payload: Vec<u8>,
     pub request_hash: [u8; 32],
     pub created_at_unix_nanos: u64,
+    pub lsn: u64,
 }
 
 impl IdempotencyEntry {
@@ -100,6 +107,7 @@ impl IdempotencyEntry {
         response_payload: Vec<u8>,
         request_hash: [u8; 32],
         created_at_unix_nanos: u64,
+        lsn: u64,
     ) -> Self {
         Self {
             response_kind,
@@ -107,6 +115,7 @@ impl IdempotencyEntry {
             response_payload,
             request_hash,
             created_at_unix_nanos,
+            lsn,
         }
     }
 
@@ -278,6 +287,7 @@ mod tests {
             vec![0xAA, 0xBB, 0xCC, byte],
             [byte; 32],
             created_at,
+            0,
         )
     }
 

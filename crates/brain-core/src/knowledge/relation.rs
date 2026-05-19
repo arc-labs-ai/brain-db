@@ -268,10 +268,10 @@ mod tests {
         let mut r = sample(false);
         r.valid_from_unix_nanos = Some(100);
         r.valid_to_unix_nanos = Some(200);
-        assert!(!r.is_current(50));   // before window
-        assert!(r.is_current(150));    // inside
-        assert!(!r.is_current(200));   // at end (exclusive)
-        assert!(!r.is_current(250));   // after
+        assert!(!r.is_current(50)); // before window
+        assert!(r.is_current(150)); // inside
+        assert!(!r.is_current(200)); // at end (exclusive)
+        assert!(!r.is_current(250)); // after
     }
 
     #[test]

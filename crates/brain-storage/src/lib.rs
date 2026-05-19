@@ -49,7 +49,7 @@ pub mod layout;
 pub mod recovery;
 pub mod wal;
 
-pub use layout::{ShardPaths, ensure_dirs};
+pub use layout::{ensure_dirs, ShardPaths};
 
 /// Slot size in bytes, per `spec/05_storage_arena_wal/02_arena_layout.md`.
 pub const SLOT_SIZE_BYTES: usize = 1600;

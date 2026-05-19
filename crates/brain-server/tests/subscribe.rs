@@ -202,6 +202,7 @@ fn open_filter() -> SubscriptionFilter {
         contexts: None,
         kinds: None,
         similar_to: None,
+        agents: None,
     }
 }
 
@@ -430,7 +431,11 @@ async fn cancel_stream_terminates_subscription() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn subscribe_rejects_from_lsn() {
+async fn subscribe_from_lsn_past_tail_is_accepted() {
+    // Locked plan decision: `from_lsn > current_tail` is NOT an error.
+    // The server transitions straight to the live tail (no replay
+    // events). Earlier versions returned `LsnTooOld` here; that was
+    // a placeholder while WAL replay was unimplemented.
     let server = start_with_shards(1).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
     let agent_id = *uuid::Uuid::now_v7().as_bytes();
@@ -454,21 +459,16 @@ async fn subscribe_rejects_from_lsn() {
     )
     .await;
 
-    let resp = read_event_within(&mut client, Duration::from_secs(2))
-        .await
-        .expect("error frame");
-    assert_eq!(resp.header.opcode_u16(), Opcode::Error.as_u16());
-    let body = ResponseBody::decode(Opcode::Error, &resp.payload).expect("decode");
-    match body {
-        ResponseBody::Error(e) => {
-            assert!(
-                e.message.to_lowercase().contains("from_lsn")
-                    || e.message.to_lowercase().contains("lsn"),
-                "unexpected error message: {:?}",
-                e.message
-            );
-        }
-        other => panic!("expected Error, got {other:?}"),
+    // Should NOT receive an ERROR within a short window. Receiving
+    // nothing (silence) is the expected outcome: replay yields zero
+    // records, then the task awaits the live tail.
+    let maybe = read_event_within(&mut client, Duration::from_millis(300)).await;
+    if let Some(frame) = maybe {
+        assert_ne!(
+            frame.header.opcode_u16(),
+            Opcode::Error.as_u16(),
+            "from_lsn past tail must not error; got an Error frame"
+        );
     }
 
     server.stop().await;
@@ -519,3 +519,258 @@ async fn double_subscribe_with_same_stream_id_errors() {
 // `unsubscribe_emits_final_eos_and_response` and
 // `cancel_stream_terminates_subscription` tests already cover the
 // registry's contract end-to-end on the wire.)
+
+// ---------------------------------------------------------------------------
+// WAL-replay end-to-end (sub-task 9.x; subscribe --start-lsn). Encodes
+// memories BEFORE the subscriber connects, then subscribes with
+// from_lsn=1 and asserts the historical events arrive — proof that
+// the writer is WAL-recording substrate ops and the connection-layer
+// replay prologue projects them back into SUBSCRIBE_EVENT frames.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_from_lsn_replays_historical_encodes() {
+    let server = start_with_shards(1).await;
+    let agent_id = *uuid::Uuid::now_v7().as_bytes();
+
+    // 1. ENCODE two memories on a writer connection BEFORE any
+    //    subscriber exists. The live event bus has no listeners, so
+    //    these events are only durable in the WAL — making this a
+    //    real replay test, not a live-tail test in disguise.
+    let mut writer = TcpStream::connect(server.addr).await.expect("writer");
+    complete_handshake(&mut writer, agent_id).await;
+    for (i, text) in ["alpha", "beta"].iter().enumerate() {
+        let stream_id = ((i * 2) + 1) as u32; // 1, 3 — odd
+        send_frame(
+            &mut writer,
+            Frame::new(
+                Opcode::EncodeReq.as_u16(),
+                FLAG_EOS,
+                stream_id,
+                RequestBody::Encode(encode_request(text, MemoryKindWire::Episodic)).encode(),
+            ),
+        )
+        .await;
+        let resp = read_one_frame(&mut writer).await.expect("encode resp");
+        assert_eq!(
+            resp.header.opcode_u16(),
+            Opcode::EncodeResp.as_u16(),
+            "encode {} expected EncodeResp, got 0x{:02x} on stream {}",
+            text,
+            resp.header.opcode_u16(),
+            resp.header.stream_id_u32()
+        );
+    }
+    // Give the WAL group commit a moment to fsync.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 2. Now open a fresh subscriber and request --start-lsn=1.
+    let mut sub = TcpStream::connect(server.addr).await.expect("sub");
+    complete_handshake(&mut sub, agent_id).await;
+    let sub_stream = 11u32;
+    send_frame(
+        &mut sub,
+        Frame::new(
+            Opcode::SubscribeReq.as_u16(),
+            FLAG_EOS,
+            sub_stream,
+            RequestBody::Subscribe(SubscribeRequest {
+                filter: open_filter(),
+                include_history: false,
+                from_lsn: Some(1),
+                max_inflight: 100,
+            })
+            .encode(),
+        ),
+    )
+    .await;
+
+    // 3. Expect at least two SUBSCRIBE_EVENT frames on `sub_stream`
+    //    (the two replayed encodes). The replay path projects the
+    //    WAL records via `EventEnvelope::from_wal_record`, so they
+    //    carry the same shape as live events. Higher read budget +
+    //    longer timeout so the SubscribeResp + framing latency
+    //    doesn't squeeze us out.
+    let mut replayed_events = 0;
+    for _ in 0..10 {
+        let Some(frame) = read_event_within(&mut sub, Duration::from_secs(3)).await else {
+            break;
+        };
+        if frame.header.opcode_u16() == Opcode::Error.as_u16() {
+            let body = ResponseBody::decode(Opcode::Error, &frame.payload).expect("decode");
+            panic!("got Error frame from subscribe-replay: {body:?}");
+        }
+        if frame.header.opcode_u16() == Opcode::SubscribeEvent.as_u16()
+            && frame.header.stream_id_u32() == sub_stream
+            && frame.header.flags_u8() & FLAG_EOS == 0
+        {
+            replayed_events += 1;
+            if replayed_events >= 2 {
+                break;
+            }
+        }
+    }
+    assert!(
+        replayed_events >= 2,
+        "expected >=2 replayed SUBSCRIBE_EVENT frames, got {replayed_events}"
+    );
+
+    server.stop().await;
+}
+
+/// `agents` filter — encodes from agent A and B; subscriber listening
+/// only to agent A receives ONLY A's events even though B's events
+/// hit the same shard. Without this filter, a multi-tenant shard
+/// leaks every agent's events to every subscriber.
+///
+/// Enabled after the per-request agent flow landed: each op now
+/// carries `agent_id` (populated from `ConnPhase::Established.agent`
+/// via `dispatch(req, caller, ctx)` → `ExecutorContext.caller_agent`
+/// → `EncodeOp.agent_id` → `EventEnvelope.agent_id`). The
+/// `SubscriptionFilter.agents` set filters server-side; subscribers
+/// only see events from agents they declared interest in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_agents_filter_isolates_per_agent() {
+    let server = start_with_shards(1).await;
+
+    let agent_a = *uuid::Uuid::now_v7().as_bytes();
+    let agent_b = *uuid::Uuid::now_v7().as_bytes();
+
+    // SUBSCRIBE with agents=[A] on a connection authed as A.
+    let mut sub_a = TcpStream::connect(server.addr).await.expect("sub_a");
+    complete_handshake(&mut sub_a, agent_a).await;
+    let sub_stream = 21u32;
+    let filter = SubscriptionFilter {
+        contexts: None,
+        kinds: None,
+        similar_to: None,
+        agents: Some(vec![agent_a]),
+    };
+    send_frame(
+        &mut sub_a,
+        Frame::new(
+            Opcode::SubscribeReq.as_u16(),
+            FLAG_EOS,
+            sub_stream,
+            RequestBody::Subscribe(subscribe_request(filter)).encode(),
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Encode from B first, then from A — both land on shard 0
+    // (single-shard test). Without the agents filter, sub_a would
+    // observe both.
+    let mut writer_b = TcpStream::connect(server.addr).await.expect("writer_b");
+    complete_handshake(&mut writer_b, agent_b).await;
+    send_frame(
+        &mut writer_b,
+        Frame::new(
+            Opcode::EncodeReq.as_u16(),
+            FLAG_EOS,
+            1,
+            RequestBody::Encode(encode_request("from-B", MemoryKindWire::Episodic)).encode(),
+        ),
+    )
+    .await;
+    let _ = read_one_frame(&mut writer_b).await.expect("enc B resp");
+
+    let mut writer_a = TcpStream::connect(server.addr).await.expect("writer_a");
+    complete_handshake(&mut writer_a, agent_a).await;
+    send_frame(
+        &mut writer_a,
+        Frame::new(
+            Opcode::EncodeReq.as_u16(),
+            FLAG_EOS,
+            1,
+            RequestBody::Encode(encode_request("from-A", MemoryKindWire::Episodic)).encode(),
+        ),
+    )
+    .await;
+    let _ = read_one_frame(&mut writer_a).await.expect("enc A resp");
+
+    // Collect events on sub_a for up to ~1s. Expect EXACTLY 1 event
+    // (from-A); the B event must be filtered out.
+    let mut a_events = 0;
+    for _ in 0..4 {
+        let Some(frame) = read_event_within(&mut sub_a, Duration::from_millis(500)).await else {
+            break;
+        };
+        if frame.header.opcode_u16() == Opcode::SubscribeEvent.as_u16()
+            && frame.header.stream_id_u32() == sub_stream
+            && frame.header.flags_u8() & FLAG_EOS == 0
+        {
+            a_events += 1;
+        }
+    }
+    assert_eq!(
+        a_events, 1,
+        "agents=[A] filter should let through exactly the A event, not B's"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscribe_from_lsn_zero_replays_everything_in_wal() {
+    // from_lsn=0 means "everything still in the WAL"; spec §09/09 §16
+    // says this is not an error.
+    let server = start_with_shards(1).await;
+    let agent_id = *uuid::Uuid::now_v7().as_bytes();
+
+    let mut writer = TcpStream::connect(server.addr).await.expect("writer");
+    complete_handshake(&mut writer, agent_id).await;
+    send_frame(
+        &mut writer,
+        Frame::new(
+            Opcode::EncodeReq.as_u16(),
+            FLAG_EOS,
+            1,
+            RequestBody::Encode(encode_request("first", MemoryKindWire::Episodic)).encode(),
+        ),
+    )
+    .await;
+    let _resp = read_one_frame(&mut writer).await.expect("encode resp");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut sub = TcpStream::connect(server.addr).await.expect("sub");
+    complete_handshake(&mut sub, agent_id).await;
+    let sub_stream = 17u32;
+    send_frame(
+        &mut sub,
+        Frame::new(
+            Opcode::SubscribeReq.as_u16(),
+            FLAG_EOS,
+            sub_stream,
+            RequestBody::Subscribe(SubscribeRequest {
+                filter: open_filter(),
+                include_history: false,
+                from_lsn: Some(0),
+                max_inflight: 100,
+            })
+            .encode(),
+        ),
+    )
+    .await;
+
+    let mut got_event = false;
+    for _ in 0..3 {
+        let Some(frame) = read_event_within(&mut sub, Duration::from_secs(1)).await else {
+            break;
+        };
+        if frame.header.opcode_u16() == Opcode::SubscribeEvent.as_u16()
+            && frame.header.stream_id_u32() == sub_stream
+            && frame.header.flags_u8() & FLAG_EOS == 0
+        {
+            got_event = true;
+            break;
+        }
+        if frame.header.opcode_u16() == Opcode::Error.as_u16() {
+            let body = ResponseBody::decode(Opcode::Error, &frame.payload).expect("decode");
+            panic!("from_lsn=0 must NOT error; got: {body:?}");
+        }
+    }
+    assert!(got_event, "from_lsn=0 should replay the WAL");
+
+    server.stop().await;
+}

@@ -23,12 +23,12 @@
 //! [`RelationHandle`].
 
 use brain_core::{EntityId, MemoryId, RelationId, RelationTypeId};
+use brain_protocol::knowledge::statement_req::EvidenceRefWire;
 use brain_protocol::knowledge::{
     RelationCreateRequest, RelationGetRequest, RelationListFromRequest, RelationListToRequest,
     RelationSupersedeRequest, RelationTombstoneRequest, RelationTraverseRequest, RelationView,
     RelationWireError,
 };
-use brain_protocol::knowledge::statement_req::EvidenceRefWire;
 use brain_protocol::opcode::Opcode;
 use brain_protocol::{RequestBody, ResponseBody};
 
@@ -71,9 +71,11 @@ impl RelationHandle {
     /// string. The SDK never round-trips the id.
     pub fn from_view(view: RelationView) -> Result<Self, ClientError> {
         let qname = view.relation_type.clone();
-        let r = view.to_relation(RelationTypeId::from(0)).map_err(
-            |e: RelationWireError| ClientError::Internal(format!("relation decode: {e}")),
-        )?;
+        let r = view
+            .to_relation(RelationTypeId::from(0))
+            .map_err(|e: RelationWireError| {
+                ClientError::Internal(format!("relation decode: {e}"))
+            })?;
         Ok(Self {
             id: r.id,
             chain_root: r.chain_root,
@@ -388,10 +390,7 @@ impl<'a> RelationsClient<'a> {
     }
 
     /// Fetch the current relation in the chain anchored at `id`.
-    pub async fn get_current(
-        &self,
-        id: RelationId,
-    ) -> Result<Option<RelationHandle>, ClientError> {
+    pub async fn get_current(&self, id: RelationId) -> Result<Option<RelationHandle>, ClientError> {
         self.fetch(id, true).await
     }
 
@@ -634,11 +633,7 @@ impl<'a> RelationListToBuilder<'a> {
         });
         let resp = self
             .client
-            .send_knowledge_request(
-                body,
-                Opcode::RelationListToReq,
-                Opcode::RelationListToResp,
-            )
+            .send_knowledge_request(body, Opcode::RelationListToReq, Opcode::RelationListToResp)
             .await?;
         match resp {
             ResponseBody::RelationListTo(frame) => {
@@ -712,6 +707,9 @@ impl<'a> RelationTraverseBuilder<'a> {
         self
     }
 
+    // Builder method: consumes and returns `self` (move-chain style),
+    // so the `as_*` self-by-ref convention does not apply.
+    #[allow(clippy::wrong_self_convention)]
     #[must_use]
     pub fn as_of(mut self, unix_nanos: u64) -> Self {
         self.time_at_unix_nanos = unix_nanos;
@@ -933,7 +931,9 @@ mod tests {
         };
         let err = build_create_request(&build).unwrap_err();
         match err {
-            ClientError::Internal(m) => assert!(m.contains("\"to\"") || m.contains("to is required")),
+            ClientError::Internal(m) => {
+                assert!(m.contains("\"to\"") || m.contains("to is required"))
+            }
             other => panic!("got {other:?}"),
         }
     }

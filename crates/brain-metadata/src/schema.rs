@@ -30,7 +30,13 @@ use redb::{Database, ReadableDatabase, TableDefinition};
 
 /// The schema version this crate writes. Bumped on backward-incompatible
 /// changes to the redb table layout or value encoding.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+///
+/// Phase C unified the substrate edge tables and the typed-relation
+/// tables under a single `NodeRef`-keyed layout. The on-disk shape is
+/// not readable by a v1 binary, and a v1 DB is not readable by a v2
+/// binary — operators must run the migration tool to copy data into a
+/// fresh v2 directory.
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// Singleton key inside [`SCHEMA_META_TABLE`].
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -62,6 +68,12 @@ pub enum SchemaError {
          upgrade the substrate or restore from a compatible backup"
     )]
     SchemaVersionTooNew { found: u32, supported: u32 },
+
+    #[error(
+        "data/ contains an older schema version (v{found}); this binary requires v{current}. \
+         Phase C is a hard break — delete the data/ directory and restart for a fresh DB."
+    )]
+    SchemaTooOld { found: u32, current: u32 },
 }
 
 /// Read the schema version from `db`, or initialize it on a fresh DB.
@@ -80,6 +92,14 @@ pub fn open_or_init_schema(db: &Database) -> Result<u32, SchemaError> {
                         return Err(SchemaError::SchemaVersionTooNew {
                             found: v,
                             supported: CURRENT_SCHEMA_VERSION,
+                        });
+                    }
+                    if v < CURRENT_SCHEMA_VERSION {
+                        // No in-place migration and no migration tool:
+                        // Brain is pre-user, fresh-start is acceptable.
+                        return Err(SchemaError::SchemaTooOld {
+                            found: v,
+                            current: CURRENT_SCHEMA_VERSION,
                         });
                     }
                     tracing::info!(
@@ -131,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_db_initializes_at_v1() {
+    fn fresh_db_initializes_at_current_version() {
         let dir = tempfile::tempdir().unwrap();
         let (db, _) = fresh_db(&dir);
         let v = open_or_init_schema(&db).unwrap();
@@ -146,12 +166,12 @@ mod tests {
         // Initialize then drop.
         {
             let db = Database::create(&path).unwrap();
-            assert_eq!(open_or_init_schema(&db).unwrap(), 1);
+            assert_eq!(open_or_init_schema(&db).unwrap(), CURRENT_SCHEMA_VERSION);
         }
         // Reopen; same version observed.
         let db = Database::open(&path).unwrap();
         let v = open_or_init_schema(&db).unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -159,13 +179,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.redb");
 
-        // Hand-write a future version (2) into the singleton.
+        // Hand-write a future version (current + 1) into the singleton.
+        let future = CURRENT_SCHEMA_VERSION + 1;
         {
             let db = Database::create(&path).unwrap();
             let wtxn = db.begin_write().unwrap();
             {
                 let mut t = wtxn.open_table(SCHEMA_META_TABLE).unwrap();
-                t.insert(SCHEMA_VERSION_KEY, &2_u32).unwrap();
+                t.insert(SCHEMA_VERSION_KEY, &future).unwrap();
             }
             wtxn.commit().unwrap();
         }
@@ -174,10 +195,39 @@ mod tests {
         let err = open_or_init_schema(&db).unwrap_err();
         match err {
             SchemaError::SchemaVersionTooNew { found, supported } => {
-                assert_eq!(found, 2);
+                assert_eq!(found, future);
                 assert_eq!(supported, CURRENT_SCHEMA_VERSION);
             }
             other => panic!("expected SchemaVersionTooNew, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_too_old_on_v1_db() {
+        // A v1 DB on disk is unreachable from the Phase C v2 layout. No
+        // migration tool exists — operators delete data/ and restart.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.redb");
+
+        {
+            let db = Database::create(&path).unwrap();
+            let wtxn = db.begin_write().unwrap();
+            {
+                let mut t = wtxn.open_table(SCHEMA_META_TABLE).unwrap();
+                t.insert(SCHEMA_VERSION_KEY, &1_u32).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let db = Database::open(&path).unwrap();
+        let err = open_or_init_schema(&db).unwrap_err();
+        match err {
+            SchemaError::SchemaTooOld { found, current } => {
+                assert_eq!(found, 1);
+                assert_eq!(current, CURRENT_SCHEMA_VERSION);
+                assert_eq!(current, 2);
+            }
+            other => panic!("expected SchemaTooOld, got {other:?}"),
         }
     }
 

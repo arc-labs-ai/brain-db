@@ -5,7 +5,7 @@
 use brain_core::RequestId;
 use brain_protocol::opcode::Opcode;
 use brain_protocol::request::{PlanBudget, PlanRequest, PlanState, PlanStrategy};
-use brain_protocol::response::{PlanResponseFrame, PlanStep};
+use brain_protocol::response::{PlanResponseFrame, PlanStatus, PlanStep};
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 
 use crate::client::Client;
@@ -13,6 +13,17 @@ use crate::error::ClientError;
 use crate::ops::common::{send_and_collect_until_eos, DEFAULT_STREAM_FRAME_CAP, FLAG_EOS};
 use crate::ops::stream::FrameStream;
 use crate::proto::frames::write_frame;
+
+/// Collected outcome of a PLAN call. `status` carries the server's
+/// classification of why the plan stopped (GoalReached / BudgetExhausted
+/// / NoPathFound / Cancelled) — populated from the final frame. The
+/// streaming form (`send_stream`) yields raw `PlanStep`s without status
+/// because the status is only known after the last frame arrives.
+#[derive(Debug, Clone)]
+pub struct PlanOutcome {
+    pub steps: Vec<PlanStep>,
+    pub status: Option<PlanStatus>,
+}
 
 pub struct PlanBuilder<'a> {
     client: &'a Client,
@@ -73,7 +84,7 @@ impl<'a> PlanBuilder<'a> {
         self
     }
 
-    pub async fn send(self) -> Result<Vec<PlanStep>, ClientError> {
+    pub async fn send(self) -> Result<PlanOutcome, ClientError> {
         let request_id = Some(
             self.request_id
                 .unwrap_or_else(|| self.client.next_request_id()),
@@ -115,10 +126,19 @@ impl<'a> PlanBuilder<'a> {
                     )
                     .await?;
                     let mut out = Vec::new();
+                    let mut status = None;
                     for f in frames {
                         match ResponseBody::decode(Opcode::PlanResp, &f.payload)? {
-                            ResponseBody::Plan(PlanResponseFrame { steps, .. }) => {
+                            ResponseBody::Plan(PlanResponseFrame {
+                                steps, plan_status, ..
+                            }) => {
                                 out.extend(steps);
+                                // Spec: plan_status is only meaningful on
+                                // the final frame, but a Some on any frame
+                                // is authoritative — take the last one.
+                                if plan_status.is_some() {
+                                    status = plan_status;
+                                }
                             }
                             _ => {
                                 return Err(ClientError::Protocol(
@@ -129,7 +149,7 @@ impl<'a> PlanBuilder<'a> {
                             }
                         }
                     }
-                    Ok(out)
+                    Ok(PlanOutcome { steps: out, status })
                 }
             })
             .await
@@ -167,6 +187,11 @@ impl<'a> PlanBuilder<'a> {
                     )),
                 },
             );
-        Ok(FrameStream::new(guard, Opcode::PlanResp, decoder))
+        Ok(FrameStream::new(
+            guard,
+            stream_id,
+            Opcode::PlanResp,
+            decoder,
+        ))
     }
 }

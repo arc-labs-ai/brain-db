@@ -366,7 +366,7 @@ Drift fixes (spec §02/03 wins): `MemoryId` bit layout corrected (shard 16 + slo
 Before tagging `phase-1-complete`:
 
 - [x] All sub-tasks 1.1–1.11 marked done in this file.
-- [x] `just verify` is green on a clean checkout. *(122 tests workspace, clippy clean, fmt clean, 23/23 skills valid.)*
+- [x] Verify suite (fmt-check + build + clippy + test + check-skills) is green on a clean checkout. *(122 tests workspace, clippy clean, fmt clean, 23/23 skills valid.)*
 - [x] `cargo test --workspace` runs ≥ 30 tests, all passing. *(122.)*
 - [x] At least one proptest with ≥ 1024 cases per opcode. *(`Opcode::from_u8_is_total` cycles every byte; `Frame::encode_decode_round_trip` and `decode_arbitrary_bytes_is_total` run 1024 cases each.)*
 - [x] Fuzz target builds and a 60-second run is clean. *(Three targets — `protocol_frame`, `protocol_request`, `protocol_response` — smoked at 60s each, ~67M total runs, zero panics, zero artifacts.)*

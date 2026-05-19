@@ -35,17 +35,32 @@ pub enum EdgeKindWire {
     PartOf = 7,
 }
 
-/// Spec §07/3 — recall-strategy hint.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+/// Client-side recall strategy selector.
+///
+/// Hybrid retrieval (semantic + lexical + graph + RRF fusion) is
+/// the default for every deployment. Schemas no longer gate
+/// retrieval; they only constrain typed knowledge ops. This
+/// selector is the client-side escape hatch.
+///
+/// - `Auto` — server default. Today: hybrid unless inside a txn,
+///   in which case it falls back to substrate so read-your-writes
+///   stays consistent with the buffered ops.
+/// - `SubstrateOnly` — force the raw substrate vector path. Used
+///   by benchmarks measuring HNSW-only latency and by clients
+///   that explicitly want no lexical/graph contribution.
+/// - `HybridOnly` — force hybrid; if a required retriever slot
+///   (semantic, lexical) is missing on this shard, the server
+///   returns `HybridUnavailable` instead of silently falling back.
+///   Lets callers fail loud rather than receive a degraded answer.
+#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 #[repr(u8)]
 pub enum RecallStrategy {
+    #[default]
     Auto = 0,
-    AnnOnly = 1,
-    Attractor = 2,
-    GraphWalk = 3,
-    Hybrid = 4,
+    SubstrateOnly = 1,
+    HybridOnly = 2,
 }
 
 /// Spec §07/4 — plan-strategy hint.

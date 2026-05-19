@@ -336,7 +336,9 @@ mod tests {
             wtxn.commit().unwrap();
         }
         let rtxn = db.begin_read().unwrap();
-        let got = extractor_lookup_by_qname(&rtxn, "acme", "p1").unwrap().unwrap();
+        let got = extractor_lookup_by_qname(&rtxn, "acme", "p1")
+            .unwrap()
+            .unwrap();
         assert_eq!(got.namespace, "acme");
         assert_eq!(got.name, "p1");
         assert_eq!(got.definition_blob, b"x");
@@ -347,8 +349,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = open_db(&dir);
         let rtxn = db.begin_read().unwrap();
-        assert!(extractor_lookup_by_qname(&rtxn, "acme", "missing").unwrap().is_none());
-        assert!(extractor_get(&rtxn, ExtractorId::from(99)).unwrap().is_none());
+        assert!(extractor_lookup_by_qname(&rtxn, "acme", "missing")
+            .unwrap()
+            .is_none());
+        assert!(extractor_get(&rtxn, ExtractorId::from(99))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

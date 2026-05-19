@@ -150,12 +150,6 @@ So Euclidean distance² = 2 - 2 × dot product. Sorting by Euclidean distance as
 
 The substrate uses cosine similarity (dot product) directly. HNSW's hnsw_rs supports it natively.
 
-## 12. The Hopfield-network connection
-
-Attractor dynamics (used in some `RECALL` strategies) treat memories as fixed points in vector space. Standard Hopfield networks expect bipolar vectors (±1); modern continuous Hopfield networks ([Ramsauer et al., 2020](https://arxiv.org/abs/2008.02217)) work with continuous unit vectors.
-
-Our normalized vectors are exactly the right input for continuous Hopfield-network-style attractor dynamics. The attractor executor uses this directly. See [08. Query Planner + Execution Engine](../08_query_planner/) §Attractor.
-
 ---
 
 *Continue to [`05_caching.md`](05_caching.md) for the cue cache.*

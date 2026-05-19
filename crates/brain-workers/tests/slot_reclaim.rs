@@ -7,7 +7,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
-use brain_metadata::tables::edge::{derived_by, origin, EdgeData, EDGES_IN_TABLE, EDGES_OUT_TABLE};
+use brain_metadata::tables::edge::{
+    derived_by, list_memory_edges_from, list_memory_edges_to, origin, zero_disambiguator, EdgeData,
+    EDGES_REVERSE_TABLE, EDGES_TABLE,
+};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
 use brain_ops::{dispatch, OpsContext, RealWriterHandle};
@@ -117,10 +120,19 @@ fn seed_edge(metadata: &SharedMetadataDb, src: MemoryId, kind: EdgeKind, tgt: Me
     let mut db = metadata.lock();
     let wtxn = db.write_txn().unwrap();
     {
-        let mut out = wtxn.open_table(EDGES_OUT_TABLE).unwrap();
-        let mut in_ = wtxn.open_table(EDGES_IN_TABLE).unwrap();
+        let mut out = wtxn.open_table(EDGES_TABLE).unwrap();
+        let mut rev = wtxn.open_table(EDGES_REVERSE_TABLE).unwrap();
         let data = EdgeData::new(1.0, origin::EXPLICIT, derived_by::CLIENT, now_unix_nanos());
-        brain_metadata::tables::edge::link(&mut out, &mut in_, src, kind, tgt, &data).unwrap();
+        brain_metadata::tables::edge::link(
+            &mut out,
+            &mut rev,
+            brain_core::NodeRef::Memory(src),
+            brain_core::EdgeKindRef::Builtin(kind),
+            brain_core::NodeRef::Memory(tgt),
+            zero_disambiguator(),
+            &data,
+        )
+        .unwrap();
     }
     wtxn.commit().unwrap();
 }
@@ -149,19 +161,17 @@ fn read_meta(metadata: &SharedMetadataDb, id: MemoryId) -> Option<MemoryMetadata
 fn edges_out_count(metadata: &SharedMetadataDb, src: MemoryId) -> usize {
     let db = metadata.lock();
     let rtxn = db.read_txn().unwrap();
-    let table = rtxn.open_table(EDGES_OUT_TABLE).unwrap();
-    let lo = (src.to_be_bytes(), 0u8, [0u8; 16]);
-    let hi = (src.to_be_bytes(), u8::MAX, [0xFFu8; 16]);
-    table.range(lo..=hi).unwrap().count()
+    list_memory_edges_from(&rtxn, src, None)
+        .map(|v| v.len())
+        .unwrap_or(0)
 }
 
 fn edges_in_count(metadata: &SharedMetadataDb, tgt: MemoryId) -> usize {
     let db = metadata.lock();
     let rtxn = db.read_txn().unwrap();
-    let table = rtxn.open_table(EDGES_IN_TABLE).unwrap();
-    let lo = (tgt.to_be_bytes(), 0u8, [0u8; 16]);
-    let hi = (tgt.to_be_bytes(), u8::MAX, [0xFFu8; 16]);
-    table.range(lo..=hi).unwrap().count()
+    list_memory_edges_to(&rtxn, tgt, None)
+        .map(|v| v.len())
+        .unwrap_or(0)
 }
 
 async fn run_one(
@@ -332,9 +342,13 @@ fn forget_stamps_tombstoned_at_unix_nanos() {
             txn_id: None,
             deduplicate: false,
         };
-        let memory_id = match dispatch(RequestBody::Encode(encode), &fix.ctx)
-            .await
-            .unwrap()
+        let memory_id = match dispatch(
+            RequestBody::Encode(encode),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap()
         {
             ResponseBody::Encode(r) => r.memory_id,
             _ => unreachable!(),
@@ -345,9 +359,13 @@ fn forget_stamps_tombstoned_at_unix_nanos() {
             request_id: [2; 16],
             txn_id: None,
         };
-        let _ = dispatch(RequestBody::Forget(forget), &fix.ctx)
-            .await
-            .unwrap();
+        let _ = dispatch(
+            RequestBody::Forget(forget),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
 
         let row = read_meta(&fix.metadata, MemoryId::from(memory_id)).unwrap();
         assert!(
@@ -371,9 +389,13 @@ fn forget_replay_does_not_overwrite_stamp() {
             txn_id: None,
             deduplicate: false,
         };
-        let memory_id = match dispatch(RequestBody::Encode(encode), &fix.ctx)
-            .await
-            .unwrap()
+        let memory_id = match dispatch(
+            RequestBody::Encode(encode),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap()
         {
             ResponseBody::Encode(r) => r.memory_id,
             _ => unreachable!(),
@@ -388,6 +410,7 @@ fn forget_replay_does_not_overwrite_stamp() {
                     request_id: rid,
                     txn_id: None,
                 }),
+                brain_ops::RequestCaller::anonymous(),
                 &fix.ctx,
             )
             .await

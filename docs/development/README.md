@@ -10,7 +10,7 @@ Inside [`usage/`](usage/):
 | Topic | File |
 |---|---|
 | Toolchain + clone | [`usage/01-setup.md`](usage/01-setup.md) |
-| Build + verify (`just verify`, etc.) | [`usage/02-build-and-verify.md`](usage/02-build-and-verify.md) |
+| Build + verify (fmt-check + build + clippy + test + check-skills) | [`usage/02-build-and-verify.md`](usage/02-build-and-verify.md) |
 | Run the server locally | [`usage/03-run-server.md`](usage/03-run-server.md) |
 | Use the CLI | [`usage/04-cli.md`](usage/04-cli.md) |
 | Use the Rust SDK | [`usage/05-sdk.md`](usage/05-sdk.md) |
@@ -43,8 +43,7 @@ sub-task; per-sub-task plans live under
 
 - Read the spec section, the phase doc, and the per-sub-task
   plan first.
-- Implement, run `just verify` (or
-  `cargo zigbuild --target x86_64-unknown-linux-gnu --workspace
-  --tests` on macOS), then commit.
+- Implement, run the verify suite (fmt-check + build + clippy +
+  test + check-skills), then commit.
 - See [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md) for the
   full contributor workflow + commit conventions.

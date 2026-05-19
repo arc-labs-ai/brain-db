@@ -66,7 +66,10 @@ impl RelationView {
             valid_from_unix_nanos: r.valid_from_unix_nanos.unwrap_or(0),
             valid_to_unix_nanos: r.valid_to_unix_nanos.unwrap_or(0),
             version: r.version,
-            superseded_by: r.superseded_by.map(RelationId::to_bytes).unwrap_or([0u8; 16]),
+            superseded_by: r
+                .superseded_by
+                .map(RelationId::to_bytes)
+                .unwrap_or([0u8; 16]),
             supersedes: r.supersedes.map(RelationId::to_bytes).unwrap_or([0u8; 16]),
             tombstoned: r.tombstoned,
             tombstoned_at_unix_nanos: r.tombstoned_at_unix_nanos.unwrap_or(0),
@@ -77,7 +80,10 @@ impl RelationView {
     /// Project a wire view back to a brain-core `Relation`. The caller
     /// supplies the resolved `relation_type` id (string canonical form
     /// is the wire transport, not the storage primitive).
-    pub fn to_relation(&self, relation_type: RelationTypeId) -> Result<Relation, RelationWireError> {
+    pub fn to_relation(
+        &self,
+        relation_type: RelationTypeId,
+    ) -> Result<Relation, RelationWireError> {
         let evidence = match &self.evidence {
             EvidenceRefWire::Inline(memory_ids) => memory_ids
                 .iter()
@@ -266,9 +272,8 @@ pub fn relation_type_canonical(rt: &RelationType) -> String {
 mod tests {
     use super::*;
     use crate::knowledge::relation_req::{
-        RelationCreateRequest, RelationGetRequest, RelationListFromRequest,
-        RelationListToRequest, RelationSupersedeRequest, RelationTombstoneRequest,
-        RelationTraverseRequest,
+        RelationCreateRequest, RelationGetRequest, RelationListFromRequest, RelationListToRequest,
+        RelationSupersedeRequest, RelationTombstoneRequest, RelationTraverseRequest,
     };
     use crate::knowledge::statement_req::EvidenceRefWire;
     use crate::opcode::Opcode;

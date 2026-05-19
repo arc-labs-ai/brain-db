@@ -117,11 +117,27 @@ fn open_cache(shard_dir: &Path) -> Option<Arc<Mutex<LlmCacheDb>>> {
     match LlmCacheDb::open(&path) {
         Ok(db) => Some(Arc::new(Mutex::new(db))),
         Err(e) => {
+            // redb uses POSIX flock; the most common cause of a failed
+            // open at server startup is another brain-server process
+            // already holding it. Spell that out so operators know what
+            // to do — the warn alone left users grep-ing.
+            let hint = if e.to_string().contains("Database already open")
+                || e.to_string().contains("Cannot acquire lock")
+            {
+                Some(format!(
+                    "another process holds the redb lock — check `fuser {p}` or \
+                     `pgrep -fl brain-server`",
+                    p = path.display()
+                ))
+            } else {
+                None
+            };
             tracing::warn!(
                 target: "brain_server::shard::llm_setup",
                 path = %path.display(),
                 error = %e,
-                "failed to open llm_cache.redb; LLM extractors will skip caching",
+                hint = hint.as_deref().unwrap_or(""),
+                "failed to open llm_cache.redb; LLM extractors will skip caching on this shard",
             );
             None
         }

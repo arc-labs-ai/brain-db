@@ -279,12 +279,13 @@ async fn extractor_disable_then_enable_round_trip_for_llm_row() {
     )
     .await;
     let llm_id = match body {
-        ResponseBody::ExtractorList(r) => r
-            .items
-            .iter()
-            .find(|i| i.namespace == "acme" && i.name == "llm_prefs")
-            .expect("acme:llm_prefs present")
-            .extractor_id,
+        ResponseBody::ExtractorList(r) => {
+            r.items
+                .iter()
+                .find(|i| i.namespace == "acme" && i.name == "llm_prefs")
+                .expect("acme:llm_prefs present")
+                .extractor_id
+        }
         _ => unreachable!(),
     };
 

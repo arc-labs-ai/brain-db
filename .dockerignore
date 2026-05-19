@@ -1,0 +1,42 @@
+# Build artefacts — rebuilt fresh inside the image.
+target/
+**/target/
+
+# VCS metadata — bloats build context, never needed at build time.
+.git/
+.gitignore
+.gitattributes
+
+# Editor / OS junk.
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Docs — not used by the build. Cuts hundreds of files from the
+# build context. Add back if a future build.rs reads from docs/.
+docs/
+spec/
+
+# Test fixtures (large, not needed in image).
+tests/data/
+**/tests/data/
+**/fixtures/
+
+# Devcontainer — a separate dev-only Dockerfile not used here.
+.devcontainer/
+
+# Claude / agent assets — not part of the build.
+.claude/
+AUTONOMY.md
+CLAUDE.md
+
+# Misc that doesn't belong in a server image.
+*.log
+*.bench
+benches/
+fuzz/
+
+# Local config that would override the in-image default.
+config/dev.toml

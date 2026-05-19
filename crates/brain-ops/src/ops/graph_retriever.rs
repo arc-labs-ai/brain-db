@@ -1,37 +1,61 @@
-//! Production `GraphRetriever` impl (phase 23.2).
+//! Production `GraphRetriever` impl.
 //!
-//! Same split as the semantic retriever (23.1): the trait + value
-//! types live in `brain-index::graph_retriever`; the impl that
-//! actually reads the entity / relation / statement redb tables
-//! lives here so `brain-index` stays free of the
-//! `brain-metadata` → `brain-storage` → `glommio` Linux-only
+//! The trait + value types live in `brain-index::graph_retriever`; the
+//! impl that reads redb tables lives here so `brain-index` stays free
+//! of the `brain-metadata` → `brain-storage` → `glommio` Linux-only
 //! transitive dep.
 //!
-//! Three traversal modes per §23/04 §3:
+//! ## One walk to rule them all
 //!
-//! - `Star` — BFS from anchor, emitting visited entities,
-//!   traversed relations, and (optionally) statements with the
-//!   visited entities as subjects.
-//! - `Path` — single-source BFS from `from` with early
-//!   termination at `to`; v1 emits the discovered path. Bidirectional
-//!   BFS is post-v1 (§23/04 §3).
-//! - `Subgraph` — closed k-hop neighbourhood (Star with
-//!   `relation_types = None` and `include_statements = true`).
+//! Before Wave 3a the retriever had two BFS modes: a memory-anchored
+//! walk over the substrate edge tables and an entity-anchored walk
+//! over the typed-relation tables. With the unified edge table
+//! (`EDGES_TABLE` / `EDGES_REVERSE_TABLE` keyed by
+//! `(NodeRef, EdgeKindRef, NodeRef, disambiguator)`), every edge —
+//! substrate `Builtin`, future `Mentions`, and typed `Typed(rel_id)`
+//! — lives in the same physical pair. The retriever no longer
+//! dispatches on anchor kind: it BFS's over `NodeRef` and emits
+//! whatever neighbours and relations the edges produce.
+//!
+//! ## Per-edge emission
+//!
+//! - `EdgeKindRef::Builtin(_)` — neighbour emitted (Memory or Entity
+//!   per the neighbour's `NodeRef` variant). No relation id exists,
+//!   so no `RankedItemId::Relation` is produced.
+//! - `EdgeKindRef::Mentions` — same shape as Builtin; reserved tag
+//!   that future mention edges will populate.
+//! - `EdgeKindRef::Typed(rt)` — neighbour emitted **and** the
+//!   `RelationId` (recovered from the edge-key disambiguator) emitted
+//!   as a separate `RankedItemId::Relation` hit. Superseded
+//!   (non-current) relations are dropped via the sidecar lookup so
+//!   the walk reflects the live graph.
+//!
+//! ## Anchor existence guard
+//!
+//! Fresh shards may not have created the `entities` / `memories`
+//! tables yet, in which case redb returns `TableError::TableDoesNotExist`
+//! on open. We map that to the matching `*AnchorNotFound` so callers
+//! see a meaningful "anchor missing" error instead of a generic
+//! `IndexUnavailable`. The auto-router relies on this distinction to
+//! drop tombstoned anchors and try the next semantic top-K hit
+//! without aborting the whole retrieval.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use brain_core::knowledge::{Relation, SubjectRef};
-use brain_core::{EntityId, RelationId, RelationTypeId, StatementId};
+use brain_core::knowledge::SubjectRef;
+use brain_core::{
+    EdgeKindRef, EntityId, MemoryId, NodeRef, RelationId, RelationTypeId, StatementId,
+};
 use brain_index::{
     proximity_score, validate_graph_depth, Direction, GraphError, GraphQuery, GraphRetriever,
     GraphRetrieverConfig, RankedItem, RankedItemId,
 };
-use brain_metadata::entity_ops::{entity_get, EntityOpError};
-use brain_metadata::relation_ops::{
-    relation_list_from, relation_list_to, RelationListFilter, RelationOpError,
-};
 use brain_metadata::statement_ops::{statement_list, StatementListFilter, StatementOpError};
+use brain_metadata::tables::edge::{walk_incoming, walk_outgoing, EdgeOpError, EdgeRow};
+use brain_metadata::tables::knowledge::entity::ENTITIES_TABLE;
+use brain_metadata::tables::knowledge::relation::RELATION_METADATA_TABLE;
+use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::MetadataDb;
 use parking_lot::Mutex;
 use redb::ReadTransaction;
@@ -70,9 +94,9 @@ impl GraphRetriever for BrainGraphRetriever {
                 direction,
                 relation_types,
                 include_statements,
-            } => run_star(
+            } => walk(
                 &rtxn,
-                *anchor,
+                NodeRef::from(*anchor),
                 *depth,
                 *direction,
                 relation_types.as_deref(),
@@ -84,85 +108,282 @@ impl GraphRetriever for BrainGraphRetriever {
                 to,
                 max_depth,
             } => run_path(&rtxn, *from, *to, *max_depth, config),
-            GraphQuery::Subgraph { anchor, depth } => {
-                run_star(&rtxn, *anchor, *depth, Direction::Both, None, true, config)
-            }
+            GraphQuery::Subgraph { anchor, depth } => walk(
+                &rtxn,
+                NodeRef::from(*anchor),
+                *depth,
+                Direction::Both,
+                None,
+                // Subgraph traditionally pulls evidence statements
+                // for entity anchors; for memory anchors there are
+                // no statement subjects to pivot from so the flag
+                // is harmless.
+                true,
+                config,
+            ),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Star / Subgraph.
+// Unified BFS.
 // ---------------------------------------------------------------------------
 
+/// Per-hit accumulator carrying enough information to rank and
+/// dedupe. We push raw entries and sort once at the end — sorting
+/// per-frontier wastes work because later hops can only score lower
+/// at equal weights.
+#[derive(Clone, Copy, Debug)]
+struct EmittedNode {
+    id: RankedItemId,
+    score: f32,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn run_star(
+fn walk(
     rtxn: &ReadTransaction,
-    anchor: EntityId,
+    anchor: NodeRef,
     depth: u8,
     direction: Direction,
-    relation_types: Option<&[RelationTypeId]>,
+    relation_type_filter: Option<&[RelationTypeId]>,
     include_statements: bool,
     config: &GraphRetrieverConfig,
 ) -> Result<Vec<RankedItem>, GraphError> {
-    if entity_get(rtxn, anchor).map_err(map_entity_err)?.is_none() {
-        return Err(GraphError::AnchorNotFound(anchor));
-    }
+    // Anchor existence guard. Picks the matching `*AnchorNotFound`
+    // variant so the router can tell entity vs memory misses apart.
+    check_anchor_exists(rtxn, anchor)?;
 
-    let mut visited: HashSet<EntityId> = HashSet::new();
-    visited.insert(anchor);
-    let mut frontier: VecDeque<(EntityId, u8)> = VecDeque::new();
-    frontier.push_back((anchor, 0));
+    let mut visited: HashSet<NodeRef> = HashSet::new();
+    // `(node, hop, edge_weight_into_node)`. Anchor enters with
+    // weight 1.0 (unused — it's never emitted).
+    let mut frontier: VecDeque<(NodeRef, u8, f32)> = VecDeque::new();
+    frontier.push_back((anchor, 0, 1.0));
 
-    let mut emitted_entities: Vec<(EntityId, u8)> = Vec::new();
-    let mut emitted_relations: Vec<(RelationId, u8)> = Vec::new();
-    let mut emitted_relations_seen: HashSet<RelationId> = HashSet::new();
-    let mut emitted_statements: Vec<(StatementId, u8)> = Vec::new();
+    let mut emitted: Vec<EmittedNode> = Vec::new();
+    let mut emitted_relations: HashSet<RelationId> = HashSet::new();
+    let mut emitted_statements: HashSet<StatementId> = HashSet::new();
+    let max_branching = config.max_branching as usize;
 
-    while let Some((current, hop)) = frontier.pop_front() {
-        // Anchor itself omitted (§23/04 §2).
-        if hop > 0 {
-            emitted_entities.push((current, hop));
-        }
-
-        if include_statements {
-            push_statements(
-                rtxn,
-                current,
-                hop,
-                config.max_branching,
-                &mut emitted_statements,
-            )?;
-        }
-
-        if hop >= depth {
-            // Reached the depth cap; this entity is emitted but
-            // we don't expand further.
+    while let Some((node, d, weight_in)) = frontier.pop_front() {
+        if !visited.insert(node) {
             continue;
         }
 
-        let children = fetch_children(rtxn, current, direction, relation_types, config)?;
-        for (relation, neighbour) in children {
-            if emitted_relations_seen.insert(relation.id) {
-                emitted_relations.push((relation.id, hop));
+        if d > 0 {
+            // Anchor itself is omitted from the result set. Score
+            // folds the incoming edge weight in so heavier edges at
+            // equal depth outrank lighter ones — preserves the
+            // substrate retriever's pre-Wave-3a contract while
+            // collapsing the entity-side score (weight = 1.0 for
+            // typed relations) to plain `proximity_score(d)`.
+            emitted.push(EmittedNode {
+                id: node_to_id(node),
+                score: proximity_score(d) * weight_in,
+            });
+        }
+
+        // Statement pivot — only meaningful for entity nodes.
+        if include_statements {
+            if let NodeRef::Entity(e) = node {
+                push_statements(
+                    rtxn,
+                    e,
+                    d,
+                    max_branching,
+                    &mut emitted,
+                    &mut emitted_statements,
+                )?;
             }
+        }
+
+        if d >= depth {
+            continue;
+        }
+
+        let neighbours = collect_neighbours(rtxn, node, direction)?;
+
+        // Per-hop branching cap. Stable ordering by `(kind bytes, to
+        // bytes, disambiguator)` is what `collect_neighbours` returns
+        // already, so the truncation is reproducible across runs.
+        let mut count = 0usize;
+        for (kind, neighbour, disamb, data) in neighbours {
+            if count >= max_branching {
+                tracing::warn!(
+                    target: "brain_ops::graph_retriever",
+                    anchor = ?node,
+                    cap = config.max_branching,
+                    "graph walk branching truncated at per-hop cap",
+                );
+                break;
+            }
+
+            if !kind_matches_filter(kind, relation_type_filter) {
+                continue;
+            }
+
+            // Typed edges go through the sidecar to drop superseded
+            // relations and to emit the relation id as a separate hit.
+            if let EdgeKindRef::Typed(_) = kind {
+                let rel_id = RelationId::from(disamb);
+                if !typed_edge_is_current(rtxn, rel_id)? {
+                    continue;
+                }
+                if emitted_relations.insert(rel_id) {
+                    // Relations sit at the same hop as the edge that
+                    // introduced them — `d` (the parent's hop), not
+                    // `d + 1`. Matches the pre-Wave-3a behaviour.
+                    emitted.push(EmittedNode {
+                        id: RankedItemId::Relation(rel_id),
+                        score: proximity_score(d),
+                    });
+                }
+            }
+
+            count += 1;
             if !visited.contains(&neighbour) {
-                visited.insert(neighbour);
-                frontier.push_back((neighbour, hop + 1));
+                frontier.push_back((neighbour, d + 1, data.weight));
             }
         }
     }
 
-    Ok(rank_and_truncate(
-        emitted_entities,
-        emitted_relations,
-        emitted_statements,
-        config.top_k,
-    ))
+    Ok(rank_emitted(emitted, config.top_k))
+}
+
+fn collect_neighbours(
+    rtxn: &ReadTransaction,
+    node: NodeRef,
+    direction: Direction,
+) -> Result<Vec<EdgeRow>, GraphError> {
+    let outgoing = || -> Result<_, GraphError> {
+        match walk_outgoing(rtxn, node, None) {
+            Ok(rows) => Ok(rows),
+            // No edges have ever been written on this shard yet —
+            // return an empty neighbour list rather than tearing
+            // down the BFS. The anchor existence check above already
+            // confirmed the node itself exists.
+            Err(EdgeOpError::Table(redb::TableError::TableDoesNotExist(_))) => Ok(Vec::new()),
+            Err(e) => Err(map_edge_err(e)),
+        }
+    };
+    let incoming = || -> Result<_, GraphError> {
+        match walk_incoming(rtxn, node, None) {
+            Ok(rows) => Ok(rows),
+            Err(EdgeOpError::Table(redb::TableError::TableDoesNotExist(_))) => Ok(Vec::new()),
+            Err(e) => Err(map_edge_err(e)),
+        }
+    };
+
+    let mut out = Vec::new();
+    match direction {
+        Direction::Outgoing => out.extend(outgoing()?),
+        Direction::Incoming => out.extend(incoming()?),
+        Direction::Both => {
+            out.extend(outgoing()?);
+            out.extend(incoming()?);
+        }
+    }
+
+    // Both-direction walks can yield the same physical edge twice
+    // when a symmetric `Builtin` kind has mirrored rows. Dedupe on
+    // `(kind, neighbour, disambiguator)` so the per-hop branching
+    // cap counts unique edges only.
+    out.sort_by(|a, b| {
+        a.0.to_bytes()
+            .cmp(&b.0.to_bytes())
+            .then_with(|| a.1.to_bytes().cmp(&b.1.to_bytes()))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    out.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+    Ok(out)
+}
+
+fn kind_matches_filter(kind: EdgeKindRef, filter: Option<&[RelationTypeId]>) -> bool {
+    match (kind, filter) {
+        // `None` means "include every kind", so substrate and typed
+        // edges both pass.
+        (_, None) => true,
+        // A non-empty allow-list restricts to typed edges with the
+        // listed relation types. Substrate `Builtin` / `Mentions`
+        // edges have no relation type, so they're excluded — the
+        // filter is asking specifically about typed relations.
+        (EdgeKindRef::Typed(rt), Some(types)) => types.contains(&rt),
+        (EdgeKindRef::Builtin(_) | EdgeKindRef::Mentions, Some(_)) => false,
+    }
+}
+
+fn typed_edge_is_current(rtxn: &ReadTransaction, rel_id: RelationId) -> Result<bool, GraphError> {
+    let sidecar = match rtxn.open_table(RELATION_METADATA_TABLE) {
+        Ok(t) => t,
+        // No typed relations exist on this shard. If we somehow saw
+        // a Typed edge without a sidecar row the data would be
+        // inconsistent; defer to the per-row lookup below to surface
+        // it as "not current".
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(GraphError::IndexUnavailable(format!("sidecar open: {e}"))),
+    };
+    let row = sidecar
+        .get(&rel_id.to_bytes())
+        .map_err(|e| GraphError::IndexUnavailable(format!("sidecar get: {e}")))?;
+    Ok(row.map(|g| g.value().is_current()).unwrap_or(false))
+}
+
+fn check_anchor_exists(rtxn: &ReadTransaction, anchor: NodeRef) -> Result<(), GraphError> {
+    match anchor {
+        NodeRef::Memory(m) => check_memory_anchor(rtxn, m),
+        NodeRef::Entity(e) => check_entity_anchor(rtxn, e),
+    }
+}
+
+fn check_memory_anchor(rtxn: &ReadTransaction, anchor: MemoryId) -> Result<(), GraphError> {
+    match rtxn.open_table(MEMORIES_TABLE) {
+        Ok(memories) => {
+            let row = memories
+                .get(&anchor.to_be_bytes())
+                .map_err(|e| GraphError::IndexUnavailable(format!("memories.get: {e}")))?;
+            let Some(row) = row else {
+                return Err(GraphError::MemoryAnchorNotFound(anchor));
+            };
+            if row.value().is_tombstoned() {
+                return Err(GraphError::MemoryAnchorNotFound(anchor));
+            }
+            Ok(())
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            Err(GraphError::MemoryAnchorNotFound(anchor))
+        }
+        Err(e) => Err(GraphError::IndexUnavailable(format!(
+            "open memories table: {e}"
+        ))),
+    }
+}
+
+fn check_entity_anchor(rtxn: &ReadTransaction, anchor: EntityId) -> Result<(), GraphError> {
+    match rtxn.open_table(ENTITIES_TABLE) {
+        Ok(entities) => {
+            let row = entities
+                .get(&anchor.to_bytes())
+                .map_err(|e| GraphError::IndexUnavailable(format!("entities.get: {e}")))?;
+            if row.is_none() {
+                return Err(GraphError::AnchorNotFound(anchor));
+            }
+            Ok(())
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => Err(GraphError::AnchorNotFound(anchor)),
+        Err(e) => Err(GraphError::IndexUnavailable(format!(
+            "open entities table: {e}"
+        ))),
+    }
+}
+
+fn node_to_id(n: NodeRef) -> RankedItemId {
+    match n {
+        NodeRef::Memory(m) => RankedItemId::Memory(m),
+        NodeRef::Entity(e) => RankedItemId::Entity(e),
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Path.
+// Path (entity-only in v1).
 // ---------------------------------------------------------------------------
 
 fn run_path(
@@ -172,16 +393,12 @@ fn run_path(
     max_depth: u8,
     config: &GraphRetrieverConfig,
 ) -> Result<Vec<RankedItem>, GraphError> {
-    if entity_get(rtxn, from).map_err(map_entity_err)?.is_none() {
-        return Err(GraphError::AnchorNotFound(from));
-    }
-    if entity_get(rtxn, to).map_err(map_entity_err)?.is_none() {
-        return Err(GraphError::AnchorNotFound(to));
-    }
+    check_entity_anchor(rtxn, from)?;
+    check_entity_anchor(rtxn, to)?;
 
     // Single-source BFS from `from`. Tracks parent for each
-    // discovered entity so we can reconstruct the path once
-    // `to` is dequeued (§23/04 §3 v1).
+    // discovered entity so we can reconstruct the path once `to`
+    // is dequeued.
     let mut visited: HashSet<EntityId> = HashSet::new();
     visited.insert(from);
     let mut parents: HashMap<EntityId, (EntityId, RelationId)> = HashMap::new();
@@ -197,25 +414,40 @@ fn run_path(
         if hop >= max_depth {
             continue;
         }
-        let children = fetch_children(rtxn, current, Direction::Both, None, config)?;
-        for (relation, neighbour) in children {
-            if visited.insert(neighbour) {
-                parents.insert(neighbour, (current, relation.id));
-                frontier.push_back((neighbour, hop + 1));
-                if neighbour == to {
-                    // Don't break here — let the outer loop's
-                    // pop_front pick `to` up and exit cleanly.
-                }
+
+        let neighbours = collect_neighbours(rtxn, NodeRef::Entity(current), Direction::Both)?;
+        let mut count = 0usize;
+        let cap = config.max_branching as usize;
+        for (kind, neighbour, disamb, _data) in neighbours {
+            if count >= cap {
+                break;
             }
+            // Path is the typed knowledge graph; substrate edges
+            // never form a relation-chain so they're not eligible.
+            let EdgeKindRef::Typed(_) = kind else {
+                continue;
+            };
+            let rel_id = RelationId::from(disamb);
+            if !typed_edge_is_current(rtxn, rel_id)? {
+                continue;
+            }
+            let NodeRef::Entity(neighbour) = neighbour else {
+                continue;
+            };
+            if visited.insert(neighbour) {
+                parents.insert(neighbour, (current, rel_id));
+                frontier.push_back((neighbour, hop + 1));
+            }
+            count += 1;
         }
     }
 
     let mut entities: Vec<(EntityId, u8)> = Vec::new();
     let mut relations: Vec<(RelationId, u8)> = Vec::new();
     if found {
-        // Walk back from `to` via `parents` to assemble the
-        // path. Both endpoints emitted with score 1.0; the
-        // path-length affects scores of intermediates only.
+        // Walk back from `to` via `parents`. Both endpoints emit at
+        // hop 0 (score 1.0); intermediates carry the distance from
+        // the target node.
         entities.push((from, 0));
         entities.push((to, 0));
         let mut cursor = to;
@@ -232,145 +464,26 @@ fn run_path(
             }
         }
     } else {
-        // No path; §23/04 §3 emits both anchors with score 0.5.
+        // No path; emit both endpoints with the proximity-1 score so
+        // the planner can still highlight the disconnected pair.
         entities.push((from, 1));
         entities.push((to, 1));
     }
 
-    Ok(rank_and_truncate(
-        entities,
-        relations,
-        Vec::new(),
-        config.top_k,
-    ))
-}
-
-// ---------------------------------------------------------------------------
-// Children expansion.
-// ---------------------------------------------------------------------------
-
-fn fetch_children(
-    rtxn: &ReadTransaction,
-    entity: EntityId,
-    direction: Direction,
-    relation_types: Option<&[RelationTypeId]>,
-    config: &GraphRetrieverConfig,
-) -> Result<Vec<(Relation, EntityId)>, GraphError> {
-    let mut filter = RelationListFilter {
-        relation_type: None,
-        current_only: true,
-        limit: config.max_branching as usize,
-    };
-
-    let mut relations: Vec<Relation> = Vec::new();
-    match direction {
-        Direction::Outgoing => {
-            relations.extend(fetch_dir(
-                rtxn,
-                entity,
-                true,
-                &mut filter,
-                relation_types,
-                config,
-            )?);
-        }
-        Direction::Incoming => {
-            relations.extend(fetch_dir(
-                rtxn,
-                entity,
-                false,
-                &mut filter,
-                relation_types,
-                config,
-            )?);
-        }
-        Direction::Both => {
-            relations.extend(fetch_dir(
-                rtxn,
-                entity,
-                true,
-                &mut filter,
-                relation_types,
-                config,
-            )?);
-            relations.extend(fetch_dir(
-                rtxn,
-                entity,
-                false,
-                &mut filter,
-                relation_types,
-                config,
-            )?);
-        }
+    let mut items: Vec<EmittedNode> = Vec::with_capacity(entities.len() + relations.len());
+    for (id, d) in entities {
+        items.push(EmittedNode {
+            id: RankedItemId::Entity(id),
+            score: proximity_score(d),
+        });
     }
-
-    // Deterministic child sort by RelationId bytes (§23/04 §2 +
-    // §4 — reproducible truncation at branching cap).
-    relations.sort_by_key(|r| r.id.to_bytes());
-    relations.dedup_by_key(|r| r.id);
-
-    let truncated = if relations.len() > config.max_branching as usize {
-        tracing::warn!(
-            target: "brain_ops::graph_retriever",
-            anchor = ?entity,
-            cap = config.max_branching,
-            actual = relations.len(),
-            "graph retriever branching truncated",
-        );
-        relations.truncate(config.max_branching as usize);
-        true
-    } else {
-        false
-    };
-    let _ = truncated;
-
-    let pairs = relations
-        .into_iter()
-        .map(|r| {
-            let neighbour = if r.from_entity == entity {
-                r.to_entity
-            } else {
-                r.from_entity
-            };
-            (r, neighbour)
-        })
-        .collect();
-    Ok(pairs)
-}
-
-fn fetch_dir(
-    rtxn: &ReadTransaction,
-    entity: EntityId,
-    outgoing: bool,
-    filter: &mut RelationListFilter,
-    relation_types: Option<&[RelationTypeId]>,
-    config: &GraphRetrieverConfig,
-) -> Result<Vec<Relation>, GraphError> {
-    let _ = config;
-    let mut out: Vec<Relation> = Vec::new();
-    if let Some(types) = relation_types {
-        if types.is_empty() {
-            return Ok(out);
-        }
-        for ty in types {
-            filter.relation_type = Some(*ty);
-            let rows = if outgoing {
-                relation_list_from(rtxn, entity, filter).map_err(map_relation_err)?
-            } else {
-                relation_list_to(rtxn, entity, filter).map_err(map_relation_err)?
-            };
-            out.extend(rows);
-        }
-    } else {
-        filter.relation_type = None;
-        let rows = if outgoing {
-            relation_list_from(rtxn, entity, filter).map_err(map_relation_err)?
-        } else {
-            relation_list_to(rtxn, entity, filter).map_err(map_relation_err)?
-        };
-        out.extend(rows);
+    for (id, d) in relations {
+        items.push(EmittedNode {
+            id: RankedItemId::Relation(id),
+            score: proximity_score(d),
+        });
     }
-    Ok(out)
+    Ok(rank_emitted(items, config.top_k))
 }
 
 // ---------------------------------------------------------------------------
@@ -381,8 +494,9 @@ fn push_statements(
     rtxn: &ReadTransaction,
     subject: EntityId,
     hop: u8,
-    cap: u32,
-    out: &mut Vec<(StatementId, u8)>,
+    cap: usize,
+    out: &mut Vec<EmittedNode>,
+    seen: &mut HashSet<StatementId>,
 ) -> Result<(), GraphError> {
     let filter = StatementListFilter {
         subject: Some(subject),
@@ -390,49 +504,35 @@ fn push_statements(
         kind: None,
         current_only: true,
         min_confidence: None,
-        limit: cap as usize,
+        limit: cap,
     };
-    let rows = statement_list(rtxn, &filter).map_err(map_statement_err)?;
+    let rows = match statement_list(rtxn, &filter) {
+        Ok(rows) => rows,
+        // A shard that has never written any statement yet won't
+        // have the by-subject index. Treat as empty list so the BFS
+        // keeps walking other branches.
+        Err(StatementOpError::Table(redb::TableError::TableDoesNotExist(_))) => Vec::new(),
+        Err(e) => return Err(map_statement_err(e)),
+    };
     for s in rows {
-        if matches!(s.subject, SubjectRef::Entity(_)) {
-            out.push((s.id, hop));
+        if !matches!(s.subject, SubjectRef::Entity(_)) {
+            continue;
         }
+        if !seen.insert(s.id) {
+            continue;
+        }
+        out.push(EmittedNode {
+            id: RankedItemId::Statement(s.id),
+            score: proximity_score(hop),
+        });
     }
     Ok(())
 }
 
-fn rank_and_truncate(
-    entities: Vec<(EntityId, u8)>,
-    relations: Vec<(RelationId, u8)>,
-    statements: Vec<(StatementId, u8)>,
-    top_k: usize,
-) -> Vec<RankedItem> {
-    let mut items: Vec<RankedItem> =
-        Vec::with_capacity(entities.len() + relations.len() + statements.len());
-    for (id, d) in entities {
-        items.push(RankedItem {
-            id: RankedItemId::Entity(id),
-            rank: 0,
-            score: proximity_score(d),
-            snippet: None,
-        });
-    }
-    for (id, d) in relations {
-        items.push(RankedItem {
-            id: RankedItemId::Relation(id),
-            rank: 0,
-            score: proximity_score(d),
-            snippet: None,
-        });
-    }
-    for (id, d) in statements {
-        items.push(RankedItem {
-            id: RankedItemId::Statement(id),
-            rank: 0,
-            score: proximity_score(d),
-            snippet: None,
-        });
-    }
+fn rank_emitted(mut items: Vec<EmittedNode>, top_k: usize) -> Vec<RankedItem> {
+    // Score-descending; ties broken on the same id_sort_key the
+    // pre-unification retriever used so RRF stays deterministic
+    // across runs.
     items.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -440,10 +540,16 @@ fn rank_and_truncate(
             .then_with(|| id_sort_key(&a.id).cmp(&id_sort_key(&b.id)))
     });
     items.truncate(top_k);
-    for (i, it) in items.iter_mut().enumerate() {
-        it.rank = (i as u32) + 1;
-    }
     items
+        .into_iter()
+        .enumerate()
+        .map(|(i, it)| RankedItem {
+            id: it.id,
+            rank: (i as u32) + 1,
+            score: it.score,
+            snippet: None,
+        })
+        .collect()
 }
 
 fn id_sort_key(id: &RankedItemId) -> [u8; 17] {
@@ -469,12 +575,8 @@ fn id_sort_key(id: &RankedItemId) -> [u8; 17] {
     key
 }
 
-fn map_entity_err(e: EntityOpError) -> GraphError {
-    GraphError::IndexUnavailable(format!("entity_get: {e}"))
-}
-
-fn map_relation_err(e: RelationOpError) -> GraphError {
-    GraphError::IndexUnavailable(format!("relation_list: {e}"))
+fn map_edge_err(e: EdgeOpError) -> GraphError {
+    GraphError::IndexUnavailable(format!("edges scan: {e}"))
 }
 
 fn map_statement_err(e: StatementOpError) -> GraphError {

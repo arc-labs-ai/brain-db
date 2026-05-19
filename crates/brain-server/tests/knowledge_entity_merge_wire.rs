@@ -13,8 +13,7 @@ use brain_protocol::handshake::{
 };
 use brain_protocol::knowledge::{
     EntityCreateRequest, EntityGetRequest, EntityListRequest, EntityMergeRequest,
-    EntityResolveRequest, EntityTombstoneRequest, EntityUnmergeRequest,
-    ResolutionOutcomeWire,
+    EntityResolveRequest, EntityTombstoneRequest, EntityUnmergeRequest, ResolutionOutcomeWire,
 };
 use brain_protocol::opcode::Opcode;
 use brain_protocol::request::RequestBody;
@@ -75,8 +74,8 @@ where
             .await
             .expect("payload");
     }
-    let (frame, rest) = Frame::decode_with_max(&buf, brain_protocol::MAX_PAYLOAD_BYTES as u32)
-        .expect("decode");
+    let (frame, rest) =
+        Frame::decode_with_max(&buf, brain_protocol::MAX_PAYLOAD_BYTES as u32).expect("decode");
     debug_assert!(rest.is_empty());
     frame
 }
@@ -139,9 +138,11 @@ async fn round_trip(
     send_frame(client, Frame::new(opcode, FLAG_EOS, stream_id, payload)).await;
     let resp = read_one_frame(client).await;
     let resp_opcode = resp.header.opcode_u16();
-    let body =
-        ResponseBody::decode(Opcode::from_u16(resp_opcode).expect("known opcode"), &resp.payload)
-            .expect("decode resp");
+    let body = ResponseBody::decode(
+        Opcode::from_u16(resp_opcode).expect("known opcode"),
+        &resp.payload,
+    )
+    .expect("decode resp");
     (resp_opcode, body)
 }
 
@@ -176,7 +177,9 @@ async fn create_person(
 #[tokio::test(flavor = "current_thread")]
 async fn merge_and_unmerge_round_trip() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let alice = create_person(&mut client, 1, "Alice", vec![]).await;
@@ -305,7 +308,9 @@ async fn merge_and_unmerge_round_trip() {
 #[tokio::test(flavor = "current_thread")]
 async fn merge_self_returns_error() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let alice = create_person(&mut client, 1, "Alice", vec![]).await;
@@ -333,7 +338,9 @@ async fn merge_self_returns_error() {
 #[tokio::test(flavor = "current_thread")]
 async fn merge_low_confidence_returns_error() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let alice = create_person(&mut client, 1, "Alice", vec![]).await;
@@ -358,7 +365,9 @@ async fn merge_low_confidence_returns_error() {
 #[tokio::test(flavor = "current_thread")]
 async fn tombstone_then_get_shows_flag() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let alice = create_person(&mut client, 1, "Alice", vec![]).await;
@@ -398,7 +407,9 @@ async fn tombstone_then_get_shows_flag() {
 #[tokio::test(flavor = "current_thread")]
 async fn resolve_exact_match_via_canonical_name() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let alice = create_person(&mut client, 1, "Alice", vec![]).await;
@@ -432,7 +443,9 @@ async fn resolve_exact_match_via_canonical_name() {
 #[tokio::test(flavor = "current_thread")]
 async fn resolve_unknown_returns_not_found() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     create_person(&mut client, 1, "Alice", vec![]).await;
@@ -462,7 +475,9 @@ async fn resolve_unknown_returns_not_found() {
 #[tokio::test(flavor = "current_thread")]
 async fn list_returns_created_entities() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let alice = create_person(&mut client, 1, "Alice", vec![]).await;
@@ -505,7 +520,9 @@ async fn list_returns_created_entities() {
 #[tokio::test(flavor = "current_thread")]
 async fn list_with_name_prefix_filters() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     let alice = create_person(&mut client, 1, "Alice", vec![]).await;
@@ -539,7 +556,9 @@ async fn list_with_name_prefix_filters() {
 #[tokio::test(flavor = "current_thread")]
 async fn list_cursor_rejected_in_v1() {
     let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client).await;
 
     create_person(&mut client, 1, "Alice", vec![]).await;

@@ -130,14 +130,14 @@ pub struct EntityTombstoneRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::request::RequestBody;
-    use crate::response::ResponseBody;
     use crate::knowledge::{
         EntityCreateResponse, EntityGetResponse, EntityMergeResponse, EntityRenameResponse,
         EntityTombstoneResponse, EntityUnmergeResponse, EntityUpdateResponse, EntityView,
         ResolutionOutcomeWire,
     };
     use crate::opcode::Opcode;
+    use crate::request::RequestBody;
+    use crate::response::ResponseBody;
 
     fn sample_uuid(seed: u8) -> WireUuid {
         let mut u = [0u8; 16];
@@ -347,7 +347,10 @@ mod tests {
                 outcome,
                 tier: 1,
                 confidence: 0.9,
-                resolved_entity: if matches!(outcome, ResolutionOutcomeWire::Resolved | ResolutionOutcomeWire::Created) {
+                resolved_entity: if matches!(
+                    outcome,
+                    ResolutionOutcomeWire::Resolved | ResolutionOutcomeWire::Created
+                ) {
                     sample_uuid(30)
                 } else {
                     [0; 16]
@@ -401,4 +404,3 @@ mod tests {
         }));
     }
 }
-

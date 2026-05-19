@@ -19,7 +19,7 @@ container was started without those flags.
 **Fix:**
 
 ```bash
-just docker-rebuild
+devcontainer up --workspace-folder . --remove-existing-container --build-no-cache
 ```
 
 Recreates the container from the devcontainer spec.
@@ -27,7 +27,7 @@ Recreates the container from the devcontainer spec.
 **Verify:**
 
 ```bash
-just docker bash -c "cat /proc/self/limits | grep memlock"
+cat /proc/self/limits | grep memlock
 ```
 
 Should show `max locked memory  unlimited  unlimited`.
@@ -125,13 +125,17 @@ execution — not a regression in Brain. Tests pass standalone.
 **Fix:**
 
 ```bash
-just docker-verify
+cargo fmt --all -- --check
+cargo build --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
+./scripts/check-skills.sh
 ```
 
 Re-run. Passes on retry. To run brain-index in isolation:
 
 ```bash
-just docker-test -p brain-index
+cargo test -p brain-index
 ```
 
 ## Clean build required
@@ -155,7 +159,7 @@ post-clean build takes 3–5 minutes.
 
 ```bash
 docker volume rm brain-cargo-registry brain-cargo-git brain-target-cache
-just docker-rebuild
+devcontainer up --workspace-folder . --remove-existing-container --build-no-cache
 ```
 
 ## Server starts but `/healthz` hangs
@@ -207,7 +211,7 @@ text returns an empty Vec.
 2. **Wrong shard.** RECALL queries are routed per agent_id. If
    your test client uses a different agent_id from the one that
    ran ENCODE, you'll hit a different shard.
-   - **Verify:** `just cli --output json debug-snapshot --shard 0`
+   - **Verify:** `cargo run --bin brain-cli -- --output json debug-snapshot --shard 0`
      vs `--shard 1` to see where memories landed.
 
 3. **Tombstoned.** Soft-FORGET hides memories from RECALL.
@@ -270,8 +274,8 @@ Increase Docker Desktop's RAM allocation to ≥ 6 GiB (Settings →
 Resources → Memory). Or run subsets:
 
 ```bash
-just docker-test -p brain-server
-just docker-clippy
+cargo test -p brain-server
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## Next

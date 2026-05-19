@@ -6,18 +6,21 @@
 //! schema-version row is written. The single code path used both
 //! by the system-schema bootstrap and by every user `SCHEMA_UPLOAD`.
 
+use std::collections::HashSet;
+
 use brain_core::knowledge::StatementKind;
-use brain_core::{Cardinality, EntityTypeId, ExtractorKind};
+use brain_core::{Cardinality, EntityTypeId, ExtractorKind, PredicateId};
 use brain_protocol::schema::{
-    CardinalityAst, ExtractorKindAst, ObjectTypeDecl, SchemaItem, StatementKindAst,
-    ValidatedSchema,
+    CardinalityAst, ExtractorKindAst, ObjectTypeDecl, SchemaItem, StatementKindAst, ValidatedSchema,
 };
-use redb::WriteTransaction;
+use redb::{ReadableTable, WriteTransaction};
 
 use crate::entity_type_ops::{entity_type_intern, entity_type_lookup_by_name, EntityTypeOpError};
 use crate::extractor_ops::{extractor_intern, ExtractorOpError};
 use crate::predicate_ops::{predicate_intern, PredicateOpError};
 use crate::relation_type_ops::{relation_type_intern, RelationTypeOpError};
+use crate::tables::knowledge::predicate::{PredicateDefinition, PREDICATES_TABLE};
+use crate::tables::knowledge::statement::{statement_flags, StatementMetadata, STATEMENTS_TABLE};
 
 #[derive(thiserror::Error, Debug)]
 pub enum SchemaApplyError {
@@ -31,6 +34,10 @@ pub enum SchemaApplyError {
     Extractor(#[from] ExtractorOpError),
     #[error("extractor encode: {0}")]
     ExtractorEncode(String),
+    #[error("redb storage: {0}")]
+    Storage(#[from] redb::StorageError),
+    #[error("redb table: {0}")]
+    Table(#[from] redb::TableError),
 }
 
 /// Walk `validated.items` in source order and intern each
@@ -98,6 +105,78 @@ pub fn apply_schema_definitions(
     Ok(())
 }
 
+/// Mark every statement in `namespace` whose predicate isn't in the
+/// just-uploaded schema with [`statement_flags::OUTSIDE_ACTIVE_SCHEMA`]
+/// (and clear the flag from statements that *are* now in-vocabulary).
+///
+/// Cost: O(N) over the predicates table (small) plus O(N) over the
+/// statements table for the namespace's predicate ids. SCHEMA_UPLOAD
+/// is a rare operator action — a full scan inside the upload txn is
+/// acceptable per the design note.
+///
+/// Returns the count of rows whose flag bit changed (for observability).
+pub fn flag_statements_outside_schema(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    active_predicate_ids: &HashSet<PredicateId>,
+) -> Result<usize, SchemaApplyError> {
+    // First pass: build the namespace ↔ predicate-id map so we don't
+    // touch every row in every other namespace.
+    let predicate_namespace_map: Vec<(PredicateId, String)> = {
+        let t = wtxn.open_table(PREDICATES_TABLE)?;
+        let mut out = Vec::new();
+        for entry in t.iter()? {
+            let (k, v) = entry?;
+            let pid = PredicateId::from(k.value());
+            let row: PredicateDefinition = v.value();
+            out.push((pid, row.namespace));
+        }
+        out
+    };
+    let in_namespace: HashSet<PredicateId> = predicate_namespace_map
+        .iter()
+        .filter(|(_, ns)| ns == namespace)
+        .map(|(p, _)| *p)
+        .collect();
+
+    let mut changed = 0usize;
+    let updates: Vec<([u8; 16], StatementMetadata)> = {
+        let t = wtxn.open_table(STATEMENTS_TABLE)?;
+        let mut out = Vec::new();
+        for entry in t.iter()? {
+            let (k, v) = entry?;
+            let row: StatementMetadata = v.value();
+            let pid = PredicateId::from(row.predicate_id);
+            // Only inspect rows whose predicate lives in this
+            // namespace — cross-namespace rows are off-topic for
+            // this upload.
+            if !in_namespace.contains(&pid) {
+                continue;
+            }
+            let should_flag = !active_predicate_ids.contains(&pid);
+            let has_flag = row.has_flag(statement_flags::OUTSIDE_ACTIVE_SCHEMA);
+            if should_flag != has_flag {
+                let mut new_row = row;
+                if should_flag {
+                    new_row.set_flag(statement_flags::OUTSIDE_ACTIVE_SCHEMA);
+                } else {
+                    new_row.clear_flag(statement_flags::OUTSIDE_ACTIVE_SCHEMA);
+                }
+                out.push((k.value(), new_row));
+            }
+        }
+        out
+    };
+    {
+        let mut t = wtxn.open_table(STATEMENTS_TABLE)?;
+        for (k, row) in updates {
+            t.insert(&k, &row)?;
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
 fn map_statement_kind(k: StatementKindAst) -> Option<StatementKind> {
     match k {
         StatementKindAst::Fact => Some(StatementKind::Fact),
@@ -158,9 +237,7 @@ fn resolve_entity_type(
 mod tests {
     use super::*;
     use crate::extractor_ops::extractor_lookup_by_qname;
-    use brain_protocol::schema::{
-        parse_schema, validate, ExtractorDef, ExtractorTarget,
-    };
+    use brain_protocol::schema::{parse_schema, validate, ExtractorDef, ExtractorTarget};
     use redb::{Database, ReadableDatabase};
 
     fn open_db(dir: &tempfile::TempDir) -> Database {

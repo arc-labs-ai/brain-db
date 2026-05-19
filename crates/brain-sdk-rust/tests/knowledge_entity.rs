@@ -123,7 +123,10 @@ async fn create_person_round_trip() {
 
     assert_eq!(handle.id, EntityId::from(entity_id));
     assert_eq!(handle.canonical_name, "Alice");
-    assert_eq!(handle.attributes.email.as_deref(), Some("alice@example.com"));
+    assert_eq!(
+        handle.attributes.email.as_deref(),
+        Some("alice@example.com")
+    );
     assert_eq!(handle.attributes.role.as_deref(), Some("Engineer"));
     assert_eq!(handle.attributes.team, None);
 }
@@ -442,7 +445,12 @@ async fn resolve_resolved_outcome() {
         .await
         .expect("resolve");
     match outcome {
-        ResolutionOutcome::Resolved { entity_id: id, tier, confidence, .. } => {
+        ResolutionOutcome::Resolved {
+            entity_id: id,
+            tier,
+            confidence,
+            ..
+        } => {
             assert_eq!(id, EntityId::from(entity_id));
             assert_eq!(tier, 1);
             assert!((confidence - 1.0).abs() < 1e-6);

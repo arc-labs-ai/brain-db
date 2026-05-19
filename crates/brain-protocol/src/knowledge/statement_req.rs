@@ -363,7 +363,7 @@ mod tests {
             StatementObjectWire::EntityRef(sample_uuid(10)),
             StatementObjectWire::Value(StatementValueWire::Text("hello".into())),
             StatementObjectWire::Value(StatementValueWire::Integer(-7)),
-            StatementObjectWire::Value(StatementValueWire::Float(3.14)),
+            StatementObjectWire::Value(StatementValueWire::Float(3.5)),
             StatementObjectWire::Value(StatementValueWire::Bool(true)),
             StatementObjectWire::Value(StatementValueWire::UnixNanos(42)),
             StatementObjectWire::Value(StatementValueWire::Blob(vec![0xDE, 0xAD])),
@@ -506,4 +506,3 @@ mod tests {
         }));
     }
 }
-

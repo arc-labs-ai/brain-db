@@ -16,19 +16,15 @@
 //!   reverse-index population.
 
 use brain_core::knowledge::{
-    EvidenceEntry, EvidenceRef, Predicate, Statement, StatementObject, SubjectRef,
-    TombstoneReason,
+    EvidenceEntry, EvidenceRef, Predicate, Statement, StatementObject, SubjectRef, TombstoneReason,
 };
-use brain_core::{
-    EntityId, EvidenceOverflowId, PredicateId, StatementId, StatementKind,
-};
+use brain_core::{EntityId, EvidenceOverflowId, PredicateId, StatementId, StatementKind};
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
 use crate::tables::knowledge::statement::{
     confidence_bucket, metadata_from_statement, statement_from_metadata, tombstone_reason,
-    EvidenceOverflow, StatementMetadata, EVIDENCE_OVERFLOW_TABLE,
-    STATEMENTS_BY_EVENT_TIME_TABLE, STATEMENTS_BY_EVIDENCE_TABLE,
-    STATEMENTS_BY_OBJECT_ENTITY_TABLE, STATEMENTS_BY_PREDICATE_TABLE,
+    EvidenceOverflow, StatementMetadata, EVIDENCE_OVERFLOW_TABLE, STATEMENTS_BY_EVENT_TIME_TABLE,
+    STATEMENTS_BY_EVIDENCE_TABLE, STATEMENTS_BY_OBJECT_ENTITY_TABLE, STATEMENTS_BY_PREDICATE_TABLE,
     STATEMENTS_BY_SUBJECT_TABLE, STATEMENTS_TABLE, STATEMENT_CHAIN_TABLE,
 };
 
@@ -189,8 +185,7 @@ pub fn statements_contradicting(
     subject: EntityId,
     predicate: PredicateId,
 ) -> Result<Vec<Statement>, StatementOpError> {
-    let candidates =
-        load_active_facts_for_subject_predicate(rtxn, subject, predicate)?;
+    let candidates = load_active_facts_for_subject_predicate(rtxn, subject, predicate)?;
     if candidates.len() < 2 {
         return Ok(Vec::new());
     }
@@ -470,9 +465,9 @@ pub fn statement_supersede(
             StatementId::from(succ),
         ));
     }
-    let old_kind = old
-        .kind()
-        .ok_or(StatementOpError::InvalidArgument("old row has unknown kind"))?;
+    let old_kind = old.kind().ok_or(StatementOpError::InvalidArgument(
+        "old row has unknown kind",
+    ))?;
     if old_kind == StatementKind::Event {
         return Err(StatementOpError::EventCannotSupersede);
     }
@@ -688,10 +683,7 @@ fn validate_against_predicate(s: &Statement, p: &Predicate) -> Result<(), Statem
 /// Insert a fresh statement row + every secondary index in one call.
 /// Used by both `statement_create` (root path) and `statement_supersede`
 /// (new-statement path).
-fn insert_new_statement(
-    wtxn: &WriteTransaction,
-    s: &Statement,
-) -> Result<(), StatementOpError> {
+fn insert_new_statement(wtxn: &WriteTransaction, s: &Statement) -> Result<(), StatementOpError> {
     let m = metadata_from_statement(s);
 
     // 1. Primary row.
@@ -704,12 +696,7 @@ fn insert_new_statement(
     if m.subject_is_pending == 0 {
         let mut t = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
         t.insert(
-            &(
-                m.subject_entity_bytes,
-                m.kind,
-                m.predicate_id,
-                m.is_current,
-            ),
+            &(m.subject_entity_bytes, m.kind, m.predicate_id, m.is_current),
             &m.statement_id_bytes,
         )?;
     }
@@ -733,10 +720,7 @@ fn insert_new_statement(
     if s.kind == StatementKind::Event {
         if let Some(event_at) = s.event_at_unix_nanos {
             let mut t = wtxn.open_table(STATEMENTS_BY_EVENT_TIME_TABLE)?;
-            t.insert(
-                &(event_at, m.subject_entity_bytes),
-                &m.statement_id_bytes,
-            )?;
+            t.insert(&(event_at, m.subject_entity_bytes), &m.statement_id_bytes)?;
         }
     }
 
@@ -745,7 +729,7 @@ fn insert_new_statement(
         let mut t = wtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE)?;
         match &s.evidence {
             EvidenceRef::Inline(entries) => {
-                for e in entries {
+                for e in entries.iter() {
                     t.insert(&(e.memory_id.to_be_bytes(), m.statement_id_bytes), &())?;
                 }
             }
@@ -768,10 +752,7 @@ fn insert_new_statement(
     // 7. chain.
     {
         let mut t = wtxn.open_table(STATEMENT_CHAIN_TABLE)?;
-        t.insert(
-            &(m.chain_root_bytes, m.version),
-            &m.statement_id_bytes,
-        )?;
+        t.insert(&(m.chain_root_bytes, m.version), &m.statement_id_bytes)?;
     }
 
     // Defensive: tombstoned-status field. New rows aren't tombstoned;
@@ -807,7 +788,12 @@ fn load_active_facts_for_subject_predicate(
     predicate: PredicateId,
 ) -> Result<Vec<Statement>, StatementOpError> {
     let bys = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
-    let key = (subject.to_bytes(), StatementKind::Fact.as_u8(), predicate.raw(), 1u8);
+    let key = (
+        subject.to_bytes(),
+        StatementKind::Fact.as_u8(),
+        predicate.raw(),
+        1u8,
+    );
     let bytes: Option<[u8; 16]> = bys.get(&key)?.map(|g| g.value());
     let Some(b) = bytes else {
         return Ok(Vec::new());
@@ -828,7 +814,12 @@ fn load_active_facts_for_subject_predicate_wtxn(
     predicate: PredicateId,
 ) -> Result<Vec<Statement>, StatementOpError> {
     let bys = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
-    let key = (subject.to_bytes(), StatementKind::Fact.as_u8(), predicate.raw(), 1u8);
+    let key = (
+        subject.to_bytes(),
+        StatementKind::Fact.as_u8(),
+        predicate.raw(),
+        1u8,
+    );
     let bytes: Option<[u8; 16]> = bys.get(&key)?.map(|g| g.value());
     let Some(b) = bytes else {
         return Ok(Vec::new());
@@ -858,7 +849,9 @@ fn evidence_has_per_entry_metadata(
         EvidenceRef::Overflow(id) => {
             let t = wtxn.open_table(EVIDENCE_OVERFLOW_TABLE)?;
             let row: Option<EvidenceOverflow> = t.get(&id.to_bytes())?.map(|g| g.value());
-            let Some(over) = row else { return Ok(false); };
+            let Some(over) = row else {
+                return Ok(false);
+            };
             Ok(over.confidences_milli.iter().any(|&c| c > 0))
         }
     }
@@ -896,10 +889,7 @@ enum TxnAsRead<'t> {
     Write(&'t WriteTransaction),
 }
 
-fn entity_get_via(
-    txn: TxnAsRead<'_>,
-    id: EntityId,
-) -> Result<bool, StatementOpError> {
+fn entity_get_via(txn: TxnAsRead<'_>, id: EntityId) -> Result<bool, StatementOpError> {
     match txn {
         TxnAsRead::Write(wtxn) => {
             use crate::tables::knowledge::entity::{EntityMetadata, ENTITIES_TABLE};
@@ -1007,11 +997,7 @@ mod tests {
         id
     }
 
-    fn fresh_fact(
-        subject: EntityId,
-        predicate: PredicateId,
-        object: EntityId,
-    ) -> Statement {
+    fn fresh_fact(subject: EntityId, predicate: PredicateId, object: EntityId) -> Statement {
         let id = StatementId::new();
         Statement::new_root(
             id,
@@ -1027,11 +1013,7 @@ mod tests {
         )
     }
 
-    fn fresh_pref(
-        subject: EntityId,
-        predicate: PredicateId,
-        value: &str,
-    ) -> Statement {
+    fn fresh_pref(subject: EntityId, predicate: PredicateId, value: &str) -> Statement {
         Statement::new_root(
             StatementId::new(),
             StatementKind::Preference,
@@ -1046,11 +1028,7 @@ mod tests {
         )
     }
 
-    fn fresh_event(
-        subject: EntityId,
-        predicate: PredicateId,
-        when: u64,
-    ) -> Statement {
+    fn fresh_event(subject: EntityId, predicate: PredicateId, when: u64) -> Statement {
         let mut s = Statement::new_root(
             StatementId::new(),
             StatementKind::Event,
@@ -1113,7 +1091,11 @@ mod tests {
         // by_predicate
         let byp = rtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE).unwrap();
         assert!(byp
-            .get(&(pred.raw(), StatementKind::Fact.as_u8(), confidence_bucket(0.9)))
+            .get(&(
+                pred.raw(),
+                StatementKind::Fact.as_u8(),
+                confidence_bucket(0.9)
+            ))
             .unwrap()
             .is_some());
         // by_object_entity
@@ -1348,13 +1330,23 @@ mod tests {
 
         let rtxn = db.read_txn().unwrap();
         let bys = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE).unwrap();
-        let cur =
-            bys.get(&(subj.to_bytes(), StatementKind::Fact.as_u8(), pred.raw(), 1u8))
-                .unwrap();
+        let cur = bys
+            .get(&(
+                subj.to_bytes(),
+                StatementKind::Fact.as_u8(),
+                pred.raw(),
+                1u8,
+            ))
+            .unwrap();
         assert!(cur.is_none(), "is_current=1 entry must be gone");
-        let stale =
-            bys.get(&(subj.to_bytes(), StatementKind::Fact.as_u8(), pred.raw(), 0u8))
-                .unwrap();
+        let stale = bys
+            .get(&(
+                subj.to_bytes(),
+                StatementKind::Fact.as_u8(),
+                pred.raw(),
+                0u8,
+            ))
+            .unwrap();
         assert!(stale.is_some(), "is_current=0 entry must exist");
     }
 
@@ -1366,7 +1358,7 @@ mod tests {
         let pred = intern_fact_entity_pred(&mut db, "role8");
         let mem = MemoryId::pack(7, ContextId::DEFAULT.into(), 0);
         let mut f = fresh_fact(subj, pred, obj);
-        f.evidence = EvidenceRef::Inline({
+        f.evidence = EvidenceRef::Inline(Box::new({
             let entry = EvidenceEntry::from_parts(
                 mem,
                 0.8,
@@ -1376,7 +1368,7 @@ mod tests {
             let mut sv = SmallVec::<[EvidenceEntry; INLINE_EVIDENCE_CAP]>::new();
             sv.push(entry);
             sv
-        });
+        }));
 
         let wtxn = db.write_txn().unwrap();
         statement_create(&wtxn, &f, 0).unwrap();
@@ -1388,7 +1380,10 @@ mod tests {
 
         let rtxn = db.read_txn().unwrap();
         let evi = rtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE).unwrap();
-        assert!(evi.get(&(mem.to_be_bytes(), f.id.to_bytes())).unwrap().is_some());
+        assert!(evi
+            .get(&(mem.to_be_bytes(), f.id.to_bytes()))
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -1550,7 +1545,7 @@ mod tests {
         let mut sv = SmallVec::<[EvidenceEntry; INLINE_EVIDENCE_CAP]>::new();
         sv.push(entry(0.9));
         sv.push(entry(0.9));
-        s.evidence = EvidenceRef::Inline(sv);
+        s.evidence = EvidenceRef::Inline(Box::new(sv));
 
         let wtxn = db.write_txn().unwrap();
         statement_create(&wtxn, &s, 1_700_000_000_000_000_000).unwrap();
@@ -1559,7 +1554,11 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let got = statement_get(&rtxn, s.id).unwrap().unwrap();
         // Expected: 1 - (1 - 0.9)^2 = 0.99 (zero age → decay = 1).
-        assert!((got.confidence - 0.99).abs() < 1e-3, "got {}", got.confidence);
+        assert!(
+            (got.confidence - 0.99).abs() < 1e-3,
+            "got {}",
+            got.confidence
+        );
     }
 
     #[test]
@@ -1582,7 +1581,7 @@ mod tests {
         };
         let mut sv = SmallVec::<[EvidenceEntry; INLINE_EVIDENCE_CAP]>::new();
         sv.push(entry_zero);
-        s.evidence = EvidenceRef::Inline(sv);
+        s.evidence = EvidenceRef::Inline(Box::new(sv));
 
         let wtxn = db.write_txn().unwrap();
         statement_create(&wtxn, &s, 1_700_000_000_000_000_000).unwrap();
@@ -1591,6 +1590,10 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let got = statement_get(&rtxn, s.id).unwrap().unwrap();
         // No aggregation: caller's confidence preserved verbatim.
-        assert!((got.confidence - 0.42).abs() < 1e-6, "got {}", got.confidence);
+        assert!(
+            (got.confidence - 0.42).abs() < 1e-6,
+            "got {}",
+            got.confidence
+        );
     }
 }

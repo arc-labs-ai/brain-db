@@ -1,0 +1,39 @@
+name: Nightly perf
+
+# Acceptance benches that assert §16/02 p50 / p99 targets in-process.
+# Heavy enough that we don't gate every PR on them — they run on
+# schedule and on manual dispatch. A red run fails the workflow,
+# surfacing the regression via GitHub's notification path.
+
+on:
+  schedule:
+    # Daily at 03:00 UTC. Off-peak so cache hits on the previous green build.
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  perf:
+    name: Acceptance benches (relation_traverse + recall)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # relation_traverse.rs asserts spec §16/02 §2.4 p50 targets
+      # in-process (d1 ≤ 5 ms, d2 ≤ 15 ms, d3 ≤ 30 ms). A regression
+      # is a panic out of the bench, which fails the step.
+      - name: brain-planner — relation_traverse bench
+        run: cargo bench -p brain-planner --bench relation_traverse
+
+      # recall.rs (brain-index) asserts recall@10 ≥ 0.95 at N=100K
+      # per spec §16/05 §2 and emits the latency distribution for
+      # the HNSW search path that backs RECALL p99.
+      - name: brain-index — recall bench
+        run: cargo bench -p brain-index --bench recall

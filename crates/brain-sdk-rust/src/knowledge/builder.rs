@@ -92,9 +92,9 @@ where
             .send_knowledge_request(body, Opcode::EntityGetReq, Opcode::EntityGetResp)
             .await
         {
-            Ok(ResponseBody::EntityGet(r)) => {
-                Ok(Some(EntityHandle::from_view(r.entity).map_err(map_type_mismatch)?))
-            }
+            Ok(ResponseBody::EntityGet(r)) => Ok(Some(
+                EntityHandle::from_view(r.entity).map_err(map_type_mismatch)?,
+            )),
             Ok(other) => Err(unexpected_body("EntityGetResp", other)),
             Err(e) if is_entity_not_found(&e) => Ok(None),
             Err(e) => Err(e),
@@ -188,7 +188,11 @@ where
         });
         let resp = self
             .client
-            .send_knowledge_request(body, Opcode::EntityTombstoneReq, Opcode::EntityTombstoneResp)
+            .send_knowledge_request(
+                body,
+                Opcode::EntityTombstoneReq,
+                Opcode::EntityTombstoneResp,
+            )
             .await?;
         match resp {
             ResponseBody::EntityTombstone(r) => Ok(r.tombstoned_at_unix_nanos),
@@ -606,11 +610,7 @@ where
                 _marker: PhantomData,
             }),
             ResolutionOutcomeWire::Ambiguous => Ok(ResolutionOutcome::Ambiguous {
-                candidates: r
-                    .candidate_ids
-                    .into_iter()
-                    .map(EntityId::from)
-                    .collect(),
+                candidates: r.candidate_ids.into_iter().map(EntityId::from).collect(),
                 audit_id: r.audit_id,
                 tier: r.tier,
                 confidence: r.confidence,

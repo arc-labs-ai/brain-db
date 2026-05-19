@@ -48,7 +48,7 @@ pub trait Worker: 'static {
 
 /// Spec §11/01 §5: drive a stream of work-units, bounded by batch
 /// size, wall-clock time, and shutdown. Yields every
-/// [`YIELD_EVERY`] units (§11/01 §6).
+/// `YIELD_EVERY` units (§11/01 §6).
 ///
 /// `unit` returns `Ok(true)` when work was done and more *may* exist,
 /// `Ok(false)` when there's nothing else to do (cycle ends early),
@@ -81,7 +81,7 @@ where
             true => processed += 1,
             false => break,
         }
-        if processed % YIELD_EVERY == 0 {
+        if processed.is_multiple_of(YIELD_EVERY) {
             glommio::executor().yield_if_needed().await;
         }
     }

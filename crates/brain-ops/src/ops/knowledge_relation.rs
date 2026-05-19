@@ -21,7 +21,7 @@
 //! open questions.
 
 use brain_core::knowledge::Relation;
-use brain_core::{EntityId, RelationId, RelationTypeId};
+use brain_core::{Cardinality, EntityId, RelationId, RelationTypeId};
 use brain_metadata::relation_ops::{
     relation_create, relation_get, relation_history, relation_list_from, relation_list_to,
     relation_supersede, relation_tombstone, RelationListFilter, RelationOpError,
@@ -30,8 +30,10 @@ use brain_metadata::relation_traversal::{
     traverse, TraversalConfig, TraversalDirection, MAX_DEPTH,
 };
 use brain_metadata::relation_type_ops::{
-    relation_type_get, relation_type_lookup_by_qname, RelationTypeOpError,
+    relation_type_get, relation_type_intern_or_get, relation_type_lookup_by_qname,
+    RelationTypeOpError,
 };
+use brain_metadata::schema_store::schema_active;
 use brain_protocol::knowledge::{
     KnowledgeEventPayload, RelationCreateRequest, RelationCreateResponse, RelationCreatedEvent,
     RelationGetRequest, RelationGetResponse, RelationListFromRequest,
@@ -76,11 +78,41 @@ pub async fn handle_relation_create(
             .write_txn()
             .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
 
-        let rt = relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?.ok_or_else(|| {
-            OpError::InvalidRequest(format!(
-                "unknown relation type {namespace:?}:{name:?}; declare via SCHEMA_UPLOAD first"
-            ))
-        })?;
+        // Schema-strict: relation type MUST be registered. Schemaless:
+        // intern on demand. Implicit relation types default to
+        // ManyToMany so the cardinality auto-supersession path in
+        // `relation_create` never fires for them — the client must
+        // call RELATION_SUPERSEDE explicitly if they want to retire
+        // an older row.
+        let active_version = schema_active_in_wtxn_rel(&wtxn, namespace)?;
+        let rt = if let Some(version) = active_version {
+            let rt =
+                relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?.ok_or_else(|| {
+                    OpError::RelationTypeNotInSchema {
+                        type_name: req.relation_type.clone(),
+                        namespace: namespace.to_string(),
+                        version,
+                    }
+                })?;
+            if !rt_active_for_schema_wtxn(&wtxn, namespace, version)?.contains(&rt.id) {
+                return Err(OpError::RelationTypeNotInSchema {
+                    type_name: req.relation_type.clone(),
+                    namespace: namespace.to_string(),
+                    version,
+                });
+            }
+            rt
+        } else {
+            match relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)? {
+                Some(rt) => rt,
+                None => {
+                    let _ = relation_type_intern_or_get(&wtxn, namespace, name, 0, now)
+                        .map_err(map_relation_type_op_error)?;
+                    relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?
+                        .expect("just-interned relation type vanished")
+                }
+            }
+        };
 
         let relation = build_relation_from_create(&req, &rt, now)?;
         let created = relation_create(&wtxn, &relation, now).map_err(map_relation_op_error)?;
@@ -99,7 +131,8 @@ pub async fn handle_relation_create(
             to: req.to_entity,
         }),
         now,
-    );
+    )
+    .await;
 
     Ok(RelationCreateResponse {
         relation_id: created_id.to_bytes(),
@@ -172,9 +205,36 @@ pub async fn handle_relation_supersede(
             .write_txn()
             .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
 
-        let rt = relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?.ok_or_else(|| {
-            OpError::InvalidRequest(format!("unknown relation type {namespace:?}:{name:?}"))
-        })?;
+        // Mirror CREATE: strict vs schemaless dispatch.
+        let active_version = schema_active_in_wtxn_rel(&wtxn, namespace)?;
+        let rt = if let Some(version) = active_version {
+            let rt =
+                relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?.ok_or_else(|| {
+                    OpError::RelationTypeNotInSchema {
+                        type_name: req.new_relation.relation_type.clone(),
+                        namespace: namespace.to_string(),
+                        version,
+                    }
+                })?;
+            if !rt_active_for_schema_wtxn(&wtxn, namespace, version)?.contains(&rt.id) {
+                return Err(OpError::RelationTypeNotInSchema {
+                    type_name: req.new_relation.relation_type.clone(),
+                    namespace: namespace.to_string(),
+                    version,
+                });
+            }
+            rt
+        } else {
+            match relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)? {
+                Some(rt) => rt,
+                None => {
+                    let _ = relation_type_intern_or_get(&wtxn, namespace, name, 0, now)
+                        .map_err(map_relation_type_op_error)?;
+                    relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?
+                        .expect("just-interned relation type vanished")
+                }
+            }
+        };
 
         let new_relation = build_relation_from_create(&req.new_relation, &rt, now)?;
         let new_id =
@@ -199,7 +259,8 @@ pub async fn handle_relation_supersede(
             new_relation_id: new_id.to_bytes(),
         }),
         now,
-    );
+    )
+    .await;
 
     Ok(RelationSupersedeResponse {
         new_relation_id: new_id.to_bytes(),
@@ -239,7 +300,8 @@ pub async fn handle_relation_tombstone(
             reason: req.reason,
         }),
         now,
-    );
+    )
+    .await;
 
     Ok(RelationTombstoneResponse {
         tombstoned_at_unix_nanos: now,
@@ -324,12 +386,24 @@ fn run_list(
     } else {
         validate_qname(type_filter)?;
         let (ns, name) = split_qname(type_filter)?;
-        let rt = relation_type_lookup_by_qname(&rtxn, ns, name)
-            .map_err(map_relation_type_op_error)?
-            .ok_or_else(|| {
-                OpError::InvalidRequest(format!("unknown relation type {ns:?}:{name:?}"))
-            })?;
-        Some(rt.id)
+        // Schema-strict: unknown qname → PredicateNotInSchema-style
+        // error. Schemaless: short-circuit with empty result set (no
+        // matching rows are possible).
+        let active_version = schema_active(&rtxn, ns)
+            .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
+        match relation_type_lookup_by_qname(&rtxn, ns, name).map_err(map_relation_type_op_error)? {
+            Some(rt) => Some(rt.id),
+            None => {
+                if let Some(version) = active_version {
+                    return Err(OpError::RelationTypeNotInSchema {
+                        type_name: type_filter.to_string(),
+                        namespace: ns.to_string(),
+                        version,
+                    });
+                }
+                return Ok((Vec::new(), 0));
+            }
+        }
     };
 
     let filter = RelationListFilter {
@@ -390,15 +464,28 @@ pub async fn handle_relation_traverse(
         .read_txn()
         .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
 
-    // Resolve type qnames → ids.
+    // Resolve type qnames → ids. Same dispatch as LIST: schemaless
+    // unknown qnames just contribute zero matches; schema-strict
+    // mode surfaces the typo to the client.
     let mut type_ids: Vec<RelationTypeId> = Vec::with_capacity(req.relation_types.len());
     for qname in &req.relation_types {
         validate_qname(qname)?;
         let (ns, name) = split_qname(qname)?;
-        let rt = relation_type_lookup_by_qname(&rtxn, ns, name)
-            .map_err(map_relation_type_op_error)?
-            .ok_or_else(|| OpError::InvalidRequest(format!("unknown relation type {qname}")))?;
-        type_ids.push(rt.id);
+        let active_version = schema_active(&rtxn, ns)
+            .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
+        match relation_type_lookup_by_qname(&rtxn, ns, name).map_err(map_relation_type_op_error)? {
+            Some(rt) => type_ids.push(rt.id),
+            None => {
+                if let Some(version) = active_version {
+                    return Err(OpError::RelationTypeNotInSchema {
+                        type_name: qname.clone(),
+                        namespace: ns.to_string(),
+                        version,
+                    });
+                }
+                // Schemaless: skip — no rows can match this qname.
+            }
+        }
     }
 
     let config = TraversalConfig {
@@ -551,13 +638,15 @@ fn relation_type_lookup_by_qname_wtxn(
         RelationTypeDefinition, RELATION_TYPES_BY_QNAME_TABLE, RELATION_TYPES_TABLE,
     };
     let q = format!("{namespace}:{name}");
-    let idx = wtxn
-        .open_table(RELATION_TYPES_BY_QNAME_TABLE)
-        .map_err(|e| OpError::Internal(format!("open by_qname: {e}")))?;
-    let id_raw: Option<u32> = idx
-        .get(q.as_str())
-        .map_err(|e| OpError::Internal(format!("by_qname lookup: {e}")))?
-        .map(|g| g.value());
+    let id_raw: Option<u32> = {
+        let idx = wtxn
+            .open_table(RELATION_TYPES_BY_QNAME_TABLE)
+            .map_err(|e| OpError::Internal(format!("open by_qname: {e}")))?;
+        let g = idx
+            .get(q.as_str())
+            .map_err(|e| OpError::Internal(format!("by_qname lookup: {e}")))?;
+        g.map(|guard| guard.value())
+    };
     let Some(id_raw) = id_raw else {
         return Ok(None);
     };
@@ -571,6 +660,58 @@ fn relation_type_lookup_by_qname_wtxn(
     Ok(row.as_ref().map(RelationTypeDefinition::to_relation_type))
 }
 
+/// Active schema version for `namespace` inside a write txn. Mirrors
+/// the same helper in `knowledge_statement.rs` — relation handlers
+/// run a different write path so we keep the helpers local rather
+/// than re-export through a shared module.
+fn schema_active_in_wtxn_rel(
+    wtxn: &redb::WriteTransaction,
+    namespace: &str,
+) -> Result<Option<u32>, OpError> {
+    use brain_metadata::tables::knowledge::schema_version::SCHEMA_ACTIVE_VERSIONS_TABLE;
+    let active = match wtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(OpError::Internal(format!("open schema_active: {e}"))),
+    };
+    let g = active
+        .get(&namespace)
+        .map_err(|e| OpError::Internal(format!("schema_active lookup: {e}")))?;
+    Ok(g.map(|guard| guard.value()))
+}
+
+/// Set of `RelationTypeId`s the active schema version declares — used
+/// to enforce strict-mode RELATION_CREATE / SUPERSEDE.
+fn rt_active_for_schema_wtxn(
+    wtxn: &redb::WriteTransaction,
+    namespace: &str,
+    version: u32,
+) -> Result<std::collections::HashSet<RelationTypeId>, OpError> {
+    use brain_metadata::tables::knowledge::relation_type::{
+        RelationTypeDefinition, RelationTypeOrigin, RELATION_TYPES_TABLE,
+    };
+    let t = wtxn
+        .open_table(RELATION_TYPES_TABLE)
+        .map_err(|e| OpError::Internal(format!("open relation_types: {e}")))?;
+    let mut out = std::collections::HashSet::new();
+    for entry in t
+        .iter()
+        .map_err(|e| OpError::Internal(format!("relation_types iter: {e}")))?
+    {
+        let (k, v) = entry.map_err(|e| OpError::Internal(format!("relation_types entry: {e}")))?;
+        let row: RelationTypeDefinition = v.value();
+        if row.namespace != namespace {
+            continue;
+        }
+        if let RelationTypeOrigin::SchemaDeclared { version: v_decl } = row.origin() {
+            if v_decl == version {
+                out.insert(RelationTypeId::from(k.value()));
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn map_relation_type_op_error(err: RelationTypeOpError) -> OpError {
     match err {
         RelationTypeOpError::InvalidIdentifier { reason } => {
@@ -581,6 +722,27 @@ fn map_relation_type_op_error(err: RelationTypeOpError) -> OpError {
         )),
         RelationTypeOpError::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
         RelationTypeOpError::Table(e) => OpError::Internal(format!("redb table: {e}")),
+    }
+}
+
+/// Human-readable cardinality label for the wire `CardinalityViolation`
+/// error variant. Stable strings — SDKs key off them.
+fn cardinality_kind_str(c: Cardinality) -> &'static str {
+    match c {
+        Cardinality::OneToOne => "OneToOne",
+        Cardinality::OneToMany => "OneToMany",
+        Cardinality::ManyToOne => "ManyToOne",
+        Cardinality::ManyToMany => "ManyToMany",
+    }
+}
+
+/// The maximum number of current rows the cardinality permits per
+/// `from` endpoint (or unbounded — surfaced as `u32::MAX`). Surfaced
+/// to the client so they can build a sensible error message.
+fn cardinality_limit(c: Cardinality) -> u32 {
+    match c {
+        Cardinality::OneToOne | Cardinality::ManyToOne => 1,
+        Cardinality::OneToMany | Cardinality::ManyToMany => u32::MAX,
     }
 }
 
@@ -616,14 +778,18 @@ fn map_relation_op_error(err: RelationOpError) -> OpError {
         RelationOpError::CardinalityViolation {
             variant,
             conflicting,
-        } => OpError::Conflict(format!(
-            "cardinality {variant:?} violated; {conflicting} conflicting current relation(s)"
-        )),
-        RelationOpError::DecodeFailed => {
-            OpError::Internal("relation row decode failed — possible corruption".into())
-        }
+        } => OpError::CardinalityViolation {
+            relation_type: String::new(),
+            kind: cardinality_kind_str(variant),
+            existing: conflicting as u32,
+            limit: cardinality_limit(variant),
+        },
         RelationOpError::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
         RelationOpError::Table(e) => OpError::Internal(format!("redb table: {e}")),
+        RelationOpError::EdgeOp(e) => OpError::Internal(format!("edge op: {e}")),
+        RelationOpError::EdgeKey(e) => {
+            OpError::Internal(format!("edge key decode (corruption?): {e}"))
+        }
         RelationOpError::RelationTypeOp(e) => map_relation_type_op_error(e),
         RelationOpError::EntityOp(e) => {
             OpError::Internal(format!("entity op forwarded from relation_ops: {e}"))

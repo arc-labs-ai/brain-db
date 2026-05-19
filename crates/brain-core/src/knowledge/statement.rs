@@ -14,9 +14,7 @@
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::knowledge::ids::{
-    EntityId, EvidenceOverflowId, ExtractorId, PredicateId, StatementId,
-};
+use crate::knowledge::ids::{EntityId, EvidenceOverflowId, ExtractorId, PredicateId, StatementId};
 use crate::knowledge::kinds::StatementKind;
 use crate::knowledge::AuditId;
 use crate::MemoryId;
@@ -200,9 +198,13 @@ impl EvidenceEntry {
 
 /// Evidence pointer — inline (up to `INLINE_EVIDENCE_CAP`) or
 /// overflow row pointer. Spec `§19/05`.
+///
+/// The inline payload is boxed: the inline `SmallVec` carries an
+/// 8-wide `EvidenceEntry` buffer (~272 bytes); without boxing every
+/// enum value would pay that cost even for the `Overflow` discriminant.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvidenceRef {
-    Inline(SmallVec<[EvidenceEntry; INLINE_EVIDENCE_CAP]>),
+    Inline(Box<SmallVec<[EvidenceEntry; INLINE_EVIDENCE_CAP]>>),
     /// Pointer to a row in `EVIDENCE_OVERFLOW_TABLE`. Caller resolves
     /// against `brain-metadata::statement_ops::evidence_overflow_load`.
     Overflow(EvidenceOverflowId),
@@ -210,7 +212,22 @@ pub enum EvidenceRef {
 
 impl Default for EvidenceRef {
     fn default() -> Self {
-        Self::Inline(SmallVec::new())
+        Self::Inline(Box::new(SmallVec::new()))
+    }
+}
+
+impl EvidenceRef {
+    /// Construct an inline `EvidenceRef` from a `SmallVec`, handling
+    /// the boxing internally.
+    #[must_use]
+    pub fn inline(entries: SmallVec<[EvidenceEntry; INLINE_EVIDENCE_CAP]>) -> Self {
+        Self::Inline(Box::new(entries))
+    }
+
+    /// Construct an inline `EvidenceRef` from any slice of entries.
+    #[must_use]
+    pub fn inline_from_slice(entries: &[EvidenceEntry]) -> Self {
+        Self::Inline(Box::new(SmallVec::from_slice(entries)))
     }
 }
 
@@ -280,9 +297,9 @@ impl TombstoneReason {
 /// A typed claim about an entity. Spec `§19/00`.
 ///
 /// Pure value type. The brain-metadata storage layer holds the rkyv-
-/// archived form ([`brain_metadata::tables::knowledge::statement::StatementMetadata`]);
+/// archived form (`brain_metadata::tables::knowledge::statement::StatementMetadata`);
 /// the wire layer holds the rkyv-archived view
-/// ([`brain_protocol::knowledge::statement_resp::StatementView`]).
+/// (`brain_protocol::knowledge::statement_resp::StatementView`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Statement {
     pub id: StatementId,
@@ -451,7 +468,10 @@ mod tests {
             1_700_000_000_000_000_000,
             ExtractorId::default(),
         );
-        EvidenceRef::Inline(SmallVec::from_buf_and_len([entry; INLINE_EVIDENCE_CAP], 1))
+        EvidenceRef::Inline(Box::new(SmallVec::from_buf_and_len(
+            [entry; INLINE_EVIDENCE_CAP],
+            1,
+        )))
     }
 
     fn sample_statement(kind: StatementKind) -> Statement {
@@ -553,12 +573,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "invariant: confidence must be in [0, 1]")]
     fn evidence_entry_rejects_out_of_range() {
-        let _ = EvidenceEntry::from_parts(
-            MemoryId::pack(1, 0, 0),
-            1.5,
-            0,
-            ExtractorId::default(),
-        );
+        let _ = EvidenceEntry::from_parts(MemoryId::pack(1, 0, 0), 1.5, 0, ExtractorId::default());
     }
 
     #[test]

@@ -11,14 +11,13 @@
 --shard <N>              Target a specific shard (0-indexed)
 ```
 
-The CLI is invoked via `just cli ...` (which forwards to
-`target/debug/brain` inside the container) or directly:
+The CLI is invoked via:
 
 ```bash
-cargo run --bin brain -- <subcommand> ...
+cargo run --bin brain-cli -- <subcommand> ...
 ```
 
-Examples below use the `just cli` form.
+Examples below use the `cargo run --bin brain-cli --` form.
 
 ---
 
@@ -29,7 +28,7 @@ Pings the admin server and reports liveness.
 **Input:**
 
 ```bash
-just cli health
+cargo run --bin brain-cli -- health
 ```
 
 **Expected (table):**
@@ -43,7 +42,7 @@ probe             /healthz
 **Expected (JSON):**
 
 ```bash
-just cli --output json health
+cargo run --bin brain-cli -- --output json health
 ```
 
 ```json
@@ -68,7 +67,7 @@ Snapshot of Prometheus metrics.
 **Input:**
 
 ```bash
-just cli stats
+cargo run --bin brain-cli -- stats
 ```
 
 **Expected:**
@@ -104,7 +103,7 @@ Lists configured shards.
 **Input:**
 
 ```bash
-just cli shard list
+cargo run --bin brain-cli -- shard list
 ```
 
 **Expected (table):**
@@ -119,7 +118,7 @@ index 3    shard_id=3
 **Expected (JSON):**
 
 ```bash
-just cli --output json shard list
+cargo run --bin brain-cli -- --output json shard list
 ```
 
 ```json
@@ -140,7 +139,7 @@ hnsw_maintenance, etc.). List them all or filter to one shard.
 **Input (all shards):**
 
 ```bash
-just cli worker list
+cargo run --bin brain-cli -- worker list
 ```
 
 **Expected:**
@@ -156,7 +155,7 @@ shard 3 / snapshot           cycles=0   processed=0   errors=0  last_run_unix=0
 **Input (single shard):**
 
 ```bash
-just cli --shard 0 worker list
+cargo run --bin brain-cli -- --shard 0 worker list
 ```
 
 **Verify:**
@@ -176,7 +175,7 @@ Read the loaded config, optionally by dotted key path.
 **Input (full config):**
 
 ```bash
-just cli --output json config get
+cargo run --bin brain-cli -- --output json config get
 ```
 
 **Expected:**
@@ -193,7 +192,7 @@ just cli --output json config get
 **Input (single key):**
 
 ```bash
-just cli --output json config get --key hnsw.m
+cargo run --bin brain-cli -- --output json config get --key hnsw.m
 ```
 
 **Expected:**
@@ -203,7 +202,7 @@ just cli --output json config get --key hnsw.m
 ```
 
 ```bash
-just cli --output json config get --key workers.decay_interval_sec
+cargo run --bin brain-cli -- --output json config get --key workers.decay_interval_sec
 ```
 
 ```json
@@ -228,7 +227,7 @@ copies; the daily background worker prunes to retention.
 **Input:**
 
 ```bash
-just cli --shard 0 snapshot create
+cargo run --bin brain-cli -- --shard 0 snapshot create
 ```
 
 **Expected:**
@@ -241,7 +240,7 @@ shard    0
 **Verify:**
 
 ```bash
-just cli snapshot list
+cargo run --bin brain-cli -- snapshot list
 ```
 
 The newly-created snapshot ID appears in the listing.
@@ -255,7 +254,7 @@ List snapshots across all shards (or filter).
 **Input:**
 
 ```bash
-just cli snapshot list
+cargo run --bin brain-cli -- snapshot list
 ```
 
 **Expected:**
@@ -273,7 +272,7 @@ Delete a snapshot by id.
 **Input:**
 
 ```bash
-just cli --shard 0 snapshot delete 1715682345
+cargo run --bin brain-cli -- --shard 0 snapshot delete 1715682345
 ```
 
 **Expected:**
@@ -283,7 +282,7 @@ Exit code 0; no stdout output (HTTP 204 No Content).
 **Verify:**
 
 ```bash
-just cli snapshot list
+cargo run --bin brain-cli -- snapshot list
 ```
 
 The deleted id is gone from the list.
@@ -299,7 +298,7 @@ one shard. Used when the tombstone ratio climbs (see
 **Input:**
 
 ```bash
-just cli --shard 0 rebuild-ann
+cargo run --bin brain-cli -- --shard 0 rebuild-ann
 ```
 
 **Expected:**
@@ -327,7 +326,7 @@ in `deferred[]` per the spec deferred-set.
 **Input:**
 
 ```bash
-just cli --output json debug-snapshot --shard 0
+cargo run --bin brain-cli -- --output json debug-snapshot --shard 0
 ```
 
 **Expected:**
@@ -348,7 +347,7 @@ just cli --output json debug-snapshot --shard 0
 **Write to a file:**
 
 ```bash
-just cli --output json debug-snapshot --shard 0 --value /tmp/snap.json
+cargo run --bin brain-cli -- --output json debug-snapshot --shard 0 --value /tmp/snap.json
 cat /tmp/snap.json
 ```
 
@@ -365,8 +364,8 @@ primitives land.
 All commands accept `--server`:
 
 ```bash
-just cli --server 10.0.0.5:9091 health
-just cli --server 10.0.0.5:9091 --output json shard list
+cargo run --bin brain-cli -- --server 10.0.0.5:9091 health
+cargo run --bin brain-cli -- --server 10.0.0.5:9091 --output json shard list
 ```
 
 ## Next

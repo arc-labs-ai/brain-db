@@ -77,10 +77,8 @@ The agent asks for memories relevant to a cue.
 
 1. Embeds the cue text.
 2. Asks the planner which strategy to use:
-   - **ANN search** — default, fast similarity.
-   - **Attractor dynamics** — for noisy cues; runs energy descent until convergence.
-   - **Graph walk** — for structural queries.
-   - **Hybrid** — ANN candidate set, graph or attractor re-ranking.
+   - **Hybrid** (default) — ANN + lexical + memory-edge graph fused via RRF.
+   - **Substrate-only** — fast vector-only similarity.
 3. Executes the strategy.
 4. Filters by context, age, kind, and other criteria.
 5. Computes confidence scores.
@@ -135,7 +133,6 @@ The agent asks the substrate to construct a path from a start state to a goal, u
 2. Asks the planner which search algorithm to use:
    - **A*** — heuristic search with admissible heuristic from vector distance.
    - **MCTS** — Monte Carlo Tree Search for stochastic domains.
-   - **Attractor rollout** — energy-descent in the memory landscape.
 3. Runs the search with budget enforcement.
 4. Streams plan steps as they're discovered.
 5. Emits a terminal frame when goal is reached, budget is exhausted, or no path is found.

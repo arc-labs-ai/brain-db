@@ -70,6 +70,15 @@ pub struct ExecutorContext {
     /// the in-flight buffer so the executor's edge / memory lookups can
     /// layer pending state on committed state.
     pub txn: Option<Arc<TxnSnapshot>>,
+    /// Authenticated caller for **this request only**. The shared
+    /// per-shard `ExecutorContext` carries the connection-less
+    /// default; `brain-ops::dispatch` clones the ctx and stamps the
+    /// per-request value via [`Self::with_caller_agent`] before
+    /// invoking handlers. The encode executor reads it to populate
+    /// `EncodeOp.agent_id`, which the writer then stamps onto the
+    /// memory row + WAL payload + EventEnvelope so the subscribe
+    /// `agents` filter can isolate per-tenant.
+    pub caller_agent: brain_core::AgentId,
 }
 
 impl ExecutorContext {
@@ -86,12 +95,22 @@ impl ExecutorContext {
             metadata,
             writer,
             txn: None,
+            caller_agent: brain_core::AgentId::default(),
         }
     }
 
     #[must_use]
     pub fn with_txn(mut self, snapshot: Arc<TxnSnapshot>) -> Self {
         self.txn = Some(snapshot);
+        self
+    }
+
+    /// Stamp the per-request authenticated agent. Called by
+    /// `brain-ops::dispatch` after cloning the shared ctx so the
+    /// per-request flow doesn't mutate shared state.
+    #[must_use]
+    pub fn with_caller_agent(mut self, agent: brain_core::AgentId) -> Self {
+        self.caller_agent = agent;
         self
     }
 }

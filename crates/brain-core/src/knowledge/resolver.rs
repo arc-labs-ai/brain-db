@@ -45,9 +45,7 @@ const AMBIGUITY_DELTA: f32 = 0.05;
 /// §18/01). `Created` is a side-effect, not a tier in the strict
 /// sense — included for completeness so audit records carry a
 /// single enum.
-#[derive(
-    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ResolverTier {
     Exact = 0,
@@ -451,8 +449,7 @@ where
     let mut tier2_scored: Vec<(EntityId, f32)> = Vec::new();
     if config.enable_fuzzy {
         let q_trigrams = trigrams::extract_trigrams(&normalized);
-        if !q_trigrams.is_empty() && entity_type_hint.is_some() {
-            let hint = entity_type_hint.unwrap();
+        if let (false, Some(hint)) = (q_trigrams.is_empty(), entity_type_hint) {
             let mut cands = storage.trigram_candidates(hint, &normalized)?;
             // Include the tier-1 alias pool — they're real matches we
             // want scored too.
@@ -468,9 +465,7 @@ where
                     tier2_scored.push((cid, score));
                 }
             }
-            tier2_scored.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            tier2_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
             // Spec §18/01: "match fuzzy_hits.len() { 1 if score ≥
             // threshold => Resolved, _ => keep for tier 3 }".
@@ -521,9 +516,7 @@ where
             }
             tier3_scored.push((cid, sim));
         }
-        tier3_scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        tier3_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let above: Vec<&(EntityId, f32)> = tier3_scored
             .iter()
@@ -698,10 +691,7 @@ mod algorithm_tests {
         fn trigrams_of(&self, id: EntityId) -> Result<HashSet<[u8; 3]>, ResolverError> {
             Ok(self.trigrams.borrow().get(&id).cloned().unwrap_or_default())
         }
-        fn entity_type_of(
-            &self,
-            id: EntityId,
-        ) -> Result<Option<EntityTypeId>, ResolverError> {
+        fn entity_type_of(&self, id: EntityId) -> Result<Option<EntityTypeId>, ResolverError> {
             Ok(self.types.borrow().get(&id).copied())
         }
     }
@@ -781,10 +771,12 @@ mod algorithm_tests {
         let m = MockBackend::new();
         let id = EntityId::new();
         m.set_canonical(person(), "Priya", id);
-        let mut cfg = ResolverConfig::default();
-        cfg.enable_exact = false;
-        cfg.enable_fuzzy = false;
-        cfg.enable_embedding = false;
+        let cfg = ResolverConfig {
+            enable_exact: false,
+            enable_fuzzy: false,
+            enable_embedding: false,
+            ..Default::default()
+        };
         let out = resolve_entity(&m, &m, &m, "Priya", "", Some(person()), &cfg).unwrap();
         assert!(out.is_created(), "all tiers disabled → Created");
     }
@@ -826,9 +818,11 @@ mod algorithm_tests {
         let q = normalize_for_resolver("Priya Patel");
         m.set_trigram_candidates(person(), &q, [id].into_iter().collect());
         m.set_trigrams_for(id, "Totally Different"); // low Jaccard
-        // Disable tier 3 + tier 1 to isolate.
-        let mut cfg = ResolverConfig::default();
-        cfg.enable_embedding = false;
+                                                     // Disable tier 3 + tier 1 to isolate.
+        let cfg = ResolverConfig {
+            enable_embedding: false,
+            ..Default::default()
+        };
         let out = resolve_entity(&m, &m, &m, "Priya Patel", "", Some(person()), &cfg).unwrap();
         assert!(
             out.is_created(),
@@ -892,8 +886,10 @@ mod algorithm_tests {
         m.set_index_results(vec![(cross, 0.99)]);
         m.set_type(cross, EntityTypeId(7)); // not Person
 
-        let mut cfg = ResolverConfig::default();
-        cfg.type_constraint = TypeConstraint::Strict;
+        let cfg = ResolverConfig {
+            type_constraint: TypeConstraint::Strict,
+            ..Default::default()
+        };
         let out = resolve_entity(&m, &m, &m, "Priya", "ctx", Some(person()), &cfg).unwrap();
         assert!(
             out.is_created(),
@@ -925,8 +921,7 @@ mod algorithm_tests {
         .unwrap();
         match out {
             ResolutionOutcome::Ambiguous { candidates, .. } => {
-                let ids: HashSet<EntityId> =
-                    candidates.iter().map(|(id, _)| *id).collect();
+                let ids: HashSet<EntityId> = candidates.iter().map(|(id, _)| *id).collect();
                 assert!(ids.contains(&a));
                 assert!(ids.contains(&b));
             }
@@ -969,8 +964,10 @@ mod algorithm_tests {
         let m = MockBackend::new();
         m.set_embedding("X", [0.5; VECTOR_DIM]);
         m.set_index_results(vec![]);
-        let mut cfg = ResolverConfig::default();
-        cfg.enable_llm = true;
+        let cfg = ResolverConfig {
+            enable_llm: true,
+            ..Default::default()
+        };
         let out = resolve_entity(&m, &m, &m, "X", "", Some(person()), &cfg).unwrap();
         // Tier-4 stub falls through; created.
         assert!(out.is_created());
@@ -1026,16 +1023,7 @@ mod algorithm_tests {
         // outcome.
         let m = MockBackend::new();
         m.set_embedding("", adv_vec_zeros());
-        let out = resolve_entity(
-            &m,
-            &m,
-            &m,
-            "",
-            "",
-            Some(person()),
-            &adv_config(),
-        )
-        .unwrap();
+        let out = resolve_entity(&m, &m, &m, "", "", Some(person()), &adv_config()).unwrap();
         // Tier 1 yields no canonical / alias hit; tier 2 has no
         // trigrams (the empty-input split produces nothing); tier 3
         // is configured-out by default in this test path. Tier 5
@@ -1047,16 +1035,8 @@ mod algorithm_tests {
     fn whitespace_only_candidate_does_not_resolve_no_matches() {
         let m = MockBackend::new();
         m.set_embedding("", adv_vec_zeros());
-        let out = resolve_entity(
-            &m,
-            &m,
-            &m,
-            "   \t  \n  ",
-            "",
-            Some(person()),
-            &adv_config(),
-        )
-        .unwrap();
+        let out =
+            resolve_entity(&m, &m, &m, "   \t  \n  ", "", Some(person()), &adv_config()).unwrap();
         assert!(matches!(out, ResolutionOutcome::Created { .. }));
     }
 
@@ -1067,16 +1047,7 @@ mod algorithm_tests {
         let huge = "a".repeat(64 * 1024);
         let m = MockBackend::new();
         m.set_embedding(huge.as_str(), adv_vec_zeros());
-        let out = resolve_entity(
-            &m,
-            &m,
-            &m,
-            &huge,
-            "",
-            Some(person()),
-            &adv_config(),
-        )
-        .unwrap();
+        let out = resolve_entity(&m, &m, &m, &huge, "", Some(person()), &adv_config()).unwrap();
         // No fixtures match; tier 5 fires.
         assert!(matches!(out, ResolutionOutcome::Created { .. }));
     }
@@ -1092,16 +1063,8 @@ mod algorithm_tests {
         m.set_canonical(person(), "山田 太郎", id);
         m.set_embedding("山田 太郎", adv_vec_zeros());
 
-        let out = resolve_entity(
-            &m,
-            &m,
-            &m,
-            "山田 太郎",
-            "",
-            Some(person()),
-            &adv_config(),
-        )
-        .unwrap();
+        let out =
+            resolve_entity(&m, &m, &m, "山田 太郎", "", Some(person()), &adv_config()).unwrap();
         match out {
             ResolutionOutcome::Resolved { entity, tier, .. } => {
                 assert_eq!(entity, id);
@@ -1128,16 +1091,7 @@ mod algorithm_tests {
         m.set_canonical(person(), nfc, id);
         m.set_embedding(nfd, adv_vec_zeros());
 
-        let out = resolve_entity(
-            &m,
-            &m,
-            &m,
-            nfd,
-            "",
-            Some(person()),
-            &adv_config(),
-        )
-        .unwrap();
+        let out = resolve_entity(&m, &m, &m, nfd, "", Some(person()), &adv_config()).unwrap();
         // NFD candidate doesn't tier-1 match the NFC stored entity;
         // tier 2 has no trigram fixture; tier 3 LLM disabled by
         // default; tier 5 creates a new entity.
@@ -1148,16 +1102,8 @@ mod algorithm_tests {
     fn emoji_in_candidate_does_not_panic() {
         let m = MockBackend::new();
         m.set_embedding("🚀 rocket", adv_vec_zeros());
-        let out = resolve_entity(
-            &m,
-            &m,
-            &m,
-            "🚀 rocket",
-            "",
-            Some(person()),
-            &adv_config(),
-        )
-        .unwrap();
+        let out =
+            resolve_entity(&m, &m, &m, "🚀 rocket", "", Some(person()), &adv_config()).unwrap();
         // Emoji is a 4-byte codepoint; trigram windows slice mid-
         // codepoint. We just want "no panic" + a sane outcome.
         assert!(matches!(out, ResolutionOutcome::Created { .. }));
@@ -1171,16 +1117,7 @@ mod algorithm_tests {
         let huge_a = "a".repeat(10_000);
         let m = MockBackend::new();
         m.set_embedding(huge_a.as_str(), adv_vec_zeros());
-        let out = resolve_entity(
-            &m,
-            &m,
-            &m,
-            &huge_a,
-            "",
-            Some(person()),
-            &adv_config(),
-        )
-        .unwrap();
+        let out = resolve_entity(&m, &m, &m, &huge_a, "", Some(person()), &adv_config()).unwrap();
         assert!(matches!(out, ResolutionOutcome::Created { .. }));
     }
 
@@ -1231,4 +1168,3 @@ mod algorithm_tests {
         assert!(matches!(out, ResolutionOutcome::Resolved { .. }));
     }
 }
-

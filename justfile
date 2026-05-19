@@ -129,6 +129,27 @@ docker-clippy:
 # The full verification suite — what CI runs.
 verify: fmt-check build clippy test check-skills
 
+# The production gate. Runs every check CI runs (`.github/workflows/ci.yml`)
+# locally in one command. Sequential link (`-j 1`) on the test sweep
+# matches CI's OOM-avoidance posture; if you have ≥ 16 GB free, drop
+# `-j 1` for faster local runs. Release-build smoke + doc build round
+# out the gates. The acceptance benches are not run here — they live
+# in the nightly perf workflow because they take 5–15 minutes each.
+prod-verify:
+    cargo fmt --all -- --check
+    cargo clippy --workspace --tests --all-features -- -D warnings
+    cargo test --workspace --all-targets --no-fail-fast -j 1
+    cargo test --workspace --doc
+    cargo doc --workspace --no-deps
+    cargo build --release --bin brain-server --bin brain-cli
+    ./scripts/check-skills.sh
+
+# Run the acceptance benches (asserted p50/p99 from spec §16/02).
+# Same gates the nightly-perf workflow runs.
+prod-bench:
+    cargo bench -p brain-planner --bench relation_traverse
+    cargo bench -p brain-index --bench recall
+
 # Run miri on brain-storage's lib tests. Miri doesn't shim our syscalls
 # (mmap/mremap/pwritev2/...), so syscall-bound tests are gated under
 # `cfg(not(miri))`; the ~47 pure-data tests run. See
@@ -181,3 +202,38 @@ specs:
 spec-stats:
     @echo "Total spec files: $(find spec -name '*.md' | wc -l)"
     @echo "Total spec lines: $(find spec -name '*.md' -exec cat {} \; | wc -l)"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Production Docker — distinct from the `.devcontainer/` recipes above
+# (those build a dev image for Linux cross-compile from macOS). The recipes
+# below build the runtime image that ships to operators and runs Brain itself.
+# Full guide: docs/guides/deployment/docker.md
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Build the production image. Uses BuildKit cache mounts — first build
+# takes ~15 min from cold; subsequent builds reuse the cargo cache.
+image TAG="latest":
+    DOCKER_BUILDKIT=1 docker build -t brain:{{TAG}} .
+
+# Run the production image with a named volume for data. Foreground;
+# Ctrl-C stops it. Smoke-test target after the image-build path.
+image-run TAG="latest":
+    @docker rm -f brain >/dev/null 2>&1 || true
+    docker run --rm --name brain \
+        -p 8080:8080 -p 9091:9091 \
+        -v brain-data:/var/lib/brain/data \
+        -v brain-models:/var/lib/brain/models \
+        brain:{{TAG}}
+
+# Bring up the full compose stack (brain + prometheus + otel-collector + grafana).
+# See docs/guides/deployment/docker-compose.md for the walkthrough.
+compose-up:
+    docker compose up -d --build
+    @echo
+    @echo "brain         : http://127.0.0.1:9091/healthz"
+    @echo "prometheus UI : http://127.0.0.1:9090"
+    @echo "grafana       : http://127.0.0.1:3000 (anonymous viewer enabled)"
+
+# Tear down the compose stack. Pass `-v` to also drop data volumes.
+compose-down *ARGS:
+    docker compose down {{ARGS}}

@@ -125,6 +125,28 @@ pub struct MemoryMetadata {
     // -- Denormalized edge counters --
     pub edges_out_count: u32,
     pub edges_in_count: u32,
+
+    // -- Opt-in dedup index back-reference (spec §07/07 §6) --
+    /// `Some(BLAKE3(text)[..32])` iff this row was written by an
+    /// ENCODE with `deduplicate = true` — used by `do_forget` /
+    /// slot reclamation to evict the matching `FINGERPRINTS` row
+    /// in the same write txn as the tombstone. `None` for the
+    /// dedup-off path so we don't pay 32 B per row in
+    /// substrate-only deployments.
+    pub content_hash: Option<[u8; 32]>,
+
+    // -- Provenance: WAL position of the ENCODE that wrote this row --
+    /// LSN of the `WalPayload::Encode` record that created this
+    /// memory. `0` means "unknown" — either the writer has no WAL
+    /// sink wired (test path) or the row predates the field
+    /// (rkyv-schema break would surface that case differently;
+    /// not a concern in the hard-cut shipping model).
+    ///
+    /// Surfaced through `RecallHit.encoded_at_lsn` →
+    /// `MemoryResult.lsn`, letting a client chain
+    /// `recall → subscribe --start-lsn lsn+1` to "follow this
+    /// memory's downstream events from when it was written."
+    pub encoded_at_lsn: u64,
 }
 
 impl MemoryMetadata {
@@ -166,7 +188,32 @@ impl MemoryMetadata {
             flags: flags::ACTIVE,
             edges_out_count: 0,
             edges_in_count: 0,
+            content_hash: None,
+            // Default to 0 = "unknown LSN". Live writers stamp the
+            // real value via `with_encoded_at_lsn` after they get
+            // the LSN back from `wal_sink.append`. Test fixtures
+            // that bypass the WAL get 0, which is fine — they
+            // don't exercise the `RecallHit.encoded_at_lsn` flow.
+            encoded_at_lsn: 0,
         }
+    }
+
+    /// Stamp the content hash on this row. Called by `do_encode`
+    /// when the ENCODE opted in to fingerprint dedup; the value is
+    /// later read by `do_forget` (and the slot-reclamation worker)
+    /// to evict the matching `FINGERPRINTS` entry.
+    pub fn with_content_hash(mut self, content_hash: [u8; 32]) -> Self {
+        self.content_hash = Some(content_hash);
+        self
+    }
+
+    /// Stamp the WAL LSN this memory was encoded at. Called by
+    /// `do_encode` after `wal_sink.append` returns. Builder-style so
+    /// the field defaults to `0` (unknown) and callers without WAL
+    /// access don't need to thread a value through.
+    pub fn with_encoded_at_lsn(mut self, lsn: u64) -> Self {
+        self.encoded_at_lsn = lsn;
+        self
     }
 
     // ---- Typed accessors for the brain-core fields ----

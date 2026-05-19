@@ -33,9 +33,7 @@ use crate::entity_ops::{normalize_name, EntityOpError};
 use crate::tables::knowledge::entity::{
     flags, EntityMetadata, ENTITIES_TABLE, ENTITY_ALIASES_TABLE, ENTITY_BY_CANONICAL_NAME_TABLE,
 };
-use crate::tables::knowledge::merge::{
-    actor_kind, MergeRecord, MERGE_LOG_TABLE,
-};
+use crate::tables::knowledge::merge::{actor_kind, MergeRecord, MERGE_LOG_TABLE};
 use crate::trigram_ops::{
     extract_trigrams, index_entity_trigrams, remove_entity_trigrams, trigrams_of_components,
     TrigramOpError,
@@ -261,7 +259,11 @@ pub fn merge_entity(
         for a in &aliases_added {
             let n = normalize_name(a);
             t.insert(
-                &(survivor_row.entity_type_id, n.as_str(), survivor_row.entity_id_bytes),
+                &(
+                    survivor_row.entity_type_id,
+                    n.as_str(),
+                    survivor_row.entity_id_bytes,
+                ),
                 &(),
             )?;
         }
@@ -276,7 +278,9 @@ pub fn merge_entity(
     for a in &aliases_added {
         survivor_next.aliases.push(a.clone());
     }
-    survivor_next.mention_count = survivor_next.mention_count.saturating_add(mention_count_added);
+    survivor_next.mention_count = survivor_next
+        .mention_count
+        .saturating_add(mention_count_added);
     survivor_next.updated_at_unix_nanos = now_unix_nanos;
 
     // 6. Mutate merged row: set merged_into, MERGED flag, updated_at.
@@ -576,8 +580,7 @@ mod tests {
             entity_lookup_by_canonical_name(&rtxn, EntityType::PERSON_ID, "Alyss").unwrap(),
             None
         );
-        let by_alias =
-            entity_lookup_by_alias(&rtxn, EntityType::PERSON_ID, "Alyss").unwrap();
+        let by_alias = entity_lookup_by_alias(&rtxn, EntityType::PERSON_ID, "Alyss").unwrap();
         assert_eq!(by_alias, vec![alice.id]);
 
         let alice_after = entity_get(&rtxn, alice.id).unwrap().unwrap();
@@ -715,9 +718,13 @@ mod tests {
         // Unmerge inside the grace period.
         {
             let wtxn = db.write_txn().unwrap();
-            let restored =
-                unmerge_entity(&wtxn, alyss.id, MergeActor::Agent([2; 16]), merge_at + 60_000_000_000)
-                    .unwrap();
+            let restored = unmerge_entity(
+                &wtxn,
+                alyss.id,
+                MergeActor::Agent([2; 16]),
+                merge_at + 60_000_000_000,
+            )
+            .unwrap();
             assert_eq!(restored, alice.id);
             wtxn.commit().unwrap();
         }
@@ -788,8 +795,7 @@ mod tests {
         put(&mut db, &alice);
 
         let wtxn = db.write_txn().unwrap();
-        let err =
-            unmerge_entity(&wtxn, alice.id, MergeActor::Agent([1; 16]), LATER).unwrap_err();
+        let err = unmerge_entity(&wtxn, alice.id, MergeActor::Agent([1; 16]), LATER).unwrap_err();
         assert!(matches!(err, EntityMergeOpError::NotMerged(_)));
     }
 
@@ -823,5 +829,4 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, EntityMergeOpError::Tombstoned(_)));
     }
-
 }

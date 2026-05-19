@@ -1,7 +1,7 @@
 //! Classifier extractor framework + BERT-based NER. Spec §22/02.
 //!
 //! Operator-provided model directory, matching `brain-embed`'s
-//! [`EmbedderConfig`] surface (phase 5). The substrate doesn't
+//! `EmbedderConfig` surface (phase 5). The substrate doesn't
 //! bundle weights or auto-download.
 //!
 //! ## Load path
@@ -205,11 +205,12 @@ impl BertTokenClassifier {
         }
 
         // 2. Model path.
-        let dir = config.model_path.as_ref().ok_or_else(|| {
-            ExtractorError::ModelNotFound {
+        let dir = config
+            .model_path
+            .as_ref()
+            .ok_or_else(|| ExtractorError::ModelNotFound {
                 id: "model_path unset".into(),
-            }
-        })?;
+            })?;
         if !dir.is_dir() {
             return Err(ExtractorError::ModelNotFound {
                 id: format!("not a directory: {}", dir.display()),
@@ -242,24 +243,25 @@ impl BertTokenClassifier {
         //    lights this up; the load path itself is what
         //    actually fails when the safetensors blob doesn't
         //    line up with a BertForTokenClassification layout.
-        let runtime: Option<Box<dyn BertRuntime>> = match crate::candle_runtime::CandleBertRuntime::load(
-            dir,
-            config.device.clone(),
-            config.dtype,
-            config.warmup_iters,
-            labels.len(),
-        ) {
-            Ok(rt) => Some(Box::new(rt)),
-            Err(e) => {
-                tracing::warn!(
-                    target: "brain_extractors::classifier",
-                    model_dir = %dir.display(),
-                    error = %e,
-                    "candle runtime load failed; classifier will run degraded",
-                );
-                None
-            }
-        };
+        let runtime: Option<Box<dyn BertRuntime>> =
+            match crate::candle_runtime::CandleBertRuntime::load(
+                dir,
+                config.device.clone(),
+                config.dtype,
+                config.warmup_iters,
+                labels.len(),
+            ) {
+                Ok(rt) => Some(Box::new(rt)),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "brain_extractors::classifier",
+                        model_dir = %dir.display(),
+                        error = %e,
+                        "candle runtime load failed; classifier will run degraded",
+                    );
+                    None
+                }
+            };
 
         tracing::info!(
             target: "brain_extractors::classifier",
@@ -416,7 +418,10 @@ impl ClassifierExtractor {
 /// (`Organization` / `Location`) accept `ORG` / `LOC`. Unknown
 /// entity types fall through with no match.
 fn label_matches_entity_type(label: &str, entity_type_qname: &str) -> bool {
-    let local = entity_type_qname.rsplit(':').next().unwrap_or(entity_type_qname);
+    let local = entity_type_qname
+        .rsplit(':')
+        .next()
+        .unwrap_or(entity_type_qname);
     match (label, local) {
         ("PER", "Person") => true,
         ("ORG", "Organization") => true,
@@ -445,11 +450,7 @@ impl Extractor for ClassifierExtractor {
         self.extractor_version
     }
 
-    fn run<'a>(
-        &'a self,
-        ctx: &'a ExtractionContext<'a>,
-        mem: &'a Memory,
-    ) -> ExtractionFuture<'a> {
+    fn run<'a>(&'a self, ctx: &'a ExtractionContext<'a>, mem: &'a Memory) -> ExtractionFuture<'a> {
         Box::pin(async move {
             let at = ctx.now_unix_nanos;
             let text = mem.text.as_deref().unwrap_or("");
@@ -532,7 +533,10 @@ mod tests {
     #[test]
     fn config_with_model_path_keeps_defaults() {
         let c = ClassifierConfig::with_model_path("/tmp/ner".into());
-        assert_eq!(c.model_path.as_deref(), Some(std::path::Path::new("/tmp/ner")));
+        assert_eq!(
+            c.model_path.as_deref(),
+            Some(std::path::Path::new("/tmp/ner"))
+        );
         assert_eq!(c.max_seq_len, DEFAULT_MAX_SEQ_LEN);
     }
 
@@ -654,7 +658,11 @@ mod tests {
         let cfg = ClassifierConfig::with_model_path(path.into());
         let model = BertTokenClassifier::load(&cfg).expect("load");
         let spans = model.predict("Alice met Bob in Paris.").expect("predict");
-        assert!(spans.iter().any(|s| s.label == "PER" && s.text.contains("Alice")));
-        assert!(spans.iter().any(|s| s.label == "LOC" && s.text.contains("Paris")));
+        assert!(spans
+            .iter()
+            .any(|s| s.label == "PER" && s.text.contains("Alice")));
+        assert!(spans
+            .iter()
+            .any(|s| s.label == "LOC" && s.text.contains("Paris")));
     }
 }

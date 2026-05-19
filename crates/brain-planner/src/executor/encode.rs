@@ -53,6 +53,12 @@ pub async fn execute_encode(
             weight: step.edge.weight,
         })
         .collect();
+    // Compute the content hash once. The writer only consults it
+    // when `deduplicate` is set, but computing here keeps the writer
+    // side branch-free and pure-redb (no hashing under the metadata
+    // lock).
+    let content_hash = *blake3::hash(plan.embedding.text.as_bytes()).as_bytes();
+
     let op = EncodeOp {
         request_id: plan.idempotency_check.request_id,
         context_id,
@@ -62,6 +68,9 @@ pub async fn execute_encode(
         salience_initial: plan.wal_append.salience_initial,
         fingerprint: ctx.embedder.fingerprint(),
         edges,
+        deduplicate: plan.deduplicate,
+        content_hash,
+        agent_id: ctx.caller_agent,
     };
 
     // 4. Submit. WriterError → ExecError::WriterFailed via #[from].
@@ -71,5 +80,9 @@ pub async fn execute_encode(
         memory_id: ack.memory_id,
         edge_results: ack.edge_results,
         replayed: ack.replayed,
+        was_deduplicated: ack.was_deduplicated,
+        lsn: ack.lsn,
+        created_at_unix_nanos: ack.created_at_unix_nanos,
+        edges_out_count: ack.edges_out_count,
     })
 }

@@ -15,6 +15,8 @@ brain-embed = { path = "../brain-embed" }
 brain-extractors = { path = "../brain-extractors" }
 brain-index = { path = "../brain-index" }
 brain-metadata = { path = "../brain-metadata" }
+brain-storage = { path = "../brain-storage" }
+rkyv.workspace = true
 redb.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -22,7 +24,7 @@ parking_lot.workspace = true
 arc-swap.workspace = true
 blake3.workspace = true
 uuid.workspace = true
-tokio = { version = "1", features = ["sync", "time"] }
+tokio = { version = "1", default-features = false, features = ["sync"] }
 # 17.7: SmallVec used when projecting overflow evidence back to inline
 # for StatementView responses.
 smallvec.workspace = true
@@ -32,12 +34,17 @@ flume = { workspace = true }
 # 22.3 — IndexWriter, PreparedCommit, Term, doc!() — used by
 # the text indexer worker.
 tantivy = { workspace = true }
-# 22.3 — `glommio::spawn_local` for the per-shard drain task.
+# 22.3 — `glommio::spawn_local` for the per-shard drain task,
+# `glommio::timer::sleep` + `futures_lite::FutureExt::or` for the
+# Glommio-side wait-or-deadline race in the text indexers
+# (matches the pattern in `brain-storage::wal::group_commit`).
 # Same Linux-only constraint as brain-storage.
 [target.'cfg(target_os = "linux")'.dependencies]
 glommio = { workspace = true }
+futures-lite = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
 uuid.workspace = true
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+proptest.workspace = true

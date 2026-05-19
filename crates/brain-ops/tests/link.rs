@@ -14,9 +14,10 @@ use std::sync::Arc;
 use brain_core::{EdgeKind as CoreEdgeKind, MemoryId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
-use brain_metadata::tables::edge::EDGES_OUT_TABLE;
+use brain_metadata::tables::edge::edge_get;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::MetadataDb;
+use brain_ops::test_support::run_in_glommio;
 use brain_ops::{dispatch, ErrorCode, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::request::{
@@ -121,7 +122,14 @@ fn unlink_req(
 
 async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str) -> u128 {
     let req = encode_req(request_id, text);
-    match dispatch(RequestBody::Encode(req), &fix.ctx).await.unwrap() {
+    match dispatch(
+        RequestBody::Encode(req),
+        brain_ops::RequestCaller::anonymous(),
+        &fix.ctx,
+    )
+    .await
+    .unwrap()
+    {
         ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
         other => panic!("expected Encode response, got {other:?}"),
     }
@@ -144,10 +152,15 @@ fn unwrap_unlink(body: ResponseBody) -> UnlinkResponse {
 fn edge_exists(fix: &Fixture, source: u128, kind: CoreEdgeKind, target: u128) -> bool {
     let db = fix.metadata.lock();
     let rtxn = db.read_txn().unwrap();
-    let table = rtxn.open_table(EDGES_OUT_TABLE).unwrap();
-    let s = MemoryId::from(source).to_be_bytes();
-    let t = MemoryId::from(target).to_be_bytes();
-    table.get(&(s, kind as u8, t)).unwrap().is_some()
+    edge_get(
+        &rtxn,
+        brain_core::NodeRef::Memory(MemoryId::from(source)),
+        brain_core::EdgeKindRef::Builtin(kind),
+        brain_core::NodeRef::Memory(MemoryId::from(target)),
+        brain_metadata::tables::edge::zero_disambiguator(),
+    )
+    .unwrap()
+    .is_some()
 }
 
 fn edge_counts(fix: &Fixture, memory_id: u128) -> (u32, u32) {
@@ -166,276 +179,353 @@ fn edge_counts(fix: &Fixture, memory_id: u128) -> (u32, u32) {
 // LINK
 // ===========================================================================
 
-#[tokio::test]
-async fn link_inserts_edge_and_bumps_counts() {
-    let fix = build_fixture();
-    let a = encode(&fix, [1; 16], "alpha").await;
-    let b = encode(&fix, [2; 16], "beta").await;
+#[test]
+fn link_inserts_edge_and_bumps_counts() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let a = encode(&fix, [1; 16], "alpha").await;
+        let b = encode(&fix, [2; 16], "beta").await;
 
-    let resp = unwrap_link(
-        dispatch(
-            RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.7, [10; 16])),
-            &fix.ctx,
-        )
-        .await
-        .unwrap(),
-    );
-    assert_eq!(resp.source, a);
-    assert_eq!(resp.target, b);
-    assert!(!resp.already_existed);
-    assert!((resp.weight - 0.7).abs() < 1e-6);
+        let resp = unwrap_link(
+            dispatch(
+                RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.7, [10; 16])),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(resp.source, a);
+        assert_eq!(resp.target, b);
+        assert!(!resp.already_existed);
+        assert!((resp.weight - 0.7).abs() < 1e-6);
 
-    // Edge actually present.
-    assert!(edge_exists(&fix, a, CoreEdgeKind::Caused, b));
+        // Edge actually present.
+        assert!(edge_exists(&fix, a, CoreEdgeKind::Caused, b));
 
-    // Counts bumped on both endpoints.
-    let (a_out, _a_in) = edge_counts(&fix, a);
-    let (_b_out, b_in) = edge_counts(&fix, b);
-    assert_eq!(a_out, 1);
-    assert_eq!(b_in, 1);
+        // Counts bumped on both endpoints.
+        let (a_out, _a_in) = edge_counts(&fix, a);
+        let (_b_out, b_in) = edge_counts(&fix, b);
+        assert_eq!(a_out, 1);
+        assert_eq!(b_in, 1);
+    })
 }
 
-#[tokio::test]
-async fn link_replays_same_request_id() {
-    let fix = build_fixture();
-    let a = encode(&fix, [1; 16], "alpha").await;
-    let b = encode(&fix, [2; 16], "beta").await;
+#[test]
+fn link_replays_same_request_id() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let a = encode(&fix, [1; 16], "alpha").await;
+        let b = encode(&fix, [2; 16], "beta").await;
 
-    let req = link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16]);
-    let first = unwrap_link(dispatch(RequestBody::Link(req), &fix.ctx).await.unwrap());
-    let second = unwrap_link(dispatch(RequestBody::Link(req), &fix.ctx).await.unwrap());
-    assert_eq!(first.source, second.source);
-    assert_eq!(first.target, second.target);
-    assert!((first.weight - second.weight).abs() < 1e-6);
-    // The denormalized count must not double-bump.
-    assert_eq!(edge_counts(&fix, a).0, 1);
+        let req = link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16]);
+        let first = unwrap_link(
+            dispatch(
+                RequestBody::Link(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        let second = unwrap_link(
+            dispatch(
+                RequestBody::Link(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(first.source, second.source);
+        assert_eq!(first.target, second.target);
+        assert!((first.weight - second.weight).abs() < 1e-6);
+        // The denormalized count must not double-bump.
+        assert_eq!(edge_counts(&fix, a).0, 1);
+    })
 }
 
-#[tokio::test]
-async fn link_overwrite_with_new_request_id_marks_already_existed() {
-    let fix = build_fixture();
-    let a = encode(&fix, [1; 16], "alpha").await;
-    let b = encode(&fix, [2; 16], "beta").await;
+#[test]
+fn link_overwrite_with_new_request_id_marks_already_existed() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let a = encode(&fix, [1; 16], "alpha").await;
+        let b = encode(&fix, [2; 16], "beta").await;
 
-    let r1 = unwrap_link(
-        dispatch(
+        let r1 = unwrap_link(
+            dispatch(
+                RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16])),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(!r1.already_existed);
+
+        // Second LINK with a NEW request_id overwrites weight; already_existed=true.
+        let r2 = unwrap_link(
+            dispatch(
+                RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.9, [11; 16])),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(r2.already_existed);
+        assert!((r2.weight - 0.9).abs() < 1e-6);
+        // No double-count.
+        assert_eq!(edge_counts(&fix, a).0, 1);
+    })
+}
+
+#[test]
+fn link_conflict_on_request_id_reuse_with_different_target() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let a = encode(&fix, [1; 16], "alpha").await;
+        let b = encode(&fix, [2; 16], "beta").await;
+        let c = encode(&fix, [3; 16], "gamma").await;
+
+        let _ = dispatch(
             RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16])),
+            brain_ops::RequestCaller::anonymous(),
             &fix.ctx,
         )
         .await
-        .unwrap(),
-    );
-    assert!(!r1.already_existed);
+        .unwrap();
 
-    // Second LINK with a NEW request_id overwrites weight; already_existed=true.
-    let r2 = unwrap_link(
-        dispatch(
-            RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.9, [11; 16])),
+        let err = dispatch(
+            RequestBody::Link(link_req(a, c, EdgeKindWire::Caused, 0.5, [10; 16])),
+            brain_ops::RequestCaller::anonymous(),
             &fix.ctx,
         )
         .await
-        .unwrap(),
-    );
-    assert!(r2.already_existed);
-    assert!((r2.weight - 0.9).abs() < 1e-6);
-    // No double-count.
-    assert_eq!(edge_counts(&fix, a).0, 1);
+        .unwrap_err();
+        assert_eq!(err.error_code(), ErrorCode::Conflict);
+    })
 }
 
-#[tokio::test]
-async fn link_conflict_on_request_id_reuse_with_different_target() {
-    let fix = build_fixture();
-    let a = encode(&fix, [1; 16], "alpha").await;
-    let b = encode(&fix, [2; 16], "beta").await;
-    let c = encode(&fix, [3; 16], "gamma").await;
+#[test]
+fn link_missing_target_returns_not_found() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let a = encode(&fix, [1; 16], "alpha").await;
+        let phantom: u128 = 0xDEAD_BEEF_DEAD_BEEF_0000_0000_0000_0000;
 
-    let _ = dispatch(
-        RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16])),
-        &fix.ctx,
-    )
-    .await
-    .unwrap();
-
-    let err = dispatch(
-        RequestBody::Link(link_req(a, c, EdgeKindWire::Caused, 0.5, [10; 16])),
-        &fix.ctx,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err.error_code(), ErrorCode::Conflict);
-}
-
-#[tokio::test]
-async fn link_missing_target_returns_not_found() {
-    let fix = build_fixture();
-    let a = encode(&fix, [1; 16], "alpha").await;
-    let phantom: u128 = 0xDEAD_BEEF_DEAD_BEEF_0000_0000_0000_0000;
-
-    let err = dispatch(
-        RequestBody::Link(link_req(a, phantom, EdgeKindWire::Caused, 0.5, [10; 16])),
-        &fix.ctx,
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(err, OpError::NotFound { .. }));
-    assert_eq!(err.error_code(), ErrorCode::NotFound);
-}
-
-#[tokio::test]
-async fn link_invalid_weight_returns_invalid_request() {
-    let fix = build_fixture();
-    let a = encode(&fix, [1; 16], "alpha").await;
-    let b = encode(&fix, [2; 16], "beta").await;
-
-    let err = dispatch(
-        RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 1.5, [10; 16])),
-        &fix.ctx,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err.error_code(), ErrorCode::InvalidRequest);
-}
-
-#[tokio::test]
-async fn link_contradicts_allows_negative_weight() {
-    let fix = build_fixture();
-    let a = encode(&fix, [1; 16], "alpha").await;
-    let b = encode(&fix, [2; 16], "beta").await;
-
-    let resp = unwrap_link(
-        dispatch(
-            RequestBody::Link(link_req(a, b, EdgeKindWire::Contradicts, -0.7, [10; 16])),
+        let err = dispatch(
+            RequestBody::Link(link_req(a, phantom, EdgeKindWire::Caused, 0.5, [10; 16])),
+            brain_ops::RequestCaller::anonymous(),
             &fix.ctx,
         )
         .await
-        .unwrap(),
-    );
-    assert!((resp.weight + 0.7).abs() < 1e-6);
+        .unwrap_err();
+        assert!(matches!(err, OpError::NotFound { .. }));
+        assert_eq!(err.error_code(), ErrorCode::NotFound);
+    })
+}
+
+#[test]
+fn link_invalid_weight_returns_invalid_request() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let a = encode(&fix, [1; 16], "alpha").await;
+        let b = encode(&fix, [2; 16], "beta").await;
+
+        let err = dispatch(
+            RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 1.5, [10; 16])),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.error_code(), ErrorCode::InvalidRequest);
+    })
+}
+
+#[test]
+fn link_contradicts_allows_negative_weight() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let a = encode(&fix, [1; 16], "alpha").await;
+        let b = encode(&fix, [2; 16], "beta").await;
+
+        let resp = unwrap_link(
+            dispatch(
+                RequestBody::Link(link_req(a, b, EdgeKindWire::Contradicts, -0.7, [10; 16])),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!((resp.weight + 0.7).abs() < 1e-6);
+    })
 }
 
 // ===========================================================================
 // UNLINK
 // ===========================================================================
 
-#[tokio::test]
-async fn unlink_removes_existing_edge_and_decrements_counts() {
-    let fix = build_fixture();
-    let a = encode(&fix, [1; 16], "alpha").await;
-    let b = encode(&fix, [2; 16], "beta").await;
-    let _ = dispatch(
-        RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16])),
-        &fix.ctx,
-    )
-    .await
-    .unwrap();
-    assert_eq!(edge_counts(&fix, a).0, 1);
-
-    let resp = unwrap_unlink(
-        dispatch(
-            RequestBody::Unlink(unlink_req(a, b, EdgeKindWire::Caused, [20; 16])),
+#[test]
+fn unlink_removes_existing_edge_and_decrements_counts() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let a = encode(&fix, [1; 16], "alpha").await;
+        let b = encode(&fix, [2; 16], "beta").await;
+        let _ = dispatch(
+            RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16])),
+            brain_ops::RequestCaller::anonymous(),
             &fix.ctx,
         )
         .await
-        .unwrap(),
-    );
-    assert!(resp.removed);
-    assert!(!edge_exists(&fix, a, CoreEdgeKind::Caused, b));
-    let (a_out, _) = edge_counts(&fix, a);
-    let (_, b_in) = edge_counts(&fix, b);
-    assert_eq!(a_out, 0);
-    assert_eq!(b_in, 0);
+        .unwrap();
+        assert_eq!(edge_counts(&fix, a).0, 1);
+
+        let resp = unwrap_unlink(
+            dispatch(
+                RequestBody::Unlink(unlink_req(a, b, EdgeKindWire::Caused, [20; 16])),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(resp.removed);
+        assert!(!edge_exists(&fix, a, CoreEdgeKind::Caused, b));
+        let (a_out, _) = edge_counts(&fix, a);
+        let (_, b_in) = edge_counts(&fix, b);
+        assert_eq!(a_out, 0);
+        assert_eq!(b_in, 0);
+    })
 }
 
-#[tokio::test]
-async fn unlink_non_existent_edge_returns_false_not_error() {
-    let fix = build_fixture();
-    let a = encode(&fix, [1; 16], "alpha").await;
-    let b = encode(&fix, [2; 16], "beta").await;
+#[test]
+fn unlink_non_existent_edge_returns_false_not_error() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let a = encode(&fix, [1; 16], "alpha").await;
+        let b = encode(&fix, [2; 16], "beta").await;
 
-    let resp = unwrap_unlink(
-        dispatch(
-            RequestBody::Unlink(unlink_req(a, b, EdgeKindWire::Caused, [20; 16])),
+        let resp = unwrap_unlink(
+            dispatch(
+                RequestBody::Unlink(unlink_req(a, b, EdgeKindWire::Caused, [20; 16])),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(!resp.removed);
+    })
+}
+
+#[test]
+fn unlink_idempotent_replay() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let a = encode(&fix, [1; 16], "alpha").await;
+        let b = encode(&fix, [2; 16], "beta").await;
+        let _ = dispatch(
+            RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16])),
+            brain_ops::RequestCaller::anonymous(),
             &fix.ctx,
         )
         .await
-        .unwrap(),
-    );
-    assert!(!resp.removed);
+        .unwrap();
+
+        let req = unlink_req(a, b, EdgeKindWire::Caused, [20; 16]);
+        let first = unwrap_unlink(
+            dispatch(
+                RequestBody::Unlink(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        let second = unwrap_unlink(
+            dispatch(
+                RequestBody::Unlink(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(first.removed);
+        // Replay must return the same outcome; counts must not double-decrement.
+        assert_eq!(first.removed, second.removed);
+        assert_eq!(edge_counts(&fix, a).0, 0);
+    })
 }
 
-#[tokio::test]
-async fn unlink_idempotent_replay() {
-    let fix = build_fixture();
-    let a = encode(&fix, [1; 16], "alpha").await;
-    let b = encode(&fix, [2; 16], "beta").await;
-    let _ = dispatch(
-        RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16])),
-        &fix.ctx,
-    )
-    .await
-    .unwrap();
+#[test]
+fn unlink_conflict_on_request_id_reuse_with_different_target() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let a = encode(&fix, [1; 16], "alpha").await;
+        let b = encode(&fix, [2; 16], "beta").await;
+        let c = encode(&fix, [3; 16], "gamma").await;
 
-    let req = unlink_req(a, b, EdgeKindWire::Caused, [20; 16]);
-    let first = unwrap_unlink(dispatch(RequestBody::Unlink(req), &fix.ctx).await.unwrap());
-    let second = unwrap_unlink(dispatch(RequestBody::Unlink(req), &fix.ctx).await.unwrap());
-    assert!(first.removed);
-    // Replay must return the same outcome; counts must not double-decrement.
-    assert_eq!(first.removed, second.removed);
-    assert_eq!(edge_counts(&fix, a).0, 0);
-}
+        let _ = dispatch(
+            RequestBody::Unlink(unlink_req(a, b, EdgeKindWire::Caused, [20; 16])),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
 
-#[tokio::test]
-async fn unlink_conflict_on_request_id_reuse_with_different_target() {
-    let fix = build_fixture();
-    let a = encode(&fix, [1; 16], "alpha").await;
-    let b = encode(&fix, [2; 16], "beta").await;
-    let c = encode(&fix, [3; 16], "gamma").await;
-
-    let _ = dispatch(
-        RequestBody::Unlink(unlink_req(a, b, EdgeKindWire::Caused, [20; 16])),
-        &fix.ctx,
-    )
-    .await
-    .unwrap();
-
-    let err = dispatch(
-        RequestBody::Unlink(unlink_req(a, c, EdgeKindWire::Caused, [20; 16])),
-        &fix.ctx,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err.error_code(), ErrorCode::Conflict);
+        let err = dispatch(
+            RequestBody::Unlink(unlink_req(a, c, EdgeKindWire::Caused, [20; 16])),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.error_code(), ErrorCode::Conflict);
+    })
 }
 
 // ===========================================================================
 // Encode-inline edge insertion (the bug fix)
 // ===========================================================================
 
-#[tokio::test]
-async fn encode_inline_edges_actually_land_in_redb() {
-    let fix = build_fixture();
+#[test]
+fn encode_inline_edges_actually_land_in_redb() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
 
-    // First memory becomes a target.
-    let target = encode(&fix, [1; 16], "target").await;
+        // First memory becomes a target.
+        let target = encode(&fix, [1; 16], "target").await;
 
-    // Second memory carries an inline edge to the target.
-    let mut req = encode_req([2; 16], "linker");
-    req.edges = vec![EdgeRequest {
-        target,
-        kind: EdgeKindWire::References,
-        weight: 0.5,
-    }];
-    let linker = match dispatch(RequestBody::Encode(req), &fix.ctx).await.unwrap() {
-        ResponseBody::Encode(r) => r.memory_id,
-        other => panic!("got {other:?}"),
-    };
+        // Second memory carries an inline edge to the target.
+        let mut req = encode_req([2; 16], "linker");
+        req.edges = vec![EdgeRequest {
+            target,
+            kind: EdgeKindWire::References,
+            weight: 0.5,
+        }];
+        let linker = match dispatch(
+            RequestBody::Encode(req),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap()
+        {
+            ResponseBody::Encode(r) => r.memory_id,
+            other => panic!("got {other:?}"),
+        };
 
-    // The edge must actually exist in redb (pre-7.8 bug: it didn't).
-    assert!(edge_exists(&fix, linker, CoreEdgeKind::References, target));
+        // The edge must actually exist in redb (pre-7.8 bug: it didn't).
+        assert!(edge_exists(&fix, linker, CoreEdgeKind::References, target));
 
-    // Edge counts must be set on BOTH endpoints.
-    let (linker_out, _) = edge_counts(&fix, linker);
-    let (_, target_in) = edge_counts(&fix, target);
-    assert_eq!(linker_out, 1, "source memory tracks outgoing edges");
-    assert_eq!(target_in, 1, "target memory tracks incoming edges");
+        // Edge counts must be set on BOTH endpoints.
+        let (linker_out, _) = edge_counts(&fix, linker);
+        let (_, target_in) = edge_counts(&fix, target);
+        assert_eq!(linker_out, 1, "source memory tracks outgoing edges");
+        assert_eq!(target_in, 1, "target memory tracks incoming edges");
+    })
 }

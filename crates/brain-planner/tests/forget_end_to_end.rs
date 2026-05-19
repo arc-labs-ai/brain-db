@@ -163,6 +163,10 @@ impl WriterHandle for FakeWriterHandle {
                 memory_id,
                 edge_results: Vec::new(),
                 replayed: false,
+                was_deduplicated: false,
+                lsn: None,
+                edges_out_count: 0,
+                created_at_unix_nanos: 0,
             };
             state.encode_seen.insert(op.request_id, ack.clone());
             Ok(ack)
@@ -333,9 +337,10 @@ fn recall_request(cue: &str, top_k: u32) -> RecallRequest {
         age_bound_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
-        strategy_hint: None,
+        strategy: None,
         include_vectors: false,
         include_edges: false,
+        include_text: false,
         request_id: None,
         txn_id: None,
     }

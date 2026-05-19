@@ -63,6 +63,28 @@ pub trait WriterHandle {
         &'a self,
         batch: TxnBatch,
     ) -> Pin<Box<dyn Future<Output = Result<TxnBatchAck, WriterError>> + 'a>>;
+
+    /// Agent the writer stamps on every memory it creates. Surfaced
+    /// to handlers so the wire response can echo the bound agent
+    /// without threading it through the request. Default is `nil`
+    /// (`AgentId::default`) for impls that don't bind an agent.
+    fn agent_id(&self) -> brain_core::AgentId {
+        brain_core::AgentId::default()
+    }
+
+    /// Push `(memory_id, text)` onto the per-shard ExtractorWorker
+    /// channel for out-of-band re-extraction. Returns `true` iff the
+    /// enqueue landed (writer has a wired extractor channel and the
+    /// queue accepted the payload), `false` otherwise.
+    ///
+    /// Used by the admin `EXTRACT_BACKFILL` op — operators replay
+    /// existing memories through the three-tier extractor pipeline
+    /// after enabling the worker or uploading a new schema. The
+    /// default implementation drops on the floor so test fakes /
+    /// substrate-only writers keep working without overriding.
+    fn enqueue_for_extraction(&self, _memory_id: MemoryId, _text: &str) -> bool {
+        false
+    }
 }
 
 /// Encode operation payload submitted to the writer. Carries
@@ -87,6 +109,23 @@ pub struct EncodeOp {
     /// `Dispatcher::fingerprint()` through.
     pub fingerprint: [u8; 16],
     pub edges: Vec<EncodeOpEdge>,
+    /// Spec §07/07 §6 — when `true`, the writer consults the per-
+    /// shard `fingerprints` table keyed by
+    /// `(agent_id, context_id, content_hash)` and, on a hit, returns
+    /// the existing `MemoryId` without allocating a new slot.
+    pub deduplicate: bool,
+    /// BLAKE3 over the canonical UTF-8 text. Always computed by
+    /// the executor (cheap); the writer only reads it when
+    /// `deduplicate` is set.
+    pub content_hash: [u8; 32],
+    /// **The caller's authenticated agent.** Stamped by the
+    /// dispatcher from `ConnPhase::Established.agent` — not from
+    /// the wire request. Used by the writer to populate the
+    /// memory row, the WAL payload, and the published event so the
+    /// subscribe `agents` filter can isolate per-tenant on a
+    /// shared shard. Defaults to `AgentId::default()` in tests
+    /// that bypass the dispatcher.
+    pub agent_id: brain_core::AgentId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,9 +140,29 @@ pub struct EncodeOpEdge {
 pub struct EncodeAck {
     pub memory_id: MemoryId,
     pub edge_results: Vec<EdgeOutcome>,
-    /// `true` iff this ack came from a replayed idempotency entry;
-    /// `false` for a fresh write. Spec §08/04 §4.
+    /// `true` iff this ack came from a replayed idempotency entry
+    /// (same `request_id` retried); `false` for a fresh write.
+    /// Spec §08/04 §4. **Transparent to the caller** — never
+    /// surfaced in the wire response.
     pub replayed: bool,
+    /// `true` iff `op.deduplicate` was set AND the fingerprint
+    /// lookup hit an existing Active memory; the returned
+    /// `memory_id` is that prior memory's. Spec §07/07 §6.
+    pub was_deduplicated: bool,
+    /// WAL LSN this encode was recorded at. `Some(lsn)` when the
+    /// shard has a wired WAL sink (production); `None` for the
+    /// legacy in-memory test path that mints LSNs from the event
+    /// bus. Surfaced to the client so they can chain
+    /// `encode → subscribe --start-lsn lsn+1` to follow downstream
+    /// events.
+    pub lsn: Option<u64>,
+    /// Outgoing edges actually inserted (`EdgeOutcome::Inserted`
+    /// count). Reported back so clients can show "5 of 7 edges
+    /// landed; 2 targets were missing."
+    pub edges_out_count: u32,
+    /// Server unix-nanos timestamp stamped on the memory row.
+    /// Useful when the client clock drifts vs the server.
+    pub created_at_unix_nanos: u64,
 }
 
 /// Per-edge outcome. Spec §08/04 §10: edges with missing targets are
@@ -134,6 +193,8 @@ pub struct ForgetOp {
     pub request_id: RequestId,
     pub memory_id: MemoryId,
     pub mode: ForgetMode,
+    /// Caller's authenticated agent (see [`EncodeOp::agent_id`]).
+    pub agent_id: brain_core::AgentId,
 }
 
 /// Per-memory outcome. Spec §08/06 §10's per-memory error tolerance:
@@ -168,6 +229,8 @@ pub struct LinkOp {
     pub kind: EdgeKind,
     /// `[0, 1]` for most kinds; `[-1, 1]` for `Contradicts`.
     pub weight: f32,
+    /// Caller's authenticated agent (see [`EncodeOp::agent_id`]).
+    pub agent_id: brain_core::AgentId,
 }
 
 /// Writer's ack for a LINK. Spec §09/07 §3.
@@ -192,6 +255,8 @@ pub struct UnlinkOp {
     pub source: MemoryId,
     pub target: MemoryId,
     pub kind: EdgeKind,
+    /// Caller's authenticated agent (see [`EncodeOp::agent_id`]).
+    pub agent_id: brain_core::AgentId,
 }
 
 /// Writer's ack for an UNLINK. Spec §09/07 §5: non-existent edge →
@@ -236,6 +301,8 @@ pub struct TxnEncode {
     pub fingerprint: [u8; 16],
     pub edges: Vec<EncodeOpEdge>,
     pub created_at_unix_nanos: u64,
+    /// Caller's authenticated agent (see [`EncodeOp::agent_id`]).
+    pub agent_id: brain_core::AgentId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -247,6 +314,8 @@ pub struct TxnLink {
     pub kind: EdgeKind,
     pub weight: f32,
     pub created_at_unix_nanos: u64,
+    /// Caller's authenticated agent (see [`EncodeOp::agent_id`]).
+    pub agent_id: brain_core::AgentId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -257,6 +326,8 @@ pub struct TxnUnlink {
     pub target: MemoryId,
     pub kind: EdgeKind,
     pub created_at_unix_nanos: u64,
+    /// Caller's authenticated agent (see [`EncodeOp::agent_id`]).
+    pub agent_id: brain_core::AgentId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -266,6 +337,8 @@ pub struct TxnForget {
     pub memory_id: MemoryId,
     pub mode: brain_protocol::request::ForgetMode,
     pub created_at_unix_nanos: u64,
+    /// Caller's authenticated agent (see [`EncodeOp::agent_id`]).
+    pub agent_id: brain_core::AgentId,
 }
 
 /// Result of a successful `submit_batch`. Per-op acks come back in

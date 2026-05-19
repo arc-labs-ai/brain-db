@@ -8,7 +8,7 @@ Cross-references:
 
 ## 1. Knowledge error code namespace
 
-§28's top-level table lists 14 knowledge-specific error codes:
+§28's top-level table lists the knowledge-specific error codes:
 
 | Code | Name | Family |
 |---|---|---|
@@ -21,7 +21,6 @@ Cross-references:
 | `0x40` | `STATEMENT_NOT_FOUND` | Statement |
 | `0x41` | `STATEMENT_OBJECT_TYPE_MISMATCH` | Statement |
 | `0x42` | `STATEMENT_CONTRADICTS_EXISTING` | Statement |
-| `0x50` | `RELATION_CARDINALITY_VIOLATION` | Relation |
 | `0x60` | `QUERY_TIMEOUT` | Query |
 | `0x61` | `QUERY_OVER_BUDGET` | Query |
 | `0x70` | `EXTRACTOR_DISABLED` | Extractor |
@@ -29,6 +28,8 @@ Cross-references:
 | `0x72` | `EXTRACTION_FAILED` | Extractor |
 
 These codes are **carried in the ERROR frame body** ([§03/10 §3](../03_wire_protocol/10_errors.md)) — they are not opcodes. The numeric values are independent of the opcode namespace.
+
+Cardinality violations on RELATION_CREATE surface as the substrate-wide `CardinalityViolation` (0x0065) — there is no §28-local code for it; see [`../03_wire_protocol/10_errors.md`](../03_wire_protocol/10_errors.md) §3.6. Open-vocabulary qname rejections in strict mode surface as `PredicateNotInSchema` (0x004B) / `RelationTypeNotInSchema` (0x004C) under §3.4. Hybrid-capability gaps surface as `HybridUnavailable` (0x0083) under §3.9.
 
 ## 2. Carrying knowledge codes in the substrate ERROR frame
 
@@ -63,7 +64,6 @@ Each knowledge code maps to one substrate category for client retry behavior:
 | `STATEMENT_NOT_FOUND` | `StatementNotFound` | NotFound |
 | `STATEMENT_OBJECT_TYPE_MISMATCH` | `StatementObjectTypeMismatch` | Validation |
 | `STATEMENT_CONTRADICTS_EXISTING` | `StatementContradictsExisting` | Conflict |
-| `RELATION_CARDINALITY_VIOLATION` | `RelationCardinalityViolation` | Validation |
 | `QUERY_TIMEOUT` | `QueryTimeout` | Unavailable |
 | `QUERY_OVER_BUDGET` | `QueryOverBudget` | ResourceExhausted |
 | `EXTRACTOR_DISABLED` | `ExtractorDisabled` | Conflict |
@@ -110,7 +110,7 @@ The optional `ErrorDetails` carries structured context. Knowledge handlers popul
 | `ENTITY_AMBIGUOUS` | `"canonical_name"` | (empty) | newline-joined existing EntityIds |
 | `ENTITY_MERGE_CONFLICT` | `"merge"` | reason (e.g. "grace period expired", "already merged") | (empty) |
 | `STATEMENT_OBJECT_TYPE_MISMATCH` | predicate name | expected object type | actual encountered |
-| `RELATION_CARDINALITY_VIOLATION` | `"cardinality"` | declared rule (e.g. "one_to_many") | (empty) |
+| `CardinalityViolation` (substrate 0x0065) | `"cardinality"` | declared rule (e.g. "one_to_many") | (empty) |
 | `QUERY_TIMEOUT` | `"timeout_ms"` | wall budget | elapsed |
 | `EXTRACTOR_BUDGET_EXCEEDED` | extractor name | tier budget | usage |
 
@@ -118,15 +118,11 @@ Free-form `message` accompanies every error and is intended for log lines, not p
 
 ## 5. Schema-not-declared mode
 
-If no schema has been declared on the deployment ([`./00_purpose.md`](./00_purpose.md) §"Schema-optional behavior"), knowledge-namespace opcodes other than `SCHEMA_UPLOAD` (0x0120) return:
+When no schema has been declared for a namespace ([`./00_purpose.md`](./00_purpose.md) §"Schema-optional behavior", [`./08_schema_optional_mode.md`](./08_schema_optional_mode.md) §2), knowledge writes (`STATEMENT_CREATE`, `RELATION_CREATE`) and reads (`QUERY`, etc.) accept any predicate / relation-type qname — the registry interns it on first use with `SchemaOrigin::ImplicitFromWrite` / `RelationTypeOrigin::ImplicitFromWrite`. No `SchemaNotDeclared` error is returned for these opcodes in v1.0.
 
-```
-code:    SchemaNotDeclared    (new substrate variant under Strategy A)
-category: Conflict
-message: "operation requires a schema; call SCHEMA_UPLOAD first"
-```
+`SchemaNotDeclared` remains reserved for explicit schema-introspection opcodes (e.g. `SCHEMA_GET` against a namespace that has never had one), where there is nothing to return. Its category is `Conflict`.
 
-The substrate's cognitive primitives (the `0x00xx` namespace) are unaffected and continue to work normally.
+The substrate's cognitive primitives (the `0x00xx` namespace) are unaffected and continue to work normally in both modes.
 
 ## 6. EOS and stream_id
 

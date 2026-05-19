@@ -25,7 +25,12 @@ pub struct EntityTypeDefinition {
 
 impl EntityTypeDefinition {
     #[must_use]
-    pub fn new(id: EntityTypeId, name: String, schema_blob: Vec<u8>, created_at_unix_nanos: u64) -> Self {
+    pub fn new(
+        id: EntityTypeId,
+        name: String,
+        schema_blob: Vec<u8>,
+        created_at_unix_nanos: u64,
+    ) -> Self {
         Self {
             entity_type_id: id.raw(),
             name,
@@ -40,7 +45,10 @@ impl EntityTypeDefinition {
     }
 }
 
-impl_redb_rkyv_value!(EntityTypeDefinition, "brain_metadata::EntityTypeDefinition::v1");
+impl_redb_rkyv_value!(
+    EntityTypeDefinition,
+    "brain_metadata::EntityTypeDefinition::v1"
+);
 
 #[cfg(all(test, not(miri)))]
 mod tests {

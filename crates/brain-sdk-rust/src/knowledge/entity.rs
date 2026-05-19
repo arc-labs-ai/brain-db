@@ -110,8 +110,9 @@ impl BrainEntityType for Person {
         }
         let wire = PersonAttributesWire::from(attrs);
         // rkyv's archive infallibly produces a Vec<u8>.
-        let bytes = rkyv::to_bytes::<_, 256>(&wire)
-            .expect("invariant: PersonAttributesWire serialization cannot fail for in-memory bounded data");
+        let bytes = rkyv::to_bytes::<_, 256>(&wire).expect(
+            "invariant: PersonAttributesWire serialization cannot fail for in-memory bounded data",
+        );
         bytes.into_vec()
     }
 

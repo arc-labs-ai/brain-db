@@ -121,15 +121,12 @@ fn build_fixture(
     let metadata = Arc::new(Mutex::new(metadata));
 
     let ctx = HybridExecutorContext {
-        semantic: semantic.map(|items| {
-            Arc::new(CannedSemanticRetriever { items }) as Arc<dyn SemanticRetriever>
-        }),
-        lexical: lexical.map(|items| {
-            Arc::new(CannedLexicalRetriever { items }) as Arc<dyn LexicalRetriever>
-        }),
-        graph: graph.map(|items| {
-            Arc::new(CannedGraphRetriever { items }) as Arc<dyn GraphRetriever>
-        }),
+        semantic: semantic
+            .map(|items| Arc::new(CannedSemanticRetriever { items }) as Arc<dyn SemanticRetriever>),
+        lexical: lexical
+            .map(|items| Arc::new(CannedLexicalRetriever { items }) as Arc<dyn LexicalRetriever>),
+        graph: graph
+            .map(|items| Arc::new(CannedGraphRetriever { items }) as Arc<dyn GraphRetriever>),
         metadata,
     };
 
@@ -181,24 +178,22 @@ fn build_plan(req: &PlannerQueryRequest) -> QueryPlan {
 /// p99 50 ms (production wall-time gate is phase 14; this bench
 /// measures plan/fuse/filter/project glue with mocked retrievers).
 fn bench_hybrid_three_retriever(c: &mut Criterion) {
-    let semantic_items = make_items(TOP_N, |i| RankedItemId::Memory(MemoryId::from_raw(i as u128)));
+    let semantic_items = make_items(TOP_N, |i| {
+        RankedItemId::Memory(MemoryId::from_raw(i as u128))
+    });
     let lexical_items = make_items(TOP_N, |i| {
         RankedItemId::Memory(MemoryId::from_raw((TOP_N + i) as u128))
     });
     let graph_items = make_items(TOP_N / 2, |_| RankedItemId::Entity(EntityId::new()));
 
-    let fx = build_fixture(
-        Some(semantic_items),
-        Some(lexical_items),
-        Some(graph_items),
-    );
+    let fx = build_fixture(Some(semantic_items), Some(lexical_items), Some(graph_items));
     let req = text_anchor_request();
     let plan = build_plan(&req);
 
     c.bench_function("hybrid_three_retriever", |b| {
         b.iter(|| {
-            let result = execute(black_box(&plan), black_box(&req), black_box(&fx.ctx))
-                .expect("execute");
+            let result =
+                execute(black_box(&plan), black_box(&req), black_box(&fx.ctx)).expect("execute");
             black_box(result.items.len());
         });
     });
@@ -207,7 +202,9 @@ fn bench_hybrid_three_retriever(c: &mut Criterion) {
 /// Router-degraded path: text-only query → router picks Semantic +
 /// Lexical (no Graph). §16/02 §2.10 target p50 7 ms / p99 30 ms.
 fn bench_hybrid_router_degraded(c: &mut Criterion) {
-    let semantic_items = make_items(TOP_N, |i| RankedItemId::Memory(MemoryId::from_raw(i as u128)));
+    let semantic_items = make_items(TOP_N, |i| {
+        RankedItemId::Memory(MemoryId::from_raw(i as u128))
+    });
     let lexical_items = make_items(TOP_N, |i| {
         RankedItemId::Memory(MemoryId::from_raw((TOP_N + i) as u128))
     });
@@ -217,8 +214,8 @@ fn bench_hybrid_router_degraded(c: &mut Criterion) {
 
     c.bench_function("hybrid_router_degraded", |b| {
         b.iter(|| {
-            let result = execute(black_box(&plan), black_box(&req), black_box(&fx.ctx))
-                .expect("execute");
+            let result =
+                execute(black_box(&plan), black_box(&req), black_box(&fx.ctx)).expect("execute");
             black_box(result.items.len());
         });
     });

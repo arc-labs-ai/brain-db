@@ -1,5 +1,5 @@
 //! `brain-cli snapshot delete <id> [--shard N]` — DELETE
-//! /v1/snapshots/<id>.
+//! `/v1/snapshots/<id>`.
 
 use serde::Serialize;
 

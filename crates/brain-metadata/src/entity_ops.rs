@@ -96,10 +96,7 @@ pub fn normalize_name(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Fetch an entity by id. Returns `None` if the row doesn't exist.
-pub fn entity_get(
-    rtxn: &ReadTransaction,
-    id: EntityId,
-) -> Result<Option<Entity>, EntityOpError> {
+pub fn entity_get(rtxn: &ReadTransaction, id: EntityId) -> Result<Option<Entity>, EntityOpError> {
     let t = rtxn.open_table(ENTITIES_TABLE)?;
     let row: Option<EntityMetadata> = t.get(&id.to_bytes())?.map(|g| g.value());
     Ok(row.as_ref().map(Entity::from))
@@ -182,10 +179,7 @@ pub fn entity_list_by_type(
 ///   EntityId.
 ///
 /// Does NOT write trigrams (16.4) or HNSW embedding (16.3).
-pub fn entity_put(
-    wtxn: &WriteTransaction,
-    entity: &Entity,
-) -> Result<(), EntityOpError> {
+pub fn entity_put(wtxn: &WriteTransaction, entity: &Entity) -> Result<(), EntityOpError> {
     require_entity_type_exists(wtxn, entity.entity_type)?;
 
     let normalized = normalize_name(&entity.canonical_name);
@@ -242,12 +236,7 @@ pub fn entity_put(
     // alias contributes to the entity's trigram set.
     let trigrams =
         crate::trigram_ops::trigrams_of_components(&entity.canonical_name, &entity.aliases);
-    crate::trigram_ops::index_entity_trigrams(
-        wtxn,
-        entity.entity_type,
-        entity.id,
-        &trigrams,
-    )?;
+    crate::trigram_ops::index_entity_trigrams(wtxn, entity.entity_type, entity.id, &trigrams)?;
 
     Ok(())
 }
@@ -374,8 +363,7 @@ pub fn entity_rename(
     new_canonical_name: String,
     now_unix_nanos: u64,
 ) -> Result<(), EntityOpError> {
-    let current = read_entity_inside_wtxn(wtxn, id)?
-        .ok_or(EntityOpError::NotFound(id))?;
+    let current = read_entity_inside_wtxn(wtxn, id)?.ok_or(EntityOpError::NotFound(id))?;
     let mut next: Entity = (&current).into();
     next.canonical_name = new_canonical_name;
     entity_update(wtxn, &next, now_unix_nanos)
@@ -389,8 +377,7 @@ pub fn entity_add_alias(
     alias: String,
     now_unix_nanos: u64,
 ) -> Result<(), EntityOpError> {
-    let current = read_entity_inside_wtxn(wtxn, id)?
-        .ok_or(EntityOpError::NotFound(id))?;
+    let current = read_entity_inside_wtxn(wtxn, id)?.ok_or(EntityOpError::NotFound(id))?;
     let na_new = normalize_name(&alias);
     if current.aliases.iter().any(|a| normalize_name(a) == na_new) {
         return Ok(());
@@ -408,8 +395,7 @@ pub fn entity_remove_alias(
     alias: &str,
     now_unix_nanos: u64,
 ) -> Result<(), EntityOpError> {
-    let current = read_entity_inside_wtxn(wtxn, id)?
-        .ok_or(EntityOpError::NotFound(id))?;
+    let current = read_entity_inside_wtxn(wtxn, id)?.ok_or(EntityOpError::NotFound(id))?;
     let na_target = normalize_name(alias);
     let mut next: Entity = (&current).into();
     let before = next.aliases.len();
@@ -428,8 +414,7 @@ pub fn entity_tombstone(
     id: EntityId,
     now_unix_nanos: u64,
 ) -> Result<(), EntityOpError> {
-    let current = read_entity_inside_wtxn(wtxn, id)?
-        .ok_or(EntityOpError::NotFound(id))?;
+    let current = read_entity_inside_wtxn(wtxn, id)?.ok_or(EntityOpError::NotFound(id))?;
 
     // Tear down exact-name index.
     let normalized = normalize_name(&current.canonical_name);
@@ -659,8 +644,7 @@ mod tests {
         }
         let rtxn = db.read_txn().unwrap();
         assert_eq!(
-            entity_lookup_by_canonical_name(&rtxn, EntityType::PERSON_ID, "PRIYA  PATEL")
-                .unwrap(),
+            entity_lookup_by_canonical_name(&rtxn, EntityType::PERSON_ID, "PRIYA  PATEL").unwrap(),
             Some(id),
             "lookup must normalize the candidate"
         );
@@ -687,8 +671,7 @@ mod tests {
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
-        let mut ids =
-            entity_lookup_by_alias(&rtxn, EntityType::PERSON_ID, "priya").unwrap();
+        let mut ids = entity_lookup_by_alias(&rtxn, EntityType::PERSON_ID, "priya").unwrap();
         ids.sort();
         let mut expected = vec![a_id, b_id];
         expected.sort();
@@ -729,13 +712,11 @@ mod tests {
 
         // Old name no longer in canonical-name index; new name is.
         assert_eq!(
-            entity_lookup_by_canonical_name(&rtxn, EntityType::PERSON_ID, "Priya Patel")
-                .unwrap(),
+            entity_lookup_by_canonical_name(&rtxn, EntityType::PERSON_ID, "Priya Patel").unwrap(),
             None
         );
         assert_eq!(
-            entity_lookup_by_canonical_name(&rtxn, EntityType::PERSON_ID, "Priya Singh")
-                .unwrap(),
+            entity_lookup_by_canonical_name(&rtxn, EntityType::PERSON_ID, "Priya Singh").unwrap(),
             Some(id)
         );
     }
@@ -847,13 +828,14 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         // Indexes empty.
         assert_eq!(
-            entity_lookup_by_canonical_name(&rtxn, EntityType::PERSON_ID, "Priya Patel")
-                .unwrap(),
+            entity_lookup_by_canonical_name(&rtxn, EntityType::PERSON_ID, "Priya Patel").unwrap(),
             None
         );
-        assert!(entity_lookup_by_alias(&rtxn, EntityType::PERSON_ID, "priya")
-            .unwrap()
-            .is_empty());
+        assert!(
+            entity_lookup_by_alias(&rtxn, EntityType::PERSON_ID, "priya")
+                .unwrap()
+                .is_empty()
+        );
         // Primary row preserved with flag set.
         let got = entity_get(&rtxn, id).unwrap().expect("primary preserved");
         assert!(got.flags & flags::TOMBSTONED != 0);
@@ -888,8 +870,7 @@ mod tests {
         assert_ne!(id1, id2);
         let rtxn = db.read_txn().unwrap();
         assert_eq!(
-            entity_lookup_by_canonical_name(&rtxn, EntityType::PERSON_ID, "Priya Patel")
-                .unwrap(),
+            entity_lookup_by_canonical_name(&rtxn, EntityType::PERSON_ID, "Priya Patel").unwrap(),
             Some(id2)
         );
     }
@@ -903,18 +884,12 @@ mod tests {
 
         // Seed a second type so the filter is meaningful.
         {
-            use crate::tables::knowledge::entity_type::{
-                EntityTypeDefinition, ENTITY_TYPES_TABLE,
-            };
+            use crate::tables::knowledge::entity_type::{EntityTypeDefinition, ENTITY_TYPES_TABLE};
             let wtxn = db.write_txn().unwrap();
             {
                 let mut t = wtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
-                let row = EntityTypeDefinition::new(
-                    EntityTypeId(7),
-                    "Project".into(),
-                    Vec::new(),
-                    NOW,
-                );
+                let row =
+                    EntityTypeDefinition::new(EntityTypeId(7), "Project".into(), Vec::new(), NOW);
                 t.insert(&7u32, &row).unwrap();
             }
             wtxn.commit().unwrap();
@@ -982,8 +957,7 @@ mod tests {
 
         let rtxn = db.read_txn().unwrap();
         // "pri" comes only from the alias.
-        let cands =
-            lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, *b"pri").unwrap();
+        let cands = lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, *b"pri").unwrap();
         assert!(cands.contains(&id));
     }
 

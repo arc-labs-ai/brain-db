@@ -22,8 +22,9 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::access_buffer::AccessBuffer;
 use crate::ops::text_indexer::{MemoryTextDispatcher, StatementTextDispatcher};
+use crate::ops::writer::WalSink;
 use crate::schema_gate::SchemaGate;
-use crate::subscribe::{EventBus, SubscriptionRegistry};
+use crate::subscribe::{EventBus, EventEnvelope, SubscriptionRegistry};
 use crate::txn::TxnStore;
 
 /// Default bounded poll window for the one-shot SUBSCRIBE dispatcher
@@ -90,7 +91,7 @@ pub struct OpsContext {
     /// Per-shard semantic retriever (phase 23.1). Reads the
     /// substrate memory HNSW + (when wired) the statement
     /// HNSW. Phase 23's hybrid query consumes this slot
-    /// alongside [`lexical_retriever`].
+    /// alongside [`Self::lexical_retriever`].
     pub semantic_retriever: Option<Arc<dyn SemanticRetriever>>,
     /// Per-shard graph retriever (phase 23.2). Reads the
     /// entity / relation / statement redb tables. Phase 23's
@@ -102,6 +103,23 @@ pub struct OpsContext {
     /// `handle_schema_upload` after a successful commit. Spec
     /// §28/08 §1.
     pub schema_gate: SchemaGate,
+    /// WAL append sink for the knowledge-layer subscribe-replay
+    /// pipeline. Knowledge handlers (the `crate::ops::knowledge_*`
+    /// modules) call [`OpsContext::publish_knowledge`] after their successful
+    /// redb commit; that helper appends a `WalPayload::Knowledge`
+    /// record carrying the rkyv-encoded
+    /// [`brain_protocol::knowledge::KnowledgeEventPayload`] body, then
+    /// publishes the matching [`EventEnvelope`] on the bus with the
+    /// WAL-assigned LSN. When `None`, the helper falls back to a
+    /// pure bus publish (test wiring / substrate-only deployments).
+    ///
+    /// Knowledge ops are post-commit WAL'd (not pre-commit like
+    /// substrate ENCODE/FORGET): redb is the source of truth for
+    /// knowledge state; the WAL record exists purely so subscribe-
+    /// replay can reconstruct the event stream. A crash between
+    /// commit and WAL append loses the matching subscribe event for
+    /// that op, not the underlying knowledge data.
+    pub wal_sink: Option<Arc<dyn WalSink>>,
 }
 
 impl OpsContext {
@@ -127,6 +145,7 @@ impl OpsContext {
             semantic_retriever: None,
             graph_retriever: None,
             schema_gate: SchemaGate::default(),
+            wal_sink: None,
         }
     }
 
@@ -268,4 +287,160 @@ impl OpsContext {
         self.schema_gate = gate;
         self
     }
+
+    /// Install (or clear) the WAL sink for knowledge-layer event
+    /// publishing. The shard's spawn path wires the same sink that
+    /// the writer uses, so substrate and knowledge events share one
+    /// LSN domain.
+    #[must_use]
+    pub fn with_wal_sink(mut self, sink: Option<Arc<dyn WalSink>>) -> Self {
+        self.wal_sink = sink;
+        self
+    }
+
+    /// Publish a knowledge-layer event: WAL-append the rkyv-encoded
+    /// payload (if a sink is wired), then publish to the bus with
+    /// the assigned LSN. The `kind` discriminates the WAL record
+    /// type so subscribe-replay can decode it back into the matching
+    /// `KnowledgeEventPayload` variant.
+    ///
+    /// `make_envelope` builds the bus envelope from the assigned LSN.
+    /// Most callers will just stamp `lsn` and clone their payload in.
+    pub async fn publish_knowledge<F>(
+        &self,
+        kind: brain_storage::wal::kinds::WalRecordKind,
+        payload: brain_protocol::knowledge::KnowledgeEventPayload,
+        make_envelope: F,
+    ) where
+        F: FnOnce(u64, brain_protocol::knowledge::KnowledgeEventPayload) -> EventEnvelope,
+    {
+        debug_assert!(
+            kind.is_knowledge(),
+            "publish_knowledge expects a knowledge-layer WalRecordKind, got {kind:?}"
+        );
+        let lsn = if let Some(sink) = &self.wal_sink {
+            // rkyv-encode the typed payload as the WAL record body.
+            // Subscribe-replay's `from_wal_record` decodes it back.
+            let body = match rkyv::to_bytes::<_, 1024>(&payload) {
+                Ok(b) => b.into_vec(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "rkyv encode of knowledge event failed; publishing bus-only");
+                    let _ = self.events.publish(make_envelope(0, payload));
+                    return;
+                }
+            };
+            let body_len = body.len();
+            let record = brain_storage::wal::record::WalRecord {
+                lsn: brain_storage::wal::record::Lsn(0),
+                kind,
+                flags: 0,
+                timestamp_ns: now_unix_nanos_ctx(),
+                agent_id_lo64: 0,
+                payload: body,
+            };
+            match sink.append(record).await {
+                Ok(lsn) => {
+                    tracing::trace!(
+                        ?kind,
+                        body_len,
+                        lsn = lsn.raw(),
+                        "knowledge event WAL-recorded"
+                    );
+                    lsn.raw()
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "knowledge event WAL append failed; bus-only publish");
+                    self.events.current_lsn().saturating_add(1)
+                }
+            }
+        } else {
+            // No sink wired — fall through to bus's allocator.
+            0
+        };
+        let env = make_envelope(lsn, payload);
+        if lsn == 0 {
+            self.events.publish(env);
+        } else {
+            self.events.publish_prestamped(env);
+        }
+    }
+}
+
+impl OpsContext {
+    /// Persist a batch of auto-derived `SimilarTo` edges in a single
+    /// redb write txn. Used by the AutoEdgeWorker (one wtxn per cycle
+    /// keeps the writer's lock window short even when the worker
+    /// drains hundreds of memories).
+    ///
+    /// Each pair becomes `(from, SimilarTo, to)` plus the auto-mirror
+    /// row that `brain_metadata::tables::edge::link` writes for
+    /// symmetric builtin kinds. Existing rows are overwritten with the
+    /// fresh `EdgeData` — this is what makes idempotent re-drive safe.
+    /// Self-edges (`from == to`) and duplicate pairs within `pairs` are
+    /// the caller's responsibility to filter; the helper writes
+    /// whatever it's handed.
+    ///
+    /// Returns the number of (logical) edges written. With the auto-
+    /// mirror, the physical row count in `EDGES_TABLE` is `2 *
+    /// returned` (each pair lands once forward and once mirrored).
+    pub fn write_auto_edges(
+        &self,
+        pairs: &[(brain_core::MemoryId, brain_core::MemoryId, f32)],
+    ) -> Result<usize, String> {
+        use brain_core::{EdgeKind, EdgeKindRef, NodeRef};
+        use brain_metadata::tables::edge::{
+            self, derived_by, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE,
+            EDGES_TABLE,
+        };
+
+        if pairs.is_empty() {
+            return Ok(0);
+        }
+
+        let now = now_unix_nanos_ctx();
+        let mut written = 0usize;
+        let metadata = self.executor.metadata.clone();
+        let mut db = metadata.lock();
+        let wtxn = db
+            .write_txn()
+            .map_err(|e| format!("auto_edges write_txn: {e:?}"))?;
+        {
+            let mut edges_t = wtxn
+                .open_table(EDGES_TABLE)
+                .map_err(|e| format!("auto_edges open EDGES: {e:?}"))?;
+            let mut edges_rev_t = wtxn
+                .open_table(EDGES_REVERSE_TABLE)
+                .map_err(|e| format!("auto_edges open EDGES_REVERSE: {e:?}"))?;
+            for (from, to, sim) in pairs {
+                let data = EdgeData::new(
+                    *sim,
+                    origin::AUTO_DERIVED,
+                    derived_by::SIMILARITY_WORKER,
+                    now,
+                );
+                edge::link(
+                    &mut edges_t,
+                    &mut edges_rev_t,
+                    NodeRef::Memory(*from),
+                    EdgeKindRef::Builtin(EdgeKind::SimilarTo),
+                    NodeRef::Memory(*to),
+                    zero_disambiguator(),
+                    &data,
+                )
+                .map_err(|e| format!("auto_edges link: {e:?}"))?;
+                written += 1;
+            }
+        }
+        wtxn.commit()
+            .map_err(|e| format!("auto_edges commit: {e:?}"))?;
+        Ok(written)
+    }
+}
+
+fn now_unix_nanos_ctx() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }

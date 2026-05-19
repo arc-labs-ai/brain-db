@@ -17,7 +17,10 @@
 use brain_protocol::schema::ValidatedSchema;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
-use crate::schema_apply::{apply_schema_definitions, SchemaApplyError};
+use crate::predicate_ops::PredicateOpError;
+use crate::schema_apply::{
+    apply_schema_definitions, flag_statements_outside_schema, SchemaApplyError,
+};
 use crate::tables::knowledge::schema_version::{
     SchemaVersionRow, SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE, VALIDATOR_VERSION,
 };
@@ -45,6 +48,9 @@ pub enum SchemaStoreError {
 
     #[error("schema apply: {0}")]
     Apply(#[from] SchemaApplyError),
+
+    #[error("predicate op while flagging pre-existing rows: {0}")]
+    Predicate(#[from] PredicateOpError),
 }
 
 // ---------------------------------------------------------------------------
@@ -95,7 +101,47 @@ pub fn schema_upload(
     // existing entity_type / predicate / relation_type intern paths.
     apply_schema_definitions(wtxn, validated, new_version, now_unix_nanos)?;
 
+    // Pre-existing statements authored under the previous schema
+    // version (or against open-vocabulary predicates) must remain
+    // readable, but a schema-strict reader needs to know which rows
+    // are now outside the active vocabulary. Re-flag the
+    // OUTSIDE_ACTIVE_SCHEMA bit across the namespace in one shot.
+    // Schema upload is rare; full-table cost is fine.
+    let active = predicates_active_for_schema_wtxn(wtxn, &namespace, new_version)?;
+    let _changed = flag_statements_outside_schema(wtxn, &namespace, &active)?;
+
     Ok(new_version)
+}
+
+/// `predicates_active_for_schema` takes a `&ReadTransaction`, but
+/// inside `schema_upload` we've already opened a `WriteTransaction`.
+/// redb doesn't let a `WriteTransaction` masquerade as a
+/// `ReadTransaction`, so we inline the equivalent scan over the
+/// write txn.
+fn predicates_active_for_schema_wtxn(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    version: u32,
+) -> Result<std::collections::HashSet<brain_core::PredicateId>, SchemaStoreError> {
+    use crate::tables::knowledge::predicate::{
+        PredicateDefinition, SchemaOrigin, PREDICATES_TABLE,
+    };
+    use brain_core::PredicateId;
+    let t = wtxn.open_table(PREDICATES_TABLE)?;
+    let mut out = std::collections::HashSet::new();
+    for entry in t.iter()? {
+        let (_, v) = entry?;
+        let row: PredicateDefinition = v.value();
+        if row.namespace != namespace {
+            continue;
+        }
+        if let SchemaOrigin::SchemaDeclared { version: v_decl } = row.origin() {
+            if v_decl == version {
+                out.insert(PredicateId::from(row.predicate_id));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn next_version_in(wtxn: &WriteTransaction, namespace: &str) -> Result<u32, SchemaStoreError> {
@@ -337,6 +383,100 @@ mod tests {
     }
 
     #[test]
+    fn schema_upload_flags_pre_existing_outside_predicates() {
+        use crate::predicate_ops::predicate_intern_or_get;
+        use crate::statement_ops::statement_create;
+        use crate::tables::knowledge::statement::{statement_flags, STATEMENTS_TABLE};
+        use brain_core::knowledge::{
+            EvidenceEntry, EvidenceRef, Statement, StatementObject, StatementValue, SubjectRef,
+        };
+        use brain_core::{ContextId, EntityId, ExtractorId, MemoryId, StatementId, StatementKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        // Use the seeded wrapper so EntityTypeId(1) (Person) exists.
+        let md = crate::MetadataDb::open(dir.path().join("test.redb")).unwrap();
+        let db = md.db();
+
+        // Pre-existing schemaless world: intern two predicates and
+        // write a statement for each.
+        let subject = EntityId::new();
+        let (sid_inside, sid_outside) = {
+            let wtxn = db.begin_write().unwrap();
+            // Ensure the subject exists.
+            use crate::entity_ops::entity_put;
+            use brain_core::knowledge::Entity;
+            let now = 0u64;
+            entity_put(
+                &wtxn,
+                &Entity::new_active(
+                    subject,
+                    brain_core::EntityTypeId(1),
+                    "anchor".into(),
+                    "anchor".into(),
+                    now,
+                ),
+            )
+            .unwrap();
+
+            let p_in = predicate_intern_or_get(&wtxn, "acme", "prefers", 0, 0).unwrap();
+            let p_out = predicate_intern_or_get(&wtxn, "acme", "ghost", 0, 0).unwrap();
+            let mk_stmt = |pid| {
+                let id = StatementId::new();
+                let evidence_entry = EvidenceEntry::from_parts(
+                    MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+                    1.0,
+                    0,
+                    ExtractorId::default(),
+                );
+                Statement::new_root(
+                    id,
+                    StatementKind::Fact,
+                    SubjectRef::Entity(subject),
+                    pid,
+                    StatementObject::Value(StatementValue::Text("x".into())),
+                    0.9,
+                    EvidenceRef::inline_from_slice(&[evidence_entry]),
+                    ExtractorId::default(),
+                    0,
+                    1,
+                )
+            };
+            let s_in = mk_stmt(p_in);
+            let s_out = mk_stmt(p_out);
+            let sid_in = statement_create(&wtxn, &s_in, 0).unwrap();
+            let sid_out = statement_create(&wtxn, &s_out, 0).unwrap();
+            wtxn.commit().unwrap();
+            (sid_in, sid_out)
+        };
+
+        // Now upload a schema that declares only `prefers`. The other
+        // pre-existing predicate (`ghost`) must remain readable but
+        // be flagged OUTSIDE_ACTIVE_SCHEMA.
+        {
+            let wtxn = db.begin_write().unwrap();
+            schema_upload(&wtxn, &acme_schema_v2(), 0).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        // Inspect the statement rows: ghost-predicate row gets the
+        // flag, prefers-predicate row stays clean.
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(STATEMENTS_TABLE).unwrap();
+        let inside = t.get(&sid_inside.to_bytes()).unwrap().unwrap().value();
+        let outside = t.get(&sid_outside.to_bytes()).unwrap().unwrap().value();
+        assert!(
+            !inside.has_flag(statement_flags::OUTSIDE_ACTIVE_SCHEMA),
+            "in-vocabulary statement must not be flagged: flags={:#b}",
+            inside.flags,
+        );
+        assert!(
+            outside.has_flag(statement_flags::OUTSIDE_ACTIVE_SCHEMA),
+            "out-of-vocabulary statement must be flagged: flags={:#b}",
+            outside.flags,
+        );
+    }
+
+    #[test]
     fn schema_active_row_returns_full_row() {
         let dir = tempfile::tempdir().unwrap();
         let db = open_db(&dir);
@@ -352,8 +492,7 @@ mod tests {
         assert_eq!(row.validator_version, VALIDATOR_VERSION);
         assert!(row.source_text.is_some());
         // Source is JSON; decode round-trips.
-        let decoded: brain_protocol::schema::Schema =
-            serde_json::from_slice(&row.source).unwrap();
+        let decoded: brain_protocol::schema::Schema = serde_json::from_slice(&row.source).unwrap();
         assert_eq!(decoded.namespace, "acme");
     }
 }

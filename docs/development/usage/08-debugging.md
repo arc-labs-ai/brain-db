@@ -62,7 +62,7 @@ cargo run ... 2>&1 \
 state without stopping the server:
 
 ```bash
-just cli --output json debug-snapshot --shard 0 \
+cargo run --bin brain-cli -- --output json debug-snapshot --shard 0 \
   | jq '.workers[] | select(.errors > 0)'
 ```
 
@@ -154,7 +154,7 @@ unsafe blocks under Miri to check for UB. Syscall-bound paths
 ~47 pure-data tests run:
 
 ```bash
-just miri
+cargo +nightly miri test -p brain-storage --lib
 ```
 
 Failures here are real soundness bugs — surface immediately.

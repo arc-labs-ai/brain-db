@@ -17,7 +17,6 @@
 pub mod audit_ops;
 pub mod cascade_ops;
 pub mod db;
-pub mod sweeper_ops;
 pub mod entity_merge_ops;
 pub mod entity_ops;
 pub mod entity_type_ops;
@@ -32,6 +31,7 @@ pub mod schema_apply;
 pub mod schema_store;
 pub mod sink;
 pub mod statement_ops;
+pub mod sweeper_ops;
 pub mod system_schema;
 pub mod tables;
 pub mod trigram_ops;
@@ -45,6 +45,11 @@ pub use entity_ops::{
     entity_add_alias, entity_get, entity_list_by_type, entity_lookup_by_alias,
     entity_lookup_by_canonical_name, entity_put, entity_remove_alias, entity_rename,
     entity_tombstone, entity_update, normalize_name, EntityOpError,
+};
+pub use entity_type_ops::{entity_type_intern, entity_type_lookup_by_name, EntityTypeOpError};
+pub use extractor_ops::{
+    extractor_get, extractor_intern, extractor_list, extractor_lookup_by_qname,
+    extractor_set_enabled, ExtractorOpError,
 };
 pub use llm_cache::{LlmCacheDb, LlmCacheError, LlmResponse};
 pub use predicate_ops::{
@@ -63,25 +68,24 @@ pub use relation_type_ops::{
     relation_type_get, relation_type_intern, relation_type_list, relation_type_lookup_by_qname,
     RelationTypeOpError,
 };
-pub use entity_type_ops::{entity_type_intern, entity_type_lookup_by_name, EntityTypeOpError};
-pub use extractor_ops::{
-    extractor_get, extractor_intern, extractor_list, extractor_lookup_by_qname,
-    extractor_set_enabled, ExtractorOpError,
-};
 pub use schema_apply::{apply_schema_definitions, SchemaApplyError};
 pub use schema_store::{
     schema_active, schema_active_row, schema_get, schema_list, schema_namespaces, schema_upload,
     SchemaStoreError,
 };
-pub use system_schema::{seed_system_schema, SystemSchemaError, SYSTEM_SCHEMA_SOURCE};
-pub use tables::knowledge::schema_version::{
-    SchemaVersionRow, SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE, VALIDATOR_VERSION,
-};
 pub use statement_ops::{
     allocate_evidence_overflow, evidence_overflow_load, statement_create, statement_get,
-    statement_history, statement_list, statement_retract, statement_supersede,
-    statement_tombstone, statements_contradicting, StatementListFilter, StatementOpError,
-    DEFAULT_LIST_LIMIT,
+    statement_history, statement_list, statement_retract, statement_supersede, statement_tombstone,
+    statements_contradicting, StatementListFilter, StatementOpError, DEFAULT_LIST_LIMIT,
+};
+pub use system_schema::{seed_system_schema, SystemSchemaError, SYSTEM_SCHEMA_SOURCE};
+pub use tables::extractor_audit::{
+    audit_count as pipeline_audit_count, has_extracted as pipeline_has_extracted, pipeline_status,
+    record_extracted as pipeline_record_extracted, tier_status, ExtractorItemCounts,
+    ExtractorPipelineAuditEntry, ExtractorPipelineAuditError, EXTRACTOR_PIPELINE_AUDIT_TABLE,
+};
+pub use tables::knowledge::schema_version::{
+    SchemaVersionRow, SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE, VALIDATOR_VERSION,
 };
 pub use trigram_ops::{
     candidates_for_query, extract_trigrams, index_entity_trigrams, jaccard,

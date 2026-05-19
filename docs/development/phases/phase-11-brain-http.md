@@ -314,7 +314,7 @@ Realistic timeline: 2-3 weeks of focused work.
 ## Phase exit checklist
 
 - [x] All 8 milestones complete.
-- [x] `just docker-verify` green.
+- [x] Verify suite (fmt-check + build + clippy + test + check-skills) green.
 - [x] `brain-server::admin` hand-roll deleted (M3).
 - [x] Admin endpoints unchanged externally (all 47 existing tests pass).
 - [x] WebSocket server (M6) + client (M7) smoke-tested round-trip.

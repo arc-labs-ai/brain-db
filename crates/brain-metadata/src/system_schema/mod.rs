@@ -77,10 +77,8 @@ mod tests {
 
     #[test]
     fn system_schema_parses_and_validates() {
-        let schema = parse_schema(SYSTEM_SCHEMA_SOURCE)
-            .expect("system schema parses");
-        let _ = validate_system_schema(&schema)
-            .expect("system schema validates under system mode");
+        let schema = parse_schema(SYSTEM_SCHEMA_SOURCE).expect("system schema parses");
+        let _ = validate_system_schema(&schema).expect("system schema validates under system mode");
     }
 
     #[test]
@@ -88,9 +86,10 @@ mod tests {
         let schema = parse_schema(SYSTEM_SCHEMA_SOURCE).unwrap();
         let errs = brain_protocol::schema::validate(&schema)
             .expect_err("user validate must reject `namespace brain`");
-        assert!(errs.iter().any(
-            |e| e.code == brain_protocol::schema::ValidationErrorCode::NamespaceInvalidIdentifier
-        ));
+        assert!(errs
+            .iter()
+            .any(|e| e.code
+                == brain_protocol::schema::ValidationErrorCode::NamespaceInvalidIdentifier));
     }
 
     #[test]
@@ -173,13 +172,10 @@ mod tests {
         seed_system_schema(&db).unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let entity_mentions = crate::extractor_ops::extractor_lookup_by_qname(
-            &rtxn,
-            "brain",
-            "entity_mentions",
-        )
-        .unwrap()
-        .expect("entity_mentions registered");
+        let entity_mentions =
+            crate::extractor_ops::extractor_lookup_by_qname(&rtxn, "brain", "entity_mentions")
+                .unwrap()
+                .expect("entity_mentions registered");
         let basic_ner =
             crate::extractor_ops::extractor_lookup_by_qname(&rtxn, "brain", "basic_ner")
                 .unwrap()
@@ -209,9 +205,9 @@ mod tests {
             }
             other => panic!("expected Entity target, got {other:?}"),
         }
-        let has_patterns = ast.fields.iter().any(|f| {
-            matches!(f, brain_protocol::schema::ExtractorField::Patterns(p) if p.len() == 2)
-        });
+        let has_patterns = ast.fields.iter().any(
+            |f| matches!(f, brain_protocol::schema::ExtractorField::Patterns(p) if p.len() == 2),
+        );
         assert!(has_patterns);
     }
 

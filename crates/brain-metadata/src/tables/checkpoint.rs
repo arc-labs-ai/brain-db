@@ -26,7 +26,7 @@
 //! ## What does NOT live here
 //!
 //! - **Composition with `brain_storage::wal::checkpoint::write_checkpoint`**
-//!   — [`MetadataSink`] in sub-task 3.11 owns the conversion from
+//!   — `MetadataSink` in sub-task 3.11 owns the conversion from
 //!   `CheckpointReport` to [`CheckpointMeta`], filling
 //!   `metadata_version_at_checkpoint` from
 //!   [`crate::schema::CURRENT_SCHEMA_VERSION`].

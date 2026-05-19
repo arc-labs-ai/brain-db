@@ -152,6 +152,30 @@ impl Wal {
         self.inner.borrow().next_lsn
     }
 
+    /// The LSN the next `append` will assign. Subscribe uses this as the
+    /// cutover point `T`: records `[from_lsn, T-1]` are replayed from the
+    /// WAL, records `[T, ∞)` arrive via the live event bus.
+    #[must_use]
+    pub fn current_tail_lsn(&self) -> u64 {
+        self.inner.borrow().next_lsn
+    }
+
+    /// The lowest LSN still readable from disk — `starting_lsn` of the
+    /// oldest segment under retention. If the WAL is empty (no segments
+    /// at all), returns `next_lsn` so callers see a coherent "nothing
+    /// before this point" answer.
+    ///
+    /// Subscribe rejects `from_lsn < oldest_available_lsn()` with
+    /// `SubscriptionLsnTooOld`.
+    pub fn oldest_available_lsn(&self) -> Result<u64, WalError> {
+        let inner = self.inner.borrow();
+        let reader = WalReader::open(&inner.dir, inner.shard_uuid)?;
+        Ok(reader
+            .segments()
+            .first()
+            .map_or(inner.next_lsn, |s| s.starting_lsn))
+    }
+
     #[must_use]
     pub fn active_segment_seq(&self) -> u64 {
         self.inner.borrow().active_segment_seq
@@ -766,6 +790,61 @@ mod tests {
             // WalReader catches the uuid mismatch before we get to
             // open_for_append, so the error surfaces as Read(_).
             assert!(matches!(err, WalError::Read(_)), "got {err:?}");
+        });
+    }
+
+    // ----- Subscribe-replay accessors ----------------------------------
+
+    #[test]
+    fn oldest_available_lsn_empty_wal_returns_next_lsn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_owned();
+        glommio_run(move || async move {
+            let wal = Wal::create(&path, uuid(30)).await.unwrap();
+            // Empty WAL: zero records, segment 0 with starting_lsn=1.
+            // The first segment's starting_lsn IS 1, so oldest reads as 1.
+            // Subscribe treats this as "everything still in the WAL."
+            assert_eq!(wal.oldest_available_lsn().unwrap(), 1);
+            wal.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn oldest_available_lsn_after_rollover_reports_first_segment_start() {
+        // After rollover, segments 0 and 1 both exist on disk; retention
+        // hasn't GC'd yet, so the first segment's starting_lsn (1) is
+        // still the oldest available.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_owned();
+        let small_cap = WAL_SEGMENT_HEADER_LEN + 200;
+        let cfg = WalConfig {
+            group_commit: GroupCommitConfig::default(),
+            max_segment_bytes: small_cap,
+        };
+        glommio_run(move || async move {
+            let wal = Wal::create_with_config(&path, uuid(31), cfg).await.unwrap();
+            wal.append(record_with_payload_size(64)).await.unwrap();
+            wal.append(record_with_payload_size(64)).await.unwrap();
+            assert!(wal.active_segment_seq() >= 1);
+            // Both segments still on disk; first one's starting_lsn = 1.
+            assert_eq!(wal.oldest_available_lsn().unwrap(), 1);
+            wal.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn current_tail_lsn_increments_with_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_owned();
+        glommio_run(move || async move {
+            let wal = Wal::create(&path, uuid(32)).await.unwrap();
+            assert_eq!(wal.current_tail_lsn(), 1);
+            wal.append(record(0)).await.unwrap();
+            assert_eq!(wal.current_tail_lsn(), 2);
+            wal.append(record(0)).await.unwrap();
+            wal.append(record(0)).await.unwrap();
+            assert_eq!(wal.current_tail_lsn(), 4);
+            wal.shutdown().await.unwrap();
         });
     }
 

@@ -26,6 +26,13 @@ async fn encode_round_trip() {
             was_deduplicated: false,
             salience: req.salience_hint,
             auto_edges_added: 0,
+            lsn: 0,
+            agent_id: [0; 16],
+            context_id: req.context_id,
+            kind: req.kind,
+            created_at_unix_nanos: 0,
+            edges_out_count: 0,
+            embedding_model_fp: [0; 16],
         };
         common::write_frame(
             &mut socket,

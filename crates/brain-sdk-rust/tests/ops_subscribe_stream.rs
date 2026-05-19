@@ -24,6 +24,7 @@ fn event(idx: u64) -> SubscriptionEvent {
         timestamp_unix_nanos: idx * 1_000_000_000,
         text: String::new(),
         knowledge_payload: None,
+        edge_payload: None,
     }
 }
 

@@ -201,6 +201,10 @@ impl WriterHandle for FakeWriterHandle {
                 memory_id,
                 edge_results,
                 replayed: false,
+                was_deduplicated: false,
+                lsn: None,
+                edges_out_count: 0,
+                created_at_unix_nanos: 0,
             };
             state.seen.insert(op.request_id, ack.clone());
             Ok(ack)
@@ -511,9 +515,10 @@ async fn encode_then_recall_finds_it() {
         age_bound_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
-        strategy_hint: None,
+        strategy: None,
         include_vectors: false,
         include_edges: false,
+        include_text: false,
         request_id: None,
         txn_id: None,
     };

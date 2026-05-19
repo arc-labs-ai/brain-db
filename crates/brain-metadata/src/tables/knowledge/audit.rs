@@ -54,19 +54,16 @@ pub const EXTRACTOR_AUDIT_TABLE: TableDefinition<'static, [u8; 16], ExtractionAu
 /// `(memory_id_bytes, audit_id_bytes) → ()`. Iterating
 /// `(mem_id, [0;16])..=(mem_id, [0xff;16])` yields all audits for
 /// one memory in audit-id order.
-pub const EXTRACTOR_AUDIT_BY_MEMORY_TABLE:
-    TableDefinition<'static, ([u8; 16], [u8; 16]), ()> =
+pub const EXTRACTOR_AUDIT_BY_MEMORY_TABLE: TableDefinition<'static, ([u8; 16], [u8; 16]), ()> =
     TableDefinition::new("extractor_audit_by_memory");
 
 /// `(extractor_id, audit_id_bytes) → ()`. Per-extractor history.
-pub const EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE:
-    TableDefinition<'static, (u32, [u8; 16]), ()> =
+pub const EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE: TableDefinition<'static, (u32, [u8; 16]), ()> =
     TableDefinition::new("extractor_audit_by_extractor");
 
 /// `(started_at_unix_nanos, audit_id_bytes) → ()`. Global
 /// time-window scans (e.g., "recent failures").
-pub const EXTRACTOR_AUDIT_BY_TIME_TABLE:
-    TableDefinition<'static, (u64, [u8; 16]), ()> =
+pub const EXTRACTOR_AUDIT_BY_TIME_TABLE: TableDefinition<'static, (u64, [u8; 16]), ()> =
     TableDefinition::new("extractor_audit_by_time");
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
@@ -111,6 +108,9 @@ impl ExtractionAudit {
     /// Build an audit row for a `Success` extraction. `outputs`
     /// supplied by the caller; `status_reason` is empty by
     /// convention.
+    // Argument list mirrors the on-disk row's required fields — a
+    // builder struct would be the same field set with extra indirection.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn success(
         audit_id: AuditId,
@@ -142,6 +142,8 @@ impl ExtractionAudit {
 
     /// Build a non-Success audit row. `status` MUST be one of the
     /// `extraction_status::*` constants other than SUCCESS.
+    // See [`Self::success`] re: arg count.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn non_success(
         audit_id: AuditId,

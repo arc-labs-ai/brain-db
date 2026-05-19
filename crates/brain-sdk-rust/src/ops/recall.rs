@@ -24,9 +24,10 @@ pub struct RecallBuilder<'a> {
     age_bound_unix_nanos: Option<u64>,
     kind_filter: Option<Vec<MemoryKindWire>>,
     salience_floor: f32,
-    strategy_hint: Option<RecallStrategy>,
+    strategy: Option<RecallStrategy>,
     include_vectors: bool,
     include_edges: bool,
+    include_text: bool,
     request_id: Option<RequestId>,
     txn_id: Option<[u8; 16]>,
 }
@@ -42,9 +43,10 @@ impl<'a> RecallBuilder<'a> {
             age_bound_unix_nanos: None,
             kind_filter: None,
             salience_floor: 0.0,
-            strategy_hint: None,
+            strategy: None,
             include_vectors: false,
             include_edges: false,
+            include_text: false,
             request_id: None,
             txn_id: None,
         }
@@ -92,6 +94,31 @@ impl<'a> RecallBuilder<'a> {
         self
     }
 
+    /// Ask the substrate to populate `MemoryResult.text` for each hit.
+    /// Costs one extra batched read per recall; defaults to `false`,
+    /// in which case the response carries ids and scores only.
+    #[must_use]
+    pub fn include_text(mut self, on: bool) -> Self {
+        self.include_text = on;
+        self
+    }
+
+    /// Pick a recall strategy. `Auto` is the server default — the
+    /// substrate runs hybrid retrieval (semantic + lexical + graph
+    /// fused via RRF) unless inside a transaction.
+    ///
+    /// `SubstrateOnly` forces the raw HNSW vector path; useful for
+    /// benchmarks comparing hybrid against pure vector recall.
+    ///
+    /// `HybridOnly` forces hybrid; if a required retriever slot is
+    /// missing on this shard the server returns
+    /// `HybridUnavailable` rather than silently degrading.
+    #[must_use]
+    pub fn strategy(mut self, strategy: RecallStrategy) -> Self {
+        self.strategy = Some(strategy);
+        self
+    }
+
     #[must_use]
     pub fn request_id(mut self, id: RequestId) -> Self {
         self.request_id = Some(id);
@@ -120,9 +147,10 @@ impl<'a> RecallBuilder<'a> {
         let age_bound_unix_nanos = self.age_bound_unix_nanos;
         let kind_filter = self.kind_filter;
         let salience_floor = self.salience_floor;
-        let strategy_hint = self.strategy_hint;
+        let strategy = self.strategy;
         let include_vectors = self.include_vectors;
         let include_edges = self.include_edges;
+        let include_text = self.include_text;
         let txn_id = self.txn_id;
         let client = self.client.clone();
 
@@ -143,9 +171,10 @@ impl<'a> RecallBuilder<'a> {
                         age_bound_unix_nanos,
                         kind_filter,
                         salience_floor,
-                        strategy_hint,
+                        strategy,
                         include_vectors,
                         include_edges,
+                        include_text,
                         request_id: request_id_bytes,
                         txn_id,
                     });
@@ -209,9 +238,10 @@ impl<'a> RecallBuilder<'a> {
             age_bound_unix_nanos: self.age_bound_unix_nanos,
             kind_filter: self.kind_filter,
             salience_floor: self.salience_floor,
-            strategy_hint: self.strategy_hint,
+            strategy: self.strategy,
             include_vectors: self.include_vectors,
             include_edges: self.include_edges,
+            include_text: self.include_text,
             request_id: request_id_bytes,
             txn_id: self.txn_id,
         });
@@ -236,6 +266,11 @@ impl<'a> RecallBuilder<'a> {
                     )),
                 },
             );
-        Ok(FrameStream::new(guard, Opcode::RecallResp, decoder))
+        Ok(FrameStream::new(
+            guard,
+            stream_id,
+            Opcode::RecallResp,
+            decoder,
+        ))
     }
 }

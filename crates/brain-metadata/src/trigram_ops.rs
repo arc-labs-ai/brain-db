@@ -217,7 +217,10 @@ mod tests {
         let with_alias = trigrams_of_entity(&e);
         assert!(with_alias.len() > canonical_only.len());
         for tg in &canonical_only {
-            assert!(with_alias.contains(tg), "alias union must include canonical");
+            assert!(
+                with_alias.contains(tg),
+                "alias union must include canonical"
+            );
         }
         // "pat" is only in the alias.
         assert!(with_alias.contains(b"pat"));
@@ -246,8 +249,7 @@ mod tests {
 
         let rtxn = db.read_txn().unwrap();
         for tg in &trigrams {
-            let ids =
-                lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, *tg).unwrap();
+            let ids = lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, *tg).unwrap();
             assert_eq!(ids, vec![id]);
         }
     }
@@ -269,9 +271,11 @@ mod tests {
 
         let rtxn = db.read_txn().unwrap();
         for tg in &trigrams {
-            assert!(lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, *tg)
-                .unwrap()
-                .is_empty());
+            assert!(
+                lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, *tg)
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 
@@ -315,18 +319,12 @@ mod tests {
 
         // Seed a second entity type so the filter is meaningful.
         {
-            use crate::tables::knowledge::entity_type::{
-                EntityTypeDefinition, ENTITY_TYPES_TABLE,
-            };
+            use crate::tables::knowledge::entity_type::{EntityTypeDefinition, ENTITY_TYPES_TABLE};
             let wtxn = db.write_txn().unwrap();
             {
                 let mut t = wtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
-                let row = EntityTypeDefinition::new(
-                    EntityTypeId(7),
-                    "Project".into(),
-                    Vec::new(),
-                    0,
-                );
+                let row =
+                    EntityTypeDefinition::new(EntityTypeId(7), "Project".into(), Vec::new(), 0);
                 t.insert(&7u32, &row).unwrap();
             }
             wtxn.commit().unwrap();
@@ -343,8 +341,7 @@ mod tests {
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
-        let person_cands =
-            lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, tg).unwrap();
+        let person_cands = lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, tg).unwrap();
         assert_eq!(person_cands, vec![person]);
         let project_cands = lookup_candidates_by_trigram(&rtxn, EntityTypeId(7), tg).unwrap();
         assert_eq!(project_cands, vec![project]);

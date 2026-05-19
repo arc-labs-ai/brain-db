@@ -19,8 +19,7 @@ use crate::registry::ExtractorRegistry;
 /// classifier impls wrap their sync bodies via
 /// `Box::pin(async move { ... })`; LLM impls use the async path
 /// natively for HTTP calls.
-pub type ExtractionFuture<'a> =
-    Pin<Box<dyn Future<Output = ExtractionResult> + Send + 'a>>;
+pub type ExtractionFuture<'a> = Pin<Box<dyn Future<Output = ExtractionResult> + Send + 'a>>;
 
 /// Object-safe extractor interface. Pattern / classifier / LLM
 /// impls live in `pattern.rs`, `classifier.rs`, and `llm.rs`.
@@ -39,11 +38,7 @@ pub trait Extractor: Send + Sync {
     /// Run over `mem`. Returns a populated [`ExtractionResult`]
     /// including `started_at` / `completed_at` timestamps; the
     /// caller writes the audit row from these.
-    fn run<'a>(
-        &'a self,
-        ctx: &'a ExtractionContext<'a>,
-        mem: &'a Memory,
-    ) -> ExtractionFuture<'a>;
+    fn run<'a>(&'a self, ctx: &'a ExtractionContext<'a>, mem: &'a Memory) -> ExtractionFuture<'a>;
 }
 
 // ---------------------------------------------------------------------------

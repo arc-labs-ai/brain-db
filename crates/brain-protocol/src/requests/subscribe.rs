@@ -3,7 +3,7 @@
 use rkyv::{Archive, Deserialize, Serialize};
 
 use super::types::MemoryKindWire;
-use crate::request::{WireContextId, WireMemoryId};
+use crate::request::{WireContextId, WireMemoryId, WireUuid};
 
 /// Spec §07/7.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -24,6 +24,13 @@ pub struct SubscriptionFilter {
     pub contexts: Option<Vec<WireContextId>>,
     pub kinds: Option<Vec<MemoryKindWire>>,
     pub similar_to: Option<SimilarityFilter>,
+    /// Subset of agent ids whose events the subscriber wants. `None`
+    /// or empty = all agents (server-wide / shard-wide). The single
+    /// most useful filter on a multi-tenant shard — without it, a
+    /// subscriber sees every other agent's events that happen to
+    /// route to the same shard. Server-side matching is a
+    /// `HashSet::contains` per event.
+    pub agents: Option<Vec<WireUuid>>,
 }
 
 /// Spec §07/7.

@@ -196,15 +196,32 @@ fn iterate_statements(
     let rtxn = metadata
         .read_txn()
         .map_err(|e| RebuildError::Metadata(format!("read_txn: {e}")))?;
-    let stmts = rtxn
-        .open_table(STATEMENTS_TABLE)
-        .map_err(|e| RebuildError::Metadata(format!("open STATEMENTS_TABLE: {e}")))?;
-    let entities = rtxn
-        .open_table(ENTITIES_TABLE)
-        .map_err(|e| RebuildError::Metadata(format!("open ENTITIES_TABLE: {e}")))?;
-    let predicates = rtxn
-        .open_table(PREDICATES_TABLE)
-        .map_err(|e| RebuildError::Metadata(format!("open PREDICATES_TABLE: {e}")))?;
+    // Tables are created lazily on first write. If any of the three
+    // joined tables has never been opened (e.g. fresh DB with no
+    // statements yet), the rebuild trivially has nothing to do.
+    let stmts = match rtxn.open_table(STATEMENTS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+        Err(e) => {
+            return Err(RebuildError::Metadata(format!(
+                "open STATEMENTS_TABLE: {e}"
+            )))
+        }
+    };
+    let entities = match rtxn.open_table(ENTITIES_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+        Err(e) => return Err(RebuildError::Metadata(format!("open ENTITIES_TABLE: {e}"))),
+    };
+    let predicates = match rtxn.open_table(PREDICATES_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+        Err(e) => {
+            return Err(RebuildError::Metadata(format!(
+                "open PREDICATES_TABLE: {e}"
+            )))
+        }
+    };
 
     let mut count: u64 = 0;
     let mut chunk: usize = 0;

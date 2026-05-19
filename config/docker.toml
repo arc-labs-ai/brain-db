@@ -1,0 +1,124 @@
+# Brain — in-container default configuration.
+#
+# This file is baked into the container image at
+# /etc/brain/config.toml. To override a single field at runtime
+# without rebuilding the image, set BRAIN__SECTION__FIELD=value as
+# an environment variable on the container — e.g.:
+#
+#   docker run -e BRAIN__STORAGE__SHARD_COUNT=8 ...
+#
+# To override the whole file, bind-mount your own:
+#
+#   docker run -v /host/brain.toml:/etc/brain/config.toml:ro ...
+#
+# Full field reference: docs/reference/configuration.md
+# Tuning advice:        docs/guides/tuning/
+
+[server]
+# Data plane: clients + SDK speak the rkyv wire protocol here.
+# Bound to 0.0.0.0 inside the container; expose with -p 8080:8080.
+listen_addr  = "0.0.0.0:8080"
+
+# HTTP server: /healthz, /metrics, /v1/* (REST surface).
+# Bound to 0.0.0.0 inside the container; expose with -p 9091:9091.
+metrics_addr = "0.0.0.0:9091"
+
+# Admin CLI surface — /v1/* routes. Kept on loopback inside the
+# container (no `-p` mapping in docker run / compose). The host can't
+# reach it; `docker exec brain brain-cli ...` does. v1 has no built-in
+# auth on /v1/* — keep this on loopback or front it with a token /
+# mTLS proxy.
+admin_addr   = "127.0.0.1:9092"
+
+[storage]
+data_dir    = "/var/lib/brain/data"
+# Single shard is the safe default for a single-container deployment.
+# Grow this for higher write throughput; see docs/guides/tuning/shard-sizing.md.
+shard_count = 1
+
+[shard]
+# 1 GiB arena per shard ≈ 660K vectors at 1600 B/slot.
+# Override via BRAIN__SHARD__ARENA_CAPACITY_BYTES=4GiB at runtime.
+arena_capacity_bytes    = "1GiB"
+wal_segment_size_bytes  = "64MiB"
+wal_retention_segments  = 16        # 1 GiB WAL retention per shard
+
+[hnsw]
+# Spec §06/02 defaults. Don't change without reading docs/guides/tuning/hnsw-parameters.md.
+m              = 16
+ef_construction = 200
+ef_search      = 64
+
+[embedder]
+# BGE-small-en-v1.5 (384-dim). Cached under /var/lib/brain/models
+# after first download (HuggingFace).
+model            = "bge-small-en-v1.5"
+cache_size       = 10000
+batch_size       = 32
+batch_window_ms  = 5
+
+[auth]
+# v1.0 ships only `none`. Token / mTLS are deferred (spec §03/09).
+# Until then: never expose listen_addr to the public internet.
+# See docs/guides/security/auth-modes.md.
+mode = "none"
+
+[logging]
+level  = "info"
+output = "stdout"
+format = "json"   # Loki / Elastic / CloudWatch ingest cleanly.
+
+[tracing]
+# Disabled in the in-image default. Compose stack flips this on
+# via BRAIN__TRACING__ENABLED=true and points at the in-stack
+# OTel collector. For a standalone container, set:
+#   -e BRAIN__TRACING__ENABLED=true
+#   -e BRAIN__TRACING__ENDPOINT=http://your-collector:4318/v1/traces
+enabled       = false
+sampler       = "ratio"
+sample_ratio  = 0.01
+endpoint      = ""
+service_name  = "brain-server"
+
+[workers]
+# Spec §11 defaults. Each value is seconds; 0 disables the worker.
+# Most operators never touch these.
+decay_interval_sec                 = 3600
+consolidation_interval_sec         = 600
+hnsw_maintenance_interval_sec      = 1800
+idempotency_cleanup_interval_sec   = 3600
+slot_reclamation_interval_sec      = 3600
+wal_retention_interval_sec         = 600
+edge_scrub_interval_sec            = 86400
+counter_reconciliation_interval_sec = 86400
+statistics_update_interval_sec     = 60
+embedder_cache_eviction_interval_sec = 300
+snapshot_interval_sec              = 21600
+
+# Phase B: per-shard AutoEdgeWorker. Derives SimilarTo edges from
+# HNSW knn after each ENCODE. Every field defaults if the section
+# is omitted; commented overrides shown for visibility.
+[workers.auto_edge]
+enabled              = true
+interval_ms          = 100
+batch_size           = 256
+similarity_threshold = 0.85
+top_k                = 5
+ef_search            = 64
+channel_capacity     = 1024
+
+# Phase E: per-shard ExtractorWorker. See dev.toml for full field
+# documentation.
+[workers.extractor]
+enabled                          = true
+interval_ms                      = 1000
+drain_per_cycle                  = 32
+llm_budget_per_cycle_micro_usd   = 50000
+channel_capacity                 = 1024
+skip_already_extracted           = true
+
+[summarizer]
+# Consolidation worker is a no-op until an LLM backend is wired.
+# Spec §11/03 §6. See docs/guides/configure.md "Summarizer" for
+# enabling openai / ollama at build time.
+backend = "disabled"

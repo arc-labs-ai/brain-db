@@ -76,7 +76,9 @@ fn build_fixture(n: usize) -> Fixture {
 
 fn bench_tier1_exact_lookup(c: &mut Criterion) {
     let fixture = build_fixture(N_ENTITIES);
-    let queries: Vec<String> = (0..1024).map(|i| format!("person_{}", i * 97 % N_ENTITIES)).collect();
+    let queries: Vec<String> = (0..1024)
+        .map(|i| format!("person_{}", i * 97 % N_ENTITIES))
+        .collect();
     let mut idx = 0usize;
 
     c.bench_function("entity_resolve::tier1_exact_lookup", |b| {
@@ -97,7 +99,9 @@ fn bench_tier1_exact_lookup(c: &mut Criterion) {
 
 fn bench_tier1_alias_lookup(c: &mut Criterion) {
     let fixture = build_fixture(N_ENTITIES);
-    let queries: Vec<String> = (0..1024).map(|i| format!("alias_{}", i * 97 % N_ENTITIES)).collect();
+    let queries: Vec<String> = (0..1024)
+        .map(|i| format!("alias_{}", i * 97 % N_ENTITIES))
+        .collect();
     let mut idx = 0usize;
 
     c.bench_function("entity_resolve::tier1_alias_lookup", |b| {
@@ -129,8 +133,8 @@ fn bench_tier2_trigram_candidates_only(c: &mut Criterion) {
             let rtxn = fixture.db.read_txn().expect("read_txn");
             let q = &queries[idx % queries.len()];
             idx = idx.wrapping_add(1);
-            let candidates =
-                candidates_for_query(&rtxn, PERSON, &normalize_name(black_box(q))).expect("trigram");
+            let candidates = candidates_for_query(&rtxn, PERSON, &normalize_name(black_box(q)))
+                .expect("trigram");
             black_box(candidates);
         });
     });
@@ -156,14 +160,13 @@ fn bench_tier2_full_resolve(c: &mut Criterion) {
             idx = idx.wrapping_add(1);
             let q_norm = normalize_name(q);
             let q_trigrams = extract_trigrams(&q_norm);
-            let candidates =
-                candidates_for_query(&rtxn, PERSON, &q_norm).expect("trigram");
+            let candidates = candidates_for_query(&rtxn, PERSON, &q_norm).expect("trigram");
 
             let mut scored = Vec::with_capacity(candidates.len());
             for cand in candidates {
                 // Re-fetch the candidate's name to compute its trigram set.
-                let cand_entity = brain_metadata::entity_ops::entity_get(&rtxn, cand)
-                    .expect("entity_get");
+                let cand_entity =
+                    brain_metadata::entity_ops::entity_get(&rtxn, cand).expect("entity_get");
                 if let Some(e) = cand_entity {
                     let cand_trigrams = trigrams_of_components(&e.canonical_name, &e.aliases);
                     let score = jaccard(&q_trigrams, &cand_trigrams);

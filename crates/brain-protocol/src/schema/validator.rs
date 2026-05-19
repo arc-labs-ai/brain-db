@@ -97,9 +97,7 @@ pub fn validate(schema: &Schema) -> Result<ValidatedSchema, ValidationErrors> {
 /// Restricted to the substrate's seed path (`brain-metadata`'s
 /// `system_schema` module). User uploads of `namespace brain`
 /// must continue to be rejected by [`validate`].
-pub fn validate_system_schema(
-    schema: &Schema,
-) -> Result<ValidatedSchema, ValidationErrors> {
+pub fn validate_system_schema(schema: &Schema) -> Result<ValidatedSchema, ValidationErrors> {
     validate_inner(schema, ValidatorMode::System)
 }
 
@@ -269,24 +267,23 @@ fn collect_relation_names(schema: &Schema) -> Vec<&str> {
 }
 
 fn resolves_to_entity(name: &str, entity_names: &[&str]) -> bool {
-    name == ANY_TYPE_LITERAL || entity_names.iter().any(|e| *e == name)
+    name == ANY_TYPE_LITERAL || entity_names.contains(&name)
 }
 
 // ---------------------------------------------------------------------------
 // §2.6 Entity attributes.
 // ---------------------------------------------------------------------------
 
-fn check_entity_attributes(entity: &crate::schema::ast::EntityTypeDef, errors: &mut ValidationErrors) {
+fn check_entity_attributes(
+    entity: &crate::schema::ast::EntityTypeDef,
+    errors: &mut ValidationErrors,
+) {
     for attr in &entity.attributes {
         check_attribute_decl(attr, &entity.name, errors);
     }
 }
 
-fn check_attribute_decl(
-    attr: &AttributeDecl,
-    owner_label: &str,
-    errors: &mut ValidationErrors,
-) {
+fn check_attribute_decl(attr: &AttributeDecl, owner_label: &str, errors: &mut ValidationErrors) {
     // Name.
     if !is_lower_snake_ident(&attr.name) {
         errors.push(ValidationError {
@@ -356,11 +353,7 @@ fn default_matches_attr_type(default: &LiteralValue, attr: &AttrType) -> bool {
 // §2.3 + §2.4 Predicate.
 // ---------------------------------------------------------------------------
 
-fn check_predicate(
-    pred: &PredicateDef,
-    entity_names: &[&str],
-    errors: &mut ValidationErrors,
-) {
+fn check_predicate(pred: &PredicateDef, entity_names: &[&str], errors: &mut ValidationErrors) {
     // Type ref resolution for Entity<...>.
     if let ObjectTypeDecl::Entity { entity_type } = &pred.object {
         if !resolves_to_entity(entity_type, entity_names) {
@@ -391,10 +384,9 @@ fn check_predicate(
 fn predicate_kind_object_compatible(kind: StatementKindAst, object: &ObjectTypeDecl) -> bool {
     match kind {
         StatementKindAst::Fact | StatementKindAst::Any => true,
-        StatementKindAst::Preference => matches!(
-            object,
-            ObjectTypeDecl::Value { .. } | ObjectTypeDecl::Any
-        ),
+        StatementKindAst::Preference => {
+            matches!(object, ObjectTypeDecl::Value { .. } | ObjectTypeDecl::Any)
+        }
         StatementKindAst::Event => matches!(
             object,
             ObjectTypeDecl::Value { .. } | ObjectTypeDecl::Entity { .. } | ObjectTypeDecl::Any
@@ -406,11 +398,7 @@ fn predicate_kind_object_compatible(kind: StatementKindAst, object: &ObjectTypeD
 // §2.3 + §2.5 + §2.6 Relation.
 // ---------------------------------------------------------------------------
 
-fn check_relation(
-    rel: &RelationTypeDef,
-    entity_names: &[&str],
-    errors: &mut ValidationErrors,
-) {
+fn check_relation(rel: &RelationTypeDef, entity_names: &[&str], errors: &mut ValidationErrors) {
     if !resolves_to_entity(&rel.from_type, entity_names) {
         errors.push(ValidationError {
             code: ValidationErrorCode::UnresolvedTypeRef,
@@ -576,29 +564,22 @@ fn check_extractor(
     // Confidence ranges.
     for f in &ext.fields {
         match f {
-            ExtractorField::Confidence(c) => {
-                if !(0.0..=1.0).contains(c) {
-                    errors.push(ValidationError {
-                        code: ValidationErrorCode::ExtractorInvalidConfig,
-                        message: format!(
-                            "extractor {:?}: confidence {} not in [0, 1]",
-                            ext.name, c
-                        ),
-                        source_span: None,
-                    });
-                }
+            ExtractorField::Confidence(c) if !(0.0..=1.0).contains(c) => {
+                errors.push(ValidationError {
+                    code: ValidationErrorCode::ExtractorInvalidConfig,
+                    message: format!("extractor {:?}: confidence {} not in [0, 1]", ext.name, c),
+                    source_span: None,
+                });
             }
-            ExtractorField::ConfidenceThreshold(c) => {
-                if !(0.0..=1.0).contains(c) {
-                    errors.push(ValidationError {
-                        code: ValidationErrorCode::ExtractorInvalidConfig,
-                        message: format!(
-                            "extractor {:?}: confidence_threshold {} not in [0, 1]",
-                            ext.name, c
-                        ),
-                        source_span: None,
-                    });
-                }
+            ExtractorField::ConfidenceThreshold(c) if !(0.0..=1.0).contains(c) => {
+                errors.push(ValidationError {
+                    code: ValidationErrorCode::ExtractorInvalidConfig,
+                    message: format!(
+                        "extractor {:?}: confidence_threshold {} not in [0, 1]",
+                        ext.name, c
+                    ),
+                    source_span: None,
+                });
             }
             _ => {}
         }
@@ -697,16 +678,8 @@ mod tests {
     #[test]
     fn predicate_kind_object_compatible_matrix() {
         for (kind, obj, ok) in &[
-            (
-                StatementKindAst::Fact,
-                ObjectTypeDecl::Memory,
-                true,
-            ),
-            (
-                StatementKindAst::Preference,
-                ObjectTypeDecl::Memory,
-                false,
-            ),
+            (StatementKindAst::Fact, ObjectTypeDecl::Memory, true),
+            (StatementKindAst::Preference, ObjectTypeDecl::Memory, false),
             (
                 StatementKindAst::Preference,
                 ObjectTypeDecl::Value {
@@ -714,11 +687,7 @@ mod tests {
                 },
                 true,
             ),
-            (
-                StatementKindAst::Event,
-                ObjectTypeDecl::Statement,
-                false,
-            ),
+            (StatementKindAst::Event, ObjectTypeDecl::Statement, false),
             (
                 StatementKindAst::Event,
                 ObjectTypeDecl::Entity {

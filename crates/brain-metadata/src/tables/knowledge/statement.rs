@@ -21,8 +21,8 @@
 
 use crate::impl_redb_rkyv_value;
 use brain_core::knowledge::{
-    EvidenceEntry, EvidenceRef, INLINE_EVIDENCE_CAP, Statement, StatementObject,
-    StatementValue, SubjectRef,
+    EvidenceEntry, EvidenceRef, Statement, StatementObject, StatementValue, SubjectRef,
+    INLINE_EVIDENCE_CAP,
 };
 use brain_core::{
     EntityId, EvidenceOverflowId, ExtractorId, MemoryId, PredicateId, StatementId, StatementKind,
@@ -38,43 +38,28 @@ pub const STATEMENTS_TABLE: TableDefinition<'static, [u8; 16], StatementMetadata
     TableDefinition::new("statements");
 
 /// `(EntityId, kind, predicate_id, is_current)` → `StatementId.to_bytes()`.
-pub const STATEMENTS_BY_SUBJECT_TABLE: TableDefinition<
-    'static,
-    ([u8; 16], u8, u32, u8),
-    [u8; 16],
-> = TableDefinition::new("statements_by_subject");
+pub const STATEMENTS_BY_SUBJECT_TABLE: TableDefinition<'static, ([u8; 16], u8, u32, u8), [u8; 16]> =
+    TableDefinition::new("statements_by_subject");
 
 /// `(predicate_id, kind, confidence_bucket)` → `StatementId.to_bytes()`.
 /// `confidence_bucket` is `floor(confidence * 10)` clamped to `0..=10`.
-pub const STATEMENTS_BY_PREDICATE_TABLE: TableDefinition<
-    'static,
-    (u32, u8, u8),
-    [u8; 16],
-> = TableDefinition::new("statements_by_predicate");
+pub const STATEMENTS_BY_PREDICATE_TABLE: TableDefinition<'static, (u32, u8, u8), [u8; 16]> =
+    TableDefinition::new("statements_by_predicate");
 
 /// `(EntityId, kind)` → `StatementId.to_bytes()`. Walk this when
 /// answering "what statements have X as object?".
-pub const STATEMENTS_BY_OBJECT_ENTITY_TABLE: TableDefinition<
-    'static,
-    ([u8; 16], u8),
-    [u8; 16],
-> = TableDefinition::new("statements_by_object_entity");
+pub const STATEMENTS_BY_OBJECT_ENTITY_TABLE: TableDefinition<'static, ([u8; 16], u8), [u8; 16]> =
+    TableDefinition::new("statements_by_object_entity");
 
 /// `(event_at_unix_nanos, subject_entity_bytes)` → `StatementId.to_bytes()`.
 /// Time-range queries scan a prefix; the EntityId disambiguates same-time
 /// events for the same subject.
-pub const STATEMENTS_BY_EVENT_TIME_TABLE: TableDefinition<
-    'static,
-    (u64, [u8; 16]),
-    [u8; 16],
-> = TableDefinition::new("statements_by_event_time");
+pub const STATEMENTS_BY_EVENT_TIME_TABLE: TableDefinition<'static, (u64, [u8; 16]), [u8; 16]> =
+    TableDefinition::new("statements_by_event_time");
 
 /// `(MemoryId, StatementId)` → `()`. Reverse index for FORGET cascade.
-pub const STATEMENTS_BY_EVIDENCE_TABLE: TableDefinition<
-    'static,
-    ([u8; 16], [u8; 16]),
-    (),
-> = TableDefinition::new("statements_by_evidence");
+pub const STATEMENTS_BY_EVIDENCE_TABLE: TableDefinition<'static, ([u8; 16], [u8; 16]), ()> =
+    TableDefinition::new("statements_by_evidence");
 
 /// `(chain_root, version)` → `StatementId.to_bytes()`. Walk this to
 /// reconstruct the supersession chain of a statement.
@@ -349,6 +334,33 @@ pub struct StatementMetadata {
     pub tombstoned_at_unix_nanos: Option<u64>,
     pub tombstone_reason: u8,
     pub is_current: u8,
+    /// Bit flags. Bits in use:
+    /// - bit 0: row was authored from an open-vocabulary write
+    ///   (predicate origin is `ImplicitFromWrite`).
+    /// - bit 1: `OUTSIDE_ACTIVE_SCHEMA` — set lazily by SCHEMA_UPLOAD
+    ///   when the row's predicate is not in the new active schema
+    ///   version. Allows readers to surface "pre-schema" data while
+    ///   schema-strict queries can opt to filter it out.
+    pub flags: u32,
+}
+
+/// Bit flags written to [`StatementMetadata::flags`].
+pub mod statement_flags {
+    /// The statement was created against a predicate that was interned
+    /// implicitly (schemaless write path). Distinct from
+    /// `OUTSIDE_ACTIVE_SCHEMA` because a later SCHEMA_UPLOAD might
+    /// adopt the predicate, in which case `OUTSIDE_ACTIVE_SCHEMA` is
+    /// cleared but `IMPLICIT_PREDICATE` remains as historical signal.
+    pub const IMPLICIT_PREDICATE: u32 = 1 << 0;
+    /// The statement's predicate is not present in the namespace's
+    /// active schema version. Set on SCHEMA_UPLOAD for pre-existing
+    /// rows whose predicate is missing from the new schema, and on
+    /// open-vocabulary STATEMENT_CREATE when the predicate gets
+    /// interned but a schema is already active in some other
+    /// namespace. Readers must keep returning these rows; queries
+    /// running in strict mode use the flag to decide whether to
+    /// drop them.
+    pub const OUTSIDE_ACTIVE_SCHEMA: u32 = 1 << 1;
 }
 
 impl StatementMetadata {
@@ -377,7 +389,29 @@ impl StatementMetadata {
     }
 }
 
-impl_redb_rkyv_value!(StatementMetadata, "brain_metadata::StatementMetadata::v2");
+impl StatementMetadata {
+    /// Convenience: read the named [`statement_flags`] bit.
+    #[must_use]
+    pub fn has_flag(&self, bit: u32) -> bool {
+        self.flags & bit != 0
+    }
+
+    /// Set the named bit, returning whether the flag word changed.
+    pub fn set_flag(&mut self, bit: u32) -> bool {
+        let old = self.flags;
+        self.flags |= bit;
+        old != self.flags
+    }
+
+    /// Clear the named bit, returning whether the flag word changed.
+    pub fn clear_flag(&mut self, bit: u32) -> bool {
+        let old = self.flags;
+        self.flags &= !bit;
+        old != self.flags
+    }
+}
+
+impl_redb_rkyv_value!(StatementMetadata, "brain_metadata::StatementMetadata::v3");
 
 /// Overflow row for statements whose inline evidence list outgrew the
 /// `INLINE_EVIDENCE_CAP = 8` inline budget. Four parallel vectors per
@@ -512,6 +546,13 @@ pub fn metadata_from_statement(s: &Statement) -> StatementMetadata {
         tombstoned_at_unix_nanos: s.tombstoned_at_unix_nanos,
         tombstone_reason,
         is_current,
+        // Flags are owned by the wire handler / sweepers — neither
+        // `IMPLICIT_PREDICATE` nor `OUTSIDE_ACTIVE_SCHEMA` is derivable
+        // from the brain-core `Statement` alone (both need registry
+        // and active-schema lookups). Default to no flags here; the
+        // STATEMENT_CREATE handler / SCHEMA_UPLOAD will OR in the
+        // right bits after `metadata_from_statement` returns.
+        flags: 0,
     }
 }
 
@@ -540,7 +581,7 @@ pub fn statement_from_metadata(m: &StatementMetadata) -> Option<Statement> {
             .iter()
             .map(EvidenceEntryRow::to_entry)
             .collect();
-        EvidenceRef::Inline(entries)
+        EvidenceRef::Inline(Box::new(entries))
     };
 
     let tombstone_reason = brain_core::knowledge::TombstoneReason::from_u8(m.tombstone_reason);
@@ -600,10 +641,10 @@ mod tests {
             PredicateId::from(7),
             StatementObject::Entity(EntityId::new()),
             0.91,
-            EvidenceRef::Inline(SmallVec::from_buf_and_len(
+            EvidenceRef::Inline(Box::new(SmallVec::from_buf_and_len(
                 [sample_evidence_entry(1, 900); INLINE_EVIDENCE_CAP],
                 1,
-            )),
+            ))),
             ExtractorId::from(0),
             1_700_000_000_000_000_000,
             1,
@@ -639,7 +680,7 @@ mod tests {
             StatementObject::Entity(EntityId::new()),
             StatementObject::Value(StatementValue::Text("hello".into())),
             StatementObject::Value(StatementValue::Integer(-42)),
-            StatementObject::Value(StatementValue::Float(3.14)),
+            StatementObject::Value(StatementValue::Float(3.5)),
             StatementObject::Value(StatementValue::Bool(true)),
             StatementObject::Value(StatementValue::UnixNanos(1_700_000_000)),
             StatementObject::Value(StatementValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF])),
@@ -671,7 +712,12 @@ mod tests {
         let db = fresh_db(&dir);
         let subject = EntityId::new();
         let stmt = StatementId::new();
-        let key = (subject.to_bytes(), StatementKind::Preference.as_u8(), 3u32, 1u8);
+        let key = (
+            subject.to_bytes(),
+            StatementKind::Preference.as_u8(),
+            3u32,
+            1u8,
+        );
 
         let wtxn = db.begin_write().unwrap();
         {
@@ -758,7 +804,8 @@ mod tests {
             let mut e = wtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE).unwrap();
             e.insert(&(mem, stmt.to_bytes()), &()).unwrap();
             let mut c = wtxn.open_table(STATEMENT_CHAIN_TABLE).unwrap();
-            c.insert(&(chain_root.to_bytes(), 1u32), &stmt.to_bytes()).unwrap();
+            c.insert(&(chain_root.to_bytes(), 1u32), &stmt.to_bytes())
+                .unwrap();
         }
         wtxn.commit().unwrap();
 
@@ -766,7 +813,11 @@ mod tests {
         let e = rtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE).unwrap();
         assert!(e.get(&(mem, stmt.to_bytes())).unwrap().is_some());
         let c = rtxn.open_table(STATEMENT_CHAIN_TABLE).unwrap();
-        let got = c.get(&(chain_root.to_bytes(), 1u32)).unwrap().unwrap().value();
+        let got = c
+            .get(&(chain_root.to_bytes(), 1u32))
+            .unwrap()
+            .unwrap()
+            .value();
         assert_eq!(StatementId::from(got), stmt);
     }
 

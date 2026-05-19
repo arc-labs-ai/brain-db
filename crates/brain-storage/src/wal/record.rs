@@ -407,13 +407,14 @@ mod tests {
             Err(WalRecordError::UnknownRecordType(0))
         );
 
-        // A reserved-future byte (e.g. 16) likewise rejected.
-        buf[8] = 16;
+        // A reserved-future byte (e.g. 0x60 — past the audit kind, still
+        // inside the v1 reserved range) likewise rejected.
+        buf[8] = 0x60;
         let crc = crc32c::crc32c(&buf[..HEADER_LEN]);
         buf[crc_off..crc_off + 4].copy_from_slice(&crc.to_le_bytes());
         assert_eq!(
             WalRecord::decode_one(&buf),
-            Err(WalRecordError::UnknownRecordType(16))
+            Err(WalRecordError::UnknownRecordType(0x60))
         );
     }
 
@@ -528,15 +529,21 @@ mod tests {
         use crate::wal::payload::{KnowledgeRecord, WalPayload};
 
         // One example per discriminant boundary in the knowledge block.
+        // RelationCreate / RelationSupersede / RelationTombstone became
+        // first-class typed payloads in Phase C, so they are no longer
+        // valid kinds for an opaque-body KnowledgeRecord.
         for kind in [
             WalRecordKind::EntityCreate,
             WalRecordKind::StatementCreate,
-            WalRecordKind::RelationCreate,
             WalRecordKind::SchemaUpdate,
             WalRecordKind::Audit,
         ] {
             let body: Vec<u8> = (0..48u8).map(|i| i.wrapping_mul(kind.as_u8())).collect();
-            let payload = WalPayload::Knowledge(KnowledgeRecord::new(kind, body.clone()));
+            let payload = WalPayload::Knowledge(KnowledgeRecord::new(
+                kind,
+                brain_core::AgentId::default(),
+                body.clone(),
+            ));
             let record = WalRecord::from_typed(Lsn(7), 0, 9999, 0xBB, &payload);
             assert_eq!(record.kind, kind);
 

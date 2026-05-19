@@ -8,7 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
-use brain_metadata::tables::edge::{derived_by, origin, EdgeData, EDGES_IN_TABLE, EDGES_OUT_TABLE};
+use brain_metadata::tables::edge::{
+    derived_by, link, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
+};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
 use brain_ops::{OpsContext, RealWriterHandle};
@@ -105,14 +107,19 @@ fn seed_edge_raw(metadata: &SharedMetadataDb, src: MemoryId, kind: EdgeKind, tgt
     let mut db = metadata.lock();
     let wtxn = db.write_txn().unwrap();
     {
-        let mut out = wtxn.open_table(EDGES_OUT_TABLE).unwrap();
-        let mut in_t = wtxn.open_table(EDGES_IN_TABLE).unwrap();
+        let mut out = wtxn.open_table(EDGES_TABLE).unwrap();
+        let mut rev = wtxn.open_table(EDGES_REVERSE_TABLE).unwrap();
         let data = EdgeData::new(1.0, origin::EXPLICIT, derived_by::CLIENT, now_unix_nanos());
-        let s = src.to_be_bytes();
-        let t = tgt.to_be_bytes();
-        let k = kind as u8;
-        out.insert(&(s, k, t), &data).unwrap();
-        in_t.insert(&(t, k, s), &data).unwrap();
+        link(
+            &mut out,
+            &mut rev,
+            brain_core::NodeRef::Memory(src),
+            brain_core::EdgeKindRef::Builtin(kind),
+            brain_core::NodeRef::Memory(tgt),
+            zero_disambiguator(),
+            &data,
+        )
+        .unwrap();
     }
     wtxn.commit().unwrap();
 }
@@ -120,14 +127,14 @@ fn seed_edge_raw(metadata: &SharedMetadataDb, src: MemoryId, kind: EdgeKind, tgt
 fn count_edges_out(metadata: &SharedMetadataDb) -> usize {
     let db = metadata.lock();
     let rtxn = db.read_txn().unwrap();
-    let t = rtxn.open_table(EDGES_OUT_TABLE).unwrap();
+    let t = rtxn.open_table(EDGES_TABLE).unwrap();
     t.iter().unwrap().count()
 }
 
 fn count_edges_in(metadata: &SharedMetadataDb) -> usize {
     let db = metadata.lock();
     let rtxn = db.read_txn().unwrap();
-    let t = rtxn.open_table(EDGES_IN_TABLE).unwrap();
+    let t = rtxn.open_table(EDGES_REVERSE_TABLE).unwrap();
     t.iter().unwrap().count()
 }
 
@@ -213,13 +220,15 @@ fn edge_from_dead_source_removed_from_in() {
             let mut db = fix.metadata.lock();
             let wtxn = db.write_txn().unwrap();
             {
-                let mut out = wtxn.open_table(EDGES_OUT_TABLE).unwrap();
-                out.remove(&(
-                    dead_src.to_be_bytes(),
-                    EdgeKind::FollowedBy as u8,
-                    alive_tgt.to_be_bytes(),
-                ))
-                .unwrap();
+                let mut out = wtxn.open_table(EDGES_TABLE).unwrap();
+                let key = brain_metadata::tables::edge::EdgeKey {
+                    from: brain_core::NodeRef::Memory(dead_src),
+                    kind: brain_core::EdgeKindRef::Builtin(EdgeKind::FollowedBy),
+                    to: brain_core::NodeRef::Memory(alive_tgt),
+                    disambiguator: zero_disambiguator(),
+                }
+                .encode();
+                out.remove(key.as_slice()).unwrap();
             }
             wtxn.commit().unwrap();
         }

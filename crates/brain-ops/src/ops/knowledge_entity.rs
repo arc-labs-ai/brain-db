@@ -10,7 +10,8 @@
 //! 5. Commits the transaction.
 //! 6. Maps `EntityOpError` to `OpError` per spec §28's error codes
 //!    (mapped through the substrate ErrorCode taxonomy until §28 error
-//!    codes land as first-class — see [`map_entity_op_error`]).
+//!    codes land as first-class — see the module-private
+//!    `map_entity_op_error` helper).
 //!
 //! Phase 16.6c handlers do **not** touch the entity HNSW (16.3) or
 //! emit subscription events. Both wire in later sub-tasks.
@@ -91,7 +92,8 @@ pub async fn handle_entity_create(
             canonical_name: req.canonical_name,
         }),
         now,
-    );
+    )
+    .await;
 
     Ok(EntityCreateResponse {
         entity_id: id.to_bytes(),
@@ -185,7 +187,8 @@ pub async fn handle_entity_update(
             embedding_version_changed: after.embedding_version > 0,
         }),
         now,
-    );
+    )
+    .await;
 
     Ok(EntityUpdateResponse {
         entity: entity_to_view(&after),
@@ -259,7 +262,8 @@ pub async fn handle_entity_rename(
             old_moved_to_alias: req.move_to_alias,
         }),
         now,
-    );
+    )
+    .await;
 
     Ok(EntityRenameResponse {
         entity: entity_to_view(&after),
@@ -320,7 +324,8 @@ pub async fn handle_entity_merge(
             relations_rerouted: 0,
         }),
         now,
-    );
+    )
+    .await;
 
     Ok(EntityMergeResponse {
         audit_id: merge_id.to_bytes(),
@@ -362,7 +367,8 @@ pub async fn handle_entity_unmerge(
             audit_id: [0; 16],
         }),
         now,
-    );
+    )
+    .await;
 
     Ok(EntityUnmergeResponse {
         restored_entity_id: merged.to_bytes(),
@@ -400,7 +406,8 @@ pub async fn handle_entity_tombstone(
             reason: req.reason,
         }),
         now,
-    );
+    )
+    .await;
 
     Ok(EntityTombstoneResponse {
         tombstoned_at_unix_nanos: now,
@@ -709,17 +716,47 @@ fn map_entity_merge_op_error(err: EntityMergeOpError) -> OpError {
 }
 
 /// Emit a knowledge-layer event onto the EventBus. Substrate fields are
-/// zero-filled per spec §28/02 §2. Called post-commit by every entity
-/// handler that mutates state. Also reused by the statement handlers
-/// (17.7).
-pub(crate) fn emit_knowledge_event(
+/// zero-filled per spec §28/02 §2. Called post-commit by every knowledge
+/// handler that mutates state (entity / statement / relation / schema).
+///
+/// Routes through [`OpsContext::publish_knowledge`] so the event is
+/// **also** WAL-recorded — letting subscribe-replay (`--start-lsn`)
+/// reconstruct knowledge events the same way it reconstructs substrate
+/// events. The WAL append is post-commit (redb is the source of truth
+/// for knowledge state); a crash between commit and WAL append loses
+/// the subscribe event for that op, not the knowledge data.
+pub(crate) async fn emit_knowledge_event(
     ctx: &OpsContext,
     event_type: EventType,
     payload: KnowledgeEventPayload,
     timestamp_unix_nanos: u64,
 ) {
-    let envelope = EventEnvelope {
-        lsn: 0, // overwritten by EventBus::publish
+    // Stamp the writer's bound agent on the envelope so the
+    // subscribe `agents` filter routes knowledge events the same
+    // way it routes substrate events. Without this, a
+    // schema-on subscriber filtering for "my agent" would silently
+    // miss every knowledge event.
+    let agent_id = ctx.executor.writer.agent_id();
+    let Some(kind) = wal_kind_for_event(&payload) else {
+        // Extraction / unsupported variants: bus-only publish.
+        let envelope = EventEnvelope {
+            lsn: 0,
+            event_type,
+            memory_id: MemoryId::NULL,
+            context_id: brain_core::ContextId::default(),
+            kind: brain_core::MemoryKind::Episodic,
+            salience: 0.0,
+            timestamp_unix_nanos,
+            text: None,
+            knowledge_payload: Some(payload),
+            edge_payload: None,
+            agent_id,
+        };
+        let _ = ctx.events.publish(envelope);
+        return;
+    };
+    ctx.publish_knowledge(kind, payload, move |lsn, payload| EventEnvelope {
+        lsn,
         event_type,
         memory_id: MemoryId::NULL,
         context_id: brain_core::ContextId::default(),
@@ -728,6 +765,34 @@ pub(crate) fn emit_knowledge_event(
         timestamp_unix_nanos,
         text: None,
         knowledge_payload: Some(payload),
-    };
-    let _ = ctx.events.publish(envelope);
+        edge_payload: None,
+        agent_id,
+    })
+    .await;
+}
+
+/// Map a [`KnowledgeEventPayload`] variant to its WAL record kind so
+/// subscribe-replay can decode the body back into the matching variant.
+/// `EntityRenamed` and `EntityUnmerged` collapse onto `EntityUpdate` and
+/// `EntityMerge` respectively — recovery distinguishes by rkyv-decoding
+/// the body, the kind byte is just the lookup key.
+fn wal_kind_for_event(
+    payload: &KnowledgeEventPayload,
+) -> Option<brain_storage::wal::kinds::WalRecordKind> {
+    use brain_storage::wal::kinds::WalRecordKind as K;
+    use KnowledgeEventPayload as P;
+    Some(match payload {
+        P::EntityCreated(_) => K::EntityCreate,
+        P::EntityUpdated(_) | P::EntityRenamed(_) => K::EntityUpdate,
+        P::EntityMerged(_) | P::EntityUnmerged(_) => K::EntityMerge,
+        P::EntityTombstoned(_) => K::EntityTombstone,
+        P::StatementCreated(_) => K::StatementCreate,
+        P::StatementSuperseded(_) => K::StatementSupersede,
+        P::StatementTombstoned(_) => K::StatementTombstone,
+        P::RelationCreated(_) => K::RelationCreate,
+        P::RelationSuperseded(_) => K::RelationSupersede,
+        P::RelationTombstoned(_) => K::RelationTombstone,
+        P::SchemaUpdated(_) => K::SchemaUpdate,
+        P::ExtractionCompleted(_) | P::ExtractionFailed(_) => return None,
+    })
 }

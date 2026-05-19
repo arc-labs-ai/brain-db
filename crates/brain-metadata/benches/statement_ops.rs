@@ -25,9 +25,7 @@ use brain_metadata::entity_ops::{entity_put, normalize_name};
 use brain_metadata::statement_ops::{
     statement_create, statement_get, statement_list, statement_supersede, StatementListFilter,
 };
-use brain_metadata::tables::knowledge::predicate::{
-    PREDICATES_BY_QNAME_TABLE, PREDICATES_TABLE,
-};
+use brain_metadata::tables::knowledge::predicate::{PREDICATES_BY_QNAME_TABLE, PREDICATES_TABLE};
 use brain_metadata::MetadataDb;
 use criterion::{black_box, criterion_group, Criterion};
 use tempfile::TempDir;
@@ -141,7 +139,11 @@ fn bench_statement_create_fact(c: &mut Criterion) {
     let extra_objects: Vec<EntityId> = (0..1024).map(|_| EntityId::new()).collect();
     {
         let wtxn = fixture.db.write_txn().expect("write_txn");
-        for (i, id) in extra_subjects.iter().chain(extra_objects.iter()).enumerate() {
+        for (i, id) in extra_subjects
+            .iter()
+            .chain(extra_objects.iter())
+            .enumerate()
+        {
             let name = format!("xfix_{i}");
             let e = Entity::new_active(*id, PERSON, name.clone(), normalize_name(&name), now);
             entity_put(&wtxn, &e).expect("entity_put");
@@ -258,8 +260,8 @@ fn bench_statement_supersede(c: &mut Criterion) {
                 1,
             );
             let wtxn = fixture.db.write_txn().expect("write_txn");
-            let written = statement_supersede(&wtxn, old_id, black_box(&new_stmt), now)
-                .expect("supersede");
+            let written =
+                statement_supersede(&wtxn, old_id, black_box(&new_stmt), now).expect("supersede");
             wtxn.commit().expect("commit");
             heads[i].2 = written;
         });

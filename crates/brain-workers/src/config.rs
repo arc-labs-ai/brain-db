@@ -30,6 +30,14 @@ pub enum WorkerKind {
     LlmCacheSweeper,
     StaleExtractionDetector,
     EntityGc,
+    /// Derives `SimilarTo` edges from HNSW knn after each successful
+    /// ENCODE. Turns the substrate's static vector store into a graph
+    /// the planner can traverse without forcing clients to LINK manually.
+    AutoEdge,
+    /// Runs the three-tier extractor pipeline (pattern + classifier +
+    /// LLM) after each ENCODE, then writes the resolved entities /
+    /// statements / relations / mention edges back through brain-metadata.
+    Extractor,
 }
 
 impl WorkerKind {
@@ -57,6 +65,8 @@ impl WorkerKind {
             Self::LlmCacheSweeper => "llm_cache_sweeper",
             Self::StaleExtractionDetector => "stale_extraction_detector",
             Self::EntityGc => "entity_gc",
+            Self::AutoEdge => "auto_edge",
+            Self::Extractor => "extractor",
         }
     }
 }
@@ -106,6 +116,15 @@ impl WorkerConfig {
             WorkerKind::LlmCacheSweeper => (true, Duration::from_secs(3600), 1024, 10_000),
             WorkerKind::StaleExtractionDetector => (true, Duration::from_secs(3600), 512, 10_000),
             WorkerKind::EntityGc => (false, Duration::from_secs(86400), 256, 30_000),
+            // 100ms tick keeps encode→edge latency tight; batch=256 caps
+            // how much HNSW + redb work one cycle can do.
+            WorkerKind::AutoEdge => (true, Duration::from_millis(100), 256, 5_000),
+            // Extraction is heavier than HNSW knn (pattern + classifier
+            // inference + LLM round-trip). 1s tick + 32-memory batch
+            // gives the pipeline room to amortise LLM latency without
+            // blocking the scheduler. max_runtime=5s caps a stuck LLM
+            // call from monopolising the lane.
+            WorkerKind::Extractor => (true, Duration::from_secs(1), 32, 5_000),
         };
         Self {
             enabled,

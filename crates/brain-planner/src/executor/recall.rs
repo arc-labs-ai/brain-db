@@ -5,7 +5,8 @@
 //!
 //! 1. Embed the cue (single call; cache hits stay sub-µs per
 //!    `CachingDispatcher`).
-//! 2. ANN search via [`SharedHnsw::search_active`] — tombstoned slots
+//! 2. ANN search via [`brain_index::SharedHnsw`]'s `search_active` —
+//!    tombstoned slots
 //!    are filtered out as the pre-filter (spec §03 §6).
 //! 3. Look up `MemoryMetadata` for each candidate from a single
 //!    read txn.
@@ -19,6 +20,7 @@
 
 use brain_core::{ContextId, MemoryId, MemoryKind};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
+use brain_metadata::tables::text::TEXTS_TABLE;
 
 use crate::plan::{FilterRule, FilterStage, RecallPlan, SortKey};
 
@@ -102,9 +104,49 @@ pub async fn execute_recall(
 
     enriched.truncate(plan.merge.final_top);
 
-    Ok(RecallResult {
-        hits: enriched.into_iter().map(|(h, _)| h).collect(),
-    })
+    let mut hits: Vec<RecallHit> = enriched.into_iter().map(|(h, _)| h).collect();
+
+    if plan.text_fetch.is_some() && !hits.is_empty() {
+        let metadata_guard = ctx.metadata.lock();
+        let txn = metadata_guard
+            .read_txn()
+            .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
+        // A shard that hasn't received an encode yet won't have a
+        // texts table — treat that as "no texts available" rather
+        // than failing the recall.
+        let table = match txn.open_table(TEXTS_TABLE) {
+            Ok(t) => Some(t),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => return Err(ExecError::MetadataReadFailed(e.to_string())),
+        };
+        for hit in &mut hits {
+            hit.text = if let Some(tbl) = table.as_ref() {
+                let row = tbl
+                    .get(hit.memory_id.to_be_bytes())
+                    .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
+                match row {
+                    Some(guard) => Some(
+                        std::str::from_utf8(guard.value())
+                            .map_err(|e| {
+                                ExecError::Internal(format!(
+                                    "texts row for {:?} is not UTF-8: {e}",
+                                    hit.memory_id
+                                ))
+                            })?
+                            .to_owned(),
+                    ),
+                    // Hit survived the memories-table read but the
+                    // texts row is gone — a hard-FORGET landed in
+                    // between. Return empty rather than failing.
+                    None => Some(String::new()),
+                }
+            } else {
+                Some(String::new())
+            };
+        }
+    }
+
+    Ok(RecallResult { hits })
 }
 
 fn build_hit(
@@ -123,6 +165,14 @@ fn build_hit(
         salience: meta.salience,
         created_at_unix_nanos: meta.created_at_unix_nanos,
         text: None,
+        salience_initial: meta.salience_initial,
+        access_count: meta.access_count,
+        flags: meta.flags,
+        consolidated_at_unix_nanos: meta.consolidated_at_unix_nanos,
+        edges_out_count: meta.edges_out_count,
+        edges_in_count: meta.edges_in_count,
+        last_accessed_at_unix_nanos: meta.last_accessed_at_unix_nanos,
+        encoded_at_lsn: meta.encoded_at_lsn,
     })
 }
 

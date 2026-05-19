@@ -58,6 +58,9 @@ fn make_encode_op(request_id: [u8; 16], text: &str) -> EncodeOp {
         salience_initial: 0.5,
         fingerprint: [0x11; 16],
         edges: vec![],
+        deduplicate: false,
+        content_hash: [0u8; 32],
+        agent_id: brain_core::AgentId::default(),
     }
 }
 
@@ -66,6 +69,7 @@ fn make_forget_op(request_id: [u8; 16], memory_id: MemoryId, mode: ForgetMode) -
         request_id: RequestId::from(request_id),
         memory_id,
         mode,
+        agent_id: brain_core::AgentId::default(),
     }
 }
 

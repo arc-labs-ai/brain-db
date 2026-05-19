@@ -25,7 +25,9 @@ pub enum EntityTypeOpError {
     #[error("redb table error: {0}")]
     Table(#[from] redb::TableError),
 
-    #[error("entity_type name {name:?} already exists with id {existing_id:?} but constraints differ")]
+    #[error(
+        "entity_type name {name:?} already exists with id {existing_id:?} but constraints differ"
+    )]
     AlreadyExists {
         name: String,
         existing_id: EntityTypeId,

@@ -64,7 +64,10 @@ async fn relation_builder_create() {
     let (addr, _server) = common::spawn_mock_server(move |mut socket| async move {
         // RELATION_CREATE
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode_u16(), Opcode::RelationCreateReq.as_u16());
+        assert_eq!(
+            frame.header.opcode_u16(),
+            Opcode::RelationCreateReq.as_u16()
+        );
         let body = RequestBody::decode(Opcode::RelationCreateReq, &frame.payload).unwrap();
         match body {
             RequestBody::RelationCreate(r) => {
@@ -257,7 +260,10 @@ async fn relations_list_from_with_type_filter() {
     let to = [2u8; 16];
     let (addr, _server) = common::spawn_mock_server(move |mut socket| async move {
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode_u16(), Opcode::RelationListFromReq.as_u16());
+        assert_eq!(
+            frame.header.opcode_u16(),
+            Opcode::RelationListFromReq.as_u16()
+        );
         let body = RequestBody::decode(Opcode::RelationListFromReq, &frame.payload).unwrap();
         match body {
             RequestBody::RelationListFrom(r) => {
@@ -304,7 +310,10 @@ async fn relations_list_to_returns_handles() {
     let to = [2u8; 16];
     let (addr, _server) = common::spawn_mock_server(move |mut socket| async move {
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode_u16(), Opcode::RelationListToReq.as_u16());
+        assert_eq!(
+            frame.header.opcode_u16(),
+            Opcode::RelationListToReq.as_u16()
+        );
         common::write_frame(
             &mut socket,
             Opcode::RelationListToResp.as_u16(),
@@ -343,7 +352,10 @@ async fn relations_traverse_returns_paths() {
     let to = [2u8; 16];
     let (addr, _server) = common::spawn_mock_server(move |mut socket| async move {
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode_u16(), Opcode::RelationTraverseReq.as_u16());
+        assert_eq!(
+            frame.header.opcode_u16(),
+            Opcode::RelationTraverseReq.as_u16()
+        );
         let body = RequestBody::decode(Opcode::RelationTraverseReq, &frame.payload).unwrap();
         match body {
             RequestBody::RelationTraverse(r) => {
@@ -402,7 +414,10 @@ async fn unknown_relation_type_classifies_via_extension_trait() {
     let to = [2u8; 16];
     let (addr, _server) = common::spawn_mock_server(move |mut socket| async move {
         let frame = common::read_frame(&mut socket).await;
-        assert_eq!(frame.header.opcode_u16(), Opcode::RelationCreateReq.as_u16());
+        assert_eq!(
+            frame.header.opcode_u16(),
+            Opcode::RelationCreateReq.as_u16()
+        );
         common::write_frame(
             &mut socket,
             Opcode::Error.as_u16(),

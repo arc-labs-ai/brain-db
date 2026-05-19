@@ -100,7 +100,7 @@ Implement ENCODE, RECALL, PLAN, REASON, FORGET (plus LINK/UNLINK and TXN_*) on t
 ## Phase exit checklist
 
 - [ ] All sub-tasks complete.
-- [ ] `just verify` green.
+- [ ] Verify suite (fmt-check + build + clippy + test + check-skills) green.
 - [ ] Correctness suite (§16/01) all passing.
 - [ ] Idempotency tests pass for every write op.
 - [ ] Tag `phase-7-complete`.

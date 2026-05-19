@@ -20,6 +20,7 @@ members = [
     "crates/brain-server",
     "crates/brain-sdk-rust",
     "crates/brain-cli",
+    "crates/brain-shell",
     "crates/brain-http",
 ]
 exclude = ["fuzz"]
@@ -137,6 +138,15 @@ uuid = { version = "1.7", features = ["v7", "serde"] }
 # Errors
 thiserror = "1"
 anyhow = "1"
+
+# `brain-shell` CLI: clap for the argv + REPL command tree, rustyline
+# for line editing + persistent history, dirs for XDG history-file
+# discovery. Self-contained to the shell crate; no other workspace
+# member depends on these.
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+clap_complete = "4"
+rustyline = "14"
+dirs = "5"
 
 # Syscalls (mmap/mremap/munmap/fallocate/msync/madvise — used by brain-storage).
 libc = "0.2"

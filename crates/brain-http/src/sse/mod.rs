@@ -48,7 +48,7 @@
 //!
 //! ## Flush discipline
 //!
-//! [`SseStream::poll_frame`] yields exactly one event per frame.
+//! `SseStream::poll_frame` yields exactly one event per frame.
 //! Each frame becomes its own chunked-transfer chunk and gets
 //! flushed. The R3 bug pattern from the design report (framework
 //! buffers multiple events into one chunk) is structurally

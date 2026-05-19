@@ -4,7 +4,7 @@
 //! ([`connect`] / [`ConnectBuilder`]). The HTTP/1.1
 //! `Upgrade: websocket` handshake is handled inside this module; the
 //! frame protocol below the upgrade is driven by
-//! [`tokio-tungstenite`] (~3 kLOC of audited RFC 6455 conformance).
+//! `tokio-tungstenite` (~3 kLOC of audited RFC 6455 conformance).
 //!
 //! ## What we own
 //!

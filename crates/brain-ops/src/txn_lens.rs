@@ -14,7 +14,8 @@ use crate::error::OpError;
 
 /// Build a clone of `ctx.executor` with a snapshot of the txn's
 /// buffer attached. Returns the original executor if `txn_id` is
-/// `None`. Errors with `TxnExpired` if the txn isn't `Active`.
+/// `None`. Errors with `TxnNotFound` if the id was never created,
+/// `TxnExpired` if it existed but is no longer Active.
 pub fn build_executor_with_lens(
     ctx: &OpsContext,
     txn_id: Option<[u8; 16]>,

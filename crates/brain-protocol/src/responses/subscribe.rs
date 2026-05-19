@@ -4,7 +4,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 use super::types::EventType;
 use crate::knowledge::KnowledgeEventPayload;
-use crate::request::{MemoryKindWire, WireContextId, WireMemoryId};
+use crate::request::{MemoryKindWire, WireContextId, WireMemoryId, WireUuid};
 
 /// Spec §03/08 §7 — push event for a subscription.
 ///
@@ -35,6 +35,47 @@ pub struct SubscriptionEvent {
     /// `None` for substrate events; `Some(_)` for knowledge events
     /// (see `spec/28_knowledge_wire_protocol/02_subscribe_events.md`).
     pub knowledge_payload: Option<KnowledgeEventPayload>,
+    /// `Some(_)` when `event_type` is `EdgeAdded`, `EdgeRemoved` or
+    /// `EdgeSuperseded` — Phase C unified-edge change-feed events.
+    /// Substrate LINK / UNLINK, typed-relation create / supersede /
+    /// tombstone all surface here. `None` for every other event.
+    pub edge_payload: Option<EdgeEventPayload>,
+}
+
+/// Side-channel payload carried on an `EdgeAdded` / `EdgeRemoved` /
+/// `EdgeSuperseded` subscription event. The same shape covers
+/// substrate edges and typed knowledge relations — kind discriminator
+/// and optional `relation_id` distinguish them.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub struct EdgeEventPayload {
+    /// `0` = Memory, `1` = Entity — matches the `NodeRef::tag()` byte.
+    pub from_kind: u8,
+    pub from_id: WireUuid,
+    pub to_kind: u8,
+    pub to_id: WireUuid,
+    /// `0` = Builtin substrate kind, `1` = Mentions, `2` = Typed
+    /// relation. Matches `EdgeKindRef` discriminator.
+    pub edge_kind_tag: u8,
+    /// Discriminator-specific payload byte:
+    /// - `Builtin(EdgeKind)` → the substrate `EdgeKind` u8.
+    /// - `Mentions` → 0.
+    /// - `Typed(RelationTypeId)` → low byte; full id in
+    ///   `relation_type_id`.
+    pub edge_kind_byte: u8,
+    /// `Some(_)` for typed-relation events (`Typed(RelationTypeId)`).
+    /// `None` for substrate / mentions edges.
+    pub relation_type_id: Option<u32>,
+    /// Per-edge weight from `EdgeData`. Typed-relation rows write
+    /// `1.0` (sidecar carries `confidence`).
+    pub weight: f32,
+    /// `Some(_)` for typed-relation events — the per-relation
+    /// disambiguator id. `None` for substrate / mentions edges.
+    pub relation_id: Option<WireUuid>,
+    /// Only populated for `EdgeSuperseded` — the prior relation that
+    /// got replaced.
+    pub superseded_relation_id: Option<WireUuid>,
 }
 
 /// Spec §08 §8.

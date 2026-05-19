@@ -287,7 +287,7 @@ let mid = client.encode("Priya likes async meetings").await?;
 let memories = client.recall("Priya preferences").await?;
 ```
 
-When a schema is declared, RECALL goes through the hybrid retriever. Returns the same `Vec<Memory>` shape; metadata fields gain new fields (contributing_retrievers, etc.) but old fields stay.
+RECALL always runs through the hybrid retriever (semantic + lexical + memory-edge graph). The returned `Vec<Memory>` shape is identical in both deployment postures; `contributing_retrievers` and `fused_score` are populated regardless of whether a schema has been declared. Declaring a schema additionally enables typed entity-anchored graph traversal as a contributing path.
 
 ## Error handling
 

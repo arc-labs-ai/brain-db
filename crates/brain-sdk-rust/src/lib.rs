@@ -100,8 +100,8 @@ pub use knowledge::{
 };
 pub use observability::{MetricsSnapshot, OpMetrics};
 pub use ops::{
-    EncodeBuilder, ForgetBuilder, LinkBuilder, PlanBuilder, ReasonBuilder, RecallBuilder,
-    SubscribeBuilder, UnlinkBuilder,
+    EncodeBuilder, ForgetBuilder, LinkBuilder, PlanBuilder, PlanOutcome, ReasonBuilder,
+    RecallBuilder, SubscribeBuilder, UnlinkBuilder,
 };
 pub use pool::{Connection, Pool, PoolConfig, PoolGuard};
 pub use proto::handshake::{ClientIdentity, NegotiatedSession};

@@ -205,6 +205,48 @@ impl WalReader {
         &self.segments
     }
 
+    /// Open a reader positioned at `start_lsn`: drops leading segments
+    /// whose entire LSN range is below `start_lsn`, then filters records
+    /// emitted from the first retained segment so the first record
+    /// yielded has `lsn >= start_lsn`.
+    ///
+    /// Subscribe uses this for the WAL-replay leg of the cutover.
+    pub fn iter_from(
+        dir: impl AsRef<Path>,
+        shard_uuid: [u8; 16],
+        start_lsn: u64,
+    ) -> Result<IterFrom, WalReadError> {
+        let mut reader = Self::open(dir, shard_uuid)?;
+
+        // Drop leading segments whose successor starts at or below
+        // start_lsn — their entire payload is below the cutoff. The
+        // last retained segment is then the one that may contain
+        // start_lsn (or where iteration ends without reaching it).
+        let drop_count = reader
+            .segments
+            .windows(2)
+            .take_while(|w| w[1].starting_lsn <= start_lsn)
+            .count();
+        if drop_count > 0 {
+            reader.segments.drain(..drop_count);
+        }
+
+        // Reset cursor state to point at the first retained segment.
+        reader.current_idx = 0;
+        reader.current = None;
+        reader.expected_next_lsn = reader
+            .segments
+            .first()
+            .map_or(start_lsn, |s| s.starting_lsn);
+        reader.last_decoded_lsn = None;
+        reader.finished = reader.segments.is_empty();
+
+        Ok(IterFrom {
+            inner: reader,
+            start_lsn,
+        })
+    }
+
     /// The LSN of the most recently emitted record, or `None` if the reader
     /// hasn't yielded any records yet (or the WAL is empty).
     #[must_use]
@@ -323,6 +365,28 @@ impl Iterator for WalReader {
 }
 
 impl core::iter::FusedIterator for WalReader {}
+
+/// Iterator returned by [`WalReader::iter_from`]. Yields only records
+/// with `lsn >= start_lsn`, in LSN order. Any decoding error from the
+/// underlying reader propagates unchanged.
+pub struct IterFrom {
+    inner: WalReader,
+    start_lsn: u64,
+}
+
+impl Iterator for IterFrom {
+    type Item = Result<WalRecord, WalReadError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.inner.next()? {
+                Ok(rec) if rec.lsn.raw() < self.start_lsn => continue,
+                other => return Some(other),
+            }
+        }
+    }
+}
+
+impl core::iter::FusedIterator for IterFrom {}
 
 impl core::fmt::Debug for WalReader {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -840,6 +904,68 @@ mod tests {
                 }
             ),
             "got {err:?}"
+        );
+    }
+
+    // ----- iter_from (subscribe replay) --------------------------------
+
+    #[test]
+    fn iter_from_zero_yields_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let recs = (1..=5u64)
+            .map(|i| make_record(i, WalRecordKind::Encode, vec![0xAB; 8]))
+            .collect::<Vec<_>>();
+        write_segment(dir.path(), 0, 1, uuid(1), &recs);
+        let iter = WalReader::iter_from(dir.path(), uuid(1), 0).unwrap();
+        let lsns: Vec<u64> = iter.map(|r| r.unwrap().lsn.raw()).collect();
+        assert_eq!(lsns, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn iter_from_filters_records_below_start_within_single_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let recs = (1..=5u64)
+            .map(|i| make_record(i, WalRecordKind::Encode, vec![0xAB; 8]))
+            .collect::<Vec<_>>();
+        write_segment(dir.path(), 0, 1, uuid(1), &recs);
+        let iter = WalReader::iter_from(dir.path(), uuid(1), 3).unwrap();
+        let lsns: Vec<u64> = iter.map(|r| r.unwrap().lsn.raw()).collect();
+        assert_eq!(lsns, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn iter_from_drops_leading_segments_fully_below_start() {
+        // Two segments: seg 0 carries LSNs 1-3, seg 1 carries LSNs 4-6.
+        // start_lsn=4 must skip seg 0 entirely (no read of those record
+        // bytes) and yield 4..=6 from seg 1.
+        let dir = tempfile::tempdir().unwrap();
+        let recs_a = (1..=3u64)
+            .map(|i| make_record(i, WalRecordKind::Encode, vec![0xAB; 8]))
+            .collect::<Vec<_>>();
+        let recs_b = (4..=6u64)
+            .map(|i| make_record(i, WalRecordKind::Encode, vec![0xAB; 8]))
+            .collect::<Vec<_>>();
+        write_segment(dir.path(), 0, 1, uuid(1), &recs_a);
+        write_segment(dir.path(), 1, 4, uuid(1), &recs_b);
+        let iter = WalReader::iter_from(dir.path(), uuid(1), 4).unwrap();
+        let lsns: Vec<u64> = iter.map(|r| r.unwrap().lsn.raw()).collect();
+        assert_eq!(lsns, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn iter_from_past_tail_yields_nothing() {
+        // start_lsn > all on-disk LSNs: subscribe expects this to be a
+        // no-op replay (caller transitions straight to live).
+        let dir = tempfile::tempdir().unwrap();
+        let recs = (1..=3u64)
+            .map(|i| make_record(i, WalRecordKind::Encode, vec![0xAB; 8]))
+            .collect::<Vec<_>>();
+        write_segment(dir.path(), 0, 1, uuid(1), &recs);
+        let iter = WalReader::iter_from(dir.path(), uuid(1), 100).unwrap();
+        let collected: Vec<_> = iter.collect();
+        assert!(
+            collected.is_empty(),
+            "expected empty replay, got {collected:?}"
         );
     }
 

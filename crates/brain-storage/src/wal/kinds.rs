@@ -186,8 +186,8 @@ mod tests {
     #[test]
     fn from_u8_rejects_reserved_and_unknown() {
         assert_eq!(WalRecordKind::from_u8(0), None); // reserved per spec
-        // Gaps inside the substrate block — none, 1..=15 are all populated.
-        // Gaps inside the knowledge-layer block (entity 0x14..=0x1F, etc.).
+                                                     // Gaps inside the substrate block — none, 1..=15 are all populated.
+                                                     // Gaps inside the knowledge-layer block (entity 0x14..=0x1F, etc.).
         assert_eq!(WalRecordKind::from_u8(0x14), None);
         assert_eq!(WalRecordKind::from_u8(0x23), None);
         assert_eq!(WalRecordKind::from_u8(0x60), None); // beyond 0x50 audit
@@ -203,10 +203,18 @@ mod tests {
         let seen: std::collections::HashSet<u8> = ALL_KINDS.iter().map(|k| k.as_u8()).collect();
         assert_eq!(seen.len(), 27, "15 substrate + 12 knowledge = 27 kinds");
         for v in 1..=15u8 {
-            assert!(seen.contains(&v), "substrate kind {v} missing from ALL_KINDS");
+            assert!(
+                seen.contains(&v),
+                "substrate kind {v} missing from ALL_KINDS"
+            );
         }
-        for v in [0x10, 0x11, 0x12, 0x13, 0x20, 0x21, 0x22, 0x30, 0x31, 0x32, 0x40, 0x50] {
-            assert!(seen.contains(&v), "knowledge kind 0x{v:02X} missing from ALL_KINDS");
+        for v in [
+            0x10, 0x11, 0x12, 0x13, 0x20, 0x21, 0x22, 0x30, 0x31, 0x32, 0x40, 0x50,
+        ] {
+            assert!(
+                seen.contains(&v),
+                "knowledge kind 0x{v:02X} missing from ALL_KINDS"
+            );
         }
     }
 

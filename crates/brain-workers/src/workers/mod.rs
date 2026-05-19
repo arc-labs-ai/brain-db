@@ -3,6 +3,7 @@
 
 pub mod access_boost;
 pub mod audit_log_sweeper;
+pub mod auto_edge;
 pub mod backfill;
 pub mod cache_evict;
 pub mod consolidation;
@@ -10,6 +11,7 @@ pub mod counter_reconcile;
 pub mod decay;
 pub mod edge_scrub;
 pub mod entity_gc;
+pub mod extractor;
 pub mod forget_cascade;
 pub mod hnsw_maint;
 pub mod idempotency_cleanup;

@@ -245,8 +245,11 @@ async fn encode_dispatches_builtin_extractors_and_writes_audit_rows() {
     .await;
     match body {
         ResponseBody::ExtractorList(r) => {
-            let entity_mentions =
-                r.items.iter().find(|i| i.name == "entity_mentions").unwrap();
+            let entity_mentions = r
+                .items
+                .iter()
+                .find(|i| i.name == "entity_mentions")
+                .unwrap();
             assert!(!entity_mentions.enabled);
         }
         _ => unreachable!(),

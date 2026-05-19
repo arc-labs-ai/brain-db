@@ -6,6 +6,7 @@ pub mod agent;
 pub mod audit;
 pub mod config;
 pub mod diagnostics;
+pub mod extract;
 pub mod health;
 pub mod rebuild;
 pub mod shard;

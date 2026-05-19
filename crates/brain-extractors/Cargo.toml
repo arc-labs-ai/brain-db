@@ -13,6 +13,8 @@ brain-protocol = { path = "../brain-protocol" }
 # 20.6: materialize loads `ExtractorDefinition` rows persisted by
 # brain-metadata::schema_apply.
 brain-metadata = { path = "../brain-metadata" }
+# Resolver writes entity rows + indexes inside the caller's redb txn.
+redb = { workspace = true }
 blake3 = { workspace = true }
 thiserror.workspace = true
 tracing.workspace = true
@@ -40,6 +42,23 @@ criterion.workspace = true
 # 21.3: Extractor::run is async; tests block on the future via
 # futures-lite::future::block_on.
 futures-lite.workspace = true
+# E.9: property tests exercise resolver determinism + threshold
+# monotonicity over randomly-generated surface-form sequences.
+proptest = { workspace = true }
+# `live-llm` test drives `AnthropicClient::complete` (a reqwest call
+# spawned inside an async fn) and needs a real reactor. Pulled in as
+# a regular dev-dep so `cargo check --all-targets` without features
+# stays valid; the live test itself is `#[cfg(feature = "live-llm")]`.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[features]
+# Opt-in switch for tests that hit a real LLM provider.
+# Tests under `tests/llm_live.rs` also guard on the matching env
+# var (`ANTHROPIC_API_KEY`) so the suite is a no-op skip when the
+# secret is unavailable. Run with:
+#   cargo test -p brain-extractors --features live-llm \
+#       --test llm_live -- --nocapture
+live-llm = []
 
 [[bench]]
 name = "pattern_extract"
@@ -48,3 +67,8 @@ harness = false
 [[bench]]
 name = "llm_pipeline"
 harness = false
+
+[[test]]
+name = "llm_live"
+path = "tests/llm_live.rs"
+required-features = ["live-llm"]

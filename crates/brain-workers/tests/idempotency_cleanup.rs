@@ -85,6 +85,7 @@ fn seed_entry(metadata: &SharedMetadataDb, byte: u8, created_at_unix_nanos: u64)
             vec![byte, byte ^ 0xAA],
             [byte; 32],
             created_at_unix_nanos,
+            0,
         );
         t.insert(rid(byte), entry).unwrap();
     }

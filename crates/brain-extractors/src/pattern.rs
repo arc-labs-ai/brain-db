@@ -105,8 +105,8 @@ impl PatternExtractor {
     fn project(&self, text: String, start: usize, end: usize) -> Option<ExtractedItem> {
         let id_raw = self.id.raw();
         match &self.target {
-            ExtractorTarget::Entity { entity_type } => Some(ExtractedItem::EntityMention(
-                EntityMention {
+            ExtractorTarget::Entity { entity_type } => {
+                Some(ExtractedItem::EntityMention(EntityMention {
                     entity_type_qname: entity_type.clone(),
                     text,
                     start,
@@ -114,10 +114,10 @@ impl PatternExtractor {
                     confidence: self.confidence,
                     extractor_id: id_raw,
                     extractor_version: self.extractor_version,
-                },
-            )),
-            ExtractorTarget::Statement { kind } => Some(ExtractedItem::StatementMention(
-                StatementMention {
+                }))
+            }
+            ExtractorTarget::Statement { kind } => {
+                Some(ExtractedItem::StatementMention(StatementMention {
                     kind: statement_kind_byte(*kind),
                     subject_text: None,
                     // §22/07 Q6 — predicate qname inference is out of v1 scope.
@@ -126,18 +126,20 @@ impl PatternExtractor {
                     confidence: self.confidence,
                     extractor_id: id_raw,
                     extractor_version: self.extractor_version,
-                },
-            )),
+                }))
+            }
             ExtractorTarget::Relation { .. } => None, // handled by run_for_relation below
-            ExtractorTarget::EntityOrStatement => Some(ExtractedItem::EntityMention(EntityMention {
-                entity_type_qname: String::new(),
-                text,
-                start,
-                end,
-                confidence: self.confidence,
-                extractor_id: id_raw,
-                extractor_version: self.extractor_version,
-            })),
+            ExtractorTarget::EntityOrStatement => {
+                Some(ExtractedItem::EntityMention(EntityMention {
+                    entity_type_qname: String::new(),
+                    text,
+                    start,
+                    end,
+                    confidence: self.confidence,
+                    extractor_id: id_raw,
+                    extractor_version: self.extractor_version,
+                }))
+            }
         }
     }
 }
@@ -159,11 +161,7 @@ impl Extractor for PatternExtractor {
         self.extractor_version
     }
 
-    fn run<'a>(
-        &'a self,
-        ctx: &'a ExtractionContext<'a>,
-        mem: &'a Memory,
-    ) -> ExtractionFuture<'a> {
+    fn run<'a>(&'a self, ctx: &'a ExtractionContext<'a>, mem: &'a Memory) -> ExtractionFuture<'a> {
         Box::pin(async move {
             let start_ns = ctx.now_unix_nanos;
             let mut items: Vec<ExtractedItem> = Vec::new();
@@ -302,10 +300,7 @@ mod tests {
             0.5,
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            ExtractorError::RegexCompile { index: 0, .. }
-        ));
+        assert!(matches!(err, ExtractorError::RegexCompile { index: 0, .. }));
     }
 
     #[test]
@@ -317,10 +312,7 @@ mod tests {
         // canonical "huge alternation" patterns still fit under 1 MiB.
         // The mapping itself is asserted via `compile_error`'s
         // `CompiledTooBig` arm in the runtime path.
-        let mapped = super::compile_error(
-            3,
-            regex::Error::CompiledTooBig(42),
-        );
+        let mapped = super::compile_error(3, regex::Error::CompiledTooBig(42));
         assert!(matches!(
             mapped,
             ExtractorError::ResourceLimit { index: 3, limit }

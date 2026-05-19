@@ -11,12 +11,14 @@
 //! - `spec/26_knowledge_storage/00_purpose.md` — predicate row lives
 //!   in the knowledge storage catalog.
 
+use std::collections::HashSet;
+
 use brain_core::knowledge::{Predicate, StatementKind};
 use brain_core::PredicateId;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
 use crate::tables::knowledge::predicate::{
-    PredicateDefinition, PREDICATES_BY_QNAME_TABLE, PREDICATES_TABLE,
+    PredicateDefinition, SchemaOrigin, PREDICATES_BY_QNAME_TABLE, PREDICATES_TABLE,
 };
 
 // ---------------------------------------------------------------------------
@@ -34,9 +36,7 @@ pub enum PredicateOpError {
     #[error("invalid predicate identifier: {reason}")]
     InvalidIdentifier { reason: &'static str },
 
-    #[error(
-        "predicate {qname:?} already exists with id {existing_id:?} but constraints differ"
-    )]
+    #[error("predicate {qname:?} already exists with id {existing_id:?} but constraints differ")]
     AlreadyExists {
         qname: String,
         existing_id: PredicateId,
@@ -149,6 +149,38 @@ pub fn predicate_lookup_by_qname(
     Ok(row.as_ref().map(PredicateDefinition::to_predicate))
 }
 
+/// Set of `PredicateId`s the active schema version of `namespace`
+/// declares. Used by schema-strict STATEMENT_CREATE / QUERY to
+/// validate incoming predicate qnames without doing per-row lookups.
+///
+/// Includes only rows whose `SchemaOrigin == SchemaDeclared { version }`
+/// — implicit-from-write rows are never reported here even if their
+/// namespace later gains a schema. Schema-strict callers want exactly
+/// the schema's vocabulary, not the vocabulary plus historical
+/// schemaless drift.
+pub fn predicates_active_for_schema(
+    rtxn: &ReadTransaction,
+    namespace: &str,
+    version: u32,
+) -> Result<HashSet<PredicateId>, PredicateOpError> {
+    validate_namespace(namespace)?;
+    let t = rtxn.open_table(PREDICATES_TABLE)?;
+    let mut out = HashSet::new();
+    for entry in t.iter()? {
+        let (_, v) = entry?;
+        let row = v.value();
+        if row.namespace != namespace {
+            continue;
+        }
+        if let SchemaOrigin::SchemaDeclared { version: v_decl } = row.origin() {
+            if v_decl == version {
+                out.insert(PredicateId::from(row.predicate_id));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// List predicates. With `namespace_filter = None`, returns every
 /// registered predicate; with `Some(ns)`, only that namespace's
 /// predicates. O(N) over the primary table; predicate count is small.
@@ -207,29 +239,101 @@ pub fn predicate_intern(
 
     let q = qname(namespace, name);
 
-    // Idempotency probe.
-    {
+    // Idempotency / adoption probe.
+    //
+    // Three cases for a pre-existing row:
+    // 1. Constraints match exactly → idempotent re-registration,
+    //    return existing id.
+    // 2. Row's origin is `ImplicitFromWrite` → adopt it: upgrade
+    //    to `SchemaDeclared` at this schema_version with the new
+    //    constraints. This is the schemaless-to-strict transition
+    //    that lets a deployment add a schema after open-vocabulary
+    //    use without losing data or rewriting predicate ids.
+    // 3. Constraints diverge AND the existing row is schema-
+    //    declared → genuine conflict, error.
+    let probed: Option<(u32, PredicateDefinition)> = {
         let idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
-        let existing_id: Option<u32> = idx.get(q.as_str())?.map(|g| g.value());
-        if let Some(id_raw) = existing_id {
-            let t = wtxn.open_table(PREDICATES_TABLE)?;
-            let row: Option<PredicateDefinition> = t.get(&id_raw)?.map(|g| g.value());
-            let row = row.expect("qname index points to a missing row — file is corrupt");
-
-            let same = row.kind_constraint
-                == crate::tables::knowledge::predicate::encode_kind_constraint(kind_constraint)
-                && row.object_type_constraint_byte == object_type_constraint_byte
-                && row.schema_version == schema_version
-                && row.description == description;
-
-            if same {
-                return Ok(PredicateId::from(id_raw));
+        let id_raw: Option<u32> = idx.get(q.as_str())?.map(|g| g.value());
+        match id_raw {
+            None => None,
+            Some(id_raw) => {
+                let t = wtxn.open_table(PREDICATES_TABLE)?;
+                let row = t
+                    .get(&id_raw)?
+                    .map(|g| g.value())
+                    .expect("qname index points to a missing row — file is corrupt");
+                Some((id_raw, row))
             }
-            return Err(PredicateOpError::AlreadyExists {
-                qname: q,
-                existing_id: PredicateId::from(id_raw),
-            });
         }
+    };
+    if let Some((id_raw, row)) = probed {
+        // Constraint-only equality — version is treated separately so
+        // an unchanged predicate carried into a new schema version is a
+        // no-op rather than a conflict.
+        let constraints_match = row.kind_constraint
+            == crate::tables::knowledge::predicate::encode_kind_constraint(kind_constraint)
+            && row.object_type_constraint_byte == object_type_constraint_byte
+            && row.description == description;
+
+        if constraints_match && row.schema_version == schema_version {
+            return Ok(PredicateId::from(id_raw));
+        }
+
+        // Constraints match but schema_version moved forward: bump the
+        // stored row's version (and the SchemaDeclared origin payload)
+        // in-place so v2 schemas that keep v1's predicates verbatim can
+        // be uploaded cleanly. Same row id is reused so already-written
+        // statements that reference it stay valid.
+        if constraints_match && row.origin().is_schema_declared() {
+            let pred = Predicate {
+                id: PredicateId::from(id_raw),
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                kind_constraint,
+                object_type_constraint_byte,
+                schema_version,
+                description: description.to_string(),
+            };
+            let new_row = PredicateDefinition::from_predicate_with_origin(
+                &pred,
+                now_unix_nanos,
+                SchemaOrigin::SchemaDeclared {
+                    version: schema_version,
+                },
+            );
+            let mut t = wtxn.open_table(PREDICATES_TABLE)?;
+            t.insert(&id_raw, &new_row)?;
+            return Ok(PredicateId::from(id_raw));
+        }
+
+        // Schemaless adoption path: rewrite the row with the new
+        // constraints, preserving the existing id so any in-flight
+        // statements that reference it stay valid.
+        if !row.origin().is_schema_declared() {
+            let pred = Predicate {
+                id: PredicateId::from(id_raw),
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                kind_constraint,
+                object_type_constraint_byte,
+                schema_version,
+                description: description.to_string(),
+            };
+            let new_row = PredicateDefinition::from_predicate_with_origin(
+                &pred,
+                now_unix_nanos,
+                SchemaOrigin::SchemaDeclared {
+                    version: schema_version,
+                },
+            );
+            let mut t = wtxn.open_table(PREDICATES_TABLE)?;
+            t.insert(&id_raw, &new_row)?;
+            return Ok(PredicateId::from(id_raw));
+        }
+        return Err(PredicateOpError::AlreadyExists {
+            qname: q,
+            existing_id: PredicateId::from(id_raw),
+        });
     }
 
     // Fresh registration. Allocate id = max(existing) + 1.
@@ -266,6 +370,88 @@ pub fn predicate_intern(
         idx.insert(q.as_str(), &row.predicate_id)?;
     }
 
+    Ok(PredicateId::from(next_id_raw))
+}
+
+/// Open-vocabulary intern: look up `(namespace, name)` and return its
+/// `PredicateId` if it exists, else allocate a fresh row with
+/// [`SchemaOrigin::ImplicitFromWrite`].
+///
+/// This is the path schemaless STATEMENT_CREATE takes. It always
+/// succeeds (modulo identifier validation + redb errors) — it never
+/// returns `AlreadyExists` for a constraint mismatch the way
+/// [`predicate_intern`] does, because schemaless writers don't carry
+/// kind / object-type constraints in their request shape.
+///
+/// `first_seen_lsn` is captured for operator traceability; pass `0`
+/// from call sites that don't have an LSN handy.
+pub fn predicate_intern_or_get(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+    first_seen_lsn: u64,
+    now_unix_nanos: u64,
+) -> Result<PredicateId, PredicateOpError> {
+    validate_namespace(namespace)?;
+    validate_name(name)?;
+
+    let q = qname(namespace, name);
+
+    // Probe the index first — common-case happy path for repeat
+    // mentions of the same predicate.
+    let existing_id: Option<u32> = {
+        let idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+        let got = idx.get(q.as_str())?.map(|g| g.value());
+        got
+    };
+    if let Some(id_raw) = existing_id {
+        return Ok(PredicateId::from(id_raw));
+    }
+
+    // Fresh allocation. Same `max + 1` scheme as `predicate_intern`
+    // so id ordering stays globally monotone across both write paths.
+    let next_id_raw: u32 = {
+        let t = wtxn.open_table(PREDICATES_TABLE)?;
+        let mut max: u32 = 0;
+        for entry in t.iter()? {
+            let (k, _) = entry?;
+            let id = k.value();
+            if id > max {
+                max = id;
+            }
+        }
+        max.checked_add(1).expect("PredicateId space exhausted")
+    };
+
+    let pred = Predicate {
+        id: PredicateId::from(next_id_raw),
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        // Open-vocabulary writes don't carry constraints — `None`
+        // means "any kind / object type"; the schema validator would
+        // tighten this on a subsequent SCHEMA_UPLOAD.
+        kind_constraint: None,
+        object_type_constraint_byte: 0,
+        // `schema_version = 0` reserves the slot for "not declared
+        // by any schema yet". The origin tag carries the real
+        // provenance via `ImplicitFromWrite`.
+        schema_version: 0,
+        description: String::new(),
+    };
+    let row = PredicateDefinition::from_predicate_with_origin(
+        &pred,
+        now_unix_nanos,
+        SchemaOrigin::ImplicitFromWrite { first_seen_lsn },
+    );
+
+    {
+        let mut t = wtxn.open_table(PREDICATES_TABLE)?;
+        t.insert(&row.predicate_id, &row)?;
+    }
+    {
+        let mut idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+        idx.insert(q.as_str(), &row.predicate_id)?;
+    }
     Ok(PredicateId::from(next_id_raw))
 }
 
@@ -319,12 +505,28 @@ mod tests {
     fn intern_idempotent_returns_same_id() {
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
-        let id1 =
-            predicate_intern(&wtxn, "brain", "is_a", Some(StatementKind::Fact), 1, 1, "x", 0)
-                .unwrap();
-        let id2 =
-            predicate_intern(&wtxn, "brain", "is_a", Some(StatementKind::Fact), 1, 1, "x", 999)
-                .unwrap();
+        let id1 = predicate_intern(
+            &wtxn,
+            "brain",
+            "is_a",
+            Some(StatementKind::Fact),
+            1,
+            1,
+            "x",
+            0,
+        )
+        .unwrap();
+        let id2 = predicate_intern(
+            &wtxn,
+            "brain",
+            "is_a",
+            Some(StatementKind::Fact),
+            1,
+            1,
+            "x",
+            999,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
         assert_eq!(id1, id2);
 
@@ -372,8 +574,17 @@ mod tests {
     fn intern_two_distinct_qnames_get_distinct_ids() {
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
-        let a = predicate_intern(&wtxn, "brain", "is_a", Some(StatementKind::Fact), 0, 1, "", 0)
-            .unwrap();
+        let a = predicate_intern(
+            &wtxn,
+            "brain",
+            "is_a",
+            Some(StatementKind::Fact),
+            0,
+            1,
+            "",
+            0,
+        )
+        .unwrap();
         let b = predicate_intern(&wtxn, "brain", "mentions", None, 0, 1, "", 0).unwrap();
         wtxn.commit().unwrap();
         assert_ne!(a, b);
@@ -481,6 +692,211 @@ mod tests {
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
         let err = predicate_intern(&wtxn, "brain", "is-a", None, 0, 1, "", 0).unwrap_err();
+        matches!(err, PredicateOpError::InvalidIdentifier { .. })
+            .then_some(())
+            .expect("expected InvalidIdentifier");
+    }
+
+    // ----- Open-vocabulary intern path. -----
+
+    #[test]
+    fn predicates_intern_or_get_allocates_then_returns_same_id() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let a = predicate_intern_or_get(&wtxn, "acme", "loves", 0, 0).unwrap();
+        let b = predicate_intern_or_get(&wtxn, "acme", "loves", 0, 0).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(a, b);
+
+        let rtxn = db.begin_read().unwrap();
+        let row = predicate_get(&rtxn, a).unwrap().unwrap();
+        assert_eq!(row.namespace, "acme");
+        assert_eq!(row.name, "loves");
+        // No constraints — open-vocabulary writer doesn't know them.
+        assert_eq!(row.kind_constraint, None);
+        assert_eq!(row.object_type_constraint_byte, 0);
+    }
+
+    #[test]
+    fn predicates_intern_or_get_marks_origin_implicit() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let id = predicate_intern_or_get(&wtxn, "acme", "x", 7, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(PREDICATES_TABLE).unwrap();
+        let row = t.get(&id.raw()).unwrap().unwrap().value();
+        assert_eq!(row.origin_tag, 1);
+        assert_eq!(row.origin_payload, 7);
+    }
+
+    #[test]
+    fn predicates_active_for_schema_excludes_implicit_rows() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        // Schema-declared row at v=2.
+        let declared = predicate_intern(&wtxn, "acme", "in_schema", None, 0, 2, "", 0).unwrap();
+        // Implicit row.
+        let implicit = predicate_intern_or_get(&wtxn, "acme", "implicit", 0, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let active = predicates_active_for_schema(&rtxn, "acme", 2).unwrap();
+        assert!(active.contains(&declared));
+        assert!(!active.contains(&implicit));
+
+        let active_v3 = predicates_active_for_schema(&rtxn, "acme", 3).unwrap();
+        assert!(active_v3.is_empty(), "no rows for unknown schema version");
+    }
+
+    #[test]
+    fn predicates_active_for_schema_distinguishes_implicit_from_declared_after_upgrade() {
+        // After schema-upload adopts an implicit row, that row should
+        // appear in `predicates_active_for_schema` for the new
+        // version. A separate still-implicit predicate must not.
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let adopted = predicate_intern_or_get(&wtxn, "acme", "prefers", 0, 0).unwrap();
+        let _untouched = predicate_intern_or_get(&wtxn, "acme", "other", 0, 0).unwrap();
+        // SCHEMA_UPLOAD path adopts only `prefers`.
+        let adopted2 = predicate_intern(&wtxn, "acme", "prefers", None, 0, 4, "", 0).unwrap();
+        assert_eq!(adopted, adopted2);
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let active = predicates_active_for_schema(&rtxn, "acme", 4).unwrap();
+        assert!(
+            active.contains(&adopted),
+            "adopted predicate must be considered active at the new schema version",
+        );
+        assert_eq!(
+            active.len(),
+            1,
+            "implicit-only predicates must not appear in the active set",
+        );
+    }
+
+    #[test]
+    fn schema_upload_adopts_implicit_predicate_preserving_id() {
+        // Pre-existing implicit row at id=1, no constraints.
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let implicit_id = predicate_intern_or_get(&wtxn, "acme", "prefers", 0, 0).unwrap();
+        // Now run the schema-declared intern path with a tighter
+        // constraint — the registry should adopt the existing row
+        // rather than allocate a fresh id or error.
+        let declared_id = predicate_intern(
+            &wtxn,
+            "acme",
+            "prefers",
+            Some(StatementKind::Preference),
+            2,
+            1,
+            "preferred meeting style",
+            0,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(implicit_id, declared_id);
+
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(PREDICATES_TABLE).unwrap();
+        let row = t.get(&implicit_id.raw()).unwrap().unwrap().value();
+        // Origin must flip to SchemaDeclared(1) and constraints land.
+        assert_eq!(row.origin(), SchemaOrigin::SchemaDeclared { version: 1 });
+        assert_eq!(row.kind_constraint, 2); // Preference
+        assert_eq!(row.object_type_constraint_byte, 2);
+        assert_eq!(row.description, "preferred meeting style");
+    }
+
+    #[test]
+    fn predicate_intern_at_higher_version_with_same_constraints_bumps_version() {
+        // A v2 schema that keeps a v1 predicate verbatim must upload
+        // cleanly: same id, version field bumped, origin payload
+        // updated to v2.
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let v1_id = predicate_intern(
+            &wtxn,
+            "acme",
+            "prefers",
+            Some(StatementKind::Preference),
+            2,
+            1,
+            "preferred meeting style",
+            0,
+        )
+        .unwrap();
+        let v2_id = predicate_intern(
+            &wtxn,
+            "acme",
+            "prefers",
+            Some(StatementKind::Preference),
+            2,
+            2,
+            "preferred meeting style",
+            42,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(v1_id, v2_id, "id must be preserved across version bump");
+
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(PREDICATES_TABLE).unwrap();
+        let row = t.get(&v1_id.raw()).unwrap().unwrap().value();
+        assert_eq!(row.schema_version, 2);
+        assert_eq!(row.origin(), SchemaOrigin::SchemaDeclared { version: 2 });
+        assert_eq!(row.kind_constraint, 2); // Preference
+        assert_eq!(row.object_type_constraint_byte, 2);
+
+        // Only one row exists.
+        let all = predicate_list(&rtxn, Some("acme")).unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn predicate_intern_at_higher_version_with_different_constraints_errors() {
+        // A v2 schema that *changes* a predicate's constraints must
+        // still hit AlreadyExists — version-bump only applies when the
+        // constraint shape is unchanged.
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let _ = predicate_intern(
+            &wtxn,
+            "acme",
+            "prefers",
+            Some(StatementKind::Preference),
+            2,
+            1,
+            "",
+            0,
+        )
+        .unwrap();
+        let err = predicate_intern(
+            &wtxn,
+            "acme",
+            "prefers",
+            Some(StatementKind::Fact), // changed
+            2,
+            2,
+            "",
+            0,
+        )
+        .unwrap_err();
+        match err {
+            PredicateOpError::AlreadyExists { qname, .. } => {
+                assert_eq!(qname, "acme:prefers");
+            }
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn predicates_intern_or_get_validates_identifier() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let err = predicate_intern_or_get(&wtxn, "Bad", "x", 0, 0).unwrap_err();
         matches!(err, PredicateOpError::InvalidIdentifier { .. })
             .then_some(())
             .expect("expected InvalidIdentifier");

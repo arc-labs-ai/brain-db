@@ -353,7 +353,7 @@ budget ~2× the LOC of other sub-tasks.
 
 ## 11. CI/grep guard (post-Phase-9)
 
-Once the port is complete, add to `just verify`:
+Once the port is complete, add to the verify suite (fmt-check + build + clippy + test + check-skills):
 
 ```bash
 # No tokio in shard-bound src/, except brain-server/src/connection.rs and tests.

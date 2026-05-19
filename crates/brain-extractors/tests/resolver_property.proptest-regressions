@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5caa296a3081b340b6d367fc57cd3b410a39dc497e7e7267190e050d1c53234d # shrinks to base = "aaa", extra_spaces = 1, upper_count = 0
+cc 8b82e90beb2e190a081364e10e2fc8cf1a0199b5f3ff0c4ab8c0271a7a9293fa # shrinks to seq = [("  ", "brain:Person")]

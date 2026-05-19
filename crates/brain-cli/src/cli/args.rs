@@ -4,7 +4,14 @@
 
 use anyhow::{anyhow, Result};
 
-pub const DEFAULT_SERVER: &str = "127.0.0.1:9091";
+/// Default admin endpoint — serves `/v1/*` routes. Loopback by
+/// default; matches `server.admin_addr` in `config/dev.toml`.
+pub const DEFAULT_SERVER: &str = "127.0.0.1:9092";
+
+/// Default metrics endpoint — serves `/healthz` + `/metrics`.
+/// Matches `server.metrics_addr` in `config/dev.toml`. Used by the
+/// `health` and `stats` subcommands.
+pub const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9091";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -24,7 +31,12 @@ impl OutputFormat {
 
 #[derive(Debug, Clone)]
 pub struct Args {
+    /// Admin endpoint (`/v1/*` routes). Default `127.0.0.1:9092`.
     pub server: String,
+    /// Metrics endpoint (`/healthz` + `/metrics`). Default
+    /// `127.0.0.1:9091`. Used by the `health` and `stats`
+    /// subcommands.
+    pub metrics_addr: String,
     pub output: OutputFormat,
     pub token: Option<String>,
     pub command: Command,
@@ -79,11 +91,16 @@ pub enum Command {
         shard: usize,
         output_path: Option<String>,
     },
+    /// `extract --backfill --memory-id <id> | --since <ts> | --all`.
+    /// Re-enqueues existing memories for the three-tier extractor
+    /// pipeline (POST `/v1/extract/backfill`).
+    Extract(crate::commands::extract::ExtractAction),
 }
 
 /// Parse a `Vec<String>` (typically `env::args().skip(1).collect()`).
 pub fn parse(argv: Vec<String>) -> Result<Args> {
     let mut server = DEFAULT_SERVER.to_string();
+    let mut metrics_addr = DEFAULT_METRICS_ADDR.to_string();
     let mut output = OutputFormat::Table;
     let mut token: Option<String> = None;
     let mut shard: usize = 0;
@@ -97,6 +114,7 @@ pub fn parse(argv: Vec<String>) -> Result<Args> {
             "--help" | "-h" => {
                 return Ok(Args {
                     server,
+                    metrics_addr,
                     output,
                     token,
                     command: Command::Help,
@@ -105,6 +123,7 @@ pub fn parse(argv: Vec<String>) -> Result<Args> {
             "--version" | "-V" => {
                 return Ok(Args {
                     server,
+                    metrics_addr,
                     output,
                     token,
                     command: Command::Version,
@@ -113,6 +132,10 @@ pub fn parse(argv: Vec<String>) -> Result<Args> {
             "--server" => {
                 i += 1;
                 server = take_value("--server", &argv, i)?.to_string();
+            }
+            "--metrics-addr" => {
+                i += 1;
+                metrics_addr = take_value("--metrics-addr", &argv, i)?.to_string();
             }
             "--output" => {
                 i += 1;
@@ -221,11 +244,16 @@ pub fn parse(argv: Vec<String>) -> Result<Args> {
             shard,
             output_path: family.value.clone(),
         },
+        Some("extract") => {
+            use crate::commands::extract::ExtractAction;
+            Command::Extract(ExtractAction::parse(&positional[1..], &family)?)
+        }
         Some(other) => return Err(anyhow!("unknown subcommand `{other}`")),
     };
 
     Ok(Args {
         server,
+        metrics_addr,
         output,
         token,
         command,
@@ -250,6 +278,7 @@ mod tests {
     fn defaults() {
         let a = parse_str(&["health"]).unwrap();
         assert_eq!(a.server, DEFAULT_SERVER);
+        assert_eq!(a.metrics_addr, DEFAULT_METRICS_ADDR);
         assert_eq!(a.output, OutputFormat::Table);
         assert!(a.token.is_none());
         assert_eq!(a.command, Command::Health);
@@ -259,6 +288,15 @@ mod tests {
     fn server_override() {
         let a = parse_str(&["--server", "foo:7", "health"]).unwrap();
         assert_eq!(a.server, "foo:7");
+        // --server alone leaves the metrics default untouched.
+        assert_eq!(a.metrics_addr, DEFAULT_METRICS_ADDR);
+    }
+
+    #[test]
+    fn metrics_addr_override() {
+        let a = parse_str(&["--metrics-addr", "bar:8", "health"]).unwrap();
+        assert_eq!(a.metrics_addr, "bar:8");
+        assert_eq!(a.server, DEFAULT_SERVER);
     }
 
     #[test]

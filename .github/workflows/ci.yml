@@ -33,19 +33,29 @@ jobs:
       - name: Build (workspace)
         run: cargo build --workspace --all-targets
 
-      - name: Test (workspace)
-        run: cargo test --workspace --all-targets
+      # Sequential link (`-j 1`) — the workspace's release-shaped link
+      # graph OOMs the 7 GB GitHub Actions runner when N test binaries
+      # link in parallel. `--no-fail-fast` so a single crate's red test
+      # doesn't mask regressions in unrelated crates.
+      - name: Test (workspace, sequential link)
+        run: cargo test --workspace --all-targets --no-fail-fast -j 1
 
       - name: Doc tests
         run: cargo test --workspace --doc
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --tests --all-features -- -D warnings
 
       - name: Cargo doc (warnings as errors)
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps
+
+      # Smoke-asserts the shipped binaries link in release mode. Catches
+      # regressions where a debug-only path masks a release-only failure
+      # (LTO / codegen-units=1 / panic=abort interactions).
+      - name: Release build smoke (brain-server, brain-cli)
+        run: cargo build --release --bin brain-server --bin brain-cli
 
   miri:
     name: Miri (storage layer)

@@ -23,6 +23,8 @@
 use brain_core::knowledge::StatementKind;
 use brain_core::{EntityId, PredicateId};
 use brain_index::RankedItemId;
+use brain_metadata::predicate_ops::predicate_lookup_by_qname;
+use brain_metadata::schema_store::schema_active;
 use brain_planner::knowledge::executor::{
     execute, ExecutionError, HybridExecutorContext, QueryMetadata, QueryResult, RetrieverStatus,
 };
@@ -60,13 +62,33 @@ pub const MAX_EXPLICIT_RETRIEVERS: usize = 3;
 // Handlers.
 // ---------------------------------------------------------------------------
 
+/// Outcome of resolving a `Vec<String>` predicate filter against the
+/// registry: either we got the requested PredicateIds (possibly an
+/// empty vector when the schemaless caller named no predicates we
+/// know yet) or we short-circuited with an empty response because at
+/// least one qname is unknown in schemaless mode.
+enum PredicateResolution {
+    Ok(Vec<PredicateId>),
+    EmptyResultSet,
+}
+
 /// Run a full hybrid query: plan + execute, project to wire.
 pub async fn handle_query(
     req: WireQueryRequest,
     ctx: &OpsContext,
 ) -> Result<QueryResponse, OpError> {
     validate_text_length(&req.text)?;
-    let planner_req = wire_to_planner_request(req)?;
+    let predicate_ids = match resolve_predicate_filter(&req.predicate_filter, ctx)? {
+        PredicateResolution::Ok(v) => v,
+        PredicateResolution::EmptyResultSet => {
+            return Ok(QueryResponse {
+                items: Vec::new(),
+                total_latency_ms: 0.0,
+                retriever_outcomes: Vec::new(),
+            });
+        }
+    };
+    let planner_req = wire_to_planner_request(req, predicate_ids)?;
     let qp = plan(&planner_req).map_err(map_plan_error)?;
     let exec_ctx = build_executor_context(ctx)?;
     let result = execute(&qp, &planner_req, &exec_ctx).map_err(map_executor_error)?;
@@ -76,10 +98,17 @@ pub async fn handle_query(
 /// EXPLAIN — plan only, return rendered plan text.
 pub async fn handle_query_explain(
     req: QueryExplainRequest,
-    _ctx: &OpsContext,
+    ctx: &OpsContext,
 ) -> Result<QueryExplainResponse, OpError> {
     validate_text_length(&req.query.text)?;
-    let planner_req = wire_to_planner_request(req.query)?;
+    let predicate_ids = match resolve_predicate_filter(&req.query.predicate_filter, ctx)? {
+        PredicateResolution::Ok(v) => v,
+        // For EXPLAIN we still want to produce a plan even when the
+        // filter would zero out — explain the plan the planner would
+        // build with no predicate constraint applied.
+        PredicateResolution::EmptyResultSet => Vec::new(),
+    };
+    let planner_req = wire_to_planner_request(req.query, predicate_ids)?;
     let qp = plan(&planner_req).map_err(map_plan_error)?;
     Ok(QueryExplainResponse {
         plan_text: render_plan(&qp),
@@ -93,7 +122,18 @@ pub async fn handle_query_trace(
     ctx: &OpsContext,
 ) -> Result<QueryTraceResponse, OpError> {
     validate_text_length(&req.query.text)?;
-    let planner_req = wire_to_planner_request(req.query)?;
+    let predicate_ids = match resolve_predicate_filter(&req.query.predicate_filter, ctx)? {
+        PredicateResolution::Ok(v) => v,
+        PredicateResolution::EmptyResultSet => {
+            return Ok(QueryTraceResponse {
+                trace_text: "PLAN: skipped (predicate filter contains an unknown qname; \
+                             schemaless mode short-circuits to empty result set)"
+                    .into(),
+                total_latency_ms: 0.0,
+            });
+        }
+    };
+    let planner_req = wire_to_planner_request(req.query, predicate_ids)?;
     let qp = plan(&planner_req).map_err(map_plan_error)?;
     let exec_ctx = build_executor_context(ctx)?;
     let result = execute(&qp, &planner_req, &exec_ctx).map_err(map_executor_error)?;
@@ -101,6 +141,57 @@ pub async fn handle_query_trace(
         trace_text: render_trace(&qp, &result.metadata),
         total_latency_ms: result.metadata.total_latency_ms,
     })
+}
+
+/// Resolve a wire `Vec<String>` predicate filter (canonical qnames)
+/// to the planner's `Vec<PredicateId>`. Behavior:
+///
+/// - Empty input → empty output. No DB hit.
+/// - Each qname is validated for `"namespace:name"` shape.
+/// - Unknown qname in schemaless mode → return
+///   [`PredicateResolution::EmptyResultSet`] so the handler can
+///   short-circuit (no matching rows are possible).
+/// - Unknown qname in schema-strict mode → `PredicateNotInSchema`.
+fn resolve_predicate_filter(
+    qnames: &[String],
+    ctx: &OpsContext,
+) -> Result<PredicateResolution, OpError> {
+    if qnames.is_empty() {
+        return Ok(PredicateResolution::Ok(Vec::new()));
+    }
+    let db_guard = ctx.executor.metadata.lock();
+    let rtxn = db_guard
+        .read_txn()
+        .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
+    let mut out = Vec::with_capacity(qnames.len());
+    for q in qnames {
+        if q.is_empty() || !q.contains(':') {
+            return Err(OpError::InvalidRequest(format!(
+                "predicate filter qname {q:?} must be \"namespace:name\""
+            )));
+        }
+        let (ns, name) = q
+            .split_once(':')
+            .ok_or_else(|| OpError::InvalidRequest("predicate qname missing ':'".into()))?;
+        let active_version = schema_active(&rtxn, ns)
+            .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
+        match predicate_lookup_by_qname(&rtxn, ns, name)
+            .map_err(|e| OpError::InvalidRequest(format!("predicate lookup ({q:?}): {e}")))?
+        {
+            Some(p) => out.push(p.id),
+            None => {
+                if let Some(version) = active_version {
+                    return Err(OpError::PredicateNotInSchema {
+                        predicate: q.clone(),
+                        namespace: ns.to_string(),
+                        version,
+                    });
+                }
+                return Ok(PredicateResolution::EmptyResultSet);
+            }
+        }
+    }
+    Ok(PredicateResolution::Ok(out))
 }
 
 /// RECALL_HYBRID — narrow projection over the hybrid path: text → memory ids.
@@ -146,7 +237,10 @@ fn validate_text_length(text: &str) -> Result<(), OpError> {
     Ok(())
 }
 
-fn wire_to_planner_request(req: WireQueryRequest) -> Result<PlannerQueryRequest, OpError> {
+fn wire_to_planner_request(
+    req: WireQueryRequest,
+    predicate_filter: Vec<PredicateId>,
+) -> Result<PlannerQueryRequest, OpError> {
     let text = if req.text.is_empty() {
         None
     } else {
@@ -159,12 +253,6 @@ fn wire_to_planner_request(req: WireQueryRequest) -> Result<PlannerQueryRequest,
         .copied()
         .map(statement_kind_from_byte)
         .collect::<Result<Vec<_>, OpError>>()?;
-    let predicate_filter = req
-        .predicate_filter
-        .iter()
-        .copied()
-        .map(PredicateId::from)
-        .collect();
     let time_filter = req.time_filter.map(time_range_from_wire);
     let retrievers = retriever_selection_from_wire(req.retrievers)?;
     let fusion_config = req.fusion_config.map(fusion_config_from_wire);

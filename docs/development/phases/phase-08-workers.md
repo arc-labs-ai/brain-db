@@ -110,7 +110,7 @@ Implement the 12 background workers: decay, access boost, consolidation, HNSW ma
 ## Phase exit checklist
 
 - [ ] All 13 sub-tasks complete (12 workers + scheduler).
-- [ ] `just verify` green.
+- [ ] Verify suite (fmt-check + build + clippy + test + check-skills) green.
 - [ ] Each worker has a unit test.
 - [ ] Performance regression test green.
 - [ ] Tag `phase-8-complete`.

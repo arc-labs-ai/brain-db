@@ -64,10 +64,10 @@ impl Default for TraversalConfig {
 
 impl TraversalConfig {
     fn clamped_depth(&self) -> u8 {
-        self.max_depth.min(MAX_DEPTH).max(1)
+        self.max_depth.clamp(1, MAX_DEPTH)
     }
     fn clamped_branching(&self) -> u32 {
-        self.max_branching_factor.min(MAX_BRANCHING).max(1)
+        self.max_branching_factor.clamp(1, MAX_BRANCHING)
     }
 }
 
@@ -190,11 +190,8 @@ fn expand(
     direction: TraversalDirection,
     current_only: bool,
 ) -> Result<Vec<Edge>, RelationOpError> {
-    let filter_set: HashSet<u32> =
-        type_filter.iter().map(|t| t.raw()).collect::<HashSet<_>>();
-    let want_type = |t: RelationTypeId| {
-        type_filter.is_empty() || filter_set.contains(&t.raw())
-    };
+    let filter_set: HashSet<u32> = type_filter.iter().map(|t| t.raw()).collect::<HashSet<_>>();
+    let want_type = |t: RelationTypeId| type_filter.is_empty() || filter_set.contains(&t.raw());
 
     let list_filter = RelationListFilter {
         relation_type: None,
@@ -210,8 +207,14 @@ fn expand(
     let mut out: Vec<Edge> = Vec::new();
     let mut seen: HashSet<(RelationId, EntityId)> = HashSet::new();
 
-    let direction_outgoing = matches!(direction, TraversalDirection::Outgoing | TraversalDirection::Both);
-    let direction_incoming = matches!(direction, TraversalDirection::Incoming | TraversalDirection::Both);
+    let direction_outgoing = matches!(
+        direction,
+        TraversalDirection::Outgoing | TraversalDirection::Both
+    );
+    let direction_incoming = matches!(
+        direction,
+        TraversalDirection::Incoming | TraversalDirection::Both
+    );
 
     if direction_outgoing {
         for r in relation_list_from(rtxn, node, &list_filter)? {

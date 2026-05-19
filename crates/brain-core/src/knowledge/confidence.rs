@@ -75,7 +75,8 @@ pub fn aggregate_confidence(
     }
     let mut product: f32 = 1.0;
     for e in evidence {
-        let age_secs = (now_unix_nanos.saturating_sub(e.timestamp_unix_nanos) / 1_000_000_000) as f32;
+        let age_secs =
+            (now_unix_nanos.saturating_sub(e.timestamp_unix_nanos) / 1_000_000_000) as f32;
         let decay = decay_for(kind, age_secs, config);
         let c_i = e.confidence();
         let weighted = (c_i * decay).clamp(0.0, 1.0);

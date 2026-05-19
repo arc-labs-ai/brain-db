@@ -119,7 +119,8 @@ pub async fn handle_schema_upload(
             backward_compatible: true,
         }),
         now,
-    );
+    )
+    .await;
 
     Ok(SchemaUploadResponse {
         namespace,

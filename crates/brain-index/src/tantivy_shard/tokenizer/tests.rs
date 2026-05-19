@@ -69,7 +69,6 @@ fn no_stopword_removal() {
     // All four tokens (stemmed) must be present — no stop-word filter.
     let set: HashSet<_> = out.iter().cloned().collect();
     assert!(set.contains("the"), "stop-word `the` must be preserved");
-    assert!(set.contains("a") || true); // input has no `a`; sanity check that `the` survived.
     assert!(set.contains("quick"));
     assert!(set.contains("brown"));
     assert!(set.contains("fox"));

@@ -106,7 +106,7 @@ The low byte's high bit selects direction within the knowledge namespace, mirror
 
 `QUERY` is the primary structured query opcode. `RECALL_HYBRID` is the simple-text fast path used by clients that just want hybrid text-only retrieval with no entity anchoring.
 
-The simpler `RECALL` opcode (substrate, `0x0021`) is the substrate-level vector recall. When a schema is declared, the server routes `RECALL` through the hybrid retriever transparently — clients see the same response shape with additional metadata fields (`contributing_retrievers`, etc.).
+The simpler `RECALL` opcode (substrate, `0x0021`) is the substrate-level vector recall. Hybrid retrieval (semantic + lexical + memory-edge graph) is the default `RECALL` path; the server runs it regardless of whether a schema has been declared. The response always carries `contributing_retrievers` and `fused_score`. What declaring a schema adds here is typed entity-anchored graph traversal and predicate-vocabulary checking; it does not toggle the retrieval mode.
 
 ## Admin operations (0x0170–0x017F)
 
@@ -159,12 +159,20 @@ Beyond the substrate's error codes (section 03):
 | 0x40 | STATEMENT_NOT_FOUND |
 | 0x41 | STATEMENT_OBJECT_TYPE_MISMATCH |
 | 0x42 | STATEMENT_CONTRADICTS_EXISTING |
-| 0x50 | RELATION_CARDINALITY_VIOLATION |
 | 0x60 | QUERY_TIMEOUT |
 | 0x61 | QUERY_OVER_BUDGET |
 | 0x70 | EXTRACTOR_DISABLED |
 | 0x71 | EXTRACTOR_BUDGET_EXCEEDED |
 | 0x72 | EXTRACTION_FAILED |
+
+Cardinality violations, unknown-qname rejections, and hybrid-capability gaps surface via substrate-wide codes (see [`../03_wire_protocol/10_errors.md`](../03_wire_protocol/10_errors.md)):
+
+| Code | Meaning |
+|---|---|
+| 0x004B | `PredicateNotInSchema` — STATEMENT_CREATE / QUERY named a predicate not in the active schema (strict mode). |
+| 0x004C | `RelationTypeNotInSchema` — RELATION_CREATE / QUERY named a relation type not in the active schema (strict mode). |
+| 0x0065 | `CardinalityViolation` — RELATION_CREATE would violate the declared cardinality of a schema-declared relation type. |
+| 0x0083 | `HybridUnavailable` — `HybridOnly` or knowledge `QUERY` requested but a required retriever component is not currently servable. |
 
 Error responses include human-readable detail in the body. Mapping into the substrate ERROR frame's `ErrorCodeWire` / `ErrorCategoryWire` enums and retry semantics are specified in [`03_errors.md`](./03_errors.md). Per-opcode validation rules and the field caps that produce these errors are in [`04_validation.md`](./04_validation.md).
 

@@ -15,13 +15,13 @@ Operators MAY run Brain on a different port. Clients accept a server-supplied ad
 The server SHOULD set the following TCP options on accepted connections:
 
 - `TCP_NODELAY` — disable Nagle's algorithm. Brain's frames are typically small and latency-sensitive; Nagle's batching adds milliseconds of latency for no benefit.
-- `SO_KEEPALIVE` — enable TCP keepalive at the OS level, with reasonable defaults (typically idle timeout 75s, probe interval 15s, probe count 9). This catches dead peers without application-level pings.
+- `SO_KEEPALIVE` — enable TCP keepalive at the OS level. Recommended server defaults: **idle 75 s, interval 15 s, retries 9** (~210 s detection budget). This catches dead clients without application-level pings; the longer budget reflects that a single server tolerates many concurrent clients and shouldn't probe aggressively across all of them.
 - `SO_REUSEADDR` (server only) — for graceful restart, allowing the server to rebind the listening socket.
 
 Clients SHOULD set:
 
 - `TCP_NODELAY` — same reason.
-- `SO_KEEPALIVE` — to detect server crashes that don't close the connection cleanly.
+- `SO_KEEPALIVE` — to detect server crashes that don't close the connection cleanly. Recommended SDK defaults: **idle 30 s, interval 10 s, retries 3** (~60 s detection budget). Aggressive vs the server side because a client typically tracks one server, so faster probing is cheap; and operators want their next op to fail fast (and trigger transparent reconnect via §13/04 retries) rather than stall on a dead route. On platforms that don't expose the retries socket option (macOS, Windows), idle + interval still apply and the OS default retry count provides a slightly looser bound (~80 s).
 
 ### 1.3 Connection model
 

@@ -78,14 +78,14 @@ This is detailed in `21_schema_dsl/` and `25_provenance_versioning/`.
 
 A user can deploy the knowledge layer and never declare a schema. In this case:
 
-- The substrate behaves exactly in pure substrate mode: ENCODE, RECALL by cosine.
-- The Entity, Statement, and Relation tables exist but are empty.
-- The tantivy index is empty.
-- The query router falls back to single-retriever HNSW.
+- ENCODE, RECALL, and the knowledge opcodes (STATEMENT_CREATE, RELATION_CREATE, QUERY) all accept traffic.
+- The Entity, Statement, and Relation tables populate from writes against an open vocabulary — predicates and relation types are interned on first use with origin `ImplicitFromWrite`.
+- The lexical (tantivy) index and statement HNSW are populated by the extractors as memories arrive.
+- The hybrid query router runs in both modes — it is the default RECALL path for every deployment.
 
-This is the substrate-only mode, used by deployments that only need vector retrieval.
+This is the open-vocabulary mode. It is a first-class deployment posture, not a degraded one.
 
-When the user declares their first schema, extractors begin running on incoming memories. They can optionally trigger a backfill over existing memories. The substrate switches the query router to hybrid mode.
+When the user declares their first schema, extractors gain a typed vocabulary and may optionally trigger a backfill over existing memories. Declaring a schema activates **strict validation** for statements, relations, and predicate filters within that namespace — unknown qnames produce `PredicateNotInSchema` / `RelationTypeNotInSchema`, and declared cardinalities are enforced. It does NOT activate hybrid retrieval; hybrid (semantic + lexical + memory-edge graph) is already the default. What schema adds is typed entity-anchored graph traversal and predicate-vocabulary checking.
 
 ## What gets stored where: summary
 

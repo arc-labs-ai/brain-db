@@ -63,7 +63,8 @@ mod tests {
         let wtxn = db.begin_write().unwrap();
         {
             let mut t = wtxn.open_table(SCHEMA_VERSIONS_TABLE).unwrap();
-            t.insert(&(row.namespace.as_str(), row.version), &row).unwrap();
+            t.insert(&(row.namespace.as_str(), row.version), &row)
+                .unwrap();
         }
         {
             let mut t = wtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE).unwrap();

@@ -24,38 +24,26 @@ pub const ENTITIES_TABLE: TableDefinition<'static, [u8; 16], EntityMetadata> =
     TableDefinition::new("entities");
 
 /// `(entity_type_id, normalized_name)` → `EntityId.to_bytes()`.
-pub const ENTITY_BY_CANONICAL_NAME_TABLE: TableDefinition<
-    'static,
-    (u32, &'static str),
-    [u8; 16],
-> = TableDefinition::new("entity_by_canonical_name");
+pub const ENTITY_BY_CANONICAL_NAME_TABLE: TableDefinition<'static, (u32, &'static str), [u8; 16]> =
+    TableDefinition::new("entity_by_canonical_name");
 
 /// `(entity_type_id, normalized_alias, EntityId.to_bytes())` → `()`.
 /// The EntityId in the key lets one alias map to multiple entities
 /// (ambiguity surfaces to the resolver).
-pub const ENTITY_ALIASES_TABLE: TableDefinition<
-    'static,
-    (u32, &'static str, [u8; 16]),
-    (),
-> = TableDefinition::new("entity_aliases");
+pub const ENTITY_ALIASES_TABLE: TableDefinition<'static, (u32, &'static str, [u8; 16]), ()> =
+    TableDefinition::new("entity_aliases");
 
 /// `(entity_type_id, trigram, EntityId.to_bytes())` → `()`.
 ///
 /// Trigrams are fixed 3-byte windows (pg_trgm-style, byte-level) per
 /// spec §18/02. 15.1 declared this with `&'static str` for the trigram
 /// component; sub-task 16.4 corrected the key shape to `[u8; 3]`.
-pub const ENTITY_TRIGRAMS_TABLE: TableDefinition<
-    'static,
-    (u32, [u8; 3], [u8; 16]),
-    (),
-> = TableDefinition::new("entity_trigrams");
+pub const ENTITY_TRIGRAMS_TABLE: TableDefinition<'static, (u32, [u8; 3], [u8; 16]), ()> =
+    TableDefinition::new("entity_trigrams");
 
 /// `(EntityId.to_bytes(), MemoryId.to_be_bytes())` → [`MentionMetadata`].
-pub const ENTITY_MENTIONS_TABLE: TableDefinition<
-    'static,
-    ([u8; 16], [u8; 16]),
-    MentionMetadata,
-> = TableDefinition::new("entity_mentions");
+pub const ENTITY_MENTIONS_TABLE: TableDefinition<'static, ([u8; 16], [u8; 16]), MentionMetadata> =
+    TableDefinition::new("entity_mentions");
 
 // ---------------------------------------------------------------------------
 // Status flags (sub-task 16.2).
@@ -425,11 +413,7 @@ mod tests {
         let db = fresh_db(&dir);
         let id = EntityId::new();
         let memory = MemoryId::pack(1, 100, 1);
-        let m = MentionMetadata::new(
-            1_700_000_000_000_000_000,
-            mention_context::SUBJECT_OF,
-            0.95,
-        );
+        let m = MentionMetadata::new(1_700_000_000_000_000_000, mention_context::SUBJECT_OF, 0.95);
         let key = (id.to_bytes(), memory.to_be_bytes());
 
         let wtxn = db.begin_write().unwrap();

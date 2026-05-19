@@ -24,8 +24,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Instant;
 
-use brain_core::MemoryId;
-use brain_metadata::tables::edge::{EdgeKey, EDGES_IN_TABLE, EDGES_OUT_TABLE};
+use brain_core::NodeRef;
+use brain_metadata::tables::edge::{EdgeKey, EDGES_REVERSE_TABLE, EDGES_TABLE};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use parking_lot::Mutex;
 use redb::ReadableTable;
@@ -38,10 +38,10 @@ use crate::worker::Worker;
 
 pub struct EdgeScrubWorker {
     config: WorkerConfig,
-    /// Cursor into `EDGES_OUT`. `None` means start of table. Spec
-    /// §11/00 §10: lost on restart, idempotent (already-deleted
-    /// rows are no-ops).
-    out_cursor: Mutex<Option<EdgeKey>>,
+    /// Encoded `EdgeKey` cursor into the unified edge table. `None`
+    /// means start of table; lost on restart, idempotent (already-
+    /// deleted rows are no-ops).
+    out_cursor: Mutex<Option<Vec<u8>>>,
 }
 
 impl EdgeScrubWorker {
@@ -96,7 +96,7 @@ async fn do_scrub_cycle(
     let started = Instant::now();
 
     // ── Phase A: collect orphans from EDGES_OUT above cursor. ────
-    let start_cursor = *worker.out_cursor.lock();
+    let start_cursor = worker.out_cursor.lock().clone();
     let out_orphans = collect_orphans_out(
         &metadata,
         start_cursor,
@@ -114,19 +114,24 @@ async fn do_scrub_cycle(
             .map_err(|e| WorkerError::Ops(format!("scrub out wtxn: {e:?}")))?;
         {
             let mut out = wtxn
-                .open_table(EDGES_OUT_TABLE)
-                .map_err(|e| WorkerError::Ops(format!("open EDGES_OUT: {e:?}")))?;
-            let mut in_t = wtxn
-                .open_table(EDGES_IN_TABLE)
-                .map_err(|e| WorkerError::Ops(format!("open EDGES_IN: {e:?}")))?;
-            for (source, kind, target) in &out_orphans.victims {
-                let s = source.to_be_bytes();
-                let t = target.to_be_bytes();
-                out.remove(&(s, *kind, t))
-                    .map_err(|e| WorkerError::Ops(format!("EDGES_OUT remove: {e:?}")))?;
-                // Mirror in EDGES_IN keyed (target, kind, source).
-                in_t.remove(&(t, *kind, s))
-                    .map_err(|e| WorkerError::Ops(format!("EDGES_IN mirror remove: {e:?}")))?;
+                .open_table(EDGES_TABLE)
+                .map_err(|e| WorkerError::Ops(format!("open EDGES: {e:?}")))?;
+            let mut rev = wtxn
+                .open_table(EDGES_REVERSE_TABLE)
+                .map_err(|e| WorkerError::Ops(format!("open EDGES_REVERSE: {e:?}")))?;
+            for key in &out_orphans.victims {
+                let fwd_bytes = key.encode();
+                let rev_key = EdgeKey {
+                    from: key.to,
+                    kind: key.kind,
+                    to: key.from,
+                    disambiguator: key.disambiguator,
+                };
+                let rev_bytes = rev_key.encode();
+                out.remove(fwd_bytes.as_slice())
+                    .map_err(|e| WorkerError::Ops(format!("EDGES remove: {e:?}")))?;
+                rev.remove(rev_bytes.as_slice())
+                    .map_err(|e| WorkerError::Ops(format!("EDGES_REVERSE mirror remove: {e:?}")))?;
                 total_removed += 1;
             }
         }
@@ -157,20 +162,27 @@ async fn do_scrub_cycle(
                 .write_txn()
                 .map_err(|e| WorkerError::Ops(format!("scrub in wtxn: {e:?}")))?;
             {
-                let mut in_t = wtxn
-                    .open_table(EDGES_IN_TABLE)
-                    .map_err(|e| WorkerError::Ops(format!("open EDGES_IN: {e:?}")))?;
+                let mut rev = wtxn
+                    .open_table(EDGES_REVERSE_TABLE)
+                    .map_err(|e| WorkerError::Ops(format!("open EDGES_REVERSE: {e:?}")))?;
                 let mut out = wtxn
-                    .open_table(EDGES_OUT_TABLE)
-                    .map_err(|e| WorkerError::Ops(format!("open EDGES_OUT: {e:?}")))?;
-                for (target, kind, source) in &in_orphans.victims {
-                    let t = target.to_be_bytes();
-                    let s = source.to_be_bytes();
-                    in_t.remove(&(t, *kind, s))
-                        .map_err(|e| WorkerError::Ops(format!("EDGES_IN remove: {e:?}")))?;
-                    // Mirror in EDGES_OUT keyed (source, kind, target).
-                    out.remove(&(s, *kind, t))
-                        .map_err(|e| WorkerError::Ops(format!("EDGES_OUT mirror remove: {e:?}")))?;
+                    .open_table(EDGES_TABLE)
+                    .map_err(|e| WorkerError::Ops(format!("open EDGES: {e:?}")))?;
+                for key in &in_orphans.victims {
+                    // `key` is keyed from the reverse table perspective
+                    // (from = victim's target, to = victim's source).
+                    let rev_bytes = key.encode();
+                    let fwd_key = EdgeKey {
+                        from: key.to,
+                        kind: key.kind,
+                        to: key.from,
+                        disambiguator: key.disambiguator,
+                    };
+                    let fwd_bytes = fwd_key.encode();
+                    rev.remove(rev_bytes.as_slice())
+                        .map_err(|e| WorkerError::Ops(format!("EDGES_REVERSE remove: {e:?}")))?;
+                    out.remove(fwd_bytes.as_slice())
+                        .map_err(|e| WorkerError::Ops(format!("EDGES mirror remove: {e:?}")))?;
                     total_removed += 1;
                 }
             }
@@ -192,20 +204,22 @@ async fn do_scrub_cycle(
 // ---------------------------------------------------------------------------
 
 struct OutOrphans {
-    /// Tuples (source, kind_byte, target) ready to remove.
-    victims: Vec<(MemoryId, u8, MemoryId)>,
-    last_scanned: Option<EdgeKey>,
+    /// Decoded edge keys (forward perspective) ready to remove.
+    victims: Vec<EdgeKey>,
+    /// Cursor bytes (raw encoded key) where the last scan stopped.
+    last_scanned: Option<Vec<u8>>,
     scanned_to_end: bool,
 }
 
 struct InOrphans {
-    /// Tuples (target, kind_byte, source) — EDGES_IN's natural key.
-    victims: Vec<(MemoryId, u8, MemoryId)>,
+    /// Decoded edge keys (reverse perspective: `from` is the
+    /// reverse-table anchor = forward target).
+    victims: Vec<EdgeKey>,
 }
 
 fn collect_orphans_out(
     metadata: &brain_planner::SharedMetadataDb,
-    start_cursor: Option<EdgeKey>,
+    start_cursor: Option<Vec<u8>>,
     batch_size: usize,
     started: &Instant,
     max_runtime: std::time::Duration,
@@ -215,43 +229,42 @@ fn collect_orphans_out(
         .read_txn()
         .map_err(|e| WorkerError::Ops(format!("scrub out rtxn: {e:?}")))?;
     let out = rtxn
-        .open_table(EDGES_OUT_TABLE)
-        .map_err(|e| WorkerError::Ops(format!("open EDGES_OUT: {e:?}")))?;
+        .open_table(EDGES_TABLE)
+        .map_err(|e| WorkerError::Ops(format!("open EDGES: {e:?}")))?;
     let memories = rtxn
         .open_table(MEMORIES_TABLE)
         .map_err(|e| WorkerError::Ops(format!("open MEMORIES: {e:?}")))?;
 
-    let from_key: EdgeKey = match start_cursor {
-        Some(k) => bump_edge_key(k),
-        None => ([0u8; 16], 0u8, [0u8; 16]),
+    // Cursor strategy: start from the cursor bytes + 0x00 suffix so the
+    // next scan begins strictly after the last row we saw. An empty
+    // cursor starts at the table beginning.
+    let from_bytes: Vec<u8> = match start_cursor.as_ref() {
+        Some(b) => {
+            let mut next = b.clone();
+            next.push(0);
+            next
+        }
+        None => Vec::new(),
     };
 
     let mut victims = Vec::with_capacity(batch_size.min(1024));
-    let mut last_scanned = start_cursor;
+    let mut last_scanned: Option<Vec<u8>> = start_cursor;
     let mut scanned_to_end = true;
     let mut scanned = 0usize;
 
     for entry in out
-        .range(from_key..)
-        .map_err(|e| WorkerError::Ops(format!("EDGES_OUT range: {e:?}")))?
+        .range::<&[u8]>(from_bytes.as_slice()..)
+        .map_err(|e| WorkerError::Ops(format!("EDGES range: {e:?}")))?
     {
-        let (key, _) = entry.map_err(|e| WorkerError::Ops(format!("EDGES_OUT row: {e:?}")))?;
-        let (s, k, t) = key.value();
-        last_scanned = Some((s, k, t));
+        let (key, _) = entry.map_err(|e| WorkerError::Ops(format!("EDGES row: {e:?}")))?;
+        let bytes = key.value().to_vec();
+        let decoded = EdgeKey::decode(&bytes)
+            .map_err(|e| WorkerError::Ops(format!("EDGES key decode: {e:?}")))?;
+        last_scanned = Some(bytes);
         scanned += 1;
 
-        let source = MemoryId::from_be_bytes(s);
-        let target = MemoryId::from_be_bytes(t);
-        let source_alive = memories
-            .get(s)
-            .map_err(|e| WorkerError::Ops(format!("memory get src: {e:?}")))?
-            .is_some();
-        let target_alive = memories
-            .get(t)
-            .map_err(|e| WorkerError::Ops(format!("memory get tgt: {e:?}")))?
-            .is_some();
-        if !source_alive || !target_alive {
-            victims.push((source, k, target));
+        if !endpoints_alive(&memories, decoded.from, decoded.to)? {
+            victims.push(decoded);
         }
 
         if scanned >= batch_size {
@@ -282,8 +295,8 @@ fn collect_orphans_in(
         .read_txn()
         .map_err(|e| WorkerError::Ops(format!("scrub in rtxn: {e:?}")))?;
     let in_t = rtxn
-        .open_table(EDGES_IN_TABLE)
-        .map_err(|e| WorkerError::Ops(format!("open EDGES_IN: {e:?}")))?;
+        .open_table(EDGES_REVERSE_TABLE)
+        .map_err(|e| WorkerError::Ops(format!("open EDGES_REVERSE: {e:?}")))?;
     let memories = rtxn
         .open_table(MEMORIES_TABLE)
         .map_err(|e| WorkerError::Ops(format!("open MEMORIES: {e:?}")))?;
@@ -293,24 +306,15 @@ fn collect_orphans_in(
 
     for entry in in_t
         .iter()
-        .map_err(|e| WorkerError::Ops(format!("EDGES_IN iter: {e:?}")))?
+        .map_err(|e| WorkerError::Ops(format!("EDGES_REVERSE iter: {e:?}")))?
     {
-        let (key, _) = entry.map_err(|e| WorkerError::Ops(format!("EDGES_IN row: {e:?}")))?;
-        let (t, k, s) = key.value();
+        let (key, _) = entry.map_err(|e| WorkerError::Ops(format!("EDGES_REVERSE row: {e:?}")))?;
+        let decoded = EdgeKey::decode(key.value())
+            .map_err(|e| WorkerError::Ops(format!("EDGES_REVERSE key decode: {e:?}")))?;
         scanned += 1;
 
-        let target = MemoryId::from_be_bytes(t);
-        let source = MemoryId::from_be_bytes(s);
-        let source_alive = memories
-            .get(s)
-            .map_err(|e| WorkerError::Ops(format!("memory get src: {e:?}")))?
-            .is_some();
-        let target_alive = memories
-            .get(t)
-            .map_err(|e| WorkerError::Ops(format!("memory get tgt: {e:?}")))?
-            .is_some();
-        if !source_alive || !target_alive {
-            victims.push((target, k, source));
+        if !endpoints_alive(&memories, decoded.from, decoded.to)? {
+            victims.push(decoded);
         }
 
         if scanned >= batch_size {
@@ -324,69 +328,24 @@ fn collect_orphans_in(
     Ok(InOrphans { victims })
 }
 
-/// Big-endian increment on the composite `EdgeKey` so we range
-/// "strictly above" the cursor in the next scan. Saturates at the
-/// max key.
-fn bump_edge_key(key: EdgeKey) -> EdgeKey {
-    let (mut s, mut k, mut t) = key;
-    // Increment t first; if it wraps, bump k; if k wraps, bump s.
-    let mut overflow = true;
-    for i in (0..16).rev() {
-        if !overflow {
-            break;
-        }
-        let (v, o) = t[i].overflowing_add(1);
-        t[i] = v;
-        overflow = o;
-    }
-    if overflow {
-        let (v, o) = k.overflowing_add(1);
-        k = v;
-        overflow = o;
-    }
-    if overflow {
-        let mut over2 = true;
-        for i in (0..16).rev() {
-            if !over2 {
-                break;
+/// Are both endpoints live in `MEMORIES_TABLE`? Non-`Memory` endpoints
+/// (entities) are considered alive — entity liveness is the knowledge
+/// layer's responsibility, not this scrub worker.
+fn endpoints_alive(
+    memories: &redb::ReadOnlyTable<[u8; 16], brain_metadata::tables::memory::MemoryMetadata>,
+    from: NodeRef,
+    to: NodeRef,
+) -> Result<bool, WorkerError> {
+    let alive = |n: NodeRef| -> Result<bool, WorkerError> {
+        match n {
+            NodeRef::Memory(m) => {
+                let row = memories
+                    .get(m.to_be_bytes())
+                    .map_err(|e| WorkerError::Ops(format!("memory get: {e:?}")))?;
+                Ok(row.is_some())
             }
-            let (v, o) = s[i].overflowing_add(1);
-            s[i] = v;
-            over2 = o;
+            NodeRef::Entity(_) => Ok(true),
         }
-        if over2 {
-            // All bits set — return saturated max.
-            return ([0xFFu8; 16], 0xFF, [0xFFu8; 16]);
-        }
-    }
-    (s, k, t)
-}
-
-#[cfg(test)]
-mod unit {
-    use super::*;
-
-    #[test]
-    fn bump_edge_key_increments_target() {
-        let k0 = ([1u8; 16], 0u8, [0u8; 16]);
-        let k1 = bump_edge_key(k0);
-        assert_eq!(k1.0, k0.0);
-        assert_eq!(k1.1, k0.1);
-        assert_eq!(k1.2[15], 1);
-    }
-
-    #[test]
-    fn bump_edge_key_carries_into_kind() {
-        let k0 = ([1u8; 16], 5u8, [0xFFu8; 16]);
-        let k1 = bump_edge_key(k0);
-        assert_eq!(k1.0, k0.0);
-        assert_eq!(k1.1, 6);
-        assert_eq!(k1.2, [0u8; 16]);
-    }
-
-    #[test]
-    fn bump_edge_key_saturates() {
-        let k = bump_edge_key(([0xFFu8; 16], 0xFFu8, [0xFFu8; 16]));
-        assert_eq!(k, ([0xFFu8; 16], 0xFF, [0xFFu8; 16]));
-    }
+    };
+    Ok(alive(from)? && alive(to)?)
 }

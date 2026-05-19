@@ -106,6 +106,15 @@ pub enum ErrorCode {
     TopKOutOfRange,
     BudgetTooLarge,
     BadModelFingerprint,
+    /// Schema-strict mode rejected a STATEMENT_CREATE / QUERY because
+    /// the requested predicate qname is not declared in the namespace's
+    /// active schema version. In schemaless mode this never fires —
+    /// unknown predicates are interned on demand.
+    PredicateNotInSchema,
+    /// Schema-strict mode rejected a RELATION_CREATE because the
+    /// requested relation type qname is not declared. Same shape as
+    /// `PredicateNotInSchema` for the relation registry.
+    RelationTypeNotInSchema,
 
     // §3.5 Not found
     MemoryNotFound,
@@ -120,6 +129,11 @@ pub enum ErrorCode {
     TransactionTimeout,
     StreamIdInUse,
     SubscriptionLsnTooOld,
+    /// A schema-declared relation type's cardinality (OneToOne /
+    /// OneToMany / ManyToOne) is violated by the requested write.
+    /// Implicit relation types never trigger this — they always
+    /// behave as ManyToMany.
+    CardinalityViolation,
 
     // §3.7 Resource exhausted
     OutOfSlots,
@@ -186,7 +200,9 @@ impl ErrorCode {
             | Self::BadStrategyHint
             | Self::TopKOutOfRange
             | Self::BudgetTooLarge
-            | Self::BadModelFingerprint => ErrorCategory::Validation,
+            | Self::BadModelFingerprint
+            | Self::PredicateNotInSchema
+            | Self::RelationTypeNotInSchema => ErrorCategory::Validation,
 
             // §3.5
             Self::MemoryNotFound
@@ -200,7 +216,8 @@ impl ErrorCode {
             | Self::TransactionConflict
             | Self::TransactionTimeout
             | Self::StreamIdInUse
-            | Self::SubscriptionLsnTooOld => ErrorCategory::Conflict,
+            | Self::SubscriptionLsnTooOld
+            | Self::CardinalityViolation => ErrorCategory::Conflict,
 
             // §3.7
             Self::OutOfSlots
