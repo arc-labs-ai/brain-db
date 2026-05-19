@@ -37,6 +37,18 @@ terminal_size = "0.4"
 
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+
+# Output-format support. Explicit versions (not workspace) because today
+# brain-explore is the only crate that consumes them; promoting to workspace
+# can wait until a second crate needs the same surface.
+serde_yaml = "0.9"
+serde_json_path = "0.7"
+
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+# unicode-segmentation lets middle_truncate count user-perceived characters
+# (graphemes) rather than `char`s — emoji like 🦀 and joined sequences stay
+# intact across the truncation boundary.
+unicode-segmentation = "1.12"

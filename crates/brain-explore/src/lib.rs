@@ -9,9 +9,12 @@
 #![forbid(unsafe_code)]
 #![warn(clippy::all)]
 
+pub mod format;
+pub mod table;
 pub mod term;
 pub mod theme;
 pub mod util;
 
+pub use format::{dispatch, OutputFormat, Render, RenderCtx};
 pub use term::policy::TermPolicy;
 pub use theme::{Theme, Token};
