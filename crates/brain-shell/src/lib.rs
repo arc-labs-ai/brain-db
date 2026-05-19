@@ -19,12 +19,14 @@
 //!
 //! - [`parser`]  — clap `Cli` + `Command` + tokeniser.
 //! - [`commands`] — one module per verb, all returning a uniform
-//!   `output::Rendered` envelope.
+//!   boxed renderer for the dispatch loop to format.
 //! - [`connection`] — wrap [`brain_sdk_rust::Client`] with the
 //!   shell's defaults (timeout, retry, agent id).
 //! - [`session`] — REPL state across lines (active txn, sticky
 //!   context, recent ids).
-//! - [`output`] — table + JSON renderers.
+//! - Rendering — handled by the `brain-explore` crate (theme, term,
+//!   table, render). Both brain-shell and brain-cli consume the same
+//!   library so their output stays in lockstep.
 //! - [`repl`] — rustyline editor, completion, event loop.
 //! - [`cli`] — one-shot dispatch.
 
@@ -36,7 +38,6 @@ use std::process::ExitCode;
 pub mod cli;
 pub mod commands;
 pub mod connection;
-pub mod output;
 pub mod parser;
 pub mod repl;
 pub mod session;

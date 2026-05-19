@@ -4,8 +4,9 @@ use brain_core::knowledge::{StatementObject, SubjectRef};
 use brain_sdk_rust::{Client, ClientError, StatementHandle};
 use uuid::Uuid;
 
+use brain_explore::AdHocTable;
+
 use crate::commands::Rendered;
-use crate::output::table::AdHocTable;
 use crate::parser::StatementListArgs;
 use crate::session::Session;
 

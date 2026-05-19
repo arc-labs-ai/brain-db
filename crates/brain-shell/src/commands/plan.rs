@@ -3,9 +3,9 @@
 use brain_protocol::request::{PlanBudget, PlanState};
 use brain_sdk_rust::{Client, ClientError};
 
-use crate::output::table::PlanSteps;
 use crate::parser::PlanArgs;
 use crate::session::Session;
+use brain_explore::PlanSteps;
 
 use super::Rendered;
 

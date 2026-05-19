@@ -120,6 +120,40 @@ impl OutputFormatArg {
     }
 }
 
+impl From<OutputFormatArg> for brain_explore::OutputFormat {
+    fn from(value: OutputFormatArg) -> Self {
+        match value {
+            OutputFormatArg::Auto => Self::Auto,
+            OutputFormatArg::Table => Self::Table,
+            OutputFormatArg::Wide => Self::Wide,
+            OutputFormatArg::Json => Self::Json,
+            OutputFormatArg::Ndjson => Self::Ndjson,
+            OutputFormatArg::Yaml => Self::Yaml,
+            OutputFormatArg::JsonPath(expr) => Self::JsonPath(expr),
+        }
+    }
+}
+
+impl From<ColorMode> for brain_explore::term::ColorMode {
+    fn from(value: ColorMode) -> Self {
+        match value {
+            ColorMode::Auto => Self::Auto,
+            ColorMode::Always => Self::Always,
+            ColorMode::Never => Self::Never,
+        }
+    }
+}
+
+impl From<HyperlinkMode> for brain_explore::term::HyperlinkMode {
+    fn from(value: HyperlinkMode) -> Self {
+        match value {
+            HyperlinkMode::Auto => Self::Auto,
+            HyperlinkMode::Always => Self::Always,
+            HyperlinkMode::Never => Self::Never,
+        }
+    }
+}
+
 /// `--color={auto,always,never}` global flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ColorMode {

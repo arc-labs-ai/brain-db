@@ -1,15 +1,13 @@
 //! `statement show <id>` — single-card view (evidence + chain).
 
 use brain_core::knowledge::{StatementObject, SubjectRef};
+use brain_explore::{ObjectRef, StatementCard};
 use brain_sdk_rust::{Client, ClientError, StatementId};
-use std::io::{self, Write};
 use uuid::Uuid;
 
 use crate::commands::Rendered;
-use crate::output::Render;
 use crate::parser::StatementShowArgs;
 use crate::session::Session;
-use serde_json::{json, Value};
 
 pub async fn run(
     client: &Client,
@@ -28,50 +26,32 @@ pub async fn run(
             )))
         }
     };
-    Ok(Box::new(StatementCard(handle)))
-}
 
-struct StatementCard(brain_sdk_rust::StatementHandle);
-
-impl Render for StatementCard {
-    fn render_table(&self, w: &mut dyn Write) -> io::Result<()> {
-        let h = &self.0;
-        writeln!(w, "Statement {}", h.id.0)?;
-        writeln!(w, "  kind        = {:?}", h.kind)?;
-        let subj = match h.subject {
-            SubjectRef::Entity(id) => format!("entity {}", id.0),
-            SubjectRef::Pending(audit) => format!("pending audit {}", audit.0),
-        };
-        writeln!(w, "  subject     = {subj}")?;
-        writeln!(w, "  predicate   = {}", h.predicate)?;
-        let obj = match &h.object {
-            StatementObject::Entity(id) => format!("entity {}", id.0),
-            StatementObject::Value(v) => format!("value {v:?}"),
-            StatementObject::Memory(m) => format!("memory 0x{:032x}", m.raw()),
-            StatementObject::Statement(s) => format!("statement {}", s.0),
-        };
-        writeln!(w, "  object      = {obj}")?;
-        writeln!(w, "  confidence  = {:.4}", h.confidence)?;
-        writeln!(w, "  evidence    = {:?}", h.evidence)?;
-        writeln!(w, "  version     = {}", h.version)?;
-        if h.tombstoned {
-            writeln!(w, "  TOMBSTONED  reason={:?}", h.tombstone_reason)?;
-        }
-        if let Some(s) = h.superseded_by {
-            writeln!(w, "  superseded_by = {}", s.0)?;
-        }
-        Ok(())
-    }
-
-    fn to_json_value(&self) -> Value {
-        let h = &self.0;
-        json!({
-            "id": h.id.0.to_string(),
-            "kind": format!("{:?}", h.kind),
-            "predicate": h.predicate,
-            "confidence": h.confidence,
-            "version": h.version,
-            "tombstoned": h.tombstoned,
-        })
-    }
+    // Map the SDK handle to brain-explore's card. The handle carries
+    // ids; canonical names need a follow-up lookup the shell doesn't
+    // do today, so we surface the id strings for subject and entity
+    // objects.
+    let subject_canonical = match handle.subject {
+        SubjectRef::Entity(id) => id.0.to_string(),
+        SubjectRef::Pending(audit) => format!("pending({})", audit.0),
+    };
+    let object = match &handle.object {
+        StatementObject::Entity(id) => ObjectRef::Entity {
+            id: id.0.to_string(),
+            name: id.0.to_string(),
+        },
+        StatementObject::Value(v) => ObjectRef::Literal(format!("{v:?}")),
+        StatementObject::Memory(m) => ObjectRef::Literal(format!("memory 0x{:032x}", m.raw())),
+        StatementObject::Statement(s) => ObjectRef::Literal(format!("statement {}", s.0)),
+    };
+    let card = StatementCard {
+        id: handle.id.0.to_string(),
+        kind: format!("{:?}", handle.kind),
+        subject_canonical,
+        predicate_qname: handle.predicate.clone(),
+        object,
+        confidence: handle.confidence,
+        evidence_memories: Vec::new(),
+    };
+    Ok(Box::new(card))
 }

@@ -10,10 +10,10 @@ use rustyline::error::ReadlineError;
 use crate::cli::agent_id::AgentIdSource;
 use crate::cli::config::Config;
 use crate::commands;
+use crate::commands::render_ctx;
 use crate::connection;
-use crate::output::{write_rendered, OutputFormatArg};
 use crate::parser::tokenize::tokenize_line;
-use crate::parser::{format_txn_id, parse_server, Cli, Command, TxnCommand};
+use crate::parser::{format_txn_id, parse_server, Cli, Command, OutputFormatArg, TxnCommand};
 use crate::repl::editor;
 use crate::repl::help;
 use crate::session::Session;
@@ -103,7 +103,7 @@ pub async fn run(
 async fn run_one(client: &Client, session: &mut Session, cmd: Command) {
     let started = Instant::now();
     let inherited_active_txn = inherits_active_txn(&cmd);
-    let result: Result<(String, Box<dyn crate::output::Render>), ClientError> = match cmd {
+    let result: Result<(String, Box<dyn brain_explore::Render>), ClientError> = match cmd {
         Command::Encode(a) => commands::encode::run(client, session, a)
             .await
             .map(|r| ("encode".to_string(), r)),
@@ -185,16 +185,27 @@ async fn run_one(client: &Client, session: &mut Session, cmd: Command) {
     };
 
     match result {
-        Ok((op, body)) => {
+        Ok((_op, body)) => {
             let mut stdout = std::io::stdout();
-            if let Err(e) = write_rendered(
-                &mut stdout,
-                &op,
-                body.as_ref(),
+            // REPL doesn't carry per-line clap flags, so we route the
+            // session-resolved output format through the default
+            // color / hyperlink policy (Auto: honors NO_COLOR / isatty).
+            let ctx = render_ctx(
                 session.output.clone(),
-                elapsed_ms,
-            ) {
+                crate::parser::ColorMode::Auto,
+                crate::parser::HyperlinkMode::Auto,
+            );
+            if let Err(e) = brain_explore::dispatch(body.as_ref(), &ctx, &mut stdout) {
                 eprintln!("output error: {e}");
+            }
+            if let Some(ms) = elapsed_ms {
+                if matches!(
+                    session.output,
+                    OutputFormatArg::Auto | OutputFormatArg::Table | OutputFormatArg::Wide
+                ) {
+                    use std::io::Write as _;
+                    let _ = writeln!(stdout, "({ms} ms)");
+                }
             }
         }
         Err(e) => {

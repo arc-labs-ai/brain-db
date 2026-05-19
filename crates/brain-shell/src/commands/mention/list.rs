@@ -7,8 +7,9 @@
 
 use brain_sdk_rust::{Client, ClientError};
 
+use brain_explore::AdHocTable;
+
 use crate::commands::Rendered;
-use crate::output::table::AdHocTable;
 use crate::parser::MentionListArgs;
 use crate::session::Session;
 

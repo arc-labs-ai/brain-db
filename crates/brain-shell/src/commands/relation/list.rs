@@ -3,8 +3,9 @@
 use brain_sdk_rust::{Client, ClientError, EntityId, RelationHandle};
 use uuid::Uuid;
 
+use brain_explore::AdHocTable;
+
 use crate::commands::Rendered;
-use crate::output::table::AdHocTable;
 use crate::parser::RelationListArgs;
 use crate::session::Session;
 

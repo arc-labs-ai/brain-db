@@ -1,4 +1,4 @@
-//! `entity neighbors <id> [--depth N]` — termtree neighborhood.
+//! `entity neighbors <id> [--depth N]` — tree-shaped neighborhood.
 //!
 //! Walks outgoing relations from the root entity to `depth`. The base
 //! relation-traversal wire op (`RelationTraverseReq`) exists; binding
@@ -9,8 +9,9 @@
 use brain_sdk_rust::{Client, ClientError, Person};
 use uuid::Uuid;
 
+use brain_explore::{GraphNode, GraphTree};
+
 use crate::commands::Rendered;
-use crate::output::render::graph_tree::{GraphNode, GraphTree};
 use crate::parser::EntityNeighborsArgs;
 use crate::session::Session;
 

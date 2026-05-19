@@ -1,5 +1,6 @@
 //! `link` verb.
 
+use brain_explore::LinkRendered;
 use brain_sdk_rust::{Client, ClientError};
 
 use crate::parser::{parse_txn_id, LinkArgs};
@@ -24,5 +25,5 @@ pub async fn run(
         b = b.txn(t);
     }
     let resp = b.send().await?;
-    Ok(Box::new(resp))
+    Ok(Box::new(LinkRendered(resp)))
 }

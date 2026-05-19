@@ -10,8 +10,8 @@
 use brain_core::MemoryId;
 use brain_sdk_rust::{Client, ClientError};
 
-use crate::output::render::recall_with_graph::{GraphEnrichment, RecallWithGraph};
-use crate::output::table::RecallResults;
+use brain_explore::{GraphEnrichment, RecallResults, RecallWithGraph};
+
 use crate::parser::{parse_txn_id, RecallArgs};
 use crate::session::Session;
 

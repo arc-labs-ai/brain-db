@@ -9,9 +9,11 @@ use clap::{CommandFactory, Parser};
 use crate::cli::agent_id;
 use crate::cli::config::{Config, MigrationNote};
 use crate::commands;
+use crate::commands::render_ctx;
 use crate::connection;
-use crate::output::{write_rendered, OutputFormatArg};
-use crate::parser::{parse_server, AgentCommand, Cli, Command, ConfigCommand, TxnCommand};
+use crate::parser::{
+    parse_server, AgentCommand, Cli, Command, ConfigCommand, OutputFormatArg, TxnCommand,
+};
 use crate::repl;
 use crate::session::Session;
 
@@ -140,7 +142,7 @@ pub async fn dispatch_argv(argv: Vec<String>) -> ExitCode {
     let cmd = cli.subcommand.expect("invariant: is_repl handled above");
 
     let started = Instant::now();
-    let res: Result<(String, Box<dyn crate::output::Render>), brain_sdk_rust::ClientError> =
+    let res: Result<(String, Box<dyn brain_explore::Render>), brain_sdk_rust::ClientError> =
         match cmd {
             Command::Encode(a) => commands::encode::run(&client, &mut session, a)
                 .await
@@ -221,17 +223,27 @@ pub async fn dispatch_argv(argv: Vec<String>) -> ExitCode {
     };
 
     match res {
-        Ok((op, body)) => {
+        Ok((_op, body)) => {
             let mut stdout = std::io::stdout();
-            if let Err(e) = write_rendered(
-                &mut stdout,
-                &op,
-                body.as_ref(),
+            let ctx = render_ctx(
                 session.output.clone(),
-                elapsed_ms,
-            ) {
+                cli.global.color,
+                cli.global.hyperlinks,
+            );
+            if let Err(e) = brain_explore::dispatch(body.as_ref(), &ctx, &mut stdout) {
                 eprintln!("output error: {e}");
                 return ExitCode::from(1);
+            }
+            // Per-op timing footer — only meaningful for human formats; the
+            // structured outputs would break under a stray trailer line.
+            if let Some(ms) = elapsed_ms {
+                if matches!(
+                    session.output,
+                    OutputFormatArg::Auto | OutputFormatArg::Table | OutputFormatArg::Wide
+                ) {
+                    use std::io::Write as _;
+                    let _ = writeln!(stdout, "({ms} ms)");
+                }
             }
             ExitCode::SUCCESS
         }

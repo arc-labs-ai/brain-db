@@ -3,9 +3,9 @@
 use brain_protocol::request::ObservationInput;
 use brain_sdk_rust::{Client, ClientError};
 
-use crate::output::table::ReasonSteps;
 use crate::parser::ReasonArgs;
 use crate::session::Session;
+use brain_explore::ReasonSteps;
 
 use super::Rendered;
 

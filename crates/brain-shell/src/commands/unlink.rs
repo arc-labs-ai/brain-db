@@ -1,5 +1,6 @@
 //! `unlink` verb.
 
+use brain_explore::UnlinkRendered;
 use brain_sdk_rust::{Client, ClientError};
 
 use crate::parser::{parse_txn_id, UnlinkArgs};
@@ -22,5 +23,5 @@ pub async fn run(
         b = b.txn(t);
     }
     let resp = b.send().await?;
-    Ok(Box::new(resp))
+    Ok(Box::new(UnlinkRendered(resp)))
 }

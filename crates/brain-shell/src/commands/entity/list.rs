@@ -10,8 +10,9 @@
 
 use brain_sdk_rust::{Client, ClientError, Person};
 
+use brain_explore::AdHocTable;
+
 use crate::commands::Rendered;
-use crate::output::table::AdHocTable;
 use crate::parser::EntityListArgs;
 use crate::session::Session;
 

@@ -20,6 +20,11 @@ brain-core = { path = "../brain-core" }
 brain-protocol = { path = "../brain-protocol" }
 brain-sdk-rust = { path = "../brain-sdk-rust" }
 
+# Rendering primitives + user-domain renderers. default-features = false
+# skips the ratatui-full TUI deps; the shell only consumes the library
+# surface (theme, term, table, render).
+brain-explore = { path = "../brain-explore", default-features = false }
+
 # CLI / REPL stack — see workspace Cargo.toml for the rationale.
 clap = { workspace = true }
 clap_complete = { workspace = true }
@@ -39,18 +44,6 @@ toml = { workspace = true }
 tempfile = { workspace = true }
 time = { workspace = true }
 futures-lite = { workspace = true }
-
-# Terminal rendering. Comfy_table handles per-cell wrap, multi-line
-# cells, terminal-width auto-fit, color, alignment, borders.
-# terminal_size detects width when $COLUMNS is unset; owo_colors emits
-# ANSI sequences with a build-time opt-out. termtree renders ASCII
-# trees for entity neighborhoods. supports_hyperlinks gates OSC 8
-# emission so unsupported terminals never see the escape codes.
-comfy-table = "7"
-terminal_size = "0.4"
-owo-colors = "4"
-termtree = "0.5"
-supports-hyperlinks = "3"
 
 [dev-dependencies]
 tempfile = { workspace = true }

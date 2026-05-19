@@ -2,7 +2,7 @@
 //!
 //! - `subscribe --collect <N>` — batch wait. Returns after N events
 //!   have arrived. The collected list is rendered by
-//!   [`SubscriptionEvents`]. Useful in tests + scripts.
+//!   [`SubscriptionEventList`]. Useful in tests + scripts.
 //! - `subscribe` (no `--collect`) — real-time stream. Events render
 //!   one at a time as they arrive; the loop exits on Ctrl-C or
 //!   SIGTERM, sending `UnsubscribeRequest` to the server first so
@@ -16,14 +16,16 @@
 
 use std::io::{self, Write};
 
+use brain_explore::{
+    dispatch, Render, RenderCtx, SubscriptionEventList, SubscriptionEventRendered,
+};
 use brain_protocol::response::SubscriptionEvent;
 use brain_sdk_rust::{Client, ClientError};
 use futures_lite::StreamExt;
 use serde_json::Value;
 
-use crate::output::table::SubscriptionEvents;
-use crate::output::{OutputFormatArg, Render};
-use crate::parser::SubscribeArgs;
+use crate::commands::render_ctx;
+use crate::parser::{OutputFormatArg, SubscribeArgs};
 use crate::session::Session;
 
 use super::Rendered;
@@ -62,10 +64,13 @@ pub async fn run(
             // guard failed if EOS wasn't observed, so even an early
             // server-side close won't poison the pool.
             let events = b.collect(n).await?;
-            Ok(Box::new(SubscriptionEvents(events)))
+            Ok(Box::new(SubscriptionEventList(events)))
         }
         None => {
-            stream_until_signal(client, b, &session.output).await?;
+            // The streaming path renders events as they arrive — by
+            // the time we return there's nothing left to dispatch. The
+            // sentinel below makes the outer dispatch loop a no-op.
+            stream_until_signal(client, b, session).await?;
             Ok(Box::new(AlreadyRendered))
         }
     }
@@ -77,15 +82,34 @@ pub async fn run(
 async fn stream_until_signal(
     client: &Client,
     builder: brain_sdk_rust::SubscribeBuilder<'_>,
-    output: &OutputFormatArg,
+    session: &Session,
 ) -> Result<(), ClientError> {
     let mut stream = builder.send_stream().await?;
     let stream_id = stream.stream_id();
 
-    if is_human_output(output) {
+    let output = session.output.clone();
+    if is_human_output(&output) {
         let _ = writeln!(io::stderr(), "subscribed — Ctrl-C to stop");
         let _ = io::stderr().flush();
     }
+
+    // Build the render context once. The streaming loop reuses it for
+    // every event so OSC 8 / NO_COLOR / width handling stays consistent.
+    // Force ndjson when the user picked JSON / NDJSON / YAML — pretty
+    // JSON or YAML buffer poorly across event boundaries; ndjson is
+    // the right shape for any structured stream.
+    let stream_format = match output.clone() {
+        OutputFormatArg::Json | OutputFormatArg::Ndjson | OutputFormatArg::Yaml => {
+            OutputFormatArg::Ndjson
+        }
+        OutputFormatArg::JsonPath(_) => OutputFormatArg::Ndjson,
+        other => other,
+    };
+    let ctx = render_ctx(
+        stream_format,
+        crate::parser::ColorMode::Auto,
+        crate::parser::HyperlinkMode::Auto,
+    );
 
     // Persistent signal receivers — installed ONCE outside the
     // loop. Using `tokio::signal::ctrl_c()` per-iteration drops
@@ -115,8 +139,7 @@ async fn stream_until_signal(
             }
             ev = stream.next() => match ev {
                 Some(Ok(event)) => {
-                    if let Err(e) = render_stream_event(&event, output) {
-                        // (output is borrowed for the whole loop; no clone needed.)
+                    if let Err(e) = render_stream_event(&event, &ctx) {
                         // stdout closed (broken pipe): exit quietly.
                         if e.kind() == io::ErrorKind::BrokenPipe {
                             break;
@@ -141,7 +164,7 @@ async fn stream_until_signal(
     // server-side cleanup below can take a moment (unsubscribe RPC
     // + drop of in-flight frames), and the worst UX is staring at
     // a dead prompt wondering whether Ctrl-C was registered.
-    if signalled && is_human_output(output) {
+    if signalled && is_human_output(&output) {
         let _ = writeln!(io::stderr(), "\nclosing stream…");
         let _ = io::stderr().flush();
     }
@@ -169,7 +192,7 @@ async fn stream_until_signal(
     // failed unless EOS was observed — prevents pool poisoning.
     drop(stream);
 
-    if is_human_output(output) {
+    if is_human_output(&output) {
         let footer = if server_closed {
             format!("(stream closed by server; {count} events)")
         } else if stream_err.is_some() {
@@ -189,64 +212,26 @@ async fn stream_until_signal(
 
 /// One event → one line on stdout, flushed.
 ///
-/// `Auto` is treated as table when the stream is interactive (the
-/// caller has already filtered for that). `Wide` reuses the table
-/// format. Ndjson / json / yaml / jsonpath emit one JSON envelope per
-/// event so downstream `jq` keeps streaming-decoding.
-fn render_stream_event(ev: &SubscriptionEvent, output: &OutputFormatArg) -> io::Result<()> {
+/// Goes through brain-explore's dispatch so streamed events get the
+/// same color / OSC 8 / format matrix as one-shot output. NDJSON is
+/// the right shape across event boundaries (the caller has already
+/// normalised JSON / YAML into NDJSON before calling here).
+fn render_stream_event(ev: &SubscriptionEvent, ctx: &RenderCtx) -> io::Result<()> {
     let mut out = io::stdout().lock();
-    let json_body = || {
-        serde_json::json!({
-            "op": "subscribe_event",
-            "result": {
-                "lsn": ev.lsn,
-                "event_type": format!("{:?}", ev.event_type),
-                "memory_id": format!("0x{:032x}", ev.memory_id),
-                "context_id": ev.context_id,
-                "kind": format!("{:?}", ev.kind),
-                "salience": ev.salience,
-                "timestamp_unix_nanos": ev.timestamp_unix_nanos,
-                "text": ev.text,
-            },
-        })
-    };
-    match output {
-        OutputFormatArg::Auto | OutputFormatArg::Table | OutputFormatArg::Wide => {
-            writeln!(
-                out,
-                "{:>6}  {:<19}  0x{:032x}  ctx={:<3}  {:<12}  {}",
-                ev.lsn,
-                format!("{:?}", ev.event_type),
-                ev.memory_id,
-                ev.context_id,
-                format!("{:?}", ev.kind),
-                ev.text,
-            )?;
-        }
-        OutputFormatArg::Json | OutputFormatArg::Ndjson | OutputFormatArg::Yaml => {
-            // For streaming output ndjson is the right shape regardless
-            // of which JSON family the user asked for — yaml and pretty
-            // json would buffer poorly across event boundaries.
-            writeln!(out, "{}", json_body())?;
-        }
-        OutputFormatArg::JsonPath(_) => {
-            // jsonpath over a stream emits the matched value per event;
-            // since the event shape is fixed, surface the whole event.
-            writeln!(out, "{}", json_body())?;
-        }
-    }
+    let item = SubscriptionEventRendered(ev.clone());
+    dispatch(&item, ctx, &mut out)?;
     out.flush()
 }
 
 /// Sentinel returned by the streaming path so the dispatch layer's
-/// `write_rendered` is a no-op (the events were already printed).
+/// outer `dispatch()` call is a no-op (the events were already printed).
 struct AlreadyRendered;
 
 impl Render for AlreadyRendered {
-    fn render_table(&self, _w: &mut dyn Write) -> io::Result<()> {
+    fn render_table(&self, _ctx: &RenderCtx, _w: &mut dyn Write) -> io::Result<()> {
         Ok(())
     }
-    fn to_json_value(&self) -> Value {
+    fn render_json(&self, _ctx: &RenderCtx) -> Value {
         Value::Null
     }
 }

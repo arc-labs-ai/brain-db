@@ -1,5 +1,6 @@
 //! `txn begin` / `txn commit` / `txn abort`.
 
+use brain_explore::{TxnAbortRendered, TxnBeginRendered, TxnCommitRendered};
 use brain_sdk_rust::{Client, ClientError};
 
 use crate::parser::{parse_txn_id, TxnCommand};
@@ -16,21 +17,21 @@ pub async fn run(
         TxnCommand::Begin => {
             let resp = client.txn_begin().await?;
             session.active_txn = Some(resp.txn_id);
-            Ok(Box::new(resp))
+            Ok(Box::new(TxnBeginRendered(resp)))
         }
         TxnCommand::Commit { id } => {
             let bytes = parse_txn_id(&id).map_err(ClientError::Internal)?;
             let result = client.txn_commit(bytes).await;
             clear_if_matches(session, bytes, &result);
             let resp = result?;
-            Ok(Box::new(resp))
+            Ok(Box::new(TxnCommitRendered(resp)))
         }
         TxnCommand::Abort { id } => {
             let bytes = parse_txn_id(&id).map_err(ClientError::Internal)?;
             let result = client.txn_abort(bytes).await;
             clear_if_matches(session, bytes, &result);
             let resp = result?;
-            Ok(Box::new(resp))
+            Ok(Box::new(TxnAbortRendered(resp)))
         }
     }
 }

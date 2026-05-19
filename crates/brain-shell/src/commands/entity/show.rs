@@ -8,8 +8,9 @@
 use brain_sdk_rust::{Client, ClientError, Person};
 use uuid::Uuid;
 
+use brain_explore::EntityCard;
+
 use crate::commands::Rendered;
-use crate::output::render::entity_card::EntityCard;
 use crate::parser::EntityShowArgs;
 use crate::session::Session;
 

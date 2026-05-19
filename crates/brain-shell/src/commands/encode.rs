@@ -22,7 +22,8 @@ use brain_sdk_rust::{Client, ClientError};
 use futures_lite::StreamExt;
 use uuid::Uuid;
 
-use crate::output::table::EncodeRendered;
+use brain_explore::EncodeRendered;
+
 use crate::parser::{parse_txn_id, EncodeArgs};
 use crate::session::Session;
 
