@@ -99,7 +99,7 @@ pub async fn handle_relation_create(
             to: req.to_entity,
         }),
         now,
-    );
+    ).await;
 
     Ok(RelationCreateResponse {
         relation_id: created_id.to_bytes(),
@@ -199,7 +199,7 @@ pub async fn handle_relation_supersede(
             new_relation_id: new_id.to_bytes(),
         }),
         now,
-    );
+    ).await;
 
     Ok(RelationSupersedeResponse {
         new_relation_id: new_id.to_bytes(),
@@ -239,7 +239,7 @@ pub async fn handle_relation_tombstone(
             reason: req.reason,
         }),
         now,
-    );
+    ).await;
 
     Ok(RelationTombstoneResponse {
         tombstoned_at_unix_nanos: now,

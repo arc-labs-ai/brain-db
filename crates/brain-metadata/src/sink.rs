@@ -14,10 +14,6 @@
 //!
 //! ## Deliberate placeholders (documented in module docs)
 //!
-//! - `IdempotencyEntry.request_hash` is filled with zeros during
-//!   recovery. Spec §07/06 §5's conflict-detection hash is computed
-//!   from canonicalised request bytes which the WAL doesn't carry; the
-//!   wire layer (Phase 9) populates the hash on live requests.
 //! - `ModelInfo.model_name` is filled with `""` — `EncodePayload`
 //!   carries the fingerprint bytes but not the human-readable name.
 //!   `ADMIN_REGISTER_MODEL` (Phase 9) or the embedding loader fills
@@ -40,6 +36,9 @@ use crate::db::MetadataDb;
 use crate::schema::CURRENT_SCHEMA_VERSION;
 use crate::tables::checkpoint::{CheckpointMeta, CHECKPOINTS_TABLE};
 use crate::tables::edge::{self, EdgeData, EdgeKey, EDGES_IN_TABLE, EDGES_OUT_TABLE};
+use crate::tables::fingerprint::{
+    content_hash as fp_content_hash, fingerprint_key, FingerprintEntry, FINGERPRINTS_TABLE,
+};
 use crate::tables::idempotency::{response_kind, IdempotencyEntry, IDEMPOTENCY_TABLE};
 use crate::tables::memory::{flags, memory_kind_to_u8, MemoryMetadata, MEMORIES_TABLE};
 use crate::tables::model_fingerprint::{ModelInfo, MODEL_FINGERPRINTS_TABLE};
@@ -116,7 +115,10 @@ impl MetadataDb {
             let slot_id = memory_id.slot();
             let slot_version = memory_id.version();
 
-            let mem = MemoryMetadata::new_active(
+            // Stamp the dedup back-reference on the memory row when the
+            // originating ENCODE opted in. Forget reads it to evict the
+            // matching FINGERPRINTS entry in the same write txn.
+            let mut mem = MemoryMetadata::new_active(
                 memory_id,
                 p.agent_id,
                 p.context_id,
@@ -127,7 +129,17 @@ impl MetadataDb {
                 p.salience_initial,
                 u32::try_from(p.text.len()).unwrap_or(u32::MAX),
                 timestamp_ns,
-            );
+            )
+            // Stamp the replayed-from LSN so the rebuilt row carries
+            // the same provenance the live writer would have written.
+            .with_encoded_at_lsn(lsn);
+            let content_hash = if p.deduplicate {
+                let h = fp_content_hash(&p.text);
+                mem.content_hash = Some(h);
+                Some(h)
+            } else {
+                None
+            };
 
             // memories
             {
@@ -143,18 +155,34 @@ impl MetadataDb {
                     .map_err(transient)?;
             }
 
-            // idempotency
+            // idempotency — populated from the WAL payload so a retry
+            // after restart with the same request_id returns the original
+            // response bytes; mismatching params surface as Conflict.
+            // Persist the replayed-from LSN so a post-restart retry can
+            // chain `subscribe --start-lsn=lsn+1` against the same
+            // durable position the original write reached.
             {
                 let entry = IdempotencyEntry::new(
                     response_kind::ENCODE,
                     Some(memory_id.to_be_bytes()),
-                    /* response_payload */ Vec::new(),
-                    /* request_hash */ [0u8; 32],
+                    p.response_payload.clone(),
+                    p.request_hash,
                     timestamp_ns,
+                    lsn,
                 );
                 let mut t = wtxn.open_table(IDEMPOTENCY_TABLE).map_err(transient)?;
                 t.insert(&<[u8; 16]>::from(p.request_id), &entry)
                     .map_err(transient)?;
+            }
+
+            // fingerprints — restore the dedup index for opt-in ENCODEs
+            // so future ENCODE+dedup requests for the same text in the
+            // same (agent, context) collapse onto the existing memory.
+            if let Some(hash) = content_hash {
+                let key = fingerprint_key(p.agent_id, p.context_id, &hash);
+                let entry = FingerprintEntry::new(memory_id, timestamp_ns);
+                let mut t = wtxn.open_table(FINGERPRINTS_TABLE).map_err(transient)?;
+                t.insert(&key, &entry).map_err(transient)?;
             }
 
             // model_fingerprints — insert if absent.
@@ -203,15 +231,37 @@ impl MetadataDb {
         {
             let key = p.memory_id.to_be_bytes();
 
-            // Update memory: set HARD_FORGOTTEN flag + forgot_at.
-            {
+            // Update memory: set HARD_FORGOTTEN flag + forgot_at. Capture
+            // (agent, context, hash) for the matching FINGERPRINTS row so
+            // we can evict it in the same write txn (spec §07/07 §6.3 —
+            // the dedup index must never reference a forgotten memory).
+            let dedup_key: Option<(brain_core::AgentId, brain_core::ContextId, [u8; 32])> = {
                 let mut t = wtxn.open_table(MEMORIES_TABLE).map_err(transient)?;
                 let existing = t.get(&key).map_err(transient)?.map(|a| a.value());
                 if let Some(mut mem) = existing {
+                    let captured = mem.content_hash.map(|h| {
+                        (
+                            brain_core::AgentId::from(mem.agent_id_bytes),
+                            brain_core::ContextId(mem.context_id),
+                            h,
+                        )
+                    });
                     mem.flags |= flags::HARD_FORGOTTEN;
                     mem.forgot_at_unix_nanos = Some(timestamp_ns);
+                    mem.content_hash = None;
                     t.insert(&key, &mem).map_err(transient)?;
+                    captured
+                } else {
+                    None
                 }
+            };
+
+            // Evict FINGERPRINTS row in the same txn as the tombstone so
+            // a concurrent ENCODE+dedup can't observe a stale hit.
+            if let Some((agent, ctx, hash)) = dedup_key {
+                let fp_key = fingerprint_key(agent, ctx, &hash);
+                let mut t = wtxn.open_table(FINGERPRINTS_TABLE).map_err(transient)?;
+                t.remove(&fp_key).map_err(transient)?;
             }
 
             // Idempotency entry.
@@ -222,6 +272,7 @@ impl MetadataDb {
                     Vec::new(),
                     [0u8; 32],
                     timestamp_ns,
+                    lsn,
                 );
                 let mut t = wtxn.open_table(IDEMPOTENCY_TABLE).map_err(transient)?;
                 t.insert(&<[u8; 16]>::from(p.request_id), &entry)
@@ -367,6 +418,14 @@ impl MetadataDb {
                 flags: flags::ACTIVE,
                 edges_out_count: 0,
                 edges_in_count: 0,
+                // WAL-recovered Consolidated rows have no dedup
+                // back-reference — consolidation never opts into
+                // fingerprint dedup (see consolidation.rs).
+                content_hash: None,
+                // Recovery threads the WAL LSN through so a future
+                // RECALL of a consolidated row can resume subscribe
+                // from the moment consolidation ran.
+                encoded_at_lsn: lsn,
             };
 
             {
@@ -616,6 +675,9 @@ mod tests {
             text: format!("text for memory {byte}"),
             vector: vec![0.0; 384],
             edges: Vec::new(),
+            request_hash: [byte; 32],
+            response_payload: vec![],
+            deduplicate: false,
         }
     }
 
@@ -771,6 +833,7 @@ mod tests {
             &WalPayload::Forget(ForgetPayload {
                 memory_id: id,
                 request_id: rid(2),
+                agent_id: brain_core::AgentId::default(),
                 mode: ForgetMode::Soft,
                 reason: ForgetReason::ClientRequest,
             }),

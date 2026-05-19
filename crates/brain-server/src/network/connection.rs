@@ -118,9 +118,13 @@ pub struct ConnectionLimits {
     /// Maximum payload bytes accepted by `Frame::decode_with_max`. Defaults
     /// to the 24-bit spec hard cap (16 MiB - 1).
     pub max_payload_bytes: u32,
-    /// Per-frame read budget. Bytes received before this deadline elapses
-    /// are kept; the deadline is enforced per `read_one_frame` call. A
-    /// connection that goes silent mid-frame is closed.
+    /// Mid-frame read budget. Applies AFTER the first byte of a
+    /// frame arrives — so a connection that starts a frame and then
+    /// stalls mid-header / mid-payload is closed within this window.
+    /// Inter-frame idle (the wait BETWEEN frames, while no bytes
+    /// are on the wire) is governed by `idle_timeout` + the
+    /// SERVER_PING path instead; bounding it here too closes idle
+    /// REPLs / SDKs before the application-level keepalive can fire.
     pub read_timeout: Duration,
     /// Spec §03/06 §6.3 — interval before AUTH must arrive after WELCOME.
     pub auth_timeout: Duration,
@@ -847,25 +851,51 @@ enum FrameReadError {
 async fn read_one_frame<S>(
     stream: &mut S,
     max_payload_bytes: u32,
-    timeout: Duration,
+    mid_frame_timeout: Duration,
 ) -> Result<Frame, FrameReadError>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    tokio::time::timeout(timeout, read_one_frame_inner(stream, max_payload_bytes))
-        .await
-        .map_err(|_| FrameReadError::Timeout)?
+    // Wait for the first byte of the next frame WITHOUT a timeout.
+    // Inter-frame idle is governed by the connection layer's
+    // [`ConnectionLimits::idle_timeout`] + SERVER_PING path (spec
+    // §03/02 §6.1). Bounding it here too caused a real regression:
+    // any client (e.g. the `brain` REPL) that paused > `read_timeout`
+    // between two valid requests was silently closed before the
+    // application-level keepalive could fire. `read_timeout`
+    // applies only AFTER the first byte arrives — to keep mid-frame
+    // stalls from holding a slot indefinitely. See the comment on
+    // [`ConnectionLimits::read_timeout`] for the contract.
+    let mut first_byte = [0u8; 1];
+    match stream.read_exact(&mut first_byte).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Err(FrameReadError::Eof),
+        Err(e) => return Err(FrameReadError::Io(e)),
+    }
+
+    // First byte in hand — now bound the rest of the frame.
+    tokio::time::timeout(
+        mid_frame_timeout,
+        read_rest_of_frame(stream, first_byte[0], max_payload_bytes),
+    )
+    .await
+    .map_err(|_| FrameReadError::Timeout)?
 }
 
-async fn read_one_frame_inner<S>(
+/// Read the remaining `HEADER_SIZE - 1` header bytes (the caller has
+/// already consumed the first byte) plus the payload. Bounded by the
+/// caller's `mid_frame_timeout` via [`read_one_frame`].
+async fn read_rest_of_frame<S>(
     stream: &mut S,
+    first_byte: u8,
     max_payload_bytes: u32,
 ) -> Result<Frame, FrameReadError>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
     let mut header_buf = [0u8; HEADER_SIZE];
-    match stream.read_exact(&mut header_buf).await {
+    header_buf[0] = first_byte;
+    match stream.read_exact(&mut header_buf[1..]).await {
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Err(FrameReadError::Eof),
         Err(e) => return Err(FrameReadError::Io(e)),

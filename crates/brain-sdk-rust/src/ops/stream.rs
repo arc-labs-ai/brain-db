@@ -58,6 +58,12 @@ enum StreamState<T> {
 /// Streaming response engine. Each `Stream::poll_next` produces
 /// one `Result<T, ClientError>`.
 pub struct FrameStream<T> {
+    /// The wire stream id assigned at request time. Surfaced to
+    /// callers so they can send `UnsubscribeRequest { target_stream_id }`
+    /// over a separate connection — server-side the registry key is
+    /// global per shard (`crates/brain-ops/src/ops/subscribe.rs`
+    /// `subscriptions.cancel(target)`).
+    stream_id: u32,
     expected_opcode: Opcode,
     decoder: StreamDecoder<T>,
     state: StreamState<T>,
@@ -68,13 +74,54 @@ impl<T> FrameStream<T> {
     /// already had its request frame written.
     pub(crate) fn new(
         guard: PoolGuard,
+        stream_id: u32,
         expected_opcode: Opcode,
         decoder: StreamDecoder<T>,
     ) -> Self {
         Self {
+            stream_id,
             expected_opcode,
             decoder,
             state: StreamState::Idle(guard),
+        }
+    }
+
+    /// Connection-relative stream id this stream rode in on. Callers
+    /// that need to send an explicit cancel (e.g. `UnsubscribeRequest`
+    /// for SUBSCRIBE) use this as `target_stream_id`.
+    #[must_use]
+    pub fn stream_id(&self) -> u32 {
+        self.stream_id
+    }
+}
+
+impl<T> Drop for FrameStream<T> {
+    /// If we still hold a pool guard at drop time AND the server
+    /// hasn't signalled EOS, the in-flight bytes on the wire would
+    /// poison the next op that acquires the same pool slot. Mark
+    /// the guard failed so the slot is discarded.
+    ///
+    /// Note: the `Reading` state's pool guard lives inside the
+    /// pinned future. When `select!` cancels mid-read, that future
+    /// is dropped and the guard inside it is released *without*
+    /// being marked failed. Callers who care about the lurking
+    /// race should send an `UnsubscribeRequest` (or equivalent
+    /// op-level cancel) before letting the stream go.
+    fn drop(&mut self) {
+        match std::mem::replace(&mut self.state, StreamState::Ended) {
+            StreamState::Idle(mut g) => {
+                g.mark_failed();
+                drop(g);
+            }
+            StreamState::Buffered { mut guard, .. } => {
+                guard.mark_failed();
+                drop(guard);
+            }
+            StreamState::Reading(_) | StreamState::Ended | StreamState::Transitioning => {
+                // Reading: guard is inside the future; future-drop
+                // releases it (without mark_failed). Documented above.
+                // Ended/Transitioning: no guard to release.
+            }
         }
     }
 }
@@ -142,15 +189,26 @@ impl<T: Unpin> Stream for FrameStream<T> {
                             this.state = StreamState::Reading(fut);
                             return Poll::Pending;
                         }
-                        Poll::Ready((guard, Ok(frame))) => {
+                        Poll::Ready((mut guard, Ok(frame))) => {
                             // Validate opcode + EOS, decode, transition
                             // to Buffered.
                             if frame.header.opcode_u16() == Opcode::Error.as_u16() {
+                                // Server-side error response — the
+                                // connection itself is fine, just the
+                                // op was rejected. Don't poison the
+                                // pool slot. (Drop is fine: stream
+                                // ended, guard returns to Idle.)
                                 drop(guard);
                                 this.state = StreamState::Ended;
                                 return Poll::Ready(Some(Err(map_error_frame(&frame.payload))));
                             }
                             if frame.header.opcode_u16() != this.expected_opcode.as_u16() {
+                                // Byte stream is desynced — we read a
+                                // valid frame but with the wrong
+                                // opcode. Future ops on this conn
+                                // can't reliably parse subsequent
+                                // frames. Discard the slot.
+                                guard.mark_failed();
                                 drop(guard);
                                 this.state = StreamState::Ended;
                                 return Poll::Ready(Some(Err(ClientError::Protocol(
@@ -165,6 +223,11 @@ impl<T: Unpin> Stream for FrameStream<T> {
                             let items = match (this.decoder)(&frame.payload) {
                                 Ok(v) => v,
                                 Err(e) => {
+                                    // Payload didn't decode. Treat the
+                                    // stream as broken: subsequent
+                                    // frames can't be trusted to
+                                    // realign.
+                                    guard.mark_failed();
                                     drop(guard);
                                     this.state = StreamState::Ended;
                                     return Poll::Ready(Some(Err(e)));
@@ -177,7 +240,11 @@ impl<T: Unpin> Stream for FrameStream<T> {
                             };
                             // Loop back to pop the first item.
                         }
-                        Poll::Ready((guard, Err(e))) => {
+                        Poll::Ready((mut guard, Err(e))) => {
+                            // read_one_frame failed — Io / Closed /
+                            // Protocol. All connection-fatal: the
+                            // socket is unusable.
+                            guard.mark_failed();
                             drop(guard);
                             this.state = StreamState::Ended;
                             return Poll::Ready(Some(Err(e)));
@@ -194,12 +261,23 @@ mod tests {
     use super::*;
 
     // FrameStream's machinery requires a live PoolGuard, which
-    // can only be constructed via Pool::acquire. The stream's
-    // invariants are exercised end-to-end by the integration
-    // tests in `tests/ops_recall_stream.rs` etc. We keep this
-    // unit module as a placeholder for type-shape assertions.
+    // can only be constructed via Pool::acquire. End-to-end
+    // invariants are exercised by tests/pool.rs and the per-op
+    // streaming tests; this module keeps shape assertions only.
+
     #[test]
     fn type_shape() {
         let _ = std::marker::PhantomData::<FrameStream<u32>>;
+    }
+
+    #[test]
+    fn frame_stream_exposes_stream_id_field() {
+        // Compile-time check: the public getter exists and returns
+        // u32. Behaviour is exercised through the SDK integration
+        // tests once a connected pool is available.
+        fn _assert<T>(s: &FrameStream<T>) -> u32 {
+            s.stream_id()
+        }
+        let _: fn(&FrameStream<u32>) -> u32 = _assert;
     }
 }

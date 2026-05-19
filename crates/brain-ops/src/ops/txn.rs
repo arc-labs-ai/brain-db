@@ -90,6 +90,7 @@ pub struct BufferedEncode {
     pub request_id: [u8; 16],
     pub request_hash: [u8; 32],
     pub created_at_unix_nanos: u64,
+    pub agent_id: brain_core::AgentId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -108,6 +109,7 @@ pub struct BufferedLink {
     pub request_id: [u8; 16],
     pub request_hash: [u8; 32],
     pub created_at_unix_nanos: u64,
+    pub agent_id: brain_core::AgentId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -118,6 +120,7 @@ pub struct BufferedUnlink {
     pub request_id: [u8; 16],
     pub request_hash: [u8; 32],
     pub created_at_unix_nanos: u64,
+    pub agent_id: brain_core::AgentId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -127,6 +130,7 @@ pub struct BufferedForget {
     pub request_id: [u8; 16],
     pub request_hash: [u8; 32],
     pub created_at_unix_nanos: u64,
+    pub agent_id: brain_core::AgentId,
 }
 
 /// Cached per-`request_id` response within a txn so we can replay
@@ -218,7 +222,7 @@ impl TxnStore {
         let now = now_unix_nanos();
         Self::sweep_expired_locked(&mut entries, now);
         match entries.get(&txn_id) {
-            None => Err(OpError::TxnExpired),
+            None => Err(OpError::TxnNotFound),
             Some(e) => match e.state {
                 TxnState::Active => Ok(e.expires_at_unix_nanos),
                 _ => Err(OpError::TxnExpired),
@@ -227,7 +231,8 @@ impl TxnStore {
     }
 
     /// Apply `f` to the mutable buffer of an Active txn. Errors with
-    /// `TxnExpired` if the txn isn't Active.
+    /// `TxnNotFound` if no such id was ever created, `TxnExpired`
+    /// otherwise.
     pub fn with_buffer<R>(
         &self,
         txn_id: TxnId,
@@ -237,7 +242,7 @@ impl TxnStore {
         let now = now_unix_nanos();
         Self::sweep_expired_locked(&mut entries, now);
         match entries.get_mut(&txn_id) {
-            None => Err(OpError::TxnExpired),
+            None => Err(OpError::TxnNotFound),
             Some(entry) => match (&entry.state, &mut entry.buffer) {
                 (TxnState::Active, Some(buf)) => f(buf),
                 _ => Err(OpError::TxnExpired),
@@ -305,7 +310,7 @@ pub async fn handle_txn_commit(
         let mut entries = store.entries.lock();
         let now = now_unix_nanos();
         TxnStore::sweep_expired_locked(&mut entries, now);
-        let entry = entries.get_mut(&req.txn_id).ok_or(OpError::TxnExpired)?;
+        let entry = entries.get_mut(&req.txn_id).ok_or(OpError::TxnNotFound)?;
         // Replay support.
         if let Some(TxnFinalResponse::Commit(c)) = entry.final_response {
             return Ok(TxnCommitResponse {
@@ -372,7 +377,7 @@ pub async fn handle_txn_abort(
     let now = now_unix_nanos();
     TxnStore::sweep_expired_locked(&mut entries, now);
 
-    let entry = entries.get_mut(&req.txn_id).ok_or(OpError::TxnExpired)?;
+    let entry = entries.get_mut(&req.txn_id).ok_or(OpError::TxnNotFound)?;
     if let Some(TxnFinalResponse::Abort(a)) = entry.final_response {
         return Ok(TxnAbortResponse {
             txn_id: req.txn_id,
@@ -434,6 +439,7 @@ fn build_batch(buffer: &TxnBuffer) -> TxnBatch {
                 })
                 .collect(),
             created_at_unix_nanos: e.created_at_unix_nanos,
+            agent_id: e.agent_id,
         })
         .collect();
     let links: Vec<TxnBatchLink> = buffer
@@ -447,6 +453,7 @@ fn build_batch(buffer: &TxnBuffer) -> TxnBatch {
             kind: l.kind,
             weight: l.weight,
             created_at_unix_nanos: l.created_at_unix_nanos,
+            agent_id: l.agent_id,
         })
         .collect();
     let unlinks: Vec<TxnBatchUnlink> = buffer
@@ -459,6 +466,7 @@ fn build_batch(buffer: &TxnBuffer) -> TxnBatch {
             target: u.target,
             kind: u.kind,
             created_at_unix_nanos: u.created_at_unix_nanos,
+            agent_id: u.agent_id,
         })
         .collect();
     let forgets: Vec<TxnBatchForget> = buffer
@@ -470,6 +478,7 @@ fn build_batch(buffer: &TxnBuffer) -> TxnBatch {
             memory_id: f.memory_id,
             mode: f.mode,
             created_at_unix_nanos: f.created_at_unix_nanos,
+            agent_id: f.agent_id,
         })
         .collect();
     TxnBatch {

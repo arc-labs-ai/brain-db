@@ -20,12 +20,6 @@ localhost:
 cargo run --bin brain-server -- --config config/dev.toml
 ```
 
-Or via the Justfile shortcut:
-
-```bash
-just run-server
-```
-
 **Expected startup log** (JSON format per `dev.toml`):
 
 ```json
@@ -37,8 +31,7 @@ just run-server
 
 The server is ready when the **`"listening"`** line appears.
 
-**Verify (from a second terminal in the container, or from host
-via `just docker`):**
+**Verify (from a second terminal):**
 
 ```bash
 curl -s http://127.0.0.1:9091/healthz

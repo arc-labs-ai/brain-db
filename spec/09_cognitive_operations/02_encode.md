@@ -69,11 +69,20 @@ Up to 64 edges per encode (configurable).
 
 Required. A `RequestId` for idempotency. The same RequestId returns the original response for retries.
 
+### deduplicate
+
+Optional, default `false`. When `true`, the substrate consults a per-`(shard, agent_id, context_id)` fingerprint index (see §07/07 §6) before allocating a new slot. On a hit, the existing `MemoryId` is returned and no new slot, WAL record, or HNSW node is created; `EncodeResponse.was_deduplicated = true`.
+
+Default-off: the simpler "one ENCODE → one memory" model is the substrate's primitive. Callers opt in explicitly when they know the content is dedup-safe (template outputs, idempotent ingestion).
+
 ## 3. The response
 
 ```rust
 struct EncodeResponse {
     memory_id: MemoryId,
+    was_deduplicated: bool,           // Fingerprint dedup hit (§4a)
+    salience: f32,                    // Server-stamped salience
+    auto_edges_added: u32,            // Count of edge_results.Inserted
     edge_results: Vec<EdgeResult>,    // Per-edge success/error
     persisted_at: u64,                // The substrate's timestamp
     fingerprint: ModelFingerprint,    // The model that produced this vector
@@ -81,6 +90,8 @@ struct EncodeResponse {
 ```
 
 The MemoryId is the agent's primary handle. Stable. Use it to refer to this memory in all future operations.
+
+`was_deduplicated` is `true` only when the request asked for dedup AND the substrate found a matching fingerprint (see §4a + §07/07 §6). Idempotency-replay does not set this flag — replay is transparent to the caller and returns whatever the original response carried.
 
 ## 4. Idempotency
 
@@ -90,7 +101,23 @@ If the same RequestId is sent twice (e.g., due to network retry):
 - No duplicate memory is created.
 - No additional WAL record is written.
 
-This is the substrate's commitment: at-most-once execution per RequestId, with replay-safe responses.
+This is the substrate's commitment: at-most-once execution per RequestId, with replay-safe responses. Idempotency replay is **transparent** — `was_deduplicated` reports whatever the original response carried, not whether the wire-level replay occurred.
+
+## 4a. Fingerprint deduplication
+
+A distinct mechanism from §4 idempotency. Idempotency dedupes by *request identity* (same `RequestId`); fingerprint dedup dedupes by *content identity* (same `BLAKE3(text)` under the same `agent_id` + `context_id`).
+
+Opt-in via `EncodeRequest.deduplicate = true`. On a hit:
+
+- The substrate returns the existing `MemoryId` for the matched memory.
+- No new slot is allocated, no WAL record is written, no HNSW node is inserted.
+- `EncodeResponse.was_deduplicated = true`.
+
+On a miss (or `deduplicate = false`): the normal allocation path runs, the new memory's fingerprint is inserted into the per-`(shard, agent_id, context_id)` index, and `was_deduplicated = false`.
+
+Only **Active** memories can dedup. Tombstoned and reclaimed memories are evicted from the fingerprint index in the same write transaction as the FORGET / reclamation, so a dedup lookup never returns a memory that RECALL would not find.
+
+Full design: §07/07 §6.
 
 ## 5. The "what gets stored" question
 

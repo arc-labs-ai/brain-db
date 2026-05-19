@@ -322,9 +322,9 @@ All 12 sub-tasks done. Final state on `feature/brain-storage`:
 - 12 plan files in `.claude/plans/phase-02-task-NN.md` documenting the design rationale per sub-task.
 
 Outstanding from the phase exit checklist:
-- [x] `just verify` green inside the dev container (fmt + clippy `-D warnings` + skill-lint + tests).
+- [x] Verify suite (fmt-check + build + clippy + test + check-skills) green inside the dev container (fmt + clippy `-D warnings` + skill-lint + tests).
 - [x] Random-kill test passes 1000 iterations.
-- [x] Miri on `brain-storage` — see [`.claude/plans/phase-02-miri.md`](../../.claude/plans/phase-02-miri.md). Miri doesn't shim the syscalls we use (`mmap`/`mremap`/`pwritev2`/`fallocate`/`msync`/`madvise`); syscall-bound test modules are gated behind `#[cfg(all(test, not(miri)))]`. The ~47 pure-data tests (record framing, payload encoding, slot byte layout, kind discriminator) run under miri and pass cleanly. Invoke via `just miri`.
+- [x] Miri on `brain-storage` — see [`.claude/plans/phase-02-miri.md`](../../.claude/plans/phase-02-miri.md). Miri doesn't shim the syscalls we use (`mmap`/`mremap`/`pwritev2`/`fallocate`/`msync`/`madvise`); syscall-bound test modules are gated behind `#[cfg(all(test, not(miri)))]`. The ~47 pure-data tests (record framing, payload encoding, slot byte layout, kind discriminator) run under miri and pass cleanly. Invoke via `cargo +nightly miri test -p brain-storage --lib`.
 - [x] All `unsafe` blocks have `// SAFETY:` comments (`arena/file.rs` + `wal/segment.rs`).
 - [x] `cargo doc -p brain-storage` warnings-clean (verified before tagging).
 - [x] Tagged `phase-2-complete` on `main` after final verify.
@@ -334,7 +334,7 @@ Outstanding from the phase exit checklist:
 ## Phase exit checklist
 
 - [ ] Sub-tasks 2.1–2.12 complete.
-- [ ] `just verify` green.
+- [ ] Verify suite (fmt-check + build + clippy + test + check-skills) green.
 - [ ] Random-kill test passes 1000 iterations.
 - [ ] Miri passes on `brain-storage` (requires nightly): `cargo +nightly miri test -p brain-storage`.
 - [ ] All `unsafe` blocks have `// SAFETY:` comments.

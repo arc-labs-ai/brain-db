@@ -94,7 +94,7 @@ Wrap `hnsw_rs` with the parameters and lifecycle the spec defines. After this ph
 ## Phase exit checklist
 
 - [x] Sub-tasks 4.1–4.8 complete.
-- [x] `just verify` green (brain-index 73 tests: 72 unit + 1 integration; bench compiles via `--no-run`).
+- [x] Verify suite (fmt-check + build + clippy + test + check-skills) green (brain-index 73 tests: 72 unit + 1 integration; bench compiles via `--no-run`).
 - [x] Recall@10 ≥ 0.95 at default params, 100K scale (asserted in `benches/recall.rs`).
 - [x] Persistence round-trip identical (`round_trip_with_memories` test).
 - [x] Rebuild correctness (`rebuild_search_returns_correct_results` + `rebuild_then_save_then_load`).

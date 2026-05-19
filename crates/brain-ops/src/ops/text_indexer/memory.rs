@@ -5,7 +5,7 @@
 //! `spec/27_knowledge_workers/02_text_indexer_workers.md` §2.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use brain_core::{AgentId, MemoryId, MemoryKind};
 use brain_index::{schema_payload_json, IndexHandle, LexicalScope};
@@ -13,7 +13,6 @@ use flume::{bounded, Receiver, Sender};
 use tantivy::schema::Field;
 use tantivy::{IndexWriter, TantivyDocument, TantivyError, Term};
 use thiserror::Error;
-use tokio::time::{timeout_at, Instant as TokioInstant};
 use tracing::{error, warn};
 
 use super::{CommitPolicy, DEFAULT_QUEUE_CAPACITY};
@@ -108,10 +107,9 @@ impl MemoryFields {
 }
 
 /// Spawn the drain loop using `glommio::spawn_local` and return
-/// immediately. Server-side path.
-///
-/// In test contexts where Glommio isn't running, call
-/// [`run_memory_text_indexer`] directly inside a `tokio::spawn`.
+/// immediately. Server-side path. Tests spawn
+/// [`run_memory_text_indexer`] themselves inside a `run_in_glommio`
+/// block so they can `.await` the task; production detaches.
 #[cfg(target_os = "linux")]
 pub fn spawn_memory_text_indexer_local(
     handle: IndexHandle,
@@ -127,10 +125,11 @@ pub fn spawn_memory_text_indexer_local(
     Ok(())
 }
 
-/// Non-Linux + test path. Returns the future; the caller spawns
-/// it on whatever runtime they have. The future never returns
-/// `Result` — it logs commit failures and self-terminates on
-/// receiver close.
+/// Build the writer + resolved fields and run the drain loop. The
+/// caller spawns this on the current Glommio executor — production
+/// goes through [`spawn_memory_text_indexer_local`] which detaches;
+/// tests `glommio::spawn_local` it and `.await` the returned task.
+#[cfg(target_os = "linux")]
 pub async fn run_memory_text_indexer(
     handle: IndexHandle,
     rx: Receiver<MemoryTextOp>,
@@ -161,6 +160,39 @@ fn build_writer(handle: &IndexHandle) -> Result<IndexWriter, IndexerError> {
     Ok(handle.index.writer_with_num_threads(1, 50_000_000)?)
 }
 
+/// Outcome of the per-iteration wait inside `run_loop`. Decouples
+/// the Glommio-aware wait helper (`wait_next`) from the body.
+enum NextOp<T> {
+    /// Received an op from the dispatcher.
+    Op(T),
+    /// Sender side dropped — shard tearing down.
+    Disconnected,
+    /// Commit-interval deadline elapsed without any op arriving.
+    DeadlineHit,
+}
+
+/// Wait for the next op or the commit deadline. Glommio-only — both
+/// production (`spawn_*_local`) and tests (`run_in_glommio`) run
+/// under Glommio, so there is no Tokio fallback. Mixing Tokio
+/// primitives onto a Glommio thread panics looking for a Tokio
+/// reactor (see `crates/brain-ops/src/test_support.rs`).
+#[cfg(target_os = "linux")]
+async fn wait_next<T: 'static>(rx: &Receiver<T>, remaining: Duration) -> NextOp<T> {
+    use futures_lite::FutureExt;
+    let recv = async {
+        match rx.recv_async().await {
+            Ok(op) => NextOp::Op(op),
+            Err(_) => NextOp::Disconnected,
+        }
+    };
+    let timer = async {
+        glommio::timer::sleep(remaining).await;
+        NextOp::DeadlineHit
+    };
+    recv.or(timer).await
+}
+
+#[cfg(target_os = "linux")]
 async fn run_loop(
     mut writer: IndexWriter,
     fields: MemoryFields,
@@ -171,15 +203,11 @@ async fn run_loop(
     let mut last_commit = Instant::now();
 
     loop {
-        // Wait up to `policy.interval - elapsed` for the next op.
         let deadline = last_commit + policy.interval;
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let tokio_deadline = TokioInstant::now() + remaining;
 
-        let next = timeout_at(tokio_deadline, rx.recv_async()).await;
-
-        match next {
-            Ok(Ok(op)) => {
+        match wait_next(&rx, remaining).await {
+            NextOp::Op(op) => {
                 if let Err(err) = apply_op(&mut writer, &fields, &op) {
                     warn!(
                         target: "brain_ops::text_indexer",
@@ -197,15 +225,14 @@ async fn run_loop(
                     last_commit = Instant::now();
                 }
             }
-            Ok(Err(_disconnected)) => {
+            NextOp::Disconnected => {
                 // Sender side dropped — drain + final commit + exit.
                 if batch > 0 {
                     let _ = commit_with_retry(&mut writer);
                 }
                 return;
             }
-            Err(_elapsed) => {
-                // T-deadline hit. Commit if we have buffered work.
+            NextOp::DeadlineHit => {
                 if batch > 0 {
                     if commit_with_retry(&mut writer).is_err() {
                         return;

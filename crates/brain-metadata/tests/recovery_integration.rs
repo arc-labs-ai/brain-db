@@ -139,6 +139,9 @@ fn encode_payload(slot: u64, byte: u8) -> EncodePayload {
         text: format!("text for memory {byte}"),
         vector: vec![0.0; 384],
         edges: Vec::new(),
+        request_hash: [byte; 32],
+        response_payload: vec![],
+        deduplicate: false,
     }
 }
 
@@ -607,6 +610,7 @@ fn run_iteration(seed: u64) {
                             WalPayload::Forget(ForgetPayload {
                                 memory_id: mid(slot, 1),
                                 request_id: rid(seed_byte ^ 0xFF),
+                                agent_id: brain_core::AgentId::default(),
                                 mode: ForgetMode::Soft,
                                 reason: ForgetReason::ClientRequest,
                             }),

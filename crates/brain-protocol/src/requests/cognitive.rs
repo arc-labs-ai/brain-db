@@ -68,6 +68,10 @@ pub struct RecallRequest {
     pub strategy_hint: Option<RecallStrategy>,
     pub include_vectors: bool,
     pub include_edges: bool,
+    /// When set, each `MemoryResult` carries the memory's stored UTF-8
+    /// text. Costs one batched read against the per-shard `texts`
+    /// table. When unset, `MemoryResult.text` is the empty string.
+    pub include_text: bool,
     pub request_id: Option<WireUuid>,
     /// Spec §09/08 §5: when set, RECALL reads against a snapshot
     /// that includes the txn's pending writes (read-your-writes).

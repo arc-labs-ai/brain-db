@@ -21,6 +21,7 @@ use brain_core::{AgentId, ContextId, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
+use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_metadata::MetadataDb;
 use brain_planner::{
     execute_recall, plan_recall, plan_recall_inner, EncodeAck, EncodeOp, ExecutionPlan,
@@ -262,6 +263,7 @@ fn base_request(cue: &str, top_k: u32) -> RecallRequest {
         strategy_hint: None,
         include_vectors: false,
         include_edges: false,
+        include_text: false,
         request_id: None,
         txn_id: None,
     }
@@ -379,6 +381,239 @@ async fn empty_index_returns_no_hits() {
     let plan = plan_recall(&base_request("cue", 5), &PlannerContext::default()).unwrap();
     let result = execute_recall(unwrap_recall(plan), &fix.ctx).await.unwrap();
     assert!(result.hits.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// include_text tests.
+// ---------------------------------------------------------------------------
+
+/// Write a UTF-8 text row per MemoryId already present in the fixture.
+fn seed_texts(metadata: &SharedMetadataDb, memory_ids: &[MemoryId], texts: &[&str]) {
+    assert_eq!(memory_ids.len(), texts.len(), "id/text length mismatch");
+    let mut guard = metadata.lock();
+    let wtxn = guard.write_txn().unwrap();
+    {
+        let mut t = wtxn.open_table(TEXTS_TABLE).unwrap();
+        for (mid, text) in memory_ids.iter().zip(texts.iter()) {
+            t.insert(mid.to_be_bytes(), text.as_bytes()).unwrap();
+        }
+    }
+    wtxn.commit().unwrap();
+}
+
+#[tokio::test]
+async fn recall_include_text_false_leaves_hit_text_none() {
+    let memories: Vec<_> = (0..3)
+        .map(|i| (MemoryKind::Episodic, 0.5, unit_vector_at_dim(i)))
+        .collect();
+    let fix = build_fixture(&memories);
+    fix.mock.install("cue", unit_vector_at_dim(0));
+    let metadata = fix.ctx.metadata.clone();
+    seed_texts(
+        &metadata,
+        &fix.memory_ids,
+        &["alpha text", "beta text", "gamma text"],
+    );
+
+    let plan = plan_recall(&base_request("cue", 3), &PlannerContext::default()).unwrap();
+    let result = execute_recall(unwrap_recall(plan), &fix.ctx).await.unwrap();
+
+    assert!(!result.hits.is_empty());
+    for hit in &result.hits {
+        assert!(
+            hit.text.is_none(),
+            "include_text=false must leave hit.text=None, got {:?}",
+            hit.text
+        );
+    }
+}
+
+#[tokio::test]
+async fn recall_include_text_true_populates_hit_text_from_metadata() {
+    let memories: Vec<_> = (0..3)
+        .map(|i| (MemoryKind::Episodic, 0.5, unit_vector_at_dim(i)))
+        .collect();
+    let fix = build_fixture(&memories);
+    fix.mock.install("cue", unit_vector_at_dim(0));
+    let metadata = fix.ctx.metadata.clone();
+    let texts = ["alpha text", "beta text", "gamma text"];
+    seed_texts(&metadata, &fix.memory_ids, &texts);
+
+    // memory_id → text lookup so we can assert regardless of returned order.
+    let by_id: std::collections::HashMap<_, _> = fix
+        .memory_ids
+        .iter()
+        .copied()
+        .zip(texts.iter().copied())
+        .collect();
+
+    let mut req = base_request("cue", 3);
+    req.include_text = true;
+
+    let plan = plan_recall(&req, &PlannerContext::default()).unwrap();
+    let result = execute_recall(unwrap_recall(plan), &fix.ctx).await.unwrap();
+
+    assert!(!result.hits.is_empty());
+    for hit in &result.hits {
+        let got = hit
+            .text
+            .as_deref()
+            .expect("include_text=true must populate hit.text");
+        let want = by_id
+            .get(&hit.memory_id)
+            .copied()
+            .expect("hit memory_id must be one we seeded");
+        assert_eq!(got, want);
+    }
+}
+
+#[tokio::test]
+async fn recall_include_text_true_on_empty_index_is_a_noop() {
+    let fix = build_fixture(&[]);
+    fix.mock.install("cue", unit_vector_at_dim(0));
+
+    let mut req = base_request("cue", 3);
+    req.include_text = true;
+
+    let plan = plan_recall(&req, &PlannerContext::default()).unwrap();
+    let result = execute_recall(unwrap_recall(plan), &fix.ctx).await.unwrap();
+    // No hits → executor must not open the texts table at all (no
+    // assertion here beyond "doesn't panic / doesn't error").
+    assert!(result.hits.is_empty());
+}
+
+#[tokio::test]
+async fn recall_include_text_true_when_texts_table_unborn_returns_empty() {
+    // The fixture seeds MEMORIES (via build_fixture) but NOT TEXTS.
+    // Recall must surface empty strings, not a `Table does not exist`
+    // error.
+    let memories: Vec<_> = (0..3)
+        .map(|i| (MemoryKind::Episodic, 0.5, unit_vector_at_dim(i)))
+        .collect();
+    let fix = build_fixture(&memories);
+    fix.mock.install("cue", unit_vector_at_dim(0));
+
+    let mut req = base_request("cue", 3);
+    req.include_text = true;
+
+    let plan = plan_recall(&req, &PlannerContext::default()).unwrap();
+    let result = execute_recall(unwrap_recall(plan), &fix.ctx).await.unwrap();
+    assert!(!result.hits.is_empty());
+    for hit in &result.hits {
+        assert_eq!(hit.text.as_deref(), Some(""));
+    }
+}
+
+#[tokio::test]
+async fn recall_include_text_mixed_present_and_missing_rows() {
+    // Three memories, but only two get text rows — simulates a
+    // FORGET race after the memories table was populated.
+    let memories: Vec<_> = (0..3)
+        .map(|i| (MemoryKind::Episodic, 0.5, unit_vector_at_dim(i)))
+        .collect();
+    let fix = build_fixture(&memories);
+    fix.mock.install("cue", unit_vector_at_dim(0));
+    let metadata = fix.ctx.metadata.clone();
+    // Seed only memory_ids[0] and memory_ids[2]; skip the middle.
+    seed_texts(
+        &metadata,
+        &[fix.memory_ids[0], fix.memory_ids[2]],
+        &["zero-text", "two-text"],
+    );
+
+    let mut req = base_request("cue", 3);
+    req.include_text = true;
+    let result = execute_recall(unwrap_recall(plan_recall(&req, &PlannerContext::default()).unwrap()), &fix.ctx)
+        .await
+        .unwrap();
+
+    let by_id: std::collections::HashMap<_, _> = result
+        .hits
+        .iter()
+        .map(|h| (h.memory_id, h.text.as_deref().unwrap_or("<none>").to_string()))
+        .collect();
+    assert_eq!(by_id.get(&fix.memory_ids[0]).map(String::as_str), Some("zero-text"));
+    assert_eq!(by_id.get(&fix.memory_ids[1]).map(String::as_str), Some(""));
+    assert_eq!(by_id.get(&fix.memory_ids[2]).map(String::as_str), Some("two-text"));
+}
+
+#[tokio::test]
+async fn recall_include_text_round_trips_unicode_bytes() {
+    let memories: Vec<_> = (0..1)
+        .map(|i| (MemoryKind::Episodic, 0.5, unit_vector_at_dim(i)))
+        .collect();
+    let fix = build_fixture(&memories);
+    fix.mock.install("cue", unit_vector_at_dim(0));
+    let metadata = fix.ctx.metadata.clone();
+    let stored = "héllo 🌍 — naïve café";
+    seed_texts(&metadata, &fix.memory_ids, &[stored]);
+
+    let mut req = base_request("cue", 1);
+    req.include_text = true;
+    let result = execute_recall(unwrap_recall(plan_recall(&req, &PlannerContext::default()).unwrap()), &fix.ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.hits[0].text.as_deref(), Some(stored));
+}
+
+#[tokio::test]
+async fn recall_include_text_with_empty_stored_text_returns_empty_string() {
+    // Distinct from "row missing": the row IS present, value is "".
+    let memories: Vec<_> = (0..1)
+        .map(|i| (MemoryKind::Episodic, 0.5, unit_vector_at_dim(i)))
+        .collect();
+    let fix = build_fixture(&memories);
+    fix.mock.install("cue", unit_vector_at_dim(0));
+    let metadata = fix.ctx.metadata.clone();
+    seed_texts(&metadata, &fix.memory_ids, &[""]);
+
+    let mut req = base_request("cue", 1);
+    req.include_text = true;
+    let result = execute_recall(unwrap_recall(plan_recall(&req, &PlannerContext::default()).unwrap()), &fix.ctx)
+        .await
+        .unwrap();
+
+    // Some("") is the right shape — empty IS the stored value, not
+    // "missing" (which would also yield Some("") here, but we want
+    // both paths to behave the same).
+    assert_eq!(result.hits[0].text.as_deref(), Some(""));
+}
+
+#[tokio::test]
+async fn recall_include_text_with_invalid_utf8_in_texts_table_surfaces_internal_error() {
+    use brain_metadata::tables::text::TEXTS_TABLE;
+    let memories: Vec<_> = (0..1)
+        .map(|i| (MemoryKind::Episodic, 0.5, unit_vector_at_dim(i)))
+        .collect();
+    let fix = build_fixture(&memories);
+    fix.mock.install("cue", unit_vector_at_dim(0));
+
+    // Insert raw bytes that are not valid UTF-8 (a lone 0x80
+    // continuation byte). The encoded write path can never produce
+    // this — we go straight to redb to fake corruption.
+    {
+        let mut guard = fix.ctx.metadata.lock();
+        let wtxn = guard.write_txn().unwrap();
+        {
+            let mut t = wtxn.open_table(TEXTS_TABLE).unwrap();
+            t.insert(fix.memory_ids[0].to_be_bytes(), [0x80_u8].as_slice())
+                .unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+
+    let mut req = base_request("cue", 1);
+    req.include_text = true;
+    let err = execute_recall(unwrap_recall(plan_recall(&req, &PlannerContext::default()).unwrap()), &fix.ctx)
+        .await
+        .expect_err("corrupt UTF-8 must fail recall, not silently coerce");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("UTF-8") || msg.contains("utf8"),
+        "error should mention UTF-8, got: {msg}",
+    );
 }
 
 #[test]

@@ -1,0 +1,47 @@
+# OpenTelemetry Collector config for the Brain compose stack.
+#
+# Receives OTLP/HTTP traces from brain-server, logs them via the
+# debug exporter (visible in `docker compose logs otel-collector`),
+# and exposes its own scrape endpoint for Prometheus.
+#
+# Replace the `exporters` section with a real backend (Tempo, Jaeger,
+# Honeycomb, etc.) for production. See:
+# https://opentelemetry.io/docs/collector/configuration/
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+
+exporters:
+  debug:
+    verbosity: normal
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  telemetry:
+    metrics:
+      address: 0.0.0.0:8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]

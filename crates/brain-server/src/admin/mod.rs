@@ -4,16 +4,30 @@
 //! hand-rolled HTTP/1.1 parser + writeln-chain that lived here through
 //! Phase 10.
 //!
-//! Spec §14/01. Binds a separate listener on `cfg.server.metrics_addr`
-//! (default `127.0.0.1:9091`) and serves:
+//! ## Two listeners
 //!
-//! - `GET /healthz` → `200 OK\nok`
-//! - `GET /metrics` → Prometheus text-format exposition
-//! - `/v1/snapshots`, `/v1/rebuild-ann`, `/v1/workers`, `/v1/config`,
-//!   `/v1/audit`, `/v1/agents`, `/v1/shards`, `/v1/diagnostics/*`
-//!   — see the per-family handler modules.
-//! - unknown paths → `404 Not Found` (was `400 Bad Request` pre-M3
-//!   — wire-behaviour delta documented in the M3 commit message).
+//! Production binds **two** [`AdminServer`] instances:
+//!
+//! - **Public** (constructed via [`AdminServer::public`], bound to
+//!   `cfg.server.metrics_addr`, default `127.0.0.1:9091`):
+//!   `GET /healthz` + `GET /metrics`. Safe to expose to load
+//!   balancers and Prometheus scrapers.
+//! - **Admin** (constructed via [`AdminServer::admin`], bound to
+//!   `cfg.server.admin_addr`, default `127.0.0.1:9092` — loopback):
+//!   every `/v1/*` route (snapshots, rebuild-ann, workers, config,
+//!   audit, agents, shards, diagnostics). Operationally sensitive;
+//!   v1 has no built-in authentication so the loopback default
+//!   matters. Front with mTLS / a token-checking reverse proxy if
+//!   you bind it to a public interface.
+//!
+//! Unknown paths → `404 Not Found` (was `400 Bad Request` pre-M3 —
+//! wire-behaviour delta documented in the M3 commit message). Routes
+//! that exist on the "other" listener also 404 — `/v1/workers` on
+//! `metrics_addr` and `/metrics` on `admin_addr` both fail closed.
+//!
+//! Spec §14/01 (metrics) + §14/06 (admin). The unified
+//! [`AdminServer::new`] constructor still exists for the test
+//! harness; production must not use it.
 
 #![cfg(target_os = "linux")]
 
@@ -109,6 +123,27 @@ impl AdminState {
 // AdminServer
 // ---------------------------------------------------------------------------
 
+/// Which router this listener serves. See module docs.
+#[derive(Clone, Copy, Debug)]
+enum RouterKind {
+    /// `/healthz` + `/metrics`.
+    Public,
+    /// `/v1/*`.
+    Admin,
+    /// Both, on one listener. Test-only.
+    Unified,
+}
+
+impl RouterKind {
+    fn log_name(self) -> &'static str {
+        match self {
+            RouterKind::Public => "metrics server",
+            RouterKind::Admin => "admin server",
+            RouterKind::Unified => "admin server",
+        }
+    }
+}
+
 /// Pre-bind admin server descriptor. Call [`Self::bind`] to acquire
 /// the TCP listener, then [`BoundAdminServer::serve`] to enter the
 /// accept loop.
@@ -116,6 +151,7 @@ pub struct AdminServer {
     listen_addr: SocketAddr,
     state: Arc<AdminState>,
     shutdown: ShutdownSignal,
+    kind: RouterKind,
 }
 
 /// Admin server with its TCP listener already bound. Holds the
@@ -125,14 +161,43 @@ pub struct BoundAdminServer {
     bound: BoundServer,
     local_addr: SocketAddr,
     shutdown: ShutdownSignal,
+    log_name: &'static str,
 }
 
 impl AdminServer {
+    /// Public listener: `/healthz` + `/metrics` only.
+    pub fn public(
+        listen_addr: SocketAddr,
+        state: Arc<AdminState>,
+        shutdown: ShutdownSignal,
+    ) -> Self {
+        Self {
+            listen_addr,
+            state,
+            shutdown,
+            kind: RouterKind::Public,
+        }
+    }
+
+    /// Admin listener: `/v1/*` only.
+    pub fn admin(listen_addr: SocketAddr, state: Arc<AdminState>, shutdown: ShutdownSignal) -> Self {
+        Self {
+            listen_addr,
+            state,
+            shutdown,
+            kind: RouterKind::Admin,
+        }
+    }
+
+    /// Test-only: serve every route on one listener. Production
+    /// uses [`Self::public`] + [`Self::admin`] on separate ports.
+    #[allow(dead_code)] // exercised by tests/admin.rs + tests/support_harness
     pub fn new(listen_addr: SocketAddr, state: Arc<AdminState>, shutdown: ShutdownSignal) -> Self {
         Self {
             listen_addr,
             state,
             shutdown,
+            kind: RouterKind::Unified,
         }
     }
 
@@ -140,7 +205,12 @@ impl AdminServer {
     /// listener bind sits behind an `async fn` (matches the underlying
     /// tokio TCP listener API).
     pub async fn bind(self) -> io::Result<BoundAdminServer> {
-        let router = router::build(self.state.clone());
+        let router = match self.kind {
+            RouterKind::Public => router::build_public(self.state.clone()),
+            RouterKind::Admin => router::build_admin(self.state.clone()),
+            RouterKind::Unified => router::build_unified(self.state.clone()),
+        };
+        let log_name = self.kind.log_name();
         let bound = HttpServer::bind(self.listen_addr)
             .router(router)
             .listen()
@@ -150,11 +220,12 @@ impl AdminServer {
                 other => io::Error::other(format!("brain-http bind: {other}")),
             })?;
         let local_addr = bound.local_addr()?;
-        info!(addr = %local_addr, "admin server bound");
+        info!(addr = %local_addr, "{log_name} bound");
         Ok(BoundAdminServer {
             bound,
             local_addr,
             shutdown: self.shutdown,
+            log_name,
         })
     }
 }
@@ -173,7 +244,8 @@ impl BoundAdminServer {
     /// — same shape as the pre-M3 API.
     pub async fn serve(mut self) -> io::Result<SocketAddr> {
         let local_addr = self.local_addr;
-        info!(addr = %local_addr, "admin server accepting");
+        let log_name = self.log_name;
+        info!(addr = %local_addr, "{log_name} accepting");
 
         // Bridge: brain-server::ShutdownSignal → brain-http::ShutdownHandle.
         // When the project-wide shutdown fires, trigger brain-http's
@@ -194,12 +266,12 @@ impl BoundAdminServer {
 
         match result {
             Ok(()) => {
-                info!(addr = %local_addr, "admin server shutdown complete");
+                info!(addr = %local_addr, "{log_name} shutdown complete");
                 Ok(local_addr)
             }
             Err(brain_http::Error::Io(e)) => Err(e),
             Err(other) => {
-                warn!(addr = %local_addr, error = %other, "admin server exited with error");
+                warn!(addr = %local_addr, error = %other, "{log_name} exited with error");
                 Err(io::Error::other(format!("brain-http run: {other}")))
             }
         }

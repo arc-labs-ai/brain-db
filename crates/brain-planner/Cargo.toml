@@ -23,6 +23,10 @@ regex = { workspace = true }
 # 23.5: filter chain reads MetadataDb via a single redb
 # ReadTransaction shared across the five filters.
 redb = { workspace = true }
+# Spec §07/07 §6 — content hash for opt-in dedup. The hash is
+# computed in `execute_encode` so the writer hot path stays
+# pure-redb under the metadata lock.
+blake3 = { workspace = true }
 
 [dev-dependencies]
 uuid.workspace = true

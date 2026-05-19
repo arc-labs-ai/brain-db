@@ -181,3 +181,38 @@ specs:
 spec-stats:
     @echo "Total spec files: $(find spec -name '*.md' | wc -l)"
     @echo "Total spec lines: $(find spec -name '*.md' -exec cat {} \; | wc -l)"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Production Docker — distinct from the `.devcontainer/` recipes above
+# (those build a dev image for Linux cross-compile from macOS). The recipes
+# below build the runtime image that ships to operators and runs Brain itself.
+# Full guide: docs/guides/deployment/docker.md
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Build the production image. Uses BuildKit cache mounts — first build
+# takes ~15 min from cold; subsequent builds reuse the cargo cache.
+image TAG="latest":
+    DOCKER_BUILDKIT=1 docker build -t brain:{{TAG}} .
+
+# Run the production image with a named volume for data. Foreground;
+# Ctrl-C stops it. Smoke-test target after the image-build path.
+image-run TAG="latest":
+    @docker rm -f brain >/dev/null 2>&1 || true
+    docker run --rm --name brain \
+        -p 8080:8080 -p 9091:9091 \
+        -v brain-data:/var/lib/brain/data \
+        -v brain-models:/var/lib/brain/models \
+        brain:{{TAG}}
+
+# Bring up the full compose stack (brain + prometheus + otel-collector + grafana).
+# See docs/guides/deployment/docker-compose.md for the walkthrough.
+compose-up:
+    docker compose up -d --build
+    @echo
+    @echo "brain         : http://127.0.0.1:9091/healthz"
+    @echo "prometheus UI : http://127.0.0.1:9090"
+    @echo "grafana       : http://127.0.0.1:3000 (anonymous viewer enabled)"
+
+# Tear down the compose stack. Pass `-v` to also drop data volumes.
+compose-down *ARGS:
+    docker compose down {{ARGS}}

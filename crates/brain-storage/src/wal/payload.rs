@@ -44,6 +44,20 @@ pub struct EncodePayload {
     /// Empty `Vec` means "vector excluded" (spec's optional-include mode).
     pub vector: Vec<f32>,
     pub edges: Vec<EdgePayload>,
+    /// blake3 of the canonical request body. Recovery uses this to
+    /// repopulate the idempotency cache so a retry after restart with
+    /// the same `request_id` returns the original response if the
+    /// payload matches, and `Conflict` if it diverges.
+    pub request_hash: [u8; 32],
+    /// Bytes of the original encoded response (rkyv of EncodeResponse).
+    /// Recovery replays this verbatim on idempotency hit so the client
+    /// sees a byte-identical reply across restarts.
+    pub response_payload: Vec<u8>,
+    /// True if the originating ENCODE opted into content-hash
+    /// deduplication. Recovery uses this to know whether to insert a
+    /// FINGERPRINTS row (and stamp the memory's back-reference). False
+    /// for ordinary ENCODE writes — the dedup index stays untouched.
+    pub deduplicate: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -59,6 +73,12 @@ pub struct EdgePayload {
 pub struct ForgetPayload {
     pub memory_id: MemoryId,
     pub request_id: RequestId,
+    /// Agent the FORGET ran under. Carried in the WAL so subscribe-
+    /// replay can route Forgotten events through the same per-agent
+    /// allowlist that filters live publishes — without it, a
+    /// multi-tenant subscriber filtering by `agents` would silently
+    /// drop every replayed forget.
+    pub agent_id: AgentId,
     pub mode: ForgetMode,
     pub reason: ForgetReason,
 }
@@ -213,6 +233,13 @@ use crate::wal::kinds::WalRecordKind;
 #[derive(Debug, Clone, PartialEq)]
 pub struct KnowledgeRecord {
     pub kind: WalRecordKind,
+    /// Agent the knowledge mutation ran under. Carried in the WAL
+    /// alongside the opaque body so subscribe-replay can route
+    /// knowledge events through the per-agent `agents` filter the
+    /// same way it routes substrate events. Without it, a multi-
+    /// tenant subscriber would silently drop every replayed
+    /// knowledge event.
+    pub agent_id: AgentId,
     pub body: Vec<u8>,
 }
 
@@ -221,12 +248,16 @@ impl KnowledgeRecord {
     /// `kind.is_knowledge()`; passing a substrate kind is a programmer
     /// error and panics in debug builds.
     #[must_use]
-    pub fn new(kind: WalRecordKind, body: Vec<u8>) -> Self {
+    pub fn new(kind: WalRecordKind, agent_id: AgentId, body: Vec<u8>) -> Self {
         debug_assert!(
             kind.is_knowledge(),
             "KnowledgeRecord requires a knowledge-layer kind (0x10..=0x50); got {kind:?}"
         );
-        Self { kind, body }
+        Self {
+            kind,
+            agent_id,
+            body,
+        }
     }
 }
 
@@ -298,7 +329,11 @@ impl WalPayload {
             Self::TxnCommit(p) => encode_txn_commit(p, &mut out),
             Self::TxnAbort(p) => encode_txn_abort(p, &mut out),
             Self::MigrateEmbedding(p) => encode_migrate_embedding(p, &mut out),
-            Self::Knowledge(r) => out.extend_from_slice(&r.body),
+            Self::Knowledge(r) => {
+                // Layout: agent_id (16 B) || opaque body.
+                put_uuid_bytes(&mut out, r.agent_id.into());
+                out.extend_from_slice(&r.body);
+            }
         }
         out
     }
@@ -346,7 +381,16 @@ impl WalPayload {
             | WalRecordKind::RelationTombstone
             | WalRecordKind::SchemaUpdate
             | WalRecordKind::Audit => {
-                return Ok(Self::Knowledge(KnowledgeRecord::new(kind, bytes.to_vec())));
+                // Layout: agent_id (16 B) || opaque body. The body
+                // remains opaque to the framing layer; phases 16+
+                // supply typed parsers via their own sinks.
+                let agent_id: AgentId = r.array16()?.into();
+                let body = bytes[r.cursor..].to_vec();
+                return Ok(Self::Knowledge(KnowledgeRecord {
+                    kind,
+                    agent_id,
+                    body,
+                }));
             }
         };
         if !r.is_at_end() {
@@ -403,7 +447,14 @@ pub enum WalPayloadError {
 
     #[error("edge_count {0} exceeds remaining payload bytes")]
     BadEdgeCount(u16),
+
+    #[error("blob_length {0} exceeds cap or remaining payload bytes")]
+    BadBlobLength(u32),
 }
+
+/// Cap on `response_payload` length (in bytes). 1 MiB is far past any
+/// rkyv-encoded substrate response; a larger value is corruption.
+pub const RESPONSE_BLOB_MAX: u32 = 1024 * 1024;
 
 /// Cap on `vector_dims` (in f32 elements). 4096 dims = 16 KiB vector — well
 /// past the largest production embedding model we expect to encounter. A
@@ -558,6 +609,22 @@ fn read_text(r: &mut Reader<'_>) -> Result<String, WalPayloadError> {
         .map_err(|_| WalPayloadError::BadUtf8)
 }
 
+fn put_blob(out: &mut Vec<u8>, bytes: &[u8]) {
+    put_u32_le(
+        out,
+        u32::try_from(bytes.len()).expect("invariant: blob fits in u32"),
+    );
+    out.extend_from_slice(bytes);
+}
+
+fn read_blob(r: &mut Reader<'_>) -> Result<Vec<u8>, WalPayloadError> {
+    let len = r.u32_le()?;
+    if len > RESPONSE_BLOB_MAX || len as usize > r.remaining() {
+        return Err(WalPayloadError::BadBlobLength(len));
+    }
+    Ok(r.take(len as usize)?.to_vec())
+}
+
 // MemoryKind <-> u8 mapping. Mirrors brain_protocol::MemoryKindWire so the
 // wire and storage representations agree on the byte values, but kept local
 // to brain-storage so this crate doesn't depend on the protocol crate.
@@ -648,6 +715,9 @@ fn encode_encode(p: &EncodePayload, out: &mut Vec<u8>) {
         put_f32_le(out, e.weight);
         out.push(e.origin as u8);
     }
+    out.extend_from_slice(&p.request_hash);
+    put_blob(out, &p.response_payload);
+    out.push(u8::from(p.deduplicate));
 }
 
 fn decode_encode(r: &mut Reader<'_>) -> Result<EncodePayload, WalPayloadError> {
@@ -680,6 +750,14 @@ fn decode_encode(r: &mut Reader<'_>) -> Result<EncodePayload, WalPayloadError> {
             origin,
         });
     }
+    let request_hash = {
+        let b = r.take(32)?;
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(b);
+        arr
+    };
+    let response_payload = read_blob(r)?;
+    let deduplicate = r.u8()? != 0;
     Ok(EncodePayload {
         memory_id,
         request_id,
@@ -691,12 +769,16 @@ fn decode_encode(r: &mut Reader<'_>) -> Result<EncodePayload, WalPayloadError> {
         text,
         vector,
         edges,
+        request_hash,
+        response_payload,
+        deduplicate,
     })
 }
 
 fn encode_forget(p: &ForgetPayload, out: &mut Vec<u8>) {
     put_memory_id(out, p.memory_id);
     put_uuid_bytes(out, p.request_id.into());
+    put_uuid_bytes(out, p.agent_id.into());
     out.push(p.mode as u8);
     out.push(p.reason as u8);
 }
@@ -705,6 +787,7 @@ fn decode_forget(r: &mut Reader<'_>) -> Result<ForgetPayload, WalPayloadError> {
     Ok(ForgetPayload {
         memory_id: r.memory_id()?,
         request_id: r.array16()?.into(),
+        agent_id: r.array16()?.into(),
         mode: forget_mode_from_u8(r.u8()?)?,
         reason: forget_reason_from_u8(r.u8()?)?,
     })
@@ -980,10 +1063,14 @@ mod tests {
                     weight: 0.9,
                     origin: EdgeOrigin::Explicit,
                 }],
+                request_hash: [0x11; 32],
+                response_payload: b"response-bytes".to_vec(),
+                deduplicate: true,
             }),
             WalPayload::Forget(ForgetPayload {
                 memory_id: mid(9),
                 request_id: rid(3),
+                agent_id: aid(4),
                 mode: ForgetMode::Hard,
                 reason: ForgetReason::Eviction,
             }),
@@ -1187,6 +1274,9 @@ mod tests {
             text: "ab".into(),
             vector: vec![],
             edges: vec![],
+            request_hash: [0; 32],
+            response_payload: vec![],
+            deduplicate: false,
         });
         let mut bytes = p.encode_to_bytes();
         // Text starts after MemoryId(16) + RequestId(16) + AgentId(16)
@@ -1239,9 +1329,100 @@ mod tests {
             text: String::new(),
             vector: vec![],
             edges: vec![],
+            request_hash: [0; 32],
+            response_payload: vec![],
+            deduplicate: false,
         });
         let bytes = p.encode_to_bytes();
         assert_eq!(WalPayload::decode(p.kind(), &bytes).unwrap(), p);
+    }
+
+    #[test]
+    fn encode_payload_with_request_hash_round_trips() {
+        // request_hash is a 32-byte blake3 of the canonical request body;
+        // recovery needs it byte-identical so the idempotency cache can
+        // detect a same-id-different-params conflict.
+        let hash: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let p = WalPayload::Encode(EncodePayload {
+            memory_id: mid(1),
+            request_id: rid(0),
+            agent_id: aid(0),
+            context_id: ContextId(0),
+            kind: MemoryKind::Episodic,
+            salience_initial: 0.0,
+            embedding_model_fp: fp(0),
+            text: "hi".into(),
+            vector: vec![],
+            edges: vec![],
+            request_hash: hash,
+            response_payload: vec![],
+            deduplicate: false,
+        });
+        let bytes = p.encode_to_bytes();
+        match WalPayload::decode(WalRecordKind::Encode, &bytes).unwrap() {
+            WalPayload::Encode(decoded) => assert_eq!(decoded.request_hash, hash),
+            other => panic!("expected Encode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_payload_with_response_payload_round_trips() {
+        // response_payload is an rkyv blob; recovery replays it verbatim
+        // to a retried client.
+        let body: Vec<u8> = (0..256u16).map(|i| (i & 0xFF) as u8).collect();
+        let p = WalPayload::Encode(EncodePayload {
+            memory_id: mid(1),
+            request_id: rid(0),
+            agent_id: aid(0),
+            context_id: ContextId(0),
+            kind: MemoryKind::Episodic,
+            salience_initial: 0.0,
+            embedding_model_fp: fp(0),
+            text: "hi".into(),
+            vector: vec![],
+            edges: vec![],
+            request_hash: [0; 32],
+            response_payload: body.clone(),
+            deduplicate: false,
+        });
+        let bytes = p.encode_to_bytes();
+        match WalPayload::decode(WalRecordKind::Encode, &bytes).unwrap() {
+            WalPayload::Encode(decoded) => assert_eq!(decoded.response_payload, body),
+            other => panic!("expected Encode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_encode_payload_without_new_fields_errors_cleanly() {
+        // The hard-cut design means a WAL written by a pre-PR binary
+        // lacks the trailing request_hash + response_payload tail. A
+        // load attempt must fail loudly so operators see "wipe and
+        // restart," not silent zeros.
+        let p = WalPayload::Encode(EncodePayload {
+            memory_id: mid(1),
+            request_id: rid(0),
+            agent_id: aid(0),
+            context_id: ContextId(0),
+            kind: MemoryKind::Episodic,
+            salience_initial: 0.0,
+            embedding_model_fp: fp(0),
+            text: String::new(),
+            vector: vec![],
+            edges: vec![],
+            request_hash: [0; 32],
+            response_payload: vec![],
+            deduplicate: false,
+        });
+        let full = p.encode_to_bytes();
+        // Drop the 32-byte hash + 4-byte response_payload length + 1-byte
+        // deduplicate flag tail (37 bytes total) — what a pre-PR binary
+        // would have written.
+        let legacy_len = full.len() - 32 - 4 - 1;
+        let legacy = &full[..legacy_len];
+        match WalPayload::decode(WalRecordKind::Encode, legacy) {
+            Err(WalPayloadError::Underrun { .. }) => {}
+            other => panic!("expected Underrun on legacy payload, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1277,14 +1458,19 @@ mod tests {
             WalRecordKind::Audit,
         ] {
             let body: Vec<u8> = (0..32u8).map(|i| i ^ kind.as_u8()).collect();
-            let payload = WalPayload::Knowledge(KnowledgeRecord::new(kind, body.clone()));
+            let agent = aid(kind.as_u8());
+            let payload =
+                WalPayload::Knowledge(KnowledgeRecord::new(kind, agent, body.clone()));
             assert_eq!(payload.kind(), kind);
             let bytes = payload.encode_to_bytes();
-            assert_eq!(bytes, body, "encode is identity for knowledge bodies");
+            // Layout: 16-byte agent_id, then the opaque body.
+            assert_eq!(bytes.len(), 16 + body.len());
+            assert_eq!(&bytes[16..], body.as_slice());
             let decoded = WalPayload::decode(kind, &bytes).expect("decode knowledge");
             match decoded {
                 WalPayload::Knowledge(r) => {
                     assert_eq!(r.kind, kind);
+                    assert_eq!(r.agent_id, agent);
                     assert_eq!(r.body, body);
                 }
                 other => panic!("expected Knowledge, got {other:?}"),
@@ -1293,14 +1479,39 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_agent_id_round_trips_through_encode_decode() {
+        // The new `agent_id` field must survive an encode_to_bytes →
+        // decode round-trip so subscribe-replay can route knowledge
+        // events through the per-agent `agents` filter.
+        let agent = aid(0x7F);
+        let body = b"opaque-rkyv-blob".to_vec();
+        let payload = WalPayload::Knowledge(KnowledgeRecord::new(
+            WalRecordKind::EntityCreate,
+            agent,
+            body.clone(),
+        ));
+        let bytes = payload.encode_to_bytes();
+        match WalPayload::decode(WalRecordKind::EntityCreate, &bytes).unwrap() {
+            WalPayload::Knowledge(r) => {
+                assert_eq!(r.agent_id, agent);
+                assert_eq!(r.body, body);
+            }
+            other => panic!("expected Knowledge, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn knowledge_decode_empty_body_is_ok() {
         // An empty body is a legal opaque payload (a tombstone marker,
-        // for instance, may carry no fields).
-        let payload =
-            WalPayload::decode(WalRecordKind::EntityTombstone, &[]).expect("empty body decodes");
+        // for instance, may carry no fields). The 16-byte agent_id
+        // prefix is still mandatory.
+        let agent_bytes = [0u8; 16];
+        let payload = WalPayload::decode(WalRecordKind::EntityTombstone, &agent_bytes)
+            .expect("empty body decodes");
         match payload {
             WalPayload::Knowledge(r) => {
                 assert_eq!(r.kind, WalRecordKind::EntityTombstone);
+                assert_eq!(r.agent_id, AgentId::from(agent_bytes));
                 assert!(r.body.is_empty());
             }
             other => panic!("expected Knowledge, got {other:?}"),
@@ -1308,15 +1519,29 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_decode_rejects_short_prefix() {
+        // Anything shorter than the 16-byte agent_id prefix must
+        // underrun rather than silently succeeding.
+        for n in 0..16 {
+            match WalPayload::decode(WalRecordKind::EntityTombstone, &vec![0u8; n]) {
+                Err(WalPayloadError::Underrun { .. }) => {}
+                other => panic!("expected Underrun for {n}-byte payload, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn knowledge_decode_skips_trailing_bytes_check() {
         // For substrate kinds, trailing bytes after the structured tail
-        // are an error. For knowledge kinds the entire payload IS the
-        // body — no such check applies. Verify by feeding garbage.
-        let body = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
-        let decoded =
-            WalPayload::decode(WalRecordKind::SchemaUpdate, &body).expect("knowledge accepts any bytes");
+        // are an error. For knowledge kinds the bytes following the
+        // 16-byte agent_id prefix are the opaque body — no such check
+        // applies. Verify by feeding garbage past the prefix.
+        let mut bytes = vec![0u8; 16];
+        bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE]);
+        let decoded = WalPayload::decode(WalRecordKind::SchemaUpdate, &bytes)
+            .expect("knowledge accepts any bytes after prefix");
         if let WalPayload::Knowledge(r) = decoded {
-            assert_eq!(r.body, body);
+            assert_eq!(r.body, bytes[16..].to_vec());
         } else {
             panic!("expected Knowledge");
         }
@@ -1329,6 +1554,35 @@ mod tests {
         // substrate kind panics. (In release builds the debug_assert is
         // elided; that's intentional — callers are not expected to feed
         // adversarial kinds.)
-        let _ = KnowledgeRecord::new(WalRecordKind::Encode, vec![]);
+        let _ = KnowledgeRecord::new(WalRecordKind::Encode, AgentId::default(), vec![]);
+    }
+
+    #[test]
+    fn forget_payload_agent_id_round_trips() {
+        // The new `agent_id` field on ForgetPayload must survive a
+        // full encode_to_bytes → decode round-trip so subscribe-
+        // replay can populate EventEnvelope.agent_id from a
+        // non-default value (the live-publish path already stamps
+        // it from the writer; replay used to fall back to nil and
+        // silently drop forgets for any `agents`-filtered
+        // subscriber).
+        let agent = aid(0x42);
+        let payload = WalPayload::Forget(ForgetPayload {
+            memory_id: mid(99),
+            request_id: rid(7),
+            agent_id: agent,
+            mode: ForgetMode::Hard,
+            reason: ForgetReason::ClientRequest,
+        });
+        let bytes = payload.encode_to_bytes();
+        match WalPayload::decode(WalRecordKind::Forget, &bytes).unwrap() {
+            WalPayload::Forget(p) => {
+                assert_eq!(p.agent_id, agent);
+                assert_eq!(p.memory_id, mid(99));
+                assert_eq!(p.mode, ForgetMode::Hard);
+                assert_eq!(p.reason, ForgetReason::ClientRequest);
+            }
+            other => panic!("expected Forget, got {other:?}"),
+        }
     }
 }

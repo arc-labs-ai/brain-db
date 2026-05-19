@@ -86,7 +86,7 @@ Deferred (each has a `phase-12/<slug>` marker in `crates/brain-server/src/metric
 - [x] OTel spans build (integration against a real collector is operator-side; the runtime ships).
 - [x] All 8 dashboards exist + parse + reference taxonomy metrics (`tests/dashboards.rs`).
 - [x] `monitoring/alerts/brain-rules.yml` carries every spec-mandated alert with valid severities (`tests/alerts.rs`).
-- [x] `just docker-verify` green.
+- [x] Verify suite (fmt-check + build + clippy + test + check-skills) green.
 - [ ] Tag `phase-12-complete`.  *(awaiting user signal)*
 
 ## Notes

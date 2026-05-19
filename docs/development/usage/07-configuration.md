@@ -19,7 +19,7 @@ admin_addr = "127.0.0.1:9092"    # additional admin HTTP
 **Verify:**
 
 ```bash
-just cli --output json config get --key server.listen_addr
+cargo run --bin brain-cli -- --output json config get --key server.listen_addr
 ```
 
 Should echo `"127.0.0.1:9090"`.
@@ -85,7 +85,7 @@ Spec §06/02 documents why these defaults; tuning trade-offs are:
 **Verify:**
 
 ```bash
-just cli --output json config get --key hnsw
+cargo run --bin brain-cli -- --output json config get --key hnsw
 ```
 
 ```json
@@ -139,7 +139,7 @@ each worker does.
 **Verify:**
 
 ```bash
-just cli worker list | head -5
+cargo run --bin brain-cli -- worker list | head -5
 ```
 
 After running for ≥ 10 minutes, you should see `cycles > 0` on the
@@ -218,7 +218,7 @@ BRAIN__TRACING__ENDPOINT=http://localhost:4318/v1/traces
 BRAIN__HNSW__EF_SEARCH=128 \
   cargo run --bin brain-server -- --config config/dev.toml &
 sleep 3
-just cli --output json config get --key hnsw.ef_search
+cargo run --bin brain-cli -- --output json config get --key hnsw.ef_search
 # → 128
 ```
 

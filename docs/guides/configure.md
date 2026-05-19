@@ -9,8 +9,8 @@ Brain reads a TOML config at the path passed via `--config`
 ```toml
 [server]
 listen_addr  = "0.0.0.0:8080"      # data plane (clients + SDK)
-metrics_addr = "0.0.0.0:9091"      # /metrics, /healthz, /v1/*
-admin_addr   = "127.0.0.1:9090"    # admin CLI surface (loopback)
+metrics_addr = "0.0.0.0:9091"      # /healthz + /metrics (public)
+admin_addr   = "127.0.0.1:9092"    # /v1/* admin routes (loopback)
 
 [storage]
 data_dir    = "/var/lib/brain/data"

@@ -142,7 +142,7 @@ pub async fn handle_statement_create(
             confidence: req.confidence,
         }),
         now,
-    );
+    ).await;
 
     // If a Preference was auto-superseded, also emit STATEMENT_SUPERSEDED.
     if let Some(old) = auto_superseded {
@@ -155,7 +155,8 @@ pub async fn handle_statement_create(
                 chain_root: chain_root.to_bytes(),
             }),
             now,
-        );
+        )
+        .await;
     }
 
     // §27/02 §3: statement text indexer dispatch.
@@ -278,7 +279,7 @@ pub async fn handle_statement_supersede(
             chain_root: chain_root.to_bytes(),
         }),
         now,
-    );
+    ).await;
 
     // §27/02 §3: Delete old + Upsert new.
     if let Some(dispatcher) = ctx.statement_text_dispatcher.as_ref() {
@@ -330,7 +331,7 @@ pub async fn handle_statement_tombstone(
             reason: req.reason_message,
         }),
         now,
-    );
+    ).await;
 
     if let Some(dispatcher) = ctx.statement_text_dispatcher.as_ref() {
         dispatcher.dispatch(StatementTextOp::Delete { id }).await;
@@ -378,7 +379,7 @@ pub async fn handle_statement_retract(
             reason: format!("retract: {}", req.reason_message),
         }),
         now,
-    );
+    ).await;
 
     // Retract drops the row from the lexical index (the §19/06
     // grace period only affects when the metadata is zeroed; the

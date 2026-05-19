@@ -367,6 +367,12 @@ async fn do_consolidation_cycle(
                 salience_initial: worker.initial_salience,
                 fingerprint: ctx.ops.executor.embedder.fingerprint(),
                 edges,
+                deduplicate: false,
+                content_hash: [0u8; 32],
+                // Consolidation worker runs server-side, not under
+                // an authenticated client connection. Default
+                // AgentId; consolidated rows aren't tenant-scoped.
+                agent_id: brain_core::AgentId::default(),
             };
             let ack = ctx
                 .ops

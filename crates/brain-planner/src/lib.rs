@@ -215,6 +215,7 @@ mod tests {
                 persistent_id: true,
             },
             estimated_cost_ms: 7.5,
+            deduplicate: false,
         });
         assert!(matches!(plan, ExecutionPlan::Encode(_)));
 

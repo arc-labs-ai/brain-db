@@ -1,0 +1,17 @@
+# Grafana dashboard provisioning for the Brain compose stack.
+# Loads every JSON file under /var/lib/grafana/dashboards (mounted
+# from monitoring/dashboards/ on the host).
+
+apiVersion: 1
+
+providers:
+  - name: brain
+    orgId: 1
+    folder: Brain
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

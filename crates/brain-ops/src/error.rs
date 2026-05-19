@@ -46,9 +46,18 @@ pub enum OpError {
     #[error("too many memories targeted by one request")]
     TooManyMemories,
 
-    /// Spec §09/08 §9 — transaction duration cap exceeded.
+    /// Transaction was Active and either ran past its deadline (the
+    /// sweeper marked it Expired), or has already moved past Active
+    /// (Committed / Aborted). Distinct from `TxnNotFound` — the id
+    /// was real at some point.
     #[error("transaction expired")]
     TxnExpired,
+
+    /// The supplied transaction id has never existed on this server.
+    /// Distinct from `TxnExpired` so clients can tell a typo from a
+    /// timed-out txn and recover accordingly.
+    #[error("transaction not found")]
+    TxnNotFound,
 
     /// Sub-task placeholder. 7.3–7.10 replace each stub handler;
     /// while in flight, the dispatcher returns this for handlers
@@ -81,6 +90,13 @@ pub enum ErrorCode {
     QuotaExceeded,
     Unauthorized,
     Conflict,
+    /// Txn was real at some point but is no longer Active (timed out,
+    /// committed, or aborted). Split from `Conflict` so the
+    /// dispatcher maps it to the right wire code and the SDK can
+    /// detect it programmatically.
+    TxnExpired,
+    /// Txn id never existed on this server.
+    TxnNotFound,
     Overloaded,
     InternalError,
 }
@@ -92,7 +108,9 @@ impl OpError {
         match self {
             Self::InvalidRequest(_) | Self::TooManyMemories => ErrorCode::InvalidRequest,
             Self::NotFound { .. } => ErrorCode::NotFound,
-            Self::Conflict(_) | Self::TxnExpired => ErrorCode::Conflict,
+            Self::Conflict(_) => ErrorCode::Conflict,
+            Self::TxnExpired => ErrorCode::TxnExpired,
+            Self::TxnNotFound => ErrorCode::TxnNotFound,
             Self::QuotaExceeded(_) => ErrorCode::QuotaExceeded,
             Self::Unauthorized(_) => ErrorCode::Unauthorized,
             Self::Overloaded(_) => ErrorCode::Overloaded,

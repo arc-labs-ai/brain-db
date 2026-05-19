@@ -35,15 +35,29 @@ pub const MAX_SLOT_INDEX: u64 = (1u64 << 48) - 1;
 pub struct AgentId(pub Uuid);
 
 impl AgentId {
+    /// All-zero "anonymous / unauthenticated" agent. Stable across
+    /// calls — unlike [`Self::new`] which mints a fresh v7 UUID
+    /// every time. Use this for:
+    /// - Test fixtures that don't authenticate a connection
+    /// - Server-side workers (consolidation, decay) acting without
+    ///   a per-request caller
+    /// - The dispatch shortcut that compares "is this an anonymous
+    ///   request?" (so it knows whether to skip the per-request ctx
+    ///   clone)
+    pub const NIL: Self = Self(Uuid::nil());
+
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::now_v7())
     }
 }
 
+/// `Default::default()` returns [`AgentId::NIL`] — the stable
+/// anonymous sentinel, NOT a fresh UUID. Code that wanted a fresh
+/// agent id should call [`Self::new`] explicitly.
 impl Default for AgentId {
     fn default() -> Self {
-        Self::new()
+        Self::NIL
     }
 }
 

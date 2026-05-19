@@ -465,6 +465,7 @@ mod tests {
                 persistent_id: true,
             },
             estimated_cost_ms: 9.86,
+            deduplicate: false,
         }
     }
 

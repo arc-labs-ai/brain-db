@@ -22,8 +22,9 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::access_buffer::AccessBuffer;
 use crate::ops::text_indexer::{MemoryTextDispatcher, StatementTextDispatcher};
+use crate::ops::writer::WalSink;
 use crate::schema_gate::SchemaGate;
-use crate::subscribe::{EventBus, SubscriptionRegistry};
+use crate::subscribe::{EventBus, EventEnvelope, SubscriptionRegistry};
 use crate::txn::TxnStore;
 
 /// Default bounded poll window for the one-shot SUBSCRIBE dispatcher
@@ -102,6 +103,23 @@ pub struct OpsContext {
     /// `handle_schema_upload` after a successful commit. Spec
     /// §28/08 §1.
     pub schema_gate: SchemaGate,
+    /// WAL append sink for the knowledge-layer subscribe-replay
+    /// pipeline. Knowledge handlers ([`crate::ops::knowledge_*`])
+    /// call [`OpsContext::publish_knowledge`] after their successful
+    /// redb commit; that helper appends a `WalPayload::Knowledge`
+    /// record carrying the rkyv-encoded
+    /// [`brain_protocol::knowledge::KnowledgeEventPayload`] body, then
+    /// publishes the matching [`EventEnvelope`] on the bus with the
+    /// WAL-assigned LSN. When `None`, the helper falls back to a
+    /// pure bus publish (test wiring / substrate-only deployments).
+    ///
+    /// Knowledge ops are post-commit WAL'd (not pre-commit like
+    /// substrate ENCODE/FORGET): redb is the source of truth for
+    /// knowledge state; the WAL record exists purely so subscribe-
+    /// replay can reconstruct the event stream. A crash between
+    /// commit and WAL append loses the matching subscribe event for
+    /// that op, not the underlying knowledge data.
+    pub wal_sink: Option<Arc<dyn WalSink>>,
 }
 
 impl OpsContext {
@@ -127,6 +145,7 @@ impl OpsContext {
             semantic_retriever: None,
             graph_retriever: None,
             schema_gate: SchemaGate::default(),
+            wal_sink: None,
         }
     }
 
@@ -268,4 +287,106 @@ impl OpsContext {
         self.schema_gate = gate;
         self
     }
+
+    /// Install (or clear) the WAL sink for knowledge-layer event
+    /// publishing. The shard's spawn path wires the same sink that
+    /// the writer uses, so substrate and knowledge events share one
+    /// LSN domain.
+    #[must_use]
+    pub fn with_wal_sink(mut self, sink: Option<Arc<dyn WalSink>>) -> Self {
+        self.wal_sink = sink;
+        self
+    }
+
+    /// Publish a knowledge-layer event: WAL-append the rkyv-encoded
+    /// payload (if a sink is wired), then publish to the bus with
+    /// the assigned LSN. The `kind` discriminates the WAL record
+    /// type so subscribe-replay can decode it back into the matching
+    /// `KnowledgeEventPayload` variant.
+    ///
+    /// `agent_id` stamps the WAL record so subscribe-replay can
+    /// route knowledge events through the per-agent `agents`
+    /// filter — without it, a multi-tenant subscriber would
+    /// silently drop every replayed knowledge event.
+    ///
+    /// `make_envelope` builds the bus envelope from the assigned LSN.
+    /// Most callers will just stamp `lsn` and clone their payload in.
+    pub async fn publish_knowledge<F>(
+        &self,
+        kind: brain_storage::wal::kinds::WalRecordKind,
+        agent_id: brain_core::AgentId,
+        payload: brain_protocol::knowledge::KnowledgeEventPayload,
+        make_envelope: F,
+    ) where
+        F: FnOnce(u64, brain_protocol::knowledge::KnowledgeEventPayload) -> EventEnvelope,
+    {
+        debug_assert!(
+            kind.is_knowledge(),
+            "publish_knowledge expects a knowledge-layer WalRecordKind, got {kind:?}"
+        );
+        let lsn = if let Some(sink) = &self.wal_sink {
+            // rkyv-encode the typed payload as the WAL record body.
+            // Subscribe-replay's `from_wal_record` decodes it back.
+            let body = match rkyv::to_bytes::<_, 1024>(&payload) {
+                Ok(b) => b.into_vec(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "rkyv encode of knowledge event failed; publishing bus-only");
+                    let _ = self.events.publish(make_envelope(0, payload));
+                    return;
+                }
+            };
+            let body_len = body.len();
+            let agent_bytes: [u8; 16] = agent_id.into();
+            let agent_id_lo64 = u64::from_be_bytes(
+                agent_bytes[8..16]
+                    .try_into()
+                    .expect("invariant: AgentId is 16 bytes"),
+            );
+            // Build through KnowledgeRecord so the payload bytes carry
+            // the agent_id prefix that subscribe-replay's `from_wal_record`
+            // decodes back into `EventEnvelope.agent_id`.
+            let typed = brain_storage::wal::payload::WalPayload::Knowledge(
+                brain_storage::wal::payload::KnowledgeRecord::new(kind, agent_id, body),
+            );
+            let record = brain_storage::wal::record::WalRecord::from_typed(
+                brain_storage::wal::record::Lsn(0),
+                0,
+                now_unix_nanos_ctx(),
+                agent_id_lo64,
+                &typed,
+            );
+            match sink.append(record).await {
+                Ok(lsn) => {
+                    tracing::trace!(
+                        ?kind,
+                        body_len,
+                        lsn = lsn.raw(),
+                        "knowledge event WAL-recorded"
+                    );
+                    lsn.raw()
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "knowledge event WAL append failed; bus-only publish");
+                    self.events.current_lsn().saturating_add(1)
+                }
+            }
+        } else {
+            // No sink wired — fall through to bus's allocator.
+            0
+        };
+        let env = make_envelope(lsn, payload);
+        if lsn == 0 {
+            self.events.publish(env);
+        } else {
+            self.events.publish_prestamped(env);
+        }
+    }
+}
+
+fn now_unix_nanos_ctx() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }

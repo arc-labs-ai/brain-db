@@ -50,7 +50,7 @@ Implement backfill jobs, FORGET cascade, supersession sweeper, audit log sweeper
 - [x] `scripts/schema-toggle-e2e.sh` runbook-mirroring bash driver.
 - [x] `scripts/full-acceptance.sh` orchestrator.
 - [x] `scripts/spec-link-check.sh` cross-ref validator.
-- [x] `docs/tutorials/01-getting-started.md` 15-minute walkthrough.
+- [x] `docs/tutorials/02-first-substrate-app.md` (originally landed as `01-getting-started.md`; renumbered when `01-quickstart-docker.md` was added) 15-minute walkthrough.
 - [x] `CHANGELOG.md` v1.0.0 release notes.
 
 ## Scope cuts (v1)

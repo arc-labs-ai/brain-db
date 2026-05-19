@@ -5,7 +5,7 @@
 //! `spec/27_knowledge_workers/02_text_indexer_workers.md` §3.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use brain_core::knowledge::{Statement, StatementObject, StatementValue, SubjectRef};
 use brain_core::{StatementId, StatementKind};
@@ -14,7 +14,6 @@ use flume::{bounded, Receiver, Sender};
 use tantivy::schema::Field;
 use tantivy::{IndexWriter, TantivyDocument, TantivyError, Term};
 use thiserror::Error;
-use tokio::time::{timeout_at, Instant as TokioInstant};
 use tracing::{error, warn};
 
 use super::{CommitPolicy, DEFAULT_QUEUE_CAPACITY};
@@ -127,8 +126,10 @@ pub fn spawn_statement_text_indexer_local(
     Ok(())
 }
 
-/// Test / non-Linux entry point. Returns the loop future; the
-/// caller picks the runtime.
+/// Build the writer + resolved fields and run the drain loop on
+/// the current Glommio executor. See the matching docs on
+/// [`super::memory::run_memory_text_indexer`].
+#[cfg(target_os = "linux")]
 pub async fn run_statement_text_indexer(
     handle: IndexHandle,
     rx: Receiver<StatementTextOp>,
@@ -156,6 +157,31 @@ fn build_writer(handle: &IndexHandle) -> Result<IndexWriter, IndexerError> {
     Ok(handle.index.writer_with_num_threads(1, 50_000_000)?)
 }
 
+/// Outcome of the per-iteration wait inside `run_loop`. See the
+/// matching docs in [`super::memory`].
+enum NextOp<T> {
+    Op(T),
+    Disconnected,
+    DeadlineHit,
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_next<T: 'static>(rx: &Receiver<T>, remaining: Duration) -> NextOp<T> {
+    use futures_lite::FutureExt;
+    let recv = async {
+        match rx.recv_async().await {
+            Ok(op) => NextOp::Op(op),
+            Err(_) => NextOp::Disconnected,
+        }
+    };
+    let timer = async {
+        glommio::timer::sleep(remaining).await;
+        NextOp::DeadlineHit
+    };
+    recv.or(timer).await
+}
+
+#[cfg(target_os = "linux")]
 async fn run_loop(
     mut writer: IndexWriter,
     fields: StatementFields,
@@ -168,10 +194,9 @@ async fn run_loop(
     loop {
         let deadline = last_commit + policy.interval;
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let tokio_deadline = TokioInstant::now() + remaining;
 
-        match timeout_at(tokio_deadline, rx.recv_async()).await {
-            Ok(Ok(op)) => {
+        match wait_next(&rx, remaining).await {
+            NextOp::Op(op) => {
                 if let Err(err) = apply_op(&mut writer, &fields, &op) {
                     warn!(
                         target: "brain_ops::text_indexer",
@@ -189,13 +214,13 @@ async fn run_loop(
                     last_commit = Instant::now();
                 }
             }
-            Ok(Err(_disconnected)) => {
+            NextOp::Disconnected => {
                 if batch > 0 {
                     let _ = commit_with_retry(&mut writer);
                 }
                 return;
             }
-            Err(_elapsed) => {
+            NextOp::DeadlineHit => {
                 if batch > 0 {
                     if commit_with_retry(&mut writer).is_err() {
                         return;

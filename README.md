@@ -518,93 +518,86 @@ For a hands-on walkthrough of every feature in context (substrate primitives, sc
 
 ## Development environment
 
-**Linux x86_64 / aarch64, kernel ≥ 5.15.** Brain depends on `io_uring`, `O_DIRECT`, `pwritev2(RWF_DSYNC)`, and a few Linux-only `madvise` / `fallocate` flags — see [`spec/01_system_architecture/05_hardware.md`](spec/01_system_architecture/05_hardware.md) §1.1 for why we chose a single-platform backend over portable shims.
+> **Just want to run Brain?** Follow the [5-minute Docker quickstart](docs/tutorials/01-quickstart-docker.md). The rest of this section is for contributors.
 
-### What compiles where
+**Linux only. Kernel ≥ 5.15.** macOS and Windows are not supported.
 
-| Crate | Linux | macOS / Windows native |
-|---|---|---|
-| `brain-core` | ✓ | ✓ (pure value types) |
-| `brain-protocol` | ✓ | ✓ (codec + DSL parser) |
-| `brain-cli` | ✓ | ✓ (no runtime dep yet) |
-| `brain-sdk-rust` | ✓ | ✓ (client-side) |
-| `brain-http` | ✓ | ✓ (hyper-based; client side works) |
-| `brain-planner` | ✓ | ✓ (pure logic) |
-| `brain-storage` | ✓ | ✗ — `compile_error!` |
-| `brain-metadata` | ✓ | ✗ (redb with `O_DIRECT`-aware paths) |
-| `brain-index` | ✓ | ✗ (HNSW + tantivy persistence) |
-| `brain-embed` | ✓ | ✗ (candle wiring) |
-| `brain-ops` | ✓ | △ partial — wires runtime crates |
-| `brain-workers` | ✓ | ✗ — runs on Glommio |
-| `brain-extractors` | ✓ | ✗ (phase 20) |
-| `brain-llm` | ✓ | ✗ (phase 21) |
-| `brain-server` | ✓ | ✗ — Glommio + Tokio runtime |
+The repo ships a dev container so you don't have to manage toolchains. This is the supported local-development path.
 
-CI (`.github/workflows/ci.yml`) runs everything on `ubuntu-latest` and is the authoritative test gate.
+### Setup
 
-### Native Linux
+**Requires:** Docker (any engine — `docker info` must work) and `@devcontainers/cli` (`npm install -g @devcontainers/cli`).
 
 ```bash
-rustup toolchain install stable
-rustup component add rustfmt clippy
-just verify        # fmt + build + clippy + test
+git clone https://github.com/brain-db-io/brain-db
+cd brain-db
+just docker-up                # builds image, starts container, runs post-create.sh
+just docker-shell             # drop into bash inside the container
 ```
 
-### macOS / Windows — dev container (recommended)
-
-The repo ships a `.devcontainer/` config. With Docker, OrbStack, or Colima running:
+Inside the container, everything works:
 
 ```bash
-just shell        # builds the image on first run, drops you into bash
-# inside the container:
-just verify
+just verify                                                # fmt + build + clippy + test
+cargo test -p brain-storage
+cargo run --bin brain-server -- --config config/dev.toml
+cargo run --bin brain -- encode "hello" --context 1       # interactive shell (psql equivalent)
+cargo run --bin brain-cli -- stats                         # admin HTTP CLI
+cargo +nightly fuzz run protocol_frame -- -max_total_time=60
 ```
 
-Editor integration: VS Code, Cursor, JetBrains, and GitHub Codespaces auto-detect `.devcontainer/devcontainer.json`. Use "Reopen in Container."
+> **Three binaries.** `brain-server` is the daemon. `brain` is the
+> interactive shell — REPL plus one-shot wire-protocol verbs (the
+> `psql` / `redis-cli` equivalent). `brain-cli` is the admin CLI over
+> HTTP (snapshots, audit, worker control). See
+> [`docs/reference/brain-shell.md`](docs/reference/brain-shell.md)
+> and [`docs/reference/cli.md`](docs/reference/cli.md).
 
-#### Container runtime notes
+> **Persistent settings + named agents.** Settings you keep (output
+> format, sticky context, default server) live in
+> `~/.config/brain/config.toml` and are managed by `brain config
+> get/set/list`. Identity is opt-in: by default every connection mints
+> a fresh ephemeral agent (lost on quit). To carry memories across
+> sessions, create a named agent — `brain agent create work` — then
+> use it via `brain --agent work` or `BRAIN_AGENT=work brain`.
+> `brain agent list` shows what's stored; inside the shell `\agent`
+> prints the current binding. (Schema is aws-cli-flavoured; there is
+> no persisted "current agent" — selection is per-invocation.)
 
-| Runtime | macOS recommendation |
+Or run one-off commands without an interactive shell:
+
+```bash
+just docker just verify
+just docker cargo test -p brain-protocol
+```
+
+Manage the container:
+
+```bash
+just docker-stop              # stop (cargo + target caches preserved)
+just docker-rebuild           # rebuild from scratch after Dockerfile edits
+```
+
+The container is idempotent — `just docker-up` on a running container re-attaches; `post-create.sh` does not re-fire. Incremental builds persist because `target/` is a named volume.
+
+Editors auto-detect [`.devcontainer/devcontainer.json`](.devcontainer/devcontainer.json) — VS Code, Cursor, JetBrains, and GitHub Codespaces all support "Reopen in Container" with no extra config.
+
+#### What's inside `.devcontainer/`
+
+| File | Role |
 |---|---|
-| **OrbStack** | Recommended on Apple Silicon. Permissive seccomp; works with `io_uring`. |
-| **Docker Desktop** | Works, but 4.42+ needs a custom seccomp profile or `--security-opt seccomp=unconfined` to allow `io_uring`. |
-| **Colima** | Works similarly to Docker Desktop; uses Lima/QEMU. |
+| [`Dockerfile`](.devcontainer/Dockerfile) | Debian-bookworm + stable + nightly Rust, `build-essential`, `cmake`, `pkg-config`, `gh`, `just`, `cargo-fuzz`, `cargo-audit`, `rust-analyzer`. |
+| [`devcontainer.json`](.devcontainer/devcontainer.json) | Workspace bind mount; persistent named volumes for cargo registry + git + `target/`; `--ulimit memlock=-1` + `seccomp=unconfined` for `io_uring`; `RUST_BACKTRACE`, `CARGO_BUILD_JOBS`. Architecture-specific tuning lives in [`.cargo/config.toml`](.cargo/config.toml) (per-target rustflags); don't add `RUSTFLAGS` here — env vars override the per-target config. |
+| [`post-create.sh`](.devcontainer/post-create.sh) | First-start checks: prints tool versions, fixes cargo volume ownership, runs `just check-skills`. |
+| [`.cargo/config.toml`](.cargo/config.toml) | Per-target rustflags. Sets `target-cpu=neoverse-n1` for `aarch64-unknown-linux-gnu` so candle's `gemm-f16` half-precision inline asm assembles. macOS host and x86_64 Linux unaffected. |
 
-#### Container caveats
+### CI
 
-- **`O_DIRECT` against bind-mounted source.** macOS-hosted Docker mounts via VirtioFS / 9P; these may not support `O_DIRECT`. Storage tests should write under `/tmp` (tmpfs) or a named-volume path inside the container — not `/workspaces/brain` (the bind mount).
-- **First build is slow** (downloads ~100 crates). Persistent named volumes (`brain-cargo-registry`, `brain-cargo-git`, `brain-target-cache`) keep the cache across container restarts.
+`.github/workflows/ci.yml` runs everything on `ubuntu-latest` and is the authoritative test gate.
 
-### macOS / Windows — cross-compile-only
+### Step-by-step walk-through
 
-Validates compilation without running. Pair with the dev container (or CI) for actual tests.
-
-```bash
-rustup target add x86_64-unknown-linux-gnu
-brew install lld   # or: cargo install --locked cargo-zigbuild
-
-cargo check --workspace --target x86_64-unknown-linux-gnu
-```
-
-### Common commands
-
-```bash
-just verify                                                       # full verify: fmt + build + clippy + test
-cargo test -p brain-protocol                                      # per-crate (cross-platform crates)
-cargo run --bin brain-server -- --config config/dev.toml          # Linux only
-cargo run --bin brain-cli -- stats                                # cross-platform
-cargo +nightly fuzz run protocol_frame -- -max_total_time=60      # nightly + Linux
-just shell                                                        # enter the dev container (Docker required)
-```
-
-A step-by-step setup, CLI tour, SDK tour, and troubleshooting walkthrough lives under [`docs/development/usage/`](docs/development/usage/).
-
-### When something doesn't work
-
-- **`liburing-sys` link error on macOS native:** expected. Use the dev container.
-- **`compile_error!` mentioning README.md:** the friendly Linux gate; switch to the container.
-- **`io_uring_setup: Function not implemented`:** kernel too old or seccomp restricted; check host kernel and container runtime.
-- **`O_DIRECT` returns `EINVAL`:** the filesystem under the test path doesn't support direct I/O; use `/tmp` or a named volume.
+[`docs/development/usage/`](docs/development/usage/) — setup, CLI tour, SDK tour, troubleshooting.
 
 ## Repository layout
 
@@ -659,7 +652,8 @@ brain/
 │   ├── brain-http/               # HTTP/WS/SSE transport
 │   ├── brain-server/             # Server binary
 │   ├── brain-sdk-rust/           # Rust SDK (substrate + typed knowledge SDK)
-│   └── brain-cli/                # Admin CLI
+│   ├── brain-shell/              # `brain` — interactive REPL + one-shot wire-protocol CLI
+│   └── brain-cli/                # `brain-cli` — admin HTTP CLI
 ├── benches/                      # criterion benches per crate
 ├── fuzz/                         # cargo-fuzz harnesses
 ├── tests/                        # cross-crate integration + chaos + soak

@@ -30,6 +30,11 @@ pub struct EncodePlan {
     pub edges: Vec<EdgeStep>,
     pub response: EncodeResponseStep,
     pub estimated_cost_ms: f32,
+    /// Spec §07/07 §6 — when `true`, the executor computes a
+    /// content hash and consults the per-shard `fingerprints`
+    /// table; on a hit, the existing `MemoryId` is returned
+    /// without allocating a new slot.
+    pub deduplicate: bool,
 }
 
 #[derive(Debug, Clone, Copy)]

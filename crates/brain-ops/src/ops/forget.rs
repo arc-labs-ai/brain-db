@@ -65,6 +65,7 @@ async fn handle_forget_in_txn(
         request_id: brain_core::RequestId::from(req.request_id),
         memory_id,
         mode: req.mode,
+        agent_id: ctx.executor.caller_agent,
     });
 
     // Replay check.
@@ -134,6 +135,7 @@ async fn handle_forget_in_txn(
         request_id: req.request_id,
         request_hash,
         created_at_unix_nanos: crate::txn::now_unix_nanos_pub(),
+        agent_id: ctx.executor.caller_agent,
     };
     ctx.txn_store.with_buffer(txn_id, |buf| {
         buf.forgets.push(buffered);

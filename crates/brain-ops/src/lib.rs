@@ -32,6 +32,8 @@ pub mod error;
 pub mod idempotency;
 pub mod ops;
 pub mod schema_gate;
+#[doc(hidden)]
+pub mod test_support;
 pub mod txn_lens;
 
 // Module-level re-exports preserve `brain_ops::<op>::*` paths so
@@ -45,7 +47,7 @@ pub use ops::{
 pub use access_buffer::{AccessBuffer, DEFAULT_ACCESS_BUFFER_CAPACITY};
 pub use brain_planner::PlannerContext;
 pub use context::OpsContext;
-pub use dispatch::dispatch;
+pub use dispatch::{dispatch, RequestCaller};
 pub use error::{ErrorCode, OpError};
 pub use ops::subscribe::{
     parse_filter, EventBus, EventEnvelope, LsnAllocator, ParsedFilter, SubscriptionHandle,
@@ -89,7 +91,8 @@ mod tests {
             ),
             (OpError::Overloaded("busy".into()), ErrorCode::Overloaded),
             (OpError::TooManyMemories, ErrorCode::InvalidRequest),
-            (OpError::TxnExpired, ErrorCode::Conflict),
+            (OpError::TxnExpired, ErrorCode::TxnExpired),
+            (OpError::TxnNotFound, ErrorCode::TxnNotFound),
             (
                 OpError::NotYetImplemented("anything"),
                 ErrorCode::InternalError,
@@ -131,6 +134,7 @@ mod tests {
         assert!(!OpError::Internal("oops".into()).retryable());
         assert!(!OpError::NotYetImplemented("X").retryable());
         assert!(!OpError::TxnExpired.retryable());
+        assert!(!OpError::TxnNotFound.retryable());
     }
 
     #[test]
@@ -283,31 +287,37 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn dispatch_encode_routes_to_handler() {
-        // 7.3 wired the real ENCODE handler. The `NopWriter` returns
-        // `WriterError::Internal`, so the handler propagates an
-        // `ExecError::WriterFailed` — which is enough to prove the
-        // dispatcher reaches `handle_encode` rather than the stub.
-        let ctx = fake_context();
-        let req = brain_protocol::request::RequestBody::Encode(encode_req());
-        match dispatch(req, &ctx).await {
-            Err(OpError::ExecError(_)) => {}
-            other => panic!("expected ExecError from NopWriter, got {other:?}"),
-        }
+    #[test]
+    fn dispatch_encode_routes_to_handler() {
+        use crate::test_support::run_in_glommio;
+        run_in_glommio(|| async {
+            // 7.3 wired the real ENCODE handler. The `NopWriter` returns
+            // `WriterError::Internal`, so the handler propagates an
+            // `ExecError::WriterFailed` — which is enough to prove the
+            // dispatcher reaches `handle_encode` rather than the stub.
+            let ctx = fake_context();
+            let req = brain_protocol::request::RequestBody::Encode(encode_req());
+            match dispatch(req, RequestCaller::anonymous(), &ctx).await {
+                Err(OpError::ExecError(_)) => {}
+                other => panic!("expected ExecError from NopWriter, got {other:?}"),
+            }
+        })
     }
 
-    #[tokio::test]
-    async fn dispatch_admin_variant_returns_not_yet_implemented() {
-        let ctx = fake_context();
-        let req = brain_protocol::request::RequestBody::AdminStats(
-            brain_protocol::request::AdminStatsRequest {
-                detail: brain_protocol::request::StatsDetail::Summary,
-            },
-        );
-        match dispatch(req, &ctx).await {
-            Err(OpError::NotYetImplemented(msg)) => assert!(msg.contains("admin")),
-            other => panic!("expected NotYetImplemented, got {other:?}"),
-        }
+    #[test]
+    fn dispatch_admin_variant_returns_not_yet_implemented() {
+        use crate::test_support::run_in_glommio;
+        run_in_glommio(|| async {
+            let ctx = fake_context();
+            let req = brain_protocol::request::RequestBody::AdminStats(
+                brain_protocol::request::AdminStatsRequest {
+                    detail: brain_protocol::request::StatsDetail::Summary,
+                },
+            );
+            match dispatch(req, RequestCaller::anonymous(), &ctx).await {
+                Err(OpError::NotYetImplemented(msg)) => assert!(msg.contains("admin")),
+                other => panic!("expected NotYetImplemented, got {other:?}"),
+            }
+        })
     }
 }

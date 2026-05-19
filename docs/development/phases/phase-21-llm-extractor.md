@@ -116,7 +116,7 @@ The actual landed mapping:
 - [x] Sub-tasks 21.1–21.6 + 21.9 landed (renumbered to `.claude/plans` 21.0–21.6).
 - [x] 21.7 + 21.8 explicitly scope-cut and recorded in ROADMAP §"Deferred".
 - [x] `llm_pipeline` criterion bench added (`crates/brain-extractors/benches/llm_pipeline.rs`); `pattern_extract` bench restored after the async-trait refactor. Bench wall-time capture deferred to phase-22 pre-flight to keep the implementation loop moving.
-- [x] Workspace verify suite green at tag time (see commit history for `cargo zigbuild` + `just docker cargo test` evidence).
+- [x] Workspace verify suite green at tag time (see commit history for `cargo zigbuild` + `cargo test` evidence).
 - [x] Tag `phase-21-complete` cut.
 
 ## Pitfalls

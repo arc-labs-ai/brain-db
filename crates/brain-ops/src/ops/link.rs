@@ -23,6 +23,7 @@ pub async fn handle_link(req: LinkRequest, ctx: &OpsContext) -> Result<LinkRespo
         target: MemoryId::from(req.target),
         kind: req.kind.into(),
         weight: req.weight,
+        agent_id: ctx.executor.caller_agent,
     };
     let ack = ctx
         .executor
@@ -52,6 +53,7 @@ pub async fn handle_unlink(
         source: MemoryId::from(req.source),
         target: MemoryId::from(req.target),
         kind: req.kind.into(),
+        agent_id: ctx.executor.caller_agent,
     };
     let ack = ctx
         .executor
@@ -83,6 +85,7 @@ async fn handle_link_in_txn(
         target,
         kind,
         weight: req.weight,
+        agent_id: ctx.executor.caller_agent,
     };
     let request_hash = hash_link_request(&op);
 
@@ -200,6 +203,7 @@ async fn handle_link_in_txn(
         request_id: req.request_id,
         request_hash,
         created_at_unix_nanos: created_at,
+        agent_id: ctx.executor.caller_agent,
     };
     ctx.txn_store.with_buffer(txn_id, |buf| {
         buf.links.push(buffered);
@@ -245,6 +249,7 @@ async fn handle_unlink_in_txn(
         source,
         target,
         kind,
+        agent_id: ctx.executor.caller_agent,
     };
     let request_hash = hash_unlink_request(&op);
 
@@ -320,6 +325,7 @@ async fn handle_unlink_in_txn(
         request_id: req.request_id,
         request_hash,
         created_at_unix_nanos: created_at,
+        agent_id: ctx.executor.caller_agent,
     };
     ctx.txn_store.with_buffer(txn_id, |buf| {
         buf.unlinks.push(buffered);

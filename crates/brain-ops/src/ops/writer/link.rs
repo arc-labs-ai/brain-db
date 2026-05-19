@@ -9,6 +9,8 @@ use brain_metadata::tables::edge::{
 use brain_metadata::tables::idempotency::{IdempotencyEntry, IDEMPOTENCY_TABLE};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_planner::{LinkAck, LinkOp, WriterError};
+use brain_storage::wal::payload::{LinkPayload as WalLinkPayload, WalPayload};
+use brain_storage::wal::record::{Lsn, WalRecord};
 
 use crate::idempotency::{
     decode_link_payload, encode_link_payload, hash_link_request, RESPONSE_KIND_LINK,
@@ -16,7 +18,10 @@ use crate::idempotency::{
 
 use super::{bump_edge_count, hex_short, now_unix_nanos, RealWriterHandle};
 
-pub(super) fn do_link(writer: &RealWriterHandle, op: LinkOp) -> Result<LinkAck, WriterError> {
+pub(super) async fn do_link(
+    writer: &RealWriterHandle,
+    op: LinkOp,
+) -> Result<LinkAck, WriterError> {
     let request_hash = hash_link_request(&op);
     let request_id_bytes: [u8; 16] = op.request_id.into();
 
@@ -115,6 +120,35 @@ pub(super) fn do_link(writer: &RealWriterHandle, op: LinkOp) -> Result<LinkAck, 
             .is_some()
     };
 
+    // ── WAL append (spec §05/07 durability barrier). ─────────────
+    // LINK always WALs: even an `already_existed` op writes a new
+    // weight + timestamp into redb (overwrite semantics), so the
+    // log must reflect it for replay determinism.
+    let wal_lsn: Option<Lsn> = if let Some(sink) = &writer.wal_sink {
+        let record_payload = WalPayload::Link(WalLinkPayload {
+            source: op.source,
+            target: op.target,
+            edge_kind: op.kind,
+            weight: op.weight,
+            origin: brain_core::EdgeOrigin::Explicit,
+        });
+        let agent_bytes: [u8; 16] = op.agent_id.into();
+        let agent_id_lo64 = u64::from_be_bytes(agent_bytes[8..16].try_into().unwrap());
+        let record = WalRecord::from_typed(
+            Lsn(0),
+            /* flags */ 0,
+            created_at,
+            agent_id_lo64,
+            &record_payload,
+        );
+        let lsn = sink
+            .append(record)
+            .await
+            .map_err(|e| WriterError::Internal(format!("wal append: {e}")))?;
+        Some(lsn)
+    } else {
+        None
+    };
     // ── Apply: edge insert + count bumps + idempotency in one txn. ─
     {
         let mut db = writer.metadata.lock();
@@ -152,8 +186,14 @@ pub(super) fn do_link(writer: &RealWriterHandle, op: LinkOp) -> Result<LinkAck, 
                 .open_table(IDEMPOTENCY_TABLE)
                 .map_err(|e| WriterError::Internal(format!("link open IDEMPOTENCY: {e:?}")))?;
             let payload = encode_link_payload(op.weight, created_at, already_existed);
-            let entry =
-                IdempotencyEntry::new(RESPONSE_KIND_LINK, None, payload, request_hash, created_at);
+            let entry = IdempotencyEntry::new(
+                RESPONSE_KIND_LINK,
+                None,
+                payload,
+                request_hash,
+                created_at,
+                wal_lsn.map(|l| l.raw()).unwrap_or(0),
+            );
             idem_t
                 .insert(request_id_bytes, entry)
                 .map_err(|e| WriterError::Internal(format!("link idempotency insert: {e:?}")))?;

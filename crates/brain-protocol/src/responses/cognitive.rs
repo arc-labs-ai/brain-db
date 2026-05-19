@@ -3,7 +3,7 @@
 use rkyv::{Archive, Deserialize, Serialize};
 
 use super::types::{InferenceKind, PlanStatus, ReasonStatus, RetrieverNameWire, TransitionKind};
-use crate::request::{EdgeKindWire, MemoryKindWire, WireContextId, WireMemoryId};
+use crate::request::{EdgeKindWire, MemoryKindWire, WireContextId, WireMemoryId, WireUuid};
 
 /// Spec §08 §1 `ENCODE_RESP`. Same shape used for §08 §2
 /// `ENCODE_VECTOR_DIRECT_RESP`.
@@ -15,6 +15,30 @@ pub struct EncodeResponse {
     pub was_deduplicated: bool,
     pub salience: f32,
     pub auto_edges_added: u32,
+    // ── Provenance + chaining (added by the v1 subscribe-replay PR) ──
+    /// WAL LSN the encode was recorded at. `0` for the in-memory
+    /// test path / substrate-only deployments without a WAL sink.
+    /// Production clients chain `encode → subscribe --start-lsn lsn+1`
+    /// to follow downstream events from this point.
+    pub lsn: u64,
+    /// Agent the row was attributed to. Echoes the connection's
+    /// AUTH-time agent so the client can verify routing.
+    pub agent_id: WireUuid,
+    /// Context the row was filed under. Echoes the request's
+    /// `context_id`.
+    pub context_id: WireContextId,
+    /// Memory kind that was stored.
+    pub kind: MemoryKindWire,
+    /// Server unix-nanos at write time. Useful when client clock
+    /// drifts vs the server.
+    pub created_at_unix_nanos: u64,
+    /// Outgoing edges that actually landed (the request may carry
+    /// edges whose targets are missing — those are dropped silently;
+    /// this count reflects the survivors).
+    pub edges_out_count: u32,
+    /// Embedding-model fingerprint stamped on the row. Lets the
+    /// client detect when a model migration would change the vector.
+    pub embedding_model_fp: [u8; 16],
 }
 
 /// Spec §08 §3 — one streaming RECALL frame.
@@ -53,6 +77,34 @@ pub struct MemoryResult {
     /// and inside transactions; positive when hybrid retrieval ran
     /// (spec §28/08 §5).
     pub fused_score: f32,
+    // ── Memory provenance + decay signals (v1 expansion) ──
+    /// Salience the row was first written with. Together with
+    /// `salience` this shows how much decay has happened.
+    pub salience_initial: f32,
+    /// How many times this memory has been accessed (RECALL hits +
+    /// explicit gets). Hotness signal — clients can sort by it for
+    /// a recency-vs-popularity tradeoff.
+    pub access_count: u32,
+    /// WAL LSN this row was written at — derived from
+    /// `MemoryMetadata.created_at_unix_nanos` + the shard's
+    /// next_lsn watermark. `0` for substrate-only deployments that
+    /// never wired a WAL sink. Lets the client say "subscribe from
+    /// the moment this memory was written."
+    pub lsn: u64,
+    /// Status flags. ACTIVE = 0x1, HARD_FORGOTTEN = 0x2,
+    /// CONSOLIDATED = 0x4, DEDUP_BACKREF = 0x8 (matches
+    /// `brain_metadata::tables::memory::flags`).
+    pub flags: u32,
+    /// `Some(t)` when this row was produced by a consolidation
+    /// worker (and is therefore a summary, not a raw memory).
+    /// `None` for ordinary ENCODE-produced rows.
+    pub consolidated_at_unix_nanos: Option<u64>,
+    /// Denormalised outgoing-edge count (matches the source row's
+    /// `edges_out_count`). Cheap connectivity signal even when the
+    /// caller didn't ask for `--include-edges`.
+    pub edges_out_count: u32,
+    /// Denormalised incoming-edge count. "How linked-into is this?"
+    pub edges_in_count: u32,
 }
 
 /// Spec §08 §3.

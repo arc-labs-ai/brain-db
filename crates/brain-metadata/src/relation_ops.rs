@@ -346,14 +346,15 @@ pub fn relation_supersede(
             new: new_relation.relation_type,
         });
     }
-    // For symmetric, both should already be canonicalised by the
-    // caller (relation_create canonicalises before delegating);
-    // verify the canonical endpoints match.
-    let new_from = new_relation.from_entity.to_bytes();
-    let new_to = new_relation.to_entity.to_bytes();
-    if old.from_entity_bytes != new_from || old.to_entity_bytes != new_to {
-        return Err(RelationOpError::EndpointMismatch);
-    }
+    // We deliberately do NOT require both endpoints to match here.
+    // Cardinality-based auto-supersede legitimately replaces a
+    // ManyToOne or OneToMany relation with one whose constrained
+    // side matches but whose other side differs (that's the whole
+    // point — adding a new value on the unconstrained side). The
+    // caller (`relation_create`'s cardinality-conflict probe) has
+    // already validated that the new relation satisfies the
+    // cardinality constraint, so re-checking endpoints here would
+    // reject valid supersessions.
 
     // ID uniqueness on new.
     {

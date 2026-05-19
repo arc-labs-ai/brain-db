@@ -11,7 +11,7 @@ pub mod connection;
 mod guard;
 
 pub use config::PoolConfig;
-pub use connection::Connection;
+pub use connection::{Connection, IdleConnection};
 pub use guard::PoolGuard;
 
 use std::net::SocketAddr;
@@ -29,9 +29,10 @@ use crate::error::ClientError;
 /// Per-slot lifecycle state.
 #[derive(Debug)]
 enum SlotState {
-    /// Slot owns a `Connection` and nobody's using it.
+    /// Slot owns an [`IdleConnection`] (background task running, auto-
+    /// pongs SERVER_PING). Nobody's using it for an op.
     Idle {
-        connection: Connection,
+        connection: IdleConnection,
         last_used: Instant,
     },
     /// Slot is checked out via a `PoolGuard`. The connection
@@ -132,7 +133,7 @@ impl Pool {
         let mut slots = self.slots.lock();
         for c in opened {
             slots.push(SlotState::Idle {
-                connection: c,
+                connection: IdleConnection::from_active(c),
                 last_used: now,
             });
         }
@@ -149,9 +150,13 @@ impl Pool {
             if self.closed.load(Ordering::Acquire) {
                 return Err(ClientError::PoolClosed);
             }
-            // Try to grab an idle slot first.
-            if let Some(guard) = self.try_take_idle() {
-                return Ok(guard);
+            // Try to grab an idle slot first. May fail if the
+            // background pong task died — slot gets marked Closed,
+            // we retry (loop will then try_open_new).
+            match self.try_take_idle().await {
+                Some(Ok(guard)) => return Ok(guard),
+                Some(Err(_e)) => continue,
+                None => {}
             }
             // Or open a fresh one if we're under cap.
             if let Some(guard) = self.try_open_new().await? {
@@ -212,19 +217,55 @@ impl Pool {
             .count()
     }
 
-    /// Pull one `Idle` slot out, mark it `InUse`, return a guard.
-    fn try_take_idle(self: &Arc<Self>) -> Option<PoolGuard> {
-        let mut slots = self.slots.lock();
-        for idx in 0..slots.len() {
-            if matches!(slots[idx], SlotState::Idle { .. }) {
-                let prev = std::mem::replace(&mut slots[idx], SlotState::InUse);
-                let SlotState::Idle { connection, .. } = prev else {
-                    unreachable!()
-                };
-                return Some(PoolGuard::new(self.clone(), idx, connection));
+    /// Pull one `Idle` slot out, reactivate it (cancel the
+    /// background pong task, recover the stream), return a guard.
+    ///
+    /// Three outcomes:
+    ///   - `None` — no Idle slot in the pool; caller should
+    ///     `try_open_new` or wait.
+    ///   - `Some(Ok(guard))` — reactivated successfully.
+    ///   - `Some(Err(e))` — slot was Idle but reactivation failed
+    ///     (the background pong task exited on a fatal I/O or
+    ///     protocol error before we asked for the stream back). The
+    ///     slot is marked `Closed` and the caller retries — the
+    ///     next iteration of `acquire`'s loop will try_open_new and
+    ///     get a fresh connection.
+    async fn try_take_idle(
+        self: &Arc<Self>,
+    ) -> Option<Result<PoolGuard, ClientError>> {
+        // Step 1: synchronously pull the IdleConnection out and
+        // mark the slot InUse. Release the lock immediately so the
+        // (potentially-slow) reactivate await doesn't block other
+        // pool operations.
+        let (idx, idle) = {
+            let mut slots = self.slots.lock();
+            let mut found: Option<(usize, IdleConnection)> = None;
+            for i in 0..slots.len() {
+                if matches!(slots[i], SlotState::Idle { .. }) {
+                    let prev = std::mem::replace(&mut slots[i], SlotState::InUse);
+                    let SlotState::Idle { connection, .. } = prev else {
+                        unreachable!()
+                    };
+                    found = Some((i, connection));
+                    break;
+                }
+            }
+            found?
+        };
+
+        // Step 2: cancel the background pong task and recover the
+        // stream. If the bg task already died, mark the slot Closed.
+        match idle.into_active().await {
+            Ok(conn) => Some(Ok(PoolGuard::new(self.clone(), idx, conn))),
+            Err(e) => {
+                {
+                    let mut slots = self.slots.lock();
+                    slots[idx] = SlotState::Closed;
+                }
+                self.release_notify.notify_one();
+                Some(Err(e))
             }
         }
-        None
     }
 
     /// Open a fresh connection if we're under the cap. Returns
@@ -276,11 +317,30 @@ impl Pool {
             if self.closed.load(Ordering::Acquire) {
                 slots[slot_index] = SlotState::Closed;
             } else {
+                // Wrap the recovered connection in an IdleConnection
+                // that spawns the background pong task. Without this,
+                // the slot would sit silently and the server would
+                // close it after `idle_timeout + ping_timeout`
+                // (spec §03/02 §6.1).
                 slots[slot_index] = SlotState::Idle {
-                    connection,
+                    connection: IdleConnection::from_active(connection),
                     last_used,
                 };
             }
+        }
+        self.release_notify.notify_one();
+    }
+
+    /// Called by [`super::PoolGuard::drop`] when the op observed a
+    /// fatal error on the connection. Slot → `Closed`, broken
+    /// socket dropped by caller; next acquire opens a fresh
+    /// connection in this slot's place. Wakes one waiter so a
+    /// retry can proceed without waiting for the (impossible)
+    /// release of this stale slot.
+    pub(super) fn discard(&self, slot_index: usize) {
+        {
+            let mut slots = self.slots.lock();
+            slots[slot_index] = SlotState::Closed;
         }
         self.release_notify.notify_one();
     }

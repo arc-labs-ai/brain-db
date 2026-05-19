@@ -10,16 +10,70 @@
 //! Stub handlers return `OpError::NotYetImplemented`; sub-tasks 7.3
 //! through 7.10 replace each stub with a real implementation.
 
+use brain_core::AgentId;
 use brain_protocol::request::RequestBody;
 use brain_protocol::response::ResponseBody;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
 
-pub async fn dispatch(req: RequestBody, ctx: &OpsContext) -> Result<ResponseBody, OpError> {
+/// Per-request caller context. Carries the auth-time agent (from
+/// `ConnPhase::Established.agent`) so handlers can stamp it onto
+/// the Ops they build — separate from the wire request because the
+/// agent is auth metadata, not request data. Future fields might
+/// include permissions, request id for tracing, etc.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestCaller {
+    /// Authenticated agent for this request. `AgentId::default()`
+    /// means "unauthenticated / test path"; the writer treats that
+    /// as a substrate-wide event with no agent filter applicability.
+    pub agent_id: AgentId,
+}
+
+impl RequestCaller {
+    /// Construct a caller with the given agent.
+    #[must_use]
+    pub fn new(agent_id: AgentId) -> Self {
+        Self { agent_id }
+    }
+
+    /// The substrate-wide / test-only default. Used by paths that
+    /// don't yet wire connection auth (in-process unit tests).
+    #[must_use]
+    pub fn anonymous() -> Self {
+        Self {
+            agent_id: AgentId::default(),
+        }
+    }
+}
+
+pub async fn dispatch(
+    req: RequestBody,
+    caller: RequestCaller,
+    ctx: &OpsContext,
+) -> Result<ResponseBody, OpError> {
+    // Per-request override: stamp the caller's agent onto a clone
+    // of the shared ctx so handlers that build writer Ops can pull
+    // it via `ctx.executor.caller_agent` without taking another
+    // function param. The clone is cheap — every field is Arc'd.
+    let per_request_ctx = if caller.agent_id == brain_core::AgentId::default() {
+        // Anonymous caller — no override needed; reuse the shared
+        // ctx (zero-cost on the hot path that doesn't actually
+        // authenticate).
+        None
+    } else {
+        let mut owned = ctx.clone();
+        owned.executor = owned.executor.with_caller_agent(caller.agent_id);
+        Some(owned)
+    };
+    let ctx = per_request_ctx.as_ref().unwrap_or(ctx);
     match req {
         // -----------------------------------------------------------
         // Cognitive primitives — real handlers land in 7.3-7.7.
+        // Handlers read `ctx.executor.caller_agent` to populate
+        // `agent_id` on the writer Ops they build; the per-request
+        // clone above ensures they see the auth-time value, not the
+        // shared per-shard default.
         // -----------------------------------------------------------
         RequestBody::Encode(r) => crate::encode::handle_encode(r, ctx)
             .await

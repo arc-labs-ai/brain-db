@@ -22,19 +22,21 @@ Rust (MSRV: latest minus one, currently 1.95):
 ```bash
 git clone https://github.com/brain-db-io/brain-db
 cd brain-db
-just build         # cargo build --workspace --release
+cargo build --workspace --release
 ```
 
-The two binaries you'll want on the host:
+The three binaries you'll want on the host:
 
 - `target/release/brain-server` — the substrate daemon.
-- `target/release/brain` — the admin CLI.
+- `target/release/brain` — the interactive shell (`psql` / `redis-cli` equivalent). REPL + one-shot cognitive ops over the wire protocol. See [`../reference/brain-shell.md`](../reference/brain-shell.md).
+- `target/release/brain-cli` — the admin CLI. HTTP `/v1/*` routes (snapshots, audit, worker control, health, metrics). See [`../reference/cli.md`](../reference/cli.md).
 
 Copy them somewhere on `$PATH`:
 
 ```bash
 sudo install -m 755 target/release/brain-server /usr/local/bin/
-sudo install -m 755 target/release/brain         /usr/local/bin/
+sudo install -m 755 target/release/brain        /usr/local/bin/
+sudo install -m 755 target/release/brain-cli    /usr/local/bin/
 ```
 
 ### From pre-built release
@@ -48,12 +50,17 @@ For development on macOS or Windows, use the in-repo dev container:
 
 ```bash
 # OrbStack / Docker Desktop must be running.
-just docker-verify     # build + test + clippy inside the container
+devcontainer up --workspace-folder .
+devcontainer exec --workspace-folder . cargo fmt --all -- --check
+devcontainer exec --workspace-folder . cargo build --workspace --all-targets
+devcontainer exec --workspace-folder . cargo clippy --workspace --all-targets -- -D warnings
+devcontainer exec --workspace-folder . cargo test --workspace --all-targets
+devcontainer exec --workspace-folder . ./scripts/check-skills.sh
 ```
 
-The `just docker-*` recipes shell out to the same container that CI
-uses. Everything that compiles in the container compiles on a real
-Linux host. See [`docs/development/usage/`](../usage/) for the day-to-day
+The container shells out to the same image CI uses. Everything that
+compiles in the container compiles on a real Linux host. See
+[`docs/development/usage/`](../development/usage/) for the day-to-day
 inner loop.
 
 ## Smoke test
@@ -71,8 +78,8 @@ mkdir -p /tmp/brain-test/data
 cat > /tmp/brain-test/config.toml <<'EOF'
 [server]
 listen_addr = "127.0.0.1:8080"
-metrics_addr = "127.0.0.1:9091"
-admin_addr = "127.0.0.1:9090"
+metrics_addr = "127.0.0.1:9091"    # /healthz + /metrics
+admin_addr   = "127.0.0.1:9092"    # /v1/* admin routes (keep loopback)
 
 [storage]
 data_dir = "/tmp/brain-test/data"

@@ -177,6 +177,9 @@ mod tests {
             text: String::new(),
             vector: vec![0.0; 384],
             edges: vec![],
+            request_hash: [0; 32],
+            response_payload: vec![],
+            deduplicate: false,
         };
         WalRecord::from_typed(
             Lsn(0),

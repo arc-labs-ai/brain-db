@@ -14,15 +14,55 @@ use brain_protocol::opcode::Opcode;
 use brain_protocol::{Frame, ResponseBody};
 
 use crate::error::ClientError;
-use crate::pool::Connection;
+use crate::pool::{Connection, PoolGuard};
 use crate::proto::frames::{read_one_frame, write_frame};
 
 /// Spec §03/03 §4 last-frame-of-stream flag.
 pub const FLAG_EOS: u8 = 1 << 7;
 
+/// Classify a [`ClientError`] as "the connection is dead, throw it
+/// away" vs "the connection is fine, just the op failed."
+///
+/// `Io` / `Closed` / `Protocol` indicate the underlying socket is
+/// unusable: a write to it produced EPIPE, a read EOF'd, or we
+/// saw a frame we couldn't parse (the byte stream is desynced and
+/// not recoverable). Returning these on the next op would just
+/// repeat the failure, so the pool slot must be discarded.
+///
+/// `Server { .. }` is a legitimate wire-level error response from
+/// the server (e.g. `MemoryNotFound`); the connection is healthy
+/// and should stay in the pool.
+fn is_connection_fatal(e: &ClientError) -> bool {
+    matches!(
+        e,
+        ClientError::Io(_) | ClientError::Closed | ClientError::Protocol(_)
+    )
+}
+
 /// Send one request frame and read one response frame. The
 /// caller decodes the body. Maps `ERROR` opcode automatically.
+///
+/// Takes [`PoolGuard`] rather than `&mut Connection` so a fatal
+/// I/O or protocol error can mark the slot for discard — without
+/// this, a broken connection is recycled into the Idle pool and
+/// every subsequent op on the same `Client` will repeat the
+/// failure until retry-exhaustion (see plan-mode write-up "Bug B"
+/// in `/Users/dodo/.claude/plans/i-want-proper-doc-indexed-brook.md`).
 pub async fn send_and_read_one(
+    guard: &mut PoolGuard,
+    request: Frame,
+    expected: Opcode,
+) -> Result<Frame, ClientError> {
+    let r = send_and_read_one_inner(&mut **guard, request, expected).await;
+    if let Err(ref e) = r {
+        if is_connection_fatal(e) {
+            guard.mark_failed();
+        }
+    }
+    r
+}
+
+async fn send_and_read_one_inner(
     conn: &mut Connection,
     request: Frame,
     expected: Opcode,
@@ -49,7 +89,25 @@ pub async fn send_and_read_one(
 ///
 /// `max_frames` bounds the collection so a misbehaving server
 /// can't bloat client memory.
+///
+/// Same `PoolGuard` discipline as [`send_and_read_one`] — fatal
+/// I/O or protocol errors mark the slot for discard.
 pub async fn send_and_collect_until_eos(
+    guard: &mut PoolGuard,
+    request: Frame,
+    expected: Opcode,
+    max_frames: usize,
+) -> Result<Vec<Frame>, ClientError> {
+    let r = send_and_collect_until_eos_inner(&mut **guard, request, expected, max_frames).await;
+    if let Err(ref e) = r {
+        if is_connection_fatal(e) {
+            guard.mark_failed();
+        }
+    }
+    r
+}
+
+async fn send_and_collect_until_eos_inner(
     conn: &mut Connection,
     request: Frame,
     expected: Opcode,

@@ -281,6 +281,9 @@ fn encode_record(slot: u64, byte: u8) -> WalRecord {
         text: format!("memory {slot}"),
         vector: vec![0.0; 384],
         edges: vec![],
+        request_hash: [byte; 32],
+        response_payload: vec![],
+        deduplicate: false,
     };
     WalRecord::from_typed(
         Lsn(0),

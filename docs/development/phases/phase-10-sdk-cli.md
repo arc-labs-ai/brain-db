@@ -229,7 +229,7 @@ Other-language SDKs (Python, TypeScript, Go) are deferred to v1.x.
 read paths end-to-end (`worker list`, `config get`, `shard list`)
 and returns a structured `501 {error:"not_implemented",deferred_to:..}`
 for the rest. CLI surfaces the marker uniformly and exits non-zero.
-30+ new tests; `just docker-verify` green.
+30+ new tests; verify suite (fmt-check + build + clippy + test + check-skills) green.
 **Deferred (per 501 marker):**
 - `phase-11/scheduler-control` — worker stop/start/run-now (needs
   Scheduler pause/resume/trigger hooks).
@@ -248,7 +248,7 @@ for the rest. CLI surfaces the marker uniformly and exits non-zero.
 **Done when:** `debug-snapshot --shard N [--value PATH]` returns JSON
 from the admin server (v1 partial schema: workers populated;
 `partial:true` + `deferred[]` lists missing fields). `profile`
-returns the structured 501 marker. 6 new tests; `just docker-verify`
+returns the structured 501 marker. 6 new tests; verify suite (fmt-check + build + clippy + test + check-skills)
 green.
 **Deferred (per 501 marker / `deferred[]`):**
 - `phase-11/glommio-profiler` — real CPU profile capture for the
@@ -263,7 +263,7 @@ bringup factored out of `e2e.rs`), `crates/brain-server/tests/sdk_e2e.rs`
 (5 SDK tests), `crates/brain-server/tests/cli_e2e.rs` (6 CLI lib-API tests).
 **Done when:** All 11 new tests pass against the in-process harness.
 Library-level integration (not subprocess) — argv parsing already
-covered by brain-cli's own `tests/cli.rs`. `just docker-verify` green.
+covered by brain-cli's own `tests/cli.rs`. Verify suite (fmt-check + build + clippy + test + check-skills) green.
 **Scope notes:** Workspace-level e2e crate (option A in the plan)
 deferred because brain-server is bin-only; option C (colocate)
 chosen for v1. Subprocess black-box (option B) can layer on later as
@@ -272,7 +272,7 @@ a smoke test.
 ## Phase exit checklist
 
 - [x] All sub-tasks complete.
-- [x] `just verify` green.
+- [x] Verify suite (fmt-check + build + clippy + test + check-skills) green.
 - [x] SDK can drive every operation per spec.
 - [x] CLI covers every command in spec §14/06.
 - [ ] Tag `phase-10-complete`. *(awaiting user signal)*

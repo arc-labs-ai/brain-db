@@ -24,6 +24,7 @@ pub async fn execute_forget(
         request_id: plan.idempotency_check.request_id,
         memory_id: plan.memory_id,
         mode: plan.mode,
+        agent_id: ctx.caller_agent,
     };
     let ack = ctx.writer.submit_forget(op).await?;
     Ok(ForgetResult {

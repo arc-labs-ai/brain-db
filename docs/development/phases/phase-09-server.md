@@ -84,7 +84,7 @@ macOS still compiles brain-server (shard module cfg-gated).
   (waiting on 9.10's `CachingDispatcher`); `Shard.arena` +
   `Shard.wal` switch to `Rc<RefCell<…>>` so adapters can share state
   with the main loop; 31 brain-server tests + full workspace green
-  (`just docker-verify`).
+  (verify suite: fmt-check + build + clippy + test + check-skills).
 
 ### Task 9.7b — Per-shard OpsContext + workers wired in  [x]
 **Reads:** plan `phase-09-task-07b.md`, audit §5.3 + §6 + §8.2.
@@ -372,11 +372,11 @@ under `<data_dir>/<shard_id>/`; persists UUID across restarts; stub
 - [x] All sub-tasks complete. (19/19 — 9.1, 9.2, 9.4, 9.5, 9.5
       cross-shard routing, 9.6, 9.6a, 9.7a, 9.7b, 9.8, 9.9, 9.10,
       9.11, 9.12, 9.13, 9.14, 9.15, 9.16, 9.17.)
-- [x] `just docker-verify` green. (Host `just verify` is
-      structurally unavailable — glommio's liburing needs Linux
-      headers; macOS host cannot build the workspace. The dev
-      container is the authoritative verify since the 9.6a / 9.7a
-      Glommio port; the phase doc wording predates that.)
+- [x] Verify suite (fmt-check + build + clippy + test + check-skills) green.
+      (glommio's liburing needs Linux headers; macOS host cannot
+      build the workspace. The dev container is the authoritative
+      verify since the 9.6a / 9.7a Glommio port; the phase doc
+      wording predates that.)
 - [x] `cargo run --bin brain-server` accepts a connection from a
       sample client. (Boot release binary against an empty data
       dir, TCP-connect to data + metrics ports, clean SIGTERM
@@ -385,7 +385,7 @@ under `<data_dir>/<shard_id>/`; persists UUID across restarts; stub
       `repeated_encode_recall_is_stable` × 10 consecutive runs:
       10/10 pass. Each run = 100 round-trips, so 1000 round-trips
       observed in aggregate.)
-- [x] `just run-server` boots in < 5 seconds with empty data.
+- [x] `cargo run --bin brain-server -- --config config/dev.toml` boots in < 5 seconds with empty data.
       (Release-mode brain-server cold-boot to first
       `accept()`-ready on the data-plane port: 0.023 s on a 1-shard,
       256 MiB-arena config; verified against a freshly-created

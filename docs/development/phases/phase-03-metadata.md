@@ -252,7 +252,7 @@ The test file lives in `tests/` so it sees only `brain-metadata`'s **public** AP
 ## Phase exit checklist
 
 - [x] All sub-tasks complete.
-- [x] `just verify` equivalent green in the Linux container (workspace-wide: brain-storage 155+95+4, brain-metadata 109+7 integration, all small crates).
+- [x] Verify suite (fmt-check + build + clippy + test + check-skills) equivalent green in the Linux container (workspace-wide: brain-storage 155+95+4, brain-metadata 109+7 integration, all small crates).
 - [x] Recovery integration test passes 100 random-seed iterations (Scenario G).
 - [x] All 13 spec'd tables present in `crates/brain-metadata/src/tables/`: agent, checkpoint, context, edge, idempotency, memory, model_fingerprint, next_lsn, slot_version, text — 10 files containing the 13 tables (`context.rs` bundles `contexts`, `context_names`, `agent_contexts`; `edge.rs` bundles `edges_out`, `edges_in`).
 - [x] Tag `phase-3-complete`.

@@ -1,7 +1,11 @@
-# Getting started with Brain v1.0
+# Your first substrate app
 
-A 15-minute walk from a blank deployment to a working hybrid
-query. You'll:
+A 15-minute walk from a blank Brain deployment to a working
+hybrid query. Picks up where the
+[Docker quickstart](01-quickstart-docker.md) left off — you have
+Brain running and want to actually *use* it.
+
+You'll:
 
 1. Install and start `brain-server`.
 2. Encode three memories.
@@ -16,9 +20,15 @@ query. You'll:
 Brain ships as a workspace of Rust crates. From a checkout:
 
 ```bash
-cargo install --path crates/brain-server
-cargo install --path crates/brain-cli
+cargo install --path crates/brain-server   # the daemon
+cargo install --path crates/brain-shell    # `brain` — interactive shell
+cargo install --path crates/brain-cli      # admin HTTP CLI
 ```
+
+The `brain` shell is the fastest way to poke a running substrate
+end-to-end — it's the `psql` / `redis-cli` equivalent. The SDK
+example walked through at the end of this page is the same thing
+written in Rust.
 
 Or, on Linux (recommended — Glommio + io_uring), use a
 cross-compiled binary from your `target/x86_64-unknown-linux-gnu`
@@ -35,16 +45,16 @@ on first start; it's empty until you encode.
 
 ## 3. Encode three memories
 
-In another terminal:
+In another terminal, use the `brain` shell:
 
 ```bash
-brain-cli --server 127.0.0.1:7332 encode \
+brain --server 127.0.0.1:7332 encode \
     "ticket ACME-1247 reproduces under heavy load"
 
-brain-cli --server 127.0.0.1:7332 encode \
+brain --server 127.0.0.1:7332 encode \
     "Priya merged the budget pushback decision on Friday"
 
-brain-cli --server 127.0.0.1:7332 encode \
+brain --server 127.0.0.1:7332 encode \
     "strawberry rhubarb cobbler recipe — bake at 375F"
 ```
 
@@ -52,10 +62,14 @@ Each call returns a `MemoryId`. The substrate stores the text
 in the WAL, indexes the vector in HNSW, and indexes the text
 in tantivy.
 
+> **Or, interactively:** just `brain --server 127.0.0.1:7332` drops
+> you into a REPL prompt where every line above runs without the
+> `brain --server …` prefix. See [`../reference/brain-shell.md`](../reference/brain-shell.md).
+
 ## 4. Substrate recall (no schema yet)
 
 ```bash
-brain-cli --server 127.0.0.1:7332 recall "budget pushback"
+brain --server 127.0.0.1:7332 recall "budget pushback" --include-text
 ```
 
 The response is a list of `MemoryResult` rows with their
@@ -65,15 +79,15 @@ pure-semantic recall path.
 
 ## 5. Declare a schema
 
-```bash
-cat > /tmp/my-schema.brain <<'EOF'
-namespace acme
+Schema upload (`SCHEMA_UPLOAD_REQ`, spec §21/08) doesn't yet have a
+shell or CLI surface — for now, upload it through the SDK:
 
-define entity_type Foo { attributes {} }
-EOF
-
-brain-cli --server 127.0.0.1:7332 schema upload \
-    --file /tmp/my-schema.brain
+```rust
+let req = SchemaUploadRequest {
+    schema_document: std::fs::read_to_string("/tmp/my-schema.brain")?,
+    dry_run: false,
+};
+client.schema_upload(req).await?;
 ```
 
 The server's per-shard `SchemaGate` flips from `false` to
@@ -82,8 +96,11 @@ pipeline transparently (spec §28/08 §5).
 
 ## 6. Hybrid query
 
+Once a schema is declared, the existing `recall` verb routes through
+the hybrid path automatically. Re-run:
+
 ```bash
-brain-cli --server 127.0.0.1:7332 query "budget pushback"
+brain --server 127.0.0.1:7332 recall "budget pushback" --include-text --output json | jq
 ```
 
 The response now includes per-hit `contributing_retrievers`

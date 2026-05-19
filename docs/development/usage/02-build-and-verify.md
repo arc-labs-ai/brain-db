@@ -5,16 +5,10 @@ Compile the workspace and run the full verification suite (`fmt` +
 
 ## 1. Build the workspace
 
-**Input (inside container):**
+**Input:**
 
 ```bash
-cargo build --workspace
-```
-
-**Or from host:**
-
-```bash
-just docker cargo build --workspace
+cargo build --workspace --all-targets
 ```
 
 **Expected output:**
@@ -61,7 +55,11 @@ test suite, and `clippy -D warnings`.
 **Input:**
 
 ```bash
-just docker-verify
+cargo fmt --all -- --check
+cargo build --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
+./scripts/check-skills.sh
 ```
 
 **Expected output:**
@@ -87,25 +85,25 @@ back through the output to find the failing line.
 **Single crate's tests with output:**
 
 ```bash
-just docker-test -p brain-protocol -- --nocapture
+cargo test -p brain-protocol -- --nocapture
 ```
 
 **Clippy only:**
 
 ```bash
-just docker-clippy
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 **One specific test:**
 
 ```bash
-just docker cargo test -p brain-server --test e2e
+cargo test -p brain-server --test e2e
 ```
 
 **One specific test function with output:**
 
 ```bash
-just docker cargo test -p brain-storage --lib -- arena::tests::crc_mismatch_halts --nocapture
+cargo test -p brain-storage --lib -- arena::tests::crc_mismatch_halts --nocapture
 ```
 
 ## 5. Reading test output

@@ -24,6 +24,27 @@ pub struct RecallHit {
     /// `None` until a wire-level `include_text` flag lands and the
     /// planner builds a `TextFetchStep`.
     pub text: Option<String>,
+    // ── Provenance + decay signals (v1 expansion) ──
+    /// Salience the row was first written with.
+    pub salience_initial: f32,
+    /// RECALL hit + explicit-get accumulator.
+    pub access_count: u32,
+    /// MemoryMetadata flags (ACTIVE / DEDUP_BACKREF / etc.).
+    pub flags: u32,
+    /// `Some(t)` for consolidation-worker-produced rows.
+    pub consolidated_at_unix_nanos: Option<u64>,
+    /// Denormalised outgoing edge count from the source row.
+    pub edges_out_count: u32,
+    /// Denormalised incoming edge count.
+    pub edges_in_count: u32,
+    /// Last-access timestamp (separate from `created_at`).
+    pub last_accessed_at_unix_nanos: u64,
+    /// WAL LSN this memory was encoded at — copied from
+    /// `MemoryMetadata.encoded_at_lsn`. `0` when unknown (test
+    /// fixtures, substrate-only deployments without a WAL sink).
+    /// Surfaced as `MemoryResult.lsn` so clients can chain
+    /// `recall → subscribe --start-lsn lsn+1`.
+    pub encoded_at_lsn: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -31,8 +52,23 @@ pub struct EncodeResult {
     pub memory_id: MemoryId,
     pub edge_results: Vec<EdgeOutcome>,
     /// `true` when the writer replayed a cached idempotency entry;
-    /// `false` for a fresh write. Spec §08/04 §4.
+    /// `false` for a fresh write. Spec §08/04 §4. Transparent —
+    /// the wire response does not carry this.
     pub replayed: bool,
+    /// `true` when the caller asked for dedup AND the fingerprint
+    /// table hit (spec §07/07 §6). The returned `memory_id` is
+    /// the pre-existing Active memory's; no new slot was
+    /// allocated. Surfaced to the wire as
+    /// `EncodeResponse.was_deduplicated`.
+    pub was_deduplicated: bool,
+    /// WAL LSN this encode was recorded at (production); `None`
+    /// for the in-memory test path. Surfaced as
+    /// `EncodeResponse.lsn` so the client can chain subscribe.
+    pub lsn: Option<u64>,
+    /// Server unix-nanos timestamp on the memory row.
+    pub created_at_unix_nanos: u64,
+    /// Edges actually inserted (Inserted-outcome count).
+    pub edges_out_count: u32,
 }
 
 #[derive(Debug, Clone, Copy)]

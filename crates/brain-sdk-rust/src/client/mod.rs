@@ -223,11 +223,28 @@ impl Client {
         UnlinkBuilder::new(self, source, kind, target)
     }
 
-    /// SUBSCRIBE to change events. 10.5 ships a `collect(N)`
-    /// helper; 10.6 adds the streaming iterator.
+    /// SUBSCRIBE to change events. `collect(N)` returns a batch;
+    /// `send_stream()` returns a `Stream` that yields events as
+    /// they arrive.
     #[must_use]
     pub fn subscribe(&self) -> SubscribeBuilder<'_> {
         SubscribeBuilder::new(self)
+    }
+
+    /// Cancel a live subscription by its target stream id (the
+    /// value returned by [`FrameStream::stream_id`] on the
+    /// subscriber). The server cancels the registry entry and
+    /// returns the final LSN it emitted to that subscriber.
+    ///
+    /// Safe to call from any connection in the pool — the registry
+    /// key is global per shard.
+    ///
+    /// [`FrameStream::stream_id`]: crate::ops::FrameStream::stream_id
+    pub async fn unsubscribe(
+        &self,
+        target_stream_id: u32,
+    ) -> Result<brain_protocol::response::UnsubscribeResponse, ClientError> {
+        crate::ops::subscribe::unsubscribe(self, target_stream_id).await
     }
 
     /// Open a transaction. Returns the `TxnBeginResponse`

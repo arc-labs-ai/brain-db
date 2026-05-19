@@ -107,8 +107,15 @@ pub(crate) enum ShardRequest {
     /// Dispatch a wire `RequestBody` through `brain_ops::dispatch` and
     /// return the resulting `ResponseBody`. Added in 9.10 — the
     /// frame-dispatcher's primary boundary primitive.
+    ///
+    /// `caller` carries the authenticated agent from the
+    /// connection's `ConnPhase::Established.agent`. The shard
+    /// passes it to `brain_ops::dispatch`, which stamps it onto
+    /// the per-request `ExecutorContext` so the writer-built Ops
+    /// know who they belong to.
     DispatchOp {
         req: Box<RequestBody>,
+        caller: brain_ops::RequestCaller,
         reply_tx: Sender<Result<ResponseBody, OpError>>,
     },
     /// Append a pre-built record to the WAL. Returns the durable LSN.
@@ -337,6 +344,15 @@ pub struct ShardHandle {
     /// observe events via a connection-side `tokio::sync::broadcast`
     /// bridge fed from this Receiver.
     events: Receiver<EventEnvelope>,
+    /// Absolute path to this shard's WAL directory. Surfaced so the
+    /// connection layer's subscribe-replay path (`run_subscription_task`'s
+    /// replay prologue) can open a [`brain_storage::wal::reader::WalReader`]
+    /// without round-tripping through the executor for every read.
+    wal_dir: std::path::PathBuf,
+    /// Shard UUID — required to validate WAL segment headers during
+    /// subscribe-replay. Same value that's stamped in every WAL
+    /// segment + arena slot.
+    shard_uuid: [u8; 16],
 }
 
 impl ShardHandle {
@@ -351,6 +367,20 @@ impl ShardHandle {
     #[must_use]
     pub fn events(&self) -> Receiver<EventEnvelope> {
         self.events.clone()
+    }
+
+    /// Absolute path to this shard's WAL directory. The connection
+    /// layer's subscribe-replay opens a [`brain_storage::wal::reader::WalReader`]
+    /// from this path to project records into events.
+    #[must_use]
+    pub fn wal_dir(&self) -> std::path::PathBuf {
+        self.wal_dir.clone()
+    }
+
+    /// Shard UUID — used by the WAL reader to validate segment headers.
+    #[must_use]
+    pub fn shard_uuid(&self) -> [u8; 16] {
+        self.shard_uuid
     }
 
     /// Round-trip Ping. Returns once the shard has replied.
@@ -516,11 +546,23 @@ impl ShardHandle {
     /// `OpsContext`. Returns the wire `ResponseBody` (variant chosen by
     /// `brain_ops::dispatch`). Added in 9.10 as the frame-dispatcher's
     /// boundary primitive.
-    pub async fn dispatch_op(&self, req: RequestBody) -> Result<ResponseBody, DispatchError> {
+    ///
+    /// `caller` carries the authenticated agent from the
+    /// connection's `ConnPhase::Established.agent`. The shard
+    /// passes it through to `brain_ops::dispatch`, which stamps it
+    /// onto the per-request `ExecutorContext` so the writer-built
+    /// Ops know who they belong to — closing the multi-tenant leak
+    /// on shared shards.
+    pub async fn dispatch_op(
+        &self,
+        req: RequestBody,
+        caller: brain_ops::RequestCaller,
+    ) -> Result<ResponseBody, DispatchError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.tx
             .send_async(ShardRequest::DispatchOp {
                 req: Box::new(req),
+                caller,
                 reply_tx,
             })
             .await
@@ -830,9 +872,32 @@ pub fn spawn_shard(
                 );
                 Some(Arc::new(retriever))
             };
-            // Per-shard writer wraps metadata + hnsw_writer.
-            let writer: Arc<dyn WriterHandle> =
-                Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
+            // Per-shard writer wraps metadata + hnsw_writer. The
+            // shard_id stamp on `reserve_memory_id` is required —
+            // without it every MemoryId claims shard 0, and
+            // dispatch::shard_for_memory routes LINK / UNLINK /
+            // FORGET to shard 0 regardless of where the row lives.
+            //
+            // The shared `event_bus` is also handed to OpsContext
+            // below so the writer's commit-time publishes land on
+            // the same bus the SubscriptionRegistry listens on —
+            // without this link, SUBSCRIBE clients silently see
+            // zero events.
+            let event_bus = Arc::new(brain_ops::subscribe::EventBus::default());
+            // Wire the WAL sink. The sender lives on the writer
+            // (Send + Sync), the receiver is drained by a Glommio-
+            // local task spawned after the Wal is open (see "WAL
+            // drain task" below). Without this link the writer
+            // silently falls back to the legacy bus-stamped-LSN
+            // path and subscribe --start-lsn finds an empty log.
+            let (wal_sink, wal_drain_rx) = brain_ops::ops::writer::channel_wal_sink();
+            let wal_sink_for_ops: Arc<dyn brain_ops::ops::writer::WalSink> = wal_sink.clone();
+            let writer: Arc<dyn WriterHandle> = Arc::new(
+                RealWriterHandle::new(metadata.clone(), hnsw_writer)
+                    .with_shard_id(shard_id)
+                    .with_event_bus(event_bus.clone())
+                    .with_wal_sink(wal_sink),
+            );
             let executor_ctx =
                 ExecutorContext::new(dispatcher, hnsw_shared.clone(), metadata.clone(), writer);
 
@@ -1008,6 +1073,7 @@ pub fn spawn_shard(
 
             let ops = Arc::new(
                 OpsContext::new(executor_ctx)
+                    .with_event_bus(event_bus.clone())
                     .with_extractor_registry(extractor_registry)
                     .with_classifier_config(classifier_config)
                     .with_llm_cache(llm_cache_for_ops)
@@ -1017,7 +1083,8 @@ pub fn spawn_shard(
                     .with_lexical_retriever(lexical_retriever_for_ops)
                     .with_semantic_retriever(semantic_retriever_for_ops)
                     .with_graph_retriever(graph_retriever_for_ops)
-                    .with_schema_gate(schema_gate),
+                    .with_schema_gate(schema_gate)
+                    .with_wal_sink(Some(wal_sink_for_ops)),
             );
 
             // Spawn the per-shard fanout task: drains the in-process
@@ -1074,6 +1141,37 @@ pub fn spawn_shard(
             // sound; the discipline is "drop the borrow before .await".
             let arena_cell = Rc::new(RefCell::new(arena));
             let wal_cell = Rc::new(RefCell::new(Some(wal)));
+
+            // WAL drain task: forwards every record the writer's
+            // `ChannelWalSink` enqueues to the real `Wal::append`,
+            // replying with the assigned LSN over the per-call
+            // oneshot. Lives on this executor so it can share the
+            // `Rc<RefCell<Option<Wal>>>` with the main loop's
+            // `AppendWalRecord` handler — both serialise on the
+            // RefCell, and single-threaded scheduling means a
+            // `.await` inside the drain task doesn't conflict with
+            // the main loop's borrow.
+            //
+            // The task ends when the sender (held inside the
+            // writer's `Arc<dyn WalSink>`) is dropped — which happens
+            // at shard shutdown when the `OpsContext` Arc count
+            // hits zero.
+            let wal_cell_for_drain = wal_cell.clone();
+            glommio::spawn_local(async move {
+                while let Ok((record, reply)) = wal_drain_rx.recv_async().await {
+                    let outcome = {
+                        let guard = wal_cell_for_drain.borrow();
+                        match guard.as_ref() {
+                            Some(wal) => wal.append(record).await.map_err(|e| {
+                                brain_ops::ops::writer::WalSinkError::Internal(format!("{e}"))
+                            }),
+                            None => Err(brain_ops::ops::writer::WalSinkError::Disconnected),
+                        }
+                    };
+                    let _ = reply.send(outcome);
+                }
+            })
+            .detach();
 
             // Build real Phase-8 adapters (sub-task 9.8).
             let rebuild_source: Arc<dyn RebuildSource<{ VECTOR_DIM }>> = Arc::new(
@@ -1138,6 +1236,8 @@ pub fn spawn_shard(
         shard_id,
         tx,
         events: events_rx,
+        wal_dir: wal_dir.clone(),
+        shard_uuid,
     };
     let joiner = ShardJoiner {
         shard_id,
@@ -1301,7 +1401,7 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     );
                 }
             }
-            ShardRequest::DispatchOp { req, reply_tx } => {
+            ShardRequest::DispatchOp { req, caller, reply_tx } => {
                 // `brain_ops::dispatch` is async and runs entirely
                 // within the per-shard Glommio executor: it touches
                 // `OpsContext` (which is !Send post-9.7a) and yields
@@ -1309,7 +1409,7 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                 // the main loop is single-threaded and processes one
                 // request at a time, the same shape as
                 // `AppendWalRecord`.
-                let out = brain_ops::dispatch::dispatch(*req, &shard.ops).await;
+                let out = brain_ops::dispatch::dispatch(*req, caller, &shard.ops).await;
                 if reply_tx.send_async(out).await.is_err() {
                     warn!(
                         shard_id = shard.shard_id,

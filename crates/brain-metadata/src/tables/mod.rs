@@ -8,6 +8,7 @@ pub mod agent;
 pub mod checkpoint;
 pub mod context;
 pub mod edge;
+pub mod fingerprint;
 pub mod idempotency;
 pub mod knowledge;
 pub mod memory;

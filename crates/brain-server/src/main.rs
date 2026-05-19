@@ -207,17 +207,37 @@ mod linux_main {
 
             let connection_metrics = Arc::new(crate::connection::ConnectionMetrics::default());
 
-            // Sub-task 9.13: admin HTTP server (/healthz + /metrics).
-            // Shares the shutdown signal so a single ctrl-c brings
-            // both down.
+            // Two HTTP listeners (see `crates/brain-server/src/admin/mod.rs`
+            // module docs):
+            //   - public  → `/healthz` + `/metrics`  on `metrics_addr`
+            //   - admin   → `/v1/*`                  on `admin_addr` (loopback default)
+            // Both share the same ShutdownSignal so a single ctrl-c brings
+            // them down together.
             let admin_state = Arc::new(crate::admin::AdminState::new(
                 topology.shards.clone(),
                 connection_metrics.clone(),
                 Arc::new(cfg.clone()),
                 request_metrics.clone(),
             ));
-            let admin = crate::admin::AdminServer::new(
+
+            let public = crate::admin::AdminServer::public(
                 cfg.server.metrics_addr,
+                admin_state.clone(),
+                signal.clone(),
+            );
+            let public_handle = match public.bind().await {
+                Ok(bound) => {
+                    tracing::info!(addr = %bound.local_addr(), "metrics server listening");
+                    tokio::spawn(async move { bound.serve().await })
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to bind metrics server");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let admin = crate::admin::AdminServer::admin(
+                cfg.server.admin_addr,
                 admin_state,
                 signal.clone(),
             );
@@ -271,31 +291,23 @@ mod linux_main {
                 }
             };
 
-            // Bounded wait for the admin server to observe the same
+            // Bounded wait for both HTTP listeners to observe the same
             // signal and exit. 2s is generous — the accept loop's
             // shutdown arm resolves immediately.
             let admin_rc =
-                match tokio::time::timeout(std::time::Duration::from_secs(2), admin_handle).await {
-                    Ok(Ok(Ok(_))) => ExitCode::SUCCESS,
-                    Ok(Ok(Err(e))) => {
-                        tracing::error!(error = %e, "admin server failed");
-                        ExitCode::FAILURE
-                    }
-                    Ok(Err(e)) => {
-                        tracing::error!(error = %e, "admin server task panicked");
-                        ExitCode::FAILURE
-                    }
-                    Err(_) => {
-                        tracing::error!("admin server drain timed out");
-                        ExitCode::FAILURE
-                    }
-                };
+                drain_http_listener("admin server", admin_handle, std::time::Duration::from_secs(2))
+                    .await;
+            let public_rc = drain_http_listener(
+                "metrics server",
+                public_handle,
+                std::time::Duration::from_secs(2),
+            )
+            .await;
 
-            if serve_rc == ExitCode::SUCCESS {
-                admin_rc
-            } else {
-                serve_rc
-            }
+            [serve_rc, admin_rc, public_rc]
+                .into_iter()
+                .find(|rc| *rc != ExitCode::SUCCESS)
+                .unwrap_or(ExitCode::SUCCESS)
         });
 
         // Phase B (outside the Tokio runtime): close every shard's
@@ -340,6 +352,31 @@ mod linux_main {
             }
         }
         Ok((handles, joiners))
+    }
+
+    /// Bounded drain helper for one HTTP listener task. `label` is
+    /// the human-facing name used in error logs (e.g. "admin server"
+    /// vs "metrics server"). Returns the appropriate `ExitCode`.
+    async fn drain_http_listener(
+        label: &'static str,
+        handle: tokio::task::JoinHandle<std::io::Result<std::net::SocketAddr>>,
+        budget: std::time::Duration,
+    ) -> ExitCode {
+        match tokio::time::timeout(budget, handle).await {
+            Ok(Ok(Ok(_))) => ExitCode::SUCCESS,
+            Ok(Ok(Err(e))) => {
+                tracing::error!(error = %e, "{label} failed");
+                ExitCode::FAILURE
+            }
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "{label} task panicked");
+                ExitCode::FAILURE
+            }
+            Err(_) => {
+                tracing::error!("{label} drain timed out");
+                ExitCode::FAILURE
+            }
+        }
     }
 
     fn spawn_signal_listener(trigger: ShutdownTrigger) {

@@ -4,10 +4,17 @@
 //! `Tombstoned` transition (spec §10/4).
 
 use brain_core::MemoryKind;
+use brain_metadata::tables::fingerprint::{fingerprint_key, FINGERPRINTS_TABLE};
 use brain_metadata::tables::idempotency::{IdempotencyEntry, IDEMPOTENCY_TABLE};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_planner::{ForgetAck, ForgetOp, ForgetOutcome, WriterError};
+use brain_protocol::request::ForgetMode as ForgetModeWire;
 use brain_protocol::response::EventType;
+use brain_storage::wal::payload::{
+    ForgetMode as WalForgetMode, ForgetPayload as WalForgetPayload,
+    ForgetReason as WalForgetReason, WalPayload,
+};
+use brain_storage::wal::record::{Lsn, WalRecord};
 use redb::ReadableTable;
 
 use crate::idempotency::{
@@ -17,7 +24,10 @@ use crate::subscribe::EventEnvelope;
 
 use super::{hex_short, now_unix_nanos, RealWriterHandle};
 
-pub(super) fn do_forget(writer: &RealWriterHandle, op: ForgetOp) -> Result<ForgetAck, WriterError> {
+pub(super) async fn do_forget(
+    writer: &RealWriterHandle,
+    op: ForgetOp,
+) -> Result<ForgetAck, WriterError> {
     let request_hash = hash_forget_request(&op);
     let request_id_bytes: [u8; 16] = op.request_id.into();
 
@@ -66,7 +76,8 @@ pub(super) fn do_forget(writer: &RealWriterHandle, op: ForgetOp) -> Result<Forge
             request_hash,
             ForgetOutcome::AlreadyTombstoned,
             None,
-        );
+        )
+        .await;
     }
 
     // ── Look up the memory row (existence + context/kind/salience
@@ -92,7 +103,8 @@ pub(super) fn do_forget(writer: &RealWriterHandle, op: ForgetOp) -> Result<Forge
             request_hash,
             ForgetOutcome::MemoryNotFound,
             None,
-        );
+        )
+        .await;
     };
 
     // ── Tombstone in HNSW (durable in the sense it survives this
@@ -112,9 +124,10 @@ pub(super) fn do_forget(writer: &RealWriterHandle, op: ForgetOp) -> Result<Forge
         ForgetOutcome::Tombstoned,
         Some(meta),
     )
+    .await
 }
 
-fn record_and_return_forget(
+async fn record_and_return_forget(
     writer: &RealWriterHandle,
     op: &ForgetOp,
     request_hash: [u8; 32],
@@ -124,6 +137,48 @@ fn record_and_return_forget(
     let request_id_bytes: [u8; 16] = op.request_id.into();
     let created_at = now_unix_nanos();
     let payload = encode_forget_payload(op.memory_id, outcome);
+
+    // ── WAL append for the substrate-affecting transition only.
+    // `MemoryNotFound` and `AlreadyTombstoned` are pure no-ops on
+    // arena + index; their idempotency stamp lives in redb and
+    // doesn't need a separate WAL record. The Tombstoned transition
+    // DOES need durable WAL ordering so subscribe-replay can emit
+    // the matching `Forgotten` event and recovery can re-tombstone
+    // the slot on a fresh boot. ────────────────────────────────────
+    let wal_lsn: Option<Lsn> = if matches!(outcome, ForgetOutcome::Tombstoned) {
+        if let Some(sink) = &writer.wal_sink {
+            let wal_mode = match op.mode {
+                ForgetModeWire::Soft => WalForgetMode::Soft,
+                ForgetModeWire::Hard => WalForgetMode::Hard,
+            };
+            let record_payload = WalPayload::Forget(WalForgetPayload {
+                memory_id: op.memory_id,
+                request_id: op.request_id,
+                agent_id: op.agent_id,
+                mode: wal_mode,
+                reason: WalForgetReason::ClientRequest,
+            });
+            let agent_bytes: [u8; 16] = op.agent_id.into();
+            let agent_id_lo64 = u64::from_be_bytes(agent_bytes[8..16].try_into().unwrap());
+            let record = WalRecord::from_typed(
+                Lsn(0),
+                /* flags */ 0,
+                created_at,
+                agent_id_lo64,
+                &record_payload,
+            );
+            let lsn = sink
+                .append(record)
+                .await
+                .map_err(|e| WriterError::Internal(format!("wal append: {e}")))?;
+            Some(lsn)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     {
         let mut db = writer.metadata.lock();
         let wtxn = db
@@ -139,6 +194,7 @@ fn record_and_return_forget(
                 payload,
                 request_hash,
                 created_at,
+                wal_lsn.map(|l| l.raw()).unwrap_or(0),
             );
             idem_t
                 .insert(request_id_bytes, entry)
@@ -147,6 +203,10 @@ fn record_and_return_forget(
         // Sub-task 8.7: stamp tombstoned_at on the MEMORIES row so the
         // slot-reclamation worker (and any tombstone-aware filter)
         // can discover age. Set-once — replays don't bump the stamp.
+        // Phase 8.dedup: at the same time, if the row carried a
+        // dedup back-reference (`content_hash`), evict the matching
+        // `FINGERPRINTS` entry so future dedup-true ENCODEs don't
+        // hit a tombstoned memory (spec §07/07 §6.3 option b).
         if matches!(outcome, ForgetOutcome::Tombstoned) {
             let mut memories_t = wtxn
                 .open_table(MEMORIES_TABLE)
@@ -156,6 +216,9 @@ fn record_and_return_forget(
                 .map_err(|e| WriterError::Internal(format!("forget memories get: {e:?}")))?
                 .map(|access| access.value());
             if let Some(mut row) = prior {
+                let dedup_back_ref = row.content_hash;
+                let row_agent = row.agent_id();
+                let row_context = row.context();
                 if row.tombstoned_at_unix_nanos.is_none() {
                     row.tombstoned_at_unix_nanos = Some(created_at);
                     memories_t
@@ -163,6 +226,15 @@ fn record_and_return_forget(
                         .map_err(|e| {
                             WriterError::Internal(format!("forget memories stamp: {e:?}"))
                         })?;
+                }
+                if let Some(hash) = dedup_back_ref {
+                    let key = fingerprint_key(row_agent, row_context, &hash);
+                    let mut fp_t = wtxn.open_table(FINGERPRINTS_TABLE).map_err(|e| {
+                        WriterError::Internal(format!("forget open FINGERPRINTS: {e:?}"))
+                    })?;
+                    fp_t.remove(key).map_err(|e| {
+                        WriterError::Internal(format!("forget fingerprints remove: {e:?}"))
+                    })?;
                 }
             }
         }
@@ -180,17 +252,21 @@ fn record_and_return_forget(
             // Episodic in that pathological case — the change-feed
             // event is best-effort, not load-bearing.
             let kind = m.kind().unwrap_or(MemoryKind::Episodic);
-            writer.publish(EventEnvelope {
-                lsn: 0,
-                event_type: EventType::Forgotten,
-                memory_id: op.memory_id,
-                context_id: m.context(),
-                kind,
-                salience: m.salience,
-                timestamp_unix_nanos: created_at,
-                text: None,
-                knowledge_payload: None,
-            });
+            writer.publish_with_lsn(
+                EventEnvelope {
+                    lsn: 0,
+                    event_type: EventType::Forgotten,
+                    memory_id: op.memory_id,
+                    context_id: m.context(),
+                    kind,
+                    salience: m.salience,
+                    timestamp_unix_nanos: created_at,
+                    text: None,
+                    knowledge_payload: None,
+                    agent_id: op.agent_id,
+                },
+                wal_lsn.map(|l| l.raw()),
+            );
         }
     }
 

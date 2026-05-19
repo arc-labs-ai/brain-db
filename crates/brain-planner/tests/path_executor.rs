@@ -354,3 +354,117 @@ async fn plan_silently_skips_tombstoned_goal() {
     assert_eq!(result.status, PlanStatus::NoPathFound);
     assert!(result.paths.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// node_text hydration.
+// ---------------------------------------------------------------------------
+
+/// Seed a UTF-8 text row per id directly into TEXTS_TABLE on the
+/// fixture's metadata. Mirrors what live encode now does.
+fn seed_texts(fix: &Fixture, pairs: &[(MemoryId, &str)]) {
+    use brain_metadata::tables::text::TEXTS_TABLE;
+    let mut guard = fix.ctx.metadata.lock();
+    let wtxn = guard.write_txn().unwrap();
+    {
+        let mut t = wtxn.open_table(TEXTS_TABLE).unwrap();
+        for (id, text) in pairs {
+            t.insert(id.to_be_bytes(), text.as_bytes()).unwrap();
+        }
+    }
+    wtxn.commit().unwrap();
+}
+
+#[tokio::test]
+async fn plan_populates_node_text_from_texts_table() {
+    let fix = build_fixture(3, &[(0, EdgeKind::Caused, 1), (1, EdgeKind::FollowedBy, 2)]);
+    seed_texts(
+        &fix,
+        &[
+            (fix.ids[0], "start"),
+            (fix.ids[1], "middle"),
+            (fix.ids[2], "end"),
+        ],
+    );
+
+    let result = run(&fix, plan_request(fix.ids[0], fix.ids[2], 3)).await;
+    assert_eq!(result.status, PlanStatus::GoalReached);
+    let p = &result.paths[0];
+    assert_eq!(p.nodes, vec![fix.ids[0], fix.ids[1], fix.ids[2]]);
+    assert_eq!(p.node_text, vec!["start", "middle", "end"]);
+}
+
+#[tokio::test]
+async fn plan_node_text_is_empty_when_texts_table_unborn() {
+    // No seed_texts call → the texts table is never created. PLAN
+    // must still succeed with empty per-node text instead of 500.
+    let fix = build_fixture(2, &[(0, EdgeKind::Caused, 1)]);
+    let result = run(&fix, plan_request(fix.ids[0], fix.ids[1], 2)).await;
+    assert_eq!(result.status, PlanStatus::GoalReached);
+    let p = &result.paths[0];
+    assert_eq!(p.node_text, vec![String::new(), String::new()]);
+}
+
+#[tokio::test]
+async fn plan_node_text_round_trips_unicode_bytes() {
+    let fix = build_fixture(3, &[(0, EdgeKind::Caused, 1), (1, EdgeKind::FollowedBy, 2)]);
+    // Multibyte UTF-8 and emoji across the path.
+    seed_texts(
+        &fix,
+        &[
+            (fix.ids[0], "héllo"),
+            (fix.ids[1], "naïve 🌍"),
+            (fix.ids[2], "café é\u{0301}"),
+        ],
+    );
+
+    let result = run(&fix, plan_request(fix.ids[0], fix.ids[2], 3)).await;
+    assert_eq!(result.status, PlanStatus::GoalReached);
+    let p = &result.paths[0];
+    assert_eq!(p.node_text, vec!["héllo", "naïve 🌍", "café é\u{0301}"]);
+}
+
+#[tokio::test]
+async fn plan_node_text_mixed_present_and_missing_rows() {
+    // Three-node path; only endpoints get text rows. The middle
+    // node's missing row must surface as empty, not as an error.
+    let fix = build_fixture(3, &[(0, EdgeKind::Caused, 1), (1, EdgeKind::FollowedBy, 2)]);
+    seed_texts(
+        &fix,
+        &[(fix.ids[0], "first"), (fix.ids[2], "last")],
+    );
+
+    let result = run(&fix, plan_request(fix.ids[0], fix.ids[2], 3)).await;
+    assert_eq!(result.status, PlanStatus::GoalReached);
+    let p = &result.paths[0];
+    assert_eq!(p.node_text, vec!["first", "", "last"]);
+}
+
+#[tokio::test]
+async fn plan_node_text_with_invalid_utf8_in_texts_table_errors() {
+    use brain_metadata::tables::text::TEXTS_TABLE;
+    let fix = build_fixture(2, &[(0, EdgeKind::Caused, 1)]);
+    // Seed one valid row, then directly insert invalid UTF-8 for the
+    // other. Encoded writes can never produce this — fake corruption.
+    seed_texts(&fix, &[(fix.ids[0], "ok")]);
+    {
+        let mut guard = fix.ctx.metadata.lock();
+        let wtxn = guard.write_txn().unwrap();
+        {
+            let mut t = wtxn.open_table(TEXTS_TABLE).unwrap();
+            t.insert(fix.ids[1].to_be_bytes(), [0xC3, 0x28].as_slice())
+                .unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+
+    let req = plan_request(fix.ids[0], fix.ids[1], 2);
+    let plan = plan_path_inner(&req, &PlannerContext::default()).unwrap();
+    let err = execute_path(plan, &fix.ctx)
+        .await
+        .expect_err("corrupt UTF-8 must fail PLAN, not silently coerce");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("UTF-8") || msg.contains("utf8"),
+        "error should mention UTF-8, got: {msg}",
+    );
+}

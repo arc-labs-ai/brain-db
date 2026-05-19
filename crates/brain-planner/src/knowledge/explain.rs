@@ -189,10 +189,15 @@ fn render_post_filters(s: &mut String, chain: &FilterChain) {
     if let Some(c) = chain.confidence_min {
         parts.push(format!("confidence >= {c:.2}"));
     }
-    if !chain.include_tombstoned {
+    // !tombstoned / !superseded are implicit defaults — only
+    // surface them when the request also carries an explicit
+    // filter, so a no-filter EXPLAIN reads as `none` instead of
+    // listing the always-on guards.
+    let has_explicit_filter = !parts.is_empty();
+    if has_explicit_filter && !chain.include_tombstoned {
         parts.push("!tombstoned".into());
     }
-    if !chain.include_superseded {
+    if has_explicit_filter && !chain.include_superseded {
         parts.push("!superseded".into());
     }
     let summary = if parts.is_empty() {

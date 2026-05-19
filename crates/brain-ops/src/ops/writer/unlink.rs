@@ -6,6 +6,8 @@ use brain_metadata::tables::edge::{self, EDGES_IN_TABLE, EDGES_OUT_TABLE};
 use brain_metadata::tables::idempotency::{IdempotencyEntry, IDEMPOTENCY_TABLE};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_planner::{UnlinkAck, UnlinkOp, WriterError};
+use brain_storage::wal::payload::{UnlinkPayload as WalUnlinkPayload, WalPayload};
+use brain_storage::wal::record::{Lsn, WalRecord};
 
 use crate::idempotency::{
     decode_unlink_payload, encode_unlink_payload, hash_unlink_request, RESPONSE_KIND_UNLINK,
@@ -13,7 +15,10 @@ use crate::idempotency::{
 
 use super::{bump_edge_count, hex_short, now_unix_nanos, RealWriterHandle};
 
-pub(super) fn do_unlink(writer: &RealWriterHandle, op: UnlinkOp) -> Result<UnlinkAck, WriterError> {
+pub(super) async fn do_unlink(
+    writer: &RealWriterHandle,
+    op: UnlinkOp,
+) -> Result<UnlinkAck, WriterError> {
     let request_hash = hash_unlink_request(&op);
     let request_id_bytes: [u8; 16] = op.request_id.into();
 
@@ -57,6 +62,34 @@ pub(super) fn do_unlink(writer: &RealWriterHandle, op: UnlinkOp) -> Result<Unlin
 
     let created_at = now_unix_nanos();
 
+    // ── WAL append BEFORE the redb txn. The recovery path's
+    // apply_unlink is idempotent (missing edge = no-op) so we WAL
+    // unconditionally; whether the edge actually got removed lives
+    // in the response payload, not the WAL record.
+    let wal_lsn: Option<Lsn> = if let Some(sink) = &writer.wal_sink {
+        let record_payload = WalPayload::Unlink(WalUnlinkPayload {
+            source: op.source,
+            target: op.target,
+            edge_kind: op.kind,
+            edge_seq: 0,
+        });
+        let agent_bytes: [u8; 16] = op.agent_id.into();
+        let agent_id_lo64 = u64::from_be_bytes(agent_bytes[8..16].try_into().unwrap());
+        let record = WalRecord::from_typed(
+            Lsn(0),
+            /* flags */ 0,
+            created_at,
+            agent_id_lo64,
+            &record_payload,
+        );
+        let lsn = sink
+            .append(record)
+            .await
+            .map_err(|e| WriterError::Internal(format!("wal append: {e}")))?;
+        Some(lsn)
+    } else {
+        None
+    };
     // ── Apply: edge remove + count decrement + idempotency. ───────
     let removed = {
         let mut db = writer.metadata.lock();
@@ -97,6 +130,7 @@ pub(super) fn do_unlink(writer: &RealWriterHandle, op: UnlinkOp) -> Result<Unlin
                 payload,
                 request_hash,
                 created_at,
+                wal_lsn.map(|l| l.raw()).unwrap_or(0),
             );
             idem_t
                 .insert(request_id_bytes, entry)

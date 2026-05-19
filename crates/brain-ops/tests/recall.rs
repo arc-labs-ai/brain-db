@@ -12,6 +12,7 @@ use std::sync::Arc;
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
+use brain_ops::test_support::run_in_glommio;
 use brain_ops::{dispatch, ErrorCode, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::request::{EncodeRequest, MemoryKindWire, RecallRequest, RequestBody};
@@ -99,6 +100,7 @@ fn recall_req(cue: &str, top_k: u32) -> RecallRequest {
         strategy_hint: None,
         include_vectors: false,
         include_edges: false,
+        include_text: false,
         request_id: None,
         txn_id: None,
     }
@@ -106,7 +108,7 @@ fn recall_req(cue: &str, top_k: u32) -> RecallRequest {
 
 async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str, kind: MemoryKindWire) -> u128 {
     let req = encode_req(request_id, text, kind);
-    match dispatch(RequestBody::Encode(req), &fix.ctx).await.unwrap() {
+    match dispatch(RequestBody::Encode(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap() {
         ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
         other => panic!("expected Encode response, got {other:?}"),
     }
@@ -123,199 +125,277 @@ fn unwrap_recall_resp(body: ResponseBody) -> RecallResponseFrame {
 // 1. Full pipeline.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn recall_full_pipeline_returns_top_k() {
-    let fix = build_fixture();
-    encode(&fix, [1; 16], "alpha", MemoryKindWire::Episodic).await;
-    encode(&fix, [2; 16], "beta", MemoryKindWire::Episodic).await;
-    encode(&fix, [3; 16], "gamma", MemoryKindWire::Episodic).await;
+#[test]
+fn recall_full_pipeline_returns_top_k() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        encode(&fix, [1; 16], "alpha", MemoryKindWire::Episodic).await;
+        encode(&fix, [2; 16], "beta", MemoryKindWire::Episodic).await;
+        encode(&fix, [3; 16], "gamma", MemoryKindWire::Episodic).await;
 
-    let frame = unwrap_recall_resp(
-        dispatch(RequestBody::Recall(recall_req("alpha", 2)), &fix.ctx)
-            .await
-            .unwrap(),
-    );
-    assert!(frame.is_final);
-    assert_eq!(frame.results.len(), 2, "k=2 → exactly 2 results");
-    assert_eq!(frame.cumulative_count, 2);
-    // Sorted by score descending.
-    assert!(
-        frame.results[0].similarity_score >= frame.results[1].similarity_score,
-        "results must be sorted by score desc"
-    );
-    // Fields plumbed through.
-    let top = &frame.results[0];
-    assert_ne!(top.memory_id, 0);
-    assert_eq!(top.context_id, 42);
-    assert_eq!(top.kind, MemoryKindWire::Episodic);
-    assert!((top.salience - 0.5).abs() < 1e-6);
-    assert_eq!(
-        top.confidence, top.similarity_score,
-        "v1: confidence == similarity"
-    );
-    assert_eq!(
-        top.last_accessed_at_unix_nanos, top.created_at_unix_nanos,
-        "v1: last_accessed mirrors created_at"
-    );
-    assert_eq!(top.vector_offset, 0);
-    assert_eq!(top.vector_dim, 0);
-    assert!(top.edges.is_none());
+        let frame = unwrap_recall_resp(
+            dispatch(RequestBody::Recall(recall_req("alpha", 2)), brain_ops::RequestCaller::anonymous(), &fix.ctx)
+                .await
+                .unwrap(),
+        );
+        assert!(frame.is_final);
+        assert_eq!(frame.results.len(), 2, "k=2 → exactly 2 results");
+        assert_eq!(frame.cumulative_count, 2);
+        // Sorted by score descending.
+        assert!(
+            frame.results[0].similarity_score >= frame.results[1].similarity_score,
+            "results must be sorted by score desc"
+        );
+        // Fields plumbed through.
+        let top = &frame.results[0];
+        assert_ne!(top.memory_id, 0);
+        assert_eq!(top.context_id, 42);
+        assert_eq!(top.kind, MemoryKindWire::Episodic);
+        assert!((top.salience - 0.5).abs() < 1e-6);
+        assert_eq!(
+            top.confidence, top.similarity_score,
+            "v1: confidence == similarity"
+        );
+        assert_eq!(
+            top.last_accessed_at_unix_nanos, top.created_at_unix_nanos,
+            "v1: last_accessed mirrors created_at"
+        );
+        assert_eq!(top.vector_offset, 0);
+        assert_eq!(top.vector_dim, 0);
+        assert!(top.edges.is_none());
+    })
 }
 
 // ---------------------------------------------------------------------------
 // 2. Empty index → empty frame.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn recall_empty_index_returns_empty_frame() {
-    let fix = build_fixture();
-    let frame = unwrap_recall_resp(
-        dispatch(RequestBody::Recall(recall_req("nothing", 10)), &fix.ctx)
-            .await
-            .unwrap(),
-    );
-    assert!(frame.results.is_empty());
-    assert!(frame.is_final);
-    assert_eq!(frame.cumulative_count, 0);
-    assert!(frame.estimated_remaining.is_none());
+#[test]
+fn recall_empty_index_returns_empty_frame() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let frame = unwrap_recall_resp(
+            dispatch(RequestBody::Recall(recall_req("nothing", 10)), brain_ops::RequestCaller::anonymous(), &fix.ctx)
+                .await
+                .unwrap(),
+        );
+        assert!(frame.results.is_empty());
+        assert!(frame.is_final);
+        assert_eq!(frame.cumulative_count, 0);
+        assert!(frame.estimated_remaining.is_none());
+    })
 }
 
 // ---------------------------------------------------------------------------
 // 3. K-truncation.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn recall_k_truncation() {
-    let fix = build_fixture();
-    for i in 0..5u8 {
-        let mut req_id = [0u8; 16];
-        req_id[0] = 0x10 + i;
-        let text = format!("doc-{i}");
-        encode(&fix, req_id, &text, MemoryKindWire::Episodic).await;
-    }
-    let frame = unwrap_recall_resp(
-        dispatch(RequestBody::Recall(recall_req("doc-2", 3)), &fix.ctx)
-            .await
-            .unwrap(),
-    );
-    assert_eq!(frame.results.len(), 3, "k=3 → exactly 3 results");
+#[test]
+fn recall_k_truncation() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        for i in 0..5u8 {
+            let mut req_id = [0u8; 16];
+            req_id[0] = 0x10 + i;
+            let text = format!("doc-{i}");
+            encode(&fix, req_id, &text, MemoryKindWire::Episodic).await;
+        }
+        let frame = unwrap_recall_resp(
+            dispatch(RequestBody::Recall(recall_req("doc-2", 3)), brain_ops::RequestCaller::anonymous(), &fix.ctx)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(frame.results.len(), 3, "k=3 → exactly 3 results");
+    })
 }
 
 // ---------------------------------------------------------------------------
 // 4. Kind filter.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn recall_kind_filter_rejects_off_kind_hits() {
-    let fix = build_fixture();
-    encode(&fix, [20; 16], "ep-a", MemoryKindWire::Episodic).await;
-    encode(&fix, [21; 16], "ep-b", MemoryKindWire::Episodic).await;
-    encode(&fix, [22; 16], "sem-a", MemoryKindWire::Semantic).await;
-    encode(&fix, [23; 16], "sem-b", MemoryKindWire::Semantic).await;
+#[test]
+fn recall_kind_filter_rejects_off_kind_hits() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        encode(&fix, [20; 16], "ep-a", MemoryKindWire::Episodic).await;
+        encode(&fix, [21; 16], "ep-b", MemoryKindWire::Episodic).await;
+        encode(&fix, [22; 16], "sem-a", MemoryKindWire::Semantic).await;
+        encode(&fix, [23; 16], "sem-b", MemoryKindWire::Semantic).await;
 
-    let mut req = recall_req("ep-a", 10);
-    req.kind_filter = Some(vec![MemoryKindWire::Semantic]);
-    let frame = unwrap_recall_resp(dispatch(RequestBody::Recall(req), &fix.ctx).await.unwrap());
+        let mut req = recall_req("ep-a", 10);
+        req.kind_filter = Some(vec![MemoryKindWire::Semantic]);
+        let frame = unwrap_recall_resp(dispatch(RequestBody::Recall(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
 
-    assert!(
-        !frame.results.is_empty(),
-        "the semantic memories must be in candidates"
-    );
-    for r in &frame.results {
-        assert_eq!(r.kind, MemoryKindWire::Semantic);
-    }
+        assert!(
+            !frame.results.is_empty(),
+            "the semantic memories must be in candidates"
+        );
+        for r in &frame.results {
+            assert_eq!(r.kind, MemoryKindWire::Semantic);
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
 // 5. Confidence floor.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn recall_confidence_floor_drops_low_score_hits() {
-    let fix = build_fixture();
-    encode(&fix, [30; 16], "alpha", MemoryKindWire::Episodic).await;
-    encode(
-        &fix,
-        [31; 16],
-        "completely-different-cue",
-        MemoryKindWire::Episodic,
-    )
-    .await;
+#[test]
+fn recall_confidence_floor_drops_low_score_hits() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        encode(&fix, [30; 16], "alpha", MemoryKindWire::Episodic).await;
+        encode(
+            &fix,
+            [31; 16],
+            "completely-different-cue",
+            MemoryKindWire::Episodic,
+        )
+        .await;
 
-    let mut req = recall_req("totally-unrelated-query-xyz", 10);
-    // 0.999 is so strict that the unrelated cue should drop everything.
-    req.confidence_threshold = 0.999;
-    let frame = unwrap_recall_resp(dispatch(RequestBody::Recall(req), &fix.ctx).await.unwrap());
-    for r in &frame.results {
-        assert!(
-            r.similarity_score >= 0.999,
-            "every result must clear the floor; got {}",
-            r.similarity_score
-        );
-    }
+        let mut req = recall_req("totally-unrelated-query-xyz", 10);
+        // 0.999 is so strict that the unrelated cue should drop everything.
+        req.confidence_threshold = 0.999;
+        let frame = unwrap_recall_resp(dispatch(RequestBody::Recall(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
+        for r in &frame.results {
+            assert!(
+                r.similarity_score >= 0.999,
+                "every result must clear the floor; got {}",
+                r.similarity_score
+            );
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
 // 6. Invalid top_k → planner rejects.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn recall_invalid_top_k_returns_plan_error() {
-    let fix = build_fixture();
-    let req = recall_req("anything", 0);
-    let err = dispatch(RequestBody::Recall(req), &fix.ctx)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, OpError::PlanError(_)),
-        "top_k=0 is a planner validation failure, got {err:?}"
-    );
-    assert_eq!(err.error_code(), ErrorCode::InvalidRequest);
+#[test]
+fn recall_invalid_top_k_returns_plan_error() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let req = recall_req("anything", 0);
+        let err = dispatch(RequestBody::Recall(req), brain_ops::RequestCaller::anonymous(), &fix.ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OpError::PlanError(_)),
+            "top_k=0 is a planner validation failure, got {err:?}"
+        );
+        assert_eq!(err.error_code(), ErrorCode::InvalidRequest);
+    })
 }
 
 // ---------------------------------------------------------------------------
-// 7. Real-embedder gated test. Skips when env var is unset.
+// 7. include_text — substrate path round-trip.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn recall_with_real_embedder_end_to_end() {
-    let Ok(model_dir) = std::env::var("BRAIN_EMBED_MODEL_DIR") else {
-        eprintln!("BRAIN_EMBED_MODEL_DIR unset; skipping BGE end-to-end test");
-        return;
-    };
+#[test]
+fn recall_include_text_false_returns_empty_text_field() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        encode(&fix, [40; 16], "alpha-text-rev0", MemoryKindWire::Episodic).await;
+        encode(&fix, [41; 16], "beta-text-rev0", MemoryKindWire::Episodic).await;
 
-    let model_dir = std::path::PathBuf::from(model_dir);
-    let handle = brain_embed::ModelHandle::load(&brain_embed::EmbedderConfig::new(model_dir))
-        .expect("BGE model loads");
-    let dispatcher = brain_embed::CpuDispatcher::new(handle);
-    let fix = build_fixture_with_embedder(Arc::new(dispatcher) as Arc<dyn Dispatcher>);
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(recall_req("alpha-text-rev0", 2)), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(frame.results.len(), 2);
+        for r in &frame.results {
+            assert!(
+                r.text.is_empty(),
+                "include_text default=false must return empty text, got {:?}",
+                r.text
+            );
+        }
+    })
+}
 
-    let cats_id = encode(
-        &fix,
-        [0x70; 16],
-        "the cat sat on the mat",
-        MemoryKindWire::Episodic,
-    )
-    .await;
-    let _physics_id = encode(
-        &fix,
-        [0x71; 16],
-        "quantum entanglement collapses on observation",
-        MemoryKindWire::Episodic,
-    )
-    .await;
+#[test]
+fn recall_include_text_true_returns_stored_text() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let ids = vec![
+            (
+                encode(&fix, [50; 16], "alpha-text-rev1", MemoryKindWire::Episodic).await,
+                "alpha-text-rev1",
+            ),
+            (
+                encode(&fix, [51; 16], "beta-text-rev1", MemoryKindWire::Episodic).await,
+                "beta-text-rev1",
+            ),
+            (
+                encode(&fix, [52; 16], "gamma-text-rev1", MemoryKindWire::Episodic).await,
+                "gamma-text-rev1",
+            ),
+        ];
+        let by_id: std::collections::HashMap<u128, &'static str> = ids.iter().copied().collect();
 
-    let frame = unwrap_recall_resp(
-        dispatch(
-            RequestBody::Recall(recall_req("a cat resting on a rug", 2)),
-            &fix.ctx,
+        let mut req = recall_req("alpha-text-rev1", 3);
+        req.include_text = true;
+        let frame =
+            unwrap_recall_resp(dispatch(RequestBody::Recall(req), brain_ops::RequestCaller::anonymous(), &fix.ctx).await.unwrap());
+
+        assert_eq!(frame.results.len(), 3);
+        for r in &frame.results {
+            let want = by_id.get(&r.memory_id).copied().expect("known id");
+            assert_eq!(
+                r.text, want,
+                "include_text=true must return the exact UTF-8 we encoded",
+            );
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 8. Real-embedder gated test. Skips when env var is unset.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recall_with_real_embedder_end_to_end() {
+    run_in_glommio(|| async {
+        let Ok(model_dir) = std::env::var("BRAIN_EMBED_MODEL_DIR") else {
+            eprintln!("BRAIN_EMBED_MODEL_DIR unset; skipping BGE end-to-end test");
+            return;
+        };
+
+        let model_dir = std::path::PathBuf::from(model_dir);
+        let handle = brain_embed::ModelHandle::load(&brain_embed::EmbedderConfig::new(model_dir))
+            .expect("BGE model loads");
+        let dispatcher = brain_embed::CpuDispatcher::new(handle);
+        let fix = build_fixture_with_embedder(Arc::new(dispatcher) as Arc<dyn Dispatcher>);
+
+        let cats_id = encode(
+            &fix,
+            [0x70; 16],
+            "the cat sat on the mat",
+            MemoryKindWire::Episodic,
         )
-        .await
-        .unwrap(),
-    );
-    assert_eq!(frame.results.len(), 2);
-    assert_eq!(
-        frame.results[0].memory_id, cats_id,
-        "the cat memory must rank higher than the physics memory"
-    );
+        .await;
+        let _physics_id = encode(
+            &fix,
+            [0x71; 16],
+            "quantum entanglement collapses on observation",
+            MemoryKindWire::Episodic,
+        )
+        .await;
+
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(recall_req("a cat resting on a rug", 2)), brain_ops::RequestCaller::anonymous(), &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(frame.results.len(), 2);
+        assert_eq!(
+            frame.results[0].memory_id, cats_id,
+            "the cat memory must rank higher than the physics memory"
+        );
+    })
 }

@@ -434,6 +434,7 @@ mod tests {
             strategy_hint: Some(RecallStrategy::Hybrid),
             include_vectors: false,
             include_edges: true,
+            include_text: true,
             request_id: Some(sample_uuid(7)),
             txn_id: None,
         }));
@@ -506,6 +507,7 @@ mod tests {
                     reference_memory_id: sample_memory_id(),
                     threshold: 0.85,
                 }),
+                agents: None,
             },
             include_history: true,
             from_lsn: Some(42),

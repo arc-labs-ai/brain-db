@@ -1,0 +1,29 @@
+# Cargo build configuration shared by every checkout.
+#
+# Cargo merges rustflags from this file with the RUSTFLAGS environment
+# variable using "last wins" — if RUSTFLAGS is set in the shell or in
+# devcontainer.json, it OVERRIDES this file. Keep environment-level
+# RUSTFLAGS overrides empty unless you genuinely need to override.
+
+# ---------------------------------------------------------------------------
+# aarch64 Linux — covers AWS Graviton, Apple Silicon under a Linux VM (the
+# dev container on M-series Macs), and any bare aarch64 server.
+# ---------------------------------------------------------------------------
+#
+# candle's `gemm-f16` emits half-precision FMLA inline assembly such as
+# `fmla v0.8h, v1.8h, v2.8h`. The LLVM aarch64 assembler only accepts these
+# instructions when the `fullfp16` target feature is enabled, and the default
+# `aarch64-unknown-linux-gnu` rustc target does not enable it.
+#
+# `+fp16` alone is a different (and insufficient) feature — it covers the
+# half-precision register file, not the v8.2-A scalar / vector half-precision
+# arithmetic. We need `+fullfp16`, which is implied by every modern aarch64
+# baseline CPU: Neoverse N1 (Graviton 2), V1 (Graviton 3), and the
+# Cortex-A78 / Apple-Silicon families. Setting target-cpu is cleaner than a
+# bare feature list because the optimiser also picks up the rest of the
+# v8.2-A schedule, which is what every aarch64 host we ship to has anyway.
+#
+# x86_64 hosts read a different `[target.*]` section (none here = stock
+# rustc defaults). macOS hosts target `aarch64-apple-darwin`, also unaffected.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=neoverse-n1"]

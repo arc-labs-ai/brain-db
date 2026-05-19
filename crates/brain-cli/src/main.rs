@@ -38,7 +38,10 @@ fn main() -> ExitCode {
             println!("{NAME} {VERSION}");
             ExitCode::SUCCESS
         }
-        Command::Health => match health::run(&args.server, args.output) {
+        // `health` + `stats` hit `/healthz` + `/metrics`, which live
+        // on the public listener (metrics_addr). Every other command
+        // hits `/v1/*` on the admin listener (server / admin_addr).
+        Command::Health => match health::run(&args.metrics_addr, args.output) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS
@@ -48,7 +51,7 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        Command::Stats => match stats::run(&args.server, args.output) {
+        Command::Stats => match stats::run(&args.metrics_addr, args.output) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS
@@ -142,7 +145,11 @@ COMMANDS:
     debug-snapshot [--value PATH]             Runtime snapshot (partial schema)
 
 OPTIONS:
-    --server <host:port>      Admin endpoint (default 127.0.0.1:9091)
+    --server <host:port>      Admin endpoint — /v1/* routes
+                              (default 127.0.0.1:9092)
+    --metrics-addr <host:port>  Metrics endpoint — /healthz + /metrics,
+                              used by `health` and `stats`
+                              (default 127.0.0.1:9091)
     --output <json|table>     Output format (default table)
     --token <value>           Admin token (parsed; auth wiring lands later)
     --shard <N>               Target a specific shard

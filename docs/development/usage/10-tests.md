@@ -8,13 +8,13 @@ benchmarks, and the acceptance gate runner. This page covers each.
 **Input:**
 
 ```bash
-just docker-test
+cargo test --workspace --all-targets
 ```
 
 Or scoped:
 
 ```bash
-just docker-test --workspace
+cargo test --workspace
 ```
 
 **Expected output:**
@@ -39,9 +39,9 @@ Exit code 0; every per-crate `test result:` line ends in
 **Input:**
 
 ```bash
-just docker-test -p brain-protocol
-just docker-test -p brain-storage
-just docker-test -p brain-server
+cargo test -p brain-protocol
+cargo test -p brain-storage
+cargo test -p brain-server
 ```
 
 **Verify:**
@@ -54,38 +54,38 @@ The brain-server crate has named integration suites in `tests/`:
 
 ```bash
 # admin HTTP server
-just docker-test -p brain-server --test admin
+cargo test -p brain-server --test admin
 
 # wire-protocol e2e (real server, framed TCP)
-just docker-test -p brain-server --test e2e
+cargo test -p brain-server --test e2e
 
 # SDK round-trips
-just docker-test -p brain-server --test sdk_e2e
+cargo test -p brain-server --test sdk_e2e
 
 # CLI lib-level e2e
-just docker-test -p brain-server --test cli_e2e
+cargo test -p brain-server --test cli_e2e
 
 # dispatch + subscribe
-just docker-test -p brain-server --test dispatch --test subscribe
+cargo test -p brain-server --test dispatch --test subscribe
 
 # Phase 12.4 dashboard validator
-just docker-test -p brain-server --test dashboards
+cargo test -p brain-server --test dashboards
 
 # Phase 12.5 alert rules validator
-just docker-test -p brain-server --test alerts
+cargo test -p brain-server --test alerts
 ```
 
 These require Linux (io_uring) and report zero tests on macOS —
-that's expected. Always run via the container.
+that's expected.
 
 ## 4. Single test function
 
 ```bash
-just docker cargo test -p brain-storage --lib -- arena::tests::crc_mismatch_halts --nocapture
+cargo test -p brain-storage --lib -- arena::tests::crc_mismatch_halts --nocapture
 ```
 
 ```bash
-just docker cargo test -p brain-server --test sdk_e2e -- sdk_encode_recall_roundtrip --nocapture
+cargo test -p brain-server --test sdk_e2e -- sdk_encode_recall_roundtrip --nocapture
 ```
 
 `--nocapture` shows print output suppressed by default.
@@ -95,16 +95,16 @@ just docker cargo test -p brain-server --test sdk_e2e -- sdk_encode_recall_round
 Phase 13.3 ships three storage-layer chaos suites:
 
 ```bash
-just docker-test -p brain-storage --test random_kill
-just docker-test -p brain-storage --test bit_flip
-just docker-test -p brain-storage --test io_fault
+cargo test -p brain-storage --test random_kill
+cargo test -p brain-storage --test bit_flip
+cargo test -p brain-storage --test io_fault
 ```
 
 `random_kill` has a `#[ignore]`-gated full sweep (1000 iterations,
 ~3 minutes); the smoke version (100 iters) runs by default:
 
 ```bash
-just docker-test -p brain-storage --test random_kill -- --ignored
+cargo test -p brain-storage --test random_kill -- --ignored
 ```
 
 **Verify:**
@@ -118,7 +118,7 @@ at the bad record, never return a corrupted record as valid.
 Memory-safety check on `brain-storage`'s `unsafe` blocks:
 
 ```bash
-just miri
+cargo +nightly miri test -p brain-storage --lib
 ```
 
 Syscall-bound paths (mmap, pwritev2) are excluded via
@@ -248,8 +248,8 @@ for the per-gate table.
 
 | Cadence | What | Wall clock |
 |---|---|---|
-| Per save / dev loop | `just docker-test -p <crate>` for the crate you touched | < 30 s |
-| Pre-commit | `just docker-verify` | 1–3 min |
+| Per save / dev loop | `cargo test -p <crate>` for the crate you touched | < 30 s |
+| Pre-commit | the verify suite (fmt-check + build + clippy + test + check-skills) | 1–3 min |
 | Per PR (CI) | gates 1, 2, 3, 4, 6 (storage), 8 (TLS path), 9, 10 (smoke) | 15–30 min |
 | Per merge to main (CI) | + full e2e + light bench | 1–2 h |
 | Nightly (operator) | + full chaos + soak (compile only) | 6–12 h |

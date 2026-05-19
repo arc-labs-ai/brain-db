@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind, ShardId};
 use brain_index::Writer as HnswWriter;
 use brain_metadata::tables::edge::{
     self, derived_by, origin, EdgeData, EDGES_IN_TABLE, EDGES_OUT_TABLE,
@@ -73,11 +73,28 @@ pub struct RealWriterHandle {
     /// nil. Carried as a field so tests + the future server can pin
     /// it without re-creating the writer.
     agent_id: AgentId,
+    /// Shard id stamped into every `MemoryId` this writer issues.
+    /// Routing back to the owning shard (LINK / UNLINK / FORGET in
+    /// `brain-server::network::dispatch::shard_for_memory`) reads
+    /// the shard prefix from the `MemoryId`, so stamping the wrong
+    /// shard here silently steers follow-up ops to the wrong shard
+    /// and surfaces as `NotFound`. Defaults to `0`; production
+    /// callers must override via [`Self::with_shard_id`].
+    shard_id: ShardId,
     /// Change-feed publisher (sub-task 7.10). Single-op encode/forget
     /// commits and TXN_COMMIT batches publish here *after* the redb
     /// commit() succeeds. Optional so existing callers don't break
     /// (defaults to no publication — events are dropped on the floor).
     events: Option<Arc<EventBus>>,
+    /// WAL append sink (Phase 9 wiring). When `Some`, every write
+    /// op appends a typed [`brain_storage::wal::payload::WalPayload`]
+    /// record to the WAL **before** mutating redb — establishing the
+    /// spec §05/07 durability barrier. The returned LSN is stamped
+    /// onto the published event so subscribe-replay finds the right
+    /// position. When `None`, the writer falls back to the legacy
+    /// "redb-first, EventBus mints LSN" path used by unit tests that
+    /// don't spin up a shard.
+    wal_sink: Option<Arc<dyn wal_sink::WalSink>>,
 }
 
 impl RealWriterHandle {
@@ -105,13 +122,26 @@ impl RealWriterHandle {
             next_slot: AtomicU64::new(1),
             tombstoned: Mutex::new(HashSet::new()),
             agent_id: AgentId(Uuid::nil()),
+            shard_id: 0,
             events: None,
+            wal_sink: None,
         }
     }
 
     #[must_use]
     pub fn with_agent_id(mut self, agent_id: AgentId) -> Self {
         self.agent_id = agent_id;
+        self
+    }
+
+    /// Stamp the shard prefix on every `MemoryId` this writer issues.
+    /// Production must call this with the owning shard's id;
+    /// otherwise LINK / UNLINK / FORGET route to the wrong shard and
+    /// return `NotFound`. Tests on a single shard can keep the
+    /// default (`0`).
+    #[must_use]
+    pub fn with_shard_id(mut self, shard_id: ShardId) -> Self {
+        self.shard_id = shard_id;
         self
     }
 
@@ -123,11 +153,34 @@ impl RealWriterHandle {
         self
     }
 
-    fn publish(&self, env: EventEnvelope) {
+    /// Wire the WAL sink. After this call every write op runs the
+    /// spec §05/07 ordering — WAL append → fsync → redb → indexes →
+    /// publish — so a restart can replay the durable log onto a fresh
+    /// shard and a subscribe-replay can synthesise the change feed
+    /// from segment data.
+    #[must_use]
+    pub fn with_wal_sink(mut self, sink: Arc<dyn wal_sink::WalSink>) -> Self {
+        self.wal_sink = Some(sink);
+        self
+    }
+
+    /// Publish an event. When a WAL sink is wired, callers pass
+    /// `Some(lsn)` so the envelope carries the WAL-assigned LSN
+    /// instead of the bus's internal allocator stamp.
+    fn publish_with_lsn(&self, mut env: EventEnvelope, lsn: Option<u64>) {
         if let Some(bus) = &self.events {
-            bus.publish(env);
+            if let Some(lsn) = lsn {
+                // Pre-stamp so the bus's LsnAllocator becomes a noop
+                // for events that already carry a durable LSN. The
+                // bus's send() is the only side-effect we want.
+                env.lsn = lsn;
+                bus.publish_prestamped(env);
+            } else {
+                bus.publish(env);
+            }
         }
     }
+
 }
 
 fn now_unix_nanos() -> u64 {
@@ -142,28 +195,28 @@ impl WriterHandle for RealWriterHandle {
         &'a self,
         op: EncodeOp,
     ) -> Pin<Box<dyn Future<Output = Result<EncodeAck, WriterError>> + 'a>> {
-        Box::pin(async move { do_encode(self, op) })
+        Box::pin(async move { do_encode(self, op).await })
     }
 
     fn submit_forget<'a>(
         &'a self,
         op: ForgetOp,
     ) -> Pin<Box<dyn Future<Output = Result<ForgetAck, WriterError>> + 'a>> {
-        Box::pin(async move { do_forget(self, op) })
+        Box::pin(async move { do_forget(self, op).await })
     }
 
     fn submit_link<'a>(
         &'a self,
         op: LinkOp,
     ) -> Pin<Box<dyn Future<Output = Result<LinkAck, WriterError>> + 'a>> {
-        Box::pin(async move { do_link(self, op) })
+        Box::pin(async move { do_link(self, op).await })
     }
 
     fn submit_unlink<'a>(
         &'a self,
         op: UnlinkOp,
     ) -> Pin<Box<dyn Future<Output = Result<UnlinkAck, WriterError>> + 'a>> {
-        Box::pin(async move { do_unlink(self, op) })
+        Box::pin(async move { do_unlink(self, op).await })
     }
 
     fn reserve_memory_id<'a>(
@@ -171,7 +224,7 @@ impl WriterHandle for RealWriterHandle {
     ) -> Pin<Box<dyn Future<Output = Result<MemoryId, WriterError>> + 'a>> {
         Box::pin(async move {
             let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
-            Ok(MemoryId::pack(0, slot, 1))
+            Ok(MemoryId::pack(self.shard_id, slot, 1))
         })
     }
 
@@ -179,7 +232,11 @@ impl WriterHandle for RealWriterHandle {
         &'a self,
         batch: brain_planner::TxnBatch,
     ) -> Pin<Box<dyn Future<Output = Result<brain_planner::TxnBatchAck, WriterError>> + 'a>> {
-        Box::pin(async move { do_submit_batch(self, batch) })
+        Box::pin(async move { do_submit_batch(self, batch).await })
+    }
+
+    fn agent_id(&self) -> AgentId {
+        self.agent_id
     }
 }
 
@@ -191,11 +248,17 @@ mod encode;
 mod forget;
 mod link;
 mod unlink;
+pub mod wal_sink;
 
 use encode::do_encode;
 use forget::do_forget;
 use link::do_link;
 use unlink::do_unlink;
+
+pub use wal_sink::{
+    channel_wal_sink, channel_wal_sink_with_capacity, ChannelWalSink, FailingWalSink, NoopWalSink,
+    RecordingWalSink, WalAppendMessage, WalSink, WalSinkError, DEFAULT_WAL_DRAIN_CAPACITY,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers.
@@ -251,10 +314,196 @@ fn hex_short(bytes: &[u8; 16]) -> String {
 // submit_batch — atomic apply of a TXN_COMMIT buffer.
 // ---------------------------------------------------------------------------
 
-fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatchAck, WriterError> {
+async fn do_submit_batch(
+    writer: &RealWriterHandle,
+    batch: TxnBatch,
+) -> Result<TxnBatchAck, WriterError> {
+    use brain_core::TxnId;
+    use brain_storage::wal::payload::{
+        EdgePayload as WalEdgePayload, EncodePayload as WalEncodePayload,
+        ForgetMode as WalForgetMode, ForgetPayload as WalForgetPayload,
+        ForgetReason as WalForgetReason, LinkPayload as WalLinkPayload,
+        TxnBeginPayload as WalTxnBeginPayload, TxnCommitPayload as WalTxnCommitPayload,
+        UnlinkPayload as WalUnlinkPayload, WalPayload,
+    };
+    use brain_storage::wal::record::{Lsn, WalRecord};
+
     use crate::idempotency::{
         encode_encode_payload, encode_forget_payload, encode_link_payload, encode_unlink_payload,
     };
+
+    // ── WAL prologue (spec §05/07 + §05/08 §6). Bracket the batch
+    // with TxnBegin / TxnCommit so recovery's buffered-apply replays
+    // it atomically. The intra-batch ops go in between; recovery
+    // doesn't apply any of them until it sees TxnCommit. ─────────
+    let mut wal_lsn_for_encode: Vec<Option<u64>> = Vec::with_capacity(batch.memories.len());
+    let mut wal_lsn_for_link: Vec<Option<u64>> = Vec::with_capacity(batch.links.len());
+    let mut wal_lsn_for_unlink: Vec<Option<u64>> = Vec::with_capacity(batch.unlinks.len());
+    let mut wal_lsn_for_forget: Vec<Option<u64>> = Vec::with_capacity(batch.forgets.len());
+    let txn_id = TxnId::from(*uuid::Uuid::now_v7().as_bytes());
+    if let Some(sink) = &writer.wal_sink {
+        let agent_bytes: [u8; 16] = writer.agent_id.into();
+        let agent_id_lo64 = u64::from_be_bytes(agent_bytes[8..16].try_into().unwrap());
+        let stage_count = batch.memories.len()
+            + batch.links.len()
+            + batch.unlinks.len()
+            + batch.forgets.len();
+        let begin_ts = now_unix_nanos();
+        let begin = WalPayload::TxnBegin(WalTxnBeginPayload {
+            txn_id,
+            expected_record_count: u32::try_from(stage_count).unwrap_or(u32::MAX),
+        });
+        sink.append(WalRecord::from_typed(
+            Lsn(0),
+            0,
+            begin_ts,
+            agent_id_lo64,
+            &begin,
+        ))
+        .await
+        .map_err(|e| WriterError::Internal(format!("txn wal begin: {e}")))?;
+
+        for enc in &batch.memories {
+            // Compute response_payload identically to the redb path so
+            // recovery can replay the cached EncodeAck byte-for-byte.
+            // edge_outcomes aren't known yet (the in-batch resolution
+            // happens below) — recovery doesn't need them for arena/
+            // hnsw correctness, only for the idempotency cache. Use
+            // an empty edge_outcomes here; the redb write below will
+            // produce the authoritative response. This is a known
+            // simplification documented in `wal-tail-subscribe.md` —
+            // an idempotency retry after a crash mid-batch would
+            // return an empty edge_results vector instead of the
+            // original. Worst case the caller re-issues edges.
+            let response_payload = encode_encode_payload(enc.memory_id, &[]);
+            let wal_edges: Vec<WalEdgePayload> = enc
+                .edges
+                .iter()
+                .map(|e| WalEdgePayload {
+                    source: enc.memory_id,
+                    target: e.target,
+                    kind: e.kind,
+                    weight: e.weight,
+                    origin: brain_core::EdgeOrigin::Explicit,
+                })
+                .collect();
+            let payload = WalPayload::Encode(WalEncodePayload {
+                memory_id: enc.memory_id,
+                request_id: enc.request_id,
+                agent_id: enc.agent_id,
+                context_id: enc.context_id,
+                kind: enc.kind,
+                salience_initial: enc.salience_initial,
+                embedding_model_fp: enc.fingerprint,
+                text: enc.text.clone(),
+                vector: enc.vector.to_vec(),
+                edges: wal_edges,
+                request_hash: enc.request_hash,
+                response_payload,
+                deduplicate: false,
+            });
+            let lsn = sink
+                .append(WalRecord::from_typed(
+                    Lsn(0),
+                    0,
+                    enc.created_at_unix_nanos,
+                    agent_id_lo64,
+                    &payload,
+                ))
+                .await
+                .map_err(|e| WriterError::Internal(format!("txn wal encode: {e}")))?;
+            wal_lsn_for_encode.push(Some(lsn.raw()));
+        }
+        for link in &batch.links {
+            let payload = WalPayload::Link(WalLinkPayload {
+                source: link.source,
+                target: link.target,
+                edge_kind: link.kind,
+                weight: link.weight,
+                origin: brain_core::EdgeOrigin::Explicit,
+            });
+            let lsn = sink
+                .append(WalRecord::from_typed(
+                    Lsn(0),
+                    0,
+                    link.created_at_unix_nanos,
+                    agent_id_lo64,
+                    &payload,
+                ))
+                .await
+                .map_err(|e| WriterError::Internal(format!("txn wal link: {e}")))?;
+            wal_lsn_for_link.push(Some(lsn.raw()));
+        }
+        for unlink in &batch.unlinks {
+            let payload = WalPayload::Unlink(WalUnlinkPayload {
+                source: unlink.source,
+                target: unlink.target,
+                edge_kind: unlink.kind,
+                edge_seq: 0,
+            });
+            let lsn = sink
+                .append(WalRecord::from_typed(
+                    Lsn(0),
+                    0,
+                    unlink.created_at_unix_nanos,
+                    agent_id_lo64,
+                    &payload,
+                ))
+                .await
+                .map_err(|e| WriterError::Internal(format!("txn wal unlink: {e}")))?;
+            wal_lsn_for_unlink.push(Some(lsn.raw()));
+        }
+        for forget in &batch.forgets {
+            let wal_mode = match forget.mode {
+                brain_protocol::request::ForgetMode::Soft => WalForgetMode::Soft,
+                brain_protocol::request::ForgetMode::Hard => WalForgetMode::Hard,
+            };
+            let payload = WalPayload::Forget(WalForgetPayload {
+                memory_id: forget.memory_id,
+                request_id: forget.request_id,
+                agent_id: forget.agent_id,
+                mode: wal_mode,
+                reason: WalForgetReason::ClientRequest,
+            });
+            let lsn = sink
+                .append(WalRecord::from_typed(
+                    Lsn(0),
+                    0,
+                    forget.created_at_unix_nanos,
+                    agent_id_lo64,
+                    &payload,
+                ))
+                .await
+                .map_err(|e| WriterError::Internal(format!("txn wal forget: {e}")))?;
+            wal_lsn_for_forget.push(Some(lsn.raw()));
+        }
+        let commit_ts = now_unix_nanos();
+        let commit = WalPayload::TxnCommit(WalTxnCommitPayload { txn_id });
+        sink.append(WalRecord::from_typed(
+            Lsn(0),
+            0,
+            commit_ts,
+            agent_id_lo64,
+            &commit,
+        ))
+        .await
+        .map_err(|e| WriterError::Internal(format!("txn wal commit: {e}")))?;
+    } else {
+        // No WAL sink: leave the per-op LSN slots empty; the publish
+        // path falls back to the bus allocator.
+        for _ in &batch.memories {
+            wal_lsn_for_encode.push(None);
+        }
+        for _ in &batch.links {
+            wal_lsn_for_link.push(None);
+        }
+        for _ in &batch.unlinks {
+            wal_lsn_for_unlink.push(None);
+        }
+        for _ in &batch.forgets {
+            wal_lsn_for_forget.push(None);
+        }
+    }
 
     let mut encode_acks: Vec<EncodeAck> = Vec::with_capacity(batch.memories.len());
     let mut link_acks: Vec<LinkAck> = Vec::with_capacity(batch.links.len());
@@ -279,6 +528,14 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
         salience: f32,
         timestamp_unix_nanos: u64,
         text: Option<String>,
+        /// WAL-assigned LSN for this event. `Some` when the batch was
+        /// WAL-recorded; `None` for the test path where the bus mints
+        /// the LSN.
+        wal_lsn: Option<u64>,
+        /// Per-op agent (not the per-shard writer.agent_id) — used
+        /// so the subscribe `agents` filter can isolate per-tenant
+        /// even inside a TXN batch.
+        agent_id: brain_core::AgentId,
     }
     let mut pending_events: Vec<PendingEvent> = Vec::new();
 
@@ -307,7 +564,7 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
                 .map_err(|e| WriterError::Internal(format!("batch open IDEMPOTENCY: {e:?}")))?;
 
             // 1. Memories + their inline edges.
-            for enc in &batch.memories {
+            for (enc_idx, enc) in batch.memories.iter().enumerate() {
                 // Compute edge outcomes against committed + in-batch ids.
                 let mut edge_outcomes: Vec<EdgeOutcome> = Vec::with_capacity(enc.edges.len());
                 for edge in &enc.edges {
@@ -360,7 +617,7 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
                 // Build the metadata row.
                 let mut meta = MemoryMetadata::new_active(
                     enc.memory_id,
-                    writer.agent_id,
+                    enc.agent_id,
                     enc.context_id,
                     enc.memory_id.slot(),
                     /* slot_version */ 1,
@@ -373,11 +630,20 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
                 meta.edges_out_count = u32::try_from(inserted_count).unwrap_or(u32::MAX);
                 // edges_in_count starts at 0 — any in-batch edge to this
                 // memory bumps it as part of *that* edge's loop below.
+                // Stamp the per-encode WAL LSN; matches what
+                // `wal_lsn_for_encode[enc_idx]` recorded earlier in
+                // this same batch's prologue.
+                if let Some(lsn) = wal_lsn_for_encode.get(enc_idx).copied().flatten() {
+                    meta.encoded_at_lsn = lsn;
+                }
                 memories_t
                     .insert(enc.memory_id.to_be_bytes(), meta)
                     .map_err(|e| WriterError::Internal(format!("batch memories insert: {e:?}")))?;
 
-                // Idempotency entry.
+                // Idempotency entry. Stamp the per-encode WAL LSN
+                // (or 0 when no WAL sink is wired) so a retry replays
+                // the original durable position to clients chaining
+                // subscribe.
                 let payload = encode_encode_payload(enc.memory_id, &edge_outcomes);
                 let entry = IdempotencyEntry::new(
                     crate::idempotency::RESPONSE_KIND_ENCODE,
@@ -385,6 +651,7 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
                     payload,
                     enc.request_hash,
                     enc.created_at_unix_nanos,
+                    wal_lsn_for_encode.get(enc_idx).copied().flatten().unwrap_or(0),
                 );
                 idem_t
                     .insert(<[u8; 16]>::from(enc.request_id), entry)
@@ -393,10 +660,21 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
                     })?;
 
                 batch_memory_ids.insert(enc.memory_id);
+                let edges_out_count_enc = u32::try_from(inserted_count).unwrap_or(u32::MAX);
                 encode_acks.push(EncodeAck {
                     memory_id: enc.memory_id,
                     edge_results: edge_outcomes,
                     replayed: false,
+                    // TXN batch path does not wire fingerprint dedup
+                    // in this phase — dedup is a per-encode
+                    // single-write feature and the batch commits in
+                    // one redb txn; allowing dedup inside a batch
+                    // would require cross-encode coordination. Phase
+                    // 8.dedup+1 if needed.
+                    was_deduplicated: false,
+                    lsn: wal_lsn_for_encode.get(enc_idx).copied().flatten(),
+                    edges_out_count: edges_out_count_enc,
+                    created_at_unix_nanos: enc.created_at_unix_nanos,
                 });
                 hnsw_inserts.push((enc.memory_id, enc.vector));
                 pending_events.push(PendingEvent {
@@ -407,6 +685,8 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
                     salience: enc.salience_initial,
                     timestamp_unix_nanos: enc.created_at_unix_nanos,
                     text: Some(enc.text.clone()),
+                    wal_lsn: wal_lsn_for_encode.get(enc_idx).copied().flatten(),
+                    agent_id: enc.agent_id,
                 });
 
                 // Bump in-counts for any in-batch edges that target a
@@ -422,7 +702,7 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
             }
 
             // 2. Top-level LINKs.
-            for link in &batch.links {
+            for (link_idx, link) in batch.links.iter().enumerate() {
                 // Source/target must exist (committed or in-batch).
                 let src_exists = batch_memory_ids.contains(&link.source)
                     || memories_t
@@ -482,6 +762,7 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
                     payload,
                     link.request_hash,
                     link.created_at_unix_nanos,
+                    wal_lsn_for_link.get(link_idx).copied().flatten().unwrap_or(0),
                 );
                 idem_t
                     .insert(<[u8; 16]>::from(link.request_id), entry)
@@ -500,7 +781,7 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
             }
 
             // 3. UNLINKs.
-            for unlink in &batch.unlinks {
+            for (unlink_idx, unlink) in batch.unlinks.iter().enumerate() {
                 let removed = edge::unlink(
                     &mut edges_out_t,
                     &mut edges_in_t,
@@ -520,6 +801,7 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
                     payload,
                     unlink.request_hash,
                     unlink.created_at_unix_nanos,
+                    wal_lsn_for_unlink.get(unlink_idx).copied().flatten().unwrap_or(0),
                 );
                 idem_t
                     .insert(<[u8; 16]>::from(unlink.request_id), entry)
@@ -536,7 +818,7 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
             }
 
             // 4. FORGETs.
-            for forget in &batch.forgets {
+            for (forget_idx, forget) in batch.forgets.iter().enumerate() {
                 let meta_row: Option<MemoryMetadata> = memories_t
                     .get(forget.memory_id.to_be_bytes())
                     .map_err(|e| WriterError::Internal(format!("batch get forget: {e:?}")))?
@@ -556,6 +838,7 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
                     // inserted above), but a same-batch encode→forget
                     // ordering is unusual; if no row, fall back to
                     // searching the batch's pending events.
+                    let wal_lsn_here = wal_lsn_for_forget.get(forget_idx).copied().flatten();
                     let event = if let Some(m) = meta_row {
                         Some(PendingEvent {
                             event_type: EventType::Forgotten,
@@ -565,6 +848,8 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
                             salience: m.salience,
                             timestamp_unix_nanos: forget.created_at_unix_nanos,
                             text: None,
+                            wal_lsn: wal_lsn_here,
+                            agent_id: forget.agent_id,
                         })
                     } else {
                         pending_events
@@ -582,6 +867,8 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
                                 salience: p.salience,
                                 timestamp_unix_nanos: forget.created_at_unix_nanos,
                                 text: None,
+                                wal_lsn: wal_lsn_here,
+                                agent_id: forget.agent_id,
                             })
                     };
                     if let Some(e) = event {
@@ -595,6 +882,7 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
                     payload,
                     forget.request_hash,
                     forget.created_at_unix_nanos,
+                    wal_lsn_for_forget.get(forget_idx).copied().flatten().unwrap_or(0),
                 );
                 idem_t
                     .insert(<[u8; 16]>::from(forget.request_id), entry)
@@ -632,19 +920,25 @@ fn do_submit_batch(writer: &RealWriterHandle, batch: TxnBatch) -> Result<TxnBatc
         }
     }
 
-    // ── Change-feed (sub-task 7.10). Publish in buffer order. ────
+    // ── Change-feed (sub-task 7.10). Publish in buffer order,
+    //    stamping the WAL-assigned LSN onto each event so subscribe
+    //    replay and the live tail share a coordinate system. ─────
     for ev in pending_events {
-        writer.publish(EventEnvelope {
-            lsn: 0,
-            event_type: ev.event_type,
-            memory_id: ev.memory_id,
-            context_id: ev.context_id,
-            kind: ev.kind,
-            salience: ev.salience,
-            timestamp_unix_nanos: ev.timestamp_unix_nanos,
-            text: ev.text,
-            knowledge_payload: None,
-        });
+        writer.publish_with_lsn(
+            EventEnvelope {
+                lsn: 0,
+                event_type: ev.event_type,
+                memory_id: ev.memory_id,
+                context_id: ev.context_id,
+                kind: ev.kind,
+                salience: ev.salience,
+                timestamp_unix_nanos: ev.timestamp_unix_nanos,
+                text: ev.text,
+                knowledge_payload: None,
+                agent_id: ev.agent_id,
+            },
+            ev.wal_lsn,
+        );
     }
 
     Ok(TxnBatchAck {

@@ -1,7 +1,16 @@
 //! Build the admin HTTP router from an [`AdminState`].
 //!
-//! One free function: [`build`] — register every admin route in
-//! order. `with_state` and `with_state_prefix` hide the `Arc::clone`
+//! Three public builders:
+//!
+//! - [`build_public`] — `/healthz` + `/metrics`. Safe to expose to
+//!   load balancers and Prometheus scrapers. Bound to `metrics_addr`.
+//! - [`build_admin`] — every `/v1/*` route. Operationally sensitive
+//!   (audit log, snapshots, worker control, config). Bound to
+//!   `admin_addr` — default loopback.
+//! - [`build_unified`] — both of the above on one router. Test-only
+//!   path so the existing harness can bring up a single listener.
+//!
+//! `with_state` and `with_state_prefix` hide the `Arc::clone`
 //! boilerplate that state injection requires when the router has no
 //! typed extractors.
 
@@ -17,10 +26,22 @@ use crate::admin::handlers::{
 };
 use crate::admin::AdminState;
 
-/// Construct the admin router with every Phase-9-and-later route
-/// registered. The returned `Router<Incoming>` is ready to hand to
-/// `brain_http::server::HttpServer::router`.
-pub fn build(state: Arc<AdminState>) -> Router<Incoming> {
+/// `/healthz` + `/metrics`. Operator-safe to expose.
+pub fn build_public(state: Arc<AdminState>) -> Router<Incoming> {
+    let r = Router::new();
+    let r = r.get("/healthz", healthz::handle);
+    with_state(r, Method::GET, "/metrics", state, metrics::handle)
+}
+
+/// Every `/v1/*` admin route. Bind to loopback or front with mTLS.
+pub fn build_admin(state: Arc<AdminState>) -> Router<Incoming> {
+    let r = Router::new();
+    attach_v1_routes(r, state)
+}
+
+/// Test-only: register everything on one router. Production uses two
+/// separate routers via [`build_public`] + [`build_admin`].
+pub fn build_unified(state: Arc<AdminState>) -> Router<Incoming> {
     let r = Router::new();
 
     // ──────── /healthz — string OK, no state ───────────────────────────
@@ -29,6 +50,12 @@ pub fn build(state: Arc<AdminState>) -> Router<Incoming> {
     // ──────── /metrics — Prometheus text exposition ────────────────────
     let r = with_state(r, Method::GET, "/metrics", state.clone(), metrics::handle);
 
+    attach_v1_routes(r, state)
+}
+
+/// Register every `/v1/*` route on `r`. Shared between
+/// [`build_admin`] and [`build_unified`].
+fn attach_v1_routes(r: Router<Incoming>, state: Arc<AdminState>) -> Router<Incoming> {
     // ──────── Snapshot family (POST / GET / DELETE) ────────────────────
     // One handler dispatches on (method, path) internally.
     let r = with_state_prefix(

@@ -16,7 +16,7 @@ is for **developers running Brain locally inside the dev container**.
 | # | Page | Topic |
 |---|---|---|
 | 01 | [Setup](01-setup.md) | Prerequisites + clone + container + shell |
-| 02 | [Build and verify](02-build-and-verify.md) | `cargo build`, `just verify`, reading the output |
+| 02 | [Build and verify](02-build-and-verify.md) | `cargo build`, the verify suite, reading the output |
 | 03 | [Run the server](03-run-server.md) | Start `brain-server` with `config/dev.toml`; env overrides; the data directory |
 | 04 | [Admin CLI](04-cli.md) | Every `brain` CLI command with input / output / verify |
 | 05 | [Rust SDK](05-sdk.md) | Connect, encode, recall, forget, link, transactions |
@@ -34,9 +34,6 @@ the minimum sequence is:
 ```bash
 git clone https://github.com/brain-db-io/brain-db.git
 cd brain-db
-just docker-up                          # build the dev container
-just docker-shell                       # enter it
-# inside container:
 cargo run --bin brain-server -- --config config/dev.toml &
 # wait for "listening" log line
 cargo run --example store_and_recall -p brain-sdk-rust

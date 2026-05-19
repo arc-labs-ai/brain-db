@@ -6,9 +6,9 @@
 
 use brain_protocol::opcode::Opcode;
 use brain_protocol::request::{
-    MemoryKindWire, SimilarityFilter, SubscribeRequest, SubscriptionFilter,
+    MemoryKindWire, SimilarityFilter, SubscribeRequest, SubscriptionFilter, UnsubscribeRequest,
 };
-use brain_protocol::response::SubscriptionEvent;
+use brain_protocol::response::{SubscriptionEvent, UnsubscribeResponse};
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 
 use crate::client::Client;
@@ -89,6 +89,7 @@ impl<'a> SubscribeBuilder<'a> {
             contexts: self.contexts,
             kinds: self.kinds,
             similar_to: self.similar_to,
+            agents: None,
         };
         let include_history = self.include_history;
         let from_lsn = self.from_lsn;
@@ -157,6 +158,7 @@ impl<'a> SubscribeBuilder<'a> {
             contexts: self.contexts,
             kinds: self.kinds,
             similar_to: self.similar_to,
+            agents: None,
         };
         let body = RequestBody::Subscribe(SubscribeRequest {
             filter,
@@ -185,6 +187,62 @@ impl<'a> SubscribeBuilder<'a> {
                     )),
                 },
             );
-        Ok(FrameStream::new(guard, Opcode::SubscribeEvent, decoder))
+        Ok(FrameStream::new(guard, stream_id, Opcode::SubscribeEvent, decoder))
     }
 }
+
+/// Cancel a subscription by its target stream id. Called by
+/// [`Client::unsubscribe`]; also used internally by the
+/// `collect(N)` happy path so server-side registry entries don't
+/// outlive the SDK call. Riding on a fresh stream is fine — the
+/// server registry key is global per shard.
+///
+/// Best-effort: a server-side `NotFound` (the target was already
+/// cancelled, e.g. by an EOS-triggered cleanup) is reported as
+/// `Ok(UnsubscribeResponse { final_lsn: 0, .. })` so the caller's
+/// cleanup path doesn't crash on benign races.
+pub(crate) async fn unsubscribe(
+    client: &Client,
+    target_stream_id: u32,
+) -> Result<UnsubscribeResponse, ClientError> {
+    let body = RequestBody::Unsubscribe(UnsubscribeRequest { target_stream_id });
+    let mut guard = client.acquire().await?;
+    let stream_id = guard.next_stream_id();
+    let frame = Frame::new(
+        Opcode::UnsubscribeReq.as_u16(),
+        FLAG_EOS,
+        stream_id,
+        body.encode(),
+    );
+    write_frame(guard.stream_mut(), &frame).await?;
+    let resp = read_one_frame(guard.stream_mut()).await?;
+    if resp.header.opcode_u16() == Opcode::Error.as_u16() {
+        let err = map_error_frame(&resp.payload);
+        if let ClientError::Server { code, .. } = &err {
+            // 0x0052 = SubscriptionNotFound (per brain-protocol's
+            // ErrorCodeWire). Treat as benign — the server cleaned
+            // it up before we asked.
+            if *code == 0x0052 {
+                return Ok(UnsubscribeResponse {
+                    target_stream_id,
+                    final_lsn: 0,
+                });
+            }
+        }
+        return Err(err);
+    }
+    match ResponseBody::decode(Opcode::UnsubscribeResp, &resp.payload)? {
+        ResponseBody::Unsubscribe(r) => Ok(r),
+        _ => Err(ClientError::Protocol(
+            brain_protocol::error::ProtocolError::BadFrame(
+                "UnsubscribeResp opcode but body variant didn't match".into(),
+            ),
+        )),
+    }
+}
+
+// Suppress the unused-import warning for `DEFAULT_STREAM_FRAME_CAP`
+// in case future refactors trim the collect path. Today the helper
+// is referenced by collect().
+#[allow(dead_code)]
+const _USE: usize = DEFAULT_STREAM_FRAME_CAP;

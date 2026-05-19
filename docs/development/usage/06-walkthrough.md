@@ -14,8 +14,6 @@ You'll need two terminals inside the same container.
 **Terminal 1 — start the server:**
 
 ```bash
-just docker-shell
-# inside container:
 cargo run --bin brain-server -- --config config/dev.toml
 ```
 
@@ -24,8 +22,6 @@ Wait for the `"listening"` log line.
 **Terminal 2 — run the example:**
 
 ```bash
-just docker-shell
-# inside container:
 cargo run --example store_and_recall -p brain-sdk-rust
 ```
 
@@ -124,8 +120,8 @@ Connected.
 ──────────────────────────────────────────────────────────────────────
   Done. Session closed.
   To inspect the server state, run in another terminal:
-    just cli --output json debug-snapshot --shard 0 | jq .
-    just cli --output json worker list
+    cargo run --bin brain-cli -- --output json debug-snapshot --shard 0 | jq .
+    cargo run --bin brain-cli -- --output json worker list
     curl http://127.0.0.1:9091/metrics | grep brain_
 ──────────────────────────────────────────────────────────────────────
 ```
@@ -145,7 +141,7 @@ After the example finishes:
 Now in a third terminal, validate via the admin CLI / metrics:
 
 ```bash
-just cli --output json worker list | jq '.workers | length'
+cargo run --bin brain-cli -- --output json worker list | jq '.workers | length'
 ```
 
 Should print the worker count (12 × shard_count = 48 for the
@@ -158,7 +154,7 @@ curl -s http://127.0.0.1:9091/metrics | grep "brain_request_total{op=\"encode\""
 You should see counters reflecting the ENCODEs from the example.
 
 ```bash
-just cli --output json debug-snapshot --shard 0 \
+cargo run --bin brain-cli -- --output json debug-snapshot --shard 0 \
   | jq '.workers[] | select(.cycles > 0) | {name, cycles}'
 ```
 

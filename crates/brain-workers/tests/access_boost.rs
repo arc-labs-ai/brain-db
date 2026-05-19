@@ -369,10 +369,10 @@ fn recall_fills_buffer_then_boost_worker_applies() {
             txn_id: None,
             deduplicate: false,
         };
-        let _ = dispatch(RequestBody::Encode(encode_req([1; 16], "alpha")), &ctx)
+        let _ = dispatch(RequestBody::Encode(encode_req([1; 16], "alpha")), brain_ops::RequestCaller::anonymous(), &ctx)
             .await
             .unwrap();
-        let _ = dispatch(RequestBody::Encode(encode_req([2; 16], "beta")), &ctx)
+        let _ = dispatch(RequestBody::Encode(encode_req([2; 16], "beta")), brain_ops::RequestCaller::anonymous(), &ctx)
             .await
             .unwrap();
 
@@ -396,10 +396,11 @@ fn recall_fills_buffer_then_boost_worker_applies() {
             strategy_hint: None,
             include_vectors: false,
             include_edges: false,
+            include_text: false,
             request_id: None,
             txn_id: None,
         };
-        let resp = dispatch(RequestBody::Recall(recall), &ctx).await.unwrap();
+        let resp = dispatch(RequestBody::Recall(recall), brain_ops::RequestCaller::anonymous(), &ctx).await.unwrap();
         let n_results = match resp {
             ResponseBody::Recall(r) => r.results.len(),
             _ => unreachable!(),

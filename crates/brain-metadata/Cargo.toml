@@ -22,11 +22,16 @@ tracing.workspace = true
 # 17.4: SmallVec used when projecting StatementMetadata → Statement
 # (inline evidence list size INLINE_EVIDENCE_CAP).
 smallvec.workspace = true
+# Phase 8.dedup: BLAKE3 over canonical UTF-8 text for the
+# `fingerprints` opt-in content-dedup index (spec §07/07 §6).
+blake3.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
+# Used by fingerprint dedup tests to fabricate AgentIds.
+uuid.workspace = true
 # Hosts the async WAL writer in integration tests (sub-task 9.6a port).
 glommio.workspace = true
 

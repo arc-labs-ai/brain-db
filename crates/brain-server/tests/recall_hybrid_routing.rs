@@ -168,6 +168,7 @@ fn recall_request(txn_id: Option<[u8; 16]>) -> RecallRequest {
         strategy_hint: None,
         include_vectors: false,
         include_edges: false,
+        include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id,
     }

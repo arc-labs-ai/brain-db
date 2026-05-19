@@ -187,6 +187,6 @@ impl<'a> ReasonBuilder<'a> {
                     )),
                 },
             );
-        Ok(FrameStream::new(guard, Opcode::ReasonResp, decoder))
+        Ok(FrameStream::new(guard, stream_id, Opcode::ReasonResp, decoder))
     }
 }
