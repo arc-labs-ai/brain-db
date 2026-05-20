@@ -34,22 +34,13 @@ pub enum BannerAgentSource {
     /// `BRAIN_AGENT_ID=<uuid>` env var.
     IdEnv,
     /// Picked from config because `active = true` was set.
-    ActiveFromConfig {
-        name: String,
-        file_display: String,
-    },
+    ActiveFromConfig { name: String, file_display: String },
     /// Picked from config because `default = true` and no active.
-    DefaultFromConfig {
-        name: String,
-        file_display: String,
-    },
+    DefaultFromConfig { name: String, file_display: String },
     /// First-run auto-mint — the shell just created and persisted
     /// this agent. `file_display` is the path the new config was
     /// written to so the user knows where their state lives.
-    AutoMinted {
-        name: String,
-        file_display: String,
-    },
+    AutoMinted { name: String, file_display: String },
     /// In-memory ephemeral (no HOME, no config). Rare.
     Ephemeral,
 }
@@ -103,10 +94,7 @@ impl Render for WelcomeBanner {
         let sep = muted("·");
         let conn_label = muted("connected to");
         let server = val(&self.server_addr);
-        writeln!(
-            w,
-            "  {icon} {product}  {ver}  {sep}  {conn_label} {server}"
-        )?;
+        writeln!(w, "  {icon} {product}  {ver}  {sep}  {conn_label} {server}")?;
         writeln!(w)?;
 
         // ── Agent block ──────────────────────────────────────────
@@ -192,9 +180,7 @@ fn source_annotation(source: &BannerAgentSource) -> String {
             // name itself is already in the UUID label row above.
             format!("auto-minted on first run · stored at {file_display}")
         }
-        BannerAgentSource::Ephemeral => {
-            "ephemeral (no config file available)".to_string()
-        }
+        BannerAgentSource::Ephemeral => "ephemeral (no config file available)".to_string(),
     }
 }
 

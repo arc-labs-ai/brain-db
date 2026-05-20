@@ -456,7 +456,16 @@ async fn handle_meta(
     match meta {
         Meta::Quit => true,
         Meta::Help(v) => {
-            print!("{}", help::lookup(v.as_deref()));
+            let payload = help::lookup(v.as_deref());
+            let ctx = render_ctx(
+                OutputFormatArg::Auto,
+                crate::parser::ColorMode::Auto,
+                crate::parser::HyperlinkMode::Auto,
+            );
+            let mut stdout = std::io::stdout();
+            if let Err(e) = brain_explore::dispatch(payload.as_ref(), &ctx, &mut stdout) {
+                eprintln!("help render error: {e}");
+            }
             false
         }
         Meta::SetOutput(o) => {
