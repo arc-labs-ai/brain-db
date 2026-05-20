@@ -30,6 +30,7 @@ fn mock_result(idx: u32) -> MemoryResult {
         consolidated_at_unix_nanos: None,
         edges_out_count: 0,
         edges_in_count: 0,
+        graph: None,
     }
 }
 

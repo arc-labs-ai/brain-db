@@ -461,6 +461,7 @@ mod tests {
                 consolidated_at_unix_nanos: None,
                 edges_out_count: 2,
                 edges_in_count: 3,
+                graph: None,
             }],
             is_final: false,
             cumulative_count: 1,

@@ -262,9 +262,9 @@ fn fetch_outgoing_edges_for(
     use brain_metadata::tables::edge::walk_outgoing;
 
     let db_guard = ctx.executor.metadata.lock();
-    let rtxn = db_guard
-        .read_txn()
-        .map_err(|e| OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string())))?;
+    let rtxn = db_guard.read_txn().map_err(|e| {
+        OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
+    })?;
     let mut out: Vec<Vec<brain_protocol::response::EdgeView>> = Vec::with_capacity(hits.len());
     for hit in hits {
         let rows = walk_outgoing(&rtxn, NodeRef::Memory(hit.memory_id), None).map_err(|e| {
@@ -347,13 +347,11 @@ fn fetch_enrichment_for(
     for &memory_id in memory_ids {
         // 1. Mentioned entities (walk Mentions edges from memory).
         let mention_rows = walk_outgoing(
-            &rtxn,
+            rtxn,
             NodeRef::Memory(memory_id),
             Some(EdgeKindRef::Mentions),
         )
-        .map_err(|e| {
-            OpError::Internal(format!("include_graph: walk_outgoing(Mentions): {e}"))
-        })?;
+        .map_err(|e| OpError::Internal(format!("include_graph: walk_outgoing(Mentions): {e}")))?;
         let entity_ids: Vec<EntityId> = mention_rows
             .iter()
             .filter_map(|(_, to, _, _)| match to {
@@ -373,7 +371,7 @@ fn fetch_enrichment_for(
         let mut enriched_entities: Vec<EnrichedEntity> =
             Vec::with_capacity(entity_ids.len().min(ENTITY_CAP));
         for eid in entity_ids.iter().take(ENTITY_CAP) {
-            let Some(ent) = entity_get(&rtxn, *eid)
+            let Some(ent) = entity_get(rtxn, *eid)
                 .map_err(|e| OpError::Internal(format!("include_graph: entity_get: {e}")))?
             else {
                 continue;
@@ -398,17 +396,17 @@ fn fetch_enrichment_for(
             let lo = (mid, [0u8; 16]);
             let hi = (mid, [0xFFu8; 16]);
             let mut stmts: Vec<brain_core::knowledge::Statement> = Vec::new();
-            for entry in et.range(lo..=hi).map_err(|e| {
-                OpError::Internal(format!("include_graph: evidence range: {e}"))
-            })? {
-                let (k, _v) = entry.map_err(|e| {
-                    OpError::Internal(format!("include_graph: evidence row: {e}"))
-                })?;
+            for entry in et
+                .range(lo..=hi)
+                .map_err(|e| OpError::Internal(format!("include_graph: evidence range: {e}")))?
+            {
+                let (k, _v) = entry
+                    .map_err(|e| OpError::Internal(format!("include_graph: evidence row: {e}")))?;
                 let (_mem_bytes, sid_bytes) = k.value();
                 let sid = StatementId::from_bytes(sid_bytes);
-                if let Some(stmt) = statement_get(&rtxn, sid).map_err(|e| {
-                    OpError::Internal(format!("include_graph: statement_get: {e}"))
-                })? {
+                if let Some(stmt) = statement_get(rtxn, sid)
+                    .map_err(|e| OpError::Internal(format!("include_graph: statement_get: {e}")))?
+                {
                     if !stmt.tombstoned {
                         stmts.push(stmt);
                     }
@@ -421,20 +419,20 @@ fn fetch_enrichment_for(
             });
             for stmt in stmts.into_iter().take(STATEMENT_CAP) {
                 let subject_name = match stmt.subject {
-                    SubjectRef::Entity(eid) => entity_get(&rtxn, eid)
+                    SubjectRef::Entity(eid) => entity_get(rtxn, eid)
                         .ok()
                         .flatten()
                         .map(|e| e.canonical_name)
                         .unwrap_or_default(),
                     _ => "(ambiguous)".to_string(),
                 };
-                let predicate = predicate_get(&rtxn, stmt.predicate)
+                let predicate = predicate_get(rtxn, stmt.predicate)
                     .ok()
                     .flatten()
                     .map(|p| p.canonical())
                     .unwrap_or_default();
                 let object_label = match &stmt.object {
-                    brain_core::knowledge::StatementObject::Entity(eid) => entity_get(&rtxn, *eid)
+                    brain_core::knowledge::StatementObject::Entity(eid) => entity_get(rtxn, *eid)
                         .ok()
                         .flatten()
                         .map(|e| e.canonical_name)
@@ -464,13 +462,11 @@ fn fetch_enrichment_for(
         for eid in &entity_ids {
             for outgoing in [true, false] {
                 let rows = if outgoing {
-                    walk_outgoing(&rtxn, NodeRef::Entity(*eid), None)
+                    walk_outgoing(rtxn, NodeRef::Entity(*eid), None)
                 } else {
-                    walk_incoming(&rtxn, NodeRef::Entity(*eid), None)
+                    walk_incoming(rtxn, NodeRef::Entity(*eid), None)
                 }
-                .map_err(|e| {
-                    OpError::Internal(format!("include_graph: walk relation: {e}"))
-                })?;
+                .map_err(|e| OpError::Internal(format!("include_graph: walk relation: {e}")))?;
                 for (kind, other, _disamb, data) in rows {
                     let typed_id = match kind {
                         EdgeKindRef::Typed(rt_id) => rt_id,
@@ -480,7 +476,7 @@ fn fetch_enrichment_for(
                         NodeRef::Entity(oid) => oid,
                         _ => continue,
                     };
-                    let Some(rt) = relation_type_get(&rtxn, typed_id).map_err(|e| {
+                    let Some(rt) = relation_type_get(rtxn, typed_id).map_err(|e| {
                         OpError::Internal(format!("include_graph: relation_type_get: {e}"))
                     })?
                     else {
@@ -491,12 +487,12 @@ fn fetch_enrichment_for(
                     } else {
                         (other_entity, *eid)
                     };
-                    let from_name = entity_get(&rtxn, from_id)
+                    let from_name = entity_get(rtxn, from_id)
                         .ok()
                         .flatten()
                         .map(|e| e.canonical_name)
                         .unwrap_or_default();
-                    let to_name = entity_get(&rtxn, to_id)
+                    let to_name = entity_get(rtxn, to_id)
                         .ok()
                         .flatten()
                         .map(|e| e.canonical_name)
@@ -689,26 +685,27 @@ fn project_memory_results(
     // Pre-fetch knowledge-layer enrichment in one pass if requested.
     // The hybrid path holds metadata_guard for the whole loop, so the
     // helper takes the existing rtxn (no double-lock).
-    let graph_per_memory: Option<std::collections::HashMap<MemoryId, brain_protocol::response::GraphEnrichment>> =
-        if req.include_graph {
-            let ids: Vec<MemoryId> = result
-                .items
-                .iter()
-                .filter_map(|fused| match fused.id {
-                    RankedItemId::Memory(mid) => Some(mid),
-                    _ => None,
-                })
-                .collect();
-            let enriched = fetch_enrichment_for(&ids, &rtxn)?;
-            Some(
-                ids.into_iter()
-                    .zip(enriched.into_iter())
-                    .filter_map(|(id, e)| e.map(|g| (id, g)))
-                    .collect(),
-            )
-        } else {
-            None
-        };
+    let graph_per_memory: Option<
+        std::collections::HashMap<MemoryId, brain_protocol::response::GraphEnrichment>,
+    > = if req.include_graph {
+        let ids: Vec<MemoryId> = result
+            .items
+            .iter()
+            .filter_map(|fused| match fused.id {
+                RankedItemId::Memory(mid) => Some(mid),
+                _ => None,
+            })
+            .collect();
+        let enriched = fetch_enrichment_for(&ids, &rtxn)?;
+        Some(
+            ids.into_iter()
+                .zip(enriched)
+                .filter_map(|(id, e)| e.map(|g| (id, g)))
+                .collect(),
+        )
+    } else {
+        None
+    };
 
     let mut out: Vec<MemoryResult> = Vec::with_capacity(result.items.len());
     for fused in &result.items {
@@ -800,9 +797,7 @@ fn project_memory_results(
                 NodeRef::Memory(memory_id),
                 None,
             )
-            .map_err(|e| {
-                OpError::Internal(format!("hybrid recall walk_outgoing: {e}"))
-            })?;
+            .map_err(|e| OpError::Internal(format!("hybrid recall walk_outgoing: {e}")))?;
             Some(
                 rows.into_iter()
                     .filter_map(|(kind, to, _disamb, data)| {
@@ -841,7 +836,9 @@ fn project_memory_results(
             created_at_unix_nanos: row.created_at_unix_nanos,
             last_accessed_at_unix_nanos: row.last_accessed_at_unix_nanos,
             edges,
-            graph: graph_per_memory.as_ref().and_then(|m| m.get(&memory_id).cloned()),
+            graph: graph_per_memory
+                .as_ref()
+                .and_then(|m| m.get(&memory_id).cloned()),
             contributing_retrievers: fused
                 .contributing
                 .iter()
