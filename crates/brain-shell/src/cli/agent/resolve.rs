@@ -201,14 +201,14 @@ pub fn resolve_with(
     // 7. Auto-mint + persist. The config is freshly-loaded and has
     // no agents at all (or the previous defaults got wiped); minting
     // here is the first-run UX.
+    //
+    // The resolver is pure — it returns AgentIdSource::AutoMinted
+    // carrying the new name + file path; the caller decides how to
+    // surface the "first run" event to the user. brain-shell's
+    // REPL banner formats it in the welcome card; one-shot CLI
+    // flows that don't print a banner suppress it entirely.
     let (name, agent_id) = auto_mint::create_and_persist(&mut config)?;
     let file = config.path.clone();
-    // Best-effort note on stderr so the user knows a file just got
-    // written under their HOME.
-    eprintln!(
-        "note: first run — minted and persisted agent '{name}' at {}",
-        file.display()
-    );
     Ok(ResolvedAgentId {
         agent_id,
         source: AgentIdSource::AutoMinted { name, file },

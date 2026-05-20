@@ -28,16 +28,22 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let (mut ed, history_path) = editor::build(session.recent_ids.clone())?;
 
-    println!(
-        "brain shell — connected to {} as {}{}.",
-        session.server,
-        agent_id.0,
-        source_suffix(&agent_source),
+    // Welcome card. Single dispatch through brain-explore so the
+    // banner picks up the same TermPolicy / Theme the rest of the
+    // shell uses; replaces the previous three println!s (connect
+    // line + first-run note + help hint), which had a duplicate
+    // "first run — minted" message between the resolver's eprintln
+    // and source_note's println.
+    let banner = build_welcome_banner(&session, agent_id, &agent_source);
+    let banner_ctx = render_ctx(
+        OutputFormatArg::Auto,
+        crate::parser::ColorMode::Auto,
+        crate::parser::HyperlinkMode::Auto,
     );
-    if let Some(note) = source_note(&agent_source) {
-        println!("{note}");
+    let mut stdout = std::io::stdout();
+    if let Err(e) = brain_explore::dispatch(&banner, &banner_ctx, &mut stdout) {
+        eprintln!("banner render error: {e}");
     }
-    println!("Type `help` for commands, `quit` to exit.");
 
     loop {
         let prompt = session.prompt();
@@ -731,42 +737,65 @@ fn apply_setting_to_session(key: &str, value: &str, session: &mut Session) {
 
 // ─── source-aware banner + \agent helpers ───────────────────────
 
-fn source_suffix(s: &AgentIdSource) -> String {
-    match s {
-        AgentIdSource::NamedFlag { .. } => " (via --agent)".into(),
-        AgentIdSource::IdFlag => " (via --agent-id)".into(),
-        AgentIdSource::NamedEnv { .. } => " (via BRAIN_AGENT)".into(),
-        AgentIdSource::IdEnv => " (via BRAIN_AGENT_ID)".into(),
-        AgentIdSource::ActiveFromConfig { name, .. } => {
-            format!(" (config: active = {name})")
-        }
-        AgentIdSource::DefaultFromConfig { name, .. } => {
-            format!(" (config: default = {name})")
-        }
-        AgentIdSource::AutoMinted { name, .. } => {
-            format!(" (auto-minted as {name})")
-        }
-        AgentIdSource::Ephemeral => " (ephemeral)".into(),
+/// Build the welcome banner from the resolved agent identity and
+/// session metadata. Renders via brain_explore::WelcomeBanner so
+/// the visual matches the encode / info cards.
+fn build_welcome_banner(
+    session: &Session,
+    agent_id: AgentId,
+    agent_source: &AgentIdSource,
+) -> brain_explore::WelcomeBanner {
+    use brain_explore::BannerAgentSource as BAS;
+    let agent_name = match agent_source {
+        AgentIdSource::NamedFlag { name, .. }
+        | AgentIdSource::NamedEnv { name, .. }
+        | AgentIdSource::ActiveFromConfig { name, .. }
+        | AgentIdSource::DefaultFromConfig { name, .. }
+        | AgentIdSource::AutoMinted { name, .. } => Some(name.clone()),
+        AgentIdSource::IdFlag | AgentIdSource::IdEnv | AgentIdSource::Ephemeral => None,
+    };
+    let source = match agent_source {
+        AgentIdSource::NamedFlag { name, .. } => BAS::NamedFlag(name.clone()),
+        AgentIdSource::IdFlag => BAS::IdFlag,
+        AgentIdSource::NamedEnv { name, .. } => BAS::NamedEnv(name.clone()),
+        AgentIdSource::IdEnv => BAS::IdEnv,
+        AgentIdSource::ActiveFromConfig { name, file } => BAS::ActiveFromConfig {
+            name: name.clone(),
+            file_display: file.display().to_string(),
+        },
+        AgentIdSource::DefaultFromConfig { name, file } => BAS::DefaultFromConfig {
+            name: name.clone(),
+            file_display: file.display().to_string(),
+        },
+        AgentIdSource::AutoMinted { name, file } => BAS::AutoMinted {
+            name: name.clone(),
+            file_display: file.display().to_string(),
+        },
+        AgentIdSource::Ephemeral => BAS::Ephemeral,
+    };
+    brain_explore::WelcomeBanner {
+        product_name: "brain-shell".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        server_addr: session.server.to_string(),
+        agent_name,
+        agent_id: *agent_id.0.as_bytes(),
+        agent_source: source,
     }
 }
 
-fn source_note(s: &AgentIdSource) -> Option<String> {
-    match s {
-        AgentIdSource::AutoMinted { name, file } => Some(format!(
-            "note: first run — minted and persisted agent '{name}' at {}. \
-             Use `\\agent create <name>` to add another, and \
-             `\\agent use <name>` to switch.",
-            file.display()
-        )),
-        AgentIdSource::Ephemeral => Some(
-            "note: ephemeral session — no config file available so the \
-             minted agent is in-memory only. Memories you encode are \
-             visible only until you quit."
-                .to_string(),
-        ),
-        _ => None,
-    }
-}
+// `source_suffix` (formerly here) was the inline " (via --agent)"
+// / " (auto-minted as X)" tail on the old single-line connect
+// banner. The new card-style banner annotates each source under
+// the agent UUID via brain_explore::WelcomeBanner's
+// source_annotation, so this helper is dead. Tests that exercised
+// it moved into banner.rs.
+
+// `source_note` (formerly here) was the inline formatter for the
+// "first run — minted" + "ephemeral session" stderr notes. Both
+// roles moved into brain_explore::WelcomeBanner's agent block
+// (the AutoMinted / Ephemeral variants render their own one-line
+// muted annotation under the UUID). Deleting the function and its
+// test that no longer have callers.
 
 fn source_label(s: &AgentIdSource) -> String {
     match s {
@@ -921,51 +950,17 @@ mod tests {
 
     // ----- source helpers ----------------------------------------
 
-    #[test]
-    fn source_suffix_describes_each_variant() {
-        assert_eq!(source_suffix(&AgentIdSource::IdFlag), " (via --agent-id)");
-        assert_eq!(
-            source_suffix(&AgentIdSource::IdEnv),
-            " (via BRAIN_AGENT_ID)"
-        );
-        assert_eq!(source_suffix(&AgentIdSource::Ephemeral), " (ephemeral)");
-        let p = PathBuf::from("/x/y");
-        assert_eq!(
-            source_suffix(&AgentIdSource::NamedFlag {
-                name: "work".into(),
-                file: p.clone(),
-            }),
-            " (via --agent)"
-        );
-        assert_eq!(
-            source_suffix(&AgentIdSource::NamedEnv {
-                name: "work".into(),
-                file: p
-            }),
-            " (via BRAIN_AGENT)"
-        );
-    }
+    // source_suffix_describes_each_variant was here. The function
+    // it tested (source_suffix) is dead now that the banner renders
+    // via brain_explore::WelcomeBanner with its own source
+    // annotation; coverage moved into banner.rs's source_annotation
+    // tests.
 
-    #[test]
-    fn source_note_fires_for_ephemeral_and_automint() {
-        assert!(source_note(&AgentIdSource::IdFlag).is_none());
-        assert!(source_note(&AgentIdSource::IdEnv).is_none());
-        let p = PathBuf::from("/x/y");
-        assert!(source_note(&AgentIdSource::NamedFlag {
-            name: "w".into(),
-            file: p.clone(),
-        })
-        .is_none());
-        assert!(source_note(&AgentIdSource::Ephemeral)
-            .unwrap()
-            .contains("ephemeral"));
-        assert!(source_note(&AgentIdSource::AutoMinted {
-            name: "agent-deadbeef".into(),
-            file: p,
-        })
-        .unwrap()
-        .contains("first run"));
-    }
+    // source_note_fires_for_ephemeral_and_automint was here. The
+    // function it tested moved into brain_explore::WelcomeBanner's
+    // agent-source annotation; see banner.rs's tests for the new
+    // coverage (render_table_first_run_annotation_includes_config_path,
+    // render_table_ephemeral_is_marked_clearly).
 
     #[test]
     fn source_name_returns_named_variants_only() {

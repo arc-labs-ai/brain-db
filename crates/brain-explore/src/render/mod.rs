@@ -11,6 +11,7 @@
 
 pub mod adhoc;
 pub mod audit_card;
+pub mod banner;
 pub mod encode;
 pub mod entity_card;
 pub mod error;
@@ -29,6 +30,7 @@ pub mod txn;
 
 pub use adhoc::AdHocTable;
 pub use audit_card::{AuditCard, TierOutcome};
+pub use banner::{BannerAgentSource, WelcomeBanner};
 pub use encode::EncodeRendered;
 pub use entity_card::{EntityCard, MemorySummary, RelationSummary, StatementSummary};
 pub use error::RenderableError;
