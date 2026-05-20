@@ -260,7 +260,8 @@ fn help_recall() -> HelpVerb {
         description: vec![
             "Vector-similarity search. Embeds the query text, runs a top-K HNSW lookup in the active context's index, returns ranked MemoryResults.".into(),
             "Score fields: `similarity_score` is the raw cosine from the semantic retriever (the substrate path uses it directly; the hybrid path reports the semantic retriever's contribution to the fusion, or 0.0 if semantic didn't fire). `confidence` is the value `--confidence` thresholds against — `similarity_score` on substrate, RRF-fused `fused_score` on hybrid.".into(),
-            "When the top-K scores cluster within Δ<0.001, the table footer warns that ranking may not be meaningful (computed client-side from the response). Typically the embedder isn't loaded (test mode), or the query genuinely doesn't discriminate.".into(),
+            "Hybrid hits show a `retrievers=N` column with the count of contributing retrievers (semantic + lexical + graph). A row with `retrievers=1` matched only one retriever and is typically weak signal — don't read its fused-score ranking as authoritative.".into(),
+            "When the top-K scores cluster within Δ<0.001 of each other, the table footer warns that ranking may not be meaningful (computed client-side from the response). Typically the embedder isn't loaded (test mode), or the query genuinely doesn't discriminate.".into(),
             "Returned ids are remembered in the session for tab-completion — the next `forget` or `link` can refer to them by short id.".into(),
         ],
         example: Some(r#"recall "auth rewrite" --top-k 5 --include-text --filter-context 7"#.into()),

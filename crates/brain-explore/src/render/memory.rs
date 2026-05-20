@@ -65,6 +65,15 @@ impl Render for RecallResults {
                     r.edges_in_count, r.edges_out_count
                 ));
             }
+            // Hybrid hits carry a non-empty contributing_retrievers
+            // list (substrate path leaves it empty). Surfacing the
+            // count flags single-retriever hits — they're typically
+            // weak signal that only one of {semantic, lexical, graph}
+            // ranked the row, so the user shouldn't read fused-score
+            // ordering as authoritative for them.
+            if !r.contributing_retrievers.is_empty() {
+                meta.push(format!("retrievers={}", r.contributing_retrievers.len()));
+            }
             writeln!(w, "#{}  {}", idx + 1, meta.join("  "))?;
             if r.text.is_empty() {
                 let hint = theme.paint(
@@ -228,6 +237,45 @@ mod tests {
         r.render_table(&ctx, &mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains('…'), "should middle-truncate: {s}");
+    }
+
+    #[test]
+    fn substrate_hit_omits_retrievers_column() {
+        // Empty contributing_retrievers (the substrate-path default)
+        // → no retrievers=N column. Keeps the row tight when hybrid
+        // metadata isn't available.
+        let r = RecallResults(vec![make_hit("substrate hit", 0.9)]);
+        let mut buf = Vec::new();
+        r.render_table(&ctx(), &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(!s.contains("retrievers="), "substrate row should not show retrievers count: {s}");
+    }
+
+    #[test]
+    fn hybrid_hit_shows_retrievers_count() {
+        // Non-empty contributing_retrievers → retrievers=N column.
+        // A single-retriever hit (count=1) is the signal that a row
+        // only matched one of the routed retrievers.
+        use brain_protocol::responses::types::RetrieverNameWire;
+        let mut hit = make_hit("hybrid hit", 0.9);
+        hit.contributing_retrievers = vec![RetrieverNameWire::Semantic];
+        let r = RecallResults(vec![hit]);
+        let mut buf = Vec::new();
+        r.render_table(&ctx(), &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("retrievers=1"), "expected retrievers=1: {s}");
+
+        // Multi-retriever consensus.
+        let mut hit = make_hit("strong hit", 0.9);
+        hit.contributing_retrievers = vec![
+            RetrieverNameWire::Semantic,
+            RetrieverNameWire::Lexical,
+        ];
+        let r = RecallResults(vec![hit]);
+        let mut buf = Vec::new();
+        r.render_table(&ctx(), &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("retrievers=2"), "expected retrievers=2: {s}");
     }
 
     #[test]
