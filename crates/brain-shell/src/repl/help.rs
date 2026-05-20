@@ -473,10 +473,14 @@ fn help_meta() -> HelpVerb {
         sources: vec![],
         description: vec![
             "Session-only settings (the first block) live until quit. Persisted commands (`\\config set`, `\\agent use`, `\\agent set-default`) write to ~/.config/brain/config.toml and survive across sessions.".into(),
+            "Per-meta-command deep dives live under docs/reference/shell/meta/ — one page per meta verb (agent, config, set, unset, info, timing, connect, help).".into(),
         ],
-        example: None,
+        example: Some("\\set output ndjson   →   \\set context 7   →   encode \"...\"".into()),
         see_also: vec![],
-        reference: None,
+        reference: Some(HelpReference {
+            clap_command: "brain --help".into(),
+            doc_path: Some("docs/reference/shell/meta/".into()),
+        }),
     }
 }
 
@@ -667,6 +671,18 @@ mod tests {
         assert!(card.contains("txn commit"));
         assert!(card.contains("txn abort"));
         assert!(card.contains("txn --help"));
+    }
+
+    #[test]
+    fn help_meta_points_at_per_command_docs() {
+        let card = render_card_table(&help_meta());
+        // Reference must include the per-meta-command docs dir so a
+        // reader knows where to find the deep dive for each meta verb.
+        assert!(card.contains("docs/reference/shell/meta/"));
+        // Usage block keeps the directory of meta commands.
+        for cmd in ["\\set", "\\agent", "\\config", "\\info"] {
+            assert!(card.contains(cmd), "missing meta cmd {cmd} in:\n{card}");
+        }
     }
 
     #[test]
