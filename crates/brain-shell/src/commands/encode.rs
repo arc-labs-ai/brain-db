@@ -88,10 +88,9 @@ pub async fn run(
         wait_for_extraction(client, MemoryId::from_raw(resp.memory_id), resp.lsn).await?;
     }
 
-    Ok(Box::new(EncodeRendered {
-        response: resp,
-        dedup_requested: deduplicate,
-    }))
+    Ok(Box::new(
+        EncodeRendered::new(resp).with_source(text.clone()),
+    ))
 }
 
 /// Pull text from whichever source the user picked. Errors when no
