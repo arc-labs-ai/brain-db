@@ -36,6 +36,7 @@ pub mod schema_gate;
 pub mod test_support;
 pub mod txn_lens;
 pub mod worker_metrics;
+pub mod write;
 
 // Module-level re-exports preserve `brain_ops::<op>::*` paths so
 // external callers (brain-server, brain-planner) don't churn.
@@ -65,6 +66,11 @@ pub use worker_metrics::{
     ResolverOutcome, TemporalEdgeMetrics, TemporalEdgeMetricsSnapshot, TemporalSkipReason,
     TierKind, TierStatus, WorkerBucketSnapshot, WorkerHistogram, WorkerHistogramSnapshot,
     ITEM_KIND_LABELS, RESOLVER_OUTCOME_LABELS, TIER_LABELS, TIER_STATUS_LABELS,
+};
+pub use write::{
+    AllocatedId, AttributeTarget, EntityAttributesUpdate, EvidenceRefPhase, IdKind, Phase,
+    PhaseAck, ResolveContext, SupersedeTarget, TombstoneTarget, TriggerEvent, TriggerKind,
+    TriggerMask, Write, WriteAck, WriteId,
 };
 
 #[cfg(test)]
