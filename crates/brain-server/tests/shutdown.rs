@@ -19,15 +19,32 @@ mod shard;
 #[path = "../src/bootstrap/shutdown.rs"]
 mod shutdown;
 
+use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use shard::{spawn_shard, ShardHandle, ShardJoiner, ShardSpawnConfig};
 use shutdown::{graceful_shutdown_shards, DEFAULT_SHARD_DRAIN_BUDGET};
+
+struct TestStubDispatcher;
+impl Dispatcher for TestStubDispatcher {
+    fn embed(&self, _: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+        Ok([0.0; VECTOR_DIM])
+    }
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+        Ok(vec![[0.0; VECTOR_DIM]; texts.len()])
+    }
+    fn fingerprint(&self) -> [u8; 16] {
+        [0; 16]
+    }
+}
+fn stub_dispatcher() -> Arc<dyn Dispatcher> {
+    Arc::new(TestStubDispatcher)
+}
 
 fn fixture(n_shards: usize) -> (Arc<Vec<ShardHandle>>, Vec<ShardJoiner>, TempDir) {
     let dir = TempDir::new().expect("tmp");
     let mut handles = Vec::with_capacity(n_shards);
     let mut joiners = Vec::with_capacity(n_shards);
     for shard_id in 0..n_shards {
-        let cfg = ShardSpawnConfig::new(dir.path());
+        let cfg = ShardSpawnConfig::new(dir.path(), stub_dispatcher());
         let (h, j) = spawn_shard(shard_id as u16, cfg).expect("spawn shard");
         handles.push(h);
         joiners.push(j);

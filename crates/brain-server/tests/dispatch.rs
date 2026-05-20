@@ -53,9 +53,26 @@ mod subscribe;
 #[path = "../src/bootstrap/tls.rs"]
 mod tls;
 
+use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use connection::{ConnectionLimits, ConnectionListener, ShutdownSignal, ShutdownTrigger, Topology};
 use routing::RoutingTable;
 use shard::{spawn_shard, ShardHandle, ShardJoiner, ShardSpawnConfig};
+
+struct TestStubDispatcher;
+impl Dispatcher for TestStubDispatcher {
+    fn embed(&self, _: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+        Ok([0.0; VECTOR_DIM])
+    }
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+        Ok(vec![[0.0; VECTOR_DIM]; texts.len()])
+    }
+    fn fingerprint(&self) -> [u8; 16] {
+        [0; 16]
+    }
+}
+fn stub_dispatcher() -> Arc<dyn Dispatcher> {
+    Arc::new(TestStubDispatcher)
+}
 
 // ---------------------------------------------------------------------------
 // Scaffold
@@ -91,7 +108,7 @@ async fn start_with_shards(n_shards: usize, limits: ConnectionLimits) -> Server 
     let mut handles = Vec::with_capacity(n_shards);
     let mut joiners = Vec::with_capacity(n_shards);
     for shard_id in 0..n_shards {
-        let cfg = ShardSpawnConfig::new(data_dir.path());
+        let cfg = ShardSpawnConfig::new(data_dir.path(), stub_dispatcher());
         let (h, j) = spawn_shard(shard_id as u16, cfg).expect("spawn shard");
         handles.push(h);
         joiners.push(Some(j));

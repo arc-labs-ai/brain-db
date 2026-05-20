@@ -95,7 +95,26 @@ fn main() -> ExitCode {
 
     #[cfg(target_os = "linux")]
     {
-        linux_main::run(cfg)
+        // Load the embedding model once at process startup. The same
+        // CachingDispatcher Arc is cloned into each shard executor so
+        // the ~130 MiB BGE weights live in memory exactly once
+        // regardless of shard count. We fail-stop here when the model
+        // is missing — the substrate has no honest fallback that still
+        // produces meaningful recall results.
+        let dispatcher = match linux_main::build_dispatcher(&cfg.embedder) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("error: failed to initialise embedder: {e}");
+                eprintln!();
+                eprintln!("brain-server requires a BERT-shaped embedding model on disk.");
+                eprintln!("To install BGE-small-en-v1.5:");
+                eprintln!("  ./scripts/bootstrap-model.sh");
+                eprintln!("Or set BRAIN_EMBED_MODEL_DIR=/path/to/model");
+                eprintln!("See docs/notes/embedding-model-install.md for details.");
+                return ExitCode::FAILURE;
+            }
+        };
+        linux_main::run(cfg, dispatcher)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -132,7 +151,61 @@ mod linux_main {
         ShardSpawnConfig,
     };
 
-    pub fn run(cfg: Config) -> ExitCode {
+    /// Errors surfaced by [`build_dispatcher`]. Hand-rolled `Display`
+    /// rather than `thiserror` because `main.rs` is a binary and the
+    /// error never crosses a library boundary.
+    #[derive(Debug)]
+    pub enum EmbedderInitError {
+        ResolvePath(String),
+        MissingFile { expected: std::path::PathBuf },
+        Load(String),
+    }
+
+    impl std::fmt::Display for EmbedderInitError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::ResolvePath(e) => write!(f, "resolve model path: {e}"),
+                Self::MissingFile { expected } => {
+                    write!(f, "missing required model file: {}", expected.display())
+                }
+                Self::Load(e) => write!(f, "load model: {e}"),
+            }
+        }
+    }
+
+    /// Resolve `cfg.embedder.model` to a directory, verify the three
+    /// required model files are present, load the BERT weights once,
+    /// and wrap the resulting `CpuDispatcher` in `CachingDispatcher`
+    /// so process-wide repeated embeds skip the forward pass.
+    ///
+    /// Returns an `Arc<dyn Dispatcher>` that is cheap to clone into
+    /// every shard's executor closure.
+    pub fn build_dispatcher(
+        cfg: &super::config::EmbedderConfig,
+    ) -> Result<Arc<dyn brain_embed::Dispatcher>, EmbedderInitError> {
+        let model_dir = cfg
+            .resolve_model_dir()
+            .map_err(|e| EmbedderInitError::ResolvePath(e.to_string()))?;
+
+        // Friendly pre-check: the loader would fail with a candle /
+        // tokenizers diagnostic that doesn't help operators figure out
+        // which file is missing. Surface the path ourselves.
+        for required in ["config.json", "tokenizer.json", "model.safetensors"] {
+            let p = model_dir.join(required);
+            if !p.exists() {
+                return Err(EmbedderInitError::MissingFile { expected: p });
+            }
+        }
+
+        let embed_cfg = brain_embed::EmbedderConfig::new(model_dir);
+        let handle = brain_embed::ModelHandle::load(&embed_cfg)
+            .map_err(|e| EmbedderInitError::Load(e.to_string()))?;
+        let cpu = brain_embed::CpuDispatcher::new(handle);
+        let cached = brain_embed::CachingDispatcher::new(cpu, cfg.cache_size);
+        Ok(Arc::new(cached))
+    }
+
+    pub fn run(cfg: Config, dispatcher: Arc<dyn brain_embed::Dispatcher>) -> ExitCode {
         // Sub-task 9.15: build the configured Summarizer (default
         // `DisabledSummarizer`). Construction happens once and the
         // resulting `Arc<dyn Summarizer>` is cloned into each shard's
@@ -148,7 +221,7 @@ mod linux_main {
         // Sub-task 9.10: spawn one Glommio shard per `cfg.storage.shard_count`,
         // then build a `Topology` (shards + `RoutingTable` + `ServerCapabilities`)
         // and feed it into the `ConnectionListener`.
-        let (shards, joiners) = match spawn_shards(&cfg, &summarizer) {
+        let (shards, joiners) = match spawn_shards(&cfg, &summarizer, &dispatcher) {
             Ok(pair) => pair,
             Err(rc) => return rc,
         };
@@ -338,11 +411,13 @@ mod linux_main {
     fn spawn_shards(
         cfg: &Config,
         summarizer: &Arc<dyn brain_workers::Summarizer>,
+        dispatcher: &Arc<dyn brain_embed::Dispatcher>,
     ) -> Result<(Vec<ShardHandle>, Vec<ShardJoiner>), ExitCode> {
         let mut handles = Vec::with_capacity(cfg.storage.shard_count);
         let mut joiners = Vec::with_capacity(cfg.storage.shard_count);
         for shard_id in 0..cfg.storage.shard_count {
-            let mut spawn_cfg = ShardSpawnConfig::new(cfg.storage.data_dir.clone());
+            let mut spawn_cfg =
+                ShardSpawnConfig::new(cfg.storage.data_dir.clone(), dispatcher.clone());
             spawn_cfg.summarizer = summarizer.clone();
             // Phase B: ferry the operator's `[workers.auto_edge]`
             // overrides into the per-shard spawn config so the

@@ -37,6 +37,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_protocol::handshake::{AuthMethod, ServerCapabilities};
 use tempfile::TempDir;
 
@@ -48,6 +49,26 @@ use crate::connection::{
 };
 use crate::routing::RoutingTable;
 use crate::shard::{spawn_shard, ShardHandle, ShardJoiner, ShardSpawnConfig};
+
+/// Integration-test stub dispatcher. The harness never exercises
+/// embedding quality and we don't want to load a real BGE model per
+/// test binary.
+struct TestStubDispatcher;
+impl Dispatcher for TestStubDispatcher {
+    fn embed(&self, _: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+        Ok([0.0; VECTOR_DIM])
+    }
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+        Ok(vec![[0.0; VECTOR_DIM]; texts.len()])
+    }
+    fn fingerprint(&self) -> [u8; 16] {
+        [0; 16]
+    }
+}
+
+pub fn stub_dispatcher() -> Arc<dyn Dispatcher> {
+    Arc::new(TestStubDispatcher)
+}
 
 pub struct Server {
     pub data_plane_addr: SocketAddr,
@@ -91,7 +112,7 @@ pub async fn start_in(data_dir: &Path, n_shards: usize) -> Server {
     let mut handles = Vec::with_capacity(n_shards);
     let mut joiners = Vec::with_capacity(n_shards);
     for shard_id in 0..n_shards {
-        let cfg = ShardSpawnConfig::new(data_dir);
+        let cfg = ShardSpawnConfig::new(data_dir, stub_dispatcher());
         let (h, j) = spawn_shard(shard_id as u16, cfg).expect("spawn shard");
         handles.push(h);
         joiners.push(Some(j));

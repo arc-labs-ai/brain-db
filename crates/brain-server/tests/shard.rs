@@ -7,8 +7,10 @@
 
 #![cfg(target_os = "linux")]
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use tempfile::TempDir;
 
 // shard.rs uses `crate::shard_adapters::…`; pull both source files into
@@ -24,6 +26,25 @@ use shard::{
     ShardSpawnConfig,
 };
 
+/// File-local stub: the substrate tests in this file don't exercise
+/// embedding quality. Real CpuDispatcher loads in production via
+/// `linux_main::build_dispatcher`.
+struct TestStubDispatcher;
+impl Dispatcher for TestStubDispatcher {
+    fn embed(&self, _: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+        Ok([0.0; VECTOR_DIM])
+    }
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+        Ok(vec![[0.0; VECTOR_DIM]; texts.len()])
+    }
+    fn fingerprint(&self) -> [u8; 16] {
+        [0; 16]
+    }
+}
+fn stub() -> Arc<dyn Dispatcher> {
+    Arc::new(TestStubDispatcher)
+}
+
 // ---------------------------------------------------------------------------
 // 9.4 — Ping + lifecycle
 // ---------------------------------------------------------------------------
@@ -31,7 +52,8 @@ use shard::{
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ping_roundtrips() {
     let dir = TempDir::new().unwrap();
-    let (handle, joiner) = spawn_shard(0, ShardSpawnConfig::new(dir.path())).expect("spawn");
+    let (handle, joiner) =
+        spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
     handle.ping().await.expect("ping should succeed");
     drop(handle);
     joiner.join().expect("shard joins cleanly");
@@ -40,7 +62,8 @@ async fn ping_roundtrips() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sequential_pings_complete() {
     let dir = TempDir::new().unwrap();
-    let (handle, joiner) = spawn_shard(1, ShardSpawnConfig::new(dir.path())).expect("spawn");
+    let (handle, joiner) =
+        spawn_shard(1, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
     for _ in 0..100 {
         handle.ping().await.expect("ping should succeed");
     }
@@ -51,7 +74,8 @@ async fn sequential_pings_complete() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_pings_via_cloned_handles() {
     let dir = TempDir::new().unwrap();
-    let (handle, joiner) = spawn_shard(2, ShardSpawnConfig::new(dir.path())).expect("spawn");
+    let (handle, joiner) =
+        spawn_shard(2, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
 
     let mut joins = Vec::with_capacity(50);
     for _ in 0..50 {
@@ -68,7 +92,8 @@ async fn concurrent_pings_via_cloned_handles() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_last_handle_lets_joiner_complete() {
     let dir = TempDir::new().unwrap();
-    let (handle, joiner) = spawn_shard(3, ShardSpawnConfig::new(dir.path())).expect("spawn");
+    let (handle, joiner) =
+        spawn_shard(3, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
     handle.ping().await.expect("ping pre-drop");
 
     drop(handle);
@@ -83,7 +108,7 @@ async fn pin_to_invalid_cpu_errors() {
     let dir = TempDir::new().unwrap();
     let cfg = ShardSpawnConfig {
         pin_cpu: Some(usize::MAX),
-        ..ShardSpawnConfig::new(dir.path().to_owned())
+        ..ShardSpawnConfig::new(dir.path().to_owned(), stub())
     };
     match spawn_shard(4, cfg) {
         Ok(_) => panic!("spawn should fail for invalid CPU id usize::MAX"),
@@ -95,7 +120,8 @@ async fn pin_to_invalid_cpu_errors() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ping_after_drop_fails_cleanly() {
     let dir = TempDir::new().unwrap();
-    let (handle, joiner) = spawn_shard(5, ShardSpawnConfig::new(dir.path())).expect("spawn");
+    let (handle, joiner) =
+        spawn_shard(5, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
     let extra = handle.clone();
     drop(handle);
     extra.ping().await.expect("extra clone can still ping");
@@ -123,7 +149,8 @@ fn shard_handle_send_sync_at_use_site() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn arena_first_spawn_creates_files() {
     let dir = TempDir::new().unwrap();
-    let (handle, joiner) = spawn_shard(0, ShardSpawnConfig::new(dir.path())).expect("spawn");
+    let (handle, joiner) =
+        spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
     drop(handle);
     tokio::task::spawn_blocking(move || joiner.join())
         .await
@@ -141,7 +168,8 @@ async fn arena_first_spawn_creates_files() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn arena_alloc_returns_sequential_indices() {
     let dir = TempDir::new().unwrap();
-    let (handle, joiner) = spawn_shard(0, ShardSpawnConfig::new(dir.path())).expect("spawn");
+    let (handle, joiner) =
+        spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
     let a = handle.alloc_slot().await.expect("alloc 1");
     let b = handle.alloc_slot().await.expect("alloc 2");
     let c = handle.alloc_slot().await.expect("alloc 3");
@@ -168,7 +196,7 @@ async fn arena_uuid_persists_across_restarts() {
 
     let (uuid_before, arena_len_before) = {
         let (handle, joiner) =
-            spawn_shard(0, ShardSpawnConfig::new(dir.path())).expect("spawn 1st");
+            spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn 1st");
         // Alloc twice. These slots end up in PENDING_WRITE state — the
         // encoder (9.7) is responsible for promoting to OCCUPIED; on the
         // current scaffold they're correctly reclaimed by the allocator
@@ -188,7 +216,7 @@ async fn arena_uuid_persists_across_restarts() {
     // Re-spawn on the same dir.
     {
         let (handle, joiner) =
-            spawn_shard(0, ShardSpawnConfig::new(dir.path())).expect("spawn 2nd");
+            spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn 2nd");
         let uuid_after = std::fs::read(&uuid_path).unwrap();
         assert_eq!(uuid_before, uuid_after, "UUID must persist across restarts");
         let arena_len_after = std::fs::metadata(&arena_path).unwrap().len();
@@ -216,7 +244,7 @@ async fn shard_uuid_mismatch_errors_on_reopen() {
 
     // First spawn writes the UUID.
     let (handle, joiner) =
-        spawn_shard(0, ShardSpawnConfig::new(dir.path())).expect("spawn initial");
+        spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn initial");
     drop(handle);
     tokio::task::spawn_blocking(move || joiner.join())
         .await
@@ -228,7 +256,7 @@ async fn shard_uuid_mismatch_errors_on_reopen() {
     let uuid_path = dir.path().join("0").join("shard.uuid");
     std::fs::write(&uuid_path, [0u8; 16]).unwrap();
 
-    match spawn_shard(0, ShardSpawnConfig::new(dir.path())) {
+    match spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())) {
         Ok(_) => panic!("expected mismatch error"),
         Err(ShardError::ArenaOpen(e)) => {
             // Either ShardUuidMismatch (the spec-shaped case) or one of
@@ -250,7 +278,7 @@ async fn shard_uuid_mismatch_errors_on_reopen() {
 async fn data_dir_under_nested_path() {
     let dir = TempDir::new().unwrap();
     let nested = dir.path().join("a").join("b").join("c");
-    let (handle, joiner) = spawn_shard(7, ShardSpawnConfig::new(&nested)).expect("spawn");
+    let (handle, joiner) = spawn_shard(7, ShardSpawnConfig::new(&nested, stub())).expect("spawn");
     handle.ping().await.expect("ping");
     drop(handle);
     tokio::task::spawn_blocking(move || joiner.join())
@@ -306,7 +334,8 @@ fn read_shard_uuid(shard_dir: &std::path::Path) -> [u8; 16] {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wal_first_spawn_creates_segment_zero() {
     let dir = TempDir::new().unwrap();
-    let (handle, joiner) = spawn_shard(0, ShardSpawnConfig::new(dir.path())).expect("spawn");
+    let (handle, joiner) =
+        spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
     drop(handle);
     tokio::task::spawn_blocking(move || joiner.join())
         .await
@@ -324,7 +353,8 @@ async fn wal_first_spawn_creates_segment_zero() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_wal_record_returns_lsn() {
     let dir = TempDir::new().unwrap();
-    let (handle, joiner) = spawn_shard(0, ShardSpawnConfig::new(dir.path())).expect("spawn");
+    let (handle, joiner) =
+        spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
     let lsn1 = handle.append_wal_record(encode_record(0, 1)).await.unwrap();
     let lsn2 = handle.append_wal_record(encode_record(1, 2)).await.unwrap();
     let lsn3 = handle.append_wal_record(encode_record(2, 3)).await.unwrap();
@@ -341,7 +371,8 @@ async fn append_wal_record_returns_lsn() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wal_records_visible_to_reader_after_shutdown() {
     let dir = TempDir::new().unwrap();
-    let (handle, joiner) = spawn_shard(0, ShardSpawnConfig::new(dir.path())).expect("spawn");
+    let (handle, joiner) =
+        spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
     for slot in 0..3u64 {
         handle
             .append_wal_record(encode_record(slot, slot as u8))
@@ -368,7 +399,8 @@ async fn wal_persists_across_restart() {
 
     // Run 1: write 2 records, clean shutdown.
     {
-        let (handle, joiner) = spawn_shard(0, ShardSpawnConfig::new(&data_path)).expect("spawn 1");
+        let (handle, joiner) =
+            spawn_shard(0, ShardSpawnConfig::new(&data_path, stub())).expect("spawn 1");
         handle.append_wal_record(encode_record(0, 1)).await.unwrap();
         handle.append_wal_record(encode_record(1, 2)).await.unwrap();
         drop(handle);
@@ -379,7 +411,8 @@ async fn wal_persists_across_restart() {
     }
     // Run 2: re-spawn; recovery seeds next_lsn at 3; next append returns 3.
     {
-        let (handle, joiner) = spawn_shard(0, ShardSpawnConfig::new(&data_path)).expect("spawn 2");
+        let (handle, joiner) =
+            spawn_shard(0, ShardSpawnConfig::new(&data_path, stub())).expect("spawn 2");
         let lsn = handle.append_wal_record(encode_record(2, 3)).await.unwrap();
         assert_eq!(lsn, 3, "LSN continues across restart");
         drop(handle);
@@ -406,7 +439,8 @@ async fn wal_persists_across_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shard_constructs_full_ops_stack() {
     let dir = TempDir::new().unwrap();
-    let (handle, joiner) = spawn_shard(0, ShardSpawnConfig::new(dir.path())).expect("spawn");
+    let (handle, joiner) =
+        spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
     handle.ping().await.expect("ping");
     let (slot, _ver) = handle.alloc_slot().await.expect("alloc");
     assert_eq!(slot, 0);
@@ -430,7 +464,8 @@ async fn shard_constructs_full_ops_stack() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shard_shutdown_drains_workers_cleanly() {
     let dir = TempDir::new().unwrap();
-    let (handle, joiner) = spawn_shard(0, ShardSpawnConfig::new(dir.path())).expect("spawn");
+    let (handle, joiner) =
+        spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
     handle
         .ping()
         .await

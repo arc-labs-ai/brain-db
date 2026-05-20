@@ -61,7 +61,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use brain_core::{ShardId, SlotVersion};
-use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
+use brain_embed::{Dispatcher, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
 use brain_ops::error::OpError;
@@ -267,6 +267,14 @@ pub struct ShardSpawnConfig {
     /// Phase E: per-shard extractor pipeline knobs. Same shape as
     /// `auto_edge` — `enabled=false` skips registration entirely.
     pub extractor: ExtractorSpawnConfig,
+    /// Text → vector dispatcher used inside the shard's executor.
+    ///
+    /// The same `Arc` is cloned into every shard at process startup so
+    /// the ~130 MiB BERT weights are loaded once and shared across all
+    /// N shards (spec §04/03 §7 "weights shared via Arc<Model>"). In
+    /// production this is a `CachingDispatcher<CpuDispatcher>`; tests
+    /// inject a file-local stub.
+    pub dispatcher: Arc<dyn Dispatcher>,
 }
 
 /// Knobs ferried from `Config.workers.auto_edge` into the spawn path.
@@ -322,9 +330,12 @@ impl Default for ExtractorSpawnConfig {
 }
 
 impl ShardSpawnConfig {
-    /// Construct with arena under `data_dir`, all other knobs defaulted.
+    /// Construct with arena under `data_dir`, every other knob
+    /// defaulted. The caller supplies the embedding `dispatcher`
+    /// because a real `CpuDispatcher` requires a ~130 MiB model load
+    /// that can't reasonably default; tests pass in their own stub.
     #[must_use]
-    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(data_dir: impl Into<PathBuf>, dispatcher: Arc<dyn Dispatcher>) -> Self {
         Self {
             channel_capacity: 1024,
             pin_cpu: None,
@@ -334,6 +345,7 @@ impl ShardSpawnConfig {
             summarizer: Arc::new(DisabledSummarizer),
             auto_edge: AutoEdgeSpawnConfig::default(),
             extractor: ExtractorSpawnConfig::default(),
+            dispatcher,
         }
     }
 }
@@ -818,29 +830,10 @@ struct Shard {
     hnsw_shared: SharedHnsw<{ VECTOR_DIM }>,
 }
 
-/// Stub dispatcher used until 9.10 wires the config-driven CpuDispatcher.
-/// Returns zero vectors + an all-zero fingerprint — sufficient for the
-/// 9.7b smoke tests (which don't exercise encode/recall correctness).
-struct NopDispatcher;
-
-impl Dispatcher for NopDispatcher {
-    fn embed(&self, _: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
-        Ok([0.0; VECTOR_DIM])
-    }
-    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
-        Ok(vec![[0.0; VECTOR_DIM]; texts.len()])
-    }
-    fn fingerprint(&self) -> [u8; 16] {
-        [0; 16]
-    }
-}
-
 /// Register every Phase-8 worker against `scheduler`. Sub-task 9.8
 /// plugs in real adapters for `RebuildSource`, `WalRetentionSource`,
-/// and `SnapshotSource`. `CacheEvictionSource` stays `Disabled*` until
-/// 9.10 wires a real `CachingDispatcher` per shard. Sub-task 9.15
-/// surfaces the `Summarizer` parameter so `main.rs` can inject an
-/// OpenAI / Ollama adapter when configured.
+/// and `SnapshotSource`. `Summarizer` is injected by `main.rs` (OpenAI
+/// / Ollama if configured, `DisabledSummarizer` otherwise).
 fn register_phase8_workers(
     scheduler: &mut WorkerScheduler,
     ops: Arc<OpsContext>,
@@ -990,6 +983,11 @@ pub fn spawn_shard(
         };
     let auto_edge_metrics_for_closure = auto_edge_metrics_for_handle.clone();
     let extractor_metrics_for_closure = extractor_metrics_for_handle.clone();
+    // Clone the process-wide dispatcher Arc into the executor closure.
+    // The CachingDispatcher<CpuDispatcher> built once in main.rs is
+    // shared across every shard so the BERT weights live in memory
+    // exactly once no matter how many shards spawn.
+    let dispatcher_for_closure = cfg.dispatcher.clone();
     let wal_dir_for_executor = wal_dir.clone();
     let arena_path_for_executor = arena_path.clone();
     let metadata_path_for_executor = metadata_path.clone();
@@ -1004,8 +1002,7 @@ pub fn spawn_shard(
             let (hnsw_shared, hnsw_writer) =
                 SharedHnsw::<{ VECTOR_DIM }>::new(IndexParams::default_v1())
                     .expect("SharedHnsw::new");
-            // Stub dispatcher — 9.10's frame dispatcher swaps in a real CpuDispatcher.
-            let dispatcher: Arc<dyn Dispatcher> = Arc::new(NopDispatcher);
+            let dispatcher: Arc<dyn Dispatcher> = dispatcher_for_closure;
             // 23.1: per-shard semantic retriever. Reuses the
             // executor's embedder + the shared memory HNSW
             // reader; statement HNSW handle is None in v1.
@@ -1948,7 +1945,29 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brain_embed::EmbedError;
     use tempfile::TempDir;
+
+    /// File-local stub: substrate tests don't exercise embedding
+    /// quality and we don't want to load a ~130 MiB BERT model per
+    /// `cargo test` invocation. Production paths go through the real
+    /// `CachingDispatcher<CpuDispatcher>` built in `main.rs`.
+    struct TestStubDispatcher;
+    impl Dispatcher for TestStubDispatcher {
+        fn embed(&self, _: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+            Ok([0.0; VECTOR_DIM])
+        }
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+            Ok(vec![[0.0; VECTOR_DIM]; texts.len()])
+        }
+        fn fingerprint(&self) -> [u8; 16] {
+            [0; 16]
+        }
+    }
+
+    fn stub_dispatcher() -> Arc<dyn Dispatcher> {
+        Arc::new(TestStubDispatcher)
+    }
 
     #[test]
     fn shard_handle_is_send_sync_compile_check() {
@@ -1958,7 +1977,7 @@ mod tests {
 
     #[test]
     fn shard_spawn_config_new_uses_arena_default_capacity() {
-        let cfg = ShardSpawnConfig::new("/tmp/example");
+        let cfg = ShardSpawnConfig::new("/tmp/example", stub_dispatcher());
         assert_eq!(cfg.channel_capacity, 1024);
         assert_eq!(cfg.pin_cpu, None);
         assert_eq!(
@@ -1999,7 +2018,7 @@ mod tests {
     #[test]
     fn spawn_unbound_and_join() {
         let dir = TempDir::new().unwrap();
-        let cfg = ShardSpawnConfig::new(dir.path());
+        let cfg = ShardSpawnConfig::new(dir.path(), stub_dispatcher());
         let (handle, joiner) =
             spawn_shard(0, cfg).expect("Glommio spawn should succeed with Unbound placement");
         assert_eq!(handle.shard_id(), 0);
@@ -2013,7 +2032,7 @@ mod tests {
     #[test]
     fn spawn_creates_knowledge_directories() {
         let dir = TempDir::new().unwrap();
-        let cfg = ShardSpawnConfig::new(dir.path());
+        let cfg = ShardSpawnConfig::new(dir.path(), stub_dispatcher());
         let (handle, joiner) = spawn_shard(3, cfg).expect("spawn");
         // Stop the executor before inspecting state so the test isn't
         // racing with shard startup.

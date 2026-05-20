@@ -93,6 +93,63 @@ pub struct EmbedderConfig {
     pub batch_window_ms: u32,
 }
 
+impl EmbedderConfig {
+    /// Resolve the on-disk directory containing the embedding model
+    /// files (`config.json`, `tokenizer.json`, `model.safetensors`).
+    ///
+    /// Priority cascade:
+    ///   1. `BRAIN_EMBED_MODEL_DIR` env var if set (must be absolute).
+    ///   2. `self.model` if it starts with `/` (absolute path literal).
+    ///   3. `$XDG_DATA_HOME/brain/models/<self.model>` (XDG default).
+    ///   4. `~/.local/share/brain/models/<self.model>` (fallback).
+    ///
+    /// Path resolution only; existence checks belong to the loader. The
+    /// env-override slot lets devs point at any local checkout without
+    /// editing TOML; the XDG default keeps the no-config first-run
+    /// experience clean.
+    #[allow(dead_code)] // consumed by main.rs on Linux; unused on non-Linux stub builds.
+    pub fn resolve_model_dir(&self) -> Result<PathBuf, ConfigError> {
+        self.resolve_model_dir_with(&|k| std::env::var(k).ok())
+    }
+
+    /// Same as [`resolve_model_dir`] but reads env via the supplied
+    /// closure so tests can drive the cascade without touching the
+    /// global process environment.
+    pub fn resolve_model_dir_with<F>(&self, env: &F) -> Result<PathBuf, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        if let Some(env_path) = env("BRAIN_EMBED_MODEL_DIR") {
+            let p = PathBuf::from(env_path);
+            if !p.is_absolute() {
+                return Err(ConfigError::Invariant(format!(
+                    "BRAIN_EMBED_MODEL_DIR must be an absolute path; got {}",
+                    p.display()
+                )));
+            }
+            return Ok(p);
+        }
+        let model = &self.model;
+        if model.starts_with('/') {
+            return Ok(PathBuf::from(model));
+        }
+        if let Some(xdg) = env("XDG_DATA_HOME") {
+            return Ok(PathBuf::from(xdg).join("brain").join("models").join(model));
+        }
+        if let Some(home) = env("HOME") {
+            return Ok(PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("brain")
+                .join("models")
+                .join(model));
+        }
+        Err(ConfigError::Invariant(format!(
+            "cannot resolve model directory for '{model}': set BRAIN_EMBED_MODEL_DIR or HOME",
+        )))
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkersConfig {
@@ -770,6 +827,83 @@ mod tests {
         set_path(&mut value, &["a".into(), "b".into()], "0.0.0.0:8080");
         let s = value["a"]["b"].as_str().unwrap();
         assert_eq!(s, "0.0.0.0:8080");
+    }
+
+    fn embedder(model: &str) -> EmbedderConfig {
+        EmbedderConfig {
+            model: model.to_owned(),
+            cache_size: 1,
+            batch_size: 1,
+            batch_window_ms: 1,
+        }
+    }
+
+    #[test]
+    fn resolve_model_dir_honours_env() {
+        let cfg = embedder("bge-small-en-v1.5");
+        let env = |k: &str| match k {
+            "BRAIN_EMBED_MODEL_DIR" => Some("/var/lib/brain/models/x".to_owned()),
+            _ => None,
+        };
+        let p = cfg.resolve_model_dir_with(&env).unwrap();
+        assert_eq!(p, PathBuf::from("/var/lib/brain/models/x"));
+    }
+
+    #[test]
+    fn resolve_model_dir_honours_absolute_path() {
+        let cfg = embedder("/opt/models/bge");
+        let env = |_: &str| None;
+        let p = cfg.resolve_model_dir_with(&env).unwrap();
+        assert_eq!(p, PathBuf::from("/opt/models/bge"));
+    }
+
+    #[test]
+    fn resolve_model_dir_xdg_default() {
+        let cfg = embedder("bge-small-en-v1.5");
+        let env = |k: &str| match k {
+            "XDG_DATA_HOME" => Some("/home/dev/.local/share".to_owned()),
+            _ => None,
+        };
+        let p = cfg.resolve_model_dir_with(&env).unwrap();
+        assert_eq!(
+            p,
+            PathBuf::from("/home/dev/.local/share/brain/models/bge-small-en-v1.5"),
+        );
+    }
+
+    #[test]
+    fn resolve_model_dir_home_fallback() {
+        let cfg = embedder("bge-small-en-v1.5");
+        let env = |k: &str| match k {
+            "HOME" => Some("/home/dev".to_owned()),
+            _ => None,
+        };
+        let p = cfg.resolve_model_dir_with(&env).unwrap();
+        assert_eq!(
+            p,
+            PathBuf::from("/home/dev/.local/share/brain/models/bge-small-en-v1.5"),
+        );
+    }
+
+    #[test]
+    fn resolve_model_dir_rejects_relative_env() {
+        let cfg = embedder("bge-small-en-v1.5");
+        let env = |k: &str| match k {
+            "BRAIN_EMBED_MODEL_DIR" => Some("relative/path".to_owned()),
+            _ => None,
+        };
+        let err = cfg.resolve_model_dir_with(&env).unwrap_err();
+        assert!(matches!(err, ConfigError::Invariant(ref m) if m.contains("absolute")));
+    }
+
+    #[test]
+    fn resolve_model_dir_errors_without_env_or_home() {
+        let cfg = embedder("bge-small-en-v1.5");
+        let env = |_: &str| None;
+        assert!(matches!(
+            cfg.resolve_model_dir_with(&env),
+            Err(ConfigError::Invariant(_))
+        ));
     }
 
     #[test]
