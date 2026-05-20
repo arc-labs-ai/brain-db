@@ -1,22 +1,22 @@
 //! Apply functions for entity-shaped phases.
 //!
-//! Implemented in P2b:
+//! Implemented:
 //! - apply_upsert_entity         — entity_ops::entity_put
 //! - apply_tombstone_entity      — entity_ops::entity_tombstone
+//! - apply_resolve               — extractors::resolver::resolve_or_create
 //!
-//! Deferred:
-//! - apply_resolve               — the resolver gauntlet needs to run
-//!   ahead of the write; the apply function would just persist what's
-//!   already been decided. Lands when handler migration drives demand.
+//! Still deferred:
 //! - apply_merge_entities        — complex aliases / attributes /
-//!   edge-rewrite logic in handle_entity_merge that needs careful
+//!   edge-rewrite logic from handle_entity_merge that needs careful
 //!   porting. Stays NotYetImplemented until a follow-up slice.
 
 use brain_core::knowledge::Entity;
+use brain_extractors::resolver::resolve_or_create;
 use brain_metadata::entity_ops::{entity_put, entity_tombstone};
 use redb::WriteTransaction;
 
 use super::ApplyError;
+use crate::write::phase::ResolveTier;
 use crate::write::{Phase, PhaseAck, TombstoneTarget, Write};
 
 pub fn apply_upsert_entity(
@@ -69,11 +69,41 @@ pub fn apply_tombstone_entity(
 }
 
 pub fn apply_resolve(
-    _wtxn: &WriteTransaction,
-    _phase: &Phase,
-    _write: &Write,
+    wtxn: &WriteTransaction,
+    phase: &Phase,
+    write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
-    Err(ApplyError::NotYetImplemented("Resolve"))
+    let Phase::Resolve {
+        surface,
+        ty_qname,
+        confidence,
+        context: _,
+    } = phase
+    else {
+        return Err(ApplyError::PhaseMisShape("expected Resolve"));
+    };
+    // The resolver needs a clock for entity-creation provenance.
+    // Apply functions don't read the clock — we pull from
+    // write.started_at_unix_nanos (stamped by the handler at submit
+    // time). Zero falls back to 1 so the resolver doesn't think the
+    // entity was created at the unix epoch.
+    let now = write.started_at_unix_nanos.max(1);
+    let res = resolve_or_create(wtxn, surface, ty_qname, *confidence, now)
+        .map_err(|e| ApplyError::Metadata(format!("resolve_or_create: {e}")))?;
+    Ok(PhaseAck::Resolved {
+        result_id: res.entity_id,
+        tier: map_resolution_tier(res.tier),
+    })
+}
+
+fn map_resolution_tier(t: brain_extractors::resolver::ResolutionTier) -> ResolveTier {
+    use brain_extractors::resolver::ResolutionTier as RT;
+    match t {
+        RT::Exact => ResolveTier::Exact,
+        RT::Alias => ResolveTier::Alias,
+        RT::Fuzzy => ResolveTier::Fuzzy,
+        RT::Created => ResolveTier::Created,
+    }
 }
 
 pub fn apply_merge_entities(
@@ -131,6 +161,46 @@ mod tests {
         let got = brain_metadata::entity_ops::entity_get(&rtxn, id).unwrap();
         let e = got.expect("entity must exist after upsert");
         assert_eq!(e.canonical_name, "Alice");
+    }
+
+    #[test]
+    fn resolve_creates_entity_on_first_lookup() {
+        let (_dir, mut db) = open_db();
+        let phase = Phase::Resolve {
+            surface: "Priya Sharma".into(),
+            ty_qname: "brain:Person".into(),
+            confidence: 0.95,
+            context: crate::write::ResolveContext::Global,
+        };
+        let write = Write {
+            write_id: WriteId::new(),
+            agent_id: brain_core::AgentId::default(),
+            started_at_unix_nanos: 1_700_000_000_000,
+            phases: vec![],
+        };
+
+        let wtxn = db.write_txn().unwrap();
+        let ack = apply_resolve(&wtxn, &phase, &write).expect("resolve");
+        wtxn.commit().unwrap();
+
+        let PhaseAck::Resolved { result_id, tier } = ack else {
+            panic!("expected PhaseAck::Resolved");
+        };
+        assert_eq!(tier, ResolveTier::Created);
+
+        // Calling again returns the same id with Exact tier.
+        let wtxn = db.write_txn().unwrap();
+        let ack2 = apply_resolve(&wtxn, &phase, &write).expect("resolve replay");
+        wtxn.commit().unwrap();
+        let PhaseAck::Resolved {
+            result_id: id2,
+            tier: tier2,
+        } = ack2
+        else {
+            panic!("expected PhaseAck::Resolved");
+        };
+        assert_eq!(id2, result_id);
+        assert_eq!(tier2, ResolveTier::Exact);
     }
 
     #[test]
