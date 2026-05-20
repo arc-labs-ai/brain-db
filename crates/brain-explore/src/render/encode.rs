@@ -541,7 +541,10 @@ mod tests {
         let mut r = sample();
         r.response.created_at_unix_nanos = 1_700_000_000_000_000_000;
         let out = render(&r, OutputFormat::Wide);
-        assert!(out.contains("created"), "wide must label created row: {out}");
+        assert!(
+            out.contains("created"),
+            "wide must label created row: {out}"
+        );
         assert!(
             out.contains("1700000000000000000 unix-nanos"),
             "wide must show raw nanos: {out}"

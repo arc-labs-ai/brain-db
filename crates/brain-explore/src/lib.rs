@@ -20,11 +20,12 @@ pub mod util;
 
 pub use format::{dispatch, OutputFormat, Render, RenderCtx};
 pub use render::{
-    AdHocTable, AuditCard, EncodeRendered, EntityCard, GraphEnrichment, GraphNode, GraphTree,
-    LinkRendered, MemorySummary, ObjectRef, PlanSteps, ReasonSteps, RecallResults, RecallWithGraph,
-    RelationCard, RelationSummary, RenderableError, StatementCard, StatementSummary,
-    SubscriptionEventList, SubscriptionEventRendered, TxnAbortRendered, TxnBeginRendered,
-    TxnCommitRendered, UnlinkRendered,
+    AdHocTable, AgentInfo, AuditCard, ConnectionInfo, EncodeRendered, EntityCard, GraphEnrichment,
+    GraphNode, GraphTree, InfoCard, LinkRendered, MemorySummary, ObjectRef, PlanSteps, ReasonSteps,
+    RecallResults, RecallWithGraph, RelationCard, RelationSummary, RenderableError, ServerInfo,
+    ServerWelcomeFields, SessionInfo, StatementCard, StatementSummary, SubscriptionEventList,
+    SubscriptionEventRendered, TxnAbortRendered, TxnBeginRendered, TxnCommitRendered,
+    UnlinkRendered,
 };
 pub use term::policy::TermPolicy;
 pub use theme::{Theme, Token};

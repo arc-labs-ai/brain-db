@@ -86,6 +86,25 @@ pub async fn run(
                 Some(Command::GenerateCompletion(_)) => {
                     eprintln!("generate-completion is only available as a one-shot subcommand");
                 }
+                Some(Command::Info) => {
+                    // Mirror the `\info` meta — the bare verb is here so
+                    // users who type `info` (no backslash) get the same
+                    // diagnostic instead of a clap parse error.
+                    let card =
+                        commands::info::collect(&client, &session, agent_id, &agent_source).await;
+                    let ctx = render_ctx(
+                        cli.global
+                            .output
+                            .clone()
+                            .unwrap_or_else(|| session.output.clone()),
+                        cli.global.color,
+                        cli.global.hyperlinks,
+                    );
+                    let mut stdout = std::io::stdout();
+                    if let Err(e) = brain_explore::dispatch(&card, &ctx, &mut stdout) {
+                        eprintln!("output error: {e}");
+                    }
+                }
                 Some(cmd) => {
                     run_one(&client, &mut session, cmd, &cli.global).await;
                 }
@@ -180,7 +199,9 @@ async fn run_one(
             eprintln!("use `\\config <subcommand>` or `\\agent <subcommand>` inside the REPL");
             return;
         }
-        Command::Shell | Command::GenerateCompletion(_) => unreachable!("filtered above"),
+        Command::Shell | Command::Info | Command::GenerateCompletion(_) => {
+            unreachable!("filtered above")
+        }
     };
     let elapsed = started.elapsed();
     let elapsed_ms = if session.timing {
@@ -260,6 +281,7 @@ fn inherits_active_txn(cmd: &Command) -> bool {
         | Command::Config(_)
         | Command::Agent(_)
         | Command::Shell
+        | Command::Info
         | Command::GenerateCompletion(_) => false,
     }
 }
@@ -278,6 +300,7 @@ enum Meta {
     Agent,
     AgentSub(AgentSub),
     ConfigSub(ConfigSub),
+    Info,
     Unknown(String),
 }
 
@@ -339,6 +362,10 @@ fn parse_meta(line: &str) -> Option<Meta> {
 
     if lower == "\\unset txn" {
         return Some(Meta::UnsetTxn);
+    }
+
+    if lower == "\\info" {
+        return Some(Meta::Info);
     }
 
     // `\agent` and `\agent <subcommand …>`
@@ -478,6 +505,19 @@ async fn handle_meta(
         }
         Meta::ConfigSub(sub) => {
             handle_config_sub(sub, session);
+            false
+        }
+        Meta::Info => {
+            let card = commands::info::collect(client, session, agent_id, agent_source).await;
+            let ctx = render_ctx(
+                session.output.clone(),
+                crate::parser::ColorMode::Auto,
+                crate::parser::HyperlinkMode::Auto,
+            );
+            let mut stdout = std::io::stdout();
+            if let Err(e) = brain_explore::dispatch(&card, &ctx, &mut stdout) {
+                eprintln!("output error: {e}");
+            }
             false
         }
         Meta::Unknown(s) => {

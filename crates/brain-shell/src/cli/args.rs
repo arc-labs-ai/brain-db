@@ -208,6 +208,27 @@ pub async fn dispatch_argv(argv: Vec<String>) -> ExitCode {
                     .await
                     .map(|r| (op, r))
             }
+            Command::Info => {
+                // `brain info` runs the same diagnostic the REPL's
+                // `\info` meta does. It's handled here (rather than
+                // alongside `config` / `agent` above) so the agent
+                // resolver and `connect` attempt have already run —
+                // the card needs both to fill in the Server +
+                // Connection blocks.
+                let card =
+                    commands::info::collect(&client, &session, agent_id, &agent_source).await;
+                let ctx = render_ctx(
+                    session.output.clone(),
+                    cli.global.color,
+                    cli.global.hyperlinks,
+                );
+                let mut stdout = std::io::stdout();
+                if let Err(e) = brain_explore::dispatch(&card, &ctx, &mut stdout) {
+                    eprintln!("output error: {e}");
+                    return ExitCode::from(1);
+                }
+                return ExitCode::SUCCESS;
+            }
             Command::Config(_)
             | Command::Agent(_)
             | Command::Shell

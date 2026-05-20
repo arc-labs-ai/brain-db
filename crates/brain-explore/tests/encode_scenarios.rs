@@ -58,7 +58,10 @@ fn fresh_encode_table_shows_check_id_lsn_and_content_echo() {
     let out = render(item, OutputFormat::Table);
 
     // Heading
-    assert!(out.contains("encoded"), "missing fresh-encode heading: {out}");
+    assert!(
+        out.contains("encoded"),
+        "missing fresh-encode heading: {out}"
+    );
     assert!(out.contains("LSN 1"), "missing LSN line: {out}");
 
     // Content echo (the text the substrate received — confirmation
@@ -81,7 +84,10 @@ fn fresh_encode_table_shows_check_id_lsn_and_content_echo() {
 
     // Defensive: nil agent + zero fingerprint must NOT leak into
     // default-mode output. They're wide-mode-only.
-    assert!(!out.contains("agent "), "nil agent leaked into default view: {out}");
+    assert!(
+        !out.contains("agent "),
+        "nil agent leaked into default view: {out}"
+    );
     assert!(
         !out.contains("00000000"),
         "zero-bytes leaked into default view: {out}"
@@ -105,7 +111,10 @@ fn dedup_hit_table_shows_alt_glyph_and_no_fresh_write_signal() {
     // The dedup-hit signal is the heading. It must not say "encoded"
     // (would be a regression to the old behavior where the user got
     // no signal that the content matched).
-    assert!(out.contains("dedup hit"), "missing dedup-hit heading: {out}");
+    assert!(
+        out.contains("dedup hit"),
+        "missing dedup-hit heading: {out}"
+    );
 
     // No "LSN N" — there's no fresh LSN to chain off.
     assert!(
@@ -145,7 +154,10 @@ fn wide_mode_surfaces_stub_embedder_warning_when_fingerprint_is_zeros() {
 
     // Wide adds the agent / embedder / edges block.
     assert!(out.contains("agent"), "wide must surface agent row: {out}");
-    assert!(out.contains("embedder"), "wide must surface embedder row: {out}");
+    assert!(
+        out.contains("embedder"),
+        "wide must surface embedder row: {out}"
+    );
 
     // The honesty signal: server today uses NopDispatcher, so the
     // embedder fingerprint is [0; 16]. The renderer must say so
@@ -153,12 +165,17 @@ fn wide_mode_surfaces_stub_embedder_warning_when_fingerprint_is_zeros() {
     // When 9.10 wires the real CpuDispatcher this row flips to
     // "fp <short hex>" and this test will need to be updated.
     assert!(
-        out.contains("stub") || out.contains("NopDispatcher") || out.contains("semantic search inactive"),
+        out.contains("stub")
+            || out.contains("NopDispatcher")
+            || out.contains("semantic search inactive"),
         "wide must call out the stub embedder honestly: {out}"
     );
 
     // Default mode is still in the output — wide ADDS, doesn't replace.
-    assert!(out.contains("encoded"), "wide must still show the heading: {out}");
+    assert!(
+        out.contains("encoded"),
+        "wide must still show the heading: {out}"
+    );
     assert!(
         out.contains("Alice merged the auth-rewrite branch"),
         "wide must still echo source text: {out}"
@@ -179,8 +196,7 @@ fn json_view_emits_raw_zero_lsn_and_raw_was_deduplicated() {
     let item = EncodeRendered::new(resp);
     let out = render(item, OutputFormat::Json);
 
-    let value: serde_json::Value =
-        serde_json::from_str(&out).expect("json output must parse");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("json output must parse");
 
     // The JSON view is the machine-readable surface. The 0 sentinel
     // is a table-view concern; consumers parse the raw u64 and apply
@@ -212,8 +228,7 @@ fn auto_format_on_non_tty_routes_to_ndjson_one_record_per_line() {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines.len(), 1, "expected single ndjson record: {out:?}");
 
-    let value: serde_json::Value =
-        serde_json::from_str(lines[0]).expect("ndjson line must parse");
+    let value: serde_json::Value = serde_json::from_str(lines[0]).expect("ndjson line must parse");
     assert!(value.is_object(), "expected JSON object: {value}");
     assert_eq!(value["lsn"], 1);
 }

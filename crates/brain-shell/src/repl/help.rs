@@ -52,6 +52,9 @@ fn top_level() -> String {
     s.push_str("  \\unset txn                       drop the active transaction\n");
     s.push_str("  \\timing on|off                   per-op wall time\n");
     s.push_str("  \\connect <host:port>             reconnect to a different server\n");
+    s.push_str(
+        "  \\info                            server / agent / connection / session diagnostic\n",
+    );
     s.push_str("\nPersisted (writes ~/.config/brain/config.toml):\n");
     s.push_str("  \\config list                     show effective settings\n");
     s.push_str("  \\config get <key>                read a single setting\n");
@@ -140,6 +143,7 @@ Session-only (lost on quit):\n\
   \\unset txn                 drop the active transaction\n\
   \\timing on|off             show per-op wall time\n\
   \\connect <host:port>       reconnect to a different server\n\
+  \\info                      server / agent / connection / session diagnostic\n\
 \n\
 Persisted (writes ~/.config/brain/config.toml):\n\
   \\config list               show effective settings\n\

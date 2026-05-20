@@ -240,6 +240,9 @@ pub enum Command {
     Extract(ExtractCommand),
     /// Drop into the interactive REPL (default when no subcommand given).
     Shell,
+    /// Show server / agent / connection / session diagnostic info.
+    /// Same content as the REPL's `\info` meta.
+    Info,
     /// Emit a shell-completion script.
     GenerateCompletion(GenerateCompletionArgs),
 }
