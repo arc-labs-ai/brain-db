@@ -84,6 +84,39 @@ pub fn fmt_hex_16(bytes: &[u8; 16]) -> String {
     s
 }
 
+/// 32 hex chars, no `0x` prefix. Bare-bytes form for opaque
+/// fingerprints (BLAKE3-truncated, content hashes, etc.) where the
+/// `0x` is just visual noise — operators copying the value into a
+/// log search want exactly the same bytes that go on the wire.
+#[must_use]
+pub fn fmt_hex_16_bare(bytes: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(32);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Canonical UUID 8-4-4-4-12 dashed form: `01927a8b-4c2f-7000-8000-deadbeeffeed`.
+/// Use for `AgentId` / any other field that's logically a UUID — the
+/// dashes are the standard, scripts and humans both parse this shape.
+/// Skip `0x`-prefixed `fmt_hex_16` for these: the prefix is wrong for
+/// UUIDs and tools that interpret UUIDs reject it.
+#[must_use]
+pub fn fmt_uuid(bytes: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(36);
+    let pairs = [(0, 4), (4, 6), (6, 8), (8, 10), (10, 16)];
+    for (i, (start, end)) in pairs.iter().enumerate() {
+        if i > 0 {
+            s.push('-');
+        }
+        for b in &bytes[*start..*end] {
+            s.push_str(&format!("{b:02x}"));
+        }
+    }
+    s
+}
+
 #[must_use]
 pub fn fmt_kind(k: brain_protocol::request::MemoryKindWire) -> &'static str {
     match k {

@@ -47,7 +47,16 @@ pub async fn handle_encode(
         salience,
         auto_edges_added,
         lsn: result.lsn.unwrap_or(0),
-        agent_id: ctx.executor.writer.agent_id().into(),
+        // Stamp the CALLER's agent (auth-time UUID, threaded through
+        // by dispatch::dispatch into ctx.executor.caller_agent) on the
+        // response, NOT the writer's per-shard field. The writer's
+        // agent_id is shard-level state that's set at spawn and is
+        // unrelated to which agent owns the encode — leaving it on
+        // the response surface meant every EncodeResponse echoed nil
+        // (the writer's default) regardless of how the client
+        // authenticated. brain-shell's wide-mode render then read that
+        // nil and helpfully said "agent default," masking the bug.
+        agent_id: ctx.executor.caller_agent.into(),
         context_id: req.context_id,
         kind: req.kind,
         created_at_unix_nanos: result.created_at_unix_nanos,
@@ -139,7 +148,7 @@ async fn handle_encode_in_txn(
             // it. Clients chaining subscribe-from-encode inside a
             // txn must subscribe after COMMIT instead.
             lsn: 0,
-            agent_id: ctx.executor.writer.agent_id().into(),
+            agent_id: ctx.executor.caller_agent.into(),
             context_id: req.context_id,
             kind: req.kind,
             created_at_unix_nanos: 0,
@@ -273,7 +282,7 @@ async fn handle_encode_in_txn(
         auto_edges_added,
         // Buffered op — durable LSN lands at TXN_COMMIT.
         lsn: 0,
-        agent_id: ctx.executor.writer.agent_id().into(),
+        agent_id: ctx.executor.caller_agent.into(),
         context_id: req.context_id,
         kind: req.kind,
         created_at_unix_nanos: created_at,

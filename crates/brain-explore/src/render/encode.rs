@@ -20,7 +20,7 @@ use std::io::{self, Write};
 use brain_protocol::response::EncodeResponse;
 use serde_json::{json, Value};
 
-use crate::render::{fmt_hex_16, fmt_id, fmt_short_hex_16, fmt_short_id};
+use crate::render::{fmt_hex_16, fmt_hex_16_bare, fmt_id, fmt_short_id, fmt_uuid};
 use crate::table::truncate::middle_truncate;
 use crate::theme::Token;
 use crate::util::humanize::humanize_age;
@@ -198,24 +198,25 @@ fn render_human(
     if wide {
         writeln!(w)?;
 
-        // Agent — first-class Brain noun. We label the row "agent"
-        // (not "id") per project convention. The nil uuid means the
-        // connection authenticated under the default agent and the
-        // server didn't override it; surface that as "default" rather
-        // than print zeros.
+        // Agent — first-class Brain noun. Render as canonical UUID
+        // 8-4-4-4-12 dashed form so the same string drops into log
+        // searches, config files, and `brain --agent-id <uuid>`
+        // without reshaping. Nil UUID = unauthenticated / test path;
+        // render as "default" instead of 32 zeros plus dashes.
         let agent_value = if r.agent_id == [0u8; 16] {
             "default".to_string()
         } else {
-            fmt_short_hex_16(&r.agent_id)
+            fmt_uuid(&r.agent_id)
         };
         let agent_label = theme.paint(Token::Label, "agent", policy);
         writeln!(w, "  {agent_label:<10}  {agent_value}")?;
 
-        // Embedder fingerprint. The server runs `NopDispatcher` today
-        // (Phase 9.10 isn't wired), so the fingerprint is genuinely
-        // all-zeros — not a hash collision, not a missing field. We
-        // say so out loud so the operator doesn't go looking for the
-        // bug.
+        // Embedder fingerprint — bare 32-hex (no `0x`, no dashes; the
+        // canonical form for BLAKE3-truncated model fingerprints).
+        // Operators copying this match it byte-for-byte against the
+        // model directory's hashed bytes. The all-zeros special case
+        // shouldn't fire post-9.10 but the honest "(stub)" branch
+        // stays as defense-in-depth.
         let embedder_label = theme.paint(Token::Label, "embedder", policy);
         if r.embedding_model_fp == [0u8; 16] {
             let warn = theme.paint(
@@ -225,22 +226,53 @@ fn render_human(
             );
             writeln!(w, "  {embedder_label:<10}  {warn}")?;
         } else {
-            let fp = fmt_short_hex_16(&r.embedding_model_fp);
+            let fp = fmt_hex_16_bare(&r.embedding_model_fp);
             writeln!(w, "  {embedder_label:<10}  fp {fp}")?;
         }
 
-        // Edges. The wire response carries `auto_edges_added` and the
-        // total `edges_out_count`; the explicit count is whatever's
-        // left over (request-supplied edges that survived target
-        // resolution). Saturating-sub keeps the math honest even if
-        // a future server emits inconsistent counts.
+        // Edges. Wire carries `auto_edges_added` and total
+        // `edges_out_count`; explicit = total − auto. Saturating-sub
+        // keeps the math honest if a future server emits inconsistent
+        // counts. Show "total" too so operators can sanity-check
+        // against the auto / explicit split.
         let edges_label = theme.paint(Token::Label, "edges", policy);
         let explicit = r.edges_out_count.saturating_sub(r.auto_edges_added);
         writeln!(
             w,
-            "  {edges_label:<10}  {auto} auto, {explicit} explicit",
+            "  {edges_label:<10}  {auto} auto, {explicit} explicit  ({total} total)",
             auto = r.auto_edges_added,
+            total = r.edges_out_count,
         )?;
+
+        // Created — absolute unix nanos timestamp. Heading already
+        // shows the relative form ("3 ms ago") for humans; wide adds
+        // the raw nanos so operators can correlate with WAL records,
+        // tracing spans, and log timestamps. Dedup hits get this too
+        // (it's the wire's created_at, which for dedup is the time of
+        // the hit, NOT the original encode — clear distinction worth
+        // documenting in the row label).
+        let created_label = theme.paint(Token::Label, "created", policy);
+        let created_value = if r.was_deduplicated {
+            format!(
+                "{} unix-nanos  (dedup hit time, not original encode)",
+                r.created_at_unix_nanos
+            )
+        } else {
+            format!("{} unix-nanos", r.created_at_unix_nanos)
+        };
+        writeln!(w, "  {created_label:<10}  {created_value}")?;
+
+        // Dedup state — explicit bool. The heading glyph already
+        // shows fresh-vs-dedup, but having it as a key=value row
+        // makes wide-mode output scriptable: `brain encode … -o wide
+        // | grep '^  dedup'` is a deterministic check.
+        let dedup_label = theme.paint(Token::Label, "dedup", policy);
+        let dedup_value = if r.was_deduplicated {
+            "yes  (existing memory returned; no fresh write)"
+        } else {
+            "no   (fresh write)"
+        };
+        writeln!(w, "  {dedup_label:<10}  {dedup_value}")?;
     }
 
     // ── Footer hint ───────────────────────────────────────────────
@@ -448,19 +480,114 @@ mod tests {
         );
     }
 
-    // 8. Wide mode shows short fp for a real fingerprint.
+    // 8. Wide mode shows the FULL fingerprint hex (bare, no `0x`)
+    // for a real fp. Operators copying the value into log searches /
+    // model registries match against bare bytes; the `0x` prefix
+    // (used in JSON output for unambiguity) is visual noise here.
     #[test]
-    fn render_table_wide_mode_shows_short_fp_for_real_fingerprint() {
+    fn render_table_wide_mode_shows_full_fp_for_real_fingerprint() {
         let mut r = sample();
         r.response.embedding_model_fp = [
-            0x7a, 0x8b, 0x3c, 0x2d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00,
+            0x7a, 0x8b, 0x3c, 0x2d, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+            0x0b, 0x0c,
         ];
         let out = render(&r, OutputFormat::Wide);
-        assert!(out.contains("fp 7a8b3c2d…"), "expected short fp: {out}");
+        assert!(
+            out.contains("fp 7a8b3c2d0102030405060708090a0b0c"),
+            "expected full 32-hex bare fp: {out}"
+        );
+        assert!(
+            !out.contains("7a8b3c2d…"),
+            "must not use the …-truncated short form in wide: {out}"
+        );
+        assert!(
+            !out.contains("0x7a8b3c2d"),
+            "wide fp must be bare hex, no `0x` prefix: {out}"
+        );
         assert!(
             !out.contains("NopDispatcher"),
             "must not show stub warning with real fp: {out}"
+        );
+    }
+
+    // 8b. Wide mode renders the agent as a canonical 8-4-4-4-12
+    // dashed UUID — drops into `brain --agent-id <uuid>` without
+    // reshaping, parses by every UUID-aware tool.
+    #[test]
+    fn render_table_wide_mode_shows_full_agent_uuid_for_real_agent() {
+        let mut r = sample();
+        r.response.agent_id = [
+            0x01, 0x92, 0x7a, 0x8b, 0x4c, 0x2f, 0x70, 0x00, 0x80, 0x00, 0xde, 0xad, 0xbe, 0xef,
+            0xfe, 0xed,
+        ];
+        let out = render(&r, OutputFormat::Wide);
+        assert!(
+            out.contains("01927a8b-4c2f-7000-8000-deadbeeffeed"),
+            "expected canonical UUID dashed form: {out}"
+        );
+        assert!(
+            !out.contains("01927a8b…"),
+            "must not use the …-truncated short form in wide: {out}"
+        );
+        assert!(
+            !out.contains("default"),
+            "real agent must not render as 'default': {out}"
+        );
+    }
+
+    // 8c. Wide mode surfaces the absolute created_at timestamp.
+    #[test]
+    fn render_table_wide_mode_shows_created_timestamp_in_unix_nanos() {
+        let mut r = sample();
+        r.response.created_at_unix_nanos = 1_700_000_000_000_000_000;
+        let out = render(&r, OutputFormat::Wide);
+        assert!(out.contains("created"), "wide must label created row: {out}");
+        assert!(
+            out.contains("1700000000000000000 unix-nanos"),
+            "wide must show raw nanos: {out}"
+        );
+    }
+
+    // 8d. Wide mode labels the dedup state explicitly for scriptable
+    // checks like `brain encode … -o wide | grep '^  dedup'`.
+    #[test]
+    fn render_table_wide_mode_surfaces_dedup_state() {
+        let fresh = render(&sample(), OutputFormat::Wide);
+        // Assert label + value without pinning the exact whitespace
+        // between them — the column width could change without
+        // changing the contract this test cares about (the bool +
+        // its annotation are both present).
+        assert!(
+            fresh.contains("dedup") && fresh.contains("no   (fresh write)"),
+            "fresh write must report dedup=no: {fresh}"
+        );
+
+        let mut r = sample();
+        r.response.was_deduplicated = true;
+        r.response.lsn = 0;
+        let hit = render(&r, OutputFormat::Wide);
+        assert!(
+            hit.contains("dedup")
+                && hit.contains("yes  (existing memory returned; no fresh write)"),
+            "dedup hit must report dedup=yes: {hit}"
+        );
+        assert!(
+            hit.contains("dedup hit time, not original encode"),
+            "dedup hit must label its created timestamp: {hit}"
+        );
+    }
+
+    // 8e. Wide mode reports the total edge count alongside the
+    // auto/explicit split so operators can sanity-check the arithmetic.
+    #[test]
+    fn render_table_wide_mode_shows_total_edge_count() {
+        let mut r = sample();
+        r.response.auto_edges_added = 2;
+        r.response.edges_out_count = 5;
+        let out = render(&r, OutputFormat::Wide);
+        assert!(
+            out.contains("2 auto, 3 explicit  (5 total)"),
+            "wide must split + total edges: {out}"
         );
     }
 
