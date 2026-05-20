@@ -570,6 +570,7 @@ async fn recall_returns_single_frame_eos_in_v1() {
         kind_filter: None,
         salience_floor: 0.0,
         include_edges: false,
+        include_graph: false,
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id: None,

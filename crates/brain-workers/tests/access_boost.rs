@@ -401,6 +401,7 @@ fn recall_fills_buffer_then_boost_worker_applies() {
             salience_floor: 0.0,
             strategy: None,
             include_edges: false,
+            include_graph: false,
             include_text: false,
             request_id: None,
             txn_id: None,

@@ -63,6 +63,14 @@ pub struct RecallRequest {
     pub kind_filter: Option<Vec<MemoryKindWire>>,
     pub salience_floor: f32,
     pub include_edges: bool,
+    /// When set, each `MemoryResult` carries a populated
+    /// `graph: GraphEnrichment` field listing entities mentioned by
+    /// the memory, statements sourced from it, and typed relations
+    /// incident to those entities. Server-side knowledge-layer
+    /// queries; if the memory wasn't extracted (substrate-only
+    /// deployment, mention-less memory), the field is `None` even
+    /// when this flag is set.
+    pub include_graph: bool,
     /// When set, each `MemoryResult` carries the memory's stored UTF-8
     /// text. Costs one batched read against the per-shard `texts`
     /// table. When unset, `MemoryResult.text` is the empty string.

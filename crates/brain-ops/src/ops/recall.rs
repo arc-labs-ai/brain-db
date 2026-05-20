@@ -126,15 +126,34 @@ async fn substrate_recall(
     } else {
         None
     };
+    // When include_graph is set, fetch knowledge-layer enrichment
+    // (mentioned entities / sourced statements / incident typed
+    // relations) per hit. Independent of include_edges — both can be
+    // set; both share the metadata lock but each opens its own read
+    // txn for now (cheap; future optimisation can fold them).
+    let graph_per_hit = if req.include_graph {
+        let ids: Vec<MemoryId> = hits.iter().map(|h| h.memory_id).collect();
+        let db_guard = ctx.executor.metadata.lock();
+        let rtxn = db_guard.read_txn().map_err(|e| {
+            OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
+        })?;
+        Some(fetch_enrichment_for(&ids, &rtxn)?)
+    } else {
+        None
+    };
 
     let results: Vec<MemoryResult> = hits
         .into_iter()
         .enumerate()
         .map(|(i, h)| {
-            let edges = edges_per_hit
+            let edges = edges_per_hit.as_ref().and_then(|v| v.get(i).cloned());
+            // graph_per_hit is Vec<Option<GraphEnrichment>>; index → Option<&Option<…>>;
+            // flatten the outer Option (i is in range by construction).
+            let graph = graph_per_hit
                 .as_ref()
-                .and_then(|v| v.get(i).cloned());
-            hit_to_wire(h, edges)
+                .and_then(|v| v.get(i).cloned())
+                .flatten();
+            hit_to_wire(h, edges, graph)
         })
         .collect();
     let cumulative_count = u32::try_from(results.len()).unwrap_or(u32::MAX);
@@ -278,6 +297,237 @@ fn fetch_outgoing_edges_for(
     Ok(out)
 }
 
+/// Per-hit knowledge-layer enrichment populated when the request
+/// carries `include_graph = true`. One redb read txn serves all
+/// hits; per hit we issue a small handful of point/range reads.
+/// Schema-gating is by table presence + edge presence: if
+/// `STATEMENTS_BY_EVIDENCE_TABLE` doesn't exist AND the hit has no
+/// `Mentions` edges, the result is `None` (memory wasn't through
+/// extractors). Otherwise the lists may be empty — "extracted, found
+/// nothing" is a distinct state from "not extracted."
+///
+/// Caps:
+///   * entities  — first 16 mentioned (mention order)
+///   * statements — top 5 by `confidence` desc, tombstoned skipped
+///   * relations  — top 5 by `created_at_unix_nanos` desc, both
+///     incoming and outgoing typed edges incident to mentioned
+///     entities
+fn fetch_enrichment_for(
+    memory_ids: &[MemoryId],
+    rtxn: &redb::ReadTransaction,
+) -> Result<Vec<Option<brain_protocol::response::GraphEnrichment>>, OpError> {
+    use brain_core::knowledge::{EntityId, StatementId, SubjectRef};
+    use brain_core::{EdgeKindRef, NodeRef};
+    use brain_metadata::entity_ops::entity_get;
+    use brain_metadata::predicate_ops::predicate_get;
+    use brain_metadata::relation_type_ops::relation_type_get;
+    use brain_metadata::statement_ops::statement_get;
+    use brain_metadata::tables::edge::{walk_incoming, walk_outgoing};
+    use brain_metadata::tables::knowledge::entity_type::ENTITY_TYPES_TABLE;
+    use brain_metadata::tables::knowledge::statement::STATEMENTS_BY_EVIDENCE_TABLE;
+    use brain_protocol::response::{
+        EnrichedEntity, EnrichedRelation, EnrichedStatement, GraphEnrichment,
+    };
+
+    const ENTITY_CAP: usize = 16;
+    const STATEMENT_CAP: usize = 5;
+    const RELATION_CAP: usize = 5;
+    let entity_types = rtxn.open_table(ENTITY_TYPES_TABLE).ok();
+    let evidence_table = match rtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE) {
+        Ok(t) => Some(t),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => {
+            return Err(OpError::Internal(format!(
+                "include_graph: open STATEMENTS_BY_EVIDENCE_TABLE: {e}"
+            )));
+        }
+    };
+
+    let mut out: Vec<Option<GraphEnrichment>> = Vec::with_capacity(memory_ids.len());
+    for &memory_id in memory_ids {
+        // 1. Mentioned entities (walk Mentions edges from memory).
+        let mention_rows = walk_outgoing(
+            &rtxn,
+            NodeRef::Memory(memory_id),
+            Some(EdgeKindRef::Mentions),
+        )
+        .map_err(|e| {
+            OpError::Internal(format!("include_graph: walk_outgoing(Mentions): {e}"))
+        })?;
+        let entity_ids: Vec<EntityId> = mention_rows
+            .iter()
+            .filter_map(|(_, to, _, _)| match to {
+                NodeRef::Entity(eid) => Some(*eid),
+                _ => None,
+            })
+            .collect();
+
+        // Hard schema gate: no mentions AND no statements infra → the
+        // memory never went through extractors. Distinguish from
+        // "extracted but no entities" (Some(empty)) below.
+        if entity_ids.is_empty() && evidence_table.is_none() {
+            out.push(None);
+            continue;
+        }
+
+        let mut enriched_entities: Vec<EnrichedEntity> =
+            Vec::with_capacity(entity_ids.len().min(ENTITY_CAP));
+        for eid in entity_ids.iter().take(ENTITY_CAP) {
+            let Some(ent) = entity_get(&rtxn, *eid)
+                .map_err(|e| OpError::Internal(format!("include_graph: entity_get: {e}")))?
+            else {
+                continue;
+            };
+            let type_name = entity_types
+                .as_ref()
+                .and_then(|t| t.get(&ent.entity_type.raw()).ok().flatten())
+                .map(|g| g.value().name)
+                .unwrap_or_default();
+            enriched_entities.push(EnrichedEntity {
+                id: eid.to_bytes(),
+                name: ent.canonical_name,
+                type_qname: type_name,
+            });
+        }
+
+        // 2. Statements sourced by this memory. STATEMENTS_BY_EVIDENCE
+        // keys are `(MemoryId.to_be_bytes(), StatementId.to_bytes())`.
+        let mut enriched_statements: Vec<EnrichedStatement> = Vec::new();
+        if let Some(et) = &evidence_table {
+            let mid = memory_id.to_be_bytes();
+            let lo = (mid, [0u8; 16]);
+            let hi = (mid, [0xFFu8; 16]);
+            let mut stmts: Vec<brain_core::knowledge::Statement> = Vec::new();
+            for entry in et.range(lo..=hi).map_err(|e| {
+                OpError::Internal(format!("include_graph: evidence range: {e}"))
+            })? {
+                let (k, _v) = entry.map_err(|e| {
+                    OpError::Internal(format!("include_graph: evidence row: {e}"))
+                })?;
+                let (_mem_bytes, sid_bytes) = k.value();
+                let sid = StatementId::from_bytes(sid_bytes);
+                if let Some(stmt) = statement_get(&rtxn, sid).map_err(|e| {
+                    OpError::Internal(format!("include_graph: statement_get: {e}"))
+                })? {
+                    if !stmt.tombstoned {
+                        stmts.push(stmt);
+                    }
+                }
+            }
+            stmts.sort_by(|a, b| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for stmt in stmts.into_iter().take(STATEMENT_CAP) {
+                let subject_name = match stmt.subject {
+                    SubjectRef::Entity(eid) => entity_get(&rtxn, eid)
+                        .ok()
+                        .flatten()
+                        .map(|e| e.canonical_name)
+                        .unwrap_or_default(),
+                    _ => "(ambiguous)".to_string(),
+                };
+                let predicate = predicate_get(&rtxn, stmt.predicate)
+                    .ok()
+                    .flatten()
+                    .map(|p| p.canonical())
+                    .unwrap_or_default();
+                let object_label = match &stmt.object {
+                    brain_core::knowledge::StatementObject::Entity(eid) => entity_get(&rtxn, *eid)
+                        .ok()
+                        .flatten()
+                        .map(|e| e.canonical_name)
+                        .unwrap_or_default(),
+                    brain_core::knowledge::StatementObject::Value(v) => format!("{v:?}"),
+                    brain_core::knowledge::StatementObject::Memory(mid) => {
+                        format!("memory:{:x?}", mid.to_be_bytes())
+                    }
+                    brain_core::knowledge::StatementObject::Statement(sid) => {
+                        format!("statement:{:x?}", sid.to_bytes())
+                    }
+                };
+                enriched_statements.push(EnrichedStatement {
+                    id: stmt.id.to_bytes(),
+                    subject_name,
+                    predicate,
+                    object_label,
+                    confidence: stmt.confidence,
+                });
+            }
+        }
+
+        // 3. Typed relations incident to any mentioned entity. Both
+        // directions; top RELATION_CAP by created_at desc across the
+        // pool.
+        let mut all_rels: Vec<(u64, EnrichedRelation)> = Vec::new();
+        for eid in &entity_ids {
+            for outgoing in [true, false] {
+                let rows = if outgoing {
+                    walk_outgoing(&rtxn, NodeRef::Entity(*eid), None)
+                } else {
+                    walk_incoming(&rtxn, NodeRef::Entity(*eid), None)
+                }
+                .map_err(|e| {
+                    OpError::Internal(format!("include_graph: walk relation: {e}"))
+                })?;
+                for (kind, other, _disamb, data) in rows {
+                    let typed_id = match kind {
+                        EdgeKindRef::Typed(rt_id) => rt_id,
+                        _ => continue,
+                    };
+                    let other_entity = match other {
+                        NodeRef::Entity(oid) => oid,
+                        _ => continue,
+                    };
+                    let Some(rt) = relation_type_get(&rtxn, typed_id).map_err(|e| {
+                        OpError::Internal(format!("include_graph: relation_type_get: {e}"))
+                    })?
+                    else {
+                        continue;
+                    };
+                    let (from_id, to_id) = if outgoing {
+                        (*eid, other_entity)
+                    } else {
+                        (other_entity, *eid)
+                    };
+                    let from_name = entity_get(&rtxn, from_id)
+                        .ok()
+                        .flatten()
+                        .map(|e| e.canonical_name)
+                        .unwrap_or_default();
+                    let to_name = entity_get(&rtxn, to_id)
+                        .ok()
+                        .flatten()
+                        .map(|e| e.canonical_name)
+                        .unwrap_or_default();
+                    all_rels.push((
+                        data.created_at_unix_nanos,
+                        EnrichedRelation {
+                            from_name,
+                            predicate: rt.canonical(),
+                            to_name,
+                        },
+                    ));
+                }
+            }
+        }
+        all_rels.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+        let enriched_relations: Vec<EnrichedRelation> = all_rels
+            .into_iter()
+            .take(RELATION_CAP)
+            .map(|(_, r)| r)
+            .collect();
+
+        out.push(Some(GraphEnrichment {
+            entities: enriched_entities,
+            statements: enriched_statements,
+            relations: enriched_relations,
+        }));
+    }
+    Ok(out)
+}
+
 fn cosine(a: &[f32; brain_embed::VECTOR_DIM], b: &[f32; brain_embed::VECTOR_DIM]) -> f32 {
     let mut dot = 0.0_f32;
     let mut na = 0.0_f32;
@@ -295,7 +545,11 @@ fn cosine(a: &[f32; brain_embed::VECTOR_DIM], b: &[f32; brain_embed::VECTOR_DIM]
     }
 }
 
-fn hit_to_wire(hit: RecallHit, edges: Option<Vec<brain_protocol::response::EdgeView>>) -> MemoryResult {
+fn hit_to_wire(
+    hit: RecallHit,
+    edges: Option<Vec<brain_protocol::response::EdgeView>>,
+    graph: Option<brain_protocol::response::GraphEnrichment>,
+) -> MemoryResult {
     MemoryResult {
         memory_id: hit.memory_id.into(),
         text: hit.text.unwrap_or_default(),
@@ -307,6 +561,7 @@ fn hit_to_wire(hit: RecallHit, edges: Option<Vec<brain_protocol::response::EdgeV
         created_at_unix_nanos: hit.created_at_unix_nanos,
         last_accessed_at_unix_nanos: hit.last_accessed_at_unix_nanos,
         edges,
+        graph,
         // Substrate path — no hybrid metadata.
         contributing_retrievers: Vec::new(),
         fused_score: 0.0,
@@ -430,6 +685,30 @@ fn project_memory_results(
     } else {
         None
     };
+
+    // Pre-fetch knowledge-layer enrichment in one pass if requested.
+    // The hybrid path holds metadata_guard for the whole loop, so the
+    // helper takes the existing rtxn (no double-lock).
+    let graph_per_memory: Option<std::collections::HashMap<MemoryId, brain_protocol::response::GraphEnrichment>> =
+        if req.include_graph {
+            let ids: Vec<MemoryId> = result
+                .items
+                .iter()
+                .filter_map(|fused| match fused.id {
+                    RankedItemId::Memory(mid) => Some(mid),
+                    _ => None,
+                })
+                .collect();
+            let enriched = fetch_enrichment_for(&ids, &rtxn)?;
+            Some(
+                ids.into_iter()
+                    .zip(enriched.into_iter())
+                    .filter_map(|(id, e)| e.map(|g| (id, g)))
+                    .collect(),
+            )
+        } else {
+            None
+        };
 
     let mut out: Vec<MemoryResult> = Vec::with_capacity(result.items.len());
     for fused in &result.items {
@@ -562,6 +841,7 @@ fn project_memory_results(
             created_at_unix_nanos: row.created_at_unix_nanos,
             last_accessed_at_unix_nanos: row.last_accessed_at_unix_nanos,
             edges,
+            graph: graph_per_memory.as_ref().and_then(|m| m.get(&memory_id).cloned()),
             contributing_retrievers: fused
                 .contributing
                 .iter()

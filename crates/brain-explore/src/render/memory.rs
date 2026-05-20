@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use brain_protocol::response::MemoryResult;
 use serde_json::{json, Value};
 
-use crate::render::{fmt_id, fmt_kind, fmt_short_id};
+use crate::render::{fmt_hex_16, fmt_id, fmt_kind, fmt_short_id};
 use crate::table::middle_truncate;
 use crate::theme::Token;
 use crate::{Render, RenderCtx};
@@ -109,6 +109,58 @@ impl Render for RecallResults {
                     }
                 }
             }
+            // Per-hit knowledge-layer enrichment — only when
+            // --include-graph populated `r.graph`. `None` distinguishes
+            // "didn't ask" / "memory wasn't extracted" from "asked, got
+            // empty lists." Empty sub-vectors render as muted "(none)"
+            // lines so a reader can tell the extraction ran but found
+            // nothing of that kind.
+            if let Some(graph) = &r.graph {
+                if !graph.entities.is_empty() {
+                    let label = theme.paint(Token::Label, "    Entities:", policy);
+                    let names: Vec<String> = graph
+                        .entities
+                        .iter()
+                        .map(|e| format!("{} ({})", e.name, e.type_qname))
+                        .collect();
+                    writeln!(w, "{label} {}", names.join(" · "))?;
+                }
+                if !graph.statements.is_empty() {
+                    let label = theme.paint(Token::Label, "    Statements:", policy);
+                    writeln!(w, "{label}")?;
+                    for s in &graph.statements {
+                        let arrow = theme.paint(Token::Muted, "→", policy);
+                        writeln!(
+                            w,
+                            "      {arrow} {} {} {} [{:.2}]",
+                            s.subject_name, s.predicate, s.object_label, s.confidence,
+                        )?;
+                    }
+                }
+                if !graph.relations.is_empty() {
+                    let label = theme.paint(Token::Label, "    Relations:", policy);
+                    writeln!(w, "{label}")?;
+                    for rel in &graph.relations {
+                        let arrow = theme.paint(Token::Muted, "→", policy);
+                        writeln!(
+                            w,
+                            "      {} --{}{} {}",
+                            rel.from_name, rel.predicate, arrow, rel.to_name,
+                        )?;
+                    }
+                }
+                if graph.entities.is_empty()
+                    && graph.statements.is_empty()
+                    && graph.relations.is_empty()
+                {
+                    let hint = theme.paint(
+                        Token::Muted,
+                        "    (no knowledge enrichment — extractor produced no entities/statements/relations)",
+                        policy,
+                    );
+                    writeln!(w, "{hint}")?;
+                }
+            }
             if idx + 1 < results.len() {
                 writeln!(w)?;
             }
@@ -166,6 +218,25 @@ impl Render for RecallResults {
                         "kind": format!("{:?}", e.kind),
                         "weight": e.weight,
                     })).collect::<Vec<_>>()),
+                    "graph": r.graph.as_ref().map(|g| json!({
+                        "entities": g.entities.iter().map(|e| json!({
+                            "id": fmt_hex_16(&e.id),
+                            "name": e.name,
+                            "type_qname": e.type_qname,
+                        })).collect::<Vec<_>>(),
+                        "statements": g.statements.iter().map(|s| json!({
+                            "id": fmt_hex_16(&s.id),
+                            "subject_name": s.subject_name,
+                            "predicate": s.predicate,
+                            "object_label": s.object_label,
+                            "confidence": s.confidence,
+                        })).collect::<Vec<_>>(),
+                        "relations": g.relations.iter().map(|rel| json!({
+                            "from_name": rel.from_name,
+                            "predicate": rel.predicate,
+                            "to_name": rel.to_name,
+                        })).collect::<Vec<_>>(),
+                    })),
                     "fused_score": r.fused_score,
                     "text": r.text,
                 })
@@ -205,6 +276,7 @@ mod tests {
             consolidated_at_unix_nanos: None,
             edges_out_count: 0,
             edges_in_count: 0,
+            graph: None,
         }
     }
 

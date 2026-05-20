@@ -256,6 +256,10 @@ fn help_recall() -> HelpVerb {
                 "list each hit's outgoing edges (one prefix scan per hit)",
             ),
             row(
+                "--include-graph",
+                "knowledge-layer enrichment per hit (entities + statements + relations)",
+            ),
+            row(
                 "--txn HEX",
                 "read inside an open transaction; auto in REPL",
             ),
@@ -622,6 +626,7 @@ mod tests {
             "--filter-kind",
             "--include-text",
             "--include-edges",
+            "--include-graph",
             "--txn",
         ] {
             assert!(card.contains(flag), "missing flag {flag} in:\n{card}");

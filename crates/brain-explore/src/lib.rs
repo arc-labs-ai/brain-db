@@ -21,12 +21,12 @@ pub mod util;
 pub use format::{dispatch, OutputFormat, Render, RenderCtx};
 pub use render::{
     AdHocTable, AgentInfo, AuditCard, BannerAgentSource, ConnectionInfo, EncodeRendered,
-    EntityCard, GraphEnrichment, GraphNode, GraphTree, HelpFlagRow, HelpItem, HelpReference,
-    HelpSection, HelpTopLevel, HelpUnknown, HelpVerb, InfoCard, LinkRendered, MemorySummary,
-    ObjectRef, PlanSteps, ReasonSteps, RecallResults, RecallWithGraph, RelationCard,
-    RelationSummary, RenderableError, ServerInfo, ServerWelcomeFields, SessionInfo, StatementCard,
-    StatementSummary, SubscriptionEventList, SubscriptionEventRendered, TxnAbortRendered,
-    TxnBeginRendered, TxnCommitRendered, UnlinkRendered, WelcomeBanner,
+    EntityCard, GraphNode, GraphTree, HelpFlagRow, HelpItem, HelpReference, HelpSection,
+    HelpTopLevel, HelpUnknown, HelpVerb, InfoCard, LinkRendered, MemorySummary, ObjectRef,
+    PlanSteps, ReasonSteps, RecallResults, RelationCard, RelationSummary, RenderableError,
+    ServerInfo, ServerWelcomeFields, SessionInfo, StatementCard, StatementSummary,
+    SubscriptionEventList, SubscriptionEventRendered, TxnAbortRendered, TxnBeginRendered,
+    TxnCommitRendered, UnlinkRendered, WelcomeBanner,
 };
 pub use term::policy::TermPolicy;
 pub use theme::{Theme, Token};

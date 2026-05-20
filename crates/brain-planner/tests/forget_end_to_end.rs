@@ -336,6 +336,7 @@ fn recall_request(cue: &str, top_k: u32) -> RecallRequest {
         kind_filter: None,
         salience_floor: 0.0,
         include_edges: false,
+        include_graph: false,
         include_text: false,
         request_id: None,
         txn_id: None,

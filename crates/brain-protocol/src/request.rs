@@ -430,6 +430,7 @@ mod tests {
             kind_filter: Some(vec![MemoryKindWire::Episodic, MemoryKindWire::Semantic]),
             salience_floor: 0.1,
             include_edges: true,
+            include_graph: false,
             include_text: true,
             request_id: Some(sample_uuid(7)),
             txn_id: None,

@@ -23,7 +23,6 @@ pub mod link;
 pub mod memory;
 pub mod plan;
 pub mod reason;
-pub mod recall_with_graph;
 pub mod relation_card;
 pub mod statement_card;
 pub mod subscribe;
@@ -44,9 +43,6 @@ pub use link::{LinkRendered, UnlinkRendered};
 pub use memory::RecallResults;
 pub use plan::PlanSteps;
 pub use reason::ReasonSteps;
-pub use recall_with_graph::{
-    EnrichedEntity, EnrichedRelation, EnrichedStatement, GraphEnrichment, RecallWithGraph,
-};
 pub use relation_card::{EntityRef, RelationCard};
 pub use statement_card::{ObjectRef, StatementCard};
 pub use subscribe::{SubscriptionEventList, SubscriptionEventRendered};

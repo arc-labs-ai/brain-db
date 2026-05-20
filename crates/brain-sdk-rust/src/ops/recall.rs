@@ -25,6 +25,7 @@ pub struct RecallBuilder<'a> {
     kind_filter: Option<Vec<MemoryKindWire>>,
     salience_floor: f32,
     include_edges: bool,
+    include_graph: bool,
     include_text: bool,
     request_id: Option<RequestId>,
     txn_id: Option<[u8; 16]>,
@@ -42,6 +43,7 @@ impl<'a> RecallBuilder<'a> {
             kind_filter: None,
             salience_floor: 0.0,
             include_edges: false,
+            include_graph: false,
             include_text: false,
             request_id: None,
             txn_id: None,
@@ -94,6 +96,17 @@ impl<'a> RecallBuilder<'a> {
         self
     }
 
+    /// Ask the server to populate `MemoryResult.graph` with each hit's
+    /// knowledge-layer enrichment (mentioned entities, sourced
+    /// statements, incident relations). Costs additional reads against
+    /// the knowledge tables; `None` on substrate-only deployments and
+    /// for memories that never went through the extractors.
+    #[must_use]
+    pub fn include_graph(mut self, on: bool) -> Self {
+        self.include_graph = on;
+        self
+    }
+
     /// Ask the substrate to populate `MemoryResult.text` for each hit.
     /// Costs one extra batched read per recall; defaults to `false`,
     /// in which case the response carries ids and scores only.
@@ -132,6 +145,7 @@ impl<'a> RecallBuilder<'a> {
         let kind_filter = self.kind_filter;
         let salience_floor = self.salience_floor;
         let include_edges = self.include_edges;
+        let include_graph = self.include_graph;
         let include_text = self.include_text;
         let txn_id = self.txn_id;
         let client = self.client.clone();
@@ -152,6 +166,7 @@ impl<'a> RecallBuilder<'a> {
                         kind_filter,
                         salience_floor,
                         include_edges,
+                        include_graph,
                         include_text,
                         request_id: request_id_bytes,
                         txn_id,
@@ -215,6 +230,7 @@ impl<'a> RecallBuilder<'a> {
             kind_filter: self.kind_filter,
             salience_floor: self.salience_floor,
             include_edges: self.include_edges,
+            include_graph: self.include_graph,
             include_text: self.include_text,
             request_id: request_id_bytes,
             txn_id: self.txn_id,

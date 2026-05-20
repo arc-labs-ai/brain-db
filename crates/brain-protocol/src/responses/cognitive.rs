@@ -103,6 +103,77 @@ pub struct MemoryResult {
     pub edges_out_count: u32,
     /// Denormalised incoming-edge count. "How linked-into is this?"
     pub edges_in_count: u32,
+    /// Per-hit graph enrichment populated when the request carries
+    /// `include_graph = true` AND the memory was processed by the
+    /// knowledge layer (mentions edges exist). `None` on substrate-
+    /// only deployments and when `include_graph` is unset.
+    pub graph: Option<GraphEnrichment>,
+}
+
+/// Per-hit knowledge-layer side-channel surfaced when the client
+/// passes `include_graph = true`. Empty vectors are valid (the memory
+/// went through extractors but produced no entities/statements/
+/// relations) — the renderer omits empty sections.
+///
+/// All three lists are capped server-side so the response stays
+/// bounded for memories that mention dozens of entities. Caps:
+///   * entities — 16 (all mentioned entities, scored by mention
+///     recency; oldest dropped first if over cap)
+///   * statements — 5 (top by `confidence` desc, restricted to
+///     `is_current = 1`)
+///   * relations — 5 (top by `created_at_unix_nanos` desc, both
+///     incoming and outgoing typed edges incident to mentioned
+///     entities)
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub struct GraphEnrichment {
+    pub entities: Vec<EnrichedEntity>,
+    pub statements: Vec<EnrichedStatement>,
+    pub relations: Vec<EnrichedRelation>,
+}
+
+/// Wire form of one entity mentioned by the recalled memory. Carries
+/// the canonical name + type label so the renderer doesn't need to
+/// follow back-references to the entity table.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub struct EnrichedEntity {
+    pub id: [u8; 16],
+    pub name: String,
+    /// Human-readable `"namespace:typename"` (or bare `"typename"` for
+    /// the default namespace). The renderer prints this inline beside
+    /// the entity name.
+    pub type_qname: String,
+}
+
+/// Wire form of one statement sourced by the recalled memory.
+/// `predicate` and `object_label` are pre-rendered server-side so the
+/// renderer doesn't have to chase predicate-id / object-blob lookups.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub struct EnrichedStatement {
+    pub id: [u8; 16],
+    pub subject_name: String,
+    pub predicate: String,
+    /// Stringified object — entity canonical name for entity objects,
+    /// formatted scalar for literal objects.
+    pub object_label: String,
+    pub confidence: f32,
+}
+
+/// Wire form of one typed relation incident to an entity mentioned by
+/// the recalled memory. `predicate` is the human-readable name of the
+/// relation type (e.g. `"works_at"`, `"lives_in"`).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub struct EnrichedRelation {
+    pub from_name: String,
+    pub predicate: String,
+    pub to_name: String,
 }
 
 /// Spec §08 §3.

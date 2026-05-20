@@ -238,6 +238,7 @@ fn recall_req(txn_id: Option<[u8; 16]>) -> RecallRequest {
         kind_filter: None,
         salience_floor: 0.0,
         include_edges: false,
+        include_graph: false,
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id,

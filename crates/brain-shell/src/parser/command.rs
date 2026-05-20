@@ -778,14 +778,14 @@ pub struct RecallArgs {
     /// Bind to an active transaction (hex bytes).
     #[arg(long)]
     pub txn: Option<String>,
-    /// Surface linked entities + top statements per hit in the
-    /// stacked-card renderer. Hidden from `--help` until the wire
-    /// `RecallResp` grows the per-hit knowledge-graph fields — the
-    /// renderer falls back to empty enrichment today, so exposing
-    /// the flag would lie to users. The shell still accepts the
-    /// flag (parses cleanly) so existing scripts don't break; it
-    /// just stays invisible until the server-side path is real.
-    #[arg(long = "include-graph", default_value_t = false, hide = true)]
+    /// Surface knowledge-layer enrichment per hit: mentioned entities,
+    /// statements sourced from this memory, and typed relations
+    /// incident to those entities. Costs additional reads against the
+    /// knowledge tables; results are capped server-side
+    /// (16 entities / 5 statements / 5 relations per hit) so the
+    /// response stays bounded. `None` on substrate-only deployments
+    /// and for memories that never went through the extractors.
+    #[arg(long = "include-graph", default_value_t = false)]
     pub include_graph: bool,
     /// Drop results whose current salience is below this floor.
     /// `[0.0, 1.0]`, default 0.0 (no filter). Filters AFTER the
