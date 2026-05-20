@@ -12,7 +12,7 @@ use std::io::{self, Write};
 
 use serde_json::{json, Value};
 
-use crate::render::fmt_uuid;
+use crate::render::{fmt_time, fmt_time_rfc3339_with_age, fmt_time_with_note, fmt_uuid};
 use crate::theme::Token;
 use crate::{Render, RenderCtx};
 
@@ -117,7 +117,13 @@ impl Render for InfoCard {
                     "wire_version",
                     &welcome.wire_version.to_string(),
                 )?;
-                let server_time = format!("{} unix-nanos", welcome.server_time_unix_nanos);
+                // Raw nanos stay primary; bracketed RFC3339 + relative
+                // age land alongside. The "server clock" note flags that
+                // this is the server's wall clock — useful when an
+                // operator is diagnosing clock skew between client and
+                // server (the only place this card is the diagnosis).
+                let server_time =
+                    fmt_time_with_note(welcome.server_time_unix_nanos, "server clock");
                 write_row(w, theme, policy, "server_time", &server_time)?;
                 write_row(
                     w,
@@ -168,7 +174,10 @@ impl Render for InfoCard {
             write_row(w, theme, policy, "note", &self.agent.note)?;
         }
         if let Some(ts) = &self.agent.created_at {
-            write_row(w, theme, policy, "created_at", ts)?;
+            // Already RFC3339 from config; append the relative age so
+            // "two years ago" reads at a glance.
+            let formatted = fmt_time_rfc3339_with_age(ts);
+            write_row(w, theme, policy, "created_at", &formatted)?;
         }
         writeln!(w)?;
 
@@ -183,7 +192,7 @@ impl Render for InfoCard {
             writeln!(w, "  {label}  {muted}")?;
         }
         if let Some(ts) = self.connection.connected_at_unix_nanos {
-            let formatted = format!("{ts} unix-nanos");
+            let formatted = fmt_time(ts);
             write_row(w, theme, policy, "connected_at", &formatted)?;
         }
         writeln!(w)?;
@@ -361,6 +370,29 @@ mod tests {
         assert!(out.contains("bound_shard"));
         assert!(out.contains("streaming"));
         assert!(out.contains("authenticated"));
+        // server_time renders raw-primary + bracketed RFC3339 (year
+        // "20…") + "server clock" note inside the brackets.
+        assert!(
+            out.contains("1700000000000000000 unix-nanos"),
+            "raw nanos primary: {out}"
+        );
+        assert!(out.contains("(20"), "human RFC3339 in brackets: {out}");
+        assert!(
+            out.contains("server clock"),
+            "server-clock note in brackets: {out}"
+        );
+    }
+
+    #[test]
+    fn render_table_agent_created_at_appends_relative_age() {
+        // baseline() supplies an RFC3339 created_at; ensure the
+        // relative-age clause is appended (operators tracking which
+        // agents have been around longest want this at a glance).
+        let out = render(&baseline(), OutputFormat::Table);
+        assert!(
+            out.contains("2026-05-20T02:00:00Z ("),
+            "created_at must keep RFC3339 + open paren: {out}"
+        );
     }
 
     #[test]
