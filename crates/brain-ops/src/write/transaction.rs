@@ -132,7 +132,9 @@ mod tests {
             context: ContextId(0),
             created_at_unix_nanos: 1_700_000_000_000,
             arena_slot: 1,
-            fingerprint: [0; 16],
+            embedding_model_fp: [0; 16],
+            content_hash: None,
+            deduplicate: false,
         }
     }
 

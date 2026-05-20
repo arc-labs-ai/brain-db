@@ -55,9 +55,18 @@ pub enum Phase {
         created_at_unix_nanos: u64,
         /// Slot in the per-shard memory arena.
         arena_slot: u64,
-        /// Stable fingerprint for dedupe. The handler computes this
-        /// before submit (text-hash + agent + context).
-        fingerprint: [u8; 16],
+        /// Embedding-model fingerprint stamped on the stored row. The
+        /// handler pulls this from the dispatcher that produced the
+        /// vector (`Dispatcher::fingerprint()` in the legacy path).
+        embedding_model_fp: [u8; 16],
+        /// BLAKE3 of the canonical UTF-8 text. `Some` only when
+        /// `deduplicate=true` — controls whether a row gets stamped
+        /// into FINGERPRINTS_TABLE for content-hash dedup.
+        content_hash: Option<[u8; 32]>,
+        /// `true` ⇒ consult FINGERPRINTS_TABLE before write and
+        /// re-use any matching MemoryId (spec §07/07 §6). `false`
+        /// skips the dedup index entirely.
+        deduplicate: bool,
     },
 
     /// Insert or update an entity row.
@@ -484,7 +493,9 @@ mod tests {
             context: ContextId(7),
             created_at_unix_nanos: 1_700_000_000_000,
             arena_slot: 42,
-            fingerprint: [0xAA; 16],
+            embedding_model_fp: [0xAA; 16],
+            content_hash: None,
+            deduplicate: false,
         }
     }
 
@@ -531,7 +542,9 @@ mod tests {
             context: ContextId(0),
             created_at_unix_nanos: 0,
             arena_slot: 0,
-            fingerprint: [0; 16],
+            embedding_model_fp: [0; 16],
+            content_hash: None,
+            deduplicate: false,
         };
         let small = make("x");
         let big = make(&"x".repeat(1024));

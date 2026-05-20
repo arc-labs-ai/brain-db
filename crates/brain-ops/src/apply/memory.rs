@@ -28,24 +28,31 @@ pub fn apply_upsert_memory(
         context,
         created_at_unix_nanos,
         arena_slot,
-        fingerprint,
+        embedding_model_fp,
+        content_hash,
+        deduplicate,
     } = phase
     else {
         return Err(ApplyError::PhaseMisShape("expected UpsertMemory"));
     };
 
-    let row = MemoryMetadata::new_active(
+    let mut row = MemoryMetadata::new_active(
         *id,
         write.agent_id,
         *context,
         *arena_slot,
         id.version(),
         *kind,
-        *fingerprint,
+        *embedding_model_fp,
         salience.raw(),
         text.len() as u32,
         *created_at_unix_nanos,
     );
+    if *deduplicate {
+        if let Some(ch) = content_hash {
+            row = row.with_content_hash(*ch);
+        }
+    }
 
     // Memory row.
     {
@@ -72,6 +79,25 @@ pub fn apply_upsert_memory(
         timeline_t
             .insert(key.as_slice(), ())
             .map_err(|e| ApplyError::Storage(format!("TIMELINE insert: {e:?}")))?;
+    }
+
+    // FINGERPRINTS_TABLE entry when the encode opted into content-
+    // hash dedup. The row keys (agent_id, context_id, content_hash) →
+    // this memory id, so a future ENCODE with matching text/agent/ctx
+    // can dedupe-to-existing without minting a fresh row.
+    if *deduplicate {
+        if let Some(ch) = content_hash {
+            use brain_metadata::tables::fingerprint::{
+                fingerprint_key, FingerprintEntry, FINGERPRINTS_TABLE,
+            };
+            let key = fingerprint_key(write.agent_id, *context, ch);
+            let entry = FingerprintEntry::new(*id, *created_at_unix_nanos);
+            let mut fp_t = wtxn
+                .open_table(FINGERPRINTS_TABLE)
+                .map_err(|e| ApplyError::Storage(format!("open FINGERPRINTS: {e:?}")))?;
+            fp_t.insert(&key, entry)
+                .map_err(|e| ApplyError::Storage(format!("FINGERPRINTS insert: {e:?}")))?;
+        }
     }
 
     Ok(PhaseAck::UpsertedMemory(*id))
@@ -313,7 +339,9 @@ mod tests {
             context: ContextId(7),
             created_at_unix_nanos: 1_700_000_000_000,
             arena_slot: 42,
-            fingerprint: [0xAA; 16],
+            embedding_model_fp: [0xAA; 16],
+            content_hash: None,
+            deduplicate: false,
         }
     }
 

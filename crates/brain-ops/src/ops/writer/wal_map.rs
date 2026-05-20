@@ -7,19 +7,20 @@
 //! ## Scope
 //!
 //! Covered (substrate phases with direct typed-payload counterparts):
-//! - Link, Unlink, Tombstone(Memory)
-//! - UpdateSalience, UpdateKind, UpdateContext
+//! - UpsertMemory → WalPayload::Encode
+//! - Tombstone(Memory) → WalPayload::Forget
+//! - Link / Unlink → WalPayload::Link / Unlink
+//! - UpdateSalience / UpdateKind / UpdateContext → matching payloads
+//!
+//! Multi-phase wrapping in TxnBegin/TxnCommit is handled by the
+//! caller (`submit::wal_append_for_write`) — this module just maps
+//! each phase to its payload.
 //!
 //! Deferred (later P3b slices):
-//! - UpsertMemory → WalPayload::Encode. EncodePayload carries
-//!   request_hash, response_payload, deduplicate fields that aren't
-//!   natively on Phase::UpsertMemory. Adding them needs a Phase shape
-//!   extension; lands once handler migration drives the requirement.
 //! - UpsertEntity / UpsertStatement / UpsertRelation / Supersede /
-//!   UpsertSchema / SetExtractorEnabled / MergeEntities → these need
+//!   UpsertSchema / SetExtractorEnabled / MergeEntities — these need
 //!   the `WalPayload::Knowledge` variant with rkyv-encoded bodies; the
 //!   body schemas land in a knowledge_bodies.rs follow-up.
-//! - Multi-phase writes (wrap in TxnBegin/TxnCommit) — its own slice.
 //!
 //! Phases without a wire-side WAL event (UpdateEmbedding before
 //! arena-write wiring, Resolve, StampAudit, ReclaimSlots, UpdateAttribute):
@@ -29,8 +30,8 @@ use brain_core::EdgeOrigin;
 #[cfg(test)]
 use brain_core::NodeRef;
 use brain_storage::wal::payload::{
-    ForgetPayload, ForgetReason, LinkPayload, SalienceReason, SalienceUpdate, UnlinkPayload,
-    UpdateContextPayload, UpdateKindPayload, UpdateSaliencePayload, WalPayload,
+    EncodePayload, ForgetPayload, ForgetReason, LinkPayload, SalienceReason, SalienceUpdate,
+    UnlinkPayload, UpdateContextPayload, UpdateKindPayload, UpdateSaliencePayload, WalPayload,
 };
 
 use crate::write::{Phase, TombstoneTarget, Write};
@@ -47,6 +48,52 @@ use crate::write::{Phase, TombstoneTarget, Write};
 #[must_use]
 pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> {
     match phase {
+        // content_hash isn't an EncodePayload field — the legacy WAL
+        // doesn't ship it inline; recovery reconstructs the
+        // FINGERPRINTS_TABLE row from MEMORIES_TABLE.content_hash
+        // which apply_upsert_memory wrote durably alongside the
+        // metadata row. So Phase::UpsertMemory's content_hash flows
+        // through redb, not the WAL.
+        Phase::UpsertMemory {
+            id,
+            text,
+            vector,
+            kind,
+            salience,
+            context,
+            embedding_model_fp,
+            content_hash: _,
+            deduplicate,
+            ..
+        } => Some(WalPayload::Encode(EncodePayload {
+            memory_id: *id,
+            // Project the unified write's WriteId into the legacy
+            // request_id slot. Both are UUIDv7 16 bytes; recovery
+            // keys the idempotency cache off this field, so a unified-
+            // path write gets an IDEMPOTENCY_TABLE entry on replay.
+            request_id: brain_core::RequestId(write.write_id.as_uuid()),
+            agent_id: write.agent_id,
+            context_id: *context,
+            kind: *kind,
+            salience_initial: salience.raw(),
+            embedding_model_fp: *embedding_model_fp,
+            text: text.clone(),
+            vector: vector.to_vec(),
+            // Inline edges aren't part of Phase::UpsertMemory — they
+            // ride as separate Phase::Link records in the same write
+            // (wrapped in TxnBegin/Commit). EncodePayload.edges stays
+            // empty for unified-path writes.
+            edges: Vec::new(),
+            // request_hash + response_payload are the legacy
+            // idempotency / replay-cache fields. The unified path
+            // stores everything it needs in WriteIdempotencyCache;
+            // recovery's IDEMPOTENCY_TABLE entry from these zeros is
+            // a harmless ghost (the unified path never consults it).
+            request_hash: [0; 32],
+            response_payload: Vec::new(),
+            deduplicate: *deduplicate,
+        })),
+
         Phase::Link {
             from,
             to,
@@ -282,27 +329,53 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_phases_return_none() {
-        // UpsertMemory needs EncodePayload extras (request_hash,
-        // response_payload, deduplicate) that aren't on the Phase yet
-        // — handler-migration slice adds them. Until then: None.
+    fn upsert_memory_maps_to_encode_payload() {
+        let id = MemoryId::pack(0, 1, 0);
         let phase = Phase::UpsertMemory {
-            id: MemoryId::pack(0, 1, 0),
-            text: "x".into(),
-            vector: Box::new([0.0_f32; brain_embed::VECTOR_DIM]),
+            id,
+            text: "hello".into(),
+            vector: Box::new([0.5_f32; brain_embed::VECTOR_DIM]),
             kind: MemoryKind::Episodic,
-            salience: Salience::default(),
-            context: ContextId(0),
-            created_at_unix_nanos: 0,
-            arena_slot: 1,
-            fingerprint: [0; 16],
+            salience: Salience::new(0.7),
+            context: ContextId(3),
+            created_at_unix_nanos: 1_700_000_000_000,
+            arena_slot: 7,
+            embedding_model_fp: [0xCC; 16],
+            content_hash: Some([0xDD; 32]),
+            deduplicate: true,
         };
         let w = write_for(phase.clone());
-        assert!(phase_to_wal_payload(&phase, &w).is_none());
+        let WalPayload::Encode(ep) = phase_to_wal_payload(&phase, &w).unwrap() else {
+            panic!("expected Encode payload")
+        };
+        assert_eq!(ep.memory_id, id);
+        assert_eq!(ep.context_id, ContextId(3));
+        assert_eq!(ep.kind, MemoryKind::Episodic);
+        assert!((ep.salience_initial - 0.7).abs() < 1e-6);
+        assert_eq!(ep.embedding_model_fp, [0xCC; 16]);
+        assert_eq!(ep.text, "hello");
+        assert_eq!(ep.vector.len(), brain_embed::VECTOR_DIM);
+        assert!(
+            ep.edges.is_empty(),
+            "unified path puts edges in their own phases"
+        );
+        assert!(ep.deduplicate);
+    }
 
+    #[test]
+    fn phases_without_mapping_return_none() {
         // ReclaimSlots — derivable from MEMORIES_TABLE state on
         // recovery; never WAL'd.
         let phase = Phase::ReclaimSlots { slots: vec![1, 2] };
+        let w = write_for(phase.clone());
+        assert!(phase_to_wal_payload(&phase, &w).is_none());
+
+        // SetExtractorEnabled — knowledge-layer phase; no WAL mapping
+        // until knowledge_bodies.rs lands.
+        let phase = Phase::SetExtractorEnabled {
+            id: brain_core::knowledge::ExtractorId::from(1),
+            enabled: false,
+        };
         let w = write_for(phase.clone());
         assert!(phase_to_wal_payload(&phase, &w).is_none());
     }

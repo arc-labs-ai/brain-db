@@ -530,7 +530,9 @@ mod tests {
             context: ContextId(0),
             created_at_unix_nanos: 1_700_000_000_000,
             arena_slot: 1,
-            fingerprint: [0xAA; 16],
+            embedding_model_fp: [0xAA; 16],
+            content_hash: None,
+            deduplicate: false,
         };
         let link = Phase::Link {
             from: NodeRef::Memory(MemoryId::pack(0, 1, 0)),
@@ -599,7 +601,9 @@ mod tests {
             context: ContextId(0),
             created_at_unix_nanos: 1_700_000_000_000,
             arena_slot: 1,
-            fingerprint: [0xAA; 16],
+            embedding_model_fp: [0xAA; 16],
+            content_hash: None,
+            deduplicate: false,
         };
         let write = Write::single(WriteId::new(), AgentId::new(), phase);
         writer.submit(write).await.expect("submit");
