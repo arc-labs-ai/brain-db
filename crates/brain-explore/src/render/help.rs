@@ -153,13 +153,53 @@ fn write_top_level_row(
 // ── HelpVerb ────────────────────────────────────────────────────────
 
 /// Per-verb detail card. Top + bottom rules frame the focused content:
-/// usage signature, description paragraphs, optional see-also pointers.
+/// usage signature, optional flag + source tables, prose notes, an
+/// example, see-also pointers, and a reference block.
+///
+/// Each section suppresses when its field is empty / `None`, so a
+/// verb that only wants `usage + notes + see_also` (the pre-H2 shape)
+/// renders identically to before.
 pub struct HelpVerb {
     pub name: String,
     pub tagline: String,
     pub usage: Vec<String>,
+    /// Flag-by-flag reference. Empty → no `Flags` block is rendered.
+    pub flags: Vec<HelpFlagRow>,
+    /// Alternate sources for the verb's main argument (e.g. encode's
+    /// `--from-file`, `--from-stdin`, `--vector`). Empty → no `Sources`
+    /// block.
+    pub sources: Vec<HelpFlagRow>,
+    /// Prose paragraphs. Rendered under a `Notes` label, not
+    /// `Description`, so the section name matches its content shape
+    /// once Flags + Sources carry the structured part of the card.
     pub description: Vec<String>,
+    /// Single-line example. `None` → no `Example` block.
+    pub example: Option<String>,
     pub see_also: Vec<String>,
+    /// Pointer to clap's full reference + the per-verb markdown doc.
+    /// `None` → no `Reference` block.
+    pub reference: Option<HelpReference>,
+}
+
+/// One row inside the [`HelpVerb`] `flags` or `sources` tables.
+/// `signature` is the flag form (`"--context N"`), `description` is a
+/// one-line semantics blurb (range, default, gotcha) — clap covers
+/// syntax, this carries meaning.
+pub struct HelpFlagRow {
+    pub signature: String,
+    pub description: String,
+}
+
+/// Reference pointers shown at the bottom of a [`HelpVerb`] card.
+/// Surfaces the canonical clap-generated help and the markdown deep
+/// dive so a reader knows where to go next when the card is too brief.
+pub struct HelpReference {
+    /// Clap-generated form, e.g. `"encode --help"`. Always rendered.
+    pub clap_command: String,
+    /// Optional markdown doc path, e.g.
+    /// `"docs/reference/shell/commands/encode.md"`. `None` → only the
+    /// clap line is shown.
+    pub doc_path: Option<String>,
 }
 
 impl Render for HelpVerb {
@@ -242,13 +282,33 @@ impl Render for HelpVerb {
     }
 
     fn render_json(&self, _ctx: &RenderCtx) -> Value {
+        let flags: Vec<Value> = self
+            .flags
+            .iter()
+            .map(|f| json!({ "signature": f.signature, "description": f.description }))
+            .collect();
+        let sources: Vec<Value> = self
+            .sources
+            .iter()
+            .map(|f| json!({ "signature": f.signature, "description": f.description }))
+            .collect();
+        let reference = self.reference.as_ref().map(|r| {
+            json!({
+                "clap_command": r.clap_command,
+                "doc_path": r.doc_path,
+            })
+        });
         json!({
             "kind": "help-verb",
             "name": self.name,
             "tagline": self.tagline,
             "usage": self.usage,
+            "flags": flags,
+            "sources": sources,
             "description": self.description,
+            "example": self.example,
             "see_also": self.see_also,
+            "reference": reference,
         })
     }
 }
@@ -336,11 +396,15 @@ mod tests {
                 "encode <TEXT> [--context N] [--kind episodic|semantic|consolidated]".into(),
                 "       [--salience F] [--allow-duplicate] [--txn HEX]".into(),
             ],
+            flags: vec![],
+            sources: vec![],
             description: vec![
                 "Stores text as a memory. Inherits the session's sticky --context.".into(),
                 "Deduplication is ON by default.".into(),
             ],
+            example: None,
             see_also: vec!["recall".into(), "forget".into()],
+            reference: None,
         }
     }
 

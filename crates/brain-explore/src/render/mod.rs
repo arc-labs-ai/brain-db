@@ -36,7 +36,9 @@ pub use encode::EncodeRendered;
 pub use entity_card::{EntityCard, MemorySummary, RelationSummary, StatementSummary};
 pub use error::RenderableError;
 pub use graph_tree::{GraphNode, GraphTree};
-pub use help::{HelpItem, HelpSection, HelpTopLevel, HelpUnknown, HelpVerb};
+pub use help::{
+    HelpFlagRow, HelpItem, HelpReference, HelpSection, HelpTopLevel, HelpUnknown, HelpVerb,
+};
 pub use info::{AgentInfo, ConnectionInfo, InfoCard, ServerInfo, ServerWelcomeFields, SessionInfo};
 pub use link::{LinkRendered, UnlinkRendered};
 pub use memory::RecallResults;

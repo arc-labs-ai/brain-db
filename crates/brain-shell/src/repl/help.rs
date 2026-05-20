@@ -3,7 +3,10 @@
 //! lives here, the layout lives in brain-explore so the shell and CLI
 //! pick up the same visual language.
 
-use brain_explore::{HelpItem, HelpSection, HelpTopLevel, HelpUnknown, HelpVerb, Render};
+#[allow(unused_imports)] // HelpFlagRow + HelpReference land in H3-H6 fixtures
+use brain_explore::{
+    HelpFlagRow, HelpItem, HelpReference, HelpSection, HelpTopLevel, HelpUnknown, HelpVerb, Render,
+};
 
 /// Look up help for `verb`. Returns a boxed [`Render`] payload because
 /// the three concrete types (top-level, per-verb, unknown) all need to
@@ -144,11 +147,15 @@ fn help_encode() -> HelpVerb {
             "encode <TEXT> [--context N] [--kind episodic|semantic|consolidated]".into(),
             "       [--salience F] [--allow-duplicate] [--txn HEX]".into(),
         ],
+        flags: vec![],
+        sources: vec![],
         description: vec![
             "Stores text as a memory. Inherits the session's sticky --context and active transaction when those flags are omitted. ENCODE happens against the current agent (use `\\agent` to see the binding).".into(),
             "Deduplication is ON by default — encoding the same text twice in the same context returns the existing memory rather than creating a duplicate. Pass --allow-duplicate to force a fresh write (use this for episodic memory where the same content is a genuinely distinct event).".into(),
         ],
+        example: None,
         see_also: vec!["recall".into(), "forget".into(), "link".into()],
+        reference: None,
     }
 }
 
@@ -160,10 +167,14 @@ fn help_recall() -> HelpVerb {
             "recall <QUERY> [--top-k N] [--confidence F]".into(),
             "       [--filter-context N]... [--filter-kind K]... [--txn HEX]".into(),
         ],
+        flags: vec![],
+        sources: vec![],
         description: vec![
             "Retrieve memories whose embedding is similar to the query text. The returned ids are remembered in the session for tab-completion, so the next `forget` / `link` can refer to them by short id.".into(),
         ],
+        example: None,
         see_also: vec!["encode".into(), "reason".into()],
+        reference: None,
     }
 }
 
@@ -172,10 +183,14 @@ fn help_plan() -> HelpVerb {
         name: "plan".into(),
         tagline: "plan a path".into(),
         usage: vec!["plan <FROM> <TO> [--max-steps N] [--max-wall-time-ms N]".into()],
+        flags: vec![],
+        sources: vec![],
         description: vec![
             "Plan a path between two textual states. Returns an ordered list of intermediate memories that bridge the gap.".into(),
         ],
+        example: None,
         see_also: vec!["reason".into(), "recall".into()],
+        reference: None,
     }
 }
 
@@ -186,10 +201,14 @@ fn help_reason() -> HelpVerb {
         usage: vec![
             "reason <OBSERVATION> [--depth N] [--confidence F] [--max-inferences N]".into(),
         ],
+        flags: vec![],
+        sources: vec![],
         description: vec![
             "Reason about a textual observation; returns a list of inference steps with the chain of supporting memories.".into(),
         ],
+        example: None,
         see_also: vec!["recall".into(), "plan".into()],
+        reference: None,
     }
 }
 
@@ -198,11 +217,15 @@ fn help_forget() -> HelpVerb {
         name: "forget".into(),
         tagline: "tombstone a memory".into(),
         usage: vec!["forget <ID> [--mode soft|hard]".into()],
+        flags: vec![],
+        sources: vec![],
         description: vec![
             "Soft tombstones reclaim the slot after a grace period (default 7 days) — recoverable in case the operator changes their mind.".into(),
             "Hard erases zero the slot immediately. Use --mode hard only when content must be unrecoverable (right-to-be-forgotten / secret material).".into(),
         ],
+        example: None,
         see_also: vec!["encode".into(), "recall".into()],
+        reference: None,
     }
 }
 
@@ -211,10 +234,14 @@ fn help_link() -> HelpVerb {
         name: "link".into(),
         tagline: "add an explicit edge".into(),
         usage: vec!["link <SRC> <KIND> <TGT> [--weight F] [--txn HEX]".into()],
+        flags: vec![],
+        sources: vec![],
         description: vec![
             "Add a typed edge between two memories. KIND is one of: caused, followed-by, derived-from, similar-to, contradicts, supports, references, part-of.".into(),
         ],
+        example: None,
         see_also: vec!["unlink".into(), "recall".into()],
+        reference: None,
     }
 }
 
@@ -223,10 +250,14 @@ fn help_unlink() -> HelpVerb {
         name: "unlink".into(),
         tagline: "remove an edge".into(),
         usage: vec!["unlink <SRC> <KIND> <TGT> [--txn HEX]".into()],
+        flags: vec![],
+        sources: vec![],
         description: vec![
             "Remove a typed edge between two memories. Idempotent: removing a non-existent edge succeeds without error.".into(),
         ],
+        example: None,
         see_also: vec!["link".into()],
+        reference: None,
     }
 }
 
@@ -239,10 +270,14 @@ fn help_txn() -> HelpVerb {
             "txn commit <ID>               commit by id".into(),
             "txn abort <ID>                abort by id".into(),
         ],
+        flags: vec![],
+        sources: vec![],
         description: vec![
             "Within an active txn, subsequent encode/forget/link/unlink calls inherit the txn id unless --txn is passed explicitly. `\\unset txn` drops the session's active txn without affecting the server-side transaction.".into(),
         ],
+        example: None,
         see_also: vec!["encode".into(), "forget".into()],
+        reference: None,
     }
 }
 
@@ -251,12 +286,16 @@ fn help_subscribe() -> HelpVerb {
         name: "subscribe".into(),
         tagline: "live event stream".into(),
         usage: vec!["subscribe [--context N]... [--kind K]... [--collect N]".into()],
+        flags: vec![],
+        sources: vec![],
         description: vec![
             "Without --collect, streams forever — events render as they arrive, Ctrl-C or SIGTERM cancels cleanly (server-side registry entry is removed). With --collect N, blocks until N events arrive then exits.".into(),
             "Filters within a kind/context are OR; across (kind AND context) is AND. --start-lsn / WAL replay is not supported in v1.".into(),
             "In the REPL, bare `subscribe` blocks the prompt — prefer running it in a second terminal so the writer (encode / forget) can fire events.".into(),
         ],
+        example: None,
         see_also: vec!["encode".into(), "forget".into()],
+        reference: None,
     }
 }
 
@@ -282,10 +321,14 @@ fn help_meta() -> HelpVerb {
             "\\agent list|show|use|create|set-default  manage named agents".into(),
             "\\q                            exit (alias for quit)".into(),
         ],
+        flags: vec![],
+        sources: vec![],
         description: vec![
             "Session-only settings (the first block) live until quit. Persisted commands (`\\config set`, `\\agent use`, `\\agent set-default`) write to ~/.config/brain/config.toml and survive across sessions.".into(),
         ],
+        example: None,
         see_also: vec![],
+        reference: None,
     }
 }
 
