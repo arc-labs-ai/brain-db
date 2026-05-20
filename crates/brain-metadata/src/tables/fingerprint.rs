@@ -86,10 +86,17 @@ impl redb::Value for FingerprintEntry {
     where
         Self: 'a,
     {
-        let archived =
-            rkyv::check_archived_root::<FingerprintEntry>(data).expect("invariant: valid rkyv");
-        rkyv::Deserialize::deserialize(archived, &mut rkyv::Infallible)
-            .expect("invariant: deserialize")
+        // rkyv 0.7's validation requires 8-byte alignment for archives
+        // containing u64 fields. redb hands us &[u8] borrowed from the
+        // backing page at arbitrary alignment — frequently 4-aligned,
+        // which trips the validator on every recall whose row didn't
+        // happen to land on an 8-byte boundary. Copy into an
+        // AlignedVec first, matching IdempotencyEntry / MemoryMetadata
+        // / EdgeData / CheckpointMeta which all hit the same hazard.
+        let mut buf = rkyv::AlignedVec::with_capacity(data.len());
+        buf.extend_from_slice(data);
+        rkyv::from_bytes::<FingerprintEntry>(&buf)
+            .expect("FingerprintEntry bytes failed rkyv validation; redb file is corrupt")
     }
 
     fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
@@ -172,6 +179,31 @@ mod tests {
     fn content_hash_stable_across_calls() {
         assert_eq!(content_hash("hello world"), content_hash("hello world"));
         assert_ne!(content_hash("hello world"), content_hash("hello  world"));
+    }
+
+    /// Regression for the 2026-05-20 panic. redb hands `from_bytes` a
+    /// `&[u8]` borrowed from the backing page at arbitrary alignment,
+    /// frequently 4 instead of 8. The earlier `check_archived_root`
+    /// path rejected anything not 8-aligned, which manifested as a
+    /// shard-killing panic on the second dedup lookup of the session
+    /// (the first one happened to land aligned, the second didn't).
+    /// Force the path on a deliberately-misaligned slice.
+    #[test]
+    fn from_bytes_handles_misaligned_input() {
+        use redb::Value;
+
+        let entry = FingerprintEntry::new(memory(0, 17), 1_700_000_000_000_000_000);
+        let bytes = <FingerprintEntry as Value>::as_bytes(&entry);
+
+        // Build a buffer where the entry starts at offset 1 — that
+        // forces a 1-byte alignment, which would have panicked under
+        // the old check_archived_root path. The AlignedVec copy
+        // inside from_bytes is what makes this safe.
+        let mut misaligned = vec![0u8; bytes.len() + 1];
+        misaligned[1..].copy_from_slice(&bytes);
+
+        let decoded = <FingerprintEntry as Value>::from_bytes(&misaligned[1..]);
+        assert_eq!(decoded, entry);
     }
 
     #[test]
