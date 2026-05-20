@@ -30,12 +30,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use brain_core::{ContextId, MemoryId, MemoryKind, NodeRef};
 use brain_planner::WriterError;
 use brain_protocol::responses::types::EventType;
-use brain_storage::wal::record::Lsn;
+use brain_storage::wal::record::{Lsn, WalRecord};
 
 use crate::apply::{dispatch, ApplyError};
 use crate::ops::subscribe::{edge_payload_to_event, EventEnvelope};
 use crate::write::{Phase, PhaseAck, TombstoneTarget, Write, WriteAck, WriteId};
 
+use super::wal_map::phase_to_wal_payload;
 use super::RealWriterHandle;
 
 /// In-memory idempotency cache. Indexed by [`WriteId`] → cached ack.
@@ -100,8 +101,16 @@ impl RealWriterHandle {
             return Ok((*cached).clone());
         }
 
-        // 2-4. Open wtxn, apply each phase, commit.
+        // 2. WAL append (P3b first slice). For single-phase writes
+        // whose phase has a typed WalPayload mapping we append before
+        // the wtxn opens — same ordering as the legacy
+        // submit_encode/forget/link/unlink paths. Multi-phase writes
+        // and phases without a payload mapping skip WAL today; their
+        // WAL story lands in later P3b slices.
         let started_at = self.now_unix_nanos_or_zero(write.started_at_unix_nanos);
+        let lsn_first = wal_append_for_write(self, &write, started_at).await?;
+
+        // 3-5. Open wtxn, apply each phase, commit.
         let phase_acks: Vec<PhaseAck> = {
             let mut db = self.metadata().lock();
             let wtxn = db
@@ -133,8 +142,8 @@ impl RealWriterHandle {
         let ack = WriteAck {
             write_id: write.write_id,
             committed_at_unix_nanos: committed_at,
-            lsn_first: Lsn(0),
-            lsn_last: Lsn(0),
+            lsn_first: lsn_first.unwrap_or(Lsn(0)),
+            lsn_last: lsn_first.unwrap_or(Lsn(0)),
             phase_acks,
         };
         let arc_ack = Arc::new(ack.clone());
@@ -159,6 +168,46 @@ fn now_unix_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+/// First slice of P3b: append a typed WAL record per phase that has
+/// a mapping. Returns the LSN of the first appended record so events
+/// can stamp it. `None` means no WAL record was written (either no
+/// sink wired, or no phase had a mapping today).
+///
+/// Single-phase coverage only — multi-phase writes (TxnBegin/Commit
+/// envelope) are a follow-up.
+async fn wal_append_for_write(
+    writer: &RealWriterHandle,
+    write: &Write,
+    started_at_unix_nanos: u64,
+) -> Result<Option<Lsn>, WriterError> {
+    let Some(sink) = writer.wal_sink_ref() else {
+        return Ok(None);
+    };
+    // Multi-phase support lands in a follow-up; for now skip WAL for
+    // multi-phase writes (they still hit redb correctly — durability
+    // gap is bounded and recoverable from redb's own fsync).
+    if write.phases.len() != 1 {
+        return Ok(None);
+    }
+    let Some(payload) = phase_to_wal_payload(&write.phases[0], write) else {
+        return Ok(None);
+    };
+    let agent_bytes: [u8; 16] = write.agent_id.into();
+    let agent_id_lo64 = u64::from_be_bytes(agent_bytes[8..16].try_into().unwrap_or([0; 8]));
+    let record = WalRecord::from_typed(
+        Lsn(0),
+        /* flags */ 0,
+        started_at_unix_nanos,
+        agent_id_lo64,
+        &payload,
+    );
+    let lsn = sink
+        .append(record)
+        .await
+        .map_err(|e| WriterError::Internal(format!("wal append: {e}")))?;
+    Ok(Some(lsn))
 }
 
 /// Publish one event per phase that has a wire-side counterpart.

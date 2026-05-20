@@ -255,6 +255,15 @@ impl RealWriterHandle {
         self.events.as_ref()
     }
 
+    /// Accessor for the optional WAL sink. Lets the unified
+    /// `submit(Write)` path append durable records before opening
+    /// the redb wtxn. `None` when the writer was constructed without
+    /// `with_wal_sink` (test path).
+    #[must_use]
+    pub(crate) fn wal_sink_ref(&self) -> Option<&Arc<dyn wal_sink::WalSink>> {
+        self.wal_sink.as_ref()
+    }
+
     #[must_use]
     pub fn with_agent_id(mut self, agent_id: AgentId) -> Self {
         self.agent_id = agent_id;
@@ -533,6 +542,7 @@ mod forget;
 mod link;
 pub mod submit;
 mod unlink;
+pub mod wal_map;
 pub mod wal_sink;
 
 use encode::do_encode;
