@@ -793,6 +793,11 @@ fn wal_kind_for_event(
         P::RelationSuperseded(_) => K::RelationSupersede,
         P::RelationTombstoned(_) => K::RelationTombstone,
         P::SchemaUpdated(_) => K::SchemaUpdate,
-        P::ExtractionCompleted(_) | P::ExtractionFailed(_) => return None,
+        // Extractor-published signals don't have a WAL kind — they're
+        // emitted as live change-feed events by the worker, not
+        // replayed from the WAL.
+        P::ExtractionCompleted(_) | P::ExtractionFailed(_) | P::ExtractedKnowledge(_) => {
+            return None
+        }
     })
 }

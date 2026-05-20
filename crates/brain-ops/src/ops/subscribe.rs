@@ -371,7 +371,8 @@ impl EventEnvelope {
                     KnowledgeEventPayload::RelationTombstoned(_) => EventType::RelationTombstoned,
                     KnowledgeEventPayload::SchemaUpdated(_) => EventType::SchemaUpdated,
                     KnowledgeEventPayload::ExtractionCompleted(_)
-                    | KnowledgeEventPayload::ExtractionFailed(_) => return Vec::new(),
+                    | KnowledgeEventPayload::ExtractionFailed(_)
+                    | KnowledgeEventPayload::ExtractedKnowledge(_) => return Vec::new(),
                 };
                 vec![Self {
                     lsn,
