@@ -36,13 +36,20 @@ field semantics.
 
 ### `--filter-context <N>` (repeatable)
 
-Keep only results from these context ids. Repeat the flag once per id:
+Keep only results from these context ids. Repeat the flag once
+per id; up to 16 in a single query. No filter → search the
+agent's union of contexts (rarely what you want — see below).
 
 ```bash
 brain recall "build status" --filter-context 4 --filter-context 7
 ```
 
-No filter → search the agent's union of contexts.
+Contexts are the substrate's coarse partition. Most recalls
+want exactly one context filter so high-salience memories from
+unrelated projects don't crowd out the relevant ones. For the
+full story (why contexts exist, how they get created, when to
+use the default vs explicit), see
+[`docs/concepts/26-contexts.md`](../../../concepts/26-contexts.md).
 
 ### `--filter-kind <KIND>` (repeatable)
 

@@ -52,13 +52,18 @@ returns control via the standard exit path.
 
 ### `--context <N>` (repeatable)
 
-Subscribe only to events from these context ids. Repeat once per id:
+Subscribe only to events from these context ids. Repeat once
+per id; up to 16. No filter → events from every context the
+agent can see.
 
 ```bash
 brain subscribe --context 4 --context 7
 ```
 
-No filter → events from every context the agent can see.
+The wire's `context_id` is the substrate's coarse partition;
+filtering at subscribe time keeps cross-context event noise
+out of your stream. For when to scope subscriptions vs not,
+see [`docs/concepts/26-contexts.md`](../../../concepts/26-contexts.md).
 
 ### `--kind <KIND>` (repeatable)
 

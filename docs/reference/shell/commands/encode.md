@@ -56,13 +56,47 @@ brain encode --vector "0.01,-0.04,...,0.07"
 
 ### `--context <N>`
 
-Context id (`u64`). Defaults to `0`, or to the session's sticky context
-if set. Contexts are the substrate's namespace boundary — RECALL with
-`--filter-context N` reads only that context's memories.
+Context id (`u64`). Defaults to `0` (the **default context** —
+always present, can't be deleted), or to the session's sticky
+context set via `\set context N` if you're in the REPL.
+
+Contexts are the substrate's coarse partition of an agent's
+memories. Same agent, different `--context` values → separate
+memory pools that don't mix on recall, don't dedup across, and
+don't share salience ranking. The wire field is a `u64`
+allocated lazily on first reference — pass any positive
+integer and the substrate creates the context if it doesn't
+exist yet. No "create context first" step needed.
 
 ```bash
-brain encode "team standup" --context 7
+# Bare — lands in context 0 (default).
+brain encode "casual note"
+
+# Explicit context. Created lazily.
+brain encode "atlas project standup" --context 7
+
+# In the REPL with a sticky context, the flag is the override.
+brain> \set context 7
+brain[ctx=7]> encode "..."             # lands in 7
+brain[ctx=7]> encode "..." --context 9 # lands in 9 (override)
 ```
+
+**Same text, different contexts → different memories.** Dedup is
+keyed on `(agent_id, context_id, content_hash)`, so a memory
+encoded into context 7 is a different memory from the same text
+in context 12, and the substrate won't merge them:
+
+```bash
+brain encode "the build broke" --context 7    # m1
+brain encode "the build broke" --context 12   # m2 (different memory)
+brain encode "the build broke" --context 7    # dedup hit → returns m1
+```
+
+**For the full story** — when to use `0` vs explicit contexts,
+the lazy-creation model, anti-patterns ("contexts as tags",
+"contexts as access control"), best practices, and how contexts
+interact with edges, salience, and the knowledge layer — see
+[`docs/concepts/26-contexts.md`](../../../concepts/26-contexts.md).
 
 ### `--kind episodic|semantic|consolidated`
 
@@ -101,7 +135,7 @@ The response surfaces this in `dedup=`:
 | `dedup=` | Meaning |
 |---|---|
 | `off` | `--allow-duplicate` was passed; no fingerprint check ran. |
-| `miss` | Dedup was on; no existing memory matched; fresh slot allocated. |
+| `miss`| Dedup was on; no existing memory matched; fresh slot allocated. |
 | `hit` | Dedup was on; existing memory matched; returned its id. |
 
 **Dedup scope.** Per `(shard, agent_id, context_id)`. The same text
