@@ -2,7 +2,10 @@
 //! argv and per-line REPL input.
 
 pub mod command;
+pub mod help_intent;
 pub mod tokenize;
+
+pub use help_intent::{detect_help_intent, HelpIntent};
 
 pub use command::{
     format_txn_id, parse_server, parse_txn_id, AgentCommand, Cli, ColorMode, Command,

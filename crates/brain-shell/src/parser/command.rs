@@ -261,6 +261,41 @@ pub enum Command {
     GenerateCompletion(GenerateCompletionArgs),
 }
 
+impl Command {
+    /// Canonical verb name, used by the unified help dispatcher to
+    /// look up the matching `HelpVerb` fixture when the user passes
+    /// `--help` on a subcommand. Knowledge-layer subcommands return
+    /// the parent verb name (`"entity"` etc.) so a single card covers
+    /// all of `entity list / show / neighbors`. Variants without a
+    /// per-verb card (`Shell`, `GenerateCompletion`, `Config`, `Agent`)
+    /// route to the top-level help.
+    #[must_use]
+    pub fn verb_name(&self) -> Option<&'static str> {
+        match self {
+            Command::Encode(_) => Some("encode"),
+            Command::Recall(_) => Some("recall"),
+            Command::Plan(_) => Some("plan"),
+            Command::Reason(_) => Some("reason"),
+            Command::Forget(_) => Some("forget"),
+            Command::Link(_) => Some("link"),
+            Command::Unlink(_) => Some("unlink"),
+            Command::Txn(_) => Some("txn"),
+            Command::Subscribe(_) => Some("subscribe"),
+            Command::Info => Some("meta"),
+            // No per-verb card → caller falls through to top-level help.
+            Command::Config(_)
+            | Command::Agent(_)
+            | Command::Entity(_)
+            | Command::Statement(_)
+            | Command::Relation(_)
+            | Command::Mention(_)
+            | Command::Extract(_)
+            | Command::Shell
+            | Command::GenerateCompletion(_) => None,
+        }
+    }
+}
+
 /// `brain entity <…>` subcommands.
 #[derive(Debug, Clone, Subcommand)]
 pub enum EntityCommand {

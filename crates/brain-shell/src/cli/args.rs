@@ -19,6 +19,28 @@ use crate::session::Session;
 
 /// Entry point used by both `main` and integration tests.
 pub async fn dispatch_argv(argv: Vec<String>) -> ExitCode {
+    // ── unified help interception (pre-clap) ──────────────────────
+    // clap validates required positional args before surfacing global
+    // flags, so `brain recall --help` would fail "missing <QUERY>"
+    // without this short-circuit. The pre-scan respects `--` so
+    // `brain encode -- --help` (encode the literal text) still works.
+    // `--color` / `--hyperlinks` overrides are not honoured on the
+    // help path — we'd have to re-implement clap to read them safely
+    // before the parse, and `auto` is the right default for help.
+    if let Some(intent) = crate::parser::detect_help_intent(&argv) {
+        let ctx = commands::render_ctx(
+            OutputFormatArg::Table,
+            crate::parser::ColorMode::Auto,
+            crate::parser::HyperlinkMode::Auto,
+        );
+        let mut stdout = std::io::stdout();
+        if let Err(e) = repl::help::render(intent.verb.as_deref(), &ctx, &mut stdout) {
+            eprintln!("output error: {e}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+
     let cli = match Cli::try_parse_from(argv) {
         Ok(cli) => cli,
         Err(e) => {

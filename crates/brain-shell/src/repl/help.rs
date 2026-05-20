@@ -7,6 +7,21 @@ use brain_explore::{
     HelpFlagRow, HelpItem, HelpReference, HelpSection, HelpTopLevel, HelpUnknown, HelpVerb, Render,
 };
 
+/// Render the help card for `verb` directly to `w` using `ctx`'s
+/// terminal policy + theme. Centralises the "look up + dispatch"
+/// pairing so the three help entry points — the REPL's `help <verb>`
+/// command, `<verb> --help` interception in the REPL line dispatcher,
+/// and `<verb> --help` interception in the one-shot CLI dispatcher —
+/// stay byte-identical for the same `RenderCtx`.
+pub fn render(
+    verb: Option<&str>,
+    ctx: &brain_explore::RenderCtx,
+    w: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    let payload = lookup(verb);
+    brain_explore::dispatch(payload.as_ref(), ctx, w)
+}
+
 /// Look up help for `verb`. Returns a boxed [`Render`] payload because
 /// the three concrete types (top-level, per-verb, unknown) all need to
 /// flow through the same dispatcher and a `Box<dyn Render>` is the

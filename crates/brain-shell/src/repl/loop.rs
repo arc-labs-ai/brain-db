@@ -84,8 +84,26 @@ pub async fn run(
         }
         let argv: Vec<String> = std::iter::once("brain".to_string()).chain(tokens).collect();
 
+        // Unified help interception (pre-clap). Same reasoning as in
+        // cli/args.rs — clap rejects `recall --help` for missing
+        // <QUERY> otherwise. The pre-scan respects `--` so encoding
+        // the literal text `--help` via `encode -- --help` works.
+        if let Some(intent) = crate::parser::detect_help_intent(&argv) {
+            let ctx = render_ctx(
+                session.output.clone(),
+                crate::parser::ColorMode::Auto,
+                crate::parser::HyperlinkMode::Auto,
+            );
+            let mut stdout = std::io::stdout();
+            if let Err(e) = help::render(intent.verb.as_deref(), &ctx, &mut stdout) {
+                eprintln!("output error: {e}");
+            }
+            continue;
+        }
+
         match Cli::try_parse_from(&argv) {
-            Ok(cli) => match cli.subcommand {
+            Ok(cli) => {
+                match cli.subcommand {
                 None | Some(Command::Shell) => {
                     eprintln!("(already in the shell)");
                 }
@@ -114,7 +132,8 @@ pub async fn run(
                 Some(cmd) => {
                     run_one(&client, &mut session, cmd, &cli.global).await;
                 }
-            },
+                }
+            }
             Err(e) => {
                 eprint!("{e}");
             }
