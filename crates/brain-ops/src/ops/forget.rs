@@ -1,15 +1,20 @@
 //! FORGET handler (sub-task 7.7 + 7.9 transactional path).
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use brain_core::MemoryId;
-use brain_planner::{execute_forget, plan_forget_inner, ForgetOp, ForgetOutcome};
-use brain_protocol::request::ForgetRequest;
+use brain_planner::{plan_forget_inner, ForgetOp, ForgetOutcome};
+use brain_protocol::request::{ForgetMode, ForgetRequest};
 use brain_protocol::response::ForgetResponse;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
 use crate::idempotency::hash_forget_request;
+use crate::ops::link::downcast_writer_pub;
 use crate::ops::text_indexer::MemoryTextOp;
 use crate::txn::{BufferedForget, BufferedReplay};
+use crate::write::phase::TombstoneMode as PhaseTombstoneMode;
+use crate::write::{Phase, PhaseAck, TombstoneTarget, Write, WriteId};
 
 pub async fn handle_forget(
     req: ForgetRequest,
@@ -20,26 +25,52 @@ pub async fn handle_forget(
     }
 
     let memory_id_wire = req.memory_id;
-    let plan = plan_forget_inner(&req, &ctx.planner_ctx)?;
-    let result = execute_forget(plan, &ctx.executor).await?;
+    // Validate input (mode range etc.) via the existing planner check.
+    let _ = plan_forget_inner(&req, &ctx.planner_ctx)?;
 
+    let memory_id = MemoryId::from(memory_id_wire);
+
+    // Peek MEMORIES_TABLE: distinguish MemoryNotFound /
+    // AlreadyTombstoned / Tombstoned. apply_tombstone_memory returns
+    // NotFound for missing rows; legacy wire semantic treats that as
+    // a successful no-op with was_already_forgotten=true. So we
+    // branch pre-submit rather than swallowing the apply error.
+    let outcome = peek_forget_outcome(ctx, memory_id)?;
     let was_already_forgotten = matches!(
-        result.outcome,
+        outcome,
         ForgetOutcome::AlreadyTombstoned | ForgetOutcome::MemoryNotFound
     );
 
-    // §27/02 §2: FORGET drops the memory_text index row.
-    // Dispatch only when the row could actually exist (i.e. we
-    // didn't no-op on a missing memory) — keeps the queue tight
-    // on idempotent FORGET retries.
-    if let Some(dispatcher) = ctx.memory_text_dispatcher.as_ref() {
-        if !matches!(result.outcome, ForgetOutcome::MemoryNotFound) {
+    // Drop the lexical-index row when we'll actually tombstone.
+    // Matches the legacy gate.
+    if matches!(outcome, ForgetOutcome::Tombstoned) {
+        if let Some(dispatcher) = ctx.memory_text_dispatcher.as_ref() {
             dispatcher
-                .dispatch(MemoryTextOp::Forget {
-                    id: MemoryId::from(memory_id_wire),
-                })
+                .dispatch(MemoryTextOp::Forget { id: memory_id })
                 .await;
         }
+
+        // Only submit a Write when the memory actually exists active.
+        // AlreadyTombstoned + MemoryNotFound are wire-level no-ops.
+        let real_writer = downcast_writer_pub(ctx)?;
+        let phase = Phase::Tombstone {
+            target: TombstoneTarget::Memory {
+                id: memory_id,
+                mode: map_mode(req.mode),
+            },
+            reason: 1, // ClientRequest
+            at_unix_nanos: now_unix_nanos(),
+        };
+        let write = Write::single(
+            WriteId::from_request(brain_core::RequestId::from(req.request_id)),
+            ctx.executor.caller_agent,
+            phase,
+        );
+        let ack = real_writer
+            .submit(write)
+            .await
+            .map_err(|e| OpError::ExecError(brain_planner::ExecError::WriterFailed(e)))?;
+        debug_assert!(matches!(ack.single_phase(), PhaseAck::Tombstoned(_)));
     }
 
     Ok(ForgetResponse {
@@ -47,6 +78,45 @@ pub async fn handle_forget(
         was_already_forgotten,
         edges_removed: 0,
     })
+}
+
+/// Read MEMORIES_TABLE to classify the FORGET outcome before submit.
+/// Returns `MemoryNotFound` when no row exists, `AlreadyTombstoned`
+/// when the row is present but inactive, `Tombstoned` for the
+/// "actually do the work" case.
+fn peek_forget_outcome(ctx: &OpsContext, id: MemoryId) -> Result<ForgetOutcome, OpError> {
+    let db_guard = ctx.executor.metadata.lock();
+    let rtxn = db_guard.read_txn().map_err(|e| {
+        OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
+    })?;
+    let t = rtxn
+        .open_table(brain_metadata::tables::memory::MEMORIES_TABLE)
+        .map_err(|e| {
+            OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
+        })?;
+    let Some(guard) = t.get(id.to_be_bytes()).ok().flatten() else {
+        return Ok(ForgetOutcome::MemoryNotFound);
+    };
+    let row = guard.value();
+    if row.flags & brain_metadata::tables::memory::flags::ACTIVE == 0 {
+        Ok(ForgetOutcome::AlreadyTombstoned)
+    } else {
+        Ok(ForgetOutcome::Tombstoned)
+    }
+}
+
+fn map_mode(mode: ForgetMode) -> PhaseTombstoneMode {
+    match mode {
+        ForgetMode::Soft => PhaseTombstoneMode::Soft,
+        ForgetMode::Hard => PhaseTombstoneMode::Hard,
+    }
+}
+
+fn now_unix_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 async fn handle_forget_in_txn(

@@ -121,6 +121,12 @@ fn peek_link_state(
 /// so we can call its `submit(Write)` method. Wire handlers that
 /// migrate to the unified path go through this helper.
 fn downcast_writer(ctx: &OpsContext) -> Result<&RealWriterHandle, OpError> {
+    downcast_writer_pub(ctx)
+}
+
+/// pub(crate) version of [`downcast_writer`] for other handler
+/// modules to use as they migrate to submit(Write).
+pub(crate) fn downcast_writer_pub(ctx: &OpsContext) -> Result<&RealWriterHandle, OpError> {
     ctx.executor
         .writer
         .as_any()
