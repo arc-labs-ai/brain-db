@@ -3,7 +3,6 @@
 //! lives here, the layout lives in brain-explore so the shell and CLI
 //! pick up the same visual language.
 
-#[allow(unused_imports)] // HelpFlagRow + HelpReference land in H3-H6 fixtures
 use brain_explore::{
     HelpFlagRow, HelpItem, HelpReference, HelpSection, HelpTopLevel, HelpUnknown, HelpVerb, Render,
 };
@@ -139,23 +138,73 @@ fn item(signature: &str, flags: &str, description: &str) -> HelpItem {
 
 // ── per-verb cards ──────────────────────────────────────────────────
 
+/// Construct a [`HelpFlagRow`]. Tiny shim that keeps each fixture's
+/// flag table readable as a `[(sig, desc), …]` literal instead of an
+/// inline struct constructor on every row.
+fn row(sig: &str, desc: &str) -> HelpFlagRow {
+    HelpFlagRow {
+        signature: sig.to_string(),
+        description: desc.to_string(),
+    }
+}
+
+/// Build the per-verb markdown reference path. Centralises the
+/// `docs/reference/shell/commands/<verb>.md` convention so a future
+/// docs reorg only edits one place.
+fn doc_for(verb: &str) -> String {
+    format!("docs/reference/shell/commands/{verb}.md")
+}
+
 fn help_encode() -> HelpVerb {
     HelpVerb {
         name: "encode".into(),
         tagline: "write a memory".into(),
         usage: vec![
-            "encode <TEXT> [--context N] [--kind episodic|semantic|consolidated]".into(),
-            "       [--salience F] [--allow-duplicate] [--txn HEX]".into(),
+            "encode <TEXT> [flags]".into(),
+            "encode --from-file <PATH> [flags]".into(),
+            "encode --from-stdin [flags]".into(),
         ],
-        flags: vec![],
-        sources: vec![],
+        flags: vec![
+            row("--context N", "u64; default 0; sticky via \\set context"),
+            row(
+                "--kind K",
+                "episodic | semantic | consolidated (default: episodic)",
+            ),
+            row("--salience F", "[0.0, 1.0]; default 0.5"),
+            row(
+                "--allow-duplicate",
+                "force fresh write; dedup is ON by default",
+            ),
+            row("--edge KIND:ID", "add edge at create time; repeatable"),
+            row("--request-id UUID", "idempotency key (24h cache)"),
+            row(
+                "--wait-for-extraction",
+                "block until knowledge layer extracts",
+            ),
+            row("--txn HEX", "attach to an open transaction"),
+        ],
+        sources: vec![
+            row("<TEXT>", "inline string (the default)"),
+            row("--from-file P", "read from file (use - for stdin)"),
+            row("--from-stdin", "shorthand for --from-file -"),
+            row("--vector CSV", "gated — panics today; see Notes"),
+        ],
         description: vec![
-            "Stores text as a memory. Inherits the session's sticky --context and active transaction when those flags are omitted. ENCODE happens against the current agent (use `\\agent` to see the binding).".into(),
-            "Deduplication is ON by default — encoding the same text twice in the same context returns the existing memory rather than creating a duplicate. Pass --allow-duplicate to force a fresh write (use this for episodic memory where the same content is a genuinely distinct event).".into(),
+            "Dedup is on by default — encoding the same text twice in the same (agent, context) returns the existing memory. Pass --allow-duplicate for episodic events where the same content is a genuinely distinct event.".into(),
+            "Inherits the session's sticky --context (set via \\set context N) and active txn (begun via `txn begin`) unless the corresponding flag overrides. The card shows the caller's agent in wide output (`-o wide`).".into(),
+            "--vector and --from-file *.jsonl are parsed today but not wired server-side — they panic / return a stub error. The other flags work as documented.".into(),
         ],
-        example: None,
-        see_also: vec!["recall".into(), "forget".into(), "link".into()],
-        reference: None,
+        example: Some(r#"encode "Alice merged the auth-rewrite branch" --context 7"#.into()),
+        see_also: vec![
+            "recall".into(),
+            "forget".into(),
+            "link".into(),
+            "subscribe".into(),
+        ],
+        reference: Some(HelpReference {
+            clap_command: "encode --help".into(),
+            doc_path: Some(doc_for("encode")),
+        }),
     }
 }
 
@@ -383,6 +432,54 @@ mod tests {
         let lower = lookup(Some("encode"));
         assert_eq!(payload_kind(upper.as_ref()), payload_kind(lower.as_ref()));
         assert_eq!(payload_kind(upper.as_ref()), "help-verb");
+    }
+
+    /// Render the verb's card to a plain-policy table and return the
+    /// raw string so per-verb regression tests can grep for flag names.
+    fn render_card_table(verb: &HelpVerb) -> String {
+        use brain_explore::{RenderCtx, TermPolicy, Theme};
+        let ctx = RenderCtx {
+            policy: TermPolicy::plain(),
+            theme: Theme::default(),
+            format: brain_explore::OutputFormat::Table,
+        };
+        let mut buf = Vec::new();
+        brain_explore::dispatch(verb, &ctx, &mut buf).expect("render");
+        String::from_utf8(buf).expect("utf8")
+    }
+
+    #[test]
+    fn help_encode_lists_every_documented_flag() {
+        // Regression guard: if a flag from the reference doc isn't in
+        // the card, the card lies to the user about what flags exist.
+        let card = render_card_table(&help_encode());
+        for flag in [
+            "--context",
+            "--kind",
+            "--salience",
+            "--allow-duplicate",
+            "--edge",
+            "--request-id",
+            "--wait-for-extraction",
+            "--txn",
+        ] {
+            assert!(card.contains(flag), "missing flag {flag} in:\n{card}");
+        }
+        // Sources block must list all four source forms.
+        for source in ["<TEXT>", "--from-file", "--from-stdin", "--vector"] {
+            assert!(
+                card.contains(source),
+                "missing source {source} in:\n{card}"
+            );
+        }
+        // Reference block must surface clap + markdown deep-dive.
+        assert!(card.contains("encode --help"), "missing clap reference");
+        assert!(
+            card.contains("docs/reference/shell/commands/encode.md"),
+            "missing markdown reference"
+        );
+        // Example line must be present.
+        assert!(card.contains("Example"), "missing Example label");
     }
 
     #[test]
