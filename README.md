@@ -8,25 +8,38 @@
 
 **Status:** Specification complete — 32 sections covering both the substrate (§00–§16) and the knowledge layer (§17–§31). Implementation is phased: substrate phases 0–12 shipped; phases 13–14 (benchmarks + substrate acceptance) close the substrate; phases 15–24 deliver the knowledge layer. The `v1.0.0` tag lands at the end of Phase 24, after the combined acceptance suite passes.
 
-```rust
-// 1. Substrate-only: encode an experience, recall what's relevant.
-brain.encode("Had a difficult conversation with Alex about the project").await?;
-let memories = brain.recall("conflicts with Alex").top_k(5).await?;
-//   → ranked by semantic similarity, edge proximity, temporal recency,
-//     and salience — not just vector distance.
+```text
+$ brain
+─────────────────────────────────────────────────────────────────────────────
+  ◉ brain-shell  v1.0.0  ·  connected to 127.0.0.1:9090
 
-// 2. Declare a schema; the knowledge layer comes alive.
-brain.schema_upload(include_str!("acme.brain")).await?;
-brain.encode("Priya kicked off the billing rewrite project today").await?;
-//   → background extractors create: entity Priya, entity Project(billing rewrite),
-//     statement Event(Priya, kicked_off, billing rewrite), relation Priya→Project.
+  agent       agent-019e433e
+              019e433e-9272-7e70-b071-4a4fd6135d1e
+              auto-minted on first run · stored at ~/.config/brain/config.toml
 
-// 3. Hybrid query: semantic + lexical + graph retrieval, RRF-fused.
-let results = brain.query()
-    .text("what's Priya working on?")
-    .filter_subject_entity("priya")
-    .top_k(10)
-    .await?;
+  Type `help` for commands, `quit` to exit.
+─────────────────────────────────────────────────────────────────────────────
+
+# 1. Substrate-only: encode an experience, recall what's relevant.
+brain> encode "Had a difficult conversation with Alex about the project"
+  ✓ ENCODED                                          LSN 1 · s1/m1/v1 ·  9 ms
+  content   "Had a difficult conversation with Alex about the project"
+  type      episodic      salience  0.50      context  0
+
+brain> recall "conflicts with Alex" --top-k 5
+  # → ranked by semantic similarity, edge proximity, temporal recency,
+  #   and salience — not just vector distance.
+
+# 2. Once a schema is declared (today via the SDK), the knowledge layer
+#    comes alive — subsequent encodes go through pattern → classifier →
+#    LLM extractors, producing typed entities, statements, and relations.
+brain> encode "Priya kicked off the billing rewrite project today"
+  ✓ ENCODED                                          LSN 2 · s1/m2/v1 · 11 ms
+  → next    subscribe --start-lsn 3   to watch for extraction
+
+# 3. Hybrid retrieval is transparent: with a schema declared, RECALL
+#    routes through semantic + lexical + graph retrievers, RRF-fused.
+brain> recall "what's Priya working on?" --include-graph
 ```
 
 ---
@@ -121,42 +134,50 @@ Eight verbs at the substrate level (spec [§09](spec/09_cognitive_operations/)):
 | **LINK / UNLINK** | Manually assert / retract a typed edge between two memories. |
 | **SUBSCRIBE** | Stream events: memory created, statement created, extractor failed, schema updated, etc. |
 
-```rust
-use brain_sdk::{Client, EdgeKind, ForgetMode, PlanState, PlanBudget};
+One-shot mode (each invocation runs a single verb and exits):
 
-let brain = Client::connect("127.0.0.1:7860", "mind-agent-1").await?;
+```text
+$ brain encode "Alex pushed the deadline to next Friday" \
+    --edge followed-by:s1/m17/v1
+─────────────────────────────────────────────────────────────────────────────
+  ✓ ENCODED                                          LSN 42 · s1/m18/v1 · 8 ms
 
-// 1. Encode a memory; capture an edge to the previous turn.
-let memory = brain
-    .encode("Alex pushed the deadline to next Friday")
-    .edge(EdgeKind::FollowedBy, prev_turn_id)
-    .await?;
-println!("stored as {}, salience {:.2}", memory.id, memory.salience);
+  content   "Alex pushed the deadline to next Friday"
+  type      episodic      salience  0.50      context  0
+  edges     0 auto · 1 explicit · 1 total
+─────────────────────────────────────────────────────────────────────────────
 
-// 2. Later: recall everything related to deadlines and Alex.
-let mut results = brain.recall("when did Alex change the deadline?")
-    .top_k(5)
-    .include_edges(true)
-    .stream()
-    .await?;
-while let Some(r) = results.next().await {
-    println!("{:.2}  {}", r.confidence, r.text);
-}
+$ brain recall "when did Alex change the deadline?" --top-k 5 --include-text
+  # ranked table of memories, blended by similarity + salience + recency
+  # + edge proximity. Pipe `-o json` for machine-readable output.
 
-// 3. Plan from "current sprint" to "shipping the feature":
-let mut plan = brain.plan(
-        PlanState::ByText("current sprint state".into()),
-        PlanState::ByText("feature shipped".into()),
-    )
-    .budget(PlanBudget { max_steps: 8, max_wall_time_ms: 1_000, max_branches_explored: 50 })
-    .stream()
-    .await?;
-while let Some(step) = plan.next().await {
-    println!("step {}: {}", step.step_index, step.text);
-}
+$ brain plan "current sprint state" "feature shipped" \
+    --max-steps 8 --max-wall-time-ms 1000
+  # streamed plan steps, each with its text + confidence.
 
-// 4. Soft-forget when something becomes private:
-brain.forget(memory.id, ForgetMode::Soft).await?;
+$ brain forget s1/m18/v1 --mode soft
+  # tombstones the memory; grace window before reclamation (spec §05/06).
+```
+
+Or do the same inside the REPL — same verbs, no `brain` prefix:
+
+```text
+brain> encode "Alex pushed the deadline to next Friday" --edge followed-by:s1/m17/v1
+brain> recall "when did Alex change the deadline?" --top-k 5 --include-text
+brain> plan "current sprint state" "feature shipped" --max-steps 8
+brain> reason "Alex changed the deadline" --depth 3
+brain> forget s1/m18/v1 --mode soft
+brain> subscribe --kind episodic --collect 10
+```
+
+Encoding the same content twice is a no-op by default (dedup-on; pass
+`--allow-duplicate` if you genuinely want a second copy):
+
+```text
+brain> encode "Alex pushed the deadline to next Friday"
+  ⟳ DEDUP HIT                                              matched · s1/m18/v1
+  match     same content in context 0
+  × no fresh write — nothing to do
 ```
 
 ## The knowledge layer
