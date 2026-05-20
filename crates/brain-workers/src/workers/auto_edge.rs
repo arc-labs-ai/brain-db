@@ -213,6 +213,19 @@ async fn do_auto_edge_cycle(
             continue;
         }
 
+        // Zero-vector guard. Until the real embedder lands (Phase 9.10
+        // wires the BGE-small CpuDispatcher), the stub dispatcher hands
+        // every encode a [0; VECTOR_DIM] vector. Two such memories in
+        // HNSW make cosine similarity compute 0/0 = NaN, which
+        // contaminates the edge weight and crashes downstream consumers
+        // that expect a finite f32. Skip the memory outright — there's
+        // no useful similarity work to do when every vector is zero,
+        // and silently writing NaN-weighted edges is worse than
+        // refusing to write any.
+        if vector.iter().all(|component| *component == 0.0) {
+            continue;
+        }
+
         // Over-fetch by one so the self-hit doesn't eat into the
         // requested k. HNSW's search_active already filters tombstones,
         // so per-neighbour is_tombstoned checks would be redundant.
@@ -220,6 +233,16 @@ async fn do_auto_edge_cycle(
         let hits = index.search_active(&vector, fetch_k, knobs.ef_search);
         for (neighbour, similarity) in hits {
             if neighbour == source_id {
+                continue;
+            }
+            // NaN/Inf filter. The threshold comparison alone won't
+            // reject NaN because `NaN < threshold` is `false` per IEEE
+            // 754, so an unguarded path would push NaN-weighted edges
+            // into write_auto_edges. Belt-and-suspenders alongside the
+            // zero-vector guard above: that guard covers the source
+            // side, this one covers the neighbour-side path if HNSW
+            // ever returns a non-finite score for any other reason.
+            if !similarity.is_finite() {
                 continue;
             }
             if similarity < knobs.similarity_threshold {

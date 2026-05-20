@@ -443,3 +443,84 @@ fn channel_full_drops_enqueue_metric_bumps() {
         let _ = (a, b);
     });
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Regression: zero-vector + NaN-similarity guards.
+//
+// These cover the production crash diagnosed at 2026-05-20: the
+// NopDispatcher (still wired in brain-server until Phase 9.10 lands the
+// real BGE embedder) hands every encode a [0; VECTOR_DIM] vector. As
+// soon as ≥2 such memories live in HNSW, cosine similarity between any
+// two of them computes 0/0 = NaN. Without the guards in
+// `do_auto_edge_cycle`, NaN-weighted edges leak into write_auto_edges
+// and downstream consumers crash on the non-finite f32.
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn zero_vector_source_writes_no_edges() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        // Two zero-vector encodes. submit_encode pre-computes the
+        // vector (bypassing the embedder), so we can hand it exactly
+        // the NopDispatcher signature [0.0; VECTOR_DIM] without going
+        // through brain-ops::handle_encode.
+        let zero: [f32; VECTOR_DIM] = [0.0; VECTOR_DIM];
+        let a = submit_encode(&fix.ctx, encode_op(1, 0, zero)).await;
+        let b = submit_encode(&fix.ctx, encode_op(2, 1, zero)).await;
+
+        let worker = AutoEdgeWorker::new(fix.queue_rx.clone()).with_knobs(high_recall_knobs());
+        // Must not panic. Before the guard, this drove cosine(0, 0) = NaN
+        // into the link list, which then panicked write_auto_edges or
+        // downstream HNSW maintenance on the non-finite weight.
+        let drained = run_one_cycle(&worker, fix.ctx.clone()).await.unwrap();
+        assert_eq!(drained, 2, "both encodes are drained from the queue");
+
+        // The guard skips the source memory entirely when its vector
+        // is all zeros — no edges land in redb.
+        assert_eq!(
+            count_similar_out(&fix.metadata, a),
+            0,
+            "zero-vector source must not produce SimilarTo edges"
+        );
+        assert_eq!(
+            count_similar_out(&fix.metadata, b),
+            0,
+            "zero-vector source must not produce SimilarTo edges"
+        );
+        assert_eq!(
+            count_similar_total(&fix.metadata),
+            0,
+            "no SimilarTo rows of any kind"
+        );
+    });
+}
+
+#[test]
+fn mixed_zero_and_real_vectors_only_real_produces_edges() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        // One real, two zeros. The real vector's worker tick searches
+        // HNSW and gets back the two zero points as neighbours; the
+        // NaN-finite guard inside the hits loop rejects them. So the
+        // real source produces zero edges (no finite-similarity
+        // neighbour exists), the zero sources also produce zero edges
+        // (rejected by the source-side zero guard). Net: zero edges,
+        // zero panics.
+        let real = dense_vec(0);
+        let zero: [f32; VECTOR_DIM] = [0.0; VECTOR_DIM];
+        let _r = submit_encode(&fix.ctx, encode_op(1, 0, real)).await;
+        let _z1 = submit_encode(&fix.ctx, encode_op(2, 1, zero)).await;
+        let _z2 = submit_encode(&fix.ctx, encode_op(3, 2, zero)).await;
+
+        let worker = AutoEdgeWorker::new(fix.queue_rx.clone()).with_knobs(high_recall_knobs());
+        let drained = run_one_cycle(&worker, fix.ctx.clone()).await.unwrap();
+        assert_eq!(drained, 3);
+        assert_eq!(
+            count_similar_total(&fix.metadata),
+            0,
+            "mixed zero/real produces no edges until a second real \
+             vector lands; defends against the NaN cross-similarity \
+             that would otherwise leak through"
+        );
+    });
+}
