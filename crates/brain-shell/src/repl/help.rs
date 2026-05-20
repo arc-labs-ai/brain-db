@@ -212,18 +212,44 @@ fn help_recall() -> HelpVerb {
     HelpVerb {
         name: "recall".into(),
         tagline: "find similar memories".into(),
-        usage: vec![
-            "recall <QUERY> [--top-k N] [--confidence F]".into(),
-            "       [--filter-context N]... [--filter-kind K]... [--txn HEX]".into(),
+        usage: vec!["recall <QUERY> [flags]".into()],
+        flags: vec![
+            row("--top-k N", "result cap; default 10; server clamps to cap"),
+            row("--confidence F", "[0.0, 1.0] similarity threshold; default 0.0"),
+            row(
+                "--filter-context N",
+                "keep results from this context; repeatable, up to 16",
+            ),
+            row(
+                "--filter-kind K",
+                "episodic | semantic | consolidated; repeatable",
+            ),
+            row("--include-text", "populate the text column (off by default)"),
+            row(
+                "--include-graph",
+                "request per-hit graph enrichment (gated)",
+            ),
+            row(
+                "--txn HEX",
+                "read inside an open transaction; auto in REPL",
+            ),
         ],
-        flags: vec![],
         sources: vec![],
         description: vec![
-            "Retrieve memories whose embedding is similar to the query text. The returned ids are remembered in the session for tab-completion, so the next `forget` / `link` can refer to them by short id.".into(),
+            "Vector-similarity search. Embeds the query text, runs a top-K HNSW lookup in the active context's index, returns ranked MemoryResults. Substrate path compares the threshold to similarity_score; hybrid (knowledge-layer) path compares it to the RRF-fused score.".into(),
+            "When the top-K scores cluster within Δ<0.001, the table footer warns that ranking may not be meaningful — typically the embedder isn't loaded (test mode) or the query genuinely doesn't discriminate. Don't trust the order in that case.".into(),
+            "Returned ids are remembered in the session for tab-completion — the next `forget` or `link` can refer to them by short id.".into(),
         ],
-        example: None,
-        see_also: vec!["encode".into(), "reason".into()],
-        reference: None,
+        example: Some(r#"recall "auth rewrite" --top-k 5 --include-text --filter-context 7"#.into()),
+        see_also: vec![
+            "encode".into(),
+            "reason".into(),
+            "subscribe".into(),
+        ],
+        reference: Some(HelpReference {
+            clap_command: "recall --help".into(),
+            doc_path: Some(doc_for("recall")),
+        }),
     }
 }
 
@@ -265,16 +291,26 @@ fn help_forget() -> HelpVerb {
     HelpVerb {
         name: "forget".into(),
         tagline: "tombstone a memory".into(),
-        usage: vec!["forget <ID> [--mode soft|hard]".into()],
-        flags: vec![],
+        usage: vec!["forget <ID> [flags]".into()],
+        flags: vec![
+            row(
+                "--mode M",
+                "soft (default) | hard — hard zeroes the slot immediately",
+            ),
+            row("--txn HEX", "tombstone inside an open transaction"),
+        ],
         sources: vec![],
         description: vec![
-            "Soft tombstones reclaim the slot after a grace period (default 7 days) — recoverable in case the operator changes their mind.".into(),
-            "Hard erases zero the slot immediately. Use --mode hard only when content must be unrecoverable (right-to-be-forgotten / secret material).".into(),
+            "Soft tombstones reclaim the slot after a grace period (default 7 days) — recoverable in case the operator changes their mind. The fingerprint is evicted in the same write transaction as the tombstone so a re-encode of the same content is a dedup miss, not a hit.".into(),
+            "Hard erases zero the slot immediately. Use --mode hard only when content must be unrecoverable (right-to-be-forgotten / secret material) — the operation is not reversible.".into(),
+            "Forgetting a non-existent or already-tombstoned id returns success (idempotent) — outcome=MemoryNotFound or outcome=AlreadyTombstoned.".into(),
         ],
-        example: None,
-        see_also: vec!["encode".into(), "recall".into()],
-        reference: None,
+        example: Some("forget s2/m17/v1 --mode hard".into()),
+        see_also: vec!["encode".into(), "recall".into(), "subscribe".into()],
+        reference: Some(HelpReference {
+            clap_command: "forget --help".into(),
+            doc_path: Some(doc_for("forget")),
+        }),
     }
 }
 
@@ -282,15 +318,26 @@ fn help_link() -> HelpVerb {
     HelpVerb {
         name: "link".into(),
         tagline: "add an explicit edge".into(),
-        usage: vec!["link <SRC> <KIND> <TGT> [--weight F] [--txn HEX]".into()],
-        flags: vec![],
+        usage: vec!["link <SRC> <KIND> <TGT> [flags]".into()],
+        flags: vec![
+            row(
+                "<KIND>",
+                "caused | followed-by | derived-from | similar-to | contradicts | supports | references | part-of",
+            ),
+            row("--weight F", "[0.0, 1.0]; default 1.0"),
+            row("--txn HEX", "link inside an open transaction"),
+        ],
         sources: vec![],
         description: vec![
-            "Add a typed edge between two memories. KIND is one of: caused, followed-by, derived-from, similar-to, contradicts, supports, references, part-of.".into(),
+            "Add a typed edge between two memories. Source and target ids accept any of the three MemoryId input forms — short (s2/m17/v1), long hex (0x…), decimal u128 — including pasting from a recall table directly.".into(),
+            "Kind names accept both hyphen and underscore variants (followed-by ≡ followed_by); co_occurs is normalised to similar_to. Inline edges added at encode-time via `--edge KIND:ID` fix the weight at 1.0 — use `link` after the fact to vary it.".into(),
         ],
-        example: None,
-        see_also: vec!["unlink".into(), "recall".into()],
-        reference: None,
+        example: Some("link s2/m1/v1 caused s2/m2/v1 --weight 0.8".into()),
+        see_also: vec!["unlink".into(), "encode".into(), "recall".into()],
+        reference: Some(HelpReference {
+            clap_command: "link --help".into(),
+            doc_path: Some(doc_for("link")),
+        }),
     }
 }
 
@@ -298,15 +345,22 @@ fn help_unlink() -> HelpVerb {
     HelpVerb {
         name: "unlink".into(),
         tagline: "remove an edge".into(),
-        usage: vec!["unlink <SRC> <KIND> <TGT> [--txn HEX]".into()],
-        flags: vec![],
+        usage: vec!["unlink <SRC> <KIND> <TGT> [flags]".into()],
+        flags: vec![
+            row("<KIND>", "same whitelist as `link`"),
+            row("--txn HEX", "unlink inside an open transaction"),
+        ],
         sources: vec![],
         description: vec![
-            "Remove a typed edge between two memories. Idempotent: removing a non-existent edge succeeds without error.".into(),
+            "Remove a typed edge between two memories. Idempotent — removing a non-existent edge succeeds without error so retries from a flaky client are safe.".into(),
+            "Source / target ids accept short, long-hex, or decimal forms (same as `link`).".into(),
         ],
-        example: None,
-        see_also: vec!["link".into()],
-        reference: None,
+        example: Some("unlink s2/m1/v1 caused s2/m2/v1".into()),
+        see_also: vec!["link".into(), "recall".into()],
+        reference: Some(HelpReference {
+            clap_command: "unlink --help".into(),
+            doc_path: Some(doc_for("unlink")),
+        }),
     }
 }
 
@@ -480,6 +534,63 @@ mod tests {
         );
         // Example line must be present.
         assert!(card.contains("Example"), "missing Example label");
+    }
+
+    #[test]
+    fn help_recall_lists_every_documented_flag() {
+        let card = render_card_table(&help_recall());
+        for flag in [
+            "--top-k",
+            "--confidence",
+            "--filter-context",
+            "--filter-kind",
+            "--include-text",
+            "--include-graph",
+            "--txn",
+        ] {
+            assert!(card.contains(flag), "missing flag {flag} in:\n{card}");
+        }
+        assert!(card.contains("recall --help"));
+        assert!(card.contains("docs/reference/shell/commands/recall.md"));
+    }
+
+    #[test]
+    fn help_forget_lists_every_documented_flag() {
+        let card = render_card_table(&help_forget());
+        assert!(card.contains("--mode"));
+        assert!(card.contains("--txn"));
+        assert!(card.contains("forget --help"));
+        assert!(card.contains("docs/reference/shell/commands/forget.md"));
+    }
+
+    #[test]
+    fn help_link_lists_kind_whitelist() {
+        let card = render_card_table(&help_link());
+        assert!(card.contains("--weight"));
+        assert!(card.contains("--txn"));
+        // Kind whitelist must list every accepted kind so a reader
+        // sees what `<KIND>` can be without leaving the card.
+        for kind in [
+            "caused",
+            "followed-by",
+            "derived-from",
+            "similar-to",
+            "contradicts",
+            "supports",
+            "references",
+            "part-of",
+        ] {
+            assert!(card.contains(kind), "missing kind {kind} in:\n{card}");
+        }
+        assert!(card.contains("link --help"));
+    }
+
+    #[test]
+    fn help_unlink_documents_kind_and_txn() {
+        let card = render_card_table(&help_unlink());
+        assert!(card.contains("<KIND>"));
+        assert!(card.contains("--txn"));
+        assert!(card.contains("unlink --help"));
     }
 
     #[test]
