@@ -516,13 +516,16 @@ mod tests {
     #[tokio::test]
     async fn submit_phase_with_no_apply_function_surfaces_internal_error() {
         let (_dir, writer) = build_writer();
-        // UpsertEntity is stubbed in P2 with NotYetImplemented.
-        let phase = Phase::UpsertEntity {
-            id: brain_core::knowledge::EntityId::new(),
-            ty: brain_core::knowledge::EntityType::PERSON_ID,
-            canonical: "Alice".into(),
-            normalized: "alice".into(),
-            attributes: brain_core::knowledge::EntityAttributes::empty(),
+        // UpsertSchema is still stubbed (P2b deferred it — needs to
+        // intern predicates/relation-types and flip the schema gate
+        // in a single txn, which is its own slice).
+        let phase = Phase::UpsertSchema {
+            namespace: "test".into(),
+            version: 1,
+            blob: Vec::new(),
+            declared_predicates: Vec::new(),
+            declared_relation_types: Vec::new(),
+            declared_entity_types: Vec::new(),
             created_at_unix_nanos: 0,
         };
         let write = Write::single(WriteId::new(), AgentId::default(), phase);
