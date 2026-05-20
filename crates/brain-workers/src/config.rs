@@ -38,6 +38,11 @@ pub enum WorkerKind {
     /// LLM) after each ENCODE, then writes the resolved entities /
     /// statements / relations / mention edges back through brain-metadata.
     Extractor,
+    /// Derives `FollowedBy` edges by walking the per-agent timeline
+    /// index after each ENCODE. Connects each new memory to the
+    /// agent's previous memory in the same context, weighted by
+    /// elapsed time. The substrate's narrative spine.
+    TemporalEdge,
 }
 
 impl WorkerKind {
@@ -67,6 +72,7 @@ impl WorkerKind {
             Self::EntityGc => "entity_gc",
             Self::AutoEdge => "auto_edge",
             Self::Extractor => "extractor",
+            Self::TemporalEdge => "temporal_edge",
         }
     }
 }
@@ -125,6 +131,10 @@ impl WorkerConfig {
             // blocking the scheduler. max_runtime=5s caps a stuck LLM
             // call from monopolising the lane.
             WorkerKind::Extractor => (true, Duration::from_secs(1), 32, 5_000),
+            // Temporal-edge derivation is one redb point-lookup per
+            // enqueue. Cheap; tick at 100ms to keep encode→edge
+            // latency tight, same shape as AutoEdge.
+            WorkerKind::TemporalEdge => (true, Duration::from_millis(100), 256, 5_000),
         };
         Self {
             enabled,

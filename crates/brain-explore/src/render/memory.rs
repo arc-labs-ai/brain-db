@@ -101,10 +101,8 @@ impl Render for RecallResults {
                         let tgt = fmt_short_id(e.target);
                         let kind_label = format!("{:?}", e.kind);
                         let arrow = theme.paint(Token::Muted, "→", policy);
-                        let line = format!(
-                            "    {arrow} {kind_label}  {tgt}  weight={:.3}",
-                            e.weight
-                        );
+                        let line =
+                            format!("    {arrow} {kind_label}  {tgt}  weight={:.3}", e.weight);
                         writeln!(w, "{line}")?;
                     }
                 }

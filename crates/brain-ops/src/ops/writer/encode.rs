@@ -390,6 +390,29 @@ pub(super) async fn do_encode(
                 .insert(memory_id.to_be_bytes(), meta)
                 .map_err(|e| WriterError::Internal(format!("memories insert: {e:?}")))?;
         }
+        // Index the new memory in MEMORIES_BY_AGENT_TIMELINE so the
+        // TemporalEdgeWorker can find the previous memory for this
+        // agent in O(log n) time. Written in the same write txn as
+        // the metadata insert so the two stay consistent under crash.
+        {
+            use brain_metadata::tables::memory::{
+                agent_timeline_key, MEMORIES_BY_AGENT_TIMELINE_TABLE,
+            };
+            let mut timeline_t =
+                wtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE)
+                    .map_err(|e| {
+                        WriterError::Internal(format!("open MEMORIES_BY_AGENT_TIMELINE: {e:?}"))
+                    })?;
+            let key = agent_timeline_key(
+                op.agent_id.0.into_bytes(),
+                created_at,
+                op.context_id.0,
+                memory_id.to_be_bytes(),
+            );
+            timeline_t
+                .insert(key.as_slice(), ())
+                .map_err(|e| WriterError::Internal(format!("timeline insert: {e:?}")))?;
+        }
         // Couple text to the memory row inside the same write txn:
         // a later RECALL --include-text reads from this table and
         // must see the row atomically with the memory metadata.
@@ -441,6 +464,10 @@ pub(super) async fn do_encode(
     // enqueue (channel full / disconnected) is best-effort, never an
     // encode error.
     super::try_enqueue_auto_edge(writer, memory_id, &op.vector);
+    // ── TemporalEdgeWorker enqueue. The worker writes FollowedBy
+    //    edges from the agent's previous memory in this context.
+    //    Same best-effort semantics as the auto-edge enqueue.
+    super::try_enqueue_temporal_edge(writer, memory_id, op.agent_id, op.context_id, created_at);
 
     // ── ExtractorWorker enqueue (post-durability + post-HNSW). ───
     // The worker runs the three-tier extractor pipeline (pattern +

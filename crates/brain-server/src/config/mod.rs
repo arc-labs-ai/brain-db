@@ -175,6 +175,11 @@ pub struct WorkersConfig {
     /// Section may be omitted; every field has a default.
     #[serde(default)]
     pub extractor: ExtractorWorkerConfig,
+    /// Phase T: substrate auto-derived `FollowedBy` edges keyed on
+    /// per-agent temporal adjacency. Defaults kick in when the
+    /// section is omitted from TOML.
+    #[serde(default)]
+    pub temporal_edge: TemporalEdgeWorkerConfig,
 }
 
 /// `[workers.auto_edge]` TOML section. Controls the substrate
@@ -247,6 +252,74 @@ fn default_auto_edge_ef_search() -> usize {
 }
 fn default_auto_edge_channel_capacity() -> usize {
     1024
+}
+
+/// `[workers.temporal_edge]` TOML section. Controls the substrate
+/// `FollowedBy` derivation worker (sub-task T). Every field defaults
+/// so an existing `dev.toml` keeps working without edits.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TemporalEdgeWorkerConfig {
+    /// Master switch. `false` skips registration entirely.
+    #[serde(default = "default_temporal_edge_enabled")]
+    pub enabled: bool,
+    /// Scheduler tick in milliseconds. Smaller → faster encode →
+    /// edge visibility; larger → less worker CPU.
+    #[serde(default = "default_temporal_edge_interval_ms")]
+    pub interval_ms: u64,
+    /// Max memories drained per cycle.
+    #[serde(default = "default_temporal_edge_batch_size")]
+    pub batch_size: usize,
+    /// Temporal window in seconds. Memories older than this are not
+    /// candidates for predecessor lookup.
+    #[serde(default = "default_temporal_edge_window_seconds")]
+    pub window_seconds: u64,
+    /// Hard floor on the decay-weight curve. Below this, no edge is
+    /// written even if the gap is within the window.
+    #[serde(default = "default_temporal_edge_weight_min")]
+    pub weight_min: f32,
+    /// Writer → worker queue depth.
+    #[serde(default = "default_temporal_edge_channel_capacity")]
+    pub channel_capacity: usize,
+    /// Allow `FollowedBy` edges across context boundaries.
+    #[serde(default = "default_temporal_edge_cross_context")]
+    pub cross_context: bool,
+}
+
+impl Default for TemporalEdgeWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_temporal_edge_enabled(),
+            interval_ms: default_temporal_edge_interval_ms(),
+            batch_size: default_temporal_edge_batch_size(),
+            window_seconds: default_temporal_edge_window_seconds(),
+            weight_min: default_temporal_edge_weight_min(),
+            channel_capacity: default_temporal_edge_channel_capacity(),
+            cross_context: default_temporal_edge_cross_context(),
+        }
+    }
+}
+
+fn default_temporal_edge_enabled() -> bool {
+    true
+}
+fn default_temporal_edge_interval_ms() -> u64 {
+    100
+}
+fn default_temporal_edge_batch_size() -> usize {
+    256
+}
+fn default_temporal_edge_window_seconds() -> u64 {
+    300
+}
+fn default_temporal_edge_weight_min() -> f32 {
+    0.1
+}
+fn default_temporal_edge_channel_capacity() -> usize {
+    1024
+}
+fn default_temporal_edge_cross_context() -> bool {
+    false
 }
 
 /// `[workers.extractor]` TOML section. Defaults registered every

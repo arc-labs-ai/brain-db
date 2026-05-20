@@ -22,4 +22,5 @@ pub mod snapshot;
 pub mod stale_extraction_detector;
 pub mod statistics;
 pub mod supersession_sweeper;
+pub mod temporal_edge;
 pub mod wal_retention;

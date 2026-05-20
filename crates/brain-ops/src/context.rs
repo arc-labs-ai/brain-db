@@ -476,6 +476,94 @@ impl OpsContext {
         }
         Ok(written)
     }
+
+    /// Persist a batch of `(from, to, weight)` tuples as `FollowedBy`
+    /// auto-edges. Counterpart to [`Self::write_auto_edges`] for the
+    /// TemporalEdgeWorker. Asymmetric — temporal edges have direction
+    /// (the predecessor wrote the FORWARD edge; no mirror).
+    ///
+    /// Returns the logical (= physical, since unmirrored) edge count.
+    pub fn write_temporal_edges(
+        &self,
+        pairs: &[(brain_core::MemoryId, brain_core::MemoryId, f32)],
+    ) -> Result<usize, String> {
+        use brain_core::{EdgeKind, EdgeKindRef, NodeRef};
+        use brain_metadata::tables::edge::{
+            self, derived_by, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE,
+            EDGES_TABLE,
+        };
+        use brain_protocol::responses::types::EventType;
+
+        if pairs.is_empty() {
+            return Ok(0);
+        }
+
+        let now = now_unix_nanos_ctx();
+        let mut written = 0usize;
+        let metadata = self.executor.metadata.clone();
+        let mut db = metadata.lock();
+        let wtxn = db
+            .write_txn()
+            .map_err(|e| format!("temporal_edges write_txn: {e:?}"))?;
+        {
+            let mut edges_t = wtxn
+                .open_table(EDGES_TABLE)
+                .map_err(|e| format!("temporal_edges open EDGES: {e:?}"))?;
+            let mut edges_rev_t = wtxn
+                .open_table(EDGES_REVERSE_TABLE)
+                .map_err(|e| format!("temporal_edges open EDGES_REVERSE: {e:?}"))?;
+            for (from, to, weight) in pairs {
+                let data = EdgeData::new(
+                    *weight,
+                    origin::AUTO_DERIVED,
+                    derived_by::TEMPORAL_WORKER,
+                    now,
+                );
+                edge::link(
+                    &mut edges_t,
+                    &mut edges_rev_t,
+                    NodeRef::Memory(*from),
+                    EdgeKindRef::Builtin(EdgeKind::FollowedBy),
+                    NodeRef::Memory(*to),
+                    zero_disambiguator(),
+                    &data,
+                )
+                .map_err(|e| format!("temporal_edges link: {e:?}"))?;
+                written += 1;
+            }
+        }
+        wtxn.commit()
+            .map_err(|e| format!("temporal_edges commit: {e:?}"))?;
+        drop(db);
+
+        // Publish EdgeAdded events post-commit. One per logical pair;
+        // no mirror writes for temporal (FollowedBy has direction).
+        for (from, to, weight) in pairs {
+            let env = EventEnvelope {
+                lsn: 0,
+                event_type: EventType::EdgeAdded,
+                memory_id: brain_core::MemoryId::NULL,
+                context_id: brain_core::ContextId::default(),
+                kind: brain_core::MemoryKind::Episodic,
+                salience: 0.0,
+                timestamp_unix_nanos: now,
+                text: None,
+                knowledge_payload: None,
+                edge_payload: Some(crate::ops::subscribe::edge_payload_to_event(
+                    NodeRef::Memory(*from),
+                    NodeRef::Memory(*to),
+                    EdgeKindRef::Builtin(EdgeKind::FollowedBy),
+                    *weight,
+                    None,
+                    None,
+                    origin::AUTO_DERIVED,
+                )),
+                agent_id: brain_core::AgentId::default(),
+            };
+            self.events.publish(env);
+        }
+        Ok(written)
+    }
 }
 
 fn now_unix_nanos_ctx() -> u64 {

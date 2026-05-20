@@ -32,6 +32,71 @@ use redb::TableDefinition;
 pub const MEMORIES_TABLE: TableDefinition<'static, [u8; 16], MemoryMetadata> =
     TableDefinition::new("memories");
 
+/// Secondary timeline index keyed `(agent_id_bytes, created_at_unix_nanos
+/// BE bytes, context_id BE bytes, memory_id BE bytes)` → `()`.
+///
+/// The TemporalEdgeWorker (§02/06 `FollowedBy` auto-derivation) needs
+/// to answer "most-recent memory by agent A within context C and
+/// timestamp window" cheaply. Without this index the worker would
+/// either full-scan `MEMORIES_TABLE` per encode or maintain an
+/// in-memory shadow that can't survive recovery.
+///
+/// Key layout (48 bytes total) is chosen so a backward range scan
+/// from `(agent, t_now, ctx, *)` yields rows in descending-time order;
+/// the worker stops at the first hit that satisfies its window. The
+/// trailing `memory_id` is purely a disambiguator so two memories
+/// committed at exactly the same nanos can both index without
+/// collision.
+///
+/// On encode commit the writer inserts a row here; on forget /
+/// tombstone the writer must delete it so a tombstoned memory never
+/// surfaces as a temporal predecessor.
+pub const MEMORIES_BY_AGENT_TIMELINE_TABLE: TableDefinition<'static, &[u8], ()> =
+    TableDefinition::new("memories_by_agent_timeline_v1");
+
+/// Encoded length: `agent(16) + created_at(8) + context(8) + memory_id(16)`.
+pub const AGENT_TIMELINE_KEY_LEN: usize = 16 + 8 + 8 + 16;
+
+/// Pack the four discriminators into the canonical key bytes.
+/// `created_at_unix_nanos` is encoded big-endian so a redb range
+/// scan in lexicographic order yields chronological order.
+#[must_use]
+pub fn agent_timeline_key(
+    agent_id_bytes: [u8; 16],
+    created_at_unix_nanos: u64,
+    context_id: u64,
+    memory_id_bytes: [u8; 16],
+) -> [u8; AGENT_TIMELINE_KEY_LEN] {
+    let mut k = [0u8; AGENT_TIMELINE_KEY_LEN];
+    k[0..16].copy_from_slice(&agent_id_bytes);
+    k[16..24].copy_from_slice(&created_at_unix_nanos.to_be_bytes());
+    k[24..32].copy_from_slice(&context_id.to_be_bytes());
+    k[32..48].copy_from_slice(&memory_id_bytes);
+    k
+}
+
+/// Prefix matching every row for an agent — useful for cleanup and
+/// for the in-context worker scan that further narrows by
+/// `created_at`.
+#[must_use]
+pub fn agent_timeline_prefix_agent(agent_id_bytes: [u8; 16]) -> [u8; 16] {
+    agent_id_bytes
+}
+
+/// Prefix matching every row for (agent, time, ctx) — useful for the
+/// worker's "what was the predecessor" probe (a backward range scan
+/// stops at the first key strictly less than the prefix).
+#[must_use]
+pub fn agent_timeline_prefix_agent_time(
+    agent_id_bytes: [u8; 16],
+    created_at_unix_nanos: u64,
+) -> [u8; 24] {
+    let mut p = [0u8; 24];
+    p[0..16].copy_from_slice(&agent_id_bytes);
+    p[16..24].copy_from_slice(&created_at_unix_nanos.to_be_bytes());
+    p
+}
+
 // ---------------------------------------------------------------------------
 // Flag bits (spec §07/03 §2.7).
 // ---------------------------------------------------------------------------

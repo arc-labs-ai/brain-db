@@ -117,6 +117,15 @@ llm_budget_per_cycle_micro_usd   = 50000
 channel_capacity                 = 1024
 skip_already_extracted           = true
 
+[workers.temporal_edge]
+enabled                          = true
+interval_ms                      = 100
+batch_size                       = 256
+window_seconds                   = 300
+weight_min                       = 0.1
+channel_capacity                 = 1024
+cross_context                    = false
+
 [summarizer]
 # Consolidation worker is a no-op until an LLM backend is wired.
 # Spec §11/03 §6. See docs/guides/configure.md "Summarizer" for

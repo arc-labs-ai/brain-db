@@ -236,17 +236,34 @@ async fn watch_auto_edges(
         let Some(payload) = next.edge_payload.as_ref() else {
             continue;
         };
-        // Match the encode's source memory; reject EXPLICIT-origin
-        // events (the user may have called `link` during the window
-        // and we don't want to attribute that to auto-edges).
+        // Match the encode's memory on either side of the edge.
+        // Different workers stamp the new memory in different
+        // positions:
+        //   * AutoEdgeWorker (SimilarTo) writes `new → similar`
+        //     (and a mirror), so `from_id == this memory`.
+        //   * TemporalEdgeWorker (FollowedBy) writes
+        //     `predecessor → new`, so `to_id == this memory`.
+        //   * CausalEdgeWorker (when it lands) is direction-by-
+        //     statement-semantics; either side can match.
+        // Reject EXPLICIT-origin events so a concurrent `link`
+        // call doesn't appear in the delta line.
         if payload.origin != AUTO_DERIVED {
             continue;
         }
-        if payload.from_id != from_id_bytes {
+        let this_is_source = payload.from_id == from_id_bytes;
+        let this_is_target = payload.to_id == from_id_bytes;
+        if !this_is_source && !this_is_target {
             continue;
         }
+        // Display the OTHER end of the edge — the one the user
+        // actually cares about ("what got linked to my new memory").
+        let other_bytes = if this_is_source {
+            payload.to_id
+        } else {
+            payload.from_id
+        };
         edges.push(AutoEdgeSummary {
-            target: u128::from_be_bytes(payload.to_id),
+            target: u128::from_be_bytes(other_bytes),
             kind: edge_kind_label(payload.edge_kind_tag, payload.edge_kind_byte),
             weight: payload.weight,
         });

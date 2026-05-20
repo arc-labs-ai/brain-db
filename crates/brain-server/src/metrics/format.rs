@@ -65,6 +65,7 @@ pub async fn format(snap: &Snapshot<'_>) -> String {
     emit_request_metrics(&mut s, snap.request_metrics);
     emit_auto_edge_metrics(&mut s, snap.shards);
     emit_extractor_metrics(&mut s, snap.shards);
+    emit_temporal_edge_metrics(&mut s, snap.shards);
 
     s
 }
@@ -448,6 +449,102 @@ fn emit_auto_edge_metrics(out: &mut String, shards: &[ShardHandle]) {
                 "brain_auto_edge_neighbours_found_per_cycle",
                 &inner,
                 &m.snapshot().neighbours_found_per_cycle,
+            );
+        }
+    }
+}
+
+/// Phase T: per-shard TemporalEdgeWorker metric family. Mirrors the
+/// AutoEdge emitter's shape.
+fn emit_temporal_edge_metrics(out: &mut String, shards: &[ShardHandle]) {
+    emit_header(
+        out,
+        "brain_temporal_edge_drops_total",
+        "Encode-side enqueues dropped because the temporal-edge channel was full.",
+        "counter",
+    );
+    for shard in shards {
+        if let Some(m) = shard.temporal_edge_metrics() {
+            let labels = format!("{{shard=\"{}\"}}", shard.shard_id());
+            let _ = writeln!(
+                out,
+                "brain_temporal_edge_drops_total{labels} {}",
+                m.snapshot().drops_total
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_temporal_edge_edges_written_total",
+        "Logical FollowedBy edges persisted by the TemporalEdgeWorker.",
+        "counter",
+    );
+    for shard in shards {
+        if let Some(m) = shard.temporal_edge_metrics() {
+            let labels = format!("{{shard=\"{}\"}}", shard.shard_id());
+            let _ = writeln!(
+                out,
+                "brain_temporal_edge_edges_written_total{labels} {}",
+                m.snapshot().edges_written_total
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_temporal_edge_skipped_total",
+        "TemporalEdgeWorker enqueues that produced no edge, broken out by reason.",
+        "counter",
+    );
+    for shard in shards {
+        if let Some(m) = shard.temporal_edge_metrics() {
+            let snap = m.snapshot();
+            for (reason, value) in [
+                ("no_prev", snap.skipped_no_prev),
+                ("out_of_order", snap.skipped_out_of_order),
+                ("tombstoned", snap.skipped_tombstoned),
+                ("cross_context", snap.skipped_cross_context),
+                ("window_exceeded", snap.skipped_window_exceeded),
+            ] {
+                let labels = format!("{{shard=\"{}\",reason=\"{reason}\"}}", shard.shard_id());
+                let _ = writeln!(out, "brain_temporal_edge_skipped_total{labels} {value}");
+            }
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_temporal_edge_cycle_duration_seconds",
+        "Wall-clock duration of one TemporalEdgeWorker cycle.",
+        "histogram",
+    );
+    for shard in shards {
+        if let Some(m) = shard.temporal_edge_metrics() {
+            let inner = format!("shard=\"{}\"", shard.shard_id());
+            emit_worker_histogram(
+                out,
+                "brain_temporal_edge_cycle_duration_seconds",
+                &inner,
+                &m.snapshot().cycle_duration_seconds,
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_temporal_edge_gap_seconds",
+        "Observed predecessor→memory gap distribution for FollowedBy edges.",
+        "histogram",
+    );
+    for shard in shards {
+        if let Some(m) = shard.temporal_edge_metrics() {
+            let inner = format!("shard=\"{}\"", shard.shard_id());
+            emit_worker_histogram(
+                out,
+                "brain_temporal_edge_gap_seconds",
+                &inner,
+                &m.snapshot().gap_seconds,
             );
         }
     }

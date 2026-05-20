@@ -116,6 +116,14 @@ pub struct RealWriterHandle {
     // TODO(part-3): make non-optional when extractor pool is unconditionally
     // wired at shard spawn (entity HNSW + statement HNSW dependencies land then).
     extractor_tx: Option<flume::Sender<ExtractorEnqueue>>,
+    /// Optional non-blocking sender feeding the per-shard
+    /// TemporalEdgeWorker. Each successful ENCODE enqueues
+    /// `(memory_id, agent_id, context_id, created_at_unix_nanos)`
+    /// post-commit; the worker looks up the previous memory for the
+    /// same agent + context in `MEMORIES_BY_AGENT_TIMELINE_TABLE`
+    /// and writes a `FollowedBy` auto-edge with decay-weighted
+    /// strength. `None` → worker disabled.
+    temporal_edge_tx: Option<flume::Sender<TemporalEdgeEnqueue>>,
     /// Shared metric handle for the AutoEdgeWorker family. When
     /// wired (production), `try_enqueue_auto_edge` bumps `drops_total`
     /// on `Full`. The worker holds the same `Arc` and publishes
@@ -126,6 +134,11 @@ pub struct RealWriterHandle {
     /// pipeline. Writer bumps `drops_total`; worker publishes the
     /// rest.
     extractor_metrics: Option<Arc<crate::worker_metrics::ExtractorMetrics>>,
+    /// Companion to [`Self::auto_edge_metrics`] for the
+    /// TemporalEdgeWorker. Writer bumps `drops_total` on `Full`;
+    /// the worker publishes edges-written / cycle-duration / skip
+    /// reasons.
+    temporal_edge_metrics: Option<Arc<crate::worker_metrics::TemporalEdgeMetrics>>,
     /// Optional memory tantivy dispatcher. Wired by the shard's
     /// spawn path when the deployment has a tantivy handle. After
     /// each successful ENCODE (single op or TXN batch) the writer
@@ -149,6 +162,19 @@ pub type AutoEdgeEnqueue = (brain_core::MemoryId, [f32; brain_embed::VECTOR_DIM]
 /// row from redb (which would re-cross the metadata lock on the
 /// extractor's hot path).
 pub type ExtractorEnqueue = (brain_core::MemoryId, std::sync::Arc<str>);
+
+/// What the writer pushes into the TemporalEdgeWorker's channel after
+/// a successful ENCODE. The worker only needs the indexable fields:
+/// the freshly-inserted memory's `(memory_id, agent_id, context_id,
+/// created_at_unix_nanos)`. It looks up the predecessor via
+/// `MEMORIES_BY_AGENT_TIMELINE_TABLE` itself — no need to carry the
+/// vector or text.
+pub type TemporalEdgeEnqueue = (
+    brain_core::MemoryId,
+    brain_core::AgentId,
+    brain_core::ContextId,
+    u64,
+);
 
 impl RealWriterHandle {
     #[must_use]
@@ -180,8 +206,10 @@ impl RealWriterHandle {
             wal_sink: None,
             auto_edge_tx: None,
             extractor_tx: None,
+            temporal_edge_tx: None,
             auto_edge_metrics: None,
             extractor_metrics: None,
+            temporal_edge_metrics: None,
             memory_text_dispatcher: None,
         }
     }
@@ -285,6 +313,34 @@ impl RealWriterHandle {
         &self,
     ) -> Option<&Arc<crate::worker_metrics::ExtractorMetrics>> {
         self.extractor_metrics.as_ref()
+    }
+
+    /// Wire the TemporalEdgeWorker's feed channel. After this call
+    /// every successful ENCODE enqueues
+    /// `(memory_id, agent_id, context_id, created_at_unix_nanos)`
+    /// post-commit. Without this call the enqueue path is a no-op
+    /// (matches `set_auto_edge_sender`).
+    pub fn set_temporal_edge_sender(&mut self, sender: flume::Sender<TemporalEdgeEnqueue>) {
+        self.temporal_edge_tx = Some(sender);
+    }
+
+    pub(super) fn temporal_edge_sender(&self) -> Option<&flume::Sender<TemporalEdgeEnqueue>> {
+        self.temporal_edge_tx.as_ref()
+    }
+
+    /// Install the shared `TemporalEdgeMetrics` handle. Same semantics
+    /// as [`Self::set_auto_edge_metrics`].
+    pub fn set_temporal_edge_metrics(
+        &mut self,
+        metrics: Arc<crate::worker_metrics::TemporalEdgeMetrics>,
+    ) {
+        self.temporal_edge_metrics = Some(metrics);
+    }
+
+    pub(super) fn temporal_edge_metrics(
+        &self,
+    ) -> Option<&Arc<crate::worker_metrics::TemporalEdgeMetrics>> {
+        self.temporal_edge_metrics.as_ref()
     }
 
     /// Install the memory text dispatcher. After this call, every
@@ -1232,6 +1288,43 @@ pub(super) fn try_enqueue_auto_edge(
 // inside conditional code paths.
 #[allow(dead_code)]
 fn _kind_use(_: EdgeKind) {}
+
+/// Enqueue `(memory_id, agent_id, context_id, created_at_unix_nanos)`
+/// onto the TemporalEdgeWorker channel if one is wired. Mirrors
+/// [`try_enqueue_auto_edge`] semantics — full channel drops with a
+/// counter bump; disconnected logs at debug.
+pub(super) fn try_enqueue_temporal_edge(
+    writer: &RealWriterHandle,
+    memory_id: MemoryId,
+    agent_id: brain_core::AgentId,
+    context_id: brain_core::ContextId,
+    created_at_unix_nanos: u64,
+) {
+    let Some(sender) = writer.temporal_edge_sender() else {
+        return;
+    };
+    let payload: TemporalEdgeEnqueue = (memory_id, agent_id, context_id, created_at_unix_nanos);
+    match sender.try_send(payload) {
+        Ok(()) => {
+            tracing::trace!(memory_id = ?memory_id, "temporal_edge enqueue");
+        }
+        Err(flume::TrySendError::Full(_)) => {
+            if let Some(m) = writer.temporal_edge_metrics() {
+                m.inc_drop();
+            }
+            tracing::warn!(
+                memory_id = ?memory_id,
+                "temporal_edge channel full; dropping enqueue"
+            );
+        }
+        Err(flume::TrySendError::Disconnected(_)) => {
+            tracing::debug!(
+                memory_id = ?memory_id,
+                "temporal_edge worker disconnected; encode continues"
+            );
+        }
+    }
+}
 
 /// Enqueue `(memory_id, text)` onto the ExtractorWorker channel if
 /// one is wired. Non-blocking; full channel logs a warn and drops

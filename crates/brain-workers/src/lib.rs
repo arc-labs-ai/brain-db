@@ -43,7 +43,8 @@ pub use worker::{drive_batch, Worker};
 // (`brain_workers::<worker>::<Type>`) so external callers don't churn.
 pub use workers::{
     access_boost, auto_edge, cache_evict, consolidation, counter_reconcile, decay, edge_scrub,
-    extractor, hnsw_maint, idempotency_cleanup, slot_reclaim, snapshot, statistics, wal_retention,
+    extractor, hnsw_maint, idempotency_cleanup, slot_reclaim, snapshot, statistics, temporal_edge,
+    wal_retention,
 };
 
 pub use workers::access_boost::{
@@ -84,6 +85,10 @@ pub use workers::snapshot::{
     SnapshotSourceError, SnapshotWorker, TakeFuture as SnapshotTakeFuture,
 };
 pub use workers::statistics::{StatisticsUpdateWorker, Stats};
+pub use workers::temporal_edge::{
+    TemporalEdgeKnobs, TemporalEdgeWorker, DEFAULT_CROSS_CONTEXT, DEFAULT_WEIGHT_MIN,
+    DEFAULT_WINDOW_SECONDS,
+};
 pub use workers::wal_retention::{
     decide_deletions, CheckpointDesc, CheckpointFuture, DeleteFuture as WalDeleteFuture,
     DisabledWalRetentionSource, SegmentDesc, SegmentListFuture, WalRetentionSource,

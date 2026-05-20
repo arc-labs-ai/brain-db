@@ -267,6 +267,9 @@ pub struct ShardSpawnConfig {
     /// Phase E: per-shard extractor pipeline knobs. Same shape as
     /// `auto_edge` — `enabled=false` skips registration entirely.
     pub extractor: ExtractorSpawnConfig,
+    /// Phase T: per-shard temporal-edge worker knobs. Same shape as
+    /// `auto_edge`; `enabled=false` skips registration entirely.
+    pub temporal_edge: TemporalEdgeSpawnConfig,
     /// Text → vector dispatcher used inside the shard's executor.
     ///
     /// The same `Arc` is cloned into every shard at process startup so
@@ -329,6 +332,34 @@ impl Default for ExtractorSpawnConfig {
     }
 }
 
+/// Knobs ferried from `Config.workers.temporal_edge` into the spawn
+/// path. Mirrors `AutoEdgeSpawnConfig` but with temporal-specific
+/// fields.
+#[derive(Clone, Debug)]
+pub struct TemporalEdgeSpawnConfig {
+    pub enabled: bool,
+    pub interval_ms: u64,
+    pub batch_size: usize,
+    pub window_seconds: u64,
+    pub weight_min: f32,
+    pub channel_capacity: usize,
+    pub cross_context: bool,
+}
+
+impl Default for TemporalEdgeSpawnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_ms: 100,
+            batch_size: 256,
+            window_seconds: 300,
+            weight_min: 0.1,
+            channel_capacity: 1024,
+            cross_context: false,
+        }
+    }
+}
+
 impl ShardSpawnConfig {
     /// Construct with arena under `data_dir`, every other knob
     /// defaulted. The caller supplies the embedding `dispatcher`
@@ -345,6 +376,7 @@ impl ShardSpawnConfig {
             summarizer: Arc::new(DisabledSummarizer),
             auto_edge: AutoEdgeSpawnConfig::default(),
             extractor: ExtractorSpawnConfig::default(),
+            temporal_edge: TemporalEdgeSpawnConfig::default(),
             dispatcher,
         }
     }
@@ -457,6 +489,8 @@ pub struct ShardHandle {
     auto_edge_metrics: Option<Arc<brain_ops::AutoEdgeMetrics>>,
     /// Phase E metrics. Same shape as [`Self::auto_edge_metrics`].
     extractor_metrics: Option<Arc<brain_ops::ExtractorMetrics>>,
+    /// Phase T (TemporalEdgeWorker) metrics. Same shape.
+    temporal_edge_metrics: Option<Arc<brain_ops::TemporalEdgeMetrics>>,
 }
 
 impl ShardHandle {
@@ -478,6 +512,13 @@ impl ShardHandle {
     #[must_use]
     pub fn extractor_metrics(&self) -> Option<Arc<brain_ops::ExtractorMetrics>> {
         self.extractor_metrics.clone()
+    }
+
+    /// Read-only handle to the Phase T (TemporalEdgeWorker) metric
+    /// state for this shard.
+    #[must_use]
+    pub fn temporal_edge_metrics(&self) -> Option<Arc<brain_ops::TemporalEdgeMetrics>> {
+        self.temporal_edge_metrics.clone()
     }
 
     /// Per-shard event feed. Cloning the Receiver shares the underlying
@@ -964,6 +1005,7 @@ pub fn spawn_shard(
     let summarizer = cfg.summarizer;
     let auto_edge_spawn_cfg_for_closure = cfg.auto_edge.clone();
     let extractor_spawn_cfg_for_closure = cfg.extractor.clone();
+    let temporal_edge_spawn_cfg_for_closure = cfg.temporal_edge.clone();
     // Construct the Phase B / Phase E metric handles up-front so we
     // can both stash them on `ShardHandle` (for /metrics exposition)
     // and inject them into the writer + worker (so both sides bump
@@ -981,8 +1023,15 @@ pub fn spawn_shard(
         } else {
             None
         };
+    let temporal_edge_metrics_for_handle: Option<Arc<brain_ops::TemporalEdgeMetrics>> =
+        if cfg.temporal_edge.enabled {
+            Some(Arc::new(brain_ops::TemporalEdgeMetrics::new()))
+        } else {
+            None
+        };
     let auto_edge_metrics_for_closure = auto_edge_metrics_for_handle.clone();
     let extractor_metrics_for_closure = extractor_metrics_for_handle.clone();
+    let temporal_edge_metrics_for_closure = temporal_edge_metrics_for_handle.clone();
     // Clone the process-wide dispatcher Arc into the executor closure.
     // The CachingDispatcher<CpuDispatcher> built once in main.rs is
     // shared across every shard so the BERT weights live in memory
@@ -1077,6 +1126,21 @@ pub fn spawn_shard(
                 None
             };
             let (extractor_sender, extractor_receiver) = match &extractor_channel {
+                Some((tx, rx)) => (Some(tx.clone()), Some(rx.clone())),
+                None => (None, None),
+            };
+
+            // Phase T: per-shard TemporalEdgeWorker channel. Mirrors
+            // the auto-edge shape; disabled → no channel, no worker.
+            let temporal_edge_spawn_cfg = temporal_edge_spawn_cfg_for_closure.clone();
+            let temporal_edge_channel = if temporal_edge_spawn_cfg.enabled {
+                Some(flume::bounded::<brain_ops::TemporalEdgeEnqueue>(
+                    temporal_edge_spawn_cfg.channel_capacity.max(1),
+                ))
+            } else {
+                None
+            };
+            let (temporal_edge_sender, temporal_edge_receiver) = match &temporal_edge_channel {
                 Some((tx, rx)) => (Some(tx.clone()), Some(rx.clone())),
                 None => (None, None),
             };
@@ -1229,11 +1293,17 @@ pub fn spawn_shard(
             if let Some(tx) = extractor_sender {
                 real_writer.set_extractor_sender(tx);
             }
+            if let Some(tx) = temporal_edge_sender {
+                real_writer.set_temporal_edge_sender(tx);
+            }
             if let Some(m) = auto_edge_metrics_for_closure.clone() {
                 real_writer.set_auto_edge_metrics(m);
             }
             if let Some(m) = extractor_metrics_for_closure.clone() {
                 real_writer.set_extractor_metrics(m);
+            }
+            if let Some(m) = temporal_edge_metrics_for_closure.clone() {
+                real_writer.set_temporal_edge_metrics(m);
             }
             if let Some(d) = memory_text_dispatcher_for_ops.clone() {
                 real_writer.set_memory_text_dispatcher(d);
@@ -1450,6 +1520,35 @@ pub fn spawn_shard(
                     .expect("register AutoEdgeWorker");
             }
 
+            // Phase T: register the TemporalEdgeWorker when its
+            // channel was created above. Drains the writer's post-
+            // encode channel, looks up the agent's prior memory, and
+            // writes a decay-weighted `FollowedBy` edge.
+            if let Some(rx) = temporal_edge_receiver {
+                let worker_cfg = WorkerConfig {
+                    enabled: temporal_edge_spawn_cfg.enabled,
+                    interval: std::time::Duration::from_millis(
+                        temporal_edge_spawn_cfg.interval_ms.max(1),
+                    ),
+                    batch_size: temporal_edge_spawn_cfg.batch_size,
+                    max_runtime: std::time::Duration::from_secs(5),
+                };
+                let knobs = brain_workers::TemporalEdgeKnobs {
+                    window_seconds: temporal_edge_spawn_cfg.window_seconds,
+                    weight_min: temporal_edge_spawn_cfg.weight_min,
+                    cross_context: temporal_edge_spawn_cfg.cross_context,
+                };
+                let mut temporal_edge_worker = brain_workers::TemporalEdgeWorker::new(rx)
+                    .with_config(worker_cfg)
+                    .with_knobs(knobs);
+                if let Some(m) = temporal_edge_metrics_for_closure.clone() {
+                    temporal_edge_worker = temporal_edge_worker.with_metrics(m);
+                }
+                scheduler
+                    .register(Arc::new(temporal_edge_worker), ops.clone())
+                    .expect("register TemporalEdgeWorker");
+            }
+
             // Phase E: register the ExtractorWorker when its channel was
             // created above (i.e. when `cfg.extractor.enabled` is true).
             // The worker drains the writer's post-encode channel and
@@ -1510,6 +1609,7 @@ pub fn spawn_shard(
         shard_uuid,
         auto_edge_metrics: auto_edge_metrics_for_handle,
         extractor_metrics: extractor_metrics_for_handle,
+        temporal_edge_metrics: temporal_edge_metrics_for_handle,
     };
     let joiner = ShardJoiner {
         shard_id,

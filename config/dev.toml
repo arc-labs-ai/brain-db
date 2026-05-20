@@ -88,6 +88,26 @@ channel_capacity = 1024
 # only for re-extraction backfill scenarios.
 skip_already_extracted = true
 
+# Phase T: per-shard TemporalEdgeWorker. Drains the writer's post-encode
+# channel and writes `FollowedBy` edges from the agent's previous memory
+# in the same context within `window_seconds`. Linear decay weight on
+# the gap; asymmetric edges (no mirror).
+[workers.temporal_edge]
+# Master switch.
+enabled = true
+# Scheduler tick.
+interval_ms = 100
+# Max memories drained per cycle.
+batch_size = 256
+# Temporal window. Memories older than this are not candidates.
+window_seconds = 300
+# Hard floor on the decay-weight curve.
+weight_min = 0.1
+# Writer→worker queue depth.
+channel_capacity = 1024
+# Allow FollowedBy edges across context boundaries.
+cross_context = false
+
 [logging]
 level = "info"
 output = "stdout"

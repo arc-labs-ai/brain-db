@@ -148,7 +148,7 @@ mod linux_main {
     use crate::routing::RoutingTable;
     use crate::shard::{
         spawn_shard, AutoEdgeSpawnConfig, ExtractorSpawnConfig, ShardHandle, ShardJoiner,
-        ShardSpawnConfig,
+        ShardSpawnConfig, TemporalEdgeSpawnConfig,
     };
 
     /// Errors surfaced by [`build_dispatcher`]. Hand-rolled `Display`
@@ -446,6 +446,17 @@ mod linux_main {
                     .llm_budget_per_cycle_micro_usd,
                 channel_capacity: cfg.workers.extractor.channel_capacity,
                 skip_already_extracted: cfg.workers.extractor.skip_already_extracted,
+            };
+            // Phase T: ferry the operator's `[workers.temporal_edge]`
+            // overrides into the per-shard spawn config.
+            spawn_cfg.temporal_edge = TemporalEdgeSpawnConfig {
+                enabled: cfg.workers.temporal_edge.enabled,
+                interval_ms: cfg.workers.temporal_edge.interval_ms,
+                batch_size: cfg.workers.temporal_edge.batch_size,
+                window_seconds: cfg.workers.temporal_edge.window_seconds,
+                weight_min: cfg.workers.temporal_edge.weight_min,
+                channel_capacity: cfg.workers.temporal_edge.channel_capacity,
+                cross_context: cfg.workers.temporal_edge.cross_context,
             };
             match spawn_shard(shard_id as u16, spawn_cfg) {
                 Ok((h, j)) => {

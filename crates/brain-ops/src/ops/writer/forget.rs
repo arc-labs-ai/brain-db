@@ -219,6 +219,10 @@ async fn record_and_return_forget(
                 let dedup_back_ref = row.content_hash;
                 let row_agent = row.agent_id();
                 let row_context = row.context();
+                // Snapshot the original-encode timestamp before we
+                // consume `row` in the metadata stamp below. The
+                // timeline-index delete needs it.
+                let row_created_at = row.created_at_unix_nanos;
                 if row.tombstoned_at_unix_nanos.is_none() {
                     row.tombstoned_at_unix_nanos = Some(created_at);
                     memories_t
@@ -234,6 +238,31 @@ async fn record_and_return_forget(
                     })?;
                     fp_t.remove(key).map_err(|e| {
                         WriterError::Internal(format!("forget fingerprints remove: {e:?}"))
+                    })?;
+                }
+                // Drop the agent-timeline index row so the
+                // TemporalEdgeWorker never proposes a tombstoned
+                // memory as a temporal predecessor. Same write txn
+                // as the metadata stamp so the two stay consistent.
+                {
+                    use brain_metadata::tables::memory::{
+                        agent_timeline_key, MEMORIES_BY_AGENT_TIMELINE_TABLE,
+                    };
+                    let key = agent_timeline_key(
+                        row_agent.0.into_bytes(),
+                        row_created_at,
+                        row_context.0,
+                        op.memory_id.to_be_bytes(),
+                    );
+                    let mut tl_t =
+                        wtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE)
+                            .map_err(|e| {
+                                WriterError::Internal(format!(
+                                    "forget open MEMORIES_BY_AGENT_TIMELINE: {e:?}"
+                                ))
+                            })?;
+                    tl_t.remove(key.as_slice()).map_err(|e| {
+                        WriterError::Internal(format!("forget timeline remove: {e:?}"))
                     })?;
                 }
             }
