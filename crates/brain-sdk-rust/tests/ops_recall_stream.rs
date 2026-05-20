@@ -20,8 +20,6 @@ fn mock_result(idx: u32) -> MemoryResult {
         context_id: 0,
         created_at_unix_nanos: 0,
         last_accessed_at_unix_nanos: 0,
-        vector_offset: 0,
-        vector_dim: 0,
         edges: None,
         contributing_retrievers: Vec::new(),
         fused_score: 0.0,

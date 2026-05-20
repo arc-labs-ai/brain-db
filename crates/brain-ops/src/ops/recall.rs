@@ -237,8 +237,6 @@ fn hit_to_wire(hit: RecallHit) -> MemoryResult {
         context_id: hit.context_id.into(),
         created_at_unix_nanos: hit.created_at_unix_nanos,
         last_accessed_at_unix_nanos: hit.last_accessed_at_unix_nanos,
-        vector_offset: 0,
-        vector_dim: 0,
         edges: None,
         // Substrate path — no hybrid metadata.
         contributing_retrievers: Vec::new(),
@@ -458,8 +456,6 @@ fn project_memory_results(
             context_id: ContextId(row.context_id).into(),
             created_at_unix_nanos: row.created_at_unix_nanos,
             last_accessed_at_unix_nanos: row.last_accessed_at_unix_nanos,
-            vector_offset: 0,
-            vector_dim: 0,
             edges: None,
             contributing_retrievers: fused
                 .contributing

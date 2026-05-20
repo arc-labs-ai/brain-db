@@ -66,8 +66,6 @@ pub struct MemoryResult {
     pub context_id: WireContextId,
     pub created_at_unix_nanos: u64,
     pub last_accessed_at_unix_nanos: u64,
-    pub vector_offset: u32,
-    pub vector_dim: u16,
     pub edges: Option<Vec<EdgeView>>,
     /// Retrievers that surfaced this memory. Empty on substrate-only
     /// deployments and inside transactions; populated when the server

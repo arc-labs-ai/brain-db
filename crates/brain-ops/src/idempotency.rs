@@ -206,7 +206,11 @@ pub fn decode_encode_payload(
         1 => true,
         _ => return Err(DecodeError::Malformed("encode unknown dedup flag")),
     };
-    Ok((MemoryId::from_be_bytes(mid_bytes), outcomes, was_deduplicated))
+    Ok((
+        MemoryId::from_be_bytes(mid_bytes),
+        outcomes,
+        was_deduplicated,
+    ))
 }
 
 /// Encode a FORGET outcome.

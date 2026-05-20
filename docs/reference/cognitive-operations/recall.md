@@ -16,7 +16,6 @@ HNSW, applies filters, and returns up to `k` ranked results.
 | `filter` | `RecallFilter` | no | See below. |
 | `include_text` | `bool` | no | Include memory text in results. Default `false`. ~50 µs/result. |
 | `include_metadata` | `bool` | no | Include K/V metadata. Default `false`. |
-| `include_vectors` | `bool` | no | Include the raw vector. Default `false`. |
 | `consistency` | `Consistency` | no | `Eventual` (default) or `ReadAfterWrite`. The latter waits for the HNSW maintenance tick to apply pending inserts (adds ~50 ms). |
 | `confidence_min` | `f32` | no | Drop results with score below this. |
 

@@ -98,15 +98,12 @@ fn encode_req(request_id: [u8; 16], text: &str, kind: MemoryKindWire) -> EncodeR
 fn recall_req(cue: &str, top_k: u32) -> RecallRequest {
     RecallRequest {
         cue_text: cue.into(),
-        cue_vector_offset: 0,
-        cue_vector_dim: 0,
         top_k,
         confidence_threshold: 0.0,
         context_filter: None,
         age_bound_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
-        include_vectors: false,
         include_edges: false,
         include_text: false,
         request_id: None,
@@ -179,8 +176,6 @@ fn recall_full_pipeline_returns_top_k() {
             top.last_accessed_at_unix_nanos, top.created_at_unix_nanos,
             "v1: last_accessed mirrors created_at"
         );
-        assert_eq!(top.vector_offset, 0);
-        assert_eq!(top.vector_dim, 0);
         assert!(top.edges.is_none());
     })
 }

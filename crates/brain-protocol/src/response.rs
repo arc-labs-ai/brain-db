@@ -444,8 +444,6 @@ mod tests {
                 context_id: 1_u64,
                 created_at_unix_nanos: 1_700_000_000_000_000_000,
                 last_accessed_at_unix_nanos: 1_700_000_001_000_000_000,
-                vector_offset: 0,
-                vector_dim: 0,
                 contributing_retrievers: vec![
                     crate::responses::types::RetrieverNameWire::Semantic,
                     crate::responses::types::RetrieverNameWire::Lexical,

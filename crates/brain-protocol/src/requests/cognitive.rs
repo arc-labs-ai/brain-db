@@ -56,15 +56,12 @@ pub struct EncodeVectorDirectRequest {
 #[archive_attr(derive(Debug))]
 pub struct RecallRequest {
     pub cue_text: String,
-    pub cue_vector_offset: u32,
-    pub cue_vector_dim: u16,
     pub top_k: u32,
     pub confidence_threshold: f32,
     pub context_filter: Option<Vec<WireContextId>>,
     pub age_bound_unix_nanos: Option<u64>,
     pub kind_filter: Option<Vec<MemoryKindWire>>,
     pub salience_floor: f32,
-    pub include_vectors: bool,
     pub include_edges: bool,
     /// When set, each `MemoryResult` carries the memory's stored UTF-8
     /// text. Costs one batched read against the per-shard `texts`

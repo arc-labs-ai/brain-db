@@ -722,7 +722,10 @@ fn encode_dedup_then_replay_returns_was_deduplicated_true() {
             .await
             .unwrap(),
         );
-        assert!(second.was_deduplicated, "second encode hits the fingerprint");
+        assert!(
+            second.was_deduplicated,
+            "second encode hits the fingerprint"
+        );
         assert_eq!(first.memory_id, second.memory_id);
 
         // Third: retry the SAME request_id as `second` → idempotency

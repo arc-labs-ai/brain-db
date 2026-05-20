@@ -101,8 +101,6 @@ async fn encode_one(ctx: &OpsContext, rid: u32, text: &str) {
 async fn recall_one(ctx: &OpsContext, cue: &str) -> usize {
     let req = RecallRequest {
         cue_text: cue.into(),
-        cue_vector_offset: 0,
-        cue_vector_dim: 0,
         top_k: 5,
         confidence_threshold: 0.0,
         context_filter: None,
@@ -110,7 +108,6 @@ async fn recall_one(ctx: &OpsContext, cue: &str) -> usize {
         kind_filter: None,
         salience_floor: 0.0,
         strategy: None,
-        include_vectors: false,
         include_edges: false,
         include_text: false,
         request_id: None,

@@ -24,7 +24,6 @@ pub struct RecallBuilder<'a> {
     age_bound_unix_nanos: Option<u64>,
     kind_filter: Option<Vec<MemoryKindWire>>,
     salience_floor: f32,
-    include_vectors: bool,
     include_edges: bool,
     include_text: bool,
     request_id: Option<RequestId>,
@@ -42,7 +41,6 @@ impl<'a> RecallBuilder<'a> {
             age_bound_unix_nanos: None,
             kind_filter: None,
             salience_floor: 0.0,
-            include_vectors: false,
             include_edges: false,
             include_text: false,
             request_id: None,
@@ -91,12 +89,6 @@ impl<'a> RecallBuilder<'a> {
     }
 
     #[must_use]
-    pub fn include_vectors(mut self, on: bool) -> Self {
-        self.include_vectors = on;
-        self
-    }
-
-    #[must_use]
     pub fn include_edges(mut self, on: bool) -> Self {
         self.include_edges = on;
         self
@@ -139,7 +131,6 @@ impl<'a> RecallBuilder<'a> {
         let age_bound_unix_nanos = self.age_bound_unix_nanos;
         let kind_filter = self.kind_filter;
         let salience_floor = self.salience_floor;
-        let include_vectors = self.include_vectors;
         let include_edges = self.include_edges;
         let include_text = self.include_text;
         let txn_id = self.txn_id;
@@ -154,15 +145,12 @@ impl<'a> RecallBuilder<'a> {
                 async move {
                     let body = RequestBody::Recall(RecallRequest {
                         cue_text,
-                        cue_vector_offset: 0,
-                        cue_vector_dim: 0,
                         top_k,
                         confidence_threshold,
                         context_filter,
                         age_bound_unix_nanos,
                         kind_filter,
                         salience_floor,
-                        include_vectors,
                         include_edges,
                         include_text,
                         request_id: request_id_bytes,
@@ -220,15 +208,12 @@ impl<'a> RecallBuilder<'a> {
         let request_id_bytes: Option<[u8; 16]> = request_id.map(Into::into);
         let body = RequestBody::Recall(RecallRequest {
             cue_text: self.cue_text,
-            cue_vector_offset: 0,
-            cue_vector_dim: 0,
             top_k: self.top_k,
             confidence_threshold: self.confidence_threshold,
             context_filter: self.context_filter,
             age_bound_unix_nanos: self.age_bound_unix_nanos,
             kind_filter: self.kind_filter,
             salience_floor: self.salience_floor,
-            include_vectors: self.include_vectors,
             include_edges: self.include_edges,
             include_text: self.include_text,
             request_id: request_id_bytes,

@@ -423,15 +423,12 @@ mod tests {
     fn recall_round_trips() {
         round_trip(RequestBody::Recall(RecallRequest {
             cue_text: "what about budgets".into(),
-            cue_vector_offset: 0,
-            cue_vector_dim: 0,
             top_k: 10,
             confidence_threshold: 0.3,
             context_filter: Some(vec![1_u64, 2_u64]),
             age_bound_unix_nanos: Some(1_700_000_000_000_000_000),
             kind_filter: Some(vec![MemoryKindWire::Episodic, MemoryKindWire::Semantic]),
             salience_floor: 0.1,
-            include_vectors: false,
             include_edges: true,
             include_text: true,
             request_id: Some(sample_uuid(7)),

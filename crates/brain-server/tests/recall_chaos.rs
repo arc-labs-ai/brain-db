@@ -172,15 +172,12 @@ async fn seed_fixture(client: &mut TcpStream) {
 fn recall_request() -> RecallRequest {
     RecallRequest {
         cue_text: "meeting preferences".into(),
-        cue_vector_offset: 0,
-        cue_vector_dim: 0,
         top_k: 5,
         confidence_threshold: 0.0,
         context_filter: None,
         age_bound_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
-        include_vectors: false,
         include_edges: false,
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),

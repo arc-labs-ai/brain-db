@@ -329,15 +329,12 @@ fn forget_request(memory_id: MemoryId, mode: ForgetMode, request_id: [u8; 16]) -
 fn recall_request(cue: &str, top_k: u32) -> RecallRequest {
     RecallRequest {
         cue_text: cue.into(),
-        cue_vector_offset: 0,
-        cue_vector_dim: 0,
         top_k,
         confidence_threshold: 0.0,
         context_filter: None,
         age_bound_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
-        include_vectors: false,
         include_edges: false,
         include_text: false,
         request_id: None,
