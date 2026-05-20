@@ -180,8 +180,16 @@ pub fn resolve_with(
         },
         None => None,
     };
+    // Mint a fresh UUIDv7. `AgentId::default()` is the nil-uuid
+    // anonymous sentinel — the wrong thing here: ephemeral memories
+    // need a unique routing key so they don't collide across shell
+    // sessions or with the substrate's anonymous-sentinel reads.
+    // The shell's connect banner advertises this as "ephemeral —
+    // memories you encode are visible only until you quit," and the
+    // visible-only-until-quit guarantee depends on the agent id being
+    // distinct from every other session's.
     Ok(ResolvedAgentId {
-        agent_id: AgentId::default(),
+        agent_id: AgentId::new(),
         source: AgentIdSource::Ephemeral,
         migration,
     })
