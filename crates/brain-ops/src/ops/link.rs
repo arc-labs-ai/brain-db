@@ -142,25 +142,66 @@ pub async fn handle_unlink(
     if let Some(txn_id) = req.txn_id {
         return handle_unlink_in_txn(req, txn_id, ctx).await;
     }
-    let op = UnlinkOp {
-        request_id: RequestId::from(req.request_id),
-        source: MemoryId::from(req.source),
-        target: MemoryId::from(req.target),
-        kind: req.kind.into(),
-        agent_id: ctx.executor.caller_agent,
+    let source = MemoryId::from(req.source);
+    let target = MemoryId::from(req.target);
+    let kind = EdgeKind::from(req.kind);
+
+    // Peek the edge to compute `removed`: legacy submit_unlink folded
+    // the pre-write existence check into its ack. apply_unlink doesn't
+    // surface it, so we read EDGES_TABLE here pre-submit.
+    let removed = peek_edge_exists(ctx, source, target, kind)?;
+
+    let real_writer = downcast_writer(ctx)?;
+    let phase = Phase::Unlink {
+        from: NodeRef::Memory(source),
+        to: NodeRef::Memory(target),
+        kind: EdgeKindRef::Builtin(kind),
+        disambiguator: brain_metadata::tables::edge::zero_disambiguator(),
     };
-    let ack = ctx
-        .executor
-        .writer
-        .submit_unlink(op)
+    let write = Write::single(
+        WriteId::from_request(RequestId::from(req.request_id)),
+        ctx.executor.caller_agent,
+        phase,
+    );
+    let ack = real_writer
+        .submit(write)
         .await
         .map_err(map_writer_err_for_unlink)?;
+    debug_assert!(matches!(ack.single_phase(), PhaseAck::Unlinked));
     Ok(UnlinkResponse {
-        source: ack.source.into(),
-        target: ack.target.into(),
-        kind: EdgeKindWire::from(ack.kind),
-        removed: ack.removed,
+        source: source.into(),
+        target: target.into(),
+        kind: EdgeKindWire::from(kind),
+        removed,
     })
+}
+
+/// Read EDGES_TABLE for the (source, kind, target) tuple. Returns
+/// `true` if the canonical forward row exists. Used by handle_unlink
+/// to compute the `removed` wire flag pre-submit.
+fn peek_edge_exists(
+    ctx: &OpsContext,
+    source: MemoryId,
+    target: MemoryId,
+    kind: EdgeKind,
+) -> Result<bool, OpError> {
+    let db_guard = ctx.executor.metadata.lock();
+    let rtxn = db_guard.read_txn().map_err(|e| {
+        OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
+    })?;
+    let edges_t = rtxn
+        .open_table(brain_metadata::tables::edge::EDGES_TABLE)
+        .map_err(|e| {
+            OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
+        })?;
+    let key = brain_metadata::tables::edge::EdgeKey {
+        from: NodeRef::Memory(source),
+        kind: EdgeKindRef::Builtin(kind),
+        to: NodeRef::Memory(target),
+        disambiguator: brain_metadata::tables::edge::zero_disambiguator(),
+    }
+    .encode();
+    Ok(edges_t.get(key.as_slice()).ok().flatten().is_some())
 }
 
 async fn handle_link_in_txn(
