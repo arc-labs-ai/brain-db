@@ -570,10 +570,7 @@ mod tests {
         }
         // Sources block must list all four source forms.
         for source in ["<TEXT>", "--from-file", "--from-stdin", "--vector"] {
-            assert!(
-                card.contains(source),
-                "missing source {source} in:\n{card}"
-            );
+            assert!(card.contains(source), "missing source {source} in:\n{card}");
         }
         // Reference block must surface clap + markdown deep-dive.
         assert!(card.contains("encode --help"), "missing clap reference");

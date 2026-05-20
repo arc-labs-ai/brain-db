@@ -794,7 +794,10 @@ mod tests {
     #[test]
     fn wrap_lines_handles_empty_and_basic_inputs() {
         assert_eq!(wrap_lines("", 10), vec![String::new()]);
-        assert_eq!(wrap_lines("hello world", 20), vec!["hello world".to_string()]);
+        assert_eq!(
+            wrap_lines("hello world", 20),
+            vec!["hello world".to_string()]
+        );
         let wrapped = wrap_lines("one two three four five", 10);
         assert!(
             wrapped.iter().all(|l| l.len() <= 10),
