@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 pub mod access_buffer;
+pub mod apply;
 pub mod context;
 pub mod dispatch;
 pub mod error;
