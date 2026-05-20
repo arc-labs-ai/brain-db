@@ -7,7 +7,7 @@ use brain_sdk_rust::{Client, ClientError};
 use clap::Parser;
 use rustyline::error::ReadlineError;
 
-use crate::cli::agent_id::AgentIdSource;
+use crate::cli::agent::AgentIdSource;
 use crate::cli::config::Config;
 use crate::commands;
 use crate::commands::render_ctx;

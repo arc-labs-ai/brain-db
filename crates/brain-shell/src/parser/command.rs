@@ -38,12 +38,12 @@ pub struct GlobalOpts {
 
     /// Named agent (looked up in ~/.config/brain/config.toml). Use
     /// `brain agent list` to see configured names.
-    // Env-var (BRAIN_AGENT) handling lives in cli::agent_id::resolve.
+    // Env-var (BRAIN_AGENT) handling lives in cli::agent::resolve.
     #[arg(long, global = true)]
     pub agent: Option<String>,
 
     /// Raw agent UUID. Bypasses the named-agent lookup entirely.
-    // Env-var (BRAIN_AGENT_ID) handling lives in cli::agent_id::resolve.
+    // Env-var (BRAIN_AGENT_ID) handling lives in cli::agent::resolve.
     #[arg(long, global = true)]
     pub agent_id: Option<String>,
 

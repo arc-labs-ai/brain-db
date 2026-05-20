@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use clap::{CommandFactory, Parser};
 
-use crate::cli::agent_id;
+use crate::cli::agent;
 use crate::cli::config::{Config, MigrationNote};
 use crate::commands;
 use crate::commands::render_ctx;
@@ -49,14 +49,14 @@ pub async fn dispatch_argv(argv: Vec<String>) -> ExitCode {
     }
 
     // ── agent + settings resolution ────────────────────────────────
-    let resolved =
-        match agent_id::resolve(cli.global.agent.as_deref(), cli.global.agent_id.as_deref()) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::from(2);
-            }
-        };
+    let resolved = match agent::resolve(cli.global.agent.as_deref(), cli.global.agent_id.as_deref())
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
     if let Some(note) = &resolved.migration {
         eprint_migration_note(note);
     }
@@ -489,7 +489,7 @@ fn resolved_bound_name(agent_flag: Option<&str>, agent_id_flag: Option<&str>) ->
     if agent_id_flag.is_some() {
         return None;
     }
-    if let Ok(s) = std::env::var(agent_id::ENV_VAR_NAME) {
+    if let Ok(s) = std::env::var(agent::ENV_VAR_NAME) {
         if !s.is_empty() {
             return Some(s);
         }

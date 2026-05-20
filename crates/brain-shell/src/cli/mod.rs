@@ -1,6 +1,6 @@
 //! One-shot dispatch + REPL entrypoint.
 
-pub mod agent_id;
+pub mod agent;
 pub mod args;
 pub mod config;
 
