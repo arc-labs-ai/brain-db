@@ -514,8 +514,12 @@ mod tests {
         };
         let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::None]);
         server.supported_versions = vec![1, 2];
-        let session = negotiate(&client, &server).expect("overlap on 1");
-        assert_eq!(session.chosen_version, 1);
+        // Client only speaks the current wire version; server speaks
+        // both 1 and the current. Negotiation must pick the current,
+        // not the older. Pinning the assert to `crate::VERSION` keeps
+        // the test honest across future bumps.
+        let session = negotiate(&client, &server).expect("overlap on current version");
+        assert_eq!(session.chosen_version, crate::VERSION);
     }
 
     #[test]
