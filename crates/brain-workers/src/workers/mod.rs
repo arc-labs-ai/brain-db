@@ -6,6 +6,7 @@ pub mod audit_log_sweeper;
 pub mod auto_edge;
 pub mod backfill;
 pub mod cache_evict;
+pub mod causal_edge;
 pub mod consolidation;
 pub mod counter_reconcile;
 pub mod decay;

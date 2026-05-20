@@ -42,9 +42,9 @@ pub use worker::{drive_batch, Worker};
 // Module-level re-exports preserve the pre-refactor public paths
 // (`brain_workers::<worker>::<Type>`) so external callers don't churn.
 pub use workers::{
-    access_boost, auto_edge, cache_evict, consolidation, counter_reconcile, decay, edge_scrub,
-    extractor, hnsw_maint, idempotency_cleanup, slot_reclaim, snapshot, statistics, temporal_edge,
-    wal_retention,
+    access_boost, auto_edge, cache_evict, causal_edge, consolidation, counter_reconcile, decay,
+    edge_scrub, extractor, hnsw_maint, idempotency_cleanup, slot_reclaim, snapshot, statistics,
+    temporal_edge, wal_retention,
 };
 
 pub use workers::access_boost::{
@@ -57,6 +57,11 @@ pub use workers::auto_edge::{
 pub use workers::cache_evict::{
     CacheEvictionError, CacheEvictionSource, CacheEvictionWorker, DisabledCacheEvictionSource,
     PruneFuture, DEFAULT_CACHE_MAX_AGE,
+};
+pub use workers::causal_edge::{
+    resolve_whitelist as resolve_causal_whitelist, CausalEdgeKnobs, CausalEdgeWorker,
+    DEFAULT_MAX_CAUSE_MEMORIES, DEFAULT_MAX_EFFECT_MEMORIES, DEFAULT_MAX_RELATED_STATEMENTS,
+    DEFAULT_MIN_CONFIDENCE as DEFAULT_CAUSAL_MIN_CONFIDENCE, DEFAULT_WHITELIST_QNAMES,
 };
 pub use workers::consolidation::{
     cluster_by_similarity, cosine, deterministic_request_id, ClusterCandidate, ConsolidationWorker,

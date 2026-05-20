@@ -55,14 +55,16 @@ pub use ops::subscribe::{
     SubscriptionRegistry, DEFAULT_EVENT_CHANNEL_CAPACITY,
 };
 pub use ops::txn::{TxnState, TxnStore};
-pub use ops::writer::{AutoEdgeEnqueue, ExtractorEnqueue, RealWriterHandle, TemporalEdgeEnqueue};
+pub use ops::writer::{
+    AutoEdgeEnqueue, CausalEdgeEnqueue, ExtractorEnqueue, RealWriterHandle, TemporalEdgeEnqueue,
+};
 pub use schema_gate::SchemaGate;
 pub use worker_metrics::{
-    AutoEdgeMetrics, AutoEdgeMetricsSnapshot, ExtractorItemKind, ExtractorMetrics,
-    ExtractorMetricsSnapshot, ResolverOutcome, TemporalEdgeMetrics, TemporalEdgeMetricsSnapshot,
-    TemporalSkipReason, TierKind, TierStatus, WorkerBucketSnapshot, WorkerHistogram,
-    WorkerHistogramSnapshot, ITEM_KIND_LABELS, RESOLVER_OUTCOME_LABELS, TIER_LABELS,
-    TIER_STATUS_LABELS,
+    AutoEdgeMetrics, AutoEdgeMetricsSnapshot, CausalEdgeMetrics, CausalEdgeMetricsSnapshot,
+    CausalSkipReason, ExtractorItemKind, ExtractorMetrics, ExtractorMetricsSnapshot,
+    ResolverOutcome, TemporalEdgeMetrics, TemporalEdgeMetricsSnapshot, TemporalSkipReason,
+    TierKind, TierStatus, WorkerBucketSnapshot, WorkerHistogram, WorkerHistogramSnapshot,
+    ITEM_KIND_LABELS, RESOLVER_OUTCOME_LABELS, TIER_LABELS, TIER_STATUS_LABELS,
 };
 
 #[cfg(test)]

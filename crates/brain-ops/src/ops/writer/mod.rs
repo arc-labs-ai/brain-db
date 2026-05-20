@@ -176,6 +176,15 @@ pub type TemporalEdgeEnqueue = (
     u64,
 );
 
+/// What the ExtractorWorker pushes into the CausalEdgeWorker's channel
+/// post-statement-commit, when the statement's predicate is in the
+/// resolved causal whitelist. Only the `StatementId` travels — the
+/// CausalEdgeWorker reads the full row + walks the cause-side
+/// `STATEMENTS_BY_SUBJECT` index inside its own rtxn. Carrying the
+/// statement inline would make the enqueue tuple awkward (variable-size
+/// evidence) without saving any redb work on the worker side.
+pub type CausalEdgeEnqueue = brain_core::StatementId;
+
 impl RealWriterHandle {
     #[must_use]
     pub fn new(metadata: SharedMetadataDb, hnsw_writer: HnswWriter<384>) -> Self {
