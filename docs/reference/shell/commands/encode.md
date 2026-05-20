@@ -16,6 +16,7 @@ brain encode [TEXT]
         [--from-stdin]
         [--vector <CSV>]
         [--wait-for-extraction]
+        [--wait-auto-edges-ms <N>]
         [--txn <HEX>]
 ```
 
@@ -195,6 +196,42 @@ substrate-only deployment this flag will time out silently.
 ```bash
 brain encode "Alice mentions Bob and Carol" --wait-for-extraction
 # Returns only after entities Alice/Bob/Carol are persisted in the KG.
+```
+
+### `--wait-auto-edges-ms <N>`
+
+The encode response always carries `auto_edges_added = 0` because the
+AutoEdgeWorker writes its edges asynchronously (~100 ms after the
+response leaves the wire). When this flag is positive, the shell opens
+a filtered subscribe stream at `lsn+1` for `N` milliseconds, collects
+the `EdgeAdded(AUTO_DERIVED)` events whose source matches this
+encode's memory id, and appends a delta line below the card:
+
+```
+──────────────────────────────────────────────────────────────────────
+  ✓ ENCODED                              LSN 4 · s0/m4/v1 · 12 ms ago
+  content     "alpha test sentence one duplicate"
+  type        episodic      salience  0.50      context  0
+  edges       0 auto · 0 explicit · 0 total
+──────────────────────────────────────────────────────────────────────
+→ 1 auto-edge landed in 187 ms
+    SimilarTo s0/m3/v1  weight=0.991
+```
+
+When the watcher window expires without seeing any auto-edge events,
+no delta line prints (silence is the correct UX for memories that
+genuinely have no similar neighbours). `0` (the default) keeps
+behaviour unchanged. Reasonable values are 100–500 ms; the worker
+cycles every 100 ms so a window narrower than that risks missing the
+first cycle.
+
+The watcher runs in-process; the encode response has already left the
+wire by the time the delta lands.
+
+```bash
+brain encode "alpha test sentence one" --wait-auto-edges-ms 500
+brain encode "alpha test sentence one duplicate" --wait-auto-edges-ms 500
+# Second card prints with `auto · 0` AND a delta line one cycle later.
 ```
 
 ### `--txn <HEX>`

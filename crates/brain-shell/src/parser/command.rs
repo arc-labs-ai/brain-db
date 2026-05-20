@@ -690,6 +690,14 @@ pub struct EncodeArgs {
     /// emit the `ExtractionCompleted` event variant on the change feed.
     #[arg(long = "wait-for-extraction")]
     pub wait_for_extraction: bool,
+    /// After the encode response renders, open a filtered subscribe
+    /// stream for up to N milliseconds and amend the card with a
+    /// delta line listing the auto-edges the AutoEdgeWorker writes.
+    /// `0` (the default) keeps behaviour unchanged — the card prints
+    /// `auto · 0` and exits immediately. Useful values are 100–500 ms
+    /// (the worker cycles every 100 ms).
+    #[arg(long = "wait-auto-edges-ms", default_value_t = 0u32)]
+    pub wait_auto_edges_ms: u32,
     /// Skip the embedder; use this comma-separated vector directly.
     /// Mutually exclusive with `text`. Requires the `ENCODE_VECTOR_DIRECT`
     /// wire op — see warnings emitted at run time.

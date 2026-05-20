@@ -22,7 +22,7 @@ use brain_sdk_rust::{Client, ClientError};
 use futures_lite::StreamExt;
 use uuid::Uuid;
 
-use brain_explore::EncodeRendered;
+use brain_explore::{AutoEdgeSummary, AutoEdgesDelta, EncodeRendered};
 
 use crate::parser::{parse_txn_id, EncodeArgs};
 use crate::session::Session;
@@ -88,9 +88,30 @@ pub async fn run(
         wait_for_extraction(client, MemoryId::from_raw(resp.memory_id), resp.lsn).await?;
     }
 
-    Ok(Box::new(
-        EncodeRendered::new(resp).with_source(text.clone()),
-    ))
+    // When --wait-auto-edges-ms is positive, open a filtered subscribe
+    // stream for that window and collect EdgeAdded(AUTO_DERIVED) events
+    // whose `from_id` matches this encode's memory id. The watcher
+    // returns whatever it sees within the window; non-blocking on
+    // success or empty result. The encode response already left the
+    // wire — the watcher only amends what we render to the user.
+    let auto_edges_delta = if args.wait_auto_edges_ms > 0 {
+        let delta = watch_auto_edges(
+            client,
+            MemoryId::from_raw(resp.memory_id),
+            resp.lsn,
+            args.wait_auto_edges_ms,
+        )
+        .await;
+        Some(delta)
+    } else {
+        None
+    };
+
+    let mut rendered = EncodeRendered::new(resp).with_source(text.clone());
+    if let Some(delta) = auto_edges_delta {
+        rendered = rendered.with_auto_edges_delta(delta);
+    }
+    Ok(Box::new(rendered))
 }
 
 /// Pull text from whichever source the user picked. Errors when no
@@ -142,6 +163,124 @@ fn parse_request_id(arg: Option<&str>) -> Result<Option<RequestId>, ClientError>
     let uuid = Uuid::parse_str(s.trim())
         .map_err(|e| ClientError::Internal(format!("bad --request-id `{s}`: {e}")))?;
     Ok(Some(RequestId(uuid)))
+}
+
+/// Subscribe at `lsn+1` and collect `EdgeAdded(AUTO_DERIVED)` events
+/// whose source matches `memory_id` for up to `window_ms` milliseconds.
+/// Returns whatever the watcher saw — empty list when the worker
+/// didn't pair this memory or didn't run in time.
+///
+/// Errors during subscribe are logged and swallowed: the encode
+/// already succeeded; an observation problem must not crash the
+/// caller's response.
+async fn watch_auto_edges(
+    client: &Client,
+    memory_id: MemoryId,
+    start_lsn: u64,
+    window_ms: u32,
+) -> AutoEdgesDelta {
+    // Origin discriminator on the wire's `EdgeEventPayload.origin`.
+    // Mirrors `brain_metadata::tables::edge::origin::AUTO_DERIVED`;
+    // hardcoded here so brain-shell doesn't pull brain-metadata in
+    // for a single byte. If the meaning ever changes the broken
+    // filter would silently keep `EXPLICIT` edges through, which is
+    // visible immediately on first run (the wrong column on the card).
+    const AUTO_DERIVED: u8 = 1;
+
+    let started = std::time::Instant::now();
+    let from_id_bytes = memory_id.raw().to_be_bytes();
+    let mut edges: Vec<AutoEdgeSummary> = Vec::new();
+
+    let stream_result = client
+        .subscribe()
+        .start_lsn(start_lsn.saturating_add(1))
+        .send_stream()
+        .await;
+    let mut stream = match stream_result {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                target: "brain_shell",
+                "encode --wait-auto-edges-ms: subscribe failed ({e}); \
+                 encode succeeded, returning empty delta.",
+            );
+            return AutoEdgesDelta {
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                edges,
+            };
+        }
+    };
+
+    let window = Duration::from_millis(u64::from(window_ms));
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let next = match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(ev))) => ev,
+            Ok(Some(Err(e))) => {
+                tracing::debug!(
+                    target: "brain_shell",
+                    "encode --wait-auto-edges-ms: stream error ({e}); returning partial delta."
+                );
+                break;
+            }
+            Ok(None) => break, // server closed the stream
+            Err(_) => break,   // timeout — done
+        };
+        if !matches!(next.event_type, EventType::EdgeAdded) {
+            continue;
+        }
+        let Some(payload) = next.edge_payload.as_ref() else {
+            continue;
+        };
+        // Match the encode's source memory; reject EXPLICIT-origin
+        // events (the user may have called `link` during the window
+        // and we don't want to attribute that to auto-edges).
+        if payload.origin != AUTO_DERIVED {
+            continue;
+        }
+        if payload.from_id != from_id_bytes {
+            continue;
+        }
+        edges.push(AutoEdgeSummary {
+            target: u128::from_be_bytes(payload.to_id),
+            kind: edge_kind_label(payload.edge_kind_tag, payload.edge_kind_byte),
+            weight: payload.weight,
+        });
+    }
+
+    AutoEdgesDelta {
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        edges,
+    }
+}
+
+/// Cheap label for the edge-kind discriminator the wire ships.
+/// `tag 0` = `Builtin(EdgeKind)`; the byte is the substrate kind.
+/// `tag 1` = `Mentions`; `tag 2` = `Typed(RelationTypeId)`. Auto-edges
+/// are always `Builtin(SimilarTo)` today; the other variants render
+/// generically in case future workers emit them.
+fn edge_kind_label(tag: u8, byte: u8) -> String {
+    match tag {
+        0 => match byte {
+            0 => "Caused",
+            1 => "FollowedBy",
+            2 => "DerivedFrom",
+            3 => "SimilarTo",
+            4 => "Contradicts",
+            5 => "Supports",
+            6 => "References",
+            7 => "PartOf",
+            _ => "Builtin",
+        }
+        .to_string(),
+        1 => "Mentions".to_string(),
+        2 => "Typed".to_string(),
+        _ => format!("kind({tag},{byte})"),
+    }
 }
 
 /// Subscribe at `lsn+1` and block until the extractor emits an

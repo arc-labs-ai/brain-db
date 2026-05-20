@@ -196,6 +196,10 @@ fn help_encode() -> HelpVerb {
                 "--wait-for-extraction",
                 "block until knowledge layer extracts",
             ),
+            row(
+                "--wait-auto-edges-ms N",
+                "after the card renders, watch for AUTO_DERIVED EdgeAdded events for N ms and amend the card with a delta line",
+            ),
             row("--txn HEX", "attach to an open transaction"),
         ],
         sources: vec![
@@ -596,6 +600,7 @@ mod tests {
             "--edge",
             "--request-id",
             "--wait-for-extraction",
+            "--wait-auto-edges-ms",
             "--txn",
         ] {
             assert!(card.contains(flag), "missing flag {flag} in:\n{card}");

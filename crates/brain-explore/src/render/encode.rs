@@ -61,6 +61,38 @@ const BODY_INDENT: &str = "  ";
 pub struct EncodeRendered {
     pub response: EncodeResponse,
     pub source_text: Option<String>,
+    /// Optional post-encode amendment: auto-edges the AutoEdgeWorker
+    /// landed for this memory after the encode response returned.
+    /// `Some(non_empty)` → render a "→ N auto-edges landed in …ms"
+    /// delta line below the card. `Some(empty)` and `None` both
+    /// suppress the line (the latter means the caller didn't ask
+    /// via `--wait-auto-edges-ms`; the former means the worker had
+    /// time to run and produced nothing — silent by design).
+    pub auto_edges_delta: Option<AutoEdgesDelta>,
+}
+
+/// Per-encode summary of auto-edges that landed during the
+/// `--wait-auto-edges-ms` window. Populated by the shell's filtered
+/// subscribe watcher after the encode response returns.
+#[derive(Debug, Clone)]
+pub struct AutoEdgesDelta {
+    /// Wall-clock time the watcher spent listening.
+    pub elapsed_ms: u64,
+    /// One entry per `EdgeAdded(AUTO_DERIVED)` event the watcher saw.
+    pub edges: Vec<AutoEdgeSummary>,
+}
+
+/// One auto-edge surfaced in the delta line. Mirrors `EdgeView` plus
+/// the origin tag so the renderer can label this as "auto" without
+/// assuming the field's discriminant.
+#[derive(Debug, Clone)]
+pub struct AutoEdgeSummary {
+    /// Target memory id, raw `u128` form (matches `EdgeView.target`).
+    pub target: u128,
+    /// Edge kind label (`"SimilarTo"`, etc.).
+    pub kind: String,
+    /// Similarity-derived weight from `EdgeData.weight`.
+    pub weight: f32,
 }
 
 impl EncodeRendered {
@@ -71,6 +103,7 @@ impl EncodeRendered {
         Self {
             response,
             source_text: None,
+            auto_edges_delta: None,
         }
     }
 
@@ -80,6 +113,15 @@ impl EncodeRendered {
     #[must_use]
     pub fn with_source(mut self, text: impl Into<String>) -> Self {
         self.source_text = Some(text.into());
+        self
+    }
+
+    /// Attach an auto-edges delta gathered after the encode response.
+    /// `None` and `Some(delta with empty edges)` both suppress the
+    /// rendered delta line — only a non-empty edge list prints.
+    #[must_use]
+    pub fn with_auto_edges_delta(mut self, delta: AutoEdgesDelta) -> Self {
+        self.auto_edges_delta = Some(delta);
         self
     }
 }
@@ -319,6 +361,32 @@ fn render_human(
     // No trailing blank inside the rule: footer hint sits flush
     // against the bottom framing, matching the top.
     writeln!(w, "{rule}")?;
+
+    // ── Async amendment: auto-edges delta ─────────────────────────
+    // Sits below the card (NOT inside the rules) so the card itself
+    // stays the same shape whether or not the watcher ran. Only
+    // prints when the caller passed `--wait-auto-edges-ms N` AND the
+    // worker landed ≥1 auto-edge in that window. Empty/None: silent.
+    if let Some(delta) = &rendered.auto_edges_delta {
+        if !delta.edges.is_empty() {
+            let arrow = theme.paint(Token::Accent, "→", policy);
+            let n = delta.edges.len();
+            let plural = if n == 1 { "" } else { "s" };
+            let head_text = format!("{n} auto-edge{plural} landed in {} ms", delta.elapsed_ms);
+            let head_painted = theme.paint(Token::Value, &head_text, policy);
+            writeln!(w, "{arrow} {head_painted}")?;
+            for e in &delta.edges {
+                let tgt_short = crate::render::fmt_short_id(e.target);
+                let tgt_painted = theme.paint(Token::MemoryId, &tgt_short, policy);
+                let kind_painted = theme.paint(Token::Muted, &e.kind, policy);
+                writeln!(
+                    w,
+                    "    {kind_painted} {tgt_painted}  weight={:.3}",
+                    e.weight,
+                )?;
+            }
+        }
+    }
 
     Ok(())
 }
