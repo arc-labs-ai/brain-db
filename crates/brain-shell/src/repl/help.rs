@@ -62,8 +62,14 @@ fn top_level() -> String {
     s.push_str("  \\agent                           current binding (id + source)\n");
     s.push_str("  \\agent list                      named agents in config.toml\n");
     s.push_str("  \\agent show [<name>]             full record\n");
-    s.push_str("  \\agent use <name>                sticky-bind to <name> (reconnect)\n");
+    s.push_str("  \\agent use <name>                switch + persist as active\n");
     s.push_str("  \\agent create <name> [--note T]  mint a fresh agent\n");
+    s.push_str("  \\agent set-default <name>        mark <name> as default (sticky)\n");
+    s.push_str(
+        "\nFirst run with no agent? brain mints `agent-<8hex>` and marks it\n\
+         default + active. Use `\\agent create <name>` to add another, and\n\
+         `\\agent use <name>` to switch (persists across sessions).\n",
+    );
     s
 }
 
@@ -146,6 +152,8 @@ Agents:\n\
   \\agent                     current binding (id + source)\n\
   \\agent list                table of named agents\n\
   \\agent show [<name>]       full record\n\
+  \\agent use <name>          switch + persist as active\n\
   \\agent create <name>       mint and persist a fresh agent\n\
+  \\agent set-default <name>  mark as default (factory fallback)\n\
 \n\
   \\q                         exit (alias for quit)\n";

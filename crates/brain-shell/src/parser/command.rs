@@ -423,6 +423,10 @@ pub enum AgentCommand {
         #[arg(long)]
         note: Option<String>,
     },
+    /// Mark <name> as the file's `default` agent (the factory
+    /// fallback the resolver uses when no `active` is set).
+    /// Doesn't touch `active`.
+    SetDefault { name: String },
 }
 
 /// `MemoryId` parser that accepts three input forms:

@@ -285,11 +285,9 @@ enum Meta {
 enum AgentSub {
     List,
     Show(Option<String>),
-    // `name` is reserved for future live-rebind support; today the
-    // handler refuses with a "quit + relaunch" message and doesn't
-    // need the value.
-    Use(#[allow(dead_code)] String),
+    Use(String),
     Create { name: String, note: Option<String> },
+    SetDefault(String),
 }
 
 #[derive(Debug)]
@@ -393,6 +391,8 @@ fn parse_agent_sub(rest: &str) -> Meta {
             name: (*name).to_string(),
             note: Some(note.join(" ")),
         }),
+        ["set-default", name] => Meta::AgentSub(AgentSub::SetDefault((*name).to_string())),
+        ["set-default"] => Meta::Unknown("\\agent set-default needs <name>".into()),
         _ => Meta::Unknown(format!("\\agent {}", rest)),
     }
 }
@@ -562,6 +562,18 @@ fn handle_agent_sub(sub: AgentSub, session: &mut Session, agent_source: &AgentId
             match uuid::Uuid::parse_str(&entry.id) {
                 Ok(uuid) => {
                     session.sticky_agent = Some(brain_core::AgentId(uuid));
+                    // Persist the switch so the next bare `brain`
+                    // session picks the same agent. Best-effort: if
+                    // the file write fails we keep the in-memory
+                    // sticky_agent so the live session still uses the
+                    // new id; the user sees a note explaining the
+                    // session-vs-disk divergence.
+                    if let Err(e) = config.set_active(&name) {
+                        eprintln!(
+                            "note: could not persist active flag to config: {e}\n\
+                             the switch is effective for this session only."
+                        );
+                    }
                     println!(
                         "sticky agent set to '{name}' ({uuid}); reconnect via `\\connect <host:port>` \
                          to bind the new id on the wire."
@@ -570,6 +582,10 @@ fn handle_agent_sub(sub: AgentSub, session: &mut Session, agent_source: &AgentId
                 Err(e) => eprintln!("error: agent '{name}' has malformed uuid: {e}"),
             }
         }
+        AgentSub::SetDefault(name) => match config.set_default(&name) {
+            Ok(()) => println!("default agent → {name}"),
+            Err(e) => eprintln!("error: {e}"),
+        },
         AgentSub::Create { name, note } => {
             // Mirror the CLI's first-create-promotes invariant fix so
             // the in-shell create path also keeps the file valid.
@@ -675,22 +691,37 @@ fn apply_setting_to_session(key: &str, value: &str, session: &mut Session) {
 
 // ─── source-aware banner + \agent helpers ───────────────────────
 
-fn source_suffix(s: &AgentIdSource) -> &'static str {
+fn source_suffix(s: &AgentIdSource) -> String {
     match s {
-        AgentIdSource::NamedFlag { .. } => " (via --agent)",
-        AgentIdSource::IdFlag => " (via --agent-id)",
-        AgentIdSource::NamedEnv { .. } => " (via BRAIN_AGENT)",
-        AgentIdSource::IdEnv => " (via BRAIN_AGENT_ID)",
-        AgentIdSource::Ephemeral => " (ephemeral)",
+        AgentIdSource::NamedFlag { .. } => " (via --agent)".into(),
+        AgentIdSource::IdFlag => " (via --agent-id)".into(),
+        AgentIdSource::NamedEnv { .. } => " (via BRAIN_AGENT)".into(),
+        AgentIdSource::IdEnv => " (via BRAIN_AGENT_ID)".into(),
+        AgentIdSource::ActiveFromConfig { name, .. } => {
+            format!(" (config: active = {name})")
+        }
+        AgentIdSource::DefaultFromConfig { name, .. } => {
+            format!(" (config: default = {name})")
+        }
+        AgentIdSource::AutoMinted { name, .. } => {
+            format!(" (auto-minted as {name})")
+        }
+        AgentIdSource::Ephemeral => " (ephemeral)".into(),
     }
 }
 
 fn source_note(s: &AgentIdSource) -> Option<String> {
     match s {
+        AgentIdSource::AutoMinted { name, file } => Some(format!(
+            "note: first run — minted and persisted agent '{name}' at {}. \
+             Use `\\agent create <name>` to add another, and \
+             `\\agent use <name>` to switch.",
+            file.display()
+        )),
         AgentIdSource::Ephemeral => Some(
-            "note: ephemeral session — memories you encode are visible only \
-             until you quit. Use `brain agent create <name>` then \
-             `brain --agent <name>` for persistence."
+            "note: ephemeral session — no config file available so the \
+             minted agent is in-memory only. Memories you encode are \
+             visible only until you quit."
                 .to_string(),
         ),
         _ => None,
@@ -707,7 +738,16 @@ fn source_label(s: &AgentIdSource) -> String {
             format!("env BRAIN_AGENT={name} ({})", file.display())
         }
         AgentIdSource::IdEnv => "env BRAIN_AGENT_ID".into(),
-        AgentIdSource::Ephemeral => "ephemeral (no --agent / BRAIN_AGENT set)".into(),
+        AgentIdSource::ActiveFromConfig { name, file } => {
+            format!("config active = {name} ({})", file.display())
+        }
+        AgentIdSource::DefaultFromConfig { name, file } => {
+            format!("config default = {name} ({})", file.display())
+        }
+        AgentIdSource::AutoMinted { name, file } => {
+            format!("auto-minted {name} ({})", file.display())
+        }
+        AgentIdSource::Ephemeral => "ephemeral (no config file path available)".into(),
     }
 }
 
@@ -716,9 +756,11 @@ fn source_label(s: &AgentIdSource) -> String {
 /// fallback.
 fn source_name(s: &AgentIdSource) -> Option<String> {
     match s {
-        AgentIdSource::NamedFlag { name, .. } | AgentIdSource::NamedEnv { name, .. } => {
-            Some(name.clone())
-        }
+        AgentIdSource::NamedFlag { name, .. }
+        | AgentIdSource::NamedEnv { name, .. }
+        | AgentIdSource::ActiveFromConfig { name, .. }
+        | AgentIdSource::DefaultFromConfig { name, .. }
+        | AgentIdSource::AutoMinted { name, .. } => Some(name.clone()),
         _ => None,
     }
 }
@@ -742,6 +784,9 @@ fn print_agent_info(output: &OutputFormatArg, agent_id: AgentId, source: &AgentI
         AgentIdSource::IdFlag => "id-flag",
         AgentIdSource::NamedEnv { .. } => "named-env",
         AgentIdSource::IdEnv => "id-env",
+        AgentIdSource::ActiveFromConfig { .. } => "active",
+        AgentIdSource::DefaultFromConfig { .. } => "default",
+        AgentIdSource::AutoMinted { .. } => "auto-minted",
         AgentIdSource::Ephemeral => "ephemeral",
     };
     let name = source_name(source);
@@ -862,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn source_note_fires_only_for_ephemeral() {
+    fn source_note_fires_for_ephemeral_and_automint() {
         assert!(source_note(&AgentIdSource::IdFlag).is_none());
         assert!(source_note(&AgentIdSource::IdEnv).is_none());
         let p = PathBuf::from("/x/y");
@@ -874,6 +919,12 @@ mod tests {
         assert!(source_note(&AgentIdSource::Ephemeral)
             .unwrap()
             .contains("ephemeral"));
+        assert!(source_note(&AgentIdSource::AutoMinted {
+            name: "agent-deadbeef".into(),
+            file: p,
+        })
+        .unwrap()
+        .contains("first run"));
     }
 
     #[test]

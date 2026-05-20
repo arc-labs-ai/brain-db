@@ -20,7 +20,20 @@ pub enum AgentIdSource {
     NamedEnv { name: String, file: PathBuf },
     /// `BRAIN_AGENT_ID=<uuid>` (raw id, no name).
     IdEnv,
-    /// Default — fresh UUIDv7 minted at connect, discarded at quit.
+    /// The agent was selected from the config file's `active` flag.
+    /// Set by `\agent use <name>` or `brain agent use <name>`.
+    ActiveFromConfig { name: String, file: PathBuf },
+    /// The agent was selected from the config file's `default` flag
+    /// because no active agent was set. The "factory default" path.
+    DefaultFromConfig { name: String, file: PathBuf },
+    /// First-run path: no flag, no env, no agents in the file —
+    /// brain-shell minted a fresh agent + persisted it as both
+    /// default and active.
+    AutoMinted { name: String, file: PathBuf },
+    /// No config file available (no HOME / XDG dir, can't write).
+    /// Session lives entirely in memory; nothing is persisted. The
+    /// resolved id is still a fresh UUIDv7 so the wire identity
+    /// doesn't collide with other in-process bare-mints.
     Ephemeral,
 }
 

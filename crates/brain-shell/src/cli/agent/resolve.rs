@@ -7,7 +7,16 @@
 //! 2. `--agent-id <uuid>` flag → raw id; no file touched.
 //! 3. `BRAIN_AGENT=<name>` env → same lookup as (1).
 //! 4. `BRAIN_AGENT_ID=<uuid>` env → raw id.
-//! 5. Fresh ephemeral UUIDv7, minted at connect, discarded at quit.
+//! 5. `[agents.<x>] active = true` in the config file (sticky
+//!    selection set by `\agent use`).
+//! 6. `[agents.<x>] default = true` in the config file (factory
+//!    default — only reachable if the load-time auto-promote did
+//!    not also synthesise an `active` flag).
+//! 7. Auto-mint a fresh UUIDv7, persist it as both default and
+//!    active, return it. First-run path.
+//! 8. No config file path available (no HOME / XDG dir): mint a
+//!    fresh UUIDv7 in-memory; nothing is written. This is the only
+//!    surviving `Ephemeral` case.
 //!
 //! Conflict (both `--agent` and `--agent-id`, or both env vars set)
 //! is an error so the user doesn't get silent "name wins"
@@ -20,6 +29,7 @@ use brain_core::AgentId;
 use uuid::Uuid;
 
 use super::super::config::{Config, ConfigError, MigrationNote};
+use super::auto_mint;
 use super::source::{AgentIdSource, ResolvedAgentId};
 
 /// Env-var read in the named-agent slot (`BRAIN_AGENT=work`).
@@ -145,27 +155,63 @@ pub fn resolve_with(
         });
     }
 
-    // 5. Ephemeral. Load the config opportunistically only to surface
-    // a pending migration note — but do NOT auto-bind to the
-    // migrated `default` agent.
-    let migration = match config_path {
-        Some(path) => match Config::load_or_default_at(path) {
-            Ok((_, note)) => note,
-            Err(_) => None, // ephemeral path should never crash the shell
-        },
-        None => None,
+    // 5 / 6 / 7 / 8 — all require knowing where the config lives.
+    // Without a config path the only honest answer is the in-memory
+    // ephemeral path: we can't persist, so we don't pretend to.
+    let config_path = match config_path {
+        Some(p) => p,
+        None => {
+            return Ok(ResolvedAgentId {
+                agent_id: AgentId::new(),
+                source: AgentIdSource::Ephemeral,
+                migration: None,
+            });
+        }
     };
-    // Mint a fresh UUIDv7. `AgentId::default()` is the nil-uuid
-    // anonymous sentinel — the wrong thing here: ephemeral memories
-    // need a unique routing key so they don't collide across shell
-    // sessions or with the substrate's anonymous-sentinel reads.
-    // The shell's connect banner advertises this as "ephemeral —
-    // memories you encode are visible only until you quit," and the
-    // visible-only-until-quit guarantee depends on the agent id being
-    // distinct from every other session's.
+
+    let (mut config, migration) = load_config(Some(config_path))?;
+
+    // 5. config.active
+    if let Some((name, entry)) = config.active_agent() {
+        let agent_id = parse_id_or_fail(&entry.id)?;
+        let name = name.to_owned();
+        let file = config.path.clone();
+        return Ok(ResolvedAgentId {
+            agent_id,
+            source: AgentIdSource::ActiveFromConfig { name, file },
+            migration,
+        });
+    }
+
+    // 6. config.default (only reachable if `active` wasn't set;
+    // load-time auto-promote usually fills both, so this fires only
+    // when the user hand-edited the file to clear `active` on every
+    // entry).
+    if let Some((name, entry)) = config.default_agent() {
+        let agent_id = parse_id_or_fail(&entry.id)?;
+        let name = name.to_owned();
+        let file = config.path.clone();
+        return Ok(ResolvedAgentId {
+            agent_id,
+            source: AgentIdSource::DefaultFromConfig { name, file },
+            migration,
+        });
+    }
+
+    // 7. Auto-mint + persist. The config is freshly-loaded and has
+    // no agents at all (or the previous defaults got wiped); minting
+    // here is the first-run UX.
+    let (name, agent_id) = auto_mint::create_and_persist(&mut config)?;
+    let file = config.path.clone();
+    // Best-effort note on stderr so the user knows a file just got
+    // written under their HOME.
+    eprintln!(
+        "note: first run — minted and persisted agent '{name}' at {}",
+        file.display()
+    );
     Ok(ResolvedAgentId {
-        agent_id: AgentId::new(),
-        source: AgentIdSource::Ephemeral,
+        agent_id,
+        source: AgentIdSource::AutoMinted { name, file },
         migration,
     })
 }

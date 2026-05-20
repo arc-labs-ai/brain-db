@@ -5,7 +5,10 @@
 //! - [`source`] — the `AgentIdSource` / `ResolvedAgentId` value
 //!   shapes the resolver returns; consumed by the connect banner
 //!   and `\agent` meta-command.
+//! - [`auto_mint`] — first-run helper that mints + persists a fresh
+//!   default + active agent when nothing else fires.
 
+pub mod auto_mint;
 pub mod resolve;
 pub mod source;
 

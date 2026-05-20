@@ -467,6 +467,16 @@ fn run_agent(cmd: AgentCommand, agent_flag: Option<&str>, agent_id_flag: Option<
                 }
             }
         }
+        AgentCommand::SetDefault { name } => match config.set_default(&name) {
+            Ok(()) => {
+                println!("default agent → {name}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
         AgentCommand::Import { name, id, note } => {
             let promote = if config.agents().is_empty() {
                 crate::cli::config::AgentPromotion::DefaultAndActive
