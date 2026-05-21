@@ -328,12 +328,22 @@ pub async fn handle_txn_commit(
     };
 
     let ops_applied = buffer.ops_count();
-    let batch = build_batch(&buffer);
 
-    // Apply atomically via the writer's submit_batch. On failure,
-    // re-mark the txn aborted (the redb wtxn auto-rolled back).
-    match ctx.executor.writer.submit_batch(batch).await {
-        Ok(_acks) => {}
+    // Build a single multi-phase Write from the buffer. The WAL
+    // envelope (TxnBegin/Phase×N/TxnCommit) makes the whole commit
+    // atomic; recovery's existing TXN state machine replays the
+    // batch or discards it. The unified path replaces the legacy
+    // submit_batch which had its own (now-redundant) atomic-commit
+    // logic in brain-ops/src/ops/writer/mod.rs::do_submit_batch.
+    let phases = build_phases(&buffer);
+    let write = crate::write::Write::from_phases(
+        crate::write::WriteId::new(),
+        ctx.executor.caller_agent,
+        phases,
+    );
+    let real_writer = crate::ops::link::downcast_writer_pub(ctx)?;
+    match real_writer.submit(write).await {
+        Ok(_ack) => {}
         Err(err) => {
             let mut entries = store.entries.lock();
             if let Some(entry) = entries.get_mut(&req.txn_id) {
@@ -414,7 +424,102 @@ fn clamp_timeout(req: u32) -> u32 {
     v.clamp(MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS)
 }
 
+/// Convert a `TxnBuffer` into a `Vec<Phase>` for the unified write
+/// path. Ordering preserves the legacy submit_batch semantic:
+///
+///   per encode: UpsertMemory + N × Link (encode-inline edges) for
+///                Inserted outcomes only — TargetMissing edges drop
+///                at buffer-time so they don't reach this point.
+///   then       : standalone Link phases (TXN LINK ops)
+///   then       : standalone Unlink phases (TXN UNLINK ops)
+///   then       : Tombstone(Memory) phases (TXN FORGET ops)
+///
+/// The encode-first ordering matters: a TXN containing
+/// ENCODE-A + LINK(A → B) needs A's row to land before the
+/// LINK touches the edge table (the LINK doesn't read MEMORIES, but
+/// the EDGES table key uses A's MemoryId — only valid if A was
+/// minted).
+pub(crate) fn build_phases(buffer: &TxnBuffer) -> Vec<crate::write::Phase> {
+    use crate::write::phase::TombstoneMode as PhaseTombstoneMode;
+    use crate::write::{Phase, TombstoneTarget};
+    use brain_core::{EdgeKindRef, NodeRef, Salience};
+    use brain_metadata::tables::edge::{derived_by, origin, zero_disambiguator};
+
+    let mut phases: Vec<Phase> = Vec::with_capacity(
+        buffer.encodes.len() * 2 + buffer.links.len() + buffer.unlinks.len() + buffer.forgets.len(),
+    );
+
+    for e in &buffer.encodes {
+        phases.push(Phase::UpsertMemory {
+            id: e.memory_id,
+            text: e.text.clone(),
+            vector: Box::new(e.vector),
+            kind: e.kind,
+            salience: Salience::new(e.salience_initial),
+            context: e.context_id,
+            created_at_unix_nanos: e.created_at_unix_nanos,
+            arena_slot: e.memory_id.slot(),
+            embedding_model_fp: e.fingerprint,
+            content_hash: None,
+            deduplicate: false,
+        });
+        for edge in &e.edges {
+            phases.push(Phase::Link {
+                from: NodeRef::Memory(e.memory_id),
+                to: NodeRef::Memory(edge.target),
+                kind: EdgeKindRef::Builtin(edge.kind),
+                weight: edge.weight,
+                origin: origin::EXPLICIT,
+                derived_by: derived_by::CLIENT,
+                disambiguator: zero_disambiguator(),
+                created_at_unix_nanos: e.created_at_unix_nanos,
+            });
+        }
+    }
+
+    for l in &buffer.links {
+        phases.push(Phase::Link {
+            from: NodeRef::Memory(l.source),
+            to: NodeRef::Memory(l.target),
+            kind: EdgeKindRef::Builtin(l.kind),
+            weight: l.weight,
+            origin: origin::EXPLICIT,
+            derived_by: derived_by::CLIENT,
+            disambiguator: zero_disambiguator(),
+            created_at_unix_nanos: l.created_at_unix_nanos,
+        });
+    }
+
+    for u in &buffer.unlinks {
+        phases.push(Phase::Unlink {
+            from: NodeRef::Memory(u.source),
+            to: NodeRef::Memory(u.target),
+            kind: EdgeKindRef::Builtin(u.kind),
+            disambiguator: zero_disambiguator(),
+        });
+    }
+
+    for f in &buffer.forgets {
+        phases.push(Phase::Tombstone {
+            target: TombstoneTarget::Memory {
+                id: f.memory_id,
+                mode: match f.mode {
+                    brain_protocol::request::ForgetMode::Soft => PhaseTombstoneMode::Soft,
+                    brain_protocol::request::ForgetMode::Hard => PhaseTombstoneMode::Hard,
+                },
+            },
+            reason: 1, // ClientRequest
+            at_unix_nanos: f.created_at_unix_nanos,
+        });
+    }
+
+    phases
+}
+
 /// Convert a `TxnBuffer` into the `TxnBatch` the writer consumes.
+/// Legacy path — used only when handle_txn_commit hasn't migrated to
+/// build_phases + submit(Write). Kept until the migration is complete.
+#[allow(dead_code)]
 fn build_batch(buffer: &TxnBuffer) -> TxnBatch {
     let memories: Vec<TxnEncode> = buffer
         .encodes
