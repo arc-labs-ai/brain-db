@@ -452,9 +452,11 @@ fn write_heading(
     writeln!(w, "{BODY_INDENT}{badge_painted}{spaces}{right_painted}")
 }
 
-/// Render the labelled type / salience / context row. Three sub-columns
-/// with fixed 6-space inter-column gap; the per-row consistency makes
-/// multiple cards on the same screen line up visually.
+/// Render the labelled `metadata` row carrying type / salience /
+/// context as three sub-columns separated by a fixed 6-space gap.
+/// The row label is `metadata` so it reads naturally with the rest
+/// of the body (`id`, `content`, `metadata`); each inner field
+/// keeps its own sub-label so a glance picks out the three values.
 fn write_type_row(w: &mut dyn Write, ctx: &RenderCtx, r: &EncodeResponse) -> io::Result<()> {
     let theme = &ctx.theme;
     let policy = ctx.policy;
@@ -465,15 +467,16 @@ fn write_type_row(w: &mut dyn Write, ctx: &RenderCtx, r: &EncodeResponse) -> io:
     let ctx_text = r.context_id.to_string();
     let ctx_painted = theme.paint(Token::Value, &ctx_text, policy);
 
-    // Labels are muted so the values pop. Use a fixed 6-space inter-
-    // column gap; long context ids will simply push the right side
-    // further out and that's OK — better than rewrapping into a
-    // multi-line mess.
+    // Sub-labels are muted so values pop. Fixed 6-space inter-
+    // column gap keeps cards aligned side-by-side; long context ids
+    // push the right side further out instead of wrapping.
+    let type_label = theme.paint(Token::Label, "type", policy);
     let sal_label = theme.paint(Token::Label, "salience", policy);
     let ctx_label = theme.paint(Token::Label, "context", policy);
-    let value =
-        format!("{kind_painted}      {sal_label}  {sal_painted}      {ctx_label}  {ctx_painted}");
-    write_row(w, ctx, "type", &value)
+    let value = format!(
+        "{type_label}  {kind_painted}      {sal_label}  {sal_painted}      {ctx_label}  {ctx_painted}"
+    );
+    write_row(w, ctx, "metadata", &value)
 }
 
 /// Wire variant → canonical lower-case string used in the table view.
@@ -1097,11 +1100,15 @@ mod tests {
                 "default mode leaked wide row `{absent}`: {out}"
             );
         }
-        // Rules + heading + id + content + type + footer are still there.
+        // Rules + heading + id + content + metadata + footer are still there.
         assert!(out.contains("─"), "rules must remain in default mode");
         assert!(out.contains("✓ ENCODED"), "heading must remain");
         assert!(out.contains("  id  "), "id row must remain in default mode");
         assert!(out.contains("content"), "content row must remain");
-        assert!(out.contains("type"), "type row must remain");
+        assert!(out.contains("metadata"), "metadata row must remain");
+        assert!(
+            out.contains("type") && out.contains("salience") && out.contains("context"),
+            "metadata row must carry type/salience/context sub-labels: {out}"
+        );
     }
 }

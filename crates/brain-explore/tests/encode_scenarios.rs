@@ -85,14 +85,17 @@ fn fresh_encode_table_shows_check_id_lsn_and_content_echo() {
     );
 
     // Defensive: nil agent + zero fingerprint must NOT leak into
-    // default-mode output. They're wide-mode-only.
+    // default-mode output. They're wide-mode-only. (The id row
+    // legitimately shows `0x00…` zero bytes for sample memories
+    // packed with shard=0/slot=0/version=0; assert on the labeled
+    // rows instead of raw zeroes.)
     assert!(
-        !out.contains("agent "),
-        "nil agent leaked into default view: {out}"
+        !out.lines().any(|l| l.contains("  agent  ")),
+        "nil agent row leaked into default view: {out}"
     );
     assert!(
-        !out.contains("00000000"),
-        "zero-bytes leaked into default view: {out}"
+        !out.lines().any(|l| l.contains("  embedder  ")),
+        "nil embedder row leaked into default view: {out}"
     );
 }
 
