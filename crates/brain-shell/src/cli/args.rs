@@ -291,7 +291,16 @@ pub async fn dispatch_argv(argv: Vec<String>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            let ctx = render_ctx(
+                session.output.clone(),
+                cli.global.color,
+                cli.global.hyperlinks,
+            );
+            let rendered = commands::client_error_to_renderable(&e);
+            let mut stderr = std::io::stderr();
+            if brain_explore::dispatch(&rendered, &ctx, &mut stderr).is_err() {
+                eprintln!("error: {e}");
+            }
             ExitCode::from(1)
         }
     }

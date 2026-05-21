@@ -282,8 +282,32 @@ async fn run_one(
                     );
                 }
             }
-            eprintln!("error: {e}");
+            render_error(&e, globals, session);
         }
+    }
+}
+
+/// Render a `ClientError` as a card via brain-explore, matching the
+/// success-path formatting (table / json / ndjson honoring the
+/// active output flag). Errors land on stderr so JSON-piped success
+/// output isn't corrupted by an error frame.
+fn render_error(
+    err: &brain_sdk_rust::ClientError,
+    globals: &crate::parser::GlobalOpts,
+    session: &mut Session,
+) {
+    let output = globals
+        .output
+        .clone()
+        .unwrap_or_else(|| session.output.clone());
+    let ctx = render_ctx(output, globals.color, globals.hyperlinks);
+    let rendered = commands::client_error_to_renderable(err);
+    let mut stderr = std::io::stderr();
+    if let Err(io_err) = brain_explore::dispatch(&rendered, &ctx, &mut stderr) {
+        // Fall back to the raw Display if the renderer itself errors;
+        // never swallow the original diagnostic.
+        eprintln!("error: {err}");
+        eprintln!("(renderer failed: {io_err})");
     }
 }
 

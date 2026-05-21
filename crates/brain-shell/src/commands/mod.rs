@@ -67,3 +67,33 @@ pub fn is_txn_terminal(err: &ClientError) -> bool {
     };
     code == ErrorCodeWire::TxnNotFound as u16 || code == ErrorCodeWire::TransactionTimeout as u16
 }
+
+/// Translate a [`ClientError`] into the renderer's card type. The
+/// wire `code` (when present) drives the heading; client-side
+/// failures (Connect/Io/Pool/Closed/Internal) collapse to the
+/// `Client` category with code 0.
+#[must_use]
+pub fn client_error_to_renderable(err: &ClientError) -> brain_explore::RenderableError {
+    use brain_explore::RenderableError;
+    match err {
+        ClientError::Server { code, message } => RenderableError::from_server(*code, message),
+        ClientError::RetryExhausted {
+            last_error,
+            attempts,
+            total_duration,
+        } => {
+            // Surface the underlying error's code (so the heading
+            // reads "RateLimited" or whatever) plus the retry
+            // exhaustion in the message body.
+            let inner_code = last_error.code().unwrap_or(0);
+            let msg = format!(
+                "retry exhausted after {attempts} attempt(s) in {:?}: {last_error}",
+                total_duration,
+            );
+            RenderableError::from_server(inner_code, msg)
+        }
+        // Client-side variants — no wire code; preserve the Display
+        // message which already names the failure mode.
+        _ => RenderableError::client_side(err.to_string()),
+    }
+}
