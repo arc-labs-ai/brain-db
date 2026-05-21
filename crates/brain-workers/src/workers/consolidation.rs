@@ -36,10 +36,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use brain_core::{ContextId, EdgeKind, MemoryId, MemoryKind, RequestId};
+use brain_core::{
+    ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, RequestId, Salience,
+};
 use brain_embed::VECTOR_DIM;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
-use brain_planner::{EncodeOp, EncodeOpEdge};
+use brain_ops::ops::writer::RealWriterHandle;
+use brain_ops::write::{Phase, Write, WriteId};
 use redb::ReadableTable;
 use tracing::trace;
 use uuid::Uuid;
@@ -348,43 +351,66 @@ async fn do_consolidation_cycle(
                 .embedder
                 .embed(&summary)
                 .map_err(|e| WorkerError::Ops(format!("embed: {e:?}")))?;
-            // Encode.
+            // Reserve a fresh MemoryId, then build a multi-phase Write
+            // through the unified path. Deterministic request_id
+            // → WriteId so a restart-retry hits the writer's
+            // idempotency cache instead of minting a duplicate row.
             let request_id = deterministic_request_id(&cluster);
-            let edges: Vec<EncodeOpEdge> = cluster
-                .iter()
-                .map(|id| EncodeOpEdge {
-                    target: *id,
-                    kind: EdgeKind::DerivedFrom,
-                    weight: 1.0,
-                })
-                .collect();
-            let op = EncodeOp {
-                request_id,
-                context_id,
-                kind: MemoryKind::Consolidated,
-                text: summary,
-                vector,
-                salience_initial: worker.initial_salience,
-                fingerprint: ctx.ops.executor.embedder.fingerprint(),
-                edges,
-                deduplicate: false,
-                content_hash: [0u8; 32],
-                // Consolidation worker runs server-side, not under
-                // an authenticated client connection. Default
-                // AgentId; consolidated rows aren't tenant-scoped.
-                agent_id: brain_core::AgentId::default(),
-            };
-            let ack = ctx
+            let memory_id = ctx
                 .ops
                 .executor
                 .writer
-                .submit_encode(op)
+                .reserve_memory_id()
                 .await
-                .map_err(|e| WorkerError::Ops(format!("submit_encode: {e:?}")))?;
+                .map_err(|e| WorkerError::Ops(format!("reserve_memory_id: {e:?}")))?;
+            let created_at = now_nanos;
+            let mut phases: Vec<Phase> = Vec::with_capacity(1 + cluster.len());
+            phases.push(Phase::UpsertMemory {
+                id: memory_id,
+                text: summary,
+                vector: Box::new(vector),
+                kind: MemoryKind::Consolidated,
+                salience: Salience::new(worker.initial_salience),
+                context: context_id,
+                created_at_unix_nanos: created_at,
+                arena_slot: memory_id.slot(),
+                embedding_model_fp: ctx.ops.executor.embedder.fingerprint(),
+                content_hash: None,
+                deduplicate: false,
+            });
+            for source_id in &cluster {
+                phases.push(Phase::Link {
+                    from: NodeRef::Memory(memory_id),
+                    to: NodeRef::Memory(*source_id),
+                    kind: EdgeKindRef::Builtin(EdgeKind::DerivedFrom),
+                    weight: 1.0,
+                    origin: brain_metadata::tables::edge::origin::EXPLICIT,
+                    derived_by: brain_metadata::tables::edge::derived_by::CONSOLIDATION_WORKER,
+                    disambiguator: brain_metadata::tables::edge::zero_disambiguator(),
+                    created_at_unix_nanos: created_at,
+                });
+            }
+            let real_writer = ctx
+                .ops
+                .executor
+                .writer
+                .as_any()
+                .downcast_ref::<RealWriterHandle>()
+                .ok_or_else(|| {
+                    WorkerError::Ops("consolidation: unified path requires RealWriterHandle".into())
+                })?;
+            let write = Write::from_phases(
+                WriteId::from_request(request_id),
+                brain_core::AgentId::default(),
+                phases,
+            );
+            let _ack = real_writer
+                .submit(write)
+                .await
+                .map_err(|e| WorkerError::Ops(format!("submit: {e:?}")))?;
             // Stamp sources. Idempotent: set-once on consolidated_at.
             stamp_sources(ctx, &cluster, now_nanos)?;
             consolidations += 1;
-            let _ = ack;
         }
     }
 
