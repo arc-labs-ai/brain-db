@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "brain-cli"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "brain-core",
@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "brain-core"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "proptest",
  "serde",
@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "brain-embed"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "brain-core",
@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "brain-explore"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "brain-core",
@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "brain-extractors"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "brain-core",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "brain-http"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "brain-index"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "brain-core",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "brain-llm"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "http-body-util",
@@ -539,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "brain-metadata"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "brain-core",
@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "brain-ops"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "brain-planner"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "brain-core",
@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "brain-plugins"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "brain-core",
  "brain-extractors",
@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "brain-protocol"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "brain-core",
  "bytemuck",
@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "brain-rerank"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -662,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "brain-sdk-rust"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "brain-core",
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "brain-server"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -734,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "brain-shell"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "brain-core",
@@ -759,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "brain-storage"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "brain-core",
  "bytemuck",
@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "brain-workers"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "brain-core",

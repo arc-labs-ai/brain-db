@@ -24,7 +24,7 @@ Report:
 2. **Regressions** (>5% slower than baseline) — flag prominently.
 3. **Improvements** (>5% faster) — note these, since they often indicate a real change worth understanding.
 
-Compare results against the targets in `spec/16_benchmarks_acceptance/02_latency_targets.md` and `spec/16_benchmarks_acceptance/03_throughput_targets.md`. If a benchmark is below target, flag it.
+Compare results against the targets in `spec/20_benchmarks/02_latency_targets.md` and `spec/20_benchmarks/03_throughput_targets.md`. If a benchmark is below target, flag it.
 
 After running:
 - Save the results to `bench-results/$(date +%Y-%m-%d)-$ARGUMENTS.txt` if requested.

@@ -38,8 +38,8 @@ pub use tokenizer::{build_analyzer, BrainTokenizer, BRAIN_TOKENIZER_NAME};
 /// (§26/01 §2 + §6).
 pub const BRAIN_SCHEMA_VERSION: u32 = 1;
 
-const MEMORY_TEXT_DIR: &str = "memory_text.tantivy";
 const STATEMENTS_DIR: &str = "statements.tantivy";
+const MEMORY_TEXT_DIR: &str = "memory_text.tantivy";
 
 /// Scope tag carried alongside each [`IndexHandle`] so retrievers (§23/02 §4)
 /// can dispatch without an extra lookup.

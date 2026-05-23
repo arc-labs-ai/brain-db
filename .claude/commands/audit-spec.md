@@ -11,7 +11,7 @@ This is a careful, slow review — not a quick check. The spec is authoritative;
 Process:
 
 1. **Identify the scope.**
-   - If `$ARGUMENTS` is a crate name: audit that crate against its corresponding spec sections (e.g. `brain-storage` → `spec/05_storage_arena_wal/`).
+   - If `$ARGUMENTS` is a crate name: audit that crate against its corresponding spec sections (e.g. `brain-storage` → `spec/08_storage/`).
    - If `$ARGUMENTS` is a spec section number (e.g. `09` or `09_cognitive_operations`): audit the relevant code against that spec.
 
 2. **Read the spec section.** All files in the spec directory, including the README and open-questions.

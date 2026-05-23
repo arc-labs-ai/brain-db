@@ -35,7 +35,7 @@ Your job is to find the right spec content and return it with surgical precision
 
 4. **Summarize, don't dump.** Return a focused answer with key excerpts. If the user wants the full file, they can read it themselves.
 
-5. **Cite locations.** Always include the file path (e.g. `spec/05_storage_arena_wal/08_recovery.md`) so the user can verify and explore.
+5. **Cite locations.** Always include the file path (e.g. `spec/08_storage/08_recovery.md`) so the user can verify and explore.
 
 ## Output format
 
