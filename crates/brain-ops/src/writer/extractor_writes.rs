@@ -18,17 +18,13 @@
 //! desired side-effect. Calling the wire handler from the worker
 //! would re-enter the metadata lock and duplicate events.
 
-use brain_core::{
-    EvidenceEntry, EvidenceRef, Relation, Statement, StatementKind, StatementObject, SubjectRef,
-    INLINE_EVIDENCE_CAP,
-};
+use brain_core::{Relation, Statement, StatementKind, StatementObject, SubjectRef};
 use brain_core::{
     EntityId, ExtractorId, MemoryId, PredicateId, RelationId, RelationTypeId, StatementId,
 };
 use brain_metadata::relation::ops::{relation_create, RelationOpError};
-use brain_metadata::statement::{statement_create, StatementOpError};
+use brain_metadata::statement::{pack_evidence_ids, statement_create, StatementOpError};
 use redb::WriteTransaction;
-use smallvec::SmallVec;
 
 /// What the worker hands to [`statement_create_internal`]. Mirrors
 /// the wire `StatementCreateRequest` minus schema-gate / event fields.
@@ -39,9 +35,10 @@ pub struct StatementCreatePayload {
     pub predicate: PredicateId,
     pub object: StatementObject,
     pub confidence: f32,
-    /// Memories backing this statement. Always inline — overflow is
-    /// the wire path's concern (the worker emits at most one evidence
-    /// id per statement: the originating memory).
+    /// Memories backing this statement. The worker typically emits one
+    /// evidence id (the originating memory) but the slot accepts any
+    /// length — the helper spills to an overflow row when it exceeds
+    /// the inline cap.
     pub evidence_memory_ids: Vec<MemoryId>,
     pub extractor_id: ExtractorId,
     /// Schema version stamped on the row. The worker passes `0` when
@@ -79,12 +76,13 @@ pub fn statement_create_internal(
     payload: &StatementCreatePayload,
 ) -> Result<StatementId, StatementOpError> {
     let id = StatementId::new();
-    let evidence = build_inline_evidence(
-        &payload.evidence_memory_ids,
+    let evidence = pack_evidence_ids(
+        wtxn,
+        payload.evidence_memory_ids.clone(),
         payload.confidence,
         payload.extracted_at_unix_nanos,
         payload.extractor_id,
-    );
+    )?;
     let subject = SubjectRef::Entity(payload.subject);
     let mut s = Statement::new_root(
         id,
@@ -123,24 +121,6 @@ pub fn relation_create_internal(
         payload.is_symmetric,
     );
     relation_create(wtxn, &r, payload.extracted_at_unix_nanos)
-}
-
-fn build_inline_evidence(
-    memory_ids: &[MemoryId],
-    confidence: f32,
-    now_unix_nanos: u64,
-    extractor_id: ExtractorId,
-) -> EvidenceRef {
-    let mut out: SmallVec<[EvidenceEntry; INLINE_EVIDENCE_CAP]> = SmallVec::new();
-    for &m in memory_ids.iter().take(INLINE_EVIDENCE_CAP) {
-        out.push(EvidenceEntry::from_parts(
-            m,
-            confidence,
-            now_unix_nanos,
-            extractor_id,
-        ));
-    }
-    EvidenceRef::inline(out)
 }
 
 // ---------------------------------------------------------------------------

@@ -4,23 +4,25 @@
 //! When a memory is forgotten, statements / relations whose
 //! evidence list referenced it must be updated:
 //!
-//! 1. Drop `memory_id` from `evidence_inline` (and overflow, when
-//!    we get there post-v1).
+//! 1. Drop `memory_id` from the statement's evidence — inline buffer
+//!    on the row when small, the overflow row when the list spilled.
 //! 2. Recompute `confidence` from the remaining evidence per
 //!    §25/00 §"Confidence aggregation across evidence".
 //! 3. If evidence becomes empty AND confidence < threshold,
-//!    tombstone with reason `SourceMemoryForgotten`.
+//!    tombstone with reason `SourceMemoryForgotten` and reclaim
+//!    the orphaned overflow row.
 //!
-//! ## v1 scope cuts
+//! ## Scope notes
 //!
-//! - Overflow evidence lists (post-`INLINE_EVIDENCE_CAP = 8`) are
-//!   **not** searched in v1. Statements with overflow evidence
-//!   containing the forgotten memory keep the evidence entry; the
-//!   v1 confidence is still recomputed on the inline-only set.
-//!   Full overflow-aware cascade is a post-v1 enhancement.
-//! - Relations are scanned but only have a single-evidence link
-//!   per the v1 schema; if that evidence equals `memory_id`, the
-//!   relation is tombstoned.
+//! - Overflow evidence lists are walked alongside inline. A statement
+//!   whose forgotten memory lives only in the overflow row gets the
+//!   entry dropped + the row rewritten (or reclaimed if the rewrite
+//!   leaves it empty). When the entry rewrite would bring the list
+//!   back inside [`INLINE_EVIDENCE_CAP`] the row also collapses back
+//!   onto the inline buffer.
+//! - Relations are scanned through `RELATION_BY_EVIDENCE_TABLE`; if
+//!   the forgotten memory was the sole evidence, the relation is
+//!   tombstoned.
 //!
 //! ## Audit
 //!
@@ -31,8 +33,8 @@
 //! external observer can see the change via the change feed.
 
 use brain_core::{
-    aggregate_confidence, ConfidenceConfig, EvidenceEntry, ExtractorId, StatementKind,
-    TombstoneReason,
+    aggregate_confidence, ConfidenceConfig, EvidenceEntry, EvidenceOverflowId, StatementKind,
+    TombstoneReason, INLINE_EVIDENCE_CAP,
 };
 use brain_core::{EdgeKindRef, MemoryId, NodeRef, RelationId};
 use redb::{ReadableTable, WriteTransaction};
@@ -42,7 +44,10 @@ use crate::statement::tombstone::statement_tombstone;
 use crate::statement::StatementOpError;
 use crate::tables::edge::{self, EdgeKey, EDGES_REVERSE_TABLE, EDGES_TABLE};
 use crate::tables::relation::{RELATION_BY_EVIDENCE_TABLE, RELATION_METADATA_TABLE};
-use crate::tables::statement::{EvidenceEntryRow, StatementMetadata, STATEMENTS_TABLE};
+use crate::tables::statement::{
+    EvidenceEntryRow, EvidenceOverflow, StatementMetadata, EVIDENCE_OVERFLOW_TABLE,
+    STATEMENTS_TABLE,
+};
 
 /// Default confidence threshold below which a statement that
 /// loses its only piece of evidence is tombstoned. Configurable
@@ -95,10 +100,12 @@ pub fn cascade_forget_to_statements(
     let mut summary = CascadeSummary::default();
     let memory_bytes = memory_id.to_be_bytes();
 
-    // Collect affected statement_ids first; then mutate per-row.
-    // Snapshot-then-update avoids interleaving redb reads and
-    // writes against the same table.
-    let mut affected: Vec<(StatementMetadata, Vec<EvidenceEntryRowLike>)> = Vec::new();
+    // Snapshot phase. We collect every row that references the
+    // forgotten memory along with the surviving evidence list (with
+    // the forgotten entry removed) so the mutate phase has a single
+    // source of truth per statement. Reading inline + overflow in
+    // the same pass avoids re-scanning the statements table.
+    let mut affected: Vec<AffectedStatement> = Vec::new();
     {
         let table = wtxn.open_table(STATEMENTS_TABLE)?;
         for entry in table.iter()? {
@@ -108,33 +115,60 @@ pub fn cascade_forget_to_statements(
             if row.is_tombstoned() {
                 continue;
             }
-            let referenced = row
+            let inline_hit = row
                 .evidence_inline
                 .iter()
                 .any(|e| e.memory_id_bytes == memory_bytes);
-            if !referenced {
+
+            let overflow_id = row
+                .evidence_overflow_id_bytes
+                .map(EvidenceOverflowId::from);
+
+            // The overflow row needs probing too — the inline list is
+            // empty when the row owns evidence-overflow form, so a
+            // pure inline check would silently miss those statements.
+            let (overflow_hit, overflow_entries) = if let Some(oid) = overflow_id {
+                load_overflow_entries(wtxn, oid)?
+                    .map(|entries| {
+                        let hit = entries.iter().any(|e| e.memory_id_bytes == memory_bytes);
+                        (hit, Some(entries))
+                    })
+                    .unwrap_or((false, None))
+            } else {
+                (false, None)
+            };
+
+            if !inline_hit && !overflow_hit {
                 continue;
             }
-            let remaining: Vec<EvidenceEntryRowLike> = row
-                .evidence_inline
-                .iter()
+
+            // Build the surviving entries from whichever side holds
+            // the row's evidence. By construction these are mutually
+            // exclusive (see `metadata_from_statement`), so it's safe
+            // to source from inline OR overflow exclusively.
+            let source_entries: Vec<EvidenceEntryRow> = if let Some(over) = overflow_entries {
+                over
+            } else {
+                row.evidence_inline.clone()
+            };
+            let remaining: Vec<EvidenceEntryRow> = source_entries
+                .into_iter()
                 .filter(|e| e.memory_id_bytes != memory_bytes)
-                .map(|e| EvidenceEntryRowLike {
-                    memory_id_bytes: e.memory_id_bytes,
-                    confidence_milli: e.confidence_milli,
-                    timestamp_unix_nanos: e.timestamp_unix_nanos,
-                    extractor_id: e.extractor_id,
-                })
                 .collect();
-            affected.push((row, remaining));
+
+            affected.push(AffectedStatement {
+                row,
+                remaining,
+                prior_overflow_id: overflow_id,
+            });
             if affected.len() >= batch_cap {
                 break;
             }
         }
     }
 
-    // Apply mutations. Each affected statement either becomes
-    // evidence-shrunk + confidence-recomputed, or tombstoned.
+    // Mutate phase. Each affected statement either becomes evidence-
+    // shrunk + confidence-recomputed, or tombstoned.
     //
     // Re-derivation uses the noisy-OR formula across the surviving
     // evidence with per-kind decay — same math the resolver and the
@@ -143,74 +177,89 @@ pub fn cascade_forget_to_statements(
     // inputs. Falling back to a flat mean would silently diverge from
     // the rest of the system on every cascade.
     //
-    // The mutation-side table handle is hoisted out of the loop so
+    // The mutation-side table handles are hoisted out of the loop so
     // we don't pay the open-table cost N times per cascade. We drop
-    // it before any `statement_tombstone` call because that helper
+    // them before any `statement_tombstone` call because that helper
     // opens the same table itself and redb prefers one handle in
     // flight.
     let confidence_cfg = ConfidenceConfig::default_v1();
+    // Tombstone deferral + overflow reclamation deferral — both side-
+    // effects open `STATEMENTS_TABLE` / `EVIDENCE_OVERFLOW_TABLE`, so
+    // we collect them and apply after the mutation handles drop.
     let mut to_tombstone: Vec<brain_core::StatementId> = Vec::new();
+    let mut overflow_reclaim: Vec<EvidenceOverflowId> = Vec::new();
     {
         let mut table = wtxn.open_table(STATEMENTS_TABLE)?;
-        for (mut row, remaining) in affected {
+        let mut overflow_table = wtxn.open_table(EVIDENCE_OVERFLOW_TABLE)?;
+        for AffectedStatement {
+            mut row,
+            remaining,
+            prior_overflow_id,
+        } in affected
+        {
             let kind = StatementKind::from_u8(row.kind).unwrap_or(StatementKind::Fact);
+            // A previously-overflowed statement that drops back to ≤
+            // INLINE_EVIDENCE_CAP entries collapses onto the inline
+            // buffer; the now-orphaned overflow row gets reclaimed.
+            // Statements that stay overflowed get the row rewritten
+            // in place — same id, smaller payload. Statements that
+            // grow past the cap (not possible here, but the code is
+            // symmetric) would allocate a new overflow.
             if remaining.is_empty() {
-                // Empty inline evidence after dropping the forgotten
-                // memory. If the row also lacks an overflow pointer the
-                // statement is now evidence-orphaned; either tombstone
-                // with SourceMemoryForgotten (below the floor, by far
-                // the common case since confidence collapses to 0) or
-                // keep as a stale-evidence sentinel for audit.
-                let new_conf = if row.evidence_overflow_id_bytes.is_some() {
-                    // Overflow still holds evidence the v1 cascade
-                    // doesn't crack open; preserve the stored
-                    // confidence so the row remains queryable.
-                    row.confidence
-                } else {
-                    0.0
-                };
-                // Whether we tombstone or keep stale, the inline list
-                // must no longer reference the forgotten memory. Clear
-                // it here and persist so the row's on-disk shape is
-                // consistent before `statement_tombstone` flips its
-                // tombstone bits in a separate open of the table.
                 row.evidence_inline.clear();
-                row.confidence = new_conf;
+                row.evidence_overflow_id_bytes = None;
+                row.confidence = 0.0;
                 table.insert(&row.statement_id_bytes, &row)?;
-                if new_conf < confidence_threshold && row.evidence_overflow_id_bytes.is_none() {
-                    // Defer to a second loop so we can drop the table handle
-                    // before statement_tombstone re-opens it.
+                if let Some(oid) = prior_overflow_id {
+                    overflow_reclaim.push(oid);
+                }
+                if 0.0 < confidence_threshold {
                     to_tombstone.push(row.statement_id());
                 } else {
                     summary.kept_stale += 1;
                 }
-            } else {
-                let entries: Vec<EvidenceEntry> = remaining
-                    .iter()
-                    .map(|e| EvidenceEntry {
-                        memory_id: MemoryId::from_be_bytes(e.memory_id_bytes),
-                        confidence_milli: e.confidence_milli,
-                        timestamp_unix_nanos: e.timestamp_unix_nanos,
-                        extractor_id: ExtractorId::from(e.extractor_id),
-                    })
-                    .collect();
-                let new_conf =
-                    aggregate_confidence(&entries, now_unix_nanos, kind, &confidence_cfg);
-                row.evidence_inline = remaining
-                    .into_iter()
-                    .map(|e| EvidenceEntryRow {
-                        memory_id_bytes: e.memory_id_bytes,
-                        confidence_milli: e.confidence_milli,
-                        timestamp_unix_nanos: e.timestamp_unix_nanos,
-                        extractor_id: e.extractor_id,
-                    })
-                    .collect();
-                row.confidence = new_conf;
-                table.insert(&row.statement_id_bytes, &row)?;
-                summary.evidence_dropped += 1;
+                continue;
             }
+
+            let entries: Vec<EvidenceEntry> =
+                remaining.iter().map(EvidenceEntryRow::to_entry).collect();
+            let new_conf = aggregate_confidence(&entries, now_unix_nanos, kind, &confidence_cfg);
+            row.confidence = new_conf;
+
+            if remaining.len() <= INLINE_EVIDENCE_CAP {
+                row.evidence_inline = remaining;
+                row.evidence_overflow_id_bytes = None;
+                if let Some(oid) = prior_overflow_id {
+                    overflow_reclaim.push(oid);
+                }
+            } else {
+                // Rewrite the overflow row in place when one already
+                // exists, or allocate a fresh id when the row used to
+                // be inline (can't happen during a single-entry FORGET
+                // since the list only shrinks, but the branch keeps
+                // the helper symmetric for future callers).
+                let oid = prior_overflow_id.unwrap_or_else(EvidenceOverflowId::new);
+                let entries_clone: Vec<EvidenceEntry> = entries.clone();
+                let overflow_row = EvidenceOverflow::from_entries(oid, &entries_clone, now_unix_nanos);
+                overflow_table.insert(&oid.to_bytes(), &overflow_row)?;
+                row.evidence_inline.clear();
+                row.evidence_overflow_id_bytes = Some(oid.to_bytes());
+            }
+
+            table.insert(&row.statement_id_bytes, &row)?;
+            summary.evidence_dropped += 1;
         }
-    } // table handle dropped here, before statement_tombstone re-opens.
+    } // table handles dropped before tombstone / overflow-reclaim re-open.
+
+    // Reclaim orphaned overflow rows. Safe to do regardless of
+    // tombstone outcome — once the statement no longer references the
+    // id, the row is dead weight.
+    {
+        let mut overflow_table = wtxn.open_table(EVIDENCE_OVERFLOW_TABLE)?;
+        for oid in overflow_reclaim {
+            overflow_table.remove(&oid.to_bytes())?;
+        }
+    }
 
     for id in to_tombstone {
         statement_tombstone(
@@ -223,6 +272,47 @@ pub fn cascade_forget_to_statements(
     }
 
     Ok(summary)
+}
+
+/// Helper used by the snapshot phase. Pulls the overflow row's
+/// entries into a `Vec<EvidenceEntryRow>` so callers can apply the
+/// same `retain`-style filter they use for inline entries.
+fn load_overflow_entries(
+    wtxn: &WriteTransaction,
+    overflow_id: EvidenceOverflowId,
+) -> Result<Option<Vec<EvidenceEntryRow>>, StatementOpError> {
+    let t = wtxn.open_table(EVIDENCE_OVERFLOW_TABLE)?;
+    let row: Option<EvidenceOverflow> = t.get(&overflow_id.to_bytes())?.map(|g| g.value());
+    let Some(over) = row else {
+        return Ok(None);
+    };
+    let n = over
+        .memory_ids
+        .len()
+        .min(over.extractor_ids.len())
+        .min(over.confidences_milli.len())
+        .min(over.timestamps_unix_nanos.len());
+    let entries = (0..n)
+        .map(|i| EvidenceEntryRow {
+            memory_id_bytes: over.memory_ids[i],
+            confidence_milli: over.confidences_milli[i],
+            timestamp_unix_nanos: over.timestamps_unix_nanos[i],
+            extractor_id: over.extractor_ids[i],
+        })
+        .collect();
+    Ok(Some(entries))
+}
+
+/// One snapshot-phase entry: the existing row, the surviving evidence
+/// list (forgotten memory already filtered out), and the prior
+/// overflow id (if any) so the mutate phase can rewrite or reclaim
+/// it. The overflow id stays separate from the row because the row's
+/// `evidence_overflow_id_bytes` may be cleared mid-flow when the
+/// remaining list collapses back inline.
+struct AffectedStatement {
+    row: StatementMetadata,
+    remaining: Vec<EvidenceEntryRow>,
+    prior_overflow_id: Option<EvidenceOverflowId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -421,16 +511,6 @@ pub enum EdgeCascadeError {
 
     #[error("relation op error: {0}")]
     Relation(#[from] RelationOpError),
-}
-
-// Local mirror so cascade_ops doesn't depend on the row layout
-// from brain-metadata's table module directly. The two are kept
-// in sync; cascade-side processing is the only consumer.
-struct EvidenceEntryRowLike {
-    memory_id_bytes: [u8; 16],
-    confidence_milli: u16,
-    timestamp_unix_nanos: u64,
-    extractor_id: u32,
 }
 
 #[cfg(all(test, not(miri)))]
@@ -682,5 +762,225 @@ mod edge_cascade_tests {
         // Typed-relation edge rows survive — tombstoning is a sidecar
         // operation, not an edge deletion.
         assert_eq!(edges_before, edges_after);
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod statement_cascade_overflow_tests {
+    use super::*;
+    use crate::entity::ops::{entity_put, normalize_name};
+    use crate::schema::predicate::predicate_intern;
+    use crate::statement::evidence::{pack_evidence_ids, read_evidence_ids};
+    use crate::statement::statement_create;
+    use crate::tables::statement::{StatementMetadata, EVIDENCE_OVERFLOW_TABLE, STATEMENTS_TABLE};
+    use crate::MetadataDb;
+    use brain_core::{
+        ContextId, Entity, EntityType, EvidenceRef, ExtractorId, PredicateId, Statement,
+        StatementId, StatementKind, StatementObject, StatementValue, SubjectRef,
+    };
+
+    const NOW: u64 = 1_700_000_000_000_000_000;
+
+    fn open_db() -> (tempfile::TempDir, MetadataDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(dir.path().join("md.redb")).unwrap();
+        (dir, db)
+    }
+
+    fn make_subject(db: &mut MetadataDb, name: &str) -> brain_core::EntityId {
+        let id = brain_core::EntityId::new();
+        let e = Entity::new_active(
+            id,
+            EntityType::PERSON_ID,
+            name.into(),
+            normalize_name(name),
+            NOW,
+        );
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, &e).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn intern_pred(db: &mut MetadataDb, name: &str) -> PredicateId {
+        let wtxn = db.write_txn().unwrap();
+        let id = predicate_intern(
+            &wtxn,
+            "test",
+            name,
+            Some(StatementKind::Fact),
+            2,
+            1,
+            "",
+            false,
+            NOW,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn pack_ids_for_test(db: &mut MetadataDb, ids: Vec<MemoryId>) -> EvidenceRef {
+        let wtxn = db.write_txn().unwrap();
+        let r = pack_evidence_ids(&wtxn, ids, 0.9, NOW, ExtractorId::from(0)).unwrap();
+        wtxn.commit().unwrap();
+        r
+    }
+
+    fn make_statement(
+        db: &mut MetadataDb,
+        subject: brain_core::EntityId,
+        predicate: PredicateId,
+        evidence: EvidenceRef,
+    ) -> StatementId {
+        let id = StatementId::new();
+        let s = Statement::new_root(
+            id,
+            StatementKind::Fact,
+            SubjectRef::Entity(subject),
+            predicate,
+            StatementObject::Value(StatementValue::Text("placeholder".into())),
+            0.9,
+            evidence,
+            ExtractorId::from(0),
+            NOW,
+            1,
+        );
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, &s, NOW).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn ids(n: usize) -> Vec<MemoryId> {
+        (0..n)
+            .map(|i| MemoryId::pack(i as u16 + 1, ContextId::DEFAULT.into(), 0))
+            .collect()
+    }
+
+    fn statement_row(db: &MetadataDb, id: StatementId) -> StatementMetadata {
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(STATEMENTS_TABLE).unwrap();
+        t.get(&id.to_bytes()).unwrap().unwrap().value()
+    }
+
+    #[test]
+    fn cascade_drops_forgotten_memory_from_overflow_and_collapses_back_inline() {
+        let (_dir, mut db) = open_db();
+        let subj = make_subject(&mut db, "ada");
+        let pred = intern_pred(&mut db, "knows_collapse");
+
+        // 9 evidence ids — guaranteed overflow.
+        let memory_ids = ids(9);
+        let ev = pack_ids_for_test(&mut db, memory_ids.clone());
+        assert!(matches!(ev, EvidenceRef::Overflow(_)));
+        let stmt = make_statement(&mut db, subj, pred, ev);
+
+        // Forget the first memory — leaves 8 surviving, fits inline.
+        let wtxn = db.write_txn().unwrap();
+        let summary =
+            cascade_forget_to_statements(&wtxn, memory_ids[0], 0.2, 100, NOW + 1).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.evidence_dropped, 1);
+        assert_eq!(summary.tombstoned, 0);
+
+        let row = statement_row(&db, stmt);
+        assert_eq!(row.evidence_inline.len(), 8);
+        assert!(row.evidence_overflow_id_bytes.is_none());
+    }
+
+    #[test]
+    fn cascade_drops_forgotten_memory_keeping_overflow_form() {
+        let (_dir, mut db) = open_db();
+        let subj = make_subject(&mut db, "ada-keep");
+        let pred = intern_pred(&mut db, "knows_keep");
+
+        // 12 ids — stays overflow after forgetting one (11 > 8).
+        let memory_ids = ids(12);
+        let ev = pack_ids_for_test(&mut db, memory_ids.clone());
+        let stmt = make_statement(&mut db, subj, pred, ev);
+
+        let wtxn = db.write_txn().unwrap();
+        cascade_forget_to_statements(&wtxn, memory_ids[3], 0.2, 100, NOW + 1).unwrap();
+        wtxn.commit().unwrap();
+
+        let row = statement_row(&db, stmt);
+        assert!(row.evidence_overflow_id_bytes.is_some());
+        assert!(row.evidence_inline.is_empty());
+
+        // The overflow row now holds 11 ids.
+        let oid = EvidenceOverflowId::from(row.evidence_overflow_id_bytes.unwrap());
+        let reference = EvidenceRef::Overflow(oid);
+        let rtxn = db.read_txn().unwrap();
+        let back = read_evidence_ids(&rtxn, &reference).unwrap();
+        assert_eq!(back.len(), 11);
+        assert!(!back.contains(&memory_ids[3]));
+    }
+
+    #[test]
+    fn cascade_tombstones_statement_and_reclaims_overflow_when_evidence_empty() {
+        let (_dir, mut db) = open_db();
+        let subj = make_subject(&mut db, "ada-tomb");
+        let pred = intern_pred(&mut db, "knows_tomb");
+
+        // 9 ids — overflow. After forgetting all but one, then forgetting
+        // the last, the row should tombstone + reclaim.
+        let memory_ids = ids(9);
+        let ev = pack_ids_for_test(&mut db, memory_ids.clone());
+        let stmt = make_statement(&mut db, subj, pred, ev);
+
+        // Forget all 9 in sequence; the last call should tombstone.
+        for mid in &memory_ids {
+            let wtxn = db.write_txn().unwrap();
+            cascade_forget_to_statements(&wtxn, *mid, 0.2, 100, NOW + 1).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let row = statement_row(&db, stmt);
+        assert!(row.is_tombstoned());
+        assert!(row.evidence_inline.is_empty());
+        assert!(row.evidence_overflow_id_bytes.is_none());
+
+        // The overflow row is reclaimed.
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(EVIDENCE_OVERFLOW_TABLE).unwrap();
+        assert_eq!(t.iter().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cascade_recomputes_confidence_over_overflow_evidence() {
+        let (_dir, mut db) = open_db();
+        let subj = make_subject(&mut db, "ada-conf");
+        let pred = intern_pred(&mut db, "knows_conf");
+
+        // 50 ids — overflow. Recompute is observable: the per-entry
+        // confidence_milli (0 from pack_evidence_ids — actually 900 since
+        // we pass 0.9 → milli) yields a noisy-OR aggregate the cascade
+        // can re-derive after dropping one.
+        let memory_ids = ids(50);
+        let ev = pack_ids_for_test(&mut db, memory_ids.clone());
+        let stmt = make_statement(&mut db, subj, pred, ev);
+        let before = statement_row(&db, stmt).confidence;
+
+        let wtxn = db.write_txn().unwrap();
+        let summary =
+            cascade_forget_to_statements(&wtxn, memory_ids[7], 0.05, 100, NOW + 1).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.evidence_dropped, 1);
+
+        let after_row = statement_row(&db, stmt);
+        let after = after_row.confidence;
+        // 49 surviving entries still aggregate well above the floor.
+        assert!(after > 0.0);
+        // Confidence either stays equal or shrinks — never grows when an
+        // entry is removed.
+        assert!(after <= before + 1e-6);
+        assert!(after_row.evidence_overflow_id_bytes.is_some());
+
+        // Cross-check the overflow row holds 49 ids.
+        let oid = EvidenceOverflowId::from(after_row.evidence_overflow_id_bytes.unwrap());
+        let rtxn = db.read_txn().unwrap();
+        let back = read_evidence_ids(&rtxn, &EvidenceRef::Overflow(oid)).unwrap();
+        assert_eq!(back.len(), 49);
     }
 }

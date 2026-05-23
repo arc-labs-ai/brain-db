@@ -5,9 +5,10 @@
 //! helper that runs inside the wtxn.
 
 use brain_core::{EvidenceRef, Statement, TombstoneReason};
-use brain_metadata::statement::{statement_create, statement_supersede, statement_tombstone};
+use brain_metadata::statement::{
+    pack_evidence_entries, statement_create, statement_supersede, statement_tombstone,
+};
 use redb::WriteTransaction;
-use smallvec::SmallVec;
 
 use super::ApplyError;
 use crate::write::{
