@@ -9,7 +9,7 @@
 //! version and intersects the [`HelloCapabilities`] flags. Auth-method
 //! intersection is *not* part of negotiation — that check happens when
 //! the server validates the AUTH frame against the methods it advertised
-//! in WELCOME and is owned by Phase 9.
+//! in WELCOME, owned by the connection-layer AUTH handler.
 
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -165,7 +165,7 @@ pub struct WelcomePayload {
 pub struct AuthPayload {
     /// Auth method. MUST be one of the methods declared in
     /// `WelcomePayload.server_features.auth_methods` (validated at the
-    /// AUTH-frame handler in Phase 9, not by [`negotiate`]).
+    /// AUTH-frame handler in the connection layer, not by [`negotiate`]).
     pub method: AuthMethod,
     /// The agent the client is identifying as.
     pub agent_id: WireUuid,
@@ -250,10 +250,10 @@ pub struct NegotiatedSession {
 /// Pick the highest mutually-supported wire-protocol version and
 /// intersect the capability flags.
 ///
-/// Returns [`ProtocolError::BadVersion`] if no version overlaps. Per
-/// the over-the-wire failure path emits an `ERROR` frame
-/// with code `VersionNotSupported`; mapping `BadVersion` → that code is
-/// the connection layer's responsibility (Phase 9).
+/// Returns [`ProtocolError::BadVersion`] if no version overlaps. The
+/// over-the-wire failure path emits an `ERROR` frame with code
+/// `VersionNotSupported`; mapping `BadVersion` → that code is the
+/// connection layer's responsibility.
 ///
 /// Auth-method intersection is **not** performed here — that's checked
 /// when the AUTH frame arrives, not at handshake-negotiation time.

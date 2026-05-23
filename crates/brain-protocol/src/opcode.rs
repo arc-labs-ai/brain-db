@@ -2,35 +2,38 @@
 //!
 //! ## Namespaces (high byte)
 //!
-//! - `0x00xx` — substrate ops (cognitive primitives + connection mgmt + admin).
+//! - `0x00xx` — cognitive primitives + connection mgmt + admin
+//!   (available in both schemaless and schema-declared modes).
 //! - `0x01xx` — typed-graph ops (schema / entities / statements / relations /
-//!   queries / extractors), active when a schema is declared.
+//!   queries / extractors), active once a schema is declared.
 //! - `0x02xx`–`0xFFxx` — reserved for future namespaces.
 //!
 //! ## Direction (low byte's high bit)
 //!
 //! Within a namespace, low byte `< 0x80` is server-bound (C→S, request);
-//! low byte `>= 0x80` is client-bound (S→C, response). Substrate's
+//! low byte `>= 0x80` is client-bound (S→C, response). The
 //! `0x2N → 0xAN` (encode→encode_resp) convention is preserved as
 //! `0x002N → 0x00AN`; typed-graph follows the same convention: e.g.
 //! `0x0130 ENTITY_CREATE` (req) ↔ `0x01B0 ENTITY_CREATE_RESP`.
 //!
 //! ## Reserved ranges
 //!
-//! Substrate reserved (low byte): `0x70–0x7F` (server-bound, open for future
-//! substrate ops) and `0xF0–0xFE` (client-bound, reserved future).
+//! Reserved (low byte) inside the `0x00xx` namespace: `0x70–0x7F`
+//! (server-bound, open for future ops) and `0xF0–0xFE` (client-bound,
+//! reserved future).
 
 use crate::error::ProtocolError;
 
-/// Wire-protocol opcode. for the full table.
+/// Wire-protocol opcode. See `spec/04_wire_protocol/03_opcodes.md` for
+/// the full table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(u16)]
 pub enum Opcode {
     // ============================================================
-    // Substrate namespace (high byte = 0x00).
+    // Cognitive + connection + admin namespace (high byte = 0x00).
     // ============================================================
 
-    // §03/05 §1.1 Connection management
+    // Connection management
     Hello = 0x0001,
     Welcome = 0x0081,
     Auth = 0x0002,
@@ -41,7 +44,7 @@ pub enum Opcode {
     ClientPong = 0x0011,
     Bye = 0x001F,
 
-    // §04/03 §1.2 Cognitive operations
+    // Cognitive operations
     EncodeReq = 0x0020,
     EncodeResp = 0x00A0,
     RecallReq = 0x0021,
@@ -59,13 +62,13 @@ pub enum Opcode {
     EncodeVectorDirectReq = 0x002A,
     EncodeVectorDirectResp = 0x00AA,
 
-    // §04/03 §1.3 Subscription
+    // Subscription
     SubscribeReq = 0x0030,
     SubscribeEvent = 0x00B0,
     UnsubscribeReq = 0x0031,
     UnsubscribeResp = 0x00B1,
 
-    // §04/03 §1.4 Transactions
+    // Transactions
     TxnBegin = 0x0040,
     TxnBeginResp = 0x00C0,
     TxnCommit = 0x0041,
@@ -73,11 +76,11 @@ pub enum Opcode {
     TxnAbort = 0x0042,
     TxnAbortResp = 0x00C2,
 
-    // §04/03 §1.5 Stream control
+    // Stream control
     CancelStream = 0x0050,
     CancelStreamAck = 0x00D0,
 
-    // §04/03 §1.6 Admin operations
+    // Admin operations
     AdminStatsReq = 0x0060,
     AdminStatsResp = 0x00E0,
     AdminSnapshotReq = 0x0061,
@@ -99,7 +102,7 @@ pub enum Opcode {
     AdminListTombstonedReq = 0x0069,
     AdminListTombstonedResp = 0x00E9,
     // Embedding-layer admin ops (handler implementations pending — wire
-    // surface allocated in spec §04/03 §1.6 + §07).
+    // surface allocated alongside the canonical admin range).
     AdminTokenizeReq = 0x006A,
     AdminTokenizeResp = 0x00EA,
     AdminRegisterModelReq = 0x006B,
@@ -109,7 +112,7 @@ pub enum Opcode {
     AdminRetireFingerprintReq = 0x006D,
     AdminRetireFingerprintResp = 0x00ED,
 
-    // §04/03 §1.7 Errors
+    // Errors
     Error = 0x00FF,
 
     // ============================================================
@@ -117,7 +120,7 @@ pub enum Opcode {
     // schema is declared via SCHEMA_UPLOAD.
     // ============================================================
 
-    // §04/03 §2.1 Schema operations (0x0120-0x0123 low-byte range).
+    // Schema operations (0x0120-0x0123 low-byte range).
     SchemaUploadReq = 0x0120,
     SchemaUploadResp = 0x01A0,
     SchemaGetReq = 0x0121,
@@ -127,7 +130,7 @@ pub enum Opcode {
     SchemaValidateReq = 0x0123,
     SchemaValidateResp = 0x01A3,
 
-    // §04/03 §2.1 Extractor governance (0x0124-0x0126 low-byte range).
+    // Extractor governance (0x0124-0x0126 low-byte range).
     ExtractorListReq = 0x0124,
     ExtractorListResp = 0x01A4,
     ExtractorDisableReq = 0x0125,
@@ -135,7 +138,7 @@ pub enum Opcode {
     ExtractorEnableReq = 0x0126,
     ExtractorEnableResp = 0x01A6,
 
-    // §04/03 §2.2 Entity operations (0x0130-0x013F low-byte range).
+    // Entity operations (0x0130-0x013F low-byte range).
     EntityCreateReq = 0x0130,
     EntityCreateResp = 0x01B0,
     EntityGetReq = 0x0131,
@@ -155,7 +158,7 @@ pub enum Opcode {
     EntityTombstoneReq = 0x0138,
     EntityTombstoneResp = 0x01B8,
 
-    // §04/03 §2.3 Statement operations (0x0140-0x014F low-byte range).
+    // Statement operations (0x0140-0x014F low-byte range).
     StatementCreateReq = 0x0140,
     StatementCreateResp = 0x01C0,
     StatementGetReq = 0x0141,
@@ -171,7 +174,7 @@ pub enum Opcode {
     StatementListReq = 0x0146,
     StatementListResp = 0x01C6,
 
-    // §04/03 §2.4 Relation operations (0x0150-0x015F low-byte range).
+    // Relation operations (0x0150-0x015F low-byte range).
     RelationCreateReq = 0x0150,
     RelationCreateResp = 0x01D0,
     RelationGetReq = 0x0151,
@@ -187,7 +190,7 @@ pub enum Opcode {
     RelationTraverseReq = 0x0156,
     RelationTraverseResp = 0x01D6,
 
-    // §04/03 §2.5 Hybrid query operations (0x0160-0x0163).
+    // Hybrid query operations (0x0160-0x0163).
     QueryReq = 0x0160,
     QueryResp = 0x01E0,
     QueryExplainReq = 0x0161,
@@ -197,9 +200,9 @@ pub enum Opcode {
     RecallHybridReq = 0x0163,
     RecallHybridResp = 0x01E3,
 
-    // Procedural-memory materialization (W3.1, wire v2). Renders an
-    // agent's stored `brain:behavior_*` Preferences into a system
-    // block for LLM prompt injection.
+    // Procedural-memory materialization. Renders an agent's stored
+    // `brain:behavior_*` Preferences into a system block for LLM prompt
+    // injection.
     MaterializeProceduralReq = 0x0164,
     MaterializeProceduralResp = 0x01E4,
 }
@@ -209,7 +212,7 @@ impl Opcode {
     /// for values not assigned in the spec table.
     pub fn from_u16(v: u16) -> Result<Self, ProtocolError> {
         Ok(match v {
-            // Substrate namespace
+            // Cognitive + connection + admin namespace.
             0x0001 => Self::Hello,
             0x0081 => Self::Welcome,
             0x0002 => Self::Auth,
@@ -303,7 +306,7 @@ impl Opcode {
             0x0138 => Self::EntityTombstoneReq,
             0x01B8 => Self::EntityTombstoneResp,
 
-            // §28 statement operations (phase 17.6).
+            // Statement operations.
             0x0140 => Self::StatementCreateReq,
             0x01C0 => Self::StatementCreateResp,
             0x0141 => Self::StatementGetReq,
@@ -319,7 +322,7 @@ impl Opcode {
             0x0146 => Self::StatementListReq,
             0x01C6 => Self::StatementListResp,
 
-            // §28 relation operations (phase 18.6).
+            // Relation operations.
             0x0150 => Self::RelationCreateReq,
             0x01D0 => Self::RelationCreateResp,
             0x0151 => Self::RelationGetReq,
@@ -374,7 +377,8 @@ impl Opcode {
         self as u16
     }
 
-    /// Namespace byte (high byte): 0x00 substrate, 0x01 knowledge.
+    /// Namespace byte (high byte): 0x00 cognitive + connection + admin,
+    /// 0x01 typed-graph.
     #[inline]
     #[must_use]
     pub fn namespace(self) -> u8 {
@@ -389,8 +393,7 @@ impl Opcode {
     }
 
     /// True if this opcode is server-bound (C→S, request) — low byte's
-    /// high bit is clear. Mirrors dispatch rule, applied
-    /// per-namespace.
+    /// high bit is clear. Applied per-namespace.
     #[inline]
     #[must_use]
     pub fn is_request(self) -> bool {
@@ -404,9 +407,9 @@ impl Opcode {
         !self.is_request()
     }
 
-    /// True if this opcode is in the substrate's admin range
-    /// low byte `0x60..=0x6D` (req) or `0xE0..=0xED`
-    /// (resp), namespace 0x00.
+    /// True if this opcode is in the admin range:
+    /// low byte `0x60..=0x6D` (req) or `0xE0..=0xED` (resp),
+    /// namespace `0x00`.
     #[inline]
     #[must_use]
     pub fn is_admin(self) -> bool {
@@ -455,7 +458,7 @@ mod tests {
     /// update site. The `from_u16_covers_all` test prevents enum/decoder
     /// drift; this `ALL` table prevents drift from the spec.
     const ALL: &[(u16, Opcode)] = &[
-        // Substrate — connection management
+        // Connection management
         (0x0001, Opcode::Hello),
         (0x0081, Opcode::Welcome),
         (0x0002, Opcode::Auth),
@@ -465,7 +468,7 @@ mod tests {
         (0x0091, Opcode::ServerPing),
         (0x0011, Opcode::ClientPong),
         (0x001F, Opcode::Bye),
-        // Substrate — cognitive operations
+        // Cognitive operations
         (0x0020, Opcode::EncodeReq),
         (0x00A0, Opcode::EncodeResp),
         (0x0021, Opcode::RecallReq),
@@ -482,22 +485,22 @@ mod tests {
         (0x00A6, Opcode::UnlinkResp),
         (0x002A, Opcode::EncodeVectorDirectReq),
         (0x00AA, Opcode::EncodeVectorDirectResp),
-        // Substrate — subscription
+        // Subscription
         (0x0030, Opcode::SubscribeReq),
         (0x00B0, Opcode::SubscribeEvent),
         (0x0031, Opcode::UnsubscribeReq),
         (0x00B1, Opcode::UnsubscribeResp),
-        // Substrate — transactions
+        // Transactions
         (0x0040, Opcode::TxnBegin),
         (0x00C0, Opcode::TxnBeginResp),
         (0x0041, Opcode::TxnCommit),
         (0x00C1, Opcode::TxnCommitResp),
         (0x0042, Opcode::TxnAbort),
         (0x00C2, Opcode::TxnAbortResp),
-        // Substrate — stream control
+        // Stream control
         (0x0050, Opcode::CancelStream),
         (0x00D0, Opcode::CancelStreamAck),
-        // Substrate — admin
+        // Admin
         (0x0060, Opcode::AdminStatsReq),
         (0x00E0, Opcode::AdminStatsResp),
         (0x0061, Opcode::AdminSnapshotReq),
@@ -526,7 +529,7 @@ mod tests {
         (0x00EC, Opcode::AdminAbortMigrationResp),
         (0x006D, Opcode::AdminRetireFingerprintReq),
         (0x00ED, Opcode::AdminRetireFingerprintResp),
-        // Substrate — errors
+        // Errors
         (0x00FF, Opcode::Error),
         // Typed-graph — schema
         (0x0120, Opcode::SchemaUploadReq),
@@ -626,12 +629,12 @@ mod tests {
             Opcode::from_u16(0x0000),
             Err(ProtocolError::UnknownOpcode(0x0000))
         ));
-        // 0x0070 is in the reserved substrate server-bound range.
+        // 0x0070 is in the reserved server-bound range of the 0x00xx namespace.
         assert!(matches!(
             Opcode::from_u16(0x0070),
             Err(ProtocolError::UnknownOpcode(0x0070))
         ));
-        // 0x0139 is a not-yet-assigned knowledge entity opcode.
+        // 0x0139 is a not-yet-assigned typed-graph entity opcode.
         assert!(matches!(
             Opcode::from_u16(0x0139),
             Err(ProtocolError::UnknownOpcode(0x0139))
@@ -651,7 +654,7 @@ mod tests {
         assert!(!Opcode::Welcome.is_request());
         assert!(Opcode::Bye.is_request());
         assert!(Opcode::Error.is_response());
-        // Knowledge ops follow the same low-byte rule.
+        // Typed-graph ops follow the same low-byte rule.
         assert!(Opcode::EntityCreateReq.is_request());
         assert!(Opcode::EntityCreateResp.is_response());
     }
@@ -663,7 +666,7 @@ mod tests {
         assert!(!Opcode::EncodeReq.is_admin());
         assert!(!Opcode::Ping.is_admin());
         assert!(!Opcode::Error.is_admin());
-        // Knowledge ops are never admin.
+        // Typed-graph ops are never admin.
         assert!(!Opcode::EntityCreateReq.is_admin());
     }
 
@@ -680,8 +683,8 @@ mod tests {
     #[test]
     fn admin_range_includes_embedding_admin_ops() {
         // The four embedding-layer admin opcodes added alongside the
-        // canonical admin range (§04/03 §1.6). They MUST classify as admin
-        // so dispatch and authorization wrappers find them.
+        // canonical admin range. They MUST classify as admin so dispatch
+        // and authorization wrappers find them.
         assert!(Opcode::AdminTokenizeReq.is_admin());
         assert!(Opcode::AdminTokenizeResp.is_admin());
         assert!(Opcode::AdminRegisterModelReq.is_admin());

@@ -1,4 +1,4 @@
-//! Extractor-op request payloads-§7, phase 20.8.
+//! Extractor-op request payloads.
 
 use rkyv::{Archive, Deserialize, Serialize};
 

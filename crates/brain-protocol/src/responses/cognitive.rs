@@ -43,8 +43,8 @@ pub struct EncodeResponse {
     /// Background stages this write queued. Each entry will emit a
     /// `SubscriptionEvent` with `event_type == StageCompleted` once
     /// the corresponding worker commits its derived phases. Empty
-    /// when the write triggered no background work (e.g. substrate-
-    /// only deployment with workers disabled, or a dedup hit).
+    /// when the write triggered no background work (e.g. schemaless
+    /// deployment with workers disabled, or a dedup hit).
     pub pending_stages: Vec<StageKind>,
     /// Whether a user schema is currently declared on the shard the
     /// write landed on. Lets the client distinguish two structurally
@@ -129,12 +129,12 @@ pub struct MemoryResult {
     pub edges_in_count: u32,
     /// Per-hit graph enrichment populated when the request carries
     /// `include_graph = true` AND the memory was processed by the
-    /// knowledge layer (mentions edges exist). `None` on substrate-
-    /// only deployments and when `include_graph` is unset.
+    /// typed-graph extractors (mentions edges exist). `None` on
+    /// schemaless deployments and when `include_graph` is unset.
     pub graph: Option<GraphEnrichment>,
 }
 
-/// Per-hit knowledge-layer side-channel surfaced when the client
+/// Per-hit typed-graph side-channel surfaced when the client
 /// passes `include_graph = true`. Empty vectors are valid (the memory
 /// went through extractors but produced no entities/statements/
 /// relations) — the renderer omits empty sections.

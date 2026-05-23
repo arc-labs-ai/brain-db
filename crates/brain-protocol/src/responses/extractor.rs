@@ -1,4 +1,4 @@
-//! Extractor-op response payloads-§7.
+//! Extractor-op response payloads.
 
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -18,15 +18,15 @@ pub struct ExtractorListItem {
 }
 
 /// `EXTRACTOR_LIST_RESP` (`0x01A4`). Single-frame snapshot in v1;
-/// phase 23 may split into streaming if registry counts demand.
+/// a later cut may split into streaming if registry counts demand.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub struct ExtractorListResponseFrame {
     pub items: Vec<ExtractorListItem>,
     pub total: u32,
-    /// Always `true` in v1. Phase 23 may set `false` on intermediate
-    /// frames if streaming lands.
+    /// Always `true` in v1. A later streaming cut may set `false` on
+    /// intermediate frames.
     pub is_final: bool,
 }
 

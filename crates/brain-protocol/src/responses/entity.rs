@@ -1,4 +1,4 @@
-//! Entity-op response payloads entity table.
+//! Entity-op response payloads.
 
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -121,12 +121,10 @@ pub struct EntityListItem {
 
 /// Response body for `ENTITY_LIST` (`0x01B7`). Carries one or more
 /// `EntityListItem`s per frame; `is_final = true` on the last frame.
-/// Mirrors the substrate's `RecallResponseFrame` streaming shape — see
-/// [`../../../spec/04_wire_protocol/09_streaming.md`](../../../spec/04_wire_protocol/09_streaming.md).
+/// Mirrors `RecallResponseFrame`'s streaming shape.
 ///
-/// Phase 16.7.5 emits a single frame with `is_final = true` carrying
-/// the entire snapshot. Phase 16.7.6 splits this into per-batch
-/// streaming.
+/// v1 emits a single frame with `is_final = true` carrying the entire
+/// snapshot. A later cut splits this into per-batch streaming.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
@@ -144,7 +142,8 @@ pub struct EntityListResponseFrame {
 
 impl EntityListResponseFrame {
     /// True for the final tail frame; false for per-batch intermediate
-    /// frames. Mirrors the substrate's `is_final` body-side signal.
+    /// frames. Mirrors the body-side `is_final` signal used by other
+    /// streaming responses.
     #[must_use]
     pub fn is_final(&self) -> bool {
         self.is_final

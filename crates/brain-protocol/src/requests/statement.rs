@@ -13,9 +13,9 @@ use crate::request::WireUuid;
 // Shared types (used by requests + StatementView in statement_resp.rs).
 // ---------------------------------------------------------------------------
 
-/// Wire counterpart to `brain_core::StatementKind`. Spec
-/// §28/06 §2.1. Discriminants are offset by 1 vs `StatementKind` so
-/// `0` can mean "no filter" in [`StatementListRequest::kind`].
+/// Wire counterpart to `brain_core::StatementKind`. Discriminants are
+/// offset by 1 vs `StatementKind` so `0` can mean "no filter" in
+/// [`StatementListRequest::kind`].
 #[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
@@ -26,11 +26,9 @@ pub enum StatementKindWire {
     Event = 3,
 }
 
-/// Wire counterpart to `brain_core::StatementValue`. Spec
-/// §28/06 §2.2.
+/// Wire counterpart to `brain_core::StatementValue`.
 ///
-/// `Blob` is capped at 64 KiB by the handler (spec
-/// §28_knowledge_wire_protocol/04_validation.md §3.2).
+/// `Blob` is capped at 64 KiB by the handler.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
@@ -44,8 +42,8 @@ pub enum StatementValueWire {
 }
 
 // `From` impls for ergonomic `.object_value(...)` setters on the SDK
-// builders (17.8). Local-type rule means these must live alongside
-// the enum definition.
+// builders. Local-type rule means these must live alongside the enum
+// definition.
 impl From<String> for StatementValueWire {
     fn from(s: String) -> Self {
         Self::Text(s)
@@ -77,11 +75,10 @@ impl From<Vec<u8>> for StatementValueWire {
     }
 }
 
-/// Wire counterpart to `brain_core::StatementObject`. Spec
-/// §28/06 §2.2.
+/// Wire counterpart to `brain_core::StatementObject`.
 ///
-/// `MemoryRef` carries the raw 16-byte `MemoryId` packed form (spec
-/// §02/03). All other variants use `WireUuid` ([u8; 16]).
+/// `MemoryRef` carries the raw 16-byte `MemoryId` packed form. All
+/// other variants use `WireUuid` ([u8; 16]).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
@@ -107,15 +104,14 @@ impl StatementObjectWire {
     }
 }
 
-/// Wire counterpart to `brain_core::EvidenceRef`. Spec
-/// §28/06 §2.3.
+/// Wire counterpart to `brain_core::EvidenceRef`.
 ///
 /// `Inline` MUST contain ≤ 8 MemoryIds. Each entry is the raw 16-byte
-/// `MemoryId` packed form. Confidence + timestamp +
-/// extractor metadata that brain-core's `EvidenceEntry` carries is NOT
-/// re-sent over the wire — the handler supplies them server-side from
-/// the request context. Phase-22 add-evidence ops carry the metadata
-/// explicitly via a follow-up structured payload.
+/// `MemoryId` packed form. Confidence + timestamp + extractor metadata
+/// that brain-core's `EvidenceEntry` carries is NOT re-sent over the
+/// wire — the handler supplies them server-side from the request
+/// context. Add-evidence ops carry the metadata explicitly via a
+/// follow-up structured payload.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
@@ -231,8 +227,8 @@ pub struct StatementHistoryRequest {
 /// - `kind == 0` → no kind filter; otherwise matches `StatementKindWire`.
 /// - `time_range_*_unix_nanos == 0` → no time bound.
 ///
-/// `limit` must be in `1..=1000`. `cursor` is opaque (phase 23
-/// streaming).
+/// `limit` must be in `1..=1000`. `cursor` is opaque (reserved for a
+/// later streaming cut).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]

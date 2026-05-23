@@ -1,7 +1,7 @@
 //! Schema-op request payloads.
 //!
-//! Aligns with the §21/05 truth (per-namespace versioning, no
-//! migration); see §21/07 Q15 for the §28/05 reconciliation.
+//! Per-namespace versioning. No migrations in v1; breaking schema
+//! changes are made in place.
 
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -12,12 +12,13 @@ use crate::request::WireUuid;
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub struct SchemaUploadRequest {
-    /// DSL source text per §21.
+    /// Schema DSL source text.
     pub schema_document: String,
     /// Parse + validate without persisting. Identical to
     /// `SCHEMA_VALIDATE` when `true`.
     pub dry_run: bool,
-    /// Reserved for §28/05 forward-compat. Ignored in v1.
+    /// Reserved for forward-compat with future migration support.
+    /// Ignored in v1.
     pub allow_breaking: bool,
     pub request_id: WireUuid,
 }

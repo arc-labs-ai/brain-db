@@ -102,7 +102,7 @@ pub struct RelationListToRequest {
 /// `RELATION_TRAVERSE` (`0x0156`).
 ///
 /// `direction`: `0` = Outgoing / `1` = Incoming / `2` = Both.
-/// `max_depth` clamped to phase-18.5 `MAX_DEPTH = 5`.
+/// `max_depth` clamped to `MAX_DEPTH = 5`.
 /// `max_nodes` ≤ 1000.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[archive(check_bytes)]

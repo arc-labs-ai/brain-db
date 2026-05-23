@@ -1,4 +1,4 @@
-//! Admin-surface requests (– §07/25).
+//! Admin-surface requests.
 
 use rkyv::{Archive, Deserialize, Serialize};
 

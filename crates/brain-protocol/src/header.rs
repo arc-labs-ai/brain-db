@@ -12,13 +12,13 @@
 //!
 //! The opcode field is a `u16` (bytes 5-6, big-endian). The high byte is a
 //! **namespace**:
-//! - `0x00xx` — substrate ops (cognitive primitives + connection mgmt + admin),
+//! - `0x00xx` — cognitive primitives + connection mgmt + admin,
 //! - `0x01xx` — typed-graph ops (schema / entities / statements / relations /
-//!   queries / extractors), active when a schema is declared,
+//!   queries / extractors), active once a schema is declared,
 //! - `0x02xx`–`0xFFxx` — reserved for future namespaces.
 //!
 //! Within a namespace the low byte's high bit selects direction (request vs
-//! response). Substrate's `0x2N → 0xAN` (encode→encode_resp) convention is
+//! response). The `0x2N → 0xAN` (encode→encode_resp) convention is
 //! preserved as `0x002N → 0x00AN`; typed-graph follows the same convention
 //! (e.g. `0x0130 ENTITY_CREATE` ↔ `0x01B0 ENTITY_CREATE_RESP`).
 //!
@@ -256,10 +256,10 @@ mod tests {
 
     #[test]
     fn opcode_u16_round_trips_both_namespaces() {
-        // Substrate: ENCODE_REQ.
+        // 0x00xx namespace: ENCODE_REQ.
         let h = Header::new(0x0020, 0, 1, 0);
         assert_eq!(h.opcode_u16(), 0x0020);
-        // Knowledge: ENTITY_CREATE.
+        // 0x01xx (typed-graph) namespace: ENTITY_CREATE.
         let h = Header::new(0x0130, 0, 1, 0);
         assert_eq!(h.opcode_u16(), 0x0130);
         h.validate().unwrap();
@@ -360,7 +360,7 @@ mod tests {
         let h = Header::new(0x0130, 0x80, 0, 0);
         let bytes: [u8; 32] = bytemuck::cast(h);
         assert_eq!(bytes[4], VERSION, "version");
-        assert_eq!(bytes[5], 0x01, "opcode high byte (knowledge namespace)");
+        assert_eq!(bytes[5], 0x01, "opcode high byte (typed-graph namespace)");
         assert_eq!(bytes[6], 0x30, "opcode low byte (ENTITY_CREATE)");
         assert_eq!(bytes[7], 0x80, "flags = EOS");
     }

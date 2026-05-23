@@ -160,8 +160,8 @@ pub fn evidence_ref_to_wire(e: &EvidenceRef) -> EvidenceRefWire {
 /// Convert the wire shape back to brain-core's `EvidenceRef`. Inline
 /// entries get zero confidence / zero timestamp / extractor_id = 0;
 /// callers that need the per-entry metadata read it from the storage
-/// layer's overflow row (or from a future phase-22 add-evidence
-/// payload that carries the metadata explicitly).
+/// layer's overflow row (or from a future add-evidence payload that
+/// carries the metadata explicitly).
 pub fn evidence_ref_from_wire(w: &EvidenceRefWire) -> Result<EvidenceRef, WireToStatementError> {
     match w {
         EvidenceRefWire::Inline(memory_ids) => {
@@ -372,14 +372,14 @@ pub struct StatementTombstoneResponse {
 #[archive_attr(derive(Debug))]
 pub struct StatementRetractResponse {
     pub retracted_at_unix_nanos: u64,
-    /// When the GC sweep will physically reclaim the row. Phase 21
-    /// wires the worker; in v1 this is "tombstoned_at + 30 days".
+    /// When the GC sweep will physically reclaim the row. In v1 this
+    /// is "tombstoned_at + 30 days".
     pub will_zero_at_unix_nanos: u64,
 }
 
 /// Single-frame snapshot reply for `STATEMENT_HISTORY` (`0x01C5`).
-/// Per phase-17 plan we collapse the per-item +
-/// tail shapes into one frame; phase 23 splits when it streams.
+/// v1 collapses the per-item + tail shapes into one frame; a later
+/// cut splits when it streams.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
@@ -399,7 +399,7 @@ impl StatementHistoryResponseFrame {
 }
 
 /// Single-frame snapshot reply for `STATEMENT_LIST` (`0x01C6`).
-/// Mirrors `EntityListResponseFrame` (16.7.5). Phase 23 splits into
+/// Mirrors `EntityListResponseFrame`. A later cut splits into
 /// per-batch streaming + cursor pagination.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[archive(check_bytes)]

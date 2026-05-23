@@ -198,7 +198,7 @@ pub struct RelationTombstoneResponse {
 }
 
 /// Reply to `RELATION_LIST_FROM` (`0x01D4`) — single-frame snapshot
-/// in v1 (cursor pagination + true streaming → phase 23).
+/// in v1 (cursor pagination + true streaming is a follow-up).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
@@ -235,8 +235,8 @@ impl RelationListToResponseFrame {
 }
 
 /// Reply to `RELATION_TRAVERSE` (`0x01D6`) — single-frame snapshot
-/// carrying `Vec<TraversalPathWire>`'s per-frame
-/// streaming variant lands in phase 23.
+/// carrying `Vec<TraversalPathWire>`; the per-frame streaming variant
+/// is a follow-up.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]

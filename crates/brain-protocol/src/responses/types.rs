@@ -18,10 +18,10 @@ pub enum TransitionKind {
     Other(String),
 }
 
-// Bridge from the knowledge namespace's hybrid-query retriever
-// enum to the substrate response field. Lives here so the
-// substrate response module stays free of knowledge-namespace
-// imports beyond this single conversion.
+// Bridge from the typed-graph namespace's hybrid-query retriever
+// enum to the cognitive RECALL response field. Lives here so the
+// cognitive response module stays free of typed-graph imports beyond
+// this single conversion.
 impl From<crate::requests::RetrieverWire> for RetrieverNameWire {
     fn from(w: crate::requests::RetrieverWire) -> Self {
         match w {
@@ -32,15 +32,14 @@ impl From<crate::requests::RetrieverWire> for RetrieverNameWire {
     }
 }
 
-/// — names the retriever family that surfaced a
-/// memory in a `MemoryResult`. Populated when the substrate
-/// `RECALL_REQ` routes through the hybrid query engine
-/// (schema-declared deployments).
+/// Names the retriever family that surfaced a memory in a
+/// `MemoryResult`. Populated when `RECALL_REQ` routes through the
+/// hybrid query engine (schema-declared deployments).
 ///
-/// This is a substrate-side wire enum. The knowledge namespace
+/// This is the cognitive-side wire enum. The typed-graph namespace
 /// has its own `RetrieverWire` for hybrid-query opcodes;
-/// `From<RetrieverWire>` bridges the two so the substrate
-/// response type doesn't depend on the knowledge namespace.
+/// `From<RetrieverWire>` bridges the two so the cognitive response
+/// type doesn't depend on the typed-graph namespace.
 #[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
@@ -87,26 +86,25 @@ pub enum ReasonStatus {
     Cancelled = 3,
 }
 
-/// — `SubscriptionEvent::EventType`.
+/// `SubscriptionEvent::EventType`.
 ///
-/// Phase 16.7 extended this enum with the 14 knowledge-layer event
-/// variants ([`Self::EntityCreated`] through [`Self::SchemaUpdated`]).
-/// For knowledge events the substrate fields on `SubscriptionEvent`
-/// (`memory_id`, `context_id`, `kind`, `salience`, `text`) are
-/// zero-filled and `knowledge_payload` carries the typed body. See
-/// `spec/28_knowledge_wire_protocol/02_subscribe_events.md`.
+/// Carries 14 typed-graph event variants ([`Self::EntityCreated`]
+/// through [`Self::SchemaUpdated`]). For typed-graph events the
+/// cognitive fields on `SubscriptionEvent` (`memory_id`, `context_id`,
+/// `kind`, `salience`, `text`) are zero-filled and `knowledge_payload`
+/// carries the typed body.
 #[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 #[repr(u8)]
 pub enum EventType {
-    // Substrate events.
+    // Cognitive events.
     Encoded = 0,
     Forgotten = 1,
     Reclaimed = 2,
     KindChanged = 3,
 
-    // Knowledge-layer events (§28/02). knowledge_payload is populated.
+    // Typed-graph events. knowledge_payload is populated.
     EntityCreated = 16,
     EntityUpdated = 17,
     EntityRenamed = 18,
@@ -128,11 +126,11 @@ pub enum EventType {
     /// edges written, etc.).
     StageCompleted = 27,
     SchemaUpdated = 29,
-    /// Phase 18.7. Appended after `SchemaUpdated` to preserve the
-    /// stable discriminants of prior variants.
+    /// Appended after `SchemaUpdated` to preserve the stable
+    /// discriminants of prior variants.
     RelationTombstoned = 30,
 
-    // Unified-edge change feed. Substrate Link / Unlink and typed-
+    // Unified-edge change feed. Cognitive Link / Unlink and typed-
     // relation create / supersede / tombstone all flow through these
     // three variants; the per-event `edge_payload` sidecar carries
     // `from`, `to`, kind discriminator, relation id when applicable.
@@ -317,15 +315,14 @@ impl From<ErrorCategoryWire> for ErrorCategory {
     }
 }
 
-/// rkyv-archivable mirror of [`crate::error::ErrorCode`]. Variants are in
-/// the same order as the spec table (§10 §3.1–§3.9). Numeric repr is
-/// stable; this is the *wire* representation.
+/// rkyv-archivable mirror of [`crate::error::ErrorCode`]. Numeric repr
+/// is stable; this is the *wire* representation.
 #[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 #[repr(u16)]
 pub enum ErrorCodeWire {
-    // §3.1 Protocol
+    // Protocol
     BadMagic = 0x0001,
     BadHeaderCrc = 0x0002,
     BadPayloadCrc = 0x0003,
@@ -337,18 +334,18 @@ pub enum ErrorCodeWire {
     BadFlagCombination = 0x0009,
     MalformedRkyv = 0x000A,
     MalformedVector = 0x000B,
-    // §3.2 Connection / handshake
+    // Connection / handshake
     VersionNotSupported = 0x0020,
     NoSuchAuthMethod = 0x0021,
     Unauthenticated = 0x0022,
     NotAuthenticated = 0x0023,
     AuthBackendUnavailable = 0x0024,
     SessionExpired = 0x0025,
-    // §3.3 Authorization
+    // Authorization
     PermissionDenied = 0x0030,
     AdminPermissionRequired = 0x0031,
     WrongShard = 0x0032,
-    // §3.4 Validation
+    // Validation
     InvalidArgument = 0x0040,
     MissingRequiredField = 0x0041,
     TextTooLarge = 0x0042,
@@ -362,20 +359,20 @@ pub enum ErrorCodeWire {
     BadModelFingerprint = 0x004A,
     PredicateNotInSchema = 0x004B,
     RelationTypeNotInSchema = 0x004C,
-    // §3.5 Not found
+    // Not found
     MemoryNotFound = 0x0050,
     ContextNotFound = 0x0051,
     SubscriptionNotFound = 0x0052,
     SnapshotNotFound = 0x0053,
     TxnNotFound = 0x0054,
-    // §3.6 Conflict
+    // Conflict
     IdempotencyConflict = 0x0060,
     TransactionConflict = 0x0061,
     TransactionTimeout = 0x0062,
     StreamIdInUse = 0x0063,
     SubscriptionLsnTooOld = 0x0064,
     CardinalityViolation = 0x0065,
-    // §3.7 Resource exhausted
+    // Resource exhausted
     OutOfSlots = 0x0070,
     OutOfDisk = 0x0071,
     OutOfMemory = 0x0072,
@@ -383,13 +380,13 @@ pub enum ErrorCodeWire {
     StreamLimitExceeded = 0x0074,
     ConnectionLimitExceeded = 0x0075,
     TransactionLimitExceeded = 0x0076,
-    // §3.8 Internal
+    // Internal
     Internal = 0x0080,
     StorageError = 0x0081,
     IndexError = 0x0082,
     EmbeddingError = 0x0083,
     MetadataError = 0x0084,
-    // §3.9 Unavailable
+    // Unavailable
     ShardUnavailable = 0x0090,
     Overloaded = 0x0091,
     Restarting = 0x0092,

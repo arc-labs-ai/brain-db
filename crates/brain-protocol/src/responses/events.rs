@@ -1,11 +1,8 @@
-//! Knowledge-layer SUBSCRIBE event payloads. Spec
-//! `spec/28_knowledge_wire_protocol/02_subscribe_events.md` §3.
+//! Typed-graph SUBSCRIBE event payloads.
 //!
-//! Carried on the substrate's [`crate::responses::SubscriptionEvent`]
-//! via its `knowledge_payload: Option<KnowledgeEventPayload>` field.
-//! Phase 16.7 emits only the entity variants; statement / relation /
-//! extraction / schema variants are defined here for forward compat
-//! and land in their respective phases (17 / 18 / 22 / 19).
+//! Carried on [`crate::responses::SubscriptionEvent`] via its
+//! `knowledge_payload: Option<KnowledgeEventPayload>` field. The
+//! variants cover entity, statement, relation, and schema events.
 
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -15,13 +12,13 @@ use crate::request::WireUuid;
 // Top-level union.
 // ---------------------------------------------------------------------------
 
-/// Typed payload for a knowledge-layer SUBSCRIBE event. Discriminated
-/// by the parent [`crate::responses::SubscriptionEvent::event_type`].
+/// Typed payload for a typed-graph SUBSCRIBE event. Discriminated by
+/// the parent [`crate::responses::SubscriptionEvent::event_type`].
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub enum KnowledgeEventPayload {
-    // Entity events (phase 16.7).
+    // Entity events.
     EntityCreated(EntityCreatedEvent),
     EntityUpdated(EntityUpdatedEvent),
     EntityRenamed(EntityRenamedEvent),
@@ -29,22 +26,22 @@ pub enum KnowledgeEventPayload {
     EntityUnmerged(EntityUnmergedEvent),
     EntityTombstoned(EntityTombstonedEvent),
 
-    // Statement events (phase 17).
+    // Statement events.
     StatementCreated(StatementCreatedEvent),
     StatementSuperseded(StatementSupersededEvent),
     StatementTombstoned(StatementTombstonedEvent),
 
-    // Relation events (phase 18).
+    // Relation events.
     RelationCreated(RelationCreatedEvent),
     RelationSuperseded(RelationSupersededEvent),
     RelationTombstoned(RelationTombstonedEvent),
 
-    // Schema events (phase 19).
+    // Schema events.
     SchemaUpdated(SchemaUpdatedEvent),
 }
 
 // ---------------------------------------------------------------------------
-// Entity events — phase 16.7.
+// Entity events.
 // ---------------------------------------------------------------------------
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -106,7 +103,7 @@ pub struct EntityTombstonedEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Statement events — phase 17 (defined for forward compat).
+// Statement events.
 // ---------------------------------------------------------------------------
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -139,7 +136,7 @@ pub struct StatementTombstonedEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Relation events — phase 18 (defined for forward compat).
+// Relation events.
 // ---------------------------------------------------------------------------
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -169,18 +166,18 @@ pub struct RelationTombstonedEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Schema events — phase 19 (defined for forward compat).
+// Schema events.
 // ---------------------------------------------------------------------------
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub struct SchemaUpdatedEvent {
-    /// Namespace the new version belongs to (§21/04 / phase 19.5).
+    /// Namespace the new version belongs to.
     pub namespace: String,
     pub from_version: u32,
     pub to_version: u32,
-    /// Always `true` in v1 — no diff computed (§21/05 §3).
+    /// Always `true` in v1 — no diff computed.
     pub backward_compatible: bool,
 }
 

@@ -47,18 +47,18 @@ pub struct RecallRequest {
     /// When set, each `MemoryResult` carries a populated
     /// `graph: GraphEnrichment` field listing entities mentioned by
     /// the memory, statements sourced from it, and typed relations
-    /// incident to those entities. Server-side knowledge-layer
-    /// queries; if the memory wasn't extracted (no schema declared,
-    /// no extractors registered, or a mention-less memory), the
-    /// field is `None` even when this flag is set.
+    /// incident to those entities. Server-side typed-graph queries;
+    /// if the memory wasn't extracted (no schema declared, no
+    /// extractors registered, or a mention-less memory), the field
+    /// is `None` even when this flag is set.
     pub include_graph: bool,
     /// When set, each `MemoryResult` carries the memory's stored UTF-8
     /// text. Costs one batched read against the per-shard `texts`
     /// table. When unset, `MemoryResult.text` is the empty string.
     pub include_text: bool,
     pub request_id: Option<WireUuid>,
-    /// when set, RECALL reads against a snapshot
-    /// that includes the txn's pending writes (read-your-writes).
+    /// When set, RECALL reads against a snapshot that includes the
+    /// txn's pending writes (read-your-writes).
     pub txn_id: Option<WireUuid>,
     /// Opt-in cross-encoder rerank over the RRF-fused candidates.
     /// Defaults to `false` so existing clients see no behaviour

@@ -569,8 +569,8 @@ fn parse_extractor_def(pair: Pair<'_, Rule>) -> Result<ExtractorDef, ParseError>
                 fields.push(ExtractorField::DependsOn(parse_identifier_list(list)));
             }
             Rule::extractor_resolver_field => {
-                // Body content is intentionally discarded — §22 will define
-                // the schema. Phase 19 ships an empty placeholder.
+                // Body content is intentionally discarded — the resolver
+                // schema isn't defined yet; v1 ships an empty placeholder.
                 fields.push(ExtractorField::Resolver(ResolverConfig::default()));
             }
             _ => {}

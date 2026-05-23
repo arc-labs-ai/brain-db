@@ -1,5 +1,4 @@
-//! Schema-op response payloads reconciled against
-//! §21/05.
+//! Schema-op response payloads.
 
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -15,10 +14,10 @@ pub struct SchemaUploadResponse {
     pub namespace: String,
     pub schema_version: u32,
     pub validation_errors: Vec<SchemaValidationErrorWire>,
-    /// Always `true` in v1 (no diff computed). Reserved for §28/05
-    /// forward-compat.
+    /// Always `true` in v1 (no diff computed). Reserved for a
+    /// future migration-aware schema cut.
     pub backward_compatible: bool,
-    /// Reserved opaque blob for §28/05 `SchemaMigrationSummary`.
+    /// Reserved opaque blob for a future `SchemaMigrationSummary`.
     /// Empty in v1.
     pub migration_summary_blob: Vec<u8>,
 }
@@ -40,7 +39,7 @@ pub struct SchemaGetResponse {
 }
 
 /// `SCHEMA_LIST_RESP` (`0x01A2`). Single-frame snapshot in v1;
-/// phase 23 may split into streaming.
+/// a later cut may split into streaming.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]

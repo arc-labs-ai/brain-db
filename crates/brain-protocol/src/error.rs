@@ -2,11 +2,12 @@
 //!
 //! Three layers, in order of generality:
 //!
-//! - [`ErrorCategory`] — the 9 broad classes from that drive
-//!   client retry behavior.
-//! - [`ErrorCode`] — every named code in, faithfully one
-//!   variant per row. Used both for ERROR-frame encoding/decoding (later
-//!   sub-tasks) and as a stable mapping target for [`ProtocolError`].
+//! - [`ErrorCategory`] — nine broad classes that drive client retry
+//!   behavior (Protocol, Authentication, Authorization, Validation,
+//!   NotFound, Conflict, ResourceExhausted, Internal, Unavailable).
+//! - [`ErrorCode`] — one variant per named code in the wire-error table.
+//!   Used both for ERROR-frame encoding/decoding and as a stable mapping
+//!   target for [`ProtocolError`].
 //! - [`ProtocolError`] — the Rust error type emitted by this crate's codec
 //!   (frame parse / validate / encode failures). Each variant maps to an
 //!   [`ErrorCode`] via [`ProtocolError::code`].
@@ -22,7 +23,9 @@ use thiserror::Error;
 // ErrorCategory.
 // ---------------------------------------------------------------------------
 
-/// Broad error class. Drives the SDK's default retry policy
+/// Broad error class. Drives the SDK's default retry policy: only
+/// `ResourceExhausted`, `Internal`, and `Unavailable` retry by default
+/// (see [`ErrorCategory::is_retryable`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum ErrorCategory {
     /// Bad frame, version mismatch, malformed message — client bug.
@@ -46,7 +49,8 @@ pub enum ErrorCategory {
 }
 
 impl ErrorCategory {
-    /// Whether the SDK should retry by default. Mirrors the §6 retry table.
+    /// Whether the SDK should retry by default. Three retryable
+    /// categories: `ResourceExhausted`, `Internal`, `Unavailable`.
     #[must_use]
     pub fn is_retryable(self) -> bool {
         matches!(
@@ -57,13 +61,15 @@ impl ErrorCategory {
 }
 
 // ---------------------------------------------------------------------------
-// ErrorCode — every named code in.
+// ErrorCode — every named code in the wire error table.
 // ---------------------------------------------------------------------------
 
-/// Wire-level error code. One variant per row in.
+/// Wire-level error code. One variant per named code in the wire error
+/// table.
 ///
 /// Numeric / on-wire encoding for these is owned by the ERROR-frame codec
-/// (a later sub-task in Phase 1); this enum is the in-memory representation.
+/// (see [`crate::responses::types::ErrorCodeWire`]); this enum is the
+/// in-memory representation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum ErrorCode {
@@ -158,11 +164,11 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// Map this code to its spec category (§3.1–3.9).
+    /// Map this code to its broad category.
     #[must_use]
     pub fn category(self) -> ErrorCategory {
         match self {
-            // §3.1 — all Protocol.
+            // Protocol codes.
             Self::BadMagic
             | Self::BadHeaderCrc
             | Self::BadPayloadCrc
@@ -175,20 +181,20 @@ impl ErrorCode {
             | Self::MalformedRkyv
             | Self::MalformedVector => ErrorCategory::Protocol,
 
-            // §3.2 — version/auth-method failures are Protocol; credential
-            // failures are Authentication.
+            // Connection / handshake — version + auth-method failures are
+            // Protocol; credential failures are Authentication.
             Self::VersionNotSupported | Self::NoSuchAuthMethod => ErrorCategory::Protocol,
             Self::Unauthenticated
             | Self::NotAuthenticated
             | Self::AuthBackendUnavailable
             | Self::SessionExpired => ErrorCategory::Authentication,
 
-            // §3.3
+            // Authorization codes.
             Self::PermissionDenied | Self::AdminPermissionRequired | Self::WrongShard => {
                 ErrorCategory::Authorization
             }
 
-            // §3.4
+            // Validation codes.
             Self::InvalidArgument
             | Self::MissingRequiredField
             | Self::TextTooLarge
@@ -203,14 +209,14 @@ impl ErrorCode {
             | Self::PredicateNotInSchema
             | Self::RelationTypeNotInSchema => ErrorCategory::Validation,
 
-            // §3.5
+            // Not-found codes.
             Self::MemoryNotFound
             | Self::ContextNotFound
             | Self::SubscriptionNotFound
             | Self::SnapshotNotFound
             | Self::TxnNotFound => ErrorCategory::NotFound,
 
-            // §3.6
+            // Conflict codes.
             Self::IdempotencyConflict
             | Self::TransactionConflict
             | Self::TransactionTimeout
@@ -218,7 +224,7 @@ impl ErrorCode {
             | Self::SubscriptionLsnTooOld
             | Self::CardinalityViolation => ErrorCategory::Conflict,
 
-            // §3.7
+            // Resource-exhausted codes.
             Self::OutOfSlots
             | Self::OutOfDisk
             | Self::OutOfMemory
@@ -227,14 +233,14 @@ impl ErrorCode {
             | Self::ConnectionLimitExceeded
             | Self::TransactionLimitExceeded => ErrorCategory::ResourceExhausted,
 
-            // §3.8
+            // Internal codes.
             Self::Internal
             | Self::StorageError
             | Self::IndexError
             | Self::EmbeddingError
             | Self::MetadataError => ErrorCategory::Internal,
 
-            // §3.9
+            // Unavailable codes.
             Self::ShardUnavailable | Self::Overloaded | Self::Restarting | Self::Maintenance => {
                 ErrorCategory::Unavailable
             }
@@ -270,15 +276,15 @@ pub enum ProtocolError {
     /// A reserved header field was non-zero.
     #[error("reserved field non-zero")]
     ReservedFieldNonZero,
-    /// An opcode value didn't match any known opcode (+
-    /// §28/00). The u16 is the offending wire value.
+    /// An opcode value didn't match any known opcode. The u16 is the
+    /// offending wire value.
     #[error("unknown opcode: 0x{0:04X}")]
     UnknownOpcode(u16),
     /// Input ran out before a full frame could be decoded.
     #[error("truncated frame: have {have} bytes, need {need}")]
     Truncated { have: usize, need: usize },
     /// Generic malformed-frame error for cases not covered by a more
-    /// specific variant (`BadFrame` in).
+    /// specific variant (maps to `BadFrame` in the wire error table).
     #[error("bad frame: {0}")]
     BadFrame(String),
     /// Frame flags are mutually inconsistent.
@@ -290,7 +296,7 @@ pub enum ProtocolError {
 }
 
 impl ProtocolError {
-    /// Map the variant to its spec [`ErrorCode`].
+    /// Map the variant to its [`ErrorCode`].
     #[must_use]
     pub fn code(&self) -> ErrorCode {
         match self {
@@ -336,8 +342,8 @@ impl From<ProtocolError> for brain_core::Error {
 mod tests {
     use super::*;
 
-    /// Spot-check the category mapping against with
-    /// at least one code per category.
+    /// Spot-check the category mapping with at least one code per
+    /// category.
     #[test]
     fn error_code_categories_match_spec() {
         assert_eq!(ErrorCode::BadMagic.category(), ErrorCategory::Protocol);
@@ -378,7 +384,7 @@ mod tests {
 
     #[test]
     fn retryability_matches_spec_table() {
-        // §6: retryable categories are ResourceExhausted, Internal, Unavailable.
+        // Retryable categories: ResourceExhausted, Internal, Unavailable.
         assert!(ErrorCategory::ResourceExhausted.is_retryable());
         assert!(ErrorCategory::Internal.is_retryable());
         assert!(ErrorCategory::Unavailable.is_retryable());

@@ -1,9 +1,9 @@
 //! Response-frame payload codecs.
 //!
-//! One variant of [`ResponseBody`] per client-bound opcode in.
-//! Mirrors `crate::request` exactly: rkyv-archivable structs for the
-//! structured fields, raw vector blobs (where applicable) appended at
-//! the [`crate::Frame`] layer.
+//! One variant of [`ResponseBody`] per client-bound opcode. Mirrors
+//! `crate::request` exactly: rkyv-archivable structs for the structured
+//! fields, raw vector blobs (where applicable) appended at the
+//! [`crate::Frame`] layer.
 //!
 //! ## Streaming
 //!
@@ -11,18 +11,17 @@
 //! (`RECALL_RESP`, `PLAN_RESP`, `REASON_RESP`, `SUBSCRIBE_EVENT`,
 //! `ADMIN_MIGRATE_EMBEDDINGS_RESP`, `ADMIN_LIST_TOMBSTONED_RESP`). Each
 //! emitted frame is one variant payload; the *last* frame of a stream
-//! sets the header's `EOS` flag and the body's
-//! `is_final = true`. [`ResponseBody::is_final`] surfaces the body-side
-//! signal so a Frame-layer dispatcher can cross-check against the
-//! header (Phase 9).
+//! sets the header's `EOS` flag and the body's `is_final = true`.
+//! [`ResponseBody::is_final`] surfaces the body-side signal so a
+//! Frame-layer dispatcher can cross-check against the header.
 //!
 //! ## ERROR-frame mirror enums
 //!
-//! ties the ERROR body to `ErrorCode` / `ErrorCategory`
-//! from §10. Those enums live in [`crate::error`] and are intentionally
-//! `#[non_exhaustive]` for forward-compat. We mirror them here as
-//! plain rkyv-archivable enums so wire encoding/decoding is closed,
-//! and convert at the boundary via `From` impls.
+//! The ERROR body ties to `ErrorCode` / `ErrorCategory`. Those enums
+//! live in [`crate::error`] and are intentionally `#[non_exhaustive]`
+//! for forward-compat. We mirror them here as plain rkyv-archivable
+//! enums so wire encoding/decoding is closed, and convert at the
+//! boundary via `From` impls.
 
 use crate::error::ProtocolError;
 use crate::handshake::{AuthOkPayload, WelcomePayload};
@@ -38,15 +37,15 @@ use crate::rkyv_codec::{from_rkyv_bytes, to_rkyv_bytes};
 // `brain_protocol::response::EncodeResponse` etc.
 pub use crate::responses::*;
 
-/// One variant per client-bound opcode in. Mirrors
+/// One variant per client-bound opcode. Mirrors
 /// [`crate::request::RequestBody`]; raw vector blobs (where applicable)
 /// live in the trailing section of [`crate::Frame::payload`] and are
 /// not part of the rkyv-encoded bytes this module produces.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResponseBody {
-    /// — server reply to HELLO (connection-level, stream 0).
+    /// Server reply to HELLO (connection-level, stream 0).
     Welcome(WelcomePayload),
-    /// — server confirmation of authentication.
+    /// Server confirmation of authentication.
     AuthOk(AuthOkPayload),
     Encode(EncodeResponse),
     Recall(RecallResponseFrame),
@@ -74,7 +73,7 @@ pub enum ResponseBody {
     AdminReclassify(AdminReclassifyResponse),
     AdminListTombstoned(AdminListTombstonedResponseFrame),
 
-    // Knowledge namespace.
+    // Typed-graph namespace.
     EntityCreate(crate::responses::EntityCreateResponse),
     EntityGet(crate::responses::EntityGetResponse),
     EntityUpdate(crate::responses::EntityUpdateResponse),
@@ -87,50 +86,50 @@ pub enum ResponseBody {
     EntityList(crate::responses::EntityListResponseFrame),
     EntityTombstone(crate::responses::EntityTombstoneResponse),
 
-    // Statement ops (phase 17.6).
+    // Statement ops.
     StatementCreate(crate::responses::StatementCreateResponse),
     StatementGet(crate::responses::StatementGetResponse),
     StatementSupersede(crate::responses::StatementSupersedeResponse),
     StatementTombstone(crate::responses::StatementTombstoneResponse),
     StatementRetract(crate::responses::StatementRetractResponse),
-    /// Single-frame snapshot in v1; phase 23 splits into streaming.
+    /// Single-frame snapshot in v1; a later cut splits into streaming.
     StatementHistory(crate::responses::StatementHistoryResponseFrame),
-    /// Single-frame snapshot in v1; phase 23 splits into streaming.
+    /// Single-frame snapshot in v1; a later cut splits into streaming.
     StatementList(crate::responses::StatementListResponseFrame),
 
-    // Relation ops (phase 18.6).
+    // Relation ops.
     RelationCreate(crate::responses::RelationCreateResponse),
     RelationGet(crate::responses::RelationGetResponse),
     RelationSupersede(crate::responses::RelationSupersedeResponse),
     RelationTombstone(crate::responses::RelationTombstoneResponse),
-    /// Single-frame snapshot in v1; phase 23 splits into streaming.
+    /// Single-frame snapshot in v1; a later cut splits into streaming.
     RelationListFrom(crate::responses::RelationListFromResponseFrame),
-    /// Single-frame snapshot in v1; phase 23 splits into streaming.
+    /// Single-frame snapshot in v1; a later cut splits into streaming.
     RelationListTo(crate::responses::RelationListToResponseFrame),
-    /// Single-frame snapshot in v1; phase 23 splits into streaming.
+    /// Single-frame snapshot in v1; a later cut splits into streaming.
     RelationTraverse(crate::responses::RelationTraverseResponseFrame),
 
-    // Schema ops (phase 19.6).
+    // Schema ops.
     SchemaUpload(crate::responses::SchemaUploadResponse),
     SchemaGet(crate::responses::SchemaGetResponse),
-    /// Single-frame snapshot in v1; phase 23 may split into streaming.
+    /// Single-frame snapshot in v1; a later cut may split into streaming.
     SchemaList(crate::responses::SchemaListResponseFrame),
     SchemaValidate(crate::responses::SchemaValidateResponse),
 
-    // Extractor governance ops (phase 20.8)-§7.
+    // Extractor governance ops.
     /// Single-frame snapshot in v1.
     ExtractorList(crate::responses::ExtractorListResponseFrame),
     ExtractorDisable(crate::responses::ExtractorDisableResponse),
     ExtractorEnable(crate::responses::ExtractorEnableResponse),
 
-    // Hybrid query ops (phase 23.9).
+    // Hybrid query ops.
     Query(crate::responses::QueryResponse),
     QueryExplain(crate::responses::QueryExplainResponse),
     QueryTrace(crate::responses::QueryTraceResponse),
     RecallHybrid(crate::responses::RecallHybridResponse),
 
-    // Procedural-memory materialization (wire v2). Carries the
-    // rendered system block + the statement ids that contributed.
+    // Procedural-memory materialization. Carries the rendered system
+    // block plus the statement ids that contributed.
     MaterializeProcedural(crate::responses::MaterializeProceduralResponse),
 
     Error(ErrorResponse),

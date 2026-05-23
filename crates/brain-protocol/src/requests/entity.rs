@@ -1,4 +1,4 @@
-//! Entity-op request payloads entity table.
+//! Entity-op request payloads.
 
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -6,10 +6,11 @@ use crate::request::WireUuid;
 
 /// `ENTITY_CREATE` (0x0130).
 ///
-/// `entity_type_id` is the u32 raw form of the registry id (Person =
-/// 1 in phase 16; user-declared types arrive with phase 19 schema DSL).
-/// `attributes_blob` is opaque — phase 19 typed accessors. `aliases`
-/// are stored verbatim, normalized inside the handler.
+/// `entity_type_id` is the u32 raw form of the registry id. Built-in
+/// types (Person = 1, etc.) ship pre-registered; user-declared types
+/// arrive via the schema DSL. `attributes_blob` is opaque (typed
+/// accessors are a follow-up). `aliases` are stored verbatim,
+/// normalized inside the handler.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
@@ -53,7 +54,7 @@ pub struct EntityUpdateRequest {
 /// old canonical_name is appended to the entity's aliases atomically
 /// with the swap. The handler currently always moves to alias
 /// (matching `brain-metadata::entity_ops::entity_rename`); the flag is
-/// here for forward compat with a "no-trail" mode in later phases.
+/// here for forward compat with a future "no-trail" mode.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
