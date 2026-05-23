@@ -15,10 +15,10 @@
 use std::future::Future;
 use std::net::SocketAddr;
 
-use brain_protocol::handshake::{
+use brain_protocol::connection::handshake::{
     AgentPermissions, AuthMethod, AuthOkPayload, HelloCapabilities, ServerFeatures, WelcomePayload,
 };
-use brain_protocol::opcode::Opcode;
+use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -56,7 +56,7 @@ pub async fn complete_handshake(socket: &mut TcpStream) -> bool {
 
     let welcome = WelcomePayload {
         server_id: "mock-server".into(),
-        chosen_version: brain_protocol::header::VERSION,
+        chosen_version: brain_protocol::codec::header::VERSION,
         session_id: [0xCD; 16],
         capabilities: HelloCapabilities {
             streaming: true,

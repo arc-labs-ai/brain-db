@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use brain_protocol::opcode::Opcode;
+use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::Frame;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -44,7 +44,7 @@ mod subscribe;
 #[path = "../src/bootstrap/tls.rs"]
 mod tls;
 
-use brain_protocol::handshake::{AuthMethod, ServerCapabilities};
+use brain_protocol::connection::handshake::{AuthMethod, ServerCapabilities};
 use connection::{ConnectionLimits, ConnectionListener, ShutdownSignal, ShutdownTrigger, Topology};
 use routing::RoutingTable;
 use shard::ShardHandle;
@@ -142,10 +142,10 @@ async fn ping_works_pre_handshake_and_keeps_connection_alive() {
     let server = start(None, ConnectionLimits::default()).await;
 
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let ping = brain_protocol::request::PingRequest {
+    let ping = brain_protocol::envelope::request::PingRequest {
         client_timestamp_unix_nanos: 1234,
     };
-    let body = brain_protocol::request::RequestBody::Ping(ping);
+    let body = brain_protocol::envelope::request::RequestBody::Ping(ping);
     let frame = Frame::new(Opcode::Ping.as_u16(), 0, 0, body.encode());
     client.write_all(&frame.encode()).await.expect("send");
     client.flush().await.expect("flush");

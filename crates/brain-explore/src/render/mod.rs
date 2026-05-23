@@ -57,7 +57,7 @@ use crate::util::humanize::humanize_age;
 
 // ─── id formatters shared across renderers ──────────────────────
 
-/// Full `0x` + 32 hex form of a [`brain_protocol::request::WireMemoryId`].
+/// Full `0x` + 32 hex form of a [`brain_protocol::envelope::request::WireMemoryId`].
 /// Used in JSON output where a tool wants the canonical id.
 #[must_use]
 pub fn fmt_id(raw: u128) -> String {
@@ -127,25 +127,25 @@ pub fn fmt_uuid(bytes: &[u8; 16]) -> String {
 }
 
 #[must_use]
-pub fn fmt_kind(k: brain_protocol::request::MemoryKindWire) -> &'static str {
+pub fn fmt_kind(k: brain_protocol::envelope::request::MemoryKindWire) -> &'static str {
     match k {
-        brain_protocol::request::MemoryKindWire::Episodic => "episodic",
-        brain_protocol::request::MemoryKindWire::Semantic => "semantic",
-        brain_protocol::request::MemoryKindWire::Consolidated => "consolidated",
+        brain_protocol::envelope::request::MemoryKindWire::Episodic => "episodic",
+        brain_protocol::envelope::request::MemoryKindWire::Semantic => "semantic",
+        brain_protocol::envelope::request::MemoryKindWire::Consolidated => "consolidated",
     }
 }
 
 #[must_use]
-pub fn fmt_edge_kind(k: brain_protocol::request::EdgeKindWire) -> &'static str {
+pub fn fmt_edge_kind(k: brain_protocol::envelope::request::EdgeKindWire) -> &'static str {
     match k {
-        brain_protocol::request::EdgeKindWire::Caused => "Caused",
-        brain_protocol::request::EdgeKindWire::FollowedBy => "FollowedBy",
-        brain_protocol::request::EdgeKindWire::DerivedFrom => "DerivedFrom",
-        brain_protocol::request::EdgeKindWire::SimilarTo => "SimilarTo",
-        brain_protocol::request::EdgeKindWire::Contradicts => "Contradicts",
-        brain_protocol::request::EdgeKindWire::Supports => "Supports",
-        brain_protocol::request::EdgeKindWire::References => "References",
-        brain_protocol::request::EdgeKindWire::PartOf => "PartOf",
+        brain_protocol::envelope::request::EdgeKindWire::Caused => "Caused",
+        brain_protocol::envelope::request::EdgeKindWire::FollowedBy => "FollowedBy",
+        brain_protocol::envelope::request::EdgeKindWire::DerivedFrom => "DerivedFrom",
+        brain_protocol::envelope::request::EdgeKindWire::SimilarTo => "SimilarTo",
+        brain_protocol::envelope::request::EdgeKindWire::Contradicts => "Contradicts",
+        brain_protocol::envelope::request::EdgeKindWire::Supports => "Supports",
+        brain_protocol::envelope::request::EdgeKindWire::References => "References",
+        brain_protocol::envelope::request::EdgeKindWire::PartOf => "PartOf",
     }
 }
 

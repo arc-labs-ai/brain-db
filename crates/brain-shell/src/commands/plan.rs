@@ -1,6 +1,6 @@
 //! `plan` verb.
 
-use brain_protocol::request::{PlanBudget, PlanState};
+use brain_protocol::envelope::request::{PlanBudget, PlanState};
 use brain_sdk_rust::{Client, ClientError};
 
 use crate::parser::PlanArgs;

@@ -12,9 +12,9 @@
 //! ```
 
 use brain_core::RequestId;
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::{EdgeRequest, EncodeRequest, MemoryKindWire};
-use brain_protocol::response::EncodeResponse;
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::{EdgeRequest, EncodeRequest, MemoryKindWire};
+use brain_protocol::envelope::response::EncodeResponse;
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 
 use crate::client::Client;
@@ -200,7 +200,7 @@ impl<'a> EncodeBuilder<'a> {
 mod tests {
     use super::*;
     use brain_core::MemoryId;
-    use brain_protocol::request::MemoryKindWire;
+    use brain_protocol::envelope::request::MemoryKindWire;
 
     fn response_with_lsn(lsn: u64) -> EncodeResponse {
         EncodeResponse {

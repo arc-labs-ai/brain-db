@@ -185,7 +185,7 @@ fn cycle_writes_link_phase_through_unified_path() {
         // 2. Subscribe bus saw an EdgeAdded envelope with AUTO_DERIVED origin.
         let mut saw_auto_derived_edge = false;
         while let Ok(env) = rx.try_recv() {
-            if env.event_type == brain_protocol::responses::types::EventType::EdgeAdded {
+            if env.event_type == brain_protocol::EventType::EdgeAdded {
                 let ep = env.edge_payload.as_ref().expect("edge payload");
                 if ep.origin == edge_origin::AUTO_DERIVED {
                     saw_auto_derived_edge = true;

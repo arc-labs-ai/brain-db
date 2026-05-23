@@ -68,7 +68,7 @@ impl ErrorCategory {
 /// table.
 ///
 /// Numeric / on-wire encoding for these is owned by the ERROR-frame codec
-/// (see [`crate::responses::types::ErrorCodeWire`]); this enum is the
+/// (see [`crate::shared::enums::ErrorCodeWire`]); this enum is the
 /// in-memory representation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]

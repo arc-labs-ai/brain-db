@@ -8,7 +8,7 @@
 
 use std::io::{self, Write};
 
-use brain_protocol::response::{PlanStatus, PlanStep};
+use brain_protocol::envelope::response::{PlanStatus, PlanStep};
 use comfy_table::{Cell, Row};
 use serde_json::{json, Value};
 
@@ -121,7 +121,7 @@ mod tests {
     use crate::format::OutputFormat;
     use crate::theme::Theme;
     use crate::TermPolicy;
-    use brain_protocol::response::types::TransitionKind;
+    use brain_protocol::shared::enums::TransitionKind;
 
     fn ctx() -> RenderCtx {
         RenderCtx {

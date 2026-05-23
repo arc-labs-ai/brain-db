@@ -6,7 +6,7 @@
 //! only carries one `MemoryId`; batch + filter modes need a wire bump.
 
 use brain_core::{MemoryId, RequestId};
-use brain_protocol::request::{ForgetMode, ForgetRequest};
+use brain_protocol::envelope::request::{ForgetMode, ForgetRequest};
 
 use crate::context::PlannerContext;
 use crate::cost;
@@ -69,7 +69,7 @@ fn validate(req: &ForgetRequest) -> Result<(), PlanError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_protocol::request::ForgetMode;
+    use brain_protocol::envelope::request::ForgetMode;
 
     fn base_request() -> ForgetRequest {
         ForgetRequest {

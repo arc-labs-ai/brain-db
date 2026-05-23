@@ -4,9 +4,9 @@
 //! land post-Phase-10.
 
 use brain_core::{MemoryId, RequestId};
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::{ForgetMode, ForgetRequest};
-use brain_protocol::response::ForgetResponse;
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::{ForgetMode, ForgetRequest};
+use brain_protocol::envelope::response::ForgetResponse;
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 
 use crate::client::Client;

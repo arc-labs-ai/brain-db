@@ -10,10 +10,10 @@
 //! surfaces here.
 
 use brain_protocol::error::{ErrorCategory, ErrorCode, ProtocolError};
-use brain_protocol::request::RequestBody;
-use brain_protocol::response::ResponseBody;
-use brain_protocol::responses::error::{ErrorDetails, ErrorResponse};
-use brain_protocol::responses::types::{ErrorCategoryWire, ErrorCodeWire};
+use brain_protocol::envelope::request::RequestBody;
+use brain_protocol::envelope::response::ResponseBody;
+use brain_protocol::envelope::error::{ErrorDetails, ErrorResponse};
+use brain_protocol::shared::enums::{ErrorCategoryWire, ErrorCodeWire};
 use brain_protocol::Opcode;
 
 fn round_trip_error(body: ErrorResponse) -> ErrorResponse {

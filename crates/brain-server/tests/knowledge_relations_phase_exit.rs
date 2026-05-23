@@ -5,17 +5,17 @@
 
 #![cfg(target_os = "linux")]
 
-use brain_protocol::handshake::{
+use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
-use brain_protocol::requests::statement::EvidenceRefWire;
+use brain_protocol::EvidenceRefWire;
 use brain_protocol::{
     EntityCreateRequest, RelationCreateRequest, RelationListFromRequest, RelationTombstoneRequest,
     RelationTraverseRequest,
 };
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::RequestBody;
-use brain_protocol::response::ResponseBody;
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::RequestBody;
+use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;

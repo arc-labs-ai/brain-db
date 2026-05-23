@@ -84,7 +84,7 @@ use brain_ops::{
     CausalEdgeEnqueue, CausalEdgeMetrics, EventEnvelope, ExtractorEnqueue, ExtractorItemKind,
     ExtractorMetrics, ResolverOutcome, TierKind as MetricTierKind, TierStatus as MetricTierStatus,
 };
-use brain_protocol::responses::types::{
+use brain_protocol::shared::enums::{
     EventType, StageAuditStatus, StageExtractorPayload, StageKind, StageOutcome, StagePayload,
 };
 use futures_lite::FutureExt;

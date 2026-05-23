@@ -4,9 +4,9 @@
 //! 10.6 will add `send_stream()` returning `impl Stream`.
 
 use brain_core::RequestId;
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::{MemoryKindWire, RecallRequest};
-use brain_protocol::response::{MemoryResult, RecallResponseFrame};
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::{MemoryKindWire, RecallRequest};
+use brain_protocol::envelope::response::{MemoryResult, RecallResponseFrame};
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 
 use crate::client::Client;

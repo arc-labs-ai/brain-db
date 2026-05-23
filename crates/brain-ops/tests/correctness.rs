@@ -22,13 +22,13 @@ use brain_metadata::MetadataDb;
 use brain_ops::test_support::run_in_glommio;
 use brain_ops::{dispatch, ErrorCode, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::request::{
+use brain_protocol::envelope::request::{
     EdgeKindWire, EncodeRequest, ForgetMode, ForgetRequest, LinkRequest, MemoryKindWire,
     ObservationInput, PlanBudget, PlanRequest, PlanState, ReasonRequest, RecallRequest,
     RequestBody, SubscribeRequest, SubscriptionFilter, TxnAbortRequest, TxnBeginRequest,
     TxnCommitRequest, UnlinkRequest, UnsubscribeRequest,
 };
-use brain_protocol::response::{
+use brain_protocol::envelope::response::{
     EncodeResponse, ForgetResponse, LinkResponse, PlanResponseFrame, PlanStatus,
     ReasonResponseFrame, RecallResponseFrame, ResponseBody, UnlinkResponse,
 };
@@ -347,7 +347,7 @@ mod common {
 
 mod criterion_01_wire {
     use super::*;
-    use brain_protocol::opcode::Opcode;
+    use brain_protocol::codec::opcode::Opcode;
 
     /// Round-trip every `RequestBody` variant a 7.x handler accepts.
     /// brain-protocol owns the exhaustive fuzz/CRC suite; here we
@@ -611,7 +611,7 @@ mod criterion_04_plan {
 
 mod criterion_05_reason {
     use super::*;
-    use brain_protocol::response::ReasonStatus;
+    use brain_protocol::envelope::response::ReasonStatus;
 
     #[test]
     fn reason_traverses_supports_and_terminates_on_cycle() {
@@ -1173,7 +1173,7 @@ mod criterion_17_error_codes {
                     filter: SubscriptionFilter {
                         contexts: None,
                         kinds: None,
-                        similar_to: Some(brain_protocol::request::SimilarityFilter {
+                        similar_to: Some(brain_protocol::envelope::request::SimilarityFilter {
                             reference_memory_id: 1,
                             threshold: 0.5,
                         }),

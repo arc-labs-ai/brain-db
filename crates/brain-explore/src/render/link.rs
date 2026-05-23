@@ -2,7 +2,7 @@
 
 use std::io::{self, Write};
 
-use brain_protocol::response::{LinkResponse, UnlinkResponse};
+use brain_protocol::envelope::response::{LinkResponse, UnlinkResponse};
 use serde_json::{json, Value};
 
 use crate::render::{fmt_edge_kind, fmt_id};
@@ -78,7 +78,7 @@ mod tests {
     use crate::format::OutputFormat;
     use crate::theme::Theme;
     use crate::TermPolicy;
-    use brain_protocol::request::EdgeKindWire;
+    use brain_protocol::envelope::request::EdgeKindWire;
 
     fn ctx() -> RenderCtx {
         RenderCtx {

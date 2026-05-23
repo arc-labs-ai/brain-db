@@ -6,15 +6,15 @@
 
 mod common;
 
-use brain_protocol::requests::statement::EvidenceRefWire;
+use brain_protocol::EvidenceRefWire;
 use brain_protocol::{
     RelationCreateResponse, RelationGetResponse, RelationListFromResponseFrame,
     RelationListToResponseFrame, RelationSupersedeResponse, RelationTombstoneResponse,
     RelationTraverseResponseFrame, RelationView, TraversalPathWire, TraversalStepWire,
 };
-use brain_protocol::opcode::Opcode;
-use brain_protocol::responses::error::ErrorResponse;
-use brain_protocol::responses::types::{ErrorCategoryWire, ErrorCodeWire};
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::ErrorResponse;
+use brain_protocol::shared::enums::{ErrorCategoryWire, ErrorCodeWire};
 use brain_protocol::{RequestBody, ResponseBody};
 use brain_sdk_rust::models::errors::{ClientErrorRelationExt, RelationErrorKind};
 use brain_sdk_rust::{Client, EntityId, RelationId, TraverseDirection};

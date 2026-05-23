@@ -1,9 +1,9 @@
 //! LINK op.
 
 use brain_core::{MemoryId, RequestId};
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::{EdgeKindWire, LinkRequest};
-use brain_protocol::response::LinkResponse;
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::{EdgeKindWire, LinkRequest};
+use brain_protocol::envelope::response::LinkResponse;
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 
 use crate::client::Client;

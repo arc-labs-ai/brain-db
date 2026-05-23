@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
-use brain_protocol::handshake::{AuthMethod, ServerCapabilities};
+use brain_protocol::connection::handshake::{AuthMethod, ServerCapabilities};
 use tempfile::TempDir;
 
 use crate::admin::{AdminServer, AdminState};

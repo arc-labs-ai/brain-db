@@ -10,8 +10,8 @@
 use std::io::Cursor;
 
 use brain_explore::{dispatch, EncodeRendered, OutputFormat, RenderCtx, TermPolicy, Theme};
-use brain_protocol::request::MemoryKindWire;
-use brain_protocol::response::EncodeResponse;
+use brain_protocol::envelope::request::MemoryKindWire;
+use brain_protocol::envelope::response::EncodeResponse;
 
 /// Minimal renderable response. Helpers below override individual
 /// fields per scenario so the tests stay focused on one variable

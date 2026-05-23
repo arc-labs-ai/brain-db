@@ -19,12 +19,12 @@ use std::net::TcpStream as StdTcpStream;
 use std::time::Duration;
 
 use brain_core::MemoryId;
-use brain_protocol::handshake::{
+use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::{EncodeRequest, MemoryKindWire, RequestBody};
-use brain_protocol::response::ResponseBody;
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::{EncodeRequest, MemoryKindWire, RequestBody};
+use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

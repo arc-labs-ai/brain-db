@@ -26,7 +26,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use brain_protocol::request::RequestBody;
+use brain_protocol::envelope::request::RequestBody;
 
 use super::counter::Counter;
 use super::gauge::Gauge;

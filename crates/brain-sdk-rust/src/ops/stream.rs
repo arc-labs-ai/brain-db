@@ -16,7 +16,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use brain_protocol::opcode::Opcode;
+use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::{Frame, ProtocolError};
 use futures_lite::stream::Stream;
 

@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use brain_core::{EdgeKind, EdgeKindRef, MemoryId, NodeRef, RequestId};
 use brain_planner::{LinkOp, UnlinkOp, WriterError};
-use brain_protocol::request::{EdgeKindWire, LinkRequest, UnlinkRequest};
-use brain_protocol::response::{LinkResponse, UnlinkResponse};
+use brain_protocol::envelope::request::{EdgeKindWire, LinkRequest, UnlinkRequest};
+use brain_protocol::envelope::response::{LinkResponse, UnlinkResponse};
 
 use crate::context::OpsContext;
 use crate::error::OpError;

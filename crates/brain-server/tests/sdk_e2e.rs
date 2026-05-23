@@ -45,7 +45,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use brain_core::MemoryId;
-use brain_protocol::request::ForgetMode;
+use brain_protocol::envelope::request::ForgetMode;
 use brain_sdk_rust::Client;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;

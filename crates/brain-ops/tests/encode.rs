@@ -16,10 +16,10 @@ use brain_metadata::MetadataDb;
 use brain_ops::test_support::run_in_glommio;
 use brain_ops::{dispatch, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::request::{
+use brain_protocol::envelope::request::{
     EdgeKindWire, EdgeRequest, EncodeRequest, MemoryKindWire, RequestBody,
 };
-use brain_protocol::response::{EncodeResponse, ResponseBody};
+use brain_protocol::envelope::response::{EncodeResponse, ResponseBody};
 use parking_lot::Mutex;
 
 // ---------------------------------------------------------------------------
@@ -455,9 +455,9 @@ fn dedup_after_forget_evicts_and_misses() {
         assert!(!first.was_deduplicated);
 
         // Forget the dedup-indexed memory.
-        let forget = brain_protocol::request::ForgetRequest {
+        let forget = brain_protocol::envelope::request::ForgetRequest {
             memory_id: first.memory_id,
-            mode: brain_protocol::request::ForgetMode::Soft,
+            mode: brain_protocol::envelope::request::ForgetMode::Soft,
             request_id: [0xAA; 16],
             txn_id: None,
         };

@@ -19,7 +19,7 @@ use std::io::{self, Write};
 use brain_explore::{
     dispatch, Render, RenderCtx, SubscriptionEventList, SubscriptionEventRendered,
 };
-use brain_protocol::response::SubscriptionEvent;
+use brain_protocol::envelope::response::SubscriptionEvent;
 use brain_sdk_rust::{Client, ClientError};
 use futures_lite::StreamExt;
 use serde_json::Value;

@@ -28,12 +28,12 @@ use brain_ops::{
     SubscriptionRegistry,
 };
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::request::{
+use brain_protocol::envelope::request::{
     EncodeRequest, ForgetMode, ForgetRequest, MemoryKindWire, RequestBody, SimilarityFilter,
     SubscribeRequest, SubscriptionFilter, TxnAbortRequest, TxnBeginRequest, TxnCommitRequest,
     UnsubscribeRequest,
 };
-use brain_protocol::response::{EventType, ResponseBody, SubscriptionEvent};
+use brain_protocol::envelope::response::{EventType, ResponseBody, SubscriptionEvent};
 use futures_lite::FutureExt;
 use parking_lot::Mutex;
 use tokio::sync::broadcast;

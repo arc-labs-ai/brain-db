@@ -37,7 +37,7 @@ use brain_protocol::{
     EntityMergeRequest, EntityRenameRequest, EntityResolveRequest, EntityTombstoneRequest,
     EntityUnmergeRequest, EntityUpdateRequest, ResolutionOutcomeWire,
 };
-use brain_protocol::opcode::Opcode;
+use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 
 use crate::client::Client;

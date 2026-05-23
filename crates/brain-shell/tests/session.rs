@@ -89,7 +89,7 @@ fn effective_context_inherits_sticky() {
 
 #[test]
 fn is_txn_terminal_matches_txn_not_found_and_transaction_timeout() {
-    use brain_protocol::responses::types::ErrorCodeWire;
+    use brain_protocol::ErrorCodeWire;
     use brain_sdk_rust::ClientError;
     use brain_shell::commands::is_txn_terminal;
 
@@ -108,7 +108,7 @@ fn is_txn_terminal_matches_txn_not_found_and_transaction_timeout() {
 
 #[test]
 fn is_txn_terminal_ignores_other_codes() {
-    use brain_protocol::responses::types::ErrorCodeWire;
+    use brain_protocol::ErrorCodeWire;
     use brain_sdk_rust::ClientError;
     use brain_shell::commands::is_txn_terminal;
 

@@ -203,7 +203,7 @@ fn cycle_writes_followed_by_link_through_unified_path() {
         // 2. Bus saw the EdgeAdded(AUTO_DERIVED) envelope for the FollowedBy.
         let mut saw_followed_by_auto_derived = false;
         while let Ok(env) = rx.try_recv() {
-            if env.event_type == brain_protocol::responses::types::EventType::EdgeAdded {
+            if env.event_type == brain_protocol::EventType::EdgeAdded {
                 let ep = env.edge_payload.as_ref().expect("edge payload");
                 if ep.origin == edge_origin::AUTO_DERIVED {
                     saw_followed_by_auto_derived = true;

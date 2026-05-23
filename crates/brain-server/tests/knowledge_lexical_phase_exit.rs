@@ -17,14 +17,14 @@ use brain_index::{
     IndexStatus, LexicalQuery, LexicalRetriever, LexicalRetrieverConfig, LexicalScope,
     RankedItemId, TantivyLexicalRetriever, TantivyShard,
 };
-use brain_protocol::handshake::{
+use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::{
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::{
     EncodeRequest, ForgetMode, ForgetRequest, MemoryKindWire, RequestBody,
 };
-use brain_protocol::response::ResponseBody;
+use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
 use brain_storage::ShardPaths;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

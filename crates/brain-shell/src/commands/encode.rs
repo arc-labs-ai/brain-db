@@ -17,7 +17,7 @@ use std::io::Read;
 use std::time::Duration;
 
 use brain_core::{MemoryId, RequestId};
-use brain_protocol::responses::types::EventType;
+use brain_protocol::EventType;
 use brain_sdk_rust::{Client, ClientError};
 use futures_lite::StreamExt;
 use uuid::Uuid;
@@ -123,7 +123,7 @@ pub async fn run(
         // in the card, making clear the flag was a no-op (no
         // workers wired, dedup hit, or no schema declared so the
         // extractor lane never fired).
-        let stages: Vec<brain_protocol::responses::StageKind> = resp.pending_stages.to_vec();
+        let stages: Vec<brain_protocol::StageKind> = resp.pending_stages.to_vec();
         Some(
             wait_for_stages(
                 pre_subscribe_stream,
@@ -362,13 +362,13 @@ const WAIT_STAGES_TIMEOUT_SECS: u64 = 10;
 /// with a zero-result delta so the caller still renders a stages
 /// section (making clear the flag was a no-op for this write).
 async fn wait_for_stages(
-    pre_stream: Option<brain_sdk_rust::FrameStream<brain_protocol::response::SubscriptionEvent>>,
+    pre_stream: Option<brain_sdk_rust::FrameStream<brain_protocol::envelope::response::SubscriptionEvent>>,
     memory_id: MemoryId,
-    pending_stages: &[brain_protocol::responses::StageKind],
+    pending_stages: &[brain_protocol::StageKind],
     _start_lsn: u64,
 ) -> Result<brain_explore::StageResultsDelta, ClientError> {
     use brain_explore::{StageOutcomeLabel, StageResult, StageResultsDelta};
-    use brain_protocol::responses::{StageKind, StageOutcome};
+    use brain_protocol::{StageKind, StageOutcome};
 
     let started = std::time::Instant::now();
     if pending_stages.is_empty() {
@@ -453,9 +453,9 @@ async fn wait_for_stages(
     })
 }
 
-fn wire_to_label(k: brain_protocol::responses::StageKind) -> brain_explore::StageKindLabel {
+fn wire_to_label(k: brain_protocol::StageKind) -> brain_explore::StageKindLabel {
     use brain_explore::StageKindLabel;
-    use brain_protocol::responses::StageKind;
+    use brain_protocol::StageKind;
     match k {
         StageKind::AutoEdge => StageKindLabel::AutoEdge,
         StageKind::TemporalEdge => StageKindLabel::TemporalEdge,
@@ -468,12 +468,12 @@ fn wire_to_label(k: brain_protocol::responses::StageKind) -> brain_explore::Stag
 /// extractor; edges written for edge stages); falls back to a
 /// generic phrase when the payload is missing.
 fn summarize_stage_payload(
-    kind: brain_protocol::responses::StageKind,
-    payload: Option<&brain_protocol::responses::StagePayload>,
+    kind: brain_protocol::StageKind,
+    payload: Option<&brain_protocol::StagePayload>,
     outcome: brain_explore::StageOutcomeLabel,
 ) -> String {
     use brain_explore::StageOutcomeLabel;
-    use brain_protocol::responses::{StageAuditStatus, StagePayload};
+    use brain_protocol::{StageAuditStatus, StagePayload};
     match (kind, payload) {
         (_, Some(StagePayload::AutoEdge(p))) => {
             if p.edges_written == 0 {
@@ -519,8 +519,8 @@ fn summarize_stage_payload(
     }
 }
 
-fn stage_kind_word(k: brain_protocol::responses::StageKind) -> &'static str {
-    use brain_protocol::responses::StageKind;
+fn stage_kind_word(k: brain_protocol::StageKind) -> &'static str {
+    use brain_protocol::StageKind;
     match k {
         StageKind::AutoEdge => "auto_edge",
         StageKind::TemporalEdge => "temporal_edge",

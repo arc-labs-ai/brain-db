@@ -40,7 +40,7 @@ use brain_metadata::MetadataDb;
 use brain_ops::test_support::run_in_glommio;
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::request::{EncodeRequest, MemoryKindWire, RecallRequest, TxnBeginRequest};
+use brain_protocol::envelope::request::{EncodeRequest, MemoryKindWire, RecallRequest, TxnBeginRequest};
 use parking_lot::Mutex;
 
 const ITERATIONS: usize = 100;
@@ -182,8 +182,8 @@ fn attach_hybrid_mocks(fix: &mut Fixture, memory_id: u128) {
 }
 
 async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str) -> u128 {
-    use brain_protocol::request::RequestBody;
-    use brain_protocol::response::{EncodeResponse, ResponseBody};
+    use brain_protocol::envelope::request::RequestBody;
+    use brain_protocol::envelope::response::{EncodeResponse, ResponseBody};
 
     let req = EncodeRequest {
         text: text.into(),

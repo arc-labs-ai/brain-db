@@ -7,10 +7,10 @@
 
 use std::io::{self, Write};
 
-use brain_protocol::response::types::{
+use brain_protocol::shared::enums::{
     EventType, StageAuditStatus, StageExtractorPayload, StageKind, StagePayload,
 };
-use brain_protocol::response::SubscriptionEvent;
+use brain_protocol::envelope::response::SubscriptionEvent;
 use comfy_table::Cell;
 use serde_json::{json, Value};
 
@@ -208,8 +208,8 @@ mod tests {
     use crate::theme::Theme;
     use crate::TermPolicy;
     use brain_core::MemoryId;
-    use brain_protocol::request::MemoryKindWire;
-    use brain_protocol::response::types::EventType;
+    use brain_protocol::envelope::request::MemoryKindWire;
+    use brain_protocol::shared::enums::EventType;
 
     fn ctx() -> RenderCtx {
         RenderCtx {
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn stage_completed_extractor_renders_counts_and_status() {
-        use brain_protocol::response::types::{
+        use brain_protocol::shared::enums::{
             StageAuditStatus, StageExtractorPayload, StageKind, StageOutcome, StagePayload,
         };
 

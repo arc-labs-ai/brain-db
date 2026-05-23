@@ -28,9 +28,9 @@ use brain_planner::hybrid::router::{
     QueryRequest as PlannerQueryRequest, Retriever, RetrieverSelection,
 };
 use brain_planner::{execute_recall, plan_recall_inner, RecallHit};
-use brain_protocol::request::{MemoryKindWire, RecallRequest};
-use brain_protocol::response::{MemoryResult, RecallResponseFrame};
-use brain_protocol::responses::types::RetrieverNameWire;
+use brain_protocol::envelope::request::{MemoryKindWire, RecallRequest};
+use brain_protocol::envelope::response::{MemoryResult, RecallResponseFrame};
+use brain_protocol::RetrieverNameWire;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
@@ -207,7 +207,7 @@ fn merge_with_txn(
             continue;
         }
         if let Some(kinds) = &kind_filter {
-            let wire_kind = brain_protocol::request::MemoryKindWire::from(pending.kind);
+            let wire_kind = brain_protocol::envelope::request::MemoryKindWire::from(pending.kind);
             if !kinds.contains(&wire_kind) {
                 continue;
             }
@@ -265,7 +265,7 @@ fn merge_with_txn(
 fn fetch_outgoing_edges_for(
     hits: &[brain_planner::RecallHit],
     ctx: &OpsContext,
-) -> Result<Vec<Vec<brain_protocol::response::EdgeView>>, OpError> {
+) -> Result<Vec<Vec<brain_protocol::envelope::response::EdgeView>>, OpError> {
     use brain_core::NodeRef;
     use brain_metadata::tables::edge::walk_outgoing;
 
@@ -273,12 +273,12 @@ fn fetch_outgoing_edges_for(
     let rtxn = db_guard.read_txn().map_err(|e| {
         OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
     })?;
-    let mut out: Vec<Vec<brain_protocol::response::EdgeView>> = Vec::with_capacity(hits.len());
+    let mut out: Vec<Vec<brain_protocol::envelope::response::EdgeView>> = Vec::with_capacity(hits.len());
     for hit in hits {
         let rows = walk_outgoing(&rtxn, NodeRef::Memory(hit.memory_id), None).map_err(|e| {
             OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
         })?;
-        let edges: Vec<brain_protocol::response::EdgeView> = rows
+        let edges: Vec<brain_protocol::envelope::response::EdgeView> = rows
             .into_iter()
             .filter_map(|(kind, to, _disamb, data)| {
                 // Only builtin substrate edges (Caused / FollowedBy /
@@ -293,7 +293,7 @@ fn fetch_outgoing_edges_for(
                     NodeRef::Memory(mid) => mid,
                     _ => return None,
                 };
-                Some(brain_protocol::response::EdgeView {
+                Some(brain_protocol::envelope::response::EdgeView {
                     target: target.into(),
                     kind: builtin.into(),
                     weight: data.weight,
@@ -323,7 +323,7 @@ fn fetch_outgoing_edges_for(
 fn fetch_enrichment_for(
     memory_ids: &[MemoryId],
     rtxn: &redb::ReadTransaction,
-) -> Result<Vec<Option<brain_protocol::response::GraphEnrichment>>, OpError> {
+) -> Result<Vec<Option<brain_protocol::envelope::response::GraphEnrichment>>, OpError> {
     use brain_core::{EntityId, StatementId, SubjectRef};
     use brain_core::{EdgeKindRef, NodeRef};
     use brain_metadata::entity::ops::entity_get;
@@ -333,7 +333,7 @@ fn fetch_enrichment_for(
     use brain_metadata::tables::edge::{walk_incoming, walk_outgoing};
     use brain_metadata::tables::entity_type::ENTITY_TYPES_TABLE;
     use brain_metadata::tables::statement::STATEMENTS_BY_EVIDENCE_TABLE;
-    use brain_protocol::response::{
+    use brain_protocol::envelope::response::{
         EnrichedEntity, EnrichedRelation, EnrichedStatement, GraphEnrichment,
     };
 
@@ -551,8 +551,8 @@ fn cosine(a: &[f32; brain_embed::VECTOR_DIM], b: &[f32; brain_embed::VECTOR_DIM]
 
 fn hit_to_wire(
     hit: RecallHit,
-    edges: Option<Vec<brain_protocol::response::EdgeView>>,
-    graph: Option<brain_protocol::response::GraphEnrichment>,
+    edges: Option<Vec<brain_protocol::envelope::response::EdgeView>>,
+    graph: Option<brain_protocol::envelope::response::GraphEnrichment>,
 ) -> MemoryResult {
     MemoryResult {
         memory_id: hit.memory_id.into(),
@@ -701,7 +701,7 @@ fn project_memory_results(
     // The hybrid path holds metadata_guard for the whole loop, so the
     // helper takes the existing rtxn (no double-lock).
     let graph_per_memory: Option<
-        std::collections::HashMap<MemoryId, brain_protocol::response::GraphEnrichment>,
+        std::collections::HashMap<MemoryId, brain_protocol::envelope::response::GraphEnrichment>,
     > = if req.include_graph {
         let ids: Vec<MemoryId> = result
             .items
@@ -824,7 +824,7 @@ fn project_memory_results(
                             NodeRef::Memory(mid) => mid,
                             _ => return None,
                         };
-                        Some(brain_protocol::response::EdgeView {
+                        Some(brain_protocol::envelope::response::EdgeView {
                             target: target.into(),
                             kind: builtin.into(),
                             weight: data.weight,

@@ -10,8 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use brain_core::{ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience};
 use brain_metadata::tables::memory::MemoryMetadata;
 use brain_planner::{plan_encode_inner, EdgeOutcome};
-use brain_protocol::request::EncodeRequest;
-use brain_protocol::response::EncodeResponse;
+use brain_protocol::envelope::request::EncodeRequest;
+use brain_protocol::envelope::response::EncodeResponse;
 
 use crate::context::OpsContext;
 use crate::error::OpError;

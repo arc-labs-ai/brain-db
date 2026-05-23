@@ -29,7 +29,7 @@ use brain_metadata::{
     api_key_create, api_key_list_for_agent, api_key_lookup_by_secret, api_key_revoke, ApiKeyDb,
     ApiKeyError,
 };
-use brain_protocol::handshake::{AgentPermissions, AuthCredentials, AuthMethod, AuthPayload};
+use brain_protocol::connection::handshake::{AgentPermissions, AuthCredentials, AuthMethod, AuthPayload};
 use parking_lot::RwLock;
 use tracing::{debug, warn};
 

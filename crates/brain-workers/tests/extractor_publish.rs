@@ -28,7 +28,7 @@ use brain_metadata::tables::extractor_audit::{
 use brain_metadata::MetadataDb;
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::responses::types::{
+use brain_protocol::shared::enums::{
     EventType, StageAuditStatus, StageKind, StageOutcome, StagePayload,
 };
 use brain_workers::{ExtractorWorker, Worker, WorkerContext};

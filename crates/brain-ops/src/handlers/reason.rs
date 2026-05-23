@@ -6,8 +6,8 @@
 //! is Phase 9 server work.
 
 use brain_planner::{execute_reason, plan_reason_inner, ReasonResult, ReasonStatus};
-use brain_protocol::request::{ObservationInput, ReasonRequest};
-use brain_protocol::response::{
+use brain_protocol::envelope::request::{ObservationInput, ReasonRequest};
+use brain_protocol::envelope::response::{
     InferenceKind, InferenceStep, ReasonResponseFrame, ReasonStatus as WireReasonStatus,
 };
 

@@ -26,7 +26,7 @@
 use std::sync::Arc;
 
 use brain_http::body::ResponseBody;
-use brain_protocol::requests::admin::BackfillSelector;
+use brain_protocol::BackfillSelector;
 use http::{Request, Response, StatusCode};
 use hyper::body::Incoming;
 use tracing::warn;

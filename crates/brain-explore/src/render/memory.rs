@@ -7,7 +7,7 @@
 
 use std::io::{self, Write};
 
-use brain_protocol::response::MemoryResult;
+use brain_protocol::envelope::response::MemoryResult;
 use serde_json::{json, Value};
 
 use crate::render::{fmt_hex_16, fmt_id, fmt_kind, fmt_short_id};
@@ -251,7 +251,7 @@ mod tests {
     use crate::theme::Theme;
     use crate::TermPolicy;
     use brain_core::MemoryId;
-    use brain_protocol::request::MemoryKindWire;
+    use brain_protocol::envelope::request::MemoryKindWire;
 
     fn make_hit(text: &str, score: f32) -> MemoryResult {
         MemoryResult {
@@ -353,7 +353,7 @@ mod tests {
         // Non-empty contributing_retrievers → retrievers=N column.
         // A single-retriever hit (count=1) is the signal that a row
         // only matched one of the routed retrievers.
-        use brain_protocol::responses::types::RetrieverNameWire;
+        use brain_protocol::RetrieverNameWire;
         let mut hit = make_hit("hybrid hit", 0.9);
         hit.contributing_retrievers = vec![RetrieverNameWire::Semantic];
         let r = RecallResults(vec![hit]);

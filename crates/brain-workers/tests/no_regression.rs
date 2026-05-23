@@ -17,8 +17,8 @@ use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
 use brain_ops::{dispatch, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::request::{EncodeRequest, MemoryKindWire, RecallRequest, RequestBody};
-use brain_protocol::response::ResponseBody;
+use brain_protocol::envelope::request::{EncodeRequest, MemoryKindWire, RecallRequest, RequestBody};
+use brain_protocol::envelope::response::ResponseBody;
 use brain_workers::{
     AccessBoostWorker, CacheEvictionWorker, ConsolidationWorker, CounterReconcileWorker,
     DecayWorker, DisabledCacheEvictionSource, DisabledRebuildSource, DisabledSnapshotSource,

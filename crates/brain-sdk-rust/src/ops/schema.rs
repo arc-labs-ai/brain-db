@@ -23,8 +23,8 @@ use brain_protocol::{
     SchemaListResponseFrame, SchemaUploadRequest, SchemaUploadResponse, SchemaValidateRequest,
     SchemaValidateResponse, SchemaValidationErrorWire,
 };
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::WireUuid;
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::WireUuid;
 use brain_protocol::schema::{
     AttrType, AttributeDecl, CacheConfig, CardinalityAst, ConditionExpr, ConditionOp,
     ConditionValue, CostUnit, DurationUnit, EntityTypeDef, ExtractorDef, ExtractorField,

@@ -22,7 +22,7 @@ use brain_core::{EdgeKind, MemoryId};
 use brain_metadata::tables::edge::{list_memory_edges_from, list_memory_edges_to};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
-use brain_protocol::request::PlanState;
+use brain_protocol::envelope::request::PlanState;
 
 use crate::plan::path::PathPlan;
 

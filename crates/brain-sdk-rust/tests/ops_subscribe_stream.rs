@@ -6,9 +6,9 @@
 
 mod common;
 
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::MemoryKindWire;
-use brain_protocol::response::{EventType, SubscriptionEvent};
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::MemoryKindWire;
+use brain_protocol::envelope::response::{EventType, SubscriptionEvent};
 use brain_protocol::{RequestBody, ResponseBody};
 use brain_sdk_rust::Client;
 use futures_lite::StreamExt;

@@ -10,7 +10,7 @@
 //! `WriteIdempotencyCache` compares hashes on lookup.
 
 use brain_planner::{EncodeOp, ForgetOp, LinkOp, UnlinkOp};
-use brain_protocol::request::ForgetMode;
+use brain_protocol::envelope::request::ForgetMode;
 
 /// BLAKE3 over the canonical encode-request fields. Excludes
 /// `request_id` (the table key) —.

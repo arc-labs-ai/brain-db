@@ -5,6 +5,7 @@
 //! - 19.4 — Static validator (next).
 
 pub mod ast;
+pub mod ops;
 pub mod parse_error;
 pub mod parser;
 pub mod validator;

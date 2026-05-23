@@ -27,7 +27,7 @@
 
 use std::io::{self, Write};
 
-use brain_protocol::response::EncodeResponse;
+use brain_protocol::envelope::response::EncodeResponse;
 use serde_json::{json, Value};
 
 use crate::render::{
@@ -105,7 +105,7 @@ pub struct StageResult {
     pub summary: String,
 }
 
-/// Stage discriminator. Mirrors `brain_protocol::responses::StageKind`
+/// Stage discriminator. Mirrors `brain_protocol::StageKind`
 /// but kept as a free enum here so the brain-explore crate doesn't
 /// re-export the protocol's wire type into its public surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -637,7 +637,7 @@ fn augment_extractor_summary(
 fn write_stages_row(
     w: &mut dyn Write,
     ctx: &RenderCtx,
-    pending: &[brain_protocol::responses::StageKind],
+    pending: &[brain_protocol::StageKind],
 ) -> io::Result<()> {
     let theme = &ctx.theme;
     let policy = ctx.policy;
@@ -653,9 +653,9 @@ fn write_stages_row(
         let names: Vec<&'static str> = pending
             .iter()
             .map(|s| match s {
-                brain_protocol::responses::StageKind::AutoEdge => "auto_edge",
-                brain_protocol::responses::StageKind::TemporalEdge => "temporal_edge",
-                brain_protocol::responses::StageKind::Extractor => "extractor",
+                brain_protocol::StageKind::AutoEdge => "auto_edge",
+                brain_protocol::StageKind::TemporalEdge => "temporal_edge",
+                brain_protocol::StageKind::Extractor => "extractor",
             })
             .collect();
         let joined = names.join(" · ");
@@ -720,11 +720,11 @@ fn write_type_row(w: &mut dyn Write, ctx: &RenderCtx, r: &EncodeResponse) -> io:
 }
 
 /// Wire variant → canonical lower-case string used in the table view.
-fn kind_label(k: brain_protocol::request::MemoryKindWire) -> &'static str {
+fn kind_label(k: brain_protocol::envelope::request::MemoryKindWire) -> &'static str {
     match k {
-        brain_protocol::request::MemoryKindWire::Episodic => "episodic",
-        brain_protocol::request::MemoryKindWire::Semantic => "semantic",
-        brain_protocol::request::MemoryKindWire::Consolidated => "consolidated",
+        brain_protocol::envelope::request::MemoryKindWire::Episodic => "episodic",
+        brain_protocol::envelope::request::MemoryKindWire::Semantic => "semantic",
+        brain_protocol::envelope::request::MemoryKindWire::Consolidated => "consolidated",
     }
 }
 
@@ -735,7 +735,7 @@ mod tests {
     use crate::theme::Theme;
     use crate::TermPolicy;
     use brain_core::MemoryId;
-    use brain_protocol::request::MemoryKindWire;
+    use brain_protocol::envelope::request::MemoryKindWire;
 
     /// Build a baseline rendered encode. Tests override the fields
     /// they care about so a new field never silently bypasses
@@ -1376,7 +1376,7 @@ mod tests {
     // name plus a `(N pending)` count suffix.
     #[test]
     fn render_stages_row_lists_pending_stages() {
-        use brain_protocol::responses::StageKind;
+        use brain_protocol::StageKind;
         let mut r = sample();
         r.response.pending_stages = vec![
             StageKind::AutoEdge,

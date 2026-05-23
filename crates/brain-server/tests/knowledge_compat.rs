@@ -83,7 +83,7 @@ use brain_metadata::tables::statement::{
     STATEMENTS_TABLE, STATEMENT_CHAIN_TABLE,
 };
 use brain_metadata::LlmCacheDb;
-use brain_protocol::request::ForgetMode;
+use brain_protocol::envelope::request::ForgetMode;
 use brain_sdk_rust::Client;
 use brain_storage::ShardPaths;
 use redb::ReadableDatabase;

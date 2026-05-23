@@ -28,7 +28,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use brain_core::{ContextId, MemoryId, MemoryKind, NodeRef};
 use brain_planner::WriterError;
-use brain_protocol::responses::types::EventType;
+use brain_protocol::EventType;
 use brain_storage::wal::payload::WalPayload;
 use brain_storage::wal::record::{Lsn, WalRecord};
 
@@ -394,7 +394,7 @@ impl RealWriterHandle {
                 if super::try_enqueue_auto_edge(self, *id, vector.as_ref()) {
                     pending_stages.push(crate::write::PendingStage {
                         memory_id: *id,
-                        stage_kind: brain_protocol::responses::StageKind::AutoEdge,
+                        stage_kind: brain_protocol::StageKind::AutoEdge,
                     });
                 }
                 if super::try_enqueue_temporal_edge(
@@ -407,7 +407,7 @@ impl RealWriterHandle {
                 ) {
                     pending_stages.push(crate::write::PendingStage {
                         memory_id: *id,
-                        stage_kind: brain_protocol::responses::StageKind::TemporalEdge,
+                        stage_kind: brain_protocol::StageKind::TemporalEdge,
                     });
                 }
                 let extractor_enqueued = super::try_enqueue_extractor(self, *id, text);
@@ -420,7 +420,7 @@ impl RealWriterHandle {
                 if extractor_enqueued {
                     pending_stages.push(crate::write::PendingStage {
                         memory_id: *id,
-                        stage_kind: brain_protocol::responses::StageKind::Extractor,
+                        stage_kind: brain_protocol::StageKind::Extractor,
                     });
                 }
             }

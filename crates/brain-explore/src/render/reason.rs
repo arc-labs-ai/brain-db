@@ -2,7 +2,7 @@
 
 use std::io::{self, Write};
 
-use brain_protocol::response::InferenceStep;
+use brain_protocol::envelope::response::InferenceStep;
 use comfy_table::Cell;
 use serde_json::{json, Value};
 
@@ -65,7 +65,7 @@ mod tests {
     use crate::format::OutputFormat;
     use crate::theme::Theme;
     use crate::TermPolicy;
-    use brain_protocol::response::types::InferenceKind;
+    use brain_protocol::shared::enums::InferenceKind;
 
     fn ctx() -> RenderCtx {
         RenderCtx {

@@ -105,9 +105,9 @@ impl SubscriptionMetrics {
 use brain_core::{MemoryId, ShardId};
 use brain_ops::{parse_filter, EventEnvelope, ParsedFilter};
 use brain_protocol::error::ErrorCode;
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::{CancelStreamRequest, SubscribeRequest, UnsubscribeRequest};
-use brain_protocol::response::{
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::{CancelStreamRequest, SubscribeRequest, UnsubscribeRequest};
+use brain_protocol::envelope::response::{
     CancelStreamAck, ErrorCategoryWire, ErrorCodeWire, ErrorResponse, ResponseBody,
     SubscriptionEvent, UnsubscribeResponse,
 };
@@ -679,11 +679,11 @@ fn empty_subscription_event_frame(stream_id: u32, last_lsn: u64) -> Frame {
     // Terminal EOS frame for a cancelled / lagged subscription. The
     // body carries the last-delivered LSN so the client can resume.
     let payload = ResponseBody::SubscribeEvent(SubscriptionEvent {
-        event_type: brain_protocol::response::EventType::Forgotten,
+        event_type: brain_protocol::envelope::response::EventType::Forgotten,
         memory_id: MemoryId::NULL.raw(),
         context_id: 0,
         text: String::new(),
-        kind: brain_protocol::request::MemoryKindWire::Episodic,
+        kind: brain_protocol::envelope::request::MemoryKindWire::Episodic,
         salience: 0.0,
         timestamp_unix_nanos: 0,
         lsn: last_lsn,

@@ -2,7 +2,7 @@
 
 use std::io::{self, Write};
 
-use brain_protocol::response::ForgetResponse;
+use brain_protocol::envelope::response::ForgetResponse;
 use serde_json::{json, Value};
 
 use crate::render::fmt_id;

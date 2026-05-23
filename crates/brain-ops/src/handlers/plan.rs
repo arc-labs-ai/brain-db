@@ -7,8 +7,8 @@
 
 use brain_core::EdgeKind;
 use brain_planner::{execute_path, plan_path_inner, Path, PlanStatus};
-use brain_protocol::request::PlanRequest;
-use brain_protocol::response::{
+use brain_protocol::envelope::request::PlanRequest;
+use brain_protocol::envelope::response::{
     PlanResponseFrame, PlanStatus as WirePlanStatus, PlanStep, TransitionKind,
 };
 

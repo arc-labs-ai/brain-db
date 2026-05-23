@@ -15,12 +15,12 @@ use brain_metadata::pipeline_has_extracted;
 use brain_metadata::tables::edge::{EdgeKey, EDGES_TABLE};
 use brain_metadata::tables::entity::ENTITIES_TABLE;
 use brain_metadata::MetadataDb;
-use brain_protocol::handshake::{
+use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::{EncodeRequest, MemoryKindWire, RequestBody};
-use brain_protocol::response::ResponseBody;
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::{EncodeRequest, MemoryKindWire, RequestBody};
+use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
 use redb::ReadableTable;
 use tempfile::TempDir;

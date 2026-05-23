@@ -11,7 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use brain_core::{ContextId, EdgeKind, MemoryId, MemoryKind, RequestId};
-use brain_protocol::request::ForgetMode;
+use brain_protocol::envelope::request::ForgetMode;
 use thiserror::Error;
 
 /// Per-shard write surface.

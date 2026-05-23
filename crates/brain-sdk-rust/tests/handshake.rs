@@ -15,10 +15,10 @@
 use std::net::SocketAddr;
 
 use brain_core::AgentId;
-use brain_protocol::handshake::{
+use brain_protocol::connection::handshake::{
     AgentPermissions, AuthMethod, AuthOkPayload, HelloCapabilities, ServerFeatures, WelcomePayload,
 };
-use brain_protocol::opcode::Opcode;
+use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 use brain_sdk_rust::ClientError;
 use brain_sdk_rust::{Client, ClientConfig};
@@ -53,7 +53,7 @@ async fn run_canned_script(socket: &mut TcpStream) {
     // ---- WELCOME --------------------------------------------------
     let welcome = WelcomePayload {
         server_id: "mock-server".into(),
-        chosen_version: brain_protocol::header::VERSION,
+        chosen_version: brain_protocol::codec::header::VERSION,
         session_id: [0xAB; 16],
         capabilities: HelloCapabilities {
             streaming: true,
@@ -178,7 +178,7 @@ async fn connects_completes_handshake() {
         .expect("non-empty session");
     assert_eq!(
         session.welcome.chosen_version,
-        brain_protocol::header::VERSION
+        brain_protocol::codec::header::VERSION
     );
     assert_eq!(session.welcome.session_id, [0xAB; 16]);
     assert_eq!(session.welcome.server_features.max_concurrent_streams, 1024);

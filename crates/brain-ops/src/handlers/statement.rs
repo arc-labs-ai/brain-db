@@ -42,7 +42,7 @@ use brain_protocol::{
     StatementSupersedeRequest, StatementSupersedeResponse, StatementSupersededEvent,
     StatementTombstoneRequest, StatementTombstoneResponse, StatementTombstonedEvent, StatementView,
 };
-use brain_protocol::response::EventType;
+use brain_protocol::envelope::response::EventType;
 use redb::ReadableTable;
 
 use crate::context::OpsContext;

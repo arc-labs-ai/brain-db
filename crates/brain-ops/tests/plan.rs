@@ -20,10 +20,10 @@ use brain_metadata::MetadataDb;
 use brain_ops::test_support::run_in_glommio;
 use brain_ops::{dispatch, ErrorCode, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::request::{
+use brain_protocol::envelope::request::{
     EdgeKindWire, LinkRequest, PlanBudget, PlanRequest, PlanState, RequestBody,
 };
-use brain_protocol::response::{
+use brain_protocol::envelope::response::{
     PlanResponseFrame, PlanStatus as WirePlanStatus, ResponseBody, TransitionKind,
 };
 use parking_lot::Mutex;

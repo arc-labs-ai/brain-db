@@ -2,8 +2,8 @@
 
 mod common;
 
-use brain_protocol::opcode::Opcode;
-use brain_protocol::response::EncodeResponse;
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::response::EncodeResponse;
 use brain_protocol::{RequestBody, ResponseBody};
 use brain_sdk_rust::Client;
 
@@ -20,7 +20,7 @@ async fn metrics_snapshot_records_request_and_op_breakdown() {
             lsn: 0,
             agent_id: [0; 16],
             context_id: 0,
-            kind: brain_protocol::request::MemoryKindWire::Episodic,
+            kind: brain_protocol::envelope::request::MemoryKindWire::Episodic,
             created_at_unix_nanos: 0,
             edges_out_count: 0,
             embedding_model_fp: [0; 16],

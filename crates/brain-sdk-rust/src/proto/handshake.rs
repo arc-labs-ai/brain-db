@@ -5,11 +5,11 @@
 //! negotiated capabilities + bound shard.
 
 use brain_core::AgentId;
-use brain_protocol::handshake::{
+use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthOkPayload, AuthPayload, HelloCapabilities, HelloPayload,
     WelcomePayload,
 };
-use brain_protocol::opcode::Opcode;
+use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -42,7 +42,7 @@ impl ClientIdentity {
     pub fn v1(client_id: impl Into<String>) -> Self {
         Self {
             client_id: client_id.into(),
-            supported_versions: vec![brain_protocol::header::VERSION],
+            supported_versions: vec![brain_protocol::codec::header::VERSION],
             capabilities: HelloCapabilities {
                 streaming: true,
                 compression_zstd: false,

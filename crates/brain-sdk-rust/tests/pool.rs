@@ -10,10 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brain_core::AgentId;
-use brain_protocol::handshake::{
+use brain_protocol::connection::handshake::{
     AgentPermissions, AuthMethod, AuthOkPayload, HelloCapabilities, ServerFeatures, WelcomePayload,
 };
-use brain_protocol::opcode::Opcode;
+use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 use brain_sdk_rust::{Client, ClientConfig, ClientError, Pool, PoolConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -85,7 +85,7 @@ async fn run_handshake_only(socket: &mut TcpStream, counter: &AtomicUsize) -> bo
     // ---- WELCOME --------------------------------------------------
     let welcome = WelcomePayload {
         server_id: "mock-server".into(),
-        chosen_version: brain_protocol::header::VERSION,
+        chosen_version: brain_protocol::codec::header::VERSION,
         session_id: [0xCD; 16],
         capabilities: HelloCapabilities {
             streaming: true,
@@ -493,8 +493,8 @@ async fn pool_guard_without_mark_failed_still_recycles() {
 
 #[tokio::test]
 async fn sdk_auto_responds_to_server_ping() {
-    use brain_protocol::request::ClientPongRequest;
-    use brain_protocol::responses::stream::ServerPingResponse;
+    use brain_protocol::envelope::request::ClientPongRequest;
+    use brain_protocol::ServerPingResponse;
     use brain_protocol::ResponseBody;
     use tokio::sync::oneshot;
 
@@ -572,7 +572,7 @@ async fn idle_connection_survives_a_burst_of_server_pings() {
     // Multiple SERVER_PINGs in flight while the connection sits Idle
     // in the pool — bg task must pong each one and then hand the
     // stream back cleanly when the test acquires for a BYE.
-    use brain_protocol::responses::stream::ServerPingResponse;
+    use brain_protocol::ServerPingResponse;
     use brain_protocol::ResponseBody;
     use std::sync::atomic::AtomicUsize;
 

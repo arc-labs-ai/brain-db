@@ -30,14 +30,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use brain_core::AgentId;
 use brain_ops::error::OpError;
 use brain_protocol::error::ErrorCode;
-use brain_protocol::handshake::{
+use brain_protocol::connection::handshake::{
     AgentPermissions, AuthOkPayload, AuthPayload, HelloPayload, ServerCapabilities, WelcomePayload,
 };
 
 use crate::auth::{derive_scope_from_handshake, AuthError, AuthStore, RequestScope};
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::RequestBody;
-use brain_protocol::response::{
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::RequestBody;
+use brain_protocol::envelope::response::{
     ErrorCategoryWire, ErrorCodeWire, ErrorResponse, PongResponse, ResponseBody, ServerPingResponse,
 };
 use brain_protocol::{Frame, ProtocolError};
@@ -147,18 +147,18 @@ pub(crate) struct SubscribeStart {
     /// Stream id the SUBSCRIBE_REQ rode in on (and where SUBSCRIPTION_
     /// EVENT frames flow out).
     pub(crate) stream_id: u32,
-    pub(crate) req: brain_protocol::request::SubscribeRequest,
+    pub(crate) req: brain_protocol::envelope::request::SubscribeRequest,
     pub(crate) target_shard: u16,
 }
 
 pub(crate) enum CancelSubscribe {
     Unsubscribe {
         request_stream_id: u32,
-        req: brain_protocol::request::UnsubscribeRequest,
+        req: brain_protocol::envelope::request::UnsubscribeRequest,
     },
     CancelStream {
         request_stream_id: u32,
-        req: brain_protocol::request::CancelStreamRequest,
+        req: brain_protocol::envelope::request::CancelStreamRequest,
     },
 }
 
@@ -316,7 +316,7 @@ fn on_hello(frame: Frame, state: &mut ConnState, topology: &Topology) -> Action 
             return Action::CloseWith(error_frame(0, protocol_error_to_code(&e), &e.to_string()));
         }
     };
-    let negotiated = match brain_protocol::handshake::negotiate(&hello, &topology.server_caps) {
+    let negotiated = match brain_protocol::connection::handshake::negotiate(&hello, &topology.server_caps) {
         Ok(n) => n,
         Err(_) => {
             let server_max = topology
@@ -654,7 +654,7 @@ pub(crate) enum Tick {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_protocol::handshake::{AuthMethod, HelloCapabilities};
+    use brain_protocol::connection::handshake::{AuthMethod, HelloCapabilities};
 
     fn test_topology() -> Topology {
         let tmp = tempfile::tempdir().expect("tmpdir");
@@ -716,10 +716,10 @@ mod tests {
         let topo = test_topology();
         let _ = dispatch_frame(build_hello_frame(), &mut state, &topo);
         // Try an ENCODE while still AwaitingAuth.
-        let body = RequestBody::Encode(brain_protocol::request::EncodeRequest {
+        let body = RequestBody::Encode(brain_protocol::envelope::request::EncodeRequest {
             text: "hello".into(),
             context_id: 0,
-            kind: brain_protocol::request::MemoryKindWire::Episodic,
+            kind: brain_protocol::envelope::request::MemoryKindWire::Episodic,
             salience_hint: 0.5,
             edges: Vec::new(),
             request_id: [0u8; 16],
@@ -759,7 +759,7 @@ mod tests {
 
     #[test]
     fn ping_round_trips_timestamps() {
-        let payload = brain_protocol::request::PingRequest {
+        let payload = brain_protocol::envelope::request::PingRequest {
             client_timestamp_unix_nanos: 42,
         };
         let body = RequestBody::Ping(payload);

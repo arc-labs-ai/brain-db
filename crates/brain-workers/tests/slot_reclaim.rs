@@ -15,10 +15,10 @@ use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
 use brain_ops::{dispatch, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::request::{
+use brain_protocol::envelope::request::{
     EncodeRequest, ForgetMode, ForgetRequest, MemoryKindWire, RequestBody,
 };
-use brain_protocol::response::ResponseBody;
+use brain_protocol::envelope::response::ResponseBody;
 use brain_workers::{
     SlotReclamationWorker, Worker, WorkerConfig, WorkerContext, WorkerKind, WorkerScheduler,
 };

@@ -35,7 +35,7 @@ use brain_protocol::{
     EntityUnmergeResponse, EntityUnmergedEvent, EntityUpdateRequest, EntityUpdateResponse,
     EntityUpdatedEvent, EntityView, KnowledgeEventPayload, ResolutionOutcomeWire,
 };
-use brain_protocol::response::EventType;
+use brain_protocol::envelope::response::EventType;
 
 use crate::context::OpsContext;
 use crate::error::OpError;

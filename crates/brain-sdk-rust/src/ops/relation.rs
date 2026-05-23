@@ -23,13 +23,13 @@
 //! [`RelationHandle`].
 
 use brain_core::{EntityId, MemoryId, RelationId, RelationTypeId};
-use brain_protocol::requests::statement::EvidenceRefWire;
+use brain_protocol::EvidenceRefWire;
 use brain_protocol::{
     RelationCreateRequest, RelationGetRequest, RelationListFromRequest, RelationListToRequest,
     RelationSupersedeRequest, RelationTombstoneRequest, RelationTraverseRequest, RelationView,
     RelationWireError,
 };
-use brain_protocol::opcode::Opcode;
+use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::{RequestBody, ResponseBody};
 
 use crate::client::Client;
@@ -818,7 +818,7 @@ fn is_relation_not_found(err: &ClientError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_protocol::requests::statement::EvidenceRefWire;
+    use brain_protocol::EvidenceRefWire;
 
     fn sample_view() -> RelationView {
         RelationView {

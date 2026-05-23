@@ -9,7 +9,7 @@
 //! step; the writer task enforces the order at execution time.
 
 use brain_core::MemoryId;
-use brain_protocol::request::ForgetMode;
+use brain_protocol::envelope::request::ForgetMode;
 
 use super::common::ShardId;
 use super::encode::IdempotencyCheckStep;

@@ -5,9 +5,9 @@
 //! sugar is a Phase-11 polish — for now the user threads `TxnId`
 //! into op builders via `.txn(id)`.
 
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::{TxnAbortRequest, TxnBeginRequest, TxnCommitRequest};
-use brain_protocol::response::{TxnAbortResponse, TxnBeginResponse, TxnCommitResponse};
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::{TxnAbortRequest, TxnBeginRequest, TxnCommitRequest};
+use brain_protocol::envelope::response::{TxnAbortResponse, TxnBeginResponse, TxnCommitResponse};
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 use uuid::Uuid;
 

@@ -45,8 +45,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use brain_core::{ContextId, MemoryId, MemoryKind};
-use brain_protocol::request::{SubscribeRequest, UnsubscribeRequest};
-use brain_protocol::response::{
+use brain_protocol::envelope::request::{SubscribeRequest, UnsubscribeRequest};
+use brain_protocol::envelope::response::{
     EdgeEventPayload, EventType, SubscriptionEvent, UnsubscribeResponse,
 };
 use parking_lot::Mutex;
@@ -128,9 +128,9 @@ pub struct EventEnvelope {
     /// All three are populated together; the helper publishers in
     /// brain-workers fill all three on the same envelope. `None` on
     /// every non-stage event.
-    pub stage_kind: Option<brain_protocol::responses::StageKind>,
-    pub stage_outcome: Option<brain_protocol::responses::StageOutcome>,
-    pub stage_payload: Option<brain_protocol::responses::StagePayload>,
+    pub stage_kind: Option<brain_protocol::StageKind>,
+    pub stage_outcome: Option<brain_protocol::StageOutcome>,
+    pub stage_payload: Option<brain_protocol::StagePayload>,
     /// Agent the event was attributed to. Substrate writers stamp
     /// their bound agent; knowledge handlers stamp the auth-time
     /// agent the request ran under. Default (nil) for tests +

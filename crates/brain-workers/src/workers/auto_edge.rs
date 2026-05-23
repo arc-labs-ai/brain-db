@@ -53,7 +53,7 @@ use brain_metadata::tables::edge::{derived_by, origin, zero_disambiguator};
 use brain_ops::{
     AutoEdgeEnqueue, AutoEdgeMetrics, EventEnvelope, Phase, RealWriterHandle, Write, WriteId,
 };
-use brain_protocol::responses::types::{
+use brain_protocol::shared::enums::{
     EventType, StageAutoEdgePayload, StageKind, StageOutcome, StagePayload,
 };
 use futures_lite::FutureExt;

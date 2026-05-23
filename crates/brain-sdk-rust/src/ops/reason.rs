@@ -1,9 +1,9 @@
 //! REASON op.
 
 use brain_core::RequestId;
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::{ObservationInput, ReasonRequest};
-use brain_protocol::response::{InferenceStep, ReasonResponseFrame};
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::{ObservationInput, ReasonRequest};
+use brain_protocol::envelope::response::{InferenceStep, ReasonResponseFrame};
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 
 use crate::client::Client;

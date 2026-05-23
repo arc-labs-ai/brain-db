@@ -15,7 +15,7 @@
 //! 8. Response
 
 use brain_core::{ContextId, EdgeKind, MemoryId, MemoryKind, RequestId};
-use brain_protocol::request::EncodeRequest;
+use brain_protocol::envelope::request::EncodeRequest;
 
 use crate::config::PlannerConfig;
 use crate::context::PlannerContext;
@@ -147,7 +147,7 @@ fn validate(req: &EncodeRequest, config: &PlannerConfig) -> Result<(), PlanError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_protocol::request::{EdgeKindWire, EdgeRequest, MemoryKindWire};
+    use brain_protocol::envelope::request::{EdgeKindWire, EdgeRequest, MemoryKindWire};
 
     fn base_request() -> EncodeRequest {
         EncodeRequest {

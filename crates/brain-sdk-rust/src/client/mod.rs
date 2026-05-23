@@ -15,8 +15,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use brain_core::{AgentId, MemoryId, RequestId};
-use brain_protocol::request::{EdgeKindWire, ObservationInput, PlanState};
-use brain_protocol::response::{TxnAbortResponse, TxnBeginResponse, TxnCommitResponse};
+use brain_protocol::envelope::request::{EdgeKindWire, ObservationInput, PlanState};
+use brain_protocol::envelope::response::{TxnAbortResponse, TxnBeginResponse, TxnCommitResponse};
 
 use crate::config::ClientConfig;
 use crate::error::ClientError;
@@ -252,7 +252,7 @@ impl Client {
     pub async fn unsubscribe(
         &self,
         target_stream_id: u32,
-    ) -> Result<brain_protocol::response::UnsubscribeResponse, ClientError> {
+    ) -> Result<brain_protocol::envelope::response::UnsubscribeResponse, ClientError> {
         crate::ops::subscribe::unsubscribe(self, target_stream_id).await
     }
 
@@ -365,8 +365,8 @@ impl Client {
         //
         // We can't call `Connection::bye` because that consumes
         // the connection by value. So we hand-roll the BYE here.
-        use brain_protocol::opcode::Opcode;
-        use brain_protocol::request::ByeRequest;
+        use brain_protocol::codec::opcode::Opcode;
+        use brain_protocol::envelope::request::ByeRequest;
         use brain_protocol::{Frame, RequestBody};
 
         const FLAG_EOS: u8 = 1 << 7;

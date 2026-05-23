@@ -23,7 +23,7 @@ use super::phase::{Phase, PhaseAck};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingStage {
     pub memory_id: MemoryId,
-    pub stage_kind: brain_protocol::responses::StageKind,
+    pub stage_kind: brain_protocol::StageKind,
 }
 
 /// One submission to the writer. Owns its phases (no borrowing — the

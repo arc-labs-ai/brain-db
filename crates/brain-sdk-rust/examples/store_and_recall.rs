@@ -23,7 +23,7 @@
 use std::net::SocketAddr;
 
 use brain_core::MemoryId;
-use brain_protocol::request::{EdgeKindWire, ForgetMode, MemoryKindWire};
+use brain_protocol::envelope::request::{EdgeKindWire, ForgetMode, MemoryKindWire};
 use brain_sdk_rust::Client;
 
 const SERVER: &str = "127.0.0.1:9090";
@@ -49,7 +49,7 @@ fn separator(label: &str) {
     println!("{}", "─".repeat(70));
 }
 
-fn print_memories(label: &str, results: &[brain_protocol::response::MemoryResult]) {
+fn print_memories(label: &str, results: &[brain_protocol::envelope::response::MemoryResult]) {
     if results.is_empty() {
         println!("  {label}: (no results — HNSW index may still be warming up)");
         return;

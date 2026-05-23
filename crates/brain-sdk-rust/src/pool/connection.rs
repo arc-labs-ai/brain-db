@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use brain_core::AgentId;
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::{ByeRequest, ClientPongRequest};
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::{ByeRequest, ClientPongRequest};
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;

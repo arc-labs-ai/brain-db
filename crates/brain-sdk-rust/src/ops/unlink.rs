@@ -1,9 +1,9 @@
 //! UNLINK op.
 
 use brain_core::{MemoryId, RequestId};
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::{EdgeKindWire, UnlinkRequest};
-use brain_protocol::response::UnlinkResponse;
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::{EdgeKindWire, UnlinkRequest};
+use brain_protocol::envelope::response::UnlinkResponse;
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 
 use crate::client::Client;

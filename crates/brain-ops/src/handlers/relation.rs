@@ -43,7 +43,7 @@ use brain_protocol::{
     RelationTraverseRequest, RelationTraverseResponseFrame, RelationView, TraversalPathWire,
     TraversalStepWire,
 };
-use brain_protocol::response::EventType;
+use brain_protocol::envelope::response::EventType;
 use redb::ReadableTable;
 
 use crate::context::OpsContext;

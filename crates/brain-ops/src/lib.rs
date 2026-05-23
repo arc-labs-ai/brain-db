@@ -257,11 +257,11 @@ mod tests {
         OpsContext::new(executor)
     }
 
-    fn encode_req() -> brain_protocol::request::EncodeRequest {
-        brain_protocol::request::EncodeRequest {
+    fn encode_req() -> brain_protocol::envelope::request::EncodeRequest {
+        brain_protocol::envelope::request::EncodeRequest {
             text: "hi".into(),
             context_id: 1,
-            kind: brain_protocol::request::MemoryKindWire::Episodic,
+            kind: brain_protocol::envelope::request::MemoryKindWire::Episodic,
             salience_hint: 0.5,
             edges: vec![],
             request_id: [1; 16],
@@ -280,7 +280,7 @@ mod tests {
             // prove the dispatcher reaches `handle_encode` rather than
             // a stub. Either of those error shapes confirms routing.
             let ctx = fake_context();
-            let req = brain_protocol::request::RequestBody::Encode(encode_req());
+            let req = brain_protocol::envelope::request::RequestBody::Encode(encode_req());
             match dispatch(req, RequestCaller::anonymous(), &ctx).await {
                 Err(OpError::ExecError(_)) | Err(OpError::Internal(_)) => {}
                 other => panic!("expected ExecError or Internal from NopWriter, got {other:?}"),
@@ -293,9 +293,9 @@ mod tests {
         use crate::test_support::run_in_glommio;
         run_in_glommio(|| async {
             let ctx = fake_context();
-            let req = brain_protocol::request::RequestBody::AdminStats(
-                brain_protocol::request::AdminStatsRequest {
-                    detail: brain_protocol::request::StatsDetail::Summary,
+            let req = brain_protocol::envelope::request::RequestBody::AdminStats(
+                brain_protocol::envelope::request::AdminStatsRequest {
+                    detail: brain_protocol::envelope::request::StatsDetail::Summary,
                 },
             );
             match dispatch(req, RequestCaller::anonymous(), &ctx).await {

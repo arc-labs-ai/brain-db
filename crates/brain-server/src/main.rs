@@ -139,7 +139,7 @@ mod linux_main {
     use std::process::ExitCode;
     use std::sync::Arc;
 
-    use brain_protocol::handshake::{AuthMethod, ServerCapabilities};
+    use brain_protocol::connection::handshake::{AuthMethod, ServerCapabilities};
 
     use super::config::Config;
     use crate::connection::{

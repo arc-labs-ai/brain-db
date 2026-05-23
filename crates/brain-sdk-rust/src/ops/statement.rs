@@ -47,7 +47,7 @@ use brain_protocol::{
     StatementSupersedeRequest, StatementTombstoneRequest, StatementValueWire, StatementView,
     WireToStatementError,
 };
-use brain_protocol::opcode::Opcode;
+use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::{RequestBody, ResponseBody};
 use smallvec::SmallVec;
 

@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use brain_core::{EdgeKind, MemoryId};
 use brain_metadata::tables::edge::list_memory_edges_from;
-use brain_protocol::request::ObservationInput;
+use brain_protocol::envelope::request::ObservationInput;
 
 use crate::plan::reason::ReasonPlan;
 

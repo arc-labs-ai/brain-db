@@ -11,7 +11,7 @@
 //! cognitive-ops alongside `LINK` / `UNLINK`.
 
 use brain_core::EdgeKind;
-use brain_protocol::request::{PlanBudget, PlanState, PlanStrategy};
+use brain_protocol::envelope::request::{PlanBudget, PlanState, PlanStrategy};
 
 use super::common::RecallSubStep;
 

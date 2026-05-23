@@ -1,6 +1,6 @@
 //! `reason` verb.
 
-use brain_protocol::request::ObservationInput;
+use brain_protocol::envelope::request::ObservationInput;
 use brain_sdk_rust::{Client, ClientError};
 
 use crate::parser::ReasonArgs;

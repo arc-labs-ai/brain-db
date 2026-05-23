@@ -30,7 +30,7 @@ pub enum ExtractAction {
     Backfill(BackfillKind),
 }
 
-/// Mirrors `brain_protocol::requests::admin::BackfillSelector` but
+/// Mirrors `brain_protocol::BackfillSelector` but
 /// without the protocol-crate dep — the CLI only renders + transports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackfillKind {

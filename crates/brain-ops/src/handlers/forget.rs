@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use brain_core::MemoryId;
 use brain_planner::{plan_forget_inner, ForgetOp, ForgetOutcome};
-use brain_protocol::request::{ForgetMode, ForgetRequest};
-use brain_protocol::response::ForgetResponse;
+use brain_protocol::envelope::request::{ForgetMode, ForgetRequest};
+use brain_protocol::envelope::response::ForgetResponse;
 
 use crate::context::OpsContext;
 use crate::error::OpError;

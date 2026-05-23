@@ -717,7 +717,7 @@ mod tests {
         let mut ack = ack_with(vec![PhaseAck::Linked]);
         ack.pending_stages.push(crate::write::PendingStage {
             memory_id: MemoryId::pack(0, 1, 0),
-            stage_kind: brain_protocol::responses::StageKind::AutoEdge,
+            stage_kind: brain_protocol::StageKind::AutoEdge,
         });
         let decoded = round_trip(ack);
         assert!(decoded.pending_stages.is_empty());

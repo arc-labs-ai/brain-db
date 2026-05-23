@@ -3,8 +3,8 @@
 mod common;
 
 use brain_core::MemoryId;
-use brain_protocol::opcode::Opcode;
-use brain_protocol::response::ForgetResponse;
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::response::ForgetResponse;
 use brain_protocol::{RequestBody, ResponseBody};
 use brain_sdk_rust::Client;
 

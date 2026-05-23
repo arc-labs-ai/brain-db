@@ -2,9 +2,9 @@
 
 mod common;
 
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::MemoryKindWire;
-use brain_protocol::response::{MemoryResult, RecallResponseFrame};
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::MemoryKindWire;
+use brain_protocol::envelope::response::{MemoryResult, RecallResponseFrame};
 use brain_protocol::{RequestBody, ResponseBody};
 use brain_sdk_rust::Client;
 

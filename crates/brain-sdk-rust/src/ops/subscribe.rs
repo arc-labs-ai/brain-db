@@ -4,11 +4,11 @@
 //! events then returns. The real streaming surface (async
 //! iterator with backpressure) lands in 10.6.
 
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::{
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::{
     MemoryKindWire, SimilarityFilter, SubscribeRequest, SubscriptionFilter, UnsubscribeRequest,
 };
-use brain_protocol::response::{SubscriptionEvent, UnsubscribeResponse};
+use brain_protocol::envelope::response::{SubscriptionEvent, UnsubscribeResponse};
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 
 use crate::client::Client;

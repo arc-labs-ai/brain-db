@@ -70,8 +70,8 @@ use brain_ops::error::OpError;
 use brain_ops::subscribe::EventEnvelope;
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::request::RequestBody;
-use brain_protocol::response::ResponseBody;
+use brain_protocol::envelope::request::RequestBody;
+use brain_protocol::envelope::response::ResponseBody;
 use brain_storage::arena::{
     AllocError, ArenaFile, ArenaOpenError, SlotAllocator, DEFAULT_INITIAL_CAPACITY_SLOTS,
 };
@@ -168,7 +168,7 @@ pub(crate) enum ShardRequest {
     /// `brain-cli extract --backfill` after a fresh schema upload or
     /// after enabling the worker on a populated shard.
     ExtractBackfill {
-        selector: brain_protocol::requests::admin::BackfillSelector,
+        selector: brain_protocol::BackfillSelector,
         reply_tx: Sender<Result<ExtractBackfillReport, String>>,
     },
 }
@@ -798,7 +798,7 @@ impl ShardHandle {
     /// hit.
     pub async fn extract_backfill(
         &self,
-        selector: brain_protocol::requests::admin::BackfillSelector,
+        selector: brain_protocol::BackfillSelector,
     ) -> Result<ExtractBackfillReport, ShardError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.tx
@@ -2230,12 +2230,12 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
 /// against redb + the bounded flume queue.
 fn run_extract_backfill(
     shard: &Shard,
-    selector: brain_protocol::requests::admin::BackfillSelector,
+    selector: brain_protocol::BackfillSelector,
 ) -> Result<ExtractBackfillReport, String> {
     use brain_core::MemoryId;
     use brain_metadata::tables::memory::MEMORIES_TABLE;
     use brain_metadata::tables::text::TEXTS_TABLE;
-    use brain_protocol::requests::admin::BackfillSelector;
+    use brain_protocol::BackfillSelector;
     use redb::ReadableTable;
 
     let mut report = ExtractBackfillReport::default();

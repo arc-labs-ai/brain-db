@@ -20,9 +20,9 @@ use brain_protocol::{
     StatementObjectWire, StatementRetractResponse, StatementTombstoneResponse, StatementValueWire,
     StatementView,
 };
-use brain_protocol::opcode::Opcode;
-use brain_protocol::responses::error::ErrorResponse;
-use brain_protocol::responses::types::{ErrorCategoryWire, ErrorCodeWire};
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::ErrorResponse;
+use brain_protocol::shared::enums::{ErrorCategoryWire, ErrorCodeWire};
 use brain_protocol::{RequestBody, ResponseBody};
 use brain_sdk_rust::models::errors::{ClientErrorStatementExt, StatementErrorKind};
 use brain_sdk_rust::{Client, EntityId, StatementId, StatementKind, TombstoneReason};

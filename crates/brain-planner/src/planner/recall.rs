@@ -9,7 +9,7 @@
 //! same `RecallPlan { shards: Vec<_> }` envelope.
 
 use brain_core::ContextId;
-use brain_protocol::request::RecallRequest;
+use brain_protocol::envelope::request::RecallRequest;
 
 use crate::config::PlannerConfig;
 use crate::context::PlannerContext;
@@ -169,7 +169,7 @@ fn build_filter_rules(req: &RecallRequest) -> Vec<FilterRule> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_protocol::request::MemoryKindWire;
+    use brain_protocol::envelope::request::MemoryKindWire;
 
     fn base_request() -> RecallRequest {
         RecallRequest {

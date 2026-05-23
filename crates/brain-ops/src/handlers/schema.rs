@@ -23,7 +23,7 @@ use brain_protocol::{
     SchemaListRequest, SchemaListResponseFrame, SchemaUpdatedEvent, SchemaUploadRequest,
     SchemaUploadResponse, SchemaValidateRequest, SchemaValidateResponse, SchemaValidationErrorWire,
 };
-use brain_protocol::response::EventType;
+use brain_protocol::envelope::response::EventType;
 use brain_protocol::schema::{parse_schema, validate, ParseError, ValidationError};
 
 use crate::context::OpsContext;

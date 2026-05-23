@@ -6,7 +6,7 @@
 //!
 //! See `spec/12_query_optimizer/05_plan_reason_planning.md`.
 
-use brain_protocol::request::{PlanRequest, PlanState, PlanStrategy};
+use brain_protocol::envelope::request::{PlanRequest, PlanState, PlanStrategy};
 
 use crate::config::PlannerConfig;
 use crate::context::PlannerContext;
@@ -149,7 +149,7 @@ fn recall_substep_for(state: &PlanState, ctx: &PlannerContext) -> Option<RecallS
 mod tests {
     use super::*;
     use brain_core::MemoryId;
-    use brain_protocol::request::{PlanBudget, PlanState};
+    use brain_protocol::envelope::request::{PlanBudget, PlanState};
 
     fn base_request() -> PlanRequest {
         PlanRequest {

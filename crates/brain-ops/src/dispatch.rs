@@ -12,8 +12,8 @@
 
 use brain_core::AgentId;
 use brain_metadata::api_keys::bits as perm_bits;
-use brain_protocol::request::RequestBody;
-use brain_protocol::response::ResponseBody;
+use brain_protocol::envelope::request::RequestBody;
+use brain_protocol::envelope::response::ResponseBody;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
@@ -542,8 +542,8 @@ fn enforce_namespace(caller: &RequestCaller, req: &RequestBody) -> Result<(), Op
 mod tests {
     use super::*;
     use brain_protocol::{SchemaGetRequest, SchemaListRequest};
-    use brain_protocol::requests::cognitive::EncodeRequest;
-    use brain_protocol::requests::types::MemoryKindWire;
+    use brain_protocol::EncodeRequest;
+    use brain_protocol::MemoryKindWire;
 
     fn agent(byte: u8) -> AgentId {
         let mut a = [0u8; 16];

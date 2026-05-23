@@ -5,7 +5,7 @@ use std::num::ParseIntError;
 use std::str::FromStr;
 
 use brain_core::MemoryId;
-use brain_protocol::request::{EdgeKindWire, EdgeRequest, ForgetMode, MemoryKindWire};
+use brain_protocol::envelope::request::{EdgeKindWire, EdgeRequest, ForgetMode, MemoryKindWire};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 

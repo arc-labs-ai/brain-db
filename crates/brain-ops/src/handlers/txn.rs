@@ -16,8 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use brain_core::{EdgeKind, MemoryId};
 use brain_metadata::tables::memory::MemoryMetadata;
-use brain_protocol::request::{ForgetMode, TxnAbortRequest, TxnBeginRequest, TxnCommitRequest};
-use brain_protocol::response::{TxnAbortResponse, TxnBeginResponse, TxnCommitResponse};
+use brain_protocol::envelope::request::{ForgetMode, TxnAbortRequest, TxnBeginRequest, TxnCommitRequest};
+use brain_protocol::envelope::response::{TxnAbortResponse, TxnBeginResponse, TxnCommitResponse};
 use parking_lot::Mutex;
 
 use crate::context::OpsContext;
@@ -515,8 +515,8 @@ pub(crate) fn build_phases(buffer: &TxnBuffer) -> Vec<crate::write::Phase> {
             target: TombstoneTarget::Memory {
                 id: f.memory_id,
                 mode: match f.mode {
-                    brain_protocol::request::ForgetMode::Soft => PhaseTombstoneMode::Soft,
-                    brain_protocol::request::ForgetMode::Hard => PhaseTombstoneMode::Hard,
+                    brain_protocol::envelope::request::ForgetMode::Soft => PhaseTombstoneMode::Soft,
+                    brain_protocol::envelope::request::ForgetMode::Hard => PhaseTombstoneMode::Hard,
                 },
             },
             reason: 1, // ClientRequest

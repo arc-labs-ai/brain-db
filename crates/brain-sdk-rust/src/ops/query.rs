@@ -50,8 +50,8 @@ use brain_protocol::{
     RetrieverOutcomeWire as WireRetrieverOutcome, RetrieverSelectionWire, RetrieverWire,
     TimeRangeWire,
 };
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::WireUuid;
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::WireUuid;
 use brain_protocol::{RequestBody, ResponseBody};
 
 use crate::client::Client;
@@ -130,9 +130,9 @@ impl From<Retriever> for RetrieverWire {
     }
 }
 
-impl From<brain_protocol::responses::types::RetrieverNameWire> for Retriever {
-    fn from(w: brain_protocol::responses::types::RetrieverNameWire) -> Self {
-        use brain_protocol::responses::types::RetrieverNameWire as W;
+impl From<brain_protocol::RetrieverNameWire> for Retriever {
+    fn from(w: brain_protocol::RetrieverNameWire) -> Self {
+        use brain_protocol::RetrieverNameWire as W;
         match w {
             W::Semantic => Self::Semantic,
             W::Lexical => Self::Lexical,

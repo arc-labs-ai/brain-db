@@ -21,7 +21,7 @@ use brain_explore::{
     term::{ColorMode as ExploreColorMode, HyperlinkMode as ExploreHyperlinkMode},
     OutputFormat, Render, RenderCtx, TermPolicy, Theme,
 };
-use brain_protocol::responses::types::ErrorCodeWire;
+use brain_protocol::ErrorCodeWire;
 use brain_sdk_rust::ClientError;
 
 use crate::parser::{ColorMode, HyperlinkMode, OutputFormatArg};

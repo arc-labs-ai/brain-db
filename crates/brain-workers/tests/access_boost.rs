@@ -322,8 +322,8 @@ fn worker_registers_with_correct_kind_and_default_cadence() {
 fn recall_fills_buffer_then_boost_worker_applies() {
     glommio_run(|| async {
         use brain_ops::dispatch;
-        use brain_protocol::request::{EncodeRequest, MemoryKindWire, RecallRequest, RequestBody};
-        use brain_protocol::response::ResponseBody;
+        use brain_protocol::envelope::request::{EncodeRequest, MemoryKindWire, RecallRequest, RequestBody};
+        use brain_protocol::envelope::response::ResponseBody;
 
         // Build a fixture with a real MockDispatcher so encode/recall
         // actually produce vectors.

@@ -5,7 +5,7 @@
 
 use brain_core::{AgentId, ContextId, RequestId};
 use brain_protocol::{MaterializeProceduralRequest, MaterializeProceduralResponse};
-use brain_protocol::opcode::Opcode;
+use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 
 use crate::client::Client;

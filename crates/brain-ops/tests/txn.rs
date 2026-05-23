@@ -15,12 +15,12 @@ use brain_metadata::MetadataDb;
 use brain_ops::test_support::run_in_glommio;
 use brain_ops::{dispatch, ErrorCode, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::request::{
+use brain_protocol::envelope::request::{
     EdgeKindWire, EncodeRequest, ForgetMode, ForgetRequest, LinkRequest, MemoryKindWire,
     ObservationInput, PlanBudget, PlanRequest, PlanState, ReasonRequest, RecallRequest,
     RequestBody, TxnAbortRequest, TxnBeginRequest, TxnCommitRequest, UnlinkRequest,
 };
-use brain_protocol::response::{
+use brain_protocol::envelope::response::{
     EncodeResponse, ForgetResponse, LinkResponse, PlanResponseFrame, PlanStatus as WirePlanStatus,
     ReasonResponseFrame, RecallResponseFrame, ResponseBody, TxnAbortResponse, TxnBeginResponse,
     TxnCommitResponse, UnlinkResponse,

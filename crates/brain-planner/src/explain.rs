@@ -368,7 +368,7 @@ fn substep_one_liner(s: &Option<RecallSubStep>) -> &'static str {
 mod tests {
     use super::*;
     use brain_core::{ContextId, MemoryId, MemoryKind, RequestId};
-    use brain_protocol::request::{
+    use brain_protocol::envelope::request::{
         ForgetMode, ObservationInput, PlanBudget, PlanState, PlanStrategy,
     };
 

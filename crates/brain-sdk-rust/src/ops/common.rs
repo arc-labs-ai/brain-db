@@ -10,7 +10,7 @@
 //!   error.
 
 use brain_protocol::error::ProtocolError;
-use brain_protocol::opcode::Opcode;
+use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::{Frame, ResponseBody};
 
 use crate::error::ClientError;

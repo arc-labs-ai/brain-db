@@ -9,7 +9,7 @@
 //! Phase 7 cognitive-ops alongside `LINK` / `UNLINK`.
 
 use brain_core::EdgeKind;
-use brain_protocol::request::ObservationInput;
+use brain_protocol::envelope::request::ObservationInput;
 
 use super::common::RecallSubStep;
 use super::path::{EvidenceResponseStep, TraversalStep};

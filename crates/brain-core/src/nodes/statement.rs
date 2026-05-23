@@ -320,7 +320,7 @@ impl TombstoneReason {
 /// Pure value type. The brain-metadata storage layer holds the rkyv-
 /// archived form (`brain_metadata::tables::statement::StatementMetadata`);
 /// the wire layer holds the rkyv-archived view
-/// (`brain_protocol::responses::statement::StatementView`).
+/// (`brain_protocol::ops::statement::StatementView`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Statement {
     pub id: StatementId,

@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-pub use brain_protocol::handshake::AuthMethod;
+pub use brain_protocol::connection::handshake::AuthMethod;
 
 use crate::pool::PoolConfig;
 use crate::retry::RetryConfig;

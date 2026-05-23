@@ -3,9 +3,9 @@
 //! Streaming response — 10.5 ships a Vec-collecting `send()`.
 
 use brain_core::RequestId;
-use brain_protocol::opcode::Opcode;
-use brain_protocol::request::{PlanBudget, PlanRequest, PlanState, PlanStrategy};
-use brain_protocol::response::{PlanResponseFrame, PlanStatus, PlanStep};
+use brain_protocol::codec::opcode::Opcode;
+use brain_protocol::envelope::request::{PlanBudget, PlanRequest, PlanState, PlanStrategy};
+use brain_protocol::envelope::response::{PlanResponseFrame, PlanStatus, PlanStep};
 use brain_protocol::{Frame, RequestBody, ResponseBody};
 
 use crate::client::Client;

@@ -53,7 +53,7 @@ use brain_ops::{
     EventEnvelope, Phase, RealWriterHandle, TemporalEdgeEnqueue, TemporalEdgeMetrics,
     TemporalSkipReason, Write, WriteId,
 };
-use brain_protocol::responses::types::{
+use brain_protocol::shared::enums::{
     EventType, StageKind, StageOutcome, StagePayload, StageTemporalEdgePayload,
 };
 use futures_lite::FutureExt;

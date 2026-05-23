@@ -7,7 +7,7 @@
 
 use std::io::{self, Write};
 
-use brain_protocol::response::{TxnAbortResponse, TxnBeginResponse, TxnCommitResponse};
+use brain_protocol::envelope::response::{TxnAbortResponse, TxnBeginResponse, TxnCommitResponse};
 use serde_json::{json, Value};
 
 use crate::render::fmt_txn_id;

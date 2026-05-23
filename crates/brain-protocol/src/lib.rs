@@ -3,6 +3,25 @@
 //! Brain's wire protocol: a custom binary protocol over TCP (with optional
 //! TLS). Frames have a fixed 32-byte header, a magic of `b"BRN0"`, header
 //! and payload CRC32C, and a 24-bit payload length cap (16 MiB).
+//!
+//! The crate is laid out by **role**, not by wire direction:
+//!
+//! - [`codec`] — bytes-on-the-wire plumbing (header, frame, CRC, rkyv,
+//!   opcode). Nothing in this module knows what an operation means.
+//! - [`envelope`] — the [`RequestBody`] / [`ResponseBody`] dispatch
+//!   enums, the [`ErrorResponse`] payload, and core ↔ wire conversions.
+//! - [`connection`] — connection-lifecycle ops: handshake and stream
+//!   control (PING / PONG / CANCEL_STREAM / BYE / SERVER_PING).
+//! - [`ops`] — per-domain wire ops. One file per capability (memory,
+//!   entity, statement, relation, query, procedural, txn, subscribe,
+//!   admin, extractor) holding request, response, and view types
+//!   together.
+//! - [`schema`] — schema DSL surface (AST, parser, validator) plus the
+//!   schema-management wire ops in [`schema::ops`].
+//! - [`shared`] — wire primitives and enums shared across multiple op
+//!   families.
+//! - [`error`] — the [`ErrorCategory`] / [`ErrorCode`] / [`ProtocolError`]
+//!   taxonomy.
 
 #![allow(
     clippy::module_name_repetitions,
@@ -11,71 +30,57 @@
 )]
 #![forbid(unsafe_code)]
 
-pub mod convert;
-pub mod crc;
+pub mod codec;
+pub mod connection;
+pub mod envelope;
 pub mod error;
-pub mod frame;
-pub mod handshake;
-pub mod header;
-pub mod opcode;
-pub mod request;
-pub mod requests;
-pub mod response;
-pub mod responses;
-mod rkyv_codec;
+pub mod ops;
 pub mod schema;
+pub mod shared;
 
+// -- Codec layer --
+pub use codec::frame::Frame;
+pub use codec::header::{Header, VERSION};
+pub use codec::opcode::Opcode;
+
+// -- Envelope layer --
+pub use envelope::error::{ErrorDetails, ErrorResponse};
+pub use envelope::request::{RequestBody, WireContextId, WireMemoryId, WireUuid};
+pub use envelope::response::ResponseBody;
+
+// -- Error taxonomy --
 pub use error::{ErrorCategory, ErrorCode, ProtocolError};
-pub use frame::Frame;
-pub use header::{Header, VERSION};
-pub use opcode::Opcode;
-pub use request::RequestBody;
-pub use response::ResponseBody;
 
-// Flat re-exports of the typed-graph wire payloads — formerly accessible
-// via `brain_protocol::*`. Callers can pull any noun's
-// request/response/event type directly from the crate root.
-pub use requests::{
-    EntityCreateRequest, EntityGetRequest, EntityListRequest, EntityMergeRequest,
-    EntityRenameRequest, EntityResolveRequest, EntityTombstoneRequest, EntityUnmergeRequest,
-    EntityUpdateRequest, ExtractorDisableRequest, ExtractorEnableRequest, ExtractorListRequest,
-    FusionConfigWire, ItemIdWire, MaterializeProceduralRequest, QueryExplainRequest, QueryRequest,
-    QueryTraceRequest, RecallHybridRequest, RelationCreateRequest, RelationGetRequest,
-    RelationListFromRequest, RelationListToRequest, RelationSupersedeRequest,
-    RelationTombstoneRequest, RelationTraverseRequest, RetrieverContributionWire,
-    RetrieverOutcomeWire, RetrieverSelectionWire, RetrieverWire, SchemaGetRequest,
-    SchemaListRequest, SchemaUploadRequest, SchemaValidateRequest, StatementCreateRequest,
-    StatementGetRequest, StatementHistoryRequest, StatementListRequest, StatementRetractRequest,
-    StatementSupersedeRequest, StatementTombstoneRequest, TimeRangeWire,
-    // Wire-side primitives shared with statement.rs (EvidenceRefWire and the value/object/kind
-    // helpers).
-    EvidenceRefWire, StatementKindWire, StatementObjectWire, StatementValueWire,
+// -- Connection layer --
+pub use connection::handshake::{
+    AgentPermissions, AuthCredentials, AuthMethod, AuthOkPayload, AuthPayload, HelloCapabilities,
+    HelloPayload, MtlsClaim, NegotiatedSession, ServerCapabilities, ServerFeatures, WelcomePayload,
+    negotiate,
 };
-pub use responses::{
-    // Knowledge-event payloads.
-    EntityCreatedEvent, EntityMergedEvent, EntityRenamedEvent, EntityTombstonedEvent,
-    EntityUnmergedEvent, EntityUpdatedEvent, KnowledgeEventPayload, RelationCreatedEvent,
-    RelationSupersededEvent, RelationTombstonedEvent, SchemaUpdatedEvent, StatementCreatedEvent,
-    StatementSupersededEvent, StatementTombstonedEvent,
-    // Per-noun response payloads.
-    EntityCreateResponse, EntityGetResponse, EntityListItem, EntityListResponseFrame,
-    EntityMergeResponse, EntityRenameResponse, EntityResolveResponse, EntityTombstoneResponse,
-    EntityUnmergeResponse, EntityUpdateResponse, EntityView, ExtractorDisableResponse,
-    ExtractorEnableResponse, ExtractorListItem, ExtractorListResponseFrame, MaterializeProceduralResponse,
-    MemoryHit, QueryExplainResponse, QueryResponse, QueryResultItem, QueryTraceResponse,
-    RecallHybridResponse, RelationCreateResponse, RelationGetResponse,
-    RelationListFromResponseFrame, RelationListToResponseFrame, RelationSupersedeResponse,
-    RelationTombstoneResponse, RelationTraverseResponseFrame, RelationView, RelationWireError,
-    ResolutionOutcomeWire, SchemaGetResponse, SchemaListItemWire, SchemaListResponseFrame,
-    SchemaUploadResponse, SchemaValidateResponse, SchemaValidationErrorWire, StatementCreateResponse,
-    StatementGetResponse, StatementHistoryResponseFrame, StatementListResponseFrame,
-    StatementRetractResponse, StatementSupersedeResponse, StatementTombstoneResponse,
-    StatementView, TraversalPathWire, TraversalStepWire, WireToStatementError,
-    // Free-function helpers in responses/statement.rs.
-    evidence_ref_from_wire, evidence_ref_to_wire, relation_type_canonical, statement_kind_from_wire,
-    statement_kind_to_wire, statement_object_from_wire, statement_object_to_wire,
-    statement_value_from_wire, statement_value_to_wire,
+pub use connection::stream::{
+    ByeRequest, CancelStreamAck, CancelStreamRequest, ClientPongRequest, PingRequest,
+    PongResponse, ServerPingResponse,
 };
+
+// -- Shared wire primitives + enums --
+pub use shared::enums::*;
+pub use shared::primitives::*;
+
+// -- Per-domain ops (flat re-exports preserve every existing
+//    `brain_protocol::X` import path) --
+pub use ops::admin::*;
+pub use ops::entity::*;
+pub use ops::extractor::*;
+pub use ops::memory::*;
+pub use ops::procedural::*;
+pub use ops::query::*;
+pub use ops::relation::*;
+pub use ops::statement::*;
+pub use ops::subscribe::*;
+pub use ops::txn::*;
+
+// -- Schema (DSL + wire ops) --
+pub use schema::ops::*;
 
 /// Frame magic bytes. Identifies a Brain frame on the wire.
 pub const MAGIC: [u8; 4] = *b"BRN0";
