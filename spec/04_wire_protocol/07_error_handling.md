@@ -124,46 +124,47 @@ A more specific error code accompanies each category. The complete table:
 
 | Code | Meaning |
 |---|---|
-| `Internal` | Generic internal error (server bug) |
-| `StorageError` | Storage layer failed |
-| `IndexError` | vector index failed |
-| `EmbeddingError` | Embedding layer failed |
-| `MetadataError` | Metadata store failed |
+| `Internal` (0x0080) | Generic internal error (server bug) |
+| `StorageError` (0x0081) | Storage layer failed |
+| `IndexError` (0x0082) | Vector index failed |
+| `EmbeddingError` (0x0083) | Embedding layer failed |
+| `MetadataError` (0x0084) | Metadata store failed |
+| `Cancelled` (0x0085) | The operation was cancelled (client `CANCEL_STREAM`, server shutdown, or a parent stream aborted). Carries no `retry_after_ms`; clients MAY retry. |
 
 #### 3.9 Unavailable (Category: `Unavailable`)
 
 | Code | Meaning |
 |---|---|
-| `ShardUnavailable` | Shard not currently servable (e.g., during rebalance) |
-| `Overloaded` | Server temporarily overloaded |
-| `Restarting` | Server is restarting (drain mode) |
-| `Maintenance` | Server is in maintenance mode |
-| `HybridUnavailable` (0x0083) | Reserved for admin and diagnostic surfaces (`/health`, `ADMIN_STATUS`) when a shard reports a degraded retriever set — e.g. a tantivy segment corruption or a graph-store `pwritev2` failure observed after spawn. Never returned to a normal RECALL: shards refuse to spawn if a required retriever is unwired, so a wired retriever failing at query time propagates as an internal error rather than a downgrade signal. There is no client-visible recovery action; the remedy is operator intervention. |
+| `ShardUnavailable` (0x0090) | Shard not currently servable (e.g., during rebalance) |
+| `Overloaded` (0x0091) | Server temporarily overloaded |
+| `Restarting` (0x0092) | Server is restarting (drain mode) |
+| `Maintenance` (0x0093) | Server is in maintenance mode |
+| `RetrieverDegraded` (0x0094) | Reserved for admin and diagnostic surfaces (`/health`, `ADMIN_STATUS`) when a shard reports a degraded retriever set — e.g. a tantivy segment corruption or a graph-store `pwritev2` failure observed after spawn. Never returned to a normal RECALL: shards refuse to spawn if a required retriever is unwired, so a wired retriever failing at query time propagates as an internal error rather than a downgrade signal. There is no client-visible recovery action; the remedy is operator intervention. |
 
 #### 3.10 Typed-graph errors
 
-typed-graph opcodes (the `0x01xx` namespace) surface their own error codes. They ride the same substrate ERROR frame and are mapped into substrate categories above for retry behavior.
+Typed-graph opcodes (the `0x01xx` namespace) surface their own error codes. Codes share the same namespace discipline as opcodes — substrate codes occupy `0x00xx`, typed-graph codes occupy `0x01xx`, with the low-byte family mirroring the typed-graph opcode ranges (schema at `0x012x`, entity at `0x013x`, statement at `0x014x`, query at `0x016x`, extractor at `0x017x`). All codes ride the same ERROR frame and are mapped into substrate categories for retry behavior.
 
 | Code | Name | Family | Category |
 |---|---|---|---|
-| `0x20` | `SchemaInvalid` | Schema | Validation |
-| `0x21` | `SchemaMigrationRequired` | Schema | Conflict |
-| `0x30` | `EntityNotFound` | Entity | NotFound |
-| `0x31` | `EntityTypeMismatch` | Entity | Validation |
-| `0x32` | `EntityAmbiguous` | Entity | Conflict |
-| `0x33` | `EntityMergeConflict` | Entity | Conflict |
-| `0x40` | `StatementNotFound` | Statement | NotFound |
-| `0x41` | `StatementObjectTypeMismatch` | Statement | Validation |
-| `0x42` | `StatementContradictsExisting` | Statement | Conflict |
-| `0x60` | `QueryTimeout` | Query | Unavailable |
-| `0x61` | `QueryOverBudget` | Query | ResourceExhausted |
-| `0x70` | `ExtractorDisabled` | Extractor | Conflict |
-| `0x71` | `ExtractorBudgetExceeded` | Extractor | ResourceExhausted |
-| `0x72` | `ExtractionFailed` | Extractor | Internal |
+| `0x0120` | `SchemaInvalid` | Schema | Validation |
+| `0x0121` | `SchemaMigrationRequired` | Schema | Conflict |
+| `0x0130` | `EntityNotFound` | Entity | NotFound |
+| `0x0131` | `EntityTypeMismatch` | Entity | Validation |
+| `0x0132` | `EntityAmbiguous` | Entity | Conflict |
+| `0x0133` | `EntityMergeConflict` | Entity | Conflict |
+| `0x0140` | `StatementNotFound` | Statement | NotFound |
+| `0x0141` | `StatementObjectTypeMismatch` | Statement | Validation |
+| `0x0142` | `StatementContradictsExisting` | Statement | Conflict |
+| `0x0160` | `QueryTimeout` | Query | Unavailable |
+| `0x0161` | `QueryOverBudget` | Query | ResourceExhausted |
+| `0x0170` | `ExtractorDisabled` | Extractor | Conflict |
+| `0x0171` | `ExtractorBudgetExceeded` | Extractor | ResourceExhausted |
+| `0x0172` | `ExtractionFailed` | Extractor | Internal |
 
-These codes are carried in the ERROR frame body. The numeric values are independent of the opcode namespace and live in the `ErrorCodeWire` enum alongside the substrate codes.
+The namespace byte (`0x01`) tells operators reading a code at a glance that the failure originated in a typed-graph operation; the low-byte family (`0x4x`, `0x6x`, etc.) identifies which record family raised it. `ErrorCodeWire` is a `u16` enum carrying both substrate (`0x00xx`) and typed-graph (`0x01xx`) variants under one type.
 
-Cardinality violations on RELATION_CREATE surface as the substrate-wide `CardinalityViolation` (0x0065, §3.6) — there is no typed-graph–local code for it. Open-vocabulary qname rejections in strict mode surface as `PredicateNotInSchema` (0x004B) / `RelationTypeNotInSchema` (0x004C) under §3.4. Retriever degradation surfaces as `HybridUnavailable` (0x0083) under §3.9.
+Cardinality violations on RELATION_CREATE surface as the substrate-wide `CardinalityViolation` (0x0065, §3.6) — there is no typed-graph–local code for it. Open-vocabulary qname rejections in strict mode surface as `PredicateNotInSchema` (0x004B) / `RelationTypeNotInSchema` (0x004C) under §3.4. Retriever degradation surfaces as `RetrieverDegraded` (0x0094) under §3.9.
 
 ##### 3.10.1 Retry consequences for typed-graph codes
 
@@ -290,12 +291,12 @@ Strictly, this isn't an error — `CANCEL_STREAM_ACK` is a normal response. But 
 ```
 S → C: ERROR(stream_id=<cancelled stream>, EOS)
        payload:
-         code: Cancelled
+         code: Cancelled (0x0085)
          category: Internal
          message: "Stream cancelled by client"
 ```
 
-This is one of the open design questions: whether cancellation should be an error or a normal frame. See [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) WP-OQ-2.
+`Cancelled` is the assigned `Internal`-category code (§3.8). It is reused for client `CANCEL_STREAM`, server shutdown mid-stream, and parent-stream aborts. The category is `Internal` rather than a new `Cancelled` category because the retry policy is identical to other `Internal` codes (clients MAY retry; no specific `retry_after_ms` is meaningful).
 
 ### 10. Limits on error verbosity
 

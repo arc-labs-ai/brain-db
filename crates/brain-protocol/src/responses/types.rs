@@ -386,11 +386,30 @@ pub enum ErrorCodeWire {
     IndexError = 0x0082,
     EmbeddingError = 0x0083,
     MetadataError = 0x0084,
+    Cancelled = 0x0085,
     // Unavailable
     ShardUnavailable = 0x0090,
     Overloaded = 0x0091,
     Restarting = 0x0092,
     Maintenance = 0x0093,
+    RetrieverDegraded = 0x0094,
+
+    // Typed-graph error codes (0x01xx namespace; low-byte family mirrors
+    // the typed-graph opcode ranges). See spec §04/07 §3.10.
+    SchemaInvalid = 0x0120,
+    SchemaMigrationRequired = 0x0121,
+    EntityNotFound = 0x0130,
+    EntityTypeMismatch = 0x0131,
+    EntityAmbiguous = 0x0132,
+    EntityMergeConflict = 0x0133,
+    StatementNotFound = 0x0140,
+    StatementObjectTypeMismatch = 0x0141,
+    StatementContradictsExisting = 0x0142,
+    QueryTimeout = 0x0160,
+    QueryOverBudget = 0x0161,
+    ExtractorDisabled = 0x0170,
+    ExtractorBudgetExceeded = 0x0171,
+    ExtractionFailed = 0x0172,
 }
 
 impl From<ErrorCode> for ErrorCodeWire {
@@ -453,10 +472,27 @@ impl From<ErrorCode> for ErrorCodeWire {
             ErrorCode::IndexError => Self::IndexError,
             ErrorCode::EmbeddingError => Self::EmbeddingError,
             ErrorCode::MetadataError => Self::MetadataError,
+            ErrorCode::Cancelled => Self::Cancelled,
             ErrorCode::ShardUnavailable => Self::ShardUnavailable,
             ErrorCode::Overloaded => Self::Overloaded,
             ErrorCode::Restarting => Self::Restarting,
             ErrorCode::Maintenance => Self::Maintenance,
+            ErrorCode::RetrieverDegraded => Self::RetrieverDegraded,
+            // Typed-graph codes (0x01xx).
+            ErrorCode::SchemaInvalid => Self::SchemaInvalid,
+            ErrorCode::SchemaMigrationRequired => Self::SchemaMigrationRequired,
+            ErrorCode::EntityNotFound => Self::EntityNotFound,
+            ErrorCode::EntityTypeMismatch => Self::EntityTypeMismatch,
+            ErrorCode::EntityAmbiguous => Self::EntityAmbiguous,
+            ErrorCode::EntityMergeConflict => Self::EntityMergeConflict,
+            ErrorCode::StatementNotFound => Self::StatementNotFound,
+            ErrorCode::StatementObjectTypeMismatch => Self::StatementObjectTypeMismatch,
+            ErrorCode::StatementContradictsExisting => Self::StatementContradictsExisting,
+            ErrorCode::QueryTimeout => Self::QueryTimeout,
+            ErrorCode::QueryOverBudget => Self::QueryOverBudget,
+            ErrorCode::ExtractorDisabled => Self::ExtractorDisabled,
+            ErrorCode::ExtractorBudgetExceeded => Self::ExtractorBudgetExceeded,
+            ErrorCode::ExtractionFailed => Self::ExtractionFailed,
         }
     }
 }
@@ -521,10 +557,85 @@ impl From<ErrorCodeWire> for ErrorCode {
             ErrorCodeWire::IndexError => Self::IndexError,
             ErrorCodeWire::EmbeddingError => Self::EmbeddingError,
             ErrorCodeWire::MetadataError => Self::MetadataError,
+            ErrorCodeWire::Cancelled => Self::Cancelled,
             ErrorCodeWire::ShardUnavailable => Self::ShardUnavailable,
             ErrorCodeWire::Overloaded => Self::Overloaded,
             ErrorCodeWire::Restarting => Self::Restarting,
             ErrorCodeWire::Maintenance => Self::Maintenance,
+            ErrorCodeWire::RetrieverDegraded => Self::RetrieverDegraded,
+            // Typed-graph codes (0x01xx).
+            ErrorCodeWire::SchemaInvalid => Self::SchemaInvalid,
+            ErrorCodeWire::SchemaMigrationRequired => Self::SchemaMigrationRequired,
+            ErrorCodeWire::EntityNotFound => Self::EntityNotFound,
+            ErrorCodeWire::EntityTypeMismatch => Self::EntityTypeMismatch,
+            ErrorCodeWire::EntityAmbiguous => Self::EntityAmbiguous,
+            ErrorCodeWire::EntityMergeConflict => Self::EntityMergeConflict,
+            ErrorCodeWire::StatementNotFound => Self::StatementNotFound,
+            ErrorCodeWire::StatementObjectTypeMismatch => Self::StatementObjectTypeMismatch,
+            ErrorCodeWire::StatementContradictsExisting => Self::StatementContradictsExisting,
+            ErrorCodeWire::QueryTimeout => Self::QueryTimeout,
+            ErrorCodeWire::QueryOverBudget => Self::QueryOverBudget,
+            ErrorCodeWire::ExtractorDisabled => Self::ExtractorDisabled,
+            ErrorCodeWire::ExtractorBudgetExceeded => Self::ExtractorBudgetExceeded,
+            ErrorCodeWire::ExtractionFailed => Self::ExtractionFailed,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ErrorCode;
+
+    /// Spec-pinned numeric values for the new codes. If these change, the
+    /// wire format changed and this test catches it.
+    #[test]
+    fn new_codes_have_spec_numeric_values() {
+        assert_eq!(ErrorCodeWire::Cancelled as u16, 0x0085);
+        assert_eq!(ErrorCodeWire::RetrieverDegraded as u16, 0x0094);
+        assert_eq!(ErrorCodeWire::SchemaInvalid as u16, 0x0120);
+        assert_eq!(ErrorCodeWire::SchemaMigrationRequired as u16, 0x0121);
+        assert_eq!(ErrorCodeWire::EntityNotFound as u16, 0x0130);
+        assert_eq!(ErrorCodeWire::EntityTypeMismatch as u16, 0x0131);
+        assert_eq!(ErrorCodeWire::EntityAmbiguous as u16, 0x0132);
+        assert_eq!(ErrorCodeWire::EntityMergeConflict as u16, 0x0133);
+        assert_eq!(ErrorCodeWire::StatementNotFound as u16, 0x0140);
+        assert_eq!(ErrorCodeWire::StatementObjectTypeMismatch as u16, 0x0141);
+        assert_eq!(ErrorCodeWire::StatementContradictsExisting as u16, 0x0142);
+        assert_eq!(ErrorCodeWire::QueryTimeout as u16, 0x0160);
+        assert_eq!(ErrorCodeWire::QueryOverBudget as u16, 0x0161);
+        assert_eq!(ErrorCodeWire::ExtractorDisabled as u16, 0x0170);
+        assert_eq!(ErrorCodeWire::ExtractorBudgetExceeded as u16, 0x0171);
+        assert_eq!(ErrorCodeWire::ExtractionFailed as u16, 0x0172);
+    }
+
+    /// Round-trip every new code through the ErrorCode ↔ ErrorCodeWire
+    /// conversion. If a From impl forgets to wire up a variant, this
+    /// fails.
+    #[test]
+    fn new_codes_round_trip_through_wire_and_back() {
+        let codes = [
+            ErrorCode::Cancelled,
+            ErrorCode::RetrieverDegraded,
+            ErrorCode::SchemaInvalid,
+            ErrorCode::SchemaMigrationRequired,
+            ErrorCode::EntityNotFound,
+            ErrorCode::EntityTypeMismatch,
+            ErrorCode::EntityAmbiguous,
+            ErrorCode::EntityMergeConflict,
+            ErrorCode::StatementNotFound,
+            ErrorCode::StatementObjectTypeMismatch,
+            ErrorCode::StatementContradictsExisting,
+            ErrorCode::QueryTimeout,
+            ErrorCode::QueryOverBudget,
+            ErrorCode::ExtractorDisabled,
+            ErrorCode::ExtractorBudgetExceeded,
+            ErrorCode::ExtractionFailed,
+        ];
+        for code in codes {
+            let wire: ErrorCodeWire = code.into();
+            let back: ErrorCode = wire.into();
+            assert_eq!(code, back, "round-trip failed for {code:?}");
         }
     }
 }

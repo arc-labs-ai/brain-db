@@ -155,12 +155,63 @@ pub enum ErrorCode {
     IndexError,
     EmbeddingError,
     MetadataError,
+    /// Operation cancelled (client `CANCEL_STREAM`, server shutdown
+    /// mid-stream, or a parent stream aborted). Carried in the cancelled
+    /// stream's terminal ERROR frame.
+    Cancelled,
 
     // §3.9 Unavailable
     ShardUnavailable,
     Overloaded,
     Restarting,
     Maintenance,
+    /// Reserved for admin / diagnostic surfaces (`/health`, `ADMIN_STATUS`)
+    /// when a shard reports a degraded retriever set — e.g. tantivy
+    /// segment corruption or a graph-store `pwritev2` failure observed
+    /// after spawn. Never returned to a normal RECALL: shards refuse to
+    /// spawn if a required retriever is unwired.
+    RetrieverDegraded,
+
+    // §3.10 Typed-graph error codes (`0x01xx` namespace). Low-byte family
+    // mirrors the typed-graph opcode ranges.
+    /// Schema upload failed validation (syntax, type-ref, attribute rule, etc.).
+    SchemaInvalid,
+    /// Schema upload requires a migration plan that hasn't been executed.
+    SchemaMigrationRequired,
+    /// `ENTITY_GET` / `ENTITY_RESOLVE` / dependent ops referenced a
+    /// nonexistent entity.
+    EntityNotFound,
+    /// `ENTITY_CREATE` / `ENTITY_UPDATE` supplied an entity-type id that
+    /// is not in the active schema (or whose declared attribute types
+    /// don't match the supplied attribute blob).
+    EntityTypeMismatch,
+    /// `ENTITY_RESOLVE` returned multiple high-confidence candidates;
+    /// the disambiguation is a human/admin action.
+    EntityAmbiguous,
+    /// `ENTITY_MERGE` rejected the merge (grace period expired, already
+    /// merged, etc.).
+    EntityMergeConflict,
+    /// Statement op referenced a `StatementId` that doesn't exist.
+    StatementNotFound,
+    /// `StatementObject` doesn't match the predicate's declared object type.
+    StatementObjectTypeMismatch,
+    /// New Fact contradicts an existing active Fact for the same
+    /// (subject, predicate). Resolution: client picks `STATEMENT_SUPERSEDE`
+    /// or leaves both active.
+    StatementContradictsExisting,
+    /// `QUERY` / `RECALL_HYBRID` exceeded its wall-time budget.
+    QueryTimeout,
+    /// `QUERY` exceeded its declared cost budget (top_k × retrievers ×
+    /// per-hit cost).
+    QueryOverBudget,
+    /// Extractor governance op (`EXTRACTOR_DISABLE` / `_ENABLE`) refused —
+    /// extractor is disabled by the operator or unreachable.
+    ExtractorDisabled,
+    /// LLM extractor's per-call cost budget exceeded.
+    ExtractorBudgetExceeded,
+    /// LLM extractor failed (provider error, schema-invalid output after
+    /// retry, projection failed).
+    ExtractionFailed,
 }
 
 impl ErrorCode {
@@ -238,11 +289,36 @@ impl ErrorCode {
             | Self::StorageError
             | Self::IndexError
             | Self::EmbeddingError
-            | Self::MetadataError => ErrorCategory::Internal,
+            | Self::MetadataError
+            | Self::Cancelled
+            | Self::ExtractionFailed => ErrorCategory::Internal,
 
             // Unavailable codes.
-            Self::ShardUnavailable | Self::Overloaded | Self::Restarting | Self::Maintenance => {
-                ErrorCategory::Unavailable
+            Self::ShardUnavailable
+            | Self::Overloaded
+            | Self::Restarting
+            | Self::Maintenance
+            | Self::RetrieverDegraded
+            | Self::QueryTimeout => ErrorCategory::Unavailable,
+
+            // Typed-graph validation codes.
+            Self::SchemaInvalid
+            | Self::EntityTypeMismatch
+            | Self::StatementObjectTypeMismatch => ErrorCategory::Validation,
+
+            // Typed-graph not-found codes.
+            Self::EntityNotFound | Self::StatementNotFound => ErrorCategory::NotFound,
+
+            // Typed-graph conflict codes.
+            Self::SchemaMigrationRequired
+            | Self::EntityAmbiguous
+            | Self::EntityMergeConflict
+            | Self::StatementContradictsExisting
+            | Self::ExtractorDisabled => ErrorCategory::Conflict,
+
+            // Typed-graph resource-exhausted codes.
+            Self::QueryOverBudget | Self::ExtractorBudgetExceeded => {
+                ErrorCategory::ResourceExhausted
             }
         }
     }
@@ -471,6 +547,74 @@ mod tests {
         assert_eq!(
             ProtocolError::MalformedPayload("z".into()).code(),
             ErrorCode::MalformedRkyv
+        );
+    }
+
+    /// Pins every typed-graph code (§3.10) + the newly-assigned Cancelled
+    /// (§3.8) and RetrieverDegraded (§3.9) to the categories the spec lists.
+    /// Drift guard: if the spec changes a category, this fails and forces
+    /// an explicit decision rather than silent drift.
+    #[test]
+    fn typed_graph_and_new_codes_match_spec_categories() {
+        // §3.8 Internal additions.
+        assert_eq!(ErrorCode::Cancelled.category(), ErrorCategory::Internal);
+
+        // §3.9 Unavailable additions.
+        assert_eq!(
+            ErrorCode::RetrieverDegraded.category(),
+            ErrorCategory::Unavailable
+        );
+
+        // §3.10 Typed-graph codes.
+        assert_eq!(ErrorCode::SchemaInvalid.category(), ErrorCategory::Validation);
+        assert_eq!(
+            ErrorCode::SchemaMigrationRequired.category(),
+            ErrorCategory::Conflict
+        );
+        assert_eq!(ErrorCode::EntityNotFound.category(), ErrorCategory::NotFound);
+        assert_eq!(
+            ErrorCode::EntityTypeMismatch.category(),
+            ErrorCategory::Validation
+        );
+        assert_eq!(
+            ErrorCode::EntityAmbiguous.category(),
+            ErrorCategory::Conflict
+        );
+        assert_eq!(
+            ErrorCode::EntityMergeConflict.category(),
+            ErrorCategory::Conflict
+        );
+        assert_eq!(
+            ErrorCode::StatementNotFound.category(),
+            ErrorCategory::NotFound
+        );
+        assert_eq!(
+            ErrorCode::StatementObjectTypeMismatch.category(),
+            ErrorCategory::Validation
+        );
+        assert_eq!(
+            ErrorCode::StatementContradictsExisting.category(),
+            ErrorCategory::Conflict
+        );
+        assert_eq!(
+            ErrorCode::QueryTimeout.category(),
+            ErrorCategory::Unavailable
+        );
+        assert_eq!(
+            ErrorCode::QueryOverBudget.category(),
+            ErrorCategory::ResourceExhausted
+        );
+        assert_eq!(
+            ErrorCode::ExtractorDisabled.category(),
+            ErrorCategory::Conflict
+        );
+        assert_eq!(
+            ErrorCode::ExtractorBudgetExceeded.category(),
+            ErrorCategory::ResourceExhausted
+        );
+        assert_eq!(
+            ErrorCode::ExtractionFailed.category(),
+            ErrorCategory::Internal
         );
     }
 
