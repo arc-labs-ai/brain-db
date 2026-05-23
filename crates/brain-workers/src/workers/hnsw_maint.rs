@@ -4,8 +4,10 @@
 //!   1. Collects `IndexStats` from `SharedHnsw`.
 //!   2. Evaluates `decide_action(stats, thresholds)`.
 //!   3. On `FullRebuild`, asks the pluggable [`RebuildSource`] for a
-//!      `(MemoryId, [f32; D])` stream and rebuilds the index.
-//!   4. Calls `SharedHnsw::swap()` to atomically install the result.
+//!      `(MemoryId, [f32; D])` stream and rebuilds the index, folding
+//!      in the `SharedHnsw` pending buffer so no writes are lost.
+//!   4. Publishes the new epoch via `SharedHnsw::flush_with_rebuild`,
+//!      which atomically swaps main and drains pending in one step.
 //!
 //! ## v1 deviations (documented)
 //!
@@ -229,10 +231,44 @@ async fn do_maintenance_cycle(
             match worker.rebuild_source.snapshot_vectors().await {
                 Ok(vectors) => {
                     let params = index.params();
-                    let (new_idx, _report) = HnswIndex::<{ VECTOR_DIM }>::rebuild(params, vectors)
+                    // Fold the arena snapshot together with the pending
+                    // buffer so writes that landed after the snapshot
+                    // started are preserved in the new epoch. The
+                    // flush_with_rebuild call atomically publishes the
+                    // new main and drains pending.
+                    let flush = index
+                        .flush_with_rebuild(move |pending_snapshot| {
+                            let mut combined: Vec<(MemoryId, [f32; VECTOR_DIM])> = vectors;
+                            // Deduplicate against the arena snapshot:
+                            // pending entries shadow arena entries for
+                            // the same id (latest vector wins).
+                            let arena_ids: std::collections::HashSet<MemoryId> =
+                                combined.iter().map(|(id, _)| *id).collect();
+                            for entry in pending_snapshot {
+                                if entry.tombstoned {
+                                    continue;
+                                }
+                                if arena_ids.contains(&entry.memory_id) {
+                                    if let Some(slot) = combined
+                                        .iter_mut()
+                                        .find(|(id, _)| *id == entry.memory_id)
+                                    {
+                                        slot.1 = entry.vector;
+                                    }
+                                } else {
+                                    combined.push((entry.memory_id, entry.vector));
+                                }
+                            }
+                            let (idx, _) = HnswIndex::<{ VECTOR_DIM }>::rebuild(params, combined)?;
+                            Ok(idx)
+                        })
                         .map_err(|e| WorkerError::Ops(format!("rebuild: {e:?}")))?;
-                    index.swap(new_idx);
-                    trace!(?stats, "hnsw maintenance: full rebuild complete");
+                    trace!(
+                        ?stats,
+                        new_epoch = flush.new_epoch,
+                        entries_flushed = flush.entries_flushed,
+                        "hnsw maintenance: full rebuild complete"
+                    );
                     Ok(1)
                 }
                 Err(RebuildSourceError::Disabled) => {

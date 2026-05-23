@@ -123,6 +123,15 @@ pub enum HnswError {
 
     #[error("hnsw_rs load failed: {0}")]
     HnswLoadFailed(String),
+
+    /// `save_snapshot` was called with un-flushed entries in pending.
+    /// The maintenance worker must call `flush_with_rebuild` first so
+    /// the snapshot reflects the full live state.
+    #[error("pending buffer not empty: {entries} entries + {tombstones} tombstones; flush first")]
+    PendingNotEmpty {
+        entries: usize,
+        tombstones: usize,
+    },
 }
 
 impl From<HeaderError> for HnswError {

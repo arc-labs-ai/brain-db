@@ -504,10 +504,12 @@ dependencies = [
 name = "brain-index"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "blake3",
  "brain-core",
  "crc32c",
  "criterion",
+ "crossbeam-epoch",
  "hnsw_rs",
  "parking_lot",
  "regex",

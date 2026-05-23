@@ -62,7 +62,7 @@ pub use semantic_retriever::{
     DEFAULT_TIMEOUT_MS as SEMANTIC_DEFAULT_TIMEOUT_MS, DEFAULT_TOP_K as SEMANTIC_DEFAULT_TOP_K,
     EF_SEARCH_MAX as SEMANTIC_EF_SEARCH_MAX, VECTOR_DIM as SEMANTIC_VECTOR_DIM,
 };
-pub use shared::{SharedHnsw, Writer};
+pub use shared::{FlushReport, PendingEntry, SharedHnsw, Writer};
 pub use statement_hnsw::{
     RebuildReport as StatementRebuildReport, StatementHnswError, StatementHnswIndex,
     StatementHnswParams,

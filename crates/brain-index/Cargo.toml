@@ -15,6 +15,10 @@ tracing.workspace = true
 blake3.workspace = true
 crc32c.workspace = true
 parking_lot.workspace = true
+# Lock-free epoch publication for SharedHnsw's two-tier main/pending
+# model: reads against the published main HNSW never block on writes.
+arc-swap = { workspace = true }
+crossbeam-epoch = { workspace = true }
 # Phase 22.1 — lexical retrieval. tantivy provides the BM25
 # index used by the LexicalRetriever (§23/02) and laid out per
 # §26/01. Schema-version stamping uses serde_json on the
@@ -44,4 +48,8 @@ harness = false
 
 [[bench]]
 name = "lexical_retrieve"
+harness = false
+
+[[bench]]
+name = "lock_free_read_stall"
 harness = false
