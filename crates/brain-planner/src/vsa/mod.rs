@@ -30,6 +30,7 @@ pub mod codebook;
 pub mod errors;
 pub mod fft;
 pub mod ops;
+pub mod semantic_centroid;
 
 pub use analogy::{
     analogy_query, encode_triple, query_role, ROLE_OBJECT, ROLE_PREDICATE, ROLE_SUBJECT,
@@ -37,3 +38,4 @@ pub use analogy::{
 pub use codebook::Codebook;
 pub use errors::VsaError;
 pub use ops::{bind, bundle, cosine, normalize, random_vec, unbind, VsaVec, VSA_DIM};
+pub use semantic_centroid::{cosine_to_centroid, semantic_centroid};

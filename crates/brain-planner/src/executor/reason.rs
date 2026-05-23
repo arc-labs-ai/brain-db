@@ -26,10 +26,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use brain_core::{EdgeKind, MemoryId};
+use brain_embed::VECTOR_DIM;
 use brain_metadata::tables::edge::list_memory_edges_from;
+use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_protocol::envelope::request::ObservationInput;
 
 use crate::plan::reason::ReasonPlan;
+use crate::vsa::{cosine_to_centroid, semantic_centroid};
 
 use super::context::ExecutorContext;
 use super::error::ExecError;
@@ -53,6 +56,14 @@ pub async fn execute_reason(
         });
     }
 
+    // Consensus direction across the base set. The outward walk uses
+    // this to damp evidence whose memory text drifts away from the
+    // topic — it can only quiet noise, never amplify past the
+    // un-aligned baseline. `None` when the base is a singleton, when
+    // any required text row is missing, or when an embed errors;
+    // walk_outward then proceeds with neutral alignment (factor = 1).
+    let base_centroid = build_base_centroid(&plan.observation, &base_scores, ctx);
+
     let started = Instant::now();
     let wall_ms = u64::from(plan.budget_wall_time_ms);
     let max_inferences = plan.max_inferences as usize;
@@ -75,6 +86,7 @@ pub async fn execute_reason(
         ctx,
         started,
         wall_ms,
+        base_centroid.as_ref(),
     )?;
 
     // Direct-similarity supporting items: every base memory is a
@@ -97,6 +109,7 @@ pub async fn execute_reason(
         ctx,
         started,
         wall_ms,
+        base_centroid.as_ref(),
     )?;
 
     // 3+4. Apply confidence floor + trim.
@@ -199,6 +212,7 @@ fn walk_outward(
     ctx: &ExecutorContext,
     started: Instant,
     wall_ms: u64,
+    base_centroid: Option<&[f32; VECTOR_DIM]>,
 ) -> Result<Vec<EvidenceItem>, ExecError> {
     if edge_kinds.is_empty() || max_depth == 0 {
         return Ok(Vec::new());
@@ -286,17 +300,22 @@ fn walk_outward(
             #[allow(clippy::cast_precision_loss)]
             let decay = 1.0_f32 / (1.0 + new_depth as f32);
             // evidence_strength =
-            // base_similarity × ∏ edge.weight × decay(distance).
+            // base_similarity × ∏ edge.weight × decay(distance)
+            // × topic_alignment_factor.
             // We take abs() on weights so Contradicts paths with
             // negative weights still produce well-defined positive
             // scores; the sign is captured by classification (supports
-            // vs contradicts) at a higher level.
+            // vs contradicts) at a higher level. The topic alignment
+            // damps evidence whose memory text drifts away from the
+            // base set — its range is [0, 1] so an aligned candidate
+            // sees no boost, only a mis-aligned one gets quieted.
             let weight_product: f32 = edge_weights
                 .iter()
                 .map(|w| w.abs())
                 .product::<f32>()
                 .max(0.0);
-            let score = crumb.base_similarity * decay * weight_product;
+            let alignment = topic_alignment_factor(next, base_centroid, &rtxn, ctx);
+            let score = crumb.base_similarity * decay * weight_product * alignment;
             evidence.push(EvidenceItem {
                 memory_id: next,
                 score,
@@ -345,6 +364,127 @@ fn filter_and_trim(items: Vec<EvidenceItem>, floor: f32, max: usize) -> Vec<Evid
     });
     filtered.truncate(max);
     filtered
+}
+
+// ---------------------------------------------------------------------------
+// Topic-alignment heuristic. Bundles the base memories' embeddings
+// into a single direction (sum + L2 normalize, the HRR bundling
+// algebra applied in the 384-dim embedding space) and damps evidence
+// whose own embedding drifts away from that direction. Multiplicative
+// factor in [0, 1] — aligned candidates score at the unmodified
+// baseline; orthogonal/opposite candidates get quieted.
+// ---------------------------------------------------------------------------
+
+/// Build the consensus direction across a base set by re-embedding
+/// each member's stored text. Returns `None` when:
+///
+/// - the set is a singleton (centroid would equal the only input —
+///   the damper degenerates to a self-cosine and provides no signal),
+/// - the observation is `ByText` (we already represent the user's
+///   intent through `base_similarity`; layering it twice would
+///   double-count rather than add a new axis),
+/// - any required text row is missing,
+/// - or the embedder errors / the sum is zero-norm.
+fn build_base_centroid(
+    observation: &ObservationInput,
+    base: &HashMap<MemoryId, f32>,
+    ctx: &ExecutorContext,
+) -> Option<[f32; VECTOR_DIM]> {
+    if base.len() < 2 {
+        return None;
+    }
+    if matches!(observation, ObservationInput::ByText(_)) {
+        return None;
+    }
+
+    let metadata_guard = ctx.metadata.lock();
+    let rtxn = match metadata_guard.read_txn() {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::debug!(error = %e, "REASON base-centroid: read txn failed; skipping");
+            return None;
+        }
+    };
+    let table = match rtxn.open_table(TEXTS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return None,
+        Err(e) => {
+            tracing::debug!(error = %e, "REASON base-centroid: texts table open failed; skipping");
+            return None;
+        }
+    };
+
+    let mut vectors: Vec<[f32; VECTOR_DIM]> = Vec::with_capacity(base.len());
+    for id in base.keys() {
+        let row = match table.get(id.to_be_bytes()) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(?id, error = %e, "REASON base-centroid: text lookup failed; skipping");
+                return None;
+            }
+        };
+        let Some(guard) = row else { continue };
+        let text = match std::str::from_utf8(guard.value()) {
+            Ok(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        match ctx.embedder.embed(text) {
+            Ok(v) => vectors.push(v),
+            Err(e) => {
+                tracing::debug!(?id, error = %e, "REASON base-centroid: embed failed; skipping member");
+            }
+        }
+    }
+    if vectors.len() < 2 {
+        return None;
+    }
+    let refs: Vec<&[f32; VECTOR_DIM]> = vectors.iter().collect();
+    match semantic_centroid::<VECTOR_DIM>(&refs) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::debug!(error = ?e, "REASON base-centroid: bundle failed; skipping");
+            None
+        }
+    }
+}
+
+/// Multiplicative factor in `[0, 1]` that quiets evidence whose
+/// memory text drifts away from the base set's consensus direction.
+/// Returns `1.0` (no damp) when no centroid is provided, when the
+/// memory has no text row, or when any read fails — keeping the
+/// existing scoring intact whenever VSA can't add signal.
+///
+/// The cosine is remapped from `[-1, 1]` to `[0, 1]` so an opposing
+/// vector zeros the contribution rather than flipping its sign.
+///
+/// Takes the BFS-scoped read txn rather than acquiring a fresh one —
+/// `walk_outward` already holds the metadata mutex for the lifetime
+/// of the traversal and `parking_lot::Mutex` is non-reentrant.
+fn topic_alignment_factor(
+    memory_id: MemoryId,
+    base_centroid: Option<&[f32; VECTOR_DIM]>,
+    rtxn: &redb::ReadTransaction,
+    ctx: &ExecutorContext,
+) -> f32 {
+    let Some(centroid) = base_centroid else {
+        return 1.0;
+    };
+    let table = match rtxn.open_table(TEXTS_TABLE) {
+        Ok(t) => t,
+        Err(_) => return 1.0,
+    };
+    let Ok(Some(guard)) = table.get(memory_id.to_be_bytes()) else {
+        return 1.0;
+    };
+    let text = match std::str::from_utf8(guard.value()) {
+        Ok(s) if !s.is_empty() => s,
+        _ => return 1.0,
+    };
+    let Ok(vector) = ctx.embedder.embed(text) else {
+        return 1.0;
+    };
+    let cos = cosine_to_centroid(&vector, centroid);
+    (1.0 + cos) / 2.0
 }
 
 // ---------------------------------------------------------------------------

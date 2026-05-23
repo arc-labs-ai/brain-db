@@ -19,12 +19,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use brain_core::{EdgeKind, MemoryId};
+use brain_embed::VECTOR_DIM;
 use brain_metadata::tables::edge::{list_memory_edges_from, list_memory_edges_to};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_protocol::envelope::request::PlanState;
 
 use crate::plan::path::PathPlan;
+use crate::vsa::{cosine_to_centroid, semantic_centroid};
 
 use super::context::ExecutorContext;
 use super::error::ExecError;
@@ -46,6 +48,14 @@ pub async fn execute_path(plan: PathPlan, ctx: &ExecutorContext) -> Result<PathR
         });
     }
 
+    // Consensus direction across the goal-side endpoint memories. The
+    // forward BFS sorts each frontier's neighbours by cosine alignment
+    // to this centroid so the budget is spent on goal-proximate paths
+    // first. `None` whenever we can't reliably read the relevant text
+    // (missing rows, empty endpoint sets, embed failures); BFS then
+    // falls back to its native insertion order.
+    let goal_centroid = build_endpoint_centroid(&plan.goal, &goals, ctx);
+
     // 2. Bi-BFS along the configured edge kinds.
     let edge_kinds: HashSet<EdgeKind> = plan.traversal.edge_kinds.iter().copied().collect();
     let bfs = run_bidirectional_bfs(
@@ -56,6 +66,7 @@ pub async fn execute_path(plan: PathPlan, ctx: &ExecutorContext) -> Result<PathR
         plan.budget.max_branches_explored as usize,
         plan.budget.max_wall_time_ms as u64,
         plan.traversal.max_paths,
+        goal_centroid.as_ref(),
         ctx,
     )?;
 
@@ -153,6 +164,7 @@ fn run_bidirectional_bfs(
     max_branches: usize,
     max_wall_time_ms: u64,
     max_paths: usize,
+    goal_centroid: Option<&[f32; VECTOR_DIM]>,
     ctx: &ExecutorContext,
 ) -> Result<BfsRaw, ExecError> {
     // Quick win: any start == any goal.
@@ -292,6 +304,14 @@ fn run_bidirectional_bfs(
                 // Drop in-flight tombstones (committed ones already
                 // dropped above).
                 neighbours.retain(|(_, other, _)| !snap.tombstoned.contains(other));
+            }
+
+            // Forward-frontier only: spend the budget on neighbours
+            // whose memory text aligns with the goal direction first.
+            // The backward frontier is already at the goal; sorting it
+            // by goal proximity is a no-op.
+            if is_forward {
+                neighbours = order_by_goal_proximity(neighbours, goal_centroid, &rtxn, ctx);
             }
 
             for (kind, next, weight) in neighbours {
@@ -535,6 +555,194 @@ fn score_path(p: &Path, scoring: &crate::plan::path::ScoringStep) -> f32 {
         1.0
     };
     length_score * edge_score * salience_score
+}
+
+// ---------------------------------------------------------------------------
+// Goal-direction heuristic: pull a semantic centroid out of the goal-
+// side endpoint memories and bias the forward-expansion order toward
+// neighbours that already point that way. Algebra mirrors HRR bundling
+// (sum + L2 normalize) operating directly in the 384-dim embedding
+// space so we don't need a separate projection.
+// ---------------------------------------------------------------------------
+
+/// Build the consensus direction for an endpoint set by re-embedding
+/// each memory's stored text. `None` whenever:
+///
+/// - the endpoint set is empty,
+/// - any required text row is missing or non-UTF-8,
+/// - the embedder errors on a candidate,
+/// - or the resulting sum has no well-defined direction (zero-norm).
+///
+/// Returns the L2-normalized sum across whichever endpoints we can
+/// read — partial reads still produce a centroid, since the BFS only
+/// needs a direction, not a faithful average.
+fn build_endpoint_centroid(
+    state: &PlanState,
+    endpoints: &HashSet<MemoryId>,
+    ctx: &ExecutorContext,
+) -> Option<[f32; VECTOR_DIM]> {
+    if endpoints.is_empty() {
+        return None;
+    }
+
+    // ByText: re-embed the cue directly. The dispatcher cache keeps
+    // this sub-µs on repeats.
+    if let PlanState::ByText(text) = state {
+        return match ctx.embedder.embed(text) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::debug!(error = %e, "PLAN goal-centroid: embed of cue failed; skipping");
+                None
+            }
+        };
+    }
+
+    // ByMemoryId / ByVector fallthrough: look up each endpoint's text
+    // row and embed it. Skip silently on any failure — the BFS still
+    // runs, just without the goal-direction sort.
+    let vectors = match collect_endpoint_text_vectors(endpoints, ctx) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, "PLAN goal-centroid: text/embed lookup failed; skipping");
+            return None;
+        }
+    };
+    if vectors.is_empty() {
+        return None;
+    }
+    let refs: Vec<&[f32; VECTOR_DIM]> = vectors.iter().collect();
+    match semantic_centroid::<VECTOR_DIM>(&refs) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::debug!(error = ?e, "PLAN goal-centroid: bundle failed; skipping");
+            None
+        }
+    }
+}
+
+/// Read each endpoint memory's text from TEXTS_TABLE and embed it.
+/// Returns whatever we could resolve; missing/empty/non-UTF-8 texts
+/// are skipped quietly. An error here means the metadata read itself
+/// failed — the caller treats that as "no centroid" rather than
+/// failing the whole PLAN.
+fn collect_endpoint_text_vectors(
+    endpoints: &HashSet<MemoryId>,
+    ctx: &ExecutorContext,
+) -> Result<Vec<[f32; VECTOR_DIM]>, ExecError> {
+    let metadata_guard = ctx.metadata.lock();
+    let rtxn = metadata_guard
+        .read_txn()
+        .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
+    let table = match rtxn.open_table(TEXTS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(ExecError::MetadataReadFailed(e.to_string())),
+    };
+
+    let mut out = Vec::with_capacity(endpoints.len());
+    for &id in endpoints {
+        let row = table
+            .get(id.to_be_bytes())
+            .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
+        let Some(guard) = row else { continue };
+        let text = match std::str::from_utf8(guard.value()) {
+            Ok(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        match ctx.embedder.embed(text) {
+            Ok(v) => out.push(v),
+            Err(e) => {
+                tracing::debug!(?id, error = %e, "PLAN goal-centroid: embed of endpoint text failed; skipping endpoint");
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Order the forward-expansion neighbours by how well their memory
+/// vectors align with the goal centroid. Returns the input unchanged
+/// when no centroid is provided, when any vector read fails, or when
+/// fewer than two neighbours are present (a single candidate is
+/// already optimal).
+///
+/// Reuses the BFS-scoped `rtxn` rather than acquiring a fresh one —
+/// the executor holds the metadata mutex for the lifetime of the BFS
+/// (single read txn shared across all neighbour lookups), and
+/// `parking_lot::Mutex` is non-reentrant.
+fn order_by_goal_proximity(
+    mut neighbours: Vec<(EdgeKind, MemoryId, f32)>,
+    goal_centroid: Option<&[f32; VECTOR_DIM]>,
+    rtxn: &redb::ReadTransaction,
+    ctx: &ExecutorContext,
+) -> Vec<(EdgeKind, MemoryId, f32)> {
+    let Some(centroid) = goal_centroid else {
+        return neighbours;
+    };
+    if neighbours.len() < 2 {
+        return neighbours;
+    }
+
+    let scores = match neighbour_alignment_scores(&neighbours, centroid, rtxn, ctx) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(error = %e, "PLAN goal-direction: neighbour alignment lookup failed; proceeding unsorted");
+            return neighbours;
+        }
+    };
+
+    // Stable sort by alignment descending. Equal scores preserve the
+    // original insertion order so the centroid only re-ranks where it
+    // has signal.
+    let mut indexed: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out = Vec::with_capacity(neighbours.len());
+    for (i, _) in indexed {
+        out.push(neighbours[i]);
+    }
+    // Drop the original by swap to free its allocation.
+    neighbours.clear();
+    out
+}
+
+/// Per-neighbour cosine to the goal centroid, derived from each
+/// neighbour's stored text. Returns one score per neighbour preserving
+/// the input order. Missing text → 0.0 (neutral, sorts last after any
+/// positively-aligned candidate). A metadata-read failure short-
+/// circuits the whole call so the caller can fall back to unsorted.
+fn neighbour_alignment_scores(
+    neighbours: &[(EdgeKind, MemoryId, f32)],
+    centroid: &[f32; VECTOR_DIM],
+    rtxn: &redb::ReadTransaction,
+    ctx: &ExecutorContext,
+) -> Result<Vec<f32>, ExecError> {
+    let table = match rtxn.open_table(TEXTS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            // No texts table → no signal to sort on; return all-zero
+            // so the original order is preserved by the stable sort.
+            return Ok(vec![0.0; neighbours.len()]);
+        }
+        Err(e) => return Err(ExecError::MetadataReadFailed(e.to_string())),
+    };
+
+    let mut scores = Vec::with_capacity(neighbours.len());
+    for (_, id, _) in neighbours {
+        let row = table
+            .get(id.to_be_bytes())
+            .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
+        let score = match row {
+            Some(guard) => match std::str::from_utf8(guard.value()) {
+                Ok(s) if !s.is_empty() => match ctx.embedder.embed(s) {
+                    Ok(v) => cosine_to_centroid(&v, centroid),
+                    Err(_) => 0.0,
+                },
+                _ => 0.0,
+            },
+            None => 0.0,
+        };
+        scores.push(score);
+    }
+    Ok(scores)
 }
 
 // ---------------------------------------------------------------------------
