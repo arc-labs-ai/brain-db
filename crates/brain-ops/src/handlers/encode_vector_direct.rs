@@ -157,7 +157,6 @@ pub async fn handle_encode_vector_direct(
                 embedding_model_fp: server_fp,
                 pending_stages: Vec::new(),
                 has_active_schema: true,
-                has_llm_extractor: ctx.extractor_registry.read().has_enabled_llm_extractor(),
             });
         }
     }
@@ -247,7 +246,6 @@ pub async fn handle_encode_vector_direct(
         embedding_model_fp: server_fp,
         pending_stages,
         has_active_schema: true,
-        has_llm_extractor: ctx.extractor_registry.read().has_enabled_llm_extractor(),
     })
 }
 
@@ -462,7 +460,6 @@ fn reconstruct_response(
         embedding_model_fp,
         pending_stages,
         has_active_schema: true,
-        has_llm_extractor: ctx.extractor_registry.read().has_enabled_llm_extractor(),
     })
 }
 

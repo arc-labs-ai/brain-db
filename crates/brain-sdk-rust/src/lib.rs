@@ -87,7 +87,7 @@ pub use brain_core::{
 };
 pub use brain_protocol::envelope::request::BackfillScope;
 pub use brain_protocol::envelope::response::{
-    AdminBackfillCancelResponse, AdminBackfillResponse, BackfillProgress,
+    AdminBackfillCancelResponse, AdminBackfillResponse, BackfillProgress, Capabilities,
 };
 pub use client::Client;
 pub use config::{AuthMethod, ClientConfig};

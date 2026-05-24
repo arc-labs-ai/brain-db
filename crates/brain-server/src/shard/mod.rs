@@ -292,6 +292,47 @@ pub struct ShardSpawnConfig {
     /// production this is a `CachingDispatcher<CpuDispatcher>`; tests
     /// inject a file-local stub.
     pub dispatcher: Arc<dyn Dispatcher>,
+    /// Operator gate on the cross-encoder rerank capability. Operator
+    /// flips `enabled = false` to opt out — request-time opt-ins then
+    /// surface as `CapabilityNotEnabled`. Enabled-but-fails-to-load is
+    /// a hard spawn failure (see [`ShardError::CrossEncoderInitFailed`]).
+    pub rerank: RerankSpawnConfig,
+    /// Per-tier extractor gates. `Disabled` skips the materialiser
+    /// for that tier; rows of that kind never make it into the
+    /// registry. `Enabled` lets the materialiser run; init-time
+    /// errors there propagate as [`ShardError::ExtractorInitFailed`].
+    pub extractors: ExtractorTierSpawnConfig,
+}
+
+/// Knobs ferried from `Config.rerank` into the spawn path.
+#[derive(Clone, Debug)]
+pub struct RerankSpawnConfig {
+    pub enabled: bool,
+}
+
+impl Default for RerankSpawnConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Knobs ferried from `Config.extractors` into the spawn path. One
+/// `enabled` bit per tier; the materialiser honours each in turn.
+#[derive(Clone, Copy, Debug)]
+pub struct ExtractorTierSpawnConfig {
+    pub pattern_enabled: bool,
+    pub classifier_enabled: bool,
+    pub llm_enabled: bool,
+}
+
+impl Default for ExtractorTierSpawnConfig {
+    fn default() -> Self {
+        Self {
+            pattern_enabled: true,
+            classifier_enabled: true,
+            llm_enabled: true,
+        }
+    }
 }
 
 /// Knobs ferried from `Config.workers.auto_edge` into the spawn path.
@@ -442,6 +483,8 @@ impl ShardSpawnConfig {
             temporal_edge: TemporalEdgeSpawnConfig::default(),
             causal_edge: CausalEdgeSpawnConfig::default(),
             dispatcher,
+            rerank: RerankSpawnConfig::default(),
+            extractors: ExtractorTierSpawnConfig::default(),
         }
     }
 }
@@ -520,6 +563,23 @@ pub enum ShardError {
     LexicalRetrieverInitFailed {
         #[source]
         source: brain_index::LexicalError,
+    },
+
+    /// Operator left `rerank.enabled = true` (the default) but the
+    /// cross-encoder model failed to load. We refuse to spawn rather
+    /// than silently degrade — an opt-in rerank request against a
+    /// silently-degraded shard would produce wrong results.
+    #[error("cross-encoder init failed: {0}")]
+    CrossEncoderInitFailed(String),
+
+    /// An enabled extractor tier failed to initialise at shard spawn.
+    /// Disabled-by-config tiers never raise this; only tiers the
+    /// operator explicitly opted into.
+    #[error("extractor tier \"{tier}\" init failed: {source}")]
+    ExtractorInitFailed {
+        tier: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
@@ -1193,6 +1253,68 @@ pub fn spawn_shard(
     let extractor_spawn_cfg_for_closure = cfg.extractor.clone();
     let temporal_edge_spawn_cfg_for_closure = cfg.temporal_edge.clone();
     let causal_edge_spawn_cfg_for_closure = cfg.causal_edge.clone();
+
+    // ---- Cross-encoder (rerank) capability gate ----------------------------
+    //
+    // Loaded outside the Glommio executor so failures map to a clean
+    // `ShardError::CrossEncoderInitFailed` instead of an in-closure panic.
+    // The `Arc<CrossEncoder>` is then cloned into the closure and lives
+    // on `OpsContext` via `CrossEncoderSlot::Enabled`. When the operator
+    // turns rerank off in config, the slot is `Disabled` and request-time
+    // opt-ins surface as `CapabilityNotEnabled` — clients learn the
+    // capability isn't available without falling back to RRF silently.
+    let cross_encoder_slot: brain_ops::CrossEncoderSlot = if cfg.rerank.enabled {
+        match brain_rerank::try_load() {
+            Ok(Some(encoder)) => {
+                tracing::info!(
+                    target: "brain_server::shard",
+                    shard_id,
+                    "cross-encoder loaded; rerank capability online",
+                );
+                brain_ops::CrossEncoderSlot::Enabled(Arc::new(encoder))
+            }
+            Ok(None) => {
+                // Operator left `rerank.enabled = true` but no model
+                // is on disk. We treat this as a misconfiguration —
+                // an opt-in rerank request would silently fall back
+                // to RRF otherwise, and the operator wouldn't notice
+                // the rerank capability is dead.
+                return Err(ShardError::CrossEncoderInitFailed(
+                    "no cross-encoder model found (set BRAIN_RERANK_MODEL_DIR or place \
+                     weights at the XDG default path); set [rerank] enabled = false to \
+                     opt out explicitly"
+                        .to_string(),
+                ));
+            }
+            Err(err) => {
+                return Err(ShardError::CrossEncoderInitFailed(format!(
+                    "cross-encoder load failed: {err}",
+                )));
+            }
+        }
+    } else {
+        tracing::info!(
+            target: "brain_server::shard",
+            shard_id,
+            "rerank disabled by config; opt-in requests will return CapabilityNotEnabled",
+        );
+        brain_ops::CrossEncoderSlot::Disabled
+    };
+    let cross_encoder_for_closure = cross_encoder_slot.clone();
+
+    // Per-tier extractor gate — used inside the closure when the
+    // materialiser walks persisted definitions. Disabled tiers skip
+    // materialisation silently (operator opt-out, not a degradation);
+    // enabled tiers that fail to init surface as
+    // `ShardError::ExtractorInitFailed` (the materialiser already
+    // returns per-row errors; we promote any LLM / classifier error
+    // there into a hard spawn failure when the tier is enabled).
+    let tier_gate = brain_extractors::TierGate {
+        pattern: brain_extractors::TierState::from_enabled(cfg.extractors.pattern_enabled),
+        classifier: brain_extractors::TierState::from_enabled(cfg.extractors.classifier_enabled),
+        llm: brain_extractors::TierState::from_enabled(cfg.extractors.llm_enabled),
+    };
+    let tier_gate_for_closure = tier_gate;
     // Construct the Phase B / Phase E metric handles up-front so we
     // can both stash them on `ShardHandle` (for /metrics exposition)
     // and inject them into the writer + worker (so both sides bump
@@ -1494,8 +1616,11 @@ pub fn spawn_shard(
 
                 let materialize_deps = llm_deps
                     .into_materialize_deps(classifier_model, entity_type_qnames);
-                let (reg, errors) =
-                    brain_extractors::build_registry_from_definitions(&defs, &materialize_deps);
+                let (reg, errors) = brain_extractors::build_registry_with_gate(
+                    &defs,
+                    &materialize_deps,
+                    tier_gate_for_closure,
+                );
                 for (id, err) in errors {
                     tracing::warn!(
                         target: "brain_server::shard",
@@ -1614,6 +1739,7 @@ pub fn spawn_shard(
                 .with_tantivy(Some(tantivy_for_ops))
                 .with_memory_text_dispatcher(memory_text_dispatcher_for_ops)
                 .with_statement_text_dispatcher(statement_text_dispatcher_for_ops)
+                .with_cross_encoder(cross_encoder_for_closure)
                 .with_wal_sink(Some(wal_sink_for_ops)),
             );
 

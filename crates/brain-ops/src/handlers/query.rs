@@ -346,7 +346,13 @@ fn build_executor_context(ctx: &OpsContext) -> Result<HybridExecutorContext, OpE
         lexical: ctx.lexical_retriever.clone(),
         graph: ctx.graph_retriever.clone(),
         metadata: ctx.executor.metadata.clone(),
-        cross_encoder: ctx.cross_encoder.clone(),
+        // The QUERY wire ops never opt into rerank in v1, so the
+        // executor receives `None` regardless of the slot's state.
+        // Hard-fail at request entry is RECALL's job (it carries the
+        // opt-in flag); we only thread the encoder when the slot is
+        // explicitly enabled so the executor sees the same invariant
+        // it does on the recall path.
+        cross_encoder: ctx.cross_encoder.as_arc().cloned(),
     })
 }
 

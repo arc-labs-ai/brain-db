@@ -147,8 +147,9 @@ mod linux_main {
     };
     use crate::routing::RoutingTable;
     use crate::shard::{
-        spawn_shard, AutoEdgeSpawnConfig, CausalEdgeSpawnConfig, ExtractorSpawnConfig, ShardHandle,
-        ShardJoiner, ShardSpawnConfig, TemporalEdgeSpawnConfig,
+        spawn_shard, AutoEdgeSpawnConfig, CausalEdgeSpawnConfig, ExtractorSpawnConfig,
+        ExtractorTierSpawnConfig, RerankSpawnConfig, ShardHandle, ShardJoiner, ShardSpawnConfig,
+        TemporalEdgeSpawnConfig,
     };
 
     /// Errors surfaced by [`build_dispatcher`]. Hand-rolled `Display`
@@ -527,6 +528,18 @@ mod linux_main {
                     .causal_edge
                     .max_related_statements_per_entity,
                 channel_capacity: cfg.workers.causal_edge.channel_capacity,
+            };
+            // Cross-encoder + per-tier extractor capability gates.
+            // Operator opt-outs ride the same config plumbing the
+            // worker knobs above use; spawn_shard hard-fails when an
+            // enabled capability can't be brought up.
+            spawn_cfg.rerank = RerankSpawnConfig {
+                enabled: cfg.rerank.enabled,
+            };
+            spawn_cfg.extractors = ExtractorTierSpawnConfig {
+                pattern_enabled: cfg.extractors.pattern.enabled,
+                classifier_enabled: cfg.extractors.classifier.enabled,
+                llm_enabled: cfg.extractors.llm.enabled,
             };
             match spawn_shard(shard_id as u16, spawn_cfg) {
                 Ok((h, j)) => {

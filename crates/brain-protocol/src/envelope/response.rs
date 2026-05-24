@@ -40,6 +40,7 @@ use crate::error::ProtocolError;
 pub use crate::connection::stream::{CancelStreamAck, PongResponse, ServerPingResponse};
 pub use crate::envelope::error::{ErrorDetails, ErrorResponse};
 pub use crate::ops::admin::*;
+pub use crate::ops::capabilities::*;
 pub use crate::ops::entity::*;
 pub use crate::ops::extractor::*;
 pub use crate::ops::memory::*;
@@ -77,6 +78,7 @@ pub enum ResponseBody {
     Unlink(UnlinkResponse),
     SubscribeEvent(SubscriptionEvent),
     Unsubscribe(UnsubscribeResponse),
+    GetCapabilities(GetCapabilitiesResponse),
     TxnBegin(TxnBeginResponse),
     TxnCommit(TxnCommitResponse),
     TxnAbort(TxnAbortResponse),
@@ -176,6 +178,7 @@ impl ResponseBody {
             Self::Unlink(_) => Opcode::UnlinkResp,
             Self::SubscribeEvent(_) => Opcode::SubscribeEvent,
             Self::Unsubscribe(_) => Opcode::UnsubscribeResp,
+            Self::GetCapabilities(_) => Opcode::GetCapabilitiesResp,
             Self::TxnBegin(_) => Opcode::TxnBeginResp,
             Self::TxnCommit(_) => Opcode::TxnCommitResp,
             Self::TxnAbort(_) => Opcode::TxnAbortResp,
@@ -274,6 +277,7 @@ impl ResponseBody {
             Self::Unlink(r) => to_rkyv_bytes(r),
             Self::SubscribeEvent(r) => to_rkyv_bytes(r),
             Self::Unsubscribe(r) => to_rkyv_bytes(r),
+            Self::GetCapabilities(r) => to_rkyv_bytes(r),
             Self::TxnBegin(r) => to_rkyv_bytes(r),
             Self::TxnCommit(r) => to_rkyv_bytes(r),
             Self::TxnAbort(r) => to_rkyv_bytes(r),
@@ -349,6 +353,7 @@ impl ResponseBody {
             Opcode::UnlinkResp => Self::Unlink(from_rkyv_bytes(bytes)?),
             Opcode::SubscribeEvent => Self::SubscribeEvent(from_rkyv_bytes(bytes)?),
             Opcode::UnsubscribeResp => Self::Unsubscribe(from_rkyv_bytes(bytes)?),
+            Opcode::GetCapabilitiesResp => Self::GetCapabilities(from_rkyv_bytes(bytes)?),
             Opcode::TxnBeginResp => Self::TxnBegin(from_rkyv_bytes(bytes)?),
             Opcode::TxnCommitResp => Self::TxnCommit(from_rkyv_bytes(bytes)?),
             Opcode::TxnAbortResp => Self::TxnAbort(from_rkyv_bytes(bytes)?),
@@ -464,7 +469,6 @@ mod tests {
                 StageKind::Extractor,
             ],
             has_active_schema: true,
-            has_llm_extractor: true,
         }));
     }
 
@@ -487,7 +491,6 @@ mod tests {
             embedding_model_fp: [0xBB; 16],
             pending_stages: Vec::new(),
             has_active_schema: false,
-            has_llm_extractor: false,
         }));
     }
 
@@ -612,6 +615,32 @@ mod tests {
         round_trip(ResponseBody::Unsubscribe(UnsubscribeResponse {
             target_stream_id: 7,
             final_lsn: 9999,
+        }));
+    }
+
+    #[test]
+    fn get_capabilities_response_round_trips() {
+        round_trip(ResponseBody::GetCapabilities(GetCapabilitiesResponse {
+            capabilities: Capabilities {
+                rerank: true,
+                llm_extractor: false,
+                classifier_extractor: true,
+                pattern_extractor: true,
+                schema_namespaces: vec!["acme".into(), "personal".into()],
+                vector_dim: 384,
+            },
+        }));
+        // Empty namespace list (no user schema declared) — exercise
+        // the Vec encoding's empty-collection path.
+        round_trip(ResponseBody::GetCapabilities(GetCapabilitiesResponse {
+            capabilities: Capabilities {
+                rerank: false,
+                llm_extractor: false,
+                classifier_extractor: false,
+                pattern_extractor: true,
+                schema_namespaces: Vec::new(),
+                vector_dim: 384,
+            },
         }));
     }
 

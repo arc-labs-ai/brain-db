@@ -26,7 +26,6 @@ async fn metrics_snapshot_records_request_and_op_breakdown() {
             embedding_model_fp: [0; 16],
             pending_stages: Vec::new(),
             has_active_schema: false,
-            has_llm_extractor: false,
         };
         common::write_frame(
             &mut socket,

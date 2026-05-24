@@ -62,6 +62,7 @@ brain-index = { path = "../brain-index" }
 brain-embed = { path = "../brain-embed" }
 brain-planner = { path = "../brain-planner" }
 brain-ops = { path = "../brain-ops" }
+brain-rerank = { path = "../brain-rerank" }
 brain-workers = { path = "../brain-workers" }
 # `extract --backfill` walks `memories` + `texts` redb tables directly
 # inside the shard executor (avoiding the cost of a full dispatch

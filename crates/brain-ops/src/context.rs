@@ -31,6 +31,46 @@ use crate::writer::WalSink;
 /// path. Phase 9's long-lived stream bypasses this entirely.
 pub const DEFAULT_SUBSCRIBE_POLL_WINDOW: Duration = Duration::from_secs(5);
 
+/// Per-shard cross-encoder slot. Replaces an earlier
+/// `Option<Arc<CrossEncoder>>` whose `None` conflated "model failed to
+/// load" with "operator turned this off" — two different failure modes
+/// with two different client responses.
+///
+/// The shard spawn path is now responsible for resolving which variant
+/// applies: an enabled-but-unloadable model is a spawn failure (an
+/// operator misconfiguration we refuse to mask), and an explicitly
+/// disabled model lands as `Disabled` so request-time clients get a
+/// structured `CapabilityNotEnabled` instead of silent RRF fallback.
+#[derive(Clone)]
+pub enum CrossEncoderSlot {
+    /// Operator enabled rerank and the model loaded cleanly. The
+    /// inner encoder is shared by every concurrent rerank call on
+    /// this shard.
+    Enabled(Arc<CrossEncoder>),
+    /// Operator set `rerank.enabled = false` in config. Requests that
+    /// opt into rerank return `CapabilityNotEnabled`.
+    Disabled,
+}
+
+impl CrossEncoderSlot {
+    /// True iff the operator enabled rerank and the model loaded.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled(_))
+    }
+
+    /// Borrow the underlying encoder. `None` when the slot is
+    /// `Disabled` — call sites that need a hard error must check
+    /// this and surface `CapabilityNotEnabled` to the client.
+    #[must_use]
+    pub fn as_arc(&self) -> Option<&Arc<CrossEncoder>> {
+        match self {
+            Self::Enabled(e) => Some(e),
+            Self::Disabled => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct OpsContext {
     /// Inner executor context — embedder, index, metadata, writer.
@@ -98,10 +138,18 @@ pub struct OpsContext {
     /// into it.
     pub graph_retriever: Arc<dyn GraphRetriever>,
     /// Per-shard cross-encoder (W2.2 rerank pass). Shared across
-    /// shards because the model is read-only and CPU-heavy; the
-    /// hybrid executor's rerank stage runs only when this slot is
-    /// `Some` and the caller opted in via `RecallRequest.rerank=true`.
-    pub cross_encoder: Option<Arc<CrossEncoder>>,
+    /// shards because the model is read-only and CPU-heavy.
+    ///
+    /// The enum carries semantic intent the old `Option` lost: a
+    /// `Disabled` slot means the operator turned reranking off in
+    /// config and an opt-in request must hard-fail (so the client
+    /// knows to drop the flag), whereas a previous `None` was
+    /// ambiguous between "operator disabled it" and "model failed to
+    /// load — silently fall back to RRF". Spawn now refuses to start
+    /// when `rerank.enabled = true` but loading fails, so by the
+    /// time we get here `Enabled(encoder)` always means a working
+    /// encoder.
+    pub cross_encoder: CrossEncoderSlot,
     /// WAL append sink for the knowledge-layer subscribe-replay
     /// pipeline. Knowledge handlers (the `crate::handlers::knowledge_*`
     /// modules) call [`OpsContext::publish_knowledge`] after their successful
@@ -152,7 +200,7 @@ impl OpsContext {
             lexical_retriever,
             semantic_retriever,
             graph_retriever,
-            cross_encoder: None,
+            cross_encoder: CrossEncoderSlot::Disabled,
             wal_sink: None,
         }
     }
@@ -283,11 +331,14 @@ impl OpsContext {
         self
     }
 
-    /// Install (or clear) the cross-encoder used by the W2.2
-    /// rerank pass on the hybrid RECALL path.
+    /// Install the cross-encoder slot used by the rerank pass on
+    /// the hybrid RECALL path. Pass `CrossEncoderSlot::Enabled(arc)`
+    /// when the model is loaded; pass `CrossEncoderSlot::Disabled`
+    /// when the operator opted out via `rerank.enabled = false` so
+    /// request-time clients learn the slot's intent.
     #[must_use]
-    pub fn with_cross_encoder(mut self, encoder: Option<Arc<CrossEncoder>>) -> Self {
-        self.cross_encoder = encoder;
+    pub fn with_cross_encoder(mut self, slot: CrossEncoderSlot) -> Self {
+        self.cross_encoder = slot;
         self
     }
 

@@ -288,6 +288,18 @@ pub async fn dispatch(
             .map(|b| single(ResponseBody::Unsubscribe(b))),
 
         // -----------------------------------------------------------
+        // Capability introspection. Same permission model as the
+        // connection-lifecycle ops above (no special caller bits) —
+        // capability bits don't reveal sensitive state and SDKs
+        // call this at session warm-up.
+        // -----------------------------------------------------------
+        RequestBody::GetCapabilities(r) => {
+            crate::handlers::capabilities::handle_get_capabilities(r, ctx)
+                .await
+                .map(|b| single(ResponseBody::GetCapabilities(b)))
+        }
+
+        // -----------------------------------------------------------
         // Transactions — 7.9.
         // -----------------------------------------------------------
         // TXN_BEGIN stamps the wire-level session id on the entry so
@@ -604,6 +616,12 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
         | RequestBody::Bye(_)
         | RequestBody::Ping(_)
         | RequestBody::ClientPong(_) => return Ok(()),
+
+        // Capability introspection is open to every authenticated
+        // caller — same model as the keepalive / handshake ops above.
+        // Capability bits don't reveal sensitive state and SDKs need
+        // them at session warm-up.
+        RequestBody::GetCapabilities(_) => return Ok(()),
     };
     caller.require(op_bit, what)
 }

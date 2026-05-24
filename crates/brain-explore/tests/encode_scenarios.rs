@@ -32,7 +32,6 @@ fn sample_response() -> EncodeResponse {
         embedding_model_fp: [0u8; 16],
         pending_stages: Vec::new(),
         has_active_schema: false,
-        has_llm_extractor: false,
     }
 }
 

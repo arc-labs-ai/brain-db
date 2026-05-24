@@ -23,6 +23,18 @@ pub struct Config {
     pub shard: ShardConfig,
     pub hnsw: HnswConfig,
     pub embedder: EmbedderConfig,
+    /// Cross-encoder rerank capability. Defaults to enabled; when the
+    /// operator turns it off, opt-in rerank requests hard-fail with
+    /// `CapabilityNotEnabled` instead of silently falling back to RRF.
+    #[serde(default)]
+    pub rerank: RerankConfig,
+    /// Per-tier extractor capability gates. Each tier (pattern,
+    /// classifier, LLM) defaults to enabled; when disabled the tier is
+    /// skipped silently at extraction time (operator opted out, not a
+    /// degradation). An enabled tier that fails to load is a shard
+    /// spawn failure.
+    #[serde(default)]
+    pub extractors: ExtractorsConfig,
     #[serde(default)]
     pub workers: WorkersConfig,
     #[serde(default)]
@@ -148,6 +160,72 @@ impl EmbedderConfig {
             "cannot resolve model directory for '{model}': set BRAIN_EMBED_MODEL_DIR or HOME",
         )))
     }
+}
+
+/// `[rerank]` TOML section. Controls the per-shard cross-encoder
+/// reranker. Section may be omitted; every field has a default.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RerankConfig {
+    /// Master switch. `true` (default) loads the cross-encoder at
+    /// shard spawn; `false` skips loading entirely and turns any
+    /// opt-in rerank request into a `CapabilityNotEnabled` error so
+    /// clients know to drop the flag. Enabled-but-failed-to-load is
+    /// a spawn failure — operators don't get a silently-degraded
+    /// reranker.
+    #[serde(default = "default_rerank_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for RerankConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_rerank_enabled(),
+        }
+    }
+}
+
+fn default_rerank_enabled() -> bool {
+    true
+}
+
+/// `[extractors]` TOML section. Per-tier on/off knobs for the
+/// extractor pipeline. Each tier defaults to enabled.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExtractorsConfig {
+    #[serde(default)]
+    pub pattern: ExtractorTierConfig,
+    #[serde(default)]
+    pub classifier: ExtractorTierConfig,
+    #[serde(default)]
+    pub llm: ExtractorTierConfig,
+}
+
+/// `[extractors.<tier>]` TOML sub-section. Operator gate on a single
+/// extractor tier. Tiered config keeps the on/off decision separate
+/// from the materialise-time wiring inside `brain-extractors`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExtractorTierConfig {
+    /// Master switch. `true` (default) materialises this tier into
+    /// the registry at shard spawn; `false` skips registration so
+    /// the tier never contributes. Enabled-but-failed-to-init is a
+    /// spawn failure.
+    #[serde(default = "default_extractor_tier_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for ExtractorTierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_extractor_tier_enabled(),
+        }
+    }
+}
+
+fn default_extractor_tier_enabled() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -891,6 +969,8 @@ impl Config {
                 batch_size: 1,
                 batch_window_ms: 1,
             },
+            rerank: RerankConfig::default(),
+            extractors: ExtractorsConfig::default(),
             workers: WorkersConfig::default(),
             logging: LoggingConfig::default(),
             tracing: TracingConfig::default(),

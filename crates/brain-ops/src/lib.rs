@@ -46,7 +46,7 @@ pub use handlers::{
 };
 
 pub use brain_planner::PlannerContext;
-pub use context::OpsContext;
+pub use context::{CrossEncoderSlot, OpsContext};
 pub use dispatch::{dispatch, DispatchOutcome, RequestCaller};
 pub use error::{ErrorCode, OpError};
 pub use handlers::subscribe::{

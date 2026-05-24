@@ -156,6 +156,16 @@ pub enum OpError {
     #[error("hybrid retrieval unavailable on this shard: {0}")]
     HybridUnavailable(String),
 
+    /// Client requested a capability the operator explicitly turned
+    /// off in config (`rerank.enabled = false`, an extractor tier
+    /// disabled, etc.). Distinct from `HybridUnavailable`: that one is
+    /// a *runtime degradation* of a required capability; this one is a
+    /// *deployment choice*. The client can either drop the opt-in flag
+    /// (e.g. set `rerank = false` on the recall request) or talk to a
+    /// shard where the capability is enabled.
+    #[error("capability \"{capability}\" is not enabled on this shard")]
+    CapabilityNotEnabled { capability: &'static str },
+
     /// Catch-all for internal bookkeeping: maps to
     /// wire `InternalError`. Not retryable.
     #[error("internal error: {0}")]
@@ -221,6 +231,10 @@ impl OpError {
             Self::Unauthorized(_) => ErrorCode::Unauthorized,
             Self::Overloaded(_) => ErrorCode::Overloaded,
             Self::HybridUnavailable(_) => ErrorCode::HybridUnavailable,
+            // Operator opted out of this capability — surfaces as an
+            // invalid request because the client can fix it without
+            // server-side intervention by dropping the opt-in flag.
+            Self::CapabilityNotEnabled { .. } => ErrorCode::InvalidRequest,
             Self::NotYetImplemented(_) | Self::Internal(_) => ErrorCode::InternalError,
             Self::PlanError(p) => match p {
                 PlanError::QueryTooExpensive { .. } | PlanError::InvalidParameters { .. } => {

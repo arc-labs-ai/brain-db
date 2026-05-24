@@ -250,6 +250,16 @@ impl Client {
         AdminClient::new(self)
     }
 
+    /// Fetch the connected shard's capability snapshot. Call this at
+    /// session warm-up to avoid issuing requests that would hard-fail
+    /// with `CapabilityNotEnabled` (e.g. setting `rerank=true` on a
+    /// shard whose operator turned the reranker off).
+    pub async fn capabilities(
+        &self,
+    ) -> Result<brain_protocol::envelope::response::Capabilities, ClientError> {
+        crate::ops::capabilities::capabilities(self).await
+    }
+
     /// Cancel a live subscription by its target stream id (the
     /// value returned by [`FrameStream::stream_id`] on the
     /// subscriber). The server cancels the registry entry and

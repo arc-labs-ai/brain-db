@@ -8,6 +8,7 @@
 //! surface lives on the same builders.
 
 pub mod admin;
+pub mod capabilities;
 pub mod common;
 pub mod encode;
 pub mod entity;

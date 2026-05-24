@@ -208,16 +208,6 @@ pub struct EncodeResponse {
     /// distinction matters because (a) is a deployment-time
     /// configuration story and (b) is a per-memory content story.
     pub has_active_schema: bool,
-    /// Whether at least one LLM-tier extractor is registered and
-    /// enabled on the shard the write landed on. When false (no
-    /// `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` configured at boot, or
-    /// every LLM extractor disabled via `EXTRACTOR_DISABLE`),
-    /// statements/relations are unreachable regardless of input
-    /// content — the renderer surfaces a config hint instead of the
-    /// generic "extractor produced no statements" suffix. Independent
-    /// of `has_active_schema` because the two failure modes need
-    /// different operator remediation.
-    pub has_llm_extractor: bool,
 }
 
 /// — one streaming RECALL frame.

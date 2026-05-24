@@ -545,7 +545,6 @@ fn render_human(
             let summary_with_hint = augment_extractor_summary(
                 res,
                 rendered.response.has_active_schema,
-                rendered.response.has_llm_extractor,
             );
             let summary_painted = theme.paint(Token::Value, &summary_with_hint, policy);
             writeln!(
@@ -569,7 +568,7 @@ fn render_human(
 }
 
 /// When an extractor stage reports `0 statements, 0 relations`, the
-/// raw count line doesn't tell the operator WHY. Three distinct
+/// raw count line doesn't tell the operator WHY. Two distinct
 /// conditions land at the same number:
 ///
 /// 1. The deployment has no user-declared schema. Every proposed
@@ -577,23 +576,17 @@ fn render_human(
 ///    admission filter because no predicate is registered. UX hint:
 ///    "no schema declares matching predicates".
 ///
-/// 2. A schema IS declared but the deployment has no LLM tier wired
-///    (no `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, or every LLM
-///    extractor disabled). Pattern + classifier tiers can produce
-///    entities but never statements/relations. UX hint tells the
-///    operator exactly which env var to set so the missing capability
-///    isn't a guessing game.
-///
-/// 3. Schema declared, LLM tier wired, but the input sentence
-///    didn't carry any predicate the schema covers. UX hint:
-///    "extractor produced no statements".
+/// 2. Schema declared, but the input sentence didn't carry any
+///    predicate the schema covers. UX hint: "extractor produced no
+///    statements". The previous tier-availability hint moved out of
+///    the response — clients introspect tier state via the
+///    `GET_CAPABILITIES` op when they need it.
 ///
 /// The hint is appended after the existing `· <status>` suffix so
 /// scripts that parse the leading count fields stay unaffected.
 fn augment_extractor_summary(
     res: &StageResult,
     has_active_schema: bool,
-    has_llm_extractor: bool,
 ) -> String {
     if res.kind != StageKindLabel::Extractor {
         return res.summary.clone();
@@ -619,11 +612,6 @@ fn augment_extractor_summary(
         // dominates the explanation: even with an LLM, predicate
         // admission would reject everything.
         "no schema declares matching predicates"
-    } else if !has_llm_extractor {
-        // Schema declared but no LLM tier. Pattern + classifier can
-        // resolve entities but never produce statements/relations.
-        // Surface the env vars by name so the operator knows the fix.
-        "statements require an LLM tier — set ANTHROPIC_API_KEY or OPENAI_API_KEY"
     } else {
         "extractor produced no statements"
     };
@@ -755,7 +743,6 @@ mod tests {
             embedding_model_fp: [0u8; 16],
             pending_stages: Vec::new(),
             has_active_schema: false,
-            has_llm_extractor: false,
         })
     }
 
@@ -1509,14 +1496,13 @@ mod tests {
     }
 
     // 34. Extractor stage with 0 statements + 0 relations BUT a
-    // schema IS declared + an LLM tier IS wired — the extractor ran
-    // with both prerequisites satisfied but found no sentence
-    // matching any declared predicate. Content-coverage story.
+    // schema IS declared — the extractor ran with predicate admission
+    // satisfied but found no sentence matching any declared predicate.
+    // Content-coverage story.
     #[test]
     fn render_extractor_zero_stmts_with_schema_appends_content_hint() {
         let mut r = sample();
         r.response.has_active_schema = true;
-        r.response.has_llm_extractor = true;
         let r = r.with_stage_results(StageResultsDelta {
             elapsed_ms: 200,
             results: vec![StageResult {
@@ -1529,52 +1515,11 @@ mod tests {
         let out = render(&r, OutputFormat::Table);
         assert!(
             out.contains("extractor produced no statements"),
-            "schema-present + llm-wired hint missing on extractor row: {out}"
+            "schema-present hint missing on extractor row: {out}"
         );
         assert!(
             !out.contains("no schema declares matching predicates"),
             "must not emit the no-schema hint when schema IS declared: {out}"
-        );
-        assert!(
-            !out.contains("statements require an LLM tier"),
-            "must not emit the llm-missing hint when an LLM tier is wired: {out}"
-        );
-    }
-
-    // 34b. Schema declared but no LLM tier wired — the renderer
-    // tells the operator exactly which env var unlocks statements.
-    // Without this hint, the user reads "0 statements" and assumes
-    // the system is broken; with it, they know it's a one-line fix.
-    #[test]
-    fn render_extractor_zero_stmts_schema_but_no_llm_appends_llm_hint() {
-        let mut r = sample();
-        r.response.has_active_schema = true;
-        r.response.has_llm_extractor = false;
-        let r = r.with_stage_results(StageResultsDelta {
-            elapsed_ms: 200,
-            results: vec![StageResult {
-                kind: StageKindLabel::Extractor,
-                outcome: StageOutcomeLabel::Ok,
-                summary: "5 entities, 0 statements, 0 relations · succeeded".into(),
-            }],
-            timed_out: Vec::new(),
-        });
-        let out = render(&r, OutputFormat::Table);
-        assert!(
-            out.contains("statements require an LLM tier"),
-            "llm-missing hint missing on extractor row: {out}"
-        );
-        assert!(
-            out.contains("ANTHROPIC_API_KEY") && out.contains("OPENAI_API_KEY"),
-            "hint must name both env vars so operator knows the fix: {out}"
-        );
-        assert!(
-            !out.contains("extractor produced no statements"),
-            "must not also emit the content-coverage hint: {out}"
-        );
-        assert!(
-            !out.contains("partially applied"),
-            "must not slap a 'partially applied' badge on a clean classifier run: {out}"
         );
     }
 

@@ -24,7 +24,7 @@ use serde_json::Value;
 
 use crate::classifier::{ClassifierExtractor, ClassifierModel};
 use crate::framework::extractor::ExtractorError;
-use crate::framework::registry::ExtractorRegistry;
+use crate::framework::registry::{ExtractorRegistry, TierGate};
 use crate::llm::{CostBudget, LlmExtractor};
 use crate::pattern::extractor::PatternExtractor;
 
@@ -264,6 +264,12 @@ pub fn materialize_llm_extractor(
 /// The returned registry MAY be partial — the caller decides what
 /// to do with errors. The recommended pattern is `tracing::warn`
 /// each error then proceed.
+///
+/// Tiers the operator turned off in config are skipped silently
+/// (the row is never materialised, no error pushed). Use
+/// [`build_registry_with_gate`] to thread an explicit gate; this
+/// helper preserves the all-tiers-enabled default for callers that
+/// haven't migrated yet.
 #[must_use]
 pub fn build_registry_from_definitions(
     defs: &[ExtractorDefinition],
@@ -272,12 +278,32 @@ pub fn build_registry_from_definitions(
     ExtractorRegistry,
     Vec<(brain_core::ExtractorId, ExtractorError)>,
 ) {
-    let mut registry = ExtractorRegistry::new();
+    build_registry_with_gate(defs, deps, TierGate::all_enabled())
+}
+
+/// Same as [`build_registry_from_definitions`] but with an explicit
+/// per-tier gate. A `Disabled` tier means rows of that kind are
+/// skipped silently — operator opted out, not a degradation.
+#[must_use]
+pub fn build_registry_with_gate(
+    defs: &[ExtractorDefinition],
+    deps: &MaterializeDeps,
+    gate: TierGate,
+) -> (
+    ExtractorRegistry,
+    Vec<(brain_core::ExtractorId, ExtractorError)>,
+) {
+    let mut registry = ExtractorRegistry::with_tier_gate(gate);
     let mut errors: Vec<(brain_core::ExtractorId, ExtractorError)> = Vec::new();
 
     for def in defs {
         let id = def.id();
         match def.kind() {
+            Some(kind) if !gate.state(kind).is_enabled() => {
+                // Tier disabled by operator config — skip materialisation
+                // entirely. No registry row, no error.
+                continue;
+            }
             Some(ExtractorKind::Pattern) => match materialize_pattern_extractor(def) {
                 Ok(p) => registry.register(Arc::new(p)),
                 Err(e) => errors.push((id, e)),

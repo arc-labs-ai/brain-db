@@ -3,6 +3,7 @@
 //! (`context`, `dispatch`, `idempotency`, etc.) live at the crate root.
 
 pub mod admin;
+pub mod capabilities;
 pub mod encode;
 pub mod encode_vector_direct;
 pub mod entity;

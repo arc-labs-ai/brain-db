@@ -86,7 +86,6 @@ pub async fn handle_encode(
                 // were queued. The client has nothing to wait for.
                 pending_stages: Vec::new(),
                 has_active_schema: true,
-                has_llm_extractor: ctx.extractor_registry.read().has_enabled_llm_extractor(),
             });
         }
     }
@@ -177,7 +176,6 @@ pub async fn handle_encode(
         embedding_model_fp,
         pending_stages,
         has_active_schema: true,
-        has_llm_extractor: ctx.extractor_registry.read().has_enabled_llm_extractor(),
     })
 }
 
@@ -367,7 +365,6 @@ fn reconstruct_encode_response(
         embedding_model_fp,
         pending_stages,
         has_active_schema: true,
-        has_llm_extractor: ctx.extractor_registry.read().has_enabled_llm_extractor(),
     })
 }
 
@@ -465,7 +462,6 @@ async fn handle_encode_in_txn(
             // ack carries the aggregated stages for the whole txn.
             pending_stages: Vec::new(),
             has_active_schema: true,
-            has_llm_extractor: ctx.extractor_registry.read().has_enabled_llm_extractor(),
         });
     }
 
@@ -611,7 +607,6 @@ async fn handle_encode_in_txn(
         // aggregated stages for the whole txn.
         pending_stages: Vec::new(),
         has_active_schema: true,
-        has_llm_extractor: ctx.extractor_registry.read().has_enabled_llm_extractor(),
     })
 }
 

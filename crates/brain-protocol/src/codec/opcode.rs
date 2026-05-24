@@ -67,6 +67,12 @@ pub enum Opcode {
     SubscribeEvent = 0x00B0,
     UnsubscribeReq = 0x0031,
     UnsubscribeResp = 0x00B1,
+    /// Capability introspection. Returns the per-shard feature flags
+    /// (rerank, extractor tiers, schema namespaces, vector dim) so
+    /// clients can avoid issuing requests the shard can't serve.
+    /// Available to every authenticated client; not admin-only.
+    GetCapabilitiesReq = 0x0032,
+    GetCapabilitiesResp = 0x00B2,
 
     // Transactions
     TxnBegin = 0x0040,
@@ -259,6 +265,8 @@ impl Opcode {
             0x00B0 => Self::SubscribeEvent,
             0x0031 => Self::UnsubscribeReq,
             0x00B1 => Self::UnsubscribeResp,
+            0x0032 => Self::GetCapabilitiesReq,
+            0x00B2 => Self::GetCapabilitiesResp,
 
             0x0040 => Self::TxnBegin,
             0x00C0 => Self::TxnBeginResp,
@@ -514,6 +522,9 @@ mod tests {
         (0x00B0, Opcode::SubscribeEvent),
         (0x0031, Opcode::UnsubscribeReq),
         (0x00B1, Opcode::UnsubscribeResp),
+        // Capability introspection
+        (0x0032, Opcode::GetCapabilitiesReq),
+        (0x00B2, Opcode::GetCapabilitiesResp),
         // Transactions
         (0x0040, Opcode::TxnBegin),
         (0x00C0, Opcode::TxnBeginResp),

@@ -52,6 +52,7 @@ pub use crate::connection::stream::{
     ByeRequest, CancelStreamRequest, ClientPongRequest, PingRequest,
 };
 pub use crate::ops::admin::*;
+pub use crate::ops::capabilities::*;
 pub use crate::ops::entity::*;
 pub use crate::ops::extractor::*;
 pub use crate::ops::memory::*;
@@ -85,6 +86,7 @@ pub enum RequestBody {
     Unlink(UnlinkRequest),
     Subscribe(SubscribeRequest),
     Unsubscribe(UnsubscribeRequest),
+    GetCapabilities(GetCapabilitiesRequest),
     TxnBegin(TxnBeginRequest),
     TxnCommit(TxnCommitRequest),
     TxnAbort(TxnAbortRequest),
@@ -175,6 +177,7 @@ impl RequestBody {
             Self::Unlink(_) => Opcode::UnlinkReq,
             Self::Subscribe(_) => Opcode::SubscribeReq,
             Self::Unsubscribe(_) => Opcode::UnsubscribeReq,
+            Self::GetCapabilities(_) => Opcode::GetCapabilitiesReq,
             Self::TxnBegin(_) => Opcode::TxnBegin,
             Self::TxnCommit(_) => Opcode::TxnCommit,
             Self::TxnAbort(_) => Opcode::TxnAbort,
@@ -251,6 +254,7 @@ impl RequestBody {
             Self::Unlink(r) => to_rkyv_bytes(r),
             Self::Subscribe(r) => to_rkyv_bytes(r),
             Self::Unsubscribe(r) => to_rkyv_bytes(r),
+            Self::GetCapabilities(r) => to_rkyv_bytes(r),
             Self::TxnBegin(r) => to_rkyv_bytes(r),
             Self::TxnCommit(r) => to_rkyv_bytes(r),
             Self::TxnAbort(r) => to_rkyv_bytes(r),
@@ -326,6 +330,7 @@ impl RequestBody {
             Opcode::UnlinkReq => Self::Unlink(from_rkyv_bytes(bytes)?),
             Opcode::SubscribeReq => Self::Subscribe(from_rkyv_bytes(bytes)?),
             Opcode::UnsubscribeReq => Self::Unsubscribe(from_rkyv_bytes(bytes)?),
+            Opcode::GetCapabilitiesReq => Self::GetCapabilities(from_rkyv_bytes(bytes)?),
             Opcode::TxnBegin => Self::TxnBegin(from_rkyv_bytes(bytes)?),
             Opcode::TxnCommit => Self::TxnCommit(from_rkyv_bytes(bytes)?),
             Opcode::TxnAbort => Self::TxnAbort(from_rkyv_bytes(bytes)?),
@@ -585,6 +590,11 @@ mod tests {
                 reason,
             }));
         }
+    }
+
+    #[test]
+    fn get_capabilities_request_round_trips() {
+        round_trip(RequestBody::GetCapabilities(GetCapabilitiesRequest {}));
     }
 
     #[test]

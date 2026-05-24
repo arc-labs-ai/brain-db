@@ -217,7 +217,6 @@ mod tests {
             embedding_model_fp: [0; 16],
             pending_stages: Vec::new(),
             has_active_schema: false,
-            has_llm_extractor: false,
         }
     }
 

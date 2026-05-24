@@ -700,6 +700,7 @@ dependencies = [
  "brain-ops",
  "brain-planner",
  "brain-protocol",
+ "brain-rerank",
  "brain-sdk-rust",
  "brain-storage",
  "brain-workers",

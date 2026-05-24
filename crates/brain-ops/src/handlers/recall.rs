@@ -44,6 +44,15 @@ pub async fn handle_recall(
     if req.top_k == 0 {
         return Err(OpError::InvalidRequest("recall: top_k must be > 0".into()));
     }
+    // Hard-fail when the client opted into rerank but the operator
+    // turned it off. Returning a clear error beats silently falling
+    // back to RRF — the client either drops the flag or picks a
+    // shard with rerank enabled.
+    if req.rerank && !ctx.cross_encoder.is_enabled() {
+        return Err(OpError::CapabilityNotEnabled {
+            capability: "rerank",
+        });
+    }
     let planner_req = build_planner_request(&req);
 
     let plan = hybrid_plan(&planner_req).map_err(map_plan_error)?;
@@ -52,7 +61,7 @@ pub async fn handle_recall(
         lexical: ctx.lexical_retriever.clone(),
         graph: ctx.graph_retriever.clone(),
         metadata: ctx.executor.metadata.clone(),
-        cross_encoder: ctx.cross_encoder.clone(),
+        cross_encoder: ctx.cross_encoder.as_arc().cloned(),
     };
     let result = hybrid_execute(&plan, &planner_req, &exec_ctx).map_err(map_execution_error)?;
 

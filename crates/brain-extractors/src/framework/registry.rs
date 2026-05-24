@@ -9,19 +9,105 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use brain_core::ExtractorId;
+use brain_core::ExtractorKind;
 
 use crate::framework::extractor::Extractor;
+
+/// Per-tier capability gate stamped on the registry at shard spawn.
+/// Mirrors the operator's `extractors.{pattern,classifier,llm}.enabled`
+/// config: a tier marked `Disabled` here is dropped at registration
+/// time and never re-enabled by `EXTRACTOR_ENABLE`. The `Enabled`
+/// variant is the silent default.
+///
+/// "Disabled by config" is silent (operator opt-out); "enabled but
+/// failed to load the model" is a spawn failure handled in the shard
+/// boot path, not here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TierState {
+    #[default]
+    Enabled,
+    Disabled,
+}
+
+impl TierState {
+    /// Promote a boolean gate into the typed state.
+    #[must_use]
+    pub fn from_enabled(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+/// Per-tier gate snapshot. Defaults to every tier enabled — matches
+/// the default config and keeps existing tests/registry callers
+/// working without explicit setup.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TierGate {
+    pub pattern: TierState,
+    pub classifier: TierState,
+    pub llm: TierState,
+}
+
+impl TierGate {
+    /// Build a gate where every tier is enabled. Used by tests and
+    /// any deployment that doesn't customise the gate.
+    #[must_use]
+    pub fn all_enabled() -> Self {
+        Self::default()
+    }
+
+    /// Return the state for the named tier.
+    #[must_use]
+    pub fn state(&self, kind: ExtractorKind) -> TierState {
+        match kind {
+            ExtractorKind::Pattern => self.pattern,
+            ExtractorKind::Classifier => self.classifier,
+            ExtractorKind::Llm => self.llm,
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct ExtractorRegistry {
     by_id: HashMap<ExtractorId, Arc<dyn Extractor>>,
     enabled: HashSet<ExtractorId>,
+    /// Per-tier capability gates. Built at shard spawn from operator
+    /// config; immutable for the lifetime of the registry instance.
+    tier_gate: TierGate,
 }
 
 impl ExtractorRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a registry with a non-default tier gate. Used by the
+    /// shard boot path to honour `extractors.<tier>.enabled = false`.
+    #[must_use]
+    pub fn with_tier_gate(gate: TierGate) -> Self {
+        Self {
+            by_id: HashMap::default(),
+            enabled: HashSet::default(),
+            tier_gate: gate,
+        }
+    }
+
+    /// The tier gate this registry was built with. The materialiser
+    /// passes through here at build-time; runtime callers (the
+    /// extractor worker, EXTRACTOR_ENABLE handler) read it to honour
+    /// the operator's opt-out without re-deriving from config.
+    #[must_use]
+    pub fn tier_gate(&self) -> TierGate {
+        self.tier_gate
     }
 
     /// Register an extractor. New registrations default to
@@ -45,6 +131,11 @@ impl ExtractorRegistry {
         self.enabled.contains(&id)
     }
 
+    /// Toggle a per-extractor enabled flag. The tier gate still
+    /// applies — re-enabling an extractor whose tier is `Disabled` is
+    /// a no-op from [`Self::iter_enabled`]'s perspective. We honour
+    /// the flag in `enabled` regardless so an `EXTRACTOR_LIST` over
+    /// the wire surfaces the per-row state separately from the gate.
     pub fn set_enabled(&mut self, id: ExtractorId, enabled: bool) {
         if enabled {
             self.enabled.insert(id);
@@ -55,11 +146,13 @@ impl ExtractorRegistry {
 
     /// Iterate all enabled extractors. Order is unspecified; the
     /// dispatcher applies its own ordering rules (e.g. dependency
-    /// topology).
+    /// topology). Tier-gated extractors are excluded unconditionally
+    /// regardless of their per-row flag.
     pub fn iter_enabled(&self) -> impl Iterator<Item = &Arc<dyn Extractor>> {
+        let gate = self.tier_gate;
         self.by_id
             .iter()
-            .filter(|(id, _)| self.enabled.contains(id))
+            .filter(move |(id, ext)| self.enabled.contains(id) && gate.state(ext.kind()).is_enabled())
             .map(|(_, ext)| ext)
     }
 
@@ -69,23 +162,6 @@ impl ExtractorRegistry {
         self.by_id
             .iter()
             .map(|(id, ext)| (ext, self.enabled.contains(id)))
-    }
-
-    /// True iff at least one enabled, fully-wired extractor reports
-    /// [`ExtractorKind::Llm`]. "Wired" means a real LLM client is
-    /// attached — a degraded row (no API key, unknown model) is
-    /// registered but reports `is_wired() == false`, so this still
-    /// returns false. The encode response surfaces the bool so the
-    /// renderer can distinguish "0 statements because no LLM tier is
-    /// configured" from "0 statements because the input didn't match
-    /// any LLM-emitted predicate". Operators see actionable text in
-    /// the first case (set an API key) and per-memory text in the
-    /// second.
-    #[must_use]
-    pub fn has_enabled_llm_extractor(&self) -> bool {
-        use brain_core::ExtractorKind;
-        self.iter_enabled()
-            .any(|ext| ext.kind() == ExtractorKind::Llm && ext.is_wired())
     }
 
     #[must_use]

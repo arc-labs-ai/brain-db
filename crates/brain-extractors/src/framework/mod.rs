@@ -13,4 +13,4 @@ pub use extractor::{
 };
 pub use item::{EntityMention, ExtractedItem, RelationMention, StatementMention};
 pub use options::ExtractorRunOptions;
-pub use registry::ExtractorRegistry;
+pub use registry::{ExtractorRegistry, TierGate, TierState};
