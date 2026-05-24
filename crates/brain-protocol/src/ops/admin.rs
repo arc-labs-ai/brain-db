@@ -2,8 +2,8 @@
 
 use rkyv::{Archive, Deserialize, Serialize};
 
-use crate::shared::primitives::{CheckScope, ForgetMode, MemoryKindWire, StatsDetail};
 use crate::envelope::request::{WireContextId, WireMemoryId, WireUuid};
+use crate::shared::primitives::{CheckScope, ForgetMode, MemoryKindWire, StatsDetail};
 
 #[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[archive(check_bytes)]
@@ -143,9 +143,156 @@ pub struct ExtractBackfillResponse {
 }
 
 // ============================================================
-// Response payloads
+// ADMIN_BACKFILL / ADMIN_BACKFILL_CANCEL — operator control
+// surface for the per-shard backfill worker.
+//
+// The backfill worker (brain-workers) walks a
+// `(memory_range × extractor_ids)` grid, re-running extractors
+// against each memory and persisting per-pair checkpoints so
+// restarts resume mid-run. These opcodes let operators:
+//   - submit a new backfill run (returns a BackfillId);
+//   - cancel an in-flight run by id (returns a final progress
+//     snapshot).
+//
+// v1 ships fire-and-forget. The response carries the BackfillId
+// plus an initial `BackfillProgress` snapshot; callers poll for
+// detailed progress via `ADMIN_STATS` (or a future
+// `ADMIN_BACKFILL_PROGRESS` opcode). Streaming progress mirrors
+// `ADMIN_MIGRATE_EMBEDDINGS` and is deliberately deferred — the
+// worker doesn't expose a streaming channel today and adding one
+// is out of scope for the wire-allocation pass.
 // ============================================================
 
+/// Which memories a backfill request covers. Wire mirror of
+/// `brain_core::BackfillRange`; structured as an enum so future
+/// scope variants (e.g. namespace, schema-version) slot in
+/// without reshaping callers.
+#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub enum BackfillScope {
+    /// Every memory in the shard's metadata table.
+    All,
+    /// Inclusive memory-id range, walked in sorted order.
+    /// `start <= end_inclusive`.
+    MemoryRange {
+        start: WireMemoryId,
+        end_inclusive: WireMemoryId,
+    },
+}
+
+/// Submit a backfill run. The worker enqueues the request and
+/// returns immediately with a `BackfillId`; operators cancel
+/// via [`AdminBackfillCancelRequest`] and poll progress out of
+/// band.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub struct AdminBackfillRequest {
+    /// Which memories to walk.
+    pub scope: BackfillScope,
+    /// Extractor ids to re-run against each memory in scope.
+    /// Capped at 4 by the worker — backfill against more
+    /// extractors is a fresh request.
+    pub extractor_ids: Vec<u32>,
+    /// `true` = walk the plan + mark items completed without
+    /// invoking the extractor pipeline. Used to preview cost.
+    pub dry_run: bool,
+    /// Idempotency key. Re-submitting the same `request_id` with
+    /// matching params returns the cached response (per the
+    /// standard 24h-TTL idempotency rule).
+    pub request_id: WireUuid,
+}
+
+/// Ack for [`AdminBackfillRequest`]. Carries the assigned
+/// `BackfillId` (used by [`AdminBackfillCancelRequest`]) plus
+/// the worker's progress snapshot at enqueue time (which is
+/// the idle-state snapshot if the worker isn't running yet, or
+/// the live-run snapshot if a previous run is still in flight).
+#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub struct AdminBackfillResponse {
+    /// Worker-assigned id for this run. Pass to
+    /// [`AdminBackfillCancelRequest::backfill_id`] to cancel.
+    /// Wire-shape: 16 bytes, identical to the `BackfillId` UUID.
+    pub backfill_id: [u8; 16],
+    /// Snapshot of the worker's progress at submission time.
+    pub progress: BackfillProgress,
+}
+
+/// Cancel an in-flight backfill run by its id. Cancellation
+/// flips a per-run flag the worker checks between items; the
+/// run finalises at the next item boundary.
+#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub struct AdminBackfillCancelRequest {
+    /// The id returned by [`AdminBackfillResponse::backfill_id`].
+    pub backfill_id: [u8; 16],
+    /// Idempotency key for the cancel itself.
+    pub request_id: WireUuid,
+}
+
+/// Ack for [`AdminBackfillCancelRequest`]. `cancelled` is
+/// `true` iff a matching in-flight run was found; `false`
+/// means no such run is active (already finished, never
+/// submitted, or already cancelled). `progress` is the final
+/// snapshot the worker published for the targeted run, or a
+/// default-idle snapshot when no run matched.
+#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub struct AdminBackfillCancelResponse {
+    pub backfill_id: [u8; 16],
+    pub cancelled: bool,
+    pub progress: BackfillProgress,
+}
+
+/// Wire mirror of `brain_core::BackfillProgress`. Plain
+/// rkyv-archivable fields; the `Option`s are flattened to
+/// `(bool, value)` so callers don't pay for an extra rkyv
+/// `Option` wrapper on the hot path.
+#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub struct BackfillProgress {
+    /// `true` iff the worker is mid-run on the targeted request.
+    pub running: bool,
+    /// Items the worker has marked completed during this run.
+    pub completed: u64,
+    /// Items that hit the worker's per-item attempt cap and
+    /// were marked failed.
+    pub failed: u64,
+    /// Items whose checkpoint was already `Completed` from a
+    /// prior run (resume path).
+    pub skipped_already_completed: u64,
+    /// `last_processed_memory_id` is `Some` once the worker
+    /// has advanced past one item; flattened to
+    /// `(has_value, value)` for wire compactness.
+    pub last_processed_memory_id_present: bool,
+    pub last_processed_memory_id: WireMemoryId,
+}
+
+impl BackfillProgress {
+    /// Default idle snapshot. Returned when the targeted run
+    /// has no published progress yet.
+    #[must_use]
+    pub const fn idle() -> Self {
+        Self {
+            running: false,
+            completed: 0,
+            failed: 0,
+            skipped_already_completed: 0,
+            last_processed_memory_id_present: false,
+            last_processed_memory_id: 0,
+        }
+    }
+}
+
+// ============================================================
+// Response payloads
+// ============================================================
 
 use crate::shared::enums::{IntegrityIssueType, MigrationStatus};
 

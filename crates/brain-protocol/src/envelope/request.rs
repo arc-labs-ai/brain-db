@@ -25,10 +25,10 @@
 // module-level allow covers both without spreading attribute noise.
 #![allow(clippy::enum_variant_names)]
 
-use crate::error::ProtocolError;
-use crate::connection::handshake::{AuthPayload, HelloPayload};
 use crate::codec::opcode::Opcode;
 use crate::codec::rkyv::{from_rkyv_bytes, to_rkyv_bytes};
+use crate::connection::handshake::{AuthPayload, HelloPayload};
+use crate::error::ProtocolError;
 
 // ---------------------------------------------------------------------------
 // Helper aliases for spec-domain primitive types as carried on the wire.
@@ -101,6 +101,8 @@ pub enum RequestBody {
     AdminMoveMemory(AdminMoveMemoryRequest),
     AdminReclassify(AdminReclassifyRequest),
     AdminListTombstoned(AdminListTombstonedRequest),
+    AdminBackfill(AdminBackfillRequest),
+    AdminBackfillCancel(AdminBackfillCancelRequest),
 
     // Typed-graph namespace.
     EntityCreate(EntityCreateRequest),
@@ -187,6 +189,8 @@ impl RequestBody {
             Self::AdminMoveMemory(_) => Opcode::AdminMoveMemoryReq,
             Self::AdminReclassify(_) => Opcode::AdminReclassifyReq,
             Self::AdminListTombstoned(_) => Opcode::AdminListTombstonedReq,
+            Self::AdminBackfill(_) => Opcode::AdminBackfillReq,
+            Self::AdminBackfillCancel(_) => Opcode::AdminBackfillCancelReq,
             Self::EntityCreate(_) => Opcode::EntityCreateReq,
             Self::EntityGet(_) => Opcode::EntityGetReq,
             Self::EntityUpdate(_) => Opcode::EntityUpdateReq,
@@ -259,6 +263,8 @@ impl RequestBody {
             Self::AdminMoveMemory(r) => to_rkyv_bytes(r),
             Self::AdminReclassify(r) => to_rkyv_bytes(r),
             Self::AdminListTombstoned(r) => to_rkyv_bytes(r),
+            Self::AdminBackfill(r) => to_rkyv_bytes(r),
+            Self::AdminBackfillCancel(r) => to_rkyv_bytes(r),
             Self::EntityCreate(r) => to_rkyv_bytes(r),
             Self::EntityGet(r) => to_rkyv_bytes(r),
             Self::EntityUpdate(r) => to_rkyv_bytes(r),
@@ -332,6 +338,8 @@ impl RequestBody {
             Opcode::AdminMoveMemoryReq => Self::AdminMoveMemory(from_rkyv_bytes(bytes)?),
             Opcode::AdminReclassifyReq => Self::AdminReclassify(from_rkyv_bytes(bytes)?),
             Opcode::AdminListTombstonedReq => Self::AdminListTombstoned(from_rkyv_bytes(bytes)?),
+            Opcode::AdminBackfillReq => Self::AdminBackfill(from_rkyv_bytes(bytes)?),
+            Opcode::AdminBackfillCancelReq => Self::AdminBackfillCancel(from_rkyv_bytes(bytes)?),
             Opcode::EntityCreateReq => Self::EntityCreate(from_rkyv_bytes(bytes)?),
             Opcode::EntityGetReq => Self::EntityGet(from_rkyv_bytes(bytes)?),
             Opcode::EntityUpdateReq => Self::EntityUpdate(from_rkyv_bytes(bytes)?),
@@ -623,6 +631,27 @@ mod tests {
                 context_id: Some(17_u64),
                 max_age_seconds: 3600,
                 limit: 100,
+            },
+        ));
+        round_trip(RequestBody::AdminBackfill(AdminBackfillRequest {
+            scope: BackfillScope::All,
+            extractor_ids: vec![1, 2, 3],
+            dry_run: true,
+            request_id: sample_uuid(21),
+        }));
+        round_trip(RequestBody::AdminBackfill(AdminBackfillRequest {
+            scope: BackfillScope::MemoryRange {
+                start: sample_memory_id(),
+                end_inclusive: sample_memory_id().saturating_add(1024),
+            },
+            extractor_ids: vec![7],
+            dry_run: false,
+            request_id: sample_uuid(22),
+        }));
+        round_trip(RequestBody::AdminBackfillCancel(
+            AdminBackfillCancelRequest {
+                backfill_id: sample_uuid(23),
+                request_id: sample_uuid(24),
             },
         ));
     }

@@ -111,6 +111,13 @@ pub enum Opcode {
     AdminAbortMigrationResp = 0x00EC,
     AdminRetireFingerprintReq = 0x006D,
     AdminRetireFingerprintResp = 0x00ED,
+    // Operator control surface for the per-shard backfill worker:
+    // re-run extractors over a `(memory_range × extractor_ids)` grid
+    // and cancel an in-flight run by request id.
+    AdminBackfillReq = 0x006E,
+    AdminBackfillResp = 0x00EE,
+    AdminBackfillCancelReq = 0x006F,
+    AdminBackfillCancelResp = 0x00EF,
 
     // Errors
     Error = 0x00FF,
@@ -283,6 +290,10 @@ impl Opcode {
             0x00EC => Self::AdminAbortMigrationResp,
             0x006D => Self::AdminRetireFingerprintReq,
             0x00ED => Self::AdminRetireFingerprintResp,
+            0x006E => Self::AdminBackfillReq,
+            0x00EE => Self::AdminBackfillResp,
+            0x006F => Self::AdminBackfillCancelReq,
+            0x00EF => Self::AdminBackfillCancelResp,
 
             0x00FF => Self::Error,
 
@@ -408,12 +419,14 @@ impl Opcode {
     }
 
     /// True if this opcode is in the admin range:
-    /// low byte `0x60..=0x6D` (req) or `0xE0..=0xED` (resp),
-    /// namespace `0x00`.
+    /// low byte `0x60..=0x6F` (req) or `0xE0..=0xEF` (resp),
+    /// namespace `0x00`. Widened past `0x6D / 0xED` when the
+    /// backfill-control opcodes (`ADMIN_BACKFILL`,
+    /// `ADMIN_BACKFILL_CANCEL`) landed.
     #[inline]
     #[must_use]
     pub fn is_admin(self) -> bool {
-        self.namespace() == 0x00 && matches!(self.low_byte(), 0x60..=0x6D | 0xE0..=0xED)
+        self.namespace() == 0x00 && matches!(self.low_byte(), 0x60..=0x6F | 0xE0..=0xEF)
     }
 
     /// True if this opcode is in the typed-graph namespace (`0x01xx`).
@@ -529,6 +542,10 @@ mod tests {
         (0x00EC, Opcode::AdminAbortMigrationResp),
         (0x006D, Opcode::AdminRetireFingerprintReq),
         (0x00ED, Opcode::AdminRetireFingerprintResp),
+        (0x006E, Opcode::AdminBackfillReq),
+        (0x00EE, Opcode::AdminBackfillResp),
+        (0x006F, Opcode::AdminBackfillCancelReq),
+        (0x00EF, Opcode::AdminBackfillCancelResp),
         // Errors
         (0x00FF, Opcode::Error),
         // Typed-graph — schema
@@ -693,6 +710,12 @@ mod tests {
         assert!(Opcode::AdminAbortMigrationResp.is_admin());
         assert!(Opcode::AdminRetireFingerprintReq.is_admin());
         assert!(Opcode::AdminRetireFingerprintResp.is_admin());
+        // The backfill-control opcodes widened the range to 0x6F / 0xEF;
+        // confirm they classify as admin too.
+        assert!(Opcode::AdminBackfillReq.is_admin());
+        assert!(Opcode::AdminBackfillResp.is_admin());
+        assert!(Opcode::AdminBackfillCancelReq.is_admin());
+        assert!(Opcode::AdminBackfillCancelResp.is_admin());
     }
 
     /// Drift guard: every enum variant MUST appear in `ALL`. If a new

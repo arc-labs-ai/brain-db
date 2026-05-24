@@ -100,6 +100,10 @@ The opcode is a big-endian `u16` in the frame header (bytes 5–6). The high byt
 | 0x00EC | `ADMIN_ABORT_MIGRATION_RESP` | S → C | Abort ack |
 | 0x006D | `ADMIN_RETIRE_FINGERPRINT_REQ` | C → S | Retire a model fingerprint after a completed migration |
 | 0x00ED | `ADMIN_RETIRE_FINGERPRINT_RESP` | S → C | Retire ack |
+| 0x006E | `ADMIN_BACKFILL_REQ` | C → S | Submit a backfill run (re-run extractors over a memory range); returns a `BackfillId` |
+| 0x00EE | `ADMIN_BACKFILL_RESP` | S → C | Backfill submission ack (id + initial progress) |
+| 0x006F | `ADMIN_BACKFILL_CANCEL_REQ` | C → S | Cancel an in-flight backfill run by id |
+| 0x00EF | `ADMIN_BACKFILL_CANCEL_RESP` | S → C | Cancel ack (final progress snapshot) |
 
 ### 1.7 Errors
 

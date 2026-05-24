@@ -22,6 +22,7 @@ use crate::config::ClientConfig;
 use crate::error::ClientError;
 use crate::observability::{MetricsSnapshot, MetricsState};
 use crate::ops::{
+    admin::AdminClient,
     txn::{txn_abort, txn_begin, txn_commit, DEFAULT_TXN_TIMEOUT_SECONDS},
     EncodeBuilder, ForgetBuilder, LinkBuilder, MaterializeProceduralBuilder, PlanBuilder,
     ReasonBuilder, RecallBuilder, SubscribeBuilder, UnlinkBuilder,
@@ -238,6 +239,15 @@ impl Client {
     #[must_use]
     pub fn subscribe(&self) -> SubscribeBuilder<'_> {
         SubscribeBuilder::new(self)
+    }
+
+    /// Operator-only admin surface. Currently exposes
+    /// `backfill(scope)` (re-run extractors over a memory range)
+    /// and `backfill_cancel(id)`. Streaming progress is deferred;
+    /// today's wire is fire-and-forget with an initial snapshot.
+    #[must_use]
+    pub fn admin(&self) -> AdminClient<'_> {
+        AdminClient::new(self)
     }
 
     /// Cancel a live subscription by its target stream id (the

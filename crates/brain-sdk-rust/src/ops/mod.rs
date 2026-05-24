@@ -7,6 +7,7 @@
 //! Vec-collecting `send()` (or `collect()`); the async-iterator
 //! surface lives on the same builders.
 
+pub mod admin;
 pub mod common;
 pub mod encode;
 pub mod entity;
@@ -27,6 +28,7 @@ pub mod unlink;
 
 pub use stream::FrameStream;
 
+pub use admin::{AdminClient, BackfillBuilder, BackfillHandle};
 pub use encode::{EncodeBuilder, EncodeResponseExt};
 pub use forget::ForgetBuilder;
 pub use link::LinkBuilder;

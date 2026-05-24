@@ -23,10 +23,10 @@
 //! enums so wire encoding/decoding is closed, and convert at the
 //! boundary via `From` impls.
 
-use crate::error::ProtocolError;
-use crate::connection::handshake::{AuthOkPayload, WelcomePayload};
 use crate::codec::opcode::Opcode;
 use crate::codec::rkyv::{from_rkyv_bytes, to_rkyv_bytes};
+use crate::connection::handshake::{AuthOkPayload, WelcomePayload};
+use crate::error::ProtocolError;
 
 // ---------------------------------------------------------------------------
 // Helper enums shared by multiple response bodies.
@@ -88,6 +88,8 @@ pub enum ResponseBody {
     AdminMoveMemory(AdminMoveMemoryResponse),
     AdminReclassify(AdminReclassifyResponse),
     AdminListTombstoned(AdminListTombstonedResponseFrame),
+    AdminBackfill(AdminBackfillResponse),
+    AdminBackfillCancel(AdminBackfillCancelResponse),
 
     // Typed-graph namespace.
     EntityCreate(EntityCreateResponse),
@@ -183,6 +185,8 @@ impl ResponseBody {
             Self::AdminMoveMemory(_) => Opcode::AdminMoveMemoryResp,
             Self::AdminReclassify(_) => Opcode::AdminReclassifyResp,
             Self::AdminListTombstoned(_) => Opcode::AdminListTombstonedResp,
+            Self::AdminBackfill(_) => Opcode::AdminBackfillResp,
+            Self::AdminBackfillCancel(_) => Opcode::AdminBackfillCancelResp,
             Self::EntityCreate(_) => Opcode::EntityCreateResp,
             Self::EntityGet(_) => Opcode::EntityGetResp,
             Self::EntityUpdate(_) => Opcode::EntityUpdateResp,
@@ -277,6 +281,8 @@ impl ResponseBody {
             Self::AdminMoveMemory(r) => to_rkyv_bytes(r),
             Self::AdminReclassify(r) => to_rkyv_bytes(r),
             Self::AdminListTombstoned(r) => to_rkyv_bytes(r),
+            Self::AdminBackfill(r) => to_rkyv_bytes(r),
+            Self::AdminBackfillCancel(r) => to_rkyv_bytes(r),
             Self::EntityCreate(r) => to_rkyv_bytes(r),
             Self::EntityGet(r) => to_rkyv_bytes(r),
             Self::EntityUpdate(r) => to_rkyv_bytes(r),
@@ -350,6 +356,8 @@ impl ResponseBody {
             Opcode::AdminMoveMemoryResp => Self::AdminMoveMemory(from_rkyv_bytes(bytes)?),
             Opcode::AdminReclassifyResp => Self::AdminReclassify(from_rkyv_bytes(bytes)?),
             Opcode::AdminListTombstonedResp => Self::AdminListTombstoned(from_rkyv_bytes(bytes)?),
+            Opcode::AdminBackfillResp => Self::AdminBackfill(from_rkyv_bytes(bytes)?),
+            Opcode::AdminBackfillCancelResp => Self::AdminBackfillCancel(from_rkyv_bytes(bytes)?),
             Opcode::EntityCreateResp => Self::EntityCreate(from_rkyv_bytes(bytes)?),
             Opcode::EntityGetResp => Self::EntityGet(from_rkyv_bytes(bytes)?),
             Opcode::EntityUpdateResp => Self::EntityUpdate(from_rkyv_bytes(bytes)?),
@@ -400,8 +408,10 @@ impl ResponseBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope::request::{
+        EdgeKindWire, ForgetMode, MemoryKindWire, WireMemoryId, WireUuid,
+    };
     use crate::error::{ErrorCategory, ErrorCode};
-    use crate::envelope::request::{EdgeKindWire, ForgetMode, MemoryKindWire, WireMemoryId, WireUuid};
 
     fn round_trip(body: ResponseBody) {
         let bytes = body.encode();
@@ -730,6 +740,31 @@ mod tests {
                     eligible_for_reclaim: false,
                 },
                 is_final: false,
+            },
+        ));
+        round_trip(ResponseBody::AdminBackfill(AdminBackfillResponse {
+            backfill_id: sample_uuid(31),
+            progress: BackfillProgress {
+                running: true,
+                completed: 12,
+                failed: 1,
+                skipped_already_completed: 4,
+                last_processed_memory_id_present: true,
+                last_processed_memory_id: sample_memory_id(),
+            },
+        }));
+        round_trip(ResponseBody::AdminBackfillCancel(
+            AdminBackfillCancelResponse {
+                backfill_id: sample_uuid(32),
+                cancelled: true,
+                progress: BackfillProgress::idle(),
+            },
+        ));
+        round_trip(ResponseBody::AdminBackfillCancel(
+            AdminBackfillCancelResponse {
+                backfill_id: sample_uuid(33),
+                cancelled: false,
+                progress: BackfillProgress::idle(),
             },
         ));
     }

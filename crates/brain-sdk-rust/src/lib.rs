@@ -82,7 +82,13 @@ pub mod request_id;
 pub mod retry;
 
 pub use brain_core::TombstoneReason;
-pub use brain_core::{EntityId, MemoryId, RelationId, RequestId, StatementId, StatementKind};
+pub use brain_core::{
+    BackfillId, EntityId, MemoryId, RelationId, RequestId, StatementId, StatementKind,
+};
+pub use brain_protocol::envelope::request::BackfillScope;
+pub use brain_protocol::envelope::response::{
+    AdminBackfillCancelResponse, AdminBackfillResponse, BackfillProgress,
+};
 pub use client::Client;
 pub use config::{AuthMethod, ClientConfig};
 pub use error::ClientError;
@@ -95,7 +101,8 @@ pub use models::errors::{
 };
 pub use observability::{MetricsSnapshot, OpMetrics};
 pub use ops::{
-    EncodeBuilder, EncodeResponseExt, EntityClient, EntityCreateBuilder, EntityListBuilder,
+    AdminClient, BackfillBuilder, BackfillHandle, EncodeBuilder, EncodeResponseExt, EntityClient,
+    EntityCreateBuilder, EntityListBuilder,
     EntityMergeBuilder, EntityResolveBuilder, EntityUpdateBuilder, EventBuilder, ExplainResult,
     FactBuilder, ForgetBuilder, FrameStream, FusionConfig, ItemKind, ItemRef, LinkBuilder,
     MaterializeProceduralBuilder, MergeOutcome, PlanBuilder, PlanOutcome, PreferenceBuilder,

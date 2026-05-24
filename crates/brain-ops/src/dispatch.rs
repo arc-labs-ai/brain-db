@@ -301,6 +301,16 @@ pub async fn dispatch(
             Err(OpError::NotYetImplemented("admin op — Phase 8 / 9"))
         }
 
+        // Backfill control surface. The wire layer is allocated;
+        // the handler that bridges to the per-shard
+        // `BackfillWorker::submit` / `::cancel` API lands when the
+        // worker handle threads into `OpsContext`. Today the call
+        // returns `NotYetImplemented` so callers see a structured
+        // error rather than a silent route miss.
+        RequestBody::AdminBackfill(_) | RequestBody::AdminBackfillCancel(_) => Err(
+            OpError::NotYetImplemented("admin backfill op — worker handle not wired"),
+        ),
+
         // -----------------------------------------------------------
         // Knowledge layer — Phase 16+.
         // -----------------------------------------------------------
