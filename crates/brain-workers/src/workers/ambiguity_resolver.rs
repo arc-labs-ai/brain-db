@@ -637,7 +637,7 @@ mod tests {
         let writer: Arc<dyn WriterHandle> =
             Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
         let executor = ExecutorContext::new(embedder, shared, metadata, writer);
-        let ops = Arc::new(OpsContext::new(executor));
+        let ops = Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor));
         WorkerContext {
             ops,
             shutdown: Arc::new(AtomicBool::new(false)),

@@ -254,7 +254,7 @@ mod tests {
         // construct a fresh context per test — leaking the dir for a
         // few µs is fine.
         std::mem::forget(tempdir);
-        OpsContext::new(executor)
+        crate::test_support::ops_context_for_tests_owning_tempdir(executor)
     }
 
     fn encode_req() -> brain_protocol::envelope::request::EncodeRequest {

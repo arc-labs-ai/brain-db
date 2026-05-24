@@ -39,13 +39,14 @@ use super::router::{GraphAnchorMode, QueryRequest, Retriever};
 // ---------------------------------------------------------------------------
 
 /// What the executor needs beyond a `QueryPlan`. Built from
-/// `OpsContext`'s retriever slots in the caller (the wire
-/// handler does the assembly when 23.9 / 23.11 land).
+/// `OpsContext`'s retriever slots in the caller. The three
+/// retrievers are mandatory: every spawned shard wires real
+/// impls and tests provide mocks.
 #[derive(Clone)]
 pub struct HybridExecutorContext {
-    pub semantic: Option<Arc<dyn SemanticRetriever>>,
-    pub lexical: Option<Arc<dyn LexicalRetriever>>,
-    pub graph: Option<Arc<dyn GraphRetriever>>,
+    pub semantic: Arc<dyn SemanticRetriever>,
+    pub lexical: Arc<dyn LexicalRetriever>,
+    pub graph: Arc<dyn GraphRetriever>,
     pub metadata: Arc<Mutex<MetadataDb>>,
     /// Optional cross-encoder for the W2.2 rerank pass. When
     /// `Some` and the plan opted in (`QueryPlan.rerank == true`),
@@ -117,8 +118,6 @@ pub enum RetrieverStatus {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
-    #[error("missing retriever handle: {0:?}")]
-    MissingRetriever(Retriever),
     #[error("filter chain: {0}")]
     Filter(#[from] FilterError),
 }
@@ -176,9 +175,6 @@ pub fn execute(
         match invocation {
             Ok(items) => {
                 cached_semantic = Some(items);
-            }
-            Err(RetrieverInvocationError::Missing) => {
-                return Err(ExecutionError::MissingRetriever(Retriever::Semantic));
             }
             Err(_) => {
                 // Semantic failed or was skipped. Graph will
@@ -242,9 +238,6 @@ pub fn execute(
                     retriever: planned.retriever,
                     status: RetrieverStatus::Skipped(reason),
                 });
-            }
-            Err(RetrieverInvocationError::Missing) => {
-                return Err(ExecutionError::MissingRetriever(planned.retriever));
             }
             Err(RetrieverInvocationError::Failure(msg)) => {
                 tracing::warn!(
@@ -411,7 +404,6 @@ fn fetch_texts(
 
 enum RetrieverInvocationError {
     Skipped(&'static str),
-    Missing,
     Failure(String),
 }
 
@@ -433,9 +425,7 @@ fn invoke_semantic(
     req: &QueryRequest,
     ctx: &HybridExecutorContext,
 ) -> Result<Vec<RankedItem>, RetrieverInvocationError> {
-    let Some(handle) = ctx.semantic.as_ref() else {
-        return Err(RetrieverInvocationError::Missing);
-    };
+    let handle = &ctx.semantic;
     let Some(text) = req.text.as_ref() else {
         return Err(RetrieverInvocationError::Skipped("no query text"));
     };
@@ -496,9 +486,7 @@ fn invoke_lexical(
     req: &QueryRequest,
     ctx: &HybridExecutorContext,
 ) -> Result<Vec<RankedItem>, RetrieverInvocationError> {
-    let Some(handle) = ctx.lexical.as_ref() else {
-        return Err(RetrieverInvocationError::Missing);
-    };
+    let handle = &ctx.lexical;
     let Some(text) = req.text.as_ref() else {
         return Err(RetrieverInvocationError::Skipped("no query text"));
     };
@@ -558,9 +546,7 @@ fn invoke_graph(
     ctx: &HybridExecutorContext,
     pre_anchors: Option<&[RankedItem]>,
 ) -> Result<Vec<RankedItem>, RetrieverInvocationError> {
-    let Some(handle) = ctx.graph.as_ref() else {
-        return Err(RetrieverInvocationError::Missing);
-    };
+    let handle = &ctx.graph;
     let RetrieverConfig::Graph {
         max_depth,
         max_branching,

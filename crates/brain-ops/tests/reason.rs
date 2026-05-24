@@ -94,7 +94,7 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
         metadata,
         writer as Arc<dyn WriterHandle>,
     );
-    let ctx = OpsContext::new(executor);
+    let ctx = brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor);
 
     for (i, (src, kind, tgt)) in edges.iter().enumerate() {
         let mut request_id = [0u8; 16];

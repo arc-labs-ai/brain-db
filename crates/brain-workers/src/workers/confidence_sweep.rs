@@ -704,7 +704,7 @@ mod tests {
             StatementHnswIndex::new(StatementHnswParams::default_v1()).unwrap(),
         ));
         let executor = ExecutorContext::new(dispatcher, shared, metadata.clone(), writer);
-        let ops = Arc::new(OpsContext::new(executor));
+        let ops = Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor));
         let ctx = WorkerContext {
             ops,
             shutdown: Arc::new(AtomicBool::new(false)),

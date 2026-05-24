@@ -75,7 +75,7 @@ fn build_fixture_with_registry(registry: ExtractorRegistry) -> Fixture {
         metadata.clone(),
         writer as Arc<dyn WriterHandle>,
     );
-    let ops = OpsContext::new(executor).with_extractor_registry(registry);
+    let ops = brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor).with_extractor_registry(registry);
     let ops = Arc::new(ops);
 
     let (tx, rx) = flume::bounded::<brain_ops::ExtractorEnqueue>(64);

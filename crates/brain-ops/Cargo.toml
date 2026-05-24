@@ -26,6 +26,11 @@ arc-swap.workspace = true
 blake3.workspace = true
 uuid.workspace = true
 tokio = { version = "1", default-features = false, features = ["sync"] }
+# `test_support::ops_context_for_tests_owning_tempdir` builds a
+# throwaway directory for tantivy at runtime. The module is `pub mod`
+# so external test crates can use it, hence tempfile lives in regular
+# deps rather than dev-only.
+tempfile.workspace = true
 # 17.7: SmallVec used when projecting overflow evidence back to inline
 # for StatementView responses.
 smallvec.workspace = true

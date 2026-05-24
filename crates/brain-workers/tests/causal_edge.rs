@@ -77,7 +77,7 @@ fn build_fixture() -> Fixture {
         metadata.clone(),
         writer.clone() as Arc<dyn WriterHandle>,
     );
-    let ctx = Arc::new(OpsContext::new(executor).with_event_bus(bus.clone()));
+    let ctx = Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor).with_event_bus(bus.clone()));
     Fixture {
         ctx,
         writer,

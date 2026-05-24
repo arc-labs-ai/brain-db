@@ -152,7 +152,7 @@ fn build_fixture() -> Fixture {
     );
 
     Fixture {
-        ctx: OpsContext::new(executor),
+        ctx: brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor),
         _tempdir: tempdir,
     }
 }
@@ -176,9 +176,9 @@ fn attach_hybrid_mocks(fix: &mut Fixture, memory_id: u128) {
     fix.ctx = fix
         .ctx
         .clone()
-        .with_semantic_retriever(Some(Arc::new(semantic) as Arc<dyn SemanticRetriever>))
-        .with_lexical_retriever(Some(Arc::new(lexical) as Arc<dyn LexicalRetriever>))
-        .with_graph_retriever(Some(Arc::new(graph) as Arc<dyn GraphRetriever>));
+        .with_semantic_retriever(Arc::new(semantic) as Arc<dyn SemanticRetriever>)
+        .with_lexical_retriever(Arc::new(lexical) as Arc<dyn LexicalRetriever>)
+        .with_graph_retriever(Arc::new(graph) as Arc<dyn GraphRetriever>);
 }
 
 async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str) -> u128 {

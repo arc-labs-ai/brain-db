@@ -1,18 +1,17 @@
 //! RECALL handler.
 //!
-//! RECALL is one verb with one server-side routing rule:
+//! RECALL is one verb, one code path: every request walks the same
+//! plan → fan-out → fuse → filter → enrich → project pipeline. Shards
+//! always wire all three retrievers (semantic + lexical + graph) at
+//! spawn — there is no "substrate-only" fallback. A schema upload does
+//! not gate retrieval; it only narrows what STATEMENT_CREATE /
+//! RELATION_CREATE / predicate filters accept.
 //!
-//! - `txn_id` present → substrate path. Transactional
-//!   read-your-writes requires the per-txn buffer overlay, and the
-//!   lexical + graph retrievers only see committed state, so they
-//!   can't honour a pending write.
-//! - otherwise → hybrid (semantic + lexical + graph fused via RRF).
-//!
-//! Hybrid is the default for every deployment. A schema upload does
-//! not gate retrieval — it only narrows what STATEMENT_CREATE /
-//! RELATION_CREATE / predicate filters accept. The substrate code
-//! path stays internal so transactional recalls keep working, but it
-//! is not selectable from the wire.
+//! In-txn reads: when the caller passes `req.txn_id`, the per-txn
+//! buffer is overlaid on the committed result so RECALL inside a
+//! transaction sees its own pending ENCODE writes (read-your-writes).
+//! Tombstoned ids from the txn buffer are dropped from the committed
+//! side before the merge.
 
 use std::collections::HashSet;
 
@@ -27,7 +26,6 @@ use brain_planner::hybrid::planner::{plan as hybrid_plan, PlanError};
 use brain_planner::hybrid::router::{
     QueryRequest as PlannerQueryRequest, Retriever, RetrieverSelection,
 };
-use brain_planner::{execute_recall, plan_recall_inner, RecallHit};
 use brain_protocol::envelope::request::{MemoryKindWire, RecallRequest};
 use brain_protocol::envelope::response::{MemoryResult, RecallResponseFrame};
 use brain_protocol::RetrieverNameWire;
@@ -40,269 +38,189 @@ pub async fn handle_recall(
     req: RecallRequest,
     ctx: &OpsContext,
 ) -> Result<RecallResponseFrame, OpError> {
-    if req.txn_id.is_some() {
-        return substrate_recall(req, ctx).await;
+    // Reject obviously-invalid input up front. The hybrid planner
+    // silently clamps `limit == 0` to a default, which is the wrong
+    // behavior for a caller who literally asked for "zero results."
+    if req.top_k == 0 {
+        return Err(OpError::InvalidRequest("recall: top_k must be > 0".into()));
     }
-    // Cold-start posture: a context with zero retrievers wired is
-    // either a unit-test fixture that bypasses shard spawn, or a
-    // shard whose tantivy + HNSW slots haven't been populated yet.
-    // The substrate path is the only thing it can serve. Production
-    // shards wire all three at spawn; reaching the hybrid path with
-    // any individual slot missing is still a real internal error
-    // (see `map_execution_error`).
-    if ctx.semantic_retriever.is_none()
-        && ctx.lexical_retriever.is_none()
-        && ctx.graph_retriever.is_none()
-    {
-        return substrate_recall(req, ctx).await;
-    }
-    let HybridRecallOutcome::Frame(frame) = hybrid_recall(&req, ctx).await?;
-    Ok(frame)
-}
+    let planner_req = build_planner_request(&req);
 
-// ---------------------------------------------------------------------------
-// Substrate path. Reachable only from inside this module (transactional
-// recalls). Never selectable from the wire.
-// ---------------------------------------------------------------------------
+    let plan = hybrid_plan(&planner_req).map_err(map_plan_error)?;
+    let exec_ctx = HybridExecutorContext {
+        semantic: ctx.semantic_retriever.clone(),
+        lexical: ctx.lexical_retriever.clone(),
+        graph: ctx.graph_retriever.clone(),
+        metadata: ctx.executor.metadata.clone(),
+        cross_encoder: ctx.cross_encoder.clone(),
+    };
+    let result = hybrid_execute(&plan, &planner_req, &exec_ctx).map_err(map_execution_error)?;
 
-async fn substrate_recall(
-    req: RecallRequest,
-    ctx: &OpsContext,
-) -> Result<RecallResponseFrame, OpError> {
-    // 1. Plan.
-    let plan = plan_recall_inner(&req, &ctx.planner_ctx)?;
+    let memory_results = project_memory_results(&result, &req, ctx)?;
 
-    // 2. If a txn is set, embed the cue once and snapshot the buffer
-    //    so we can layer pending memories on top of HNSW hits + drop
-    //    tombstoned ids.
-    let txn_snapshot = if let Some(txn_id) = req.txn_id {
-        let _ = ctx.txn_store.validate_active(txn_id)?;
-        let snap = ctx.txn_store.with_buffer(txn_id, |buf| {
-            Ok(TxnReadSnapshot {
-                pending: buf.encodes.clone(),
-                tombstoned: buf.tombstoned.clone(),
-            })
-        })?;
-        Some(snap)
+    // In-txn read-your-writes: overlay the txn's pending ENCODE
+    // buffer on top of the committed hybrid result. Without this,
+    // an in-txn RECALL would never see writes the same transaction
+    // has buffered but not yet committed.
+    let memory_results = if let Some(txn_id) = req.txn_id {
+        overlay_txn_buffer(memory_results, txn_id, &req, ctx)?
     } else {
-        None
+        memory_results
     };
 
-    // 3. Execute committed RECALL.
-    let result = execute_recall(plan, &ctx.executor).await?;
+    let cumulative_count = u32::try_from(memory_results.len()).unwrap_or(u32::MAX);
 
-    // 4. Merge in pending-memory hits and drop tombstoned ids.
-    let merged = if let Some(snap) = txn_snapshot {
-        merge_with_txn(&req, result.hits, &snap, ctx)?
-    } else {
-        result.hits
-    };
-
-    // 5. Sort by score desc and trim to top_k.
-    let mut hits = merged;
-    hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    if req.confidence_threshold > 0.0 {
-        hits.retain(|h| h.score >= req.confidence_threshold);
+    for r in &memory_results {
+        ctx.access_buffer.record(MemoryId::from_raw(r.memory_id));
     }
-    hits.truncate(req.top_k as usize);
-
-    // Every memory returned by RECALL is a candidate for the next
-    // access-boost cycle.
-    for h in &hits {
-        ctx.access_buffer.record(h.memory_id);
-    }
-
-    // When include_edges is set, fetch outgoing builtin edges for each
-    // surviving hit. Mentions / typed-relation edges (knowledge layer)
-    // are filtered out — they're answered by separate ops (entity_get,
-    // relation_list), not by the RECALL response. One redb read txn
-    // serves every hit.
-    let edges_per_hit = if req.include_edges {
-        Some(fetch_outgoing_edges_for(&hits, ctx)?)
-    } else {
-        None
-    };
-    // When include_graph is set, fetch knowledge-layer enrichment
-    // (mentioned entities / sourced statements / incident typed
-    // relations) per hit. Independent of include_edges — both can be
-    // set; both share the metadata lock but each opens its own read
-    // txn for now (cheap; future optimisation can fold them).
-    let graph_per_hit = if req.include_graph {
-        let ids: Vec<MemoryId> = hits.iter().map(|h| h.memory_id).collect();
-        let db_guard = ctx.executor.metadata.lock();
-        let rtxn = db_guard.read_txn().map_err(|e| {
-            OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
-        })?;
-        Some(fetch_enrichment_for(&ids, &rtxn)?)
-    } else {
-        None
-    };
-
-    let results: Vec<MemoryResult> = hits
-        .into_iter()
-        .enumerate()
-        .map(|(i, h)| {
-            let edges = edges_per_hit.as_ref().and_then(|v| v.get(i).cloned());
-            // graph_per_hit is Vec<Option<GraphEnrichment>>; index → Option<&Option<…>>;
-            // flatten the outer Option (i is in range by construction).
-            let graph = graph_per_hit
-                .as_ref()
-                .and_then(|v| v.get(i).cloned())
-                .flatten();
-            hit_to_wire(h, edges, graph)
-        })
-        .collect();
-    let cumulative_count = u32::try_from(results.len()).unwrap_or(u32::MAX);
 
     Ok(RecallResponseFrame {
-        results,
+        results: memory_results,
         is_final: true,
         cumulative_count,
         estimated_remaining: None,
     })
 }
 
-struct TxnReadSnapshot {
-    pending: Vec<BufferedEncode>,
-    tombstoned: std::collections::HashSet<MemoryId>,
-}
-
-fn merge_with_txn(
+/// Merge the txn's pending writes into the committed hybrid result.
+/// Drops tombstoned ids on the committed side, scores each pending
+/// encode against the cue, applies the post-filters (kind, context,
+/// salience, age), then re-sorts by score and trims to `top_k`.
+fn overlay_txn_buffer(
+    committed: Vec<MemoryResult>,
+    txn_id: [u8; 16],
     req: &RecallRequest,
-    committed: Vec<RecallHit>,
-    snap: &TxnReadSnapshot,
     ctx: &OpsContext,
-) -> Result<Vec<RecallHit>, OpError> {
-    // Drop tombstoned ids from the committed side.
-    let mut hits: Vec<RecallHit> = committed
+) -> Result<Vec<MemoryResult>, OpError> {
+    let _ = ctx.txn_store.validate_active(txn_id)?;
+    let (pending, tombstoned) = ctx.txn_store.with_buffer(txn_id, |buf| {
+        Ok::<_, OpError>((buf.encodes.clone(), buf.tombstoned.clone()))
+    })?;
+
+    // Drop tombstoned committed hits first — a tombstone in the
+    // buffer wins over a committed row for in-txn reads.
+    let mut merged: Vec<MemoryResult> = committed
         .into_iter()
-        .filter(|h| !snap.tombstoned.contains(&h.memory_id))
+        .filter(|m| !tombstoned.contains(&MemoryId::from_raw(m.memory_id)))
         .collect();
 
-    // Embed the cue once for the linear pending scan. Reuse the
-    // dispatcher embed call; with a CachingDispatcher this is free
-    // after the first call.
+    if pending.is_empty() {
+        // No buffered writes to overlay — committed result (minus
+        // tombstoned) is the final answer.
+        // Re-truncate just in case the tombstone filter pushed us
+        // over the requested top_k boundary.
+        merged.truncate(req.top_k as usize);
+        return Ok(merged);
+    }
+
     let cue_vec = ctx
         .executor
         .embedder
         .embed(&req.cue_text)
         .map_err(|e| OpError::ExecError(brain_planner::ExecError::EmbedFailed(e)))?;
 
-    // Filters reused: kind, context, salience floor.
-    let kind_filter = req
+    let kind_filter: Option<HashSet<MemoryKindWire>> = req
         .kind_filter
         .as_ref()
-        .map(|v| v.iter().copied().collect::<std::collections::HashSet<_>>());
-    let context_filter = req
+        .map(|v| v.iter().copied().collect());
+    let context_filter: Option<HashSet<u64>> = req
         .context_filter
         .as_ref()
-        .map(|v| v.iter().copied().collect::<std::collections::HashSet<_>>());
+        .map(|v| v.iter().copied().collect());
 
-    for pending in &snap.pending {
-        if snap.tombstoned.contains(&pending.memory_id) {
+    for p in &pending {
+        if tombstoned.contains(&p.memory_id) {
             continue;
         }
-        if let Some(kinds) = &kind_filter {
-            let wire_kind = brain_protocol::envelope::request::MemoryKindWire::from(pending.kind);
+        let wire_kind = MemoryKindWire::from(p.kind);
+        if let Some(ref kinds) = kind_filter {
             if !kinds.contains(&wire_kind) {
                 continue;
             }
         }
-        if let Some(contexts) = &context_filter {
-            if !contexts.contains(&pending.context_id.raw()) {
+        if let Some(ref contexts) = context_filter {
+            if !contexts.contains(&p.context_id.raw()) {
                 continue;
             }
         }
-        if pending.salience_initial < req.salience_floor {
+        if p.salience_initial < req.salience_floor {
             continue;
         }
-        let score = cosine(&cue_vec, &pending.vector);
-        hits.push(RecallHit {
-            memory_id: pending.memory_id,
-            score,
-            kind: pending.kind,
-            context_id: pending.context_id,
-            salience: pending.salience_initial,
-            created_at_unix_nanos: pending.created_at_unix_nanos,
-            // The text was buffered by the in-txn encode handler and
-            // lives on `BufferedEncode.text`. Mirror the committed-
-            // side contract: surface it only when the caller asked
-            // via `include_text`, otherwise leave it None.
-            text: if req.include_text {
-                Some(pending.text.clone())
-            } else {
-                None
-            },
-            // Pending (buffered) memories — no committed metadata
-            // yet, so decay/access/flags are all defaults.
-            salience_initial: pending.salience_initial,
-            access_count: 0,
-            flags: 0,
-            consolidated_at_unix_nanos: None,
-            edges_out_count: 0,
-            edges_in_count: 0,
-            last_accessed_at_unix_nanos: pending.created_at_unix_nanos,
-            // Buffered ops haven't been WAL'd yet — they get an LSN
-            // at TXN_COMMIT. Recall inside a txn sees them with
-            // encoded_at_lsn=0 (unknown until commit).
-            encoded_at_lsn: 0,
-        });
+        if let Some(bound) = req.age_bound_unix_nanos {
+            if p.created_at_unix_nanos < bound {
+                continue;
+            }
+        }
+        let score = cosine(&cue_vec, &p.vector);
+        if score < req.confidence_threshold {
+            continue;
+        }
+        merged.push(pending_to_memory_result(p, req, score));
     }
 
-    Ok(hits)
+    // Re-sort by similarity_score descending; pending hits are
+    // exact-cosine and committed hits carry semantic_score (also
+    // exact cosine) so the scale is consistent.
+    merged.sort_by(|a, b| {
+        b.similarity_score
+            .partial_cmp(&a.similarity_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    merged.truncate(req.top_k as usize);
+    Ok(merged)
 }
 
-/// For each `RecallHit`, walk the unified edge table prefix-scanned at
-/// (NodeRef::Memory(hit.memory_id), *, *) and project to the wire
-/// `EdgeView` shape. One redb read transaction serves every hit so the
-/// cost is amortised. Only `EdgeKindRef::Builtin` edges are included —
-/// memory→entity (`Mentions`) and typed relations belong to the
-/// knowledge-layer ops, not to RECALL.
-fn fetch_outgoing_edges_for(
-    hits: &[brain_planner::RecallHit],
-    ctx: &OpsContext,
-) -> Result<Vec<Vec<brain_protocol::envelope::response::EdgeView>>, OpError> {
-    use brain_core::NodeRef;
-    use brain_metadata::tables::edge::walk_outgoing;
-
-    let db_guard = ctx.executor.metadata.lock();
-    let rtxn = db_guard.read_txn().map_err(|e| {
-        OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
-    })?;
-    let mut out: Vec<Vec<brain_protocol::envelope::response::EdgeView>> = Vec::with_capacity(hits.len());
-    for hit in hits {
-        let rows = walk_outgoing(&rtxn, NodeRef::Memory(hit.memory_id), None).map_err(|e| {
-            OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
-        })?;
-        let edges: Vec<brain_protocol::envelope::response::EdgeView> = rows
-            .into_iter()
-            .filter_map(|(kind, to, _disamb, data)| {
-                // Only builtin substrate edges (Caused / FollowedBy /
-                // DerivedFrom / SimilarTo / Contradicts / Supports /
-                // References / PartOf) surface in RECALL. Mentions and
-                // typed relations are knowledge-layer surface.
-                let builtin = match kind {
-                    brain_core::EdgeKindRef::Builtin(k) => k,
-                    _ => return None,
-                };
-                let target = match to {
-                    NodeRef::Memory(mid) => mid,
-                    _ => return None,
-                };
-                Some(brain_protocol::envelope::response::EdgeView {
-                    target: target.into(),
-                    kind: builtin.into(),
-                    weight: data.weight,
-                })
-            })
-            .collect();
-        out.push(edges);
+fn pending_to_memory_result(
+    p: &BufferedEncode,
+    req: &RecallRequest,
+    score: f32,
+) -> MemoryResult {
+    MemoryResult {
+        memory_id: p.memory_id.raw(),
+        text: if req.include_text {
+            p.text.clone()
+        } else {
+            String::new()
+        },
+        similarity_score: score,
+        // Within a txn the buffered hit has no fused score (no
+        // retrievers contributed); surface the same value as
+        // similarity so threshold reasoning on `confidence` works
+        // uniformly across both code paths.
+        confidence: score,
+        salience: p.salience_initial,
+        kind: MemoryKindWire::from(p.kind),
+        context_id: p.context_id.into(),
+        created_at_unix_nanos: p.created_at_unix_nanos,
+        last_accessed_at_unix_nanos: p.created_at_unix_nanos,
+        // Edges and graph enrichment from buffered writes aren't
+        // visible until commit — the typed-graph tables they'd
+        // resolve against don't have the buffered rows yet.
+        edges: if req.include_edges { Some(Vec::new()) } else { None },
+        graph: None,
+        contributing_retrievers: Vec::new(),
+        fused_score: score,
+        salience_initial: p.salience_initial,
+        access_count: 0,
+        // Buffered writes haven't been WAL'd yet; LSN is assigned
+        // at TXN_COMMIT.
+        lsn: 0,
+        flags: 0,
+        consolidated_at_unix_nanos: None,
+        edges_out_count: 0,
+        edges_in_count: 0,
     }
-    Ok(out)
+}
+
+/// Cosine similarity between two equal-length f32 vectors. Both are
+/// expected L2-normalised (the embedder normalises by construction);
+/// no norm correction needed.
+fn cosine(a: &[f32; brain_embed::VECTOR_DIM], b: &[f32; brain_embed::VECTOR_DIM]) -> f32 {
+    let mut sum = 0.0_f32;
+    for i in 0..brain_embed::VECTOR_DIM {
+        sum += a[i] * b[i];
+    }
+    sum
 }
 
 /// Per-hit knowledge-layer enrichment populated when the request
@@ -530,100 +448,6 @@ fn fetch_enrichment_for(
         }));
     }
     Ok(out)
-}
-
-fn cosine(a: &[f32; brain_embed::VECTOR_DIM], b: &[f32; brain_embed::VECTOR_DIM]) -> f32 {
-    let mut dot = 0.0_f32;
-    let mut na = 0.0_f32;
-    let mut nb = 0.0_f32;
-    for i in 0..brain_embed::VECTOR_DIM {
-        dot += a[i] * b[i];
-        na += a[i] * a[i];
-        nb += b[i] * b[i];
-    }
-    let denom = na.sqrt() * nb.sqrt();
-    if denom <= 0.0 {
-        0.0
-    } else {
-        dot / denom
-    }
-}
-
-fn hit_to_wire(
-    hit: RecallHit,
-    edges: Option<Vec<brain_protocol::envelope::response::EdgeView>>,
-    graph: Option<brain_protocol::envelope::response::GraphEnrichment>,
-) -> MemoryResult {
-    MemoryResult {
-        memory_id: hit.memory_id.into(),
-        text: hit.text.unwrap_or_default(),
-        similarity_score: hit.score,
-        confidence: hit.score,
-        salience: hit.salience,
-        kind: hit.kind.into(),
-        context_id: hit.context_id.into(),
-        created_at_unix_nanos: hit.created_at_unix_nanos,
-        last_accessed_at_unix_nanos: hit.last_accessed_at_unix_nanos,
-        edges,
-        graph,
-        // Substrate path — no hybrid metadata.
-        contributing_retrievers: Vec::new(),
-        fused_score: 0.0,
-        salience_initial: hit.salience_initial,
-        access_count: hit.access_count,
-        // WAL position the row was originally encoded at. Stamped
-        // by the live writer (and recovery, on replay) onto
-        // `MemoryMetadata.encoded_at_lsn`. Clients chain
-        // `recall → subscribe --start-lsn lsn+1` off this.
-        lsn: hit.encoded_at_lsn,
-        flags: hit.flags,
-        consolidated_at_unix_nanos: hit.consolidated_at_unix_nanos,
-        edges_out_count: hit.edges_out_count,
-        edges_in_count: hit.edges_in_count,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Hybrid path.
-// ---------------------------------------------------------------------------
-
-/// Outcome of the hybrid path. Single-variant today; kept as an enum
-/// because every other production result-shape on this hot path is an
-/// enum, and a future "deferred to background" outcome (the planned
-/// async-fusion mode) lands here without churning the call site.
-enum HybridRecallOutcome {
-    Frame(RecallResponseFrame),
-}
-
-async fn hybrid_recall(
-    req: &RecallRequest,
-    ctx: &OpsContext,
-) -> Result<HybridRecallOutcome, OpError> {
-    let planner_req = build_planner_request(req);
-
-    let plan = hybrid_plan(&planner_req).map_err(map_plan_error)?;
-    let exec_ctx = HybridExecutorContext {
-        semantic: ctx.semantic_retriever.clone(),
-        lexical: ctx.lexical_retriever.clone(),
-        graph: ctx.graph_retriever.clone(),
-        metadata: ctx.executor.metadata.clone(),
-        cross_encoder: ctx.cross_encoder.clone(),
-    };
-    let result = hybrid_execute(&plan, &planner_req, &exec_ctx).map_err(map_execution_error)?;
-
-    let memory_results = project_memory_results(&result, req, ctx)?;
-    let cumulative_count = u32::try_from(memory_results.len()).unwrap_or(u32::MAX);
-
-    for r in &memory_results {
-        ctx.access_buffer.record(MemoryId::from_raw(r.memory_id));
-    }
-
-    Ok(HybridRecallOutcome::Frame(RecallResponseFrame {
-        results: memory_results,
-        is_final: true,
-        cumulative_count,
-        estimated_remaining: None,
-    }))
 }
 
 fn build_planner_request(req: &RecallRequest) -> PlannerQueryRequest {
@@ -889,17 +713,8 @@ fn map_plan_error(e: PlanError) -> OpError {
     }
 }
 
-/// A retriever slot being empty on a shard that accepted a RECALL is
-/// a real internal error: shard spawn is responsible for wiring every
-/// required retriever, and a recall reaching the handler means spawn
-/// succeeded. If we see `MissingRetriever` here, somebody downgraded
-/// a sink to `None` after spawn — flag it loud rather than silently
-/// degrading.
 fn map_execution_error(e: ExecutionError) -> OpError {
     match e {
-        ExecutionError::MissingRetriever(r) => OpError::Internal(format!(
-            "hybrid retriever slot empty for {r:?} after shard spawn",
-        )),
         ExecutionError::Filter(inner) => OpError::Internal(format!("hybrid filter: {inner}")),
     }
 }

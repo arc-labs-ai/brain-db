@@ -494,6 +494,33 @@ pub enum ShardError {
 
     #[error("LLM cache open failed: {0}")]
     LlmCache(#[from] brain_metadata::LlmCacheError),
+
+    /// Lexical retrieval is a core capability — a shard that can't
+    /// open its tantivy indexes can't serve recalls correctly, so we
+    /// refuse to spawn rather than degrade silently.
+    #[error("tantivy init failed: {source}")]
+    TantivyInitFailed {
+        #[source]
+        source: brain_index::TantivyShardError,
+    },
+
+    /// Snapshot-restore + rebuild on tantivy open failed. Same
+    /// rationale as `TantivyInitFailed` — the spawn must abort so
+    /// the operator sees the problem.
+    #[error("tantivy recovery failed: {source}")]
+    TantivyRecoveryFailed {
+        #[source]
+        source: crate::shard::tantivy_recovery::RecoveryError,
+    },
+
+    /// `TantivyLexicalRetriever::new` failed against an open
+    /// `TantivyShard`. Treat the same as `TantivyInitFailed`: the
+    /// shard can't serve recalls correctly, so spawn aborts.
+    #[error("lexical retriever init failed: {source}")]
+    LexicalRetrieverInitFailed {
+        #[source]
+        source: brain_index::LexicalError,
+    },
 }
 
 impl ShardError {
@@ -1127,6 +1154,29 @@ pub fn spawn_shard(
     };
     let metadata: SharedMetadataDb = Arc::new(Mutex::new(metadata_db));
 
+    // ---- 4b. Tantivy open + recovery (must succeed at spawn) -------------
+    //
+    // Lexical retrieval is a core capability. A shard that can't open or
+    // recover its tantivy indexes can't serve recalls correctly, so we
+    // refuse to spawn rather than silently flip to a degraded mode. We
+    // do this *outside* the Glommio executor closure so the error can
+    // bubble through `spawn_shard`'s `Result` directly.
+    let tantivy_shard: Arc<brain_index::TantivyShard> = {
+        let startup = brain_index::TantivyShard::open(&dir)
+            .map_err(|source| ShardError::TantivyInitFailed { source })?;
+        let db_guard = metadata.lock();
+        crate::shard::tantivy_recovery::recover_tantivy_on_open(&dir, &db_guard, startup)
+            .map_err(|source| ShardError::TantivyRecoveryFailed { source })?
+    };
+    // Build the lexical retriever from the same `TantivyShard` the
+    // indexer workers will write to. Constructing it here (outside the
+    // closure) propagates the failure through `spawn_shard`'s `Result`
+    // just like the open above.
+    let lexical_retriever: Arc<dyn brain_index::LexicalRetriever> = Arc::new(
+        brain_index::TantivyLexicalRetriever::new(tantivy_shard.clone())
+            .map_err(|source| ShardError::LexicalRetrieverInitFailed { source })?,
+    );
+
     // ---- 5. Spawn the Glommio executor + build the rest of the stack -----
     let (tx, rx) = flume::bounded::<ShardRequest>(cfg.channel_capacity);
     // 9.11 cross-shard event feed. The Glommio closure spawns a
@@ -1211,6 +1261,10 @@ pub fn spawn_shard(
     // 21.5: the shard dir is also home to the per-shard LLM
     // extractor response cache (`<shard_dir>/llm_cache.redb`).
     let shard_dir_for_executor = dir.clone();
+    // Tantivy is opened above and propagated into the closure pre-built.
+    // The closure can no longer downgrade lexical retrieval to `None`.
+    let tantivy_for_closure = tantivy_shard.clone();
+    let lexical_retriever_for_closure = lexical_retriever.clone();
     let join_handle = LocalExecutorBuilder::new(placement)
         .name(&format!("brain-shard-{shard_id}"))
         .spawn(move || async move {
@@ -1244,28 +1298,24 @@ pub fn spawn_shard(
                         .expect("EntityHnswIndex::new"),
                 ),
             );
-            // 23.1: per-shard semantic retriever. Reuses the
-            // executor's embedder + the shared memory HNSW reader.
-            // The statement HNSW handle lets the retriever fan out
-            // to the statement corpus when `SemanticScope::Statement`
-            // or `SemanticScope::Both` is requested.
-            let semantic_retriever_for_ops: Option<Arc<dyn brain_index::SemanticRetriever>> = {
-                let retriever = brain_ops::index::semantic_retriever::BrainSemanticRetriever::new(
+            // Per-shard semantic retriever. Reuses the executor's
+            // embedder + the shared memory HNSW reader. The statement
+            // HNSW handle lets the retriever fan out to the statement
+            // corpus when `SemanticScope::Statement` or
+            // `SemanticScope::Both` is requested.
+            let semantic_retriever_for_ops: Arc<dyn brain_index::SemanticRetriever> = Arc::new(
+                brain_ops::index::semantic_retriever::BrainSemanticRetriever::new(
                     dispatcher.clone(),
                     hnsw_shared.clone(),
                     Some(statement_hnsw_for_shard.clone()),
                     metadata.clone(),
-                );
-                Some(Arc::new(retriever))
-            };
-            // 23.2: per-shard graph retriever. Reads from the
-            // entity / relation / statement redb tables.
-            let graph_retriever_for_ops: Option<Arc<dyn brain_index::GraphRetriever>> = {
-                let retriever = brain_ops::index::graph_retriever::BrainGraphRetriever::new(
-                    metadata.clone(),
-                );
-                Some(Arc::new(retriever))
-            };
+                ),
+            );
+            // Per-shard graph retriever. Reads from the entity /
+            // relation / statement redb tables.
+            let graph_retriever_for_ops: Arc<dyn brain_index::GraphRetriever> = Arc::new(
+                brain_ops::index::graph_retriever::BrainGraphRetriever::new(metadata.clone()),
+            );
             // Per-shard writer wraps metadata + hnsw_writer. The
             // shard_id stamp on `reserve_memory_id` is required —
             // without it every MemoryId claims shard 0, and
@@ -1363,42 +1413,13 @@ pub fn spawn_shard(
             // band partial matches get a second opinion.
             let entity_disambiguator_for_worker = llm_deps.disambiguator.clone();
 
-            // 22.1 + 22.7: open the per-shard tantivy indexes
-            // (`memory_text.tantivy/` + `statements.tantivy/`)
-            // and honour any `IndexStatus::NeedsRebuild` arms by
-            // calling the 22.6 rebuild functions before the
-            // indexer workers start..
-            // Recovery failures abort shard spawn — a shard with
-            // unrecoverable lexical indexes shouldn't accept
-            // reads.
-            let tantivy_for_ops = match brain_index::TantivyShard::open(&shard_dir_for_executor) {
-                Ok(startup) => {
-                    let db_guard = metadata.lock();
-                    match crate::shard::tantivy_recovery::recover_tantivy_on_open(
-                        &shard_dir_for_executor,
-                        &db_guard,
-                        startup,
-                    ) {
-                        Ok(shard) => Some(shard),
-                        Err(err) => {
-                            tracing::error!(
-                                target: "brain_server::shard",
-                                error = %err,
-                                "tantivy recovery failed; lexical retrieval unavailable",
-                            );
-                            None
-                        }
-                    }
-                }
-                Err(err) => {
-                    tracing::error!(
-                        target: "brain_server::shard",
-                        error = %err,
-                        "TantivyShard::open failed; lexical retrieval unavailable for this shard",
-                    );
-                    None
-                }
-            };
+            // Tantivy is opened (and any post-recovery rebuilds run)
+            // before the executor closure spawns — see "Tantivy open
+            // + recovery" above. We just consume the pre-built handle
+            // here. `IndexStatus::NeedsRebuild` is *not* a spawn
+            // failure: the maintenance worker handles steady-state
+            // rebuilds while the live indexes keep serving reads.
+            let tantivy_for_ops = tantivy_for_closure;
 
             // Resolve the classifier model config. Cascades through
             // `BRAIN_NER_MODEL_PATH` (operator override) and the XDG
@@ -1494,54 +1515,51 @@ pub fn spawn_shard(
             // writer's post-commit hook) can tombstone the row.
             // No-schema deployments (no tantivy handle) skip
             // both.
-            let (memory_text_dispatcher_for_ops, statement_text_dispatcher_for_ops) =
-                if let Some(tantivy_shard) = tantivy_for_ops.as_ref() {
-                    let policy = brain_ops::index::text_indexer::CommitPolicy::from_env();
+            let (memory_text_dispatcher_for_ops, statement_text_dispatcher_for_ops) = {
+                let policy = brain_ops::index::text_indexer::CommitPolicy::from_env();
 
-                    let memory_dispatcher = {
-                        let (dispatcher, receiver) =
-                            brain_ops::index::text_indexer::MemoryTextDispatcher::default_channel();
-                        match brain_ops::index::text_indexer::memory::spawn_memory_text_indexer_local(
-                            tantivy_shard.memory_text.clone(),
-                            receiver,
-                            policy,
-                        ) {
-                            Ok(()) => Some(Arc::new(dispatcher)),
-                            Err(err) => {
-                                tracing::error!(
-                                    target: "brain_server::shard",
-                                    error = %err,
-                                    "memory text indexer spawn failed; lexical writes unavailable",
-                                );
-                                None
-                            }
+                let memory_dispatcher = {
+                    let (dispatcher, receiver) =
+                        brain_ops::index::text_indexer::MemoryTextDispatcher::default_channel();
+                    match brain_ops::index::text_indexer::memory::spawn_memory_text_indexer_local(
+                        tantivy_for_ops.memory_text.clone(),
+                        receiver,
+                        policy,
+                    ) {
+                        Ok(()) => Some(Arc::new(dispatcher)),
+                        Err(err) => {
+                            tracing::error!(
+                                target: "brain_server::shard",
+                                error = %err,
+                                "memory text indexer spawn failed; lexical writes unavailable",
+                            );
+                            None
                         }
-                    };
-
-                    let statement_dispatcher = {
-                        let (dispatcher, receiver) =
-                            brain_ops::index::text_indexer::StatementTextDispatcher::default_channel();
-                        match brain_ops::index::text_indexer::statement::spawn_statement_text_indexer_local(
-                            tantivy_shard.statements.clone(),
-                            receiver,
-                            policy,
-                        ) {
-                            Ok(()) => Some(Arc::new(dispatcher)),
-                            Err(err) => {
-                                tracing::error!(
-                                    target: "brain_server::shard",
-                                    error = %err,
-                                    "statement text indexer spawn failed; lexical writes unavailable",
-                                );
-                                None
-                            }
-                        }
-                    };
-
-                    (memory_dispatcher, statement_dispatcher)
-                } else {
-                    (None, None)
+                    }
                 };
+
+                let statement_dispatcher = {
+                    let (dispatcher, receiver) =
+                        brain_ops::index::text_indexer::StatementTextDispatcher::default_channel();
+                    match brain_ops::index::text_indexer::statement::spawn_statement_text_indexer_local(
+                        tantivy_for_ops.statements.clone(),
+                        receiver,
+                        policy,
+                    ) {
+                        Ok(()) => Some(Arc::new(dispatcher)),
+                        Err(err) => {
+                            tracing::error!(
+                                target: "brain_server::shard",
+                                error = %err,
+                                "statement text indexer spawn failed; lexical writes unavailable",
+                            );
+                            None
+                        }
+                    }
+                };
+
+                (memory_dispatcher, statement_dispatcher)
+            };
 
             let mut real_writer = RealWriterHandle::new(metadata.clone(), hnsw_writer)
                 .with_shard_id(shard_id)
@@ -1576,26 +1594,11 @@ pub fn spawn_shard(
                 writer,
             );
 
-            // 22.5: per-shard lexical retriever. Constructed
-            // from the same TantivyShard the indexer workers
-            // write to; phase 23's hybrid query consumes it via
+            // The lexical retriever was constructed alongside the
+            // tantivy open above and propagated in here pre-built.
+            // Hybrid query (phase 23) consumes it via
             // `OpsContext.lexical_retriever`.
-            let lexical_retriever_for_ops = tantivy_for_ops.as_ref().and_then(|shard| {
-                match brain_index::TantivyLexicalRetriever::new(shard.clone()) {
-                    Ok(r) => {
-                        let arc: Arc<dyn brain_index::LexicalRetriever> = Arc::new(r);
-                        Some(arc)
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            target: "brain_server::shard",
-                            error = %err,
-                            "lexical retriever init failed; reads will return IndexUnavailable",
-                        );
-                        None
-                    }
-                }
-            });
+            let lexical_retriever_for_ops = lexical_retriever_for_closure;
 
             // 23.11: seed the per-shard schema-declared gate from
             // the metadata DB. Initial value is
@@ -1613,19 +1616,21 @@ pub fn spawn_shard(
             };
 
             let ops = Arc::new(
-                OpsContext::new(executor_ctx)
-                    .with_event_bus(event_bus.clone())
-                    .with_extractor_registry(extractor_registry)
-                    .with_classifier_config(classifier_config)
-                    .with_llm_cache(llm_cache_for_ops)
-                    .with_tantivy(tantivy_for_ops)
-                    .with_memory_text_dispatcher(memory_text_dispatcher_for_ops)
-                    .with_statement_text_dispatcher(statement_text_dispatcher_for_ops)
-                    .with_lexical_retriever(lexical_retriever_for_ops)
-                    .with_semantic_retriever(semantic_retriever_for_ops)
-                    .with_graph_retriever(graph_retriever_for_ops)
-                    .with_schema_gate(schema_gate)
-                    .with_wal_sink(Some(wal_sink_for_ops)),
+                OpsContext::new(
+                    executor_ctx,
+                    lexical_retriever_for_ops,
+                    semantic_retriever_for_ops,
+                    graph_retriever_for_ops,
+                )
+                .with_event_bus(event_bus.clone())
+                .with_extractor_registry(extractor_registry)
+                .with_classifier_config(classifier_config)
+                .with_llm_cache(llm_cache_for_ops)
+                .with_tantivy(Some(tantivy_for_ops))
+                .with_memory_text_dispatcher(memory_text_dispatcher_for_ops)
+                .with_statement_text_dispatcher(statement_text_dispatcher_for_ops)
+                .with_schema_gate(schema_gate)
+                .with_wal_sink(Some(wal_sink_for_ops)),
             );
 
             // Spawn the per-shard fanout task: drains the in-process

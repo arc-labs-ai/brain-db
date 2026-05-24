@@ -66,7 +66,7 @@ fn build_fixture() -> Fixture {
         ExecutorContext::new(embedder, shared, metadata, writer as Arc<dyn WriterHandle>);
 
     Fixture {
-        ctx: OpsContext::new(executor),
+        ctx: brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor),
         _tempdir: tempdir,
     }
 }

@@ -80,7 +80,7 @@ fn build_fixture() -> Fixture {
         metadata.clone(),
         writer.clone() as Arc<dyn WriterHandle>,
     );
-    let ops = Arc::new(OpsContext::new(executor));
+    let ops = Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor));
     let ctx = WorkerContext {
         ops,
         shutdown: Arc::new(AtomicBool::new(false)),

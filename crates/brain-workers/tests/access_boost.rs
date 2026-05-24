@@ -55,7 +55,7 @@ fn build_fixture_with_buffer(buffer: Arc<AccessBuffer>) -> Fixture {
         metadata.clone(),
         writer as Arc<dyn WriterHandle>,
     );
-    let ctx = OpsContext::new(executor).with_access_buffer(buffer);
+    let ctx = brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor).with_access_buffer(buffer);
     Fixture {
         ctx: Arc::new(ctx),
         metadata,
@@ -357,7 +357,7 @@ fn recall_fills_buffer_then_boost_worker_applies() {
             metadata.clone(),
             writer as Arc<dyn WriterHandle>,
         );
-        let ctx = Arc::new(OpsContext::new(executor));
+        let ctx = Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor));
 
         // Encode two memories.
         let encode_req = |rid: [u8; 16], text: &str| EncodeRequest {

@@ -101,10 +101,29 @@ fn make_ctx(
 ) -> (TempDir, HybridExecutorContext) {
     let dir = TempDir::new().expect("tempdir");
     let metadata = MetadataDb::open(dir.path().join("metadata.redb")).expect("open");
+    let sem_arc: Arc<dyn SemanticRetriever> = match semantic {
+        Some(m) => Arc::new(m),
+        None => Arc::new(MockSemantic {
+            response: Arc::new(StdMutex::new(Ok(Vec::new()))),
+            delay: None,
+        }),
+    };
+    let lex_arc: Arc<dyn LexicalRetriever> = match lexical {
+        Some(m) => Arc::new(m),
+        None => Arc::new(MockLexical {
+            response: Arc::new(StdMutex::new(Ok(Vec::new()))),
+        }),
+    };
+    let graph_arc: Arc<dyn GraphRetriever> = match graph {
+        Some(m) => Arc::new(m),
+        None => Arc::new(MockGraph {
+            response: Arc::new(StdMutex::new(Ok(Vec::new()))),
+        }),
+    };
     let ctx = HybridExecutorContext {
-        semantic: semantic.map(|m| Arc::new(m) as Arc<dyn SemanticRetriever>),
-        lexical: lexical.map(|m| Arc::new(m) as Arc<dyn LexicalRetriever>),
-        graph: graph.map(|m| Arc::new(m) as Arc<dyn GraphRetriever>),
+        semantic: sem_arc,
+        lexical: lex_arc,
+        graph: graph_arc,
         metadata: Arc::new(Mutex::new(metadata)),
         cross_encoder: None,
     };
@@ -346,89 +365,6 @@ fn timeout_records_status() {
     );
     // Items still included — soft timeout.
     assert_eq!(result.items.len(), 1);
-}
-
-// ---------------------------------------------------------------------------
-// Errors.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn missing_retriever_handle_errors() {
-    // Plan calls for Semantic but the context provides no
-    // handle.
-    let (_dir, ctx) = make_ctx(None, None, None);
-    let req = QueryRequest {
-        text: Some("topic".into()),
-        retrievers: RetrieverSelection::Explicit(vec![Retriever::Semantic]),
-        ..Default::default()
-    };
-    let qp = plan(&req).expect("plan");
-    let err = execute(&qp, &req, &ctx).expect_err("missing handle");
-    assert!(matches!(
-        err,
-        ExecutionError::MissingRetriever(Retriever::Semantic)
-    ));
-}
-
-// CH2 — missing lexical handle on a hybrid plan fails loud rather
-// than silently degrading. If a deployment is misconfigured to skip
-// wiring the lexical retriever, the executor must surface that as
-// `MissingRetriever(Lexical)` instead of returning a semantic-only
-// result that looks hybrid to the caller.
-#[test]
-fn missing_lexical_handle_on_hybrid_plan_errors() {
-    let sem = MockSemantic {
-        response: Arc::new(StdMutex::new(Ok(vec![ranked_memory(1, 1, 0.9)]))),
-        delay: None,
-    };
-    // Semantic wired, lexical absent. Plan asks for both.
-    let (_dir, ctx) = make_ctx(Some(sem), None, None);
-
-    let req = QueryRequest {
-        text: Some("budget".into()),
-        retrievers: RetrieverSelection::Explicit(vec![Retriever::Semantic, Retriever::Lexical]),
-        ..Default::default()
-    };
-    let qp = plan(&req).expect("plan");
-    let err = execute(&qp, &req, &ctx).expect_err("missing lexical handle must error");
-    assert!(
-        matches!(err, ExecutionError::MissingRetriever(Retriever::Lexical)),
-        "expected MissingRetriever(Lexical), got {err:?}",
-    );
-}
-
-#[test]
-fn missing_graph_handle_on_hybrid_plan_errors() {
-    // Same fail-loud contract for the graph retriever. The hybrid
-    // path's planner selects all three retrievers for an
-    // entity-anchored query; with the graph handle absent the
-    // executor must error on the graph invocation instead of
-    // silently routing to semantic + lexical only.
-    let sem = MockSemantic {
-        response: Arc::new(StdMutex::new(Ok(vec![ranked_memory(1, 1, 0.9)]))),
-        delay: None,
-    };
-    let lex = MockLexical {
-        response: Arc::new(StdMutex::new(Ok(vec![ranked_memory(2, 1, 0.9)]))),
-    };
-    let (_dir, ctx) = make_ctx(Some(sem), Some(lex), None);
-
-    let req = QueryRequest {
-        text: Some("topic".into()),
-        entity_anchor: Some(EntityId::new()),
-        retrievers: RetrieverSelection::Explicit(vec![
-            Retriever::Semantic,
-            Retriever::Lexical,
-            Retriever::Graph,
-        ]),
-        ..Default::default()
-    };
-    let qp = plan(&req).expect("plan");
-    let err = execute(&qp, &req, &ctx).expect_err("missing graph handle must error");
-    assert!(
-        matches!(err, ExecutionError::MissingRetriever(Retriever::Graph)),
-        "expected MissingRetriever(Graph), got {err:?}",
-    );
 }
 
 // ---------------------------------------------------------------------------

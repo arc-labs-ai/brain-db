@@ -589,14 +589,10 @@ async fn drain_batch(
     // Fetch bounded LLM context (top-m similar memories + optional
     // rolling summary) per memory before running tiers. The fetch
     // happens once for the whole micro-batch so the per-memory cost
-    // amortises against the LLM call that follows. Skipped entirely
-    // when no semantic retriever is wired (substrate-only deployments,
-    // tests without an HNSW handle) or when the cycle LLM budget is
-    // exhausted — there's nothing to feed.
-    let extractor_context_map = if skip_llm_budget_exhausted
-        || ctx.ops.semantic_retriever.is_none()
-        || llm_exts_count(&extractors) == 0
-    {
+    // amortises against the LLM call that follows. Skipped when the
+    // cycle LLM budget is exhausted or no LLM-tier extractors are
+    // registered — there's nothing to feed.
+    let extractor_context_map = if skip_llm_budget_exhausted || llm_exts_count(&extractors) == 0 {
         None
     } else {
         Some(fetch_extractor_context_for_batch(ctx, &live_mems, &worker.metrics).await)

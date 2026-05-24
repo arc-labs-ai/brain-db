@@ -77,8 +77,6 @@ impl Default for ExtractorContextFetchConfig {
 /// HNSW from a missing memory row.
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractorContextError {
-    #[error("semantic retriever not wired")]
-    NoRetriever,
     #[error("memory not found: {0:?}")]
     MemoryNotFound(MemoryId),
     #[error("metadata read failed: {0}")]
@@ -114,9 +112,7 @@ pub async fn fetch_extractor_context(
     config: ExtractorContextFetchConfig,
 ) -> Result<ExtractorContext, ExtractorContextError> {
     let started = Instant::now();
-    let Some(retriever) = ctx.semantic_retriever.as_ref() else {
-        return Err(ExtractorContextError::NoRetriever);
-    };
+    let retriever = &ctx.semantic_retriever;
 
     // Step 1 + 5 prep: open one read txn against metadata. Borrows
     // the same Arc the writer uses; the per-shard Mutex makes the
@@ -338,7 +334,7 @@ mod tests {
             metadata,
             Arc::new(NopWriter) as Arc<dyn WriterHandle>,
         );
-        let ops = OpsContext::new(executor);
+        let ops = crate::test_support::ops_context_for_tests_owning_tempdir(executor);
         (dir, ops)
     }
 
@@ -406,7 +402,7 @@ mod tests {
                 hit(n3, 0.71),
             ],
         });
-        ops.semantic_retriever = Some(stub);
+        ops.semantic_retriever = stub;
 
         let cfg = ExtractorContextFetchConfig {
             top_m: 10,
@@ -442,7 +438,7 @@ mod tests {
         let stub = Arc::new(StubRetriever {
             hits: vec![hit(near_ctx, 0.9), hit(far_ctx, 0.8)],
         });
-        ops.semantic_retriever = Some(stub);
+        ops.semantic_retriever = stub;
 
         let cfg = ExtractorContextFetchConfig {
             top_m: 10,
@@ -473,7 +469,7 @@ mod tests {
         let stub = Arc::new(StubRetriever {
             hits: vec![hit(self_id, 0.99)],
         });
-        ops.semantic_retriever = Some(stub);
+        ops.semantic_retriever = stub;
 
         let cfg = ExtractorContextFetchConfig::default();
         let ec = futures_lite::future::block_on(fetch_extractor_context(&ops, self_id, "cue", cfg))
@@ -497,7 +493,7 @@ mod tests {
             insert_memory(&ops, id, ContextId(7), &format!("n{slot}"), 100 + slot);
             hits.push(hit(id, 0.9 - (slot as f32) * 0.01));
         }
-        ops.semantic_retriever = Some(Arc::new(StubRetriever { hits }));
+        ops.semantic_retriever = Arc::new(StubRetriever { hits });
 
         let cfg = ExtractorContextFetchConfig {
             top_m: 5,
@@ -506,21 +502,6 @@ mod tests {
         let ec = futures_lite::future::block_on(fetch_extractor_context(&ops, self_id, "cue", cfg))
             .expect("fetch succeeds");
         assert_eq!(ec.neighbors.len(), 5, "top_m is the hard cap");
-    }
-
-    #[test]
-    fn fetch_extractor_context_no_retriever_errors_cleanly() {
-        let (_dir, ops) = fresh_ctx();
-        let self_id = MemoryId::pack(0, 1, 0);
-        insert_memory(&ops, self_id, ContextId(7), "self", 100);
-        let err = futures_lite::future::block_on(fetch_extractor_context(
-            &ops,
-            self_id,
-            "cue",
-            ExtractorContextFetchConfig::default(),
-        ))
-        .expect_err("no retriever wired");
-        assert!(matches!(err, ExtractorContextError::NoRetriever));
     }
 
     #[test]

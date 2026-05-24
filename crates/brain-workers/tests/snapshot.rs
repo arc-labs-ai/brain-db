@@ -49,7 +49,7 @@ fn make_ops_context() -> (Arc<OpsContext>, tempfile::TempDir) {
         metadata,
         writer as Arc<dyn WriterHandle>,
     );
-    (Arc::new(OpsContext::new(executor)), tempdir)
+    (Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor)), tempdir)
 }
 
 async fn run_one(

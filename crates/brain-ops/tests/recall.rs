@@ -23,7 +23,7 @@ use brain_ops::test_support::{run_in_glommio, single_body};
 use brain_ops::{dispatch, DispatchOutcome, ErrorCode, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
-    EncodeRequest, MemoryKindWire, RecallRequest, RequestBody, TxnBeginRequest,
+    EncodeRequest, MemoryKindWire, RecallRequest, RequestBody,
 };
 use brain_protocol::envelope::response::{EncodeResponse, RecallResponseFrame, ResponseBody};
 use parking_lot::Mutex;
@@ -77,7 +77,7 @@ fn build_fixture_with_embedder(embedder: Arc<dyn Dispatcher>) -> Fixture {
         ExecutorContext::new(embedder, shared, metadata, writer as Arc<dyn WriterHandle>);
 
     Fixture {
-        ctx: OpsContext::new(executor),
+        ctx: brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor),
         _tempdir: tempdir,
     }
 }
@@ -170,10 +170,13 @@ fn recall_full_pipeline_returns_top_k() {
         assert_eq!(top.context_id, 42);
         assert_eq!(top.kind, MemoryKindWire::Episodic);
         assert!((top.salience - 0.5).abs() < 1e-6);
-        assert_eq!(
-            top.confidence, top.similarity_score,
-            "v1: confidence == similarity"
-        );
+        // The hybrid pipeline carries two distinct scores per hit:
+        // `similarity_score` is the semantic retriever's raw cosine,
+        // `confidence` is the RRF-fused score across all retrievers
+        // that contributed. They will rarely be equal — just assert
+        // both are populated.
+        assert!(top.similarity_score > 0.0, "similarity_score populated");
+        assert!(top.confidence > 0.0, "confidence (fused) populated");
         assert_eq!(
             top.last_accessed_at_unix_nanos, top.created_at_unix_nanos,
             "v1: last_accessed mirrors created_at"
@@ -313,6 +316,9 @@ fn recall_confidence_floor_drops_low_score_hits() {
 
 #[test]
 fn recall_invalid_top_k_returns_plan_error() {
+    // top_k=0 has no meaningful "give me zero results" interpretation;
+    // it's an obvious client bug. The handler rejects it up front rather
+    // than letting the hybrid planner silently clamp it to a default.
     run_in_glommio(|| async {
         let fix = build_fixture();
         let req = recall_req("anything", 0);
@@ -324,8 +330,8 @@ fn recall_invalid_top_k_returns_plan_error() {
         .await
         .unwrap_err();
         assert!(
-            matches!(err, OpError::PlanError(_)),
-            "top_k=0 is a planner validation failure, got {err:?}"
+            matches!(err, OpError::InvalidRequest(_)),
+            "top_k=0 must be rejected as invalid input, got {err:?}"
         );
         assert_eq!(err.error_code(), ErrorCode::InvalidRequest);
     })
@@ -514,10 +520,10 @@ impl GraphRetriever for CannedGraph {
 }
 
 /// Build a fixture whose `OpsContext` has all three hybrid retrievers
-/// wired with canned hits for `memory_id`. With all three slots
-/// populated, `handle_recall` exits the cold-start branch and picks
-/// the production route: `substrate_recall` when a txn is attached,
-/// `hybrid_recall` otherwise.
+/// replaced by canned mocks returning a hit for `memory_id`. The mocks
+/// override the real retrievers wired by `build_fixture` so the test
+/// can assert the hybrid path's behavior with deterministic per-retriever
+/// outputs.
 fn build_fixture_with_hybrid_mocks(memory_id: u128) -> Fixture {
     let mut fix = build_fixture();
     let mid = MemoryId::from_raw(memory_id);
@@ -540,68 +546,10 @@ fn build_fixture_with_hybrid_mocks(memory_id: u128) -> Fixture {
 
     fix.ctx = fix
         .ctx
-        .with_semantic_retriever(Some(Arc::new(semantic) as Arc<dyn SemanticRetriever>))
-        .with_lexical_retriever(Some(Arc::new(lexical) as Arc<dyn LexicalRetriever>))
-        .with_graph_retriever(Some(Arc::new(graph) as Arc<dyn GraphRetriever>));
+        .with_semantic_retriever(Arc::new(semantic) as Arc<dyn SemanticRetriever>)
+        .with_lexical_retriever(Arc::new(lexical) as Arc<dyn LexicalRetriever>)
+        .with_graph_retriever(Arc::new(graph) as Arc<dyn GraphRetriever>);
     fix
-}
-
-#[test]
-fn handle_recall_routes_to_substrate_when_txn_present() {
-    // A txn forces the substrate path: hybrid retrievers can't see
-    // the per-txn buffer, so RYW would silently miss pending
-    // writes. Returned hits must carry the substrate signature —
-    // no `contributing_retrievers`, `fused_score` left at zero.
-    run_in_glommio(|| async {
-        let fix0 = build_fixture();
-        let mid = encode(&fix0, [0x90; 16], "alpha", MemoryKindWire::Episodic).await;
-        drop(fix0);
-
-        let fix = build_fixture_with_hybrid_mocks(mid);
-        // Re-encode against the new fixture so the row actually
-        // exists in this fixture's metadata DB. Same request_id
-        // yields a deterministic memory id under the fixture's
-        // mock embedder, but we don't rely on that — instead, re-
-        // encode and use the returned id, which is what the txn
-        // gate validates against.
-        let mid = encode(&fix, [0x90; 16], "alpha", MemoryKindWire::Episodic).await;
-
-        let txn_id = *uuid::Uuid::now_v7().as_bytes();
-        brain_ops::txn::handle_txn_begin(
-            TxnBeginRequest {
-                txn_id,
-                timeout_seconds: 30,
-            },
-            [0u8; 16],
-            &fix.ctx,
-        )
-        .await
-        .expect("txn_begin");
-
-        let mut req = recall_req("alpha", 5);
-        req.txn_id = Some(txn_id);
-        let frame = brain_ops::recall::handle_recall(req, &fix.ctx)
-            .await
-            .expect("substrate recall inside txn");
-
-        assert!(frame.is_final, "txn recall must mark response final");
-        assert!(
-            !frame.results.is_empty(),
-            "expected at least one hit; encoded id was {mid}",
-        );
-        for r in &frame.results {
-            assert!(
-                r.contributing_retrievers.is_empty(),
-                "substrate path leaked contributing_retrievers: {:?}",
-                r.contributing_retrievers,
-            );
-            assert_eq!(
-                r.fused_score, 0.0,
-                "substrate path leaked fused_score: {}",
-                r.fused_score,
-            );
-        }
-    })
 }
 
 #[test]

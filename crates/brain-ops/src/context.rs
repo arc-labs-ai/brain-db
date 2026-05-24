@@ -84,21 +84,20 @@ pub struct OpsContext {
     /// supersede / tombstone / retract handlers enqueue
     /// Upsert / Delete events post-commit.
     pub statement_text_dispatcher: Option<Arc<StatementTextDispatcher>>,
-    /// Per-shard lexical retriever (phase 22.5). Reads the
-    /// tantivy indexes maintained by the 22.3 + 22.4 workers.
-    /// Phase 23's hybrid query consumes this slot; substrate-
-    /// only deployments leave it `None`.
-    pub lexical_retriever: Option<Arc<dyn LexicalRetriever>>,
-    /// Per-shard semantic retriever (phase 23.1). Reads the
-    /// substrate memory HNSW + (when wired) the statement
-    /// HNSW. Phase 23's hybrid query consumes this slot
-    /// alongside [`Self::lexical_retriever`].
-    pub semantic_retriever: Option<Arc<dyn SemanticRetriever>>,
-    /// Per-shard graph retriever (phase 23.2). Reads the
-    /// entity / relation / statement redb tables. Phase 23's
-    /// hybrid query consumes this slot alongside the lexical
-    /// + semantic retrievers.
-    pub graph_retriever: Option<Arc<dyn GraphRetriever>>,
+    /// Per-shard lexical retriever. Reads the tantivy indexes
+    /// maintained by the text-indexer workers. Mandatory: tantivy
+    /// is a core shard capability, and a shard that can't serve
+    /// lexical queries refuses to spawn (see `ShardError::TantivyInitFailed`).
+    pub lexical_retriever: Arc<dyn LexicalRetriever>,
+    /// Per-shard semantic retriever. Reads the memory HNSW + the
+    /// statement HNSW. Mandatory once the shard is spawned — the
+    /// HNSW is constructed at spawn time and can't be missing.
+    pub semantic_retriever: Arc<dyn SemanticRetriever>,
+    /// Per-shard graph retriever. Reads the entity / relation /
+    /// statement redb tables. Mandatory: the metadata DB is open
+    /// the moment the shard spawns; the retriever just dispatches
+    /// into it.
+    pub graph_retriever: Arc<dyn GraphRetriever>,
     /// Per-shard cross-encoder (W2.2 rerank pass). Shared across
     /// shards because the model is read-only and CPU-heavy; the
     /// hybrid executor's rerank stage runs only when this slot is
@@ -129,8 +128,17 @@ pub struct OpsContext {
 }
 
 impl OpsContext {
+    /// Build an `OpsContext` with all three retrievers wired up. Every
+    /// production shard provides real impls (tantivy + brain-index
+    /// HNSW + brain-index graph); tests build mock impls via
+    /// [`crate::test_support`].
     #[must_use]
-    pub fn new(executor: ExecutorContext) -> Self {
+    pub fn new(
+        executor: ExecutorContext,
+        lexical_retriever: Arc<dyn LexicalRetriever>,
+        semantic_retriever: Arc<dyn SemanticRetriever>,
+        graph_retriever: Arc<dyn GraphRetriever>,
+    ) -> Self {
         let events = Arc::new(EventBus::default());
         let subscriptions = Arc::new(SubscriptionRegistry::new(events.clone()));
         Self {
@@ -147,9 +155,9 @@ impl OpsContext {
             tantivy: None,
             memory_text_dispatcher: None,
             statement_text_dispatcher: None,
-            lexical_retriever: None,
-            semantic_retriever: None,
-            graph_retriever: None,
+            lexical_retriever,
+            semantic_retriever,
+            graph_retriever,
             cross_encoder: None,
             schema_gate: SchemaGate::default(),
             wal_sink: None,
@@ -259,29 +267,25 @@ impl OpsContext {
         self
     }
 
-    /// Install (or clear) the lexical retriever (phase 22.5).
-    /// Phase 23's hybrid query path reads through this slot.
+    /// Replace the lexical retriever. Constructed mandatorily by
+    /// the server's shard spawn from the per-shard `TantivyShard`;
+    /// tests inject mocks via [`crate::test_support`].
     #[must_use]
-    pub fn with_lexical_retriever(mut self, retriever: Option<Arc<dyn LexicalRetriever>>) -> Self {
+    pub fn with_lexical_retriever(mut self, retriever: Arc<dyn LexicalRetriever>) -> Self {
         self.lexical_retriever = retriever;
         self
     }
 
-    /// Install (or clear) the semantic retriever (phase 23.1).
-    /// Phase 23's hybrid query path reads through this slot.
+    /// Replace the semantic retriever.
     #[must_use]
-    pub fn with_semantic_retriever(
-        mut self,
-        retriever: Option<Arc<dyn SemanticRetriever>>,
-    ) -> Self {
+    pub fn with_semantic_retriever(mut self, retriever: Arc<dyn SemanticRetriever>) -> Self {
         self.semantic_retriever = retriever;
         self
     }
 
-    /// Install (or clear) the graph retriever (phase 23.2).
-    /// Phase 23's hybrid query path reads through this slot.
+    /// Replace the graph retriever.
     #[must_use]
-    pub fn with_graph_retriever(mut self, retriever: Option<Arc<dyn GraphRetriever>>) -> Self {
+    pub fn with_graph_retriever(mut self, retriever: Arc<dyn GraphRetriever>) -> Self {
         self.graph_retriever = retriever;
         self
     }

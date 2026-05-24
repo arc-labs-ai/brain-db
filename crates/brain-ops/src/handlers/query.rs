@@ -350,6 +350,10 @@ fn build_executor_context(ctx: &OpsContext) -> Result<HybridExecutorContext, OpE
     })
 }
 
+// (The above mirrors the analogous block in `handle_recall`; the
+// retrievers are now mandatory Arcs so each `clone()` is just an
+// Arc bump.)
+
 // ---------------------------------------------------------------------------
 // Result projection.
 // ---------------------------------------------------------------------------
@@ -468,9 +472,6 @@ fn map_plan_error(e: PlanError) -> OpError {
 
 fn map_executor_error(e: ExecutionError) -> OpError {
     match e {
-        ExecutionError::MissingRetriever(r) => {
-            OpError::Internal(format!("retriever not configured for this shard: {r:?}",))
-        }
         ExecutionError::Filter(inner) => OpError::Internal(format!("filter chain: {inner}")),
     }
 }

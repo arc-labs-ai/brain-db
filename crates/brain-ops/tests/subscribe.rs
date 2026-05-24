@@ -93,7 +93,7 @@ fn build_fixture_with(bus: EventBus) -> Fixture {
         metadata,
         writer as Arc<dyn WriterHandle>,
     );
-    let ctx = OpsContext::new(executor)
+    let ctx = brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor)
         .with_event_bus(bus.clone())
         .with_subscribe_poll_window(Duration::from_millis(200));
     Fixture {
