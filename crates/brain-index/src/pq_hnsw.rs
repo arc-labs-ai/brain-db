@@ -21,9 +21,7 @@ use thiserror::Error;
 
 use crate::idmap::{IdMap, IdMapError};
 use crate::params::{IndexParams, IndexParamsError, DEFAULT_CAPACITY_HINT, MAX_LAYER, VECTOR_DIM};
-use crate::pq::{
-    encode, install_search_lut, Codebook, CodebookError, EncodeError, Lut, PqDist,
-};
+use crate::pq::{encode, install_search_lut, Codebook, CodebookError, EncodeError, Lut, PqDist};
 use crate::tombstones::TombstoneBitmap;
 
 /// Default over-fetch multiplier for the per-search bailout loop.
@@ -51,10 +49,7 @@ pub enum PqHnswError {
     #[error("invalid params: {0}")]
     InvalidParams(#[from] IndexParamsError),
 
-    #[error("params.pq is None — PqHnswIndex requires PQ-enabled params")]
-    PqNotConfigured,
-
-    #[error("codebook does not match params: {0}")]
+    #[error("codebook invalid: {0}")]
     CodebookMismatch(#[from] CodebookError),
 
     #[error("duplicate memory_id: {memory_id_bytes:?}")]
@@ -82,17 +77,11 @@ impl From<IdMapError> for PqHnswError {
 }
 
 impl<const M: usize> PqHnswIndex<M> {
-    /// Build a fresh empty index. `params.pq` must be `Some` and the
-    /// codebook must agree on `M` and centroid count.
-    ///
-    /// The supplied codebook is moved into an `Arc` and shared with the
-    /// inner [`PqDist`] — cloning the index handle would re-share the
-    /// same codebook by reference.
+    /// Build a fresh empty index over PQ codes. The codebook is moved
+    /// into an `Arc` and shared with the inner [`PqDist`] — cloning
+    /// the index handle would re-share the same codebook by reference.
     pub fn new(params: IndexParams, codebook: Codebook<M>) -> Result<Self, PqHnswError> {
         params.validate()?;
-        let pq_params = params.pq.ok_or(PqHnswError::PqNotConfigured)?;
-        codebook.matches_params(&pq_params)?;
-
         let dist = PqDist::<M>::new(&codebook);
         let inner = Hnsw::<u8, PqDist<M>>::new(
             params.m,
@@ -299,7 +288,7 @@ impl<const M: usize> PqHnswIndex<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pq::{PqParams, PQ_CENTROIDS_PER_SUBSPACE};
+    use crate::pq::PQ_CENTROIDS_PER_SUBSPACE;
 
     /// Same hand-built codebook fixture used by the distance tests:
     /// subspace `s` centroid `k` is `[k, 0, 0, ...]`. Distances are
@@ -317,7 +306,7 @@ mod tests {
     }
 
     fn pq_params_default() -> IndexParams {
-        IndexParams::default_v1().with_pq(PqParams::default_v1())
+        IndexParams::default_v1()
     }
 
     fn mid(slot: u8) -> MemoryId {
@@ -334,24 +323,6 @@ mod tests {
             v[s * sub_dim] = t as f32;
         }
         v
-    }
-
-    #[test]
-    fn new_with_pure_hnsw_params_rejected() {
-        let result = PqHnswIndex::<8>::new(IndexParams::default_v1(), arithmetic_codebook::<8>());
-        assert!(matches!(result, Err(PqHnswError::PqNotConfigured)));
-    }
-
-    #[test]
-    fn new_with_codebook_params_mismatch_rejected() {
-        // The const generic enforces struct-level M agreement at
-        // compile time, so the only runtime drift left is
-        // `params.pq.m != M`. Spike the params and watch
-        // `matches_params` reject.
-        let mut params = pq_params_default();
-        params.pq.as_mut().unwrap().m = 16;
-        let result = PqHnswIndex::<8>::new(params, arithmetic_codebook::<8>());
-        assert!(matches!(result, Err(PqHnswError::CodebookMismatch(_))));
     }
 
     #[test]

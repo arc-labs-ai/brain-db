@@ -27,6 +27,11 @@ use crate::params::{IndexParams, VECTOR_DIM};
 use crate::pq::rerank;
 use crate::pq_hnsw::{PqHnswError, PqHnswIndex};
 
+/// Search-time over-fetch factor: pull `K * RERANK_FACTOR` ADC
+/// candidates from the HNSW, re-rank against full-precision arena
+/// vectors, keep the top `K`. Spec §09.07 §3.1 default.
+const RERANK_FACTOR: usize = 4;
+
 /// An immutable PQ-HNSW snapshot for a single published epoch.
 struct MainPqEpoch<const M: usize> {
     index: PqHnswIndex<M>,
@@ -144,15 +149,9 @@ impl<const M: usize> SharedPqHnsw<M> {
         // Pending tombstone overlay wins everywhere.
         let pending_tombstones: HashSet<MemoryId> = self.pending.read().tombstoned.clone();
 
-        // 1. Main: PQ-ADC top-K' where K' = k * rerank_factor.
+        // 1. Main: PQ-ADC top-K' where K' = k * RERANK_FACTOR.
         let epoch = self.main.load();
-        let rerank_factor = epoch
-            .index
-            .params()
-            .pq
-            .map(|p| usize::from(p.rerank_factor))
-            .unwrap_or(4);
-        let inflated_k = k.saturating_mul(rerank_factor.max(1));
+        let inflated_k = k.saturating_mul(RERANK_FACTOR);
         let main_candidates = epoch.index.search(query, inflated_k, ef, |id| {
             !pending_tombstones.contains(&id) && filter(id)
         });
@@ -416,7 +415,7 @@ fn merge_dedupe_descending(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pq::{Codebook, PqParams, PQ_CENTROIDS_PER_SUBSPACE};
+    use crate::pq::{Codebook, PQ_CENTROIDS_PER_SUBSPACE};
 
     fn mid(slot: u8) -> MemoryId {
         MemoryId::pack(1, slot as u64, 1)
@@ -442,7 +441,7 @@ mod tests {
     }
 
     fn pq_params_default() -> IndexParams {
-        IndexParams::default_v1().with_pq(PqParams::default_v1())
+        IndexParams::default_v1()
     }
 
     fn build_shared() -> (SharedPqHnsw<8>, PqWriter<8>) {

@@ -118,7 +118,6 @@ mod tests {
             ef_construction: 100,
             ef_search: 50,
             ef_search_max: 250,
-            pq: None,
         };
         let (idx, _) = rebuild_impl::<4, _>(params, std::iter::empty()).unwrap();
         assert_eq!(idx.params(), params);
