@@ -15,6 +15,7 @@
 //! Later sub-tasks add the encoder (25.2), distance kernels (25.3),
 //! and the `PqHnswIndex` wrapper (25.4).
 
+pub mod bootstrap;
 pub mod codebook;
 pub mod distance;
 pub mod encode;
@@ -22,6 +23,7 @@ pub mod kmeans;
 pub mod params;
 pub mod rerank;
 
+pub use bootstrap::{bootstrap_codebook, BOOTSTRAP_M};
 pub use codebook::{Codebook, CodebookError};
 pub use distance::{adc, install_search_lut, sdc, Lut, LutGuard, PqDist, SdcTable};
 pub use encode::{encode, encode_batch, EncodeError};
