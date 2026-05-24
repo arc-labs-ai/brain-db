@@ -235,7 +235,7 @@ pub async fn dispatch(
         RequestBody::EncodeVectorDirect(r) => {
             crate::encode_vector_direct::handle_encode_vector_direct(r, ctx)
                 .await
-                .map(ResponseBody::EncodeVectorDirect)
+                .map(|b| single(ResponseBody::EncodeVectorDirect(b)))
         }
 
         RequestBody::Recall(r) => crate::recall::handle_recall(r, ctx)
