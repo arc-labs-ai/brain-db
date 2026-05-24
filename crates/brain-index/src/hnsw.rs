@@ -588,11 +588,14 @@ impl<const D: usize> HnswIndex<D> {
         );
 
         // 7. Build the IndexParams back from the header.
+        // PQ is not persisted in the legacy HNSW snapshot — the PQ
+        // flavour rides on its own snapshot layout (§09.07 §12).
         let params = IndexParams {
             m: header.m as usize,
             ef_construction: header.ef_construction as usize,
             ef_search: header.ef_search as usize,
             ef_search_max: header.ef_search_max as usize,
+            pq: None,
         };
 
         let idx = Self {

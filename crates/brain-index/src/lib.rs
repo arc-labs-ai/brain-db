@@ -33,6 +33,7 @@ pub mod hnsw;
 pub mod idmap;
 pub mod params;
 pub mod persistence;
+pub mod pq;
 pub mod rebuild;
 pub mod semantic_retriever;
 pub mod shared;
@@ -53,6 +54,11 @@ pub use graph_retriever::{
 pub use hnsw::{HnswError, HnswIndex};
 pub use idmap::{IdMap, IdMapError};
 pub use params::{IndexParams, IndexParamsError, MAX_LAYER, VECTOR_DIM};
+pub use pq::{
+    train as pq_train, Codebook, CodebookError, KmeansError, PqParams, PqParamsError,
+    MAX_TRAINING_SAMPLE as PQ_MAX_TRAINING_SAMPLE, MIN_TRAINING_SAMPLE as PQ_MIN_TRAINING_SAMPLE,
+    PQ_BITS_V1, PQ_CENTROIDS_PER_SUBSPACE,
+};
 pub use rebuild::RebuildReport;
 pub use semantic_retriever::{
     project_memory_hits, project_statement_hits,

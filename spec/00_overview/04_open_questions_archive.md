@@ -2919,6 +2919,8 @@ Pure HNSW (per §09) holds every full-precision 384-dim vector in RAM. At billio
 
 **Path:** post-v1. New executor mode in §09 indexing; HNSW remains default for ≤10M vectors.
 
+**Partially resolved (v1.x):** HNSW + PQ (compressed graph payload, full-precision arena for re-rank) shipped per [§09.07](../09_indexing/07_hnsw_pq.md). Pure IVF (no HNSW graph) remains deferred — HNSW+PQ resolves the immediate memory pressure at Brain's mid-scale target.
+
 ---
 
 ### Q8 — Cross-encoder rerank model upgrade

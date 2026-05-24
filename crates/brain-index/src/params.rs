@@ -1,9 +1,13 @@
 //! HNSW parameters with Brain's spec defaults.
 //!
 //! See `spec/09_indexing/02_parameters.md` (M=16, ef_construction=200,
-//! ef_search=64, ef_search_max=500).
+//! ef_search=64, ef_search_max=500). The optional [`IndexParams::pq`]
+//! field opts the corpus into PQ compression per
+//! `spec/09_indexing/07_hnsw_pq.md`; `None` keeps pure HNSW.
 
 use thiserror::Error;
+
+use crate::pq::{PqParams, PqParamsError};
 
 /// The vector dimension used throughout v1: BGE-small-en-v1.5 produces
 /// 384-dim L2-normalised vectors. Spec `§04/03 §1`.
@@ -39,6 +43,12 @@ pub struct IndexParams {
     pub ef_search: usize,
     /// Cap on per-query `ef_search` overrides. Spec `§02 §8` config key.
     pub ef_search_max: usize,
+    /// Opt-in PQ compression. `None` → pure HNSW (the v1 default for
+    /// every existing deployment). `Some(_)` activates the PQ flavour
+    /// per `spec/09_indexing/07_hnsw_pq.md`; the corpus rebuilds the
+    /// graph against `[u8; M]` codes and keeps the full-precision arena
+    /// for re-rank.
+    pub pq: Option<PqParams>,
 }
 
 impl IndexParams {
@@ -50,6 +60,21 @@ impl IndexParams {
             ef_construction: 200,
             ef_search: 64,
             ef_search_max: 500,
+            pq: None,
+        }
+    }
+
+    /// Same defaults, but with PQ enabled at the v1 profile
+    /// ([`PqParams::default_v1`]). Convenience for tests + the
+    /// activation handler.
+    #[must_use]
+    pub const fn default_v1_with_pq() -> Self {
+        Self {
+            m: 16,
+            ef_construction: 200,
+            ef_search: 64,
+            ef_search_max: 500,
+            pq: Some(PqParams::default_v1()),
         }
     }
 
@@ -73,6 +98,9 @@ impl IndexParams {
                 ef_search: self.ef_search,
                 ef_search_max: self.ef_search_max,
             });
+        }
+        if let Some(ref pq) = self.pq {
+            pq.validate().map_err(IndexParamsError::PqInvalid)?;
         }
         Ok(())
     }
@@ -101,6 +129,9 @@ pub enum IndexParamsError {
         ef_search: usize,
         ef_search_max: usize,
     },
+
+    #[error("pq parameters invalid: {0}")]
+    PqInvalid(PqParamsError),
 }
 
 #[cfg(test)]
@@ -163,6 +194,7 @@ mod tests {
             ef_construction: 200,
             ef_search: 100,
             ef_search_max: 50, // < ef_search
+            pq: None,
         };
         assert!(matches!(
             p.validate(),

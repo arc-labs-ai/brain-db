@@ -64,7 +64,7 @@ Brain selected HNSW over alternatives:
 - **Annoy (random forest of trees).** Simpler. Worse recall at high K.
 - **DiskANN.** Designed for SSDs holding indexes too large for RAM. Adds I/O complexity Brain does not need at this scale.
 - **ScaNN.** Google's competitive ANN. Excellent quality. Less mature in Rust ecosystem.
-- **PQ + IVF hybrids.** Fancy compression + clustering. Useful at extreme scale; overkill for Brain.
+- **PQ + IVF hybrids.** Compression + clustering. Useful at extreme scale; pure IVF (no graph) remains overkill for Brain's mid-scale target. HNSW with PQ-compressed graph payload **is** in scope as an opt-in extension — see [`07_hnsw_pq.md`](07_hnsw_pq.md).
 
 HNSW wins because:
 
