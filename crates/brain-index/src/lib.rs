@@ -35,6 +35,7 @@ pub mod params;
 pub mod persistence;
 pub mod pq;
 pub mod pq_hnsw;
+pub mod pq_shared;
 pub mod rebuild;
 pub mod semantic_retriever;
 pub mod shared;
@@ -60,6 +61,7 @@ pub use pq::{
     SdcTable, PQ_BITS_V1, PQ_CENTROIDS_PER_SUBSPACE,
 };
 pub use pq_hnsw::{PqHnswError, PqHnswIndex};
+pub use pq_shared::{PendingPqEntry, PqFlushReport, PqWriter, SharedPqHnsw};
 pub use rebuild::RebuildReport;
 pub use semantic_retriever::{
     project_memory_hits, project_statement_hits,

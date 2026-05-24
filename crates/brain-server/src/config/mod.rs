@@ -82,6 +82,113 @@ pub struct HnswConfig {
     pub m: usize,
     pub ef_construction: usize,
     pub ef_search: usize,
+    /// Optional PQ compression. Absent (or `enabled=false`) keeps the
+    /// corpus on pure HNSW. Present + enabled activates the PQ flavour
+    /// per `spec/09_indexing/07_hnsw_pq.md`; the corpus rebuilds the
+    /// graph against PQ codes and keeps the full-precision arena for
+    /// re-rank.
+    #[serde(default)]
+    pub pq: Option<PqConfig>,
+}
+
+/// Per-corpus PQ knobs. Mirrors [`brain_index::PqParams`]. Absent in
+/// the TOML means pure HNSW; present-but-disabled also means pure
+/// HNSW. The split lets operators stage the config (write the keys,
+/// review the values) before flipping the activation bit.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PqConfig {
+    /// `false` means the rest of the fields are ignored and the corpus
+    /// stays on pure HNSW. Flip to `true` to activate at next restart;
+    /// runtime activation goes through `ADMIN_INDEX_CONFIGURE`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Subquantiser count. Must divide `VECTOR_DIM` evenly. Default 8
+    /// matches the v1 profile (`spec/09_indexing/07_hnsw_pq.md` §3.1).
+    #[serde(default = "default_pq_m")]
+    pub m: usize,
+    /// Bits per code. v1 accepts only 8.
+    #[serde(default = "default_pq_bits")]
+    pub bits: u8,
+    /// Training sample size. Bounded to the spec range.
+    #[serde(default = "default_pq_training_sample")]
+    pub training_sample: usize,
+    /// k-means Lloyd iteration cap.
+    #[serde(default = "default_pq_kmeans_iters")]
+    pub kmeans_iters: u8,
+    /// Search-time over-fetch factor for the re-rank pass.
+    #[serde(default = "default_pq_rerank_factor")]
+    pub rerank_factor: u8,
+}
+
+fn default_pq_m() -> usize {
+    8
+}
+fn default_pq_bits() -> u8 {
+    8
+}
+fn default_pq_training_sample() -> usize {
+    65_536
+}
+fn default_pq_kmeans_iters() -> u8 {
+    25
+}
+fn default_pq_rerank_factor() -> u8 {
+    4
+}
+
+impl PqConfig {
+    /// Validate against the spec ranges. Standalone — does not depend
+    /// on the brain-index crate (which is Linux-only for this binary),
+    /// so config parsing works the same way on every platform. The
+    /// ranges mirror `spec/09_indexing/07_hnsw_pq.md` §3 and must stay
+    /// in lockstep with [`brain_index::PqParams::validate`].
+    fn validate(&self) -> Result<(), ConfigError> {
+        // `enabled = false` short-circuits — operators can stage the
+        // numbers without forcing them into compliance until they flip
+        // the bit.
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.m == 0 {
+            return Err(ConfigError::Invariant("hnsw.pq.m must be >= 1".into()));
+        }
+        // VECTOR_DIM is 384 in v1 (BGE-small). Hardcoded here to keep
+        // the config crate cross-platform; the canonical constant
+        // lives in brain-index.
+        const VECTOR_DIM: usize = 384;
+        if VECTOR_DIM % self.m != 0 {
+            return Err(ConfigError::Invariant(format!(
+                "hnsw.pq.m={} does not divide VECTOR_DIM={VECTOR_DIM} evenly",
+                self.m,
+            )));
+        }
+        if self.bits != 8 {
+            return Err(ConfigError::Invariant(format!(
+                "hnsw.pq.bits={} is not supported (v1 accepts only bits=8)",
+                self.bits,
+            )));
+        }
+        if !(4_096..=1_048_576).contains(&self.training_sample) {
+            return Err(ConfigError::Invariant(format!(
+                "hnsw.pq.training_sample={} is outside the supported range 4096..=1048576",
+                self.training_sample,
+            )));
+        }
+        if !(5..=100).contains(&self.kmeans_iters) {
+            return Err(ConfigError::Invariant(format!(
+                "hnsw.pq.kmeans_iters={} is outside the supported range 5..=100",
+                self.kmeans_iters,
+            )));
+        }
+        if !(1..=16).contains(&self.rerank_factor) {
+            return Err(ConfigError::Invariant(format!(
+                "hnsw.pq.rerank_factor={} is outside the supported range 1..=16",
+                self.rerank_factor,
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -884,6 +991,7 @@ impl Config {
                 m: 16,
                 ef_construction: 64,
                 ef_search: 64,
+                pq: None,
             },
             embedder: EmbedderConfig {
                 model: "test".into(),
@@ -926,6 +1034,9 @@ impl Config {
         if self.hnsw.ef_search == 0 {
             return Err(ConfigError::Invariant("hnsw.ef_search must be >= 1".into()));
         }
+        if let Some(ref pq) = self.hnsw.pq {
+            pq.validate()?;
+        }
         if self.shard.arena_capacity_bytes == 0 {
             return Err(ConfigError::Invariant(
                 "shard.arena_capacity_bytes must be > 0".into(),
@@ -960,6 +1071,66 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hnsw_pq_absent_in_toml_keeps_pure_hnsw() {
+        let toml_str = "m = 16\nef_construction = 200\nef_search = 64\n";
+        let cfg: HnswConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.pq.is_none());
+    }
+
+    #[test]
+    fn hnsw_pq_present_but_disabled_round_trips() {
+        let toml_str = "m = 16\nef_construction = 200\nef_search = 64\n[pq]\nenabled = false\n";
+        let cfg: HnswConfig = toml::from_str(toml_str).unwrap();
+        let pq = cfg.pq.as_ref().unwrap();
+        assert!(!pq.enabled);
+        // Defaults filled in.
+        assert_eq!(pq.m, 8);
+        assert_eq!(pq.bits, 8);
+        assert_eq!(pq.training_sample, 65_536);
+        assert_eq!(pq.kmeans_iters, 25);
+        assert_eq!(pq.rerank_factor, 4);
+        // Disabled bypasses the range checks.
+        pq.validate().unwrap();
+    }
+
+    #[test]
+    fn hnsw_pq_enabled_with_defaults_validates() {
+        let toml_str =
+            "m = 16\nef_construction = 200\nef_search = 64\n[pq]\nenabled = true\n";
+        let cfg: HnswConfig = toml::from_str(toml_str).unwrap();
+        let pq = cfg.pq.as_ref().unwrap();
+        assert!(pq.enabled);
+        pq.validate().unwrap();
+    }
+
+    #[test]
+    fn hnsw_pq_rejects_non_dividing_m() {
+        let toml_str =
+            "m = 16\nef_construction = 200\nef_search = 64\n[pq]\nenabled = true\nm = 7\n";
+        let cfg: HnswConfig = toml::from_str(toml_str).unwrap();
+        let err = cfg.pq.as_ref().unwrap().validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Invariant(s) if s.contains("does not divide")));
+    }
+
+    #[test]
+    fn hnsw_pq_rejects_unsupported_bits() {
+        let toml_str =
+            "m = 16\nef_construction = 200\nef_search = 64\n[pq]\nenabled = true\nbits = 4\n";
+        let cfg: HnswConfig = toml::from_str(toml_str).unwrap();
+        let err = cfg.pq.as_ref().unwrap().validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Invariant(s) if s.contains("bits=4")));
+    }
+
+    #[test]
+    fn hnsw_pq_rejects_too_small_sample() {
+        let toml_str =
+            "m = 16\nef_construction = 200\nef_search = 64\n[pq]\nenabled = true\ntraining_sample = 100\n";
+        let cfg: HnswConfig = toml::from_str(toml_str).unwrap();
+        let err = cfg.pq.as_ref().unwrap().validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Invariant(s) if s.contains("training_sample=100")));
+    }
 
     #[test]
     fn human_bytes_binary_units() {
