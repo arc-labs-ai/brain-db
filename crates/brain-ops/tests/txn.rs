@@ -1217,7 +1217,7 @@ async fn buffer_encode(
         &fix.ctx,
     )
     .await
-    .map(|r| match r {
+    .map(|r| match single_body(r) {
         ResponseBody::Encode(e) => e,
         other => panic!("expected Encode, got {other:?}"),
     })

@@ -183,11 +183,11 @@ pub enum ReasonStatus {
 }
 
 /// One inference step emitted as REASON streams. In v1 the executor
-/// always produces exactly one step — the aggregate of all supporting
-/// + contradicting evidence — so the stream is length-1. The shape
+/// always produces exactly one step (the aggregate of all supporting
+/// and contradicting evidence), so the stream is length-1. The shape
 /// is kept multi-frame-ready: future iterations that walk supporting
-/// and contradicting passes independently can emit one step per
-/// pass without changing the framing.
+/// and contradicting passes independently can emit one step per pass
+/// without changing the framing.
 #[derive(Debug, Clone)]
 pub struct InferenceStep {
     /// Position in the emission order; first emitted step is 0.

@@ -19,8 +19,8 @@ use brain_index::{
     SharedHnsw,
 };
 use brain_metadata::MetadataDb;
-use brain_ops::test_support::run_in_glommio;
-use brain_ops::{dispatch, ErrorCode, OpError, OpsContext, RealWriterHandle};
+use brain_ops::test_support::{run_in_glommio, single_body};
+use brain_ops::{dispatch, DispatchOutcome, ErrorCode, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
     EncodeRequest, MemoryKindWire, RecallRequest, RequestBody, TxnBeginRequest,
@@ -115,21 +115,21 @@ fn recall_req(cue: &str, top_k: u32) -> RecallRequest {
 
 async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str, kind: MemoryKindWire) -> u128 {
     let req = encode_req(request_id, text, kind);
-    match dispatch(
+    let outcome = dispatch(
         RequestBody::Encode(req),
         brain_ops::RequestCaller::anonymous(),
         &fix.ctx,
     )
     .await
-    .unwrap()
-    {
+    .unwrap();
+    match single_body(outcome) {
         ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
         other => panic!("expected Encode response, got {other:?}"),
     }
 }
 
-fn unwrap_recall_resp(body: ResponseBody) -> RecallResponseFrame {
-    match body {
+fn unwrap_recall_resp(outcome: DispatchOutcome) -> RecallResponseFrame {
+    match single_body(outcome) {
         ResponseBody::Recall(r) => r,
         other => panic!("expected ResponseBody::Recall, got {other:?}"),
     }

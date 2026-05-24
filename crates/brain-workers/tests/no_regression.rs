@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
+use brain_ops::test_support::single_body;
 use brain_ops::{dispatch, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{EncodeRequest, MemoryKindWire, RecallRequest, RequestBody};
@@ -114,14 +115,14 @@ async fn recall_one(ctx: &OpsContext, cue: &str) -> usize {
         txn_id: None,
         rerank: false,
     };
-    match dispatch(
+    let outcome = dispatch(
         RequestBody::Recall(req),
         brain_ops::RequestCaller::anonymous(),
         ctx,
     )
     .await
-    .unwrap()
-    {
+    .unwrap();
+    match single_body(outcome) {
         ResponseBody::Recall(r) => r.results.len(),
         _ => 0,
     }

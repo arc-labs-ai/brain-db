@@ -322,6 +322,7 @@ fn worker_registers_with_correct_kind_and_default_cadence() {
 fn recall_fills_buffer_then_boost_worker_applies() {
     glommio_run(|| async {
         use brain_ops::dispatch;
+        use brain_ops::test_support::single_body;
         use brain_protocol::envelope::request::{EncodeRequest, MemoryKindWire, RecallRequest, RequestBody};
         use brain_protocol::envelope::response::ResponseBody;
 
@@ -406,14 +407,14 @@ fn recall_fills_buffer_then_boost_worker_applies() {
             txn_id: None,
             rerank: false,
         };
-        let resp = dispatch(
+        let outcome = dispatch(
             RequestBody::Recall(recall),
             brain_ops::RequestCaller::anonymous(),
             &ctx,
         )
         .await
         .unwrap();
-        let n_results = match resp {
+        let n_results = match single_body(outcome) {
             ResponseBody::Recall(r) => r.results.len(),
             _ => unreachable!(),
         };

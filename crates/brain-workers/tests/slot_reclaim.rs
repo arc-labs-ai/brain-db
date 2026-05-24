@@ -13,6 +13,7 @@ use brain_metadata::tables::edge::{
 };
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
+use brain_ops::test_support::single_body;
 use brain_ops::{dispatch, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
@@ -342,14 +343,15 @@ fn forget_stamps_tombstoned_at_unix_nanos() {
             txn_id: None,
             deduplicate: false,
         };
-        let memory_id = match dispatch(
-            RequestBody::Encode(encode),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap()
-        {
+        let memory_id = match single_body(
+            dispatch(
+                RequestBody::Encode(encode),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        ) {
             ResponseBody::Encode(r) => r.memory_id,
             _ => unreachable!(),
         };
@@ -389,14 +391,15 @@ fn forget_replay_does_not_overwrite_stamp() {
             txn_id: None,
             deduplicate: false,
         };
-        let memory_id = match dispatch(
-            RequestBody::Encode(encode),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap()
-        {
+        let memory_id = match single_body(
+            dispatch(
+                RequestBody::Encode(encode),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        ) {
             ResponseBody::Encode(r) => r.memory_id,
             _ => unreachable!(),
         };

@@ -857,7 +857,6 @@ mod tests {
             IndexParams::default_v1(),
             vec![(mid(10), vec4(1.0, 0.0, 0.0, 0.0))],
         )
-        .map(|(idx, r)| (idx, r))
         .unwrap();
         reader.swap(replacement);
 

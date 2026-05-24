@@ -37,7 +37,7 @@ use brain_index::{
     SharedHnsw,
 };
 use brain_metadata::MetadataDb;
-use brain_ops::test_support::run_in_glommio;
+use brain_ops::test_support::{run_in_glommio, single_body};
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{EncodeRequest, MemoryKindWire, RecallRequest, TxnBeginRequest};
@@ -195,14 +195,14 @@ async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str) -> u128 {
         txn_id: None,
         deduplicate: false,
     };
-    let body = brain_ops::dispatch(
+    let outcome = brain_ops::dispatch(
         RequestBody::Encode(req),
         brain_ops::RequestCaller::anonymous(),
         &fix.ctx,
     )
     .await
     .expect("encode");
-    match body {
+    match single_body(outcome) {
         ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
         other => panic!("expected Encode response, got {other:?}"),
     }

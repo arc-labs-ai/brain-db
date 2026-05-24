@@ -17,8 +17,8 @@ use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::edge::edge_get;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::MetadataDb;
-use brain_ops::test_support::run_in_glommio;
-use brain_ops::{dispatch, ErrorCode, OpError, OpsContext, RealWriterHandle};
+use brain_ops::test_support::{run_in_glommio, single_body};
+use brain_ops::{dispatch, DispatchOutcome, ErrorCode, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
     EdgeKindWire, EdgeRequest, EncodeRequest, LinkRequest, MemoryKindWire, RequestBody,
@@ -122,28 +122,28 @@ fn unlink_req(
 
 async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str) -> u128 {
     let req = encode_req(request_id, text);
-    match dispatch(
+    let outcome = dispatch(
         RequestBody::Encode(req),
         brain_ops::RequestCaller::anonymous(),
         &fix.ctx,
     )
     .await
-    .unwrap()
-    {
+    .unwrap();
+    match single_body(outcome) {
         ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
         other => panic!("expected Encode response, got {other:?}"),
     }
 }
 
-fn unwrap_link(body: ResponseBody) -> LinkResponse {
-    match body {
+fn unwrap_link(outcome: DispatchOutcome) -> LinkResponse {
+    match single_body(outcome) {
         ResponseBody::Link(r) => r,
         other => panic!("expected ResponseBody::Link, got {other:?}"),
     }
 }
 
-fn unwrap_unlink(body: ResponseBody) -> UnlinkResponse {
-    match body {
+fn unwrap_unlink(outcome: DispatchOutcome) -> UnlinkResponse {
+    match single_body(outcome) {
         ResponseBody::Unlink(r) => r,
         other => panic!("expected ResponseBody::Unlink, got {other:?}"),
     }
@@ -507,14 +507,15 @@ fn encode_inline_edges_actually_land_in_redb() {
             kind: EdgeKindWire::References,
             weight: 0.5,
         }];
-        let linker = match dispatch(
-            RequestBody::Encode(req),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap()
-        {
+        let linker = match single_body(
+            dispatch(
+                RequestBody::Encode(req),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        ) {
             ResponseBody::Encode(r) => r.memory_id,
             other => panic!("got {other:?}"),
         };

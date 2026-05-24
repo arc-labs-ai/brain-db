@@ -167,6 +167,10 @@ impl RequestCaller {
 /// turning the outcome into wire frames; the connection layer is the
 /// only place that distinguishes them.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // Boxing Single would force a heap alloc on the dispatch hot
+// path for the common (non-streaming) case to save ~280 bytes of
+// stack. Not worth it — the outcome lives for the duration of one
+// request and is consumed by the framing layer immediately.
 pub enum DispatchOutcome {
     Single(ResponseBody),
     Stream(Vec<ResponseBody>),
@@ -581,7 +585,9 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
         | RequestBody::AdminRenameContext(_)
         | RequestBody::AdminMoveMemory(_)
         | RequestBody::AdminReclassify(_)
-        | RequestBody::AdminListTombstoned(_) => (perm_bits::ADMIN, "ADMIN"),
+        | RequestBody::AdminListTombstoned(_)
+        | RequestBody::AdminBackfill(_)
+        | RequestBody::AdminBackfillCancel(_) => (perm_bits::ADMIN, "ADMIN"),
 
         // Connection-lifecycle ops never reach the dispatcher in
         // production (the network layer handles them inline); the

@@ -13,8 +13,8 @@ use std::sync::Arc;
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
-use brain_ops::test_support::run_in_glommio;
-use brain_ops::{dispatch, OpError, OpsContext, RealWriterHandle};
+use brain_ops::test_support::{run_in_glommio, single_body};
+use brain_ops::{dispatch, DispatchOutcome, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
     EdgeKindWire, EdgeRequest, EncodeRequest, MemoryKindWire, RequestBody,
@@ -91,8 +91,8 @@ fn encode_req(request_id: [u8; 16], text: &str) -> EncodeRequest {
     }
 }
 
-fn unwrap_encode_resp(body: ResponseBody) -> EncodeResponse {
-    match body {
+fn unwrap_encode_resp(outcome: DispatchOutcome) -> EncodeResponse {
+    match single_body(outcome) {
         ResponseBody::Encode(r) => r,
         other => panic!("expected ResponseBody::Encode, got {other:?}"),
     }

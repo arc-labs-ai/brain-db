@@ -466,15 +466,22 @@ fn on_bye(frame: Frame) -> Action {
 // OpDispatch — runs in a per-op tokio sub-task
 // ---------------------------------------------------------------------------
 
-/// Run an `OpDispatch` and return the wire frame to send back. Runs in
-/// a spawned tokio task per request; the receiver loop hands off here
-/// and continues reading frames.
-pub(crate) async fn run_op_dispatch(op: OpDispatch, shards: Arc<Vec<ShardHandle>>) -> Frame {
+/// Run an `OpDispatch` and return the wire frames to send back. Runs
+/// in a spawned tokio task per request; the receiver loop hands off
+/// here and continues reading frames.
+///
+/// Single-frame ops return a one-element `Vec`. Streaming ops (PLAN /
+/// REASON) return one frame per emitted body, with `is_final = true`
+/// on the last frame only.
+pub(crate) async fn run_op_dispatch(
+    op: OpDispatch,
+    shards: Arc<Vec<ShardHandle>>,
+) -> Vec<Frame> {
     let stream_id = op.stream_id;
     let shard = match shards.get(op.target_shard as usize) {
         Some(s) => s,
         None => {
-            return error_frame(
+            return vec![error_frame(
                 stream_id,
                 ErrorCode::ShardUnavailable,
                 &format!(
@@ -482,21 +489,29 @@ pub(crate) async fn run_op_dispatch(op: OpDispatch, shards: Arc<Vec<ShardHandle>
                     op.target_shard,
                     shards.len()
                 ),
-            );
+            )];
         }
     };
     match shard.dispatch_op(op.req, op.scope.to_caller(op.session_id)).await {
-        Ok(body) => {
-            // 9.10 ships single-frame EOS responses. Multi-frame
-            // streaming for RECALL / PLAN / REASON is 9.11.
-            build_response_frame(stream_id, true, body)
-        }
-        Err(DispatchError::ShardDisconnected) => error_frame(
+        Ok(outcome) => match outcome {
+            brain_ops::DispatchOutcome::Single(body) => {
+                vec![build_response_frame(stream_id, true, body)]
+            }
+            brain_ops::DispatchOutcome::Stream(bodies) => {
+                let n = bodies.len();
+                bodies
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, body)| build_response_frame(stream_id, i + 1 == n, body))
+                    .collect()
+            }
+        },
+        Err(DispatchError::ShardDisconnected) => vec![error_frame(
             stream_id,
             ErrorCode::ShardUnavailable,
             "shard is no longer accepting requests",
-        ),
-        Err(DispatchError::Op(e)) => error_frame_from_op_error(stream_id, &e),
+        )],
+        Err(DispatchError::Op(e)) => vec![error_frame_from_op_error(stream_id, &e)],
     }
 }
 
@@ -566,6 +581,7 @@ fn error_frame_from_op_error(stream_id: u32, e: &OpError) -> Frame {
         brain_ops::error::ErrorCode::Conflict => (ErrorCode::IdempotencyConflict, None),
         brain_ops::error::ErrorCode::TxnExpired => (ErrorCode::TransactionTimeout, None),
         brain_ops::error::ErrorCode::TxnNotFound => (ErrorCode::TxnNotFound, None),
+        brain_ops::error::ErrorCode::TransactionTooLarge => (ErrorCode::TransactionTooLarge, None),
         brain_ops::error::ErrorCode::PredicateNotInSchema => {
             (ErrorCode::PredicateNotInSchema, None)
         }

@@ -97,7 +97,7 @@ fn build_statement_corpus() -> (TempDir, Arc<TantivyShard>) {
         let mut doc = TantivyDocument::default();
         let id = StatementId::new();
         doc.add_bytes(stmt_id, &id.to_bytes());
-        doc.add_text(subj, &format!("Subject {}", i));
+        doc.add_text(subj, format!("Subject {}", i));
         doc.add_text(pred_name, "lives_in");
         doc.add_u64(pred_id, 1);
         let object_text = if i % 100 == 0 {

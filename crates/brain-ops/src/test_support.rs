@@ -10,6 +10,23 @@
 #[cfg(target_os = "linux")]
 pub use linux::run_in_glommio;
 
+use brain_protocol::envelope::response::ResponseBody;
+
+use crate::DispatchOutcome;
+
+/// Unwrap a non-streaming `dispatch` outcome. The vast majority of
+/// integration-test call sites assert against a single response frame;
+/// expecting a `Stream` here is a test-author bug, not a runtime case
+/// to handle.
+pub fn single_body(outcome: DispatchOutcome) -> ResponseBody {
+    match outcome {
+        DispatchOutcome::Single(b) => b,
+        DispatchOutcome::Stream(_) => {
+            panic!("expected DispatchOutcome::Single, got Stream")
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     /// Run an async test body inside a fresh Glommio executor on a

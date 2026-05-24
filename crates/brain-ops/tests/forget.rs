@@ -12,8 +12,8 @@ use std::sync::Arc;
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
-use brain_ops::test_support::run_in_glommio;
-use brain_ops::{dispatch, ErrorCode, OpError, OpsContext, RealWriterHandle};
+use brain_ops::test_support::{run_in_glommio, single_body};
+use brain_ops::{dispatch, DispatchOutcome, ErrorCode, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
     EncodeRequest, ForgetMode, ForgetRequest, MemoryKindWire, RequestBody,
@@ -96,21 +96,21 @@ fn forget_req(memory_id: u128, request_id: [u8; 16]) -> ForgetRequest {
 
 async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str) -> u128 {
     let req = encode_req(request_id, text);
-    match dispatch(
+    let outcome = dispatch(
         RequestBody::Encode(req),
         brain_ops::RequestCaller::anonymous(),
         &fix.ctx,
     )
     .await
-    .unwrap()
-    {
+    .unwrap();
+    match single_body(outcome) {
         ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
         other => panic!("expected Encode response, got {other:?}"),
     }
 }
 
-fn unwrap_forget_resp(body: ResponseBody) -> ForgetResponse {
-    match body {
+fn unwrap_forget_resp(outcome: DispatchOutcome) -> ForgetResponse {
+    match single_body(outcome) {
         ResponseBody::Forget(r) => r,
         other => panic!("expected ResponseBody::Forget, got {other:?}"),
     }

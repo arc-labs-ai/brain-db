@@ -217,7 +217,7 @@ fn server_cancel_handshake_simulates_client_server_hop() {
         },
     };
     let on_client_cancel =
-        match frame_round_trip_response(ResponseBody::AdminBackfillCancel(cancel_ack.clone())) {
+        match frame_round_trip_response(ResponseBody::AdminBackfillCancel(cancel_ack)) {
             ResponseBody::AdminBackfillCancel(r) => r,
             other => panic!("expected AdminBackfillCancel resp, got {other:?}"),
         };

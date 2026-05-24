@@ -704,15 +704,23 @@ where
                                                 idx,
                                             )
                                         });
-                                        let frame = run_op_dispatch(op, shards).await;
-                                        if let Some(timer) = timer {
-                                            let status = response_status(&frame);
+                                        let frames = run_op_dispatch(op, shards).await;
+                                        if let (Some(timer), Some(last)) = (timer, frames.last()) {
+                                            let status = response_status(last);
                                             timer.record(status);
                                         }
-                                        let _ = tx.send_async(OutgoingFrame {
-                                            bytes: frame.encode(),
-                                            close_after: false,
-                                        }).await;
+                                        for frame in frames {
+                                            if tx
+                                                .send_async(OutgoingFrame {
+                                                    bytes: frame.encode(),
+                                                    close_after: false,
+                                                })
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
                                     }
                                     .instrument(span),
                                 );

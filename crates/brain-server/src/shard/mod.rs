@@ -71,7 +71,6 @@ use brain_ops::subscribe::EventEnvelope;
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::RequestBody;
-use brain_protocol::envelope::response::ResponseBody;
 use brain_storage::arena::{
     AllocError, ArenaFile, ArenaOpenError, SlotAllocator, DEFAULT_INITIAL_CAPACITY_SLOTS,
 };

@@ -9,8 +9,8 @@ use std::sync::Arc;
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
-use brain_ops::test_support::run_in_glommio;
-use brain_ops::{dispatch, ErrorCode, OpError, OpsContext, RealWriterHandle};
+use brain_ops::test_support::{run_in_glommio, single_body};
+use brain_ops::{dispatch, DispatchOutcome, ErrorCode, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
     EdgeKindWire, EdgeRequest, EncodeVectorDirectRequest, MemoryKindWire, RequestBody,
@@ -94,8 +94,8 @@ fn vector_direct_req(request_id: [u8; 16], slot: usize) -> EncodeVectorDirectReq
     }
 }
 
-fn unwrap_resp(body: ResponseBody) -> EncodeResponse {
-    match body {
+fn unwrap_resp(outcome: DispatchOutcome) -> EncodeResponse {
+    match single_body(outcome) {
         ResponseBody::EncodeVectorDirect(r) => r,
         other => panic!("expected ResponseBody::EncodeVectorDirect, got {other:?}"),
     }

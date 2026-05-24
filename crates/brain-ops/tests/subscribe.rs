@@ -22,7 +22,7 @@ use brain_core::{ContextId, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
-use brain_ops::test_support::run_in_glommio;
+use brain_ops::test_support::{run_in_glommio, single_body};
 use brain_ops::{
     dispatch, ErrorCode, EventBus, EventEnvelope, OpError, OpsContext, RealWriterHandle,
     SubscriptionRegistry,
@@ -144,14 +144,14 @@ fn sub_req(filter: SubscriptionFilter) -> SubscribeRequest {
 }
 
 async fn do_encode(ctx: &OpsContext, req: EncodeRequest) -> u128 {
-    let resp = dispatch(
+    let outcome = dispatch(
         RequestBody::Encode(req),
         brain_ops::RequestCaller::anonymous(),
         ctx,
     )
     .await
     .unwrap();
-    match resp {
+    match single_body(outcome) {
         ResponseBody::Encode(r) => r.memory_id,
         other => panic!("expected Encode resp, got {other:?}"),
     }
@@ -164,14 +164,14 @@ async fn do_forget(ctx: &OpsContext, memory_id: u128, request_id: [u8; 16]) {
         request_id,
         txn_id: None,
     };
-    let resp = dispatch(
+    let outcome = dispatch(
         RequestBody::Forget(req),
         brain_ops::RequestCaller::anonymous(),
         ctx,
     )
     .await
     .unwrap();
-    match resp {
+    match single_body(outcome) {
         ResponseBody::Forget(_) => {}
         other => panic!("expected Forget resp, got {other:?}"),
     }
@@ -336,43 +336,45 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
         .unwrap();
 
         // Two encodes inside the txn — preview returns, no events yet.
-        let id1 = match dispatch(
-            RequestBody::Encode(EncodeRequest {
-                text: "one".into(),
-                context_id: 100,
-                kind: MemoryKindWire::Episodic,
-                salience_hint: 0.5,
-                edges: vec![],
-                request_id: [0xA; 16],
-                txn_id: Some(txn_id),
-                deduplicate: false,
-            }),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap()
-        {
+        let id1 = match single_body(
+            dispatch(
+                RequestBody::Encode(EncodeRequest {
+                    text: "one".into(),
+                    context_id: 100,
+                    kind: MemoryKindWire::Episodic,
+                    salience_hint: 0.5,
+                    edges: vec![],
+                    request_id: [0xA; 16],
+                    txn_id: Some(txn_id),
+                    deduplicate: false,
+                }),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        ) {
             ResponseBody::Encode(r) => r.memory_id,
             other => panic!("got {other:?}"),
         };
-        let id2 = match dispatch(
-            RequestBody::Encode(EncodeRequest {
-                text: "two".into(),
-                context_id: 100,
-                kind: MemoryKindWire::Episodic,
-                salience_hint: 0.5,
-                edges: vec![],
-                request_id: [0xB; 16],
-                txn_id: Some(txn_id),
-                deduplicate: false,
-            }),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap()
-        {
+        let id2 = match single_body(
+            dispatch(
+                RequestBody::Encode(EncodeRequest {
+                    text: "two".into(),
+                    context_id: 100,
+                    kind: MemoryKindWire::Episodic,
+                    salience_hint: 0.5,
+                    edges: vec![],
+                    request_id: [0xB; 16],
+                    txn_id: Some(txn_id),
+                    deduplicate: false,
+                }),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        ) {
             ResponseBody::Encode(r) => r.memory_id,
             other => panic!("got {other:?}"),
         };
@@ -626,7 +628,7 @@ fn dispatcher_returns_first_matching_event() {
         )
         .await;
 
-        let resp = dispatch(
+        let outcome = dispatch(
             RequestBody::Subscribe(sub_req(empty_filter())),
             brain_ops::RequestCaller::anonymous(),
             &fix.ctx,
@@ -634,7 +636,7 @@ fn dispatcher_returns_first_matching_event() {
         .await
         .unwrap();
         let producer: Result<(), ()> = Ok(()); // placeholder — original future-handle unused below
-        let event: SubscriptionEvent = match resp {
+        let event: SubscriptionEvent = match single_body(outcome) {
             ResponseBody::SubscribeEvent(e) => e,
             other => panic!("expected SubscribeEvent, got {other:?}"),
         };
