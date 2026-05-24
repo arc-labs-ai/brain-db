@@ -107,7 +107,7 @@ fn fixture() -> Fixture {
     ));
     let embedder = Arc::new(ScriptedEmbedder::new());
 
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let writer: Arc<dyn WriterHandle> =
         Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
     let executor = ExecutorContext::new(

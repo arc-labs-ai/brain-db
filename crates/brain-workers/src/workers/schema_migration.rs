@@ -353,7 +353,7 @@ mod tests {
         let db_path = tempdir.path().join("metadata.redb");
         let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
         let (shared, hnsw_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+            SharedHnsw::new(IndexParams::default_v1()).unwrap();
         let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
 
         let (tx, rx) = flume::unbounded::<SchemaFlagSweepJob>();

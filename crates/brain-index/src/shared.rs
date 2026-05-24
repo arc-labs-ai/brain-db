@@ -1,7 +1,7 @@
 //! Two-tier lock-free wrapper for the PQ-flavour HNSW.
 //!
-//! Mirrors [`crate::shared::SharedHnsw`]'s shape — immutable
-//! [`MainEpoch`] swapped via `ArcSwap`, mutable [`PendingBuffer`]
+//! Mirrors [`crate::shared::SharedHnswImpl`]'s shape — immutable
+//! [`MainEpochImpl`] swapped via `ArcSwap`, mutable [`PendingBufferImpl`]
 //! protected by `RwLock`. Differences:
 //!
 //! - Vector dim is fixed at [`VECTOR_DIM`] (the PQ codebook is trained
@@ -24,8 +24,69 @@ use brain_core::MemoryId;
 use parking_lot::RwLock;
 
 use crate::params::{IndexParams, VECTOR_DIM};
-use crate::pq::rerank;
-use crate::hnsw::{HnswError, HnswIndex};
+use crate::pq::{rerank, BOOTSTRAP_M};
+use crate::hnsw::{HnswError, HnswIndexImpl};
+
+/// Public alias: the production shared HNSW handle, fixed at the
+/// bootstrap PQ shape. Callers reach for [`SharedHnsw`] without
+/// thinking about `M` — the alias keeps the PQ implementation
+/// detail off the public surface.
+pub type SharedHnsw = SharedHnswImpl<{ BOOTSTRAP_M }>;
+
+/// Public alias for the single-writer handle that pairs with
+/// [`SharedHnsw`].
+pub type Writer = WriterImpl<{ BOOTSTRAP_M }>;
+
+impl SharedHnswImpl<{ BOOTSTRAP_M }> {
+    /// Convenience constructor: build an empty [`SharedHnsw`] backed
+    /// by the [`crate::pq::bootstrap_codebook`] and a null arena
+    /// reader. Production shards replace the arena via
+    /// [`Self::with_arena`] before serving search traffic; tests
+    /// stay on the null reader (search results come back ADC-ranked,
+    /// no re-rank).
+    ///
+    /// Errors:
+    /// - [`HnswError::InvalidParams`] if `params` doesn't validate.
+    pub fn new(params: IndexParams) -> Result<(Self, Writer), HnswError> {
+        let codebook = crate::pq::bootstrap_codebook();
+        let idx = crate::hnsw::HnswIndex::new(params, (*codebook).clone())?;
+        Ok(Self::from_index(idx, crate::arena_reader::null_arena_reader()))
+    }
+
+    /// Return a clone of this handle with `arena` swapped in as the
+    /// re-rank reader. Production shards call this after constructing
+    /// the arena to wire it in; the writer half is unchanged because
+    /// writes don't consult the arena.
+    #[must_use]
+    pub fn with_arena(mut self, arena: Arc<dyn crate::arena_reader::ArenaReader>) -> Self {
+        self.arena = arena;
+        self
+    }
+
+    /// Snapshot the published main to disk. Stub for the always-PQ
+    /// pivot — the PQ-aware persistence (codebook + graph + arena
+    /// reference) isn't wired yet. Always returns
+    /// `HnswError::SnapshotNotYetImplemented`; callers handle the
+    /// error and skip checkpointing until persistence lands.
+    pub fn save_snapshot(
+        &self,
+        _dir: &std::path::Path,
+        _basename: &str,
+        _taken_at_lsn: u64,
+        _shard_uuid: [u8; 16],
+    ) -> Result<(), HnswError> {
+        Err(HnswError::SnapshotNotYetImplemented)
+    }
+
+    /// Companion to [`Self::save_snapshot`]. Same stub.
+    pub fn load_snapshot(
+        _dir: &std::path::Path,
+        _basename: &str,
+        _expected_shard_uuid: [u8; 16],
+    ) -> Result<(Self, Writer, u64), HnswError> {
+        Err(HnswError::SnapshotNotYetImplemented)
+    }
+}
 
 /// Search-time over-fetch factor: pull `K * RERANK_FACTOR` ADC
 /// candidates from the HNSW, re-rank against full-precision arena
@@ -33,20 +94,20 @@ use crate::hnsw::{HnswError, HnswIndex};
 const RERANK_FACTOR: usize = 4;
 
 /// An immutable PQ-HNSW snapshot for a single published epoch.
-struct MainEpoch<const M: usize> {
-    index: HnswIndex<M>,
+struct MainEpochImpl<const M: usize> {
+    index: HnswIndexImpl<M>,
     epoch_id: u64,
 }
 
 /// Recent inserts and tombstones that haven't yet been folded into
 /// the main PQ-HNSW. Full-precision vectors live here — encoding
 /// happens during the flush rebuild.
-struct PendingBuffer {
+struct PendingBufferImpl {
     entries: Vec<PendingEntry>,
     tombstoned: HashSet<MemoryId>,
 }
 
-impl PendingBuffer {
+impl PendingBufferImpl {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
@@ -65,7 +126,7 @@ pub struct PendingEntry {
     pub tombstoned: bool,
 }
 
-/// Report returned by [`SharedHnsw::flush_with_rebuild`]. Same shape
+/// Report returned by [`SharedHnswImpl::flush_with_rebuild`]. Same shape
 /// as the pure-HNSW flush report so the maintenance worker can branch
 /// on the flavour once and emit consistent metrics either way.
 #[derive(Debug, Clone)]
@@ -77,22 +138,22 @@ pub struct FlushReport {
 
 /// Cloneable reader handle for a PQ-flavour shared index.
 #[derive(Clone)]
-pub struct SharedHnsw<const M: usize> {
-    main: Arc<ArcSwap<MainEpoch<M>>>,
-    pending: Arc<RwLock<PendingBuffer>>,
+pub struct SharedHnswImpl<const M: usize> {
+    main: Arc<ArcSwap<MainEpochImpl<M>>>,
+    pending: Arc<RwLock<PendingBufferImpl>>,
     arena: Arc<dyn crate::arena_reader::ArenaReader>,
 }
 
 /// Single-writer handle. Not `Clone` — enforces single-writer-per-shard
-/// at the type level, matching [`crate::shared::Writer`].
-pub struct Writer<const M: usize> {
+/// at the type level, matching [`crate::shared::WriterImpl`].
+pub struct WriterImpl<const M: usize> {
     /// Kept so the published main outlives the writer regardless of
     /// reader cloning patterns; never read directly.
-    _main: Arc<ArcSwap<MainEpoch<M>>>,
-    pending: Arc<RwLock<PendingBuffer>>,
+    _main: Arc<ArcSwap<MainEpochImpl<M>>>,
+    pending: Arc<RwLock<PendingBufferImpl>>,
 }
 
-impl<const M: usize> SharedHnsw<M> {
+impl<const M: usize> SharedHnswImpl<M> {
     /// Wrap an existing [`HnswIndex`] with an injected
     /// [`crate::ArenaReader`], returning the reader/writer pair.
     /// The arena reader is consulted for the PQ re-rank pass on every
@@ -100,21 +161,21 @@ impl<const M: usize> SharedHnsw<M> {
     /// pass [`crate::arena_reader::null_arena_reader`].
     #[must_use]
     pub fn from_index(
-        idx: HnswIndex<M>,
+        idx: HnswIndexImpl<M>,
         arena: Arc<dyn crate::arena_reader::ArenaReader>,
-    ) -> (Self, Writer<M>) {
-        let epoch = Arc::new(MainEpoch {
+    ) -> (Self, WriterImpl<M>) {
+        let epoch = Arc::new(MainEpochImpl {
             index: idx,
             epoch_id: 0,
         });
         let main = Arc::new(ArcSwap::new(epoch));
-        let pending = Arc::new(RwLock::new(PendingBuffer::new()));
+        let pending = Arc::new(RwLock::new(PendingBufferImpl::new()));
         let reader = Self {
             main: main.clone(),
             pending: pending.clone(),
             arena,
         };
-        let writer = Writer {
+        let writer = WriterImpl {
             _main: main,
             pending,
         };
@@ -258,9 +319,9 @@ impl<const M: usize> SharedHnsw<M> {
     /// clear pending. Used for bootstrap and snapshot-load paths
     /// where main was rebuilt from a source of truth that already
     /// reflects all writes.
-    pub fn swap(&self, new_index: HnswIndex<M>) {
+    pub fn swap(&self, new_index: HnswIndexImpl<M>) {
         let prev = self.main.load();
-        let next = Arc::new(MainEpoch {
+        let next = Arc::new(MainEpochImpl {
             index: new_index,
             epoch_id: prev.epoch_id.wrapping_add(1),
         });
@@ -272,10 +333,10 @@ impl<const M: usize> SharedHnsw<M> {
 
     /// Snapshot pending entries, pass them to `build` to produce a new
     /// main, then atomically publish + drain the flushed ids. Same
-    /// shape as [`crate::shared::SharedHnsw::flush_with_rebuild`].
+    /// shape as [`crate::shared::SharedHnswImpl::flush_with_rebuild`].
     pub fn flush_with_rebuild<F>(&self, build: F) -> Result<FlushReport, HnswError>
     where
-        F: FnOnce(&[PendingEntry]) -> Result<HnswIndex<M>, HnswError>,
+        F: FnOnce(&[PendingEntry]) -> Result<HnswIndexImpl<M>, HnswError>,
     {
         let snapshot: Vec<PendingEntry> = self.pending.read().entries.clone();
         let snapshot_count = snapshot.len();
@@ -286,7 +347,7 @@ impl<const M: usize> SharedHnsw<M> {
         let prev_epoch = self.main.load();
         let new_epoch_id = prev_epoch.epoch_id.wrapping_add(1);
         let main_len_after = new_index.len();
-        let new_epoch = Arc::new(MainEpoch {
+        let new_epoch = Arc::new(MainEpochImpl {
             index: new_index,
             epoch_id: new_epoch_id,
         });
@@ -350,7 +411,7 @@ impl<const M: usize> SharedHnsw<M> {
     }
 }
 
-impl<const M: usize> Writer<M> {
+impl<const M: usize> WriterImpl<M> {
     /// Insert a full-precision vector. The PQ encode happens at flush
     /// time inside the build closure; until then the vector lives in
     /// pending and reads at exact cosine.
@@ -376,7 +437,7 @@ impl<const M: usize> Writer<M> {
     }
 
     /// Mark a memory tombstoned. Visible immediately via
-    /// [`SharedHnsw::is_tombstoned`].
+    /// [`SharedHnswImpl::is_tombstoned`].
     pub fn mark_tombstoned(&mut self, memory_id: MemoryId) -> Result<(), HnswError> {
         let mut pending = self.pending.write();
         pending.tombstoned.insert(memory_id);
@@ -454,9 +515,9 @@ mod tests {
         IndexParams::default_v1()
     }
 
-    fn build_shared() -> (SharedHnsw<8>, Writer<8>) {
-        let idx = HnswIndex::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
-        SharedHnsw::<8>::from_index(idx, crate::null_arena_reader())
+    fn build_shared() -> (SharedHnswImpl<8>, WriterImpl<8>) {
+        let idx = HnswIndexImpl::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
+        SharedHnswImpl::<8>::from_index(idx, crate::null_arena_reader())
     }
 
     #[test]
@@ -502,7 +563,7 @@ mod tests {
         let before = reader.epoch();
 
         let replacement =
-            HnswIndex::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
+            HnswIndexImpl::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
         reader.swap(replacement);
 
         assert_eq!(reader.epoch(), before.wrapping_add(1));
@@ -523,7 +584,7 @@ mod tests {
         let report = reader
             .flush_with_rebuild(|snapshot| {
                 let mut new_idx =
-                    HnswIndex::<8>::new(pq_params_default(), codebook_for_build).unwrap();
+                    HnswIndexImpl::<8>::new(pq_params_default(), codebook_for_build).unwrap();
                 for entry in snapshot {
                     if !entry.tombstoned {
                         new_idx.insert(entry.memory_id, &entry.vector).unwrap();

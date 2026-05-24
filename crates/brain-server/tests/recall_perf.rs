@@ -141,7 +141,7 @@ fn build_fixture() -> Fixture {
     ));
 
     let (shared, hnsw_writer) =
-        SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).expect("hnsw");
+        SharedHnsw::new(IndexParams::default_v1()).expect("hnsw");
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
 
     let executor = ExecutorContext::new(

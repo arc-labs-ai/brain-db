@@ -633,7 +633,7 @@ mod tests {
         embedder: Arc<dyn Dispatcher>,
     ) -> WorkerContext {
         let (shared, hnsw_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).expect("SharedHnsw::new");
+            SharedHnsw::new(IndexParams::default_v1()).expect("SharedHnsw::new");
         let writer: Arc<dyn WriterHandle> =
             Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
         let executor = ExecutorContext::new(embedder, shared, metadata, writer);

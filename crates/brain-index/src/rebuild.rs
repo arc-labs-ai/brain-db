@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use brain_core::MemoryId;
 
-use crate::hnsw::{HnswError, HnswIndex};
+use crate::hnsw::{HnswError, HnswIndexImpl};
 use crate::params::{IndexParams, VECTOR_DIM};
 use crate::pq::Codebook;
 
@@ -38,7 +38,7 @@ pub struct RebuildReport {
     pub duration: Duration,
 }
 
-/// Build a fresh PQ-flavour `HnswIndex<M>` from `source`. Every
+/// Build a fresh PQ-flavour `HnswIndexImpl<M>` from `source`. Every
 /// vector is PQ-encoded against `codebook` before it lands in the
 /// graph; the iteration order influences HNSW graph quality
 /// slightly.
@@ -56,12 +56,12 @@ pub fn rebuild_impl<const M: usize, I>(
     params: IndexParams,
     codebook: Arc<Codebook<M>>,
     source: I,
-) -> Result<(HnswIndex<M>, RebuildReport), HnswError>
+) -> Result<(HnswIndexImpl<M>, RebuildReport), HnswError>
 where
     I: IntoIterator<Item = (MemoryId, [f32; VECTOR_DIM])>,
 {
     let started_at = Instant::now();
-    let mut idx = HnswIndex::<M>::new(params, (*codebook).clone())?;
+    let mut idx = HnswIndexImpl::<M>::new(params, (*codebook).clone())?;
     let mut count: u64 = 0;
     for (memory_id, vector) in source {
         idx.insert(memory_id, &vector)?;

@@ -239,7 +239,7 @@ pub(crate) struct ShardSnapshotSource {
     arena: Rc<RefCell<ArenaFile>>,
     wal: Rc<RefCell<Option<Wal>>>,
     metadata: SharedMetadataDb,
-    hnsw: SharedHnsw<{ VECTOR_DIM }>,
+    hnsw: SharedHnsw,
     next_checkpoint_id: RefCell<u64>,
 }
 
@@ -253,7 +253,7 @@ impl ShardSnapshotSource {
         arena: Rc<RefCell<ArenaFile>>,
         wal: Rc<RefCell<Option<Wal>>>,
         metadata: SharedMetadataDb,
-        hnsw: SharedHnsw<{ VECTOR_DIM }>,
+        hnsw: SharedHnsw,
     ) -> Self {
         Self {
             shard_uuid,
@@ -714,7 +714,7 @@ mod tests {
                     .expect("Wal::create_with_config");
                 let wal_cell = Rc::new(RefCell::new(Some(wal)));
 
-                let (hnsw_shared, _hnsw_writer) = brain_index::SharedHnsw::<{ VECTOR_DIM }>::new(
+                let (hnsw_shared, _hnsw_writer) = brain_index::SharedHnsw::new(
                     brain_index::IndexParams::default_v1(),
                 )
                 .expect("SharedHnsw::new");

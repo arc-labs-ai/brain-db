@@ -1,6 +1,6 @@
-//! `HnswIndex<const M: usize>` — HNSW with PQ-compressed payload.
+//! `HnswIndexImpl<const M: usize>` — HNSW with PQ-compressed payload.
 //!
-//! Mirrors the [`crate::hnsw::HnswIndex`] surface (insert, search,
+//! Mirrors the [`crate::hnsw::HnswIndexImpl`] surface (insert, search,
 //! tombstone, len) but stores `[u8; M]` PQ codes in the graph instead
 //! of full-precision `[f32; D]` vectors. The query side stays `f32`
 //! so the search wrapper can build an ADC LUT.
@@ -21,11 +21,19 @@ use thiserror::Error;
 
 use crate::idmap::{IdMap, IdMapError};
 use crate::params::{IndexParams, IndexParamsError, DEFAULT_CAPACITY_HINT, MAX_LAYER, VECTOR_DIM};
-use crate::pq::{encode, install_search_lut, Codebook, CodebookError, EncodeError, Lut, PqDist};
+use crate::pq::{
+    encode, install_search_lut, Codebook, CodebookError, EncodeError, Lut, PqDist, BOOTSTRAP_M,
+};
 use crate::tombstones::TombstoneBitmap;
 
+/// Public alias: the production HNSW index, fixed at the
+/// bootstrap PQ shape. Callers reach for [`HnswIndex`] without
+/// thinking about `M` — the alias hides the type-system parameter
+/// that's an implementation detail of PQ compression.
+pub type HnswIndex = HnswIndexImpl<{ BOOTSTRAP_M }>;
+
 /// Default over-fetch multiplier for the per-search bailout loop.
-/// Mirrors `HnswIndex`'s constant; the bailout escalation rules apply
+/// Mirrors `HnswIndexImpl`'s constant; the bailout escalation rules apply
 /// identically.
 const OVER_FACTOR: usize = 2;
 
@@ -35,8 +43,8 @@ const OVER_FACTOR: usize = 2;
 /// codebook bakes it in.
 ///
 /// **Single-writer:** `insert` takes `&mut self`. See
-/// [`HnswIndex`]'s preamble for the discipline.
-pub struct HnswIndex<const M: usize> {
+/// [`HnswIndexImpl`]'s preamble for the discipline.
+pub struct HnswIndexImpl<const M: usize> {
     inner: Hnsw<'static, u8, PqDist<M>>,
     params: IndexParams,
     codebook: Arc<Codebook<M>>,
@@ -63,6 +71,12 @@ pub enum HnswError {
 
     #[error("encoding failed: {0}")]
     Encode(#[from] EncodeError),
+
+    #[error("snapshot persistence not yet wired for the PQ index")]
+    SnapshotNotYetImplemented,
+
+    #[error("snapshot I/O: {0}")]
+    SnapshotIo(#[from] std::io::Error),
 }
 
 impl From<IdMapError> for HnswError {
@@ -76,7 +90,7 @@ impl From<IdMapError> for HnswError {
     }
 }
 
-impl<const M: usize> HnswIndex<M> {
+impl<const M: usize> HnswIndexImpl<M> {
     /// Build a fresh empty index over PQ codes. The codebook is moved
     /// into an `Arc` and shared with the inner [`PqDist`] — cloning
     /// the index handle would re-share the same codebook by reference.
@@ -119,7 +133,7 @@ impl<const M: usize> HnswIndex<M> {
     /// is ADC-approximate — exact ranking against full-precision
     /// vectors is the re-rank pass's job (task 25.5).
     ///
-    /// `ef` works the same as in [`HnswIndex::search`]: `None` uses
+    /// `ef` works the same as in [`HnswIndexImpl::search`]: `None` uses
     /// `params.ef_search`; `Some` clamps to `[k, params.ef_search_max]`.
     ///
     /// Tombstoned memories are always excluded.
@@ -285,7 +299,7 @@ impl<const M: usize> HnswIndex<M> {
     }
 
     /// Resolve the effective `ef_search` for a single query. Mirrors
-    /// the clamp rules in [`HnswIndex::search`].
+    /// the clamp rules in [`HnswIndexImpl::search`].
     fn resolve_ef(&self, k: usize, ef: Option<usize>) -> usize {
         let requested = ef.unwrap_or(self.params.ef_search);
         requested.max(k).min(self.params.ef_search_max)
@@ -334,7 +348,7 @@ mod tests {
 
     #[test]
     fn insert_then_search_returns_inserted_id() {
-        let mut idx = HnswIndex::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
+        let mut idx = HnswIndexImpl::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
         let v = vec_with_targets([10, 10, 10, 10, 10, 10, 10, 10]);
         idx.insert(mid(1), &v).unwrap();
         let results = idx.search_all(&v, 1, None);
@@ -344,7 +358,7 @@ mod tests {
 
     #[test]
     fn duplicate_insert_rejected() {
-        let mut idx = HnswIndex::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
+        let mut idx = HnswIndexImpl::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
         let v = vec_with_targets([5, 5, 5, 5, 5, 5, 5, 5]);
         idx.insert(mid(2), &v).unwrap();
         let result = idx.insert(mid(2), &v);
@@ -353,7 +367,7 @@ mod tests {
 
     #[test]
     fn nan_vector_rejected_at_insert() {
-        let mut idx = HnswIndex::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
+        let mut idx = HnswIndexImpl::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
         let mut v = vec_with_targets([1, 1, 1, 1, 1, 1, 1, 1]);
         v[100] = f32::NAN;
         let result = idx.insert(mid(3), &v);
@@ -365,7 +379,7 @@ mod tests {
 
     #[test]
     fn search_excludes_tombstoned() {
-        let mut idx = HnswIndex::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
+        let mut idx = HnswIndexImpl::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
         for i in 0..5 {
             idx.insert(mid(i), &vec_with_targets([i, i, i, i, i, i, i, i])).unwrap();
         }
@@ -380,7 +394,7 @@ mod tests {
 
     #[test]
     fn search_ranks_closer_first() {
-        let mut idx = HnswIndex::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
+        let mut idx = HnswIndexImpl::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
         // Insert vectors that encode to per-subspace targets 0..16.
         for t in 0..16 {
             idx.insert(mid(t as u8), &vec_with_targets([t; 8])).unwrap();
@@ -401,14 +415,14 @@ mod tests {
 
     #[test]
     fn search_empty_index_returns_empty() {
-        let idx = HnswIndex::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
+        let idx = HnswIndexImpl::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
         let results = idx.search_all(&vec_with_targets([0; 8]), 5, None);
         assert!(results.is_empty());
     }
 
     #[test]
     fn search_zero_k_returns_empty() {
-        let mut idx = HnswIndex::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
+        let mut idx = HnswIndexImpl::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
         idx.insert(mid(1), &vec_with_targets([1; 8])).unwrap();
         let results = idx.search_all(&vec_with_targets([1; 8]), 0, None);
         assert!(results.is_empty());
@@ -416,7 +430,7 @@ mod tests {
 
     #[test]
     fn filter_excludes_unwanted_ids() {
-        let mut idx = HnswIndex::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
+        let mut idx = HnswIndexImpl::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
         for t in 0..5u8 {
             idx.insert(mid(t), &vec_with_targets([t; 8])).unwrap();
         }
@@ -435,7 +449,7 @@ mod tests {
 
     #[test]
     fn contains_and_len_track_inserts() {
-        let mut idx = HnswIndex::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
+        let mut idx = HnswIndexImpl::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
         assert_eq!(idx.len(), 0);
         assert!(idx.is_empty());
         assert!(!idx.contains(mid(1)));
@@ -450,7 +464,7 @@ mod tests {
     #[test]
     fn codebook_accessor_returns_arc_to_same_data() {
         let cb_bytes_before: Vec<f32> = arithmetic_codebook::<8>().as_flat().to_vec();
-        let idx = HnswIndex::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
+        let idx = HnswIndexImpl::<8>::new(pq_params_default(), arithmetic_codebook::<8>()).unwrap();
         let cb_arc = idx.codebook();
         assert_eq!(cb_arc.as_flat(), cb_bytes_before.as_slice());
     }

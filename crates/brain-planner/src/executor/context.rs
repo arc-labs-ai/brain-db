@@ -63,7 +63,7 @@ pub struct PendingMemorySnapshot {
 #[derive(Clone)]
 pub struct ExecutorContext {
     pub embedder: Arc<dyn Dispatcher>,
-    pub index: SharedHnsw<384>,
+    pub index: SharedHnsw,
     pub metadata: SharedMetadataDb,
     pub writer: Arc<dyn WriterHandle>,
     /// `Some` only inside the request scope of a txn-flagged op. Carries
@@ -85,7 +85,7 @@ impl ExecutorContext {
     #[must_use]
     pub fn new(
         embedder: Arc<dyn Dispatcher>,
-        index: SharedHnsw<384>,
+        index: SharedHnsw,
         metadata: SharedMetadataDb,
         writer: Arc<dyn WriterHandle>,
     ) -> Self {

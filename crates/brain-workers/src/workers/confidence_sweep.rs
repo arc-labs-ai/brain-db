@@ -697,7 +697,7 @@ mod tests {
         let metadata = Arc::new(Mutex::new(metadata));
         let dispatcher: Arc<dyn Dispatcher> = Arc::new(NoopDispatcher);
         let (shared, hnsw_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).expect("SharedHnsw::new");
+            SharedHnsw::new(IndexParams::default_v1()).expect("SharedHnsw::new");
         let writer: Arc<dyn WriterHandle> =
             Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
         let _statement_hnsw = Arc::new(RwLock::new(

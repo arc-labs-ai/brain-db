@@ -975,12 +975,12 @@ mod tests {
     /// Test helper that also returns the SharedHnsw reader so tests
     /// can assert on HNSW post-submit (the RealWriterHandle holds
     /// only the Writer half of the pair).
-    fn build_writer_with_shared() -> (TempDir, RealWriterHandle, SharedHnsw<VECTOR_DIM>) {
+    fn build_writer_with_shared() -> (TempDir, RealWriterHandle, SharedHnsw) {
         let dir = TempDir::new().unwrap();
         let db = MetadataDb::open(dir.path().join("meta.redb")).unwrap();
         let metadata: SharedMetadataDb = Arc::new(Mutex::new(db));
         let (shared, hnsw_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+            SharedHnsw::new(IndexParams::default_v1()).unwrap();
         let writer = RealWriterHandle::new(metadata, hnsw_writer);
         (dir, writer, shared)
     }
@@ -1249,7 +1249,7 @@ mod tests {
         let db = MetadataDb::open(dir.path().join("meta.redb")).unwrap();
         let metadata: SharedMetadataDb = Arc::new(Mutex::new(db));
         let (_shared, hnsw_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+            SharedHnsw::new(IndexParams::default_v1()).unwrap();
         let _writer = RealWriterHandle::new(metadata.clone(), hnsw_writer);
 
         // After construction, every table that op handlers read from
@@ -1526,7 +1526,7 @@ mod tests {
         let db = MetadataDb::open(path).unwrap();
         let metadata: SharedMetadataDb = Arc::new(Mutex::new(db));
         let (_shared, hnsw_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+            SharedHnsw::new(IndexParams::default_v1()).unwrap();
         RealWriterHandle::new(metadata, hnsw_writer)
     }
 
@@ -1537,7 +1537,7 @@ mod tests {
         let db = MetadataDb::open(path).unwrap();
         let metadata: SharedMetadataDb = Arc::new(Mutex::new(db));
         let (_shared, hnsw_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+            SharedHnsw::new(IndexParams::default_v1()).unwrap();
         let writer = RealWriterHandle::new(metadata, hnsw_writer);
         // Swap the default clock for the test-driven one.
         let c = clock.clone();

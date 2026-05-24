@@ -52,7 +52,7 @@ use crate::subscribe::EventBus;
 /// without changing `WriterHandle`'s public surface.
 pub struct RealWriterHandle {
     metadata: SharedMetadataDb,
-    hnsw_writer: Mutex<HnswWriter<384>>,
+    hnsw_writer: Mutex<HnswWriter>,
     /// In-process slot counter. Phase 8 / 9 will replace with the
     /// arena allocator. Starts at 1.
     next_slot: AtomicU64,
@@ -273,7 +273,7 @@ pub struct SchemaFlagSweepJob {
 
 impl RealWriterHandle {
     #[must_use]
-    pub fn new(metadata: SharedMetadataDb, hnsw_writer: HnswWriter<384>) -> Self {
+    pub fn new(metadata: SharedMetadataDb, hnsw_writer: HnswWriter) -> Self {
         // Materialise the tables we read from. redb creates tables
         // on first write_txn().open_table(), but read_txn() on a
         // never-opened table returns `TableDoesNotExist`. We do a
@@ -401,7 +401,7 @@ impl RealWriterHandle {
     /// Lock the HNSW writer for the unified path's side-effect step.
     /// Returns a `MutexGuard` so the caller holds the lock for the
     /// minimum window (single insert / mark_tombstoned).
-    pub(crate) fn hnsw_writer_lock(&self) -> parking_lot::MutexGuard<'_, brain_index::Writer<384>> {
+    pub(crate) fn hnsw_writer_lock(&self) -> parking_lot::MutexGuard<'_, brain_index::Writer> {
         self.hnsw_writer.lock()
     }
 

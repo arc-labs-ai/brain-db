@@ -5,7 +5,7 @@
 //! native-buildable on macOS). The impl ties together:
 //!
 //! - `brain-embed::Dispatcher` — for the `SemanticQuery::Text` path.
-//! - `brain-index::SharedHnsw<384>` — substrate memory HNSW
+//! - `brain-index::SharedHnsw` — substrate memory HNSW
 //!   reader handle.
 //! - `brain-index::StatementHnswIndex` — statement HNSW
 //!   (optional; `None` in v1 until the statement-embedding
@@ -34,7 +34,7 @@ use redb::TableError;
 #[derive(Clone)]
 pub struct BrainSemanticRetriever {
     embedder: Arc<dyn Dispatcher>,
-    memory_index: SharedHnsw<SEMANTIC_VECTOR_DIM>,
+    memory_index: SharedHnsw,
     statement_index: Option<Arc<RwLock<StatementHnswIndex>>>,
     metadata: Arc<Mutex<MetadataDb>>,
 }
@@ -43,7 +43,7 @@ impl BrainSemanticRetriever {
     #[must_use]
     pub fn new(
         embedder: Arc<dyn Dispatcher>,
-        memory_index: SharedHnsw<SEMANTIC_VECTOR_DIM>,
+        memory_index: SharedHnsw,
         statement_index: Option<Arc<RwLock<StatementHnswIndex>>>,
         metadata: Arc<Mutex<MetadataDb>>,
     ) -> Self {

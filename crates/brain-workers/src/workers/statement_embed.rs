@@ -515,7 +515,7 @@ mod tests {
         // to satisfy WorkerContext's shape — mirrors the decay /
         // consolidation integration-test fixtures.
         let (shared, hnsw_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).expect("SharedHnsw::new");
+            SharedHnsw::new(IndexParams::default_v1()).expect("SharedHnsw::new");
         let writer: Arc<dyn WriterHandle> =
             Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
         let executor = ExecutorContext::new(dispatcher, shared, metadata, writer);

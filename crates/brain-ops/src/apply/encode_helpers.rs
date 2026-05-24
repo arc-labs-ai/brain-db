@@ -331,7 +331,7 @@ mod tests {
         let metadata = Arc::new(parking_lot::Mutex::new(
             brain_metadata::MetadataDb::open(&db_path).unwrap(),
         ));
-        let (shared, _writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+        let (shared, _writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
         let executor = ExecutorContext::new(
             Arc::new(NopDispatcher) as Arc<dyn Dispatcher>,
             shared,

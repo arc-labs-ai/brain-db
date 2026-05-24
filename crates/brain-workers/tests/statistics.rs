@@ -37,7 +37,7 @@ impl Dispatcher for NopDispatcher {
 struct Fixture {
     ctx: Arc<OpsContext>,
     metadata: SharedMetadataDb,
-    index: SharedHnsw<VECTOR_DIM>,
+    index: SharedHnsw,
     _tempdir: tempfile::TempDir,
 }
 
@@ -45,7 +45,7 @@ fn build_fixture() -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
     let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let index = shared.clone();
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
     let executor = ExecutorContext::new(
@@ -154,7 +154,7 @@ fn tombstone_count_reflects_hnsw_state() {
         // RealWriterHandle — reach through with a fresh writer pair
         // and swap).
         let (replacement_reader, mut replacement_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+            SharedHnsw::new(IndexParams::default_v1()).unwrap();
         let _ = replacement_reader;
         for slot in 1..=4u64 {
             let mut v = [0.0f32; VECTOR_DIM];
@@ -172,8 +172,9 @@ fn tombstone_count_reflects_hnsw_state() {
                 (make_id(slot), v)
             })
             .collect();
+        let cb = brain_index::bootstrap_codebook();
         let (mut new_idx, _r) =
-            brain_index::HnswIndex::<VECTOR_DIM>::rebuild(fix.index.params(), source).unwrap();
+            brain_index::rebuild::rebuild_impl::<8, _>(fix.index.params(), cb, source).unwrap();
         new_idx.mark_tombstoned(make_id(1)).unwrap();
         new_idx.mark_tombstoned(make_id(2)).unwrap();
         fix.index.swap(new_idx);

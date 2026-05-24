@@ -1004,7 +1004,7 @@ struct Shard {
     rebuild_source: Arc<dyn RebuildSource<{ VECTOR_DIM }>>,
     /// The shared HNSW handle. `rebuild-ann` swaps a freshly-
     /// rebuilt index in via `SharedHnsw::swap()`.
-    hnsw_shared: SharedHnsw<{ VECTOR_DIM }>,
+    hnsw_shared: SharedHnsw,
 }
 
 /// Register every Phase-8 worker against `scheduler`. Sub-task 9.8
@@ -1216,7 +1216,7 @@ pub fn spawn_shard(
         .spawn(move || async move {
             // Build per-shard HNSW; tombstones rebuilt by HnswMaintenanceWorker.
             let (hnsw_shared, hnsw_writer) =
-                SharedHnsw::<{ VECTOR_DIM }>::new(IndexParams::default_v1())
+                SharedHnsw::new(IndexParams::default_v1())
                     .expect("SharedHnsw::new");
             let dispatcher: Arc<dyn Dispatcher> = dispatcher_for_closure;
             // Per-shard StatementHnswIndex. Populated by the
@@ -2143,7 +2143,9 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                 let result = match shard.rebuild_source.snapshot_vectors().await {
                     Ok(vectors) => {
                         let params = shard.hnsw_shared.params();
-                        match brain_index::HnswIndex::<{ VECTOR_DIM }>::rebuild(params, vectors) {
+                        let codebook = brain_index::bootstrap_codebook();
+                        match brain_index::rebuild::rebuild_impl::<8, _>(params, codebook, vectors)
+                        {
                             Ok((new_idx, _report)) => {
                                 let entries = new_idx.len();
                                 shard.hnsw_shared.swap(new_idx);

@@ -82,7 +82,7 @@ fn write_memory_row(
 
 fn build_retriever(metadata: MetadataDb) -> BrainSemanticRetriever {
     let (reader, _writer) =
-        SharedHnsw::<{ VECTOR_DIM }>::new(IndexParams::default_v1()).expect("SharedHnsw::new");
+        SharedHnsw::new(IndexParams::default_v1()).expect("SharedHnsw::new");
     let embedder: Arc<dyn Dispatcher> = Arc::new(FixedDispatcher {
         vector: one_hot(0),
         fingerprint: [0u8; 16],
@@ -173,7 +173,7 @@ fn empty_memory_corpus_returns_no_hits() {
 fn memory_scope_returns_ranked_hits() {
     let (_dir, mut metadata) = fresh_metadata();
     let (reader, mut writer) =
-        SharedHnsw::<{ VECTOR_DIM }>::new(IndexParams::default_v1()).expect("SharedHnsw");
+        SharedHnsw::new(IndexParams::default_v1()).expect("SharedHnsw");
     let agent = AgentId::new();
     let id1 = MemoryId::pack(0, 1, 0);
     let id2 = MemoryId::pack(0, 2, 0);
@@ -212,7 +212,7 @@ fn memory_scope_returns_ranked_hits() {
 fn agent_id_filter_narrows() {
     let (_dir, mut metadata) = fresh_metadata();
     let (reader, mut writer) =
-        SharedHnsw::<{ VECTOR_DIM }>::new(IndexParams::default_v1()).expect("SharedHnsw");
+        SharedHnsw::new(IndexParams::default_v1()).expect("SharedHnsw");
     let agent_a = AgentId::new();
     let agent_b = AgentId::new();
     let id1 = MemoryId::pack(0, 1, 0);
@@ -260,7 +260,7 @@ fn agent_id_filter_narrows() {
 fn created_at_range_filter_narrows() {
     let (_dir, mut metadata) = fresh_metadata();
     let (reader, mut writer) =
-        SharedHnsw::<{ VECTOR_DIM }>::new(IndexParams::default_v1()).expect("SharedHnsw");
+        SharedHnsw::new(IndexParams::default_v1()).expect("SharedHnsw");
     let agent = AgentId::new();
     let id1 = MemoryId::pack(0, 1, 0);
     let id2 = MemoryId::pack(0, 2, 0);
@@ -305,7 +305,7 @@ fn created_at_range_filter_narrows() {
 fn text_query_path_routes_through_embedder() {
     let (_dir, mut metadata) = fresh_metadata();
     let (reader, mut writer) =
-        SharedHnsw::<{ VECTOR_DIM }>::new(IndexParams::default_v1()).expect("SharedHnsw");
+        SharedHnsw::new(IndexParams::default_v1()).expect("SharedHnsw");
     let agent = AgentId::new();
     let id = MemoryId::pack(0, 1, 0);
 
@@ -337,7 +337,7 @@ fn text_query_path_routes_through_embedder() {
 fn similarity_threshold_drops_low_scores() {
     let (_dir, mut metadata) = fresh_metadata();
     let (reader, mut writer) =
-        SharedHnsw::<{ VECTOR_DIM }>::new(IndexParams::default_v1()).expect("SharedHnsw");
+        SharedHnsw::new(IndexParams::default_v1()).expect("SharedHnsw");
     let agent = AgentId::new();
     let id1 = MemoryId::pack(0, 1, 0);
     let id2 = MemoryId::pack(0, 2, 0);
