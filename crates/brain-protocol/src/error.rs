@@ -148,6 +148,13 @@ pub enum ErrorCode {
     StreamLimitExceeded,
     ConnectionLimitExceeded,
     TransactionLimitExceeded,
+    /// Transaction buffer exceeded the per-transaction op cap (1000 ops
+    /// per spec §05/04 §10). Surfaced both at append-time (so the agent
+    /// learns immediately when the 1001st op is buffered) and at commit
+    /// time (defense-in-depth for any buffer mutation that slipped past
+    /// the append guard). The client should split the work into multiple
+    /// transactions.
+    TransactionTooLarge,
 
     // §3.8 Internal
     Internal,
@@ -282,7 +289,8 @@ impl ErrorCode {
             | Self::RateLimited
             | Self::StreamLimitExceeded
             | Self::ConnectionLimitExceeded
-            | Self::TransactionLimitExceeded => ErrorCategory::ResourceExhausted,
+            | Self::TransactionLimitExceeded
+            | Self::TransactionTooLarge => ErrorCategory::ResourceExhausted,
 
             // Internal codes.
             Self::Internal

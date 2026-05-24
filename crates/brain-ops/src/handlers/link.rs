@@ -323,6 +323,11 @@ async fn handle_link_in_txn(
         return Ok(resp);
     }
 
+    // Reject the 1001st op now — replay-cache hits still replay, but
+    // a fresh LINK against a full buffer fails fast (spec §05/04 §10).
+    ctx.txn_store
+        .with_buffer(txn_id, |buf| buf.check_capacity_for_push())?;
+
     // Validate both endpoints (committed or pending in-buffer).
     let (src_committed, tgt_committed) = {
         let db_guard = ctx.executor.metadata.lock();
@@ -487,6 +492,11 @@ async fn handle_unlink_in_txn(
     if let Some(resp) = cached {
         return Ok(resp);
     }
+
+    // Reject the 1001st op now — replay-cache hits still replay, but
+    // a fresh UNLINK against a full buffer fails fast (spec §05/04 §10).
+    ctx.txn_store
+        .with_buffer(txn_id, |buf| buf.check_capacity_for_push())?;
 
     // Decide `removed` at preview time. An edge "exists" if it's in
     // the committed `edges_out` table OR appears in any pending

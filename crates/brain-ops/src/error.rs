@@ -45,6 +45,15 @@ pub enum OpError {
     #[error("too many memories targeted by one request")]
     TooManyMemories,
 
+    /// Transaction buffer would exceed the per-transaction op cap.
+    /// Spec §05/04 §10 fixes the cap at 1000 buffered ops (ENCODE +
+    /// FORGET + LINK + UNLINK). Surfaced at append-time so an agent
+    /// learns immediately when the 1001st op is buffered, and again at
+    /// commit-time as defense-in-depth. The client should split the
+    /// work into multiple transactions.
+    #[error("transaction too large: {ops} ops exceeds cap of {cap}")]
+    TransactionTooLarge { ops: u32, cap: u32 },
+
     /// Schema-strict mode: STATEMENT_CREATE / QUERY referenced a
     /// predicate qname that the active schema version doesn't
     /// declare. Schemaless deployments never raise this — unknown
@@ -146,6 +155,11 @@ pub enum ErrorCode {
     TxnExpired,
     /// Txn id never existed on this server.
     TxnNotFound,
+    /// Buffered transaction would exceed the per-transaction op cap
+    /// (1000 ops per spec §05/04 §10). Distinct from `Conflict` so the
+    /// SDK can report a domain-specific recovery hint ("split into
+    /// multiple transactions").
+    TransactionTooLarge,
     /// Schema-strict mode rejected the request because the predicate
     /// qname isn't in the active schema's vocabulary.
     PredicateNotInSchema,
@@ -175,6 +189,7 @@ impl OpError {
             Self::Conflict(_) => ErrorCode::Conflict,
             Self::TxnExpired => ErrorCode::TxnExpired,
             Self::TxnNotFound => ErrorCode::TxnNotFound,
+            Self::TransactionTooLarge { .. } => ErrorCode::TransactionTooLarge,
             Self::PredicateNotInSchema { .. } => ErrorCode::PredicateNotInSchema,
             Self::RelationTypeNotInSchema { .. } => ErrorCode::RelationTypeNotInSchema,
             Self::CardinalityViolation { .. } => ErrorCode::CardinalityViolation,

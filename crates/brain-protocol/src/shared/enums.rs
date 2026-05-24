@@ -380,6 +380,7 @@ pub enum ErrorCodeWire {
     StreamLimitExceeded = 0x0074,
     ConnectionLimitExceeded = 0x0075,
     TransactionLimitExceeded = 0x0076,
+    TransactionTooLarge = 0x0077,
     // Internal
     Internal = 0x0080,
     StorageError = 0x0081,
@@ -467,6 +468,7 @@ impl From<ErrorCode> for ErrorCodeWire {
             ErrorCode::StreamLimitExceeded => Self::StreamLimitExceeded,
             ErrorCode::ConnectionLimitExceeded => Self::ConnectionLimitExceeded,
             ErrorCode::TransactionLimitExceeded => Self::TransactionLimitExceeded,
+            ErrorCode::TransactionTooLarge => Self::TransactionTooLarge,
             ErrorCode::Internal => Self::Internal,
             ErrorCode::StorageError => Self::StorageError,
             ErrorCode::IndexError => Self::IndexError,
@@ -552,6 +554,7 @@ impl From<ErrorCodeWire> for ErrorCode {
             ErrorCodeWire::StreamLimitExceeded => Self::StreamLimitExceeded,
             ErrorCodeWire::ConnectionLimitExceeded => Self::ConnectionLimitExceeded,
             ErrorCodeWire::TransactionLimitExceeded => Self::TransactionLimitExceeded,
+            ErrorCodeWire::TransactionTooLarge => Self::TransactionTooLarge,
             ErrorCodeWire::Internal => Self::Internal,
             ErrorCodeWire::StorageError => Self::StorageError,
             ErrorCodeWire::IndexError => Self::IndexError,

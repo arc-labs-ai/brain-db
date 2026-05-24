@@ -1183,3 +1183,138 @@ fn auto_abort_sweep_is_noop_for_zero_session_id() {
         assert_eq!(resp.operations_applied, 1);
     })
 }
+
+// =============================================================================
+// Per-transaction op cap (MAX_TXN_OPS = 1000)
+// =============================================================================
+//
+// The cap is enforced two ways: append-time (so the 1001st buffered op
+// fails fast) and commit-time (defense-in-depth for buffer mutations
+// that slip past the append guard). The append-time check sits AFTER
+// the intra-txn replay cache so an idempotent re-submit at the cap
+// boundary still replays.
+
+/// `i`-th request_id within these tests. Disambiguates the per-op
+/// idempotency hash so each buffered op hits a fresh buffer slot.
+fn rid(prefix: u8, i: u32) -> [u8; 16] {
+    let mut id = [prefix; 16];
+    id[12..16].copy_from_slice(&i.to_be_bytes());
+    id
+}
+
+/// Buffer one ENCODE inside `txn`, returning the dispatch result so
+/// callers can assert on success/failure. Each call grows the buffer
+/// by exactly one (the encoder mints a fresh `MemoryId` per call).
+async fn buffer_encode(
+    fix: &Fixture,
+    txn: [u8; 16],
+    i: u32,
+) -> Result<EncodeResponse, OpError> {
+    let text = format!("cap-fill-{i}");
+    dispatch(
+        RequestBody::Encode(encode_req(rid(0xE0, i), &text, Some(txn))),
+        brain_ops::RequestCaller::anonymous(),
+        &fix.ctx,
+    )
+    .await
+    .map(|r| match r {
+        ResponseBody::Encode(e) => e,
+        other => panic!("expected Encode, got {other:?}"),
+    })
+}
+
+#[test]
+fn txn_at_exactly_1000_commits_fine() {
+    // Boundary test: a buffer filled to exactly MAX_TXN_OPS must still
+    // commit. The 1001st op is what fails — not the 1000th.
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let txn = [160; 16];
+        let _ = begin(&fix, txn, 300).await; // generous timeout
+        for i in 0..1000u32 {
+            buffer_encode(&fix, txn, i)
+                .await
+                .unwrap_or_else(|e| panic!("encode #{i} failed: {e:?}"));
+        }
+        let c = commit(&fix, txn).await;
+        assert_eq!(
+            c.operations_applied, 1000,
+            "exactly-MAX_TXN_OPS commit must apply all ops"
+        );
+    })
+}
+
+#[test]
+fn txn_rejects_op_beyond_1000_cap() {
+    // Append-time check: the 1000th op succeeds, the 1001st returns
+    // TransactionTooLarge. The agent learns about the cap immediately
+    // rather than burning thousands of doomed ops only to be rejected
+    // at TXN_COMMIT.
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let txn = [161; 16];
+        let _ = begin(&fix, txn, 300).await;
+        for i in 0..1000u32 {
+            buffer_encode(&fix, txn, i)
+                .await
+                .unwrap_or_else(|e| panic!("encode #{i} failed: {e:?}"));
+        }
+        // The 1001st op must fail with TransactionTooLarge carrying
+        // the current ops count + cap, so the SDK can surface a useful
+        // message.
+        let err = buffer_encode(&fix, txn, 1000).await.unwrap_err();
+        match err {
+            OpError::TransactionTooLarge { ops, cap } => {
+                assert_eq!(ops, 1000, "ops should report the current buffered count");
+                assert_eq!(cap, 1000, "cap should report MAX_TXN_OPS");
+            }
+            other => panic!("expected TransactionTooLarge, got {other:?}"),
+        }
+        // Wire-level error code maps to the dedicated TransactionTooLarge
+        // code (not generic Conflict or InvalidArgument) so SDK clients
+        // can detect it programmatically.
+        let err = buffer_encode(&fix, txn, 1001).await.unwrap_err();
+        assert_eq!(err.error_code(), ErrorCode::TransactionTooLarge);
+
+        // The buffer is intact at exactly 1000 — commit must succeed.
+        // (Append-time rejection MUST NOT corrupt the buffer.)
+        let c = commit(&fix, txn).await;
+        assert_eq!(c.operations_applied, 1000);
+    })
+}
+
+#[test]
+fn txn_replay_still_works_when_buffer_is_full() {
+    // Edge case: at the cap, an idempotent re-submit of an already-
+    // buffered request_id MUST still replay (return cached response)
+    // — the replay path doesn't grow the buffer, so the cap doesn't
+    // apply. Otherwise an agent's automatic retry on a flaky
+    // connection would fail the moment it hit the cap.
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let txn = [162; 16];
+        let _ = begin(&fix, txn, 300).await;
+        let mut first_id: u128 = 0;
+        for i in 0..1000u32 {
+            let resp = buffer_encode(&fix, txn, i)
+                .await
+                .unwrap_or_else(|e| panic!("encode #{i} failed: {e:?}"));
+            if i == 500 {
+                first_id = resp.memory_id;
+            }
+        }
+        // Re-submit op #500 — same request_id, same params — should
+        // hit the replay cache and return the same memory id, not
+        // bump the buffer to 1001.
+        let replay = buffer_encode(&fix, txn, 500)
+            .await
+            .expect("idempotent replay at-cap must succeed");
+        assert_eq!(
+            replay.memory_id, first_id,
+            "replayed encode must return the cached memory id"
+        );
+        // Commit still works.
+        let c = commit(&fix, txn).await;
+        assert_eq!(c.operations_applied, 1000);
+    })
+}

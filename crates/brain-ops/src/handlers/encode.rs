@@ -469,6 +469,13 @@ async fn handle_encode_in_txn(
         });
     }
 
+    // 4a. Reject the 1001st op now — after the replay-cache miss
+    //     (an idempotent re-submit against a full buffer must still
+    //     replay) but before we burn embed + writer-reserve work on a
+    //     doomed buffer (spec §05/04 §10).
+    ctx.txn_store
+        .with_buffer(txn_id, |buf| buf.check_capacity_for_push())?;
+
     // 5. Embed.
     let vector = ctx
         .executor

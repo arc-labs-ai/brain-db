@@ -29,6 +29,17 @@ const MIN_TIMEOUT_SECONDS: u32 = 1;
 const MAX_TIMEOUT_SECONDS: u32 = 300;
 const DEFAULT_TIMEOUT_SECONDS: u32 = 30;
 
+/// Maximum number of buffered operations (ENCODE + FORGET + LINK +
+/// UNLINK) a single transaction may hold. Spec §05/04 §10 fixes the
+/// limit at 1000; beyond it, TXN_COMMIT returns `TransactionTooLarge`
+/// and the client splits into multiple transactions.
+///
+/// Fixed at a compile-time constant in v1.0: the value is a protocol
+/// commitment, not an operational knob. If a future deployment needs a
+/// different cap, it becomes a runtime setting at that point — keeping
+/// it static now avoids accumulating a config knob no one tunes.
+pub const MAX_TXN_OPS: u32 = 1000;
+
 // ---------------------------------------------------------------------------
 // State + entries.
 // ---------------------------------------------------------------------------
@@ -186,6 +197,23 @@ impl TxnBuffer {
     pub fn ops_count(&self) -> u32 {
         let n = self.encodes.len() + self.forgets.len() + self.links.len() + self.unlinks.len();
         u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
+    /// Reject a buffer mutation that would push past the per-transaction
+    /// op cap. Called at the top of every buffer-mutating in-txn handler
+    /// so the 1001st op fails fast — the agent learns about the cap
+    /// immediately instead of buffering thousands of doomed ops only to
+    /// be rejected at TXN_COMMIT. `handle_txn_commit` runs the same
+    /// check on the taken buffer as defense-in-depth.
+    pub fn check_capacity_for_push(&self) -> Result<(), OpError> {
+        let current = self.ops_count();
+        if current >= MAX_TXN_OPS {
+            return Err(OpError::TransactionTooLarge {
+                ops: current,
+                cap: MAX_TXN_OPS,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -383,6 +411,24 @@ pub async fn handle_txn_commit(
     };
 
     let ops_applied = buffer.ops_count();
+
+    // Defense-in-depth: the append-time guard rejects any push that
+    // would breach `MAX_TXN_OPS`, but a future code path that extends
+    // the buffer through a different route would slip past it. Reject
+    // an oversized buffer here too, before we touch the writer.
+    if ops_applied > MAX_TXN_OPS {
+        let mut entries = store.entries.lock();
+        if let Some(entry) = entries.get_mut(&req.txn_id) {
+            entry.state = TxnState::Aborted;
+            entry.final_response = Some(TxnFinalResponse::Abort(TxnFinalAbort {
+                operations_discarded: ops_applied,
+            }));
+        }
+        return Err(OpError::TransactionTooLarge {
+            ops: ops_applied,
+            cap: MAX_TXN_OPS,
+        });
+    }
 
     // Build a single multi-phase Write from the buffer. The WAL
     // envelope (TxnBegin/Phase×N/TxnCommit) makes the whole commit
@@ -609,4 +655,104 @@ fn hash_txn_commit_request(txn_id: TxnId, phases: &[crate::write::Phase]) -> [u8
         h.update(b"\0");
     }
     *h.finalize().as_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stuff `count` no-op forgets into the buffer to drive
+    /// `ops_count` to a known value. The contents don't matter — the
+    /// cap check looks only at the running total.
+    fn fill_buffer(buf: &mut TxnBuffer, count: usize) {
+        for i in 0..count {
+            buf.forgets.push(BufferedForget {
+                memory_id: MemoryId::from(u128::from(i as u64) + 1),
+                mode: ForgetMode::Soft,
+                request_id: [0u8; 16],
+                request_hash: [0u8; 32],
+                created_at_unix_nanos: 0,
+                agent_id: brain_core::AgentId(uuid::Uuid::nil()),
+            });
+        }
+    }
+
+    #[test]
+    fn check_capacity_for_push_passes_below_cap() {
+        let mut buf = TxnBuffer::default();
+        fill_buffer(&mut buf, (MAX_TXN_OPS - 1) as usize);
+        // Pushing the 1000th op is fine — the cap is exclusive of the
+        // pending push, so a count of 999 still has room.
+        buf.check_capacity_for_push()
+            .expect("999/1000 buffer must accept one more push");
+    }
+
+    #[test]
+    fn check_capacity_for_push_rejects_at_cap() {
+        let mut buf = TxnBuffer::default();
+        fill_buffer(&mut buf, MAX_TXN_OPS as usize);
+        // Pushing the 1001st op fails — the buffer is already at
+        // MAX_TXN_OPS and one more would breach the cap.
+        let err = buf
+            .check_capacity_for_push()
+            .expect_err("at-cap buffer must reject the next push");
+        match err {
+            OpError::TransactionTooLarge { ops, cap } => {
+                assert_eq!(ops, MAX_TXN_OPS);
+                assert_eq!(cap, MAX_TXN_OPS);
+            }
+            other => panic!("expected TransactionTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_capacity_for_push_rejects_when_already_over_cap() {
+        // Defense-in-depth case: if a future code path somehow pushed
+        // past the cap, the check must still reject — never silently
+        // accept an over-sized buffer.
+        let mut buf = TxnBuffer::default();
+        fill_buffer(&mut buf, (MAX_TXN_OPS as usize) + 5);
+        let err = buf
+            .check_capacity_for_push()
+            .expect_err("over-cap buffer must reject");
+        match err {
+            OpError::TransactionTooLarge { ops, cap } => {
+                assert_eq!(ops, MAX_TXN_OPS + 5);
+                assert_eq!(cap, MAX_TXN_OPS);
+            }
+            other => panic!("expected TransactionTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ops_count_sums_across_kinds() {
+        // Sanity: the cap is enforced against the total — encodes +
+        // forgets + links + unlinks all count equally. Future cap
+        // refactors must preserve this property.
+        let mut buf = TxnBuffer::default();
+        fill_buffer(&mut buf, 3);
+        // Forge three different op kinds via direct pushes (the
+        // BufferedX shapes don't need plausible payloads for the
+        // count check).
+        buf.links.push(BufferedLink {
+            source: MemoryId::from(1u128),
+            target: MemoryId::from(2u128),
+            kind: EdgeKind::Caused,
+            weight: 1.0,
+            request_id: [0u8; 16],
+            request_hash: [0u8; 32],
+            created_at_unix_nanos: 0,
+            agent_id: brain_core::AgentId(uuid::Uuid::nil()),
+        });
+        buf.unlinks.push(BufferedUnlink {
+            source: MemoryId::from(3u128),
+            target: MemoryId::from(4u128),
+            kind: EdgeKind::Caused,
+            request_id: [0u8; 16],
+            request_hash: [0u8; 32],
+            created_at_unix_nanos: 0,
+            agent_id: brain_core::AgentId(uuid::Uuid::nil()),
+        });
+        assert_eq!(buf.ops_count(), 5);
+    }
 }
