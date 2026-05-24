@@ -27,6 +27,7 @@
 )]
 #![forbid(unsafe_code)]
 
+pub mod arena_reader;
 pub mod entity_hnsw;
 pub mod graph_retriever;
 pub mod hnsw;
@@ -34,14 +35,14 @@ pub mod idmap;
 pub mod params;
 pub mod persistence;
 pub mod pq;
-pub mod pq_hnsw;
-pub mod pq_shared;
 pub mod rebuild;
 pub mod semantic_retriever;
 pub mod shared;
 pub mod statement_hnsw;
 pub mod tantivy_shard;
 pub mod tombstones;
+
+pub use arena_reader::{null_arena_reader, ArenaReader, NullArenaReader};
 
 pub use entity_hnsw::{
     EntityHnswError, EntityHnswIndex, EntityHnswParams, RebuildReport as EntityRebuildReport,
@@ -57,11 +58,9 @@ pub use hnsw::{HnswError, HnswIndex};
 pub use idmap::{IdMap, IdMapError};
 pub use params::{IndexParams, IndexParamsError, MAX_LAYER, VECTOR_DIM};
 pub use pq::{
-    Codebook, CodebookError, EncodeError, KmeansError, Lut, PqDist, PqParams, PqParamsError,
-    SdcTable, PQ_BITS_V1, PQ_CENTROIDS_PER_SUBSPACE,
+    bootstrap_codebook, Codebook, CodebookError, EncodeError, KmeansError, Lut, PqDist, PqParams,
+    PqParamsError, SdcTable, BOOTSTRAP_M, PQ_BITS_V1, PQ_CENTROIDS_PER_SUBSPACE,
 };
-pub use pq_hnsw::{PqHnswError, PqHnswIndex};
-pub use pq_shared::{PendingPqEntry, PqFlushReport, PqWriter, SharedPqHnsw};
 pub use rebuild::RebuildReport;
 pub use semantic_retriever::{
     project_memory_hits, project_statement_hits,

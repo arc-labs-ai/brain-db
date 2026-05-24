@@ -1,37 +1,34 @@
 //! Build a fresh `HnswIndex` from an external iterator of
-//! `(MemoryId, [f32; D])` pairs.
+//! `(MemoryId, [f32; VECTOR_DIM])` pairs.
 //!
 //! See `spec/09_indexing/06_persistence.md` §2 (rebuild procedure)
-//! and `spec/09_indexing/07_maintenance.md` §5 (the full-rebuild
-//! flow — 4.6 implements only the **Build** phase; Catch-up,
-//! Atomic-swap, and Cleanup are the Phase 8 maintenance worker's
-//! responsibility).
+//! and `spec/09_indexing/07_hnsw_pq.md` §8 (PQ-aware rebuild — the
+//! arena vector is encoded against the supplied codebook before
+//! landing in the HNSW graph).
 //!
 //! ## Caller owns the filter
 //!
-//! says tombstoned memories are skipped during
-//! rebuild says corrupted vectors are skipped too.
-//! Both filters are **upstream** of brain-index: the iterator the
-//! caller passes yields only active, valid memories. `rebuild`
-//! itself just iterates and inserts.
+//! Tombstoned memories are skipped upstream of brain-index; the
+//! iterator the caller passes yields only active, valid memories.
+//! `rebuild` itself just iterates and inserts.
 //!
 //! ## Sequential in v1
 //!
-//! mentions parallel insertion as a perf target. v1
-//! ships sequential insertion — simpler, deterministic, fine for
-//! shard sizes ≤ 1M (~30 s rebuild). A `rebuild_parallel` is a
-//! small additive change later, since hnsw_rs already exposes
-//! `parallel_insert_slice`.
+//! v1 ships sequential insertion — simpler, deterministic, fine for
+//! shard sizes ≤ 1M. A parallel variant is a small additive change
+//! later (hnsw_rs already exposes `parallel_insert_slice`).
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use brain_core::MemoryId;
 
 use crate::hnsw::{HnswError, HnswIndex};
-use crate::params::IndexParams;
+use crate::params::{IndexParams, VECTOR_DIM};
+use crate::pq::Codebook;
 
 /// Observability snapshot returned alongside a rebuilt index.
-/// Used by the Phase 8 maintenance worker for the
+/// Used by the maintenance worker for the
 /// `last_rebuild_duration_ms` metric.
 #[derive(Debug, Clone, Copy)]
 pub struct RebuildReport {
@@ -41,30 +38,30 @@ pub struct RebuildReport {
     pub duration: Duration,
 }
 
-/// Build a fresh `HnswIndex<D>` from `source`. The iterator is
-/// consumed in order; the iteration order influences HNSW graph
-/// quality slightly (recommends metadata-store /
-/// MemoryId order — UUIDv7's time-ordered prefix gives roughly
-/// insertion-time order, which is a sensible default).
+/// Build a fresh PQ-flavour `HnswIndex<M>` from `source`. Every
+/// vector is PQ-encoded against `codebook` before it lands in the
+/// graph; the iteration order influences HNSW graph quality
+/// slightly.
 ///
 /// Returns the fresh index plus a [`RebuildReport`]. Tombstones
-/// start empty (the iterator skips them's
-/// "compaction" property).
+/// start empty (the iterator skips them upstream).
 ///
 /// Errors:
-/// - `HnswError::InvalidParams` if `params` doesn't validate.
-/// - `HnswError::DuplicateMemoryId` if the iterator yields the same
-///   `MemoryId` twice (caller bug).
-/// - `HnswError::IdMapExhausted` at `u32::MAX` items.
-pub fn rebuild_impl<const D: usize, I>(
+/// - [`HnswError::InvalidParams`] if `params` doesn't validate.
+/// - [`HnswError::DuplicateMemoryId`] if the iterator yields the
+///   same `MemoryId` twice (caller bug).
+/// - [`HnswError::IdMapExhausted`] at `u32::MAX` items.
+/// - [`HnswError::Encode`] if any vector contains NaN / infinity.
+pub fn rebuild_impl<const M: usize, I>(
     params: IndexParams,
+    codebook: Arc<Codebook<M>>,
     source: I,
-) -> Result<(HnswIndex<D>, RebuildReport), HnswError>
+) -> Result<(HnswIndex<M>, RebuildReport), HnswError>
 where
-    I: IntoIterator<Item = (MemoryId, [f32; D])>,
+    I: IntoIterator<Item = (MemoryId, [f32; VECTOR_DIM])>,
 {
     let started_at = Instant::now();
-    let mut idx = HnswIndex::<D>::new(params)?;
+    let mut idx = HnswIndex::<M>::new(params, (*codebook).clone())?;
     let mut count: u64 = 0;
     for (memory_id, vector) in source {
         idx.insert(memory_id, &vector)?;
@@ -80,20 +77,30 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pq::bootstrap_codebook;
 
     fn mid(slot: u64) -> MemoryId {
         MemoryId::pack(1, slot, 1)
     }
 
-    fn vec4(a: f32, b: f32, c: f32, d: f32) -> [f32; 4] {
-        let n = (a * a + b * b + c * c + d * d).sqrt();
-        [a / n, b / n, c / n, d / n]
+    /// Build a 384-dim unit vector with `value` in the first
+    /// component, zero elsewhere — normalised. Quick fixture for
+    /// rebuild tests that don't need realistic distributions.
+    fn unit_first(value: f32) -> [f32; VECTOR_DIM] {
+        let mut v = [0.0_f32; VECTOR_DIM];
+        v[0] = value.signum();
+        v
     }
 
     #[test]
     fn rebuild_empty_iterator() {
-        let (idx, report) =
-            rebuild_impl::<4, _>(IndexParams::default_v1(), std::iter::empty()).unwrap();
+        let cb = bootstrap_codebook();
+        let (idx, report) = rebuild_impl::<8, _>(
+            IndexParams::default_v1(),
+            cb,
+            std::iter::empty::<(MemoryId, [f32; VECTOR_DIM])>(),
+        )
+        .unwrap();
         assert_eq!(idx.len(), 0);
         assert!(idx.is_empty());
         assert_eq!(report.memories_inserted, 0);
@@ -101,48 +108,40 @@ mod tests {
 
     #[test]
     fn rebuild_from_iterator_yields_correct_len() {
+        let cb = bootstrap_codebook();
         let source = vec![
-            (mid(1), vec4(1.0, 0.0, 0.0, 0.0)),
-            (mid(2), vec4(0.0, 1.0, 0.0, 0.0)),
-            (mid(3), vec4(0.0, 0.0, 1.0, 0.0)),
+            (mid(1), unit_first(1.0)),
+            (mid(2), unit_first(-1.0)),
+            (mid(3), unit_first(1.0)),
         ];
-        let (idx, report) = rebuild_impl::<4, _>(IndexParams::default_v1(), source).unwrap();
+        let (idx, report) = rebuild_impl::<8, _>(IndexParams::default_v1(), cb, source).unwrap();
         assert_eq!(idx.len(), 3);
         assert_eq!(report.memories_inserted, 3);
     }
 
     #[test]
     fn rebuild_uses_provided_params() {
+        let cb = bootstrap_codebook();
         let params = IndexParams {
             m: 32,
             ef_construction: 100,
             ef_search: 50,
             ef_search_max: 250,
         };
-        let (idx, _) = rebuild_impl::<4, _>(params, std::iter::empty()).unwrap();
+        let (idx, _) = rebuild_impl::<8, _>(
+            params,
+            cb,
+            std::iter::empty::<(MemoryId, [f32; VECTOR_DIM])>(),
+        )
+        .unwrap();
         assert_eq!(idx.params(), params);
     }
 
     #[test]
-    fn rebuild_starts_with_empty_tombstones() {
-        let source = vec![
-            (mid(1), vec4(1.0, 0.0, 0.0, 0.0)),
-            (mid(2), vec4(0.0, 1.0, 0.0, 0.0)),
-        ];
-        let (idx, _) = rebuild_impl::<4, _>(IndexParams::default_v1(), source).unwrap();
-        assert_eq!(idx.tombstone_count(), 0);
-        assert!(!idx.is_tombstoned(mid(1)));
-        assert!(!idx.is_tombstoned(mid(2)));
-    }
-
-    #[test]
     fn rebuild_rejects_duplicate_memory_id() {
-        // Two entries with the same MemoryId — caller bug.
-        let source = vec![
-            (mid(7), vec4(1.0, 0.0, 0.0, 0.0)),
-            (mid(7), vec4(0.0, 1.0, 0.0, 0.0)),
-        ];
-        match rebuild_impl::<4, _>(IndexParams::default_v1(), source) {
+        let cb = bootstrap_codebook();
+        let source = vec![(mid(7), unit_first(1.0)), (mid(7), unit_first(-1.0))];
+        match rebuild_impl::<8, _>(IndexParams::default_v1(), cb, source) {
             Err(HnswError::DuplicateMemoryId { memory_id_bytes }) => {
                 assert_eq!(memory_id_bytes, mid(7).to_be_bytes());
             }

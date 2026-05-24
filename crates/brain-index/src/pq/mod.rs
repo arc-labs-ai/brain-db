@@ -13,7 +13,7 @@
 //! - [`kmeans`]: deterministic trainer that produces a [`Codebook`].
 //!
 //! Later sub-tasks add the encoder (25.2), distance kernels (25.3),
-//! and the `PqHnswIndex` wrapper (25.4).
+//! and the `HnswIndex` wrapper (25.4).
 
 pub mod bootstrap;
 pub mod codebook;

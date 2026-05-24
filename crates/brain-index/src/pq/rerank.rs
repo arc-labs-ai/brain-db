@@ -19,7 +19,7 @@ use crate::params::VECTOR_DIM;
 
 /// Re-rank PQ candidates against full-precision arena vectors.
 ///
-/// `candidates` is the output of [`crate::pq_hnsw::PqHnswIndex::search`]
+/// `candidates` is the output of [`crate::hnsw::HnswIndex::search`]
 /// (or a streaming-friendly equivalent): each pair carries a memory id
 /// and an ADC distance. The distance is used only as input ordering;
 /// the output scores are exact cosine similarities computed here.

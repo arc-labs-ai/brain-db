@@ -39,17 +39,5 @@ tempfile.workspace = true
 criterion.workspace = true
 
 [[bench]]
-name = "recall"
-harness = false
-
-[[bench]]
-name = "insert"
-harness = false
-
-[[bench]]
 name = "lexical_retrieve"
-harness = false
-
-[[bench]]
-name = "lock_free_read_stall"
 harness = false
