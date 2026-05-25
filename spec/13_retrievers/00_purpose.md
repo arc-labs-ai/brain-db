@@ -14,7 +14,7 @@
 
 ## What this spec defines
 
-The retrieval surface activated when a schema is declared. Three retrievers (semantic, lexical, graph) run in parallel; their ranked outputs are fused with weighted Reciprocal Rank Fusion (RRF, k=60). An optional cross-encoder reranker (bge-reranker-base) reorders the top-K. A rule-based query router decides per-query which retrievers to invoke and with what weights.
+The retrieval surface activated when a schema is declared. Three retrievers (semantic, lexical, graph) run in parallel; their ranked outputs are fused with weighted Reciprocal Rank Fusion (RRF, k=60). A cross-encoder reranker (bge-reranker-base) then reorders the top-K — always-on whenever the model is loaded, gated only by the deploy-time `config.rerank.enabled` switch, with no per-request flag. A rule-based query router decides per-query which retrievers to invoke and with what weights.
 
 `RECALL` transparently uses this path when a schema is active; the response shape is identical to the schemaless path with extra `contributing_retrievers` and `fused_score` metadata.
 

@@ -23,6 +23,7 @@ fn mock_result(idx: u32) -> MemoryResult {
         edges: None,
         contributing_retrievers: Vec::new(),
         fused_score: 0.0,
+        rerank_score: None,
         salience_initial: 0.5,
         access_count: 0,
         lsn: 0,

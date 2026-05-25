@@ -167,7 +167,6 @@ fn recall_request(cue: &str, txn_id: Option<[u8; 16]>) -> RecallRequest {
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id,
-        rerank: false,
     }
 }
 

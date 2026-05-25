@@ -73,13 +73,9 @@ pub struct QueryPlan {
     pub estimated_cost_ms: f32,
     /// Retrieval profile picked from `routing.query_class`. The
     /// executor uses `weights` for RRF and `final_top_k` after the
-    /// optional rerank pass; the planner already baked
-    /// `per_retriever_top_n` into each [`PlannedRetriever::top_n`].
+    /// rerank stage; the planner already baked `per_retriever_top_n`
+    /// into each [`PlannedRetriever::top_n`].
     pub profile: RetrievalProfile,
-    /// When set, the executor calls a cross-encoder reranker on
-    /// the top fused candidates and re-sorts. Carries through
-    /// from `QueryRequest::rerank`.
-    pub rerank: bool,
 }
 
 /// Per-retriever invocation. Richer than the router's
@@ -204,7 +200,6 @@ pub fn plan(req: &QueryRequest) -> Result<QueryPlan, PlanError> {
         limit,
         estimated_cost_ms,
         profile,
-        rerank: req.rerank,
     })
 }
 

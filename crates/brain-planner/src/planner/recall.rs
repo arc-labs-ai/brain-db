@@ -185,7 +185,6 @@ mod tests {
             include_text: false,
             request_id: None,
             txn_id: None,
-            rerank: false,
         }
     }
 

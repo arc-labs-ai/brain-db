@@ -63,11 +63,12 @@ pub struct HybridExecutorContext {
     pub lexical: Arc<dyn LexicalRetriever>,
     pub graph: Arc<dyn GraphRetriever>,
     pub metadata: Arc<MetadataDb>,
-    /// Optional cross-encoder for the W2.2 rerank pass. When
-    /// `Some` and the plan opted in (`QueryPlan.rerank == true`),
-    /// the executor reranks the top fused candidates. When `None`
-    /// (no model on disk, auto-discover failed) the rerank stage
-    /// is silently skipped — RRF order wins.
+    /// Cross-encoder for the always-on rerank pass. When `Some`,
+    /// the executor reranks the top fused candidates on every
+    /// query — there is no per-request opt-in. When `None` (the
+    /// operator set `config.rerank.enabled = false`, or no model is
+    /// on disk) the rerank stage is skipped and RRF order wins. No
+    /// error either way.
     pub cross_encoder: Option<Arc<CrossEncoder>>,
 }
 
@@ -89,23 +90,23 @@ pub struct QueryMetadata {
     pub retriever_total_results: Vec<(Retriever, usize)>,
     pub filter_stats: FilterChainStats,
     pub total_latency_ms: f64,
-    /// Outcome of the optional cross-encoder rerank stage. `None`
-    /// means the caller didn't opt in via `rerank=true`.
+    /// Outcome of the always-on cross-encoder rerank stage. `None`
+    /// means the cross-encoder isn't loaded on this shard (operator
+    /// opted out, or no model on disk) so the result is RRF-only.
     pub rerank: Option<RerankOutcome>,
 }
 
 /// What the rerank stage did. Surfaces in trace output so callers
-/// can see whether a `rerank=true` request actually ran the
-/// cross-encoder.
+/// can see whether the cross-encoder re-sorted the fused list. Only
+/// produced when the cross-encoder is loaded; a shard with rerank
+/// disabled leaves `QueryMetadata.rerank` as `None`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RerankOutcome {
     /// Cross-encoder ran and re-sorted the fused list.
     Applied { candidates: usize, latency_ms: f64 },
-    /// Opt-in was set but the cross-encoder isn't loaded on this
-    /// server. RRF-only order returned.
-    SkippedUnavailable,
-    /// Opt-in was set but the fused list had no candidates with
-    /// fetchable text (tombstoned mid-query, non-memory variants).
+    /// Cross-encoder is loaded but the fused list had no candidates
+    /// with fetchable text (no query text, tombstoned mid-query, or
+    /// non-memory variants only). RRF order returned unchanged.
     SkippedNoCandidates,
 }
 
@@ -297,7 +298,11 @@ pub async fn execute(
 
     let fused = fuse_rrf(&outputs, plan.fusion.k, &plan.fusion.weights);
 
-    let (fused_after_rerank, rerank_outcome) = if plan.rerank {
+    // Rerank is always-on: the stage fires whenever the shard has a
+    // cross-encoder loaded, regardless of any request field. When
+    // the operator disabled the load (`cross_encoder` is `None`),
+    // the result is RRF-only with no error.
+    let (fused_after_rerank, rerank_outcome) = if ctx.cross_encoder.is_some() {
         rerank_stage(fused, request, ctx)
     } else {
         (fused, None)
@@ -334,12 +339,10 @@ fn rerank_stage(
     request: &QueryRequest,
     ctx: &HybridExecutorContext,
 ) -> (Vec<FusedItem>, Option<RerankOutcome>) {
+    // Only reached when `ctx.cross_encoder` is `Some` (the caller in
+    // `execute` gates on it), so the encoder is guaranteed present.
     let Some(encoder) = ctx.cross_encoder.as_ref() else {
-        tracing::info!(
-            target: "brain_planner::executor",
-            "rerank requested but cross-encoder unavailable; returning RRF-only ranking",
-        );
-        return (fused, Some(RerankOutcome::SkippedUnavailable));
+        return (fused, None);
     };
     let Some(query) = request.text.as_deref() else {
         // No query text → rerank has no `query` half of the pair.

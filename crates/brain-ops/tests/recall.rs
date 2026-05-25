@@ -108,7 +108,6 @@ fn recall_req(cue: &str, top_k: u32) -> RecallRequest {
         include_text: false,
         request_id: None,
         txn_id: None,
-        rerank: false,
     }
 }
 

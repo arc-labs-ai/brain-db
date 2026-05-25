@@ -481,7 +481,6 @@ mod tests {
             include_text: true,
             request_id: Some(sample_uuid(7)),
             txn_id: None,
-            rerank: false,
         }));
     }
 

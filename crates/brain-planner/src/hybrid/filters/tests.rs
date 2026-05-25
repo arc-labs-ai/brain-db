@@ -202,6 +202,7 @@ fn fused(id: RankedItemId, rank: u32) -> FusedItem {
             rank,
             raw_score: 1.0 - 0.01 * f32::from(rank as u16),
         }],
+        rerank_score: None,
     }
 }
 

@@ -214,7 +214,6 @@ mod common {
             include_text: false,
             request_id: None,
             txn_id: None,
-            rerank: false,
         };
         match single_body(
             dispatch(
@@ -438,7 +437,6 @@ mod criterion_01_wire {
                     include_text: false,
                     request_id: None,
                     txn_id: None,
-                    rerank: false,
                 }),
             ),
             (

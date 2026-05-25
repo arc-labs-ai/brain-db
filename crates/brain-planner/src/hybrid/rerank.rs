@@ -1,16 +1,17 @@
 //! Cross-encoder rerank pass over RRF-fused candidates.
 //!
 //! Sits between the RRF fusion stage and the post-fusion filter
-//! chain. When the caller opts in via `RecallRequest.rerank=true`,
-//! the executor pulls the top fused candidates' text from the
-//! per-shard `texts` table, calls `CrossEncoder::score_pairs`, and
-//! re-sorts by relevance. The filter chain then runs over the
-//! reranked list as usual.
+//! chain. Rerank is first-class and always-on: whenever the
+//! cross-encoder is loaded on the shard, the executor pulls the top
+//! fused candidates' text from the per-shard `texts` table, calls
+//! `CrossEncoder::score_pairs`, and re-sorts by relevance. The
+//! filter chain then runs over the reranked list as usual. There is
+//! no per-request toggle — the only control is the deploy-time
+//! `config.rerank.enabled` load gate.
 //!
-//! When no cross-encoder is available (model not bootstrapped on
-//! disk, env var not set, etc.), this module is a no-op and the
-//! RRF-only ordering is preserved. The hybrid pipeline logs the
-//! skip exactly once per query at `info`.
+//! When no cross-encoder is available (operator opted out, or the
+//! model isn't bootstrapped on disk), the executor never reaches
+//! this module and the RRF-only ordering is preserved.
 
 use std::sync::Arc;
 
@@ -83,6 +84,12 @@ pub fn rerank_top_n(
     let (mut in_window, out_window): (Vec<_>, Vec<_>) = fused
         .into_iter()
         .partition(|item| scored.contains_key(&item.id));
+    // Stamp each scored item with its cross-encoder logit so the
+    // result projection can surface it (`rr=` in the recall card)
+    // and callers can tell reranked rows from RRF-only ones.
+    for item in &mut in_window {
+        item.rerank_score = scored.get(&item.id).copied();
+    }
     in_window.sort_by(|a, b| {
         let sa = scored.get(&a.id).copied().unwrap_or(f32::NEG_INFINITY);
         let sb = scored.get(&b.id).copied().unwrap_or(f32::NEG_INFINITY);
@@ -110,6 +117,7 @@ mod tests {
                 rank: 1,
                 raw_score: 0.9,
             }],
+            rerank_score: None,
         }
     }
 

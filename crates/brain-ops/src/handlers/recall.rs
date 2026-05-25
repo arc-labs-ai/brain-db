@@ -44,15 +44,6 @@ pub async fn handle_recall(
     if req.top_k == 0 {
         return Err(OpError::InvalidRequest("recall: top_k must be > 0".into()));
     }
-    // Hard-fail when the client opted into rerank but the operator
-    // turned it off. Returning a clear error beats silently falling
-    // back to RRF — the client either drops the flag or picks a
-    // shard with rerank enabled.
-    if req.rerank && !ctx.cross_encoder.is_enabled() {
-        return Err(OpError::CapabilityNotEnabled {
-            capability: "rerank",
-        });
-    }
     let planner_req = build_planner_request(&req);
 
     let plan = hybrid_plan(&planner_req).map_err(map_plan_error)?;
@@ -211,6 +202,8 @@ fn pending_to_memory_result(p: &BufferedEncode, req: &RecallRequest, score: f32)
         graph: None,
         contributing_retrievers: Vec::new(),
         fused_score: score,
+        // Buffered txn writes never go through the hybrid rerank stage.
+        rerank_score: None,
         salience_initial: p.salience_initial,
         access_count: 0,
         // Buffered writes haven't been WAL'd yet; LSN is assigned
@@ -486,7 +479,6 @@ fn build_planner_request(req: &RecallRequest) -> PlannerQueryRequest {
         limit: req.top_k,
         retrievers: RetrieverSelection::Auto,
         fusion_config: None,
-        rerank: req.rerank,
     }
 }
 
@@ -696,6 +688,10 @@ fn project_memory_results(
                 .map(|c| retriever_to_wire_name(c.retriever))
                 .collect(),
             fused_score: fused.fused_score as f32,
+            // Present iff the always-on rerank stage scored this hit.
+            // When set, the result list is ordered by this score, not
+            // `fused_score`; the recall card surfaces it as `rr=`.
+            rerank_score: fused.rerank_score,
             salience_initial: row.salience_initial,
             access_count: row.access_count,
             // WAL position the row was originally encoded at.

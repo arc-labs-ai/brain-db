@@ -186,7 +186,6 @@ fn recall_request() -> RecallRequest {
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id: None,
-        rerank: false,
     }
 }
 

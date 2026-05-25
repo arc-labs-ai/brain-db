@@ -149,7 +149,6 @@ fn recall_req(cue: &str, top_k: u32, txn: Option<[u8; 16]>) -> RecallRequest {
         include_text: false,
         request_id: None,
         txn_id: txn,
-        rerank: false,
     }
 }
 

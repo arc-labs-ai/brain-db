@@ -27,6 +27,16 @@ impl Render for RecallResults {
         }
         let policy = ctx.policy;
         let theme = &ctx.theme;
+        // Header marks how the list is ordered: if any hit carries a
+        // cross-encoder score the whole list was re-sorted by it
+        // (⟳ reranked); otherwise it's the RRF fused order.
+        let reranked = results.iter().any(|r| r.rerank_score.is_some());
+        let header = if reranked {
+            theme.paint(Token::Label, "⟳ reranked", policy)
+        } else {
+            theme.paint(Token::Muted, "RRF-only", policy)
+        };
+        writeln!(w, "{header}")?;
         for (idx, r) in results.iter().enumerate() {
             let kind_str = if r.consolidated_at_unix_nanos.is_some() {
                 format!("{}†", fmt_kind(r.kind))
@@ -45,8 +55,13 @@ impl Render for RecallResults {
             };
             let short = fmt_short_id(r.memory_id);
             let id_painted = theme.paint(Token::MemoryId, &short, policy).into_owned();
+            // Primary column is the fused score — the actual rank key
+            // (RRF, or the rerank logit when reranked). `confidence`
+            // carries the fused value server-side. Semantic cosine
+            // rides alongside as a secondary signal so a reader can
+            // tell a strong-cosine hit from a strong-fused one.
             let score_painted = {
-                let s = format!("score={:.4}", r.similarity_score);
+                let s = format!("score={:.4}", r.confidence);
                 theme.paint(Token::Score, &s, policy).into_owned()
             };
             let mut meta: Vec<String> = vec![
@@ -55,7 +70,13 @@ impl Render for RecallResults {
                 format!("ctx={}", r.context_id),
                 salience,
                 score_painted,
+                format!("sem={:.4}", r.similarity_score),
             ];
+            // Cross-encoder relevance, only present when rerank scored
+            // this hit. Surfacing it makes the re-sort auditable.
+            if let Some(rr) = r.rerank_score {
+                meta.push(format!("rr={rr:.4}"));
+            }
             if r.access_count > 0 {
                 meta.push(format!("acc={}", r.access_count));
             }
@@ -165,15 +186,21 @@ impl Render for RecallResults {
         }
         writeln!(w)?;
         let n = results.len();
+        // Spread is computed over the rank key the list is actually
+        // ordered by: the rerank logit when reranked, else the fused
+        // score (`confidence`). A tight spread means the ranking
+        // signal barely separated these hits.
+        let rank_key = |r: &MemoryResult| r.rerank_score.unwrap_or(r.confidence);
         let score_spread = {
             let mut min = f32::INFINITY;
             let mut max = f32::NEG_INFINITY;
             for r in results {
-                if r.similarity_score < min {
-                    min = r.similarity_score;
+                let k = rank_key(r);
+                if k < min {
+                    min = k;
                 }
-                if r.similarity_score > max {
-                    max = r.similarity_score;
+                if k > max {
+                    max = k;
                 }
             }
             max - min
@@ -236,6 +263,7 @@ impl Render for RecallResults {
                         })).collect::<Vec<_>>(),
                     })),
                     "fused_score": r.fused_score,
+                    "rerank_score": r.rerank_score,
                     "text": r.text,
                 })
             })
@@ -267,6 +295,7 @@ mod tests {
             edges: None,
             contributing_retrievers: Vec::new(),
             fused_score: 0.0,
+            rerank_score: None,
             salience_initial: 0.5,
             access_count: 0,
             lsn: 0,
@@ -301,9 +330,33 @@ mod tests {
         r.render_table(&ctx(), &mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("s2/m17/v1"));
+        // Primary score is the fused value (confidence); semantic
+        // cosine rides as the secondary `sem=` column.
         assert!(s.contains("score=0.9100"));
+        assert!(s.contains("sem=0.9100"));
+        // RRF-only hit (no rerank score) → RRF-only header, no rr=.
+        assert!(s.contains("RRF-only"), "expected RRF-only header: {s}");
+        assert!(!s.contains("rr="), "RRF-only hit should not show rr=: {s}");
         assert!(s.contains("the quick brown fox"));
         assert!(s.contains("1 results"));
+    }
+
+    #[test]
+    fn reranked_hit_shows_rr_column_and_header() {
+        let mut hit = make_hit("the exact phrase", 0.40);
+        // Fused score (confidence) and cosine differ from the rerank
+        // logit so each column is distinguishable.
+        hit.confidence = 0.0164;
+        hit.similarity_score = 0.40;
+        hit.rerank_score = Some(7.25);
+        let r = RecallResults(vec![hit]);
+        let mut buf = Vec::new();
+        r.render_table(&ctx(), &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("⟳ reranked"), "expected reranked header: {s}");
+        assert!(s.contains("score=0.0164"), "fused primary column: {s}");
+        assert!(s.contains("sem=0.4000"), "secondary cosine column: {s}");
+        assert!(s.contains("rr=7.2500"), "rerank column: {s}");
     }
 
     #[test]

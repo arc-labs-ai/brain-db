@@ -1,9 +1,9 @@
 //! `GET_CAPABILITIES` request + response payloads.
 //!
 //! Capability introspection lets clients learn at session start which
-//! features the connected shard supports. Without it a client has to
-//! discover capability state through trial-and-error: send a rerank
-//! request, get back `CapabilityNotEnabled`, redo without the flag.
+//! features the connected shard supports — whether the cross-encoder
+//! reranker is loaded, which extractor tiers are live, the embedding
+//! dimensionality, and which user schema namespaces are active.
 //! `GET_CAPABILITIES` collapses that into one round-trip and makes the
 //! deployment shape part of the public contract.
 //!
@@ -30,9 +30,12 @@ pub struct GetCapabilitiesRequest {}
 #[archive_attr(derive(Debug))]
 pub struct Capabilities {
     /// True when the cross-encoder reranker is loaded on this shard.
-    /// Clients should drop `RecallRequest.rerank = true` against
-    /// shards reporting `false` — the request would otherwise return
-    /// `CapabilityNotEnabled`.
+    /// Rerank is first-class and always-on: when this is `true`,
+    /// every RECALL / QUERY result is reranked by the cross-encoder
+    /// automatically — there is no per-request toggle. When `false`
+    /// (the operator set `[rerank] enabled = false` at spawn), the
+    /// shard returns RRF-only ordering. Clients read this bit purely
+    /// to know whether the results they get back are reranked.
     pub rerank: bool,
     /// True when the LLM extractor tier is enabled (operator gate is
     /// on AND the registry has at least one wired LLM extractor).

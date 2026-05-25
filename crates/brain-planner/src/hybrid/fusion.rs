@@ -28,6 +28,11 @@ pub struct FusedItem {
     pub id: RankedItemId,
     pub fused_score: f64,
     pub contributing: Vec<RetrieverContribution>,
+    /// Cross-encoder relevance score, set by the rerank stage iff
+    /// this item fell inside the rerank window and the encoder
+    /// scored it. `None` means RRF-only — `fused_score` is the rank
+    /// key. When `Some`, the list was re-sorted by this score.
+    pub rerank_score: Option<f32>,
 }
 
 /// Per-retriever contribution to a fused item — surfaces in
@@ -76,6 +81,7 @@ pub fn fuse_rrf(
                 id: item.id,
                 fused_score: 0.0,
                 contributing: Vec::new(),
+                rerank_score: None,
             });
             entry.fused_score += contribution;
             entry.contributing.push(RetrieverContribution {

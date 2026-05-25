@@ -170,7 +170,6 @@ impl<'a> RecallBuilder<'a> {
                         include_text,
                         request_id: request_id_bytes,
                         txn_id,
-                        rerank: false,
                     });
                     let mut guard = client.acquire().await?;
                     let stream_id = guard.next_stream_id();
@@ -235,7 +234,6 @@ impl<'a> RecallBuilder<'a> {
             include_text: self.include_text,
             request_id: request_id_bytes,
             txn_id: self.txn_id,
-            rerank: false,
         });
         let mut guard = self.client.acquire().await?;
         let stream_id = guard.next_stream_id();

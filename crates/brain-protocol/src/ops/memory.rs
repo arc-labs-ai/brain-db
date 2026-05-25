@@ -100,12 +100,6 @@ pub struct RecallRequest {
     /// When set, RECALL reads against a snapshot that includes the
     /// txn's pending writes (read-your-writes).
     pub txn_id: Option<WireUuid>,
-    /// Opt-in cross-encoder rerank over the RRF-fused candidates.
-    /// Defaults to `false` so existing clients see no behaviour
-    /// change. When set, the server runs `bge-reranker-base` over
-    /// the top fused candidates and re-sorts; if the model isn't
-    /// loaded the request still succeeds with RRF-only ordering.
-    pub rerank: bool,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -245,6 +239,13 @@ pub struct MemoryResult {
     /// Post-RRF fused rank score. `0.0` on no-schema deployments
     /// and inside transactions; positive when hybrid retrieval ran
     pub fused_score: f32,
+    /// Cross-encoder relevance score, present iff the rerank stage
+    /// actually scored this hit (cross-encoder loaded on the shard
+    /// AND the hit fell inside the rerank window with fetchable
+    /// text). `None` means the result is RRF-only ordered. When
+    /// `Some`, the result list was re-sorted by this score, not by
+    /// `fused_score`.
+    pub rerank_score: Option<f32>,
     // ── Memory provenance + decay signals (v1 expansion) ──
     /// Salience the row was first written with. Together with
     /// `salience` this shows how much decay has happened.

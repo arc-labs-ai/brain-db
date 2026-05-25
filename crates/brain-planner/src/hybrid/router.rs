@@ -66,11 +66,6 @@ pub struct QueryRequest {
     pub limit: u32,
     pub retrievers: RetrieverSelection,
     pub fusion_config: Option<FusionConfig>,
-    /// When `true`, after RRF fusion the executor runs a cross-
-    /// encoder rerank pass over the top fused candidates and
-    /// re-sorts. Gracefully skipped if no cross-encoder is
-    /// available — the unranked fused list is returned instead.
-    pub rerank: bool,
 }
 
 /// Inclusive-start / inclusive-end window. `None` bounds mean

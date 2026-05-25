@@ -158,7 +158,6 @@ fn text_anchor_request() -> PlannerQueryRequest {
         limit: 20,
         retrievers: RetrieverSelection::Auto,
         fusion_config: None,
-        rerank: false,
     }
 }
 
@@ -176,7 +175,6 @@ fn text_only_request() -> PlannerQueryRequest {
         limit: 20,
         retrievers: RetrieverSelection::Auto,
         fusion_config: None,
-        rerank: false,
     }
 }
 

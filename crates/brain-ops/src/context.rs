@@ -34,21 +34,26 @@ pub const DEFAULT_SUBSCRIBE_POLL_WINDOW: Duration = Duration::from_secs(5);
 /// Per-shard cross-encoder slot. Replaces an earlier
 /// `Option<Arc<CrossEncoder>>` whose `None` conflated "model failed to
 /// load" with "operator turned this off" — two different failure modes
-/// with two different client responses.
+/// the shard spawn path must keep distinct.
 ///
-/// The shard spawn path is now responsible for resolving which variant
-/// applies: an enabled-but-unloadable model is a spawn failure (an
-/// operator misconfiguration we refuse to mask), and an explicitly
-/// disabled model lands as `Disabled` so request-time clients get a
-/// structured `CapabilityNotEnabled` instead of silent RRF fallback.
+/// The shard spawn path resolves which variant applies: an
+/// enabled-but-unloadable model is a spawn failure (an operator
+/// misconfiguration we refuse to mask), and an explicitly disabled
+/// model lands as `Disabled`.
+///
+/// Rerank is first-class and always-on: when the slot is `Enabled`,
+/// every RECALL / QUERY reranks automatically. `Disabled` means the
+/// operator opted out of the load — recall succeeds with RRF-only
+/// ordering, never an error. There is no per-request toggle to
+/// conflict with the slot state.
 #[derive(Clone)]
 pub enum CrossEncoderSlot {
     /// Operator enabled rerank and the model loaded cleanly. The
     /// inner encoder is shared by every concurrent rerank call on
     /// this shard.
     Enabled(Arc<CrossEncoder>),
-    /// Operator set `rerank.enabled = false` in config. Requests that
-    /// opt into rerank return `CapabilityNotEnabled`.
+    /// Operator set `rerank.enabled = false` in config. Recall runs
+    /// RRF-only — no rerank stage, no error.
     Disabled,
 }
 
@@ -60,8 +65,8 @@ impl CrossEncoderSlot {
     }
 
     /// Borrow the underlying encoder. `None` when the slot is
-    /// `Disabled` — call sites that need a hard error must check
-    /// this and surface `CapabilityNotEnabled` to the client.
+    /// `Disabled` — the executor's always-on rerank stage skips and
+    /// returns RRF-only ordering.
     #[must_use]
     pub fn as_arc(&self) -> Option<&Arc<CrossEncoder>> {
         match self {

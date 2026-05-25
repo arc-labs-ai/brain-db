@@ -512,6 +512,7 @@ mod tests {
                     crate::shared::enums::RetrieverNameWire::Lexical,
                 ],
                 fused_score: 0.0164,
+                rerank_score: Some(2.31),
                 edges: Some(vec![EdgeView {
                     target: sample_memory_id(),
                     kind: EdgeKindWire::Caused,

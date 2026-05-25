@@ -218,7 +218,6 @@ pub async fn handle_recall_hybrid(
         limit: req.limit,
         retrievers: RetrieverSelection::Auto,
         fusion_config: None,
-        rerank: false,
     };
     let qp = plan(&planner_req).map_err(map_plan_error)?;
     let exec_ctx = build_executor_context(ctx)?;
@@ -278,7 +277,6 @@ fn wire_to_planner_request(
         limit: req.limit,
         retrievers,
         fusion_config,
-        rerank: false,
     })
 }
 
@@ -353,12 +351,10 @@ fn build_executor_context(ctx: &OpsContext) -> Result<HybridExecutorContext, OpE
         lexical: ctx.lexical_retriever.clone(),
         graph: ctx.graph_retriever.clone(),
         metadata: ctx.executor.metadata.clone(),
-        // The QUERY wire ops never opt into rerank in v1, so the
-        // executor receives `None` regardless of the slot's state.
-        // Hard-fail at request entry is RECALL's job (it carries the
-        // opt-in flag); we only thread the encoder when the slot is
-        // explicitly enabled so the executor sees the same invariant
-        // it does on the recall path.
+        // Rerank is always-on for QUERY just as for RECALL: the
+        // executor reranks whenever the cross-encoder is loaded. When
+        // the operator disabled the load this is `None` and the query
+        // returns RRF-only.
         cross_encoder: ctx.cross_encoder.as_arc().cloned(),
     })
 }
