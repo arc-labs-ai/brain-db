@@ -1814,17 +1814,17 @@ pub fn spawn_shard(
             // hits zero.
             let wal_cell_for_drain = wal_cell.clone();
             glommio::spawn_local(async move {
-                while let Ok((record, reply)) = wal_drain_rx.recv_async().await {
+                while let Ok(msg) = wal_drain_rx.recv_async().await {
                     let outcome = {
                         let guard = wal_cell_for_drain.borrow();
                         match guard.as_ref() {
-                            Some(wal) => wal.append(record).await.map_err(|e| {
+                            Some(wal) => wal.append_many(msg.records).await.map_err(|e| {
                                 brain_ops::writer::WalSinkError::Internal(format!("{e}"))
                             }),
                             None => Err(brain_ops::writer::WalSinkError::Disconnected),
                         }
                     };
-                    let _ = reply.send(outcome);
+                    let _ = msg.reply.send(outcome);
                 }
             })
             .detach();

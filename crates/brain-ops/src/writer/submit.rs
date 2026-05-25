@@ -259,7 +259,7 @@ impl RealWriterHandle {
     /// - [`WriterError::Conflict`] for idempotency mismatch — same
     ///   `WriteId`, different phases. (Not yet wired in P3; the cache
     ///   just returns the cached ack on hit.)
-    pub async fn submit(&self, write: Write) -> Result<WriteAck, WriterError> {
+    pub async fn submit(&self, write: Write) -> Result<Arc<WriteAck>, WriterError> {
         let start = Instant::now();
         let metrics = self.writer_metrics().clone();
 
@@ -270,7 +270,9 @@ impl RealWriterHandle {
         match cache.lookup_with_hash(self.metadata(), write.write_id, write.request_hash) {
             CacheLookup::Hit(cached) => {
                 metrics.record_idempotency(IdempotencyOutcome::Hit);
-                return Ok((*cached).clone());
+                // Hand the cached Arc straight back to the caller — no
+                // inner clone. Hot replays cost one Arc bump.
+                return Ok(cached);
             }
             CacheLookup::Conflict => {
                 metrics.record_idempotency(IdempotencyOutcome::Conflict);
@@ -307,8 +309,13 @@ impl RealWriterHandle {
         // idempotency stamp shares the wtxn so a crash between "phases
         // applied" and "idempotency stamped" is impossible — either
         // both commit or neither.
+        //
+        // We construct the durable `WriteAck` once — moving `acks` into
+        // it instead of cloning. The `pending_stages` list lands later
+        // (after the post-commit worker fan-out) and is patched onto the
+        // same struct just before we Arc-wrap and return.
         let committed_at = (cache.now_unix_nanos)();
-        let phase_acks: Vec<PhaseAck> = {
+        let mut durable_ack: WriteAck = {
             let mut db = self.metadata().lock();
             let wtxn = match db.write_txn() {
                 Ok(w) => w,
@@ -343,7 +350,7 @@ impl RealWriterHandle {
                 committed_at_unix_nanos: committed_at,
                 lsn_first: lsn_first.unwrap_or(Lsn(0)),
                 lsn_last: lsn_first.unwrap_or(Lsn(0)),
-                phase_acks: acks.clone(),
+                phase_acks: acks,
                 pending_stages: Vec::new(),
             };
             let idem_entry = idempotency_entry_for(&durable_ack, write.request_hash, committed_at);
@@ -365,7 +372,7 @@ impl RealWriterHandle {
                 record_phase_outcomes(&metrics, &write, SubmitOutcome::Err, start.elapsed());
                 return Err(WriterError::Internal(format!("commit: {e:?}")));
             }
-            acks
+            durable_ack
         };
 
         // 5. Publish events (one per phase that has a wire surface).
@@ -476,7 +483,7 @@ impl RealWriterHandle {
                 // just committed, so the matching ack from `apply` is
                 // the source of truth for what version the sweep
                 // should align against.
-                let ack_version = phase_acks.iter().find_map(|a| match a {
+                let ack_version = durable_ack.phase_acks.iter().find_map(|a| match a {
                     PhaseAck::UpsertedSchema {
                         namespace: ns,
                         version,
@@ -502,18 +509,14 @@ impl RealWriterHandle {
 
         // 6. Stamp the in-memory hot cache. The durable row already
         // landed inside the wtxn above; this just keeps the in-process
-        // replay path off redb for hot keys.
-        let ack = WriteAck {
-            write_id: write.write_id,
-            committed_at_unix_nanos: committed_at,
-            lsn_first: lsn_first.unwrap_or(Lsn(0)),
-            lsn_last: lsn_first.unwrap_or(Lsn(0)),
-            phase_acks,
-            pending_stages,
-        };
+        // replay path off redb for hot keys. We Arc-wrap once and hand
+        // the same Arc to both the cache and the caller — no inner
+        // clone.
+        durable_ack.pending_stages = pending_stages;
+        let ack = Arc::new(durable_ack);
         cache.stamp_hot(
             write.write_id,
-            Arc::new(ack.clone()),
+            ack.clone(),
             write.request_hash,
             committed_at,
         );
@@ -610,68 +613,62 @@ async fn wal_append_for_write(
         return Ok(None);
     }
 
-    if mapped.len() == 1 {
-        let record = WalRecord::from_typed(
+    // Build the full record batch up front (TxnBegin + payloads +
+    // TxnCommit for multi-phase, single payload for single-phase) and
+    // issue ONE `append_many`. Multi-phase writes previously cost
+    // 2 + N channel hops + 2 + N fsyncs; the batched path collapses
+    // to 1 channel hop + 1 fsync (group-commit folds the whole batch).
+    let records: Vec<WalRecord> = if mapped.len() == 1 {
+        vec![WalRecord::from_typed(
             Lsn(0),
             /* flags */ 0,
             started_at_unix_nanos,
             agent_id_lo64,
             &mapped[0],
-        );
-        let lsn = sink
-            .append(record)
-            .await
-            .map_err(|e| WriterError::Internal(format!("wal append: {e}")))?;
-        return Ok(Some(lsn));
-    }
+        )]
+    } else {
+        use brain_core::TxnId;
+        use brain_storage::wal::payload::{TxnBeginPayload, TxnCommitPayload};
 
-    use brain_core::TxnId;
-    use brain_storage::wal::payload::{TxnBeginPayload, TxnCommitPayload};
+        let txn_id = TxnId(write.write_id.as_uuid());
+        let begin = WalPayload::TxnBegin(TxnBeginPayload {
+            txn_id,
+            expected_record_count: mapped.len() as u32,
+        });
+        let commit = WalPayload::TxnCommit(TxnCommitPayload { txn_id });
 
-    let txn_id = TxnId(write.write_id.as_uuid());
-    let begin = WalPayload::TxnBegin(TxnBeginPayload {
-        txn_id,
-        expected_record_count: mapped.len() as u32,
-    });
-    let commit = WalPayload::TxnCommit(TxnCommitPayload { txn_id });
-
-    let begin_record = WalRecord::from_typed(
-        Lsn(0),
-        /* flags */ 0,
-        started_at_unix_nanos,
-        agent_id_lo64,
-        &begin,
-    );
-    let lsn_first = sink
-        .append(begin_record)
-        .await
-        .map_err(|e| WriterError::Internal(format!("wal append (txn begin): {e}")))?;
-
-    for payload in &mapped {
-        let record = WalRecord::from_typed(
+        let mut batch: Vec<WalRecord> = Vec::with_capacity(mapped.len() + 2);
+        batch.push(WalRecord::from_typed(
             Lsn(0),
-            /* flags */ 0,
+            0,
             started_at_unix_nanos,
             agent_id_lo64,
-            payload,
-        );
-        sink.append(record)
-            .await
-            .map_err(|e| WriterError::Internal(format!("wal append (phase): {e}")))?;
-    }
+            &begin,
+        ));
+        for payload in &mapped {
+            batch.push(WalRecord::from_typed(
+                Lsn(0),
+                0,
+                started_at_unix_nanos,
+                agent_id_lo64,
+                payload,
+            ));
+        }
+        batch.push(WalRecord::from_typed(
+            Lsn(0),
+            0,
+            started_at_unix_nanos,
+            agent_id_lo64,
+            &commit,
+        ));
+        batch
+    };
 
-    let commit_record = WalRecord::from_typed(
-        Lsn(0),
-        /* flags */ 0,
-        started_at_unix_nanos,
-        agent_id_lo64,
-        &commit,
-    );
-    sink.append(commit_record)
+    let lsns = sink
+        .append_many(records)
         .await
-        .map_err(|e| WriterError::Internal(format!("wal append (txn commit): {e}")))?;
-
-    Ok(Some(lsn_first))
+        .map_err(|e| WriterError::Internal(format!("wal append_many: {e}")))?;
+    Ok(lsns.first().copied())
 }
 
 /// P3d: HNSW writes per phase. Runs after WAL append and before the
@@ -1352,6 +1349,35 @@ mod tests {
                     Ok(lsn)
                 })
             }
+
+            fn append_many<'a>(
+                &'a self,
+                records: Vec<WalRecord>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                Vec<brain_storage::wal::record::Lsn>,
+                                crate::writer::wal_sink::WalSinkError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    let mut out = Vec::with_capacity(records.len());
+                    let mut lsn_guard = self.next_lsn.lock().unwrap();
+                    let mut sink = self.records.lock().unwrap();
+                    for mut record in records {
+                        let lsn = brain_storage::wal::record::Lsn(*lsn_guard);
+                        *lsn_guard += 1;
+                        record.lsn = lsn;
+                        sink.push(record);
+                        out.push(lsn);
+                    }
+                    Ok(out)
+                })
+            }
         }
 
         // The WAL sink type is referenced through brain_ops to keep
@@ -1502,6 +1528,106 @@ mod tests {
              got {} record(s)",
             sink.len(),
         );
+    }
+
+    /// An N-phase Write must cross the writer→WAL boundary in exactly
+    /// one `append_many` invocation. The pre-batched code path issued
+    /// `2 + N` separate `append` calls (TxnBegin, N records, TxnCommit)
+    /// — each one a channel hop, a oneshot allocation, and a wakeup. The
+    /// batched path collapses that to a single hop while still emitting
+    /// the same on-WAL framing.
+    #[tokio::test]
+    async fn multi_phase_write_issues_one_append_many_call() {
+        use crate::writer::wal_sink::RecordingWalSink;
+        use brain_storage::wal::kinds::WalRecordKind;
+
+        let (_dir, mut writer) = build_writer();
+        let sink = Arc::new(RecordingWalSink::new());
+        writer = writer.with_wal_sink(sink.clone());
+
+        let upsert = Phase::UpsertMemory {
+            id: MemoryId::pack(0, 1, 0),
+            text: "hello".into(),
+            vector: Box::new([0.0_f32; VECTOR_DIM]),
+            kind: MemoryKind::Episodic,
+            salience: brain_core::Salience::default(),
+            context: ContextId(0),
+            created_at_unix_nanos: 1_700_000_000_000,
+            arena_slot: 1,
+            embedding_model_fp: [0xAA; 16],
+            content_hash: None,
+            deduplicate: false,
+        };
+        let mk_link = |from_slot: u64, to_slot: u64| Phase::Link {
+            from: NodeRef::Memory(MemoryId::pack(0, from_slot, 0)),
+            to: NodeRef::Memory(MemoryId::pack(0, to_slot, 0)),
+            kind: EdgeKindRef::Builtin(EdgeKind::SimilarTo),
+            weight: 0.5,
+            origin: 0,
+            derived_by: 0,
+            disambiguator: zero_disambiguator(),
+            created_at_unix_nanos: 1_700_000_000_000,
+        };
+        let phases = vec![upsert, mk_link(1, 1), mk_link(1, 1), mk_link(1, 1)];
+        let write = Write::from_phases(WriteId::new(), AgentId::default(), phases);
+        let _ = writer.submit(write).await;
+
+        // One batched submission, zero single-record submissions.
+        assert_eq!(
+            sink.append_many_calls(),
+            1,
+            "expected one batched append_many call",
+        );
+        assert_eq!(
+            sink.append_calls(),
+            0,
+            "writer must not issue per-phase append calls",
+        );
+
+        // The on-WAL framing still matches what recovery expects:
+        // TxnBegin + 4 typed payloads + TxnCommit.
+        let kinds: Vec<WalRecordKind> = sink.appended().iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                WalRecordKind::TxnBegin,
+                WalRecordKind::Encode,
+                WalRecordKind::Link,
+                WalRecordKind::Link,
+                WalRecordKind::Link,
+                WalRecordKind::TxnCommit,
+            ],
+        );
+    }
+
+    /// A single-phase Write also takes the batched path (records.len()==1)
+    /// — verified by call counts.
+    #[tokio::test]
+    async fn single_phase_write_also_takes_append_many_path() {
+        use crate::writer::wal_sink::RecordingWalSink;
+
+        let (_dir, mut writer) = build_writer();
+        let sink = Arc::new(RecordingWalSink::new());
+        writer = writer.with_wal_sink(sink.clone());
+
+        let phase = Phase::Link {
+            from: NodeRef::Memory(MemoryId::pack(0, 1, 0)),
+            to: NodeRef::Memory(MemoryId::pack(0, 2, 0)),
+            kind: EdgeKindRef::Builtin(EdgeKind::SimilarTo),
+            weight: 0.5,
+            origin: 0,
+            derived_by: 0,
+            disambiguator: zero_disambiguator(),
+            created_at_unix_nanos: 0,
+        };
+        let write = Write::single(WriteId::new(), AgentId::default(), phase);
+        let _ = writer.submit(write).await;
+
+        assert_eq!(sink.append_many_calls(), 1);
+        assert_eq!(sink.append_calls(), 0);
+        // Single-phase: no TxnBegin/TxnCommit envelope, just the
+        // typed payload itself.
+        assert_eq!(sink.len(), 1);
     }
 
     // ---------------------------------------------------------------

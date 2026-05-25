@@ -21,7 +21,7 @@ use crate::txn::{BufferedEdgeSpec, BufferedEncode, BufferedReplay};
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
 pub async fn handle_encode(
-    req: EncodeRequest,
+    mut req: EncodeRequest,
     ctx: &OpsContext,
 ) -> Result<EncodeResponse, OpError> {
     if let Some(txn_id) = req.txn_id {
@@ -109,10 +109,15 @@ pub async fn handle_encode(
         .count() as u32;
 
     // 6. Build the multi-phase Write: UpsertMemory + N × Link.
+    // `req.text` is no longer read after this point (the embedding ran
+    // off `&req.text` above and `req.text` doesn't surface in the
+    // response). Move the string into the phase instead of cloning it
+    // — clients can ship multi-KB memories and that clone showed up in
+    // hot-path allocator traces.
     let mut phases: Vec<Phase> = Vec::with_capacity(1 + req.edges.len());
     phases.push(Phase::UpsertMemory {
         id: memory_id,
-        text: req.text.clone(),
+        text: std::mem::take(&mut req.text),
         vector: Box::new(vector),
         kind,
         salience: Salience::new(salience),

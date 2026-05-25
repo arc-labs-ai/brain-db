@@ -35,6 +35,22 @@ pub trait WalSink: Send + Sync {
         record: WalRecord,
     ) -> Pin<Box<dyn Future<Output = Result<Lsn, WalSinkError>> + Send + 'a>>;
 
+    /// Append a batch of records as a single logical submission. Returns
+    /// the assigned LSNs in input order.
+    ///
+    /// The contract is: the entire batch crosses the writer/drain
+    /// boundary in **one** channel hop, and the underlying WAL writes
+    /// them back-to-back so the group-commit task can fold them into a
+    /// single `fdatasync`. The bounded-channel backpressure semantics of
+    /// the production sink still apply — a full channel awaits a slot
+    /// before the batch is enqueued.
+    ///
+    /// Empty input is a no-op that returns `Ok(vec![])`.
+    fn append_many<'a>(
+        &'a self,
+        records: Vec<WalRecord>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Lsn>, WalSinkError>> + Send + 'a>>;
+
     /// LSN the next `append` will assign. Subscribe uses this as the
     /// cutover point. Default delegates to a monotonic counter on the
     /// sink itself; the real channel-backed impl asks the WAL.
@@ -90,6 +106,15 @@ impl WalSink for NoopWalSink {
         Box::pin(async move { Ok(Lsn(lsn)) })
     }
 
+    fn append_many<'a>(
+        &'a self,
+        records: Vec<WalRecord>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Lsn>, WalSinkError>> + Send + 'a>> {
+        let n = records.len() as u64;
+        let first = self.next_lsn.fetch_add(n, Ordering::Relaxed);
+        Box::pin(async move { Ok((0..n).map(|i| Lsn(first + i)).collect()) })
+    }
+
     fn current_tail_lsn(&self) -> u64 {
         self.next_lsn.load(Ordering::Relaxed)
     }
@@ -102,10 +127,17 @@ impl WalSink for NoopWalSink {
 /// Wraps a `NoopWalSink` and captures every appended record so tests
 /// can assert what was written, in which order. The captured records
 /// have their assigned LSN stamped in.
+///
+/// `append_calls` and `append_many_calls` count the number of
+/// invocations (not the number of records) — useful for asserting the
+/// batched code path issues exactly one `append_many` instead of N
+/// single appends.
 #[derive(Debug, Default)]
 pub struct RecordingWalSink {
     inner: NoopWalSink,
     appended: Mutex<Vec<WalRecord>>,
+    append_calls: AtomicU64,
+    append_many_calls: AtomicU64,
 }
 
 impl RecordingWalSink {
@@ -114,6 +146,8 @@ impl RecordingWalSink {
         Self {
             inner: NoopWalSink::new(),
             appended: Mutex::new(Vec::new()),
+            append_calls: AtomicU64::new(0),
+            append_many_calls: AtomicU64::new(0),
         }
     }
 
@@ -130,6 +164,16 @@ impl RecordingWalSink {
     pub fn is_empty(&self) -> bool {
         self.appended.lock().is_empty()
     }
+
+    /// Number of `append` (single-record) invocations recorded.
+    pub fn append_calls(&self) -> u64 {
+        self.append_calls.load(Ordering::Relaxed)
+    }
+
+    /// Number of `append_many` (batched) invocations recorded.
+    pub fn append_many_calls(&self) -> u64 {
+        self.append_many_calls.load(Ordering::Relaxed)
+    }
 }
 
 impl WalSink for RecordingWalSink {
@@ -137,11 +181,28 @@ impl WalSink for RecordingWalSink {
         &'a self,
         mut record: WalRecord,
     ) -> Pin<Box<dyn Future<Output = Result<Lsn, WalSinkError>> + Send + 'a>> {
+        self.append_calls.fetch_add(1, Ordering::Relaxed);
         Box::pin(async move {
             let lsn = self.inner.append(record.clone()).await?;
             record.lsn = lsn;
             self.appended.lock().push(record);
             Ok(lsn)
+        })
+    }
+
+    fn append_many<'a>(
+        &'a self,
+        records: Vec<WalRecord>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Lsn>, WalSinkError>> + Send + 'a>> {
+        self.append_many_calls.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let lsns = self.inner.append_many(records.clone()).await?;
+            let mut stamped = records;
+            for (r, lsn) in stamped.iter_mut().zip(lsns.iter()) {
+                r.lsn = *lsn;
+            }
+            self.appended.lock().extend(stamped);
+            Ok(lsns)
         })
     }
 
@@ -178,6 +239,14 @@ impl WalSink for FailingWalSink {
         let reason = self.reason.clone();
         Box::pin(async move { Err(WalSinkError::Internal(reason)) })
     }
+
+    fn append_many<'a>(
+        &'a self,
+        _records: Vec<WalRecord>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Lsn>, WalSinkError>> + Send + 'a>> {
+        let reason = self.reason.clone();
+        Box::pin(async move { Err(WalSinkError::Internal(reason)) })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -185,9 +254,16 @@ impl WalSink for FailingWalSink {
 // channel to a drain task that owns the real `Wal`.
 // ---------------------------------------------------------------------------
 
-/// One in-flight append: the record to write + a one-shot channel for
-/// the reply.
-pub type WalAppendMessage = (WalRecord, flume::Sender<Result<Lsn, WalSinkError>>);
+/// One in-flight append batch. Carries one or more records plus a
+/// one-shot channel that receives all assigned LSNs in input order.
+///
+/// Single-record `append` calls use a `Vec` of length 1 — the drain
+/// task doesn't special-case batch size, and the storage layer's
+/// `append_many` handles both shapes uniformly.
+pub struct WalAppendMessage {
+    pub records: Vec<WalRecord>,
+    pub reply: flume::Sender<Result<Vec<Lsn>, WalSinkError>>,
+}
 
 /// Send-side handle the writer holds. The receiving end of the same
 /// channel is drained by a Glommio-local task on the shard executor;
@@ -243,15 +319,54 @@ impl WalSink for ChannelWalSink {
             // in memory. Under sustained overload the caller's encode
             // request becomes flow-controlled by the WAL — which is
             // exactly the semantics we want.
-            tx.send_async((record, reply_tx))
-                .await
-                .map_err(|_| WalSinkError::Disconnected)?;
-            let lsn = reply_rx
+            tx.send_async(WalAppendMessage {
+                records: vec![record],
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| WalSinkError::Disconnected)?;
+            let lsns = reply_rx
                 .recv_async()
                 .await
                 .map_err(|_| WalSinkError::Disconnected)??;
+            let lsn = *lsns
+                .first()
+                .ok_or_else(|| WalSinkError::Internal("drain returned empty LSN vec".into()))?;
             self.bump_cached_tail(lsn.raw().saturating_add(1));
             Ok(lsn)
+        })
+    }
+
+    fn append_many<'a>(
+        &'a self,
+        records: Vec<WalRecord>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Lsn>, WalSinkError>> + Send + 'a>> {
+        let tx = self.tx.clone();
+        Box::pin(async move {
+            if records.is_empty() {
+                return Ok(Vec::new());
+            }
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            // One channel hop carries the entire batch. The drain task
+            // receives a single `WalAppendMessage` and forwards it to
+            // `Wal::append_many`, which submits every record to the
+            // group-commit task within one executor turn. Result: one
+            // channel hop + one fdatasync per multi-phase Write,
+            // independent of phase count.
+            tx.send_async(WalAppendMessage {
+                records,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| WalSinkError::Disconnected)?;
+            let lsns = reply_rx
+                .recv_async()
+                .await
+                .map_err(|_| WalSinkError::Disconnected)??;
+            if let Some(last) = lsns.last() {
+                self.bump_cached_tail(last.raw().saturating_add(1));
+            }
+            Ok(lsns)
         })
     }
 
@@ -388,10 +503,73 @@ mod tests {
 
         // Drain both: pop two messages, reply with synthetic LSNs.
         for expected in 1..=2u64 {
-            let (_record, reply) = rx.recv_async().await.unwrap();
-            reply.send(Ok(Lsn(expected))).unwrap();
+            let msg = rx.recv_async().await.unwrap();
+            msg.reply.send(Ok(vec![Lsn(expected)])).unwrap();
         }
         assert_eq!(first.await.unwrap().unwrap(), 1);
         assert_eq!(second.await.unwrap().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn noop_sink_append_many_assigns_contiguous_lsns() {
+        let sink = NoopWalSink::new();
+        let lsns = sink
+            .append_many(vec![sample_record(), sample_record(), sample_record()])
+            .await
+            .unwrap();
+        assert_eq!(
+            lsns.iter().map(|l| l.raw()).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(sink.current_tail_lsn(), 4);
+    }
+
+    #[tokio::test]
+    async fn noop_sink_append_many_empty_is_noop() {
+        let sink = NoopWalSink::new();
+        let lsns = sink.append_many(Vec::new()).await.unwrap();
+        assert!(lsns.is_empty());
+        assert_eq!(sink.current_tail_lsn(), 1);
+    }
+
+    #[tokio::test]
+    async fn recording_sink_counts_append_vs_append_many_calls() {
+        let sink = RecordingWalSink::new();
+        sink.append(sample_record()).await.unwrap();
+        sink.append_many(vec![sample_record(), sample_record()])
+            .await
+            .unwrap();
+        assert_eq!(sink.append_calls(), 1);
+        assert_eq!(sink.append_many_calls(), 1);
+        // All three records show up in `appended()`, in order.
+        let recs = sink.appended();
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[0].lsn.raw(), 1);
+        assert_eq!(recs[1].lsn.raw(), 2);
+        assert_eq!(recs[2].lsn.raw(), 3);
+    }
+
+    #[tokio::test]
+    async fn channel_sink_append_many_round_trips_in_one_hop() {
+        let (sink, rx) = channel_wal_sink();
+        let drain = tokio::spawn(async move {
+            // Single recv: even though there are 3 records, they cross
+            // the channel as one message.
+            let msg = rx.recv_async().await.unwrap();
+            assert_eq!(msg.records.len(), 3);
+            let lsns = (1..=3u64).map(Lsn).collect();
+            msg.reply.send(Ok(lsns)).unwrap();
+            // Confirm nothing more arrives.
+            assert!(rx.try_recv().is_err());
+        });
+        let lsns = sink
+            .append_many(vec![sample_record(), sample_record(), sample_record()])
+            .await
+            .unwrap();
+        assert_eq!(
+            lsns.iter().map(|l| l.raw()).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        drain.await.unwrap();
     }
 }

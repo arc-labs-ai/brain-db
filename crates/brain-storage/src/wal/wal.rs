@@ -28,7 +28,7 @@ use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::wal::group_commit::{CommitError, GroupCommitConfig, GroupCommitter};
+use crate::wal::group_commit::{AppendHandle, CommitError, GroupCommitConfig, GroupCommitter};
 use crate::wal::reader::{WalReadError, WalReader};
 use crate::wal::record::{Lsn, WalRecord};
 use crate::wal::segment::{WalSegment, WalSegmentError, WAL_SEGMENT_HEADER_LEN};
@@ -330,6 +330,110 @@ impl Wal {
             inner.next_lsn = lsn + 1;
         }
         Ok(Lsn(lsn))
+    }
+
+    /// Append a batch of records under one logical "submit". All records
+    /// hit the committer back-to-back without an `.await` between
+    /// submissions, so the group-commit task accumulates the entire batch
+    /// into a single `fdatasync`. Returns the assigned LSNs in input
+    /// order.
+    ///
+    /// Empty input is a no-op that returns `Ok(vec![])`.
+    ///
+    /// Rollovers mid-batch are handled: when the next record would exceed
+    /// the active segment, the in-flight handles are drained durably
+    /// against the *current* segment first, then rollover proceeds, then
+    /// the remaining records target the new segment. A batch that
+    /// straddles a rollover therefore costs one extra fsync (the
+    /// drain-before-rollover one) — still strictly better than the
+    /// per-record path.
+    pub async fn append_many(&self, records: Vec<WalRecord>) -> Result<Vec<Lsn>, WalError> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut assigned: Vec<Lsn> = Vec::with_capacity(records.len());
+        let mut handles: Vec<AppendHandle> = Vec::with_capacity(records.len());
+
+        let mut iter = records.into_iter();
+        let mut pending: Option<WalRecord> = None;
+        while let Some(mut record) = pending.take().or_else(|| iter.next()) {
+            let record_bytes = record.encoded_len();
+
+            // Phase A: short borrow — validate size, decide rollover, assign LSN.
+            enum Action {
+                Append { lsn: u64 },
+                Rollover,
+            }
+            let action = {
+                let inner = self.inner.borrow();
+                let segment_capacity_bytes = inner
+                    .config
+                    .max_segment_bytes
+                    .saturating_sub(WAL_SEGMENT_HEADER_LEN);
+                if record_bytes > segment_capacity_bytes {
+                    return Err(WalError::RecordExceedsSegmentLimit {
+                        record_bytes,
+                        segment_max: inner.config.max_segment_bytes,
+                    });
+                }
+                let lsn = inner.next_lsn;
+                let projected =
+                    WAL_SEGMENT_HEADER_LEN + inner.bytes_in_active_segment + record_bytes;
+                if projected > inner.config.max_segment_bytes {
+                    Action::Rollover
+                } else {
+                    Action::Append { lsn }
+                }
+            };
+
+            match action {
+                Action::Rollover => {
+                    // Make sure everything we already submitted lands on
+                    // the old segment durably before we tear it down.
+                    for h in handles.drain(..) {
+                        let durable_lsn = h.wait().await?;
+                        let _ = durable_lsn;
+                    }
+                    self.rollover().await?;
+                    pending = Some(record);
+                    continue;
+                }
+                Action::Append { lsn } => {
+                    record.lsn = Lsn(lsn);
+                    // Single borrow_mut: enqueue + bump counters. The
+                    // committer's `append` is synchronous (flume push),
+                    // so the borrow window doesn't span an await.
+                    // Bumping `next_lsn` early (before durability) is
+                    // safe because a flush failure makes the WAL "broken"
+                    // and all subsequent appends error — no LSN reuse
+                    // window opens.
+                    let handle = {
+                        let mut inner = self.inner.borrow_mut();
+                        let committer = inner
+                            .committer
+                            .as_ref()
+                            .expect("committer present between rollovers");
+                        let h = committer.append(record.clone())?;
+                        inner.bytes_in_active_segment += record_bytes;
+                        inner.next_lsn = lsn + 1;
+                        h
+                    };
+                    handles.push(handle);
+                    assigned.push(Lsn(lsn));
+                }
+            }
+        }
+
+        // Await durability for the whole batch. GroupCommitter coalesces
+        // the entire vector into one fsync as long as the records reach
+        // the committer task within the commit_window.
+        for h in handles {
+            let durable_lsn = h.wait().await?;
+            let _ = durable_lsn;
+        }
+
+        Ok(assigned)
     }
 
     async fn rollover(&self) -> Result<(), WalError> {
