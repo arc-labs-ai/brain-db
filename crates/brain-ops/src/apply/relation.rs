@@ -5,7 +5,9 @@
 
 use brain_core::Relation;
 use brain_metadata::relation::ops::{relation_create, relation_supersede, relation_tombstone};
-use redb::WriteTransaction;
+use brain_metadata::relation::types::relation_type_intern_or_get;
+use brain_metadata::tables::relation_type::{RelationTypeDefinition, RELATION_TYPES_TABLE};
+use redb::{ReadableTable, WriteTransaction};
 
 use super::ApplyError;
 use crate::write::{
@@ -30,20 +32,56 @@ pub fn apply_upsert_relation(
         properties_blob,
         valid_from_unix_nanos,
         valid_to_unix_nanos,
+        relation_type_intern_hint,
     } = phase
     else {
         return Err(ApplyError::PhaseMisShape("expected UpsertRelation"));
     };
+
+    // Schemaless path: intern the relation_type inside this wtxn so the
+    // schemaless RELATION_CREATE costs one fsync instead of two.
+    // `relation_type_intern_or_get` is idempotent — concurrent writers
+    // converge on the same id without conflict.
+    //
+    // `is_symmetric` is encoded into the relation row itself; the
+    // handler reads it from the resolved row before submit when the
+    // hint is `None` (strict mode). For the hint path we have to look
+    // up the row's is_symmetric here because intern may have allocated
+    // a fresh row with the (open-vocab) default — see the lookup
+    // immediately below.
+    let resolved_ty = match relation_type_intern_hint {
+        None => *ty,
+        Some((namespace, name)) => {
+            relation_type_intern_or_get(
+                wtxn,
+                namespace,
+                name,
+                /* first_seen_lsn */ 0,
+                *extracted_at_unix_nanos,
+            )
+            .map_err(|e| ApplyError::Metadata(format!("relation_type_intern_or_get: {e}")))?
+        }
+    };
+    // For the schemaless hint path, the canonical `is_symmetric` lives
+    // on the (possibly just-allocated) relation_type row. Re-read it so
+    // a concurrent SCHEMA_UPLOAD that already adopted the qname with a
+    // declared symmetry wins over the handler's open-vocab default.
+    let effective_is_symmetric = if relation_type_intern_hint.is_some() {
+        lookup_is_symmetric_in_wtxn(wtxn, resolved_ty)?
+    } else {
+        *is_symmetric
+    };
+
     let mut r = Relation::new_root(
         *id,
-        *ty,
+        resolved_ty,
         *from,
         *to,
         *confidence,
         evidence_memories.clone(),
         *extractor,
         *extracted_at_unix_nanos,
-        *is_symmetric,
+        effective_is_symmetric,
     );
     r.properties_blob = properties_blob.clone();
     r.valid_from_unix_nanos = *valid_from_unix_nanos;
@@ -51,6 +89,25 @@ pub fn apply_upsert_relation(
     relation_create(wtxn, &r, *extracted_at_unix_nanos)
         .map_err(|e| ApplyError::Metadata(format!("relation_create: {e}")))?;
     Ok(PhaseAck::UpsertedRelation(*id, 1))
+}
+
+/// Read `is_symmetric` for a `RelationTypeId` inside a write txn.
+/// Used when the schemaless intern path didn't have a pre-resolved
+/// relation_type row.
+fn lookup_is_symmetric_in_wtxn(
+    wtxn: &WriteTransaction,
+    ty: brain_core::RelationTypeId,
+) -> Result<bool, ApplyError> {
+    let t = wtxn
+        .open_table(RELATION_TYPES_TABLE)
+        .map_err(|e| ApplyError::Storage(format!("open relation_types: {e}")))?;
+    let row = t
+        .get(&ty.raw())
+        .map_err(|e| ApplyError::Storage(format!("relation_types lookup: {e}")))?;
+    let row: RelationTypeDefinition = row
+        .ok_or_else(|| ApplyError::Invariant(format!("relation_type {ty:?} missing after intern")))?
+        .value();
+    Ok(row.to_relation_type().is_symmetric)
 }
 
 pub fn apply_supersede_relation(

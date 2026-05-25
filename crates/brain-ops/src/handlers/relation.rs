@@ -34,6 +34,7 @@ use brain_metadata::relation::types::{
 };
 use brain_metadata::schema::store::schema_active;
 use brain_planner::WriterError;
+use brain_protocol::envelope::response::EventType;
 use brain_protocol::{
     KnowledgeEventPayload, RelationCreateRequest, RelationCreateResponse, RelationCreatedEvent,
     RelationGetRequest, RelationGetResponse, RelationListFromRequest,
@@ -43,7 +44,6 @@ use brain_protocol::{
     RelationTraverseRequest, RelationTraverseResponseFrame, RelationView, TraversalPathWire,
     TraversalStepWire,
 };
-use brain_protocol::envelope::response::EventType;
 use redb::ReadableTable;
 
 use crate::context::OpsContext;
@@ -77,58 +77,65 @@ pub async fn handle_relation_create(
     let now = crate::txn::now_unix_nanos_pub();
     let (namespace, name) = split_qname(&req.relation_type)?;
 
-    // Resolve the relation-type qname (strict vs schemaless dispatch)
-    // and intern-on-demand for the schemaless case BEFORE submit, so
-    // the `RelationTypeNotInSchema` and intern errors keep their
-    // structured wire shape. The lookup runs in a short-lived wtxn that
-    // commits the intern; the create itself then submits via the
-    // unified writer.
+    // Resolve the relation-type qname (strict vs schemaless dispatch).
+    //
+    // Strict mode (active schema in namespace): look up the declared
+    // relation_type via rtxn — same shape as the pre-fold path, the
+    // wire error (`RelationTypeNotInSchema`) keeps its structured
+    // surface for clients.
+    //
+    // Schemaless mode (no active schema): if the qname is already
+    // interned (a prior write registered it), reuse its row; otherwise
+    // pass an intern hint on the Phase and let apply do the work
+    // inside the main submit wtxn. The pre-refactor code ran a
+    // separate intern wtxn here, paying an extra fsync per schemaless
+    // RELATION_CREATE — folding it into apply halves the cost.
     //
     // The unified apply path calls `relation_create` which preserves
     // the single-conflict cardinality auto-supersede short-circuit:
     // when exactly one existing current relation conflicts on the
     // cardinality axis, the helper internally supersedes it with the
-    // pre-minted id rather than erroring. The wire response shape
-    // (just `relation_id`) doesn't distinguish fresh-create from
-    // auto-supersede — both return the pre-minted id — so no extra
-    // ack projection is needed.
-    let rt = {
-        let mut db_guard = ctx.executor.metadata.lock();
-        let wtxn = db_guard
-            .write_txn()
-            .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
-        let active_version = schema_active_in_wtxn_rel(&wtxn, namespace)?;
-        let rt = if let Some(version) = active_version {
-            let rt =
-                relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?.ok_or_else(|| {
-                    OpError::RelationTypeNotInSchema {
-                        type_name: req.relation_type.clone(),
-                        namespace: namespace.to_string(),
-                        version,
-                    }
+    // pre-minted id rather than erroring.
+    let (resolved_ty, resolved_is_symmetric, intern_hint) = {
+        let db_guard = ctx.executor.metadata.lock();
+        let rtxn = db_guard
+            .read_txn()
+            .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
+        let active_version = schema_active(&rtxn, namespace)
+            .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
+        if let Some(version) = active_version {
+            let rt = relation_type_lookup_by_qname(&rtxn, namespace, name)
+                .map_err(map_relation_type_op_error)?
+                .ok_or_else(|| OpError::RelationTypeNotInSchema {
+                    type_name: req.relation_type.clone(),
+                    namespace: namespace.to_string(),
+                    version,
                 })?;
-            if !rt_active_for_schema_wtxn(&wtxn, namespace, version)?.contains(&rt.id) {
+            if !rt_active_for_schema_rtxn(&rtxn, namespace, version)?.contains(&rt.id) {
                 return Err(OpError::RelationTypeNotInSchema {
                     type_name: req.relation_type.clone(),
                     namespace: namespace.to_string(),
                     version,
                 });
             }
-            rt
+            (rt.id, rt.is_symmetric, None)
         } else {
-            match relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)? {
-                Some(rt) => rt,
-                None => {
-                    let _ = relation_type_intern_or_get(&wtxn, namespace, name, 0, now)
-                        .map_err(map_relation_type_op_error)?;
-                    relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?
-                        .expect("just-interned relation type vanished")
-                }
+            match relation_type_lookup_by_qname(&rtxn, namespace, name)
+                .map_err(map_relation_type_op_error)?
+            {
+                Some(rt) => (rt.id, rt.is_symmetric, None),
+                None => (
+                    // Sentinel id; apply replaces it via
+                    // `relation_type_intern_or_get`.
+                    RelationTypeId::from(0u32),
+                    // Open-vocab default for is_symmetric. Apply re-reads
+                    // the row after intern to pick up any concurrent
+                    // SCHEMA_UPLOAD's declared symmetry.
+                    false,
+                    Some((namespace.to_string(), name.to_string())),
+                ),
             }
-        };
-        wtxn.commit()
-            .map_err(|e| OpError::Internal(format!("commit: {e}")))?;
-        rt
+        }
     };
 
     // Mint id pre-submit (mirrors encode.rs MemoryId pre-allocation).
@@ -155,17 +162,18 @@ pub async fn handle_relation_create(
     let request_hash = hash_relation_create_request(&req);
     let phase = Phase::UpsertRelation {
         id: new_id,
-        ty: rt.id,
+        ty: resolved_ty,
         from: EntityId::from(req.from_entity),
         to: EntityId::from(req.to_entity),
         confidence: req.confidence,
         evidence_memories,
-        is_symmetric: rt.is_symmetric,
+        is_symmetric: resolved_is_symmetric,
         extractor: brain_core::ExtractorId::from(req.extractor_id),
         extracted_at_unix_nanos: extracted_at,
         properties_blob: req.properties_blob.clone(),
         valid_from_unix_nanos: valid_from_phase,
         valid_to_unix_nanos: valid_to_phase,
+        relation_type_intern_hint: intern_hint,
     };
     let write =
         Write::single(write_id, ctx.executor.caller_agent, phase).with_request_hash(request_hash);
@@ -187,7 +195,9 @@ pub async fn handle_relation_create(
         EventType::RelationCreated,
         KnowledgeEventPayload::RelationCreated(RelationCreatedEvent {
             relation_id: stored_id.to_bytes(),
-            relation_type: rt.canonical(),
+            // The wire request's `relation_type` is already the
+            // canonical "namespace:name" form (validated above).
+            relation_type: req.relation_type.clone(),
             from: req.from_entity,
             to: req.to_entity,
         }),
@@ -822,6 +832,42 @@ fn rt_active_for_schema_wtxn(
     let t = wtxn
         .open_table(RELATION_TYPES_TABLE)
         .map_err(|e| OpError::Internal(format!("open relation_types: {e}")))?;
+    let mut out = std::collections::HashSet::new();
+    for entry in t
+        .iter()
+        .map_err(|e| OpError::Internal(format!("relation_types iter: {e}")))?
+    {
+        let (k, v) = entry.map_err(|e| OpError::Internal(format!("relation_types entry: {e}")))?;
+        let row: RelationTypeDefinition = v.value();
+        if row.namespace != namespace {
+            continue;
+        }
+        if let RelationTypeOrigin::SchemaDeclared { version: v_decl } = row.origin() {
+            if v_decl == version {
+                out.insert(RelationTypeId::from(k.value()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// rtxn variant of `rt_active_for_schema_wtxn`. The fold of the
+/// intern micro-wtxn moved relation-type vocabulary resolution off
+/// the write-txn path; the strict-mode check still needs the active
+/// set, just now via a read txn.
+fn rt_active_for_schema_rtxn(
+    rtxn: &redb::ReadTransaction,
+    namespace: &str,
+    version: u32,
+) -> Result<std::collections::HashSet<RelationTypeId>, OpError> {
+    use brain_metadata::tables::relation_type::{
+        RelationTypeDefinition, RelationTypeOrigin, RELATION_TYPES_TABLE,
+    };
+    let t = match rtxn.open_table(RELATION_TYPES_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(std::collections::HashSet::new()),
+        Err(e) => return Err(OpError::Internal(format!("open relation_types: {e}"))),
+    };
     let mut out = std::collections::HashSet::new();
     for entry in t
         .iter()

@@ -15,12 +15,12 @@
 //!   no LLM, no network. Strategies (the things that compute derived
 //!   phases) do that ahead of submit; apply functions only mutate redb.
 
+use brain_core::{ContextId, EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience};
 use brain_core::{
     Entity, EntityAttributes, EntityId, EntityTypeId, EvidenceEntry, EvidenceOverflowId,
     ExtractorId, MergeId, PredicateId, Relation, RelationId, RelationTypeId, Statement,
     StatementId, StatementKind, StatementObject, SubjectRef,
 };
-use brain_core::{ContextId, EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience};
 use brain_embed::VECTOR_DIM;
 
 // ---------------------------------------------------------------------------
@@ -85,6 +85,13 @@ pub enum Phase {
     /// Create a fresh statement row. Supersession of an existing
     /// statement uses [`Phase::Supersede`] + this phase together (the
     /// `Write` lists both, in order: supersede first, then upsert new).
+    ///
+    /// `predicate` is authoritative when `predicate_intern_hint` is
+    /// `None`. When the hint is `Some`, the handler is in the schemaless
+    /// path and didn't pre-intern the predicate; apply runs
+    /// `predicate_intern_or_get` inside the same wtxn (folding what used
+    /// to be a separate fsync-amplifying micro-commit). The hint also
+    /// triggers stamping `IMPLICIT_PREDICATE` on the resulting row.
     UpsertStatement {
         id: StatementId,
         kind: StatementKind,
@@ -97,9 +104,20 @@ pub enum Phase {
         extractor: ExtractorId,
         extracted_at_unix_nanos: u64,
         schema_version: u32,
+        /// Schemaless-path intern hint. `Some((namespace, name))` means
+        /// "apply: resolve the predicate inside this wtxn and stamp the
+        /// row IMPLICIT_PREDICATE." `None` is the strict / already-
+        /// interned path — apply uses `predicate` as-is.
+        predicate_intern_hint: Option<(String, String)>,
     },
 
     /// Create or supersede a typed relation row.
+    ///
+    /// `ty` is authoritative when `relation_type_intern_hint` is `None`.
+    /// When the hint is `Some`, the handler is in the schemaless path
+    /// and didn't pre-intern the relation type; apply runs
+    /// `relation_type_intern_or_get` inside the same wtxn (folding what
+    /// used to be a separate fsync-amplifying micro-commit).
     UpsertRelation {
         id: RelationId,
         ty: RelationTypeId,
@@ -118,6 +136,11 @@ pub enum Phase {
         valid_from_unix_nanos: Option<u64>,
         /// Validity window end (exclusive). `None` = open-ended.
         valid_to_unix_nanos: Option<u64>,
+        /// Schemaless-path intern hint. `Some((namespace, name))` means
+        /// "apply: resolve the relation_type inside this wtxn." `None`
+        /// is the strict / already-interned path — apply uses `ty`
+        /// as-is.
+        relation_type_intern_hint: Option<(String, String)>,
     },
 
     /// Apply a schema upload — interns predicates / relation-types /

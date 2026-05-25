@@ -3,11 +3,10 @@
 //! (phase 17.7).
 //!
 //! Write handlers go through the unified writer's `submit(Write)` path:
-//! pre-submit reads validate inputs and resolve predicate qnames against
-//! the active schema (rtxn-only); a brief micro-wtxn handles predicate
-//! interning in schemaless mode; the main mutation lands as a `Phase`
-//! through `submit`; a post-submit micro-wtxn stamps the implicit-
-//! predicate flag when needed; finally a post-submit rtxn recovers
+//! pre-submit reads validate inputs against the active schema (rtxn-
+//! only); for schemaless writes the predicate intern is carried on the
+//! `Phase::UpsertStatement.predicate_intern_hint` and runs inside the
+//! main submit wtxn (no separate fsync); a post-submit rtxn recovers
 //! the wire-shape fields (chain_root, version) that the `WriteAck`
 //! doesn't surface.
 //!
@@ -21,8 +20,8 @@
 //! Phase 17.7 handlers do **not** touch the statement HNSW (17.5);
 //! the embedding worker that populates it lives in phase 21.
 
-use brain_core::{EvidenceEntry, Statement, TombstoneReason};
 use brain_core::{EntityId, PredicateId, RequestId, StatementId, StatementKind};
+use brain_core::{EvidenceEntry, Statement, TombstoneReason};
 use brain_metadata::schema::predicate::{
     predicate_get, predicate_intern_or_get, predicate_lookup_by_qname,
     predicates_active_for_schema, PredicateOpError,
@@ -32,8 +31,8 @@ use brain_metadata::statement::{
     evidence_overflow_load, statement_get, statement_history, statement_list, StatementListFilter,
     StatementOpError,
 };
-use brain_metadata::tables::statement::{statement_flags, StatementMetadata, STATEMENTS_TABLE};
 use brain_planner::WriterError;
+use brain_protocol::envelope::response::EventType;
 use brain_protocol::{
     statement_kind_from_wire, KnowledgeEventPayload, StatementCreateRequest,
     StatementCreateResponse, StatementCreatedEvent, StatementGetRequest, StatementGetResponse,
@@ -42,8 +41,6 @@ use brain_protocol::{
     StatementSupersedeRequest, StatementSupersedeResponse, StatementSupersededEvent,
     StatementTombstoneRequest, StatementTombstoneResponse, StatementTombstonedEvent, StatementView,
 };
-use brain_protocol::envelope::response::EventType;
-use redb::ReadableTable;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
@@ -81,12 +78,18 @@ pub async fn handle_statement_create(
     let now = crate::txn::now_unix_nanos_pub();
     let (namespace, name) = split_qname(&req.predicate)?;
 
-    // Phase A — pre-submit validation in rtxn. Schema vocabulary check
-    // and existing-predicate lookup. We do NOT pre-read the prior
-    // current Preference here: that lookup is repeated each call and
-    // would drift across replays. Instead the post-submit reconstruction
+    // Pre-submit validation in rtxn. Schema vocabulary check and
+    // existing-predicate lookup. We do NOT pre-read the prior current
+    // Preference here: that lookup is repeated each call and would
+    // drift across replays. Instead the post-submit reconstruction
     // recovers `auto_superseded` from the committed row's `supersedes`
     // field, which is stable.
+    //
+    // For schemaless mode with a missing predicate, we don't run a
+    // separate intern wtxn — the Phase carries the qname as an intern
+    // hint and apply does the work inside the main submit wtxn,
+    // collapsing what used to be three commits (intern, statement,
+    // flag stamp) into one.
     let (predicate_id_opt, schemaless) = {
         let db_guard = ctx.executor.metadata.lock();
         let rtxn = db_guard
@@ -122,42 +125,35 @@ pub async fn handle_statement_create(
         (predicate_id_opt, schemaless)
     };
 
-    // Phase B — schemaless intern. When the predicate is missing in
-    // schemaless mode we intern it through a brief micro-wtxn before
-    // submitting the UpsertStatement (apply_upsert_statement requires
-    // the PredicateId already exist). predicate_intern_or_get is
-    // idempotent so a racing write can't break us here.
-    let (predicate_id, implicit_predicate) = match predicate_id_opt {
-        Some(pid) => (pid, false),
+    // Resolve to either an existing PredicateId (strict mode, or
+    // schemaless where a prior write already interned the qname) or an
+    // intern hint that apply will run inside the main wtxn.
+    let (predicate_id, intern_hint) = match predicate_id_opt {
+        Some(pid) => (pid, None),
         None => {
             if !schemaless {
-                // Strict mode + missing predicate was already caught
-                // above; reaching here is internal corruption.
                 return Err(OpError::Internal(
                     "predicate resolution inconsistency: strict-mode none after vocab check".into(),
                 ));
             }
-            let mut db_guard = ctx.executor.metadata.lock();
-            let wtxn = db_guard
-                .write_txn()
-                .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
-            let pid = predicate_intern_or_get(&wtxn, namespace, name, 0, now)
-                .map_err(map_predicate_op_error)?;
-            wtxn.commit()
-                .map_err(|e| OpError::Internal(format!("commit: {e}")))?;
-            (pid, true)
+            // Sentinel predicate id; apply will replace it with the
+            // result of `predicate_intern_or_get` against the hint.
+            (
+                PredicateId::from(0u32),
+                Some((namespace.to_string(), name.to_string())),
+            )
         }
     };
 
-    // Phase C — submit the UpsertStatement phase through the unified
-    // writer. The apply function runs statement_create which handles
-    // Preference auto-supersession in the same wtxn.
+    // Submit the UpsertStatement phase through the unified writer. The
+    // apply function runs (optional) predicate intern + statement_create
+    // + (optional) IMPLICIT_PREDICATE flag stamp in one wtxn.
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id = WriteId::from_request(RequestId::from(req.request_id));
     let request_hash = hash_statement_create_request(&req);
 
     let statement_value = build_statement_from_create(&req, predicate_id, now, kind)?;
-    let phase = build_upsert_statement_phase(&statement_value);
+    let phase = build_upsert_statement_phase(&statement_value, intern_hint);
     let write =
         Write::single(write_id, ctx.executor.caller_agent, phase).with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
@@ -165,7 +161,10 @@ pub async fn handle_statement_create(
     // recover from it is the one the *original* call wrote (which may
     // differ from `statement_value.id` because that's freshly minted
     // each call). Reading downstream state by the ack's id is what
-    // makes replay safe.
+    // makes replay safe. The original predicate intern also stays
+    // stable across replays — apply doesn't re-run on a cache hit, so
+    // even if a later schema declared the same qname differently, the
+    // replay surfaces the originally-stored PredicateId.
     let created_id = match ack.single_phase() {
         PhaseAck::UpsertedStatement(id, _) => *id,
         other => {
@@ -175,21 +174,7 @@ pub async fn handle_statement_create(
         }
     };
 
-    // Phase D — schemaless implicit-flag stamp. Runs in its own short
-    // wtxn after the statement row exists. The flag is informational
-    // (lets later schema-adoption work tell which rows the active
-    // schema would need to adopt or evict).
-    if implicit_predicate {
-        let mut db_guard = ctx.executor.metadata.lock();
-        let wtxn = db_guard
-            .write_txn()
-            .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
-        stamp_implicit_predicate_flag(&wtxn, created_id)?;
-        wtxn.commit()
-            .map_err(|e| OpError::Internal(format!("commit: {e}")))?;
-    }
-
-    // Phase E — recover chain_root + auto_superseded from storage. The
+    // Recover chain_root + auto_superseded from storage. The
     // committed row's `supersedes` field carries the prior current
     // Preference's id (when statement_create delegated to supersede)
     // or `None` (fresh row). `chain_root` is self-referential for a
@@ -895,10 +880,7 @@ fn project_view(rtxn: &redb::ReadTransaction, s: &Statement) -> Result<Statement
         let mut sv = smallvec::SmallVec::<
             [brain_core::EvidenceEntry; brain_core::INLINE_EVIDENCE_CAP],
         >::new();
-        for e in entries
-            .into_iter()
-            .take(brain_core::INLINE_EVIDENCE_CAP)
-        {
+        for e in entries.into_iter().take(brain_core::INLINE_EVIDENCE_CAP) {
             sv.push(e);
         }
         s.evidence = brain_core::EvidenceRef::inline(sv);
@@ -911,7 +893,16 @@ fn project_view(rtxn: &redb::ReadTransaction, s: &Statement) -> Result<Statement
 /// shape consumed by `apply_upsert_statement`. The fields mirror
 /// `Statement::new_root` so the apply function reproduces an
 /// equivalent row.
-fn build_upsert_statement_phase(s: &Statement) -> Phase {
+///
+/// `predicate_intern_hint` is `Some((namespace, name))` for schemaless
+/// writes whose predicate isn't yet in the registry; apply will run
+/// `predicate_intern_or_get` inside the main wtxn and stamp the row
+/// `IMPLICIT_PREDICATE`. `None` for the strict path or schemaless
+/// writes where the predicate is already interned.
+fn build_upsert_statement_phase(
+    s: &Statement,
+    predicate_intern_hint: Option<(String, String)>,
+) -> Phase {
     let evidence = match &s.evidence {
         brain_core::EvidenceRef::Inline(entries) => {
             let v: Vec<EvidenceEntry> = entries.iter().copied().collect();
@@ -931,6 +922,7 @@ fn build_upsert_statement_phase(s: &Statement) -> Phase {
         extractor: s.extractor_id,
         extracted_at_unix_nanos: s.extracted_at_unix_nanos,
         schema_version: s.schema_version,
+        predicate_intern_hint,
     }
 }
 
@@ -994,10 +986,7 @@ fn hash_statement_retract_request(req: &StatementRetractRequest) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-fn hash_statement_object(
-    h: &mut blake3::Hasher,
-    obj: &brain_protocol::StatementObjectWire,
-) {
+fn hash_statement_object(h: &mut blake3::Hasher, obj: &brain_protocol::StatementObjectWire) {
     use brain_protocol::{StatementObjectWire, StatementValueWire};
     h.update(&[obj.discriminant()]);
     match obj {
@@ -1096,42 +1085,6 @@ fn map_predicate_op_error(err: PredicateOpError) -> OpError {
         PredicateOpError::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
         PredicateOpError::Table(e) => OpError::Internal(format!("redb table: {e}")),
     }
-}
-
-/// OR the `IMPLICIT_PREDICATE` bit into the just-written statement
-/// row's flags. Called by the schemaless STATEMENT_CREATE path after
-/// the unified writer commits, so the row carries provenance forward
-/// for later schema-adoption analysis.
-fn stamp_implicit_predicate_flag(
-    wtxn: &redb::WriteTransaction,
-    id: StatementId,
-) -> Result<(), OpError> {
-    let key = id.to_bytes();
-    let existing: Option<StatementMetadata> = {
-        let t = wtxn
-            .open_table(STATEMENTS_TABLE)
-            .map_err(|e| OpError::Internal(format!("open statements: {e}")))?;
-        let g = t
-            .get(&key)
-            .map_err(|e| OpError::Internal(format!("statement lookup: {e}")))?;
-        g.map(|guard| guard.value())
-    };
-    let Some(mut row) = existing else {
-        // statement_create just wrote this — should always be present.
-        // Treat absence as internal corruption so the wire layer can
-        // surface it via tracing.
-        return Err(OpError::Internal(format!(
-            "statement {id:?} missing after create"
-        )));
-    };
-    if row.set_flag(statement_flags::IMPLICIT_PREDICATE) {
-        let mut t = wtxn
-            .open_table(STATEMENTS_TABLE)
-            .map_err(|e| OpError::Internal(format!("open statements (write): {e}")))?;
-        t.insert(&key, &row)
-            .map_err(|e| OpError::Internal(format!("statement update: {e}")))?;
-    }
-    Ok(())
 }
 
 fn map_statement_op_error(err: StatementOpError) -> OpError {
