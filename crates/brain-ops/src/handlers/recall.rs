@@ -63,7 +63,9 @@ pub async fn handle_recall(
         metadata: ctx.executor.metadata.clone(),
         cross_encoder: ctx.cross_encoder.as_arc().cloned(),
     };
-    let result = hybrid_execute(&plan, &planner_req, &exec_ctx).map_err(map_execution_error)?;
+    let result = hybrid_execute(&plan, &planner_req, &exec_ctx)
+        .await
+        .map_err(map_execution_error)?;
 
     let memory_results = project_memory_results(&result, &req, ctx)?;
 

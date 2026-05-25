@@ -17,6 +17,10 @@ brain-rerank = { path = "../brain-rerank" }
 thiserror.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
+# 27.B: hybrid executor fans out independent retrievers concurrently.
+# We stay runtime-agnostic — the executor runs under whichever async
+# runtime the caller picks (Glommio in production, `block_on` in tests).
+futures-lite = { workspace = true }
 # 23.3: query router classification heuristics use regex over
 # query text (exact-id detection, Title-Case mention probe,
 # temporal expression detection).

@@ -1,21 +1,36 @@
-//! Hybrid query executor (phase 23.7).
+//! Hybrid query executor.
 //!
-//! Consumes a `QueryPlan` (23.6) + a `HybridExecutorContext`
+//! Consumes a `QueryPlan` + a `HybridExecutorContext`
 //! (Arc handles to the three retrievers plus the `MetadataDb`
 //! the filter chain reads), invokes each retriever per its
-//! `PlannedRetriever` config, fuses via RRF (23.4), applies the
-//! post-fusion filter chain (23.5), truncates to `limit`, and
+//! `PlannedRetriever` config, fuses via RRF, applies the
+//! post-fusion filter chain, truncates to `limit`, and
 //! returns a `QueryResult` with per-retriever latency and
-//! outcome metadata for EXPLAIN/TRACE (23.8).
+//! outcome metadata for EXPLAIN/TRACE.
 //!
-//! v1 invokes retrievers **sequentially** — the retriever
-//! traits are sync, and brain-planner's per-shard Glommio
-//! executor is single-threaded. Parallel execution requires
-//! async-trait migration and lands post-v1. Wall-time budget
-//! per §16/02 §2.10 has comfortable headroom (3 × 10 ms =
-//! ~30 ms total vs the 50 ms p99 target).
+//! Independent retrievers fan out concurrently — each
+//! `invoke_retriever` call is wrapped in a future and the
+//! whole set is driven via a small `join_all_local` helper.
+//! The one dependency the executor honours is the memory-
+//! anchor graph mode: when `GraphAnchorMode::MemoryFromSemantic`
+//! is in the plan, the executor runs semantic eagerly and
+//! feeds its top-K into the graph walk. Everything else runs
+//! in parallel.
+//!
+//! Honest characterisation: the retriever traits are still
+//! synchronous, so concurrent execution on a single-thread
+//! Glommio executor gives **interleaving**, not true
+//! parallelism. CPU-bound retrievers (HNSW search) only overlap
+//! at task-poll boundaries. I/O-bound retrievers (Tantivy mmap
+//! cold reads, redb cold reads) yield to the kernel inside
+//! their syscalls and produce real overlap. The structural
+//! fan-out is in place either way; the win arrives without
+//! a planner / wire change when retrievers grow async I/O.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use brain_index::{
@@ -26,6 +41,7 @@ use brain_index::{
 };
 use brain_metadata::MetadataDb;
 use brain_rerank::CrossEncoder;
+use futures_lite::future::poll_fn;
 use parking_lot::Mutex;
 
 use super::filters::{apply_filter_chain, FilterChainStats, FilterError};
@@ -129,27 +145,23 @@ pub enum ExecutionError {
 /// Run a plan end-to-end. Returns the fused-then-filtered
 /// result plus metadata.
 ///
-/// Most retrievers run independently. The one exception is the
-/// memory-anchor graph mode: when the schemaless hybrid path
-/// selects graph without an entity anchor, the executor must
-/// run semantic first and feed its top-K memory ids into the
-/// graph walk. We detect this up-front, run semantic eagerly,
-/// stash its output, and let the iteration loop reuse it
-/// instead of re-invoking.
-pub fn execute(
+/// Independent retrievers fan out concurrently. The one
+/// exception is the memory-anchor graph mode: when the
+/// schemaless hybrid path selects graph without an entity
+/// anchor, the executor must run semantic first and feed its
+/// top-K memory ids into the graph walk. We detect this
+/// up-front, run semantic eagerly, stash its output, and let
+/// the fan-out reuse it instead of re-invoking.
+pub async fn execute(
     plan: &QueryPlan,
     request: &QueryRequest,
     ctx: &HybridExecutorContext,
 ) -> Result<QueryResult, ExecutionError> {
     let total_started = Instant::now();
-    let mut outputs: Vec<(Retriever, Vec<RankedItem>)> = Vec::new();
-    let mut latencies: Vec<(Retriever, f64)> = Vec::new();
-    let mut outcomes: Vec<RetrieverOutcome> = Vec::new();
-    let mut totals: Vec<(Retriever, usize)> = Vec::new();
 
     // Pre-run semantic if graph depends on it. Without this the
-    // sequential loop would invoke graph with no anchors and
-    // either skip or error.
+    // fan-out would invoke graph with no anchors and either skip
+    // or error.
     let needs_semantic_first = plan.retrievers.iter().any(|r| {
         matches!(
             &r.config,
@@ -159,7 +171,7 @@ pub fn execute(
             }
         )
     });
-    let pre_semantic = if needs_semantic_first {
+    let pre_semantic_planned = if needs_semantic_first {
         plan.retrievers
             .iter()
             .find(|r| r.retriever == Retriever::Semantic)
@@ -168,26 +180,47 @@ pub fn execute(
         None
     };
     let mut cached_semantic: Option<Vec<RankedItem>> = None;
-    if let Some(sem) = &pre_semantic {
+    let mut pre_semantic_latency_ms: f64 = 0.0;
+    let mut pre_semantic_invocation: Option<
+        Result<Vec<RankedItem>, RetrieverInvocationError>,
+    > = None;
+    if let Some(sem) = &pre_semantic_planned {
         let started = Instant::now();
         let invocation = invoke_retriever(sem, request, ctx, None);
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-        match invocation {
-            Ok(items) => {
-                cached_semantic = Some(items);
-            }
-            Err(_) => {
-                // Semantic failed or was skipped. Graph will
-                // then fall back to "no anchors" and skip
-                // itself — let the main loop handle the
-                // bookkeeping uniformly.
-                let _ = elapsed_ms;
-            }
+        pre_semantic_latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if let Ok(items) = &invocation {
+            cached_semantic = Some(items.clone());
         }
+        pre_semantic_invocation = Some(invocation);
     }
 
-    for planned in &plan.retrievers {
-        let started = Instant::now();
+    // Build one future per planned retriever. Each future
+    // returns `(index, elapsed_ms, invocation)` so we can
+    // rebuild the per-retriever bookkeeping in plan order
+    // after the fan-out.
+    //
+    // For the semantic-reuse case (semantic already ran
+    // eagerly) the corresponding future returns the cached
+    // result with the eager-run latency attribution intact —
+    // no second HNSW search.
+    let mut futures: Vec<
+        Pin<
+            Box<
+                dyn Future<
+                        Output = (usize, f64, Result<Vec<RankedItem>, RetrieverInvocationError>),
+                    > + '_,
+            >,
+        >,
+    > = Vec::with_capacity(plan.retrievers.len());
+    for (idx, planned) in plan.retrievers.iter().enumerate() {
+        if planned.retriever == Retriever::Semantic && pre_semantic_invocation.is_some() {
+            let invocation = pre_semantic_invocation
+                .take()
+                .expect("invariant: guarded by is_some check above");
+            let elapsed_ms = pre_semantic_latency_ms;
+            futures.push(Box::pin(async move { (idx, elapsed_ms, invocation) }));
+            continue;
+        }
         let pre_anchors = if planned.retriever == Retriever::Graph
             && matches!(
                 &planned.config,
@@ -200,17 +233,27 @@ pub fn execute(
         } else {
             None
         };
-        let invocation = match (planned.retriever, cached_semantic.as_ref()) {
-            (Retriever::Semantic, Some(cached)) => {
-                // Reuse the pre-run semantic output rather than
-                // paying for the HNSW search twice.
-                Ok(cached.clone())
-            }
-            _ => invoke_retriever(planned, request, ctx, pre_anchors),
-        };
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-        latencies.push((planned.retriever, elapsed_ms));
+        futures.push(Box::pin(async move {
+            let started = Instant::now();
+            let invocation = invoke_retriever(planned, request, ctx, pre_anchors);
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            (idx, elapsed_ms, invocation)
+        }));
+    }
 
+    let mut fanout_results = join_all_local(futures).await;
+    // `join_all_local` preserves submission order, but sort
+    // defensively so any future shuffling stays correct.
+    fanout_results.sort_by_key(|(idx, _, _)| *idx);
+
+    // Rebuild per-retriever bookkeeping in plan order.
+    let mut outputs: Vec<(Retriever, Vec<RankedItem>)> = Vec::new();
+    let mut latencies: Vec<(Retriever, f64)> = Vec::with_capacity(plan.retrievers.len());
+    let mut outcomes: Vec<RetrieverOutcome> = Vec::with_capacity(plan.retrievers.len());
+    let mut totals: Vec<(Retriever, usize)> = Vec::with_capacity(plan.retrievers.len());
+    for (idx, elapsed_ms, invocation) in fanout_results {
+        let planned = &plan.retrievers[idx];
+        latencies.push((planned.retriever, elapsed_ms));
         match invocation {
             Ok(items) => {
                 totals.push((planned.retriever, items.len()));
@@ -680,6 +723,53 @@ fn range_to_inclusive(from: Option<u64>, to: Option<u64>) -> Option<std::ops::Ra
     } else {
         Some(lo..=hi)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent fan-out helper.
+// ---------------------------------------------------------------------------
+
+/// Drive a small heterogeneous set of futures to completion
+/// concurrently, returning their outputs in submission order.
+/// Polls every still-pending future on each wakeup — fine for
+/// the planner's bounded fan-out (at most three retrievers per
+/// query) but not a substitute for a real `join_all` if
+/// `futures` grows large.
+///
+/// Lives here instead of in a shared util because the planner
+/// is the only caller and the helper deliberately stays
+/// runtime-agnostic (no `spawn_local` — the caller's executor
+/// already runs us inside one task).
+async fn join_all_local<T>(mut futures: Vec<Pin<Box<dyn Future<Output = T> + '_>>>) -> Vec<T> {
+    if futures.is_empty() {
+        return Vec::new();
+    }
+    let mut results: Vec<Option<T>> = (0..futures.len()).map(|_| None).collect();
+    let mut remaining = futures.len();
+    poll_fn(move |cx: &mut Context<'_>| {
+        for (slot, fut) in results.iter_mut().zip(futures.iter_mut()) {
+            if slot.is_some() {
+                continue;
+            }
+            if let Poll::Ready(v) = fut.as_mut().poll(cx) {
+                *slot = Some(v);
+                remaining -= 1;
+            }
+        }
+        if remaining == 0 {
+            // All futures resolved — drain results in submission
+            // order. `take()` is safe because each slot was
+            // marked ready exactly once.
+            let out: Vec<T> = results
+                .iter_mut()
+                .map(|s| s.take().expect("invariant: slot resolved"))
+                .collect();
+            Poll::Ready(out)
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 #[cfg(test)]

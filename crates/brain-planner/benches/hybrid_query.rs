@@ -120,13 +120,24 @@ fn build_fixture(
     let metadata = MetadataDb::open(dir.path().join("md.redb")).expect("open metadata");
     let metadata = Arc::new(Mutex::new(metadata));
 
+    // The executor context now requires all three retrievers — a
+    // None slot defaults to a canned-empty retriever so the bench
+    // can still measure plan-execute-fuse-filter glue without a
+    // given tier contributing.
+    let sem: Arc<dyn SemanticRetriever> = Arc::new(CannedSemanticRetriever {
+        items: semantic.unwrap_or_default(),
+    });
+    let lex: Arc<dyn LexicalRetriever> = Arc::new(CannedLexicalRetriever {
+        items: lexical.unwrap_or_default(),
+    });
+    let gr: Arc<dyn GraphRetriever> = Arc::new(CannedGraphRetriever {
+        items: graph.unwrap_or_default(),
+    });
+
     let ctx = HybridExecutorContext {
-        semantic: semantic
-            .map(|items| Arc::new(CannedSemanticRetriever { items }) as Arc<dyn SemanticRetriever>),
-        lexical: lexical
-            .map(|items| Arc::new(CannedLexicalRetriever { items }) as Arc<dyn LexicalRetriever>),
-        graph: graph
-            .map(|items| Arc::new(CannedGraphRetriever { items }) as Arc<dyn GraphRetriever>),
+        semantic: sem,
+        lexical: lex,
+        graph: gr,
         metadata,
         cross_encoder: None,
     };
@@ -197,8 +208,12 @@ fn bench_hybrid_three_retriever(c: &mut Criterion) {
 
     c.bench_function("hybrid_three_retriever", |b| {
         b.iter(|| {
-            let result =
-                execute(black_box(&plan), black_box(&req), black_box(&fx.ctx)).expect("execute");
+            let result = futures_lite::future::block_on(execute(
+                black_box(&plan),
+                black_box(&req),
+                black_box(&fx.ctx),
+            ))
+            .expect("execute");
             black_box(result.items.len());
         });
     });
@@ -219,8 +234,12 @@ fn bench_hybrid_router_degraded(c: &mut Criterion) {
 
     c.bench_function("hybrid_router_degraded", |b| {
         b.iter(|| {
-            let result =
-                execute(black_box(&plan), black_box(&req), black_box(&fx.ctx)).expect("execute");
+            let result = futures_lite::future::block_on(execute(
+                black_box(&plan),
+                black_box(&req),
+                black_box(&fx.ctx),
+            ))
+            .expect("execute");
             black_box(result.items.len());
         });
     });

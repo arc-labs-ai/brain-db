@@ -605,6 +605,7 @@ dependencies = [
  "brain-protocol",
  "brain-rerank",
  "criterion",
+ "futures-lite 2.6.1",
  "parking_lot",
  "proptest",
  "redb",

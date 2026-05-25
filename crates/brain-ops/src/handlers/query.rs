@@ -91,7 +91,9 @@ pub async fn handle_query(
     let planner_req = wire_to_planner_request(req, predicate_ids)?;
     let qp = plan(&planner_req).map_err(map_plan_error)?;
     let exec_ctx = build_executor_context(ctx)?;
-    let result = execute(&qp, &planner_req, &exec_ctx).map_err(map_executor_error)?;
+    let result = execute(&qp, &planner_req, &exec_ctx)
+        .await
+        .map_err(map_executor_error)?;
     Ok(project_query_response(&result))
 }
 
@@ -136,7 +138,9 @@ pub async fn handle_query_trace(
     let planner_req = wire_to_planner_request(req.query, predicate_ids)?;
     let qp = plan(&planner_req).map_err(map_plan_error)?;
     let exec_ctx = build_executor_context(ctx)?;
-    let result = execute(&qp, &planner_req, &exec_ctx).map_err(map_executor_error)?;
+    let result = execute(&qp, &planner_req, &exec_ctx)
+        .await
+        .map_err(map_executor_error)?;
     Ok(QueryTraceResponse {
         trace_text: render_trace(&qp, &result.metadata),
         total_latency_ms: result.metadata.total_latency_ms,
@@ -217,7 +221,9 @@ pub async fn handle_recall_hybrid(
     };
     let qp = plan(&planner_req).map_err(map_plan_error)?;
     let exec_ctx = build_executor_context(ctx)?;
-    let result = execute(&qp, &planner_req, &exec_ctx).map_err(map_executor_error)?;
+    let result = execute(&qp, &planner_req, &exec_ctx)
+        .await
+        .map_err(map_executor_error)?;
     let items = result
         .items
         .iter()
