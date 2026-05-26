@@ -33,6 +33,18 @@ pub trait Worker: 'static {
     /// Configuration knobs (interval, batch_size, max_runtime).
     fn config(&self) -> WorkerConfig;
 
+    /// When `true`, the scheduler sleeps one `interval` *before* this
+    /// worker's first `run_cycle` instead of ticking immediately on
+    /// register. Defaults to `false` — most workers tick promptly so
+    /// any pending state from a previous run drains right away. The
+    /// Snapshot worker overrides this to `true`: an immediate tick at
+    /// shard spawn would write a CHECKPOINT_BEGIN/END pair to the WAL
+    /// before any user work, shifting LSN positions in ways that
+    /// surprise recovery tooling and tests.
+    fn skip_first_tick(&self) -> bool {
+        false
+    }
+
     /// Execute one bounded cycle. Returns the number of units
     /// processed — the scheduler adds it to `processed_total`.
     ///

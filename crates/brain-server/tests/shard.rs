@@ -540,12 +540,42 @@ async fn wal_persists_across_restart() {
             .expect("blocking 2")
             .expect("join 2");
     }
-    // WAL now has 3 records (LSNs 1, 2, 3).
+    // The three ENCODE records persist at LSNs 1, 2, 3. The shutdown
+    // snapshot (enabled now that PQ persistence is wired) may append
+    // CHECKPOINT_BEGIN/END records after them when the recovered HNSW
+    // is non-empty — those are expected and not part of this test's
+    // contract, so assert the encode records specifically rather than
+    // the full WAL contents.
+    use brain_storage::wal::kinds::WalRecordKind;
     let shard_dir = data_path.join("0");
     let uuid = read_shard_uuid(&shard_dir);
     let reader = WalReader::open(shard_dir.join("wal"), uuid).unwrap();
-    let lsns: Vec<u64> = reader.map(|r| r.unwrap().lsn.raw()).collect();
-    assert_eq!(lsns, vec![1, 2, 3]);
+    let records: Vec<_> = reader.map(|r| r.unwrap()).collect();
+    let encode_lsns: Vec<u64> = records
+        .iter()
+        .filter(|r| r.kind == WalRecordKind::Encode)
+        .map(|r| r.lsn.raw())
+        .collect();
+    assert_eq!(
+        encode_lsns,
+        vec![1, 2, 3],
+        "the three encodes must persist at sequential LSNs across restart"
+    );
+    // Any trailing records must be checkpoint bookkeeping, and the LSN
+    // sequence must stay gap-free overall (the reader already enforces
+    // this — a gap would have surfaced as a WalReadError above).
+    for r in &records {
+        assert!(
+            matches!(
+                r.kind,
+                WalRecordKind::Encode
+                    | WalRecordKind::CheckpointBegin
+                    | WalRecordKind::CheckpointEnd
+            ),
+            "unexpected WAL record kind {:?}",
+            r.kind
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

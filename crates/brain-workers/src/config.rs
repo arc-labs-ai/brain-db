@@ -149,7 +149,14 @@ impl WorkerConfig {
             WorkerKind::CounterReconcile => (true, Duration::from_secs(3600), 1, 30_000),
             WorkerKind::Statistics => (true, Duration::from_secs(300), 1, 5_000),
             WorkerKind::EmbedderCacheEvict => (true, Duration::from_secs(60), 5_000, 2_000),
-            WorkerKind::Snapshot => (false, Duration::from_secs(3600), 1, 300_000),
+            // Was `false` during the PQ-persistence stub era — every tick
+            // would have failed on `SnapshotNotYetImplemented`. With Task 3
+            // landed, save_snapshot writes the four-file triple cleanly,
+            // so the worker is on by default; an hourly snapshot bounds
+            // the next restart's WAL replay. The worker's
+            // `do_snapshot_cycle` skips empty-HNSW shards to avoid
+            // writing redundant CHECKPOINT records.
+            WorkerKind::Snapshot => (true, Duration::from_secs(3600), 1, 300_000),
             // Phase 24 — knowledge workers.
             // Backfill is admin-triggered; the loop ticks fast when work is pending.
             WorkerKind::Backfill => (true, Duration::from_secs(1), 256, 20_000),

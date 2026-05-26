@@ -295,12 +295,19 @@ async fn worker_loop(
 ) {
     let name = worker.name();
     let cfg = worker.config();
+    let skip_first_tick = worker.skip_first_tick();
+    let mut first_iter = true;
     loop {
         if ctx.is_shutdown() {
             break;
         }
         let paused = controls.paused.load(Ordering::Relaxed);
-        if cfg.enabled && !paused {
+        // `skip_first_tick` workers (Snapshot) sleep the first interval
+        // *before* ticking — see `Worker::skip_first_tick` for the
+        // rationale. All other workers tick immediately so any pending
+        // state from a previous run drains promptly.
+        let skip_this_cycle = first_iter && skip_first_tick;
+        if cfg.enabled && !paused && !skip_this_cycle {
             let start = Instant::now();
             match worker.run_cycle(&ctx).await {
                 Ok(processed) => {
@@ -337,6 +344,7 @@ async fn worker_loop(
         if ctx.is_shutdown() {
             break;
         }
+        first_iter = false;
     }
     debug!(worker = name, "loop exiting");
 }

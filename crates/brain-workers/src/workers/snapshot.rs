@@ -192,6 +192,10 @@ impl Worker for SnapshotWorker {
     fn config(&self) -> WorkerConfig {
         self.config.clone()
     }
+    fn skip_first_tick(&self) -> bool {
+        // Don't snapshot at shard spawn — see Worker::skip_first_tick.
+        true
+    }
     fn run_cycle<'a>(
         &'a self,
         ctx: &'a WorkerContext,
@@ -204,6 +208,18 @@ async fn do_snapshot_cycle(
     worker: &SnapshotWorker,
     ctx: &WorkerContext,
 ) -> Result<usize, WorkerError> {
+    // Skip when there's nothing meaningful to snapshot. The empty-HNSW
+    // case fires on every shard's first tick (workers run a cycle
+    // immediately at register, before any encodes have populated the
+    // index) — without this guard each shard would write a redundant
+    // CHECKPOINT_BEGIN/END pair to the WAL at startup, which throws
+    // off any consumer that reasons about exact LSN positions
+    // (recovery tests, downstream tooling). Admin-driven take_snapshot
+    // calls bypass the worker and don't need this gate.
+    if ctx.ops.executor.index.is_empty() {
+        return Ok(0);
+    }
+
     // Take the snapshot.
     let new_id = match worker.source.take_snapshot().await {
         Ok(id) => id,

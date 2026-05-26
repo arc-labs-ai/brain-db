@@ -41,7 +41,14 @@ fn make_ops_context() -> (Arc<OpsContext>, tempfile::TempDir) {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
     let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
-    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
+    let (shared, mut hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
+    // Seed one entry so the HNSW is non-empty: `do_snapshot_cycle` skips
+    // empty-HNSW shards (no semantic state worth checkpointing), but these
+    // tests exercise the retention path and need the cycle to actually
+    // call the (mock) snapshot source.
+    hnsw_writer
+        .insert(brain_core::MemoryId::pack(0, 1, 1), &[0.0; VECTOR_DIM])
+        .unwrap();
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
     let executor = ExecutorContext::new(
         Arc::new(NopDispatcher) as Arc<dyn Dispatcher>,
@@ -358,7 +365,7 @@ fn enabled_worker_deletes_old_snapshots_per_retention() {
 // ===========================================================================
 
 #[test]
-fn worker_registers_with_correct_kind_and_default_cadence_disabled() {
+fn worker_registers_with_correct_kind_and_hourly_enabled_cadence() {
     glommio_run(|| async {
         let (ops, _td) = make_ops_context();
         let mut sched = WorkerScheduler::new();
@@ -370,16 +377,24 @@ fn worker_registers_with_correct_kind_and_default_cadence_disabled() {
             .unwrap();
         let cfg = sched.config(WorkerKind::Snapshot.name()).unwrap();
         assert_eq!(cfg.interval, Duration::from_secs(3600));
-        assert!(!cfg.enabled, ".2 — Snapshot defaults to disabled");
+        // Enabled by default now that PQ snapshot persistence is wired
+        // (Task 3).
+        assert!(cfg.enabled, "Snapshot is enabled by default post-Task-3");
         sched.shutdown().await.unwrap();
     });
 }
 
 #[test]
-fn default_config_has_enabled_false_per_spec() {
+fn default_config_enabled_and_worker_skips_first_tick() {
     glommio_run(|| async {
         let cfg = WorkerConfig::defaults_for(WorkerKind::Snapshot);
-        assert!(!cfg.enabled);
+        assert!(cfg.enabled, "Snapshot enabled by default post-Task-3");
+        // skip-first-tick is a Worker trait method, not a config knob.
+        let worker = SnapshotWorker::new(Arc::new(DisabledSnapshotSource));
+        assert!(
+            brain_workers::Worker::skip_first_tick(&worker),
+            "Snapshot worker skips its first tick"
+        );
     });
 }
 

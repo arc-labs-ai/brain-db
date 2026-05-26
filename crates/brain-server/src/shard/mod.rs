@@ -2631,15 +2631,38 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
             }
         }
     }
-    // Clean shutdown: drain worker scheduler → WAL committer → arena msync.
-    // Order matters: workers may have in-flight WAL appends; let them drain
-    // before closing the WAL so the fsync acks land.
+    // Clean shutdown: drain worker scheduler → final snapshot → WAL
+    // committer → arena msync. Order matters:
+    //   - Workers drain first so in-flight WAL appends complete and the
+    //     background snapshot worker can't race with the final snapshot.
+    //   - Final snapshot runs while the WAL is still alive (it writes
+    //     CHECKPOINT_BEGIN/END records) and bounds the next start's
+    //     replay tail to "nothing since just now."
+    //   - WAL committer closes after the snapshot's BEGIN/END are acked.
+    //   - Arena msync runs last so all pre-msync writes (including the
+    //     snapshot's redb checkpoint flag) are visible to a fresh process.
     if let Some(scheduler) = shard.scheduler.take() {
         if let Err(e) = scheduler.shutdown().await {
             warn!(
                 shard_id = shard.shard_id,
                 error = %e,
                 "scheduler shutdown failed"
+            );
+        }
+    }
+    // Final snapshot, only if there's something to snapshot. Mirrors the
+    // worker's empty-HNSW guard: a shard that never received an encode
+    // has no semantic state worth checkpointing, and writing
+    // CHECKPOINT_BEGIN/END for it would just pollute the WAL and break
+    // recovery-tooling assumptions about LSN positions. Best-effort: a
+    // failure here doesn't break shutdown; the arena-rebuild fallback on
+    // next start keeps correctness intact.
+    if !shard.ops.executor.index.is_empty() {
+        if let Err(e) = shard.snapshot_source.take_snapshot().await {
+            warn!(
+                shard_id = shard.shard_id,
+                error = ?e,
+                "final snapshot at shutdown failed; next start will replay more WAL"
             );
         }
     }
