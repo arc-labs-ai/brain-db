@@ -120,6 +120,63 @@ impl<const M: usize> Codebook<M> {
         &self.data
     }
 
+    /// Serialize the codebook into a self-describing byte image. Layout:
+    /// `magic(4) | version(4) | M(4) | sub_dim(4) | data_len(4) | data: f32 LE`.
+    /// The wrapper carries an independent BLAKE3 over the bytes for
+    /// integrity; this format only needs to round-trip the centroids
+    /// and the shape parameters it was trained for.
+    #[must_use]
+    pub fn serialize(&self) -> Vec<u8> {
+        let header_len = CODEBOOK_HEADER_LEN;
+        let mut out = Vec::with_capacity(header_len + self.data.len() * 4);
+        out.extend_from_slice(&CODEBOOK_MAGIC);
+        out.extend_from_slice(&CODEBOOK_FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&(M as u32).to_le_bytes());
+        out.extend_from_slice(&(self.sub_dim as u32).to_le_bytes());
+        out.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
+        for f in &self.data {
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+        out
+    }
+
+    /// Inverse of [`Self::serialize`]. Validates magic + version, then
+    /// hands the centroids to [`Self::from_trained`] for the standard
+    /// shape + non-finite checks.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, CodebookError> {
+        if bytes.len() < CODEBOOK_HEADER_LEN {
+            return Err(CodebookError::Truncated);
+        }
+        let magic: [u8; 4] = bytes[0..4].try_into().expect("4 bytes");
+        if magic != CODEBOOK_MAGIC {
+            return Err(CodebookError::BadMagic);
+        }
+        let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        if version != CODEBOOK_FORMAT_VERSION {
+            return Err(CodebookError::UnsupportedVersion(version));
+        }
+        let m = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        if m != M {
+            return Err(CodebookError::ConfigMismatch {
+                params_m: m,
+                codebook_m: M,
+            });
+        }
+        let sub_dim = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let data_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        let expected_bytes = CODEBOOK_HEADER_LEN + data_len * 4;
+        if bytes.len() != expected_bytes {
+            return Err(CodebookError::Truncated);
+        }
+        let mut data = Vec::with_capacity(data_len);
+        for i in 0..data_len {
+            let off = CODEBOOK_HEADER_LEN + i * 4;
+            let chunk: [u8; 4] = bytes[off..off + 4].try_into().unwrap();
+            data.push(f32::from_le_bytes(chunk));
+        }
+        Self::from_trained(data, sub_dim)
+    }
+
     /// Confirm the codebook matches a [`PqParams`] config — `m` matches,
     /// `bits` matches (centroid count). Run at index-load time to fail
     /// loudly on a config/snapshot drift instead of silently producing
@@ -141,6 +198,11 @@ impl<const M: usize> Codebook<M> {
     }
 }
 
+/// `b"BCB0"` — Brain Codebook v0 magic.
+const CODEBOOK_MAGIC: [u8; 4] = *b"BCB0";
+const CODEBOOK_FORMAT_VERSION: u32 = 1;
+const CODEBOOK_HEADER_LEN: usize = 20;
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CodebookError {
     #[error("M={m} × sub_dim={sub_dim} ≠ VECTOR_DIM={d}")]
@@ -157,6 +219,15 @@ pub enum CodebookError {
 
     #[error("params.K={params_k} does not match codebook K={codebook_k}")]
     ConfigCentroidsMismatch { params_k: usize, codebook_k: usize },
+
+    #[error("codebook serialized bytes are truncated or malformed length")]
+    Truncated,
+
+    #[error("codebook bytes have wrong magic prefix")]
+    BadMagic,
+
+    #[error("codebook bytes have unsupported format version: {0}")]
+    UnsupportedVersion(u32),
 }
 
 #[cfg(test)]
@@ -233,6 +304,44 @@ mod tests {
                 params_m: 16,
                 codebook_m: 8
             })
+        ));
+    }
+
+    #[test]
+    fn serialize_round_trip_is_bit_exact() {
+        let cb = Codebook::<8>::from_trained(fake_centroids::<8>(), SUB_DIM_M8).unwrap();
+        let bytes = cb.serialize();
+        let cb2 = Codebook::<8>::deserialize(&bytes).unwrap();
+        assert_eq!(cb2.sub_dim(), cb.sub_dim());
+        assert_eq!(cb2.m(), cb.m());
+        // Bit-exact centroid round-trip via the little-endian f32 image.
+        let a = cb.as_flat();
+        let b = cb2.as_flat();
+        assert_eq!(a.len(), b.len());
+        for i in 0..a.len() {
+            assert_eq!(a[i].to_bits(), b[i].to_bits(), "centroid {i} drifted");
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_wrong_magic() {
+        let cb = Codebook::<8>::from_trained(fake_centroids::<8>(), SUB_DIM_M8).unwrap();
+        let mut bytes = cb.serialize();
+        bytes[0] = b'X';
+        assert!(matches!(
+            Codebook::<8>::deserialize(&bytes),
+            Err(CodebookError::BadMagic)
+        ));
+    }
+
+    #[test]
+    fn deserialize_rejects_truncation() {
+        let cb = Codebook::<8>::from_trained(fake_centroids::<8>(), SUB_DIM_M8).unwrap();
+        let mut bytes = cb.serialize();
+        bytes.truncate(bytes.len() - 4);
+        assert!(matches!(
+            Codebook::<8>::deserialize(&bytes),
+            Err(CodebookError::Truncated)
         ));
     }
 }

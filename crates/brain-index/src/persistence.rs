@@ -1,18 +1,22 @@
 //! Snapshot persistence for `HnswIndex`.
 //!
-//! See `spec/09_indexing/06_persistence.md` §5 and SD-4.5-1 in
+//! See `spec/09_indexing/06_persistence.md` §7 and SD-4.5-1 in
 //! `docs/development/spec-deviations.md`.
 //!
 //! ## File layout
 //!
-//! A snapshot is a **directory** containing three files at the same
+//! A snapshot is a **directory** containing four files at the same
 //! `basename` (SD-4.5-1: hnsw_rs's `Hnsw::file_dump` writes two files,
-//! so we live with three rather than concatenating into one):
+//! and the PQ codebook is a third sibling, so the wrapper makes four):
 //!
 //! - `<basename>.hnsw.graph` — hnsw_rs's graph dump.
 //! - `<basename>.hnsw.data`  — hnsw_rs's data dump.
+//! - `<basename>.codebook`   — PQ codebook bytes (v2+; sibling of the
+//!   two hnsw_rs files).
 //! - `<basename>.brain`      — our wrapper (this module). Written
 //!   **last** so its presence is the marker for "snapshot complete".
+//!   The wrapper body carries BLAKE3 hashes of each sibling so cross-
+//!   file integrity is verifiable from the wrapper alone.
 //!
 //! ### `.brain` layout
 //!
@@ -20,7 +24,7 @@
 //! offset  size  field
 //! ------  ----  -----
 //!    0    4     magic = b"BHN0"
-//!    4    4     format_version: u32 LE  (= 1)
+//!    4    4     format_version: u32 LE  (= 2)
 //!    8    16    shard_uuid: [u8; 16]
 //!   24    8     taken_at_lsn: u64 LE
 //!   32    8     graph_node_count: u64 LE  (= IdMap.len at save time)
@@ -37,6 +41,9 @@
 //!    .    8     tombstone_word_count: u64 LE
 //!    .   M×8   tombstone bitmap: u64 LE words
 //!    .    4     tombstone_set_count: u32 LE (TombstoneBitmap.count)
+//!    .   32    graph_hash: BLAKE3 of <basename>.hnsw.graph
+//!    .   32    data_hash:  BLAKE3 of <basename>.hnsw.data
+//!    .   32    codebook_hash: BLAKE3 of <basename>.codebook
 //!    .    8     footer: BLAKE3(file[..footer]) truncated to u64 LE
 //! ```
 
@@ -50,7 +57,14 @@ use crate::tombstones::TombstoneBitmap;
 pub const BRAIN_MAGIC: [u8; 4] = *b"BHN0";
 
 /// On-disk format version. Bump on any incompatible layout change.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// v1 (pre-Task 3) — non-PQ HnswIndex snapshot (`.brain` wrapper only).
+/// v2 (Task 3)     — PQ snapshot. The `.brain` body now carries BLAKE3
+///                   hashes of the sibling files (`.hnsw.graph`,
+///                   `.hnsw.data`, `.codebook`) so the wrapper protects
+///                   the whole quadruple, not just itself. The codebook
+///                   sidecar is new in v2.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Size of the fixed-width header (bytes 0..=63).
 pub const HEADER_LEN: usize = 64;
@@ -167,9 +181,19 @@ pub struct Body {
 }
 
 impl Body {
-    /// Encode the id_map + tombstone bitmap state.
+    /// Encode the id_map + tombstone bitmap state + sibling-file hashes.
+    /// The three hashes bind the wrapper to its `.hnsw.graph`,
+    /// `.hnsw.data`, and `.codebook` siblings — load-time verification
+    /// hashes each sibling and matches against these fields.
     #[must_use]
-    pub fn encode(id_map: &IdMap, next_internal_id: u32, tombstones: &TombstoneBitmap) -> Self {
+    pub fn encode(
+        id_map: &IdMap,
+        next_internal_id: u32,
+        tombstones: &TombstoneBitmap,
+        graph_hash: [u8; 32],
+        data_hash: [u8; 32],
+        codebook_hash: [u8; 32],
+    ) -> Self {
         let mut bytes = Vec::new();
 
         // id_map entries.
@@ -193,6 +217,14 @@ impl Body {
         let set_count = u32::try_from(tombstones.count()).expect("tombstone count fits in u32");
         bytes.extend_from_slice(&set_count.to_le_bytes());
 
+        // Sibling-file hashes (v2). 96 bytes appended after the
+        // tombstone footer so an old v1 parser would fail with
+        // TrailingBytes and the FORMAT_VERSION bump catches it before
+        // we get there. Order matches load-time verification.
+        bytes.extend_from_slice(&graph_hash);
+        bytes.extend_from_slice(&data_hash);
+        bytes.extend_from_slice(&codebook_hash);
+
         Self { bytes }
     }
 }
@@ -203,6 +235,9 @@ pub struct ParsedBody {
     pub next_internal_id: u32,
     pub tombstone_words: Vec<u64>,
     pub tombstone_set_count: u32,
+    pub graph_hash: [u8; 32],
+    pub data_hash: [u8; 32],
+    pub codebook_hash: [u8; 32],
 }
 
 impl ParsedBody {
@@ -223,6 +258,9 @@ impl ParsedBody {
             tombstone_words.push(read_u64(&mut bytes)?);
         }
         let tombstone_set_count = read_u32(&mut bytes)?;
+        let graph_hash = read_array_32(&mut bytes)?;
+        let data_hash = read_array_32(&mut bytes)?;
+        let codebook_hash = read_array_32(&mut bytes)?;
         if !bytes.is_empty() {
             return Err(BodyError::TrailingBytes(bytes.len()));
         }
@@ -231,6 +269,9 @@ impl ParsedBody {
             next_internal_id,
             tombstone_words,
             tombstone_set_count,
+            graph_hash,
+            data_hash,
+            codebook_hash,
         })
     }
 }
@@ -265,6 +306,15 @@ fn read_array_16(bytes: &mut &[u8]) -> Result<[u8; 16], BodyError> {
     }
     let v: [u8; 16] = bytes[..16].try_into().unwrap();
     *bytes = &bytes[16..];
+    Ok(v)
+}
+
+fn read_array_32(bytes: &mut &[u8]) -> Result<[u8; 32], BodyError> {
+    if bytes.len() < 32 {
+        return Err(BodyError::Truncated);
+    }
+    let v: [u8; 32] = bytes[..32].try_into().unwrap();
+    *bytes = &bytes[32..];
     Ok(v)
 }
 

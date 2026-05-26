@@ -77,6 +77,9 @@ pub enum HnswError {
 
     #[error("snapshot I/O: {0}")]
     SnapshotIo(#[from] std::io::Error),
+
+    #[error("snapshot corrupt or incompatible: {0}")]
+    SnapshotCorrupt(String),
 }
 
 impl From<IdMapError> for HnswError {
@@ -298,11 +301,61 @@ impl<const M: usize> HnswIndexImpl<M> {
         self.params
     }
 
+    /// Borrow the internal id-map. Snapshot writers need this to
+    /// serialise the forward direction + `next_id`.
+    #[must_use]
+    pub fn id_map(&self) -> &IdMap {
+        &self.id_map
+    }
+
+    /// Borrow the internal tombstone bitmap. Snapshot writers need
+    /// this to serialise the bitmap and its set-count.
+    #[must_use]
+    pub fn tombstones(&self) -> &TombstoneBitmap {
+        &self.tombstones
+    }
+
     /// Resolve the effective `ef_search` for a single query. Mirrors
     /// the clamp rules in [`HnswIndexImpl::search`].
     fn resolve_ef(&self, k: usize, ef: Option<usize>) -> usize {
         let requested = ef.unwrap_or(self.params.ef_search);
         requested.max(k).min(self.params.ef_search_max)
+    }
+
+    /// Dump the inner `hnsw_rs` graph to `<dir>/<basename>.hnsw.{graph,data}`.
+    /// Wraps [`hnsw_rs::api::AnnT::file_dump`]. Caller is responsible for
+    /// ensuring `dir` exists.
+    pub fn file_dump(
+        &self,
+        dir: &std::path::Path,
+        basename: &str,
+    ) -> Result<String, HnswError> {
+        use hnsw_rs::api::AnnT;
+        self.inner
+            .file_dump(dir, basename)
+            .map_err(|e| HnswError::SnapshotIo(std::io::Error::other(format!("file_dump: {e}"))))
+    }
+
+    /// Rehydrate from persisted parts. Used by snapshot-load: the
+    /// `inner` Hnsw graph is reloaded via `hnsw_rs::HnswIo` and the
+    /// codebook/id_map/tombstones are reconstructed from the wrapper
+    /// body. The caller has verified codebook + wrapper integrity
+    /// before invoking this.
+    #[must_use]
+    pub fn from_persisted_parts(
+        params: IndexParams,
+        codebook: Codebook<M>,
+        inner: hnsw_rs::hnsw::Hnsw<'static, u8, crate::pq::PqDist<M>>,
+        id_map: IdMap,
+        tombstones: TombstoneBitmap,
+    ) -> Self {
+        Self {
+            inner,
+            params,
+            codebook: Arc::new(codebook),
+            id_map,
+            tombstones,
+        }
     }
 }
 

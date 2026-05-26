@@ -66,29 +66,210 @@ impl SharedHnswImpl<{ BOOTSTRAP_M }> {
         self
     }
 
-    /// Snapshot the published main to disk. Stub for the always-PQ
-    /// pivot — the PQ-aware persistence (codebook + graph + arena
-    /// reference) isn't wired yet. Always returns
-    /// `HnswError::SnapshotNotYetImplemented`; callers handle the
-    /// error and skip checkpointing until persistence lands.
+    /// Persist the published main to a directory at the given basename.
+    /// Writes four files per `spec/09_indexing/06_persistence.md §7`:
+    /// `<basename>.hnsw.graph`, `<basename>.hnsw.data`,
+    /// `<basename>.codebook`, and `<basename>.brain` (the wrapper, written
+    /// **last** so its presence marks "snapshot complete"). The wrapper
+    /// carries BLAKE3 hashes of the three sibling files so cross-file
+    /// integrity is verifiable from the wrapper alone.
+    ///
+    /// `taken_at_lsn` is recorded in the wrapper header so recovery
+    /// knows the WAL position to replay past. Pending-buffer state is
+    /// **not** included; the convention is that the snapshot worker
+    /// runs after a checkpoint, so any pending entry at that point
+    /// either landed in the arena (will be replayed on load) or hadn't
+    /// reached durable state yet (no WAL record → not visible at all).
+    ///
+    /// `dir` must already exist (matches `hnsw_rs::Hnsw::file_dump`).
     pub fn save_snapshot(
         &self,
-        _dir: &std::path::Path,
-        _basename: &str,
-        _taken_at_lsn: u64,
-        _shard_uuid: [u8; 16],
+        dir: &std::path::Path,
+        basename: &str,
+        taken_at_lsn: u64,
+        shard_uuid: [u8; 16],
     ) -> Result<(), HnswError> {
-        Err(HnswError::SnapshotNotYetImplemented)
+        use crate::persistence::{compute_footer, Body, Header};
+
+        // 1. Snapshot the published main. ArcSwap → no writer locking.
+        let epoch = self.main.load();
+        let idx = &epoch.index;
+        let params = idx.params();
+
+        // 2. Empty-main guard: `hnsw_rs::Hnsw::file_dump` errors on an
+        //    empty graph. An empty snapshot has no value over the arena-
+        //    rebuild fallback (no nodes to load), so skip the write
+        //    silently. Recovery's `find_latest_snapshot_dir` won't find a
+        //    `<basename>.brain` here and will run the rebuild path.
+        if idx.is_empty() {
+            return Ok(());
+        }
+
+        // 3. Dump the inner graph: hnsw_rs writes
+        //    <basename>.hnsw.graph + <basename>.hnsw.data into `dir`.
+        let _basename_used = idx.file_dump(dir, basename)?;
+
+        // 3. Write the codebook sidecar.
+        let codebook_bytes = (**idx.codebook()).clone().serialize();
+        let codebook_path = dir.join(format!("{basename}.codebook"));
+        std::fs::write(&codebook_path, &codebook_bytes)?;
+
+        // 4. BLAKE3 each sibling file. Read-once, no streaming — the
+        //    largest will be the graph file; load time will repeat the
+        //    same hash before trusting the load (see load_snapshot).
+        let graph_hash = blake3_file(&dir.join(format!("{basename}.hnsw.graph")))?;
+        let data_hash = blake3_file(&dir.join(format!("{basename}.hnsw.data")))?;
+        let codebook_hash = *blake3::hash(&codebook_bytes).as_bytes();
+
+        // 5. Build the wrapper. Header.encode → 64 bytes; Body.encode →
+        //    variable; Footer = BLAKE3(header || body) truncated.
+        let header = Header::new::<{ crate::params::VECTOR_DIM }>(
+            shard_uuid,
+            taken_at_lsn,
+            idx.id_map().len() as u64,
+            params,
+        );
+        let body = Body::encode(
+            idx.id_map(),
+            idx.id_map().next_id(),
+            idx.tombstones(),
+            graph_hash,
+            data_hash,
+            codebook_hash,
+        );
+
+        let mut wrapper = Vec::with_capacity(crate::persistence::HEADER_LEN + body.bytes.len() + crate::persistence::FOOTER_LEN);
+        wrapper.extend_from_slice(&header.encode());
+        wrapper.extend_from_slice(&body.bytes);
+        let footer = compute_footer(&wrapper);
+        wrapper.extend_from_slice(&footer);
+
+        // 6. `.brain` is the snapshot-complete marker. Write last so a
+        //    partial directory (only graph + data written before crash)
+        //    fails the "load .brain first" probe and the caller cleanly
+        //    falls back to arena rebuild.
+        std::fs::write(dir.join(format!("{basename}.brain")), &wrapper)?;
+        Ok(())
     }
 
-    /// Companion to [`Self::save_snapshot`]. Same stub.
+    /// Reload a snapshot triple+wrapper into `(HnswIndexImpl, taken_at_lsn)`.
+    /// Verifies the wrapper's magic + version + header CRC + footer
+    /// BLAKE3, refuses on a `shard_uuid` mismatch, then verifies each
+    /// sibling file's BLAKE3 matches the wrapper body. Any failure
+    /// returns a clear error so the caller can fall back to a fresh
+    /// rebuild.
+    ///
+    /// Returns the bare index rather than a wrapped `(Self, Writer, _)`
+    /// so the caller (`spawn_shard`) can `swap()` the loaded index into
+    /// an already-constructed `SharedHnsw` without disturbing the
+    /// writer it has already wired into the rest of the stack.
     pub fn load_snapshot(
-        _dir: &std::path::Path,
-        _basename: &str,
-        _expected_shard_uuid: [u8; 16],
-    ) -> Result<(Self, Writer, u64), HnswError> {
-        Err(HnswError::SnapshotNotYetImplemented)
+        dir: &std::path::Path,
+        basename: &str,
+        expected_shard_uuid: [u8; 16],
+    ) -> Result<(crate::hnsw::HnswIndexImpl<{ crate::pq::BOOTSTRAP_M }>, u64), HnswError> {
+        use crate::persistence::{
+            read_brain_file, verify_footer, BodyError, Header, HeaderError, ParsedBody,
+            FOOTER_LEN, HEADER_LEN,
+        };
+
+        // 1. Wrapper.
+        let wrapper_path = dir.join(format!("{basename}.brain"));
+        let wrapper = read_brain_file(&wrapper_path)?;
+        if !verify_footer(&wrapper) {
+            return Err(HnswError::SnapshotCorrupt("wrapper footer BLAKE3 mismatch".into()));
+        }
+        if wrapper.len() < HEADER_LEN + FOOTER_LEN {
+            return Err(HnswError::SnapshotCorrupt("wrapper smaller than header+footer".into()));
+        }
+        let header = Header::parse(&wrapper[..HEADER_LEN]).map_err(|e: HeaderError| {
+            HnswError::SnapshotCorrupt(format!("wrapper header: {e:?}"))
+        })?;
+        if header.shard_uuid != expected_shard_uuid {
+            return Err(HnswError::SnapshotCorrupt(format!(
+                "shard_uuid mismatch: expected {:?}, got {:?}",
+                expected_shard_uuid, header.shard_uuid
+            )));
+        }
+        let body_bytes = &wrapper[HEADER_LEN..wrapper.len() - FOOTER_LEN];
+        let body = ParsedBody::parse(body_bytes).map_err(|e: BodyError| {
+            HnswError::SnapshotCorrupt(format!("wrapper body: {e:?}"))
+        })?;
+
+        // 2. Codebook sidecar.
+        let codebook_path = dir.join(format!("{basename}.codebook"));
+        let codebook_bytes = std::fs::read(&codebook_path)?;
+        let computed_codebook_hash = *blake3::hash(&codebook_bytes).as_bytes();
+        if computed_codebook_hash != body.codebook_hash {
+            return Err(HnswError::SnapshotCorrupt("codebook BLAKE3 mismatch".into()));
+        }
+        let codebook = crate::pq::Codebook::<{ crate::pq::BOOTSTRAP_M }>::deserialize(
+            &codebook_bytes,
+        )
+        .map_err(|e| HnswError::SnapshotCorrupt(format!("codebook deserialize: {e}")))?;
+
+        // 3. Graph + data sibling-hash verification.
+        let graph_path = dir.join(format!("{basename}.hnsw.graph"));
+        let data_path = dir.join(format!("{basename}.hnsw.data"));
+        let graph_hash = blake3_file(&graph_path)?;
+        if graph_hash != body.graph_hash {
+            return Err(HnswError::SnapshotCorrupt("graph BLAKE3 mismatch".into()));
+        }
+        let data_hash = blake3_file(&data_path)?;
+        if data_hash != body.data_hash {
+            return Err(HnswError::SnapshotCorrupt("data BLAKE3 mismatch".into()));
+        }
+
+        // 4. hnsw_rs reload with the deserialised codebook's PqDist.
+        //    `load_hnsw_with_dist` returns `Hnsw<'b, ...>` where `'b`
+        //    is bounded by the `HnswIo`'s lifetime. Brain stores the
+        //    inner Hnsw as `'static` (the existing `HnswIndexImpl<M>`
+        //    contract), so we leak the io. The leaked struct is small —
+        //    `PathBuf + String + bool + Option<DataMap>` with DataMap
+        //    unpopulated by `HnswIo::new` — and the leak is bounded by
+        //    `O(shard restarts)`, freed at process exit. The graph itself
+        //    is owned by `Hnsw` after `load_hnsw_with_dist` returns, so
+        //    we're not leaking the graph bytes — only the small handle.
+        let pq_dist = crate::pq::PqDist::<{ crate::pq::BOOTSTRAP_M }>::new(&codebook);
+        let io_ref: &'static mut hnsw_rs::hnswio::HnswIo =
+            Box::leak(Box::new(hnsw_rs::hnswio::HnswIo::new(dir, basename)));
+        let inner = io_ref
+            .load_hnsw_with_dist::<u8, _>(pq_dist)
+            .map_err(|e| HnswError::SnapshotCorrupt(format!("hnsw_rs load: {e}")))?;
+
+        // 5. Rebuild IdMap + TombstoneBitmap + params.
+        let id_map = crate::idmap::IdMap::from_snapshot(body.id_map_entries, body.next_internal_id);
+        let tombstones = crate::tombstones::TombstoneBitmap::from_snapshot(
+            body.tombstone_words,
+            body.tombstone_set_count as usize,
+        );
+        let params = crate::params::IndexParams::default_v1();
+
+        // 6. Assemble. Caller decides whether to wrap with `from_index`
+        //    (standalone usage / tests) or `swap` into an existing
+        //    SharedHnsw (recovery in spawn_shard).
+        let idx = crate::hnsw::HnswIndexImpl::<{ crate::pq::BOOTSTRAP_M }>::from_persisted_parts(
+            params, codebook, inner, id_map, tombstones,
+        );
+        Ok((idx, header.taken_at_lsn))
     }
+}
+
+/// Stream BLAKE3 over a file. Used at save+load time to verify
+/// cross-file integrity in the snapshot triple.
+fn blake3_file(path: &std::path::Path) -> Result<[u8; 32], HnswError> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(*hasher.finalize().as_bytes())
 }
 
 /// Search-time over-fetch factor: pull `K * RERANK_FACTOR` ADC
@@ -316,6 +497,44 @@ impl<const M: usize> SharedHnswImpl<M> {
     #[must_use]
     pub fn epoch(&self) -> u64 {
         self.main.load().epoch_id
+    }
+
+    /// Recovery-only: insert a `(memory_id, vector)` pair directly
+    /// into the pending buffer, bypassing the [`WriterImpl`].
+    ///
+    /// Used by `spawn_shard`'s snapshot-load → tail-replay path. The
+    /// snapshot captures the memory HNSW at `taken_at_lsn`; arena
+    /// records whose `encoded_at_lsn > taken_at_lsn` aren't in the
+    /// loaded main and must be brought forward so the rebuilt index
+    /// reflects every durable write. The writer has already been
+    /// moved into `RealWriterHandle` by the time recovery runs in the
+    /// current shard layout — exposing a direct pending insert avoids
+    /// the alternative of reordering writer construction or holding
+    /// two writers. Boot is single-threaded, so this is safe.
+    ///
+    /// Production write paths must continue to go through
+    /// [`WriterImpl::insert`].
+    pub fn insert_recovery(
+        &self,
+        memory_id: MemoryId,
+        vector: &[f32; crate::params::VECTOR_DIM],
+    ) {
+        let mut pending = self.pending.write();
+        pending.tombstoned.remove(&memory_id);
+        if let Some(slot) = pending
+            .entries
+            .iter_mut()
+            .find(|e| e.memory_id == memory_id)
+        {
+            slot.vector = *vector;
+            slot.tombstoned = false;
+        } else {
+            pending.entries.push(PendingEntry {
+                memory_id,
+                vector: *vector,
+                tombstoned: false,
+            });
+        }
     }
 
     /// Atomically replace the published main with `new_index` and
@@ -623,6 +842,125 @@ mod tests {
         // Sorted descending.
         for w in merged.windows(2) {
             assert!(w[0].1 >= w[1].1);
+        }
+    }
+
+    // ----- Snapshot persistence (Task 3) ---------------------------------
+
+    fn unit_vec(seed: u64) -> [f32; crate::params::VECTOR_DIM] {
+        // Build a deterministic non-zero vector so the HNSW has actual
+        // structure to dump. L2-normalise so PQ distances behave.
+        use crate::params::VECTOR_DIM;
+        let mut v = [0.0_f32; VECTOR_DIM];
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut norm_sq = 0.0_f32;
+        for slot in &mut v {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let f = (((x >> 33) as u32) as f32 / u32::MAX as f32) - 0.5;
+            *slot = f;
+            norm_sq += f * f;
+        }
+        let inv = 1.0 / norm_sq.sqrt();
+        for slot in &mut v {
+            *slot *= inv;
+        }
+        v
+    }
+
+    fn fixture_with_writes(n: usize) -> (SharedHnsw, Writer, Vec<MemoryId>) {
+        let (shared, mut writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let id = MemoryId::pack(0, (i + 1) as u64, 1);
+            writer.insert(id, &unit_vec(i as u64 + 1)).unwrap();
+            ids.push(id);
+        }
+        // Move pending into main: rebuild yields a freshly-published
+        // epoch the snapshot can capture from.
+        shared
+            .flush_with_rebuild(|pending| {
+                let params = shared.params();
+                let codebook = crate::pq::bootstrap_codebook();
+                let pairs: Vec<(MemoryId, [f32; crate::params::VECTOR_DIM])> = pending
+                    .iter()
+                    .map(|e| (e.memory_id, e.vector))
+                    .collect();
+                let (idx, _) = crate::rebuild::rebuild_impl::<{ crate::pq::BOOTSTRAP_M }, _>(
+                    params, codebook, pairs,
+                )?;
+                Ok(idx)
+            })
+            .unwrap();
+        (shared, writer, ids)
+    }
+
+    #[test]
+    fn save_load_round_trips_epoch_and_lsn() {
+        let dir = tempfile::tempdir().unwrap();
+        let basename = "hnsw";
+        let shard_uuid: [u8; 16] = [0xAA; 16];
+        let taken_at_lsn = 12345_u64;
+
+        let (shared, _writer, ids) = fixture_with_writes(5);
+        let len_before = shared.len();
+        shared
+            .save_snapshot(dir.path(), basename, taken_at_lsn, shard_uuid)
+            .expect("save_snapshot");
+
+        let (loaded_idx, lsn) = SharedHnsw::load_snapshot(dir.path(), basename, shard_uuid)
+            .expect("load_snapshot");
+        assert_eq!(lsn, taken_at_lsn);
+        assert_eq!(loaded_idx.len(), len_before);
+        // Every inserted id is in the rehydrated index.
+        for id in &ids {
+            assert!(loaded_idx.contains(*id), "memory {:?} missing after reload", id);
+        }
+    }
+
+    #[test]
+    fn load_rejects_shard_uuid_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, _w, _) = fixture_with_writes(2);
+        shared
+            .save_snapshot(dir.path(), "hnsw", 1, [0xAA; 16])
+            .unwrap();
+        match SharedHnsw::load_snapshot(dir.path(), "hnsw", [0xBB; 16]) {
+            Err(HnswError::SnapshotCorrupt(msg)) => assert!(msg.contains("shard_uuid")),
+            Err(other) => panic!("expected SnapshotCorrupt(shard_uuid), got {other:?}"),
+            Ok(_) => panic!("expected error on uuid mismatch"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_corrupted_graph_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, _w, _) = fixture_with_writes(2);
+        shared.save_snapshot(dir.path(), "hnsw", 1, [0xAA; 16]).unwrap();
+
+        // Flip a byte in the graph file. The wrapper's BLAKE3 over the
+        // graph won't match → SnapshotCorrupt.
+        let graph_path = dir.path().join("hnsw.hnsw.graph");
+        let mut bytes = std::fs::read(&graph_path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&graph_path, bytes).unwrap();
+
+        match SharedHnsw::load_snapshot(dir.path(), "hnsw", [0xAA; 16]) {
+            Err(HnswError::SnapshotCorrupt(msg)) => {
+                assert!(msg.contains("graph") || msg.contains("BLAKE3"), "msg: {msg}");
+            }
+            Err(other) => panic!("expected SnapshotCorrupt(graph), got {other:?}"),
+            Ok(_) => panic!("expected error on graph corruption"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_missing_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        match SharedHnsw::load_snapshot(dir.path(), "hnsw", [0xAA; 16]) {
+            Err(HnswError::SnapshotIo(_)) => {}
+            Err(other) => panic!("expected SnapshotIo(missing), got {other:?}"),
+            Ok(_) => panic!("expected error on missing wrapper"),
         }
     }
 }
