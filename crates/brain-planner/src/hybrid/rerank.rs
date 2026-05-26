@@ -19,9 +19,13 @@ use super::fusion::FusedItem;
 
 /// Top-N cap for the rerank window. RRF feeds at most this many
 /// candidates into the cross-encoder; the model's per-pair cost
-/// dominates wall-time so we keep the window narrow. Aligned with
-/// the W2.2 plan's "top-50 → top-10" budget.
-pub const RERANK_TOP_N: usize = 50;
+/// dominates wall-time, so the window is kept narrow. Set to 10: the
+/// cross-encoder forward is the recall hot-path cost (especially in
+/// debug builds and on CPU), and reranking the top-10 RRF candidates
+/// captures nearly all the ordering benefit at a fraction of the
+/// per-query cost. A candidate ranked outside the top 10 by RRF keeps
+/// its RRF position.
+pub const RERANK_TOP_N: usize = 10;
 
 /// One candidate to be scored. The executor pre-resolves text via
 /// the `texts` table; entries with no text (tombstoned mid-query,
