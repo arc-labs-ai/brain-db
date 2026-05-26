@@ -45,6 +45,25 @@ pub const ENTITY_TRIGRAMS_TABLE: TableDefinition<'static, (u32, [u8; 3], [u8; 16
 pub const ENTITY_MENTIONS_TABLE: TableDefinition<'static, ([u8; 16], [u8; 16]), MentionMetadata> =
     TableDefinition::new("entity_mentions");
 
+/// Bytes per persisted entity vector — 384 f32 components × 4 bytes
+/// each. Pinned to the BGE-small dimensionality. If/when a deployment
+/// migrates to a different model, the row's bytes are still valid for
+/// the model that wrote them; the recovery path (`spec/09/06 §6`)
+/// re-embeds any row whose length doesn't match.
+pub const ENTITY_VECTOR_BYTES: usize = 384 * 4;
+
+/// `EntityId.to_bytes()` → bytemuck-cast `[f32; 384]` as a fixed-size
+/// byte array. Written at entity-create alongside the HNSW insert so
+/// restart can rebuild the entity HNSW from durable vectors without
+/// re-embedding canonical names. A missing row (a pre-feature entity,
+/// or a write that landed before the vector existed) falls back to
+/// re-embed at startup — see `spec/09/06_persistence.md §6`.
+pub const ENTITY_VECTORS_TABLE: TableDefinition<
+    'static,
+    [u8; 16],
+    [u8; ENTITY_VECTOR_BYTES],
+> = TableDefinition::new("entity_vectors");
+
 // ---------------------------------------------------------------------------
 // Status flags (sub-task 16.2).
 // ---------------------------------------------------------------------------

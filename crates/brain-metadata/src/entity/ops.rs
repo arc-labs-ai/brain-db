@@ -32,6 +32,7 @@ use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
 use crate::tables::entity::{
     flags, EntityMetadata, ENTITIES_TABLE, ENTITY_ALIASES_TABLE, ENTITY_BY_CANONICAL_NAME_TABLE,
+    ENTITY_VECTORS_TABLE, ENTITY_VECTOR_BYTES,
 };
 use crate::tables::entity_type::ENTITY_TYPES_TABLE;
 
@@ -185,6 +186,106 @@ pub fn entity_iter_all_live(
             continue;
         }
         out.push((EntityId::from(k.value()), m.canonical_name));
+    }
+    Ok(out)
+}
+
+/// Little-endian byte image of an entity vector. Safe, no-unsafe
+/// conversion (the arena's `bytemuck::Pod` cast lives in `brain-storage`,
+/// the one crate that's allowed `unsafe`). Compile-time array sizing
+/// keeps the dimensionality honest.
+fn vector_to_bytes(vector: &[f32; 384]) -> [u8; ENTITY_VECTOR_BYTES] {
+    let mut out = [0u8; ENTITY_VECTOR_BYTES];
+    for (i, v) in vector.iter().enumerate() {
+        out[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+/// Inverse of [`vector_to_bytes`]. Reads 384 little-endian f32s out of
+/// a 1536-byte image.
+fn bytes_to_vector(bytes: &[u8; ENTITY_VECTOR_BYTES]) -> [f32; 384] {
+    let mut out = [0.0f32; 384];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let chunk: [u8; 4] = bytes[i * 4..(i + 1) * 4].try_into().expect("invariant: fixed slice");
+        *slot = f32::from_le_bytes(chunk);
+    }
+    out
+}
+
+/// Persist an entity's embedding vector at write time. Stores the
+/// little-endian byte image of the f32 array; the table's fixed-size
+/// value enforces the dimensionality. Idempotent: upserts on the
+/// EntityId key, so a re-resolved entity overwrites with the same vector.
+///
+/// See [`spec/09/06_persistence.md §6`](../../../../../spec/09_indexing/06_persistence.md):
+/// stored vectors let restart skip the synchronous re-embed of canonical
+/// names, turning the entity HNSW rebuild from O(N inferences) into
+/// O(N redb reads).
+pub fn entity_vector_put(
+    wtxn: &WriteTransaction,
+    id: EntityId,
+    vector: &[f32; 384],
+) -> Result<(), EntityOpError> {
+    let bytes = vector_to_bytes(vector);
+    let mut t = wtxn.open_table(ENTITY_VECTORS_TABLE)?;
+    t.insert(&id.to_bytes(), &bytes)?;
+    Ok(())
+}
+
+/// Read a persisted entity vector. Returns `Ok(None)` when the row is
+/// absent (entity predates the feature, or its vector hasn't been
+/// written yet) — callers fall back to re-embedding per §6.
+pub fn entity_vector_get(
+    rtxn: &ReadTransaction,
+    id: EntityId,
+) -> Result<Option<[f32; 384]>, EntityOpError> {
+    let t = match rtxn.open_table(ENTITY_VECTORS_TABLE) {
+        Ok(t) => t,
+        // Fresh shard / no entity yet → no table → no vector.
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let row = t.get(&id.to_bytes())?;
+    Ok(row.map(|g| bytes_to_vector(&g.value())))
+}
+
+/// One row yielded by [`entity_iter_all_live_with_vectors`]:
+/// `(EntityId, canonical_name, Option<vector>)`. A `Some` vector goes
+/// straight into the HNSW at restart; a `None` triggers re-embed.
+pub type EntityRebuildRow = (EntityId, String, Option<[f32; 384]>);
+
+/// Iterate every live entity, returning `(EntityId, canonical_name,
+/// Option<vector>)`. The startup rebuild uses this to drive the entity
+/// HNSW from durable vectors: rows whose vector is `Some` go straight
+/// into the index without an embedder call; rows whose vector is
+/// `None` (pre-feature data, or a partial write) fall back to
+/// re-embedding the canonical name per §6.
+pub fn entity_iter_all_live_with_vectors(
+    rtxn: &ReadTransaction,
+) -> Result<Vec<EntityRebuildRow>, EntityOpError> {
+    let entities = rtxn.open_table(ENTITIES_TABLE)?;
+    let vectors = match rtxn.open_table(ENTITY_VECTORS_TABLE) {
+        Ok(t) => Some(t),
+        // Pre-feature shard: no vectors table yet → every entry returns
+        // None, and the caller re-embeds.
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    for entry in entities.iter()? {
+        let (k, v) = entry?;
+        let m = v.value();
+        if m.flags & flags::TOMBSTONED != 0 {
+            continue;
+        }
+        let id_bytes = k.value();
+        let vector = if let Some(vt) = vectors.as_ref() {
+            vt.get(&id_bytes)?.map(|g| bytes_to_vector(&g.value()))
+        } else {
+            None
+        };
+        out.push((EntityId::from(id_bytes), m.canonical_name, vector));
     }
     Ok(out)
 }
@@ -1090,5 +1191,88 @@ mod tests {
                 "tombstoned entity surfaced via trigram {tg:?}"
             );
         }
+    }
+
+    // ----- vector persistence ---------------------------------------------
+
+    fn fixture_vector(seed: f32) -> [f32; 384] {
+        let mut v = [0.0f32; 384];
+        for (i, slot) in v.iter_mut().enumerate() {
+            *slot = seed + (i as f32) * 0.001;
+        }
+        v
+    }
+
+    #[test]
+    fn vector_round_trips_bit_exact() {
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let e = person_entity("Priya");
+        let id = e.id;
+        let v = fixture_vector(0.5);
+
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, &e).unwrap();
+        entity_vector_put(&wtxn, id, &v).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let got = entity_vector_get(&rtxn, id).unwrap().expect("vector present");
+        // Bit-exact: every f32 must survive the little-endian byte round-trip.
+        for i in 0..384 {
+            assert_eq!(got[i].to_bits(), v[i].to_bits(), "mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn vector_get_returns_none_for_missing_row() {
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let e = person_entity("NoVector");
+        let id = e.id;
+
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, &e).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        // Entity exists, but no vector was persisted → caller falls back
+        // to re-embedding per spec/09/06 §6.
+        assert!(entity_vector_get(&rtxn, id).unwrap().is_none());
+    }
+
+    #[test]
+    fn iter_all_live_with_vectors_mixes_stored_and_missing() {
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let with_vec = person_entity("Priya");
+        let without_vec = person_entity("Dana");
+        let id_with = with_vec.id;
+        let id_without = without_vec.id;
+        let v = fixture_vector(0.25);
+
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_put(&wtxn, &with_vec).unwrap();
+            entity_vector_put(&wtxn, id_with, &v).unwrap();
+            entity_put(&wtxn, &without_vec).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let rows = entity_iter_all_live_with_vectors(&rtxn).unwrap();
+        let by_id: std::collections::HashMap<_, _> =
+            rows.into_iter().map(|(id, n, v)| (id, (n, v))).collect();
+        assert_eq!(by_id.len(), 2);
+        let (_, vec_for_with) = &by_id[&id_with];
+        let (_, vec_for_without) = &by_id[&id_without];
+        assert!(
+            vec_for_with.is_some(),
+            "stored vector must surface as Some on the rebuild path"
+        );
+        assert!(
+            vec_for_without.is_none(),
+            "absent vector must surface as None so caller re-embeds"
+        );
     }
 }

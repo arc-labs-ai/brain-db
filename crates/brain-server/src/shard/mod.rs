@@ -1946,26 +1946,44 @@ pub fn spawn_shard(
             // tie-break) from the metadata store. Like the memory HNSW it's
             // in-RAM only and not persisted; without this the resolver loses
             // its embedding tie-break after restart and over-creates
-            // duplicate entities until each surface is re-extracted. The
-            // resolver inserts embed(canonical_name) at entity-create, so
-            // re-embedding canonical names reproduces the stored vectors.
+            // duplicate entities until each surface is re-extracted.
+            //
+            // Prefer the durable vector written at entity-create time
+            // (`spec/09/06_persistence.md §6`): a stored vector goes
+            // straight into the HNSW with no embedder call. Rows
+            // without a stored vector (pre-feature data, or a partial
+            // write) fall back to re-embedding the canonical name.
             match metadata.read_txn() {
-                Ok(rtxn) => match brain_metadata::entity::ops::entity_iter_all_live(&rtxn) {
+                Ok(rtxn) => match brain_metadata::entity::ops::entity_iter_all_live_with_vectors(
+                    &rtxn,
+                ) {
                     Ok(entities) if !entities.is_empty() => {
                         let count = entities.len();
                         let mut pairs: Vec<(brain_core::EntityId, [f32; VECTOR_DIM])> =
                             Vec::with_capacity(count);
+                        let mut from_stored = 0usize;
+                        let mut from_reembed = 0usize;
                         let mut embed_failures = 0usize;
-                        for (id, name) in entities {
-                            match dispatcher.embed(&name) {
-                                Ok(v) => pairs.push((id, v)),
-                                Err(_) => embed_failures += 1,
+                        for (id, name, stored) in entities {
+                            if let Some(v) = stored {
+                                pairs.push((id, v));
+                                from_stored += 1;
+                            } else {
+                                match dispatcher.embed(&name) {
+                                    Ok(v) => {
+                                        pairs.push((id, v));
+                                        from_reembed += 1;
+                                    }
+                                    Err(_) => embed_failures += 1,
+                                }
                             }
                         }
                         match entity_hnsw_for_shard.write().rebuild(pairs) {
                             Ok(_) => info!(
                                 shard_id,
                                 rebuilt = count,
+                                from_stored,
+                                from_reembed,
                                 embed_failures,
                                 "entity HNSW rebuilt from metadata on startup"
                             ),

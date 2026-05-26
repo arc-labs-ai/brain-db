@@ -53,7 +53,9 @@ use brain_embed::Dispatcher;
 use brain_index::entity_hnsw::EntityHnswIndex;
 use brain_index::VECTOR_DIM;
 use brain_llm::LlmClient;
-use brain_metadata::entity::ops::{entity_add_alias, entity_put, normalize_name, EntityOpError};
+use brain_metadata::entity::ops::{
+    entity_add_alias, entity_put, entity_vector_put, normalize_name, EntityOpError,
+};
 use brain_metadata::entity::review::{enqueue_merge_proposal, MergeReviewError};
 use brain_metadata::entity::trigram::TrigramOpError;
 use brain_metadata::entity::types::{
@@ -644,7 +646,7 @@ pub fn resolve_or_create_with_deps(
     // Failures here are non-fatal: the entity row is durable; the
     // worst case is a near-miss future resolve.
     if let Some(deps) = embed_deps {
-        if let Err(reason) = insert_into_entity_hnsw(deps, new_id, surface_form) {
+        if let Err(reason) = insert_into_entity_hnsw(wtxn, deps, new_id, surface_form) {
             tracing::warn!(
                 target: "brain_extractors::resolver",
                 entity_id = ?new_id,
@@ -773,6 +775,7 @@ fn read_entity_type(
 /// (the entity row is already committed; tier-3b becomes unreachable
 /// for paraphrases of this entity until a future HNSW rebuild).
 fn insert_into_entity_hnsw(
+    wtxn: &redb::WriteTransaction,
     deps: &EmbeddingDeps,
     entity_id: EntityId,
     canonical_name: &str,
@@ -781,6 +784,21 @@ fn insert_into_entity_hnsw(
         .embedder
         .embed(canonical_name)
         .map_err(|e| format!("embedder failed: {e}"))?;
+    // Persist the vector before inserting into the in-RAM HNSW. The
+    // persist is the durability hook for restart: on next boot the
+    // entity HNSW rebuilds from these stored vectors without
+    // re-embedding (`spec/09/06_persistence.md §6`). A failure here is
+    // non-fatal — log + fall through to the HNSW insert so the entity
+    // is at least immediately resolvable in this process; on restart
+    // the absent row drops back to the re-embed fallback.
+    if let Err(e) = entity_vector_put(wtxn, entity_id, &vector) {
+        tracing::warn!(
+            target: "brain_extractors::resolver",
+            entity_id = ?entity_id,
+            error = %e,
+            "entity_vector_put failed; HNSW will reseed via re-embed on next restart",
+        );
+    }
     let mut hnsw = deps.hnsw.write();
     if hnsw.contains(entity_id) {
         return Ok(());
