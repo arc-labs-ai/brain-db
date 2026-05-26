@@ -1883,63 +1883,126 @@ pub fn spawn_shard(
             // Keep a clone for the admin `rebuild-ann` route (10.10).
             let rebuild_source_for_shard = rebuild_source.clone();
 
-            // Recovery step 6 (spec 08.04 §2): rebuild the memory HNSW
-            // from the arena before the shard serves. WAL recovery above
-            // restored the arena + metadata + tantivy, but the memory
-            // HNSW lives only in RAM and is created empty each boot. The
-            // maintenance worker rebuilds solely on *degradation*
-            // thresholds (tombstone ratio / recall estimate), which an
-            // empty index never trips — so without this reseed every
-            // pre-restart memory is missing from semantic search until
-            // enough new writes accumulate, and recall silently falls
-            // back to lexical/RRF-only. Runs synchronously here, before
-            // the request loop starts, so the shard is never "ready" with
-            // a half-populated semantic index.
-            match rebuild_source.snapshot_vectors().await {
-                Ok(vectors) if !vectors.is_empty() => {
-                    let params = hnsw_shared.params();
-                    let reseeded = vectors.len();
-                    let outcome = hnsw_shared.flush_with_rebuild(move |pending_snapshot| {
-                        let mut combined = vectors;
-                        // Pending is empty pre-serving, but fold
-                        // defensively so a stray insert can't be lost:
-                        // arena vectors are authoritative; append any
-                        // pending id the arena didn't already cover.
-                        let arena_ids: std::collections::HashSet<brain_core::MemoryId> =
-                            combined.iter().map(|(id, _)| *id).collect();
-                        for entry in pending_snapshot {
-                            if !entry.tombstoned && !arena_ids.contains(&entry.memory_id) {
-                                combined.push((entry.memory_id, entry.vector));
+            // Recovery step 6 (spec 08.04 §8): restore the memory HNSW.
+            // Try snapshot-load first; on any failure (missing, CRC /
+            // version / shard_uuid mismatch, hnsw_rs deserialization),
+            // fall through to a full rebuild from the arena. The
+            // fallback is the same code that landed in c500012 — it's
+            // the original v1 path and is correct on its own.
+            let snapshot_loaded = match find_latest_snapshot_dir(&snapshots_root_for_executor) {
+                Some(snap_dir) => match brain_index::SharedHnsw::load_snapshot(
+                    &snap_dir,
+                    "hnsw",
+                    shard_uuid,
+                ) {
+                    Ok((loaded_idx, taken_at_lsn)) => {
+                        let loaded_len = loaded_idx.len();
+                        hnsw_shared.swap(loaded_idx);
+                        // Tail-replay: any arena entry whose memory_id
+                        // isn't in the loaded main is a write that
+                        // landed between `taken_at_lsn` and the crash.
+                        // Push them into pending via the recovery insert
+                        // path — boot is single-threaded so this is safe.
+                        let mut tail = 0usize;
+                        match rebuild_source.snapshot_vectors().await {
+                            Ok(arena_vectors) => {
+                                for (mid, v) in arena_vectors {
+                                    if !hnsw_shared.contains(mid) {
+                                        hnsw_shared.insert_recovery(mid, &v);
+                                        tail += 1;
+                                    }
+                                }
+                                info!(
+                                    shard_id,
+                                    taken_at_lsn,
+                                    loaded = loaded_len,
+                                    tail_replayed = tail,
+                                    snap_dir = %snap_dir.display(),
+                                    "memory HNSW: loaded snapshot + tail-replayed arena"
+                                );
                             }
+                            Err(e) => warn!(
+                                shard_id,
+                                error = ?e,
+                                "memory HNSW: tail-replay arena scan failed; loaded snapshot \
+                                 alone may miss writes past taken_at_lsn"
+                            ),
                         }
-                        let codebook = brain_index::bootstrap_codebook();
-                        let (idx, _) =
-                            brain_index::rebuild::rebuild_impl::<8, _>(params, codebook, combined)?;
-                        Ok(idx)
-                    });
-                    match outcome {
-                        Ok(report) => info!(
-                            shard_id,
-                            reseeded,
-                            new_epoch = report.new_epoch,
-                            "memory HNSW reseeded from arena on startup"
-                        ),
-                        Err(e) => error!(
-                            shard_id,
-                            error = ?e,
-                            "memory HNSW startup reseed failed; semantic recall degraded until \
-                             the next maintenance rebuild"
-                        ),
+                        true
                     }
+                    Err(e) => {
+                        warn!(
+                            shard_id,
+                            error = %e,
+                            snap_dir = %snap_dir.display(),
+                            "memory HNSW: snapshot load failed; falling back to arena rebuild"
+                        );
+                        false
+                    }
+                },
+                None => false, // no snapshot exists yet — fresh shard or
+                                // checkpoint hasn't run; full rebuild
+                                // below is the v1 path.
+            };
+
+            if !snapshot_loaded {
+                // Fallback: full rebuild from the arena. This is the v1
+                // recovery path — correct on its own; it just costs
+                // O(N·log N) graph-build time vs O(load) for the
+                // snapshot path.
+                match rebuild_source.snapshot_vectors().await {
+                    Ok(vectors) if !vectors.is_empty() => {
+                        let params = hnsw_shared.params();
+                        let reseeded = vectors.len();
+                        let outcome =
+                            hnsw_shared.flush_with_rebuild(move |pending_snapshot| {
+                                let mut combined = vectors;
+                                // Pending is empty pre-serving, but fold
+                                // defensively so a stray insert can't be
+                                // lost: arena vectors are authoritative.
+                                let arena_ids: std::collections::HashSet<brain_core::MemoryId> =
+                                    combined.iter().map(|(id, _)| *id).collect();
+                                for entry in pending_snapshot {
+                                    if !entry.tombstoned
+                                        && !arena_ids.contains(&entry.memory_id)
+                                    {
+                                        combined.push((entry.memory_id, entry.vector));
+                                    }
+                                }
+                                let codebook = brain_index::bootstrap_codebook();
+                                let (idx, _) = brain_index::rebuild::rebuild_impl::<8, _>(
+                                    params, codebook, combined,
+                                )?;
+                                Ok(idx)
+                            });
+                        match outcome {
+                            Ok(report) => info!(
+                                shard_id,
+                                reseeded,
+                                new_epoch = report.new_epoch,
+                                "memory HNSW rebuilt from arena on startup (fallback)"
+                            ),
+                            Err(e) => error!(
+                                shard_id,
+                                error = ?e,
+                                "memory HNSW startup rebuild failed; semantic recall \
+                                 degraded until the next maintenance rebuild"
+                            ),
+                        }
+                    }
+                    Ok(_) => {
+                        info!(
+                            shard_id,
+                            "no arena vectors to rebuild; memory HNSW starts empty"
+                        );
+                    }
+                    Err(e) => error!(
+                        shard_id,
+                        error = ?e,
+                        "memory HNSW startup rebuild: arena snapshot failed; semantic \
+                         recall degraded"
+                    ),
                 }
-                Ok(_) => {
-                    info!(shard_id, "no arena vectors to reseed; memory HNSW starts empty");
-                }
-                Err(e) => error!(
-                    shard_id,
-                    error = ?e,
-                    "memory HNSW startup reseed: arena snapshot failed; semantic recall degraded"
-                ),
             }
 
             // Recovery: rebuild the entity HNSW (resolver tier-3 embedding
@@ -2755,6 +2818,32 @@ fn snapshot_entity_type_qnames(rtxn: &redb::ReadTransaction) -> Result<Vec<Strin
 // ---------------------------------------------------------------------------
 // UUID helper
 // ---------------------------------------------------------------------------
+
+/// Scan a snapshots root for the most-recent checkpoint subdirectory.
+/// Snapshot worker writes each checkpoint into `<root>/<NN20>/` where
+/// `NN20` is a zero-padded 20-digit checkpoint id; the highest id is
+/// the freshest. Returns `None` when the root doesn't exist or contains
+/// no numeric subdirectories — the caller falls back to a full arena
+/// rebuild.
+fn find_latest_snapshot_dir(root: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let id: u64 = match path.file_name().and_then(|n| n.to_str()).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        match &best {
+            Some((cur, _)) if *cur >= id => {}
+            _ => best = Some((id, path)),
+        }
+    }
+    best.map(|(_, p)| p)
+}
 
 fn read_or_generate_uuid(path: &Path) -> Result<[u8; 16], ShardError> {
     match std::fs::read(path) {

@@ -238,6 +238,80 @@ async fn arena_uuid_persists_across_restarts() {
     }
 }
 
+/// Smoke: `take_snapshot()` no longer errors out with
+/// `SnapshotNotYetImplemented`. Drives the worker through the new save path
+/// against an empty HNSW (the basic test harness can't populate the live
+/// HNSW — `append_wal_record` only logs and arena populates at recovery
+/// time). The empty-HNSW guard in `save_snapshot` skips the hnsw_rs
+/// `file_dump` (which errors on empty graphs) so the worker succeeds and the
+/// snapshot directory is created with arena/metadata/manifest siblings, but
+/// no `hnsw.*` files. Recovery on the next spawn then falls back to the
+/// arena-rebuild path (proven by the existing
+/// `memory_hnsw_reseeds_from_arena_after_restart`).
+///
+/// A higher-fidelity test that exercises actual snapshot-load + tail-replay
+/// needs the submit-level write path that drives the live HNSW pre-snapshot;
+/// the brain-index unit test `save_load_round_trips_epoch_and_lsn` covers
+/// the round-trip at the index layer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn take_snapshot_succeeds_on_empty_hnsw_after_pq_pivot() {
+    let dir = TempDir::new().unwrap();
+    {
+        let (handle, joiner) =
+            spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn 1");
+        handle.append_wal_record(encode_record(0, 1)).await.unwrap();
+        // Previously this errored with `SnapshotNotYetImplemented`; the PQ
+        // save_snapshot now succeeds (no-op on the empty HNSW, full write
+        // when the index is populated — see brain-index round-trip test).
+        let _snap_id = handle.take_snapshot().await.expect("take_snapshot");
+        drop(handle);
+        tokio::task::spawn_blocking(move || joiner.join())
+            .await
+            .expect("blocking 1")
+            .expect("join 1");
+    }
+
+    // Snapshot directory was created by the worker for arena/metadata/manifest
+    // (hnsw.* files are absent because the HNSW was empty — see the empty
+    // guard in `SharedHnswImpl::save_snapshot`).
+    let snapshots_root = dir.path().join("0").join("snapshots");
+    assert!(
+        snapshots_root.exists(),
+        "snapshot worker should have created {}",
+        snapshots_root.display()
+    );
+    let snap_subdirs: Vec<_> = std::fs::read_dir(&snapshots_root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .collect();
+    assert!(
+        !snap_subdirs.is_empty(),
+        "expected at least one snapshot subdirectory under {}",
+        snapshots_root.display()
+    );
+
+    // Respawn: recovery sees an empty snapshot dir (no `.brain`) so it falls
+    // through to the arena rebuild path. The single ENCODE record replays
+    // into the arena, then the rebuild puts it into the HNSW.
+    {
+        let (handle, joiner) =
+            spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn 2");
+        let counts = handle.hnsw_snapshot().await.expect("hnsw snapshot");
+        assert_eq!(
+            counts.node_count, 1,
+            "recovery fallback (arena rebuild) must restore the single ENCODE \
+             after a no-op snapshot-load attempt; got {}",
+            counts.node_count
+        );
+        drop(handle);
+        tokio::task::spawn_blocking(move || joiner.join())
+            .await
+            .expect("blocking 2")
+            .expect("join 2");
+    }
+}
+
 /// Regression: the memory HNSW is in-RAM only and rebuilt on startup from the
 /// arena (recovery 08/04 §8). Before the startup reseed landed, a restart left
 /// the index empty — memories survived in the arena/metadata but were invisible
