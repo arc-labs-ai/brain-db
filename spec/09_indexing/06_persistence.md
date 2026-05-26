@@ -18,17 +18,18 @@ function of durable state. See [`08.04 §8`](../08_storage/04_recovery.md).
 
 ## 2. The three indexes
 
-| Index | Source of truth | Vector at rebuild | Rebuild trigger |
+| Index | Source of truth | Restore path | Trigger |
 |---|---|---|---|
-| Memory HNSW | arena (persisted vectors) | read verbatim from the arena | startup, synchronous, before serving |
-| Entity HNSW | redb `ENTITIES_TABLE` (`canonical_name`) | re-embed `canonical_name` | startup, synchronous, before serving |
-| Statement HNSW | redb `STATEMENTS_TABLE` (text) | re-embed via `StatementEmbedWorker` | startup seeds the embed queue; worker repopulates in background |
+| Memory HNSW | snapshot (preferred) + arena (fallback) | `SharedHnsw::load_snapshot` from latest checkpoint; replay arena entries past `taken_at_lsn` into pending. On any snapshot failure, full rebuild from the arena. | startup, synchronous, before serving |
+| Entity HNSW | `ENTITY_VECTORS_TABLE` (preferred) + `ENTITIES_TABLE.canonical_name` (fallback) | read stored vector for each live entity; re-embed canonical name when the row is absent | startup, synchronous, before serving |
+| Statement HNSW | `STATEMENTS_TABLE` (text) | seed the embed queue; `StatementEmbedWorker` repopulates the index | startup seeds the queue; worker repopulates in background |
 
-The resolver inserts `embed(canonical_name)` at entity-create, so re-embedding
-canonical names on restart reproduces the stored vectors exactly. The statement
-embedder builds `subject + predicate + object` text; seeding the embed queue
-with every live statement lets the existing worker reproduce those vectors
-without duplicating its text-assembly logic.
+Entity vectors are persisted at write time by the resolver (see §6) so the
+common path is a pure redb read with zero embedder calls. The fallback only
+fires for pre-feature rows. The statement embedder builds `subject + predicate
++ object` text; seeding the embed queue with every live statement lets the
+existing worker reproduce those vectors without duplicating its text-assembly
+logic.
 
 ## 3. Liveness & idempotency
 
@@ -66,11 +67,31 @@ calls**. This is a write-path + schema change (a redb version bump); the
 rebuild-from-text path in §2 is the baseline and remains the fallback when a
 vector is absent (a row written before the feature, or a partial write).
 
-## 7. (Future) graph snapshot persistence
+## 7. Memory-HNSW graph snapshot persistence
 
-Persisting the PQ-HNSW graph itself (the `SharedHnsw::save_snapshot` /
-`load_snapshot` path, currently `SnapshotNotYetImplemented`) would make restart
-O(load) with no rebuild at all, at the cost of snapshot CRC + checkpoint-LSN
-machinery and tail-replay. Deferred until restart latency at scale is a
-measured problem; it supersedes §2's rebuild for the memory index when adopted,
-and requires a corresponding revision of [`08.04 §8`](../08_storage/04_recovery.md).
+`SharedHnsw::save_snapshot` / `load_snapshot` persist the PQ-HNSW graph itself
+so restart is O(load) for the memory index when a snapshot is available.
+A snapshot is a directory containing four files at one shared basename:
+
+- `<basename>.hnsw.graph` — `hnsw_rs` graph dump.
+- `<basename>.hnsw.data` — `hnsw_rs` data dump.
+- `<basename>.codebook` — the PQ codebook bytes (forward-compatible with
+  per-shard retraining; today's `bootstrap_codebook` is deterministic, but a
+  future where shards retrain still works because the snapshot binds its own
+  codebook).
+- `<basename>.brain` — the wrapper, written **last**. Header CRC + footer
+  BLAKE3 over wrapper-self; the wrapper body carries BLAKE3 hashes of the
+  three sibling files for cross-file integrity. Any verification failure on
+  load returns a clear error and the caller (recovery) falls back to the
+  full arena rebuild from §2.
+
+The snapshot binds a `taken_at_lsn` so recovery knows the WAL position past
+which arena entries must be replayed into the pending buffer to bring the
+loaded main forward to the latest durable LSN. The snapshot worker writes
+snapshots at every checkpoint (see [08.05](../08_storage/05_checkpointing.md));
+recovery picks the most-recent valid snapshot under `<snapshots_root>/`.
+
+Entity-vector persistence (§6) is the analogous mechanism for the entity HNSW,
+without the graph dump — the entity index rebuilds the graph from stored
+vectors. A statement-vector / graph snapshot is a possible future
+optimization; today's statement HNSW restores via the embed queue.
