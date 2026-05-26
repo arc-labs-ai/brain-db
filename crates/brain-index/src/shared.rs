@@ -894,6 +894,21 @@ mod tests {
         (shared, writer, ids)
     }
 
+    /// Stub ArenaReader for round-trip search tests: returns the
+    /// fixture vectors so `search_active`'s rerank step has something
+    /// to read. (The production reader serves from the mmap'd arena.)
+    struct StubArenaReader {
+        vectors: std::collections::HashMap<MemoryId, [f32; crate::params::VECTOR_DIM]>,
+    }
+    impl crate::arena_reader::ArenaReader for StubArenaReader {
+        fn read(
+            &self,
+            memory_id: MemoryId,
+        ) -> Option<[f32; crate::params::VECTOR_DIM]> {
+            self.vectors.get(&memory_id).copied()
+        }
+    }
+
     #[test]
     fn save_load_round_trips_epoch_and_lsn() {
         let dir = tempfile::tempdir().unwrap();
@@ -901,8 +916,33 @@ mod tests {
         let shard_uuid: [u8; 16] = [0xAA; 16];
         let taken_at_lsn = 12345_u64;
 
-        let (shared, _writer, ids) = fixture_with_writes(5);
-        let len_before = shared.len();
+        let (shared_no_arena, _writer, ids) = fixture_with_writes(5);
+        let len_before = shared_no_arena.len();
+
+        // Wire a stub arena reader that returns the same fixture
+        // vectors so search's rerank pass has something to read.
+        let arena_vecs: std::collections::HashMap<_, _> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, unit_vec(i as u64 + 1)))
+            .collect();
+        let stub_reader: std::sync::Arc<dyn crate::arena_reader::ArenaReader> =
+            std::sync::Arc::new(StubArenaReader {
+                vectors: arena_vecs.clone(),
+            });
+        let shared = shared_no_arena.with_arena(stub_reader);
+
+        // Pre-snapshot search baseline. Query against one of the inserted
+        // vectors so the expected top-1 is deterministic: the inserted
+        // memory itself. We compare against this baseline post-load to
+        // prove the PQ codes round-tripped *semantically*, not just that
+        // node_count matches.
+        let query = unit_vec(1);
+        let pre_results = shared.search_active(&query, 5, None);
+        let pre_top1 = *pre_results
+            .first()
+            .expect("pre-snapshot search returned no results");
+
         shared
             .save_snapshot(dir.path(), basename, taken_at_lsn, shard_uuid)
             .expect("save_snapshot");
@@ -915,6 +955,34 @@ mod tests {
         for id in &ids {
             assert!(loaded_idx.contains(*id), "memory {:?} missing after reload", id);
         }
+
+        // Wrap the loaded index in a SharedHnsw with the same stub
+        // arena so search runs through the same rerank machinery.
+        let stub_reader2: std::sync::Arc<dyn crate::arena_reader::ArenaReader> =
+            std::sync::Arc::new(StubArenaReader { vectors: arena_vecs });
+        let (loaded_shared, _loaded_writer) =
+            SharedHnsw::from_index(loaded_idx, stub_reader2);
+        let post_results = loaded_shared.search_active(&query, 5, None);
+        let post_top1 = *post_results
+            .first()
+            .expect("post-load search returned no results");
+
+        // The top-1 memory id must match. Score may drift slightly (PQ
+        // ADC tables are reconstructed from the deserialised codebook —
+        // identical bits → identical scores in this fixture), but
+        // identity is the semantic-correctness check.
+        assert_eq!(
+            pre_top1.0, post_top1.0,
+            "top-1 id changed across snapshot round-trip: \
+             pre={:?} post={:?}",
+            pre_top1.0, post_top1.0
+        );
+        assert!(
+            (pre_top1.1 - post_top1.1).abs() < 1e-4,
+            "top-1 score drifted: pre={} post={}",
+            pre_top1.1,
+            post_top1.1
+        );
     }
 
     #[test]
@@ -961,6 +1029,99 @@ mod tests {
             Err(HnswError::SnapshotIo(_)) => {}
             Err(other) => panic!("expected SnapshotIo(missing), got {other:?}"),
             Ok(_) => panic!("expected error on missing wrapper"),
+        }
+    }
+
+    // ----- Chaos: partial-write / corruption scenarios -------------------
+    //
+    // Simulates each plausible kill-during-snapshot state by manually
+    // mutating the on-disk snapshot. The invariant we're protecting
+    // (`CLAUDE.md §5.7`, "no silent corruption") is: any load failure
+    // surfaces as `Err(_)` — never a panic, never a silently-wrong load.
+    // Recovery's contract is that a bad snapshot triggers the arena-
+    // rebuild fallback; these tests check the "bad snapshot" detection
+    // side of that contract.
+
+    #[test]
+    fn load_rejects_truncated_brain_wrapper() {
+        // Crash mid-write of the .brain wrapper: bytes are present but
+        // the footer or trailing body fields are missing.
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, _w, _) = fixture_with_writes(2);
+        shared.save_snapshot(dir.path(), "hnsw", 1, [0xAA; 16]).unwrap();
+        let wrapper_path = dir.path().join("hnsw.brain");
+        let mut bytes = std::fs::read(&wrapper_path).unwrap();
+        // Chop the last 16 bytes — strips the footer and bites into the
+        // trailing codebook_hash field.
+        bytes.truncate(bytes.len() - 16);
+        std::fs::write(&wrapper_path, bytes).unwrap();
+        match SharedHnsw::load_snapshot(dir.path(), "hnsw", [0xAA; 16]) {
+            Err(HnswError::SnapshotCorrupt(_)) => {}
+            Err(other) => panic!("expected SnapshotCorrupt(truncated), got {other:?}"),
+            Ok(_) => panic!("truncated wrapper must not load"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_missing_codebook() {
+        // Crash between graph-dump and codebook write: graph+data on
+        // disk, .brain present (we simulate by writing then removing
+        // the codebook). The wrapper's BLAKE3 over the (now-missing)
+        // codebook can't match, but the I/O error fires first.
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, _w, _) = fixture_with_writes(2);
+        shared.save_snapshot(dir.path(), "hnsw", 1, [0xAA; 16]).unwrap();
+        std::fs::remove_file(dir.path().join("hnsw.codebook")).unwrap();
+        match SharedHnsw::load_snapshot(dir.path(), "hnsw", [0xAA; 16]) {
+            Err(HnswError::SnapshotIo(_)) => {}
+            Err(HnswError::SnapshotCorrupt(_)) => {} // also acceptable
+            Err(other) => panic!("expected SnapshotIo|SnapshotCorrupt, got {other:?}"),
+            Ok(_) => panic!("missing codebook must not load"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_corrupted_codebook_bytes() {
+        // Codebook bytes flipped (e.g., disk bit-rot or partial write).
+        // Cross-file BLAKE3 in the wrapper catches it.
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, _w, _) = fixture_with_writes(2);
+        shared.save_snapshot(dir.path(), "hnsw", 1, [0xAA; 16]).unwrap();
+        let cb_path = dir.path().join("hnsw.codebook");
+        let mut bytes = std::fs::read(&cb_path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&cb_path, bytes).unwrap();
+        match SharedHnsw::load_snapshot(dir.path(), "hnsw", [0xAA; 16]) {
+            Err(HnswError::SnapshotCorrupt(msg)) => {
+                assert!(
+                    msg.contains("codebook") || msg.contains("BLAKE3"),
+                    "msg: {msg}"
+                );
+            }
+            Err(other) => panic!("expected SnapshotCorrupt(codebook), got {other:?}"),
+            Ok(_) => panic!("corrupted codebook must not load"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_corrupted_data_file() {
+        // The .hnsw.data file's BLAKE3 must match the wrapper body. Flip
+        // a byte well past hnsw_rs's own magic prefix.
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, _w, _) = fixture_with_writes(2);
+        shared.save_snapshot(dir.path(), "hnsw", 1, [0xAA; 16]).unwrap();
+        let data_path = dir.path().join("hnsw.hnsw.data");
+        let mut bytes = std::fs::read(&data_path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&data_path, bytes).unwrap();
+        match SharedHnsw::load_snapshot(dir.path(), "hnsw", [0xAA; 16]) {
+            Err(HnswError::SnapshotCorrupt(msg)) => {
+                assert!(msg.contains("data") || msg.contains("BLAKE3"), "msg: {msg}");
+            }
+            Err(other) => panic!("expected SnapshotCorrupt(data), got {other:?}"),
+            Ok(_) => panic!("corrupted data file must not load"),
         }
     }
 }
