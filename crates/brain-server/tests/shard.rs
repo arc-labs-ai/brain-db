@@ -238,6 +238,51 @@ async fn arena_uuid_persists_across_restarts() {
     }
 }
 
+/// Regression: the memory HNSW is in-RAM only and rebuilt on startup from the
+/// arena (recovery 08/04 §8). Before the startup reseed landed, a restart left
+/// the index empty — memories survived in the arena/metadata but were invisible
+/// to semantic recall. This proves the reseed: WAL ENCODEs replayed into the
+/// arena reappear as HNSW nodes after a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_hnsw_reseeds_from_arena_after_restart() {
+    let dir = TempDir::new().unwrap();
+
+    // Run 1: append three ENCODE records to the WAL, then shut down cleanly.
+    // `append_wal_record` only logs; the arena is populated by replay on the
+    // next open, so this run's HNSW stays empty.
+    {
+        let (handle, joiner) =
+            spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn 1");
+        handle.append_wal_record(encode_record(0, 1)).await.unwrap();
+        handle.append_wal_record(encode_record(1, 2)).await.unwrap();
+        handle.append_wal_record(encode_record(2, 3)).await.unwrap();
+        drop(handle);
+        tokio::task::spawn_blocking(move || joiner.join())
+            .await
+            .expect("blocking 1")
+            .expect("join 1");
+    }
+
+    // Run 2: respawn on the same dir. Recovery replays the three ENCODEs into
+    // the arena, and the startup reseed rebuilds the memory HNSW from it.
+    {
+        let (handle, joiner) =
+            spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn 2");
+        let counts = handle.hnsw_snapshot().await.expect("hnsw snapshot");
+        assert_eq!(
+            counts.node_count, 3,
+            "memory HNSW must be reseeded from the arena on restart (got {})",
+            counts.node_count
+        );
+        assert_eq!(counts.tombstone_count, 0);
+        drop(handle);
+        tokio::task::spawn_blocking(move || joiner.join())
+            .await
+            .expect("blocking 2")
+            .expect("join 2");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shard_uuid_mismatch_errors_on_reopen() {
     let dir = TempDir::new().unwrap();
