@@ -1,7 +1,6 @@
 //! `Wal` — the public per-shard WAL handle.
 //!
-//! Composes [`WalSegment`] (sub-task 2.6), [`GroupCommitter`] (sub-task 2.8 →
-//! ported to Glommio in 9.6a), and [`WalReader`] (sub-task 2.7) into one type
+//! Composes [`WalSegment`], [`GroupCommitter`], and [`WalReader`] into one type
 //! that:
 //!
 //! - Allocates monotonic LSNs (LSN 0 reserved; first
@@ -262,74 +261,69 @@ impl Wal {
     pub async fn append(&self, mut record: WalRecord) -> Result<Lsn, WalError> {
         let record_bytes = record.encoded_len();
 
-        // Phase A: short borrow — validate size, decide rollover, assign LSN.
-        // Crucial: drop the borrow before any `.await`.
-        enum Action {
-            Append { lsn: u64 },
-            Rollover { lsn_before_rollover: u64 },
-        }
-        let mut action = {
-            let inner = self.inner.borrow();
-            let segment_capacity_bytes = inner
-                .config
-                .max_segment_bytes
-                .saturating_sub(WAL_SEGMENT_HEADER_LEN);
-            if record_bytes > segment_capacity_bytes {
-                return Err(WalError::RecordExceedsSegmentLimit {
-                    record_bytes,
-                    segment_max: inner.config.max_segment_bytes,
-                });
+        // LSN assignment + committer enqueue + counter bump happen in ONE
+        // synchronous `borrow_mut`, with no `.await` between reading
+        // `next_lsn` and bumping it. This is the critical invariant: the
+        // committer's `append` is a synchronous flume push, so the borrow
+        // window never spans a yield. Without it, two appends racing on the
+        // same single-threaded executor (e.g. the writer's WAL-drain task
+        // and the snapshot worker's CHECKPOINT records) could both read the
+        // same `next_lsn` across the await and stamp duplicate LSNs —
+        // recovery then trips `WalReadError::LsnGap`. Mirrors `append_many`.
+        //
+        // Bumping `next_lsn` before durability is safe: a flush failure
+        // makes the WAL "broken" and every subsequent append errors, so no
+        // LSN-reuse window opens. Rollover is the one async step; it runs
+        // outside the critical section and the loop re-checks afterward.
+        loop {
+            enum Action {
+                Enqueued { lsn: u64, handle: AppendHandle },
+                Rollover,
             }
-            let lsn = inner.next_lsn;
-            let projected = WAL_SEGMENT_HEADER_LEN + inner.bytes_in_active_segment + record_bytes;
-            if projected > inner.config.max_segment_bytes {
-                Action::Rollover {
-                    lsn_before_rollover: lsn,
+            let action = {
+                let mut inner = self.inner.borrow_mut();
+                let segment_capacity_bytes = inner
+                    .config
+                    .max_segment_bytes
+                    .saturating_sub(WAL_SEGMENT_HEADER_LEN);
+                if record_bytes > segment_capacity_bytes {
+                    return Err(WalError::RecordExceedsSegmentLimit {
+                        record_bytes,
+                        segment_max: inner.config.max_segment_bytes,
+                    });
                 }
-            } else {
-                Action::Append { lsn }
-            }
-        };
-
-        // Phase B: if rollover is needed, do it (drops + re-spawns committer)
-        // while no borrow is held.
-        if let Action::Rollover {
-            lsn_before_rollover,
-        } = action
-        {
-            self.rollover().await?;
-            action = Action::Append {
-                lsn: lsn_before_rollover,
+                let lsn = inner.next_lsn;
+                let projected =
+                    WAL_SEGMENT_HEADER_LEN + inner.bytes_in_active_segment + record_bytes;
+                if projected > inner.config.max_segment_bytes {
+                    Action::Rollover
+                } else {
+                    record.lsn = Lsn(lsn);
+                    let committer = inner
+                        .committer
+                        .as_ref()
+                        .expect("committer present between rollovers");
+                    let handle = committer.append(record.clone())?;
+                    inner.bytes_in_active_segment += record_bytes;
+                    inner.next_lsn = lsn + 1;
+                    Action::Enqueued { lsn, handle }
+                }
             };
+
+            match action {
+                Action::Rollover => {
+                    self.rollover().await?;
+                    continue;
+                }
+                Action::Enqueued { lsn, handle } => {
+                    // Await durability with no borrow held — other appends
+                    // may reserve their (later) LSNs and enqueue meanwhile.
+                    let durable_lsn = handle.wait().await?;
+                    debug_assert_eq!(durable_lsn, lsn, "committer ack returned wrong LSN");
+                    return Ok(Lsn(lsn));
+                }
+            }
         }
-
-        let Action::Append { lsn } = action else {
-            unreachable!("rollover branch handled above");
-        };
-
-        record.lsn = Lsn(lsn);
-
-        // Phase C: short borrow — enqueue. Drop borrow before await.
-        let handle = {
-            let inner = self.inner.borrow();
-            let committer = inner
-                .committer
-                .as_ref()
-                .expect("committer present between rollovers");
-            committer.append(record.clone())?
-        };
-
-        // Phase D: await durability without holding any borrow.
-        let durable_lsn = handle.wait().await?;
-        debug_assert_eq!(durable_lsn, lsn, "committer ack returned wrong LSN");
-
-        // Phase E: short borrow — bump counters.
-        {
-            let mut inner = self.inner.borrow_mut();
-            inner.bytes_in_active_segment += record_bytes;
-            inner.next_lsn = lsn + 1;
-        }
-        Ok(Lsn(lsn))
     }
 
     /// Append a batch of records under one logical "submit". All records
@@ -360,7 +354,7 @@ impl Wal {
         while let Some(mut record) = pending.take().or_else(|| iter.next()) {
             let record_bytes = record.encoded_len();
 
-            // Phase A: short borrow — validate size, decide rollover, assign LSN.
+            // Step A: short borrow — validate size, decide rollover, assign LSN.
             enum Action {
                 Append { lsn: u64 },
                 Rollover,
@@ -437,7 +431,7 @@ impl Wal {
     }
 
     async fn rollover(&self) -> Result<(), WalError> {
-        // Phase A: take the old committer + capture state under a short borrow.
+        // Step A: take the old committer + capture state under a short borrow.
         let (old_committer, dir, shard_uuid, new_seq, new_starting_lsn, group_commit_cfg) = {
             let mut inner = self.inner.borrow_mut();
             let old_committer = inner
@@ -454,17 +448,17 @@ impl Wal {
             )
         };
 
-        // Phase B: shutdown the old committer (await) without any borrow held.
+        // Step B: shutdown the old committer (await) without any borrow held.
         let old_segment = old_committer.shutdown().await?;
         old_segment.close().await?;
 
-        // Phase C: create the new segment, fsync the directory.
+        // Step C: create the new segment, fsync the directory.
         let new_path = segment_path(&dir, new_seq);
         let new_segment =
             WalSegment::create_new(&new_path, new_seq, new_starting_lsn, shard_uuid).await?;
         fsync_dir(&dir)?;
 
-        // Phase D: re-install the new committer + state under a short borrow.
+        // Step D: re-install the new committer + state under a short borrow.
         {
             let mut inner = self.inner.borrow_mut();
             inner.committer = Some(GroupCommitter::start(new_segment, group_commit_cfg));
@@ -691,6 +685,62 @@ mod tests {
         let reader = WalReader::open(&path, uuid(1)).unwrap();
         let r = reader.into_iter().next().unwrap().unwrap();
         assert_eq!(r.lsn, Lsn(1));
+    }
+
+    #[test]
+    fn concurrent_appends_assign_distinct_contiguous_lsns() {
+        // Regression for the append() LSN race. Two appends running on
+        // the same single-threaded executor interleave at the
+        // `handle.wait().await` durability point. The committer enqueue
+        // and the `next_lsn` bump now happen in one synchronous borrow
+        // *before* that await — so a task that yields can never leave a
+        // stale `next_lsn` for the other task to re-read. The historical
+        // bug bumped after the await: task B read task A's un-bumped LSN,
+        // stamped a duplicate, and recovery tripped LsnGap.
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_owned();
+        let p = path.clone();
+        const PER_TASK: u64 = 50;
+        glommio_run(move || async move {
+            let wal = Rc::new(Wal::create(&p, uuid(7)).await.unwrap());
+
+            let w1 = wal.clone();
+            let t1 = glommio::spawn_local(async move {
+                let mut got = Vec::new();
+                for _ in 0..PER_TASK {
+                    got.push(w1.append(record(0)).await.unwrap().raw());
+                }
+                got
+            });
+            let w2 = wal.clone();
+            let t2 = glommio::spawn_local(async move {
+                let mut got = Vec::new();
+                for _ in 0..PER_TASK {
+                    got.push(w2.append(record(0)).await.unwrap().raw());
+                }
+                got
+            });
+
+            let mut all: Vec<u64> = t1.await;
+            all.extend(t2.await);
+            all.sort_unstable();
+
+            // Every LSN distinct and exactly 1..=2*PER_TASK — no dup, no gap.
+            assert_eq!(
+                all,
+                (1..=2 * PER_TASK).collect::<Vec<_>>(),
+                "concurrent appends must assign distinct, contiguous LSNs"
+            );
+
+            wal.shutdown_in_place().await.unwrap();
+        });
+
+        // Recovery enforces sequential LSNs; a dup would surface as LsnGap.
+        let reader = WalReader::open(&path, uuid(7)).unwrap();
+        let lsns: Vec<u64> = reader.into_iter().map(|r| r.unwrap().lsn.raw()).collect();
+        assert_eq!(lsns, (1..=2 * PER_TASK).collect::<Vec<_>>());
     }
 
     // ----- End-to-end round-trip --------------------------------------
@@ -956,7 +1006,7 @@ mod tests {
     //
     // Sibling task increments a counter every 100 µs while we burst-append
     // 200 records. Asserts the counter advanced — i.e. the executor was
-    // NOT stalled inside fsync (which would be the SD-2.8-2 v1 behavior).
+    // NOT stalled inside fsync.
 
     #[test]
     fn wal_append_does_not_block_executor() {
