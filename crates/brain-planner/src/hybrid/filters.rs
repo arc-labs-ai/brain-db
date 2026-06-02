@@ -237,6 +237,12 @@ fn filter_confidence(
     for item in items {
         let keep = match item.id {
             RankedItemId::Memory(id) => {
+                // Memory hits are filtered by salience by design — a strong but
+                // decayed memory should drop out of a "give me what still
+                // matters" recall. Cosine similarity has its own gate (the
+                // surfaced `confidence` / similarity_score), and raw relevance
+                // has `salience_floor`; this filter is the importance cut. Do
+                // not "correct" this to similarity to match older spec text.
                 let Some(salience) = memory_salience(rtxn, id)? else {
                     continue;
                 };
