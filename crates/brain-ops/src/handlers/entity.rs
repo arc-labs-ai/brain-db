@@ -32,7 +32,7 @@ use brain_protocol::{
     EntityRenameResponse, EntityRenamedEvent, EntityResolveRequest, EntityResolveResponse,
     EntityTombstoneRequest, EntityTombstoneResponse, EntityTombstonedEvent, EntityUnmergeRequest,
     EntityUnmergeResponse, EntityUnmergedEvent, EntityUpdateRequest, EntityUpdateResponse,
-    EntityUpdatedEvent, EntityView, KnowledgeEventPayload, ResolutionOutcomeWire,
+    EntityUpdatedEvent, EntityView, GraphEventPayload, ResolutionOutcomeWire,
 };
 
 use crate::context::OpsContext;
@@ -93,10 +93,10 @@ pub async fn handle_entity_create(
     };
 
     // Emit ENTITY_CREATED event post-commit.
-    emit_knowledge_event(
+    emit_graph_event(
         ctx,
         EventType::EntityCreated,
-        KnowledgeEventPayload::EntityCreated(EntityCreatedEvent {
+        GraphEventPayload::EntityCreated(EntityCreatedEvent {
             entity_id: created_id.to_bytes(),
             entity_type_id: req.entity_type_id,
             canonical_name: req.canonical_name,
@@ -175,10 +175,10 @@ pub async fn handle_entity_update(
         }
     };
 
-    emit_knowledge_event(
+    emit_graph_event(
         ctx,
         EventType::EntityUpdated,
-        KnowledgeEventPayload::EntityUpdated(EntityUpdatedEvent {
+        GraphEventPayload::EntityUpdated(EntityUpdatedEvent {
             entity_id: id.to_bytes(),
             entity_type_id: after.entity_type.raw(),
             canonical_name: after.canonical_name.clone(),
@@ -242,10 +242,10 @@ pub async fn handle_entity_rename(
         }
     };
 
-    emit_knowledge_event(
+    emit_graph_event(
         ctx,
         EventType::EntityRenamed,
-        KnowledgeEventPayload::EntityRenamed(EntityRenamedEvent {
+        GraphEventPayload::EntityRenamed(EntityRenamedEvent {
             entity_id: id.to_bytes(),
             old_canonical_name,
             new_canonical_name: req.new_canonical_name,
@@ -307,10 +307,10 @@ pub async fn handle_entity_merge(
     };
 
     // Emit ENTITY_MERGED event.
-    emit_knowledge_event(
+    emit_graph_event(
         ctx,
         EventType::EntityMerged,
-        KnowledgeEventPayload::EntityMerged(EntityMergedEvent {
+        GraphEventPayload::EntityMerged(EntityMergedEvent {
             survivor: req.survivor,
             merged: req.merged,
             audit_id: audit_id.to_bytes(),
@@ -365,10 +365,10 @@ pub async fn handle_entity_unmerge(
 
     // audit_id is not returned by the metadata unmerge helper today;
     // emit [0;16] as the sentinel until that API surfaces it.
-    emit_knowledge_event(
+    emit_graph_event(
         ctx,
         EventType::EntityUnmerged,
-        KnowledgeEventPayload::EntityUnmerged(EntityUnmergedEvent {
+        GraphEventPayload::EntityUnmerged(EntityUnmergedEvent {
             restored_entity_id: merged.to_bytes(),
             from_survivor: survivor.to_bytes(),
             audit_id: [0; 16],
@@ -445,10 +445,10 @@ pub async fn handle_entity_tombstone(
         }
     };
 
-    emit_knowledge_event(
+    emit_graph_event(
         ctx,
         EventType::EntityTombstoned,
-        KnowledgeEventPayload::EntityTombstoned(EntityTombstonedEvent {
+        GraphEventPayload::EntityTombstoned(EntityTombstonedEvent {
             entity_id: id.to_bytes(),
             reason: req.reason,
         }),
@@ -836,9 +836,9 @@ fn map_entity_op_error(err: EntityOpError) -> OpError {
     }
 }
 
-// `emit_knowledge_event` + `wal_kind_for_event` moved to
-// `crate::handlers::events`. Re-exported so other knowledge handler
-// modules that still import via `crate::handlers::entity::emit_knowledge_event`
+// `emit_graph_event` + `wal_kind_for_event` moved to
+// `crate::handlers::events`. Re-exported so other typed-graph handler
+// modules that still import via `crate::handlers::entity::emit_graph_event`
 // keep compiling; once those imports flip to the new path the
 // re-export can drop too.
-pub(crate) use crate::handlers::events::emit_knowledge_event;
+pub(crate) use crate::handlers::events::emit_graph_event;

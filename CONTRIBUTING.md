@@ -42,8 +42,8 @@ three-tier extractor pipeline.
   start.
 - [`ROADMAP.md`](ROADMAP.md) — phase index.
 - [`CLAUDE.md`](CLAUDE.md) — operating rules + invariants.
-- [`docs/development/`](docs/development/) — contributor
-  workflow.
+- [`AUTONOMY.md`](AUTONOMY.md) — contributor workflow + commit
+  conventions.
 
 ## Core invariants — DO NOT violate
 

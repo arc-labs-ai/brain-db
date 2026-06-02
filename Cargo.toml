@@ -20,10 +20,6 @@ members = [
     "crates/brain-ops",
     "crates/brain-workers",
     "crates/brain-server",
-    "crates/brain-sdk-rust",
-    "crates/brain-cli",
-    "crates/brain-shell",
-    "crates/brain-explore",
     "crates/brain-http",
 ]
 exclude = ["fuzz"]
@@ -85,6 +81,16 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rkyv = { version = "0.7", features = ["validation"] }
 bytemuck = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+serde_repr = "0.1"
+# Encodes fixed `[u8; N]` and `Vec<u8>` wire fields as CBOR byte strings
+# (major type 2) rather than serde's default integer arrays, so a
+# third-party client reading "16-byte id" from the spec produces
+# byte-identical bytes.
+serde_bytes = "0.11"
+# Portable, self-describing wire payload encoding (RFC 8949 CBOR). Pure-Rust,
+# serde-native. Replaces rkyv on the wire so any language can speak the
+# protocol from the spec alone; rkyv stays for internal on-disk storage.
+ciborium = "0.2"
 serde_json = "1"
 toml = "0.8"
 # Schema DSL parser (phase 19.3) — PEG grammar for `schema.brain`.
@@ -145,15 +151,6 @@ uuid = { version = "1.7", features = ["v7", "serde"] }
 # Errors
 thiserror = "1"
 anyhow = "1"
-
-# `brain-shell` CLI: clap for the argv + REPL command tree, rustyline
-# for line editing + persistent history, dirs for XDG history-file
-# discovery. Self-contained to the shell crate; no other workspace
-# member depends on these.
-clap = { version = "4", features = ["derive", "env", "wrap_help"] }
-clap_complete = "4"
-rustyline = "14"
-dirs = "5"
 
 # Syscalls (mmap/mremap/munmap/fallocate/msync/madvise — used by brain-storage).
 libc = "0.2"

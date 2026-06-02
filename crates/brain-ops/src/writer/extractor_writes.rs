@@ -11,7 +11,7 @@
 //! ## Why not call the wire handlers directly?
 //!
 //! Wire handlers consult `OpsContext` for the schema gate, emit
-//! knowledge events on the bus, and project to wire view types. The
+//! typed-graph events on the bus, and project to wire view types. The
 //! worker doesn't need those steps — the schema filter runs upstream
 //! (E.7), events fire via the parent ENCODE notification, and the
 //! mention edge / statement / relation rows are the worker's only

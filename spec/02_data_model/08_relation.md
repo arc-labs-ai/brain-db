@@ -417,7 +417,7 @@ Violations indicate a write-path bug. Brain ships the write path; the sweeper is
 
 ### Wire-layer semantics
 
-`RelationView` reports the **canonical** direction in `from / to` plus a `flags & 1 == 1` bit indicating symmetry. SDK projections handle this transparently — `RelationHandle::other_side(known_endpoint)` returns the opposite end without the caller caring about canonicalisation.
+`RelationView` reports the **canonical** direction in `from / to` plus a `flags & 1 == 1` bit indicating symmetry. Clients handle this transparently — `RelationHandle::other_side(known_endpoint)` returns the opposite end without the caller caring about canonicalisation.
 
 ### Cross-shard considerations (symmetric)
 

@@ -521,17 +521,17 @@ mod tests {
     }
 
     #[test]
-    fn knowledge_payload_round_trips_through_framing() {
-        // Sub-task 15.2: a knowledge-layer record carries an opaque body
+    fn graph_payload_round_trips_through_framing() {
+        // Sub-task 15.2: a opaque-body record carries an opaque body
         // through the full framing layer (header + payload + footer +
         // CRC). The framing is byte-identical to substrate records; only
         // the `record_type` byte and body interpretation differ.
-        use crate::wal::payload::{KnowledgeRecord, WalPayload};
+        use crate::wal::payload::{PhaseBodyRecord, WalPayload};
 
-        // One example per discriminant boundary in the knowledge block.
+        // One example per discriminant boundary in the typed-graph block.
         // RelationCreate / RelationSupersede / RelationTombstone are
         // first-class typed payloads, so they are no longer
-        // valid kinds for an opaque-body KnowledgeRecord.
+        // valid kinds for an opaque-body PhaseBodyRecord.
         for kind in [
             WalRecordKind::EntityCreate,
             WalRecordKind::StatementCreate,
@@ -539,7 +539,7 @@ mod tests {
             WalRecordKind::Audit,
         ] {
             let body: Vec<u8> = (0..48u8).map(|i| i.wrapping_mul(kind.as_u8())).collect();
-            let payload = WalPayload::Knowledge(KnowledgeRecord::new(
+            let payload = WalPayload::PhaseBody(PhaseBodyRecord::new(
                 kind,
                 brain_core::AgentId::default(),
                 body.clone(),
@@ -554,11 +554,11 @@ mod tests {
             };
             assert_eq!(back, record);
             match back.typed_payload().unwrap() {
-                WalPayload::Knowledge(r) => {
+                WalPayload::PhaseBody(r) => {
                     assert_eq!(r.kind, kind);
                     assert_eq!(r.body, body);
                 }
-                other => panic!("expected Knowledge, got {other:?}"),
+                other => panic!("expected PhaseBody, got {other:?}"),
             }
         }
     }

@@ -1,7 +1,7 @@
 //! Schema-DSL AST — value-typed.
 //!
-//! Consumed by the parser, validator, persistence, and the SDK
-//! `SchemaBuilder`. One source of truth for the in-memory shape of a
+//! Consumed by the parser, validator, persistence, and client-side
+//! schema building. One source of truth for the in-memory shape of a
 //! schema document.
 //!
 //! Flat per document — namespaces don't nest. `Schema::namespace`

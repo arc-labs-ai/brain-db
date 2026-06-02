@@ -32,7 +32,7 @@ use brain_metadata::statement::{
 use brain_planner::WriterError;
 use brain_protocol::envelope::response::EventType;
 use brain_protocol::{
-    statement_kind_from_wire, KnowledgeEventPayload, StatementCreateRequest,
+    statement_kind_from_wire, GraphEventPayload, StatementCreateRequest,
     StatementCreateResponse, StatementCreatedEvent, StatementGetRequest, StatementGetResponse,
     StatementHistoryRequest, StatementHistoryResponseFrame, StatementListRequest,
     StatementListResponseFrame, StatementRetractRequest, StatementRetractResponse,
@@ -41,7 +41,7 @@ use brain_protocol::{
 };
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::entity::emit_knowledge_event;
+use crate::handlers::entity::emit_graph_event;
 use crate::handlers::link::downcast_writer_pub;
 use crate::index::text_indexer::{statement::upsert_op_from_statement, StatementTextOp};
 use crate::write::{
@@ -190,10 +190,10 @@ pub async fn handle_statement_create(
     };
 
     // Emit STATEMENT_CREATED event.
-    emit_knowledge_event(
+    emit_graph_event(
         ctx,
         EventType::StatementCreated,
-        KnowledgeEventPayload::StatementCreated(StatementCreatedEvent {
+        GraphEventPayload::StatementCreated(StatementCreatedEvent {
             statement_id: created_id.to_bytes(),
             kind: req.kind as u8,
             subject: req.subject,
@@ -206,10 +206,10 @@ pub async fn handle_statement_create(
 
     // If a Preference was auto-superseded, also emit STATEMENT_SUPERSEDED.
     if let Some(old) = auto_superseded {
-        emit_knowledge_event(
+        emit_graph_event(
             ctx,
             EventType::StatementSuperseded,
-            KnowledgeEventPayload::StatementSuperseded(StatementSupersededEvent {
+            GraphEventPayload::StatementSuperseded(StatementSupersededEvent {
                 old_statement_id: old.to_bytes(),
                 new_statement_id: created_id.to_bytes(),
                 chain_root: chain_root.to_bytes(),
@@ -404,10 +404,10 @@ pub async fn handle_statement_supersede(
         (new.chain_root, new.version)
     };
 
-    emit_knowledge_event(
+    emit_graph_event(
         ctx,
         EventType::StatementSuperseded,
-        KnowledgeEventPayload::StatementSuperseded(StatementSupersededEvent {
+        GraphEventPayload::StatementSuperseded(StatementSupersededEvent {
             old_statement_id: old_id.to_bytes(),
             new_statement_id: new_id.to_bytes(),
             chain_root: chain_root.to_bytes(),
@@ -474,10 +474,10 @@ pub async fn handle_statement_tombstone(
         }
     };
 
-    emit_knowledge_event(
+    emit_graph_event(
         ctx,
         EventType::StatementTombstoned,
-        KnowledgeEventPayload::StatementTombstoned(StatementTombstonedEvent {
+        GraphEventPayload::StatementTombstoned(StatementTombstonedEvent {
             statement_id: id.to_bytes(),
             reason: req.reason_message,
         }),
@@ -544,10 +544,10 @@ pub async fn handle_statement_retract(
 
     // Retract emits StatementTombstoned in v1 (no discrete retract
     // event in v1.0; one may be added later).
-    emit_knowledge_event(
+    emit_graph_event(
         ctx,
         EventType::StatementTombstoned,
-        KnowledgeEventPayload::StatementTombstoned(StatementTombstonedEvent {
+        GraphEventPayload::StatementTombstoned(StatementTombstonedEvent {
             statement_id: id.to_bytes(),
             reason: format!("retract: {}", req.reason_message),
         }),

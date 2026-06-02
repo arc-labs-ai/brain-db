@@ -228,7 +228,7 @@ fn cosine(a: &[f32; brain_embed::VECTOR_DIM], b: &[f32; brain_embed::VECTOR_DIM]
     sum
 }
 
-/// Per-hit knowledge-layer enrichment populated when the request
+/// Per-hit opaque-body enrichment populated when the request
 /// carries `include_graph = true`. One redb read txn serves all
 /// hits; per hit we issue a small handful of point/range reads.
 /// Schema-gating is by table presence + edge presence: if
@@ -535,7 +535,7 @@ fn project_memory_results(
         None
     };
 
-    // Pre-fetch knowledge-layer enrichment in one pass if requested.
+    // Pre-fetch opaque-body enrichment in one pass if requested.
     // The hybrid path already holds a read txn open for the row hydration
     // below; the helper reuses it so we don't open a second redb snapshot.
     let graph_per_memory: Option<
@@ -635,7 +635,7 @@ fn project_memory_results(
             .map(|c| c.raw_score)
             .unwrap_or(0.0);
         // Per-hit outgoing-edge projection — only builtin substrate
-        // edges. Knowledge-layer edges (Mentions / Typed) belong to
+        // edges. typed-graph edges (Mentions / Typed) belong to
         // entity/relation ops, not RECALL. The rtxn opened above
         // serves every hit; one prefix scan per memory.
         let edges = if req.include_edges {
@@ -734,7 +734,7 @@ fn map_execution_error(e: ExecutionError) -> OpError {
 }
 
 /// Translate the planner's `Retriever` directly to the substrate
-/// `RetrieverNameWire`. Avoids round-tripping through the knowledge
+/// `RetrieverNameWire`. Avoids round-tripping through the typed-graph
 /// namespace's wire enum (which would require chained `From`s on
 /// foreign types, an orphan-rule violation).
 fn retriever_to_wire_name(r: brain_planner::hybrid::router::Retriever) -> RetrieverNameWire {

@@ -248,6 +248,9 @@ mod tests {
     fn fresh_db() -> (TempDir, redb::Database) {
         let dir = TempDir::new().expect("tempdir");
         let db = redb::Database::create(dir.path().join("test.redb")).expect("create");
+        let wtxn = db.begin_write().expect("begin_write");
+        crate::tables::materialize_all_tables(&wtxn).expect("materialize");
+        wtxn.commit().expect("commit");
         (dir, db)
     }
 

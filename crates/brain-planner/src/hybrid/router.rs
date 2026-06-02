@@ -247,7 +247,7 @@ pub struct RoutingDecision {
     /// applying it post-fusion.
     pub temporal_pushdown: bool,
     /// How the graph retriever (if any) anchors its walk.
-    /// `Entity` is the typed-knowledge mode (relations table);
+    /// `Entity` is the typed-typed-graph mode (relations table);
     /// `MemoryFromSemantic` tells the executor to materialise
     /// the anchor set from semantic top-K and walk the substrate
     /// edge tables. `None` when graph isn't selected.
@@ -319,9 +319,9 @@ pub fn route(req: &QueryRequest) -> RoutingDecision {
     //
     // Max retrievers per query: 3 (all of semantic, lexical, graph
     // if matched). The cap applies uniformly — the explicit override does NOT
-    // bypass it. The SDK already enforces this at construction
+    // bypass it. The client already enforces this at construction
     // (`RetrieverSelection::explicit()`), but a raw wire caller
-    // or another-language SDK could submit a longer list. We
+    // or another-language client could submit a longer list. We
     // dedup + truncate here so the planner's downstream
     // assumptions (per-retriever slot count, fusion config arity)
     // hold regardless of caller.

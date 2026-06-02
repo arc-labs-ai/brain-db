@@ -169,9 +169,9 @@ When something goes wrong:
 
 These three together usually identify the issue. Brain exposes them readily.
 
-## 13. The role of the SDK
+## 13. The role of the client
 
-Client SDKs contribute observability:
+Clients contribute observability:
 
 - Per-request client-side metrics (latency from client perspective).
 - Trace propagation (so server-side traces include client context).

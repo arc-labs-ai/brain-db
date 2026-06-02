@@ -206,6 +206,12 @@ pub async fn dispatch(
     // checks for schema-touching ops happen inside the namespace-bound
     // handlers (SCHEMA_UPLOAD, etc.).
     enforce_namespace(&caller, &req)?;
+    // Third gate: a RECALL's explicit cross-agent knobs (`agent_filter`,
+    // `include_other_agents`) widen the read scope past the caller's own
+    // memories. The empty-filter default already scopes to the caller, but a
+    // scoped API key — bound to exactly one agent — must not be able to name
+    // another agent or opt into the across-agents view.
+    enforce_agent_filter(&caller, &req)?;
 
     // Per-request override: stamp the caller's agent onto a clone
     // of the shared ctx so handlers that build writer Ops can pull
@@ -290,7 +296,7 @@ pub async fn dispatch(
         // -----------------------------------------------------------
         // Capability introspection. Same permission model as the
         // connection-lifecycle ops above (no special caller bits) —
-        // capability bits don't reveal sensitive state and SDKs
+        // capability bits don't reveal sensitive state and clients
         // call this at session warm-up.
         // -----------------------------------------------------------
         RequestBody::GetCapabilities(r) => {
@@ -357,7 +363,7 @@ pub async fn dispatch(
         ),
 
         // -----------------------------------------------------------
-        // Knowledge layer.
+        // typed-graph phases.
         // -----------------------------------------------------------
         RequestBody::EntityCreate(r) => crate::handlers::entity::handle_entity_create(r, ctx)
             .await
@@ -555,7 +561,7 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
             (perm_bits::RECALL, "SCHEMA_READ")
         }
 
-        // Knowledge-layer writes ride under ENCODE.
+        // typed-graph writes ride under ENCODE.
         RequestBody::EntityCreate(_)
         | RequestBody::EntityUpdate(_)
         | RequestBody::EntityRename(_)
@@ -565,14 +571,14 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
         | RequestBody::StatementSupersede(_)
         | RequestBody::StatementRetract(_)
         | RequestBody::RelationCreate(_)
-        | RequestBody::RelationSupersede(_) => (perm_bits::ENCODE, "KNOWLEDGE_WRITE"),
+        | RequestBody::RelationSupersede(_) => (perm_bits::ENCODE, "GRAPH_WRITE"),
 
-        // Knowledge-layer tombstones ride under FORGET.
+        // typed-graph tombstones ride under FORGET.
         RequestBody::EntityTombstone(_)
         | RequestBody::StatementTombstone(_)
-        | RequestBody::RelationTombstone(_) => (perm_bits::FORGET, "KNOWLEDGE_TOMBSTONE"),
+        | RequestBody::RelationTombstone(_) => (perm_bits::FORGET, "GRAPH_TOMBSTONE"),
 
-        // Knowledge-layer reads.
+        // typed-graph reads.
         RequestBody::EntityGet(_)
         | RequestBody::EntityList(_)
         | RequestBody::EntityResolve(_)
@@ -587,7 +593,7 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
         | RequestBody::QueryExplain(_)
         | RequestBody::QueryTrace(_)
         | RequestBody::RecallHybrid(_)
-        | RequestBody::MaterializeProcedural(_) => (perm_bits::RECALL, "KNOWLEDGE_READ"),
+        | RequestBody::MaterializeProcedural(_) => (perm_bits::RECALL, "GRAPH_READ"),
 
         // Extractor governance — admin-only.
         RequestBody::ExtractorList(_)
@@ -619,7 +625,7 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
 
         // Capability introspection is open to every authenticated
         // caller — same model as the keepalive / handshake ops above.
-        // Capability bits don't reveal sensitive state and SDKs need
+        // Capability bits don't reveal sensitive state and clients need
         // them at session warm-up.
         RequestBody::GetCapabilities(_) => return Ok(()),
     };
@@ -645,6 +651,37 @@ fn enforce_namespace(caller: &RequestCaller, req: &RequestBody) -> Result<(), Op
     Ok(())
 }
 
+/// Reject a RECALL whose explicit cross-agent scope would read outside the
+/// caller's bound agent. In permissive mode (default v1.0) this is a no-op —
+/// dev / trusted-network callers carry no scope binding. Under scoped API-key
+/// auth the key is bound to exactly one agent, so the only `agent_filter` it
+/// may name is its own agent, and it may not set `include_other_agents` (which
+/// drops the implicit caller scope and reads across every agent).
+///
+/// The common path — empty `agent_filter`, `include_other_agents == false` —
+/// passes here and is scoped to the caller downstream in the RECALL handler.
+fn enforce_agent_filter(caller: &RequestCaller, req: &RequestBody) -> Result<(), OpError> {
+    if !caller.scope_enforced {
+        return Ok(());
+    }
+    let RequestBody::Recall(r) = req else {
+        return Ok(());
+    };
+    if r.include_other_agents {
+        return Err(OpError::Unauthorized(
+            "recall: include_other_agents is not permitted under scoped API-key auth".into(),
+        ));
+    }
+    for bytes in &r.agent_filter {
+        if AgentId::from(*bytes) != caller.agent_id {
+            return Err(OpError::Unauthorized(
+                "recall: agent_filter may only name the API key's own agent".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests (pure permission / namespace checks).
 // ---------------------------------------------------------------------------
@@ -654,7 +691,7 @@ mod tests {
     use super::*;
     use brain_protocol::EncodeRequest;
     use brain_protocol::MemoryKindWire;
-    use brain_protocol::{SchemaGetRequest, SchemaListRequest};
+    use brain_protocol::{RecallRequest, SchemaGetRequest, SchemaListRequest};
 
     fn agent(byte: u8) -> AgentId {
         let mut a = [0u8; 16];
@@ -745,5 +782,67 @@ mod tests {
         // Permissive: any claimed agent_id passes.
         let p = permissive();
         assert!(p.require_agent(agent(99), "test").is_ok());
+    }
+
+    fn recall_with(agent_filter: Vec<[u8; 16]>, include_other_agents: bool) -> RequestBody {
+        RequestBody::Recall(RecallRequest {
+            cue_text: "x".into(),
+            top_k: 5,
+            confidence_threshold: 0.0,
+            context_filter: None,
+            age_bound_unix_nanos: None,
+            kind_filter: None,
+            salience_floor: 0.0,
+            include_edges: false,
+            include_graph: false,
+            include_text: false,
+            request_id: None,
+            txn_id: None,
+            agent_filter,
+            include_other_agents,
+        })
+    }
+
+    fn agent_bytes(byte: u8) -> [u8; 16] {
+        *agent(byte).0.as_bytes()
+    }
+
+    #[test]
+    fn permissive_recall_allows_any_agent_filter() {
+        // Dev / trusted-network mode carries no scope binding: cross-agent
+        // recall knobs are honored as-is.
+        let caller = permissive();
+        assert!(enforce_agent_filter(&caller, &recall_with(vec![agent_bytes(9)], true)).is_ok());
+    }
+
+    #[test]
+    fn strict_recall_allows_own_agent_and_empty_filter() {
+        let caller = strict(perm_bits::RECALL, "ns", agent(1));
+        // Default scope (empty filter, no cross-agent) passes.
+        assert!(enforce_agent_filter(&caller, &recall_with(Vec::new(), false)).is_ok());
+        // Naming exactly the caller's own agent passes.
+        assert!(enforce_agent_filter(&caller, &recall_with(vec![agent_bytes(1)], false)).is_ok());
+    }
+
+    #[test]
+    fn strict_recall_rejects_other_agent_filter() {
+        let caller = strict(perm_bits::RECALL, "ns", agent(1));
+        let err =
+            enforce_agent_filter(&caller, &recall_with(vec![agent_bytes(2)], false)).unwrap_err();
+        assert!(matches!(err, OpError::Unauthorized(_)));
+        // A filter mixing self with another agent is still rejected.
+        let err = enforce_agent_filter(
+            &caller,
+            &recall_with(vec![agent_bytes(1), agent_bytes(2)], false),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::Unauthorized(_)));
+    }
+
+    #[test]
+    fn strict_recall_rejects_include_other_agents() {
+        let caller = strict(perm_bits::RECALL, "ns", agent(1));
+        let err = enforce_agent_filter(&caller, &recall_with(Vec::new(), true)).unwrap_err();
+        assert!(matches!(err, OpError::Unauthorized(_)));
     }
 }

@@ -370,7 +370,7 @@ What is **not** dropped:
 The request body carries `force_drop_existing: bool`. The handler
 rejects with `InvalidRequest` if the flag is not exactly `true`.
 The flag is the wire contract's explicit-confirmation step for an
-irreversible operation — a typo in the SDK cannot accidentally
+irreversible operation — a typo in a client cannot accidentally
 wipe a deployment's schema.
 
 ### Permission

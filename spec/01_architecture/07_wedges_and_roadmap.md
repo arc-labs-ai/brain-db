@@ -59,7 +59,7 @@ Brain ships the same Rust crates whether the deployment is embedded (in-process,
 
 ## Wedge 5 — Apache 2.0, no SaaS lock-in
 
-Brain — the typed graph, the extractor pipeline, the reranker, the schema DSL, the SDKs — is Apache 2.0. Operators can self-host any feature documented in the spec.
+Brain — the typed graph, the extractor pipeline, the reranker, the schema DSL — is Apache 2.0. Operators can self-host any feature documented in the spec.
 
 **What it costs.** No premium commercial features to up-sell. Revenue model relies on hosting + support, not feature gating.
 

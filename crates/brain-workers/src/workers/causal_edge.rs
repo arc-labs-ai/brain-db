@@ -3,7 +3,7 @@
 //!
 //! ## Why this exists
 //!
-//! The extractor pipeline materialises typed knowledge — entities,
+//! The extractor pipeline materialises typed-graph — entities,
 //! statements, relations — but the substrate's planner walks edges
 //! between *memories*, not statements. Without a projection step, the
 //! cognitive surface ("recall everything caused by deploy X") can't

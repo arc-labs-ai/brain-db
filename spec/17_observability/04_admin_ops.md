@@ -4,21 +4,21 @@ The operational commands available to operators.
 
 ## 1. The admin API
 
-Admin operations use the same wire protocol as regular operations, with admin opcodes. Authentication required (admin token, distinct from agent tokens).
+Admin operations are exposed as HTTP routes under `/v1/*` on a dedicated **loopback admin listener** (default `127.0.0.1:9092`), kept off the public data-plane port. Any HTTP client works; the examples below use `curl`. Brain ships no CLI — operators administer the database directly over this API.
 
-The `brain-cli` tool provides convenient access:
+Authentication is required: admin keys are distinct from agent keys (see §12). Bind the listener to loopback or front it with mTLS; the surface is operationally sensitive.
 
 ```bash
-brain-cli stats
-brain-cli rebuild-ann <shard-id>
-brain-cli snapshot create my-snapshot
+curl -s http://127.0.0.1:9092/v1/shards
+curl -s -X POST http://127.0.0.1:9092/v1/rebuild-ann -d '{"shard":"<shard-id>"}'
+curl -s -X POST http://127.0.0.1:9092/v1/snapshots -d '{"name":"my-snapshot"}'
 ```
 
-Internally these are admin API calls.
+Health and metrics live on a separate **metrics listener** (default port `9091`): `GET /healthz` for liveness and `GET /metrics` for the Prometheus scrape. Database-wide counters (shard count, WAL size, HNSW node counts, request rates) are exposed by `GET /metrics`; a dedicated JSON stats-summary route is not yet implemented.
 
 ## 2. The categories
 
-- **Status**: stats, health, info.
+- **Status**: shards, agents, health, info, metrics scrape.
 - **Maintenance**: rebuild-ann, gc, vacuum.
 - **Snapshots**: create, list, restore.
 - **Workers**: list, stop, start, run-now.
@@ -28,32 +28,23 @@ Internally these are admin API calls.
 
 ## 3. Status operations
 
-### `stats`
+### Stats
+
+Database-wide counters are exposed via `GET /metrics` on the metrics listener (Prometheus text exposition); a dedicated JSON stats-summary route is not yet implemented. Scrape and filter for the counters you need:
 
 ```bash
-brain-cli stats [--shard SHARD]
+curl -s http://127.0.0.1:9091/metrics | grep '^brain_'
 ```
 
-Returns summary stats:
+The exposition includes `brain_shards_total`, `brain_wal_size_bytes`, `brain_hnsw_node_count`, `brain_hnsw_tombstone_count` / `brain_hnsw_tombstone_ratio`, and the `brain_request_*` request counters and histograms, among others. For per-shard or per-agent detail, use the real `GET /v1/shards` and `GET /v1/agents` routes (see §11 and §10).
 
-```json
-{
-  "shard": "<uuid>",
-  "memory_count": 1234567,
-  "tombstone_count": 23456,
-  "arena_used_gb": 45.6,
-  "wal_segments": 12,
-  "uptime_seconds": 86400
-}
-```
-
-### `health`
+### Health
 
 ```bash
-brain-cli health
+curl -s http://127.0.0.1:9091/healthz
 ```
 
-Returns overall health:
+Returns overall health, including per-shard state:
 
 ```json
 {
@@ -66,54 +57,35 @@ Returns overall health:
 }
 ```
 
-### `info`
+### Info
 
-```bash
-brain-cli info
-```
-
-Returns version, build info, configuration summary.
+Version, build info, and a configuration summary are returned by `GET /v1/config` (see §7), alongside the running configuration.
 
 ## 4. Maintenance operations
 
-### `rebuild-ann`
+### Rebuild ANN
 
 ```bash
-brain-cli rebuild-ann <shard-id>
+curl -s -X POST http://127.0.0.1:9092/v1/rebuild-ann -d '{"shard":"<shard-id>"}'
 ```
 
-Triggers immediate HNSW rebuild on the shard. Async; returns immediately. Status visible via:
+Triggers an immediate HNSW rebuild on the shard. Async; the call returns a job handle immediately. Track progress via the `brain_hnsw_rebuild_progress_pct` metric on the metrics listener.
 
-```bash
-brain-cli rebuild-ann-status <shard-id>
-```
+### GC
 
-### `gc`
+Triggers immediate garbage collection — pruning expired idempotency entries, deleting eligible WAL segments, or reclaiming eligible slots. Administer via the admin HTTP API (`/v1/*` on the admin listener). (Operator action: force an immediate `idempotency` / `wal` / `slots` collection cycle rather than waiting for the scheduled worker. Route name TBD.)
 
-```bash
-brain-cli gc [--shard SHARD] [--type idempotency|wal|slots]
-```
+### Vacuum
 
-Triggers immediate garbage collection of the specified type:
-
-- `idempotency`: prune expired idempotency entries.
-- `wal`: delete eligible WAL segments.
-- `slots`: reclaim eligible slots.
-
-### `vacuum`
-
-```bash
-brain-cli vacuum [--shard SHARD]
-```
-
-Compacts the metadata store (redb). May take minutes for large stores.
+Compacts the metadata store (redb); may take minutes for large stores. Administer via the admin HTTP API (`/v1/*` on the admin listener). (Operator action: compact the redb metadata file in place. Route name TBD.)
 
 ## 5. Snapshot operations
 
-### `snapshot create`
+### Create a snapshot
 
 ```bash
-brain-cli snapshot create <name> [--shard SHARD]
+curl -s -X POST http://127.0.0.1:9092/v1/snapshots -d '{"name":"my-snapshot"}'
+# Per-shard: add "shard":"<uuid>" to the body.
 ```
 
 Creates a consistent snapshot. Brain:
@@ -122,10 +94,10 @@ Creates a consistent snapshot. Brain:
 2. Copies (or reflinks, if supported) the storage files.
 3. Records the snapshot's metadata.
 
-### `snapshot list`
+### List snapshots
 
 ```bash
-brain-cli snapshot list
+curl -s http://127.0.0.1:9092/v1/snapshots
 ```
 
 Lists snapshots:
@@ -137,32 +109,29 @@ Lists snapshots:
 ]
 ```
 
-### `snapshot restore`
+### Restore a snapshot
 
 ```bash
-brain-cli snapshot restore <name> [--shard SHARD]
+curl -s -X POST http://127.0.0.1:9092/v1/snapshots/pre-upgrade-2026-05-07/restore
 ```
 
-Restores from a snapshot. **Destructive** — current data is lost. Requires confirmation:
+Restores from a snapshot. **Destructive** — current data is lost. The restore is gated server-side; send the confirmation field the server requires (e.g. `-d '{"confirm":true}'`).
 
-```
-brain-cli snapshot restore pre-upgrade-2026-05-07 --confirm
-```
-
-### `snapshot delete`
+### Delete a snapshot
 
 ```bash
-brain-cli snapshot delete <name>
+curl -s -X DELETE http://127.0.0.1:9092/v1/snapshots/my-snapshot
 ```
 
 Removes a snapshot.
 
 ## 6. Worker operations
 
-### `worker list`
+### List workers
 
 ```bash
-brain-cli worker list [--shard SHARD]
+curl -s http://127.0.0.1:9092/v1/workers
+# Per-shard: curl -s 'http://127.0.0.1:9092/v1/workers?shard=<uuid>'
 ```
 
 Returns worker status:
@@ -174,50 +143,47 @@ Returns worker status:
 ]
 ```
 
-### `worker stop` / `worker start`
+### Stop / start a worker
 
 ```bash
-brain-cli worker stop --name decay --shard <uuid>
-brain-cli worker start --name decay --shard <uuid>
+curl -s -X POST http://127.0.0.1:9092/v1/workers/decay/stop  -d '{"shard":"<uuid>"}'
+curl -s -X POST http://127.0.0.1:9092/v1/workers/decay/start -d '{"shard":"<uuid>"}'
 ```
 
-Pauses or resumes specific workers.
+Pauses or resumes a specific worker. The path is `/v1/workers/{name}/{action}`.
 
-### `worker run-now`
+### Run a worker now
 
 ```bash
-brain-cli worker run-now --name decay --shard <uuid>
+curl -s -X POST http://127.0.0.1:9092/v1/workers/decay/run-now -d '{"shard":"<uuid>"}'
 ```
 
 Triggers an immediate cycle.
 
 ## 7. Configuration operations
 
-### `config reload`
+### Reload configuration
 
 ```bash
-brain-cli config reload
+curl -s -X POST http://127.0.0.1:9092/v1/config/reload
 ```
 
 Reloads configuration from disk. Some settings reload live; others require restart.
 
-### `config get`
+### Get configuration
 
 ```bash
-brain-cli config get [--key KEY]
+curl -s http://127.0.0.1:9092/v1/config
+# Single key: curl -s 'http://127.0.0.1:9092/v1/config?key=workers.decay.interval'
 ```
 
-Returns current configuration. With `--key`, returns just that key:
+Returns the current configuration. With a `key` parameter, returns just that key.
+
+### Set configuration
 
 ```bash
-brain-cli config get --key workers.decay.interval
-# 1h
-```
-
-### `config set`
-
-```bash
-brain-cli config set --key workers.decay.interval --value 30m
+curl -s -X POST http://127.0.0.1:9092/v1/config/set \
+  -d '{"key":"workers.decay.interval","value":"30m"}'
 ```
 
 Updates a setting. Live reload if supported; otherwise persisted for next restart.
@@ -226,39 +192,42 @@ Not all settings are runtime-tunable. Brain logs which take effect immediately v
 
 ## 8. Audit operations
 
-### `audit query`
+### Query audit log
 
 ```bash
-brain-cli audit query \
-  --since "2026-05-01" \
-  --until "2026-05-07" \
-  --agent agent-001
+curl -s -G http://127.0.0.1:9092/v1/audit \
+  --data-urlencode 'since=2026-05-01' \
+  --data-urlencode 'until=2026-05-07' \
+  --data-urlencode 'agent=agent-001'
 ```
 
 Returns audit log entries matching the filter.
 
-### `audit export`
+### Export audit log
 
 ```bash
-brain-cli audit export --output /backup/audit-2026-05.jsonl
+curl -s -X POST http://127.0.0.1:9092/v1/audit/export \
+  -d '{"output":"/backup/audit-2026-05.jsonl"}'
 ```
 
 Exports audit logs to a file. For long-term archival.
 
 ## 9. Diagnostic operations
 
-### `profile`
+### Profile
 
 ```bash
-brain-cli profile --shard <uuid> --duration 30s --output /tmp/profile.pb
+curl -s -X POST http://127.0.0.1:9092/v1/diagnostics/profile \
+  -d '{"shard":"<uuid>","duration":"30s","output":"/tmp/profile.pb"}'
 ```
 
 Captures a CPU profile of the shard's executor. Output is pprof-compatible.
 
-### `debug-snapshot`
+### Debug snapshot
 
 ```bash
-brain-cli debug-snapshot --shard <uuid> --output /tmp/debug.json
+curl -s -X POST http://127.0.0.1:9092/v1/diagnostics/debug-snapshot \
+  -d '{"shard":"<uuid>","output":"/tmp/debug.json"}'
 ```
 
 Captures a detailed runtime snapshot:
@@ -273,18 +242,19 @@ For deep debugging.
 
 ## 10. Agent operations
 
-### `agent list`
+### List agents
 
 ```bash
-brain-cli agent list [--shard SHARD]
+curl -s http://127.0.0.1:9092/v1/agents
+# Per-shard: curl -s 'http://127.0.0.1:9092/v1/agents?shard=<uuid>'
 ```
 
 Lists agents on the shard.
 
-### `agent stats`
+### Agent stats
 
 ```bash
-brain-cli agent stats <agent-id>
+curl -s http://127.0.0.1:9092/v1/agents/<agent-id>
 ```
 
 Per-agent stats:
@@ -299,56 +269,57 @@ Per-agent stats:
 }
 ```
 
-### `agent delete`
+### Delete an agent
 
 ```bash
-brain-cli agent delete <agent-id> --confirm
+curl -s -X DELETE http://127.0.0.1:9092/v1/agents/<agent-id> -d '{"confirm":true}'
 ```
 
-Deletes all of an agent's data. Destructive. Confirm required.
+Deletes all of an agent's data. Destructive; the server requires the confirmation field.
 
 ## 11. Shard operations
 
-### `shard list`
+### List shards
 
 ```bash
-brain-cli shard list
+curl -s http://127.0.0.1:9092/v1/shards
 ```
 
 Lists shards.
 
-### `shard create` (rare)
+### Create a shard (rare)
 
 ```bash
-brain-cli shard create --logical-id 16
+curl -s -X POST http://127.0.0.1:9092/v1/shards -d '{"logical_id":16}'
 ```
 
 Creates a new shard. Used during expansion.
 
-### `shard delete` (rare)
+### Delete a shard (rare)
 
 ```bash
-brain-cli shard delete <shard-id> --confirm
+curl -s -X DELETE http://127.0.0.1:9092/v1/shards/<shard-id> -d '{"confirm":true}'
 ```
 
 Deletes a shard. All its data is gone. Used during decommission.
 
 ## 12. Authentication
 
-Admin operations require an admin token:
+Admin operations require an admin token, passed as a bearer header:
 
 ```bash
 export BRAIN_ADMIN_TOKEN="..."
-brain-cli stats
+curl -s -H "Authorization: Bearer $BRAIN_ADMIN_TOKEN" http://127.0.0.1:9092/v1/shards
 ```
 
-Or:
+Tokens are configured at deployment. Multiple tokens supported (per-operator). Issue and revoke them via the API-key routes:
 
 ```bash
-brain-cli --token "..." stats
+# Issue a scoped key
+curl -s -X POST http://127.0.0.1:9092/v1/api-keys -d '{"permissions":["encode","recall"]}'
+# Revoke a key
+curl -s -X DELETE http://127.0.0.1:9092/v1/api-keys/<key-id>
 ```
-
-Tokens are configured at deployment. Multiple tokens supported (per-operator).
 
 ### 12.1 Scope-bound API keys
 
@@ -371,60 +342,58 @@ This closes the agent-impersonation surface: an authenticated client at one `age
 
 **v1.1: default-deny.** The flag inverts; operators opt out explicitly if they have a reason to. This is the security target.
 
-The key-issuance flow + the `api_keys` redb table live under `crates/brain-server/src/admin/api_key.rs`; operator UX for key rotation rides on the admin frame surface (see §9, Diagnostic operations).
+The key-issuance flow + the `api_keys` redb table live under `crates/brain-server/src/admin/api_key.rs`; operator UX for key rotation rides on the `/v1/api-keys` routes.
 
 ## 13. The dry-run mode
 
-For destructive operations, `--dry-run`:
+For destructive operations, pass a `dry_run` field:
 
 ```bash
-brain-cli agent delete <agent-id> --dry-run
+curl -s -X DELETE http://127.0.0.1:9092/v1/agents/<agent-id> -d '{"dry_run":true}'
 # Would delete: 12345 memories, 5 contexts, 67890 edges
 ```
 
 Shows what would happen without doing it.
 
-## 14. The "scriptable" output
+## 14. Scriptable output
+
+Responses are JSON by default — ready for scripts. Pipe through `jq` for human-readable or tabular shaping:
 
 ```bash
-brain-cli stats --output json
-brain-cli stats --output yaml
-brain-cli stats --output table
+curl -s http://127.0.0.1:9092/v1/shards | jq .
+curl -s http://127.0.0.1:9092/v1/shards | jq -r '.[] | [.shard, .memory_count] | @tsv'
 ```
-
-JSON for scripts, YAML for humans, table for terminal. Default: table.
 
 ## 15. Output piping
 
-Brain-cli works in pipelines:
+The admin API composes with standard Unix tools:
 
 ```bash
-brain-cli agent list --output json | jq '.[].agent_id' | xargs -I{} brain-cli agent stats {}
+curl -s http://127.0.0.1:9092/v1/agents \
+  | jq -r '.[].agent_id' \
+  | xargs -I{} curl -s http://127.0.0.1:9092/v1/agents/{}
 ```
 
 Standard Unix tool composition.
 
 ## 16. The "background ops" tracking
 
-Async operations (rebuild, restore, etc.) return a job ID:
+Async operations (rebuild, restore, etc.) return a job ID in the response body:
 
 ```bash
-$ brain-cli rebuild-ann <shard-id>
-Job started: abc-123
-
-$ brain-cli job status abc-123
-{"id":"abc-123","status":"in_progress","progress":0.45,"started_at":"..."}
+$ curl -s -X POST http://127.0.0.1:9092/v1/rebuild-ann -d '{"shard":"<shard-id>"}'
+{"job":"abc-123","status":"started"}
 ```
 
-Job tracking lets operators check long-running operations.
+Job progress for rebuilds is exposed through the `brain_hnsw_rebuild_progress_pct` metric on the metrics listener; richer per-job status polling is future work.
 
 ## 16.5. Identity binding for admin keys
 
-Admin operations authenticate with admin keys, which are separate from client agent keys. Each admin key carries explicit scope claims — which agents it may inspect, which shards it may rebuild, whether it may snapshot, whether it may restore. The server derives the operator's permissions from the key at AUTH time; admin commands do not accept an arbitrary `agent_id` or `shard_id` override that bypasses the claims.
+Admin operations authenticate with admin keys, which are separate from client agent keys. Each admin key carries explicit scope claims — which agents it may inspect, which shards it may rebuild, whether it may snapshot, whether it may restore. The server derives the operator's permissions from the key at AUTH time; admin calls do not accept an arbitrary `agent_id` or `shard_id` override that bypasses the claims.
 
-This means an admin key issued for "inspect agent A only" cannot rebuild agent B's HNSW even if the CLI command syntactically allows it; the server rejects the operation at dispatch with an authorization error. Audit logs record the key's claims alongside the operation, so post-incident review can verify that an action was authorized at the moment it ran, not just that the operator had access at some point.
+This means an admin key issued for "inspect agent A only" cannot rebuild agent B's HNSW even if the request syntactically allows it; the server rejects the operation at dispatch with an authorization error. Audit logs record the key's claims alongside the operation, so post-incident review can verify that an action was authorized at the moment it ran, not just that the operator had access at some point.
 
-Key rotation, revocation, and claim updates flow through a separate admin operation (`ADMIN_KEY_*`); changes take effect on subsequent AUTH attempts.
+Key rotation, revocation, and claim updates flow through the `/v1/api-keys` routes; changes take effect on subsequent AUTH attempts.
 
 ## 17. The "audit of admin ops"
 

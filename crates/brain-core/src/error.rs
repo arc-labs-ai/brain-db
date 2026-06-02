@@ -52,7 +52,7 @@ pub enum Error {
 
     /// The caller's request was throttled. A `ResourceExhausted` error class.
     /// The error message includes operator-facing hints (e.g., retry-after
-    /// duration); SDKs map it to the language-native rate-limit type.
+    /// duration); clients map it to the language-native rate-limit type.
     #[error("rate limited: {0}")]
     RateLimited(String),
 

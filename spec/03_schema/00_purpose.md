@@ -7,7 +7,7 @@
 | Field | Value |
 |---|---|
 | Status | Draft |
-| Audience | Operators defining a schema; implementers of the parser + validator; SDK authors |
+| Audience | Operators defining a schema; implementers of the parser + validator; client implementers |
 | Voice | Hybrid (rationale + normative MUST/SHOULD) |
 | Depends on | [02. Data Model](../02_data_model/00_purpose.md) |
 | Referenced by | [11. Extractors](../11_extractors/00_purpose.md), [13. Retrievers](../13_retrievers/00_purpose.md), [04. Wire Protocol](../04_wire_protocol/00_purpose.md) |
@@ -266,4 +266,4 @@ The merge model matters because the cost of schema authoring is real (validation
 - **Custom indexes.** Brain decides indexes based on declared types.
 - **Joins.** The query engine handles joins; the schema declares structure, not access paths.
 
-For things outside the DSL, users write code that calls the SDK with the schema's types.
+For things outside the DSL, users write code that sends wire requests carrying the schema's types.

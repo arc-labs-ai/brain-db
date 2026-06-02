@@ -114,6 +114,8 @@ async fn recall_one(ctx: &OpsContext, cue: &str) -> usize {
         include_text: false,
         request_id: None,
         txn_id: None,
+        agent_filter: Vec::new(),
+        include_other_agents: false,
     };
     let outcome = dispatch(
         RequestBody::Recall(req),

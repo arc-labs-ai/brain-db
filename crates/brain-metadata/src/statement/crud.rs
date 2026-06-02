@@ -1179,7 +1179,7 @@ mod tests {
         let pred = intern_fact_entity_pred(&mut db, "role_wire");
 
         // Inline evidence with confidence_milli = 0 (the wire-side
-        // shape — SDK decodes EvidenceRefWire::Inline into entries
+        // shape — the client decodes EvidenceRefWire::Inline into entries
         // with zero metadata).
         let mut s = fresh_fact(subj, pred, obj);
         s.confidence = 0.42;

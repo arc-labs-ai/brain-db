@@ -389,7 +389,7 @@ fn run_path(
             if count >= cap {
                 break;
             }
-            // Path is the typed knowledge graph; substrate edges
+            // Path is the typed graph; substrate edges
             // never form a relation-chain so they're not eligible.
             let EdgeKindRef::Typed(_) = kind else {
                 continue;

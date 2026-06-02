@@ -1,10 +1,10 @@
-//! `Statement` value types — Layer 3 of the knowledge graph.
+//! `Statement` value types — the typed-graph statement node.
 //!
 //! Pure value types — no I/O, no async, no rkyv. The rkyv-archived
-//! storage shape lives in `brain-metadata::tables::knowledge::statement`
+//! storage shape lives in `brain-metadata::tables::statement`
 //! and the wire-archived shape lives in
-//! `brain-protocol::knowledge::statement_*`. Conversion between this
-//! brain-core value type and those layers is the respective layer's
+//! `brain-protocol::ops::statement`. Conversion between this
+//! brain-core value type and those crates is the respective crate's
 //! responsibility (via `From` impls).
 //!
 //! ## Four-timestamp bi-temporal model
@@ -83,7 +83,7 @@ impl SubjectRef {
 /// Typed literal value used in [`StatementObject::Value`].
 ///
 /// These match the value types the wire layer encodes in
-/// `brain-protocol::knowledge::statement_resp::StatementValueWire`.
+/// `brain-protocol::ops::statement::StatementValueWire`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StatementValue {
     Text(String),

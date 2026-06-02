@@ -1,0 +1,52 @@
+{
+  "text": "who works on brain",
+  "entity_anchor": [
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68
+  ],
+  "kind_filter": [
+    0
+  ],
+  "predicate_filter": [
+    "org:works_on"
+  ],
+  "time_filter": null,
+  "confidence_min": 0.25,
+  "include_tombstoned": false,
+  "include_superseded": false,
+  "limit": 25,
+  "retrievers": "Auto",
+  "fusion_config": null,
+  "request_id": [
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17
+  ]
+}

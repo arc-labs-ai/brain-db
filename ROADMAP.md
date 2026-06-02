@@ -2,7 +2,7 @@
 
 Forward-looking plan for Brain's road to v1.0 and beyond.
 
-This file is the **high-level milestone index**. Detailed per-phase task plans live in [`docs/development/phases/`](docs/development/phases/).
+This file is the **high-level milestone index**. The per-phase landing record lives in the git history (`git log --oneline`).
 
 ---
 
@@ -58,7 +58,7 @@ Planned improvements that land after v1.0 without changing the wire protocol or 
 | **Streaming hybrid query results** | `limit > 100` streams across multiple `QueryResponse` frames; v1 is single-frame. |
 | **Hybrid + transactional read-your-writes** | RECALL inside a txn uses the substrate path in v1; lens layering across statements + relations is v1.1+. |
 | **Multi-frame cursor pagination** | `ENTITY_LIST`, `STATEMENT_LIST`, `STATEMENT_HISTORY`, `RELATION_LIST_FROM` — all single-frame snapshots in v1. |
-| **Derive macros** | `#[derive(BrainEntity)]`, `#[derive(BrainFact)]`, `#[derive(BrainRelation)]` and the typed `Fact<T>` / `Relation<T>` SDK wrappers. Hand-written SDK ships in v1. |
+| **Wire-protocol conformance corpus** | A language-agnostic round-trip corpus (recorded request/response frames with CBOR payloads) that any client implementation can replay to verify §04 conformance. Brain ships no first-party SDK; the corpus is the drift guard for third-party clients. |
 | **`ADMIN_TANTIVY_REBUILD` wire op** | Hot tantivy rebuild from the admin CLI; v1 rebuild is startup-only. |
 | **Schema migration plan computation** | The `keep` / `re-extract` / `tombstone` action vocabulary is specified in `spec/03_schema/05_versioning.md`; computation + execution lands post-v1. |
 | **Hot rebuild while writer running** | v1 tantivy rebuild requires shard restart. |
@@ -76,7 +76,7 @@ Capability changes that touch the wire protocol, on-disk formats, or cluster arc
 |---|---|
 | **Multi-node clustering** | v1 is single-node. Distributed coordination, range-based sharding, cross-node query fan-out — each is a multi-month design. |
 | **Replication** | v1 is single-replica per shard; node loss means restore-from-snapshot. Synchronous WAL streaming + asynchronous follower replication are both v2 candidates with different trade-offs. |
-| **Python / TypeScript / Go SDKs** | Rust SDK is canonical in v1. Bindings via PyO3, NAPI-RS, and cgo land once the v1 wire protocol is frozen. |
+| **Wire-protocol conformance corpus** | Brain ships no first-party SDK in any language; the public interface is the §04 wire protocol (CBOR payloads). Once the wire freezes, a language-agnostic conformance corpus lets third-party clients verify their implementations against recorded frames. |
 | **Tenant offloading / lazy loading** | Cold tenants serialized to object storage; lazy-load on first query. Pattern documented in `spec/01_architecture/07_wedges_and_roadmap.md` Roadmap. |
 | **Storage-compute separation with freshness layer** | Blob storage as source of truth + in-memory freshness layer for recent writes. Pinecone-serverless-style architecture. |
 | **IVF + PQ on top of HNSW** | For billion-vector scale; today's HNSW is RAM-heavy past 10⁷ vectors per shard. |
@@ -95,7 +95,7 @@ Documented up front so the scope is honest:
 
 - **Single-node only.** Multi-node clustering is v2.
 - **No replication.** Backups (snapshots) only. v2.
-- **Rust SDK only.** Python / TypeScript / Go SDKs are v1.x.
+- **No first-party SDK.** Brain is a standalone database; the public interface is the §04 wire protocol (CBOR payloads). Clients are third-party.
 - **Linux only.** Glommio + `io_uring` don't run elsewhere.
 - **English text only.** `bge-small-en-v1.5` is English; multilingual support requires a different embedding model and re-embedding. v2.
 - **Single embedding model per deployment.** Hot-swapping the model requires `ADMIN_MIGRATE_EMBEDDINGS` (offline).
@@ -108,15 +108,13 @@ These aren't bugs — they're scope boundaries. Don't accidentally implement the
 
 ## Implementation history
 
-For the detailed phase-by-phase landing record (what each phase delivered, deferrals, bench results, file-level paths), see [`docs/development/phases/`](docs/development/phases/) — the index there links every phase's plan + execution log.
-
-`git log --oneline` shows the full landing history.
+`git log --oneline` shows the full landing history — what each phase delivered, deferrals, and bench results are captured in the commit log.
 
 ---
 
 ## How v1.0 gets cut
 
-1. Run the combined acceptance suite on reference hardware (`scripts/full-acceptance.sh`).
+1. Run the combined acceptance suite on reference hardware (`scripts/acceptance.sh`).
 2. Capture wall-time numbers for every operation against the targets in `spec/19_benchmarks/02_performance_targets.md`.
 3. Execute the schema-toggle and disaster-recovery runbooks against a chaos scenario.
 4. One final spec consistency pass — every cross-reference resolves, every numerical claim is harmonized.

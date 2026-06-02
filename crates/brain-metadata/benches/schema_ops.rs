@@ -30,7 +30,7 @@ const PREDICATES: usize = 30;
 const RELATION_TYPES: usize = 10;
 
 /// Renders the bench fixture (50 definitions) directly as DSL text.
-/// Avoids an SDK dev-dep and keeps the bench self-contained.
+/// Avoids a client dev-dep and keeps the bench self-contained.
 fn fixture_text() -> String {
     let mut s = String::from("namespace bench\n");
     for i in 0..ENTITY_TYPES {

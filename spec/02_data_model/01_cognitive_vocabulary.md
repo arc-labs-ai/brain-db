@@ -143,7 +143,7 @@ Some words exist in the implementation but don't surface in the public vocabular
 - **Vector** — the 384-dim float array. Internal; clients send text.
 - **Epoch** — the lock-free reclamation marker. Internal; clients don't know about epochs.
 
-This isn't accidental. Brain is opinionated about hiding implementation. A client SDK that exposed `slot_id` directly would let users build code that depends on internal stability Brain does not promise. By keeping these words inside, Brain keeps the right to evolve them.
+This isn't accidental. Brain is opinionated about hiding implementation. A client that exposed `slot_id` directly would let users build code that depends on internal stability Brain does not promise. By keeping these words inside, Brain keeps the right to evolve them.
 
 ## 7. The agent-application words Brain does not use
 

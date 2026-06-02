@@ -10,7 +10,7 @@
 //! (or small-N-phase) write. `TXN_COMMIT` buffers phases across many
 //! wire calls and submits them as one [`Write`].
 //!
-//! Inside this module the layers ("substrate" vs "knowledge") that
+//! Inside this module the layers ("substrate" vs "typed-graph") that
 //! used to scatter writes across three code paths do not exist. There
 //! is a write, with phases, going through one writer queue.
 

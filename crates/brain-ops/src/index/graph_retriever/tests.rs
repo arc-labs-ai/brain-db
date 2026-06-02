@@ -823,7 +823,7 @@ mod unified_walk {
     }
 
     // -------------------------------------------------------------
-    // Entity anchor — exercises Typed knowledge relations.
+    // Entity anchor — exercises typed-graph relations.
     // -------------------------------------------------------------
 
     #[test]

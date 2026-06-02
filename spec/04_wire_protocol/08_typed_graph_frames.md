@@ -2,7 +2,7 @@
 
 Request/response body schemas for the typed-graph "noun" opcodes — the entity (`0x0130–0x013F`), statement (`0x0140–0x014F`), and relation (`0x0150–0x015F`) ranges. The opcodes in these ranges create, read, mutate, and expire the typed records that ride on top of Brain's substrate memory model.
 
-Brain's wire protocol — 32-byte header, opcode framing, CRC32C, payload encoding — is covered in [`./02_wire_format.md`](./02_wire_format.md), [`./03_opcodes.md`](./03_opcodes.md), and [`./05_frame_layouts.md`](./05_frame_layouts.md). This file specifies only the rkyv-archived structs that live inside the request/response payloads for the noun opcodes.
+Brain's wire protocol — 32-byte header, opcode framing, CRC32C, payload encoding — is covered in [`./02_wire_format.md`](./02_wire_format.md), [`./03_opcodes.md`](./03_opcodes.md), and [`./05_frame_layouts.md`](./05_frame_layouts.md). This file specifies only the CBOR field schemas of the request/response payloads for the noun opcodes.
 
 Cross-references:
 - [`../02_data_model/06_entity_lifecycle.md`](../02_data_model/06_entity_lifecycle.md) — entity record semantics.
@@ -24,20 +24,15 @@ Defined once, reused across this section and Brain's [`./05_frame_layouts.md`](.
 | `EntityTypeId` | `u32` | Raw form of the registry id. `Person` is permanently `1` (seeded at db open); user-declared types from the schema DSL get monotonically-increasing ids ≥ 2. |
 | `AttributesBlob` | `Vec<u8>` | Opaque encoded attributes — rkyv-encoded `BTreeMap<String, Value>` validated against the entity type's attribute schema. The wire layer treats it as opaque bytes. |
 
-#### rkyv conventions
+#### CBOR conventions
 
-All structs in this section derive:
+All payloads in this section are CBOR maps validated against the per-opcode field schema. Senders use deterministic encoding (RFC 8949 §4.2.1). Receivers reject unknown fields and malformed CBOR.
 
-```rust
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-```
-
-`check_bytes` is mandatory: the server runs `rkyv::check_archived_root::<T>` on every received payload and rejects malformed buffers with `MalformedRkyv` (see [`07_error_handling.md`](./07_error_handling.md)).
+CBOR validation is mandatory: the server decodes every received payload and validates it against the opcode's field schema, rejecting malformed buffers with `MalformedPayload` (see [`07_error_handling.md`](./07_error_handling.md)).
 
 #### `None` encoding for `WireUuid` fields
 
-rkyv 0.7's `Option<[u8; 16]>` archive shape is awkward in some derive paths. Where a struct field carries an optional `EntityId`, the wire shape uses a bare `WireUuid` and treats `[0u8; 16]` as the sentinel for "absent." UUIDv7 cannot produce the all-zeros value (its first 48 bits are a unix-ms timestamp), so the collision is impossible by construction. Documented per struct below.
+A CBOR `null` is avoided for optional `WireUuid` fields. Where a struct field carries an optional `EntityId`, the wire shape uses a bare `WireUuid` and treats `[0u8; 16]` as the sentinel for "absent." UUIDv7 cannot produce the all-zeros value (its first 48 bits are a unix-ms timestamp), so the collision is impossible by construction. Documented per struct below.
 
 ### Entity opcode index
 
@@ -102,7 +97,7 @@ See [`./07_error_handling.md`](./07_error_handling.md) for the complete mapping.
 
 ```text
 C → S  frame: opcode=0x0130 stream_id=1 EOS
-       payload: rkyv(EntityCreateRequest {
+       payload: cbor(EntityCreateRequest {
            entity_type_id: 1,                 // Person
            canonical_name: "Priya Patel",
            aliases: vec!["Priya", "P. Patel"],
@@ -110,7 +105,7 @@ C → S  frame: opcode=0x0130 stream_id=1 EOS
            request_id: <UUIDv7>,
        })
 S → C  frame: opcode=0x01B0 stream_id=1 EOS
-       payload: rkyv(EntityCreateResponse {
+       payload: cbor(EntityCreateResponse {
            entity_id: <fresh UUIDv7>,
        })
 ```
@@ -281,7 +276,7 @@ pub struct EntityUnmergeResponse {
 
 ### ENTITY_RESOLVE (0x0136) — spec-only
 
-Exposes the entity resolver over the wire so SDK clients can run resolution without re-implementing the tier ladder.
+Exposes the entity resolver over the wire so clients can run resolution without re-implementing the tier ladder.
 
 #### Request body — `EntityResolveRequest`
 
@@ -429,7 +424,7 @@ For every opcode in this section that carries a `request_id`, Brain's idempotenc
 
 ### Entity-frames implementation note
 
-The wire shapes for `ENTITY_CREATE` through `ENTITY_RENAME` are implemented with round-trip rkyv tests in the `brain-protocol` crate. The shapes for `ENTITY_MERGE` through `ENTITY_TOMBSTONE` are **spec-only**; their Rust counterparts may be refined during implementation. Refinements must update this file before code lands.
+The wire shapes for `ENTITY_CREATE` through `ENTITY_RENAME` are implemented with round-trip CBOR conformance tests in the `brain-protocol` crate. The shapes for `ENTITY_MERGE` through `ENTITY_TOMBSTONE` are **spec-only**; their Rust counterparts may be refined during implementation. Refinements must update this file before code lands.
 
 ## Statement frames
 
@@ -522,7 +517,7 @@ pub struct StatementView {
 }
 ```
 
-`StatementView` mirrors `brain_core::Statement`. Optional fields become "sentinel zero" rather than `Option<T>` for the same rkyv-archive reason as `EntityView`.
+`StatementView` mirrors `brain_core::Statement`. Optional fields become "sentinel zero" rather than `Option<T>` for the same sentinel-zero wire reason as `EntityView`.
 
 ### STATEMENT_CREATE (0x0140)
 

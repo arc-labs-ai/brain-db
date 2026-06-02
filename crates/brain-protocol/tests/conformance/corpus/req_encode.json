@@ -1,0 +1,33 @@
+{
+  "text": "the sky is blue",
+  "context_id": 1,
+  "kind": 0,
+  "salience_hint": 0.25,
+  "edges": [
+    {
+      "target": 33059591799037110662230,
+      "kind": 0,
+      "weight": 0.9
+    }
+  ],
+  "request_id": [
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17
+  ],
+  "txn_id": null,
+  "deduplicate": true
+}

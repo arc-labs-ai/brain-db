@@ -1,6 +1,6 @@
 # 04.02 Wire Format
 
-The wire format covers two layers: the 32-byte frame header that prefixes every frame, and the payload encoding (rkyv for structured data, bytemuck for raw vector bytes).
+The wire format covers two layers: the 32-byte frame header that prefixes every frame, and the payload encoding (CBOR for structured data, little-endian f32 for raw vector bytes).
 
 > The opcode is a big-endian `u16` (bytes 5–6) and `flags` is a single byte (byte 7). The namespace byte (high byte of opcode) is `0x00` for substrate ops, `0x01` for typed-graph ops — see [`03_opcodes.md`](03_opcodes.md).
 
@@ -222,13 +222,13 @@ opcode           0x0021 (RECALL_REQ)
 flags            0x00
 header_crc32c    <computed>
 stream_id        7 (client-allocated, odd)
-payload_len      <size of rkyv-encoded RecallRequest>
+payload_len      <size of CBOR-encoded RecallRequest>
 reserved         0
 payload_crc32c   <computed>
 reserved         0..0
 ```
 
-Plus the rkyv-encoded RecallRequest payload. See [`05_frame_layouts.md`](05_frame_layouts.md) for layout.
+Plus the CBOR-encoded RecallRequest payload. See [`05_frame_layouts.md`](05_frame_layouts.md) for layout.
 
 #### 7.3 RECALL response frame (intermediate, with one result)
 
@@ -276,18 +276,18 @@ reserved         0..0
 | reserved bytes | byte order; must be zero |
 | `payload_crc32c` | big-endian `u32` |
 
-Within payloads, encodings (rkyv structures and bytemuck-cast vectors) have their own conventions; see the payload encoding section below.
+Within payloads, encodings (CBOR maps and little-endian f32 vectors) have their own conventions; see the payload encoding section below.
 
 ## Payload Encoding
 
-### 9. Two encodings, one payload
+### 9. Two sections, one payload
 
 A single payload may carry both:
 
-- **Structured data** (memory IDs, scores, salience, metadata) — encoded with [rkyv](https://github.com/rkyv/rkyv).
-- **Raw vector bytes** (`f32` arrays representing embeddings) — appended after the rkyv data, accessed via [bytemuck](https://github.com/Lokathor/bytemuck).
+- **Structured data** (memory IDs, scores, salience, metadata) — a [CBOR](https://www.rfc-editor.org/rfc/rfc8949) map.
+- **Raw vector bytes** (`f32` arrays representing embeddings) — appended after the CBOR map, read as a plain little-endian `f32` array.
 
-The split achieves zero-copy reads on both components. rkyv's structured access works on the rkyv portion; bytemuck's `cast_slice<u8, f32>` on the trailing bytes gives direct access to the vector data without decoding.
+The structured part is portable: any language decodes the CBOR map with a stock library, which is what lets Brain ship no client. The raw vector part stays zero-copy: it is a contiguous `f32` array the reader slices directly, no per-element decode. Most payloads carry no vector section at all — clients send text, and Brain owns the embedding model.
 
 ### 10. The payload layout
 
@@ -295,100 +295,72 @@ A typical payload:
 
 ```
 +----------------------------------+
-| rkyv-encoded structure (N bytes) |
+| CBOR-encoded map (N bytes)       |
 +----------------------------------+
 | raw f32 vectors (M bytes)        |
 +----------------------------------+
 ```
 
-The rkyv structure includes a field giving the offset (relative to the start of the payload) and length of the raw vector data. This lets the reader find the vector portion without scanning.
+The CBOR map includes fields giving the offset (relative to the start of the payload) and dimension of the raw vector data. This lets the reader find the vector portion without scanning. As a CBOR map, a RECALL request payload is:
 
-```rust
-#[derive(rkyv::Archive)]
-struct RecallRequestPayload {
-    cue_text: String,
-    cue_vector_offset: u32,    // 0 if cue is text-only; non-zero if vector pre-supplied
-    cue_vector_dim: u16,        // 0 if no vector; 384 if present
-    top_k: u32,
-    confidence_threshold: f32,
-    context_filter: Option<ContextFilter>,
-    // ... other fields
+```
+{
+  "cue_text":            <text string>,
+  "cue_vector_offset":   <u32: 0 if cue is text-only; byte offset if vector pre-supplied>,
+  "cue_vector_dim":      <u16: 0 if no vector; 384 if present>,
+  "top_k":               <u32>,
+  "confidence_threshold":<f32>,
+  "context_filter":      <array of u64, or absent>,
+  ...
 }
 ```
 
-After the rkyv data, the raw vector bytes (if any) follow.
+After the CBOR map, the raw vector bytes (if any) follow. For payloads with no vector data (the common case), `cue_vector_offset = 0` and the raw section is empty.
 
-For payloads with no vector data (e.g., metadata-only requests), `cue_vector_offset = 0` and the raw section is empty.
+Field keys are short strings as shown; an implementation MAY use integer keys for compactness as long as the per-opcode schema in [`05_frame_layouts.md`](05_frame_layouts.md) is followed and the conformance vectors ([§19](../19_benchmarks/00_purpose.md)) match. The reference encoding uses string keys for legibility.
 
-### 11. rkyv
+### 11. CBOR
 
-[rkyv](https://github.com/rkyv/rkyv) is a Rust serialization framework providing zero-copy deserialization. Self-described as "a zero-copy deserialization framework for Rust."
+[CBOR](https://www.rfc-editor.org/rfc/rfc8949) (RFC 8949, "Concise Binary Object Representation") is an IETF-standard, self-describing binary format with a small encoder/decoder in every mainstream language.
 
-#### 11.1 What rkyv provides
+#### 11.1 What CBOR provides
 
-rkyv lets the receiver access deserialized data without copying it. The bytes on the wire are the same bytes the program reads as a struct (modulo a small header). For a 1 KiB structured payload with many fields, this saves the copy and the per-field decode that Protobuf would perform.
+CBOR is self-describing: the bytes carry their own type tags, so a reader decodes a payload into a map without a schema and without a Brain-supplied library. This is the property that makes "no first-party SDK" honest — a third-party client uses its language's stock CBOR library and reads the documented fields. The cost relative to a zero-copy encoding is a decode pass, which for Brain's small text-bearing payloads is single-digit microseconds.
 
-The trade-off is that the on-wire format is rkyv-specific — third-party readers (without an rkyv library) can't easily decode it. The protocol accepts this; SDKs include rkyv.
+#### 11.2 Deterministic encoding
 
-#### 11.2 rkyv version pinning
+Senders MUST use a **reproducible deterministic** encoding: definite-length items, shortest-form (canonical) integer encoding, and a fixed field order per payload type (the order the per-opcode field schema lists). A given logical payload therefore encodes to one exact byte sequence — which is what lets the conformance corpus ([§19](../19_benchmarks/00_purpose.md)) ship golden bytes, and what keeps request-hash idempotency stable across clients. This is reproducibility from a fixed schema, not the full key-sorted canonical profile of RFC 8949 §4.2.1: keys appear in schema order, not bytewise-sorted order. The golden corpus pins the exact bytes regardless, so conformance is byte-exact either way.
 
-The protocol pins to a specific rkyv version (initially 0.7.x). Within a major rkyv version, format compatibility is preserved. Bumping rkyv to a new major version requires bumping the wire-protocol version.
+#### 11.3 Version pinning
 
-#### 11.3 What rkyv-encoded data looks like
-
-rkyv writes the data structure followed by a small trailer (the "root pointer") that lets the reader find the start of the encoded structure within the buffer. The reader decodes by:
-
-1. Reading the buffer.
-2. Asking rkyv for the archived view at the buffer's end.
-3. Accessing fields via the archived view; no allocation, no copy.
-
-The buffer is the rkyv portion of the payload. The reader knows the rkyv portion's size from the rkyv root pointer (and from the difference between `payload_len` and the trailing vector bytes).
+The CBOR data model is stable (RFC 8949 obsoletes RFC 7049 without breaking the core encoding). The wire-protocol version field (§3.2) covers the *schema* of each payload — which fields exist for each opcode — not the CBOR encoding itself. Adding or changing a field in an opcode's schema bumps the wire version.
 
 #### 11.4 Validation
 
-rkyv supports validation: checking that an archive is well-formed before accessing it. Brain uses rkyv's validation to catch malformed data (which would be a protocol error, not just garbage data).
+Receivers MUST validate every payload before acting on it: the CBOR MUST be well-formed (RFC 8949 §5.3.1), MUST decode to the map shape the opcode's schema specifies, and MUST NOT carry unknown keys. A payload that fails any of these is a protocol error (`MalformedPayload`), not garbage to be best-effort-parsed. The validation cost is small and is paid on every frame.
 
-The validation cost is small (~100 ns for typical payloads) and worth paying for safety.
+### 12. The raw vector section
 
-### 12. bytemuck
+The raw vector portion of a payload is a sequence of `f32` values, each 4 bytes, read directly from the network buffer as an `f32` array — no decode loop, no per-element overhead.
 
-[bytemuck](https://github.com/Lokathor/bytemuck) provides safe bit-cast operations between types of compatible memory layout.
+#### 12.1 Endianness for vectors
 
-#### 12.1 What bytemuck is used for
+Vectors use **little-endian** `f32`, matching the byte layout of common CPUs (x86 and ARM). Big-endian would force a byte swap on the hot path, which the protocol avoids. This is the one place the protocol deviates from the big-endian rule that governs the header and CBOR integers; the deviation is deliberate and documented so a client byte-swaps correctly on a big-endian host.
 
-The raw vector portion of a payload is a sequence of `f32` values, each 4 bytes. bytemuck's `cast_slice<u8, f32>` reinterprets the byte slice as an `f32` slice without copying:
+#### 12.2 Alignment
 
-```rust
-let vector_bytes: &[u8] = &payload[vector_offset..vector_offset + vector_byte_len];
-let vector: &[f32] = bytemuck::cast_slice(vector_bytes);
-```
+`f32` alignment is 4 bytes on all target architectures. The CBOR portion of the payload may end at any byte boundary; it is padded with zero bytes to a multiple of 4 so the vector portion starts aligned. The padding length (0 to 3 bytes) is `(4 - (cbor_len % 4)) % 4`; the reader computes the vector offset from the CBOR map's `vector_offset` field, which already accounts for the padding.
 
-The reader gets a `&[f32]` directly into the network buffer. No allocation, no decode loop, no per-element overhead.
+#### 12.3 Multiple vectors per payload
 
-#### 12.2 Endianness for vectors
-
-Vectors use **little-endian** `f32`, matching the byte layout of common CPUs (x86 and ARM). Big-endian would force a byte swap on the hot path, which the protocol avoids.
-
-The endianness mismatch with the frame header (big-endian) is internally consistent within the protocol's frame: header in big-endian, structured payload data in rkyv's native (little-endian on most platforms), vector bytes in little-endian. The reader handles each section appropriately.
-
-#### 12.3 Alignment
-
-`f32` alignment is 4 bytes on all target architectures. The rkyv portion of the payload may end at any byte boundary; the rkyv portion is padded to a multiple of 4 bytes so the vector portion starts aligned.
-
-The padding bytes are zero. The padding length (0 to 3 bytes) is determined by the rkyv portion's size; the reader skips the padding to reach the vector portion.
-
-#### 12.4 Multiple vectors per payload
-
-For payloads with multiple vectors (e.g., `RECALL` results carrying multiple memory vectors), the vectors are concatenated in the raw section. The structured section indexes into the raw section via offset and length per vector.
+For payloads with multiple vectors (e.g., `RECALL` results carrying multiple memory vectors when the client asked for them), the vectors are concatenated in the raw section. The CBOR map indexes into the raw section via offset and dim per vector:
 
 ```
 +-----------------------+
-| rkyv portion          |
+| CBOR map              |
 |   results: [          |
-|     { vec_offset: 0,  |
-|       vec_len: 1536 } |
-|     { vec_offset: 1536|
-|       vec_len: 1536 } |
+|     { vec_offset: 0,   dim: 384 }   |
+|     { vec_offset: 1536, dim: 384 }  |
 |     ...               |
 |   ]                   |
 +-----------------------+
@@ -402,182 +374,148 @@ For payloads with multiple vectors (e.g., `RECALL` results carrying multiple mem
 +-----------------------+
 ```
 
-Vectors are typically same-size (384 dims = 1536 bytes). Mixed-size vectors are supported via the explicit length field but unusual.
+Vectors are typically same-size (384 dims = 1536 bytes). Mixed-size vectors are supported via the explicit per-vector dim but unusual.
 
-### 13. The full payload format
+### 13. The full payload read algorithm
 
-A frame's payload has the structure:
+A frame's payload is:
 
 ```
-[rkyv-encoded header]  [rkyv root pointer]  [padding]  [raw vector bytes]
+[CBOR map]  [padding (0-3 bytes)]  [raw vector bytes]
 ```
 
-The rkyv root pointer is at the end of the rkyv portion (rkyv's convention). The reader:
+The reader:
 
 1. Reads the entire payload (`payload_len` bytes).
 2. Validates `payload_crc32c`.
-3. Locates the rkyv root pointer at offset N (where N is set by rkyv's encoding).
-4. Accesses the archived structure, including the `vector_offset` and `vector_len` fields.
-5. Casts the raw section to `&[f32]` via bytemuck.
+3. Decodes the leading CBOR map (a CBOR decoder consumes exactly the map's bytes and reports where it ended).
+4. Reads the `vector_offset` / `vector_dim` fields from the map.
+5. If a vector is present, slices the raw section at `vector_offset` as a little-endian `f32` array of length `vector_dim`.
 
-### 14. Why not just rkyv for everything
+### 14. Why not put vectors in the CBOR map
 
-The structured part uses rkyv. Why not put vectors in the rkyv structure too?
+The structured part is CBOR. Why not put vectors in the CBOR map too, as an array of floats?
 
-A vector field in rkyv would be encoded element-by-element. For 384-dim `f32` vectors, that's 384 fields per vector with rkyv overhead per field. Even with rkyv's efficient encoding, the overhead is non-trivial.
+A 384-dim vector encoded as a CBOR array is 384 tagged float items — per-element tag overhead, and a decode loop the receiver pays even when it only wants to forward the bytes. The raw trailing section bypasses both: the vectors are a contiguous `f32` array, sliced in one step.
 
-Putting vectors in the raw section bypasses this. The vectors are just bytes; the reader gets a slice without overhead.
+The split: structured data goes through CBOR (portable, self-describing), bulk vector data goes in the raw section (zero-copy, no per-element cost). Each part uses the representation that fits it.
 
-The architectural symmetry: structured data goes through rkyv (whose strength is structured access), bulk data goes through bytemuck (whose strength is bulk byte access). Each tool for its own job.
+### 15. ENCODE_VECTOR_DIRECT payload
 
-### 15. Encoding the cue vector for ENCODE_VECTOR_DIRECT
+`ENCODE_VECTOR_DIRECT` is the power-user opcode that lets clients send pre-computed vectors. Its CBOR map:
 
-`ENCODE_VECTOR_DIRECT` is the power-user opcode that lets clients send pre-computed vectors. Its payload:
-
-```rust
-struct EncodeVectorDirectPayload {
-    text: String,
-    vector_offset: u32,         // offset to the vector in the raw section
-    vector_dim: u16,            // expected: 384
-    model_fingerprint: [u8; 16],
-    context_id: ContextId,
-    salience_hint: f32,
-    request_id: RequestId,
+```
+{
+  "text":              <text string>,
+  "vector_offset":     <u32: offset to the vector in the raw section>,
+  "vector_dim":        <u16: expected 384>,
+  "model_fingerprint": <16-byte string>,
+  "context_id":        <u64>,
+  "salience_hint":     <f32>,
+  "request_id":        <16-byte string>
 }
 ```
 
-Followed by the raw vector. The model fingerprint identifies which embedding model produced the vector; the server validates that fingerprint matches a known model.
+Followed by the raw vector. The model fingerprint identifies which embedding model produced the vector; the server validates that fingerprint matches the shard's loaded model. This is the only common path that carries a raw vector section on a *request*.
 
-### 16. Encoding RECALL request
+### 16. RECALL request payload
 
-A request without a pre-supplied vector:
+A request without a pre-supplied vector (the common case) is the map shown in §10 with `cue_vector_offset = 0`, `cue_vector_dim = 0`, and no raw section. A request with a pre-supplied cue vector sets `cue_vector_offset` to the (post-padding) byte offset and `cue_vector_dim = 384`, followed by 1536 bytes of little-endian `f32`.
 
-```rust
-struct RecallRequestPayload {
-    cue_text: String,
-    cue_vector_offset: u32,     // 0 — no pre-supplied vector
-    cue_vector_dim: u16,         // 0
-    top_k: u32,
-    confidence_threshold: f32,
-    context_filter: Option<Vec<ContextId>>,
-    age_bound_unix_nanos: Option<u64>,
-    kind_filter: Option<Vec<MemoryKind>>,
-    request_id: Option<RequestId>,
+The full field list (types, required/optional, sentinels) for RECALL_REQ and every other opcode is in [`05_frame_layouts.md`](05_frame_layouts.md).
+
+### 17. RECALL response payload
+
+Each response frame carries a batch of results as a CBOR map:
+
+```
+{
+  "is_final":          <bool: matches the EOS flag, redundantly>,
+  "results": [
+    {
+      "memory_id":        <16-byte string>,
+      "text":             <text string>,
+      "similarity_score": <f32>,
+      "confidence":       <f32>,
+      "salience":         <f32>,
+      "kind":             <u8 enum>,
+      "context_id":       <u64>,
+      "created_at":       <u64>,
+      "vector_offset":    <u32: offset into raw section if vector included, else 0>,
+      "vector_dim":       <u16: 384 if included, else 0>
+    },
+    ...
+  ]
 }
 ```
 
-Followed by no raw vector data.
-
-A request with pre-supplied cue vector:
-
-```rust
-struct RecallRequestPayload { ... cue_vector_offset: <set> ... cue_vector_dim: 384 ... }
-```
-
-Followed by 1536 bytes of vector data.
-
-### 17. Encoding RECALL response
-
-Each response frame carries one result (or a small batch):
-
-```rust
-struct RecallResponsePayload {
-    is_final: bool,             // matches the EOS flag, redundantly
-    results: Vec<MemoryResult>,
-}
-
-struct MemoryResult {
-    memory_id: MemoryId,
-    text: String,
-    similarity_score: f32,
-    confidence: f32,
-    salience: f32,
-    kind: MemoryKind,
-    context_id: ContextId,
-    created_at: u64,
-    vector_offset: u32,         // offset into raw section, if vector included
-    vector_dim: u16,             // 384 if included, 0 otherwise
-}
-```
-
-Followed by 0 or more vectors in the raw section.
-
-By default, vectors are NOT included in `RECALL` responses. Clients receive `vector_offset = 0` and have no vectors. The `include_vectors` flag in the request enables vector return; when set, each result's vector is included in the raw section.
+Followed by 0 or more vectors in the raw section. By default vectors are NOT included in `RECALL` responses (`vector_offset = 0`); the `include_vectors` request flag enables them.
 
 ### 18. Compression
 
 The frame header reserves a `CMP` flag for compression. Not currently used.
 
-If a future major version adds compression (probably zstd over the entire payload, or just the rkyv portion), the flag is set and the receiver decompresses before parsing.
-
-For the current wire version, all payloads are uncompressed.
+If a future major version adds compression (probably zstd over the CBOR section), the flag is set and the receiver decompresses before decoding. For the current wire version, all payloads are uncompressed and a set `CMP` bit is a protocol error.
 
 ### 19. Payload size estimation
 
 A typical encode payload:
 
-- rkyv structure: ~150–200 bytes (text varies)
+- CBOR map: ~150–250 bytes (text varies)
 - vector data: 0 (text-only encode) or 1536 bytes (vector pre-supplied)
 - total: ~150–2000 bytes
 
 A typical recall request:
 
-- rkyv structure: ~80–150 bytes (cue text varies)
+- CBOR map: ~80–180 bytes (cue text varies)
 - vector data: 0 (typical)
-- total: ~80–150 bytes
+- total: ~80–180 bytes
 
 A typical recall response (10 memories, no vectors):
 
-- rkyv structure: ~2 KiB (10 × ~200 bytes per result)
+- CBOR map: ~2–3 KiB (10 × ~250 bytes per result)
 - vector data: 0
-- total: ~2 KiB
+- total: ~2–3 KiB
 
 A recall response with vectors (10 memories, vectors included):
 
-- rkyv structure: ~2 KiB
+- CBOR map: ~2–3 KiB
 - vector data: 10 × 1536 = 15,360 bytes
-- total: ~17 KiB
+- total: ~18 KiB
 
-These are well within the 16 MiB single-frame limit. Multi-payload framing is reserved for unusual cases.
+CBOR is slightly larger on the wire than a packed zero-copy encoding (self-describing tags cost a byte or two per field), but for Brain's text-dominated payloads the difference is noise against the text itself. All sizes are well within the 16 MiB single-frame limit; multi-payload framing is reserved for unusual cases.
 
 ### 20. Typed-graph payload conventions
 
-The `0x01xx` (typed-graph) opcodes reuse the payload encoding rules: rkyv 0.7 with `check_bytes`, big-endian multi-byte integers, CRC32C over the body, 16 MiB − 1 hard cap, `MPL` for multi-frame logical payloads. This section documents the typed-graph-specific conventions for what goes *inside* an rkyv body.
+The `0x01xx` (typed-graph) opcodes reuse the payload encoding rules: a CBOR map (deterministic profile, validated), big-endian multi-byte integers, CRC32C over the body, 16 MiB − 1 hard cap, `MPL` for multi-frame logical payloads. This section documents the typed-graph-specific conventions for what goes *inside* a CBOR body.
 
 #### 20.1 Opaque blob fields
 
-Several typed-graph structs carry `Vec<u8>` fields that are not interpreted by the wire layer:
+Several typed-graph payloads carry byte-string fields that the wire layer does not interpret:
 
 | Field | Carrier | Schema-aware decode by |
 |---|---|---|
 | `EntityCreateRequest.attributes_blob` | entity ops | the schema validator |
-| `EntityView.attributes_blob` | entity reads | the SDK typed accessor |
+| `EntityView.attributes_blob` | entity reads | the client |
 | `RelationCreateRequest.properties_blob` | relation ops | the schema validator |
-| `RelationView.properties_blob` | relation reads | the SDK typed accessor |
+| `RelationView.properties_blob` | relation reads | the client |
 | `StatementValueWire::Blob(_)` (inner) | statement values | application-level |
-| `SchemaUploadRequest.schema_document` (String) | schema upload | parser |
+| `SchemaUploadRequest.schema_document` (text) | schema upload | parser |
 
 ##### 20.1.1 Inner encoding
 
-`attributes_blob` and `properties_blob` are themselves rkyv-encoded maps:
+`attributes_blob` and `properties_blob` are themselves **nested CBOR maps** carried as a CBOR byte string in the outer payload:
 
-```rust
+```
 // Logical shape (decoded after schema validation):
-pub type AttributesMap = BTreeMap<String, StatementValueWire>;
+{ attribute-name (string): value }
 ```
 
-The wire layer treats them as bytes. The schema validator runs:
+The wire layer treats the blob as opaque bytes. The schema validator decodes the nested CBOR map and validates it against the entity/relation type's declared attribute schema before the redb commit. Validation failures surface as `EntityTypeMismatch` (schema-aware).
 
-```rust
-let map: AttributesMap = rkyv::check_archived_root::<AttributesMap>(blob)?;
-let validated = schema.validate_attributes(entity_type, &map)?;
-```
+##### 20.1.2 Why a nested blob (not flattened fields)
 
-before the redb commit. Validation failures surface as `EntityTypeMismatch` (schema-aware).
-
-##### 20.1.2 Why nested rkyv
-
-Letting the inner shape be rkyv means SDK code can deserialize attributes once and pattern-match against typed accessors. The alternative (e.g. JSON or protobuf inside the rkyv outer struct) adds a second codec to the client and server. One codec, one validation pass.
+The wire layer can't flatten attributes into top-level keys because it doesn't know any user-defined type's attribute schema (types are declared at runtime via SCHEMA_UPLOAD). Carrying the attributes as an opaque nested-CBOR blob defers interpretation to the handler, which has the schema. It's the same CBOR codec for inner and outer — one codec, one validation pass, and a third-party client builds the blob with the same library it uses for the rest of the frame.
 
 ##### 20.1.3 Size cap
 
@@ -604,7 +542,7 @@ pub enum EvidenceRefWire {
 
 `predicate` fields are wire-carried as `String` in their canonical `"namespace:name"` form. The server interns them into a `predicates` redb table on first encounter (per [`../02_data_model/00_purpose.md`](../02_data_model/00_purpose.md)). Subsequent reads emit the same canonical form back to the wire.
 
-**Why strings, not interned `u32`?** Convenience for SDKs. A client constructing a `StatementCreateRequest` shouldn't have to look up a `PredicateId` first. The intern step happens server-side on the create path.
+**Why strings, not interned `u32`?** Convenience for clients. A client constructing a `StatementCreateRequest` shouldn't have to look up a `PredicateId` first. The intern step happens server-side on the create path.
 
 **Trade-off.** ~20-40 bytes per statement frame for the predicate string vs ~4 bytes for an interned id. Acceptable for current scale; revisit if `STATEMENT_LIST` streaming becomes bandwidth-bound at high QPS.
 
@@ -614,14 +552,14 @@ All time fields are **unix nanoseconds**, `u64`.
 
 **Sentinel zero for "absent".** `valid_from_unix_nanos = 0`, `valid_to_unix_nanos = 0`, `event_at_unix_nanos = 0` mean "absent / not applicable" — not "January 1, 1970 00:00:00 UTC". Anyone encoding the unix epoch literally should encode as `1` ns instead (or accept the loss of one ns precision).
 
-**Why not `Option<u64>`?** Same reasoning as [§01/§12](01_design.md) — `Option<u64>` archived directly via rkyv is awkward. Sentinel zero is simpler. Documented per-field where it matters.
+**Why not `Option<u64>`?** Same reasoning as [§01/§12](01_design.md) — a CBOR-level optional is avoided here; sentinel zero is the wire convention. Sentinel zero is simpler. Documented per-field where it matters.
 
 #### 20.5 Pagination cursors
 
 `ENTITY_LIST`, `STATEMENT_LIST`, `RELATION_LIST_*`, `SCHEMA_LIST`, `EXTRACTOR_LIST` all carry an opaque `Vec<u8>` cursor field for continuation. The shape is server-defined:
 
 ```rust
-// Currently : opaque rkyv blob containing the last seen key in the
+// Currently : opaque cursor blob containing the last seen key in the
 // query's primary index. Concretely for ENTITY_LIST it's the last EntityId scanned,
 // for STATEMENT_LIST it's a (subject, predicate, statement_id) triple, etc.
 ```

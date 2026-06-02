@@ -38,7 +38,7 @@ pub trait GraphRetriever: Send + Sync {
 /// The graph retriever walks two different physical tables
 /// depending on which node it's anchored at:
 ///
-/// - [`GraphAnchor::Entity`] — the typed knowledge graph
+/// - [`GraphAnchor::Entity`] — the typed graph
 ///   (relations, predicates). Requires a declared schema for
 ///   useful results; on schemaless deployments this anchor will
 ///   simply find no entities.

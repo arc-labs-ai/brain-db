@@ -1,9 +1,9 @@
-//! Knowledge-event emission helper shared across all wire handlers
-//! that produce knowledge-layer events (entity / statement / relation /
+//! Typed-graph-event emission helper shared across all wire handlers
+//! that produce opaque-body events (entity / statement / relation /
 //! schema / extractor-admin).
 //!
 //! Previously this helper lived inside `handlers/entity.rs` and was
-//! imported by the other knowledge handlers — an awkward ownership
+//! imported by the other typed-graph handlers — an awkward ownership
 //! arrangement that perpetuated the "entity owns the cross-handler
 //! event emission" pattern. Promoted to its own module so the
 //! per-handler files only contain handler-specific code.
@@ -12,49 +12,49 @@
 //!
 //! Substrate writes get WAL coverage through their *write* records
 //! (`wal_map.rs` maps each substrate `Phase` to a typed `WalPayload`).
-//! Knowledge writes (UpsertEntity / UpsertStatement / UpsertRelation /
+//! Typed-graph writes (UpsertEntity / UpsertStatement / UpsertRelation /
 //! UpsertSchema / MergeEntities / Tombstone(E/S/R) / Supersede(S/R))
 //! don't yet have typed `WalPayload` variants — they ship via an
-//! opaque `Knowledge(KnowledgeRecord)` carrier. Until `wal_map.rs`
-//! grows arms for each knowledge `Phase`, knowledge events get WAL
+//! opaque `PhaseBody(PhaseBodyRecord)` carrier. Until `wal_map.rs`
+//! grows arms for each typed-graph `Phase`, typed-graph events get WAL
 //! coverage through this **event-side** path
-//! (`OpsContext::publish_knowledge`).
+//! (`OpsContext::publish_graph`).
 //!
 //! Once `wal_map.rs` is extended, this helper becomes redundant —
 //! `submit::publish_events_for` (which bus-publishes substrate events
-//! from `phase_to_envelope`) can also publish knowledge events, and
+//! from `phase_to_envelope`) can also publish typed-graph events, and
 //! WAL recovery reconstructs them from the write records. That's the
 //! future S-11.
 
 use brain_core::MemoryId;
 use brain_protocol::envelope::response::EventType;
-use brain_protocol::KnowledgeEventPayload;
+use brain_protocol::GraphEventPayload;
 
 use crate::context::OpsContext;
 use crate::subscribe::EventEnvelope;
 
-/// Emit a knowledge-layer event onto the EventBus. Substrate fields
+/// Emit a opaque-body event onto the EventBus. Substrate fields
 /// are zero-filled. Called post-commit by every
-/// knowledge handler that mutates state.
+/// typed-graph handler that mutates state.
 ///
-/// Routes through [`OpsContext::publish_knowledge`] so the event is
+/// Routes through [`OpsContext::publish_graph`] so the event is
 /// **also** WAL-recorded — letting subscribe-replay (`--start-lsn`)
-/// reconstruct knowledge events the same way it reconstructs
+/// reconstruct typed-graph events the same way it reconstructs
 /// substrate events. The WAL append is post-commit (redb is the
-/// source of truth for knowledge state); a crash between commit and
+/// source of truth for typed-graph state); a crash between commit and
 /// WAL append loses the subscribe event for that op, not the
-/// knowledge data.
-pub(crate) async fn emit_knowledge_event(
+/// typed-graph data.
+pub(crate) async fn emit_graph_event(
     ctx: &OpsContext,
     event_type: EventType,
-    payload: KnowledgeEventPayload,
+    payload: GraphEventPayload,
     timestamp_unix_nanos: u64,
 ) {
     // Stamp the writer's bound agent on the envelope so the
-    // subscribe `agents` filter routes knowledge events the same
+    // subscribe `agents` filter routes typed-graph events the same
     // way it routes substrate events. Without this, a
     // schema-on subscriber filtering for "my agent" would silently
-    // miss every knowledge event.
+    // miss every typed-graph event.
     let agent_id = ctx.executor.writer.agent_id();
     let Some(kind) = wal_kind_for_event(&payload) else {
         // Variants without a WAL record kind: bus-only publish.
@@ -67,7 +67,7 @@ pub(crate) async fn emit_knowledge_event(
             salience: 0.0,
             timestamp_unix_nanos,
             text: None,
-            knowledge_payload: Some(payload),
+            graph_payload: Some(payload),
             edge_payload: None,
             stage_kind: None,
             stage_outcome: None,
@@ -77,7 +77,7 @@ pub(crate) async fn emit_knowledge_event(
         let _ = ctx.events.publish(envelope);
         return;
     };
-    ctx.publish_knowledge(kind, payload, move |lsn, payload| EventEnvelope {
+    ctx.publish_graph(kind, payload, move |lsn, payload| EventEnvelope {
         lsn,
         event_type,
         memory_id: MemoryId::NULL,
@@ -86,7 +86,7 @@ pub(crate) async fn emit_knowledge_event(
         salience: 0.0,
         timestamp_unix_nanos,
         text: None,
-        knowledge_payload: Some(payload),
+        graph_payload: Some(payload),
         edge_payload: None,
         stage_kind: None,
         stage_outcome: None,
@@ -96,17 +96,17 @@ pub(crate) async fn emit_knowledge_event(
     .await;
 }
 
-/// Map a [`KnowledgeEventPayload`] variant to its WAL record kind so
+/// Map a [`GraphEventPayload`] variant to its WAL record kind so
 /// subscribe-replay can decode the body back into the matching
 /// variant. `EntityRenamed` / `EntityUnmerged` collapse onto
 /// `EntityUpdate` / `EntityMerge` respectively — recovery
 /// distinguishes by rkyv-decoding the body, the kind byte is just
 /// the lookup key.
 fn wal_kind_for_event(
-    payload: &KnowledgeEventPayload,
+    payload: &GraphEventPayload,
 ) -> Option<brain_storage::wal::kinds::WalRecordKind> {
     use brain_storage::wal::kinds::WalRecordKind as K;
-    use KnowledgeEventPayload as P;
+    use GraphEventPayload as P;
     Some(match payload {
         P::EntityCreated(_) => K::EntityCreate,
         P::EntityUpdated(_) | P::EntityRenamed(_) => K::EntityUpdate,

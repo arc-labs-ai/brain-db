@@ -9,25 +9,19 @@
 //!
 //! The op is NOT admin. It's available to every authenticated client
 //! the same way `PING` / `BYE` are — capability bits don't reveal
-//! sensitive state, and SDKs need them at session warm-up.
-
-use rkyv::{Archive, Deserialize, Serialize};
+//! sensitive state, and clients need them at session warm-up.
 
 /// Empty request — capabilities are server-side state; the client has
 /// nothing to send. Kept as a struct (rather than a unit type) so the
-/// rkyv encoding stays consistent with every other request body and
+/// encoding stays consistent with every other request body and
 /// the envelope's `decode` arm doesn't special-case empty bytes.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GetCapabilitiesRequest {}
 
 /// Capability snapshot returned by the server. Each field corresponds
 /// to one server-side opt-in or runtime parameter the client may need
 /// to know before issuing requests.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Capabilities {
     /// True when the cross-encoder reranker is loaded on this shard.
     /// Rerank is first-class and always-on: when this is `true`,
@@ -53,14 +47,12 @@ pub struct Capabilities {
     /// query?").
     pub schema_namespaces: Vec<String>,
     /// Embedding vector dimensionality the shard's embedder produces.
-    /// SDKs that drive `EncodeVectorDirect` need this to validate
+    /// clients that drive `EncodeVectorDirect` need this to validate
     /// pre-computed vectors before the round-trip.
     pub vector_dim: u16,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GetCapabilitiesResponse {
     pub capabilities: Capabilities,
 }

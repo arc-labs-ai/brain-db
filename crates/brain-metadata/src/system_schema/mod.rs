@@ -39,6 +39,9 @@ pub enum SystemSchemaError {
     #[error("redb commit error: {0}")]
     Commit(#[from] redb::CommitError),
 
+    #[error("redb table error: {0}")]
+    Table(#[from] redb::TableError),
+
     #[error("schema_store: {0}")]
     Schema(#[from] SchemaStoreError),
 
@@ -56,6 +59,18 @@ pub enum SystemSchemaError {
 /// opens. Both branches are idempotent for inputs that match the
 /// stored state.
 pub fn seed_system_schema(db: &Database) -> Result<(), SystemSchemaError> {
+    // Ensure every metadata table is materialized before any read.
+    // In production this is a no-op (MetadataDb::open already runs
+    // open_or_init_schema which calls materialize_all_tables), but
+    // direct callers (tests, internal tooling) get the same shape
+    // without each site having to remember the dance. The op is
+    // idempotent — see `materialize_all_tables_is_idempotent`.
+    {
+        let wtxn = db.begin_write()?;
+        crate::tables::materialize_all_tables(&wtxn)?;
+        wtxn.commit()?;
+    }
+
     let schema = parse_schema(SYSTEM_SCHEMA_SOURCE)
         .expect("system schema must parse — include_str!() content is compile-time");
     let validated = validate_system_schema(&schema).unwrap_or_else(|errs| {

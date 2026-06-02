@@ -3,7 +3,7 @@
 //! Brings up N shards + the data-plane connection listener + the
 //! admin HTTP server on ephemeral 127.0.0.1 ports, returns a
 //! [`Server`] with the bound addresses. The tests in `e2e.rs`,
-//! `sdk_e2e.rs`, and `cli_e2e.rs` all share this scaffold.
+//! the wire integration tests share this scaffold.
 //!
 //! ## Why each test file still has `#[path]` mounts
 //!

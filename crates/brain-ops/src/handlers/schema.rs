@@ -28,14 +28,14 @@ use brain_protocol::schema::{
     CardinalityAst, ExtractorKindAst, ObjectTypeDecl, SchemaItem, StatementKindAst, ValidatedSchema,
 };
 use brain_protocol::{
-    KnowledgeEventPayload, SchemaGetRequest, SchemaGetResponse, SchemaListItemWire,
+    GraphEventPayload, SchemaGetRequest, SchemaGetResponse, SchemaListItemWire,
     SchemaListRequest, SchemaListResponseFrame, SchemaUpdatedEvent, SchemaUploadRequest,
     SchemaUploadResponse, SchemaValidateRequest, SchemaValidateResponse, SchemaValidationErrorWire,
 };
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::entity::emit_knowledge_event;
+use crate::handlers::entity::emit_graph_event;
 use crate::handlers::link::downcast_writer_pub;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
@@ -141,10 +141,10 @@ pub async fn handle_schema_upload(
     };
 
     // 5. Emit event post-commit.
-    emit_knowledge_event(
+    emit_graph_event(
         ctx,
         EventType::SchemaUpdated,
-        KnowledgeEventPayload::SchemaUpdated(SchemaUpdatedEvent {
+        GraphEventPayload::SchemaUpdated(SchemaUpdatedEvent {
             namespace: namespace.clone(),
             from_version,
             to_version: new_version,

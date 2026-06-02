@@ -384,10 +384,9 @@ async fn metrics_emits_worker_counters() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_path_returns_404() {
     // An earlier hand-rolled admin server returned 400 for unknown
-    // paths; brain-http's
-    // Router returns 404 (correct per RFC 9110 §15.5.5). External
-    // scrapers and brain-cli are unaffected — they don't hit
-    // unknown paths.
+    // paths; brain-http's Router returns 404 (correct per RFC 9110
+    // §15.5.5). External scrapers and admin clients are unaffected —
+    // they don't hit unknown paths.
     let server = start_admin_only().await;
     let (code, _body) = http_get(server.admin_addr, "/unknown").await;
     assert_eq!(code, 404);

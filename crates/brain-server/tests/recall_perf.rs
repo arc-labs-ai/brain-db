@@ -240,6 +240,8 @@ fn recall_req(txn_id: Option<[u8; 16]>) -> RecallRequest {
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id,
+        agent_filter: Vec::new(),
+        include_other_agents: false,
     }
 }
 

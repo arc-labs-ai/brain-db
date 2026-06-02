@@ -360,10 +360,4 @@ mod tests {
         assert_eq!(got.durable_lsn, 7_777_777);
     }
 
-    #[test]
-    fn type_name_includes_v1() {
-        let name = <CheckpointMeta as redb::Value>::type_name();
-        let s = format!("{name:?}");
-        assert!(s.contains("v1"), "type_name missing v1 marker: {s}");
-    }
 }

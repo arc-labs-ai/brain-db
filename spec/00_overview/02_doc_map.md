@@ -30,7 +30,7 @@ For each section, this file gives a one-paragraph summary, key dependencies, and
 
 ## 04. Wire Protocol
 
-**Summary.** The binary protocol over TCP. 32-byte fixed header, rkyv-encoded structured payloads, bytemuck-cast raw vectors. One unified opcode space — substrate opcodes (`0x00xx`) plus typed-graph opcodes (`0x01xx`). Handshake, streaming, error handling, and typed-graph frames (entity / statement / relation / schema / query / admin).
+**Summary.** The binary protocol over TCP. 32-byte fixed header, self-describing CBOR structured payloads, little-endian `f32` raw-vector trailing section. One unified opcode space — substrate opcodes (`0x00xx`) plus typed-graph opcodes (`0x01xx`). Handshake, streaming, error handling, and typed-graph frames (entity / statement / relation / schema / query / admin). Portable: any language speaks it with a stock CBOR library; Brain ships no client.
 
 **Depends on.** [01](../01_architecture/00_purpose.md), [02](../02_data_model/00_purpose.md). **Depended on by.** [05](../05_operations/00_purpose.md), [06](../06_sdk/00_purpose.md), [07](../07_embedding/00_purpose.md).
 
@@ -44,11 +44,11 @@ For each section, this file gives a one-paragraph summary, key dependencies, and
 
 ---
 
-## 06. SDK Design
+## 06. Client Interface
 
-**Summary.** Language-level client interfaces (Rust canonical via `brain-sdk-rust`; Python / TS / Go bindings). Connection pool, retries, streams, observability, testing, typed-graph SDK (entity / statement / relation builders, schema upload, fluent query builder).
+**Summary.** A stub. Brain ships no first-party SDK or client library. Clients talk to Brain directly over the wire protocol (§04) — portable binary framing, self-describing CBOR payloads, documented per-opcode field schemas, plus the conformance corpus (§19). Building client libraries in any language is out of scope / future work.
 
-**Depends on.** [01](../01_architecture/00_purpose.md), [04](../04_wire_protocol/00_purpose.md), [05](../05_operations/00_purpose.md). **Depended on by.** Application developers.
+**Depends on.** [04](../04_wire_protocol/00_purpose.md). **Depended on by.** Third-party client implementers.
 
 ---
 

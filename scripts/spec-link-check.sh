@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Validates every `[`./…`]` relative cross-ref in spec/ + docs/
-# resolves to an existing file. Sub-task 24.12.
+# Validates that every `[`./…`]` relative cross-ref in spec/ + ROADMAP.md
+# resolves to an existing file. A broken link means the prose points at a
+# file that was moved or deleted.
 
 set -euo pipefail
 
@@ -28,7 +29,7 @@ while IFS=: read -r path line rest; do
             broken=$((broken + 1))
         fi
     done
-done < <(grep -RIn -E '\]\(\./[^)]+\)' spec/ docs/ ROADMAP.md 2>/dev/null || true)
+done < <(grep -RIn -E '\]\(\./[^)]+\)' spec/ ROADMAP.md 2>/dev/null || true)
 
 if (( broken > 0 )); then
     if [[ "${1:-}" == "--strict" ]]; then
@@ -38,4 +39,4 @@ if (( broken > 0 )); then
     echo "Found $broken broken link(s); report-only (pass --strict to fail)."
     exit 0
 fi
-echo "All spec/doc cross-refs resolve."
+echo "All spec cross-refs resolve."

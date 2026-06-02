@@ -1,6 +1,6 @@
 # 04.05 Frame Layouts
 
-The payload layout for every request and response frame. Frame headers are documented in [`02_wire_format.md`](02_wire_format.md); payload encoding (rkyv + bytemuck) is in the same file. This file focuses on the structured fields per opcode.
+The payload layout for every request and response frame. Frame headers are documented in [`02_wire_format.md`](02_wire_format.md); payload encoding (CBOR + little-endian f32) is in the same file. This file focuses on the structured fields per opcode.
 
 ## Request Frames
 
@@ -434,7 +434,7 @@ Fields:
 - `was_deduplicated` — true when `deduplicate=true` was set in the request and the memory matched an existing one.
 - `salience` — the initial salience assigned. Useful for the client to know how the agent's hint translated into a number.
 - `auto_edges_added` — count of edges (e.g., `SIMILAR_TO`) derived during encode. Doesn't include explicit edges from the request.
-- `lsn` — the WAL log-sequence-number at which this ENCODE was committed, suitable for chaining `encode → subscribe --start-lsn lsn+1`. **A value of `0` is a sentinel meaning "no LSN"** — returned when the request hit the fingerprint dedup index (no fresh WAL record was appended) or when an idempotency replay returned a cached response that originated from a dedup hit. Clients chaining onto a subscription MUST treat `0` as "subscribe from tail" rather than "subscribe from position 0." A future wire revision may change this field to a nullable type; today the sentinel is stable, and SDKs are expected to expose an `Option<u64>`-shaped accessor over the raw `u64` (e.g. the Rust SDK's `EncodeResponseExt::lsn() -> Option<u64>`).
+- `lsn` — the WAL log-sequence-number at which this ENCODE was committed, suitable for chaining `encode → subscribe --start-lsn lsn+1`. **A value of `0` is a sentinel meaning "no LSN"** — returned when the request hit the fingerprint dedup index (no fresh WAL record was appended) or when an idempotency replay returned a cached response that originated from a dedup hit. Clients chaining onto a subscription MUST treat `0` as "subscribe from tail" rather than "subscribe from position 0." Clients SHOULD expose this as an optional, treating `0` as absent.
 
 ### 27. ENCODE_VECTOR_DIRECT_RESP (0xAA)
 

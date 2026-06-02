@@ -1,7 +1,7 @@
 //! `NodeRef` — a discriminated reference to either a substrate memory or
-//! a knowledge-layer entity.
+//! a opaque-body entity.
 //!
-//! Brain v1 stored substrate edges and knowledge-layer relations in
+//! Brain v1 stored substrate edges and opaque-body relations in
 //! separate redb tables. Every node a substrate edge could touch was a
 //! `MemoryId`; every node a typed relation could touch was an
 //! `EntityId`. When mention edges (`Memory →(mentions)→ Entity`) arrive,
@@ -30,7 +30,7 @@ use crate::ids::MemoryId;
 
 /// Reference to one node in the unified edge graph.
 ///
-/// Either a substrate `MemoryId` or a knowledge-layer `EntityId`. The
+/// Either a substrate `MemoryId` or a opaque-body `EntityId`. The
 /// discriminant tag is stable for the v1 storage format; future node
 /// kinds (e.g. statement-as-node) widen the tag space.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]

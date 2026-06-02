@@ -778,7 +778,7 @@ fn emit_extractor_metrics(out: &mut String, shards: &[ShardHandle]) {
     emit_header(
         out,
         "brain_extractor_items_written_total",
-        "Knowledge-layer rows persisted by the extractor worker, by item kind.",
+        "Typed-graph rows persisted by the extractor worker, by item kind.",
         "counter",
     );
     for shard in shards {

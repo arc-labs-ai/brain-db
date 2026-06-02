@@ -3,14 +3,10 @@
 //! Per-namespace versioning. No migrations in v1; breaking schema
 //! changes are made in place.
 
-use rkyv::{Archive, Deserialize, Serialize};
-
 use crate::envelope::request::WireUuid;
 
 /// `SCHEMA_UPLOAD` (`0x0120`).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaUploadRequest {
     /// Schema DSL source text.
     pub schema_document: String,
@@ -20,13 +16,12 @@ pub struct SchemaUploadRequest {
     /// Reserved for forward-compat with future migration support.
     /// Ignored in v1.
     pub allow_breaking: bool,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
 /// `SCHEMA_GET` (`0x0121`). `version == 0` → active version.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaGetRequest {
     pub namespace: String,
     pub version: u32,
@@ -34,9 +29,7 @@ pub struct SchemaGetRequest {
 
 /// `SCHEMA_LIST` (`0x0122`). `limit == 0` → unlimited (v1 caps
 /// to schema_list output size).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaListRequest {
     pub namespace: String,
     pub limit: u32,
@@ -44,9 +37,7 @@ pub struct SchemaListRequest {
 }
 
 /// `SCHEMA_VALIDATE` (`0x0123`). Dry-run; never touches storage.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaValidateRequest {
     pub schema_document: String,
 }
@@ -62,17 +53,16 @@ pub struct SchemaValidateRequest {
 /// `force_drop_existing` MUST be `true`; the handler rejects a
 /// `false` value with `InvalidRequest`. The explicit flag is a
 /// confirmation step for an irreversible operation.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaReplaceRequest {
     /// Schema DSL source text. Must declare the same namespace as
     /// the wire `namespace` field, or the handler rejects with
     /// `InvalidRequest`.
     pub schema_document: String,
     /// Confirmation flag — MUST be `true`. Reserved name to keep the
-    /// client SDK ergonomics symmetric with the destructive intent.
+    /// client ergonomics symmetric with the destructive intent.
     pub force_drop_existing: bool,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
@@ -85,9 +75,7 @@ pub struct SchemaReplaceRequest {
 /// `schema_version == 0` indicates the upload was rejected
 /// (validation failure or dry_run). `validation_errors` carries
 /// the structured error list when present.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaUploadResponse {
     pub namespace: String,
     pub schema_version: u32,
@@ -101,9 +89,7 @@ pub struct SchemaUploadResponse {
 }
 
 /// `SCHEMA_GET_RESP` (`0x01A1`).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaGetResponse {
     pub namespace: String,
     pub schema_version: u32,
@@ -118,9 +104,7 @@ pub struct SchemaGetResponse {
 
 /// `SCHEMA_LIST_RESP` (`0x01A2`). Single-frame snapshot in v1;
 /// a later cut may split into streaming.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaListResponseFrame {
     pub namespace: String,
     /// Newest first.
@@ -130,9 +114,7 @@ pub struct SchemaListResponseFrame {
     pub is_final: bool,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaListItemWire {
     pub schema_version: u32,
     pub uploaded_at_unix_nanos: u64,
@@ -141,9 +123,7 @@ pub struct SchemaListItemWire {
 }
 
 /// `SCHEMA_VALIDATE_RESP` (`0x01A3`).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaValidateResponse {
     /// Namespace parsed from the document; `""` if parse failed
     /// before reaching `namespace`.
@@ -156,9 +136,7 @@ pub struct SchemaValidateResponse {
 /// `SCHEMA_REPLACE_RESP` (`0x01A7`). Carries the count of declared
 /// rows dropped before the new schema landed. `version` is the new
 /// active version (always > the pre-replace version).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaReplaceResponse {
     pub namespace: String,
     pub schema_version: u32,
@@ -169,9 +147,7 @@ pub struct SchemaReplaceResponse {
 /// One structured parse-or-validate error. `code` is the variant
 /// name from `ParseError` / `ValidationErrorCode`. `line` / `col`
 /// are 1-based; `0` if no source position is known.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaValidationErrorWire {
     pub code: String,
     pub message: String,

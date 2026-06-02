@@ -216,7 +216,7 @@ The pattern is clear: **operational knowledge graphs use property graphs; semant
 
 Two things are worth borrowing:
 
-1. **The triple as an API abstraction.** When a user writes a Fact, they think `(Priya, role, "engineering manager")`. The SDK accepts this shape. Internally it becomes a property-graph edge or node-with-property.
+1. **The triple as an API abstraction.** When a user writes a Fact, they think `(Priya, role, "engineering manager")`. A client constructs this shape. Internally it becomes a property-graph edge or node-with-property.
 
 2. **URI-style identifiers for predicates.** Brain uses namespaced predicate strings like `brain:prefers` or `crm:reports_to` to avoid collisions. This is RDF's convention and it's good.
 

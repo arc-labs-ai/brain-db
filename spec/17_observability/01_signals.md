@@ -480,7 +480,7 @@ Good:
 
 ## 34. The "trace ID" propagation
 
-If the SDK provides a trace ID (per OpenTelemetry):
+If the client provides a trace ID (per OpenTelemetry):
 
 ```
 "trace_id": "abc...",
@@ -648,7 +648,7 @@ These follow OpenTelemetry semantic conventions where applicable.
 
 ## 46. The propagation
 
-Trace context propagates from the client SDK to Brain:
+Trace context propagates from the client to Brain:
 
 ```
 Client request:

@@ -1,97 +1,77 @@
 //! Admin-surface requests.
 
-use rkyv::{Archive, Deserialize, Serialize};
-
 use crate::envelope::request::{WireContextId, WireMemoryId, WireUuid};
 use crate::shared::primitives::{CheckScope, ForgetMode, MemoryKindWire, StatsDetail};
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminStatsRequest {
     pub detail: StatsDetail,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminSnapshotRequest {
     pub snapshot_name: String,
     pub target_path: Option<String>,
     pub include_wal: bool,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminRestoreRequest {
     pub snapshot_name: String,
     pub target_shard: Option<u8>,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminIntegrityCheckRequest {
     pub scope: CheckScope,
     pub repair_if_possible: bool,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminMigrateEmbeddingsRequest {
     pub target_model: ModelIdentifier,
     pub batch_size: u32,
     pub rate_limit_qps: u32,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelIdentifier {
     pub name: String,
+    #[serde(with = "serde_bytes")]
     pub fingerprint: [u8; 16],
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminCreateContextRequest {
     pub name: String,
     pub description: String,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminRenameContextRequest {
     pub context_id: WireContextId,
     pub new_name: String,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminMoveMemoryRequest {
     pub memory_id: WireMemoryId,
     pub new_context_id: WireContextId,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminReclassifyRequest {
     pub memory_id: WireMemoryId,
     pub new_kind: MemoryKindWire,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminListTombstonedRequest {
     pub context_id: Option<WireContextId>,
     pub max_age_seconds: u32,
@@ -108,17 +88,13 @@ pub struct AdminListTombstonedRequest {
 /// ExtractorWorker channel via `WriterHandle::enqueue_for_extraction`.
 /// Already-extracted memories are still re-enqueued — the worker's own
 /// `skip_already_extracted` audit probe deduplicates downstream.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtractBackfillRequest {
     pub selector: BackfillSelector,
 }
 
 /// Which memories to re-extract.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BackfillSelector {
     /// Enqueue a single memory by id. Errors if the row doesn't exist
     /// on the targeted shard.
@@ -131,9 +107,7 @@ pub enum BackfillSelector {
 }
 
 /// Ack for [`ExtractBackfillRequest`].
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtractBackfillResponse {
     /// Memories the handler successfully pushed onto the queue.
     pub enqueued: u64,
@@ -167,9 +141,7 @@ pub struct ExtractBackfillResponse {
 /// `brain_core::BackfillRange`; structured as an enum so future
 /// scope variants (e.g. namespace, schema-version) slot in
 /// without reshaping callers.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BackfillScope {
     /// Every memory in the shard's metadata table.
     All,
@@ -185,9 +157,7 @@ pub enum BackfillScope {
 /// returns immediately with a `BackfillId`; operators cancel
 /// via [`AdminBackfillCancelRequest`] and poll progress out of
 /// band.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminBackfillRequest {
     /// Which memories to walk.
     pub scope: BackfillScope,
@@ -201,6 +171,7 @@ pub struct AdminBackfillRequest {
     /// Idempotency key. Re-submitting the same `request_id` with
     /// matching params returns the cached response (per the
     /// standard 24h-TTL idempotency rule).
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
@@ -209,13 +180,12 @@ pub struct AdminBackfillRequest {
 /// the worker's progress snapshot at enqueue time (which is
 /// the idle-state snapshot if the worker isn't running yet, or
 /// the live-run snapshot if a previous run is still in flight).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminBackfillResponse {
     /// Worker-assigned id for this run. Pass to
     /// [`AdminBackfillCancelRequest::backfill_id`] to cancel.
     /// Wire-shape: 16 bytes, identical to the `BackfillId` UUID.
+    #[serde(with = "serde_bytes")]
     pub backfill_id: [u8; 16],
     /// Snapshot of the worker's progress at submission time.
     pub progress: BackfillProgress,
@@ -224,13 +194,13 @@ pub struct AdminBackfillResponse {
 /// Cancel an in-flight backfill run by its id. Cancellation
 /// flips a per-run flag the worker checks between items; the
 /// run finalises at the next item boundary.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminBackfillCancelRequest {
     /// The id returned by [`AdminBackfillResponse::backfill_id`].
+    #[serde(with = "serde_bytes")]
     pub backfill_id: [u8; 16],
     /// Idempotency key for the cancel itself.
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
@@ -240,22 +210,19 @@ pub struct AdminBackfillCancelRequest {
 /// submitted, or already cancelled). `progress` is the final
 /// snapshot the worker published for the targeted run, or a
 /// default-idle snapshot when no run matched.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminBackfillCancelResponse {
+    #[serde(with = "serde_bytes")]
     pub backfill_id: [u8; 16],
     pub cancelled: bool,
     pub progress: BackfillProgress,
 }
 
 /// Wire mirror of `brain_core::BackfillProgress`. Plain
-/// rkyv-archivable fields; the `Option`s are flattened to
-/// `(bool, value)` so callers don't pay for an extra rkyv
+/// wire fields; the `Option`s are flattened to
+/// `(bool, value)` so callers don't pay for an extra
 /// `Option` wrapper on the hot path.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BackfillProgress {
     /// `true` iff the worker is mid-run on the targeted request.
     pub running: bool,
@@ -296,9 +263,7 @@ impl BackfillProgress {
 
 use crate::shared::enums::{IntegrityIssueType, MigrationStatus};
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AdminStatsResponse {
     pub summary: StatsSummary,
     pub per_shard: Option<Vec<ShardStats>>,
@@ -307,9 +272,7 @@ pub struct AdminStatsResponse {
     pub server_version: String,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatsSummary {
     pub total_memories: u64,
     pub total_active_memories: u64,
@@ -323,9 +286,7 @@ pub struct StatsSummary {
     pub disk_used_bytes: u64,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShardStats {
     pub shard_id: u16,
     pub memory_count: u64,
@@ -336,16 +297,12 @@ pub struct ShardStats {
 }
 
 /// — fixed 10-bucket histogram.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SalienceHistogram {
     pub buckets: [u32; 10],
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContextStats {
     pub context_id: WireContextId,
     pub name: String,
@@ -354,10 +311,9 @@ pub struct ContextStats {
     pub last_recalled_at_unix_nanos: u64,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminSnapshotResponse {
+    #[serde(with = "serde_bytes")]
     pub snapshot_id: [u8; 16],
     pub snapshot_name: String,
     pub snapshot_path: String,
@@ -367,9 +323,7 @@ pub struct AdminSnapshotResponse {
     pub used_reflink: bool,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminRestoreResponse {
     pub snapshot_name: String,
     pub shards_restored: Vec<u8>,
@@ -377,9 +331,7 @@ pub struct AdminRestoreResponse {
     pub memories_restored: u64,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminIntegrityCheckResponse {
     pub scope: crate::envelope::request::CheckScope,
     pub issues_found: Vec<IntegrityIssue>,
@@ -387,9 +339,7 @@ pub struct AdminIntegrityCheckResponse {
     pub completed_at_unix_nanos: u64,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IntegrityIssue {
     pub issue_type: IntegrityIssueType,
     pub affected_memory_id: Option<WireMemoryId>,
@@ -399,18 +349,14 @@ pub struct IntegrityIssue {
 }
 
 /// — one streaming migration frame.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AdminMigrateEmbeddingsResponseFrame {
     pub is_final: bool,
     pub progress: MigrationProgress,
     pub status: Option<MigrationStatus>,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MigrationProgress {
     pub total_memories: u64,
     pub migrated_so_far: u64,
@@ -419,35 +365,27 @@ pub struct MigrationProgress {
     pub estimated_remaining_seconds: u32,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminCreateContextResponse {
     pub context_id: WireContextId,
     pub name: String,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminRenameContextResponse {
     pub context_id: WireContextId,
     pub new_name: String,
     pub old_name: String,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminMoveMemoryResponse {
     pub memory_id: WireMemoryId,
     pub new_context_id: WireContextId,
     pub old_context_id: WireContextId,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminReclassifyResponse {
     pub memory_id: WireMemoryId,
     pub new_kind: MemoryKindWire,
@@ -455,17 +393,13 @@ pub struct AdminReclassifyResponse {
 }
 
 /// — one streaming tombstoned-list frame.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminListTombstonedResponseFrame {
     pub memory: TombstonedMemoryInfo,
     pub is_final: bool,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TombstonedMemoryInfo {
     pub memory_id: WireMemoryId,
     pub text: String,

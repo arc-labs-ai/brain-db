@@ -168,7 +168,7 @@ UUIDv7 encodes a 48-bit Unix-millisecond timestamp followed by random bits, with
 
 - **Permanent.** An agent's `AgentId` never changes.
 - **Cluster-scoped.** Unique across the entire cluster.
-- **Client-generated.** The agent generates its own UUIDv7 at creation. Brain doesn't issue agent ids; an external identity system or the client SDK does.
+- **Client-generated.** The agent generates its own UUIDv7 at creation. Brain doesn't issue agent ids; an external identity system or the client does.
 
 **The zero AgentId.** The all-zero `AgentId` is reserved. Operations referencing the zero `AgentId` MUST be refused with `INVALID_ARGUMENT`.
 
@@ -435,10 +435,10 @@ The chosen three are well-grounded: two from classical theory plus one operation
 
 | Context | Representation |
 |---|---|
-| Wire (rkyv-encoded) | u8 (0=Episodic, 1=Semantic, 2=Consolidated) |
+| Wire (CBOR-encoded) | u8 (0=Episodic, 1=Semantic, 2=Consolidated) |
 | Storage (redb) | u8 |
 | Memory record (in-memory) | enum `MemoryKind` |
-| SDK (typed) | language-native enum |
+| Client (typed) | language-native enum |
 
 The on-the-wire and on-disk values are stable. New kinds (in a future major version) would be added with new numeric values; old readers seeing an unknown kind reject it.
 

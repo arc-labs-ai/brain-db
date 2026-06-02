@@ -74,11 +74,7 @@ Quarantine prevents repeated failures from cascading.
 
 ## 6. Operator-triggered shard restart
 
-```bash
-brain-cli shard restart <shard-id>
-```
-
-Stops and restarts the shard's executor. WAL replay brings it up.
+Administer via the admin HTTP API (`/v1/*` on the admin listener); see [§17.04](../17_observability/04_admin_ops.md). (Operator action: stop and restart a single shard's executor in place — WAL replay brings it back up — without touching the other shards. Route name TBD.)
 
 If the issue is transient (e.g., a stuck task), restart resolves it.
 

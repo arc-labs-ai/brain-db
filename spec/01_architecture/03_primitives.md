@@ -101,7 +101,7 @@ The `min_confidence` parameter filters results below the threshold. Default: 0.0
 
 `RECALL` is streamed: results arrive one frame at a time, sharing a stream_id, with the last frame marked end-of-stream. This lets clients start processing top results before the full top-k is computed.
 
-For small `top_k` (≤ 10), Brain may emit all results in a single frame. The client SDK presents both cases with the same async-iterator interface.
+For small `top_k` (≤ 10), Brain may emit all results in a single frame. Clients present both cases with the same async-iterator interface.
 
 ### 2.5 Latency
 

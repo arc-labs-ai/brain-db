@@ -1,11 +1,9 @@
 //! Statement-op request payloads.
 //!
 //! Mirrors the value-side `brain_core` types but uses wire-domain
-//! primitives so the rkyv derive fires without coupling `brain-core`
-//! to rkyv. Conversion lives in [`crate::responses::statement`]
+//! primitives so the wire types stay decoupled from `brain-core`
+//! value types. Conversion lives in [`crate::responses::statement`]
 //! alongside `StatementView`.
-
-use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::envelope::request::WireUuid;
 
@@ -16,9 +14,7 @@ use crate::envelope::request::WireUuid;
 /// Wire counterpart to `brain_core::StatementKind`. Discriminants are
 /// offset by 1 vs `StatementKind` so `0` can mean "no filter" in
 /// [`StatementListRequest::kind`].
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum StatementKindWire {
     Fact = 1,
@@ -29,9 +25,7 @@ pub enum StatementKindWire {
 /// Wire counterpart to `brain_core::StatementValue`.
 ///
 /// `Blob` is capped at 64 KiB by the handler.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum StatementValueWire {
     Text(String),
     Integer(i64),
@@ -41,7 +35,7 @@ pub enum StatementValueWire {
     Blob(Vec<u8>),
 }
 
-// `From` impls for ergonomic `.object_value(...)` setters on the SDK
+// `From` impls for ergonomic `.object_value(...)` setters on the client
 // builders. Local-type rule means these must live alongside the enum
 // definition.
 impl From<String> for StatementValueWire {
@@ -79,14 +73,12 @@ impl From<Vec<u8>> for StatementValueWire {
 ///
 /// `MemoryRef` carries the raw 16-byte `MemoryId` packed form. All
 /// other variants use `WireUuid` ([u8; 16]).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum StatementObjectWire {
-    EntityRef(WireUuid),
+    EntityRef(#[serde(with = "serde_bytes")] WireUuid),
     Value(StatementValueWire),
-    MemoryRef([u8; 16]),
-    StatementRef(WireUuid),
+    MemoryRef(#[serde(with = "serde_bytes")] [u8; 16]),
+    StatementRef(#[serde(with = "serde_bytes")] WireUuid),
 }
 
 impl StatementObjectWire {
@@ -112,12 +104,10 @@ impl StatementObjectWire {
 /// wire — the handler supplies them server-side from the request
 /// context. Add-evidence ops carry the metadata explicitly via a
 /// follow-up structured payload.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum EvidenceRefWire {
-    Inline(Vec<[u8; 16]>),
-    Overflow(WireUuid),
+    Inline(#[serde(with = "crate::codec::cbor::vec_byte_array16")] Vec<[u8; 16]>),
+    Overflow(#[serde(with = "serde_bytes")] WireUuid),
 }
 
 // ---------------------------------------------------------------------------
@@ -134,11 +124,10 @@ pub enum EvidenceRefWire {
 /// `valid_from_unix_nanos`, `valid_to_unix_nanos`, `event_at_unix_nanos`:
 /// `0` = absent. `event_at_unix_nanos` MUST be non-zero iff
 /// `kind == Event`.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementCreateRequest {
     pub kind: StatementKindWire,
+    #[serde(with = "serde_bytes")]
     pub subject: WireUuid,
     pub predicate: String,
     pub object: StatementObjectWire,
@@ -149,14 +138,14 @@ pub struct StatementCreateRequest {
     pub valid_to_unix_nanos: u64,
     pub event_at_unix_nanos: u64,
     pub schema_version: u32,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
 /// `STATEMENT_GET` (`0x0141`).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatementGetRequest {
+    #[serde(with = "serde_bytes")]
     pub statement_id: WireUuid,
     /// If `true` and the row is superseded, the server returns the
     /// current statement in the chain (with
@@ -168,12 +157,12 @@ pub struct StatementGetRequest {
 ///
 /// Server runs CREATE for `new_statement` then links the old + new
 /// atomically inside one redb txn.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementSupersedeRequest {
+    #[serde(with = "serde_bytes")]
     pub old_statement_id: WireUuid,
     pub new_statement: StatementCreateRequest,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
@@ -182,13 +171,13 @@ pub struct StatementSupersedeRequest {
 /// `reason` byte values: `1=SourceMemoryForgotten / 2=UserRequest /
 /// 3=SchemaInvalidation / 4=ExtractorRetraction`. `reason_message`
 /// is capped at 4 KiB by the validator.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementTombstoneRequest {
+    #[serde(with = "serde_bytes")]
     pub statement_id: WireUuid,
     pub reason: u8,
     pub reason_message: String,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
@@ -197,13 +186,13 @@ pub struct StatementTombstoneRequest {
 /// Hard delete: tombstones immediately + schedules zero-out after
 /// the grace period. Distinct from `STATEMENT_TOMBSTONE` in that
 /// retracted statements are excluded from `STATEMENT_HISTORY`.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementRetractRequest {
+    #[serde(with = "serde_bytes")]
     pub statement_id: WireUuid,
     pub reason: u8,
     pub reason_message: String,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
@@ -211,10 +200,9 @@ pub struct StatementRetractRequest {
 ///
 /// `anchor_id` may be a `StatementId` (any member of the chain) or
 /// a chain-root id — server resolves.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatementHistoryRequest {
+    #[serde(with = "serde_bytes")]
     pub anchor_id: WireUuid,
     pub include_tombstoned: bool,
 }
@@ -229,10 +217,9 @@ pub struct StatementHistoryRequest {
 ///
 /// `limit` must be in `1..=1000`. `cursor` is opaque (reserved for a
 /// later streaming cut).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementListRequest {
+    #[serde(with = "serde_bytes")]
     pub subject: WireUuid,
     pub predicate: String,
     pub kind: u8,
@@ -525,13 +512,14 @@ use smallvec::SmallVec;
 /// `subject` is the resolved `EntityId` for resolved subjects; for
 /// pending subjects, `subject == [0;16]` and `subject_pending_audit_id`
 /// carries the audit row id. `flags & 1 != 0` ⇔ subject is pending.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementView {
+    #[serde(with = "serde_bytes")]
     pub statement_id: WireUuid,
     pub kind: StatementKindWire,
+    #[serde(with = "serde_bytes")]
     pub subject: WireUuid,
+    #[serde(with = "serde_bytes")]
     pub subject_pending_audit_id: WireUuid,
     pub predicate: String,
     pub object: StatementObjectWire,
@@ -544,8 +532,11 @@ pub struct StatementView {
     pub valid_to_unix_nanos: u64,
     pub event_at_unix_nanos: u64,
     pub version: u32,
+    #[serde(with = "serde_bytes")]
     pub superseded_by: WireUuid,
+    #[serde(with = "serde_bytes")]
     pub supersedes: WireUuid,
+    #[serde(with = "serde_bytes")]
     pub chain_root: WireUuid,
     pub tombstoned: bool,
     pub tombstoned_at_unix_nanos: u64,
@@ -810,21 +801,20 @@ impl StatementView {
 // ---------------------------------------------------------------------------
 
 /// Reply to `STATEMENT_CREATE` (`0x01C0`).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatementCreateResponse {
+    #[serde(with = "serde_bytes")]
     pub statement_id: WireUuid,
     /// `[0; 16]` unless auto-supersession fired (Preference kind with a
     /// prior current row at same `(subject, predicate)`).
+    #[serde(with = "serde_bytes")]
     pub auto_superseded: WireUuid,
+    #[serde(with = "serde_bytes")]
     pub chain_root: WireUuid,
 }
 
 /// Reply to `STATEMENT_GET` (`0x01C1`).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementGetResponse {
     pub statement: StatementView,
     /// `true` iff `follow_supersession = true` redirected to a later
@@ -833,27 +823,23 @@ pub struct StatementGetResponse {
 }
 
 /// Reply to `STATEMENT_SUPERSEDE` (`0x01C2`).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatementSupersedeResponse {
+    #[serde(with = "serde_bytes")]
     pub new_statement_id: WireUuid,
+    #[serde(with = "serde_bytes")]
     pub chain_root: WireUuid,
     pub version: u32,
 }
 
 /// Reply to `STATEMENT_TOMBSTONE` (`0x01C3`).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatementTombstoneResponse {
     pub tombstoned_at_unix_nanos: u64,
 }
 
 /// Reply to `STATEMENT_RETRACT` (`0x01C4`).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatementRetractResponse {
     pub retracted_at_unix_nanos: u64,
     /// When the GC sweep will physically reclaim the row. In v1 this
@@ -864,12 +850,11 @@ pub struct StatementRetractResponse {
 /// Single-frame snapshot reply for `STATEMENT_HISTORY` (`0x01C5`).
 /// v1 collapses the per-item + tail shapes into one frame; a later
 /// cut splits when it streams.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementHistoryResponseFrame {
     /// Chain entries in `version` ascending order.
     pub items: Vec<StatementView>,
+    #[serde(with = "serde_bytes")]
     pub chain_root: WireUuid,
     pub total_versions: u32,
     pub is_final: bool,
@@ -885,9 +870,7 @@ impl StatementHistoryResponseFrame {
 /// Single-frame snapshot reply for `STATEMENT_LIST` (`0x01C6`).
 /// Mirrors `EntityListResponseFrame`. A later cut splits into
 /// per-batch streaming + cursor pagination.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementListResponseFrame {
     pub items: Vec<StatementView>,
     pub next_cursor: Vec<u8>,

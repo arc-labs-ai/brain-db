@@ -156,22 +156,22 @@ pub struct OpsContext {
     /// time we get here `Enabled(encoder)` always means a working
     /// encoder.
     pub cross_encoder: CrossEncoderSlot,
-    /// WAL append sink for the knowledge-layer subscribe-replay
-    /// pipeline. Knowledge handlers (the `crate::handlers::knowledge_*`
-    /// modules) call [`OpsContext::publish_knowledge`] after their successful
-    /// redb commit; that helper appends a `WalPayload::Knowledge`
-    /// record carrying the rkyv-encoded
-    /// [`brain_protocol::KnowledgeEventPayload`] body, then
+    /// WAL append sink for the opaque-body subscribe-replay
+    /// pipeline. typed-graph handlers (the `crate::handlers`
+    /// modules) call [`OpsContext::publish_graph`] after their successful
+    /// redb commit; that helper appends a `WalPayload::PhaseBody`
+    /// record carrying the CBOR-encoded
+    /// [`brain_protocol::GraphEventPayload`] body, then
     /// publishes the matching [`EventEnvelope`] on the bus with the
     /// WAL-assigned LSN. When `None`, the helper falls back to a
     /// pure bus publish (test wiring / no-schema deployments).
     ///
-    /// Knowledge ops are post-commit WAL'd (not pre-commit like
+    /// typed-graph ops are post-commit WAL'd (not pre-commit like
     /// substrate ENCODE/FORGET): redb is the source of truth for
-    /// knowledge state; the WAL record exists purely so subscribe-
+    /// typed-graph state; the WAL record exists purely so subscribe-
     /// replay can reconstruct the event stream. A crash between
     /// commit and WAL append loses the matching subscribe event for
-    /// that op, not the underlying knowledge data.
+    /// that op, not the underlying typed-graph data.
     pub wal_sink: Option<Arc<dyn WalSink>>,
 }
 
@@ -345,9 +345,9 @@ impl OpsContext {
         self
     }
 
-    /// Install (or clear) the WAL sink for knowledge-layer event
+    /// Install (or clear) the WAL sink for opaque-body event
     /// publishing. The shard's spawn path wires the same sink that
-    /// the writer uses, so substrate and knowledge events share one
+    /// the writer uses, so substrate and typed-graph events share one
     /// LSN domain.
     #[must_use]
     pub fn with_wal_sink(mut self, sink: Option<Arc<dyn WalSink>>) -> Self {
@@ -355,35 +355,38 @@ impl OpsContext {
         self
     }
 
-    /// Publish a knowledge-layer event: WAL-append the rkyv-encoded
+    /// Publish a opaque-body event: WAL-append the CBOR-encoded
     /// payload (if a sink is wired), then publish to the bus with
     /// the assigned LSN. The `kind` discriminates the WAL record
     /// type so subscribe-replay can decode it back into the matching
-    /// `KnowledgeEventPayload` variant.
+    /// `GraphEventPayload` variant.
     ///
     /// `make_envelope` builds the bus envelope from the assigned LSN.
     /// Most callers will just stamp `lsn` and clone their payload in.
-    pub async fn publish_knowledge<F>(
+    pub async fn publish_graph<F>(
         &self,
         kind: brain_storage::wal::kinds::WalRecordKind,
-        payload: brain_protocol::KnowledgeEventPayload,
+        payload: brain_protocol::GraphEventPayload,
         make_envelope: F,
     ) where
-        F: FnOnce(u64, brain_protocol::KnowledgeEventPayload) -> EventEnvelope,
+        F: FnOnce(u64, brain_protocol::GraphEventPayload) -> EventEnvelope,
     {
         debug_assert!(
-            kind.is_knowledge(),
-            "publish_knowledge expects a knowledge-layer WalRecordKind, got {kind:?}"
+            kind.has_opaque_body(),
+            "publish_graph expects a opaque-body WalRecordKind, got {kind:?}"
         );
         let lsn = if let Some(sink) = &self.wal_sink {
-            // rkyv-encode the typed payload as the WAL record body.
+            // CBOR-encode the typed-graph event as the WAL PhaseBody record body.
             // Subscribe-replay's `from_wal_record` decodes it back.
-            let body = match rkyv::to_bytes::<_, 1024>(&payload) {
-                Ok(b) => b.into_vec(),
-                Err(e) => {
-                    tracing::warn!(error = %e, "rkyv encode of knowledge event failed; publishing bus-only");
-                    let _ = self.events.publish(make_envelope(0, payload));
-                    return;
+            let body = {
+                let mut buf = Vec::new();
+                match ciborium::into_writer(&payload, &mut buf) {
+                    Ok(()) => buf,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "CBOR encode of typed-graph event failed; publishing bus-only");
+                        let _ = self.events.publish(make_envelope(0, payload));
+                        return;
+                    }
                 }
             };
             let body_len = body.len();
@@ -401,12 +404,12 @@ impl OpsContext {
                         ?kind,
                         body_len,
                         lsn = lsn.raw(),
-                        "knowledge event WAL-recorded"
+                        "typed-graph event WAL-recorded"
                     );
                     lsn.raw()
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "knowledge event WAL append failed; bus-only publish");
+                    tracing::warn!(error = %e, "typed-graph event WAL append failed; bus-only publish");
                     self.events.current_lsn().saturating_add(1)
                 }
             }

@@ -10,7 +10,7 @@
 | Audience | Implementers of the retrieval engine; schema authors tuning query behavior |
 | Voice | Hybrid (rationale + normative) |
 | Depends on | [07. Embedding](../07_embedding/00_purpose.md), [09. Indexing](../09_indexing/00_purpose.md), [10. Metadata](../10_metadata/00_purpose.md), [11. Extractors](../11_extractors/00_purpose.md), [12. Query Optimizer](../12_query_optimizer/00_purpose.md) |
-| Referenced by | [05. Operations](../05_operations/00_purpose.md), [06. SDK](../06_sdk/00_purpose.md), [19. Benchmarks](../19_benchmarks/00_purpose.md) |
+| Referenced by | [05. Operations](../05_operations/00_purpose.md), [06. Client Interface](../06_sdk/00_purpose.md), [19. Benchmarks](../19_benchmarks/00_purpose.md) |
 
 ## What this spec defines
 

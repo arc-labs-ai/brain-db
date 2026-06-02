@@ -2,7 +2,7 @@
 //!
 //! Centralizes the names of files and directories that live inside a
 //! shard's data root. Substrate names (`arena.bin`, `metadata.redb`,
-//! `wal/`, `shard.uuid`) coexist with knowledge-layer names.
+//! `wal/`, `shard.uuid`) coexist with opaque-body names.
 //!
 //! ## Layout (per shard)
 //!
@@ -10,13 +10,13 @@
 //! <data_dir>/<shard_id>/
 //!   shard.uuid                 (substrate)
 //!   arena.bin                  (substrate)
-//!   metadata.redb              (substrate + knowledge tables)
+//!   metadata.redb              (substrate + typed-graph tables)
 //!   wal/                       (substrate — directory)
-//!   statements.tantivy/        (knowledge — directory)
-//!   memory_text.tantivy/       (knowledge — directory)
-//!   entity.hnsw                (knowledge — file)
-//!   statement.hnsw             (knowledge — file)
-//!   llm_cache.redb             (knowledge — file)
+//!   statements.tantivy/        (typed-graph — directory)
+//!   memory_text.tantivy/       (typed-graph — directory)
+//!   entity.hnsw                (typed-graph — file)
+//!   statement.hnsw             (typed-graph — file)
+//!   llm_cache.redb             (typed-graph — file)
 //! ```
 //!
 //! Files are created by their owning module on first use (HNSW on
@@ -44,7 +44,7 @@ pub const SHARD_UUID_FILE: &str = "shard.uuid";
 /// `arena.bin` — memory-mapped vector arena.
 pub const ARENA_FILE: &str = "arena.bin";
 
-/// `metadata.redb` — substrate + knowledge-layer redb tables
+/// `metadata.redb` — substrate + opaque-body redb tables
 pub const METADATA_DB_FILE: &str = "metadata.redb";
 
 /// `wal/` — write-ahead log directory; segments live inside as
@@ -52,7 +52,7 @@ pub const METADATA_DB_FILE: &str = "metadata.redb";
 pub const WAL_DIR: &str = "wal";
 
 // ---------------------------------------------------------------------------
-// Knowledge-layer names.
+// typed-graph names.
 // ---------------------------------------------------------------------------
 
 /// `entity.hnsw` — HNSW index over entity embeddings.
@@ -119,7 +119,7 @@ impl ShardPaths {
         self.root.join(WAL_DIR)
     }
 
-    // ---- Knowledge layer ----
+    // ---- typed-graph phases ----
 
     #[must_use]
     pub fn entity_hnsw(&self) -> PathBuf {
@@ -152,7 +152,7 @@ impl ShardPaths {
 // ---------------------------------------------------------------------------
 
 /// Idempotent mkdir for every directory the shard layout requires:
-/// the root, `wal/`, and the two knowledge-layer tantivy directories.
+/// the root, `wal/`, and the two opaque-body tantivy directories.
 ///
 /// Files (`arena.bin`, `metadata.redb`, `*.hnsw`, `llm_cache.redb`)
 /// are NOT created here — their owning modules open or create them on
@@ -257,7 +257,7 @@ mod tests {
     fn ensure_dirs_preserves_existing_substrate_files() {
         // Simulate an upgrade: a pre-existing shard with no schema
         // declared yet — arena.bin, metadata.redb, shard.uuid, and a
-        // WAL segment, but no knowledge-layer files on disk.
+        // WAL segment, but no opaque-body files on disk.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("shard-0");
         std::fs::create_dir_all(&root).unwrap();

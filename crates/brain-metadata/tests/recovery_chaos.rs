@@ -163,6 +163,7 @@ fn sample_relation_link(rid_byte: u8) -> RelationLinkPayload {
         is_symmetric: false,
         properties_blob: vec![0xDE, 0xAD, 0xBE, 0xEF],
         agent_id: aid(7),
+        relation_type_intern_hint: None,
     }
 }
 

@@ -108,7 +108,6 @@ fn main() -> ExitCode {
                 eprintln!("To install BGE-small-en-v1.5:");
                 eprintln!("  ./scripts/bootstrap-model.sh");
                 eprintln!("Or set BRAIN_EMBED_MODEL_DIR=/path/to/model");
-                eprintln!("See docs/notes/embedding-model-install.md for details.");
                 return ExitCode::FAILURE;
             }
         };

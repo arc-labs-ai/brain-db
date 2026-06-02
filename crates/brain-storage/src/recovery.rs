@@ -325,14 +325,14 @@ fn apply_to_arena(
         | WalPayload::RelationLink(_)
         | WalPayload::RelationSupersede(_)
         | WalPayload::RelationTombstone(_) => Ok(()),
-        // Knowledge-layer records: substrate apply-paths ignore these.
-        // Phases 16+ hydrate knowledge state via their own sinks. Sub-task 15.2.
-        WalPayload::Knowledge(r) => {
+        // typed-graph records: substrate apply-paths ignore these.
+        // Phases 16+ hydrate typed-graph state via their own sinks. Sub-task 15.2.
+        WalPayload::PhaseBody(r) => {
             tracing::trace!(
                 kind = ?r.kind,
                 body_len = r.body.len(),
                 lsn = record.lsn.raw(),
-                "recovery: skipping knowledge-layer record (substrate arena unaffected)"
+                "recovery: skipping opaque-body record (substrate arena unaffected)"
             );
             Ok(())
         }
@@ -937,19 +937,19 @@ mod tests {
         assert_eq!(reclaim_record(0, 0, 1).kind, WalRecordKind::Reclaim);
     }
 
-    // ----- Knowledge-layer -----------------------------------------------
+    // ----- typed-graph -----------------------------------------------
 
-    /// Build a knowledge-layer record with an arbitrary opaque body. Used
-    /// by `recovery_skips_knowledge_records` to interleave knowledge
+    /// Build a opaque-body record with an arbitrary opaque body. Used
+    /// by `recovery_skips_graph_records` to interleave typed-graph
     /// frames between substrate ones.
-    fn knowledge_record(kind: WalRecordKind, body: Vec<u8>) -> WalRecord {
-        use crate::wal::payload::KnowledgeRecord;
+    fn graph_record(kind: WalRecordKind, body: Vec<u8>) -> WalRecord {
+        use crate::wal::payload::PhaseBodyRecord;
         WalRecord::from_typed(
             Lsn(0),
             0,
             1_700_000_000_000_000_002,
             0xBEEF,
-            &WalPayload::Knowledge(KnowledgeRecord::new(
+            &WalPayload::PhaseBody(PhaseBodyRecord::new(
                 kind,
                 brain_core::AgentId::default(),
                 body,
@@ -958,19 +958,19 @@ mod tests {
     }
 
     #[test]
-    fn recovery_replays_knowledge_records_without_touching_arena() {
-        // A WAL containing substrate + knowledge + substrate records.
-        // Recovery treats the knowledge frame as a no-op for the
+    fn recovery_replays_graph_records_without_touching_arena() {
+        // A WAL containing substrate + typed-graph + substrate records.
+        // Recovery treats the typed-graph frame as a no-op for the
         // substrate apply-paths (arena + substrate sink) but still
         // advances the LSN counter — `records_replayed` includes it.
         let dir = tempfile::tempdir().unwrap();
         let wal_dir = fresh_wal_dir(&dir);
         let records = vec![
             encode_record(0),
-            knowledge_record(WalRecordKind::EntityCreate, vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            graph_record(WalRecordKind::EntityCreate, vec![0xDE, 0xAD, 0xBE, 0xEF]),
             encode_record(1),
-            knowledge_record(WalRecordKind::SchemaUpdate, vec![]),
-            knowledge_record(WalRecordKind::Audit, vec![1, 2, 3, 4, 5]),
+            graph_record(WalRecordKind::SchemaUpdate, vec![]),
+            graph_record(WalRecordKind::Audit, vec![1, 2, 3, 4, 5]),
             encode_record(2),
         ];
         write_via_wal(&wal_dir, records);
@@ -979,7 +979,7 @@ mod tests {
         let mut sink = InMemoryMetadataSink::new();
         let (report, _alloc) = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap();
 
-        // All 6 records counted as replayed (knowledge no-ops still
+        // All 6 records counted as replayed (typed-graph no-ops still
         // advance the LSN watermark).
         assert_eq!(report.records_replayed, 6);
         assert_eq!(report.records_skipped, 0);
@@ -992,13 +992,13 @@ mod tests {
             assert_eq!(s.metadata.slot_version, 1);
         }
 
-        // The knowledge frames passed through the sink (so checkpoint
+        // The typed-graph frames passed through the sink (so checkpoint
         // logic sees them) but as opaque payloads.
         let applied = sink.applied();
-        let knowledge_count = applied
+        let graph_count = applied
             .values()
-            .filter(|p| matches!(p, WalPayload::Knowledge(_)))
+            .filter(|p| matches!(p, WalPayload::PhaseBody(_)))
             .count();
-        assert_eq!(knowledge_count, 3);
+        assert_eq!(graph_count, 3);
     }
 }

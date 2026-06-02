@@ -18,6 +18,7 @@ brain-metadata = { path = "../brain-metadata" }
 brain-rerank = { path = "../brain-rerank" }
 brain-storage = { path = "../brain-storage" }
 rkyv.workspace = true
+ciborium.workspace = true
 redb.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -1,0 +1,73 @@
+{
+  "kind": "Fact",
+  "subject": [
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68
+  ],
+  "predicate": "org:works_on",
+  "object": {
+    "Value": {
+      "Text": "brain"
+    }
+  },
+  "confidence": 0.9,
+  "evidence": {
+    "Inline": [
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        7,
+        0,
+        42,
+        0,
+        0,
+        0,
+        0,
+        18,
+        52,
+        86
+      ]
+    ]
+  },
+  "extractor_id": 0,
+  "valid_from_unix_nanos": 1700000000000000000,
+  "valid_to_unix_nanos": 0,
+  "event_at_unix_nanos": 0,
+  "schema_version": 1,
+  "request_id": [
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17
+  ]
+}

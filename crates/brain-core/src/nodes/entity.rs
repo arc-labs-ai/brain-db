@@ -1,5 +1,5 @@
-//! `Entity` value type — the brain-core public API for a knowledge-
-//! graph entity.
+//! `Entity` value type — the brain-core public API for a typed-graph
+//! entity.
 //!
 //! Mirrors the substrate's [`crate::Memory`] / `brain_metadata::tables::memory`
 //! split: `Entity` is the high-level value type (no I/O, no rkyv); the
@@ -103,7 +103,7 @@ impl EntityType {
 // Entity — the public value type.
 // ---------------------------------------------------------------------------
 
-/// A canonical reference to a noun in the knowledge graph.
+/// A canonical reference to a noun in the typed graph.
 ///
 /// Field semantics:
 ///

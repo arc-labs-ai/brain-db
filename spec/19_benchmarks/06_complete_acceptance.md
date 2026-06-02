@@ -7,7 +7,7 @@ What "the typed graph is done" means. Concrete tests that must pass.
 ### Schemaless mode
 
 - [ ] With no schema declared, all baseline schemaless-mode acceptance tests pass.
-- [ ] SDK clients (no typed-graph types) work normally when no schema is declared.
+- [ ] Clients (no typed-graph types) work normally when no schema is declared.
 - [ ] Data directories created with no schema work with or without later declaring one.
 - [ ] RECALL latency under hybrid retrieval: P50 ≤ 10 ms, P99 ≤ 50 ms (warmed shard).
 

@@ -1,8 +1,8 @@
-//! `Relation` value types — Layer-2 typed edges between entities.
+//! `Relation` value types — typed edges between entities.
 //!
 //! Pure value types — no I/O, no async, no rkyv. The rkyv-archived
-//! storage shape lives in `brain-metadata::tables::knowledge::relation`;
-//! the wire-archived shape lives in `brain-protocol::knowledge::relation_*`.
+//! storage shape lives in `brain-metadata::tables::relation`;
+//! the wire-archived shape lives in `brain-protocol::ops::relation`.
 
 use serde::{Deserialize, Serialize};
 

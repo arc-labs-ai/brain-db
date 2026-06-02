@@ -8,8 +8,6 @@
 //!
 //! Response side: [`crate::responses::procedural`].
 
-use rkyv::{Archive, Deserialize, Serialize};
-
 use crate::envelope::request::{WireContextId, WireUuid};
 
 /// `MATERIALIZE_PROCEDURAL` (`0x0164`).
@@ -28,23 +26,23 @@ use crate::envelope::request::{WireContextId, WireUuid};
 ///   "style"]` matches `behavior_tone` and `behavior_style`). Empty
 ///   means "every brain:behavior_* predicate".
 /// - `request_id` — idempotency / tracing id.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MaterializeProceduralRequest {
+    #[serde(with = "serde_bytes")]
     pub agent_id: WireUuid,
     pub context_filter: WireContextId,
     pub top_k: u32,
     pub min_confidence: f32,
     pub categories: Vec<String>,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
 #[cfg(test)]
 mod tests_req {
     use super::*;
+    use crate::codec::cbor::{from_cbor_bytes, to_cbor_bytes};
     use crate::codec::opcode::Opcode;
-    use crate::codec::rkyv::{from_rkyv_bytes, to_rkyv_bytes};
     use crate::envelope::request::RequestBody;
 
     fn sample_uuid(seed: u8) -> WireUuid {
@@ -63,7 +61,7 @@ mod tests_req {
     }
 
     #[test]
-    fn request_round_trips_via_rkyv() {
+    fn request_round_trips_via_cbor() {
         let req = MaterializeProceduralRequest {
             agent_id: sample_uuid(1),
             context_filter: 7,
@@ -72,8 +70,8 @@ mod tests_req {
             categories: vec!["tone".into(), "style".into()],
             request_id: sample_uuid(2),
         };
-        let bytes = to_rkyv_bytes(&req);
-        let back: MaterializeProceduralRequest = from_rkyv_bytes(&bytes).unwrap();
+        let bytes = to_cbor_bytes(&req);
+        let back: MaterializeProceduralRequest = from_cbor_bytes(&bytes).unwrap();
         assert_eq!(back, req);
     }
 
@@ -107,11 +105,10 @@ mod tests_req {
 /// `total_candidates` reports how many behavior_* statements matched
 /// before the `top_k` cap; `trimmed_by_budget` is true iff the cap
 /// actually fired (`total_candidates > top_k`).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MaterializeProceduralResponse {
     pub system_block: String,
+    #[serde(with = "crate::codec::cbor::vec_byte_array16")]
     pub statement_ids: Vec<WireUuid>,
     pub total_candidates: u32,
     pub trimmed_by_budget: bool,
@@ -120,8 +117,8 @@ pub struct MaterializeProceduralResponse {
 #[cfg(test)]
 mod tests_resp {
     use super::*;
+    use crate::codec::cbor::{from_cbor_bytes, to_cbor_bytes};
     use crate::codec::opcode::Opcode;
-    use crate::codec::rkyv::{from_rkyv_bytes, to_rkyv_bytes};
     use crate::envelope::response::ResponseBody;
 
     fn sample_uuid(seed: u8) -> WireUuid {
@@ -139,15 +136,15 @@ mod tests_resp {
     }
 
     #[test]
-    fn response_round_trips_via_rkyv() {
+    fn response_round_trips_via_cbor() {
         let resp = MaterializeProceduralResponse {
             system_block: "# Learned behaviors\n\n- be concise\n".into(),
             statement_ids: vec![sample_uuid(3), sample_uuid(4)],
             total_candidates: 5,
             trimmed_by_budget: true,
         };
-        let bytes = to_rkyv_bytes(&resp);
-        let back: MaterializeProceduralResponse = from_rkyv_bytes(&bytes).unwrap();
+        let bytes = to_cbor_bytes(&resp);
+        let back: MaterializeProceduralResponse = from_cbor_bytes(&bytes).unwrap();
         assert_eq!(back, resp);
     }
 

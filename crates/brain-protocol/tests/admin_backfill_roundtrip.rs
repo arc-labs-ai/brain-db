@@ -1,7 +1,7 @@
 //! End-to-end frame round-trip for the backfill control opcodes.
 //!
 //! The unit tests in `envelope::request` / `envelope::response`
-//! exercise the rkyv encode/decode at the body level. This file
+//! exercise the CBOR encode/decode at the body level. This file
 //! goes one layer up: it wraps each body in a [`Frame`], serialises
 //! the full frame to bytes, decodes it back, and asserts every
 //! field survives — mirroring the client ↔ server hop.

@@ -1,0 +1,230 @@
+[
+  {
+    "name": "req_hello",
+    "opcode": "0x0001",
+    "kind": "request",
+    "payload_len": 130
+  },
+  {
+    "name": "req_auth",
+    "opcode": "0x0002",
+    "kind": "request",
+    "payload_len": 79
+  },
+  {
+    "name": "req_encode",
+    "opcode": "0x0020",
+    "kind": "request",
+    "payload_len": 151
+  },
+  {
+    "name": "req_encode_vector_direct",
+    "opcode": "0x002A",
+    "kind": "request",
+    "payload_len": 160
+  },
+  {
+    "name": "req_recall",
+    "opcode": "0x0021",
+    "kind": "request",
+    "payload_len": 254
+  },
+  {
+    "name": "req_forget",
+    "opcode": "0x0024",
+    "kind": "request",
+    "payload_len": 65
+  },
+  {
+    "name": "req_entity_create",
+    "opcode": "0x0130",
+    "kind": "request",
+    "payload_len": 123
+  },
+  {
+    "name": "req_statement_create",
+    "opcode": "0x0140",
+    "kind": "request",
+    "payload_len": 267
+  },
+  {
+    "name": "req_relation_create",
+    "opcode": "0x0150",
+    "kind": "request",
+    "payload_len": 245
+  },
+  {
+    "name": "req_schema_upload",
+    "opcode": "0x0120",
+    "kind": "request",
+    "payload_len": 130
+  },
+  {
+    "name": "req_query",
+    "opcode": "0x0160",
+    "kind": "request",
+    "payload_len": 239
+  },
+  {
+    "name": "req_materialize_procedural",
+    "opcode": "0x0164",
+    "kind": "request",
+    "payload_len": 113
+  },
+  {
+    "name": "resp_welcome",
+    "opcode": "0x0081",
+    "kind": "response",
+    "payload_len": 242
+  },
+  {
+    "name": "resp_auth_ok",
+    "opcode": "0x0082",
+    "kind": "response",
+    "payload_len": 157
+  },
+  {
+    "name": "resp_encode",
+    "opcode": "0x00A0",
+    "kind": "response",
+    "payload_len": 241
+  },
+  {
+    "name": "resp_recall",
+    "opcode": "0x00A1",
+    "kind": "response",
+    "payload_len": 59
+  },
+  {
+    "name": "resp_forget",
+    "opcode": "0x00A4",
+    "kind": "response",
+    "payload_len": 61
+  },
+  {
+    "name": "resp_entity_create",
+    "opcode": "0x01B0",
+    "kind": "response",
+    "payload_len": 28
+  },
+  {
+    "name": "resp_statement_create",
+    "opcode": "0x01C0",
+    "kind": "response",
+    "payload_len": 92
+  },
+  {
+    "name": "resp_relation_create",
+    "opcode": "0x01D0",
+    "kind": "response",
+    "payload_len": 30
+  },
+  {
+    "name": "resp_schema_upload",
+    "opcode": "0x01A0",
+    "kind": "response",
+    "payload_len": 95
+  },
+  {
+    "name": "resp_query",
+    "opcode": "0x01E0",
+    "kind": "response",
+    "payload_len": 48
+  },
+  {
+    "name": "resp_materialize_procedural",
+    "opcode": "0x01E4",
+    "kind": "response",
+    "payload_len": 105
+  },
+  {
+    "name": "resp_error_protocol",
+    "opcode": "0x00FF",
+    "kind": "response",
+    "payload_len": 113
+  },
+  {
+    "name": "resp_error_authentication",
+    "opcode": "0x00FF",
+    "kind": "response",
+    "payload_len": 114
+  },
+  {
+    "name": "resp_error_authorization",
+    "opcode": "0x00FF",
+    "kind": "response",
+    "payload_len": 114
+  },
+  {
+    "name": "resp_error_validation",
+    "opcode": "0x00FF",
+    "kind": "response",
+    "payload_len": 114
+  },
+  {
+    "name": "resp_error_not_found",
+    "opcode": "0x00FF",
+    "kind": "response",
+    "payload_len": 114
+  },
+  {
+    "name": "resp_error_conflict",
+    "opcode": "0x00FF",
+    "kind": "response",
+    "payload_len": 114
+  },
+  {
+    "name": "resp_error_resource_exhausted",
+    "opcode": "0x00FF",
+    "kind": "response",
+    "payload_len": 114
+  },
+  {
+    "name": "resp_error_internal",
+    "opcode": "0x00FF",
+    "kind": "response",
+    "payload_len": 114
+  },
+  {
+    "name": "resp_error_unavailable",
+    "opcode": "0x00FF",
+    "kind": "response",
+    "payload_len": 114
+  },
+  {
+    "name": "frame_hello",
+    "opcode": "0x0001",
+    "kind": "frame",
+    "payload_len": 162
+  },
+  {
+    "name": "frame_welcome",
+    "opcode": "0x0081",
+    "kind": "frame",
+    "payload_len": 274
+  },
+  {
+    "name": "frame_encode",
+    "opcode": "0x0020",
+    "kind": "frame",
+    "payload_len": 183
+  },
+  {
+    "name": "frame_encode_vector_direct",
+    "opcode": "0x002A",
+    "kind": "frame",
+    "payload_len": 192
+  },
+  {
+    "name": "frame_error",
+    "opcode": "0x00FF",
+    "kind": "frame",
+    "payload_len": 103
+  },
+  {
+    "name": "frame_recall_eos",
+    "opcode": "0x00A1",
+    "kind": "frame",
+    "payload_len": 91
+  }
+]

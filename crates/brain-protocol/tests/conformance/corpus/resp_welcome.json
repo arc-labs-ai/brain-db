@@ -1,0 +1,36 @@
+{
+  "server_id": "brain-server/conformance",
+  "chosen_version": 1,
+  "session_id": [
+    85,
+    85,
+    85,
+    85,
+    85,
+    85,
+    85,
+    85,
+    85,
+    85,
+    85,
+    85,
+    85,
+    85,
+    85,
+    85
+  ],
+  "capabilities": {
+    "streaming": true,
+    "compression_zstd": false,
+    "server_push": false
+  },
+  "server_features": {
+    "max_payload_size": 16777215,
+    "max_concurrent_streams": 1024,
+    "idle_timeout_seconds": 300,
+    "auth_methods": [
+      0,
+      2
+    ]
+  }
+}

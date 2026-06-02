@@ -116,7 +116,7 @@ impl RelationMetadata {
     }
 
     /// Project the `(from, to)` pair as [`EntityId`]s. Returns `None`
-    /// if either endpoint is not an `Entity` — typed knowledge
+    /// if either endpoint is not an `Entity` — typed-graph
     /// relations canonically have entity endpoints; a Memory endpoint
     /// indicates a future mention-style typed relation.
     #[must_use]

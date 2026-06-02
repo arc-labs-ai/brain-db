@@ -882,7 +882,7 @@ The op is a structured read — no WAL record, no idempotency-table write. The `
 
 A client could do this themselves by issuing a `STATEMENT_LIST` with the right filters and rendering the result. MATERIALIZE_PROCEDURAL exists because:
 
-1. **The renderer is opinionated.** Brain's renderer encodes the canonical phrasing for each `behavior_*` predicate, so the system block is consistent across agents and across SDK versions.
+1. **The renderer is opinionated.** Brain's renderer encodes the canonical phrasing for each `behavior_*` predicate, so the system block is consistent across agents and across clients.
 2. **The fingerprint is stable.** Clients that build their own renderer get a different hash on every re-render; the server-side renderer pins canonical ordering.
 3. **Future evolution.** A future version may add learning hooks (e.g., "agent updates its own preferences after a failed task") that go through the same op for auditability.
 

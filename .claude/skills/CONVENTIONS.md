@@ -88,7 +88,7 @@ The body is what Claude actually reads when it decides to invoke the skill. Keep
 
 ## 5. Lint
 
-`scripts/check-skills.sh` validates every `SKILL.md`:
+`.claude/scripts/check-skills.sh` validates every `SKILL.md`:
 
 - Required frontmatter keys present (`name`, `description`, `when-to-use`).
 - `name` matches the parent directory.
@@ -100,7 +100,7 @@ The body is what Claude actually reads when it decides to invoke the skill. Keep
 Run via:
 
 ```bash
-just check-skills      # or scripts/check-skills.sh
+just check-skills      # or .claude/scripts/check-skills.sh
 ```
 
 Wired into `just verify` so CI catches drift.

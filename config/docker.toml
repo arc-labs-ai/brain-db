@@ -10,12 +10,9 @@
 # To override the whole file, bind-mount your own:
 #
 #   docker run -v /host/brain.toml:/etc/brain/config.toml:ro ...
-#
-# Full field reference: docs/reference/configuration.md
-# Tuning advice:        docs/guides/tuning/
 
 [server]
-# Data plane: clients + SDK speak the rkyv wire protocol here.
+# Data plane: the binary wire protocol (CBOR payloads) is served here.
 # Bound to 0.0.0.0 inside the container; expose with -p 8080:8080.
 listen_addr  = "0.0.0.0:8080"
 
@@ -23,17 +20,17 @@ listen_addr  = "0.0.0.0:8080"
 # Bound to 0.0.0.0 inside the container; expose with -p 9091:9091.
 metrics_addr = "0.0.0.0:9091"
 
-# Admin CLI surface — /v1/* routes. Kept on loopback inside the
+# Admin surface — /v1/* HTTP routes. Kept on loopback inside the
 # container (no `-p` mapping in docker run / compose). The host can't
-# reach it; `docker exec brain brain-cli ...` does. v1 has no built-in
-# auth on /v1/* — keep this on loopback or front it with a token /
-# mTLS proxy.
+# reach it; sidecar containers / `docker exec` calls to the HTTP
+# surface can. v1 has no built-in auth on /v1/* — keep this on loopback
+# or front it with a token / mTLS proxy.
 admin_addr   = "127.0.0.1:9092"
 
 [storage]
 data_dir    = "/var/lib/brain/data"
 # Single shard is the safe default for a single-container deployment.
-# Grow this for higher write throughput; see docs/guides/tuning/shard-sizing.md.
+# Grow this for higher write throughput (one shard pins one core).
 shard_count = 1
 
 [shard]
@@ -44,7 +41,7 @@ wal_segment_size_bytes  = "64MiB"
 wal_retention_segments  = 16        # 1 GiB WAL retention per shard
 
 [hnsw]
-# Spec §06/02 defaults. Don't change without reading docs/guides/tuning/hnsw-parameters.md.
+# Defaults trade recall against latency and memory; change deliberately.
 m              = 16
 ef_construction = 200
 ef_search      = 64
@@ -58,9 +55,8 @@ batch_size       = 32
 batch_window_ms  = 5
 
 [auth]
-# v1.0 ships only `none`. Token / mTLS are deferred (spec §03/09).
+# v1.0 ships only `none`. Token / mTLS are deferred.
 # Until then: never expose listen_addr to the public internet.
-# See docs/guides/security/auth-modes.md.
 mode = "none"
 
 [logging]
@@ -139,6 +135,5 @@ channel_capacity                         = 1024
 
 [summarizer]
 # Consolidation worker is a no-op until an LLM backend is wired.
-# Spec §11/03 §6. See docs/guides/configure.md "Summarizer" for
-# enabling openai / ollama at build time.
+# Set to openai / ollama at build time to enable summarization.
 backend = "disabled"

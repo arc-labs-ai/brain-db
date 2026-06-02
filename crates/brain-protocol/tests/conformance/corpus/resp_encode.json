@@ -1,0 +1,51 @@
+{
+  "memory_id": 33059591799037110662230,
+  "was_deduplicated": false,
+  "salience": 0.5,
+  "auto_edges_added": 1,
+  "lsn": 42,
+  "agent_id": [
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34
+  ],
+  "context_id": 1,
+  "kind": 0,
+  "created_at_unix_nanos": 1700000000000000000,
+  "edges_out_count": 1,
+  "embedding_model_fp": [
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51
+  ],
+  "pending_stages": [
+    0
+  ],
+  "has_active_schema": true
+}

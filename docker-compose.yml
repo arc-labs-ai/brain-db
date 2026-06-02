@@ -10,8 +10,6 @@
 # Bring down:  docker compose down            # keeps volumes
 # Wipe:        docker compose down -v         # also drops data volumes
 #
-# Walkthrough: docs/guides/deployment/docker-compose.md
-#
 # Port map (host → container):
 #   8080  → brain          data plane (clients + SDK)
 #   9091  → brain          public HTTP (/healthz + /metrics)
@@ -20,10 +18,11 @@
 #   4318  → otel-collector OTLP/HTTP receiver (for sending traces from other services too)
 #
 # Brain's admin endpoint (/v1/*) listens on 127.0.0.1:9092 inside the
-# container and is intentionally not published. Reach it via:
-#   docker compose exec brain brain-cli worker list
-# v1 has no built-in auth on /v1/* — keep this loopback or front with
-# mTLS / a token-checking proxy if you must expose it.
+# container and is intentionally not published. Reach it from another
+# container via the HTTP surface directly, or via the external CLI
+# package (brain-db-io repo). v1 has no built-in auth on /v1/* — keep
+# this loopback or front with mTLS / a token-checking proxy if you must
+# expose it.
 
 name: brain
 

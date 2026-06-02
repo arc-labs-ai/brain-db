@@ -180,14 +180,14 @@ pub enum ErrorCode {
     Conflict,
     /// Txn was real at some point but is no longer Active (timed out,
     /// committed, or aborted). Split from `Conflict` so the
-    /// dispatcher maps it to the right wire code and the SDK can
+    /// dispatcher maps it to the right wire code and the client can
     /// detect it programmatically.
     TxnExpired,
     /// Txn id never existed on this server.
     TxnNotFound,
     /// Buffered transaction would exceed the per-transaction op cap
     /// (1000 ops). Distinct from `Conflict` so the
-    /// SDK can report a domain-specific recovery hint ("split into
+    /// client can report a domain-specific recovery hint ("split into
     /// multiple transactions").
     TransactionTooLarge,
     /// Schema-strict mode rejected the request because the predicate
@@ -197,7 +197,7 @@ pub enum ErrorCode {
     /// type qname isn't in the active schema's vocabulary.
     RelationTypeNotInSchema,
     /// Schema-declared cardinality constraint would be violated.
-    /// Distinct from generic `Conflict` so SDK clients can recognise
+    /// Distinct from generic `Conflict` so clients can recognise
     /// the constraint failure and surface a domain-specific message.
     CardinalityViolation,
     Overloaded,

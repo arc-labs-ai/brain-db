@@ -31,7 +31,7 @@ The first frame the client sends after TCP/TLS establishment. Contains:
 
 ```rust
 struct HelloPayload {
-    client_id: String,              // human-readable; e.g., "brain-rust-sdk/0.5.0"
+    client_id: String,              // human-readable; e.g., "my-app/1.0"
     supported_versions: Vec<u8>,    // protocol versions the client supports, e.g., [1]
     capabilities: HelloCapabilities,
     client_session_token: Option<[u8; 32]>,  // for resumption (not currently used)
@@ -49,11 +49,11 @@ Frame layout:
 - `opcode = 0x01` (HELLO)
 - `stream_id = 0`
 - `flags = EOS`
-- `payload`: rkyv-encoded `HelloPayload`
+- `payload`: CBOR-encoded `HelloPayload`
 
 ### 2.1 client_id
 
-A free-form string identifying the client. Used for logging and observability. Format suggestion: `"<sdk_name>/<version>"`, e.g., `"brain-python-sdk/0.3.1"`.
+A free-form string identifying the client. Used for logging and observability. Format suggestion: `"<client_name>/<version>"`, e.g., `"my-app/1.0"`.
 
 Maximum length: 256 bytes.
 
@@ -105,7 +105,7 @@ Frame layout:
 - `opcode = 0x81` (WELCOME)
 - `stream_id = 0`
 - `flags = EOS`
-- `payload`: rkyv-encoded `WelcomePayload`
+- `payload`: CBOR-encoded `WelcomePayload`
 
 ### 3.1 chosen_version
 
@@ -167,7 +167,7 @@ Frame layout:
 - `opcode = 0x02` (AUTH)
 - `stream_id = 0`
 - `flags = EOS`
-- `payload`: rkyv-encoded `AuthPayload`
+- `payload`: CBOR-encoded `AuthPayload`
 
 ### 4.1 method
 
@@ -230,7 +230,7 @@ Frame layout:
 - `opcode = 0x82` (AUTH_OK)
 - `stream_id = 0`
 - `flags = EOS`
-- `payload`: rkyv-encoded `AuthOkPayload`
+- `payload`: CBOR-encoded `AuthOkPayload`
 
 ### 5.1 bound_shard_id
 
@@ -298,7 +298,7 @@ For multi-tenant proxies, the recommended pattern is one connection per identity
 
 Brain derives the caller's identity from the authenticated API key, not from a per-request `agent_id` field. The AUTH step issues a per-tenant scope binding: the key carries `(user, agent, namespace)` claims and the server treats those as authoritative for every operation on the connection. Clients never construct or send a scope object; the server fills it from the key.
 
-This closes a class of impersonation bugs at the wire boundary. With identity carried in the request, a client SDK that constructs the wrong `agent_id` can write into another agent's namespace; with identity bound to the key, the same request is rejected at the handshake. Operations that legitimately act across agents (admin migration, snapshot scope) require an admin key with explicit cross-agent permissions, not a client key with a different `agent_id` substituted in.
+This closes a class of impersonation bugs at the wire boundary. With identity carried in the request, a client that constructs the wrong `agent_id` can write into another agent's namespace; with identity bound to the key, the same request is rejected at the handshake. Operations that legitimately act across agents (admin migration, snapshot scope) require an admin key with explicit cross-agent permissions, not a client key with a different `agent_id` substituted in.
 
 `agent_id` is not carried on client-facing requests; it is derived server-side from the authenticated connection key. The server rejects any request that carries a redundant `agent_id` field.
 

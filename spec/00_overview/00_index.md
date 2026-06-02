@@ -20,9 +20,9 @@
 | **01** | [System Architecture](../01_architecture/00_purpose.md) | The conceptual whole: cognitive primitives, the seven internal layers, hardware envelope, capacity targets, design wedges, scope and comparison, glossary. |
 | **02** | [Data Model](../02_data_model/00_purpose.md) | The four record types — Memory, Entity, Statement, Relation. Identifiers, edges, contexts, salience, kinds, lifecycle, composition, property-graph rationale, failure modes. |
 | **03** | [Schema DSL](../03_schema/00_purpose.md) | The `.brain` schema format. Grammar, AST, validator, namespaces, versioning, system schema. |
-| **04** | [Wire Protocol](../04_wire_protocol/00_purpose.md) | Binary protocol over TCP. Unified opcode space (substrate `0x00xx` + typed-graph `0x01xx`), 32-byte fixed header, rkyv payloads, handshake, streaming, error handling. |
+| **04** | [Wire Protocol](../04_wire_protocol/00_purpose.md) | Binary protocol over TCP. Unified opcode space (substrate `0x00xx` + typed-graph `0x01xx`), 32-byte fixed header, CBOR payloads, handshake, streaming, error handling. |
 | **05** | [Operations](../05_operations/00_purpose.md) | Write pipeline (`ENCODE`, `FORGET`, `LINK/UNLINK`, `MATERIALIZE_PROCEDURAL`) and read pipeline (`RECALL`, `PLAN`, `REASON`). `SUBSCRIBE`, `TXN_*`, `ADMIN_*` semantics. |
-| **06** | [SDK Design](../06_sdk/00_purpose.md) | Client interfaces (Rust canonical; Python / TS / Go bindings). Connection pool, retries, streams, observability, testing, typed-graph SDK. |
+| **06** | [Client Interface](../06_sdk/00_purpose.md) | Stub. Brain ships no SDK; clients speak the §04 wire protocol directly (CBOR payloads, documented field schemas). |
 | **07** | [Embedding Layer](../07_embedding/00_purpose.md) | BGE-small via candle. Inference pipeline, caching, fingerprinting, migration. |
 | **08** | [Storage: Arena & WAL](../08_storage/00_purpose.md) | Mmap'd vector arena (1600-byte slots). Per-shard WAL (O_DIRECT, group commit). Recovery, retention. |
 | **09** | [Indexing (HNSW)](../09_indexing/00_purpose.md) | HNSW for memory + entity + statement vectors. Parameters, operations, lifecycle. |
@@ -43,7 +43,7 @@
 
 01 → 02 → 05 → 06. Optional: 03 → 11 if extending the schema.
 
-### Implementer of a client SDK
+### Implementer of a client
 
 01 → 02 → 04 → 05 → 06.
 

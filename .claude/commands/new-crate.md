@@ -6,7 +6,7 @@ allowed-tools: Bash(cargo new:*), Bash(mkdir:*), Bash(cargo build:*), Read, Writ
 
 Scaffold a new crate in the workspace.
 
-Argument: `$ARGUMENTS` — e.g. `brain-storage` or `brain-cli --bin`.
+Argument: `$ARGUMENTS` — e.g. `brain-storage` or `brain-server --bin`.
 
 The crate name should start with `brain-` for consistency with the rest of the workspace.
 

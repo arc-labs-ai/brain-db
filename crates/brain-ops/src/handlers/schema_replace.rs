@@ -18,7 +18,7 @@
 //! Requires `force_drop_existing: true`. The flag is the wire
 //! contract's explicit-confirmation step for an irreversible
 //! operation — a `false` value is rejected with `InvalidRequest` so
-//! a typo in the SDK can't accidentally wipe a deployment's schema.
+//! a typo in a client can't accidentally wipe a deployment's schema.
 
 use brain_metadata::extractor::ops::extractor_drop_namespace;
 use brain_metadata::relation::types::relation_type_drop_schema_declared;

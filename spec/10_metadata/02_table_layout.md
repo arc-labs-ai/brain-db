@@ -53,7 +53,7 @@ The composite key encoding is little-endian concatenation; redb sorts keys lexic
 
 ## 5. Value encoding
 
-Values are encoded with **rkyv** (the same library as the wire protocol uses for structured payloads). rkyv:
+Values are encoded with **rkyv** (Brain's internal on-disk storage encoding). rkyv:
 
 - Zero-copy deserialization: read a value, get a typed reference into the redb-mmap'd page.
 - Compact: no per-field tags or alignment overhead.

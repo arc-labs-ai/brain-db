@@ -1,4 +1,4 @@
-//! Knowledge-layer enums that map to byte discriminants.
+//! Typed-graph enums that map to byte discriminants.
 //!
 //! Like `MemoryKind` in the substrate, these enums are encoded as
 //! single bytes in redb composite keys and in WAL frame bodies. The

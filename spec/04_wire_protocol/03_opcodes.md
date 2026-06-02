@@ -412,8 +412,8 @@ The HELLO frame's payload includes:
 ```
 struct HelloPayload {
     wire_version: u8,                   // must be 1
-    sdk_name: String,
-    sdk_version: String,
+    client_name: String,
+    client_version: String,
     feature_flags_requested: Vec<String>,
 }
 ```
@@ -451,9 +451,9 @@ If, after handshake, the server receives a frame whose `wire_version` differs fr
 - The `ADMIN_STATS` opcode reports the server's wire version.
 - Logs record connections that fail handshake with `WireVersionMismatch`.
 
-### SDK responsibilities
+### Client responsibilities
 
-A conforming SDK MUST:
+A conforming client MUST:
 
 - Send a HELLO at the server's wire version.
 - Refuse to operate if the server reports a different version.

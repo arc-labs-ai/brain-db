@@ -24,7 +24,7 @@ Process exits at startup. Logs show errors.
    ```
 
 2. If "config error":
-   - Validate config: `brain-cli config validate /etc/brain/config.toml`
+   - Validate the config file before launch: `brain-server --check-config /etc/brain/config.toml`
    - Fix syntax / missing required fields.
 
 3. If "address already in use":
@@ -33,11 +33,12 @@ Process exits at startup. Logs show errors.
 
 4. If "data directory missing":
    - Verify `data_dir` in config exists and is writable.
-   - For fresh deployment: `brain-cli init --data-dir /var/lib/brain/data`.
+   - For a fresh deployment, point `data_dir` at an empty writable directory and start; Brain initializes the per-shard files on first boot.
 
 5. If "file corruption" or "WAL gap":
    - **Stop**. Don't bring up; risk data loss.
-   - Restore from snapshot: `brain-cli snapshot restore <last-known-good>`.
+   - Once the admin listener is up, restore from snapshot:
+     `curl -s -X POST http://127.0.0.1:9092/v1/snapshots/<last-known-good>/restore -d '{"confirm":true}'`
    - Investigate cause.
 
 ### Escalate if
@@ -69,7 +70,7 @@ Issue not resolved by above steps. Capture full logs and pre/post state for engi
    ```
    If ratio > 30% or recall < 90%, trigger rebuild:
    ```bash
-   brain-cli rebuild-ann <shard-id>
+   curl -s -X POST http://127.0.0.1:9092/v1/rebuild-ann -d '{"shard":"<shard-id>"}'
    ```
 
 4. Check for embedder slowness:
@@ -89,7 +90,8 @@ Issue not resolved by above steps. Capture full logs and pre/post state for engi
 
 6. If still unresolved: capture profile:
    ```bash
-   brain-cli profile --shard <id> --duration 30s --output /tmp/profile.pb
+   curl -s -X POST http://127.0.0.1:9092/v1/diagnostics/profile \
+     -d '{"shard":"<id>","duration":"30s","output":"/tmp/profile.pb"}'
    ```
 
 ### Escalate if
@@ -156,20 +158,21 @@ Memory growth is unexplained. Likely a Brain bug worth investigation.
    ```
    brain_wal_size_bytes
    ```
-   If large: WAL retention worker may be stuck. Trigger manual:
+   If large: WAL retention worker may be stuck. Force its cycle:
    ```bash
-   brain-cli gc --type wal --shard <id>
+   curl -s -X POST http://127.0.0.1:9092/v1/workers/wal-retention/run-now -d '{"shard":"<id>"}'
    ```
+   For an immediate `wal`-type garbage collection, administer via the admin HTTP API (`/v1/*` on the admin listener); see [§17.04](04_admin_ops.md). (Operator action: delete eligible WAL segments now. Route name TBD.)
 
 3. Check for large agents:
    ```bash
-   brain-cli agent list --sort memory-count
+   curl -s http://127.0.0.1:9092/v1/agents | jq 'sort_by(-.memory_count)'
    ```
 
 4. Mitigations:
-   - Free WAL: `brain-cli gc --type wal`.
-   - Free old slots: `brain-cli gc --type slots`.
-   - Delete old snapshots: `brain-cli snapshot list` then delete unneeded.
+   - Free WAL: run the `wal-retention` worker (above) or the `wal` GC action.
+   - Free old slots: run the slot-reclamation worker, or the `slots` GC action — administer via the admin HTTP API (`/v1/*`); see [§17.04](04_admin_ops.md). (Operator action: reclaim eligible slots now. Route name TBD.)
+   - Delete old snapshots: `curl -s http://127.0.0.1:9092/v1/snapshots`, then `curl -s -X DELETE http://127.0.0.1:9092/v1/snapshots/<name>` for unneeded ones.
 
 5. If can't free enough:
    - Add more disk (LVM extend if possible).
@@ -189,7 +192,7 @@ Mitigations insufficient.
 
 1. Identify which worker:
    ```bash
-   brain-cli worker list --shard <id>
+   curl -s 'http://127.0.0.1:9092/v1/workers?shard=<id>'
    ```
 
 2. Check worker logs:
@@ -203,8 +206,8 @@ Mitigations insufficient.
 
 4. Try restarting the worker:
    ```bash
-   brain-cli worker stop --name <worker-name> --shard <id>
-   brain-cli worker start --name <worker-name> --shard <id>
+   curl -s -X POST http://127.0.0.1:9092/v1/workers/<worker-name>/stop  -d '{"shard":"<id>"}'
+   curl -s -X POST http://127.0.0.1:9092/v1/workers/<worker-name>/start -d '{"shard":"<id>"}'
    ```
 
 5. If worker still won't run: restart the shard:
@@ -232,7 +235,7 @@ Restart doesn't help.
 
 2. Trigger rebuild:
    ```bash
-   brain-cli rebuild-ann <shard-id>
+   curl -s -X POST http://127.0.0.1:9092/v1/rebuild-ann -d '{"shard":"<shard-id>"}'
    ```
 
 3. Monitor progress:
@@ -268,12 +271,12 @@ Rebuild doesn't restore recall. Possible deeper issue.
 
 3. Identify last known good snapshot:
    ```bash
-   brain-cli snapshot list
+   curl -s http://127.0.0.1:9092/v1/snapshots
    ```
 
 4. Restore:
    ```bash
-   brain-cli snapshot restore <name> --confirm
+   curl -s -X POST http://127.0.0.1:9092/v1/snapshots/<name>/restore -d '{"confirm":true}'
    ```
 
 5. Bring up Brain.
@@ -307,7 +310,8 @@ Requests timing out. Health endpoint slow or failing.
 
 3. Capture profile:
    ```bash
-   brain-cli profile --shard <id> --duration 30s --output /tmp/profile.pb
+   curl -s -X POST http://127.0.0.1:9092/v1/diagnostics/profile \
+     -d '{"shard":"<id>","duration":"30s","output":"/tmp/profile.pb"}'
    pprof -top /tmp/profile.pb
    ```
    Identifies the hot function.
@@ -335,7 +339,7 @@ After a large delete operation, performance degrades.
 
 2. If > 30%: trigger rebuild (will take 10s of seconds for 1M memories):
    ```bash
-   brain-cli rebuild-ann <shard-id>
+   curl -s -X POST http://127.0.0.1:9092/v1/rebuild-ann -d '{"shard":"<shard-id>"}'
    ```
 
 3. Monitor rebuild:

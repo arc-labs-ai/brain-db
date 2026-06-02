@@ -6,7 +6,7 @@
 //!
 //! The crate is laid out by **role**, not by wire direction:
 //!
-//! - [`codec`] — bytes-on-the-wire plumbing (header, frame, CRC, rkyv,
+//! - [`codec`] — bytes-on-the-wire plumbing (header, frame, CRC, CBOR,
 //!   opcode). Nothing in this module knows what an operation means.
 //! - [`envelope`] — the [`RequestBody`] / [`ResponseBody`] dispatch
 //!   enums, the [`ErrorResponse`] payload, and core ↔ wire conversions.

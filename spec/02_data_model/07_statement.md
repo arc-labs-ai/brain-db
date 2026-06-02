@@ -541,7 +541,7 @@ Returns:
 - Empty if all active Facts agree (`object` equal across all).
 - The set of disagreeing Facts otherwise — caller decides how to surface.
 
-#### Wire / SDK surface
+#### Wire surface
 
 In v1.0 contradiction inspection is internal to Brain (used by query routing here) and by the admin op `ADMIN_LIST_PENDING_RESOLUTIONS` ([`../04_wire_protocol/09_typed_graph_admin.md`](../04_wire_protocol/09_typed_graph_admin.md) §4). There is **no** `STATEMENT_LIST_CONTRADICTIONS` wire opcode in v1.
 
@@ -875,7 +875,7 @@ When `statement_create` is called with ≥ 9 evidence entries:
 2. Write `EvidenceOverflow { memory_ids: Vec<...>, extractor_ids: Vec<u32>, confidences: Vec<f32>, timestamps: Vec<u64> }` to `EVIDENCE_OVERFLOW_TABLE`.
 3. Set `Statement.evidence = EvidenceRef::Overflow(overflow_id)`.
 
-Subsequent reads dereference the pointer transparently — SDK / handler decodes overflow rows into the same `EvidenceEntry` shape callers see for inline.
+Subsequent reads dereference the pointer transparently — the client / handler decodes overflow rows into the same `EvidenceEntry` shape callers see for inline.
 
 #### Add-evidence promotion
 
@@ -950,7 +950,7 @@ Evidence to memories in OTHER shards is allowed. The cross-shard reverse-index e
 
 `extractor_id` lives on each `EvidenceEntry` and identifies **which extractor produced this evidence**. Values:
 
-- `0` — user-authored (no extractor; the statement came from an SDK call by an agent or human).
+- `0` — user-authored (no extractor; the statement came from an explicit client write by an agent or human).
 - `≥ 1` — registered extractor id (per [`../11_extractors/`](../11_extractors/00_purpose.md)).
 
 Brain uses `extractor_id` for:

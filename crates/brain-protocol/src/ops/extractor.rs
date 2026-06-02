@@ -1,34 +1,28 @@
 //! Extractor-op request payloads.
 
-use rkyv::{Archive, Deserialize, Serialize};
-
 use crate::envelope::request::WireUuid;
 
 /// `EXTRACTOR_LIST` (`0x0124`).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtractorListRequest {
     pub include_disabled: bool,
 }
 
 /// `EXTRACTOR_DISABLE` (`0x0125`).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtractorDisableRequest {
     pub extractor_id: u32,
     /// Free-form reason recorded in the audit; ≤ 4 KiB.
     pub reason: String,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
 /// `EXTRACTOR_ENABLE` (`0x0126`).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtractorEnableRequest {
     pub extractor_id: u32,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
@@ -37,9 +31,7 @@ pub struct ExtractorEnableRequest {
 // ============================================================
 
 /// One row in [`ExtractorListResponseFrame`].
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtractorListItem {
     pub extractor_id: u32,
     pub namespace: String,
@@ -53,9 +45,7 @@ pub struct ExtractorListItem {
 
 /// `EXTRACTOR_LIST_RESP` (`0x01A4`). Single-frame snapshot in v1;
 /// a later cut may split into streaming if registry counts demand.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtractorListResponseFrame {
     pub items: Vec<ExtractorListItem>,
     pub total: u32,
@@ -65,18 +55,14 @@ pub struct ExtractorListResponseFrame {
 }
 
 /// `EXTRACTOR_DISABLE_RESP` (`0x01A5`).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtractorDisableResponse {
     pub previously_enabled: bool,
     pub disabled_at_unix_nanos: u64,
 }
 
 /// `EXTRACTOR_ENABLE_RESP` (`0x01A6`).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtractorEnableResponse {
     pub previously_disabled: bool,
     pub enabled_at_unix_nanos: u64,

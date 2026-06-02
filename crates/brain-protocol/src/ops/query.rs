@@ -1,17 +1,14 @@
 //! Hybrid-query request wire types.
 //!
-//! Maps the planner's `QueryRequest` shape onto rkyv-archivable structs.
-//! Every field width is fixed (no `Option<EnumVariant>` etc. that would
-//! need an Archive impl); discriminants are u8s with explicit semantics
-//! documented inline.
+//! Maps the planner's `QueryRequest` shape onto CBOR-encoded structs.
+//! Discriminants are u8s with explicit semantics documented inline; the
+//! wire-domain enums encode as their integer discriminant on the wire.
 //!
 //! Several shared types live here (`TimeRangeWire`, `RetrieverWire`,
 //! `RetrieverSelectionWire`, `FusionConfigWire`, `ItemIdWire`,
 //! `RetrieverContributionWire`, `RetrieverOutcomeWire`) because the
 //! request needs them to be parsed; the response side
 //! ([`crate::responses::query`]) re-exports them.
-
-use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::envelope::request::WireUuid;
 
@@ -21,18 +18,14 @@ use crate::envelope::request::WireUuid;
 
 /// Inclusive-start / inclusive-end window. `None` bounds =
 /// open-ended.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TimeRangeWire {
     pub from_unix_ms: Option<u64>,
     pub to_unix_ms: Option<u64>,
 }
 
 /// Which retriever family. Discriminant byte stable.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum RetrieverWire {
     Semantic = 0,
@@ -41,18 +34,14 @@ pub enum RetrieverWire {
 }
 
 /// Auto-routing vs explicit retriever list.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RetrieverSelectionWire {
     Auto,
     Explicit(Vec<RetrieverWire>),
 }
 
 /// Per-query fusion override.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FusionConfigWire {
     pub k: u32,
     pub semantic_weight: f32,
@@ -67,18 +56,15 @@ pub struct FusionConfigWire {
 /// - 1 = Statement (`bytes` = u128 BE for StatementId).
 /// - 2 = Entity (`bytes` = uuid bytes).
 /// - 3 = Relation (`bytes` = uuid bytes).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ItemIdWire {
     pub kind: u8,
+    #[serde(with = "serde_bytes")]
     pub bytes: [u8; 16],
 }
 
 /// Per-retriever contribution to a fused item.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RetrieverContributionWire {
     pub retriever: RetrieverWire,
     pub rank: u32,
@@ -90,9 +76,7 @@ pub struct RetrieverContributionWire {
 /// `status` byte: 0=Success, 1=Skipped, 2=Timeout, 3=Failure.
 /// `message` carries the skip reason or failure text; empty
 /// for Success / Timeout.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RetrieverOutcomeWire {
     pub retriever: RetrieverWire,
     pub status: u8,
@@ -105,11 +89,10 @@ pub struct RetrieverOutcomeWire {
 // QUERY (0x0160).
 // ---------------------------------------------------------------------------
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QueryRequest {
     pub text: String,
+    #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub entity_anchor: Option<WireUuid>,
     /// StatementKind bytes (0=Fact / 1=Preference / 2=Event).
     pub kind_filter: Vec<u8>,
@@ -127,6 +110,7 @@ pub struct QueryRequest {
     pub limit: u32,
     pub retrievers: RetrieverSelectionWire,
     pub fusion_config: Option<FusionConfigWire>,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
@@ -134,9 +118,7 @@ pub struct QueryRequest {
 // QUERY_EXPLAIN (0x0161).
 // ---------------------------------------------------------------------------
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QueryExplainRequest {
     pub query: QueryRequest,
 }
@@ -145,9 +127,7 @@ pub struct QueryExplainRequest {
 // QUERY_TRACE (0x0162).
 // ---------------------------------------------------------------------------
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QueryTraceRequest {
     pub query: QueryRequest,
 }
@@ -156,13 +136,13 @@ pub struct QueryTraceRequest {
 // RECALL_HYBRID (0x0163).
 // ---------------------------------------------------------------------------
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RecallHybridRequest {
     pub text: String,
+    #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub agent_id_filter: Option<WireUuid>,
     pub limit: u32,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
@@ -172,13 +152,10 @@ mod tests_req {
 
     fn round_trip<T>(value: &T) -> T
     where
-        T: rkyv::Archive + rkyv::Serialize<rkyv::ser::serializers::AllocSerializer<256>> + Clone,
-        T::Archived: rkyv::Deserialize<T, rkyv::Infallible>
-            + for<'a> rkyv::CheckBytes<rkyv::validation::validators::DefaultValidator<'a>>,
+        T: serde::Serialize + serde::de::DeserializeOwned + Clone,
     {
-        let bytes = rkyv::to_bytes::<_, 256>(value).expect("rkyv ser");
-        let archived = rkyv::check_archived_root::<T>(&bytes).expect("check");
-        archived.deserialize(&mut rkyv::Infallible).expect("deser")
+        let bytes = crate::codec::cbor::to_cbor_bytes(value);
+        crate::codec::cbor::from_cbor_bytes(&bytes).expect("cbor decode")
     }
 
     fn sample_request() -> QueryRequest {
@@ -246,18 +223,14 @@ mod tests_req {
 // QUERY (0x0160) — response side.
 // ---------------------------------------------------------------------------
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QueryResultItem {
     pub id: ItemIdWire,
     pub fused_score: f64,
     pub contributing: Vec<RetrieverContributionWire>,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QueryResponse {
     pub items: Vec<QueryResultItem>,
     pub total_latency_ms: f64,
@@ -268,9 +241,7 @@ pub struct QueryResponse {
 // QUERY_EXPLAIN (0x0161) — response side.
 // ---------------------------------------------------------------------------
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QueryExplainResponse {
     pub plan_text: String,
     pub estimated_cost_ms: f32,
@@ -280,9 +251,7 @@ pub struct QueryExplainResponse {
 // QUERY_TRACE (0x0162) — response side.
 // ---------------------------------------------------------------------------
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QueryTraceResponse {
     pub trace_text: String,
     pub total_latency_ms: f64,
@@ -292,18 +261,15 @@ pub struct QueryTraceResponse {
 // RECALL_HYBRID (0x0163) — response side.
 // ---------------------------------------------------------------------------
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryHit {
     /// Big-endian bytes of the u128 MemoryId.
+    #[serde(with = "serde_bytes")]
     pub memory_id: [u8; 16],
     pub fused_score: f64,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RecallHybridResponse {
     pub items: Vec<MemoryHit>,
 }
@@ -311,17 +277,13 @@ pub struct RecallHybridResponse {
 #[cfg(test)]
 mod tests_resp {
     use super::*;
-    use rkyv::Deserialize;
 
     fn round_trip<T>(value: &T) -> T
     where
-        T: rkyv::Archive + rkyv::Serialize<rkyv::ser::serializers::AllocSerializer<256>> + Clone,
-        T::Archived: rkyv::Deserialize<T, rkyv::Infallible>
-            + for<'a> rkyv::CheckBytes<rkyv::validation::validators::DefaultValidator<'a>>,
+        T: serde::Serialize + serde::de::DeserializeOwned + Clone,
     {
-        let bytes = rkyv::to_bytes::<_, 256>(value).expect("rkyv ser");
-        let archived = rkyv::check_archived_root::<T>(&bytes).expect("check");
-        archived.deserialize(&mut rkyv::Infallible).expect("deser")
+        let bytes = crate::codec::cbor::to_cbor_bytes(value);
+        crate::codec::cbor::from_cbor_bytes(&bytes).expect("cbor decode")
     }
 
     #[test]

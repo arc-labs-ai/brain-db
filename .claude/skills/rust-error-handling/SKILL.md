@@ -21,7 +21,7 @@ source: https://github.com/actionbook/rust-skills/tree/1f4becdcb88d1cbccc1880594
 Designing or reviewing how a Rust function reports failure. Brain has a strict policy (CLAUDE.md §7):
 
 - **Libraries** (`brain-core`, `brain-protocol`, `brain-storage`, `brain-metadata`, `brain-index`, `brain-embed`, `brain-planner`, `brain-ops`, `brain-workers`, `brain-sdk-rust`): **`thiserror`**, no `anyhow`.
-- **Binaries** (`brain-server`, `brain-cli`): **`anyhow`** for ergonomic top-level handling.
+- **Binaries** (`brain-server`): **`anyhow`** for ergonomic top-level handling.
 - **No `.unwrap()` outside tests.** Use `expect("invariant: <reason>")` only when reaching that line is genuinely impossible.
 - The wire-protocol error taxonomy is fixed — see `brain_protocol::error::{ProtocolError, ErrorCode, ErrorCategory}` and spec §04/07.
 

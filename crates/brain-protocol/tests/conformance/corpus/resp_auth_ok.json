@@ -1,0 +1,30 @@
+{
+  "agent_id": [
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34
+  ],
+  "bound_shard_id": 5,
+  "permissions": {
+    "can_encode": true,
+    "can_recall": true,
+    "can_plan": true,
+    "can_reason": true,
+    "can_forget": true,
+    "can_admin": false
+  },
+  "server_time_unix_nanos": 1700000000000000000
+}

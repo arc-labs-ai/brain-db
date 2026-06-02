@@ -7,7 +7,7 @@
 | Field | Value |
 |---|---|
 | Status | Draft |
-| Audience | Implementers of the embedding layer; SDK authors needing to understand model semantics |
+| Audience | Implementers of the embedding layer; client implementers needing to understand model semantics |
 | Voice | Hybrid (rationale + normative) |
 | Depends on | [01. System Architecture](../01_architecture/00_purpose.md), [02. Data Model](../02_data_model/00_purpose.md) |
 | Referenced by | [08. Storage](../08_storage/00_purpose.md), [05. Operations](../05_operations/00_purpose.md), [18. Failure Recovery](../18_failure_recovery/00_purpose.md) |
@@ -85,7 +85,7 @@ trait EmbeddingProvider {
     async fn embed(&self, text: &str) -> Result<(Vector, CacheState), EmbedError>;
 
     /// Embed multiple texts in a batch.
-    /// Used internally for GPU batching; SDKs don't have a multi-embed.
+    /// Used internally for GPU batching; clients don't have a multi-embed.
     async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vector>, EmbedError>;
 }
 ```

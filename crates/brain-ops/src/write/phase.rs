@@ -3,7 +3,8 @@
 //! A [`Phase`] is the verb. Combine several into a [`super::Write`] and
 //! the writer applies them all against one `WriteTransaction`. The
 //! same enum is the WAL record body (encoded via rkyv) so live
-//! writes and crash recovery share one apply path.
+//! writes and crash recovery share one apply path. (The typed-graph
+//! `PhaseBody` opaque body is the exception: it is CBOR-encoded.)
 //!
 //! Design rules:
 //! - **Pre-allocated ids**: every id field travels inside the phase.

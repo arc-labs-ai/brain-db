@@ -191,7 +191,7 @@ mod tests {
 
     // ----- Extraction + Jaccard ----------------------------------------
     //
-    // The pure functions live in brain-core::knowledge::trigrams and are
+    // The pure functions live in brain-core::typed-graph::trigrams and are
     // tested there. One re-export sanity test here ensures the public
     // path through brain-metadata still works.
 

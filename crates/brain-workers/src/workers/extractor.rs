@@ -5,10 +5,10 @@
 //! ## Why this exists
 //!
 //! Before this worker landed, ENCODE wrote a memory row and a vector
-//! into HNSW and stopped there. The knowledge layer's entities,
+//! into HNSW and stopped there. The phase bodies's entities,
 //! statements, and relations only appeared when an operator hand-wrote
 //! them through `ENTITY_CREATE` / `STATEMENT_CREATE` / `RELATION_CREATE`
-//! wire ops. ExtractorWorker turns ENCODE into a knowledge-rich
+//! wire ops. ExtractorWorker turns ENCODE into a typed-graph-rich
 //! operation: every encoded memory runs through pattern + classifier +
 //! LLM tiers, items are resolved against the entity registry, and the
 //! resulting graph rows are written transactionally.
@@ -455,7 +455,7 @@ async fn do_extractor_cycle(
                     (ExtractorItemCounts::zero(), StageAuditStatus::Skipped)
                 }
             };
-            publish_extracted_knowledge(ctx, *memory_id, counts, audit_status);
+            publish_extracted_graph(ctx, *memory_id, counts, audit_status);
         }
         processed += micro.len();
 
@@ -1128,7 +1128,7 @@ fn tier_outcome_for(result: &ExtractionResult) -> u8 {
 }
 
 /// Summary of a successful `apply_outcome` commit. The cycle uses it
-/// to populate the `ExtractedKnowledge` SUBSCRIBE event so clients
+/// to populate the `StageCompleted` SUBSCRIBE event so clients
 /// know exactly how many entities / statements / relations landed.
 struct ApplyOutcome {
     counts: ExtractorItemCounts,
@@ -1537,13 +1537,13 @@ fn audit_status_from_byte(byte: u8) -> StageAuditStatus {
     }
 }
 
-/// Publish the `ExtractedKnowledge` SUBSCRIBE event onto the per-shard
+/// Publish the `StageCompleted` SUBSCRIBE event onto the per-shard
 /// bus. A no-op when no subscriber is listening — `events.publish`
 /// still mints an LSN for the bus's own bookkeeping.
 /// Publish a `StageCompleted{Extractor}` event so subscribers waiting
 /// via `--wait` can decrement their pending-stage checklist for this
 /// memory.
-fn publish_extracted_knowledge(
+fn publish_extracted_graph(
     ctx: &WorkerContext,
     memory_id: MemoryId,
     counts: ExtractorItemCounts,
@@ -1563,7 +1563,7 @@ fn publish_extracted_knowledge(
         statements = counts.statements,
         relations = counts.relations,
         bus_subscriber_count = ctx.ops.events.subscriber_count(),
-        "publish_extracted_knowledge: emitting StageCompleted",
+        "publish_extracted_graph: emitting StageCompleted",
     );
     let payload = StagePayload::Extractor(StageExtractorPayload {
         entity_count: counts.entities,
@@ -1581,7 +1581,7 @@ fn publish_extracted_knowledge(
         salience: 0.0,
         timestamp_unix_nanos: now_unix_nanos(),
         text: None,
-        knowledge_payload: None,
+        graph_payload: None,
         edge_payload: None,
         stage_kind: Some(StageKind::Extractor),
         stage_outcome: Some(outcome),

@@ -317,7 +317,7 @@ A subtle race: a memory has been encoded, the WAL is fsync'd, but the HNSW inser
 
 This is acceptable: encode is durable (WAL fsync'd), but ANN visibility is eventually-consistent (HNSW catch-up is async after the durability barrier).
 
-For workloads that need strict read-your-writes, a `RECALL` after `ENCODE` may need to retry briefly if the encoded memory isn't yet in HNSW. Brain doesn't enforce this; the SDK handles it for client convenience.
+For workloads that need strict read-your-writes, a `RECALL` after `ENCODE` may need to retry briefly if the encoded memory isn't yet in HNSW. Brain doesn't enforce this; clients handle the brief retry.
 
 ### 27. Result quality monitoring
 

@@ -29,7 +29,7 @@ Storage tables are **shared**:
   namespace via `relation_types` row).
 
 Cross-namespace queries are queryable in v1 but **discouraged** —
-the SDK doesn't surface convenience APIs for them; clients that
+clients need not surface convenience APIs for them; clients that
 need cross-namespace must use lower-level lookups.
 
 ## 2. Identifier resolution rules
@@ -61,7 +61,7 @@ everywhere a type is referenced:
 - `STATEMENT_CREATE.predicate: "acme:role"`.
 - `RELATION_CREATE.relation_type: "acme:reports_to"`.
 - `ENTITY_CREATE.entity_type: "acme:Person"` — string qname. The
-  v1 SDK and wire path use the qname form exclusively.
+  the v1 wire path uses the qname form exclusively.
 
 ## 4. Storage layout
 

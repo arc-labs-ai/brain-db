@@ -1,7 +1,7 @@
 //! Frame envelope: the 32-byte [`Header`] together with its raw payload bytes.
 //!
 //! This module gives the wire-protocol codec for a single frame. It does NOT
-//! interpret the payload — that's the job of higher layers (rkyv decoders for
+//! interpret the payload — that's the job of higher layers (CBOR decoders for
 //! structured data, `bytemuck` views over raw vector bytes).
 //! Here, the payload is simply `Vec<u8>`.
 //!

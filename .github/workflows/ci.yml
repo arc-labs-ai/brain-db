@@ -28,7 +28,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Skill conventions lint
-        run: ./scripts/check-skills.sh
+        run: ./.claude/scripts/check-skills.sh
 
       - name: Build (workspace)
         run: cargo build --workspace --all-targets
@@ -54,8 +54,8 @@ jobs:
       # Smoke-asserts the shipped binaries link in release mode. Catches
       # regressions where a debug-only path masks a release-only failure
       # (LTO / codegen-units=1 / panic=abort interactions).
-      - name: Release build smoke (brain-server, brain-cli)
-        run: cargo build --release --bin brain-server --bin brain-cli
+      - name: Release build smoke (brain-server)
+        run: cargo build --release --bin brain-server
 
   miri:
     name: Miri (storage layer)

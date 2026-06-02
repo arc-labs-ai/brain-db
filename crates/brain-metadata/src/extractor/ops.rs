@@ -283,7 +283,11 @@ mod tests {
     use redb::{Database, ReadableDatabase};
 
     fn open_db(dir: &tempfile::TempDir) -> Database {
-        Database::create(dir.path().join("test.redb")).unwrap()
+        let db = Database::create(dir.path().join("test.redb")).unwrap();
+        let wtxn = db.begin_write().unwrap();
+        crate::tables::materialize_all_tables(&wtxn).unwrap();
+        wtxn.commit().unwrap();
+        db
     }
 
     fn intern_pattern(

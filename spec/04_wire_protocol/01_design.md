@@ -1,6 +1,6 @@
 # 04.01 Design and Transport
 
-> **TL;DR.** Why Brain uses a custom binary protocol over TCP (and not gRPC, REST, or MessagePack-RPC), and what the transport layer looks like: TCP with optional TLS, default port 7474, connection lifecycle, keepalive, and TLS configuration.
+> **TL;DR.** Why Brain uses a custom binary framing over TCP with portable CBOR payloads (and not gRPC, REST, or a Rust-coupled zero-copy encoding), and what the transport layer looks like: TCP with optional TLS, default port 7474, connection lifecycle, keepalive, and TLS configuration. The framing is custom and tiny; the payloads are CBOR so any language can speak the protocol without a Brain-provided client.
 
 ## Design Choices
 
@@ -34,9 +34,7 @@ Each layer adds latency. On a sub-millisecond hot path, each microsecond matters
 
 For a `RECALL` whose total budget is 10 ms (8 ms embedding + 2 ms everything else), 100 µs of gRPC overhead is 5% of the latency budget — eaten by framing alone. For cache-hit `RECALL` (target p50: 1.5 ms), it's 7%.
 
-There's a second, less-visible cost. Protobuf's wire format is a serialization step: the data on the wire isn't directly usable by the program; it has to be decoded into language-native objects. Brain's payloads are already typed Rust structs; Brain wants them on the wire in a form directly accessible without copying.
-
-This is what `rkyv` provides (zero-copy structured deserialization) and Protobuf does not.
+gRPC's other costs — a build-time `protoc` dependency, generated-client churn across ~10 languages, and an HTTP/2 stack Brain doesn't otherwise need — outweigh its ecosystem benefits for a protocol this small. Brain keeps its own framing and accepts a lightweight payload decode (CBOR) in exchange for portability: any language reads the payload with a stock library, and for Brain's text-in / results-out payloads the decode cost is single-digit microseconds. The zero-copy that a Rust-coupled encoding would buy is retained only where it pays off — internal storage (WAL, arena) and the trailing raw-vector section — not on the structured request/response bodies.
 
 ### 1.3 What Brain considered as a compromise
 
@@ -46,14 +44,17 @@ Brain also considered using Cap'n Proto, which has zero-copy similar to rkyv. Ca
 
 ### 1.4 The conclusion
 
-For a system whose value proposition is latency, Brain accepts the cost of a custom binary protocol. The trade-off is real:
+For a system whose value proposition is latency, Brain keeps a custom binary framing over TCP — but it does **not** pay for that with a Rust-specific payload encoding. Payloads are CBOR ([RFC 8949](https://www.rfc-editor.org/rfc/rfc8949)), a self-describing format with a stock decoder in every language, so any third-party client can speak the protocol without a Brain-provided SDK. Brain ships none.
 
-- **Cost:** Brain maintains protocol implementations in each language SDK, instead of using a generated client.
+The trade-off is real but small:
+
+- **Cost:** a client implements Brain's 32-byte framing (header, CRC32C, opcode dispatch). It is fully specified here and is a few dozen lines in any language.
 - **Cost:** Brain implements its own observability hooks (gRPC's metadata propagation comes for free).
-- **Cost:** clients without a Brain SDK can't connect.
-- **Benefit:** ~50–100 µs latency reduction per request, predictable framing, zero-copy payload access.
+- **Benefit:** predictable, allocation-light framing on the hot path; portable payloads any language reads with an off-the-shelf CBOR library; zero-copy retained where it matters — the trailing raw-vector section ([`02_wire_format.md`](02_wire_format.md)) and all internal storage (WAL, arena), which keep their original layout.
 
-The benefit is consequential at Brain's latency target. The cost is contained: the protocol is small (this spec defines all of it), the SDK count is small (4 languages at launch), and the protocol is unambiguous (Brain controls the spec).
+The earlier rationale weighed gRPC's ~30–100 µs framing overhead against a Rust-coupled zero-copy payload (rkyv) and accepted that non-SDK clients couldn't connect. That accepted cost is now the thing the design avoids: a standalone database must be reachable from any language, and clients send **text** (Brain owns the embedding model), so a CBOR decode of a request body costs single-digit µs — not the 50–100 µs a vector-heavy decode would. Zero-copy on the structured payload was solving a problem this workload doesn't have.
+
+The benefit is consequential at Brain's latency target. The cost is contained: the protocol is small (this spec defines all of it), the client surface is just this spec plus the conformance corpus (Brain ships no SDKs to maintain), and the protocol is unambiguous (Brain controls the spec).
 
 ## 2. Why not REST
 
@@ -91,31 +92,31 @@ Brain's server-to-server target uses raw TCP framing. Browser clients are out of
 Fixed-size headers simplify parsing:
 
 - The reader knows in advance how many bytes to read for the header.
-- Parsing is a single struct cast (zero-copy) under bytemuck/rkyv.
+- Parsing the header is a single fixed-layout read; the CRC validates it before any field is trusted.
 - The header CRC validates the header without needing the payload.
 
 Variable-length headers would save a few bytes on small frames but complicate parsing and prevent zero-copy header access. The 32 bytes are enough room for all the fields Brain requires (magic, version, opcode, flags, header_crc32c, stream_id, payload_len, payload_crc32c) plus reserved space for one or two future expansions.
 
 Brain considered 16 bytes (cuts header overhead in half) but ran out of room: with magic + version + opcode + flags + crc + stream_id + payload_len, the protocol already uses 19 bytes; adding payload_crc and reserved bytes pushed it to 32. The waste vs 16 bytes per frame is small (16 bytes of overhead) and worth the room for evolution.
 
-## 6. Why split rkyv (structured) and bytemuck (raw vectors)
+## 6. Why split structured (CBOR) and raw vectors
 
 Most payloads carry both structured fields (memory IDs, scores, metadata) and bulk binary data (vectors, embeddings). Brain splits them:
 
-- **Structured fields** are encoded with rkyv. Zero-copy on read; small overhead per field.
-- **Raw vector bytes** are appended after the rkyv-encoded structure, accessed via bytemuck's `cast_slice<u8, f32>`. Zero-copy on read; no encoding overhead.
+- **Structured fields** are encoded as a CBOR map. Portable — any language decodes it with a stock library, which is what lets Brain ship no client.
+- **Raw vector bytes** are appended after the CBOR section as little-endian `f32`, located by an `offset`+`dim` field in the map. Zero-copy on read; no per-element encoding overhead.
 
 This yields:
 
-- Zero-copy structured access (rkyv).
-- Zero-copy bulk binary access (bytemuck).
+- Portable structured access (CBOR).
+- Zero-copy bulk binary access (the trailing section is a plain `f32` array).
 - One frame per logical message (no separate frames for "vector data").
 
-The alternative — encoding vectors as repeated `f32` fields in rkyv — would add per-element overhead. With 384-dim vectors, that's 384 fields per memory; the overhead matters.
+The alternative — encoding vectors as a CBOR array of floats — would add per-element tag overhead. With 384-dim vectors that's 384 tagged elements per memory; the raw trailing section avoids it.
 
 The alternative — sending vectors in a separate frame — would multiply round trips or require complex multi-frame messages.
 
-The split keeps frames atomic and zero-copy throughout.
+The split keeps the structured part portable and the bulk part zero-copy. (Note: most clients never send vectors at all — Brain owns the embedding model, so clients send text. The raw section is the power-user `ENCODE_VECTOR_DIRECT` path.)
 
 ## 7. Why CRC32C, not stronger hashes
 
@@ -168,7 +169,7 @@ The opcode width and the `flags` byte are the current wire shape; see [`03_opcod
 ### Cost paid
 
 - 1 byte per frame.
-- All existing substrate code call-sites updated in the same change (~256 sites across `brain-server`, `brain-sdk-rust`, tests).
+- All existing substrate code call-sites updated in the same change (~256 sites across `brain-server`, tests).
 - The `flags` field shrank from `u16` to `u8` to reclaim the byte. Only EOS / MPL / CMP bits were ever used; the shrink lost nothing.
 
 ## 10. Typed-graph errors ride the substrate ERROR frame
@@ -182,7 +183,7 @@ The opcode width and the `flags` byte are the current wire shape; see [`03_opcod
 
 ### Reasoning
 
-Two ERROR shapes mean SDK clients write two error-handling paths. Reuse means one path with new enum variants — the cheapest extension point. The cost is coordinated edits to [`07_error_handling.md`](07_error_handling.md) when new typed-graph codes appear; at current scale the surface is small enough that this is fine.
+Two ERROR shapes mean clients write two error-handling paths. Reuse means one path with new enum variants — the cheapest extension point. The cost is coordinated edits to [`07_error_handling.md`](07_error_handling.md) when new typed-graph codes appear; at current scale the surface is small enough that this is fine.
 
 Migration path detailed in [`07_error_handling.md`](07_error_handling.md) §3.10: an interim fallback (mapping new errors to closest existing substrate codes) lets handlers ship before `ErrorCodeWire` is extended; extension is the long-term goal.
 
@@ -205,14 +206,14 @@ The cost is wire bandwidth — schemaless frames carry an extra 1-2 bytes for th
 
 ### Alternatives
 
-(a) `Option<[u8; 16]>` archived directly via rkyv.
-(b) Bare `[u8; 16]` with the all-zeros value as "absent" sentinel.
+(a) A CBOR `null` (or an absent key) for "no id".
+(b) Bare 16-byte string with the all-zeros value as "absent" sentinel.
 
 ### Choice: (b).
 
 ### Reasoning
 
-rkyv 0.7's `Option<[u8; 16]>` archive shape requires the `check_bytes` derive to recurse into the optional discriminant, which works but produces noisier archive types and slightly larger payloads (one byte for the discriminant per Option). UUIDv7's first 48 bits are a unix-ms timestamp, so the all-zero value is unreachable — collision is impossible by construction.
+A fixed `[u8; 16]` field is simpler for a client to read than a present-or-null union: the field is always there, always 16 bytes, and the all-zero value means absent. UUIDv7's first 48 bits are a unix-ms timestamp, so the all-zero value is unreachable — collision is impossible by construction. Keeping the field non-optional also keeps the per-opcode CBOR schemas ([`05_frame_layouts.md`](05_frame_layouts.md)) flat and the conformance vectors deterministic.
 
 Used uniformly for `EntityId`, `StatementId`, `RelationId`, `AuditId`, etc., across the typed-graph wire shapes. Documented per-struct.
 
@@ -251,7 +252,7 @@ The original draft mentioned `STREAM_START` / `STREAM_ITEM` / `STREAM_END`; that
 ### Alternatives
 
 (a) Wire structs decode attributes / properties into typed `BTreeMap<String, Value>` at the wire layer.
-(b) Wire structs carry rkyv-encoded blobs; the schema validator unpacks them in the handler.
+(b) Wire structs carry CBOR-encoded blobs; the schema validator unpacks them in the handler.
 
 ### Choice: (b).
 
@@ -298,7 +299,7 @@ The wire protocol's design choices:
 - **Custom binary, not gRPC** — for latency.
 - **TCP, not UDP/QUIC** — for ordering and reliability.
 - **32-byte fixed header** — for parser simplicity.
-- **rkyv + bytemuck split** — for zero-copy of both structured and raw data.
+- **CBOR + raw-vector split** — portable structured payloads (no SDK required), zero-copy bulk vectors.
 - **CRC32C checksums** — for error detection without crypto cost.
 - **Client-allocated 32-bit stream IDs** — for streaming model.
 - **u16 opcode with namespace byte** — substrate at `0x00xx`, typed graph at `0x01xx`, future at `0x02xx+`.
@@ -334,7 +335,7 @@ The server SHOULD set the following TCP options on accepted connections:
 Clients SHOULD set:
 
 - `TCP_NODELAY` — same reason.
-- `SO_KEEPALIVE` — to detect server crashes that don't close the connection cleanly. Recommended SDK defaults: **idle 30 s, interval 10 s, retries 3** (~60 s detection budget). Aggressive vs the server side because a client typically tracks one server, so faster probing is cheap; and operators want their next op to fail fast (and trigger transparent reconnect via the SDK's retry policy) rather than stall on a dead route. On platforms that don't expose the retries socket option (macOS, Windows), idle + interval still apply and the OS default retry count provides a slightly looser bound (~80 s).
+- `SO_KEEPALIVE` — to detect server crashes that don't close the connection cleanly. Recommended client defaults: **idle 30 s, interval 10 s, retries 3** (~60 s detection budget). Aggressive vs the server side because a client typically tracks one server, so faster probing is cheap; and operators want their next op to fail fast (and trigger transparent reconnect via the client's retry policy) rather than stall on a dead route. On platforms that don't expose the retries socket option (macOS, Windows), idle + interval still apply and the OS default retry count provides a slightly looser bound (~80 s).
 
 ### 1.3 Connection model
 
@@ -432,7 +433,7 @@ The total is amortized across many subsequent operations on the same connection.
 
 ### 3.2 Connection reuse
 
-Clients SHOULD maintain a connection pool. The recommended SDK behavior:
+Clients SHOULD maintain a connection pool. The recommended client behavior:
 
 - Pool size per server: 4–16 connections (configurable).
 - Connections kept alive indefinitely; recycled on errors or after a max-idle time.
@@ -527,7 +528,7 @@ Brain's typical workload is moderately bandwidth-intensive. See [01.05 Hardware]
 
 ## 10. IPv4 and IPv6
 
-The server SHOULD listen on both IPv4 and IPv6 by default. Client SDKs SHOULD prefer IPv6 when both are available (consistent with [RFC 6724](https://datatracker.ietf.org/doc/html/rfc6724) destination address selection).
+The server SHOULD listen on both IPv4 and IPv6 by default. Clients SHOULD prefer IPv6 when both are available (consistent with [RFC 6724](https://datatracker.ietf.org/doc/html/rfc6724) destination address selection).
 
 ---
 

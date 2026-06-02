@@ -15,24 +15,26 @@
 > **A memory database for AI agents.** Stores four record types — Memory, Entity, Statement, Relation — with explicit provenance, confidence, and bi-temporal validity. Hybrid retrieval (semantic + lexical + entity-graph + temporal) fused with weighted rank fusion. One Rust core, one wire protocol, one schema. Apache 2.0.
 
 ```text
-$ brain
+$ brain-server --config config/dev.toml
 ─────────────────────────────────────────────────────────────────────────────
-  ◉ brain-shell  v0.1.0  ·  connected to 127.0.0.1:9090
-  agent       agent-019e433e (auto-minted)
-
-  Type `help` for commands, `quit` to exit.
+  ◉ brain-server  v0.1.0  ·  listening 127.0.0.1:9090 (wire) · :9092 (admin)
+  ◉ p99 recall 4.2ms  ·  WAL synced  ·  HNSW warm
+  ◉ schema: brain:core + acme:sales (2 namespaces, 14 types)
 ─────────────────────────────────────────────────────────────────────────────
 
-brain> encode "Had a difficult conversation with Alex about the project"
-  ✓ ENCODED                                          LSN 1 · s1/m1/v1 ·  9 ms
+# Brain ships no client. Any language speaks the binary wire protocol (§04)
+# directly — CBOR payloads, documented per-opcode field schemas. Conceptually:
 
-brain> recall "conflicts with Alex" --top-k 5
+ENCODE  "Had a difficult conversation with Alex about the project"
+  → ENCODED                                          LSN 1 · s1/m1/v1 ·  9 ms
+
+RECALL  "conflicts with Alex"  top_k=5
   # → ranked by semantic similarity, edge proximity, recency, and salience
   #   — not just vector distance.
 
 # With a schema declared, RECALL routes through the hybrid path:
 # semantic + lexical + entity-graph, fused via RRF.
-brain> recall "what's Priya working on?" --include-graph
+RECALL  "what's Priya working on?"  include_graph=true
 ```
 
 ---
@@ -66,7 +68,7 @@ Brain collapses the stack into one Rust core with one wire protocol and one sche
 - **Hybrid retrieval out of the box.** Three retrievers (semantic / lexical / graph) fused via weighted RRF — not "top-k by cosine."
 - **Provenance is first-class.** Every typed claim carries an evidence list back to source memories, plus four bi-temporal timestamps.
 - **Predictable tail latency.** Thread-per-core (Glommio + `io_uring`), single-writer-per-shard, lock-free reads, group-commit WAL.
-- **Apache 2.0, end to end.** No premium edition, no SaaS lock-in. The typed graph, the extractor pipeline, the reranker, the schema DSL, the SDKs are all in the open repo.
+- **Apache 2.0, end to end.** No premium edition, no SaaS lock-in. The typed graph, the extractor pipeline, the reranker, and the schema DSL are all in the open repo.
 
 The architectural justification, the five design wedges, and the comparison with adjacent systems (Pinecone, Qdrant, Neo4j, Mem0, Letta, Zep) are in [`spec/01_architecture/`](spec/01_architecture/00_purpose.md).
 
@@ -151,27 +153,17 @@ Inside the container:
 
 ```bash
 just verify                                            # fmt + build + clippy + test
-cargo run --bin brain-server -- --config config/dev.toml   # the daemon
-cargo run --bin brain                                  # the interactive shell
-cargo run --bin brain-cli -- stats                     # admin HTTP CLI
+cargo run --bin brain-server -- --config config/dev.toml   # the database
+curl -s http://127.0.0.1:9092/v1/stats                 # admin via curl (loopback)
 ```
 
-Three binaries:
+One binary:
 
-- **`brain-server`** — the daemon (TCP + optional HTTP/WS/SSE).
-- **`brain`** — interactive shell (REPL + one-shot wire-protocol verbs; the `psql` / `redis-cli` equivalent).
-- **`brain-cli`** — admin CLI over HTTP (snapshots, audit, worker control).
+- **`brain-server`** — the database. Binary wire protocol on the data port; a loopback HTTP admin listener (stats, snapshots, audit, worker control) reachable with `curl`. Brain ships no client/SDK/CLI — speak the wire protocol from any language; a `brainctl` migration tool is future work.
 
-A persistent agent identity is opt-in; by default each connection mints an ephemeral one:
+A persistent agent identity is opt-in; a client supplies its `agent_id` at handshake, and by default the server mints an ephemeral one per connection if none is given.
 
-```bash
-brain agent create work             # named agent persisted to ~/.config/brain/
-brain --agent work encode "..."     # use it
-```
-
-**Memory is isolated per agent.** `RECALL` returns only the calling agent's own memories by default — one tenant never sees another's. Cross-agent reads are explicit: `--filter-agent <id>` scopes to a named set, `--include-other-agents` opts into the shared view. Each hit carries its owning `agent_id` so provenance is always legible.
-
-Full setup walkthrough: [`docs/tutorials/01-quickstart-docker.md`](docs/tutorials/01-quickstart-docker.md).
+**Memory is isolated per agent.** `RECALL` returns only the calling agent's own memories by default — one tenant never sees another's. Cross-agent reads are explicit: a request scopes to a named agent set, or opts into the shared view. Each hit carries its owning `agent_id` so provenance is always legible.
 
 ---
 
@@ -216,10 +208,10 @@ Encoding the same content twice is a no-op by default — pass `--allow-duplicat
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                        CLIENTS · SDKs (Rust · Python · TS · Go)             │
+│            CLIENTS (any language — speak the wire protocol directly)         │
 └────────────────────────────────────┬────────────────────────────────────────┘
                                      │ custom binary protocol over TCP
-                                     │ rkyv structured + bytemuck raw vectors
+                                     │ CBOR structured payloads + raw LE-f32 vectors
 ┌────────────────────────────────────▼────────────────────────────────────────┐
 │  CONNECTION LAYER · Tokio · accept · TLS · frame validate · shard dispatch  │
 └────────────────────────────────────┬────────────────────────────────────────┘
@@ -303,7 +295,7 @@ Brain optimizes for predictable tails, not minimum averages. The combined accept
 
 The v1.0 release ships when the combined acceptance suite passes — functional, performance, storage, operational, and schemaless mode tests, end-to-end.
 
-For the high-level phase index, see [`ROADMAP.md`](ROADMAP.md). For per-phase sub-task breakdowns, see [`docs/development/phases/`](docs/development/phases/).
+For the high-level milestone index, see [`ROADMAP.md`](ROADMAP.md); the per-phase landing record is in the git history.
 
 ---
 
@@ -318,9 +310,6 @@ For the high-level phase index, see [`ROADMAP.md`](ROADMAP.md). For per-phase su
 | Wire protocol (frames + opcodes + handshake) | [`spec/04_wire_protocol/`](spec/04_wire_protocol/00_purpose.md) |
 | Schema DSL grammar | [`spec/03_schema/`](spec/03_schema/00_purpose.md) |
 | Acceptance gate for v1.0 | [`spec/19_benchmarks/06_complete_acceptance.md`](spec/19_benchmarks/06_complete_acceptance.md) |
-| **Tutorials** | [`docs/tutorials/`](docs/tutorials/) |
-| Setup, CLI tour, SDK tour, troubleshooting | [`docs/development/usage/`](docs/development/usage/) |
-| CLI reference (`brain` shell + `brain-cli` admin) | [`docs/reference/`](docs/reference/) |
 | Roadmap (milestone index) | [`ROADMAP.md`](ROADMAP.md) |
 
 ---
@@ -341,12 +330,9 @@ brain/
 │   ├── brain-workers/      Background workers (decay, consolidation, extractors, …)
 │   ├── brain-extractors/   Pattern + classifier extractors
 │   ├── brain-llm/          LLM client + cache + budget
-│   ├── brain-http/         HTTP/WS/SSE transport
-│   ├── brain-server/       Server binary
-│   ├── brain-sdk-rust/     Rust SDK
-│   └── brain-cli/          Admin CLI
+│   ├── brain-http/         HTTP transport for the admin listener
+│   └── brain-server/       Server binary
 ├── spec/                   The 153-file specification (authoritative)
-├── docs/                   Tutorials, references, development guides
 └── ROADMAP.md              Milestone index
 ```
 
@@ -360,7 +346,8 @@ Pinned in the workspace `Cargo.toml`. New dependencies require commit-message ju
 |---|---|
 | Async runtime (shards) | [`glommio`](https://github.com/DataDog/glommio) — thread-per-core, `io_uring` |
 | Async runtime (connection layer) | [`tokio`](https://tokio.rs) |
-| Wire encoding | [`rkyv`](https://github.com/rkyv/rkyv) + [`bytemuck`](https://github.com/Lokathor/bytemuck) |
+| Wire encoding | [`ciborium`](https://github.com/enarx/ciborium) (CBOR) + raw little-endian `f32` vectors |
+| Internal storage encoding | [`rkyv`](https://github.com/rkyv/rkyv) + [`bytemuck`](https://github.com/Lokathor/bytemuck) |
 | Metadata store | [`redb`](https://github.com/cberner/redb) |
 | ANN index | [`hnsw_rs`](https://github.com/jean-pierreBoth/hnswlib-rs) |
 | Lexical index | [`tantivy`](https://github.com/quickwit-oss/tantivy) |

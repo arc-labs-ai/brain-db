@@ -12,8 +12,8 @@ default = ["server", "sse", "ws"]
 # Server-side accept loop + Router + Connection + graceful shutdown.
 # Lands in M2; M1 only adds the foundation types.
 server = ["dep:tokio", "dep:hyper-util", "dep:socket2", "hyper/server", "hyper/http1"]
-# HTTP client. M5 decides whether to expose one or keep brain-cli
-# hand-rolled.
+# HTTP client. Not wired today — see client/mod.rs for the trigger
+# list. Engine has no in-workspace outbound HTTP consumer.
 client = ["dep:tokio", "hyper/client", "hyper/http1"]
 # WebSocket via tokio-tungstenite — M6 (server) / M7 (client).
 ws = [

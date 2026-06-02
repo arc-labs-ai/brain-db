@@ -147,7 +147,7 @@ pub struct RealWriterHandle {
     /// run inside the upload's redb wtxn and pay full-table scan cost
     /// before ack — moving it post-commit keeps SCHEMA_UPLOAD latency
     /// bounded. `None` when the worker isn't wired (test fixtures /
-    /// no-knowledge deployments). Best-effort: a full channel logs a
+    /// no-typed-graph deployments). Best-effort: a full channel logs a
     /// warn and drops; the upload itself never fails on backpressure.
     schema_flag_sweep_tx: Option<flume::Sender<SchemaFlagSweepJob>>,
     /// Companion to [`Self::auto_edge_metrics`] for the

@@ -140,7 +140,7 @@ confirmation = brain.recall(
 
 The recall waits exactly until the encode's LSN is published. Precise.
 
-Brain exposes this in the SDK as a "wait for write" helper.
+A client can implement a "wait for write" helper over this.
 
 ## 11. The "consistency" parameter precedence
 

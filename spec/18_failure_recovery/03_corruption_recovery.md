@@ -124,11 +124,9 @@ systemctl stop brain
 # Backup the current (corrupt) state for forensics
 mv /var/lib/brain/data /var/lib/brain/data-corrupt-2026-05-07
 
-# Restore from snapshot
-brain-cli snapshot restore <snapshot-name> --confirm
-
-# Start
+# Start Brain so the admin listener comes up, then restore from snapshot
 systemctl start brain
+curl -s -X POST http://127.0.0.1:9092/v1/snapshots/<snapshot-name>/restore -d '{"confirm":true}'
 ```
 
 Data after the snapshot is lost. RPO is bounded by snapshot frequency.
@@ -165,11 +163,7 @@ Operator decides:
 - Full replay (will hit corruption; manual intervention).
 - Partial replay (up to LSN 12344; data loss from 12345 onwards).
 
-The CLI exposes this:
-
-```bash
-brain-cli wal-replay --shard <id> --max-lsn 12344
-```
+Bounded replay is offline data-file surgery: the server is down, and the operator caps the LSN at which recovery stops (e.g. `--max-lsn 12344` against the shard's WAL). This runs outside the admin HTTP surface — an offline `brainctl` migration tool to drive it is future work; until then it is a manual, engineering-supervised procedure.
 
 For surgical recovery.
 
@@ -178,13 +172,9 @@ For surgical recovery.
 If metadata is corrupt but arena is intact:
 
 - The arena holds vectors with embedded slot metadata.
-- A specialized recovery tool reads the arena and rebuilds metadata.
+- A specialized recovery procedure reads the arena and rebuilds metadata.
 
-```bash
-brain-cli recovery rebuild-metadata --shard <id>
-```
-
-This is a slow, manual operation. Bounded by arena scan time.
+This is offline data-file surgery against a stopped shard: it scans the shard's arena and reconstructs the redb metadata from the embedded slot metadata. It runs outside the admin HTTP surface — the offline `brainctl` migration tool that will drive it is future work; until then it is a slow, manual, engineering-supervised operation bounded by arena scan time.
 
 Useful when:
 - Metadata corruption is severe.
@@ -198,13 +188,9 @@ The recovery is best-effort; some metadata (text, edges) may not be reconstructa
 If both metadata and arena are damaged but WAL is intact:
 
 - The WAL has records of every ENCODE.
-- A recovery tool can rebuild metadata and arena from WAL.
+- A recovery procedure can rebuild metadata and arena from the WAL.
 
-```bash
-brain-cli recovery rebuild-from-wal --shard <id>
-```
-
-This is even slower than from-arena. Bounded by WAL size.
+This too is offline data-file surgery against a stopped shard: it re-applies the shard's WAL records to reconstruct both the arena and the redb metadata. Like the from-arena path, it runs outside the admin HTTP surface and awaits the offline `brainctl` migration tool; until then it is a manual, engineering-supervised operation, even slower than from-arena and bounded by WAL size.
 
 ## 12. The "no recovery" worst case
 
@@ -260,14 +246,11 @@ After corruption is recovered:
 
 After a recovery from snapshot:
 
-- Run a consistency check (`brain-cli verify`).
-- Verify metric counts match expectations.
+- Run a consistency check across the shard.
+- Verify counters match expectations against the metrics listener (`curl -s http://127.0.0.1:9091/metrics | grep '^brain_'` — e.g. `brain_shards_total`, `brain_hnsw_node_count`), and check per-shard status via `curl -s http://127.0.0.1:9092/v1/shards`. (Database-wide counters are exposed via `GET /metrics` on the metrics listener; a dedicated JSON stats-summary route is not yet implemented.)
 - Test sample queries.
 
-```bash
-brain-cli verify --shard <id>
-# Checks: arena/metadata/HNSW consistency, sample queries return reasonable results.
-```
+The consistency check (arena/metadata/HNSW agreement plus a sample-query sanity pass) is an operator action driven through the admin HTTP API (`/v1/*` on the admin listener); see [§17.04](../17_observability/04_admin_ops.md). (Operator action: verify arena/metadata/HNSW consistency for a shard and confirm sample queries return reasonable results. Route name TBD.)
 
 Verification gives confidence the recovery worked.
 
@@ -278,7 +261,7 @@ After restoring metadata, the HNSW may be stale (if from-snapshot was used and t
 Trigger rebuild:
 
 ```bash
-brain-cli rebuild-ann <shard-id>
+curl -s -X POST http://127.0.0.1:9092/v1/rebuild-ann -d '{"shard":"<shard-id>"}'
 ```
 
 This ensures the HNSW matches the restored metadata.

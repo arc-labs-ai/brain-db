@@ -751,6 +751,7 @@ fn relation_link_payload(
         is_symmetric: false,
         properties_blob: vec![],
         agent_id: aid(1),
+        relation_type_intern_hint: None,
     }
 }
 

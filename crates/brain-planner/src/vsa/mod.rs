@@ -14,7 +14,7 @@
 //!   when `c` was bundled, so the caller snaps it to a known
 //!   vocabulary via [`Codebook::cleanup`].
 //!
-//! Together these let us represent structured knowledge ("Alice
+//! Together these let us represent structured data ("Alice
 //! works_at Acme") as a single fixed-dim vector that supports
 //! retrieval of any one component given the others. The smoke test
 //! in [`analogy`] encodes two such triples and recovers "Stripe"

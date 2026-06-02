@@ -31,13 +31,13 @@ pub mod worker_checkpoints;
 
 /// Boilerplate `redb::Value` impl for an rkyv-archived struct.
 ///
-/// Each value type in the knowledge layer uses the same encoding
+/// Each value type in the phase bodies uses the same encoding
 /// pattern (rkyv with `check_bytes`, deserialize-on-read, type_name
 /// versioned with `::v1`). This macro emits that impl from the type
 /// name and a stable `type_name` string.
 ///
 /// Mirrors the per-file impl in substrate tables (`agent.rs`,
-/// `memory.rs`); collapsed into a macro here because 11 knowledge-layer
+/// `memory.rs`); collapsed into a macro here because 11 opaque-body
 /// value structs share the exact same body.
 #[macro_export]
 macro_rules! impl_redb_rkyv_value {
@@ -183,12 +183,23 @@ pub fn materialize_all_tables(
 
 #[cfg(all(test, not(miri)))]
 pub(crate) fn fresh_db(dir: &tempfile::TempDir) -> redb::Database {
-    redb::Database::create(dir.path().join("test.redb")).expect("create redb")
+    let db = redb::Database::create(dir.path().join("test.redb")).expect("create redb");
+    // Materialize every table once on creation so read-only tests
+    // (counting rows on empty tables, missing-key lookups, etc.)
+    // don't trip TableDoesNotExist. Idempotent — see
+    // `materialize_all_tables_is_idempotent`.
+    {
+        let wtxn = db.begin_write().expect("begin_write");
+        materialize_all_tables(&wtxn).expect("materialize");
+        wtxn.commit().expect("commit");
+    }
+    db
 }
 
 #[cfg(all(test, not(miri)))]
 mod registry_tests {
     use super::*;
+    use redb::ReadableDatabase;
 
     #[test]
     fn materialize_all_tables_is_idempotent() {

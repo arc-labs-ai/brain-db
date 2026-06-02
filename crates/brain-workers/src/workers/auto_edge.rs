@@ -427,7 +427,7 @@ async fn do_auto_edge_cycle(
             salience: 0.0,
             timestamp_unix_nanos: ts,
             text: None,
-            knowledge_payload: None,
+            graph_payload: None,
             edge_payload: None,
             stage_kind: Some(StageKind::AutoEdge),
             stage_outcome: Some(outcome),

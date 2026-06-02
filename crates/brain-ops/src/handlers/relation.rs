@@ -34,7 +34,7 @@ use brain_metadata::schema::store::schema_active;
 use brain_planner::WriterError;
 use brain_protocol::envelope::response::EventType;
 use brain_protocol::{
-    KnowledgeEventPayload, RelationCreateRequest, RelationCreateResponse, RelationCreatedEvent,
+    GraphEventPayload, RelationCreateRequest, RelationCreateResponse, RelationCreatedEvent,
     RelationGetRequest, RelationGetResponse, RelationListFromRequest,
     RelationListFromResponseFrame, RelationListToRequest, RelationListToResponseFrame,
     RelationSupersedeRequest, RelationSupersedeResponse, RelationSupersededEvent,
@@ -46,7 +46,7 @@ use redb::ReadableTable;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::entity::emit_knowledge_event;
+use crate::handlers::entity::emit_graph_event;
 use crate::handlers::link::downcast_writer_pub;
 use crate::write::{
     Phase, PhaseAck, SupersedeReplacement, SupersedeReplacementId, SupersedeTarget,
@@ -189,10 +189,10 @@ pub async fn handle_relation_create(
         }
     };
 
-    emit_knowledge_event(
+    emit_graph_event(
         ctx,
         EventType::RelationCreated,
-        KnowledgeEventPayload::RelationCreated(RelationCreatedEvent {
+        GraphEventPayload::RelationCreated(RelationCreatedEvent {
             relation_id: stored_id.to_bytes(),
             // The wire request's `relation_type` is already the
             // canonical "namespace:name" form (validated above).
@@ -362,10 +362,10 @@ pub async fn handle_relation_supersede(
         new.version
     };
 
-    emit_knowledge_event(
+    emit_graph_event(
         ctx,
         EventType::RelationSuperseded,
-        KnowledgeEventPayload::RelationSuperseded(RelationSupersededEvent {
+        GraphEventPayload::RelationSuperseded(RelationSupersededEvent {
             old_relation_id: old_id.to_bytes(),
             new_relation_id: new_id.to_bytes(),
         }),
@@ -426,10 +426,10 @@ pub async fn handle_relation_tombstone(
         }
     };
 
-    emit_knowledge_event(
+    emit_graph_event(
         ctx,
         EventType::RelationTombstoned,
-        KnowledgeEventPayload::RelationTombstoned(RelationTombstonedEvent {
+        GraphEventPayload::RelationTombstoned(RelationTombstonedEvent {
             relation_id: id.to_bytes(),
             reason: req.reason,
         }),
@@ -804,7 +804,7 @@ fn relation_type_lookup_by_qname_wtxn(
 }
 
 /// Active schema version for `namespace` inside a write txn. Mirrors
-/// the same helper in `knowledge_statement.rs` — relation handlers
+/// the same helper in `statement.rs` — relation handlers
 /// run a different write path so we keep the helpers local rather
 /// than re-export through a shared module.
 fn schema_active_in_wtxn_rel(
@@ -991,7 +991,7 @@ fn map_relation_type_op_error(err: RelationTypeOpError) -> OpError {
 }
 
 /// Human-readable cardinality label for the wire `CardinalityViolation`
-/// error variant. Stable strings — SDKs key off them.
+/// error variant. Stable strings — clients key off them.
 fn cardinality_kind_str(c: Cardinality) -> &'static str {
     match c {
         Cardinality::OneToOne => "OneToOne",

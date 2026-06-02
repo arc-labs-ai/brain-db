@@ -1,7 +1,7 @@
 //! Brain-HTTP error taxonomy, built on `thiserror`.
 //!
 //! Variants are deliberately Brain-flavoured — they correspond to the
-//! shapes the admin / SDK surfaces care about. Hyper's own
+//! shapes the admin / client surfaces care about. Hyper's own
 //! [`hyper::Error`] is collapsed under [`Error::Hyper`] for now; finer
 //! mapping can come later if it's worth the surface.
 

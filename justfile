@@ -38,7 +38,7 @@ fmt:
 
 # Validate .claude/skills/ frontmatter and references.
 check-skills:
-    @./scripts/check-skills.sh
+    @./.claude/scripts/check-skills.sh
 
 # Build (if needed) the Linux dev container and drop into a bash shell.
 # One-shot interactive container — for ad-hoc poking. For ongoing dev
@@ -141,8 +141,8 @@ prod-verify:
     cargo test --workspace --all-targets --no-fail-fast -j 1
     cargo test --workspace --doc
     cargo doc --workspace --no-deps
-    cargo build --release --bin brain-server --bin brain-cli
-    ./scripts/check-skills.sh
+    cargo build --release --bin brain-server
+    ./.claude/scripts/check-skills.sh
 
 # Run the acceptance benches (asserted p50/p99 from spec §16/02).
 # Same gates the nightly-perf workflow runs.
@@ -165,10 +165,6 @@ fix:
 # Run the server in dev mode.
 run-server:
     cargo run --bin brain-server -- --config config/dev.toml
-
-# Run the CLI.
-cli *ARGS:
-    cargo run --bin brain-cli -- {{ARGS}}
 
 # Run benchmarks for a crate.
 bench CRATE:
@@ -207,7 +203,6 @@ spec-stats:
 # Production Docker — distinct from the `.devcontainer/` recipes above
 # (those build a dev image for Linux cross-compile from macOS). The recipes
 # below build the runtime image that ships to operators and runs Brain itself.
-# Full guide: docs/guides/deployment/docker.md
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Build the production image. Uses BuildKit cache mounts — first build
@@ -226,7 +221,6 @@ image-run TAG="latest":
         brain:{{TAG}}
 
 # Bring up the full compose stack (brain + prometheus + otel-collector + grafana).
-# See docs/guides/deployment/docker-compose.md for the walkthrough.
 compose-up:
     docker compose up -d --build
     @echo

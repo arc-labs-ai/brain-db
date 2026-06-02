@@ -1,6 +1,6 @@
 //! Handshake codec — `HELLO`, `WELCOME`, `AUTH`, `AUTH_OK`.
 //!
-//! All four payloads use rkyv 0.7 like the rest of `brain-protocol`. The
+//! All four payloads encode as CBOR like the rest of `brain-protocol`. The
 //! four message structs are surfaced through `RequestBody` (HELLO, AUTH —
 //! server-bound) and `ResponseBody` (WELCOME, AUTH_OK — client-bound) so
 //! Frame dispatch is uniform.
@@ -11,10 +11,8 @@
 //! the server validates the AUTH frame against the methods it advertised
 //! in WELCOME, owned by the connection-layer AUTH handler.
 
-use rkyv::{Archive, Deserialize, Serialize};
-
+use crate::codec::cbor::{from_cbor_bytes, to_cbor_bytes};
 use crate::codec::header::VERSION;
-use crate::codec::rkyv::{from_rkyv_bytes, to_rkyv_bytes};
 use crate::envelope::request::WireUuid;
 use crate::error::ProtocolError;
 
@@ -25,9 +23,7 @@ use crate::error::ProtocolError;
 /// — feature flags exchanged during handshake. The same
 /// shape appears in HELLO (client-supported) and WELCOME (mutually-
 /// supported after intersection).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HelloCapabilities {
     /// Streaming support. Always `true` in v1.
     pub streaming: bool,
@@ -38,9 +34,7 @@ pub struct HelloCapabilities {
 }
 
 /// — server-declared parameters carried in WELCOME.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ServerFeatures {
     /// Server's max accepted payload (spec default 16 MiB).
     pub max_payload_size: u32,
@@ -57,9 +51,9 @@ pub struct ServerFeatures {
 ///
 /// Numeric repr is stable wire-side: `Token = 0`, `Mtls = 1`, `None = 2`.
 /// Adding a new method requires a wire-version bump.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum AuthMethod {
     /// Bearer token (opaque to the protocol; backend-validated).
@@ -71,9 +65,7 @@ pub enum AuthMethod {
 }
 
 /// — credentials carried in the AUTH frame.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AuthCredentials {
     /// Opaque bearer token bytes.
     Token(Vec<u8>),
@@ -84,20 +76,17 @@ pub enum AuthCredentials {
 }
 
 /// — mTLS claim accompanying an mTLS auth.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MtlsClaim {
     /// SHA-256 of the client's certificate.
+    #[serde(with = "serde_bytes")]
     pub cert_fingerprint: [u8; 32],
     /// Subject the client claims (typically Subject Alternative Name or CN).
     pub asserted_subject: String,
 }
 
 /// — the agent's permitted operations after AUTH_OK.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AgentPermissions {
     pub can_encode: bool,
     pub can_recall: bool,
@@ -118,9 +107,7 @@ pub struct AgentPermissions {
 /// server intersects against its own capabilities and replies with
 /// `WelcomePayload`. `client_session_token` is reserved for future
 /// session-resumption (not used in v1).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HelloPayload {
     /// Free-form client identifier (≤ 256 bytes).
     pub client_id: String,
@@ -128,6 +115,7 @@ pub struct HelloPayload {
     pub supported_versions: Vec<u8>,
     pub capabilities: HelloCapabilities,
     /// Reserved for v2 session-resumption.
+    #[serde(with = "serde_bytes")]
     pub client_session_token: Option<[u8; 32]>,
 }
 
@@ -137,9 +125,7 @@ pub struct HelloPayload {
 
 /// — server's response to `HELLO`. The connection is bound
 /// to `chosen_version` and `session_id` once this frame is received.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WelcomePayload {
     /// Free-form server identifier (≤ 256 bytes).
     pub server_id: String,
@@ -147,6 +133,7 @@ pub struct WelcomePayload {
     /// otherwise.
     pub chosen_version: u8,
     /// 16 cryptographically-random bytes; per-connection identifier
+    #[serde(with = "serde_bytes")]
     pub session_id: [u8; 16],
     /// Mutually-supported feature flags (intersection of client and
     /// server `HelloCapabilities`).
@@ -159,15 +146,14 @@ pub struct WelcomePayload {
 // ---------------------------------------------------------------------------
 
 /// — credentials for the agent claiming identity.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AuthPayload {
     /// Auth method. MUST be one of the methods declared in
     /// `WelcomePayload.server_features.auth_methods` (validated at the
     /// AUTH-frame handler in the connection layer, not by [`negotiate`]).
     pub method: AuthMethod,
     /// The agent the client is identifying as.
+    #[serde(with = "serde_bytes")]
     pub agent_id: WireUuid,
     pub credentials: AuthCredentials,
 }
@@ -179,11 +165,10 @@ pub struct AuthPayload {
 /// — server's acknowledgment of successful authentication.
 /// After this frame, the connection is in the "established" state and
 /// operations can flow.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AuthOkPayload {
     /// Confirmed agent_id (echoed from AUTH).
+    #[serde(with = "serde_bytes")]
     pub agent_id: WireUuid,
     /// Runtime shard ID this agent is bound to.
     pub bound_shard_id: u16,
@@ -303,40 +288,40 @@ pub fn negotiate(
 impl HelloPayload {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        to_rkyv_bytes(self)
+        to_cbor_bytes(self)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        from_rkyv_bytes::<Self>(bytes)
+        from_cbor_bytes::<Self>(bytes)
     }
 }
 
 impl WelcomePayload {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        to_rkyv_bytes(self)
+        to_cbor_bytes(self)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        from_rkyv_bytes::<Self>(bytes)
+        from_cbor_bytes::<Self>(bytes)
     }
 }
 
 impl AuthPayload {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        to_rkyv_bytes(self)
+        to_cbor_bytes(self)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        from_rkyv_bytes::<Self>(bytes)
+        from_cbor_bytes::<Self>(bytes)
     }
 }
 
 impl AuthOkPayload {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        to_rkyv_bytes(self)
+        to_cbor_bytes(self)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        from_rkyv_bytes::<Self>(bytes)
+        from_cbor_bytes::<Self>(bytes)
     }
 }
 
@@ -389,7 +374,7 @@ mod tests {
     #[test]
     fn hello_payload_round_trips() {
         let original = HelloPayload {
-            client_id: "brain-rust-sdk/0.5.0".into(),
+            client_id: "example-client/1.0".into(),
             supported_versions: vec![1, 2],
             capabilities: full_caps(),
             client_session_token: Some(sample_token(1)),

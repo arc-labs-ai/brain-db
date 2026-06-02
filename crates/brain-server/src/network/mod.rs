@@ -1,7 +1,9 @@
 //! Tokio connection layer: the per-listener accept loop
 //! (`connection`), the Tokio↔Glommio frame dispatcher (`dispatch`),
 //! the agent→shard routing table (`routing`), and the SUBSCRIBE bridge
-//! (`subscribe`).
+//! (`subscribe`). The connection admission gate (`gate`) is a child of
+//! `connection` so it travels with the accept loop across the binary and
+//! integration-test `#[path]` mounts.
 
 #[cfg(target_os = "linux")]
 pub mod auth;

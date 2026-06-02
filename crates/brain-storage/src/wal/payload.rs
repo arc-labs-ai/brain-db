@@ -255,6 +255,12 @@ pub struct RelationLinkPayload {
     /// without it, a multi-tenant subscriber would silently drop every
     /// replayed relation create.
     pub agent_id: AgentId,
+    /// Schemaless-path intern hint: `Some((namespace, name))` when the
+    /// relation type was not declared at write time, so `relation_type_id`
+    /// holds the pre-intern placeholder and recovery re-resolves it
+    /// (deterministic in LSN order, idempotent `relation_type_intern_or_get`).
+    /// `None` means `relation_type_id` is authoritative (strict path).
+    pub relation_type_intern_hint: Option<(String, String)>,
 }
 
 /// Typed-relation supersession. Carries the id of the row being
@@ -282,38 +288,38 @@ pub struct RelationTombstonePayload {
 
 use crate::wal::kinds::WalRecordKind;
 
-/// Opaque knowledge-layer WAL record.
+/// Opaque opaque-body WAL record.
 ///
-/// The body is the rkyv-encoded record produced by knowledge-layer
+/// The body is the rkyv-encoded record produced by opaque-body
 /// writers (entity / statement / relation / schema / audit). For the
 /// framing layer it is an opaque blob: the WAL records, reads, and
 /// recovery transports it unchanged. The substrate apply-paths ignore
-/// these records; knowledge-state hydration has its own sink.
+/// these records; typed-graph-state hydration has its own sink.
 ///
 /// Body size is bounded by the frame header's `payload_len` (3 bytes),
 /// i.e. ~16 MiB — same envelope as substrate payloads.
 #[derive(Debug, Clone, PartialEq)]
-pub struct KnowledgeRecord {
+pub struct PhaseBodyRecord {
     pub kind: WalRecordKind,
-    /// Agent the knowledge mutation ran under. Carried in the WAL
+    /// Agent the typed-graph mutation ran under. Carried in the WAL
     /// alongside the opaque body so subscribe-replay can route
-    /// knowledge events through the per-agent `agents` filter the
+    /// typed-graph events through the per-agent `agents` filter the
     /// same way it routes substrate events. Without it, a multi-
     /// tenant subscriber would silently drop every replayed
-    /// knowledge event.
+    /// typed-graph event.
     pub agent_id: AgentId,
     pub body: Vec<u8>,
 }
 
-impl KnowledgeRecord {
-    /// Construct a knowledge record. The `kind` MUST satisfy
-    /// `kind.is_knowledge()`; passing a substrate kind is a programmer
+impl PhaseBodyRecord {
+    /// Construct a typed-graph record. The `kind` MUST satisfy
+    /// `kind.has_opaque_body()`; passing a substrate kind is a programmer
     /// error and panics in debug builds.
     #[must_use]
     pub fn new(kind: WalRecordKind, agent_id: AgentId, body: Vec<u8>) -> Self {
         debug_assert!(
-            kind.is_knowledge(),
-            "KnowledgeRecord requires a knowledge-layer kind (0x10..=0x50); got {kind:?}"
+            kind.has_opaque_body(),
+            "PhaseBodyRecord requires a opaque-body kind (0x10..=0x50); got {kind:?}"
         );
         Self {
             kind,
@@ -342,18 +348,18 @@ pub enum WalPayload {
     TxnAbort(TxnAbortPayload),
     MigrateEmbedding(MigrateEmbeddingPayload),
     /// Typed-relation create. These are first-class instead of
-    /// being carried as an opaque `Knowledge` body so recovery can
+    /// being carried as an opaque `PhaseBody` body so recovery can
     /// rebuild the unified edge row + sidecar atomically.
     RelationLink(RelationLinkPayload),
     /// Typed-relation supersession.
     RelationSupersede(RelationSupersedePayload),
     /// Typed-relation tombstone.
     RelationTombstone(RelationTombstonePayload),
-    /// Knowledge-layer record carried as an opaque body. Used for the
+    /// opaque-body record carried as an opaque body. Used for the
     /// entity / statement / schema / audit kinds whose typed body
     /// schemas are layered above; the framing layer transports them
     /// unchanged.
-    Knowledge(KnowledgeRecord),
+    PhaseBody(PhaseBodyRecord),
 }
 
 impl WalPayload {
@@ -379,7 +385,7 @@ impl WalPayload {
             Self::RelationLink(_) => WalRecordKind::RelationCreate,
             Self::RelationSupersede(_) => WalRecordKind::RelationSupersede,
             Self::RelationTombstone(_) => WalRecordKind::RelationTombstone,
-            Self::Knowledge(r) => r.kind,
+            Self::PhaseBody(r) => r.kind,
         }
     }
 
@@ -406,7 +412,7 @@ impl WalPayload {
             Self::RelationLink(p) => encode_relation_link(p, &mut out),
             Self::RelationSupersede(p) => encode_relation_supersede(p, &mut out),
             Self::RelationTombstone(p) => encode_relation_tombstone(p, &mut out),
-            Self::Knowledge(r) => {
+            Self::PhaseBody(r) => {
                 // Layout: agent_id (16 B) || opaque body.
                 put_uuid_bytes(&mut out, r.agent_id.into());
                 out.extend_from_slice(&r.body);
@@ -453,7 +459,7 @@ impl WalPayload {
             WalRecordKind::RelationTombstone => {
                 Self::RelationTombstone(decode_relation_tombstone(&mut r)?)
             }
-            // Remaining knowledge kinds keep the opaque body. Their
+            // Remaining typed-graph kinds keep the opaque body. Their
             // typed schemas land in later phases; the framing layer
             // transports them unchanged. We early-return so the
             // trailing-bytes check below doesn't fire (the entire
@@ -462,17 +468,20 @@ impl WalPayload {
             | WalRecordKind::EntityUpdate
             | WalRecordKind::EntityMerge
             | WalRecordKind::EntityTombstone
+            | WalRecordKind::EntityRename
+            | WalRecordKind::EntityUnmerge
             | WalRecordKind::StatementCreate
             | WalRecordKind::StatementSupersede
             | WalRecordKind::StatementTombstone
             | WalRecordKind::SchemaUpdate
+            | WalRecordKind::ExtractorToggle
             | WalRecordKind::Audit => {
                 // Layout: agent_id (16 B) || opaque body. The body
                 // remains opaque to the framing layer; phases 16+
                 // supply typed parsers via their own sinks.
                 let agent_id: AgentId = r.array16()?.into();
                 let body = bytes[r.cursor..].to_vec();
-                return Ok(Self::Knowledge(KnowledgeRecord {
+                return Ok(Self::PhaseBody(PhaseBodyRecord {
                     kind,
                     agent_id,
                     body,
@@ -1194,6 +1203,15 @@ fn encode_relation_link(p: &RelationLinkPayload, out: &mut Vec<u8>) {
     out.push(u8::from(p.is_symmetric));
     put_blob(out, &p.properties_blob);
     put_uuid_bytes(out, p.agent_id.into());
+    // relation_type_intern_hint: tag byte then two length-prefixed strings.
+    match &p.relation_type_intern_hint {
+        None => out.push(0),
+        Some((namespace, name)) => {
+            out.push(1);
+            put_blob(out, namespace.as_bytes());
+            put_blob(out, name.as_bytes());
+        }
+    }
 }
 
 fn decode_relation_link(r: &mut Reader<'_>) -> Result<RelationLinkPayload, WalPayloadError> {
@@ -1218,6 +1236,15 @@ fn decode_relation_link(r: &mut Reader<'_>) -> Result<RelationLinkPayload, WalPa
     let is_symmetric = r.u8()? != 0;
     let properties_blob = read_blob(r)?;
     let agent_id: AgentId = r.array16()?.into();
+    let relation_type_intern_hint = match r.u8()? {
+        0 => None,
+        1 => {
+            let namespace = String::from_utf8(read_blob(r)?).map_err(|_| WalPayloadError::BadUtf8)?;
+            let name = String::from_utf8(read_blob(r)?).map_err(|_| WalPayloadError::BadUtf8)?;
+            Some((namespace, name))
+        }
+        other => return Err(WalPayloadError::BadOptionTag(other)),
+    };
     Ok(RelationLinkPayload {
         relation_id,
         from,
@@ -1233,6 +1260,7 @@ fn decode_relation_link(r: &mut Reader<'_>) -> Result<RelationLinkPayload, WalPa
         is_symmetric,
         properties_blob,
         agent_id,
+        relation_type_intern_hint,
     })
 }
 
@@ -1466,6 +1494,7 @@ mod tests {
             is_symmetric: false,
             properties_blob: vec![1, 2, 3, 4, 5],
             agent_id: aid(0xC5),
+            relation_type_intern_hint: None,
         }
     }
 
@@ -1769,13 +1798,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Knowledge-layer.
+    // opaque-body.
     // -----------------------------------------------------------------
 
     #[test]
-    fn knowledge_record_round_trip() {
+    fn graph_record_round_trip() {
         // The three RelationCreate/Supersede/Tombstone kinds are
-        // first-class typed payloads — not opaque-body knowledge
+        // first-class typed payloads — not opaque-body typed-graph
         // records — so they are excluded from this fixture.
         for kind in [
             WalRecordKind::EntityCreate,
@@ -1790,48 +1819,48 @@ mod tests {
         ] {
             let body: Vec<u8> = (0..32u8).map(|i| i ^ kind.as_u8()).collect();
             let agent = aid(kind.as_u8());
-            let payload = WalPayload::Knowledge(KnowledgeRecord::new(kind, agent, body.clone()));
+            let payload = WalPayload::PhaseBody(PhaseBodyRecord::new(kind, agent, body.clone()));
             assert_eq!(payload.kind(), kind);
             let bytes = payload.encode_to_bytes();
             // Layout: 16-byte agent_id, then the opaque body.
             assert_eq!(bytes.len(), 16 + body.len());
             assert_eq!(&bytes[16..], body.as_slice());
-            let decoded = WalPayload::decode(kind, &bytes).expect("decode knowledge");
+            let decoded = WalPayload::decode(kind, &bytes).expect("decode typed-graph");
             match decoded {
-                WalPayload::Knowledge(r) => {
+                WalPayload::PhaseBody(r) => {
                     assert_eq!(r.kind, kind);
                     assert_eq!(r.agent_id, agent);
                     assert_eq!(r.body, body);
                 }
-                other => panic!("expected Knowledge, got {other:?}"),
+                other => panic!("expected PhaseBody, got {other:?}"),
             }
         }
     }
 
     #[test]
-    fn knowledge_agent_id_round_trips_through_encode_decode() {
+    fn graph_agent_id_round_trips_through_encode_decode() {
         // The new `agent_id` field must survive an encode_to_bytes →
-        // decode round-trip so subscribe-replay can route knowledge
+        // decode round-trip so subscribe-replay can route typed-graph
         // events through the per-agent `agents` filter.
         let agent = aid(0x7F);
         let body = b"opaque-rkyv-blob".to_vec();
-        let payload = WalPayload::Knowledge(KnowledgeRecord::new(
+        let payload = WalPayload::PhaseBody(PhaseBodyRecord::new(
             WalRecordKind::EntityCreate,
             agent,
             body.clone(),
         ));
         let bytes = payload.encode_to_bytes();
         match WalPayload::decode(WalRecordKind::EntityCreate, &bytes).unwrap() {
-            WalPayload::Knowledge(r) => {
+            WalPayload::PhaseBody(r) => {
                 assert_eq!(r.agent_id, agent);
                 assert_eq!(r.body, body);
             }
-            other => panic!("expected Knowledge, got {other:?}"),
+            other => panic!("expected PhaseBody, got {other:?}"),
         }
     }
 
     #[test]
-    fn knowledge_decode_empty_body_is_ok() {
+    fn graph_decode_empty_body_is_ok() {
         // An empty body is a legal opaque payload (a tombstone marker,
         // for instance, may carry no fields). The 16-byte agent_id
         // prefix is still mandatory.
@@ -1839,17 +1868,17 @@ mod tests {
         let payload = WalPayload::decode(WalRecordKind::EntityTombstone, &agent_bytes)
             .expect("empty body decodes");
         match payload {
-            WalPayload::Knowledge(r) => {
+            WalPayload::PhaseBody(r) => {
                 assert_eq!(r.kind, WalRecordKind::EntityTombstone);
                 assert_eq!(r.agent_id, AgentId::from(agent_bytes));
                 assert!(r.body.is_empty());
             }
-            other => panic!("expected Knowledge, got {other:?}"),
+            other => panic!("expected PhaseBody, got {other:?}"),
         }
     }
 
     #[test]
-    fn knowledge_decode_rejects_short_prefix() {
+    fn graph_decode_rejects_short_prefix() {
         // Anything shorter than the 16-byte agent_id prefix must
         // underrun rather than silently succeeding.
         for n in 0..16 {
@@ -1861,30 +1890,30 @@ mod tests {
     }
 
     #[test]
-    fn knowledge_decode_skips_trailing_bytes_check() {
+    fn graph_decode_skips_trailing_bytes_check() {
         // For substrate kinds, trailing bytes after the structured tail
-        // are an error. For knowledge kinds the bytes following the
+        // are an error. For typed-graph kinds the bytes following the
         // 16-byte agent_id prefix are the opaque body — no such check
         // applies. Verify by feeding garbage past the prefix.
         let mut bytes = vec![0u8; 16];
         bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE]);
         let decoded = WalPayload::decode(WalRecordKind::SchemaUpdate, &bytes)
-            .expect("knowledge accepts any bytes after prefix");
-        if let WalPayload::Knowledge(r) = decoded {
+            .expect("typed-graph accepts any bytes after prefix");
+        if let WalPayload::PhaseBody(r) = decoded {
             assert_eq!(r.body, bytes[16..].to_vec());
         } else {
-            panic!("expected Knowledge");
+            panic!("expected PhaseBody");
         }
     }
 
     #[test]
-    #[should_panic(expected = "KnowledgeRecord requires a knowledge-layer kind")]
-    fn knowledge_record_rejects_substrate_kind_in_debug() {
-        // Debug-only invariant: constructing a KnowledgeRecord with a
+    #[should_panic(expected = "PhaseBodyRecord requires a opaque-body kind")]
+    fn graph_record_rejects_substrate_kind_in_debug() {
+        // Debug-only invariant: constructing a PhaseBodyRecord with a
         // substrate kind panics. (In release builds the debug_assert is
         // elided; that's intentional — callers are not expected to feed
         // adversarial kinds.)
-        let _ = KnowledgeRecord::new(WalRecordKind::Encode, AgentId::default(), vec![]);
+        let _ = PhaseBodyRecord::new(WalRecordKind::Encode, AgentId::default(), vec![]);
     }
 
     // -----------------------------------------------------------------
@@ -2189,6 +2218,7 @@ mod tests {
                 is_symmetric,
                 properties_blob,
                 agent_id: aid(0x09),
+                relation_type_intern_hint: None,
             };
             let p = WalPayload::RelationLink(rl);
             let bytes = p.encode_to_bytes();

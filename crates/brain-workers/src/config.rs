@@ -21,7 +21,7 @@ pub enum WorkerKind {
     Statistics,
     EmbedderCacheEvict,
     Snapshot,
-    // Knowledge-layer workers.
+    // Typed-graph workers.
     Backfill,
     ForgetCascade,
     SchemaMigration,
@@ -47,7 +47,7 @@ pub enum WorkerKind {
     /// statements (predicates `caused_by`, `triggered`, `led_to`, …).
     /// Walks the statement-by-subject index to find the cause-side
     /// memories anchoring the statement's object entity, and writes
-    /// memory→memory edges from cause to effect. Knowledge-layer only:
+    /// memory→memory edges from cause to effect. Typed-graph only:
     /// no-schema deployments resolve an empty whitelist and the
     /// worker no-ops.
     CausalEdge,
@@ -151,7 +151,7 @@ impl WorkerConfig {
             // WAL replay. `do_snapshot_cycle` skips empty-HNSW shards to
             // avoid writing redundant CHECKPOINT records.
             WorkerKind::Snapshot => (true, Duration::from_secs(3600), 1, 300_000),
-            // Knowledge workers.
+            // Typed-graph workers.
             // Backfill is admin-triggered; the loop ticks fast when work is pending.
             WorkerKind::Backfill => (true, Duration::from_secs(1), 256, 20_000),
             WorkerKind::ForgetCascade => (true, Duration::from_secs(1), 256, 10_000),

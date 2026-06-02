@@ -139,7 +139,7 @@ where
         .run(async move { body().await });
 }
 
-/// Seed the knowledge state needed for the worker's
+/// Seed the typed-graph state needed for the worker's
 /// `StatementObject::Memory` short-circuit branch: an entity-type +
 /// entity (subject), the `brain:caused_by` predicate, and a causal
 /// statement whose object names `cause_mem` directly. The worker walks

@@ -37,7 +37,7 @@ This file collects external sources (academic papers, RFC documents, library doc
 
 ## Wire format
 
-- **rkyv** — Zero-copy archived serialization. https://github.com/rkyv/rkyv
+- **rkyv** — Zero-copy archived serialization (internal on-disk storage). https://github.com/rkyv/rkyv
 - **bytemuck** — Plain-old-data type casts for raw vector payloads. https://github.com/Lokathor/bytemuck
 - **RFC 2119** — Key words for use in requirements (MUST / SHOULD / MAY).
 

@@ -581,7 +581,7 @@ fn record_phase_outcomes(
 /// record (event publishing stamps this onto envelopes).
 ///
 /// Only phases that map to a `WalPayload` are appended. Unmapped phases
-/// (knowledge-layer phases persisted via redb; auto-derived phases
+/// (opaque-body phases persisted via redb; auto-derived phases
 /// re-derivable from state) are skipped — their durability rides on the
 /// redb commit's fsync. A `tracing::debug!` log surfaces each skip.
 ///
@@ -735,7 +735,7 @@ fn execute_hnsw_side_effects(writer: &RealWriterHandle, write: &Write) -> Result
 /// Publish one event per phase that has a wire-side counterpart.
 ///
 /// Memory phases (UpsertMemory, Tombstone(Memory), Link, Unlink) and
-/// knowledge phases (UpsertEntity, ...) publish their corresponding
+/// typed-graph phases (UpsertEntity, ...) publish their corresponding
 /// event types. Phases without a wire surface (UpdateSalience,
 /// ReclaimSlots, …) don't publish — they affect observability through
 /// metrics, not subscribers.
@@ -817,7 +817,7 @@ fn phase_to_envelope(
             salience: salience.raw(),
             timestamp_unix_nanos: committed_at_unix_nanos,
             text: Some(text.clone()),
-            knowledge_payload: None,
+            graph_payload: None,
             edge_payload: None,
             stage_kind: None,
             stage_outcome: None,
@@ -835,15 +835,15 @@ fn phase_to_envelope(
                 salience: 0.0,
                 timestamp_unix_nanos: committed_at_unix_nanos,
                 text: None,
-                knowledge_payload: None,
+                graph_payload: None,
                 edge_payload: None,
                 stage_kind: None,
                 stage_outcome: None,
                 stage_payload: None,
                 agent_id: write.agent_id,
             }),
-            // Knowledge tombstones publish through the knowledge-event
-            // path (emit_knowledge_event), not the memory subscribe bus.
+            // Typed-graph tombstones publish through the typed-graph-event
+            // path (emit_graph_event), not the memory subscribe bus.
             TombstoneTarget::Entity(_)
             | TombstoneTarget::Statement(_)
             | TombstoneTarget::Relation(_) => None,
@@ -865,7 +865,7 @@ fn phase_to_envelope(
             salience: 0.0,
             timestamp_unix_nanos: committed_at_unix_nanos,
             text: None,
-            knowledge_payload: None,
+            graph_payload: None,
             edge_payload: Some(edge_payload_to_event(
                 *from,
                 *to,
@@ -890,7 +890,7 @@ fn phase_to_envelope(
             salience: 0.0,
             timestamp_unix_nanos: committed_at_unix_nanos,
             text: None,
-            knowledge_payload: None,
+            graph_payload: None,
             edge_payload: Some(edge_payload_to_event(
                 *from,
                 *to,
@@ -906,8 +906,8 @@ fn phase_to_envelope(
             agent_id: write.agent_id,
         }),
 
-        // Knowledge phases publish through the knowledge-event channel
-        // (emit_knowledge_event), not the memory subscribe bus — they
+        // typed-graph phases publish through the typed-graph-event channel
+        // (emit_graph_event), not the memory subscribe bus — they
         // surface to subscribers via that path, not this envelope.
         Phase::UpsertEntity { .. }
         | Phase::UpsertStatement { .. }
@@ -1429,7 +1429,7 @@ mod tests {
     }
 
     /// A Write that mixes mapped substrate phases with an unmapped
-    /// knowledge phase must produce a WAL record for every mapped
+    /// typed-graph phase must produce a WAL record for every mapped
     /// phase. The earlier "all-or-nothing" gate dropped the entire
     /// append, silently demoting WAL-durable writes to redb-only.
     #[tokio::test]
@@ -1496,7 +1496,7 @@ mod tests {
                 WalRecordKind::TxnCommit,
             ],
             "mapped substrate phases must reach WAL even when an unmapped \
-             knowledge phase is interleaved",
+             typed-graph phase is interleaved",
         );
     }
 

@@ -115,9 +115,9 @@ pub struct EventEnvelope {
     /// Memory text — `Some` only if the publisher carries it
     /// (encode publishes the text; forget does not).
     pub text: Option<String>,
-    /// Typed knowledge-layer payload — `None` for substrate events,
-    /// `Some(_)` for the knowledge event variants.
-    pub knowledge_payload: Option<brain_protocol::KnowledgeEventPayload>,
+    /// Typed opaque-body payload — `None` for substrate events,
+    /// `Some(_)` for the typed-graph event variants.
+    pub graph_payload: Option<brain_protocol::GraphEventPayload>,
     /// Unified-edge change-feed payload — `Some(_)` when `event_type`
     /// is `EdgeAdded`, `EdgeRemoved` or `EdgeSuperseded`.
     pub edge_payload: Option<EdgeEventPayload>,
@@ -129,7 +129,7 @@ pub struct EventEnvelope {
     pub stage_outcome: Option<brain_protocol::StageOutcome>,
     pub stage_payload: Option<brain_protocol::StagePayload>,
     /// Agent the event was attributed to. Substrate writers stamp
-    /// their bound agent; knowledge handlers stamp the auth-time
+    /// their bound agent; typed-graph handlers stamp the auth-time
     /// agent the request ran under. Default (nil) for tests +
     /// events synthesized from WAL records that didn't capture an
     /// agent (none today — every WAL payload carries agent_id).
@@ -149,7 +149,7 @@ impl EventEnvelope {
             salience: self.salience,
             timestamp_unix_nanos: self.timestamp_unix_nanos,
             lsn: self.lsn,
-            knowledge_payload: self.knowledge_payload.clone(),
+            graph_payload: self.graph_payload.clone(),
             edge_payload: self.edge_payload.clone(),
             stage_kind: self.stage_kind,
             stage_outcome: self.stage_outcome,
@@ -174,7 +174,7 @@ impl EventEnvelope {
     /// caller skips those LSNs silently.
     #[must_use]
     pub fn from_wal_record(record: &brain_storage::wal::record::WalRecord) -> Vec<Self> {
-        use brain_protocol::KnowledgeEventPayload;
+        use brain_protocol::GraphEventPayload;
         use brain_storage::wal::payload::WalPayload;
 
         let lsn = record.lsn.raw();
@@ -197,7 +197,7 @@ impl EventEnvelope {
                     salience: p.salience_initial,
                     timestamp_unix_nanos,
                     text: Some(p.text),
-                    knowledge_payload: None,
+                    graph_payload: None,
                     edge_payload: None,
                     stage_kind: None,
                     stage_outcome: None,
@@ -214,7 +214,7 @@ impl EventEnvelope {
                         salience: 0.0,
                         timestamp_unix_nanos,
                         text: None,
-                        knowledge_payload: None,
+                        graph_payload: None,
                         edge_payload: Some(edge_payload_to_event(
                             e.source,
                             e.target,
@@ -246,7 +246,7 @@ impl EventEnvelope {
                 salience: 0.0,
                 timestamp_unix_nanos,
                 text: None,
-                knowledge_payload: None,
+                graph_payload: None,
                 edge_payload: None,
                 // ForgetPayload doesn't carry agent_id today; replay
                 // can't route through the per-agent allowlist for
@@ -265,7 +265,7 @@ impl EventEnvelope {
                 salience: 0.0,
                 timestamp_unix_nanos,
                 text: None,
-                knowledge_payload: None,
+                graph_payload: None,
                 edge_payload: Some(edge_payload_to_event(
                     p.source,
                     p.target,
@@ -292,7 +292,7 @@ impl EventEnvelope {
                 salience: 0.0,
                 timestamp_unix_nanos,
                 text: None,
-                knowledge_payload: None,
+                graph_payload: None,
                 edge_payload: Some(edge_payload_to_event(
                     p.source,
                     p.target,
@@ -316,7 +316,7 @@ impl EventEnvelope {
                 salience: 0.0,
                 timestamp_unix_nanos,
                 text: None,
-                knowledge_payload: None,
+                graph_payload: None,
                 edge_payload: Some(edge_payload_to_event(
                     p.from,
                     p.to,
@@ -340,7 +340,7 @@ impl EventEnvelope {
                 salience: 0.0,
                 timestamp_unix_nanos,
                 text: None,
-                knowledge_payload: None,
+                graph_payload: None,
                 edge_payload: Some(edge_payload_to_event(
                     p.new.from,
                     p.new.to,
@@ -364,7 +364,7 @@ impl EventEnvelope {
                 salience: 0.0,
                 timestamp_unix_nanos,
                 text: None,
-                knowledge_payload: None,
+                graph_payload: None,
                 // Tombstone replay doesn't reconstruct (from, to)
                 // endpoints — the WAL record only carries the
                 // relation_id; the sidecar lookup needed to recover
@@ -390,28 +390,29 @@ impl EventEnvelope {
                 stage_payload: None,
                 agent_id: p.agent_id,
             }],
-            WalPayload::Knowledge(record) => {
-                // Decode the rkyv body back into the typed knowledge
+            WalPayload::PhaseBody(record) => {
+                // Decode the CBOR body back into the typed-graph
                 // event so subscribers see the same shape as a live
                 // publish. Pair with `wal_kind_for_event` in
-                // `crate::handlers::knowledge_entity`.
-                let Ok(payload) = rkyv::from_bytes::<KnowledgeEventPayload>(&record.body) else {
+                // `crate::handlers::entity`.
+                let Ok(payload) = ciborium::from_reader::<GraphEventPayload, _>(&record.body[..])
+                else {
                     return Vec::new();
                 };
                 let event_type = match &payload {
-                    KnowledgeEventPayload::EntityCreated(_) => EventType::EntityCreated,
-                    KnowledgeEventPayload::EntityUpdated(_) => EventType::EntityUpdated,
-                    KnowledgeEventPayload::EntityRenamed(_) => EventType::EntityRenamed,
-                    KnowledgeEventPayload::EntityMerged(_) => EventType::EntityMerged,
-                    KnowledgeEventPayload::EntityUnmerged(_) => EventType::EntityUnmerged,
-                    KnowledgeEventPayload::EntityTombstoned(_) => EventType::EntityTombstoned,
-                    KnowledgeEventPayload::StatementCreated(_) => EventType::StatementCreated,
-                    KnowledgeEventPayload::StatementSuperseded(_) => EventType::StatementSuperseded,
-                    KnowledgeEventPayload::StatementTombstoned(_) => EventType::StatementTombstoned,
-                    KnowledgeEventPayload::RelationCreated(_) => EventType::RelationCreated,
-                    KnowledgeEventPayload::RelationSuperseded(_) => EventType::RelationSuperseded,
-                    KnowledgeEventPayload::RelationTombstoned(_) => EventType::RelationTombstoned,
-                    KnowledgeEventPayload::SchemaUpdated(_) => EventType::SchemaUpdated,
+                    GraphEventPayload::EntityCreated(_) => EventType::EntityCreated,
+                    GraphEventPayload::EntityUpdated(_) => EventType::EntityUpdated,
+                    GraphEventPayload::EntityRenamed(_) => EventType::EntityRenamed,
+                    GraphEventPayload::EntityMerged(_) => EventType::EntityMerged,
+                    GraphEventPayload::EntityUnmerged(_) => EventType::EntityUnmerged,
+                    GraphEventPayload::EntityTombstoned(_) => EventType::EntityTombstoned,
+                    GraphEventPayload::StatementCreated(_) => EventType::StatementCreated,
+                    GraphEventPayload::StatementSuperseded(_) => EventType::StatementSuperseded,
+                    GraphEventPayload::StatementTombstoned(_) => EventType::StatementTombstoned,
+                    GraphEventPayload::RelationCreated(_) => EventType::RelationCreated,
+                    GraphEventPayload::RelationSuperseded(_) => EventType::RelationSuperseded,
+                    GraphEventPayload::RelationTombstoned(_) => EventType::RelationTombstoned,
+                    GraphEventPayload::SchemaUpdated(_) => EventType::SchemaUpdated,
                 };
                 vec![Self {
                     lsn,
@@ -422,7 +423,7 @@ impl EventEnvelope {
                     salience: 0.0,
                     timestamp_unix_nanos,
                     text: None,
-                    knowledge_payload: Some(payload),
+                    graph_payload: Some(payload),
                     edge_payload: None,
                     stage_kind: None,
                     stage_outcome: None,

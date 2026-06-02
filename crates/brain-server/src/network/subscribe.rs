@@ -686,7 +686,7 @@ fn empty_subscription_event_frame(stream_id: u32, last_lsn: u64) -> Frame {
         salience: 0.0,
         timestamp_unix_nanos: 0,
         lsn: last_lsn,
-        knowledge_payload: None,
+        graph_payload: None,
         edge_payload: None,
         stage_kind: None,
         stage_outcome: None,

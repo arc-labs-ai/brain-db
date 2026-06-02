@@ -51,7 +51,7 @@ What can go wrong in the embedding layer and how Brain responds.
 
 **Response.** The encode operation fails with `EmptyTextAfterTokenization`. Brain suggests the text be cleaned or replaced.
 
-**Client action.** Validate input text before encoding. The SDK does basic validation (non-empty after Unicode whitespace trim).
+**Client action.** Validate input text before encoding. Clients should do basic validation (non-empty after Unicode whitespace trim).
 
 ## 5. Tokenization exceeds maximum
 
@@ -166,7 +166,7 @@ Move the model to local fast storage; ensure no contention.
 
 **Response.** New embedding requests are rejected with `EmbeddingOverloaded`. The operations that already have requests in flight continue to completion.
 
-**Client action.** Back off and retry. The SDK does this with exponential backoff plus jitter.
+**Client action.** Back off and retry. Clients should do this with exponential backoff plus jitter.
 
 ## 15. Determinism violations
 

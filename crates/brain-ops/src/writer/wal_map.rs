@@ -19,8 +19,8 @@
 //! Deferred:
 //! - UpsertEntity / UpsertStatement / UpsertRelation / Supersede /
 //!   UpsertSchema / SetExtractorEnabled / MergeEntities — these need
-//!   the `WalPayload::Knowledge` variant with rkyv-encoded bodies; the
-//!   body schemas land in a knowledge_bodies.rs follow-up.
+//!   the `WalPayload::PhaseBody` variant with rkyv-encoded bodies; the
+//!   body schemas land in a phase_bodies.rs follow-up.
 //!
 //! Phases without a wire-side WAL event (UpdateEmbedding before
 //! arena-write wiring, ReclaimSlots, UpdateEntity, RenameEntity,
@@ -28,15 +28,27 @@
 //! append for them — these phases mirror the pre-migration handler
 //! behavior of not WAL-logging.
 
-use brain_core::EdgeOrigin;
-#[cfg(test)]
-use brain_core::NodeRef;
+use brain_core::{EdgeOrigin, NodeRef};
+use brain_metadata::recovery::phase_bodies::{
+    encode_entity_create, encode_entity_merge, encode_entity_rename, encode_entity_tombstone,
+    encode_entity_unmerge, encode_entity_update, encode_extractor_toggle, encode_schema_update,
+    encode_statement_create, encode_statement_supersede, encode_statement_tombstone,
+    EntityMergeBody, EntityRenameBody, EntityTombstoneBody, EntityUnmergeBody, EntityUpdateBody,
+    ExtractorToggleBody, SchemaUpdateBody, StatementCreateBody, StatementSupersedeBody,
+    StatementTombstoneBody,
+};
+use brain_metadata::tables::entity::EntityMetadata;
+use brain_metadata::tables::statement::metadata_from_statement;
+use brain_storage::wal::kinds::WalRecordKind;
 use brain_storage::wal::payload::{
-    EncodePayload, ForgetPayload, ForgetReason, LinkPayload, SalienceReason, SalienceUpdate,
+    EncodePayload, ForgetPayload, ForgetReason, PhaseBodyRecord, LinkPayload, RelationLinkPayload,
+    RelationSupersedePayload, RelationTombstonePayload, SalienceReason, SalienceUpdate,
     UnlinkPayload, UpdateContextPayload, UpdateKindPayload, UpdateSaliencePayload, WalPayload,
 };
 
-use crate::write::{Phase, TombstoneTarget, Write};
+use crate::apply::entity::entity_from_upsert_phase;
+use crate::apply::statement::statement_from_upsert_phase;
+use crate::write::{Phase, SupersedeReplacement, SupersedeTarget, TombstoneTarget, Write};
 
 /// Map a phase to its WAL payload, if one exists.
 ///
@@ -114,7 +126,11 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             edge_seq: 0,
         })),
 
-        Phase::Tombstone { target, .. } => match target {
+        Phase::Tombstone {
+            target,
+            reason,
+            at_unix_nanos,
+        } => match target {
             TombstoneTarget::Memory { id, mode } => Some(WalPayload::Forget(ForgetPayload {
                 memory_id: *id,
                 // ForgetPayload.request_id carries the WriteId for
@@ -137,12 +153,45 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
                 // with their own WAL record.
                 reason: ForgetReason::ClientRequest,
             })),
-            // Knowledge tombstones — durability rides on the redb commit;
-            // wire-side subscribers learn via the post-commit event burst.
-            // No WAL-replay path independent of redb today.
-            TombstoneTarget::Entity(_)
-            | TombstoneTarget::Statement(_)
-            | TombstoneTarget::Relation(_) => None,
+            // Entity tombstone rides the PhaseBody envelope: recovery
+            // replays it through `entity_tombstone`, the same helper the
+            // live apply path calls.
+            TombstoneTarget::Entity(id) => {
+                let body = encode_entity_tombstone(&EntityTombstoneBody {
+                    id: id.to_bytes(),
+                    at_unix_nanos: *at_unix_nanos,
+                });
+                Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
+                    WalRecordKind::EntityTombstone,
+                    write.agent_id,
+                    body,
+                )))
+            }
+            // Statement tombstone rides the PhaseBody envelope: recovery
+            // replays it through `statement_tombstone`.
+            TombstoneTarget::Statement(id) => {
+                let body = encode_statement_tombstone(&StatementTombstoneBody {
+                    id: id.to_bytes(),
+                    reason: *reason,
+                    at_unix_nanos: *at_unix_nanos,
+                });
+                Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
+                    WalRecordKind::StatementTombstone,
+                    write.agent_id,
+                    body,
+                )))
+            }
+            // Relation tombstone rides the first-class RelationTombstone
+            // payload. The reason byte isn't carried — neither the live
+            // apply nor recovery uses a relation tombstone reason today.
+            TombstoneTarget::Relation(id) => {
+                Some(WalPayload::RelationTombstone(RelationTombstonePayload {
+                    relation_id: *id,
+                    reason: String::new(),
+                    at_unix_nanos: *at_unix_nanos,
+                    agent_id: write.agent_id,
+                }))
+            }
         },
 
         Phase::UpdateSalience { id, new_salience } => {
@@ -170,21 +219,276 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             }))
         }
 
-        // Knowledge phases — durability rides on the redb commit; wire
-        // replay flows through the post-commit knowledge-event burst.
+        // Opaque-body phases — durability rides on the redb commit; wire
+        // replay flows through the post-commit typed-graph-event burst.
         // No standalone WAL body today.
-        Phase::UpsertEntity { .. }
-        | Phase::UpsertStatement { .. }
-        | Phase::UpsertRelation { .. }
-        | Phase::UpsertSchema { .. }
-        | Phase::Supersede { .. }
-        | Phase::UpdateEntity { .. }
-        | Phase::RenameEntity { .. }
-        | Phase::UnmergeEntities { .. }
-        | Phase::MergeEntities { .. }
+        // Entity create rides the PhaseBody envelope: the body is the
+        // full entity row, replayed via `entity_put` (the same helper the
+        // live apply path calls). Built through `entity_from_upsert_phase`
+        // so the WAL row matches what apply persists.
+        Phase::UpsertEntity { .. } => {
+            let e = entity_from_upsert_phase(phase)?;
+            let meta = EntityMetadata::from(&e);
+            let body = encode_entity_create(&meta);
+            Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
+                WalRecordKind::EntityCreate,
+                write.agent_id,
+                body,
+            )))
+        }
+
+        // Statement create rides the PhaseBody envelope. The body carries
+        // the statement row built from the phase's predicate plus the
+        // schemaless intern hint; recovery re-resolves the predicate when
+        // the hint is present (see phase_bodies::StatementCreateBody).
+        Phase::UpsertStatement {
+            predicate,
+            predicate_intern_hint,
+            ..
+        } => {
+            let s = statement_from_upsert_phase(phase, *predicate)?;
+            let body = encode_statement_create(&StatementCreateBody {
+                meta: metadata_from_statement(&s),
+                predicate_intern_hint: predicate_intern_hint.clone(),
+            });
+            Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
+                WalRecordKind::StatementCreate,
+                write.agent_id,
+                body,
+            )))
+        }
+
+        // Statement supersession rides the PhaseBody envelope; the new
+        // statement is fully built (predicate resolved) so its row is
+        // carried inline. Relation supersession falls through to the
+        // None group below — not WAL-mapped yet.
+        Phase::Supersede {
+            target: SupersedeTarget::Statement(old_id),
+            replacement: SupersedeReplacement::Statement(new_statement),
+            at_unix_nanos,
+        } => {
+            let body = encode_statement_supersede(&StatementSupersedeBody {
+                old_id: old_id.to_bytes(),
+                new: metadata_from_statement(new_statement.as_ref()),
+                at_unix_nanos: *at_unix_nanos,
+            });
+            Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
+                WalRecordKind::StatementSupersede,
+                write.agent_id,
+                body,
+            )))
+        }
+
+        // Relation supersession rides the first-class RelationSupersede
+        // payload; the new relation is fully built (type resolved) so its
+        // row is carried inline (no intern hint). The supersession
+        // timestamp comes from the WAL record, not the payload.
+        Phase::Supersede {
+            target: SupersedeTarget::Relation(old_id),
+            replacement: SupersedeReplacement::Relation(new_rel),
+            ..
+        } => Some(WalPayload::RelationSupersede(RelationSupersedePayload {
+            old_relation_id: *old_id,
+            new: RelationLinkPayload {
+                relation_id: new_rel.id,
+                from: NodeRef::Entity(new_rel.from_entity),
+                to: NodeRef::Entity(new_rel.to_entity),
+                relation_type_id: new_rel.relation_type,
+                chain_root: new_rel.chain_root,
+                confidence: new_rel.confidence,
+                valid_from_unix_nanos: new_rel.valid_from_unix_nanos,
+                valid_to_unix_nanos: new_rel.valid_to_unix_nanos,
+                supersedes: new_rel.supersedes,
+                evidence: new_rel.evidence.clone(),
+                extractor_id: new_rel.extractor_id.raw(),
+                is_symmetric: new_rel.is_symmetric,
+                properties_blob: new_rel.properties_blob.clone(),
+                agent_id: write.agent_id,
+                relation_type_intern_hint: None,
+            },
+        })),
+
+        // Relation create rides the first-class RelationLink payload (the
+        // edge row + sidecar + evidence index rebuild atomically on
+        // recovery). `relation_type_id` is the placeholder on the
+        // schemaless path; recovery re-resolves it via the intern hint.
+        Phase::UpsertRelation {
+            id,
+            ty,
+            from,
+            to,
+            confidence,
+            evidence_memories,
+            is_symmetric,
+            extractor,
+            properties_blob,
+            valid_from_unix_nanos,
+            valid_to_unix_nanos,
+            relation_type_intern_hint,
+            ..
+        } => Some(WalPayload::RelationLink(RelationLinkPayload {
+            relation_id: *id,
+            from: NodeRef::Entity(*from),
+            to: NodeRef::Entity(*to),
+            relation_type_id: *ty,
+            chain_root: *id,
+            confidence: *confidence,
+            valid_from_unix_nanos: *valid_from_unix_nanos,
+            valid_to_unix_nanos: *valid_to_unix_nanos,
+            supersedes: None,
+            evidence: evidence_memories.clone(),
+            extractor_id: extractor.raw(),
+            is_symmetric: *is_symmetric,
+            properties_blob: properties_blob.clone(),
+            agent_id: write.agent_id,
+            relation_type_intern_hint: relation_type_intern_hint.clone(),
+        })),
+
+        // Entity full-row update rides the PhaseBody envelope; recovery
+        // re-reads the current row and applies the new canonical / aliases
+        // / attributes via `entity_update`.
+        Phase::UpdateEntity {
+            id,
+            canonical_name,
+            aliases,
+            attributes_blob,
+            at_unix_nanos,
+        } => {
+            let body = encode_entity_update(&EntityUpdateBody {
+                id: id.to_bytes(),
+                canonical_name: canonical_name.clone(),
+                aliases: aliases.clone(),
+                attributes_blob: attributes_blob.clone(),
+                at_unix_nanos: *at_unix_nanos,
+            });
+            Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
+                WalRecordKind::EntityUpdate,
+                write.agent_id,
+                body,
+            )))
+        }
+
+        // Entity rename rides the PhaseBody envelope; recovery applies it
+        // via `entity_rename` (which moves the old canonical into aliases).
+        Phase::RenameEntity {
+            id,
+            new_canonical_name,
+            at_unix_nanos,
+        } => {
+            let body = encode_entity_rename(&EntityRenameBody {
+                id: id.to_bytes(),
+                new_canonical_name: new_canonical_name.clone(),
+                at_unix_nanos: *at_unix_nanos,
+            });
+            Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
+                WalRecordKind::EntityRename,
+                write.agent_id,
+                body,
+            )))
+        }
+
+        // Entity merge rides the PhaseBody envelope; recovery replays it
+        // via `merge_entity` (guarded by `merged_into` for re-replay).
+        Phase::MergeEntities {
+            source,
+            target,
+            retain_aliases,
+            retain_attributes,
+            at_unix_nanos,
+            confidence,
+            reason,
+            actor,
+            grace_seconds,
+        } => {
+            let (actor_kind, actor_agent) = match actor {
+                brain_metadata::entity::merge::MergeActor::System => (0u8, [0u8; 16]),
+                brain_metadata::entity::merge::MergeActor::Agent(bytes) => (1u8, *bytes),
+            };
+            let body = encode_entity_merge(&EntityMergeBody {
+                source: source.to_bytes(),
+                target: target.to_bytes(),
+                retain_aliases: *retain_aliases,
+                retain_attributes: *retain_attributes,
+                at_unix_nanos: *at_unix_nanos,
+                confidence: *confidence,
+                reason: reason.clone(),
+                actor_kind,
+                actor_agent,
+                grace_seconds: *grace_seconds,
+            });
+            Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
+                WalRecordKind::EntityMerge,
+                write.agent_id,
+                body,
+            )))
+        }
+
+        // Schema upload rides the PhaseBody envelope; recovery re-parses
+        // the DSL blob + re-uploads. namespace+version are carried so
+        // recovery can skip an already-applied version on re-replay.
+        Phase::UpsertSchema {
+            namespace,
+            version,
+            blob,
+            created_at_unix_nanos,
+            ..
+        } => {
+            let body = encode_schema_update(&SchemaUpdateBody {
+                namespace: namespace.clone(),
+                version: *version,
+                blob: blob.clone(),
+                created_at_unix_nanos: *created_at_unix_nanos,
+            });
+            Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
+                WalRecordKind::SchemaUpdate,
+                write.agent_id,
+                body,
+            )))
+        }
+
+        // Entity unmerge rides the PhaseBody envelope; recovery reverses
+        // the merge via `unmerge_entity` (guarded by `merged_into`).
+        Phase::UnmergeEntities {
+            merged,
+            actor,
+            at_unix_nanos,
+        } => {
+            let (actor_kind, actor_agent) = match actor {
+                brain_metadata::entity::merge::MergeActor::System => (0u8, [0u8; 16]),
+                brain_metadata::entity::merge::MergeActor::Agent(bytes) => (1u8, *bytes),
+            };
+            let body = encode_entity_unmerge(&EntityUnmergeBody {
+                merged: merged.to_bytes(),
+                actor_kind,
+                actor_agent,
+                at_unix_nanos: *at_unix_nanos,
+            });
+            Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
+                WalRecordKind::EntityUnmerge,
+                write.agent_id,
+                body,
+            )))
+        }
+
+        // Extractor enable/disable rides the PhaseBody envelope.
+        Phase::SetExtractorEnabled { id, enabled } => {
+            let body = encode_extractor_toggle(&ExtractorToggleBody {
+                id: id.raw(),
+                enabled: *enabled,
+            });
+            Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
+                WalRecordKind::ExtractorToggle,
+                write.agent_id,
+                body,
+            )))
+        }
+
+        // ApproveMerge / RejectMerge resolve a merge proposal at apply
+        // time, so they need a handler-side pre-resolution before they can
+        // be WAL-mapped — durability still rides the redb commit for now.
+        Phase::Supersede { .. }
         | Phase::ApproveMerge { .. }
-        | Phase::RejectMerge { .. }
-        | Phase::SetExtractorEnabled { .. } => None,
+        | Phase::RejectMerge { .. } => None,
 
         // No wire-replay semantic — UpdateEmbedding rewrites a vector
         // the HNSW already absorbed pre-commit; ReclaimSlots is derivable
@@ -207,13 +511,271 @@ fn edge_origin_from_byte(byte: u8) -> EdgeOrigin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_core::{AgentId, ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, Salience};
+    use brain_core::{
+        AgentId, ContextId, EdgeKind, EdgeKindRef, EntityAttributes, EntityId, EntityTypeId,
+        MemoryId, MemoryKind, Salience,
+    };
     use brain_metadata::tables::edge::zero_disambiguator;
 
     use crate::write::{Phase, Write, WriteId};
 
     fn write_for(phase: Phase) -> Write {
         Write::single(WriteId::new(), AgentId::default(), phase)
+    }
+
+    #[test]
+    fn upsert_entity_maps_to_graph_entity_create() {
+        let phase = Phase::UpsertEntity {
+            id: EntityId::new(),
+            ty: EntityTypeId::from(1),
+            canonical: "Priya Patel".into(),
+            normalized: "priya patel".into(),
+            aliases: vec!["priya".into()],
+            attributes: EntityAttributes::default(),
+            created_at_unix_nanos: 1_700_000_000_000,
+        };
+        let w = write_for(phase.clone());
+        let WalPayload::PhaseBody(rec) = phase_to_wal_payload(&phase, &w).expect("should map") else {
+            panic!("expected PhaseBody payload")
+        };
+        assert_eq!(rec.kind, WalRecordKind::EntityCreate);
+        assert!(!rec.body.is_empty());
+    }
+
+    #[test]
+    fn tombstone_entity_maps_to_graph_entity_tombstone() {
+        let phase = Phase::Tombstone {
+            target: TombstoneTarget::Entity(EntityId::new()),
+            reason: 0,
+            at_unix_nanos: 1_700_000_000_000,
+        };
+        let w = write_for(phase.clone());
+        let WalPayload::PhaseBody(rec) = phase_to_wal_payload(&phase, &w).expect("should map") else {
+            panic!("expected PhaseBody payload")
+        };
+        assert_eq!(rec.kind, WalRecordKind::EntityTombstone);
+    }
+
+    #[test]
+    fn update_entity_maps_to_graph_entity_update() {
+        let phase = Phase::UpdateEntity {
+            id: EntityId::new(),
+            canonical_name: "New Name".into(),
+            aliases: vec![],
+            attributes_blob: vec![],
+            at_unix_nanos: 1_700_000_000_000,
+        };
+        let w = write_for(phase.clone());
+        let WalPayload::PhaseBody(rec) = phase_to_wal_payload(&phase, &w).expect("should map") else {
+            panic!("expected PhaseBody payload")
+        };
+        assert_eq!(rec.kind, WalRecordKind::EntityUpdate);
+    }
+
+    #[test]
+    fn rename_entity_maps_to_graph_entity_rename() {
+        let phase = Phase::RenameEntity {
+            id: EntityId::new(),
+            new_canonical_name: "New Canonical".into(),
+            at_unix_nanos: 1_700_000_000_000,
+        };
+        let w = write_for(phase.clone());
+        let WalPayload::PhaseBody(rec) = phase_to_wal_payload(&phase, &w).expect("should map") else {
+            panic!("expected PhaseBody payload")
+        };
+        assert_eq!(rec.kind, WalRecordKind::EntityRename);
+    }
+
+    #[test]
+    fn merge_entities_maps_to_graph_entity_merge() {
+        let phase = Phase::MergeEntities {
+            source: EntityId::new(),
+            target: EntityId::new(),
+            retain_aliases: true,
+            retain_attributes: true,
+            at_unix_nanos: 1_700_000_000_000,
+            confidence: 0.9,
+            reason: "dup".into(),
+            actor: brain_metadata::entity::merge::MergeActor::System,
+            grace_seconds: 0,
+        };
+        let w = write_for(phase.clone());
+        let WalPayload::PhaseBody(rec) = phase_to_wal_payload(&phase, &w).expect("should map") else {
+            panic!("expected PhaseBody payload")
+        };
+        assert_eq!(rec.kind, WalRecordKind::EntityMerge);
+    }
+
+    #[test]
+    fn upsert_schema_maps_to_graph_schema_update() {
+        let phase = Phase::UpsertSchema {
+            namespace: "acme".into(),
+            version: 1,
+            blob: b"namespace acme".to_vec(),
+            declared_predicates: vec![],
+            declared_relation_types: vec![],
+            declared_entity_types: vec![],
+            created_at_unix_nanos: 1_700_000_000_000,
+        };
+        let w = write_for(phase.clone());
+        let WalPayload::PhaseBody(rec) = phase_to_wal_payload(&phase, &w).expect("should map") else {
+            panic!("expected PhaseBody payload")
+        };
+        assert_eq!(rec.kind, WalRecordKind::SchemaUpdate);
+    }
+
+    #[test]
+    fn unmerge_entities_maps_to_graph_entity_unmerge() {
+        let phase = Phase::UnmergeEntities {
+            merged: EntityId::new(),
+            actor: brain_metadata::entity::merge::MergeActor::System,
+            at_unix_nanos: 1_700_000_000_000,
+        };
+        let w = write_for(phase.clone());
+        let WalPayload::PhaseBody(rec) = phase_to_wal_payload(&phase, &w).expect("should map") else {
+            panic!("expected PhaseBody payload")
+        };
+        assert_eq!(rec.kind, WalRecordKind::EntityUnmerge);
+    }
+
+    #[test]
+    fn set_extractor_enabled_maps_to_graph_extractor_toggle() {
+        let phase = Phase::SetExtractorEnabled {
+            id: brain_core::ExtractorId::from(3),
+            enabled: false,
+        };
+        let w = write_for(phase.clone());
+        let WalPayload::PhaseBody(rec) = phase_to_wal_payload(&phase, &w).expect("should map") else {
+            panic!("expected PhaseBody payload")
+        };
+        assert_eq!(rec.kind, WalRecordKind::ExtractorToggle);
+    }
+
+    #[test]
+    fn upsert_statement_maps_to_graph_statement_create() {
+        use brain_core::{
+            ExtractorId, PredicateId, StatementId, StatementKind, StatementObject, StatementValue,
+            SubjectRef,
+        };
+        let phase = Phase::UpsertStatement {
+            id: StatementId::new(),
+            kind: StatementKind::Fact,
+            subject: SubjectRef::Entity(EntityId::new()),
+            predicate: PredicateId::from(0),
+            object: StatementObject::Value(StatementValue::Text("blue".into())),
+            confidence: 0.9,
+            evidence: crate::write::EvidenceRefPhase::Inline(vec![]),
+            valid_from_unix_nanos: None,
+            extractor: ExtractorId::from(0),
+            extracted_at_unix_nanos: 1_700_000_000_000,
+            schema_version: 1,
+            predicate_intern_hint: Some(("brain".into(), "likes".into())),
+        };
+        let w = write_for(phase.clone());
+        let WalPayload::PhaseBody(rec) = phase_to_wal_payload(&phase, &w).expect("should map") else {
+            panic!("expected PhaseBody payload")
+        };
+        assert_eq!(rec.kind, WalRecordKind::StatementCreate);
+        assert!(!rec.body.is_empty());
+    }
+
+    #[test]
+    fn tombstone_statement_maps_to_graph_statement_tombstone() {
+        let phase = Phase::Tombstone {
+            target: TombstoneTarget::Statement(brain_core::StatementId::new()),
+            reason: 0,
+            at_unix_nanos: 1_700_000_000_000,
+        };
+        let w = write_for(phase.clone());
+        let WalPayload::PhaseBody(rec) = phase_to_wal_payload(&phase, &w).expect("should map") else {
+            panic!("expected PhaseBody payload")
+        };
+        assert_eq!(rec.kind, WalRecordKind::StatementTombstone);
+    }
+
+    #[test]
+    fn upsert_relation_maps_to_relation_link_with_hint() {
+        use brain_core::{ExtractorId, RelationId, RelationTypeId};
+        let id = RelationId::new();
+        let from = EntityId::new();
+        let phase = Phase::UpsertRelation {
+            id,
+            ty: RelationTypeId::from(0),
+            from,
+            to: EntityId::new(),
+            confidence: 0.9,
+            evidence_memories: vec![],
+            is_symmetric: true,
+            extractor: ExtractorId::from(0),
+            extracted_at_unix_nanos: 1_700_000_000_000,
+            properties_blob: vec![],
+            valid_from_unix_nanos: None,
+            valid_to_unix_nanos: None,
+            relation_type_intern_hint: Some(("app".into(), "works_with".into())),
+        };
+        let w = write_for(phase.clone());
+        let WalPayload::RelationLink(rl) = phase_to_wal_payload(&phase, &w).expect("should map")
+        else {
+            panic!("expected RelationLink payload")
+        };
+        assert_eq!(rl.relation_id, id);
+        assert_eq!(rl.from, NodeRef::Entity(from));
+        assert!(rl.is_symmetric);
+        assert!(rl.relation_type_intern_hint.is_some());
+    }
+
+    #[test]
+    fn tombstone_relation_maps_to_relation_tombstone() {
+        let phase = Phase::Tombstone {
+            target: TombstoneTarget::Relation(brain_core::RelationId::new()),
+            reason: 0,
+            at_unix_nanos: 1_700_000_000_000,
+        };
+        let w = write_for(phase.clone());
+        let WalPayload::RelationTombstone(rt) = phase_to_wal_payload(&phase, &w).expect("should map")
+        else {
+            panic!("expected RelationTombstone payload")
+        };
+        assert_eq!(rt.at_unix_nanos, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn supersede_relation_maps_to_relation_supersede() {
+        use brain_core::{ExtractorId, Relation, RelationId, RelationTypeId};
+        let old_id = RelationId::new();
+        let new_id = RelationId::new();
+        let new_rel = Relation {
+            id: new_id,
+            relation_type: RelationTypeId::from(7),
+            from_entity: EntityId::new(),
+            to_entity: EntityId::new(),
+            properties_blob: vec![],
+            confidence: 0.9,
+            evidence: vec![],
+            extractor_id: ExtractorId::from(0),
+            extracted_at_unix_nanos: 1_700_000_000_000,
+            valid_from_unix_nanos: None,
+            valid_to_unix_nanos: None,
+            version: 2,
+            superseded_by: None,
+            supersedes: Some(old_id),
+            chain_root: old_id,
+            tombstoned: false,
+            tombstoned_at_unix_nanos: None,
+            is_symmetric: false,
+        };
+        let phase = Phase::Supersede {
+            target: SupersedeTarget::Relation(old_id),
+            replacement: SupersedeReplacement::Relation(Box::new(new_rel)),
+            at_unix_nanos: 1_700_000_000_001,
+        };
+        let w = write_for(phase.clone());
+        let WalPayload::RelationSupersede(rs) = phase_to_wal_payload(&phase, &w).expect("should map")
+        else {
+            panic!("expected RelationSupersede payload")
+        };
+        assert_eq!(rs.old_relation_id, old_id);
+        assert_eq!(rs.new.relation_id, new_id);
     }
 
     #[test]
@@ -383,11 +945,11 @@ mod tests {
         let w = write_for(phase.clone());
         assert!(phase_to_wal_payload(&phase, &w).is_none());
 
-        // SetExtractorEnabled — knowledge-layer phase; no WAL mapping
-        // until knowledge_bodies.rs lands.
-        let phase = Phase::SetExtractorEnabled {
-            id: brain_core::ExtractorId::from(1),
-            enabled: false,
+        // RejectMerge — resolves a merge proposal at apply time; needs a
+        // handler-side pre-resolution before it can be WAL-mapped.
+        let phase = Phase::RejectMerge {
+            proposal_id: brain_core::MergeId::new(),
+            at_unix_nanos: 1_700_000_000_000,
         };
         let w = write_for(phase.clone());
         assert!(phase_to_wal_payload(&phase, &w).is_none());

@@ -10,7 +10,7 @@ This file is loaded automatically by Claude Code at the start of every session. 
 
 **Brain** is a memory database for AI agents. It stores typed memories — facts, preferences, events, entities, relations — with explicit provenance, confidence, and bi-temporal validity. Retrieval is hybrid (semantic + lexical + entity-graph + temporal) fused with weighted rank fusion. One Rust core, one wire protocol, one schema. Apache 2.0.
 
-Brain is **one system, one write path**. There is one `Write { phases: Vec<Phase> }` model, one writer (`submit(Write)`), one apply layer dispatching every phase variant. Capabilities differ by which state they touch (memories, entities, statements, relations, edges, schema, audit, slots) — not by which "layer" they belong to. The spec is being restructured to drop the old substrate / knowledge-layer split entirely; see [`docs/development/spec-restructure-plan.md`](docs/development/spec-restructure-plan.md).
+Brain is **one system, one write path**. There is one `Write { phases: Vec<Phase> }` model, one writer (`submit(Write)`), one apply layer dispatching every phase variant. Capabilities differ by which state they touch (memories, entities, statements, relations, edges, schema, audit, slots) — not by which "layer" they belong to. The spec drops the old substrate / knowledge-layer split entirely.
 
 Capabilities that touch typed-graph state (typed-entity wire ops, statement/relation graph, procedural-memory materialization, VSA algebra, plugins, bi-temporal record-time) check **per-type** against the active schema set: a write referencing a declared type is accepted; one referencing an undeclared type is rejected or dropped (depending on whether the write is explicit or extractor-driven). The seeded `brain:` system namespace is always active; there is no "schema not declared" mode any more. Retrieval, extraction, and the index pipeline run on every shard regardless.
 
@@ -56,15 +56,12 @@ The full directory map is in [`spec/00_overview/02_doc_map.md`](spec/00_overview
 
 ## 3. How work is structured
 
-The roadmap is in three layers:
+The implementation phases are complete; what remains for v1.0 is convergence (see [`ROADMAP.md`](ROADMAP.md)). Work is tracked in two places:
 
-1. **[`ROADMAP.md`](ROADMAP.md)** — high-level phase index. One-line per phase.
-2. **[`docs/development/phases/phase-NN-*.md`](docs/development/phases/)** — detailed sub-task breakdown for each phase. Reads, writes, "done when" criteria.
-3. **[`AUTONOMY.md`](AUTONOMY.md)** — operating rules (commit format, stop conditions, scope guards).
+1. **[`ROADMAP.md`](ROADMAP.md)** — high-level milestone index and the v1.0 cut criteria.
+2. **[`AUTONOMY.md`](AUTONOMY.md)** — operating rules (commit format, stop conditions, scope guards).
 
-When asked "what's next?", the answer is always: the lowest-numbered unfinished sub-task in the active phase doc.
-
-The `/next-task` slash command finds it for you.
+The per-phase landing record (what each phase delivered, deferrals, bench results) lives in the git history — `git log --oneline`. New plans are drafted under `.claude/plans/`.
 
 ## 4. Architecture in one paragraph
 
@@ -100,7 +97,8 @@ Approved set. New deps require justification + commit message rationale.
 |---|---|
 | Async runtime (shards) | `glommio` |
 | Async runtime (connection layer) | `tokio` |
-| Wire encoding | `rkyv` + `bytemuck` |
+| Wire encoding | `ciborium` (CBOR) + little-endian `f32` vectors |
+| Internal storage encoding | `rkyv` + `bytemuck` |
 | Metadata | `redb` |
 | HNSW | `hnsw_rs` |
 | Embedding | `candle-core` + `candle-nn` + `candle-transformers` + `tokenizers` |
@@ -143,13 +141,13 @@ crates/
 ├── brain-workers/       Background workers (auto-edge, temporal-edge, extractor, decay, …)
 ├── brain-extractors/    Pattern + classifier extractors (introduced phase 20)
 ├── brain-llm/           LLM client + cache + budget (introduced phase 21)
-├── brain-http/          HTTP/WS/SSE transport
-├── brain-server/        Server binary, wires it all together
-├── brain-sdk-rust/      Rust SDK (`ops/` per opcode + `models/` typed handles)
-└── brain-cli/           Admin CLI
+├── brain-http/          HTTP transport for the operator admin listener
+└── brain-server/        Server binary, wires it all together
 ```
 
-Each maps to one or more spec sections; see the relevant phase doc. `brain-extractors` and `brain-llm` are introduced in phases 20 and 21 respectively — earlier phases must not depend on them.
+Brain ships **no first-party client, SDK, or CLI**. Clients speak the §04 wire protocol directly (portable binary frame + CBOR payloads); operators administer via `curl` against the admin HTTP listener. A `brainctl` offline migration/admin tool is future work, not yet built.
+
+Each crate maps to one or more spec sections. `brain-extractors` and `brain-llm` are the extraction tiers; the rest of the workspace must not depend on them at the wire/storage layer.
 
 ## 9. Anti-patterns
 
@@ -189,9 +187,7 @@ just doc               # docs
 
 # Slash commands inside Claude Code
 /spec <num> [file]     # navigate the spec
-/next-task             # find next sub-task
 /verify                # run verify suite
-/status                # show phase progress
 /audit-spec <crate>    # check implementation against spec
 ```
 
@@ -225,11 +221,9 @@ Autonomous mode is enabled. The autonomy contract ([`AUTONOMY.md`](AUTONOMY.md))
 If running for the first time on a fresh checkout:
 
 1. `git status` — confirm clean.
-2. `just verify` — confirm Phase 0 passes.
-3. If green: `git tag phase-0-complete` (if not already tagged).
-4. Read [`AUTONOMY.md`](AUTONOMY.md) end-to-end.
-5. Read the relevant phase doc (`docs/development/phases/phase-NN-*.md`) end-to-end.
-6. Begin sub-task 1.1 (or current).
+2. `just verify` — confirm the workspace builds and the suite is green.
+3. Read [`AUTONOMY.md`](AUTONOMY.md) end-to-end.
+4. Read [`ROADMAP.md`](ROADMAP.md) for the v1.0 convergence work that remains.
 
 ## 15. When in doubt
 

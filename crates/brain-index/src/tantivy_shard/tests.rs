@@ -24,6 +24,7 @@ fn memory_text_schema_matches_spec() {
         ("agent_id", "bytes"),
         ("kind", "u64"),
         ("created_at", "u64"),
+        ("context", "u64"),
     ];
 
     let actual: Vec<(String, &'static str)> = schema

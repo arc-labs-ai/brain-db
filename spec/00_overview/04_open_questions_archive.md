@@ -97,7 +97,7 @@ Question IDs (`OQ-V2-N`, `OQ-23-X`, etc.) are stable; once assigned, they don't 
 
 ## OQ-V2-14: GUI for schema management and audit review
 
-**Current:** CLI and SDK only.
+**Current:** wire protocol only.
 **Open:** web-based admin UI.
 **Why deferred:** out of scope.
 **Path:** separate project / community.
@@ -113,8 +113,8 @@ Question IDs (`OQ-V2-N`, `OQ-23-X`, etc.) are stable; once assigned, they don't 
 
 **Current:** the hybrid `QUERY` opcode returns a single `QueryResponse` frame, items truncated to `limit`.
 **Open:** stream items over the SUBSCRIBE wire path as they pass the limit boundary, per spec §13/05 §"Streaming results".
-**Why deferred:** v1 deployments are local-first with modest result-set sizes; the streaming path adds wire-protocol surface (event types) and SDK iterator plumbing that wasn't worth the complexity at v1.
-**Path:** post-v1 — add a `QueryStream` event type on SUBSCRIBE; SDK gains `client.query()…stream().await` returning a `Stream<Item = QueryHit>`.
+**Why deferred:** v1 deployments are local-first with modest result-set sizes; the streaming path adds wire-protocol surface (event types) and client iterator plumbing that wasn't worth the complexity at v1.
+**Path:** post-v1 — add a `QueryStream` event type on SUBSCRIBE; clients gain a `query()…stream()` pattern returning a `Stream<Item = QueryHit>`.
 
 ## OQ-23-B: query + transactional read-your-writes
 
@@ -1089,8 +1089,8 @@ upload is gated.
 
 ### Q13 — Derive macros + their generated schema contributions
 
-[`../06_sdk/07_typed_graph_sdk.md`](../06_sdk/07_typed_graph_sdk.md)
-lists `#[derive(BrainEntity)] / BrainFact /
+An earlier [client interface](../06_sdk/00_purpose.md) sketch
+listed `#[derive(BrainEntity)] / BrainFact /
 BrainRelation` macros. These auto-generate trait
 impls + a static schema fragment per type.
 
@@ -1450,9 +1450,9 @@ a) **Single-shard only (status quo).**
 
 b) **Two-phase commit across shards.** Heavy; complex.
 
-c) **Saga pattern in SDK.** Application-level compensating actions.
+c) **Saga pattern in the client.** Application-level compensating actions.
 
-**Recommendation.** (c). The SDK provides saga helpers; Brain stays simple.
+**Recommendation.** (c). Clients provide saga helpers; Brain stays simple.
 
 ---
 
@@ -1602,7 +1602,7 @@ b) **Add a graph query language.** Substantial work.
 ## §06_sdk open questions
 
 
-SDK questions unresolved as of this spec version.
+**Superseded (standalone-DB pivot).** Brain ships no first-party SDK; the questions below are retained as historical record only and are moot.
 
 ---
 
@@ -2349,7 +2349,7 @@ b) **Two-phase commit across shards.** Heavy; Brain does not want to be a distri
 
 c) **Saga pattern.** Application-level compensating actions on failure.
 
-**Recommendation.** Stay with (a). For applications needing cross-shard atomicity, the SDK provides saga helpers.
+**Recommendation.** Stay with (a). For applications needing cross-shard atomicity, clients provide saga helpers.
 
 ---
 
@@ -2367,7 +2367,7 @@ Provenance / versioning deferrals.
 
 [`../11_extractors/04_audit.md`](../11_extractors/04_audit.md) §8 — audit query
 is available via `brain-metadata::audit_ops` but
-isn't exposed over the wire. Operators have to attach a CLI / SDK
+isn't exposed over the wire. Operators have to attach a client
 shim. A dedicated wire op is deferred.
 
 **Status:** deferred.
@@ -2875,9 +2875,9 @@ Brain ships BM25 over tantivy for lexical retrieval. SPLADE (sparse-neural) woul
 
 The `QUERY` opcode returns a single `QueryResponse` frame with items truncated to `limit`. For large result sets, streaming over SUBSCRIBE as items pass the limit boundary would lower client-side memory pressure.
 
-**Deferred because:** v1 deployments are local-first with modest result-set sizes. The streaming path adds wire-protocol surface (event types) and SDK iterator plumbing.
+**Deferred because:** v1 deployments are local-first with modest result-set sizes. The streaming path adds wire-protocol surface (event types) and client iterator plumbing.
 
-**Path:** post-v1. Add a `QueryStream` event type on SUBSCRIBE; SDK gains `client.query()…stream().await` returning a `Stream<Item = QueryHit>`.
+**Path:** post-v1. Add a `QueryStream` event type on SUBSCRIBE; clients gain a `query()…stream()` pattern returning a `Stream<Item = QueryHit>`.
 
 ---
 
@@ -3047,9 +3047,9 @@ a) **No support (status quo).**
 
 b) **Two-phase commit.** Heavy; adds complexity.
 
-c) **Saga pattern via SDK.** Application-level compensating actions.
+c) **Saga pattern via the client.** Application-level compensating actions.
 
-**Recommendation.** Stay with (a). For applications needing cross-shard atomicity, the SDK's saga pattern is sufficient.
+**Recommendation.** Stay with (a). For applications needing cross-shard atomicity, the client's saga pattern is sufficient.
 
 ---
 

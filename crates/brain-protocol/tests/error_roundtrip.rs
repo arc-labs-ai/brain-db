@@ -6,7 +6,7 @@
 //! Code/category mapping is covered by the colocated tests in
 //! `error.rs`. This file walks the codes through the full
 //! `ResponseBody::Error(...)` encode → decode cycle so a regression
-//! in either rkyv shim or the `ErrorCodeWire ↔ ErrorCode` table
+//! in either the CBOR codec or the `ErrorCodeWire ↔ ErrorCode` table
 //! surfaces here.
 
 use brain_protocol::envelope::error::{ErrorDetails, ErrorResponse};
@@ -120,7 +120,7 @@ fn code_to_wire_and_back_is_identity_for_new_variants() {
 // ---------------------------------------------------------------------------
 // Malformed bytes return MalformedPayload — never panic.
 //
-// The CheckBytes-validated rkyv path must surface garbage as a
+// The CBOR decoder must surface garbage as a
 // structured error. The four shapes below stress the validator from
 // each direction: empty buffer, undersized, oversized garbage, bytes
 // that look ALMOST like a valid frame.
@@ -148,9 +148,9 @@ fn random_bytes_to_error_response_returns_malformed_not_panic() {
 #[test]
 fn bytes_with_corrupt_middle_return_malformed_not_panic() {
     // Build a real ErrorResponse, encode, then corrupt the middle of
-    // the buffer. The rkyv CheckBytes derive must reject this without
+    // the buffer. The CBOR decoder must reject this without
     // panicking. Resolution-in-force: `UnknownErrorCode` doesn't
-    // panic — CheckBytes rejects invalid u16 discriminants and
+    // panic — the decoder rejects invalid u16 discriminants and
     // surfaces them as MalformedPayload.
     let resp = ResponseBody::Error(ErrorResponse {
         code: ErrorCodeWire::InvalidArgument,
@@ -183,7 +183,7 @@ fn truncated_real_payload_returns_malformed_not_panic() {
         retry_after_ms: None,
     });
     let bytes = resp.encode();
-    // Lop the last quarter off so the rkyv root pointer dangles.
+    // Lop the last quarter off so the CBOR body is truncated.
     let truncated = &bytes[..bytes.len() * 3 / 4];
     let err = ResponseBody::decode(Opcode::Error, truncated).unwrap_err();
     assert_malformed(err);
@@ -193,7 +193,7 @@ fn truncated_real_payload_returns_malformed_not_panic() {
 fn malformed_bytes_on_unrelated_opcode_also_returns_structured_error() {
     // The "no panic on bad bytes" guarantee is per-opcode. Confirm
     // it holds for at least one non-error opcode too — guards against
-    // the rkyv decode helper being inconsistently routed.
+    // the CBOR decode helper being inconsistently routed.
     let garbage = vec![0xFFu8; 64];
     let err = ResponseBody::decode(Opcode::EncodeResp, &garbage).unwrap_err();
     assert_malformed(err);
@@ -205,7 +205,7 @@ fn malformed_bytes_on_unrelated_opcode_also_returns_structured_error() {
 
 // ---------------------------------------------------------------------------
 // Bookend: a known-good ErrorResponse continues to round-trip
-// cleanly so a regression in the rkyv shim couldn't masquerade as
+// cleanly so a regression in the CBOR codec could not masquerade as
 // "everything's malformed."
 // ---------------------------------------------------------------------------
 

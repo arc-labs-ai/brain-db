@@ -2,14 +2,10 @@
 //! ErrorCategoryWire / ErrorCodeWire mirrors of `crate::error`'s
 //! `#[non_exhaustive]` types.
 
-use rkyv::{Archive, Deserialize, Serialize};
-
 use crate::error::{ErrorCategory, ErrorCode};
 
 /// — `PlanResponseFrame::TransitionKind`.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TransitionKind {
     Initial,
     Causal,
@@ -40,9 +36,16 @@ impl From<crate::ops::query::RetrieverWire> for RetrieverNameWire {
 /// has its own `RetrieverWire` for hybrid-query opcodes;
 /// `From<RetrieverWire>` bridges the two so the cognitive response
 /// type doesn't depend on the typed-graph namespace.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq, Hash)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    serde_repr::Serialize_repr,
+    serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum RetrieverNameWire {
     Semantic = 0,
@@ -52,9 +55,9 @@ pub enum RetrieverNameWire {
 
 /// — `PlanResponseFrame::PlanStatus` (set on the final frame
 /// only).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum PlanStatus {
     GoalReached = 0,
@@ -64,9 +67,7 @@ pub enum PlanStatus {
 }
 
 /// — `ReasonResponseFrame::InferenceKind`.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum InferenceKind {
     CausalExplanation,
     EvidenceAccumulation,
@@ -75,9 +76,9 @@ pub enum InferenceKind {
 }
 
 /// — `ReasonResponseFrame::ReasonStatus`.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum ReasonStatus {
     Complete = 0,
@@ -91,11 +92,11 @@ pub enum ReasonStatus {
 /// Carries 14 typed-graph event variants ([`Self::EntityCreated`]
 /// through [`Self::SchemaUpdated`]). For typed-graph events the
 /// cognitive fields on `SubscriptionEvent` (`memory_id`, `context_id`,
-/// `kind`, `salience`, `text`) are zero-filled and `knowledge_payload`
+/// `kind`, `salience`, `text`) are zero-filled and `graph_payload`
 /// carries the typed body.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum EventType {
     // Cognitive events.
@@ -104,7 +105,7 @@ pub enum EventType {
     Reclaimed = 2,
     KindChanged = 3,
 
-    // Typed-graph events. knowledge_payload is populated.
+    // Typed-graph events. graph_payload is populated.
     EntityCreated = 16,
     EntityUpdated = 17,
     EntityRenamed = 18,
@@ -145,9 +146,16 @@ pub enum EventType {
 /// may opt in via `--wait`). The ack lists the stages this write
 /// queued so a client knows which `StageCompleted` events to wait
 /// for.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq, Hash)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    serde_repr::Serialize_repr,
+    serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum StageKind {
     /// `SimilarTo` edges derived from HNSW k-NN of the new memory.
@@ -162,9 +170,9 @@ pub enum StageKind {
 /// Verdict of a completed stage. Carried on every `StageCompleted`
 /// event so a client can distinguish "ran and produced output" from
 /// "ran but had nothing to produce" from "failed."
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum StageOutcome {
     /// Stage produced at least one derived item.
@@ -181,34 +189,26 @@ pub enum StageOutcome {
 /// Per-stage detail sidecar on `StageCompleted` events. Discriminated
 /// by [`StageKind`] but kept as a flat enum so subscribers can
 /// destructure without first reading the parent stage_kind byte.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum StagePayload {
     AutoEdge(StageAutoEdgePayload),
     TemporalEdge(StageTemporalEdgePayload),
     Extractor(StageExtractorPayload),
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StageAutoEdgePayload {
     /// How many `SimilarTo` rows the worker wrote.
     pub edges_written: u32,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StageTemporalEdgePayload {
     /// How many `FollowedBy` rows the worker wrote.
     pub edges_written: u32,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StageExtractorPayload {
     pub entity_count: u32,
     pub statement_count: u32,
@@ -223,9 +223,9 @@ pub struct StageExtractorPayload {
 /// because the extractor pipeline has more granularity than the
 /// generic three-state outcome — `PartiallyApplied` is a per-tier
 /// concern that doesn't make sense for the edge stages.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum StageAuditStatus {
     /// Every enabled tier ran cleanly and writes committed.
@@ -241,9 +241,7 @@ pub enum StageAuditStatus {
 }
 
 /// — `IntegrityIssue::IntegrityIssueType`.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum IntegrityIssueType {
     VectorCorruption,
     TextCorruption,
@@ -254,9 +252,7 @@ pub enum IntegrityIssueType {
 }
 
 /// — `AdminMigrateEmbeddingsResponseFrame::MigrationStatus`.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum MigrationStatus {
     InProgress,
     Completed,
@@ -264,12 +260,12 @@ pub enum MigrationStatus {
     Cancelled,
 }
 
-/// rkyv-archivable mirror of [`crate::error::ErrorCategory`]. The
+/// Wire-encoded mirror of [`crate::error::ErrorCategory`]. The
 /// canonical type is intentionally `#[non_exhaustive]` for forward-
-/// compatibility, which is incompatible with rkyv's closed-world derive.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+/// compatibility, so the wire needs a closed mirror with a stable repr.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum ErrorCategoryWire {
     Protocol = 0,
@@ -315,11 +311,11 @@ impl From<ErrorCategoryWire> for ErrorCategory {
     }
 }
 
-/// rkyv-archivable mirror of [`crate::error::ErrorCode`]. Numeric repr
+/// Wire-encoded mirror of [`crate::error::ErrorCode`]. Numeric repr
 /// is stable; this is the *wire* representation.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u16)]
 pub enum ErrorCodeWire {
     // Protocol
@@ -332,7 +328,7 @@ pub enum ErrorCodeWire {
     OversizePayload = 0x0007,
     ReservedFieldNonZero = 0x0008,
     BadFlagCombination = 0x0009,
-    MalformedRkyv = 0x000A,
+    MalformedPayload = 0x000A,
     MalformedVector = 0x000B,
     // Connection / handshake
     VersionNotSupported = 0x0020,
@@ -426,7 +422,7 @@ impl From<ErrorCode> for ErrorCodeWire {
             ErrorCode::OversizePayload => Self::OversizePayload,
             ErrorCode::ReservedFieldNonZero => Self::ReservedFieldNonZero,
             ErrorCode::BadFlagCombination => Self::BadFlagCombination,
-            ErrorCode::MalformedRkyv => Self::MalformedRkyv,
+            ErrorCode::MalformedPayload => Self::MalformedPayload,
             ErrorCode::MalformedVector => Self::MalformedVector,
             ErrorCode::VersionNotSupported => Self::VersionNotSupported,
             ErrorCode::NoSuchAuthMethod => Self::NoSuchAuthMethod,
@@ -512,7 +508,7 @@ impl From<ErrorCodeWire> for ErrorCode {
             ErrorCodeWire::OversizePayload => Self::OversizePayload,
             ErrorCodeWire::ReservedFieldNonZero => Self::ReservedFieldNonZero,
             ErrorCodeWire::BadFlagCombination => Self::BadFlagCombination,
-            ErrorCodeWire::MalformedRkyv => Self::MalformedRkyv,
+            ErrorCodeWire::MalformedPayload => Self::MalformedPayload,
             ErrorCodeWire::MalformedVector => Self::MalformedVector,
             ErrorCodeWire::VersionNotSupported => Self::VersionNotSupported,
             ErrorCodeWire::NoSuchAuthMethod => Self::NoSuchAuthMethod,

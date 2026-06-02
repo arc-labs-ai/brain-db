@@ -278,9 +278,181 @@ async fn tls_round_trip_smoke() {
     server.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn global_connection_cap_rejects_beyond_max() {
+    // Isolate the global cap by disabling the per-IP cap (all test
+    // connections share 127.0.0.1, so a per-IP cap would fire first).
+    let limits = ConnectionLimits {
+        max_connections: 2,
+        max_connections_per_ip: 0,
+        ..ConnectionLimits::default()
+    };
+    let server = start(None, limits).await;
+
+    // Open the two admitted connections and confirm each is live: a PONG
+    // proves the per-connection task is running, so its admission slot is held.
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let mut c = TcpStream::connect(server.addr).await.expect("connect");
+        c.write_all(&ping_frame().encode()).await.expect("send");
+        c.flush().await.expect("flush");
+        let resp = read_one_frame(&mut c).await.expect("admitted conn answers");
+        assert_eq!(resp.header.opcode_u16(), Opcode::Pong.as_u16());
+        held.push(c);
+    }
+
+    // The third connection exceeds the cap. The kernel still completes the
+    // TCP handshake from its backlog, but the server drops the socket at
+    // accept — before any frame work — so the client observes EOF, never a
+    // reply.
+    let mut over = TcpStream::connect(server.addr).await.expect("connect");
+    over.write_all(&ping_frame().encode()).await.expect("send");
+    over.flush().await.expect("flush");
+    assert!(
+        closed_without_reply(&mut over).await,
+        "over-cap connection must be dropped, not served"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_ip_connection_cap_rejects_beyond_max() {
+    // Unlimited globally; the per-IP cap is what must fire.
+    let limits = ConnectionLimits {
+        max_connections: 0,
+        max_connections_per_ip: 1,
+        ..ConnectionLimits::default()
+    };
+    let server = start(None, limits).await;
+
+    let mut held = TcpStream::connect(server.addr).await.expect("connect");
+    held.write_all(&ping_frame().encode()).await.expect("send");
+    held.flush().await.expect("flush");
+    let resp = read_one_frame(&mut held).await.expect("first conn answers");
+    assert_eq!(resp.header.opcode_u16(), Opcode::Pong.as_u16());
+
+    // Second connection from the same IP exceeds the per-IP cap.
+    let mut over = TcpStream::connect(server.addr).await.expect("connect");
+    over.write_all(&ping_frame().encode()).await.expect("send");
+    over.flush().await.expect("flush");
+    assert!(
+        closed_without_reply(&mut over).await,
+        "second connection from the same IP must be rejected"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_frame_is_rejected_before_alloc() {
+    let limits = ConnectionLimits {
+        max_payload_bytes: 16,
+        ..ConnectionLimits::default()
+    };
+    let server = start(None, limits).await;
+
+    let mut client = TcpStream::connect(server.addr).await.expect("connect");
+    // A well-formed frame whose 100-byte payload exceeds the server's 16-byte
+    // cap. The server peeks payload_len from the header and rejects before
+    // allocating or reading the body — the defense against memory-exhaustion
+    // via a giant declared length.
+    let frame = Frame::new(Opcode::Ping.as_u16(), 0, 0, vec![0u8; 100]);
+    client.write_all(&frame.encode()).await.expect("send");
+    client.flush().await.expect("flush");
+
+    // The server peeks payload_len, rejects before allocating the body, and
+    // closes. It writes a diagnostic ERROR first, but since the client's
+    // 100-byte body is never drained, the close can surface as a RST that
+    // discards that frame — so tolerate either an ERROR-then-EOF or a bare
+    // close, exactly as `bad_magic_closes_connection` does. The invariant
+    // under test is "rejected and closed", not "always diagnosed".
+    let mut buf = vec![0u8; 1024];
+    let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await;
+    match read {
+        Ok(Ok(0)) => {} // bare close
+        Ok(Ok(n)) => {
+            if let Ok((resp, _)) =
+                Frame::decode_with_max(&buf[..n], brain_protocol::MAX_PAYLOAD_BYTES as u32)
+            {
+                assert_eq!(
+                    resp.header.opcode_u16(),
+                    Opcode::Error.as_u16(),
+                    "oversized frame must be rejected with an ERROR, not served"
+                );
+            }
+            // Whether or not the bytes decoded as a frame, the connection
+            // must then close — EOF (Ok(0)) or a reset (Err) both prove it.
+            match client.read(&mut buf).await {
+                Ok(0) | Err(_) => {}
+                Ok(n2) => panic!("expected close after rejection, read {n2} more bytes"),
+            }
+        }
+        Ok(Err(_)) => {} // reset — also acceptable
+        Err(_) => panic!("server neither answered nor closed on an oversized frame"),
+    }
+
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_timeout_closes_unauthenticated_connection() {
+    // A client that connects and never authenticates must not hold a slot
+    // indefinitely — the handshake deadline closes it.
+    let limits = ConnectionLimits {
+        auth_timeout: Duration::from_millis(150),
+        ..ConnectionLimits::default()
+    };
+    let server = start(None, limits).await;
+
+    let mut client = TcpStream::connect(server.addr).await.expect("connect");
+    // Send nothing. The server sends an Unauthenticated ERROR then closes;
+    // accept either that diagnostic-frame-then-EOF, or a bare close.
+    let mut buf = vec![0u8; 1024];
+    let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await;
+    match read {
+        Ok(Ok(0)) => {} // closed without a diagnostic frame
+        Ok(Ok(n)) => {
+            let (frame, _) =
+                Frame::decode_with_max(&buf[..n], brain_protocol::MAX_PAYLOAD_BYTES as u32)
+                    .expect("decode error frame");
+            assert_eq!(frame.header.opcode_u16(), Opcode::Error.as_u16());
+            let n2 = client.read(&mut buf).await.expect("read EOF");
+            assert_eq!(n2, 0, "connection closes after auth timeout");
+        }
+        Ok(Err(_)) => {} // reset — also acceptable
+        Err(_) => panic!("server did not close unauthenticated connection within auth_timeout"),
+    }
+
+    server.stop().await;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// A PING carrying a valid `PingRequest` body — the dispatcher answers it with
+/// PONG (an empty-payload PING decodes to an error instead), so a PONG reply
+/// confirms the connection was admitted and its serve task is running.
+fn ping_frame() -> Frame {
+    let ping = brain_protocol::envelope::request::PingRequest {
+        client_timestamp_unix_nanos: 1,
+    };
+    let body = brain_protocol::envelope::request::RequestBody::Ping(ping);
+    Frame::new(Opcode::Ping.as_u16(), 0, 0, body.encode())
+}
+
+/// True if the connection was dropped at admission: the client gets no reply,
+/// only EOF or a reset. A served connection would answer the PING instead.
+async fn closed_without_reply(stream: &mut TcpStream) -> bool {
+    let mut buf = [0u8; 1];
+    match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
+        Ok(Ok(0)) => true,  // EOF
+        Ok(Err(_)) => true, // reset
+        Ok(Ok(_)) => false, // got bytes back → it was served
+        Err(_) => false,    // neither closed nor served within the window
+    }
+}
 
 async fn read_one_frame<S>(stream: &mut S) -> Result<Frame, String>
 where

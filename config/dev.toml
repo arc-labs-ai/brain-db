@@ -161,6 +161,13 @@ request_timeout_sec = 30
 max_summary_chars = 4096
 # OpenAI knobs — only used when backend = "openai".
 openai_model = "gpt-4o-mini"
+openai_api_key = ""  # operator sets at deploy time — never commit a real key
 # Ollama knobs — only used when backend = "ollama".
 # ollama_base = "http://localhost:11434"
 # ollama_model = "llama3.1:8b"
+
+[llm]
+openai_api_key = ""  # operator sets at deploy time — never commit a real key
+
+[rerank]
+enabled = true

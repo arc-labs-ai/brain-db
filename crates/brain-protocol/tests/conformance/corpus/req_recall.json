@@ -1,0 +1,37 @@
+{
+  "cue_text": "what color is the sky",
+  "top_k": 10,
+  "confidence_threshold": 0.3,
+  "context_filter": [
+    1
+  ],
+  "age_bound_unix_nanos": null,
+  "kind_filter": [
+    0
+  ],
+  "salience_floor": 0.1,
+  "include_edges": true,
+  "include_graph": false,
+  "include_text": true,
+  "request_id": [
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17
+  ],
+  "txn_id": null,
+  "agent_filter": [],
+  "include_other_agents": false
+}

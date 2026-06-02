@@ -18,7 +18,7 @@
 //! - [`reclaim`] — Reclaim / Consolidate
 //! - [`checkpoint`] — CheckpointBegin (inlined here as in-memory) / CheckpointEnd
 //!
-//! `TxnBegin` / `TxnCommit` / `TxnAbort` and `Knowledge(_)` are dispatched
+//! `TxnBegin` / `TxnCommit` / `TxnAbort` and `PhaseBody(_)` are dispatched
 //! inline in the match arm below — they have no family module because the
 //! sink's only job for them is to advance `next_lsn` (see comments at the
 //! match arms).
@@ -46,6 +46,8 @@ use crate::tables::next_lsn::NEXT_LSN_TABLE;
 
 pub mod checkpoint;
 pub mod edge;
+pub mod phases;
+pub mod phase_bodies;
 pub mod memory;
 pub mod reclaim;
 pub mod relation;
@@ -94,14 +96,36 @@ impl MetadataSink for MetadataDb {
                 // the next_lsn watermark monotonic.
                 self.bump_next_lsn(lsn)
             }
-            WalPayload::Knowledge(_) => {
-                // Knowledge-layer payloads (entity / statement / schema /
-                // audit) are applied by their own sinks downstream. This
-                // sink is the memory/edge/relation owner; it ignores
-                // knowledge variants but still bumps next_lsn so
-                // checkpointing and replay-from-LSN stay correct
-                // regardless of which sinks are wired up alongside it.
-                self.bump_next_lsn(lsn)
+            WalPayload::PhaseBody(record) => {
+                use brain_storage::wal::kinds::WalRecordKind;
+                match record.kind {
+                    WalRecordKind::EntityCreate => self.apply_entity_create(lsn, &record.body),
+                    WalRecordKind::EntityUpdate => self.apply_entity_update(lsn, &record.body),
+                    WalRecordKind::EntityRename => self.apply_entity_rename(lsn, &record.body),
+                    WalRecordKind::EntityMerge => self.apply_entity_merge(lsn, &record.body),
+                    WalRecordKind::EntityUnmerge => self.apply_entity_unmerge(lsn, &record.body),
+                    WalRecordKind::EntityTombstone => {
+                        self.apply_entity_tombstone(lsn, &record.body)
+                    }
+                    WalRecordKind::StatementCreate => {
+                        self.apply_statement_create(lsn, &record.body)
+                    }
+                    WalRecordKind::StatementSupersede => {
+                        self.apply_statement_supersede(lsn, &record.body)
+                    }
+                    WalRecordKind::StatementTombstone => {
+                        self.apply_statement_tombstone(lsn, &record.body)
+                    }
+                    WalRecordKind::SchemaUpdate => self.apply_schema_update(lsn, &record.body),
+                    WalRecordKind::ExtractorToggle => {
+                        self.apply_extractor_toggle(lsn, &record.body)
+                    }
+                    // Other typed-graph kinds aren't WAL-mapped on the write
+                    // side yet (durability still rides the redb commit for
+                    // them); bump next_lsn so checkpointing and
+                    // replay-from-LSN stay correct as families land.
+                    _ => self.bump_next_lsn(lsn),
+                }
             }
             WalPayload::RelationLink(p) => self.apply_relation_link(lsn, timestamp_ns, p),
             WalPayload::RelationSupersede(p) => self.apply_relation_supersede(lsn, timestamp_ns, p),
@@ -859,6 +883,7 @@ mod tests {
             is_symmetric: false,
             properties_blob: vec![1, 2, 3],
             agent_id: aid(1),
+            relation_type_intern_hint: None,
         }
     }
 

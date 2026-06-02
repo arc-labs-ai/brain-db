@@ -1,68 +1,26 @@
 //! HTTP client surface.
 //!
-//! **Status:** no client. `brain-http` ships server-side
-//! transport only. This module exists as the design log for the
-//! deferral decision.
-//!
-//! ## Why no client in v1
-//!
-//! No consumer in the Brain workspace currently needs an async HTTP
-//! client:
-//!
-//! - `brain-cli` uses a self-contained ~200-LOC blocking client in
-//!   its own `http::` module — works, tested via the admin integration
-//!   suites, no external deps beyond stdlib.
-//! - `brain-sdk-rust` speaks the binary wire protocol over TCP
-//!   (`brain-protocol` rkyv frames), not HTTP.
-//! - `brain-server`'s only outbound HTTP today is the optional
-//!   `reqwest` feature pulled in for the LLM summarizer.
-//!   That's gated behind `summarizer-openai` / `summarizer-ollama`;
-//!   the default build doesn't include it.
-//!
-//! Building a brain-http client now would be a speculative dependency
-//! — code that solves no current problem.
+//! **Status:** no client. `brain-http` ships server-side transport
+//! only. The engine has no in-workspace outbound HTTP consumer:
+//! external clients live in their own repos, and the
+//! only outbound HTTP in this crate is the LLM summarizer's optional
+//! `reqwest` dep, gated behind `summarizer-openai` /
+//! `summarizer-ollama`. Building a client here today would be
+//! speculative.
 //!
 //! ## When to revisit
 //!
-//! Add a client to brain-http when **any one** of these is true:
+//! Add a client when any of:
 //!
-//! 1. **OTLP push.** If observability ships HTTP-based
-//!    OpenTelemetry export and needs a runtime-shareable client
-//!    (rather than instantiating a `reqwest::Client` per request),
-//!    we need our own.
+//! 1. **OTLP push.** Observability ships HTTP-based OpenTelemetry
+//!    export needing a runtime-shareable client.
 //! 2. **A new outbound consumer.** Webhook delivery from a worker,
-//!    health check fan-out, federation between brain shards — any
-//!    new code path that needs async HTTP and where the brain-cli
-//!    blocking client is the wrong fit.
+//!    health-check fan-out, federation between brain shards.
 //! 3. **`reqwest` becomes painful.** If the summarizer dep tree
-//!    audit surfaces something we can't accept, replacing reqwest
-//!    with our own thin client on `hyper_util::client::legacy::Client`
-//!    is worth the ~700 LOC.
+//!    audit surfaces something we can't accept, we replace it with
+//!    a thin client on `hyper_util::client::legacy::Client`.
 //!
-//! ## What the client would look like
-//!
-//! When we build it, the natural shape is:
-//!
-//! - `client::Client` — a builder over [`hyper_util::client::legacy::Client`]
-//!   with a `Connect` implementation. Plain HTTP via the default
-//!   `HttpConnector`; TLS via a feature-gated `hyper-rustls` connector.
-//! - `client::RequestBuilder` / `client::Response` — match the
-//!   server-side `Request<Body>` / `Response<Body>` ergonomics.
-//! - `client::Pool` — keep-alive pooling, idle eviction, per-host
-//!   bounds. Mirrors the server's `ServerLimits` shape.
-//! - `client::blocking` — a sync facade that wraps the async client
-//!   with `tokio::runtime::Runtime` block-on, for `brain-cli` and any
-//!   future sync consumer.
-//!
-//! Roughly 700 LOC production + 400 LOC tests. Out of scope for now;
-//! a body of work of its own when the trigger fires.
-//!
-//! ## Why not migrate brain-cli now
-//!
-//! One option: move `brain-cli::http` into
-//! `brain-http::client::blocking` verbatim. Same code, different
-//! module path. Considered and rejected: it's churn without a real
-//! consumer — we'd be moving 200 LOC across the workspace to make
-//! the brain-http crate feel "complete." brain-cli's hand-roll is
-//! not technical debt; it's exactly the right amount of code for
-//! the surface it serves.
+//! Natural shape when it lands: a builder over
+//! [`hyper_util::client::legacy::Client`] with HTTP/TLS connectors,
+//! a pool mirroring the server's `ServerLimits`, and a small
+//! blocking facade for sync consumers. Roughly 700 LOC + tests.

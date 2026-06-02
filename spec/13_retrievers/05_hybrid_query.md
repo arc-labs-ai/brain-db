@@ -29,7 +29,7 @@ pipeline.
 
 Two surfaces, same engine:
 
-### Fluent API (primary, Rust SDK)
+### Fluent client API (illustrative)
 
 ```rust
 let results = brain.query()
@@ -286,7 +286,7 @@ Brain uses rule-based routing. A future version (deferred) may support learned r
 
 Labels come from:
 - Click-through data (user picks a result; retrievers that surfaced it get credit).
-- Explicit feedback (`/feedback` slash command in the SDK).
+- Explicit feedback (an explicit feedback call from the client).
 - Synthetic labels from a teacher LLM.
 
 Brain is rule-based by default. Documents the path to future learned routing.

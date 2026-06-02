@@ -20,11 +20,12 @@ use redb::WriteTransaction;
 use super::ApplyError;
 use crate::write::{Phase, PhaseAck, TombstoneTarget, Write};
 
-pub fn apply_upsert_entity(
-    wtxn: &WriteTransaction,
-    phase: &Phase,
-    _write: &Write,
-) -> Result<PhaseAck, ApplyError> {
+/// Build the [`Entity`] a [`Phase::UpsertEntity`] describes. Shared by
+/// the apply path (which persists it via `entity_put`) and the
+/// WAL-mapping path (which serializes its row form into the WAL body),
+/// so both agree byte-for-byte on what an upsert writes. Returns `None`
+/// for any other phase shape.
+pub(crate) fn entity_from_upsert_phase(phase: &Phase) -> Option<Entity> {
     let Phase::UpsertEntity {
         id,
         ty,
@@ -35,7 +36,7 @@ pub fn apply_upsert_entity(
         created_at_unix_nanos,
     } = phase
     else {
-        return Err(ApplyError::PhaseMisShape("expected UpsertEntity"));
+        return None;
     };
     let mut e = Entity::new_active(
         *id,
@@ -46,8 +47,19 @@ pub fn apply_upsert_entity(
     );
     e.aliases = aliases.clone();
     e.attributes = attributes.clone();
+    Some(e)
+}
+
+pub fn apply_upsert_entity(
+    wtxn: &WriteTransaction,
+    phase: &Phase,
+    _write: &Write,
+) -> Result<PhaseAck, ApplyError> {
+    let e = entity_from_upsert_phase(phase)
+        .ok_or(ApplyError::PhaseMisShape("expected UpsertEntity"))?;
+    let id = e.id;
     entity_put(wtxn, &e).map_err(|err| ApplyError::Metadata(format!("entity_put: {err}")))?;
-    Ok(PhaseAck::UpsertedEntity(*id))
+    Ok(PhaseAck::UpsertedEntity(id))
 }
 
 pub fn apply_tombstone_entity(

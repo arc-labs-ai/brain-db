@@ -336,7 +336,7 @@ A new TCP connection:
 - TLS handshake (if used): additional ~1-3 ms.
 - First request: above + normal request latency.
 
-Typical SDKs use connection pooling; subsequent requests skip the connection cost.
+Typical clients use connection pooling; subsequent requests skip the connection cost.
 
 ## 13. The variability
 
@@ -517,7 +517,7 @@ For a single client connection:
 For 100 connections:
 - ~10,000 ops/sec aggregate (if each does ~100/sec).
 
-Many parallel connections are needed for high throughput. SDKs handle this.
+Many parallel connections are needed for high throughput. Clients handle this.
 
 ## 9. The "concurrent" target
 
@@ -536,7 +536,7 @@ With pipelining (multiple requests in flight per connection):
 - Per-connection: ~10K ops/sec (vs ~1K without).
 - Aggregate: scales with the number of active connections.
 
-Brain's protocol supports pipelining; SDKs use it.
+Brain's protocol supports pipelining; clients use it.
 
 ## 11. The "load step" test
 

@@ -137,6 +137,22 @@ fn write_relation_link(
     p: &RelationLinkPayload,
     now_unix_nanos: u64,
 ) -> Result<(), MetadataSinkError> {
+    // Schemaless path: the relation type wasn't interned at WAL-append
+    // time, so re-resolve it here. Deterministic in LSN order; idempotent.
+    let relation_type_id = match &p.relation_type_intern_hint {
+        None => p.relation_type_id,
+        Some((namespace, name)) => crate::relation::types::relation_type_intern_or_get(
+            wtxn,
+            namespace,
+            name,
+            /* first_seen_lsn */ 0,
+            now_unix_nanos,
+        )
+        .map_err(|e| {
+            MetadataSinkError::Corruption(format!("relation_type_intern_or_get: {e}"))
+        })?,
+    };
+
     // Edge row(s). The auto-mirror split mirrors `relation_ops`:
     // symmetric typed relations write the mirror explicitly here so
     // the `is_symmetric` bit stays sidecar-local. Substrate auto-
@@ -151,7 +167,7 @@ fn write_relation_link(
             derived_by::CLIENT,
             now_unix_nanos,
         );
-        let kind = EdgeKindRef::Typed(p.relation_type_id);
+        let kind = EdgeKindRef::Typed(relation_type_id);
         edge::link(
             &mut edges,
             &mut reverse,
@@ -203,7 +219,7 @@ fn write_relation_link(
         from_bytes: p.from.id_bytes(),
         to_tag: p.to.tag(),
         to_bytes: p.to.id_bytes(),
-        relation_type_id: p.relation_type_id.raw(),
+        relation_type_id: relation_type_id.raw(),
         chain_root_bytes,
         properties_blob: p.properties_blob.clone(),
         version,

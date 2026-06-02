@@ -710,7 +710,7 @@ fn lagged_subscriber_freezes_final_lsn_and_reports_overloaded() {
                 salience: 0.5,
                 timestamp_unix_nanos: 0,
                 text: None,
-                knowledge_payload: None,
+                graph_payload: None,
                 edge_payload: None,
                 stage_kind: None,
                 stage_outcome: None,
@@ -830,7 +830,7 @@ mod wal_record_projection {
         assert!((ep.weight - 0.7).abs() < 1e-6);
         assert!(ep.relation_id.is_none());
         assert!(ep.relation_type_id.is_none());
-        assert!(envs[0].knowledge_payload.is_none());
+        assert!(envs[0].graph_payload.is_none());
     }
 
     #[test]
@@ -866,6 +866,7 @@ mod wal_record_projection {
             is_symmetric: false,
             properties_blob: vec![],
             agent_id: AgentId::default(),
+            relation_type_intern_hint: None,
         };
         let r = rec(WalPayload::RelationLink(p));
         let envs = EventEnvelope::from_wal_record(&r);
@@ -895,6 +896,7 @@ mod wal_record_projection {
             is_symmetric: false,
             properties_blob: vec![],
             agent_id: AgentId::default(),
+            relation_type_intern_hint: None,
         };
         let r = rec(WalPayload::RelationSupersede(RelationSupersedePayload {
             old_relation_id: relid(5),

@@ -36,7 +36,7 @@ use crate::edges::edge::EdgeKind;
 use crate::ids::RelationTypeId;
 
 /// A reference to an edge label. The substrate uses [`EdgeKind`]; the
-/// knowledge layer uses typed relations keyed by [`RelationTypeId`].
+/// phase bodies uses typed relations keyed by [`RelationTypeId`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum EdgeKindRef {
     /// One of the eight substrate edge kinds.

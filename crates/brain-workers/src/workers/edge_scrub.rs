@@ -325,7 +325,7 @@ fn collect_orphans_in(
 }
 
 /// Are both endpoints live in `MEMORIES_TABLE`? Non-`Memory` endpoints
-/// (entities) are considered alive — entity liveness is the knowledge
+/// (entities) are considered alive — entity liveness is the typed-graph
 /// layer's responsibility, not this scrub worker.
 fn endpoints_alive(
     memories: &redb::ReadOnlyTable<[u8; 16], brain_metadata::tables::memory::MemoryMetadata>,

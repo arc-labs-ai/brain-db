@@ -149,6 +149,8 @@ fn recall_req(cue: &str, top_k: u32, txn: Option<[u8; 16]>) -> RecallRequest {
         include_text: false,
         request_id: None,
         txn_id: txn,
+        agent_filter: Vec::new(),
+        include_other_agents: false,
     }
 }
 
@@ -1254,7 +1256,7 @@ fn txn_rejects_op_beyond_1000_cap() {
                 .unwrap_or_else(|e| panic!("encode #{i} failed: {e:?}"));
         }
         // The 1001st op must fail with TransactionTooLarge carrying
-        // the current ops count + cap, so the SDK can surface a useful
+        // the current ops count + cap, so the client can surface a useful
         // message.
         let err = buffer_encode(&fix, txn, 1000).await.unwrap_err();
         match err {
@@ -1265,7 +1267,7 @@ fn txn_rejects_op_beyond_1000_cap() {
             other => panic!("expected TransactionTooLarge, got {other:?}"),
         }
         // Wire-level error code maps to the dedicated TransactionTooLarge
-        // code (not generic Conflict or InvalidArgument) so SDK clients
+        // code (not generic Conflict or InvalidArgument) so clients
         // can detect it programmatically.
         let err = buffer_encode(&fix, txn, 1001).await.unwrap_err();
         assert_eq!(err.error_code(), ErrorCode::TransactionTooLarge);

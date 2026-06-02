@@ -1,0 +1,11 @@
+{
+  "code": 1,
+  "category": 0,
+  "message": "fixed error message",
+  "details": {
+    "field": "top_k",
+    "expected": "[1, 1000]",
+    "actual": "5000"
+  },
+  "retry_after_ms": null
+}

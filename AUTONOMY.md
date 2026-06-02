@@ -15,7 +15,7 @@ LOOP:
   1. Read current state:
      - git status, git log -5
      - last commit's tag (phase-N-task-M-complete or similar)
-     - check ROADMAP.md and the active docs/development/phases/phase-NN-*.md
+     - check ROADMAP.md for the active milestone and `git log` for recent landings
 
   2. Decide the next sub-task:
      - The lowest-numbered sub-task in the current phase that isn't ✓ done
@@ -233,13 +233,13 @@ The biggest autonomous-mode failure mode is scope creep — "while I'm here, let
 - ❌ Don't optimize speculatively.
 - ❌ Don't add abstractions for hypothetical future users.
 - ✓ Do exactly what the sub-task says.
-- ✓ Do file an issue (or note in `docs/notes/`) if you spot something worth doing later.
+- ✓ Do file an issue (or note in `.claude/notes/`) if you spot something worth doing later.
 
 Scope creep is how 1-day phases become 1-week phases.
 
-## 13. The "doc/notes/" practice
+## 13. The ".claude/notes/" practice
 
-For thoughts that don't belong in the spec or in a commit message — observations, future-work ideas, gotchas — write a dated note in `docs/notes/YYYY-MM-DD-topic.md`.
+For thoughts that don't belong in the spec or in a commit message — observations, future-work ideas, gotchas — write a dated note in `.claude/notes/YYYY-MM-DD-topic.md`.
 
 Format:
 
@@ -377,7 +377,7 @@ Brain stores four record types — Memory, Entity, Statement, Relation — in on
 
 ### Spec precedence
 
-The spec is being restructured per [`docs/development/spec-restructure-plan.md`](docs/development/spec-restructure-plan.md). Until that lands, the current sections still apply: hybrid retrieval lives in §23, wire opcodes in §03, workers in §11, SDK in §13. `RECALL` runs the hybrid retrieval path when a schema is declared.
+The spec is the single source of truth and wins over any other doc. When code disagrees with spec, fix the code. `RECALL` runs the hybrid retrieval path on every shard.
 
 ### Stricter on extractor changes
 

@@ -23,7 +23,7 @@ use thiserror::Error;
 // ErrorCategory.
 // ---------------------------------------------------------------------------
 
-/// Broad error class. Drives the SDK's default retry policy: only
+/// Broad error class. Drives the client's default retry policy: only
 /// `ResourceExhausted`, `Internal`, and `Unavailable` retry by default
 /// (see [`ErrorCategory::is_retryable`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -49,7 +49,7 @@ pub enum ErrorCategory {
 }
 
 impl ErrorCategory {
-    /// Whether the SDK should retry by default. Three retryable
+    /// Whether the client should retry by default. Three retryable
     /// categories: `ResourceExhausted`, `Internal`, `Unavailable`.
     #[must_use]
     pub fn is_retryable(self) -> bool {
@@ -83,7 +83,7 @@ pub enum ErrorCode {
     OversizePayload,
     ReservedFieldNonZero,
     BadFlagCombination,
-    MalformedRkyv,
+    MalformedPayload,
     MalformedVector,
 
     // Connection / handshake
@@ -236,7 +236,7 @@ impl ErrorCode {
             | Self::OversizePayload
             | Self::ReservedFieldNonZero
             | Self::BadFlagCombination
-            | Self::MalformedRkyv
+            | Self::MalformedPayload
             | Self::MalformedVector => ErrorCategory::Protocol,
 
             // Connection / handshake — version + auth-method failures are
@@ -374,7 +374,7 @@ pub enum ProtocolError {
     /// Frame flags are mutually inconsistent.
     #[error("bad flag combination: {0}")]
     BadFlagCombination(String),
-    /// Payload failed structural validation (rkyv / vector layout).
+    /// Payload failed structural validation (CBOR / vector layout).
     #[error("malformed payload: {0}")]
     MalformedPayload(String),
 }
@@ -394,7 +394,7 @@ impl ProtocolError {
             Self::Truncated { .. } => ErrorCode::BadFrame,
             Self::BadFrame(_) => ErrorCode::BadFrame,
             Self::BadFlagCombination(_) => ErrorCode::BadFlagCombination,
-            Self::MalformedPayload(_) => ErrorCode::MalformedRkyv,
+            Self::MalformedPayload(_) => ErrorCode::MalformedPayload,
         }
     }
 
@@ -501,7 +501,7 @@ mod tests {
             ProtocolError::Truncated { have: 0, need: 32 },
             ProtocolError::BadFrame("x".into()),
             ProtocolError::BadFlagCombination("EOS+MPL".into()),
-            ProtocolError::MalformedPayload("rkyv check failed".into()),
+            ProtocolError::MalformedPayload("CBOR decode failed".into()),
         ];
         for e in samples {
             assert_eq!(
@@ -554,7 +554,7 @@ mod tests {
         );
         assert_eq!(
             ProtocolError::MalformedPayload("z".into()).code(),
-            ErrorCode::MalformedRkyv
+            ErrorCode::MalformedPayload
         );
     }
 

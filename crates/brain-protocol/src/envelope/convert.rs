@@ -8,7 +8,7 @@
 //! domain types are local (orphan rules).
 //!
 //! What stays here are the enum mirrors that exist only in this crate
-//! because rkyv's closed-world derive needs concrete enums:
+//! because the wire needs closed, concrete enums:
 //! `MemoryKindWire`, `EdgeKindWire`. Those map back to `brain_core`'s
 //! `MemoryKind` / `EdgeKind` via the impls below.
 

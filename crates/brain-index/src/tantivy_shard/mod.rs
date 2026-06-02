@@ -74,7 +74,7 @@ impl std::fmt::Debug for IndexHandle {
 }
 
 /// Per-shard handle bundle. Always carries both indexes — a shard
-/// without one of them is not a valid knowledge-layer shard.
+/// without one of them is not a valid opaque-body shard.
 #[derive(Debug)]
 pub struct TantivyShard {
     pub memory_text: IndexHandle,

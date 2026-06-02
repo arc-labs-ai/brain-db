@@ -1,23 +1,21 @@
 //! Cognitive-op requests: ENCODE / ENCODE_VECTOR_DIRECT / RECALL / PLAN /
 //! REASON / FORGET.
 
-use rkyv::{Archive, Deserialize, Serialize};
-
 use crate::envelope::request::{WireContextId, WireMemoryId, WireUuid};
 use crate::shared::primitives::{
     EdgeKindWire, ForgetMode, MemoryKindWire, ObservationInput, PlanState, PlanStrategy,
 };
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EncodeRequest {
     pub text: String,
     pub context_id: WireContextId,
     pub kind: MemoryKindWire,
     pub salience_hint: f32,
     pub edges: Vec<EdgeRequest>,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
     pub deduplicate: bool,
 }
@@ -34,9 +32,7 @@ pub struct EncodeRequest {
 /// shard's currently-loaded model. Both checks fail with
 /// `InvalidArgument` carrying a precise human-readable reason — power
 /// users get to debug their embed pipeline.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EncodeVectorDirectRequest {
     /// Text that produced the vector. Stored verbatim (for tantivy +
     /// future re-embedding). May be empty when the upstream embedder
@@ -47,34 +43,41 @@ pub struct EncodeVectorDirectRequest {
     /// The L2-normalised embedding (384 floats for the BGE-small v1
     /// fingerprint Brain ships with). Server validates length matches
     /// `brain_embed::VECTOR_DIM` and the norm is within tolerance.
+    ///
+    /// Excluded from the CBOR map: the floats ride the trailing raw
+    /// little-endian `f32` section of the payload at full precision (CBOR
+    /// would tag each float and round to half-precision). The encode arm
+    /// appends them; the decode arm repopulates this field from the
+    /// trailing bytes. `serde(default)` lets the CBOR-only decode
+    /// reconstruct the struct with an empty vector before it is filled.
+    #[serde(skip, default)]
     pub vector: Vec<f32>,
     /// Fingerprint of the model that produced `vector`. Must match
     /// the shard's loaded model fingerprint — a mismatch fails the
     /// write because the resulting memory would be unsearchable
     /// against future text-cued recalls.
+    #[serde(with = "serde_bytes")]
     pub model_fingerprint: [u8; 16],
     pub context_id: WireContextId,
     pub kind: MemoryKindWire,
     pub salience_hint: f32,
     pub edges: Vec<EdgeRequest>,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
     pub deduplicate: bool,
 }
 
 /// Edge attached to an `ENCODE_REQ`.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EdgeRequest {
     pub target: WireMemoryId,
     pub kind: EdgeKindWire,
     pub weight: f32,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RecallRequest {
     pub cue_text: String,
     pub top_k: u32,
@@ -96,9 +99,11 @@ pub struct RecallRequest {
     /// text. Costs one batched read against the per-shard `texts`
     /// table. When unset, `MemoryResult.text` is the empty string.
     pub include_text: bool,
+    #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub request_id: Option<WireUuid>,
     /// When set, RECALL reads against a snapshot that includes the
     /// txn's pending writes (read-your-writes).
+    #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
     /// Explicit agent-id scope for the recall. Controls cross-agent
     /// isolation together with `include_other_agents`:
@@ -109,6 +114,7 @@ pub struct RecallRequest {
     ///     regardless of who the caller is.
     ///   * any value + `include_other_agents == true` — see that flag;
     ///     no implicit caller filter is applied.
+    #[serde(with = "crate::codec::cbor::vec_byte_array16")]
     pub agent_filter: Vec<WireUuid>,
     /// When true, the server does NOT inject the implicit
     /// caller-agent filter, yielding the across-agents view. Combined
@@ -118,32 +124,28 @@ pub struct RecallRequest {
     pub include_other_agents: bool,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlanRequest {
     pub start: PlanState,
     pub goal: PlanState,
     pub budget: PlanBudget,
     pub strategy_hint: Option<PlanStrategy>,
     pub context_filter: Option<Vec<WireContextId>>,
+    #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub request_id: Option<WireUuid>,
+    #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
 }
 
 /// — plan budget.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlanBudget {
     pub max_steps: u32,
     pub max_wall_time_ms: u32,
     pub max_branches_explored: u32,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ReasonRequest {
     pub observation: ObservationInput,
     pub depth: u32,
@@ -151,17 +153,19 @@ pub struct ReasonRequest {
     pub context_filter: Option<Vec<WireContextId>>,
     pub max_inferences: u32,
     pub budget_wall_time_ms: u32,
+    #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub request_id: Option<WireUuid>,
+    #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ForgetRequest {
     pub memory_id: WireMemoryId,
     pub mode: ForgetMode,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
 }
 
@@ -174,9 +178,7 @@ use crate::shared::enums::{
 };
 
 /// `ENCODE_RESP`.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EncodeResponse {
     pub memory_id: WireMemoryId,
     pub was_deduplicated: bool,
@@ -190,6 +192,7 @@ pub struct EncodeResponse {
     pub lsn: u64,
     /// Agent the row was attributed to. Echoes the connection's
     /// AUTH-time agent so the client can verify routing.
+    #[serde(with = "serde_bytes")]
     pub agent_id: WireUuid,
     /// Context the row was filed under. Echoes the request's
     /// `context_id`.
@@ -205,6 +208,7 @@ pub struct EncodeResponse {
     pub edges_out_count: u32,
     /// Embedding-model fingerprint stamped on the row. Lets the
     /// client detect when a model migration would change the vector.
+    #[serde(with = "serde_bytes")]
     pub embedding_model_fp: [u8; 16],
     /// Background stages this write queued. Each entry will emit a
     /// `SubscriptionEvent` with `event_type == StageCompleted` once
@@ -224,9 +228,7 @@ pub struct EncodeResponse {
 }
 
 /// — one streaming RECALL frame.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RecallResponseFrame {
     pub results: Vec<MemoryResult>,
     pub is_final: bool,
@@ -234,9 +236,7 @@ pub struct RecallResponseFrame {
     pub estimated_remaining: Option<u32>,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryResult {
     pub memory_id: WireMemoryId,
     pub text: String,
@@ -247,6 +247,7 @@ pub struct MemoryResult {
     /// Agent that owns this memory row. Lets the client see provenance
     /// and, on a cross-agent recall (`include_other_agents == true` or
     /// an explicit `agent_filter`), tell whose memory each hit is.
+    #[serde(with = "serde_bytes")]
     pub agent_id: WireUuid,
     pub context_id: WireContextId,
     pub created_at_unix_nanos: u64,
@@ -315,9 +316,7 @@ pub struct MemoryResult {
 ///   * relations — 5 (top by `created_at_unix_nanos` desc, both
 ///     incoming and outgoing typed edges incident to mentioned
 ///     entities)
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GraphEnrichment {
     pub entities: Vec<EnrichedEntity>,
     pub statements: Vec<EnrichedStatement>,
@@ -327,10 +326,9 @@ pub struct GraphEnrichment {
 /// Wire form of one entity mentioned by the recalled memory. Carries
 /// the canonical name + type label so the renderer doesn't need to
 /// follow back-references to the entity table.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EnrichedEntity {
+    #[serde(with = "serde_bytes")]
     pub id: [u8; 16],
     pub name: String,
     /// Human-readable `"namespace:typename"` (or bare `"typename"` for
@@ -342,10 +340,9 @@ pub struct EnrichedEntity {
 /// Wire form of one statement sourced by the recalled memory.
 /// `predicate` and `object_label` are pre-rendered server-side so the
 /// renderer doesn't have to chase predicate-id / object-blob lookups.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EnrichedStatement {
+    #[serde(with = "serde_bytes")]
     pub id: [u8; 16],
     pub subject_name: String,
     pub predicate: String,
@@ -358,18 +355,14 @@ pub struct EnrichedStatement {
 /// Wire form of one typed relation incident to an entity mentioned by
 /// the recalled memory. `predicate` is the human-readable name of the
 /// relation type (e.g. `"works_at"`, `"lives_in"`).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EnrichedRelation {
     pub from_name: String,
     pub predicate: String,
     pub to_name: String,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EdgeView {
     pub target: WireMemoryId,
     pub kind: EdgeKindWire,
@@ -377,18 +370,14 @@ pub struct EdgeView {
 }
 
 /// — one streaming PLAN frame.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlanResponseFrame {
     pub steps: Vec<PlanStep>,
     pub is_final: bool,
     pub plan_status: Option<PlanStatus>,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlanStep {
     pub step_index: u32,
     pub memory_id: WireMemoryId,
@@ -399,18 +388,14 @@ pub struct PlanStep {
 }
 
 /// — one streaming REASON frame.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ReasonResponseFrame {
     pub inferences: Vec<InferenceStep>,
     pub is_final: bool,
     pub reason_status: Option<ReasonStatus>,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct InferenceStep {
     pub step_index: u32,
     pub claim: String,
@@ -420,9 +405,7 @@ pub struct InferenceStep {
     pub inference_kind: InferenceKind,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ForgetResponse {
     pub memory_id: WireMemoryId,
     pub was_already_forgotten: bool,
@@ -434,29 +417,29 @@ pub struct ForgetResponse {
 // ============================================================
 
 /// — `LINK_REQ` body. Creates an edge between two memories.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LinkRequest {
     pub source: WireMemoryId,
     pub target: WireMemoryId,
     pub kind: EdgeKindWire,
     /// `[0, 1]` for most kinds; `[-1, 1]` for `Contradicts`.
     pub weight: f32,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
 }
 
 /// — `UNLINK_REQ` body. Removes an edge identified by the
 /// `(source, kind, target)` triple.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UnlinkRequest {
     pub source: WireMemoryId,
     pub target: WireMemoryId,
     pub kind: EdgeKindWire,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
 }
 
@@ -465,9 +448,7 @@ pub struct UnlinkRequest {
 // ============================================================
 
 /// — `LINK_RESP` body.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LinkResponse {
     pub source: WireMemoryId,
     pub target: WireMemoryId,
@@ -480,9 +461,7 @@ pub struct LinkResponse {
 }
 
 /// — `UNLINK_RESP` body.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UnlinkResponse {
     pub source: WireMemoryId,
     pub target: WireMemoryId,
@@ -490,4 +469,99 @@ pub struct UnlinkResponse {
     /// `true` if the edge existed and was removed; `false` if it
     /// didn't exist (UNLINK is idempotent — non-existent = no-op).
     pub removed: bool,
+}
+
+#[cfg(test)]
+mod serde_smoke {
+    use super::*;
+
+    // Proves the additive serde derives actually function: a JSON
+    // round-trip of one representative payload. The codec path is
+    // covered by the round-trip tests in request.rs / response.rs.
+    #[test]
+    fn encode_request_serde_json_round_trips() {
+        let req = EncodeRequest {
+            text: "hello world".to_string(),
+            context_id: 1,
+            kind: MemoryKindWire::Episodic,
+            salience_hint: 0.25,
+            edges: vec![EdgeRequest {
+                target: 0,
+                kind: EdgeKindWire::Caused,
+                weight: 0.9,
+            }],
+            request_id: [7u8; 16],
+            txn_id: Some([8u8; 16]),
+            deduplicate: true,
+        };
+        let j = serde_json::to_vec(&req).expect("serde_json encode");
+        let back: EncodeRequest = serde_json::from_slice(&j).expect("serde_json decode");
+        assert_eq!(req, back);
+    }
+
+    // The raw embedding for ENCODE_VECTOR_DIRECT rides the trailing raw
+    // section of the frame payload, not the CBOR map. This proves three
+    // things at once:
+    //   1. the floats survive an encode/decode round-trip bit-for-bit,
+    //   2. the CBOR section is *independent* of the vector contents
+    //      (changing the vector does not change the CBOR prefix length —
+    //      the floats are not encoded inside the map), and
+    //   3. the raw f32 bytes appear exactly once on the wire (the CBOR
+    //      prefix never contains them), so the total payload length is
+    //      cbor_prefix_len + 4*dim with the prefix invariant to dim.
+    #[test]
+    fn encode_vector_direct_carries_vector_in_trailing_section() {
+        use crate::codec::opcode::Opcode;
+        use crate::envelope::request::RequestBody;
+
+        let vector: Vec<f32> = vec![1.0, -2.5, 3.25, 0.0, 42.0, -0.125];
+        let req = EncodeVectorDirectRequest {
+            text: "precomputed".into(),
+            vector: vector.clone(),
+            model_fingerprint: [0xAB; 16],
+            context_id: 9,
+            kind: MemoryKindWire::Semantic,
+            salience_hint: 0.5,
+            edges: vec![],
+            request_id: [3u8; 16],
+            txn_id: None,
+            deduplicate: false,
+        };
+
+        // Same struct, different vector. Because `vector` is skipped from
+        // CBOR, the two CBOR prefixes must be byte-identical — this is
+        // what proves the floats are not double-encoded into the map.
+        let mut req_other = req.clone();
+        req_other.vector = vec![9.0; 32];
+        let cbor_a = crate::codec::cbor::to_cbor_bytes(&req);
+        let cbor_b = crate::codec::cbor::to_cbor_bytes(&req_other);
+        assert_eq!(
+            cbor_a, cbor_b,
+            "CBOR prefix must be invariant to vector contents (single-encode)"
+        );
+
+        // The raw little-endian f32 trailer bytes must NOT appear inside
+        // the CBOR section.
+        let raw = crate::codec::cbor::f32_slice_to_le_bytes(&vector);
+        assert!(
+            !cbor_a.windows(raw.len()).any(|w| w == raw.as_slice()),
+            "CBOR section must not contain the raw f32 vector bytes"
+        );
+
+        let body = RequestBody::EncodeVectorDirect(req);
+        let bytes = body.encode();
+
+        assert_eq!(
+            bytes.len(),
+            cbor_a.len() + 4 * vector.len(),
+            "payload == CBOR prefix + 4 bytes per float (single trailer)"
+        );
+
+        let decoded = RequestBody::decode(Opcode::EncodeVectorDirectReq, &bytes)
+            .expect("decode EncodeVectorDirect");
+        match decoded {
+            RequestBody::EncodeVectorDirect(r) => assert_eq!(r.vector, vector),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
 }

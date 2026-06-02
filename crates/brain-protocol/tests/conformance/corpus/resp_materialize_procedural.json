@@ -1,0 +1,25 @@
+{
+  "system_block": "## Behaviors\n- step 1",
+  "statement_ids": [
+    [
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17
+    ]
+  ],
+  "total_candidates": 1,
+  "trimmed_by_budget": false
+}

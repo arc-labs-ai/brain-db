@@ -1,7 +1,5 @@
 //! Entity-op request payloads.
 
-use rkyv::{Archive, Deserialize, Serialize};
-
 use crate::envelope::request::WireUuid;
 
 /// `ENTITY_CREATE` (0x0130).
@@ -11,22 +9,20 @@ use crate::envelope::request::WireUuid;
 /// arrive via the schema DSL. `attributes_blob` is opaque (typed
 /// accessors are a follow-up). `aliases` are stored verbatim,
 /// normalized inside the handler.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityCreateRequest {
     pub entity_type_id: u32,
     pub canonical_name: String,
     pub aliases: Vec<String>,
     pub attributes_blob: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
 /// `ENTITY_GET` (0x0131).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EntityGetRequest {
+    #[serde(with = "serde_bytes")]
     pub entity_id: WireUuid,
 }
 
@@ -35,16 +31,16 @@ pub struct EntityGetRequest {
 /// Carries the **full desired state** for the mutable fields. The
 /// handler reads the current row, applies the delta, and writes back
 /// inside one redb transaction (per `brain-metadata::entity_ops::entity_update`).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityUpdateRequest {
+    #[serde(with = "serde_bytes")]
     pub entity_id: WireUuid,
     /// New canonical_name (the handler treats unchanged-vs-rename
     /// using the same comparison as `entity_update`).
     pub canonical_name: String,
     pub aliases: Vec<String>,
     pub attributes_blob: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
@@ -55,54 +51,52 @@ pub struct EntityUpdateRequest {
 /// with the swap. The handler currently always moves to alias
 /// (matching `brain-metadata::entity_ops::entity_rename`); the flag is
 /// here for forward compat with a future "no-trail" mode.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityRenameRequest {
+    #[serde(with = "serde_bytes")]
     pub entity_id: WireUuid,
     pub new_canonical_name: String,
     pub move_to_alias: bool,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
 /// `ENTITY_MERGE` (0x0134).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityMergeRequest {
+    #[serde(with = "serde_bytes")]
     pub survivor: WireUuid,
+    #[serde(with = "serde_bytes")]
     pub merged: WireUuid,
     pub confidence: f32,
     pub reason: String,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
 /// `ENTITY_UNMERGE` (0x0135).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EntityUnmergeRequest {
+    #[serde(with = "serde_bytes")]
     pub merged_entity: WireUuid,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
 /// `ENTITY_RESOLVE` (0x0136).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityResolveRequest {
     pub candidate_name: String,
     pub context: String,
     /// `0` = no hint; otherwise an EntityTypeId.
     pub entity_type_hint: u32,
     pub allow_create: bool,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
 /// `ENTITY_LIST` (0x0137).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityListRequest {
     /// `0` = no filter; otherwise an EntityTypeId.
     pub entity_type_id: u32,
@@ -119,12 +113,12 @@ pub struct EntityListRequest {
 }
 
 /// `ENTITY_TOMBSTONE` (0x0138).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityTombstoneRequest {
+    #[serde(with = "serde_bytes")]
     pub entity_id: WireUuid,
     pub reason: String,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
@@ -230,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn knowledge_opcode_byte_assignments() {
+    fn graph_opcode_byte_assignments() {
         assert_eq!(Opcode::EntityCreateReq.as_u16(), 0x0130);
         assert_eq!(Opcode::EntityCreateResp.as_u16(), 0x01B0);
         assert_eq!(Opcode::EntityGetReq.as_u16(), 0x0131);
@@ -406,12 +400,11 @@ mod tests {
 
 /// Read-side view of an entity. Mirrors `brain_core::Entity` but uses
 /// wire-domain primitives (`[u8; 16]` for the entity id, `u32` for the
-/// type id) so the rkyv derive fires without coupling `brain-core`
-/// value types to rkyv.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+/// type id) so the wire types stay decoupled from `brain-core`
+/// value types.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityView {
+    #[serde(with = "serde_bytes")]
     pub entity_id: WireUuid,
     pub entity_type_id: u32,
     pub canonical_name: String,
@@ -421,70 +414,62 @@ pub struct EntityView {
     pub mention_count: u32,
     pub created_at_unix_nanos: u64,
     pub updated_at_unix_nanos: u64,
-    /// `[0; 16]` when not merged (rkyv archive derives don't play well
-    /// with `Option<[u8; 16]>` here; consumers treat all-zero as None).
+    /// `[0; 16]` when not merged (the wire form avoids `Option<[u8; 16]>`;
+    /// consumers treat all-zero as None).
+    #[serde(with = "serde_bytes")]
     pub merged_into: WireUuid,
     pub embedding_version: u32,
     pub flags: u32,
 }
 
 /// Reply to `ENTITY_CREATE`.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EntityCreateResponse {
+    #[serde(with = "serde_bytes")]
     pub entity_id: WireUuid,
 }
 
 /// Reply to `ENTITY_GET`.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityGetResponse {
     pub entity: EntityView,
 }
 
 /// Reply to `ENTITY_UPDATE`. Carries the post-update view for the
 /// client's convenience (avoids a follow-up `ENTITY_GET`).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityUpdateResponse {
     pub entity: EntityView,
 }
 
 /// Reply to `ENTITY_RENAME`. Carries the post-rename view.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityRenameResponse {
     pub entity: EntityView,
 }
 
 /// Reply to `ENTITY_MERGE`.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EntityMergeResponse {
     /// MergeId (the audit row id), not an EntityId.
+    #[serde(with = "serde_bytes")]
     pub audit_id: WireUuid,
     pub grace_period_seconds: u64,
 }
 
 /// Reply to `ENTITY_UNMERGE`.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EntityUnmergeResponse {
+    #[serde(with = "serde_bytes")]
     pub restored_entity_id: WireUuid,
 }
 
 /// `ResolutionOutcome` wire enum — mirrors `brain_core::ResolutionOutcome`
-/// but flattened to a u8 for rkyv-archive simplicity.
+/// but flattened to a u8 for wire simplicity.
 ///
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum ResolutionOutcomeWire {
     Resolved = 1,
@@ -494,9 +479,7 @@ pub enum ResolutionOutcomeWire {
 }
 
 /// Reply to `ENTITY_RESOLVE`.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityResolveResponse {
     pub outcome: ResolutionOutcomeWire,
     /// Which tier resolved (1..=5; 0 if unresolved).
@@ -504,17 +487,18 @@ pub struct EntityResolveResponse {
     pub confidence: f32,
     /// Populated when outcome == Resolved or Created (single id).
     /// `[0; 16]` for Ambiguous / NotFound.
+    #[serde(with = "serde_bytes")]
     pub resolved_entity: WireUuid,
     /// Populated when outcome == Ambiguous; ranked by score.
+    #[serde(with = "crate::codec::cbor::vec_byte_array16")]
     pub candidate_ids: Vec<WireUuid>,
     /// `[0; 16]` unless an ambiguity audit was written.
+    #[serde(with = "serde_bytes")]
     pub audit_id: WireUuid,
 }
 
 /// One entity in an `ENTITY_LIST` response batch.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityListItem {
     pub entity: EntityView,
 }
@@ -525,9 +509,7 @@ pub struct EntityListItem {
 ///
 /// v1 emits a single frame with `is_final = true` carrying the entire
 /// snapshot. A later cut splits this into per-batch streaming.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityListResponseFrame {
     pub items: Vec<EntityListItem>,
     /// Empty on intermediate frames; populated only on the final
@@ -551,9 +533,7 @@ impl EntityListResponseFrame {
 }
 
 /// Reply to `ENTITY_TOMBSTONE`.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EntityTombstoneResponse {
     pub tombstoned_at_unix_nanos: u64,
 }

@@ -22,19 +22,15 @@ pub fn apply_upsert_statement(
     phase: &Phase,
     _write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
+    // Only the fields the apply path needs directly: the predicate
+    // resolution + idempotency stamp. The rest of the row is built by
+    // `statement_from_upsert_phase` (shared with the WAL-mapping path).
     let Phase::UpsertStatement {
         id,
-        kind,
-        subject,
         predicate,
-        object,
-        confidence,
-        evidence,
-        valid_from_unix_nanos,
-        extractor,
         extracted_at_unix_nanos,
-        schema_version,
         predicate_intern_hint,
+        ..
     } = phase
     else {
         return Err(ApplyError::PhaseMisShape("expected UpsertStatement"));
@@ -56,20 +52,8 @@ pub fn apply_upsert_statement(
         .map_err(|e| ApplyError::Metadata(format!("predicate_intern_or_get: {e}")))?,
     };
 
-    let evidence_ref = build_evidence_ref(evidence);
-    let mut s = Statement::new_root(
-        *id,
-        *kind,
-        *subject,
-        resolved_predicate,
-        object.clone(),
-        *confidence,
-        evidence_ref,
-        *extractor,
-        *extracted_at_unix_nanos,
-        *schema_version,
-    );
-    s.valid_from_unix_nanos = *valid_from_unix_nanos;
+    let s = statement_from_upsert_phase(phase, resolved_predicate)
+        .ok_or(ApplyError::PhaseMisShape("expected UpsertStatement"))?;
     statement_create(wtxn, &s, *extracted_at_unix_nanos)
         .map_err(|e| ApplyError::Metadata(format!("statement_create: {e}")))?;
 
@@ -169,6 +153,49 @@ pub fn apply_tombstone_statement(
         target: *target,
         tombstoned_at_unix_nanos: *at_unix_nanos,
     })
+}
+
+/// Build the [`Statement`] a [`Phase::UpsertStatement`] describes, given
+/// the resolved predicate. Shared by the apply path (which interns the
+/// predicate inside its wtxn, then persists) and the WAL-mapping path
+/// (which passes the phase's placeholder predicate and carries the intern
+/// hint for recovery to re-resolve) — so both agree on every
+/// non-predicate field. Returns `None` for any other phase shape.
+pub(crate) fn statement_from_upsert_phase(
+    phase: &Phase,
+    predicate: brain_core::PredicateId,
+) -> Option<Statement> {
+    let Phase::UpsertStatement {
+        id,
+        kind,
+        subject,
+        object,
+        confidence,
+        evidence,
+        valid_from_unix_nanos,
+        extractor,
+        extracted_at_unix_nanos,
+        schema_version,
+        ..
+    } = phase
+    else {
+        return None;
+    };
+    let evidence_ref = build_evidence_ref(evidence);
+    let mut s = Statement::new_root(
+        *id,
+        *kind,
+        *subject,
+        predicate,
+        object.clone(),
+        *confidence,
+        evidence_ref,
+        *extractor,
+        *extracted_at_unix_nanos,
+        *schema_version,
+    );
+    s.valid_from_unix_nanos = *valid_from_unix_nanos;
+    Some(s)
 }
 
 fn build_evidence_ref(phase_ref: &EvidenceRefPhase) -> EvidenceRef {

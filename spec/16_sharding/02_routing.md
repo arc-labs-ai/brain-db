@@ -166,15 +166,15 @@ If a request lands on the wrong shard (a stale routing table, or a misconfigured
 
 Proxying isn't implemented in v1. Clients are expected to use the correct routing.
 
-## 15. The SDK's role
+## 15. The client's role
 
-Client SDKs handle routing transparently:
+Clients handle routing transparently:
 
-- The SDK has the routing table.
+- The client has the routing table.
 - Each request is sent directly to the correct shard.
-- If the routing table is stale, the SDK handles `WrongShard` errors and refreshes.
+- If the routing table is stale, the client handles `WrongShard` errors and refreshes.
 
-For most users, routing is invisible. The SDK abstracts it away.
+For most users, routing is invisible. The client abstracts it away.
 
 ## 16. The "all shards" fan-out
 
@@ -201,7 +201,7 @@ Once a deployment is configured, routing is stable:
 - Same agent → same shard (assuming overrides don't change).
 - Same memory → same shard (encoded in the ID).
 
-This stability matters for client SDKs (caching) and for application correctness (no surprise migrations).
+This stability matters for clients (caching) and for application correctness (no surprise migrations).
 
 ---
 
@@ -341,7 +341,7 @@ If a request arrives at the wrong shard for an agent:
 
 - The shard checks the agents table; finds no record (the agent isn't here).
 - Returns a `WrongShard` error with the correct shard's ID.
-- The client (or SDK) retries on the correct shard.
+- The client retries on the correct shard.
 
 This handles routing-table staleness gracefully. The client refreshes its routing and retries.
 

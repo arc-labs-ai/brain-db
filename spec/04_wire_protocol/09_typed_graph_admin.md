@@ -2,7 +2,7 @@
 
 Request/response body schemas for the typed-graph "operation" opcodes — schema management (`0x0120–0x0126`), SUBSCRIBE event payloads carrying typed-graph deltas, the schema-optional / schemaless dispatch gate, hybrid query (`0x0160–0x0163`), and admin operations (`0x0170–0x0177`). These opcodes orchestrate the noun-frame surface defined in [`./08_typed_graph_frames.md`](./08_typed_graph_frames.md).
 
-Brain's wire protocol — 32-byte header, opcode framing, CRC32C, payload encoding — is covered in [`./02_wire_format.md`](./02_wire_format.md), [`./03_opcodes.md`](./03_opcodes.md), and [`./05_frame_layouts.md`](./05_frame_layouts.md). This file specifies only the rkyv-archived structs that live inside the request/response payloads for the operation opcodes.
+Brain's wire protocol — 32-byte header, opcode framing, CRC32C, payload encoding — is covered in [`./02_wire_format.md`](./02_wire_format.md), [`./03_opcodes.md`](./03_opcodes.md), and [`./05_frame_layouts.md`](./05_frame_layouts.md). This file specifies only the CBOR field schemas of the request/response payloads for the operation opcodes.
 
 Cross-references:
 - [`./08_typed_graph_frames.md`](./08_typed_graph_frames.md) — entity / statement / relation noun frames.
@@ -29,7 +29,7 @@ Request/response body schemas for every opcode in the `0x0120–0x012F` schema r
 
 Responses live at `0x01A0–0x01A6` (low byte with high bit set).
 
-All structs derive `Archive + Serialize + Deserialize + check_bytes` per the entity-frames rkyv conventions in [`./08_typed_graph_frames.md`](./08_typed_graph_frames.md).
+All payloads follow the CBOR field-schema conventions in [`./08_typed_graph_frames.md`](./08_typed_graph_frames.md).
 
 ### SCHEMA_UPLOAD (0x0120)
 
@@ -312,7 +312,7 @@ pub enum KnowledgeEventPayload {
 }
 ```
 
-Each variant is rkyv-archivable. Variants for ops not yet implemented carry typed shells; only the entity variants land first (in parallel with the merge / tombstone / etc. opcodes).
+Each variant is a CBOR map. Variants for ops not yet implemented carry typed shells; only the entity variants land first (in parallel with the merge / tombstone / etc. opcodes).
 
 #### Entity events
 
@@ -580,7 +580,7 @@ pub struct WelcomeCapabilities {
 }
 ```
 
-SDKs use this to decide:
+Clients use this to decide:
 
 - which schema version to encode typed-graph calls against (pinning); typed derive-macro APIs that depend on declared predicates should be hidden when `!schema_declared`. Untyped (qname-based) typed-graph calls and the cognitive primitives surface in both modes.
 
@@ -667,7 +667,7 @@ pub struct RetrieverSelection {
 
 Semantics:
 
-- The query DSL is structured — combinations of entity / predicate / time / confidence conditions. For text-only queries the SDK builds the DSL automatically (or use `RECALL_HYBRID` below).
+- The query DSL is structured — combinations of entity / predicate / time / confidence conditions. For text-only queries the client builds the DSL (or use `RECALL_HYBRID` below).
 - `RetrieverSelection` lets clients disable retrievers or override per-retriever depth. Setting all three to false → `INVALID_ARGUMENT`.
 - `top_k` is the **final fused** top-K. Per-retriever `top_k`s are typically larger to give RRF a useful candidate pool (default: `4 * top_k`).
 - `budget_wall_time_ms` is a soft budget. The server returns whatever it has when exceeded with `QUERY_TIMEOUT` on the final frame.
@@ -710,7 +710,7 @@ pub struct RetrieverTimings {
 }
 ```
 
-Field discipline: only the field matching `kind` is populated; the others carry zero-filled shapes. This is the rkyv equivalent of a tagged union (avoids the archive-cost of true enums for the per-item path).
+Field discipline: only the field matching `kind` is populated; the others carry zero-filled shapes. This is a tagged-union-by-discriminant shape.
 
 #### `MemoryResult` reuse
 
@@ -743,7 +743,7 @@ S → C  frame: opcode=0x01E0 stream_id=N        body: QueryResultItem  (interme
 S → C  frame: opcode=0x01E0 stream_id=N EOS    body: QueryResultTail  (tail)
 ```
 
-Substrate streaming model: per-frame, `EOS` on the tail. The tail body is a different rkyv struct than the per-item bodies — clients dispatch on `is_final` (set when EOS is set) and decode accordingly.
+Substrate streaming model: per-frame, `EOS` on the tail. The tail body is a different CBOR shape than the per-item bodies — clients dispatch on `is_final` (set when EOS is set) and decode accordingly.
 
 #### Errors
 
@@ -827,7 +827,7 @@ pub struct RetrieverTrace {
 
 #### Performance note
 
-`QUERY_TRACE` is **noticeably slower** than `QUERY` because of the trace bookkeeping. SDKs should expose it as a debug-only operation. Production hot paths use `QUERY` (`0x0160`).
+`QUERY_TRACE` is **noticeably slower** than `QUERY` because of the trace bookkeeping. Clients should expose it as a debug-only operation. Production hot paths use `QUERY` (`0x0160`).
 
 ### RECALL_HYBRID (0x0163)
 

@@ -28,7 +28,7 @@ The `ErrorCategory` enum classifies errors into broad groups:
 | `Internal` | Server bug | Maybe (retry; report if persistent) |
 | `Unavailable` | Shard unavailable, server overloaded | Yes (after retry-after) |
 
-The category drives client retry behavior. The SDK uses category to decide whether to retry, propagate, or fail fast.
+The category drives client retry behavior. The client uses category to decide whether to retry, propagate, or fail fast.
 
 ### 3. Error codes
 
@@ -47,7 +47,7 @@ A more specific error code accompanies each category. The complete table:
 | `OversizePayload` | Payload exceeds server's max |
 | `ReservedFieldNonZero` | A reserved field had a non-zero value |
 | `BadFlagCombination` | Frame flags are mutually inconsistent |
-| `MalformedRkyv` | Rkyv-encoded payload didn't validate |
+| `MalformedPayload` | CBOR payload didn't decode or failed schema validation |
 | `MalformedVector` | Raw vector bytes don't match declared dim or fail norm check |
 
 #### 3.2 Connection / handshake (Category: `Protocol` or `Authentication`)
@@ -231,7 +231,7 @@ For `Overloaded`, it's the server's estimate of when load might subside.
 
 ### 6. Client retry guidance
 
-The SDK's recommended retry policy:
+The recommended client retry policy:
 
 | Error category | Action |
 |---|---|
@@ -282,7 +282,7 @@ S → C: ERROR(stream_id=<encode's stream>, EOS)
          retry_after_ms: None
 ```
 
-The client's SDK maps this to a typed exception (`InvalidArgumentError`) and surfaces it.
+A client maps this to a typed error (`InvalidArgumentError`) and surfaces it.
 
 ### 9. Wire format example: stream cancellation acknowledged
 
@@ -329,14 +329,14 @@ Each log entry includes the connection's session_id and the stream_id of the aff
 
 What the server validates when it receives a frame, and what it rejects. The protocol assumes adversarial input and validates aggressively.
 
-The validation rules MUST be implemented by every conforming server. SDKs SHOULD perform the same validation client-side to fail fast on bugs without round-tripping to the server.
+The validation rules MUST be implemented by every conforming server. Clients SHOULD perform the same validation locally to fail fast on bugs without round-tripping to the server.
 
 ### 13. Layered validation
 
 Validation happens in three layers, in order:
 
 1. **Frame-level** — the 32-byte header is parsed and structurally validated. Bad framing closes the connection.
-2. **Payload-level** — the payload is decoded (rkyv or bytemuck) and structurally validated. Bad payloads return an error frame.
+2. **Payload-level** — the payload is decoded (CBOR for structured fields, little-endian f32 for vectors) and structurally validated. Bad payloads return an error frame.
 3. **Operation-level** — the parameters of a specific opcode are validated against the data model. Bad parameters return an opcode-specific error frame.
 
 Earlier failures take precedence over later ones. If the frame's header is malformed, the payload is never decoded.
@@ -394,11 +394,11 @@ The payload's CRC32C in the header is recomputed against the actual payload byte
 
 For zero-length payloads, the payload CRC field is 0; no CRC check.
 
-#### 15.2 rkyv structural validation
+#### 15.2 CBOR structural validation
 
-For structured payloads encoded with rkyv:
+For structured payloads encoded with CBOR:
 
-- The payload MUST decode without error using rkyv's `check_archived_root` (or equivalent validation API). This catches:
+- The payload MUST decode without error using a standards-conformant CBOR decoder. This catches:
   - Truncated payloads.
   - Out-of-bounds offsets within the payload.
   - Type tag mismatches.
@@ -479,7 +479,7 @@ All ENCODE rules plus:
 
 #### 16.9 Typed-graph opcodes (`0x01xx`)
 
-Typed-graph opcodes use the same two-layer discipline: rkyv structural validation at the wire layer, then handler-layer semantic validation. The rules below run before any storage call.
+Typed-graph opcodes use the same two-layer discipline: CBOR structural validation at the wire layer, then handler-layer semantic validation. The rules below run before any storage call.
 
 ##### 16.9.1 Universal field caps
 
@@ -502,7 +502,7 @@ Violations return `InvalidArgument` (category `Validation`) with `details.field`
 | Field | Rule | Error code |
 |---|---|---|
 | `entity_type_id` | must be > 0 and registered in `entity_types` table | `EntityTypeMismatch` |
-| `canonical_name` | non-empty after `.trim()`; ≤ 256 bytes; valid UTF-8 (rkyv guarantees) | `InvalidArgument` |
+| `canonical_name` | non-empty after `.trim()`; ≤ 256 bytes; valid UTF-8 (validated on decode) | `InvalidArgument` |
 | `canonical_name` (after server-side `normalize_name`) | must not collide with an existing entity of the same `entity_type_id` | `EntityAmbiguous` (duplicate) |
 | `aliases.len()` | ≤ 32 | `InvalidArgument` |
 | each `alias` | non-empty after `.trim()`; ≤ 256 bytes | `InvalidArgument` |
@@ -607,7 +607,7 @@ Aliases are deduplicated server-side on the normalized form before insertion. A 
 
 ##### 16.9.8 Constants
 
-Centralized so SDK clients and the server agree on the same numbers. Defined at `brain-core::knowledge::validation`:
+Centralized so clients and the server agree on the same numbers. Defined at `brain-core::knowledge::validation`:
 
 ```rust
 pub const MAX_IDENT_BYTES: usize        = 256;
@@ -627,7 +627,7 @@ pub const MIN_MERGE_CONFIDENCE: f32     = 0.7;
 
 Per typed-graph request, the server runs validations in this order. The first failure short-circuits with the corresponding error:
 
-1. **rkyv structural check** (`check_archived_root`). `MalformedRkyv` → close frame, keep connection.
+1. **CBOR structural check** (decode + schema). `MalformedPayload` → close frame, keep connection.
 2. **Universal field caps** (§16.9.1). `InvalidArgument`.
 3. **Op-specific field-level rules** (§16.9.2 – §16.9.7). Various codes per table.
 4. **Cross-field rules** (e.g. `survivor != merged`). Op-specific codes.
@@ -691,7 +691,7 @@ This matters for testing and debugging: a frame that fails validation in product
 
 When a validation rule is unclear or under-specified, the server MUST reject. New, unspecified fields, novel opcode parameters, ambiguous flag combinations: all reject by default.
 
-This is the opposite of "best effort". The protocol's premise is that the SDK provides correct frames; anything unrecognized is treated as a bug or attack, not as a feature to be inferred.
+This is the opposite of "best effort". The protocol's premise is that the client provides correct frames; anything unrecognized is treated as a bug or attack, not as a feature to be inferred.
 
 ### 21. Validation error reporting
 
@@ -709,7 +709,7 @@ The server SHOULD include enough detail to diagnose the issue without leaking in
 Validation is on the hot path. Each validation step adds latency. The budget for validation cost is:
 
 - Frame-level: < 100 ns per frame (CRC plus a few comparisons).
-- Payload-level rkyv decode: < 1 µs typical, larger for bigger payloads.
+- Payload-level CBOR decode: single-digit µs typical, larger for bigger payloads.
 - Payload-level bytemuck cast: < 100 ns (no copying, just a length check and a pointer reinterpret).
 - Operation-level: < 5 µs typical.
 

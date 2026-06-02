@@ -1,32 +1,27 @@
 //! Request-frame payload codecs.
 //!
 //! One variant of [`RequestBody`] per server-bound opcode. Structured
-//! fields are encoded with [rkyv] 0.7; raw vector blobs (per
-//! `ENCODE_VECTOR_DIRECT_REQ` and `RECALL_REQ` with a pre-supplied cue
-//! vector) live in the trailing raw section of the payload and are
-//! composed at the [`crate::Frame`] layer — they are *not* part of the
-//! rkyv-encoded bytes this module produces.
+//! fields are CBOR-encoded; the raw embedding blob for
+//! `ENCODE_VECTOR_DIRECT_REQ` lives in the trailing raw section of the
+//! payload and is composed at the [`crate::Frame`] layer — it is *not*
+//! part of the CBOR-encoded bytes this module produces.
 //!
 //! ## Wire-domain types
 //!
 //! Each request struct uses raw representations (`u128` for `MemoryId`,
-//! `[u8; 16]` for UUID-shaped IDs, `u8`-mapped enums) so the
-//! `rkyv::Archive` derive can fire without coupling `brain-core` value
-//! types to rkyv. Conversion between these wire types and `brain_core`
-//! domain types is the operation handler's responsibility.
-//!
-//! [rkyv]: https://docs.rs/rkyv/0.7
+//! `[u8; 16]` for UUID-shaped IDs, `u8`-mapped enums) so the wire types
+//! stay decoupled from `brain-core` value types. Conversion between
+//! these wire types and `brain_core` domain types is the operation
+//! handler's responsibility.
 
-// `PlanState` and `ObservationInput` use `By*` variant naming that mirrors
-// the spec's discriminator phrasing. rkyv's `Archive` derive generates a
-// parallel `ArchivedPlanState` whose variant names are inherited; clippy
-// 1.95+ flags both the source and the macro-generated copy and the
-// per-item `#[allow]` doesn't always reach the macro expansion path. The
-// module-level allow covers both without spreading attribute noise.
+// `PlanState` and `ObservationInput` use `By*` variant naming that
+// mirrors the spec's discriminator phrasing; clippy flags the family as
+// same-prefixed. The module-level allow covers it without spreading
+// attribute noise.
 #![allow(clippy::enum_variant_names)]
 
+use crate::codec::cbor::{from_cbor_bytes, to_cbor_bytes};
 use crate::codec::opcode::Opcode;
-use crate::codec::rkyv::{from_rkyv_bytes, to_rkyv_bytes};
 use crate::connection::handshake::{AuthPayload, HelloPayload};
 use crate::error::ProtocolError;
 
@@ -67,7 +62,7 @@ pub use crate::shared::enums::*;
 pub use crate::shared::primitives::*;
 
 /// One variant per server-bound opcode. The variant carries the
-/// rkyv-archivable structured payload; raw vector blobs (for opcodes
+/// CBOR-encoded structured payload; raw vector blobs (for opcodes
 /// that include them) are appended by the [`crate::Frame`] layer as the
 /// trailing raw section, not by this enum.
 #[derive(Clone, Debug, PartialEq)]
@@ -236,80 +231,84 @@ impl RequestBody {
         }
     }
 
-    /// Encode the structured body to bytes via rkyv. The returned vector
+    /// Encode the structured body to bytes via CBOR. The returned vector
     /// is suitable for placement in a [`crate::Frame::payload`]; vector
     /// blobs (where this opcode supports them) are appended by callers.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Self::Hello(r) => to_rkyv_bytes(r),
-            Self::Auth(r) => to_rkyv_bytes(r),
-            Self::Encode(r) => to_rkyv_bytes(r),
-            Self::EncodeVectorDirect(r) => to_rkyv_bytes(r),
-            Self::Recall(r) => to_rkyv_bytes(r),
-            Self::Plan(r) => to_rkyv_bytes(r),
-            Self::Reason(r) => to_rkyv_bytes(r),
-            Self::Forget(r) => to_rkyv_bytes(r),
-            Self::Link(r) => to_rkyv_bytes(r),
-            Self::Unlink(r) => to_rkyv_bytes(r),
-            Self::Subscribe(r) => to_rkyv_bytes(r),
-            Self::Unsubscribe(r) => to_rkyv_bytes(r),
-            Self::GetCapabilities(r) => to_rkyv_bytes(r),
-            Self::TxnBegin(r) => to_rkyv_bytes(r),
-            Self::TxnCommit(r) => to_rkyv_bytes(r),
-            Self::TxnAbort(r) => to_rkyv_bytes(r),
-            Self::CancelStream(r) => to_rkyv_bytes(r),
-            Self::Ping(r) => to_rkyv_bytes(r),
-            Self::ClientPong(r) => to_rkyv_bytes(r),
-            Self::Bye(r) => to_rkyv_bytes(r),
-            Self::AdminStats(r) => to_rkyv_bytes(r),
-            Self::AdminSnapshot(r) => to_rkyv_bytes(r),
-            Self::AdminRestore(r) => to_rkyv_bytes(r),
-            Self::AdminIntegrityCheck(r) => to_rkyv_bytes(r),
-            Self::AdminMigrateEmbeddings(r) => to_rkyv_bytes(r),
-            Self::AdminCreateContext(r) => to_rkyv_bytes(r),
-            Self::AdminRenameContext(r) => to_rkyv_bytes(r),
-            Self::AdminMoveMemory(r) => to_rkyv_bytes(r),
-            Self::AdminReclassify(r) => to_rkyv_bytes(r),
-            Self::AdminListTombstoned(r) => to_rkyv_bytes(r),
-            Self::AdminBackfill(r) => to_rkyv_bytes(r),
-            Self::AdminBackfillCancel(r) => to_rkyv_bytes(r),
-            Self::EntityCreate(r) => to_rkyv_bytes(r),
-            Self::EntityGet(r) => to_rkyv_bytes(r),
-            Self::EntityUpdate(r) => to_rkyv_bytes(r),
-            Self::EntityRename(r) => to_rkyv_bytes(r),
-            Self::EntityMerge(r) => to_rkyv_bytes(r),
-            Self::EntityUnmerge(r) => to_rkyv_bytes(r),
-            Self::EntityResolve(r) => to_rkyv_bytes(r),
-            Self::EntityList(r) => to_rkyv_bytes(r),
-            Self::EntityTombstone(r) => to_rkyv_bytes(r),
-            Self::StatementCreate(r) => to_rkyv_bytes(r),
-            Self::StatementGet(r) => to_rkyv_bytes(r),
-            Self::StatementSupersede(r) => to_rkyv_bytes(r),
-            Self::StatementTombstone(r) => to_rkyv_bytes(r),
-            Self::StatementRetract(r) => to_rkyv_bytes(r),
-            Self::StatementHistory(r) => to_rkyv_bytes(r),
-            Self::StatementList(r) => to_rkyv_bytes(r),
-            Self::RelationCreate(r) => to_rkyv_bytes(r),
-            Self::RelationGet(r) => to_rkyv_bytes(r),
-            Self::RelationSupersede(r) => to_rkyv_bytes(r),
-            Self::RelationTombstone(r) => to_rkyv_bytes(r),
-            Self::RelationListFrom(r) => to_rkyv_bytes(r),
-            Self::RelationListTo(r) => to_rkyv_bytes(r),
-            Self::RelationTraverse(r) => to_rkyv_bytes(r),
-            Self::SchemaUpload(r) => to_rkyv_bytes(r),
-            Self::SchemaGet(r) => to_rkyv_bytes(r),
-            Self::SchemaList(r) => to_rkyv_bytes(r),
-            Self::SchemaValidate(r) => to_rkyv_bytes(r),
-            Self::SchemaReplace(r) => to_rkyv_bytes(r),
-            Self::ExtractorList(r) => to_rkyv_bytes(r),
-            Self::ExtractorDisable(r) => to_rkyv_bytes(r),
-            Self::ExtractorEnable(r) => to_rkyv_bytes(r),
-            Self::Query(r) => to_rkyv_bytes(r),
-            Self::QueryExplain(r) => to_rkyv_bytes(r),
-            Self::QueryTrace(r) => to_rkyv_bytes(r),
-            Self::RecallHybrid(r) => to_rkyv_bytes(r),
-            Self::MaterializeProcedural(r) => to_rkyv_bytes(r),
+            Self::Hello(r) => to_cbor_bytes(r),
+            Self::Auth(r) => to_cbor_bytes(r),
+            Self::Encode(r) => to_cbor_bytes(r),
+            Self::EncodeVectorDirect(r) => {
+                let mut p = to_cbor_bytes(r);
+                p.extend_from_slice(&crate::codec::cbor::f32_slice_to_le_bytes(&r.vector));
+                p
+            }
+            Self::Recall(r) => to_cbor_bytes(r),
+            Self::Plan(r) => to_cbor_bytes(r),
+            Self::Reason(r) => to_cbor_bytes(r),
+            Self::Forget(r) => to_cbor_bytes(r),
+            Self::Link(r) => to_cbor_bytes(r),
+            Self::Unlink(r) => to_cbor_bytes(r),
+            Self::Subscribe(r) => to_cbor_bytes(r),
+            Self::Unsubscribe(r) => to_cbor_bytes(r),
+            Self::GetCapabilities(r) => to_cbor_bytes(r),
+            Self::TxnBegin(r) => to_cbor_bytes(r),
+            Self::TxnCommit(r) => to_cbor_bytes(r),
+            Self::TxnAbort(r) => to_cbor_bytes(r),
+            Self::CancelStream(r) => to_cbor_bytes(r),
+            Self::Ping(r) => to_cbor_bytes(r),
+            Self::ClientPong(r) => to_cbor_bytes(r),
+            Self::Bye(r) => to_cbor_bytes(r),
+            Self::AdminStats(r) => to_cbor_bytes(r),
+            Self::AdminSnapshot(r) => to_cbor_bytes(r),
+            Self::AdminRestore(r) => to_cbor_bytes(r),
+            Self::AdminIntegrityCheck(r) => to_cbor_bytes(r),
+            Self::AdminMigrateEmbeddings(r) => to_cbor_bytes(r),
+            Self::AdminCreateContext(r) => to_cbor_bytes(r),
+            Self::AdminRenameContext(r) => to_cbor_bytes(r),
+            Self::AdminMoveMemory(r) => to_cbor_bytes(r),
+            Self::AdminReclassify(r) => to_cbor_bytes(r),
+            Self::AdminListTombstoned(r) => to_cbor_bytes(r),
+            Self::AdminBackfill(r) => to_cbor_bytes(r),
+            Self::AdminBackfillCancel(r) => to_cbor_bytes(r),
+            Self::EntityCreate(r) => to_cbor_bytes(r),
+            Self::EntityGet(r) => to_cbor_bytes(r),
+            Self::EntityUpdate(r) => to_cbor_bytes(r),
+            Self::EntityRename(r) => to_cbor_bytes(r),
+            Self::EntityMerge(r) => to_cbor_bytes(r),
+            Self::EntityUnmerge(r) => to_cbor_bytes(r),
+            Self::EntityResolve(r) => to_cbor_bytes(r),
+            Self::EntityList(r) => to_cbor_bytes(r),
+            Self::EntityTombstone(r) => to_cbor_bytes(r),
+            Self::StatementCreate(r) => to_cbor_bytes(r),
+            Self::StatementGet(r) => to_cbor_bytes(r),
+            Self::StatementSupersede(r) => to_cbor_bytes(r),
+            Self::StatementTombstone(r) => to_cbor_bytes(r),
+            Self::StatementRetract(r) => to_cbor_bytes(r),
+            Self::StatementHistory(r) => to_cbor_bytes(r),
+            Self::StatementList(r) => to_cbor_bytes(r),
+            Self::RelationCreate(r) => to_cbor_bytes(r),
+            Self::RelationGet(r) => to_cbor_bytes(r),
+            Self::RelationSupersede(r) => to_cbor_bytes(r),
+            Self::RelationTombstone(r) => to_cbor_bytes(r),
+            Self::RelationListFrom(r) => to_cbor_bytes(r),
+            Self::RelationListTo(r) => to_cbor_bytes(r),
+            Self::RelationTraverse(r) => to_cbor_bytes(r),
+            Self::SchemaUpload(r) => to_cbor_bytes(r),
+            Self::SchemaGet(r) => to_cbor_bytes(r),
+            Self::SchemaList(r) => to_cbor_bytes(r),
+            Self::SchemaValidate(r) => to_cbor_bytes(r),
+            Self::SchemaReplace(r) => to_cbor_bytes(r),
+            Self::ExtractorList(r) => to_cbor_bytes(r),
+            Self::ExtractorDisable(r) => to_cbor_bytes(r),
+            Self::ExtractorEnable(r) => to_cbor_bytes(r),
+            Self::Query(r) => to_cbor_bytes(r),
+            Self::QueryExplain(r) => to_cbor_bytes(r),
+            Self::QueryTrace(r) => to_cbor_bytes(r),
+            Self::RecallHybrid(r) => to_cbor_bytes(r),
+            Self::MaterializeProcedural(r) => to_cbor_bytes(r),
         }
     }
 
@@ -318,77 +317,83 @@ impl RequestBody {
     /// don't carry a request body (responses, error frames).
     pub fn decode(opcode: Opcode, bytes: &[u8]) -> Result<Self, ProtocolError> {
         Ok(match opcode {
-            Opcode::Hello => Self::Hello(from_rkyv_bytes(bytes)?),
-            Opcode::Auth => Self::Auth(from_rkyv_bytes(bytes)?),
-            Opcode::EncodeReq => Self::Encode(from_rkyv_bytes(bytes)?),
-            Opcode::EncodeVectorDirectReq => Self::EncodeVectorDirect(from_rkyv_bytes(bytes)?),
-            Opcode::RecallReq => Self::Recall(from_rkyv_bytes(bytes)?),
-            Opcode::PlanReq => Self::Plan(from_rkyv_bytes(bytes)?),
-            Opcode::ReasonReq => Self::Reason(from_rkyv_bytes(bytes)?),
-            Opcode::ForgetReq => Self::Forget(from_rkyv_bytes(bytes)?),
-            Opcode::LinkReq => Self::Link(from_rkyv_bytes(bytes)?),
-            Opcode::UnlinkReq => Self::Unlink(from_rkyv_bytes(bytes)?),
-            Opcode::SubscribeReq => Self::Subscribe(from_rkyv_bytes(bytes)?),
-            Opcode::UnsubscribeReq => Self::Unsubscribe(from_rkyv_bytes(bytes)?),
-            Opcode::GetCapabilitiesReq => Self::GetCapabilities(from_rkyv_bytes(bytes)?),
-            Opcode::TxnBegin => Self::TxnBegin(from_rkyv_bytes(bytes)?),
-            Opcode::TxnCommit => Self::TxnCommit(from_rkyv_bytes(bytes)?),
-            Opcode::TxnAbort => Self::TxnAbort(from_rkyv_bytes(bytes)?),
-            Opcode::CancelStream => Self::CancelStream(from_rkyv_bytes(bytes)?),
-            Opcode::Ping => Self::Ping(from_rkyv_bytes(bytes)?),
-            Opcode::ClientPong => Self::ClientPong(from_rkyv_bytes(bytes)?),
-            Opcode::Bye => Self::Bye(from_rkyv_bytes(bytes)?),
-            Opcode::AdminStatsReq => Self::AdminStats(from_rkyv_bytes(bytes)?),
-            Opcode::AdminSnapshotReq => Self::AdminSnapshot(from_rkyv_bytes(bytes)?),
-            Opcode::AdminRestoreReq => Self::AdminRestore(from_rkyv_bytes(bytes)?),
-            Opcode::AdminIntegrityCheckReq => Self::AdminIntegrityCheck(from_rkyv_bytes(bytes)?),
-            Opcode::AdminMigrateEmbeddingsReq => {
-                Self::AdminMigrateEmbeddings(from_rkyv_bytes(bytes)?)
+            Opcode::Hello => Self::Hello(from_cbor_bytes(bytes)?),
+            Opcode::Auth => Self::Auth(from_cbor_bytes(bytes)?),
+            Opcode::EncodeReq => Self::Encode(from_cbor_bytes(bytes)?),
+            Opcode::EncodeVectorDirectReq => {
+                let (mut req, consumed) = crate::codec::cbor::from_cbor_prefix::<
+                    crate::ops::memory::EncodeVectorDirectRequest,
+                >(bytes)?;
+                req.vector = crate::codec::cbor::le_bytes_to_f32_vec(&bytes[consumed..])?;
+                Self::EncodeVectorDirect(req)
             }
-            Opcode::AdminCreateContextReq => Self::AdminCreateContext(from_rkyv_bytes(bytes)?),
-            Opcode::AdminRenameContextReq => Self::AdminRenameContext(from_rkyv_bytes(bytes)?),
-            Opcode::AdminMoveMemoryReq => Self::AdminMoveMemory(from_rkyv_bytes(bytes)?),
-            Opcode::AdminReclassifyReq => Self::AdminReclassify(from_rkyv_bytes(bytes)?),
-            Opcode::AdminListTombstonedReq => Self::AdminListTombstoned(from_rkyv_bytes(bytes)?),
-            Opcode::AdminBackfillReq => Self::AdminBackfill(from_rkyv_bytes(bytes)?),
-            Opcode::AdminBackfillCancelReq => Self::AdminBackfillCancel(from_rkyv_bytes(bytes)?),
-            Opcode::EntityCreateReq => Self::EntityCreate(from_rkyv_bytes(bytes)?),
-            Opcode::EntityGetReq => Self::EntityGet(from_rkyv_bytes(bytes)?),
-            Opcode::EntityUpdateReq => Self::EntityUpdate(from_rkyv_bytes(bytes)?),
-            Opcode::EntityRenameReq => Self::EntityRename(from_rkyv_bytes(bytes)?),
-            Opcode::EntityMergeReq => Self::EntityMerge(from_rkyv_bytes(bytes)?),
-            Opcode::EntityUnmergeReq => Self::EntityUnmerge(from_rkyv_bytes(bytes)?),
-            Opcode::EntityResolveReq => Self::EntityResolve(from_rkyv_bytes(bytes)?),
-            Opcode::EntityListReq => Self::EntityList(from_rkyv_bytes(bytes)?),
-            Opcode::EntityTombstoneReq => Self::EntityTombstone(from_rkyv_bytes(bytes)?),
-            Opcode::StatementCreateReq => Self::StatementCreate(from_rkyv_bytes(bytes)?),
-            Opcode::StatementGetReq => Self::StatementGet(from_rkyv_bytes(bytes)?),
-            Opcode::StatementSupersedeReq => Self::StatementSupersede(from_rkyv_bytes(bytes)?),
-            Opcode::StatementTombstoneReq => Self::StatementTombstone(from_rkyv_bytes(bytes)?),
-            Opcode::StatementRetractReq => Self::StatementRetract(from_rkyv_bytes(bytes)?),
-            Opcode::StatementHistoryReq => Self::StatementHistory(from_rkyv_bytes(bytes)?),
-            Opcode::StatementListReq => Self::StatementList(from_rkyv_bytes(bytes)?),
-            Opcode::RelationCreateReq => Self::RelationCreate(from_rkyv_bytes(bytes)?),
-            Opcode::RelationGetReq => Self::RelationGet(from_rkyv_bytes(bytes)?),
-            Opcode::RelationSupersedeReq => Self::RelationSupersede(from_rkyv_bytes(bytes)?),
-            Opcode::RelationTombstoneReq => Self::RelationTombstone(from_rkyv_bytes(bytes)?),
-            Opcode::RelationListFromReq => Self::RelationListFrom(from_rkyv_bytes(bytes)?),
-            Opcode::RelationListToReq => Self::RelationListTo(from_rkyv_bytes(bytes)?),
-            Opcode::RelationTraverseReq => Self::RelationTraverse(from_rkyv_bytes(bytes)?),
-            Opcode::SchemaUploadReq => Self::SchemaUpload(from_rkyv_bytes(bytes)?),
-            Opcode::SchemaGetReq => Self::SchemaGet(from_rkyv_bytes(bytes)?),
-            Opcode::SchemaListReq => Self::SchemaList(from_rkyv_bytes(bytes)?),
-            Opcode::SchemaValidateReq => Self::SchemaValidate(from_rkyv_bytes(bytes)?),
-            Opcode::SchemaReplaceReq => Self::SchemaReplace(from_rkyv_bytes(bytes)?),
-            Opcode::ExtractorListReq => Self::ExtractorList(from_rkyv_bytes(bytes)?),
-            Opcode::ExtractorDisableReq => Self::ExtractorDisable(from_rkyv_bytes(bytes)?),
-            Opcode::ExtractorEnableReq => Self::ExtractorEnable(from_rkyv_bytes(bytes)?),
-            Opcode::QueryReq => Self::Query(from_rkyv_bytes(bytes)?),
-            Opcode::QueryExplainReq => Self::QueryExplain(from_rkyv_bytes(bytes)?),
-            Opcode::QueryTraceReq => Self::QueryTrace(from_rkyv_bytes(bytes)?),
-            Opcode::RecallHybridReq => Self::RecallHybrid(from_rkyv_bytes(bytes)?),
+            Opcode::RecallReq => Self::Recall(from_cbor_bytes(bytes)?),
+            Opcode::PlanReq => Self::Plan(from_cbor_bytes(bytes)?),
+            Opcode::ReasonReq => Self::Reason(from_cbor_bytes(bytes)?),
+            Opcode::ForgetReq => Self::Forget(from_cbor_bytes(bytes)?),
+            Opcode::LinkReq => Self::Link(from_cbor_bytes(bytes)?),
+            Opcode::UnlinkReq => Self::Unlink(from_cbor_bytes(bytes)?),
+            Opcode::SubscribeReq => Self::Subscribe(from_cbor_bytes(bytes)?),
+            Opcode::UnsubscribeReq => Self::Unsubscribe(from_cbor_bytes(bytes)?),
+            Opcode::GetCapabilitiesReq => Self::GetCapabilities(from_cbor_bytes(bytes)?),
+            Opcode::TxnBegin => Self::TxnBegin(from_cbor_bytes(bytes)?),
+            Opcode::TxnCommit => Self::TxnCommit(from_cbor_bytes(bytes)?),
+            Opcode::TxnAbort => Self::TxnAbort(from_cbor_bytes(bytes)?),
+            Opcode::CancelStream => Self::CancelStream(from_cbor_bytes(bytes)?),
+            Opcode::Ping => Self::Ping(from_cbor_bytes(bytes)?),
+            Opcode::ClientPong => Self::ClientPong(from_cbor_bytes(bytes)?),
+            Opcode::Bye => Self::Bye(from_cbor_bytes(bytes)?),
+            Opcode::AdminStatsReq => Self::AdminStats(from_cbor_bytes(bytes)?),
+            Opcode::AdminSnapshotReq => Self::AdminSnapshot(from_cbor_bytes(bytes)?),
+            Opcode::AdminRestoreReq => Self::AdminRestore(from_cbor_bytes(bytes)?),
+            Opcode::AdminIntegrityCheckReq => Self::AdminIntegrityCheck(from_cbor_bytes(bytes)?),
+            Opcode::AdminMigrateEmbeddingsReq => {
+                Self::AdminMigrateEmbeddings(from_cbor_bytes(bytes)?)
+            }
+            Opcode::AdminCreateContextReq => Self::AdminCreateContext(from_cbor_bytes(bytes)?),
+            Opcode::AdminRenameContextReq => Self::AdminRenameContext(from_cbor_bytes(bytes)?),
+            Opcode::AdminMoveMemoryReq => Self::AdminMoveMemory(from_cbor_bytes(bytes)?),
+            Opcode::AdminReclassifyReq => Self::AdminReclassify(from_cbor_bytes(bytes)?),
+            Opcode::AdminListTombstonedReq => Self::AdminListTombstoned(from_cbor_bytes(bytes)?),
+            Opcode::AdminBackfillReq => Self::AdminBackfill(from_cbor_bytes(bytes)?),
+            Opcode::AdminBackfillCancelReq => Self::AdminBackfillCancel(from_cbor_bytes(bytes)?),
+            Opcode::EntityCreateReq => Self::EntityCreate(from_cbor_bytes(bytes)?),
+            Opcode::EntityGetReq => Self::EntityGet(from_cbor_bytes(bytes)?),
+            Opcode::EntityUpdateReq => Self::EntityUpdate(from_cbor_bytes(bytes)?),
+            Opcode::EntityRenameReq => Self::EntityRename(from_cbor_bytes(bytes)?),
+            Opcode::EntityMergeReq => Self::EntityMerge(from_cbor_bytes(bytes)?),
+            Opcode::EntityUnmergeReq => Self::EntityUnmerge(from_cbor_bytes(bytes)?),
+            Opcode::EntityResolveReq => Self::EntityResolve(from_cbor_bytes(bytes)?),
+            Opcode::EntityListReq => Self::EntityList(from_cbor_bytes(bytes)?),
+            Opcode::EntityTombstoneReq => Self::EntityTombstone(from_cbor_bytes(bytes)?),
+            Opcode::StatementCreateReq => Self::StatementCreate(from_cbor_bytes(bytes)?),
+            Opcode::StatementGetReq => Self::StatementGet(from_cbor_bytes(bytes)?),
+            Opcode::StatementSupersedeReq => Self::StatementSupersede(from_cbor_bytes(bytes)?),
+            Opcode::StatementTombstoneReq => Self::StatementTombstone(from_cbor_bytes(bytes)?),
+            Opcode::StatementRetractReq => Self::StatementRetract(from_cbor_bytes(bytes)?),
+            Opcode::StatementHistoryReq => Self::StatementHistory(from_cbor_bytes(bytes)?),
+            Opcode::StatementListReq => Self::StatementList(from_cbor_bytes(bytes)?),
+            Opcode::RelationCreateReq => Self::RelationCreate(from_cbor_bytes(bytes)?),
+            Opcode::RelationGetReq => Self::RelationGet(from_cbor_bytes(bytes)?),
+            Opcode::RelationSupersedeReq => Self::RelationSupersede(from_cbor_bytes(bytes)?),
+            Opcode::RelationTombstoneReq => Self::RelationTombstone(from_cbor_bytes(bytes)?),
+            Opcode::RelationListFromReq => Self::RelationListFrom(from_cbor_bytes(bytes)?),
+            Opcode::RelationListToReq => Self::RelationListTo(from_cbor_bytes(bytes)?),
+            Opcode::RelationTraverseReq => Self::RelationTraverse(from_cbor_bytes(bytes)?),
+            Opcode::SchemaUploadReq => Self::SchemaUpload(from_cbor_bytes(bytes)?),
+            Opcode::SchemaGetReq => Self::SchemaGet(from_cbor_bytes(bytes)?),
+            Opcode::SchemaListReq => Self::SchemaList(from_cbor_bytes(bytes)?),
+            Opcode::SchemaValidateReq => Self::SchemaValidate(from_cbor_bytes(bytes)?),
+            Opcode::SchemaReplaceReq => Self::SchemaReplace(from_cbor_bytes(bytes)?),
+            Opcode::ExtractorListReq => Self::ExtractorList(from_cbor_bytes(bytes)?),
+            Opcode::ExtractorDisableReq => Self::ExtractorDisable(from_cbor_bytes(bytes)?),
+            Opcode::ExtractorEnableReq => Self::ExtractorEnable(from_cbor_bytes(bytes)?),
+            Opcode::QueryReq => Self::Query(from_cbor_bytes(bytes)?),
+            Opcode::QueryExplainReq => Self::QueryExplain(from_cbor_bytes(bytes)?),
+            Opcode::QueryTraceReq => Self::QueryTrace(from_cbor_bytes(bytes)?),
+            Opcode::RecallHybridReq => Self::RecallHybrid(from_cbor_bytes(bytes)?),
             Opcode::MaterializeProceduralReq => {
-                Self::MaterializeProcedural(from_rkyv_bytes(bytes)?)
+                Self::MaterializeProcedural(from_cbor_bytes(bytes)?)
             }
             other => return Err(ProtocolError::UnknownOpcode(other.as_u16())),
         })
@@ -726,7 +731,7 @@ mod tests {
 
         for body in [
             RequestBody::Hello(HelloPayload {
-                client_id: "brain-rust-sdk/0.5.0".into(),
+                client_id: "example-client/1.0".into(),
                 supported_versions: vec![crate::VERSION],
                 capabilities: HelloCapabilities {
                     streaming: true,

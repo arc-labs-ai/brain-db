@@ -1,0 +1,12 @@
+{
+  "client_id": "brain-conformance/1",
+  "supported_versions": [
+    1
+  ],
+  "capabilities": {
+    "streaming": true,
+    "compression_zstd": false,
+    "server_push": false
+  },
+  "client_session_token": null
+}

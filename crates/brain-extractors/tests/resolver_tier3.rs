@@ -1,7 +1,7 @@
 //! Tier-3 embedding resolver — integration coverage against a
 //! deterministic mocked embedder. The unit tests inside
 //! `resolver.rs::tests` cover the same surface; this file pins the
-//! external API shape that downstream callers (worker, future SDK
+//! external API shape that downstream callers (worker, future client
 //! consumers) bind to.
 
 use std::collections::HashMap;

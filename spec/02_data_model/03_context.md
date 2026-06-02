@@ -98,7 +98,7 @@ Why not hot-path: most apps don't need to move memories at runtime, and exposing
 
 The set form is bounded (max 16 contexts per query in v1) to keep filter evaluation cheap.
 
-The default for `context_filter` in the SDK is the agent's "current" context — typically the one the application is currently operating in. The protocol-level default is `None` (no filter), which the SDK overrides per its convention.
+A common client default for `context_filter` is the agent's "current" context — typically the one the application is currently operating in. The protocol-level default is `None` (no filter), which a client may override per its convention.
 
 See [05. Operations](../05_operations/00_purpose.md) §RECALL for the exact filter semantics.
 

@@ -2,28 +2,24 @@
 //!
 //! ## Scope
 //!
-//! Drives encode → recall → forget → recall. Two facts shape the
-//! test:
+//! Drives encode → recall → forget → recall against a real server over a
+//! real TCP socket, building every frame by hand from the `brain-protocol`
+//! public API (`RequestBody::encode` / `ResponseBody::decode` + raw
+//! framing). Two facts shape what this test can assert:
 //!
-//! 1. `brain-sdk-rust` is a placeholder; the real client SDK lands
-//!    later. This test drives the
-//!    server via the same hand-rolled frame helpers used by the
-//!    other wire tests.
-//! 2. The shard scaffold uses [`crate::shard::NopDispatcher`]
-//!    (zero-vector embeddings). Cosine similarity between two zero
-//!    vectors is degenerate; RECALL returns memories essentially
-//!    at random. So *content-level* correctness — "RECALL returns
-//!    the memory I just encoded with relevance 0.95" — can't be
-//!    asserted on this path's content-correctness
-//!    suite lives in the brain-ops / brain-planner crates with
-//!    proper fixtures.
+//! 1. The shard scaffold uses [`crate::shard::NopDispatcher`] (zero-vector
+//!    embeddings). Cosine similarity between two zero vectors is degenerate,
+//!    so RECALL returns memories essentially at random — *content-level*
+//!    correctness ("RECALL returns the memory I just encoded with relevance
+//!    0.95") can't be asserted here. Content correctness lives in the
+//!    brain-ops / brain-planner suites with proper fixtures.
 //!
-//! This is therefore the **wire smoke**: prove the whole stack
-//! survives a full client lifecycle, end-to-end, without hangs /
-//! panics / FD leaks. Specifically:
+//! This is therefore the **wire smoke**: prove the whole stack survives a
+//! full connection lifecycle, end-to-end, without hangs / panics / FD
+//! leaks. Specifically:
 //!
-//! - Each request opcode produces the matching response opcode
-//!   (or an ERROR with a sane shape).
+//! - Each request opcode produces the matching response opcode (or an
+//!   ERROR with a sane shape).
 //! - EOS is set where the spec requires.
 //! - Routing reaches the right shard for memory-bearing ops.
 //! - 100 round-trips don't degrade.
@@ -81,10 +77,8 @@ use support_harness::start;
 
 const FLAG_EOS: u8 = 1 << 7;
 
-// Bringup scaffold (Server, start) lives in tests/support_harness/mod.rs.
-
 // ---------------------------------------------------------------------------
-// Client helpers
+// Wire helpers
 // ---------------------------------------------------------------------------
 
 async fn read_one_frame<S>(stream: &mut S) -> Result<Frame, String>
@@ -96,9 +90,8 @@ where
         .read_exact(&mut header)
         .await
         .map_err(|e| format!("header read: {e}"))?;
-    let payload_len_be = [header[16], header[17], header[18]];
     let payload_len =
-        u32::from_be_bytes([0, payload_len_be[0], payload_len_be[1], payload_len_be[2]]) as usize;
+        u32::from_be_bytes([0, header[16], header[17], header[18]]) as usize;
     let mut buf = Vec::with_capacity(brain_protocol::HEADER_SIZE + payload_len);
     buf.extend_from_slice(&header);
     if payload_len > 0 {
@@ -162,8 +155,8 @@ async fn complete_handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
     assert_eq!(auth_ok.header.opcode_u16(), Opcode::AuthOk.as_u16());
 }
 
-/// Send an `ENCODE_REQ` and read the response. Returns
-/// `(opcode_byte, optional memory_id)` so the caller can branch on
+/// Sends an `ENCODE_REQ` and reads the response. Returns
+/// `(opcode, optional memory_id)` so the caller can branch on
 /// ENCODE_RESP vs ERROR without panicking.
 async fn encode_round_trip(
     client: &mut TcpStream,
@@ -217,6 +210,8 @@ async fn recall_round_trip(client: &mut TcpStream, stream_id: u32, cue: &str) ->
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id: None,
+        agent_filter: Vec::new(),
+        include_other_agents: false,
     };
     send_frame(
         client,
@@ -229,7 +224,7 @@ async fn recall_round_trip(client: &mut TcpStream, stream_id: u32, cue: &str) ->
     )
     .await;
     let resp = read_one_frame(client).await.expect("RECALL response");
-    // EOS must be set (single-frame EOS in v1).
+    // Single-frame EOS response in v1.
     assert!(
         resp.header.flags_u8() & FLAG_EOS != 0,
         "RECALL response must carry EOS in v1"
@@ -314,25 +309,24 @@ async fn encode_recall_forget_recall_round_trip() {
     let agent_id = *uuid::Uuid::now_v7().as_bytes();
     complete_handshake(&mut client, agent_id).await;
 
-    // Step 1: ENCODE. May succeed (returning a memory_id) or surface
-    // an ERROR (the NopDispatcher path is not always green
-    // end-to-end). Both are valid wire shapes.
+    // ENCODE. Either succeeds (returning a memory_id) or surfaces an ERROR
+    // (the NopDispatcher path is not always green end-to-end). Both are
+    // valid wire shapes.
     let (encode_op, encode_id) = encode_round_trip(&mut client, 1, "the cat sat on the mat").await;
     assert!(
         encode_op == Opcode::EncodeResp.as_u16() || encode_op == Opcode::Error.as_u16(),
         "ENCODE returned unexpected opcode 0x{encode_op:02x}"
     );
 
-    // Step 2: RECALL. Single-frame EOS response.
+    // RECALL. Single-frame EOS response.
     let recall_op = recall_round_trip(&mut client, 3, "cat").await;
     assert!(
         recall_op == Opcode::RecallResp.as_u16() || recall_op == Opcode::Error.as_u16(),
         "RECALL returned unexpected opcode 0x{recall_op:02x}"
     );
 
-    // Step 3: FORGET (only if we got a memory_id). Routes to the
-    // memory's shard via `shard_for_memory(memory_id)` — exercises
-    // the memory-id routing path.
+    // FORGET (only if we got a memory_id). Routes to the memory's shard via
+    // `shard_for_memory(memory_id)` — exercises the memory-id routing path.
     if let Some(memory_id) = encode_id {
         let forget_op = forget_round_trip(&mut client, 5, memory_id).await;
         assert!(
@@ -341,18 +335,15 @@ async fn encode_recall_forget_recall_round_trip() {
         );
     }
 
-    // Step 4: RECALL again. May or may not differ from step 2's
-    // content (NopDispatcher returns identical embeddings); we only
-    // assert wire shape.
+    // RECALL again — only the wire shape is asserted (NopDispatcher returns
+    // identical embeddings, so content may not differ from the first RECALL).
     let recall_op2 = recall_round_trip(&mut client, 7, "cat").await;
     assert!(
         recall_op2 == Opcode::RecallResp.as_u16() || recall_op2 == Opcode::Error.as_u16(),
         "second RECALL returned unexpected opcode 0x{recall_op2:02x}"
     );
 
-    // Step 5: BYE; server closes.
     bye_round_trip(&mut client).await;
-
     server.stop().await;
 }
 
@@ -365,9 +356,8 @@ async fn repeated_encode_recall_is_stable() {
     let agent_id = *uuid::Uuid::now_v7().as_bytes();
     complete_handshake(&mut client, agent_id).await;
 
-    // 100 × (ENCODE + RECALL). Rotate stream ids 1, 3, 5, …
-    // through a 1024-slot space (well below the outgoing
-    // capacity).
+    // 100 × (ENCODE + RECALL). Rotate stream ids through a 1024-slot space
+    // (well below the outgoing capacity).
     for i in 0..100u32 {
         let enc_stream = (i * 4 + 1) % 1024;
         let rec_stream = (i * 4 + 3) % 1024;
@@ -391,8 +381,8 @@ async fn repeated_encode_recall_is_stable() {
 async fn metrics_endpoint_reflects_traffic() {
     let server = start(1).await;
 
-    // Open a couple of data-plane connections; let the accept loop
-    // bump `brain_connections_total`.
+    // Two data-plane connections; the accept loop bumps
+    // `brain_connections_total`.
     let mut c1 = TcpStream::connect(server.data_plane_addr)
         .await
         .expect("connect 1");
@@ -403,9 +393,7 @@ async fn metrics_endpoint_reflects_traffic() {
     complete_handshake(&mut c1, agent_id).await;
     complete_handshake(&mut c2, agent_id).await;
 
-    // Allow the accept loop a moment to update the atomics. (The
-    // counter is updated before the per-conn task runs, so this is
-    // belt + suspenders.)
+    // Give the accept loop a moment to publish the atomics.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let (code, body) = http_get(server.admin_addr, "/metrics").await;
@@ -424,7 +412,6 @@ async fn metrics_endpoint_reflects_traffic() {
         "expected ≥2 accepted connections, got {value}; body:\n{body}"
     );
 
-    // The admin server also reports the build info and shard count.
     assert!(body.contains("brain_build_info{"), "missing build_info");
     assert!(
         body.contains("brain_shards_total 1"),
@@ -445,14 +432,11 @@ async fn bye_and_shutdown_drain_cleanly() {
     let agent_id = *uuid::Uuid::now_v7().as_bytes();
     complete_handshake(&mut client, agent_id).await;
 
-    // Client-initiated BYE.
     bye_round_trip(&mut client).await;
     drop(client);
 
-    // Server shutdown — the test scaffold's `stop()` runs the same
-    // graceful_shutdown_shards path that production uses.
-    // We rely on its timeouts: listener exits within 2 s,
-    // admin within 2 s, shards within the default 30 s budget.
+    // `stop()` runs the same graceful-shutdown path production uses: listener
+    // exits within 2 s, admin within 2 s, shards within the 30 s budget.
     let started = std::time::Instant::now();
     server.stop().await;
     assert!(

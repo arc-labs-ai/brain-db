@@ -9,11 +9,11 @@ This file presents the layers in summary, with cross-references to the detail sp
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                            CLIENTS                                   │
-│   Native SDKs in Rust, Python (PyO3), TypeScript (NAPI-RS), Go       │
+│   Client (any language; speaks the wire protocol directly)          │
 └──────────────────────────────────┬──────────────────────────────────┘
                                    │
                            Custom binary protocol over TCP
-                           rkyv (structured), bytemuck (vectors)
+                           CBOR (structured), little-endian f32 (vectors)
                                    │
 ┌──────────────────────────────────▼──────────────────────────────────┐
 │  L1 │ CONNECTION LAYER  (glommio, thread-per-core, io_uring)         │
@@ -81,7 +81,7 @@ This file presents the layers in summary, with cross-references to the detail sp
 - TCP accept loop on a configurable port (default `7474`).
 - Optional TLS termination via [rustls](https://github.com/rustls/rustls).
 - Session establishment: protocol version check, authentication, namespace selection.
-- Frame parsing (binary-protocol, rkyv-decoded headers and bodies).
+- Frame parsing (binary-protocol; 32-byte header, CBOR-decoded bodies).
 - Dispatch into the embedding layer or the planner depending on opcode.
 - Backpressure: when downstream queues fill, the read loop awaits, the TCP window narrows, and the client experiences flow control end-to-end with no application-level signaling.
 
