@@ -48,10 +48,33 @@ mod common {
             for (i, byte) in text.as_bytes().iter().enumerate() {
                 v[i % VECTOR_DIM] += f32::from(*byte) / 255.0;
             }
+            // The real embedder always L2-normalizes its output, and the
+            // HNSW (DistCosine) only yields cosine in [-1, 1] for unit
+            // input. The mock must honor that contract — otherwise a longer
+            // string's larger-magnitude vector dominates the raw dot product
+            // and wins every cue (similarity > 1.0), so a memory never tops
+            // its own exact cue.
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for x in &mut v {
+                    *x /= norm;
+                }
+            }
             Ok(v)
         }
         fn embed_batch(&self, texts: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
             texts.iter().map(|t| self.embed(t)).collect()
+        }
+        // The default `embed_query` prepends BGE_QUERY_PREFIX so a real
+        // model maps query and passage of the same text into comparable
+        // vectors (asymmetric retrieval). This byte-additive mock has no
+        // such model — the ~57-char prefix would just be noise that
+        // dominates every query vector, so all cues would collapse onto
+        // one direction. Embed the bare text instead, which is the
+        // mock-world equivalent of "query and passage of the same surface
+        // are comparable". Then a memory tops its own exact cue.
+        fn embed_query(&self, text: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+            self.embed(text)
         }
         fn fingerprint(&self) -> [u8; 16] {
             [0xAB; 16]
