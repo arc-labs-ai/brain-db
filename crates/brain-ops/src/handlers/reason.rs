@@ -41,9 +41,29 @@ pub async fn handle_reason(
     let exec_ctx = build_executor_with_lens(ctx, req.txn_id)?;
     let stream = execute_reason_stream(plan, &exec_ctx).await?;
 
-    let mut frames: Vec<ReasonResponseFrame> = Vec::with_capacity(stream.steps.len() + 1);
+    let mut frames: Vec<ReasonResponseFrame> = Vec::with_capacity(stream.steps.len() + 2);
+    let had_steps = !stream.steps.is_empty();
     for step in stream.steps {
         frames.push(step_to_wire(step, &claim));
+    }
+    // "No support, no contradiction" case: the base set was empty (the
+    // agent has no memory near the query). The executor emits no step,
+    // but the contract still returns one inference echoing the claim with
+    // empty evidence and confidence 0.0 — the client reads that as "I
+    // don't know", not an absent answer.
+    if !had_steps {
+        frames.push(ReasonResponseFrame {
+            inferences: vec![WireInferenceStep {
+                step_index: 0,
+                claim: claim.clone(),
+                supporting_memories: Vec::new(),
+                contradicting_memories: Vec::new(),
+                confidence: stream.terminal.confidence,
+                inference_kind: InferenceKind::EvidenceAccumulation,
+            }],
+            is_final: false,
+            reason_status: None,
+        });
     }
     // Terminal frame — carries the aggregate confidence + status and
     // marks end-of-stream.
