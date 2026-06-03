@@ -38,9 +38,7 @@ pub struct Config {
     #[serde(default)]
     pub workers: WorkersConfig,
     #[serde(default)]
-    pub logging: LoggingConfig,
-    #[serde(default)]
-    pub tracing: TracingConfig,
+    pub monitoring: MonitoringConfig,
     #[serde(default)]
     pub auth: AuthConfig,
     /// Defaulted so existing `dev.toml` files keep
@@ -622,6 +620,18 @@ fn default_extractor_batch_size() -> usize {
     brain_workers::DEFAULT_EXTRACTOR_BATCH_SIZE
 }
 
+/// `[monitoring]` TOML section. Groups logging and distributed-tracing
+/// configuration. All sub-sections default so existing configs that
+/// omit the block entirely still load.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MonitoringConfig {
+    #[serde(default)]
+    pub logging: LoggingConfig,
+    #[serde(default)]
+    pub tracing: TracingConfig,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
@@ -1005,8 +1015,7 @@ impl Config {
             rerank: RerankConfig::default(),
             extractors: ExtractorsConfig::default(),
             workers: WorkersConfig::default(),
-            logging: LoggingConfig::default(),
-            tracing: TracingConfig::default(),
+            monitoring: MonitoringConfig::default(),
             auth: AuthConfig::default(),
             summarizer: SummarizerConfig::default(),
             llm: LlmConfig::default(),

@@ -59,17 +59,17 @@ batch_window_ms  = 5
 # Until then: never expose listen_addr to the public internet.
 mode = "none"
 
-[logging]
+[monitoring.logging]
 level  = "info"
 output = "stdout"
 format = "json"   # Loki / Elastic / CloudWatch ingest cleanly.
 
-[tracing]
+[monitoring.tracing]
 # Disabled in the in-image default. Compose stack flips this on
-# via BRAIN__TRACING__ENABLED=true and points at the in-stack
+# via BRAIN__MONITORING__TRACING__ENABLED=true and points at the in-stack
 # OTel collector. For a standalone container, set:
-#   -e BRAIN__TRACING__ENABLED=true
-#   -e BRAIN__TRACING__ENDPOINT=http://your-collector:4318/v1/traces
+#   -e BRAIN__MONITORING__TRACING__ENABLED=true
+#   -e BRAIN__MONITORING__TRACING__ENDPOINT=http://your-collector:4318/v1/traces
 enabled       = false
 sampler       = "ratio"
 sample_ratio  = 0.01

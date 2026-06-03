@@ -6,7 +6,7 @@
 //!   startup errors are still captured. Defaults to a `compact`
 //!   formatter at `info` level; honors `BRAIN_LOG` / `RUST_LOG`.
 //! - [`reinit_from_config`] — called after `Config::load`. Switches
-//!   the formatter and level per the `[logging]` section. Because
+//!   the formatter and level per the `[monitoring.logging]` section. Because
 //!   `tracing` only allows one global subscriber, this is a no-op if
 //!   `init_pre_config` already installed one — but the values are
 //!   logged for operator visibility.
@@ -82,7 +82,7 @@ pub fn init_pre_config() {
     let _ = fmt().with_env_filter(filter).with_target(true).try_init();
 }
 
-/// Re-install or update the subscriber from `[logging]` + `[tracing]`.
+/// Re-install or update the subscriber from `[monitoring.logging]` + `[monitoring.tracing]`.
 ///
 /// Composes three layers:
 /// - `EnvFilter` (env-driven level filter).

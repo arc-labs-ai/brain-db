@@ -76,7 +76,7 @@ fn dev_toml_round_trips_cleanly() {
     let cfg = Config::load_with_env(&path, &env).expect("dev.toml must load");
 
     assert_eq!(cfg.server.listen_addr.to_string(), "127.0.0.1:9090");
-    assert_eq!(cfg.storage.shard_count, 4);
+    assert_eq!(cfg.storage.shard_count, 2);
     assert_eq!(cfg.shard.arena_capacity_bytes, 1u64 << 30);
     assert_eq!(cfg.shard.wal_segment_size_bytes, 256u64 << 20);
     assert_eq!(cfg.shard.wal_retention_segments, 4);
@@ -86,7 +86,7 @@ fn dev_toml_round_trips_cleanly() {
     assert_eq!(cfg.embedder.model, "bge-small-en-v1.5");
     assert_eq!(cfg.auth.mode, AuthMode::None);
     assert!(!cfg.server.tls.enabled);
-    assert_eq!(cfg.logging.format, "json");
+    assert_eq!(cfg.monitoring.logging.format, "json");
 }
 
 // ---------------------------------------------------------------------------
@@ -254,8 +254,8 @@ fn omitted_optional_sections_use_defaults() {
     let cfg = Config::load_with_env(&path, &HashMap::new()).unwrap();
 
     assert_eq!(cfg.workers, Default::default());
-    assert_eq!(cfg.logging, LoggingConfig::default());
-    assert!(!cfg.tracing.enabled);
+    assert_eq!(cfg.monitoring.logging, LoggingConfig::default());
+    assert!(!cfg.monitoring.tracing.enabled);
     assert_eq!(cfg.auth.mode, AuthMode::None);
     assert!(!cfg.server.tls.enabled);
 }

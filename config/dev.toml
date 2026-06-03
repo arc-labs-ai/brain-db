@@ -138,12 +138,12 @@ max_cause_memories_per_statement = 3
 max_effect_memories_per_statement = 3
 max_related_statements_per_entity = 5
 
-[logging]
+[monitoring.logging]
 level = "info"
 format = "json"
 output = "stdout"
 
-[tracing]
+[monitoring.tracing]
 enabled = false
 sampler = "ratio"
 sample_ratio = 0.01
