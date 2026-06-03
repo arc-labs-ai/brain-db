@@ -367,6 +367,7 @@ impl OpsContext {
         &self,
         kind: brain_storage::wal::kinds::WalRecordKind,
         payload: brain_protocol::GraphEventPayload,
+        agent_id: brain_core::AgentId,
         make_envelope: F,
     ) where
         F: FnOnce(u64, brain_protocol::GraphEventPayload) -> EventEnvelope,
@@ -376,10 +377,15 @@ impl OpsContext {
             "publish_graph expects a opaque-body WalRecordKind, got {kind:?}"
         );
         let lsn = if let Some(sink) = &self.wal_sink {
-            // CBOR-encode the typed-graph event as the WAL PhaseBody record body.
-            // Subscribe-replay's `from_wal_record` decodes it back.
+            // CBOR-encode the typed-graph event, then frame it in the same
+            // opaque-body envelope every other typed-graph record uses:
+            // `agent_id (16 B) || body`. `WalPayload::decode` strips that
+            // 16-byte prefix before handing the body to subscribe-replay's
+            // `from_wal_record`, so the prefix is mandatory — without it the
+            // CBOR body would be decoded starting 16 bytes in and fail.
             let body = {
-                let mut buf = Vec::new();
+                let mut buf = Vec::with_capacity(16);
+                buf.extend_from_slice(&<[u8; 16]>::from(agent_id));
                 match ciborium::into_writer(&payload, &mut buf) {
                     Ok(()) => buf,
                     Err(e) => {

@@ -77,7 +77,7 @@ pub(crate) async fn emit_graph_event(
         let _ = ctx.events.publish(envelope);
         return;
     };
-    ctx.publish_graph(kind, payload, move |lsn, payload| EventEnvelope {
+    ctx.publish_graph(kind, payload, agent_id, move |lsn, payload| EventEnvelope {
         lsn,
         event_type,
         memory_id: MemoryId::NULL,

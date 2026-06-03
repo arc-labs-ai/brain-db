@@ -22,6 +22,7 @@
 
 use brain_metadata::schema::predicate::predicate_intern_or_get;
 use brain_metadata::schema::store::{schema_active, schema_get, schema_upload};
+use brain_metadata::tables::materialize_all_tables;
 use brain_metadata::tables::predicate::{PredicateDefinition, PREDICATES_TABLE};
 use brain_metadata::tables::schema_version::{SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE};
 use brain_protocol::schema::{parse_schema, validate, ValidatedSchema};
@@ -29,8 +30,19 @@ use redb::{Database, ReadableDatabase, ReadableTable};
 
 const T0: u64 = 1_700_000_000_000_000_000;
 
+/// A raw `redb::Database` with every table materialized but **no**
+/// `MetadataDb::open` seeding — so schema/predicate id allocation stays
+/// deterministic while the read paths see the same "tables always exist"
+/// contract production guarantees (`storage_version::open_or_init_schema`
+/// → `materialize_all_tables`). Without materialization, a read after a
+/// dropped (never-committed) upload would hit `TableDoesNotExist`, which
+/// the read helpers deliberately don't paper over.
 fn fresh_db(dir: &tempfile::TempDir) -> Database {
-    Database::create(dir.path().join("test.redb")).expect("create redb")
+    let db = Database::create(dir.path().join("test.redb")).expect("create redb");
+    let wtxn = db.begin_write().expect("begin_write");
+    materialize_all_tables(&wtxn).expect("materialize tables");
+    wtxn.commit().expect("commit materialize");
+    db
 }
 
 fn validated_schema(src: &str) -> ValidatedSchema {

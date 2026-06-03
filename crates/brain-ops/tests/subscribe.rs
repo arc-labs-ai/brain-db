@@ -985,4 +985,61 @@ mod wal_record_projection {
         assert_eq!(envs[0].event_type, EventType::Forgotten);
         assert!(envs[0].edge_payload.is_none());
     }
+
+    // ----- typed-graph change-feed event records (publish_graph) --------
+    //
+    // Entity/statement/schema events ride a separate flagged WAL record
+    // whose body is `agent_id (16 B) || CBOR(GraphEventPayload)` — the same
+    // opaque-body envelope the durable records use. These tests pin that
+    // framing: from_wal_record must strip the agent prefix and decode the
+    // CBOR back to the event, and must do so ONLY for flagged records.
+
+    fn entity_created_event_record(flags: u8) -> WalRecord {
+        use brain_protocol::{EntityCreatedEvent, GraphEventPayload};
+        let ev = GraphEventPayload::EntityCreated(EntityCreatedEvent {
+            entity_id: entid(9).to_bytes(),
+            entity_type_id: 1,
+            canonical_name: "Priya Patel".into(),
+        });
+        // Mirror publish_graph: agent_id (16 B) prefix, then CBOR.
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&[0xAB; 16]);
+        ciborium::into_writer(&ev, &mut body).unwrap();
+        WalRecord {
+            lsn: Lsn(7),
+            kind: brain_storage::wal::kinds::WalRecordKind::EntityCreate,
+            flags,
+            timestamp_ns: 1_700_000_000_000_000_000,
+            agent_id_lo64: 0,
+            payload: body,
+        }
+    }
+
+    #[test]
+    fn flagged_entity_event_record_projects_to_entity_created() {
+        let r = entity_created_event_record(
+            brain_storage::wal::record::FLAG_SUBSCRIBE_EVENT,
+        );
+        let envs = EventEnvelope::from_wal_record(&r);
+        assert_eq!(envs.len(), 1, "one EntityCreated event");
+        assert_eq!(envs[0].event_type, EventType::EntityCreated);
+        match envs[0].graph_payload.as_ref().expect("graph_payload") {
+            brain_protocol::GraphEventPayload::EntityCreated(e) => {
+                assert_eq!(e.canonical_name, "Priya Patel");
+                assert_eq!(e.entity_type_id, 1);
+            }
+            other => panic!("expected EntityCreated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unflagged_phasebody_record_is_not_projected() {
+        // Without the subscribe-event flag a record is a durable write,
+        // reconstructed by recovery — not surfaced as a change-feed event.
+        let r = entity_created_event_record(0);
+        assert!(
+            EventEnvelope::from_wal_record(&r).is_empty(),
+            "unflagged opaque-body records must not project to events"
+        );
+    }
 }

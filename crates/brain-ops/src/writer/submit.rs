@@ -1435,7 +1435,6 @@ mod tests {
     #[tokio::test]
     async fn mixed_mapped_and_unmapped_phases_wal_only_the_mapped() {
         use crate::writer::wal_sink::RecordingWalSink;
-        use brain_core::EntityId;
         use brain_storage::wal::kinds::WalRecordKind;
 
         let (_dir, mut writer) = build_writer();
@@ -1455,15 +1454,10 @@ mod tests {
             content_hash: None,
             deduplicate: false,
         };
-        // UpdateEntity has no WAL mapping today — must be skipped, not
+        // ReclaimSlots has no WAL mapping (it's derivable from
+        // MEMORIES_TABLE state on recovery) — it must be skipped, not
         // poison the whole append.
-        let update_entity = Phase::UpdateEntity {
-            id: EntityId::new(),
-            canonical_name: "Alice".into(),
-            aliases: Vec::new(),
-            attributes_blob: Vec::new(),
-            at_unix_nanos: 1_700_000_000_000,
-        };
+        let reclaim = Phase::ReclaimSlots { slots: vec![1, 2] };
         let link = Phase::Link {
             from: NodeRef::Memory(MemoryId::pack(0, 1, 0)),
             to: NodeRef::Memory(MemoryId::pack(0, 1, 0)),
@@ -1478,12 +1472,12 @@ mod tests {
         let write = Write::from_phases(
             WriteId::new(),
             AgentId::default(),
-            vec![upsert, update_entity, link],
+            vec![upsert, reclaim, link],
         );
-        // Apply may reject UpdateEntity (the entity row doesn't exist
-        // in metadata yet), but WAL append runs before apply opens its
-        // wtxn, so the recording sink sees the durable framing we're
-        // asserting on regardless of apply's outcome.
+        // The unmapped ReclaimSlots phase is skipped at the WAL layer;
+        // WAL append runs before apply opens its wtxn, so the recording
+        // sink sees the durable framing we're asserting on regardless of
+        // apply's outcome.
         let _ = writer.submit(write).await;
 
         let kinds: Vec<WalRecordKind> = sink.appended().iter().map(|r| r.kind).collect();
@@ -1496,7 +1490,7 @@ mod tests {
                 WalRecordKind::TxnCommit,
             ],
             "mapped substrate phases must reach WAL even when an unmapped \
-             typed-graph phase is interleaved",
+             phase is interleaved",
         );
     }
 
@@ -1506,29 +1500,24 @@ mod tests {
     #[tokio::test]
     async fn all_unmapped_phases_no_wal_records() {
         use crate::writer::wal_sink::RecordingWalSink;
-        use brain_core::EntityId;
 
         let (_dir, mut writer) = build_writer();
         let sink = Arc::new(RecordingWalSink::new());
         writer = writer.with_wal_sink(sink.clone());
 
-        let update_entity = Phase::UpdateEntity {
-            id: EntityId::new(),
-            canonical_name: "Alice".into(),
-            aliases: Vec::new(),
-            attributes_blob: Vec::new(),
-            at_unix_nanos: 1_700_000_000_000,
-        };
-        let rename_entity = Phase::RenameEntity {
-            id: EntityId::new(),
-            new_canonical_name: "Bob".into(),
-            at_unix_nanos: 1_700_000_000_000,
+        // Two phases with no WAL mapping: ReclaimSlots is derivable from
+        // MEMORIES_TABLE on recovery, and UpdateEmbedding rewrites a
+        // vector the HNSW already absorbed pre-commit.
+        let reclaim = Phase::ReclaimSlots { slots: vec![3, 4] };
+        let update_embedding = Phase::UpdateEmbedding {
+            id: MemoryId::pack(0, 1, 0),
+            new_vector: Box::new([0.0_f32; VECTOR_DIM]),
         };
 
         let write = Write::from_phases(
             WriteId::new(),
             AgentId::default(),
-            vec![update_entity, rename_entity],
+            vec![reclaim, update_embedding],
         );
         // The phases will fail in apply (no rows to update), but the WAL
         // append happens before apply — we only care that nothing reached
