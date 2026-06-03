@@ -244,6 +244,12 @@ compose-down *ARGS:
 #   • PORT is a parameter (8080 is often taken locally; use 18080 etc.)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# One command: compile the DB code (Linux builder stage) into the image,
+# then start the server in a container with the port bound. This is the
+# "spin up Linux → compile → serve" one-liner. `just up 18080` if 8080 is
+# taken. The compile step is cached, so re-runs after no code change are fast.
+up PORT="8080": image (serve-local PORT)
+
 # Run the DB locally, detached, exposing the data plane on PORT (default 8080).
 # Prereqs: `just image` once, and `scripts/bootstrap-model.sh --only embed`.
 # Example (8080 busy): `just serve-local 18080`   →  connect to 127.0.0.1:18080
