@@ -838,3 +838,103 @@ fn scenario_h_relation_link_supersede_tombstone_replays() {
     let by_ev = rtxn.open_table(RELATION_BY_EVIDENCE_TABLE).unwrap();
     assert_eq!(by_ev.iter().unwrap().count(), 3);
 }
+
+// ---------------------------------------------------------------------------
+// Scenario I — opaque-body entity_create replay (the PhaseBody path).
+//
+// Regression: the live server failed WAL recovery on restart whenever any
+// entity_create had been written ("entity_create decode: typed-graph body
+// failed rkyv validation: pointer out of bounds"). The relation path
+// (Scenario H) is first-class and never exercised the opaque-body codec, so
+// the gap shipped. This drives an EntityCreate PhaseBody record through the
+// real Wal::append → recover loop and asserts the entity row lands.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scenario_i_entity_create_phase_body_replays() {
+    use brain_metadata::entity::ops::entity_get;
+    use brain_metadata::recovery::phase_bodies::encode_entity_create;
+    use brain_metadata::tables::entity::EntityMetadata;
+    use brain_storage::wal::kinds::WalRecordKind;
+    use brain_storage::wal::payload::PhaseBodyRecord;
+
+    let env = Env::new();
+
+    // Person type (id=1) is seeded by the system schema at MetadataDb::open.
+    let entity_id = ent(7);
+    let mut meta_row = EntityMetadata::new_active(
+        entity_id,
+        brain_core::EntityTypeId::from(1),
+        "Priya Patel".into(),
+        "priya patel".into(),
+        T0,
+    );
+    meta_row.add_alias("priya".into());
+    meta_row.add_alias("p. patel".into());
+    // Non-empty attributes_blob: the live failure (LSN 3) was the entity
+    // that carried one; the empty-blob entity at LSN 2 recovered fine.
+    meta_row.attributes_blob = vec![1, 2, 3, 4];
+
+    let body = encode_entity_create(&meta_row);
+
+    // Isolation check: the framing layer must hand recovery byte-identical
+    // body bytes. A mismatch here localizes the bug to encode/decode framing
+    // rather than the rkyv codec.
+    let payload = WalPayload::PhaseBody(PhaseBodyRecord::new(
+        WalRecordKind::EntityCreate,
+        aid(1),
+        body.clone(),
+    ));
+    let framed = WalRecord::from_typed(Lsn(1), 0, T0, 1, &payload);
+    let encoded = framed.encode();
+    match WalRecord::decode_one(&encoded).unwrap() {
+        brain_storage::wal::record::DecodeOutcome::Record { record, .. } => {
+            match record.typed_payload().unwrap() {
+                WalPayload::PhaseBody(r) => assert_eq!(
+                    r.body, body,
+                    "framing must preserve the opaque body byte-for-byte"
+                ),
+                other => panic!("expected PhaseBody, got {other:?}"),
+            }
+        }
+        other => panic!("expected a decoded record, got {other:?}"),
+    }
+
+    // Reproduce production exactly: each create_entity emits TWO WAL
+    // records under kind=EntityCreate — the durable rkyv row (above) and a
+    // CBOR-encoded subscribe-replay event. The event record carries the
+    // FLAG_SUBSCRIBE_EVENT bit; recovery must skip it (rkyv-decoding its
+    // CBOR body is exactly the crash this test guards against).
+    // Any non-rkyv body models the collision; recovery skips on the flag
+    // before it ever tries to decode, so the bytes only need to be
+    // something the rkyv codec would choke on (as the real CBOR body does).
+    let cbor_event_body = b"\xa1ientity_idkPriya Patel".to_vec();
+    let event_payload = WalPayload::PhaseBody(PhaseBodyRecord::new(
+        WalRecordKind::EntityCreate,
+        aid(1),
+        cbor_event_body,
+    ));
+    let mut event_record = WalRecord::from_typed(Lsn(0), 0, T0 + 1, 1, &event_payload);
+    event_record.flags = brain_storage::wal::record::FLAG_SUBSCRIBE_EVENT;
+
+    // Full loop: append both via the real WAL, crash, recover.
+    env.write_wal_records(vec![record(payload, T0), event_record]);
+
+    let mut arena = env.open_arena();
+    let mut meta = env.open_meta();
+    let (report, _alloc) =
+        recover(&mut arena, &env.wal_dir, SHARD_UUID, &mut meta).expect("recover");
+    assert_eq!(report.records_replayed, 1, "only the durable row replays");
+    assert_eq!(
+        report.records_skipped, 1,
+        "the flagged subscribe-event record is skipped, not applied"
+    );
+    assert_eq!(report.records_discarded, 0);
+
+    let rtxn = meta.read_txn().unwrap();
+    let got = entity_get(&rtxn, entity_id)
+        .unwrap()
+        .expect("entity present after recovery");
+    assert_eq!(got.canonical_name, "Priya Patel");
+    assert_eq!(got.aliases.len(), 2);
+}

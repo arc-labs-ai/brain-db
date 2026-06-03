@@ -393,7 +393,12 @@ impl OpsContext {
             let record = brain_storage::wal::record::WalRecord {
                 lsn: brain_storage::wal::record::Lsn(0),
                 kind,
-                flags: 0,
+                // Mark as a subscribe-replay change-feed event so recovery
+                // skips it — the durable write record carries the state.
+                // Without this flag, recovery would try to rkyv-decode this
+                // CBOR body as a row and fail (kinds collide across the two
+                // record classes).
+                flags: brain_storage::wal::record::FLAG_SUBSCRIBE_EVENT,
                 timestamp_ns: now_unix_nanos_ctx(),
                 agent_id_lo64: 0,
                 payload: body,

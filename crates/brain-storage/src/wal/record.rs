@@ -67,6 +67,23 @@ pub const FOOTER_LEN: usize = 8;
 /// Maximum payload size (default 16 MiB).
 pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
 
+/// `flags` bit marking a record as a **subscribe-replay change-feed
+/// event**, not a state mutation.
+///
+/// Typed-graph ops are WAL-logged twice: once as the durable write
+/// record (rkyv-encoded row / first-class payload, the source of truth
+/// recovery replays into the metadata store) and once as a CBOR-encoded
+/// `GraphEventPayload` so subscribe-replay can reconstruct the change
+/// feed after a restart. Both records carry the same `WalRecordKind`
+/// (e.g. `EntityCreate`), so the kind byte alone can't tell them apart.
+///
+/// The event record sets this flag. Recovery skips flagged records (the
+/// durable record already carries the state; replaying the CBOR body as
+/// a row would fail decode and, if it didn't, would duplicate the row).
+/// Subscribe-replay does the inverse — it projects flagged records into
+/// change-feed events and ignores the unflagged durable records.
+pub const FLAG_SUBSCRIBE_EVENT: u8 = 0x01;
+
 /// In-memory representation of one WAL record.
 ///
 /// Holds every header field so encode/decode is a lossless round-trip.

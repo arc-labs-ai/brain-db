@@ -36,7 +36,7 @@ use crate::wal::payload::{
     WalPayload, WalPayloadError,
 };
 use crate::wal::reader::{WalReadError, WalReader};
-use crate::wal::record::WalRecord;
+use crate::wal::record::{WalRecord, FLAG_SUBSCRIBE_EVENT};
 
 // ---------------------------------------------------------------------------
 // MetadataSink trait + in-memory impl.
@@ -219,6 +219,16 @@ pub fn recover(
         next_lsn = lsn + 1;
 
         if lsn <= durable_lsn {
+            records_skipped += 1;
+            continue;
+        }
+
+        // Subscribe-replay change-feed events ride the WAL under the same
+        // record kinds as the durable write records, distinguished only by
+        // this flag. They are not state mutations — the durable record
+        // carries the data recovery needs — so skip them here. (Decoding
+        // their CBOR body as a typed-graph row would fail outright.)
+        if record.flags & FLAG_SUBSCRIBE_EVENT != 0 {
             records_skipped += 1;
             continue;
         }

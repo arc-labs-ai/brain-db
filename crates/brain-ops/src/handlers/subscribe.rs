@@ -179,6 +179,9 @@ impl EventEnvelope {
 
         let lsn = record.lsn.raw();
         let timestamp_unix_nanos = record.timestamp_ns;
+        let is_subscribe_event = record.flags
+            & brain_storage::wal::record::FLAG_SUBSCRIBE_EVENT
+            != 0;
         let Ok(payload) = record.typed_payload() else {
             return Vec::new();
         };
@@ -390,12 +393,23 @@ impl EventEnvelope {
                 stage_payload: None,
                 agent_id: p.agent_id,
             }],
-            WalPayload::PhaseBody(record) => {
+            WalPayload::PhaseBody(body_record) => {
+                // Only the subscribe-event records carry a CBOR
+                // `GraphEventPayload` body; the durable write records share
+                // these kinds but hold an rkyv row instead. Project only the
+                // flagged change-feed records — the durable ones are
+                // reconstructed by recovery, not surfaced as subscribe
+                // events here. Pair with `wal_kind_for_event` /
+                // `publish_graph` (which sets the flag).
+                if !is_subscribe_event {
+                    return Vec::new();
+                }
                 // Decode the CBOR body back into the typed-graph
                 // event so subscribers see the same shape as a live
                 // publish. Pair with `wal_kind_for_event` in
                 // `crate::handlers::entity`.
-                let Ok(payload) = ciborium::from_reader::<GraphEventPayload, _>(&record.body[..])
+                let Ok(payload) =
+                    ciborium::from_reader::<GraphEventPayload, _>(&body_record.body[..])
                 else {
                     return Vec::new();
                 };

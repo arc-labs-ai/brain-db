@@ -236,7 +236,17 @@ macro_rules! body_codec {
         /// rkyv `check_bytes` validation or the deserialize fails.
         pub fn $decode(bytes: &[u8]) -> Result<$ty, PhaseBodyError> {
             use rkyv::Deserialize;
-            let archived = rkyv::check_archived_root::<$ty>(bytes)
+            // rkyv's `check_archived_root` resolves the archived root from
+            // the *end* of the buffer and follows relative pointers that
+            // assume the buffer is aligned to the archive's alignment. The
+            // encode side returns an `AlignedVec`, but a WAL record body is
+            // a `&[u8]` slice at an arbitrary offset inside the larger
+            // record buffer — almost never aligned. Validating that slice
+            // directly trips "pointer out of bounds". Copy into an
+            // `AlignedVec` so the relative-pointer arithmetic is sound.
+            let mut aligned = rkyv::AlignedVec::with_capacity(bytes.len());
+            aligned.extend_from_slice(bytes);
+            let archived = rkyv::check_archived_root::<$ty>(&aligned)
                 .map_err(|e| PhaseBodyError::Decode(e.to_string()))?;
             archived
                 .deserialize(&mut rkyv::Infallible)
@@ -494,5 +504,77 @@ mod tests {
     fn decode_rejects_garbage_bytes() {
         let err = decode_entity_tombstone(&[0xFF, 0x00, 0x13, 0x37]);
         assert!(matches!(err, Err(PhaseBodyError::Decode(_))));
+    }
+
+    /// Regression: during recovery the body is a `&[u8]` slice carved out
+    /// of a larger WAL record buffer, so it lands on an arbitrary
+    /// (almost-never-aligned) address. Decoding such a slice directly used
+    /// to trip rkyv's "pointer out of bounds" because `check_archived_root`
+    /// assumes the buffer is aligned to the archive's alignment. The decode
+    /// now copies into an `AlignedVec` first. This test reproduces the
+    /// recovery layout by placing each encoded body at a deliberately odd
+    /// offset inside a backing buffer and decoding from the misaligned
+    /// sub-slice.
+    fn decode_from_misaligned<T, F>(bytes: &[u8], decode: F) -> T
+    where
+        F: Fn(&[u8]) -> Result<T, PhaseBodyError>,
+    {
+        // Prefix with 1 byte to force an odd start offset, then decode the
+        // tail sub-slice — the same shape a WAL body slice has.
+        let mut backing = Vec::with_capacity(bytes.len() + 1);
+        backing.push(0xAB);
+        backing.extend_from_slice(bytes);
+        decode(&backing[1..]).expect("misaligned decode must succeed")
+    }
+
+    #[test]
+    fn entity_create_body_decodes_from_misaligned_slice() {
+        let body = sample_entity_metadata();
+        let bytes = encode_entity_create(&body);
+        let got = decode_from_misaligned(&bytes, decode_entity_create);
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn statement_create_body_decodes_from_misaligned_slice() {
+        let body = StatementCreateBody {
+            meta: sample_statement_metadata(),
+            predicate_intern_hint: Some(("brain".into(), "likes".into())),
+        };
+        let bytes = encode_statement_create(&body);
+        let got = decode_from_misaligned(&bytes, decode_statement_create);
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn entity_merge_body_decodes_from_misaligned_slice() {
+        let body = EntityMergeBody {
+            source: EntityId::new().to_bytes(),
+            target: EntityId::new().to_bytes(),
+            retain_aliases: true,
+            retain_attributes: false,
+            at_unix_nanos: 1_700_000_000_000_000_333,
+            confidence: 0.95,
+            reason: "duplicate detected by resolver".into(),
+            actor_kind: 1,
+            actor_agent: [7u8; 16],
+            grace_seconds: 7 * 24 * 60 * 60,
+        };
+        let bytes = encode_entity_merge(&body);
+        let got = decode_from_misaligned(&bytes, decode_entity_merge);
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn schema_update_body_decodes_from_misaligned_slice() {
+        let body = SchemaUpdateBody {
+            namespace: "acme".into(),
+            version: 3,
+            blob: b"entity Person { name: text }".to_vec(),
+            created_at_unix_nanos: 1_700_000_000_000_000_777,
+        };
+        let bytes = encode_schema_update(&body);
+        let got = decode_from_misaligned(&bytes, decode_schema_update);
+        assert_eq!(got, body);
     }
 }
