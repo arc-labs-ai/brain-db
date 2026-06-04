@@ -5,17 +5,18 @@ use std::sync::Mutex as StdMutex;
 use std::thread;
 use std::time::Duration;
 
-use brain_core::{EntityId, MemoryId};
+use brain_core::{AgentId, ContextId, EntityId, MemoryId, MemoryKind};
 use brain_index::{
     GraphError, GraphQuery, GraphRetriever, GraphRetrieverConfig, LexicalError, LexicalQuery,
     LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItem, RankedItemId,
     SemanticError, SemanticQuery, SemanticRetriever, SemanticRetrieverConfig, SemanticScope,
 };
+use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
 use tempfile::TempDir;
 
 use super::{execute, QueryMetadata, QueryResult, RetrievalExecutorContext, RetrieverStatus};
-use crate::retrieval::planner::plan;
+use crate::retrieval::planner::{plan, RetrieverConfig};
 use crate::retrieval::router::{QueryRequest, Retriever, RetrieverSelection};
 
 // ---------------------------------------------------------------------------
@@ -91,13 +92,47 @@ fn ranked_memory(slot: u64, rank: u32, score: f32) -> RankedItem {
     }
 }
 
+/// Seed `slots` as live (ACTIVE) memory rows so the executor's
+/// always-on tombstone filter keeps mock retriever hits — it drops any
+/// candidate whose row is absent (`memory_active` → None → drop). Ids
+/// mirror the `MemoryId::pack(0, slot, 0)` the mock retrievers emit.
+fn seed_active_memories(metadata: &mut MetadataDb, slots: std::ops::Range<u64>) {
+    let wtxn = metadata.write_txn().expect("wtxn");
+    {
+        let mut t = wtxn.open_table(MEMORIES_TABLE).expect("open");
+        for slot in slots {
+            let id = MemoryId::pack(0, slot, 0);
+            let row = MemoryMetadata::new_active(
+                id,
+                AgentId::new(),
+                ContextId::from(0),
+                id.slot(),
+                id.version(),
+                MemoryKind::Semantic,
+                [0u8; 16],
+                0.5,
+                0,
+                0,
+            );
+            t.insert(&id.raw().to_be_bytes(), &row).expect("insert");
+        }
+    }
+    wtxn.commit().expect("commit");
+}
+
 fn make_ctx(
     semantic: Option<MockSemantic>,
     lexical: Option<MockLexical>,
     graph: Option<MockGraph>,
 ) -> (TempDir, RetrievalExecutorContext) {
     let dir = TempDir::new().expect("tempdir");
-    let metadata = MetadataDb::open(dir.path().join("metadata.redb")).expect("open");
+    let mut metadata = MetadataDb::open(dir.path().join("metadata.redb")).expect("open");
+    // The executor's always-on tombstone filter drops any memory hit
+    // whose row is absent from metadata (`memory_active` → None → drop).
+    // The mock retrievers return ids `MemoryId::pack(0, slot, 0)` for
+    // small slots, so seed those slots as live rows; otherwise every
+    // fused candidate is filtered out and the executor returns nothing.
+    seed_active_memories(&mut metadata, 0..256);
     let sem_arc: Arc<dyn SemanticRetriever> = match semantic {
         Some(m) => Arc::new(m),
         None => Arc::new(MockSemantic {
@@ -349,13 +384,20 @@ fn timeout_records_status() {
     };
     let (_dir, ctx) = make_ctx(Some(sem), None, None);
 
-    // Plan's default semantic timeout is 50 ms; the mock sleeps 60.
     let req = QueryRequest {
         text: Some("topic".into()),
         retrievers: RetrieverSelection::Explicit(vec![Retriever::Semantic]),
         ..Default::default()
     };
-    let qp = plan(&req).expect("plan");
+    // Force a tight semantic budget so the mock's 60 ms delay trips the
+    // soft timeout deterministically — the planner default is 1 s, far
+    // above any sleep we'd want in a unit test.
+    let mut qp = plan(&req).expect("plan");
+    for r in &mut qp.retrievers {
+        if let RetrieverConfig::Semantic { timeout_ms, .. } = &mut r.config {
+            *timeout_ms = 10;
+        }
+    }
     let result = futures_lite::future::block_on(execute(&qp, &req, &ctx)).expect("execute");
     assert_eq!(
         outcome_status(&result.metadata, Retriever::Semantic),
