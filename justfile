@@ -148,7 +148,7 @@ prod-verify:
 # Same gates the nightly-perf workflow runs.
 prod-bench:
     cargo bench -p brain-planner --bench relation_traverse
-    cargo bench -p brain-index --bench recall
+    cargo bench -p brain-index --bench lexical_retrieve
 
 # Run miri on brain-storage's lib tests. Miri doesn't shim our syscalls
 # (mmap/mremap/pwritev2/...), so syscall-bound tests are gated under
