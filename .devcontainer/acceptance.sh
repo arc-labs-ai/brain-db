@@ -134,9 +134,12 @@ gate_smoke() {
 }
 
 gate_performance() {
-  # CI compiles the criterion benches (catches breakage); a real
-  # release run replaces this with a full `cargo bench` on quiet
-  # hardware and a diff against the prior release baseline.
+  # CI compiles the in-crate criterion benches (catches breakage); a real
+  # release run replaces this with a full `cargo bench` on quiet hardware
+  # and a diff against the prior release baseline. The end-to-end
+  # performance-at-scale run (100K/1M latency + throughput + recall@K)
+  # lives in the brain-eval rig (brain-db-io/brain-eval), which drives a
+  # running server over the wire on reference hardware.
   cargo bench --workspace --no-run 2>&1 | tail -3
 }
 
