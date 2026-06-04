@@ -7,7 +7,7 @@
 //!   path over a 5-doc fixture has no HNSW pressure beyond the
 //!   substrate memory index and no tantivy round-trip; this is
 //!   the cache-warm floor reachable from RECALL inside a txn.
-//! - **Hybrid path** — must hold p95 ≤ 12 ms. Hybrid is the
+//! - **Retrieval path** — must hold p95 ≤ 12 ms. Retrieval is the
 //!   default for every wire RECALL; a 12 ms p95 keeps interactive
 //!   flows responsive at K=10 without text.
 //!
@@ -72,7 +72,7 @@ impl Dispatcher for MockDispatcher {
 }
 
 // ---------------------------------------------------------------------------
-// Canned retrievers — return one hit each so the hybrid path
+// Canned retrievers — return one hit each so the retrieval path
 // exercises the full RRF + projection codepath. Production deployments
 // hit real tantivy and HNSW shards; this measurement is the in-process
 // floor, not an upper bound.
@@ -155,7 +155,7 @@ fn build_fixture() -> Fixture {
     }
 }
 
-fn attach_hybrid_mocks(fix: &mut Fixture, memory_id: u128) {
+fn attach_retrieval_mocks(fix: &mut Fixture, memory_id: u128) {
     let item = RankedItem {
         id: RankedItemId::Memory(MemoryId::from_raw(memory_id)),
         rank: 1,
@@ -308,7 +308,7 @@ fn recall_p95_substrate_via_internal_entry_point() {
 }
 
 // ---------------------------------------------------------------------------
-// PERF1B — hybrid path. Reached by `handle_recall` when no txn is
+// PERF1B — retrieval path. Reached by `handle_recall` when no txn is
 // attached and all three retrievers are wired. Gated at 12 ms p95;
 // canned retrievers keep this an in-process floor measurement, not
 // an end-to-end wire test.
@@ -316,17 +316,17 @@ fn recall_p95_substrate_via_internal_entry_point() {
 
 #[test]
 #[ignore = "perf gate: workstation-tuned thresholds, run explicitly"]
-fn recall_p95_hybrid_via_handle_recall() {
+fn recall_p95_retrieval_via_handle_recall() {
     run_in_glommio(|| async {
         let mut fix = build_fixture();
         let first = seed(&fix).await;
-        attach_hybrid_mocks(&mut fix, first);
+        attach_retrieval_mocks(&mut fix, first);
 
         let (p50, p95) = measure(&fix, None).await;
         let budget = Duration::from_millis(12);
         assert!(
             p95 <= budget,
-            "hybrid p95 {p95:?} exceeds budget {budget:?} (p50 {p50:?})",
+            "retrieval p95 {p95:?} exceeds budget {budget:?} (p50 {p50:?})",
         );
     })
 }

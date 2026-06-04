@@ -503,7 +503,7 @@ pub async fn dispatch(
                 .map(|b| single(ResponseBody::ExtractorEnable(b)))
         }
 
-        // Hybrid query ops.
+        // Retrieval query ops.
         RequestBody::Query(r) => crate::query::handle_query(r, ctx)
             .await
             .map(|b| single(ResponseBody::Query(b))),
@@ -513,9 +513,9 @@ pub async fn dispatch(
         RequestBody::QueryTrace(r) => crate::query::handle_query_trace(r, ctx)
             .await
             .map(|b| single(ResponseBody::QueryTrace(b))),
-        RequestBody::RecallHybrid(r) => crate::query::handle_recall_hybrid(r, ctx)
+        RequestBody::QueryText(r) => crate::query::handle_query_text(r, ctx)
             .await
-            .map(|b| single(ResponseBody::RecallHybrid(b))),
+            .map(|b| single(ResponseBody::QueryText(b))),
 
         // Procedural-memory materialization (W3.1, wire v2).
         RequestBody::MaterializeProcedural(r) => {
@@ -592,7 +592,7 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
         | RequestBody::Query(_)
         | RequestBody::QueryExplain(_)
         | RequestBody::QueryTrace(_)
-        | RequestBody::RecallHybrid(_)
+        | RequestBody::QueryText(_)
         | RequestBody::MaterializeProcedural(_) => (perm_bits::RECALL, "GRAPH_READ"),
 
         // Extractor governance — admin-only.

@@ -165,7 +165,7 @@ Brain applies this asymmetry through a dispatcher-level split:
 | ENCODE memory text | `Dispatcher::embed` | passage — stored vector |
 | Entity-create canonical name | `Dispatcher::embed` | passage — stored vector (resolver tier-3 looks up by passage similarity) |
 | RECALL cue, PLAN cue, REASON cue | `Dispatcher::embed_query` | query — looked up against passage vectors |
-| Hybrid SemanticRetriever query | `Dispatcher::embed_query` | query |
+| Retrieval SemanticRetriever query | `Dispatcher::embed_query` | query |
 | Statement embed worker | `Dispatcher::embed` | passage — stored vector |
 
 `embed_query` is a default-implemented trait method that concatenates the prefix and forwards to `embed`. Implementations may override the default (for example, a multilingual deployment swapping to a model whose prefix differs, or to no prefix). The model fingerprint covers the choice of model but **not** the prefix; a deployment that overrides the prefix and then changes back without rebuilding the index will see degraded recall until the cue cache cycles. (Operator-visible knob; not a correctness invariant.)

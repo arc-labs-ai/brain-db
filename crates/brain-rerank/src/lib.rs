@@ -1,6 +1,6 @@
 //! # brain-rerank
 //!
-//! Cross-encoder reranker for Brain's hybrid retrieval. Loads
+//! Cross-encoder reranker for Brain's retrieval. Loads
 //! `BAAI/bge-reranker-base` (a `BertForSequenceClassification`
 //! with `num_labels=1`) via candle and scores `(query, candidate)`
 //! pairs.
@@ -12,7 +12,7 @@
 //! and truncates to `final_top_k`.
 //!
 //! The reranker is **optional**. When the model is unavailable
-//! (no on-disk weights, unsupported device, etc.) the hybrid
+//! (no on-disk weights, unsupported device, etc.) the retrieval
 //! pipeline gracefully falls back to RRF-only ranking and logs
 //! the skip at `info` level.
 
@@ -71,7 +71,7 @@ pub fn auto_discover_model_dir() -> Option<PathBuf> {
 
 /// Best-effort load: returns `Ok(None)` (rather than an error) when
 /// auto-discovery succeeds but the directory is empty / missing.
-/// The hybrid pipeline treats `Ok(None)` as "reranker not
+/// The retrieval pipeline treats `Ok(None)` as "reranker not
 /// configured; fall back to RRF" and logs at `info`.
 ///
 /// Hard errors (corrupt weights, unsupported device on an

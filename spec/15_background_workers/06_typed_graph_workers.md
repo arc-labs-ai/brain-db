@@ -186,7 +186,7 @@ Both use **bounded queues** with capacity 4096 by default.
 
 Both use **backpressure-on-overflow**, NOT drop-on-overflow. This is the only worker class in this section that backpressures the foreground; every other typed-graph worker (classifier extractor, LLM extractor, entity resolver, embedding workers, audit-log sweeper) drops on queue full and records a metric.
 
-**Justification:** lexical recall is a correctness property of query (see [`../13_retrievers/05_hybrid_query.md`](../13_retrievers/05_hybrid_query.md)). Silent index drift — where a memory exists in redb but not in tantivy — would mean clients see incomplete results without any audit trail. Backpressure is preferable: the foreground op waits a few milliseconds, the user sees a slightly slower ENCODE, but the index stays consistent.
+**Justification:** lexical recall is a correctness property of query (see [`../13_retrievers/05_retrieval_query.md`](../13_retrievers/05_retrieval_query.md)). Silent index drift — where a memory exists in redb but not in tantivy — would mean clients see incomplete results without any audit trail. Backpressure is preferable: the foreground op waits a few milliseconds, the user sees a slightly slower ENCODE, but the index stays consistent.
 
 When the queue is at capacity:
 - The post-commit pipeline `await`s on the channel send.

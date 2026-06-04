@@ -148,11 +148,11 @@ pub enum ResponseBody {
     ExtractorDisable(ExtractorDisableResponse),
     ExtractorEnable(ExtractorEnableResponse),
 
-    // Hybrid query ops.
+    // Retrieval query ops.
     Query(QueryResponse),
     QueryExplain(QueryExplainResponse),
     QueryTrace(QueryTraceResponse),
-    RecallHybrid(RecallHybridResponse),
+    QueryText(QueryTextResponse),
 
     // Procedural-memory materialization. Carries the rendered system
     // block plus the statement ids that contributed.
@@ -231,7 +231,7 @@ impl ResponseBody {
             Self::Query(_) => Opcode::QueryResp,
             Self::QueryExplain(_) => Opcode::QueryExplainResp,
             Self::QueryTrace(_) => Opcode::QueryTraceResp,
-            Self::RecallHybrid(_) => Opcode::RecallHybridResp,
+            Self::QueryText(_) => Opcode::QueryTextResp,
             Self::MaterializeProcedural(_) => Opcode::MaterializeProceduralResp,
             Self::Error(_) => Opcode::Error,
         }
@@ -330,7 +330,7 @@ impl ResponseBody {
             Self::Query(r) => to_cbor_bytes(r),
             Self::QueryExplain(r) => to_cbor_bytes(r),
             Self::QueryTrace(r) => to_cbor_bytes(r),
-            Self::RecallHybrid(r) => to_cbor_bytes(r),
+            Self::QueryText(r) => to_cbor_bytes(r),
             Self::MaterializeProcedural(r) => to_cbor_bytes(r),
             Self::Error(r) => to_cbor_bytes(r),
         }
@@ -408,7 +408,7 @@ impl ResponseBody {
             Opcode::QueryResp => Self::Query(from_cbor_bytes(bytes)?),
             Opcode::QueryExplainResp => Self::QueryExplain(from_cbor_bytes(bytes)?),
             Opcode::QueryTraceResp => Self::QueryTrace(from_cbor_bytes(bytes)?),
-            Opcode::RecallHybridResp => Self::RecallHybrid(from_cbor_bytes(bytes)?),
+            Opcode::QueryTextResp => Self::QueryText(from_cbor_bytes(bytes)?),
             Opcode::MaterializeProceduralResp => {
                 Self::MaterializeProcedural(from_cbor_bytes(bytes)?)
             }

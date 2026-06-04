@@ -210,15 +210,15 @@ pub enum Opcode {
     RelationTraverseReq = 0x0156,
     RelationTraverseResp = 0x01D6,
 
-    // Hybrid query operations (0x0160-0x0163).
+    // Retrieval query operations (0x0160-0x0163).
     QueryReq = 0x0160,
     QueryResp = 0x01E0,
     QueryExplainReq = 0x0161,
     QueryExplainResp = 0x01E1,
     QueryTraceReq = 0x0162,
     QueryTraceResp = 0x01E2,
-    RecallHybridReq = 0x0163,
-    RecallHybridResp = 0x01E3,
+    QueryTextReq = 0x0163,
+    QueryTextResp = 0x01E3,
 
     // Procedural-memory materialization. Renders an agent's stored
     // `brain:behavior_*` Preferences into a system block for LLM prompt
@@ -370,8 +370,8 @@ impl Opcode {
             0x01E1 => Self::QueryExplainResp,
             0x0162 => Self::QueryTraceReq,
             0x01E2 => Self::QueryTraceResp,
-            0x0163 => Self::RecallHybridReq,
-            0x01E3 => Self::RecallHybridResp,
+            0x0163 => Self::QueryTextReq,
+            0x01E3 => Self::QueryTextResp,
 
             0x0164 => Self::MaterializeProceduralReq,
             0x01E4 => Self::MaterializeProceduralResp,
@@ -637,15 +637,15 @@ mod tests {
         (0x01D5, Opcode::RelationListToResp),
         (0x0156, Opcode::RelationTraverseReq),
         (0x01D6, Opcode::RelationTraverseResp),
-        // Typed-graph — hybrid query
+        // Typed-graph — retrieval query
         (0x0160, Opcode::QueryReq),
         (0x01E0, Opcode::QueryResp),
         (0x0161, Opcode::QueryExplainReq),
         (0x01E1, Opcode::QueryExplainResp),
         (0x0162, Opcode::QueryTraceReq),
         (0x01E2, Opcode::QueryTraceResp),
-        (0x0163, Opcode::RecallHybridReq),
-        (0x01E3, Opcode::RecallHybridResp),
+        (0x0163, Opcode::QueryTextReq),
+        (0x01E3, Opcode::QueryTextResp),
         // Typed-graph — procedural memory materialization
         (0x0164, Opcode::MaterializeProceduralReq),
         (0x01E4, Opcode::MaterializeProceduralResp),

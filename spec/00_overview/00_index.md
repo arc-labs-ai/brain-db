@@ -6,7 +6,7 @@
 
 > **Brain — a memory database for AI agents.**
 >
-> Stores four record types — Memory, Entity, Statement, Relation — with explicit provenance, confidence, and bi-temporal validity. Hybrid retrieval (semantic + lexical + entity-graph + temporal) fused with weighted rank fusion. One Rust core, one wire protocol, one schema. Embedded / self-hosted / cluster from the same Apache 2.0 crates.
+> Stores four record types — Memory, Entity, Statement, Relation — with explicit provenance, confidence, and bi-temporal validity. Retrieval fuses semantic, lexical, entity-graph, and temporal signals with weighted rank fusion. One Rust core, one wire protocol, one schema. Embedded / self-hosted / cluster from the same Apache 2.0 crates.
 
 ## Status
 

@@ -1017,9 +1017,7 @@ mod wal_record_projection {
 
     #[test]
     fn flagged_entity_event_record_projects_to_entity_created() {
-        let r = entity_created_event_record(
-            brain_storage::wal::record::FLAG_SUBSCRIBE_EVENT,
-        );
+        let r = entity_created_event_record(brain_storage::wal::record::FLAG_SUBSCRIBE_EVENT);
         let envs = EventEnvelope::from_wal_record(&r);
         assert_eq!(envs.len(), 1, "one EntityCreated event");
         assert_eq!(envs[0].event_type, EventType::EntityCreated);

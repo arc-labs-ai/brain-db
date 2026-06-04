@@ -87,7 +87,7 @@ This gives the correct behaviour for both schemaless deployments (no knowledge t
 
 ## Interaction with schemaless vs schema-declared paths
 
-The enrichment payload is identical on both server-side paths. The schemaless path opens its own `ReadTransaction`; the schema-declared (hybrid retrieval) path reuses the transaction already open for the `MEMORIES_TABLE` scan (no double-lock). Both paths populate `MemoryResult.graph` exactly when `req.include_graph` is set; the rest of `MemoryResult` (`similarity_score`, `confidence`, `fused_score`, `contributing_retrievers`, …) is unaffected.
+The enrichment payload is identical on both server-side paths. The schemaless path opens its own `ReadTransaction`; the schema-declared (retrieval) path reuses the transaction already open for the `MEMORIES_TABLE` scan (no double-lock). Both paths populate `MemoryResult.graph` exactly when `req.include_graph` is set; the rest of `MemoryResult` (`similarity_score`, `confidence`, `fused_score`, `contributing_retrievers`, …) is unaffected.
 
 ## Cost note
 
@@ -124,7 +124,7 @@ bge-reranker-base.
 - **Params:** ~110M.
 - **License:** MIT.
 
-bge-reranker-base is the production-default cross-encoder for hybrid retrieval in the field — best precision-per-MB among the MIT-licensed options and small enough to keep CPU rerank cost in budget for the 50→10 cut.
+bge-reranker-base is the production-default cross-encoder for retrieval in the field — best precision-per-MB among the MIT-licensed options and small enough to keep CPU rerank cost in budget for the 50→10 cut.
 
 ## Triggering
 

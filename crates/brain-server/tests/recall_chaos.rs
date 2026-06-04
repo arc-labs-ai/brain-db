@@ -1,6 +1,6 @@
-//! Chaos: kill the server while a hybrid recall is in flight.
+//! Chaos: kill the server while a retrieval recall is in flight.
 //!
-//! **CH1** — issue a hybrid recall on a populated shard; concurrently
+//! **CH1** — issue a retrieval recall on a populated shard; concurrently
 //! drop the shard handles + signal shutdown before the response is
 //! fully read. The client must observe a clean failure (connection
 //! reset / EOF / decode error against a truncated frame) within a
@@ -192,7 +192,7 @@ fn recall_request() -> RecallRequest {
 }
 
 // ---------------------------------------------------------------------------
-// CH1 — kill during hybrid recall.
+// CH1 — kill during retrieval recall.
 //
 // Sequence:
 //   1. start server, handshake, seed a non-trivial fixture.
@@ -212,7 +212,7 @@ fn recall_request() -> RecallRequest {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shutdown_mid_hybrid_recall_completes_within_two_seconds() {
+async fn shutdown_mid_retrieval_recall_completes_within_two_seconds() {
     let outer = tokio::time::timeout(Duration::from_secs(15), async {
         let server = start(1).await;
         let mut client = TcpStream::connect(server.data_plane_addr)
@@ -221,7 +221,7 @@ async fn shutdown_mid_hybrid_recall_completes_within_two_seconds() {
         complete_handshake(&mut client).await;
         seed_fixture(&mut client).await;
 
-        // Send the hybrid recall but do NOT read the response yet —
+        // Send the retrieval recall but do NOT read the response yet —
         // we want the server's reply (or its truncation) to race
         // with our shutdown signal.
         let body = RequestBody::Recall(recall_request());

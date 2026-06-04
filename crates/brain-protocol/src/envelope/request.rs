@@ -143,11 +143,11 @@ pub enum RequestBody {
     ExtractorDisable(ExtractorDisableRequest),
     ExtractorEnable(ExtractorEnableRequest),
 
-    // Hybrid query ops.
+    // Retrieval query ops.
     Query(QueryRequest),
     QueryExplain(QueryExplainRequest),
     QueryTrace(QueryTraceRequest),
-    RecallHybrid(RecallHybridRequest),
+    QueryText(QueryTextRequest),
 
     // Procedural-memory materialization. Reads an agent's stored
     // `brain:behavior_*` Preferences and renders a system block for
@@ -226,7 +226,7 @@ impl RequestBody {
             Self::Query(_) => Opcode::QueryReq,
             Self::QueryExplain(_) => Opcode::QueryExplainReq,
             Self::QueryTrace(_) => Opcode::QueryTraceReq,
-            Self::RecallHybrid(_) => Opcode::RecallHybridReq,
+            Self::QueryText(_) => Opcode::QueryTextReq,
             Self::MaterializeProcedural(_) => Opcode::MaterializeProceduralReq,
         }
     }
@@ -307,7 +307,7 @@ impl RequestBody {
             Self::Query(r) => to_cbor_bytes(r),
             Self::QueryExplain(r) => to_cbor_bytes(r),
             Self::QueryTrace(r) => to_cbor_bytes(r),
-            Self::RecallHybrid(r) => to_cbor_bytes(r),
+            Self::QueryText(r) => to_cbor_bytes(r),
             Self::MaterializeProcedural(r) => to_cbor_bytes(r),
         }
     }
@@ -391,7 +391,7 @@ impl RequestBody {
             Opcode::QueryReq => Self::Query(from_cbor_bytes(bytes)?),
             Opcode::QueryExplainReq => Self::QueryExplain(from_cbor_bytes(bytes)?),
             Opcode::QueryTraceReq => Self::QueryTrace(from_cbor_bytes(bytes)?),
-            Opcode::RecallHybridReq => Self::RecallHybrid(from_cbor_bytes(bytes)?),
+            Opcode::QueryTextReq => Self::QueryText(from_cbor_bytes(bytes)?),
             Opcode::MaterializeProceduralReq => {
                 Self::MaterializeProcedural(from_cbor_bytes(bytes)?)
             }

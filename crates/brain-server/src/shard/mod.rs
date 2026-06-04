@@ -1783,7 +1783,7 @@ pub fn spawn_shard(
 
             // The lexical retriever was constructed alongside the
             // tantivy open above and propagated in here pre-built.
-            // Hybrid query consumes it via
+            // Retrieval consumes it via
             // `OpsContext.lexical_retriever`.
             let lexical_retriever_for_ops = lexical_retriever_for_closure;
 
@@ -2171,7 +2171,7 @@ pub fn spawn_shard(
             // StatementEmbedWorker — drains the redb embed queue, runs
             // each pending statement through the BGE dispatcher, and
             // populates the per-shard StatementHnswIndex. Without this
-            // worker the hybrid query path's statement-corpus semantic
+            // worker the retrieval path's statement-corpus semantic
             // retriever returns zero hits and recall degenerates to
             // BM25 + graph only.
             //

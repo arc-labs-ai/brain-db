@@ -1,18 +1,18 @@
-//! Hybrid query handlers.
+//! Retrieval query handlers.
 //!
-//! Wire entry points for the four hybrid-query opcodes:
+//! Wire entry points for the four retrieval-query opcodes:
 //!
 //! - `Query`         (0x0160 / 0x01E0) — plan + execute; return fused items.
 //! - `QueryExplain`  (0x0161 / 0x01E1) — plan only; return rendered plan text.
 //! - `QueryTrace`    (0x0162 / 0x01E2) — plan + execute; return rendered
 //!   plan-with-execution text.
-//! - `RecallHybrid`  (0x0163 / 0x01E3) — narrow projection: text → list of
+//! - `QueryText`     (0x0163 / 0x01E3) — narrow projection: text → list of
 //!   Memory ids + fused scores.
 //!
 //! Each handler does three things:
 //!
 //! 1. Translate the wire request into the planner's
-//!    `brain_planner::hybrid::router::QueryRequest`.
+//!    `brain_planner::retrieval::router::QueryRequest`.
 //! 2. Call `plan(&req)` and (for non-EXPLAIN paths) `execute(...)`.
 //! 3. Project the planner's `QueryResult` back onto a wire response.
 //!
@@ -25,20 +25,20 @@ use brain_core::{EntityId, PredicateId};
 use brain_index::RankedItemId;
 use brain_metadata::schema::predicate::predicate_lookup_by_qname;
 use brain_metadata::schema::store::schema_active;
-use brain_planner::hybrid::executor::{
-    execute, ExecutionError, HybridExecutorContext, QueryMetadata, QueryResult, RetrieverStatus,
+use brain_planner::retrieval::executor::{
+    execute, ExecutionError, QueryMetadata, QueryResult, RetrievalExecutorContext, RetrieverStatus,
 };
-use brain_planner::hybrid::explain::{render_plan, render_trace};
-use brain_planner::hybrid::fusion::FusedItem;
-use brain_planner::hybrid::planner::{plan, PlanError};
-use brain_planner::hybrid::router::{
+use brain_planner::retrieval::explain::{render_plan, render_trace};
+use brain_planner::retrieval::fusion::FusedItem;
+use brain_planner::retrieval::planner::{plan, PlanError};
+use brain_planner::retrieval::router::{
     FusionConfig, PerRetrieverWeights, QueryRequest as PlannerQueryRequest, Retriever,
     RetrieverSelection, TimeRange,
 };
 use brain_protocol::{
     FusionConfigWire, ItemIdWire, MemoryHit, QueryExplainRequest, QueryExplainResponse,
-    QueryRequest as WireQueryRequest, QueryResponse, QueryResultItem, QueryTraceRequest,
-    QueryTraceResponse, RecallHybridRequest, RecallHybridResponse, RetrieverContributionWire,
+    QueryRequest as WireQueryRequest, QueryResponse, QueryResultItem, QueryTextRequest,
+    QueryTextResponse, QueryTraceRequest, QueryTraceResponse, RetrieverContributionWire,
     RetrieverOutcomeWire, RetrieverSelectionWire, RetrieverWire, TimeRangeWire,
 };
 
@@ -72,7 +72,7 @@ enum PredicateResolution {
     EmptyResultSet,
 }
 
-/// Run a full hybrid query: plan + execute, project to wire.
+/// Run a full retrieval query: plan + execute, project to wire.
 pub async fn handle_query(
     req: WireQueryRequest,
     ctx: &OpsContext,
@@ -199,11 +199,11 @@ fn resolve_predicate_filter(
     Ok(PredicateResolution::Ok(out))
 }
 
-/// RECALL_HYBRID — narrow projection over the hybrid path: text → memory ids.
-pub async fn handle_recall_hybrid(
-    req: RecallHybridRequest,
+/// QUERY_TEXT — narrow projection over the retrieval path: text → memory ids.
+pub async fn handle_query_text(
+    req: QueryTextRequest,
     ctx: &OpsContext,
-) -> Result<RecallHybridResponse, OpError> {
+) -> Result<QueryTextResponse, OpError> {
     validate_text_length(&req.text)?;
     let planner_req = PlannerQueryRequest {
         text: Some(req.text),
@@ -211,7 +211,7 @@ pub async fn handle_recall_hybrid(
         kind_filter: Vec::new(),
         predicate_filter: Vec::new(),
         context_filter: Vec::new(),
-        // Wire-level QUERY/RECALL_HYBRID is the low-level hybrid API
+        // Wire-level QUERY/QUERY_TEXT is the low-level retrieval API
         // used by explore/admin tooling — no implicit caller-agent
         // isolation. Callers that want agent scope pass it through the
         // higher-level RECALL path.
@@ -235,7 +235,7 @@ pub async fn handle_recall_hybrid(
         .iter()
         .filter_map(memory_hit_from_fused)
         .collect();
-    Ok(RecallHybridResponse { items })
+    Ok(QueryTextResponse { items })
 }
 
 // ---------------------------------------------------------------------------
@@ -357,8 +357,8 @@ fn fusion_config_from_wire(w: FusionConfigWire) -> FusionConfig {
 // Executor context assembly.
 // ---------------------------------------------------------------------------
 
-fn build_executor_context(ctx: &OpsContext) -> Result<HybridExecutorContext, OpError> {
-    Ok(HybridExecutorContext {
+fn build_executor_context(ctx: &OpsContext) -> Result<RetrievalExecutorContext, OpError> {
+    Ok(RetrievalExecutorContext {
         semantic: ctx.semantic_retriever.clone(),
         lexical: ctx.lexical_retriever.clone(),
         graph: ctx.graph_retriever.clone(),

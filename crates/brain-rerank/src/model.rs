@@ -36,7 +36,7 @@ const WEIGHTS_FILE: &str = "model.safetensors";
 pub const DEFAULT_MAX_TOKEN_LEN: usize = 512;
 
 /// Errors raised by the cross-encoder loader / scorer. Hot-path
-/// callers (the hybrid executor) downgrade `Skipped` returns to
+/// callers (the retrieval executor) downgrade `Skipped` returns to
 /// "RRF-only result" with a single `info` log.
 #[derive(Debug, Error)]
 pub enum RerankError {

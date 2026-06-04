@@ -179,9 +179,8 @@ impl EventEnvelope {
 
         let lsn = record.lsn.raw();
         let timestamp_unix_nanos = record.timestamp_ns;
-        let is_subscribe_event = record.flags
-            & brain_storage::wal::record::FLAG_SUBSCRIBE_EVENT
-            != 0;
+        let is_subscribe_event =
+            record.flags & brain_storage::wal::record::FLAG_SUBSCRIBE_EVENT != 0;
         let Ok(payload) = record.typed_payload() else {
             return Vec::new();
         };

@@ -255,10 +255,10 @@ pub struct MemoryResult {
     pub edges: Option<Vec<EdgeView>>,
     /// Retrievers that surfaced this memory. Empty when no schema is
     /// declared and inside transactions; populated when the server
-    /// routes RECALL through the hybrid engine.
+    /// routes RECALL through the retrieval engine.
     pub contributing_retrievers: Vec<RetrieverNameWire>,
     /// Post-RRF fused rank score. `0.0` on no-schema deployments
-    /// and inside transactions; positive when hybrid retrieval ran
+    /// and inside transactions; positive when retrieval ran
     pub fused_score: f32,
     /// Cross-encoder relevance score, present iff the rerank stage
     /// actually scored this hit (cross-encoder loaded on the shard

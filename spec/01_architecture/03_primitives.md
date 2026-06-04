@@ -77,7 +77,7 @@ The agent asks for memories relevant to a cue.
 
 1. Embeds the cue text.
 2. Asks the planner which strategy to use:
-   - **Hybrid** (default) — ANN + lexical + memory-edge graph fused via RRF.
+   - **Retrieval** (default) — ANN + lexical + memory-edge graph fused via RRF.
    - **Schemaless** — fast vector-only similarity.
 3. Executes the strategy.
 4. Filters by context, age, kind, and other criteria.
@@ -89,7 +89,7 @@ The agent asks for memories relevant to a cue.
 
 The planner's strategy choice is invisible to the client. The agent says "recall things similar to this cue"; Brain decides which path to run. This is the SQL-like abstraction: declarative query, the planner picks the algorithm.
 
-For RECALL specifically there are exactly two paths and one selection rule: a request carrying a `txn_id` runs Brain path so read-your-writes works against the per-txn buffer overlay; every other request runs the hybrid path (semantic + lexical + memory-edge graph, fused via RRF). The selection is server-side; no wire field controls it.
+For RECALL specifically there are exactly two paths and one selection rule: a request carrying a `txn_id` runs Brain path so read-your-writes works against the per-txn buffer overlay; every other request runs the retrieval path (semantic + lexical + memory-edge graph, fused via RRF). The selection is server-side; no wire field controls it.
 
 ### 2.3 Confidence calibration
 

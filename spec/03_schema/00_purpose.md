@@ -27,7 +27,7 @@ User declarations narrow two things:
 | `STATEMENT_CREATE`, `RELATION_CREATE`, `ENTITY_CREATE` (explicit wire ops) | Accept the call only when the referenced predicate / relation_type / entity_type exists in some active namespace. Otherwise reject with `PredicateNotInSchema` / `RelationTypeNotInSchema` / `EntityTypeNotInSchema`. |
 | Extractor outputs | The pipeline runs on every ENCODE; persistence to the typed-graph tables happens only when the extracted entity / statement / relation references a declared type. Undeclared types are dropped silently (extraction is best-effort). |
 
-Read-side surfaces (`RECALL`, `QUERY`, hybrid fan-out, lexical and semantic retrievers) run regardless of which user namespaces are present — every shard wires all three retrievers at spawn.
+Read-side surfaces (`RECALL`, `QUERY`, retrieval fan-out, lexical and semantic retrievers) run regardless of which user namespaces are present — every shard wires all three retrievers at spawn.
 
 ## Purpose
 

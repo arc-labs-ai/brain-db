@@ -1,6 +1,6 @@
 # 04.09 Typed-Graph Operation Frames
 
-Request/response body schemas for the typed-graph "operation" opcodes — schema management (`0x0120–0x0126`), SUBSCRIBE event payloads carrying typed-graph deltas, the schema-optional / schemaless dispatch gate, hybrid query (`0x0160–0x0163`), and admin operations (`0x0170–0x0177`). These opcodes orchestrate the noun-frame surface defined in [`./08_typed_graph_frames.md`](./08_typed_graph_frames.md).
+Request/response body schemas for the typed-graph "operation" opcodes — schema management (`0x0120–0x0126`), SUBSCRIBE event payloads carrying typed-graph deltas, the schema-optional / schemaless dispatch gate, retrieval query (`0x0160–0x0163`), and admin operations (`0x0170–0x0177`). These opcodes orchestrate the noun-frame surface defined in [`./08_typed_graph_frames.md`](./08_typed_graph_frames.md).
 
 Brain's wire protocol — 32-byte header, opcode framing, CRC32C, payload encoding — is covered in [`./02_wire_format.md`](./02_wire_format.md), [`./03_opcodes.md`](./03_opcodes.md), and [`./05_frame_layouts.md`](./05_frame_layouts.md). This file specifies only the CBOR field schemas of the request/response payloads for the operation opcodes.
 
@@ -495,7 +495,7 @@ Notably:
 
 The typed-graph opcodes accept traffic in both modes: with or without a declared schema. When no schema is declared, predicates and relation types are open-vocabulary — they are interned on first use with origin `ImplicitFromWrite` (see [`../02_data_model/07_statement.md`](../02_data_model/07_statement.md) and [`../02_data_model/08_relation.md`](../02_data_model/08_relation.md)). When a schema is declared, it acts as a **strict validator** for that namespace: unknown qnames are rejected with `PredicateNotInSchema` / `RelationTypeNotInSchema`, and declared cardinalities are enforced.
 
-Brain's cognitive primitives (the `0x00xx` opcode namespace) and the hybrid retrieval path are unaffected by schema state — hybrid is the default `RECALL` path for every deployment.
+Brain's cognitive primitives (the `0x00xx` opcode namespace) and the retrieval path are unaffected by schema state — retrieval is the default `RECALL` path for every deployment.
 
 Schemaless ("open-vocabulary") and schema-declared ("strict") are both **first-class deployment postures**. A deployment that wants vector-schemaless behavior simply never calls the typed-graph opcodes.
 
@@ -528,7 +528,7 @@ Every opcode in the `0x00xx` namespace works in both modes:
 | Substrate opcode | Behavior in schemaless mode |
 |---|---|
 | `ENCODE_REQ` | works normally; no extractor runs because none are registered |
-| `RECALL_REQ` | works normally; runs the hybrid path (semantic + lexical + memory-edge graph) — hybrid is the default in both modes |
+| `RECALL_REQ` | works normally; runs the retrieval path (semantic + lexical + memory-edge graph) — retrieval is the default in both modes |
 | `PLAN_REQ`, `REASON_REQ`, `FORGET_REQ`, `LINK_REQ`, `UNLINK_REQ` | unchanged |
 | `SUBSCRIBE_REQ` | works; carries substrate events only (no typed-graph events possible since none can be emitted) |
 | `ADMIN_*` | unchanged |
@@ -547,14 +547,14 @@ The cutover is the redb commit, not the response emission. The connection layer 
 
 ### RECALL routing
 
-`RECALL_REQ` (`0x0021`) runs through the hybrid retriever (semantic + lexical + memory-edge graph, fused via RRF) by default in every deployment. Clients always see these fields populated on `MemoryResult`:
+`RECALL_REQ` (`0x0021`) runs through the retrieval pipeline (semantic + lexical + memory-edge graph, fused via RRF) by default in every deployment. Clients always see these fields populated on `MemoryResult`:
 
 - `contributing_retrievers: Vec<RetrieverNameWire>` — which retrievers ranked this memory.
 - `fused_score: f32` — the post-RRF rank score.
 
 Declaring a schema does not change the retrieval mode; it adds typed entity-anchored graph traversal as an additional path that the planner may select for the graph retriever. The `RecallResponseFrame` shape is identical in both modes.
 
-RECALL is one verb with no client-side strategy switch. A request that carries a `txn_id` runs the transactional path internally (read-your-writes requires it); every other RECALL runs the hybrid path. Clients always observe the same `RecallResponseFrame` shape; the `contributing_retrievers` field is populated for hybrid responses and empty for the transactional case. See [`./05_frame_layouts.md`](./05_frame_layouts.md).
+RECALL is one verb with no client-side strategy switch. A request that carries a `txn_id` runs the transactional path internally (read-your-writes requires it); every other RECALL runs the retrieval path. Clients always observe the same `RecallResponseFrame` shape; the `contributing_retrievers` field is populated for retrieval responses and empty for the transactional case. See [`./05_frame_layouts.md`](./05_frame_layouts.md).
 
 ### Multi-shard schema state
 
@@ -599,7 +599,7 @@ The wire shape is identical (`SchemaUploadRequest`). The server's behavior diver
 
 ## Query frames
 
-Request/response body schemas for `0x0160–0x0163` — the hybrid-query opcodes. These are the primary read API of the typed graph and accept traffic regardless of schema state.
+Request/response body schemas for `0x0160–0x0163` — the retrieval-query opcodes. These are the primary read API of the typed graph and accept traffic regardless of schema state.
 
 Cross-references:
 - [`../13_retrievers/`](../13_retrievers/00_purpose.md) — three retrievers (semantic / lexical / graph) + RRF fusion.
@@ -612,13 +612,13 @@ Cross-references:
 | `0x0160` | `QUERY` | "QUERY" | spec-only |
 | `0x0161` | `QUERY_EXPLAIN` | "QUERY_EXPLAIN" | spec-only |
 | `0x0162` | `QUERY_TRACE` | "QUERY_TRACE" | spec-only |
-| `0x0163` | `RECALL_HYBRID` | "RECALL_HYBRID" | spec-only |
+| `0x0163` | `QUERY_TEXT` | "QUERY_TEXT" | spec-only |
 
 Responses live at `0x01E0–0x01E3`.
 
-`QUERY` (`0x0160`) is the primary structured query opcode. `RECALL_HYBRID` (`0x0163`) is the simple-text fast path used by clients that just want hybrid text-only retrieval without an explicit query language.
+`QUERY` (`0x0160`) is the primary structured query opcode. `QUERY_TEXT` (`0x0163`) is the simple-text fast path used by clients that just want text-only retrieval without an explicit query language.
 
-Brain's `RECALL_REQ` (`0x0021`) runs the hybrid path by default in every deployment (see §"Schema-optional mode" §"RECALL routing"). The wire response carries `contributing_retrievers` and `fused_score` populated whether or not a schema has been declared.
+Brain's `RECALL_REQ` (`0x0021`) runs the retrieval path by default in every deployment (see §"Schema-optional mode" §"RECALL routing"). The wire response carries `contributing_retrievers` and `fused_score` populated whether or not a schema has been declared.
 
 ### Shared query types
 
@@ -667,7 +667,7 @@ pub struct RetrieverSelection {
 
 Semantics:
 
-- The query DSL is structured — combinations of entity / predicate / time / confidence conditions. For text-only queries the client builds the DSL (or use `RECALL_HYBRID` below).
+- The query DSL is structured — combinations of entity / predicate / time / confidence conditions. For text-only queries the client builds the DSL (or use `QUERY_TEXT` below).
 - `RetrieverSelection` lets clients disable retrievers or override per-retriever depth. Setting all three to false → `INVALID_ARGUMENT`.
 - `top_k` is the **final fused** top-K. Per-retriever `top_k`s are typically larger to give RRF a useful candidate pool (default: `4 * top_k`).
 - `budget_wall_time_ms` is a soft budget. The server returns whatever it has when exceeded with `QUERY_TIMEOUT` on the final frame.
@@ -714,7 +714,7 @@ Field discipline: only the field matching `kind` is populated; the others carry 
 
 #### `MemoryResult` reuse
 
-The `MemoryResult` substrate type ([`./05_frame_layouts.md`](./05_frame_layouts.md)) is reused unchanged. Typed-graph hybrid-retrieval results that include memories carry that type's existing fields; the post-schema additions (`contributing_retrievers`, `fused_score`) live on the **outer** `QueryResultItem` rather than mutating `MemoryResult`. Schemaless clients ignore the outer fields and consume `MemoryResult` directly.
+The `MemoryResult` substrate type ([`./05_frame_layouts.md`](./05_frame_layouts.md)) is reused unchanged. Typed-graph retrieval results that include memories carry that type's existing fields; the post-schema additions (`contributing_retrievers`, `fused_score`) live on the **outer** `QueryResultItem` rather than mutating `MemoryResult`. Schemaless clients ignore the outer fields and consume `MemoryResult` directly.
 
 #### `contributing_retrievers` bit-flag values
 
@@ -751,7 +751,7 @@ Substrate streaming model: per-frame, `EOS` on the tail. The tail body is a diff
 - `QUERY_OVER_BUDGET` (substrate `ResourceExhausted`) — per-shard memory or candidate-pool cap blown. Frame stream ends without an EOS tail; an `ERROR` frame closes the stream.
 - `PredicateNotInSchema` (0x004B) — strict mode only; `filters.predicate_filter` contains a qname not declared in the active schema.
 - `RelationTypeNotInSchema` (0x004C) — strict mode only; the DSL or graph step referenced an unknown relation type.
-- `HybridUnavailable` (0x0083) — a required retriever component is not currently servable (e.g. inside a transaction, during index rebuild).
+- `RetrievalUnavailable` (0x0083) — a required retriever component is not currently servable (e.g. inside a transaction, during index rebuild).
 - `INVALID_ARGUMENT` — DSL parse failure, `top_k > 1000`, all retrievers disabled.
 
 #### Cancellation
@@ -829,14 +829,14 @@ pub struct RetrieverTrace {
 
 `QUERY_TRACE` is **noticeably slower** than `QUERY` because of the trace bookkeeping. Clients should expose it as a debug-only operation. Production hot paths use `QUERY` (`0x0160`).
 
-### RECALL_HYBRID (0x0163)
+### QUERY_TEXT (0x0163)
 
 Text-only fast path. The server's planner builds a default `QueryRequest` from the text + minimal filters and runs it.
 
-#### Request — `RecallHybridRequest`
+#### Request — `QueryTextRequest`
 
 ```rust
-pub struct RecallHybridRequest {
+pub struct QueryTextRequest {
     pub text: String,                       // non-empty; ≤ 4 KiB
     pub top_k: u32,                         // 1..=1000
     pub min_confidence: f32,
@@ -857,9 +857,9 @@ Same shape as `QUERY` (streamed `QueryResultItem` frames + `QueryResultTail`). C
 
 `RECALL_REQ` (`0x0021`) returns **only** `MemoryResult`s — its substrate contract.
 
-`RECALL_HYBRID` (`0x0163`) returns a mix of `MemoryResult`, `EntityView`, `StatementView`, `RelationView` — leveraging the entity / statement / relation indexes alongside the memory HNSW.
+`QUERY_TEXT` (`0x0163`) returns a mix of `MemoryResult`, `EntityView`, `StatementView`, `RelationView` — leveraging the entity / statement / relation indexes alongside the memory HNSW.
 
-Both deployment postures may use either: the substrate `RECALL_REQ` returns memory results from the hybrid path; `RECALL_HYBRID` additionally surfaces typed entity / statement / relation results that have been populated from prior typed-graph writes (open-vocabulary or schema-declared).
+Both deployment postures may use either: the substrate `RECALL_REQ` returns memory results from the retrieval path; `QUERY_TEXT` additionally surfaces typed entity / statement / relation results that have been populated from prior typed-graph writes (open-vocabulary or schema-declared).
 
 #### Errors
 

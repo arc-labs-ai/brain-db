@@ -56,8 +56,8 @@ pub enum WorkerKind {
     /// text via the shared BGE dispatcher, and inserts the resulting
     /// 384-d vector into the per-shard `StatementHnswIndex`. Without
     /// this worker the statement HNSW stays empty forever and the
-    /// hybrid query path's statement-corpus semantic retriever returns
-    /// zero hits — hybrid recall over statements degenerates to
+    /// retrieval query path's statement-corpus semantic retriever returns
+    /// zero hits — retrieval recall over statements degenerates to
     /// BM25 + graph only.
     StatementEmbed,
     /// Walks active Statement rows and re-aggregates their stored

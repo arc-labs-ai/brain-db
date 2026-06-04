@@ -8,7 +8,7 @@ This file is loaded automatically by Claude Code at the start of every session. 
 
 ## 1. What this project is
 
-**Brain** is a memory database for AI agents. It stores typed memories — facts, preferences, events, entities, relations — with explicit provenance, confidence, and bi-temporal validity. Retrieval is hybrid (semantic + lexical + entity-graph + temporal) fused with weighted rank fusion. One Rust core, one wire protocol, one schema. Apache 2.0.
+**Brain** is a memory database for AI agents. It stores typed memories — facts, preferences, events, entities, relations — with explicit provenance, confidence, and bi-temporal validity. Retrieval fuses semantic, lexical, entity-graph, and temporal signals with weighted rank fusion. One Rust core, one wire protocol, one schema. Apache 2.0.
 
 Brain is **one system, one write path**. There is one `Write { phases: Vec<Phase> }` model, one writer (`submit(Write)`), one apply layer dispatching every phase variant. Capabilities differ by which state they touch (memories, entities, statements, relations, edges, schema, audit, slots) — not by which "layer" they belong to. The spec drops the old substrate / knowledge-layer split entirely.
 
@@ -45,7 +45,7 @@ Quick-find:
 | Fact vs Preference vs Event rules? | `spec/02_data_model/07_statement.md` |
 | What does the schema DSL look like? | `spec/03_schema/01_grammar.md` |
 | How do the three extractor tiers compose? | `spec/11_extractors/00_purpose.md` |
-| How does rank fusion work? | `spec/13_retrievers/01_rrf_fusion.md` + `spec/13_retrievers/05_hybrid_query.md` |
+| How does rank fusion work? | `spec/13_retrievers/01_rrf_fusion.md` + `spec/13_retrievers/05_retrieval_query.md` |
 | What typed-graph wire opcodes exist? | `spec/04_wire_protocol/03_opcodes.md` |
 | What's the typed-graph storage layout? | `spec/10_metadata/02_table_layout.md` |
 | What's the combined acceptance gate? | `spec/19_benchmarks/06_complete_acceptance.md` |
@@ -136,7 +136,7 @@ crates/
 ├── brain-metadata/      redb wrapper: memory + entity + statement + relation + predicate + audit tables
 ├── brain-index/         HNSW (memory + entity + statement); tantivy integration (phase 22)
 ├── brain-embed/         BGE embedding service
-├── brain-planner/       Query planner + executor (memory recall + hybrid query router)
+├── brain-planner/       Query planner + executor (memory recall + retrieval query router)
 ├── brain-ops/           One write path (`handlers/` per opcode → `apply/` per table → `writer/submit`) + `index/` retrievers + `extractor_writes`
 ├── brain-workers/       Background workers (auto-edge, temporal-edge, extractor, decay, …)
 ├── brain-extractors/    Pattern + classifier extractors (introduced phase 20)

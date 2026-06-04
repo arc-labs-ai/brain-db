@@ -44,7 +44,7 @@ pub trait GraphRetriever: Send + Sync {
 ///   simply find no entities.
 /// - [`GraphAnchor::Memory`] — the substrate memory graph
 ///   (edges_out / edges_in). Works on every deployment; lights
-///   up the hybrid path's graph contribution even without a
+///   up the retrieval path's graph contribution even without a
 ///   schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphAnchor {

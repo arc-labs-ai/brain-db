@@ -18,7 +18,7 @@ The retrieval surface activated when a schema is declared. Three retrievers (sem
 
 `RECALL` transparently uses this path when a schema is active; the response shape is identical to the schemaless path with extra `contributing_retrievers` and `fused_score` metadata.
 
-## The hybrid retrieval architecture
+## The retrieval architecture
 
 The typed-graph retrieval surface is a multi-retriever architecture. Three retrievers run in parallel (or selectively, per the query router), each producing a ranked list. Results are fused with Reciprocal Rank Fusion (RRF) into a single ranked output.
 

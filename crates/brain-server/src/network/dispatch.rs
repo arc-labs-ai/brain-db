@@ -594,7 +594,7 @@ fn error_frame_from_op_error(stream_id: u32, e: &OpError) -> Frame {
             (ErrorCode::CardinalityViolation, None)
         }
         brain_ops::error::ErrorCode::Overloaded => (ErrorCode::Overloaded, Some(1000u32)),
-        brain_ops::error::ErrorCode::HybridUnavailable => (ErrorCode::ShardUnavailable, None),
+        brain_ops::error::ErrorCode::RetrievalUnavailable => (ErrorCode::ShardUnavailable, None),
         brain_ops::error::ErrorCode::InternalError => (ErrorCode::Internal, None),
     };
     let body = ResponseBody::Error(ErrorResponse {

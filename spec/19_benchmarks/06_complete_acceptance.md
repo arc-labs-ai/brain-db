@@ -9,7 +9,7 @@ What "the typed graph is done" means. Concrete tests that must pass.
 - [ ] With no schema declared, all baseline schemaless-mode acceptance tests pass.
 - [ ] Clients (no typed-graph types) work normally when no schema is declared.
 - [ ] Data directories created with no schema work with or without later declaring one.
-- [ ] RECALL latency under hybrid retrieval: P50 ≤ 10 ms, P99 ≤ 50 ms (warmed shard).
+- [ ] RECALL latency under retrieval: P50 ≤ 10 ms, P99 ≤ 50 ms (warmed shard).
 
 ### Schema operations
 
@@ -95,7 +95,7 @@ Targets below assume the default text-input path (CPU embedding ~5–10 ms). The
 - [ ] ENCODE + classifier extractors (post-encode async): P50 ≤ 5 ms added to extractor-completion event, P99 ≤ 20 ms.
 - [ ] STATEMENT_CREATE: P50 ≤ 1 ms, P99 ≤ 5 ms.
 - [ ] RELATION_CREATE: P50 ≤ 1 ms, P99 ≤ 5 ms.
-- [ ] QUERY (hybrid, default top_n): P50 ≤ 10 ms, P99 ≤ 50 ms.
+- [ ] QUERY (retrieval, default top_n): P50 ≤ 10 ms, P99 ≤ 50 ms.
 - [ ] QUERY (entity-anchored, 2-hop graph): P50 ≤ 15 ms, P99 ≤ 100 ms.
 - [ ] Entity resolution (tiers 1–2, exact+fuzzy): P50 ≤ 1 ms.
 - [ ] Entity resolution (tier 3, embedding HNSW): P50 ≤ 10 ms.

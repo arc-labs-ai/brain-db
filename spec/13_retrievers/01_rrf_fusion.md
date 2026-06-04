@@ -21,7 +21,7 @@ Documents not present in retriever `i`'s output contribute 0 to the sum.
 
 ## Why this formula
 
-RRF has three properties that make it the production-default for hybrid retrieval:
+RRF has three properties that make it the production-default for retrieval:
 
 1. **Score-scale invariance.** It doesn't matter that cosine returns [0, 1] while BM25 returns unbounded positives. Only ranks are used.
 
@@ -66,7 +66,7 @@ Tuning weights requires evaluation data; Brain provides metrics on per-retriever
 
 ## Adaptive top-K from the router
 
-The query router (see [`./05_hybrid_query.md`](./05_hybrid_query.md) §"Query router") classifies the incoming query and emits an **adaptive top-K hint** alongside the weight set. The hint lets fusion bound work per query class without pinning a single global `top_n`:
+The query router (see [`./05_retrieval_query.md`](./05_retrieval_query.md) §"Query router") classifies the incoming query and emits an **adaptive top-K hint** alongside the weight set. The hint lets fusion bound work per query class without pinning a single global `top_n`:
 
 | Query class | top-K hint per retriever |
 |---|---|
@@ -135,7 +135,7 @@ Considered and rejected. Reasons:
 
 - Cosine and BM25 distributions are not Gaussian; min-max normalization is unstable.
 - Per-retriever calibration requires labeled data per deployment.
-- RRF is simpler and benchmarks equivalent or better in published hybrid-retrieval evaluations.
+- RRF is simpler and benchmarks equivalent or better in published retrieval evaluations.
 
 Brain may revisit in a future version if specific use cases demand learned fusion. The current default is RRF.
 

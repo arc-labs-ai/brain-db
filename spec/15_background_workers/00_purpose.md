@@ -262,7 +262,7 @@ async fn run_statement_embed(ctx: &OpsContext) -> Result<(), ()> {
 
 The worker tracks `embedded_at_unix_nanos` on each statement row so a re-scan after restart skips already-embedded statements (idempotency on restart, per the Idempotency reminders section below).
 
-Without this worker the statement HNSW stays empty and the SemanticRetriever's statement-corpus mode returns no candidates — hybrid recall degrades to BM25 + graph only. Populating it is what makes the typed graph pull its weight in RECALL.
+Without this worker the statement HNSW stays empty and the SemanticRetriever's statement-corpus mode returns no candidates — retrieval degrades to BM25 + graph only. Populating it is what makes the typed graph pull its weight in RECALL.
 
 ### 15.4. Classifier extractor
 

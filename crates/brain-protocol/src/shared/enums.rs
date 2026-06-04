@@ -14,7 +14,7 @@ pub enum TransitionKind {
     Other(String),
 }
 
-// Bridge from the typed-graph namespace's hybrid-query retriever
+// Bridge from the typed-graph namespace's retrieval-query retriever
 // enum to the cognitive RECALL response field. Lives here so the
 // cognitive response module stays free of typed-graph imports beyond
 // this single conversion.
@@ -30,10 +30,10 @@ impl From<crate::ops::query::RetrieverWire> for RetrieverNameWire {
 
 /// Names the retriever family that surfaced a memory in a
 /// `MemoryResult`. Populated when `RECALL_REQ` routes through the
-/// hybrid query engine (schema-declared deployments).
+/// retrieval query engine (schema-declared deployments).
 ///
 /// This is the cognitive-side wire enum. The typed-graph namespace
-/// has its own `RetrieverWire` for hybrid-query opcodes;
+/// has its own `RetrieverWire` for retrieval-query opcodes;
 /// `From<RetrieverWire>` bridges the two so the cognitive response
 /// type doesn't depend on the typed-graph namespace.
 #[derive(

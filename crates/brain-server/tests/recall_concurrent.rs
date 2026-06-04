@@ -3,9 +3,9 @@
 //! N parallel tokio tasks against a shared server. Each task picks
 //! txn-attached or non-txn at random and asserts its own response
 //! carries the right shape: txn → substrate (empty
-//! `contributing_retrievers`, zero `fused_score`); no-txn → hybrid
+//! `contributing_retrievers`, zero `fused_score`); no-txn → retrieval
 //! (at least one hit carries retrievers + a non-zero fused_score).
-//! Interleaving must not leak per-shard state — a hybrid hit's
+//! Interleaving must not leak per-shard state — a retrieval hit's
 //! retriever list from one task showing up in a sibling's substrate
 //! response would prove a routing-state race.
 
@@ -61,7 +61,7 @@ use support_harness::start;
 const FLAG_EOS: u8 = 1 << 7;
 
 // ---------------------------------------------------------------------------
-// Wire helpers — copied minimally from `recall_hybrid_routing.rs` so each
+// Wire helpers — copied minimally from `recall_routing.rs` so each
 // integration-test binary is self-contained.
 // ---------------------------------------------------------------------------
 
@@ -202,7 +202,7 @@ async fn seed_fixture(client: &mut TcpStream) {
     }
 }
 
-fn is_hybrid_response(frame: &RecallResponseFrame) -> bool {
+fn is_retrieval_response(frame: &RecallResponseFrame) -> bool {
     frame
         .results
         .iter()
@@ -233,7 +233,7 @@ fn assert_substrate(frame: &RecallResponseFrame) {
 //
 // The invariant: a task whose RECALL carries a txn_id MUST receive a
 // substrate-shaped response (empty contributing_retrievers + zero
-// fused_score). A task with no txn MUST receive a hybrid-shaped
+// fused_score). A task with no txn MUST receive a retrieval-shaped
 // response on a non-empty fixture (at least one hit reports
 // contributing_retrievers + positive fused_score). Either bucket
 // leaking the other's shape would indicate per-shard routing state
@@ -307,8 +307,8 @@ async fn concurrent_txn_and_non_txn_recalls_route_correctly() {
         } else {
             non_txn_count += 1;
             assert!(
-                is_hybrid_response(&frame),
-                "task {i} (no txn): hybrid metadata absent — substrate signature leaked into a hybrid response",
+                is_retrieval_response(&frame),
+                "task {i} (no txn): retrieval metadata absent — substrate signature leaked into a retrieval response",
             );
         }
     }

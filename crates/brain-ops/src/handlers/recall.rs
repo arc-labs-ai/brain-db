@@ -19,11 +19,11 @@ use brain_core::{ContextId, MemoryId};
 use brain_index::RankedItemId;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
-use brain_planner::hybrid::executor::{
-    execute as hybrid_execute, ExecutionError, HybridExecutorContext, QueryResult,
+use brain_planner::retrieval::executor::{
+    execute as retrieval_execute, ExecutionError, QueryResult, RetrievalExecutorContext,
 };
-use brain_planner::hybrid::planner::{plan as hybrid_plan, PlanError};
-use brain_planner::hybrid::router::{
+use brain_planner::retrieval::planner::{plan as retrieval_plan, PlanError};
+use brain_planner::retrieval::router::{
     QueryRequest as PlannerQueryRequest, Retriever, RetrieverSelection,
 };
 use brain_protocol::envelope::request::{MemoryKindWire, RecallRequest};
@@ -38,7 +38,7 @@ pub async fn handle_recall(
     req: RecallRequest,
     ctx: &OpsContext,
 ) -> Result<RecallResponseFrame, OpError> {
-    // Reject obviously-invalid input up front. The hybrid planner
+    // Reject obviously-invalid input up front. The retrieval planner
     // silently clamps `limit == 0` to a default, which is the wrong
     // behavior for a caller who literally asked for "zero results."
     if req.top_k == 0 {
@@ -46,22 +46,22 @@ pub async fn handle_recall(
     }
     let planner_req = build_planner_request(&req, ctx.executor.caller_agent);
 
-    let plan = hybrid_plan(&planner_req).map_err(map_plan_error)?;
-    let exec_ctx = HybridExecutorContext {
+    let plan = retrieval_plan(&planner_req).map_err(map_plan_error)?;
+    let exec_ctx = RetrievalExecutorContext {
         semantic: ctx.semantic_retriever.clone(),
         lexical: ctx.lexical_retriever.clone(),
         graph: ctx.graph_retriever.clone(),
         metadata: ctx.executor.metadata.clone(),
         cross_encoder: ctx.cross_encoder.as_arc().cloned(),
     };
-    let result = hybrid_execute(&plan, &planner_req, &exec_ctx)
+    let result = retrieval_execute(&plan, &planner_req, &exec_ctx)
         .await
         .map_err(map_execution_error)?;
 
     let memory_results = project_memory_results(&result, &req, ctx)?;
 
     // In-txn read-your-writes: overlay the txn's pending ENCODE
-    // buffer on top of the committed hybrid result. Without this,
+    // buffer on top of the committed retrieval result. Without this,
     // an in-txn RECALL would never see writes the same transaction
     // has buffered but not yet committed.
     let memory_results = if let Some(txn_id) = req.txn_id {
@@ -84,7 +84,7 @@ pub async fn handle_recall(
     })
 }
 
-/// Merge the txn's pending writes into the committed hybrid result.
+/// Merge the txn's pending writes into the committed retrieval result.
 /// Drops tombstoned ids on the committed side, scores each pending
 /// encode against the cue, applies the post-filters (kind, context,
 /// salience, age), then re-sorts by score and trims to `top_k`.
@@ -203,7 +203,7 @@ fn pending_to_memory_result(p: &BufferedEncode, req: &RecallRequest, score: f32)
         graph: None,
         contributing_retrievers: Vec::new(),
         fused_score: score,
-        // Buffered txn writes never go through the hybrid rerank stage.
+        // Buffered txn writes never go through the retrieval rerank stage.
         rerank_score: None,
         salience_initial: p.salience_initial,
         access_count: 0,
@@ -467,7 +467,7 @@ fn build_planner_request(
     PlannerQueryRequest {
         text: Some(req.cue_text.clone()),
         entity_anchor: None,
-        // RECALL doesn't filter by statement kind; the hybrid
+        // RECALL doesn't filter by statement kind; the retrieval
         // planner uses an empty filter to mean "any kind". Substrate
         // post-filters (kind / context / salience) re-apply below.
         kind_filter: Vec::new(),
@@ -487,7 +487,7 @@ fn build_planner_request(
         include_superseded: false,
         // v1.0: bi-temporal as-of is server-internal only — adding it
         // to `RecallRequest` would bump the wire `RecallRequest` archive
-        // shape (rkyv field order is structural, not nominal). Hybrid
+        // shape (rkyv field order is structural, not nominal). Retrieval
         // callers route through `PlannerQueryRequest` directly.
         as_of_record_time_unix_nanos: None,
         limit: req.top_k,
@@ -517,23 +517,23 @@ fn project_memory_results(
         .executor
         .metadata
         .read_txn()
-        .map_err(|e| OpError::Internal(format!("hybrid recall read_txn: {e}")))?;
+        .map_err(|e| OpError::Internal(format!("retrieval recall read_txn: {e}")))?;
     let table = rtxn
         .open_table(MEMORIES_TABLE)
-        .map_err(|e| OpError::Internal(format!("hybrid recall open MEMORIES_TABLE: {e}")))?;
+        .map_err(|e| OpError::Internal(format!("retrieval recall open MEMORIES_TABLE: {e}")))?;
     // Opening the texts table costs a redb seek; only do it when the
     // caller asked for text, so the common ids-only path stays cheap.
-    let texts_table = if req.include_text {
-        Some(
-            rtxn.open_table(TEXTS_TABLE)
-                .map_err(|e| OpError::Internal(format!("hybrid recall open TEXTS_TABLE: {e}")))?,
-        )
-    } else {
-        None
-    };
+    let texts_table =
+        if req.include_text {
+            Some(rtxn.open_table(TEXTS_TABLE).map_err(|e| {
+                OpError::Internal(format!("retrieval recall open TEXTS_TABLE: {e}"))
+            })?)
+        } else {
+            None
+        };
 
     // Pre-fetch opaque-body enrichment in one pass if requested.
-    // The hybrid path already holds a read txn open for the row hydration
+    // The retrieval path already holds a read txn open for the row hydration
     // below; the helper reuses it so we don't open a second redb snapshot.
     let graph_per_memory: Option<
         std::collections::HashMap<MemoryId, brain_protocol::envelope::response::GraphEnrichment>,
@@ -563,7 +563,7 @@ fn project_memory_results(
             Ok(None) => continue, // Tombstoned between fusion and projection — drop.
             Err(e) => {
                 return Err(OpError::Internal(format!(
-                    "hybrid recall MEMORIES_TABLE get: {e}",
+                    "retrieval recall MEMORIES_TABLE get: {e}",
                 )));
             }
         };
@@ -602,13 +602,13 @@ fn project_memory_results(
                     .map(str::to_owned)
                     .map_err(|e| {
                         OpError::Internal(format!(
-                            "hybrid recall TEXTS_TABLE non-UTF-8 for {memory_id:?}: {e}",
+                            "retrieval recall TEXTS_TABLE non-UTF-8 for {memory_id:?}: {e}",
                         ))
                     })?,
                 Ok(None) => String::new(),
                 Err(e) => {
                     return Err(OpError::Internal(format!(
-                        "hybrid recall TEXTS_TABLE get: {e}",
+                        "retrieval recall TEXTS_TABLE get: {e}",
                     )));
                 }
             }
@@ -616,7 +616,7 @@ fn project_memory_results(
             String::new()
         };
 
-        // similarity_score on the hybrid path is the semantic
+        // similarity_score on the retrieval path is the semantic
         // retriever's raw cosine — the same quantity the substrate
         // path returns in this field. This keeps the field's meaning
         // stable across paths so the client-side cluster-warning
@@ -642,7 +642,7 @@ fn project_memory_results(
                 NodeRef::Memory(memory_id),
                 None,
             )
-            .map_err(|e| OpError::Internal(format!("hybrid recall walk_outgoing: {e}")))?;
+            .map_err(|e| OpError::Internal(format!("retrieval recall walk_outgoing: {e}")))?;
             Some(
                 rows.into_iter()
                     .filter_map(|(kind, to, _disamb, data)| {
@@ -671,7 +671,7 @@ fn project_memory_results(
             similarity_score: semantic_score,
             // `confidence` is the cosine similarity of the hit — a [0,1]
             // quantity, identical to `similarity_score`, consistent across
-            // the hybrid and substrate paths. The raw RRF rank-fusion sum
+            // the retrieval and substrate paths. The raw RRF rank-fusion sum
             // is unbounded (it grows with the number of contributing
             // retrievers) and is exposed separately as `fused_score`; it is
             // a ranking diagnostic, not a confidence.
@@ -727,7 +727,7 @@ fn map_plan_error(e: PlanError) -> OpError {
 
 fn map_execution_error(e: ExecutionError) -> OpError {
     match e {
-        ExecutionError::Filter(inner) => OpError::Internal(format!("hybrid filter: {inner}")),
+        ExecutionError::Filter(inner) => OpError::Internal(format!("retrieval filter: {inner}")),
     }
 }
 
@@ -735,8 +735,8 @@ fn map_execution_error(e: ExecutionError) -> OpError {
 /// `RetrieverNameWire`. Avoids round-tripping through the typed-graph
 /// namespace's wire enum (which would require chained `From`s on
 /// foreign types, an orphan-rule violation).
-fn retriever_to_wire_name(r: brain_planner::hybrid::router::Retriever) -> RetrieverNameWire {
-    use brain_planner::hybrid::router::Retriever as R;
+fn retriever_to_wire_name(r: brain_planner::retrieval::router::Retriever) -> RetrieverNameWire {
+    use brain_planner::retrieval::router::Retriever as R;
     match r {
         R::Semantic => RetrieverNameWire::Semantic,
         R::Lexical => RetrieverNameWire::Lexical,
@@ -751,7 +751,7 @@ fn retriever_to_wire_name(r: brain_planner::hybrid::router::Retriever) -> Retrie
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_planner::hybrid::router::Retriever;
+    use brain_planner::retrieval::router::Retriever;
 
     #[test]
     fn retriever_to_wire_name_matches_each_variant() {

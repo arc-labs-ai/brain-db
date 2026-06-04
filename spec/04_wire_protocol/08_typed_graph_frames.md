@@ -409,7 +409,7 @@ Field semantics mirror `brain_core::Entity`. One projection used by `GET`, `UPDA
 
 #### What `EntityView` deliberately omits
 
-- The raw embedding bytes. Clients that need the embedding query the entity HNSW directly via `RECALL_HYBRID` or `ADMIN_GET_AUDIT`-style debug paths.
+- The raw embedding bytes. Clients that need the embedding query the entity HNSW directly via `QUERY_TEXT` or `ADMIN_GET_AUDIT`-style debug paths.
 - Reference counts to specific statements / relations. Use `STATEMENT_LIST` / `RELATION_LIST_FROM`.
 
 ### Idempotency cache key (entity ops)

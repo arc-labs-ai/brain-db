@@ -33,7 +33,7 @@ This file presents the layers in summary, with cross-references to the detail sp
 ┌──────────────────────────────────▼──────────────────────────────────┐
 │  L3 │ QUERY PLANNER                                                   │
 │     │   • Pure function: (op, query, stats) → execution plan          │
-│     │   • Strategy selection: schemaless | hybrid (default)        │
+│     │   • Strategy selection: schemaless | retrieval (default)     │
 │     │   • Plan caching for repeated query shapes                      │
 └──────────────────────────────────┬──────────────────────────────────┘
                                    │
@@ -161,7 +161,7 @@ The query planner is a **pure function** from `(operation, query parameters, cur
 
 For `RECALL`, the planner chooses among:
 
-- **Hybrid** (default) — runs ANN, lexical (tantivy), and memory-edge graph retrievers in parallel and fuses ranks via RRF.
+- **Retrieval** (default) — runs ANN, lexical (tantivy), and memory-edge graph retrievers in parallel and fuses ranks via RRF.
 - **Schemaless** — pure ANN over the memory HNSW, no fusion. Selected automatically when the request carries a `txn_id`: read-your-writes requires the per-txn buffer overlay, which the lexical and graph retrievers (working off committed indexes) cannot see. Not selectable from the wire — RECALL is one verb. A shard with an unwired retriever refuses to spawn, so the planner never picks substrate as a degraded fallback at query time.
 
 For `PLAN`, the planner chooses among A* and MCTS. For `REASON`, the planner constructs an inference DAG.
@@ -199,15 +199,15 @@ The execution engine consists of four parallel implementations, one per executio
 
 Wraps the HNSW index. The hot loop is SIMD-accelerated dot products against candidate vectors. Reads are lock-free under [crossbeam-epoch](https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-epoch) reclamation; writes are funneled through a single writer per shard.
 
-The vector executor is Brain's vector arm of every `RECALL` — it always contributes to the hybrid fusion, and is the sole contributor for the transactional substrate path (the only case where the lexical and graph retrievers are skipped). See [09. Indexing](../09_indexing/00_purpose.md).
+The vector executor is Brain's vector arm of every `RECALL` — it always contributes to the retrieval fusion, and is the sole contributor for the transactional substrate path (the only case where the lexical and graph retrievers are skipped). See [09. Indexing](../09_indexing/00_purpose.md).
 
 #### Lexical executor
 
-Wraps the tantivy text index. Returns BM25-ranked memory ids for the cue's tokenized form. One of the three retrievers fused by the hybrid path.
+Wraps the tantivy text index. Returns BM25-ranked memory ids for the cue's tokenized form. One of the three retrievers fused by the retrieval path.
 
 #### Graph executor
 
-Traverses the typed-edge graph in `redb`-backed metadata storage. Used during `PLAN`, `REASON`, and as the third hybrid-RECALL retriever (memory-edge graph walks; entity-anchored graph traversal when a schema is declared).
+Traverses the typed-edge graph in `redb`-backed metadata storage. Used during `PLAN`, `REASON`, and as the third RECALL retriever (memory-edge graph walks; entity-anchored graph traversal when a schema is declared).
 
 #### VSA algebra
 

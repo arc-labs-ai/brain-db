@@ -61,7 +61,7 @@ impl BrainSemanticRetriever {
     ) -> Result<Box<[f32; SEMANTIC_VECTOR_DIM]>, SemanticError> {
         match query {
             SemanticQuery::Vector(v) => Ok(v.clone()),
-            // BGE asymmetric retrieval: the hybrid
+            // BGE asymmetric retrieval: the retrieval
             // SemanticRetriever's query path applies the retrieval prefix.
             // The cache keys on input text so this doesn't collide with
             // any stored passage embedding for the same surface.

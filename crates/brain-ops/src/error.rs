@@ -144,19 +144,19 @@ pub enum OpError {
     #[error(transparent)]
     ExecError(#[from] ExecError),
 
-    /// Diagnostic-only: a hybrid retriever degraded after the shard
+    /// Diagnostic-only: a retrieval retriever degraded after the shard
     /// spawned (tantivy segment corruption, an HNSW reader going
     /// stale, etc.). Surfaced only by admin / health surfaces
     /// (`/health`, `ADMIN_STATUS`) so operators learn about the
     /// degradation; never returned from `handle_recall` in v1,
     /// because RECALL is a single verb whose path the server picks
     /// and whose required sinks shard spawn guarantees.
-    #[error("hybrid retrieval unavailable on this shard: {0}")]
-    HybridUnavailable(String),
+    #[error("retrieval unavailable on this shard: {0}")]
+    RetrievalUnavailable(String),
 
     /// Client requested a capability the operator explicitly turned
     /// off in config (`rerank.enabled = false`, an extractor tier
-    /// disabled, etc.). Distinct from `HybridUnavailable`: that one is
+    /// disabled, etc.). Distinct from `RetrievalUnavailable`: that one is
     /// a *runtime degradation* of a required capability; this one is a
     /// *deployment choice*. The client can either drop the opt-in flag
     /// (e.g. set `rerank = false` on the recall request) or talk to a
@@ -201,11 +201,11 @@ pub enum ErrorCode {
     /// the constraint failure and surface a domain-specific message.
     CardinalityViolation,
     Overloaded,
-    /// Hybrid retrieval is unavailable on this shard. Wire code
+    /// Retrieval is unavailable on this shard. Wire code
     /// reserved for admin / health diagnostics only; a normal
     /// client RECALL never sees this — the server picks the path
     /// and shard spawn guarantees the required sinks are wired.
-    HybridUnavailable,
+    RetrievalUnavailable,
     InternalError,
 }
 
@@ -228,7 +228,7 @@ impl OpError {
             Self::QuotaExceeded(_) => ErrorCode::QuotaExceeded,
             Self::Unauthorized(_) => ErrorCode::Unauthorized,
             Self::Overloaded(_) => ErrorCode::Overloaded,
-            Self::HybridUnavailable(_) => ErrorCode::HybridUnavailable,
+            Self::RetrievalUnavailable(_) => ErrorCode::RetrievalUnavailable,
             // Operator opted out of this capability — surfaces as an
             // invalid request because the client can fix it without
             // server-side intervention by dropping the opt-in flag.

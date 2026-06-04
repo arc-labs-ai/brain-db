@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Cross-encoder reranker (bge-reranker-base) for the hybrid query pipeline."
+description = "Cross-encoder reranker (bge-reranker-base) for the retrieval query pipeline."
 
 [dependencies]
 thiserror.workspace = true

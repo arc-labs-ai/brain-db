@@ -82,7 +82,7 @@ Every Statement carries four timestamps, splitting object time (when the claim i
 
 Object time answers "when was this true?"; record time answers "when did Brain believe this?". The split is what makes `as_of(record_time)` queries possible: "what did Brain believe about Priya's role on March 1st?" returns rows whose record window contains March 1st, even if those rows have since been superseded.
 
-See [`07_statement.md`](07_statement.md) for the storage layout and [`../13_retrievers/05_hybrid_query.md`](../13_retrievers/05_hybrid_query.md) for the filter-chain integration.
+See [`07_statement.md`](07_statement.md) for the storage layout and [`../13_retrievers/05_retrieval_query.md`](../13_retrievers/05_retrieval_query.md) for the filter-chain integration.
 
 ## Rule 6: Schemas can evolve; data must be migratable
 
@@ -106,7 +106,7 @@ A user can deploy Brain and never declare a schema. In this case:
 
 This is the open-vocabulary mode. It is a first-class deployment posture, not a degraded one.
 
-When the user declares their first schema, extractors gain a typed vocabulary and may optionally trigger a backfill over existing memories. Declaring a schema activates **strict validation** for statements, relations, and predicate filters within that namespace — unknown qnames produce `PredicateNotInSchema` / `RelationTypeNotInSchema`, and declared cardinalities are enforced. It does NOT activate hybrid retrieval; hybrid (semantic + lexical + memory-edge graph) is already the default. What schema adds is typed entity-anchored graph traversal and predicate-vocabulary checking.
+When the user declares their first schema, extractors gain a typed vocabulary and may optionally trigger a backfill over existing memories. Declaring a schema activates **strict validation** for statements, relations, and predicate filters within that namespace — unknown qnames produce `PredicateNotInSchema` / `RelationTypeNotInSchema`, and declared cardinalities are enforced. It does NOT activate retrieval; the retrieval pipeline (semantic + lexical + memory-edge graph) is already the default. What schema adds is typed entity-anchored graph traversal and predicate-vocabulary checking.
 
 ## What gets stored where: summary
 

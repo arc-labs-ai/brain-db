@@ -30,7 +30,7 @@ The three retrievers are mandatory shard wiring — they are never `None`. If `r
 
 #### In-transaction read-your-writes overlay
 
-When `req.txn_id` is set, the txn's pending ENCODE buffer is overlaid on the committed hybrid result before the response is built:
+When `req.txn_id` is set, the txn's pending ENCODE buffer is overlaid on the committed retrieval result before the response is built:
 
 - Tombstoned ids in the buffer drop committed hits.
 - Pending encodes are scored against the cue vector and merged with the committed list.

@@ -7,8 +7,8 @@
 //! `Both` modes, but until this worker landed there was no producer:
 //! statements were committed to redb by the extractor pipeline and
 //! nothing ever added their embeddings to the HNSW. As a result the
-//! hybrid query path's statement-corpus semantic retriever returned
-//! zero hits and hybrid recall over statements degenerated to BM25 +
+//! retrieval query path's statement-corpus semantic retriever returned
+//! zero hits and retrieval recall over statements degenerated to BM25 +
 //! graph only — the single biggest gap on the Recall@10 path.
 //!
 //! ## Flow

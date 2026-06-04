@@ -43,7 +43,7 @@ pub trait Dispatcher: Send + Sync {
     /// Embed a *query* (lookup vector). Returns a 384-dim L2-normalised
     /// vector with the BGE asymmetric-retrieval prefix
     /// ([`BGE_QUERY_PREFIX`]) applied. Use this for RECALL / PLAN /
-    /// REASON cues and the hybrid SemanticRetriever's query embed.
+    /// REASON cues and the retrieval SemanticRetriever's query embed.
     ///
     /// Default impl concatenates the prefix and delegates to `embed`;
     /// the prefix is applied *before* the cache lookup so query and

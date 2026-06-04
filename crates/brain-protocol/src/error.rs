@@ -206,7 +206,7 @@ pub enum ErrorCode {
     /// (subject, predicate). Resolution: client picks `STATEMENT_SUPERSEDE`
     /// or leaves both active.
     StatementContradictsExisting,
-    /// `QUERY` / `RECALL_HYBRID` exceeded its wall-time budget.
+    /// `QUERY` / `QUERY_TEXT` exceeded its wall-time budget.
     QueryTimeout,
     /// `QUERY` exceeded its declared cost budget (top_k × retrievers ×
     /// per-hit cost).

@@ -1,4 +1,4 @@
-//! Hybrid-query request wire types.
+//! Retrieval-query request wire types.
 //!
 //! Maps the planner's `QueryRequest` shape onto CBOR-encoded structs.
 //! Discriminants are u8s with explicit semantics documented inline; the
@@ -133,11 +133,11 @@ pub struct QueryTraceRequest {
 }
 
 // ---------------------------------------------------------------------------
-// RECALL_HYBRID (0x0163).
+// QUERY_TEXT (0x0163).
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct RecallHybridRequest {
+pub struct QueryTextRequest {
     pub text: String,
     #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub agent_id_filter: Option<WireUuid>,
@@ -193,8 +193,8 @@ mod tests_req {
     }
 
     #[test]
-    fn recall_hybrid_request_round_trips() {
-        let v = RecallHybridRequest {
+    fn query_text_request_round_trips() {
+        let v = QueryTextRequest {
             text: "x".into(),
             agent_id_filter: Some([9u8; 16]),
             limit: 10,
@@ -258,7 +258,7 @@ pub struct QueryTraceResponse {
 }
 
 // ---------------------------------------------------------------------------
-// RECALL_HYBRID (0x0163) — response side.
+// QUERY_TEXT (0x0163) — response side.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -270,7 +270,7 @@ pub struct MemoryHit {
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct RecallHybridResponse {
+pub struct QueryTextResponse {
     pub items: Vec<MemoryHit>,
 }
 
@@ -332,8 +332,8 @@ mod tests_resp {
     }
 
     #[test]
-    fn recall_hybrid_response_round_trips() {
-        let v = RecallHybridResponse {
+    fn query_text_response_round_trips() {
+        let v = QueryTextResponse {
             items: vec![MemoryHit {
                 memory_id: [3u8; 16],
                 fused_score: 0.05,

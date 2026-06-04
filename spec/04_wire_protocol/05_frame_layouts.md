@@ -85,7 +85,7 @@ struct RecallRequest {
 RECALL is one verb with one server-side path-selection rule: a request that
 carries a `txn_id` runs the txn path (read-your-writes requires the
 per-txn buffer overlay, which the lexical and graph retrievers do not see);
-every other request runs the hybrid path (semantic + lexical + memory-edge
+every other request runs the retrieval path (semantic + lexical + memory-edge
 graph, fused via RRF). The client cannot select between paths.
 
 Fields:

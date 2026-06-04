@@ -111,23 +111,23 @@ Question IDs (`OQ-V2-N`, `OQ-23-X`, etc.) are stable; once assigned, they don't 
 
 ## OQ-23-A: Streaming query results (`limit > 100`)
 
-**Current:** the hybrid `QUERY` opcode returns a single `QueryResponse` frame, items truncated to `limit`.
+**Current:** the `QUERY` opcode returns a single `QueryResponse` frame, items truncated to `limit`.
 **Open:** stream items over the SUBSCRIBE wire path as they pass the limit boundary, per spec §13/05 §"Streaming results".
 **Why deferred:** v1 deployments are local-first with modest result-set sizes; the streaming path adds wire-protocol surface (event types) and client iterator plumbing that wasn't worth the complexity at v1.
 **Path:** post-v1 — add a `QueryStream` event type on SUBSCRIBE; clients gain a `query()…stream()` pattern returning a `Stream<Item = QueryHit>`.
 
 ## OQ-23-B: query + transactional read-your-writes
 
-**Current:** RECALL inside a txn falls back to Brain vector path even when a schema is declared. The hybrid pipeline doesn't see the txn buffer's pending statements / relations.
-**Open:** layer the txn buffer's pending writes (entities, statements, relations) on top of the hybrid retriever outputs before fusion + filter.
-**Why deferred:** lens layering for Brain's vector recall is bounded scope (one buffer, one corpus). Hybrid + RYW would need parallel lenses for the entity, statement, and relation tables, plus fusion logic that tolerates pending rows missing from secondary indexes (HNSW / tantivy commit cadence).
-**Path:** post-v1 — design a per-table `TxnLens` shared by Brain and hybrid paths; phase ordering would put it after the §11 sweepers stabilise.
+**Current:** RECALL inside a txn falls back to Brain vector path even when a schema is declared. The retrieval pipeline doesn't see the txn buffer's pending statements / relations.
+**Open:** layer the txn buffer's pending writes (entities, statements, relations) on top of the retriever outputs before fusion + filter.
+**Why deferred:** lens layering for Brain's vector recall is bounded scope (one buffer, one corpus). Retrieval + RYW would need parallel lenses for the entity, statement, and relation tables, plus fusion logic that tolerates pending rows missing from secondary indexes (HNSW / tantivy commit cadence).
+**Path:** post-v1 — design a per-table `TxnLens` shared by Brain and retrieval paths; phase ordering would put it after the §11 sweepers stabilise.
 
 ## OQ-23-C: Filter-only retriever mode (no text, no anchor)
 
 **Current:** the planner rejects requests with neither `text` nor `entity_anchor` as `PlanError::NoSignal`. A filter-only query like "all preferences with confidence ≥ 0.9 in the last week" is not expressible.
 **Open:** add an "everything" retriever (or a "filter scan" mode) that emits all candidates matching the pre-filter, then applies the post-fusion filter chain.
-**Why deferred:** v1 didn't have a clear use case; "filter-only" is also a query class that benefits from a dedicated index design rather than reusing the hybrid pipeline.
+**Why deferred:** v1 didn't have a clear use case; "filter-only" is also a query class that benefits from a dedicated index design rather than reusing the retrieval pipeline.
 **Path:** post-v1 — likely a new opcode or a planner-side filter-scan retriever; depends on how users land on filter-only patterns in practice.
 
 ## OQ-23-D: Learned router on top of the rule-based one
@@ -137,11 +137,11 @@ Question IDs (`OQ-V2-N`, `OQ-23-X`, etc.) are stable; once assigned, they don't 
 **Why deferred:** need real query traffic + labels. The rules ship as the stable fallback so cold start works.
 **Path:** future versions — feature-flag a learned classifier on top; rules stay as fallback. Labels come from click-through, explicit feedback, and synthetic teacher-LLM labels (per §13/05 §"Learned routing").
 
-## OQ-23-E: Cross-shard hybrid result merging
+## OQ-23-E: Cross-shard retrieval result merging
 
-**Current:** the hybrid pipeline runs per-shard. Multi-shard deployments fan RECALL / QUERY out at the connection layer and merge results by score upstream of the hybrid engine.
+**Current:** the retrieval pipeline runs per-shard. Multi-shard deployments fan RECALL / QUERY out at the connection layer and merge results by score upstream of the retrieval engine.
 **Open:** push the cross-shard merge into the query layer — global RRF fusion across shards, with per-shard partial results streamed in.
-**Why deferred:** single-shard deployments are the v1 default; multi-shard with cross-shard hybrid fusion adds latency-budget pressure that's better tackled once production telemetry is in.
+**Why deferred:** single-shard deployments are the v1 default; multi-shard with cross-shard retrieval fusion adds latency-budget pressure that's better tackled once production telemetry is in.
 **Path:** post-v1 — extend the connection layer's fan-out to deliver per-retriever partial result lists, and fuse globally before the filter chain.
 
 
@@ -1378,7 +1378,7 @@ Deferred behaviors:
 - **Cursor resume.** Caller passes a non-empty `cursor` to fetch the next page. Wire-side currently rejects with `InvalidArgument`.
 - **Multi-frame streaming within a page.** The 1000-cap is comfortable; sub-1k responses fit in one frame.
 
-The query router already needs streaming infrastructure for `QUERY` (`0x0160`), `RECALL_HYBRID` (`0x0163`), and `STATEMENT_LIST` (`0x0146`); `ENTITY_LIST` pagination would piggyback on that work rather than duplicating it here.
+The query router already needs streaming infrastructure for `QUERY` (`0x0160`), `QUERY_TEXT` (`0x0163`), and `STATEMENT_LIST` (`0x0146`); `ENTITY_LIST` pagination would piggyback on that work rather than duplicating it here.
 
 **Status:** open.
 
@@ -1686,7 +1686,7 @@ a) **Hand-written (status quo).** Each SDK is its own codebase.
 
 b) **Generated from schema.** Single source of truth; multiple language outputs.
 
-c) **Hybrid: generate types, hand-write logic.**
+c) **Mixed: generate types, hand-write logic.**
 
 **Recommendation.** (c). Types are tedious to maintain by hand; logic benefits from manual care.
 
@@ -1969,7 +1969,7 @@ a) **mmap (status quo).** Page cache handles working set.
 
 b) **O_DIRECT reads.** Manual buffer management, more deterministic latency, but loses kernel readahead.
 
-c) **Hybrid.** Configurable per shard.
+c) **Mixed.** Configurable per shard.
 
 **Recommendation.** Stay with mmap. The page cache works well for our access patterns; manual buffer management would be a significant complexity increase for marginal benefit.
 
@@ -2111,7 +2111,7 @@ b) **GPU search.** Use a GPU-aware ANN library. Different architecture (FAISS-GP
 
 ---
 
-## OQ-AN-5: Hybrid index types
+## OQ-AN-5: Mixed index types
 
 **Issue.** Some workloads might benefit from non-HNSW index types (IVF for very large indexes, brute-force for very small).
 
@@ -2883,11 +2883,11 @@ The `QUERY` opcode returns a single `QueryResponse` frame with items truncated t
 
 ### Q4 — Query inside a transaction + read-your-writes
 
-`RECALL` inside a txn falls back to memory-only ANN search even when a schema is declared. The hybrid pipeline does not see the txn buffer's pending statements / relations.
+`RECALL` inside a txn falls back to memory-only ANN search even when a schema is declared. The retrieval pipeline does not see the txn buffer's pending statements / relations.
 
-**Deferred because:** layering txn-buffer reads onto the hybrid pipeline requires parallel `TxnLens` instances for the entity, statement, and relation tables, plus fusion logic that tolerates pending rows missing from secondary indexes (HNSW / tantivy commit cadence).
+**Deferred because:** layering txn-buffer reads onto the retrieval pipeline requires parallel `TxnLens` instances for the entity, statement, and relation tables, plus fusion logic that tolerates pending rows missing from secondary indexes (HNSW / tantivy commit cadence).
 
-**Path:** post-v1. Design a per-table `TxnLens` shared by both the memory-only and hybrid paths.
+**Path:** post-v1. Design a per-table `TxnLens` shared by both the memory-only and retrieval paths.
 
 ---
 
@@ -2895,7 +2895,7 @@ The `QUERY` opcode returns a single `QueryResponse` frame with items truncated t
 
 The planner rejects requests with neither `text` nor `entity_anchor` as `PlanError::NoSignal`. A filter-only query like "all preferences with confidence ≥ 0.9 in the last week" is currently inexpressible.
 
-**Deferred because:** v1 has no clear use case. Filter-only also benefits from a dedicated index design rather than reusing the hybrid pipeline.
+**Deferred because:** v1 has no clear use case. Filter-only also benefits from a dedicated index design rather than reusing the retrieval pipeline.
 
 **Path:** post-v1. Likely a new opcode or a planner-side filter-scan retriever.
 
@@ -2903,7 +2903,7 @@ The planner rejects requests with neither `text` nor `entity_anchor` as `PlanErr
 
 ### Q6 — Cross-shard query result merging
 
-The hybrid pipeline runs per-shard. Multi-shard deployments fan `RECALL` / `QUERY` out at the connection layer and merge by score upstream of the hybrid engine.
+The retrieval pipeline runs per-shard. Multi-shard deployments fan `RECALL` / `QUERY` out at the connection layer and merge by score upstream of the retrieval engine.
 
 **Deferred because:** single-shard deployments are the v1 default. Multi-shard cross-shard fusion adds latency-budget pressure that is best tackled once production telemetry exists.
 

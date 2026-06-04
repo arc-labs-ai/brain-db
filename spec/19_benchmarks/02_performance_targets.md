@@ -181,7 +181,7 @@ covers only the per-retriever LexicalRetriever numbers.
 
 Query latency is dominated by per-retriever wall-time;
 RRF fusion (see [`../13_retrievers/01_rrf_fusion.md`](../13_retrievers/01_rrf_fusion.md))
-and the filter chain (see [`../13_retrievers/05_hybrid_query.md`](../13_retrievers/05_hybrid_query.md))
+and the filter chain (see [`../13_retrievers/05_retrieval_query.md`](../13_retrievers/05_retrieval_query.md))
 add sub-ms overhead. The gate at this section measures three
 retrievers in parallel (semantic + lexical + graph at depth 1)
 plus the cross-cutting operations.
@@ -203,11 +203,11 @@ query end-to-end (parallel retrievers + RRF + filter):
 
 | Operation | p50 | p99 |
 |---|---|---|
-| Hybrid 3-retriever, push-down filters | 10 ms | 50 ms |
-| Hybrid 3-retriever, post-fusion filters only | 15 ms | 70 ms |
-| Hybrid single-retriever (router-degraded) | 7 ms | 30 ms |
+| Retrieval, 3-retriever, push-down filters | 10 ms | 50 ms |
+| Retrieval, 3-retriever, post-fusion filters only | 15 ms | 70 ms |
+| Retrieval, single-retriever (router-degraded) | 7 ms | 30 ms |
 | `EXPLAIN` (plan-only, no execution) | 500 µs | 2 ms |
-| `TRACE` (plan + per-retriever metadata, includes execution) | inherits hybrid + ~200 µs | inherits + ~1 ms |
+| `TRACE` (plan + per-retriever metadata, includes execution) | inherits retrieval + ~200 µs | inherits + ~1 ms |
 | Filter chain (1 K candidates, full chain) | 1 ms | 5 ms |
 | RRF fusion (3 lists × 100 items) | 100 µs | 500 µs |
 
@@ -216,7 +216,7 @@ Notes:
 - The query end-to-end is approximately `max(per-retriever) + filter + fusion`, not their sum — retrievers run in parallel on the shard's executor.
 - Production-scale validation (100 K memories / 1 M statements / 100 K entities) is the acceptance gate; this section validates these targets at the 10 K corpus scale used by the bench harnesses.
 - `EXPLAIN` skips the executor entirely — cost is plan construction (router + cost estimate + pre-filter computation).
-- Streaming queries (limit > 100; see streaming results in [`../13_retrievers/05_hybrid_query.md`](../13_retrievers/05_hybrid_query.md)) use the SUBSCRIBE wire path; per-emit latency is hybrid-query latency divided across the result chunks.
+- Streaming queries (limit > 100; see streaming results in [`../13_retrievers/05_retrieval_query.md`](../13_retrievers/05_retrieval_query.md)) use the SUBSCRIBE wire path; per-emit latency is retrieval-query latency divided across the result chunks.
 
 ### 2.11 Perf gates
 

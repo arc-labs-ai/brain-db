@@ -170,7 +170,7 @@ fn recall_full_pipeline_returns_top_k() {
         assert_eq!(top.context_id, 42);
         assert_eq!(top.kind, MemoryKindWire::Episodic);
         assert!((top.salience - 0.5).abs() < 1e-6);
-        // The hybrid pipeline carries two distinct scores per hit:
+        // The retrieval pipeline carries two distinct scores per hit:
         // `similarity_score` is the semantic retriever's raw cosine and
         // `confidence` mirrors it — both bounded in [0, 1]. The unbounded
         // RRF rank-fusion sum is a separate diagnostic (`fused_score`),
@@ -183,7 +183,7 @@ fn recall_full_pipeline_returns_top_k() {
         );
         assert!(
             (top.confidence - top.similarity_score).abs() < 1e-6,
-            "confidence mirrors similarity_score on the hybrid path"
+            "confidence mirrors similarity_score on the retrieval path"
         );
         assert_eq!(
             top.last_accessed_at_unix_nanos, top.created_at_unix_nanos,
@@ -326,7 +326,7 @@ fn recall_confidence_floor_drops_low_score_hits() {
 fn recall_invalid_top_k_returns_plan_error() {
     // top_k=0 has no meaningful "give me zero results" interpretation;
     // it's an obvious client bug. The handler rejects it up front rather
-    // than letting the hybrid planner silently clamp it to a default.
+    // than letting the retrieval planner silently clamp it to a default.
     run_in_glommio(|| async {
         let fix = build_fixture();
         let req = recall_req("anything", 0);
@@ -470,11 +470,11 @@ fn recall_with_real_embedder_end_to_end() {
 }
 
 // ---------------------------------------------------------------------------
-// 9. handle_recall routing — txn_id determines substrate vs hybrid.
+// 9. handle_recall routing — txn_id determines substrate vs retrieval.
 //
 // RECALL is one verb with one server-side rule: a txn forces the
 // substrate path (read-your-writes), everything else fuses through the
-// hybrid retrievers. These tests pin both branches with a context
+// retrieval retrievers. These tests pin both branches with a context
 // that has all three retrievers wired, so the cold-start fallback at
 // `recall.rs::handle_recall` doesn't mask a regression in the txn
 // gate.
@@ -527,12 +527,12 @@ impl GraphRetriever for CannedGraph {
     }
 }
 
-/// Build a fixture whose `OpsContext` has all three hybrid retrievers
+/// Build a fixture whose `OpsContext` has all three retrieval retrievers
 /// replaced by canned mocks returning a hit for `memory_id`. The mocks
 /// override the real retrievers wired by `build_fixture` so the test
-/// can assert the hybrid path's behavior with deterministic per-retriever
+/// can assert the retrieval path's behavior with deterministic per-retriever
 /// outputs.
-fn build_fixture_with_hybrid_mocks(memory_id: u128) -> Fixture {
+fn build_fixture_with_retrieval_mocks(memory_id: u128) -> Fixture {
     let mut fix = build_fixture();
     let mid = MemoryId::from_raw(memory_id);
     let item = RankedItem {
@@ -561,8 +561,8 @@ fn build_fixture_with_hybrid_mocks(memory_id: u128) -> Fixture {
 }
 
 #[test]
-fn handle_recall_routes_to_hybrid_when_no_txn() {
-    // No txn → hybrid runs. The canned retrievers all return the
+fn handle_recall_routes_to_retrieval_when_no_txn() {
+    // No txn → retrieval runs. The canned retrievers all return the
     // same memory id, so RRF fusion produces one hit with three
     // contributors and a non-zero fused score. A regression that
     // re-routed to substrate would zero `fused_score` and clear
@@ -572,15 +572,18 @@ fn handle_recall_routes_to_hybrid_when_no_txn() {
         let mid = encode(&fix0, [0xA0; 16], "beta", MemoryKindWire::Episodic).await;
         drop(fix0);
 
-        let fix = build_fixture_with_hybrid_mocks(mid);
+        let fix = build_fixture_with_retrieval_mocks(mid);
         let _ = encode(&fix, [0xA0; 16], "beta", MemoryKindWire::Episodic).await;
 
         let frame = brain_ops::recall::handle_recall(recall_req("beta", 5), &fix.ctx)
             .await
-            .expect("hybrid recall");
+            .expect("retrieval recall");
 
         assert!(frame.is_final);
-        assert!(!frame.results.is_empty(), "hybrid recall returned no hits",);
+        assert!(
+            !frame.results.is_empty(),
+            "retrieval recall returned no hits",
+        );
         let any_with_retrievers = frame
             .results
             .iter()
@@ -588,11 +591,11 @@ fn handle_recall_routes_to_hybrid_when_no_txn() {
         let any_nonzero_fused = frame.results.iter().any(|r| r.fused_score > 0.0);
         assert!(
             any_with_retrievers,
-            "hybrid path must populate contributing_retrievers on at least one hit",
+            "retrieval path must populate contributing_retrievers on at least one hit",
         );
         assert!(
             any_nonzero_fused,
-            "hybrid path must produce a non-zero fused_score on at least one hit",
+            "retrieval path must produce a non-zero fused_score on at least one hit",
         );
     })
 }

@@ -335,7 +335,7 @@ impl OpsContext {
     }
 
     /// Install the cross-encoder slot used by the rerank pass on
-    /// the hybrid RECALL path. Pass `CrossEncoderSlot::Enabled(arc)`
+    /// the retrieval RECALL path. Pass `CrossEncoderSlot::Enabled(arc)`
     /// when the model is loaded; pass `CrossEncoderSlot::Disabled`
     /// when the operator opted out via `rerank.enabled = false` so
     /// request-time clients learn the slot's intent.

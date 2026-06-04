@@ -6,7 +6,7 @@
 //! Before this worker landed, every substrate edge was client-supplied
 //! (via `ENCODE_REQ.edges` or a separate `LINK`). The memory graph was
 //! empty by default, which made the planner's memory-anchor graph
-//! retriever (the hybrid recall) a no-op on any deployment that
+//! retriever (the retrieval recall) a no-op on any deployment that
 //! didn't manually LINK things. AutoEdgeWorker fills that gap: the
 //! substrate now produces a real graph clients can traverse without
 //! lifting a finger.

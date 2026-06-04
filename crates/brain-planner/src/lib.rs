@@ -28,9 +28,9 @@ pub mod cost;
 pub mod error;
 pub mod executor;
 pub mod explain;
-pub mod hybrid;
 pub mod plan;
 pub mod planner;
+pub mod retrieval;
 pub mod stats;
 pub mod vsa;
 

@@ -1,6 +1,6 @@
 //! LexicalRetriever — the read side of the tantivy pipeline.
 //!
-//! Consumers (hybrid query, RECALL paths) hold an
+//! Consumers (retrieval query, RECALL paths) hold an
 //! `Arc<dyn LexicalRetriever>` and call [`LexicalRetriever::retrieve`].
 //! Per-shard wiring is the server's responsibility (see
 //! `brain-server::shard::spawn`).

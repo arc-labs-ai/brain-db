@@ -10,7 +10,7 @@ This file is the **high-level milestone index**. The per-phase landing record li
 
 **Pre-release: v0.1.0.** No external users. Wire protocol, redb tables, and schema model are still in flux. Breaking changes land in place without back-compat shims until v1.0 ships.
 
-Implementation coverage is broad — the substrate (vector memory, WAL, HNSW, wire protocol, write/read pipelines, observability) and the typed-graph layer (entities, statements, relations, schema DSL, three-tier extractors, hybrid retrieval) both have code landing on every crate the spec calls for. What remains for **v1.0** is **convergence**, not new feature work: the combined acceptance suite at [`spec/19_benchmarks/06_complete_acceptance.md`](spec/19_benchmarks/06_complete_acceptance.md) must pass end-to-end on reference hardware, several scope-cuts from the implementation phases need closing, and the documentation surface needs a final pass.
+Implementation coverage is broad — the substrate (vector memory, WAL, HNSW, wire protocol, write/read pipelines, observability) and the typed-graph layer (entities, statements, relations, schema DSL, three-tier extractors, retrieval) both have code landing on every crate the spec calls for. What remains for **v1.0** is **convergence**, not new feature work: the combined acceptance suite at [`spec/19_benchmarks/06_complete_acceptance.md`](spec/19_benchmarks/06_complete_acceptance.md) must pass end-to-end on reference hardware, several scope-cuts from the implementation phases need closing, and the documentation surface needs a final pass.
 
 ---
 
@@ -55,15 +55,15 @@ Planned improvements that land after v1.0 without changing the wire protocol or 
 | **`SCHEMA_DROP` opcode** | In-place schema downgrade (revert is manual per runbook in v1). |
 | **Cascade audit rows + soft-cascade revert** | FORGET cascade itself works; the audit log of cascaded writes + revert path is v1.1. |
 | **Per-row stale-extraction flag** | Stale-count surfaces via metric in v1; per-row flag (needs `StatementRow.flags` schema bump) is v1.1. |
-| **Streaming hybrid query results** | `limit > 100` streams across multiple `QueryResponse` frames; v1 is single-frame. |
-| **Hybrid + transactional read-your-writes** | RECALL inside a txn uses the substrate path in v1; lens layering across statements + relations is v1.1+. |
+| **Streaming retrieval query results** | `limit > 100` streams across multiple `QueryResponse` frames; v1 is single-frame. |
+| **Retrieval + transactional read-your-writes** | RECALL inside a txn uses the substrate path in v1; lens layering across statements + relations is v1.1+. |
 | **Multi-frame cursor pagination** | `ENTITY_LIST`, `STATEMENT_LIST`, `STATEMENT_HISTORY`, `RELATION_LIST_FROM` — all single-frame snapshots in v1. |
 | **Wire-protocol conformance corpus** | A language-agnostic round-trip corpus (recorded request/response frames with CBOR payloads) that any client implementation can replay to verify §04 conformance. Brain ships no first-party SDK; the corpus is the drift guard for third-party clients. |
 | **`ADMIN_TANTIVY_REBUILD` wire op** | Hot tantivy rebuild from the admin CLI; v1 rebuild is startup-only. |
 | **Schema migration plan computation** | The `keep` / `re-extract` / `tombstone` action vocabulary is specified in `spec/03_schema/05_versioning.md`; computation + execution lands post-v1. |
 | **Hot rebuild while writer running** | v1 tantivy rebuild requires shard restart. |
 | **Partial WAL replay on tantivy recovery** | v1 rebuilds from scratch on `NeedsRebuild` status; partial replay using indexer cursors is post-v1. |
-| **Cross-shard hybrid result merging** | v1 is per-shard; router-level fan-out and merge for cross-shard agents is v1.1. |
+| **Cross-shard retrieval result merging** | v1 is per-shard; router-level fan-out and merge for cross-shard agents is v1.1. |
 | **Live-registry sync on `SCHEMA_UPLOAD`** | Uploaded extractors are observable via `EXTRACTOR_LIST` but the dispatching registry rebuilds only at shard spawn in v1. |
 
 ---

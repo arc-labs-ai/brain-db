@@ -1,12 +1,12 @@
-//! Hybrid query wire-op smoke tests.
+//! Retrieval query wire-op smoke tests.
 //!
-//! Drives the four hybrid-query opcodes through the full data-plane
+//! Drives the four query opcodes through the full data-plane
 //! stack:
 //!
 //! - `QUERY`          (0x0160) — plan + execute → `QueryResponse`.
 //! - `QUERY_EXPLAIN`  (0x0161) — plan only → plan text.
 //! - `QUERY_TRACE`    (0x0162) — plan + execute → trace text.
-//! - `RECALL_HYBRID`  (0x0163) — narrow projection → memory ids.
+//! - `QUERY_TEXT`     (0x0163) — narrow projection → memory ids.
 //!
 //! These tests run against the shared in-process harness (one shard,
 //! empty fixture). Retrievers are wired automatically by `spawn_shard`,
@@ -24,8 +24,8 @@ use brain_protocol::envelope::request::RequestBody;
 use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
 use brain_protocol::{
-    QueryExplainRequest, QueryRequest, QueryTraceRequest, RecallHybridRequest,
-    RetrieverSelectionWire, RetrieverWire,
+    QueryExplainRequest, QueryRequest, QueryTextRequest, QueryTraceRequest, RetrieverSelectionWire,
+    RetrieverWire,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -286,7 +286,7 @@ async fn query_trace_returns_execution_block() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn recall_hybrid_returns_memory_only_results() {
+async fn query_text_returns_memory_only_results() {
     let server = start(1).await;
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
@@ -296,7 +296,7 @@ async fn recall_hybrid_returns_memory_only_results() {
     let (opcode, body) = round_trip(
         &mut client,
         1,
-        RequestBody::RecallHybrid(RecallHybridRequest {
+        RequestBody::QueryText(QueryTextRequest {
             text: "anything".into(),
             agent_id_filter: None,
             limit: 5,
@@ -304,13 +304,13 @@ async fn recall_hybrid_returns_memory_only_results() {
         }),
     )
     .await;
-    assert_eq!(opcode, Opcode::RecallHybridResp.as_u16());
+    assert_eq!(opcode, Opcode::QueryTextResp.as_u16());
     match body {
-        ResponseBody::RecallHybrid(r) => {
+        ResponseBody::QueryText(r) => {
             // Empty fixture; just verify the wire path and shape.
             assert!(r.items.is_empty());
         }
-        other => panic!("expected RecallHybridResp, got {other:?}"),
+        other => panic!("expected QueryTextResp, got {other:?}"),
     }
 
     server.stop().await;

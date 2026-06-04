@@ -597,7 +597,7 @@ Aliases are deduplicated server-side on the normalized form before insertion. A 
 - `top_k`: 1 ≤ top_k ≤ 1000.
 - `depth` (for `RELATION_TRAVERSE`-shaped queries): 1 ≤ depth ≤ 8.
 - `budget_wall_time_ms`: 1 ≤ budget ≤ 60000 (60 s ceiling).
-- empty filter clauses are allowed (no-op); empty `text` for `RECALL_HYBRID` rejected.
+- empty filter clauses are allowed (no-op); empty `text` for `QUERY_TEXT` rejected.
 
 ##### 16.9.7 Admin opcodes (`0x0170–0x0177`)
 
