@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 broken=0
 while IFS=: read -r path line rest; do

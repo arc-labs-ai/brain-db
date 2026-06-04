@@ -161,7 +161,7 @@ gate_docs() {
   # Cargo doc must build clean and every relative cross-reference in
   # spec/ + ROADMAP.md must resolve.
   cargo doc --workspace --no-deps 2>&1 | tail -3
-  bash scripts/spec-link-check.sh --strict
+  bash .claude/scripts/spec-link-check.sh --strict
 }
 
 gate_security() {
