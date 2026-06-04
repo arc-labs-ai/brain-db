@@ -13,9 +13,9 @@
 #
 # Usage:
 #
-#   bash scripts/acceptance.sh                # all gates
-#   bash scripts/acceptance.sh 1 2 4          # only those gates
-#   bash scripts/acceptance.sh --skip 7 8     # all except soak + compliance
+#   bash .devcontainer/acceptance.sh                # all gates
+#   bash .devcontainer/acceptance.sh 1 2 4          # only those gates
+#   bash .devcontainer/acceptance.sh --skip 7 8     # all except soak + compliance
 #
 # Environment:
 #

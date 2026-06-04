@@ -39,7 +39,7 @@ on every load, so the file on disk stays vanilla DeBERTa-v3.
 
 ## Download script
 
-The reference path is `scripts/bootstrap-model.sh`. It's a pure
+The reference path is `.devcontainer/bootstrap-model.sh`. It's a pure
 download — no torch, no conversion, no Python at runtime:
 
 ```bash

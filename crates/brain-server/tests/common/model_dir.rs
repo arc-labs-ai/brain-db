@@ -28,7 +28,7 @@ pub fn with_model_dir<F: FnOnce(PathBuf)>(f: F) {
         None => {
             eprintln!(
                 "skipping: set BRAIN_EMBED_MODEL_DIR to run \
-                 (download with ./scripts/bootstrap-model.sh)"
+                 (download with ./.devcontainer/bootstrap-model.sh)"
             );
         }
     }

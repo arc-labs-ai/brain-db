@@ -107,7 +107,7 @@ fn main() -> ExitCode {
                 eprintln!();
                 eprintln!("brain-server requires a BERT-shaped embedding model on disk.");
                 eprintln!("To install BGE-small-en-v1.5:");
-                eprintln!("  ./scripts/bootstrap-model.sh");
+                eprintln!("  ./.devcontainer/bootstrap-model.sh");
                 eprintln!("Or set BRAIN_EMBED_MODEL_DIR=/path/to/model");
                 return ExitCode::FAILURE;
             }

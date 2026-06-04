@@ -51,13 +51,13 @@
 # with no env vars at all.
 #
 # Usage:
-#   ./scripts/bootstrap-model.sh                  # embed + ner + reranker (default)
-#   ./scripts/bootstrap-model.sh --only embed     # embedding only
-#   ./scripts/bootstrap-model.sh --only ner       # NER only
-#   ./scripts/bootstrap-model.sh --only rerank    # reranker only
-#   ./scripts/bootstrap-model.sh --no-rerank      # embed + ner; skip the ~1.1 GiB reranker
-#   ./scripts/bootstrap-model.sh --force          # re-download even if files exist
-#   ./scripts/bootstrap-model.sh --verify         # check existing files; no download
+#   ./.devcontainer/bootstrap-model.sh                  # embed + ner + reranker (default)
+#   ./.devcontainer/bootstrap-model.sh --only embed     # embedding only
+#   ./.devcontainer/bootstrap-model.sh --only ner       # NER only
+#   ./.devcontainer/bootstrap-model.sh --only rerank    # reranker only
+#   ./.devcontainer/bootstrap-model.sh --no-rerank      # embed + ner; skip the ~1.1 GiB reranker
+#   ./.devcontainer/bootstrap-model.sh --force          # re-download even if files exist
+#   ./.devcontainer/bootstrap-model.sh --verify         # check existing files; no download
 
 set -euo pipefail
 

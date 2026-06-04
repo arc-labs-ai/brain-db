@@ -58,7 +58,7 @@ pub const NER_MODEL_PATH_ENV: &str = "BRAIN_NER_MODEL_PATH";
 pub const NER_THRESHOLD_ENV: &str = "BRAIN_NER_THRESHOLD";
 
 /// Directory name under `$XDG_DATA_HOME/brain/models/` populated by
-/// `scripts/bootstrap-model.sh` for the GLiNER NER model.
+/// `.devcontainer/bootstrap-model.sh` for the GLiNER NER model.
 pub const NER_MODEL_DIR_NAME: &str = "gliner-small-v2.1";
 
 /// Files the bootstrap script writes for a healthy GLiNER install.

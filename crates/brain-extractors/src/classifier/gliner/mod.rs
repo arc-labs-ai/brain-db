@@ -204,7 +204,7 @@ impl GlinerModel {
     /// - `pytorch_model.bin` — GLiNER pickle weights (loaded
     ///   directly via candle's `PthTensors`; no conversion step).
     /// - `tokenizer.json` — DeBERTa-v3 tokenizer pre-patched by
-    ///   `scripts/bootstrap-model.sh` with `<<ENT>>` @128001 and
+    ///   `.devcontainer/bootstrap-model.sh` with `<<ENT>>` @128001 and
     ///   `<<SEP>>` @128002.
     /// - `config.json` — DeBERTa-v2 / v3 backbone config.
     pub fn load(dir: &Path, config: GlinerConfig) -> Result<Self, GlinerError> {

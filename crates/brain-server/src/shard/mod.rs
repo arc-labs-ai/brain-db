@@ -1604,7 +1604,7 @@ pub fn spawn_shard(
             // Resolve the classifier model config. Cascades through
             // `BRAIN_NER_MODEL_PATH` (operator override) and the XDG
             // default location populated by
-            // `scripts/bootstrap-model.sh`, mirroring the bootstrap
+            // `.devcontainer/bootstrap-model.sh`, mirroring the bootstrap
             // script's own resolution order so an operator who ran the
             // script gets a working classifier on the next boot without
             // exporting an env var. Built once and reused: the loaded

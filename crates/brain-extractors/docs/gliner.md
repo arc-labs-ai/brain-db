@@ -83,7 +83,7 @@ with `GlinerError::TooManyLabels`.
 
 GLiNER v2.1 ships PyTorch pickle (`pytorch_model.bin`). Brain loads
 it directly via candle's `PthTensors` — no conversion step, no torch
-dependency. `scripts/bootstrap-model.sh` just downloads:
+dependency. `.devcontainer/bootstrap-model.sh` just downloads:
 
 - `pytorch_model.bin` + `gliner_config.json` from `urchade/gliner_small-v2.1`
 - `tokenizer.json` + `config.json` + `spm.model` from `microsoft/deberta-v3-small`
@@ -96,7 +96,7 @@ By default, Brain probes
 is unset) for the four required files: `pytorch_model.bin`,
 `tokenizer.json`, `config.json`, `gliner_config.json`. If all four
 are present, the shard wires the classifier tier automatically — no
-environment variable required. Run `./scripts/bootstrap-model.sh` to
+environment variable required. Run `./.devcontainer/bootstrap-model.sh` to
 populate this location.
 
 Set `BRAIN_NER_MODEL_PATH=<dir>` to point at a different directory.

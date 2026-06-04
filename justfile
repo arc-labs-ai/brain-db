@@ -251,7 +251,7 @@ compose-down *ARGS:
 up PORT="8080": image (serve-local PORT)
 
 # Run the DB locally, detached, exposing the data plane on PORT (default 8080).
-# Prereqs: `just image` once, and `scripts/bootstrap-model.sh --only embed`.
+# Prereqs: `just image` once, and `.devcontainer/bootstrap-model.sh --only embed`.
 # Example (8080 busy): `just serve-local 18080`   →  connect to 127.0.0.1:18080
 serve-local PORT="8080" TAG="latest":
     @docker rm -f brain-local >/dev/null 2>&1 || true

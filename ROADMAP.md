@@ -114,7 +114,7 @@ These aren't bugs — they're scope boundaries. Don't accidentally implement the
 
 ## How v1.0 gets cut
 
-1. Run the combined acceptance suite on reference hardware (`scripts/acceptance.sh`).
+1. Run the combined acceptance suite on reference hardware (`.devcontainer/acceptance.sh`).
 2. Capture wall-time numbers for every operation against the targets in `spec/19_benchmarks/02_performance_targets.md`.
 3. Execute the schema-toggle and disaster-recovery runbooks against a chaos scenario.
 4. One final spec consistency pass — every cross-reference resolves, every numerical claim is harmonized.
