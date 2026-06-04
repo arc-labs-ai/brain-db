@@ -32,10 +32,10 @@ What's pending before the acceptance suite can run green:
 
 | Area | What's needed |
 |---|---|
-| **Acceptance suite execution** | Wire the harness, run on reference hardware, capture wall-time numbers across all 50+ acceptance checks. Many criterion benches are in place; full-suite integration is the missing piece. |
+| **Acceptance suite execution** | The end-to-end harness now lives in the `brain-eval` rig (`brain-eval acceptance --scale 1m` / `soak`) — latency / throughput / recall@K / system scenarios / restart-recovery, gated. What remains is running it on quiet reference hardware and capturing wall-time numbers across all 50+ checks. |
 | **Classifier inference (candle BERT)** | The classifier extractor framework ships with the load path validated; the candle forward pass + linear classifier head is parked behind `BRAIN_NER_MODEL_PATH`. Operator-provided model + runtime weights need to light up the inference path. |
 | **Live LLM provider validation** | Anthropic + OpenAI clients are wired through a mock-client integration suite. Live-provider end-to-end runs (real API keys, real cost accounting) need a pass before v1.0. |
-| **Production-scale benches** | Per-shard benches run at 10K corpus scale. Full v1.0 acceptance runs at 1M memories per shard with mixed workloads. |
+| **Production-scale benches** | In-crate criterion benches run at 10K corpus scale in CI; the 1M-per-shard mixed-workload acceptance run is driven by the `brain-eval` rig on reference hardware. |
 | **Spec consistency final pass** | One last sweep to ensure every cross-reference resolves, all numerical claims are consistent (latency targets, HNSW parameters, slot sizes, grace periods), and any remaining stub sections in §17–§19 are filled. |
 | **Tutorial polish** | The end-to-end tutorial walks blank deployment → working query; needs one round of "follow it on a fresh laptop" testing. |
 
@@ -56,7 +56,7 @@ Planned improvements that land after v1.0 without changing the wire protocol or 
 | **Cascade audit rows + soft-cascade revert** | FORGET cascade itself works; the audit log of cascaded writes + revert path is v1.1. |
 | **Per-row stale-extraction flag** | Stale-count surfaces via metric in v1; per-row flag (needs `StatementRow.flags` schema bump) is v1.1. |
 | **Streaming retrieval query results** | `limit > 100` streams across multiple `QueryResponse` frames; v1 is single-frame. |
-| **Retrieval + transactional read-your-writes** | RECALL inside a txn uses the substrate path in v1; lens layering across statements + relations is v1.1+. |
+| **Retrieval + transactional read-your-writes** | RECALL inside a txn runs the same retrieval pipeline over committed data with the txn's pending writes overlaid (read-your-writes); richer lens layering across statements + relations is v1.1+. |
 | **Multi-frame cursor pagination** | `ENTITY_LIST`, `STATEMENT_LIST`, `STATEMENT_HISTORY`, `RELATION_LIST_FROM` — all single-frame snapshots in v1. |
 | **Wire-protocol conformance corpus** | A language-agnostic round-trip corpus (recorded request/response frames with CBOR payloads) that any client implementation can replay to verify §04 conformance. Brain ships no first-party SDK; the corpus is the drift guard for third-party clients. |
 | **`ADMIN_TANTIVY_REBUILD` wire op** | Hot tantivy rebuild from the admin CLI; v1 rebuild is startup-only. |
@@ -114,7 +114,7 @@ These aren't bugs — they're scope boundaries. Don't accidentally implement the
 
 ## How v1.0 gets cut
 
-1. Run the combined acceptance suite on reference hardware (`.devcontainer/acceptance.sh`).
+1. Run the in-repo acceptance gates (`.devcontainer/acceptance.sh`) plus the end-to-end scale-run + soak in the `brain-eval` rig (`brain-eval acceptance --scale 1m` / `soak`) on reference hardware.
 2. Capture wall-time numbers for every operation against the targets in `spec/19_benchmarks/02_performance_targets.md`.
 3. Execute the schema-toggle and disaster-recovery runbooks against a chaos scenario.
 4. One final spec consistency pass — every cross-reference resolves, every numerical claim is harmonized.

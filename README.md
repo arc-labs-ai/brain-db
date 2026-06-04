@@ -7,12 +7,12 @@
   <a href="#status"><img src="https://img.shields.io/badge/status-pre--release%20v0.1.0-orange.svg" alt="Status"></a>
   <a href="#tech-stack"><img src="https://img.shields.io/badge/language-Rust-orange.svg" alt="Rust"></a>
   <a href="#platform-support"><img src="https://img.shields.io/badge/platform-Linux-lightgrey.svg" alt="Linux"></a>
-  <a href="spec/"><img src="https://img.shields.io/badge/spec-153%20files-blue.svg" alt="Spec"></a>
+  <a href="spec/"><img src="https://img.shields.io/badge/spec-148%20files-blue.svg" alt="Spec"></a>
 </p>
 
 # Brain
 
-> **A memory database for AI agents.** Stores four record types — Memory, Entity, Statement, Relation — with explicit provenance, confidence, and bi-temporal validity. Hybrid retrieval (semantic + lexical + entity-graph + temporal) fused with weighted rank fusion. One Rust core, one wire protocol, one schema. Apache 2.0.
+> **A memory database for AI agents.** Stores four record types — Memory, Entity, Statement, Relation — with explicit provenance, confidence, and bi-temporal validity. Fused retrieval (semantic + lexical + entity-graph + temporal) combined with weighted rank fusion. One Rust core, one wire protocol, one schema. Apache 2.0.
 
 ```text
 $ brain-server --config config/dev.toml
@@ -32,8 +32,9 @@ RECALL  "conflicts with Alex"  top_k=5
   # → ranked by semantic similarity, edge proximity, recency, and salience
   #   — not just vector distance.
 
-# With a schema declared, RECALL routes through the hybrid path:
-# semantic + lexical + entity-graph, fused via RRF.
+# RECALL always fuses semantic + lexical + entity-graph via RRF — one
+# read path. A declared schema adds entity-anchored graph traversal and
+# typed enrichment on each hit.
 RECALL  "what's Priya working on?"  include_graph=true
 ```
 
@@ -65,7 +66,7 @@ Today's agent stacks duct-tape four or five storage systems: a vector database f
 Brain collapses the stack into one Rust core with one wire protocol and one schema:
 
 - **Cognitive verbs, not CRUD.** `encode` / `recall` / `plan` / `reason` / `forget` are the primitive operations.
-- **Hybrid retrieval out of the box.** Three retrievers (semantic / lexical / graph) fused via weighted RRF — not "top-k by cosine."
+- **Fused retrieval out of the box.** Three retrievers (semantic / lexical / graph) combined via weighted RRF — not "top-k by cosine."
 - **Provenance is first-class.** Every typed claim carries an evidence list back to source memories, plus four bi-temporal timestamps.
 - **Predictable tail latency.** Thread-per-core (Glommio + `io_uring`), single-writer-per-shard, lock-free reads, group-commit WAL.
 - **Apache 2.0, end to end.** No premium edition, no SaaS lock-in. The typed graph, the extractor pipeline, the reranker, and the schema DSL are all in the open repo.
@@ -98,7 +99,7 @@ The same Brain binary serves both modes; the runtime gate is whether the per-sha
 | Mode | What's active | Use it when |
 |---|---|---|
 | **Schemaless** (default) | Memory record only. `ENCODE`, `RECALL`, `PLAN`, `REASON`, `FORGET`, `SUBSCRIBE`, `TXN_*` over vector memory. | Prototyping; semantic memory without typed-graph overhead; small agents. |
-| **Schema-declared** | All of the above + typed extraction + entity/statement/relation writes + hybrid retrieval over the typed graph. | Production agents that need provenance, temporal reasoning, supersession, or entity-anchored queries. |
+| **Schema-declared** | All of the above + typed extraction + entity/statement/relation writes + entity-anchored retrieval over the typed graph. | Production agents that need provenance, temporal reasoning, supersession, or entity-anchored queries. |
 
 A deployment can move in either direction. Declaring a schema after months of schemaless use kicks off a backfill. Schema is not a legacy or minimal mode — both postures are first-class.
 
@@ -174,7 +175,7 @@ The verbs that drive Brain. Full semantics are in [`spec/05_operations/`](spec/0
 | Verb | What it does |
 |---|---|
 | **ENCODE** | Store an experience. Embeds the text, picks a slot, writes the WAL record, updates metadata, inserts into HNSW. With a schema declared, queues extractors. |
-| **RECALL** | Find memories relevant to a cue. Blends similarity with salience, recency, and edge proximity. Routes through the hybrid retriever when a schema is declared. |
+| **RECALL** | Find memories relevant to a cue. Fans out to the semantic, lexical, and graph retrievers and fuses them by RRF — one read path. A declared schema adds entity-anchored typed-graph enrichment. |
 | **PLAN** | Construct a path from one cognitive state to another. Pull-based executor with budgets (steps, wall time, branches). |
 | **REASON** | Multi-hop traversal explaining why X is connected to Y. Returns the path, evidence memories, and confidence. |
 | **FORGET** | Soft (mark + grace period) or hard (zero the slot) tombstoning. Cascades to derived typed-graph records when a schema is active. |
@@ -280,7 +281,7 @@ Hard targets from [`spec/01_architecture/05_hardware_and_targets.md`](spec/01_ar
 | `ENCODE` (text, GPU embedding) | ≤ 3 ms | ≤ 8 ms |
 | `ENCODE_VECTOR_DIRECT` (pre-supplied vector) | ≤ 1 ms | ≤ 5 ms |
 | `RECALL` (top-k = 10, schemaless) | ≤ 8 ms | ≤ 20 ms |
-| `RECALL` (top-k = 10, hybrid path) | ≤ 10 ms | ≤ 50 ms |
+| `RECALL` (top-k = 10, schema-declared, +graph) | ≤ 10 ms | ≤ 50 ms |
 | `FORGET` | ≤ 3 ms | ≤ 10 ms |
 | `PLAN` (simple) | ≤ 50 ms | ≤ 200 ms |
 | `REASON` | ≤ 100 ms | ≤ 500 ms |
@@ -303,7 +304,7 @@ For the high-level milestone index, see [`ROADMAP.md`](ROADMAP.md); the per-phas
 
 | Topic | Location |
 |---|---|
-| **Specification** (153 files, 20 sections, normative) | [`spec/`](spec/) |
+| **Specification** (148 files, 20 sections, normative) | [`spec/`](spec/) |
 | Spec entry point + glossary + doc map | [`spec/00_overview/`](spec/00_overview/00_index.md) |
 | System architecture + design wedges | [`spec/01_architecture/`](spec/01_architecture/00_purpose.md) |
 | Data model (Memory / Entity / Statement / Relation) | [`spec/02_data_model/`](spec/02_data_model/00_purpose.md) |
@@ -311,6 +312,8 @@ For the high-level milestone index, see [`ROADMAP.md`](ROADMAP.md); the per-phas
 | Schema DSL grammar | [`spec/03_schema/`](spec/03_schema/00_purpose.md) |
 | Acceptance gate for v1.0 | [`spec/19_benchmarks/06_complete_acceptance.md`](spec/19_benchmarks/06_complete_acceptance.md) |
 | Roadmap (milestone index) | [`ROADMAP.md`](ROADMAP.md) |
+| Client SDKs (Rust / Python / TS) + interactive shell | [`brain-sdk`](https://github.com/brain-db-io/brain-sdk), [`brain-shell`](https://github.com/brain-db-io/brain-shell) — separate repos |
+| Evaluation, perf/scale-run, soak & acceptance harness | [`brain-eval`](https://github.com/brain-db-io/brain-eval) — separate repo |
 
 ---
 
@@ -325,14 +328,16 @@ brain/
 │   ├── brain-metadata/     redb wrapper: memory + entity + statement + relation tables
 │   ├── brain-index/        HNSW × 3 + tantivy
 │   ├── brain-embed/        BGE embedding service
+│   ├── brain-rerank/       Cross-encoder reranker (bge-reranker-base)
 │   ├── brain-planner/      Query planner + executor
 │   ├── brain-ops/          One write path + retrievers + extractor writes
 │   ├── brain-workers/      Background workers (decay, consolidation, extractors, …)
 │   ├── brain-extractors/   Pattern + classifier extractors
 │   ├── brain-llm/          LLM client + cache + budget
+│   ├── brain-plugins/      Plugin surface (enricher + connector)
 │   ├── brain-http/         HTTP transport for the admin listener
 │   └── brain-server/       Server binary
-├── spec/                   The 153-file specification (authoritative)
+├── spec/                   The 148-file specification (authoritative)
 └── ROADMAP.md              Milestone index
 ```
 

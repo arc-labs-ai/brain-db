@@ -8,14 +8,15 @@ constraints — read this end-to-end before you start.
 1. The [spec](spec/) is authoritative. Code disagreements get
    fixed in the code, not the spec. Spec changes go through
    the maintainer.
-2. Every sub-task: **read the spec → read the phase doc → write
-   a plan in `.claude/plans/phase-NN-task-MM.md` → wait for
-   approval → implement → verify → commit**.
+2. Every sub-task: **read the spec → write a plan in
+   `.claude/plans/<short-name>.md` → wait for approval →
+   implement → verify → commit**.
 3. No `unwrap()` outside tests. Use `expect("invariant:
    <reason>")` for unreachable.
-4. Run `just verify` (or `cargo zigbuild --target
-   x86_64-unknown-linux-gnu --workspace --tests` on macOS)
-   before opening a PR.
+4. Run `just verify` before opening a PR. On macOS (or any
+   non-Linux host) use `just docker-verify` — the dev container
+   is the supported path; the server can't build natively
+   (glommio / `io_uring`).
 
 See [`AUTONOMY.md`](AUTONOMY.md) for the full operating
 contract Brain's autonomous mode runs under — much of it
@@ -78,8 +79,9 @@ Code that violates these is wrong regardless of test results:
 
 ### 1. Pick a sub-task
 
-The lowest-numbered unfinished sub-task in the active phase
-doc. Use `/next-task` if you're in Claude Code.
+A task from [`ROADMAP.md`](ROADMAP.md)'s convergence list, or an
+open issue. The numbered implementation phases are complete;
+remaining work to v1.0 is convergence (see ROADMAP).
 
 ### 2. Read the spec
 
@@ -88,7 +90,7 @@ from the code if the spec covers it — read the spec.
 
 ### 3. Plan
 
-Write `.claude/plans/phase-NN-task-MM.md` with:
+Write `.claude/plans/<short-name>.md` with:
 - Scope.
 - Spec references.
 - Architecture sketch.
@@ -108,19 +110,17 @@ Follow the plan. Deviations go back through plan → approval.
 ### 5. Verify
 
 ```bash
-just verify
-# or, on macOS:
-cargo zigbuild --target x86_64-unknown-linux-gnu --workspace --tests
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --check
+just verify          # fmt + build + clippy -D warnings + test + check-skills
+# or, on macOS / any non-Linux host (the dev container is the supported path):
+just docker-verify
 ```
 
 ### 6. Commit
 
-One commit per sub-task. Commit subject:
+One commit per task. Commit subject:
 
 ```
-<type>(<scope>): <NN.MM> — <summary>
+<type>(<scope>): <summary>
 ```
 
 Types: `feat`, `fix`, `refactor`, `test`, `docs`, `chore`,

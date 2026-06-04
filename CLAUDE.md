@@ -136,16 +136,18 @@ crates/
 ├── brain-metadata/      redb wrapper: memory + entity + statement + relation + predicate + audit tables
 ├── brain-index/         HNSW (memory + entity + statement); tantivy integration (phase 22)
 ├── brain-embed/         BGE embedding service
+├── brain-rerank/        Cross-encoder reranker (bge-reranker-base) for the read path
 ├── brain-planner/       Query planner + executor (memory recall + retrieval query router)
 ├── brain-ops/           One write path (`handlers/` per opcode → `apply/` per table → `writer/submit`) + `index/` retrievers + `extractor_writes`
 ├── brain-workers/       Background workers (auto-edge, temporal-edge, extractor, decay, …)
 ├── brain-extractors/    Pattern + classifier extractors (introduced phase 20)
 ├── brain-llm/           LLM client + cache + budget (introduced phase 21)
+├── brain-plugins/       Plugin surface (enricher + connector) for the knowledge layer
 ├── brain-http/          HTTP transport for the operator admin listener
 └── brain-server/        Server binary, wires it all together
 ```
 
-Brain ships **no first-party client, SDK, or CLI**. Clients speak the §04 wire protocol directly (portable binary frame + CBOR payloads); operators administer via `curl` against the admin HTTP listener. A `brainctl` offline migration/admin tool is future work, not yet built.
+This repo ships **the server only** — no first-party client, SDK, or CLI lives here. Clients speak the §04 wire protocol directly (portable binary frame + CBOR payloads); operators administer via `curl` against the admin HTTP listener. The client/eval tooling lives in **sibling repos** (one-way deps onto this one, never the reverse): `brain-db-io/brain-sdk` (hand-written Rust/Python/TS SDKs + conformance corpus), `brain-db-io/brain-shell` (interactive `brain` client), and `brain-db-io/brain-eval` (end-to-end evaluation, perf/scale-run, durability/soak, and the v1.0 acceptance harness). A `brainctl` offline migration/admin tool is future work, not yet built.
 
 Each crate maps to one or more spec sections. `brain-extractors` and `brain-llm` are the extraction tiers; the rest of the workspace must not depend on them at the wire/storage layer.
 
