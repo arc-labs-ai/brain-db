@@ -1,0 +1,72 @@
+{
+  "title": "Brain — Per-Shard",
+  "uid": "brain-per-shard",
+  "schemaVersion": 39,
+  "tags": ["brain"],
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request Rate by Shard",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum by (shard) (rate(brain_request_total[5m]))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "p99 Latency by Shard (ms)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum by (shard, le) (rate(brain_request_duration_ms_bucket[5m])))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "In-flight Requests by Shard",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum by (shard) (brain_request_active)", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "HNSW Node Count by Shard",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum by (shard) (brain_hnsw_node_count)", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Error Rate by Shard",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum by (shard) (rate(brain_request_total{status=\"error\"}[5m]))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Frame Recv Rate by Shard",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum by (shard) (rate(brain_frame_recv_total[5m]))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    }
+  ]
+}

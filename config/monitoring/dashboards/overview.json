@@ -1,0 +1,103 @@
+{
+  "title": "Brain — Overview",
+  "uid": "brain-overview",
+  "schemaVersion": 39,
+  "tags": ["brain"],
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Up",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "brain_up", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Build / Version",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 4, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "brain_build_info", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Shards",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "brain_shards_total", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Active Connections",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(brain_connections_active)", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "In-flight Requests",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(brain_request_active)", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Request Rate (by op)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum by (op) (rate(brain_request_total[5m]))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Request Latency p99 (ms)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(brain_request_duration_ms_bucket[5m])))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(brain_request_duration_ms_bucket[5m])))", "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Error Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(rate(brain_request_total{status=\"error\"}[5m]))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Resident Memory",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "process_resident_memory_bytes", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    }
+  ]
+}
