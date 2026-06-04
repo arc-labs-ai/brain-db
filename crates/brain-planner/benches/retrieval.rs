@@ -1,0 +1,269 @@
+//! Retrieval query criterion benches.
+//!
+//! Three benches:
+//!
+//! 1. Retrieval 3-retriever end-to-end — `plan + execute` with
+//!    Semantic + Lexical + Graph mocked at the trait level (target
+//!    p50 10 ms / p99 50 ms; the wall-time gate is end-to-end
+//!    acceptance — this bench is a regression detector for the
+//!    plan/fuse/filter/project glue).
+//! 2. Router-degraded single-retriever path — text-only query with
+//!    only Semantic available (target p50 7 ms / p99 30 ms).
+//! 3. EXPLAIN — `plan` only, no execute (target p50 500 µs /
+//!    p99 2 ms).
+//!
+//! Mocked retrievers return a fixed list of `RankedItem` so the
+//! bench measures planner + executor + RRF fusion + filter chain +
+//! result projection. Production-scale (real BGE embedder + 100K
+//! HNSW + tantivy + redb-backed graph) is validated in end-to-end
+//! acceptance.
+//!
+//! Run:
+//!
+//! ```bash
+//! cargo bench -p brain-planner --bench retrieval
+//! cargo bench -p brain-planner --bench retrieval -- --quick
+//! ```
+
+use std::sync::Arc;
+
+use brain_core::{EntityId, MemoryId};
+use brain_index::{
+    GraphError, GraphQuery, GraphRetriever, GraphRetrieverConfig, LexicalError, LexicalQuery,
+    LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItem, RankedItemId,
+    SemanticError, SemanticQuery, SemanticRetriever, SemanticRetrieverConfig, SemanticScope,
+};
+use brain_metadata::MetadataDb;
+use brain_planner::retrieval::executor::{execute, RetrievalExecutorContext};
+use brain_planner::retrieval::planner::{plan, QueryPlan};
+use brain_planner::retrieval::router::{QueryRequest as PlannerQueryRequest, RetrieverSelection};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use tempfile::TempDir;
+
+const TOP_N: usize = 100;
+
+// ---------------------------------------------------------------------------
+// Mock retrievers — return canned RankedItem lists with no I/O.
+// ---------------------------------------------------------------------------
+
+struct CannedSemanticRetriever {
+    items: Vec<RankedItem>,
+}
+
+impl SemanticRetriever for CannedSemanticRetriever {
+    fn retrieve(
+        &self,
+        _query: &SemanticQuery,
+        _scope: SemanticScope,
+        _config: &SemanticRetrieverConfig,
+    ) -> Result<Vec<RankedItem>, SemanticError> {
+        Ok(self.items.clone())
+    }
+}
+
+struct CannedLexicalRetriever {
+    items: Vec<RankedItem>,
+}
+
+impl LexicalRetriever for CannedLexicalRetriever {
+    fn retrieve(
+        &self,
+        _query: &LexicalQuery,
+        _scope: LexicalScope,
+        _config: &LexicalRetrieverConfig,
+    ) -> Result<Vec<RankedItem>, LexicalError> {
+        Ok(self.items.clone())
+    }
+}
+
+struct CannedGraphRetriever {
+    items: Vec<RankedItem>,
+}
+
+impl GraphRetriever for CannedGraphRetriever {
+    fn retrieve(
+        &self,
+        _query: &GraphQuery,
+        _config: &GraphRetrieverConfig,
+    ) -> Result<Vec<RankedItem>, GraphError> {
+        Ok(self.items.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fixture construction. Built once per Criterion bench fn and reused
+// across the timed loop via `iter`.
+// ---------------------------------------------------------------------------
+
+fn make_items(corpus: usize, kind: impl Fn(usize) -> RankedItemId) -> Vec<RankedItem> {
+    (0..corpus)
+        .map(|i| RankedItem {
+            id: kind(i),
+            rank: (i + 1) as u32,
+            score: 1.0 / (i as f32 + 1.0),
+            snippet: None,
+        })
+        .collect()
+}
+
+struct Fixture {
+    _dir: TempDir,
+    ctx: RetrievalExecutorContext,
+}
+
+fn build_fixture(
+    semantic: Option<Vec<RankedItem>>,
+    lexical: Option<Vec<RankedItem>>,
+    graph: Option<Vec<RankedItem>>,
+) -> Fixture {
+    let dir = TempDir::new().expect("tempdir");
+    let metadata = MetadataDb::open(dir.path().join("md.redb")).expect("open metadata");
+    let metadata = Arc::new(metadata);
+
+    // The executor context now requires all three retrievers — a
+    // None slot defaults to a canned-empty retriever so the bench
+    // can still measure plan-execute-fuse-filter glue without a
+    // given tier contributing.
+    let sem: Arc<dyn SemanticRetriever> = Arc::new(CannedSemanticRetriever {
+        items: semantic.unwrap_or_default(),
+    });
+    let lex: Arc<dyn LexicalRetriever> = Arc::new(CannedLexicalRetriever {
+        items: lexical.unwrap_or_default(),
+    });
+    let gr: Arc<dyn GraphRetriever> = Arc::new(CannedGraphRetriever {
+        items: graph.unwrap_or_default(),
+    });
+
+    let ctx = RetrievalExecutorContext {
+        semantic: sem,
+        lexical: lex,
+        graph: gr,
+        metadata,
+        cross_encoder: None,
+    };
+
+    Fixture { _dir: dir, ctx }
+}
+
+fn text_anchor_request() -> PlannerQueryRequest {
+    PlannerQueryRequest {
+        text: Some("budget pushback meeting".into()),
+        entity_anchor: Some(EntityId::new()),
+        kind_filter: Vec::new(),
+        predicate_filter: Vec::new(),
+        context_filter: Vec::new(),
+        agent_filter: Vec::new(),
+        time_filter: None,
+        confidence_min: None,
+        include_tombstoned: false,
+        include_superseded: false,
+        as_of_record_time_unix_nanos: None,
+        limit: 20,
+        retrievers: RetrieverSelection::Auto,
+        fusion_config: None,
+    }
+}
+
+fn text_only_request() -> PlannerQueryRequest {
+    PlannerQueryRequest {
+        text: Some("budget pushback meeting".into()),
+        entity_anchor: None,
+        kind_filter: Vec::new(),
+        predicate_filter: Vec::new(),
+        context_filter: Vec::new(),
+        agent_filter: Vec::new(),
+        time_filter: None,
+        confidence_min: None,
+        include_tombstoned: false,
+        include_superseded: false,
+        as_of_record_time_unix_nanos: None,
+        limit: 20,
+        retrievers: RetrieverSelection::Auto,
+        fusion_config: None,
+    }
+}
+
+fn build_plan(req: &PlannerQueryRequest) -> QueryPlan {
+    plan(req).expect("plan")
+}
+
+// ---------------------------------------------------------------------------
+// Benches.
+// ---------------------------------------------------------------------------
+
+/// Retrieval 3-retriever end-to-end: text + entity anchor invites
+/// Semantic, Lexical, and Graph. Target p50 10 ms / p99 50 ms
+/// (production wall-time gate is end-to-end acceptance; this bench
+/// measures plan/fuse/filter/project glue with mocked retrievers).
+fn bench_retrieval_three_retriever(c: &mut Criterion) {
+    let semantic_items = make_items(TOP_N, |i| {
+        RankedItemId::Memory(MemoryId::from_raw(i as u128))
+    });
+    let lexical_items = make_items(TOP_N, |i| {
+        RankedItemId::Memory(MemoryId::from_raw((TOP_N + i) as u128))
+    });
+    let graph_items = make_items(TOP_N / 2, |_| RankedItemId::Entity(EntityId::new()));
+
+    let fx = build_fixture(Some(semantic_items), Some(lexical_items), Some(graph_items));
+    let req = text_anchor_request();
+    let plan = build_plan(&req);
+
+    c.bench_function("retrieval_three_retriever", |b| {
+        b.iter(|| {
+            let result = futures_lite::future::block_on(execute(
+                black_box(&plan),
+                black_box(&req),
+                black_box(&fx.ctx),
+            ))
+            .expect("execute");
+            black_box(result.items.len());
+        });
+    });
+}
+
+/// Router-degraded path: text-only query → router picks Semantic +
+/// Lexical (no Graph). Target p50 7 ms / p99 30 ms.
+fn bench_retrieval_router_degraded(c: &mut Criterion) {
+    let semantic_items = make_items(TOP_N, |i| {
+        RankedItemId::Memory(MemoryId::from_raw(i as u128))
+    });
+    let lexical_items = make_items(TOP_N, |i| {
+        RankedItemId::Memory(MemoryId::from_raw((TOP_N + i) as u128))
+    });
+    let fx = build_fixture(Some(semantic_items), Some(lexical_items), None);
+    let req = text_only_request();
+    let plan = build_plan(&req);
+
+    c.bench_function("retrieval_router_degraded", |b| {
+        b.iter(|| {
+            let result = futures_lite::future::block_on(execute(
+                black_box(&plan),
+                black_box(&req),
+                black_box(&fx.ctx),
+            ))
+            .expect("execute");
+            black_box(result.items.len());
+        });
+    });
+}
+
+/// EXPLAIN — `plan(req)` only. No retrievers invoked. Target
+/// p50 500 µs / p99 2 ms.
+fn bench_explain_plan_only(c: &mut Criterion) {
+    let req = text_anchor_request();
+
+    c.bench_function("explain_plan_only", |b| {
+        b.iter(|| {
+            let qp = plan(black_box(&req)).expect("plan");
+            black_box(qp.estimated_cost_ms);
+        });
+    });
+}
+
+criterion_group!(
+    retrieval,
+    bench_retrieval_three_retriever,
+    bench_retrieval_router_degraded,
+    bench_explain_plan_only,
+);
+criterion_main!(retrieval);
