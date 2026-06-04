@@ -36,8 +36,8 @@ use brain_metadata::tables::relation::RELATION_METADATA_TABLE;
 use brain_metadata::MetadataDb;
 use redb::ReadTransaction;
 
-use super::fusion::FusedItem;
-use super::router::TimeRange;
+use crate::retrieval::fusion::FusedItem;
+use crate::retrieval::router::TimeRange;
 
 /// Per-filter configuration. All fields default to "pass
 /// through"; an empty kind filter, `None` time range,
@@ -537,4 +537,5 @@ fn statement_temporal_match(stmt: &brain_core::Statement, range: &TimeRange) -> 
 }
 
 #[cfg(test)]
+#[path = "tests.rs"]
 mod tests;

@@ -521,4 +521,5 @@ fn discriminant_order(r: Retriever) -> u8 {
 }
 
 #[cfg(test)]
+#[path = "tests.rs"]
 mod tests;

@@ -15,10 +15,10 @@
 
 use std::fmt::Write;
 
-use super::executor::{QueryMetadata, RetrieverStatus};
-use super::filters::{FilterChain, FilterChainStats};
-use super::planner::{PreFilter, QueryPlan, RetrieverConfig};
-use super::router::{OverrideKind, Retriever};
+use crate::retrieval::executor::{QueryMetadata, RetrieverStatus};
+use crate::retrieval::filters::{FilterChain, FilterChainStats};
+use crate::retrieval::planner::{PreFilter, QueryPlan, RetrieverConfig};
+use crate::retrieval::router::{OverrideKind, Retriever};
 
 /// Render a `QueryPlan` as a human-readable EXPLAIN report.
 #[must_use]
@@ -259,4 +259,5 @@ fn retriever_label(r: Retriever) -> &'static str {
 }
 
 #[cfg(test)]
+#[path = "tests.rs"]
 mod tests;

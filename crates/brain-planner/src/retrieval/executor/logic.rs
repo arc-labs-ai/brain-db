@@ -43,11 +43,11 @@ use brain_metadata::MetadataDb;
 use brain_rerank::RerankService;
 use futures_lite::future::poll_fn;
 
-use super::filters::{apply_filter_chain, FilterChainStats, FilterError};
-use super::fusion::{fuse, FusedItem};
-use super::planner::{PreFilter, QueryPlan, RetrieverConfig};
-use super::rerank::{rerank_top_n, RerankCandidate, RERANK_TOP_N};
-use super::router::{GraphAnchorMode, QueryRequest, Retriever};
+use crate::retrieval::filters::{apply_filter_chain, FilterChainStats, FilterError};
+use crate::retrieval::fusion::{fuse, FusedItem};
+use crate::retrieval::planner::{PreFilter, QueryPlan, RetrieverConfig};
+use crate::retrieval::rerank::{rerank_top_n, RerankCandidate, RERANK_TOP_N};
+use crate::retrieval::router::{GraphAnchorMode, QueryRequest, Retriever};
 
 // ---------------------------------------------------------------------------
 // Public types.
@@ -518,7 +518,7 @@ enum RetrieverInvocationError {
 }
 
 fn invoke_retriever(
-    planned: &super::planner::PlannedRetriever,
+    planned: &crate::retrieval::planner::PlannedRetriever,
     req: &QueryRequest,
     ctx: &RetrievalExecutorContext,
     pre_anchors: Option<&[RankedItem]>,
@@ -531,7 +531,7 @@ fn invoke_retriever(
 }
 
 fn invoke_semantic(
-    planned: &super::planner::PlannedRetriever,
+    planned: &crate::retrieval::planner::PlannedRetriever,
     req: &QueryRequest,
     ctx: &RetrievalExecutorContext,
 ) -> Result<Vec<RankedItem>, RetrieverInvocationError> {
@@ -611,7 +611,7 @@ fn apply_pre_filter_to_semantic(pre: &Option<PreFilter>, filters: &mut SemanticF
 }
 
 fn invoke_lexical(
-    planned: &super::planner::PlannedRetriever,
+    planned: &crate::retrieval::planner::PlannedRetriever,
     req: &QueryRequest,
     ctx: &RetrievalExecutorContext,
 ) -> Result<Vec<RankedItem>, RetrieverInvocationError> {
@@ -673,7 +673,7 @@ fn apply_pre_filter_to_lexical(pre: &Option<PreFilter>, filters: &mut LexicalFil
 }
 
 fn invoke_graph(
-    planned: &super::planner::PlannedRetriever,
+    planned: &crate::retrieval::planner::PlannedRetriever,
     req: &QueryRequest,
     ctx: &RetrievalExecutorContext,
     pre_anchors: Option<&[RankedItem]>,
@@ -885,4 +885,5 @@ async fn join_all_local<T>(mut futures: Vec<Pin<Box<dyn Future<Output = T> + '_>
 }
 
 #[cfg(test)]
+#[path = "tests.rs"]
 mod tests;

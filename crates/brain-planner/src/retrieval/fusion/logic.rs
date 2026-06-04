@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use brain_index::{RankedItem, RankedItemId};
 
-use super::router::{PerRetrieverWeights, Retriever};
+use crate::retrieval::router::{PerRetrieverWeights, Retriever};
 
 /// RRF smoothing-constant default (from Cormack et al. 2009).
 pub const DEFAULT_K: u32 = 60;
@@ -269,4 +269,5 @@ fn id_sort_key(id: &RankedItemId) -> [u8; 17] {
 }
 
 #[cfg(test)]
+#[path = "tests.rs"]
 mod tests;

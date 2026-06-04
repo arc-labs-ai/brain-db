@@ -17,9 +17,9 @@ use brain_core::StatementKind;
 use brain_core::{AgentId, MemoryKind, PredicateId, RelationTypeId};
 use brain_index::Direction as GraphDirection;
 
-use super::filters::FilterChain;
-use super::fusion::{FusionMethod, DEFAULT_K};
-use super::router::{
+use crate::retrieval::filters::FilterChain;
+use crate::retrieval::fusion::{FusionMethod, DEFAULT_K};
+use crate::retrieval::router::{
     route, GraphAnchorMode, PerRetrieverWeights, QueryRequest, RetrievalProfile, Retriever,
     RoutingDecision, TimeRange,
 };
@@ -447,7 +447,7 @@ impl QueryPlan {
     pub fn is_explicit(&self) -> bool {
         matches!(
             self.routing.override_kind,
-            super::router::OverrideKind::Explicit
+            crate::retrieval::router::OverrideKind::Explicit
         )
     }
 
@@ -464,4 +464,5 @@ impl QueryPlan {
 }
 
 #[cfg(test)]
+#[path = "tests.rs"]
 mod tests;
