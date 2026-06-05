@@ -13,10 +13,8 @@ use std::collections::HashMap;
 
 use brain_core::{ContextId, EntityId, PredicateId, StatementKind};
 use brain_core::{Statement, StatementObject, StatementValue};
-use brain_metadata::schema::predicate::{
-    predicate_get, predicate_lookup_by_qname, PredicateOpError,
-};
-use brain_metadata::statement::{statement_list, StatementListFilter, StatementOpError};
+use brain_metadata::schema::predicate::{predicate_get, predicate_lookup_by_qname};
+use brain_metadata::statement::{statement_list, StatementListFilter};
 use brain_protocol::{MaterializeProceduralRequest, MaterializeProceduralResponse};
 
 use crate::context::OpsContext;
@@ -152,7 +150,7 @@ pub async fn handle_materialize_procedural(
                 continue;
             }
             match predicate_lookup_by_qname(&rtxn, BEHAVIOR_NAMESPACE, name)
-                .map_err(map_predicate_op_error)?
+                .map_err(OpError::from)?
             {
                 Some(p) => {
                     procedural_ids.insert(p.id, (*name).into());
@@ -194,7 +192,7 @@ pub async fn handle_materialize_procedural(
                 // sort + cap across the union below.
                 limit: TOP_K_MAX as usize,
             };
-            let rows = statement_list(&rtxn, &filter).map_err(map_statement_op_error)?;
+            let rows = statement_list(&rtxn, &filter).map_err(OpError::from)?;
             for row in rows {
                 if row.tombstoned {
                     continue;
@@ -234,7 +232,7 @@ pub async fn handle_materialize_procedural(
         for s in hits {
             let predicate_name = match procedural_ids.get(&s.predicate) {
                 Some(name) => name.clone(),
-                None => match predicate_get(&rtxn, s.predicate).map_err(map_predicate_op_error)? {
+                None => match predicate_get(&rtxn, s.predicate).map_err(OpError::from)? {
                     Some(p) => p.name,
                     None => continue,
                 },
@@ -405,13 +403,9 @@ fn uuid_short(b: &[u8; 16]) -> String {
     s
 }
 
-fn map_predicate_op_error(e: PredicateOpError) -> OpError {
-    OpError::Internal(format!("predicate lookup: {e}"))
-}
-
-fn map_statement_op_error(e: StatementOpError) -> OpError {
-    OpError::Internal(format!("statement_list: {e}"))
-}
+// Errors are classified by `OpError`'s `From` impls (crate::error) —
+// this path previously downgraded everything to Internal (500), losing
+// NotFound/Conflict classification; routing through `From` fixes that.
 
 // ---------------------------------------------------------------------------
 // Tests (rendering / validation only — handler integration tests live in

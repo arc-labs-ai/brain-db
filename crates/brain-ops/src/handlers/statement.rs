@@ -31,12 +31,11 @@ use brain_core::{EntityId, PredicateId, RequestId, StatementId, StatementKind};
 use brain_core::{EvidenceEntry, Statement, TombstoneReason};
 use brain_metadata::schema::predicate::{
     predicate_get, predicate_intern_or_get, predicate_lookup_by_qname,
-    predicates_active_for_schema, PredicateOpError,
+    predicates_active_for_schema,
 };
 use brain_metadata::schema::store::schema_active;
 use brain_metadata::statement::{
     evidence_overflow_load, statement_get, statement_history, statement_list, StatementListFilter,
-    StatementOpError,
 };
 use brain_planner::WriterError;
 use brain_protocol::envelope::response::EventType;
@@ -98,14 +97,14 @@ pub async fn handle_statement_create(
         let predicate_id_opt: Option<PredicateId> = match active_version {
             Some(version) => {
                 let pred = predicate_lookup_by_qname(&rtxn, namespace, name)
-                    .map_err(map_predicate_op_error)?
+                    .map_err(OpError::from)?
                     .ok_or_else(|| OpError::PredicateNotInSchema {
                         predicate: req.predicate.clone(),
                         namespace: namespace.to_string(),
                         version,
                     })?;
                 let active = predicates_active_for_schema(&rtxn, namespace, version)
-                    .map_err(map_predicate_op_error)?;
+                    .map_err(OpError::from)?;
                 if !active.contains(&pred.id) {
                     return Err(OpError::PredicateNotInSchema {
                         predicate: req.predicate.clone(),
@@ -116,7 +115,7 @@ pub async fn handle_statement_create(
                 Some(pred.id)
             }
             None => predicate_lookup_by_qname(&rtxn, namespace, name)
-                .map_err(map_predicate_op_error)?
+                .map_err(OpError::from)?
                 .map(|p| p.id),
         };
         let schemaless = active_version.is_none();
@@ -184,7 +183,7 @@ pub async fn handle_statement_create(
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
         let new = statement_get(&rtxn, created_id)
-            .map_err(map_statement_op_error)?
+            .map_err(OpError::from)?
             .ok_or_else(|| OpError::Internal("created statement missing post-commit".into()))?;
         (new.chain_root, new.supersedes)
     };
@@ -258,7 +257,7 @@ pub async fn handle_statement_get(
         .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
 
     let mut current = statement_get(&rtxn, id)
-        .map_err(map_statement_op_error)?
+        .map_err(OpError::from)?
         .ok_or_else(|| OpError::NotFound {
             what: "statement",
             detail: format!("{id:?}"),
@@ -269,7 +268,7 @@ pub async fn handle_statement_get(
         while let Some(succ) = current.superseded_by {
             returned_via_supersession = true;
             current = statement_get(&rtxn, succ)
-                .map_err(map_statement_op_error)?
+                .map_err(OpError::from)?
                 .ok_or_else(|| {
                     OpError::Internal(format!("chain dangling at {succ:?} from {id:?}"))
                 })?;
@@ -316,14 +315,14 @@ pub async fn handle_statement_supersede(
         let pid = match active_version {
             Some(version) => {
                 let pred = predicate_lookup_by_qname(&rtxn, namespace, name)
-                    .map_err(map_predicate_op_error)?
+                    .map_err(OpError::from)?
                     .ok_or_else(|| OpError::PredicateNotInSchema {
                         predicate: req.new_statement.predicate.clone(),
                         namespace: namespace.to_string(),
                         version,
                     })?;
                 let active = predicates_active_for_schema(&rtxn, namespace, version)
-                    .map_err(map_predicate_op_error)?;
+                    .map_err(OpError::from)?;
                 if !active.contains(&pred.id) {
                     return Err(OpError::PredicateNotInSchema {
                         predicate: req.new_statement.predicate.clone(),
@@ -334,7 +333,7 @@ pub async fn handle_statement_supersede(
                 Some(pred.id)
             }
             None => predicate_lookup_by_qname(&rtxn, namespace, name)
-                .map_err(map_predicate_op_error)?
+                .map_err(OpError::from)?
                 .map(|p| p.id),
         };
         (pid, active_version.is_none())
@@ -354,7 +353,7 @@ pub async fn handle_statement_supersede(
                 .write_txn()
                 .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
             let pid = predicate_intern_or_get(&wtxn, namespace, name, 0, now)
-                .map_err(map_predicate_op_error)?;
+                .map_err(OpError::from)?;
             wtxn.commit()
                 .map_err(|e| OpError::Internal(format!("commit: {e}")))?;
             pid
@@ -399,7 +398,7 @@ pub async fn handle_statement_supersede(
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
         let new = statement_get(&rtxn, new_id)
-            .map_err(map_statement_op_error)?
+            .map_err(OpError::from)?
             .ok_or_else(|| OpError::Internal("new statement missing post-supersede".into()))?;
         (new.chain_root, new.version)
     };
@@ -589,7 +588,7 @@ pub async fn handle_statement_history(
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        let chain = statement_history(&rtxn, anchor).map_err(map_statement_op_error)?;
+        let chain = statement_history(&rtxn, anchor).map_err(OpError::from)?;
         if chain.is_empty() {
             return Err(OpError::NotFound {
                 what: "statement",
@@ -669,7 +668,7 @@ pub async fn handle_statement_list(
             let (ns, name) = split_qname(&req.predicate)?;
             let active_version = schema_active(&rtxn, ns)
                 .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
-            match predicate_lookup_by_qname(&rtxn, ns, name).map_err(map_predicate_op_error)? {
+            match predicate_lookup_by_qname(&rtxn, ns, name).map_err(OpError::from)? {
                 Some(p) => Some(p.id),
                 None => {
                     if let Some(version) = active_version {
@@ -702,7 +701,7 @@ pub async fn handle_statement_list(
             },
             limit: req.limit as usize,
         };
-        let mut rows = statement_list(&rtxn, &filter).map_err(map_statement_op_error)?;
+        let mut rows = statement_list(&rtxn, &filter).map_err(OpError::from)?;
 
         // Wire-level filters not pushed into statement_list.
         if !req.include_tombstoned {
@@ -864,7 +863,7 @@ fn build_statement_from_create(
 /// possible (single-shot read).
 fn project_view(rtxn: &redb::ReadTransaction, s: &Statement) -> Result<StatementView, OpError> {
     let predicate = predicate_get(rtxn, s.predicate)
-        .map_err(map_predicate_op_error)?
+        .map_err(OpError::from)?
         .ok_or_else(|| {
             OpError::Internal(format!(
                 "statement {:?} references missing predicate {:?}",
@@ -880,7 +879,7 @@ fn project_view(rtxn: &redb::ReadTransaction, s: &Statement) -> Result<Statement
     let mut s = s.clone();
     if let brain_core::EvidenceRef::Overflow(id) = s.evidence {
         let entries = evidence_overflow_load(rtxn, id)
-            .map_err(map_statement_op_error)?
+            .map_err(OpError::from)?
             .ok_or_else(|| {
                 OpError::Internal(format!(
                     "statement {:?} references missing overflow row {:?}",
@@ -1084,66 +1083,8 @@ fn map_writer_err(err: WriterError) -> OpError {
     }
 }
 
-fn map_predicate_op_error(err: PredicateOpError) -> OpError {
-    match err {
-        PredicateOpError::InvalidIdentifier { reason } => {
-            OpError::InvalidRequest(format!("predicate identifier: {reason}"))
-        }
-        PredicateOpError::AlreadyExists { qname, existing_id } => OpError::Conflict(format!(
-            "predicate {qname:?} already exists with id {existing_id:?}"
-        )),
-        PredicateOpError::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
-        PredicateOpError::Table(e) => OpError::Internal(format!("redb table: {e}")),
-    }
-}
-
-fn map_statement_op_error(err: StatementOpError) -> OpError {
-    match err {
-        StatementOpError::NotFound(id) => OpError::NotFound {
-            what: "statement",
-            detail: format!("{id:?}"),
-        },
-        StatementOpError::AlreadyExists(id) => {
-            OpError::Conflict(format!("statement {id:?} already exists"))
-        }
-        StatementOpError::UnknownPredicate(p) => OpError::NotFound {
-            what: "predicate",
-            detail: format!("id={p}"),
-        },
-        StatementOpError::UnknownSubject(id) => OpError::NotFound {
-            what: "subject entity",
-            detail: format!("{id:?}"),
-        },
-        StatementOpError::InvalidArgument(s) => OpError::InvalidRequest(s.to_string()),
-        StatementOpError::AlreadySuperseded(id, by) => {
-            OpError::Conflict(format!("statement {id:?} already superseded by {by:?}"))
-        }
-        StatementOpError::AlreadyTombstoned(id) => {
-            OpError::Conflict(format!("statement {id:?} is tombstoned"))
-        }
-        StatementOpError::EventCannotSupersede => {
-            OpError::Conflict("events cannot be superseded".into())
-        }
-        StatementOpError::KindMismatch { old, new } => OpError::InvalidRequest(format!(
-            "kind mismatch on supersede: old={old:?} new={new:?}"
-        )),
-        StatementOpError::SubjectMismatch => {
-            OpError::InvalidRequest("subject must match on supersede".into())
-        }
-        StatementOpError::PredicateMismatch => {
-            OpError::InvalidRequest("predicate must match on supersede".into())
-        }
-        StatementOpError::DecodeFailed => {
-            OpError::Internal("statement row decode failed — possible corruption".into())
-        }
-        StatementOpError::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
-        StatementOpError::Table(e) => OpError::Internal(format!("redb table: {e}")),
-        StatementOpError::PredicateOp(e) => map_predicate_op_error(e),
-        StatementOpError::EntityOp(e) => {
-            OpError::Internal(format!("entity op forwarded from statement_ops: {e}"))
-        }
-    }
-}
+// Statement / predicate error classification lives in
+// `OpError`'s `From` impls (crate::error) — handlers use `OpError::from`.
 
 // ---------------------------------------------------------------------------
 // Text-indexer dispatch helpers.

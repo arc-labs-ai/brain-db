@@ -9,7 +9,7 @@
 //! 4. Calls into `brain_metadata::entity::ops::*`.
 //! 5. Commits the transaction.
 //! 6. Maps `EntityOpError` to `OpError`'s error codes
-//!    (see the module-private `map_entity_op_error` helper).
+//!    (see the `OpError` `From<EntityOpError>` impl).
 //!
 //! These handlers do **not** touch the entity HNSW or emit
 //! subscription events. Both wire in later.
@@ -18,7 +18,6 @@ use brain_core::{Entity, EntityAttributes, EntityId, EntityTypeId, RequestId};
 use brain_metadata::entity::merge::MergeActor;
 use brain_metadata::entity::ops::{
     entity_get, entity_list_by_type, entity_lookup_by_alias, entity_lookup_by_canonical_name,
-    EntityOpError,
 };
 use brain_metadata::entity::trigram::{
     candidates_for_query, extract_trigrams, jaccard, trigrams_of_components,
@@ -125,7 +124,7 @@ pub async fn handle_entity_get(
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        entity_get(&rtxn, id).map_err(map_entity_op_error)?
+        entity_get(&rtxn, id).map_err(OpError::from)?
     };
     let entity = entity.ok_or_else(|| OpError::NotFound {
         what: "entity",
@@ -410,7 +409,7 @@ pub async fn handle_entity_tombstone(
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
         if entity_get(&rtxn, id)
-            .map_err(map_entity_op_error)?
+            .map_err(OpError::from)?
             .is_none()
         {
             return Err(OpError::NotFound {
@@ -603,7 +602,7 @@ pub async fn handle_entity_list(
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        entity_list_by_type(&rtxn, type_id).map_err(map_entity_op_error)?
+        entity_list_by_type(&rtxn, type_id).map_err(OpError::from)?
     };
 
     let mut items: Vec<EntityListItem> = entities
@@ -686,7 +685,7 @@ pub async fn handle_entity_resolve(
 
     // Tier 1: exact canonical_name match.
     if let Some(eid) = entity_lookup_by_canonical_name(&rtxn, type_id, &req.candidate_name)
-        .map_err(map_entity_op_error)?
+        .map_err(OpError::from)?
     {
         return Ok(EntityResolveResponse {
             outcome: ResolutionOutcomeWire::Resolved,
@@ -700,7 +699,7 @@ pub async fn handle_entity_resolve(
 
     // Tier 1b: alias match.
     let alias_hits =
-        entity_lookup_by_alias(&rtxn, type_id, &req.candidate_name).map_err(map_entity_op_error)?;
+        entity_lookup_by_alias(&rtxn, type_id, &req.candidate_name).map_err(OpError::from)?;
     if alias_hits.len() == 1 {
         return Ok(EntityResolveResponse {
             outcome: ResolutionOutcomeWire::Resolved,
@@ -719,7 +718,7 @@ pub async fn handle_entity_resolve(
 
     let mut scored: Vec<(EntityId, f32)> = Vec::new();
     for cand_id in trigram_candidates {
-        if let Some(cand_entity) = entity_get(&rtxn, cand_id).map_err(map_entity_op_error)? {
+        if let Some(cand_entity) = entity_get(&rtxn, cand_id).map_err(OpError::from)? {
             let cand_trigrams =
                 trigrams_of_components(&cand_entity.canonical_name, &cand_entity.aliases);
             let score = jaccard(&candidate_trigrams, &cand_trigrams);
@@ -809,32 +808,8 @@ fn entity_to_view(e: &Entity) -> EntityView {
     }
 }
 
-/// Map `EntityOpError` to `OpError`. Until entity-specific error codes
-/// get a first-class slot in `ErrorCode`, we surface them as
-/// the closest categories — NotFound for missing rows,
-/// Conflict for duplicates, InvalidArgument for type-registry misses,
-/// Internal for redb failures.
-fn map_entity_op_error(err: EntityOpError) -> OpError {
-    match err {
-        EntityOpError::NotFound(id) => OpError::NotFound {
-            what: "entity",
-            detail: format!("{id:?}"),
-        },
-        EntityOpError::UnknownEntityType(t) => {
-            OpError::InvalidRequest(format!("unknown entity_type {t:?}"))
-        }
-        EntityOpError::DuplicateCanonicalName {
-            type_id,
-            name,
-            existing,
-        } => OpError::Conflict(format!(
-            "canonical_name {name:?} already exists for type {type_id:?}: {existing:?}"
-        )),
-        EntityOpError::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
-        EntityOpError::Table(e) => OpError::Internal(format!("redb table: {e}")),
-        EntityOpError::TrigramOp(e) => OpError::Internal(format!("trigram op: {e}")),
-    }
-}
+// Entity error classification lives in `OpError`'s `From<EntityOpError>`
+// impl (crate::error) — handlers use `OpError::from`.
 
 // `emit_graph_event` + `wal_kind_for_event` moved to
 // `crate::handlers::events`. Re-exported so other typed-graph handler

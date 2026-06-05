@@ -28,7 +28,6 @@ use brain_metadata::relation::traversal::{
 };
 use brain_metadata::relation::types::{
     relation_type_get, relation_type_intern_or_get, relation_type_lookup_by_qname,
-    RelationTypeOpError,
 };
 use brain_metadata::schema::store::schema_active;
 use brain_planner::WriterError;
@@ -104,7 +103,7 @@ pub async fn handle_relation_create(
             .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
         if let Some(version) = active_version {
             let rt = relation_type_lookup_by_qname(&rtxn, namespace, name)
-                .map_err(map_relation_type_op_error)?
+                .map_err(OpError::from)?
                 .ok_or_else(|| OpError::RelationTypeNotInSchema {
                     type_name: req.relation_type.clone(),
                     namespace: namespace.to_string(),
@@ -120,7 +119,7 @@ pub async fn handle_relation_create(
             (rt.id, rt.is_symmetric, None)
         } else {
             match relation_type_lookup_by_qname(&rtxn, namespace, name)
-                .map_err(map_relation_type_op_error)?
+                .map_err(OpError::from)?
             {
                 Some(rt) => (rt.id, rt.is_symmetric, None),
                 None => (
@@ -305,7 +304,7 @@ pub async fn handle_relation_supersede(
                 Some(rt) => rt,
                 None => {
                     let _ = relation_type_intern_or_get(&wtxn, namespace, name, 0, now)
-                        .map_err(map_relation_type_op_error)?;
+                        .map_err(OpError::from)?;
                     relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?
                         .expect("just-interned relation type vanished")
                 }
@@ -526,7 +525,7 @@ fn run_list(
         // matching rows are possible).
         let active_version = schema_active(&rtxn, ns)
             .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
-        match relation_type_lookup_by_qname(&rtxn, ns, name).map_err(map_relation_type_op_error)? {
+        match relation_type_lookup_by_qname(&rtxn, ns, name).map_err(OpError::from)? {
             Some(rt) => Some(rt.id),
             None => {
                 if let Some(version) = active_version {
@@ -609,7 +608,7 @@ pub async fn handle_relation_traverse(
         let (ns, name) = split_qname(qname)?;
         let active_version = schema_active(&rtxn, ns)
             .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
-        match relation_type_lookup_by_qname(&rtxn, ns, name).map_err(map_relation_type_op_error)? {
+        match relation_type_lookup_by_qname(&rtxn, ns, name).map_err(OpError::from)? {
             Some(rt) => type_ids.push(rt.id),
             None => {
                 if let Some(version) = active_version {
@@ -762,7 +761,7 @@ fn project_view(rtxn: &redb::ReadTransaction, r: &Relation) -> Result<RelationVi
 
 fn type_qname(rtxn: &redb::ReadTransaction, id: RelationTypeId) -> Result<String, OpError> {
     let rt = relation_type_get(rtxn, id)
-        .map_err(map_relation_type_op_error)?
+        .map_err(OpError::from)?
         .ok_or_else(|| {
             OpError::Internal(format!("relation references missing relation_type {id:?}"))
         })?;
@@ -977,18 +976,9 @@ fn map_writer_err(err: WriterError) -> OpError {
     OpError::ExecError(brain_planner::ExecError::WriterFailed(err))
 }
 
-fn map_relation_type_op_error(err: RelationTypeOpError) -> OpError {
-    match err {
-        RelationTypeOpError::InvalidIdentifier { reason } => {
-            OpError::InvalidRequest(format!("relation_type identifier: {reason}"))
-        }
-        RelationTypeOpError::AlreadyExists { qname, existing_id } => OpError::Conflict(format!(
-            "relation_type {qname:?} already exists with id {existing_id:?}"
-        )),
-        RelationTypeOpError::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
-        RelationTypeOpError::Table(e) => OpError::Internal(format!("redb table: {e}")),
-    }
-}
+// relation_type error classification lives in `OpError`'s `From` impl
+// (crate::error). `map_relation_op_error` stays local — its
+// CardinalityViolation arm needs the handler's cardinality helpers.
 
 /// Human-readable cardinality label for the wire `CardinalityViolation`
 /// error variant. Stable strings — clients key off them.
@@ -1055,7 +1045,7 @@ fn map_relation_op_error(err: RelationOpError) -> OpError {
         RelationOpError::EdgeKey(e) => {
             OpError::Internal(format!("edge key decode (corruption?): {e}"))
         }
-        RelationOpError::RelationTypeOp(e) => map_relation_type_op_error(e),
+        RelationOpError::RelationTypeOp(e) => OpError::from(e),
         RelationOpError::EntityOp(e) => {
             OpError::Internal(format!("entity op forwarded from relation_ops: {e}"))
         }

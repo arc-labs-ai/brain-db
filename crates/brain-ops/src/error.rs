@@ -266,3 +266,121 @@ impl OpError {
         )
     }
 }
+
+// ---------------------------------------------------------------------------
+// Domain-error → OpError conversions.
+//
+// One place each metadata error type is classified into the wire taxonomy,
+// so handlers `?` them through. Previously every handler module hand-rolled
+// a `map_*_op_error` fn — and the procedural handler's copies silently
+// downgraded everything to `Internal` (500), losing NotFound/Conflict
+// classification. Centralizing here removes that divergence.
+// ---------------------------------------------------------------------------
+
+impl From<brain_metadata::schema::predicate::PredicateOpError> for OpError {
+    fn from(err: brain_metadata::schema::predicate::PredicateOpError) -> Self {
+        use brain_metadata::schema::predicate::PredicateOpError as E;
+        match err {
+            E::InvalidIdentifier { reason } => {
+                OpError::InvalidRequest(format!("predicate identifier: {reason}"))
+            }
+            E::AlreadyExists { qname, existing_id } => OpError::Conflict(format!(
+                "predicate {qname:?} already exists with id {existing_id:?}"
+            )),
+            E::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
+            E::Table(e) => OpError::Internal(format!("redb table: {e}")),
+        }
+    }
+}
+
+impl From<brain_metadata::statement::StatementOpError> for OpError {
+    fn from(err: brain_metadata::statement::StatementOpError) -> Self {
+        use brain_metadata::statement::StatementOpError as E;
+        match err {
+            E::NotFound(id) => OpError::NotFound {
+                what: "statement",
+                detail: format!("{id:?}"),
+            },
+            E::AlreadyExists(id) => {
+                OpError::Conflict(format!("statement {id:?} already exists"))
+            }
+            E::UnknownPredicate(p) => OpError::NotFound {
+                what: "predicate",
+                detail: format!("id={p}"),
+            },
+            E::UnknownSubject(id) => OpError::NotFound {
+                what: "subject entity",
+                detail: format!("{id:?}"),
+            },
+            E::InvalidArgument(s) => OpError::InvalidRequest(s.to_string()),
+            E::AlreadySuperseded(id, by) => {
+                OpError::Conflict(format!("statement {id:?} already superseded by {by:?}"))
+            }
+            E::AlreadyTombstoned(id) => {
+                OpError::Conflict(format!("statement {id:?} is tombstoned"))
+            }
+            E::EventCannotSupersede => {
+                OpError::Conflict("events cannot be superseded".into())
+            }
+            E::KindMismatch { old, new } => OpError::InvalidRequest(format!(
+                "kind mismatch on supersede: old={old:?} new={new:?}"
+            )),
+            E::SubjectMismatch => {
+                OpError::InvalidRequest("subject must match on supersede".into())
+            }
+            E::PredicateMismatch => {
+                OpError::InvalidRequest("predicate must match on supersede".into())
+            }
+            E::DecodeFailed => {
+                OpError::Internal("statement row decode failed — possible corruption".into())
+            }
+            E::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
+            E::Table(e) => OpError::Internal(format!("redb table: {e}")),
+            E::PredicateOp(e) => OpError::from(e),
+            E::EntityOp(e) => {
+                OpError::Internal(format!("entity op forwarded from statement_ops: {e}"))
+            }
+        }
+    }
+}
+
+impl From<brain_metadata::entity::ops::EntityOpError> for OpError {
+    fn from(err: brain_metadata::entity::ops::EntityOpError) -> Self {
+        use brain_metadata::entity::ops::EntityOpError as E;
+        match err {
+            E::NotFound(id) => OpError::NotFound {
+                what: "entity",
+                detail: format!("{id:?}"),
+            },
+            E::UnknownEntityType(t) => {
+                OpError::InvalidRequest(format!("unknown entity_type {t:?}"))
+            }
+            E::DuplicateCanonicalName {
+                type_id,
+                name,
+                existing,
+            } => OpError::Conflict(format!(
+                "canonical_name {name:?} already exists for type {type_id:?}: {existing:?}"
+            )),
+            E::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
+            E::Table(e) => OpError::Internal(format!("redb table: {e}")),
+            E::TrigramOp(e) => OpError::Internal(format!("trigram op: {e}")),
+        }
+    }
+}
+
+impl From<brain_metadata::relation::types::RelationTypeOpError> for OpError {
+    fn from(err: brain_metadata::relation::types::RelationTypeOpError) -> Self {
+        use brain_metadata::relation::types::RelationTypeOpError as E;
+        match err {
+            E::InvalidIdentifier { reason } => {
+                OpError::InvalidRequest(format!("relation_type identifier: {reason}"))
+            }
+            E::AlreadyExists { qname, existing_id } => OpError::Conflict(format!(
+                "relation_type {qname:?} already exists with id {existing_id:?}"
+            )),
+            E::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
+            E::Table(e) => OpError::Internal(format!("redb table: {e}")),
+        }
+    }
+}
