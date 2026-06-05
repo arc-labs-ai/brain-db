@@ -23,7 +23,7 @@ use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 use crate::tables::statement::{StatementMetadata, STATEMENTS_BY_SUBJECT_TABLE, STATEMENTS_TABLE};
 
 use super::crud::{
-    evidence_has_per_entry_metadata, insert_new_statement, resolve_evidence_entries,
+    flip_by_subject_to_noncurrent, insert_new_statement, recompute_confidence_from_evidence,
     validate_statement_shape,
 };
 use super::StatementOpError;
@@ -110,16 +110,9 @@ pub fn statement_supersede(
     new_to_insert.chain_root = StatementId::from(chain_root_bytes);
 
     // Aggregate confidence over per-entry evidence metadata when
-    // present (mirrors statement_create — wire-vs-in-process split).
-    if evidence_has_per_entry_metadata(wtxn, &new_to_insert.evidence)? {
-        let entries = resolve_evidence_entries(wtxn, &new_to_insert.evidence)?;
-        new_to_insert.confidence = brain_core::aggregate_confidence(
-            &entries,
-            new_to_insert.extracted_at_unix_nanos,
-            new_to_insert.kind,
-            &brain_core::ConfidenceConfig::default_v1(),
-        );
-    }
+    // present (shared with statement_create — wire-vs-in-process split).
+    let extracted_at = new_to_insert.extracted_at_unix_nanos;
+    recompute_confidence_from_evidence(wtxn, &mut new_to_insert, extracted_at)?;
 
     // Update old in place — flip is_current, set valid_to (Fact /
     // Preference only) if not already pinned (caller-supplied
@@ -151,13 +144,13 @@ pub fn statement_supersede(
         t.insert(&old.statement_id_bytes, &old)?;
     }
 
-    // Flip the by-subject index for old: remove (subject, kind,
-    // predicate, 1), insert (subject, kind, predicate, 0).
+    // Flip the by-subject index for old: current -> non-current.
     if old_was_current {
-        let mut bys = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
-        bys.remove(&(old_subject_bytes, old_kind_byte, old_pred, 1u8))?;
-        bys.insert(
-            &(old_subject_bytes, old_kind_byte, old_pred, 0u8),
+        flip_by_subject_to_noncurrent(
+            wtxn,
+            old_subject_bytes,
+            old_kind_byte,
+            old_pred,
             &old.statement_id_bytes,
         )?;
         // The old row is no longer current — drop its predicate-bucket

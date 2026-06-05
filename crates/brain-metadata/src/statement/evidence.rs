@@ -124,19 +124,11 @@ pub fn read_evidence_ids(
     rtxn: &ReadTransaction,
     reference: &EvidenceRef,
 ) -> Result<Vec<MemoryId>, StatementOpError> {
-    match reference {
-        EvidenceRef::Inline(entries) => Ok(entries.iter().map(|e| e.memory_id).collect()),
-        EvidenceRef::Overflow(id) => {
-            let t = rtxn.open_table(EVIDENCE_OVERFLOW_TABLE)?;
-            let row: Option<EvidenceOverflow> = t.get(&id.to_bytes())?.map(|g| g.value());
-            let over = row.ok_or(StatementOpError::DecodeFailed)?;
-            Ok(over
-                .memory_ids
-                .iter()
-                .map(|b| MemoryId::from_be_bytes(*b))
-                .collect())
-        }
-    }
+    read_evidence_ids_with(reference, |id| {
+        let t = rtxn.open_table(EVIDENCE_OVERFLOW_TABLE)?;
+        let row: Option<EvidenceOverflow> = t.get(&id.to_bytes())?.map(|g| g.value());
+        Ok(row)
+    })
 }
 
 /// Write-txn-side variant of [`read_evidence_ids`]. Use this when the
@@ -146,12 +138,28 @@ pub fn read_evidence_ids_w(
     wtxn: &WriteTransaction,
     reference: &EvidenceRef,
 ) -> Result<Vec<MemoryId>, StatementOpError> {
+    read_evidence_ids_with(reference, |id| {
+        let t = wtxn.open_table(EVIDENCE_OVERFLOW_TABLE)?;
+        let row: Option<EvidenceOverflow> = t.get(&id.to_bytes())?.map(|g| g.value());
+        Ok(row)
+    })
+}
+
+/// Shared projection for [`read_evidence_ids`] / [`read_evidence_ids_w`].
+/// `load_overflow` is the only txn-specific part (redb forbids nesting a
+/// read txn inside a write txn, so each caller opens the table on its own
+/// transaction); the inline path and the overflow→`MemoryId` projection
+/// live here once.
+fn read_evidence_ids_with(
+    reference: &EvidenceRef,
+    load_overflow: impl FnOnce(
+        &brain_core::EvidenceOverflowId,
+    ) -> Result<Option<EvidenceOverflow>, StatementOpError>,
+) -> Result<Vec<MemoryId>, StatementOpError> {
     match reference {
         EvidenceRef::Inline(entries) => Ok(entries.iter().map(|e| e.memory_id).collect()),
         EvidenceRef::Overflow(id) => {
-            let t = wtxn.open_table(EVIDENCE_OVERFLOW_TABLE)?;
-            let row: Option<EvidenceOverflow> = t.get(&id.to_bytes())?.map(|g| g.value());
-            let over = row.ok_or(StatementOpError::DecodeFailed)?;
+            let over = load_overflow(id)?.ok_or(StatementOpError::DecodeFailed)?;
             Ok(over
                 .memory_ids
                 .iter()

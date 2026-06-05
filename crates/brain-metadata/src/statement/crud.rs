@@ -168,15 +168,7 @@ pub fn statement_create(
     // on a live row (the confidence sweep and the FORGET cascade), which
     // call `rekey_predicate_index`.
     let mut to_insert = s.clone();
-    if evidence_has_per_entry_metadata(wtxn, &to_insert.evidence)? {
-        let entries = resolve_evidence_entries(wtxn, &to_insert.evidence)?;
-        to_insert.confidence = brain_core::aggregate_confidence(
-            &entries,
-            now_unix_nanos,
-            to_insert.kind,
-            &brain_core::ConfidenceConfig::default_v1(),
-        );
-    }
+    recompute_confidence_from_evidence(wtxn, &mut to_insert, now_unix_nanos)?;
 
     insert_new_statement(wtxn, &to_insert)?;
     Ok(to_insert.id)
@@ -411,6 +403,50 @@ pub fn rekey_predicate_index(
         t.remove(&old_key)?;
     }
     t.insert(&(predicate_id, kind, new_bucket), statement_id_bytes)?;
+    Ok(())
+}
+
+/// Recompute a statement's confidence via noisy-OR over its evidence,
+/// **iff** the evidence carries per-entry metadata. Wire callers send
+/// `EvidenceRef::Inline` with `confidence_milli = 0` (per-entry metadata
+/// dropped on the wire), so this is a no-op for them; in-process callers
+/// (extractors / tests) populate the field. Shared by `statement_create`
+/// and `statement_supersede` so the aggregation hookup lives in one
+/// place.
+pub(super) fn recompute_confidence_from_evidence(
+    wtxn: &WriteTransaction,
+    stmt: &mut Statement,
+    now_unix_nanos: u64,
+) -> Result<(), StatementOpError> {
+    if evidence_has_per_entry_metadata(wtxn, &stmt.evidence)? {
+        let entries = resolve_evidence_entries(wtxn, &stmt.evidence)?;
+        stmt.confidence = brain_core::aggregate_confidence(
+            &entries,
+            now_unix_nanos,
+            stmt.kind,
+            &brain_core::ConfidenceConfig::default_v1(),
+        );
+    }
+    Ok(())
+}
+
+/// Flip a statement's `by_subject` index entry from current (`is_current
+/// = 1`) to non-current (`0`). Shared by `statement_tombstone` and the
+/// old-row path of `statement_supersede` — the deactivation flip is the
+/// same in both.
+pub(super) fn flip_by_subject_to_noncurrent(
+    wtxn: &WriteTransaction,
+    subject_entity_bytes: [u8; 16],
+    kind: u8,
+    predicate_id: u32,
+    statement_id_bytes: &[u8; 16],
+) -> Result<(), StatementOpError> {
+    let mut bys = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
+    bys.remove(&(subject_entity_bytes, kind, predicate_id, 1u8))?;
+    bys.insert(
+        &(subject_entity_bytes, kind, predicate_id, 0u8),
+        statement_id_bytes,
+    )?;
     Ok(())
 }
 

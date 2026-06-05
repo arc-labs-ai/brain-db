@@ -7,7 +7,7 @@ use brain_core::TombstoneReason;
 use redb::{ReadableTable, WriteTransaction};
 
 use crate::tables::statement::{
-    StatementMetadata, STATEMENTS_BY_SUBJECT_TABLE, STATEMENTS_TABLE, STATEMENT_EMBED_QUEUE_TABLE,
+    StatementMetadata, STATEMENTS_TABLE, STATEMENT_EMBED_QUEUE_TABLE,
 };
 
 use super::StatementOpError;
@@ -50,10 +50,11 @@ pub fn statement_tombstone(
         t.insert(&row.statement_id_bytes, &row)?;
     }
     if was_current {
-        let mut bys = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
-        bys.remove(&(subject_bytes, kind_byte, pred, 1u8))?;
-        bys.insert(
-            &(subject_bytes, kind_byte, pred, 0u8),
+        super::crud::flip_by_subject_to_noncurrent(
+            wtxn,
+            subject_bytes,
+            kind_byte,
+            pred,
             &row.statement_id_bytes,
         )?;
         // A tombstoned row is no longer current — drop its
