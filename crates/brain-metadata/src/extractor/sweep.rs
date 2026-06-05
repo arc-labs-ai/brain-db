@@ -140,6 +140,15 @@ pub fn sweep_superseded_statements(
 /// summary; the caller is expected to short-circuit but this
 /// double-checks. `dry_run` computes `dry_run_would_delete` without any
 /// mutation.
+///
+/// **No audit row at reclamation.** The retract event is already durably
+/// recorded at retract time (the WAL `StatementTombstone` record carries
+/// the id, the `Retract` reason, and the timestamp, and a
+/// `StatementTombstoned` graph event is emitted). Reclamation is the
+/// idempotent physical cleanup of an already-audited decision, so it
+/// writes no separate row — do not re-add one against
+/// `entity_resolution_audit` (that table is the entity-resolution log and
+/// has no statement-lifecycle discriminator).
 pub fn reclaim_retracted_statements(
     wtxn: &WriteTransaction,
     grace_nanos: u64,

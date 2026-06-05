@@ -590,7 +590,7 @@ Reverse-evidence index entries (§19.6 `statements_by_evidence`) are **preserved
 
 1. Tombstones as in §19.11.
 2. Schedules zero-out after `RETRACT_GRACE_NANOS` (default 30 days) — handled by the periodic GC worker.
-3. At reclamation: remove from **all** tables except the audit row in `entity_resolution_audit` (kind discriminator `STATEMENT_RETRACTED`).
+3. At reclamation: remove the row from **all** tables. The retract event is already durably recorded at retract time — the WAL `StatementTombstone` record carries the statement id, the `Retract` reason, and the timestamp, and a `StatementTombstoned` graph event is emitted — so reclamation writes no additional audit row. (`entity_resolution_audit` is the entity-resolution audit log; it carries no discriminator for a statement-lifecycle event, and reclamation is idempotent physical cleanup of an already-audited decision.)
 
 `STATEMENTS_BY_EVIDENCE_TABLE` is also stripped — the dependency is gone since the row no longer exists.
 
