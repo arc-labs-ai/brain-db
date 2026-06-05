@@ -242,7 +242,9 @@ enum StatementIndexOp {
 ```
 writer.delete_term(statement_id_term(id));
 if let Upsert { .. } = op {
-    let bucket = ((confidence * 10.0).floor() as u8).min(9) as u64;
+    // Canonical bucket: floor(c*10).clamp(0,10), 0..=10 — same formula as
+    // the redb statements_by_predicate index (§10/02), so both indexes agree.
+    let bucket = u64::from(confidence_bucket(confidence));
     writer.add_document(doc! {
         statement_id => id.to_u128(),
         subject_name => upsert.subject_canonical_name,

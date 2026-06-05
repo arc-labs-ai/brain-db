@@ -277,13 +277,17 @@ fn kind_to_u64(kind: StatementKind) -> u64 {
     kind.as_u8() as u64
 }
 
-/// Compute the confidence-bucket field:
-/// `(confidence.clamp(0,1) * 10).floor()` ∈ `[0, 9]`.
+/// Confidence-bucket field for the tantivy StatementText index.
+///
+/// Delegates to the canonical
+/// [`brain_metadata::tables::statement::confidence_bucket`] (0..=10) so
+/// the tantivy index and the redb `statements_by_predicate` index bucket
+/// identically. Previously this used `.min(9)`, so a `confidence = 1.0`
+/// row landed in bucket 10 in redb but bucket 9 here — a silent
+/// cross-index disagreement at the boundary.
 #[must_use]
 pub fn confidence_bucket(confidence: f32) -> u64 {
-    let clamped = confidence.clamp(0.0, 1.0);
-    let bucket = (clamped * 10.0).floor() as u64;
-    bucket.min(9)
+    u64::from(brain_metadata::tables::statement::confidence_bucket(confidence))
 }
 
 fn commit_with_retry(writer: &mut IndexWriter) -> Result<(), ()> {

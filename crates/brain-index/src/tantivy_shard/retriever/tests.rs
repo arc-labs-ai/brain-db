@@ -85,7 +85,9 @@ fn write_statement(
     let bucket_field = schema.get_field("confidence_bucket").unwrap();
     let extracted_field = schema.get_field("extracted_at").unwrap();
 
-    let bucket = ((confidence.clamp(0.0, 1.0) * 10.0).floor() as u64).min(9);
+    // Mirrors the canonical bucket formula (floor(c*10).clamp(0,10),
+    // 0..=10) used by brain-metadata + the brain-ops tantivy writer.
+    let bucket = ((confidence.clamp(0.0, 1.0) * 10.0).floor() as u64).min(10);
 
     let mut writer = shard
         .statements
