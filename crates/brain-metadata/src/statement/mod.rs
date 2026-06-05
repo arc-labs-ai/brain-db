@@ -25,7 +25,8 @@ pub mod tombstone;
 // statement_ops API surface without consumers having to walk the
 // sub-modules.
 pub use crud::{
-    allocate_evidence_overflow, evidence_overflow_load, statement_create, statement_get,
+    allocate_evidence_overflow, evidence_overflow_load, rekey_predicate_index,
+    remove_from_predicate_index, statement_create, statement_get,
 };
 pub use embed_queue::{
     statement_embed_queue_len, statement_embed_queue_peek, statement_embed_queue_remove,

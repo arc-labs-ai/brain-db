@@ -151,8 +151,11 @@ pub fn statement_create(
     // wire); in-process callers (extractors / unit tests) populate the
     // field.
     //
-    // TODO: also re-key the by_predicate confidence bucket entry when
-    // the bucket changes by > 0.05.
+    // No predicate-bucket re-key here: this is a fresh insert, and
+    // `insert_new_statement` below indexes it under the just-aggregated
+    // confidence. Re-keying applies only to *later* confidence changes
+    // on a live row (the confidence sweep and the FORGET cascade), which
+    // call `rekey_predicate_index`.
     let mut to_insert = s.clone();
     if evidence_has_per_entry_metadata(wtxn, &to_insert.evidence)? {
         let entries = resolve_evidence_entries(wtxn, &to_insert.evidence)?;
@@ -328,6 +331,75 @@ pub(super) fn insert_new_statement(
         "new statement tombstone_reason must be 0"
     );
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `statements_by_predicate` lifecycle helpers.
+//
+// Invariant: the predicate-bucket index holds an entry
+// `(predicate_id, kind, confidence_bucket) -> statement_id` only for
+// statements that are **current and not tombstoned**, bucketed by their
+// current confidence. The index stores a single id per key
+// (last-writer-wins when two live statements land in the same bucket),
+// so every mutation here is ownership-guarded: we only touch a key that
+// currently points at *this* statement, never evicting a bucket-sharing
+// sibling.
+//
+// Obligations across the statement lifecycle:
+//   - create / insert_new_statement: insert (live row)
+//   - confidence recompute on a live row (confidence sweep, FORGET
+//     cascade evidence-drop): `rekey_predicate_index`
+//   - supersede of the old row / tombstone / retract (row leaves the
+//     live set): `remove_from_predicate_index`
+//   - physical reclamation: the row (and every index entry) is already
+//     gone by tombstone time; reclaim strips defensively.
+// ---------------------------------------------------------------------------
+
+/// Remove a statement's `statements_by_predicate` entry when it leaves
+/// the live set (tombstone, retract, or the old row of a supersede).
+/// Ownership-guarded: a no-op unless the bucket currently points at this
+/// statement, so a bucket-sharing sibling is never evicted.
+pub fn remove_from_predicate_index(
+    wtxn: &WriteTransaction,
+    predicate_id: u32,
+    kind: u8,
+    confidence: f32,
+    statement_id_bytes: &[u8; 16],
+) -> Result<(), StatementOpError> {
+    let mut t = wtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE)?;
+    let key = (predicate_id, kind, confidence_bucket(confidence));
+    if t.get(&key)?.map(|g| g.value()).as_ref() == Some(statement_id_bytes) {
+        t.remove(&key)?;
+    }
+    Ok(())
+}
+
+/// Re-key a still-current statement's predicate-bucket entry after its
+/// confidence changed. No-op when the coarse bucket is unchanged — this
+/// is the index-churn gate that mirrors the >0.05 confidence threshold
+/// callers apply before recomputing (a >0.05 drift that stays in one
+/// bucket rewrites the row but not the index). Ownership-guarded on the
+/// old key like [`remove_from_predicate_index`].
+pub fn rekey_predicate_index(
+    wtxn: &WriteTransaction,
+    predicate_id: u32,
+    kind: u8,
+    old_confidence: f32,
+    new_confidence: f32,
+    statement_id_bytes: &[u8; 16],
+) -> Result<(), StatementOpError> {
+    let old_bucket = confidence_bucket(old_confidence);
+    let new_bucket = confidence_bucket(new_confidence);
+    if old_bucket == new_bucket {
+        return Ok(());
+    }
+    let mut t = wtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE)?;
+    let old_key = (predicate_id, kind, old_bucket);
+    if t.get(&old_key)?.map(|g| g.value()).as_ref() == Some(statement_id_bytes) {
+        t.remove(&old_key)?;
+    }
+    t.insert(&(predicate_id, kind, new_bucket), statement_id_bytes)?;
     Ok(())
 }
 

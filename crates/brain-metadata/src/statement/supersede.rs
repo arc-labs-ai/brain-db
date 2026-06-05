@@ -160,6 +160,16 @@ pub fn statement_supersede(
             &(old_subject_bytes, old_kind_byte, old_pred, 0u8),
             &old.statement_id_bytes,
         )?;
+        // The old row is no longer current — drop its predicate-bucket
+        // entry before the new row (possibly) claims the same bucket
+        // below. Ownership-guarded so it never evicts a sibling.
+        crate::statement::remove_from_predicate_index(
+            wtxn,
+            old_pred,
+            old_kind_byte,
+            old.confidence,
+            &old.statement_id_bytes,
+        )?;
     }
 
     // Insert new statement + all indexes.
@@ -634,6 +644,46 @@ mod tests {
         );
         s.is_stateful = is_stateful;
         s
+    }
+
+    #[test]
+    fn supersede_moves_predicate_bucket_to_new_row() {
+        use crate::tables::statement::{confidence_bucket, STATEMENTS_BY_PREDICATE_TABLE};
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "ada-sup-byp");
+        let pred = intern_fact(&mut db, "sup_byp", /* is_stateful */ true);
+
+        // Old: confidence 0.9 -> bucket 9.
+        let old = fresh_fact_value(subj, pred, "v1", true);
+        let old_bucket = confidence_bucket(0.9);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, &old, 1_700_000_000_000_000_000).unwrap();
+        wtxn.commit().unwrap();
+
+        // New: confidence 0.3 -> bucket 3. Same subject+predicate, so the
+        // stateful predicate auto-supersedes the old row.
+        let mut new = fresh_fact_value(subj, pred, "v2", true);
+        new.confidence = 0.3;
+        let new_bucket = confidence_bucket(0.3);
+        assert_ne!(old_bucket, new_bucket);
+        let wtxn = db.write_txn().unwrap();
+        let new_id = statement_create(&wtxn, &new, 1_700_000_000_000_000_500).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE).unwrap();
+        // Old bucket no longer points at the superseded row.
+        let at_old = t
+            .get(&(pred.raw(), StatementKind::Fact.as_u8(), old_bucket))
+            .unwrap()
+            .map(|g| g.value());
+        assert_ne!(at_old, Some(old.id.to_bytes()), "old bucket must drop the superseded row");
+        // New bucket points at the current row.
+        let at_new = t
+            .get(&(pred.raw(), StatementKind::Fact.as_u8(), new_bucket))
+            .unwrap()
+            .map(|g| g.value());
+        assert_eq!(at_new, Some(new_id.to_bytes()), "new bucket points at the current row");
     }
 
     // ----- Fakes -----

@@ -42,11 +42,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use brain_core::{aggregate_confidence, ConfidenceConfig, EvidenceEntry, StatementKind};
 use brain_core::{EvidenceOverflowId, ExtractorId, MemoryId, StatementId};
-use brain_metadata::statement::evidence_overflow_load;
-use brain_metadata::tables::statement::{
-    confidence_bucket, EvidenceEntryRow, StatementMetadata, STATEMENTS_BY_PREDICATE_TABLE,
-    STATEMENTS_TABLE,
-};
+use brain_metadata::statement::{evidence_overflow_load, rekey_predicate_index};
+use brain_metadata::tables::statement::{EvidenceEntryRow, StatementMetadata, STATEMENTS_TABLE};
 use brain_metadata::MetadataDb;
 use brain_ops::ConfidenceSweepMetrics;
 use redb::ReadableTable;
@@ -376,13 +373,15 @@ impl ConfidenceSweepWorker {
             .metadata
             .write_txn()
             .map_err(|e| WorkerError::Internal(format!("confidence sweep wtxn: {e}")))?;
+        // Bucket re-keys deferred until the STATEMENTS handle drops — the
+        // shared `rekey_predicate_index` opens STATEMENTS_BY_PREDICATE
+        // itself, and redb forbids holding two handles to one table.
+        // Tuple: (predicate_id, kind, old_confidence, new_confidence, id).
+        let mut rekey_moves: Vec<(u32, u8, f32, f32, [u8; 16])> = Vec::new();
         {
             let mut s_table = wtxn
                 .open_table(STATEMENTS_TABLE)
                 .map_err(|e| WorkerError::Internal(format!("open STATEMENTS (w): {e}")))?;
-            let mut by_pred = wtxn
-                .open_table(STATEMENTS_BY_PREDICATE_TABLE)
-                .map_err(|e| WorkerError::Internal(format!("open BY_PREDICATE (w): {e}")))?;
             for u in updates {
                 let key = u.id.to_bytes();
                 let prior = s_table
@@ -399,29 +398,21 @@ impl ConfidenceSweepWorker {
                 if meta.is_tombstoned() || meta.is_current == 0 {
                     continue;
                 }
-                let old_bucket = confidence_bucket(meta.confidence);
-                let new_bucket = confidence_bucket(u.new_confidence);
+                let old_conf = meta.confidence;
                 meta.confidence = u.new_confidence;
                 s_table
                     .insert(key, meta)
                     .map_err(|e| WorkerError::Internal(format!("insert STATEMENTS: {e}")))?;
-                if old_bucket != new_bucket {
-                    let old_key = (u.predicate_id, u.kind_byte, old_bucket);
-                    let new_key = (u.predicate_id, u.kind_byte, new_bucket);
-                    // Move the row's predicate-bucket index entry. The
-                    // index is keyed by `(predicate, kind, bucket)` and
-                    // stores the statement id; we remove from the old
-                    // bucket and re-insert into the new one. A missing
-                    // old-bucket row is fine (the index may have been
-                    // pruned by a parallel path).
-                    let _ = by_pred
-                        .remove(&old_key)
-                        .map_err(|e| WorkerError::Internal(format!("remove old bucket: {e}")))?;
-                    by_pred
-                        .insert(&new_key, &key)
-                        .map_err(|e| WorkerError::Internal(format!("insert new bucket: {e}")))?;
-                }
+                rekey_moves.push((u.predicate_id, u.kind_byte, old_conf, u.new_confidence, key));
             }
+        }
+        // Re-key the predicate-bucket index for every row whose confidence
+        // moved. The helper is a no-op when the coarse bucket is
+        // unchanged and is ownership-guarded against evicting a
+        // bucket-sharing sibling.
+        for (pred, kind, old_conf, new_conf, id) in rekey_moves {
+            rekey_predicate_index(&wtxn, pred, kind, old_conf, new_conf, &id)
+                .map_err(|e| WorkerError::Internal(format!("rekey by_predicate: {e}")))?;
         }
         wtxn.commit()
             .map_err(|e| WorkerError::Internal(format!("confidence sweep commit: {e}")))?;

@@ -39,7 +39,7 @@ use redb::{ReadableTable, WriteTransaction};
 
 use crate::relation::ops::{relation_tombstone, RelationOpError};
 use crate::statement::tombstone::statement_tombstone;
-use crate::statement::StatementOpError;
+use crate::statement::{rekey_predicate_index, StatementOpError};
 use crate::tables::edge::{self, EdgeKey, EDGES_REVERSE_TABLE, EDGES_TABLE};
 use crate::tables::relation::{RELATION_BY_EVIDENCE_TABLE, RELATION_METADATA_TABLE};
 use crate::tables::statement::{
@@ -183,6 +183,12 @@ pub fn cascade_forget_to_statements(
     // we collect them and apply after the mutation handles drop.
     let mut to_tombstone: Vec<brain_core::StatementId> = Vec::new();
     let mut overflow_reclaim: Vec<EvidenceOverflowId> = Vec::new();
+    // Predicate-bucket re-keys for rows whose confidence changed. Applied
+    // after the STATEMENTS handle drops (and before the tombstone pass,
+    // so a subsequently-tombstoned row's index entry sits under its new
+    // bucket where `statement_tombstone` will find and remove it).
+    // Tuple: (predicate_id, kind, old_confidence, new_confidence, id).
+    let mut rekey_moves: Vec<(u32, u8, f32, f32, [u8; 16])> = Vec::new();
     {
         let mut table = wtxn.open_table(STATEMENTS_TABLE)?;
         let mut overflow_table = wtxn.open_table(EVIDENCE_OVERFLOW_TABLE)?;
@@ -201,9 +207,17 @@ pub fn cascade_forget_to_statements(
             // grow past the cap (not possible here, but the code is
             // symmetric) would allocate a new overflow.
             if remaining.is_empty() {
+                let old_conf = row.confidence;
                 row.evidence_inline.clear();
                 row.evidence_overflow_id_bytes = None;
                 row.confidence = 0.0;
+                rekey_moves.push((
+                    row.predicate_id,
+                    row.kind,
+                    old_conf,
+                    0.0,
+                    row.statement_id_bytes,
+                ));
                 table.insert(&row.statement_id_bytes, &row)?;
                 if let Some(oid) = prior_overflow_id {
                     overflow_reclaim.push(oid);
@@ -219,7 +233,15 @@ pub fn cascade_forget_to_statements(
             let entries: Vec<EvidenceEntry> =
                 remaining.iter().map(EvidenceEntryRow::to_entry).collect();
             let new_conf = aggregate_confidence(&entries, now_unix_nanos, kind, &confidence_cfg);
+            let old_conf = row.confidence;
             row.confidence = new_conf;
+            rekey_moves.push((
+                row.predicate_id,
+                row.kind,
+                old_conf,
+                new_conf,
+                row.statement_id_bytes,
+            ));
 
             if remaining.len() <= INLINE_EVIDENCE_CAP {
                 row.evidence_inline = remaining;
@@ -246,6 +268,14 @@ pub fn cascade_forget_to_statements(
             summary.evidence_dropped += 1;
         }
     } // table handles dropped before tombstone / overflow-reclaim re-open.
+
+    // Move predicate-bucket entries for rows whose confidence changed.
+    // Runs before the tombstone pass so a row about to be tombstoned has
+    // its index entry under the new (zeroed) bucket, where
+    // `statement_tombstone` will then remove it.
+    for (pred, kind, old_conf, new_conf, id) in rekey_moves {
+        rekey_predicate_index(wtxn, pred, kind, old_conf, new_conf, &id)?;
+    }
 
     // Reclaim orphaned overflow rows. Safe to do regardless of
     // tombstone outcome — once the statement no longer references the

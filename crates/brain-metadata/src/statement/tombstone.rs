@@ -56,6 +56,17 @@ pub fn statement_tombstone(
             &(subject_bytes, kind_byte, pred, 0u8),
             &row.statement_id_bytes,
         )?;
+        // A tombstoned row is no longer current — drop its
+        // predicate-bucket entry so predicate-anchored queries stop
+        // returning it. Ownership-guarded (a superseded row's entry is
+        // already gone; this is then a no-op).
+        super::remove_from_predicate_index(
+            wtxn,
+            pred,
+            kind_byte,
+            row.confidence,
+            &row.statement_id_bytes,
+        )?;
     }
     // Drop any pending embed-queue row — a tombstoned statement does
     // not belong in the Statement HNSW. The worker filters tombstoned
@@ -171,6 +182,38 @@ mod tests {
         assert!(got.tombstoned);
         assert_eq!(got.tombstoned_at_unix_nanos, Some(tomb_now));
         assert_eq!(got.record_invalidated_at_unix_nanos, Some(tomb_now));
+    }
+
+    #[test]
+    fn tombstone_removes_predicate_bucket_entry() {
+        use crate::tables::statement::{confidence_bucket, STATEMENTS_BY_PREDICATE_TABLE};
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "ada-byp");
+        let pred = intern_fact(&mut db, "byp");
+        let s = fresh_fact(subj, pred, "v"); // confidence 0.9 -> bucket 9
+        let bucket = confidence_bucket(0.9);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, &s, 1_700_000_000_000_000_000).unwrap();
+        wtxn.commit().unwrap();
+
+        // Live row has a predicate-bucket entry pointing at it.
+        {
+            let rtxn = db.read_txn().unwrap();
+            let t = rtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE).unwrap();
+            let got = t.get(&(pred.raw(), StatementKind::Fact.as_u8(), bucket)).unwrap();
+            assert_eq!(got.map(|g| g.value()), Some(s.id.to_bytes()));
+        }
+
+        let wtxn = db.write_txn().unwrap();
+        statement_tombstone(&wtxn, s.id, TombstoneReason::UserRequest, 1_700_000_000_000_000_500)
+            .unwrap();
+        wtxn.commit().unwrap();
+
+        // Tombstoned row is gone from the predicate-bucket index.
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE).unwrap();
+        let got = t.get(&(pred.raw(), StatementKind::Fact.as_u8(), bucket)).unwrap();
+        assert!(got.is_none(), "tombstone must remove the predicate-bucket entry");
     }
 
     #[test]
