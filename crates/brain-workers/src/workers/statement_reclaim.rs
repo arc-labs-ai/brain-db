@@ -56,31 +56,14 @@ pub const DEFAULT_GRACE_SECONDS: u64 = 30 * 24 * 60 * 60;
 /// default in `WorkerConfig`.
 pub const DEFAULT_PERIOD_SECONDS: u64 = 86_400;
 
-/// Parse a truthy enable flag. `None` / unrecognised → disabled.
-#[must_use]
-pub fn parse_enabled(raw: Option<&str>) -> bool {
-    matches!(
-        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
-}
-
-/// Parse a positive seconds override. `None` for unset / empty /
-/// non-numeric / zero.
-#[must_use]
-pub fn parse_seconds(raw: Option<&str>) -> Option<u64> {
-    let v: u64 = raw?.trim().parse().ok()?;
-    (v > 0).then_some(v)
-}
-
 fn resolved_grace_nanos() -> u64 {
-    let secs = parse_seconds(std::env::var(GRACE_SECONDS_ENV).ok().as_deref())
+    let secs = crate::env::parse_positive_seconds(std::env::var(GRACE_SECONDS_ENV).ok().as_deref())
         .unwrap_or(DEFAULT_GRACE_SECONDS);
     secs.saturating_mul(1_000_000_000)
 }
 
 fn resolved_period() -> std::time::Duration {
-    let secs = parse_seconds(std::env::var(PERIOD_SECONDS_ENV).ok().as_deref())
+    let secs = crate::env::parse_positive_seconds(std::env::var(PERIOD_SECONDS_ENV).ok().as_deref())
         .unwrap_or(DEFAULT_PERIOD_SECONDS);
     std::time::Duration::from_secs(secs)
 }
@@ -98,7 +81,7 @@ impl StatementReclaimWorker {
     pub fn new() -> Self {
         let mut config = WorkerConfig::defaults_for(WorkerKind::StatementReclaim);
         config.interval = resolved_period();
-        let enabled = parse_enabled(std::env::var(ENABLED_ENV).ok().as_deref());
+        let enabled = crate::env::parse_enabled(std::env::var(ENABLED_ENV).ok().as_deref());
         config.enabled = enabled;
         Self {
             config,
@@ -245,26 +228,7 @@ mod tests {
         assert_eq!(w.kind(), WorkerKind::StatementReclaim);
     }
 
-    #[test]
-    fn parse_enabled_truthy_and_falsey() {
-        for t in ["1", "true", "TRUE", "Yes", "on"] {
-            assert!(parse_enabled(Some(t)), "{t} should enable");
-        }
-        for f in [None, Some(""), Some("0"), Some("false"), Some("nope")] {
-            assert!(!parse_enabled(f), "{f:?} should not enable");
-        }
-    }
-
-    #[test]
-    fn parse_seconds_rejects_invalid() {
-        assert_eq!(parse_seconds(Some("2592000")), Some(2_592_000));
-        assert_eq!(parse_seconds(Some("1")), Some(1));
-        assert!(parse_seconds(None).is_none());
-        assert!(parse_seconds(Some("")).is_none());
-        assert!(parse_seconds(Some("0")).is_none());
-        assert!(parse_seconds(Some("-5")).is_none());
-        assert!(parse_seconds(Some("abc")).is_none());
-    }
+    // env enable/seconds parsing is tested once in crate::env.
 
     #[test]
     fn default_grace_is_thirty_days() {

@@ -124,20 +124,8 @@ impl Default for AmbiguityResolverConfig {
     }
 }
 
-/// Parse the env override. Returns `None` for unset / empty / zero /
-/// non-numeric.
-#[must_use]
-pub fn parse_interval_override(raw: Option<&str>) -> Option<Duration> {
-    let s = raw?;
-    let v: u64 = s.parse().ok()?;
-    if v == 0 {
-        return None;
-    }
-    Some(Duration::from_secs(v))
-}
-
 fn resolved_interval() -> Duration {
-    parse_interval_override(std::env::var(SWEEP_INTERVAL_ENV).ok().as_deref())
+    crate::env::parse_interval_override(std::env::var(SWEEP_INTERVAL_ENV).ok().as_deref())
         .unwrap_or_else(|| Duration::from_secs(DEFAULT_INTERVAL_SECS))
 }
 

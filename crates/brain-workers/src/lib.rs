@@ -21,6 +21,7 @@
 
 pub mod config;
 pub mod context;
+pub mod env;
 pub mod error;
 pub mod metrics;
 pub mod scheduler;
@@ -30,6 +31,7 @@ pub mod workers;
 
 pub use config::{WorkerConfig, WorkerKind};
 pub use context::WorkerContext;
+pub use env::{parse_enabled, parse_interval_override, parse_positive_seconds};
 pub use error::WorkerError;
 pub use metrics::{Snapshot as MetricsSnapshot, WorkerMetrics};
 pub use scheduler::{WorkerHandle, WorkerScheduler};
@@ -46,8 +48,7 @@ pub use workers::{
 };
 
 pub use workers::ambiguity_resolver::{
-    parse_interval_override as parse_ambiguity_resolver_interval, AmbiguityResolverConfig,
-    AmbiguityResolverWorker,
+    AmbiguityResolverConfig, AmbiguityResolverWorker,
     DEFAULT_AUTO_APPLY_THRESHOLD as DEFAULT_AMBIGUITY_RESOLVER_AUTO_APPLY_THRESHOLD,
     DEFAULT_EXPIRE_AFTER_SECS as DEFAULT_AMBIGUITY_RESOLVER_EXPIRE_AFTER_SECS,
     DEFAULT_INTERVAL_SECS as DEFAULT_AMBIGUITY_RESOLVER_INTERVAL_SECS,
@@ -74,8 +75,8 @@ pub use workers::causal_edge::{
     DEFAULT_MIN_CONFIDENCE as DEFAULT_CAUSAL_MIN_CONFIDENCE, DEFAULT_WHITELIST_QNAMES,
 };
 pub use workers::confidence_sweep::{
-    decay as confidence_decay, parse_interval_override as parse_confidence_sweep_interval,
-    ConfidenceSweepKnobs, ConfidenceSweepWorker, DEFAULT_BATCH_SIZE as CONFIDENCE_SWEEP_BATCH_SIZE,
+    decay as confidence_decay, ConfidenceSweepKnobs, ConfidenceSweepWorker,
+    DEFAULT_BATCH_SIZE as CONFIDENCE_SWEEP_BATCH_SIZE,
     DEFAULT_INTERVAL_SECS as DEFAULT_CONFIDENCE_SWEEP_INTERVAL_SECS,
     DEFAULT_MAX_CHANGE_PER_TICK as CONFIDENCE_SWEEP_MAX_CHANGE_PER_TICK,
     DEFAULT_MAX_PER_TICK as CONFIDENCE_SWEEP_MAX_PER_TICK,
@@ -105,8 +106,7 @@ pub use workers::hnsw_maint::{
 };
 pub use workers::idempotency_cleanup::{IdempotencyCleanupWorker, DEFAULT_IDEMPOTENCY_TTL};
 pub use workers::llm_cache_sweeper::{
-    parse_interval_override as parse_llm_cache_sweep_interval, LlmCacheSweeper,
-    DEFAULT_INTERVAL_SECS as DEFAULT_LLM_CACHE_SWEEP_INTERVAL_SECS,
+    LlmCacheSweeper, DEFAULT_INTERVAL_SECS as DEFAULT_LLM_CACHE_SWEEP_INTERVAL_SECS,
     SWEEP_INTERVAL_ENV as LLM_CACHE_SWEEP_INTERVAL_ENV,
 };
 pub use workers::slot_reclaim::{SlotReclamationWorker, DEFAULT_FORGET_GRACE};

@@ -32,20 +32,8 @@ pub const SWEEP_INTERVAL_ENV: &str = "BRAIN_LLM_CACHE_SWEEP_INTERVAL_SECS";
 /// default in `WorkerConfig`.
 pub const DEFAULT_INTERVAL_SECS: u64 = 3600;
 
-/// Parse the env override. Returns `None` when the variable is unset,
-/// empty, non-numeric, or zero.
-#[must_use]
-pub fn parse_interval_override(raw: Option<&str>) -> Option<std::time::Duration> {
-    let s = raw?;
-    let v: u64 = s.parse().ok()?;
-    if v == 0 {
-        return None;
-    }
-    Some(std::time::Duration::from_secs(v))
-}
-
 fn resolved_interval() -> std::time::Duration {
-    parse_interval_override(std::env::var(SWEEP_INTERVAL_ENV).ok().as_deref())
+    crate::env::parse_interval_override(std::env::var(SWEEP_INTERVAL_ENV).ok().as_deref())
         .unwrap_or_else(|| std::time::Duration::from_secs(DEFAULT_INTERVAL_SECS))
 }
 
@@ -173,33 +161,11 @@ mod tests {
 
     #[test]
     fn default_interval_is_one_hour() {
-        // Pure helper test: parse_interval_override sees no env value.
         let cfg = WorkerConfig::defaults_for(WorkerKind::LlmCacheSweeper);
         assert_eq!(cfg.interval, Duration::from_secs(DEFAULT_INTERVAL_SECS));
     }
 
-    #[test]
-    fn env_override_changes_interval() {
-        assert_eq!(
-            parse_interval_override(Some("300")),
-            Some(Duration::from_secs(300)),
-        );
-        assert_eq!(
-            parse_interval_override(Some("1")),
-            Some(Duration::from_secs(1)),
-        );
-    }
-
-    #[test]
-    fn env_override_rejects_invalid_inputs() {
-        // None / empty / non-numeric / zero all fall through to the
-        // default — production starts a sweeper even with a typo'd env.
-        assert!(parse_interval_override(None).is_none());
-        assert!(parse_interval_override(Some("")).is_none());
-        assert!(parse_interval_override(Some("not-a-number")).is_none());
-        assert!(parse_interval_override(Some("0")).is_none());
-        assert!(parse_interval_override(Some("-5")).is_none());
-    }
+    // env-override parsing is tested once in crate::env.
 
     #[test]
     fn worker_kind_name() {

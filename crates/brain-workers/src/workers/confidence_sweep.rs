@@ -104,20 +104,8 @@ impl Default for ConfidenceSweepKnobs {
     }
 }
 
-/// Parse the env override. Returns `None` when the variable is unset,
-/// empty, non-numeric, or zero.
-#[must_use]
-pub fn parse_interval_override(raw: Option<&str>) -> Option<Duration> {
-    let s = raw?;
-    let v: u64 = s.parse().ok()?;
-    if v == 0 {
-        return None;
-    }
-    Some(Duration::from_secs(v))
-}
-
 fn resolved_interval() -> Duration {
-    parse_interval_override(std::env::var(SWEEP_INTERVAL_ENV).ok().as_deref())
+    crate::env::parse_interval_override(std::env::var(SWEEP_INTERVAL_ENV).ok().as_deref())
         .unwrap_or_else(|| Duration::from_secs(DEFAULT_INTERVAL_SECS))
 }
 
@@ -936,16 +924,7 @@ mod tests {
         assert_eq!(w.kind(), WorkerKind::ConfidenceSweep);
     }
 
-    #[test]
-    fn env_override_parses() {
-        assert_eq!(
-            parse_interval_override(Some("60")),
-            Some(Duration::from_secs(60))
-        );
-        assert_eq!(parse_interval_override(Some("0")), None);
-        assert_eq!(parse_interval_override(None), None);
-        assert_eq!(parse_interval_override(Some("not-a-number")), None);
-    }
+    // env-override parsing is tested once in crate::env.
 
     // Use the suppressed helper to satisfy clippy's dead-code check
     // when integration tests are compiled but unused.
