@@ -34,6 +34,11 @@ use crate::context::OpsContext;
 use crate::error::OpError;
 use crate::txn::BufferedEncode;
 
+/// Upper bound on `top_k`. Bounds the fan-out + result-buffer allocation
+/// so a crafted request can't drive an unbounded allocation. Matches the
+/// statement/relation list cap (`LIST_LIMIT_MAX`).
+pub const MAX_RECALL_TOP_K: u32 = 1000;
+
 pub async fn handle_recall(
     req: RecallRequest,
     ctx: &OpsContext,
@@ -43,6 +48,11 @@ pub async fn handle_recall(
     // behavior for a caller who literally asked for "zero results."
     if req.top_k == 0 {
         return Err(OpError::InvalidRequest("recall: top_k must be > 0".into()));
+    }
+    if req.top_k > MAX_RECALL_TOP_K {
+        return Err(OpError::InvalidRequest(format!(
+            "recall: top_k must be <= {MAX_RECALL_TOP_K}"
+        )));
     }
     let planner_req = build_planner_request(&req, ctx.executor.caller_agent);
 

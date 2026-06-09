@@ -267,6 +267,23 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
     let stream_id = frame.header.stream_id_u32();
     let req = match req {
         RequestBody::Subscribe(sub_req) => {
+            // Under scoped API-key auth, a subscriber may only receive its
+            // own agent's events. `filter.agents == None`/empty means "all
+            // agents" (a cross-tenant leak on a shared shard), and any id
+            // other than the caller's own agent is likewise forbidden —
+            // mirrors RECALL's `enforce_agent_filter`.
+            if !subscribe_agents_allowed(
+                scope.scope_enforced,
+                scope.agent_id,
+                sub_req.filter.agents.as_deref(),
+            ) {
+                return Action::Inline(error_frame(
+                    stream_id,
+                    ErrorCode::PermissionDenied,
+                    "subscribe: filter.agents must name only the API key's own \
+                     agent under scoped API-key auth",
+                ));
+            }
             return Action::Subscribe(SubscribeStart {
                 stream_id,
                 req: sub_req,
@@ -563,6 +580,24 @@ fn build_response_frame(stream_id: u32, eos: bool, body: ResponseBody) -> Frame 
     Frame::new(opcode, flags, stream_id, payload)
 }
 
+/// Whether a SUBSCRIBE's `filter.agents` is allowed for this scope.
+///
+/// Under scoped API-key auth a subscriber may only receive its own
+/// agent's events, so `agents` must be a non-empty list naming only the
+/// caller's own agent — `None`/empty (= all agents on the shard) is a
+/// cross-tenant leak and is rejected. Permissive mode allows any filter.
+/// Mirrors RECALL's `enforce_agent_filter`.
+fn subscribe_agents_allowed(
+    scope_enforced: bool,
+    own: AgentId,
+    agents: Option<&[[u8; 16]]>,
+) -> bool {
+    if !scope_enforced {
+        return true;
+    }
+    agents.is_some_and(|a| !a.is_empty() && a.iter().all(|b| AgentId::from(*b) == own))
+}
+
 fn error_frame(stream_id: u32, code: ErrorCode, message: &str) -> Frame {
     let body = ResponseBody::Error(ErrorResponse {
         code: ErrorCodeWire::from(code),
@@ -832,6 +867,23 @@ mod tests {
             }
             _ => panic!("expected Inline(ERROR) on even op stream_id"),
         }
+    }
+
+    #[test]
+    fn subscribe_agents_scope_guard() {
+        let own = AgentId::from([7u8; 16]);
+        let other = [9u8; 16];
+        // Permissive mode: any filter is allowed.
+        assert!(subscribe_agents_allowed(false, own, None));
+        assert!(subscribe_agents_allowed(false, own, Some(&[other])));
+        // Scoped mode: only a non-empty list of the caller's own agent.
+        assert!(subscribe_agents_allowed(true, own, Some(&[[7u8; 16]])));
+        // Scoped mode rejects: None (= all), empty (= all), other agent,
+        // and any list that includes another agent.
+        assert!(!subscribe_agents_allowed(true, own, None));
+        assert!(!subscribe_agents_allowed(true, own, Some(&[])));
+        assert!(!subscribe_agents_allowed(true, own, Some(&[other])));
+        assert!(!subscribe_agents_allowed(true, own, Some(&[[7u8; 16], other])));
     }
 
     /// Client op on stream_id = 0 is BadFrame.

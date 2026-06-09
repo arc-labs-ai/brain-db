@@ -58,6 +58,11 @@ pub const MAX_QUERY_TEXT_BYTES: usize = 16 * 1024;
 /// the router's `MAX_RETRIEVERS = 3`.
 pub const MAX_EXPLICIT_RETRIEVERS: usize = 3;
 
+/// Max entries in a `predicate_filter`. Each entry costs a registry
+/// lookup, so cap the count to bound per-request I/O against a crafted
+/// payload.
+pub const MAX_PREDICATE_FILTER: usize = 256;
+
 // ---------------------------------------------------------------------------
 // Handlers.
 // ---------------------------------------------------------------------------
@@ -162,6 +167,12 @@ fn resolve_predicate_filter(
 ) -> Result<PredicateResolution, OpError> {
     if qnames.is_empty() {
         return Ok(PredicateResolution::Ok(Vec::new()));
+    }
+    if qnames.len() > MAX_PREDICATE_FILTER {
+        return Err(OpError::InvalidRequest(format!(
+            "predicate_filter has {} entries; max is {MAX_PREDICATE_FILTER}",
+            qnames.len()
+        )));
     }
     let rtxn = ctx
         .executor
