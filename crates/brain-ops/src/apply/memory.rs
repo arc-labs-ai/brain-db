@@ -130,7 +130,7 @@ pub fn apply_tombstone_memory(
     else {
         return Err(ApplyError::PhaseMisShape("expected Tombstone"));
     };
-    let TombstoneTarget::Memory { id, mode: _ } = target else {
+    let TombstoneTarget::Memory { id, mode } = target else {
         return Err(ApplyError::PhaseMisShape("expected Tombstone(Memory)"));
     };
 
@@ -201,6 +201,23 @@ pub fn apply_tombstone_memory(
         let _ = fp_t
             .remove(&key)
             .map_err(|e| ApplyError::Storage(format!("FINGERPRINTS remove: {e:?}")))?;
+    }
+
+    // Hard FORGET is the privacy escape hatch: the spec promises the
+    // plaintext is "no longer recoverable from the file" once the OS
+    // flushes. The text lives in the metadata (redb) TEXTS_TABLE, so
+    // drop that row in the same wtxn as the tombstone — a soft forget
+    // keeps it (reclamation handles it after grace), a hard forget
+    // purges it now. The arena-side vector is zeroed by the storage
+    // layer (live-path arena bytes are written only on WAL recovery,
+    // where the recovery replay re-zeroes a hard-forgotten slot).
+    if matches!(mode, crate::write::phase::TombstoneMode::Hard) {
+        let mut texts_t = wtxn
+            .open_table(TEXTS_TABLE)
+            .map_err(|e| ApplyError::Storage(format!("open TEXTS: {e:?}")))?;
+        let _ = texts_t
+            .remove(&id.to_be_bytes())
+            .map_err(|e| ApplyError::Storage(format!("TEXTS remove (hard forget): {e:?}")))?;
     }
 
     Ok(PhaseAck::Tombstoned {
@@ -473,6 +490,60 @@ mod tests {
             id.to_be_bytes(),
         );
         assert!(timeline_t.get(key.as_slice()).unwrap().is_none());
+    }
+
+    #[test]
+    fn hard_forget_purges_text_row_soft_keeps_it() {
+        let (_dir, db) = open_db();
+        let agent = AgentId::new();
+        let write = fresh_write_for(agent);
+        let soft_id = MemoryId::pack(0, 1, 0);
+        let hard_id = MemoryId::pack(0, 2, 0);
+
+        // Upsert both — fixture text is "hello world".
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_upsert_memory(&wtxn, &fixture_phase(soft_id), &write).unwrap();
+            let mut hard_phase = fixture_phase(hard_id);
+            if let Phase::UpsertMemory { id, .. } = &mut hard_phase {
+                *id = hard_id;
+            }
+            apply_upsert_memory(&wtxn, &hard_phase, &write).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let tombstone = |id, mode| Phase::Tombstone {
+            target: TombstoneTarget::Memory { id, mode },
+            reason: 1,
+            at_unix_nanos: 1_700_000_001_000,
+        };
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_tombstone_memory(
+                &wtxn,
+                &tombstone(soft_id, crate::write::phase::TombstoneMode::Soft),
+                &write,
+            )
+            .unwrap();
+            apply_tombstone_memory(
+                &wtxn,
+                &tombstone(hard_id, crate::write::phase::TombstoneMode::Hard),
+                &write,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let texts = rtxn.open_table(TEXTS_TABLE).unwrap();
+        assert!(
+            texts.get(&soft_id.to_be_bytes()).unwrap().is_some(),
+            "soft forget must retain the plaintext text row"
+        );
+        assert!(
+            texts.get(&hard_id.to_be_bytes()).unwrap().is_none(),
+            "hard forget must purge the plaintext text row"
+        );
     }
 
     #[test]
