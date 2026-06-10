@@ -33,12 +33,10 @@ ExtractorRun → Vec<ExtractedItem>
   Persisted Entity / Statement / Relation rows + audit log
 ```
 
-The pipeline runs **synchronously after the extractor returns**.
-Per-item resolver work shares the shard's foreground budget
-(see [`../15_background_workers/06_typed_graph_workers.md`](../15_background_workers/06_typed_graph_workers.md)) —
-for pattern extractors this fits inside ENCODE's
-P99 budget; for classifier extractors the resolver tier may push
-the extractor to near-foreground.
+The pipeline runs **synchronously after each extractor returns, inside the
+extractor worker** (see [`../15_background_workers/06_typed_graph_workers.md`](../15_background_workers/06_typed_graph_workers.md)).
+Resolver work shares the worker's background budget, not ENCODE's, so it
+never widens ENCODE's p99.
 
 ## 2. Entity resolution — four-tier gauntlet
 

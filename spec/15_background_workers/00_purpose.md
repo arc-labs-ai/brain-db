@@ -201,9 +201,7 @@ worker can monopolize.
 
 | Worker | Trigger | Priority | Backpressure |
 |---|---|---|---|
-| **Pattern extractor** | On ENCODE | Foreground (sync) | None |
-| **Classifier extractor** | On ENCODE | Near-foreground | Bounded queue (1000) |
-| **LLM extractor** | On ENCODE | Background | Bounded queue (10000), drops on overflow with metric |
+| **Extractor worker** (pattern → classifier → LLM) | On ENCODE | Background | Single bounded queue (1000), drops on overflow with metric |
 | **Entity resolver** | On extractor output mentioning entities | Near-foreground | Bounded queue |
 | **Entity embedding** | On entity create/rename | Background | Bounded queue |
 | **Statement embedding** | On statement create/update | Background | Bounded queue |
@@ -240,7 +238,7 @@ fn run_pattern_extractor(memory: &Memory, ext: &PatternExtractor) -> Vec<Extract
 }
 ```
 
-Runs synchronously during ENCODE. Output is immediately visible. Cost: tens of µs per memory.
+Runs in the per-shard extractor worker (pattern is the first tier the worker runs), not inline in ENCODE. Cost: tens of µs per memory.
 
 ### 15.3. Statement embedding worker
 
@@ -279,7 +277,7 @@ fn run_classifier_extractor(memory: &Memory, ext: &ClassifierExtractor) -> Vec<E
 }
 ```
 
-Runs in near-foreground task. Latency: 1-10 ms. May be batched if the model supports batching (deferred to future versions).
+Runs in the extractor worker after the pattern tier. Latency: 1-10 ms per memory. Batched across memories in one backbone forward pass.
 
 ### 15.5. LLM extractor
 
@@ -361,9 +359,9 @@ Idempotency is enforced by checking existence/staleness before writing. A re-run
 
 | Priority | Use | Budget |
 |---|---|---|
-| Foreground | Pattern extraction, entity resolver tier-1/2, sync index writes | 50% of shard time |
-| Near-foreground | Classifier, tantivy indexing | 25% of shard time |
-| Background | LLM, embedding, FORGET cascade | 20% of shard time |
+| Foreground | ENCODE / RECALL op handling, backpressured index writes | 50% of shard time |
+| Near-foreground | Tantivy indexing | 25% of shard time |
+| Background | Extractor worker (pattern/classifier/LLM + resolver), embedding, FORGET cascade | 20% of shard time |
 | Low | Sweepers, GC, audit log sweeper | 5% of shard time |
 
 Within a priority, FIFO within each worker's queue. Across priorities, higher priority preempts lower at yield points.

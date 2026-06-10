@@ -1,6 +1,6 @@
 # 11. Extractors
 
-> **TL;DR.** Three-tier pipeline that derives Entities, Statements, and Relations from Memories. **Extractors are always wired** — every shard runs them on every ENCODE regardless of whether a user schema is declared. Pattern (regex, tens of microseconds, free) runs synchronously on ENCODE. Classifier (pinned model, milliseconds, cheap) runs near-foreground. LLM (cached, hundreds of milliseconds to seconds, dollar-significant) runs in background workers with strict cost budgets, schema-validated output, and a per-call cache keyed by `(input_hash, extractor_version, model_version)`. Persistence is **per-entity gated**: an extracted entity / statement / relation whose type exists in some active schema namespace is persisted; one whose type is undeclared is silently dropped (extraction is best-effort). Tier-level enable flags live in `config.toml`; an enabled tier that fails to load at shard spawn → `ShardError::ExtractorInitFailed`. All tiers are required to be idempotent. Built-in extractors ship for common entity types, temporal expressions, and basic relations.
+> **TL;DR.** Three-tier pipeline that derives Entities, Statements, and Relations from Memories. **Extractors are always wired** — every shard runs them on every ENCODE regardless of whether a user schema is declared. All three tiers run **asynchronously** in the per-shard extractor worker — ENCODE enqueues the memory and acknowledges, then the worker runs pattern (regex, tens of microseconds, free) → classifier (pinned model, milliseconds, cheap) → LLM (cached, hundreds of milliseconds to seconds, dollar-significant) over it, with strict cost budgets, schema-validated output, and a per-call cache keyed by `(input_hash, extractor_version, model_version)`. No extractor output exists when ENCODE returns. Persistence is **per-entity gated**: an extracted entity / statement / relation whose type exists in some active schema namespace is persisted; one whose type is undeclared is silently dropped (extraction is best-effort). Tier-level enable flags live in `config.toml`; an enabled tier that fails to load at shard spawn → `ShardError::ExtractorInitFailed`. All tiers are required to be idempotent. Built-in extractors ship for common entity types, temporal expressions, and basic relations.
 
 ## Status
 
@@ -83,7 +83,7 @@ define extractor person_mentions {
 ```
 
 Pattern semantics:
-- Run on every ENCODE (foreground or queued background).
+- Run on every ENCODE (enqueued to the per-shard extractor worker; never inline).
 - Apply regex to memory text.
 - For each match: invoke `resolve_entity` (or `resolve_predicate`, etc., per the target).
 - Confidence is fixed at the declared value (patterns don't compute per-match confidence).
@@ -111,7 +111,7 @@ Classifier semantics:
 - Output: structured prediction with confidence.
 - Determinism: pinned weights + pinned tokenizer + pinned random seed → identical output across runs.
 
-Cost: bounded by model size and CPU. Typically 1-10 ms per memory on a CPU. Latency: low; runs in foreground or near-foreground.
+Cost: bounded by model size and CPU. Typically 1-10 ms per memory on a CPU. It runs in the background extractor worker (after the pattern tier), never on the ENCODE path.
 
 The tier is **live in v1.0** — both the entity-mention head and the statement-kind head (Fact / Preference / Event) run a real forward pass over the shared GLiNER encoder. Earlier phases shipped the head wired but degraded; v1.0 is the first cut where the statement-kind classification gate fires before the LLM tier on the hot path.
 
@@ -249,13 +249,13 @@ When used, they run alongside user-declared extractors.
 
 ## Concurrency and ordering
 
-Multiple extractors can run on the same memory. Default execution:
+Multiple extractors can run on the same memory. All extraction is asynchronous — ENCODE enqueues the memory and the per-shard extractor worker runs the tiers in order when it drains the queue:
 
-1. Pattern extractors run synchronously during ENCODE (foreground, fast).
-2. Classifier extractors run synchronously or in near-foreground (low latency).
-3. LLM extractors run in background workers (high latency, batched).
+1. Pattern extractors run first (fast, deterministic).
+2. Classifier extractors run next (pinned model, low per-memory latency).
+3. LLM extractors run last (high latency, cached).
 
-Pattern and classifier outputs are visible immediately after ENCODE returns. LLM outputs appear within seconds to minutes.
+No extractor output exists when ENCODE returns. Pattern and classifier outputs typically appear within one worker cycle; LLM outputs appear within seconds to minutes.
 
 Ordering matters when later extractors depend on earlier ones' outputs:
 

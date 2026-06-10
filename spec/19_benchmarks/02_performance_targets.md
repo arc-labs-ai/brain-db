@@ -134,10 +134,10 @@ specificity. Classifier numbers assume the bundled `brain.basic_ner`
 (small distilled BERT or rule-based fallback) — larger classifiers
 scale linearly with inference cost.
 
-ENCODE's overall P99 (§2.1, 20 ms) absorbs at most one classifier
-extractor synchronously per memory; additional classifier
-extractors dispatch through the near-foreground queue and don't
-widen ENCODE's budget.
+Extraction is **not** part of ENCODE's latency: every tier (pattern,
+classifier, LLM) runs in the per-shard extractor worker, which ENCODE
+feeds via a single non-blocking enqueue. The classifier numbers above
+are a worker-throughput target, not a component of ENCODE's p99.
 
 ### 2.8 typed graph — LLM extractor
 

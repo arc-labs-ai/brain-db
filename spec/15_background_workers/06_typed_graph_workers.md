@@ -23,21 +23,26 @@ ENCODE(memory) → wtxn.commit() → emit("Encoded" event)
                                    │
                                    ▼
               ┌──────────────────────────────────────┐
-              │ for each active extractor:           │
-              │   if trigger(memory): dispatch       │
+              │ enqueue memory once (non-blocking)   │
+              │ onto the per-shard extractor queue   │
               └──────────────────────────────────────┘
                                    │
-              ┌────────────────────┼────────────────────┐
-              ▼                    ▼                    ▼
-        Pattern queue       Classifier queue        LLM queue
-        (foreground)        (near-foreground)       (background)
+                                   │ drained by the ExtractorWorker
+                                   ▼ on its scheduler cadence
+              ┌──────────────────────────────────────┐
+              │ run tiers in order, per memory:      │
+              │   pattern → classifier → LLM         │
+              └──────────────────────────────────────┘
 
 ```
 
-Dispatch order:
-1. Pattern extractors run **synchronously** inside the ENCODE op handler, before the response is returned. Their outputs are already persisted when ENCODE acknowledges.
-2. Classifier extractors are **enqueued** onto the near-foreground queue. ENCODE doesn't wait for them. Their outputs are visible 1–10 ms later (typical p99).
-3. LLM extractors are **enqueued** onto the background queue. The LLM dispatcher drains the queue out-of-band; outputs are visible once each call completes.
+Dispatch model — **all three tiers run asynchronously**. ENCODE never runs an extractor inline:
+
+1. On commit, the writer's post-commit step performs a **single non-blocking enqueue** of the memory onto the per-shard extractor queue, then ENCODE acknowledges. No extracted entity / statement / relation exists when ENCODE returns.
+2. The per-shard **ExtractorWorker** drains the queue on its scheduler cadence and runs the tiers **in order — pattern → classifier → LLM —** over each drained memory. Pattern output is cheap (~µs) but it too is produced by the worker, so it becomes visible only after the worker processes the memory (typically within one worker cycle), not at ENCODE-ack.
+3. The LLM tier runs last in the same pass; its outputs land once each (possibly cached) call completes.
+
+Why fully async: it keeps ENCODE's p99 independent of extraction cost. Pattern is microseconds, but the classifier forward pass (GLiNER, tens of ms to seconds on CPU) and the LLM round-trips vary by orders of magnitude — coupling any tier to the write path would make ENCODE latency hostage to model and inference cost. One queue gives one back-pressure / drop surface and one idempotency guard (the per-memory audit row); running the tiers together per memory lets later tiers supplement or replace earlier candidates and resolves `depends_on` in a single pass, and batching amortizes the GLiNER backbone GEMM across memories.
 
 ### Queue shapes
 
@@ -60,27 +65,23 @@ pub struct QueueItem {
 }
 ```
 
-Per-tier defaults (operator-configurable):
+Queue defaults (operator-configurable):
 
-| Tier | Capacity | Overflow |
+| Queue | Capacity | Overflow |
 |---|---|---|
-| Pattern | n/a (synchronous, no queue) | n/a |
-| Classifier | 1 000 | `Drop` + metric |
-| LLM | 10 000 | `Drop` + metric |
+| Per-shard extractor queue (feeds all three tiers) | 1 000 | `Drop` + metric |
 
-Overflow policy `Drop` records a metric counter and emits a warn-level trace event so the operator sees pressure. The dropped extraction writes an audit row `Skipped(reason: "queue full")`.
+There is **one** physical queue per shard: the memory is enqueued once and the worker runs every eligible tier on it. Overflow policy `Drop` records a metric counter and emits a warn-level trace event so the operator sees pressure. The dropped extraction writes an audit row `Skipped(reason: "queue full")`.
 
 ### Scheduling priorities
 
-Inherited from [`./00_purpose.md`](./00_purpose.md) §"Scheduling priorities":
+The ExtractorWorker runs under the per-shard scheduler's background allowance — it is never on the foreground (ENCODE) path. All three tiers share that one budget; there is no separate per-tier lane.
 
-| Tier | Priority | Budget |
+| Worker | Priority | Budget |
 |---|---|---|
-| Pattern | Foreground | shares the ENCODE op's allowance |
-| Classifier | Near-foreground | 25% of shard time |
-| LLM | Background | 20% of shard time |
+| ExtractorWorker (pattern + classifier + LLM) | Background | shares the shard's worker allowance |
 
-The per-shard executor's cooperative-yield model applies — a long classifier inference yields between memories to let foreground work proceed.
+The per-shard executor's cooperative-yield model applies — a long classifier or LLM inference yields between memories so foreground ops (ENCODE / RECALL) keep their latency.
 
 ### Dispatch eligibility check
 
@@ -96,7 +97,7 @@ fn is_dispatchable(ext: &ExtractorRow, mem: &Memory) -> bool {
 }
 ```
 
-Pattern dispatch runs this filter synchronously in ENCODE. Classifier dispatch runs the same filter — if the trigger doesn't match, no audit row is written (no row, no skip). The condition "trigger eval error" still writes `Skipped(reason: "trigger eval error")` because the extractor was eligible but the condition itself was malformed.
+The ExtractorWorker runs this filter when it drains each memory, once per eligible extractor — if the trigger doesn't match, no audit row is written (no row, no skip). The condition "trigger eval error" still writes `Skipped(reason: "trigger eval error")` because the extractor was eligible but the condition itself was malformed.
 
 ### Worker loop
 
@@ -158,7 +159,7 @@ Per [`./00_purpose.md`](./00_purpose.md) (Observability) plus extractor-specific
 
 Brain's tests verify:
 
-- Pattern dispatch is in-process synchronous (no queue).
+- All three tiers dispatch through the single extractor queue (no in-ENCODE synchronous path).
 - Classifier queue overflow drops + writes audit + emits metric.
 - `enabled = false` causes dispatch to skip.
 - `depends_on` chain blocks dequeue until parent's audit row appears.
@@ -290,11 +291,10 @@ Ordering on the shard's post-commit fan-out (deterministic):
 
 1. WAL fsync.
 2. redb wtxn commit (memory + typed-graph tables).
-3. Pattern extractor (synchronous).
-4. Classifier extractor enqueue (near-foreground).
-5. LLM extractor enqueue (background).
-6. **MemoryTextIndexer enqueue** (near-foreground).
-7. **StatementTextIndexer enqueue** (near-foreground; only if extractors created statements, OR if this op was a direct STATEMENT_CREATE).
+3. Extractor enqueue (single queue; non-blocking).
+4. **MemoryTextIndexer enqueue** (near-foreground).
+
+Statement creation, entity resolution, and the **StatementTextIndexer enqueue** for extractor-derived statements happen later, inside the ExtractorWorker when it drains the memory (or, for a direct `STATEMENT_CREATE` op, in that op's own post-commit fan-out).
 
 Each is a separate shard-local queue; failures don't cascade (except text indexer failures, which "Commit policy" specifies as shard-fatal).
 

@@ -56,8 +56,8 @@ What "the typed graph is done" means. Concrete tests that must pass.
 
 ### Extraction
 
-- [ ] Pattern extractor: runs synchronously, output visible immediately after ENCODE.
-- [ ] Classifier extractor: runs near-foreground; output visible within 100 ms.
+- [ ] Pattern extractor: runs in the extractor worker; output visible after the memory is drained (not at ENCODE-ack).
+- [ ] Classifier extractor: runs in the extractor worker after the pattern tier; output visible within one worker cycle of ENCODE.
 - [ ] LLM extractor (cache hit): returns from cache without LLM call.
 - [ ] LLM extractor (cache miss): calls LLM, caches result, schema-validates.
 - [ ] LLM extractor (invalid output): retries once, then drops with audit.
