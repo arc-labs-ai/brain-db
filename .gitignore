@@ -15,9 +15,9 @@ Cargo.lock.bak
 .DS_Store
 Thumbs.db
 
-# Claude Code local overrides (don't commit personal settings)
-.claude/settings.local.json
-.claude/.session-state/
+# Claude Code config and project context (kept out of version control)
+.claude/
+CLAUDE.md
 
 # Brain runtime data
 /data/
