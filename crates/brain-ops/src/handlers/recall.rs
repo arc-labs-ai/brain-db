@@ -91,7 +91,9 @@ pub async fn handle_recall(
         metadata: ctx.executor.metadata.clone(),
         cross_encoder: ctx.cross_encoder.as_arc().cloned(),
     };
-    let result = retrieval_execute(&plan, &planner_req, &exec_ctx)
+    // RECALL is memory-centric — its projector drops non-memory hits, so
+    // the statement corpus is not searched (passing `false`).
+    let result = retrieval_execute(&plan, &planner_req, false, &exec_ctx)
         .await
         .map_err(map_execution_error)?;
 

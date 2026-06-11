@@ -192,7 +192,7 @@ fn executes_single_semantic_retriever() {
     };
     let qp = plan(&req).expect("plan");
     let result: QueryResult =
-        futures_lite::future::block_on(execute(&qp, &req, &ctx)).expect("execute");
+        futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
 
     assert_eq!(result.items.len(), 2);
     assert_eq!(result.metadata.retriever_latencies_ms.len(), 1);
@@ -236,7 +236,7 @@ fn executes_three_retrievers_and_fuses() {
         ..Default::default()
     };
     let qp = plan(&req).expect("plan");
-    let result = futures_lite::future::block_on(execute(&qp, &req, &ctx)).expect("execute");
+    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
 
     assert_eq!(result.items.len(), 1);
     assert_eq!(result.items[0].contributing.len(), 3);
@@ -277,7 +277,7 @@ fn graph_runs_in_memory_mode_when_no_entity_anchor() {
         ..Default::default()
     };
     let qp = plan(&req).expect("plan");
-    let result = futures_lite::future::block_on(execute(&qp, &req, &ctx)).expect("execute");
+    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
 
     assert_eq!(
         outcome_status(&result.metadata, Retriever::Graph),
@@ -309,7 +309,7 @@ fn memory_anchor_graph_skips_when_semantic_returns_nothing() {
         ..Default::default()
     };
     let qp = plan(&req).expect("plan");
-    let result = futures_lite::future::block_on(execute(&qp, &req, &ctx)).expect("execute");
+    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
 
     assert_eq!(
         outcome_status(&result.metadata, Retriever::Graph),
@@ -336,7 +336,7 @@ fn skips_semantic_when_no_text() {
         ..Default::default()
     };
     let qp = plan(&req).expect("plan");
-    let result = futures_lite::future::block_on(execute(&qp, &req, &ctx)).expect("execute");
+    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
     assert_eq!(
         outcome_status(&result.metadata, Retriever::Semantic),
         Some(RetrieverStatus::Skipped("no query text"))
@@ -365,7 +365,7 @@ fn failing_retriever_returns_partial_results() {
         ..Default::default()
     };
     let qp = plan(&req).expect("plan");
-    let result = futures_lite::future::block_on(execute(&qp, &req, &ctx)).expect("execute");
+    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
 
     // Semantic succeeds with one hit; lexical failed →
     // partial fused result.
@@ -398,7 +398,7 @@ fn timeout_records_status() {
             *timeout_ms = 10;
         }
     }
-    let result = futures_lite::future::block_on(execute(&qp, &req, &ctx)).expect("execute");
+    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
     assert_eq!(
         outcome_status(&result.metadata, Retriever::Semantic),
         Some(RetrieverStatus::Timeout)
@@ -428,7 +428,7 @@ fn total_latency_at_least_sum_of_per_retriever() {
         ..Default::default()
     };
     let qp = plan(&req).expect("plan");
-    let result = futures_lite::future::block_on(execute(&qp, &req, &ctx)).expect("execute");
+    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
 
     let sum: f64 = result
         .metadata
@@ -461,7 +461,7 @@ fn empty_retriever_result_doesnt_break_fusion() {
         ..Default::default()
     };
     let qp = plan(&req).expect("plan");
-    let result = futures_lite::future::block_on(execute(&qp, &req, &ctx)).expect("execute");
+    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
     assert_eq!(result.items.len(), 1);
     assert_eq!(
         outcome_status(&result.metadata, Retriever::Semantic),
@@ -491,6 +491,6 @@ fn limit_truncates_after_filters() {
         ..Default::default()
     };
     let qp = plan(&req).expect("plan");
-    let result = futures_lite::future::block_on(execute(&qp, &req, &ctx)).expect("execute");
+    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
     assert_eq!(result.items.len(), 3);
 }

@@ -101,7 +101,9 @@ pub async fn handle_query(
     let planner_req = wire_to_planner_request(req, predicate_ids)?;
     let qp = plan(&planner_req).map_err(map_plan_error)?;
     let exec_ctx = build_executor_context(ctx)?;
-    let result = execute(&qp, &planner_req, &exec_ctx)
+    // QUERY is the typed-graph query: it surfaces statement results, so
+    // the statement corpus is searched (passing `true`).
+    let result = execute(&qp, &planner_req, true, &exec_ctx)
         .await
         .map_err(map_executor_error)?;
     Ok(project_query_response(&result))
@@ -148,7 +150,8 @@ pub async fn handle_query_trace(
     let planner_req = wire_to_planner_request(req.query, predicate_ids)?;
     let qp = plan(&planner_req).map_err(map_plan_error)?;
     let exec_ctx = build_executor_context(ctx)?;
-    let result = execute(&qp, &planner_req, &exec_ctx)
+    // TRACE mirrors QUERY's execution, statement corpus included.
+    let result = execute(&qp, &planner_req, true, &exec_ctx)
         .await
         .map_err(map_executor_error)?;
     Ok(QueryTraceResponse {
@@ -243,7 +246,9 @@ pub async fn handle_query_text(
     };
     let qp = plan(&planner_req).map_err(map_plan_error)?;
     let exec_ctx = build_executor_context(ctx)?;
-    let result = execute(&qp, &planner_req, &exec_ctx)
+    // QUERY_TEXT projects to memory ids only (`memory_hit_from_fused`
+    // drops non-memory hits), so the statement corpus is not searched.
+    let result = execute(&qp, &planner_req, false, &exec_ctx)
         .await
         .map_err(map_executor_error)?;
     let items = result

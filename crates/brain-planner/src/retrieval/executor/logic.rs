@@ -155,6 +155,7 @@ pub enum ExecutionError {
 pub async fn execute(
     plan: &QueryPlan,
     request: &QueryRequest,
+    include_statements: bool,
     ctx: &RetrievalExecutorContext,
 ) -> Result<QueryResult, ExecutionError> {
     let total_started = Instant::now();
@@ -185,7 +186,7 @@ pub async fn execute(
         None;
     if let Some(sem) = &pre_semantic_planned {
         let started = Instant::now();
-        let invocation = invoke_retriever(sem, request, ctx, None);
+        let invocation = invoke_retriever(sem, request, ctx, None, include_statements);
         pre_semantic_latency_ms = started.elapsed().as_secs_f64() * 1000.0;
         if let Ok(items) = &invocation {
             cached_semantic = Some(items.clone());
@@ -237,7 +238,7 @@ pub async fn execute(
         };
         futures.push(Box::pin(async move {
             let started = Instant::now();
-            let invocation = invoke_retriever(planned, request, ctx, pre_anchors);
+            let invocation = invoke_retriever(planned, request, ctx, pre_anchors, include_statements);
             let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
             (idx, elapsed_ms, invocation)
         }));
@@ -531,10 +532,11 @@ fn invoke_retriever(
     req: &QueryRequest,
     ctx: &RetrievalExecutorContext,
     pre_anchors: Option<&[RankedItem]>,
+    include_statements: bool,
 ) -> Result<Vec<RankedItem>, RetrieverInvocationError> {
     match planned.retriever {
-        Retriever::Semantic => invoke_semantic(planned, req, ctx),
-        Retriever::Lexical => invoke_lexical(planned, req, ctx),
+        Retriever::Semantic => invoke_semantic(planned, req, ctx, include_statements),
+        Retriever::Lexical => invoke_lexical(planned, req, ctx, include_statements),
         Retriever::Graph => invoke_graph(planned, req, ctx, pre_anchors),
     }
 }
@@ -543,6 +545,7 @@ fn invoke_semantic(
     planned: &crate::retrieval::planner::PlannedRetriever,
     req: &QueryRequest,
     ctx: &RetrievalExecutorContext,
+    include_statements: bool,
 ) -> Result<Vec<RankedItem>, RetrieverInvocationError> {
     let handle = &ctx.semantic;
     let Some(text) = req.text.as_ref() else {
@@ -581,10 +584,12 @@ fn invoke_semantic(
         ef_search.saturating_mul(4).min(FILTERED_EF_CEILING)
     };
 
-    // Scope: Both when both text and entity_anchor present
-    // (statement HNSW may be empty in v1 → silent Ok([]));
-    // Memory otherwise.
-    let scope = if req.entity_anchor.is_some() {
+    // Scope: search the statement corpus alongside memories when the
+    // caller is a typed-graph QUERY (`include_statements`) or anchored
+    // an entity. RECALL stays memory-only — its projector drops
+    // non-memory hits, so statement candidates there are pure overhead.
+    // (Statement HNSW may be empty → silent Ok([]).)
+    let scope = if include_statements || req.entity_anchor.is_some() {
         SemanticScope::Both
     } else {
         SemanticScope::Memory
@@ -623,6 +628,7 @@ fn invoke_lexical(
     planned: &crate::retrieval::planner::PlannedRetriever,
     req: &QueryRequest,
     ctx: &RetrievalExecutorContext,
+    include_statements: bool,
 ) -> Result<Vec<RankedItem>, RetrieverInvocationError> {
     let handle = &ctx.lexical;
     let Some(text) = req.text.as_ref() else {
@@ -661,9 +667,50 @@ fn invoke_lexical(
         timeout_ms,
     };
 
-    handle
+    let mut hits = handle
         .retrieve(&query, LexicalScope::MemoryText, &config)
-        .map_err(|e| RetrieverInvocationError::Failure(e.to_string()))
+        .map_err(|e| RetrieverInvocationError::Failure(e.to_string()))?;
+
+    // Typed-graph QUERY also searches the statement-text index. The
+    // StatementText scope rejects the memory-only filters (agent_id,
+    // memory_kind, created_at_ms), so build a statement-scoped filter
+    // carrying only the predicate / statement-kind pre-filter and the
+    // shared context scope. The two corpora return disjoint id variants
+    // (Memory vs Statement), so fusion merges them without collision.
+    if include_statements {
+        let mut stmt_filters = LexicalFilters {
+            context_ids: req.context_filter.clone(),
+            ..Default::default()
+        };
+        apply_pre_filter_to_lexical_statement(&planned.pre_filter, &mut stmt_filters);
+        let stmt_query = LexicalQuery {
+            terms: query.terms.clone(),
+            phrase_clauses: Vec::new(),
+            filters: stmt_filters,
+        };
+        let stmt_hits = handle
+            .retrieve(&stmt_query, LexicalScope::StatementText, &config)
+            .map_err(|e| RetrieverInvocationError::Failure(e.to_string()))?;
+        hits.extend(stmt_hits);
+    }
+
+    Ok(hits)
+}
+
+/// Project a pre-filter onto the statement-text lexical scope. Only the
+/// statement-relevant predicates carry over; the memory-only filters
+/// (agent_id / memory_kind / created_at_ms) would be rejected by the
+/// StatementText scope, so they are dropped here.
+fn apply_pre_filter_to_lexical_statement(pre: &Option<PreFilter>, filters: &mut LexicalFilters) {
+    let Some(pf) = pre else {
+        return;
+    };
+    match pf {
+        PreFilter::StatementKind(ks) => filters.statement_kind = ks.first().copied(),
+        PreFilter::PredicateId(ps) => filters.predicate_id = ps.first().map(|p| p.raw()),
+        // Memory-only pre-filters don't apply to the statement corpus.
+        PreFilter::AgentIds(_) | PreFilter::MemoryKind(_) | PreFilter::Temporal(_) => {}
+    }
 }
 
 fn apply_pre_filter_to_lexical(pre: &Option<PreFilter>, filters: &mut LexicalFilters) {
