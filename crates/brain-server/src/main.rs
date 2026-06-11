@@ -279,10 +279,18 @@ mod linux_main {
             );
         }
 
-        let server_caps = Arc::new(ServerCapabilities::v1_default(
+        // One source of truth for the per-connection stream budget: the
+        // connection layer enforces `limits.max_concurrent_streams`, and we
+        // advertise that same value in WELCOME so a client's stream budget
+        // matches what the server will actually accept (no drift between the
+        // advertised and enforced caps).
+        let limits = ConnectionLimits::default();
+        let mut caps = ServerCapabilities::v1_default(
             format!("brain-server/{}", env!("CARGO_PKG_VERSION")),
             vec![AuthMethod::Token, AuthMethod::None],
-        ));
+        );
+        caps.server_features.max_concurrent_streams = limits.max_concurrent_streams;
+        let server_caps = Arc::new(caps);
 
         // Keep an extra `Arc<Vec<ShardHandle>>` clone outside the
         // runtime so `graceful_shutdown_shards` can
@@ -374,7 +382,7 @@ mod linux_main {
                 tls,
                 topology,
                 connection_metrics.clone(),
-                ConnectionLimits::default(),
+                limits,
                 signal,
             );
             let bound = match listener.bind() {
