@@ -366,19 +366,19 @@ fn build_fusion_step(
     }
 }
 
-/// Deploy-time fusion-method selector. Defaults to score-aware
-/// (`RelativeScore`); `BRAIN_FUSION_METHOD=rrf|zscore` switches it
-/// without a recompile so the strategies can be A/B'd on a fixed
-/// corpus.
+/// Deploy-time fusion-method selector. Defaults to RRF (the
+/// score-scale-invariant rank fusion the spec mandates as the default);
+/// `BRAIN_FUSION_METHOD=relative|zscore` opts into the score-aware
+/// strategies without a recompile so they can be A/B'd on a fixed corpus.
 fn fusion_method_from_env() -> FusionMethod {
     match std::env::var("BRAIN_FUSION_METHOD")
         .ok()
         .as_deref()
         .map(str::trim)
     {
-        Some("rrf") => FusionMethod::Rrf,
+        Some("relative" | "relative_score") => FusionMethod::RelativeScore,
         Some("zscore" | "relative_zscore") => FusionMethod::RelativeScoreZScore,
-        _ => FusionMethod::RelativeScore,
+        _ => FusionMethod::Rrf,
     }
 }
 

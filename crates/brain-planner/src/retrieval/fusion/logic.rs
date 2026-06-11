@@ -34,8 +34,8 @@ pub const DEFAULT_K: u32 = 60;
 /// more robust when score scales differ widely or have outliers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FusionMethod {
-    Rrf,
     #[default]
+    Rrf,
     RelativeScore,
     RelativeScoreZScore,
 }

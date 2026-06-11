@@ -642,6 +642,8 @@ fn error_frame_from_op_error(stream_id: u32, e: &OpError) -> Frame {
     let (code, retry_after_ms) = match e.error_code() {
         brain_ops::error::ErrorCode::InvalidRequest => (ErrorCode::InvalidArgument, None),
         brain_ops::error::ErrorCode::NotFound => (ErrorCode::MemoryNotFound, None),
+        brain_ops::error::ErrorCode::EntityNotFound => (ErrorCode::EntityNotFound, None),
+        brain_ops::error::ErrorCode::StatementNotFound => (ErrorCode::StatementNotFound, None),
         brain_ops::error::ErrorCode::QuotaExceeded => (ErrorCode::RateLimited, None),
         brain_ops::error::ErrorCode::Unauthorized => (ErrorCode::PermissionDenied, None),
         brain_ops::error::ErrorCode::Conflict => (ErrorCode::IdempotencyConflict, None),

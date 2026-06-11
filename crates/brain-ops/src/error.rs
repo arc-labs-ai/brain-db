@@ -175,6 +175,13 @@ pub enum OpError {
 pub enum ErrorCode {
     InvalidRequest,
     NotFound,
+    /// A typed-graph entity (or a statement's subject entity) was not
+    /// found. Split from the generic `NotFound` so the wire surfaces the
+    /// precise `EntityNotFound` code instead of `MemoryNotFound`.
+    EntityNotFound,
+    /// A typed-graph statement was not found. Surfaces the wire
+    /// `StatementNotFound` code instead of the generic `MemoryNotFound`.
+    StatementNotFound,
     QuotaExceeded,
     Unauthorized,
     Conflict,
@@ -217,7 +224,14 @@ impl OpError {
             Self::InvalidRequest(_) | Self::TooManyMemories | Self::SchemaConflict { .. } => {
                 ErrorCode::InvalidRequest
             }
-            Self::NotFound { .. } => ErrorCode::NotFound,
+            // Route the typed-graph NotFound cases to their precise wire
+            // codes. The `what` tag is set at construction (here and in the
+            // `From<*OpError>` conversions); anything else stays generic.
+            Self::NotFound { what, .. } => match *what {
+                "entity" | "subject entity" => ErrorCode::EntityNotFound,
+                "statement" => ErrorCode::StatementNotFound,
+                _ => ErrorCode::NotFound,
+            },
             Self::Conflict(_) => ErrorCode::Conflict,
             Self::TxnExpired => ErrorCode::TxnExpired,
             Self::TxnNotFound => ErrorCode::TxnNotFound,

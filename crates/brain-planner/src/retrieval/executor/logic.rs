@@ -328,22 +328,31 @@ pub async fn execute(
         }
     }
 
+    // Read pipeline order: filter the fused set BEFORE rerank. Reranking
+    // first would spend the cross-encoder window on tombstoned/superseded
+    // items and could push a valid hit out of the window behind junk that
+    // is about to be dropped. Filter WITHOUT the final limit cut (pass 0),
+    // rerank the survivors, then truncate to `limit` — applying the limit
+    // before rerank would collapse the rerank window whenever `limit` is
+    // smaller than it.
+    let (filtered, mut filter_stats) =
+        apply_filter_chain(fused, &plan.post_filters, ctx.metadata.as_ref(), 0)?;
+
     // Rerank is always-on: the stage fires whenever the shard has a
     // cross-encoder loaded, regardless of any request field. When
     // the operator disabled the load (`cross_encoder` is `None`),
     // the result is RRF-only with no error.
-    let (fused_after_rerank, rerank_outcome) = if ctx.cross_encoder.is_some() {
-        rerank_stage(fused, request, ctx).await
+    let (reranked, rerank_outcome) = if ctx.cross_encoder.is_some() {
+        rerank_stage(filtered, request, ctx).await
     } else {
-        (fused, None)
+        (filtered, None)
     };
 
-    let (items, filter_stats) = apply_filter_chain(
-        fused_after_rerank,
-        &plan.post_filters,
-        ctx.metadata.as_ref(),
-        plan.limit,
-    )?;
+    let mut items = reranked;
+    if plan.limit > 0 && items.len() > plan.limit as usize {
+        items.truncate(plan.limit as usize);
+    }
+    filter_stats.after_limit = items.len() as u32;
 
     let total_latency_ms = total_started.elapsed().as_secs_f64() * 1000.0;
 
