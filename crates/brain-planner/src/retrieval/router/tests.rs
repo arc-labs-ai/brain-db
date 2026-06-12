@@ -83,17 +83,15 @@ fn lowercase_text_doesnt_trigger_all_caps_path() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rule_5_default_free_text_picks_semantic_lexical_and_graph() {
+fn rule_5_default_free_text_picks_semantic_lexical_only() {
     let d = route(&req_with_text("budget pushback"));
     assert_eq!(retriever_weight(&d, Retriever::Semantic), Some(1.0));
     assert_eq!(retriever_weight(&d, Retriever::Lexical), Some(1.0));
-    // Graph rides along anchored at the semantic top-K — keeps
-    // substrate edges contributing on schemaless deployments.
-    assert_eq!(retriever_weight(&d, Retriever::Graph), Some(0.5));
-    assert_eq!(
-        d.graph_anchor_mode,
-        Some(GraphAnchorMode::MemoryFromSemantic)
-    );
+    // No graph on the default free-text path: the graph lane needs a
+    // resolved entity anchor, and the unanchored memory-edge walk buried
+    // direct semantic/lexical hits.
+    assert_eq!(retriever_weight(&d, Retriever::Graph), None);
+    assert_eq!(d.graph_anchor_mode, None);
 }
 
 #[test]
@@ -287,11 +285,16 @@ fn question_text_is_detected() {
 }
 
 #[test]
-fn title_case_triggers_entity_mention_heuristic() {
+fn title_case_mention_alone_does_not_select_graph() {
     let d = route(&req_with_text("Alice met Bob in Paris"));
+    // The heuristic still fires (used for profile/classification)...
     assert!(d.features.contains_entity_mention_heuristic);
-    // Without an explicit anchor, Title-Case alone triggers Rule 1.
-    assert_eq!(retriever_weight(&d, Retriever::Graph), Some(2.0));
+    // ...but a bare Title-Case mention is NOT a resolved entity anchor,
+    // so the graph lane is not selected. It falls to the default free-text
+    // path: semantic + lexical only.
+    assert_eq!(retriever_weight(&d, Retriever::Graph), None);
+    assert_eq!(retriever_weight(&d, Retriever::Semantic), Some(1.0));
+    assert_eq!(retriever_weight(&d, Retriever::Lexical), Some(1.0));
 }
 
 #[test]
@@ -389,8 +392,10 @@ fn classify_routes_default_when_request_is_empty() {
 
 #[test]
 fn title_case_text_classifies_as_entity_anchored() {
-    // "Alice met Bob" trips the Title-Case mention heuristic which
-    // routes Rule 1; the QueryClass tracks that signal too.
+    // "Alice met Bob" trips the Title-Case mention heuristic, which still
+    // sets the QueryClass (used for profile weights). It no longer selects
+    // the graph lane (that needs a resolved EntityId anchor) — the
+    // retriever set falls to the default semantic+lexical path.
     let d = route(&req_with_text("Alice met Bob in Paris"));
     assert_eq!(d.query_class, QueryClass::EntityAnchored);
 }

@@ -373,8 +373,14 @@ pub fn route(req: &QueryRequest) -> RoutingDecision {
     // Auto routing — union of matching rules with max-weight.
     let mut weights: HashMap<Retriever, f32> = HashMap::new();
 
-    // Rule 1: entity-anchored.
-    if features.has_entity_anchor || features.contains_entity_mention_heuristic {
+    // Rule 1: entity-anchored. The graph lane walks the entity graph from a
+    // resolved entity id, so it only fires on a real anchor. A bare
+    // Title-Case mention is not one — honouring it alone routed nearly every
+    // capitalized question (incl. sentence-initial "When"/"What") into the
+    // graph-dominant profile, and the unanchored memory-edge walk then buried
+    // direct semantic/lexical hits. Resolving cue mentions to anchors and a
+    // capped graph tie-breaker are deferred follow-ups.
+    if features.has_entity_anchor {
         upsert_max(&mut weights, Retriever::Graph, 2.0);
         upsert_max(&mut weights, Retriever::Semantic, 1.0);
         if features.has_text {
@@ -388,19 +394,13 @@ pub fn route(req: &QueryRequest) -> RoutingDecision {
         upsert_max(&mut weights, Retriever::Semantic, 0.5);
     }
 
-    // Rule 5: default — fires only if no other rule matched
-    // AND the query has text.
-    //
-    // Schemaless deployments live here: no entity anchor, no
-    // exact-id signature. Retrieval is still the default — semantic
-    // + lexical fuse, and graph rides along anchored at the
-    // semantic top-K so substrate `SimilarTo` / `Caused` edges
-    // contribute. The executor materialises the anchor set after
-    // semantic runs.
+    // Rule 5: default free-text — semantic + lexical only. No graph rider:
+    // the unanchored memory-edge walk it used to pull in returned
+    // low-precision neighbour memories that outranked direct semantic/lexical
+    // hits. Similar-memory recall is the semantic retriever's job.
     if weights.is_empty() && features.has_text {
         upsert_max(&mut weights, Retriever::Semantic, 1.0);
         upsert_max(&mut weights, Retriever::Lexical, 1.0);
-        upsert_max(&mut weights, Retriever::Graph, 0.5);
     }
 
     // Rules 3 + 4 add no retrievers — they signal the filter chain.
