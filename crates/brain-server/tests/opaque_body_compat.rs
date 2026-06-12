@@ -217,6 +217,7 @@ async fn recall_round_trip(client: &mut TcpStream, stream_id: u32, cue: String) 
         confidence_threshold: 0.0,
         context_filter: None,
         age_bound_unix_nanos: None,
+        as_of_record_time_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
         include_edges: false,

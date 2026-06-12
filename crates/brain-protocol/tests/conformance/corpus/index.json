@@ -27,7 +27,7 @@
     "name": "req_recall",
     "opcode": "0x0021",
     "kind": "request",
-    "payload_len": 254
+    "payload_len": 293
   },
   {
     "name": "req_forget",
@@ -63,7 +63,7 @@
     "name": "req_query",
     "opcode": "0x0160",
     "kind": "request",
-    "payload_len": 239
+    "payload_len": 278
   },
   {
     "name": "req_materialize_procedural",

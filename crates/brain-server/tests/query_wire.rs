@@ -171,6 +171,7 @@ fn text_only_query(text: &str) -> QueryRequest {
         kind_filter: Vec::new(),
         predicate_filter: Vec::new(),
         time_filter: None,
+        as_of_record_time_unix_nanos: None,
         confidence_min: None,
         include_tombstoned: false,
         include_superseded: false,

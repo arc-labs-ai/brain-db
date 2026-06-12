@@ -9,5 +9,6 @@ pub mod explain;
 pub mod filters;
 pub mod fusion;
 pub mod planner;
+pub mod recency;
 pub mod rerank;
 pub mod router;

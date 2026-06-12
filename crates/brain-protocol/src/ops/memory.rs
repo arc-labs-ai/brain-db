@@ -89,6 +89,13 @@ pub struct RecallRequest {
     pub confidence_threshold: f32,
     pub context_filter: Option<Vec<WireContextId>>,
     pub age_bound_unix_nanos: Option<u64>,
+    /// Bi-temporal time-travel anchor. When `Some(t)`, the read is
+    /// resolved against the state the substrate believed at record-time
+    /// `t` (statement results are filtered to that as-of view) and `t`
+    /// also becomes the reference point for recency ranking. `None` is
+    /// the current-state default. Distinct from `age_bound_unix_nanos`,
+    /// which is a lower-bound *event-time* cutoff.
+    pub as_of_record_time_unix_nanos: Option<u64>,
     pub kind_filter: Option<Vec<MemoryKindWire>>,
     pub salience_floor: f32,
     pub include_edges: bool,

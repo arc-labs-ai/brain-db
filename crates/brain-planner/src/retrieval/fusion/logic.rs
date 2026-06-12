@@ -110,12 +110,7 @@ pub fn fuse_rrf(
     }
 
     let mut out: Vec<FusedItem> = accum.into_values().collect();
-    out.sort_by(|a, b| {
-        b.fused_score
-            .partial_cmp(&a.fused_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| id_sort_key(&a.id).cmp(&id_sort_key(&b.id)))
-    });
+    sort_by_fused_score(&mut out);
     out
 }
 
@@ -181,12 +176,7 @@ fn fuse_relative_score(
     }
 
     let mut out: Vec<FusedItem> = accum.into_values().collect();
-    out.sort_by(|a, b| {
-        b.fused_score
-            .partial_cmp(&a.fused_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| id_sort_key(&a.id).cmp(&id_sort_key(&b.id)))
-    });
+    sort_by_fused_score(&mut out);
     out
 }
 
@@ -239,6 +229,19 @@ fn weight_for(r: Retriever, w: &PerRetrieverWeights) -> f32 {
         Retriever::Lexical => w.lexical,
         Retriever::Graph => w.graph,
     }
+}
+
+/// Re-sort a fused list by `fused_score` descending, breaking ties by
+/// the same deterministic id key the fusion stage uses. Exposed so a
+/// post-fusion scoring pass (e.g. the recency boost) can re-establish
+/// the canonical order after mutating `fused_score`.
+pub fn sort_by_fused_score(items: &mut [FusedItem]) {
+    items.sort_by(|a, b| {
+        b.fused_score
+            .partial_cmp(&a.fused_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| id_sort_key(&a.id).cmp(&id_sort_key(&b.id)))
+    });
 }
 
 /// Deterministic 17-byte sort key for `RankedItemId`. Tag

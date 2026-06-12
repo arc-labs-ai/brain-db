@@ -525,11 +525,7 @@ fn build_planner_request(
         },
         include_tombstoned: false,
         include_superseded: false,
-        // v1.0: bi-temporal as-of is server-internal only — adding it
-        // to `RecallRequest` would bump the wire `RecallRequest` archive
-        // shape (rkyv field order is structural, not nominal). Retrieval
-        // callers route through `PlannerQueryRequest` directly.
-        as_of_record_time_unix_nanos: None,
+        as_of_record_time_unix_nanos: req.as_of_record_time_unix_nanos,
         limit: req.top_k,
         retrievers: RetrieverSelection::Auto,
         fusion_config: None,
@@ -769,6 +765,7 @@ fn map_plan_error(e: PlanError) -> OpError {
 fn map_execution_error(e: ExecutionError) -> OpError {
     match e {
         ExecutionError::Filter(inner) => OpError::Internal(format!("retrieval filter: {inner}")),
+        ExecutionError::Recency(inner) => OpError::Internal(format!("recency ranking: {inner}")),
     }
 }
 

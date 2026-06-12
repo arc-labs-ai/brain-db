@@ -46,6 +46,7 @@ use futures_lite::future::poll_fn;
 use crate::retrieval::filters::{apply_filter_chain, FilterChainStats, FilterError};
 use crate::retrieval::fusion::{fuse, FusedItem};
 use crate::retrieval::planner::{PreFilter, QueryPlan, RetrieverConfig};
+use crate::retrieval::recency::apply_recency_boost;
 use crate::retrieval::rerank::{rerank_top_n, RerankCandidate, RERANK_TOP_N};
 use crate::retrieval::router::{GraphAnchorMode, QueryRequest, Retriever};
 
@@ -136,6 +137,8 @@ pub enum RetrieverStatus {
 pub enum ExecutionError {
     #[error("filter chain: {0}")]
     Filter(#[from] FilterError),
+    #[error("recency ranking: {0}")]
+    Recency(#[from] crate::retrieval::recency::RecencyError),
 }
 
 // ---------------------------------------------------------------------------
@@ -337,8 +340,27 @@ pub async fn execute(
     // rerank the survivors, then truncate to `limit` — applying the limit
     // before rerank would collapse the rerank window whenever `limit` is
     // smaller than it.
-    let (filtered, mut filter_stats) =
+    let (mut filtered, mut filter_stats) =
         apply_filter_chain(fused, &plan.post_filters, ctx.metadata.as_ref(), 0)?;
+
+    // Recency ranking (soft, additive, RRF-scale). Only when the query
+    // carries a temporal signal — a temporal expression / explicit time
+    // filter (`temporal_pushdown`) or an `as_of` anchor — so timeless
+    // facts aren't penalised for being old. Reference point is the
+    // `as_of` anchor when set, else wall-clock now. Folded into
+    // `fused_score` BEFORE rerank so a fresh hit both enters the rerank
+    // window and carries its recency into the rerank blend.
+    let as_of = plan.post_filters.as_of_record_time_unix_nanos;
+    if plan.routing.temporal_pushdown || as_of.is_some() {
+        let reference_time = as_of.unwrap_or_else(now_unix_nanos);
+        apply_recency_boost(
+            &mut filtered,
+            ctx.metadata.as_ref(),
+            reference_time,
+            plan.fusion.weights.temporal,
+            plan.fusion.k,
+        )?;
+    }
 
     // Rerank is always-on: the stage fires whenever the shard has a
     // cross-encoder loaded, regardless of any request field. When
@@ -997,6 +1019,19 @@ async fn join_all_local<T>(mut futures: Vec<Pin<Box<dyn Future<Output = T> + '_>
         }
     })
     .await
+}
+
+/// Wall-clock now in unix nanoseconds. Used as the recency-decay
+/// reference point when the query carries no explicit `as_of` anchor.
+/// A clock before the epoch (impossible in practice) reads as 0, which
+/// makes every memory look future-dated and saturate at full freshness
+/// — harmless for a soft ranking term.
+fn now_unix_nanos() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

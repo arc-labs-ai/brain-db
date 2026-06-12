@@ -648,6 +648,11 @@ pub struct QueryFilters {
     pub predicate_filter: Vec<String>,
     pub time_range_start_unix_nanos: u64,
     pub time_range_end_unix_nanos: u64,
+    /// Bi-temporal time-travel anchor (record-time). 0 = current state.
+    /// When non-zero, results are resolved against the substrate's
+    /// believed state at this record-time, and it is the reference point
+    /// for recency ranking.
+    pub as_of_record_time_unix_nanos: u64,
     pub min_confidence: f32,
     pub context_ids: Vec<u64>,              // empty = no filter
     pub kind_filter: Vec<StatementKindWire>, // empty = no filter

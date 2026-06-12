@@ -102,6 +102,7 @@ fn recall_req(cue: &str, top_k: u32) -> RecallRequest {
         confidence_threshold: 0.0,
         context_filter: None,
         age_bound_unix_nanos: None,
+        as_of_record_time_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
         include_edges: false,
@@ -248,6 +249,82 @@ fn recall_echoes_client_supplied_occurred_at() {
         assert_ne!(
             hit.created_at_unix_nanos, event_time,
             "occurred_at is the client's timeline, not the server write time"
+        );
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 1c. Recency ranking: with a temporal signal (`as_of`), the more-recent
+//     memory wins a relevance tie.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recency_breaks_relevance_ties_toward_recent_event_time() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+
+        // Reference point for the recency decay. `as_of` on the request
+        // both supplies the temporal signal that gates the boost and sets
+        // this reference.
+        let reference: u64 = 1_900_000_000 * 1_000_000_000;
+        let day = 86_400 * 1_000_000_000_u64;
+
+        // Identical text ⇒ identical mock vectors ⇒ identical cosine, so
+        // the two hits tie on pure relevance and only event-time recency
+        // separates them.
+        let text = "team offsite in lisbon";
+        let recent = EncodeRequest {
+            text: text.into(),
+            context_id: 42,
+            kind: MemoryKindWire::Episodic,
+            salience_hint: 0.5,
+            edges: vec![],
+            request_id: [21; 16],
+            txn_id: None,
+            deduplicate: false,
+            occurred_at_unix_nanos: Some(reference - day), // yesterday
+        };
+        let old = EncodeRequest {
+            occurred_at_unix_nanos: Some(reference - 400 * day), // >1 year ago
+            request_id: [22; 16],
+            ..recent.clone()
+        };
+        let recent_id = match single_body(
+            dispatch(
+                RequestBody::Encode(recent),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        ) {
+            ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
+            other => panic!("expected Encode, got {other:?}"),
+        };
+        dispatch(
+            RequestBody::Encode(old),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
+
+        let mut recall = recall_req(text, 2);
+        recall.as_of_record_time_unix_nanos = Some(reference);
+
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(recall),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(frame.results.len(), 2);
+        assert_eq!(
+            frame.results[0].memory_id, recent_id,
+            "on a relevance tie, the more recent event time ranks first when a temporal signal is present",
         );
     })
 }

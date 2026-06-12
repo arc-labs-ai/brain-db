@@ -104,6 +104,11 @@ pub struct QueryRequest {
     /// mode.
     pub predicate_filter: Vec<String>,
     pub time_filter: Option<TimeRangeWire>,
+    /// Bi-temporal time-travel anchor (record-time). When `Some(t)`,
+    /// statement/relation results are filtered to the state the
+    /// substrate believed at `t`, and `t` is the reference point for
+    /// recency ranking. `None` is the current-state default.
+    pub as_of_record_time_unix_nanos: Option<u64>,
     pub confidence_min: Option<f32>,
     pub include_tombstoned: bool,
     pub include_superseded: bool,
@@ -168,6 +173,7 @@ mod tests_req {
                 from_unix_ms: Some(100),
                 to_unix_ms: Some(900),
             }),
+            as_of_record_time_unix_nanos: Some(1_700_000_000_000_000_000),
             confidence_min: Some(0.5),
             include_tombstoned: false,
             include_superseded: true,

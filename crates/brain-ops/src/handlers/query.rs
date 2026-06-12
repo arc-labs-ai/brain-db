@@ -312,7 +312,7 @@ fn wire_to_planner_request(
         confidence_min: req.confidence_min,
         include_tombstoned: req.include_tombstoned,
         include_superseded: req.include_superseded,
-        as_of_record_time_unix_nanos: None,
+        as_of_record_time_unix_nanos: req.as_of_record_time_unix_nanos,
         limit: req.limit,
         retrievers,
         fusion_config,
@@ -521,5 +521,6 @@ fn map_plan_error(e: PlanError) -> OpError {
 fn map_executor_error(e: ExecutionError) -> OpError {
     match e {
         ExecutionError::Filter(inner) => OpError::Internal(format!("filter chain: {inner}")),
+        ExecutionError::Recency(inner) => OpError::Internal(format!("recency ranking: {inner}")),
     }
 }
