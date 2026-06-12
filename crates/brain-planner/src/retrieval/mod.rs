@@ -4,6 +4,7 @@
 //! chain, planner, and executor share types without polluting the
 //! substrate planner.
 
+pub mod diversity;
 pub mod executor;
 pub mod explain;
 pub mod filters;

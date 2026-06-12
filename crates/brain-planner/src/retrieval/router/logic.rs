@@ -31,6 +31,19 @@ static EXACT_ID_RE: LazyLock<Regex> =
 static TITLE_CASE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b").expect("invariant: literal")
 });
+// Enumerative / aggregation cues — the router's *internal* signal that
+// the caller is asking for a set ("list all X", "how many Y", "what are
+// the Z") rather than one fact. Never exposed on the wire; the client
+// just calls recall and the router decides. Precision-biased: a false
+// positive widens the pool and runs the merge/diversity stage over a
+// single-answer question, and an earlier over-eager detector regressed
+// such queries. Bare "what"/"who"/"how" are excluded.
+static LIST_INTENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(list|every|enumerate|how many|how much|all of|name (all|every|the)|which of|what are|what were|what kinds? of|what types? of)\b",
+    )
+    .expect("invariant: literal")
+});
 static TEMPORAL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"\b(yesterday|today|tomorrow|last\s+(week|month|year|\d+\s+days?|\d+\s+weeks?|\d+\s+months?)|next\s+(week|month|year)|\d{4}-\d{2}-\d{2})\b",
@@ -143,6 +156,12 @@ pub enum QueryClass {
     /// signal. Semantic embedding does the heavy lifting; pool
     /// widens so RRF has overlap to fuse.
     Paraphrase,
+    /// Free-text query with enumerative intent ("list all X", "how many
+    /// Y"). Semantic-led like Paraphrase but with a much wider
+    /// per-retriever pool: set members ranked deep still need to reach
+    /// fusion before the merge/diversity stage spreads them. A purely
+    /// internal classification — the client never asks for it.
+    ListAggregation,
     /// Everything else — used when no other class fits and as the
     /// fallback for empty / filter-only queries.
     Default,
@@ -200,6 +219,21 @@ impl RetrievalProfile {
                 per_retriever_top_n: 200,
                 final_top_k: requested_top_k,
             },
+            // Semantic-led like Paraphrase, but a much wider per-retriever
+            // pool so deeply-ranked set members enter fusion. Diversity
+            // can't surface a member that never made the pool — the
+            // coverage gap that made an earlier diversity-only attempt
+            // ineffective. `final_top_k` still rides the caller's request.
+            QueryClass::ListAggregation => Self {
+                weights: PerRetrieverWeights {
+                    semantic: 1.5,
+                    lexical: 1.0,
+                    graph: 0.5,
+                    temporal: 0.5,
+                },
+                per_retriever_top_n: 400,
+                final_top_k: requested_top_k,
+            },
             QueryClass::Default => Self {
                 weights: PerRetrieverWeights::default(),
                 per_retriever_top_n: 100,
@@ -217,11 +251,19 @@ impl RetrievalProfile {
 #[must_use]
 pub fn classify_query(features: &ClassificationFeatures) -> QueryClass {
     if features.has_entity_anchor || features.contains_entity_mention_heuristic {
+        // Entity-anchored queries keep their graph-led profile even when
+        // they also read as a list ("what movies did X make"); the
+        // coverage + merge ride the orthogonal `list_intent` flag, not
+        // the class.
         QueryClass::EntityAnchored
     } else if features.contains_exact_id || features.is_all_caps_tokens {
         QueryClass::ExactTerm
     } else if features.has_text {
-        QueryClass::Paraphrase
+        if features.is_list_intent {
+            QueryClass::ListAggregation
+        } else {
+            QueryClass::Paraphrase
+        }
     } else {
         QueryClass::Default
     }
@@ -255,6 +297,12 @@ pub struct RoutingDecision {
     /// Coarse classification used downstream to pick adaptive
     /// top-K and per-retriever weights via [`RetrievalProfile`].
     pub query_class: QueryClass,
+    /// Detected list/aggregation intent ("list all X", "how many Y").
+    /// Orthogonal to `query_class` so it also fires on entity-anchored
+    /// list queries. Purely server-internal — the executor reads it to
+    /// run the coverage + merge/diversity stage. The client never sees
+    /// or sets it.
+    pub list_intent: bool,
 }
 
 /// Where the graph retriever gets its starting nodes. The
@@ -302,6 +350,9 @@ pub struct ClassificationFeatures {
     pub is_question: bool,
     pub contains_entity_mention_heuristic: bool,
     pub contains_temporal_expression: bool,
+    /// Cue text carries enumerative / aggregation intent (matches
+    /// [`LIST_INTENT_RE`]). Server-internal signal only.
+    pub is_list_intent: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +411,7 @@ pub fn route(req: &QueryRequest) -> RoutingDecision {
         let temporal_pushdown = features.has_time_filter || features.contains_temporal_expression;
         let graph_anchor_mode = pick_graph_anchor_mode(&retrievers, &features);
         let query_class = classify_query(&features);
+        let list_intent = features.is_list_intent;
         return RoutingDecision {
             features,
             retrievers,
@@ -367,6 +419,7 @@ pub fn route(req: &QueryRequest) -> RoutingDecision {
             temporal_pushdown,
             graph_anchor_mode,
             query_class,
+            list_intent,
         };
     }
 
@@ -423,6 +476,7 @@ pub fn route(req: &QueryRequest) -> RoutingDecision {
 
     let graph_anchor_mode = pick_graph_anchor_mode(&retrievers, &features);
     let query_class = classify_query(&features);
+    let list_intent = features.is_list_intent;
     RoutingDecision {
         features,
         retrievers,
@@ -430,6 +484,7 @@ pub fn route(req: &QueryRequest) -> RoutingDecision {
         temporal_pushdown,
         graph_anchor_mode,
         query_class,
+        list_intent,
     }
 }
 
@@ -496,6 +551,8 @@ fn classify(req: &QueryRequest) -> ClassificationFeatures {
         f.contains_entity_mention_heuristic = TITLE_CASE_RE.is_match(trimmed);
 
         f.contains_temporal_expression = TEMPORAL_RE.is_match(&lower);
+
+        f.is_list_intent = LIST_INTENT_RE.is_match(&lower);
     }
 
     f

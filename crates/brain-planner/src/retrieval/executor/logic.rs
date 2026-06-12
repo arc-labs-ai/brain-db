@@ -43,6 +43,7 @@ use brain_metadata::MetadataDb;
 use brain_rerank::RerankService;
 use futures_lite::future::poll_fn;
 
+use crate::retrieval::diversity::{mmr_reorder, tokenize, MMR_LAMBDA_LIST, MMR_WINDOW};
 use crate::retrieval::filters::{apply_filter_chain, FilterChainStats, FilterError};
 use crate::retrieval::fusion::{fuse, FusedItem};
 use crate::retrieval::planner::{PreFilter, QueryPlan, RetrieverConfig};
@@ -372,7 +373,16 @@ pub async fn execute(
         (filtered, None)
     };
 
+    // Merge / diversity stage — internal, router-decided. Runs only when
+    // the router detected list/aggregation intent (a set question), so a
+    // single-answer query is never re-ordered. Spreads near-duplicate
+    // members across the head before the caller's `top_k` cut, so a list
+    // result is distinct items rather than paraphrases of the top one.
     let mut items = reranked;
+    if plan.routing.list_intent {
+        apply_diversity(&mut items, ctx);
+    }
+
     if plan.limit > 0 && items.len() > plan.limit as usize {
         items.truncate(plan.limit as usize);
     }
@@ -539,6 +549,60 @@ fn fetch_texts(
         }
     }
     Ok(out)
+}
+
+/// Run the merge / diversity (MMR) stage over the head of `items`.
+///
+/// Fetches text for the windowed memory hits, tokenizes it for the
+/// Jaccard redundancy term, and reorders in place via
+/// [`mmr_reorder`]. Best-effort: a text-fetch error or a non-memory /
+/// text-less hit just yields an empty token set (treated as maximally
+/// novel), so diversity degrades to relevance order rather than failing
+/// the read.
+fn apply_diversity(items: &mut Vec<FusedItem>, ctx: &RetrievalExecutorContext) {
+    let window = items.len().min(MMR_WINDOW);
+    if window <= 2 {
+        return;
+    }
+
+    let mem_ids: Vec<brain_core::MemoryId> = items
+        .iter()
+        .take(window)
+        .filter_map(|it| match it.id {
+            RankedItemId::Memory(m) => Some(m),
+            _ => None,
+        })
+        .collect();
+
+    let text_by_id: std::collections::HashMap<brain_core::MemoryId, String> =
+        match fetch_texts(&mem_ids, ctx) {
+            Ok(cands) => cands
+                .into_iter()
+                .filter_map(|c| match c.id {
+                    RankedItemId::Memory(m) => Some((m, c.text)),
+                    _ => None,
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    target: "brain_planner::executor",
+                    error = %e,
+                    "diversity text fetch failed; returning relevance order",
+                );
+                return;
+            }
+        };
+
+    let token_sets: Vec<std::collections::HashSet<String>> = items
+        .iter()
+        .take(window)
+        .map(|it| match it.id {
+            RankedItemId::Memory(m) => text_by_id.get(&m).map(|t| tokenize(t)).unwrap_or_default(),
+            _ => std::collections::HashSet::new(),
+        })
+        .collect();
+
+    mmr_reorder(items, &token_sets, MMR_LAMBDA_LIST);
 }
 
 // ---------------------------------------------------------------------------

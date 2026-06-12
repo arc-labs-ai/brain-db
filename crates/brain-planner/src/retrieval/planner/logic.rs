@@ -39,6 +39,11 @@ pub const MIN_TOP_N: usize = 100;
 /// Hard cap on per-retriever `top_n` — `top_n_per_retriever ≤ 200`.
 pub const MAX_TOP_N: usize = 200;
 
+/// Raised per-retriever `top_n` ceiling for detected list/aggregation
+/// intent. Wider pool = deeply-ranked set members reach fusion; still
+/// bounded so a single retriever's per-query work stays predictable.
+pub const LIST_MAX_TOP_N: usize = 400;
+
 // Retriever-config defaults:
 
 const SEMANTIC_DEFAULT_EF_SEARCH: usize = 64;
@@ -183,7 +188,7 @@ pub fn plan(req: &QueryRequest) -> Result<QueryPlan, PlanError> {
         req.limit
     };
     let profile = RetrievalProfile::for_class(routing.query_class, limit as usize);
-    let top_n = top_n_for(limit, profile.per_retriever_top_n);
+    let top_n = top_n_for(limit, profile.per_retriever_top_n, routing.list_intent);
 
     let retrievers: Vec<PlannedRetriever> = routing
         .retrievers
@@ -222,10 +227,22 @@ pub fn plan(req: &QueryRequest) -> Result<QueryPlan, PlanError> {
 /// per-query work bounded; the min guarantees fusion has enough
 /// candidates even on small `top_k` requests where the user's
 /// `× 3` value would otherwise undershoot.
-fn top_n_for(limit: u32, profile_hint: usize) -> usize {
+///
+/// `list_intent` raises the ceiling to [`LIST_MAX_TOP_N`]: a set
+/// question's members are often individually weak matches that rank
+/// deep, so the pool must be wide enough for them to reach fusion
+/// before the merge/diversity stage spreads them. This is the coverage
+/// half of list handling — entirely internal; the caller's `top_k`
+/// still bounds what's returned.
+fn top_n_for(limit: u32, profile_hint: usize, list_intent: bool) -> usize {
     let from_limit = (limit as usize).saturating_mul(3);
     let raw = from_limit.max(profile_hint);
-    raw.clamp(MIN_TOP_N, MAX_TOP_N)
+    let ceiling = if list_intent {
+        LIST_MAX_TOP_N
+    } else {
+        MAX_TOP_N
+    };
+    raw.clamp(MIN_TOP_N, ceiling)
 }
 
 fn retriever_config_for(

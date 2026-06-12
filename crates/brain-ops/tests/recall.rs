@@ -330,6 +330,58 @@ fn recency_breaks_relevance_ties_toward_recent_event_time() {
 }
 
 // ---------------------------------------------------------------------------
+// 1d. List-intent recall drives the merge/diversity path end-to-end.
+//     The cue carries enumerative intent ("list all ..."), so the router
+//     flags list_intent and the executor runs the MMR stage over real
+//     redb text. This is a smoke test that the path (text fetch →
+//     tokenize → MMR reorder) executes on live data without panicking
+//     and still returns the requested results.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn list_intent_recall_runs_merge_path_and_returns_results() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        encode(
+            &fix,
+            [1; 16],
+            "she enjoys hiking in the mountains",
+            MemoryKindWire::Episodic,
+        )
+        .await;
+        encode(
+            &fix,
+            [2; 16],
+            "she enjoys hiking up steep trails",
+            MemoryKindWire::Episodic,
+        )
+        .await;
+        encode(
+            &fix,
+            [3; 16],
+            "she enjoys painting watercolors",
+            MemoryKindWire::Episodic,
+        )
+        .await;
+
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(recall_req("list all the things she enjoys", 3)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            !frame.results.is_empty(),
+            "list-intent recall must still return results after the merge stage",
+        );
+        assert!(frame.results.len() <= 3, "top_k still bounds the count");
+    })
+}
+
+// ---------------------------------------------------------------------------
 // 2. Empty index → empty frame.
 // ---------------------------------------------------------------------------
 

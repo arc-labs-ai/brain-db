@@ -391,6 +391,41 @@ fn classify_routes_default_when_request_is_empty() {
 }
 
 #[test]
+fn list_intent_fires_on_enumerative_cues() {
+    for cue in [
+        "list all the books she read",
+        "how many times did he visit berlin",
+        "what are her hobbies",
+        "name all of his coworkers",
+        "what kinds of music does she like",
+    ] {
+        let d = route(&req_with_text(cue));
+        assert!(d.list_intent, "expected list_intent for {cue:?}");
+    }
+    // Free-text list cue (no anchor / id) routes to the ListAggregation
+    // class with its wide pool.
+    let d = route(&req_with_text("list all the books she read"));
+    assert_eq!(d.query_class, QueryClass::ListAggregation);
+}
+
+#[test]
+fn list_intent_does_not_fire_on_single_answer_factoids() {
+    // The detector is precision-biased: these single-answer questions
+    // must NOT trip list handling (an earlier over-eager version
+    // regressed exactly this shape).
+    for cue in [
+        "what is her wife's name",
+        "when did he move to berlin",
+        "where does she work",
+        "who is his manager",
+        "how do i debug a flaky test",
+    ] {
+        let d = route(&req_with_text(cue));
+        assert!(!d.list_intent, "did NOT expect list_intent for {cue:?}");
+    }
+}
+
+#[test]
 fn title_case_text_classifies_as_entity_anchored() {
     // "Alice met Bob" trips the Title-Case mention heuristic, which still
     // sets the QueryClass (used for profile weights). It no longer selects
