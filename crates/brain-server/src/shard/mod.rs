@@ -469,7 +469,9 @@ impl Default for TemporalEdgeSpawnConfig {
             enabled: true,
             interval_ms: 100,
             batch_size: 256,
-            window_seconds: 300,
+            // 30 minutes: a 5-minute window fragmented a single
+            // conversational session so consecutive turns never linked.
+            window_seconds: 1800,
             weight_min: 0.1,
             channel_capacity: 1024,
             cross_context: false,

@@ -92,7 +92,14 @@ pub struct TemporalEdgeKnobs {
     pub topical_threshold: f32,
 }
 
-pub const DEFAULT_WINDOW_SECONDS: u64 = 300;
+/// Maximum gap between two memories for the later one to be linked as
+/// `FollowedBy` the earlier. 30 minutes, not 5: a single conversational
+/// session has natural pauses — the agent reads a doc, the human steps
+/// away — and a 5-minute window slices that one session into
+/// disconnected fragments, breaking the narrative chain the retriever
+/// walks. 30 minutes keeps a session's turns linked while still cutting
+/// the thread between genuinely separate sittings.
+pub const DEFAULT_WINDOW_SECONDS: u64 = 1800;
 pub const DEFAULT_WEIGHT_MIN: f32 = 0.1;
 pub const DEFAULT_CROSS_CONTEXT: bool = false;
 pub const DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD: f32 = 0.4;

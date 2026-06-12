@@ -358,8 +358,8 @@ fn default_auto_edge_batch_size() -> usize {
 fn default_auto_edge_similarity_threshold() -> f32 {
     // Reads `BRAIN_AUTO_EDGE_THRESHOLD` at startup so operators can
     // tune the cosine-similarity floor without re-rolling the config.
-    // The crate default is 0.75 (topical-cluster floor), tunable up
-    // to 0.85+ for strict deduping.
+    // The crate default is 0.85 (near-duplicate floor); a looser value
+    // manufactures false SimilarTo edges and hub clutter.
     brain_workers::auto_edge::resolved_threshold(
         brain_workers::DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD,
     )
@@ -439,7 +439,10 @@ fn default_temporal_edge_batch_size() -> usize {
     256
 }
 fn default_temporal_edge_window_seconds() -> u64 {
-    300
+    // 30 minutes. A short 5-minute window split a single conversational
+    // session into disconnected fragments, so consecutive turns never
+    // linked; 30 minutes keeps one session's turns chained.
+    1800
 }
 fn default_temporal_edge_weight_min() -> f32 {
     0.1

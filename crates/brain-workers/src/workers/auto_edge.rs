@@ -49,7 +49,9 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use brain_core::{AgentId, ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
-use brain_metadata::tables::edge::{derived_by, origin, zero_disambiguator};
+use brain_metadata::tables::edge::{
+    derived_by, list_memory_edges_from, origin, zero_disambiguator,
+};
 use brain_ops::{
     AutoEdgeEnqueue, AutoEdgeMetrics, EventEnvelope, Phase, RealWriterHandle, Write, WriteId,
 };
@@ -91,16 +93,28 @@ pub struct AutoEdgeKnobs {
 pub const DEFAULT_TOP_K: usize = 5;
 /// Cosine similarity floor for auto-derived `SimilarTo` edges.
 ///
-/// 0.85 is the classical "near-duplicate" floor (paraphrases of the
-/// same sentence; same agent restating itself). For an agent
-/// journaling its day, that threshold is too tight — "Priya works at
-/// Stripe" and "Priya now works at OpenAI" describe the same entity
-/// but their BGE-small embeddings sit around 0.75–0.80. 0.75 catches
-/// the "same topic / same entity" cluster the planner's graph
-/// retriever actually wants; operators who want strict deduping push
-/// it back to 0.85 via `BRAIN_AUTO_EDGE_THRESHOLD`.
-pub const DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD: f32 = 0.75;
+/// 0.85 is the classical "near-duplicate" floor — paraphrases of the
+/// same sentence, or an agent restating itself. Below it, BGE-small
+/// embeddings still score 0.75–0.80 for pairs that are merely
+/// topically near but semantically distinct ("Priya works at Stripe"
+/// vs. "Priya now works at OpenAI" — same entity, contradictory
+/// fact); admitting those manufactures false `SimilarTo` edges and
+/// turns popular memories into hub nodes that drown the graph
+/// retriever. We keep the floor at the near-duplicate boundary so an
+/// edge means "these say the same thing." Operators who want a looser
+/// topical clustering lower it via `BRAIN_AUTO_EDGE_THRESHOLD`.
+pub const DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD: f32 = 0.85;
 pub const DEFAULT_EF_SEARCH: usize = 64;
+
+/// Maximum cumulative `SimilarTo` out-edges any one memory may
+/// accumulate across cycles. Each cycle adds at most `top_k`, but
+/// nothing else bounds the total: a memory that keeps surfacing as a
+/// near-neighbour would otherwise grow an unbounded fan-out and become
+/// a hub node that the graph retriever has to expand on every walk,
+/// inflating latency and burying the genuinely-relevant edges. 16
+/// near-duplicate links is far more than any single memory needs to be
+/// reachable; past that, more edges add cost without adding recall.
+pub const MAX_SIMILAR_TO_OUT_DEGREE: usize = 16;
 
 /// Environment variable for overriding [`DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD`].
 /// Accepts an `f32` in `[0.0, 1.0]`. Values outside the range or
@@ -254,6 +268,14 @@ async fn do_auto_edge_cycle(
     let knobs = worker.knobs;
     let started = Instant::now();
     let index = ctx.ops.executor.index.clone();
+    let metadata = ctx.ops.executor.metadata.clone();
+
+    // Remaining `SimilarTo` out-edge budget per source for this cycle.
+    // Seeded lazily from the persisted out-degree on first sight of a
+    // source, then decremented as we queue edges — so a source drained
+    // twice in one cycle doesn't blow past the cap by reading the same
+    // stale persisted count both times.
+    let mut similar_to_budget: HashMap<MemoryId, usize> = HashMap::new();
 
     // Read phase: drain up to `batch_size` (or the per-cycle wall-clock
     // budget) from the channel, run knn for each, collect link tuples.
@@ -325,6 +347,30 @@ async fn do_auto_edge_cycle(
             continue;
         }
 
+        // Seed this source's remaining out-edge budget from the count
+        // already persisted in redb (first time we see it this cycle),
+        // so the cap holds across cycles and not just within one. A read
+        // failure is non-fatal: rather than drop the source's edges
+        // entirely we fall back to a fresh budget — over-linking on a
+        // transient metadata error is the lesser evil, and the
+        // counter_reconcile worker keeps the persisted count honest.
+        let budget = match similar_to_budget.entry(source_id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let existing = metadata
+                    .read_txn()
+                    .ok()
+                    .and_then(|rtxn| {
+                        list_memory_edges_from(&rtxn, source_id, Some(EdgeKind::SimilarTo)).ok()
+                    })
+                    .map_or(0, |edges| edges.len());
+                e.insert(MAX_SIMILAR_TO_OUT_DEGREE.saturating_sub(existing))
+            }
+        };
+        if *budget == 0 {
+            continue;
+        }
+
         // Over-fetch by one so the self-hit doesn't eat into the
         // requested k. HNSW's search_active already filters tombstones,
         // so per-neighbour is_tombstoned checks would be redundant.
@@ -347,8 +393,16 @@ async fn do_auto_edge_cycle(
             if similarity < knobs.similarity_threshold {
                 continue;
             }
+            // Stop once the source has spent its out-edge budget. HNSW
+            // returns neighbours strongest-first, so the edges we keep
+            // are the highest-similarity ones — the cap sheds the
+            // weakest links, not arbitrary ones.
+            if *budget == 0 {
+                break;
+            }
             to_link.push((source_id, neighbour, similarity));
             *per_source_edges.entry(source_id).or_insert(0) += 1;
+            *budget -= 1;
             neighbours_found += 1;
         }
 
