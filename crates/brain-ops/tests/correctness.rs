@@ -126,6 +126,7 @@ mod common {
             request_id: rid,
             txn_id: None,
             deduplicate: false,
+            occurred_at_unix_nanos: None,
         }
     }
 

@@ -196,9 +196,7 @@ impl ResponseBody {
             Self::AdminMoveMemory(_) => Opcode::AdminMoveMemoryResp,
             Self::AdminReclassify(_) => Opcode::AdminReclassifyResp,
             Self::AdminListTombstoned(_) => Opcode::AdminListTombstonedResp,
-            Self::AdminListPendingContradictions(_) => {
-                Opcode::AdminListPendingContradictionsResp
-            }
+            Self::AdminListPendingContradictions(_) => Opcode::AdminListPendingContradictionsResp,
             Self::AdminBackfill(_) => Opcode::AdminBackfillResp,
             Self::AdminBackfillCancel(_) => Opcode::AdminBackfillCancelResp,
             Self::EntityCreate(_) => Opcode::EntityCreateResp,
@@ -532,6 +530,7 @@ mod tests {
                 lsn: 100,
                 flags: 0x1,
                 consolidated_at_unix_nanos: None,
+                occurred_at_unix_nanos: Some(1_699_990_000_000_000_000),
                 edges_out_count: 2,
                 edges_in_count: 3,
                 graph: None,

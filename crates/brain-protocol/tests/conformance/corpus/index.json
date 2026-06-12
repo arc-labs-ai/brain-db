@@ -15,7 +15,7 @@
     "name": "req_encode",
     "opcode": "0x0020",
     "kind": "request",
-    "payload_len": 151
+    "payload_len": 183
   },
   {
     "name": "req_encode_vector_direct",
@@ -303,7 +303,7 @@
     "name": "frame_encode",
     "opcode": "0x0020",
     "kind": "frame",
-    "payload_len": 183
+    "payload_len": 215
   },
   {
     "name": "frame_encode_vector_direct",

@@ -251,6 +251,7 @@ fn pending_to_memory_result(p: &BufferedEncode, req: &RecallRequest, score: f32)
         lsn: 0,
         flags: 0,
         consolidated_at_unix_nanos: None,
+        occurred_at_unix_nanos: p.occurred_at_unix_nanos,
         edges_out_count: 0,
         edges_in_count: 0,
     }
@@ -741,6 +742,7 @@ fn project_memory_results(
             lsn: row.encoded_at_lsn,
             flags: row.flags,
             consolidated_at_unix_nanos: row.consolidated_at_unix_nanos,
+            occurred_at_unix_nanos: row.occurred_at_unix_nanos,
             edges_out_count: row.edges_out_count,
             edges_in_count: row.edges_in_count,
         });

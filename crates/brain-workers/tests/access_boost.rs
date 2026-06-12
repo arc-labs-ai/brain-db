@@ -368,6 +368,7 @@ fn recall_fills_buffer_then_boost_worker_applies() {
             request_id: rid,
             txn_id: None,
             deduplicate: false,
+            occurred_at_unix_nanos: None,
         };
         let _ = dispatch(
             RequestBody::Encode(encode_req([1; 16], "alpha")),

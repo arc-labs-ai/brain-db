@@ -174,6 +174,7 @@ async fn encode_drives_pattern_extractor_and_writes_mention_edge() {
         edges: vec![],
         request_id: *Uuid::now_v7().as_bytes(),
         txn_id: None,
+        occurred_at_unix_nanos: None,
         deduplicate: false,
     };
     let (opcode, body) = round_trip(&mut client, 1, RequestBody::Encode(req)).await;

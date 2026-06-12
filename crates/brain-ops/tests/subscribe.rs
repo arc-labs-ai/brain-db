@@ -121,6 +121,7 @@ fn encode_req(
         request_id,
         txn_id: None,
         deduplicate: false,
+        occurred_at_unix_nanos: None,
     }
 }
 
@@ -346,6 +347,7 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
                     request_id: [0xA; 16],
                     txn_id: Some(txn_id),
                     deduplicate: false,
+                    occurred_at_unix_nanos: None,
                 }),
                 brain_ops::RequestCaller::anonymous(),
                 &fix.ctx,
@@ -367,6 +369,7 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
                     request_id: [0xB; 16],
                     txn_id: Some(txn_id),
                     deduplicate: false,
+                    occurred_at_unix_nanos: None,
                 }),
                 brain_ops::RequestCaller::anonymous(),
                 &fix.ctx,
@@ -435,6 +438,7 @@ fn publish_txn_abort_emits_nothing() {
                 request_id: [0xCC; 16],
                 txn_id: Some(txn_id),
                 deduplicate: false,
+                occurred_at_unix_nanos: None,
             }),
             brain_ops::RequestCaller::anonymous(),
             &fix.ctx,
@@ -956,6 +960,7 @@ mod wal_record_projection {
             request_hash: [0; 32],
             response_payload: vec![],
             deduplicate: false,
+            occurred_at_unix_nanos: None,
         };
         let r = rec(WalPayload::Encode(p));
         let envs = EventEnvelope::from_wal_record(&r);

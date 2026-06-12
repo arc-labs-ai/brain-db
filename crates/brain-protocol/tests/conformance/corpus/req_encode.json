@@ -29,5 +29,6 @@
     17
   ],
   "txn_id": null,
-  "deduplicate": true
+  "deduplicate": true,
+  "occurred_at_unix_nanos": 1700000000000000000
 }

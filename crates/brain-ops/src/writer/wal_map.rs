@@ -77,6 +77,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             embedding_model_fp,
             content_hash: _,
             deduplicate,
+            occurred_at_unix_nanos,
             ..
         } => Some(WalPayload::Encode(EncodePayload {
             memory_id: *id,
@@ -100,6 +101,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             request_hash: [0; 32],
             response_payload: Vec::new(),
             deduplicate: *deduplicate,
+            occurred_at_unix_nanos: *occurred_at_unix_nanos,
         })),
 
         Phase::Link {

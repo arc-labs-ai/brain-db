@@ -160,6 +160,7 @@ async fn encode_one(client: &mut TcpStream, stream_id: u32, text: &str) -> Memor
         edges: vec![],
         request_id: *Uuid::now_v7().as_bytes(),
         txn_id: None,
+        occurred_at_unix_nanos: None,
         deduplicate: false,
     };
     let resp = round_trip(client, stream_id, RequestBody::Encode(req)).await;

@@ -334,6 +334,7 @@ fn forget_stamps_tombstoned_at_unix_nanos() {
             request_id: [1; 16],
             txn_id: None,
             deduplicate: false,
+            occurred_at_unix_nanos: None,
         };
         let memory_id = match single_body(
             dispatch(
@@ -382,6 +383,7 @@ fn forget_replay_does_not_overwrite_stamp() {
             request_id: [10; 16],
             txn_id: None,
             deduplicate: false,
+            occurred_at_unix_nanos: None,
         };
         let memory_id = match single_body(
             dispatch(

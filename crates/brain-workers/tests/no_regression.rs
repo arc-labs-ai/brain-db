@@ -90,6 +90,7 @@ async fn encode_one(ctx: &OpsContext, rid: u32, text: &str) {
         request_id,
         txn_id: None,
         deduplicate: false,
+        occurred_at_unix_nanos: None,
     };
     let _ = dispatch(
         RequestBody::Encode(req),

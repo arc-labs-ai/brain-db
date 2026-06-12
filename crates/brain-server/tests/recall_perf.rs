@@ -191,6 +191,7 @@ async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str) -> u128 {
         edges: Vec::new(),
         request_id,
         txn_id: None,
+        occurred_at_unix_nanos: None,
         deduplicate: false,
     };
     let outcome = brain_ops::dispatch(

@@ -91,6 +91,7 @@ fn encode_req(request_id: [u8; 16], text: &str, kind: MemoryKindWire) -> EncodeR
         request_id,
         txn_id: None,
         deduplicate: false,
+        occurred_at_unix_nanos: None,
     }
 }
 
@@ -190,6 +191,64 @@ fn recall_full_pipeline_returns_top_k() {
             "v1: last_accessed mirrors created_at"
         );
         assert!(top.edges.is_none());
+        // A plain ENCODE supplies no event time, so the echoed field is
+        // absent — distinct from `created_at`, which is always stamped.
+        assert_eq!(top.occurred_at_unix_nanos, None);
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 1b. Client-supplied event time round-trips through to RECALL.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recall_echoes_client_supplied_occurred_at() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+
+        // A real-world event time well in the past — distinct from the
+        // server's write time so we can prove the two don't get conflated.
+        let event_time: u64 = 1_577_836_800_000_000_000; // 2020-01-01T00:00:00Z
+
+        let req = EncodeRequest {
+            text: "moved to berlin".into(),
+            context_id: 42,
+            kind: MemoryKindWire::Episodic,
+            salience_hint: 0.5,
+            edges: vec![],
+            request_id: [9; 16],
+            txn_id: None,
+            deduplicate: false,
+            occurred_at_unix_nanos: Some(event_time),
+        };
+        dispatch(
+            RequestBody::Encode(req),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
+
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(recall_req("moved to berlin", 1)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(frame.results.len(), 1);
+        let hit = &frame.results[0];
+        assert_eq!(
+            hit.occurred_at_unix_nanos,
+            Some(event_time),
+            "client event time must survive the write→read round trip"
+        );
+        assert_ne!(
+            hit.created_at_unix_nanos, event_time,
+            "occurred_at is the client's timeline, not the server write time"
+        );
     })
 }
 

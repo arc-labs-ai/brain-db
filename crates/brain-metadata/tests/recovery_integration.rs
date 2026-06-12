@@ -141,6 +141,7 @@ fn encode_payload(slot: u64, byte: u8) -> EncodePayload {
         request_hash: [byte; 32],
         response_payload: vec![],
         deduplicate: false,
+        occurred_at_unix_nanos: None,
     }
 }
 

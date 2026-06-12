@@ -57,6 +57,11 @@ pub struct EncodePayload {
     /// FINGERPRINTS row (and stamp the memory's back-reference). False
     /// for ordinary ENCODE writes — the dedup index stays untouched.
     pub deduplicate: bool,
+    /// Client-supplied event time (when the content actually happened),
+    /// distinct from the server write time. Carried in the WAL so the
+    /// field survives recovery — without it, replay would rebuild the
+    /// row with `occurred_at = None` and silently lose the timeline.
+    pub occurred_at_unix_nanos: Option<u64>,
 }
 
 /// Inline edge attached to an ENCODE payload.
@@ -836,6 +841,7 @@ fn encode_encode(p: &EncodePayload, out: &mut Vec<u8>) {
     out.extend_from_slice(&p.request_hash);
     put_blob(out, &p.response_payload);
     out.push(u8::from(p.deduplicate));
+    put_option_u64(out, p.occurred_at_unix_nanos);
 }
 
 fn decode_encode(r: &mut Reader<'_>) -> Result<EncodePayload, WalPayloadError> {
@@ -879,6 +885,7 @@ fn decode_encode(r: &mut Reader<'_>) -> Result<EncodePayload, WalPayloadError> {
     };
     let response_payload = read_blob(r)?;
     let deduplicate = r.u8()? != 0;
+    let occurred_at_unix_nanos = read_option_u64(r)?;
     Ok(EncodePayload {
         memory_id,
         request_id,
@@ -893,6 +900,7 @@ fn decode_encode(r: &mut Reader<'_>) -> Result<EncodePayload, WalPayloadError> {
         request_hash,
         response_payload,
         deduplicate,
+        occurred_at_unix_nanos,
     })
 }
 
@@ -1385,6 +1393,7 @@ mod tests {
                 request_hash: [0x11; 32],
                 response_payload: b"response-bytes".to_vec(),
                 deduplicate: true,
+                occurred_at_unix_nanos: None,
             }),
             WalPayload::Forget(ForgetPayload {
                 memory_id: mid(9),
@@ -1635,6 +1644,7 @@ mod tests {
             request_hash: [0; 32],
             response_payload: vec![],
             deduplicate: false,
+            occurred_at_unix_nanos: None,
         });
         let mut bytes = p.encode_to_bytes();
         // Text starts after MemoryId(16) + RequestId(16) + AgentId(16)
@@ -1690,6 +1700,7 @@ mod tests {
             request_hash: [0; 32],
             response_payload: vec![],
             deduplicate: false,
+            occurred_at_unix_nanos: None,
         });
         let bytes = p.encode_to_bytes();
         assert_eq!(WalPayload::decode(p.kind(), &bytes).unwrap(), p);
@@ -1715,6 +1726,7 @@ mod tests {
             request_hash: hash,
             response_payload: vec![],
             deduplicate: false,
+            occurred_at_unix_nanos: None,
         });
         let bytes = p.encode_to_bytes();
         match WalPayload::decode(WalRecordKind::Encode, &bytes).unwrap() {
@@ -1742,6 +1754,7 @@ mod tests {
             request_hash: [0; 32],
             response_payload: body.clone(),
             deduplicate: false,
+            occurred_at_unix_nanos: None,
         });
         let bytes = p.encode_to_bytes();
         match WalPayload::decode(WalRecordKind::Encode, &bytes).unwrap() {
@@ -1770,6 +1783,7 @@ mod tests {
             request_hash: [0; 32],
             response_payload: vec![],
             deduplicate: false,
+            occurred_at_unix_nanos: None,
         });
         let full = p.encode_to_bytes();
         // Drop the 32-byte hash + 4-byte response_payload length + 1-byte
@@ -2002,6 +2016,7 @@ mod tests {
             request_hash: [0; 32],
             response_payload: vec![],
             deduplicate: false,
+            occurred_at_unix_nanos: None,
         });
         let bytes = p.encode_to_bytes();
         assert_eq!(
@@ -2185,6 +2200,7 @@ mod tests {
                 request_hash: [0; 32],
                 response_payload: vec![],
                 deduplicate: false,
+                occurred_at_unix_nanos: None,
             });
             let bytes = p.encode_to_bytes();
             prop_assert_eq!(WalPayload::decode(WalRecordKind::Encode, &bytes).unwrap(), p);

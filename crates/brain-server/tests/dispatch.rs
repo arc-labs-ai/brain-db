@@ -345,6 +345,7 @@ async fn ops_before_auth_are_rejected() {
         edges: Vec::new(),
         request_id: [0u8; 16],
         txn_id: None,
+        occurred_at_unix_nanos: None,
         deduplicate: false,
     };
     send_frame(
@@ -479,6 +480,7 @@ async fn encode_round_trips_through_shard() {
         edges: Vec::new(),
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
+        occurred_at_unix_nanos: None,
         deduplicate: false,
     };
     send_frame(

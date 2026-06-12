@@ -23,7 +23,6 @@
 //! aren't useful. A non-None `txn_id` is rejected so we don't
 //! silently degrade the user's intent.
 
-
 use brain_core::{ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience};
 use brain_embed::VECTOR_DIM;
 use brain_planner::{EdgeOutcome, EncodeOp, EncodeOpEdge};
@@ -189,6 +188,9 @@ pub async fn handle_encode_vector_direct(
         salience: Salience::new(salience),
         context: context_id,
         created_at_unix_nanos: created_at,
+        // EncodeVectorDirect carries no event-time field on the wire;
+        // power-user vector writes default the timeline to write time.
+        occurred_at_unix_nanos: None,
         arena_slot: memory_id.slot(),
         embedding_model_fp: server_fp,
         content_hash: if req.deduplicate {
@@ -264,6 +266,9 @@ fn validate_common(req: &EncodeVectorDirectRequest, ctx: &OpsContext) -> Result<
         request_id: req.request_id,
         txn_id: None,
         deduplicate: req.deduplicate,
+        // Vector-direct writes carry no client event time; the proxy is
+        // only used for planner validation, which ignores this field.
+        occurred_at_unix_nanos: None,
     };
     // The planner rejects empty text. Power-user vector path may
     // genuinely have empty text (multi-modal upstream); skip the

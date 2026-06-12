@@ -87,6 +87,7 @@ fn encode_req(request_id: [u8; 16], text: &str) -> EncodeRequest {
         request_id,
         txn_id: None,
         deduplicate: false,
+        occurred_at_unix_nanos: None,
     }
 }
 
@@ -306,6 +307,7 @@ fn encode_req_with_dedup(
         request_id,
         txn_id: None,
         deduplicate,
+        occurred_at_unix_nanos: None,
     }
 }
 

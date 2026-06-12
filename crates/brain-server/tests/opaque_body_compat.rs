@@ -185,6 +185,7 @@ async fn encode_round_trip(client: &mut TcpStream, stream_id: u32, text: String)
         edges: Vec::new(),
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
+        occurred_at_unix_nanos: None,
         deduplicate: false,
     };
     send_frame(

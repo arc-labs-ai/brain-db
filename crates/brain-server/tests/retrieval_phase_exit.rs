@@ -188,6 +188,7 @@ fn encode_request(text: &str) -> RequestBody {
         edges: Vec::new(),
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
+        occurred_at_unix_nanos: None,
         deduplicate: false,
     })
 }

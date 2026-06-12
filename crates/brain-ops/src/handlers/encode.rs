@@ -5,7 +5,6 @@
 //! With `txn_id`: validate + embed + reserve a `MemoryId`, push to
 //! the buffer, return a preview response. Writes happen at TXN_COMMIT.
 
-
 use brain_core::{ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience};
 use brain_metadata::tables::memory::MemoryMetadata;
 use brain_planner::{plan_encode_inner, EdgeOutcome};
@@ -123,6 +122,7 @@ pub async fn handle_encode(
         salience: Salience::new(salience),
         context: context_id,
         created_at_unix_nanos: created_at,
+        occurred_at_unix_nanos: req.occurred_at_unix_nanos,
         arena_slot: memory_id.slot(),
         embedding_model_fp,
         content_hash: if req.deduplicate {
@@ -527,7 +527,8 @@ async fn handle_encode_in_txn(
         salience,
         req.text.len() as u32,
         created_at,
-    );
+    )
+    .with_occurred_at(req.occurred_at_unix_nanos);
 
     let buffered = BufferedEncode {
         memory_id,
@@ -557,6 +558,7 @@ async fn handle_encode_in_txn(
         request_id: req.request_id,
         request_hash,
         created_at_unix_nanos: created_at,
+        occurred_at_unix_nanos: req.occurred_at_unix_nanos,
         agent_id: ctx.executor.caller_agent,
     };
 

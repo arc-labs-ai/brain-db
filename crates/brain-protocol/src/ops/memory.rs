@@ -18,6 +18,11 @@ pub struct EncodeRequest {
     #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
     pub deduplicate: bool,
+    /// Client-supplied event time — when the memory's content actually
+    /// happened, distinct from the server's write time (`created_at`).
+    /// `None` when the client doesn't know it. Lets time-aware clients
+    /// store the real timeline instead of cramming dates into the text.
+    pub occurred_at_unix_nanos: Option<u64>,
 }
 
 /// Power-user encode: client supplies the embedding vector itself and
@@ -289,6 +294,10 @@ pub struct MemoryResult {
     /// worker (and is therefore a summary, not a raw memory).
     /// `None` for ordinary ENCODE-produced rows.
     pub consolidated_at_unix_nanos: Option<u64>,
+    /// Client-supplied event time (when the memory's content happened),
+    /// echoed from `EncodeRequest.occurred_at_unix_nanos`. `None` when the
+    /// client didn't supply one. Distinct from `created_at` (write time).
+    pub occurred_at_unix_nanos: Option<u64>,
     /// Denormalised outgoing-edge count (matches the source row's
     /// `edges_out_count`). Cheap connectivity signal even when the
     /// caller didn't ask for `--include-edges`.
@@ -493,6 +502,7 @@ mod serde_smoke {
             request_id: [7u8; 16],
             txn_id: Some([8u8; 16]),
             deduplicate: true,
+            occurred_at_unix_nanos: Some(1_700_000_000_000_000_000),
         };
         let j = serde_json::to_vec(&req).expect("serde_json encode");
         let back: EncodeRequest = serde_json::from_slice(&j).expect("serde_json decode");

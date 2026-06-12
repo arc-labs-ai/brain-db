@@ -28,6 +28,7 @@ pub fn apply_upsert_memory(
         salience,
         context,
         created_at_unix_nanos,
+        occurred_at_unix_nanos,
         arena_slot,
         embedding_model_fp,
         content_hash,
@@ -48,7 +49,8 @@ pub fn apply_upsert_memory(
         salience.raw(),
         text.len() as u32,
         *created_at_unix_nanos,
-    );
+    )
+    .with_occurred_at(*occurred_at_unix_nanos);
     if *deduplicate {
         if let Some(ch) = content_hash {
             row = row.with_content_hash(*ch);
@@ -391,6 +393,7 @@ mod tests {
             salience: brain_core::Salience::default(),
             context: ContextId(7),
             created_at_unix_nanos: 1_700_000_000_000,
+            occurred_at_unix_nanos: None,
             arena_slot: 42,
             embedding_model_fp: [0xAA; 16],
             content_hash: None,

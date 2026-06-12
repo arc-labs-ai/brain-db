@@ -83,6 +83,9 @@ impl MetadataDb {
                 forgot_at_unix_nanos: None,
                 tombstoned_at_unix_nanos: None,
                 consolidated_at_unix_nanos: Some(timestamp_ns),
+                // Consolidated rows synthesise content from sources; they
+                // carry no client-supplied event time.
+                occurred_at_unix_nanos: None,
                 salience: 0.5,
                 salience_initial: 0.5,
                 access_count: 0,

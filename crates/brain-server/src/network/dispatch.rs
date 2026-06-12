@@ -817,6 +817,7 @@ mod tests {
             edges: Vec::new(),
             request_id: [0u8; 16],
             txn_id: None,
+            occurred_at_unix_nanos: None,
             deduplicate: false,
         });
         let frame = Frame::new(Opcode::EncodeReq.as_u16(), FLAG_EOS, 1, body.encode());
@@ -914,7 +915,11 @@ mod tests {
         assert!(!subscribe_agents_allowed(true, own, None));
         assert!(!subscribe_agents_allowed(true, own, Some(&[])));
         assert!(!subscribe_agents_allowed(true, own, Some(&[other])));
-        assert!(!subscribe_agents_allowed(true, own, Some(&[[7u8; 16], other])));
+        assert!(!subscribe_agents_allowed(
+            true,
+            own,
+            Some(&[[7u8; 16], other])
+        ));
     }
 
     /// Client op on stream_id = 0 is BadFrame.

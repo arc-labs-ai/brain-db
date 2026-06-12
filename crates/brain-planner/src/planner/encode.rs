@@ -158,6 +158,7 @@ mod tests {
             request_id: [1u8; 16],
             txn_id: None,
             deduplicate: false,
+            occurred_at_unix_nanos: None,
         }
     }
 

@@ -42,7 +42,12 @@ fn main() {
         },
         client_session_token: None,
     };
-    send(&mut stream, Opcode::Hello, 0, RequestBody::Hello(hello).encode());
+    send(
+        &mut stream,
+        Opcode::Hello,
+        0,
+        RequestBody::Hello(hello).encode(),
+    );
     let welcome = read_response(&mut stream, &mut buf, Opcode::Welcome);
     let ResponseBody::Welcome(w) = welcome else {
         panic!("expected WELCOME, got {welcome:?}");
@@ -58,7 +63,12 @@ fn main() {
         agent_id,
         credentials: AuthCredentials::None,
     };
-    send(&mut stream, Opcode::Auth, 0, RequestBody::Auth(auth).encode());
+    send(
+        &mut stream,
+        Opcode::Auth,
+        0,
+        RequestBody::Auth(auth).encode(),
+    );
     let auth_ok = read_response(&mut stream, &mut buf, Opcode::AuthOk);
     let ResponseBody::AuthOk(_) = auth_ok else {
         panic!("expected AUTH_OK, got {auth_ok:?}");
@@ -76,8 +86,14 @@ fn main() {
         request_id: [0x11u8; 16],
         txn_id: None,
         deduplicate: true,
+        occurred_at_unix_nanos: None,
     };
-    send(&mut stream, Opcode::EncodeReq, 1, RequestBody::Encode(encode).encode());
+    send(
+        &mut stream,
+        Opcode::EncodeReq,
+        1,
+        RequestBody::Encode(encode).encode(),
+    );
     let encode_resp = read_response(&mut stream, &mut buf, Opcode::EncodeResp);
     let ResponseBody::Encode(er) = encode_resp else {
         panic!("expected ENCODE_RESP, got {encode_resp:?}");
@@ -104,7 +120,12 @@ fn main() {
         agent_filter: vec![agent_id],
         include_other_agents: false,
     };
-    send(&mut stream, Opcode::RecallReq, 3, RequestBody::Recall(recall).encode());
+    send(
+        &mut stream,
+        Opcode::RecallReq,
+        3,
+        RequestBody::Recall(recall).encode(),
+    );
     let recall_resp = read_response(&mut stream, &mut buf, Opcode::RecallResp);
     let ResponseBody::Recall(rr) = recall_resp else {
         panic!("expected RECALL_RESP, got {recall_resp:?}");

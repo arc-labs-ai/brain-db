@@ -43,16 +43,16 @@ use brain_protocol::envelope::response::{ErrorCategoryWire, ErrorCodeWire};
 use brain_protocol::error::{ErrorCategory, ErrorCode};
 use brain_protocol::ops::capabilities::{Capabilities, GetCapabilitiesResponse};
 use brain_protocol::{
-    EdgeKindWire, EdgeRequest, EncodeRequest, EncodeResponse,
-    EncodeVectorDirectRequest, EntityCreateRequest, EntityCreateResponse, EntityGetResponse,
-    EntityListItem, EntityListResponseFrame, EntityResolveResponse, EntityView, EventType,
-    EvidenceRefWire, ForgetMode, ForgetRequest, ForgetResponse, Frame,
-    InferenceKind, InferenceStep, LinkResponse, MaterializeProceduralRequest,
-    MaterializeProceduralResponse, MemoryKindWire, Opcode, PlanResponseFrame, PlanStatus, PlanStep,
-    PongResponse, QueryRequest, QueryResponse, ReasonResponseFrame, ReasonStatus, RecallRequest,
-    RecallResponseFrame, RelationCreateRequest, RelationCreateResponse, RelationListFromResponseFrame,
-    RelationView, RequestBody, ResolutionOutcomeWire, ResponseBody, RetrieverSelectionWire,
-    SchemaUploadRequest, SchemaUploadResponse, ServerPingResponse, StageKind, StatementCreateRequest,
+    EdgeKindWire, EdgeRequest, EncodeRequest, EncodeResponse, EncodeVectorDirectRequest,
+    EntityCreateRequest, EntityCreateResponse, EntityGetResponse, EntityListItem,
+    EntityListResponseFrame, EntityResolveResponse, EntityView, EventType, EvidenceRefWire,
+    ForgetMode, ForgetRequest, ForgetResponse, Frame, InferenceKind, InferenceStep, LinkResponse,
+    MaterializeProceduralRequest, MaterializeProceduralResponse, MemoryKindWire, Opcode,
+    PlanResponseFrame, PlanStatus, PlanStep, PongResponse, QueryRequest, QueryResponse,
+    ReasonResponseFrame, ReasonStatus, RecallRequest, RecallResponseFrame, RelationCreateRequest,
+    RelationCreateResponse, RelationListFromResponseFrame, RelationView, RequestBody,
+    ResolutionOutcomeWire, ResponseBody, RetrieverSelectionWire, SchemaUploadRequest,
+    SchemaUploadResponse, ServerPingResponse, StageKind, StatementCreateRequest,
     StatementCreateResponse, StatementGetResponse, StatementKindWire, StatementListResponseFrame,
     StatementObjectWire, StatementValueWire, StatementView, SubscriptionEvent, TransitionKind,
     TxnAbortResponse, TxnBeginResponse, TxnCommitResponse,
@@ -277,6 +277,7 @@ fn sample_encode() -> EncodeRequest {
         request_id: RID,
         txn_id: None,
         deduplicate: true,
+        occurred_at_unix_nanos: Some(1_700_000_000_000_000_000),
     }
 }
 
@@ -1063,7 +1064,10 @@ fn required_families() -> Vec<(&'static str, Opcode)> {
         ("graph.entity_resolve_resp", Opcode::EntityResolveResp),
         ("graph.statement_get_resp", Opcode::StatementGetResp),
         ("graph.statement_list_resp", Opcode::StatementListResp),
-        ("graph.relation_list_from_resp", Opcode::RelationListFromResp),
+        (
+            "graph.relation_list_from_resp",
+            Opcode::RelationListFromResp,
+        ),
         ("cognitive.plan_resp", Opcode::PlanResp),
         ("cognitive.reason_resp", Opcode::ReasonResp),
         ("cognitive.link_resp", Opcode::LinkResp),

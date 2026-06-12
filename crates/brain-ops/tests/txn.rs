@@ -89,6 +89,7 @@ fn encode_req(request_id: [u8; 16], text: &str, txn: Option<[u8; 16]>) -> Encode
         request_id,
         txn_id: txn,
         deduplicate: false,
+        occurred_at_unix_nanos: None,
     }
 }
 

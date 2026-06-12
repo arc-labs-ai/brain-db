@@ -53,6 +53,10 @@ pub enum Phase {
         salience: Salience,
         context: ContextId,
         created_at_unix_nanos: u64,
+        /// Client-supplied event time (when the content actually
+        /// happened), distinct from `created_at_unix_nanos` (server write
+        /// time). `None` when the client didn't supply one.
+        occurred_at_unix_nanos: Option<u64>,
         /// Slot in the per-shard memory arena.
         arena_slot: u64,
         /// Embedding-model fingerprint stamped on the stored row. The
@@ -563,6 +567,7 @@ mod tests {
             salience: Salience::default(),
             context: ContextId(7),
             created_at_unix_nanos: 1_700_000_000_000,
+            occurred_at_unix_nanos: None,
             arena_slot: 42,
             embedding_model_fp: [0xAA; 16],
             content_hash: None,
@@ -612,6 +617,7 @@ mod tests {
             salience: Salience::default(),
             context: ContextId(0),
             created_at_unix_nanos: 0,
+            occurred_at_unix_nanos: None,
             arena_slot: 0,
             embedding_model_fp: [0; 16],
             content_hash: None,

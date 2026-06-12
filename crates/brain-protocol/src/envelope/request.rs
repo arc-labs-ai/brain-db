@@ -191,9 +191,7 @@ impl RequestBody {
             Self::AdminMoveMemory(_) => Opcode::AdminMoveMemoryReq,
             Self::AdminReclassify(_) => Opcode::AdminReclassifyReq,
             Self::AdminListTombstoned(_) => Opcode::AdminListTombstonedReq,
-            Self::AdminListPendingContradictions(_) => {
-                Opcode::AdminListPendingContradictionsReq
-            }
+            Self::AdminListPendingContradictions(_) => Opcode::AdminListPendingContradictionsReq,
             Self::AdminBackfill(_) => Opcode::AdminBackfillReq,
             Self::AdminBackfillCancel(_) => Opcode::AdminBackfillCancelReq,
             Self::EntityCreate(_) => Opcode::EntityCreateReq,
@@ -453,6 +451,7 @@ mod tests {
             request_id: sample_uuid(2),
             txn_id: Some(sample_uuid(3)),
             deduplicate: true,
+            occurred_at_unix_nanos: Some(1_700_000_000_000_000_000),
         }));
     }
 
