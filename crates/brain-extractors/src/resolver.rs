@@ -631,6 +631,21 @@ pub fn resolve_or_create_with_deps(
     // re-running this branch with the same surface form produces a
     // different id because the previous one is still around for
     // tiers 1/2 to short-circuit.
+    //
+    // Reaching create means tiers 1/2/3a (and 3b when wired) all
+    // missed. Without the embedding tier the gauntlet cannot catch
+    // paraphrases the trigram tier misses ("Stripe Inc." vs "Stripe
+    // Payments"), so a missing embedding tier here is the prime cause
+    // of one real-world entity splitting into many duplicate nodes.
+    // Warn so an operator can correlate a creeping entity-cardinality
+    // blowup with an absent embedding tier instead of chasing it blind.
+    if embed_deps.is_none() {
+        tracing::warn!(
+            target: "brain_extractors::resolver",
+            surface_form,
+            "resolver fell through to create with no embedding tier wired; paraphrases the trigram tier misses will over-split into duplicate entities",
+        );
+    }
     let new_id = EntityId::new();
     let mut entity = Entity::new_active(
         new_id,
@@ -641,6 +656,18 @@ pub fn resolve_or_create_with_deps(
     );
     entity.mention_count = 1;
     entity_put(wtxn, &entity)?;
+
+    // Minting a new node is normal much of the time, but it is also the
+    // exact event that grows entity cardinality. Record it at debug so a
+    // suspected over-split can be reconstructed from logs — which surface
+    // forms produced fresh entities, and how many collapse onto the same
+    // real-world thing once aliased.
+    tracing::debug!(
+        target: "brain_extractors::resolver",
+        surface_form,
+        entity_id = ?new_id,
+        "all resolver tiers missed; created a new entity",
+    );
 
     // Populate the entity HNSW so the next paraphrase can hit tier-3b.
     // Failures here are non-fatal: the entity row is durable; the
