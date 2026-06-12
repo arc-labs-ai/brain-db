@@ -1103,6 +1103,7 @@ mod tests {
             arena_slot: 1,
             embedding_model_fp: [0xAA; 16],
             content_hash: None,
+            occurred_at_unix_nanos: None,
             deduplicate: false,
         };
         let link = Phase::Link {
@@ -1174,6 +1175,7 @@ mod tests {
             arena_slot: 1,
             embedding_model_fp: [0xAA; 16],
             content_hash: None,
+            occurred_at_unix_nanos: None,
             deduplicate: false,
         };
         let write = Write::single(WriteId::new(), AgentId::new(), phase);
@@ -1204,6 +1206,7 @@ mod tests {
             arena_slot: 1,
             embedding_model_fp: [0xAA; 16],
             content_hash: None,
+            occurred_at_unix_nanos: None,
             deduplicate: false,
         };
         let write = Write::single(WriteId::new(), AgentId::new(), phase);
@@ -1230,6 +1233,7 @@ mod tests {
             arena_slot: 1,
             embedding_model_fp: [0; 16],
             content_hash: None,
+            occurred_at_unix_nanos: None,
             deduplicate: false,
         };
         writer
@@ -1461,6 +1465,7 @@ mod tests {
             arena_slot: 1,
             embedding_model_fp: [0xAA; 16],
             content_hash: None,
+            occurred_at_unix_nanos: None,
             deduplicate: false,
         };
         // ReclaimSlots has no WAL mapping (it's derivable from
@@ -1567,6 +1572,7 @@ mod tests {
             arena_slot: 1,
             embedding_model_fp: [0xAA; 16],
             content_hash: None,
+            occurred_at_unix_nanos: None,
             deduplicate: false,
         };
         let mk_link = |from_slot: u64, to_slot: u64| Phase::Link {

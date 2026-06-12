@@ -131,6 +131,7 @@ async fn seed_memory_with_vec(
         salience: Salience::default(),
         context: context_id,
         created_at_unix_nanos: created_at,
+        occurred_at_unix_nanos: None,
         arena_slot: slot,
         embedding_model_fp: [0; 16],
         content_hash: None,

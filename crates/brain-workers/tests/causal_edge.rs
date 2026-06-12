@@ -118,6 +118,7 @@ async fn seed_memory(fixture: &Fixture, slot: u64) -> MemoryId {
         salience: Salience::default(),
         context: ContextId(1),
         created_at_unix_nanos: now_unix_nanos(),
+        occurred_at_unix_nanos: None,
         arena_slot: slot,
         embedding_model_fp: [0; 16],
         content_hash: None,

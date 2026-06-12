@@ -371,6 +371,9 @@ async fn do_consolidation_cycle(
                 salience: Salience::new(worker.initial_salience),
                 context: context_id,
                 created_at_unix_nanos: created_at,
+                // Consolidated memories synthesise content from their
+                // sources; they carry no single client event time.
+                occurred_at_unix_nanos: None,
                 arena_slot: memory_id.slot(),
                 embedding_model_fp: ctx.ops.executor.embedder.fingerprint(),
                 content_hash: None,

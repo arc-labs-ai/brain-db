@@ -926,6 +926,7 @@ mod tests {
             salience: Salience::new(0.7),
             context: ContextId(3),
             created_at_unix_nanos: 1_700_000_000_000,
+            occurred_at_unix_nanos: None,
             arena_slot: 7,
             embedding_model_fp: [0xCC; 16],
             content_hash: Some([0xDD; 32]),

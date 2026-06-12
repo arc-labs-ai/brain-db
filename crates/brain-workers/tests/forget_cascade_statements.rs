@@ -169,6 +169,7 @@ fn upsert_memory(writer: &RealWriterHandle, id: MemoryId) {
         salience: Salience::default(),
         context: ContextId::DEFAULT,
         created_at_unix_nanos: NOW,
+        occurred_at_unix_nanos: None,
         arena_slot: id.slot(),
         embedding_model_fp: [0u8; 16],
         content_hash: None,
