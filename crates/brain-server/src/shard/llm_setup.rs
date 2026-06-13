@@ -128,6 +128,12 @@ pub struct LlmDeps {
     /// that client (Anthropic preferred, OpenAI as fallback) so
     /// there's no duplicate API key handling.
     pub disambiguator: Option<Arc<EntityDisambiguator>>,
+    /// The primary provider client + its wire model, retained so other
+    /// write-time LLM consumers (the HyPE generator) can reuse the same
+    /// client without re-resolving credentials. `None` mirrors
+    /// `disambiguator`: no provider key was resolvable.
+    pub primary_client: Option<Arc<dyn LlmClient>>,
+    pub primary_model: String,
 }
 
 impl LlmDeps {
@@ -167,12 +173,15 @@ impl LlmDeps {
 /// local development.
 pub fn build_llm_deps(shard_dir: &Path, llm_cfg: &LlmSpawnConfig) -> LlmDeps {
     let (primary_client, primary_model) = build_primary_client(llm_cfg);
-    let disambiguator =
-        primary_client.map(|c| Arc::new(EntityDisambiguator::new(c, primary_model)));
+    let disambiguator = primary_client
+        .clone()
+        .map(|c| Arc::new(EntityDisambiguator::new(c, primary_model.clone())));
     LlmDeps {
         router: build_router(llm_cfg),
         cache: open_cache(shard_dir),
         disambiguator,
+        primary_client,
+        primary_model,
     }
 }
 
@@ -492,6 +501,8 @@ mod tests {
             router: None,
             cache: open_cache(dir.path()),
             disambiguator: None,
+            primary_client: None,
+            primary_model: String::new(),
         };
         let labels = Arc::new(vec!["brain:Person".to_string()]);
         let materialize = deps.into_materialize_deps(None, labels.clone());
@@ -552,12 +563,16 @@ mod tests {
             router: None,
             cache: Some(Arc::clone(&cache_arc)),
             disambiguator: None,
+            primary_client: None,
+            primary_model: String::new(),
         }
         .into_materialize_deps(None, labels.clone());
         let deps_b = LlmDeps {
             router: None,
             cache: Some(Arc::clone(&cache_arc)),
             disambiguator: None,
+            primary_client: None,
+            primary_model: String::new(),
         }
         .into_materialize_deps(None, labels.clone());
 

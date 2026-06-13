@@ -61,6 +61,7 @@ use std::sync::Arc;
 use brain_core::{ShardId, SlotVersion};
 use brain_embed::{Dispatcher, VECTOR_DIM};
 use brain_index::entity_hnsw::{EntityHnswIndex, EntityHnswParams};
+use brain_index::hype_hnsw::HypeHnswIndex;
 use brain_index::statement_hnsw::{StatementHnswIndex, StatementHnswParams};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
@@ -1565,6 +1566,19 @@ pub fn spawn_shard(
                         .expect("EntityHnswIndex::new"),
                 ),
             );
+            // Per-shard HyPE pool (hypothetical-question embeddings).
+            // Written by the extractor worker's HyPE generator when
+            // generation is enabled; probed by the semantic retriever on
+            // every memory search. In-memory only — rebuilt below from the
+            // durable `hype_question_vectors` rows. Always constructed: a
+            // read probe of an empty pool is a cheap no-op, so reads can
+            // probe unconditionally even on a shard that isn't generating.
+            let hype_hnsw_for_shard: Arc<parking_lot::RwLock<HypeHnswIndex>> = Arc::new(
+                parking_lot::RwLock::new(
+                    HypeHnswIndex::new(brain_index::hype_default_params())
+                        .expect("HypeHnswIndex::new"),
+                ),
+            );
             // Per-shard semantic retriever. Reuses the executor's
             // embedder + the shared memory HNSW reader. The statement
             // HNSW handle lets the retriever fan out to the statement
@@ -1576,7 +1590,8 @@ pub fn spawn_shard(
                     hnsw_shared.clone(),
                     Some(statement_hnsw_for_shard.clone()),
                     metadata.clone(),
-                ),
+                )
+                .with_hype_index(hype_hnsw_for_shard.clone()),
             );
             // Per-shard graph retriever. Reads from the entity /
             // relation / statement redb tables.
@@ -1722,6 +1737,14 @@ pub fn spawn_shard(
             // wires it directly into the resolver path so ambiguous-
             // band partial matches get a second opinion.
             let entity_disambiguator_for_worker = llm_deps.disambiguator.clone();
+            // Snapshot the primary LLM client + model for the HyPE
+            // generator, before `llm_deps` is consumed below. `None` when
+            // no provider key resolved — HyPE generation then stays off.
+            let hype_client_for_worker = llm_deps.primary_client.clone();
+            let hype_model_for_worker = llm_deps.primary_model.clone();
+            // Dedicated cache handle for the HyPE generator: `llm_cache_for_ops`
+            // is moved into OpsContext below, so snapshot the Arc now.
+            let hype_cache_for_worker = llm_deps.cache.clone();
 
             // Tantivy is opened (and any post-recovery rebuilds run)
             // before the executor closure spawns — see "Tantivy open
@@ -2242,6 +2265,38 @@ pub fn spawn_shard(
                 ),
             }
 
+            // HyPE pool rebuild: re-insert every persisted
+            // hypothetical-question vector into the in-RAM index. Unlike
+            // the entity index there is no re-embed fallback — the vectors
+            // are the durable source of truth, so a missing/empty table
+            // just means an empty pool (a fresh shard, or HyPE never
+            // generated). The open_table error on a never-written table is
+            // expected and logged at INFO, not ERROR.
+            match metadata.read_txn() {
+                Ok(rtxn) => match brain_metadata::hype_iter_all_vectors(&rtxn) {
+                    Ok(points) if !points.is_empty() => {
+                        let report = hype_hnsw_for_shard.write().rebuild(points);
+                        info!(
+                            shard_id,
+                            inserted = report.inserted,
+                            memories = report.memories,
+                            "HyPE HNSW rebuilt from metadata on startup"
+                        );
+                    }
+                    Ok(_) => info!(shard_id, "no HyPE vectors to rebuild; pool starts empty"),
+                    Err(e) => info!(
+                        shard_id,
+                        error = ?e,
+                        "HyPE pool empty or table absent; pool starts empty"
+                    ),
+                },
+                Err(e) => error!(
+                    shard_id,
+                    error = ?e,
+                    "HyPE HNSW startup rebuild: read_txn failed"
+                ),
+            }
+
             // Recovery: re-enqueue every live statement so the
             // StatementEmbedWorker repopulates the (in-RAM, non-persisted)
             // statement HNSW. Runs in the background off the embed queue, so
@@ -2552,6 +2607,45 @@ pub fn spawn_shard(
                         whitelist_qnames: whitelist,
                     };
                     extractor_worker = extractor_worker.with_causal_edge_feed(feed);
+                }
+                // Wire the write-time HyPE generator when enabled and an
+                // LLM provider + cache are available. Enablement is a
+                // deploy-time flag (`BRAIN_HYPE_ENABLED`); the number of
+                // questions per memory is `BRAIN_HYPE_NUM_QUESTIONS`
+                // (default 6). A set flag with no provider/cache is an
+                // INFO skip, not a hard fail — HyPE is a recall
+                // enhancement, never a correctness dependency.
+                let hype_enabled = std::env::var("BRAIN_HYPE_ENABLED")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if hype_enabled {
+                    match (hype_client_for_worker.clone(), hype_cache_for_worker.clone()) {
+                        (Some(client), Some(cache)) => {
+                            let num_questions = std::env::var("BRAIN_HYPE_NUM_QUESTIONS")
+                                .ok()
+                                .and_then(|s| s.parse::<usize>().ok())
+                                .unwrap_or(6);
+                            let generator = brain_workers::HypeGenerator::new(
+                                client,
+                                hype_model_for_worker.clone(),
+                                dispatcher.clone(),
+                                hype_hnsw_for_shard.clone(),
+                                metadata.clone(),
+                                cache,
+                                num_questions,
+                            );
+                            extractor_worker = extractor_worker.with_hype(generator);
+                            info!(
+                                shard_id,
+                                num_questions, "HyPE write-time generation enabled"
+                            );
+                        }
+                        _ => info!(
+                            shard_id,
+                            "BRAIN_HYPE_ENABLED set but no LLM provider/cache; \
+                             HyPE generation skipped"
+                        ),
+                    }
                 }
                 scheduler
                     .register(Arc::new(extractor_worker), ops.clone())

@@ -85,6 +85,7 @@ pub use workers::hnsw_maint::{
     decide_action, Action, DisabledRebuildSource, HnswMaintenanceWorker, IndexStats, RebuildSource,
     RebuildSourceError, RebuildThresholds, SnapshotFuture,
 };
+pub use workers::hype::{HypeGenOutcome, HypeGenerator};
 pub use workers::idempotency_cleanup::{IdempotencyCleanupWorker, DEFAULT_IDEMPOTENCY_TTL};
 pub use workers::llm_cache_sweeper::LlmCacheSweeper;
 pub use workers::slot_reclaim::{SlotReclamationWorker, DEFAULT_FORGET_GRACE};
