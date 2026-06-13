@@ -46,7 +46,7 @@ use futures_lite::future::poll_fn;
 
 use crate::retrieval::diversity::{mmr_reorder, tokenize, MMR_LAMBDA_LIST, MMR_WINDOW};
 use crate::retrieval::filters::{apply_filter_chain, FilterChainStats, FilterError};
-use crate::retrieval::fusion::{fuse, FusedItem};
+use crate::retrieval::fusion::{adaptive_k, fuse, FusedItem, FusionMethod};
 use crate::retrieval::planner::{PreFilter, QueryPlan, RetrieverConfig, LIST_MAX_TOP_N, MAX_TOP_N};
 use crate::retrieval::recency::apply_recency_boost;
 use crate::retrieval::rerank::{rerank_top_n, RerankCandidate, RERANK_TOP_N};
@@ -436,12 +436,16 @@ async fn execute_once(
         }
     }
 
-    let fused = fuse(
-        &outputs,
-        plan.fusion.k,
-        &plan.fusion.weights,
-        plan.fusion.method,
-    );
+    // Adaptive RRF k from the actual candidate-pool size (small pools →
+    // smaller k → sharper top ranks). Falls back to the plan's k for
+    // non-RRF fusion methods, which don't use k.
+    let candidate_pool: usize = outputs.iter().map(|(_, v)| v.len()).sum();
+    let fusion_k = if plan.fusion.method == FusionMethod::Rrf {
+        adaptive_k(candidate_pool)
+    } else {
+        plan.fusion.k
+    };
+    let fused = fuse(&outputs, fusion_k, &plan.fusion.weights, plan.fusion.method);
     let fused_len = fused.len();
 
     // Per-candidate fusion breakdown for deep diagnosis: which

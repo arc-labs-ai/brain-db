@@ -1,4 +1,4 @@
-//! Reciprocal Rank Fusion.
+//! Reciprocal Rank Fusion (adaptive-k).
 //!
 //! Combines multiple retrievers' ranked outputs into one ranked list
 //! using score-scale-invariant rank fusion:
@@ -7,9 +7,15 @@
 //! RRF_score(d) = Σ_i  w_i / (k + rank_i(d))
 //! ```
 //!
-//! Where `i` iterates the retrievers that returned `d`, `w_i`
-//! is the per-retriever weight (default 1.0), and `k` is the
-//! smoothing constant (default 60).
+//! Where `i` iterates the retrievers that returned `d`, `w_i` is the
+//! per-retriever weight (default 1.0), and `k` is the smoothing
+//! constant chosen from the candidate-pool size by [`adaptive_k`]: the
+//! textbook `k=60` was tuned for TREC-scale pools, but Brain's per-shard
+//! pools are small, where a smaller `k` sharpens the top ranks.
+//!
+//! (Score-weighting — folding each lane's own confidence into the
+//! contribution — is a separate, eval-gated change: it removes the
+//! scale-invariance property above, so it is deferred until measured.)
 
 use std::collections::HashMap;
 
@@ -17,8 +23,24 @@ use brain_index::{RankedItem, RankedItemId};
 
 use crate::retrieval::router::{PerRetrieverWeights, Retriever};
 
-/// RRF smoothing-constant default (from Cormack et al. 2009).
+/// RRF smoothing-constant default (from Cormack et al. 2009). Used as
+/// the large-pool bucket of [`adaptive_k`] and by tests that pin the
+/// textbook constant.
 pub const DEFAULT_K: u32 = 60;
+
+/// Pick the RRF smoothing constant from the candidate-pool size. Smaller
+/// `k` emphasises the top of the list, which suits Brain's small
+/// per-shard pools; the textbook 60 only kicks in for large pools.
+#[must_use]
+pub fn adaptive_k(candidate_pool: usize) -> u32 {
+    if candidate_pool < 200 {
+        15
+    } else if candidate_pool < 2_000 {
+        30
+    } else {
+        DEFAULT_K
+    }
+}
 
 /// Which fusion strategy combines the per-retriever ranked lists.
 ///
