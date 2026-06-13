@@ -144,6 +144,39 @@ pub fn entity_lookup_by_canonical_name(
     Ok(bytes.map(EntityId::from))
 }
 
+/// Resolve a free-text candidate to entities by exact canonical-name
+/// match across **every** registered entity type. The canonical-name
+/// index is keyed `(type_id, normalized_name)`, so a bare cue with no
+/// type hint needs one point lookup per registered type — the registry
+/// is small (a few hundred entries at most). Returns the distinct
+/// EntityIds that matched (0, 1, or more); the caller decides how to
+/// treat ambiguity. No fuzzy / alias matching — exact canonical only,
+/// so this stays a high-precision resolver.
+pub fn entity_resolve_canonical_all_types(
+    rtxn: &ReadTransaction,
+    candidate: &str,
+) -> Result<Vec<EntityId>, EntityOpError> {
+    let type_ids: Vec<u32> = {
+        let types_t = rtxn.open_table(ENTITY_TYPES_TABLE)?;
+        let mut v = Vec::new();
+        for entry in types_t.iter()? {
+            let (k, _) = entry?;
+            v.push(k.value());
+        }
+        v
+    };
+    let mut out: Vec<EntityId> = Vec::new();
+    for tid in type_ids {
+        if let Some(id) = entity_lookup_by_canonical_name(rtxn, EntityTypeId::from(tid), candidate)?
+        {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Alias lookup. Returns every EntityId whose alias set contains
 /// `normalize_name(candidate)` under `type_id`. Multi-value index
 /// (— "the same alias maps to entities of different
@@ -713,6 +746,26 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let got = entity_get(&rtxn, id).unwrap().expect("present");
         assert_eq!(got, e);
+    }
+
+    #[test]
+    fn resolve_canonical_all_types_finds_match_without_type_hint() {
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let e = person_entity("Priya Patel");
+        let id = e.id;
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, &e).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        // Resolves by canonical name across all types — no type hint, and
+        // normalization folds the casing.
+        let ids = entity_resolve_canonical_all_types(&rtxn, "priya patel").unwrap();
+        assert_eq!(ids, vec![id]);
+        // A name no entity carries resolves to nothing.
+        let none = entity_resolve_canonical_all_types(&rtxn, "Nobody Here").unwrap();
+        assert!(none.is_empty());
     }
 
     #[test]

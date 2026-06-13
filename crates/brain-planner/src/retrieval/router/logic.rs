@@ -320,6 +320,37 @@ pub enum GraphAnchorMode {
     /// graph contributing on schemaless deployments where no
     /// `EntityId` is ever known.
     MemoryFromSemantic,
+    /// The router left a blind [`MemoryFromSemantic`] lane, but the
+    /// executor resolved the query's named subject to this entity
+    /// against the canonical-name index. It walks one hop from the
+    /// entity over `Mentions` edges so the memories that name the
+    /// subject enter fusion directly — a sharper anchor than the
+    /// semantic top-K guess. Never produced by the router (it has no
+    /// DB access); injected by the executor post-plan.
+    MemoryFromEntityCue(EntityId),
+}
+
+/// Extract candidate entity-name cues from query text: maximal
+/// Title-Case spans (`"Sarah"`, `"Phoenix Project"`), plus the
+/// individual words of any multi-word span. The split matters because
+/// the regex greedily merges consecutive capitals — a name after a
+/// sentence-initial capital ("Did Sarah") would otherwise hide inside a
+/// span that resolves to nothing; emitting "Sarah" on its own recovers
+/// it. The executor resolves these against the canonical-name index, so
+/// a cue that names no entity simply resolves to nothing and is ignored;
+/// resolution there is the real precision gate.
+#[must_use]
+pub fn entity_cue_candidates(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for m in TITLE_CASE_RE.find_iter(text) {
+        let span = m.as_str();
+        out.push(span.to_string());
+        let words: Vec<&str> = span.split_whitespace().collect();
+        if words.len() > 1 {
+            out.extend(words.into_iter().map(str::to_string));
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy)]

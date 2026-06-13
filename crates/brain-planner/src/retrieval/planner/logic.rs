@@ -271,7 +271,13 @@ fn retriever_config_for(
             let anchor_mode = routing.graph_anchor_mode.unwrap_or(GraphAnchorMode::Entity);
             let direction = match anchor_mode {
                 GraphAnchorMode::Entity => GraphDirection::Outgoing,
-                GraphAnchorMode::MemoryFromSemantic => GraphDirection::Both,
+                // Memory modes traverse symmetric substrate / Mentions
+                // edges, so both directions. The cue mode is never set at
+                // plan time (the executor injects it post-plan); the arm
+                // exists for exhaustiveness.
+                GraphAnchorMode::MemoryFromSemantic | GraphAnchorMode::MemoryFromEntityCue(_) => {
+                    GraphDirection::Both
+                }
             };
             // Memory-anchor walks include_statements is moot —
             // there are no statements on the substrate edge

@@ -5,7 +5,7 @@ use std::sync::Mutex as StdMutex;
 use std::thread;
 use std::time::Duration;
 
-use brain_core::{AgentId, ContextId, EntityId, MemoryId, MemoryKind};
+use brain_core::{AgentId, ContextId, Entity, EntityId, EntityType, MemoryId, MemoryKind};
 use brain_index::{
     GraphError, GraphQuery, GraphRetriever, GraphRetrieverConfig, LexicalError, LexicalQuery,
     LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItem, RankedItemId,
@@ -17,7 +17,7 @@ use tempfile::TempDir;
 
 use super::{execute, QueryMetadata, QueryResult, RetrievalExecutorContext, RetrieverStatus};
 use crate::retrieval::planner::{plan, RetrieverConfig};
-use crate::retrieval::router::{QueryRequest, Retriever, RetrieverSelection};
+use crate::retrieval::router::{GraphAnchorMode, QueryRequest, Retriever, RetrieverSelection};
 
 // ---------------------------------------------------------------------------
 // Mock retrievers.
@@ -684,4 +684,111 @@ fn dynamic_k_no_deepen_when_first_pass_fills_limit() {
         "a first pass that already fills the limit must not re-query"
     );
     assert_eq!(result.items.len(), 10);
+}
+
+// ---------------------------------------------------------------------------
+// Cue→anchor entity-graph expansion.
+// ---------------------------------------------------------------------------
+
+fn graph_anchor_mode_of(plan: &crate::retrieval::planner::QueryPlan) -> Option<GraphAnchorMode> {
+    plan.retrievers.iter().find_map(|r| match &r.config {
+        RetrieverConfig::Graph { anchor_mode, .. } => Some(*anchor_mode),
+        _ => None,
+    })
+}
+
+fn cue_ctx(metadata: MetadataDb) -> RetrievalExecutorContext {
+    RetrievalExecutorContext {
+        semantic: Arc::new(MockSemantic {
+            response: Arc::new(StdMutex::new(Ok(Vec::new()))),
+            delay: None,
+        }),
+        lexical: Arc::new(MockLexical {
+            response: Arc::new(StdMutex::new(Ok(Vec::new()))),
+        }),
+        graph: Arc::new(MockGraph {
+            response: Arc::new(StdMutex::new(Ok(Vec::new()))),
+        }),
+        metadata: Arc::new(metadata),
+        cross_encoder: None,
+    }
+}
+
+fn cue_request(text: &str) -> QueryRequest {
+    QueryRequest {
+        text: Some(text.into()),
+        retrievers: RetrieverSelection::Explicit(vec![Retriever::Semantic, Retriever::Graph]),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn cue_anchor_upgrades_blind_graph_to_resolved_entity() {
+    let dir = TempDir::new().expect("tempdir");
+    let metadata = MetadataDb::open(dir.path().join("metadata.redb")).expect("open");
+    let sarah = Entity::new_active(
+        EntityId::new(),
+        EntityType::PERSON_ID,
+        "Sarah".to_owned(),
+        brain_metadata::normalize_name("Sarah"),
+        0,
+    );
+    let sarah_id = sarah.id;
+    {
+        let wtxn = metadata.write_txn().expect("wtxn");
+        brain_metadata::entity_put(&wtxn, &sarah).expect("put");
+        wtxn.commit().expect("commit");
+    }
+    let ctx = cue_ctx(metadata);
+
+    let req = cue_request("Tell me about Sarah");
+    let qp = plan(&req).expect("plan");
+    // A blind memory-from-semantic graph lane is what the resolver upgrades.
+    assert_eq!(
+        graph_anchor_mode_of(&qp),
+        Some(GraphAnchorMode::MemoryFromSemantic)
+    );
+
+    let rewritten = super::resolve_cue_anchor(&qp, &req, &ctx).expect("Sarah resolves");
+    assert_eq!(
+        graph_anchor_mode_of(&rewritten),
+        Some(GraphAnchorMode::MemoryFromEntityCue(sarah_id)),
+        "the named subject becomes the graph anchor"
+    );
+}
+
+#[test]
+fn cue_anchor_falls_back_when_no_entity_matches() {
+    let dir = TempDir::new().expect("tempdir");
+    let metadata = MetadataDb::open(dir.path().join("metadata.redb")).expect("open");
+    let ctx = cue_ctx(metadata);
+
+    let req = cue_request("Tell me about Nobody");
+    let qp = plan(&req).expect("plan");
+    // No entity named in the query exists → keep the original plan.
+    assert!(super::resolve_cue_anchor(&qp, &req, &ctx).is_none());
+}
+
+#[test]
+fn cue_anchor_falls_back_on_two_distinct_entities() {
+    let dir = TempDir::new().expect("tempdir");
+    let metadata = MetadataDb::open(dir.path().join("metadata.redb")).expect("open");
+    for name in ["Sarah", "Aurora"] {
+        let e = Entity::new_active(
+            EntityId::new(),
+            EntityType::PERSON_ID,
+            name.to_owned(),
+            brain_metadata::normalize_name(name),
+            0,
+        );
+        let wtxn = metadata.write_txn().expect("wtxn");
+        brain_metadata::entity_put(&wtxn, &e).expect("put");
+        wtxn.commit().expect("commit");
+    }
+    let ctx = cue_ctx(metadata);
+
+    // Two known entities named → ambiguous for a single-anchor walk → fall back.
+    let req = cue_request("Did Sarah meet Aurora");
+    let qp = plan(&req).expect("plan");
+    assert!(super::resolve_cue_anchor(&qp, &req, &ctx).is_none());
 }

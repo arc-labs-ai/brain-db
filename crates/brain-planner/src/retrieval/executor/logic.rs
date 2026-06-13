@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use brain_core::EntityId;
 use brain_index::{
     GraphAnchor, GraphQuery, GraphRetriever, GraphRetrieverConfig, LexicalFilters, LexicalQuery,
     LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItem, RankedItemId,
@@ -46,9 +47,7 @@ use futures_lite::future::poll_fn;
 use crate::retrieval::diversity::{mmr_reorder, tokenize, MMR_LAMBDA_LIST, MMR_WINDOW};
 use crate::retrieval::filters::{apply_filter_chain, FilterChainStats, FilterError};
 use crate::retrieval::fusion::{fuse, FusedItem};
-use crate::retrieval::planner::{
-    PlannedRetriever, PreFilter, QueryPlan, RetrieverConfig, LIST_MAX_TOP_N, MAX_TOP_N,
-};
+use crate::retrieval::planner::{PreFilter, QueryPlan, RetrieverConfig, LIST_MAX_TOP_N, MAX_TOP_N};
 use crate::retrieval::recency::apply_recency_boost;
 use crate::retrieval::rerank::{rerank_top_n, RerankCandidate, RERANK_TOP_N};
 use crate::retrieval::router::{GraphAnchorMode, QueryRequest, Retriever};
@@ -166,6 +165,14 @@ pub async fn execute(
     include_statements: bool,
     ctx: &RetrievalExecutorContext,
 ) -> Result<QueryResult, ExecutionError> {
+    // Cue→anchor: when the router left a blind memory-from-semantic graph
+    // lane and the query names exactly one known entity, upgrade that
+    // lane to an entity-anchored walk seeded from the resolved subject.
+    // Returns a rewritten plan only when resolution succeeds; otherwise
+    // the original plan stands.
+    let rewritten = resolve_cue_anchor(plan, request, ctx);
+    let plan = rewritten.as_ref().unwrap_or(plan);
+
     let result = execute_once(plan, request, include_statements, ctx).await?;
 
     let ceiling = if plan.routing.list_intent {
@@ -202,6 +209,71 @@ pub async fn execute(
     }
 
     Ok(result)
+}
+
+/// Try to upgrade a blind memory-from-semantic graph lane to an
+/// entity-anchored walk by resolving the query's named subject.
+///
+/// Fires only when (a) the caller gave no explicit `entity_anchor`,
+/// (b) the plan has a `MemoryFromSemantic` graph lane to upgrade, and
+/// (c) the query text names **exactly one** entity that resolves by
+/// exact canonical name. Two distinct named entities, an unresolvable
+/// cue, or any resolution error all fall back to the original plan — a
+/// noisy guess is worse than the existing semantic-seeded walk, so the
+/// bar to switch is unambiguous single-subject resolution. Returns the
+/// rewritten plan, or `None` to keep the original.
+fn resolve_cue_anchor(
+    plan: &QueryPlan,
+    request: &QueryRequest,
+    ctx: &RetrievalExecutorContext,
+) -> Option<QueryPlan> {
+    if request.entity_anchor.is_some() {
+        return None;
+    }
+    let text = request.text.as_deref()?;
+    let has_blind_graph = plan.retrievers.iter().any(|r| {
+        matches!(
+            &r.config,
+            RetrieverConfig::Graph {
+                anchor_mode: GraphAnchorMode::MemoryFromSemantic,
+                ..
+            }
+        )
+    });
+    if !has_blind_graph {
+        return None;
+    }
+
+    let cues = crate::retrieval::router::entity_cue_candidates(text);
+    if cues.is_empty() {
+        return None;
+    }
+    let rtxn = ctx.metadata.read_txn().ok()?;
+    let mut resolved: Option<EntityId> = None;
+    for cue in &cues {
+        let ids = brain_metadata::entity_resolve_canonical_all_types(&rtxn, cue).ok()?;
+        for id in ids {
+            match resolved {
+                None => resolved = Some(id),
+                Some(prev) if prev == id => {}
+                // A second distinct entity — the query names more than
+                // one subject. A single-anchor walk can't honour both,
+                // so fall back rather than pick arbitrarily.
+                Some(_) => return None,
+            }
+        }
+    }
+    let eid = resolved?;
+
+    let mut p = plan.clone();
+    for r in &mut p.retrievers {
+        if let RetrieverConfig::Graph { anchor_mode, .. } = &mut r.config {
+            if matches!(anchor_mode, GraphAnchorMode::MemoryFromSemantic) {
+                *anchor_mode = GraphAnchorMode::MemoryFromEntityCue(eid);
+            }
+        }
+    }
+    Some(p)
 }
 
 /// Run a plan end-to-end. Returns the fused-then-filtered
@@ -1070,6 +1142,40 @@ fn invoke_graph(
                 item.rank = (i as u32) + 1;
             }
             Ok(merged)
+        }
+        GraphAnchorMode::MemoryFromEntityCue(entity_id) => {
+            // The executor resolved the query's named subject to this
+            // entity. Walk one hop in both directions with no relation
+            // filter so the `Mentions` edges (Memory → Entity) traverse
+            // in reverse — the neighbours are exactly the memories that
+            // name the subject. Depth stays at 1: the direct mentions
+            // are the answer to "tell me about X"; deeper hops pull in
+            // query-independent neighbours that flood fusion (the same
+            // noise that keeps the memory-from-semantic walk shallow).
+            let query = GraphQuery::Star {
+                anchor: GraphAnchor::Entity(*entity_id),
+                depth: 1,
+                direction: brain_index::Direction::Both,
+                relation_types: None,
+                include_statements: false,
+            };
+            let mut items = handle
+                .retrieve(&query, &config)
+                .map_err(|e| RetrieverInvocationError::Failure(e.to_string()))?;
+            // Entity / relation nodes reached during the walk are not
+            // recall results — keep only the mentioning memories, same
+            // as the memory-from-semantic lane.
+            items.retain(|item| matches!(item.id, RankedItemId::Memory(_)));
+            items.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            items.truncate(planned.top_n);
+            for (i, item) in items.iter_mut().enumerate() {
+                item.rank = (i as u32) + 1;
+            }
+            Ok(items)
         }
     }
 }

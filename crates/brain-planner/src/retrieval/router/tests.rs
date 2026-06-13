@@ -4,8 +4,8 @@ use brain_core::EntityId;
 use brain_core::StatementKind;
 
 use super::{
-    classify_query, route, GraphAnchorMode, OverrideKind, QueryClass, QueryRequest,
-    RetrievalProfile, Retriever, RetrieverSelection, TimeRange, MAX_RETRIEVERS,
+    classify_query, entity_cue_candidates, route, GraphAnchorMode, OverrideKind, QueryClass,
+    QueryRequest, RetrievalProfile, Retriever, RetrieverSelection, TimeRange, MAX_RETRIEVERS,
 };
 
 fn req_with_text(text: &str) -> QueryRequest {
@@ -464,4 +464,16 @@ fn entity_anchor_without_text_selects_graph_and_semantic_only() {
         Some(GraphAnchorMode::Entity),
         "anchor present → entity graph mode (no semantic anchoring)",
     );
+}
+
+#[test]
+fn entity_cue_candidates_extracts_title_case_spans() {
+    // Multi-word spans also emit their individual words, so a name that
+    // merged with a leading capital still resolves on its own.
+    assert_eq!(
+        entity_cue_candidates("What did Sarah say about the Phoenix Project?"),
+        vec!["What", "Sarah", "Phoenix Project", "Phoenix", "Project"],
+    );
+    // Lowercase queries name no Title-Case cue → nothing to resolve.
+    assert!(entity_cue_candidates("what did she say").is_empty());
 }
