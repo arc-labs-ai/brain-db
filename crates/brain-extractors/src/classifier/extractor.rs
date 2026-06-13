@@ -153,6 +153,14 @@ impl ClassifierExtractor {
                 Some(qname) => span.label = qname.clone(),
                 None => continue,
             }
+            // Drop non-referential spans the model tags as entities:
+            // pronouns ("I", "you", "they"), bare determiners, and
+            // single-character noise. These resolve to junk entities and
+            // pollute the entity graph (and its Mentions edges) without
+            // naming a real referent.
+            if is_non_referential_span(&span.text) {
+                continue;
+            }
             if let Some(item) = self.project(span) {
                 match item {
                     // GLiNER frequently tags conjoined names ("Alice and
@@ -195,6 +203,66 @@ impl ClassifierExtractor {
             _ => None,
         }
     }
+}
+
+/// True for spans that name no real referent and must not become
+/// entities: personal/possessive pronouns, bare determiners, and
+/// single-character or non-alphabetic noise. Conservative — it only
+/// rejects an exact closed-class match (case-insensitive) or a span with
+/// no alphabetic character, so real names like "Ian" or "Al" pass.
+fn is_non_referential_span(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if !t.chars().any(|c| c.is_alphabetic()) {
+        return true;
+    }
+    const STOP: &[&str] = &[
+        "i",
+        "you",
+        "we",
+        "they",
+        "he",
+        "she",
+        "it",
+        "me",
+        "us",
+        "him",
+        "her",
+        "them",
+        "myself",
+        "yourself",
+        "himself",
+        "herself",
+        "itself",
+        "ourselves",
+        "yourselves",
+        "themselves",
+        "my",
+        "your",
+        "our",
+        "their",
+        "his",
+        "its",
+        "this",
+        "that",
+        "these",
+        "those",
+        "the",
+        "a",
+        "an",
+        "who",
+        "whom",
+        "whose",
+        "someone",
+        "something",
+        "anyone",
+        "everyone",
+        "nobody",
+    ];
+    let lower = t.to_lowercase();
+    STOP.contains(&lower.as_str())
 }
 
 /// Split a Person mention whose text is a conjunction of names
@@ -413,7 +481,7 @@ impl Extractor for ClassifierExtractor {
 
 #[cfg(test)]
 mod conjunction_tests {
-    use super::split_person_conjunction;
+    use super::{is_non_referential_span, split_person_conjunction};
     use crate::framework::item::EntityMention;
 
     fn mention(qname: &str, text: &str) -> EntityMention {
@@ -430,6 +498,26 @@ mod conjunction_tests {
 
     fn texts(ms: Vec<EntityMention>) -> Vec<String> {
         ms.into_iter().map(|m| m.text).collect()
+    }
+
+    #[test]
+    fn non_referential_spans_are_rejected() {
+        // Pronouns / determiners / non-alpha noise → dropped.
+        for junk in [
+            "I", "you", "We", "they", "It", "the", "this", "Their", "someone", "  ", "123", "-",
+        ] {
+            assert!(
+                is_non_referential_span(junk),
+                "{junk:?} should be rejected as non-referential"
+            );
+        }
+        // Real names — including short ones — pass.
+        for name in ["Alice", "Ian", "Al", "Phoenix Project", "Caroline"] {
+            assert!(
+                !is_non_referential_span(name),
+                "{name:?} should pass as a real referent"
+            );
+        }
     }
 
     #[test]

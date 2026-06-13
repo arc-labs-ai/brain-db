@@ -1365,37 +1365,26 @@ async fn apply_outcome(
                         }
                     }
 
-                    // Resolve the LLM's proposed predicate against the
-                    // schema. Only declared predicates pass; an
-                    // undeclared qname is dropped silently with a
-                    // metric. The prior `brain:fact` wildcard-sink
-                    // path collapsed semantically distinct relations
-                    // (mentors, owns, located_in, …) onto a single
-                    // `(subject, brain:fact)` key, which then tripped
-                    // the supersession rule for every new emission —
-                    // producing a steady stream of "Fact contradicts
-                    // active facts" WARNs that were entirely an
-                    // artifact of the sink, not of real conflicts.
-                    if !pred_ok {
-                        worker.metrics.inc_schema_filtered(&sm.predicate_qname);
-                        trace!(
-                            memory_id = ?memory_id,
-                            predicate = %sm.predicate_qname,
-                            "predicate outside active schema; dropping",
-                        );
-                        continue;
-                    }
+                    // Open-vocabulary persistence: an undeclared predicate is
+                    // NOT dropped. Extracted relational facts ("X researches Y")
+                    // are the whole point of write-time distillation — dropping
+                    // them strands the fact and leaves read-time with nothing to
+                    // match. We intern the coined predicate and keep its real
+                    // qname (better for retrieval than collapsing every coined
+                    // verb onto one sink key), and force `is_stateful = false`
+                    // for undeclared predicates so distinct coined predicates
+                    // never collide under supersession — the exact failure that
+                    // retired the old `brain:fact` wildcard sink (which flattened
+                    // mentors/owns/located_in onto `(subject, brain:fact)` and
+                    // tripped the supersession rule on every emission).
                     let pid = predicate_intern_or_get(&wtxn, ns, name, 0, now)
                         .map_err(|e| ApplyError::Predicate(format!("{e}")))?;
                     let used_qname = (ns.to_string(), name.to_string());
-
-                    // Schema-registered statefulness wins for declared
-                    // predicates — it's what the operator committed to
-                    // when uploading the schema and what supersession
-                    // logic keys off. Fall back to the extractor's hint
-                    // when the registry row is silent.
-                    let is_stateful =
-                        predicate_is_stateful_in_write_txn(&wtxn, pid)?.unwrap_or(sm.is_stateful);
+                    let is_stateful = if pred_ok {
+                        predicate_is_stateful_in_write_txn(&wtxn, pid)?.unwrap_or(sm.is_stateful)
+                    } else {
+                        false
+                    };
 
                     let kind = statement_kind_from_byte(sm.kind);
                     let payload = StatementCreatePayload {
@@ -1488,19 +1477,11 @@ async fn apply_outcome(
                             continue;
                         }
 
-                        // Neither a relation_type nor a predicate → genuinely
-                        // unknown. Relation graph semantics require a typed
-                        // relation row, and brain:fact promotion doesn't apply
-                        // to two-endpoint relations, so drop. Warn so an
-                        // operator notices.
-                        worker.metrics.inc_schema_filtered(&rm.relation_type_qname);
-                        warn!(
-                            target: "brain_workers::extractor",
-                            memory_id = ?memory_id,
-                            relation_type = %rm.relation_type_qname,
-                            "relation_type outside active schema; dropping",
-                        );
-                        continue;
+                        // Neither a declared relation_type nor a declared
+                        // predicate → an extractor-coined relation. Open-
+                        // vocabulary persistence: intern the coined relation_type
+                        // and keep the typed edge rather than dropping the fact.
+                        // Falls through to the relation_create below.
                     }
                     let rt = relation_type_intern_or_get(&wtxn, ns, name, 0, now)
                         .map_err(|e| ApplyError::RelationType(format!("{e}")))?;
