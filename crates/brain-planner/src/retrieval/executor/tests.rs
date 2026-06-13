@@ -92,6 +92,57 @@ fn ranked_memory(slot: u64, rank: u32, score: f32) -> RankedItem {
     }
 }
 
+/// Semantic mock whose result depth tracks the config — it returns one
+/// ranked hit per requested `top_k` slot (slots `1..=top_k`) and counts
+/// invocations. Lets the dynamic-k tests observe both the deeper page a
+/// re-query produces and whether a second pass ran at all.
+#[derive(Clone)]
+struct CountingSemantic {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SemanticRetriever for CountingSemantic {
+    fn retrieve(
+        &self,
+        _query: &SemanticQuery,
+        _scope: SemanticScope,
+        config: &SemanticRetrieverConfig,
+    ) -> Result<Vec<RankedItem>, SemanticError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let items = (1..=config.top_k as u64)
+            .map(|slot| ranked_memory(slot, slot as u32, 0.9))
+            .collect();
+        Ok(items)
+    }
+}
+
+/// Seed only the given slots as live ACTIVE rows. Unlike
+/// [`seed_active_memories`] (a contiguous range) this leaves gaps so the
+/// always-on tombstone filter thins a retriever's page predictably.
+fn seed_active_slots(metadata: &mut MetadataDb, slots: impl IntoIterator<Item = u64>) {
+    let wtxn = metadata.write_txn().expect("wtxn");
+    {
+        let mut t = wtxn.open_table(MEMORIES_TABLE).expect("open");
+        for slot in slots {
+            let id = MemoryId::pack(0, slot, 0);
+            let row = MemoryMetadata::new_active(
+                id,
+                AgentId::new(),
+                ContextId::from(0),
+                id.slot(),
+                id.version(),
+                MemoryKind::Semantic,
+                [0u8; 16],
+                0.5,
+                0,
+                0,
+            );
+            t.insert(&id.raw().to_be_bytes(), &row).expect("insert");
+        }
+    }
+    wtxn.commit().expect("commit");
+}
+
 /// Seed `slots` as live (ACTIVE) memory rows so the executor's
 /// always-on tombstone filter keeps mock retriever hits — it drops any
 /// candidate whose row is absent (`memory_active` → None → drop). Ids
@@ -520,4 +571,117 @@ fn lexical_terms_all_stopwords_falls_back_to_raw_split() {
     // set; the raw whitespace split is preserved as a fallback.
     let terms = super::lexical_content_terms("What did you do?");
     assert_eq!(terms, vec!["What", "did", "you", "do?"]);
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic-k runtime deepening.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dynamic_k_deepens_when_filters_thin_the_pool() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::retrieval::planner::RetrieverConfig;
+
+    // Only every 10th slot is a live row, so the tombstone filter keeps
+    // ~top_n/10 of a returned page. A 100-deep first pass yields 10
+    // survivors (< limit 15); the deeper 200-pass yields 20 (truncated
+    // to 15). Without deepening the caller would get only 10.
+    let dir = TempDir::new().expect("tempdir");
+    let mut metadata = MetadataDb::open(dir.path().join("metadata.redb")).expect("open");
+    seed_active_slots(&mut metadata, (10..=400).step_by(10).map(|s| s as u64));
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let ctx = RetrievalExecutorContext {
+        semantic: Arc::new(CountingSemantic {
+            calls: calls.clone(),
+        }),
+        lexical: Arc::new(MockLexical {
+            response: Arc::new(StdMutex::new(Ok(Vec::new()))),
+        }),
+        graph: Arc::new(MockGraph {
+            response: Arc::new(StdMutex::new(Ok(Vec::new()))),
+        }),
+        metadata: Arc::new(metadata),
+        cross_encoder: None,
+    };
+
+    let req = QueryRequest {
+        text: Some("budget".into()),
+        retrievers: RetrieverSelection::Explicit(vec![Retriever::Semantic]),
+        limit: 15,
+        ..Default::default()
+    };
+    let mut qp = plan(&req).expect("plan");
+    // Pin the first pass below the ceiling so there is room to deepen,
+    // independent of how the router classified the query.
+    for r in &mut qp.retrievers {
+        r.top_n = 100;
+        if let RetrieverConfig::Semantic { ef_search, .. } = &mut r.config {
+            *ef_search = 100;
+        }
+    }
+
+    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "under-target + saturated first pass should trigger one deeper re-query"
+    );
+    assert_eq!(
+        result.items.len(),
+        15,
+        "the deeper pass surfaces enough survivors to fill the limit"
+    );
+}
+
+#[test]
+fn dynamic_k_no_deepen_when_first_pass_fills_limit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::retrieval::planner::RetrieverConfig;
+
+    // All returned slots are live (default 0..256 seed), so a 100-deep
+    // first pass already returns far more survivors than the limit. No
+    // saturation-driven deepening: the retriever runs exactly once.
+    let (_dir, ctx) = make_ctx(
+        Some(MockSemantic {
+            // placeholder; replaced below with the counting mock via ctx
+            response: Arc::new(StdMutex::new(Ok(Vec::new()))),
+            delay: None,
+        }),
+        None,
+        None,
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let ctx = RetrievalExecutorContext {
+        semantic: Arc::new(CountingSemantic {
+            calls: calls.clone(),
+        }),
+        ..ctx
+    };
+
+    let req = QueryRequest {
+        text: Some("budget".into()),
+        retrievers: RetrieverSelection::Explicit(vec![Retriever::Semantic]),
+        limit: 10,
+        ..Default::default()
+    };
+    let mut qp = plan(&req).expect("plan");
+    for r in &mut qp.retrievers {
+        r.top_n = 100;
+        if let RetrieverConfig::Semantic { ef_search, .. } = &mut r.config {
+            *ef_search = 100;
+        }
+    }
+
+    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a first pass that already fills the limit must not re-query"
+    );
+    assert_eq!(result.items.len(), 10);
 }

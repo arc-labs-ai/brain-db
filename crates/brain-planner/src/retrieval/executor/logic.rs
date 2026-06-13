@@ -46,7 +46,9 @@ use futures_lite::future::poll_fn;
 use crate::retrieval::diversity::{mmr_reorder, tokenize, MMR_LAMBDA_LIST, MMR_WINDOW};
 use crate::retrieval::filters::{apply_filter_chain, FilterChainStats, FilterError};
 use crate::retrieval::fusion::{fuse, FusedItem};
-use crate::retrieval::planner::{PreFilter, QueryPlan, RetrieverConfig};
+use crate::retrieval::planner::{
+    PlannedRetriever, PreFilter, QueryPlan, RetrieverConfig, LIST_MAX_TOP_N, MAX_TOP_N,
+};
 use crate::retrieval::recency::apply_recency_boost;
 use crate::retrieval::rerank::{rerank_top_n, RerankCandidate, RERANK_TOP_N};
 use crate::retrieval::router::{GraphAnchorMode, QueryRequest, Retriever};
@@ -146,6 +148,62 @@ pub enum ExecutionError {
 // Entry point.
 // ---------------------------------------------------------------------------
 
+/// Run a plan, with one optional dynamic-k deepening pass.
+///
+/// The first pass runs at the planner's per-class `top_n`. If its
+/// post-filter survivor pool comes back below the caller's `limit`
+/// **and** at least one retriever returned a full page (its candidate
+/// cap was the binding constraint, so deeper retrieval can surface
+/// more) **and** the initial depth was below the per-class ceiling, the
+/// executor re-runs once at the ceiling and keeps whichever pass
+/// yielded more results. Recall-additive by construction: it fires only
+/// when the shallow pass would otherwise under-fill the request, so it
+/// can never trade away a hit the shallow pass already found. The cost
+/// is one extra fan-out, bounded to the under-recall case.
+pub async fn execute(
+    plan: &QueryPlan,
+    request: &QueryRequest,
+    include_statements: bool,
+    ctx: &RetrievalExecutorContext,
+) -> Result<QueryResult, ExecutionError> {
+    let result = execute_once(plan, request, include_statements, ctx).await?;
+
+    let ceiling = if plan.routing.list_intent {
+        LIST_MAX_TOP_N
+    } else {
+        MAX_TOP_N
+    };
+    // A retriever that returned at least its `top_n` page hit the cap —
+    // deeper retrieval may yield more. One that returned fewer has
+    // exhausted what the index holds for this query, so deepening it is
+    // wasted work. `retriever_total_results` is built in plan order.
+    let saturated = plan
+        .retrievers
+        .iter()
+        .zip(result.metadata.retriever_total_results.iter())
+        .any(|(r, (_retriever, total))| r.top_n > 0 && *total >= r.top_n);
+    let under_target = plan.limit > 0 && (result.items.len() as u32) < plan.limit;
+    let room_to_deepen = plan.retrievers.iter().any(|r| r.top_n < ceiling);
+
+    if under_target && saturated && room_to_deepen {
+        let mut deepened = plan.clone();
+        for r in &mut deepened.retrievers {
+            r.top_n = ceiling;
+            // Raise HNSW exploration to match the deeper page — a
+            // semantic top_k above ef_search would silently under-return.
+            if let RetrieverConfig::Semantic { ef_search, .. } = &mut r.config {
+                *ef_search = (*ef_search).max(ceiling);
+            }
+        }
+        let retry = execute_once(&deepened, request, include_statements, ctx).await?;
+        if retry.items.len() > result.items.len() {
+            return Ok(retry);
+        }
+    }
+
+    Ok(result)
+}
+
 /// Run a plan end-to-end. Returns the fused-then-filtered
 /// result plus metadata.
 ///
@@ -156,7 +214,7 @@ pub enum ExecutionError {
 /// top-K memory ids into the graph walk. We detect this
 /// up-front, run semantic eagerly, stash its output, and let
 /// the fan-out reuse it instead of re-invoking.
-pub async fn execute(
+async fn execute_once(
     plan: &QueryPlan,
     request: &QueryRequest,
     include_statements: bool,
