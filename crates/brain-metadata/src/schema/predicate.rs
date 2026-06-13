@@ -200,6 +200,54 @@ pub fn predicate_list(
     Ok(out)
 }
 
+/// Render the active predicates as a prompt block for the LLM extractor's
+/// `{DECLARED_PREDICATES}` placeholder. Each predicate becomes one bullet
+/// line of the form `qname (Kind, single|set): description`. This makes the
+/// extractor's closed vocabulary track the **active schema** at runtime —
+/// the seeded system core together with any predicates a user declared via
+/// `SCHEMA_UPLOAD` — so a user's declared predicate appears here
+/// automatically with no system-schema edits.
+///
+/// Predicates whose name starts with `behavior_` are excluded; they are
+/// procedural-memory sinks materialized by `MATERIALIZE_PROCEDURAL`, not
+/// extraction targets, and listing them only invites mis-mapping.
+pub fn render_declared_predicates_block(
+    rtxn: &ReadTransaction,
+) -> Result<String, PredicateOpError> {
+    let mut preds = predicate_list(rtxn, None)?;
+    // Stable order: namespace then name, so the prompt block (and its
+    // prompt-cache key) is deterministic across cycles.
+    preds.sort_by(|a, b| (a.namespace.as_str(), a.name.as_str()).cmp(&(&b.namespace, &b.name)));
+    let mut out = String::new();
+    for p in &preds {
+        if p.name.starts_with("behavior_") {
+            continue;
+        }
+        let kind = match p.kind_constraint {
+            Some(StatementKind::Fact) => "Fact",
+            Some(StatementKind::Preference) => "Preference",
+            Some(StatementKind::Event) => "Event",
+            None => "any-kind",
+        };
+        let card = if p.is_stateful { "single" } else { "set" };
+        out.push_str("- ");
+        out.push_str(&p.namespace);
+        out.push(':');
+        out.push_str(&p.name);
+        out.push_str(" (");
+        out.push_str(kind);
+        out.push_str(", ");
+        out.push_str(card);
+        out.push(')');
+        if !p.description.is_empty() {
+            out.push_str(": ");
+            out.push_str(&p.description);
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Write path.
 // ---------------------------------------------------------------------------
