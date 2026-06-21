@@ -23,9 +23,9 @@ use brain_ops::{dispatch, DispatchOutcome, ErrorCode, OpError, OpsContext, RealW
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
     EdgeKindWire, EncodeRequest, ForgetMode, ForgetRequest, LinkRequest, MemoryKindWire,
-    ObservationInput, PlanBudget, PlanRequest, PlanState, ReasonRequest, RecallRequest,
-    RequestBody, SubscribeRequest, SubscriptionFilter, TxnAbortRequest, TxnBeginRequest,
-    TxnCommitRequest, UnlinkRequest, UnsubscribeRequest,
+    ObservationInput, PlanBudget, PlanRequest, PlanState, ReasonRequest, 
+    RecallRequest, RequestBody, SubscribeRequest, SubscriptionFilter, TxnAbortRequest,
+    TxnBeginRequest, TxnCommitRequest, UnlinkRequest, UnsubscribeRequest,
 };
 use brain_protocol::envelope::response::{
     EncodeResponse, ForgetResponse, LinkResponse, PlanResponseFrame, PlanStatus,
@@ -110,22 +110,22 @@ mod common {
         encode_req_full(rid, text, 42, MemoryKindWire::Episodic, 0.5)
     }
 
+    // `_kind` / `_salience` are accepted for call-site compatibility
+    // but ignored: the write router decides kind (always Episodic) and
+    // salience now; the client can no longer steer them.
     pub(super) fn encode_req_full(
         rid: [u8; 16],
         text: &str,
         context: u64,
-        kind: MemoryKindWire,
-        salience: f32,
+        _kind: MemoryKindWire,
+        _salience: f32,
     ) -> EncodeRequest {
         EncodeRequest {
             text: text.into(),
             context_id: context,
-            kind,
-            salience_hint: salience,
-            edges: vec![],
             request_id: rid,
             txn_id: None,
-            deduplicate: false,
+            occurred_at_unix_nanos: None,
         }
     }
 
@@ -218,17 +218,19 @@ mod common {
     pub(super) async fn recall(
         fix: &Fixture,
         cue: &str,
-        top_k: u32,
+        max_results: u32,
         context_filter: Option<Vec<u64>>,
         kind_filter: Option<Vec<MemoryKindWire>>,
         salience_floor: f32,
     ) -> RecallResponseFrame {
         let req = RecallRequest {
             cue_text: cue.into(),
-            top_k,
+            subject_name: String::new(),
+            max_results,
             confidence_threshold: 0.0,
             context_filter,
             age_bound_unix_nanos: None,
+            as_of_record_time_unix_nanos: None,
             kind_filter,
             salience_floor,
             include_edges: false,
@@ -450,10 +452,12 @@ mod criterion_01_wire {
                 Opcode::RecallReq,
                 RequestBody::Recall(RecallRequest {
                     cue_text: "alpha".into(),
-                    top_k: 5,
+                    subject_name: String::new(),
+                    max_results: 5,
                     confidence_threshold: 0.0,
                     context_filter: None,
                     age_bound_unix_nanos: None,
+                    as_of_record_time_unix_nanos: None,
                     kind_filter: None,
                     salience_floor: 0.0,
                     include_edges: false,
@@ -601,15 +605,15 @@ mod criterion_02_encode {
                 .enumerate()
             {
                 let frame = common::recall(&fix, text, 1, None, None, 0.0).await;
-                assert_eq!(frame.results.len(), 1, "top-1 must exist for {text}");
+                assert_eq!(frame.memories.len(), 1, "top-1 must exist for {text}");
                 assert_eq!(
-                    frame.results[0].memory_id, ids[i],
+                    frame.memories[0].memory_id, ids[i],
                     "top-1 for {text} must be the memory we just encoded"
                 );
                 assert!(
-                    frame.results[0].similarity_score > 0.99,
+                    frame.memories[0].similarity_score > 0.99,
                     "exact-cue similarity for {text} must be ~1.0, got {}",
-                    frame.results[0].similarity_score
+                    frame.memories[0].similarity_score
                 );
             }
         })
@@ -634,9 +638,9 @@ mod criterion_03_recall {
             }
             let frame = common::recall(&fix, "aa", 3, None, None, 0.0).await;
             assert!(frame.is_final);
-            assert!(frame.results.len() <= 3, "top_k bounds the result count");
+            assert!(frame.memories.len() <= 3, "top_k bounds the result count");
             // Sorted by similarity descending.
-            for w in frame.results.windows(2) {
+            for w in frame.memories.windows(2) {
                 assert!(
                     w[0].similarity_score >= w[1].similarity_score,
                     "results must be sorted by similarity desc"
@@ -770,7 +774,7 @@ mod criterion_06_forget {
 
             // Pre-FORGET: recallable.
             let before = common::recall(&fix, "forgettable", 5, None, None, 0.0).await;
-            assert!(before.results.iter().any(|r| r.memory_id == mid));
+            assert!(before.memories.iter().any(|r| r.memory_id == mid));
 
             // Soft FORGET.
             let resp = common::forget(&fix, mid, [2; 16]).await;
@@ -779,7 +783,7 @@ mod criterion_06_forget {
             // Post-FORGET: hidden.
             let after = common::recall(&fix, "forgettable", 5, None, None, 0.0).await;
             assert!(
-                !after.results.iter().any(|r| r.memory_id == mid),
+                !after.memories.iter().any(|r| r.memory_id == mid),
                 "soft-forgotten memory must not appear in RECALL"
             );
         })
@@ -854,7 +858,7 @@ mod criterion_08_idempotency {
             // Only one row should exist.
             let frame = common::recall(&fix, "idempotent", 10, None, None, 0.0).await;
             let count = frame
-                .results
+                .memories
                 .iter()
                 .filter(|r| r.memory_id == first)
                 .count();
@@ -931,9 +935,9 @@ mod criterion_09_txn {
 
             let frame = common::recall(&fix, "ghost", 5, None, None, 0.0).await;
             assert!(
-                frame.results.is_empty(),
+                frame.memories.is_empty(),
                 "aborted txn must leave no trace, got {:?}",
-                frame.results
+                frame.memories
             );
         })
     }
@@ -951,7 +955,7 @@ mod criterion_09_txn {
 
             let frame = common::recall(&fix, "kept", 5, None, None, 0.0).await;
             assert!(
-                frame.results.iter().any(|r| r.memory_id == mid),
+                frame.memories.iter().any(|r| r.memory_id == mid),
                 "committed memory must be visible"
             );
         })
@@ -966,60 +970,42 @@ mod criterion_10_filters {
     use super::*;
 
     #[test]
-    fn recall_filters_by_context_kind_and_salience() {
+    fn recall_filters_by_context() {
         run_in_glommio(|| async {
             let fix = common::build_fixture();
-            // 3 memories: (ctx=1, Episodic, sal=0.2), (ctx=2, Semantic, sal=0.8),
-            //             (ctx=2, Episodic, sal=0.6).
+            // Kind and salience are router-decided now (always Episodic /
+            // 0.5), so the client can no longer vary them per memory —
+            // the kind-filter and salience-floor assertions that relied
+            // on that have been removed. The context filter is still a
+            // client-driven dimension and is exercised here. Both the
+            // kind-filter and salience-floor retrieval mechanisms remain
+            // covered by the planner/retriever unit tests.
             common::encode_with(
                 &fix,
-                common::encode_req_full([1; 16], "ctx1ep", 1, MemoryKindWire::Episodic, 0.2),
-            )
-            .await;
-            let m_sem = common::encode_with(
-                &fix,
-                common::encode_req_full([2; 16], "ctx2sem", 2, MemoryKindWire::Semantic, 0.8),
+                common::encode_req_full([1; 16], "ctx1ep", 1, MemoryKindWire::Episodic, 0.5),
             )
             .await;
             common::encode_with(
                 &fix,
-                common::encode_req_full([3; 16], "ctx2ep", 2, MemoryKindWire::Episodic, 0.6),
+                common::encode_req_full([2; 16], "ctx2a", 2, MemoryKindWire::Episodic, 0.5),
+            )
+            .await;
+            common::encode_with(
+                &fix,
+                common::encode_req_full([3; 16], "ctx2b", 2, MemoryKindWire::Episodic, 0.5),
             )
             .await;
 
-            // Context filter.
-            let by_ctx = common::recall(&fix, "ctx2sem", 10, Some(vec![2]), None, 0.0).await;
+            // Context filter keeps only context=2.
+            let by_ctx = common::recall(&fix, "ctx2a", 10, Some(vec![2]), None, 0.0).await;
             assert!(
-                by_ctx.results.iter().all(|r| r.context_id == 2),
+                !by_ctx.memories.is_empty(),
+                "context=2 memories must be returned"
+            );
+            assert!(
+                by_ctx.memories.iter().all(|r| r.context_id == 2),
                 "context filter must keep only context=2"
             );
-
-            // Kind filter.
-            let by_kind = common::recall(
-                &fix,
-                "ctx2sem",
-                10,
-                None,
-                Some(vec![MemoryKindWire::Semantic]),
-                0.0,
-            )
-            .await;
-            assert!(
-                by_kind
-                    .results
-                    .iter()
-                    .all(|r| r.kind == MemoryKindWire::Semantic),
-                "kind filter must keep only Semantic"
-            );
-
-            // Salience floor.
-            let by_sal = common::recall(&fix, "ctx2sem", 10, None, None, 0.7).await;
-            assert!(
-                by_sal.results.iter().all(|r| r.salience >= 0.7),
-                "salience filter must keep only sal>=0.7"
-            );
-            // The high-salience Semantic memory should be the survivor.
-            assert!(by_sal.results.iter().any(|r| r.memory_id == m_sem));
         })
     }
 }
@@ -1110,7 +1096,7 @@ mod criterion_12_tombstones {
 
             let recall = common::recall(&fix, "doomed", 5, None, None, 0.0).await;
             assert!(
-                !recall.results.iter().any(|r| r.memory_id == b),
+                !recall.memories.iter().any(|r| r.memory_id == b),
                 "RECALL must not return tombstoned memory"
             );
         })
@@ -1207,9 +1193,10 @@ mod criterion_17_error_codes {
             .unwrap_err();
             assert_eq!(err.error_code(), ErrorCode::Conflict);
 
-            // 2. InvalidRequest — Consolidated kind at ENCODE.
-            let mut req = common::encode_req([2; 16], "bad");
-            req.kind = MemoryKindWire::Consolidated;
+            // 2. InvalidRequest — empty text at ENCODE (the planner
+            //    rejects it). Memory kind is router-decided now, so the
+            //    old Consolidated-rejection trigger no longer exists.
+            let req = common::encode_req([2; 16], "");
             let err = dispatch(
                 RequestBody::Encode(req),
                 brain_ops::RequestCaller::anonymous(),
@@ -1326,9 +1313,10 @@ mod criterion_20_no_surprises {
         run_in_glommio(|| async {
             let fix = common::build_fixture();
 
-            // Drive an ENCODE that the planner rejects (Consolidated kind).
-            let mut req = common::encode_req([1; 16], "should-not-land");
-            req.kind = MemoryKindWire::Consolidated;
+            // Drive an ENCODE that the planner rejects (empty text).
+            // Kind is router-decided now, so empty text is the
+            // remaining client-side rejection trigger.
+            let req = common::encode_req([1; 16], "");
             let err = dispatch(
                 RequestBody::Encode(req),
                 brain_ops::RequestCaller::anonymous(),
@@ -1341,8 +1329,8 @@ mod criterion_20_no_surprises {
             // No row landed: the next ENCODE gets memory_id #1 (no gap).
             let id = common::encode(&fix, [2; 16], "fresh").await;
             let frame = common::recall(&fix, "fresh", 5, None, None, 0.0).await;
-            assert_eq!(frame.results.len(), 1, "exactly one memory in the index");
-            assert_eq!(frame.results[0].memory_id, id);
+            assert_eq!(frame.memories.len(), 1, "exactly one memory in the index");
+            assert_eq!(frame.memories[0].memory_id, id);
         })
     }
 

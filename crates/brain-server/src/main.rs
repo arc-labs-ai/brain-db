@@ -145,8 +145,10 @@ mod linux_main {
     };
     use crate::routing::RoutingTable;
     use crate::shard::{
-        spawn_shard, AutoEdgeSpawnConfig, CausalEdgeSpawnConfig, ExtractorSpawnConfig,
-        ExtractorTierSpawnConfig, RerankSpawnConfig, ShardHandle, ShardJoiner, ShardSpawnConfig,
+        spawn_shard, AmbiguityResolverSpawnConfig, AutoEdgeSpawnConfig, CausalEdgeSpawnConfig,
+        ConfidenceSweepSpawnConfig, ExtractorSpawnConfig, ExtractorTierSpawnConfig,
+        ExtractorTuningSpawnConfig, IndexSpawnConfig, LlmCacheSweepSpawnConfig, RerankSpawnConfig,
+        ShardHandle, ShardJoiner, ShardSpawnConfig, StatementReclaimSpawnConfig,
         TemporalEdgeSpawnConfig,
     };
 
@@ -468,14 +470,12 @@ mod linux_main {
             let mut spawn_cfg =
                 ShardSpawnConfig::new(cfg.storage.data_dir.clone(), dispatcher.clone());
             spawn_cfg.summarizer = summarizer.clone();
-            // Ferry the operator's `[llm]` provider keys / model
-            // overrides so the LLM extractor tier can resolve a client
-            // from config when no env var is set.
+            // Ferry the operator's `[llm]` provider key / model id so the
+            // LLM extractor tier can resolve a client from config when no
+            // env var is set.
             spawn_cfg.llm = crate::shard::LlmSpawnConfig {
-                openai_api_key: cfg.llm.openai_api_key.clone(),
-                anthropic_api_key: cfg.llm.anthropic_api_key.clone(),
-                openai_model: cfg.llm.openai_model.clone(),
-                anthropic_model: cfg.llm.anthropic_model.clone(),
+                api_key: cfg.llm.api_key.clone(),
+                model: cfg.llm.model.clone(),
             };
             // Ferry the operator's `[workers.auto_edge]`
             // overrides into the per-shard spawn config so the
@@ -572,6 +572,35 @@ mod linux_main {
                 pattern_enabled: cfg.extractors.pattern.enabled,
                 classifier_enabled: cfg.extractors.classifier.enabled,
                 llm_enabled: cfg.extractors.llm.enabled,
+            };
+            // Ferry the per-worker cadence / gate knobs that previously
+            // only had bespoke `BRAIN_*` env vars.
+            spawn_cfg.statement_reclaim = StatementReclaimSpawnConfig {
+                enabled: cfg.workers.statement_reclaim.enabled,
+                grace_seconds: cfg.workers.statement_reclaim.grace_seconds,
+                period_seconds: cfg.workers.statement_reclaim.period_seconds,
+            };
+            spawn_cfg.ambiguity_resolver = AmbiguityResolverSpawnConfig {
+                interval_secs: cfg.workers.ambiguity_resolver.interval_secs,
+            };
+            spawn_cfg.confidence_sweep = ConfidenceSweepSpawnConfig {
+                interval_secs: cfg.workers.confidence_sweep.interval_secs,
+            };
+            spawn_cfg.llm_cache_sweep = LlmCacheSweepSpawnConfig {
+                interval_secs: cfg.workers.llm_cache_sweep.interval_secs,
+            };
+            // Ferry the extractor-pipeline tuning (resolver / classifier
+            // / HyPE) that previously read bespoke `BRAIN_*` env vars.
+            spawn_cfg.extractor_tuning = ExtractorTuningSpawnConfig {
+                resolver_embed_threshold: cfg.extractors.resolver.embed_threshold,
+                classifier_model_path: cfg.extractors.classifier.model_path.clone(),
+                classifier_threshold: cfg.extractors.classifier.threshold,
+                hype_num_questions: cfg.extractors.hype.num_questions,
+            };
+            // Ferry the tantivy commit cadence.
+            spawn_cfg.index = IndexSpawnConfig {
+                tantivy_commit_n: cfg.index.tantivy_commit_n,
+                tantivy_commit_ms: cfg.index.tantivy_commit_ms,
             };
             match spawn_shard(shard_id as u16, spawn_cfg) {
                 Ok((h, j)) => {

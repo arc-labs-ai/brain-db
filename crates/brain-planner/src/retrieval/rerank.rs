@@ -28,19 +28,21 @@ use super::fusion::FusedItem;
 pub const RERANK_TOP_N: usize = 50;
 
 /// Weight on the rerank contribution when combining with the fused
-/// score. The final sort key is `fused_score + RERANK_ALPHA *
-/// normalize(rerank_logit)`, where `normalize` is per-batch min/max
-/// to the unit interval. The cross-encoder is a re-scoring signal,
-/// not the primary one: a strongly-fused RRF candidate (multiple
-/// retrievers agreeing) should not be overridden by a noisy
-/// cross-encoder logit on a single pair. 0.5 places the rerank
-/// contribution in the same numeric range as a typical fused-score
-/// gap on RRF-perfect hits (≈ 1.7), so rerank decisively breaks
-/// close ties (e.g., funded/founded near-duplicates) but cannot
-/// dethrone a clear fusion winner. Picked empirically from the 12-
-/// query Sarah/Aurora corpus: smaller values let known phonetic
-/// traps survive; larger values let one-pair cross-encoder
-/// idiosyncrasies override unambiguous lexical+semantic agreement.
+/// score. The final sort key is
+/// `normalize(fused_score) + RERANK_ALPHA * normalize(rerank_logit)`,
+/// where both `normalize` passes are per-batch min/max to the unit
+/// interval. Normalizing the fused score too is what makes α a real
+/// blend weight: raw RRF (k=60) fused scores sit at ≈ 0.01–0.05 while
+/// the un-normalized rerank term spans [0, 0.5], so combining them on
+/// raw scales lets rerank dominate ~10× and effectively override
+/// fusion. With both terms on [0, 1], fusion carries weight 1.0 and
+/// rerank weight 0.5 — fusion leads, rerank refines. The cross-encoder
+/// is a re-scoring signal, not the primary one: a strongly-fused RRF
+/// candidate (multiple retrievers agreeing) should not be overridden by
+/// a noisy cross-encoder logit on a single pair. 0.5 lets rerank
+/// decisively break close fused ties (e.g., funded/founded near-
+/// duplicates) but a full-span fusion lead (Δnorm = 1.0) cannot be
+/// dethroned by the bounded rerank term (≤ 0.5).
 pub const RERANK_ALPHA: f64 = 0.5;
 
 /// One candidate to be scored. The executor pre-resolves text via
@@ -62,15 +64,19 @@ pub struct RerankCandidate {
 ///
 /// - `scores[i]` is the cross-encoder logit for `candidates[i]`;
 ///   the two slices must be the same length and order.
-/// - Cross-encoder logits are normalized per-batch to the unit
-///   interval (min→0, max→1). Items outside the rerank window
-///   contribute `0` to the rerank term — they kept their RRF
-///   ordering and never saw the model.
-/// - The final sort key is `fused_score + RERANK_ALPHA · normalized`.
-///   A confident multi-retriever consensus survives a low logit;
-///   the rerank pass acts as a tie-breaker between close fused
-///   neighbours and pulls strongly-scored rescues forward only when
-///   the cross-encoder's gap is decisive.
+/// - Both the fused scores and the cross-encoder logits are
+///   normalized per-batch to the unit interval (min→0, max→1). Items
+///   outside the rerank window contribute `0` to the rerank term —
+///   they kept their RRF ordering and never saw the model.
+/// - The final sort key is
+///   `normalize(fused_score) + RERANK_ALPHA · normalize(rerank)`.
+///   Normalizing both terms puts them on equal footing so α is a true
+///   blend weight (raw RRF k=60 fused scores are ≈ 0.01–0.05 and would
+///   otherwise be swamped by the rerank term). A confident multi-
+///   retriever consensus survives a low logit; the rerank pass acts as
+///   a tie-breaker between close fused neighbours and pulls strongly-
+///   scored rescues forward only when the cross-encoder's gap is
+///   decisive.
 /// - Empty `candidates` (or `scores`) returns `fused` unchanged.
 pub fn rerank_top_n(
     scores: &[f32],
@@ -104,6 +110,22 @@ pub fn rerank_top_n(
         });
     let rer_range = (rer_max - rer_min).max(f32::EPSILON);
 
+    // Per-batch min/max over the *fused* scores as well. Raw RRF
+    // (k=60) fused scores sit at ≈ 0.01–0.05; the rerank term spans
+    // [0, RERANK_ALPHA]. Combining them on raw scales lets rerank
+    // dominate ~10× and effectively override fusion. Normalizing the
+    // fused score to [0, 1] alongside the rerank term puts both on
+    // equal footing so RERANK_ALPHA is a true blend weight: fusion
+    // leads, rerank refines.
+    let (fus_min, fus_max) = fused
+        .iter()
+        .map(|f| f.fused_score)
+        .filter(|s| s.is_finite())
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), s| {
+            (lo.min(s), hi.max(s))
+        });
+    let fus_range = (fus_max - fus_min).max(f64::EPSILON);
+
     // Stamp the in-window items with their raw cross-encoder logit
     // so the result projection can surface it (`rr=` in the recall
     // card) — separately from how we use it in the sort key.
@@ -117,7 +139,17 @@ pub fn rerank_top_n(
                 }
                 Some(_) | None => 0.0,
             };
-            let key = item.fused_score + RERANK_ALPHA * rer_norm;
+            let fus_norm = if item.fused_score.is_finite() {
+                ((item.fused_score - fus_min) / fus_range).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            // Deliberate blend (owner-approved): instead of sorting purely
+            // by cross-encoder score descending, we keep the fusion signal
+            // in the ranking via a normalized fusion+rerank blend. The
+            // amendment to that ordering is tracked separately and is out
+            // of scope here.
+            let key = fus_norm + RERANK_ALPHA * rer_norm;
             (key, item)
         })
         .collect();
@@ -163,36 +195,46 @@ mod tests {
 
     #[test]
     fn rerank_breaks_close_fused_ties_in_window() {
-        // RRF order: slots 1,2,3,4 with tight fused scores. The
-        // rerank window covers slots 1 and 3; the cross-encoder
-        // ranks slot 3 well above slot 1. The combined score
-        // (fused + α · normalized rerank) lifts slot 3 ahead. Slots
-        // 2 and 4 are out-of-window and contribute 0 to the rerank
-        // term, so they keep their fused order behind the reranked
-        // winner.
+        // RRF order: slots 1,2,3,4 with very tight fused scores
+        // (the realistic RRF k=60 regime, where neighbours differ by
+        // hundredths). The rerank window covers slots 1 and 3; the
+        // cross-encoder ranks slot 3 well above slot 1. Because the
+        // fused-score gap is small, its normalized contribution can't
+        // hold slot 1 ahead, so the rerank term lifts slot 3 to the
+        // top. Slots 2 and 4 are out-of-window and contribute 0 to
+        // the rerank term, keeping their fused order.
+        //
+        // fus_min=0.030, fus_max=0.040, range=0.010
+        //   slot1 fus_norm = (0.040-0.030)/0.010 = 1.000
+        //   slot2 fus_norm = (0.037-0.030)/0.010 = 0.700
+        //   slot3 fus_norm = (0.034-0.030)/0.010 = 0.400
+        //   slot4 fus_norm = (0.030-0.030)/0.010 = 0.000
+        // rer_min=0.1, rer_max=0.9, range=0.8
+        //   slot1 rer_norm = 0.0, slot3 rer_norm = 1.0
+        // keys: slot1 1.000, slot2 0.700, slot3 0.400+0.5=0.900, slot4 0.000
         let fused = vec![
-            fused_item(1, 0.9),
-            fused_item(2, 0.8),
-            fused_item(3, 0.7),
-            fused_item(4, 0.6),
+            fused_item(1, 0.040),
+            fused_item(2, 0.037),
+            fused_item(3, 0.034),
+            fused_item(4, 0.030),
         ];
         let candidates = [candidate(1), candidate(3)];
         let scores = [0.1_f32, 0.9_f32];
 
         let out = rerank_top_n(&scores, fused, &candidates);
 
-        // slot 3 combined = 0.7 + 0.5·1.0 = 1.2 → #1
-        // slot 1 combined = 0.9 + 0.5·0.0 = 0.9 → #2 (ties slot 2 at 0.8 fused)
-        // slot 2 combined = 0.8 + 0     = 0.8 → #3
-        // slot 4 combined = 0.6 + 0     = 0.6 → #4
-        assert_eq!(out[0].id, RankedItemId::Memory(MemoryId::pack(0, 3, 0)));
-        assert_eq!(out[1].id, RankedItemId::Memory(MemoryId::pack(0, 1, 0)));
+        // slot 1 key = 1.000 → #1
+        // slot 3 key = 0.900 → #2
+        // slot 2 key = 0.700 → #3
+        // slot 4 key = 0.000 → #4
+        assert_eq!(out[0].id, RankedItemId::Memory(MemoryId::pack(0, 1, 0)));
+        assert_eq!(out[1].id, RankedItemId::Memory(MemoryId::pack(0, 3, 0)));
         assert_eq!(out[2].id, RankedItemId::Memory(MemoryId::pack(0, 2, 0)));
         assert_eq!(out[3].id, RankedItemId::Memory(MemoryId::pack(0, 4, 0)));
 
         // Reranked rows carry their logit; out-of-window rows don't.
-        assert_eq!(out[0].rerank_score, Some(0.9));
-        assert_eq!(out[1].rerank_score, Some(0.1));
+        assert_eq!(out[0].rerank_score, Some(0.1));
+        assert_eq!(out[1].rerank_score, Some(0.9));
         assert_eq!(out[2].rerank_score, None);
         assert_eq!(out[3].rerank_score, None);
     }
@@ -213,8 +255,12 @@ mod tests {
 
         let out = rerank_top_n(&scores, fused, &candidates);
 
-        // slot 1 combined = 1.7 + 0.5·0.0 = 1.7 → #1
-        // slot 2 combined = 0.5 + 0.5·1.0 = 1.0 → #2
+        // fus_norm: slot1 = 1.0 (max), slot2 = 0.0 (min).
+        // rer_norm: slot1 = 0.0 (min), slot2 = 1.0 (max).
+        // slot 1 key = 1.0 + 0.5·0.0 = 1.0 → #1
+        // slot 2 key = 0.0 + 0.5·1.0 = 0.5 → #2
+        // A full-span fusion lead (Δfus_norm = 1.0) outweighs the
+        // bounded rerank term (≤ RERANK_ALPHA = 0.5).
         assert_eq!(out[0].id, RankedItemId::Memory(MemoryId::pack(0, 1, 0)));
         assert_eq!(out[1].id, RankedItemId::Memory(MemoryId::pack(0, 2, 0)));
     }

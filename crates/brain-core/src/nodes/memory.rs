@@ -54,6 +54,12 @@ pub struct Memory {
     pub text: Option<String>,
     pub created_at_unix_ms: u64,
     pub last_accessed_at_unix_ms: u64,
+    /// Client-supplied event time (when the content happened), in unix
+    /// nanoseconds. `None` when unsupplied. The temporal-expressions
+    /// extractor anchors relative dates ("last week") to this when
+    /// present, falling back to `created_at` — so a memory ingested today
+    /// about a 2020 event resolves its relative dates against 2020.
+    pub occurred_at_unix_nanos: Option<u64>,
 }
 
 #[cfg(test)]

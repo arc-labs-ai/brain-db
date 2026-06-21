@@ -62,6 +62,7 @@ pub async fn format(snap: &Snapshot<'_>) -> String {
     emit_process_resource(&mut s);
     emit_worker_counters(&mut s, snap.shards).await;
     emit_hnsw_counts(&mut s, snap.shards).await;
+    emit_storage_gauges(&mut s, snap.shards).await;
     emit_request_metrics(&mut s, snap.request_metrics);
     emit_auto_edge_metrics(&mut s, snap.shards);
     emit_extractor_metrics(&mut s, snap.shards);
@@ -416,6 +417,100 @@ async fn emit_hnsw_counts(out: &mut String, shards: &[ShardHandle]) {
             }
             Err(e) => {
                 warn!(shard_id, error = %e, "hnsw_snapshot failed");
+            }
+        }
+    }
+}
+
+/// Per-shard storage-footprint gauges. Sampled per-shard via
+/// [`ShardHandle::storage_stats`], which stats the WAL directory and
+/// `metadata.redb` and reads the live arena occupancy. Operators watch
+/// these for "approaching capacity".
+async fn emit_storage_gauges(out: &mut String, shards: &[ShardHandle]) {
+    emit_header(
+        out,
+        "brain_wal_size_bytes",
+        "Total bytes across the shard's WAL segment files.",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_wal_segments",
+        "Number of WAL segment files on disk.",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_metadata_size_bytes",
+        "Byte size of the shard's metadata.redb file.",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_arena_capacity_bytes",
+        "Addressable arena capacity in bytes.",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_arena_used_bytes",
+        "Bytes backing allocated arena slots (occupied + tombstoned).",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_arena_slots_used",
+        "Allocated arena slots (occupied + tombstoned).",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_arena_slots_free",
+        "Reclaimed arena slots on the free list, ready to reuse.",
+        "gauge",
+    );
+    for shard in shards.iter() {
+        let shard_id = shard.shard_id();
+        match shard.storage_stats().await {
+            Ok(st) => {
+                let _ = writeln!(
+                    out,
+                    "brain_wal_size_bytes{{shard=\"{shard_id}\"}} {}",
+                    st.wal_size_bytes
+                );
+                let _ = writeln!(
+                    out,
+                    "brain_wal_segments{{shard=\"{shard_id}\"}} {}",
+                    st.wal_segments
+                );
+                let _ = writeln!(
+                    out,
+                    "brain_metadata_size_bytes{{shard=\"{shard_id}\"}} {}",
+                    st.metadata_size_bytes
+                );
+                let _ = writeln!(
+                    out,
+                    "brain_arena_capacity_bytes{{shard=\"{shard_id}\"}} {}",
+                    st.arena_capacity_bytes
+                );
+                let _ = writeln!(
+                    out,
+                    "brain_arena_used_bytes{{shard=\"{shard_id}\"}} {}",
+                    st.arena_used_bytes
+                );
+                let _ = writeln!(
+                    out,
+                    "brain_arena_slots_used{{shard=\"{shard_id}\"}} {}",
+                    st.arena_slots_used
+                );
+                let _ = writeln!(
+                    out,
+                    "brain_arena_slots_free{{shard=\"{shard_id}\"}} {}",
+                    st.arena_slots_free
+                );
+            }
+            Err(e) => {
+                warn!(shard_id, error = %e, "storage_stats failed");
             }
         }
     }
@@ -814,6 +909,26 @@ fn emit_extractor_metrics(out: &mut String, shards: &[ShardHandle]) {
                     escape_label(&predicate)
                 );
                 let _ = writeln!(out, "brain_extractor_schema_filtered_total{labels} {count}",);
+            }
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_extractor_apply_dropped_total",
+        "Real extracted items the apply pass could not persist, by reason. Any nonzero value is signal loss.",
+        "counter",
+    );
+    for shard in shards {
+        if let Some(m) = shard.extractor_metrics() {
+            let snap = m.snapshot();
+            for (reason, count) in snap.apply_dropped_total {
+                let labels = format!(
+                    "{{shard=\"{}\",reason=\"{}\"}}",
+                    shard.shard_id(),
+                    escape_label(&reason)
+                );
+                let _ = writeln!(out, "brain_extractor_apply_dropped_total{labels} {count}",);
             }
         }
     }

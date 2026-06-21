@@ -586,6 +586,14 @@ fn classify_schema_merge(
                     }
                 }
             }
+            SchemaItem::Kind(_k) => {
+                // Conservative pre-flight: treat a kind declaration as a
+                // potential change. The authoritative idempotency /
+                // conflict check is `kind_intern` at apply time, which
+                // returns `KindOpError::Conflict` on a divergent
+                // re-declaration.
+                all_idempotent = false;
+            }
         }
     }
 
@@ -600,6 +608,9 @@ fn map_statement_kind(k: StatementKindAst) -> Option<StatementKind> {
         StatementKindAst::Fact => Some(StatementKind::Fact),
         StatementKindAst::Preference => Some(StatementKind::Preference),
         StatementKindAst::Event => Some(StatementKind::Event),
+        StatementKindAst::Attribute => Some(StatementKind::Attribute),
+        StatementKindAst::Relation => Some(StatementKind::Relation),
+        StatementKindAst::Directive => Some(StatementKind::Directive),
         StatementKindAst::Any => None,
     }
 }

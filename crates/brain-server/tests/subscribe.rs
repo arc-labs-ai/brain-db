@@ -248,16 +248,15 @@ fn subscribe_request(filter: SubscriptionFilter) -> SubscribeRequest {
     }
 }
 
-fn encode_request(text: &str, kind: MemoryKindWire) -> EncodeRequest {
+// `_kind` is accepted for call-site compatibility but ignored: the
+// write router decides the memory kind now (always Episodic).
+fn encode_request(text: &str, _kind: MemoryKindWire) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
         context_id: 0,
-        kind,
-        salience_hint: 0.5,
-        edges: Vec::new(),
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
     }
 }
 

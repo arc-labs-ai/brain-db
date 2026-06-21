@@ -101,7 +101,9 @@ pub async fn handle_query(
     let planner_req = wire_to_planner_request(req, predicate_ids)?;
     let qp = plan(&planner_req).map_err(map_plan_error)?;
     let exec_ctx = build_executor_context(ctx)?;
-    let result = execute(&qp, &planner_req, &exec_ctx)
+    // QUERY is the typed-graph query: it surfaces statement results, so
+    // the statement corpus is searched (passing `true`).
+    let result = execute(&qp, &planner_req, true, &exec_ctx)
         .await
         .map_err(map_executor_error)?;
     Ok(project_query_response(&result))
@@ -148,7 +150,8 @@ pub async fn handle_query_trace(
     let planner_req = wire_to_planner_request(req.query, predicate_ids)?;
     let qp = plan(&planner_req).map_err(map_plan_error)?;
     let exec_ctx = build_executor_context(ctx)?;
-    let result = execute(&qp, &planner_req, &exec_ctx)
+    // TRACE mirrors QUERY's execution, statement corpus included.
+    let result = execute(&qp, &planner_req, true, &exec_ctx)
         .await
         .map_err(map_executor_error)?;
     Ok(QueryTraceResponse {
@@ -243,7 +246,9 @@ pub async fn handle_query_text(
     };
     let qp = plan(&planner_req).map_err(map_plan_error)?;
     let exec_ctx = build_executor_context(ctx)?;
-    let result = execute(&qp, &planner_req, &exec_ctx)
+    // QUERY_TEXT projects to memory ids only (`memory_hit_from_fused`
+    // drops non-memory hits), so the statement corpus is not searched.
+    let result = execute(&qp, &planner_req, false, &exec_ctx)
         .await
         .map_err(map_executor_error)?;
     let items = result
@@ -307,7 +312,7 @@ fn wire_to_planner_request(
         confidence_min: req.confidence_min,
         include_tombstoned: req.include_tombstoned,
         include_superseded: req.include_superseded,
-        as_of_record_time_unix_nanos: None,
+        as_of_record_time_unix_nanos: req.as_of_record_time_unix_nanos,
         limit: req.limit,
         retrievers,
         fusion_config,
@@ -315,14 +320,9 @@ fn wire_to_planner_request(
 }
 
 fn statement_kind_from_byte(b: u8) -> Result<StatementKind, OpError> {
-    match b {
-        0 => Ok(StatementKind::Fact),
-        1 => Ok(StatementKind::Preference),
-        2 => Ok(StatementKind::Event),
-        other => Err(OpError::InvalidRequest(format!(
-            "unknown StatementKind byte: {other}",
-        ))),
-    }
+    // 0-based kind byte (matches `StatementKind::as_u8`). Every byte is a
+    // valid kind now (builtin 0..=5, else Custom).
+    Ok(StatementKind::from_u8(b))
 }
 
 fn time_range_from_wire(w: TimeRangeWire) -> TimeRange {
@@ -516,5 +516,6 @@ fn map_plan_error(e: PlanError) -> OpError {
 fn map_executor_error(e: ExecutionError) -> OpError {
     match e {
         ExecutionError::Filter(inner) => OpError::Internal(format!("filter chain: {inner}")),
+        ExecutionError::Recency(inner) => OpError::Internal(format!("recency ranking: {inner}")),
     }
 }

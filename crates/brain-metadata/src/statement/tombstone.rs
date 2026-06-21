@@ -6,9 +6,7 @@ use brain_core::StatementId;
 use brain_core::TombstoneReason;
 use redb::{ReadableTable, WriteTransaction};
 
-use crate::tables::statement::{
-    StatementMetadata, STATEMENTS_TABLE, STATEMENT_EMBED_QUEUE_TABLE,
-};
+use crate::tables::statement::{StatementMetadata, STATEMENTS_TABLE, STATEMENT_EMBED_QUEUE_TABLE};
 
 use super::StatementOpError;
 
@@ -201,20 +199,32 @@ mod tests {
         {
             let rtxn = db.read_txn().unwrap();
             let t = rtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE).unwrap();
-            let got = t.get(&(pred.raw(), StatementKind::Fact.as_u8(), bucket)).unwrap();
+            let got = t
+                .get(&(pred.raw(), StatementKind::Fact.as_u8(), bucket))
+                .unwrap();
             assert_eq!(got.map(|g| g.value()), Some(s.id.to_bytes()));
         }
 
         let wtxn = db.write_txn().unwrap();
-        statement_tombstone(&wtxn, s.id, TombstoneReason::UserRequest, 1_700_000_000_000_000_500)
-            .unwrap();
+        statement_tombstone(
+            &wtxn,
+            s.id,
+            TombstoneReason::UserRequest,
+            1_700_000_000_000_000_500,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
         // Tombstoned row is gone from the predicate-bucket index.
         let rtxn = db.read_txn().unwrap();
         let t = rtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE).unwrap();
-        let got = t.get(&(pred.raw(), StatementKind::Fact.as_u8(), bucket)).unwrap();
-        assert!(got.is_none(), "tombstone must remove the predicate-bucket entry");
+        let got = t
+            .get(&(pred.raw(), StatementKind::Fact.as_u8(), bucket))
+            .unwrap();
+        assert!(
+            got.is_none(),
+            "tombstone must remove the predicate-bucket entry"
+        );
     }
 
     #[test]

@@ -1,0 +1,12 @@
+{
+  "capabilities": {
+    "rerank": true,
+    "llm_extractor": false,
+    "classifier_extractor": true,
+    "pattern_extractor": true,
+    "schema_namespaces": [
+      "org"
+    ],
+    "vector_dim": 384
+  }
+}

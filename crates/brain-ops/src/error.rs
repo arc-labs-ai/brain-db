@@ -175,6 +175,13 @@ pub enum OpError {
 pub enum ErrorCode {
     InvalidRequest,
     NotFound,
+    /// A typed-graph entity (or a statement's subject entity) was not
+    /// found. Split from the generic `NotFound` so the wire surfaces the
+    /// precise `EntityNotFound` code instead of `MemoryNotFound`.
+    EntityNotFound,
+    /// A typed-graph statement was not found. Surfaces the wire
+    /// `StatementNotFound` code instead of the generic `MemoryNotFound`.
+    StatementNotFound,
     QuotaExceeded,
     Unauthorized,
     Conflict,
@@ -217,7 +224,14 @@ impl OpError {
             Self::InvalidRequest(_) | Self::TooManyMemories | Self::SchemaConflict { .. } => {
                 ErrorCode::InvalidRequest
             }
-            Self::NotFound { .. } => ErrorCode::NotFound,
+            // Route the typed-graph NotFound cases to their precise wire
+            // codes. The `what` tag is set at construction (here and in the
+            // `From<*OpError>` conversions); anything else stays generic.
+            Self::NotFound { what, .. } => match *what {
+                "entity" | "subject entity" => ErrorCode::EntityNotFound,
+                "statement" => ErrorCode::StatementNotFound,
+                _ => ErrorCode::NotFound,
+            },
             Self::Conflict(_) => ErrorCode::Conflict,
             Self::TxnExpired => ErrorCode::TxnExpired,
             Self::TxnNotFound => ErrorCode::TxnNotFound,
@@ -301,9 +315,7 @@ impl From<brain_metadata::statement::StatementOpError> for OpError {
                 what: "statement",
                 detail: format!("{id:?}"),
             },
-            E::AlreadyExists(id) => {
-                OpError::Conflict(format!("statement {id:?} already exists"))
-            }
+            E::AlreadyExists(id) => OpError::Conflict(format!("statement {id:?} already exists")),
             E::UnknownPredicate(p) => OpError::NotFound {
                 what: "predicate",
                 detail: format!("id={p}"),
@@ -319,15 +331,11 @@ impl From<brain_metadata::statement::StatementOpError> for OpError {
             E::AlreadyTombstoned(id) => {
                 OpError::Conflict(format!("statement {id:?} is tombstoned"))
             }
-            E::EventCannotSupersede => {
-                OpError::Conflict("events cannot be superseded".into())
-            }
+            E::EventCannotSupersede => OpError::Conflict("events cannot be superseded".into()),
             E::KindMismatch { old, new } => OpError::InvalidRequest(format!(
                 "kind mismatch on supersede: old={old:?} new={new:?}"
             )),
-            E::SubjectMismatch => {
-                OpError::InvalidRequest("subject must match on supersede".into())
-            }
+            E::SubjectMismatch => OpError::InvalidRequest("subject must match on supersede".into()),
             E::PredicateMismatch => {
                 OpError::InvalidRequest("predicate must match on supersede".into())
             }
@@ -336,6 +344,7 @@ impl From<brain_metadata::statement::StatementOpError> for OpError {
             }
             E::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
             E::Table(e) => OpError::Internal(format!("redb table: {e}")),
+            E::Kind(e) => OpError::Internal(format!("kind registry: {e}")),
             E::PredicateOp(e) => OpError::from(e),
             E::EntityOp(e) => {
                 OpError::Internal(format!("entity op forwarded from statement_ops: {e}"))

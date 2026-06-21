@@ -92,58 +92,17 @@ pub struct TemporalEdgeKnobs {
     pub topical_threshold: f32,
 }
 
-pub const DEFAULT_WINDOW_SECONDS: u64 = 300;
+/// Maximum gap between two memories for the later one to be linked as
+/// `FollowedBy` the earlier. 30 minutes, not 5: a single conversational
+/// session has natural pauses — the agent reads a doc, the human steps
+/// away — and a 5-minute window slices that one session into
+/// disconnected fragments, breaking the narrative chain the retriever
+/// walks. 30 minutes keeps a session's turns linked while still cutting
+/// the thread between genuinely separate sittings.
+pub const DEFAULT_WINDOW_SECONDS: u64 = 1800;
 pub const DEFAULT_WEIGHT_MIN: f32 = 0.1;
 pub const DEFAULT_CROSS_CONTEXT: bool = false;
 pub const DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD: f32 = 0.4;
-
-/// Environment variable for overriding
-/// [`DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD`]. Accepts an `f32` in
-/// `[0.0, 1.0]`. Out-of-range or unparseable values fall back to the
-/// default with a tracing warn.
-pub const TEMPORAL_EDGE_TOPICAL_THRESHOLD_ENV: &str = "BRAIN_TEMPORAL_EDGE_TOPICAL_THRESHOLD";
-
-/// Resolve the topical threshold from the env var (if set + valid)
-/// or fall back to `default`. Same shape as
-/// `auto_edge::resolved_threshold` so operators get consistent
-/// override semantics across both derivation workers.
-#[must_use]
-pub fn resolved_topical_threshold(default: f32) -> f32 {
-    resolved_topical_threshold_from(
-        std::env::var(TEMPORAL_EDGE_TOPICAL_THRESHOLD_ENV).ok(),
-        default,
-    )
-}
-
-/// Pure parse step extracted from [`resolved_topical_threshold`] so
-/// tests can validate the value-validation logic without mutating
-/// process-wide env state (forbidden under the project's no-`unsafe`
-/// rule).
-#[must_use]
-pub fn resolved_topical_threshold_from(raw: Option<String>, default: f32) -> f32 {
-    let Some(raw) = raw else {
-        return default;
-    };
-    match raw.parse::<f32>() {
-        Ok(v) if (0.0..=1.0).contains(&v) => v,
-        Ok(v) => {
-            tracing::warn!(
-                env = TEMPORAL_EDGE_TOPICAL_THRESHOLD_ENV,
-                value = v,
-                "temporal-edge topical threshold out of [0.0, 1.0]; using default"
-            );
-            default
-        }
-        Err(e) => {
-            tracing::warn!(
-                env = TEMPORAL_EDGE_TOPICAL_THRESHOLD_ENV,
-                error = %e,
-                "temporal-edge topical threshold not a valid f32; using default"
-            );
-            default
-        }
-    }
-}
 
 impl Default for TemporalEdgeKnobs {
     fn default() -> Self {
@@ -151,7 +110,7 @@ impl Default for TemporalEdgeKnobs {
             window_seconds: DEFAULT_WINDOW_SECONDS,
             weight_min: DEFAULT_WEIGHT_MIN,
             cross_context: DEFAULT_CROSS_CONTEXT,
-            topical_threshold: resolved_topical_threshold(DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD),
+            topical_threshold: DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD,
         }
     }
 }
@@ -640,22 +599,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn topical_threshold_default_when_none() {
-        assert!((resolved_topical_threshold_from(None, 0.4) - 0.4).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn topical_threshold_env_override() {
-        let v = resolved_topical_threshold_from(Some("0.6".to_string()), 0.4);
-        assert!((v - 0.6).abs() < 1e-6);
-    }
-
-    #[test]
-    fn topical_threshold_invalid_falls_back() {
-        let v = resolved_topical_threshold_from(Some("nope".to_string()), 0.4);
-        assert!((v - 0.4).abs() < f32::EPSILON);
-        let v = resolved_topical_threshold_from(Some("2.0".to_string()), 0.4);
-        assert!((v - 0.4).abs() < f32::EPSILON);
+    fn default_knobs_match_constants() {
+        let k = TemporalEdgeKnobs::default();
+        assert!(
+            (k.topical_threshold - DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD).abs() < f32::EPSILON
+        );
+        assert_eq!(k.window_seconds, DEFAULT_WINDOW_SECONDS);
+        assert!((k.weight_min - DEFAULT_WEIGHT_MIN).abs() < f32::EPSILON);
+        assert_eq!(k.cross_context, DEFAULT_CROSS_CONTEXT);
     }
 
     #[test]

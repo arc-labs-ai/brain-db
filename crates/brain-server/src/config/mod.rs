@@ -37,6 +37,10 @@ pub struct Config {
     pub extractors: ExtractorsConfig,
     #[serde(default)]
     pub workers: WorkersConfig,
+    /// Index-pipeline tuning (tantivy commit cadence). Section may be
+    /// omitted; every field defaults.
+    #[serde(default)]
+    pub index: IndexConfig,
     #[serde(default)]
     pub monitoring: MonitoringConfig,
     #[serde(default)]
@@ -46,37 +50,34 @@ pub struct Config {
     /// is wired).
     #[serde(default)]
     pub summarizer: SummarizerConfig,
-    /// Provider credentials + model overrides for the extractor's LLM
+    /// Single provider credential + model id for the extractor's LLM
     /// tier (tier 3 — statements/relations). Section may be omitted;
-    /// the environment (`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`) takes
+    /// the environment (`BRAIN_API_KEY` / `BRAIN_AI_MODEL`) takes
     /// precedence when set, so a committed config never overrides a
     /// deployment's env-provided secret.
     #[serde(default)]
     pub llm: LlmConfig,
 }
 
-/// `[llm]` TOML section. Credentials + model overrides for the
-/// extractor's LLM tier. Every field is optional. Keys may be set here
-/// as a convenience (chiefly local/dev); the matching environment
+/// `[llm]` TOML section. Credential + model for the extractor's LLM
+/// tier. Provider-agnostic by design: a single key and a single model
+/// id. The provider (OpenAI / Anthropic) is derived from the model id
+/// prefix, so adding a provider is a routing-table entry, not a new
+/// config key. Both fields are optional; the matching environment
 /// variable wins when present. Prefer the environment for production
 /// secrets — values committed to TOML leak into version control.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LlmConfig {
-    /// OpenAI API key. Falls back to `$OPENAI_API_KEY` when unset.
+    /// API key for the configured model's provider. Falls back to
+    /// `$BRAIN_API_KEY` when unset.
     #[serde(default)]
-    pub openai_api_key: Option<String>,
-    /// Anthropic API key. Falls back to `$ANTHROPIC_API_KEY` when unset.
-    #[serde(default)]
-    pub anthropic_api_key: Option<String>,
-    /// OpenAI model id. Falls back to `$BRAIN_OPENAI_MODEL`, then the
-    /// built-in default.
-    #[serde(default)]
-    pub openai_model: Option<String>,
-    /// Anthropic model id. Falls back to `$BRAIN_ANTHROPIC_MODEL`, then
+    pub api_key: Option<String>,
+    /// Model id (e.g. `gpt-4o-mini`, `claude-haiku-4-5`). The provider
+    /// is derived from this id. Falls back to `$BRAIN_AI_MODEL`, then
     /// the built-in default.
     #[serde(default)]
-    pub anthropic_model: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -196,12 +197,13 @@ impl EmbedderConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RerankConfig {
-    /// Master switch. `true` (default) loads the cross-encoder at
-    /// shard spawn; `false` skips loading entirely and turns any
-    /// opt-in rerank request into a `CapabilityNotEnabled` error so
-    /// clients know to drop the flag. Enabled-but-failed-to-load is
-    /// a spawn failure — operators don't get a silently-degraded
-    /// reranker.
+    /// Master switch. `false` (default) skips loading the cross-encoder
+    /// entirely. Rerank only reorders already-retrieved candidates; it
+    /// cannot surface a memory the retrieval+grounding stages missed, so
+    /// the real correctness work happens before it and the deploy pays
+    /// neither its load cost nor its per-read latency by default. Set
+    /// `true` to load it; enabled-but-failed-to-load is a spawn failure
+    /// (no silently-degraded reranker).
     #[serde(default = "default_rerank_enabled")]
     pub enabled: bool,
 }
@@ -215,7 +217,7 @@ impl Default for RerankConfig {
 }
 
 fn default_rerank_enabled() -> bool {
-    true
+    false
 }
 
 /// `[extractors]` TOML section. Per-tier on/off knobs for the
@@ -226,9 +228,98 @@ pub struct ExtractorsConfig {
     #[serde(default)]
     pub pattern: ExtractorTierConfig,
     #[serde(default)]
-    pub classifier: ExtractorTierConfig,
+    pub classifier: ClassifierExtractorConfig,
     #[serde(default)]
     pub llm: ExtractorTierConfig,
+    /// Entity-resolution embedding tier tuning.
+    #[serde(default)]
+    pub resolver: ResolverExtractorConfig,
+    /// Write-time HyPE (hypothetical-question) generation tuning.
+    #[serde(default)]
+    pub hype: HypeExtractorConfig,
+}
+
+/// `[extractors.classifier]` TOML sub-section. The classifier tier's
+/// on/off gate plus an explicit NER model override and confidence
+/// threshold. The model path defaults to XDG auto-discovery at shard
+/// spawn; the field is an explicit override only.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierExtractorConfig {
+    /// Master switch. `true` (default) materialises this tier;
+    /// `false` skips registration. Enabled-but-failed-to-init is a
+    /// spawn failure.
+    #[serde(default = "default_extractor_tier_enabled")]
+    pub enabled: bool,
+    /// Explicit NER model directory. `None` (default) falls back to the
+    /// XDG-cascade auto-discovery the bootstrap script writes to.
+    #[serde(default)]
+    pub model_path: Option<String>,
+    /// Post-sigmoid acceptance threshold. Defaults to 0.5; tune up for
+    /// noisy domains, down for short / unusual surface forms.
+    #[serde(default = "default_classifier_threshold")]
+    pub threshold: f32,
+}
+
+impl Default for ClassifierExtractorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_extractor_tier_enabled(),
+            model_path: None,
+            threshold: default_classifier_threshold(),
+        }
+    }
+}
+
+fn default_classifier_threshold() -> f32 {
+    brain_extractors::classifier::DEFAULT_GLINER_THRESHOLD
+}
+
+/// `[extractors.resolver]` TOML sub-section. Entity-resolution
+/// embedding-tier tuning.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ResolverExtractorConfig {
+    /// Cosine floor for tier-3 embedding lookups. A surface form whose
+    /// top embedding-HNSW neighbour scores at or above this is accepted
+    /// as an alias. Defaults to 0.78.
+    #[serde(default = "default_resolver_embed_threshold")]
+    pub embed_threshold: f32,
+}
+
+impl Default for ResolverExtractorConfig {
+    fn default() -> Self {
+        Self {
+            embed_threshold: default_resolver_embed_threshold(),
+        }
+    }
+}
+
+fn default_resolver_embed_threshold() -> f32 {
+    brain_extractors::resolver::EMBED_RESOLVE_THRESHOLD
+}
+
+/// `[extractors.hype]` TOML sub-section. Write-time hypothetical-
+/// question generation tuning. HyPE is always-on when an LLM provider +
+/// cache are available; the only tunable is the question count.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HypeExtractorConfig {
+    /// Hypothetical questions generated per memory. Defaults to 6.
+    #[serde(default = "default_hype_num_questions")]
+    pub num_questions: usize,
+}
+
+impl Default for HypeExtractorConfig {
+    fn default() -> Self {
+        Self {
+            num_questions: default_hype_num_questions(),
+        }
+    }
+}
+
+fn default_hype_num_questions() -> usize {
+    6
 }
 
 /// `[extractors.<tier>]` TOML sub-section. Operator gate on a single
@@ -294,6 +385,164 @@ pub struct WorkersConfig {
     /// entirely.
     #[serde(default)]
     pub causal_edge: CausalEdgeWorkerConfig,
+    /// Physical reclamation of retracted statement rows after the
+    /// retract grace window. Off by default. Section may be omitted.
+    #[serde(default)]
+    pub statement_reclaim: StatementReclaimWorkerConfig,
+    /// Entity merge-review-queue sweeper cadence. Section may be
+    /// omitted; the field defaults.
+    #[serde(default)]
+    pub ambiguity_resolver: AmbiguityResolverWorkerConfig,
+    /// Statement confidence-refresh sweep cadence. Section may be
+    /// omitted; the field defaults.
+    #[serde(default)]
+    pub confidence_sweep: ConfidenceSweepWorkerConfig,
+    /// LLM extractor response-cache TTL sweep cadence. Section may be
+    /// omitted; the field defaults.
+    #[serde(default)]
+    pub llm_cache_sweep: LlmCacheSweepWorkerConfig,
+}
+
+/// `[workers.statement_reclaim]` TOML section. Controls the retracted-
+/// statement GC worker. Off by default — retracted rows stay in redb
+/// (invisible to retrieval) until an operator opts in.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StatementReclaimWorkerConfig {
+    /// Master switch. `false` (default) registers the worker as a
+    /// no-op; `true` physically deletes retracted rows past the grace
+    /// window each cycle.
+    #[serde(default = "default_statement_reclaim_enabled")]
+    pub enabled: bool,
+    /// Retract grace window in seconds. A retracted row is eligible for
+    /// physical delete only once this long has elapsed since the
+    /// retract. Defaults to 30 days, matching the retract handler's
+    /// `will_zero_at` promise.
+    #[serde(default = "default_statement_reclaim_grace_seconds")]
+    pub grace_seconds: u64,
+    /// Sweep cadence in seconds. Defaults to 1 day.
+    #[serde(default = "default_statement_reclaim_period_seconds")]
+    pub period_seconds: u64,
+}
+
+impl Default for StatementReclaimWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_statement_reclaim_enabled(),
+            grace_seconds: default_statement_reclaim_grace_seconds(),
+            period_seconds: default_statement_reclaim_period_seconds(),
+        }
+    }
+}
+
+fn default_statement_reclaim_enabled() -> bool {
+    false
+}
+fn default_statement_reclaim_grace_seconds() -> u64 {
+    brain_workers::workers::statement_reclaim::DEFAULT_GRACE_SECONDS
+}
+fn default_statement_reclaim_period_seconds() -> u64 {
+    brain_workers::workers::statement_reclaim::DEFAULT_PERIOD_SECONDS
+}
+
+/// `[workers.ambiguity_resolver]` TOML section. Controls the entity
+/// merge-review-queue sweeper cadence.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AmbiguityResolverWorkerConfig {
+    /// Sweep interval in seconds. Slow on purpose: a proposal's
+    /// confidence shifts as the HNSW absorbs new aliases, on the order
+    /// of hours. Defaults to 1 hour.
+    #[serde(default = "default_ambiguity_resolver_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for AmbiguityResolverWorkerConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_ambiguity_resolver_interval_secs(),
+        }
+    }
+}
+
+fn default_ambiguity_resolver_interval_secs() -> u64 {
+    brain_workers::workers::ambiguity_resolver::DEFAULT_INTERVAL_SECS
+}
+
+/// `[workers.confidence_sweep]` TOML section. Controls the Statement
+/// confidence-refresh sweep cadence.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConfidenceSweepWorkerConfig {
+    /// Sweep interval in seconds. Defaults to 1 hour.
+    #[serde(default = "default_confidence_sweep_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for ConfidenceSweepWorkerConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_confidence_sweep_interval_secs(),
+        }
+    }
+}
+
+fn default_confidence_sweep_interval_secs() -> u64 {
+    brain_workers::workers::confidence_sweep::DEFAULT_INTERVAL_SECS
+}
+
+/// `[workers.llm_cache_sweep]` TOML section. Controls the LLM
+/// extractor response-cache TTL sweep cadence.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LlmCacheSweepWorkerConfig {
+    /// Sweep interval in seconds. Defaults to 1 hour.
+    #[serde(default = "default_llm_cache_sweep_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for LlmCacheSweepWorkerConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_llm_cache_sweep_interval_secs(),
+        }
+    }
+}
+
+fn default_llm_cache_sweep_interval_secs() -> u64 {
+    brain_workers::workers::llm_cache_sweeper::DEFAULT_INTERVAL_SECS
+}
+
+/// `[index]` TOML section. Index-pipeline tuning. Currently the tantivy
+/// text-indexer group-commit cadence. Section may be omitted; every
+/// field defaults.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IndexConfig {
+    /// Group-commit the tantivy writer after this many queued writes,
+    /// whichever comes first with `tantivy_commit_ms`. Defaults to 256.
+    #[serde(default = "default_tantivy_commit_n")]
+    pub tantivy_commit_n: usize,
+    /// Group-commit the tantivy writer after this many milliseconds,
+    /// whichever comes first with `tantivy_commit_n`. Defaults to 1000.
+    #[serde(default = "default_tantivy_commit_ms")]
+    pub tantivy_commit_ms: u64,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            tantivy_commit_n: default_tantivy_commit_n(),
+            tantivy_commit_ms: default_tantivy_commit_ms(),
+        }
+    }
+}
+
+fn default_tantivy_commit_n() -> usize {
+    brain_ops::index::text_indexer::DEFAULT_COMMIT_N
+}
+fn default_tantivy_commit_ms() -> u64 {
+    brain_ops::index::text_indexer::DEFAULT_COMMIT_MS
 }
 
 /// `[workers.auto_edge]` TOML section. Controls the substrate
@@ -356,13 +605,11 @@ fn default_auto_edge_batch_size() -> usize {
     256
 }
 fn default_auto_edge_similarity_threshold() -> f32 {
-    // Reads `BRAIN_AUTO_EDGE_THRESHOLD` at startup so operators can
-    // tune the cosine-similarity floor without re-rolling the config.
-    // The crate default is 0.75 (topical-cluster floor), tunable up
-    // to 0.85+ for strict deduping.
-    brain_workers::auto_edge::resolved_threshold(
-        brain_workers::DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD,
-    )
+    // 0.85 is the near-duplicate floor; a looser value manufactures
+    // false SimilarTo edges and hub clutter. Operators override via
+    // `BRAIN__WORKERS__AUTO_EDGE__SIMILARITY_THRESHOLD` (the generic
+    // env-override path) or directly in TOML.
+    brain_workers::DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD
 }
 fn default_auto_edge_top_k() -> usize {
     5
@@ -408,8 +655,7 @@ pub struct TemporalEdgeWorkerConfig {
     /// candidate predecessor is dropped — preserves narrative threads
     /// without writing spurious "followed by" edges between
     /// topically-unrelated memories ("I had lunch" → "deployed to
-    /// prod"). The default reads `BRAIN_TEMPORAL_EDGE_TOPICAL_THRESHOLD`
-    /// at startup so operators can tune without re-rolling configs.
+    /// prod").
     #[serde(default = "default_temporal_edge_topical_threshold")]
     pub topical_threshold: f32,
 }
@@ -439,7 +685,10 @@ fn default_temporal_edge_batch_size() -> usize {
     256
 }
 fn default_temporal_edge_window_seconds() -> u64 {
-    300
+    // 30 minutes. A short 5-minute window split a single conversational
+    // session into disconnected fragments, so consecutive turns never
+    // linked; 30 minutes keeps one session's turns chained.
+    1800
 }
 fn default_temporal_edge_weight_min() -> f32 {
     0.1
@@ -451,9 +700,7 @@ fn default_temporal_edge_cross_context() -> bool {
     false
 }
 fn default_temporal_edge_topical_threshold() -> f32 {
-    brain_workers::resolved_topical_threshold(
-        brain_workers::DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD,
-    )
+    brain_workers::DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD
 }
 
 /// `[workers.causal_edge]` TOML section. Controls extractor-driven
@@ -577,9 +824,7 @@ pub struct ExtractorWorkerConfig {
     /// Memories the extractor worker bundles into one classifier
     /// forward pass per cycle iteration. The GLiNER backbone GEMM
     /// dominates per-encode latency; batching 8 memories pulls
-    /// per-memory cost down by ~4-5x on a CPU host. Operators can
-    /// override via `BRAIN_EXTRACTOR_BATCH_SIZE` for tail-latency
-    /// tuning.
+    /// per-memory cost down by ~4-5x on a CPU host.
     #[serde(default = "default_extractor_batch_size")]
     pub batch_size: usize,
 }
@@ -976,6 +1221,7 @@ impl Config {
             source,
         })?;
         cfg.validate_post()?;
+        cfg.validate_llm_provider(env)?;
         Ok(cfg)
     }
 
@@ -1015,6 +1261,7 @@ impl Config {
             rerank: RerankConfig::default(),
             extractors: ExtractorsConfig::default(),
             workers: WorkersConfig::default(),
+            index: IndexConfig::default(),
             monitoring: MonitoringConfig::default(),
             auth: AuthConfig::default(),
             summarizer: SummarizerConfig::default(),
@@ -1073,6 +1320,46 @@ impl Config {
         }
         Ok(())
     }
+
+    /// Hard startup gate on the LLM provider key. Brain's write path is
+    /// not a happy-path veneer: entity / statement / relation extraction
+    /// and HyPE hypothetical-question generation are core, always-on
+    /// features that depend on an LLM provider. So when the LLM extractor
+    /// tier is enabled (the default), a provider key is a HARD startup
+    /// requirement — the server refuses to boot without one rather than
+    /// silently degrading to a substrate-only shell that looks healthy but
+    /// stores no graph and no question-vector bridge.
+    ///
+    /// A key resolves from either the `BRAIN_API_KEY` process env or
+    /// `[llm] api_key` in config (the latter also covers the
+    /// `BRAIN__LLM__API_KEY` override, already folded into `self.llm`
+    /// by this point).
+    ///
+    /// The single escape hatch is an explicit substrate-only deployment:
+    /// `[extractors.llm] enabled = false` opts out of the LLM tier, and
+    /// then no key is required (HyPE has no provider to call and skips).
+    fn validate_llm_provider(&self, env: &HashMap<String, String>) -> Result<(), ConfigError> {
+        if !self.extractors.llm.enabled {
+            // Operator explicitly opted into a substrate-only deployment.
+            return Ok(());
+        }
+        let env_present = |k: &str| env.get(k).is_some_and(|v| !v.trim().is_empty());
+        let cfg_present =
+            |k: &Option<String>| k.as_deref().is_some_and(|v| !v.trim().is_empty());
+        let have_provider = env_present("BRAIN_API_KEY") || cfg_present(&self.llm.api_key);
+        if !have_provider {
+            return Err(ConfigError::Invariant(
+                "no LLM provider key configured, but the LLM extractor tier is enabled. \
+                 Brain's write path (entity / statement / relation extraction and HyPE \
+                 hypothetical-question generation) requires an LLM provider and will not \
+                 start without one. Set BRAIN_API_KEY in the environment, or `[llm] api_key` \
+                 in the config. For an intentional substrate-only deployment (no extraction, \
+                 no HyPE), set `[extractors.llm] enabled = false`."
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1090,6 +1377,41 @@ mod tests {
         assert_eq!(parse_human_bytes("256MiB").unwrap(), 256 * (1u64 << 20));
         assert_eq!(parse_human_bytes("4KiB").unwrap(), 4096);
         assert_eq!(parse_human_bytes("1TiB").unwrap(), 1u64 << 40);
+    }
+
+    #[test]
+    fn llm_provider_gate_requires_key_when_tier_enabled() {
+        let mut cfg = Config::for_tests();
+        assert!(cfg.extractors.llm.enabled, "llm tier defaults on");
+        let empty: HashMap<String, String> = HashMap::new();
+
+        // Default (tier on) + no key anywhere → refuse to start.
+        assert!(
+            cfg.validate_llm_provider(&empty).is_err(),
+            "no provider key with the LLM tier enabled must fail startup"
+        );
+
+        // Bare env key satisfies it.
+        let mut env = HashMap::new();
+        env.insert("BRAIN_API_KEY".to_string(), "sk-test".to_string());
+        assert!(cfg.validate_llm_provider(&env).is_ok());
+
+        // Config-file key satisfies it (covers BRAIN__LLM__API_KEY overrides).
+        cfg.llm.api_key = Some("sk-cfg".to_string());
+        assert!(cfg.validate_llm_provider(&empty).is_ok());
+
+        // Whitespace-only key does not count.
+        cfg.llm.api_key = Some("   ".to_string());
+        assert!(cfg.validate_llm_provider(&empty).is_err());
+    }
+
+    #[test]
+    fn llm_provider_gate_allows_substrate_only_optout() {
+        let mut cfg = Config::for_tests();
+        cfg.extractors.llm.enabled = false;
+        let empty: HashMap<String, String> = HashMap::new();
+        // Explicit substrate-only deployment: no key required.
+        assert!(cfg.validate_llm_provider(&empty).is_ok());
     }
 
     #[test]

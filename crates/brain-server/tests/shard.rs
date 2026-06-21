@@ -430,6 +430,7 @@ fn encode_record(slot: u64, byte: u8) -> WalRecord {
         edges: vec![],
         request_hash: [byte; 32],
         response_payload: vec![],
+        occurred_at_unix_nanos: None,
         deduplicate: false,
     };
     WalRecord::from_typed(

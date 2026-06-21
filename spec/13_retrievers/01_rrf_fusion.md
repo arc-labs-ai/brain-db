@@ -64,6 +64,35 @@ The shipped defaults bias toward semantic on free-text queries and lift graph fo
 
 Tuning weights requires evaluation data; Brain provides metrics on per-retriever contribution to fused results to inform tuning.
 
+## Recency ranking (the `temporal` weight)
+
+`PerRetrieverWeights` carries a fourth, `temporal` weight (default `0.5`)
+that is **not** a retriever lane — there is no temporal retriever — but a
+post-fusion **event-time recency boost** folded into `fused_score` after
+the filter chain and before rerank.
+
+It is a soft, additive, RRF-scale term applied to memory hits only:
+
+```
+boost(d) = temporal_weight · (1 / (k + 1)) · 0.5^(age(d) / half_life)
+age(d)   = reference_time − event_time(d)        # saturates at 0 for future-dated events
+event_time(d) = occurred_at(d)  ?? created_at(d)  # client event time, else write time
+```
+
+- **RRF-scale.** `1/(k+1)` is one top-rank retriever vote (≈ 0.0164 at
+  `k=60`), so a brand-new memory at the default weight earns at most half
+  of one such vote — a tie-breaker that re-orders comparably-relevant
+  hits, never one that overrides genuine relevance. This is why `0.5` is
+  the default (half-strength) and why the term is capped at the RRF unit.
+- **Exponential decay** on event time with a default half-life of **90
+  days**. Statements/relations are untouched (their bi-temporal validity
+  is the filter chain's job).
+- **Gated on a temporal signal.** The boost runs only when the query
+  carries one — a temporal expression detected by the router, an explicit
+  time filter, or an `as_of_record_time_unix_nanos` anchor — so timeless
+  facts ("what's my wife's name") are never penalised for being old. The
+  reference point is the `as_of` anchor when set, otherwise wall-clock now.
+
 ## Adaptive top-K from the router
 
 The query router (see [`./05_retrieval_query.md`](./05_retrieval_query.md) §"Query router") classifies the incoming query and emits an **adaptive top-K hint** alongside the weight set. The hint lets fusion bound work per query class without pinning a single global `top_n`:

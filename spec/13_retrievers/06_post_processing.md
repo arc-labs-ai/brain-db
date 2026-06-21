@@ -111,10 +111,35 @@ A first-class, always-on post-fusion stage that re-ranks the top of the RRF-fuse
 Where it sits in the pipeline:
 
 ```
-retrievers → RRF fusion → [rerank, if cross-encoder loaded] → filter chain → limit
+retrievers → RRF fusion → filter chain → [recency boost] → [rerank, if cross-encoder loaded] → [merge/diversity, if list intent] → limit
 ```
 
-The rerank fires after fusion and before the filter chain, on the top-50 fused candidates only. It surfaces a re-ordered top-10 that the filter chain then consumes.
+The rerank fires on the top-50 fused candidates only. It surfaces a re-ordered head that the limit then cuts to `top_k`.
+
+## Merge / diversity (MMR) — internal, list-intent only
+
+A post-rerank stage that spreads near-duplicate memories so a set
+question returns *distinct* members, not paraphrases of the most salient
+one. It runs **only** when the router detected list/aggregation intent
+(see [`./05_retrieval_query.md`](./05_retrieval_query.md) Rule 6) — there
+is no client knob; the database decides. This is the read half of list
+handling; the router's wider candidate pool is the coverage half (a
+member that never reached fusion can't be diversified into the result).
+
+- **Algorithm:** greedy Maximal Marginal Relevance over the top
+  candidates (window 50). Each pick maximises `λ·rel(d) − (1−λ)·max
+  redundancy(d, already-picked)`, `λ = 0.5`. Relevance is the rerank
+  score (else fused score), min-max normalized; redundancy is **Jaccard
+  over lowercased text token sets** (candidate vectors aren't reachable
+  post-fusion without a retriever round-trip, and token overlap is a
+  cheap near-duplicate signal).
+- **Cannot regress a single answer:** greedy MMR's first pick is always
+  the highest-relevance item, so a lone strong answer stays at rank 1.
+  Only positions 2..N are reordered, and only on detected list intent —
+  a factoid that slips the detector keeps its top hit. (Resolves
+  OQ-AN-9, which nominated MMR for this slot.)
+- `top_k` still bounds the returned count; MMR changes *which* items
+  fill the slots.
 
 ## Model
 

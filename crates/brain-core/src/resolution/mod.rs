@@ -8,12 +8,15 @@
 //! - [`resolver`] — the gauntlet itself, `ResolutionOutcome`, config.
 //! - [`trigrams`] — n-gram extraction + Jaccard similarity.
 //! - [`confidence`] — noisy-OR aggregation with kind-specific decay.
+//! - [`referential`] — shared non-referential-surface backstop.
 
 pub mod confidence;
+pub mod referential;
 pub mod resolver;
 pub mod trigrams;
 
 pub use confidence::{aggregate_confidence, ConfidenceConfig};
+pub use referential::is_non_referential_surface;
 pub use resolver::{
     resolve_entity, ResolutionOutcome, ResolverConfig, ResolverEmbedder, ResolverError,
     ResolverIndex, ResolverLlm, ResolverLlmDecision, ResolverStorage, ResolverTier, TypeConstraint,

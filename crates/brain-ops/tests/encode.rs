@@ -14,11 +14,9 @@ use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
 use brain_ops::test_support::{run_in_glommio, single_body};
-use brain_ops::{dispatch, DispatchOutcome, OpError, OpsContext, RealWriterHandle};
+use brain_ops::{dispatch, DispatchOutcome, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::envelope::request::{
-    EdgeKindWire, EdgeRequest, EncodeRequest, MemoryKindWire, RequestBody,
-};
+use brain_protocol::envelope::request::{EncodeRequest, RequestBody};
 use brain_protocol::envelope::response::{EncodeResponse, ResponseBody};
 
 // ---------------------------------------------------------------------------
@@ -81,12 +79,9 @@ fn encode_req(request_id: [u8; 16], text: &str) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
         context_id: 42,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: vec![],
         request_id,
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
     }
 }
 
@@ -117,7 +112,7 @@ fn encode_full_pipeline_returns_memory_id() {
 
         assert_ne!(enc.memory_id, 0, "memory_id must be non-zero");
         assert!(!enc.was_deduplicated);
-        assert_eq!(enc.salience, 0.5, "salience echoes the request hint");
+        assert_eq!(enc.salience, 0.5, "salience is the router default");
         assert_eq!(enc.auto_edges_added, 0);
     })
 }
@@ -204,137 +199,31 @@ fn encode_conflict_returns_conflict_error_code() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Consolidated kind rejected at planning.
+// 4. Memory kind is router-decided.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn encode_consolidated_kind_rejected() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let mut req = encode_req([4; 16], "no consolidated");
-        req.kind = MemoryKindWire::Consolidated;
-
-        let err = dispatch(
-            RequestBody::Encode(req),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(err, OpError::PlanError(_)),
-            "Consolidated rejection comes from the planner, got {err:?}"
-        );
-        assert_eq!(
-            err.error_code(),
-            brain_ops::ErrorCode::InvalidRequest,
-            "Consolidated kind must map to InvalidRequest"
-        );
-    })
-}
-
-// ---------------------------------------------------------------------------
-// 5. Edges: insert count is reflected in auto_edges_added.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn encode_auto_edges_added_counts_inserted_only() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-
-        // First, write a target memory we can link to.
-        let target = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(encode_req([5; 16], "target")),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        assert_ne!(target.memory_id, 0);
-
-        // Now encode with two edges: one valid, one to a non-existent id.
-        let mut req = encode_req([6; 16], "linker");
-        req.edges = vec![
-            EdgeRequest {
-                target: target.memory_id,
-                kind: EdgeKindWire::References,
-                weight: 0.5,
-            },
-            EdgeRequest {
-                target: 0xDEAD_BEEF_u128,
-                kind: EdgeKindWire::References,
-                weight: 0.5,
-            },
-        ];
-        let resp = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(req),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        assert_eq!(
-            resp.auto_edges_added, 1,
-            "only the edge to the live target counts"
-        );
-    })
-}
+//
+// The client can no longer choose the memory kind (the `kind` field is
+// gone from ENCODE); the write router files every text encode as
+// Episodic. The old "Consolidated is rejected" test exercised a
+// capability that no longer exists on this path.
 
 // ---------------------------------------------------------------------------
 // 5b. Fingerprint dedup (a).
 // ---------------------------------------------------------------------------
 //
-// Distinct from idempotency. Opt-in via `EncodeRequest.deduplicate`;
-// scoped per `(shard, agent_id, context_id)`; tombstone-aware.
+// Dedup is now a DB policy — always on for text ENCODE, scoped per
+// `(shard, agent_id, context_id)`, tombstone-aware. The client can no
+// longer toggle it, so the builder always produces a router-default
+// (dedup-on) encode; only the request_id / text / context vary.
 
-fn encode_req_with_dedup(
-    request_id: [u8; 16],
-    text: &str,
-    context_id: u64,
-    deduplicate: bool,
-) -> EncodeRequest {
+fn encode_req_with_dedup(request_id: [u8; 16], text: &str, context_id: u64) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
         context_id,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: vec![],
         request_id,
         txn_id: None,
-        deduplicate,
+        occurred_at_unix_nanos: None,
     }
-}
-
-#[test]
-fn dedup_off_always_returns_fresh_slot() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let a = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(encode_req_with_dedup([1; 16], "same text", 1, false)),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        let b = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(encode_req_with_dedup([2; 16], "same text", 1, false)),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        assert_ne!(a.memory_id, b.memory_id, "no dedup → distinct slots");
-        assert!(!a.was_deduplicated);
-        assert!(!b.was_deduplicated);
-    })
 }
 
 #[test]
@@ -343,7 +232,7 @@ fn dedup_hit_returns_existing_memory_id() {
         let fix = build_fixture();
         let first = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([3; 16], "dedup me", 1, true)),
+                RequestBody::Encode(encode_req_with_dedup([3; 16], "dedup me", 1)),
                 brain_ops::RequestCaller::anonymous(),
                 &fix.ctx,
             )
@@ -358,7 +247,7 @@ fn dedup_hit_returns_existing_memory_id() {
         // Same text + same context + different request_id + dedup=true.
         let second = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([4; 16], "dedup me", 1, true)),
+                RequestBody::Encode(encode_req_with_dedup([4; 16], "dedup me", 1)),
                 brain_ops::RequestCaller::anonymous(),
                 &fix.ctx,
             )
@@ -379,7 +268,7 @@ fn dedup_different_context_no_hit() {
         let fix = build_fixture();
         let ctx_a = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([5; 16], "same text", 1, true)),
+                RequestBody::Encode(encode_req_with_dedup([5; 16], "same text", 1)),
                 brain_ops::RequestCaller::anonymous(),
                 &fix.ctx,
             )
@@ -388,7 +277,7 @@ fn dedup_different_context_no_hit() {
         );
         let ctx_b = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([6; 16], "same text", 2, true)),
+                RequestBody::Encode(encode_req_with_dedup([6; 16], "same text", 2)),
                 brain_ops::RequestCaller::anonymous(),
                 &fix.ctx,
             )
@@ -408,43 +297,12 @@ fn dedup_different_context_no_hit() {
 }
 
 #[test]
-fn dedup_off_then_on_still_misses() {
-    run_in_glommio(|| async {
-        // The dedup-off encode does NOT populate the fingerprint table.
-        // A later dedup-on encode of the same text must miss.
-        let fix = build_fixture();
-        let _bare = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(encode_req_with_dedup([7; 16], "wash me", 1, false)),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        let dedup_attempt = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(encode_req_with_dedup([8; 16], "wash me", 1, true)),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        assert!(
-            !dedup_attempt.was_deduplicated,
-            "dedup-off encode does not populate the index; dedup-on must miss",
-        );
-    })
-}
-
-#[test]
 fn dedup_after_forget_evicts_and_misses() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let first = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([9; 16], "evict me", 1, true)),
+                RequestBody::Encode(encode_req_with_dedup([9; 16], "evict me", 1)),
                 brain_ops::RequestCaller::anonymous(),
                 &fix.ctx,
             )
@@ -472,7 +330,7 @@ fn dedup_after_forget_evicts_and_misses() {
         // was evicted in the same txn as the tombstone — must miss.
         let after = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([10; 16], "evict me", 1, true)),
+                RequestBody::Encode(encode_req_with_dedup([10; 16], "evict me", 1)),
                 brain_ops::RequestCaller::anonymous(),
                 &fix.ctx,
             )
@@ -643,7 +501,7 @@ fn encode_dedup_hit_does_not_clobber_original_text_row() {
 
         let first = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([0x70; 16], original_text, 9, true)),
+                RequestBody::Encode(encode_req_with_dedup([0x70; 16], original_text, 9)),
                 brain_ops::RequestCaller::anonymous(),
                 &fix.ctx,
             )
@@ -661,7 +519,7 @@ fn encode_dedup_hit_does_not_clobber_original_text_row() {
         // original text row.
         let second = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([0x71; 16], original_text, 9, true)),
+                RequestBody::Encode(encode_req_with_dedup([0x71; 16], original_text, 9)),
                 brain_ops::RequestCaller::anonymous(),
                 &fix.ctx,
             )
@@ -698,7 +556,7 @@ fn encode_dedup_then_replay_returns_was_deduplicated_true() {
         // First: dedup=true with no existing memory → miss, fresh slot.
         let first = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([0x80; 16], "round-trip me", 11, true)),
+                RequestBody::Encode(encode_req_with_dedup([0x80; 16], "round-trip me", 11)),
                 brain_ops::RequestCaller::anonymous(),
                 &fix.ctx,
             )
@@ -708,7 +566,7 @@ fn encode_dedup_then_replay_returns_was_deduplicated_true() {
         assert!(!first.was_deduplicated, "first encode is a fresh slot");
 
         // Second: same text, dedup=true, different request_id → dedup hit.
-        let second_req = encode_req_with_dedup([0x81; 16], "round-trip me", 11, true);
+        let second_req = encode_req_with_dedup([0x81; 16], "round-trip me", 11);
         let second = unwrap_encode_resp(
             dispatch(
                 RequestBody::Encode(second_req.clone()),

@@ -61,7 +61,9 @@ use std::sync::Arc;
 use brain_core::{ShardId, SlotVersion};
 use brain_embed::{Dispatcher, VECTOR_DIM};
 use brain_index::entity_hnsw::{EntityHnswIndex, EntityHnswParams};
+use brain_index::hype_hnsw::HypeHnswIndex;
 use brain_index::statement_hnsw::{StatementHnswIndex, StatementHnswParams};
+use brain_index::statement_question_hnsw::StatementQuestionHnswIndex;
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
 use brain_ops::error::OpError;
@@ -91,6 +93,21 @@ use self::adapters::{ArenaRebuildSource, ShardSnapshotSource, WalDirRetentionSou
 use flume::{Receiver, Sender};
 use glommio::{ExecutorJoinHandle, LocalExecutorBuilder, Placement};
 use tracing::{error, info, warn, Instrument as _};
+
+/// Whether the per-statement question bridge is enabled (env
+/// `BRAIN_STATEMENT_QUESTION_BRIDGE`). Default OFF: when set, each shard
+/// constructs the question-bridge HNSW, the embed worker generates templated
+/// questions for every eligible statement, and the semantic retriever probes
+/// the pool on statement-scope search. Default-off keeps write-time cost at
+/// zero until the bridge is measured.
+fn statement_question_bridge_enabled() -> bool {
+    matches!(
+        std::env::var("BRAIN_STATEMENT_QUESTION_BRIDGE")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "on" | "ON")
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Request type.
@@ -157,6 +174,14 @@ pub(crate) enum ShardRequest {
     /// Snapshot the HNSW index counts. Used by the admin `/metrics`
     /// path to emit `brain_hnsw_*` families.
     HnswSnapshot { reply_tx: Sender<HnswCounts> },
+    /// Sample the shard's on-disk storage footprint. Used by the
+    /// admin `/metrics` path to emit `brain_wal_*`,
+    /// `brain_metadata_size_bytes`, and `brain_arena_*` families. The
+    /// handler does blocking `fs::metadata`, acceptable on the
+    /// dedicated per-core thread at scrape cadence.
+    StorageStats {
+        reply_tx: Sender<StorageStatsSnapshot>,
+    },
     /// Pause / resume / run-now a single background worker.
     /// Replies with `true` iff the named worker exists.
     WorkerControl {
@@ -229,6 +254,29 @@ impl HnswCounts {
     }
 }
 
+/// On-disk storage footprint surfaced by
+/// `ShardRequest::StorageStats`. Pure data type so it crosses the
+/// Tokio↔Glommio boundary without further plumbing. All sizes are
+/// sampled lazily on the scrape that asks for them — there is no
+/// background tick.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StorageStatsSnapshot {
+    /// Sum of bytes of every `wal/*.wal` segment file.
+    pub wal_size_bytes: u64,
+    /// Count of `wal/*.wal` segment files.
+    pub wal_segments: u64,
+    /// Byte size of the shard's `metadata.redb` file.
+    pub metadata_size_bytes: u64,
+    /// Addressable arena capacity in bytes (`capacity_slots * 1600`).
+    pub arena_capacity_bytes: u64,
+    /// Bytes backing currently-allocated slots (occupied + tombstoned).
+    pub arena_used_bytes: u64,
+    /// Currently-allocated slots (occupied + tombstoned).
+    pub arena_slots_used: u64,
+    /// Reclaimed slots sitting on the free list, ready to reuse.
+    pub arena_slots_free: u64,
+}
+
 /// Owned snapshot descriptor surfaced through `ShardHandle`. Mirrors
 /// `brain_workers::snapshot::SnapshotDesc` but with plain types so it
 /// can cross the admin HTTP boundary unchanged.
@@ -286,6 +334,18 @@ pub struct ShardSpawnConfig {
     /// `enabled=false` skips registration entirely (no worker, no
     /// channel, the extractor's enqueue path stays `None`).
     pub causal_edge: CausalEdgeSpawnConfig,
+    /// Retracted-statement GC worker knobs. Off by default.
+    pub statement_reclaim: StatementReclaimSpawnConfig,
+    /// Entity merge-review-queue sweeper cadence.
+    pub ambiguity_resolver: AmbiguityResolverSpawnConfig,
+    /// Statement confidence-refresh sweep cadence.
+    pub confidence_sweep: ConfidenceSweepSpawnConfig,
+    /// LLM extractor response-cache TTL sweep cadence.
+    pub llm_cache_sweep: LlmCacheSweepSpawnConfig,
+    /// Extractor pipeline tuning (resolver / classifier / HyPE).
+    pub extractor_tuning: ExtractorTuningSpawnConfig,
+    /// Index-pipeline tuning (tantivy commit cadence).
+    pub index: IndexSpawnConfig,
     /// Text → vector dispatcher used inside the shard's executor.
     ///
     /// The same `Arc` is cloned into every shard at process startup so
@@ -310,18 +370,16 @@ pub struct ShardSpawnConfig {
     pub llm: LlmSpawnConfig,
 }
 
-/// Knobs ferried from `Config.llm` into the spawn path: provider
-/// credentials + model overrides for the LLM extractor tier. Local to
+/// Knobs ferried from `Config.llm` into the spawn path: the single
+/// provider credential + model id for the LLM extractor tier. Local to
 /// the shard module (mirrors the other `*SpawnConfig` types) so the
 /// `#[path]`-mounted integration tests don't pull in `crate::config`.
 /// Empty / `None` fields fall back to the environment at resolution
-/// time.
+/// time. The provider is derived from the model id, not configured.
 #[derive(Clone, Debug, Default)]
 pub struct LlmSpawnConfig {
-    pub openai_api_key: Option<String>,
-    pub anthropic_api_key: Option<String>,
-    pub openai_model: Option<String>,
-    pub anthropic_model: Option<String>,
+    pub api_key: Option<String>,
+    pub model: Option<String>,
 }
 
 /// Knobs ferried from `Config.rerank` into the spawn path.
@@ -425,10 +483,7 @@ pub struct TemporalEdgeSpawnConfig {
     pub cross_context: bool,
     /// Cosine similarity floor for the topical gate. See
     /// [`brain_workers::TemporalEdgeKnobs::topical_threshold`].
-    /// Server config materialises this from
-    /// `BRAIN_TEMPORAL_EDGE_TOPICAL_THRESHOLD` (via
-    /// `brain_workers::resolved_topical_threshold`) so the env var
-    /// override flows through unchanged.
+    /// Ferried from `[workers.temporal_edge] topical_threshold`.
     pub topical_threshold: f32,
 }
 
@@ -438,7 +493,9 @@ impl Default for TemporalEdgeSpawnConfig {
             enabled: true,
             interval_ms: 100,
             batch_size: 256,
-            window_seconds: 300,
+            // 30 minutes: a 5-minute window fragmented a single
+            // conversational session so consecutive turns never linked.
+            window_seconds: 1800,
             weight_min: 0.1,
             channel_capacity: 1024,
             cross_context: false,
@@ -484,6 +541,110 @@ impl Default for CausalEdgeSpawnConfig {
     }
 }
 
+/// Knobs ferried from `Config.workers.statement_reclaim` into the spawn
+/// path. The retracted-statement GC worker is off by default.
+#[derive(Clone, Copy, Debug)]
+pub struct StatementReclaimSpawnConfig {
+    pub enabled: bool,
+    pub grace_seconds: u64,
+    pub period_seconds: u64,
+}
+
+impl Default for StatementReclaimSpawnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            grace_seconds: brain_workers::workers::statement_reclaim::DEFAULT_GRACE_SECONDS,
+            period_seconds: brain_workers::workers::statement_reclaim::DEFAULT_PERIOD_SECONDS,
+        }
+    }
+}
+
+/// Knobs ferried from `Config.workers.ambiguity_resolver`.
+#[derive(Clone, Copy, Debug)]
+pub struct AmbiguityResolverSpawnConfig {
+    pub interval_secs: u64,
+}
+
+impl Default for AmbiguityResolverSpawnConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: brain_workers::workers::ambiguity_resolver::DEFAULT_INTERVAL_SECS,
+        }
+    }
+}
+
+/// Knobs ferried from `Config.workers.confidence_sweep`.
+#[derive(Clone, Copy, Debug)]
+pub struct ConfidenceSweepSpawnConfig {
+    pub interval_secs: u64,
+}
+
+impl Default for ConfidenceSweepSpawnConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: brain_workers::workers::confidence_sweep::DEFAULT_INTERVAL_SECS,
+        }
+    }
+}
+
+/// Knobs ferried from `Config.workers.llm_cache_sweep`.
+#[derive(Clone, Copy, Debug)]
+pub struct LlmCacheSweepSpawnConfig {
+    pub interval_secs: u64,
+}
+
+impl Default for LlmCacheSweepSpawnConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: brain_workers::workers::llm_cache_sweeper::DEFAULT_INTERVAL_SECS,
+        }
+    }
+}
+
+/// Knobs ferried from `Config.extractors.resolver` + `.classifier` +
+/// `.hype` into the spawn path. Tunes the extractor pipeline's
+/// resolution / classification / HyPE behaviour.
+#[derive(Clone, Debug)]
+pub struct ExtractorTuningSpawnConfig {
+    /// Tier-3 entity-resolution cosine floor.
+    pub resolver_embed_threshold: f32,
+    /// Explicit NER model directory override (`None` → XDG discovery).
+    pub classifier_model_path: Option<String>,
+    /// GLiNER post-sigmoid acceptance threshold.
+    pub classifier_threshold: f32,
+    /// Hypothetical questions generated per memory at write time.
+    pub hype_num_questions: usize,
+}
+
+impl Default for ExtractorTuningSpawnConfig {
+    fn default() -> Self {
+        Self {
+            resolver_embed_threshold: brain_extractors::resolver::EMBED_RESOLVE_THRESHOLD,
+            classifier_model_path: None,
+            classifier_threshold: brain_extractors::classifier::DEFAULT_GLINER_THRESHOLD,
+            hype_num_questions: 6,
+        }
+    }
+}
+
+/// Knobs ferried from `Config.index` into the spawn path. Tantivy
+/// group-commit cadence.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexSpawnConfig {
+    pub tantivy_commit_n: usize,
+    pub tantivy_commit_ms: u64,
+}
+
+impl Default for IndexSpawnConfig {
+    fn default() -> Self {
+        Self {
+            tantivy_commit_n: brain_ops::index::text_indexer::DEFAULT_COMMIT_N,
+            tantivy_commit_ms: brain_ops::index::text_indexer::DEFAULT_COMMIT_MS,
+        }
+    }
+}
+
 impl ShardSpawnConfig {
     /// Construct with arena under `data_dir`, every other knob
     /// defaulted. The caller supplies the embedding `dispatcher`
@@ -502,6 +663,12 @@ impl ShardSpawnConfig {
             extractor: ExtractorSpawnConfig::default(),
             temporal_edge: TemporalEdgeSpawnConfig::default(),
             causal_edge: CausalEdgeSpawnConfig::default(),
+            statement_reclaim: StatementReclaimSpawnConfig::default(),
+            ambiguity_resolver: AmbiguityResolverSpawnConfig::default(),
+            confidence_sweep: ConfidenceSweepSpawnConfig::default(),
+            llm_cache_sweep: LlmCacheSweepSpawnConfig::default(),
+            extractor_tuning: ExtractorTuningSpawnConfig::default(),
+            index: IndexSpawnConfig::default(),
             dispatcher,
             rerank: RerankSpawnConfig::default(),
             extractors: ExtractorTierSpawnConfig::default(),
@@ -878,6 +1045,22 @@ impl ShardHandle {
             .map_err(|_| ShardError::ShardDisconnected)
     }
 
+    /// Sample this shard's on-disk storage footprint for the admin
+    /// `/metrics` exposition. The shard handler stats the WAL
+    /// directory and `metadata.redb`, and reads the arena
+    /// capacity / allocator occupancy in-process.
+    pub async fn storage_stats(&self) -> Result<StorageStatsSnapshot, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::StorageStats { reply_tx })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)
+    }
+
     /// Pause / resume / run-now a named background worker on
     /// this shard. Returns `Ok(true)` iff the worker exists,
     /// `Ok(false)` if there's no such worker (caller should reply
@@ -1117,6 +1300,68 @@ struct Shard {
     hnsw_shared: SharedHnsw,
 }
 
+impl Shard {
+    /// Count the live rows in `MEMORIES_TABLE`. There is exactly one
+    /// arena slot per memory row (occupied + tombstoned until reclaimed),
+    /// so this is the authoritative source for arena occupancy on the
+    /// `/metrics` path. A read failure degrades to 0 so a transient redb
+    /// hiccup never fails the scrape.
+    fn memory_row_count(&self) -> u64 {
+        use brain_metadata::tables::memory::MEMORIES_TABLE;
+        use redb::ReadableTableMetadata;
+
+        let Ok(rtxn) = self.ops.executor.metadata.read_txn() else {
+            return 0;
+        };
+        let Ok(table) = rtxn.open_table(MEMORIES_TABLE) else {
+            return 0;
+        };
+        table.len().unwrap_or(0)
+    }
+
+    /// Sample the shard's on-disk storage footprint for `/metrics`.
+    /// WAL + metadata sizes are stat'd off disk; arena capacity comes
+    /// from the live arena header. Occupancy is the metadata memory-row
+    /// count, not the arena `SlotAllocator`: the writer allocates slots
+    /// from its own in-process counter, so the `SlotAllocator` never
+    /// advances and would always report 0. Blocking `fs::metadata` is
+    /// fine here — this runs on the shard's own core at scrape cadence,
+    /// and a missing/rotated file degrades to 0 rather than failing the
+    /// scrape.
+    fn storage_stats(&self) -> StorageStatsSnapshot {
+        let metadata_path = self.ops.executor.metadata.path().to_path_buf();
+        let metadata_size_bytes = std::fs::metadata(&metadata_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        // The shard root is metadata.redb's parent; derive the wal dir
+        // from it so we go through the same layout the writer uses.
+        let wal_dir = metadata_path
+            .parent()
+            .map(|root| brain_storage::ShardPaths::at(root).wal_dir())
+            .unwrap_or_else(|| metadata_path.clone());
+        let (wal_size_bytes, wal_segments) = brain_storage::wal_segment_stats(&wal_dir);
+
+        let capacity_slots = self.arena.borrow().capacity_slots();
+        let arena_capacity_bytes = capacity_slots * brain_storage::SLOT_SIZE_BYTES as u64;
+        let arena_slots_used = self.memory_row_count();
+        // The free-list reclamation worker isn't wired yet, so there are
+        // no reclaimed-and-reusable slots to report.
+        let arena_slots_free = 0;
+        let arena_used_bytes = arena_slots_used * brain_storage::SLOT_SIZE_BYTES as u64;
+
+        StorageStatsSnapshot {
+            wal_size_bytes,
+            wal_segments,
+            metadata_size_bytes,
+            arena_capacity_bytes,
+            arena_used_bytes,
+            arena_slots_used,
+            arena_slots_free,
+        }
+    }
+}
+
 /// Register every background worker against `scheduler`, plugging in
 /// real adapters for `RebuildSource`, `WalRetentionSource`,
 /// and `SnapshotSource`. `Summarizer` is injected by `main.rs` (OpenAI
@@ -1274,6 +1519,12 @@ pub fn spawn_shard(
     let extractor_spawn_cfg_for_closure = cfg.extractor.clone();
     let temporal_edge_spawn_cfg_for_closure = cfg.temporal_edge.clone();
     let causal_edge_spawn_cfg_for_closure = cfg.causal_edge.clone();
+    let statement_reclaim_spawn_cfg = cfg.statement_reclaim;
+    let ambiguity_resolver_spawn_cfg = cfg.ambiguity_resolver;
+    let confidence_sweep_spawn_cfg = cfg.confidence_sweep;
+    let llm_cache_sweep_spawn_cfg = cfg.llm_cache_sweep;
+    let extractor_tuning_spawn_cfg = cfg.extractor_tuning.clone();
+    let index_spawn_cfg = cfg.index;
 
     // ---- Cross-encoder (rerank) capability gate ----------------------------
     //
@@ -1454,19 +1705,56 @@ pub fn spawn_shard(
                         .expect("EntityHnswIndex::new"),
                 ),
             );
+            // Per-shard HyPE pool (hypothetical-question embeddings).
+            // Written by the extractor worker's HyPE generator when
+            // generation is enabled; probed by the semantic retriever on
+            // every memory search. In-memory only — rebuilt below from the
+            // durable `hype_question_vectors` rows. Always constructed: a
+            // read probe of an empty pool is a cheap no-op, so reads can
+            // probe unconditionally even on a shard that isn't generating.
+            let hype_hnsw_for_shard: Arc<parking_lot::RwLock<HypeHnswIndex>> = Arc::new(
+                parking_lot::RwLock::new(
+                    HypeHnswIndex::new(brain_index::hype_default_params())
+                        .expect("HypeHnswIndex::new"),
+                ),
+            );
+            // Per-shard per-statement question-bridge pool. Gated on
+            // BRAIN_STATEMENT_QUESTION_BRIDGE so the default path pays no
+            // generation cost: `None` leaves both the embed worker and the
+            // semantic retriever without it (statement search stays
+            // direct-cosine only). When enabled it is rebuilt below from the
+            // durable `statement_question_vectors` rows.
+            let statement_question_hnsw_for_shard: Option<
+                Arc<parking_lot::RwLock<StatementQuestionHnswIndex>>,
+            > = if statement_question_bridge_enabled() {
+                Some(Arc::new(parking_lot::RwLock::new(
+                    StatementQuestionHnswIndex::new(
+                        brain_index::statement_question_hnsw::statement_question_default_params(),
+                    )
+                    .expect("StatementQuestionHnswIndex::new"),
+                )))
+            } else {
+                None
+            };
             // Per-shard semantic retriever. Reuses the executor's
             // embedder + the shared memory HNSW reader. The statement
             // HNSW handle lets the retriever fan out to the statement
             // corpus when `SemanticScope::Statement` or
             // `SemanticScope::Both` is requested.
-            let semantic_retriever_for_ops: Arc<dyn brain_index::SemanticRetriever> = Arc::new(
+            let mut semantic_retriever_concrete =
                 brain_ops::index::semantic_retriever::BrainSemanticRetriever::new(
                     dispatcher.clone(),
                     hnsw_shared.clone(),
                     Some(statement_hnsw_for_shard.clone()),
                     metadata.clone(),
-                ),
-            );
+                )
+                .with_hype_index(hype_hnsw_for_shard.clone());
+            if let Some(ref sq) = statement_question_hnsw_for_shard {
+                semantic_retriever_concrete =
+                    semantic_retriever_concrete.with_statement_question_index(sq.clone());
+            }
+            let semantic_retriever_for_ops: Arc<dyn brain_index::SemanticRetriever> =
+                Arc::new(semantic_retriever_concrete);
             // Per-shard graph retriever. Reads from the entity /
             // relation / statement redb tables.
             let graph_retriever_for_ops: Arc<dyn brain_index::GraphRetriever> = Arc::new(
@@ -1565,33 +1853,43 @@ pub fn spawn_shard(
             let (forget_cascade_sender, forget_cascade_receiver) =
                 flume::bounded::<brain_ops::ForgetCascadeJob>(1024);
 
+            // Per-shard SchemaMigrationWorker channel. Always wired: a
+            // SCHEMA_UPLOAD that narrows a namespace must flag the
+            // statements/relations now outside it (the OUTSIDE_ACTIVE_SCHEMA
+            // sweep), so the writer enqueues a `SchemaFlagSweepJob`
+            // post-commit and this worker drains it. Both ends share one
+            // metrics Arc so the writer's enqueue-drop counter and the
+            // worker's sweep counts surface together.
+            let schema_migration_metrics = Arc::new(brain_ops::SchemaMigrationMetrics::new());
+            let (schema_flag_sweep_sender, schema_flag_sweep_receiver) =
+                flume::bounded::<brain_ops::SchemaFlagSweepJob>(1024);
+
             // Materialise the persisted `EXTRACTORS_TABLE`
             // rows (seeded by the system-schema bootstrap at
             // MetadataDb::open) into a runtime ExtractorRegistry.
             //
             // The LLM-tier deps the materializer
-            // needs: a `ModelRouter` built from provider keys (env
-            // ANTHROPIC_API_KEY / OPENAI_API_KEY first, then the `[llm]`
-            // config section) and the per-shard `llm_cache.redb`. Both
-            // slots default to `None` so shards started without an LLM
-            // cache or any key configured stay unchanged.
+            // needs: a `ModelRouter` built from the provider key (env
+            // BRAIN_API_KEY first, then the `[llm]` config section) and
+            // the per-shard `llm_cache.redb`. Both slots default to
+            // `None` so shards started without an LLM cache or any key
+            // configured stay unchanged.
             let llm_deps =
                 llm_setup::build_llm_deps(&shard_dir_for_executor, &llm_config_for_closure);
             // The LLM tier is on (all tiers default to enabled) but no
-            // provider client could be built — no OPENAI_API_KEY /
-            // ANTHROPIC_API_KEY in the env and no `[llm]` key in config.
-            // This is the expected out-of-box state, not a
-            // misconfiguration: pattern + classifier still extract
-            // entities; only statements/relations (LLM-only) are
-            // skipped. So it's INFO, not WARN — the server boots clean.
-            // The note stays discoverable for anyone wondering why a
-            // memory has entities but no typed-graph.
+            // provider client could be built — no BRAIN_API_KEY in the
+            // env and no `[llm] api_key` in config. This is the expected
+            // out-of-box state, not a misconfiguration: pattern +
+            // classifier still extract entities; only statements/relations
+            // (LLM-only) are skipped. So it's INFO, not WARN — the server
+            // boots clean. The note stays discoverable for anyone
+            // wondering why a memory has entities but no typed-graph.
             if llm_tier_enabled_for_closure && llm_deps.router.is_none() {
                 tracing::info!(
                     target: "brain_server::shard",
-                    "LLM extractor tier has no provider key (set OPENAI_API_KEY / \
-                     ANTHROPIC_API_KEY or `[llm] openai_api_key` in config); entities \
-                     still extract, statements/relations are skipped until a key is set",
+                    "LLM extractor tier has no provider key (set BRAIN_API_KEY or \
+                     `[llm] api_key` in config); entities still extract, \
+                     statements/relations are skipped until a key is set",
                 );
             }
             let llm_cache_for_ops = llm_deps.cache.clone();
@@ -1600,6 +1898,14 @@ pub fn spawn_shard(
             // wires it directly into the resolver path so ambiguous-
             // band partial matches get a second opinion.
             let entity_disambiguator_for_worker = llm_deps.disambiguator.clone();
+            // Snapshot the primary LLM client + model for the HyPE
+            // generator, before `llm_deps` is consumed below. `None` when
+            // no provider key resolved — HyPE generation then stays off.
+            let hype_client_for_worker = llm_deps.primary_client.clone();
+            let hype_model_for_worker = llm_deps.primary_model.clone();
+            // Dedicated cache handle for the HyPE generator: `llm_cache_for_ops`
+            // is moved into OpsContext below, so snapshot the Arc now.
+            let hype_cache_for_worker = llm_deps.cache.clone();
 
             // Tantivy is opened (and any post-recovery rebuilds run)
             // before the executor closure spawns — see "Tantivy open
@@ -1610,8 +1916,8 @@ pub fn spawn_shard(
             let tantivy_for_ops = tantivy_for_closure;
 
             // Resolve the classifier model config. Cascades through
-            // `BRAIN_NER_MODEL_PATH` (operator override) and the XDG
-            // default location populated by
+            // `[extractors.classifier] model_path` (operator override)
+            // and the XDG default location populated by
             // `.devcontainer/bootstrap-model.sh`, mirroring the bootstrap
             // script's own resolution order so an operator who ran the
             // script gets a working classifier on the next boot without
@@ -1621,7 +1927,20 @@ pub fn spawn_shard(
             // extractors instead of degraded ones) and the same
             // `ClassifierConfig` stays on the OpsContext for diagnostic
             // reporting.
-            let classifier_config = brain_extractors::ClassifierConfig::auto_discover();
+            // An explicit `[extractors.classifier] model_path` override
+            // wins; otherwise fall back to the XDG-cascade discovery the
+            // bootstrap script writes to. The configured acceptance
+            // threshold is stamped on whichever config wins.
+            let mut classifier_config =
+                match &extractor_tuning_spawn_cfg.classifier_model_path {
+                    Some(path) if !path.is_empty() => {
+                        brain_extractors::ClassifierConfig::with_model_path(
+                            std::path::PathBuf::from(path),
+                        )
+                    }
+                    _ => brain_extractors::ClassifierConfig::auto_discover(),
+                };
+            classifier_config.threshold = extractor_tuning_spawn_cfg.classifier_threshold;
 
             // Load the NER backbone if the operator configured one.
             // Fail-stop when the path is set but loading fails:
@@ -1656,7 +1975,7 @@ pub fn spawn_shard(
                         target: "brain_server::shard",
                         expected = %expected,
                         "classifier tier inactive (no model at default path or via \
-                         BRAIN_NER_MODEL_PATH); only the pattern tier will contribute",
+                         [extractors.classifier] model_path); only the pattern tier will contribute",
                     );
                     None
                 };
@@ -1680,19 +1999,37 @@ pub fn spawn_shard(
 
                 let materialize_deps = llm_deps
                     .into_materialize_deps(classifier_model, entity_type_qnames);
-                let (reg, errors) = brain_extractors::build_registry_with_gate(
+                let (mut reg, errors) = brain_extractors::build_registry_with_gate(
                     &defs,
                     &materialize_deps,
                     tier_gate_for_closure,
                 );
-                for (id, err) in errors {
-                    tracing::warn!(
-                        target: "brain_server::shard",
-                        extractor_id = id.raw(),
-                        error = %err,
-                        "extractor materialise failed; skipping",
+                if !errors.is_empty() {
+                    // An *enabled* extractor tier that fails to materialise
+                    // is a hard spawn failure, not a silent degrade: a shard
+                    // serving with a quietly-missing tier returns wrong audit
+                    // status on every ENCODE and hides the misconfiguration.
+                    // Disabled tiers never reach here — the materialiser skips
+                    // them before any fallible work — so every error is an
+                    // opted-in tier that broke or a corrupt definition.
+                    // Fail-stop, the same convention the classifier-model load
+                    // above uses.
+                    let detail = errors
+                        .iter()
+                        .map(|(id, err)| format!("extractor {}: {err}", id.raw()))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    panic!(
+                        "enabled extractor tier(s) failed to initialise at shard spawn: {detail}"
                     );
                 }
+                // Register the native built-in temporal-expressions
+                // extractor (pattern tier, deterministic date arithmetic
+                // — not materialisable from a regex schema def). Always
+                // wired; runs under the pattern-tier gate.
+                reg.register(std::sync::Arc::new(
+                    brain_extractors::TemporalExtractor::new(),
+                ));
                 reg
             };
 
@@ -1705,7 +2042,10 @@ pub fn spawn_shard(
             // No-schema deployments (no tantivy handle) skip
             // both.
             let (memory_text_dispatcher_for_ops, statement_text_dispatcher_for_ops) = {
-                let policy = brain_ops::index::text_indexer::CommitPolicy::from_env();
+                let policy = brain_ops::index::text_indexer::CommitPolicy::new(
+                    index_spawn_cfg.tantivy_commit_n.max(1),
+                    std::time::Duration::from_millis(index_spawn_cfg.tantivy_commit_ms.max(1)),
+                );
 
                 let memory_dispatcher = {
                     let (dispatcher, receiver) =
@@ -1781,6 +2121,11 @@ pub fn spawn_shard(
             // surface together.
             real_writer.set_forget_cascade_sender(forget_cascade_sender);
             real_writer.set_forget_cascade_metrics(forget_cascade_metrics.clone());
+            // Always wired: the schema-flag sweep is correctness (keeps the
+            // OUTSIDE_ACTIVE_SCHEMA flag accurate after a narrowing upload),
+            // not an optional feature.
+            real_writer.set_schema_flag_sweep_sender(schema_flag_sweep_sender);
+            real_writer.set_schema_flag_sweep_metrics(schema_migration_metrics.clone());
             let writer: Arc<dyn WriterHandle> = Arc::new(real_writer);
             let executor_ctx = ExecutorContext::new(
                 dispatcher.clone(),
@@ -2097,6 +2442,75 @@ pub fn spawn_shard(
                 ),
             }
 
+            // HyPE pool rebuild: re-insert every persisted
+            // hypothetical-question vector into the in-RAM index. Unlike
+            // the entity index there is no re-embed fallback — the vectors
+            // are the durable source of truth, so a missing/empty table
+            // just means an empty pool (a fresh shard, or HyPE never
+            // generated). The open_table error on a never-written table is
+            // expected and logged at INFO, not ERROR.
+            match metadata.read_txn() {
+                Ok(rtxn) => match brain_metadata::hype_iter_all_vectors(&rtxn) {
+                    Ok(points) if !points.is_empty() => {
+                        let report = hype_hnsw_for_shard.write().rebuild(points);
+                        info!(
+                            shard_id,
+                            inserted = report.inserted,
+                            memories = report.memories,
+                            "HyPE HNSW rebuilt from metadata on startup"
+                        );
+                    }
+                    Ok(_) => info!(shard_id, "no HyPE vectors to rebuild; pool starts empty"),
+                    Err(e) => info!(
+                        shard_id,
+                        error = ?e,
+                        "HyPE pool empty or table absent; pool starts empty"
+                    ),
+                },
+                Err(e) => error!(
+                    shard_id,
+                    error = ?e,
+                    "HyPE HNSW startup rebuild: read_txn failed"
+                ),
+            }
+
+            // Statement question-bridge rebuild (only when wired): re-insert
+            // every persisted per-statement question vector. Same durable-
+            // source-of-truth model as the HyPE pool.
+            if let Some(ref sq) = statement_question_hnsw_for_shard {
+                match metadata.read_txn() {
+                    Ok(rtxn) => {
+                        match brain_metadata::statement_question::ops::statement_question_iter_all(
+                            &rtxn,
+                        ) {
+                            Ok(points) if !points.is_empty() => {
+                                let report = sq.write().rebuild(points);
+                                info!(
+                                    shard_id,
+                                    inserted = report.inserted,
+                                    statements = report.statements,
+                                    "statement question-bridge rebuilt from metadata on startup"
+                                );
+                            }
+                            Ok(_) => info!(
+                                shard_id,
+                                "no statement question vectors to rebuild; pool starts empty"
+                            ),
+                            Err(e) => info!(
+                                shard_id,
+                                error = ?e,
+                                "statement question-bridge empty or table absent; starts empty"
+                            ),
+                        }
+                    }
+                    Err(e) => error!(
+                        shard_id,
+                        error = ?e,
+                        "statement question-bridge startup rebuild: read_txn failed"
+                    ),
+                }
+            }
+
             // Recovery: re-enqueue every live statement so the
             // StatementEmbedWorker repopulates the (in-RAM, non-persisted)
             // statement HNSW. Runs in the background off the embed queue, so
@@ -2170,6 +2584,7 @@ pub fn spawn_shard(
             // wiring it adds nothing but a wakeup every hour.
             if ops.llm_cache.is_some() {
                 let sweeper = LlmCacheSweeper::new()
+                    .with_interval_secs(llm_cache_sweep_spawn_cfg.interval_secs)
                     .with_metrics(llm_cache_sweep_metrics_for_closure.clone());
                 scheduler
                     .register(Arc::new(sweeper), ops.clone())
@@ -2188,12 +2603,15 @@ pub fn spawn_shard(
             // create / supersede events) and the worker is a 1 s
             // ticking no-op.
             {
-                let worker = brain_workers::StatementEmbedWorker::new(
+                let mut worker = brain_workers::StatementEmbedWorker::new(
                     metadata.clone(),
                     statement_hnsw_for_shard.clone(),
                     dispatcher.clone(),
                 )
                 .with_metrics(statement_embed_metrics_for_closure.clone());
+                if let Some(ref sq) = statement_question_hnsw_for_shard {
+                    worker = worker.with_question_bridge(sq.clone());
+                }
                 scheduler
                     .register(Arc::new(worker), ops.clone())
                     .expect("register StatementEmbedWorker");
@@ -2211,6 +2629,7 @@ pub fn spawn_shard(
             // negligible cost.
             {
                 let worker = brain_workers::ConfidenceSweepWorker::new(metadata.clone())
+                    .with_interval_secs(confidence_sweep_spawn_cfg.interval_secs)
                     .with_metrics(confidence_sweep_metrics_for_closure.clone());
                 scheduler
                     .register(Arc::new(worker), ops.clone())
@@ -2220,15 +2639,17 @@ pub fn spawn_shard(
             // StatementReclaimWorker — physically reclaims retracted
             // statement rows (plus their secondary-index + evidence-
             // overflow entries) after the retract grace period. Off by
-            // default; the worker reads `BRAIN_STATEMENT_RECLAIM_ENABLED`
-            // at construction and self-gates, so registering it
-            // unconditionally costs nothing when the operator hasn't
-            // opted in (the scheduler skips run_cycle on a disabled
-            // worker). Closes the tombstone-grace-then-reclaim loop on
-            // the statement side, mirroring slot reclamation for
+            // default; gated on `[workers.statement_reclaim] enabled`,
+            // so registering it unconditionally costs nothing when the
+            // operator hasn't opted in (the scheduler skips run_cycle on
+            // a disabled worker). Closes the tombstone-grace-then-reclaim
+            // loop on the statement side, mirroring slot reclamation for
             // memories.
             {
-                let worker = brain_workers::workers::statement_reclaim::StatementReclaimWorker::new();
+                let worker = brain_workers::workers::statement_reclaim::StatementReclaimWorker::new()
+                    .set_enabled(statement_reclaim_spawn_cfg.enabled)
+                    .with_grace_seconds(statement_reclaim_spawn_cfg.grace_seconds)
+                    .with_period_seconds(statement_reclaim_spawn_cfg.period_seconds);
                 scheduler
                     .register(Arc::new(worker), ops.clone())
                     .expect("register StatementReclaimWorker");
@@ -2312,6 +2733,49 @@ pub fn spawn_shard(
                     .expect("register ForgetCascadeWorker");
             }
 
+            // SchemaMigrationWorker — drains the writer's post-commit
+            // `SchemaFlagSweepJob` channel and (re)flags statements /
+            // relations that fall outside the active schema after a
+            // narrowing SCHEMA_UPLOAD. Without it the OUTSIDE_ACTIVE_SCHEMA
+            // flag never updates and ADMIN_LIST_STALE_STATEMENTS goes blind.
+            // Shares the metrics Arc handed to the writer above.
+            {
+                let worker = brain_workers::workers::schema_migration::SchemaMigrationWorker::new(
+                    schema_flag_sweep_receiver,
+                )
+                .with_metrics(schema_migration_metrics.clone());
+                scheduler
+                    .register(Arc::new(worker), ops.clone())
+                    .expect("register SchemaMigrationWorker");
+            }
+
+            // AuditLogSweeper — enforces the extractor-audit retention
+            // window (default 90d). Without it the extractor-audit table
+            // grows unbounded on long-running shards.
+            {
+                let worker = brain_workers::workers::audit_log_sweeper::AuditLogSweeper::new();
+                scheduler
+                    .register(Arc::new(worker), ops.clone())
+                    .expect("register AuditLogSweeper");
+            }
+
+            // AmbiguityResolverWorker — promotes / expires entries in the
+            // entity-merge review queue using the per-shard entity HNSW +
+            // embedder. Without it ambiguous resolutions accumulate and
+            // entity-resolution quality decays over time. Cheap ticking
+            // no-op on shards with no pending review rows.
+            {
+                let worker = brain_workers::AmbiguityResolverWorker::new(
+                    metadata.clone(),
+                    entity_hnsw_for_shard.clone(),
+                    dispatcher.clone(),
+                )
+                .with_interval_secs(ambiguity_resolver_spawn_cfg.interval_secs);
+                scheduler
+                    .register(Arc::new(worker), ops.clone())
+                    .expect("register AmbiguityResolverWorker");
+            }
+
             // Register the ExtractorWorker when its channel was
             // created above (i.e. when `cfg.extractor.enabled` is true).
             // The worker drains the writer's post-encode channel and
@@ -2333,6 +2797,8 @@ pub fn spawn_shard(
                         .llm_budget_per_cycle_micro_usd,
                     skip_already_extracted: extractor_spawn_cfg.skip_already_extracted,
                     batch_size: extractor_spawn_cfg.batch_size,
+                    hype_refresh_per_cycle:
+                        brain_workers::DEFAULT_EXTRACTOR_HYPE_REFRESH_PER_CYCLE,
                 };
                 let mut extractor_worker = ExtractorWorker::new(rx)
                     .with_config(worker_cfg)
@@ -2340,6 +2806,7 @@ pub fn spawn_shard(
                     .with_embed_deps(brain_extractors::resolver::EmbeddingDeps {
                         hnsw: entity_hnsw_for_shard.clone(),
                         embedder: dispatcher.clone(),
+                        embed_threshold: extractor_tuning_spawn_cfg.resolver_embed_threshold,
                     });
                 if let Some(d) = entity_disambiguator_for_worker.clone() {
                     extractor_worker = extractor_worker.with_entity_disambiguator(d);
@@ -2365,6 +2832,42 @@ pub fn spawn_shard(
                         whitelist_qnames: whitelist,
                     };
                     extractor_worker = extractor_worker.with_causal_edge_feed(feed);
+                }
+                // Wire the write-time HyPE generator. HyPE is a core
+                // accuracy feature — hypothetical-question embeddings are
+                // the cheap-read bridge that lets a user's phrasing match a
+                // memory it doesn't lexically resemble — so it runs by
+                // default whenever an LLM provider + cache are available,
+                // exactly like the other LLM-backed write-time tiers. It is
+                // not behind an on/off flag. The only tunable is the number
+                // of questions per memory (`[extractors.hype]
+                // num_questions`, default 6). A substrate-only deployment
+                // with no provider is an INFO skip, never a hard fail —
+                // HyPE enhances recall, it is never a correctness
+                // dependency.
+                match (hype_client_for_worker.clone(), hype_cache_for_worker.clone()) {
+                    (Some(client), Some(cache)) => {
+                        let num_questions = extractor_tuning_spawn_cfg.hype_num_questions.max(1);
+                        let generator = brain_workers::HypeGenerator::new(
+                            client,
+                            hype_model_for_worker.clone(),
+                            dispatcher.clone(),
+                            hype_hnsw_for_shard.clone(),
+                            metadata.clone(),
+                            cache,
+                            num_questions,
+                        );
+                        extractor_worker = extractor_worker.with_hype(generator);
+                        info!(
+                            shard_id,
+                            num_questions, "HyPE write-time generation enabled"
+                        );
+                    }
+                    _ => info!(
+                        shard_id,
+                        "no LLM provider/cache; HyPE generation skipped \
+                         (substrate-only deployment)"
+                    ),
                 }
                 scheduler
                     .register(Arc::new(extractor_worker), ops.clone())
@@ -2552,6 +3055,15 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     warn!(
                         shard_id = shard.shard_id,
                         "HnswSnapshot reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::StorageStats { reply_tx } => {
+                let stats = shard.storage_stats();
+                if reply_tx.send_async(stats).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "StorageStats reply dropped (caller gone)"
                     );
                 }
             }
@@ -2882,30 +3394,16 @@ fn run_extract_backfill(
 // Entity-type snapshot for zero-shot classifier labels
 // ---------------------------------------------------------------------------
 
-/// Snapshot the active schema's entity-type names as qnames
-/// (`brain:Person`, etc). Returned in stable id-order so the labels
-/// pass we hand to the classifier is deterministic across reopens
-/// and shards. Used by `materialize_classifier_extractor` to
-/// populate the per-extractor `target_labels` field.
-fn snapshot_entity_type_qnames(rtxn: &redb::ReadTransaction) -> Result<Vec<String>, redb::Error> {
-    use brain_metadata::tables::entity_type::ENTITY_TYPES_TABLE;
-    use redb::ReadableTable;
-
-    let t = rtxn.open_table(ENTITY_TYPES_TABLE)?;
-    let mut rows: Vec<(u32, String)> = Vec::new();
-    for entry in t.iter()? {
-        let (k, v) = entry?;
-        rows.push((k.value(), v.value().name));
-    }
-    rows.sort_by_key(|(id, _)| *id);
-    // System schema's entity-type registry pre-dates the namespace
-    // scheme; rows store bare names ("Person") and the implicit
-    // namespace is `brain:`. Prefix here so GLiNER's labels and the
-    // resolver's expected qname shape align.
-    Ok(rows
-        .into_iter()
-        .map(|(_, name)| format!("brain:{name}"))
-        .collect())
+/// Snapshot the active schema's entity-type names as classifier labels
+/// (`brain:Person`, …) in stable id-order. Used at shard spawn to seed the
+/// classifier's *fallback* labels; the worker re-reads the same snapshot every
+/// drain cycle (`brain_metadata::entity_type_label_qnames`) so a runtime
+/// `SCHEMA_UPLOAD` reaches the classifier without a restart. Delegates to the
+/// shared helper so the label convention has one source of truth.
+fn snapshot_entity_type_qnames(
+    rtxn: &redb::ReadTransaction,
+) -> Result<Vec<String>, brain_metadata::EntityTypeOpError> {
+    brain_metadata::entity_type_label_qnames(rtxn)
 }
 
 // ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
 use crate::tables::predicate::{
     PredicateDefinition, SchemaOrigin, PREDICATES_BY_QNAME_TABLE, PREDICATES_TABLE,
+    PREDICATE_EMBEDDINGS_TABLE,
 };
 
 // ---------------------------------------------------------------------------
@@ -53,10 +54,64 @@ fn validate_namespace(s: &str) -> Result<(), PredicateOpError> {
     validate_identifier(s, NAMESPACE_MAX_LEN, "namespace")
 }
 
-/// Validate a name segment of a predicate qname. Same grammar as
-/// namespace; different length bound.
+/// Validate a name segment of a predicate qname.
+///
+/// Predicate names are an OPEN vocabulary coined from arbitrary-domain,
+/// arbitrary-language source text (`作用于`, `wirkt_gegen`, `5ht2a_agonist`,
+/// `inhibits`). The grammar is therefore **structural-safety only**, not an
+/// ASCII/English grammar: any-script letters and digits plus `_`/`-` are
+/// accepted; only characters that would break the qname or the store are
+/// rejected (the `:` qname separator, whitespace, control chars). This keeps
+/// the write path from rejecting — and thereby dropping — a genuine non-English
+/// or symbol-bearing relation. Length is bounded by code points, not bytes, so
+/// a multibyte name isn't unfairly clipped.
 fn validate_name(s: &str) -> Result<(), PredicateOpError> {
-    validate_identifier(s, NAME_MAX_LEN, "name")
+    if s.is_empty() {
+        return Err(PredicateOpError::InvalidIdentifier {
+            reason: "name must not be empty",
+        });
+    }
+    if s.chars().count() > NAME_MAX_LEN {
+        return Err(PredicateOpError::InvalidIdentifier {
+            reason: "name exceeds 64 characters",
+        });
+    }
+    let mut saw_alnum = false;
+    let mut first = true;
+    for c in s.chars() {
+        // Structural hazards: `:` splits the qname; whitespace/control break
+        // storage, logging, and embedding-phrase derivation.
+        if c == ':' || c.is_whitespace() || c.is_control() {
+            return Err(PredicateOpError::InvalidIdentifier {
+                reason: "name must not contain ':', whitespace, or control characters",
+            });
+        }
+        let is_alnum = c.is_alphanumeric();
+        if is_alnum {
+            saw_alnum = true;
+        }
+        // A leading connector (`_`/`-`) reads as a malformed fragment, not a
+        // relation; require the name to start with an actual letter/digit.
+        if first && !is_alnum {
+            return Err(PredicateOpError::InvalidIdentifier {
+                reason: "name must start with a letter or digit",
+            });
+        }
+        // Body: letters/digits of any script, plus the two connectors a
+        // coined relation legitimately uses.
+        if !is_alnum && c != '_' && c != '-' {
+            return Err(PredicateOpError::InvalidIdentifier {
+                reason: "name may contain only letters, digits, '_', or '-'",
+            });
+        }
+        first = false;
+    }
+    if !saw_alnum {
+        return Err(PredicateOpError::InvalidIdentifier {
+            reason: "name must contain at least one letter or digit",
+        });
+    }
+    Ok(())
 }
 
 fn validate_identifier(s: &str, max: usize, label: &'static str) -> Result<(), PredicateOpError> {
@@ -197,6 +252,129 @@ pub fn predicate_list(
         }
         out.push(row.to_predicate());
     }
+    Ok(out)
+}
+
+/// Render the active predicates as a prompt block for the LLM extractor's
+/// `{DECLARED_PREDICATES}` placeholder. Each predicate becomes one bullet
+/// line of the form `qname (Kind, single|set): description`. This makes the
+/// extractor's closed vocabulary track the **active schema** at runtime —
+/// the seeded system core together with any predicates a user declared via
+/// `SCHEMA_UPLOAD` — so a user's declared predicate appears here
+/// automatically with no system-schema edits.
+///
+/// Predicates whose name starts with `behavior_` are excluded; they are
+/// procedural-memory sinks materialized by `MATERIALIZE_PROCEDURAL`, not
+/// extraction targets, and listing them only invites mis-mapping.
+pub fn render_declared_predicates_block(
+    rtxn: &ReadTransaction,
+) -> Result<String, PredicateOpError> {
+    let mut preds = predicate_list(rtxn, None)?;
+    // Stable order: namespace then name, so the prompt block (and its
+    // prompt-cache key) is deterministic across cycles.
+    preds.sort_by(|a, b| (a.namespace.as_str(), a.name.as_str()).cmp(&(&b.namespace, &b.name)));
+    let mut out = String::new();
+    for p in &preds {
+        if p.name.starts_with("behavior_") {
+            continue;
+        }
+        let kind = match p.kind_constraint {
+            Some(StatementKind::Fact) => "Fact",
+            Some(StatementKind::Preference) => "Preference",
+            Some(StatementKind::Event) => "Event",
+            Some(StatementKind::Attribute) => "Attribute",
+            Some(StatementKind::Relation) => "Relation",
+            Some(StatementKind::Directive) => "Directive",
+            Some(StatementKind::Custom(_)) | None => "any-kind",
+        };
+        let card = if p.is_stateful { "single" } else { "set" };
+        out.push_str("- ");
+        out.push_str(&p.namespace);
+        out.push(':');
+        out.push_str(&p.name);
+        out.push_str(" (");
+        out.push_str(kind);
+        out.push_str(", ");
+        out.push_str(card);
+        out.push(')');
+        if !p.description.is_empty() {
+            out.push_str(": ");
+            out.push_str(&p.description);
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Store the semantic embedding for a predicate. Called when a predicate
+/// is first interned at extraction time. `vec` is the BGE-small output
+/// (384 dims); stored as little-endian `f32` bytes. Idempotent overwrite.
+pub fn predicate_embedding_put(
+    wtxn: &WriteTransaction,
+    predicate_id: PredicateId,
+    vec: &[f32],
+) -> Result<(), PredicateOpError> {
+    let mut bytes = Vec::with_capacity(vec.len() * 4);
+    for f in vec {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    let mut t = wtxn.open_table(PREDICATE_EMBEDDINGS_TABLE)?;
+    t.insert(predicate_id.raw(), bytes.as_slice())?;
+    Ok(())
+}
+
+/// Load a predicate's embedding, decoding the little-endian `f32` bytes.
+/// Returns `None` when no vector was stored (e.g. predicates interned
+/// before the embedding pass, or user-authored facts with no extractor
+/// embedding).
+pub fn predicate_embedding_get(
+    rtxn: &ReadTransaction,
+    predicate_id: PredicateId,
+) -> Result<Option<Vec<f32>>, PredicateOpError> {
+    let t = rtxn.open_table(PREDICATE_EMBEDDINGS_TABLE)?;
+    let Some(g) = t.get(predicate_id.raw())? else {
+        return Ok(None);
+    };
+    let bytes = g.value();
+    let mut out = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(Some(out))
+}
+
+/// Record one sighting of an undeclared predicate qname in the review
+/// queue, incrementing its count. Called by the extractor's closed-vocab
+/// gate when a proposed predicate isn't in the active schema, so the
+/// candidate is captured durably for later promotion instead of silently
+/// lost. Composed inside the caller's write txn.
+pub fn predicate_review_record(
+    wtxn: &WriteTransaction,
+    qname: &str,
+) -> Result<(), PredicateOpError> {
+    let mut t = wtxn.open_table(crate::tables::predicate::PREDICATE_REVIEW_QUEUE_TABLE)?;
+    let prev = t.get(qname)?.map(|g| g.value()).unwrap_or(0);
+    t.insert(qname, &prev.saturating_add(1))?;
+    Ok(())
+}
+
+/// List the review queue as `(qname, count)` pairs, descending by count.
+/// For operator review — which coined predicates recur enough to promote.
+pub fn predicate_review_list(
+    rtxn: &ReadTransaction,
+) -> Result<Vec<(String, u64)>, PredicateOpError> {
+    let t = match rtxn.open_table(crate::tables::predicate::PREDICATE_REVIEW_QUEUE_TABLE) {
+        Ok(t) => t,
+        // Never-written table on a fresh DB → empty queue.
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out: Vec<(String, u64)> = Vec::new();
+    for entry in t.iter()? {
+        let (k, v) = entry?;
+        out.push((k.value().to_string(), v.value()));
+    }
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     Ok(out)
 }
 
@@ -517,6 +695,28 @@ mod tests {
     }
 
     #[test]
+    fn embedding_round_trips() {
+        let (_dir, db) = open_db();
+        let pid = PredicateId::from(42);
+        let vec: Vec<f32> = (0..384).map(|i| (i as f32) * 0.001 - 0.19).collect();
+        {
+            let wtxn = db.begin_write().unwrap();
+            predicate_embedding_put(&wtxn, pid, &vec).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.begin_read().unwrap();
+        let got = predicate_embedding_get(&rtxn, pid).unwrap().unwrap();
+        assert_eq!(got.len(), 384);
+        for (a, b) in got.iter().zip(vec.iter()) {
+            assert!((a - b).abs() < 1e-9, "{a} != {b}");
+        }
+        // Absent predicate → None.
+        assert!(predicate_embedding_get(&rtxn, PredicateId::from(99))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn intern_fresh_allocates_id_one() {
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
@@ -739,13 +939,32 @@ mod tests {
     }
 
     #[test]
-    fn invalid_name_with_hyphen() {
+    fn name_accepts_open_vocabulary_forms() {
+        // Predicate names are an open vocabulary. Hyphens, digits, non-ASCII
+        // letters, and CJK are all legitimate relation surfaces and must NOT
+        // be rejected — rejecting would silently drop a real fact.
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
-        let err = predicate_intern(&wtxn, "brain", "is-a", None, 0, 1, "", false, 0).unwrap_err();
-        matches!(err, PredicateOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
+        for name in ["is-a", "5ht2a_agonist", "co2_binds", "wirkt_gegen", "作用于"] {
+            predicate_intern(&wtxn, "brain", name, None, 0, 1, "", false, 0)
+                .unwrap_or_else(|e| panic!("open-vocab name {name:?} must intern, got {e:?}"));
+        }
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn name_rejects_structural_hazards() {
+        // Only structurally-unsafe names are rejected: the qname separator,
+        // whitespace, and a leading connector.
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        for bad in ["is:a", "works at", "_leading", "-leading", "\tctrl"] {
+            let err = predicate_intern(&wtxn, "brain", bad, None, 0, 1, "", false, 0)
+                .expect_err("structurally-unsafe name must be rejected");
+            matches!(err, PredicateOpError::InvalidIdentifier { .. })
+                .then_some(())
+                .unwrap_or_else(|| panic!("expected InvalidIdentifier for {bad:?}"));
+        }
     }
 
     // ----- Open-vocabulary intern path. -----

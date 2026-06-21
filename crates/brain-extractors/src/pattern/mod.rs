@@ -4,5 +4,7 @@
 //! three tiers. Runs synchronously during ENCODE.
 
 pub mod extractor;
+pub mod temporal;
 
 pub use extractor::{CompiledRegex, PatternExtractor};
+pub use temporal::TemporalExtractor;

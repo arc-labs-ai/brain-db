@@ -77,6 +77,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             embedding_model_fp,
             content_hash: _,
             deduplicate,
+            occurred_at_unix_nanos,
             ..
         } => Some(WalPayload::Encode(EncodePayload {
             memory_id: *id,
@@ -100,6 +101,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             request_hash: [0; 32],
             response_payload: Vec::new(),
             deduplicate: *deduplicate,
+            occurred_at_unix_nanos: *occurred_at_unix_nanos,
         })),
 
         Phase::Link {
@@ -924,6 +926,7 @@ mod tests {
             salience: Salience::new(0.7),
             context: ContextId(3),
             created_at_unix_nanos: 1_700_000_000_000,
+            occurred_at_unix_nanos: None,
             arena_slot: 7,
             embedding_model_fp: [0xCC; 16],
             content_hash: Some([0xDD; 32]),

@@ -1,0 +1,15 @@
+{
+  "event_type": 0,
+  "memory_id": 33059591799037110662230,
+  "context_id": 1,
+  "text": "the sky is blue",
+  "kind": 0,
+  "salience": 0.5,
+  "timestamp_unix_nanos": 1700000000000000000,
+  "lsn": 42,
+  "graph_payload": null,
+  "edge_payload": null,
+  "stage_kind": null,
+  "stage_outcome": null,
+  "stage_payload": null
+}

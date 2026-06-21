@@ -47,7 +47,7 @@ pub mod layout;
 pub mod recovery;
 pub mod wal;
 
-pub use layout::{ensure_dirs, ShardPaths};
+pub use layout::{ensure_dirs, wal_segment_stats, ShardPaths};
 
 /// Slot size in bytes.
 pub const SLOT_SIZE_BYTES: usize = 1600;

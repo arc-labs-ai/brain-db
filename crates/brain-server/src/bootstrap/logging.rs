@@ -4,7 +4,7 @@
 //!
 //! - [`init_pre_config`] — called before the config is loaded so
 //!   startup errors are still captured. Defaults to a `compact`
-//!   formatter at `info` level; honors `BRAIN_LOG` / `RUST_LOG`.
+//!   formatter at `info` level; honors `BRAIN_LOG`.
 //! - [`reinit_from_config`] — called after `Config::load`. Switches
 //!   the formatter and level per the `[monitoring.logging]` section. Because
 //!   `tracing` only allows one global subscriber, this is a no-op if
@@ -20,10 +20,13 @@
 //!
 //! ## Environment
 //!
-//! The filter precedence is `BRAIN_LOG` > `RUST_LOG` > config
-//! `[logging.level]`. `BRAIN_LOG` is the operator-facing knob; the
-//! `RUST_LOG` fallback exists because every Rust crate the world over
-//! reads it, and surprising operators isn't worth being purist.
+//! There is exactly one log-level knob with one env override: the
+//! config `[monitoring.logging] level` is the source of truth, and
+//! `BRAIN_LOG` overrides it at runtime (the same env-first /
+//! config-fallback pattern Brain uses everywhere else). `RUST_LOG` is
+//! deliberately NOT consulted — a second env var that silently wins
+//! over the configured level is exactly the kind of surprise this
+//! consolidation removes.
 
 #![cfg(target_os = "linux")]
 
@@ -63,16 +66,17 @@ impl LogFormat {
     }
 }
 
-/// Build an [`EnvFilter`] from the environment with `default_level`
-/// as the fallback. Precedence: `BRAIN_LOG` > `RUST_LOG` >
-/// `default_level`.
+/// Build an [`EnvFilter`] with `default_level` (the configured
+/// `[monitoring.logging] level`) as the source of truth and `BRAIN_LOG`
+/// as the single runtime override. `RUST_LOG` is intentionally ignored
+/// so there is exactly one way to set the level.
 fn build_filter(default_level: &str) -> EnvFilter {
     if let Ok(s) = std::env::var("BRAIN_LOG") {
         if let Ok(f) = EnvFilter::try_new(s) {
             return f;
         }
     }
-    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level))
+    EnvFilter::new(default_level)
 }
 
 /// Install a minimal subscriber before the config is loaded. Idempotent

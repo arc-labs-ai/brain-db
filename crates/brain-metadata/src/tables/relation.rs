@@ -38,6 +38,18 @@ pub const RELATION_METADATA_TABLE: TableDefinition<'static, [u8; 16], RelationMe
 pub const RELATION_BY_EVIDENCE_TABLE: TableDefinition<'static, ([u8; 16], [u8; 16]), ()> =
     TableDefinition::new("relation_by_evidence");
 
+/// `relation_type_embeddings` — per-relation-type semantic vector, keyed
+/// by `RelationTypeId.raw()` (u32). Value is the embedding as
+/// little-endian `f32` bytes (BGE-small → 384 dims → 1536 bytes). Written
+/// when a relation type is first interned at extraction time; read by the
+/// grounded answer engine to match a query's relation against a subject's
+/// relation types by cosine (the "two-way match", alongside the exact
+/// qname index). Open-vocab relation types are never gated, so this is how
+/// a free relation type stays *findable* by a paraphrased question.
+/// Mirrors [`crate::tables::predicate::PREDICATE_EMBEDDINGS_TABLE`].
+pub const RELATION_TYPE_EMBEDDINGS_TABLE: TableDefinition<'static, u32, &[u8]> =
+    TableDefinition::new("relation_type_embeddings");
+
 // ---------------------------------------------------------------------------
 // Sidecar value type.
 // ---------------------------------------------------------------------------

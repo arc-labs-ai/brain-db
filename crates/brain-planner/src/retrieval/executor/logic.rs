@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use brain_core::EntityId;
 use brain_index::{
     GraphAnchor, GraphQuery, GraphRetriever, GraphRetrieverConfig, LexicalFilters, LexicalQuery,
     LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItem, RankedItemId,
@@ -43,9 +44,11 @@ use brain_metadata::MetadataDb;
 use brain_rerank::RerankService;
 use futures_lite::future::poll_fn;
 
+use crate::retrieval::diversity::{mmr_reorder, tokenize, MMR_LAMBDA_LIST, MMR_WINDOW};
 use crate::retrieval::filters::{apply_filter_chain, FilterChainStats, FilterError};
-use crate::retrieval::fusion::{fuse, FusedItem};
-use crate::retrieval::planner::{PreFilter, QueryPlan, RetrieverConfig};
+use crate::retrieval::fusion::{adaptive_k, fuse, FusedItem, FusionMethod};
+use crate::retrieval::planner::{PreFilter, QueryPlan, RetrieverConfig, LIST_MAX_TOP_N, MAX_TOP_N};
+use crate::retrieval::recency::apply_recency_boost;
 use crate::retrieval::rerank::{rerank_top_n, RerankCandidate, RERANK_TOP_N};
 use crate::retrieval::router::{GraphAnchorMode, QueryRequest, Retriever};
 
@@ -136,11 +139,142 @@ pub enum RetrieverStatus {
 pub enum ExecutionError {
     #[error("filter chain: {0}")]
     Filter(#[from] FilterError),
+    #[error("recency ranking: {0}")]
+    Recency(#[from] crate::retrieval::recency::RecencyError),
 }
 
 // ---------------------------------------------------------------------------
 // Entry point.
 // ---------------------------------------------------------------------------
+
+/// Run a plan, with one optional dynamic-k deepening pass.
+///
+/// The first pass runs at the planner's per-class `top_n`. If its
+/// post-filter survivor pool comes back below the caller's `limit`
+/// **and** at least one retriever returned a full page (its candidate
+/// cap was the binding constraint, so deeper retrieval can surface
+/// more) **and** the initial depth was below the per-class ceiling, the
+/// executor re-runs once at the ceiling and keeps whichever pass
+/// yielded more results. Recall-additive by construction: it fires only
+/// when the shallow pass would otherwise under-fill the request, so it
+/// can never trade away a hit the shallow pass already found. The cost
+/// is one extra fan-out, bounded to the under-recall case.
+pub async fn execute(
+    plan: &QueryPlan,
+    request: &QueryRequest,
+    include_statements: bool,
+    ctx: &RetrievalExecutorContext,
+) -> Result<QueryResult, ExecutionError> {
+    // Cue→anchor: when the router left a blind memory-from-semantic graph
+    // lane and the query names exactly one known entity, upgrade that
+    // lane to an entity-anchored walk seeded from the resolved subject.
+    // Returns a rewritten plan only when resolution succeeds; otherwise
+    // the original plan stands.
+    let rewritten = resolve_cue_anchor(plan, request, ctx);
+    let plan = rewritten.as_ref().unwrap_or(plan);
+
+    let result = execute_once(plan, request, include_statements, ctx).await?;
+
+    let ceiling = if plan.routing.list_intent {
+        LIST_MAX_TOP_N
+    } else {
+        MAX_TOP_N
+    };
+    // A retriever that returned at least its `top_n` page hit the cap —
+    // deeper retrieval may yield more. One that returned fewer has
+    // exhausted what the index holds for this query, so deepening it is
+    // wasted work. `retriever_total_results` is built in plan order.
+    let saturated = plan
+        .retrievers
+        .iter()
+        .zip(result.metadata.retriever_total_results.iter())
+        .any(|(r, (_retriever, total))| r.top_n > 0 && *total >= r.top_n);
+    let under_target = plan.limit > 0 && (result.items.len() as u32) < plan.limit;
+    let room_to_deepen = plan.retrievers.iter().any(|r| r.top_n < ceiling);
+
+    if under_target && saturated && room_to_deepen {
+        let mut deepened = plan.clone();
+        for r in &mut deepened.retrievers {
+            r.top_n = ceiling;
+            // Raise HNSW exploration to match the deeper page — a
+            // semantic top_k above ef_search would silently under-return.
+            if let RetrieverConfig::Semantic { ef_search, .. } = &mut r.config {
+                *ef_search = (*ef_search).max(ceiling);
+            }
+        }
+        let retry = execute_once(&deepened, request, include_statements, ctx).await?;
+        if retry.items.len() > result.items.len() {
+            return Ok(retry);
+        }
+    }
+
+    Ok(result)
+}
+
+/// Try to upgrade a blind memory-from-semantic graph lane to an
+/// entity-anchored walk by resolving the query's named subject.
+///
+/// Fires only when (a) the caller gave no explicit `entity_anchor`,
+/// (b) the plan has a `MemoryFromSemantic` graph lane to upgrade, and
+/// (c) the query text names **exactly one** entity that resolves by
+/// exact canonical name. Two distinct named entities, an unresolvable
+/// cue, or any resolution error all fall back to the original plan — a
+/// noisy guess is worse than the existing semantic-seeded walk, so the
+/// bar to switch is unambiguous single-subject resolution. Returns the
+/// rewritten plan, or `None` to keep the original.
+fn resolve_cue_anchor(
+    plan: &QueryPlan,
+    request: &QueryRequest,
+    ctx: &RetrievalExecutorContext,
+) -> Option<QueryPlan> {
+    if request.entity_anchor.is_some() {
+        return None;
+    }
+    let text = request.text.as_deref()?;
+    let has_blind_graph = plan.retrievers.iter().any(|r| {
+        matches!(
+            &r.config,
+            RetrieverConfig::Graph {
+                anchor_mode: GraphAnchorMode::MemoryFromSemantic,
+                ..
+            }
+        )
+    });
+    if !has_blind_graph {
+        return None;
+    }
+
+    let cues = crate::retrieval::router::entity_cue_candidates(text);
+    if cues.is_empty() {
+        return None;
+    }
+    let rtxn = ctx.metadata.read_txn().ok()?;
+    let mut resolved: Option<EntityId> = None;
+    for cue in &cues {
+        let ids = brain_metadata::entity_resolve_canonical_all_types(&rtxn, cue).ok()?;
+        for id in ids {
+            match resolved {
+                None => resolved = Some(id),
+                Some(prev) if prev == id => {}
+                // A second distinct entity — the query names more than
+                // one subject. A single-anchor walk can't honour both,
+                // so fall back rather than pick arbitrarily.
+                Some(_) => return None,
+            }
+        }
+    }
+    let eid = resolved?;
+
+    let mut p = plan.clone();
+    for r in &mut p.retrievers {
+        if let RetrieverConfig::Graph { anchor_mode, .. } = &mut r.config {
+            if matches!(anchor_mode, GraphAnchorMode::MemoryFromSemantic) {
+                *anchor_mode = GraphAnchorMode::MemoryFromEntityCue(eid);
+            }
+        }
+    }
+    Some(p)
+}
 
 /// Run a plan end-to-end. Returns the fused-then-filtered
 /// result plus metadata.
@@ -152,9 +286,10 @@ pub enum ExecutionError {
 /// top-K memory ids into the graph walk. We detect this
 /// up-front, run semantic eagerly, stash its output, and let
 /// the fan-out reuse it instead of re-invoking.
-pub async fn execute(
+async fn execute_once(
     plan: &QueryPlan,
     request: &QueryRequest,
+    include_statements: bool,
     ctx: &RetrievalExecutorContext,
 ) -> Result<QueryResult, ExecutionError> {
     let total_started = Instant::now();
@@ -185,7 +320,7 @@ pub async fn execute(
         None;
     if let Some(sem) = &pre_semantic_planned {
         let started = Instant::now();
-        let invocation = invoke_retriever(sem, request, ctx, None);
+        let invocation = invoke_retriever(sem, request, ctx, None, include_statements);
         pre_semantic_latency_ms = started.elapsed().as_secs_f64() * 1000.0;
         if let Ok(items) = &invocation {
             cached_semantic = Some(items.clone());
@@ -237,7 +372,8 @@ pub async fn execute(
         };
         futures.push(Box::pin(async move {
             let started = Instant::now();
-            let invocation = invoke_retriever(planned, request, ctx, pre_anchors);
+            let invocation =
+                invoke_retriever(planned, request, ctx, pre_anchors, include_statements);
             let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
             (idx, elapsed_ms, invocation)
         }));
@@ -300,12 +436,41 @@ pub async fn execute(
         }
     }
 
-    let fused = fuse(
-        &outputs,
-        plan.fusion.k,
-        &plan.fusion.weights,
-        plan.fusion.method,
-    );
+    // Non-LLM read-time query expansion (pseudo-relevance feedback) for
+    // the lexical lane. Fires only on low-specificity queries, where the
+    // bare BM25 term set is too thin to bridge the query↔memory phrasing
+    // gap. Pure local index math — harvests topical terms from the top
+    // hits and re-probes lexical. Fail-open: leaves `outputs` untouched
+    // on any miss, so it can never regress a hit the bare pass found.
+    maybe_apply_lexical_prf(&mut outputs, plan, request, ctx, include_statements);
+
+    // Read-side multi-hop: walk the typed graph N hops from the cue's anchor
+    // and inject the connected entities' names into the lexical lane, so a
+    // question that names neither the bridge nor the answer entity ("Niraj's
+    // manager") still reaches the answer doc ("Meera … Infosys"). Pure graph +
+    // tantivy + RRF; no read-side LLM, no client knowledge of the graph.
+    let graph_expanded =
+        maybe_apply_graph_expansion(&mut outputs, plan, request, ctx, include_statements);
+
+    // Adaptive RRF k from the actual candidate-pool size (small pools →
+    // smaller k → sharper top ranks). Falls back to the plan's k for
+    // non-RRF fusion methods, which don't use k.
+    let candidate_pool: usize = outputs.iter().map(|(_, v)| v.len()).sum();
+    let fusion_k = if plan.fusion.method == FusionMethod::Rrf {
+        adaptive_k(candidate_pool)
+    } else {
+        plan.fusion.k
+    };
+    // NOTE: the graph-expansion lane is intentionally NOT down-weighted. It is
+    // the load-bearing mechanism for entity-terminal multi-hop ("Niraj's
+    // manager's former employer's city" → Infosys → Bangalore): those answer
+    // docs surface ONLY through the expansion lane, so reducing its weight trades
+    // the multi-hop recall away. Taming the single-hop noise it can add (a
+    // neighbour doc edging out a direct hit) without losing multi-hop needs a
+    // signal the bare lanes don't carry — i.e. cross-encoder rerank, which is a
+    // deploy-time gate — not a fusion-weight cut here.
+    let _ = graph_expanded;
+    let fused = fuse(&outputs, fusion_k, &plan.fusion.weights, plan.fusion.method);
     let fused_len = fused.len();
 
     // Per-candidate fusion breakdown for deep diagnosis: which
@@ -328,22 +493,59 @@ pub async fn execute(
         }
     }
 
+    // Read pipeline order: filter the fused set BEFORE rerank. Reranking
+    // first would spend the cross-encoder window on tombstoned/superseded
+    // items and could push a valid hit out of the window behind junk that
+    // is about to be dropped. Filter WITHOUT the final limit cut (pass 0),
+    // rerank the survivors, then truncate to `limit` — applying the limit
+    // before rerank would collapse the rerank window whenever `limit` is
+    // smaller than it.
+    let (mut filtered, mut filter_stats) =
+        apply_filter_chain(fused, &plan.post_filters, ctx.metadata.as_ref(), 0)?;
+
+    // Recency ranking (soft, additive, RRF-scale). Only when the query
+    // carries a temporal signal — a temporal expression / explicit time
+    // filter (`temporal_pushdown`) or an `as_of` anchor — so timeless
+    // facts aren't penalised for being old. Reference point is the
+    // `as_of` anchor when set, else wall-clock now. Folded into
+    // `fused_score` BEFORE rerank so a fresh hit both enters the rerank
+    // window and carries its recency into the rerank blend.
+    let as_of = plan.post_filters.as_of_record_time_unix_nanos;
+    if plan.routing.temporal_pushdown || as_of.is_some() {
+        let reference_time = as_of.unwrap_or_else(now_unix_nanos);
+        apply_recency_boost(
+            &mut filtered,
+            ctx.metadata.as_ref(),
+            reference_time,
+            plan.fusion.weights.temporal,
+            plan.fusion.k,
+        )?;
+    }
+
     // Rerank is always-on: the stage fires whenever the shard has a
     // cross-encoder loaded, regardless of any request field. When
     // the operator disabled the load (`cross_encoder` is `None`),
     // the result is RRF-only with no error.
-    let (fused_after_rerank, rerank_outcome) = if ctx.cross_encoder.is_some() {
-        rerank_stage(fused, request, ctx).await
+    let (reranked, rerank_outcome) = if ctx.cross_encoder.is_some() {
+        rerank_stage(filtered, request, ctx).await
     } else {
-        (fused, None)
+        (filtered, None)
     };
 
-    let (items, filter_stats) = apply_filter_chain(
-        fused_after_rerank,
-        &plan.post_filters,
-        ctx.metadata.as_ref(),
-        plan.limit,
-    )?;
+    // Merge / diversity stage — internal, router-decided. Runs only when
+    // the router detected list/aggregation intent (a set question), so a
+    // single-answer query is never re-ordered. Spreads near-duplicate
+    // members across the head before the caller's `top_k` cut, so a list
+    // result is distinct items rather than paraphrases of the top one.
+    let mut items = reranked;
+    if plan.routing.list_intent {
+        apply_diversity(&mut items, ctx);
+    }
+
+    if plan.limit > 0 && items.len() > plan.limit as usize {
+        items.truncate(plan.limit as usize);
+    }
+    filter_stats.after_limit = items.len() as u32;
 
     let total_latency_ms = total_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -508,6 +710,60 @@ fn fetch_texts(
     Ok(out)
 }
 
+/// Run the merge / diversity (MMR) stage over the head of `items`.
+///
+/// Fetches text for the windowed memory hits, tokenizes it for the
+/// Jaccard redundancy term, and reorders in place via
+/// [`mmr_reorder`]. Best-effort: a text-fetch error or a non-memory /
+/// text-less hit just yields an empty token set (treated as maximally
+/// novel), so diversity degrades to relevance order rather than failing
+/// the read.
+fn apply_diversity(items: &mut Vec<FusedItem>, ctx: &RetrievalExecutorContext) {
+    let window = items.len().min(MMR_WINDOW);
+    if window <= 2 {
+        return;
+    }
+
+    let mem_ids: Vec<brain_core::MemoryId> = items
+        .iter()
+        .take(window)
+        .filter_map(|it| match it.id {
+            RankedItemId::Memory(m) => Some(m),
+            _ => None,
+        })
+        .collect();
+
+    let text_by_id: std::collections::HashMap<brain_core::MemoryId, String> =
+        match fetch_texts(&mem_ids, ctx) {
+            Ok(cands) => cands
+                .into_iter()
+                .filter_map(|c| match c.id {
+                    RankedItemId::Memory(m) => Some((m, c.text)),
+                    _ => None,
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    target: "brain_planner::executor",
+                    error = %e,
+                    "diversity text fetch failed; returning relevance order",
+                );
+                return;
+            }
+        };
+
+    let token_sets: Vec<std::collections::HashSet<String>> = items
+        .iter()
+        .take(window)
+        .map(|it| match it.id {
+            RankedItemId::Memory(m) => text_by_id.get(&m).map(|t| tokenize(t)).unwrap_or_default(),
+            _ => std::collections::HashSet::new(),
+        })
+        .collect();
+
+    mmr_reorder(items, &token_sets, MMR_LAMBDA_LIST);
+}
+
 // ---------------------------------------------------------------------------
 // Per-retriever invocation.
 // ---------------------------------------------------------------------------
@@ -522,10 +778,11 @@ fn invoke_retriever(
     req: &QueryRequest,
     ctx: &RetrievalExecutorContext,
     pre_anchors: Option<&[RankedItem]>,
+    include_statements: bool,
 ) -> Result<Vec<RankedItem>, RetrieverInvocationError> {
     match planned.retriever {
-        Retriever::Semantic => invoke_semantic(planned, req, ctx),
-        Retriever::Lexical => invoke_lexical(planned, req, ctx),
+        Retriever::Semantic => invoke_semantic(planned, req, ctx, include_statements),
+        Retriever::Lexical => invoke_lexical(planned, req, ctx, include_statements, &[]),
         Retriever::Graph => invoke_graph(planned, req, ctx, pre_anchors),
     }
 }
@@ -534,6 +791,7 @@ fn invoke_semantic(
     planned: &crate::retrieval::planner::PlannedRetriever,
     req: &QueryRequest,
     ctx: &RetrievalExecutorContext,
+    include_statements: bool,
 ) -> Result<Vec<RankedItem>, RetrieverInvocationError> {
     let handle = &ctx.semantic;
     let Some(text) = req.text.as_ref() else {
@@ -572,10 +830,12 @@ fn invoke_semantic(
         ef_search.saturating_mul(4).min(FILTERED_EF_CEILING)
     };
 
-    // Scope: Both when both text and entity_anchor present
-    // (statement HNSW may be empty in v1 → silent Ok([]));
-    // Memory otherwise.
-    let scope = if req.entity_anchor.is_some() {
+    // Scope: search the statement corpus alongside memories when the
+    // caller is a typed-graph QUERY (`include_statements`) or anchored
+    // an entity. RECALL stays memory-only — its projector drops
+    // non-memory hits, so statement candidates there are pure overhead.
+    // (Statement HNSW may be empty → silent Ok([]).)
+    let scope = if include_statements || req.entity_anchor.is_some() {
         SemanticScope::Both
     } else {
         SemanticScope::Memory
@@ -610,10 +870,485 @@ fn apply_pre_filter_to_semantic(pre: &Option<PreFilter>, filters: &mut SemanticF
     }
 }
 
+/// English stopwords plus interrogatives, dropped from the BM25 term
+/// set. A raw cue like "When did Caroline go to the LGBTQ support
+/// group?" otherwise dilutes BM25 toward high-document-frequency
+/// function words; ranking on the content words ({caroline, go, lgbtq,
+/// support, group}) lets the lexical signal land on what the question
+/// is actually about. Kept lowercase so the comparison can be done on
+/// already-lowercased tokens.
+static LEXICAL_STOPWORDS: &[&str] = &[
+    // interrogatives
+    "when", "what", "where", "who", "whom", "whose", "why", "how", "which",
+    // auxiliaries / copulas
+    "did", "does", "do", "is", "are", "was", "were", "be", "been", "being", "am", "has", "have",
+    "had", "will", "would", "shall", "should", "can", "could", "may", "might", "must",
+    // articles / determiners
+    "the", "a", "an", "this", "that", "these", "those", "some", "any", "no",
+    // prepositions / conjunctions
+    "of", "to", "in", "on", "at", "for", "and", "or", "with", "about", "from", "as", "by", "into",
+    "over", "after", "before", "between", "out", "up", "down", "off", "than", "then", "so", "but",
+    "if", "because", // pronouns
+    "it", "its", "i", "you", "he", "she", "they", "we", "his", "her", "hers", "their", "theirs",
+    "your", "yours", "my", "mine", "our", "ours", "me", "him", "them", "us",
+];
+
+/// Strip ASCII leading/trailing punctuation from a token, preserving
+/// inner apostrophes/hyphens (so "caroline's", "co-worker" survive).
+fn trim_token_punct(tok: &str) -> &str {
+    tok.trim_matches(|c: char| c.is_ascii_punctuation())
+}
+
+/// Build the BM25 term set from content words only: lowercase, strip
+/// surrounding punctuation, drop stopwords/question-words, dedup
+/// preserving first-seen order. If filtering empties the set (a cue
+/// made entirely of stopwords), fall back to the raw whitespace split
+/// so the lexical query is never empty.
+fn lexical_content_terms(text: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut terms: Vec<String> = Vec::new();
+    for raw in text.split_whitespace() {
+        let trimmed = trim_token_punct(raw);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lowered = trimmed.to_lowercase();
+        if LEXICAL_STOPWORDS.contains(&lowered.as_str()) {
+            continue;
+        }
+        if seen.insert(lowered.clone()) {
+            terms.push(lowered);
+        }
+    }
+    if terms.is_empty() {
+        // Degenerate guard: an all-stopword question keeps the raw
+        // split so BM25 still has something to match.
+        return text.split_whitespace().map(str::to_owned).collect();
+    }
+    terms
+}
+
+// ---------------------------------------------------------------------------
+// Pseudo-relevance feedback (RM3-lite) — non-LLM read-time expansion.
+// ---------------------------------------------------------------------------
+
+/// Only queries with at most this many content terms get a PRF pass. A
+/// rich query already pins the topic, so expanding it risks drift; a
+/// thin one ("Where did Caroline move from?" → {caroline, move}) is
+/// exactly where corpus terms bridge the phrasing gap.
+const PRF_MAX_QUERY_TERMS: usize = 3;
+
+/// How many top hits form the relevance-feedback set we harvest terms
+/// from. The top of the bare ranking is our best guess at on-topic text.
+const PRF_FEEDBACK_DOCS: usize = 5;
+
+/// How many harvested terms to append to the lexical query. Bounded so
+/// the expanded BM25 query stays focused and the re-probe stays cheap.
+const PRF_EXPANSION_TERMS: usize = 5;
+
+/// Minimum length for a harvested term — drops 1–2 char noise that
+/// survives stopword filtering ("ok", "id", stray initials).
+const PRF_MIN_TERM_LEN: usize = 3;
+
+/// Run pseudo-relevance feedback on the lexical lane when the query is
+/// low-specificity. Mutates `outputs` in place, unioning the
+/// expanded-query hits into the lexical entry (recall-additive). No-op
+/// on any gate miss, empty harvest, or retriever error.
+fn maybe_apply_lexical_prf(
+    outputs: &mut [(Retriever, Vec<RankedItem>)],
+    plan: &QueryPlan,
+    request: &QueryRequest,
+    ctx: &RetrievalExecutorContext,
+    include_statements: bool,
+) {
+    let Some(text) = request.text.as_deref() else {
+        return;
+    };
+    // Gate: low-specificity queries only.
+    let content = lexical_content_terms(text);
+    if content.len() > PRF_MAX_QUERY_TERMS {
+        return;
+    }
+    // Need a planned lexical retriever to re-probe with.
+    let Some(lex_planned) = plan
+        .retrievers
+        .iter()
+        .find(|r| r.retriever == Retriever::Lexical)
+    else {
+        return;
+    };
+
+    // Feedback set: the top memory hits we already have. Prefer the
+    // semantic lane (cosine-ranked, the strongest recall signal); fall
+    // back to the bare lexical hits when semantic is empty.
+    let feedback = prf_feedback_ids(outputs);
+    if feedback.is_empty() {
+        return;
+    }
+    let candidates = match fetch_texts(&feedback, ctx) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                target: "brain_planner::executor",
+                error = %e,
+                "PRF feedback text fetch failed; skipping expansion",
+            );
+            return;
+        }
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    let feedback_texts: Vec<&str> = candidates.iter().map(|c| c.text.as_str()).collect();
+    let expansion = prf_expansion_terms(&feedback_texts, &content);
+    if expansion.is_empty() {
+        return;
+    }
+
+    let expanded = match invoke_lexical(lex_planned, request, ctx, include_statements, &expansion) {
+        Ok(hits) => hits,
+        Err(_) => return,
+    };
+    if expanded.is_empty() {
+        return;
+    }
+
+    if let Some((_, lex_out)) = outputs.iter_mut().find(|(r, _)| *r == Retriever::Lexical) {
+        let before = lex_out.len();
+        merge_lexical_hits(lex_out, expanded, lex_planned.top_n);
+        tracing::debug!(
+            target: "brain_planner::executor",
+            query = text,
+            expansion = ?expansion,
+            lexical_before = before,
+            lexical_after = lex_out.len(),
+            "PRF expansion applied",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Graph query expansion — the read-side multi-hop mechanism.
+// ---------------------------------------------------------------------------
+
+/// Max BFS depth for graph query expansion. N-hop, not a fixed 2: complex
+/// memories chain several relations deep ("X's manager's former employer's
+/// city"), so the walk follows the relation graph to this depth over the raw
+/// relation tables. Bounded together with the name / fan-out caps so a dense
+/// hub can't blow up the probe.
+const GRAPH_EXPANSION_MAX_HOPS: usize = 4;
+
+/// Total connected-entity names harvested across the whole BFS. BFS order means
+/// nearer entities are collected first; the budget caps the expanded query so a
+/// hub's transitive closure stays a bounded term set.
+const GRAPH_EXPANSION_MAX_NAMES: usize = 24;
+
+/// Per-node branching cap so one highly-connected entity can't dominate the
+/// frontier (and the term budget).
+const GRAPH_EXPANSION_FANOUT: usize = 8;
+
+/// Graph query expansion — how the DB answers multi-hop reads with no read-side
+/// LLM and no client knowledge of the graph.
+///
+/// The client sends only text. A multi-hop cue — "Where did Niraj's manager
+/// work before?" — names neither the bridge entity ("Meera") nor the answer
+/// entity ("Infosys"), so the bare lexical/semantic probes can't reach the
+/// answer doc. But both are reachable from the cue's anchor by walking the typed
+/// graph: this resolves the anchor entities named in the cue, BFS-walks their
+/// relations up to [`GRAPH_EXPANSION_MAX_HOPS`] over the raw relation tables,
+/// and injects the connected entities' canonical names as extra terms into the
+/// lexical (tantivy) probe. BM25 then matches the answer doc on the resolved
+/// name, the semantic lane still matches the relation phrasing, and RRF fuses
+/// them. Going N-hop (not a fixed 2) is the point — deep chains
+/// ("…sister's husband's job") resolve because the BFS reaches the answer
+/// entity however many edges away it sits.
+///
+/// Recall-additive, mirroring [`maybe_apply_lexical_prf`]: the expanded hits are
+/// unioned into the lexical lane (or added as one if lexical produced none —
+/// e.g. a possessive cue the bare BM25 parse choked on), never dropping a bare
+/// hit. Fail-open on any miss (no anchor, empty graph, retriever error).
+fn maybe_apply_graph_expansion(
+    outputs: &mut Vec<(Retriever, Vec<RankedItem>)>,
+    plan: &QueryPlan,
+    request: &QueryRequest,
+    ctx: &RetrievalExecutorContext,
+    include_statements: bool,
+) -> bool {
+    use std::collections::HashSet;
+
+    let Some(text) = request.text.as_deref() else {
+        return false;
+    };
+    let Some(lex_planned) = plan
+        .retrievers
+        .iter()
+        .find(|r| r.retriever == Retriever::Lexical)
+    else {
+        return false;
+    };
+    let Ok(rtxn) = ctx.metadata.read_txn() else {
+        return false;
+    };
+
+    // Anchor entities named in the cue. Use the scored resolver, not
+    // canonical-only: a cue says "Niraj" while the entity is stored as "Niraj
+    // Georgian", so we need exact + alias + the resolver's partial-name tier
+    // (an unambiguous token-subset → the full entity at 0.9) — otherwise the
+    // whole expansion never fires. Take score >= ANCHOR_FLOOR; trigram-fuzzy
+    // anchors are too loose to seed a multi-hop walk.
+    const ANCHOR_FLOOR: f32 = 0.9;
+    let mut anchors: Vec<EntityId> = Vec::new();
+    let mut visited: HashSet<EntityId> = HashSet::new();
+    for cue in crate::retrieval::router::entity_cue_candidates(text) {
+        if let Ok(scored) = brain_metadata::entity_resolve_scored(&rtxn, &cue, 5) {
+            for (id, score) in scored {
+                if score >= ANCHOR_FLOOR && visited.insert(id) {
+                    anchors.push(id);
+                }
+            }
+        }
+    }
+    if anchors.is_empty() {
+        return false;
+    }
+
+    // BFS the relation graph N hops, collecting connected entity canonical
+    // names (the anchors themselves are already in the cue, so they're seeded
+    // into `visited` and not re-collected).
+    let filter = brain_metadata::RelationListFilter {
+        relation_type: None,
+        current_only: true,
+        limit: 0,
+    };
+    let mut frontier = anchors;
+    let mut names: Vec<String> = Vec::new();
+    'bfs: for _hop in 0..GRAPH_EXPANSION_MAX_HOPS {
+        let mut next: Vec<EntityId> = Vec::new();
+        for &node in &frontier {
+            let mut neighbors: Vec<EntityId> = Vec::new();
+            if let Ok(out) = brain_metadata::relation_list_from(&rtxn, node, &filter) {
+                neighbors.extend(out.iter().map(|r| r.to_entity));
+            }
+            if let Ok(inc) = brain_metadata::relation_list_to(&rtxn, node, &filter) {
+                neighbors.extend(inc.iter().map(|r| r.from_entity));
+            }
+            for other in neighbors.into_iter().take(GRAPH_EXPANSION_FANOUT) {
+                if !visited.insert(other) {
+                    continue;
+                }
+                if let Ok(Some(e)) = brain_metadata::entity_get(&rtxn, other) {
+                    if !e.canonical_name.trim().is_empty() {
+                        names.push(e.canonical_name);
+                    }
+                }
+                next.push(other);
+                if names.len() >= GRAPH_EXPANSION_MAX_NAMES {
+                    break 'bfs;
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    drop(rtxn);
+    if names.is_empty() {
+        return false;
+    }
+
+    // Tokenize the collected names into content terms not already in the query.
+    let original: HashSet<String> = lexical_content_terms(text).into_iter().collect();
+    let mut terms: Vec<String> = Vec::new();
+    let mut seen_term: HashSet<String> = HashSet::new();
+    for nm in &names {
+        for raw in nm.split_whitespace() {
+            let t = trim_token_punct(raw).to_lowercase();
+            if t.len() < PRF_MIN_TERM_LEN
+                || LEXICAL_STOPWORDS.contains(&t.as_str())
+                || original.contains(&t)
+            {
+                continue;
+            }
+            if seen_term.insert(t.clone()) {
+                terms.push(t);
+            }
+        }
+    }
+    if terms.is_empty() {
+        return false;
+    }
+
+    let expanded = match invoke_lexical(lex_planned, request, ctx, include_statements, &terms) {
+        Ok(hits) => hits,
+        Err(_) => return false,
+    };
+    if expanded.is_empty() {
+        return false;
+    }
+
+    // Route the expanded hits into the GRAPH lane, not the lexical lane. The
+    // expansion is a graph-derived signal, and — crucially for ranking — a
+    // separate lane gives the multi-hop answer its OWN RRF contribution. If it
+    // were merged into the lexical lane it would compete there at a single mid
+    // rank and lose fusion to the anchor's own memories, which appear in BOTH
+    // semantic and lexical (two RRF terms). As its own lane, the answer doc —
+    // top-ranked among the name-matched hits — gets an independent term and
+    // surfaces. Merge into an existing graph lane (BFS proximity) or add one.
+    let mut hits = expanded;
+    hits.truncate(lex_planned.top_n);
+    for (i, it) in hits.iter_mut().enumerate() {
+        it.rank = (i as u32) + 1;
+    }
+    if let Some((_, graph_out)) = outputs.iter_mut().find(|(r, _)| *r == Retriever::Graph) {
+        merge_lexical_hits(graph_out, hits, lex_planned.top_n);
+    } else {
+        outputs.push((Retriever::Graph, hits));
+    }
+    true
+}
+
+/// Pick the relevance-feedback memory ids from the per-retriever
+/// outputs: the semantic lane's top hits if present, else the lexical
+/// lane's. Capped at [`PRF_FEEDBACK_DOCS`]; only `Memory` variants
+/// (statement/entity hits carry no rerank text).
+fn prf_feedback_ids(outputs: &[(Retriever, Vec<RankedItem>)]) -> Vec<brain_core::MemoryId> {
+    let lane = outputs
+        .iter()
+        .find(|(r, items)| *r == Retriever::Semantic && !items.is_empty())
+        .or_else(|| outputs.iter().find(|(r, _)| *r == Retriever::Lexical));
+    let Some((_, items)) = lane else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|it| match it.id {
+            RankedItemId::Memory(m) => Some(m),
+            _ => None,
+        })
+        .take(PRF_FEEDBACK_DOCS)
+        .collect()
+}
+
+/// Harvest expansion terms from the feedback texts. A term is a content
+/// word (lowercased, punctuation-stripped, non-stopword, length ≥
+/// [`PRF_MIN_TERM_LEN`]) that is **not** already in the query. Candidates
+/// are scored by feedback-document frequency, then total frequency, then
+/// the term itself for determinism; only terms recurring across ≥2
+/// feedback docs survive (a term unique to one hit is per-doc noise, not
+/// a topical signal). Returns at most [`PRF_EXPANSION_TERMS`].
+fn prf_expansion_terms(feedback_texts: &[&str], query_terms: &[String]) -> Vec<String> {
+    let original: std::collections::HashSet<&str> =
+        query_terms.iter().map(String::as_str).collect();
+    // term -> (doc_freq, total_freq)
+    let mut stats: std::collections::HashMap<String, (u32, u32)> = std::collections::HashMap::new();
+    for text in feedback_texts {
+        let mut seen_in_doc: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for raw in text.split_whitespace() {
+            let trimmed = trim_token_punct(raw);
+            if trimmed.len() < PRF_MIN_TERM_LEN {
+                continue;
+            }
+            let lowered = trimmed.to_lowercase();
+            if lowered.len() < PRF_MIN_TERM_LEN
+                || LEXICAL_STOPWORDS.contains(&lowered.as_str())
+                || original.contains(lowered.as_str())
+            {
+                continue;
+            }
+            let entry = stats.entry(lowered.clone()).or_insert((0, 0));
+            entry.1 += 1;
+            if seen_in_doc.insert(lowered) {
+                entry.0 += 1;
+            }
+        }
+    }
+
+    let mut ranked: Vec<(String, u32, u32)> = stats
+        .into_iter()
+        .filter(|(_, (doc_freq, _))| *doc_freq >= 2)
+        .map(|(term, (doc_freq, total))| (term, doc_freq, total))
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.1.cmp(&a.1) // doc_freq desc
+            .then(b.2.cmp(&a.2)) // total_freq desc
+            .then(a.0.cmp(&b.0)) // term asc (deterministic)
+    });
+    ranked.truncate(PRF_EXPANSION_TERMS);
+    ranked.into_iter().map(|(term, _, _)| term).collect()
+}
+
+/// Union the expanded-query hits into the existing lexical hits,
+/// recall-additively: keep every original hit, add any new id, and on a
+/// collision keep the higher BM25 score. The merged set is re-sorted by
+/// score and given dense 1-based ranks, then truncated to `top_n`. By
+/// never dropping an original hit, PRF can only add recall, never trade
+/// it away.
+fn merge_lexical_hits(existing: &mut Vec<RankedItem>, expanded: Vec<RankedItem>, top_n: usize) {
+    let mut by_id: std::collections::HashMap<RankedItemId, RankedItem> =
+        std::collections::HashMap::new();
+    for item in existing.drain(..).chain(expanded) {
+        by_id
+            .entry(item.id)
+            .and_modify(|cur| {
+                if item.score > cur.score {
+                    cur.score = item.score;
+                }
+            })
+            .or_insert(item);
+    }
+    let mut merged: Vec<RankedItem> = by_id.into_values().collect();
+    merged.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| rank_item_sort_key(&a.id).cmp(&rank_item_sort_key(&b.id)))
+    });
+    if top_n > 0 {
+        merged.truncate(top_n);
+    }
+    for (i, item) in merged.iter_mut().enumerate() {
+        item.rank = (i as u32) + 1;
+    }
+    *existing = merged;
+}
+
+/// Deterministic 17-byte tie-break key for a `RankedItemId`, mirroring
+/// the fusion stage's `id_sort_key` so equal-score merges order the same
+/// way the rest of the pipeline does.
+fn rank_item_sort_key(id: &RankedItemId) -> [u8; 17] {
+    let mut key = [0u8; 17];
+    match id {
+        RankedItemId::Memory(m) => {
+            key[0] = 0;
+            key[1..].copy_from_slice(&m.raw().to_be_bytes());
+        }
+        RankedItemId::Statement(s) => {
+            key[0] = 1;
+            key[1..].copy_from_slice(&s.to_bytes());
+        }
+        RankedItemId::Entity(e) => {
+            key[0] = 2;
+            key[1..].copy_from_slice(&e.to_bytes());
+        }
+        RankedItemId::Relation(r) => {
+            key[0] = 3;
+            key[1..].copy_from_slice(&r.to_bytes());
+        }
+    }
+    key
+}
+
+/// `extra_terms` are appended to the content-word term set (deduped,
+/// preserving order). Empty for the normal fan-out; the pseudo-relevance
+/// feedback pass passes corpus-harvested expansion terms here to widen
+/// the BM25 net on a low-specificity query.
 fn invoke_lexical(
     planned: &crate::retrieval::planner::PlannedRetriever,
     req: &QueryRequest,
     ctx: &RetrievalExecutorContext,
+    include_statements: bool,
+    extra_terms: &[String],
 ) -> Result<Vec<RankedItem>, RetrieverInvocationError> {
     let handle = &ctx.lexical;
     let Some(text) = req.text.as_ref() else {
@@ -637,7 +1372,12 @@ fn invoke_lexical(
     // the requested context universe only.
     filters.context_ids = req.context_filter.clone();
 
-    let terms: Vec<String> = text.split_whitespace().map(str::to_owned).collect();
+    let mut terms = lexical_content_terms(text);
+    for extra in extra_terms {
+        if !terms.iter().any(|t| t == extra) {
+            terms.push(extra.clone());
+        }
+    }
     let query = LexicalQuery {
         terms,
         phrase_clauses: Vec::new(),
@@ -652,9 +1392,50 @@ fn invoke_lexical(
         timeout_ms,
     };
 
-    handle
+    let mut hits = handle
         .retrieve(&query, LexicalScope::MemoryText, &config)
-        .map_err(|e| RetrieverInvocationError::Failure(e.to_string()))
+        .map_err(|e| RetrieverInvocationError::Failure(e.to_string()))?;
+
+    // Typed-graph QUERY also searches the statement-text index. The
+    // StatementText scope rejects the memory-only filters (agent_id,
+    // memory_kind, created_at_ms), so build a statement-scoped filter
+    // carrying only the predicate / statement-kind pre-filter and the
+    // shared context scope. The two corpora return disjoint id variants
+    // (Memory vs Statement), so fusion merges them without collision.
+    if include_statements {
+        let mut stmt_filters = LexicalFilters {
+            context_ids: req.context_filter.clone(),
+            ..Default::default()
+        };
+        apply_pre_filter_to_lexical_statement(&planned.pre_filter, &mut stmt_filters);
+        let stmt_query = LexicalQuery {
+            terms: query.terms.clone(),
+            phrase_clauses: Vec::new(),
+            filters: stmt_filters,
+        };
+        let stmt_hits = handle
+            .retrieve(&stmt_query, LexicalScope::StatementText, &config)
+            .map_err(|e| RetrieverInvocationError::Failure(e.to_string()))?;
+        hits.extend(stmt_hits);
+    }
+
+    Ok(hits)
+}
+
+/// Project a pre-filter onto the statement-text lexical scope. Only the
+/// statement-relevant predicates carry over; the memory-only filters
+/// (agent_id / memory_kind / created_at_ms) would be rejected by the
+/// StatementText scope, so they are dropped here.
+fn apply_pre_filter_to_lexical_statement(pre: &Option<PreFilter>, filters: &mut LexicalFilters) {
+    let Some(pf) = pre else {
+        return;
+    };
+    match pf {
+        PreFilter::StatementKind(ks) => filters.statement_kind = ks.first().copied(),
+        PreFilter::PredicateId(ps) => filters.predicate_id = ps.first().map(|p| p.raw()),
+        // Memory-only pre-filters don't apply to the statement corpus.
+        PreFilter::AgentIds(_) | PreFilter::MemoryKind(_) | PreFilter::Temporal(_) => {}
+    }
 }
 
 fn apply_pre_filter_to_lexical(pre: &Option<PreFilter>, filters: &mut LexicalFilters) {
@@ -812,6 +1593,40 @@ fn invoke_graph(
             }
             Ok(merged)
         }
+        GraphAnchorMode::MemoryFromEntityCue(entity_id) => {
+            // The executor resolved the query's named subject to this
+            // entity. Walk one hop in both directions with no relation
+            // filter so the `Mentions` edges (Memory → Entity) traverse
+            // in reverse — the neighbours are exactly the memories that
+            // name the subject. Depth stays at 1: the direct mentions
+            // are the answer to "tell me about X"; deeper hops pull in
+            // query-independent neighbours that flood fusion (the same
+            // noise that keeps the memory-from-semantic walk shallow).
+            let query = GraphQuery::Star {
+                anchor: GraphAnchor::Entity(*entity_id),
+                depth: 1,
+                direction: brain_index::Direction::Both,
+                relation_types: None,
+                include_statements: false,
+            };
+            let mut items = handle
+                .retrieve(&query, &config)
+                .map_err(|e| RetrieverInvocationError::Failure(e.to_string()))?;
+            // Entity / relation nodes reached during the walk are not
+            // recall results — keep only the mentioning memories, same
+            // as the memory-from-semantic lane.
+            items.retain(|item| matches!(item.id, RankedItemId::Memory(_)));
+            items.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            items.truncate(planned.top_n);
+            for (i, item) in items.iter_mut().enumerate() {
+                item.rank = (i as u32) + 1;
+            }
+            Ok(items)
+        }
     }
 }
 
@@ -882,6 +1697,19 @@ async fn join_all_local<T>(mut futures: Vec<Pin<Box<dyn Future<Output = T> + '_>
         }
     })
     .await
+}
+
+/// Wall-clock now in unix nanoseconds. Used as the recency-decay
+/// reference point when the query carries no explicit `as_of` anchor.
+/// A clock before the epoch (impossible in practice) reads as 0, which
+/// makes every memory look future-dated and saturate at full freshness
+/// — harmless for a soft ranking term.
+fn now_unix_nanos() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

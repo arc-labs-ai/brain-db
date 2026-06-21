@@ -43,15 +43,15 @@ pub mod resolver_llm;
 pub mod supersede_source;
 
 pub use classifier::{
-    classify_statement_kind_pattern, default_xdg_model_dir, ClassifiedSpan, ClassifierConfig,
-    ClassifierExtractor, ClassifierModel, GlinerClassifier, GlinerSpan, NER_MODEL_DIR_NAME,
-    NER_MODEL_PATH_ENV, NER_MODEL_REQUIRED_FILES, STATEMENT_KIND_PATTERN_THRESHOLD,
+    default_xdg_model_dir, ClassifiedSpan, ClassifierConfig, ClassifierExtractor, ClassifierModel,
+    GlinerClassifier, GlinerSpan, NER_MODEL_DIR_NAME, NER_MODEL_REQUIRED_FILES,
 };
 pub use enricher_hook::{run_pipeline_enrichers, EnricherHook, EnricherHookOutcome};
 pub use framework::{
-    EntityMention, ExtractedItem, ExtractionContext, ExtractionFuture, ExtractionResult,
-    ExtractionStatus, Extractor, ExtractorContext, ExtractorError, ExtractorRegistry,
-    ExtractorRunOptions, NeighborMemory, RelationMention, StatementMention, TierGate, TierState,
+    EntityMention, ExtractedItem, ExtractionContext, ExtractionFailureClass, ExtractionFuture,
+    ExtractionResult, ExtractionStatus, Extractor, ExtractorContext, ExtractorError,
+    ExtractorRegistry, ExtractorRunOptions, NeighborMemory, RelationMention, StatementMention,
+    TierGate, TierState,
 };
 pub use idempotency::{hash_memory_text, IdempotencyKey};
 pub use llm::{estimate_cost, CostBudget, LlmExtractor, LlmExtractorInner, Pricing};
@@ -59,7 +59,7 @@ pub use materialize::{
     build_registry_from_definitions, build_registry_with_gate, materialize_classifier_extractor,
     materialize_llm_extractor, materialize_pattern_extractor, MaterializeDeps,
 };
-pub use pattern::{CompiledRegex, PatternExtractor};
+pub use pattern::{CompiledRegex, PatternExtractor, TemporalExtractor};
 pub use resolver::{
     resolve_or_create, EntityDisambiguator, MatchVerdict, Resolution, ResolutionTier,
     ResolverError, DEFAULT_DISAMBIGUATOR_MIN_CONFIDENCE,

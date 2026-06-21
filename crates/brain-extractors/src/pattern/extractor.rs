@@ -129,6 +129,17 @@ impl PatternExtractor {
                     // Pattern extractor can't infer statefulness — schemaless
                     // pattern matches default to cumulative.
                     is_stateful: false,
+                    subject_is_memory: false,
+                    // Pattern tier can't tell entity from value or resolve an
+                    // event time — keep the safe defaults.
+                    object_is_entity: false,
+                    event_at_unix_nanos: None,
+                    // Pattern tier can't judge first-person self-reference;
+                    // that's the LLM's call.
+                    subject_is_self: false,
+                    // Pattern matches are positive assertions; negation/retraction
+                    // is a meaning judgement only the LLM tier makes.
+                    retract: false,
                 }))
             }
             ExtractorTarget::Relation { .. } => None, // handled by run_for_relation below
@@ -228,8 +239,11 @@ fn statement_kind_byte(k: StatementKindAst) -> u8 {
         StatementKindAst::Fact => StatementKind::Fact.as_u8(),
         StatementKindAst::Preference => StatementKind::Preference.as_u8(),
         StatementKindAst::Event => StatementKind::Event.as_u8(),
+        StatementKindAst::Attribute => StatementKind::Attribute.as_u8(),
+        StatementKindAst::Relation => StatementKind::Relation.as_u8(),
+        StatementKindAst::Directive => StatementKind::Directive.as_u8(),
         // `Any` carries no specific kind. Storage-side maps Any to "no constraint";
-        // emitted statements default to Fact discriminant (1) so downstream
+        // emitted statements default to Fact discriminant so downstream
         // resolution has something concrete to write.
         StatementKindAst::Any => StatementKind::Fact.as_u8(),
     }
@@ -268,11 +282,15 @@ mod tests {
             text: Some(text.to_string()),
             created_at_unix_ms: 0,
             last_accessed_at_unix_ms: 0,
+            occurred_at_unix_nanos: None,
         }
     }
 
     fn ctx<'a>(reg: &'a ExtractorRegistry) -> ExtractionContext<'a> {
         ExtractionContext {
+            declared_predicates: None,
+            declared_kinds: None,
+            entity_type_labels: None,
             schema_version: 1,
             now_unix_nanos: 0,
             registry: reg,

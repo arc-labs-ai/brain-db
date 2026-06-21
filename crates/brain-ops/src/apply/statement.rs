@@ -57,6 +57,23 @@ pub fn apply_upsert_statement(
     statement_create(wtxn, &s, *extracted_at_unix_nanos)
         .map_err(|e| ApplyError::Metadata(format!("statement_create: {e}")))?;
 
+    // Write-path trace: the structured fact this ENCODE produced. The
+    // predicate name comes from the intern hint (schemaless path) so the
+    // triple is human-readable; subject/object are ids (resolve via the
+    // entity tables when correlating a read miss to a missing/odd write).
+    tracing::debug!(
+        target: "brain_ops::write_trace",
+        ?id,
+        subject = ?s.subject,
+        predicate = %predicate_intern_hint
+            .as_ref()
+            .map(|(ns, n)| format!("{ns}:{n}"))
+            .unwrap_or_else(|| format!("{resolved_predicate:?}")),
+        kind = ?s.kind,
+        object = ?s.object,
+        "write: statement created"
+    );
+
     // Stamp IMPLICIT_PREDICATE on the schemaless write's row so later
     // schema-adoption analysis can tell which rows the new schema
     // would need to adopt or evict. Folded into the same wtxn — the

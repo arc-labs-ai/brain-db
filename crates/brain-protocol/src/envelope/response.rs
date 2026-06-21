@@ -196,9 +196,7 @@ impl ResponseBody {
             Self::AdminMoveMemory(_) => Opcode::AdminMoveMemoryResp,
             Self::AdminReclassify(_) => Opcode::AdminReclassifyResp,
             Self::AdminListTombstoned(_) => Opcode::AdminListTombstonedResp,
-            Self::AdminListPendingContradictions(_) => {
-                Opcode::AdminListPendingContradictionsResp
-            }
+            Self::AdminListPendingContradictions(_) => Opcode::AdminListPendingContradictionsResp,
             Self::AdminBackfill(_) => Opcode::AdminBackfillResp,
             Self::AdminBackfillCancel(_) => Opcode::AdminBackfillCancelResp,
             Self::EntityCreate(_) => Opcode::EntityCreateResp,
@@ -505,7 +503,8 @@ mod tests {
     #[test]
     fn recall_response_round_trips() {
         round_trip(ResponseBody::Recall(RecallResponseFrame {
-            results: vec![MemoryResult {
+            answer_kind: AnswerKindWire::Single,
+            memories: vec![MemoryResult {
                 memory_id: sample_memory_id(),
                 text: "first result".into(),
                 similarity_score: 0.92,
@@ -532,6 +531,7 @@ mod tests {
                 lsn: 100,
                 flags: 0x1,
                 consolidated_at_unix_nanos: None,
+                occurred_at_unix_nanos: Some(1_699_990_000_000_000_000),
                 edges_out_count: 2,
                 edges_in_count: 3,
                 graph: None,
@@ -887,19 +887,22 @@ mod tests {
         // 3-frame sequence and verify ordering survives.
         let seq: Vec<ResponseBody> = vec![
             ResponseBody::Recall(RecallResponseFrame {
-                results: vec![],
+                answer_kind: AnswerKindWire::None,
+                memories: vec![],
                 is_final: false,
                 cumulative_count: 0,
                 estimated_remaining: Some(10),
             }),
             ResponseBody::Recall(RecallResponseFrame {
-                results: vec![],
+                answer_kind: AnswerKindWire::None,
+                memories: vec![],
                 is_final: false,
                 cumulative_count: 5,
                 estimated_remaining: Some(5),
             }),
             ResponseBody::Recall(RecallResponseFrame {
-                results: vec![],
+                answer_kind: AnswerKindWire::None,
+                memories: vec![],
                 is_final: true,
                 cumulative_count: 10,
                 estimated_remaining: Some(0),
@@ -926,7 +929,8 @@ mod tests {
         // Streaming variants report Some(...).
         assert_eq!(
             ResponseBody::Recall(RecallResponseFrame {
-                results: vec![],
+                answer_kind: AnswerKindWire::None,
+                memories: vec![],
                 is_final: true,
                 cumulative_count: 0,
                 estimated_remaining: None,

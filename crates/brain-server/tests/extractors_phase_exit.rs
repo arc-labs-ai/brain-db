@@ -21,7 +21,7 @@ use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
-use brain_protocol::envelope::request::{EncodeRequest, MemoryKindWire, RequestBody};
+use brain_protocol::envelope::request::{EncodeRequest, RequestBody};
 use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
 use brain_protocol::{ExtractorDisableRequest, ExtractorListRequest};
@@ -160,12 +160,9 @@ fn encode_request(text: &str) -> RequestBody {
     RequestBody::Encode(EncodeRequest {
         text: text.into(),
         context_id: 0,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: Vec::new(),
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
     })
 }
 

@@ -19,6 +19,9 @@
 //! - `process_uptime_seconds` / `process_start_time_seconds`
 //! - `brain_worker_cycles_total` / `_processed_total` / `_errors_total` /
 //!   `_last_run_unixtime` (per-shard, per-worker counters / gauge)
+//! - `brain_wal_size_bytes` / `brain_wal_segments` /
+//!   `brain_metadata_size_bytes` / `brain_arena_*` (per-shard storage
+//!   gauges).
 //! - request / connection-extended / HNSW / embedder / memory / process
 //!   families.
 //!
@@ -26,8 +29,6 @@
 //!
 //! These emerge as the corresponding primitives land:
 //!
-//! - `brain_wal_size_bytes`, `brain_metadata_size_bytes` — needs a
-//!   storage-stat API.
 //! - `brain_hnsw_search_visits`, `brain_hnsw_recall_estimate`,
 //!   `brain_hnsw_rebuild_*` quantiles — sampling infrastructure.
 //! - `brain_embedder_duration_ms`, `_queue_depth`, `_workers_active`

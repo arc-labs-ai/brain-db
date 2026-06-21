@@ -30,8 +30,9 @@ struct Memory {
 
     // Lifecycle
     state: LifecycleState,      // Active | Tombstoned | Reclaimed
-    created_at: u64,            // unix_nanoseconds
+    created_at: u64,            // unix_nanoseconds; server write time
     updated_at: u64,            // unix_nanoseconds
+    occurred_at: Option<u64>,   // unix_nanoseconds; client event time, None when unsupplied
     forgot_at: Option<u64>,     // None until forgotten
 
     // Salience
@@ -49,6 +50,8 @@ struct Memory {
 ```
 
 The fields are detailed in subsequent sections of this spec. This file describes the entity as a whole and its core invariants.
+
+**`created_at` vs `occurred_at`.** `created_at` is the *write time* — when the server durably committed the memory — and is always stamped. `occurred_at` is the optional *event time* — when the memory's content actually happened in the world — supplied by the client on `ENCODE` (`occurred_at_unix_nanos`). They are distinct axes: a memory written today about an event in 2020 has `created_at ≈ now` and `occurred_at ≈ 2020`. `occurred_at` is `None` when the client doesn't supply one; it is stored verbatim, carried durably through the WAL (survives recovery), and echoed back on `RECALL`. It lets time-aware clients keep the real timeline instead of cramming dates into the text. `ENCODE_VECTOR_DIRECT` carries no event-time field — those writes default the timeline to write time.
 
 ## 3. Storage size
 

@@ -79,6 +79,10 @@ Optional, default `false`. When `true`, Brain consults a per-`(shard, agent_id, 
 
 Default-off: the simpler "one ENCODE → one memory" model is Brain's primitive. Callers opt in explicitly when they know the content is dedup-safe (template outputs, idempotent ingestion).
 
+#### occurred_at_unix_nanos
+
+Optional, default `None`. The client's **event time** — when the memory's content actually happened — distinct from `created_at` (the server write time stamped during commit). Stored verbatim on the memory row, carried durably through the WAL so it survives recovery, and echoed back on `RECALL` as `MemoryResult.occurred_at_unix_nanos`. It does not affect dedup, slot allocation, or ranking in this slice; it is a recorded fact about the memory's timeline. See [`../02_data_model/02_memory.md`](../02_data_model/02_memory.md) §2 (`created_at` vs `occurred_at`). `ENCODE_VECTOR_DIRECT` has no such field.
+
 ### 3. The response
 
 ```rust

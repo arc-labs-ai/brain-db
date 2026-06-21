@@ -213,6 +213,7 @@ fn bench_retrieval_three_retriever(c: &mut Criterion) {
             let result = futures_lite::future::block_on(execute(
                 black_box(&plan),
                 black_box(&req),
+                black_box(false),
                 black_box(&fx.ctx),
             ))
             .expect("execute");
@@ -239,6 +240,7 @@ fn bench_retrieval_router_degraded(c: &mut Criterion) {
             let result = futures_lite::future::block_on(execute(
                 black_box(&plan),
                 black_box(&req),
+                black_box(false),
                 black_box(&fx.ctx),
             ))
             .expect("execute");

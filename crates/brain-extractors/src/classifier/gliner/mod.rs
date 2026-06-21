@@ -445,9 +445,15 @@ impl GlinerModel {
 
         let max_seq_len = live_indices
             .iter()
-            .map(|i| tokenized_rows[*i].as_ref().expect("live").input_ids.len())
+            .map(|i| {
+                tokenized_rows[*i]
+                    .as_ref()
+                    .expect("invariant: live_indices only holds indices of Some rows")
+                    .input_ids
+                    .len()
+            })
             .max()
-            .expect("at least one live row");
+            .expect("invariant: live_indices is non-empty, checked above");
 
         // Pad live rows to max_seq_len. DeBERTa-v3 pad_token_id == 0
         // (validated against the upstream config); the attention mask
@@ -457,7 +463,9 @@ impl GlinerModel {
         let mut flat_ids: Vec<u32> = Vec::with_capacity(batch_size * max_seq_len);
         let mut flat_mask: Vec<u32> = Vec::with_capacity(batch_size * max_seq_len);
         for &row_idx in &live_indices {
-            let row = tokenized_rows[row_idx].as_ref().expect("live");
+            let row = tokenized_rows[row_idx]
+                .as_ref()
+                .expect("invariant: live_indices only holds indices of Some rows");
             flat_ids.extend_from_slice(&row.input_ids);
             flat_mask.extend_from_slice(&row.attention_mask);
             let pad = max_seq_len - row.input_ids.len();
@@ -481,7 +489,9 @@ impl GlinerModel {
         // its row dim and run the (cheap, post-backbone) pieces per row.
         let mut out: Vec<Vec<Span>> = (0..inputs.len()).map(|_| Vec::new()).collect();
         for (live_pos, &row_idx) in live_indices.iter().enumerate() {
-            let row = tokenized_rows[row_idx].as_ref().expect("live");
+            let row = tokenized_rows[row_idx]
+                .as_ref()
+                .expect("invariant: live_indices only holds indices of Some rows");
             if row.word_first_subtoken.is_empty() {
                 continue;
             }

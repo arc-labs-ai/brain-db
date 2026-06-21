@@ -110,6 +110,16 @@ fn single_retriever_passthrough_score_matches_formula() {
 }
 
 #[test]
+fn adaptive_k_buckets_by_pool_size() {
+    use super::adaptive_k;
+    assert_eq!(adaptive_k(0), 15);
+    assert_eq!(adaptive_k(199), 15);
+    assert_eq!(adaptive_k(200), 30);
+    assert_eq!(adaptive_k(1999), 30);
+    assert_eq!(adaptive_k(2000), 60);
+}
+
+#[test]
 fn formula_matches_spec_example() {
     // rank 1 contributes 1/61 ≈ 0.0164;
     // rank 10 contributes 1/70 ≈ 0.0143.

@@ -24,6 +24,7 @@ pub mod arena_reader;
 pub mod entity_hnsw;
 pub mod graph_retriever;
 pub mod hnsw;
+pub mod hype_hnsw;
 pub mod idmap;
 pub mod params;
 pub mod persistence;
@@ -32,6 +33,7 @@ pub mod rebuild;
 pub mod semantic_retriever;
 pub mod shared;
 pub mod statement_hnsw;
+pub mod statement_question_hnsw;
 pub mod tantivy_shard;
 pub mod tombstones;
 
@@ -48,6 +50,9 @@ pub use graph_retriever::{
     MAX_DEPTH_HARD_CAP as GRAPH_MAX_DEPTH_HARD_CAP,
 };
 pub use hnsw::{HnswError, HnswIndex};
+pub use hype_hnsw::{
+    hype_default_params, HypeHnswError, HypeHnswIndex, RebuildReport as HypeRebuildReport,
+};
 pub use idmap::{IdMap, IdMapError};
 pub use params::{IndexParams, IndexParamsError, MAX_LAYER, VECTOR_DIM};
 pub use pq::{

@@ -61,7 +61,10 @@ impl MetadataDb {
             )
             // Stamp the replayed-from LSN so the rebuilt row carries
             // the same provenance the live writer would have written.
-            .with_encoded_at_lsn(lsn);
+            .with_encoded_at_lsn(lsn)
+            // Carry the client-supplied event time through replay so the
+            // rebuilt row keeps the same timeline the live write stored.
+            .with_occurred_at(p.occurred_at_unix_nanos);
             let content_hash = if p.deduplicate {
                 let h = fp_content_hash(&p.text);
                 mem.content_hash = Some(h);

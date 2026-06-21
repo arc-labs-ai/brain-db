@@ -40,6 +40,7 @@ fn memory_can_be_constructed() {
         text: Some("hello".into()),
         created_at_unix_ms: 0,
         last_accessed_at_unix_ms: 0,
+        occurred_at_unix_nanos: None,
     };
     assert_eq!(m.salience.raw(), 0.5);
     assert_eq!(m.text.as_deref(), Some("hello"));

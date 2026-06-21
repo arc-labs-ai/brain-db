@@ -642,6 +642,8 @@ fn error_frame_from_op_error(stream_id: u32, e: &OpError) -> Frame {
     let (code, retry_after_ms) = match e.error_code() {
         brain_ops::error::ErrorCode::InvalidRequest => (ErrorCode::InvalidArgument, None),
         brain_ops::error::ErrorCode::NotFound => (ErrorCode::MemoryNotFound, None),
+        brain_ops::error::ErrorCode::EntityNotFound => (ErrorCode::EntityNotFound, None),
+        brain_ops::error::ErrorCode::StatementNotFound => (ErrorCode::StatementNotFound, None),
         brain_ops::error::ErrorCode::QuotaExceeded => (ErrorCode::RateLimited, None),
         brain_ops::error::ErrorCode::Unauthorized => (ErrorCode::PermissionDenied, None),
         brain_ops::error::ErrorCode::Conflict => (ErrorCode::IdempotencyConflict, None),
@@ -810,12 +812,9 @@ mod tests {
         let body = RequestBody::Encode(brain_protocol::envelope::request::EncodeRequest {
             text: "hello".into(),
             context_id: 0,
-            kind: brain_protocol::envelope::request::MemoryKindWire::Episodic,
-            salience_hint: 0.5,
-            edges: Vec::new(),
             request_id: [0u8; 16],
             txn_id: None,
-            deduplicate: false,
+            occurred_at_unix_nanos: None,
         });
         let frame = Frame::new(Opcode::EncodeReq.as_u16(), FLAG_EOS, 1, body.encode());
         let action = dispatch_frame(frame, &mut state, &topo);
@@ -912,7 +911,11 @@ mod tests {
         assert!(!subscribe_agents_allowed(true, own, None));
         assert!(!subscribe_agents_allowed(true, own, Some(&[])));
         assert!(!subscribe_agents_allowed(true, own, Some(&[other])));
-        assert!(!subscribe_agents_allowed(true, own, Some(&[[7u8; 16], other])));
+        assert!(!subscribe_agents_allowed(
+            true,
+            own,
+            Some(&[[7u8; 16], other])
+        ));
     }
 
     /// Client op on stream_id = 0 is BadFrame.

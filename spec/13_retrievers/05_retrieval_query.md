@@ -104,7 +104,28 @@ Rule 4: Type-filtered query
 Rule 5: Default (free-text query)
     Conditions: text present, no other signals
     Retrievers: Semantic (1.0), Lexical (1.0)
+
+Rule 6: List / aggregation query  (internal — never client-selected)
+    Conditions: free-text cue carries enumerative intent — "list", "every",
+                "how many/much", "all of", "name all/every/the", "what are/were",
+                "what kinds/types of" (precision-biased; bare "what"/"who" excluded)
+    Effect:    sets an internal `list_intent` flag, orthogonal to the class
+               so it also fires on entity-anchored list queries. Widens the
+               per-retriever pool ceiling (200 → 400) so deeply-ranked set
+               members reach fusion (coverage), and enables the merge /
+               diversity stage (see [`./06_post_processing.md`](./06_post_processing.md)).
+               Free-text list cues additionally pick the `ListAggregation`
+               class (semantic-led, wide pool).
 ```
+
+**The client never selects this.** Brain is a database: the caller asks
+`recall(cue, top_k)` and the router decides — from the cue text alone —
+whether the answer is one memory or a set, and quietly does the extra
+coverage + merge work behind the scenes. There is no `diversity` / "list
+mode" knob on the wire; the caller cannot know in advance whether their
+question has one answer or many, so the DB owns that decision. `top_k`
+still bounds what is returned — list handling changes *which* results
+fill those slots, not how many.
 
 Rules are applied non-exclusively: a query can match multiple rules. The router unions selected retrievers and uses the maximum weight per retriever across matching rules.
 
@@ -148,7 +169,7 @@ fused candidates
 
 The filter answers "what did Brain believe on date X" without resurrecting tombstoned rows — the row stays in the table with `record_invalidated_at` set, and this filter picks it up when the target time falls inside the record window.
 
-Wire surface: **server-internal only**. The filter is exposed to in-process planner callers and to admin tooling but no client opcode carries an `as_of` field.
+Wire surface: exposed on the client wire as `as_of_record_time_unix_nanos` on both `RECALL_REQ` and `QUERY_REQ` (`None`/0 = current state). Besides driving this record-time filter, a set anchor becomes the reference point for the recency-ranking decay (see [`./01_rrf_fusion.md`](./01_rrf_fusion.md) §"Recency ranking"). It applies to statement/relation results; memory hits have no record-time axis and pass the filter unchanged.
 
 Filters are applied in this order because:
 - Type and confidence are cheap and aggressive (early dropout).

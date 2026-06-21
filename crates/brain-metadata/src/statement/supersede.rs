@@ -78,6 +78,7 @@ pub fn statement_supersede(
         != match new_statement.subject {
             SubjectRef::Entity(e) => e.to_bytes(),
             SubjectRef::Pending(audit) => audit.to_bytes(),
+            SubjectRef::Memory(id) => id.to_be_bytes(),
         }
     {
         return Err(StatementOpError::SubjectMismatch);
@@ -467,9 +468,30 @@ fn lookup_current_statement(
     kind: StatementKind,
 ) -> Result<Option<StatementId>, StatementOpError> {
     let bys = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
-    let key = (subject.to_bytes(), kind.as_u8(), predicate.raw(), 1u8);
-    let bytes: Option<[u8; 16]> = bys.get(&key)?.map(|g| g.value());
-    Ok(bytes.map(StatementId::from))
+    // The trailing statement id is part of the key now; single-valued
+    // kinds still have exactly one current row, so a range scan over the
+    // (subject, kind, predicate, is_current=1) prefix yields it.
+    let lo = (
+        subject.to_bytes(),
+        kind.as_u8(),
+        predicate.raw(),
+        1u8,
+        [0u8; 16],
+    );
+    let hi = (
+        subject.to_bytes(),
+        kind.as_u8(),
+        predicate.raw(),
+        1u8,
+        [0xffu8; 16],
+    );
+    // Single-valued kinds have exactly one current row; take the first.
+    let mut it = bys.range(lo..=hi)?;
+    let first = match it.next() {
+        Some(entry) => Some(StatementId::from(entry?.1.value())),
+        None => None,
+    };
+    Ok(first)
 }
 
 // ---------------------------------------------------------------------------
@@ -670,13 +692,21 @@ mod tests {
             .get(&(pred.raw(), StatementKind::Fact.as_u8(), old_bucket))
             .unwrap()
             .map(|g| g.value());
-        assert_ne!(at_old, Some(old.id.to_bytes()), "old bucket must drop the superseded row");
+        assert_ne!(
+            at_old,
+            Some(old.id.to_bytes()),
+            "old bucket must drop the superseded row"
+        );
         // New bucket points at the current row.
         let at_new = t
             .get(&(pred.raw(), StatementKind::Fact.as_u8(), new_bucket))
             .unwrap()
             .map(|g| g.value());
-        assert_eq!(at_new, Some(new_id.to_bytes()), "new bucket points at the current row");
+        assert_eq!(
+            at_new,
+            Some(new_id.to_bytes()),
+            "new bucket points at the current row"
+        );
     }
 
     // ----- Fakes -----

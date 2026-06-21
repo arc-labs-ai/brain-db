@@ -35,7 +35,9 @@ pub use migration::{
 };
 pub use nodes::{
     entity::{Entity, EntityAttributes, EntityType},
-    kinds::{Cardinality, ExtractorKind, StatementKind},
+    kinds::{
+        Cardinality, ExtractorKind, KindBehavior, KindCardinality, StatementKind, TemporalModel,
+    },
     memory::{Memory, MemoryKind, Salience},
     relation::{canonical_pair, Relation, RelationType},
     statement::{
@@ -45,6 +47,7 @@ pub use nodes::{
 };
 pub use resolution::{
     confidence::{aggregate_confidence, ConfidenceConfig},
+    referential::is_non_referential_surface,
     resolver::{
         resolve_entity, ResolutionOutcome, ResolverConfig, ResolverEmbedder, ResolverError,
         ResolverIndex, ResolverLlm, ResolverLlmDecision, ResolverStorage, ResolverTier,

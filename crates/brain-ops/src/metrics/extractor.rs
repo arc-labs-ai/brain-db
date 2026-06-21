@@ -69,6 +69,11 @@ pub enum ExtractorItemKind {
     Statement = 1,
     Relation = 2,
     Mention = 3,
+    /// Hypothetical-question vectors written by the HyPE generator. Folded
+    /// into `items_written_total` so the eval's extraction-drain barrier
+    /// (which waits for that counter to plateau) also waits for HyPE
+    /// generation to finish before querying.
+    HyPe = 4,
 }
 
 impl ExtractorItemKind {
@@ -129,6 +134,12 @@ impl TierStatus {
 pub struct ExtractorMetrics {
     drops_total: AtomicU64,
     schema_filtered_total: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
+    /// Real extracted items the apply pass could not persist, keyed by a
+    /// low-cardinality `reason` (e.g. `subject_unresolved`,
+    /// `predicate_invalid`, `create_rejected`). A memory database must never
+    /// lose signal silently — any nonzero value here is a fact that did not
+    /// land, surfaced for alerting rather than buried in a trace log.
+    apply_dropped_total: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
     /// Indexed by [`ExtractorItemKind`].
     items_written_total: Vec<AtomicU64>,
     llm_micro_usd_spent_total: AtomicU64,
@@ -168,6 +179,7 @@ impl ExtractorMetrics {
         Self {
             drops_total: AtomicU64::new(0),
             schema_filtered_total: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            apply_dropped_total: parking_lot::Mutex::new(std::collections::HashMap::new()),
             items_written_total,
             llm_micro_usd_spent_total: AtomicU64::new(0),
             cycle_duration_seconds: WorkerHistogram::new(DEFAULT_CYCLE_BUCKETS_SECONDS),
@@ -192,6 +204,15 @@ impl ExtractorMetrics {
     pub fn inc_schema_filtered(&self, predicate_qname: &str) {
         let mut guard = self.schema_filtered_total.lock();
         *guard.entry(predicate_qname.to_string()).or_insert(0) += 1;
+    }
+
+    /// Bumped by the apply pass when a genuine extracted item (entity,
+    /// statement, or relation) could not be persisted, keyed by `reason`.
+    /// Distinct from `schema_filtered` (a deliberate admission decision) —
+    /// this is unintended signal loss the operator should see.
+    pub fn inc_apply_dropped(&self, reason: &str) {
+        let mut guard = self.apply_dropped_total.lock();
+        *guard.entry(reason.to_string()).or_insert(0) += 1;
     }
 
     /// Bumped by the worker per successfully-written item, by kind.
@@ -251,6 +272,7 @@ impl ExtractorMetrics {
     #[must_use]
     pub fn snapshot(&self) -> ExtractorMetricsSnapshot {
         let schema_filtered_total = self.schema_filtered_total.lock().clone();
+        let apply_dropped_total = self.apply_dropped_total.lock().clone();
         let items_written_total = self
             .items_written_total
             .iter()
@@ -269,6 +291,7 @@ impl ExtractorMetrics {
         ExtractorMetricsSnapshot {
             drops_total: self.drops_total.load(Ordering::Relaxed),
             schema_filtered_total,
+            apply_dropped_total,
             items_written_total,
             llm_micro_usd_spent_total: self.llm_micro_usd_spent_total.load(Ordering::Relaxed),
             cycle_duration_seconds: self.cycle_duration_seconds.snapshot(),
@@ -292,6 +315,9 @@ impl Default for ExtractorMetrics {
 pub struct ExtractorMetricsSnapshot {
     pub drops_total: u64,
     pub schema_filtered_total: std::collections::HashMap<String, u64>,
+    /// Apply-pass signal loss keyed by `reason`. Any nonzero entry is a real
+    /// extracted item that did not persist.
+    pub apply_dropped_total: std::collections::HashMap<String, u64>,
     /// Indexed in the same order as [`ITEM_KIND_LABELS`].
     pub items_written_total: Vec<u64>,
     pub llm_micro_usd_spent_total: u64,

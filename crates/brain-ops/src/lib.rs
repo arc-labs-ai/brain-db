@@ -25,6 +25,7 @@ pub mod clock;
 pub mod context;
 pub mod dispatch;
 pub mod error;
+pub mod grounded;
 pub mod handlers;
 pub mod index;
 pub mod metrics;
@@ -255,12 +256,9 @@ mod tests {
         brain_protocol::envelope::request::EncodeRequest {
             text: "hi".into(),
             context_id: 1,
-            kind: brain_protocol::envelope::request::MemoryKindWire::Episodic,
-            salience_hint: 0.5,
-            edges: vec![],
             request_id: [1; 16],
             txn_id: None,
-            deduplicate: false,
+            occurred_at_unix_nanos: None,
         }
     }
 

@@ -51,8 +51,14 @@ mod tests {
 
     #[test]
     fn interval_override_maps_to_duration() {
-        assert_eq!(parse_interval_override(Some("60")), Some(Duration::from_secs(60)));
-        assert_eq!(parse_interval_override(Some("300")), Some(Duration::from_secs(300)));
+        assert_eq!(
+            parse_interval_override(Some("60")),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            parse_interval_override(Some("300")),
+            Some(Duration::from_secs(300))
+        );
         assert_eq!(parse_interval_override(Some("0")), None);
         assert_eq!(parse_interval_override(None), None);
         assert_eq!(parse_interval_override(Some("not-a-number")), None);

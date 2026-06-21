@@ -23,19 +23,9 @@ use crate::context::WorkerContext;
 use crate::error::WorkerError;
 use crate::worker::Worker;
 
-/// Operator override for the sweep interval (seconds). Falls back to
-/// the `WorkerConfig::defaults_for` cadence when unset, empty, or
-/// non-positive.
-pub const SWEEP_INTERVAL_ENV: &str = "BRAIN_LLM_CACHE_SWEEP_INTERVAL_SECS";
-
 /// 1 h default cadence. Mirrors the `WorkerKind::LlmCacheSweeper`
 /// default in `WorkerConfig`.
 pub const DEFAULT_INTERVAL_SECS: u64 = 3600;
-
-fn resolved_interval() -> std::time::Duration {
-    crate::env::parse_interval_override(std::env::var(SWEEP_INTERVAL_ENV).ok().as_deref())
-        .unwrap_or_else(|| std::time::Duration::from_secs(DEFAULT_INTERVAL_SECS))
-}
 
 pub struct LlmCacheSweeper {
     config: WorkerConfig,
@@ -45,15 +35,26 @@ pub struct LlmCacheSweeper {
 impl LlmCacheSweeper {
     /// Construct with the default cadence and an empty metrics
     /// slot. The shard wires its shared `Arc<LlmCacheSweepMetrics>`
-    /// in via [`Self::with_metrics`] at registration time.
+    /// in via [`Self::with_metrics`] at registration time, and the
+    /// cadence via [`Self::with_interval_secs`] from
+    /// `[workers.llm_cache_sweep] interval_secs`.
     #[must_use]
     pub fn new() -> Self {
         let mut config = WorkerConfig::defaults_for(WorkerKind::LlmCacheSweeper);
-        config.interval = resolved_interval();
+        config.interval = std::time::Duration::from_secs(DEFAULT_INTERVAL_SECS);
         Self {
             config,
             metrics: None,
         }
+    }
+
+    /// Override the sweep cadence. The shard supplies
+    /// `[workers.llm_cache_sweep] interval_secs`; a zero value is
+    /// clamped to 1 second so the scheduler never busy-loops.
+    #[must_use]
+    pub fn with_interval_secs(mut self, interval_secs: u64) -> Self {
+        self.config.interval = std::time::Duration::from_secs(interval_secs.max(1));
+        self
     }
 
     /// Override the default config (e.g. interval / batch / runtime).

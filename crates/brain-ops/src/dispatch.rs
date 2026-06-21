@@ -605,10 +605,12 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
             (perm_bits::ENCODE, "TXN")
         }
 
-        // Schema ops.
-        RequestBody::SchemaUpload(_) | RequestBody::SchemaReplace(_) => {
-            (perm_bits::SCHEMA_UPLOAD, "SCHEMA_UPLOAD")
-        }
+        // Schema ops. SCHEMA_UPLOAD merges additively (any schema-writer
+        // key); SCHEMA_REPLACE is the destructive namespace wipe, so it
+        // requires the ADMIN capability — a routine upload key must not be
+        // able to drop or narrow an existing namespace.
+        RequestBody::SchemaUpload(_) => (perm_bits::SCHEMA_UPLOAD, "SCHEMA_UPLOAD"),
+        RequestBody::SchemaReplace(_) => (perm_bits::ADMIN, "SCHEMA_REPLACE"),
         RequestBody::SchemaGet(_) | RequestBody::SchemaList(_) | RequestBody::SchemaValidate(_) => {
             (perm_bits::RECALL, "SCHEMA_READ")
         }
@@ -743,7 +745,6 @@ fn enforce_agent_filter(caller: &RequestCaller, req: &RequestBody) -> Result<(),
 mod tests {
     use super::*;
     use brain_protocol::EncodeRequest;
-    use brain_protocol::MemoryKindWire;
     use brain_protocol::{RecallRequest, SchemaGetRequest, SchemaListRequest};
 
     fn agent(byte: u8) -> AgentId {
@@ -764,12 +765,9 @@ mod tests {
         RequestBody::Encode(EncodeRequest {
             text: "hi".into(),
             context_id: 0,
-            kind: MemoryKindWire::Episodic,
-            salience_hint: 0.5,
-            edges: Vec::new(),
             request_id: [0u8; 16],
             txn_id: None,
-            deduplicate: false,
+            occurred_at_unix_nanos: None,
         })
     }
 
@@ -855,10 +853,12 @@ mod tests {
     fn recall_with(agent_filter: Vec<[u8; 16]>, include_other_agents: bool) -> RequestBody {
         RequestBody::Recall(RecallRequest {
             cue_text: "x".into(),
-            top_k: 5,
+            subject_name: String::new(),
+            max_results: 5,
             confidence_threshold: 0.0,
             context_filter: None,
             age_bound_unix_nanos: None,
+            as_of_record_time_unix_nanos: None,
             kind_filter: None,
             salience_floor: 0.0,
             include_edges: false,

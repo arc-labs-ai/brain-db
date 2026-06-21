@@ -100,6 +100,7 @@ fn deps_for(embedder: Arc<ScriptedEmbedder>, hnsw: Arc<RwLock<EntityHnswIndex>>)
     EmbeddingDeps {
         hnsw,
         embedder: embedder as Arc<dyn Dispatcher>,
+        embed_threshold: brain_extractors::resolver::EMBED_RESOLVE_THRESHOLD,
     }
 }
 

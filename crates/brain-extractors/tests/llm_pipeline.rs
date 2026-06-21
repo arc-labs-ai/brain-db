@@ -108,11 +108,15 @@ fn memory(text: &str) -> Memory {
         text: Some(text.into()),
         created_at_unix_ms: 0,
         last_accessed_at_unix_ms: 0,
+        occurred_at_unix_nanos: None,
     }
 }
 
 fn ctx<'a>(reg: &'a ExtractorRegistry) -> ExtractionContext<'a> {
     ExtractionContext {
+            declared_predicates: None,
+        declared_kinds: None,
+        entity_type_labels: None,
         schema_version: 1,
         now_unix_nanos: 100,
         registry: reg,

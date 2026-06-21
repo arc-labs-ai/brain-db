@@ -48,11 +48,24 @@ pub const INLINE_EVIDENCE_CAP: usize = 8;
 // SubjectRef.
 // ---------------------------------------------------------------------------
 
-/// The subject of a statement — either a resolved entity or a pending
-/// resolution audit (when the resolver returns `Ambiguous`).
+/// The subject of a statement — a resolved entity, the source memory
+/// itself, or a pending resolution audit (when the resolver returns
+/// `Ambiguous`).
+///
+/// `Memory` lets a statement be *about a memory* rather than an entity —
+/// e.g. a temporal Event ("this memory's content occurred on
+/// 2020-01-15"), where there is no natural entity subject. Entity ids
+/// (UUID) and memory ids (packed u128) occupy disjoint byte spaces, so
+/// the by-subject index keys both by their raw 16 bytes without a kind
+/// discriminant in the key; the row's `subject_kind` disambiguates on
+/// read.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum SubjectRef {
     Entity(EntityId),
+    /// The statement is about the source memory itself (no entity
+    /// subject). Used by the temporal-expressions extractor for Event
+    /// statements.
+    Memory(MemoryId),
     /// The resolver returned `Ambiguous`; the bound audit row records
     /// the candidate set. Query paths excluding pending subjects skip
     /// these.
@@ -65,7 +78,17 @@ impl SubjectRef {
     pub fn as_entity(&self) -> Option<EntityId> {
         match self {
             Self::Entity(id) => Some(*id),
-            Self::Pending(_) => None,
+            Self::Memory(_) | Self::Pending(_) => None,
+        }
+    }
+
+    /// Returns the memory id if this subject is the source memory, else
+    /// `None`.
+    #[must_use]
+    pub fn as_memory(&self) -> Option<MemoryId> {
+        match self {
+            Self::Memory(id) => Some(*id),
+            Self::Entity(_) | Self::Pending(_) => None,
         }
     }
 

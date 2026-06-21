@@ -31,9 +31,22 @@ use smallvec::SmallVec;
 pub const STATEMENTS_TABLE: TableDefinition<'static, [u8; 16], StatementMetadata> =
     TableDefinition::new("statements");
 
-/// `(EntityId, kind, predicate_id, is_current)` → `StatementId.to_bytes()`.
-pub const STATEMENTS_BY_SUBJECT_TABLE: TableDefinition<'static, ([u8; 16], u8, u32, u8), [u8; 16]> =
-    TableDefinition::new("statements_by_subject");
+/// `(EntityId, kind, predicate_id, is_current, statement_id)` →
+/// `StatementId.to_bytes()`.
+///
+/// Multi-value index: the statement id is appended to the key so every
+/// statement is its own row. Two Set-valued statements sharing
+/// `(subject, kind, predicate_id, is_current)` — e.g. two `likes` for
+/// one person — therefore each get a distinct index entry instead of
+/// colliding on a single key (last-writer-wins) and losing all but one.
+/// The value still holds the statement id so range scans read it as
+/// before without parsing the key tuple.
+#[allow(clippy::type_complexity)] // a redb composite-key tuple, not worth a type alias
+pub const STATEMENTS_BY_SUBJECT_TABLE: TableDefinition<
+    'static,
+    ([u8; 16], u8, u32, u8, [u8; 16]),
+    [u8; 16],
+> = TableDefinition::new("statements_by_subject");
 
 /// `(predicate_id, kind, confidence_bucket)` → `StatementId.to_bytes()`.
 /// `confidence_bucket` is `floor(confidence * 10)` clamped to `0..=10`.
@@ -321,10 +334,14 @@ pub struct StatementMetadata {
     /// Fact=0 / Preference=1 / Event=2 per `brain_core::StatementKind`.
     pub kind: u8,
     pub subject_entity_bytes: [u8; 16],
-    /// `0` if subject is `SubjectRef::Entity`, `1` if
-    /// `SubjectRef::Pending` (in which case `subject_entity_bytes`
-    /// holds the pending audit id).
-    pub subject_is_pending: u8,
+    /// Subject kind: `0` = `SubjectRef::Entity`, `1` = `SubjectRef::Pending`
+    /// (in which case `subject_entity_bytes` holds the pending audit id),
+    /// `2` = `SubjectRef::Memory` (the bytes hold the source memory id).
+    /// rkyv is positional, so this repurposes the former
+    /// `subject_is_pending` slot in place. Readers that asked
+    /// `subject_is_pending == 0` ("is an entity subject") stay correct as
+    /// `subject_kind == 0`.
+    pub subject_kind: u8,
     pub predicate_id: u32,
     /// rkyv-encoded `StatementObject` (via [`encode_object`]).
     pub object_blob: Vec<u8>,
@@ -397,7 +414,10 @@ impl StatementMetadata {
     }
 
     pub fn kind(&self) -> Option<StatementKind> {
-        StatementKind::from_u8(self.kind)
+        // Every byte decodes to a valid kind now (builtin 0..=5, else
+        // Custom). The `Option` is retained so existing callers keep their
+        // `?` / `ok_or` ergonomics; it is always `Some`.
+        Some(StatementKind::from_u8(self.kind))
     }
 
     #[must_use]
@@ -519,9 +539,10 @@ impl_redb_rkyv_value!(EvidenceOverflow, "brain_metadata::EvidenceOverflow");
 /// to query-time.
 #[must_use]
 pub fn metadata_from_statement(s: &Statement) -> StatementMetadata {
-    let (subject_entity_bytes, subject_is_pending) = match s.subject {
+    let (subject_entity_bytes, subject_kind) = match s.subject {
         SubjectRef::Entity(id) => (id.to_bytes(), 0u8),
         SubjectRef::Pending(audit) => (audit.to_bytes(), 1u8),
+        SubjectRef::Memory(id) => (id.to_be_bytes(), 2u8),
     };
     let object_discriminant = s.object.discriminant() + 1;
     let object_blob = encode_object(&s.object);
@@ -549,7 +570,7 @@ pub fn metadata_from_statement(s: &Statement) -> StatementMetadata {
         version: s.version,
         kind: s.kind.as_u8(),
         subject_entity_bytes,
-        subject_is_pending,
+        subject_kind,
         predicate_id: s.predicate.raw(),
         object_blob,
         object_discriminant,
@@ -589,10 +610,13 @@ pub fn statement_from_metadata(m: &StatementMetadata) -> Option<Statement> {
     let kind = m.kind()?;
     let object = decode_object(&m.object_blob)?;
 
-    let subject = if m.subject_is_pending == 0 {
-        SubjectRef::Entity(EntityId::from_bytes(m.subject_entity_bytes))
-    } else {
-        SubjectRef::Pending(brain_core::AuditId::from_bytes(m.subject_entity_bytes))
+    let subject = match m.subject_kind {
+        0 => SubjectRef::Entity(EntityId::from_bytes(m.subject_entity_bytes)),
+        2 => SubjectRef::Memory(brain_core::MemoryId::from_raw(u128::from_be_bytes(
+            m.subject_entity_bytes,
+        ))),
+        // 1 (and any unknown byte, defensively) → Pending.
+        _ => SubjectRef::Pending(brain_core::AuditId::from_bytes(m.subject_entity_bytes)),
     };
 
     let evidence = if let Some(bytes) = m.evidence_overflow_id_bytes {
@@ -760,25 +784,65 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
         let subject = EntityId::new();
-        let stmt = StatementId::new();
-        let key = (
+        // Two Set-valued statements sharing (subject, kind, predicate,
+        // is_current) must both survive: the appended statement id makes
+        // each a distinct row.
+        let stmt_a = StatementId::new();
+        let stmt_b = StatementId::new();
+        let key_a = (
             subject.to_bytes(),
             StatementKind::Preference.as_u8(),
             3u32,
             1u8,
+            stmt_a.to_bytes(),
+        );
+        let key_b = (
+            subject.to_bytes(),
+            StatementKind::Preference.as_u8(),
+            3u32,
+            1u8,
+            stmt_b.to_bytes(),
         );
 
         let wtxn = db.begin_write().unwrap();
         {
             let mut t = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE).unwrap();
-            t.insert(&key, &stmt.to_bytes()).unwrap();
+            t.insert(&key_a, &stmt_a.to_bytes()).unwrap();
+            t.insert(&key_b, &stmt_b.to_bytes()).unwrap();
         }
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
         let t = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE).unwrap();
-        let got = t.get(&key).unwrap().unwrap().value();
-        assert_eq!(StatementId::from(got), stmt);
+        let got_a = t.get(&key_a).unwrap().unwrap().value();
+        let got_b = t.get(&key_b).unwrap().unwrap().value();
+        assert_eq!(StatementId::from(got_a), stmt_a);
+        assert_eq!(StatementId::from(got_b), stmt_b);
+
+        // Both members are enumerable via a range scan over the shared
+        // (subject, kind, predicate, is_current) prefix.
+        let lo = (
+            subject.to_bytes(),
+            StatementKind::Preference.as_u8(),
+            3u32,
+            1u8,
+            [0u8; 16],
+        );
+        let hi = (
+            subject.to_bytes(),
+            StatementKind::Preference.as_u8(),
+            3u32,
+            1u8,
+            [0xffu8; 16],
+        );
+        let mut found: Vec<StatementId> = Vec::new();
+        for entry in t.range(lo..=hi).unwrap() {
+            let (_, v) = entry.unwrap();
+            found.push(StatementId::from(v.value()));
+        }
+        assert_eq!(found.len(), 2);
+        assert!(found.contains(&stmt_a));
+        assert!(found.contains(&stmt_b));
     }
 
     #[test]

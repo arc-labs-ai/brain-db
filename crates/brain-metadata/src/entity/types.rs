@@ -68,6 +68,33 @@ pub fn entity_type_lookup_by_name_rtxn(
     Ok(None)
 }
 
+/// Snapshot the active entity-type names as zero-shot classifier labels —
+/// `brain:<Name>` in stable id-order. The GLiNER tier reads this each drain
+/// cycle so a user's `SCHEMA_UPLOAD` adding entity types reaches the classifier
+/// on the next batch without a shard restart.
+///
+/// Entity types are a flat, namespaceless registry (see the module note), so
+/// the `brain:` prefix is a cosmetic convention the resolver strips before
+/// lookup (`resolve_entity_type`); a user-uploaded type ("Drug") is labeled
+/// `brain:Drug` and still resolves to the bare row. The prefix/format matches
+/// what the classifier was tuned against — don't change it without re-measuring
+/// GLiNER zero-shot recall.
+pub fn entity_type_label_qnames(
+    rtxn: &ReadTransaction,
+) -> Result<Vec<String>, EntityTypeOpError> {
+    let t = rtxn.open_table(ENTITY_TYPES_TABLE)?;
+    let mut rows: Vec<(u32, String)> = Vec::new();
+    for entry in t.iter()? {
+        let (k, v) = entry?;
+        rows.push((k.value(), v.value().name));
+    }
+    rows.sort_by_key(|(id, _)| *id);
+    Ok(rows
+        .into_iter()
+        .map(|(_, name)| format!("brain:{name}"))
+        .collect())
+}
+
 /// Intern an entity_type by name. Idempotent on identical
 /// `schema_blob`; refuses to clobber a pre-existing row with a
 /// diverging blob.

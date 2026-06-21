@@ -411,10 +411,19 @@ fn compose_text_input(terms: &[String], phrases: &[Vec<String>]) -> String {
 /// Escape tantivy `QueryParser` syntax characters so the token is
 /// matched literally. Phrase tokens are already wrapped in quotes
 /// so we only need to escape backslashes + quotes inside.
+///
+/// Apostrophes (and the curly/back variants) are mapped to a space rather
+/// than escaped: the indexing tokenizer splits on them, so "Niraj's" is stored
+/// as the token "niraj", and a raw apostrophe in the query string makes the
+/// `QueryParser` grammar fail outright ("Syntax Error: niraj's …"). Mapping to
+/// a space yields "niraj s", which tokenizes to the same indexed terms and
+/// parses cleanly — so possessive cues ("Niraj's manager") match instead of
+/// dropping the whole lexical lane.
 fn escape_query_token(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
+            '\'' | '\u{2019}' | '\u{2018}' | '`' => out.push(' '),
             '\\' | '"' | '+' | '-' | '!' | '(' | ')' | '^' | '{' | '}' | '[' | ']' | ':' | '~'
             | '*' | '?' => {
                 out.push('\\');

@@ -112,27 +112,29 @@ fn empty_name_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// Unicode rejection — validator is ASCII-only by design.
+// Predicate NAMES are an open vocabulary — any-script letters/digits are
+// accepted (a relation coined from non-English text must not be dropped).
+// The NAMESPACE stays ASCII-strict (it's a deliberate identifier).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn unicode_letter_in_name_is_rejected() {
+fn unicode_letter_in_name_is_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
-    // Cyrillic 'а' (U+0430) looks like Latin 'a' but is NOT ASCII.
-    let err = predicate_intern_or_get(&wtxn, "acme", "loves\u{0430}", 0, 0).unwrap_err();
-    assert_invalid(err);
+    // Cyrillic 'а' (U+0430) is a real letter — a coined predicate may use it.
+    predicate_intern_or_get(&wtxn, "acme", "loves\u{0430}", 0, 0)
+        .expect("non-ASCII letter is a valid open-vocab predicate name");
 }
 
 #[test]
-fn unicode_first_char_in_name_is_rejected() {
+fn unicode_first_char_in_name_is_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
-    // German sharp s — fails the [a-z] first-char rule.
-    let err = predicate_intern_or_get(&wtxn, "acme", "\u{00DF}name", 0, 0).unwrap_err();
-    assert_invalid(err);
+    // German sharp s leading — a letter, so a valid name start.
+    predicate_intern_or_get(&wtxn, "acme", "\u{00DF}name", 0, 0)
+        .expect("a leading non-ASCII letter is valid");
 }
 
 #[test]
@@ -169,12 +171,13 @@ fn colon_in_name_is_rejected() {
 }
 
 #[test]
-fn hyphen_in_name_is_rejected() {
+fn hyphen_in_name_is_accepted() {
+    // A hyphen is a legitimate connector in domain relations (`5-ht2a`,
+    // `co-occurs`); the open-vocab name grammar accepts it.
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
-    let err = predicate_intern_or_get(&wtxn, "acme", "is-a", 0, 0).unwrap_err();
-    assert_invalid(err);
+    predicate_intern_or_get(&wtxn, "acme", "is-a", 0, 0).expect("hyphen is a valid name connector");
 }
 
 #[test]
@@ -198,25 +201,28 @@ fn whitespace_is_rejected() {
 }
 
 #[test]
-fn uppercase_first_char_is_rejected() {
+fn uppercase_first_char_namespace_rejected_name_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
+    // Namespace stays ASCII-lowercase-strict.
     let err = predicate_intern_or_get(&wtxn, "Acme", "x", 0, 0).unwrap_err();
     assert_invalid(err);
-    let err = predicate_intern_or_get(&wtxn, "acme", "Loves", 0, 0).unwrap_err();
-    assert_invalid(err);
+    // A name is open vocabulary — case isn't a structural hazard.
+    predicate_intern_or_get(&wtxn, "acme", "Loves", 0, 0).expect("uppercase name is accepted");
 }
 
 #[test]
-fn leading_digit_is_rejected() {
+fn leading_digit_namespace_rejected_name_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
+    // Namespace must not start with a digit.
     let err = predicate_intern_or_get(&wtxn, "1acme", "x", 0, 0).unwrap_err();
     assert_invalid(err);
-    let err = predicate_intern_or_get(&wtxn, "acme", "1loves", 0, 0).unwrap_err();
-    assert_invalid(err);
+    // A digit-leading name (`5ht2a_agonist`) is a real relation surface.
+    predicate_intern_or_get(&wtxn, "acme", "1loves", 0, 0)
+        .expect("digit-leading name is accepted");
 }
 
 #[test]

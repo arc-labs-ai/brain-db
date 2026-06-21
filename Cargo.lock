@@ -412,6 +412,7 @@ dependencies = [
  "candle-transformers",
  "criterion",
  "futures-lite 2.6.1",
+ "futures-util",
  "jsonschema",
  "parking_lot",
  "proptest",
@@ -421,6 +422,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "time",
  "tokenizers",
  "tokio",
  "tracing",
@@ -513,6 +515,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
+ "unicode-normalization",
  "uuid",
 ]
 

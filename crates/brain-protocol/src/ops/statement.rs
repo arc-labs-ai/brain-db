@@ -11,15 +11,32 @@ use crate::envelope::request::WireUuid;
 // Shared types (used by requests + StatementView in statement_resp.rs).
 // ---------------------------------------------------------------------------
 
-/// Wire counterpart to `brain_core::StatementKind`. Discriminants are
-/// offset by 1 vs `StatementKind` so `0` can mean "no filter" in
-/// [`StatementListRequest::kind`].
+/// Wire counterpart to `brain_core::StatementKind`. Mirrors the six
+/// built-in kinds plus `Custom` for user-declared kinds. In the raw-byte
+/// filter field [`StatementListRequest::kind`], `0` means "no filter" and
+/// any non-zero byte is `core_byte + 1` (so `1=Fact … 6=Directive`,
+/// `7+ = Custom(core_byte)`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[repr(u8)]
 pub enum StatementKindWire {
-    Fact = 1,
-    Preference = 2,
-    Event = 3,
+    Fact,
+    Preference,
+    Event,
+    Attribute,
+    Relation,
+    Directive,
+    /// User-declared kind; holds the `brain_core::StatementKind::Custom`
+    /// byte (`>= 6`).
+    Custom(u8),
+}
+
+impl StatementKindWire {
+    /// The `brain_core::StatementKind` storage byte (0-based: `0=Fact …
+    /// 5=Directive`, `>=6 = Custom`). Replaces the old `as u8` cast that
+    /// relied on a `#[repr(u8)]` discriminant.
+    #[must_use]
+    pub fn as_storage_byte(self) -> u8 {
+        statement_kind_from_wire(self).as_u8()
+    }
 }
 
 /// Wire counterpart to `brain_core::StatementValue`.
@@ -678,6 +695,10 @@ pub fn statement_kind_to_wire(k: StatementKind) -> StatementKindWire {
         StatementKind::Fact => StatementKindWire::Fact,
         StatementKind::Preference => StatementKindWire::Preference,
         StatementKind::Event => StatementKindWire::Event,
+        StatementKind::Attribute => StatementKindWire::Attribute,
+        StatementKind::Relation => StatementKindWire::Relation,
+        StatementKind::Directive => StatementKindWire::Directive,
+        StatementKind::Custom(b) => StatementKindWire::Custom(b),
     }
 }
 
@@ -687,6 +708,10 @@ pub fn statement_kind_from_wire(w: StatementKindWire) -> StatementKind {
         StatementKindWire::Fact => StatementKind::Fact,
         StatementKindWire::Preference => StatementKind::Preference,
         StatementKindWire::Event => StatementKind::Event,
+        StatementKindWire::Attribute => StatementKind::Attribute,
+        StatementKindWire::Relation => StatementKind::Relation,
+        StatementKindWire::Directive => StatementKind::Directive,
+        StatementKindWire::Custom(b) => StatementKind::Custom(b),
     }
 }
 
@@ -700,9 +725,14 @@ impl StatementView {
     /// `"namespace:name"`).
     #[must_use]
     pub fn from_statement(s: &Statement, predicate_qname: String) -> Self {
+        // `flags` bit 0 = pending subject, bit 1 = memory subject; neither
+        // set = entity. `subject` carries the 16 id bytes for entity /
+        // memory subjects, `subject_pending_audit_id` the audit id for
+        // pending ones.
         let (subject, subject_pending_audit_id, flags) = match s.subject {
             SubjectRef::Entity(id) => (id.to_bytes(), [0u8; 16], 0u32),
             SubjectRef::Pending(audit) => ([0u8; 16], audit.to_bytes(), 1u32),
+            SubjectRef::Memory(id) => (id.to_be_bytes(), [0u8; 16], 2u32),
         };
 
         Self {
@@ -744,6 +774,10 @@ impl StatementView {
             SubjectRef::Pending(brain_core::AuditId::from_bytes(
                 self.subject_pending_audit_id,
             ))
+        } else if self.flags & 2 != 0 {
+            SubjectRef::Memory(brain_core::MemoryId::from_raw(u128::from_be_bytes(
+                self.subject,
+            )))
         } else {
             SubjectRef::Entity(EntityId::from_bytes(self.subject))
         };

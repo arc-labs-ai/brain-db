@@ -27,6 +27,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # 20.2: pattern extractor uses the regex crate's DFA matcher.
 regex = { workspace = true }
+# Temporal-expressions extractor does civil-date math (calendar
+# month/year shifts, weekday resolution) via the `time` crate.
+time = { workspace = true }
 # 20.3: classifier extractor loads operator-provided BERT NER weights
 # via candle (same crate set as brain-embed, phase 5).
 candle-core.workspace = true
@@ -44,6 +47,10 @@ parking_lot = { workspace = true }
 # the sync ResolverLlm trait via futures_lite::future::block_on. Used
 # in tests too (Extractor::run is async).
 futures-lite = { workspace = true }
+# P3: run the LLM tier's per-memory calls concurrently within a micro-batch
+# (`join_all`) — the calls are independent network I/O, so overlapping them
+# turns a serial 8x-latency drain into ~1x. Already a workspace dep.
+futures-util = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -72,10 +79,6 @@ harness = false
 
 [[bench]]
 name = "llm_pipeline"
-harness = false
-
-[[bench]]
-name = "statement_kind_pattern"
 harness = false
 
 [[test]]

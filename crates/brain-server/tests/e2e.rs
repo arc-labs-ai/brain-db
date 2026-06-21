@@ -35,7 +35,7 @@ use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
 use brain_protocol::envelope::request::{
-    ByeRequest, EncodeRequest, ForgetMode, ForgetRequest, MemoryKindWire, RecallRequest,
+    ByeRequest, EncodeRequest, ForgetMode, ForgetRequest, RecallRequest,
     RequestBody,
 };
 use brain_protocol::envelope::response::ResponseBody;
@@ -165,12 +165,9 @@ async fn encode_round_trip(
     let req = EncodeRequest {
         text: text.into(),
         context_id: 0,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: Vec::new(),
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
     };
     send_frame(
         client,
@@ -198,10 +195,12 @@ async fn encode_round_trip(
 async fn recall_round_trip(client: &mut TcpStream, stream_id: u32, cue: &str) -> u16 {
     let req = RecallRequest {
         cue_text: cue.into(),
-        top_k: 5,
+        subject_name: String::new(),
+        max_results: 5,
         confidence_threshold: 0.0,
         context_filter: None,
         age_bound_unix_nanos: None,
+        as_of_record_time_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
         include_edges: false,

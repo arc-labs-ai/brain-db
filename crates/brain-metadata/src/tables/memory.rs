@@ -174,6 +174,11 @@ pub struct MemoryMetadata {
     pub forgot_at_unix_nanos: Option<u64>,
     pub tombstoned_at_unix_nanos: Option<u64>,
     pub consolidated_at_unix_nanos: Option<u64>,
+    /// Client-supplied event time — when the memory's content actually
+    /// happened, distinct from `created_at_unix_nanos` (server write
+    /// time). `None` when the client didn't supply one. Echoed back on
+    /// recall via `MemoryResult.occurred_at_unix_nanos`.
+    pub occurred_at_unix_nanos: Option<u64>,
 
     // -- Salience --
     pub salience: f32,
@@ -245,6 +250,7 @@ impl MemoryMetadata {
             forgot_at_unix_nanos: None,
             tombstoned_at_unix_nanos: None,
             consolidated_at_unix_nanos: None,
+            occurred_at_unix_nanos: None,
             salience: salience_initial,
             salience_initial,
             access_count: 0,
@@ -277,6 +283,15 @@ impl MemoryMetadata {
     /// access don't need to thread a value through.
     pub fn with_encoded_at_lsn(mut self, lsn: u64) -> Self {
         self.encoded_at_lsn = lsn;
+        self
+    }
+
+    /// Stamp the client-supplied event time on this row. Builder-style so
+    /// `new_active` defaults it to `None` and callers that don't have an
+    /// event time (the common case) need not thread a value through.
+    #[must_use]
+    pub fn with_occurred_at(mut self, occurred_at_unix_nanos: Option<u64>) -> Self {
+        self.occurred_at_unix_nanos = occurred_at_unix_nanos;
         self
     }
 

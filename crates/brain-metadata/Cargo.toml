@@ -29,6 +29,10 @@ blake3.workspace = true
 # `Arc<MetadataDb>` callers can still drive `MetadataSink::apply`
 # without an outer mutex.
 parking_lot.workspace = true
+# Entity-name normalization folds to Unicode NFC before casefolding so
+# composed vs decomposed spellings of the same name ("São Paulo") share one
+# canonical key instead of splitting into duplicate entities.
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 criterion.workspace = true

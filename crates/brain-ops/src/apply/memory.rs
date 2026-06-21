@@ -28,6 +28,7 @@ pub fn apply_upsert_memory(
         salience,
         context,
         created_at_unix_nanos,
+        occurred_at_unix_nanos,
         arena_slot,
         embedding_model_fp,
         content_hash,
@@ -48,7 +49,8 @@ pub fn apply_upsert_memory(
         salience.raw(),
         text.len() as u32,
         *created_at_unix_nanos,
-    );
+    )
+    .with_occurred_at(*occurred_at_unix_nanos);
     if *deduplicate {
         if let Some(ch) = content_hash {
             row = row.with_content_hash(*ch);
@@ -93,6 +95,15 @@ pub fn apply_upsert_memory(
             .insert(&id.to_be_bytes(), text.as_bytes())
             .map_err(|e| ApplyError::Storage(format!("TEXTS insert: {e:?}")))?;
     }
+
+    // Durable extraction trigger. Enqueue this memory for asynchronous
+    // extraction INSIDE the same wtxn as the memory row, so the trigger
+    // commits atomically with the memory — a crash or restart can never
+    // lose the work. This is the source of truth for "this memory needs
+    // extraction"; the writer's flume channel is only a low-latency
+    // wakeup hint. `created_at` is the enqueue stamp.
+    brain_metadata::extraction_queue_enqueue(wtxn, *id, *created_at_unix_nanos)
+        .map_err(|e| ApplyError::Storage(format!("extraction_queue enqueue: {e:?}")))?;
 
     // FINGERPRINTS_TABLE entry when the encode opted into content-
     // hash dedup. The row keys (agent_id, context_id, content_hash) →
@@ -391,6 +402,7 @@ mod tests {
             salience: brain_core::Salience::default(),
             context: ContextId(7),
             created_at_unix_nanos: 1_700_000_000_000,
+            occurred_at_unix_nanos: None,
             arena_slot: 42,
             embedding_model_fp: [0xAA; 16],
             content_hash: None,

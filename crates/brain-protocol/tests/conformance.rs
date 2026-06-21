@@ -41,15 +41,21 @@ use brain_protocol::connection::handshake::{
 use brain_protocol::envelope::error::{ErrorDetails, ErrorResponse};
 use brain_protocol::envelope::response::{ErrorCategoryWire, ErrorCodeWire};
 use brain_protocol::error::{ErrorCategory, ErrorCode};
+use brain_protocol::ops::capabilities::{Capabilities, GetCapabilitiesResponse};
 use brain_protocol::{
-    EdgeKindWire, EdgeRequest, EncodeRequest, EncodeResponse, EncodeVectorDirectRequest,
-    EntityCreateRequest, EntityCreateResponse, EvidenceRefWire, ForgetMode, ForgetRequest,
-    ForgetResponse, Frame, MaterializeProceduralRequest, MaterializeProceduralResponse,
-    MemoryKindWire, Opcode, QueryRequest, QueryResponse, RecallRequest, RecallResponseFrame,
-    RelationCreateRequest, RelationCreateResponse, RequestBody, ResponseBody,
-    RetrieverSelectionWire, SchemaUploadRequest, SchemaUploadResponse, StageKind,
-    StatementCreateRequest, StatementCreateResponse, StatementKindWire, StatementObjectWire,
-    StatementValueWire,
+    AnswerKindWire, EdgeKindWire, EncodeRequest, EncodeResponse, EncodeVectorDirectRequest,
+    EntityCreateRequest, EntityCreateResponse, EntityGetResponse, EntityListItem,
+    EntityListResponseFrame, EntityResolveResponse, EntityView, EventType, EvidenceRefWire,
+    ForgetMode, ForgetRequest, ForgetResponse, Frame, InferenceKind, InferenceStep, LinkResponse,
+    MaterializeProceduralRequest, MaterializeProceduralResponse, MemoryKindWire, Opcode,
+    PlanResponseFrame, PlanStatus, PlanStep, PongResponse, QueryRequest, QueryResponse,
+    ReasonResponseFrame, ReasonStatus, RecallRequest, RecallResponseFrame,
+    RelationCreateRequest, RelationCreateResponse, RelationListFromResponseFrame, RelationView,
+    RequestBody, ResolutionOutcomeWire, ResponseBody, RetrieverSelectionWire, SchemaUploadRequest,
+    SchemaUploadResponse, ServerPingResponse, StageKind, StatementCreateRequest,
+    StatementCreateResponse, StatementGetResponse, StatementKindWire, StatementListResponseFrame,
+    StatementObjectWire, StatementValueWire, StatementView, SubscriptionEvent, TransitionKind,
+    TxnAbortResponse, TxnBeginResponse, TxnCommitResponse,
 };
 
 // Fixed byte patterns. No clock, no randomness — fixtures are reproducible.
@@ -261,16 +267,9 @@ fn sample_encode() -> EncodeRequest {
     EncodeRequest {
         text: "the sky is blue".into(),
         context_id: 1,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.25,
-        edges: vec![EdgeRequest {
-            target: mid(),
-            kind: EdgeKindWire::Caused,
-            weight: 0.9,
-        }],
         request_id: RID,
         txn_id: None,
-        deduplicate: true,
+        occurred_at_unix_nanos: Some(1_700_000_000_000_000_000),
     }
 }
 
@@ -346,6 +345,7 @@ fn sample_query() -> QueryRequest {
         kind_filter: vec![0],
         predicate_filter: vec!["org:works_on".into()],
         time_filter: None,
+        as_of_record_time_unix_nanos: Some(1_710_000_000_000_000_000),
         confidence_min: Some(0.25),
         include_tombstoned: false,
         include_superseded: false,
@@ -353,6 +353,199 @@ fn sample_query() -> QueryRequest {
         retrievers: RetrieverSelectionWire::Auto,
         fusion_config: None,
         request_id: RID,
+    }
+}
+
+fn sample_entity_view() -> EntityView {
+    EntityView {
+        entity_id: EID,
+        entity_type_id: 1,
+        canonical_name: "Ada".into(),
+        normalized_name: "ada".into(),
+        aliases: vec!["Ada L.".into()],
+        attributes_blob: b"role=engineer".to_vec(),
+        mention_count: 3,
+        created_at_unix_nanos: 1_700_000_000_000_000_000,
+        updated_at_unix_nanos: 1_700_000_001_000_000_000,
+        merged_into: [0u8; 16],
+        embedding_version: 1,
+        flags: 0,
+    }
+}
+
+fn sample_entity_get() -> EntityGetResponse {
+    EntityGetResponse {
+        entity: sample_entity_view(),
+    }
+}
+
+fn sample_entity_list() -> EntityListResponseFrame {
+    EntityListResponseFrame {
+        items: vec![EntityListItem {
+            entity: sample_entity_view(),
+        }],
+        next_cursor: Vec::new(),
+        cumulative_count: 1,
+        is_final: true,
+    }
+}
+
+fn sample_entity_resolve() -> EntityResolveResponse {
+    EntityResolveResponse {
+        outcome: ResolutionOutcomeWire::Resolved,
+        tier: 2,
+        confidence: 0.95,
+        resolved_entity: EID,
+        candidate_ids: Vec::new(),
+        audit_id: [0u8; 16],
+    }
+}
+
+fn sample_statement_view() -> StatementView {
+    StatementView {
+        statement_id: RID,
+        kind: StatementKindWire::Fact,
+        subject: EID,
+        subject_pending_audit_id: [0u8; 16],
+        predicate: "org:works_on".into(),
+        object: StatementObjectWire::Value(StatementValueWire::Text("brain".into())),
+        confidence: 0.9,
+        evidence: EvidenceRefWire::Inline(vec![mid().to_be_bytes()]),
+        extractor_id: 0,
+        extracted_at_unix_nanos: 1_700_000_000_000_000_000,
+        schema_version: 1,
+        valid_from_unix_nanos: 1_700_000_000_000_000_000,
+        valid_to_unix_nanos: 0,
+        event_at_unix_nanos: 0,
+        version: 1,
+        superseded_by: [0u8; 16],
+        supersedes: [0u8; 16],
+        chain_root: RID,
+        tombstoned: false,
+        tombstoned_at_unix_nanos: 0,
+        tombstone_reason: 0,
+        flags: 0,
+        is_stateful: false,
+    }
+}
+
+fn sample_statement_get() -> StatementGetResponse {
+    StatementGetResponse {
+        statement: sample_statement_view(),
+        returned_via_supersession: false,
+    }
+}
+
+fn sample_statement_list() -> StatementListResponseFrame {
+    StatementListResponseFrame {
+        items: vec![sample_statement_view()],
+        next_cursor: Vec::new(),
+        cumulative_count: 1,
+        is_final: true,
+    }
+}
+
+fn sample_relation_view() -> RelationView {
+    RelationView {
+        relation_id: RID,
+        chain_root: RID,
+        relation_type: "org:mentors".into(),
+        from_entity: EID,
+        to_entity: AGENT,
+        properties_blob: Vec::new(),
+        evidence: EvidenceRefWire::Inline(vec![mid().to_be_bytes()]),
+        extractor_id: 0,
+        extracted_at_unix_nanos: 1_700_000_000_000_000_000,
+        confidence: 0.9,
+        valid_from_unix_nanos: 1_700_000_000_000_000_000,
+        valid_to_unix_nanos: 0,
+        version: 1,
+        superseded_by: [0u8; 16],
+        supersedes: [0u8; 16],
+        tombstoned: false,
+        tombstoned_at_unix_nanos: 0,
+        flags: 0,
+    }
+}
+
+fn sample_relation_list() -> RelationListFromResponseFrame {
+    RelationListFromResponseFrame {
+        items: vec![sample_relation_view()],
+        next_cursor: Vec::new(),
+        cumulative_count: 1,
+        is_final: true,
+    }
+}
+
+fn sample_plan() -> PlanResponseFrame {
+    PlanResponseFrame {
+        steps: vec![PlanStep {
+            step_index: 0,
+            memory_id: mid(),
+            text: "first step".into(),
+            transition_kind: TransitionKind::Causal,
+            confidence: 0.8,
+            estimated_distance_to_goal: 0.5,
+        }],
+        is_final: true,
+        plan_status: Some(PlanStatus::GoalReached),
+    }
+}
+
+fn sample_reason() -> ReasonResponseFrame {
+    ReasonResponseFrame {
+        inferences: vec![InferenceStep {
+            step_index: 0,
+            claim: "the sky is blue".into(),
+            supporting_memories: vec![mid()],
+            contradicting_memories: Vec::new(),
+            confidence: 0.85,
+            inference_kind: InferenceKind::EvidenceAccumulation,
+        }],
+        is_final: true,
+        reason_status: Some(ReasonStatus::Complete),
+    }
+}
+
+fn sample_link() -> LinkResponse {
+    LinkResponse {
+        source: mid(),
+        target: mid(),
+        kind: EdgeKindWire::Caused,
+        weight: 0.9,
+        created_at_unix_nanos: 1_700_000_000_000_000_000,
+        already_existed: false,
+    }
+}
+
+fn sample_get_capabilities() -> GetCapabilitiesResponse {
+    GetCapabilitiesResponse {
+        capabilities: Capabilities {
+            rerank: true,
+            llm_extractor: false,
+            classifier_extractor: true,
+            pattern_extractor: true,
+            schema_namespaces: vec!["org".into()],
+            vector_dim: 384,
+        },
+    }
+}
+
+fn sample_subscribe_event() -> SubscriptionEvent {
+    SubscriptionEvent {
+        event_type: EventType::Encoded,
+        memory_id: mid(),
+        context_id: 1,
+        text: "the sky is blue".into(),
+        kind: MemoryKindWire::Episodic,
+        salience: 0.5,
+        timestamp_unix_nanos: 1_700_000_000_000_000_000,
+        lsn: 42,
+        graph_payload: None,
+        edge_payload: None,
+        stage_kind: None,
+        stage_outcome: None,
+        stage_payload: None,
     }
 }
 
@@ -392,10 +585,12 @@ fn corpus() -> Vec<Case> {
     ));
     let recall = RecallRequest {
         cue_text: "what color is the sky".into(),
-        top_k: 10,
+        subject_name: "sky".into(),
+        max_results: 10,
         confidence_threshold: 0.3,
         context_filter: Some(vec![1]),
         age_bound_unix_nanos: None,
+        as_of_record_time_unix_nanos: Some(1_710_000_000_000_000_000),
         kind_filter: Some(vec![MemoryKindWire::Episodic]),
         salience_floor: 0.1,
         include_edges: true,
@@ -504,7 +699,8 @@ fn corpus() -> Vec<Case> {
         &sample_encode_response(),
     ));
     let recall_resp = RecallResponseFrame {
-        results: Vec::new(),
+        answer_kind: AnswerKindWire::None,
+        memories: Vec::new(),
         is_final: true,
         cumulative_count: 0,
         estimated_remaining: Some(0),
@@ -580,6 +776,117 @@ fn corpus() -> Vec<Case> {
         "resp_materialize_procedural",
         ResponseBody::MaterializeProcedural(materialize_resp.clone()),
         &materialize_resp,
+    ));
+
+    // ---- Read-side typed-graph responses ----
+    cases.push(resp_case(
+        "resp_entity_get",
+        ResponseBody::EntityGet(sample_entity_get()),
+        &sample_entity_get(),
+    ));
+    cases.push(resp_case(
+        "resp_entity_list",
+        ResponseBody::EntityList(sample_entity_list()),
+        &sample_entity_list(),
+    ));
+    cases.push(resp_case(
+        "resp_entity_resolve",
+        ResponseBody::EntityResolve(sample_entity_resolve()),
+        &sample_entity_resolve(),
+    ));
+    cases.push(resp_case(
+        "resp_statement_get",
+        ResponseBody::StatementGet(sample_statement_get()),
+        &sample_statement_get(),
+    ));
+    cases.push(resp_case(
+        "resp_statement_list",
+        ResponseBody::StatementList(sample_statement_list()),
+        &sample_statement_list(),
+    ));
+    cases.push(resp_case(
+        "resp_relation_list",
+        ResponseBody::RelationListFrom(sample_relation_list()),
+        &sample_relation_list(),
+    ));
+
+    // ---- Cognitive read-side responses ----
+    cases.push(resp_case(
+        "resp_plan",
+        ResponseBody::Plan(sample_plan()),
+        &sample_plan(),
+    ));
+    cases.push(resp_case(
+        "resp_reason",
+        ResponseBody::Reason(sample_reason()),
+        &sample_reason(),
+    ));
+    cases.push(resp_case(
+        "resp_link",
+        ResponseBody::Link(sample_link()),
+        &sample_link(),
+    ));
+
+    // ---- Transaction responses ----
+    let txn_begin_resp = TxnBeginResponse {
+        txn_id: RID,
+        timeout_seconds: 30,
+        started_at_unix_nanos: 1_700_000_000_000_000_000,
+    };
+    cases.push(resp_case(
+        "resp_txn_begin",
+        ResponseBody::TxnBegin(txn_begin_resp),
+        &txn_begin_resp,
+    ));
+    let txn_commit_resp = TxnCommitResponse {
+        txn_id: RID,
+        committed_at_unix_nanos: 1_700_000_001_000_000_000,
+        operations_applied: 3,
+    };
+    cases.push(resp_case(
+        "resp_txn_commit",
+        ResponseBody::TxnCommit(txn_commit_resp),
+        &txn_commit_resp,
+    ));
+    let txn_abort_resp = TxnAbortResponse {
+        txn_id: RID,
+        operations_discarded: 2,
+    };
+    cases.push(resp_case(
+        "resp_txn_abort",
+        ResponseBody::TxnAbort(txn_abort_resp),
+        &txn_abort_resp,
+    ));
+
+    // ---- Capabilities + subscription event ----
+    cases.push(resp_case(
+        "resp_get_capabilities",
+        ResponseBody::GetCapabilities(sample_get_capabilities()),
+        &sample_get_capabilities(),
+    ));
+    cases.push(resp_case(
+        "resp_subscribe_event",
+        ResponseBody::SubscribeEvent(sample_subscribe_event()),
+        &sample_subscribe_event(),
+    ));
+
+    // ---- Keepalive responses ----
+    let pong_resp = PongResponse {
+        client_timestamp_unix_nanos: 1_700_000_000_000_000_000,
+        server_timestamp_unix_nanos: 1_700_000_000_500_000_000,
+    };
+    cases.push(resp_case(
+        "resp_pong",
+        ResponseBody::Pong(pong_resp),
+        &pong_resp,
+    ));
+    let server_ping_resp = ServerPingResponse {
+        server_timestamp_unix_nanos: 1_700_000_000_000_000_000,
+    };
+    cases.push(resp_case(
+        "resp_server_ping",
+        ResponseBody::ServerPing(server_ping_resp),
+        &server_ping_resp,
     ));
 
     // ---- ERROR responses: cover every category ----
@@ -698,7 +1005,8 @@ fn corpus() -> Vec<Case> {
         0x80,
         2,
         ResponseBody::Recall(RecallResponseFrame {
-            results: Vec::new(),
+            answer_kind: AnswerKindWire::None,
+            memories: Vec::new(),
             is_final: true,
             cumulative_count: 0,
             estimated_remaining: Some(0),
@@ -748,6 +1056,25 @@ fn required_families() -> Vec<(&'static str, Opcode)> {
             "procedural.materialize_resp",
             Opcode::MaterializeProceduralResp,
         ),
+        ("graph.entity_get_resp", Opcode::EntityGetResp),
+        ("graph.entity_list_resp", Opcode::EntityListResp),
+        ("graph.entity_resolve_resp", Opcode::EntityResolveResp),
+        ("graph.statement_get_resp", Opcode::StatementGetResp),
+        ("graph.statement_list_resp", Opcode::StatementListResp),
+        (
+            "graph.relation_list_from_resp",
+            Opcode::RelationListFromResp,
+        ),
+        ("cognitive.plan_resp", Opcode::PlanResp),
+        ("cognitive.reason_resp", Opcode::ReasonResp),
+        ("cognitive.link_resp", Opcode::LinkResp),
+        ("txn.begin_resp", Opcode::TxnBeginResp),
+        ("txn.commit_resp", Opcode::TxnCommitResp),
+        ("txn.abort_resp", Opcode::TxnAbortResp),
+        ("capabilities.get_resp", Opcode::GetCapabilitiesResp),
+        ("subscribe.event", Opcode::SubscribeEvent),
+        ("keepalive.pong", Opcode::Pong),
+        ("keepalive.server_ping", Opcode::ServerPing),
         ("error", Opcode::Error),
     ]
 }

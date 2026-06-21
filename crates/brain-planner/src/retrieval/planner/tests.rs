@@ -36,14 +36,15 @@ fn has_retriever(plan: &QueryPlan, r: Retriever) -> bool {
 #[test]
 fn default_free_text_plan() {
     let p = plan(&req_with_text("budget pushback")).expect("plan");
-    // Default plan is retrieval for everyone: semantic + lexical
-    // always, plus graph at half weight using top semantic hits
-    // as memory anchors (the path that lights up the substrate
-    // edge graph even without a declared schema).
-    assert_eq!(p.retrievers.len(), 3);
+    // Free-text with no entity anchor is semantic + lexical only. The
+    // unanchored memory-edge graph rider was dropped (it surfaced
+    // low-precision neighbour memories that outranked direct hits);
+    // similar-memory recall is the semantic retriever's job. Graph
+    // fires only on a resolved entity anchor.
+    assert_eq!(p.retrievers.len(), 2);
     assert_eq!(weight_of(&p, Retriever::Semantic), Some(1.0));
     assert_eq!(weight_of(&p, Retriever::Lexical), Some(1.0));
-    assert_eq!(weight_of(&p, Retriever::Graph), Some(0.5));
+    assert!(!has_retriever(&p, Retriever::Graph));
     assert_eq!(p.fusion.k, DEFAULT_K);
 }
 

@@ -21,8 +21,7 @@ use brain_ops::test_support::{run_in_glommio, single_body};
 use brain_ops::{dispatch, DispatchOutcome, ErrorCode, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
-    EdgeKindWire, EdgeRequest, EncodeRequest, LinkRequest, MemoryKindWire, RequestBody,
-    UnlinkRequest,
+    EdgeKindWire, EncodeRequest, LinkRequest, RequestBody, UnlinkRequest,
 };
 use brain_protocol::envelope::response::{
     EncodeResponse, LinkResponse, ResponseBody, UnlinkResponse,
@@ -80,12 +79,9 @@ fn encode_req(request_id: [u8; 16], text: &str) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
         context_id: 42,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: vec![],
         request_id,
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
     }
 }
 
@@ -488,44 +484,11 @@ fn unlink_conflict_on_request_id_reuse_with_different_target() {
 }
 
 // ===========================================================================
-// Encode-inline edge insertion (the bug fix)
+// Encode-inline edge insertion
 // ===========================================================================
-
-#[test]
-fn encode_inline_edges_actually_land_in_redb() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-
-        // First memory becomes a target.
-        let target = encode(&fix, [1; 16], "target").await;
-
-        // Second memory carries an inline edge to the target.
-        let mut req = encode_req([2; 16], "linker");
-        req.edges = vec![EdgeRequest {
-            target,
-            kind: EdgeKindWire::References,
-            weight: 0.5,
-        }];
-        let linker = match single_body(
-            dispatch(
-                RequestBody::Encode(req),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        ) {
-            ResponseBody::Encode(r) => r.memory_id,
-            other => panic!("got {other:?}"),
-        };
-
-        // The edge must actually exist in redb (regression: it once didn't).
-        assert!(edge_exists(&fix, linker, CoreEdgeKind::References, target));
-
-        // Edge counts must be set on BOTH endpoints.
-        let (linker_out, _) = edge_counts(&fix, linker);
-        let (_, target_in) = edge_counts(&fix, target);
-        assert_eq!(linker_out, 1, "source memory tracks outgoing edges");
-        assert_eq!(target_in, 1, "target memory tracks incoming edges");
-    })
-}
+//
+// ENCODE no longer carries client edges (the `edges` field is gone) —
+// edge derivation is the auto/temporal-edge workers' job now. The old
+// `encode_inline_edges_actually_land_in_redb` test exercised that
+// removed capability and has been deleted. Explicit edges are still
+// covered by the LINK op tests above.

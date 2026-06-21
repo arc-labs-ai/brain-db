@@ -16,6 +16,7 @@ struct EncodeRequest {
     request_id: RequestId,                   // 16 bytes; required for idempotency
     txn_id: Option<TxnId>,                   // 16 bytes; if part of a transaction
     deduplicate: bool,                       // if true, exact-text duplicates return existing memory_id
+    occurred_at_unix_nanos: Option<u64>,     // client event time; None when unknown
 }
 
 struct EdgeRequest {
@@ -35,6 +36,7 @@ Fields:
 - `request_id` — UUIDv7 recommended; required for idempotent retry.
 - `txn_id` — if non-None, the encode is buffered as part of the transaction.
 - `deduplicate` — if true, the server checks for exact-text duplicates in the same context; if found, returns the existing memory_id without creating a new memory.
+- `occurred_at_unix_nanos` — client-supplied **event time**: when the memory's content actually happened, as opposed to `created_at` (the server's write time). `None` when the client doesn't know it. Lets time-aware clients store the real timeline instead of cramming dates into the text; echoed back verbatim on `RECALL` (`MemoryResult.occurred_at_unix_nanos`) and carried durably through the WAL so it survives recovery. `ENCODE_VECTOR_DIRECT` has no such field — vector-direct writes default the timeline to write time.
 
 ### 2. ENCODE_VECTOR_DIRECT_REQ (0x2A)
 
@@ -74,6 +76,7 @@ struct RecallRequest {
     confidence_threshold: f32,               // [0, 1]; results below this are excluded
     context_filter: Option<Vec<ContextId>>,  // None = no filter; up to 16 contexts
     age_bound_unix_nanos: Option<u64>,       // results must be newer than this
+    as_of_record_time_unix_nanos: Option<u64>, // bi-temporal time-travel anchor; also the recency reference
     kind_filter: Option<Vec<MemoryKind>>,    // None = all kinds
     salience_floor: f32,                     // [0, 1]; default 0
     include_vectors: bool,                   // include vectors in results
@@ -94,6 +97,7 @@ Fields:
 - `confidence_threshold` — results with confidence below this are filtered out. Default: 0.0.
 - `context_filter` — restrict to specific contexts. None means search across all contexts the agent owns. Up to 16 context IDs allowed.
 - `age_bound_unix_nanos` — only return memories created after this time.
+- `as_of_record_time_unix_nanos` — bi-temporal **time-travel** anchor. When set, statement/relation results are resolved against the state the substrate believed at record-time `t` (`extracted_at <= t AND (record_invalidated_at IS NULL OR record_invalidated_at > t)`), and `t` also becomes the reference point for the recency-ranking decay. `None` is the current-state default. Distinct from `age_bound_unix_nanos` (an event-time lower bound).
 - `kind_filter` — restrict to specific kinds. None means all kinds.
 - `salience_floor` — minimum salience for inclusion. Default 0.0.
 - `include_vectors` — if true, response carries vector data. Default false (saves bandwidth).
@@ -460,8 +464,9 @@ struct MemoryResult {
     salience: f32,                           // current salience
     kind: MemoryKind,
     context_id: ContextId,
-    created_at_unix_nanos: u64,
+    created_at_unix_nanos: u64,              // server write time
     last_accessed_at_unix_nanos: u64,
+    occurred_at_unix_nanos: Option<u64>,     // client event time, echoed from ENCODE; None if not supplied
     vector_offset: u32,                      // 0 if vectors not requested
     vector_dim: u16,
     edges: Option<Vec<EdgeView>>,            // None if include_edges=false

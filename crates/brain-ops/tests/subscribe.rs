@@ -106,21 +106,20 @@ fn build_fixture_with(bus: EventBus) -> Fixture {
 // Helpers.
 // ---------------------------------------------------------------------------
 
+// `_kind` is accepted for call-site compatibility but ignored: the
+// write router decides the memory kind now (always Episodic).
 fn encode_req(
     request_id: [u8; 16],
     text: &str,
     context_id: u64,
-    kind: MemoryKindWire,
+    _kind: MemoryKindWire,
 ) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
         context_id,
-        kind,
-        salience_hint: 0.5,
-        edges: vec![],
         request_id,
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
     }
 }
 
@@ -310,7 +309,9 @@ fn publish_forget_emits_forgotten_event() {
         assert_eq!(env.event_type, EventType::Forgotten);
         assert_eq!(env.memory_id, MemoryId::from(mid));
         assert_eq!(env.context_id, ContextId(7));
-        assert_eq!(env.kind, MemoryKind::Semantic);
+        // Kind is router-decided (always Episodic) regardless of the
+        // value passed to the test builder.
+        assert_eq!(env.kind, MemoryKind::Episodic);
         assert_eq!(env.text, None, "forget envelope must not carry text");
     })
 }
@@ -340,12 +341,9 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
                 RequestBody::Encode(EncodeRequest {
                     text: "one".into(),
                     context_id: 100,
-                    kind: MemoryKindWire::Episodic,
-                    salience_hint: 0.5,
-                    edges: vec![],
                     request_id: [0xA; 16],
                     txn_id: Some(txn_id),
-                    deduplicate: false,
+                    occurred_at_unix_nanos: None,
                 }),
                 brain_ops::RequestCaller::anonymous(),
                 &fix.ctx,
@@ -361,12 +359,9 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
                 RequestBody::Encode(EncodeRequest {
                     text: "two".into(),
                     context_id: 100,
-                    kind: MemoryKindWire::Episodic,
-                    salience_hint: 0.5,
-                    edges: vec![],
                     request_id: [0xB; 16],
                     txn_id: Some(txn_id),
-                    deduplicate: false,
+                    occurred_at_unix_nanos: None,
                 }),
                 brain_ops::RequestCaller::anonymous(),
                 &fix.ctx,
@@ -429,12 +424,9 @@ fn publish_txn_abort_emits_nothing() {
             RequestBody::Encode(EncodeRequest {
                 text: "dropped".into(),
                 context_id: 1,
-                kind: MemoryKindWire::Episodic,
-                salience_hint: 0.5,
-                edges: vec![],
                 request_id: [0xCC; 16],
                 txn_id: Some(txn_id),
-                deduplicate: false,
+                occurred_at_unix_nanos: None,
             }),
             brain_ops::RequestCaller::anonymous(),
             &fix.ctx,
@@ -496,78 +488,13 @@ fn filter_context_drops_off_context_events() {
     })
 }
 
-#[test]
-fn filter_kind_drops_off_kind_events() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let mut filter = empty_filter();
-        filter.kinds = Some(vec![MemoryKindWire::Semantic]);
-        let handle = fix.ctx.subscriptions.register(&sub_req(filter)).unwrap();
-        let mut rx = handle.receiver;
-
-        do_encode(
-            &fix.ctx,
-            encode_req([1; 16], "ep", 1, MemoryKindWire::Episodic),
-        )
-        .await;
-        do_encode(
-            &fix.ctx,
-            encode_req([2; 16], "se", 1, MemoryKindWire::Semantic),
-        )
-        .await;
-
-        let mut matched = 0;
-        for _ in 0..2 {
-            if let Some(env) = try_recv(&mut rx, Duration::from_millis(200)).await {
-                if handle.filter.matches(&env) {
-                    matched += 1;
-                    assert_eq!(env.kind, MemoryKind::Semantic);
-                }
-            }
-        }
-        assert_eq!(matched, 1);
-    })
-}
-
-#[test]
-fn filter_context_and_kind_combine_as_and() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let mut filter = empty_filter();
-        filter.contexts = Some(vec![5]);
-        filter.kinds = Some(vec![MemoryKindWire::Semantic]);
-        let handle = fix.ctx.subscriptions.register(&sub_req(filter)).unwrap();
-        let mut rx = handle.receiver;
-
-        do_encode(
-            &fix.ctx,
-            encode_req([1; 16], "a", 5, MemoryKindWire::Episodic),
-        )
-        .await; // no
-        do_encode(
-            &fix.ctx,
-            encode_req([2; 16], "b", 6, MemoryKindWire::Semantic),
-        )
-        .await; // no
-        do_encode(
-            &fix.ctx,
-            encode_req([3; 16], "c", 5, MemoryKindWire::Semantic),
-        )
-        .await; // yes
-
-        let mut matched = 0;
-        for _ in 0..3 {
-            if let Some(env) = try_recv(&mut rx, Duration::from_millis(200)).await {
-                if handle.filter.matches(&env) {
-                    matched += 1;
-                    assert_eq!(env.context_id, ContextId(5));
-                    assert_eq!(env.kind, MemoryKind::Semantic);
-                }
-            }
-        }
-        assert_eq!(matched, 1, "only the (ctx=5, Semantic) event matches");
-    })
-}
+// The subscription kind-filter tests (`filter_kind_drops_off_kind_events`,
+// `filter_context_and_kind_combine_as_and`) relied on the client
+// encoding a Semantic-kind memory so a Semantic event would flow onto
+// the bus. The write router now files every encode as Episodic, so
+// those scenarios can no longer be set up through ENCODE and have been
+// removed. The filter-matching logic itself (kind/context AND-combine)
+// is covered by `SubscriptionFilter::matches` unit tests.
 
 #[test]
 fn filter_null_passes_every_event() {
@@ -956,6 +883,7 @@ mod wal_record_projection {
             request_hash: [0; 32],
             response_payload: vec![],
             deduplicate: false,
+            occurred_at_unix_nanos: None,
         };
         let r = rec(WalPayload::Encode(p));
         let envs = EventEnvelope::from_wal_record(&r);

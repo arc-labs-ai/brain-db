@@ -207,7 +207,7 @@ fn fingerprint_weights(path: &std::path::Path) -> Result<String, ExtractorError>
     let hash = blake3::hash(&bytes);
     let bytes16: [u8; 16] = hash.as_bytes()[..16]
         .try_into()
-        .expect("blake3 >= 16 bytes");
+        .expect("invariant: blake3 digest is 32 bytes, slicing the first 16 always succeeds");
     let mut hex = String::with_capacity(32);
     for b in &bytes16 {
         hex.push_str(&format!("{b:02x}"));

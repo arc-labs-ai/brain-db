@@ -1,0 +1,62 @@
+# Brain — single-host Docker Compose (the product service).
+#
+# Lives under config/ alongside docker.toml (baked into the image) rather than
+# the repo root. Run from anywhere via `just compose-up` (which passes
+# `-f config/docker-compose.yml`), or directly:
+#
+#   docker compose -f config/docker-compose.yml up -d --build
+#   docker compose -f config/docker-compose.yml down        # keeps volumes
+#   docker compose -f config/docker-compose.yml down -v     # also drops data
+#
+# Port map (host → container):
+#   8080  → data plane (clients + SDK)
+#   9091  → public HTTP (/healthz + /metrics)
+#
+# The admin endpoint (/v1/*) listens on 127.0.0.1:9092 inside the container and
+# is intentionally not published; reach it via `docker exec brain ...`.
+#
+# Memory: the full capability stack loads the embed (~130 MiB) + reranker
+# (~1.1 GiB) + gliner (~590 MiB) models into RAM. Give the Docker VM enough
+# headroom (≈12 GiB recommended) or the shard spawn OOMs while loading the
+# reranker.
+#
+# Observability (prometheus / otel / grafana) is a separate concern and is not
+# bundled here; the dashboards/alerts live under config/monitoring/.
+
+name: brain
+
+services:
+  brain:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: brain:latest
+    container_name: brain
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "9091:9091"
+    environment:
+      RUST_BACKTRACE: "1"
+    volumes:
+      - brain-data:/var/lib/brain/data
+      - brain-models:/var/lib/brain/models
+    healthcheck:
+      retries: 3
+      timeout: 3s
+      interval: 10s
+      start_period: 30s
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9091/healthz"]
+    # io_uring (Glommio) needs both the memlock rlimit raised AND seccomp
+    # permission for io_uring_setup/enter/register — Docker's *default* seccomp
+    # profile blocks those syscalls even on a new-enough kernel, so an
+    # unconfined (or io_uring-allowing custom) profile is mandatory or the shard
+    # executor fails to start.
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      memlock: -1
+
+volumes:
+  brain-data:
+  brain-models:

@@ -3,29 +3,28 @@
 //!
 //! Builds the `MaterializeDeps` slots:
 //!
-//! - Reads `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (optionally
-//!   `BRAIN_ANTHROPIC_MODEL` / `BRAIN_OPENAI_MODEL` to override
-//!   the default model per provider).
-//! - Constructs a [`ModelRouter`] populated with whichever
-//!   clients have keys.
+//! - Resolves a single credential + model id: `BRAIN_API_KEY` /
+//!   `BRAIN_AI_MODEL` env vars win, else the `[llm] api_key` /
+//!   `[llm] model` config values. The provider (OpenAI / Anthropic)
+//!   is **derived from the model id prefix** — there is no separate
+//!   provider key.
+//! - Constructs a [`ModelRouter`] holding the one provider client.
 //! - Opens `<shard_dir>/llm_cache.redb` via [`LlmCacheDb::open`].
 //!   Failure to open the file is non-fatal: a warning is logged
 //!   and the cache slot stays `None` (LLM extractors then skip
 //!   caching).
 //!
-//! ## Why one client per provider in v1
+//! ## One credential, one model, derived provider
 //!
-//! The router routes by **prefix only**: the operator's
-//! `model:` schema field selects the provider, not the wire
-//! model. The wire model is whichever model the server-side
-//! client was constructed for. Per-extractor model selection +
-//! per-provider client pools are deferred.
+//! Brain takes a single provider-agnostic key + model id. The model
+//! id selects the provider via [`provider_for_model`]; adding a
+//! provider is a match-arm here, not a new config key. The router
+//! still routes by prefix, so the `model:` schema field continues to
+//! address the configured client.
 //!
-//! Defaults are picked to match the embedded pricing table in
-//! `brain_extractors::Pricing::for_model`:
-//!
-//! - Anthropic → `claude-haiku-4-5`
-//! - OpenAI    → `gpt-4o-mini`
+//! The default model (when none is configured) matches the embedded
+//! pricing table in `brain_extractors::Pricing::for_model`:
+//! `gpt-4o-mini` (OpenAI).
 
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -38,8 +37,30 @@ use parking_lot::Mutex;
 
 use super::LlmSpawnConfig;
 
-const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5";
-const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
+/// Default model when neither env nor config supplies one. OpenAI's
+/// `gpt-4o-mini` — matches the seeded extraction path and the embedded
+/// pricing table.
+const DEFAULT_MODEL: &str = "gpt-4o-mini";
+
+/// The LLM provider a model id routes to. Derived purely from the id
+/// prefix so a single configured key/model implies its provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Provider {
+    Anthropic,
+    OpenAI,
+}
+
+/// Map a model id to its provider by prefix. Anthropic models begin
+/// `claude`; everything else (OpenAI `gpt-*` / `o1`-`o4` reasoning
+/// families, and unknown ids) routes to OpenAI as the default wire
+/// dialect.
+fn provider_for_model(model: &str) -> Provider {
+    if model.trim_start().to_ascii_lowercase().starts_with("claude") {
+        Provider::Anthropic
+    } else {
+        Provider::OpenAI
+    }
+}
 
 /// Shared Tokio runtime that backs every LLM-tier HTTP call.
 ///
@@ -128,6 +149,12 @@ pub struct LlmDeps {
     /// that client (Anthropic preferred, OpenAI as fallback) so
     /// there's no duplicate API key handling.
     pub disambiguator: Option<Arc<EntityDisambiguator>>,
+    /// The primary provider client + its wire model, retained so other
+    /// write-time LLM consumers (the HyPE generator) can reuse the same
+    /// client without re-resolving credentials. `None` mirrors
+    /// `disambiguator`: no provider key was resolvable.
+    pub primary_client: Option<Arc<dyn LlmClient>>,
+    pub primary_model: String,
 }
 
 impl LlmDeps {
@@ -159,20 +186,24 @@ impl LlmDeps {
 /// Always returns a value; missing keys / unopenable cache files
 /// produce `None` slots.
 ///
-/// Credential resolution per provider is **env-first, config-fallback**:
-/// the `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` environment variable wins
-/// when set, otherwise the matching `[llm]` config value is used. This
-/// keeps the environment as the override path for production secrets
-/// while letting an operator drop a key into `config/dev.toml` for
-/// local development.
+/// Credential resolution is **env-first, config-fallback**: the
+/// `BRAIN_API_KEY` environment variable wins when set, otherwise the
+/// `[llm] api_key` config value is used. This keeps the environment as
+/// the override path for production secrets while letting an operator
+/// drop a key into `config/dev.toml` for local development. The model
+/// id resolves the same way (`BRAIN_AI_MODEL` > `[llm] model` >
+/// [`DEFAULT_MODEL`]).
 pub fn build_llm_deps(shard_dir: &Path, llm_cfg: &LlmSpawnConfig) -> LlmDeps {
     let (primary_client, primary_model) = build_primary_client(llm_cfg);
-    let disambiguator =
-        primary_client.map(|c| Arc::new(EntityDisambiguator::new(c, primary_model)));
+    let disambiguator = primary_client
+        .clone()
+        .map(|c| Arc::new(EntityDisambiguator::new(c, primary_model.clone())));
     LlmDeps {
         router: build_router(llm_cfg),
         cache: open_cache(shard_dir),
         disambiguator,
+        primary_client,
+        primary_model,
     }
 }
 
@@ -185,73 +216,47 @@ fn resolve_key(env_var: &str, config_value: &Option<String>) -> Option<String> {
         .or_else(|| config_value.clone().filter(|s| !s.is_empty()))
 }
 
-fn anthropic_model(llm_cfg: &LlmSpawnConfig) -> String {
-    std::env::var("BRAIN_ANTHROPIC_MODEL")
+/// Resolve the configured model id: `BRAIN_AI_MODEL` > `[llm] model` >
+/// [`DEFAULT_MODEL`].
+fn ai_model(llm_cfg: &LlmSpawnConfig) -> String {
+    std::env::var("BRAIN_AI_MODEL")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| llm_cfg.anthropic_model.clone().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| DEFAULT_ANTHROPIC_MODEL.to_string())
+        .or_else(|| llm_cfg.model.clone().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
 }
 
-fn openai_model(llm_cfg: &LlmSpawnConfig) -> String {
-    std::env::var("BRAIN_OPENAI_MODEL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| llm_cfg.openai_model.clone().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string())
-}
-
-/// Build an Anthropic client if a key is resolvable. Returns the
-/// `(client, model)` pair so the disambiguator can record the model.
-fn anthropic_client(llm_cfg: &LlmSpawnConfig) -> Option<(Arc<dyn LlmClient>, String)> {
-    let key = resolve_key("ANTHROPIC_API_KEY", &llm_cfg.anthropic_api_key)?;
-    let model = anthropic_model(llm_cfg);
-    let c = AnthropicClient::with_key(model.clone(), key)?;
-    Some((bridge(Arc::new(c)), model))
-}
-
-/// Build an OpenAI client if a key is resolvable.
-fn openai_client(llm_cfg: &LlmSpawnConfig) -> Option<(Arc<dyn LlmClient>, String)> {
-    let key = resolve_key("OPENAI_API_KEY", &llm_cfg.openai_api_key)?;
-    let model = openai_model(llm_cfg);
-    let c = OpenAIClient::with_key(model.clone(), key)?;
-    Some((bridge(Arc::new(c)), model))
+/// Build the single provider client if a key is resolvable. The
+/// provider is derived from the model id. Returns the `(client, model)`
+/// pair so the disambiguator can record the model.
+fn build_client(llm_cfg: &LlmSpawnConfig) -> Option<(Arc<dyn LlmClient>, String)> {
+    let key = resolve_key("BRAIN_API_KEY", &llm_cfg.api_key)?;
+    let model = ai_model(llm_cfg);
+    let client: Arc<dyn LlmClient> = match provider_for_model(&model) {
+        Provider::Anthropic => Arc::new(AnthropicClient::with_key(model.clone(), key)?),
+        Provider::OpenAI => Arc::new(OpenAIClient::with_key(model.clone(), key)?),
+    };
+    Some((bridge(client), model))
 }
 
 /// Pick the primary client for single-call surfaces (today: the
-/// partial-match disambiguator). Anthropic wins ties — it's the
-/// reference path Brain optimises prompt caching against.
+/// partial-match disambiguator).
 ///
-/// Returns `(None, String::new())` when no provider is configured.
+/// Returns `(None, String::new())` when no key is configured.
 fn build_primary_client(llm_cfg: &LlmSpawnConfig) -> (Option<Arc<dyn LlmClient>>, String) {
-    if let Some((client, model)) = anthropic_client(llm_cfg) {
-        return (Some(client), model);
+    match build_client(llm_cfg) {
+        Some((client, model)) => (Some(client), model),
+        None => (None, String::new()),
     }
-    if let Some((client, model)) = openai_client(llm_cfg) {
-        return (Some(client), model);
-    }
-    (None, String::new())
 }
 
 fn build_router(llm_cfg: &LlmSpawnConfig) -> Option<Arc<ModelRouter>> {
-    let mut r = ModelRouter::new();
-    let mut any = false;
-
-    if let Some((client, _)) = anthropic_client(llm_cfg) {
-        r = r.with_anthropic(client);
-        any = true;
-    }
-
-    if let Some((client, _)) = openai_client(llm_cfg) {
-        r = r.with_openai(client);
-        any = true;
-    }
-
-    if any {
-        Some(Arc::new(r))
-    } else {
-        None
-    }
+    let (client, model) = build_client(llm_cfg)?;
+    let router = match provider_for_model(&model) {
+        Provider::Anthropic => ModelRouter::new().with_anthropic(client),
+        Provider::OpenAI => ModelRouter::new().with_openai(client),
+    };
+    Some(Arc::new(router))
 }
 
 fn open_cache(shard_dir: &Path) -> Option<Arc<Mutex<LlmCacheDb>>> {
@@ -332,73 +337,59 @@ mod tests {
         }
     }
 
-    const ALL_KEYS: &[&str] = &[
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "BRAIN_ANTHROPIC_MODEL",
-        "BRAIN_OPENAI_MODEL",
-    ];
+    const ALL_KEYS: &[&str] = &["BRAIN_API_KEY", "BRAIN_AI_MODEL"];
 
     #[test]
-    fn build_router_returns_none_when_no_keys() {
+    fn provider_derived_from_model_prefix() {
+        assert_eq!(provider_for_model("claude-haiku-4-5"), Provider::Anthropic);
+        assert_eq!(provider_for_model("Claude-Sonnet"), Provider::Anthropic);
+        assert_eq!(provider_for_model("gpt-4o-mini"), Provider::OpenAI);
+        assert_eq!(provider_for_model("o3-mini"), Provider::OpenAI);
+        // Unknown ids default to the OpenAI wire dialect.
+        assert_eq!(provider_for_model("mystery-model"), Provider::OpenAI);
+    }
+
+    #[test]
+    fn build_router_returns_none_when_no_key() {
         let _g = ENV_LOCK.lock().unwrap();
         let _e = EnvGuard::new(ALL_KEYS);
         assert!(build_router(&LlmSpawnConfig::default()).is_none());
     }
 
     #[test]
-    fn build_router_with_anthropic_only() {
+    fn build_router_routes_to_anthropic_for_claude_model() {
         let _g = ENV_LOCK.lock().unwrap();
         let env = EnvGuard::new(ALL_KEYS);
-        env.set("ANTHROPIC_API_KEY", "test-key-anthropic");
+        env.set("BRAIN_API_KEY", "test-key");
+        env.set("BRAIN_AI_MODEL", "claude-haiku-4-5");
         let r = build_router(&LlmSpawnConfig::default()).expect("router");
         assert!(r.resolve("claude-haiku-4-5").is_some());
         assert!(r.resolve("gpt-4o-mini").is_none());
     }
 
     #[test]
-    fn build_router_with_openai_only() {
+    fn build_router_routes_to_openai_for_default_model() {
         let _g = ENV_LOCK.lock().unwrap();
         let env = EnvGuard::new(ALL_KEYS);
-        env.set("OPENAI_API_KEY", "test-key-openai");
+        env.set("BRAIN_API_KEY", "test-key");
         let r = build_router(&LlmSpawnConfig::default()).expect("router");
         assert!(r.resolve("gpt-4o-mini").is_some());
         assert!(r.resolve("claude-haiku-4-5").is_none());
     }
 
     #[test]
-    fn build_router_with_both_keys() {
+    fn model_override_env_var_takes_effect() {
         let _g = ENV_LOCK.lock().unwrap();
         let env = EnvGuard::new(ALL_KEYS);
-        env.set("ANTHROPIC_API_KEY", "test-key-a");
-        env.set("OPENAI_API_KEY", "test-key-o");
-        let r = build_router(&LlmSpawnConfig::default()).expect("router");
-        assert!(r.resolve("claude-haiku-4-5").is_some());
-        assert!(r.resolve("gpt-4o-mini").is_some());
+        env.set("BRAIN_AI_MODEL", "claude-sonnet-4-6");
+        assert_eq!(ai_model(&LlmSpawnConfig::default()), "claude-sonnet-4-6");
     }
 
     #[test]
-    fn model_override_env_vars_take_effect() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let env = EnvGuard::new(ALL_KEYS);
-        env.set("BRAIN_ANTHROPIC_MODEL", "claude-sonnet-4-6");
-        env.set("BRAIN_OPENAI_MODEL", "gpt-4o");
-        assert_eq!(
-            anthropic_model(&LlmSpawnConfig::default()),
-            "claude-sonnet-4-6"
-        );
-        assert_eq!(openai_model(&LlmSpawnConfig::default()), "gpt-4o");
-    }
-
-    #[test]
-    fn model_defaults_match_pricing_table() {
+    fn model_default_matches_pricing_table() {
         let _g = ENV_LOCK.lock().unwrap();
         let _e = EnvGuard::new(ALL_KEYS);
-        assert_eq!(
-            anthropic_model(&LlmSpawnConfig::default()),
-            "claude-haiku-4-5"
-        );
-        assert_eq!(openai_model(&LlmSpawnConfig::default()), "gpt-4o-mini");
+        assert_eq!(ai_model(&LlmSpawnConfig::default()), "gpt-4o-mini");
     }
 
     #[test]
@@ -406,7 +397,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         let _e = EnvGuard::new(ALL_KEYS); // no env keys set
         let cfg = LlmSpawnConfig {
-            openai_api_key: Some("config-openai-key".into()),
+            api_key: Some("config-key".into()),
             ..LlmSpawnConfig::default()
         };
         let r = build_router(&cfg).expect("router from config key");
@@ -418,14 +409,14 @@ mod tests {
     fn env_key_takes_precedence_over_config() {
         let _g = ENV_LOCK.lock().unwrap();
         let env = EnvGuard::new(ALL_KEYS);
-        env.set("OPENAI_API_KEY", "env-openai-key");
+        env.set("BRAIN_API_KEY", "env-key");
         let cfg = LlmSpawnConfig {
-            openai_api_key: Some("config-openai-key".into()),
+            api_key: Some("config-key".into()),
             ..LlmSpawnConfig::default()
         };
         assert_eq!(
-            resolve_key("OPENAI_API_KEY", &cfg.openai_api_key).as_deref(),
-            Some("env-openai-key"),
+            resolve_key("BRAIN_API_KEY", &cfg.api_key).as_deref(),
+            Some("env-key"),
         );
     }
 
@@ -435,7 +426,7 @@ mod tests {
         let _e = EnvGuard::new(ALL_KEYS);
         // An empty string in config is treated as unset, not a key.
         let cfg = LlmSpawnConfig {
-            openai_api_key: Some(String::new()),
+            api_key: Some(String::new()),
             ..LlmSpawnConfig::default()
         };
         assert!(build_router(&cfg).is_none());
@@ -444,14 +435,12 @@ mod tests {
     #[test]
     fn config_model_override_applies() {
         let _g = ENV_LOCK.lock().unwrap();
-        let _e = EnvGuard::new(ALL_KEYS); // no BRAIN_*_MODEL env
+        let _e = EnvGuard::new(ALL_KEYS); // no BRAIN_AI_MODEL env
         let cfg = LlmSpawnConfig {
-            openai_model: Some("gpt-4o".into()),
-            anthropic_model: Some("claude-sonnet-4-6".into()),
+            model: Some("claude-sonnet-4-6".into()),
             ..LlmSpawnConfig::default()
         };
-        assert_eq!(openai_model(&cfg), "gpt-4o");
-        assert_eq!(anthropic_model(&cfg), "claude-sonnet-4-6");
+        assert_eq!(ai_model(&cfg), "claude-sonnet-4-6");
     }
 
     #[test]
@@ -492,6 +481,8 @@ mod tests {
             router: None,
             cache: open_cache(dir.path()),
             disambiguator: None,
+            primary_client: None,
+            primary_model: String::new(),
         };
         let labels = Arc::new(vec!["brain:Person".to_string()]);
         let materialize = deps.into_materialize_deps(None, labels.clone());
@@ -552,12 +543,16 @@ mod tests {
             router: None,
             cache: Some(Arc::clone(&cache_arc)),
             disambiguator: None,
+            primary_client: None,
+            primary_model: String::new(),
         }
         .into_materialize_deps(None, labels.clone());
         let deps_b = LlmDeps {
             router: None,
             cache: Some(Arc::clone(&cache_arc)),
             disambiguator: None,
+            primary_client: None,
+            primary_model: String::new(),
         }
         .into_materialize_deps(None, labels.clone());
 

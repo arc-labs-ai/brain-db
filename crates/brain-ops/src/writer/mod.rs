@@ -755,12 +755,17 @@ pub(crate) fn try_enqueue_temporal_edge(
     }
 }
 
-/// Submit-path post-commit helper. Enqueues `(memory_id, text)` onto
-/// the ExtractorWorker channel if one is wired. Non-blocking; full
-/// channel logs a warn and drops (encode succeeds without
-/// extraction). Disconnected channel logs at debug. This is the
-/// single enqueue point both the single-encode and TXN batch paths
-/// route through.
+/// Submit-path post-commit helper. Sends a low-latency *wakeup hint*
+/// onto the ExtractorWorker channel if one is wired.
+///
+/// This is NOT the durable source of truth for extraction work — the
+/// memory is durably enqueued in `EXTRACTION_QUEUE_TABLE` inside the
+/// same redb txn that wrote the memory row (`apply_upsert_memory`), so
+/// a crash, restart, or full/dropped channel never loses the work. The
+/// flume send here only wakes the worker sooner than its interval tick;
+/// the worker reads its actual work list from the durable table. A
+/// full channel therefore drops harmlessly (logged + counted), and a
+/// disconnected channel logs at debug.
 ///
 /// The admin path (`EXTRACT_BACKFILL` op) uses
 /// [`WriterHandle::enqueue_for_extraction`] instead — same

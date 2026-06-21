@@ -55,7 +55,10 @@ pub use plan::{
     RecallSubStep, ResponseStep, ScoringStep, ShardId, ShardSearchStep, SlotAllocationStep,
     SortKey, TextFetchStep, TraversalStep, WalAppendStep,
 };
-pub use planner::encode::{plan_encode, plan_encode_inner, MAX_TEXT_BYTES};
+pub use planner::encode::{
+    plan_encode, plan_encode_inner, validate_text, validate_vector_direct, DEFAULT_ENCODE_KIND,
+    DEFAULT_ENCODE_SALIENCE, MAX_TEXT_BYTES,
+};
 pub use planner::forget::{plan_forget, plan_forget_inner};
 pub use planner::path::{plan_path, plan_path_inner};
 pub use planner::reason::{plan_reason, plan_reason_inner};

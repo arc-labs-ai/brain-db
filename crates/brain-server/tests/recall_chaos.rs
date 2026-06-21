@@ -23,7 +23,7 @@ use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
-use brain_protocol::envelope::request::{EncodeRequest, MemoryKindWire, RecallRequest};
+use brain_protocol::envelope::request::{EncodeRequest, RecallRequest};
 use brain_protocol::Frame;
 use brain_protocol::RequestBody;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -137,12 +137,9 @@ async fn encode_text(client: &mut TcpStream, stream_id: u32, text: &str) {
     let req = EncodeRequest {
         text: text.into(),
         context_id: 0,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: Vec::new(),
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
     };
     let body = RequestBody::Encode(req);
     let opcode = body.opcode().as_u16();
@@ -175,10 +172,12 @@ async fn seed_fixture(client: &mut TcpStream) {
 fn recall_request() -> RecallRequest {
     RecallRequest {
         cue_text: "meeting preferences".into(),
-        top_k: 5,
+        subject_name: String::new(),
+        max_results: 5,
         confidence_threshold: 0.0,
         context_filter: None,
         age_bound_unix_nanos: None,
+        as_of_record_time_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
         include_edges: false,

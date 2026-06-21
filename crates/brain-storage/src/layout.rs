@@ -148,6 +148,51 @@ impl ShardPaths {
 }
 
 // ---------------------------------------------------------------------------
+// WAL segment accounting.
+// ---------------------------------------------------------------------------
+
+/// Sum the on-disk size of every WAL segment in `wal_dir` and count
+/// them. Returns `(total_bytes, segment_count)`.
+///
+/// A segment is any regular file whose extension is `wal` — the same
+/// key the recovery scan and rollover writer use. Files that vanish
+/// mid-scan (a retention sweep rotating a segment away under us) are
+/// skipped rather than failing the whole count, so a `/metrics` scrape
+/// never errors on a benign race; a single missing segment only
+/// understates the total for one scrape. A `read_dir` failure on the
+/// directory itself yields `(0, 0)`.
+///
+/// ```no_run
+/// use brain_storage::ShardPaths;
+/// let paths = ShardPaths::at("/data/shard-0");
+/// let (bytes, segments) = brain_storage::wal_segment_stats(&paths.wal_dir());
+/// println!("wal: {bytes} bytes across {segments} segments");
+/// ```
+#[must_use]
+pub fn wal_segment_stats(wal_dir: &Path) -> (u64, u64) {
+    let Ok(entries) = std::fs::read_dir(wal_dir) else {
+        return (0, 0);
+    };
+    let mut total_bytes = 0u64;
+    let mut segment_count = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("wal") {
+            continue;
+        }
+        // A segment rotated away between read_dir and metadata is a
+        // benign race on the scrape path: skip it.
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.is_file() {
+                total_bytes += meta.len();
+                segment_count += 1;
+            }
+        }
+    }
+    (total_bytes, segment_count)
+}
+
+// ---------------------------------------------------------------------------
 // Directory bootstrap.
 // ---------------------------------------------------------------------------
 
@@ -251,6 +296,30 @@ mod tests {
         assert!(p.wal_dir().is_dir());
         assert!(p.statements_tantivy().is_dir());
         assert!(p.memory_text_tantivy().is_dir());
+    }
+
+    #[test]
+    fn wal_segment_stats_sums_only_dot_wal_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("wal");
+        std::fs::create_dir_all(&wal).unwrap();
+
+        std::fs::write(wal.join("0000000000.wal"), vec![0u8; 100]).unwrap();
+        std::fs::write(wal.join("0000000001.wal"), vec![0u8; 250]).unwrap();
+        // Non-segment files must not be counted.
+        std::fs::write(wal.join("scratch.tmp"), vec![0u8; 9999]).unwrap();
+        std::fs::write(wal.join("notes.txt"), vec![0u8; 9999]).unwrap();
+
+        let (bytes, segments) = wal_segment_stats(&wal);
+        assert_eq!(bytes, 350);
+        assert_eq!(segments, 2);
+    }
+
+    #[test]
+    fn wal_segment_stats_missing_dir_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("does-not-exist");
+        assert_eq!(wal_segment_stats(&absent), (0, 0));
     }
 
     #[test]

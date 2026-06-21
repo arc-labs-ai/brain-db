@@ -17,6 +17,7 @@ pub mod entity_gc;
 pub mod extractor;
 pub mod forget_cascade;
 pub mod hnsw_maint;
+pub mod hype;
 pub mod idempotency_cleanup;
 pub mod llm_cache_sweeper;
 pub mod schema_migration;

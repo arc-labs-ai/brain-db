@@ -190,7 +190,9 @@ impl WorkerScheduler {
     /// Returned order is HashMap iteration order (not registration
     /// order). Callers needing stable output should sort.
     #[must_use]
-    pub fn metrics_snapshot(&self) -> Vec<(&'static str, WorkerKind, crate::metrics::MetricsSnapshot)> {
+    pub fn metrics_snapshot(
+        &self,
+    ) -> Vec<(&'static str, WorkerKind, crate::metrics::MetricsSnapshot)> {
         self.handles
             .values()
             .map(|h| (h.name, h.kind, h.metrics.snapshot()))

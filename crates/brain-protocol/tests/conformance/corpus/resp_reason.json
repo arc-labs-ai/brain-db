@@ -1,0 +1,16 @@
+{
+  "inferences": [
+    {
+      "step_index": 0,
+      "claim": "the sky is blue",
+      "supporting_memories": [
+        33059591799037110662230
+      ],
+      "contradicting_memories": [],
+      "confidence": 0.85,
+      "inference_kind": "EvidenceAccumulation"
+    }
+  ],
+  "is_final": true,
+  "reason_status": 0
+}

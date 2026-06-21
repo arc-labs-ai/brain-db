@@ -105,6 +105,10 @@ pub struct BufferedEncode {
     pub request_id: [u8; 16],
     pub request_hash: [u8; 32],
     pub created_at_unix_nanos: u64,
+    /// Client-supplied event time, echoed from the buffered ENCODE so the
+    /// committed `Phase::UpsertMemory` carries the same timeline a
+    /// non-transactional encode would.
+    pub occurred_at_unix_nanos: Option<u64>,
     pub agent_id: brain_core::AgentId,
 }
 
@@ -558,6 +562,7 @@ pub(crate) fn build_phases(buffer: &TxnBuffer) -> Vec<crate::write::Phase> {
             salience: Salience::new(e.salience_initial),
             context: e.context_id,
             created_at_unix_nanos: e.created_at_unix_nanos,
+            occurred_at_unix_nanos: e.occurred_at_unix_nanos,
             arena_slot: e.memory_id.slot(),
             embedding_model_fp: e.fingerprint,
             content_hash: None,

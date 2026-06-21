@@ -4,8 +4,8 @@ use brain_core::EntityId;
 use brain_core::StatementKind;
 
 use super::{
-    classify_query, route, GraphAnchorMode, OverrideKind, QueryClass, QueryRequest,
-    RetrievalProfile, Retriever, RetrieverSelection, TimeRange, MAX_RETRIEVERS,
+    classify_query, entity_cue_candidates, route, GraphAnchorMode, OverrideKind, QueryClass,
+    QueryRequest, RetrievalProfile, Retriever, RetrieverSelection, TimeRange, MAX_RETRIEVERS,
 };
 
 fn req_with_text(text: &str) -> QueryRequest {
@@ -83,17 +83,15 @@ fn lowercase_text_doesnt_trigger_all_caps_path() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rule_5_default_free_text_picks_semantic_lexical_and_graph() {
+fn rule_5_default_free_text_picks_semantic_lexical_only() {
     let d = route(&req_with_text("budget pushback"));
     assert_eq!(retriever_weight(&d, Retriever::Semantic), Some(1.0));
     assert_eq!(retriever_weight(&d, Retriever::Lexical), Some(1.0));
-    // Graph rides along anchored at the semantic top-K — keeps
-    // substrate edges contributing on schemaless deployments.
-    assert_eq!(retriever_weight(&d, Retriever::Graph), Some(0.5));
-    assert_eq!(
-        d.graph_anchor_mode,
-        Some(GraphAnchorMode::MemoryFromSemantic)
-    );
+    // No graph on the default free-text path: the graph lane needs a
+    // resolved entity anchor, and the unanchored memory-edge walk buried
+    // direct semantic/lexical hits.
+    assert_eq!(retriever_weight(&d, Retriever::Graph), None);
+    assert_eq!(d.graph_anchor_mode, None);
 }
 
 #[test]
@@ -287,11 +285,16 @@ fn question_text_is_detected() {
 }
 
 #[test]
-fn title_case_triggers_entity_mention_heuristic() {
+fn title_case_mention_alone_does_not_select_graph() {
     let d = route(&req_with_text("Alice met Bob in Paris"));
+    // The heuristic still fires (used for profile/classification)...
     assert!(d.features.contains_entity_mention_heuristic);
-    // Without an explicit anchor, Title-Case alone triggers Rule 1.
-    assert_eq!(retriever_weight(&d, Retriever::Graph), Some(2.0));
+    // ...but a bare Title-Case mention is NOT a resolved entity anchor,
+    // so the graph lane is not selected. It falls to the default free-text
+    // path: semantic + lexical only.
+    assert_eq!(retriever_weight(&d, Retriever::Graph), None);
+    assert_eq!(retriever_weight(&d, Retriever::Semantic), Some(1.0));
+    assert_eq!(retriever_weight(&d, Retriever::Lexical), Some(1.0));
 }
 
 #[test]
@@ -388,9 +391,46 @@ fn classify_routes_default_when_request_is_empty() {
 }
 
 #[test]
+fn list_intent_fires_on_enumerative_cues() {
+    for cue in [
+        "list all the books she read",
+        "how many times did he visit berlin",
+        "what are her hobbies",
+        "name all of his coworkers",
+        "what kinds of music does she like",
+    ] {
+        let d = route(&req_with_text(cue));
+        assert!(d.list_intent, "expected list_intent for {cue:?}");
+    }
+    // Free-text list cue (no anchor / id) routes to the ListAggregation
+    // class with its wide pool.
+    let d = route(&req_with_text("list all the books she read"));
+    assert_eq!(d.query_class, QueryClass::ListAggregation);
+}
+
+#[test]
+fn list_intent_does_not_fire_on_single_answer_factoids() {
+    // The detector is precision-biased: these single-answer questions
+    // must NOT trip list handling (an earlier over-eager version
+    // regressed exactly this shape).
+    for cue in [
+        "what is her wife's name",
+        "when did he move to berlin",
+        "where does she work",
+        "who is his manager",
+        "how do i debug a flaky test",
+    ] {
+        let d = route(&req_with_text(cue));
+        assert!(!d.list_intent, "did NOT expect list_intent for {cue:?}");
+    }
+}
+
+#[test]
 fn title_case_text_classifies_as_entity_anchored() {
-    // "Alice met Bob" trips the Title-Case mention heuristic which
-    // routes Rule 1; the QueryClass tracks that signal too.
+    // "Alice met Bob" trips the Title-Case mention heuristic, which still
+    // sets the QueryClass (used for profile weights). It no longer selects
+    // the graph lane (that needs a resolved EntityId anchor) — the
+    // retriever set falls to the default semantic+lexical path.
     let d = route(&req_with_text("Alice met Bob in Paris"));
     assert_eq!(d.query_class, QueryClass::EntityAnchored);
 }
@@ -424,4 +464,16 @@ fn entity_anchor_without_text_selects_graph_and_semantic_only() {
         Some(GraphAnchorMode::Entity),
         "anchor present → entity graph mode (no semantic anchoring)",
     );
+}
+
+#[test]
+fn entity_cue_candidates_extracts_title_case_spans() {
+    // Multi-word spans also emit their individual words, so a name that
+    // merged with a leading capital still resolves on its own.
+    assert_eq!(
+        entity_cue_candidates("What did Sarah say about the Phoenix Project?"),
+        vec!["What", "Sarah", "Phoenix Project", "Phoenix", "Project"],
+    );
+    // Lowercase queries name no Title-Case cue → nothing to resolve.
+    assert!(entity_cue_candidates("what did she say").is_empty());
 }

@@ -21,6 +21,26 @@ pub const PREDICATES_TABLE: TableDefinition<'static, u32, PredicateDefinition> =
 pub const PREDICATES_BY_QNAME_TABLE: TableDefinition<'static, &str, u32> =
     TableDefinition::new("predicates_by_qname");
 
+/// `predicate_review_queue` — durable record of predicate qnames the
+/// extractor proposed but that are NOT declared in the active schema, so
+/// closed-vocab extraction dropped them from the live graph. Key is the
+/// canonical `"namespace:name"`; value is the number of times it was
+/// seen. Operators scan this to decide which coined predicates to promote
+/// into a schema via `SCHEMA_UPLOAD`. Nothing reads it on the hot path.
+pub const PREDICATE_REVIEW_QUEUE_TABLE: TableDefinition<'static, &str, u64> =
+    TableDefinition::new("predicate_review_queue");
+
+/// `predicate_embeddings` — per-predicate semantic vector, keyed by
+/// `PredicateId.raw()` (u32). Value is the embedding as little-endian
+/// `f32` bytes (BGE-small → 384 dims → 1536 bytes). Written when a
+/// predicate is first interned at extraction time; read by the grounded
+/// answer engine to match a query's relation against a subject's
+/// predicates by cosine (the "two-way match", alongside the exact qname
+/// index). Open-vocab predicates are never gated, so this is how a free
+/// predicate stays *findable* by a paraphrased question.
+pub const PREDICATE_EMBEDDINGS_TABLE: TableDefinition<'static, u32, &[u8]> =
+    TableDefinition::new("predicate_embeddings");
+
 /// Origin of a registered predicate. Tracks whether the row was
 /// authored by an explicit `SCHEMA_UPLOAD` (strict mode) or interned
 /// on demand from an open-vocabulary write (schemaless mode).
@@ -187,6 +207,11 @@ pub fn decode_kind_constraint(b: u8) -> Option<StatementKind> {
         1 => Some(StatementKind::Fact),
         2 => Some(StatementKind::Preference),
         3 => Some(StatementKind::Event),
+        4 => Some(StatementKind::Attribute),
+        5 => Some(StatementKind::Relation),
+        6 => Some(StatementKind::Directive),
+        // `0` (any) and any unknown byte collapse to None. User-declared
+        // Custom kinds are not used as a coarse predicate constraint.
         _ => None,
     }
 }
@@ -198,7 +223,11 @@ pub fn encode_kind_constraint(k: Option<StatementKind>) -> u8 {
         Some(StatementKind::Fact) => 1,
         Some(StatementKind::Preference) => 2,
         Some(StatementKind::Event) => 3,
-        None => 0,
+        Some(StatementKind::Attribute) => 4,
+        Some(StatementKind::Relation) => 5,
+        Some(StatementKind::Directive) => 6,
+        // No coarse constraint for Custom kinds (treated as "any").
+        Some(StatementKind::Custom(_)) | None => 0,
     }
 }
 

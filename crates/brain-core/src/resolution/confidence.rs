@@ -91,8 +91,16 @@ pub fn decay_for(kind: StatementKind, age_secs: f32, config: &ConfidenceConfig) 
     match kind {
         StatementKind::Event if config.event_decay_disabled => 1.0,
         StatementKind::Event => exp_decay(age_secs, config.fact_half_life_seconds),
-        StatementKind::Fact => exp_decay(age_secs, config.fact_half_life_seconds),
+        // Preferences are the slowest to decay — a stated like/dislike stays
+        // true far longer than an episodic fact.
         StatementKind::Preference => exp_decay(age_secs, config.pref_half_life_seconds),
+        // Everything else (Fact, Attribute, Relation, Directive, and
+        // user-declared Custom kinds) decays on the fact half-life.
+        StatementKind::Fact
+        | StatementKind::Attribute
+        | StatementKind::Relation
+        | StatementKind::Directive
+        | StatementKind::Custom(_) => exp_decay(age_secs, config.fact_half_life_seconds),
     }
 }
 
@@ -284,9 +292,9 @@ mod proptests {
         fn confidence_in_unit_interval(
             evidence in proptest::collection::vec(evi_strategy(), 0..50),
             now in 0u64..2_500_000_000_000_000_000u64,
-            kind_byte in 0u8..3u8,
+            kind_byte in 0u8..6u8,
         ) {
-            let kind = StatementKind::from_u8(kind_byte).unwrap();
+            let kind = StatementKind::from_u8(kind_byte);
             let r = aggregate_confidence(&evidence, now, kind, &ConfidenceConfig::default_v1());
             prop_assert!((0.0..=1.0).contains(&r) && !r.is_nan(), "got {r}");
         }
@@ -295,9 +303,9 @@ mod proptests {
         fn confidence_monotonic_in_evidence(
             mut evidence in proptest::collection::vec(evi_strategy(), 1..20),
             now in 1_500_000_000_000_000_000u64..2_500_000_000_000_000_000u64,
-            kind_byte in 0u8..3u8,
+            kind_byte in 0u8..6u8,
         ) {
-            let kind = StatementKind::from_u8(kind_byte).unwrap();
+            let kind = StatementKind::from_u8(kind_byte);
             let cfg = ConfidenceConfig::default_v1();
             let base = aggregate_confidence(&evidence, now, kind, &cfg);
             // Append a duplicate of the first entry; confidence must

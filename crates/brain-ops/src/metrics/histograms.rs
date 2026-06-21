@@ -47,7 +47,7 @@ pub const RESOLVER_OUTCOME_LABELS: &[&str] = &[
 
 /// Item kinds published by the `items_written_total` counter family
 /// on [`super::extractor::ExtractorMetrics`].
-pub const ITEM_KIND_LABELS: &[&str] = &["entity", "statement", "relation", "mention"];
+pub const ITEM_KIND_LABELS: &[&str] = &["entity", "statement", "relation", "mention", "hype"];
 
 // ---------------------------------------------------------------------
 // Fixed-bucket histogram (worker-local, allocation-free per observe).

@@ -1,0 +1,73 @@
+{
+  "items": [
+    {
+      "entity": {
+        "entity_id": [
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68
+        ],
+        "entity_type_id": 1,
+        "canonical_name": "Ada",
+        "normalized_name": "ada",
+        "aliases": [
+          "Ada L."
+        ],
+        "attributes_blob": [
+          114,
+          111,
+          108,
+          101,
+          61,
+          101,
+          110,
+          103,
+          105,
+          110,
+          101,
+          101,
+          114
+        ],
+        "mention_count": 3,
+        "created_at_unix_nanos": 1700000000000000000,
+        "updated_at_unix_nanos": 1700000001000000000,
+        "merged_into": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "embedding_version": 1,
+        "flags": 0
+      }
+    }
+  ],
+  "next_cursor": [],
+  "cumulative_count": 1,
+  "is_final": true
+}

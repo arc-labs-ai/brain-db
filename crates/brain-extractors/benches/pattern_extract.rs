@@ -51,6 +51,7 @@ fn build_memory(size_bytes: usize) -> Memory {
         text: Some(text),
         created_at_unix_ms: 0,
         last_accessed_at_unix_ms: 0,
+        occurred_at_unix_nanos: None,
     }
 }
 
@@ -59,6 +60,9 @@ fn bench_pattern_extract(c: &mut Criterion) {
     let mem = build_memory(4096);
     let reg = ExtractorRegistry::new();
     let ctx = ExtractionContext {
+            declared_predicates: None,
+        declared_kinds: None,
+        entity_type_labels: None,
         schema_version: 1,
         now_unix_nanos: 0,
         registry: &reg,
@@ -79,6 +83,9 @@ fn bench_pattern_extract_short(c: &mut Criterion) {
     let mem = build_memory(256);
     let reg = ExtractorRegistry::new();
     let ctx = ExtractionContext {
+            declared_predicates: None,
+        declared_kinds: None,
+        entity_type_labels: None,
         schema_version: 1,
         now_unix_nanos: 0,
         registry: &reg,
@@ -99,6 +106,9 @@ fn print_corpus_summary() {
     let mem = build_memory(4096);
     let reg = ExtractorRegistry::new();
     let ctx = ExtractionContext {
+            declared_predicates: None,
+        declared_kinds: None,
+        entity_type_labels: None,
         schema_version: 1,
         now_unix_nanos: 0,
         registry: &reg,

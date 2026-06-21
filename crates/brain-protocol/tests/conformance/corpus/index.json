@@ -15,7 +15,7 @@
     "name": "req_encode",
     "opcode": "0x0020",
     "kind": "request",
-    "payload_len": 151
+    "payload_len": 102
   },
   {
     "name": "req_encode_vector_direct",
@@ -27,7 +27,7 @@
     "name": "req_recall",
     "opcode": "0x0021",
     "kind": "request",
-    "payload_len": 254
+    "payload_len": 316
   },
   {
     "name": "req_forget",
@@ -63,7 +63,7 @@
     "name": "req_query",
     "opcode": "0x0160",
     "kind": "request",
-    "payload_len": 239
+    "payload_len": 278
   },
   {
     "name": "req_materialize_procedural",
@@ -93,7 +93,7 @@
     "name": "resp_recall",
     "opcode": "0x00A1",
     "kind": "response",
-    "payload_len": 59
+    "payload_len": 77
   },
   {
     "name": "resp_forget",
@@ -136,6 +136,102 @@
     "opcode": "0x01E4",
     "kind": "response",
     "payload_len": 105
+  },
+  {
+    "name": "resp_entity_get",
+    "opcode": "0x01B1",
+    "kind": "response",
+    "payload_len": 282
+  },
+  {
+    "name": "resp_entity_list",
+    "opcode": "0x01B7",
+    "kind": "response",
+    "payload_len": 331
+  },
+  {
+    "name": "resp_entity_resolve",
+    "opcode": "0x01B6",
+    "kind": "response",
+    "payload_len": 106
+  },
+  {
+    "name": "resp_statement_get",
+    "opcode": "0x01C1",
+    "kind": "response",
+    "payload_len": 557
+  },
+  {
+    "name": "resp_statement_list",
+    "opcode": "0x01C6",
+    "kind": "response",
+    "payload_len": 567
+  },
+  {
+    "name": "resp_relation_list",
+    "opcode": "0x01D4",
+    "kind": "response",
+    "payload_len": 470
+  },
+  {
+    "name": "resp_plan",
+    "opcode": "0x00A2",
+    "kind": "response",
+    "payload_len": 152
+  },
+  {
+    "name": "resp_reason",
+    "opcode": "0x00A3",
+    "kind": "response",
+    "payload_len": 182
+  },
+  {
+    "name": "resp_link",
+    "opcode": "0x00A5",
+    "kind": "response",
+    "payload_len": 105
+  },
+  {
+    "name": "resp_txn_begin",
+    "opcode": "0x00C0",
+    "kind": "response",
+    "payload_len": 74
+  },
+  {
+    "name": "resp_txn_commit",
+    "opcode": "0x00C1",
+    "kind": "response",
+    "payload_len": 78
+  },
+  {
+    "name": "resp_txn_abort",
+    "opcode": "0x00C2",
+    "kind": "response",
+    "payload_len": 47
+  },
+  {
+    "name": "resp_get_capabilities",
+    "opcode": "0x00B2",
+    "kind": "response",
+    "payload_len": 116
+  },
+  {
+    "name": "resp_subscribe_event",
+    "opcode": "0x00B0",
+    "kind": "response",
+    "payload_len": 193
+  },
+  {
+    "name": "resp_pong",
+    "opcode": "0x0090",
+    "kind": "response",
+    "payload_len": 77
+  },
+  {
+    "name": "resp_server_ping",
+    "opcode": "0x0091",
+    "kind": "response",
+    "payload_len": 39
   },
   {
     "name": "resp_error_protocol",
@@ -207,7 +303,7 @@
     "name": "frame_encode",
     "opcode": "0x0020",
     "kind": "frame",
-    "payload_len": 183
+    "payload_len": 134
   },
   {
     "name": "frame_encode_vector_direct",
@@ -225,6 +321,6 @@
     "name": "frame_recall_eos",
     "opcode": "0x00A1",
     "kind": "frame",
-    "payload_len": 91
+    "payload_len": 109
   }
 ]

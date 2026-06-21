@@ -166,6 +166,7 @@ mod tests {
             salience: Salience::default(),
             context: ContextId(0),
             created_at_unix_nanos: 1_700_000_000_000,
+            occurred_at_unix_nanos: None,
             arena_slot: 1,
             embedding_model_fp: [0; 16],
             content_hash: None,

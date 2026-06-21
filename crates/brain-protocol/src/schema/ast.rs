@@ -30,6 +30,11 @@ pub enum SchemaItem {
     Predicate(PredicateDef),
     RelationType(RelationTypeDef),
     Extractor(ExtractorDef),
+    /// A user-declared statement kind — the expansion lever. Predicates are
+    /// open-vocab (never declared/gated); the schema instead declares the
+    /// *shape* of facts (cardinality / temporal / polarity) so the
+    /// classifier and the read engine treat them correctly.
+    Kind(KindDef),
 }
 
 // ---------------------------------------------------------------------------
@@ -115,18 +120,89 @@ impl PredicateDef {
     #[must_use]
     pub fn resolved_stateful(&self) -> bool {
         self.stateful.unwrap_or(match self.kind {
-            StatementKindAst::Preference => true,
-            StatementKindAst::Fact | StatementKindAst::Event | StatementKindAst::Any => false,
+            // Single-valued kinds supersede; set/append kinds accumulate.
+            StatementKindAst::Attribute | StatementKindAst::Directive => true,
+            StatementKindAst::Fact
+            | StatementKindAst::Preference
+            | StatementKindAst::Event
+            | StatementKindAst::Relation
+            | StatementKindAst::Any => false,
         })
     }
 }
 
+/// The built-in statement kinds, as named in the DSL. Mirrors
+/// `brain_core::StatementKind` (minus `Custom`, which is named via a
+/// `kind {}` declaration rather than this enum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StatementKindAst {
     Fact,
     Preference,
     Event,
+    Attribute,
+    Relation,
+    Directive,
     Any,
+}
+
+// ---------------------------------------------------------------------------
+// 3b. User-declared kinds (the expansion lever).
+// ---------------------------------------------------------------------------
+
+/// A user-declared statement kind. Carries the behavioral semantics the
+/// storage + read layers need (cardinality / temporal / polarity) plus a
+/// natural-language `hint` the extractor's kind classifier uses to decide
+/// when a fact belongs to this kind.
+///
+/// ```text
+/// kind investment {
+///     cardinality: set
+///     temporal:    event
+///     object:      [entity, quantity]
+///     polarity:    false
+///     hint: "an entity funded/invested in another, with an amount"
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KindDef {
+    /// Local name; the qname is `{schema.namespace}:{name}`.
+    pub name: String,
+    pub cardinality: KindCardinalityAst,
+    pub temporal: TemporalModelAst,
+    /// Object kinds this kind accepts (empty = any).
+    #[serde(default)]
+    pub object: Vec<ObjectKindAst>,
+    #[serde(default)]
+    pub polarity: bool,
+    /// Classifier hint — what facts belong to this kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+/// How many current values a `(subject, predicate)` pair may hold under a
+/// kind. Mirrors `brain_core::KindCardinality`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum KindCardinalityAst {
+    Single,
+    Set,
+}
+
+/// How a kind relates to time. Mirrors `brain_core::TemporalModel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TemporalModelAst {
+    State,
+    Event,
+    None,
+}
+
+/// The object shape a kind accepts. Maps onto `StatementObject`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ObjectKindAst {
+    Entity,
+    Value,
+    Time,
+    Quantity,
+    List,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -550,11 +626,32 @@ mod tests {
             StatementKindAst::Fact,
             StatementKindAst::Preference,
             StatementKindAst::Event,
+            StatementKindAst::Attribute,
+            StatementKindAst::Relation,
+            StatementKindAst::Directive,
             StatementKindAst::Any,
         ] {
             let back: StatementKindAst =
                 serde_json::from_str(&serde_json::to_string(&k).unwrap()).unwrap();
             assert_eq!(k, back);
         }
+    }
+
+    #[test]
+    fn kind_def_round_trip_json() {
+        let k = KindDef {
+            name: "investment".into(),
+            cardinality: KindCardinalityAst::Set,
+            temporal: TemporalModelAst::Event,
+            object: vec![ObjectKindAst::Entity, ObjectKindAst::Quantity],
+            polarity: false,
+            hint: Some("an entity funded another, with an amount".into()),
+        };
+        let back: KindDef = serde_json::from_str(&serde_json::to_string(&k).unwrap()).unwrap();
+        assert_eq!(k, back);
+        let item = SchemaItem::Kind(k);
+        let back: SchemaItem =
+            serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
+        assert_eq!(item, back);
     }
 }

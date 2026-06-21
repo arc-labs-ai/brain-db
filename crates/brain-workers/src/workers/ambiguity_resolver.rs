@@ -59,11 +59,6 @@ use crate::worker::Worker;
 // Knobs.
 // ---------------------------------------------------------------------------
 
-/// Operator override for the sweep interval (seconds). Falls back to
-/// the [`DEFAULT_INTERVAL_SECS`] cadence when unset, empty, or
-/// non-positive.
-pub const SWEEP_INTERVAL_ENV: &str = "BRAIN_AMBIGUITY_RESOLVER_INTERVAL_SECS";
-
 /// 1 hour default tick. Slow on purpose: a proposal's confidence shifts
 /// as the HNSW absorbs new aliases / paraphrases, which happens on the
 /// order of hours, not seconds.
@@ -124,11 +119,6 @@ impl Default for AmbiguityResolverConfig {
     }
 }
 
-fn resolved_interval() -> Duration {
-    crate::env::parse_interval_override(std::env::var(SWEEP_INTERVAL_ENV).ok().as_deref())
-        .unwrap_or_else(|| Duration::from_secs(DEFAULT_INTERVAL_SECS))
-}
-
 // ---------------------------------------------------------------------------
 // Worker.
 // ---------------------------------------------------------------------------
@@ -143,9 +133,11 @@ pub struct AmbiguityResolverWorker {
 }
 
 impl AmbiguityResolverWorker {
-    /// Build a worker with default settings. The metadata + HNSW + embedder
-    /// handles are the same per-shard ones threaded through the
-    /// extractor and statement-embed workers.
+    /// Build a worker with default knobs and the default sweep cadence.
+    /// The metadata + HNSW + embedder handles are the same per-shard
+    /// ones threaded through the extractor and statement-embed workers.
+    /// Override the cadence with [`Self::with_interval_secs`], which the
+    /// shard wires from `[workers.ambiguity_resolver] interval_secs`.
     #[must_use]
     pub fn new(
         metadata: Arc<MetadataDb>,
@@ -153,7 +145,7 @@ impl AmbiguityResolverWorker {
         embedder: Arc<dyn Dispatcher>,
     ) -> Self {
         let mut config = WorkerConfig::defaults_for(WorkerKind::AmbiguityResolver);
-        config.interval = resolved_interval();
+        config.interval = Duration::from_secs(DEFAULT_INTERVAL_SECS);
         Self {
             config,
             knobs: AmbiguityResolverConfig::default(),
@@ -162,6 +154,15 @@ impl AmbiguityResolverWorker {
             embedder,
             metrics: None,
         }
+    }
+
+    /// Override the sweep cadence. The shard supplies
+    /// `[workers.ambiguity_resolver] interval_secs`; a zero value is
+    /// clamped to 1 second so the scheduler never busy-loops.
+    #[must_use]
+    pub fn with_interval_secs(mut self, interval_secs: u64) -> Self {
+        self.config.interval = Duration::from_secs(interval_secs.max(1));
+        self
     }
 
     #[must_use]

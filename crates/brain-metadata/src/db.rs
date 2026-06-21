@@ -546,9 +546,9 @@ mod tests {
 
         let rtxn = db.read_txn().unwrap();
         let all = crate::relation::types::relation_type_list(&rtxn, Some("brain")).unwrap();
-        // The system schema seeds 3 brain relation types
-        // (`related_to`, `reports_to`, `co_authored`). Idempotent
-        // on reopen — count stays at 3, not 6.
-        assert_eq!(all.len(), 3, "re-open must not duplicate built-in seeds");
+        // The system schema seeds 4 brain relation types
+        // (`related_to`, `reports_to`, `co_authored`, `family_of`).
+        // Idempotent on reopen — count stays at 4, not 8.
+        assert_eq!(all.len(), 4, "re-open must not duplicate built-in seeds");
     }
 }

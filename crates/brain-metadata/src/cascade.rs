@@ -198,7 +198,7 @@ pub fn cascade_forget_to_statements(
             prior_overflow_id,
         } in affected
         {
-            let kind = StatementKind::from_u8(row.kind).unwrap_or(StatementKind::Fact);
+            let kind = StatementKind::from_u8(row.kind);
             // A previously-overflowed statement that drops back to ≤
             // INLINE_EVIDENCE_CAP entries collapses onto the inline
             // buffer; the now-orphaned overflow row gets reclaimed.

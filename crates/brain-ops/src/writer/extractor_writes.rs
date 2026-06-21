@@ -31,7 +31,10 @@ use redb::WriteTransaction;
 #[derive(Debug, Clone)]
 pub struct StatementCreatePayload {
     pub kind: StatementKind,
-    pub subject: EntityId,
+    /// The statement's subject — an entity, or the source memory itself
+    /// (temporal Events). Pending subjects are produced only by the
+    /// resolver, not this internal path.
+    pub subject: SubjectRef,
     pub predicate: PredicateId,
     pub object: StatementObject,
     pub confidence: f32,
@@ -49,6 +52,12 @@ pub struct StatementCreatePayload {
     /// Per-statement statefulness flag (copied from the predicate
     /// registry for schema-declared rows by the caller).
     pub is_stateful: bool,
+    /// Event time, in unix-nanos, for `kind == Event` statements. An Event
+    /// is rejected at create without one (`validate_statement_shape`); every
+    /// other kind must leave this `None`. Carries the resolved occurrence
+    /// time for temporal (memory-subject) events so they persist instead of
+    /// being dropped.
+    pub event_at_unix_nanos: Option<u64>,
 }
 
 /// Same shape for relations.
@@ -78,11 +87,10 @@ pub fn statement_create_internal(
         payload.extracted_at_unix_nanos,
         payload.extractor_id,
     )?;
-    let subject = SubjectRef::Entity(payload.subject);
     let mut s = Statement::new_root(
         id,
         payload.kind,
-        subject,
+        payload.subject,
         payload.predicate,
         payload.object.clone(),
         payload.confidence,
@@ -93,6 +101,12 @@ pub fn statement_create_internal(
     );
     s.valid_from_unix_nanos = Some(payload.extracted_at_unix_nanos);
     s.is_stateful = payload.is_stateful;
+    // Event time is only valid on Event-kind rows; the shape validator
+    // rejects it on any other kind. Set it strictly for Events so temporal
+    // events persist (they were dropped when this was never plumbed).
+    if payload.kind == StatementKind::Event {
+        s.event_at_unix_nanos = payload.event_at_unix_nanos;
+    }
     statement_create(wtxn, &s, payload.extracted_at_unix_nanos)
 }
 
@@ -163,7 +177,7 @@ mod tests {
             let pid = predicate_intern_or_get(&wtxn, "brain", "current_role", 0, NOW).unwrap();
             let payload = StatementCreatePayload {
                 kind: StatementKind::Fact,
-                subject,
+                subject: SubjectRef::Entity(subject),
                 predicate: pid,
                 object: StatementObject::Value(brain_core::StatementValue::Text(
                     "Senior Engineer".into(),
@@ -174,6 +188,7 @@ mod tests {
                 schema_version: 0,
                 extracted_at_unix_nanos: NOW,
                 is_stateful: false,
+                event_at_unix_nanos: None,
             };
             let sid = statement_create_internal(&wtxn, &payload).unwrap();
             wtxn.commit().unwrap();

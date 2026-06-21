@@ -425,10 +425,7 @@ pub async fn handle_entity_tombstone(
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        if entity_get(&rtxn, id)
-            .map_err(OpError::from)?
-            .is_none()
-        {
+        if entity_get(&rtxn, id).map_err(OpError::from)?.is_none() {
             return Err(OpError::NotFound {
                 what: "entity",
                 detail: format!("{id:?}"),
@@ -683,13 +680,47 @@ pub async fn handle_entity_resolve(
             "candidate_name exceeds 256 bytes".into(),
         ));
     }
-    // Require a type hint. Without one we'd need to scan
-    // every type's index — usable but slow; deferred alongside
-    // tier-3 embedding lookup.
+    // No type hint → cross-type exact resolve across every declared
+    // entity type. This is the grounded-read default: a caller asking
+    // about "Alice" shouldn't have to know her entity type. One exact
+    // canonical-name hit → resolved; several distinct hits → ambiguous;
+    // none → not found. Typed fuzzy tiers (trigram/alias) need a specific
+    // type, so the no-hint path stays exact-only — precise and fast.
     if req.entity_type_hint == 0 {
-        return Err(OpError::InvalidRequest(
-            "entity_type_hint is required in phase 16.7.7 ENTITY_RESOLVE".into(),
-        ));
+        let rtxn = ctx
+            .executor
+            .metadata
+            .read_txn()
+            .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
+        let ids = brain_metadata::entity_resolve_canonical_all_types(&rtxn, &req.candidate_name)
+            .map_err(OpError::from)?;
+        drop(rtxn);
+        return Ok(match ids.as_slice() {
+            [id] => EntityResolveResponse {
+                outcome: ResolutionOutcomeWire::Resolved,
+                tier: 1,
+                confidence: 1.0,
+                resolved_entity: id.to_bytes(),
+                candidate_ids: Vec::new(),
+                audit_id: [0; 16],
+            },
+            [] => EntityResolveResponse {
+                outcome: ResolutionOutcomeWire::NotFound,
+                tier: 0,
+                confidence: 0.0,
+                resolved_entity: [0; 16],
+                candidate_ids: Vec::new(),
+                audit_id: [0; 16],
+            },
+            many => EntityResolveResponse {
+                outcome: ResolutionOutcomeWire::Ambiguous,
+                tier: 1,
+                confidence: 1.0,
+                resolved_entity: [0; 16],
+                candidate_ids: many.iter().map(|id| id.to_bytes()).collect(),
+                audit_id: [0; 16],
+            },
+        });
     }
     let type_id = EntityTypeId(req.entity_type_hint);
     let candidate_norm = brain_metadata::entity::ops::normalize_name(&req.candidate_name);

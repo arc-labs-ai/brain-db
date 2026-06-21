@@ -22,7 +22,7 @@ use crate::context::OpsContext;
 use crate::error::OpError;
 use crate::handlers::entity::emit_graph_event;
 use crate::handlers::link::downcast_writer_pub;
-use crate::index::text_indexer::{statement::upsert_op_from_statement, StatementTextOp};
+use crate::index::text_indexer::StatementTextOp;
 use crate::write::{
     EvidenceRefPhase, Phase, PhaseAck, SupersedeReplacement, SupersedeReplacementId,
     SupersedeTarget, TombstoneTarget, Write, WriteId,
@@ -30,8 +30,7 @@ use crate::write::{
 use brain_core::{EntityId, PredicateId, RequestId, StatementId, StatementKind};
 use brain_core::{EvidenceEntry, Statement, TombstoneReason};
 use brain_metadata::schema::predicate::{
-    predicate_get, predicate_intern_or_get, predicate_lookup_by_qname,
-    predicates_active_for_schema,
+    predicate_get, predicate_intern_or_get, predicate_lookup_by_qname, predicates_active_for_schema,
 };
 use brain_metadata::schema::store::schema_active;
 use brain_metadata::statement::{
@@ -194,7 +193,7 @@ pub async fn handle_statement_create(
         EventType::StatementCreated,
         GraphEventPayload::StatementCreated(StatementCreatedEvent {
             statement_id: created_id.to_bytes(),
-            kind: req.kind as u8,
+            kind: req.kind.as_storage_byte(),
             subject: req.subject,
             predicate: req.predicate.clone(),
             confidence: req.confidence,
@@ -352,8 +351,8 @@ pub async fn handle_statement_supersede(
                 .metadata
                 .write_txn()
                 .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
-            let pid = predicate_intern_or_get(&wtxn, namespace, name, 0, now)
-                .map_err(OpError::from)?;
+            let pid =
+                predicate_intern_or_get(&wtxn, namespace, name, 0, now).map_err(OpError::from)?;
             wtxn.commit()
                 .map_err(|e| OpError::Internal(format!("commit: {e}")))?;
             pid
@@ -631,16 +630,11 @@ pub async fn handle_statement_list(
             "STATEMENT_LIST cursor pagination lands in phase 23".into(),
         ));
     }
+    // Wire filter byte: `0` = no filter; any non-zero byte is the
+    // `brain_core` kind byte + 1 (so `1=Fact … 6=Directive`, `7+ = Custom`).
     let kind = match req.kind {
         0 => None,
-        1 => Some(StatementKind::Fact),
-        2 => Some(StatementKind::Preference),
-        3 => Some(StatementKind::Event),
-        other => {
-            return Err(OpError::InvalidRequest(format!(
-                "unknown kind byte {other}; expected 0..=3"
-            )))
-        }
+        b => Some(StatementKind::from_u8(b - 1)),
     };
     let subject = if req.subject == [0u8; 16] {
         None
@@ -942,7 +936,7 @@ fn build_upsert_statement_phase(
 fn hash_statement_create_request(req: &StatementCreateRequest) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(b"statement_create:");
-    h.update(&[req.kind as u8]);
+    h.update(&[req.kind.as_storage_byte()]);
     h.update(b"\0");
     h.update(&req.subject);
     h.update(b"\0");
@@ -1099,48 +1093,10 @@ async fn dispatch_upsert_for(
     id: StatementId,
     dispatcher: &crate::index::text_indexer::StatementTextDispatcher,
 ) {
-    let upsert_op = {
-        let rtxn = match ctx.executor.metadata.read_txn() {
-            Ok(r) => r,
-            Err(err) => {
-                tracing::warn!(
-                    target: "brain_ops::text_indexer",
-                    error = %err,
-                    "statement text indexer dispatch: read_txn failed",
-                );
-                return;
-            }
-        };
-        let statement = match statement_get(&rtxn, id) {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                tracing::warn!(
-                    target: "brain_ops::text_indexer",
-                    ?id,
-                    "statement vanished between commit and indexer dispatch",
-                );
-                return;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    target: "brain_ops::text_indexer",
-                    error = %err,
-                    "statement_get during text-indexer dispatch failed",
-                );
-                return;
-            }
-        };
-        drop(rtxn);
-        upsert_op_from_statement(&statement, ctx.executor.metadata.as_ref())
-    };
-
-    if let Some(op) = upsert_op {
-        dispatcher.dispatch(op).await;
-    } else {
-        tracing::debug!(
-            target: "brain_ops::text_indexer",
-            ?id,
-            "statement text indexer skip — Pending subject or missing metadata",
-        );
-    }
+    crate::index::text_indexer::statement::dispatch_statement_text_upsert(
+        ctx.executor.metadata.as_ref(),
+        dispatcher,
+        id,
+    )
+    .await;
 }

@@ -18,7 +18,7 @@ use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
 use brain_protocol::envelope::request::{
-    EncodeRequest, MemoryKindWire, RecallRequest, TxnBeginRequest,
+    EncodeRequest, RecallRequest, TxnBeginRequest,
 };
 use brain_protocol::envelope::response::{RecallResponseFrame, ResponseBody};
 use brain_protocol::Frame;
@@ -156,10 +156,12 @@ async fn round_trip(
 fn recall_request(cue: &str, txn_id: Option<[u8; 16]>) -> RecallRequest {
     RecallRequest {
         cue_text: cue.into(),
-        top_k: 5,
+        subject_name: String::new(),
+        max_results: 5,
         confidence_threshold: 0.0,
         context_filter: None,
         age_bound_unix_nanos: None,
+        as_of_record_time_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
         include_edges: false,
@@ -176,12 +178,9 @@ async fn encode_text(client: &mut TcpStream, stream_id: u32, text: &str) {
     let req = EncodeRequest {
         text: text.into(),
         context_id: 0,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: Vec::new(),
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
     };
     let (opcode, body) = round_trip(client, stream_id, RequestBody::Encode(req)).await;
     if opcode != Opcode::EncodeResp.as_u16() {
@@ -204,13 +203,13 @@ async fn seed_fixture(client: &mut TcpStream) {
 
 fn is_retrieval_response(frame: &RecallResponseFrame) -> bool {
     frame
-        .results
+        .memories
         .iter()
         .any(|r| !r.contributing_retrievers.is_empty() || r.fused_score != 0.0)
 }
 
 fn assert_substrate(frame: &RecallResponseFrame) {
-    for r in &frame.results {
+    for r in &frame.memories {
         assert!(
             r.contributing_retrievers.is_empty(),
             "substrate path must not populate contributing_retrievers",

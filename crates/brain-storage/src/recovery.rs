@@ -546,6 +546,7 @@ mod tests {
             request_hash: [0; 32],
             response_payload: vec![],
             deduplicate: false,
+            occurred_at_unix_nanos: None,
         };
         WalRecord::from_typed(
             Lsn(0),
@@ -740,7 +741,10 @@ mod tests {
 
         let s = arena.slot(0);
         assert!(s.is_tombstoned());
-        assert!(!s.is_hard_forgotten(), "soft forget must not set HARD_FORGOTTEN");
+        assert!(
+            !s.is_hard_forgotten(),
+            "soft forget must not set HARD_FORGOTTEN"
+        );
         assert!(
             s.vector.iter().any(|&x| x != 0.0),
             "soft forget keeps the vector (recoverable during grace)"

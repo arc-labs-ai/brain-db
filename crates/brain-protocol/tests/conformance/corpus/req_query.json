@@ -25,6 +25,7 @@
     "org:works_on"
   ],
   "time_filter": null,
+  "as_of_record_time_unix_nanos": 1710000000000000000,
   "confidence_min": 0.25,
   "include_tombstoned": false,
   "include_superseded": false,

@@ -77,6 +77,43 @@ pub struct StatementMention {
     /// `PredicateDefinition.is_stateful` wins.
     #[serde(default)]
     pub is_stateful: bool,
+    /// When true, the statement's subject is the *source memory itself*
+    /// (`SubjectRef::Memory`), not an entity — `subject_text` is ignored.
+    /// Set by the temporal-expressions extractor for memory-anchored
+    /// Events ("this memory's content occurred at T"). Default false
+    /// keeps every existing extractor's entity-subject behaviour.
+    #[serde(default)]
+    pub subject_is_memory: bool,
+    /// When true, `object_text` names an entity (e.g. "Acme Corp", "Paris")
+    /// and the apply pass resolves/mints it as an entity-object node; when
+    /// false it's a literal value kept as text ("blue", "200"). The LLM tier
+    /// sets this; a declared predicate's `object_type_constraint` overrides it,
+    /// and an object already surfaced as an entity this cycle links regardless.
+    /// Default false preserves the prior value-by-default behaviour.
+    #[serde(default)]
+    pub object_is_entity: bool,
+    /// Resolved occurrence time (unix-nanos) for an Event-kind statement. The
+    /// LLM tier emits an ISO date the projection parses into this; the
+    /// temporal-expressions extractor sets it directly. An entity-subject Event
+    /// with a time persists as an Event; without one it downgrades to Fact (no
+    /// precise time to anchor). `None` for non-Event statements.
+    #[serde(default)]
+    pub event_at_unix_nanos: Option<u64>,
+    /// When true, the subject is the *writing agent itself* — a first-person
+    /// statement ("I prefer dark roast", "yo soy vegetariano", "私は…"). The LLM
+    /// tier sets this from meaning, NOT a pronoun list, so it is language-neutral.
+    /// The apply pass routes such statements to the agent's self-entity
+    /// (`EntityId::from(agent_id)`) instead of dropping the first-person surface
+    /// as non-referential. Default false preserves entity-subject behaviour.
+    #[serde(default)]
+    pub subject_is_self: bool,
+    /// When true, the source text RETRACTS this prior fact ("not at Google
+    /// anymore", "no longer drinks coffee"): the apply pass tombstones the
+    /// matching current statement(s) for (subject, predicate, object) instead
+    /// of creating a new row. The LLM sets this from meaning, not a keyword
+    /// list. Default false = a normal positive assertion.
+    #[serde(default)]
+    pub retract: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -124,12 +161,17 @@ mod tests {
         let m = StatementMention {
             kind: 2, // Preference
             subject_text: Some("Alice".into()),
+            subject_is_memory: false,
             predicate_qname: "brain:prefers".into(),
             object_text: Some("async meetings".into()),
             confidence: 0.85,
             extractor_id: 2,
             extractor_version: 1,
             is_stateful: true,
+            object_is_entity: false,
+            event_at_unix_nanos: None,
+            subject_is_self: false,
+            retract: false,
         };
         let s = serde_json::to_string(&ExtractedItem::StatementMention(m.clone())).unwrap();
         assert!(s.contains("\"subject_text\":\"Alice\""));

@@ -31,6 +31,19 @@ static EXACT_ID_RE: LazyLock<Regex> =
 static TITLE_CASE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b").expect("invariant: literal")
 });
+// Enumerative / aggregation cues — the router's *internal* signal that
+// the caller is asking for a set ("list all X", "how many Y", "what are
+// the Z") rather than one fact. Never exposed on the wire; the client
+// just calls recall and the router decides. Precision-biased: a false
+// positive widens the pool and runs the merge/diversity stage over a
+// single-answer question, and an earlier over-eager detector regressed
+// such queries. Bare "what"/"who"/"how" are excluded.
+static LIST_INTENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(list|every|enumerate|how many|how much|all of|name (all|every|the)|which of|what are|what were|what kinds? of|what types? of)\b",
+    )
+    .expect("invariant: literal")
+});
 static TEMPORAL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"\b(yesterday|today|tomorrow|last\s+(week|month|year|\d+\s+days?|\d+\s+weeks?|\d+\s+months?)|next\s+(week|month|year)|\d{4}-\d{2}-\d{2})\b",
@@ -143,6 +156,12 @@ pub enum QueryClass {
     /// signal. Semantic embedding does the heavy lifting; pool
     /// widens so RRF has overlap to fuse.
     Paraphrase,
+    /// Free-text query with enumerative intent ("list all X", "how many
+    /// Y"). Semantic-led like Paraphrase but with a much wider
+    /// per-retriever pool: set members ranked deep still need to reach
+    /// fusion before the merge/diversity stage spreads them. A purely
+    /// internal classification — the client never asks for it.
+    ListAggregation,
     /// Everything else — used when no other class fits and as the
     /// fallback for empty / filter-only queries.
     Default,
@@ -200,6 +219,21 @@ impl RetrievalProfile {
                 per_retriever_top_n: 200,
                 final_top_k: requested_top_k,
             },
+            // Semantic-led like Paraphrase, but a much wider per-retriever
+            // pool so deeply-ranked set members enter fusion. Diversity
+            // can't surface a member that never made the pool — the
+            // coverage gap that made an earlier diversity-only attempt
+            // ineffective. `final_top_k` still rides the caller's request.
+            QueryClass::ListAggregation => Self {
+                weights: PerRetrieverWeights {
+                    semantic: 1.5,
+                    lexical: 1.0,
+                    graph: 0.5,
+                    temporal: 0.5,
+                },
+                per_retriever_top_n: 400,
+                final_top_k: requested_top_k,
+            },
             QueryClass::Default => Self {
                 weights: PerRetrieverWeights::default(),
                 per_retriever_top_n: 100,
@@ -217,11 +251,19 @@ impl RetrievalProfile {
 #[must_use]
 pub fn classify_query(features: &ClassificationFeatures) -> QueryClass {
     if features.has_entity_anchor || features.contains_entity_mention_heuristic {
+        // Entity-anchored queries keep their graph-led profile even when
+        // they also read as a list ("what movies did X make"); the
+        // coverage + merge ride the orthogonal `list_intent` flag, not
+        // the class.
         QueryClass::EntityAnchored
     } else if features.contains_exact_id || features.is_all_caps_tokens {
         QueryClass::ExactTerm
     } else if features.has_text {
-        QueryClass::Paraphrase
+        if features.is_list_intent {
+            QueryClass::ListAggregation
+        } else {
+            QueryClass::Paraphrase
+        }
     } else {
         QueryClass::Default
     }
@@ -255,6 +297,12 @@ pub struct RoutingDecision {
     /// Coarse classification used downstream to pick adaptive
     /// top-K and per-retriever weights via [`RetrievalProfile`].
     pub query_class: QueryClass,
+    /// Detected list/aggregation intent ("list all X", "how many Y").
+    /// Orthogonal to `query_class` so it also fires on entity-anchored
+    /// list queries. Purely server-internal — the executor reads it to
+    /// run the coverage + merge/diversity stage. The client never sees
+    /// or sets it.
+    pub list_intent: bool,
 }
 
 /// Where the graph retriever gets its starting nodes. The
@@ -272,6 +320,37 @@ pub enum GraphAnchorMode {
     /// graph contributing on schemaless deployments where no
     /// `EntityId` is ever known.
     MemoryFromSemantic,
+    /// The router left a blind [`MemoryFromSemantic`] lane, but the
+    /// executor resolved the query's named subject to this entity
+    /// against the canonical-name index. It walks one hop from the
+    /// entity over `Mentions` edges so the memories that name the
+    /// subject enter fusion directly — a sharper anchor than the
+    /// semantic top-K guess. Never produced by the router (it has no
+    /// DB access); injected by the executor post-plan.
+    MemoryFromEntityCue(EntityId),
+}
+
+/// Extract candidate entity-name cues from query text: maximal
+/// Title-Case spans (`"Sarah"`, `"Phoenix Project"`), plus the
+/// individual words of any multi-word span. The split matters because
+/// the regex greedily merges consecutive capitals — a name after a
+/// sentence-initial capital ("Did Sarah") would otherwise hide inside a
+/// span that resolves to nothing; emitting "Sarah" on its own recovers
+/// it. The executor resolves these against the canonical-name index, so
+/// a cue that names no entity simply resolves to nothing and is ignored;
+/// resolution there is the real precision gate.
+#[must_use]
+pub fn entity_cue_candidates(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for m in TITLE_CASE_RE.find_iter(text) {
+        let span = m.as_str();
+        out.push(span.to_string());
+        let words: Vec<&str> = span.split_whitespace().collect();
+        if words.len() > 1 {
+            out.extend(words.into_iter().map(str::to_string));
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -302,6 +381,9 @@ pub struct ClassificationFeatures {
     pub is_question: bool,
     pub contains_entity_mention_heuristic: bool,
     pub contains_temporal_expression: bool,
+    /// Cue text carries enumerative / aggregation intent (matches
+    /// [`LIST_INTENT_RE`]). Server-internal signal only.
+    pub is_list_intent: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +442,7 @@ pub fn route(req: &QueryRequest) -> RoutingDecision {
         let temporal_pushdown = features.has_time_filter || features.contains_temporal_expression;
         let graph_anchor_mode = pick_graph_anchor_mode(&retrievers, &features);
         let query_class = classify_query(&features);
+        let list_intent = features.is_list_intent;
         return RoutingDecision {
             features,
             retrievers,
@@ -367,14 +450,21 @@ pub fn route(req: &QueryRequest) -> RoutingDecision {
             temporal_pushdown,
             graph_anchor_mode,
             query_class,
+            list_intent,
         };
     }
 
     // Auto routing — union of matching rules with max-weight.
     let mut weights: HashMap<Retriever, f32> = HashMap::new();
 
-    // Rule 1: entity-anchored.
-    if features.has_entity_anchor || features.contains_entity_mention_heuristic {
+    // Rule 1: entity-anchored. The graph lane walks the entity graph from a
+    // resolved entity id, so it only fires on a real anchor. A bare
+    // Title-Case mention is not one — honouring it alone routed nearly every
+    // capitalized question (incl. sentence-initial "When"/"What") into the
+    // graph-dominant profile, and the unanchored memory-edge walk then buried
+    // direct semantic/lexical hits. Resolving cue mentions to anchors and a
+    // capped graph tie-breaker are deferred follow-ups.
+    if features.has_entity_anchor {
         upsert_max(&mut weights, Retriever::Graph, 2.0);
         upsert_max(&mut weights, Retriever::Semantic, 1.0);
         if features.has_text {
@@ -388,19 +478,13 @@ pub fn route(req: &QueryRequest) -> RoutingDecision {
         upsert_max(&mut weights, Retriever::Semantic, 0.5);
     }
 
-    // Rule 5: default — fires only if no other rule matched
-    // AND the query has text.
-    //
-    // Schemaless deployments live here: no entity anchor, no
-    // exact-id signature. Retrieval is still the default — semantic
-    // + lexical fuse, and graph rides along anchored at the
-    // semantic top-K so substrate `SimilarTo` / `Caused` edges
-    // contribute. The executor materialises the anchor set after
-    // semantic runs.
+    // Rule 5: default free-text — semantic + lexical only. No graph rider:
+    // the unanchored memory-edge walk it used to pull in returned
+    // low-precision neighbour memories that outranked direct semantic/lexical
+    // hits. Similar-memory recall is the semantic retriever's job.
     if weights.is_empty() && features.has_text {
         upsert_max(&mut weights, Retriever::Semantic, 1.0);
         upsert_max(&mut weights, Retriever::Lexical, 1.0);
-        upsert_max(&mut weights, Retriever::Graph, 0.5);
     }
 
     // Rules 3 + 4 add no retrievers — they signal the filter chain.
@@ -423,6 +507,7 @@ pub fn route(req: &QueryRequest) -> RoutingDecision {
 
     let graph_anchor_mode = pick_graph_anchor_mode(&retrievers, &features);
     let query_class = classify_query(&features);
+    let list_intent = features.is_list_intent;
     RoutingDecision {
         features,
         retrievers,
@@ -430,6 +515,7 @@ pub fn route(req: &QueryRequest) -> RoutingDecision {
         temporal_pushdown,
         graph_anchor_mode,
         query_class,
+        list_intent,
     }
 }
 
@@ -496,6 +582,8 @@ fn classify(req: &QueryRequest) -> ClassificationFeatures {
         f.contains_entity_mention_heuristic = TITLE_CASE_RE.is_match(trimmed);
 
         f.contains_temporal_expression = TEMPORAL_RE.is_match(&lower);
+
+        f.is_list_intent = LIST_INTENT_RE.is_match(&lower);
     }
 
     f

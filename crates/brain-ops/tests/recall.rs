@@ -20,7 +20,7 @@ use brain_index::{
 };
 use brain_metadata::MetadataDb;
 use brain_ops::test_support::{run_in_glommio, single_body};
-use brain_ops::{dispatch, DispatchOutcome, ErrorCode, OpError, OpsContext, RealWriterHandle};
+use brain_ops::{dispatch, DispatchOutcome, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
     EncodeRequest, MemoryKindWire, RecallRequest, RequestBody,
@@ -81,26 +81,28 @@ fn build_fixture_with_embedder(embedder: Arc<dyn Dispatcher>) -> Fixture {
     }
 }
 
-fn encode_req(request_id: [u8; 16], text: &str, kind: MemoryKindWire) -> EncodeRequest {
+// `_kind` is accepted for call-site compatibility but ignored: the
+// write router decides the memory kind now (always Episodic), so the
+// client can no longer steer it.
+fn encode_req(request_id: [u8; 16], text: &str, _kind: MemoryKindWire) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
         context_id: 42,
-        kind,
-        salience_hint: 0.5,
-        edges: vec![],
         request_id,
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
     }
 }
 
-fn recall_req(cue: &str, top_k: u32) -> RecallRequest {
+fn recall_req(cue: &str, max_results: u32) -> RecallRequest {
     RecallRequest {
         cue_text: cue.into(),
-        top_k,
+        subject_name: String::new(),
+        max_results,
         confidence_threshold: 0.0,
         context_filter: None,
         age_bound_unix_nanos: None,
+        as_of_record_time_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
         include_edges: false,
@@ -157,15 +159,15 @@ fn recall_full_pipeline_returns_top_k() {
             .unwrap(),
         );
         assert!(frame.is_final);
-        assert_eq!(frame.results.len(), 2, "k=2 → exactly 2 results");
+        assert_eq!(frame.memories.len(), 2, "k=2 → exactly 2 results");
         assert_eq!(frame.cumulative_count, 2);
         // Sorted by score descending.
         assert!(
-            frame.results[0].similarity_score >= frame.results[1].similarity_score,
+            frame.memories[0].similarity_score >= frame.memories[1].similarity_score,
             "results must be sorted by score desc"
         );
         // Fields plumbed through.
-        let top = &frame.results[0];
+        let top = &frame.memories[0];
         assert_ne!(top.memory_id, 0);
         assert_eq!(top.context_id, 42);
         assert_eq!(top.kind, MemoryKindWire::Episodic);
@@ -190,6 +192,184 @@ fn recall_full_pipeline_returns_top_k() {
             "v1: last_accessed mirrors created_at"
         );
         assert!(top.edges.is_none());
+        // A plain ENCODE supplies no event time, so the echoed field is
+        // absent — distinct from `created_at`, which is always stamped.
+        assert_eq!(top.occurred_at_unix_nanos, None);
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 1b. Client-supplied event time round-trips through to RECALL.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recall_echoes_client_supplied_occurred_at() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+
+        // A real-world event time well in the past — distinct from the
+        // server's write time so we can prove the two don't get conflated.
+        let event_time: u64 = 1_577_836_800_000_000_000; // 2020-01-01T00:00:00Z
+
+        let req = EncodeRequest {
+            text: "moved to berlin".into(),
+            context_id: 42,
+            request_id: [9; 16],
+            txn_id: None,
+            occurred_at_unix_nanos: Some(event_time),
+        };
+        dispatch(
+            RequestBody::Encode(req),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
+
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(recall_req("moved to berlin", 1)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(frame.memories.len(), 1);
+        let hit = &frame.memories[0];
+        assert_eq!(
+            hit.occurred_at_unix_nanos,
+            Some(event_time),
+            "client event time must survive the write→read round trip"
+        );
+        assert_ne!(
+            hit.created_at_unix_nanos, event_time,
+            "occurred_at is the client's timeline, not the server write time"
+        );
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 1c. Recency ranking: with a temporal signal (`as_of`), the more-recent
+//     memory wins a relevance tie.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recency_breaks_relevance_ties_toward_recent_event_time() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+
+        // Reference point for the recency decay. `as_of` on the request
+        // both supplies the temporal signal that gates the boost and sets
+        // this reference.
+        let reference: u64 = 1_900_000_000 * 1_000_000_000;
+        let day = 86_400 * 1_000_000_000_u64;
+
+        // Identical text ⇒ identical mock vectors ⇒ identical cosine, so
+        // the two hits tie on pure relevance and only event-time recency
+        // separates them.
+        let text = "team offsite in lisbon";
+        let recent = EncodeRequest {
+            text: text.into(),
+            context_id: 42,
+            request_id: [21; 16],
+            txn_id: None,
+            occurred_at_unix_nanos: Some(reference - day), // yesterday
+        };
+        let old = EncodeRequest {
+            occurred_at_unix_nanos: Some(reference - 400 * day), // >1 year ago
+            request_id: [22; 16],
+            ..recent.clone()
+        };
+        let recent_id = match single_body(
+            dispatch(
+                RequestBody::Encode(recent),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        ) {
+            ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
+            other => panic!("expected Encode, got {other:?}"),
+        };
+        dispatch(
+            RequestBody::Encode(old),
+            brain_ops::RequestCaller::anonymous(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
+
+        let mut recall = recall_req(text, 2);
+        recall.as_of_record_time_unix_nanos = Some(reference);
+
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(recall),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(frame.memories.len(), 2);
+        assert_eq!(
+            frame.memories[0].memory_id, recent_id,
+            "on a relevance tie, the more recent event time ranks first when a temporal signal is present",
+        );
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 1d. List-intent recall drives the merge/diversity path end-to-end.
+//     The cue carries enumerative intent ("list all ..."), so the router
+//     flags list_intent and the executor runs the MMR stage over real
+//     redb text. This is a smoke test that the path (text fetch →
+//     tokenize → MMR reorder) executes on live data without panicking
+//     and still returns the requested results.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn list_intent_recall_runs_merge_path_and_returns_results() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        encode(
+            &fix,
+            [1; 16],
+            "she enjoys hiking in the mountains",
+            MemoryKindWire::Episodic,
+        )
+        .await;
+        encode(
+            &fix,
+            [2; 16],
+            "she enjoys hiking up steep trails",
+            MemoryKindWire::Episodic,
+        )
+        .await;
+        encode(
+            &fix,
+            [3; 16],
+            "she enjoys painting watercolors",
+            MemoryKindWire::Episodic,
+        )
+        .await;
+
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(recall_req("list all the things she enjoys", 3)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            !frame.memories.is_empty(),
+            "list-intent recall must still return results after the merge stage",
+        );
+        assert!(frame.memories.len() <= 3, "top_k still bounds the count");
     })
 }
 
@@ -210,7 +390,7 @@ fn recall_empty_index_returns_empty_frame() {
             .await
             .unwrap(),
         );
-        assert!(frame.results.is_empty());
+        assert!(frame.memories.is_empty());
         assert!(frame.is_final);
         assert_eq!(frame.cumulative_count, 0);
         assert!(frame.estimated_remaining.is_none());
@@ -240,44 +420,20 @@ fn recall_k_truncation() {
             .await
             .unwrap(),
         );
-        assert_eq!(frame.results.len(), 3, "k=3 → exactly 3 results");
+        assert_eq!(frame.memories.len(), 3, "k=3 → exactly 3 results");
     })
 }
 
 // ---------------------------------------------------------------------------
 // 4. Kind filter.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn recall_kind_filter_rejects_off_kind_hits() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        encode(&fix, [20; 16], "ep-a", MemoryKindWire::Episodic).await;
-        encode(&fix, [21; 16], "ep-b", MemoryKindWire::Episodic).await;
-        encode(&fix, [22; 16], "sem-a", MemoryKindWire::Semantic).await;
-        encode(&fix, [23; 16], "sem-b", MemoryKindWire::Semantic).await;
-
-        let mut req = recall_req("ep-a", 10);
-        req.kind_filter = Some(vec![MemoryKindWire::Semantic]);
-        let frame = unwrap_recall_resp(
-            dispatch(
-                RequestBody::Recall(req),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-
-        assert!(
-            !frame.results.is_empty(),
-            "the semantic memories must be in candidates"
-        );
-        for r in &frame.results {
-            assert_eq!(r.kind, MemoryKindWire::Semantic);
-        }
-    })
-}
+//
+// The client can no longer choose a memory's kind via ENCODE — the
+// write router files every text encode as Episodic. The old
+// "recall kind filter rejects off-kind hits" test relied on encoding
+// Semantic memories from the client, which is no longer possible, so it
+// has been removed. The kind-filter retrieval mechanism itself is still
+// exercised by the planner/retriever unit tests.
 
 // ---------------------------------------------------------------------------
 // 5. Confidence floor.
@@ -308,7 +464,7 @@ fn recall_confidence_floor_drops_low_score_hits() {
             .await
             .unwrap(),
         );
-        for r in &frame.results {
+        for r in &frame.memories {
             assert!(
                 r.similarity_score >= 0.999,
                 "every result must clear the floor; got {}",
@@ -319,29 +475,33 @@ fn recall_confidence_floor_drops_low_score_hits() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Invalid top_k → planner rejects.
+// 6. max_results=0 → server default (the cap is a safety bound, not a
+//    "give me zero" request).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn recall_invalid_top_k_returns_plan_error() {
-    // top_k=0 has no meaningful "give me zero results" interpretation;
-    // it's an obvious client bug. The handler rejects it up front rather
-    // than letting the retrieval planner silently clamp it to a default.
+fn recall_zero_max_results_defaults_not_rejected() {
+    // `max_results` is a safety cap on the returned set, not a ranking
+    // knob: `0` means "server default", never "give me zero results".
+    // The handler normalises it and proceeds instead of erroring.
     run_in_glommio(|| async {
         let fix = build_fixture();
-        let req = recall_req("anything", 0);
-        let err = dispatch(
-            RequestBody::Recall(req),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(err, OpError::InvalidRequest(_)),
-            "top_k=0 must be rejected as invalid input, got {err:?}"
+        encode(&fix, [60; 16], "zero-cap-alpha", MemoryKindWire::Episodic).await;
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(recall_req("zero-cap-alpha", 0)),
+                brain_ops::RequestCaller::anonymous(),
+                &fix.ctx,
+            )
+            .await
+            .expect("max_results=0 must default, not error"),
         );
-        assert_eq!(err.error_code(), ErrorCode::InvalidRequest);
+        // The encoded memory is returned — the cap defaulted to a
+        // generous bound rather than zero.
+        assert!(
+            !frame.memories.is_empty(),
+            "max_results=0 should default and still return hits"
+        );
     })
 }
 
@@ -350,7 +510,12 @@ fn recall_invalid_top_k_returns_plan_error() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn recall_include_text_false_returns_empty_text_field() {
+fn recall_returns_text_even_when_include_text_false() {
+    // `include_text` is intentionally forced on in the read path: a recalled
+    // memory without its text is useless to the caller, so `handle_recall`
+    // returns the remembered text regardless of the (legacy) wire flag. This
+    // guards that deliberate behavior — `recall_req` defaults the flag to false,
+    // yet every recalled memory must still carry its text.
     run_in_glommio(|| async {
         let fix = build_fixture();
         encode(&fix, [40; 16], "alpha-text-rev0", MemoryKindWire::Episodic).await;
@@ -365,12 +530,16 @@ fn recall_include_text_false_returns_empty_text_field() {
             .await
             .unwrap(),
         );
-        assert_eq!(frame.results.len(), 2);
-        for r in &frame.results {
+        assert_eq!(frame.memories.len(), 2);
+        assert!(
+            frame.memories.iter().any(|r| r.text == "alpha-text-rev0"),
+            "recall must return the remembered text even with include_text=false, got {:?}",
+            frame.memories.iter().map(|r| &r.text).collect::<Vec<_>>()
+        );
+        for r in &frame.memories {
             assert!(
-                r.text.is_empty(),
-                "include_text default=false must return empty text, got {:?}",
-                r.text
+                !r.text.is_empty(),
+                "every recalled memory must carry its text"
             );
         }
     })
@@ -408,8 +577,8 @@ fn recall_include_text_true_returns_stored_text() {
             .unwrap(),
         );
 
-        assert_eq!(frame.results.len(), 3);
-        for r in &frame.results {
+        assert_eq!(frame.memories.len(), 3);
+        for r in &frame.memories {
             let want = by_id.get(&r.memory_id).copied().expect("known id");
             assert_eq!(
                 r.text, want,
@@ -461,9 +630,9 @@ fn recall_with_real_embedder_end_to_end() {
             .await
             .unwrap(),
         );
-        assert_eq!(frame.results.len(), 2);
+        assert_eq!(frame.memories.len(), 2);
         assert_eq!(
-            frame.results[0].memory_id, cats_id,
+            frame.memories[0].memory_id, cats_id,
             "the cat memory must rank higher than the physics memory"
         );
     })
@@ -581,14 +750,14 @@ fn handle_recall_routes_to_retrieval_when_no_txn() {
 
         assert!(frame.is_final);
         assert!(
-            !frame.results.is_empty(),
+            !frame.memories.is_empty(),
             "retrieval recall returned no hits",
         );
         let any_with_retrievers = frame
-            .results
+            .memories
             .iter()
             .any(|r| !r.contributing_retrievers.is_empty());
-        let any_nonzero_fused = frame.results.iter().any(|r| r.fused_score > 0.0);
+        let any_nonzero_fused = frame.memories.iter().any(|r| r.fused_score > 0.0);
         assert!(
             any_with_retrievers,
             "retrieval path must populate contributing_retrievers on at least one hit",

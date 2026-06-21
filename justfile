@@ -215,22 +215,22 @@ image TAG="latest":
 image-run TAG="latest":
     @docker rm -f brain >/dev/null 2>&1 || true
     docker run --rm --name brain \
+        --security-opt seccomp=unconfined --ulimit memlock=-1 \
         -p 8080:8080 -p 9091:9091 \
         -v brain-data:/var/lib/brain/data \
         -v brain-models:/var/lib/brain/models \
         brain:{{TAG}}
 
-# Bring up the full compose stack (brain + prometheus + otel-collector + grafana).
+# Bring up the brain service via compose (config/docker-compose.yml).
 compose-up:
-    docker compose up -d --build
+    docker compose -f config/docker-compose.yml up -d --build
     @echo
-    @echo "brain         : http://127.0.0.1:9091/healthz"
-    @echo "prometheus UI : http://127.0.0.1:9090"
-    @echo "grafana       : http://127.0.0.1:3000 (anonymous viewer enabled)"
+    @echo "brain  data plane : 127.0.0.1:8080"
+    @echo "brain  health     : http://127.0.0.1:9091/healthz"
 
 # Tear down the compose stack. Pass `-v` to also drop data volumes.
 compose-down *ARGS:
-    docker compose down {{ARGS}}
+    docker compose -f config/docker-compose.yml down {{ARGS}}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Local serve — run the production image on macOS/Docker Desktop so native
