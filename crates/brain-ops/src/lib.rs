@@ -281,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_admin_variant_returns_not_yet_implemented() {
+    fn dispatch_substrate_admin_variant_rejected_as_http_only() {
         use crate::test_support::run_in_glommio;
         run_in_glommio(|| async {
             let ctx = fake_context();
@@ -290,9 +290,11 @@ mod tests {
                     detail: brain_protocol::envelope::request::StatsDetail::Summary,
                 },
             );
+            // Substrate admin ops are served over the HTTP admin listener, not
+            // the wire — dispatch rejects them with a clear InvalidRequest.
             match dispatch(req, RequestCaller::anonymous(), &ctx).await {
-                Err(OpError::NotYetImplemented(msg)) => assert!(msg.contains("admin")),
-                other => panic!("expected NotYetImplemented, got {other:?}"),
+                Err(OpError::InvalidRequest(msg)) => assert!(msg.contains("admin")),
+                other => panic!("expected InvalidRequest (admin is HTTP-only), got {other:?}"),
             }
         })
     }

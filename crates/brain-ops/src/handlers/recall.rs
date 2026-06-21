@@ -68,6 +68,14 @@ pub async fn handle_recall(
     mut req: RecallRequest,
     ctx: &OpsContext,
 ) -> Result<RecallResponseFrame, OpError> {
+    // Did the caller ask for a specific result count? `0` means "no count, use
+    // the server default"; any non-zero value is an explicit caller cap. We
+    // capture this BEFORE normalising `max_results` below, because the keyed
+    // (exact-anchor) path must not clip the intrinsic belonging set to the fuzzy
+    // default window when the caller never asked for a count — and the
+    // normalisation overwrites `0` with the default, erasing the distinction.
+    let client_requested_count = req.max_results != 0;
+
     // Normalise the safety cap. `0` means "server default"; anything
     // above the hard ceiling is clamped (not rejected) — the cap is a
     // bound, never the caller's intent. The answer's shape comes from
@@ -148,7 +156,15 @@ pub async fn handle_recall(
     // A memory in BOTH is the most-confirmed (both lanes agree) and ranks first.
     // The answer's SHAPE follows the set's cardinality: 0 → None, 1 → Single,
     // N → Many. There is no caller-supplied count anywhere in this path.
-    let membership = build_membership(memories, &grounded, &req, ctx, &cue_vec, anchor);
+    let membership = build_membership(
+        memories,
+        &grounded,
+        &req,
+        ctx,
+        &cue_vec,
+        anchor,
+        client_requested_count,
+    );
     // Structural abstention (write-time anchors): if the cue resolves to no
     // subject entity present in the store, the grounded layer found nothing, and
     // no surviving member is confirmed by a non-semantic lane, the cue has no
@@ -198,6 +214,7 @@ fn build_membership(
     ctx: &OpsContext,
     cue_vec: &[f32; brain_embed::VECTOR_DIM],
     anchor: Option<EntityId>,
+    client_requested_count: bool,
 ) -> Vec<MemoryResult> {
     // Membership = candidates within the query-relative cosine band of the best
     // match. Recall-safe; shape-loose on dense single-subject corpora and cannot
@@ -362,9 +379,27 @@ fn build_membership(
         }
     }
 
-    // Safety ceiling only — never the semantic answer size. The verification
-    // band already bounds the set; this guards a pathological flat distribution.
-    out.truncate(membership_ceiling(req) as usize);
+    // ── EXACT-PATH INTRINSIC CARDINALITY ───────────────────────────────────
+    // Ablatable block (revert by deleting it and keeping the plain
+    // `membership_ceiling` truncation below): for a KEYED query — one whose cue
+    // resolved to a subject anchor OR produced a grounded answer — the exact set
+    // (grounded source memories ∪ anchor-direct statements/mentions) IS the
+    // answer, with its own intrinsic size. Clipping it to the fuzzy
+    // `DEFAULT_RECALL_RESULTS` window would drop true belonging-set members, so
+    // the keyed ceiling is the hard allocation guard (`MAX_RECALL_RESULTS`),
+    // honouring an explicit client `max_results` only when the caller actually
+    // asked for one. A KEYLESS query has no exact key, so it keeps the fuzzy
+    // default window unchanged.
+    let keyed = anchor.is_some() || matches!(grounded, GroundedOutcome::Answer(_));
+    let ceiling = if keyed {
+        keyed_membership_ceiling(req, client_requested_count)
+    } else {
+        membership_ceiling(req)
+    };
+    // Safety ceiling only — never the answer size on the keyed path; on the
+    // keyless path the verification band already bounds the set and this guards
+    // a pathological flat distribution.
+    out.truncate(ceiling as usize);
 
     tracing::debug!(
         target: "brain_ops::recall_trace",
@@ -380,13 +415,16 @@ fn build_membership(
     out
 }
 
-/// Maximum number of anchor-direct memories pulled in one read by the
-/// graph-anchored injection. Sized to the per-read result scale
-/// ([`DEFAULT_RECALL_RESULTS`]) so the pull is bounded the same way every other
-/// lane is, and so a hub entity with thousands of mentions can't blow up the
-/// candidate set or the latency budget. Not a ranking knob — the final set is
-/// still cut by `membership_ceiling`; this only bounds the scan/hydrate work.
-const ANCHOR_DIRECT_PULL_CAP: usize = DEFAULT_RECALL_RESULTS as usize;
+/// Runaway guard on the anchor-direct EXACT pull (entity→statements +
+/// incoming Mentions). The exact path is keyed: when the cue resolves to a
+/// subject entity, every fact ABOUT that subject belongs to the answer, so its
+/// size is INTRINSIC (single value / list / range) — it must not be clipped to
+/// the fuzzy `DEFAULT_RECALL_RESULTS` window the associative lane uses. The only
+/// bound here is the same hard allocation ceiling that bounds every other path
+/// ([`MAX_RECALL_RESULTS`]), so a hub entity with thousands of mentions still
+/// can't blow up the candidate set or the latency budget. This is the runaway
+/// guard, NOT the answer size.
+const ANCHOR_DIRECT_PULL_CAP: usize = MAX_RECALL_RESULTS as usize;
 
 /// Collect memories that are DIRECTLY about the resolved subject entity, for the
 /// graph-anchored injection in [`build_membership`]: the first evidence memory
@@ -474,9 +512,10 @@ const MEMBERSHIP_ABS_FLOOR: f32 = 0.20;
 /// cluster → Many. "Within ~15% of the best." Principled default, not tuned.
 const MEMBERSHIP_REL_BAND: f32 = 0.85;
 
-/// Internal safety ceiling on the membership set size. Not a ranking knob and
-/// not caller intent — the adaptive gap decides the real set; this only caps a
-/// degenerate flat-distribution result so the response can't balloon.
+/// Internal safety ceiling on the membership set size for the KEYLESS (fuzzy)
+/// path. Not a ranking knob and not caller intent — the adaptive gap decides the
+/// real set; this only caps a degenerate flat-distribution result so the
+/// response can't balloon.
 fn membership_ceiling(req: &RecallRequest) -> u32 {
     let cap = if req.max_results == 0 {
         DEFAULT_RECALL_RESULTS
@@ -484,6 +523,24 @@ fn membership_ceiling(req: &RecallRequest) -> u32 {
         req.max_results
     };
     cap.min(MAX_RECALL_RESULTS)
+}
+
+/// Ceiling for the KEYED (exact-anchor / grounded) path. The belonging set has
+/// an intrinsic cardinality, so when the caller did NOT ask for a count
+/// (`client_requested_count == false`, the common "I didn't ask for a count"
+/// case) the set is NOT clipped to the fuzzy default-50 window — it is bounded
+/// only by the hard allocation guard. An explicit client `max_results` is still
+/// honoured as a caller cap. This is the runaway guard, never the answer size.
+///
+/// `req.max_results` has already been normalised by the time this runs (a `0`
+/// became [`DEFAULT_RECALL_RESULTS`]), which is exactly why the caller's original
+/// intent is threaded in separately as `client_requested_count`.
+fn keyed_membership_ceiling(req: &RecallRequest, client_requested_count: bool) -> u32 {
+    if client_requested_count {
+        req.max_results.min(MAX_RECALL_RESULTS)
+    } else {
+        MAX_RECALL_RESULTS
+    }
 }
 
 /// Build the response frame from the router's chosen memories, deriving the
@@ -1771,6 +1828,64 @@ mod tests {
         // token path, not this one).
         assert!(capitalized_runs("what are my allergies").is_empty());
         assert!(capitalized_runs("李明 去 哪里").is_empty());
+    }
+
+    /// Minimal `RecallRequest` for ceiling-logic tests. Only `max_results`
+    /// matters here; everything else is a benign zero/empty value.
+    fn req_with_max(max_results: u32) -> RecallRequest {
+        RecallRequest {
+            cue_text: String::new(),
+            subject_name: String::new(),
+            max_results,
+            confidence_threshold: 0.0,
+            context_filter: None,
+            age_bound_unix_nanos: None,
+            as_of_record_time_unix_nanos: None,
+            kind_filter: None,
+            salience_floor: 0.0,
+            include_edges: false,
+            include_graph: false,
+            include_text: true,
+            request_id: None,
+            txn_id: None,
+            agent_filter: Vec::new(),
+            include_other_agents: false,
+        }
+    }
+
+    #[test]
+    fn keyed_ceiling_uses_intrinsic_set_not_fuzzy_window() {
+        // KEYED + no caller count → bounded only by the hard guard, NOT the
+        // fuzzy default-50 window. This is the core of the change: the exact
+        // belonging set keeps its intrinsic cardinality.
+        let normalized = req_with_max(DEFAULT_RECALL_RESULTS); // 0 → default at the gate
+        assert_eq!(
+            keyed_membership_ceiling(&normalized, false),
+            MAX_RECALL_RESULTS,
+            "keyed path with no caller count must not clip to the fuzzy default window"
+        );
+
+        // KEYED + explicit caller count → honour the caller's cap.
+        let explicit = req_with_max(7);
+        assert_eq!(
+            keyed_membership_ceiling(&explicit, true),
+            7,
+            "an explicit max_results is still a caller cap on the keyed path"
+        );
+
+        // KEYED + explicit count above the hard guard → clamped to the guard.
+        let huge = req_with_max(MAX_RECALL_RESULTS + 100);
+        assert_eq!(keyed_membership_ceiling(&huge, true), MAX_RECALL_RESULTS);
+
+        // KEYLESS (fuzzy) path is unchanged: a no-count request keeps the
+        // default-50 window — the fuzzy fallback is never widened.
+        assert_eq!(
+            membership_ceiling(&normalized),
+            DEFAULT_RECALL_RESULTS,
+            "keyless path must keep the fuzzy default window"
+        );
+        // And a keyless explicit cap is honoured (clamped to the guard).
+        assert_eq!(membership_ceiling(&req_with_max(12)), 12);
     }
 
     #[test]
