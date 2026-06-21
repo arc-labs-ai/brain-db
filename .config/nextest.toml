@@ -1,0 +1,36 @@
+# cargo-nextest configuration — https://nexte.st
+#
+# nextest is the unit + integration test runner for the workspace (see the
+# `just test` / `just docker-verify` recipes). Doctests are NOT run by nextest
+# (upstream limitation) and stay on `cargo test --doc`.
+
+[profile.default]
+# A full run should report EVERY failure, not stop at the first — we want the
+# complete picture from one invocation (matches the verify-gate intent).
+fail-fast = false
+# Flag genuinely-slow tests (heavy server / storage integration) so they're
+# visible, but never kill them — some integration tests legitimately run long.
+slow-timeout = "120s"
+
+# brain-server integration tests each mmap an arena, open redb, and spawn
+# shards; under nextest's process-per-test parallelism they can exhaust a
+# memory-constrained box (the dev container caps near 7.75 GiB, where the
+# default-parallel server suite OOM-SIGKILLs). Run that crate's tests serially.
+[test-groups]
+heavy-server = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(brain-server)'
+test-group = 'heavy-server'
+
+# CI profile: same behavior, plus retry genuinely-flaky live/integration tests
+# once so a transient TCP/timeout blip doesn't fail the whole gate. Select with
+# `cargo nextest run --profile ci`.
+[profile.ci]
+fail-fast = false
+slow-timeout = "120s"
+retries = 1
+
+[[profile.ci.overrides]]
+filter = 'package(brain-server)'
+test-group = 'heavy-server'

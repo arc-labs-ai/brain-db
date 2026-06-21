@@ -16,13 +16,16 @@ build-release:
     cargo build --workspace --release
 
 # Run all tests (unit, integration, doc tests).
+# Unit + integration run under nextest (parallel process-per-test, faster on
+# our large suite); doctests stay on `cargo test --doc` since nextest doesn't
+# run them. Install once: `cargo install --locked cargo-nextest`.
 test:
-    cargo test --workspace --all-targets
+    cargo nextest run --workspace
     cargo test --workspace --doc
 
 # Run a specific crate's tests with output.
 test-one CRATE:
-    cargo test -p {{CRATE}} -- --nocapture
+    cargo nextest run -p {{CRATE}} --no-capture
 
 # Run clippy with strict lints.
 clippy:
@@ -113,13 +116,14 @@ docker *CMD:
 docker-verify:
     @devcontainer up --workspace-folder . >/dev/null
     @devcontainer exec --workspace-folder . cargo fmt --all -- --check
-    @devcontainer exec --workspace-folder . cargo test --workspace
+    @devcontainer exec --workspace-folder . cargo nextest run --workspace
+    @devcontainer exec --workspace-folder . cargo test --workspace --doc
     @devcontainer exec --workspace-folder . cargo clippy --workspace --all-targets -- -D warnings
 
 # Linux tests, scoped. Example: just docker-test -p brain-storage -p brain-server
 docker-test *ARGS:
     @devcontainer up --workspace-folder . >/dev/null
-    @devcontainer exec --workspace-folder . cargo test {{ARGS}}
+    @devcontainer exec --workspace-folder . cargo nextest run {{ARGS}}
 
 # Linux clippy.
 docker-clippy:
