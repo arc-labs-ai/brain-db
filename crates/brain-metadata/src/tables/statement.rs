@@ -31,9 +31,22 @@ use smallvec::SmallVec;
 pub const STATEMENTS_TABLE: TableDefinition<'static, [u8; 16], StatementMetadata> =
     TableDefinition::new("statements");
 
-/// `(EntityId, kind, predicate_id, is_current)` → `StatementId.to_bytes()`.
-pub const STATEMENTS_BY_SUBJECT_TABLE: TableDefinition<'static, ([u8; 16], u8, u32, u8), [u8; 16]> =
-    TableDefinition::new("statements_by_subject");
+/// `(EntityId, kind, predicate_id, is_current, statement_id)` →
+/// `StatementId.to_bytes()`.
+///
+/// Multi-value index: the statement id is appended to the key so every
+/// statement is its own row. Two Set-valued statements sharing
+/// `(subject, kind, predicate_id, is_current)` — e.g. two `likes` for
+/// one person — therefore each get a distinct index entry instead of
+/// colliding on a single key (last-writer-wins) and losing all but one.
+/// The value still holds the statement id so range scans read it as
+/// before without parsing the key tuple.
+#[allow(clippy::type_complexity)] // a redb composite-key tuple, not worth a type alias
+pub const STATEMENTS_BY_SUBJECT_TABLE: TableDefinition<
+    'static,
+    ([u8; 16], u8, u32, u8, [u8; 16]),
+    [u8; 16],
+> = TableDefinition::new("statements_by_subject");
 
 /// `(predicate_id, kind, confidence_bucket)` → `StatementId.to_bytes()`.
 /// `confidence_bucket` is `floor(confidence * 10)` clamped to `0..=10`.
@@ -401,7 +414,10 @@ impl StatementMetadata {
     }
 
     pub fn kind(&self) -> Option<StatementKind> {
-        StatementKind::from_u8(self.kind)
+        // Every byte decodes to a valid kind now (builtin 0..=5, else
+        // Custom). The `Option` is retained so existing callers keep their
+        // `?` / `ok_or` ergonomics; it is always `Some`.
+        Some(StatementKind::from_u8(self.kind))
     }
 
     #[must_use]
@@ -768,25 +784,65 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
         let subject = EntityId::new();
-        let stmt = StatementId::new();
-        let key = (
+        // Two Set-valued statements sharing (subject, kind, predicate,
+        // is_current) must both survive: the appended statement id makes
+        // each a distinct row.
+        let stmt_a = StatementId::new();
+        let stmt_b = StatementId::new();
+        let key_a = (
             subject.to_bytes(),
             StatementKind::Preference.as_u8(),
             3u32,
             1u8,
+            stmt_a.to_bytes(),
+        );
+        let key_b = (
+            subject.to_bytes(),
+            StatementKind::Preference.as_u8(),
+            3u32,
+            1u8,
+            stmt_b.to_bytes(),
         );
 
         let wtxn = db.begin_write().unwrap();
         {
             let mut t = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE).unwrap();
-            t.insert(&key, &stmt.to_bytes()).unwrap();
+            t.insert(&key_a, &stmt_a.to_bytes()).unwrap();
+            t.insert(&key_b, &stmt_b.to_bytes()).unwrap();
         }
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
         let t = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE).unwrap();
-        let got = t.get(&key).unwrap().unwrap().value();
-        assert_eq!(StatementId::from(got), stmt);
+        let got_a = t.get(&key_a).unwrap().unwrap().value();
+        let got_b = t.get(&key_b).unwrap().unwrap().value();
+        assert_eq!(StatementId::from(got_a), stmt_a);
+        assert_eq!(StatementId::from(got_b), stmt_b);
+
+        // Both members are enumerable via a range scan over the shared
+        // (subject, kind, predicate, is_current) prefix.
+        let lo = (
+            subject.to_bytes(),
+            StatementKind::Preference.as_u8(),
+            3u32,
+            1u8,
+            [0u8; 16],
+        );
+        let hi = (
+            subject.to_bytes(),
+            StatementKind::Preference.as_u8(),
+            3u32,
+            1u8,
+            [0xffu8; 16],
+        );
+        let mut found: Vec<StatementId> = Vec::new();
+        for entry in t.range(lo..=hi).unwrap() {
+            let (_, v) = entry.unwrap();
+            found.push(StatementId::from(v.value()));
+        }
+        assert_eq!(found.len(), 2);
+        assert!(found.contains(&stmt_a));
+        assert!(found.contains(&stmt_b));
     }
 
     #[test]

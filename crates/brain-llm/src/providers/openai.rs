@@ -124,7 +124,7 @@ impl OpenAIClient {
         Self {
             http: reqwest::Client::builder()
                 .build()
-                .expect("reqwest::Client::build is infallible with defaults"),
+                .expect("invariant: reqwest::Client::build is infallible with defaults"),
             base_url: base_url.into(),
             api_key: api_key.into(),
             model_id_hash: hash,

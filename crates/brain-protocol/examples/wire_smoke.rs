@@ -19,7 +19,7 @@ use brain_protocol::connection::handshake::{
 };
 use brain_protocol::error::ProtocolError;
 use brain_protocol::{
-    EncodeRequest, Frame, MemoryKindWire, Opcode, RecallRequest, RequestBody, ResponseBody, VERSION,
+    EncodeRequest, Frame, Opcode, RecallRequest, RequestBody, ResponseBody, VERSION,
 };
 
 // EOS marks a complete single-frame message (high bit of the flags byte).
@@ -80,12 +80,8 @@ fn main() {
     let encode = EncodeRequest {
         text: text.into(),
         context_id: 1,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: Vec::new(),
         request_id: [0x11u8; 16],
         txn_id: None,
-        deduplicate: true,
         occurred_at_unix_nanos: None,
     };
     send(
@@ -106,7 +102,8 @@ fn main() {
     // ---- RECALL the just-encoded memory ----
     let recall = RecallRequest {
         cue_text: "what color did the evening sky turn".into(),
-        top_k: 5,
+        subject_name: String::new(),
+        max_results: 5,
         confidence_threshold: 0.0,
         context_filter: None,
         age_bound_unix_nanos: None,
@@ -132,13 +129,13 @@ fn main() {
         panic!("expected RECALL_RESP, got {recall_resp:?}");
     };
     eprintln!(
-        "wire_smoke: RECALL_RESP results={} cumulative={}",
-        rr.results.len(),
+        "wire_smoke: RECALL_RESP memories={} cumulative={}",
+        rr.memories.len(),
         rr.cumulative_count
     );
     assert!(
-        !rr.results.is_empty(),
-        "RECALL returned no results — the encoded memory was not retrievable"
+        !rr.memories.is_empty(),
+        "RECALL returned no memories — the encoded memory was not retrievable"
     );
 
     println!("wire_smoke: OK — handshake + encode + recall round-trip succeeded");

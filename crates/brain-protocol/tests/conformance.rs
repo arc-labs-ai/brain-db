@@ -43,15 +43,15 @@ use brain_protocol::envelope::response::{ErrorCategoryWire, ErrorCodeWire};
 use brain_protocol::error::{ErrorCategory, ErrorCode};
 use brain_protocol::ops::capabilities::{Capabilities, GetCapabilitiesResponse};
 use brain_protocol::{
-    EdgeKindWire, EdgeRequest, EncodeRequest, EncodeResponse, EncodeVectorDirectRequest,
+    AnswerKindWire, EdgeKindWire, EncodeRequest, EncodeResponse, EncodeVectorDirectRequest,
     EntityCreateRequest, EntityCreateResponse, EntityGetResponse, EntityListItem,
     EntityListResponseFrame, EntityResolveResponse, EntityView, EventType, EvidenceRefWire,
     ForgetMode, ForgetRequest, ForgetResponse, Frame, InferenceKind, InferenceStep, LinkResponse,
     MaterializeProceduralRequest, MaterializeProceduralResponse, MemoryKindWire, Opcode,
     PlanResponseFrame, PlanStatus, PlanStep, PongResponse, QueryRequest, QueryResponse,
-    ReasonResponseFrame, ReasonStatus, RecallRequest, RecallResponseFrame, RelationCreateRequest,
-    RelationCreateResponse, RelationListFromResponseFrame, RelationView, RequestBody,
-    ResolutionOutcomeWire, ResponseBody, RetrieverSelectionWire, SchemaUploadRequest,
+    ReasonResponseFrame, ReasonStatus, RecallRequest, RecallResponseFrame,
+    RelationCreateRequest, RelationCreateResponse, RelationListFromResponseFrame, RelationView,
+    RequestBody, ResolutionOutcomeWire, ResponseBody, RetrieverSelectionWire, SchemaUploadRequest,
     SchemaUploadResponse, ServerPingResponse, StageKind, StatementCreateRequest,
     StatementCreateResponse, StatementGetResponse, StatementKindWire, StatementListResponseFrame,
     StatementObjectWire, StatementValueWire, StatementView, SubscriptionEvent, TransitionKind,
@@ -267,16 +267,8 @@ fn sample_encode() -> EncodeRequest {
     EncodeRequest {
         text: "the sky is blue".into(),
         context_id: 1,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.25,
-        edges: vec![EdgeRequest {
-            target: mid(),
-            kind: EdgeKindWire::Caused,
-            weight: 0.9,
-        }],
         request_id: RID,
         txn_id: None,
-        deduplicate: true,
         occurred_at_unix_nanos: Some(1_700_000_000_000_000_000),
     }
 }
@@ -593,7 +585,8 @@ fn corpus() -> Vec<Case> {
     ));
     let recall = RecallRequest {
         cue_text: "what color is the sky".into(),
-        top_k: 10,
+        subject_name: "sky".into(),
+        max_results: 10,
         confidence_threshold: 0.3,
         context_filter: Some(vec![1]),
         age_bound_unix_nanos: None,
@@ -706,7 +699,8 @@ fn corpus() -> Vec<Case> {
         &sample_encode_response(),
     ));
     let recall_resp = RecallResponseFrame {
-        results: Vec::new(),
+        answer_kind: AnswerKindWire::None,
+        memories: Vec::new(),
         is_final: true,
         cumulative_count: 0,
         estimated_remaining: Some(0),
@@ -1011,7 +1005,8 @@ fn corpus() -> Vec<Case> {
         0x80,
         2,
         ResponseBody::Recall(RecallResponseFrame {
-            results: Vec::new(),
+            answer_kind: AnswerKindWire::None,
+            memories: Vec::new(),
             is_final: true,
             cumulative_count: 0,
             estimated_remaining: Some(0),

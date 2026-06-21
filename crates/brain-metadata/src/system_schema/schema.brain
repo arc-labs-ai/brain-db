@@ -14,35 +14,11 @@
 #   EntityTypeId(4)  = Event
 #   EntityTypeId(5)  = Place
 #   EntityTypeId(6)  = Concept
-#   PredicateId(1)   = brain:is_a
-#   PredicateId(2)   = brain:has_name
-#   PredicateId(3)   = brain:mentions
-#   PredicateId(4)   = brain:fact
-#   PredicateId(5)   = brain:related_to
-#   PredicateId(6)   = brain:prefers
-#   PredicateId(7)   = brain:scheduled
-#   PredicateId(8)   = brain:works_at
-#   PredicateId(9)   = brain:member_of
-#   PredicateId(10)  = brain:lives_in
-#   PredicateId(11)  = brain:located_in
-#   PredicateId(12)  = brain:owns
-#   PredicateId(13)  = brain:current_role
-#   PredicateId(14)  = brain:speaks
-#   PredicateId(15)  = brain:has_skill
-#   PredicateId(16)  = brain:likes
-#   PredicateId(17)  = brain:dislikes
-#   PredicateId(18)  = brain:occurred_at
-#   PredicateId(19)  = brain:mentioned_in
-#   PredicateId(20)  = brain:participated_in
-#   PredicateId(21)  = brain:behavior_tone
-#   PredicateId(22)  = brain:behavior_style
-#   PredicateId(23)  = brain:behavior_avoids
-#   PredicateId(24)  = brain:behavior_prefers
-#   PredicateId(25)  = brain:behavior_constraint
-#   PredicateId(26)  = brain:knows
-#   PredicateId(27)  = brain:interested_in
-#   PredicateId(28)  = brain:intends
-#   PredicateId(29)  = brain:did
+#   PredicateId(1)   = brain:behavior_tone
+#   PredicateId(2)   = brain:behavior_style
+#   PredicateId(3)   = brain:behavior_avoids
+#   PredicateId(4)   = brain:behavior_prefers
+#   PredicateId(5)   = brain:behavior_constraint
 #   RelationTypeId(1) = brain:related_to
 #   RelationTypeId(2) = brain:reports_to
 #   RelationTypeId(3) = brain:co_authored
@@ -50,6 +26,15 @@
 #   ExtractorId(1) = brain:entity_mentions
 #   ExtractorId(2) = brain:gliner
 #   ExtractorId(3) = brain:llm_predicate
+#
+# NOTE — predicates are an OPEN vocabulary. The seed declares ONLY the five
+# `behavior_*` predicates, because `MATERIALIZE_PROCEDURAL` resolves those by
+# qname. Every other predicate (works_at, lives_in, knows, donated, …) is
+# coined on the fly by `predicate_intern_or_get` at write time; semantics and
+# supersession come from the statement's KIND, not from a pre-seeded predicate
+# list. Seeding a fixed domain vocabulary would be unbounded and is exactly
+# what the kinds model replaced — so domain predicates are deliberately NOT
+# seeded here.
 
 namespace brain
 
@@ -104,147 +89,7 @@ define entity_type Concept {
     }
 }
 
-# --- Predicates ---------------------------------------------------
-#
-# The first six are the original generic substrate predicates kept
-# as catch-all fallbacks for direct STATEMENT_CREATE callers. The
-# remaining fifteen are the declared vocabulary the extractor
-# pipeline is constrained to. Statefulness follows the kind-derived default
-# (Preference → stateful, Fact / Event → cumulative) unless the
-# predicate is single-valued at a point in time — in which case
-# `stateful: true` makes the new observation supersede the prior.
-
-define predicate is_a {
-    kind: Fact
-    object: Entity<Any>
-    description: "Subject is an instance of the object entity type."
-}
-
-define predicate has_name {
-    kind: Fact
-    object: Value<text>
-    description: "Subject's canonical name as a text value."
-}
-
-define predicate mentions {
-    kind: Fact
-    object: Any
-    description: "Generic mention — subject mentions object."
-}
-
-define predicate fact {
-    kind: Fact
-    object: Any
-    description: "Wildcard Fact sink for LLM-coined predicates that don't match any declared predicate. The original predicate qname is preserved on the statement so a later schema upload can promote it."
-}
-
-define predicate related_to {
-    kind: Fact
-    object: Entity<Any>
-    description: "Generic relation between subject entity and object entity."
-}
-
-define predicate prefers {
-    kind: Preference
-    object: Value<text>
-    description: "Generic Preference about the subject (any value)."
-}
-
-define predicate scheduled {
-    kind: Event
-    object: Any
-    description: "Generic Event scheduled at event_at_unix_nanos."
-}
-
-define predicate works_at {
-    kind: Fact
-    object: Entity<Organization>
-    stateful: true
-    description: "Active employment / engagement relationship at a point in time."
-}
-
-define predicate member_of {
-    kind: Fact
-    object: Entity<Organization>
-    stateful: true
-    description: "Subject is a member of the object organization."
-}
-
-define predicate lives_in {
-    kind: Fact
-    object: Entity<Place>
-    stateful: true
-    description: "Subject's primary place of residence."
-}
-
-define predicate located_in {
-    kind: Fact
-    object: Entity<Place>
-    stateful: true
-    description: "Physical location of an organization, event, or place."
-}
-
-define predicate owns {
-    kind: Fact
-    object: Any
-    stateful: true
-    description: "Subject owns the object — single owner at a point in time."
-}
-
-define predicate current_role {
-    kind: Fact
-    object: Value<text>
-    stateful: true
-    description: "Person's current role title."
-}
-
-define predicate speaks {
-    kind: Fact
-    object: Value<text>
-    stateful: false
-    description: "Languages a person speaks — cumulative; multiple values coexist."
-}
-
-define predicate has_skill {
-    kind: Fact
-    object: Value<text>
-    stateful: false
-    description: "A skill the person has — cumulative; multiple values coexist."
-}
-
-define predicate likes {
-    kind: Preference
-    object: Any
-    description: "Subject likes the object — supersedes prior likes of the same target."
-}
-
-define predicate dislikes {
-    kind: Preference
-    object: Any
-    description: "Subject dislikes the object — supersedes prior dislikes of the same target."
-}
-
-define predicate occurred_at {
-    kind: Event
-    object: Value<timestamp>
-    description: "Timestamp at which the subject event occurred."
-}
-
-define predicate mentioned_in {
-    kind: Fact
-    object: Any
-    stateful: false
-    description: "Soft link from any entity to a memory that referenced it."
-}
-
-define predicate participated_in {
-    kind: Fact
-    object: Entity<Event>
-    stateful: false
-    description: "Subject person participated in the object event."
-}
-
-# --- Procedural memory --------------------------------------------
+# --- Predicates (procedural memory only) --------------------------
 #
 # Behaviors an agent learns about itself over prior sessions. All five
 # are Preference (stateful) — a fresh observation supersedes the prior
@@ -286,43 +131,6 @@ define predicate behavior_constraint {
     object: Value<text>
     stateful: true
     description: "Hard rules the agent must follow across all sessions."
-}
-
-# --- Universal agent-memory core ----------------------------------
-#
-# Only what is STRUCTURALLY universal for any agent's memory: the social
-# graph (knows + family_of), agent intent (intends), and broad sinks
-# (interested_in / did take Any). Specific attributes (birthplace,
-# nationality, …) are an open-ended space and are deliberately NOT seeded
-# — they ride the `fact` capture tail and are promoted per-domain via
-# SCHEMA_UPLOAD. Appended last so the interned ids above stay stable.
-
-define predicate knows {
-    kind: Fact
-    object: Entity<Person>
-    stateful: false
-    description: "The subject is acquainted or associated with another person (foaf:knows). Cumulative."
-}
-
-define predicate interested_in {
-    kind: Fact
-    object: Any
-    stateful: false
-    description: "A topic, field, or activity the subject is interested in or engages with (foaf:interest / schema:knowsAbout). Cumulative — a person has many."
-}
-
-define predicate intends {
-    kind: Fact
-    object: Value<text>
-    stateful: false
-    description: "A goal, plan, or intention the subject holds or has decided on. Core to agent memory. Cumulative."
-}
-
-define predicate did {
-    kind: Fact
-    object: Any
-    stateful: false
-    description: "A notable action the subject performed; the generic action sink — prefer a more specific predicate when one fits. Cumulative."
 }
 
 # --- Relation types -----------------------------------------------
@@ -383,7 +191,7 @@ define extractor entity_mentions {
     kind: pattern
     target: entity_or_statement
     patterns [
-        /\b([A-Z][a-z]+\s+[A-Z][a-z]+)\b/,
+        /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b/,
         /\b([A-Z]\.\s*[A-Z][a-z]+)\b/
     ]
     confidence: 0.7
@@ -412,57 +220,39 @@ The active schema declares these entity types:
 - brain:Place
 - brain:Concept
 
-You may use ONLY the predicates declared below. Choose the closest one and map synonyms onto it (loves/enjoys/is a fan of -> the closest "like" predicate; from/grew up in/home country -> the closest origin/location predicate; job/employer -> a work predicate). If NO declared predicate genuinely fits an assertion, OMIT that assertion — do NOT invent or coin a new predicate.
+PREDICATES ARE OPEN. Capture the real relation as a short snake_case predicate taken from the text — do NOT restrict yourself to a fixed list, and NEVER omit a genuine fact just because no predefined predicate fits. Examples: "works at" -> works_at; "lives in" -> lives_in; "donated bone marrow to" -> donated; "is allergic to" -> allergic_to; "favorite color is" -> favorite_color. Reuse a common name when natural so the same relation isn't spelled two different ways. Emit each predicate as `brain:<snake_case>`.
 
-Declared predicates — `qname (Kind, single|set): description`:
-{DECLARED_PREDICATES}
-Declared relation types (entity↔entity edges; use ONLY these):
-- brain:related_to, brain:reports_to, brain:co_authored, brain:family_of
+Classify each statement into exactly ONE kind from the list below. The kind is the *shape* of the fact, not its topic. If none truly fits, use Fact.
+
+Kinds — `Name (cardinality, temporal): what belongs here`:
+{DECLARED_KINDS}
 
 Output STRICT JSON matching this shape, and nothing else:
 {
   "statements": [
-    {
-      "subject": "Alice Wong",
-      "predicate": "brain:works_at",
-      "object": "Acme Corp",
-      "is_stateful": true,
-      "confidence": 0.92
-    },
-    {
-      "subject": "Caroline",
-      "predicate": "brain:lives_in",
-      "object": "Berlin",
-      "is_stateful": true,
-      "confidence": 0.9
-    },
-    {
-      "subject": "Melanie's kids",
-      "predicate": "brain:likes",
-      "object": "dinosaurs",
-      "is_stateful": false,
-      "confidence": 0.88
-    }
-  ],
-  "relations": [
-    {
-      "subject": "Priya Sharma",
-      "relation_type": "brain:reports_to",
-      "object": "Alice Wong",
-      "confidence": 0.85
-    }
+    { "subject": "Alice Wong", "predicate": "brain:works_at", "object": "Acme Corp", "object_is_entity": true, "kind": "Relation", "confidence": 0.92 },
+    { "subject": "Bob Smith", "predicate": "brain:lives_in", "object": "Berlin", "object_is_entity": true, "kind": "Attribute", "confidence": 0.9 },
+    { "subject": "Eve Adams", "predicate": "brain:favorite_color", "object": "blue", "object_is_entity": false, "kind": "Attribute", "confidence": 0.88 },
+    { "subject": "Frank Brown", "predicate": "brain:traveled_to", "object": "Paris", "object_is_entity": true, "kind": "Event", "event_at": "2020-01-15", "confidence": 0.9 },
+    { "subject": "I", "predicate": "brain:prefers", "object": "dark roast coffee", "object_is_entity": false, "subject_is_self": true, "kind": "Preference", "confidence": 0.95 },
+    { "subject": "Priya", "predicate": "brain:works_at", "object": "Google", "object_is_entity": true, "kind": "Relation", "retract": true, "confidence": 0.9 }
   ]
 }
 
 Rules:
-- Decompose each assertion into a clean (subject, predicate, object). The predicate is the verb/relation; the object is the entity or a short clean value it acts on — NEVER a verb phrase or sentence fragment. "Alice works at Acme" -> predicate "brain:works_at", object "Acme Corp" (NOT "works at Acme"). "Caroline lives in Berlin" -> predicate "brain:lives_in", object "Berlin".
-- Use ONLY the declared predicates above. Map synonyms to the closest declared predicate. If none genuinely fits, OMIT the assertion — never coin a new predicate, never force an ill-fitting one.
-- Same for relations: use ONLY the declared relation types; if none fits, omit.
-- Quality over coverage. Extract a durable fact / preference / relationship, not conversational noise: skip greetings, reactions ("that's awesome"), momentary feelings, and vague statements. Emitting nothing is better than a wrong or vague triple.
+- Decompose each assertion into a clean (subject, predicate, object). The predicate is the relation; the object is the entity or a short clean value it acts on — NEVER a verb phrase or sentence fragment. "Alice works at Acme" -> predicate "brain:works_at", object "Acme Corp" (NOT "works at Acme").
+- `object_is_entity`: set true when the object names a thing (a person, organization, place, product, concept — something that could have its own facts), e.g. "Acme Corp", "Paris", "aspirin"; set false when the object is a literal value, e.g. "blue", "42", "Senior Engineer". When unsure, prefer false.
+- `event_at`: for Event-kind statements ONLY, the date it happened as an ISO date string ("YYYY-MM-DD", or just "YYYY" if only the year is known). Omit it for non-Events and when no date is stated — do NOT invent one.
+- `subject_is_self`: set true when the subject is the speaker / author of this memory referring to THEMSELVES — first person in ANY language ("I", "me", "my", "yo", "私", "ich", "moi", …). Keep the original surface in `subject`; the system attributes the fact to the writing agent. Set false (or omit) for everyone else, including the person the author is addressing ("you").
+- Predicates are open: capture the real relation verbatim in snake_case. Do NOT omit a genuine, durable fact just because its relation is unusual — that is exactly what open predicates are for ("donated", "allergic_to", "favorite_color").
+- Choosing the kind: Attribute = a single-valued property of the entity (current city, role, age, favorite color); Relation = a link to another entity (works_at, knows, manages, married_to); Preference = likes / wants / avoids something; Event = something that happened at a point in time (donated, traveled, met, shipped); Directive = how the agent should behave; Fact = anything that fits none of the above (the catch-all).
+- Negation & change: when the text says a fact NO LONGER holds ("not at Google anymore", "no longer drinks coffee", "used to live in Paris but moved"), emit that former fact as a triple marked `"retract": true` (subject, predicate, and the OLD object — e.g. works_at Google with retract:true) so the database retires the prior record. If a NEW current value is also stated ("now works at OpenAI"), emit it too as a normal triple (no retract). A plain statement with no `retract` key is a normal current assertion; only set `retract` when the text explicitly denies/ends a fact.
+- Resolve pronouns before emitting. Replace "it / he / she / they / this / that" with the actual entity they refer to within this text; never output a bare pronoun, and never leave a pronoun stuck to a value ("usually drinks it black" -> predicate "brain:usually_drinks", object "black" — the manner — NOT "it black"). If a pronoun's referent is genuinely unclear, drop that triple rather than emit the pronoun.
+- Quality over coverage. Extract durable facts / preferences / relationships / events, not conversational noise: skip greetings, reactions ("that's awesome"), momentary feelings, and vague statements. Emitting nothing is better than a wrong or vague triple.
 - Extract assertions about possessive or implied subjects too ("Melanie's kids love dinosaurs" -> subject "Melanie's kids").
+- Every entity gets its OWN attributes. When a sentence states a fact about an entity that appears as the object, in an apposition, or in a subordinate clause — not just the grammatical subject — emit a separate triple with THAT entity as the subject. An apposition ("Rohan, a lawyer", "Meera's husband Rohan, who studied at NLSIU") describes the named entity: emit "Rohan -> brain:occupation -> lawyer" and "Rohan -> brain:studied_at -> NLSIU", in addition to any relation tying it to the main subject ("Meera -> brain:spouse -> Rohan"). A role-at-org clause ("Niraj is a senior engineer at NeuraCorp") yields BOTH the role as an attribute ("Niraj -> brain:role -> senior engineer") AND the affiliation as a relation ("Niraj -> brain:works_at -> NeuraCorp"). Decompose so each entity becomes a complete, independently-queryable subject — never leave an entity's stated attribute attached only to the sentence that introduced it.
 - Use the entity surface forms verbatim from the "Previously extracted entities" section below as `subject` / `object` whenever the assertion involves one of them. Do not invent new surface forms for those concepts.
-- Set is_stateful true only for single-valued attributes that supersede prior values (current job, current city); leave false for additive facts and events.
-- If the text contains no durable assertion, return `{ "statements": [], "relations": [] }`.
+- If the text contains no durable assertion, return `{ "statements": [] }`.
 {PRIOR_ENTITIES}
 Input text:
 ```

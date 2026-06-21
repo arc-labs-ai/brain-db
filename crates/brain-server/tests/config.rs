@@ -62,6 +62,12 @@ model = "bge-small-en-v1.5"
 cache_size = 10000
 batch_size = 32
 batch_window_ms = 5
+
+# Dummy provider key so these config-parser fixtures clear the hard
+# LLM-provider startup gate (the LLM extractor tier is on by default and
+# requires a provider). These tests exercise the parser, not the LLM.
+[llm]
+api_key = "sk-test-config-parser"
 "#;
 
 // ---------------------------------------------------------------------------
@@ -72,7 +78,11 @@ batch_window_ms = 5
 fn dev_toml_round_trips_cleanly() {
     let path = dev_toml_path();
     assert!(path.exists(), "expected dev.toml at {}", path.display());
-    let env: HashMap<String, String> = HashMap::new();
+    // dev.toml leaves the LLM provider key to the environment; supply one
+    // so the hard provider gate (LLM extractor tier is on by default) is
+    // satisfied and the parse round-trip can be checked.
+    let mut env: HashMap<String, String> = HashMap::new();
+    env.insert("BRAIN_API_KEY".into(), "sk-test".into());
     let cfg = Config::load_with_env(&path, &env).expect("dev.toml must load");
 
     assert_eq!(cfg.server.listen_addr.to_string(), "127.0.0.1:9090");
@@ -87,6 +97,22 @@ fn dev_toml_round_trips_cleanly() {
     assert_eq!(cfg.auth.mode, AuthMode::None);
     assert!(!cfg.server.tls.enabled);
     assert_eq!(cfg.monitoring.logging.format, "json");
+}
+
+#[test]
+fn dev_toml_without_provider_key_refuses_to_start() {
+    // The hard constraint: with the LLM extractor tier on (dev.toml's
+    // default) and no provider key in the environment or config, the
+    // server must refuse to boot rather than silently degrade to a
+    // substrate-only shell.
+    let path = dev_toml_path();
+    let err = Config::load_with_env(&path, &HashMap::new())
+        .expect_err("no provider key must fail startup");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("LLM provider") || msg.contains("provider key"),
+        "expected an LLM-provider startup error, got: {msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------

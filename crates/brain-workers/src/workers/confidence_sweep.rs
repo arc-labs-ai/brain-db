@@ -58,11 +58,6 @@ use crate::worker::Worker;
 // Knobs.
 // ---------------------------------------------------------------------------
 
-/// Operator override for the sweep interval (seconds). Falls back to
-/// the `WorkerConfig::defaults_for` cadence when unset, empty, or
-/// non-positive.
-pub const SWEEP_INTERVAL_ENV: &str = "BRAIN_CONFIDENCE_SWEEP_INTERVAL_SECS";
-
 /// Default cadence: 1 h.
 pub const DEFAULT_INTERVAL_SECS: u64 = 3600;
 pub const DEFAULT_BATCH_SIZE: usize = 256;
@@ -104,11 +99,6 @@ impl Default for ConfidenceSweepKnobs {
     }
 }
 
-fn resolved_interval() -> Duration {
-    crate::env::parse_interval_override(std::env::var(SWEEP_INTERVAL_ENV).ok().as_deref())
-        .unwrap_or_else(|| Duration::from_secs(DEFAULT_INTERVAL_SECS))
-}
-
 // ---------------------------------------------------------------------------
 // Worker.
 // ---------------------------------------------------------------------------
@@ -122,11 +112,13 @@ pub struct ConfidenceSweepWorker {
 }
 
 impl ConfidenceSweepWorker {
-    /// Construct with the default cadence + knobs.
+    /// Construct with the default cadence + knobs. Override the cadence
+    /// with [`Self::with_interval_secs`], which the shard wires from
+    /// `[workers.confidence_sweep] interval_secs`.
     #[must_use]
     pub fn new(metadata: Arc<MetadataDb>) -> Self {
         let mut config = WorkerConfig::defaults_for(WorkerKind::ConfidenceSweep);
-        config.interval = resolved_interval();
+        config.interval = Duration::from_secs(DEFAULT_INTERVAL_SECS);
         // Cap the per-cycle scan at batch_size so the read txn doesn't
         // sit on the metadata lock arbitrarily long.
         config.batch_size = DEFAULT_BATCH_SIZE;
@@ -137,6 +129,15 @@ impl ConfidenceSweepWorker {
             metadata,
             metrics: None,
         }
+    }
+
+    /// Override the sweep cadence. The shard supplies
+    /// `[workers.confidence_sweep] interval_secs`; a zero value is
+    /// clamped to 1 second so the scheduler never busy-loops.
+    #[must_use]
+    pub fn with_interval_secs(mut self, interval_secs: u64) -> Self {
+        self.config.interval = Duration::from_secs(interval_secs.max(1));
+        self
     }
 
     #[must_use]

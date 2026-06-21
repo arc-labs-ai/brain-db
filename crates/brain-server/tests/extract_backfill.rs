@@ -23,7 +23,7 @@ use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
-use brain_protocol::envelope::request::{EncodeRequest, MemoryKindWire, RequestBody};
+use brain_protocol::envelope::request::{EncodeRequest, RequestBody};
 use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
 use tempfile::TempDir;
@@ -155,13 +155,9 @@ async fn encode_one(client: &mut TcpStream, stream_id: u32, text: &str) -> Memor
     let req = EncodeRequest {
         text: text.into(),
         context_id: 1,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: vec![],
         request_id: *Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
-        deduplicate: false,
     };
     let resp = round_trip(client, stream_id, RequestBody::Encode(req)).await;
     match resp {
@@ -228,9 +224,10 @@ async fn backfill_all_enqueues_every_memory() {
         .expect("connect");
     handshake(&mut client).await;
 
+    // Client op streams must be non-zero and ODD (1, 3, 5…).
     let _ = encode_one(&mut client, 1, "alpha memory one").await;
-    let _ = encode_one(&mut client, 2, "beta memory two").await;
-    let _ = encode_one(&mut client, 3, "gamma memory three").await;
+    let _ = encode_one(&mut client, 3, "beta memory two").await;
+    let _ = encode_one(&mut client, 5, "gamma memory three").await;
 
     let admin_addr = server.admin_addr.to_string();
     let (status, body) = tokio::task::spawn_blocking(move || {
@@ -267,7 +264,7 @@ async fn backfill_since_zero_matches_all_active() {
     handshake(&mut client).await;
 
     let _ = encode_one(&mut client, 1, "alpha").await;
-    let _ = encode_one(&mut client, 2, "beta").await;
+    let _ = encode_one(&mut client, 3, "beta").await;
 
     let admin_addr = server.admin_addr.to_string();
     let (status, body) = tokio::task::spawn_blocking(move || {

@@ -15,9 +15,7 @@ use brain_metadata::MetadataDb;
 use brain_ops::test_support::{run_in_glommio, single_body};
 use brain_ops::{dispatch, DispatchOutcome, ErrorCode, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::envelope::request::{
-    EncodeRequest, ForgetMode, ForgetRequest, MemoryKindWire, RequestBody,
-};
+use brain_protocol::envelope::request::{EncodeRequest, ForgetMode, ForgetRequest, RequestBody};
 use brain_protocol::envelope::response::{EncodeResponse, ForgetResponse, ResponseBody};
 
 // ---------------------------------------------------------------------------
@@ -75,12 +73,8 @@ fn encode_req(request_id: [u8; 16], text: &str) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
         context_id: 42,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: vec![],
         request_id,
         txn_id: None,
-        deduplicate: false,
         occurred_at_unix_nanos: None,
     }
 }

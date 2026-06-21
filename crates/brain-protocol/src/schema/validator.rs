@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use crate::schema::ast::{
     AttrType, AttributeDecl, CardinalityAst, ExtractorDef, ExtractorField, ExtractorKindAst,
-    ExtractorTarget, LiteralValue, ObjectTypeDecl, PredicateDef, RelationTypeDef, Schema,
+    ExtractorTarget, KindDef, LiteralValue, ObjectTypeDecl, PredicateDef, RelationTypeDef, Schema,
     SchemaItem, StatementKindAst,
 };
 
@@ -130,6 +130,7 @@ fn validate_inner(
             SchemaItem::Extractor(x) => {
                 check_extractor(x, &entity_names, &relation_names, &mut errors);
             }
+            SchemaItem::Kind(k) => check_kind(k, &mut errors),
         }
     }
 
@@ -196,6 +197,7 @@ fn check_duplicates(schema: &Schema, errors: &mut ValidationErrors) {
     let mut predicates: HashMap<&str, usize> = HashMap::new();
     let mut relations: HashMap<&str, usize> = HashMap::new();
     let mut extractors: HashMap<&str, usize> = HashMap::new();
+    let mut kinds: HashMap<&str, usize> = HashMap::new();
 
     for item in &schema.items {
         match item {
@@ -231,6 +233,15 @@ fn check_duplicates(schema: &Schema, errors: &mut ValidationErrors) {
                     errors.push(ValidationError {
                         code: ValidationErrorCode::DuplicateDefinition,
                         message: format!("duplicate extractor {:?}", x.name),
+                        source_span: None,
+                    });
+                }
+            }
+            SchemaItem::Kind(k) => {
+                if kinds.insert(k.name.as_str(), 0).is_some() {
+                    errors.push(ValidationError {
+                        code: ValidationErrorCode::DuplicateDefinition,
+                        message: format!("duplicate kind {:?}", k.name),
                         source_span: None,
                     });
                 }
@@ -382,14 +393,58 @@ fn check_predicate(pred: &PredicateDef, entity_names: &[&str], errors: &mut Vali
 
 fn predicate_kind_object_compatible(kind: StatementKindAst, object: &ObjectTypeDecl) -> bool {
     match kind {
-        StatementKindAst::Fact | StatementKindAst::Any => true,
+        // Fact/Attribute/Any accept any object shape.
+        StatementKindAst::Fact | StatementKindAst::Attribute | StatementKindAst::Any => true,
         StatementKindAst::Preference => {
             matches!(object, ObjectTypeDecl::Value { .. } | ObjectTypeDecl::Any)
+        }
+        // Relations link two entities.
+        StatementKindAst::Relation => {
+            matches!(object, ObjectTypeDecl::Entity { .. } | ObjectTypeDecl::Any)
         }
         StatementKindAst::Event => matches!(
             object,
             ObjectTypeDecl::Value { .. } | ObjectTypeDecl::Entity { .. } | ObjectTypeDecl::Any
         ),
+        // Directives carry a value (the behavioral instruction).
+        StatementKindAst::Directive => {
+            matches!(object, ObjectTypeDecl::Value { .. } | ObjectTypeDecl::Any)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kind (user-declared statement kind).
+// ---------------------------------------------------------------------------
+
+/// Names of the built-in statement kinds. A user-declared kind may not
+/// reuse one (case-insensitively) — those shapes are fixed.
+const BUILTIN_KIND_NAMES: [&str; 6] = [
+    "fact",
+    "preference",
+    "event",
+    "attribute",
+    "relation",
+    "directive",
+];
+
+fn check_kind(k: &KindDef, errors: &mut ValidationErrors) {
+    if !is_lower_snake_ident(&k.name) {
+        errors.push(ValidationError {
+            code: ValidationErrorCode::NamespaceInvalidIdentifier,
+            message: format!("kind name {:?} must match `[a-z][a-z0-9_]*`", k.name),
+            source_span: None,
+        });
+    }
+    if BUILTIN_KIND_NAMES.contains(&k.name.to_ascii_lowercase().as_str()) {
+        errors.push(ValidationError {
+            code: ValidationErrorCode::DuplicateDefinition,
+            message: format!(
+                "kind name {:?} collides with a built-in kind; pick a distinct name",
+                k.name
+            ),
+            source_span: None,
+        });
     }
 }
 

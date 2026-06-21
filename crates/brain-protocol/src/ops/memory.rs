@@ -6,18 +6,20 @@ use crate::shared::primitives::{
     EdgeKindWire, ForgetMode, MemoryKindWire, ObservationInput, PlanState, PlanStrategy,
 };
 
+/// `ENCODE_REQ` body. Expresses client *intent* only: the text to
+/// remember, where it belongs, and when its content happened. Brain's
+/// write router decides everything mechanical — the memory kind,
+/// salience, whether the write deduplicates against an existing row, and
+/// which edges get wired — server-side. Clients do not (and cannot)
+/// dictate that machinery; they say what to remember, not how to file it.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EncodeRequest {
     pub text: String,
     pub context_id: WireContextId,
-    pub kind: MemoryKindWire,
-    pub salience_hint: f32,
-    pub edges: Vec<EdgeRequest>,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
     #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
-    pub deduplicate: bool,
     /// Client-supplied event time — when the memory's content actually
     /// happened, distinct from the server's write time (`created_at`).
     /// `None` when the client doesn't know it. Lets time-aware clients
@@ -25,12 +27,15 @@ pub struct EncodeRequest {
     pub occurred_at_unix_nanos: Option<u64>,
 }
 
-/// Power-user encode: client supplies the embedding vector itself and
-/// the fingerprint of the model that produced it. Used by deployments
-/// running their own (often domain-specific or multi-modal) embedder
-/// outside Brain. The server skips its own embed step entirely, but
-/// still runs every downstream validation, dedup, slot reservation,
-/// edge wiring, and write submission.
+/// Admin / bulk-import encode path — NOT a primary client verb. Brain
+/// owns the embedding model; ordinary clients send text via `ENCODE` and
+/// let the server embed it. This op exists for bulk or administrative
+/// import from deployments running their own (often domain-specific or
+/// multi-modal) embedder outside Brain: the caller supplies the embedding
+/// vector itself plus the fingerprint of the model that produced it. The
+/// server skips its own embed step entirely, but still runs every
+/// downstream validation, dedup, slot reservation, edge wiring, and write
+/// submission.
 ///
 /// The vector must be L2-normalised within `+/- 1e-3` (cosine
 /// similarity assumes unit norm) and the fingerprint must match the
@@ -85,7 +90,17 @@ pub struct EdgeRequest {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RecallRequest {
     pub cue_text: String,
-    pub top_k: u32,
+    /// Optional explicit subject hint for the precise grounded overlay, by
+    /// name. Resolved server-side (cross-type). When empty, the server mines
+    /// subjects from the cue itself. There is no read "mode": recall always
+    /// runs the episodic associative path and overlays a precise grounded
+    /// value when one is named exactly — this field just adds an explicit
+    /// subject candidate to that overlay.
+    pub subject_name: String,
+    /// Safety cap on returned items (set members / episodic hits). NOT a
+    /// ranking knob — the answer's shape comes from the data + kind, never
+    /// from a caller count. `0` ⇒ server default.
+    pub max_results: u32,
     pub confidence_threshold: f32,
     pub context_filter: Option<Vec<WireContextId>>,
     pub age_bound_unix_nanos: Option<u64>,
@@ -239,10 +254,32 @@ pub struct EncodeResponse {
     pub has_active_schema: bool,
 }
 
-/// — one streaming RECALL frame.
+/// The shape of a RECALL answer — pure cardinality, decided by the server's
+/// router from the stored data. A memory database answers with memories:
+/// one, several, or none. There is NO retrieval-mechanism vocabulary here
+/// (no "episodic", no "grounded") — how the router found the memories is an
+/// internal concern the caller never sees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AnswerKindWire {
+    /// One memory is the answer. `memories` has exactly one entry.
+    Single,
+    /// Several memories together are the answer. `memories` has 2+ entries.
+    Many,
+    /// Not available — the substrate has no memory that answers the cue.
+    /// `memories` is empty. Absence is explicit, never a fabricated guess.
+    None,
+}
+
+/// — one streaming RECALL frame. The answer is always memories: the router
+/// returns the one memory, the array of memories, or none — `answer_kind`
+/// carries which. The stored value lives on each memory (text + optional
+/// graph enrichment); there is no separate value channel.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RecallResponseFrame {
-    pub results: Vec<MemoryResult>,
+    /// The answer cardinality the router decided.
+    pub answer_kind: AnswerKindWire,
+    /// The answering memories: 1 for `Single`, 2+ for `Many`, 0 for `None`.
+    pub memories: Vec<MemoryResult>,
     pub is_final: bool,
     pub cumulative_count: u32,
     pub estimated_remaining: Option<u32>,
@@ -499,16 +536,8 @@ mod serde_smoke {
         let req = EncodeRequest {
             text: "hello world".to_string(),
             context_id: 1,
-            kind: MemoryKindWire::Episodic,
-            salience_hint: 0.25,
-            edges: vec![EdgeRequest {
-                target: 0,
-                kind: EdgeKindWire::Caused,
-                weight: 0.9,
-            }],
             request_id: [7u8; 16],
             txn_id: Some([8u8; 16]),
-            deduplicate: true,
             occurred_at_unix_nanos: Some(1_700_000_000_000_000_000),
         };
         let j = serde_json::to_vec(&req).expect("serde_json encode");

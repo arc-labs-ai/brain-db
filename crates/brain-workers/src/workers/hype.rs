@@ -22,7 +22,10 @@ use brain_index::HypeHnswIndex;
 use brain_llm::types::SystemBlock;
 use brain_llm::{LlmClient, LlmMessage, LlmRequest, LlmRole};
 use brain_metadata::llm_cache::{LlmResponse as CachedResponse, LLM_RESPONSES_TABLE};
-use brain_metadata::{hype_vector_put, LlmCacheDb, MetadataDb};
+use brain_metadata::{
+    hype_neighborhood_hash_get, hype_neighborhood_hash_put, hype_vector_put,
+    hype_vectors_delete_memory, LlmCacheDb, MetadataDb,
+};
 use parking_lot::{Mutex, RwLock};
 
 /// Cache namespace for HyPE generations — ASCII "HYPE". Distinct from
@@ -92,12 +95,28 @@ impl HypeGenerator {
     /// embed error, redb error) is logged and yields a zero outcome
     /// rather than failing the surrounding extraction cycle — HyPE is a
     /// recall enhancement, never a correctness dependency.
-    pub async fn generate_for(&self, memory_id: MemoryId, text: &str) -> HypeGenOutcome {
+    ///
+    /// `neighborhood` is a terse rendering of the typed-graph facts already
+    /// known about the entities this memory mentions (their statements and
+    /// relation edges). It is empty for the first memory about a subject and
+    /// fills in as the graph grows. Feeding it to the generator lets the LLM
+    /// write *bridge* questions that span more than this one memory — e.g.
+    /// "Where did Niraj's manager work before?" when the neighborhood already
+    /// records the manager and their prior employer. Those bridge questions
+    /// are embedded into the same HyPE pool the read path probes, so a
+    /// multi-hop query resolves to a single cheap ANN lookup with no read-side
+    /// LLM call.
+    pub async fn generate_for(
+        &self,
+        memory_id: MemoryId,
+        text: &str,
+        neighborhood: &str,
+    ) -> HypeGenOutcome {
         if text.trim().is_empty() {
             return HypeGenOutcome::default();
         }
 
-        let (questions, cost_micro) = match self.questions_for(text).await {
+        let (questions, cost_micro) = match self.questions_for(text, neighborhood).await {
             Ok(qs) => qs,
             Err(e) => {
                 tracing::warn!(
@@ -142,8 +161,11 @@ impl HypeGenerator {
 
         // Persist first (durable source of truth), then publish to the
         // live index. A crash between the two is harmless: boot rebuilds
-        // the index from the persisted rows.
-        match self.persist(memory_id, &vectors) {
+        // the index from the persisted rows. `replace=false`: this is the
+        // first generation for the memory, so there are no prior rows to
+        // clear and the points are appended to the live index.
+        let nbhd_hash = input_hash(text, neighborhood);
+        match self.persist(memory_id, &vectors, nbhd_hash, false) {
             Ok(()) => {}
             Err(e) => {
                 tracing::warn!(
@@ -171,16 +193,123 @@ impl HypeGenerator {
         }
     }
 
-    /// Persist all question vectors for a memory in one write transaction.
-    fn persist(&self, memory_id: MemoryId, vectors: &[[f32; 384]]) -> Result<(), String> {
+    /// Regenerate a memory's HyPE questions when its typed-graph neighborhood
+    /// has grown since they were last generated — the Phase-3 refresh path.
+    ///
+    /// The bridge questions a multi-hop read needs ("Where did Niraj's manager
+    /// work before?") can only be written once the connecting facts exist, but
+    /// extraction is incremental: a memory is first HyPE'd against whatever
+    /// graph existed at encode time, which may be empty. This recomputes the
+    /// `(text, neighborhood)` hash and, **only if it differs** from the stored
+    /// one, regenerates: the LLM is called (cache-keyed on the new pair, so a
+    /// genuinely-changed neighborhood misses), the new vectors **replace** the
+    /// old rows (delete-then-put) and the live index points are swapped via
+    /// [`HypeHnswIndex::refresh_memory`]. A matching hash is a cheap no-op (one
+    /// redb point read, no LLM). Best-effort, like [`Self::generate_for`].
+    pub async fn refresh_for(
+        &self,
+        memory_id: MemoryId,
+        text: &str,
+        neighborhood: &str,
+    ) -> HypeGenOutcome {
+        if text.trim().is_empty() || neighborhood.trim().is_empty() {
+            return HypeGenOutcome::default();
+        }
+        let nbhd_hash = input_hash(text, neighborhood);
+
+        // Gate: skip unless the neighborhood actually changed. The stored hash
+        // is the one that produced the memory's current questions. On a read
+        // error we fall through and regenerate — correctness over a saved call.
+        if let Ok(rtxn) = self.metadata.read_txn() {
+            if hype_neighborhood_hash_get(&rtxn, memory_id).ok().flatten() == Some(nbhd_hash) {
+                return HypeGenOutcome::default();
+            }
+        }
+
+        let (questions, cost_micro) = match self.questions_for(text, neighborhood).await {
+            Ok(qs) => qs,
+            Err(e) => {
+                tracing::warn!(
+                    target: "brain_workers::hype",
+                    memory_id = ?memory_id,
+                    error = %e,
+                    "HyPE refresh generation failed; keeping prior questions",
+                );
+                return HypeGenOutcome::default();
+            }
+        };
+        if questions.is_empty() {
+            return HypeGenOutcome {
+                questions_written: 0,
+                cost_micro_usd: cost_micro,
+            };
+        }
+
+        let mut vectors: Vec<[f32; 384]> = Vec::with_capacity(questions.len());
+        for q in &questions {
+            if let Ok(v) = self.embedder.embed_query(q) {
+                vectors.push(v);
+            }
+        }
+        if vectors.is_empty() {
+            return HypeGenOutcome {
+                questions_written: 0,
+                cost_micro_usd: cost_micro,
+            };
+        }
+
+        // Replace prior rows (delete-then-put) and advance the stored hash in
+        // one txn, then swap the live index points.
+        match self.persist(memory_id, &vectors, nbhd_hash, true) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(
+                    target: "brain_workers::hype",
+                    memory_id = ?memory_id,
+                    error = %e,
+                    "HyPE refresh persist failed; not reindexing",
+                );
+                return HypeGenOutcome {
+                    questions_written: 0,
+                    cost_micro_usd: cost_micro,
+                };
+            }
+        }
+        self.index.write().refresh_memory(memory_id, &vectors);
+
+        HypeGenOutcome {
+            questions_written: vectors.len(),
+            cost_micro_usd: cost_micro,
+        }
+    }
+
+    /// Persist all question vectors for a memory in one write transaction,
+    /// recording the `(text, neighborhood)` hash that produced them so the
+    /// refresh worker can detect a later neighborhood change. When `replace`
+    /// is set, every prior question row for the memory is deleted first, so a
+    /// regeneration that yields fewer questions leaves no orphan rows.
+    fn persist(
+        &self,
+        memory_id: MemoryId,
+        vectors: &[[f32; 384]],
+        neighborhood_hash: [u8; 32],
+        replace: bool,
+    ) -> Result<(), String> {
         let wtxn = self
             .metadata
             .write_txn()
             .map_err(|e| format!("hype write_txn: {e}"))?;
+        if replace {
+            hype_vectors_delete_memory(&wtxn, memory_id)
+                .map_err(|e| format!("hype_vectors_delete_memory: {e}"))?;
+        }
         for (i, v) in vectors.iter().enumerate() {
             let idx = u8::try_from(i).map_err(|_| "hype question index overflow".to_string())?;
-            hype_vector_put(&wtxn, memory_id, idx, v).map_err(|e| format!("hype_vector_put: {e}"))?;
+            hype_vector_put(&wtxn, memory_id, idx, v)
+                .map_err(|e| format!("hype_vector_put: {e}"))?;
         }
+        hype_neighborhood_hash_put(&wtxn, memory_id, neighborhood_hash)
+            .map_err(|e| format!("hype_neighborhood_hash_put: {e}"))?;
         wtxn.commit().map_err(|e| format!("hype commit: {e}"))?;
         Ok(())
     }
@@ -188,8 +317,15 @@ impl HypeGenerator {
     /// Return the generated questions and the LLM cost (0 on a cache
     /// hit). Reads the shared LLM cache first; on a miss it calls the
     /// model and writes the reply back.
-    async fn questions_for(&self, text: &str) -> Result<(Vec<String>, u64), String> {
-        let input_hash: [u8; 32] = *blake3::hash(text.as_bytes()).as_bytes();
+    async fn questions_for(
+        &self,
+        text: &str,
+        neighborhood: &str,
+    ) -> Result<(Vec<String>, u64), String> {
+        // The cache key folds in the neighborhood: the same memory text with a
+        // richer graph around it should regenerate (different bridge
+        // questions), so a neighborhood change must miss the cache.
+        let input_hash = input_hash(text, neighborhood);
         let model_id_hash = self.client.model_id_hash();
 
         if let Some(blob) = self.cache_get(input_hash, model_id_hash) {
@@ -202,7 +338,7 @@ impl HypeGenerator {
             system_blocks: vec![SystemBlock::cached(Self::system_prompt())],
             messages: vec![LlmMessage {
                 role: LlmRole::User,
-                content: Self::user_prompt(text, self.num_questions),
+                content: Self::user_prompt(text, neighborhood, self.num_questions),
             }],
             response_schema: None,
             temperature: 0.3,
@@ -242,8 +378,24 @@ line must end with a question mark."
             .to_owned()
     }
 
-    fn user_prompt(text: &str, n: usize) -> String {
-        format!("Write {n} diverse questions that the following text answers.\n\nText:\n{text}")
+    fn user_prompt(text: &str, neighborhood: &str, n: usize) -> String {
+        if neighborhood.trim().is_empty() {
+            return format!(
+                "Write {n} diverse questions that the following text answers.\n\nText:\n{text}"
+            );
+        }
+        // With a neighborhood present, ask for a mix: questions the text answers
+        // directly, PLUS bridge questions that chain the text through the
+        // connected facts (so a later multi-hop query lands on a stored
+        // question). The connected facts are context only — every question must
+        // still be answerable from the text together with those facts.
+        format!(
+            "Write {n} diverse questions answerable from the text below. Include both \
+direct questions the text answers on its own AND bridge questions that combine \
+the text with one or more of the connected facts to follow a chain (for example, \
+asking about an attribute of a person the text links to). Resolve names fully; \
+do not use pronouns.\n\nText:\n{text}\n\nConnected facts:\n{neighborhood}"
+        )
     }
 
     fn cache_get(&self, input_hash: [u8; 32], model_id_hash: u64) -> Option<Vec<u8>> {
@@ -312,6 +464,18 @@ fn parse_questions(raw: &str, num_questions: usize) -> Vec<String> {
         }
     }
     out
+}
+
+/// Hash of the `(text, neighborhood)` pair. Used both as the LLM-cache key
+/// (a changed neighborhood must miss the cache and regenerate) and as the
+/// stored neighborhood-gate hash the refresh worker compares against. A `0x00`
+/// separator keeps `(text, nbhd)` and `(text+nbhd, "")` from colliding.
+fn input_hash(text: &str, neighborhood: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(text.as_bytes());
+    hasher.update(&[0x00]);
+    hasher.update(neighborhood.as_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 fn now_unix_nanos() -> u64 {

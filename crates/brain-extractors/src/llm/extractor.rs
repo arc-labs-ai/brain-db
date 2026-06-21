@@ -38,8 +38,8 @@ use super::cache::{cache_get, cache_put};
 use super::pricing::{estimate_cost, CostBudget, Pricing};
 use super::validation::validate_against;
 use crate::framework::extractor::{
-    ExtractionContext, ExtractionFuture, ExtractionResult, ExtractionStatus, Extractor,
-    ExtractorContext, NeighborMemory,
+    ExtractionContext, ExtractionFailureClass, ExtractionFuture, ExtractionResult, ExtractionStatus,
+    Extractor, ExtractorContext, NeighborMemory,
 };
 use crate::framework::item::{EntityMention, ExtractedItem, RelationMention, StatementMention};
 use crate::idempotency::hash_memory_text;
@@ -220,6 +220,7 @@ impl LlmExtractor {
         prior_entities: &[&EntityMention],
         extractor_context: Option<&ExtractorContext>,
         declared_predicates: Option<&str>,
+        declared_kinds: Option<&str>,
         now_unix_nanos: u64,
     ) -> (LlmRequest, BuildRequestStats) {
         // Fill the active-schema predicate block once, before the
@@ -229,7 +230,8 @@ impl LlmExtractor {
         // left unchanged; an unfilled placeholder renders empty.
         let prompt = inner
             .prompt
-            .replace("{DECLARED_PREDICATES}", declared_predicates.unwrap_or(""));
+            .replace("{DECLARED_PREDICATES}", declared_predicates.unwrap_or(""))
+            .replace("{DECLARED_KINDS}", declared_kinds.unwrap_or(""));
         let (user_body, stats) = render_prompt_with_context(
             &prompt,
             memory_text,
@@ -903,14 +905,35 @@ pub(super) fn find_unfilled_placeholder(s: &str) -> Option<String> {
 }
 
 fn kind_to_byte(k: StatementKindAst) -> u8 {
+    // Wire convention is the `brain_core` kind byte + 1.
     match k {
         StatementKindAst::Fact => 1,
         StatementKindAst::Preference => 2,
         StatementKindAst::Event => 3,
+        StatementKindAst::Attribute => 4,
+        StatementKindAst::Relation => 5,
+        StatementKindAst::Directive => 6,
         // `Any` only appears in query AST; extractors targeting
         // `Any` default to Fact (1).
         StatementKindAst::Any => 1,
     }
+}
+
+/// Map a kind NAME emitted by the LLM (case-insensitive, trimmed) to the
+/// `StatementMention` wire byte (`brain_core` kind byte + 1). Any unknown
+/// name falls back to `Fact` (1), the catch-all kind.
+fn kind_from_name(s: &str) -> u8 {
+    use brain_core::StatementKind;
+    let core = match s.trim().to_ascii_lowercase().as_str() {
+        "attribute" => StatementKind::Attribute,
+        "relation" => StatementKind::Relation,
+        "preference" => StatementKind::Preference,
+        "event" => StatementKind::Event,
+        "directive" => StatementKind::Directive,
+        "fact" => StatementKind::Fact,
+        _ => StatementKind::Fact,
+    };
+    core.as_u8() + 1
 }
 
 fn read_str(v: &Value, key: &str) -> Option<String> {
@@ -922,6 +945,40 @@ fn read_conf(v: &Value) -> f32 {
         .and_then(Value::as_f64)
         .map(|f| f as f32)
         .unwrap_or(1.0)
+}
+
+/// Whether the LLM marked the statement's object as a referenced entity (vs a
+/// literal value). Default false → the apply pass keeps it a text value unless
+/// it was already surfaced as an entity or the predicate constrains it.
+fn read_object_is_entity(v: &Value) -> bool {
+    v.get("object_is_entity")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether the LLM marked this statement's subject as the writing agent
+/// itself (first person, in any language). The model judges this from
+/// meaning — there is no pronoun list anywhere — so it is language-neutral.
+fn read_subject_is_self(v: &Value) -> bool {
+    v.get("subject_is_self")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether the LLM marked this statement as a RETRACTION of a prior fact
+/// ("not at Google anymore"). The model judges negation from meaning — no
+/// keyword list — and the apply pass tombstones the matching current
+/// statement(s) instead of creating a new row. Default false = a normal
+/// positive assertion.
+fn read_retract(v: &Value) -> bool {
+    v.get("retract").and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// The event time the LLM emits as an ISO date (`"event_at": "2020-01-01"`)
+/// for Event-kind statements — resolved to unix-nanos here (models are
+/// reliable at dates, not raw epoch-nanos). `None` when absent/unparseable.
+fn read_event_at(v: &Value) -> Option<u64> {
+    read_str(v, "event_at").and_then(|s| crate::pattern::temporal::parse_event_date(&s))
 }
 
 fn project_entity(
@@ -970,6 +1027,10 @@ fn project_statement(
         extractor_version,
         is_stateful,
         subject_is_memory: false,
+        object_is_entity: read_object_is_entity(v),
+        event_at_unix_nanos: read_event_at(v),
+        subject_is_self: read_subject_is_self(v),
+        retract: read_retract(v),
     }))
 }
 
@@ -988,8 +1049,13 @@ fn project_statement_open(
         .get("is_stateful")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // The LLM may classify the statement via an optional `"kind"` name;
+    // absent or unknown falls back to Fact (the catch-all).
+    let kind = read_str(v, "kind")
+        .map(|s| kind_from_name(&s))
+        .unwrap_or_else(|| brain_core::StatementKind::Fact.as_u8() + 1);
     Some(ExtractedItem::StatementMention(StatementMention {
-        kind: 1, // Fact by default; predicate registry's declared kind wins downstream.
+        kind,
         subject_text: read_str(v, "subject"),
         predicate_qname: predicate,
         object_text: read_str(v, "object"),
@@ -998,6 +1064,10 @@ fn project_statement_open(
         extractor_version,
         is_stateful,
         subject_is_memory: false,
+        object_is_entity: read_object_is_entity(v),
+        event_at_unix_nanos: read_event_at(v),
+        subject_is_self: read_subject_is_self(v),
+        retract: read_retract(v),
     }))
 }
 
@@ -1058,6 +1128,25 @@ impl Extractor for LlmExtractor {
 
     fn is_wired(&self) -> bool {
         self.inner.is_some()
+    }
+
+    /// Run the whole micro-batch's LLM calls CONCURRENTLY rather than the
+    /// default serial loop. Each memory's `run` is an independent network
+    /// round-trip (build prompt → `client.complete().await` → cache →
+    /// project), so overlapping them on the executor lane turns an
+    /// N×round-trip drain into ~1×. Output stays input-aligned
+    /// (`join_all` preserves order). Cost-budget overshoot is bounded by
+    /// the micro-batch size (all calls in a batch launch before any
+    /// completes); the cross-cycle budget gate still stops the next batch.
+    fn run_batch<'a>(
+        &'a self,
+        ctx: &'a ExtractionContext<'a>,
+        mems: &'a [Memory],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<ExtractionResult>> + Send + 'a>> {
+        Box::pin(async move {
+            let futs: Vec<_> = mems.iter().map(|m| self.run(ctx, m)).collect();
+            futures_util::future::join_all(futs).await
+        })
     }
 
     fn run<'a>(&'a self, ctx: &'a ExtractionContext<'a>, mem: &'a Memory) -> ExtractionFuture<'a> {
@@ -1124,6 +1213,7 @@ impl Extractor for LlmExtractor {
                 &prior_entities,
                 extractor_context,
                 ctx.declared_predicates,
+                ctx.declared_kinds,
                 started,
             );
             if let Some(budget) = self.cost_budget {
@@ -1151,7 +1241,8 @@ impl Extractor for LlmExtractor {
             let resp1 = match inner.client.complete(request.clone()).await {
                 Ok(r) => r,
                 Err(e) => {
-                    return ExtractionResult::failure(llm_error_reason(&e), started, started);
+                    return ExtractionResult::failure(llm_error_reason(&e), started, started)
+                        .with_failure_class(extraction_failure_class(&e));
                 }
             };
             cost_micro = cost_micro.saturating_add(resp1.cost_micro_usd);
@@ -1184,18 +1275,24 @@ impl Extractor for LlmExtractor {
                                     llm_error_reason(&e),
                                     started,
                                     started,
-                                );
+                                )
+                                .with_failure_class(extraction_failure_class(&e));
                             }
                         };
                         cost_micro = cost_micro.saturating_add(resp2.cost_micro_usd);
                         match validate_against(schema, &resp2.content) {
                             Ok(v) => v,
                             Err(_) => {
+                                // Two valid round-trips that both failed schema
+                                // validation is a prompt/schema mismatch, not a
+                                // provider blip — retrying the same prompt won't
+                                // help, so it's permanent (terminal, no retry loop).
                                 return ExtractionResult::failure(
                                     "schema validation failed twice",
                                     started,
                                     started,
-                                );
+                                )
+                                .with_failure_class(ExtractionFailureClass::Permanent);
                             }
                         }
                     }
@@ -1245,6 +1342,18 @@ fn llm_error_reason(e: &LlmError) -> String {
         format!("rate limited: retry after {retry_after} ms")
     } else {
         e.to_string()
+    }
+}
+
+/// Map a transport-layer [`LlmError`] onto the tier-agnostic
+/// [`ExtractionFailureClass`] the worker uses to decide a failed memory's
+/// fate. A transient provider fault keeps the memory queued for a backoff
+/// retry; a permanent one (bad key, no balance, malformed request) is
+/// terminal so it surfaces to the operator instead of looping.
+fn extraction_failure_class(e: &LlmError) -> ExtractionFailureClass {
+    match e.failure_class() {
+        brain_llm::FailureClass::Transient => ExtractionFailureClass::Transient,
+        brain_llm::FailureClass::Permanent => ExtractionFailureClass::Permanent,
     }
 }
 

@@ -745,7 +745,6 @@ fn enforce_agent_filter(caller: &RequestCaller, req: &RequestBody) -> Result<(),
 mod tests {
     use super::*;
     use brain_protocol::EncodeRequest;
-    use brain_protocol::MemoryKindWire;
     use brain_protocol::{RecallRequest, SchemaGetRequest, SchemaListRequest};
 
     fn agent(byte: u8) -> AgentId {
@@ -766,12 +765,8 @@ mod tests {
         RequestBody::Encode(EncodeRequest {
             text: "hi".into(),
             context_id: 0,
-            kind: MemoryKindWire::Episodic,
-            salience_hint: 0.5,
-            edges: Vec::new(),
             request_id: [0u8; 16],
             txn_id: None,
-            deduplicate: false,
             occurred_at_unix_nanos: None,
         })
     }
@@ -858,7 +853,8 @@ mod tests {
     fn recall_with(agent_filter: Vec<[u8; 16]>, include_other_agents: bool) -> RequestBody {
         RequestBody::Recall(RecallRequest {
             cue_text: "x".into(),
-            top_k: 5,
+            subject_name: String::new(),
+            max_results: 5,
             confidence_threshold: 0.0,
             context_filter: None,
             age_bound_unix_nanos: None,

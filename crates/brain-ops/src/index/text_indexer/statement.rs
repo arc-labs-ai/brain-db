@@ -365,6 +365,67 @@ pub fn upsert_op_from_statement(
     })
 }
 
+/// Read a freshly-committed statement back from `metadata` and enqueue
+/// its text-index upsert. Shared by the wire `STATEMENT_CREATE` handler
+/// and the extractor apply path so both keep `statements.tantivy/` in
+/// sync — neither builds the op inline.
+///
+/// The statement is re-read (not passed in) because callers only hold
+/// the `StatementId` post-commit, and dispatching must happen *after*
+/// the write txn commits (a rolled-back txn must never index a phantom
+/// row). A vanished statement or missing metadata is logged and skipped
+/// — text indexing is best-effort and never blocks the durable write.
+pub async fn dispatch_statement_text_upsert(
+    metadata: &brain_metadata::MetadataDb,
+    dispatcher: &StatementTextDispatcher,
+    id: StatementId,
+) {
+    let upsert_op = {
+        let rtxn = match metadata.read_txn() {
+            Ok(r) => r,
+            Err(err) => {
+                warn!(
+                    target: "brain_ops::text_indexer",
+                    error = %err,
+                    "statement text indexer dispatch: read_txn failed",
+                );
+                return;
+            }
+        };
+        let statement = match brain_metadata::statement::statement_get(&rtxn, id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                warn!(
+                    target: "brain_ops::text_indexer",
+                    ?id,
+                    "statement vanished between commit and indexer dispatch",
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    target: "brain_ops::text_indexer",
+                    error = %err,
+                    "statement_get during text-indexer dispatch failed",
+                );
+                return;
+            }
+        };
+        drop(rtxn);
+        upsert_op_from_statement(&statement, metadata)
+    };
+
+    if let Some(op) = upsert_op {
+        dispatcher.dispatch(op).await;
+    } else {
+        tracing::debug!(
+            target: "brain_ops::text_indexer",
+            ?id,
+            "statement text indexer skip — Pending subject or missing metadata",
+        );
+    }
+}
+
 /// Project a `StatementObject` to the text representation indexed
 /// in `statements.tantivy/`:
 ///

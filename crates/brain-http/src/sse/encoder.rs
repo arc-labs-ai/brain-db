@@ -61,7 +61,7 @@ pub fn encode(event: &SseEvent) -> Bytes {
     if let Some(retry) = event.retry {
         buf.put_slice(b"retry: ");
         let mut tmp = String::with_capacity(20);
-        write!(&mut tmp, "{}", retry.as_millis()).expect("write to String");
+        write!(&mut tmp, "{}", retry.as_millis()).expect("invariant: write to String is infallible");
         buf.put_slice(tmp.as_bytes());
         buf.put_slice(NEWLINE);
     }

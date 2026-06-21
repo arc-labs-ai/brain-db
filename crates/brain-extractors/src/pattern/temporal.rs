@@ -274,6 +274,14 @@ fn mention(ts: u64) -> ExtractedItem {
         extractor_version: TEMPORAL_EXTRACTOR_VERSION,
         is_stateful: false,
         subject_is_memory: true,
+        // The object IS the time; carry it as the resolved event time too so
+        // the apply pass plumbs `event_at` directly.
+        object_is_entity: false,
+        event_at_unix_nanos: Some(ts),
+        // Subject is the source memory, not the agent.
+        subject_is_self: false,
+        // A temporal occurrence is an assertion, never a retraction.
+        retract: false,
     })
 }
 
@@ -304,6 +312,15 @@ fn parse_year(s: &str) -> Option<u64> {
     let y: i32 = s.parse().ok()?;
     let date = Date::from_calendar_date(y, Month::January, 1).ok()?;
     date_to_unix_nanos(date)
+}
+
+/// Parse an event-date string to unix-nanos at midnight UTC. Accepts an ISO
+/// `YYYY-MM-DD` date or a bare `YYYY` year. Shared with the LLM tier, which
+/// asks the model for an ISO date (models are reliable at dates, not at raw
+/// epoch-nanos) and resolves it here. `None` on any unparseable input.
+pub(crate) fn parse_event_date(s: &str) -> Option<u64> {
+    let s = s.trim();
+    parse_iso(s).or_else(|| parse_year(s))
 }
 
 /// Shift `anchor` by `n` units (`n` may be negative). `week`/`day` use
@@ -416,6 +433,8 @@ mod tests {
     fn ctx(reg: &ExtractorRegistry) -> ExtractionContext<'_> {
         ExtractionContext {
             declared_predicates: None,
+            declared_kinds: None,
+            entity_type_labels: None,
             schema_version: 1,
             // A fixed, recognisable "now" so tests that fall through to
             // it are deterministic: 2024-06-01T00:00:00Z.

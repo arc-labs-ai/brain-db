@@ -812,13 +812,9 @@ mod tests {
         let body = RequestBody::Encode(brain_protocol::envelope::request::EncodeRequest {
             text: "hello".into(),
             context_id: 0,
-            kind: brain_protocol::envelope::request::MemoryKindWire::Episodic,
-            salience_hint: 0.5,
-            edges: Vec::new(),
             request_id: [0u8; 16],
             txn_id: None,
             occurred_at_unix_nanos: None,
-            deduplicate: false,
         });
         let frame = Frame::new(Opcode::EncodeReq.as_u16(), FLAG_EOS, 1, body.encode());
         let action = dispatch_frame(frame, &mut state, &topo);

@@ -53,8 +53,8 @@ pub use workers::access_boost::{
     boosted_salience, AccessBoostWorker, DEFAULT_BOOST_FACTOR, MAX_SALIENCE,
 };
 pub use workers::auto_edge::{
-    resolved_threshold, AutoEdgeKnobs, AutoEdgeWorker, AUTO_EDGE_THRESHOLD_ENV,
-    DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD, DEFAULT_EF_SEARCH, DEFAULT_TOP_K,
+    AutoEdgeKnobs, AutoEdgeWorker, DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD, DEFAULT_EF_SEARCH,
+    DEFAULT_TOP_K,
 };
 pub use workers::cache_evict::{
     CacheEvictionError, CacheEvictionSource, CacheEvictionWorker, DisabledCacheEvictionSource,
@@ -78,8 +78,8 @@ pub use workers::decay::{
 pub use workers::edge_scrub::EdgeScrubWorker;
 pub use workers::extractor::{
     ExtractorKnobs, ExtractorWorker, DEFAULT_EXTRACTOR_BATCH_SIZE,
-    DEFAULT_EXTRACTOR_DRAIN_PER_CYCLE, DEFAULT_EXTRACTOR_LLM_BUDGET_MICRO_USD,
-    DEFAULT_EXTRACTOR_SKIP_AUDITED, EXTRACTOR_BATCH_SIZE_ENV,
+    DEFAULT_EXTRACTOR_DRAIN_PER_CYCLE, DEFAULT_EXTRACTOR_HYPE_REFRESH_PER_CYCLE,
+    DEFAULT_EXTRACTOR_LLM_BUDGET_MICRO_USD, DEFAULT_EXTRACTOR_SKIP_AUDITED,
 };
 pub use workers::hnsw_maint::{
     decide_action, Action, DisabledRebuildSource, HnswMaintenanceWorker, IndexStats, RebuildSource,
@@ -96,9 +96,8 @@ pub use workers::snapshot::{
 pub use workers::statement_embed::{StatementEmbedKnobs, StatementEmbedWorker};
 pub use workers::statistics::{StatisticsUpdateWorker, Stats};
 pub use workers::temporal_edge::{
-    resolved_topical_threshold, TemporalEdgeKnobs, TemporalEdgeWorker, DEFAULT_CROSS_CONTEXT,
+    TemporalEdgeKnobs, TemporalEdgeWorker, DEFAULT_CROSS_CONTEXT,
     DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD, DEFAULT_WEIGHT_MIN, DEFAULT_WINDOW_SECONDS,
-    TEMPORAL_EDGE_TOPICAL_THRESHOLD_ENV,
 };
 pub use workers::wal_retention::{
     decide_deletions, CheckpointDesc, CheckpointFuture, DeleteFuture, DisabledWalRetentionSource,

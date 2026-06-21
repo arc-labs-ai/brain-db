@@ -77,7 +77,7 @@ endpoint      = ""
 service_name  = "brain-server"
 
 [workers]
-# Spec §11 defaults. Each value is seconds; 0 disables the worker.
+# Background worker cadence defaults. Each value is seconds; 0 disables the worker.
 # Most operators never touch these.
 decay_interval_sec                 = 3600
 consolidation_interval_sec         = 600

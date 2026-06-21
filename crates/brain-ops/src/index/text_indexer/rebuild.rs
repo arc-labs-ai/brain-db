@@ -335,19 +335,7 @@ fn iterate_statements(
 
         let object_text = object_text_from_blob(&stmt.object_blob, &entities);
 
-        let kind = match stmt.kind {
-            0 => StatementKind::Fact,
-            1 => StatementKind::Preference,
-            2 => StatementKind::Event,
-            other => {
-                tracing::warn!(
-                    target: "brain_ops::text_indexer::rebuild",
-                    kind = other,
-                    "unknown statement kind during rebuild; skipping",
-                );
-                continue;
-            }
-        };
+        let kind = StatementKind::from_u8(stmt.kind);
 
         let mut doc = TantivyDocument::default();
         doc.add_bytes(statement_id_field, &stmt.statement_id_bytes);

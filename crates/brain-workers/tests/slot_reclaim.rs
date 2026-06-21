@@ -16,9 +16,7 @@ use brain_metadata::MetadataDb;
 use brain_ops::test_support::single_body;
 use brain_ops::{dispatch, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::envelope::request::{
-    EncodeRequest, ForgetMode, ForgetRequest, MemoryKindWire, RequestBody,
-};
+use brain_protocol::envelope::request::{EncodeRequest, ForgetMode, ForgetRequest, RequestBody};
 use brain_protocol::envelope::response::ResponseBody;
 use brain_workers::{
     SlotReclamationWorker, Worker, WorkerConfig, WorkerContext, WorkerKind, WorkerScheduler,
@@ -328,12 +326,8 @@ fn forget_stamps_tombstoned_at_unix_nanos() {
         let encode = EncodeRequest {
             text: "doomed".into(),
             context_id: 1,
-            kind: MemoryKindWire::Episodic,
-            salience_hint: 0.5,
-            edges: vec![],
             request_id: [1; 16],
             txn_id: None,
-            deduplicate: false,
             occurred_at_unix_nanos: None,
         };
         let memory_id = match single_body(
@@ -377,12 +371,8 @@ fn forget_replay_does_not_overwrite_stamp() {
         let encode = EncodeRequest {
             text: "doomed-twice".into(),
             context_id: 1,
-            kind: MemoryKindWire::Episodic,
-            salience_hint: 0.5,
-            edges: vec![],
             request_id: [10; 16],
             txn_id: None,
-            deduplicate: false,
             occurred_at_unix_nanos: None,
         };
         let memory_id = match single_body(

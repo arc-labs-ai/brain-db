@@ -27,3 +27,17 @@ pub const HYPE_VECTOR_BYTES: usize = 384 * 4;
 /// question; several rows share a memory's 16-byte prefix.
 pub const HYPE_QUESTION_VECTORS_TABLE: TableDefinition<'static, [u8; 17], [u8; HYPE_VECTOR_BYTES]> =
     TableDefinition::new("hype_question_vectors");
+
+/// `MemoryId.to_be_bytes()` (16 bytes) → the blake3 hash of the
+/// `(text, neighborhood)` pair that produced this memory's current HyPE
+/// questions. The write-time refresh worker reads it to decide whether a
+/// memory needs re-generation: when a memory's typed-graph neighborhood
+/// grows (a later memory adds an edge to one of its entities), the recomputed
+/// hash diverges from the stored one and the worker regenerates the
+/// questions — the bridge questions a multi-hop read needs only become
+/// writable once the connecting facts exist. A matching hash means the
+/// neighborhood is unchanged since the last generation, so the memory is
+/// skipped (no LLM call). Absent row ⇒ never generated under the graph-aware
+/// path ⇒ eligible.
+pub const HYPE_NEIGHBORHOOD_HASH_TABLE: TableDefinition<'static, [u8; 16], [u8; 32]> =
+    TableDefinition::new("hype_neighborhood_hash");

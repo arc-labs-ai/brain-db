@@ -19,7 +19,7 @@ use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
-use brain_protocol::envelope::request::{EncodeRequest, MemoryKindWire, RequestBody};
+use brain_protocol::envelope::request::{EncodeRequest, RequestBody};
 use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
 use redb::ReadableTable;
@@ -169,13 +169,9 @@ async fn encode_drives_pattern_extractor_and_writes_mention_edge() {
     let req = EncodeRequest {
         text: text.clone(),
         context_id: 1,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: vec![],
         request_id: *Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
-        deduplicate: false,
     };
     let (opcode, body) = round_trip(&mut client, 1, RequestBody::Encode(req)).await;
     let memory_id = match body {

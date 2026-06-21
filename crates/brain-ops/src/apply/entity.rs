@@ -59,6 +59,16 @@ pub fn apply_upsert_entity(
         .ok_or(ApplyError::PhaseMisShape("expected UpsertEntity"))?;
     let id = e.id;
     entity_put(wtxn, &e).map_err(|err| ApplyError::Metadata(format!("entity_put: {err}")))?;
+    // Write-path trace: which entity (canonical name) was minted/updated.
+    // Subject resolution at read time keys on this canonical name, so a read
+    // miss often traces back to a name that was never written this way.
+    tracing::debug!(
+        target: "brain_ops::write_trace",
+        ?id,
+        canonical = %e.canonical_name,
+        type_id = ?e.entity_type,
+        "write: entity upserted"
+    );
     Ok(PhaseAck::UpsertedEntity(id))
 }
 

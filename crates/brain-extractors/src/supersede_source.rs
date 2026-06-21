@@ -58,7 +58,9 @@ impl StatementSimilaritySource for StatementHnswSource {
         if query_vector.len() != DIM {
             return Ok(Vec::new());
         }
-        let arr: &[f32; DIM] = query_vector.try_into().expect("dim equality just checked");
+        let arr: &[f32; DIM] = query_vector
+            .try_into()
+            .expect("invariant: query_vector.len() == DIM, length-checked above");
 
         // Hold the read lock only for the duration of the HNSW search
         // — re-locking per-candidate would let writers slip in

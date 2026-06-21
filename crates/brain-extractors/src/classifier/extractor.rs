@@ -93,11 +93,13 @@ impl ClassifierExtractor {
     /// Build the (`simple_labels`, `qname_by_simple`) pair the classifier
     /// path uses to feed GLiNER plain labels and then remap them back
     /// to qnames on the way out. Pulled out of `run` so the batched
-    /// path can share it without copy-paste.
-    fn resolve_labels(&self) -> (Vec<String>, HashMap<String, String>) {
+    /// path can share it without copy-paste. `labels` is the effective
+    /// label set for this dispatch — the per-cycle schema snapshot when the
+    /// worker supplies one, else the set baked in at construction.
+    fn resolve_labels(&self, labels: &[String]) -> (Vec<String>, HashMap<String, String>) {
         let mut seen = std::collections::HashSet::new();
         let mut collision = false;
-        for q in self.target_labels.iter() {
+        for q in labels.iter() {
             if !seen.insert(simple_label(q.as_str())) {
                 collision = true;
                 break;
@@ -108,31 +110,31 @@ impl ClassifierExtractor {
                 target: "brain_extractors::classifier",
                 "simple-label collision across namespaces; passing underscore-encoded qnames to GLiNER — accuracy degraded"
             );
-            let simples: Vec<String> = self
-                .target_labels
-                .iter()
-                .map(|q| q.replace(':', "_"))
-                .collect();
-            let map: HashMap<String, String> = self
-                .target_labels
+            let simples: Vec<String> = labels.iter().map(|q| q.replace(':', "_")).collect();
+            let map: HashMap<String, String> = labels
                 .iter()
                 .zip(simples.iter())
                 .map(|(q, s)| (s.clone(), q.clone()))
                 .collect();
             (simples, map)
         } else {
-            let simples: Vec<String> = self
-                .target_labels
+            let simples: Vec<String> = labels
                 .iter()
                 .map(|q| simple_label(q.as_str()).to_string())
                 .collect();
-            let map: HashMap<String, String> = self
-                .target_labels
+            let map: HashMap<String, String> = labels
                 .iter()
                 .map(|q| (simple_label(q.as_str()).to_string(), q.clone()))
                 .collect();
             (simples, map)
         }
+    }
+
+    /// The effective label set for a dispatch: the worker's per-cycle schema
+    /// snapshot (so a runtime `SCHEMA_UPLOAD`'s new entity types take effect on
+    /// the next batch) when present, else the labels baked in at construction.
+    fn effective_labels<'a>(&'a self, ctx: &'a ExtractionContext<'a>) -> &'a [String] {
+        ctx.entity_type_labels.unwrap_or(&self.target_labels)
     }
 
     /// Project a vector of GLiNER spans for one memory into the
@@ -206,63 +208,17 @@ impl ClassifierExtractor {
 }
 
 /// True for spans that name no real referent and must not become
-/// entities: personal/possessive pronouns, bare determiners, and
-/// single-character or non-alphabetic noise. Conservative — it only
-/// rejects an exact closed-class match (case-insensitive) or a span with
-/// no alphabetic character, so real names like "Ian" or "Al" pass.
+/// entities: a span with no alphabetic character (pure punctuation/digits),
+/// or a closed-class function word. The closed-class check is the shared
+/// `brain_core::is_non_referential_surface` backstop (one source of truth with
+/// the apply path). Conservative — exact whole-surface match — so real names
+/// like "Ian" or "Al" pass.
 fn is_non_referential_span(text: &str) -> bool {
     let t = text.trim();
-    if t.is_empty() {
-        return true;
-    }
     if !t.chars().any(|c| c.is_alphabetic()) {
         return true;
     }
-    const STOP: &[&str] = &[
-        "i",
-        "you",
-        "we",
-        "they",
-        "he",
-        "she",
-        "it",
-        "me",
-        "us",
-        "him",
-        "her",
-        "them",
-        "myself",
-        "yourself",
-        "himself",
-        "herself",
-        "itself",
-        "ourselves",
-        "yourselves",
-        "themselves",
-        "my",
-        "your",
-        "our",
-        "their",
-        "his",
-        "its",
-        "this",
-        "that",
-        "these",
-        "those",
-        "the",
-        "a",
-        "an",
-        "who",
-        "whom",
-        "whose",
-        "someone",
-        "something",
-        "anyone",
-        "everyone",
-        "nobody",
-    ];
-    let lower = t.to_lowercase();
-    STOP.contains(&lower.as_str())
+    brain_core::is_non_referential_surface(t)
 }
 
 /// Split a Person mention whose text is a conjunction of names
@@ -350,7 +306,8 @@ impl Extractor for ClassifierExtractor {
                 return ExtractionResult::skipped(ExtractionStatus::SkippedDisabled, reason, at);
             };
 
-            if self.target_labels.is_empty() {
+            let labels = self.effective_labels(ctx);
+            if labels.is_empty() {
                 return ExtractionResult::skipped(
                     ExtractionStatus::SkippedDisabled,
                     "no entity-type labels declared by the active schema",
@@ -358,7 +315,7 @@ impl Extractor for ClassifierExtractor {
                 );
             }
 
-            let (label_owned, qname_by_label) = self.resolve_labels();
+            let (label_owned, qname_by_label) = self.resolve_labels(labels);
             let label_refs: Vec<&str> = label_owned.iter().map(String::as_str).collect();
             let spans = match model.predict(text, &label_refs) {
                 Ok(s) => s,
@@ -415,7 +372,8 @@ impl Extractor for ClassifierExtractor {
                     })
                     .collect();
             };
-            if self.target_labels.is_empty() {
+            let labels = self.effective_labels(ctx);
+            if labels.is_empty() {
                 return mems
                     .iter()
                     .map(|_| {
@@ -428,7 +386,7 @@ impl Extractor for ClassifierExtractor {
                     .collect();
             }
 
-            let (label_owned, qname_by_label) = self.resolve_labels();
+            let (label_owned, qname_by_label) = self.resolve_labels(labels);
             let label_refs: Vec<&str> = label_owned.iter().map(String::as_str).collect();
 
             // Hold an owned String for each memory's text so the

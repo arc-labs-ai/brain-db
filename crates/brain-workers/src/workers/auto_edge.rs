@@ -102,7 +102,8 @@ pub const DEFAULT_TOP_K: usize = 5;
 /// turns popular memories into hub nodes that drown the graph
 /// retriever. We keep the floor at the near-duplicate boundary so an
 /// edge means "these say the same thing." Operators who want a looser
-/// topical clustering lower it via `BRAIN_AUTO_EDGE_THRESHOLD`.
+/// topical clustering lower it via `[workers.auto_edge]
+/// similarity_threshold` in the server config.
 pub const DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD: f32 = 0.85;
 pub const DEFAULT_EF_SEARCH: usize = 64;
 
@@ -116,56 +117,11 @@ pub const DEFAULT_EF_SEARCH: usize = 64;
 /// reachable; past that, more edges add cost without adding recall.
 pub const MAX_SIMILAR_TO_OUT_DEGREE: usize = 16;
 
-/// Environment variable for overriding [`DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD`].
-/// Accepts an `f32` in `[0.0, 1.0]`. Values outside the range or
-/// unparseable strings fall back to the default with a tracing warn —
-/// silently ignoring a misconfigured threshold would let auto-edge
-/// fire on everything (or nothing) for a whole deployment.
-pub const AUTO_EDGE_THRESHOLD_ENV: &str = "BRAIN_AUTO_EDGE_THRESHOLD";
-
-/// Resolve the threshold from the env var (if set + valid) or fall
-/// back to `default`. Lives outside [`AutoEdgeKnobs::default`] so
-/// callers wiring `AutoEdgeKnobs` programmatically (tests, server
-/// config) can pick the same precedence.
-#[must_use]
-pub fn resolved_threshold(default: f32) -> f32 {
-    resolved_threshold_from(std::env::var(AUTO_EDGE_THRESHOLD_ENV).ok(), default)
-}
-
-/// Pure parse step extracted from [`resolved_threshold`] so tests can
-/// exercise the value-validation logic without mutating process-wide
-/// env state (forbidden under the project's no-`unsafe` rule).
-#[must_use]
-pub fn resolved_threshold_from(raw: Option<String>, default: f32) -> f32 {
-    let Some(raw) = raw else {
-        return default;
-    };
-    match raw.parse::<f32>() {
-        Ok(v) if (0.0..=1.0).contains(&v) => v,
-        Ok(v) => {
-            tracing::warn!(
-                env = AUTO_EDGE_THRESHOLD_ENV,
-                value = v,
-                "auto-edge threshold out of [0.0, 1.0]; using default"
-            );
-            default
-        }
-        Err(e) => {
-            tracing::warn!(
-                env = AUTO_EDGE_THRESHOLD_ENV,
-                error = %e,
-                "auto-edge threshold not a valid f32; using default"
-            );
-            default
-        }
-    }
-}
-
 impl Default for AutoEdgeKnobs {
     fn default() -> Self {
         Self {
             top_k: DEFAULT_TOP_K,
-            similarity_threshold: resolved_threshold(DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD),
+            similarity_threshold: DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD,
             ef_search: Some(DEFAULT_EF_SEARCH),
         }
     }
@@ -532,36 +488,11 @@ fn hash_link_batch(pairs: &[(MemoryId, MemoryId, f32)]) -> [u8; 32] {
 mod tests {
     use super::*;
 
-    // We test the *parse step* (`resolved_threshold_from`) instead of
-    // the env-reading wrapper. Mutating process-wide env state would
-    // require `unsafe` (forbidden in this crate); the wrapper itself
-    // is two lines and exercised in integration tests via the
-    // configured worker.
-
     #[test]
-    fn auto_edge_threshold_default_when_none() {
-        assert!((resolved_threshold_from(None, 0.75) - 0.75).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn auto_edge_threshold_env_overrides_default() {
-        let v = resolved_threshold_from(Some("0.6".to_string()), 0.75);
-        assert!((v - 0.6).abs() < 1e-6);
-    }
-
-    #[test]
-    fn auto_edge_threshold_invalid_falls_back() {
-        let v = resolved_threshold_from(Some("not-a-number".to_string()), 0.75);
-        assert!((v - 0.75).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn auto_edge_threshold_out_of_range_falls_back() {
-        assert!(
-            (resolved_threshold_from(Some("1.5".to_string()), 0.75) - 0.75).abs() < f32::EPSILON
-        );
-        assert!(
-            (resolved_threshold_from(Some("-0.1".to_string()), 0.75) - 0.75).abs() < f32::EPSILON
-        );
+    fn default_knobs_match_constants() {
+        let k = AutoEdgeKnobs::default();
+        assert!((k.similarity_threshold - DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD).abs() < f32::EPSILON);
+        assert_eq!(k.top_k, DEFAULT_TOP_K);
+        assert_eq!(k.ef_search, Some(DEFAULT_EF_SEARCH));
     }
 }

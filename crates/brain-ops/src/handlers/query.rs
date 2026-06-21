@@ -320,14 +320,9 @@ fn wire_to_planner_request(
 }
 
 fn statement_kind_from_byte(b: u8) -> Result<StatementKind, OpError> {
-    match b {
-        0 => Ok(StatementKind::Fact),
-        1 => Ok(StatementKind::Preference),
-        2 => Ok(StatementKind::Event),
-        other => Err(OpError::InvalidRequest(format!(
-            "unknown StatementKind byte: {other}",
-        ))),
-    }
+    // 0-based kind byte (matches `StatementKind::as_u8`). Every byte is a
+    // valid kind now (builtin 0..=5, else Custom).
+    Ok(StatementKind::from_u8(b))
 }
 
 fn time_range_from_wire(w: TimeRangeWire) -> TimeRange {

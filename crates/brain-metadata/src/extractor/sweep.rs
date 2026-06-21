@@ -243,8 +243,20 @@ fn reclaim_one(wtxn: &WriteTransaction, row: &StatementMetadata) -> Result<(), S
     // by-subject-indexed (skip only pending), so remove for both.
     if row.subject_kind != 1 {
         let mut t = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
-        t.remove(&(row.subject_entity_bytes, row.kind, row.predicate_id, 0u8))?;
-        t.remove(&(row.subject_entity_bytes, row.kind, row.predicate_id, 1u8))?;
+        t.remove(&(
+            row.subject_entity_bytes,
+            row.kind,
+            row.predicate_id,
+            0u8,
+            id_bytes,
+        ))?;
+        t.remove(&(
+            row.subject_entity_bytes,
+            row.kind,
+            row.predicate_id,
+            1u8,
+            id_bytes,
+        ))?;
     }
 
     // 3. by_predicate.
@@ -643,16 +655,25 @@ mod reclaim_tests {
         // Primary gone.
         let prim = rtxn.open_table(STATEMENTS_TABLE).unwrap();
         assert!(prim.get(&s.id.to_bytes()).unwrap().is_none());
-        // by_subject (both bits) gone.
+        // by_subject (both bits) gone — range over each prefix is empty.
         let bys = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE).unwrap();
-        assert!(bys
-            .get(&(subj.to_bytes(), StatementKind::Fact.as_u8(), p.raw(), 0u8))
-            .unwrap()
-            .is_none());
-        assert!(bys
-            .get(&(subj.to_bytes(), StatementKind::Fact.as_u8(), p.raw(), 1u8))
-            .unwrap()
-            .is_none());
+        for bit in [0u8, 1u8] {
+            let lo = (
+                subj.to_bytes(),
+                StatementKind::Fact.as_u8(),
+                p.raw(),
+                bit,
+                [0u8; 16],
+            );
+            let hi = (
+                subj.to_bytes(),
+                StatementKind::Fact.as_u8(),
+                p.raw(),
+                bit,
+                [0xffu8; 16],
+            );
+            assert!(bys.range(lo..=hi).unwrap().next().is_none());
+        }
         // by_object_entity gone.
         let byo = rtxn.open_table(STATEMENTS_BY_OBJECT_ENTITY_TABLE).unwrap();
         assert!(byo

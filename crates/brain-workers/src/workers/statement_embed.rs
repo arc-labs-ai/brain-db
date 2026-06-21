@@ -47,10 +47,14 @@ use brain_core::StatementId;
 use brain_core::{Statement, StatementObject, StatementValue, SubjectRef};
 use brain_embed::Dispatcher;
 use brain_index::statement_hnsw::StatementHnswIndex;
+use brain_index::statement_question_hnsw::StatementQuestionHnswIndex;
 use brain_metadata::entity::ops::entity_get;
 use brain_metadata::schema::predicate::predicate_get;
 use brain_metadata::statement::{
     statement_embed_queue_peek, statement_embed_queue_remove_many, statement_get,
+};
+use brain_metadata::statement_question::ops::{
+    statement_question_has_vectors, statement_question_put,
 };
 use brain_metadata::MetadataDb;
 use brain_ops::StatementEmbedMetrics;
@@ -98,6 +102,13 @@ pub struct StatementEmbedWorker {
     statement_hnsw: Arc<RwLock<StatementHnswIndex>>,
     embedder: Arc<dyn Dispatcher>,
     metrics: Option<Arc<StatementEmbedMetrics>>,
+    /// Optional per-statement question-bridge index. When wired (the shard
+    /// constructs it only when the bridge capability is enabled), each
+    /// eligible statement also gets a few templated questions embedded into
+    /// this pool — the per-statement analogue of HyPE. `None` leaves the
+    /// worker doing exactly its original statement-embed work (zero extra
+    /// cost on the default path).
+    question_bridge: Option<Arc<RwLock<StatementQuestionHnswIndex>>>,
 }
 
 impl StatementEmbedWorker {
@@ -117,7 +128,20 @@ impl StatementEmbedWorker {
             statement_hnsw,
             embedder,
             metrics: None,
+            question_bridge: None,
         }
+    }
+
+    /// Wire the per-statement question-bridge index. When set, each tick also
+    /// generates + embeds templated questions for the eligible statements it
+    /// processes, idempotent on the statement's own stored question vectors.
+    #[must_use]
+    pub fn with_question_bridge(
+        mut self,
+        bridge: Arc<RwLock<StatementQuestionHnswIndex>>,
+    ) -> Self {
+        self.question_bridge = Some(bridge);
+        self
     }
 
     #[must_use]
@@ -298,6 +322,22 @@ impl StatementEmbedWorker {
                 .map_err(|e| WorkerError::Internal(format!("queue commit: {e}")))?;
         }
 
+        // 5. Per-statement question bridge (best-effort, only when wired).
+        //    Generates a few templated questions per eligible statement and
+        //    embeds them into the question-bridge pool, idempotent on the
+        //    statement's own stored question vectors. A failure here never
+        //    fails the tick — the bridge is read-time enrichment, not the
+        //    durable statement embed.
+        if self.question_bridge.is_some() {
+            if let Err(e) = self.embed_question_bridge(&pending, ctx) {
+                tracing::warn!(
+                    target: "brain_workers::statement_embed",
+                    error = %e,
+                    "question-bridge generation failed this tick; will retry on next ingest",
+                );
+            }
+        }
+
         if let Some(m) = &self.metrics {
             m.add_rows_embedded(embedded.len() as u64);
             m.add_rows_skipped((already_in_hnsw.len() + to_drop.len()) as u64);
@@ -305,6 +345,96 @@ impl StatementEmbedWorker {
         }
 
         Ok(embedded.len() + already_in_hnsw.len() + to_drop.len())
+    }
+
+    /// Generate + embed + persist templated questions for the eligible
+    /// statements in `pending`, skipping any that already own question
+    /// vectors. Inserts the vectors into the bridge HNSW and persists them to
+    /// the `statement_question_vectors` table so a restart rebuilds without
+    /// re-embedding.
+    fn embed_question_bridge(
+        &self,
+        pending: &[StatementId],
+        ctx: &WorkerContext,
+    ) -> Result<(), WorkerError> {
+        let Some(bridge) = self.question_bridge.as_ref() else {
+            return Ok(());
+        };
+
+        // Render questions for statements that lack them.
+        let mut to_generate: Vec<(StatementId, Vec<String>)> = Vec::new();
+        {
+            let rtxn = self
+                .metadata
+                .read_txn()
+                .map_err(|e| WorkerError::Internal(format!("read_txn: {e}")))?;
+            for &id in pending {
+                if ctx.is_shutdown() {
+                    break;
+                }
+                if statement_question_has_vectors(&rtxn, id)
+                    .map_err(|e| WorkerError::Internal(format!("has_question_vectors: {e}")))?
+                {
+                    continue;
+                }
+                let Some(statement) = statement_get(&rtxn, id)
+                    .map_err(|e| WorkerError::Internal(format!("statement_get: {e}")))?
+                else {
+                    continue;
+                };
+                if !is_eligible_for_embedding(&statement) {
+                    continue;
+                }
+                let questions = render_bridge_questions(&rtxn, &statement);
+                if !questions.is_empty() {
+                    to_generate.push((id, questions));
+                }
+            }
+        }
+        if to_generate.is_empty() {
+            return Ok(());
+        }
+
+        // Embed every question (one flat batch), then insert + persist per
+        // statement. `u8` index caps a statement at 256 questions; we generate
+        // a handful, so the cast is safe.
+        for (id, questions) in to_generate {
+            if ctx.is_shutdown() {
+                break;
+            }
+            let refs: Vec<&str> = questions.iter().map(String::as_str).collect();
+            let vectors = match self.embedder.embed_batch(&refs) {
+                Ok(v) if v.len() == refs.len() => v,
+                Ok(_) => continue,
+                Err(e) => {
+                    tracing::debug!(
+                        target: "brain_workers::statement_embed",
+                        statement_id = ?id,
+                        error = %e,
+                        "question-bridge embed failed for statement; skipping",
+                    );
+                    continue;
+                }
+            };
+            {
+                let mut idx = bridge.write();
+                for v in &vectors {
+                    idx.insert(id, v);
+                }
+            }
+            let wtxn = self
+                .metadata
+                .write_txn()
+                .map_err(|e| WorkerError::Internal(format!("write_txn: {e}")))?;
+            for (i, v) in vectors.iter().enumerate() {
+                let qi = u8::try_from(i).unwrap_or(u8::MAX);
+                statement_question_put(&wtxn, id, qi, v)
+                    .map_err(|e| WorkerError::Internal(format!("question_put: {e}")))?;
+            }
+            wtxn.commit()
+                .map_err(|e| WorkerError::Internal(format!("question commit: {e}")))?;
+        }
+        Ok(())
     }
 }
 
@@ -389,6 +519,37 @@ fn render_embed_text(rtxn: &redb::ReadTransaction, s: &Statement) -> Result<Stri
         "{} {} {}",
         subject_entity.canonical_name, predicate_text, object_text
     ))
+}
+
+/// Render a few templated questions whose answer is this statement —
+/// the zero-LLM per-statement question bridge. Each question embeds the
+/// FULL surface (subject name + predicate words), never a bare predicate
+/// name, so the embedding is discriminative and avoids the short-name
+/// cosine trap. Returns empty when the subject entity or predicate can't be
+/// resolved (the statement then simply contributes no bridge questions).
+fn render_bridge_questions(rtxn: &redb::ReadTransaction, s: &Statement) -> Vec<String> {
+    let SubjectRef::Entity(subject_id) = s.subject else {
+        return Vec::new();
+    };
+    let Some(subject) = entity_get(rtxn, subject_id).ok().flatten() else {
+        return Vec::new();
+    };
+    let Some(predicate) = predicate_get(rtxn, s.predicate).ok().flatten() else {
+        return Vec::new();
+    };
+    let subj = subject.canonical_name;
+    // Predicate names are snake/compound; render as spaced words so the
+    // question reads naturally ("works_at" → "works at").
+    let pred = predicate.name.replace(['_', '-'], " ");
+    let pred = pred.trim();
+    if subj.trim().is_empty() || pred.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        format!("what is {subj}'s {pred}?"),
+        format!("what {pred} does {subj} have?"),
+        format!("{subj} {pred}"),
+    ]
 }
 
 fn render_value(v: &StatementValue) -> String {

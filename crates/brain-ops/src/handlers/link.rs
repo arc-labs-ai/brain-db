@@ -1,7 +1,6 @@
 //! LINK / UNLINK handlers — submit Link / Unlink phases through the
 //! unified writer; in-TXN ops buffer for later commit.
 
-
 use brain_core::{EdgeKind, EdgeKindRef, MemoryId, NodeRef, RequestId};
 use brain_planner::{LinkOp, UnlinkOp, WriterError};
 use brain_protocol::envelope::request::{EdgeKindWire, LinkRequest, UnlinkRequest};

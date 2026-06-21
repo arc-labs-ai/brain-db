@@ -8,7 +8,9 @@
 use brain_core::MemoryId;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
-use crate::tables::hype::{HYPE_QUESTION_VECTORS_TABLE, HYPE_VECTOR_BYTES};
+use crate::tables::hype::{
+    HYPE_NEIGHBORHOOD_HASH_TABLE, HYPE_QUESTION_VECTORS_TABLE, HYPE_VECTOR_BYTES,
+};
 
 /// Errors from the HyPE CRUD layer.
 #[derive(thiserror::Error, Debug)]
@@ -66,6 +68,30 @@ pub fn hype_vector_put(
     Ok(())
 }
 
+/// Whether `memory_id` already owns at least one HyPE question vector.
+///
+/// The write-time generator uses this to skip regeneration on re-ingest:
+/// HyPE runs once per memory, gated on its OWN vector presence rather than
+/// on the extraction audit row, so re-encoding an already-extracted memory
+/// still generates its questions exactly once and never double-inserts
+/// them into the live index.
+pub fn hype_has_vectors(
+    rtxn: &ReadTransaction,
+    memory_id: MemoryId,
+) -> Result<bool, HypeOpError> {
+    let prefix = memory_id.to_be_bytes();
+    let lo = row_key(memory_id, 0);
+    let hi = row_key(memory_id, u8::MAX);
+    let t = rtxn.open_table(HYPE_QUESTION_VECTORS_TABLE)?;
+    for entry in t.range(lo..=hi)? {
+        let (k, _) = entry?;
+        if k.value()[..16] == prefix {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Delete every question vector owned by `memory_id` (FORGET cascade).
 /// Returns the number of rows removed. No-op if the memory owns none.
 pub fn hype_vectors_delete_memory(
@@ -92,6 +118,38 @@ pub fn hype_vectors_delete_memory(
     Ok(removed)
 }
 
+/// Read the stored `(text, neighborhood)` hash that produced `memory_id`'s
+/// current HyPE questions, or `None` if the memory was never generated under
+/// the graph-aware path (or the table doesn't exist yet — it is created
+/// lazily on first write). The refresh worker compares this against a freshly
+/// recomputed hash to decide whether the neighborhood has changed and the
+/// questions must be regenerated.
+pub fn hype_neighborhood_hash_get(
+    rtxn: &ReadTransaction,
+    memory_id: MemoryId,
+) -> Result<Option<[u8; 32]>, HypeOpError> {
+    let t = match rtxn.open_table(HYPE_NEIGHBORHOOD_HASH_TABLE) {
+        Ok(t) => t,
+        // Lazily created on first put; absent table ⇒ nothing generated yet.
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(t.get(&memory_id.to_be_bytes())?.map(|g| g.value()))
+}
+
+/// Record the `(text, neighborhood)` hash that produced `memory_id`'s current
+/// HyPE questions. Written in the same transaction that persists the new
+/// question vectors, so a memory's hash never advances without its questions.
+pub fn hype_neighborhood_hash_put(
+    wtxn: &WriteTransaction,
+    memory_id: MemoryId,
+    hash: [u8; 32],
+) -> Result<(), HypeOpError> {
+    let mut t = wtxn.open_table(HYPE_NEIGHBORHOOD_HASH_TABLE)?;
+    t.insert(&memory_id.to_be_bytes(), &hash)?;
+    Ok(())
+}
+
 /// One row yielded by [`hype_iter_all_vectors`]: `(MemoryId, vector)`.
 /// Several rows may share a `MemoryId` (one per generated question).
 pub type HypeRebuildRow = (MemoryId, [f32; 384]);
@@ -99,9 +157,7 @@ pub type HypeRebuildRow = (MemoryId, [f32; 384]);
 /// Iterate every stored question vector, returning `(MemoryId, vector)`
 /// pairs in key order. The boot rebuild feeds these straight into a fresh
 /// `HypeHnswIndex` — no LLM, no embedder.
-pub fn hype_iter_all_vectors(
-    rtxn: &ReadTransaction,
-) -> Result<Vec<HypeRebuildRow>, HypeOpError> {
+pub fn hype_iter_all_vectors(rtxn: &ReadTransaction) -> Result<Vec<HypeRebuildRow>, HypeOpError> {
     let t = rtxn.open_table(HYPE_QUESTION_VECTORS_TABLE)?;
     let mut out = Vec::new();
     for entry in t.iter()? {
@@ -109,7 +165,10 @@ pub fn hype_iter_all_vectors(
         let key = k.value();
         let mut id_bytes = [0u8; 16];
         id_bytes.copy_from_slice(&key[..16]);
-        out.push((MemoryId::from_be_bytes(id_bytes), bytes_to_vector(&v.value())));
+        out.push((
+            MemoryId::from_be_bytes(id_bytes),
+            bytes_to_vector(&v.value()),
+        ));
     }
     Ok(out)
 }
@@ -155,6 +214,21 @@ mod tests {
     }
 
     #[test]
+    fn has_vectors_reports_presence_per_memory() {
+        let (_d, db) = open();
+        let wtxn = db.begin_write().unwrap();
+        hype_vector_put(&wtxn, mem(1), 0, &vec_seed(0.5)).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        assert!(hype_has_vectors(&rtxn, mem(1)).unwrap(), "mem 1 has a vector");
+        assert!(
+            !hype_has_vectors(&rtxn, mem(2)).unwrap(),
+            "mem 2 has none — the idempotency gate must let it generate"
+        );
+    }
+
+    #[test]
     fn delete_memory_removes_only_its_rows() {
         let (_d, db) = open();
         let wtxn = db.begin_write().unwrap();
@@ -172,6 +246,40 @@ mod tests {
         let rows = hype_iter_all_vectors(&rtxn).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, mem(2), "only memory 2 survives");
+    }
+
+    #[test]
+    fn neighborhood_hash_round_trips_and_absent_is_none() {
+        let (_d, db) = open();
+        // Absent table / row ⇒ None (never panics on a fresh db).
+        let rtxn = db.begin_read().unwrap();
+        assert!(hype_neighborhood_hash_get(&rtxn, mem(1)).unwrap().is_none());
+        drop(rtxn);
+
+        let wtxn = db.begin_write().unwrap();
+        hype_neighborhood_hash_put(&wtxn, mem(1), [7u8; 32]).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        assert_eq!(
+            hype_neighborhood_hash_get(&rtxn, mem(1)).unwrap(),
+            Some([7u8; 32])
+        );
+        assert!(
+            hype_neighborhood_hash_get(&rtxn, mem(2)).unwrap().is_none(),
+            "unrelated memory has no stored hash"
+        );
+        drop(rtxn);
+
+        // Overwrite advances the hash.
+        let wtxn = db.begin_write().unwrap();
+        hype_neighborhood_hash_put(&wtxn, mem(1), [9u8; 32]).unwrap();
+        wtxn.commit().unwrap();
+        let rtxn = db.begin_read().unwrap();
+        assert_eq!(
+            hype_neighborhood_hash_get(&rtxn, mem(1)).unwrap(),
+            Some([9u8; 32])
+        );
     }
 
     #[test]

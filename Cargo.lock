@@ -412,6 +412,7 @@ dependencies = [
  "candle-transformers",
  "criterion",
  "futures-lite 2.6.1",
+ "futures-util",
  "jsonschema",
  "parking_lot",
  "proptest",
@@ -514,6 +515,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
+ "unicode-normalization",
  "uuid",
 ]
 

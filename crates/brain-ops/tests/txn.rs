@@ -16,9 +16,9 @@ use brain_ops::test_support::run_in_glommio;
 use brain_ops::{dispatch, DispatchOutcome, ErrorCode, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
-    EdgeKindWire, EncodeRequest, ForgetMode, ForgetRequest, LinkRequest, MemoryKindWire,
-    ObservationInput, PlanBudget, PlanRequest, PlanState, ReasonRequest, RecallRequest,
-    RequestBody, TxnAbortRequest, TxnBeginRequest, TxnCommitRequest, UnlinkRequest,
+    EdgeKindWire, EncodeRequest, ForgetMode, ForgetRequest, LinkRequest, ObservationInput,
+    PlanBudget, PlanRequest, PlanState, ReasonRequest, RecallRequest, RequestBody,
+    TxnAbortRequest, TxnBeginRequest, TxnCommitRequest, UnlinkRequest,
 };
 use brain_protocol::envelope::response::{
     EncodeResponse, ForgetResponse, LinkResponse, PlanResponseFrame, PlanStatus as WirePlanStatus,
@@ -83,12 +83,8 @@ fn encode_req(request_id: [u8; 16], text: &str, txn: Option<[u8; 16]>) -> Encode
     EncodeRequest {
         text: text.into(),
         context_id: 42,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: vec![],
         request_id,
         txn_id: txn,
-        deduplicate: false,
         occurred_at_unix_nanos: None,
     }
 }
@@ -136,10 +132,11 @@ fn forget_req(memory_id: u128, request_id: [u8; 16], txn: Option<[u8; 16]>) -> F
     }
 }
 
-fn recall_req(cue: &str, top_k: u32, txn: Option<[u8; 16]>) -> RecallRequest {
+fn recall_req(cue: &str, max_results: u32, txn: Option<[u8; 16]>) -> RecallRequest {
     RecallRequest {
         cue_text: cue.into(),
-        top_k,
+        subject_name: String::new(),
+        max_results,
         confidence_threshold: 0.0,
         context_filter: None,
         age_bound_unix_nanos: None,
@@ -421,7 +418,7 @@ fn encode_in_txn_not_visible_outside() {
             .unwrap(),
         );
         assert!(
-            !frame.results.iter().any(|r| r.memory_id == mid),
+            !frame.memories.iter().any(|r| r.memory_id == mid),
             "pending memory must be invisible to non-txn RECALL"
         );
     })
@@ -447,7 +444,7 @@ fn commit_makes_buffered_writes_visible() {
             .await
             .unwrap(),
         );
-        assert!(frame.results.iter().any(|r| r.memory_id == mid));
+        assert!(frame.memories.iter().any(|r| r.memory_id == mid));
     })
 }
 
@@ -472,7 +469,7 @@ fn abort_discards_buffered_writes() {
             .await
             .unwrap(),
         );
-        assert!(!frame.results.iter().any(|r| r.memory_id == mid));
+        assert!(!frame.memories.iter().any(|r| r.memory_id == mid));
     })
 }
 
@@ -533,9 +530,9 @@ fn recall_in_txn_sees_pending_encode() {
             .unwrap(),
         );
         assert!(
-            frame.results.iter().any(|r| r.memory_id == mid),
+            frame.memories.iter().any(|r| r.memory_id == mid),
             "in-txn RECALL must see pending memory; got {:?}",
-            frame.results
+            frame.memories
         );
     })
 }
@@ -560,13 +557,13 @@ fn recall_in_txn_returns_pending_text_when_include_text_set() {
             .unwrap(),
         );
         let hit = frame
-            .results
+            .memories
             .iter()
             .find(|r| r.text == "alpha buffered text")
             .unwrap_or_else(|| {
                 panic!(
                     "expected pending hit to carry the buffered text; got {:?}",
-                    frame.results
+                    frame.memories
                 )
             });
         assert_eq!(hit.text, "alpha buffered text");
@@ -592,7 +589,7 @@ fn recall_in_txn_omits_pending_text_when_include_text_unset() {
             .unwrap(),
         );
         let hit = frame
-            .results
+            .memories
             .iter()
             .find(|r| r.memory_id == mid)
             .expect("pending hit must surface even without include_text");
@@ -632,7 +629,7 @@ fn recall_in_txn_drops_pending_tombstone() {
             .await
             .unwrap(),
         );
-        assert!(!in_txn.results.iter().any(|r| r.memory_id == committed_mid));
+        assert!(!in_txn.memories.iter().any(|r| r.memory_id == committed_mid));
 
         // Non-txn RECALL still sees it (uncommitted abort below).
         let outside = unwrap_recall(
@@ -644,7 +641,7 @@ fn recall_in_txn_drops_pending_tombstone() {
             .await
             .unwrap(),
         );
-        assert!(outside.results.iter().any(|r| r.memory_id == committed_mid));
+        assert!(outside.memories.iter().any(|r| r.memory_id == committed_mid));
 
         // Abort the txn — the tombstone goes away.
         let _ = abort(&fix, txn).await;
@@ -1069,9 +1066,9 @@ fn session_drop_aborts_open_txns() {
             .unwrap(),
         );
         assert!(
-            recall.results.is_empty(),
+            recall.memories.is_empty(),
             "buffered encodes leaked into committed state: {:?}",
-            recall.results
+            recall.memories
         );
     })
 }
@@ -1108,7 +1105,7 @@ fn session_drop_does_not_affect_other_sessions() {
             .unwrap(),
         );
         assert_eq!(
-            recall.results.len(),
+            recall.memories.len(),
             1,
             "session B's committed encode should be visible"
         );
@@ -1149,7 +1146,7 @@ fn reconnect_after_drop_sees_clean_state() {
             .await
             .unwrap(),
         );
-        let texts: Vec<&str> = recall.results.iter().map(|h| h.text.as_str()).collect();
+        let texts: Vec<&str> = recall.memories.iter().map(|h| h.text.as_str()).collect();
         assert!(
             texts.iter().any(|t| t.contains("fresh-draft")),
             "new-session recall must see its own pending encode: {texts:?}"

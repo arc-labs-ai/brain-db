@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use brain_core::{
-    AgentId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience, StatementKind,
+    AgentId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience,
 };
 use brain_protocol::schema::ExtractorTarget;
 use candle_core::Device;
@@ -15,10 +15,9 @@ use candle_core::Device;
 use super::config::{default_xdg_model_dir_with, ClassifierConfig};
 use super::extractor::ClassifierExtractor;
 use super::model::{ClassifiedSpan, ClassifierModel, GlinerClassifier};
-use super::statement_kind::classify_statement_kind_pattern;
 use super::{
     simple_label, DEFAULT_GLINER_THRESHOLD, DEFAULT_MAX_SEQ_LEN, NER_MODEL_DIR_NAME,
-    NER_MODEL_PATH_ENV, NER_MODEL_REQUIRED_FILES,
+    NER_MODEL_REQUIRED_FILES,
 };
 use crate::framework::extractor::ExtractionContext;
 use crate::framework::extractor::{Extractor, ExtractorError};
@@ -48,6 +47,8 @@ fn memory(text: &str) -> Memory {
 fn ctx<'a>(reg: &'a ExtractorRegistry) -> ExtractionContext<'a> {
     ExtractionContext {
             declared_predicates: None,
+        declared_kinds: None,
+        entity_type_labels: None,
         schema_version: 1,
         now_unix_nanos: 0,
         registry: reg,
@@ -219,6 +220,43 @@ fn predict_passes_stripped_labels_to_model() {
         "labels={:?}",
         seen[0]
     );
+}
+
+#[test]
+fn per_cycle_ctx_labels_override_construction_labels() {
+    // The classifier is built with the 6 seeded labels, but the worker hands
+    // it a fresh per-cycle label set via the ExtractionContext (e.g. after a
+    // user SCHEMA_UPLOAD adds `Drug`). The model must see the per-cycle labels,
+    // not the frozen construction ones — this is what lets a new entity type
+    // reach GLiNER without a shard restart.
+    let model = Arc::new(LabelCaptureModel::new(Vec::new()));
+    let ext = ClassifierExtractor::new(
+        ExtractorId::from(1),
+        "brain:gliner".into(),
+        entity_target(),
+        1,
+        0.5,
+        model.clone(),
+        default_labels(), // construction-time fallback (the 6 seeds)
+    );
+    let reg = ExtractorRegistry::new();
+    let cycle_labels: Vec<String> = vec!["brain:Person".into(), "brain:Drug".into()];
+    let cycle_ctx = ExtractionContext {
+        declared_predicates: None,
+        declared_kinds: None,
+        entity_type_labels: Some(&cycle_labels),
+        schema_version: 1,
+        now_unix_nanos: 0,
+        registry: &reg,
+        prior_tier_items: None,
+        extractor_context: None,
+    };
+    let _ = futures_lite::future::block_on(ext.run(&cycle_ctx, &memory("text")));
+    let seen = model.seen.lock();
+    assert_eq!(seen.len(), 1);
+    // The model saw the per-cycle labels (stripped), including the new `Drug`,
+    // not the 6 construction-time defaults.
+    assert_eq!(seen[0], vec!["Person".to_string(), "Drug".to_string()]);
 }
 
 #[test]
@@ -461,55 +499,6 @@ fn auto_discover_returns_with_path_when_env_unset_and_default_path_valid() {
 }
 
 #[test]
-fn auto_discover_prefers_env_var_over_default_path() {
-    let tmp_xdg = tempfile::tempdir().unwrap();
-    let xdg_model_dir = tmp_xdg
-        .path()
-        .join("brain")
-        .join("models")
-        .join(NER_MODEL_DIR_NAME);
-    write_fake_gliner_dir(&xdg_model_dir);
-
-    let tmp_explicit = tempfile::tempdir().unwrap();
-    let explicit = tmp_explicit.path().to_path_buf();
-
-    let env = env_fn(vec![
-        env_pair(NER_MODEL_PATH_ENV, explicit.to_str().unwrap()),
-        env_pair("XDG_DATA_HOME", tmp_xdg.path().to_str().unwrap()),
-    ]);
-    let is_file = |p: &Path| p.is_file();
-    let cfg = ClassifierConfig::auto_discover_with(&env, &is_file);
-    assert_eq!(
-        cfg.model_path.as_deref(),
-        Some(explicit.as_path()),
-        "env-var path should win over XDG even when XDG also has a valid install"
-    );
-}
-
-#[test]
-fn auto_discover_falls_through_to_default_when_env_var_empty_string() {
-    let tmp = tempfile::tempdir().unwrap();
-    let model_dir = tmp
-        .path()
-        .join("brain")
-        .join("models")
-        .join(NER_MODEL_DIR_NAME);
-    write_fake_gliner_dir(&model_dir);
-
-    let env = env_fn(vec![
-        env_pair(NER_MODEL_PATH_ENV, ""),
-        env_pair("XDG_DATA_HOME", tmp.path().to_str().unwrap()),
-    ]);
-    let is_file = |p: &Path| p.is_file();
-    let cfg = ClassifierConfig::auto_discover_with(&env, &is_file);
-    assert_eq!(
-        cfg.model_path.as_deref(),
-        Some(model_dir.as_path()),
-        "empty BRAIN_NER_MODEL_PATH must be treated as unset"
-    );
-}
-
-#[test]
 fn auto_discover_skips_default_when_one_required_file_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let model_dir = tmp
@@ -554,90 +543,6 @@ fn default_xdg_model_dir_falls_back_to_home_local_share() {
         dir,
         PathBuf::from("/home/dev/.local/share/brain/models/gliner-small-v2.1")
     );
-}
-
-// ----- Statement-kind pattern classifier --------------------------------
-
-#[test]
-fn pattern_kind_first_person_preference() {
-    let cases = [
-        "I prefer dark roast coffee.",
-        "I like async meetings.",
-        "I love this team.",
-        "I hate flaky tests.",
-        "I'd rather skip the call.",
-        "I don't like long meetings.",
-        "My favorite editor is helix.",
-    ];
-    for text in cases {
-        let got = classify_statement_kind_pattern(text);
-        assert!(
-            matches!(got, Some((StatementKind::Preference, c)) if c >= 0.7),
-            "text={text:?} got={got:?}"
-        );
-    }
-}
-
-#[test]
-fn pattern_kind_event_with_date_and_verb() {
-    let cases = [
-        "The all-hands is Friday at 10am.",
-        "The release is scheduled for 2026-06-15.",
-        "Demo happened on Tuesday.",
-        "The standup is at 9:30am.",
-        "Our deploy occurred at 15:00.",
-    ];
-    for text in cases {
-        let got = classify_statement_kind_pattern(text);
-        assert!(
-            matches!(got, Some((StatementKind::Event, c)) if c >= 0.7),
-            "text={text:?} got={got:?}"
-        );
-    }
-}
-
-#[test]
-fn pattern_kind_fact_with_copula() {
-    let cases = [
-        "Alice works at Acme Corp.",
-        "Bob lives in Berlin.",
-        "The capital of France is Paris.",
-        "Acme has 200 employees.",
-    ];
-    for text in cases {
-        let got = classify_statement_kind_pattern(text);
-        assert!(
-            matches!(got, Some((StatementKind::Fact, c)) if c >= 0.7),
-            "text={text:?} got={got:?}"
-        );
-    }
-}
-
-#[test]
-fn pattern_kind_none_for_ambiguous() {
-    // No copula, no preference cue, no event cue — caller must
-    // defer to LLM.
-    let got = classify_statement_kind_pattern("Whatever happens.");
-    assert!(got.is_none(), "got={got:?}");
-}
-
-#[test]
-fn pattern_kind_preference_beats_event_when_both_fire() {
-    // "I prefer ... by Friday" — preference wins; the deadline is
-    // context, not the statement's truth condition.
-    let got = classify_statement_kind_pattern("I prefer to ship the review by Friday at 3pm.");
-    assert!(
-        matches!(got, Some((StatementKind::Preference, _))),
-        "got={got:?}"
-    );
-}
-
-#[test]
-fn pattern_kind_year_anchor_alone_is_not_an_event() {
-    // "founded in 2024" is a Fact, not an Event — no event noun /
-    // verb fires.
-    let got = classify_statement_kind_pattern("Acme was founded in 2024.");
-    assert!(matches!(got, Some((StatementKind::Fact, _))), "got={got:?}");
 }
 
 // ----- Real-inference smoke (operator-gated) ----------------------------

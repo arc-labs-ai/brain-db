@@ -915,6 +915,26 @@ fn emit_extractor_metrics(out: &mut String, shards: &[ShardHandle]) {
 
     emit_header(
         out,
+        "brain_extractor_apply_dropped_total",
+        "Real extracted items the apply pass could not persist, by reason. Any nonzero value is signal loss.",
+        "counter",
+    );
+    for shard in shards {
+        if let Some(m) = shard.extractor_metrics() {
+            let snap = m.snapshot();
+            for (reason, count) in snap.apply_dropped_total {
+                let labels = format!(
+                    "{{shard=\"{}\",reason=\"{}\"}}",
+                    shard.shard_id(),
+                    escape_label(&reason)
+                );
+                let _ = writeln!(out, "brain_extractor_apply_dropped_total{labels} {count}",);
+            }
+        }
+    }
+
+    emit_header(
+        out,
         "brain_extractor_items_written_total",
         "Typed-graph rows persisted by the extractor worker, by item kind.",
         "counter",

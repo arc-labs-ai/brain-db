@@ -48,7 +48,10 @@ use crate::connection::{
     Topology,
 };
 use crate::routing::RoutingTable;
-use crate::shard::{spawn_shard, ShardHandle, ShardJoiner, ShardSpawnConfig};
+use crate::shard::{
+    spawn_shard, ExtractorTierSpawnConfig, LlmSpawnConfig, RerankSpawnConfig, ShardHandle,
+    ShardJoiner, ShardSpawnConfig,
+};
 
 /// Integration-test stub dispatcher. The harness never exercises
 /// embedding quality and we don't want to load a real BGE model per
@@ -109,10 +112,49 @@ pub async fn start(n_shards: usize) -> Server {
 /// caller owns the directory's lifetime — useful when a test wants to
 /// inspect on-disk state after `Server::stop()` returns.
 pub async fn start_in(data_dir: &Path, n_shards: usize) -> Server {
+    start_in_with(data_dir, n_shards, |dd| {
+        ShardSpawnConfig::new(dd, stub_dispatcher())
+    })
+    .await
+}
+
+/// Boot a single shard with the FULL extraction pipeline live: a real
+/// embedding dispatcher plus the pattern + classifier (GLiNER) + LLM extractor
+/// tiers enabled, with the OpenAI key ferried into the LLM tier. Rerank is left
+/// off (read-path only; skips loading the cross-encoder). The GLiNER model is
+/// auto-discovered from the XDG model dir at shard spawn. Used by the
+/// write-extraction-accuracy corpus test, which needs every tier running to
+/// exercise real entity/statement/relation extraction.
+pub async fn start_full_pipeline_in(
+    data_dir: &Path,
+    dispatcher: Arc<dyn Dispatcher>,
+    api_key: Option<String>,
+) -> Server {
+    start_in_with(data_dir, 1, move |dd| {
+        let mut cfg = ShardSpawnConfig::new(dd, dispatcher.clone());
+        cfg.extractors = ExtractorTierSpawnConfig {
+            pattern_enabled: true,
+            classifier_enabled: true,
+            llm_enabled: true,
+        };
+        cfg.llm = LlmSpawnConfig {
+            api_key: api_key.clone(),
+            model: None,
+        };
+        cfg.rerank = RerankSpawnConfig { enabled: false };
+        cfg
+    })
+    .await
+}
+
+async fn start_in_with<F>(data_dir: &Path, n_shards: usize, mk_cfg: F) -> Server
+where
+    F: Fn(&Path) -> ShardSpawnConfig,
+{
     let mut handles = Vec::with_capacity(n_shards);
     let mut joiners = Vec::with_capacity(n_shards);
     for shard_id in 0..n_shards {
-        let cfg = ShardSpawnConfig::new(data_dir, stub_dispatcher());
+        let cfg = mk_cfg(data_dir);
         let (h, j) = spawn_shard(shard_id as u16, cfg).expect("spawn shard");
         handles.push(h);
         joiners.push(Some(j));

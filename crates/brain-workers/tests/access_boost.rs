@@ -322,7 +322,7 @@ fn recall_fills_buffer_then_boost_worker_applies() {
         use brain_ops::dispatch;
         use brain_ops::test_support::single_body;
         use brain_protocol::envelope::request::{
-            EncodeRequest, MemoryKindWire, RecallRequest, RequestBody,
+            EncodeRequest, RecallRequest, RequestBody,
         };
         use brain_protocol::envelope::response::ResponseBody;
 
@@ -362,12 +362,8 @@ fn recall_fills_buffer_then_boost_worker_applies() {
         let encode_req = |rid: [u8; 16], text: &str| EncodeRequest {
             text: text.into(),
             context_id: 1,
-            kind: MemoryKindWire::Episodic,
-            salience_hint: 0.5,
-            edges: vec![],
             request_id: rid,
             txn_id: None,
-            deduplicate: false,
             occurred_at_unix_nanos: None,
         };
         let _ = dispatch(
@@ -394,7 +390,8 @@ fn recall_fills_buffer_then_boost_worker_applies() {
         // RECALL fills the buffer.
         let recall = RecallRequest {
             cue_text: "alpha".into(),
-            top_k: 5,
+            subject_name: String::new(),
+            max_results: 5,
             confidence_threshold: 0.0,
             context_filter: None,
             age_bound_unix_nanos: None,
@@ -417,7 +414,7 @@ fn recall_fills_buffer_then_boost_worker_applies() {
         .await
         .unwrap();
         let n_results = match single_body(outcome) {
-            ResponseBody::Recall(r) => r.results.len(),
+            ResponseBody::Recall(r) => r.memories.len(),
             _ => unreachable!(),
         };
         assert!(n_results >= 1);

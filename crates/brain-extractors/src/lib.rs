@@ -43,15 +43,15 @@ pub mod resolver_llm;
 pub mod supersede_source;
 
 pub use classifier::{
-    classify_statement_kind_pattern, default_xdg_model_dir, ClassifiedSpan, ClassifierConfig,
-    ClassifierExtractor, ClassifierModel, GlinerClassifier, GlinerSpan, NER_MODEL_DIR_NAME,
-    NER_MODEL_PATH_ENV, NER_MODEL_REQUIRED_FILES, STATEMENT_KIND_PATTERN_THRESHOLD,
+    default_xdg_model_dir, ClassifiedSpan, ClassifierConfig, ClassifierExtractor, ClassifierModel,
+    GlinerClassifier, GlinerSpan, NER_MODEL_DIR_NAME, NER_MODEL_REQUIRED_FILES,
 };
 pub use enricher_hook::{run_pipeline_enrichers, EnricherHook, EnricherHookOutcome};
 pub use framework::{
-    EntityMention, ExtractedItem, ExtractionContext, ExtractionFuture, ExtractionResult,
-    ExtractionStatus, Extractor, ExtractorContext, ExtractorError, ExtractorRegistry,
-    ExtractorRunOptions, NeighborMemory, RelationMention, StatementMention, TierGate, TierState,
+    EntityMention, ExtractedItem, ExtractionContext, ExtractionFailureClass, ExtractionFuture,
+    ExtractionResult, ExtractionStatus, Extractor, ExtractorContext, ExtractorError,
+    ExtractorRegistry, ExtractorRunOptions, NeighborMemory, RelationMention, StatementMention,
+    TierGate, TierState,
 };
 pub use idempotency::{hash_memory_text, IdempotencyKey};
 pub use llm::{estimate_cost, CostBudget, LlmExtractor, LlmExtractorInner, Pricing};

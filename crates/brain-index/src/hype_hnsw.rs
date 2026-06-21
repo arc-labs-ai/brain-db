@@ -209,6 +209,45 @@ impl HypeHnswIndex {
         Ok(out)
     }
 
+    /// Replace all of `memory_id`'s question points with `vectors`.
+    ///
+    /// The write-time HyPE refresh calls this when a memory's typed-graph
+    /// neighborhood has grown and its questions were regenerated: the old
+    /// (now stale) points are tombstoned so they no longer surface, the new
+    /// vectors are inserted, and — crucially — `by_memory[memory_id]` is reset
+    /// to point at *only* the new ids. That reset is what makes repeated
+    /// refresh correct: a later refresh tombstones only this batch, never the
+    /// live points a still-newer refresh inserted. Without it `by_memory`
+    /// would accumulate old + new ids and the next refresh would tombstone the
+    /// live ones too.
+    ///
+    /// The old points stay in `forward`/`tombstones` (excluded from search,
+    /// harmless) until the next boot rebuild from redb compacts them away —
+    /// the persisted `hype_question_vectors` rows are the source of truth and
+    /// the refresh overwrites those. Empty `vectors` simply retires the memory
+    /// (its entry is removed); the caller only passes a non-empty slice.
+    pub fn refresh_memory(&mut self, memory_id: MemoryId, vectors: &[[f32; VECTOR_DIM]]) {
+        if let Some(old) = self.by_memory.get(&memory_id) {
+            for id in old {
+                self.tombstones.set(*id);
+            }
+        }
+        if vectors.is_empty() {
+            self.by_memory.remove(&memory_id);
+            return;
+        }
+        let mut new_ids = Vec::with_capacity(vectors.len());
+        for v in vectors {
+            let internal_id = u32::try_from(self.forward.len())
+                .expect("invariant: HyPE point count per shard never reaches u32::MAX");
+            self.forward.push(memory_id);
+            self.inner
+                .insert_slice((v.as_slice(), internal_id as usize));
+            new_ids.push(internal_id);
+        }
+        self.by_memory.insert(memory_id, new_ids);
+    }
+
     /// Tombstone every question point owned by `memory_id` (the FORGET
     /// cascade analogue). No-op if the memory owns no points.
     pub fn mark_memory_tombstoned(&mut self, memory_id: MemoryId) {
@@ -372,6 +411,49 @@ mod tests {
             err,
             HypeHnswError::EfSearchTooLarge { ef: 1000, max: 500 }
         ));
+    }
+
+    #[test]
+    fn refresh_memory_replaces_points_and_survives_repeat() {
+        let mut idx = HypeHnswIndex::new(hype_default_params()).unwrap();
+        let m = mem(3);
+        // First generation: question embeds near one_hot(0).
+        idx.refresh_memory(m, &[one_hot(0), one_hot(1)]);
+        let r = idx.search(&one_hot(0), 5).unwrap();
+        assert_eq!(r[0].0, m);
+        assert!(r[0].1 > 0.99, "first-gen point surfaces");
+
+        // Second refresh (neighborhood grew): new questions near one_hot(50).
+        // The OLD points must be retired and the NEW ones live.
+        idx.refresh_memory(m, &[one_hot(50), one_hot(51)]);
+        let r_new = idx.search(&one_hot(50), 5).unwrap();
+        assert_eq!(r_new[0].0, m, "second-gen point surfaces");
+        assert!(r_new[0].1 > 0.99);
+
+        // The crux: a THIRD refresh must not have re-tombstoned the live
+        // second-gen points (the by_memory reset guards this). After it, the
+        // third-gen points are live and queryable.
+        idx.refresh_memory(m, &[one_hot(120)]);
+        let r3 = idx.search(&one_hot(120), 5).unwrap();
+        assert_eq!(r3[0].0, m, "third-gen point live after repeated refresh");
+        assert!(r3[0].1 > 0.99);
+        // And the memory still resolves to exactly its latest batch.
+        assert!(idx.contains_memory(m));
+    }
+
+    #[test]
+    fn refresh_memory_empty_retires_memory() {
+        let mut idx = HypeHnswIndex::new(hype_default_params()).unwrap();
+        let m = mem(9);
+        idx.refresh_memory(m, &[one_hot(0)]);
+        assert!(idx.contains_memory(m));
+        idx.refresh_memory(m, &[]);
+        assert!(!idx.contains_memory(m), "empty refresh retires the memory");
+        let r = idx.search(&one_hot(0), 5).unwrap();
+        assert!(
+            !r.iter().any(|(id, _)| *id == m),
+            "retired memory does not surface"
+        );
     }
 
     #[test]

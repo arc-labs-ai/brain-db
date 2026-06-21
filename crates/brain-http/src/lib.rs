@@ -30,7 +30,6 @@
 //!
 //! - `server` (default) — server accept loop, router, connection
 //!   handling.
-//! - `client` — async HTTP client.
 //! - `ws` — WebSocket via `tokio-tungstenite`.
 //! - `sse` — Server-Sent Events.
 //! - `tls` — rustls termination at the server. Implies `server`.
@@ -44,8 +43,6 @@ pub mod error;
 pub mod observability;
 pub mod service;
 
-#[cfg(feature = "client")]
-pub mod client;
 #[cfg(feature = "server")]
 pub mod router;
 #[cfg(feature = "server")]

@@ -33,6 +33,7 @@ pub mod rebuild;
 pub mod semantic_retriever;
 pub mod shared;
 pub mod statement_hnsw;
+pub mod statement_question_hnsw;
 pub mod tantivy_shard;
 pub mod tombstones;
 

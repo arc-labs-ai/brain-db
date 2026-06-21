@@ -36,12 +36,11 @@
 //! tier-1/2/3/4 miss — which is the intended split-brain semantics
 //! for two simultaneous extractions.
 //!
-//! The embedding threshold defaults to 0.78 cosine. Operators can
-//! tighten or loosen it via `BRAIN_RESOLVER_EMBED_THRESHOLD` (parsed
-//! as an f32 in `[0.0, 1.0]`; invalid values fall back to the
-//! default with a `tracing::warn!`). Callers that have no HNSW or no
-//! embedder pass `None` for either and the tier silently skips —
-//! the gauntlet still flows through tier-1/2/3/5 unchanged.
+//! The embedding threshold defaults to 0.78 cosine, carried on
+//! [`EmbeddingDeps::embed_threshold`]; the shard ferries
+//! `[extractors.resolver] embed_threshold` there. Callers that have no
+//! HNSW or no embedder pass `None` for either and the tier silently
+//! skips — the gauntlet still flows through tier-1/2/3/5 unchanged.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -54,7 +53,8 @@ use brain_index::entity_hnsw::EntityHnswIndex;
 use brain_index::VECTOR_DIM;
 use brain_llm::LlmClient;
 use brain_metadata::entity::ops::{
-    entity_add_alias, entity_put, entity_vector_put, normalize_name, EntityOpError,
+    entity_add_alias, entity_put, entity_resolve_canonical_all_types_wtxn, entity_vector_put,
+    normalize_name, EntityOpError,
 };
 use brain_metadata::entity::review::{enqueue_merge_proposal, MergeReviewError};
 use brain_metadata::entity::trigram::TrigramOpError;
@@ -98,54 +98,10 @@ pub const EMBED_RESOLVE_THRESHOLD: f32 = 0.78;
 /// — "0.7 to 0.95 goes to review".
 pub const PARTIAL_MATCH_FLOOR: f32 = 0.7;
 
-/// Env-var override for [`EMBED_RESOLVE_THRESHOLD`]. Parsed as an
-/// f32 in `[0.0, 1.0]`; invalid / out-of-range values fall back to
-/// the default with a `tracing::warn!`.
-pub const EMBED_RESOLVE_THRESHOLD_ENV: &str = "BRAIN_RESOLVER_EMBED_THRESHOLD";
-
 /// Top-K asked of the entity HNSW during a tier-3 embedding probe.
 /// 8 balances "enough candidates to break a near-tie" against the
 /// cost of `entity_get`-ing each one for the type-filter pass.
 const EMBED_RESOLVE_TOP_K: usize = 8;
-
-/// Resolved effective threshold for the current process. Reads the
-/// env var once (per call) so tests can flip it inside `with_var`.
-fn embed_resolve_threshold() -> f32 {
-    parse_embed_threshold_env(std::env::var(EMBED_RESOLVE_THRESHOLD_ENV).ok().as_deref())
-}
-
-/// Pure-logic parser for [`EMBED_RESOLVE_THRESHOLD_ENV`]. Exposed for
-/// unit tests that don't want to race the process-wide env.
-pub fn parse_embed_threshold_env(raw: Option<&str>) -> f32 {
-    let Some(raw) = raw else {
-        return EMBED_RESOLVE_THRESHOLD;
-    };
-    if raw.is_empty() {
-        return EMBED_RESOLVE_THRESHOLD;
-    }
-    match raw.parse::<f32>() {
-        Ok(v) if (0.0..=1.0).contains(&v) => v,
-        Ok(v) => {
-            tracing::warn!(
-                target: "brain_extractors::resolver",
-                env_var = EMBED_RESOLVE_THRESHOLD_ENV,
-                value = v,
-                "embed-resolve threshold outside [0.0, 1.0]; using default",
-            );
-            EMBED_RESOLVE_THRESHOLD
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: "brain_extractors::resolver",
-                env_var = EMBED_RESOLVE_THRESHOLD_ENV,
-                value = %raw,
-                error = %e,
-                "embed-resolve threshold env var is not a valid f32; using default",
-            );
-            EMBED_RESOLVE_THRESHOLD
-        }
-    }
-}
 
 /// Outcome of one resolve attempt. The worker uses the tier to bump
 /// per-tier counters on the pipeline audit row.
@@ -308,6 +264,12 @@ fn trigram_candidates_wtxn(
 pub struct EmbeddingDeps {
     pub hnsw: Arc<RwLock<EntityHnswIndex>>,
     pub embedder: Arc<dyn Dispatcher>,
+    /// Cosine floor for tier-3 auto-aliasing. Surface forms whose top
+    /// neighbour scores at or above this are aliased onto that entity;
+    /// scores in `[PARTIAL_MATCH_FLOOR, embed_threshold)` enter the
+    /// merge-review queue. Defaults to [`EMBED_RESOLVE_THRESHOLD`] —
+    /// the shard ferries `[extractors.resolver] embed_threshold` here.
+    pub embed_threshold: f32,
 }
 
 impl std::fmt::Debug for EmbeddingDeps {
@@ -511,6 +473,29 @@ pub fn resolve_or_create_with_deps(
         });
     }
 
+    // Tier 1b — cross-type exact canonical. Every tier above is scoped to the
+    // hinted `type_id`, but the pattern and LLM extractor tiers routinely assign
+    // DIFFERENT type ids to the SAME referent (e.g. "Atlas" under one type and
+    // "The Atlas" — normalized to the same `atlas` key — under another). Without
+    // a cross-type check the referent fragments into two nodes and its relations
+    // split across them, which silently breaks multi-hop traversal even though
+    // every individual fact was extracted. An EXACT normalized-name match under a
+    // different type is the same referent at very high precision, so reuse it.
+    // Guard: only when EXACTLY ONE cross-type entity matches — a normalized name
+    // shared by two different-typed entities is a genuine homograph ("Apple" the
+    // company vs the fruit), so fall through to mint rather than conflate them.
+    {
+        let cross = entity_resolve_canonical_all_types_wtxn(wtxn, surface_form)?;
+        if cross.len() == 1 {
+            let id = cross[0];
+            entity_add_alias(wtxn, id, surface_form.to_string(), now_unix_nanos)?;
+            return Ok(Resolution {
+                entity_id: id,
+                tier: ResolutionTier::Exact,
+            });
+        }
+    }
+
     // Tier 3a — trigram fuzzy lookup. Candidates whose Jaccard against
     // the query is above `DEFAULT_FUZZY_THRESHOLD` get the surface
     // form added as an alias and are returned as the match.
@@ -519,7 +504,7 @@ pub fn resolve_or_create_with_deps(
         let query_tgs = trigrams::extract_trigrams(&normalized);
         if !query_tgs.is_empty() {
             let mut best: Option<(EntityId, f32)> = None;
-            for cid in candidate_ids {
+            for &cid in &candidate_ids {
                 let cid_tgs = trigram_set_for_entity(wtxn, cid)?;
                 if cid_tgs.is_empty() {
                     continue;
@@ -543,6 +528,54 @@ pub fn resolve_or_create_with_deps(
                 });
             }
         }
+
+        // Tier 3a' — partial-name (token-subset) coref. A short reference
+        // ("Niraj") whose normalized tokens are a STRICT subset of an
+        // existing same-type entity's canonical name ("Niraj Georgian") is
+        // the same entity. Jaccard misses this — the longer name dilutes the
+        // trigram overlap below the fuzzy floor — yet in a personal-knowledge
+        // graph first-name / short references are the dominant coref case, and
+        // missing them mints duplicate person nodes that fragment every
+        // relation across name variants (Niraj's reports_to lands on one node,
+        // his family_of on another), which is what breaks multi-hop reads.
+        // Token containment is far stricter than cosine (no "Tokyo"≈"Japan"
+        // risk), so it's safe where the embedding tier is deliberately
+        // conservative. Merge ONLY when EXACTLY ONE candidate contains the
+        // surface tokens — "John" with both "John Smith" and "John Doe" is
+        // genuinely ambiguous, so fall through to create rather than guess.
+        let q_tokens: Vec<&str> = normalized.split_whitespace().collect();
+        if !q_tokens.is_empty() {
+            let mut containment: Option<EntityId> = None;
+            let mut ambiguous = false;
+            for &cid in &candidate_ids {
+                let Some(cn) = read_entity_canonical(wtxn, cid)? else {
+                    continue;
+                };
+                let c_norm = normalize_name(&cn);
+                let c_tokens: Vec<&str> = c_norm.split_whitespace().collect();
+                // Strict superset: candidate carries every query token and at
+                // least one more (so "Niraj" → "Niraj Georgian", never the
+                // reverse, which would alias a full name onto a bare first).
+                if c_tokens.len() > q_tokens.len()
+                    && q_tokens.iter().all(|qt| c_tokens.contains(qt))
+                {
+                    if containment.is_some() {
+                        ambiguous = true;
+                        break;
+                    }
+                    containment = Some(cid);
+                }
+            }
+            if !ambiguous {
+                if let Some(cid) = containment {
+                    entity_add_alias(wtxn, cid, surface_form.to_string(), now_unix_nanos)?;
+                    return Ok(Resolution {
+                        entity_id: cid,
+                        tier: ResolutionTier::Alias,
+                    });
+                }
+            }
+        }
     }
 
     // Tier 3b — embedding HNSW. The trigram tier above misses
@@ -558,11 +591,57 @@ pub fn resolve_or_create_with_deps(
     if let Some(deps) = embed_deps {
         match tier_embedding(deps, type_id, surface_form, wtxn) {
             Ok(EmbeddingProbe::AutoAlias { entity_id, .. }) => {
-                entity_add_alias(wtxn, entity_id, surface_form.to_string(), now_unix_nanos)?;
-                return Ok(Resolution {
-                    entity_id,
-                    tier: ResolutionTier::Embedding,
-                });
+                // A high cosine alone is not proof of identity: two
+                // distinct same-type entities ("Japan" vs "Tokyo", both
+                // Places) can sit above the auto-alias threshold and the
+                // tier is type-scoped, so the type filter never separates
+                // them. When a disambiguator is wired, get a second
+                // opinion before merging; only an explicit rejection
+                // blocks the alias, so genuine paraphrases ("Stripe Inc."
+                // vs "Stripe Payments") — confirmed or merely uncertain —
+                // still merge as before. With no disambiguator, the
+                // cosine threshold remains the sole arbiter.
+                match disambiguator
+                    .map(|d| confirm_partial_match(d, entity_id, surface_form, wtxn, entity_type_qname))
+                {
+                    Some(MatchVerdict::Rejected) => {
+                        // Confirmed distinct despite the high cosine.
+                        // Fall through to Create without enqueuing a
+                        // merge proposal — there is nothing to review.
+                        tracing::info!(
+                            target: "brain_extractors::resolver",
+                            ?entity_id,
+                            surface_form,
+                            "high-cosine auto-alias rejected by disambiguator; minting a distinct entity",
+                        );
+                    }
+                    Some(MatchVerdict::Confirmed { entity, confidence }) => {
+                        entity_add_alias(wtxn, entity, surface_form.to_string(), now_unix_nanos)?;
+                        tracing::info!(
+                            target: "brain_extractors::resolver",
+                            ?entity,
+                            confidence,
+                            "high-cosine auto-alias confirmed by disambiguator",
+                        );
+                        return Ok(Resolution {
+                            entity_id: entity,
+                            tier: ResolutionTier::Disambiguated,
+                        });
+                    }
+                    // No disambiguator, or it declined to commit either
+                    // way (Uncertain / Skipped). The cosine already
+                    // cleared the auto-alias threshold, so preserve the
+                    // pre-disambiguator behaviour and merge.
+                    None
+                    | Some(MatchVerdict::Uncertain)
+                    | Some(MatchVerdict::Skipped { .. }) => {
+                        entity_add_alias(wtxn, entity_id, surface_form.to_string(), now_unix_nanos)?;
+                        return Ok(Resolution {
+                            entity_id,
+                            tier: ResolutionTier::Embedding,
+                        });
+                    }
+                }
             }
             Ok(EmbeddingProbe::PartialMatch { entity_id, score }) => {
                 partial_match = Some((entity_id, score));
@@ -738,7 +817,7 @@ fn tier_embedding(
     surface_form: &str,
     wtxn: &WriteTransaction,
 ) -> Result<EmbeddingProbe, String> {
-    let threshold = embed_resolve_threshold();
+    let threshold = deps.embed_threshold;
     let vector = deps
         .embedder
         .embed(surface_form)
@@ -794,6 +873,17 @@ fn read_entity_type(
     let t = wtxn.open_table(ENTITIES_TABLE)?;
     let row: Option<EntityMetadata> = t.get(&id.to_bytes())?.map(|g| g.value());
     Ok(row.map(|m| EntityTypeId::from(m.entity_type_id)))
+}
+
+/// Read just the `canonical_name` for `id` inside an existing write txn.
+/// Used by the partial-name coref tier to compare token sets.
+fn read_entity_canonical(
+    wtxn: &WriteTransaction,
+    id: EntityId,
+) -> Result<Option<String>, ResolverError> {
+    let t = wtxn.open_table(ENTITIES_TABLE)?;
+    let row: Option<EntityMetadata> = t.get(&id.to_bytes())?.map(|g| g.value());
+    Ok(row.map(|m| m.canonical_name))
 }
 
 /// Embed the entity's canonical name and insert into the HNSW. Best-
@@ -1061,6 +1151,60 @@ mod tests {
     }
 
     #[test]
+    fn tier_partial_name_subset_resolves_to_full_entity() {
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        let full = Entity::new_active(
+            EntityId::new(),
+            EntityType::PERSON_ID,
+            "Niraj Georgian".into(),
+            normalize_name("Niraj Georgian"),
+            NOW,
+        );
+        let full_id = full.id;
+        {
+            let wtxn = d.write_txn().unwrap();
+            entity_put(&wtxn, &full).unwrap();
+            wtxn.commit().unwrap();
+        }
+        // A bare first-name reference must coref onto the full-name entity
+        // (token subset) instead of minting a duplicate person node.
+        let wtxn = d.write_txn().unwrap();
+        let res = resolve_or_create(&wtxn, "Niraj", "brain:Person", 0.8, NOW + 1).unwrap();
+        assert_eq!(res.entity_id, full_id, "Niraj should coref to Niraj Georgian");
+        assert_eq!(res.tier, ResolutionTier::Alias);
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn tier_partial_name_ambiguous_does_not_merge() {
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        for name in ["Niraj Georgian", "Niraj Patel"] {
+            let e = Entity::new_active(
+                EntityId::new(),
+                EntityType::PERSON_ID,
+                name.into(),
+                normalize_name(name),
+                NOW,
+            );
+            let wtxn = d.write_txn().unwrap();
+            entity_put(&wtxn, &e).unwrap();
+            wtxn.commit().unwrap();
+        }
+        // "Niraj" is a subset of TWO distinct people → ambiguous → must not
+        // guess; mint a fresh entity instead of mis-merging.
+        let wtxn = d.write_txn().unwrap();
+        let res = resolve_or_create(&wtxn, "Niraj", "brain:Person", 0.8, NOW + 1).unwrap();
+        assert_eq!(
+            res.tier,
+            ResolutionTier::Created,
+            "ambiguous partial name must not merge"
+        );
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
     fn tier_fuzzy_matches_close_surface_form_and_adds_alias() {
         let dir = TempDir::new().unwrap();
         let d = db(&dir);
@@ -1132,6 +1276,67 @@ mod tests {
             resolve_or_create(&wtxn, "Brand New Name", "brain:Person", 0.5, NOW + 1).unwrap();
         assert_eq!(res2.entity_id, res.entity_id);
         assert_eq!(res2.tier, ResolutionTier::Exact);
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn cross_type_exact_reuses_existing_entity_under_different_type() {
+        // The pattern and LLM extractor tiers routinely assign DIFFERENT type
+        // ids to the same referent: "The Atlas" (determiner-stripped to the
+        // normalized key "atlas") under one type and "Atlas" under another.
+        // Without cross-type reuse these fragment into two nodes and split the
+        // entity's relations across them, silently breaking multi-hop traversal.
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        // First mention mints under Concept; determiner-strip → key "atlas".
+        let wtxn = d.write_txn().unwrap();
+        let first = resolve_or_create(&wtxn, "The Atlas", "brain:Concept", 0.9, NOW).unwrap();
+        assert_eq!(first.tier, ResolutionTier::Created);
+        wtxn.commit().unwrap();
+        // Second mention, DIFFERENT type hint, bare form → must reuse, not mint.
+        let wtxn = d.write_txn().unwrap();
+        let second = resolve_or_create(&wtxn, "Atlas", "brain:Person", 0.9, NOW + 1).unwrap();
+        assert_eq!(
+            second.entity_id, first.entity_id,
+            "cross-type exact name match must reuse the existing node, not fragment"
+        );
+        assert_eq!(second.tier, ResolutionTier::Exact);
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn cross_type_exact_declines_on_homograph_ambiguity() {
+        // A normalized name shared by two DIFFERENT-typed entities is a genuine
+        // homograph ("Apple" the company vs the fruit). Cross-type reuse must
+        // NOT pick one arbitrarily — with >1 match it falls through to mint a
+        // distinct entity.
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        // Mint "Apple" as an Organization (registers the Organization type).
+        let wtxn = d.write_txn().unwrap();
+        let org = resolve_or_create(&wtxn, "Apple", "brain:Organization", 0.9, NOW).unwrap();
+        wtxn.commit().unwrap();
+        // Seed a second "apple" under the (already-registered) Person type.
+        let person_apple = Entity::new_active(
+            EntityId::new(),
+            EntityType::PERSON_ID,
+            "Apple".into(),
+            normalize_name("Apple"),
+            NOW,
+        );
+        let person_id = person_apple.id;
+        let wtxn = d.write_txn().unwrap();
+        entity_put(&wtxn, &person_apple).unwrap();
+        wtxn.commit().unwrap();
+        // Now resolve "Apple" under a THIRD type: two cross-type matches exist
+        // → ambiguous → mint a fresh entity rather than conflate them.
+        let wtxn = d.write_txn().unwrap();
+        let res = resolve_or_create(&wtxn, "Apple", "brain:Event", 0.9, NOW + 1).unwrap();
+        assert!(
+            res.entity_id != org.entity_id && res.entity_id != person_id,
+            "ambiguous cross-type homograph must not be reused"
+        );
+        assert_eq!(res.tier, ResolutionTier::Created);
         wtxn.commit().unwrap();
     }
 
@@ -1244,6 +1449,7 @@ mod tests {
         EmbeddingDeps {
             hnsw,
             embedder: embedder as Arc<dyn Dispatcher>,
+            embed_threshold: EMBED_RESOLVE_THRESHOLD,
         }
     }
 
@@ -1407,25 +1613,6 @@ mod tests {
 
         assert_eq!(res.entity_id, alice_person_id);
         assert_eq!(res.tier, ResolutionTier::Embedding);
-    }
-
-    #[test]
-    fn tier_embedding_env_threshold_override_parser() {
-        // Direct parser test — avoids racing the process-wide env.
-        assert!((parse_embed_threshold_env(None) - EMBED_RESOLVE_THRESHOLD).abs() < 1e-6);
-        assert!((parse_embed_threshold_env(Some("")) - EMBED_RESOLVE_THRESHOLD).abs() < 1e-6);
-        assert!((parse_embed_threshold_env(Some("0.6")) - 0.6).abs() < 1e-6);
-        assert!((parse_embed_threshold_env(Some("0.0")) - 0.0).abs() < 1e-6);
-        assert!((parse_embed_threshold_env(Some("1.0")) - 1.0).abs() < 1e-6);
-        // Out-of-range + non-numeric → default.
-        assert!(
-            (parse_embed_threshold_env(Some("1.5")) - EMBED_RESOLVE_THRESHOLD).abs() < 1e-6,
-            "out-of-range must fall back to default",
-        );
-        assert!(
-            (parse_embed_threshold_env(Some("nope")) - EMBED_RESOLVE_THRESHOLD).abs() < 1e-6,
-            "non-numeric must fall back to default",
-        );
     }
 
     #[test]

@@ -122,12 +122,14 @@ pub fn statement_create(
         }
     }
 
-    // Auto-supersession honours the predicate's `is_stateful` flag.
-    // Resolved at schema-intern time from the DSL's `stateful` keyword
-    // (or the kind-derived default), this lets declared Facts opt into
-    // supersession semantics while still defaulting Preference to true.
-    // Event is never superseded — each event is its own row by design.
-    if pred.is_stateful && s.kind != StatementKind::Event {
+    // Auto-supersession is kind-derived: single-valued kinds (Attribute,
+    // Directive, and user-declared `cardinality: single` kinds) supersede
+    // their prior current value. A predicate explicitly declared
+    // `stateful: true` in the schema is also honored as an override, so a
+    // schema author can make any non-Event kind single-valued. Event is
+    // never superseded — each event is its own row by design.
+    let kind_single = crate::schema::kind::kind_supersedes_w(wtxn, s.kind)?;
+    if (kind_single || pred.is_stateful) && s.kind != StatementKind::Event {
         if let Some(e) = subject_entity {
             if let Some(prior) = find_current_statement(wtxn, e, s.predicate, s.kind)? {
                 return statement_supersede(wtxn, prior, s, now_unix_nanos);
@@ -268,7 +270,13 @@ pub(super) fn insert_new_statement(
     if m.subject_kind != 1 {
         let mut t = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
         t.insert(
-            &(m.subject_entity_bytes, m.kind, m.predicate_id, m.is_current),
+            &(
+                m.subject_entity_bytes,
+                m.kind,
+                m.predicate_id,
+                m.is_current,
+                m.statement_id_bytes,
+            ),
             &m.statement_id_bytes,
         )?;
     }
@@ -456,9 +464,21 @@ pub(super) fn flip_by_subject_to_noncurrent(
     statement_id_bytes: &[u8; 16],
 ) -> Result<(), StatementOpError> {
     let mut bys = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
-    bys.remove(&(subject_entity_bytes, kind, predicate_id, 1u8))?;
+    bys.remove(&(
+        subject_entity_bytes,
+        kind,
+        predicate_id,
+        1u8,
+        *statement_id_bytes,
+    ))?;
     bys.insert(
-        &(subject_entity_bytes, kind, predicate_id, 0u8),
+        &(
+            subject_entity_bytes,
+            kind,
+            predicate_id,
+            0u8,
+            *statement_id_bytes,
+        ),
         statement_id_bytes,
     )?;
     Ok(())
@@ -473,9 +493,32 @@ fn find_current_statement(
     kind: StatementKind,
 ) -> Result<Option<StatementId>, StatementOpError> {
     let bys = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
-    let key = (subject.to_bytes(), kind.as_u8(), predicate.raw(), 1u8);
-    let bytes: Option<[u8; 16]> = bys.get(&key)?.map(|g| g.value());
-    Ok(bytes.map(StatementId::from))
+    // The trailing statement id is part of the key now, so an exact get
+    // can't address the single current row directly. Single-valued kinds
+    // still have exactly one current row, so a range scan over the
+    // (subject, kind, predicate, is_current=1) prefix yields it as the
+    // first (and only) value.
+    let lo = (
+        subject.to_bytes(),
+        kind.as_u8(),
+        predicate.raw(),
+        1u8,
+        [0u8; 16],
+    );
+    let hi = (
+        subject.to_bytes(),
+        kind.as_u8(),
+        predicate.raw(),
+        1u8,
+        [0xffu8; 16],
+    );
+    // Single-valued kinds have exactly one current row; take the first.
+    let mut it = bys.range(lo..=hi)?;
+    let first = match it.next() {
+        Some(entry) => Some(StatementId::from(entry?.1.value())),
+        None => None,
+    };
+    Ok(first)
 }
 
 /// Write-txn variant used by the in-line contradiction probe so it
@@ -486,25 +529,39 @@ fn load_active_facts_for_subject_predicate_wtxn(
     predicate: PredicateId,
 ) -> Result<Vec<Statement>, StatementOpError> {
     let bys = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
-    let key = (
+    // Cumulative Facts can have many current rows for one
+    // (subject, predicate); collect every one via a range scan over the
+    // is_current=1 prefix.
+    let lo = (
         subject.to_bytes(),
         StatementKind::Fact.as_u8(),
         predicate.raw(),
         1u8,
+        [0u8; 16],
     );
-    let bytes: Option<[u8; 16]> = bys.get(&key)?.map(|g| g.value());
-    let Some(b) = bytes else {
-        return Ok(Vec::new());
-    };
+    let hi = (
+        subject.to_bytes(),
+        StatementKind::Fact.as_u8(),
+        predicate.raw(),
+        1u8,
+        [0xffu8; 16],
+    );
+    let mut ids: Vec<[u8; 16]> = Vec::new();
+    for entry in bys.range(lo..=hi)? {
+        let (_, v) = entry?;
+        ids.push(v.value());
+    }
     let st = wtxn.open_table(STATEMENTS_TABLE)?;
-    let row: Option<StatementMetadata> = st.get(&b)?.map(|g| g.value());
-    let Some(m) = row else {
-        return Ok(Vec::new());
-    };
-    let Some(s) = statement_from_metadata(&m) else {
-        return Ok(Vec::new());
-    };
-    Ok(vec![s])
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let row: Option<StatementMetadata> = st.get(&id)?.map(|g| g.value());
+        if let Some(m) = row {
+            if let Some(s) = statement_from_metadata(&m) {
+                out.push(s);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// True iff any inline evidence entry carries per-entry metadata
@@ -763,17 +820,24 @@ mod tests {
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
-        // by_subject
+        // by_subject — range over the is_current=1 prefix; the trailing
+        // statement id is now part of the key.
         let bys = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE).unwrap();
-        assert!(bys
-            .get(&(
-                subj.to_bytes(),
-                StatementKind::Fact.as_u8(),
-                pred.raw(),
-                1u8,
-            ))
-            .unwrap()
-            .is_some());
+        let lo = (
+            subj.to_bytes(),
+            StatementKind::Fact.as_u8(),
+            pred.raw(),
+            1u8,
+            [0u8; 16],
+        );
+        let hi = (
+            subj.to_bytes(),
+            StatementKind::Fact.as_u8(),
+            pred.raw(),
+            1u8,
+            [0xffu8; 16],
+        );
+        assert!(bys.range(lo..=hi).unwrap().next().is_some());
         // by_predicate
         let byp = rtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE).unwrap();
         assert!(byp
@@ -975,12 +1039,14 @@ mod tests {
         assert!(!g2.tombstoned);
 
         let conflicts = super::super::list::statements_contradicting(&rtxn, subj, pred).unwrap();
-        // The by_subject Fact index is single-value per is_current bit
-        // — the second insert overwrites the first key. v1 implementation
-        // surfaces the contradiction via the WARN trace at create-time;
-        // the runtime probe returns whichever survived in by_subject.
-        // Both primary rows still exist by id.
-        assert!(conflicts.len() <= 1);
+        // The by_subject Fact index is multi-value now: appending the
+        // statement id to the key means both contradicting Facts are
+        // distinct rows, so the runtime probe enumerates both and
+        // surfaces the disagreement.
+        assert_eq!(conflicts.len(), 2);
+        let ids: Vec<_> = conflicts.iter().map(|s| s.id).collect();
+        assert!(ids.contains(&f1.id));
+        assert!(ids.contains(&f2.id));
     }
 
     #[test]
@@ -1073,24 +1139,42 @@ mod tests {
 
         let rtxn = db.read_txn().unwrap();
         let bys = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE).unwrap();
-        let cur = bys
-            .get(&(
-                subj.to_bytes(),
-                StatementKind::Fact.as_u8(),
-                pred.raw(),
-                1u8,
-            ))
-            .unwrap();
-        assert!(cur.is_none(), "is_current=1 entry must be gone");
-        let stale = bys
-            .get(&(
-                subj.to_bytes(),
-                StatementKind::Fact.as_u8(),
-                pred.raw(),
-                0u8,
-            ))
-            .unwrap();
-        assert!(stale.is_some(), "is_current=0 entry must exist");
+        let cur_lo = (
+            subj.to_bytes(),
+            StatementKind::Fact.as_u8(),
+            pred.raw(),
+            1u8,
+            [0u8; 16],
+        );
+        let cur_hi = (
+            subj.to_bytes(),
+            StatementKind::Fact.as_u8(),
+            pred.raw(),
+            1u8,
+            [0xffu8; 16],
+        );
+        assert!(
+            bys.range(cur_lo..=cur_hi).unwrap().next().is_none(),
+            "is_current=1 entry must be gone"
+        );
+        let stale_lo = (
+            subj.to_bytes(),
+            StatementKind::Fact.as_u8(),
+            pred.raw(),
+            0u8,
+            [0u8; 16],
+        );
+        let stale_hi = (
+            subj.to_bytes(),
+            StatementKind::Fact.as_u8(),
+            pred.raw(),
+            0u8,
+            [0xffu8; 16],
+        );
+        assert!(
+            bys.range(stale_lo..=stale_hi).unwrap().next().is_some(),
+            "is_current=0 entry must exist"
+        );
     }
 
     #[test]

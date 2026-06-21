@@ -52,6 +52,12 @@ pub struct StatementCreatePayload {
     /// Per-statement statefulness flag (copied from the predicate
     /// registry for schema-declared rows by the caller).
     pub is_stateful: bool,
+    /// Event time, in unix-nanos, for `kind == Event` statements. An Event
+    /// is rejected at create without one (`validate_statement_shape`); every
+    /// other kind must leave this `None`. Carries the resolved occurrence
+    /// time for temporal (memory-subject) events so they persist instead of
+    /// being dropped.
+    pub event_at_unix_nanos: Option<u64>,
 }
 
 /// Same shape for relations.
@@ -95,6 +101,12 @@ pub fn statement_create_internal(
     );
     s.valid_from_unix_nanos = Some(payload.extracted_at_unix_nanos);
     s.is_stateful = payload.is_stateful;
+    // Event time is only valid on Event-kind rows; the shape validator
+    // rejects it on any other kind. Set it strictly for Events so temporal
+    // events persist (they were dropped when this was never plumbed).
+    if payload.kind == StatementKind::Event {
+        s.event_at_unix_nanos = payload.event_at_unix_nanos;
+    }
     statement_create(wtxn, &s, payload.extracted_at_unix_nanos)
 }
 
@@ -176,6 +188,7 @@ mod tests {
                 schema_version: 0,
                 extracted_at_unix_nanos: NOW,
                 is_stateful: false,
+                event_at_unix_nanos: None,
             };
             let sid = statement_create_internal(&wtxn, &payload).unwrap();
             wtxn.commit().unwrap();

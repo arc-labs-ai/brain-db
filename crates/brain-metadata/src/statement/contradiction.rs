@@ -7,8 +7,11 @@
 //! open contradictions.
 //!
 //! Liveness is re-checked at list time against the primary `statements`
-//! table rather than the single-value `statements_by_subject` index,
-//! which cannot enumerate coexisting current Facts.
+//! table. The `statements_by_subject` index now enumerates coexisting
+//! current Facts (the statement id is part of its key), but the audit
+//! row records the specific statement ids directly, so liveness is
+//! confirmed by loading each primary row rather than re-scanning the
+//! index.
 
 use brain_core::{AuditId, EntityId, PredicateId, StatementId, StatementObject};
 use redb::{ReadableTable, WriteTransaction};
@@ -147,7 +150,13 @@ mod tests {
 
     fn make_entity(db: &crate::MetadataDb, name: &str) -> EntityId {
         let id = EntityId::new();
-        let e = Entity::new_active(id, EntityType::PERSON_ID, name.into(), normalize_name(name), T0);
+        let e = Entity::new_active(
+            id,
+            EntityType::PERSON_ID,
+            name.into(),
+            normalize_name(name),
+            T0,
+        );
         let wtxn = db.write_txn().unwrap();
         entity_put(&wtxn, &e).unwrap();
         wtxn.commit().unwrap();
@@ -222,7 +231,10 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         let pending = contradiction_audit_list_pending(&wtxn, 16, T0 + 3).unwrap();
         wtxn.commit().unwrap();
-        assert!(pending.is_empty(), "tombstoning one side resolves the contradiction");
+        assert!(
+            pending.is_empty(),
+            "tombstoning one side resolves the contradiction"
+        );
     }
 
     #[test]

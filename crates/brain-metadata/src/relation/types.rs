@@ -7,6 +7,7 @@ use brain_core::RelationType;
 use brain_core::{Cardinality, EntityTypeId, RelationTypeId};
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
+use crate::tables::relation::RELATION_TYPE_EMBEDDINGS_TABLE;
 use crate::tables::relation_type::{
     encode_entity_type_id, RelationTypeDefinition, RelationTypeOrigin,
     RELATION_TYPES_BY_QNAME_TABLE, RELATION_TYPES_TABLE,
@@ -454,6 +455,50 @@ pub fn relation_type_drop_schema_declared(
         }
     }
     Ok(count)
+}
+
+// ---------------------------------------------------------------------------
+// Embeddings.
+// ---------------------------------------------------------------------------
+
+/// Store the semantic embedding for a relation type. Called when a
+/// relation type is first interned at extraction time. `vec` is the
+/// BGE-small output (384 dims); stored as little-endian `f32` bytes.
+/// Idempotent overwrite. Mirrors
+/// [`crate::schema::predicate::predicate_embedding_put`].
+pub fn relation_type_embedding_put(
+    wtxn: &WriteTransaction,
+    id: RelationTypeId,
+    vec: &[f32],
+) -> Result<(), RelationTypeOpError> {
+    let mut bytes = Vec::with_capacity(vec.len() * 4);
+    for f in vec {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    let mut t = wtxn.open_table(RELATION_TYPE_EMBEDDINGS_TABLE)?;
+    t.insert(id.raw(), bytes.as_slice())?;
+    Ok(())
+}
+
+/// Load a relation type's embedding, decoding the little-endian `f32`
+/// bytes. Returns `None` when no vector was stored (e.g. relation types
+/// interned before the embedding pass, or user-authored relations with no
+/// extractor embedding). Mirrors
+/// [`crate::schema::predicate::predicate_embedding_get`].
+pub fn relation_type_embedding_get(
+    rtxn: &ReadTransaction,
+    id: RelationTypeId,
+) -> Result<Option<Vec<f32>>, RelationTypeOpError> {
+    let t = rtxn.open_table(RELATION_TYPE_EMBEDDINGS_TABLE)?;
+    let Some(g) = t.get(id.raw())? else {
+        return Ok(None);
+    };
+    let bytes = g.value();
+    let mut out = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(Some(out))
 }
 
 // ---------------------------------------------------------------------------
@@ -940,5 +985,24 @@ mod tests {
         let active = relation_types_active_for_schema(&rtxn, "acme", 5).unwrap();
         assert!(active.contains(&declared));
         assert!(!active.contains(&implicit));
+    }
+
+    #[test]
+    fn relation_type_embedding_round_trips_and_missing_is_none() {
+        let (_dir, db) = open_db();
+        let id = RelationTypeId::from(7);
+        let vec = vec![0.5_f32, -1.25, 3.0, 0.0];
+
+        let wtxn = db.begin_write().unwrap();
+        relation_type_embedding_put(&wtxn, id, &vec).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let got = relation_type_embedding_get(&rtxn, id).unwrap().unwrap();
+        assert_eq!(got, vec);
+
+        // An id with no stored embedding returns None.
+        let missing = relation_type_embedding_get(&rtxn, RelationTypeId::from(99)).unwrap();
+        assert!(missing.is_none());
     }
 }

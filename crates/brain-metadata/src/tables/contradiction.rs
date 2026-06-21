@@ -63,7 +63,4 @@ impl ContradictionAudit {
     }
 }
 
-impl_redb_rkyv_value!(
-    ContradictionAudit,
-    "brain_metadata::ContradictionAudit"
-);
+impl_redb_rkyv_value!(ContradictionAudit, "brain_metadata::ContradictionAudit");

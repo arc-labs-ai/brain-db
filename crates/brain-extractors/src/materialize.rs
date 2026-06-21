@@ -733,6 +733,8 @@ mod tests {
         let reg = ExtractorRegistry::new();
         let ctx = ExtractionContext {
             declared_predicates: None,
+            declared_kinds: None,
+            entity_type_labels: None,
             schema_version: 1,
             now_unix_nanos: 0,
             registry: &reg,
@@ -904,6 +906,8 @@ mod tests {
         };
         let ctx = crate::framework::extractor::ExtractionContext {
             declared_predicates: None,
+            declared_kinds: None,
+            entity_type_labels: None,
             schema_version: 1,
             now_unix_nanos: 0,
             registry: &reg,

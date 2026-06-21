@@ -138,6 +138,49 @@ max_cause_memories_per_statement = 3
 max_effect_memories_per_statement = 3
 max_related_statements_per_entity = 5
 
+# Per-shard retracted-statement GC. Physically deletes retracted
+# statement rows (and their secondary-index / evidence-overflow entries)
+# once the retract grace window has elapsed. Off by default — retracted
+# rows stay in redb (invisible to retrieval) until an operator opts in.
+# [workers.statement_reclaim]
+# enabled = false
+# grace_seconds = 2592000   # 30 days
+# period_seconds = 86400    # 1 day sweep cadence
+
+# Entity merge-review-queue sweeper. Re-checks ambiguous-band entity
+# resolutions as the entity HNSW grows. Slow cadence on purpose.
+# [workers.ambiguity_resolver]
+# interval_secs = 3600      # 1 hour
+
+# Statement confidence-refresh sweep. Recomputes stored Statement
+# confidence (noisy-OR + kind decay) so aged evidence stops over-ranking.
+# [workers.confidence_sweep]
+# interval_secs = 3600      # 1 hour
+
+# LLM extractor response-cache TTL sweep. Deletes expired cache rows so
+# the cache file doesn't grow unbounded.
+# [workers.llm_cache_sweep]
+# interval_secs = 3600      # 1 hour
+
+# Extractor pipeline tuning. The per-tier on/off gates live under each
+# sub-section; the knobs below tune resolution / classification / HyPE.
+# [extractors.resolver]
+# embed_threshold = 0.78    # tier-3 entity-alias cosine floor
+
+# [extractors.classifier]
+# enabled = true
+# model_path = "/abs/path/to/gliner-model"   # override; default = XDG discovery
+# threshold = 0.5           # GLiNER post-sigmoid acceptance floor
+
+# [extractors.hype]
+# num_questions = 6         # hypothetical questions generated per memory
+
+# Index pipeline tuning. Tantivy group-commit cadence (whichever of the
+# two thresholds trips first).
+# [index]
+# tantivy_commit_n = 256    # commit after N queued writes
+# tantivy_commit_ms = 1000  # commit after T milliseconds
+
 [monitoring.logging]
 level = "info"
 format = "json"
@@ -167,7 +210,14 @@ openai_api_key = ""  # operator sets at deploy time — never commit a real key
 # ollama_model = "llama3.1:8b"
 
 [llm]
-openai_api_key = ""  # operator sets at deploy time — never commit a real key
+# Single provider-agnostic credential + model. The provider is derived
+# from the model id (claude* → Anthropic, else OpenAI). BRAIN_API_KEY /
+# BRAIN_AI_MODEL override these at deploy time.
+api_key = ""   # operator sets at deploy time — never commit a real key
+# model = "gpt-4o-mini"  # default when unset
 
 [rerank]
-enabled = true
+# Off by default: rerank only reorders already-retrieved candidates and
+# can't surface what retrieval+grounding missed. Solve recall correctness
+# upstream; flip to true only to A/B the cross-encoder's ordering.
+enabled = false

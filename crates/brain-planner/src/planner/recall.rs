@@ -34,7 +34,7 @@ pub fn plan_recall_inner(
 
     let post_rules = build_filter_rules(req);
     let selectivity = cost::estimate_filter_selectivity(&post_rules);
-    let k = req.top_k as usize;
+    let k = req.max_results as usize;
 
     let ef = cost::pick_ef(k, selectivity, ctx).max(k); // ef ≥ k
     let factor = cost::over_factor(selectivity);
@@ -102,16 +102,16 @@ pub fn plan_recall_inner(
 }
 
 fn validate(req: &RecallRequest, config: &PlannerConfig) -> Result<(), PlanError> {
-    if req.top_k == 0 {
+    if req.max_results == 0 {
         return Err(PlanError::InvalidParameters {
-            field: "top_k",
+            field: "max_results",
             reason: "must be > 0".to_string(),
         });
     }
-    let k = req.top_k as usize;
+    let k = req.max_results as usize;
     if k > config.max_k {
         return Err(PlanError::InvalidParameters {
-            field: "top_k",
+            field: "max_results",
             reason: format!("{k} exceeds max_k = {}", config.max_k),
         });
     }
@@ -167,12 +167,13 @@ fn build_filter_rules(req: &RecallRequest) -> Vec<FilterRule> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_protocol::envelope::request::MemoryKindWire;
+    use brain_protocol::envelope::request::{MemoryKindWire};
 
     fn base_request() -> RecallRequest {
         RecallRequest {
             cue_text: "hello".into(),
-            top_k: 10,
+            subject_name: String::new(),
+            max_results: 10,
             confidence_threshold: 0.0,
             context_filter: None,
             age_bound_unix_nanos: None,
@@ -215,23 +216,23 @@ mod tests {
     #[test]
     fn zero_k_is_rejected() {
         let mut r = base_request();
-        r.top_k = 0;
+        r.max_results = 0;
         match plan_recall(&r, &ctx()) {
-            Err(PlanError::InvalidParameters { field, .. }) => assert_eq!(field, "top_k"),
-            other => panic!("expected InvalidParameters[top_k], got {other:?}"),
+            Err(PlanError::InvalidParameters { field, .. }) => assert_eq!(field, "max_results"),
+            other => panic!("expected InvalidParameters[max_results], got {other:?}"),
         }
     }
 
     #[test]
     fn k_over_max_is_rejected() {
         let mut r = base_request();
-        r.top_k = 5000;
+        r.max_results = 5000;
         match plan_recall(&r, &ctx()) {
             Err(PlanError::InvalidParameters { field, reason }) => {
-                assert_eq!(field, "top_k");
+                assert_eq!(field, "max_results");
                 assert!(reason.contains("max_k"));
             }
-            other => panic!("expected InvalidParameters[top_k], got {other:?}"),
+            other => panic!("expected InvalidParameters[max_results], got {other:?}"),
         }
     }
 
@@ -286,7 +287,7 @@ mod tests {
     #[test]
     fn candidates_are_capped() {
         let mut r = base_request();
-        r.top_k = 100;
+        r.max_results = 100;
         let plan = unwrap_recall(plan_recall(&r, &ctx()).unwrap());
         assert!(
             plan.shards[0].ann_search.candidates_to_request

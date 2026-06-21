@@ -26,7 +26,7 @@ use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
 use brain_protocol::envelope::request::{
-    EncodeRequest, MemoryKindWire, RecallRequest, RequestBody,
+    EncodeRequest, RecallRequest, RequestBody,
 };
 use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
@@ -183,13 +183,9 @@ fn encode_request(text: &str) -> RequestBody {
     RequestBody::Encode(EncodeRequest {
         text: text.into(),
         context_id: 0,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.7,
-        edges: Vec::new(),
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
-        deduplicate: false,
     })
 }
 
@@ -214,7 +210,8 @@ fn text_query(text: &str) -> WireQueryRequest {
 fn recall_request(text: &str) -> RequestBody {
     RequestBody::Recall(RecallRequest {
         cue_text: text.into(),
-        top_k: 5,
+        subject_name: String::new(),
+        max_results: 5,
         confidence_threshold: 0.0,
         context_filter: None,
         age_bound_unix_nanos: None,
@@ -391,8 +388,8 @@ async fn recall_after_schema_routes_through_retrieval_pipeline() {
     match body {
         ResponseBody::Recall(r) => {
             assert!(r.is_final);
-            assert!(!r.results.is_empty(), "expected at least one hit, got 0",);
-            let first = &r.results[0];
+            assert!(!r.memories.is_empty(), "expected at least one hit, got 0",);
+            let first = &r.memories[0];
             assert!(
                 !first.contributing_retrievers.is_empty(),
                 "retrieval path must populate contributing_retrievers",

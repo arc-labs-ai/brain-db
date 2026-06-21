@@ -444,6 +444,14 @@ async fn execute_once(
     // on any miss, so it can never regress a hit the bare pass found.
     maybe_apply_lexical_prf(&mut outputs, plan, request, ctx, include_statements);
 
+    // Read-side multi-hop: walk the typed graph N hops from the cue's anchor
+    // and inject the connected entities' names into the lexical lane, so a
+    // question that names neither the bridge nor the answer entity ("Niraj's
+    // manager") still reaches the answer doc ("Meera … Infosys"). Pure graph +
+    // tantivy + RRF; no read-side LLM, no client knowledge of the graph.
+    let graph_expanded =
+        maybe_apply_graph_expansion(&mut outputs, plan, request, ctx, include_statements);
+
     // Adaptive RRF k from the actual candidate-pool size (small pools →
     // smaller k → sharper top ranks). Falls back to the plan's k for
     // non-RRF fusion methods, which don't use k.
@@ -453,6 +461,15 @@ async fn execute_once(
     } else {
         plan.fusion.k
     };
+    // NOTE: the graph-expansion lane is intentionally NOT down-weighted. It is
+    // the load-bearing mechanism for entity-terminal multi-hop ("Niraj's
+    // manager's former employer's city" → Infosys → Bangalore): those answer
+    // docs surface ONLY through the expansion lane, so reducing its weight trades
+    // the multi-hop recall away. Taming the single-hop noise it can add (a
+    // neighbour doc edging out a direct hit) without losing multi-hop needs a
+    // signal the bare lanes don't carry — i.e. cross-encoder rerank, which is a
+    // deploy-time gate — not a fusion-weight cut here.
+    let _ = graph_expanded;
     let fused = fuse(&outputs, fusion_k, &plan.fusion.weights, plan.fusion.method);
     let fused_len = fused.len();
 
@@ -1008,6 +1025,187 @@ fn maybe_apply_lexical_prf(
             "PRF expansion applied",
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Graph query expansion — the read-side multi-hop mechanism.
+// ---------------------------------------------------------------------------
+
+/// Max BFS depth for graph query expansion. N-hop, not a fixed 2: complex
+/// memories chain several relations deep ("X's manager's former employer's
+/// city"), so the walk follows the relation graph to this depth over the raw
+/// relation tables. Bounded together with the name / fan-out caps so a dense
+/// hub can't blow up the probe.
+const GRAPH_EXPANSION_MAX_HOPS: usize = 4;
+
+/// Total connected-entity names harvested across the whole BFS. BFS order means
+/// nearer entities are collected first; the budget caps the expanded query so a
+/// hub's transitive closure stays a bounded term set.
+const GRAPH_EXPANSION_MAX_NAMES: usize = 24;
+
+/// Per-node branching cap so one highly-connected entity can't dominate the
+/// frontier (and the term budget).
+const GRAPH_EXPANSION_FANOUT: usize = 8;
+
+/// Graph query expansion — how the DB answers multi-hop reads with no read-side
+/// LLM and no client knowledge of the graph.
+///
+/// The client sends only text. A multi-hop cue — "Where did Niraj's manager
+/// work before?" — names neither the bridge entity ("Meera") nor the answer
+/// entity ("Infosys"), so the bare lexical/semantic probes can't reach the
+/// answer doc. But both are reachable from the cue's anchor by walking the typed
+/// graph: this resolves the anchor entities named in the cue, BFS-walks their
+/// relations up to [`GRAPH_EXPANSION_MAX_HOPS`] over the raw relation tables,
+/// and injects the connected entities' canonical names as extra terms into the
+/// lexical (tantivy) probe. BM25 then matches the answer doc on the resolved
+/// name, the semantic lane still matches the relation phrasing, and RRF fuses
+/// them. Going N-hop (not a fixed 2) is the point — deep chains
+/// ("…sister's husband's job") resolve because the BFS reaches the answer
+/// entity however many edges away it sits.
+///
+/// Recall-additive, mirroring [`maybe_apply_lexical_prf`]: the expanded hits are
+/// unioned into the lexical lane (or added as one if lexical produced none —
+/// e.g. a possessive cue the bare BM25 parse choked on), never dropping a bare
+/// hit. Fail-open on any miss (no anchor, empty graph, retriever error).
+fn maybe_apply_graph_expansion(
+    outputs: &mut Vec<(Retriever, Vec<RankedItem>)>,
+    plan: &QueryPlan,
+    request: &QueryRequest,
+    ctx: &RetrievalExecutorContext,
+    include_statements: bool,
+) -> bool {
+    use std::collections::HashSet;
+
+    let Some(text) = request.text.as_deref() else {
+        return false;
+    };
+    let Some(lex_planned) = plan
+        .retrievers
+        .iter()
+        .find(|r| r.retriever == Retriever::Lexical)
+    else {
+        return false;
+    };
+    let Ok(rtxn) = ctx.metadata.read_txn() else {
+        return false;
+    };
+
+    // Anchor entities named in the cue. Use the scored resolver, not
+    // canonical-only: a cue says "Niraj" while the entity is stored as "Niraj
+    // Georgian", so we need exact + alias + the resolver's partial-name tier
+    // (an unambiguous token-subset → the full entity at 0.9) — otherwise the
+    // whole expansion never fires. Take score >= ANCHOR_FLOOR; trigram-fuzzy
+    // anchors are too loose to seed a multi-hop walk.
+    const ANCHOR_FLOOR: f32 = 0.9;
+    let mut anchors: Vec<EntityId> = Vec::new();
+    let mut visited: HashSet<EntityId> = HashSet::new();
+    for cue in crate::retrieval::router::entity_cue_candidates(text) {
+        if let Ok(scored) = brain_metadata::entity_resolve_scored(&rtxn, &cue, 5) {
+            for (id, score) in scored {
+                if score >= ANCHOR_FLOOR && visited.insert(id) {
+                    anchors.push(id);
+                }
+            }
+        }
+    }
+    if anchors.is_empty() {
+        return false;
+    }
+
+    // BFS the relation graph N hops, collecting connected entity canonical
+    // names (the anchors themselves are already in the cue, so they're seeded
+    // into `visited` and not re-collected).
+    let filter = brain_metadata::RelationListFilter {
+        relation_type: None,
+        current_only: true,
+        limit: 0,
+    };
+    let mut frontier = anchors;
+    let mut names: Vec<String> = Vec::new();
+    'bfs: for _hop in 0..GRAPH_EXPANSION_MAX_HOPS {
+        let mut next: Vec<EntityId> = Vec::new();
+        for &node in &frontier {
+            let mut neighbors: Vec<EntityId> = Vec::new();
+            if let Ok(out) = brain_metadata::relation_list_from(&rtxn, node, &filter) {
+                neighbors.extend(out.iter().map(|r| r.to_entity));
+            }
+            if let Ok(inc) = brain_metadata::relation_list_to(&rtxn, node, &filter) {
+                neighbors.extend(inc.iter().map(|r| r.from_entity));
+            }
+            for other in neighbors.into_iter().take(GRAPH_EXPANSION_FANOUT) {
+                if !visited.insert(other) {
+                    continue;
+                }
+                if let Ok(Some(e)) = brain_metadata::entity_get(&rtxn, other) {
+                    if !e.canonical_name.trim().is_empty() {
+                        names.push(e.canonical_name);
+                    }
+                }
+                next.push(other);
+                if names.len() >= GRAPH_EXPANSION_MAX_NAMES {
+                    break 'bfs;
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    drop(rtxn);
+    if names.is_empty() {
+        return false;
+    }
+
+    // Tokenize the collected names into content terms not already in the query.
+    let original: HashSet<String> = lexical_content_terms(text).into_iter().collect();
+    let mut terms: Vec<String> = Vec::new();
+    let mut seen_term: HashSet<String> = HashSet::new();
+    for nm in &names {
+        for raw in nm.split_whitespace() {
+            let t = trim_token_punct(raw).to_lowercase();
+            if t.len() < PRF_MIN_TERM_LEN
+                || LEXICAL_STOPWORDS.contains(&t.as_str())
+                || original.contains(&t)
+            {
+                continue;
+            }
+            if seen_term.insert(t.clone()) {
+                terms.push(t);
+            }
+        }
+    }
+    if terms.is_empty() {
+        return false;
+    }
+
+    let expanded = match invoke_lexical(lex_planned, request, ctx, include_statements, &terms) {
+        Ok(hits) => hits,
+        Err(_) => return false,
+    };
+    if expanded.is_empty() {
+        return false;
+    }
+
+    // Route the expanded hits into the GRAPH lane, not the lexical lane. The
+    // expansion is a graph-derived signal, and — crucially for ranking — a
+    // separate lane gives the multi-hop answer its OWN RRF contribution. If it
+    // were merged into the lexical lane it would compete there at a single mid
+    // rank and lose fusion to the anchor's own memories, which appear in BOTH
+    // semantic and lexical (two RRF terms). As its own lane, the answer doc —
+    // top-ranked among the name-matched hits — gets an independent term and
+    // surfaces. Merge into an existing graph lane (BFS proximity) or add one.
+    let mut hits = expanded;
+    hits.truncate(lex_planned.top_n);
+    for (i, it) in hits.iter_mut().enumerate() {
+        it.rank = (i as u32) + 1;
+    }
+    if let Some((_, graph_out)) = outputs.iter_mut().find(|(r, _)| *r == Retriever::Graph) {
+        merge_lexical_hits(graph_out, hits, lex_planned.top_n);
+    } else {
+        outputs.push((Retriever::Graph, hits));
+    }
+    true
 }
 
 /// Pick the relevance-feedback memory ids from the per-retriever

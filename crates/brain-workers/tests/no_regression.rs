@@ -19,7 +19,7 @@ use brain_ops::test_support::single_body;
 use brain_ops::{dispatch, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
-    EncodeRequest, MemoryKindWire, RecallRequest, RequestBody,
+    EncodeRequest, RecallRequest, RequestBody,
 };
 use brain_protocol::envelope::response::ResponseBody;
 use brain_workers::{
@@ -84,12 +84,8 @@ async fn encode_one(ctx: &OpsContext, rid: u32, text: &str) {
     let req = EncodeRequest {
         text: text.into(),
         context_id: 1,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: vec![],
         request_id,
         txn_id: None,
-        deduplicate: false,
         occurred_at_unix_nanos: None,
     };
     let _ = dispatch(
@@ -104,7 +100,8 @@ async fn encode_one(ctx: &OpsContext, rid: u32, text: &str) {
 async fn recall_one(ctx: &OpsContext, cue: &str) -> usize {
     let req = RecallRequest {
         cue_text: cue.into(),
-        top_k: 5,
+        subject_name: String::new(),
+        max_results: 5,
         confidence_threshold: 0.0,
         context_filter: None,
         age_bound_unix_nanos: None,
@@ -127,7 +124,7 @@ async fn recall_one(ctx: &OpsContext, cue: &str) -> usize {
     .await
     .unwrap();
     match single_body(outcome) {
-        ResponseBody::Recall(r) => r.results.len(),
+        ResponseBody::Recall(r) => r.memories.len(),
         _ => 0,
     }
 }

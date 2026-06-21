@@ -15,7 +15,7 @@
     "name": "req_encode",
     "opcode": "0x0020",
     "kind": "request",
-    "payload_len": 183
+    "payload_len": 102
   },
   {
     "name": "req_encode_vector_direct",
@@ -27,7 +27,7 @@
     "name": "req_recall",
     "opcode": "0x0021",
     "kind": "request",
-    "payload_len": 293
+    "payload_len": 316
   },
   {
     "name": "req_forget",
@@ -93,7 +93,7 @@
     "name": "resp_recall",
     "opcode": "0x00A1",
     "kind": "response",
-    "payload_len": 59
+    "payload_len": 77
   },
   {
     "name": "resp_forget",
@@ -303,7 +303,7 @@
     "name": "frame_encode",
     "opcode": "0x0020",
     "kind": "frame",
-    "payload_len": 215
+    "payload_len": 134
   },
   {
     "name": "frame_encode_vector_direct",
@@ -321,6 +321,6 @@
     "name": "frame_recall_eos",
     "opcode": "0x00A1",
     "kind": "frame",
-    "payload_len": 91
+    "payload_len": 109
   }
 ]

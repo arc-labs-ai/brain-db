@@ -425,10 +425,7 @@ pub async fn handle_entity_tombstone(
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        if entity_get(&rtxn, id)
-            .map_err(OpError::from)?
-            .is_none()
-        {
+        if entity_get(&rtxn, id).map_err(OpError::from)?.is_none() {
             return Err(OpError::NotFound {
                 what: "entity",
                 detail: format!("{id:?}"),

@@ -1,7 +1,6 @@
 //! FORGET handler — non-TXN path submits a Tombstone phase through
 //! the unified writer; in-TXN ops buffer for later commit.
 
-
 use brain_core::MemoryId;
 use brain_planner::{plan_forget_inner, ForgetOp, ForgetOutcome};
 use brain_protocol::envelope::request::{ForgetMode, ForgetRequest};

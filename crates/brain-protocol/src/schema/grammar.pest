@@ -15,6 +15,7 @@ statement    = _{
       namespace_decl
     | use_decl
     | entity_type_def
+    | kind_def
     | predicate_def
     | relation_type_def
     | extractor_def
@@ -96,7 +97,36 @@ predicate_object_field      = { "object" ~ ":" ~ object_type }
 predicate_stateful_field    = { "stateful" ~ ":" ~ bool_literal }
 predicate_description_field = { "description" ~ ":" ~ string_literal }
 
-statement_kind = @{ "Fact" | "Preference" | "Event" | "Any" }
+statement_kind = @{ "Fact" | "Preference" | "Event" | "Attribute" | "Relation" | "Directive" | "Any" }
+
+// ────────────────────────────────────────────────────────────────────────
+// User-declared kind (the expansion lever)
+// ────────────────────────────────────────────────────────────────────────
+
+kind_def = {
+    "define" ~ "kind" ~ identifier ~ "{" ~
+        kind_field+ ~
+    "}"
+}
+
+kind_field = _{
+      kind_cardinality_field
+    | kind_temporal_field
+    | kind_object_field
+    | kind_polarity_field
+    | kind_hint_field
+}
+
+kind_cardinality_field = { "cardinality" ~ ":" ~ kind_cardinality }
+kind_temporal_field    = { "temporal" ~ ":" ~ temporal_model }
+kind_object_field      = { "object" ~ ":" ~ "[" ~ object_kind_list ~ "]" }
+kind_polarity_field    = { "polarity" ~ ":" ~ bool_literal }
+kind_hint_field        = { "hint" ~ ":" ~ string_literal }
+
+kind_cardinality = @{ "single" | "set" }
+temporal_model   = @{ "state" | "event" | "none" }
+object_kind      = @{ "entity" | "value" | "time" | "quantity" | "list" }
+object_kind_list = { object_kind ~ ("," ~ object_kind)* ~ ","? }
 
 object_type = {
       object_type_value

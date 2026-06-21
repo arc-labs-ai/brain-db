@@ -468,9 +468,30 @@ fn lookup_current_statement(
     kind: StatementKind,
 ) -> Result<Option<StatementId>, StatementOpError> {
     let bys = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
-    let key = (subject.to_bytes(), kind.as_u8(), predicate.raw(), 1u8);
-    let bytes: Option<[u8; 16]> = bys.get(&key)?.map(|g| g.value());
-    Ok(bytes.map(StatementId::from))
+    // The trailing statement id is part of the key now; single-valued
+    // kinds still have exactly one current row, so a range scan over the
+    // (subject, kind, predicate, is_current=1) prefix yields it.
+    let lo = (
+        subject.to_bytes(),
+        kind.as_u8(),
+        predicate.raw(),
+        1u8,
+        [0u8; 16],
+    );
+    let hi = (
+        subject.to_bytes(),
+        kind.as_u8(),
+        predicate.raw(),
+        1u8,
+        [0xffu8; 16],
+    );
+    // Single-valued kinds have exactly one current row; take the first.
+    let mut it = bys.range(lo..=hi)?;
+    let first = match it.next() {
+        Some(entry) => Some(StatementId::from(entry?.1.value())),
+        None => None,
+    };
+    Ok(first)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,22 +1,45 @@
-//! ENCODE handler.
+//! ENCODE handler — the write router.
+//!
+//! ENCODE expresses *intent*: the text to remember, where it belongs,
+//! and when its content happened. The mechanical decisions — memory
+//! `kind`, `salience`, whether the write deduplicates, and which edges
+//! get wired — are decided here, server-side, not by the client. The
+//! wire `EncodeRequest` no longer carries them.
 //!
 //! Without `txn_id`: validate + embed + reserve id + dedup check +
-//! build a multi-phase Write (UpsertMemory + N × Link) and submit.
+//! build a single-phase Write (UpsertMemory) and submit.
 //! With `txn_id`: validate + embed + reserve a `MemoryId`, push to
 //! the buffer, return a preview response. Writes happen at TXN_COMMIT.
 
-use brain_core::{ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience};
+use brain_core::{ContextId, MemoryId, MemoryKind, Salience};
 use brain_metadata::tables::memory::MemoryMetadata;
-use brain_planner::{plan_encode_inner, EdgeOutcome};
+use brain_planner::plan_encode_inner;
 use brain_protocol::envelope::request::EncodeRequest;
 use brain_protocol::envelope::response::EncodeResponse;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
 use crate::handlers::link::downcast_writer_pub;
-use crate::state::idempotency::hash_encode_request;
-use crate::txn::{BufferedEdgeSpec, BufferedEncode, BufferedReplay};
+use crate::txn::{BufferedEncode, BufferedReplay};
 use crate::write::{Phase, PhaseAck, Write, WriteId};
+
+/// Router-owned memory kind for an ENCODE. A real classifier is future
+/// work; until then every text encode files as Episodic.
+const DEFAULT_KIND: MemoryKind = MemoryKind::Episodic;
+
+/// Router-owned salience floor for an ENCODE. The client no longer
+/// supplies a hint; the write router decides it.
+const DEFAULT_SALIENCE: f32 = 0.5;
+
+/// Router policy: the write path stores faithfully — it does NOT collapse
+/// distinct encodes that happen to share text. Exact request *replays* are
+/// already deduplicated by `request_id` (idempotency); two genuinely
+/// separate observations of the same text (e.g. the same fact re-stated at
+/// a different `occurred_at`) are distinct memories and must both persist.
+/// Redundancy across near-duplicate memories is reconciled asynchronously
+/// by the near-dup consolidation worker, not by dropping writes here. The
+/// DB owns this decision; the client cannot toggle it.
+const ROUTER_DEDUPLICATE: bool = false;
 
 #[tracing::instrument(name = "brain.encode", skip_all)]
 pub async fn handle_encode(
@@ -27,9 +50,12 @@ pub async fn handle_encode(
         return handle_encode_in_txn(req, txn_id, ctx).await;
     }
 
-    // 1. Input validation via the existing planner check.
-    let plan = plan_encode_inner(&req, &ctx.planner_ctx)?;
-    let salience = plan.wal_append.salience_initial;
+    // 1. Input validation via the existing planner check. The plan now
+    // reports the router's policy kind/salience (the client no longer
+    // supplies them); we read them straight off the constants for
+    // clarity and use the plan only as the validation gate.
+    let _plan = plan_encode_inner(&req, &ctx.planner_ctx)?;
+    let salience = DEFAULT_SALIENCE;
 
     // 1b. Idempotency replay short-circuit. The same
     // request_id arriving twice must return the original response. The
@@ -40,7 +66,7 @@ pub async fn handle_encode(
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id = WriteId::from_request(brain_core::RequestId::from(req.request_id));
     let context_id = ContextId::from(req.context_id);
-    let kind = MemoryKind::from(req.kind);
+    let kind = DEFAULT_KIND;
     let embedding_model_fp = ctx.executor.embedder.fingerprint();
     let request_hash = encode_request_hash(&req, embedding_model_fp, ctx.executor.caller_agent);
     match real_writer.idempotency_lookup(write_id, Some(request_hash)) {
@@ -64,10 +90,10 @@ pub async fn handle_encode(
         .map_err(|e| OpError::ExecError(brain_planner::ExecError::EmbedFailed(e)))?;
     let content_hash = *blake3::hash(req.text.as_bytes()).as_bytes();
 
-    // 3. Dedup check — when opted in, look up
+    // 3. Dedup check — DB policy is always-on dedup. Look up
     // (agent, context, content_hash). On hit, return the existing
     // memory id without submitting a Write.
-    if req.deduplicate {
+    if ROUTER_DEDUPLICATE {
         if let Some(existing) = lookup_fingerprint(ctx, content_hash, context_id)? {
             return Ok(EncodeResponse {
                 memory_id: existing.raw(),
@@ -77,7 +103,7 @@ pub async fn handle_encode(
                 lsn: 0,
                 agent_id: ctx.executor.caller_agent.into(),
                 context_id: req.context_id,
-                kind: req.kind,
+                kind: kind.into(),
                 created_at_unix_nanos: 0,
                 edges_out_count: 0,
                 embedding_model_fp,
@@ -98,23 +124,15 @@ pub async fn handle_encode(
         .map_err(|e| OpError::ExecError(brain_planner::ExecError::WriterFailed(e)))?;
     let created_at = now_unix_nanos();
 
-    // 5. Compute per-edge outcomes: an edge whose target doesn't
-    // exist is `TargetMissing` (skipped, not an error). Read once
-    // through a single rtxn.
-    let edge_outcomes = compute_edge_outcomes(ctx, &req)?;
-    let auto_edges_added = edge_outcomes
-        .iter()
-        .filter(|o| matches!(o, EdgeOutcome::Inserted))
-        .count() as u32;
-
-    // 6. Build the multi-phase Write: UpsertMemory + N × Link.
-    // `req.text` is no longer read after this point (the embedding ran
-    // off `&req.text` above and `req.text` doesn't surface in the
-    // response). Move the string into the phase instead of cloning it
-    // — clients can ship multi-KB memories and that clone showed up in
-    // hot-path allocator traces.
-    let mut phases: Vec<Phase> = Vec::with_capacity(1 + req.edges.len());
-    phases.push(Phase::UpsertMemory {
+    // 5. Build the single-phase Write: UpsertMemory. ENCODE carries no
+    // client edges — auto/temporal-edge derivation is the workers' job,
+    // enqueued post-commit by submit(). `req.text` is no longer read
+    // after this point (the embedding ran off `&req.text` above and
+    // `req.text` doesn't surface in the response). Move the string into
+    // the phase instead of cloning it — clients can ship multi-KB
+    // memories and that clone showed up in hot-path allocator traces.
+    let auto_edges_added: u32 = 0;
+    let phases: Vec<Phase> = vec![Phase::UpsertMemory {
         id: memory_id,
         text: std::mem::take(&mut req.text),
         vector: Box::new(vector),
@@ -125,30 +143,15 @@ pub async fn handle_encode(
         occurred_at_unix_nanos: req.occurred_at_unix_nanos,
         arena_slot: memory_id.slot(),
         embedding_model_fp,
-        content_hash: if req.deduplicate {
+        content_hash: if ROUTER_DEDUPLICATE {
             Some(content_hash)
         } else {
             None
         },
-        deduplicate: req.deduplicate,
-    });
-    for (edge, outcome) in req.edges.iter().zip(edge_outcomes.iter()) {
-        if !matches!(outcome, EdgeOutcome::Inserted) {
-            continue;
-        }
-        phases.push(Phase::Link {
-            from: NodeRef::Memory(memory_id),
-            to: NodeRef::Memory(MemoryId::from(edge.target)),
-            kind: EdgeKindRef::Builtin(EdgeKind::from(edge.kind)),
-            weight: edge.weight,
-            origin: brain_metadata::tables::edge::origin::EXPLICIT,
-            derived_by: brain_metadata::tables::edge::derived_by::CLIENT,
-            disambiguator: brain_metadata::tables::edge::zero_disambiguator(),
-            created_at_unix_nanos: created_at,
-        });
-    }
+        deduplicate: ROUTER_DEDUPLICATE,
+    }];
 
-    // 7. Submit.
+    // 6. Submit.
     let write = Write::from_phases(write_id, ctx.executor.caller_agent, phases)
         .with_request_hash(request_hash);
     let ack = real_writer
@@ -175,7 +178,7 @@ pub async fn handle_encode(
         lsn: ack.lsn_first.raw(),
         agent_id: ctx.executor.caller_agent.into(),
         context_id: req.context_id,
-        kind: req.kind,
+        kind: kind.into(),
         created_at_unix_nanos: created_at,
         edges_out_count: auto_edges_added,
         embedding_model_fp,
@@ -208,48 +211,15 @@ fn lookup_fingerprint(
     Ok(t.get(&key).ok().flatten().map(|g| g.value().memory_id()))
 }
 
-/// For each edge in the request, classify the outcome:
-/// `Inserted` when the target memory exists, `TargetMissing` otherwise.
-/// Runs in one rtxn so all edge targets see a consistent metadata
-/// view; the corresponding Link phases skip TargetMissing edges.
-fn compute_edge_outcomes(
-    ctx: &OpsContext,
-    req: &EncodeRequest,
-) -> Result<Vec<EdgeOutcome>, OpError> {
-    if req.edges.is_empty() {
-        return Ok(Vec::new());
-    }
-    let rtxn = ctx.executor.metadata.read_txn().map_err(|e| {
-        OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
-    })?;
-    let mems_table = rtxn
-        .open_table(brain_metadata::tables::memory::MEMORIES_TABLE)
-        .map_err(|e| {
-            OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
-        })?;
-    Ok(req
-        .edges
-        .iter()
-        .map(|edge| {
-            let target = MemoryId::from(edge.target);
-            if mems_table
-                .get(target.to_be_bytes())
-                .ok()
-                .flatten()
-                .is_some()
-            {
-                EdgeOutcome::Inserted
-            } else {
-                EdgeOutcome::TargetMissing
-            }
-        })
-        .collect())
-}
-
 /// Hash of the encode request used for idempotency conflict
 /// detection. Mirrors [`crate::state::idempotency::hash_encode_request`]
 /// but operates directly on [`EncodeRequest`] so the non-TXN path can
 /// stamp the writer's cache without first building an EncodeOp.
+///
+/// The router-decided machinery (kind / salience / dedup / edges) is
+/// fixed policy, so it contributes constant bytes to the hash. The hash
+/// still distinguishes encodes by text / context / fingerprint, which is
+/// what idempotency-conflict detection needs.
 fn encode_request_hash(
     req: &EncodeRequest,
     embedding_model_fp: [u8; 16],
@@ -258,21 +228,13 @@ fn encode_request_hash(
     let op = brain_planner::EncodeOp {
         request_id: brain_core::RequestId::from(req.request_id),
         context_id: ContextId::from(req.context_id),
-        kind: MemoryKind::from(req.kind),
+        kind: DEFAULT_KIND,
         text: req.text.clone(),
         vector: [0.0; brain_embed::VECTOR_DIM],
-        salience_initial: req.salience_hint,
+        salience_initial: DEFAULT_SALIENCE,
         fingerprint: embedding_model_fp,
-        edges: req
-            .edges
-            .iter()
-            .map(|e| brain_planner::EncodeOpEdge {
-                target: MemoryId::from(e.target),
-                kind: EdgeKind::from(e.kind),
-                weight: e.weight,
-            })
-            .collect(),
-        deduplicate: req.deduplicate,
+        edges: Vec::new(),
+        deduplicate: ROUTER_DEDUPLICATE,
         content_hash: *blake3::hash(req.text.as_bytes()).as_bytes(),
         agent_id: agent,
     };
@@ -343,7 +305,7 @@ fn reconstruct_encode_response(
         lsn: cached.lsn_first.raw(),
         agent_id: ctx.executor.caller_agent.into(),
         context_id: req.context_id,
-        kind: req.kind,
+        kind: DEFAULT_KIND.into(),
         created_at_unix_nanos: created_at,
         edges_out_count: auto_edges_added,
         embedding_model_fp,
@@ -357,41 +319,23 @@ async fn handle_encode_in_txn(
     txn_id: [u8; 16],
     ctx: &OpsContext,
 ) -> Result<EncodeResponse, OpError> {
-    // 1. Validate via the planner first — same input checks the non-
-    //    txn path runs (text length, salience range, edge cap, kind).
-    let plan = plan_encode_inner(&req, &ctx.planner_ctx)?;
-    let salience = plan.wal_append.salience_initial;
-    let _ = plan;
+    // 1. Validate via the planner first — same input check the non-txn
+    //    path runs (text non-empty + size cap). Kind/salience/dedup are
+    //    router policy, not client input.
+    let _plan = plan_encode_inner(&req, &ctx.planner_ctx)?;
+    let salience = DEFAULT_SALIENCE;
 
     // 2. Validate the txn is Active.
     let _ = ctx.txn_store.validate_active(txn_id)?;
 
     // 3. Build an EncodeOp shape for hashing (matches the non-txn
     //    idempotency hash so a cross-txn replay surfaces conflicts).
-    let request_hash = {
-        let op = brain_planner::EncodeOp {
-            request_id: brain_core::RequestId::from(req.request_id),
-            context_id: ContextId::from(req.context_id),
-            kind: MemoryKind::from(req.kind),
-            text: req.text.clone(),
-            vector: [0.0; brain_embed::VECTOR_DIM],
-            salience_initial: req.salience_hint,
-            fingerprint: ctx.executor.embedder.fingerprint(),
-            edges: req
-                .edges
-                .iter()
-                .map(|e| brain_planner::EncodeOpEdge {
-                    target: MemoryId::from(e.target),
-                    kind: EdgeKind::from(e.kind),
-                    weight: e.weight,
-                })
-                .collect(),
-            deduplicate: req.deduplicate,
-            content_hash: *blake3::hash(req.text.as_bytes()).as_bytes(),
-            agent_id: ctx.executor.caller_agent,
-        };
-        hash_encode_request(&op)
-    };
+    //    The router-decided fields are constant policy.
+    let request_hash = encode_request_hash(
+        &req,
+        ctx.executor.embedder.fingerprint(),
+        ctx.executor.caller_agent,
+    );
 
     // 4. Intra-txn replay check.
     let replay = ctx.txn_store.with_buffer(txn_id, |buf| {
@@ -402,17 +346,12 @@ async fn handle_encode_in_txn(
                     hex_short(&txn_id)
                 )));
             }
-            // Same request → return cached preview.
-            if let Some(BufferedReplay::Encode {
-                memory_id,
-                edge_outcomes,
-            }) = buf.request_id_cache.get(&req.request_id)
+            // Same request → return cached preview. ENCODE carries no
+            // client edges, so the replayed auto-edge count is always 0.
+            if let Some(BufferedReplay::Encode { memory_id, .. }) =
+                buf.request_id_cache.get(&req.request_id)
             {
-                let auto = edge_outcomes
-                    .iter()
-                    .filter(|o| matches!(o, EdgeOutcome::Inserted))
-                    .count() as u32;
-                return Ok(Some((*memory_id, auto)));
+                return Ok(Some((*memory_id, 0u32)));
             }
         }
         Ok(None)
@@ -437,7 +376,7 @@ async fn handle_encode_in_txn(
             lsn: 0,
             agent_id: ctx.executor.caller_agent.into(),
             context_id: req.context_id,
-            kind: req.kind,
+            kind: DEFAULT_KIND.into(),
             created_at_unix_nanos: 0,
             edges_out_count: auto_edges_added,
             embedding_model_fp: ctx.executor.embedder.fingerprint(),
@@ -472,45 +411,10 @@ async fn handle_encode_in_txn(
         .map_err(|e| OpError::ExecError(brain_planner::ExecError::WriterFailed(e)))?;
     let created_at = crate::txn::now_unix_nanos_pub();
 
-    // 7. Compute edge outcomes against committed + in-buffer memories.
-    //    The metadata read uses a fresh redb read txn; pending
-    //    memories are checked against the buffer.
-    let edge_outcomes: Vec<EdgeOutcome> = {
-        let rtxn = ctx.executor.metadata.read_txn().map_err(|e| {
-            OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
-        })?;
-        let mems_table = rtxn
-            .open_table(brain_metadata::tables::memory::MEMORIES_TABLE)
-            .map_err(|e| {
-                OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
-            })?;
-
-        let pending_ids: std::collections::HashSet<MemoryId> =
-            ctx.txn_store.with_buffer(txn_id, |buf| {
-                Ok(buf.encodes.iter().map(|e| e.memory_id).collect())
-            })?;
-
-        req.edges
-            .iter()
-            .map(|edge| {
-                let target = MemoryId::from(edge.target);
-                let committed = mems_table
-                    .get(target.to_be_bytes())
-                    .map(|opt| opt.is_some())
-                    .unwrap_or(false);
-                if committed || pending_ids.contains(&target) {
-                    EdgeOutcome::Inserted
-                } else {
-                    EdgeOutcome::TargetMissing
-                }
-            })
-            .collect()
-    };
-
-    let auto_edges_added = edge_outcomes
-        .iter()
-        .filter(|o| matches!(o, EdgeOutcome::Inserted))
-        .count() as u32;
+    // 7. ENCODE carries no client edges — the auto/temporal-edge
+    //    workers derive edges post-commit. The buffer therefore stores
+    //    zero edges; the COMMIT path runs unchanged with an empty list.
+    let auto_edges_added: u32 = 0;
 
     // 8. Build the BufferedEncode and push. Slot version comes from
     //    the reserved id (`reserve_memory_id` consults the
@@ -522,7 +426,7 @@ async fn handle_encode_in_txn(
         ContextId::from(req.context_id),
         memory_id.slot(),
         memory_id.version(),
-        MemoryKind::from(req.kind),
+        DEFAULT_KIND,
         ctx.executor.embedder.fingerprint(),
         salience,
         req.text.len() as u32,
@@ -535,23 +439,8 @@ async fn handle_encode_in_txn(
         metadata,
         text: req.text.clone(),
         vector,
-        edges: req
-            .edges
-            .iter()
-            .zip(edge_outcomes.iter())
-            .filter_map(|(e, o)| {
-                if matches!(o, EdgeOutcome::Inserted) {
-                    Some(BufferedEdgeSpec {
-                        target: MemoryId::from(e.target),
-                        kind: EdgeKind::from(e.kind),
-                        weight: e.weight,
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect(),
-        kind: MemoryKind::from(req.kind),
+        edges: Vec::new(),
+        kind: DEFAULT_KIND,
         context_id: ContextId::from(req.context_id),
         salience_initial: salience,
         fingerprint: ctx.executor.embedder.fingerprint(),
@@ -569,7 +458,7 @@ async fn handle_encode_in_txn(
             req.request_id,
             BufferedReplay::Encode {
                 memory_id,
-                edge_outcomes: edge_outcomes.clone(),
+                edge_outcomes: Vec::new(),
             },
         );
         Ok(())
@@ -584,7 +473,7 @@ async fn handle_encode_in_txn(
         lsn: 0,
         agent_id: ctx.executor.caller_agent.into(),
         context_id: req.context_id,
-        kind: req.kind,
+        kind: DEFAULT_KIND.into(),
         created_at_unix_nanos: created_at,
         edges_out_count: auto_edges_added,
         embedding_model_fp: ctx.executor.embedder.fingerprint(),

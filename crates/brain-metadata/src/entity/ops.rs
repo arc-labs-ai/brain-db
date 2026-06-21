@@ -89,7 +89,14 @@ pub enum EntityOpError {
 /// Idempotent: `normalize_name(normalize_name(s)) == normalize_name(s)`.
 #[must_use]
 pub fn normalize_name(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    // Fold to canonical composition (NFC) FIRST so a precomposed "São Paulo"
+    // (`ã` = U+00E3) and a decomposed one (`a` + U+0303) produce the same key
+    // — otherwise the same real-world name splits into duplicate entities
+    // depending on the client's input method. Casefolding follows.
     let collapsed: String = s
+        .nfc()
+        .collect::<String>()
         .trim()
         .to_lowercase()
         .split_whitespace()
@@ -169,6 +176,178 @@ pub fn entity_resolve_canonical_all_types(
     for tid in type_ids {
         if let Some(id) = entity_lookup_by_canonical_name(rtxn, EntityTypeId::from(tid), candidate)?
         {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Minimum trigram-Jaccard a fuzzy candidate must clear to be offered by
+/// [`entity_resolve_scored`]. Read-path resolution feeds a grounded answer,
+/// so a wrong subject yields a wrong fact — the floor is deliberately
+/// conservative (well above noise, below the write-path auto-merge bar) and
+/// the caller still decides whether the top score is decisive.
+pub const READ_RESOLVE_TRIGRAM_FLOOR: f32 = 0.5;
+
+/// Read-only, confidence-scored "resolve this surface to an EXISTING entity"
+/// helper — the primitive the read path needs to anchor a structured answer.
+/// Unlike the write-path resolver it never mints; unlike
+/// [`entity_resolve_canonical_all_types`] it returns a graded list so the
+/// caller can tell a decisive match from an ambiguous one.
+///
+/// Tiers, highest confidence first (a given entity keeps only its best score):
+///   1. exact canonical-name match  → `1.0`
+///   2. alias match                 → `0.95`
+///   3. trigram-Jaccard ≥ floor     → the Jaccard score itself
+///
+/// Embedding-based resolution (entity HNSW) is intentionally NOT here: the
+/// in-RAM index lives outside the metadata layer, so the recall path layers
+/// it on top of this deterministic redb core when it wants the extra tier.
+///
+/// Results are sorted by confidence descending; ties keep insertion order.
+/// Bounded by `max_candidates` to cap the per-call trigram scan.
+pub fn entity_resolve_scored(
+    rtxn: &ReadTransaction,
+    surface: &str,
+    max_candidates: usize,
+) -> Result<Vec<(EntityId, f32)>, EntityOpError> {
+    use crate::entity::trigram::{candidates_for_query, jaccard, trigrams_of_entity};
+    use brain_core::resolution::trigrams::extract_trigrams;
+
+    let normalized = normalize_name(surface);
+    if normalized.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let type_ids: Vec<u32> = {
+        let types_t = rtxn.open_table(ENTITY_TYPES_TABLE)?;
+        let mut v = Vec::new();
+        for entry in types_t.iter()? {
+            let (k, _) = entry?;
+            v.push(k.value());
+        }
+        v
+    };
+
+    // Best score per entity. A later, lower-tier hit never overwrites a
+    // higher-tier one (we only raise).
+    let mut best: std::collections::HashMap<EntityId, f32> = std::collections::HashMap::new();
+    let raise = |id: EntityId, score: f32, best: &mut std::collections::HashMap<EntityId, f32>| {
+        best.entry(id)
+            .and_modify(|s| {
+                if score > *s {
+                    *s = score;
+                }
+            })
+            .or_insert(score);
+    };
+
+    // Tier 1 + 2: exact canonical (1.0) and alias (0.95) across all types.
+    for &tid in &type_ids {
+        let type_id = EntityTypeId::from(tid);
+        if let Some(id) = entity_lookup_by_canonical_name(rtxn, type_id, surface)? {
+            raise(id, 1.0, &mut best);
+        }
+        for id in entity_lookup_by_alias(rtxn, type_id, surface)? {
+            raise(id, 0.95, &mut best);
+        }
+    }
+
+    // Tier 3: trigram-Jaccard over the fuzzy candidate union. Score each
+    // candidate against the query's trigrams; keep those clearing the floor.
+    //
+    // Tier 3.5 (same scan): partial-name coref. A short cue ("Niraj") is a
+    // partial reference to an entity stored under its full name ("Niraj
+    // Georgian"). Trigram-Jaccard scores that pair below the floor — the longer
+    // name dilutes the shared trigrams — so without this tier the short cue
+    // never reaches the full entity's facts. We cannot lean on write-time coref
+    // to have folded the short form in as an alias: independent extractor tiers
+    // mint the short and full forms as separate nodes (sometimes under different
+    // types), so the alias is often absent. A surface whose tokens are a STRICT
+    // subset of a candidate's tokens is a partial name of it; we offer the full
+    // entity only when EXACTLY ONE candidate is such a superset, since an
+    // ambiguous partial ("John" ⊂ both "John Smith" and "John Doe") would
+    // conflate distinct referents — decline rather than guess.
+    const PARTIAL_NAME_SCORE: f32 = 0.9;
+    let surface_tokens: HashSet<&str> = normalized
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .collect();
+    let query_trigrams = extract_trigrams(&normalized);
+    if !query_trigrams.is_empty() {
+        let mut scanned: HashSet<EntityId> = HashSet::new();
+        let mut partial_supersets: Vec<EntityId> = Vec::new();
+        for &tid in &type_ids {
+            let type_id = EntityTypeId::from(tid);
+            for cand in candidates_for_query(rtxn, type_id, &normalized)? {
+                if !scanned.insert(cand) {
+                    continue;
+                }
+                let Some(entity) = entity_get(rtxn, cand)? else {
+                    continue;
+                };
+                let score = jaccard(&query_trigrams, &trigrams_of_entity(&entity));
+                if score >= READ_RESOLVE_TRIGRAM_FLOOR {
+                    raise(cand, score, &mut best);
+                }
+                if !surface_tokens.is_empty() {
+                    let cand_norm = normalize_name(&entity.canonical_name);
+                    let cand_tokens: HashSet<&str> = cand_norm
+                        .split_whitespace()
+                        .filter(|t| !t.is_empty())
+                        .collect();
+                    if surface_tokens.len() < cand_tokens.len()
+                        && surface_tokens.iter().all(|t| cand_tokens.contains(t))
+                    {
+                        partial_supersets.push(cand);
+                    }
+                }
+            }
+        }
+        if partial_supersets.len() == 1 {
+            raise(partial_supersets[0], PARTIAL_NAME_SCORE, &mut best);
+        }
+    }
+
+    let mut out: Vec<(EntityId, f32)> = best.into_iter().collect();
+    out.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out.truncate(max_candidates);
+    Ok(out)
+}
+
+/// Wtxn-capable mirror of [`entity_resolve_canonical_all_types`]. Exact
+/// canonical-name match across every registered entity type, evaluated inside
+/// an open write transaction. Used by the extractor's coined-subject path to
+/// reuse an already-typed entity (any type) instead of minting a duplicate
+/// generic node — the caller treats a *single* hit as the same referent and
+/// leaves 0-or-many to the normal type-scoped mint.
+pub fn entity_resolve_canonical_all_types_wtxn(
+    wtxn: &WriteTransaction,
+    candidate: &str,
+) -> Result<Vec<EntityId>, EntityOpError> {
+    let normalized = normalize_name(candidate);
+    if normalized.is_empty() {
+        return Ok(Vec::new());
+    }
+    let type_ids: Vec<u32> = {
+        let types_t = wtxn.open_table(ENTITY_TYPES_TABLE)?;
+        let mut v = Vec::new();
+        for entry in types_t.iter()? {
+            let (k, _) = entry?;
+            v.push(k.value());
+        }
+        v
+    };
+    let canon_t = wtxn.open_table(ENTITY_BY_CANONICAL_NAME_TABLE)?;
+    let mut out: Vec<EntityId> = Vec::new();
+    for tid in type_ids {
+        if let Some(g) = canon_t.get(&(tid, normalized.as_str()))? {
+            let id = EntityId::from(g.value());
             if !out.contains(&id) {
                 out.push(id);
             }
@@ -722,6 +901,40 @@ mod tests {
     }
 
     #[test]
+    fn normalize_folds_nfc_composed_and_decomposed() {
+        // "São Paulo" with a precomposed ã (U+00E3) and with a decomposed
+        // a + combining tilde (U+0303) must produce the SAME key — otherwise
+        // the same city splits into two entities depending on input method.
+        let composed = "S\u{00E3}o Paulo";
+        let decomposed = "Sa\u{0303}o Paulo";
+        assert_ne!(composed, decomposed, "byte-distinct inputs");
+        assert_eq!(normalize_name(composed), normalize_name(decomposed));
+        // Same for an accented Latin name and a precomposed/decomposed é.
+        assert_eq!(normalize_name("Jos\u{00E9}"), normalize_name("Jose\u{0301}"));
+    }
+
+    #[test]
+    fn cross_type_wtxn_reuses_single_match_only() {
+        // A coined surface that already exists as exactly one typed entity
+        // resolves to it (no duplicate); 0 or >1 matches return nothing so the
+        // caller mints under the generic type instead of risking a wrong merge.
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let aspirin = person_entity("aspirin"); // stand-in for a typed entity
+        let id = aspirin.id;
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_put(&wtxn, &aspirin).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let wtxn = db.write_txn().unwrap();
+        let hits = entity_resolve_canonical_all_types_wtxn(&wtxn, "Aspirin").unwrap();
+        assert_eq!(hits, vec![id], "single cross-type match is reused");
+        let none = entity_resolve_canonical_all_types_wtxn(&wtxn, "ibuprofen").unwrap();
+        assert!(none.is_empty(), "no match → caller mints fresh");
+    }
+
+    #[test]
     fn normalize_is_idempotent() {
         for s in ["Priya Patel", "  HELLO ", "Straße", "x", ""] {
             let once = normalize_name(s);
@@ -879,6 +1092,105 @@ mod tests {
         let mut expected = vec![a_id, b_id];
         expected.sort();
         assert_eq!(ids, expected);
+    }
+
+    // ----- scored resolution --------------------------------------------
+
+    #[test]
+    fn resolve_scored_grades_exact_alias_and_fuzzy() {
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let mut exact = person_entity("Priya Patel");
+        exact.aliases.push("PP".into());
+        let exact_id = exact.id;
+        // A second entity whose name is a near-miss of the query surface,
+        // sharing most trigrams ("priya parel" vs "priya patel").
+        let fuzzy = person_entity("Priya Parel");
+        let fuzzy_id = fuzzy.id;
+
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, &exact).unwrap();
+        entity_put(&wtxn, &fuzzy).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+
+        // Exact canonical → 1.0, ranked first.
+        let scored = entity_resolve_scored(&rtxn, "Priya Patel", 8).unwrap();
+        assert_eq!(scored.first().map(|(id, _)| *id), Some(exact_id));
+        assert!((scored[0].1 - 1.0).abs() < f32::EPSILON);
+        // The near-miss also surfaces via the trigram tier, below the exact.
+        assert!(
+            scored.iter().any(|(id, s)| *id == fuzzy_id && *s < 1.0),
+            "fuzzy near-miss should surface below the exact match: {scored:?}"
+        );
+
+        // Alias resolves to 0.95.
+        let by_alias = entity_resolve_scored(&rtxn, "PP", 8).unwrap();
+        assert!(
+            by_alias
+                .iter()
+                .any(|(id, s)| *id == exact_id && (*s - 0.95).abs() < f32::EPSILON),
+            "alias hit should score 0.95: {by_alias:?}"
+        );
+
+        // A surface with no canonical/alias/trigram overlap resolves to nothing.
+        assert!(entity_resolve_scored(&rtxn, "Zzxqwv", 8).unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_scored_partial_name_maps_short_cue_to_full_entity() {
+        // Fragmentation case: a person is stored under the full name ("Niraj
+        // Georgian") while a cue says just "Niraj". Trigram-Jaccard scores that
+        // pair below the fuzzy floor (the longer name dilutes the shared
+        // trigrams), so only the partial-name tier reaches it — at 0.9.
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let full = person_entity("Niraj Georgian");
+        let full_id = full.id;
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_put(&wtxn, &full).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let scored = entity_resolve_scored(&rtxn, "Niraj", 8).unwrap();
+        let hit = scored.iter().find(|(id, _)| *id == full_id);
+        assert!(
+            hit.is_some(),
+            "short cue 'Niraj' must resolve to 'Niraj Georgian': {scored:?}"
+        );
+        assert!(
+            (hit.unwrap().1 - 0.9).abs() < f32::EPSILON,
+            "partial-name tier scores 0.9: {scored:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_scored_partial_name_declines_when_ambiguous() {
+        // "John" is a strict token-subset of BOTH "John Smith" and "John Doe" —
+        // two distinct people. The partial-name tier must decline rather than
+        // conflate them, so neither full entity is offered at the 0.9 tier.
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let smith = person_entity("John Smith");
+        let doe = person_entity("John Doe");
+        let (smith_id, doe_id) = (smith.id, doe.id);
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_put(&wtxn, &smith).unwrap();
+            entity_put(&wtxn, &doe).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let scored = entity_resolve_scored(&rtxn, "John", 8).unwrap();
+        assert!(
+            !scored.iter().any(|(id, s)| (*id == smith_id || *id == doe_id)
+                && (*s - 0.9).abs() < f32::EPSILON),
+            "ambiguous partial name must not resolve to either full entity: {scored:?}"
+        );
     }
 
     // ----- update / rename ----------------------------------------------
@@ -1186,8 +1498,16 @@ mod tests {
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
-        // "pri" comes only from the alias.
-        let cands = lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, *b"pri").unwrap();
+        // A trigram that comes only from the alias "Priya Patel", not from the
+        // bare canonical "x". Trigrams are opaque buckets, so derive the query
+        // from `extract_trigrams` rather than a byte literal.
+        use crate::entity::trigram::extract_trigrams;
+        let alias_only = extract_trigrams("priya patel")
+            .difference(&extract_trigrams("x"))
+            .copied()
+            .next()
+            .expect("alias contributes trigrams the canonical lacks");
+        let cands = lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, alias_only).unwrap();
         assert!(cands.contains(&id));
     }
 
@@ -1210,17 +1530,25 @@ mod tests {
         }
 
         let rtxn = db.read_txn().unwrap();
-        // "bra" present (new canonical).
+        use crate::entity::trigram::extract_trigrams;
+        // A "bravo" trigram (new canonical) is indexed. Opaque buckets →
+        // derive the query from `extract_trigrams`.
+        let bravo_tg = extract_trigrams("bravo")
+            .into_iter()
+            .next()
+            .expect("bravo has trigrams");
+        assert!(lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, bravo_tg)
+            .unwrap()
+            .contains(&id));
+        // An "alpha" trigram remains: the old canonical_name moves into
+        // aliases on rename, so its trigrams stay indexed (resolver
+        // continuity).
+        let alpha_tg = extract_trigrams("alpha")
+            .into_iter()
+            .next()
+            .expect("alpha has trigrams");
         assert!(
-            lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, *b"bra")
-                .unwrap()
-                .contains(&id)
-        );
-        // "alp" — old canonical_name moves into aliases on rename, so
-        // its trigrams stay indexed. (Rename preserves the old name as
-        // an alias for resolver continuity.)
-        assert!(
-            lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, *b"alp")
+            lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, alpha_tg)
                 .unwrap()
                 .contains(&id),
             "alpha trigrams should remain (moved to aliases on rename)"

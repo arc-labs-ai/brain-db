@@ -123,9 +123,7 @@ pub async fn handle_relation_create(
             }
             (rt.id, rt.is_symmetric, None)
         } else {
-            match relation_type_lookup_by_qname(&rtxn, namespace, name)
-                .map_err(OpError::from)?
-            {
+            match relation_type_lookup_by_qname(&rtxn, namespace, name).map_err(OpError::from)? {
                 Some(rt) => (rt.id, rt.is_symmetric, None),
                 None => (
                     // Sentinel id; apply replaces it via

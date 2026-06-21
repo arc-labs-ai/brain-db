@@ -40,6 +40,18 @@ pub trait SemanticRetriever: Send + Sync {
         scope: SemanticScope,
         config: &SemanticRetrieverConfig,
     ) -> Result<Vec<RankedItem>, SemanticError>;
+
+    /// Return a memory's stored embedding by id, if obtainable. Used to
+    /// cue-condition graph-walk candidates — a structurally-walked node's
+    /// score is multiplied by its cosine to the query — so the always-on
+    /// entity-graph lane surfaces relationship-connected memories that are
+    /// ALSO on-topic, never flooding the top-K with the anchor's whole
+    /// neighbourhood. Default `None`: retrievers without a by-id vector
+    /// source (mocks, test doubles) contribute no relevance signal and the
+    /// caller leaves such a candidate's graph score unchanged.
+    fn vector_for(&self, _id: brain_core::MemoryId) -> Option<[f32; VECTOR_DIM]> {
+        None
+    }
 }
 
 /// Query input — either a pre-embedded 384-d vector or raw

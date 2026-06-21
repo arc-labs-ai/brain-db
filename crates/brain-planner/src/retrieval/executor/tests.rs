@@ -813,7 +813,10 @@ impl LexicalRetriever for RecordingLexical {
         _scope: LexicalScope,
         _config: &LexicalRetrieverConfig,
     ) -> Result<Vec<RankedItem>, LexicalError> {
-        self.captured.lock().expect("lock").push(query.terms.clone());
+        self.captured
+            .lock()
+            .expect("lock")
+            .push(query.terms.clone());
         let mut r = self.responses.lock().expect("lock");
         let resp = if r.len() > 1 {
             r.pop_front().unwrap_or_default()
@@ -833,7 +836,8 @@ fn seed_texts<'a>(metadata: &MetadataDb, rows: impl IntoIterator<Item = (u64, &'
         let mut t = wtxn.open_table(TEXTS_TABLE).expect("open texts");
         for (slot, text) in rows {
             let id = MemoryId::pack(0, slot, 0);
-            t.insert(&id.to_be_bytes(), text.as_bytes()).expect("insert text");
+            t.insert(&id.to_be_bytes(), text.as_bytes())
+                .expect("insert text");
         }
     }
     wtxn.commit().expect("commit");
@@ -952,8 +956,7 @@ fn prf_reprobes_lexical_with_expansion_on_low_specificity_query() {
 
     let req = prf_request("Where did Caroline move from?");
     let qp = plan(&req).expect("plan");
-    let result =
-        futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
+    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
 
     let calls = captured.lock().expect("lock").clone();
     assert_eq!(calls.len(), 2, "bare probe + one PRF re-probe: {calls:?}");

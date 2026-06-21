@@ -197,9 +197,11 @@ mod tests {
 
     #[test]
     fn re_export_extract_trigrams_works() {
+        // Trigrams are opaque code-point buckets; assert the count + that the
+        // leading "  p" window bucket is shared with another "p"-initial word.
         let t = extract_trigrams("priya");
-        assert!(t.contains(b"  p"));
-        assert!(t.contains(b"ya "));
+        assert_eq!(t.len(), 6);
+        assert!(!t.is_disjoint(&extract_trigrams("patel")));
     }
 
     #[test]
@@ -221,9 +223,15 @@ mod tests {
                 "alias union must include canonical"
             );
         }
-        // "pat" is only in the alias.
-        assert!(with_alias.contains(b"pat"));
-        assert!(!canonical_only.contains(b"pat"));
+        // The alias contributes trigrams the canonical name lacks: every
+        // "patel"-only bucket is present with the alias and absent without.
+        let patel_only: HashSet<[u8; 3]> = extract_trigrams("patel")
+            .difference(&extract_trigrams("priya"))
+            .copied()
+            .collect();
+        assert!(!patel_only.is_empty());
+        assert!(patel_only.is_subset(&with_alias));
+        assert!(patel_only.is_disjoint(&canonical_only));
     }
 
     #[test]

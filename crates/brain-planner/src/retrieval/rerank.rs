@@ -144,10 +144,11 @@ pub fn rerank_top_n(
             } else {
                 0.0
             };
-            // Deliberate blend (owner-approved): spec §13/06 currently
-            // says "sort by cross-encoder score descending"; a spec
-            // amendment to a normalized fusion+rerank blend is tracked
-            // separately and is out of scope here.
+            // Deliberate blend (owner-approved): instead of sorting purely
+            // by cross-encoder score descending, we keep the fusion signal
+            // in the ranking via a normalized fusion+rerank blend. The
+            // amendment to that ordering is tracked separately and is out
+            // of scope here.
             let key = fus_norm + RERANK_ALPHA * rer_norm;
             (key, item)
         })

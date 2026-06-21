@@ -301,7 +301,10 @@ impl Iterator for WalReader {
                 });
             }
 
-            let seg = self.current.as_mut().unwrap();
+            let seg = self
+                .current
+                .as_mut()
+                .expect("invariant: segment was just loaded into self.current above, or we returned");
 
             // (b) End of this segment? Move to the next.
             if seg.cursor >= seg.bytes.len() {
@@ -449,7 +452,9 @@ fn read_and_validate_segment_header(
     // can be 256 MiB; we'd rather not hold them all in memory during open.
     let header_bytes = read_first_n_bytes(path, WAL_SEGMENT_HEADER_LEN)?;
 
-    let magic: [u8; 4] = header_bytes[0..4].try_into().unwrap();
+    let magic: [u8; 4] = header_bytes[0..4]
+        .try_into()
+        .expect("invariant: slice [0..4] is exactly 4 bytes, header length-checked above");
     if magic != WAL_SEGMENT_MAGIC {
         return Err(WalReadError::InvalidSegmentMagic {
             path: path.to_path_buf(),
@@ -457,7 +462,11 @@ fn read_and_validate_segment_header(
         });
     }
 
-    let format_version = u32::from_le_bytes(header_bytes[4..8].try_into().unwrap());
+    let format_version = u32::from_le_bytes(
+        header_bytes[4..8]
+            .try_into()
+            .expect("invariant: slice [4..8] is exactly 4 bytes, header length-checked above"),
+    );
     if format_version != WAL_SEGMENT_FORMAT_VERSION_V1 {
         return Err(WalReadError::UnsupportedSegmentFormatVersion {
             path: path.to_path_buf(),
@@ -466,7 +475,11 @@ fn read_and_validate_segment_header(
     }
 
     // Verify CRC over [0..48].
-    let stored_crc = u32::from_le_bytes(header_bytes[48..52].try_into().unwrap());
+    let stored_crc = u32::from_le_bytes(
+        header_bytes[48..52]
+            .try_into()
+            .expect("invariant: slice [48..52] is exactly 4 bytes, header length-checked above"),
+    );
     let computed = crc32c::crc32c(&header_bytes[0..WAL_SEGMENT_HEADER_CRC_COVERAGE_END]);
     if stored_crc != computed {
         return Err(WalReadError::SegmentHeaderCrcMismatch {
@@ -476,7 +489,9 @@ fn read_and_validate_segment_header(
         });
     }
 
-    let header_shard_uuid: [u8; 16] = header_bytes[8..24].try_into().unwrap();
+    let header_shard_uuid: [u8; 16] = header_bytes[8..24]
+        .try_into()
+        .expect("invariant: slice [8..24] is exactly 16 bytes, header length-checked above");
     if header_shard_uuid != expected_shard_uuid {
         return Err(WalReadError::SegmentShardUuidMismatch {
             path: path.to_path_buf(),
@@ -485,7 +500,11 @@ fn read_and_validate_segment_header(
         });
     }
 
-    let header_segment_seq = u64::from_le_bytes(header_bytes[24..32].try_into().unwrap());
+    let header_segment_seq = u64::from_le_bytes(
+        header_bytes[24..32]
+            .try_into()
+            .expect("invariant: slice [24..32] is exactly 8 bytes, header length-checked above"),
+    );
     if header_segment_seq != filename_seq {
         return Err(WalReadError::FilenameSegmentSeqMismatch {
             path: path.to_path_buf(),
@@ -494,7 +513,11 @@ fn read_and_validate_segment_header(
         });
     }
 
-    let starting_lsn = u64::from_le_bytes(header_bytes[32..40].try_into().unwrap());
+    let starting_lsn = u64::from_le_bytes(
+        header_bytes[32..40]
+            .try_into()
+            .expect("invariant: slice [32..40] is exactly 8 bytes, header length-checked above"),
+    );
 
     Ok(SegmentInfo {
         path: path.to_path_buf(),

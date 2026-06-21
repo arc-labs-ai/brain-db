@@ -22,7 +22,7 @@ use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
 use brain_protocol::envelope::request::{
-    EncodeRequest, MemoryKindWire, RecallRequest, TxnBeginRequest,
+    EncodeRequest, RecallRequest, TxnBeginRequest,
 };
 use brain_protocol::envelope::response::{RecallResponseFrame, ResponseBody};
 use brain_protocol::Frame;
@@ -163,7 +163,8 @@ async fn round_trip(
 fn recall_request(txn_id: Option<[u8; 16]>) -> RecallRequest {
     RecallRequest {
         cue_text: "meeting preferences".into(),
-        top_k: 5,
+        subject_name: String::new(),
+        max_results: 5,
         confidence_threshold: 0.0,
         context_filter: None,
         age_bound_unix_nanos: None,
@@ -184,13 +185,9 @@ async fn encode_text(client: &mut TcpStream, stream_id: u32, text: &str) {
     let req = EncodeRequest {
         text: text.into(),
         context_id: 0,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: Vec::new(),
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
-        deduplicate: false,
     };
     let (opcode, body) = round_trip(client, stream_id, RequestBody::Encode(req)).await;
     if opcode != Opcode::EncodeResp.as_u16() {
@@ -214,11 +211,11 @@ async fn seed_fixture(client: &mut TcpStream) {
 
 fn assert_retrieval(frame: &RecallResponseFrame) {
     assert!(
-        !frame.results.is_empty(),
+        !frame.memories.is_empty(),
         "expected retrieval hits, got none"
     );
     let mut any_with_retrievers = false;
-    for r in &frame.results {
+    for r in &frame.memories {
         if !r.contributing_retrievers.is_empty() {
             any_with_retrievers = true;
             assert!(
@@ -378,9 +375,9 @@ async fn recall_against_zero_memories_returns_empty_response() {
         ResponseBody::Recall(r) => {
             assert!(r.is_final, "cold-start retrieval must mark response final");
             assert!(
-                r.results.is_empty(),
+                r.memories.is_empty(),
                 "zero-memory shard must return an empty result, got {} hits",
-                r.results.len(),
+                r.memories.len(),
             );
         }
         other => panic!("expected RecallResp, got {other:?}"),
@@ -508,7 +505,7 @@ async fn txn_recall_invariants_hold_across_request_shapes() {
 
         let mut req = recall_request(txn_id);
         req.cue_text = cue;
-        req.top_k = top_k;
+        req.max_results = top_k;
         req.salience_floor = salience;
         let (opcode, body) = round_trip(&mut client, sid, RequestBody::Recall(req)).await;
         sid += 2;
@@ -529,7 +526,7 @@ async fn txn_recall_invariants_hold_across_request_shapes() {
                 // strict salience floors can legitimately return zero
                 // hits, so only assert the retrieval shape when there's
                 // something to inspect.
-                if !r.results.is_empty() {
+                if !r.memories.is_empty() {
                     assert_retrieval(&r);
                 }
             }

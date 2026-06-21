@@ -28,7 +28,7 @@ use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
 use brain_protocol::envelope::request::{
-    EncodeRequest, MemoryKindWire, RecallRequest, RequestBody,
+    EncodeRequest, RecallRequest, RequestBody,
 };
 use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
@@ -167,13 +167,9 @@ async fn encode(client: &mut TcpStream, stream_id: u32, text: &str) -> u128 {
     let req = EncodeRequest {
         text: text.into(),
         context_id: 0,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: Vec::new(),
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
-        deduplicate: false,
     };
     let (opcode, body) = round_trip(client, stream_id, RequestBody::Encode(req)).await;
     match body {
@@ -188,7 +184,8 @@ async fn encode(client: &mut TcpStream, stream_id: u32, text: &str) -> u128 {
 async fn recall_ids(client: &mut TcpStream, stream_id: u32, cue: &str) -> Vec<u128> {
     let req = RecallRequest {
         cue_text: cue.into(),
-        top_k: 50,
+        subject_name: String::new(),
+        max_results: 50,
         confidence_threshold: 0.0,
         context_filter: None,
         age_bound_unix_nanos: None,
@@ -210,7 +207,7 @@ async fn recall_ids(client: &mut TcpStream, stream_id: u32, cue: &str) -> Vec<u1
         "expected RecallResp, got 0x{opcode:02x}"
     );
     match body {
-        ResponseBody::Recall(r) => r.results.iter().map(|h| h.memory_id).collect(),
+        ResponseBody::Recall(r) => r.memories.iter().map(|h| h.memory_id).collect(),
         other => panic!("expected RecallResp, got {other:?}"),
     }
 }

@@ -63,6 +63,9 @@ pub enum StatementOpError {
     #[error("redb table error: {0}")]
     Table(#[from] redb::TableError),
 
+    #[error("kind registry: {0}")]
+    Kind(#[from] crate::schema::kind::KindOpError),
+
     #[error("statement {0:?} not found")]
     NotFound(StatementId),
 

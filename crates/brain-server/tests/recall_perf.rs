@@ -41,7 +41,7 @@ use brain_ops::test_support::{run_in_glommio, single_body};
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
-    EncodeRequest, MemoryKindWire, RecallRequest, TxnBeginRequest,
+    EncodeRequest, RecallRequest, TxnBeginRequest,
 };
 
 const ITERATIONS: usize = 100;
@@ -186,13 +186,9 @@ async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str) -> u128 {
     let req = EncodeRequest {
         text: text.into(),
         context_id: 0,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: Vec::new(),
         request_id,
         txn_id: None,
         occurred_at_unix_nanos: None,
-        deduplicate: false,
     };
     let outcome = brain_ops::dispatch(
         RequestBody::Encode(req),
@@ -230,7 +226,8 @@ async fn seed(fix: &Fixture) -> u128 {
 fn recall_req(txn_id: Option<[u8; 16]>) -> RecallRequest {
     RecallRequest {
         cue_text: "meeting preferences".into(),
-        top_k: 5,
+        subject_name: String::new(),
+        max_results: 5,
         confidence_threshold: 0.0,
         context_filter: None,
         age_bound_unix_nanos: None,

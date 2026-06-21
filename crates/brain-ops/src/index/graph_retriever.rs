@@ -38,8 +38,8 @@ use brain_core::{
     EdgeKind, EdgeKindRef, EntityId, MemoryId, NodeRef, RelationId, RelationTypeId, StatementId,
 };
 use brain_index::{
-    proximity_score, validate_graph_depth, Direction, GraphError, GraphQuery, GraphRetriever,
-    GraphRetrieverConfig, RankedItem, RankedItemId,
+    proximity_score, validate_graph_depth, Direction, GraphError, GraphQuery,
+    GraphRetriever, GraphRetrieverConfig, RankedItem, RankedItemId,
 };
 use brain_metadata::statement::{statement_list, StatementListFilter, StatementOpError};
 use brain_metadata::tables::edge::{walk_incoming, walk_outgoing, EdgeOpError, EdgeRow};
@@ -76,6 +76,13 @@ impl GraphRetriever for BrainGraphRetriever {
             .read_txn()
             .map_err(|e| GraphError::IndexUnavailable(format!("read_txn: {e}")))?;
 
+        // One always-on graph algorithm: the proximity-decay BFS walk below
+        // (no flag, no PPR alternative). Its structural output is
+        // cue-conditioned by the recall layer — each candidate is scaled by
+        // its cosine to the query — so the entity-graph lane is always lit
+        // without the subject-dump flood, while the walk keeps the
+        // direction / relation-type-filter / closed-neighbourhood semantics
+        // typed-graph QUERY relies on.
         match query {
             GraphQuery::Star {
                 anchor,
@@ -245,7 +252,6 @@ fn walk(
 
     Ok(rank_emitted(emitted, config.top_k))
 }
-
 fn collect_neighbours(
     rtxn: &ReadTransaction,
     node: NodeRef,

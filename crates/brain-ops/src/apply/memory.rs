@@ -96,6 +96,15 @@ pub fn apply_upsert_memory(
             .map_err(|e| ApplyError::Storage(format!("TEXTS insert: {e:?}")))?;
     }
 
+    // Durable extraction trigger. Enqueue this memory for asynchronous
+    // extraction INSIDE the same wtxn as the memory row, so the trigger
+    // commits atomically with the memory — a crash or restart can never
+    // lose the work. This is the source of truth for "this memory needs
+    // extraction"; the writer's flume channel is only a low-latency
+    // wakeup hint. `created_at` is the enqueue stamp.
+    brain_metadata::extraction_queue_enqueue(wtxn, *id, *created_at_unix_nanos)
+        .map_err(|e| ApplyError::Storage(format!("extraction_queue enqueue: {e:?}")))?;
+
     // FINGERPRINTS_TABLE entry when the encode opted into content-
     // hash dedup. The row keys (agent_id, context_id, content_hash) →
     // this memory id, so a future ENCODE with matching text/agent/ctx

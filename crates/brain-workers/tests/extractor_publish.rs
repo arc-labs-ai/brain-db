@@ -62,6 +62,26 @@ struct Fixture {
     _tempdir: tempfile::TempDir,
 }
 
+impl Fixture {
+    /// Make a memory eligible for the durable extractor cycle: write
+    /// its text into `TEXTS_TABLE` and durably enqueue it, both in one
+    /// commit (mirrors `apply_upsert_memory`), then nudge the worker's
+    /// wakeup channel. The worker reads its work from the durable
+    /// queue + TEXTS_TABLE, not from the channel payload.
+    fn enqueue(&self, memory_id: MemoryId, text: &str) {
+        use brain_metadata::tables::text::TEXTS_TABLE;
+        let wtxn = self.metadata.write_txn().unwrap();
+        {
+            let mut t = wtxn.open_table(TEXTS_TABLE).unwrap();
+            t.insert(&memory_id.to_be_bytes(), text.as_bytes()).unwrap();
+        }
+        brain_metadata::extraction_queue_enqueue(&wtxn, memory_id, now_unix_nanos()).unwrap();
+        wtxn.commit().unwrap();
+        // Wakeup hint only — contents ignored by the worker.
+        let _ = self.extractor_tx.send((memory_id, Arc::from(text)));
+    }
+}
+
 fn build_fixture_with_registry(registry: ExtractorRegistry) -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
@@ -223,10 +243,7 @@ async fn drain_success_publishes_one_ok_event() {
     let mut rx = fixture.ops.events.receiver();
 
     let memory_id = make_memory_id(42);
-    fixture
-        .extractor_tx
-        .send((memory_id, Arc::from("hello world")))
-        .unwrap();
+    fixture.enqueue(memory_id, "hello world");
 
     let drained = run_cycle(&fixture).await;
     assert_eq!(drained, 1);
@@ -273,10 +290,7 @@ async fn drain_pipeline_failure_publishes_one_failed_event() {
     let mut rx = fixture.ops.events.receiver();
 
     let memory_id = make_memory_id(43);
-    fixture
-        .extractor_tx
-        .send((memory_id, Arc::from("broken pipeline")))
-        .unwrap();
+    fixture.enqueue(memory_id, "broken pipeline");
 
     let drained = run_cycle(&fixture).await;
     assert_eq!(drained, 1);
@@ -334,13 +348,10 @@ async fn seeded_pattern_extractor_persists_entities_end_to_end() {
     let mut rx = fixture.ops.events.receiver();
 
     let memory_id = make_memory_id(99);
-    fixture
-        .extractor_tx
-        .send((
-            memory_id,
-            Arc::from("Priya Sharma joined Stripe as a Senior Engineer in San Francisco"),
-        ))
-        .unwrap();
+    fixture.enqueue(
+        memory_id,
+        "Priya Sharma joined Stripe as a Senior Engineer in San Francisco",
+    );
 
     let drained = run_cycle(&fixture).await;
     assert_eq!(drained, 1);
@@ -426,13 +437,10 @@ async fn shard_registry_with_real_gliner_persists_entities() {
     let fixture = build_fixture_with_registry(registry);
     let mut rx = fixture.ops.events.receiver();
     let memory_id = make_memory_id(123);
-    fixture
-        .extractor_tx
-        .send((
-            memory_id,
-            Arc::from("Priya Sharma joined Stripe as a Senior Engineer in San Francisco"),
-        ))
-        .unwrap();
+    fixture.enqueue(
+        memory_id,
+        "Priya Sharma joined Stripe as a Senior Engineer in San Francisco",
+    );
 
     let drained = run_cycle(&fixture).await;
     assert_eq!(drained, 1);
@@ -485,10 +493,7 @@ async fn drain_already_extracted_publishes_one_empty_event() {
         wtxn.commit().unwrap();
     }
 
-    fixture
-        .extractor_tx
-        .send((memory_id, Arc::from("already extracted memory")))
-        .unwrap();
+    fixture.enqueue(memory_id, "already extracted memory");
 
     let drained = run_cycle(&fixture).await;
     assert_eq!(drained, 1);
@@ -513,4 +518,115 @@ async fn drain_already_extracted_publishes_one_empty_event() {
     // The `_uuid` is unused but suppresses dead-code warnings if the
     // test helper above ever stops needing it.
     let _ = Uuid::nil();
+}
+
+/// Read the durable extraction-queue depth.
+fn queue_len(metadata: &SharedMetadataDb) -> u64 {
+    let rtxn = metadata.read_txn().unwrap();
+    brain_metadata::extraction_queue_len(&rtxn).unwrap()
+}
+
+/// Whether the durable queue holds a row for `memory_id`.
+fn queue_contains(metadata: &SharedMetadataDb, memory_id: MemoryId) -> bool {
+    let rtxn = metadata.read_txn().unwrap();
+    brain_metadata::extraction_queue_drain(&rtxn, 1024)
+        .unwrap()
+        .iter()
+        .any(|(id, _)| *id == memory_id)
+}
+
+/// After a memory's extraction commits, the worker removes its durable
+/// `EXTRACTION_QUEUE_TABLE` row so a later cycle doesn't re-drain it.
+/// The audit gate would prevent re-extraction anyway, but a stale row
+/// would make the queue grow without bound.
+#[tokio::test(flavor = "current_thread")]
+async fn drained_memory_removes_its_queue_row() {
+    let mut registry = ExtractorRegistry::new();
+    registry.register(Arc::new(EmptySuccessStub {
+        id: ExtractorId::from(1),
+    }));
+    let fixture = build_fixture_with_registry(registry);
+
+    let memory_id = make_memory_id(77);
+    fixture.enqueue(memory_id, "remove me after extraction");
+    assert_eq!(queue_len(&fixture.metadata), 1, "row enqueued");
+
+    let drained = run_cycle(&fixture).await;
+    assert_eq!(drained, 1);
+
+    assert!(
+        !queue_contains(&fixture.metadata, memory_id),
+        "extracted memory's queue row must be removed",
+    );
+    assert_eq!(queue_len(&fixture.metadata), 0, "queue drained empty");
+}
+
+/// A drained memory that already has an audit row (a stale queue row
+/// left by, e.g., a crash between the extraction commit and the queue
+/// remove) is removed on the next cycle via the audit-gate path —
+/// WITHOUT re-running extraction. Pins the resumable-cleanup contract.
+#[tokio::test(flavor = "current_thread")]
+async fn already_audited_memory_removes_stale_queue_row_without_reextracting() {
+    // A stub that PANICS if invoked — proves the audit gate short-
+    // circuits before any tier runs.
+    struct NeverRunStub;
+    impl Extractor for NeverRunStub {
+        fn id(&self) -> ExtractorId {
+            ExtractorId::from(9)
+        }
+        fn kind(&self) -> ExtractorKind {
+            ExtractorKind::Pattern
+        }
+        fn name(&self) -> &str {
+            "test:never_run"
+        }
+        fn extractor_version(&self) -> u32 {
+            1
+        }
+        fn run<'a>(
+            &'a self,
+            _ctx: &'a ExtractionContext<'a>,
+            _mem: &'a CoreMemory,
+        ) -> ExtractionFuture<'a> {
+            Box::pin(async { panic!("extraction must not run for an already-audited memory") })
+        }
+    }
+
+    let mut registry = ExtractorRegistry::new();
+    registry.register(Arc::new(NeverRunStub));
+    let fixture = build_fixture_with_registry(registry);
+
+    let memory_id = make_memory_id(88);
+
+    // Pre-seed an audit row (memory already extracted) AND a stale
+    // durable queue row + text (the row that a crash would leave).
+    {
+        let wtxn = fixture.metadata.write_txn().unwrap();
+        let entry = ExtractorPipelineAuditEntry::new(
+            memory_id,
+            now_unix_nanos(),
+            pipeline_status::SUCCESS,
+            String::new(),
+            tier_status::ABSENT,
+            tier_status::ABSENT,
+            tier_status::ABSENT,
+            ExtractorItemCounts::zero(),
+            0,
+        );
+        record_extracted(&wtxn, &entry).unwrap();
+        wtxn.commit().unwrap();
+    }
+    fixture.enqueue(memory_id, "stale queue row, already audited");
+    assert_eq!(queue_len(&fixture.metadata), 1, "stale row present");
+
+    // The cycle must take the AlreadyExtracted branch (NeverRunStub
+    // would panic otherwise) and clean up the stale row.
+    let drained = run_cycle(&fixture).await;
+    assert_eq!(drained, 1);
+
+    assert!(
+        !queue_contains(&fixture.metadata, memory_id),
+        "stale queue row must be removed via the audit-gate cleanup path",
+    );
+    assert_eq!(queue_len(&fixture.metadata), 0);
 }

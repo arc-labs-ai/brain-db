@@ -13,8 +13,9 @@ use pest::Parser as _;
 use crate::schema::ast::{
     AttrType, AttributeDecl, CacheConfig, CardinalityAst, ConditionExpr, ConditionOp,
     ConditionValue, CostExpr, CostUnit, DurationAst, DurationUnit, EntityTypeDef, ExtractorDef,
-    ExtractorField, ExtractorKindAst, ExtractorTarget, LiteralValue, ObjectTypeDecl, PredicateDef,
-    RelationTypeDef, ResolverConfig, Schema, SchemaItem, StatementKindAst, TriggerExpr,
+    ExtractorField, ExtractorKindAst, ExtractorTarget, KindCardinalityAst, KindDef, LiteralValue,
+    ObjectKindAst, ObjectTypeDecl, PredicateDef, RelationTypeDef, ResolverConfig, Schema,
+    SchemaItem, StatementKindAst, TemporalModelAst, TriggerExpr,
 };
 use crate::schema::parse_error::ParseError;
 
@@ -54,6 +55,9 @@ pub fn parse_schema(input: &str) -> Result<Schema, ParseError> {
                 schema
                     .items
                     .push(SchemaItem::EntityType(parse_entity_type_def(inner)?));
+            }
+            Rule::kind_def => {
+                schema.items.push(SchemaItem::Kind(parse_kind_def(inner)?));
             }
             Rule::predicate_def => {
                 schema
@@ -294,9 +298,108 @@ fn parse_statement_kind(s: &str) -> StatementKindAst {
         "Fact" => StatementKindAst::Fact,
         "Preference" => StatementKindAst::Preference,
         "Event" => StatementKindAst::Event,
+        "Attribute" => StatementKindAst::Attribute,
+        "Relation" => StatementKindAst::Relation,
+        "Directive" => StatementKindAst::Directive,
         "Any" => StatementKindAst::Any,
         other => unreachable!("statement_kind produced {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// User-declared kind.
+// ---------------------------------------------------------------------------
+
+fn parse_kind_def(pair: Pair<'_, Rule>) -> Result<KindDef, ParseError> {
+    let line_col = pair.line_col();
+    let mut name = String::new();
+    let mut cardinality: Option<KindCardinalityAst> = None;
+    let mut temporal: Option<TemporalModelAst> = None;
+    let mut object: Vec<ObjectKindAst> = Vec::new();
+    let mut polarity = false;
+    let mut hint: Option<String> = None;
+
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::identifier => name = child.as_str().to_string(),
+            Rule::kind_cardinality_field => {
+                let p = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::kind_cardinality)
+                    .expect("cardinality field always has a kind_cardinality child");
+                cardinality = Some(match p.as_str() {
+                    "single" => KindCardinalityAst::Single,
+                    "set" => KindCardinalityAst::Set,
+                    other => unreachable!("kind_cardinality produced {other:?}"),
+                });
+            }
+            Rule::kind_temporal_field => {
+                let p = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::temporal_model)
+                    .expect("temporal field always has a temporal_model child");
+                temporal = Some(match p.as_str() {
+                    "state" => TemporalModelAst::State,
+                    "event" => TemporalModelAst::Event,
+                    "none" => TemporalModelAst::None,
+                    other => unreachable!("temporal_model produced {other:?}"),
+                });
+            }
+            Rule::kind_object_field => {
+                for ok in child.into_inner() {
+                    if ok.as_rule() == Rule::object_kind_list {
+                        for k in ok.into_inner() {
+                            if k.as_rule() == Rule::object_kind {
+                                object.push(match k.as_str() {
+                                    "entity" => ObjectKindAst::Entity,
+                                    "value" => ObjectKindAst::Value,
+                                    "time" => ObjectKindAst::Time,
+                                    "quantity" => ObjectKindAst::Quantity,
+                                    "list" => ObjectKindAst::List,
+                                    other => unreachable!("object_kind produced {other:?}"),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Rule::kind_polarity_field => {
+                let b = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::bool_literal)
+                    .expect("polarity field always has a bool_literal child");
+                polarity = b.as_str() == "true";
+            }
+            Rule::kind_hint_field => {
+                let s = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::string_literal)
+                    .expect("hint field always has a string_literal child");
+                hint = Some(unquote_string(s));
+            }
+            _ => {}
+        }
+    }
+
+    let cardinality = cardinality.ok_or_else(|| ParseError::MissingField {
+        line: line_col.0,
+        col: line_col.1,
+        field: "cardinality".into(),
+    })?;
+    let temporal = temporal.ok_or_else(|| ParseError::MissingField {
+        line: line_col.0,
+        col: line_col.1,
+        field: "temporal".into(),
+    })?;
+
+    Ok(KindDef {
+        name,
+        cardinality,
+        temporal,
+        object,
+        polarity,
+        hint,
+    })
 }
 
 fn parse_object_type(pair: Pair<'_, Rule>) -> ObjectTypeDecl {
@@ -1027,9 +1130,40 @@ mod tests {
         );
         assert_eq!(p.description.as_deref(), Some("user preference"));
         // No explicit stateful keyword → AST carries None; resolution
-        // happens at intern time (Preference defaults to true).
+        // happens at intern time. Preferences accumulate as a set (a person
+        // can like many things), so the kind-derived default is NOT stateful.
         assert_eq!(p.stateful, None);
-        assert!(p.resolved_stateful());
+        assert!(!p.resolved_stateful());
+    }
+
+    #[test]
+    fn kind_def_round_trip() {
+        let src = r#"
+            namespace t
+            define kind investment {
+                cardinality: set
+                temporal: event
+                object: [entity, quantity]
+                polarity: false
+                hint: "an entity funded another, with an amount"
+            }
+        "#;
+        let s = parse_ok(src);
+        let SchemaItem::Kind(k) = &s.items[0] else {
+            panic!("kind expected")
+        };
+        assert_eq!(k.name, "investment");
+        assert_eq!(k.cardinality, KindCardinalityAst::Set);
+        assert_eq!(k.temporal, TemporalModelAst::Event);
+        assert_eq!(
+            k.object,
+            vec![ObjectKindAst::Entity, ObjectKindAst::Quantity]
+        );
+        assert!(!k.polarity);
+        assert_eq!(
+            k.hint.as_deref(),
+            Some("an entity funded another, with an amount")
+        );
     }
 
     #[test]

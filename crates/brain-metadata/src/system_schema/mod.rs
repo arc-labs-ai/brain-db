@@ -285,42 +285,30 @@ mod tests {
         seed_system_schema(&db).unwrap();
 
         let rtxn = db.begin_read().unwrap();
+        // Predicates are an OPEN vocabulary: the seed declares ONLY the five
+        // `behavior_*` predicates (resolved by qname by MATERIALIZE_PROCEDURAL).
+        // Every domain predicate is coined on the fly at write time and is
+        // deliberately absent from the seed.
         for (expected_id, name) in [
-            (1u32, "is_a"),
-            (2, "has_name"),
-            (3, "mentions"),
-            (4, "fact"),
-            (5, "related_to"),
-            (6, "prefers"),
-            (7, "scheduled"),
-            (8, "works_at"),
-            (9, "member_of"),
-            (10, "lives_in"),
-            (11, "located_in"),
-            (12, "owns"),
-            (13, "current_role"),
-            (14, "speaks"),
-            (15, "has_skill"),
-            (16, "likes"),
-            (17, "dislikes"),
-            (18, "occurred_at"),
-            (19, "mentioned_in"),
-            (20, "participated_in"),
-            (21, "behavior_tone"),
-            (22, "behavior_style"),
-            (23, "behavior_avoids"),
-            (24, "behavior_prefers"),
-            (25, "behavior_constraint"),
-            (26, "knows"),
-            (27, "interested_in"),
-            (28, "intends"),
-            (29, "did"),
+            (1u32, "behavior_tone"),
+            (2, "behavior_style"),
+            (3, "behavior_avoids"),
+            (4, "behavior_prefers"),
+            (5, "behavior_constraint"),
         ] {
             let row = predicate_lookup_by_qname(&rtxn, "brain", name)
                 .unwrap()
                 .unwrap_or_else(|| panic!("brain:{name} predicate missing"));
             assert_eq!(row.id.raw(), expected_id, "brain:{name}");
         }
+
+        // A removed domain predicate must NOT be pre-seeded.
+        assert!(
+            predicate_lookup_by_qname(&rtxn, "brain", "works_at")
+                .unwrap()
+                .is_none(),
+            "brain:works_at must not be seeded — predicates are open-vocab"
+        );
     }
 
     #[test]

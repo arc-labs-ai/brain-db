@@ -124,12 +124,24 @@ pub fn statement_list(
     let ids: Vec<[u8; 16]> = match (filter.subject, filter.predicate, filter.kind) {
         (Some(subject), Some(predicate), Some(kind)) => {
             let by_subject = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
-            let lo = (subject.to_bytes(), kind.as_u8(), predicate.raw(), 0u8);
-            let hi = (subject.to_bytes(), kind.as_u8(), predicate.raw(), 1u8);
+            let lo = (
+                subject.to_bytes(),
+                kind.as_u8(),
+                predicate.raw(),
+                0u8,
+                [0u8; 16],
+            );
+            let hi = (
+                subject.to_bytes(),
+                kind.as_u8(),
+                predicate.raw(),
+                1u8,
+                [0xffu8; 16],
+            );
             let mut ids = Vec::new();
             for entry in by_subject.range(lo..=hi)? {
                 let (k, v) = entry?;
-                let (_, _, _, is_current_bit) = k.value();
+                let (_, _, _, is_current_bit, _) = k.value();
                 if filter.current_only && is_current_bit == 0 {
                     continue;
                 }
@@ -142,12 +154,12 @@ pub fn statement_list(
         }
         (Some(subject), _, _) => {
             let by_subject = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
-            let lo = (subject.to_bytes(), 0u8, 0u32, 0u8);
-            let hi = (subject.to_bytes(), u8::MAX, u32::MAX, 1u8);
+            let lo = (subject.to_bytes(), 0u8, 0u32, 0u8, [0u8; 16]);
+            let hi = (subject.to_bytes(), u8::MAX, u32::MAX, 1u8, [0xffu8; 16]);
             let mut ids = Vec::new();
             for entry in by_subject.range(lo..=hi)? {
                 let (k, v) = entry?;
-                let (_, k_kind, _, is_current_bit) = k.value();
+                let (_, k_kind, _, is_current_bit, _) = k.value();
                 if filter.current_only && is_current_bit == 0 {
                     continue;
                 }
@@ -157,7 +169,7 @@ pub fn statement_list(
                     }
                 }
                 if let Some(want_pred) = filter.predicate {
-                    let (_, _, k_pred, _) = k.value();
+                    let (_, _, k_pred, _, _) = k.value();
                     if k_pred != want_pred.raw() {
                         continue;
                     }
@@ -290,19 +302,33 @@ fn load_active_facts_for_subject_predicate(
     predicate: PredicateId,
 ) -> Result<Vec<Statement>, StatementOpError> {
     let bys = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
-    let key = (
+    // Cumulative Facts can have many current rows; collect them all via a
+    // range scan over the is_current=1 prefix (the trailing statement id
+    // is part of the key now, so an exact get can't address one row).
+    let lo = (
         subject.to_bytes(),
         StatementKind::Fact.as_u8(),
         predicate.raw(),
         1u8,
+        [0u8; 16],
     );
-    let bytes: Option<[u8; 16]> = bys.get(&key)?.map(|g| g.value());
-    let Some(b) = bytes else {
-        return Ok(Vec::new());
-    };
-    let s = match statement_get(rtxn, StatementId::from(b))? {
-        Some(s) => s,
-        None => return Ok(Vec::new()),
-    };
-    Ok(vec![s])
+    let hi = (
+        subject.to_bytes(),
+        StatementKind::Fact.as_u8(),
+        predicate.raw(),
+        1u8,
+        [0xffu8; 16],
+    );
+    let mut ids: Vec<[u8; 16]> = Vec::new();
+    for entry in bys.range(lo..=hi)? {
+        let (_, v) = entry?;
+        ids.push(v.value());
+    }
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(s) = statement_get(rtxn, StatementId::from(id))? {
+            out.push(s);
+        }
+    }
+    Ok(out)
 }

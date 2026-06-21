@@ -8,12 +8,15 @@
 use std::collections::HashSet;
 
 use brain_core::StatementKind;
-use brain_core::{Cardinality, EntityTypeId, ExtractorKind, PredicateId};
+use brain_core::{
+    Cardinality, EntityTypeId, ExtractorKind, KindCardinality, PredicateId, TemporalModel,
+};
 use brain_protocol::schema::{
     CardinalityAst, ExtractorKindAst, ObjectTypeDecl, SchemaItem, StatementKindAst, ValidatedSchema,
 };
 use redb::{ReadableTable, WriteTransaction};
 
+use super::kind::{kind_intern, KindOpError};
 use super::predicate::{predicate_intern, PredicateOpError};
 use crate::entity::types::{entity_type_intern, entity_type_lookup_by_name, EntityTypeOpError};
 use crate::extractor::ops::{extractor_intern, ExtractorOpError};
@@ -31,6 +34,8 @@ pub enum SchemaApplyError {
     RelationType(#[from] RelationTypeOpError),
     #[error("extractor: {0}")]
     Extractor(#[from] ExtractorOpError),
+    #[error("kind: {0}")]
+    Kind(#[from] KindOpError),
     #[error("extractor encode: {0}")]
     ExtractorEncode(String),
     #[error("redb storage: {0}")]
@@ -100,9 +105,39 @@ pub fn apply_schema_definitions(
                     now_unix_nanos,
                 )?;
             }
+            SchemaItem::Kind(k) => {
+                kind_intern(
+                    wtxn,
+                    namespace,
+                    &k.name,
+                    map_kind_cardinality(k.cardinality),
+                    map_temporal_model(k.temporal),
+                    k.polarity,
+                    k.hint.as_deref().unwrap_or(""),
+                    schema_version,
+                    now_unix_nanos,
+                )?;
+            }
         }
     }
     Ok(())
+}
+
+fn map_kind_cardinality(c: brain_protocol::schema::KindCardinalityAst) -> KindCardinality {
+    use brain_protocol::schema::KindCardinalityAst as A;
+    match c {
+        A::Single => KindCardinality::Single,
+        A::Set => KindCardinality::Set,
+    }
+}
+
+fn map_temporal_model(t: brain_protocol::schema::TemporalModelAst) -> TemporalModel {
+    use brain_protocol::schema::TemporalModelAst as A;
+    match t {
+        A::State => TemporalModel::State,
+        A::Event => TemporalModel::Event,
+        A::None => TemporalModel::Atemporal,
+    }
 }
 
 /// Mark every statement in `namespace` whose predicate isn't in the
@@ -182,6 +217,9 @@ fn map_statement_kind(k: StatementKindAst) -> Option<StatementKind> {
         StatementKindAst::Fact => Some(StatementKind::Fact),
         StatementKindAst::Preference => Some(StatementKind::Preference),
         StatementKindAst::Event => Some(StatementKind::Event),
+        StatementKindAst::Attribute => Some(StatementKind::Attribute),
+        StatementKindAst::Relation => Some(StatementKind::Relation),
+        StatementKindAst::Directive => Some(StatementKind::Directive),
         StatementKindAst::Any => None,
     }
 }

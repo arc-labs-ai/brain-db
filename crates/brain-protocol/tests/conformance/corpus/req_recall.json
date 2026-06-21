@@ -1,6 +1,7 @@
 {
   "cue_text": "what color is the sky",
-  "top_k": 10,
+  "subject_name": "sky",
+  "max_results": 10,
   "confidence_threshold": 0.3,
   "context_filter": [
     1

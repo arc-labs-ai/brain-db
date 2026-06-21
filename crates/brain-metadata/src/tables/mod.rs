@@ -12,11 +12,13 @@ pub mod contradiction;
 pub mod edge;
 pub mod entity;
 pub mod entity_type;
+pub mod extraction_queue;
 pub mod extractor;
 pub mod extractor_audit;
 pub mod fingerprint;
 pub mod hype;
 pub mod idempotency;
+pub mod kind;
 pub mod memory;
 pub mod merge;
 pub mod merge_review_queue;
@@ -28,6 +30,7 @@ pub mod relation_type;
 pub mod schema_version;
 pub mod slot_version;
 pub mod statement;
+pub mod statement_question;
 pub mod text;
 pub mod worker_checkpoints;
 
@@ -104,17 +107,21 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
         ENTITY_MENTIONS_TABLE, ENTITY_TRIGRAMS_TABLE, ENTITY_VECTORS_TABLE,
     };
     use entity_type::ENTITY_TYPES_TABLE;
+    use extraction_queue::EXTRACTION_QUEUE_TABLE;
     use extractor::{EXTRACTORS_BY_QNAME_TABLE, EXTRACTORS_TABLE};
     use extractor_audit::EXTRACTOR_PIPELINE_AUDIT_TABLE;
     use fingerprint::FINGERPRINTS_TABLE;
     use idempotency::IDEMPOTENCY_TABLE;
+    use kind::{KINDS_BY_BYTE_TABLE, KINDS_TABLE};
     use memory::{MEMORIES_BY_AGENT_TIMELINE_TABLE, MEMORIES_TABLE};
     use merge::{ENTITY_MERGE_AUDIT_OVERFLOW, MERGE_LOG_TABLE};
     use merge_review_queue::{MERGE_REVIEW_BY_STATUS_TABLE, MERGE_REVIEW_QUEUE_TABLE};
     use model_fingerprint::MODEL_FINGERPRINTS_TABLE;
     use next_lsn::NEXT_LSN_TABLE;
-    use predicate::{PREDICATES_BY_QNAME_TABLE, PREDICATES_TABLE};
-    use relation::{RELATION_BY_EVIDENCE_TABLE, RELATION_METADATA_TABLE};
+    use predicate::{PREDICATES_BY_QNAME_TABLE, PREDICATES_TABLE, PREDICATE_EMBEDDINGS_TABLE};
+    use relation::{
+        RELATION_BY_EVIDENCE_TABLE, RELATION_METADATA_TABLE, RELATION_TYPE_EMBEDDINGS_TABLE,
+    };
     use relation_type::{RELATION_TYPES_BY_QNAME_TABLE, RELATION_TYPES_TABLE};
     use schema_version::{SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE};
     use slot_version::SLOT_VERSIONS_TABLE;
@@ -124,6 +131,7 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
         STATEMENTS_BY_SUBJECT_TABLE, STATEMENTS_TABLE, STATEMENT_CHAIN_TABLE,
         STATEMENT_EMBED_QUEUE_TABLE,
     };
+    use statement_question::STATEMENT_QUESTION_VECTORS_TABLE;
     use text::TEXTS_TABLE;
     use worker_checkpoints::WORKER_CHECKPOINTS_TABLE;
 
@@ -147,11 +155,14 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     let _ = wtxn.open_table(ENTITY_TRIGRAMS_TABLE)?;
     let _ = wtxn.open_table(ENTITY_MENTIONS_TABLE)?;
     let _ = wtxn.open_table(ENTITY_VECTORS_TABLE)?;
+    let _ = wtxn.open_table(EXTRACTION_QUEUE_TABLE)?;
     let _ = wtxn.open_table(EXTRACTORS_TABLE)?;
     let _ = wtxn.open_table(EXTRACTORS_BY_QNAME_TABLE)?;
     let _ = wtxn.open_table(EXTRACTOR_PIPELINE_AUDIT_TABLE)?;
     let _ = wtxn.open_table(FINGERPRINTS_TABLE)?;
     let _ = wtxn.open_table(IDEMPOTENCY_TABLE)?;
+    let _ = wtxn.open_table(KINDS_TABLE)?;
+    let _ = wtxn.open_table(KINDS_BY_BYTE_TABLE)?;
     let _ = wtxn.open_table(MEMORIES_TABLE)?;
     let _ = wtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE)?;
     let _ = wtxn.open_table(MERGE_LOG_TABLE)?;
@@ -162,10 +173,12 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     let _ = wtxn.open_table(NEXT_LSN_TABLE)?;
     let _ = wtxn.open_table(PREDICATES_TABLE)?;
     let _ = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+    let _ = wtxn.open_table(PREDICATE_EMBEDDINGS_TABLE)?;
     let _ = wtxn.open_table(RELATION_METADATA_TABLE)?;
     let _ = wtxn.open_table(RELATION_BY_EVIDENCE_TABLE)?;
     let _ = wtxn.open_table(RELATION_TYPES_TABLE)?;
     let _ = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
+    let _ = wtxn.open_table(RELATION_TYPE_EMBEDDINGS_TABLE)?;
     let _ = wtxn.open_table(SCHEMA_VERSIONS_TABLE)?;
     let _ = wtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)?;
     let _ = wtxn.open_table(SLOT_VERSIONS_TABLE)?;
@@ -178,6 +191,7 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     let _ = wtxn.open_table(STATEMENT_CHAIN_TABLE)?;
     let _ = wtxn.open_table(EVIDENCE_OVERFLOW_TABLE)?;
     let _ = wtxn.open_table(STATEMENT_EMBED_QUEUE_TABLE)?;
+    let _ = wtxn.open_table(STATEMENT_QUESTION_VECTORS_TABLE)?;
     let _ = wtxn.open_table(TEXTS_TABLE)?;
     let _ = wtxn.open_table(WORKER_CHECKPOINTS_TABLE)?;
     Ok(())

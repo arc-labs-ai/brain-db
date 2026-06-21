@@ -10,8 +10,8 @@
 //! **Off by default** (`enabled == false`). Retracted rows stay in redb
 //! (invisible to retrieval — the lexical index drop and tombstone filter
 //! already hide them) until an operator opts the worker in via
-//! `BRAIN_STATEMENT_RECLAIM_ENABLED`. The grace window and cadence are
-//! tunable through the env knobs below.
+//! `[workers.statement_reclaim] enabled`. The grace window and cadence
+//! are tunable through the same config section.
 //!
 //! Only rows carrying the durable `TombstoneReason::Retract` marker are
 //! eligible — plain tombstones (kept for audit) and superseded rows
@@ -36,37 +36,13 @@ use crate::context::WorkerContext;
 use crate::error::WorkerError;
 use crate::worker::Worker;
 
-/// Operator opt-in flag. The worker stays a registered no-op unless this
-/// env var is a truthy value (`1` / `true` / `yes`, case-insensitive).
-pub const ENABLED_ENV: &str = "BRAIN_STATEMENT_RECLAIM_ENABLED";
-
-/// Operator override for the reclaim grace window (seconds). Falls back
-/// to [`DEFAULT_GRACE_SECONDS`] when unset, empty, non-numeric, or zero.
-pub const GRACE_SECONDS_ENV: &str = "BRAIN_STATEMENT_RECLAIM_GRACE_SECONDS";
-
-/// Operator override for the sweep cadence (seconds). Falls back to the
-/// `WorkerConfig::defaults_for` cadence when unset, empty, or zero.
-pub const PERIOD_SECONDS_ENV: &str = "BRAIN_STATEMENT_RECLAIM_PERIOD_SECONDS";
-
 /// 30 days. Matches `RETRACT_GRACE_NANOS` (the retract handler's
-/// `will_zero_at` promise) and the §19.12 retention-table default.
+/// `will_zero_at` promise) and the retention-table default.
 pub const DEFAULT_GRACE_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 /// 1 day default cadence. Mirrors the `WorkerKind::StatementReclaim`
 /// default in `WorkerConfig`.
 pub const DEFAULT_PERIOD_SECONDS: u64 = 86_400;
-
-fn resolved_grace_nanos() -> u64 {
-    let secs = crate::env::parse_positive_seconds(std::env::var(GRACE_SECONDS_ENV).ok().as_deref())
-        .unwrap_or(DEFAULT_GRACE_SECONDS);
-    secs.saturating_mul(1_000_000_000)
-}
-
-fn resolved_period() -> std::time::Duration {
-    let secs = crate::env::parse_positive_seconds(std::env::var(PERIOD_SECONDS_ENV).ok().as_deref())
-        .unwrap_or(DEFAULT_PERIOD_SECONDS);
-    std::time::Duration::from_secs(secs)
-}
 
 pub struct StatementReclaimWorker {
     config: WorkerConfig,
@@ -75,18 +51,19 @@ pub struct StatementReclaimWorker {
 }
 
 impl StatementReclaimWorker {
-    /// New worker — **disabled** by default, resolving the grace and
-    /// cadence knobs from the environment.
+    /// New worker — **disabled** by default, with the default grace and
+    /// cadence. The shard opts it in and overrides the windows from
+    /// `[workers.statement_reclaim]` via [`Self::set_enabled`],
+    /// [`Self::with_grace_seconds`], and [`Self::with_period_seconds`].
     #[must_use]
     pub fn new() -> Self {
         let mut config = WorkerConfig::defaults_for(WorkerKind::StatementReclaim);
-        config.interval = resolved_period();
-        let enabled = crate::env::parse_enabled(std::env::var(ENABLED_ENV).ok().as_deref());
-        config.enabled = enabled;
+        config.interval = std::time::Duration::from_secs(DEFAULT_PERIOD_SECONDS);
+        config.enabled = false;
         Self {
             config,
-            enabled,
-            grace_nanos: resolved_grace_nanos(),
+            enabled: false,
+            grace_nanos: DEFAULT_GRACE_SECONDS.saturating_mul(1_000_000_000),
         }
     }
 
@@ -103,9 +80,27 @@ impl StatementReclaimWorker {
         self
     }
 
+    /// Set the on/off state explicitly. The shard wires
+    /// `[workers.statement_reclaim] enabled` here.
+    #[must_use]
+    pub fn set_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self.config.enabled = enabled;
+        self
+    }
+
     #[must_use]
     pub fn with_grace_seconds(mut self, seconds: u64) -> Self {
         self.grace_nanos = seconds.saturating_mul(1_000_000_000);
+        self
+    }
+
+    /// Override the sweep cadence. The shard wires
+    /// `[workers.statement_reclaim] period_seconds`; a zero value is
+    /// clamped to 1 second so the scheduler never busy-loops.
+    #[must_use]
+    pub fn with_period_seconds(mut self, seconds: u64) -> Self {
+        self.config.interval = std::time::Duration::from_secs(seconds.max(1));
         self
     }
 

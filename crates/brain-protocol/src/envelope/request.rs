@@ -441,16 +441,8 @@ mod tests {
         round_trip(RequestBody::Encode(EncodeRequest {
             text: "hello brain".into(),
             context_id: 1_u64,
-            kind: MemoryKindWire::Episodic,
-            salience_hint: 0.25,
-            edges: vec![EdgeRequest {
-                target: sample_memory_id(),
-                kind: EdgeKindWire::Caused,
-                weight: 0.9,
-            }],
             request_id: sample_uuid(2),
             txn_id: Some(sample_uuid(3)),
-            deduplicate: true,
             occurred_at_unix_nanos: Some(1_700_000_000_000_000_000),
         }));
     }
@@ -482,7 +474,8 @@ mod tests {
     fn recall_round_trips() {
         round_trip(RequestBody::Recall(RecallRequest {
             cue_text: "what about budgets".into(),
-            top_k: 10,
+            subject_name: "Alice".into(),
+            max_results: 10,
             confidence_threshold: 0.3,
             context_filter: Some(vec![1_u64, 2_u64]),
             age_bound_unix_nanos: Some(1_700_000_000_000_000_000),
@@ -503,7 +496,8 @@ mod tests {
     fn recall_round_trips_with_agent_scope() {
         round_trip(RequestBody::Recall(RecallRequest {
             cue_text: "cross-agent budgets".into(),
-            top_k: 10,
+            subject_name: String::new(),
+            max_results: 10,
             confidence_threshold: 0.3,
             context_filter: None,
             age_bound_unix_nanos: None,

@@ -315,9 +315,7 @@ impl From<brain_metadata::statement::StatementOpError> for OpError {
                 what: "statement",
                 detail: format!("{id:?}"),
             },
-            E::AlreadyExists(id) => {
-                OpError::Conflict(format!("statement {id:?} already exists"))
-            }
+            E::AlreadyExists(id) => OpError::Conflict(format!("statement {id:?} already exists")),
             E::UnknownPredicate(p) => OpError::NotFound {
                 what: "predicate",
                 detail: format!("id={p}"),
@@ -333,15 +331,11 @@ impl From<brain_metadata::statement::StatementOpError> for OpError {
             E::AlreadyTombstoned(id) => {
                 OpError::Conflict(format!("statement {id:?} is tombstoned"))
             }
-            E::EventCannotSupersede => {
-                OpError::Conflict("events cannot be superseded".into())
-            }
+            E::EventCannotSupersede => OpError::Conflict("events cannot be superseded".into()),
             E::KindMismatch { old, new } => OpError::InvalidRequest(format!(
                 "kind mismatch on supersede: old={old:?} new={new:?}"
             )),
-            E::SubjectMismatch => {
-                OpError::InvalidRequest("subject must match on supersede".into())
-            }
+            E::SubjectMismatch => OpError::InvalidRequest("subject must match on supersede".into()),
             E::PredicateMismatch => {
                 OpError::InvalidRequest("predicate must match on supersede".into())
             }
@@ -350,6 +344,7 @@ impl From<brain_metadata::statement::StatementOpError> for OpError {
             }
             E::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
             E::Table(e) => OpError::Internal(format!("redb table: {e}")),
+            E::Kind(e) => OpError::Internal(format!("kind registry: {e}")),
             E::PredicateOp(e) => OpError::from(e),
             E::EntityOp(e) => {
                 OpError::Internal(format!("entity op forwarded from statement_ops: {e}"))

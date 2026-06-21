@@ -25,7 +25,7 @@ use brain_protocol::envelope::request::RequestBody;
 use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
 use brain_protocol::{
-    EncodeRequest, EntityCreateRequest, EvidenceRefWire, ForgetMode, ForgetRequest, MemoryKindWire,
+    EncodeRequest, EntityCreateRequest, EvidenceRefWire, ForgetMode, ForgetRequest,
     StatementCreateRequest, StatementGetRequest, StatementKindWire, StatementObjectWire,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -169,13 +169,9 @@ async fn encode(client: &mut TcpStream, stream_id: u32, text: &str) -> u128 {
     let req = EncodeRequest {
         text: text.into(),
         context_id: 0,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: Vec::new(),
         request_id: rid(),
         txn_id: None,
         occurred_at_unix_nanos: None,
-        deduplicate: false,
     };
     let (op, body) = round_trip(client, stream_id, RequestBody::Encode(req)).await;
     match body {

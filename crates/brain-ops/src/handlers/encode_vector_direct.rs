@@ -249,42 +249,41 @@ pub async fn handle_encode_vector_direct(
     })
 }
 
-/// Run the same input validations the text-encode path runs (text
-/// length, kind, salience range, edge cap, finite edge weights).
-/// Returns the post-validation salience so the handler doesn't have
-/// to plumb the planner output through.
+/// Run the input validations the vector-direct path requires: text
+/// length, kind, salience range, edge cap, finite edge weights. Unlike
+/// the shrunk client ENCODE, the admin/bulk-import vector-direct op
+/// still carries explicit kind/salience/edges, so it validates them
+/// directly via the planner's `validate_vector_direct`. Returns the
+/// validated salience so the handler doesn't re-derive it.
 fn validate_common(req: &EncodeVectorDirectRequest, ctx: &OpsContext) -> Result<f32, OpError> {
-    // Re-use the planner's validation by building an equivalent
-    // `EncodeRequest`. Cheap — the planner is pure and the structs
-    // are small.
-    let proxy = brain_protocol::envelope::request::EncodeRequest {
-        text: req.text.clone(),
-        context_id: req.context_id,
-        kind: req.kind,
-        salience_hint: req.salience_hint,
-        edges: req.edges.clone(),
-        request_id: req.request_id,
-        txn_id: None,
-        deduplicate: req.deduplicate,
-        // Vector-direct writes carry no client event time; the proxy is
-        // only used for planner validation, which ignores this field.
-        occurred_at_unix_nanos: None,
-    };
     // The planner rejects empty text. Power-user vector path may
-    // genuinely have empty text (multi-modal upstream); skip the
-    // planner's empty-text check by injecting a single-byte placeholder
-    // for the duration of validation when `text` is empty. The real
-    // text — empty or not — still rides through to the apply step.
-    let proxy = if proxy.text.is_empty() {
-        brain_protocol::envelope::request::EncodeRequest {
-            text: "<vector-direct>".into(),
-            ..proxy
-        }
+    // genuinely have empty text (multi-modal upstream); substitute a
+    // placeholder for the duration of validation when `text` is empty.
+    // The real text — empty or not — still rides through to apply.
+    let text = if req.text.is_empty() {
+        "<vector-direct>"
     } else {
-        proxy
+        req.text.as_str()
     };
-    let plan = brain_planner::plan_encode_inner(&proxy, &ctx.planner_ctx)?;
-    Ok(plan.wal_append.salience_initial)
+    let edges: Vec<(MemoryId, brain_core::EdgeKind, f32)> = req
+        .edges
+        .iter()
+        .map(|e| {
+            (
+                MemoryId::from(e.target),
+                brain_core::EdgeKind::from(e.kind),
+                e.weight,
+            )
+        })
+        .collect();
+    brain_planner::validate_vector_direct(
+        text,
+        MemoryKind::from(req.kind),
+        req.salience_hint,
+        &edges,
+        &ctx.planner_ctx.config,
+    )?;
+    Ok(req.salience_hint)
 }
 
 fn lookup_fingerprint(
