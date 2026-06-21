@@ -51,6 +51,8 @@ use brain_workers::wal_retention::{
     SegmentListFuture, WalRetentionSource, WalRetentionSourceError,
 };
 
+use crate::shard::snapshot_manifest::{blake3_hex, FileDigest, SnapshotManifest, MANIFEST_FILE};
+
 // ---------------------------------------------------------------------------
 // RebuildSource — scan the shard's arena for occupied/non-tombstoned slots.
 // ---------------------------------------------------------------------------
@@ -234,6 +236,7 @@ pub(crate) struct ShardSnapshotSource {
     snapshots_root: PathBuf,
     arena_path: PathBuf,
     metadata_path: PathBuf,
+    wal_dir: PathBuf,
     arena: Rc<RefCell<ArenaFile>>,
     wal: Rc<RefCell<Option<Wal>>>,
     metadata: SharedMetadataDb,
@@ -253,11 +256,19 @@ impl ShardSnapshotSource {
         metadata: SharedMetadataDb,
         hnsw: SharedHnsw,
     ) -> Self {
+        // metadata.redb lives at the shard root; the WAL directory is a
+        // sibling. Derive it through ShardPaths so the snapshot bundle's
+        // WAL-tail copy reads from the same layout the writer uses.
+        let wal_dir = metadata_path
+            .parent()
+            .map(|root| brain_storage::ShardPaths::at(root).wal_dir())
+            .unwrap_or_else(|| metadata_path.clone());
         Self {
             shard_uuid,
             snapshots_root,
             arena_path,
             metadata_path,
+            wal_dir,
             arena,
             wal,
             metadata,
@@ -361,20 +372,22 @@ impl SnapshotSource for ShardSnapshotSource {
                 SnapshotSourceError::Failed(format!("create_dir_all {}: {e}", dir.display()))
             })?;
 
-            // 5. Copy arena.bin. msync_all already ran inside
-            //    write_checkpoint; the on-disk image at this instant is
-            //    consistent with the checkpoint's durable_lsn.
+            // 5. Reflink arena.bin. msync_all already ran inside the
+            //    checkpoint sequence; the on-disk image at this instant
+            //    is consistent with the checkpoint's durable_lsn. The
+            //    reflink (FICLONE) shares blocks copy-on-write where the
+            //    filesystem supports it, falling back to a full copy.
             let arena_dst = dir.join("arena.bin");
-            std::fs::copy(&self.arena_path, &arena_dst).map_err(|e| {
+            brain_storage::reflink_or_copy(&self.arena_path, &arena_dst).map_err(|e| {
                 SnapshotSourceError::Failed(format!(
-                    "copy arena.bin → {}: {e}",
+                    "reflink arena.bin → {}: {e}",
                     arena_dst.display()
                 ))
             })?;
 
-            // 6. Copy metadata.redb. Take a read txn first to flush any
-            //    in-memory state to disk; release it before copying so
-            //    redb's file lock is dropped. (redb's read txns are
+            // 6. Reflink metadata.redb. Take a read txn first to flush
+            //    any in-memory state to disk; release it before copying
+            //    so redb's file lock is dropped. (redb's read txns are
             //    snapshot-isolated; a copy of the file *while a read txn
             //    is alive* gives a consistent point-in-time image.)
             let metadata_dst = dir.join("metadata.redb");
@@ -383,12 +396,73 @@ impl SnapshotSource for ShardSnapshotSource {
                     .metadata
                     .read_txn()
                     .map_err(|e| SnapshotSourceError::Failed(format!("metadata read_txn: {e}")))?;
-                std::fs::copy(&self.metadata_path, &metadata_dst).map_err(|e| {
+                brain_storage::reflink_or_copy(&self.metadata_path, &metadata_dst).map_err(|e| {
                     SnapshotSourceError::Failed(format!(
-                        "copy metadata.redb → {}: {e}",
+                        "reflink metadata.redb → {}: {e}",
                         metadata_dst.display()
                     ))
                 })?;
+            }
+
+            // 6a. Copy shard.uuid so the bundle is self-describing and a
+            //     restore onto a freshly-laid-out data dir lands the
+            //     identity file too. Best-effort: the manifest's
+            //     shard_uuid is the authoritative identity, so a missing
+            //     uuid file here doesn't fail the snapshot.
+            let uuid_src = self
+                .metadata_path
+                .parent()
+                .map(|root| brain_storage::ShardPaths::at(root).shard_uuid());
+            if let Some(uuid_src) = uuid_src {
+                if uuid_src.exists() {
+                    let uuid_dst = dir.join(brain_storage::layout::SHARD_UUID_FILE);
+                    if let Err(e) = brain_storage::reflink_or_copy(&uuid_src, &uuid_dst) {
+                        tracing::warn!(
+                            error = %e,
+                            "snapshot: copying shard.uuid into bundle failed (non-fatal)"
+                        );
+                    }
+                }
+            }
+
+            // 6b. Copy the WAL tail. A snapshot that can't be replayed
+            //     back to its LSN is useless, so the bundle must carry
+            //     every segment that covers [.. durable_lsn]. We copy
+            //     each segment whose starting_lsn <= durable_lsn — that
+            //     set always includes the segment containing durable_lsn
+            //     and every earlier one, so recovery can replay the WAL
+            //     to the snapshot LSN. Segments live in `<dir>/wal/`.
+            let wal_dst_dir = dir.join("wal");
+            std::fs::create_dir_all(&wal_dst_dir).map_err(|e| {
+                SnapshotSourceError::Failed(format!(
+                    "create_dir_all {}: {e}",
+                    wal_dst_dir.display()
+                ))
+            })?;
+            let mut wal_segment_rel_paths: Vec<String> = Vec::new();
+            {
+                let reader = WalReader::open(&self.wal_dir, self.shard_uuid).map_err(|e| {
+                    SnapshotSourceError::Failed(format!("WalReader::open for snapshot tail: {e}"))
+                })?;
+                for seg in reader.segments() {
+                    if seg.starting_lsn > target_lsn_hint {
+                        // Segment begins after the snapshot LSN — its
+                        // records are entirely post-snapshot. Skip so the
+                        // bundle is a true point-in-time view.
+                        continue;
+                    }
+                    let name = format!("{:010}.wal", seg.segment_seq);
+                    let src = self.wal_dir.join(&name);
+                    let dst = wal_dst_dir.join(&name);
+                    brain_storage::reflink_or_copy(&src, &dst).map_err(|e| {
+                        SnapshotSourceError::Failed(format!(
+                            "reflink wal segment {} → {}: {e}",
+                            src.display(),
+                            dst.display()
+                        ))
+                    })?;
+                    wal_segment_rel_paths.push(format!("wal/{name}"));
+                }
             }
 
             // 7. HNSW snapshot (graph + data + brain wrapper). Writes
@@ -402,20 +476,40 @@ impl SnapshotSource for ShardSnapshotSource {
                 .save_snapshot(&dir, "hnsw", durable_lsn_for_hnsw, self.shard_uuid)
                 .map_err(|e| SnapshotSourceError::Failed(format!("hnsw save_snapshot: {e}")))?;
 
-            // 8. Manifest.
-            let durable_lsn =
-                brain_storage::recovery::MetadataSink::durable_lsn(self.metadata.as_ref());
-            let manifest = format!(
-                "shard_uuid_hex = \"{}\"\n\
-                 checkpoint_id = {}\n\
-                 durable_lsn = {}\n\
-                 taken_at_unix_nanos = {}\n",
-                hex_lower(&self.shard_uuid),
-                ckpt_id,
-                durable_lsn,
-                started,
-            );
-            std::fs::write(dir.join("manifest.toml"), manifest)
+            // 8. Manifest. The snapshot's LSN is the checkpoint's
+            //    durable_lsn — the point recovery replays the bundled WAL
+            //    up to. Hash every bundle file (arena, metadata, each WAL
+            //    segment) with BLAKE3 so restore can verify integrity
+            //    before swapping files into the live data dir. The HNSW
+            //    triple is intentionally excluded: it's rebuilt on
+            //    restore, never trusted from the bundle.
+            let mut files = std::collections::BTreeMap::new();
+            for rel in
+                std::iter::once("arena.bin".to_string())
+                    .chain(std::iter::once("metadata.redb".to_string()))
+                    .chain(wal_segment_rel_paths.iter().cloned())
+            {
+                let path = dir.join(&rel);
+                let size = std::fs::metadata(&path)
+                    .map_err(|e| {
+                        SnapshotSourceError::Failed(format!("stat {}: {e}", path.display()))
+                    })?
+                    .len();
+                let blake3 = blake3_hex(&path).map_err(|e| {
+                    SnapshotSourceError::Failed(format!("blake3 {}: {e}", path.display()))
+                })?;
+                files.insert(rel, FileDigest { size, blake3 });
+            }
+
+            let manifest = SnapshotManifest {
+                snapshot_lsn: target_lsn_hint,
+                checkpoint_id: ckpt_id,
+                shard_uuid: hex_lower(&self.shard_uuid),
+                taken_at_unix_nanos: started,
+                files,
+            };
+            manifest
+                .write_to(&dir.join(MANIFEST_FILE))
                 .map_err(|e| SnapshotSourceError::Failed(format!("write manifest: {e}")))?;
 
             Ok(snap_id)
@@ -450,8 +544,10 @@ impl SnapshotSource for ShardSnapshotSource {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let manifest_path = entry.path().join("manifest.toml");
-                let taken_at = read_manifest_taken_at(&manifest_path).unwrap_or(0);
+                let manifest_path = entry.path().join(MANIFEST_FILE);
+                let taken_at = SnapshotManifest::read_from(&manifest_path)
+                    .map(|m| m.taken_at_unix_nanos)
+                    .unwrap_or(0);
                 let size_bytes = dir_size_bytes(&entry.path()).unwrap_or(0);
                 out.push(SnapshotDesc {
                     id: SnapshotId(id_u64),
@@ -502,17 +598,6 @@ fn dir_size_bytes(dir: &std::path::Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
-}
-
-fn read_manifest_taken_at(path: &std::path::Path) -> Option<u64> {
-    let text = std::fs::read_to_string(path).ok()?;
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("taken_at_unix_nanos = ") {
-            return rest.trim().parse().ok();
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -677,25 +762,25 @@ mod tests {
 
     // ---- ShardSnapshotSource ----------------------------------------------
 
-    // Snapshot persistence isn't wired for the PQ index yet
-    // (`save_snapshot` returns "snapshot persistence not yet wired for
-    // the PQ index" after the always-PQ migration). Re-enable once the
-    // PQ codebook + code rows are serialised into the snapshot.
+    /// Take a snapshot of a populated shard (≥1 HNSW vector + ≥1 WAL
+    /// record) and assert the bundle is complete: arena.bin,
+    /// metadata.redb, ≥1 WAL segment, and a manifest.json whose BLAKE3
+    /// digests match the on-disk files. Then list + delete it.
     #[test]
-    #[ignore = "PQ-aware snapshot persistence not yet wired (post always-PQ migration)"]
-    fn snapshot_take_list_delete_round_trips() {
+    fn snapshot_bundle_is_complete_and_blake3_matches() {
+        use crate::shard::snapshot_manifest::{blake3_hex, SnapshotManifest, MANIFEST_FILE};
+        use brain_core::MemoryId;
+
         let tmp = TempDir::new().unwrap();
         let snapshots_root = tmp.path().join("snapshots");
+        // metadata.redb at the root, wal/ as a sibling — the layout
+        // ShardSnapshotSource::new derives the WAL dir from.
         let arena_path = tmp.path().join("arena.bin");
         let md_path = tmp.path().join("metadata.redb");
         let wal_dir = tmp.path().join("wal");
         std::fs::create_dir_all(&wal_dir).unwrap();
         let uuid: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
 
-        // MetadataDb is `Send + Sync` (wrapped in `parking_lot::Mutex`)
-        // so it crosses the spawn boundary. ArenaFile + Wal must be
-        // opened inside the executor (Wal::create is async; ArenaFile
-        // is Send but we keep all `Rc<RefCell<…>>` construction local).
         let md = brain_metadata::MetadataDb::open(&md_path).expect("MetadataDb::open");
         let metadata: SharedMetadataDb = std::sync::Arc::new(md);
 
@@ -704,10 +789,19 @@ mod tests {
         let snapshots_root_cloned = snapshots_root.clone();
         let wal_dir_cloned = wal_dir.clone();
 
-        glommio_run({
+        let snap_dir = glommio_run({
             let metadata = metadata.clone();
             move || async move {
-                let arena = ArenaFile::open(&arena_path_cloned, uuid, 8).expect("ArenaFile::open");
+                let mut arena =
+                    ArenaFile::open(&arena_path_cloned, uuid, 8).expect("ArenaFile::open");
+                // Occupy a slot so the arena image isn't all-zero.
+                {
+                    let s = arena.slot_mut(0);
+                    s.metadata.flags = brain_storage::arena::slot::flags::OCCUPIED;
+                    s.metadata.slot_version = 1;
+                    s.vector[0] = 0.25;
+                }
+                arena.msync_all().expect("arena msync");
                 let arena_cell = Rc::new(RefCell::new(arena));
 
                 let wal = Wal::create_with_config(&wal_dir_cloned, uuid, WalConfig::default())
@@ -715,9 +809,26 @@ mod tests {
                     .expect("Wal::create_with_config");
                 let wal_cell = Rc::new(RefCell::new(Some(wal)));
 
+                // Populate the HNSW so save_snapshot isn't a no-op.
                 let (hnsw_shared, _hnsw_writer) =
                     brain_index::SharedHnsw::new(brain_index::IndexParams::default_v1())
                         .expect("SharedHnsw::new");
+                let mut v = [0.0_f32; VECTOR_DIM];
+                v[0] = 1.0;
+                let mid = MemoryId::pack(0, 0, 1);
+                hnsw_shared.insert_recovery(mid, &v);
+                // Publish pending into the main epoch so save_snapshot
+                // (which snapshots `main`) isn't an empty-graph no-op.
+                let params = hnsw_shared.params();
+                hnsw_shared
+                    .flush_with_rebuild(move |pending| {
+                        let pairs: Vec<_> =
+                            pending.iter().map(|e| (e.memory_id, e.vector)).collect();
+                        let (idx, _) = brain_index::rebuild::rebuild_impl(params, pairs)?;
+                        Ok(idx)
+                    })
+                    .expect("flush_with_rebuild publishes the vector");
+                assert!(!hnsw_shared.is_empty(), "HNSW main must be non-empty");
 
                 let src = ShardSnapshotSource::new(
                     uuid,
@@ -737,21 +848,89 @@ mod tests {
                 assert_eq!(listed.len(), 1);
                 assert_eq!(listed[0].id, id);
 
-                src.delete_snapshot(id).await.expect("delete_snapshot");
-
-                let listed_after = src.list_snapshots().await.expect("list_snapshots empty");
-                assert!(listed_after.is_empty());
+                let dir = snapshots_root_cloned.join(format!("{:020}", id.0));
 
                 // Drain the WAL cleanly so the test doesn't leak.
                 let mut g = wal_cell.borrow_mut();
                 if let Some(w) = g.take() {
                     w.shutdown().await.expect("Wal::shutdown");
                 }
+                dir
             }
         });
 
-        // The snapshot directory was created and then cleaned by
-        // `delete_snapshot`; the root itself should still exist.
+        // Bundle assertions (sync, outside the executor).
+        assert!(snap_dir.join("arena.bin").is_file(), "arena.bin present");
+        assert!(
+            snap_dir.join("metadata.redb").is_file(),
+            "metadata.redb present"
+        );
+        let wal_segs: Vec<_> = std::fs::read_dir(snap_dir.join("wal"))
+            .expect("bundle wal/ dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("wal"))
+            .collect();
+        assert!(
+            !wal_segs.is_empty(),
+            "bundle must carry ≥1 WAL segment (the checkpoint tail)"
+        );
+        assert!(
+            snap_dir.join("hnsw.brain").is_file(),
+            "non-empty HNSW snapshot marker present"
+        );
+
+        let manifest =
+            SnapshotManifest::read_from(&snap_dir.join(MANIFEST_FILE)).expect("manifest.json");
+        assert!(manifest.files.contains_key("arena.bin"));
+        assert!(manifest.files.contains_key("metadata.redb"));
+        assert!(
+            manifest.files.keys().any(|k| k.starts_with("wal/")),
+            "manifest lists ≥1 wal segment"
+        );
+        // Every manifest digest matches the on-disk file.
+        for (rel, digest) in &manifest.files {
+            let path = snap_dir.join(rel);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                digest.size,
+                "size mismatch for {rel}"
+            );
+            assert_eq!(
+                blake3_hex(&path).unwrap(),
+                digest.blake3,
+                "blake3 mismatch for {rel}"
+            );
+        }
+
+        // Delete cleans the directory; the root persists.
+        glommio_run({
+            let metadata = metadata.clone();
+            let snapshots_root = snapshots_root.clone();
+            let arena_path = arena_path.clone();
+            let md_path = md_path.clone();
+            move || async move {
+                let arena = ArenaFile::open(&arena_path, uuid, 8).expect("reopen arena");
+                let arena_cell = Rc::new(RefCell::new(arena));
+                let wal_cell = Rc::new(RefCell::new(None));
+                let (hnsw_shared, _w) =
+                    brain_index::SharedHnsw::new(brain_index::IndexParams::default_v1()).unwrap();
+                let src = ShardSnapshotSource::new(
+                    uuid,
+                    snapshots_root,
+                    arena_path,
+                    md_path,
+                    arena_cell,
+                    wal_cell,
+                    metadata,
+                    hnsw_shared,
+                );
+                src.delete_snapshot(SnapshotId(1))
+                    .await
+                    .expect("delete_snapshot");
+                let after = src.list_snapshots().await.expect("list after delete");
+                assert!(after.is_empty());
+            }
+        });
         assert!(snapshots_root.exists());
     }
 }

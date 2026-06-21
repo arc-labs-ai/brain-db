@@ -45,9 +45,11 @@ compile_error!(
 pub mod arena;
 pub mod layout;
 pub mod recovery;
+pub mod reflink;
 pub mod wal;
 
 pub use layout::{ensure_dirs, wal_segment_stats, ShardPaths};
+pub use reflink::reflink_or_copy;
 
 /// Slot size in bytes.
 pub const SLOT_SIZE_BYTES: usize = 1600;

@@ -51,6 +51,8 @@
 
 pub mod adapters;
 pub mod llm_setup;
+pub mod restore;
+pub mod snapshot_manifest;
 pub mod tantivy_recovery;
 
 use std::cell::RefCell;
