@@ -248,5 +248,4 @@ mod tests {
             Ok(_) => panic!("expected ConfigRead"),
         }
     }
-
 }

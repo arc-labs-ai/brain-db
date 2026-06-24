@@ -8,8 +8,8 @@ pub mod options;
 pub mod registry;
 
 pub use extractor::{
-    ExtractionContext, ExtractionFailureClass, ExtractionFuture, ExtractionResult, ExtractionStatus,
-    Extractor, ExtractorContext, ExtractorError, NeighborMemory,
+    ExtractionContext, ExtractionFailureClass, ExtractionFuture, ExtractionResult,
+    ExtractionStatus, Extractor, ExtractorContext, ExtractorError, NeighborMemory,
 };
 pub use item::{EntityMention, ExtractedItem, RelationMention, StatementMention};
 pub use options::ExtractorRunOptions;

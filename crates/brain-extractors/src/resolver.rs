@@ -601,9 +601,9 @@ pub fn resolve_or_create_with_deps(
                 // vs "Stripe Payments") — confirmed or merely uncertain —
                 // still merge as before. With no disambiguator, the
                 // cosine threshold remains the sole arbiter.
-                match disambiguator
-                    .map(|d| confirm_partial_match(d, entity_id, surface_form, wtxn, entity_type_qname))
-                {
+                match disambiguator.map(|d| {
+                    confirm_partial_match(d, entity_id, surface_form, wtxn, entity_type_qname)
+                }) {
                     Some(MatchVerdict::Rejected) => {
                         // Confirmed distinct despite the high cosine.
                         // Fall through to Create without enqueuing a
@@ -632,10 +632,13 @@ pub fn resolve_or_create_with_deps(
                     // way (Uncertain / Skipped). The cosine already
                     // cleared the auto-alias threshold, so preserve the
                     // pre-disambiguator behaviour and merge.
-                    None
-                    | Some(MatchVerdict::Uncertain)
-                    | Some(MatchVerdict::Skipped { .. }) => {
-                        entity_add_alias(wtxn, entity_id, surface_form.to_string(), now_unix_nanos)?;
+                    None | Some(MatchVerdict::Uncertain) | Some(MatchVerdict::Skipped { .. }) => {
+                        entity_add_alias(
+                            wtxn,
+                            entity_id,
+                            surface_form.to_string(),
+                            now_unix_nanos,
+                        )?;
                         return Ok(Resolution {
                             entity_id,
                             tier: ResolutionTier::Embedding,
@@ -1171,7 +1174,10 @@ mod tests {
         // (token subset) instead of minting a duplicate person node.
         let wtxn = d.write_txn().unwrap();
         let res = resolve_or_create(&wtxn, "Niraj", "brain:Person", 0.8, NOW + 1).unwrap();
-        assert_eq!(res.entity_id, full_id, "Niraj should coref to Niraj Georgian");
+        assert_eq!(
+            res.entity_id, full_id,
+            "Niraj should coref to Niraj Georgian"
+        );
         assert_eq!(res.tier, ResolutionTier::Alias);
         wtxn.commit().unwrap();
     }

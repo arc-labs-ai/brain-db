@@ -574,10 +574,10 @@ fn best_relation_answer(
         current_only: true,
         limit: 0,
     };
-    let outgoing =
-        relation_list_from(rtxn, subject, &filter).map_err(|e| GroundedError::Metadata(format!("{e}")))?;
-    let incoming =
-        relation_list_to(rtxn, subject, &filter).map_err(|e| GroundedError::Metadata(format!("{e}")))?;
+    let outgoing = relation_list_from(rtxn, subject, &filter)
+        .map_err(|e| GroundedError::Metadata(format!("{e}")))?;
+    let incoming = relation_list_to(rtxn, subject, &filter)
+        .map_err(|e| GroundedError::Metadata(format!("{e}")))?;
     if outgoing.is_empty() && incoming.is_empty() {
         return Ok(None);
     }

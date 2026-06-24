@@ -260,4 +260,3 @@ fn end_to_end_expire_path() {
     assert_eq!(p.status, proposal_status::EXPIRED);
     assert_eq!(metrics.snapshot().proposals_expired_total, 1);
 }
-

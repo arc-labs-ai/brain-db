@@ -277,5 +277,4 @@ mod tests {
         let a = eid(7);
         assert_eq!(canonical_pair(a, a), (a, a));
     }
-
 }

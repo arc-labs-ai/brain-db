@@ -27,7 +27,11 @@ fn bucket(a: char, b: char, c: char) -> [u8; 3] {
             h = h.wrapping_mul(0x0100_0193);
         }
     }
-    [(h & 0xff) as u8, ((h >> 8) & 0xff) as u8, ((h >> 16) & 0xff) as u8]
+    [
+        (h & 0xff) as u8,
+        ((h >> 8) & 0xff) as u8,
+        ((h >> 16) & 0xff) as u8,
+    ]
 }
 
 /// Extract the trigram set of a normalized string. Caller is

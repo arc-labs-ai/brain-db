@@ -167,7 +167,7 @@ fn build_filter_rules(req: &RecallRequest) -> Vec<FilterRule> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_protocol::envelope::request::{MemoryKindWire};
+    use brain_protocol::envelope::request::MemoryKindWire;
 
     fn base_request() -> RecallRequest {
         RecallRequest {

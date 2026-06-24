@@ -167,5 +167,4 @@ mod tests {
         let d = blake3_hash_text("");
         assert_ne!(a, d);
     }
-
 }

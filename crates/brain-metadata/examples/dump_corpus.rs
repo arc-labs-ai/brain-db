@@ -22,17 +22,39 @@ use redb::{
 };
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: dump_corpus <metadata.redb>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: dump_corpus <metadata.redb>");
     let db = Database::open(&path).expect("open redb");
     let rtxn = db.begin_read().expect("read txn");
 
     // ---- row counts -----------------------------------------------------
     let count = |name: &str, len: u64| println!("  {name:<28} {len}");
     println!("== table row counts ==");
-    count("memories", rtxn.open_table(MEMORIES_TABLE).map(|t| t.len().unwrap()).unwrap_or(0));
-    count("entities", rtxn.open_table(ENTITIES_TABLE).map(|t| t.len().unwrap()).unwrap_or(0));
-    count("statements", rtxn.open_table(STATEMENTS_TABLE).map(|t| t.len().unwrap()).unwrap_or(0));
-    count("relations", rtxn.open_table(RELATION_METADATA_TABLE).map(|t| t.len().unwrap()).unwrap_or(0));
+    count(
+        "memories",
+        rtxn.open_table(MEMORIES_TABLE)
+            .map(|t| t.len().unwrap())
+            .unwrap_or(0),
+    );
+    count(
+        "entities",
+        rtxn.open_table(ENTITIES_TABLE)
+            .map(|t| t.len().unwrap())
+            .unwrap_or(0),
+    );
+    count(
+        "statements",
+        rtxn.open_table(STATEMENTS_TABLE)
+            .map(|t| t.len().unwrap())
+            .unwrap_or(0),
+    );
+    count(
+        "relations",
+        rtxn.open_table(RELATION_METADATA_TABLE)
+            .map(|t| t.len().unwrap())
+            .unwrap_or(0),
+    );
 
     // ---- full table inventory (every redb table + row count) ------------
     println!("\n== ALL redb tables (name : rows) ==");
@@ -40,7 +62,10 @@ fn main() {
     if let Ok(handles) = rtxn.list_tables() {
         for h in handles {
             let name = h.name().to_string();
-            let len = rtxn.open_untyped_table(h).map(|t| t.len().unwrap_or(0)).unwrap_or(0);
+            let len = rtxn
+                .open_untyped_table(h)
+                .map(|t| t.len().unwrap_or(0))
+                .unwrap_or(0);
             tnames.push((name, len));
         }
     }
@@ -103,7 +128,12 @@ fn main() {
         let pred = qname_of
             .get(&s.predicate.raw())
             .cloned()
-            .or_else(|| predicate_get(&rtxn, PredicateId::from(s.predicate.raw())).ok().flatten().map(|p| format!("{}:{}", p.namespace, p.name)))
+            .or_else(|| {
+                predicate_get(&rtxn, PredicateId::from(s.predicate.raw()))
+                    .ok()
+                    .flatten()
+                    .map(|p| format!("{}:{}", p.namespace, p.name))
+            })
             .unwrap_or_else(|| format!("pred#{}", s.predicate.raw()));
         let obj = match &s.object {
             StatementObject::Entity(e) => format!("[E] {}", name_of(*e)),
@@ -131,7 +161,8 @@ fn main() {
     let mut seen_rel = std::collections::HashSet::new();
     for (tid, _) in &type_rows {
         for e in entity_list_by_type(&rtxn, EntityTypeId::from(*tid)).unwrap_or_default() {
-            for r in relation_list_from(&rtxn, e.id, &RelationListFilter::default()).unwrap_or_default()
+            for r in
+                relation_list_from(&rtxn, e.id, &RelationListFilter::default()).unwrap_or_default()
             {
                 if seen_rel.insert(r.id) {
                     println!(

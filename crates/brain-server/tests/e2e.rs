@@ -35,8 +35,7 @@ use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
 use brain_protocol::envelope::request::{
-    ByeRequest, EncodeRequest, ForgetMode, ForgetRequest, RecallRequest,
-    RequestBody,
+    ByeRequest, EncodeRequest, ForgetMode, ForgetRequest, RecallRequest, RequestBody,
 };
 use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;

@@ -87,11 +87,15 @@ impl StatementKind {
     #[must_use]
     pub const fn builtin_behavior(self) -> Option<KindBehavior> {
         let b = match self {
-            Self::Attribute => KindBehavior::new(KindCardinality::Single, TemporalModel::State, false),
+            Self::Attribute => {
+                KindBehavior::new(KindCardinality::Single, TemporalModel::State, false)
+            }
             Self::Relation => KindBehavior::new(KindCardinality::Set, TemporalModel::State, false),
             Self::Preference => KindBehavior::new(KindCardinality::Set, TemporalModel::State, true),
             Self::Event => KindBehavior::new(KindCardinality::Set, TemporalModel::Event, false),
-            Self::Directive => KindBehavior::new(KindCardinality::Single, TemporalModel::State, false),
+            Self::Directive => {
+                KindBehavior::new(KindCardinality::Single, TemporalModel::State, false)
+            }
             Self::Fact => KindBehavior::new(KindCardinality::Set, TemporalModel::Atemporal, false),
             Self::Custom(_) => return None,
         };
@@ -188,7 +192,11 @@ pub struct KindBehavior {
 
 impl KindBehavior {
     #[must_use]
-    pub const fn new(cardinality: KindCardinality, temporal: TemporalModel, polarity: bool) -> Self {
+    pub const fn new(
+        cardinality: KindCardinality,
+        temporal: TemporalModel,
+        polarity: bool,
+    ) -> Self {
         Self {
             cardinality,
             temporal,
@@ -304,10 +312,12 @@ mod tests {
         assert!(!p.supersedes());
 
         // Directive: single per key.
-        assert!(StatementKind::Directive.builtin_behavior().unwrap().supersedes());
+        assert!(StatementKind::Directive
+            .builtin_behavior()
+            .unwrap()
+            .supersedes());
 
         // Custom kinds resolve via the registry, not here.
         assert!(StatementKind::Custom(9).builtin_behavior().is_none());
     }
-
 }

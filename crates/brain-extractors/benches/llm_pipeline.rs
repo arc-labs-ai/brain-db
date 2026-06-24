@@ -145,7 +145,7 @@ fn build_extractor(
 
 fn ctx<'a>(reg: &'a ExtractorRegistry) -> ExtractionContext<'a> {
     ExtractionContext {
-            declared_predicates: None,
+        declared_predicates: None,
         declared_kinds: None,
         entity_type_labels: None,
         schema_version: 1,

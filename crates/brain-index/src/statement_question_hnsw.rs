@@ -277,18 +277,28 @@ mod tests {
 
         let r = idx.search(&one_hot(1), 5).unwrap();
         assert_eq!(r[0].0, a, "best-matching statement first");
-        assert!(r.iter().filter(|(s, _)| *s == a).count() == 1, "collapsed per statement");
+        assert!(
+            r.iter().filter(|(s, _)| *s == a).count() == 1,
+            "collapsed per statement"
+        );
 
         idx.mark_statement_tombstoned(a);
         let r = idx.search(&one_hot(1), 5).unwrap();
-        assert!(!r.iter().any(|(s, _)| *s == a), "tombstoned statement excluded");
+        assert!(
+            !r.iter().any(|(s, _)| *s == a),
+            "tombstoned statement excluded"
+        );
     }
 
     #[test]
     fn rebuild_discards_prior_entries_and_loads_new_set() {
         let mut idx = StatementQuestionHnswIndex::new(statement_question_default_params()).unwrap();
         idx.insert(sid(1), &one_hot(1));
-        let rep = idx.rebuild([(sid(2), one_hot(2)), (sid(2), one_hot(3)), (sid(3), one_hot(4))]);
+        let rep = idx.rebuild([
+            (sid(2), one_hot(2)),
+            (sid(2), one_hot(3)),
+            (sid(3), one_hot(4)),
+        ]);
         assert_eq!(rep.inserted, 3);
         assert_eq!(rep.statements, 2);
         assert!(!idx.contains_statement(sid(1)));

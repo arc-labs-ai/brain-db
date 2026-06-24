@@ -223,7 +223,6 @@ mod tests {
         let r = aggregate_confidence(&e, NOW, StatementKind::Fact, &cfg());
         assert_eq!(r, 0.0);
     }
-
 }
 
 #[cfg(test)]

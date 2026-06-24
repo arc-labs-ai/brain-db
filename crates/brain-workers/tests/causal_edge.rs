@@ -287,4 +287,3 @@ fn cycle_writes_caused_link_through_unified_path() {
         let _ = (cause_mem, effect_mem, sid, Uuid::nil());
     });
 }
-

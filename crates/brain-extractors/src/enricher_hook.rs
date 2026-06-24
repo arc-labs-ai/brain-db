@@ -161,5 +161,4 @@ mod tests {
             panic!();
         }
     }
-
 }

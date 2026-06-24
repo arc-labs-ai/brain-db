@@ -216,7 +216,11 @@ async fn complete_handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
     assert_eq!(auth_ok.header.opcode_u16(), Opcode::AuthOk.as_u16());
 }
 
-async fn encode_round_trip(client: &mut TcpStream, stream_id: u32, text: &str) -> (u16, Option<u128>) {
+async fn encode_round_trip(
+    client: &mut TcpStream,
+    stream_id: u32,
+    text: &str,
+) -> (u16, Option<u128>) {
     let req = EncodeRequest {
         text: text.into(),
         context_id: 0,
@@ -336,8 +340,7 @@ async fn scrape_lines(admin_addr: std::net::SocketAddr, prefix: &str) -> Vec<Str
     let Ok(mut s) = TcpStream::connect(admin_addr).await else {
         return Vec::new();
     };
-    if s
-        .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
+    if s.write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
         .await
         .is_err()
     {
@@ -372,10 +375,15 @@ async fn corpus_write_then_read_is_accurate() {
     println!("== booting real-tier server (BGE + GLiNER + gpt-4o-mini) ==");
     let dispatcher = build_real_dispatcher(PathBuf::from(model_dir));
     let server = start_full_pipeline_in(&data_dir, dispatcher, Some(openai_key)).await;
-    println!("   data_plane={}  admin={}", server.data_plane_addr, server.admin_addr);
+    println!(
+        "   data_plane={}  admin={}",
+        server.data_plane_addr, server.admin_addr
+    );
     println!("   data_dir={}", data_dir.display());
 
-    let mut client = TcpStream::connect(server.data_plane_addr).await.expect("connect");
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
     complete_handshake(&mut client, [7u8; 16]).await;
 
     println!("== ENCODE {} memories ==", CORPUS.len());
@@ -383,7 +391,12 @@ async fn corpus_write_then_read_is_accurate() {
     for (i, text) in CORPUS.iter().enumerate() {
         let stream_id = (i as u32) * 2 + 1; // odd, non-zero
         let (op, mem) = encode_round_trip(&mut client, stream_id, text).await;
-        assert_eq!(op, Opcode::EncodeResp.as_u16(), "m{} ENCODE must succeed: {text}", i + 1);
+        assert_eq!(
+            op,
+            Opcode::EncodeResp.as_u16(),
+            "m{} ENCODE must succeed: {text}",
+            i + 1
+        );
         let id = mem.expect("memory_id");
         let preview: String = text.chars().take(60).collect();
         println!("   m{} id={:032x}  {}", i + 1, id, preview);
@@ -467,24 +480,69 @@ enum Grade {
 async fn read_phase(client: &mut TcpStream) {
     let cases: &[ReadCase] = &[
         // ---- PRECISE — cases 1..=11 ----
-        ReadCase { cue: "what am I allergic to", grade: Grade::Precise { expect: "peanuts" } },
-        ReadCase { cue: "what kind of coffee do I prefer", grade: Grade::Precise { expect: "dark" } },
-        ReadCase { cue: "what do I dislike", grade: Grade::Precise { expect: "crowded restaurants" } },
+        ReadCase {
+            cue: "what am I allergic to",
+            grade: Grade::Precise { expect: "peanuts" },
+        },
+        ReadCase {
+            cue: "what kind of coffee do I prefer",
+            grade: Grade::Precise { expect: "dark" },
+        },
+        ReadCase {
+            cue: "what do I dislike",
+            grade: Grade::Precise {
+                expect: "crowded restaurants",
+            },
+        },
         // Memory #4 carries TWO directives ("reply concisely" + "never use
         // emojis"). Either is a real, correct directive (never a
         // hallucination), so this case accepts whichever surfaces. See
         // DIRECTIVE_ALTS.
-        ReadCase { cue: "what is my directive for replying", grade: Grade::Precise { expect: "concise" } },
-        ReadCase { cue: "what is Elena Fernández's position", grade: Grade::Precise { expect: "chief executive" } },
-        ReadCase { cue: "how tall is the Eiffel Tower", grade: Grade::Precise { expect: "330" } },
-        ReadCase { cue: "when was the Eiffel Tower completed", grade: Grade::Precise { expect: "1889" } },
-        ReadCase { cue: "where does Elena Fernández work", grade: Grade::Precise { expect: "NeuraCorp" } },
-        ReadCase { cue: "what is Tokyo the capital of", grade: Grade::Precise { expect: "Japan" } },
-        ReadCase { cue: "what did 李明 visit", grade: Grade::Precise { expect: "Paulo" } },
-        ReadCase { cue: "what languages does Aisha Okonkwo speak", grade: Grade::Precise { expect: "Yoruba" } },
+        ReadCase {
+            cue: "what is my directive for replying",
+            grade: Grade::Precise { expect: "concise" },
+        },
+        ReadCase {
+            cue: "what is Elena Fernández's position",
+            grade: Grade::Precise {
+                expect: "chief executive",
+            },
+        },
+        ReadCase {
+            cue: "how tall is the Eiffel Tower",
+            grade: Grade::Precise { expect: "330" },
+        },
+        ReadCase {
+            cue: "when was the Eiffel Tower completed",
+            grade: Grade::Precise { expect: "1889" },
+        },
+        ReadCase {
+            cue: "where does Elena Fernández work",
+            grade: Grade::Precise {
+                expect: "NeuraCorp",
+            },
+        },
+        ReadCase {
+            cue: "what is Tokyo the capital of",
+            grade: Grade::Precise { expect: "Japan" },
+        },
+        ReadCase {
+            cue: "what did 李明 visit",
+            grade: Grade::Precise { expect: "Paulo" },
+        },
+        ReadCase {
+            cue: "what languages does Aisha Okonkwo speak",
+            grade: Grade::Precise { expect: "Yoruba" },
+        },
         // ---- OPEN / ASSOCIATIVE — cases 12..=13 ----
-        ReadCase { cue: "diabetes treatment", grade: Grade::Open },
-        ReadCase { cue: "the Web Summit trip", grade: Grade::Open },
+        ReadCase {
+            cue: "diabetes treatment",
+            grade: Grade::Open,
+        },
+        ReadCase {
+            cue: "the Web Summit trip",
+            grade: Grade::Open,
+        },
     ];
 
     // Case #11 ("languages") is satisfied by ANY of these — the question
@@ -586,7 +644,10 @@ async fn read_phase(client: &mut TcpStream) {
         "precision: {precision_pct:.1}%  ({precision_violations} confident-wrong Single answers across {precise_total} precise cases)"
     );
     println!("recall:    {recall_hits}/{precise_total} precise cases surfaced the expected value");
-    println!("open:      {} associative cases, {open_failures} failures", 2);
+    println!(
+        "open:      {} associative cases, {open_failures} failures",
+        2
+    );
     println!("latency (precise reads): p50={p50:.2}ms  p99={p99:.2}ms");
 
     // ---- THE GATE ----
@@ -596,7 +657,10 @@ async fn read_phase(client: &mut TcpStream) {
         precision_violations, 0,
         "PRECISION violated: {precision_violations} confident-wrong Single answers (must be 0)"
     );
-    assert_eq!(open_failures, 0, "open/associative cues must return memories");
+    assert_eq!(
+        open_failures, 0,
+        "open/associative cues must return memories"
+    );
     assert!(
         recall_hits >= 9,
         "RECALL floor: only {recall_hits}/{precise_total} precise cases surfaced the expected value (need >=9)"

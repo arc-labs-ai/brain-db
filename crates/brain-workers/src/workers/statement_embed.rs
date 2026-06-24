@@ -136,10 +136,7 @@ impl StatementEmbedWorker {
     /// generates + embeds templated questions for the eligible statements it
     /// processes, idempotent on the statement's own stored question vectors.
     #[must_use]
-    pub fn with_question_bridge(
-        mut self,
-        bridge: Arc<RwLock<StatementQuestionHnswIndex>>,
-    ) -> Self {
+    pub fn with_question_bridge(mut self, bridge: Arc<RwLock<StatementQuestionHnswIndex>>) -> Self {
         self.question_bridge = Some(bridge);
         self
     }

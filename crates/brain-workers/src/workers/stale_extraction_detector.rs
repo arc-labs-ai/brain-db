@@ -119,4 +119,3 @@ impl Worker for StaleExtractionDetector {
         Box::pin(self.run_once(ctx))
     }
 }
-

@@ -60,7 +60,7 @@ fn bench_pattern_extract(c: &mut Criterion) {
     let mem = build_memory(4096);
     let reg = ExtractorRegistry::new();
     let ctx = ExtractionContext {
-            declared_predicates: None,
+        declared_predicates: None,
         declared_kinds: None,
         entity_type_labels: None,
         schema_version: 1,
@@ -83,7 +83,7 @@ fn bench_pattern_extract_short(c: &mut Criterion) {
     let mem = build_memory(256);
     let reg = ExtractorRegistry::new();
     let ctx = ExtractionContext {
-            declared_predicates: None,
+        declared_predicates: None,
         declared_kinds: None,
         entity_type_labels: None,
         schema_version: 1,
@@ -106,7 +106,7 @@ fn print_corpus_summary() {
     let mem = build_memory(4096);
     let reg = ExtractorRegistry::new();
     let ctx = ExtractionContext {
-            declared_predicates: None,
+        declared_predicates: None,
         declared_kinds: None,
         entity_type_labels: None,
         schema_version: 1,
