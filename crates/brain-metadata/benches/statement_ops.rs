@@ -20,10 +20,10 @@ use brain_core::{
 };
 use brain_core::{StatementObject, SubjectRef};
 use brain_metadata::entity::ops::{entity_put, normalize_name};
+use brain_metadata::schema::predicate::predicate_intern_or_get;
 use brain_metadata::statement::{
     statement_create, statement_get, statement_list, statement_supersede, StatementListFilter,
 };
-use brain_metadata::schema::predicate::predicate_intern_or_get;
 use brain_metadata::tables::predicate::PREDICATES_TABLE;
 use brain_metadata::MetadataDb;
 use criterion::{black_box, criterion_group, Criterion};
