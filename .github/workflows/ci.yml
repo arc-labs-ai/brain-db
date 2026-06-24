@@ -28,12 +28,17 @@ jobs:
       - name: Build (workspace)
         run: cargo build --workspace --all-targets
 
-      # Sequential link (`-j 1`) — the workspace's release-shaped link
-      # graph OOMs the 7 GB GitHub Actions runner when N test binaries
-      # link in parallel. `--no-fail-fast` so a single crate's red test
-      # doesn't mask regressions in unrelated crates.
+      # Run tests only (--lib --bins --tests), NOT benches: criterion bench
+      # harnesses reject `--test-threads` and are operator-run perf tools, not
+      # CI gates (they stay compile-checked by the build step's --all-targets).
+      # Sequential link (`-j 1`) — the release-shaped link graph OOMs the 7 GB
+      # runner when N test binaries link in parallel. `--test-threads=1` keeps
+      # RUNTIME memory bounded: brain-server integration tests each spin up a
+      # shard + load the embedding model, and running them in parallel within a
+      # binary SIGKILLs the runner. `--no-fail-fast` so one crate's red test
+      # doesn't mask regressions elsewhere.
       - name: Test (workspace, sequential link)
-        run: cargo test --workspace --all-targets --no-fail-fast -j 1
+        run: cargo test --workspace --lib --bins --tests --no-fail-fast -j 1 -- --test-threads=1
 
       - name: Doc tests
         run: cargo test --workspace --doc
@@ -55,6 +60,13 @@ jobs:
   miri:
     name: Miri (storage layer)
     runs-on: ubuntu-latest
+    env:
+      # The byte-logic tests miri DOES run (slot/payload) use proptest, which
+      # calls getcwd for its failure-persistence file; default miri isolation
+      # blocks that. Disable isolation so getcwd/fs/timers work — miri still
+      # checks UB. The mmap/WAL modules miri genuinely can't model stay gated
+      # behind #[cfg(all(test, not(miri)))].
+      MIRIFLAGS: -Zmiri-disable-isolation
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
@@ -62,11 +74,13 @@ jobs:
           components: miri
       - uses: Swatinem/rust-cache@v2
       - name: Miri test
-        # Only run on the storage crate where unsafe lives.
-        # Skip if the crate doesn't exist yet.
+        # --lib only: miri checks the unsafe byte-logic units (slot/record/
+        # payload layout + CRC). The integration tests (tests/*.rs) drive real
+        # arena/WAL file I/O (mmap, fallocate) that miri cannot model; they're
+        # covered by the normal Test job. Skip if the crate doesn't exist yet.
         run: |
           if [ -d "crates/brain-storage" ]; then
-            cargo +nightly miri test -p brain-storage
+            cargo +nightly miri test -p brain-storage --lib
           else
             echo "brain-storage not yet present; skipping miri."
           fi
