@@ -23,7 +23,8 @@ use brain_metadata::entity::ops::{entity_put, normalize_name};
 use brain_metadata::statement::{
     statement_create, statement_get, statement_list, statement_supersede, StatementListFilter,
 };
-use brain_metadata::tables::predicate::{PREDICATES_BY_QNAME_TABLE, PREDICATES_TABLE};
+use brain_metadata::schema::predicate::predicate_intern_or_get;
+use brain_metadata::tables::predicate::PREDICATES_TABLE;
 use brain_metadata::MetadataDb;
 use criterion::{black_box, criterion_group, Criterion};
 use tempfile::TempDir;
@@ -48,22 +49,18 @@ fn build_fixture(n: usize) -> Fixture {
     let db = MetadataDb::open(dir.path().join("metadata.redb")).expect("open db");
     let now = 1_700_000_000_000_000_000u64;
 
-    // Resolve the built-in `brain:related_to` predicate id (seeded
-    // at MetadataDb::open).
+    // Intern a predicate for the seeded Fact statements. `brain:related_to`
+    // is seeded as a relation_type, not a predicate, so the statement path
+    // needs its own interned predicate.
     let related_to: PredicateId = {
-        let rtxn = db.read_txn().expect("read_txn");
-        let idx = rtxn
-            .open_table(PREDICATES_BY_QNAME_TABLE)
-            .expect("open by_qname");
-        let raw: u32 = idx
-            .get("brain:related_to")
-            .expect("get qname")
-            .expect("brain:related_to seeded")
-            .value();
-        PredicateId::from(raw)
+        let wtxn = db.write_txn().expect("write_txn");
+        let id = predicate_intern_or_get(&wtxn, "brain", "related_to", 1, now)
+            .expect("intern predicate");
+        wtxn.commit().expect("commit predicate");
+        id
     };
 
-    // Sanity: predicate exists in the primary table too.
+    // Sanity: predicate exists in the primary table.
     {
         let rtxn = db.read_txn().expect("read_txn");
         let t = rtxn.open_table(PREDICATES_TABLE).expect("open predicates");
