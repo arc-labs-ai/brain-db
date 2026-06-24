@@ -23,7 +23,7 @@ pub trait ClassifierModel: Send + Sync {
     /// keeps the worker's drain throughput ahead of the encode arrival
     /// rate.
     ///
-    /// The default impl falls back to per-row [`predict`] for any
+    /// The default impl falls back to per-row [`Self::predict`] for any
     /// model that doesn't override; downstream callers can still call
     /// `predict_batch` unconditionally. Real impls (`GlinerClassifier`)
     /// override to run a single batched forward pass.

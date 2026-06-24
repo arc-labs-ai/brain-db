@@ -17,7 +17,7 @@
 //!
 //! Worker families live one-per-file under this module; shared
 //! histogram machinery + label arrays live in [`histograms`]. The
-//! [`crate::worker_metrics`] alias (in `lib.rs`) preserves the
+//! `crate::worker_metrics` alias (in `lib.rs`) preserves the
 //! pre-split external import path.
 
 pub mod ambiguity_resolver;

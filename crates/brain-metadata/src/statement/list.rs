@@ -256,7 +256,7 @@ pub fn statement_list(
 /// the planned `STATEMENT_EVIDENCE_INDEX` table.
 ///
 /// Performance: full table scan. For ≤100K rows this completes in ~ms.
-/// Above [`STATEMENTS_CITING_MEMORY_SLOW_SCAN_THRESHOLD`] the call
+/// Above `STATEMENTS_CITING_MEMORY_SLOW_SCAN_THRESHOLD` the call
 /// emits a `tracing::warn` so the operator sees the cost growing and
 /// can plan the secondary-index migration.
 pub fn statements_citing_memory(

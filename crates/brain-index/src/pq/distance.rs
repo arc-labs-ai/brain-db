@@ -15,7 +15,7 @@
 //!
 //! The HNSW crate's [`Distance`] trait is uniform — both args are
 //! `&[u8]`. [`PqDist`] dispatches between modes via a thread-local
-//! [`SEARCH_LUT`] slot that the search wrapper installs before
+//! `SEARCH_LUT` slot that the search wrapper installs before
 //! invoking the HNSW traversal. With the slot set, [`PqDist::eval`]
 //! treats the second argument as the candidate code and runs ADC.
 //! With the slot empty, both arguments are PQ codes from the graph

@@ -156,7 +156,7 @@ impl EmbedderConfig {
         self.resolve_model_dir_with(&|k| std::env::var(k).ok())
     }
 
-    /// Same as [`resolve_model_dir`] but reads env via the supplied
+    /// Same as [`Self::resolve_model_dir`] but reads env via the supplied
     /// closure so tests can drive the cascade without touching the
     /// global process environment.
     pub fn resolve_model_dir_with<F>(&self, env: &F) -> Result<PathBuf, ConfigError>

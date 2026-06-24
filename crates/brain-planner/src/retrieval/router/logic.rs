@@ -320,7 +320,7 @@ pub enum GraphAnchorMode {
     /// graph contributing on schemaless deployments where no
     /// `EntityId` is ever known.
     MemoryFromSemantic,
-    /// The router left a blind [`MemoryFromSemantic`] lane, but the
+    /// The router left a blind [`Self::MemoryFromSemantic`] lane, but the
     /// executor resolved the query's named subject to this entity
     /// against the canonical-name index. It walks one hop from the
     /// entity over `Mentions` edges so the memories that name the
@@ -382,7 +382,7 @@ pub struct ClassificationFeatures {
     pub contains_entity_mention_heuristic: bool,
     pub contains_temporal_expression: bool,
     /// Cue text carries enumerative / aggregation intent (matches
-    /// [`LIST_INTENT_RE`]). Server-internal signal only.
+    /// `LIST_INTENT_RE`). Server-internal signal only.
     pub is_list_intent: bool,
 }
 

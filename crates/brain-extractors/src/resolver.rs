@@ -291,10 +291,10 @@ impl std::fmt::Debug for EmbeddingDeps {
 /// The current backend is LLM-driven: the disambiguator owns an
 /// [`LlmClient`] + model identifier and issues a single yes/no/uncertain
 /// prompt per ambiguous partial match. The prompt grammar is narrower
-/// than the multi-candidate one [`BrainLlmDisambiguator`] uses because
+/// than the multi-candidate one [`crate::BrainLlmDisambiguator`] uses because
 /// the resolver's question is binary. Swapping in a heuristic or
 /// classifier backend later is a localised change to
-/// [`confirm_partial_match`].
+/// `confirm_partial_match`.
 pub struct EntityDisambiguator {
     client: Arc<dyn LlmClient>,
     model: String,

@@ -9,7 +9,7 @@
 //! - [`MigrateEmbeddingPayload`] — swap the embedding fingerprint (re-encode)
 //!
 //! Every helper opens its own write txn, applies, calls
-//! [`MetadataDb::bump_next_lsn_in_txn`], then commits.
+//! `MetadataDb::bump_next_lsn_in_txn`, then commits.
 
 use brain_storage::recovery::MetadataSinkError;
 use brain_storage::wal::payload::{

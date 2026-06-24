@@ -8,7 +8,7 @@
 //! conversion both ways so the dispatch handler stays a one-liner
 //! when the worker handle eventually threads into `OpsContext`.
 //!
-//! Today the dispatch arm in [`crate::dispatch`] returns
+//! Today the dispatch arm in [`crate::dispatch()`] returns
 //! `NotYetImplemented` for `AdminBackfill` / `AdminBackfillCancel`:
 //! the worker handle isn't on `OpsContext` yet. These adapters are
 //! ready for the wiring pass that follows.

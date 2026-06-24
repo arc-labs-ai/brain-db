@@ -64,9 +64,8 @@ const PRICE_OUTPUT_PER_TOKEN_DEFAULT: u64 = 5;
 /// directly for accurate accounting.
 const PRICE_CACHE_WRITE_PER_TOKEN_DEFAULT: u64 = 1;
 
-/// Anthropic client. Construct via [`Self::from_env`] or
-/// [`Self::with_endpoint`] (the latter is for tests against mock
-/// servers).
+/// Anthropic client. Construct via [`Self::with_endpoint`] (for tests
+/// against mock servers).
 pub struct AnthropicClient {
     http: reqwest::Client,
     base_url: String,

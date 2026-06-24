@@ -1,8 +1,8 @@
 //! Two-tier lock-free wrapper for the memory HNSW.
 //!
-//! - An immutable [`MainEpoch`] swapped via `ArcSwap` holds the
+//! - An immutable `MainEpoch` swapped via `ArcSwap` holds the
 //!   published full-precision graph.
-//! - A mutable [`PendingBuffer`] protected by `RwLock` holds recent
+//! - A mutable `PendingBuffer` protected by `RwLock` holds recent
 //!   inserts and tombstones that haven't been folded into main yet.
 //!
 //! Both tiers score with exact cosine similarity: main via the

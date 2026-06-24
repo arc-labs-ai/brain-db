@@ -12,7 +12,7 @@
 //! 1. Idempotency check (in-memory cache for now; a durable redb-backed
 //!    cache lands later).
 //! 2. Open ONE `WriteTransaction`.
-//! 3. For each phase: call [`apply::dispatch`] against the wtxn.
+//! 3. For each phase: call [`crate::apply::dispatch`] against the wtxn.
 //! 4. Commit.
 //! 5. Stamp the idempotency cache.
 //! 6. Return the [`WriteAck`].

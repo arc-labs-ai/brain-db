@@ -311,7 +311,7 @@ impl RealWriterHandle {
     }
 
     /// Accessor for the unified write-path idempotency cache.
-    /// Used by [`submit::submit`] and exposed for tests + future
+    /// Used by [`RealWriterHandle::submit`] and exposed for tests + future
     /// admin observability.
     #[must_use]
     pub fn write_idempotency_cache(&self) -> &submit::WriteIdempotencyCache {
@@ -395,7 +395,7 @@ impl RealWriterHandle {
     }
 
     /// Wire the change-feed bus. After this call every successful
-    /// commit publishes an [`EventEnvelope`] onto the bus.
+    /// commit publishes an [`crate::EventEnvelope`] onto the bus.
     #[must_use]
     pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
         self.events = Some(bus);
@@ -620,10 +620,10 @@ impl WriterHandle for RealWriterHandle {
     /// enabling a previously-disabled extractor).
     ///
     /// The encode-time post-commit enqueue goes through
-    /// [`try_enqueue_extractor`] instead — it lives outside the trait
+    /// `try_enqueue_extractor` instead — it lives outside the trait
     /// because the submit pipeline doesn't go through the
     /// `WriterHandle` indirection. Both ultimately push onto the same
-    /// `flume::Sender<ExtractorEnqueue>` channel ([`extractor_sender`]).
+    /// `flume::Sender<ExtractorEnqueue>` channel (`extractor_sender`).
     fn enqueue_for_extraction(&self, memory_id: MemoryId, text: &str) -> bool {
         let Some(sender) = self.extractor_sender() else {
             return false;

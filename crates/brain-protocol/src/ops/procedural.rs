@@ -6,7 +6,7 @@
 //! Preferences and renders them as a single system block ready to
 //! drop into an LLM prompt.
 //!
-//! Response side: [`crate::responses::procedural`].
+//! The response side lives in the envelope response module.
 
 use crate::envelope::request::{WireContextId, WireUuid};
 

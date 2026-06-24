@@ -4,7 +4,7 @@
 //! only updates `MetadataDb::pending_checkpoints` (in-memory) and
 //! bumps `next_lsn`. No file in this module is needed for that.
 //!
-//! [`apply_checkpoint_end`](MetadataDb::apply_checkpoint_end) (this
+//! `apply_checkpoint_end` (this
 //! file) pairs an incoming `CheckpointEnd` with its earlier `BEGIN`
 //! and writes a [`CheckpointMeta`] row. It also advances the cached
 //! `durable_lsn` so future [`MetadataSink::durable_lsn`](

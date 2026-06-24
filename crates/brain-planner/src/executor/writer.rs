@@ -57,7 +57,7 @@ pub trait WriterHandle {
     }
 
     /// Downcast hook for the unified write path. Handlers that want
-    /// to call the concrete [`RealWriterHandle::submit`] (which takes
+    /// to call the concrete `RealWriterHandle::submit` (which takes
     /// the brain-ops `Write` value type that brain-planner cannot
     /// import without a dep cycle) do so via
     /// `ctx.executor.writer.as_any().downcast_ref::<RealWriterHandle>()`.

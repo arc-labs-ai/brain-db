@@ -29,7 +29,7 @@ pub const MIN_TRAINING_SAMPLE: usize = 4_096;
 /// recall gain is negligible and training latency dominates.
 pub const MAX_TRAINING_SAMPLE: usize = 1_048_576;
 
-/// Per-corpus PQ knobs. Always nested inside [`crate::IndexParams::pq`]
+/// Per-corpus PQ knobs. Always nested inside `crate::IndexParams::pq`
 /// — a `None` there means pure HNSW.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PqParams {
