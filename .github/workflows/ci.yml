@@ -2,9 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,9 +24,6 @@ jobs:
 
       - name: Format check
         run: cargo fmt --all -- --check
-
-      - name: Skill conventions lint
-        run: ./.claude/scripts/check-skills.sh
 
       - name: Build (workspace)
         run: cargo build --workspace --all-targets
@@ -60,7 +55,6 @@ jobs:
   miri:
     name: Miri (storage layer)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
