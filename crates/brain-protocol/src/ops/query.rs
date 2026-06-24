@@ -8,7 +8,7 @@
 //! `RetrieverSelectionWire`, `FusionConfigWire`, `ItemIdWire`,
 //! `RetrieverContributionWire`, `RetrieverOutcomeWire`) because the
 //! request needs them to be parsed; the response side
-//! ([`crate::responses::query`]) re-exports them.
+//! re-exports them.
 
 use crate::envelope::request::WireUuid;
 

@@ -472,5 +472,4 @@ mod tests {
         let arena = fresh_arena(&dir, 16);
         arena.msync_all().unwrap();
     }
-
 }

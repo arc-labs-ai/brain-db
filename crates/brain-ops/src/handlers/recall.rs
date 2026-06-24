@@ -2025,7 +2025,11 @@ mod tests {
         // answer (B) is never discarded. This is the paraphrase/lexical guard.
         let out = vec![mr(1, &[Semantic, Lexical]), mr(2, &[Semantic])];
         let got = consensus_collapse(out, Some(2));
-        assert_eq!(got.len(), 2, "consensus≠top must not collapse the answer away");
+        assert_eq!(
+            got.len(),
+            2,
+            "consensus≠top must not collapse the answer away"
+        );
     }
 
     #[test]

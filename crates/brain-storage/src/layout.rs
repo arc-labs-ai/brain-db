@@ -217,7 +217,9 @@ pub fn ensure_dirs(root: &Path) -> std::io::Result<()> {
 // Tests.
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+// Tests create real directories (`mkdir`). Gated out under miri, which cannot
+// perform those syscalls; the syscall-free tests in other modules still run.
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
 

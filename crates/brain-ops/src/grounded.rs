@@ -12,7 +12,7 @@
 //!
 //! Matching is **purely semantic**: the cue embedding's cosine against each
 //! candidate predicate / relation-type embedding (`works_at` is embedded
-//! write-time as the phrase "works at"), gated by [`GROUNDED_MATCH_FLOOR`].
+//! write-time as the phrase "works at"), gated by `GROUNDED_MATCH_FLOOR`.
 //! There is no string tokenization, stop-word list, or stemmer — those are
 //! brittle, English-only static-text heuristics Brain deliberately avoids; the
 //! embedder is the single source of relation similarity. A subject with no
@@ -56,7 +56,7 @@ pub struct GroundedValue {
     /// First evidence memory, when present.
     pub source_memory: Option<MemoryId>,
     /// The relation match score: the cosine between the cue embedding and the
-    /// matched predicate / relation-type embedding (>= [`GROUNDED_MATCH_FLOOR`]).
+    /// matched predicate / relation-type embedding (>= `GROUNDED_MATCH_FLOOR`).
     pub match_score: f32,
     /// When this fact was asserted, in unix nanos: the event time if known,
     /// else the record (extraction) time. Competing current values are ranked
@@ -288,12 +288,12 @@ const GROUNDED_WALK_DEPTH_DISCOUNT: f32 = 0.9;
 /// manager work before?", "What does Niraj's sister do?"). It needs no LLM and
 /// no read-time generation: at each hop it scores every incident relation edge
 /// by the cosine of the cue against the edge's relation-type embedding, expands
-/// the strongest [`GROUNDED_WALK_BEAM`] neighbors, and at each visited node asks
+/// the strongest `GROUNDED_WALK_BEAM` neighbors, and at each visited node asks
 /// the same precise 1-hop matcher whether that node answers the cue. The walk
 /// assembles the chain from whatever edges exist at read time — so it follows
 /// reports_to → worked_before, or family_of → married_to → occupation, purely
 /// from edge/predicate similarity to the cue. Depth is capped at
-/// [`GROUNDED_WALK_MAX_HOPS`] and visited nodes are deduped, so the work is
+/// `GROUNDED_WALK_MAX_HOPS` and visited nodes are deduped, so the work is
 /// bounded by `beam^hops` regardless of graph size.
 ///
 /// The winner is the highest DEPTH-DISCOUNTED match score across all visited
@@ -574,10 +574,10 @@ fn best_relation_answer(
         current_only: true,
         limit: 0,
     };
-    let outgoing =
-        relation_list_from(rtxn, subject, &filter).map_err(|e| GroundedError::Metadata(format!("{e}")))?;
-    let incoming =
-        relation_list_to(rtxn, subject, &filter).map_err(|e| GroundedError::Metadata(format!("{e}")))?;
+    let outgoing = relation_list_from(rtxn, subject, &filter)
+        .map_err(|e| GroundedError::Metadata(format!("{e}")))?;
+    let incoming = relation_list_to(rtxn, subject, &filter)
+        .map_err(|e| GroundedError::Metadata(format!("{e}")))?;
     if outgoing.is_empty() && incoming.is_empty() {
         return Ok(None);
     }

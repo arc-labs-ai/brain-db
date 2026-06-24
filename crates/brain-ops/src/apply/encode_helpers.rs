@@ -99,7 +99,7 @@ pub enum ExtractorContextError {
 ///      `TEXTS_TABLE` and its `created_at_unix_nanos` from
 ///      `MEMORIES_TABLE`. Both reads happen in the same `read_txn`
 ///      so the snapshot is consistent.
-///   6. Truncate each neighbor's text at [`NEIGHBOR_TEXT_CHAR_CAP`]
+///   6. Truncate each neighbor's text at `NEIGHBOR_TEXT_CHAR_CAP`
 ///      so the prompt budget can't blow up on long memories.
 ///   7. The rolling summary is left as `None` — the summarizer
 ///      worker isn't part of W2.3. The slot is preserved so a future

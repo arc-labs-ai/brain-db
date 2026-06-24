@@ -18,8 +18,7 @@ use brain_protocol::connection::handshake::{
     ServerCapabilities, WelcomePayload,
 };
 use brain_protocol::envelope::request::{
-    ByeRequest, EncodeRequest, ForgetMode, ForgetRequest, PingRequest, 
-    RecallRequest, RequestBody,
+    ByeRequest, EncodeRequest, ForgetMode, ForgetRequest, PingRequest, RecallRequest, RequestBody,
 };
 use brain_protocol::envelope::response::{
     EncodeResponse, ErrorResponse, ForgetResponse, PongResponse, ResponseBody,

@@ -100,9 +100,17 @@ async fn send_frame(client: &mut TcpStream, frame: Frame) {
     client.flush().await.expect("flush");
 }
 
-async fn round_trip(client: &mut TcpStream, stream_id: u32, req: RequestBody) -> (u16, ResponseBody) {
+async fn round_trip(
+    client: &mut TcpStream,
+    stream_id: u32,
+    req: RequestBody,
+) -> (u16, ResponseBody) {
     let opcode = req.opcode().as_u16();
-    send_frame(client, Frame::new(opcode, FLAG_EOS, stream_id, req.encode())).await;
+    send_frame(
+        client,
+        Frame::new(opcode, FLAG_EOS, stream_id, req.encode()),
+    )
+    .await;
     let resp = read_one_frame(client).await;
     let resp_opcode = resp.header.opcode_u16();
     let body = ResponseBody::decode(
@@ -126,7 +134,12 @@ async fn handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
     };
     send_frame(
         client,
-        Frame::new(Opcode::Hello.as_u16(), FLAG_EOS, 0, RequestBody::Hello(hello).encode()),
+        Frame::new(
+            Opcode::Hello.as_u16(),
+            FLAG_EOS,
+            0,
+            RequestBody::Hello(hello).encode(),
+        ),
     )
     .await;
     let welcome = read_one_frame(client).await;
@@ -139,7 +152,12 @@ async fn handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
     };
     send_frame(
         client,
-        Frame::new(Opcode::Auth.as_u16(), FLAG_EOS, 0, RequestBody::Auth(auth).encode()),
+        Frame::new(
+            Opcode::Auth.as_u16(),
+            FLAG_EOS,
+            0,
+            RequestBody::Auth(auth).encode(),
+        ),
     )
     .await;
     let auth_ok = read_one_frame(client).await;
@@ -225,7 +243,9 @@ fn count_memory_rows(dir: &Path) -> u64 {
     let md = brain_metadata::MetadataDb::open(shard_root(dir).join("metadata.redb"))
         .expect("open metadata");
     let rtxn = md.read_txn().expect("read_txn");
-    let table = rtxn.open_table(MEMORIES_TABLE).expect("open MEMORIES_TABLE");
+    let table = rtxn
+        .open_table(MEMORIES_TABLE)
+        .expect("open MEMORIES_TABLE");
     let n = table.len().expect("table len");
     drop(table);
     drop(rtxn);
@@ -252,7 +272,9 @@ fn run_recovery(dir: &Path, uuid: [u8; 16]) -> u64 {
     use brain_metadata::tables::memory::MEMORIES_TABLE;
     use redb::ReadableTableMetadata;
     let rtxn = md.read_txn().expect("read_txn");
-    let table = rtxn.open_table(MEMORIES_TABLE).expect("open MEMORIES_TABLE");
+    let table = rtxn
+        .open_table(MEMORIES_TABLE)
+        .expect("open MEMORIES_TABLE");
     let n = table.len().expect("table len");
     drop(table);
     drop(rtxn);
@@ -349,7 +371,12 @@ async fn restore_rejects_corrupt_bundle() {
             .await
             .expect("connect");
         handshake(&mut client, agent_id).await;
-        encode(&mut client, 1, "the lighthouse keeper logs the tide at midnight").await;
+        encode(
+            &mut client,
+            1,
+            "the lighthouse keeper logs the tide at midnight",
+        )
+        .await;
 
         let (code, body) =
             http_request(server.admin_addr, "POST", "/v1/snapshots?shard=0", "").await;
@@ -382,5 +409,8 @@ async fn restore_rejects_corrupt_bundle() {
 
     // The data dir was not touched — verification runs before placement.
     let after = std::fs::read(&live_arena).expect("read live arena after");
-    assert_eq!(before, after, "arena must be untouched on a rejected restore");
+    assert_eq!(
+        before, after,
+        "arena must be untouched on a rejected restore"
+    );
 }

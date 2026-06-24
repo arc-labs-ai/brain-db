@@ -146,11 +146,17 @@ mod tests {
             FailureClass::Permanent
         );
         assert_eq!(
-            LlmError::InvalidRequest { reason: "bad".into() }.failure_class(),
+            LlmError::InvalidRequest {
+                reason: "bad".into()
+            }
+            .failure_class(),
             FailureClass::Permanent
         );
         assert_eq!(
-            LlmError::OutputDecodeFailed { reason: "bad".into() }.failure_class(),
+            LlmError::OutputDecodeFailed {
+                reason: "bad".into()
+            }
+            .failure_class(),
             FailureClass::Permanent
         );
         // 401 unauthorized, 402 payment-required, 400 bad-request → permanent.

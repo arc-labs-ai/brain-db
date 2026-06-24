@@ -339,7 +339,7 @@ pub struct ShardSpawnConfig {
     ///
     /// The same `Arc` is cloned into every shard at process startup so
     /// the ~130 MiB BERT weights are loaded once and shared across all
-    /// N shards ("weights shared via Arc<Model>"). In
+    /// N shards ("weights shared via `Arc<Model>`"). In
     /// production this is a `CachingDispatcher<CpuDispatcher>`; tests
     /// inject a file-local stub.
     pub dispatcher: Arc<dyn Dispatcher>,

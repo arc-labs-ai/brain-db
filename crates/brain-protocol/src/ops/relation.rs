@@ -2,8 +2,8 @@
 //!
 //! Mirrors the value-side `brain_core::Relation` /
 //! `RelationType` but uses wire-domain primitives so the wire types
-//! stay decoupled from brain-core. Conversion lives in
-//! [`crate::responses::relation`] alongside `RelationView`.
+//! stay decoupled from brain-core. Conversion lives alongside
+//! [`RelationView`] in this module.
 
 use crate::envelope::request::WireUuid;
 use crate::ops::statement::EvidenceRefWire;

@@ -102,7 +102,7 @@ mod openai_tests {
         // The summarizer shares the single `[llm] api_key`; the mock
         // server accepts any non-empty key.
         let mut cfg = super::cfg_with_summarizer(SummarizerConfig {
-            backend: SummarizerBackend::Openai,
+            backend: config::SummarizerBackend::Openai,
             request_timeout_sec: 5,
             max_summary_chars: 256,
             openai_api_base: api_base,
@@ -183,7 +183,7 @@ mod openai_tests {
         // reads only that one field, so there is no ambient env var to
         // guard against.
         let mut cfg = super::cfg_with_summarizer(SummarizerConfig {
-            backend: SummarizerBackend::Openai,
+            backend: config::SummarizerBackend::Openai,
             ..SummarizerConfig::default()
         });
         cfg.llm.api_key = None;
@@ -232,7 +232,7 @@ mod ollama_tests {
 
     fn ollama_cfg(base: String) -> Config {
         super::cfg_with_summarizer(SummarizerConfig {
-            backend: SummarizerBackend::Ollama,
+            backend: config::SummarizerBackend::Ollama,
             request_timeout_sec: 5,
             ollama_base: base,
             ollama_model: "llama-test".to_owned(),

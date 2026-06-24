@@ -2,8 +2,8 @@
 //!
 //! Mirrors the value-side `brain_core` types but uses wire-domain
 //! primitives so the wire types stay decoupled from `brain-core`
-//! value types. Conversion lives in [`crate::responses::statement`]
-//! alongside `StatementView`.
+//! value types. Conversion lives alongside [`StatementView`] in this
+//! module.
 
 use crate::envelope::request::WireUuid;
 
@@ -346,7 +346,6 @@ mod tests_req {
             cursor: Vec::new(),
         }));
     }
-
 }
 
 // ============================================================

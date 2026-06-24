@@ -16,7 +16,7 @@
 //! 1. `statement_create` / `statement_supersede` insert a row into the
 //!    `STATEMENT_EMBED_QUEUE_TABLE` redb table inside the same write
 //!    txn that lands the statement (see
-//!    [`brain_metadata::statement::crud::insert_new_statement`]). The
+//!    `brain_metadata::statement::crud::insert_new_statement`). The
 //!    queue is durable so a shard restart between the extractor commit
 //!    and the worker drain doesn't lose embeddings.
 //! 2. Every `interval` (default 1 s) the worker reads up to
@@ -136,10 +136,7 @@ impl StatementEmbedWorker {
     /// generates + embeds templated questions for the eligible statements it
     /// processes, idempotent on the statement's own stored question vectors.
     #[must_use]
-    pub fn with_question_bridge(
-        mut self,
-        bridge: Arc<RwLock<StatementQuestionHnswIndex>>,
-    ) -> Self {
+    pub fn with_question_bridge(mut self, bridge: Arc<RwLock<StatementQuestionHnswIndex>>) -> Self {
         self.question_bridge = Some(bridge);
         self
     }

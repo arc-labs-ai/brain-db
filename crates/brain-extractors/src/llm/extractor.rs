@@ -38,8 +38,8 @@ use super::cache::{cache_get, cache_put};
 use super::pricing::{estimate_cost, CostBudget, Pricing};
 use super::validation::validate_against;
 use crate::framework::extractor::{
-    ExtractionContext, ExtractionFailureClass, ExtractionFuture, ExtractionResult, ExtractionStatus,
-    Extractor, ExtractorContext, NeighborMemory,
+    ExtractionContext, ExtractionFailureClass, ExtractionFuture, ExtractionResult,
+    ExtractionStatus, Extractor, ExtractorContext, NeighborMemory,
 };
 use crate::framework::item::{EntityMention, ExtractedItem, RelationMention, StatementMention};
 use crate::idempotency::hash_memory_text;
@@ -1142,7 +1142,8 @@ impl Extractor for LlmExtractor {
         &'a self,
         ctx: &'a ExtractionContext<'a>,
         mems: &'a [Memory],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<ExtractionResult>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<ExtractionResult>> + Send + 'a>>
+    {
         Box::pin(async move {
             let futs: Vec<_> = mems.iter().map(|m| self.run(ctx, m)).collect();
             futures_util::future::join_all(futs).await

@@ -491,7 +491,9 @@ mod tests {
     #[test]
     fn default_knobs_match_constants() {
         let k = AutoEdgeKnobs::default();
-        assert!((k.similarity_threshold - DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD).abs() < f32::EPSILON);
+        assert!(
+            (k.similarity_threshold - DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD).abs() < f32::EPSILON
+        );
         assert_eq!(k.top_k, DEFAULT_TOP_K);
         assert_eq!(k.ef_search, Some(DEFAULT_EF_SEARCH));
     }

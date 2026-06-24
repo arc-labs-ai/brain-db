@@ -301,10 +301,9 @@ impl Iterator for WalReader {
                 });
             }
 
-            let seg = self
-                .current
-                .as_mut()
-                .expect("invariant: segment was just loaded into self.current above, or we returned");
+            let seg = self.current.as_mut().expect(
+                "invariant: segment was just loaded into self.current above, or we returned",
+            );
 
             // (b) End of this segment? Move to the next.
             if seg.cursor >= seg.bytes.len() {

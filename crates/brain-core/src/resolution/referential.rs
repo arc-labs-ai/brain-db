@@ -21,19 +21,53 @@
 /// Calls") are unaffected.
 const NON_REFERENTIAL_SURFACES: &[&str] = &[
     // personal (subject)
-    "i", "you", "we", "they", "he", "she", "it",
+    "i",
+    "you",
+    "we",
+    "they",
+    "he",
+    "she",
+    "it",
     // personal (object)
-    "me", "us", "him", "her", "them",
+    "me",
+    "us",
+    "him",
+    "her",
+    "them",
     // reflexive
-    "myself", "yourself", "himself", "herself", "itself", "ourselves", "yourselves", "themselves",
+    "myself",
+    "yourself",
+    "himself",
+    "herself",
+    "itself",
+    "ourselves",
+    "yourselves",
+    "themselves",
     // possessive
-    "my", "your", "our", "their", "his", "its",
+    "my",
+    "your",
+    "our",
+    "their",
+    "his",
+    "its",
     // determiners
-    "this", "that", "these", "those", "the", "a", "an",
+    "this",
+    "that",
+    "these",
+    "those",
+    "the",
+    "a",
+    "an",
     // relative / interrogative
-    "who", "whom", "whose",
+    "who",
+    "whom",
+    "whose",
     // indefinite
-    "someone", "something", "anyone", "everyone", "nobody",
+    "someone",
+    "something",
+    "anyone",
+    "everyone",
+    "nobody",
 ];
 
 /// True if `surface` is a closed-class English function word that names no
@@ -54,8 +88,13 @@ mod tests {
 
     #[test]
     fn rejects_closed_class_words_case_insensitively() {
-        for w in ["i", "They", "  she ", "THE", "my", "whom", "someone", "itself"] {
-            assert!(is_non_referential_surface(w), "{w:?} should be non-referential");
+        for w in [
+            "i", "They", "  she ", "THE", "my", "whom", "someone", "itself",
+        ] {
+            assert!(
+                is_non_referential_surface(w),
+                "{w:?} should be non-referential"
+            );
         }
     }
 
@@ -70,7 +109,10 @@ mod tests {
         // Only an exact whole-surface match is rejected — names that merely
         // begin with a function word are real referents.
         for w in ["Ian", "Al", "An Inspector Calls", "Theodore", "Wells Fargo"] {
-            assert!(!is_non_referential_surface(w), "{w:?} should be referential");
+            assert!(
+                !is_non_referential_surface(w),
+                "{w:?} should be referential"
+            );
         }
     }
 
@@ -79,7 +121,10 @@ mod tests {
         // Documents the known English-only limitation: the backstop misses
         // non-English pronouns (the LLM/coref + drop-counting cover these).
         for w in ["ellos", "il", "sie", "他"] {
-            assert!(!is_non_referential_surface(w), "{w:?} not in the English list");
+            assert!(
+                !is_non_referential_surface(w),
+                "{w:?} not in the English list"
+            );
         }
     }
 }

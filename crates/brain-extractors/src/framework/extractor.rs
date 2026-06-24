@@ -105,7 +105,7 @@ pub trait Extractor: Send + Sync {
     /// is ~4s on CPU; a batched backbone pass over 8 memories
     /// completes in ~1-2x the single-input cost). Pattern + LLM
     /// extractors don't benefit from batching, so they fall through
-    /// to the default impl that sequentially calls [`run`].
+    /// to the default impl that sequentially calls [`Self::run`].
     ///
     /// Output is aligned to input order: `result[i]` is the result for
     /// `mems[i]`. An empty `mems` returns an empty `Vec`.

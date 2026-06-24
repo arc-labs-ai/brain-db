@@ -126,7 +126,10 @@ impl HypeHnswIndex {
         let internal_id = u32::try_from(self.forward.len())
             .expect("invariant: HyPE point count per shard never reaches u32::MAX");
         self.forward.push(memory_id);
-        self.by_memory.entry(memory_id).or_default().push(internal_id);
+        self.by_memory
+            .entry(memory_id)
+            .or_default()
+            .push(internal_id);
         self.inner
             .insert_slice((vector.as_slice(), internal_id as usize));
     }
@@ -360,7 +363,11 @@ mod tests {
         let r = idx.search(&one_hot(7), 5).unwrap();
         assert_eq!(r.len(), 1, "one memory despite two points");
         assert_eq!(r[0].0, m);
-        assert!(r[0].1 > 0.99, "best (self) similarity surfaces; got {}", r[0].1);
+        assert!(
+            r[0].1 > 0.99,
+            "best (self) similarity surfaces; got {}",
+            r[0].1
+        );
     }
 
     #[test]

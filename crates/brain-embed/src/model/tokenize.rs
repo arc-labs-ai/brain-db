@@ -111,8 +111,8 @@ pub fn encode_batch(
             let sep_id = full[pre_trunc_len - 1];
             let mut ids = full[..MAX_TOKEN_LENGTH].to_vec();
             *ids.last_mut()
-            .expect("invariant: truncated branch leaves exactly MAX_TOKEN_LENGTH (>0) ids") =
-            sep_id;
+                .expect("invariant: truncated branch leaves exactly MAX_TOKEN_LENGTH (>0) ids") =
+                sep_id;
             ids
         } else {
             full.to_vec()

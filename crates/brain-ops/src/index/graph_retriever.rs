@@ -38,8 +38,8 @@ use brain_core::{
     EdgeKind, EdgeKindRef, EntityId, MemoryId, NodeRef, RelationId, RelationTypeId, StatementId,
 };
 use brain_index::{
-    proximity_score, validate_graph_depth, Direction, GraphError, GraphQuery,
-    GraphRetriever, GraphRetrieverConfig, RankedItem, RankedItemId,
+    proximity_score, validate_graph_depth, Direction, GraphError, GraphQuery, GraphRetriever,
+    GraphRetrieverConfig, RankedItem, RankedItemId,
 };
 use brain_metadata::statement::{statement_list, StatementListFilter, StatementOpError};
 use brain_metadata::tables::edge::{walk_incoming, walk_outgoing, EdgeOpError, EdgeRow};

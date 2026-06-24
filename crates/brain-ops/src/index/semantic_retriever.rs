@@ -218,7 +218,10 @@ impl BrainSemanticRetriever {
         // for. Each hit's `StatementId` is mapped back to its evidence memory
         // by the RECALL projector.
         if let Some(bridge) = self.statement_question_index.as_ref() {
-            let raw = bridge.read().search(vector, config.top_k).unwrap_or_default();
+            let raw = bridge
+                .read()
+                .search(vector, config.top_k)
+                .unwrap_or_default();
             merge_statement_hits(&mut direct, raw, config.similarity_threshold, config.top_k);
         }
         Ok(direct)

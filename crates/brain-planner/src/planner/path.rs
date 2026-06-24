@@ -232,5 +232,4 @@ mod tests {
             other => panic!("expected InvalidParameters, got {other:?}"),
         }
     }
-
 }

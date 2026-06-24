@@ -72,7 +72,8 @@ pub fn reflink_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+// Tests touch real files (`copy_file_range`/`reflink`). Gated out under miri.
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use std::io::Write;

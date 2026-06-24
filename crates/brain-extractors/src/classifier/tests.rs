@@ -6,9 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use brain_core::{
-    AgentId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience,
-};
+use brain_core::{AgentId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
 use brain_protocol::schema::ExtractorTarget;
 use candle_core::Device;
 
@@ -46,7 +44,7 @@ fn memory(text: &str) -> Memory {
 
 fn ctx<'a>(reg: &'a ExtractorRegistry) -> ExtractionContext<'a> {
     ExtractionContext {
-            declared_predicates: None,
+        declared_predicates: None,
         declared_kinds: None,
         entity_type_labels: None,
         schema_version: 1,

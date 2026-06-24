@@ -221,8 +221,7 @@ fn leading_digit_namespace_rejected_name_accepted() {
     let err = predicate_intern_or_get(&wtxn, "1acme", "x", 0, 0).unwrap_err();
     assert_invalid(err);
     // A digit-leading name (`5ht2a_agonist`) is a real relation surface.
-    predicate_intern_or_get(&wtxn, "acme", "1loves", 0, 0)
-        .expect("digit-leading name is accepted");
+    predicate_intern_or_get(&wtxn, "acme", "1loves", 0, 0).expect("digit-leading name is accepted");
 }
 
 #[test]

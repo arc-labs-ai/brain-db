@@ -548,13 +548,25 @@ fn default_cadence_table_is_pinned() {
         (WorkerKind::AccessBoost, Duration::from_secs(10), true),
         (WorkerKind::Consolidation, Duration::from_secs(300), true),
         (WorkerKind::HnswMaintenance, Duration::from_secs(300), true),
-        (WorkerKind::IdempotencyCleanup, Duration::from_secs(3600), true),
+        (
+            WorkerKind::IdempotencyCleanup,
+            Duration::from_secs(3600),
+            true,
+        ),
         (WorkerKind::SlotReclamation, Duration::from_secs(600), true),
         (WorkerKind::WalRetention, Duration::from_secs(60), true),
         (WorkerKind::EdgeScrub, Duration::from_secs(1800), true),
-        (WorkerKind::CounterReconcile, Duration::from_secs(3600), true),
+        (
+            WorkerKind::CounterReconcile,
+            Duration::from_secs(3600),
+            true,
+        ),
         (WorkerKind::Statistics, Duration::from_secs(300), true),
-        (WorkerKind::EmbedderCacheEvict, Duration::from_secs(60), true),
+        (
+            WorkerKind::EmbedderCacheEvict,
+            Duration::from_secs(60),
+            true,
+        ),
         (WorkerKind::Snapshot, Duration::from_secs(3600), true),
     ];
     for (kind, interval, enabled) in cases {

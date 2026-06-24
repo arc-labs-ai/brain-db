@@ -20,9 +20,7 @@ use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_workers::{
-    CounterReconcileWorker, Worker, WorkerConfig, WorkerContext,
-};
+use brain_workers::{CounterReconcileWorker, Worker, WorkerConfig, WorkerContext};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------

@@ -40,9 +40,7 @@ use brain_metadata::MetadataDb;
 use brain_ops::test_support::{run_in_glommio, single_body};
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::envelope::request::{
-    EncodeRequest, RecallRequest, TxnBeginRequest,
-};
+use brain_protocol::envelope::request::{EncodeRequest, RecallRequest, TxnBeginRequest};
 
 const ITERATIONS: usize = 100;
 const WARMUP_ITERATIONS: usize = 10;
