@@ -4,7 +4,7 @@
 //! ## Invocation
 //!
 //! ```text
-//! ANTHROPIC_API_KEY=sk-ant-... \
+//! BRAIN__LLM__API_KEY=sk-ant-... \
 //!     cargo test -p brain-extractors --features live-llm \
 //!         --test llm_live -- --nocapture
 //! ```
@@ -12,9 +12,10 @@
 //! The tests are gated twice over:
 //!   - At compile time by `--features live-llm` (this file is opted
 //!     out of `cargo test` by `required-features` in `Cargo.toml`).
-//!   - At runtime by `ANTHROPIC_API_KEY`: when the env var is
-//!     absent the body prints a `skip:` notice and returns. CI
-//!     without the secret therefore turns into a no-op pass.
+//!   - At runtime by `BRAIN__LLM__API_KEY` (the single shared
+//!     credential): when the env var is absent the body prints a
+//!     `skip:` notice and returns. CI without the secret therefore
+//!     turns into a no-op pass.
 //!
 //! Two scenarios live here:
 //!
@@ -150,10 +151,10 @@ fn build_extractor(
 /// prints a skip notice and returns `None`. Tests must early-return
 /// on `None` — there's no graceful "ignore" status in libtest 1.x.
 fn api_key_or_skip(label: &str) -> Option<String> {
-    match std::env::var("ANTHROPIC_API_KEY") {
+    match std::env::var("BRAIN__LLM__API_KEY") {
         Ok(k) if !k.is_empty() => Some(k),
         _ => {
-            println!("skip[{label}]: ANTHROPIC_API_KEY not set");
+            println!("skip[{label}]: BRAIN__LLM__API_KEY not set");
             None
         }
     }
@@ -165,12 +166,11 @@ fn api_key_or_skip(label: &str) -> Option<String> {
 
 #[tokio::test]
 async fn live_anthropic_extracts_entities_and_relation() {
-    let Some(_key) = api_key_or_skip("entities_and_relation") else {
+    let Some(key) = api_key_or_skip("entities_and_relation") else {
         return;
     };
-    let client: Arc<dyn LlmClient> = Arc::new(
-        AnthropicClient::from_env(MODEL).expect("ANTHROPIC_API_KEY was present a moment ago"),
-    );
+    let client: Arc<dyn LlmClient> =
+        Arc::new(AnthropicClient::with_key(MODEL, key).expect("non-empty key"));
     let ext = build_extractor(client, None);
     let reg = ExtractorRegistry::new();
     let mem = memory(INPUT_TEXT);
@@ -228,7 +228,7 @@ async fn live_anthropic_extracts_entities_and_relation() {
 
 #[tokio::test]
 async fn live_anthropic_cache_short_circuits_second_call() {
-    let Some(_key) = api_key_or_skip("cache_short_circuits") else {
+    let Some(key) = api_key_or_skip("cache_short_circuits") else {
         return;
     };
 
@@ -237,9 +237,8 @@ async fn live_anthropic_cache_short_circuits_second_call() {
         LlmCacheDb::open(tmp.path().join("llm_cache.redb")).expect("open llm cache"),
     ));
 
-    let client: Arc<dyn LlmClient> = Arc::new(
-        AnthropicClient::from_env(MODEL).expect("ANTHROPIC_API_KEY was present a moment ago"),
-    );
+    let client: Arc<dyn LlmClient> =
+        Arc::new(AnthropicClient::with_key(MODEL, key).expect("non-empty key"));
     let ext = build_extractor(client, Some(cache.clone()));
     let reg = ExtractorRegistry::new();
     let mem = memory(INPUT_TEXT);

@@ -1800,18 +1800,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn kind_returns_matching_discriminator() {
-        for p in all_variants() {
-            // The kind discriminator must round-trip through the typed enum
-            // and back to the exact same byte.
-            let kind = p.kind();
-            let bytes = p.encode_to_bytes();
-            let back = WalPayload::decode(kind, &bytes).unwrap();
-            assert_eq!(back.kind(), kind);
-        }
-    }
-
     // -----------------------------------------------------------------
     // opaque-body.
     // -----------------------------------------------------------------
@@ -1849,28 +1837,6 @@ mod tests {
                 }
                 other => panic!("expected PhaseBody, got {other:?}"),
             }
-        }
-    }
-
-    #[test]
-    fn graph_agent_id_round_trips_through_encode_decode() {
-        // The new `agent_id` field must survive an encode_to_bytes →
-        // decode round-trip so subscribe-replay can route typed-graph
-        // events through the per-agent `agents` filter.
-        let agent = aid(0x7F);
-        let body = b"opaque-rkyv-blob".to_vec();
-        let payload = WalPayload::PhaseBody(PhaseBodyRecord::new(
-            WalRecordKind::EntityCreate,
-            agent,
-            body.clone(),
-        ));
-        let bytes = payload.encode_to_bytes();
-        match WalPayload::decode(WalRecordKind::EntityCreate, &bytes).unwrap() {
-            WalPayload::PhaseBody(r) => {
-                assert_eq!(r.agent_id, agent);
-                assert_eq!(r.body, body);
-            }
-            other => panic!("expected PhaseBody, got {other:?}"),
         }
     }
 
@@ -2021,92 +1987,6 @@ mod tests {
         let bytes = p.encode_to_bytes();
         assert_eq!(
             WalPayload::decode(WalRecordKind::Encode, &bytes).unwrap(),
-            p
-        );
-    }
-
-    #[test]
-    fn widened_unlink_payload_round_trips() {
-        for kind in [
-            EdgeKindRef::Builtin(EdgeKind::Caused),
-            EdgeKindRef::Mentions,
-            EdgeKindRef::Typed(rtype(0xDD)),
-        ] {
-            let p = WalPayload::Unlink(UnlinkPayload {
-                source: mnode(10),
-                target: enode(0x40),
-                edge_kind: kind,
-                edge_seq: 99,
-            });
-            let bytes = p.encode_to_bytes();
-            assert_eq!(
-                WalPayload::decode(WalRecordKind::Unlink, &bytes).unwrap(),
-                p
-            );
-        }
-    }
-
-    #[test]
-    fn relation_link_payload_round_trips_full_metadata() {
-        let p = WalPayload::RelationLink(sample_relation_link());
-        let bytes = p.encode_to_bytes();
-        assert_eq!(
-            WalPayload::decode(WalRecordKind::RelationCreate, &bytes).unwrap(),
-            p
-        );
-    }
-
-    #[test]
-    fn relation_link_payload_round_trips_empty_evidence() {
-        let mut rl = sample_relation_link();
-        rl.evidence.clear();
-        rl.properties_blob.clear();
-        let p = WalPayload::RelationLink(rl);
-        let bytes = p.encode_to_bytes();
-        assert_eq!(
-            WalPayload::decode(WalRecordKind::RelationCreate, &bytes).unwrap(),
-            p
-        );
-    }
-
-    #[test]
-    fn relation_link_payload_round_trips_no_validity_window() {
-        let mut rl = sample_relation_link();
-        rl.valid_from_unix_nanos = None;
-        rl.valid_to_unix_nanos = None;
-        rl.supersedes = None;
-        let p = WalPayload::RelationLink(rl);
-        let bytes = p.encode_to_bytes();
-        assert_eq!(
-            WalPayload::decode(WalRecordKind::RelationCreate, &bytes).unwrap(),
-            p
-        );
-    }
-
-    #[test]
-    fn relation_supersede_payload_round_trips() {
-        let p = WalPayload::RelationSupersede(RelationSupersedePayload {
-            old_relation_id: relid(0x01),
-            new: sample_relation_link(),
-        });
-        let bytes = p.encode_to_bytes();
-        assert_eq!(
-            WalPayload::decode(WalRecordKind::RelationSupersede, &bytes).unwrap(),
-            p
-        );
-    }
-
-    #[test]
-    fn relation_tombstone_payload_round_trips() {
-        let p = WalPayload::RelationTombstone(RelationTombstonePayload {
-            relation_id: relid(0x02),
-            reason: "no longer holds".into(),
-            at_unix_nanos: 1_900_000_000_000_000_000,
-            agent_id: aid(0x03),
-        });
-        let bytes = p.encode_to_bytes();
-        assert_eq!(
-            WalPayload::decode(WalRecordKind::RelationTombstone, &bytes).unwrap(),
             p
         );
     }

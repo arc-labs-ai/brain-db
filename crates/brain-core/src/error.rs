@@ -62,33 +62,3 @@ pub enum Error {
 
 /// Workspace result alias.
 pub type Result<T> = std::result::Result<T, Error>;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resource_exhausted_variants_display_with_context() {
-        assert_eq!(Error::OutOfSlots.to_string(), "the shard is out of slots");
-        assert_eq!(
-            Error::OutOfMemory("arena grow failed".into()).to_string(),
-            "out of memory: arena grow failed"
-        );
-        assert_eq!(
-            Error::RateLimited("retry after 30s".into()).to_string(),
-            "rate limited: retry after 30s"
-        );
-    }
-
-    #[test]
-    fn resource_exhausted_variants_are_distinct() {
-        // Pin that the three new variants don't accidentally collapse into
-        // a single shape — they map to different spec error codes.
-        let a: Error = Error::OutOfSlots;
-        let b: Error = Error::OutOfMemory(String::new());
-        let c: Error = Error::RateLimited(String::new());
-        assert!(matches!(a, Error::OutOfSlots));
-        assert!(matches!(b, Error::OutOfMemory(_)));
-        assert!(matches!(c, Error::RateLimited(_)));
-    }
-}

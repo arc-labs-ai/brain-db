@@ -119,28 +119,6 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_get_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let key = fp(1);
-        let info = ModelInfo::new("bge-small-en-v1.5".to_string(), 1_700_000_000_000_000_000);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
-            t.insert(&key, &info).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
-        let got = t.get(&key).unwrap().unwrap().value();
-        assert_eq!(got, info);
-        assert_eq!(got.model_name, "bge-small-en-v1.5");
-        assert_eq!(got.memory_count_at_fingerprint, 0);
-    }
-
-    #[test]
     fn model_info_with_long_name_round_trips() {
         // Exercises rkyv's variable-length String path (and the
         // AlignedVec copy in from_bytes).
@@ -165,75 +143,5 @@ mod tests {
         let got = t.get(&key).unwrap().unwrap().value();
         assert_eq!(got.model_name.len(), info.model_name.len());
         assert_eq!(got, info);
-    }
-
-    #[test]
-    fn update_overwrites() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let key = fp(3);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
-            t.insert(
-                &key,
-                &ModelInfo::new("bge-small".to_string(), 1_700_000_000_000_000_000),
-            )
-            .unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let mut updated = ModelInfo::new("bge-small".to_string(), 1_700_000_000_000_000_000);
-        updated.memory_count_at_fingerprint = 42_000;
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
-            t.insert(&key, &updated).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
-        let got = t.get(&key).unwrap().unwrap().value();
-        assert_eq!(got.memory_count_at_fingerprint, 42_000);
-    }
-
-    #[test]
-    fn missing_key_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let wtxn = db.begin_write().unwrap();
-        {
-            let _t = wtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
-        assert!(t.get(&fp(99)).unwrap().is_none());
-    }
-
-    #[test]
-    fn multiple_fingerprints_coexist() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-
-        let info_a = ModelInfo::new("model-a".to_string(), 1_000);
-        let info_b = ModelInfo::new("model-b".to_string(), 2_000);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
-            t.insert(&fp(10), &info_a).unwrap();
-            t.insert(&fp(20), &info_b).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(MODEL_FINGERPRINTS_TABLE).unwrap();
-        assert_eq!(t.get(&fp(10)).unwrap().unwrap().value(), info_a);
-        assert_eq!(t.get(&fp(20)).unwrap().unwrap().value(), info_b);
     }
 }

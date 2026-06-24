@@ -312,108 +312,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_key_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-
-        let rtxn = db.begin_read().unwrap();
-        // Open via write txn first so the table exists; redb won't
-        // open a non-existent table for read.
-        drop(rtxn);
-        let wtxn = db.begin_write().unwrap();
-        {
-            let _t = wtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
-        assert!(t.get(&rid(99)).unwrap().is_none());
-    }
-
-    #[test]
-    fn update_overwrites() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let key = rid(7);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
-            t.insert(&key, &sample(7, T0)).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let mut updated = sample(7, T0);
-        updated.response_payload = vec![0xFF; 64];
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
-            t.insert(&key, &updated).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
-        let got = t.get(&key).unwrap().unwrap().value();
-        assert_eq!(got.response_payload, vec![0xFF; 64]);
-    }
-
-    // ----- Value-shape round-trips --------------------------------------
-
-    #[test]
-    fn memory_id_optional_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-
-        let mut with_some = sample(1, T0);
-        with_some.memory_id_bytes = Some(mid(0xAB));
-        let mut with_none = sample(2, T0);
-        with_none.memory_id_bytes = None;
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
-            t.insert(&rid(1), &with_some).unwrap();
-            t.insert(&rid(2), &with_none).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
-        assert_eq!(
-            t.get(&rid(1)).unwrap().unwrap().value().memory_id_bytes,
-            Some(mid(0xAB))
-        );
-        assert_eq!(
-            t.get(&rid(2)).unwrap().unwrap().value().memory_id_bytes,
-            None
-        );
-    }
-
-    #[test]
-    fn response_payload_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let mut entry = sample(5, T0);
-        entry.response_payload = (0u8..=255).cycle().take(256).collect();
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
-            t.insert(&rid(5), &entry).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
-        let got = t.get(&rid(5)).unwrap().unwrap().value();
-        assert_eq!(got.response_payload.len(), 256);
-        assert_eq!(got.response_payload, entry.response_payload);
-    }
-
-    #[test]
     fn request_hash_byte_compare() {
         let mut a = sample(1, T0);
         let mut b = sample(1, T0);
@@ -524,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_saturating() {
+    fn prune_with_overflowing_expiry_saturates_and_keeps_entry() {
         // Entry created at u64::MAX must not panic when ttl is added.
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);

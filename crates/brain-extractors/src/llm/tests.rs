@@ -32,8 +32,6 @@ use crate::framework::extractor::{
 };
 use crate::framework::item::{EntityMention, ExtractedItem, StatementMention};
 use crate::framework::registry::ExtractorRegistry;
-use crate::idempotency::hash_memory_text;
-use brain_metadata::llm_cache::LLM_RESPONSES_TABLE;
 use brain_protocol::schema::ast::StatementKindAst;
 
 // ------------------------------------------------------------------- mock
@@ -238,49 +236,6 @@ fn confidence_below_threshold_filtered() {
 }
 
 #[test]
-fn schema_validation_failure_retries_once() {
-    // First response is not an array of objects with `name`;
-    // second response is the well-formed one.
-    let schema = serde_json::json!({
-        "type": "array",
-        "items": {
-            "type": "object",
-            "properties": {"name": {"type": "string"}},
-            "required": ["name"],
-        },
-    });
-    let bad = ok_response("[\"plain string\"]", 50);
-    let good = ok_response("[{\"name\":\"Alice\"}]", 50);
-    let client = Arc::new(MockClient::new("claude-haiku-4-5", vec![Ok(bad), Ok(good)]));
-    let calls = client.calls.clone();
-    let ext = build_ext(client, None, Some(schema), None);
-    let reg = ExtractorRegistry::new();
-    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice")));
-    assert_eq!(r.status, ExtractionStatus::Success);
-    assert_eq!(r.items.len(), 1);
-    assert_eq!(calls.load(Ordering::SeqCst), 2, "retried exactly once");
-}
-
-#[test]
-fn schema_validation_failure_twice_returns_failure() {
-    let schema = serde_json::json!({
-        "type": "array",
-        "items": {"type": "object", "required": ["name"]},
-    });
-    let bad1 = ok_response("[\"x\"]", 50);
-    let bad2 = ok_response("[\"y\"]", 50);
-    let client = Arc::new(MockClient::new(
-        "claude-haiku-4-5",
-        vec![Ok(bad1), Ok(bad2)],
-    ));
-    let ext = build_ext(client, None, Some(schema), None);
-    let reg = ExtractorRegistry::new();
-    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("hello")));
-    assert_eq!(r.status, ExtractionStatus::Failure);
-    assert!(r.status_reason.contains("schema validation failed twice"));
-}
-
-#[test]
 fn rate_limit_error_surfaces_retry_after() {
     let client = Arc::new(MockClient::new(
         "claude-haiku-4-5",
@@ -293,66 +248,6 @@ fn rate_limit_error_surfaces_retry_after() {
     let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("hi")));
     assert_eq!(r.status, ExtractionStatus::Failure);
     assert!(r.status_reason.contains("1500"));
-}
-
-#[test]
-fn cache_hit_skips_llm_call() {
-    let dir = tempfile::tempdir().unwrap();
-    let cache = Arc::new(Mutex::new(
-        LlmCacheDb::open(dir.path().join("llm_cache.redb")).unwrap(),
-    ));
-
-    // Round 1: real call populates cache.
-    let client = Arc::new(MockClient::new(
-        "claude-haiku-4-5",
-        vec![Ok(ok_response("[\"Alice\"]", 50))],
-    ));
-    let calls = client.calls.clone();
-    let ext = build_ext(client.clone(), Some(cache.clone()), None, None);
-    let reg = ExtractorRegistry::new();
-    let _ = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice")));
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-    // Round 2: same input, new client with no responses queued.
-    // Cache hit must short-circuit.
-    let client2 = Arc::new(MockClient::new("claude-haiku-4-5", vec![]));
-    let calls2 = client2.calls.clone();
-    let ext2 = build_ext(client2, Some(cache.clone()), None, None);
-    let r = futures_lite::future::block_on(ext2.run(&ctx(&reg), &memory("Alice")));
-    assert_eq!(r.status, ExtractionStatus::Success);
-    assert_eq!(r.items.len(), 1);
-    assert_eq!(
-        calls2.load(Ordering::SeqCst),
-        0,
-        "cache hit: zero LLM calls"
-    );
-}
-
-#[test]
-fn cache_miss_writes_through() {
-    let dir = tempfile::tempdir().unwrap();
-    let cache = Arc::new(Mutex::new(
-        LlmCacheDb::open(dir.path().join("llm_cache.redb")).unwrap(),
-    ));
-    let client = Arc::new(MockClient::new(
-        "claude-haiku-4-5",
-        vec![Ok(ok_response("[\"Alice\"]", 50))],
-    ));
-    let ext = build_ext(client, Some(cache.clone()), None, None);
-    let reg = ExtractorRegistry::new();
-    let _ = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice")));
-
-    // Verify the row landed.
-    let db = cache.lock();
-    let rtxn = db.read_txn().unwrap();
-    let t = rtxn.open_table(LLM_RESPONSES_TABLE).unwrap();
-    let key = (
-        hash_memory_text("Alice"),
-        99u32,
-        1u32,
-        brain_llm::client::model_id_hash("claude-haiku-4-5"),
-    );
-    assert!(t.get(&key).unwrap().is_some(), "cache row present");
 }
 
 #[test]

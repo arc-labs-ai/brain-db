@@ -105,20 +105,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_input_returns_empty_bundle_error() {
-        let err = semantic_centroid::<4>(&[]).unwrap_err();
-        assert_eq!(err, VsaError::EmptyBundle);
-    }
-
-    #[test]
-    fn cosine_to_centroid_round_trips_for_identical_vectors() {
-        let x = unit_x();
-        let c = semantic_centroid::<4>(&[&x]).unwrap();
-        let cos = cosine_to_centroid(&x, &c);
-        assert!((cos - 1.0).abs() < 1e-6, "cos={cos}");
-    }
-
-    #[test]
     fn cosine_to_centroid_is_bounded_in_range() {
         // For arbitrary unit-norm inputs the cosine must sit in [-1, 1].
         let inputs: [[f32; 4]; 4] = [

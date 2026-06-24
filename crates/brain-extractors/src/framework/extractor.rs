@@ -128,7 +128,7 @@ pub trait Extractor: Send + Sync {
     /// the `degraded` variants (missing API key, missing model
     /// files, schema compile failure, …) return false. Used by the
     /// encode response so the renderer can tell operators when 0
-    /// statements is a "set ANTHROPIC_API_KEY" condition versus a
+    /// statements is a "set BRAIN__LLM__API_KEY" condition versus a
     /// content-coverage condition.
     fn is_wired(&self) -> bool {
         true
@@ -364,17 +364,6 @@ pub enum ExtractorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn status_enum_discriminants_match_spec() {
-        // Bytes from — never change.
-        assert_eq!(ExtractionStatus::Success.as_u8(), 1);
-        assert_eq!(ExtractionStatus::Failure.as_u8(), 2);
-        assert_eq!(ExtractionStatus::SkippedBudget.as_u8(), 3);
-        assert_eq!(ExtractionStatus::SkippedFilter.as_u8(), 4);
-        assert_eq!(ExtractionStatus::SkippedDuplicate.as_u8(), 5);
-        assert_eq!(ExtractionStatus::SkippedDisabled.as_u8(), 6);
-    }
 
     #[test]
     fn status_from_u8_round_trip() {

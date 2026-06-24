@@ -285,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_resets() {
+    fn rebuild_discards_prior_entries_and_loads_new_set() {
         let mut idx = StatementQuestionHnswIndex::new(statement_question_default_params()).unwrap();
         idx.insert(sid(1), &one_hot(1));
         let rep = idx.rebuild([(sid(2), one_hot(2)), (sid(2), one_hot(3)), (sid(3), one_hot(4))]);

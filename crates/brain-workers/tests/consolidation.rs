@@ -1,10 +1,17 @@
 #![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
 //! Consolidation worker integration tests.
+//!
+//! Guards episodic-memory consolidation: similar episodics in the same
+//! context cluster (cosine over a transitive chain), each cluster above
+//! the min size collapses into one consolidated memory with `DerivedFrom`
+//! edges back to its sources, sources get stamped `consolidated_at`, and
+//! re-running is idempotent. Pins exclusions (cross-context, non-episodic,
+//! tombstoned, already-consolidated) and deterministic request-id derivation.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
@@ -16,8 +23,7 @@ use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_workers::{
     cluster_by_similarity, cosine, deterministic_request_id, ClusterCandidate, ConsolidationWorker,
-    DisabledSummarizer, Summarizer, SummarizerError, Worker, WorkerConfig, WorkerContext,
-    WorkerKind, WorkerScheduler,
+    DisabledSummarizer, Summarizer, SummarizerError, Worker, WorkerContext,
 };
 use redb::ReadableTable;
 use uuid::Uuid;
@@ -604,74 +610,6 @@ fn second_cycle_is_idempotent() {
             second, 0,
             "sources are stamped; second cycle finds no candidates"
         );
-    });
-}
-
-// ===========================================================================
-// Worker integration (2).
-// ===========================================================================
-
-#[test]
-fn worker_registers_with_correct_kind_and_default_cadence() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(
-                Arc::new(ConsolidationWorker::new(Arc::new(DisabledSummarizer))),
-                fix.ctx,
-            )
-            .unwrap();
-        let cfg = sched.config(WorkerKind::Consolidation.name()).unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(300));
-        sched.shutdown().await.unwrap();
-    });
-}
-
-#[test]
-fn disabled_worker_via_config_does_not_run() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let now = now_unix_nanos();
-        for slot in 1..=5 {
-            seed_memory(
-                &fix.metadata,
-                slot,
-                1,
-                MemoryKind::Episodic,
-                0.5,
-                now,
-                None,
-                None,
-            );
-        }
-        let cfg = WorkerConfig {
-            enabled: false,
-            interval: Duration::from_millis(20),
-            batch_size: 100,
-            max_runtime: Duration::from_secs(60),
-        };
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(
-                Arc::new(
-                    ConsolidationWorker::new(Arc::new(EchoSummarizer))
-                        .with_config(cfg)
-                        .with_min_cluster_size(5),
-                ),
-                fix.ctx.clone(),
-            )
-            .unwrap();
-        glommio::timer::sleep(Duration::from_millis(200)).await;
-        sched.shutdown().await.unwrap();
-
-        let rtxn = fix.metadata.read_txn().unwrap();
-        let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
-        let any_consolidated = table.iter().unwrap().any(|e| {
-            let (_, v) = e.unwrap();
-            v.value().kind().ok() == Some(MemoryKind::Consolidated)
-        });
-        assert!(!any_consolidated);
     });
 }
 

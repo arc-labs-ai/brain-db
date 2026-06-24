@@ -79,9 +79,7 @@ pub fn entity_type_lookup_by_name_rtxn(
 /// `brain:Drug` and still resolves to the bare row. The prefix/format matches
 /// what the classifier was tuned against — don't change it without re-measuring
 /// GLiNER zero-shot recall.
-pub fn entity_type_label_qnames(
-    rtxn: &ReadTransaction,
-) -> Result<Vec<String>, EntityTypeOpError> {
+pub fn entity_type_label_qnames(rtxn: &ReadTransaction) -> Result<Vec<String>, EntityTypeOpError> {
     let t = rtxn.open_table(ENTITY_TYPES_TABLE)?;
     let mut rows: Vec<(u32, String)> = Vec::new();
     for entry in t.iter()? {

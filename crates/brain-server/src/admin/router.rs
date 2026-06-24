@@ -22,15 +22,16 @@ use http::{Method, Request, Response};
 use hyper::body::Incoming;
 
 use crate::admin::handlers::{
-    agent, api_keys, audit, config, diagnostics, extract, healthz, metrics, rebuild, shard,
+    agent, api_keys, audit, config, diagnostics, extract, healthz, metrics, readyz, rebuild, shard,
     snapshot, worker,
 };
 use crate::admin::AdminState;
 
-/// `/healthz` + `/metrics`. Operator-safe to expose.
+/// `/healthz` + `/readyz` + `/metrics`. Operator-safe to expose.
 pub fn build_public(state: Arc<AdminState>) -> Router<Incoming> {
     let r = Router::new();
     let r = r.get("/healthz", healthz::handle);
+    let r = with_state(r, Method::GET, "/readyz", state.clone(), readyz::handle);
     with_state(r, Method::GET, "/metrics", state, metrics::handle)
 }
 
@@ -47,6 +48,9 @@ pub fn build_unified(state: Arc<AdminState>) -> Router<Incoming> {
 
     // ──────── /healthz — string OK, no state ───────────────────────────
     let r = r.get("/healthz", healthz::handle);
+
+    // ──────── /readyz — shard-liveness readiness probe ─────────────────
+    let r = with_state(r, Method::GET, "/readyz", state.clone(), readyz::handle);
 
     // ──────── /metrics — Prometheus text exposition ────────────────────
     let r = with_state(r, Method::GET, "/metrics", state.clone(), metrics::handle);

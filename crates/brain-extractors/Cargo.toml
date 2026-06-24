@@ -67,7 +67,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 [features]
 # Opt-in switch for tests that hit a real LLM provider.
 # Tests under `tests/llm_live.rs` also guard on the matching env
-# var (`ANTHROPIC_API_KEY`) so the suite is a no-op skip when the
+# var (`BRAIN__LLM__API_KEY`) so the suite is a no-op skip when the
 # secret is unavailable. Run with:
 #   cargo test -p brain-extractors --features live-llm \
 #       --test llm_live -- --nocapture

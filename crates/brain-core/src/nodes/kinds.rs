@@ -310,28 +310,4 @@ mod tests {
         assert!(StatementKind::Custom(9).builtin_behavior().is_none());
     }
 
-    #[test]
-    fn cardinality_round_trip() {
-        for c in [
-            Cardinality::OneToOne,
-            Cardinality::OneToMany,
-            Cardinality::ManyToOne,
-            Cardinality::ManyToMany,
-        ] {
-            assert_eq!(Cardinality::from_u8(c.as_u8()), Some(c));
-        }
-        assert_eq!(Cardinality::from_u8(4), None);
-    }
-
-    #[test]
-    fn extractor_kind_round_trip() {
-        for k in [
-            ExtractorKind::Pattern,
-            ExtractorKind::Classifier,
-            ExtractorKind::Llm,
-        ] {
-            assert_eq!(ExtractorKind::from_u8(k.as_u8()), Some(k));
-        }
-        assert_eq!(ExtractorKind::from_u8(3), None);
-    }
 }

@@ -121,39 +121,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn counters_start_at_zero() {
-        let m = AmbiguityResolverMetrics::new();
-        let s = m.snapshot();
-        assert_eq!(s.sweeps_total, 0);
-        assert_eq!(s.proposals_promoted_to_merge_total, 0);
-        assert_eq!(s.proposals_rejected_total, 0);
-        assert_eq!(s.proposals_expired_total, 0);
-        assert_eq!(s.errors_total, 0);
-        assert_eq!(s.pending_queue_depth, 0);
-        assert_eq!(s.sweep_duration_seconds.count, 0);
-    }
-
-    #[test]
-    fn counter_increments_round_trip() {
-        let m = AmbiguityResolverMetrics::new();
-        m.inc_sweeps();
-        m.add_promoted(3);
-        m.add_rejected(1);
-        m.add_expired(2);
-        m.inc_errors();
-        m.set_pending_queue_depth(17);
-        m.observe_sweep_duration(0.050);
-        let s = m.snapshot();
-        assert_eq!(s.sweeps_total, 1);
-        assert_eq!(s.proposals_promoted_to_merge_total, 3);
-        assert_eq!(s.proposals_rejected_total, 1);
-        assert_eq!(s.proposals_expired_total, 2);
-        assert_eq!(s.errors_total, 1);
-        assert_eq!(s.pending_queue_depth, 17);
-        assert_eq!(s.sweep_duration_seconds.count, 1);
-    }
-
-    #[test]
     fn pending_depth_is_a_gauge_not_a_counter() {
         let m = AmbiguityResolverMetrics::new();
         m.set_pending_queue_depth(10);

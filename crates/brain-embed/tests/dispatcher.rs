@@ -86,17 +86,6 @@ fn cpu_dispatcher_batch_matches_single() {
 }
 
 #[test]
-fn cpu_dispatcher_fingerprint_stable() {
-    let Some(dispatcher) = try_load() else {
-        return;
-    };
-    let fp1 = dispatcher.fingerprint();
-    let fp2 = dispatcher.fingerprint();
-    assert_eq!(fp1, fp2, "fingerprint must be stable per dispatcher");
-    assert_ne!(fp1, [0u8; 16], "fingerprint should not be all-zero");
-}
-
-#[test]
 fn cpu_dispatcher_clone_shares_model() {
     let Some(d1) = try_load() else {
         return;

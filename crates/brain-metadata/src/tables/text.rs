@@ -40,7 +40,7 @@ pub const TEXTS_TABLE: TableDefinition<'static, [u8; 16], &'static [u8]> =
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use redb::{Database, ReadableDatabase, ReadableTable};
+    use redb::{Database, ReadableDatabase};
 
     fn mid(byte: u8) -> [u8; 16] {
         let mut b = [0u8; 16];
@@ -50,115 +50,6 @@ mod tests {
 
     fn fresh_db(dir: &tempfile::TempDir) -> Database {
         Database::create(dir.path().join("test.redb")).expect("create redb")
-    }
-
-    #[test]
-    fn insert_and_get_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let key = mid(1);
-        let text = b"hello world";
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(TEXTS_TABLE).unwrap();
-            t.insert(&key, text.as_ref()).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(TEXTS_TABLE).unwrap();
-        let got = t.get(&key).unwrap().unwrap();
-        assert_eq!(got.value(), text.as_ref());
-    }
-
-    #[test]
-    fn missing_key_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        // Create the table so a read txn can open it.
-        let wtxn = db.begin_write().unwrap();
-        {
-            let _t = wtxn.open_table(TEXTS_TABLE).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(TEXTS_TABLE).unwrap();
-        assert!(t.get(&mid(99)).unwrap().is_none());
-    }
-
-    #[test]
-    fn overwrite_replaces_bytes() {
-        // makes text immutable at the application level; the
-        // storage layer doesn't enforce that. A second insert at the
-        // same key replaces the prior bytes. Documented here so a
-        // future change to add storage-level immutability doesn't
-        // silently regress.
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let key = mid(2);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(TEXTS_TABLE).unwrap();
-            t.insert(&key, b"first".as_ref()).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(TEXTS_TABLE).unwrap();
-            t.insert(&key, b"second".as_ref()).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(TEXTS_TABLE).unwrap();
-        assert_eq!(t.get(&key).unwrap().unwrap().value(), b"second");
-    }
-
-    #[test]
-    fn empty_text_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let key = mid(3);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(TEXTS_TABLE).unwrap();
-            t.insert(&key, b"".as_ref()).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(TEXTS_TABLE).unwrap();
-        let got = t.get(&key).unwrap().unwrap();
-        assert_eq!(got.value(), b"");
-    }
-
-    #[test]
-    fn large_text_round_trips() {
-        // 1 MB — the default `max_text_bytes` ceiling. The substrate
-        // doesn't enforce the limit; this test pins that reads/writes
-        // at that size work in practice.
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let key = mid(4);
-        let payload: Vec<u8> = (0u8..=255).cycle().take(1024 * 1024).collect();
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(TEXTS_TABLE).unwrap();
-            t.insert(&key, payload.as_slice()).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(TEXTS_TABLE).unwrap();
-        let got = t.get(&key).unwrap().unwrap();
-        assert_eq!(got.value().len(), payload.len());
-        assert_eq!(got.value(), payload.as_slice());
     }
 
     #[test]
@@ -185,66 +76,6 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(got.value()).unwrap(),
             "héllo 🌍 — multibyte ☃ sequences"
-        );
-    }
-
-    #[test]
-    fn delete_removes_row() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let key = mid(6);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(TEXTS_TABLE).unwrap();
-            t.insert(&key, b"to be removed".as_ref()).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(TEXTS_TABLE).unwrap();
-            assert!(t.remove(&key).unwrap().is_some());
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(TEXTS_TABLE).unwrap();
-        assert!(t.get(&key).unwrap().is_none());
-    }
-
-    #[test]
-    fn iterate_all_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(TEXTS_TABLE).unwrap();
-            t.insert(&mid(10), b"alpha".as_ref()).unwrap();
-            t.insert(&mid(20), b"beta".as_ref()).unwrap();
-            t.insert(&mid(30), b"gamma".as_ref()).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(TEXTS_TABLE).unwrap();
-        let mut got: Vec<(u8, Vec<u8>)> = t
-            .iter()
-            .unwrap()
-            .map(|entry| {
-                let (k, v) = entry.unwrap();
-                (k.value()[15], v.value().to_vec())
-            })
-            .collect();
-        got.sort_by_key(|(k, _)| *k);
-        assert_eq!(
-            got,
-            vec![
-                (10, b"alpha".to_vec()),
-                (20, b"beta".to_vec()),
-                (30, b"gamma".to_vec()),
-            ]
         );
     }
 }

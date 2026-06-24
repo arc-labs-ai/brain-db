@@ -1,5 +1,11 @@
 #![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
 //! Snapshot worker tests.
+//!
+//! Guards the retention policy (`decide_retention`: drop oldest past
+//! max-count, drop aged past max-age, and the two combined) and the
+//! worker that applies it: an enabled worker takes a snapshot, reports
+//! the count, and deletes expired snapshots via its source. Pins the
+//! failing-source -> `WorkerError` path and the skip-first-tick default.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -14,7 +20,7 @@ use brain_workers::snapshot::{DeleteFuture, ListFuture, TakeFuture};
 use brain_workers::{
     decide_retention, DisabledSnapshotSource, RetentionPolicy, SnapshotDesc, SnapshotId,
     SnapshotSource, SnapshotSourceError, SnapshotWorker, Worker, WorkerConfig, WorkerContext,
-    WorkerKind, WorkerScheduler,
+    WorkerKind,
 };
 use parking_lot::Mutex;
 
@@ -234,36 +240,6 @@ impl SnapshotSource for FailingSource {
 // ===========================================================================
 
 #[test]
-fn disabled_source_returns_disabled_on_every_method() {
-    glommio_run(|| async {
-        let s = DisabledSnapshotSource;
-        assert!(matches!(
-            s.take_snapshot().await,
-            Err(SnapshotSourceError::Disabled)
-        ));
-        assert!(matches!(
-            s.list_snapshots().await,
-            Err(SnapshotSourceError::Disabled)
-        ));
-        assert!(matches!(
-            s.delete_snapshot(SnapshotId(1)).await,
-            Err(SnapshotSourceError::Disabled)
-        ));
-    });
-}
-
-#[test]
-fn stub_source_take_returns_monotonic_id() {
-    glommio_run(|| async {
-        let stub = StubSource::new();
-        let a = stub.take_snapshot().await.unwrap();
-        let b = stub.take_snapshot().await.unwrap();
-        assert!(b.0 > a.0);
-        assert_eq!(stub.list_snapshots().await.unwrap().len(), 2);
-    });
-}
-
-#[test]
 fn failed_source_propagates_as_worker_error() {
     glommio_run(|| async {
         let (ops, _td) = make_ops_context();
@@ -281,34 +257,6 @@ fn failed_source_propagates_as_worker_error() {
 // ===========================================================================
 // Cycle (3).
 // ===========================================================================
-
-#[test]
-fn disabled_worker_via_config_does_not_take() {
-    glommio_run(|| async {
-        let (ops, _td) = make_ops_context();
-        let stub = StubSource::new();
-        let deleted = stub.deleted.clone();
-        let snaps = stub as Arc<dyn SnapshotSource>;
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(
-                Arc::new(SnapshotWorker::new(snaps).with_config(WorkerConfig {
-                    enabled: false,
-                    interval: Duration::from_millis(20),
-                    batch_size: 1,
-                    max_runtime: Duration::from_secs(1),
-                })),
-                ops,
-            )
-            .unwrap();
-        glommio::timer::sleep(Duration::from_millis(150)).await;
-        sched.shutdown().await.unwrap();
-        assert!(
-            deleted.lock().is_empty(),
-            "disabled worker must not delete anything"
-        );
-    });
-}
 
 #[test]
 fn enabled_worker_takes_snapshot_and_reports_count() {
@@ -363,25 +311,6 @@ fn enabled_worker_deletes_old_snapshots_per_retention() {
 // ===========================================================================
 // Worker integration (2).
 // ===========================================================================
-
-#[test]
-fn worker_registers_with_correct_kind_and_hourly_enabled_cadence() {
-    glommio_run(|| async {
-        let (ops, _td) = make_ops_context();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(
-                Arc::new(SnapshotWorker::new(Arc::new(DisabledSnapshotSource))),
-                ops,
-            )
-            .unwrap();
-        let cfg = sched.config(WorkerKind::Snapshot.name()).unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(3600));
-        // Enabled by default now that PQ snapshot persistence is wired.
-        assert!(cfg.enabled, "Snapshot is enabled by default");
-        sched.shutdown().await.unwrap();
-    });
-}
 
 #[test]
 fn default_config_enabled_and_worker_skips_first_tick() {

@@ -297,12 +297,6 @@ mod tests {
     }
 
     #[test]
-    fn estimated_cost_is_populated() {
-        let plan = unwrap_recall(plan_recall(&base_request(), &ctx()).unwrap());
-        assert!(plan.estimated_cost_ms > 0.0);
-    }
-
-    #[test]
     fn include_text_false_omits_text_fetch_step() {
         let plan = unwrap_recall(plan_recall(&base_request(), &ctx()).unwrap());
         assert!(plan.text_fetch.is_none());

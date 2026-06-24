@@ -397,7 +397,7 @@ mod tests {
     // ----- Two and three hops -----
 
     #[test]
-    fn two_hop() {
+    fn outgoing_traversal_returns_paths_at_each_depth_up_to_two_hops() {
         let (_dir, mut db) = open_db();
         let a = make_entity(&mut db, "a-2h");
         let b = make_entity(&mut db, "b-2h");
@@ -525,7 +525,7 @@ mod tests {
     // ----- Type filter -----
 
     #[test]
-    fn type_filter() {
+    fn traversal_type_filter_follows_only_requested_relation_type() {
         let (_dir, mut db) = open_db();
         let a = make_entity(&mut db, "a-tf");
         let b = make_entity(&mut db, "b-tf");

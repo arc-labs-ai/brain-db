@@ -1,9 +1,9 @@
 //! Anthropic Messages API client.
 //!
-//! POST `https://api.anthropic.com/v1/messages`. Reads
-//! `ANTHROPIC_API_KEY` at construction; deployments without the
-//! key produce a `None` client that the registry materializer
-//! routes through degraded extractors.
+//! POST `https://api.anthropic.com/v1/messages`. Constructed with the
+//! single resolved credential (`[llm] api_key` / `BRAIN__LLM__API_KEY`);
+//! deployments without the key produce a `None` client that the registry
+//! materializer routes through degraded extractors.
 //!
 //! ## Wire shape
 //!
@@ -86,21 +86,10 @@ impl std::fmt::Debug for AnthropicClient {
 }
 
 impl AnthropicClient {
-    /// Construct from the `ANTHROPIC_API_KEY` env var. Returns
-    /// `None` if unset (the model router treats this as "provider
-    /// not configured").
-    pub fn from_env(model: impl Into<String>) -> Option<Self> {
-        let key = std::env::var("ANTHROPIC_API_KEY").ok()?;
-        if key.is_empty() {
-            return None;
-        }
-        Some(Self::new(model, key, DEFAULT_BASE_URL))
-    }
-
-    /// Construct with an explicit API key against the default
-    /// endpoint. For config-provided keys (`[llm] anthropic_api_key`);
-    /// `from_env` remains the environment path. Returns `None` for an
-    /// empty key so callers can fall back uniformly.
+    /// Construct with an explicit API key against the default endpoint.
+    /// The key comes from the single resolved credential (`[llm] api_key`
+    /// / `BRAIN__LLM__API_KEY`). Returns `None` for an empty key so
+    /// callers can fall back uniformly.
     pub fn with_key(model: impl Into<String>, api_key: impl Into<String>) -> Option<Self> {
         let key = api_key.into();
         if key.is_empty() {
@@ -414,25 +403,6 @@ fn log_call(model: &str, resp: &LlmResponse) {
 mod tests {
     use super::*;
     use crate::types::{LlmMessage, LlmRole};
-
-    #[test]
-    fn from_env_returns_none_when_key_unset() {
-        let prior = std::env::var("ANTHROPIC_API_KEY").ok();
-        std::env::remove_var("ANTHROPIC_API_KEY");
-        let client = AnthropicClient::from_env("claude-haiku-4-5");
-        assert!(client.is_none());
-        if let Some(p) = prior {
-            std::env::set_var("ANTHROPIC_API_KEY", p);
-        }
-    }
-
-    #[test]
-    fn with_endpoint_sets_fields() {
-        let c =
-            AnthropicClient::with_endpoint("claude-haiku-4-5", "test-key", "http://localhost:1234");
-        assert_eq!(c.model(), "claude-haiku-4-5");
-        assert_ne!(c.model_id_hash(), 0);
-    }
 
     #[test]
     fn request_body_minimal_shape_no_system() {

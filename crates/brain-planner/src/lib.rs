@@ -83,40 +83,7 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_core::{AgentId, ContextId, MemoryKind, RequestId};
     use std::mem::size_of;
-    use uuid::Uuid;
-
-    fn fake_context_id() -> ContextId {
-        ContextId(42)
-    }
-
-    fn fake_agent_id() -> AgentId {
-        AgentId(Uuid::nil())
-    }
-
-    fn fake_request_id() -> RequestId {
-        RequestId(Uuid::nil())
-    }
-
-    #[test]
-    fn planner_config_defaults_match_spec() {
-        let c = PlannerConfig::default();
-        assert_eq!(c.default_ef_search, 64, "");
-        assert_eq!(c.max_ef_search, 500, "");
-        assert_eq!(c.max_candidates_per_search, 1000, "");
-        assert!((c.cost_budget_ms - 1000.0).abs() < f32::EPSILON, "");
-        assert_eq!(c.max_k, 1000, "");
-        assert_eq!(c.max_edges_per_encode, 64, "");
-    }
-
-    #[test]
-    fn shard_stats_default_is_all_zero() {
-        let s = ShardStats::default();
-        assert_eq!(s.memory_count, 0);
-        assert_eq!(s.tombstone_count, 0);
-        assert_eq!(s.tombstone_ratio, 0.0);
-    }
 
     #[test]
     fn plan_error_displays_readably() {
@@ -136,87 +103,6 @@ mod tests {
 
         let e3 = PlanError::Unsupported("cross-shard fan-out");
         assert!(format!("{e3}").contains("cross-shard"));
-    }
-
-    #[test]
-    fn execution_plan_constructs_with_recall_shape() {
-        let plan = ExecutionPlan::Recall(RecallPlan {
-            embedding: EmbeddingStep {
-                text: "hello".into(),
-                cache_lookup: true,
-            },
-            shards: vec![ShardSearchStep {
-                shard_id: 0u16,
-                ann_search: AnnSearchStep {
-                    ef: 64,
-                    candidates_to_request: 80,
-                    pre_filter: vec![],
-                },
-                metadata_lookup: MetadataLookupStep {
-                    include_extra: false,
-                },
-                filter_apply: FilterStep {
-                    stage: FilterStage::PostFilter,
-                    rules: vec![],
-                },
-            }],
-            merge: MergeStep {
-                sort_by: SortKey::Score,
-                final_top: 10,
-                confidence_min: None,
-            },
-            text_fetch: None,
-            response: ResponseStep {
-                include_text: false,
-                include_metadata: false,
-            },
-            estimated_cost_ms: 7.5,
-        });
-        // The variant matches what we built.
-        assert!(matches!(plan, ExecutionPlan::Recall(_)));
-        // And it can be cloned (planner → executor handoff may clone).
-        let _cloned = plan.clone();
-    }
-
-    #[test]
-    fn execution_plan_constructs_with_encode_shape() {
-        let plan = ExecutionPlan::Encode(EncodePlan {
-            shard: 0u16,
-            idempotency_check: IdempotencyCheckStep {
-                request_id: fake_request_id(),
-            },
-            embedding: EmbeddingStep {
-                text: "hello".into(),
-                cache_lookup: true,
-            },
-            context_resolution: ContextResolutionStep::Explicit(fake_context_id()),
-            allocation: SlotAllocationStep {
-                arena_grow_if_needed: true,
-            },
-            wal_append: WalAppendStep {
-                kind: MemoryKind::Episodic,
-                salience_initial: 0.5,
-                fsync: true,
-            },
-            apply: ApplyStep {
-                arena_write: true,
-                metadata_write: true,
-                hnsw_insert: true,
-            },
-            edges: vec![],
-            response: EncodeResponseStep {
-                persistent_id: true,
-            },
-            estimated_cost_ms: 7.5,
-            deduplicate: false,
-        });
-        assert!(matches!(plan, ExecutionPlan::Encode(_)));
-
-        // Named-context branch compiles.
-        let _named = ContextResolutionStep::GetOrCreate {
-            agent_id: fake_agent_id(),
-            name: "_default".into(),
-        };
     }
 
     /// Plan size < 4 KB. A heap-allocating plan

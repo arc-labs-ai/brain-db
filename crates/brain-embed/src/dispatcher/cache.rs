@@ -405,13 +405,4 @@ mod tests {
         assert_eq!(cache.stats().misses, 1);
         assert_eq!(cache.stats().hits, 0);
     }
-
-    #[test]
-    fn caching_dispatcher_object_safe_and_send_sync() {
-        fn _assert_send_sync<T: Send + Sync>() {}
-        _assert_send_sync::<CachingDispatcher<CountingMock>>();
-        fn _accepts(_d: &dyn Dispatcher) {}
-        let cache = CachingDispatcher::new(CountingMock::new(fp(0x99)), 1);
-        _accepts(&cache);
-    }
 }

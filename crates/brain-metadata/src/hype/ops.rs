@@ -75,10 +75,7 @@ pub fn hype_vector_put(
 /// on the extraction audit row, so re-encoding an already-extracted memory
 /// still generates its questions exactly once and never double-inserts
 /// them into the live index.
-pub fn hype_has_vectors(
-    rtxn: &ReadTransaction,
-    memory_id: MemoryId,
-) -> Result<bool, HypeOpError> {
+pub fn hype_has_vectors(rtxn: &ReadTransaction, memory_id: MemoryId) -> Result<bool, HypeOpError> {
     let prefix = memory_id.to_be_bytes();
     let lo = row_key(memory_id, 0);
     let hi = row_key(memory_id, u8::MAX);
@@ -221,7 +218,10 @@ mod tests {
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        assert!(hype_has_vectors(&rtxn, mem(1)).unwrap(), "mem 1 has a vector");
+        assert!(
+            hype_has_vectors(&rtxn, mem(1)).unwrap(),
+            "mem 1 has a vector"
+        );
         assert!(
             !hype_has_vectors(&rtxn, mem(2)).unwrap(),
             "mem 2 has none — the idempotency gate must let it generate"

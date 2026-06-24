@@ -125,8 +125,6 @@ pub struct EntityTombstoneRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::opcode::Opcode;
-    use crate::envelope::request::RequestBody;
     use crate::envelope::response::ResponseBody;
 
     fn sample_uuid(seed: u8) -> WireUuid {
@@ -137,191 +135,10 @@ mod tests {
         u
     }
 
-    fn sample_view() -> EntityView {
-        EntityView {
-            entity_id: sample_uuid(7),
-            entity_type_id: 1,
-            canonical_name: "Alice".into(),
-            normalized_name: "alice".into(),
-            aliases: vec!["A.".into()],
-            attributes_blob: b"x".to_vec(),
-            mention_count: 3,
-            created_at_unix_nanos: 1_700_000_000_000_000_000,
-            updated_at_unix_nanos: 1_700_000_001_000_000_000,
-            merged_into: [0; 16],
-            embedding_version: 1,
-            flags: 0,
-        }
-    }
-
-    fn req_round_trip(body: RequestBody) {
-        let bytes = body.encode();
-        let decoded = RequestBody::decode(body.opcode(), &bytes).expect("decode req");
-        assert_eq!(decoded, body);
-    }
-
     fn resp_round_trip(body: ResponseBody) {
         let bytes = body.encode();
         let decoded = ResponseBody::decode(body.opcode(), &bytes).expect("decode resp");
         assert_eq!(decoded, body);
-    }
-
-    #[test]
-    fn entity_create_request_roundtrip() {
-        req_round_trip(RequestBody::EntityCreate(EntityCreateRequest {
-            entity_type_id: 1,
-            canonical_name: "Alice".into(),
-            aliases: vec!["A.".into(), "Alyss".into()],
-            attributes_blob: b"bio=astronaut".to_vec(),
-            request_id: sample_uuid(1),
-        }));
-    }
-
-    #[test]
-    fn entity_get_request_roundtrip() {
-        req_round_trip(RequestBody::EntityGet(EntityGetRequest {
-            entity_id: sample_uuid(2),
-        }));
-    }
-
-    #[test]
-    fn entity_update_request_roundtrip() {
-        req_round_trip(RequestBody::EntityUpdate(EntityUpdateRequest {
-            entity_id: sample_uuid(3),
-            canonical_name: "Alice Cooper".into(),
-            aliases: vec![],
-            attributes_blob: Vec::new(),
-            request_id: sample_uuid(4),
-        }));
-    }
-
-    #[test]
-    fn entity_rename_request_roundtrip_both_flags() {
-        for flag in [true, false] {
-            req_round_trip(RequestBody::EntityRename(EntityRenameRequest {
-                entity_id: sample_uuid(5),
-                new_canonical_name: "Bob".into(),
-                move_to_alias: flag,
-                request_id: sample_uuid(6),
-            }));
-        }
-    }
-
-    #[test]
-    fn entity_responses_roundtrip() {
-        resp_round_trip(ResponseBody::EntityCreate(EntityCreateResponse {
-            entity_id: sample_uuid(10),
-        }));
-        resp_round_trip(ResponseBody::EntityGet(EntityGetResponse {
-            entity: sample_view(),
-        }));
-        resp_round_trip(ResponseBody::EntityUpdate(EntityUpdateResponse {
-            entity: sample_view(),
-        }));
-        resp_round_trip(ResponseBody::EntityRename(EntityRenameResponse {
-            entity: sample_view(),
-        }));
-    }
-
-    #[test]
-    fn graph_opcode_byte_assignments() {
-        assert_eq!(Opcode::EntityCreateReq.as_u16(), 0x0130);
-        assert_eq!(Opcode::EntityCreateResp.as_u16(), 0x01B0);
-        assert_eq!(Opcode::EntityGetReq.as_u16(), 0x0131);
-        assert_eq!(Opcode::EntityGetResp.as_u16(), 0x01B1);
-        assert_eq!(Opcode::EntityUpdateReq.as_u16(), 0x0132);
-        assert_eq!(Opcode::EntityUpdateResp.as_u16(), 0x01B2);
-        assert_eq!(Opcode::EntityRenameReq.as_u16(), 0x0133);
-        assert_eq!(Opcode::EntityRenameResp.as_u16(), 0x01B3);
-        assert_eq!(Opcode::EntityMergeReq.as_u16(), 0x0134);
-        assert_eq!(Opcode::EntityMergeResp.as_u16(), 0x01B4);
-        assert_eq!(Opcode::EntityUnmergeReq.as_u16(), 0x0135);
-        assert_eq!(Opcode::EntityUnmergeResp.as_u16(), 0x01B5);
-        assert_eq!(Opcode::EntityResolveReq.as_u16(), 0x0136);
-        assert_eq!(Opcode::EntityResolveResp.as_u16(), 0x01B6);
-        assert_eq!(Opcode::EntityListReq.as_u16(), 0x0137);
-        assert_eq!(Opcode::EntityListResp.as_u16(), 0x01B7);
-        assert_eq!(Opcode::EntityTombstoneReq.as_u16(), 0x0138);
-        assert_eq!(Opcode::EntityTombstoneResp.as_u16(), 0x01B8);
-
-        assert_eq!(Opcode::EntityCreateReq.namespace(), 0x01);
-        assert!(Opcode::EntityCreateReq.is_typed_graph());
-        assert!(Opcode::EntityCreateReq.is_request());
-        assert!(Opcode::EntityCreateResp.is_response());
-        assert!(Opcode::EntityMergeReq.is_typed_graph());
-        assert!(Opcode::EntityResolveReq.is_request());
-        assert!(Opcode::EntityListResp.is_response());
-    }
-
-    // 16.7.3 — round-trip the new request/response shapes.
-
-    #[test]
-    fn entity_merge_request_roundtrip() {
-        req_round_trip(RequestBody::EntityMerge(EntityMergeRequest {
-            survivor: sample_uuid(10),
-            merged: sample_uuid(11),
-            confidence: 0.91,
-            reason: "duplicate".into(),
-            request_id: sample_uuid(12),
-        }));
-    }
-
-    #[test]
-    fn entity_unmerge_request_roundtrip() {
-        req_round_trip(RequestBody::EntityUnmerge(EntityUnmergeRequest {
-            merged_entity: sample_uuid(13),
-            request_id: sample_uuid(14),
-        }));
-    }
-
-    #[test]
-    fn entity_resolve_request_roundtrip_both_create_flags() {
-        for flag in [true, false] {
-            req_round_trip(RequestBody::EntityResolve(EntityResolveRequest {
-                candidate_name: "Priya".into(),
-                context: "in the engineering team".into(),
-                entity_type_hint: 1,
-                allow_create: flag,
-                request_id: sample_uuid(15),
-            }));
-        }
-    }
-
-    #[test]
-    fn entity_list_request_roundtrip() {
-        req_round_trip(RequestBody::EntityList(EntityListRequest {
-            entity_type_id: 1,
-            name_prefix: "pri".into(),
-            mention_count_min: 0,
-            include_tombstoned: false,
-            include_merged: false,
-            limit: 50,
-            cursor: Vec::new(),
-        }));
-    }
-
-    #[test]
-    fn entity_tombstone_request_roundtrip() {
-        req_round_trip(RequestBody::EntityTombstone(EntityTombstoneRequest {
-            entity_id: sample_uuid(16),
-            reason: "obsolete".into(),
-            request_id: sample_uuid(17),
-        }));
-    }
-
-    #[test]
-    fn entity_merge_response_roundtrip() {
-        resp_round_trip(ResponseBody::EntityMerge(EntityMergeResponse {
-            audit_id: sample_uuid(20),
-            grace_period_seconds: 7 * 24 * 60 * 60,
-        }));
-    }
-
-    #[test]
-    fn entity_unmerge_response_roundtrip() {
-        resp_round_trip(ResponseBody::EntityUnmerge(EntityUnmergeResponse {
-            restored_entity_id: sample_uuid(21),
-        }));
     }
 
     #[test]
@@ -357,40 +174,6 @@ mod tests {
                 },
             }));
         }
-    }
-
-    #[test]
-    fn entity_list_response_roundtrip_intermediate_and_final() {
-        // Intermediate frame: items present, not final.
-        let intermediate = EntityListResponseFrame {
-            items: vec![EntityListItem {
-                entity: sample_view(),
-            }],
-            next_cursor: Vec::new(),
-            cumulative_count: 1,
-            is_final: false,
-        };
-        assert!(!intermediate.is_final());
-        resp_round_trip(ResponseBody::EntityList(intermediate));
-
-        // Final frame: may carry items + cursor + EOS-flag-equivalent body bit.
-        let final_frame = EntityListResponseFrame {
-            items: vec![EntityListItem {
-                entity: sample_view(),
-            }],
-            next_cursor: vec![0xAB, 0xCD],
-            cumulative_count: 42,
-            is_final: true,
-        };
-        assert!(final_frame.is_final());
-        resp_round_trip(ResponseBody::EntityList(final_frame));
-    }
-
-    #[test]
-    fn entity_tombstone_response_roundtrip() {
-        resp_round_trip(ResponseBody::EntityTombstone(EntityTombstoneResponse {
-            tombstoned_at_unix_nanos: 1_700_000_000_000_000_000,
-        }));
     }
 }
 

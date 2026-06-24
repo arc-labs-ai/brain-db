@@ -296,6 +296,26 @@ mod tests {
                 Err(OpError::InvalidRequest(msg)) => assert!(msg.contains("admin")),
                 other => panic!("expected InvalidRequest (admin is HTTP-only), got {other:?}"),
             }
+
+            // Backfill control is part of the same HTTP-only admin plane
+            // (`POST /v1/extract/backfill`); the wire opcode must reject the
+            // same way — NOT dangle on `NotYetImplemented`. Pinned explicitly
+            // so a future split of the shared match arm can't silently
+            // regress it back to "coming later".
+            let backfill = brain_protocol::envelope::request::RequestBody::AdminBackfill(
+                brain_protocol::envelope::request::AdminBackfillRequest {
+                    scope: brain_protocol::envelope::request::BackfillScope::All,
+                    extractor_ids: vec![1],
+                    dry_run: true,
+                    request_id: [0u8; 16],
+                },
+            );
+            match dispatch(backfill, RequestCaller::anonymous(), &ctx).await {
+                Err(OpError::InvalidRequest(msg)) => assert!(msg.contains("admin")),
+                other => {
+                    panic!("expected InvalidRequest for AdminBackfill (HTTP-only), got {other:?}")
+                }
+            }
         })
     }
 }

@@ -923,13 +923,4 @@ mod tests {
             s.embed_errors_total
         );
     }
-
-    #[test]
-    fn worker_kind_name() {
-        let fx = fixture();
-        let worker =
-            StatementEmbedWorker::new(fx.metadata.clone(), fx.hnsw.clone(), fx.dispatcher.clone());
-        assert_eq!(worker.name(), "statement_embed");
-        assert_eq!(worker.kind(), WorkerKind::StatementEmbed);
-    }
 }

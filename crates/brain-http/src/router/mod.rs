@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_dispatch() {
+    async fn exact_route_dispatches_to_its_handler() {
         let r = Router::<Full<Bytes>>::new().get("/healthz", ok_handler);
         let (status, body) = collect(r.dispatch(req(Method::GET, "/healthz")).await).await;
         assert_eq!(status, StatusCode::OK);

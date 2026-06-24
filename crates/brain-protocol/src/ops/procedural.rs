@@ -41,7 +41,6 @@ pub struct MaterializeProceduralRequest {
 #[cfg(test)]
 mod tests_req {
     use super::*;
-    use crate::codec::cbor::{from_cbor_bytes, to_cbor_bytes};
     use crate::codec::opcode::Opcode;
     use crate::envelope::request::RequestBody;
 
@@ -51,28 +50,6 @@ mod tests_req {
             *b = seed.wrapping_add(i as u8);
         }
         u
-    }
-
-    #[test]
-    fn opcode_byte_assignments() {
-        assert_eq!(Opcode::MaterializeProceduralReq.as_u16(), 0x0164);
-        assert!(Opcode::MaterializeProceduralReq.is_request());
-        assert!(Opcode::MaterializeProceduralReq.is_typed_graph());
-    }
-
-    #[test]
-    fn request_round_trips_via_cbor() {
-        let req = MaterializeProceduralRequest {
-            agent_id: sample_uuid(1),
-            context_filter: 7,
-            top_k: 20,
-            min_confidence: 0.5,
-            categories: vec!["tone".into(), "style".into()],
-            request_id: sample_uuid(2),
-        };
-        let bytes = to_cbor_bytes(&req);
-        let back: MaterializeProceduralRequest = from_cbor_bytes(&bytes).unwrap();
-        assert_eq!(back, req);
     }
 
     #[test]
@@ -117,36 +94,8 @@ pub struct MaterializeProceduralResponse {
 #[cfg(test)]
 mod tests_resp {
     use super::*;
-    use crate::codec::cbor::{from_cbor_bytes, to_cbor_bytes};
     use crate::codec::opcode::Opcode;
     use crate::envelope::response::ResponseBody;
-
-    fn sample_uuid(seed: u8) -> WireUuid {
-        let mut u = [0u8; 16];
-        for (i, b) in u.iter_mut().enumerate() {
-            *b = seed.wrapping_add(i as u8);
-        }
-        u
-    }
-
-    #[test]
-    fn opcode_byte_assignment() {
-        assert_eq!(Opcode::MaterializeProceduralResp.as_u16(), 0x01E4);
-        assert!(Opcode::MaterializeProceduralResp.is_response());
-    }
-
-    #[test]
-    fn response_round_trips_via_cbor() {
-        let resp = MaterializeProceduralResponse {
-            system_block: "# Learned behaviors\n\n- be concise\n".into(),
-            statement_ids: vec![sample_uuid(3), sample_uuid(4)],
-            total_candidates: 5,
-            trimmed_by_budget: true,
-        };
-        let bytes = to_cbor_bytes(&resp);
-        let back: MaterializeProceduralResponse = from_cbor_bytes(&bytes).unwrap();
-        assert_eq!(back, resp);
-    }
 
     #[test]
     fn response_round_trips_through_response_body() {

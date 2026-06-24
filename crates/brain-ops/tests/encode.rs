@@ -227,7 +227,12 @@ fn encode_req_with_dedup(request_id: [u8; 16], text: &str, context_id: u64) -> E
 }
 
 #[test]
-fn dedup_hit_returns_existing_memory_id() {
+fn same_text_distinct_request_ids_create_two_memories() {
+    // The write path stores faithfully: two separate observations of the
+    // same text under different request_ids are two distinct memories, and
+    // neither reports a dedup hit. Collapsing genuine near-duplicates is an
+    // asynchronous consolidation concern, never a synchronous write-time
+    // drop — the client cannot lose a write to an implicit dedup.
     run_in_glommio(|| async {
         let fix = build_fixture();
         let first = unwrap_encode_resp(
@@ -239,12 +244,9 @@ fn dedup_hit_returns_existing_memory_id() {
             .await
             .unwrap(),
         );
-        assert!(
-            !first.was_deduplicated,
-            "first encode is a fresh slot (miss)"
-        );
+        assert!(!first.was_deduplicated);
 
-        // Same text + same context + different request_id + dedup=true.
+        // Same text + same context, different request_id.
         let second = unwrap_encode_resp(
             dispatch(
                 RequestBody::Encode(encode_req_with_dedup([4; 16], "dedup me", 1)),
@@ -254,11 +256,11 @@ fn dedup_hit_returns_existing_memory_id() {
             .await
             .unwrap(),
         );
-        assert!(
-            second.was_deduplicated,
-            "second encode hits the fingerprint"
+        assert!(!second.was_deduplicated);
+        assert_ne!(
+            first.memory_id, second.memory_id,
+            "same text under a new request_id is a distinct memory",
         );
-        assert_eq!(first.memory_id, second.memory_id);
     })
 }
 
@@ -494,7 +496,7 @@ fn encode_idempotent_retry_keeps_single_text_row_unchanged() {
 }
 
 #[test]
-fn encode_dedup_hit_does_not_clobber_original_text_row() {
+fn same_text_second_encode_leaves_first_text_row_intact() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let original_text = "dedup-original-text";
@@ -514,9 +516,9 @@ fn encode_dedup_hit_does_not_clobber_original_text_row() {
             Some(original_text.as_bytes().to_vec())
         );
 
-        // Same text + context + dedup=true under a different request_id:
-        // server returns the existing memory_id and must NOT mutate the
-        // original text row.
+        // Same text + context under a different request_id: the write path
+        // stores it faithfully as a second, independent memory — the first
+        // memory's text row is never mutated or collapsed.
         let second = unwrap_encode_resp(
             dispatch(
                 RequestBody::Encode(encode_req_with_dedup([0x71; 16], original_text, 9)),
@@ -526,77 +528,17 @@ fn encode_dedup_hit_does_not_clobber_original_text_row() {
             .await
             .unwrap(),
         );
-        assert!(second.was_deduplicated);
-        assert_eq!(first.memory_id, second.memory_id);
+        assert!(!second.was_deduplicated);
+        assert_ne!(first.memory_id, second.memory_id);
         assert_eq!(
             read_text(&fix, first.memory_id),
             Some(original_text.as_bytes().to_vec()),
-            "dedup hit must not rewrite the texts row",
+            "the first text row is untouched by the second encode",
         );
-    })
-}
-
-// ---------------------------------------------------------------------------
-// 6b. was_deduplicated round-trips through idempotency replay.
-// ---------------------------------------------------------------------------
-//
-// The two flags (`replayed` and `was_deduplicated`) are orthogonal.
-// Idempotency replay is transparent — clients see the
-// same shape on retry as on first attempt. If the first attempt was a
-// fingerprint dedup hit, the cached response carries that signal; a
-// retry MUST surface it too. Otherwise the same `request_id` returns
-// two different response shapes, breaking the "same params → cached
-// response" invariant.
-
-#[test]
-fn encode_dedup_then_replay_returns_was_deduplicated_true() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-
-        // First: dedup=true with no existing memory → miss, fresh slot.
-        let first = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(encode_req_with_dedup([0x80; 16], "round-trip me", 11)),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        assert!(!first.was_deduplicated, "first encode is a fresh slot");
-
-        // Second: same text, dedup=true, different request_id → dedup hit.
-        let second_req = encode_req_with_dedup([0x81; 16], "round-trip me", 11);
-        let second = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(second_req.clone()),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        assert!(
-            second.was_deduplicated,
-            "second encode hits the fingerprint"
-        );
-        assert_eq!(first.memory_id, second.memory_id);
-
-        // Third: retry the SAME request_id as `second` → idempotency
-        // replay must surface `was_deduplicated: true`.
-        let third = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(second_req),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        assert_eq!(third.memory_id, second.memory_id);
-        assert!(
-            third.was_deduplicated,
-            "idempotency replay must round-trip was_deduplicated=true",
+        assert_eq!(
+            read_text(&fix, second.memory_id),
+            Some(original_text.as_bytes().to_vec()),
+            "the second encode stores its own faithful text row",
         );
     })
 }

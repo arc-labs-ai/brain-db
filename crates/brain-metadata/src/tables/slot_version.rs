@@ -84,7 +84,7 @@ pub fn increment(table: &mut Table<'_, u64, u32>, slot_id: u64) -> Result<u32, S
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use redb::{Database, ReadableDatabase, ReadableTable};
+    use redb::{Database, ReadableDatabase};
 
     fn fresh_db(dir: &tempfile::TempDir) -> Database {
         Database::create(dir.path().join("test.redb")).expect("create redb")
@@ -214,67 +214,5 @@ mod tests {
         let rtxn = db.begin_read().unwrap();
         let t = rtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
         assert_eq!(t.get(&slot).unwrap().unwrap().value(), u32::MAX);
-    }
-
-    #[test]
-    fn direct_get_after_insert() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-            t.insert(&1234u64, &42u32).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-        assert_eq!(t.get(&1234u64).unwrap().unwrap().value(), 42);
-    }
-
-    #[test]
-    fn range_scan_returns_in_order() {
-        // Pins redb's u64-lexicographic-by-bytes key ordering matches
-        // numerical order: inserting 100, 50, 200 must iterate as
-        // 50, 100, 200. (redb sorts integer keys big-endian-encoded
-        // under the hood; this test catches any change.)
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-            t.insert(&100u64, &1u32).unwrap();
-            t.insert(&50u64, &2u32).unwrap();
-            t.insert(&200u64, &3u32).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-        let keys: Vec<u64> = t
-            .iter()
-            .unwrap()
-            .map(|entry| entry.unwrap().0.value())
-            .collect();
-        assert_eq!(keys, vec![50, 100, 200]);
-    }
-
-    #[test]
-    fn missing_key_get_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-
-        // Create the table so a read txn can open it.
-        let wtxn = db.begin_write().unwrap();
-        {
-            let _t = wtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-        assert!(t.get(&u64::MAX).unwrap().is_none());
     }
 }

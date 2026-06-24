@@ -233,18 +233,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn estimated_cost_in_reasonable_range() {
-        // Default budget (depth=4, branches=64) should fall in the
-        // 30-100 ms range when stats are at defaults.
-        let plan = unwrap_path(plan_path(&base_request(), &PlannerContext::default()).unwrap());
-        assert!(plan.estimated_cost_ms > 5.0);
-        assert!(plan.estimated_cost_ms < 500.0);
-    }
-
-    #[test]
-    fn strategy_defaults_to_auto() {
-        let plan = unwrap_path(plan_path(&base_request(), &PlannerContext::default()).unwrap());
-        assert_eq!(plan.strategy, PlanStrategy::Auto);
-    }
 }

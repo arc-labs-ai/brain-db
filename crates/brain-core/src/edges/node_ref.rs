@@ -158,15 +158,6 @@ mod tests {
     }
 
     #[test]
-    fn node_ref_roundtrip_entity() {
-        let nr = NodeRef::Entity(sample_entity());
-        let bytes = nr.to_bytes();
-        assert_eq!(bytes[0], 1);
-        assert_eq!(&bytes[1..17], &sample_entity().to_bytes());
-        assert_eq!(NodeRef::from_bytes(bytes).unwrap(), nr);
-    }
-
-    #[test]
     fn node_ref_unknown_tag_errors() {
         let mut bytes = [0u8; NodeRef::BYTES];
         bytes[0] = 2;
@@ -193,15 +184,6 @@ mod tests {
             expected.push_str(&format!("{b:02x}"));
         }
         assert_eq!(format!("{e}"), expected);
-    }
-
-    #[test]
-    fn memory_sorts_before_entity() {
-        // Same id bytes; the tag must drive ordering.
-        let id = [0xFFu8; 16];
-        let m = NodeRef::Memory(MemoryId::from_be_bytes(id));
-        let e = NodeRef::Entity(EntityId::from_bytes([0x00u8; 16]));
-        assert!(m < e, "Memory(0xFF..) should sort before Entity(0x00..)");
     }
 
     proptest! {

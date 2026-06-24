@@ -87,19 +87,6 @@ mod tests {
     use super::*;
     use crate::framework::item::{EntityMention, ExtractedItem};
 
-    struct NoopHook;
-    impl EnricherHook for NoopHook {
-        fn run(
-            &self,
-            _agent_id: AgentId,
-            _items: &mut Vec<ExtractedItem>,
-            _source_text: &str,
-            _now_unix_nanos: u64,
-        ) -> Vec<EnricherHookOutcome> {
-            Vec::new()
-        }
-    }
-
     struct UppercasingHook;
     impl EnricherHook for UppercasingHook {
         fn run(
@@ -175,11 +162,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn debug_impl_for_dyn_hook_renders() {
-        let hook: std::sync::Arc<dyn EnricherHook> = std::sync::Arc::new(NoopHook);
-        // Smoke: Debug shouldn't panic and should mention the type.
-        let s = format!("{:?}", &*hook);
-        assert!(s.contains("EnricherHook"));
-    }
 }

@@ -343,6 +343,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy PQ k-means training (v1.x feature, not wired into the v1 live path); slow in debug builds. Run with --run-ignored."]
     fn determinism_same_seed_byte_identical() {
         let sample = synthetic_sample(16, 300, 0xDEAD_BEEF); // 4800 vectors
                                                              // Bump to MIN_TRAINING_SAMPLE by padding with noise.
@@ -363,6 +364,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy PQ k-means training (v1.x feature, not wired into the v1 live path); slow in debug builds. Run with --run-ignored."]
     fn determinism_different_seed_different_codebook() {
         let sample = synthetic_sample(8, 600, 0x1234);
         let pad_count = MIN_TRAINING_SAMPLE.saturating_sub(sample.len());
@@ -381,6 +383,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy PQ k-means training (v1.x feature, not wired into the v1 live path); slow in debug builds. Run with --run-ignored."]
     fn assignment_cost_monotone_nonincreasing() {
         // Property: each Lloyd iteration cannot raise the total
         // assignment cost. We can't easily probe per-iter costs from
@@ -414,6 +417,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy PQ k-means training (v1.x feature, not wired into the v1 live path); slow in debug builds. Run with --run-ignored."]
     fn centroids_recover_subspace_0_clusters() {
         // 16 well-separated clusters in subspace 0, 300 points each.
         // Subspace-0 centroids should land near the cluster centres

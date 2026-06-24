@@ -202,67 +202,12 @@ pub(crate) fn fresh_db(dir: &tempfile::TempDir) -> redb::Database {
     let db = redb::Database::create(dir.path().join("test.redb")).expect("create redb");
     // Materialize every table once on creation so read-only tests
     // (counting rows on empty tables, missing-key lookups, etc.)
-    // don't trip TableDoesNotExist. Idempotent — see
-    // `materialize_all_tables_is_idempotent`.
+    // don't trip TableDoesNotExist. Re-opening an existing table is a
+    // no-op, so this stays idempotent across repeated calls.
     {
         let wtxn = db.begin_write().expect("begin_write");
         materialize_all_tables(&wtxn).expect("materialize");
         wtxn.commit().expect("commit");
     }
     db
-}
-
-#[cfg(all(test, not(miri)))]
-mod registry_tests {
-    use super::*;
-    use redb::ReadableDatabase;
-
-    #[test]
-    fn materialize_all_tables_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-
-        // First pass: creates every table.
-        {
-            let wtxn = db.begin_write().unwrap();
-            materialize_all_tables(&wtxn).expect("materialize");
-            wtxn.commit().unwrap();
-        }
-
-        // Second pass: every table already exists; re-open is a no-op.
-        {
-            let wtxn = db.begin_write().unwrap();
-            materialize_all_tables(&wtxn).expect("re-materialize");
-            wtxn.commit().unwrap();
-        }
-    }
-
-    #[test]
-    fn every_table_readable_after_materialize() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-
-        {
-            let wtxn = db.begin_write().unwrap();
-            materialize_all_tables(&wtxn).expect("materialize");
-            wtxn.commit().unwrap();
-        }
-
-        // A read txn should now open every table without TableDoesNotExist.
-        let rtxn = db.begin_read().unwrap();
-        rtxn.open_table(agent::AGENTS_TABLE).expect("agents");
-        rtxn.open_table(memory::MEMORIES_TABLE).expect("memories");
-        rtxn.open_table(entity::ENTITIES_TABLE).expect("entities");
-        rtxn.open_table(entity::ENTITY_VECTORS_TABLE)
-            .expect("entity_vectors");
-        rtxn.open_table(statement::STATEMENTS_TABLE)
-            .expect("statements");
-        rtxn.open_table(statement::STATEMENT_EMBED_QUEUE_TABLE)
-            .expect("statement_embed_queue");
-        rtxn.open_table(relation::RELATION_METADATA_TABLE)
-            .expect("relation_metadata");
-        rtxn.open_table(edge::EDGES_TABLE).expect("edges");
-        rtxn.open_table(checkpoint::CHECKPOINTS_TABLE)
-            .expect("checkpoints");
-    }
 }

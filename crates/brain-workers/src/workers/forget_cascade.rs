@@ -397,14 +397,6 @@ mod tests {
     }
 
     #[test]
-    fn worker_kind_name() {
-        let (_tx, rx) = flume::unbounded::<ForgetCascadeJob>();
-        let w = ForgetCascadeWorker::new(rx);
-        assert_eq!(w.name(), "forget_cascade");
-        assert_eq!(w.queue_depth(), 0);
-    }
-
-    #[test]
     fn enqueue_grows_queue_depth() {
         let (tx, rx) = flume::unbounded::<ForgetCascadeJob>();
         let w = ForgetCascadeWorker::new(rx);

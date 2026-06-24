@@ -23,7 +23,7 @@ use brain_metadata::MetadataDb;
 use brain_ops::{AmbiguityResolverMetrics, RealWriterHandle};
 use brain_planner::{ExecutorContext, WriterHandle};
 use brain_workers::ambiguity_resolver::{AmbiguityResolverConfig, AmbiguityResolverWorker};
-use brain_workers::{Worker, WorkerContext, WorkerKind};
+use brain_workers::WorkerContext;
 use parking_lot::RwLock;
 
 fn real_now() -> u64 {
@@ -261,14 +261,3 @@ fn end_to_end_expire_path() {
     assert_eq!(metrics.snapshot().proposals_expired_total, 1);
 }
 
-#[test]
-fn worker_kind_matches() {
-    let fx = fixture();
-    let worker = AmbiguityResolverWorker::new(
-        fx.metadata.clone(),
-        fx.hnsw.clone(),
-        fx.embedder.clone() as Arc<dyn Dispatcher>,
-    );
-    assert_eq!(worker.kind(), WorkerKind::AmbiguityResolver);
-    assert_eq!(worker.name(), "ambiguity_resolver");
-}

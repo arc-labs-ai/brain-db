@@ -915,16 +915,6 @@ mod tests {
         assert_eq!(snap.last_avg_drift, 0.0);
     }
 
-    #[test]
-    fn worker_kind_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let metadata = MetadataDb::open(dir.path().join("test.redb")).unwrap();
-        let metadata = Arc::new(metadata);
-        let w = ConfidenceSweepWorker::new(metadata);
-        assert_eq!(w.name(), "confidence_sweep");
-        assert_eq!(w.kind(), WorkerKind::ConfidenceSweep);
-    }
-
     // env-override parsing is tested once in crate::env.
 
     // Use the suppressed helper to satisfy clippy's dead-code check

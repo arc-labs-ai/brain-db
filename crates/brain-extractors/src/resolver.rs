@@ -1569,19 +1569,26 @@ mod tests {
 
     #[test]
     fn tier_embedding_respects_entity_type() {
-        // Both Person and Organization entries share the SAME embedding
-        // peak so the HNSW returns both at the top. The type filter
-        // must drop the Organization candidate before the threshold
-        // check.
+        // A Person and an Organization share the SAME embedding peak, so
+        // the HNSW returns both at the top. The embedding tier's type
+        // filter must drop the Organization candidate before the
+        // threshold check, resolving to the Person.
+        //
+        // The query is a paraphrase that surface-matches neither seeded
+        // name (shares only the leading token, like "Stripe Payments" vs
+        // "Stripe Inc." in `tier_embedding_resolves_near_paraphrase`), so
+        // the exact / alias / partial-name tiers all miss and tier-3
+        // (embedding) is the one under test. ("Wong" alone would be a
+        // partial-name subset of both seeded names and resolve earlier.)
         let shared_v = shared_axis(42, 43, 1.0, 0.0);
-        // Slightly off-axis for Alice's Cafe so HNSW orders Alice Wong
-        // higher when the query vector matches Alice Wong exactly —
-        // but this test is really about the type filter rejecting the
+        // Slightly off-axis for the Org so the HNSW orders the Person
+        // higher when the query vector matches the Person exactly — but
+        // this test is really about the type filter rejecting the
         // wrong-type top hit.
-        let cafe_v = shared_axis(42, 43, 0.999, 0.045);
+        let org_v = shared_axis(42, 43, 0.999, 0.045);
 
         let embedder = Arc::new(ScriptedEmbedder::new());
-        embedder.set("Alice", shared_v);
+        embedder.set("Wong Group", shared_v);
 
         let dir = TempDir::new().unwrap();
         let mut d = db(&dir);
@@ -1595,23 +1602,29 @@ mod tests {
             id
         };
 
-        let alice_person_id = seed_entity(
+        let wong_person_id = seed_entity(
             &mut d,
             &hnsw,
             brain_core::EntityType::PERSON_ID,
-            "Alice Wong",
+            "Wong Industries",
             shared_v,
         );
-        let _cafe_id = seed_entity(&mut d, &hnsw, org_type_id, "Alice's Cafe", cafe_v);
+        let _org_id = seed_entity(&mut d, &hnsw, org_type_id, "Wong Holdings", org_v);
 
         let deps = deps(embedder, hnsw);
         let wtxn = d.write_txn().unwrap();
-        let res =
-            resolve_or_create_with_hnsw(&wtxn, "Alice", "brain:Person", 0.9, NOW + 1, Some(&deps))
-                .unwrap();
+        let res = resolve_or_create_with_hnsw(
+            &wtxn,
+            "Wong Group",
+            "brain:Person",
+            0.9,
+            NOW + 1,
+            Some(&deps),
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
-        assert_eq!(res.entity_id, alice_person_id);
+        assert_eq!(res.entity_id, wong_person_id);
         assert_eq!(res.tier, ResolutionTier::Embedding);
     }
 

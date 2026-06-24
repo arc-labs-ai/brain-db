@@ -68,10 +68,11 @@ channel_capacity = 1024
 # + LLM) against each memory's text. Outputs are resolved through the
 # entity resolver gauntlet and written as entities / statements /
 # relations / mention edges.
+#
+# There is no master switch here: the worker is DERIVED from the per-tier
+# gates under `[extractors.{pattern,classifier,llm}]` — it is provisioned
+# iff at least one tier is enabled. This section only tunes the worker.
 [workers.extractor]
-# Master switch. `false` skips registration entirely — no channel, no
-# worker, encodes see a None sender.
-enabled = true
 # Scheduler tick. Extraction is heavier than auto-edge (LLM round-trip
 # dominates), so the default is 1s vs 100ms.
 interval_ms = 1000
@@ -204,9 +205,9 @@ mode = "none"
 backend = "disabled"
 request_timeout_sec = 30
 max_summary_chars = 4096
-# OpenAI knobs — only used when backend = "openai".
+# OpenAI knobs — only used when backend = "openai". The credential is
+# NOT here: the summarizer shares the single [llm] api_key below.
 openai_model = "gpt-4o-mini"
-openai_api_key = ""  # operator sets at deploy time — never commit a real key
 # Ollama knobs — only used when backend = "ollama".
 # ollama_base = "http://localhost:11434"
 # ollama_model = "llama3.1:8b"
@@ -217,9 +218,11 @@ openai_api_key = ""  # operator sets at deploy time — never commit a real key
 # depends on it. The server refuses to boot without a provider key —
 # there is no substrate-only / HyPE-less mode.
 #
-# Single provider-agnostic credential + model. The provider is derived
-# from the model id (claude* → Anthropic, else OpenAI). BRAIN_API_KEY /
-# BRAIN_AI_MODEL override these at deploy time.
+# Single provider-agnostic credential + model, shared by every LLM
+# consumer (HyPE, extraction, disambiguator, summarizer). The provider is
+# derived from the model id (claude* → Anthropic, else OpenAI). Override
+# at deploy time with the generic env parser:
+#   BRAIN__LLM__API_KEY=sk-...   BRAIN__LLM__MODEL=gpt-4o-mini
 api_key = ""   # operator sets at deploy time — never commit a real key
 # model = "gpt-4o-mini"  # default when unset
 

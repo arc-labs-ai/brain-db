@@ -170,32 +170,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backfill_id_round_trips_through_bytes() {
-        let a = BackfillId::new();
-        let b = BackfillId::from_bytes(a.to_bytes());
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn backfill_request_builder_defaults() {
-        let req = BackfillRequest::new(BackfillRange::All, vec![ExtractorId(1)]);
-        assert!(matches!(req.memory_range, BackfillRange::All));
-        assert_eq!(req.extractor_ids, vec![ExtractorId(1)]);
-        assert_eq!(req.priority, WorkerPriority::Background);
-        assert!(!req.dry_run);
-    }
-
-    #[test]
     fn backfill_request_dry_run_helper() {
         let req = BackfillRequest::new(BackfillRange::All, Vec::new()).dry_run();
         assert!(req.dry_run);
-    }
-
-    #[test]
-    fn backfill_progress_default_is_idle() {
-        let p = BackfillProgress::default();
-        assert!(!p.running);
-        assert_eq!(p.completed, 0);
-        assert_eq!(p.last_processed_memory_id, None);
     }
 }

@@ -1,9 +1,8 @@
 //! OpenAI Chat Completions Summarizer adapter.
 //!
-//! Posts to `<api_base>/chat/completions` with the
-//! prompt. API key resolved env-first (`OPENAI_API_KEY`),
-//! config-fallback (`cfg.summarizer.openai_api_key`) — the same
-//! convention as the LLM extractor tier. The resolved key is never
+//! Posts to `<api_base>/chat/completions` with the prompt. The API key
+//! is the single shared credential (`[llm] api_key` / `BRAIN__LLM__API_KEY`),
+//! the same one every other LLM consumer uses. The resolved key is never
 //! logged.
 //!
 //! Errors:

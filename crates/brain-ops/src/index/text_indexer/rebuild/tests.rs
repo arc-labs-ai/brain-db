@@ -267,7 +267,7 @@ fn rebuild_statements_skips_tombstoned() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rebuild_idempotent() {
+fn repeated_text_rebuild_succeeds_without_error() {
     let dir = TempDir::new().expect("tempdir");
     let metadata = fresh_metadata(dir.path());
 

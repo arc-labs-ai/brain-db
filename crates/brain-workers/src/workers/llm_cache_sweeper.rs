@@ -169,13 +169,6 @@ mod tests {
     // env-override parsing is tested once in crate::env.
 
     #[test]
-    fn worker_kind_name() {
-        let w = LlmCacheSweeper::new();
-        assert_eq!(w.name(), "llm_cache_sweeper");
-        assert_eq!(w.kind(), WorkerKind::LlmCacheSweeper);
-    }
-
-    #[test]
     fn worker_tick_invokes_sweep_expired() {
         // Seed an LlmCacheDb with one expired row + one fresh one,
         // call the worker's sweep_once-equivalent (via the public

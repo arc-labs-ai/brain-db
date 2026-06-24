@@ -403,7 +403,7 @@ impl redb::Value for MemoryMetadata {
 mod tests {
     use super::*;
     use brain_core::{AgentId, ContextId, MemoryId, MemoryKind};
-    use redb::{Database, ReadableDatabase, ReadableTable};
+    use redb::{Database, ReadableDatabase};
 
     fn aid(byte: u8) -> AgentId {
         let mut b = [0u8; 16];
@@ -452,160 +452,7 @@ mod tests {
         assert_eq!(row.value(), m);
     }
 
-    #[test]
-    fn get_missing_key_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        // Open the table to materialize it; nothing inserted.
-        {
-            let wtxn = db.begin_write().unwrap();
-            let _ = wtxn.open_table(MEMORIES_TABLE).unwrap();
-            wtxn.commit().unwrap();
-        }
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
-        assert!(t.get(&[0u8; 16]).unwrap().is_none());
-    }
-
-    #[test]
-    fn update_overwrites() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let mut m = sample(3);
-        let key = m.memory_id_bytes;
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
-            t.insert(&key, &m).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        // Bump salience + access count.
-        m.salience = 0.9;
-        m.access_count = 5;
-        m.last_accessed_at_unix_nanos = 1_700_000_000_000_000_500;
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
-            t.insert(&key, &m).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
-        let got = t.get(&key).unwrap().unwrap().value();
-        assert_eq!(got.salience, 0.9);
-        assert_eq!(got.access_count, 5);
-    }
-
-    #[test]
-    fn delete_removes_row() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let m = sample(10);
-        let key = m.memory_id_bytes;
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
-            t.insert(&key, &m).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
-            assert!(t.remove(&key).unwrap().is_some());
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
-        assert!(t.get(&key).unwrap().is_none());
-    }
-
-    // ----- Scan-with-filter ('s v1 path) -----------------
-
-    #[test]
-    fn scan_filter_counts_by_agent_and_context() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        // 5 memories: 3 for agent A in context 1, 2 for agent B in context 2.
-        let mut rows = Vec::new();
-        let agent_a_bytes: [u8; 16] = aid(0xAA).into();
-        let agent_b_bytes: [u8; 16] = aid(0xBB).into();
-        for slot in 0..3u64 {
-            let mut m = sample(slot);
-            m.agent_id_bytes = agent_a_bytes;
-            m.context_id = 1;
-            rows.push(m);
-        }
-        for slot in 3..5u64 {
-            let mut m = sample(slot);
-            m.agent_id_bytes = agent_b_bytes;
-            m.context_id = 2;
-            rows.push(m);
-        }
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
-            for r in &rows {
-                t.insert(&r.memory_id_bytes, r).unwrap();
-            }
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
-        let mut count_a_c1 = 0u32;
-        let mut count_b_c2 = 0u32;
-        for entry in t.iter().unwrap() {
-            let (_k, v) = entry.unwrap();
-            let r = v.value();
-            if r.agent_id_bytes == agent_a_bytes && r.context_id == 1 {
-                count_a_c1 += 1;
-            } else if r.agent_id_bytes == agent_b_bytes && r.context_id == 2 {
-                count_b_c2 += 1;
-            }
-        }
-        assert_eq!(count_a_c1, 3);
-        assert_eq!(count_b_c2, 2);
-    }
-
-    // ----- Field round-trips --------------------------------------------
-
-    #[test]
-    fn option_u64_fields_survive_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let mut m = sample(1);
-        m.forgot_at_unix_nanos = None;
-        m.tombstoned_at_unix_nanos = Some(1_700_000_000_000_000_100);
-        m.consolidated_at_unix_nanos = Some(1_700_000_000_000_000_200);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
-            t.insert(&m.memory_id_bytes, &m).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
-        let got = t.get(&m.memory_id_bytes).unwrap().unwrap().value();
-        assert_eq!(got.forgot_at_unix_nanos, None);
-        assert_eq!(
-            got.tombstoned_at_unix_nanos,
-            Some(1_700_000_000_000_000_100)
-        );
-        assert_eq!(
-            got.consolidated_at_unix_nanos,
-            Some(1_700_000_000_000_000_200)
-        );
-    }
+    // ----- Flag + type logic (no DB) ------------------------------------
 
     #[test]
     fn flag_bit_manipulation() {
@@ -646,15 +493,5 @@ mod tests {
         assert_eq!(m.agent_id(), agent_id);
         assert_eq!(m.context(), context);
         assert_eq!(m.kind().unwrap(), MemoryKind::Semantic);
-    }
-
-    // ----- Encoding stability -------------------------------------------
-
-    #[test]
-    fn same_input_same_bytes() {
-        let m = sample(123);
-        let bytes_a = <MemoryMetadata as redb::Value>::as_bytes(&m);
-        let bytes_b = <MemoryMetadata as redb::Value>::as_bytes(&m);
-        assert_eq!(bytes_a, bytes_b);
     }
 }

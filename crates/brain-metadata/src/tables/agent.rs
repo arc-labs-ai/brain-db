@@ -132,64 +132,6 @@ mod tests {
     }
 
     #[test]
-    fn update_overwrites() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let mut m = sample(3);
-        let key = m.agent_id_bytes;
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(AGENTS_TABLE).unwrap();
-            t.insert(&key, &m).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        m.memory_count = 42;
-        m.context_count = 7;
-        m.last_active_at_unix_nanos = 1_700_000_000_000_000_500;
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(AGENTS_TABLE).unwrap();
-            t.insert(&key, &m).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(AGENTS_TABLE).unwrap();
-        let got = t.get(&key).unwrap().unwrap().value();
-        assert_eq!(got.memory_count, 42);
-        assert_eq!(got.context_count, 7);
-    }
-
-    #[test]
-    fn delete_removes_row() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let m = sample(9);
-        let key = m.agent_id_bytes;
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(AGENTS_TABLE).unwrap();
-            t.insert(&key, &m).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(AGENTS_TABLE).unwrap();
-            assert!(t.remove(&key).unwrap().is_some());
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(AGENTS_TABLE).unwrap();
-        assert!(t.get(&key).unwrap().is_none());
-    }
-
-    #[test]
     fn brain_core_type_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);

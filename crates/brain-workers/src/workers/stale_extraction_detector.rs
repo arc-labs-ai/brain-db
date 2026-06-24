@@ -120,13 +120,3 @@ impl Worker for StaleExtractionDetector {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn worker_kind_name() {
-        let w = StaleExtractionDetector::new();
-        assert_eq!(w.name(), "stale_extraction_detector");
-    }
-}

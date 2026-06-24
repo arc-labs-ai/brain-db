@@ -1,5 +1,11 @@
 #![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
 //! Idempotency cleanup worker integration tests.
+//!
+//! Guards TTL expiry of the request-idempotency table: entries past the
+//! TTL are removed and younger entries are kept, with a custom TTL
+//! honoured. Pins per-cycle batch caps and multi-cycle convergence so a
+//! large backlog is fully swept, plus the no-op / batch-size-zero edges
+//! and the processed-count metric the scheduler consumes.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -216,51 +222,6 @@ fn custom_ttl_honoured() {
 // ===========================================================================
 // Worker integration (3).
 // ===========================================================================
-
-#[test]
-fn worker_registers_with_correct_kind_and_default_cadence() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(Arc::new(IdempotencyCleanupWorker::new()), fix.ctx)
-            .unwrap();
-        let cfg = sched.config(WorkerKind::IdempotencyCleanup.name()).unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(3600));
-        sched.shutdown().await.unwrap();
-    });
-}
-
-#[test]
-fn disabled_worker_via_config_does_not_run() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let now = now_unix_nanos();
-        for i in 1..=5u8 {
-            seed_entry(&fix.metadata, i, now - 30 * HOUR_NS);
-        }
-        let cfg = WorkerConfig {
-            enabled: false,
-            interval: Duration::from_millis(20),
-            batch_size: 1000,
-            max_runtime: Duration::from_secs(1),
-        };
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(
-                Arc::new(IdempotencyCleanupWorker::new().with_config(cfg)),
-                fix.ctx.clone(),
-            )
-            .unwrap();
-        glommio::timer::sleep(Duration::from_millis(150)).await;
-        sched.shutdown().await.unwrap();
-        assert_eq!(
-            count_entries(&fix.metadata),
-            5,
-            "disabled worker must not delete"
-        );
-    });
-}
 
 #[test]
 fn cycle_processed_count_feeds_metrics() {

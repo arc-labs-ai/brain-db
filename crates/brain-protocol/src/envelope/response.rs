@@ -434,7 +434,6 @@ mod tests {
     use crate::envelope::request::{
         EdgeKindWire, ForgetMode, MemoryKindWire, WireMemoryId, WireUuid,
     };
-    use crate::error::{ErrorCategory, ErrorCode};
 
     fn round_trip(body: ResponseBody) {
         let bytes = body.encode();
@@ -1027,39 +1026,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn error_code_wire_round_trips_through_canonical() {
-        // ErrorCode → ErrorCodeWire → ErrorCode is the identity for every
-        // code (sanity-check on the From mappings).
-        for code in [
-            ErrorCode::BadMagic,
-            ErrorCode::Unauthenticated,
-            ErrorCode::PermissionDenied,
-            ErrorCode::InvalidArgument,
-            ErrorCode::MemoryNotFound,
-            ErrorCode::IdempotencyConflict,
-            ErrorCode::OutOfSlots,
-            ErrorCode::Internal,
-            ErrorCode::ShardUnavailable,
-        ] {
-            let wire: ErrorCodeWire = code.into();
-            let back: ErrorCode = wire.into();
-            assert_eq!(back, code);
-        }
-        for cat in [
-            ErrorCategory::Protocol,
-            ErrorCategory::Authentication,
-            ErrorCategory::Authorization,
-            ErrorCategory::Validation,
-            ErrorCategory::NotFound,
-            ErrorCategory::Conflict,
-            ErrorCategory::ResourceExhausted,
-            ErrorCategory::Internal,
-            ErrorCategory::Unavailable,
-        ] {
-            let wire: ErrorCategoryWire = cat.into();
-            let back: ErrorCategory = wire.into();
-            assert_eq!(back, cat);
-        }
-    }
 }

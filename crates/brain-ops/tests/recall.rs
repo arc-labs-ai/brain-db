@@ -8,16 +8,9 @@
 //! first, then runs RECALL against it.
 
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 
-use brain_core::MemoryId;
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
-use brain_index::{
-    GraphError, GraphQuery, GraphRetriever, GraphRetrieverConfig, IndexParams, LexicalError,
-    LexicalQuery, LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItem, RankedItemId,
-    SemanticError, SemanticQuery, SemanticRetriever, SemanticRetrieverConfig, SemanticScope,
-    SharedHnsw,
-};
+use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
 use brain_ops::test_support::{run_in_glommio, single_body};
 use brain_ops::{dispatch, DispatchOutcome, OpsContext, RealWriterHandle};
@@ -57,7 +50,23 @@ impl Dispatcher for MockDispatcher {
 
 struct Fixture {
     ctx: OpsContext,
-    _tempdir: tempfile::TempDir,
+    tempdir: tempfile::TempDir,
+    metadata: SharedMetadataDb,
+}
+
+impl Fixture {
+    /// Rebuild the lexical lane from redb so recall sees a fully-indexed
+    /// corpus, the way a production shard does. The write path populates
+    /// redb + HNSW but no text-indexer worker runs in a unit test, so the
+    /// lexical lane is empty until this is called. Invoke it after the
+    /// last encode and before recall; the read path's structural
+    /// abstention needs a stored memory's own words to confirm it.
+    fn reindex_lexical(&mut self) {
+        self.ctx.lexical_retriever = brain_ops::test_support::reindex_memory_lexical_for_tests(
+            self.tempdir.path(),
+            &self.metadata,
+        );
+    }
 }
 
 fn build_fixture() -> Fixture {
@@ -72,12 +81,17 @@ fn build_fixture_with_embedder(embedder: Arc<dyn Dispatcher>) -> Fixture {
     let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
 
-    let executor =
-        ExecutorContext::new(embedder, shared, metadata, writer as Arc<dyn WriterHandle>);
+    let executor = ExecutorContext::new(
+        embedder,
+        shared,
+        metadata.clone(),
+        writer as Arc<dyn WriterHandle>,
+    );
 
     Fixture {
-        ctx: brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor),
-        _tempdir: tempdir,
+        ctx: brain_ops::test_support::ops_context_for_tests(executor, tempdir.path()),
+        tempdir,
+        metadata,
     }
 }
 
@@ -142,12 +156,13 @@ fn unwrap_recall_resp(outcome: DispatchOutcome) -> RecallResponseFrame {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn recall_full_pipeline_returns_top_k() {
+fn recall_cue_hit_returns_member_with_fields_plumbed() {
     run_in_glommio(|| async {
-        let fix = build_fixture();
-        encode(&fix, [1; 16], "alpha", MemoryKindWire::Episodic).await;
+        let mut fix = build_fixture();
+        let alpha = encode(&fix, [1; 16], "alpha", MemoryKindWire::Episodic).await;
         encode(&fix, [2; 16], "beta", MemoryKindWire::Episodic).await;
         encode(&fix, [3; 16], "gamma", MemoryKindWire::Episodic).await;
+        fix.reindex_lexical();
 
         let frame = unwrap_recall_resp(
             dispatch(
@@ -159,12 +174,19 @@ fn recall_full_pipeline_returns_top_k() {
             .unwrap(),
         );
         assert!(frame.is_final);
-        assert_eq!(frame.memories.len(), 2, "k=2 → exactly 2 results");
-        assert_eq!(frame.cumulative_count, 2);
-        // Sorted by score descending.
-        assert!(
-            frame.memories[0].similarity_score >= frame.memories[1].similarity_score,
-            "results must be sorted by score desc"
+        // Recall returns the membership set, not a top-k pile. The cue
+        // "alpha" is the one memory both the semantic and lexical lanes
+        // agree on, so the cross-lane consensus collapses to that crisp
+        // Single — "beta"/"gamma" are at most single-lane noise.
+        assert_eq!(
+            frame.memories.len(),
+            1,
+            "unique cross-lane consensus → Single"
+        );
+        assert_eq!(frame.cumulative_count as usize, frame.memories.len());
+        assert_eq!(
+            frame.memories[0].memory_id, alpha,
+            "the confirmed member is the alpha memory"
         );
         // Fields plumbed through.
         let top = &frame.memories[0];
@@ -205,7 +227,7 @@ fn recall_full_pipeline_returns_top_k() {
 #[test]
 fn recall_echoes_client_supplied_occurred_at() {
     run_in_glommio(|| async {
-        let fix = build_fixture();
+        let mut fix = build_fixture();
 
         // A real-world event time well in the past — distinct from the
         // server's write time so we can prove the two don't get conflated.
@@ -225,6 +247,7 @@ fn recall_echoes_client_supplied_occurred_at() {
         )
         .await
         .unwrap();
+        fix.reindex_lexical();
 
         let frame = unwrap_recall_resp(
             dispatch(
@@ -257,7 +280,7 @@ fn recall_echoes_client_supplied_occurred_at() {
 #[test]
 fn recency_breaks_relevance_ties_toward_recent_event_time() {
     run_in_glommio(|| async {
-        let fix = build_fixture();
+        let mut fix = build_fixture();
 
         // Reference point for the recency decay. `as_of` on the request
         // both supplies the temporal signal that gates the boost and sets
@@ -301,6 +324,8 @@ fn recency_breaks_relevance_ties_toward_recent_event_time() {
         .await
         .unwrap();
 
+        fix.reindex_lexical();
+
         let mut recall = recall_req(text, 2);
         recall.as_of_record_time_unix_nanos = Some(reference);
 
@@ -333,7 +358,7 @@ fn recency_breaks_relevance_ties_toward_recent_event_time() {
 #[test]
 fn list_intent_recall_runs_merge_path_and_returns_results() {
     run_in_glommio(|| async {
-        let fix = build_fixture();
+        let mut fix = build_fixture();
         encode(
             &fix,
             [1; 16],
@@ -355,6 +380,7 @@ fn list_intent_recall_runs_merge_path_and_returns_results() {
             MemoryKindWire::Episodic,
         )
         .await;
+        fix.reindex_lexical();
 
         let frame = unwrap_recall_resp(
             dispatch(
@@ -369,7 +395,10 @@ fn list_intent_recall_runs_merge_path_and_returns_results() {
             !frame.memories.is_empty(),
             "list-intent recall must still return results after the merge stage",
         );
-        assert!(frame.memories.len() <= 3, "top_k still bounds the count");
+        assert!(
+            frame.memories.len() <= 3,
+            "max_results is a safety ceiling on the membership set",
+        );
     })
 }
 
@@ -398,19 +427,20 @@ fn recall_empty_index_returns_empty_frame() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. K-truncation.
+// 3. max_results bounds the membership set (a safety ceiling, not a target).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn recall_k_truncation() {
+fn recall_membership_set_bounded_by_max_results() {
     run_in_glommio(|| async {
-        let fix = build_fixture();
+        let mut fix = build_fixture();
         for i in 0..5u8 {
             let mut req_id = [0u8; 16];
             req_id[0] = 0x10 + i;
             let text = format!("doc-{i}");
             encode(&fix, req_id, &text, MemoryKindWire::Episodic).await;
         }
+        fix.reindex_lexical();
         let frame = unwrap_recall_resp(
             dispatch(
                 RequestBody::Recall(recall_req("doc-2", 3)),
@@ -420,7 +450,15 @@ fn recall_k_truncation() {
             .await
             .unwrap(),
         );
-        assert_eq!(frame.memories.len(), 3, "k=3 → exactly 3 results");
+        // Five near-identical docs all share the "doc" token, so several
+        // belong to the cue — but the returned set never exceeds the
+        // requested ceiling. max_results caps, it does not pad.
+        assert!(!frame.memories.is_empty(), "the doc-2 cue has members");
+        assert!(
+            frame.memories.len() <= 3,
+            "membership set must not exceed max_results, got {}",
+            frame.memories.len(),
+        );
     })
 }
 
@@ -485,8 +523,9 @@ fn recall_zero_max_results_defaults_not_rejected() {
     // knob: `0` means "server default", never "give me zero results".
     // The handler normalises it and proceeds instead of erroring.
     run_in_glommio(|| async {
-        let fix = build_fixture();
+        let mut fix = build_fixture();
         encode(&fix, [60; 16], "zero-cap-alpha", MemoryKindWire::Episodic).await;
+        fix.reindex_lexical();
         let frame = unwrap_recall_resp(
             dispatch(
                 RequestBody::Recall(recall_req("zero-cap-alpha", 0)),
@@ -517,9 +556,10 @@ fn recall_returns_text_even_when_include_text_false() {
     // guards that deliberate behavior — `recall_req` defaults the flag to false,
     // yet every recalled memory must still carry its text.
     run_in_glommio(|| async {
-        let fix = build_fixture();
+        let mut fix = build_fixture();
         encode(&fix, [40; 16], "alpha-text-rev0", MemoryKindWire::Episodic).await;
         encode(&fix, [41; 16], "beta-text-rev0", MemoryKindWire::Episodic).await;
+        fix.reindex_lexical();
 
         let frame = unwrap_recall_resp(
             dispatch(
@@ -530,7 +570,6 @@ fn recall_returns_text_even_when_include_text_false() {
             .await
             .unwrap(),
         );
-        assert_eq!(frame.memories.len(), 2);
         assert!(
             frame.memories.iter().any(|r| r.text == "alpha-text-rev0"),
             "recall must return the remembered text even with include_text=false, got {:?}",
@@ -548,7 +587,7 @@ fn recall_returns_text_even_when_include_text_false() {
 #[test]
 fn recall_include_text_true_returns_stored_text() {
     run_in_glommio(|| async {
-        let fix = build_fixture();
+        let mut fix = build_fixture();
         let ids = [
             (
                 encode(&fix, [50; 16], "alpha-text-rev1", MemoryKindWire::Episodic).await,
@@ -564,6 +603,7 @@ fn recall_include_text_true_returns_stored_text() {
             ),
         ];
         let by_id: std::collections::HashMap<u128, &'static str> = ids.iter().copied().collect();
+        fix.reindex_lexical();
 
         let mut req = recall_req("alpha-text-rev1", 3);
         req.include_text = true;
@@ -577,7 +617,12 @@ fn recall_include_text_true_returns_stored_text() {
             .unwrap(),
         );
 
-        assert_eq!(frame.memories.len(), 3);
+        // Whatever the membership set's size, every returned member must
+        // carry the exact UTF-8 stored for its id.
+        assert!(
+            !frame.memories.is_empty(),
+            "the cue has at least one member"
+        );
         for r in &frame.memories {
             let want = by_id.get(&r.memory_id).copied().expect("known id");
             assert_eq!(
@@ -604,7 +649,7 @@ fn recall_with_real_embedder_end_to_end() {
         let handle = brain_embed::ModelHandle::load(&brain_embed::EmbedderConfig::new(model_dir))
             .expect("BGE model loads");
         let dispatcher = brain_embed::CpuDispatcher::new(handle);
-        let fix = build_fixture_with_embedder(Arc::new(dispatcher) as Arc<dyn Dispatcher>);
+        let mut fix = build_fixture_with_embedder(Arc::new(dispatcher) as Arc<dyn Dispatcher>);
 
         let cats_id = encode(
             &fix,
@@ -620,6 +665,7 @@ fn recall_with_real_embedder_end_to_end() {
             MemoryKindWire::Episodic,
         )
         .await;
+        fix.reindex_lexical();
 
         let frame = unwrap_recall_resp(
             dispatch(
@@ -630,119 +676,37 @@ fn recall_with_real_embedder_end_to_end() {
             .await
             .unwrap(),
         );
-        assert_eq!(frame.memories.len(), 2);
+        // The physics memory shares no words and is semantically distant,
+        // so it does not belong to a cat cue. The cat memory is the one
+        // member — and it leads the answer.
+        assert!(
+            !frame.memories.is_empty(),
+            "the cat cue must recall the cat memory"
+        );
         assert_eq!(
             frame.memories[0].memory_id, cats_id,
-            "the cat memory must rank higher than the physics memory"
+            "the cat memory must lead the membership set"
         );
     })
 }
 
 // ---------------------------------------------------------------------------
-// 9. handle_recall routing — txn_id determines substrate vs retrieval.
+// 9. handle_recall routing — no txn fuses through the retrieval lanes.
 //
-// RECALL is one verb with one server-side rule: a txn forces the
-// substrate path (read-your-writes), everything else fuses through the
-// retrieval retrievers. These tests pin both branches with a context
-// that has all three retrievers wired, so the cold-start fallback at
-// `recall.rs::handle_recall` doesn't mask a regression in the txn
-// gate.
+// RECALL is one verb with one server-side rule: a txn forces the substrate
+// path (read-your-writes), everything else fuses through the retrieval
+// lanes. With a real semantic lane (HNSW) and a populated lexical lane, a
+// cue that matches a stored memory surfaces a fused hit carrying multiple
+// contributors and a non-zero fused score. A regression that re-routed to
+// substrate would zero `fused_score` and clear `contributing_retrievers`.
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
-struct CannedSemantic {
-    items: Arc<StdMutex<Vec<RankedItem>>>,
-}
-
-impl SemanticRetriever for CannedSemantic {
-    fn retrieve(
-        &self,
-        _query: &SemanticQuery,
-        _scope: SemanticScope,
-        _config: &SemanticRetrieverConfig,
-    ) -> Result<Vec<RankedItem>, SemanticError> {
-        Ok(self.items.lock().expect("canned semantic lock").clone())
-    }
-}
-
-#[derive(Clone)]
-struct CannedLexical {
-    items: Arc<StdMutex<Vec<RankedItem>>>,
-}
-
-impl LexicalRetriever for CannedLexical {
-    fn retrieve(
-        &self,
-        _query: &LexicalQuery,
-        _scope: LexicalScope,
-        _config: &LexicalRetrieverConfig,
-    ) -> Result<Vec<RankedItem>, LexicalError> {
-        Ok(self.items.lock().expect("canned lexical lock").clone())
-    }
-}
-
-#[derive(Clone)]
-struct CannedGraph {
-    items: Arc<StdMutex<Vec<RankedItem>>>,
-}
-
-impl GraphRetriever for CannedGraph {
-    fn retrieve(
-        &self,
-        _query: &GraphQuery,
-        _config: &GraphRetrieverConfig,
-    ) -> Result<Vec<RankedItem>, GraphError> {
-        Ok(self.items.lock().expect("canned graph lock").clone())
-    }
-}
-
-/// Build a fixture whose `OpsContext` has all three retrieval retrievers
-/// replaced by canned mocks returning a hit for `memory_id`. The mocks
-/// override the real retrievers wired by `build_fixture` so the test
-/// can assert the retrieval path's behavior with deterministic per-retriever
-/// outputs.
-fn build_fixture_with_retrieval_mocks(memory_id: u128) -> Fixture {
-    let mut fix = build_fixture();
-    let mid = MemoryId::from_raw(memory_id);
-    let item = RankedItem {
-        id: RankedItemId::Memory(mid),
-        rank: 1,
-        score: 0.95,
-        snippet: None,
-    };
-
-    let semantic = CannedSemantic {
-        items: Arc::new(StdMutex::new(vec![item.clone()])),
-    };
-    let lexical = CannedLexical {
-        items: Arc::new(StdMutex::new(vec![item.clone()])),
-    };
-    let graph = CannedGraph {
-        items: Arc::new(StdMutex::new(vec![item])),
-    };
-
-    fix.ctx = fix
-        .ctx
-        .with_semantic_retriever(Arc::new(semantic) as Arc<dyn SemanticRetriever>)
-        .with_lexical_retriever(Arc::new(lexical) as Arc<dyn LexicalRetriever>)
-        .with_graph_retriever(Arc::new(graph) as Arc<dyn GraphRetriever>);
-    fix
-}
-
 #[test]
-fn handle_recall_routes_to_retrieval_when_no_txn() {
-    // No txn → retrieval runs. The canned retrievers all return the
-    // same memory id, so RRF fusion produces one hit with three
-    // contributors and a non-zero fused score. A regression that
-    // re-routed to substrate would zero `fused_score` and clear
-    // `contributing_retrievers`.
+fn handle_recall_no_txn_fuses_retrieval_lanes() {
     run_in_glommio(|| async {
-        let fix0 = build_fixture();
-        let mid = encode(&fix0, [0xA0; 16], "beta", MemoryKindWire::Episodic).await;
-        drop(fix0);
-
-        let fix = build_fixture_with_retrieval_mocks(mid);
-        let _ = encode(&fix, [0xA0; 16], "beta", MemoryKindWire::Episodic).await;
+        let mut fix = build_fixture();
+        let _mid = encode(&fix, [0xA0; 16], "beta", MemoryKindWire::Episodic).await;
+        fix.reindex_lexical();
 
         let frame = brain_ops::recall::handle_recall(recall_req("beta", 5), &fix.ctx)
             .await
@@ -753,6 +717,9 @@ fn handle_recall_routes_to_retrieval_when_no_txn() {
             !frame.memories.is_empty(),
             "retrieval recall returned no hits",
         );
+        // The cue "beta" is the stored memory's own text, so both the
+        // semantic and lexical lanes surface it — fusion records the
+        // contributing lanes and a non-zero fused score.
         let any_with_retrievers = frame
             .memories
             .iter()

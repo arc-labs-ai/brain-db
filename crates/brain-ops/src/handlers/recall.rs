@@ -27,9 +27,7 @@ use brain_planner::retrieval::router::{
     QueryRequest as PlannerQueryRequest, Retriever, RetrieverSelection,
 };
 use brain_protocol::envelope::request::{MemoryKindWire, RecallRequest};
-use brain_protocol::envelope::response::{
-    AnswerKindWire, MemoryResult, RecallResponseFrame,
-};
+use brain_protocol::envelope::response::{AnswerKindWire, MemoryResult, RecallResponseFrame};
 use brain_protocol::RetrieverNameWire;
 
 use crate::context::OpsContext;
@@ -169,7 +167,16 @@ pub async fn handle_recall(
     // subject entity present in the store, the grounded layer found nothing, and
     // no surviving member is confirmed by a non-semantic lane, the cue has no
     // anchor here — return None rather than topical semantic noise.
-    let membership = apply_anchor_abstention(membership, anchor, &grounded);
+    //
+    // In-txn reads are exempt: they are read-your-writes, and a pending write
+    // the caller just made in THIS transaction is not topical noise — it carries
+    // no retrieval-lane confirmation only because it isn't committed/indexed yet.
+    // Abstaining it away would silently break the read-your-writes guarantee.
+    let membership = if req.txn_id.is_some() {
+        membership
+    } else {
+        apply_anchor_abstention(membership, anchor, &grounded)
+    };
 
     Ok(recall_frame(membership))
 }
@@ -224,11 +231,18 @@ fn build_membership(
     let mut scored: Vec<(MemoryResult, f32)> = ranked
         .into_iter()
         .map(|m| {
+            // Re-score against the HNSW vector when present. A pending in-txn
+            // write isn't in the HNSW yet (it's only in the txn buffer), so
+            // `vector_for` misses — fall back to the cosine the overlay already
+            // computed against this hit (`similarity_score`) instead of zeroing
+            // it, which would drop the caller's own uncommitted write below the
+            // membership band and break read-your-writes. Committed hits always
+            // have a vector, so this fallback is inert outside a transaction.
             let cos = ctx
                 .semantic_retriever
                 .vector_for(MemoryId::from_raw(m.memory_id))
                 .map(|v| cosine(cue_vec, &v).max(0.0))
-                .unwrap_or(0.0);
+                .unwrap_or_else(|| m.similarity_score.max(0.0));
             (m, cos)
         })
         .collect();
@@ -244,6 +258,28 @@ fn build_membership(
                 sem_ids.insert(m.memory_id);
                 s_sem.push(m.clone());
             }
+        }
+    }
+    // Lexical / graph belonging. A hit independently confirmed by a
+    // non-semantic lane — it surfaced in the lexical or graph fan-out, or in
+    // two lanes at once — belongs to the cue even when its embedding cosine
+    // sits below the semantic floor. Keyword and paraphrase cues match
+    // lexically at a low cosine; the fan-out already did that matching, so the
+    // membership set must not discard it. This is the same cross-lane
+    // confirmation the abstention gate trusts, applied here at construction so
+    // a real lexical hit survives to be returned instead of being gated out by
+    // the cosine floor.
+    for (m, _c) in &scored {
+        if sem_ids.contains(&m.memory_id) {
+            continue;
+        }
+        let lane_confirmed = m.contributing_retrievers.len() >= 2
+            || m.contributing_retrievers
+                .iter()
+                .any(|r| !matches!(r, RetrieverNameWire::Semantic));
+        if lane_confirmed {
+            sem_ids.insert(m.memory_id);
+            s_sem.push(m.clone());
         }
     }
     let by_id: HashMap<u128, MemoryResult> =
@@ -660,10 +696,16 @@ fn hydrate_memories_by_id(
     } else if req.include_other_agents {
         None
     } else {
-        Some([<[u8; 16]>::from(ctx.executor.caller_agent)].into_iter().collect())
+        Some(
+            [<[u8; 16]>::from(ctx.executor.caller_agent)]
+                .into_iter()
+                .collect(),
+        )
     };
-    let kind_filter: Option<HashSet<MemoryKindWire>> =
-        req.kind_filter.as_ref().map(|v| v.iter().copied().collect());
+    let kind_filter: Option<HashSet<MemoryKindWire>> = req
+        .kind_filter
+        .as_ref()
+        .map(|v| v.iter().copied().collect());
     let context_filter: Option<HashSet<u64>> = req
         .context_filter
         .as_ref()
@@ -672,13 +714,14 @@ fn hydrate_memories_by_id(
     let table = rtxn
         .open_table(MEM_T)
         .map_err(|e| OpError::Internal(format!("structured recall open MEMORIES_TABLE: {e}")))?;
-    let texts_table = if req.include_text {
-        Some(rtxn.open_table(TEXTS_TABLE).map_err(|e| {
-            OpError::Internal(format!("structured recall open TEXTS_TABLE: {e}"))
-        })?)
-    } else {
-        None
-    };
+    let texts_table =
+        if req.include_text {
+            Some(rtxn.open_table(TEXTS_TABLE).map_err(|e| {
+                OpError::Internal(format!("structured recall open TEXTS_TABLE: {e}"))
+            })?)
+        } else {
+            None
+        };
 
     let mut out: Vec<MemoryResult> = Vec::with_capacity(ids.len());
     for &memory_id in ids {
@@ -895,10 +938,7 @@ fn capitalized_runs(cue: &str) -> Vec<String> {
             .trim_matches(|c: char| !c.is_alphanumeric())
             .trim_end_matches("'s")
             .trim_end_matches("’s");
-        let starts_upper = trimmed
-            .chars()
-            .next()
-            .is_some_and(char::is_uppercase);
+        let starts_upper = trimmed.chars().next().is_some_and(char::is_uppercase);
         if starts_upper {
             current.push(trimmed);
         } else {
@@ -993,12 +1033,13 @@ async fn retrieve_memories(
                 _ => n_other += 1,
             }
             for c in &f.contributing {
-                *lane.entry(match c.retriever {
-                    Retriever::Semantic => "semantic",
-                    Retriever::Lexical => "lexical",
-                    Retriever::Graph => "graph",
-                })
-                .or_default() += 1;
+                *lane
+                    .entry(match c.retriever {
+                        Retriever::Semantic => "semantic",
+                        Retriever::Lexical => "lexical",
+                        Retriever::Graph => "graph",
+                    })
+                    .or_default() += 1;
             }
         }
         tracing::debug!(
@@ -1820,10 +1861,7 @@ mod tests {
             vec!["NeuraCorp"]
         );
         // Two separate runs.
-        assert_eq!(
-            capitalized_runs("Alice met Bob"),
-            vec!["Alice", "Bob"]
-        );
+        assert_eq!(capitalized_runs("Alice met Bob"), vec!["Alice", "Bob"]);
         // No capitalized surface → empty (lowercase / CJK handled by the
         // token path, not this one).
         assert!(capitalized_runs("what are my allergies").is_empty());

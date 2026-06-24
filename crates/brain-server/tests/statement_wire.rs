@@ -178,13 +178,15 @@ fn rid() -> [u8; 16] {
     *uuid::Uuid::now_v7().as_bytes()
 }
 
-/// Build a Fact create request against the built-in `brain:related_to`
-/// predicate (Fact / Entity object).
+/// Build a Fact create request against an `app:related_to` predicate
+/// (Fact / Entity object). `app` is a user namespace with no uploaded
+/// schema, so the predicate qname is interned open-vocab on first use —
+/// the seeded `brain:` system namespace stays minimal and strict.
 fn fact_request(subject: [u8; 16], object: [u8; 16]) -> StatementCreateRequest {
     StatementCreateRequest {
         kind: StatementKindWire::Fact,
         subject,
-        predicate: "brain:related_to".into(),
+        predicate: "app:related_to".into(),
         object: StatementObjectWire::EntityRef(object),
         confidence: 0.9,
         evidence: EvidenceRefWire::Inline(vec![]),
@@ -197,11 +199,16 @@ fn fact_request(subject: [u8; 16], object: [u8; 16]) -> StatementCreateRequest {
     }
 }
 
-fn pref_request(subject: [u8; 16], value: &str) -> StatementCreateRequest {
+/// Build an Attribute create request against an `app:home_city` predicate.
+/// Attribute is the single-valued kind: a new value supersedes the prior
+/// current one, which is what the supersession / history / current-only tests
+/// exercise (Preference accumulates as a set and never supersedes). `app` is a
+/// user namespace with no uploaded schema, so the qname is interned open-vocab.
+fn attr_request(subject: [u8; 16], value: &str) -> StatementCreateRequest {
     StatementCreateRequest {
-        kind: StatementKindWire::Preference,
+        kind: StatementKindWire::Attribute,
         subject,
-        predicate: "brain:prefers".into(),
+        predicate: "app:home_city".into(),
         object: StatementObjectWire::Value(StatementValueWire::Text(value.into())),
         confidence: 0.85,
         evidence: EvidenceRefWire::Inline(vec![]),
@@ -218,7 +225,7 @@ fn event_request(subject: [u8; 16], when: u64) -> StatementCreateRequest {
     StatementCreateRequest {
         kind: StatementKindWire::Event,
         subject,
-        predicate: "brain:scheduled".into(),
+        predicate: "app:scheduled".into(),
         object: StatementObjectWire::Value(StatementValueWire::Text("session".into())),
         confidence: 0.95,
         evidence: EvidenceRefWire::Inline(vec![]),
@@ -278,7 +285,7 @@ async fn create_fact_round_trips() {
     match body {
         ResponseBody::StatementGet(r) => {
             assert_eq!(r.statement.statement_id, sid);
-            assert_eq!(r.statement.predicate, "brain:related_to");
+            assert_eq!(r.statement.predicate, "app:related_to");
             assert_eq!(r.statement.confidence, 0.9);
             assert_eq!(r.statement.version, 1);
             assert!(!r.statement.tombstoned);
@@ -291,7 +298,7 @@ async fn create_fact_round_trips() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn create_preference_auto_supersedes() {
+async fn create_attribute_auto_supersedes() {
     let server = start(1).await;
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
@@ -303,7 +310,7 @@ async fn create_preference_auto_supersedes() {
     let (_, body) = round_trip(
         &mut client,
         3,
-        RequestBody::StatementCreate(pref_request(priya, "async meetings")),
+        RequestBody::StatementCreate(attr_request(priya, "Lisbon")),
     )
     .await;
     let p1 = match body {
@@ -314,12 +321,15 @@ async fn create_preference_auto_supersedes() {
     let (_, body) = round_trip(
         &mut client,
         5,
-        RequestBody::StatementCreate(pref_request(priya, "written agendas")),
+        RequestBody::StatementCreate(attr_request(priya, "Berlin")),
     )
     .await;
     match body {
         ResponseBody::StatementCreate(r) => {
-            assert_eq!(r.auto_superseded, p1, "second pref auto-supersedes first");
+            assert_eq!(
+                r.auto_superseded, p1,
+                "second attribute value auto-supersedes first"
+            );
             assert_eq!(r.chain_root, p1, "chain_root inherits from old");
             assert_ne!(r.statement_id, p1);
         }
@@ -368,7 +378,10 @@ async fn create_unknown_predicate_returns_error() {
     let priya = make_entity(&mut client, 1, "Priya").await;
     let mgr = make_entity(&mut client, 3, "M").await;
     let mut req = fact_request(priya, mgr);
-    req.predicate = "user:not_registered".into();
+    // The seeded `brain:` namespace is strict (it has an active schema), so an
+    // undeclared predicate there is rejected — unlike an open-vocab user
+    // namespace, which would intern it. This pins the strict-mode reject path.
+    req.predicate = "brain:not_registered".into();
 
     let (op, body) = round_trip(&mut client, 5, RequestBody::StatementCreate(req)).await;
     assert_eq!(op, Opcode::Error.as_u16());
@@ -574,7 +587,7 @@ async fn history_returns_chain_in_version_order() {
     let (_, body) = round_trip(
         &mut client,
         3,
-        RequestBody::StatementCreate(pref_request(priya, "v1")),
+        RequestBody::StatementCreate(attr_request(priya, "v1")),
     )
     .await;
     let p1 = match body {
@@ -584,7 +597,7 @@ async fn history_returns_chain_in_version_order() {
     let (_, body) = round_trip(
         &mut client,
         5,
-        RequestBody::StatementCreate(pref_request(priya, "v2")),
+        RequestBody::StatementCreate(attr_request(priya, "v2")),
     )
     .await;
     let p2 = match body {
@@ -594,7 +607,7 @@ async fn history_returns_chain_in_version_order() {
     let (_, body) = round_trip(
         &mut client,
         7,
-        RequestBody::StatementCreate(pref_request(priya, "v3")),
+        RequestBody::StatementCreate(attr_request(priya, "v3")),
     )
     .await;
     let p3 = match body {
@@ -640,13 +653,13 @@ async fn list_subject_predicate_filter() {
     let _ = round_trip(
         &mut client,
         3,
-        RequestBody::StatementCreate(pref_request(priya, "v1")),
+        RequestBody::StatementCreate(attr_request(priya, "v1")),
     )
     .await;
     let _ = round_trip(
         &mut client,
         5,
-        RequestBody::StatementCreate(pref_request(priya, "v2")),
+        RequestBody::StatementCreate(attr_request(priya, "v2")),
     )
     .await;
 
@@ -655,8 +668,8 @@ async fn list_subject_predicate_filter() {
         7,
         RequestBody::StatementList(StatementListRequest {
             subject: priya,
-            predicate: "brain:prefers".into(),
-            kind: 2, // Preference
+            predicate: "app:home_city".into(),
+            kind: 4, // Attribute (brain_core byte 3 + 1)
             min_confidence: 0.0,
             time_range_start_unix_nanos: 0,
             time_range_end_unix_nanos: 0,

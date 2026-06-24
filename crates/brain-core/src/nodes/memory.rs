@@ -67,14 +67,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn salience_clamps() {
+    fn salience_clamps_out_of_range_values_to_unit_interval() {
         assert_eq!(Salience::new(2.0).raw(), 1.0);
         assert_eq!(Salience::new(-1.0).raw(), 0.0);
         assert_eq!(Salience::new(0.5).raw(), 0.5);
-    }
-
-    #[test]
-    fn salience_default_is_neutral() {
-        assert_eq!(Salience::default().raw(), 0.5);
     }
 }

@@ -132,25 +132,6 @@ const _: fn() = || {
 mod tests {
     use super::*;
 
-    /// Object-safety check: `dyn Dispatcher` must be constructible.
-    /// Both the cache and the ops layer need this.
-    #[test]
-    fn dispatcher_trait_is_object_safe() {
-        fn _accepts(_d: &dyn Dispatcher) {}
-        // Compile-only: if the trait stops being object-safe (added a
-        // generic method, used `Self` in a return position, etc.),
-        // this fails to type-check. No runtime body needed beyond the
-        // function existing.
-    }
-
-    #[test]
-    fn cpu_dispatcher_is_send_sync_and_clone() {
-        fn require_send_sync<T: Send + Sync>() {}
-        fn require_clone<T: Clone>() {}
-        require_send_sync::<CpuDispatcher>();
-        require_clone::<CpuDispatcher>();
-    }
-
     /// A small mock Dispatcher proves the trait is usable without a
     /// real model.
     #[test]

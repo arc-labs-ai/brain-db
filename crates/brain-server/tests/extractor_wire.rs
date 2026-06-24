@@ -4,7 +4,8 @@
 //! through the full data-plane stack and asserts:
 //!
 //! - LIST returns the built-in extractors registered by the system
-//!   schema bootstrap (`brain.entity_mentions` + `brain.basic_ner`).
+//!   schema bootstrap (`brain.entity_mentions`, `brain.gliner`,
+//!   `brain.llm_predicate`).
 //! - `include_disabled = false` filters out disabled rows.
 //! - DISABLE flips a row from enabled → disabled, returns
 //!   `previously_enabled = true`.
@@ -155,7 +156,7 @@ async fn round_trip(
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "current_thread")]
-async fn extractor_list_returns_builtin_pair() {
+async fn extractor_list_returns_seeded_builtins() {
     let server = start(1).await;
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
@@ -174,11 +175,13 @@ async fn extractor_list_returns_builtin_pair() {
     match body {
         ResponseBody::ExtractorList(r) => {
             assert!(r.is_final);
-            assert_eq!(r.items.len(), 2);
-            assert_eq!(r.total, 2);
+            // The system-schema bootstrap seeds the three extraction tiers.
+            assert_eq!(r.items.len(), 3);
+            assert_eq!(r.total, 3);
             let names: Vec<&str> = r.items.iter().map(|i| i.name.as_str()).collect();
             assert!(names.contains(&"entity_mentions"));
-            assert!(names.contains(&"basic_ner"));
+            assert!(names.contains(&"gliner"));
+            assert!(names.contains(&"llm_predicate"));
             for item in &r.items {
                 assert_eq!(item.namespace, "brain");
                 assert!(item.enabled, "built-ins enabled by default");
@@ -237,7 +240,8 @@ async fn extractor_disable_then_list_excludes_disabled() {
         other => panic!("expected ExtractorDisableResp, got {other:?}"),
     }
 
-    // LIST with include_disabled=false: only basic_ner.
+    // LIST with include_disabled=false: the two still-enabled built-ins,
+    // entity_mentions filtered out.
     let (_, body) = round_trip(
         &mut client,
         5,
@@ -248,13 +252,16 @@ async fn extractor_disable_then_list_excludes_disabled() {
     .await;
     match body {
         ResponseBody::ExtractorList(r) => {
-            assert_eq!(r.items.len(), 1);
-            assert_eq!(r.items[0].name, "basic_ner");
+            assert_eq!(r.items.len(), 2);
+            assert!(
+                !r.items.iter().any(|i| i.name == "entity_mentions"),
+                "disabled extractor must be filtered out"
+            );
         }
         _ => unreachable!(),
     }
 
-    // LIST with include_disabled=true: both.
+    // LIST with include_disabled=true: all three, entity_mentions disabled.
     let (_, body) = round_trip(
         &mut client,
         7,
@@ -265,7 +272,7 @@ async fn extractor_disable_then_list_excludes_disabled() {
     .await;
     match body {
         ResponseBody::ExtractorList(r) => {
-            assert_eq!(r.items.len(), 2);
+            assert_eq!(r.items.len(), 3);
             let entity_mentions = r
                 .items
                 .iter()
@@ -299,7 +306,7 @@ async fn extractor_enable_after_disable_returns_previously_disabled() {
         ResponseBody::ExtractorList(r) => {
             r.items
                 .iter()
-                .find(|i| i.name == "basic_ner")
+                .find(|i| i.name == "gliner")
                 .unwrap()
                 .extractor_id
         }

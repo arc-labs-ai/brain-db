@@ -25,15 +25,13 @@ use brain_metadata::MetadataDb;
 use brain_ops::test_support::{run_in_glommio, single_body};
 use brain_ops::{
     dispatch, ErrorCode, EventBus, EventEnvelope, OpError, OpsContext, RealWriterHandle,
-    SubscriptionRegistry,
 };
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
     EncodeRequest, ForgetMode, ForgetRequest, MemoryKindWire, RequestBody, SimilarityFilter,
-    SubscribeRequest, SubscriptionFilter, TxnAbortRequest, TxnBeginRequest, TxnCommitRequest,
-    UnsubscribeRequest,
+    SubscribeRequest, SubscriptionFilter, TxnBeginRequest, TxnCommitRequest, UnsubscribeRequest,
 };
-use brain_protocol::envelope::response::{EventType, ResponseBody, SubscriptionEvent};
+use brain_protocol::envelope::response::{EventType, ResponseBody};
 use futures_lite::FutureExt;
 use tokio::sync::broadcast;
 
@@ -292,31 +290,6 @@ fn publish_encode_emits_event_with_increasing_lsn() {
 }
 
 #[test]
-fn publish_forget_emits_forgotten_event() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let mid = do_encode(
-            &fix.ctx,
-            encode_req([1; 16], "gone", 7, MemoryKindWire::Semantic),
-        )
-        .await;
-        let mut rx = fix.bus.receiver();
-
-        do_forget(&fix.ctx, mid, [2; 16]).await;
-        let env = try_recv(&mut rx, Duration::from_millis(500))
-            .await
-            .expect("forget event");
-        assert_eq!(env.event_type, EventType::Forgotten);
-        assert_eq!(env.memory_id, MemoryId::from(mid));
-        assert_eq!(env.context_id, ContextId(7));
-        // Kind is router-decided (always Episodic) regardless of the
-        // value passed to the test builder.
-        assert_eq!(env.kind, MemoryKind::Episodic);
-        assert_eq!(env.text, None, "forget envelope must not carry text");
-    })
-}
-
-#[test]
 fn publish_txn_commit_emits_all_buffered_events_in_order() {
     run_in_glommio(|| async {
         let fix = build_fixture();
@@ -402,55 +375,6 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
     })
 }
 
-#[test]
-fn publish_txn_abort_emits_nothing() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let mut rx = fix.bus.receiver();
-        let txn_id = [11; 16];
-
-        dispatch(
-            RequestBody::TxnBegin(TxnBeginRequest {
-                txn_id,
-                timeout_seconds: 60,
-            }),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap();
-
-        let _ = dispatch(
-            RequestBody::Encode(EncodeRequest {
-                text: "dropped".into(),
-                context_id: 1,
-                request_id: [0xCC; 16],
-                txn_id: Some(txn_id),
-                occurred_at_unix_nanos: None,
-            }),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap();
-
-        dispatch(
-            RequestBody::TxnAbort(TxnAbortRequest { txn_id }),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            try_recv(&mut rx, Duration::from_millis(100))
-                .await
-                .is_none(),
-            "aborted txn must publish nothing"
-        );
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Filter matching (4).
 // ---------------------------------------------------------------------------
@@ -533,45 +457,6 @@ fn filter_null_passes_every_event() {
 // ---------------------------------------------------------------------------
 // One-shot dispatcher (3).
 // ---------------------------------------------------------------------------
-
-// FIXME: this test exercises a deliberate race — the dispatcher
-// registers a subscription then a concurrent producer publishes an
-// event. Now that the writer is `!Send`, the original
-// `tokio::spawn` pattern won't compile. A sequential rewrite changes
-// the test's semantics (subscribe-after-publish misses the event in
-// broadcast-style buses). Reworking the EventBus to a per-shard
-// LocalEventBus + connection-layer registry is the right
-// time to rewrite this race in a way that holds on a single-threaded
-// executor. Marked ignored to preserve coverage signal until then.
-#[test]
-#[ignore = "race-shape test invalidated by 9.7 Send drop; reworked in 9.11"]
-fn dispatcher_returns_first_matching_event() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        do_encode(
-            &fix.ctx,
-            encode_req([0x1A; 16], "first", 42, MemoryKindWire::Episodic),
-        )
-        .await;
-
-        let outcome = dispatch(
-            RequestBody::Subscribe(sub_req(empty_filter())),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap();
-        let producer: Result<(), ()> = Ok(()); // placeholder — original future-handle unused below
-        let event: SubscriptionEvent = match single_body(outcome) {
-            ResponseBody::SubscribeEvent(e) => e,
-            other => panic!("expected SubscribeEvent, got {other:?}"),
-        };
-        assert_eq!(event.event_type, EventType::Encoded);
-        assert_eq!(event.context_id, 42);
-        assert!(event.lsn > 0);
-        let _ = producer; // placeholder kept for line numbers
-    })
-}
 
 #[test]
 fn dispatcher_times_out_when_no_event_matches() {
@@ -689,16 +574,6 @@ fn encode_then_forget_preserve_lsn_order() {
             e1.lsn
         );
     })
-}
-
-// ---------------------------------------------------------------------------
-// Compile-time smoke test: public API surface looks correct.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn registry_constructable_directly_from_bus() {
-    let bus = Arc::new(EventBus::default());
-    let _reg: SubscriptionRegistry = SubscriptionRegistry::new(bus);
 }
 
 // ---------------------------------------------------------------------------

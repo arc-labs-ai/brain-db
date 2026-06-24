@@ -246,7 +246,9 @@ async fn create_unknown_relation_type_returns_error() {
     let (op, body) = round_trip(
         &mut client,
         5,
-        RequestBody::RelationCreate(create_request("user:does_not_exist", a, b)),
+        // The seeded `brain:` namespace is strict, so an undeclared relation
+        // type there is rejected — a no-schema user namespace would intern it.
+        RequestBody::RelationCreate(create_request("brain:does_not_exist", a, b)),
     )
     .await;
     assert_eq!(op, Opcode::Error.as_u16());
@@ -618,6 +620,107 @@ async fn traverse_one_hop() {
             assert_eq!(r.total_paths, 1);
             assert_eq!(r.paths[0].steps.len(), 1);
             assert_eq!(r.paths[0].steps[0].to, b);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn traverse_two_hop() {
+    let server = start(1).await;
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
+    complete_handshake(&mut client).await;
+
+    let a = make_entity(&mut client, 1, "a-tr2").await;
+    let b = make_entity(&mut client, 3, "b-tr2").await;
+    let c = make_entity(&mut client, 5, "c-tr2").await;
+
+    // A → B and B → C via brain:related_to (asymmetric chain).
+    let (_, body) = round_trip(
+        &mut client,
+        7,
+        RequestBody::RelationCreate(create_request("brain:related_to", a, b)),
+    )
+    .await;
+    let ab = match body {
+        ResponseBody::RelationCreate(r) => r.relation_id,
+        other => panic!("{other:?}"),
+    };
+    round_trip(
+        &mut client,
+        9,
+        RequestBody::RelationCreate(create_request("brain:related_to", b, c)),
+    )
+    .await;
+
+    // Traverse from A with depth 2 → 2 paths (A→B at depth 1, A→B→C at depth 2).
+    let (op, body) = round_trip(
+        &mut client,
+        11,
+        RequestBody::RelationTraverse(RelationTraverseRequest {
+            start_entity: a,
+            relation_types: vec!["brain:related_to".into()],
+            direction: 0,
+            max_depth: 2,
+            max_nodes: 100,
+            time_at_unix_nanos: 0,
+            include_superseded: false,
+            request_id: rid(),
+        }),
+    )
+    .await;
+    assert_eq!(op, Opcode::RelationTraverseResp.as_u16());
+    match body {
+        ResponseBody::RelationTraverse(r) => {
+            assert_eq!(r.total_paths, 2, "expected 2 paths from A with depth 2");
+            let depths: Vec<u32> = r
+                .paths
+                .iter()
+                .map(|p| p.steps.last().unwrap().depth)
+                .collect();
+            assert!(depths.contains(&1));
+            assert!(depths.contains(&2));
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Tombstone the root edge A→B.
+    let (op, _) = round_trip(
+        &mut client,
+        13,
+        RequestBody::RelationTombstone(RelationTombstoneRequest {
+            relation_id: ab,
+            reason: "test tombstone".into(),
+            request_id: rid(),
+        }),
+    )
+    .await;
+    assert_eq!(op, Opcode::RelationTombstoneResp.as_u16());
+
+    // Re-traverse from A → 0 paths: the tombstoned root edge breaks the
+    // chain and B→C is unreachable under the default current-only view.
+    let (_, body) = round_trip(
+        &mut client,
+        15,
+        RequestBody::RelationTraverse(RelationTraverseRequest {
+            start_entity: a,
+            relation_types: vec!["brain:related_to".into()],
+            direction: 0,
+            max_depth: 2,
+            max_nodes: 100,
+            time_at_unix_nanos: 0,
+            include_superseded: false,
+            request_id: rid(),
+        }),
+    )
+    .await;
+    match body {
+        ResponseBody::RelationTraverse(r) => {
+            assert_eq!(r.total_paths, 0, "tombstoned root edge breaks traversal");
         }
         other => panic!("{other:?}"),
     }

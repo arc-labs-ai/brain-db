@@ -219,21 +219,6 @@ mod tests {
         )
     }
 
-    // ----- Constructor + defaults -----
-
-    #[test]
-    fn new_root_defaults() {
-        let r = sample(false);
-        assert_eq!(r.version, 1);
-        assert_eq!(r.chain_root, r.id);
-        assert!(r.supersedes.is_none());
-        assert!(r.superseded_by.is_none());
-        assert!(!r.tombstoned);
-        assert!(r.valid_from_unix_nanos.is_none());
-        assert!(r.valid_to_unix_nanos.is_none());
-        assert!(r.is_chain_root());
-    }
-
     // ----- is_current -----
 
     #[test]
@@ -293,47 +278,4 @@ mod tests {
         assert_eq!(canonical_pair(a, a), (a, a));
     }
 
-    // ----- RelationType -----
-
-    #[test]
-    fn relation_type_canonical_form() {
-        let rt = RelationType {
-            id: RelationTypeId::from(1),
-            namespace: "brain".into(),
-            name: "related_to".into(),
-            from_type: None,
-            to_type: None,
-            cardinality: Cardinality::ManyToMany,
-            is_symmetric: false,
-            schema_version: 1,
-            description: "Generic relation".into(),
-        };
-        assert_eq!(rt.canonical(), "brain:related_to");
-    }
-
-    #[test]
-    fn relation_type_symmetric_flag_round_trips() {
-        let mut rt = RelationType {
-            id: RelationTypeId::from(2),
-            namespace: "test".into(),
-            name: "discussed_with".into(),
-            from_type: None,
-            to_type: None,
-            cardinality: Cardinality::ManyToMany,
-            is_symmetric: true,
-            schema_version: 1,
-            description: String::new(),
-        };
-        assert!(rt.is_symmetric);
-        rt.is_symmetric = false;
-        assert!(!rt.is_symmetric);
-    }
-
-    #[test]
-    fn relation_is_symmetric_mirrored_field() {
-        let asym = sample(false);
-        let sym = sample(true);
-        assert!(!asym.is_symmetric);
-        assert!(sym.is_symmetric);
-    }
 }

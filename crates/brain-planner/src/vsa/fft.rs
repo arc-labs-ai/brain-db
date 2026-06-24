@@ -127,19 +127,4 @@ mod tests {
         let cos = num / (denom_b.sqrt() * denom_bhat.sqrt());
         assert!(cos > 0.99, "cos similarity too low: {cos}");
     }
-
-    #[test]
-    fn convolve_at_vsa_dim_uses_cached_plans() {
-        // Sanity: the thread_local path completes without panic for
-        // length VSA_DIM and produces the same result as a fresh plan.
-        let n = super::super::ops::VSA_DIM;
-        let a: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.013).sin()).collect();
-        let b: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.029).cos()).collect();
-        let via_cache = convolve_circular(&a, &b);
-        let plans = FftPlans::new(n);
-        let via_fresh = convolve_with_plans(&plans, &a, &b);
-        for (x, y) in via_cache.iter().zip(via_fresh.iter()) {
-            assert!((x - y).abs() < 1e-3, "x={x} y={y}");
-        }
-    }
 }

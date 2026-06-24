@@ -46,8 +46,8 @@ pub use entity::ops::{
     entity_add_alias, entity_get, entity_list_by_type, entity_lookup_by_alias,
     entity_lookup_by_canonical_name, entity_put, entity_remove_alias, entity_rename,
     entity_resolve_canonical_all_types, entity_resolve_canonical_all_types_wtxn,
-    entity_resolve_scored, entity_tombstone, entity_update, normalize_name,
-    EntityOpError, READ_RESOLVE_TRIGRAM_FLOOR,
+    entity_resolve_scored, entity_tombstone, entity_update, normalize_name, EntityOpError,
+    READ_RESOLVE_TRIGRAM_FLOOR,
 };
 pub use entity::review::{
     enqueue_merge_proposal, list_proposals_by_status, proposal_get, proposal_get_inside_wtxn,
@@ -113,9 +113,10 @@ pub use system_schema::{seed_system_schema, SystemSchemaError, SYSTEM_SCHEMA_SOU
 pub use tables::extractor_audit::{
     audit_count as pipeline_audit_count, extraction_attempts as pipeline_extraction_attempts,
     extraction_retry_due as pipeline_extraction_retry_due, failure_class,
-    has_extracted as pipeline_has_extracted, pipeline_status, retry_backoff_nanos,
-    record_extracted as pipeline_record_extracted, tier_status, ExtractorItemCounts,
-    ExtractorPipelineAuditEntry, ExtractorPipelineAuditError, EXTRACTOR_PIPELINE_AUDIT_TABLE,
+    has_extracted as pipeline_has_extracted, pipeline_audit_entry, pipeline_status,
+    record_extracted as pipeline_record_extracted, retry_backoff_nanos, tier_status,
+    ExtractorItemCounts, ExtractorPipelineAuditEntry, ExtractorPipelineAuditError,
+    EXTRACTOR_PIPELINE_AUDIT_TABLE,
 };
 pub use tables::schema_version::{
     SchemaVersionRow, SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE, VALIDATOR_VERSION,

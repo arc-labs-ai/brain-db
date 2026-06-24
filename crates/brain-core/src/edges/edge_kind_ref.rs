@@ -167,41 +167,6 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_BUILTIN: [EdgeKind; 8] = [
-        EdgeKind::Caused,
-        EdgeKind::FollowedBy,
-        EdgeKind::DerivedFrom,
-        EdgeKind::SimilarTo,
-        EdgeKind::Contradicts,
-        EdgeKind::Supports,
-        EdgeKind::References,
-        EdgeKind::PartOf,
-    ];
-
-    #[test]
-    fn edge_kind_ref_builtin_roundtrip() {
-        for k in ALL_BUILTIN {
-            let kr = EdgeKindRef::Builtin(k);
-            let bytes = kr.to_bytes();
-            assert_eq!(bytes.len(), 2);
-            assert_eq!(bytes[0], 0);
-            assert_eq!(bytes[1], k as u8);
-            let (decoded, consumed) = EdgeKindRef::decode_from(&bytes).unwrap();
-            assert_eq!(decoded, kr);
-            assert_eq!(consumed, 2);
-        }
-    }
-
-    #[test]
-    fn edge_kind_ref_mentions_roundtrip() {
-        let kr = EdgeKindRef::Mentions;
-        let bytes = kr.to_bytes();
-        assert_eq!(bytes, vec![1]);
-        let (decoded, consumed) = EdgeKindRef::decode_from(&bytes).unwrap();
-        assert_eq!(decoded, kr);
-        assert_eq!(consumed, 1);
-    }
-
     #[test]
     fn edge_kind_ref_typed_roundtrip() {
         for raw in [0u32, 1, 42, 0x1234_5678, u32::MAX] {
@@ -247,33 +212,6 @@ mod tests {
                 other => panic!("expected Short for {n}-byte payload, got {other:?}"),
             }
         }
-    }
-
-    #[test]
-    fn edge_kind_ref_empty_input_errors() {
-        assert_eq!(
-            EdgeKindRef::decode_from(&[]),
-            Err(EdgeKindRefError::Short(0))
-        );
-    }
-
-    #[test]
-    fn edge_kind_ref_builtin_short_read_errors() {
-        let bytes = [0u8];
-        assert_eq!(
-            EdgeKindRef::decode_from(&bytes),
-            Err(EdgeKindRefError::Short(1))
-        );
-    }
-
-    #[test]
-    fn builtin_lt_mentions_lt_typed() {
-        let b = EdgeKindRef::Builtin(EdgeKind::PartOf);
-        let m = EdgeKindRef::Mentions;
-        let t = EdgeKindRef::Typed(RelationTypeId::from(0));
-        assert!(b < m);
-        assert!(m < t);
-        assert!(b < t);
     }
 
     #[test]

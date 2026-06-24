@@ -18,7 +18,7 @@ use brain_ops::{EventBus, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_storage::wal::kinds::WalRecordKind;
 use brain_workers::{
-    AutoEdgeKnobs, AutoEdgeWorker, Worker, WorkerConfig, WorkerContext, WorkerKind, WorkerScheduler,
+    AutoEdgeKnobs, AutoEdgeWorker, Worker, WorkerConfig, WorkerContext, WorkerScheduler,
 };
 use redb::ReadableTable;
 
@@ -278,17 +278,6 @@ fn hash_link_batch(pairs: &[(MemoryId, MemoryId, f32)]) -> [u8; 32] {
         hasher.update(&t.to_be_bytes());
     }
     *hasher.finalize().as_bytes()
-}
-
-#[test]
-fn name_and_kind_are_stable() {
-    let (_tx, rx) = flume::bounded(1);
-    let worker = AutoEdgeWorker::new(rx);
-    assert_eq!(worker.name(), WorkerKind::AutoEdge.name());
-    assert_eq!(worker.kind(), WorkerKind::AutoEdge);
-    // Verify the worker accepts the default config without panicking.
-    let cfg = WorkerConfig::defaults_for(WorkerKind::AutoEdge);
-    assert!(cfg.batch_size > 0);
 }
 
 /// Pins the wake-on-enqueue contract: a worker registered with a

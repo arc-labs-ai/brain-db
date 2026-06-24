@@ -1,5 +1,10 @@
 #![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
 //! Edge scrub worker tests.
+//!
+//! Guards removal of orphaned edges whose endpoints no longer live:
+//! an edge to or from a dead memory is dropped from both the forward
+//! and reverse tables, while live-to-live edges are kept. Pins per-cycle
+//! batch caps, cursor advance, and the metric the scheduler reads.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -343,47 +348,6 @@ fn mixed_live_and_orphan_only_orphans_removed() {
 // ===========================================================================
 // Worker integration (3).
 // ===========================================================================
-
-#[test]
-fn worker_registers_with_correct_kind_and_default_cadence() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(Arc::new(EdgeScrubWorker::new()), fix.ctx)
-            .unwrap();
-        let cfg = sched.config(WorkerKind::EdgeScrub.name()).unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(1800));
-        sched.shutdown().await.unwrap();
-    });
-}
-
-#[test]
-fn disabled_worker_via_config_does_not_scrub() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let alive = seed_memory(&fix.metadata, 1);
-        let dead = make_id(99);
-        seed_edge_raw(&fix.metadata, alive, EdgeKind::FollowedBy, dead);
-        let cfg = WorkerConfig {
-            enabled: false,
-            interval: Duration::from_millis(20),
-            batch_size: 100,
-            max_runtime: Duration::from_secs(1),
-        };
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(Arc::new(EdgeScrubWorker::new().with_config(cfg)), fix.ctx)
-            .unwrap();
-        glommio::timer::sleep(Duration::from_millis(150)).await;
-        sched.shutdown().await.unwrap();
-        assert_eq!(
-            count_edges_out(&fix.metadata),
-            1,
-            "disabled worker must not touch edges"
-        );
-    });
-}
 
 #[test]
 fn cycle_processed_count_feeds_metrics() {

@@ -16,6 +16,12 @@ use crate::context::WorkerContext;
 use crate::error::WorkerError;
 use crate::worker::Worker;
 
+/// Default sweep cadence in seconds (1 day) for an operator who opts in
+/// by setting a non-zero retention. Mirrors the statement-reclaim
+/// worker's daily cadence — both are low-priority physical-reclamation
+/// passes where once-a-day is ample.
+pub const DEFAULT_PERIOD_SECONDS: u64 = 86_400;
+
 pub struct SupersessionSweeper {
     config: WorkerConfig,
     retention_seconds: u64,
@@ -41,6 +47,15 @@ impl SupersessionSweeper {
     #[must_use]
     pub fn with_retention_seconds(mut self, seconds: u64) -> Self {
         self.retention_seconds = seconds;
+        self
+    }
+
+    /// Set the sweep cadence (the scheduler reads this off `config`).
+    /// Clamped to a minimum of one second so a misconfigured `0` can't
+    /// busy-loop the scheduler.
+    #[must_use]
+    pub fn with_period_seconds(mut self, seconds: u64) -> Self {
+        self.config.interval = std::time::Duration::from_secs(seconds.max(1));
         self
     }
 
@@ -118,8 +133,15 @@ mod tests {
     }
 
     #[test]
-    fn worker_kind_name() {
-        let w = SupersessionSweeper::new();
-        assert_eq!(w.name(), "supersession_sweeper");
+    fn with_period_seconds_sets_scheduler_interval() {
+        let w = SupersessionSweeper::new().with_period_seconds(3600);
+        assert_eq!(w.config().interval, std::time::Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn with_period_seconds_clamps_zero_to_one() {
+        // A misconfigured 0 must not become a zero-interval busy loop.
+        let w = SupersessionSweeper::new().with_period_seconds(0);
+        assert_eq!(w.config().interval, std::time::Duration::from_secs(1));
     }
 }

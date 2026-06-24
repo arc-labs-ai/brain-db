@@ -208,12 +208,18 @@ fn tier_embedding_below_threshold_creates_new_entity() {
 
 #[test]
 fn tier_embedding_respects_entity_type() {
-    // Person + Organization share an embedding peak — the type
-    // filter must reject the Organization candidate.
+    // A Person and an Organization share an embedding peak — the
+    // embedding tier's type filter must reject the Organization
+    // candidate. The query is a paraphrase that surface-matches neither
+    // seeded name (shares only the leading token, like the Stripe case
+    // in `tier_embedding_resolves_near_paraphrase`), so the exact /
+    // alias / partial-name tiers all miss and tier-3 (embedding) is the
+    // one under test. ("Wong" alone would be a partial-name subset of
+    // both seeded names and resolve at an earlier tier.)
     let shared_peak = axis_pair(42, 43, 1.0, 0.0);
 
     let embedder = Arc::new(ScriptedEmbedder::new());
-    embedder.set("Alice", shared_peak);
+    embedder.set("Wong Group", shared_peak);
 
     let (_dir, mut db) = fresh_db();
     let hnsw = fresh_hnsw();
@@ -232,29 +238,35 @@ fn tier_embedding_respects_entity_type() {
         id
     };
 
-    let alice_person_id = seed_entity(
+    let wong_person_id = seed_entity(
         &mut db,
         &hnsw,
         EntityType::PERSON_ID,
-        "Alice Wong",
+        "Wong Industries",
         shared_peak,
     );
-    let _cafe_id = seed_entity(
+    let _org_id = seed_entity(
         &mut db,
         &hnsw,
         org_type_id,
-        "Alice's Cafe",
+        "Wong Holdings",
         axis_pair(42, 43, 0.998, 0.063),
     );
 
     let deps = deps_for(embedder, hnsw);
     let wtxn = db.write_txn().unwrap();
-    let res =
-        resolve_or_create_with_hnsw(&wtxn, "Alice", "brain:Person", 0.9, NOW + 1, Some(&deps))
-            .unwrap();
+    let res = resolve_or_create_with_hnsw(
+        &wtxn,
+        "Wong Group",
+        "brain:Person",
+        0.9,
+        NOW + 1,
+        Some(&deps),
+    )
+    .unwrap();
     wtxn.commit().unwrap();
 
-    assert_eq!(res.entity_id, alice_person_id);
+    assert_eq!(res.entity_id, wong_person_id);
     assert_eq!(res.tier, ResolutionTier::Embedding);
 }
 

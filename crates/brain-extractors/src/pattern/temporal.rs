@@ -480,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_constants() {
+    fn temporal_extractor_reports_stable_identity_metadata() {
         let ext = TemporalExtractor::new();
         assert_eq!(ext.id(), ExtractorId::from(4));
         assert_eq!(ext.kind(), ExtractorKind::Pattern);

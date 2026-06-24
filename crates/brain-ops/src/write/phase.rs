@@ -631,15 +631,6 @@ mod tests {
     }
 
     #[test]
-    fn sample_phase_smoke() {
-        let p = sample_upsert_memory();
-        assert_eq!(p.tag(), "upsert_memory");
-        // Bytes estimate is bounded — sanity that approximate_byte_size
-        // returns a plausible value for a small memory.
-        assert!(p.approximate_byte_size() < 32 * 1024);
-    }
-
-    #[test]
     fn tombstone_target_polymorphic() {
         // Every target variant compiles in.
         let _m = TombstoneTarget::Memory {

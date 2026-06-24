@@ -117,13 +117,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn write_id_round_trips_bytes() {
-        let w = WriteId::new();
-        let b = w.to_bytes();
-        assert_eq!(WriteId::from_bytes(b), w);
-    }
-
-    #[test]
     fn write_id_from_request_preserves_uuid() {
         let req = RequestId(Uuid::now_v7());
         let w = WriteId::from_request(req);

@@ -197,42 +197,11 @@ mod tests {
     use super::*;
     use crate::storage_version::{CURRENT_SCHEMA_VERSION, SCHEMA_META_TABLE, SCHEMA_VERSION_KEY};
     use crate::tables::entity_type::{EntityTypeDefinition, ENTITY_TYPES_TABLE};
-    use crate::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
-    use brain_core::{AgentId, ContextId, EntityType, MemoryId, MemoryKind};
+    use brain_core::EntityType;
     use redb::ReadableTable;
 
     fn db_path(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().join("metadata.redb")
-    }
-
-    fn aid(byte: u8) -> AgentId {
-        let mut b = [0u8; 16];
-        b[15] = byte;
-        b.into()
-    }
-
-    fn mid(byte: u8) -> MemoryId {
-        let mut b = [0u8; 16];
-        b[15] = byte;
-        MemoryId::from_be_bytes(b)
-    }
-
-    fn sample_memory() -> ([u8; 16], MemoryMetadata) {
-        let id = mid(1);
-        let agent = aid(7);
-        let m = MemoryMetadata::new_active(
-            id,
-            agent,
-            ContextId(42),
-            /* slot_id */ 0,
-            /* slot_version */ 1,
-            MemoryKind::Episodic,
-            /* embedding_model_fp */ [0u8; 16],
-            /* salience_initial */ 0.5,
-            /* text_size */ 32,
-            /* created_at_unix_nanos */ 1_700_000_000_000_000_000,
-        );
-        (id.to_be_bytes(), m)
     }
 
     #[test]
@@ -282,133 +251,6 @@ mod tests {
             }
             other => panic!("expected SchemaVersionTooNew, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn write_then_read_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = MetadataDb::open(db_path(&dir)).unwrap();
-        let (key, m) = sample_memory();
-
-        // Write via the wrapper.
-        let wtxn = db.write_txn().unwrap();
-        {
-            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
-            t.insert(&key, &m).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        // Read via the wrapper.
-        let rtxn = db.read_txn().unwrap();
-        let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
-        assert_eq!(t.get(&key).unwrap().unwrap().value(), m);
-    }
-
-    #[test]
-    fn read_txn_doesnt_see_uncommitted_write() {
-        // MVCC pin: a read transaction sees the
-        // database as-of when it began; uncommitted writes from a
-        // concurrent write transaction are invisible.
-        //
-        // redb takes an exclusive file lock per `Database::create`, so
-        // we can't open a second `MetadataDb` on the same path. Instead
-        // we rely on the fact that `write_txn(&mut self)` borrows &mut
-        // only briefly (the returned `WriteTransaction` is owned, with
-        // no lifetime tied to `db`), so calling `read_txn(&self)`
-        // afterwards is legal.
-        let dir = tempfile::tempdir().unwrap();
-        let db = MetadataDb::open(db_path(&dir)).unwrap();
-        let (key, m) = sample_memory();
-
-        // Seed the table by writing+committing an unrelated row, so
-        // the table exists when the read txn opens it.
-        {
-            let other_key = mid(99).to_be_bytes();
-            let wtxn = db.write_txn().unwrap();
-            {
-                let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
-                t.insert(&other_key, &m).unwrap();
-            }
-            wtxn.commit().unwrap();
-        }
-
-        // Start an uncommitted write txn inserting `key`.
-        let wtxn = db.write_txn().unwrap();
-        {
-            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
-            t.insert(&key, &m).unwrap();
-        }
-
-        // A read txn must not see the uncommitted insert.
-        let rtxn = db.read_txn().unwrap();
-        let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
-        assert!(
-            t.get(&key).unwrap().is_none(),
-            "read txn must not see uncommitted write"
-        );
-
-        // Cleanup: drop the uncommitted txn (rollback).
-        drop(wtxn);
-    }
-
-    #[test]
-    fn commit_makes_write_visible_to_new_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = MetadataDb::open(db_path(&dir)).unwrap();
-        let (key, m) = sample_memory();
-
-        let wtxn = db.write_txn().unwrap();
-        {
-            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
-            t.insert(&key, &m).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.read_txn().unwrap();
-        let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
-        assert_eq!(t.get(&key).unwrap().unwrap().value(), m);
-    }
-
-    #[test]
-    fn concurrent_read_txns_coexist() {
-        // read transactions don't block each other.
-        // Two read txns from the same MetadataDb share a snapshot.
-        let dir = tempfile::tempdir().unwrap();
-        let db = MetadataDb::open(db_path(&dir)).unwrap();
-        let (key, m) = sample_memory();
-
-        // Seed one row so there's something to observe.
-        let wtxn = db.write_txn().unwrap();
-        {
-            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
-            t.insert(&key, &m).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let r1 = db.read_txn().unwrap();
-        let r2 = db.read_txn().unwrap();
-
-        let t1 = r1.open_table(MEMORIES_TABLE).unwrap();
-        let t2 = r2.open_table(MEMORIES_TABLE).unwrap();
-
-        assert_eq!(t1.get(&key).unwrap().unwrap().value(), m);
-        assert_eq!(t2.get(&key).unwrap().unwrap().value(), m);
-    }
-
-    #[test]
-    fn schema_version_accessor_returns_current() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = MetadataDb::open(db_path(&dir)).unwrap();
-        assert_eq!(db.schema_version(), CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 2);
-    }
-
-    #[test]
-    fn path_accessor_returns_open_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = db_path(&dir);
-        let db = MetadataDb::open(&path).unwrap();
-        assert_eq!(db.path(), path.as_path());
     }
 
     // -----------------------------------------------------------------

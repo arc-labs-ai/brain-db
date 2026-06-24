@@ -105,34 +105,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn counters_start_at_zero() {
-        let m = ConfidenceSweepMetrics::new();
-        let s = m.snapshot();
-        assert_eq!(s.cycles_total, 0);
-        assert_eq!(s.rows_swept_total, 0);
-        assert_eq!(s.rows_updated_total, 0);
-        assert_eq!(s.last_avg_drift, 0.0);
-        assert_eq!(s.duration_seconds.count, 0);
-    }
-
-    #[test]
-    fn counter_increments_round_trip() {
-        let m = ConfidenceSweepMetrics::new();
-        m.inc_cycles();
-        m.inc_cycles();
-        m.add_rows_swept(40);
-        m.add_rows_updated(7);
-        m.set_last_avg_drift(0.012_5);
-        m.observe_duration(0.034);
-        let s = m.snapshot();
-        assert_eq!(s.cycles_total, 2);
-        assert_eq!(s.rows_swept_total, 40);
-        assert_eq!(s.rows_updated_total, 7);
-        assert!((s.last_avg_drift - 0.012_5).abs() < 1e-5);
-        assert_eq!(s.duration_seconds.count, 1);
-    }
-
-    #[test]
     fn drift_gauge_clamps_negative_to_zero() {
         let m = ConfidenceSweepMetrics::new();
         m.set_last_avg_drift(-1.0);

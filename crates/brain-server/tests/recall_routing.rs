@@ -21,9 +21,7 @@ use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
-use brain_protocol::envelope::request::{
-    EncodeRequest, RecallRequest, TxnBeginRequest,
-};
+use brain_protocol::envelope::request::{EncodeRequest, RecallRequest, TxnBeginRequest};
 use brain_protocol::envelope::response::{RecallResponseFrame, ResponseBody};
 use brain_protocol::Frame;
 use brain_protocol::RequestBody;
@@ -230,6 +228,36 @@ fn assert_retrieval(frame: &RecallResponseFrame) {
     );
 }
 
+/// Re-issue RECALL until it returns hits or a deadline passes. The lexical
+/// lane (tantivy memory_text) is populated by the async text-indexer on a
+/// commit cadence, so a recall fired immediately after ENCODE can race ahead
+/// of indexing and the read path's structural abstention then drops the
+/// unanchored semantic-only hit. Recall is eventually consistent with encode;
+/// this polls for that steady state. Each attempt mints a fresh request_id
+/// (via `recall_request`) so RECALL idempotency never pins an early empty
+/// result.
+async fn recall_until_hits(
+    client: &mut TcpStream,
+    mut stream_id: u32,
+    txn: Option<[u8; 16]>,
+) -> RecallResponseFrame {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let (opcode, body) =
+            round_trip(client, stream_id, RequestBody::Recall(recall_request(txn))).await;
+        assert_eq!(opcode, Opcode::RecallResp.as_u16());
+        let frame = match body {
+            ResponseBody::Recall(r) => r,
+            other => panic!("expected RecallResp, got {other:?}"),
+        };
+        if !frame.memories.is_empty() || std::time::Instant::now() >= deadline {
+            return frame;
+        }
+        stream_id += 2;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
@@ -244,17 +272,10 @@ async fn recall_without_schema_uses_retrieval_path() {
 
     seed_fixture(&mut client).await;
 
-    let (opcode, body) =
-        round_trip(&mut client, 1, RequestBody::Recall(recall_request(None))).await;
-    assert_eq!(opcode, Opcode::RecallResp.as_u16());
-    match body {
-        ResponseBody::Recall(r) => {
-            assert!(r.is_final);
-            // No schema, no txn, default strategy → retrieval runs.
-            assert_retrieval(&r);
-        }
-        other => panic!("expected RecallResp, got {other:?}"),
-    }
+    // No schema, no txn, default strategy → retrieval runs.
+    let r = recall_until_hits(&mut client, 1, None).await;
+    assert!(r.is_final);
+    assert_retrieval(&r);
 
     server.stop().await;
 }
@@ -282,16 +303,9 @@ async fn recall_after_schema_upload_uses_retrieval_path() {
 
     seed_fixture(&mut client).await;
 
-    let (opcode, body) =
-        round_trip(&mut client, 3, RequestBody::Recall(recall_request(None))).await;
-    assert_eq!(opcode, Opcode::RecallResp.as_u16());
-    match body {
-        ResponseBody::Recall(r) => {
-            assert!(r.is_final);
-            assert_retrieval(&r);
-        }
-        other => panic!("expected RecallResp, got {other:?}"),
-    }
+    let r = recall_until_hits(&mut client, 3, None).await;
+    assert!(r.is_final);
+    assert_retrieval(&r);
 
     server.stop().await;
 }
@@ -331,23 +345,12 @@ async fn recall_inside_txn_returns_committed_pipeline_hits() {
     .await;
     assert_eq!(opcode, Opcode::TxnBeginResp.as_u16());
 
-    let (opcode, body) = round_trip(
-        &mut client,
-        5,
-        RequestBody::Recall(recall_request(Some(txn_id))),
-    )
-    .await;
-    assert_eq!(opcode, Opcode::RecallResp.as_u16());
-    match body {
-        ResponseBody::Recall(r) => {
-            assert!(r.is_final);
-            // In-txn recall runs the same pipeline over committed data
-            // (the fixture was seeded before the txn began), so hits
-            // carry the retrieval signature just like a non-txn recall.
-            assert_retrieval(&r);
-        }
-        other => panic!("expected RecallResp, got {other:?}"),
-    }
+    // In-txn recall runs the same pipeline over committed data (the fixture
+    // was seeded before the txn began), so hits carry the retrieval signature
+    // just like a non-txn recall — and likewise wait for the lexical index.
+    let r = recall_until_hits(&mut client, 5, Some(txn_id)).await;
+    assert!(r.is_final);
+    assert_retrieval(&r);
 
     server.stop().await;
 }

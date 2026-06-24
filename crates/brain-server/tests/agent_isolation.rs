@@ -219,6 +219,29 @@ async fn recall_ids(
     }
 }
 
+/// Retry a recall until it surfaces `wanted` or a deadline passes. The lexical
+/// lane is populated by the async text-indexer, so a cross-agent recall fired
+/// right after the other agent's ENCODE can race ahead of indexing; recall is
+/// eventually consistent with encode. `recall_ids` mints a fresh request_id
+/// per call, so idempotency never pins an early empty result.
+async fn recall_ids_until_contains(
+    client: &mut TcpStream,
+    mut stream_id: u32,
+    cue: &str,
+    include_other_agents: bool,
+    wanted: u128,
+) -> Vec<u128> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let ids = recall_ids(client, stream_id, cue, Vec::new(), include_other_agents).await;
+        if ids.contains(&wanted) || std::time::Instant::now() >= deadline {
+            return ids;
+        }
+        stream_id += 2;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -304,8 +327,8 @@ async fn include_other_agents_opt_in_widens_scope() {
         "default scope must hide agent A's memory from B; got {scoped:?}"
     );
 
-    // Opt in to cross-agent: B can now see it.
-    let cross = recall_ids(&mut b, 3, "quarterly numbers", Vec::new(), true).await;
+    // Opt in to cross-agent: B can now see it (once the index has caught up).
+    let cross = recall_ids_until_contains(&mut b, 3, "quarterly numbers", true, a1).await;
     assert!(
         cross.contains(&a1),
         "include_other_agents=true must surface agent A's memory {a1} to B; got {cross:?}"

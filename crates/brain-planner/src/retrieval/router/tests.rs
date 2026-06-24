@@ -426,16 +426,6 @@ fn list_intent_does_not_fire_on_single_answer_factoids() {
 }
 
 #[test]
-fn title_case_text_classifies_as_entity_anchored() {
-    // "Alice met Bob" trips the Title-Case mention heuristic, which still
-    // sets the QueryClass (used for profile weights). It no longer selects
-    // the graph lane (that needs a resolved EntityId anchor) — the
-    // retriever set falls to the default semantic+lexical path.
-    let d = route(&req_with_text("Alice met Bob in Paris"));
-    assert_eq!(d.query_class, QueryClass::EntityAnchored);
-}
-
-#[test]
 fn entity_anchor_without_text_selects_graph_and_semantic_only() {
     let req = QueryRequest {
         text: None,

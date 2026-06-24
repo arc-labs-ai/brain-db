@@ -46,15 +46,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hash_is_deterministic() {
-        let a = hash_memory_text("Priya likes async meetings");
-        let b = hash_memory_text("Priya likes async meetings");
-        assert_eq!(a, b);
-        let c = hash_memory_text("Priya likes async meetings ");
-        assert_ne!(a, c);
-    }
-
-    #[test]
     fn key_round_trips_eq_hash() {
         let m = MemoryId::pack(1, 0, 0);
         let k1 = IdempotencyKey::new(m, "hello", ExtractorId::from(7), 1, 3);

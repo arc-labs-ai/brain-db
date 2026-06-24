@@ -283,6 +283,57 @@ async fn upload_bumps_version_and_list_is_newest_first() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn get_by_explicit_version_returns_that_version_not_active() {
+    let server = start(1).await;
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
+    complete_handshake(&mut client).await;
+
+    // Upload v1, then v2 (adds a predicate). Active becomes v2.
+    let (_, _) = round_trip(&mut client, 1, upload_request(ACME_V1)).await;
+    let (_, _) = round_trip(&mut client, 3, upload_request(ACME_V2)).await;
+
+    // GET active → v2 (carries the predicate).
+    let (_, body) = round_trip(
+        &mut client,
+        5,
+        RequestBody::SchemaGet(SchemaGetRequest {
+            namespace: "acme".into(),
+            version: 0,
+        }),
+    )
+    .await;
+    match body {
+        ResponseBody::SchemaGet(r) => {
+            assert_eq!(r.schema_version, 2);
+            assert!(r.schema_document.contains("define predicate"));
+        }
+        other => panic!("expected SchemaGetResp, got {other:?}"),
+    }
+
+    // GET explicit version=1 → still readable, without the v2 predicate.
+    let (_, body) = round_trip(
+        &mut client,
+        7,
+        RequestBody::SchemaGet(SchemaGetRequest {
+            namespace: "acme".into(),
+            version: 1,
+        }),
+    )
+    .await;
+    match body {
+        ResponseBody::SchemaGet(r) => {
+            assert_eq!(r.schema_version, 1);
+            assert!(!r.schema_document.contains("define predicate"));
+        }
+        other => panic!("expected SchemaGetResp, got {other:?}"),
+    }
+
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn validate_dry_run_returns_would_be_version() {
     let server = start(1).await;
     let mut client = TcpStream::connect(server.data_plane_addr)

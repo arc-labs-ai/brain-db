@@ -153,10 +153,14 @@ just docker-shell         # bash inside the dev container
 Inside the container:
 
 ```bash
-just verify                                            # fmt + build + clippy + test
+just verify                                            # fmt + build + clippy + nextest + doctests
 cargo run --bin brain-server -- --config config/dev.toml   # the database
+curl -s http://127.0.0.1:9091/healthz                  # liveness (public)
+curl -s http://127.0.0.1:9091/readyz                   # readiness — 200 when all shards serve, 503 otherwise
 curl -s http://127.0.0.1:9092/v1/stats                 # admin via curl (loopback)
 ```
+
+Tests run under [`cargo-nextest`](https://nexte.st) (`just test`); doctests stay on `cargo test --doc`. Some tests are `#[ignore]`-gated (need a real model, a live API key, or are long/perf gates) — run them with `cargo nextest run --run-ignored all`.
 
 One binary:
 

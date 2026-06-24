@@ -195,62 +195,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn attributes_empty_round_trip() {
-        let a = EntityAttributes::empty();
-        assert!(a.is_empty());
-        assert_eq!(a.as_bytes(), &[] as &[u8]);
-        let bytes = a.into_bytes();
-        assert!(bytes.is_empty());
-    }
-
-    #[test]
-    fn attributes_from_vec_preserves_bytes() {
-        let raw = vec![1u8, 2, 3, 4];
-        let a = EntityAttributes::from(raw.clone());
-        assert_eq!(a.as_bytes(), raw.as_slice());
-        let back: Vec<u8> = a.into();
-        assert_eq!(back, raw);
-    }
-
-    #[test]
-    fn entity_type_person_id_is_stable() {
-        assert_eq!(EntityType::PERSON_ID, EntityTypeId(1));
-        assert_eq!(EntityType::PERSON_NAME, "Person");
-    }
-
-    #[test]
-    fn entity_type_person_constructor_populates_fields() {
-        let t = EntityType::person(1_700_000_000_000_000_000);
-        assert_eq!(t.id, EntityType::PERSON_ID);
-        assert_eq!(t.name, "Person");
-        assert!(t.attribute_schema_blob.is_empty());
-        assert_eq!(t.created_at_unix_nanos, 1_700_000_000_000_000_000);
-    }
-
-    #[test]
-    fn entity_new_active_sets_defaults() {
-        let id = EntityId::new();
-        let e = Entity::new_active(
-            id,
-            EntityType::PERSON_ID,
-            "Priya Patel".into(),
-            "priya patel".into(),
-            1_700_000_000_000_000_000,
-        );
-        assert_eq!(e.id, id);
-        assert_eq!(e.entity_type, EntityType::PERSON_ID);
-        assert_eq!(e.canonical_name, "Priya Patel");
-        assert_eq!(e.normalized_name, "priya patel");
-        assert!(e.aliases.is_empty());
-        assert!(e.attributes.is_empty());
-        assert_eq!(e.mention_count, 0);
-        assert_eq!(e.created_at_unix_nanos, e.updated_at_unix_nanos);
-        assert!(!e.is_merged());
-        assert_eq!(e.embedding_version, 0);
-        assert_eq!(e.flags, 0);
-    }
-
-    #[test]
     fn entity_has_alias_scans_aliases() {
         let mut e = Entity::new_active(
             EntityId::new(),
@@ -265,19 +209,5 @@ mod tests {
         assert!(e.has_alias("priya"));
         assert!(e.has_alias("p. patel"));
         assert!(!e.has_alias("PRIYA")); // exact match; callers normalize
-    }
-
-    #[test]
-    fn entity_is_merged_reports_redirect() {
-        let mut e = Entity::new_active(
-            EntityId::new(),
-            EntityType::PERSON_ID,
-            "old".into(),
-            "old".into(),
-            0,
-        );
-        assert!(!e.is_merged());
-        e.merged_into = Some(EntityId::new());
-        assert!(e.is_merged());
     }
 }

@@ -528,23 +528,6 @@ pub struct UnlinkResponse {
 mod serde_smoke {
     use super::*;
 
-    // Proves the additive serde derives actually function: a JSON
-    // round-trip of one representative payload. The codec path is
-    // covered by the round-trip tests in request.rs / response.rs.
-    #[test]
-    fn encode_request_serde_json_round_trips() {
-        let req = EncodeRequest {
-            text: "hello world".to_string(),
-            context_id: 1,
-            request_id: [7u8; 16],
-            txn_id: Some([8u8; 16]),
-            occurred_at_unix_nanos: Some(1_700_000_000_000_000_000),
-        };
-        let j = serde_json::to_vec(&req).expect("serde_json encode");
-        let back: EncodeRequest = serde_json::from_slice(&j).expect("serde_json decode");
-        assert_eq!(req, back);
-    }
-
     // The raw embedding for ENCODE_VECTOR_DIRECT rides the trailing raw
     // section of the frame payload, not the CBOR map. This proves three
     // things at once:

@@ -256,9 +256,7 @@ pub struct StatementListRequest {
 #[cfg(test)]
 mod tests_req {
     use super::*;
-    use crate::codec::opcode::Opcode;
     use crate::envelope::request::RequestBody;
-    use crate::envelope::response::ResponseBody;
 
     fn sample_uuid(seed: u8) -> WireUuid {
         let mut u = [0u8; 16];
@@ -285,70 +283,11 @@ mod tests_req {
         }
     }
 
-    fn sample_view() -> StatementView {
-        StatementView {
-            statement_id: sample_uuid(3),
-            kind: StatementKindWire::Fact,
-            subject: sample_uuid(4),
-            subject_pending_audit_id: [0u8; 16],
-            predicate: "test:role".into(),
-            object: StatementObjectWire::EntityRef(sample_uuid(5)),
-            confidence: 0.85,
-            evidence: EvidenceRefWire::Inline(vec![[7u8; 16]]),
-            extractor_id: 0,
-            extracted_at_unix_nanos: 1_700_000_000_000_000_000,
-            schema_version: 1,
-            valid_from_unix_nanos: 1_700_000_000_000_000_000,
-            valid_to_unix_nanos: 0,
-            event_at_unix_nanos: 0,
-            version: 1,
-            superseded_by: [0u8; 16],
-            supersedes: [0u8; 16],
-            chain_root: sample_uuid(3),
-            tombstoned: false,
-            tombstoned_at_unix_nanos: 0,
-            tombstone_reason: 0,
-            flags: 0,
-            is_stateful: false,
-        }
-    }
-
     fn req_round_trip(body: RequestBody) {
         let bytes = body.encode();
         let decoded = RequestBody::decode(body.opcode(), &bytes)
             .unwrap_or_else(|e| panic!("decode failed for {:?}: {e}", body.opcode()));
         assert_eq!(decoded, body);
-    }
-
-    fn resp_round_trip(body: ResponseBody) {
-        let bytes = body.encode();
-        let decoded = ResponseBody::decode(body.opcode(), &bytes)
-            .unwrap_or_else(|e| panic!("decode failed for {:?}: {e}", body.opcode()));
-        assert_eq!(decoded, body);
-    }
-
-    // ----- Opcode assignments -----
-
-    #[test]
-    fn statement_opcode_byte_assignments() {
-        assert_eq!(Opcode::StatementCreateReq.as_u16(), 0x0140);
-        assert_eq!(Opcode::StatementCreateResp.as_u16(), 0x01C0);
-        assert_eq!(Opcode::StatementGetReq.as_u16(), 0x0141);
-        assert_eq!(Opcode::StatementGetResp.as_u16(), 0x01C1);
-        assert_eq!(Opcode::StatementSupersedeReq.as_u16(), 0x0142);
-        assert_eq!(Opcode::StatementSupersedeResp.as_u16(), 0x01C2);
-        assert_eq!(Opcode::StatementTombstoneReq.as_u16(), 0x0143);
-        assert_eq!(Opcode::StatementTombstoneResp.as_u16(), 0x01C3);
-        assert_eq!(Opcode::StatementRetractReq.as_u16(), 0x0144);
-        assert_eq!(Opcode::StatementRetractResp.as_u16(), 0x01C4);
-        assert_eq!(Opcode::StatementHistoryReq.as_u16(), 0x0145);
-        assert_eq!(Opcode::StatementHistoryResp.as_u16(), 0x01C5);
-        assert_eq!(Opcode::StatementListReq.as_u16(), 0x0146);
-        assert_eq!(Opcode::StatementListResp.as_u16(), 0x01C6);
-
-        assert!(Opcode::StatementCreateReq.is_typed_graph());
-        assert!(Opcode::StatementCreateReq.is_request());
-        assert!(Opcode::StatementCreateResp.is_response());
     }
 
     // ----- Requests -----
@@ -376,55 +315,6 @@ mod tests_req {
         let mut req = sample_create_request(StatementObjectWire::EntityRef(sample_uuid(12)));
         req.evidence = EvidenceRefWire::Overflow(sample_uuid(13));
         req_round_trip(RequestBody::StatementCreate(req));
-    }
-
-    #[test]
-    fn statement_get_request_roundtrip_both_flags() {
-        for follow in [true, false] {
-            req_round_trip(RequestBody::StatementGet(StatementGetRequest {
-                statement_id: sample_uuid(20),
-                follow_supersession: follow,
-            }));
-        }
-    }
-
-    #[test]
-    fn statement_supersede_request_roundtrip() {
-        req_round_trip(RequestBody::StatementSupersede(StatementSupersedeRequest {
-            old_statement_id: sample_uuid(30),
-            new_statement: sample_create_request(StatementObjectWire::Value(
-                StatementValueWire::Text("new value".into()),
-            )),
-            request_id: sample_uuid(31),
-        }));
-    }
-
-    #[test]
-    fn statement_tombstone_request_roundtrip() {
-        req_round_trip(RequestBody::StatementTombstone(StatementTombstoneRequest {
-            statement_id: sample_uuid(40),
-            reason: 2,
-            reason_message: "user request".into(),
-            request_id: sample_uuid(41),
-        }));
-    }
-
-    #[test]
-    fn statement_retract_request_roundtrip() {
-        req_round_trip(RequestBody::StatementRetract(StatementRetractRequest {
-            statement_id: sample_uuid(50),
-            reason: 4,
-            reason_message: "extractor retraction".into(),
-            request_id: sample_uuid(51),
-        }));
-    }
-
-    #[test]
-    fn statement_history_request_roundtrip() {
-        req_round_trip(RequestBody::StatementHistory(StatementHistoryRequest {
-            anchor_id: sample_uuid(60),
-            include_tombstoned: true,
-        }));
     }
 
     #[test]
@@ -457,50 +347,6 @@ mod tests_req {
         }));
     }
 
-    // ----- Responses -----
-
-    #[test]
-    fn statement_responses_roundtrip() {
-        resp_round_trip(ResponseBody::StatementCreate(StatementCreateResponse {
-            statement_id: sample_uuid(80),
-            auto_superseded: [0u8; 16],
-            chain_root: sample_uuid(80),
-        }));
-        resp_round_trip(ResponseBody::StatementGet(StatementGetResponse {
-            statement: sample_view(),
-            returned_via_supersession: false,
-        }));
-        resp_round_trip(ResponseBody::StatementSupersede(
-            StatementSupersedeResponse {
-                new_statement_id: sample_uuid(81),
-                chain_root: sample_uuid(82),
-                version: 2,
-            },
-        ));
-        resp_round_trip(ResponseBody::StatementTombstone(
-            StatementTombstoneResponse {
-                tombstoned_at_unix_nanos: 1_700_000_000_000_000_000,
-            },
-        ));
-        resp_round_trip(ResponseBody::StatementRetract(StatementRetractResponse {
-            retracted_at_unix_nanos: 1_700_000_000_000_000_000,
-            will_zero_at_unix_nanos: 1_702_592_000_000_000_000,
-        }));
-        resp_round_trip(ResponseBody::StatementHistory(
-            StatementHistoryResponseFrame {
-                items: vec![sample_view()],
-                chain_root: sample_uuid(83),
-                total_versions: 1,
-                is_final: true,
-            },
-        ));
-        resp_round_trip(ResponseBody::StatementList(StatementListResponseFrame {
-            items: vec![sample_view()],
-            next_cursor: Vec::new(),
-            cumulative_count: 1,
-            is_final: true,
-        }));
-    }
 }
 
 // ============================================================

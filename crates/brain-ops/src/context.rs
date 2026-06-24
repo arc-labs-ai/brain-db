@@ -104,7 +104,7 @@ pub struct OpsContext {
     pub extractor_registry: Arc<RwLock<ExtractorRegistry>>,
     /// Per-deployment classifier config (operator-provided NER
     /// model path). Defaults to `unloaded`; operators wire
-    /// `BRAIN_NER_MODEL_PATH` via `with_classifier_config`.
+    /// `[extractors.classifier] model_path` via `with_classifier_config`.
     pub classifier_config: Arc<ClassifierConfig>,
     /// Per-shard LLM extractor response cache.
     /// `None` when no API keys are configured, the cache file
@@ -261,7 +261,7 @@ impl OpsContext {
     }
 
     /// Replace the classifier config. Operators wire
-    /// `BRAIN_NER_MODEL_PATH` here at server startup.
+    /// `[extractors.classifier] model_path` here at server startup.
     #[must_use]
     pub fn with_classifier_config(mut self, cfg: ClassifierConfig) -> Self {
         self.classifier_config = Arc::new(cfg);

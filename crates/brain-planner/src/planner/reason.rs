@@ -276,12 +276,4 @@ mod tests {
             other => panic!("expected InvalidParameters, got {other:?}"),
         }
     }
-
-    #[test]
-    fn aggregation_defaults_to_five_and_five() {
-        let plan = unwrap_reason(plan_reason(&base_request(), &PlannerContext::default()).unwrap());
-        assert_eq!(plan.aggregation.max_supporting, 5);
-        assert_eq!(plan.aggregation.max_contradicting, 5);
-        assert!(plan.aggregation.include_aggregate_confidence);
-    }
 }

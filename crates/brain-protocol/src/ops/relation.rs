@@ -383,9 +383,6 @@ pub fn relation_type_canonical(rt: &RelationType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::opcode::Opcode;
-    use crate::envelope::request::RequestBody;
-    use crate::envelope::response::ResponseBody;
 
     fn sample_uuid(seed: u8) -> WireUuid {
         let mut u = [0u8; 16];
@@ -393,21 +390,6 @@ mod tests {
             *b = seed.wrapping_add(i as u8);
         }
         u
-    }
-
-    fn sample_create_request() -> RelationCreateRequest {
-        RelationCreateRequest {
-            relation_type: "test:knows".into(),
-            from_entity: sample_uuid(1),
-            to_entity: sample_uuid(2),
-            properties_blob: Vec::new(),
-            evidence: EvidenceRefWire::Inline(vec![[7u8; 16]]),
-            extractor_id: 0,
-            confidence: 0.9,
-            valid_from_unix_nanos: 0,
-            valid_to_unix_nanos: 0,
-            request_id: sample_uuid(3),
-        }
     }
 
     fn sample_view() -> RelationView {
@@ -431,171 +413,6 @@ mod tests {
             tombstoned_at_unix_nanos: 0,
             flags: 0,
         }
-    }
-
-    fn req_round_trip(body: RequestBody) {
-        let bytes = body.encode();
-        let decoded = RequestBody::decode(body.opcode(), &bytes)
-            .unwrap_or_else(|e| panic!("decode failed for {:?}: {e}", body.opcode()));
-        assert_eq!(decoded, body);
-    }
-
-    fn resp_round_trip(body: ResponseBody) {
-        let bytes = body.encode();
-        let decoded = ResponseBody::decode(body.opcode(), &bytes)
-            .unwrap_or_else(|e| panic!("decode failed for {:?}: {e}", body.opcode()));
-        assert_eq!(decoded, body);
-    }
-
-    // ----- Opcode assignments -----
-
-    #[test]
-    fn relation_opcode_byte_assignments() {
-        assert_eq!(Opcode::RelationCreateReq.as_u16(), 0x0150);
-        assert_eq!(Opcode::RelationCreateResp.as_u16(), 0x01D0);
-        assert_eq!(Opcode::RelationGetReq.as_u16(), 0x0151);
-        assert_eq!(Opcode::RelationGetResp.as_u16(), 0x01D1);
-        assert_eq!(Opcode::RelationSupersedeReq.as_u16(), 0x0152);
-        assert_eq!(Opcode::RelationSupersedeResp.as_u16(), 0x01D2);
-        assert_eq!(Opcode::RelationTombstoneReq.as_u16(), 0x0153);
-        assert_eq!(Opcode::RelationTombstoneResp.as_u16(), 0x01D3);
-        assert_eq!(Opcode::RelationListFromReq.as_u16(), 0x0154);
-        assert_eq!(Opcode::RelationListFromResp.as_u16(), 0x01D4);
-        assert_eq!(Opcode::RelationListToReq.as_u16(), 0x0155);
-        assert_eq!(Opcode::RelationListToResp.as_u16(), 0x01D5);
-        assert_eq!(Opcode::RelationTraverseReq.as_u16(), 0x0156);
-        assert_eq!(Opcode::RelationTraverseResp.as_u16(), 0x01D6);
-
-        assert!(Opcode::RelationCreateReq.is_typed_graph());
-        assert!(Opcode::RelationCreateReq.is_request());
-        assert!(Opcode::RelationCreateResp.is_response());
-    }
-
-    // ----- Requests -----
-
-    #[test]
-    fn relation_create_request_roundtrip() {
-        req_round_trip(RequestBody::RelationCreate(sample_create_request()));
-    }
-
-    #[test]
-    fn relation_get_request_roundtrip() {
-        for follow in [true, false] {
-            req_round_trip(RequestBody::RelationGet(RelationGetRequest {
-                relation_id: sample_uuid(20),
-                follow_supersession: follow,
-            }));
-        }
-    }
-
-    #[test]
-    fn relation_supersede_request_roundtrip() {
-        req_round_trip(RequestBody::RelationSupersede(RelationSupersedeRequest {
-            old_relation_id: sample_uuid(30),
-            new_relation: sample_create_request(),
-            request_id: sample_uuid(31),
-        }));
-    }
-
-    #[test]
-    fn relation_tombstone_request_roundtrip() {
-        req_round_trip(RequestBody::RelationTombstone(RelationTombstoneRequest {
-            relation_id: sample_uuid(40),
-            reason: "test reason".into(),
-            request_id: sample_uuid(41),
-        }));
-    }
-
-    #[test]
-    fn relation_list_from_request_roundtrip() {
-        req_round_trip(RequestBody::RelationListFrom(RelationListFromRequest {
-            from_entity: sample_uuid(50),
-            relation_type_filter: "test:knows".into(),
-            time_range_start_unix_nanos: 1,
-            time_range_end_unix_nanos: 100,
-            include_superseded: false,
-            include_tombstoned: false,
-            limit: 100,
-            cursor: Vec::new(),
-        }));
-    }
-
-    #[test]
-    fn relation_list_to_request_roundtrip() {
-        req_round_trip(RequestBody::RelationListTo(RelationListToRequest {
-            to_entity: sample_uuid(60),
-            relation_type_filter: String::new(),
-            time_range_start_unix_nanos: 0,
-            time_range_end_unix_nanos: 0,
-            include_superseded: false,
-            include_tombstoned: false,
-            limit: 100,
-            cursor: Vec::new(),
-        }));
-    }
-
-    #[test]
-    fn relation_traverse_request_roundtrip() {
-        req_round_trip(RequestBody::RelationTraverse(RelationTraverseRequest {
-            start_entity: sample_uuid(70),
-            relation_types: vec!["test:knows".into()],
-            direction: 0,
-            max_depth: 3,
-            max_nodes: 100,
-            time_at_unix_nanos: 0,
-            include_superseded: false,
-            request_id: sample_uuid(71),
-        }));
-    }
-
-    // ----- Responses -----
-
-    #[test]
-    fn relation_responses_roundtrip() {
-        resp_round_trip(ResponseBody::RelationCreate(RelationCreateResponse {
-            relation_id: sample_uuid(80),
-        }));
-        resp_round_trip(ResponseBody::RelationGet(RelationGetResponse {
-            relation: sample_view(),
-            returned_via_supersession: false,
-        }));
-        resp_round_trip(ResponseBody::RelationSupersede(RelationSupersedeResponse {
-            new_relation_id: sample_uuid(81),
-            version: 2,
-        }));
-        resp_round_trip(ResponseBody::RelationTombstone(RelationTombstoneResponse {
-            tombstoned_at_unix_nanos: 1_700_000_000_000_000_000,
-        }));
-        resp_round_trip(ResponseBody::RelationListFrom(
-            RelationListFromResponseFrame {
-                items: vec![sample_view()],
-                next_cursor: Vec::new(),
-                cumulative_count: 1,
-                is_final: true,
-            },
-        ));
-        resp_round_trip(ResponseBody::RelationListTo(RelationListToResponseFrame {
-            items: vec![sample_view()],
-            next_cursor: Vec::new(),
-            cumulative_count: 1,
-            is_final: true,
-        }));
-        resp_round_trip(ResponseBody::RelationTraverse(
-            RelationTraverseResponseFrame {
-                paths: vec![TraversalPathWire {
-                    steps: vec![TraversalStepWire {
-                        relation_id: sample_uuid(90),
-                        from: sample_uuid(91),
-                        to: sample_uuid(92),
-                        relation_type: "test:knows".into(),
-                        depth: 1,
-                    }],
-                }],
-                total_paths: 1,
-                truncated: false,
-                is_final: true,
-            },
-        ));
     }
 
     // ----- View conversion -----

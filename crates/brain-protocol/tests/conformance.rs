@@ -1103,7 +1103,7 @@ struct ManifestEntry {
 }
 
 #[test]
-fn conformance_corpus() {
+fn wire_encoding_matches_golden_corpus_bytes() {
     let dir = corpus_dir();
     let cases = corpus();
     let bless = blessing();

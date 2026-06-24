@@ -50,32 +50,34 @@ pub struct Config {
     /// is wired).
     #[serde(default)]
     pub summarizer: SummarizerConfig,
-    /// Single provider credential + model id for the extractor's LLM
-    /// tier (tier 3 — statements/relations). Section may be omitted;
-    /// the environment (`BRAIN_API_KEY` / `BRAIN_AI_MODEL`) takes
-    /// precedence when set, so a committed config never overrides a
-    /// deployment's env-provided secret.
+    /// Single provider credential + model id for every LLM consumer
+    /// (write-time HyPE, the extractor's LLM tier, the entity
+    /// disambiguator, the summarizer). Section may be omitted; the
+    /// generic env override `BRAIN__LLM__API_KEY` / `BRAIN__LLM__MODEL`
+    /// folds into these fields before validation, so a deployment's
+    /// env-provided secret wins over a committed config.
     #[serde(default)]
     pub llm: LlmConfig,
 }
 
-/// `[llm]` TOML section. Credential + model for the extractor's LLM
-/// tier. Provider-agnostic by design: a single key and a single model
-/// id. The provider (OpenAI / Anthropic) is derived from the model id
-/// prefix, so adding a provider is a routing-table entry, not a new
-/// config key. Both fields are optional; the matching environment
-/// variable wins when present. Prefer the environment for production
-/// secrets — values committed to TOML leak into version control.
+/// `[llm]` TOML section. The single credential + model for every LLM
+/// consumer in the server. Provider-agnostic by design: one key and one
+/// model id. The provider (OpenAI / Anthropic) is derived from the model
+/// id prefix, so adding a provider is a routing-table entry, not a new
+/// config key. Both fields are optional; the generic env override
+/// (`BRAIN__LLM__API_KEY` / `BRAIN__LLM__MODEL`) wins when present.
+/// Prefer the environment for production secrets — values committed to
+/// TOML leak into version control.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LlmConfig {
-    /// API key for the configured model's provider. Falls back to
-    /// `$BRAIN_API_KEY` when unset.
+    /// API key for the configured model's provider. Override with
+    /// `BRAIN__LLM__API_KEY`.
     #[serde(default)]
     pub api_key: Option<String>,
     /// Model id (e.g. `gpt-4o-mini`, `claude-haiku-4-5`). The provider
-    /// is derived from this id. Falls back to `$BRAIN_AI_MODEL`, then
-    /// the built-in default.
+    /// is derived from this id. Override with `BRAIN__LLM__MODEL`;
+    /// falls back to the built-in default when unset.
     #[serde(default)]
     pub model: Option<String>,
 }
@@ -237,6 +239,25 @@ pub struct ExtractorsConfig {
     /// Write-time HyPE (hypothetical-question) generation tuning.
     #[serde(default)]
     pub hype: HypeExtractorConfig,
+    /// Write-time per-statement question-bridge (off by default until
+    /// measured). Sibling to HyPE but for the statement corpus.
+    #[serde(default)]
+    pub statement_question_bridge: StatementQuestionBridgeConfig,
+}
+
+/// `[extractors.statement_question_bridge]` TOML sub-section. When enabled,
+/// each shard builds the statement-question HNSW, the embed worker generates
+/// templated questions for every eligible statement, and the semantic
+/// retriever probes that pool on statement-scope search. Off by default: a
+/// write-time generation cost paid only once the bridge is measured. Replaces
+/// the former `BRAIN_STATEMENT_QUESTION_BRIDGE` env var — all toggles live in
+/// structured TOML.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StatementQuestionBridgeConfig {
+    /// Off by default. `true` provisions the bridge.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// `[extractors.classifier]` TOML sub-section. The classifier tier's
@@ -403,6 +424,61 @@ pub struct WorkersConfig {
     /// omitted; the field defaults.
     #[serde(default)]
     pub llm_cache_sweep: LlmCacheSweepWorkerConfig,
+    /// Physical reclamation of superseded statement rows after a
+    /// retention window. Off by default (retention 0); superseded rows
+    /// stay in redb (invisible to retrieval) until an operator opts in.
+    /// Section may be omitted.
+    #[serde(default)]
+    pub supersession_sweeper: SupersessionSweeperWorkerConfig,
+}
+
+/// `[workers.supersession_sweeper]` TOML section. Controls physical
+/// reclamation of superseded statement rows. Off by default — a
+/// superseded row is filtered from every read regardless, so retention
+/// is purely a disk-reclamation knob the operator opts into.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SupersessionSweeperWorkerConfig {
+    /// Master switch. `false` (default) registers the worker as a no-op;
+    /// `true` physically deletes superseded rows past the retention
+    /// window each cycle. A superseded row is filtered from every read
+    /// regardless, so this is purely a disk-reclamation opt-in.
+    #[serde(default = "default_supersession_enabled")]
+    pub enabled: bool,
+    /// Retention window in seconds. A superseded row is eligible for
+    /// physical delete once this long has elapsed since it was
+    /// superseded. (Tuning only — gating is `enabled`.)
+    #[serde(default = "default_supersession_retention_seconds")]
+    pub retention_seconds: u64,
+    /// Sweep cadence in seconds. Defaults to 1 day.
+    #[serde(default = "default_supersession_period_seconds")]
+    pub period_seconds: u64,
+    /// When `true`, the sweeper logs what it would delete without
+    /// deleting. Useful for validating a retention window before
+    /// arming it.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+impl Default for SupersessionSweeperWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_supersession_enabled(),
+            retention_seconds: default_supersession_retention_seconds(),
+            period_seconds: default_supersession_period_seconds(),
+            dry_run: false,
+        }
+    }
+}
+
+fn default_supersession_enabled() -> bool {
+    false
+}
+fn default_supersession_retention_seconds() -> u64 {
+    0
+}
+fn default_supersession_period_seconds() -> u64 {
+    brain_workers::workers::supersession_sweeper::DEFAULT_PERIOD_SECONDS
 }
 
 /// `[workers.statement_reclaim]` TOML section. Controls the retracted-
@@ -452,6 +528,10 @@ fn default_statement_reclaim_period_seconds() -> u64 {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AmbiguityResolverWorkerConfig {
+    /// Master switch. `true` (default) registers the worker; `false`
+    /// skips registration. Low-cost metadata maintenance — on by default.
+    #[serde(default = "default_worker_enabled_true")]
+    pub enabled: bool,
     /// Sweep interval in seconds. Slow on purpose: a proposal's
     /// confidence shifts as the HNSW absorbs new aliases, on the order
     /// of hours. Defaults to 1 hour.
@@ -462,6 +542,7 @@ pub struct AmbiguityResolverWorkerConfig {
 impl Default for AmbiguityResolverWorkerConfig {
     fn default() -> Self {
         Self {
+            enabled: default_worker_enabled_true(),
             interval_secs: default_ambiguity_resolver_interval_secs(),
         }
     }
@@ -476,6 +557,10 @@ fn default_ambiguity_resolver_interval_secs() -> u64 {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ConfidenceSweepWorkerConfig {
+    /// Master switch. `true` (default) registers the worker; `false`
+    /// skips registration. Low-cost metadata maintenance — on by default.
+    #[serde(default = "default_worker_enabled_true")]
+    pub enabled: bool,
     /// Sweep interval in seconds. Defaults to 1 hour.
     #[serde(default = "default_confidence_sweep_interval_secs")]
     pub interval_secs: u64,
@@ -484,6 +569,7 @@ pub struct ConfidenceSweepWorkerConfig {
 impl Default for ConfidenceSweepWorkerConfig {
     fn default() -> Self {
         Self {
+            enabled: default_worker_enabled_true(),
             interval_secs: default_confidence_sweep_interval_secs(),
         }
     }
@@ -493,11 +579,21 @@ fn default_confidence_sweep_interval_secs() -> u64 {
     brain_workers::workers::confidence_sweep::DEFAULT_INTERVAL_SECS
 }
 
+/// Shared default for low-cost maintenance workers that are on unless an
+/// operator explicitly opts out.
+fn default_worker_enabled_true() -> bool {
+    true
+}
+
 /// `[workers.llm_cache_sweep]` TOML section. Controls the LLM
 /// extractor response-cache TTL sweep cadence.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LlmCacheSweepWorkerConfig {
+    /// Master switch. `true` (default) registers the worker; `false`
+    /// skips registration. Low-cost metadata maintenance — on by default.
+    #[serde(default = "default_worker_enabled_true")]
+    pub enabled: bool,
     /// Sweep interval in seconds. Defaults to 1 hour.
     #[serde(default = "default_llm_cache_sweep_interval_secs")]
     pub interval_secs: u64,
@@ -506,6 +602,7 @@ pub struct LlmCacheSweepWorkerConfig {
 impl Default for LlmCacheSweepWorkerConfig {
     fn default() -> Self {
         Self {
+            enabled: default_worker_enabled_true(),
             interval_secs: default_llm_cache_sweep_interval_secs(),
         }
     }
@@ -796,15 +893,15 @@ fn default_causal_edge_channel_capacity() -> usize {
     1024
 }
 
-/// `[workers.extractor]` TOML section. Defaults registered every
-/// shard. Omit the section to accept defaults; set `enabled = false`
-/// to skip worker registration entirely for no-schema deployments.
+/// `[workers.extractor]` TOML section — TUNING for the extraction-pipeline
+/// worker. The worker is NOT enabled/disabled here: its existence is derived
+/// from the extractor tier gates (`[extractors.<tier>].enabled`) — it runs iff
+/// ≥1 tier is enabled. To turn extraction off, disable the tiers. This avoids
+/// the trap where a separate worker switch could silently dead-letter every
+/// enabled tier.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExtractorWorkerConfig {
-    /// Master switch. `false` skips registration entirely.
-    #[serde(default = "default_extractor_enabled")]
-    pub enabled: bool,
     /// Scheduler tick in milliseconds.
     #[serde(default = "default_extractor_interval_ms")]
     pub interval_ms: u64,
@@ -834,7 +931,6 @@ pub struct ExtractorWorkerConfig {
 impl Default for ExtractorWorkerConfig {
     fn default() -> Self {
         Self {
-            enabled: default_extractor_enabled(),
             interval_ms: default_extractor_interval_ms(),
             drain_per_cycle: default_extractor_drain_per_cycle(),
             llm_budget_per_cycle_micro_usd: default_extractor_llm_budget_micro_usd(),
@@ -845,9 +941,6 @@ impl Default for ExtractorWorkerConfig {
     }
 }
 
-fn default_extractor_enabled() -> bool {
-    true
-}
 fn default_extractor_interval_ms() -> u64 {
     1000
 }
@@ -979,15 +1072,12 @@ pub struct SummarizerConfig {
     #[serde(default = "default_max_summary_chars")]
     pub max_summary_chars: u32,
 
-    // OpenAI-specific knobs. Read only when `backend == Openai`.
+    // OpenAI-specific knobs. Read only when `backend == Openai`. The
+    // credential is NOT here — the summarizer shares the single
+    // `[llm] api_key` (override `BRAIN__LLM__API_KEY`) like every other
+    // LLM consumer.
     #[serde(default = "default_openai_api_base")]
     pub openai_api_base: String,
-    /// OpenAI API key. Same convention as `[llm] openai_api_key`:
-    /// falls back to `$OPENAI_API_KEY` when unset. Prefer the
-    /// environment for production secrets — values committed to TOML
-    /// leak into version control.
-    #[serde(default)]
-    pub openai_api_key: Option<String>,
     #[serde(default = "default_openai_model")]
     pub openai_model: String,
     #[serde(default = "default_temperature")]
@@ -1007,7 +1097,6 @@ impl Default for SummarizerConfig {
             request_timeout_sec: default_request_timeout_sec(),
             max_summary_chars: default_max_summary_chars(),
             openai_api_base: default_openai_api_base(),
-            openai_api_key: None,
             openai_model: default_openai_model(),
             openai_temperature: default_temperature(),
             ollama_base: default_ollama_base(),
@@ -1223,7 +1312,7 @@ impl Config {
             source,
         })?;
         cfg.validate_post()?;
-        cfg.validate_llm_provider(env)?;
+        cfg.validate_llm_provider()?;
         Ok(cfg)
     }
 
@@ -1332,27 +1421,27 @@ impl Config {
     /// question-vector bridge is empty. So the server refuses to boot
     /// without a provider key, period — there is no substrate-only mode.
     ///
-    /// A key resolves from either the `BRAIN_API_KEY` process env or
-    /// `[llm] api_key` in config (the latter also covers the
-    /// `BRAIN__LLM__API_KEY` override, already folded into `self.llm`
-    /// by this point).
+    /// The key is read from the single `[llm] api_key` field — which the
+    /// generic `BRAIN__LLM__API_KEY` env override has already folded into
+    /// `self.llm` by this point, so there is exactly one source to check.
     ///
     /// `[extractors.llm] enabled` no longer gates this requirement: the
     /// LLM is required regardless of the tier flag, and a missing key is
     /// always a hard startup error.
-    fn validate_llm_provider(&self, env: &HashMap<String, String>) -> Result<(), ConfigError> {
-        let env_present = |k: &str| env.get(k).is_some_and(|v| !v.trim().is_empty());
-        let cfg_present =
-            |k: &Option<String>| k.as_deref().is_some_and(|v| !v.trim().is_empty());
-        let have_provider = env_present("BRAIN_API_KEY") || cfg_present(&self.llm.api_key);
+    fn validate_llm_provider(&self) -> Result<(), ConfigError> {
+        let have_provider = self
+            .llm
+            .api_key
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty());
         if !have_provider {
             return Err(ConfigError::Invariant(
                 "no LLM provider key configured. Brain requires an LLM: write-time HyPE \
                  hypothetical-question generation is mandatory and always-on, and the \
                  write path (entity / statement / relation extraction) depends on it. \
                  There is no way to disable HyPE or run without an LLM. \
-                 Set BRAIN_API_KEY in the environment, or `[llm] api_key` in the config, \
-                 and ensure `[llm] model` names a provider you hold a key for."
+                 Set BRAIN__LLM__API_KEY in the environment, or `[llm] api_key` in the \
+                 config, and ensure `[llm] model` names a provider you hold a key for."
                     .into(),
             ));
         }
@@ -1380,26 +1469,23 @@ mod tests {
     #[test]
     fn llm_provider_gate_requires_key_unconditionally() {
         let mut cfg = Config::for_tests();
-        let empty: HashMap<String, String> = HashMap::new();
 
-        // No key anywhere → refuse to start.
+        // No key → refuse to start.
+        cfg.llm.api_key = None;
         assert!(
-            cfg.validate_llm_provider(&empty).is_err(),
+            cfg.validate_llm_provider().is_err(),
             "no provider key must fail startup — the LLM is mandatory"
         );
 
-        // Bare env key satisfies it.
-        let mut env = HashMap::new();
-        env.insert("BRAIN_API_KEY".to_string(), "sk-test".to_string());
-        assert!(cfg.validate_llm_provider(&env).is_ok());
-
-        // Config-file key satisfies it (covers BRAIN__LLM__API_KEY overrides).
+        // A key in `[llm] api_key` satisfies it. The generic
+        // `BRAIN__LLM__API_KEY` override folds into this same field before
+        // validation, so there is exactly one source to check.
         cfg.llm.api_key = Some("sk-cfg".to_string());
-        assert!(cfg.validate_llm_provider(&empty).is_ok());
+        assert!(cfg.validate_llm_provider().is_ok());
 
         // Whitespace-only key does not count.
         cfg.llm.api_key = Some("   ".to_string());
-        assert!(cfg.validate_llm_provider(&empty).is_err());
+        assert!(cfg.validate_llm_provider().is_err());
     }
 
     #[test]
@@ -1409,9 +1495,9 @@ mod tests {
         // keyless boot must still fail.
         let mut cfg = Config::for_tests();
         cfg.extractors.llm.enabled = false;
-        let empty: HashMap<String, String> = HashMap::new();
+        cfg.llm.api_key = None;
         assert!(
-            cfg.validate_llm_provider(&empty).is_err(),
+            cfg.validate_llm_provider().is_err(),
             "disabling the llm tier must not bypass the mandatory LLM key gate"
         );
     }

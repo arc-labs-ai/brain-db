@@ -98,7 +98,7 @@ mod tests {
     use redb::ReadableDatabase;
 
     #[test]
-    fn round_trip() {
+    fn extractor_definition_round_trips_through_redb_preserving_fields() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
         let ex = ExtractorDefinition::new(

@@ -129,7 +129,10 @@ pub fn statement_question_iter_all(
         let key = k.value();
         let mut id_bytes = [0u8; 16];
         id_bytes.copy_from_slice(&key[..16]);
-        out.push((StatementId::from_bytes(id_bytes), bytes_to_vector(&v.value())));
+        out.push((
+            StatementId::from_bytes(id_bytes),
+            bytes_to_vector(&v.value()),
+        ));
     }
     Ok(out)
 }

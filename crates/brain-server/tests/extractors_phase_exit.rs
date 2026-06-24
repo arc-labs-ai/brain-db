@@ -1,22 +1,33 @@
 //! Extractor lifecycle exit integration test.
 //!
-//! Exercises the full extractor lifecycle end-to-end:
-//! - System schema seeds `brain.entity_mentions` + `brain.basic_ner`.
+//! Exercises the extractor lifecycle end-to-end:
+//! - System schema seeds `brain.entity_mentions`, `brain.gliner`,
+//!   `brain.llm_predicate`.
 //! - ENCODE a memory whose text matches the pattern extractor's
 //!   English-name regex.
-//! - Verify an audit row was written for the pattern extractor with
-//!   `Success` status and a non-zero item count in `status_reason`.
-//! - Verify the classifier extractor wrote a `Failure` audit row
-//!   with the staged "runtime not wired" reason (a follow-up
-//!   will flip this to a real inference path).
-//! - DISABLE the pattern extractor → ENCODE again → assert only
-//!   the classifier wrote an audit row for the second memory.
+//! - Extraction is async (the per-shard worker drains the queue), so the
+//!   test settles before reading the audit table.
+//! - Verify the worker wrote a pipeline audit row whose pattern tier RAN and
+//!   produced at least one entity.
+//! - DISABLE the pattern extractor → ENCODE again → assert the wire `LIST`
+//!   reports it disabled, and the second memory still gets a pipeline audit
+//!   row from the remaining tiers.
+//!
+//! Storage note: the worker records ONE [`ExtractorPipelineAuditEntry`] per
+//! memory (via `record_extracted`), aggregating all tiers into per-tier
+//! status bytes + a combined item count. It does NOT write the legacy
+//! per-extractor `ExtractionAudit` rows (`audit_write` is test/bench-only).
+//! Because the pattern tier holds more than one extractor (entity_mentions +
+//! temporal_expressions) and the classifier tier (GLiNER) can also surface
+//! entities, the aggregate row can't isolate a single disabled extractor's
+//! contribution — so the per-extractor disable is asserted at the wire level
+//! (`LIST`), and storage only confirms the pipeline ran for each memory.
 
 #![cfg(target_os = "linux")]
 
-use brain_metadata::audit::ops::audit_by_memory;
-use brain_metadata::tables::audit::extraction_status;
-use brain_metadata::MetadataDb;
+use brain_metadata::{
+    pipeline_audit_entry, pipeline_status, tier_status, ExtractorPipelineAuditEntry, MetadataDb,
+};
 use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
@@ -166,16 +177,16 @@ fn encode_request(text: &str) -> RequestBody {
     })
 }
 
-/// Read all audit rows for a memory from the shard's metadata.redb.
-/// MUST be called after `Server::stop()` — redb serialises opens
-/// and the shard holds the lock while running.
-fn read_audit_rows_after_stop(
+/// Read a memory's pipeline audit row from the shard's metadata.redb.
+/// MUST be called after `Server::stop()` — redb serialises opens and the
+/// shard holds the lock while running.
+fn read_pipeline_audit_after_stop(
     metadata_path: &std::path::Path,
     memory_id: brain_core::MemoryId,
-) -> Vec<brain_metadata::tables::audit::ExtractionAudit> {
+) -> Option<ExtractorPipelineAuditEntry> {
     let db = MetadataDb::open(metadata_path).expect("open metadata after stop");
     let rtxn = db.read_txn().expect("read_txn");
-    audit_by_memory(&rtxn, memory_id, 100).expect("audit_by_memory")
+    pipeline_audit_entry(&rtxn, memory_id).expect("pipeline_audit_entry")
 }
 
 // ---------------------------------------------------------------------------
@@ -233,8 +244,9 @@ async fn encode_dispatches_builtin_extractors_and_writes_audit_rows() {
     };
     let memory2 = brain_core::MemoryId::from(memory2_bytes);
 
-    // 3. LIST confirms the pattern is still disabled (wire-side
-    //    check before we stop the server and inspect storage).
+    // 3. LIST confirms the pattern extractor is disabled. This is the
+    //    authoritative check of the per-extractor disable: the aggregate
+    //    pipeline audit row can't isolate one extractor inside a tier.
     let (_, body) = round_trip(
         &mut client,
         7,
@@ -255,51 +267,52 @@ async fn encode_dispatches_builtin_extractors_and_writes_audit_rows() {
         _ => unreachable!(),
     }
 
-    // 4. Stop the server so redb's exclusive lock releases; then
-    //    open the metadata file directly to verify the audit
-    //    rows. ENCODE's extractor dispatch is synchronous so all
-    //    rows are flushed by the time the ENCODE response
-    //    returned.
+    // 4. Extraction is asynchronous: ENCODE enqueues the memory, and the
+    //    per-shard extractor worker drains the queue on its interval (~1s),
+    //    writing the pipeline audit row. Give it time to run before stopping
+    //    the server and reading the audit table — redb serialises opens, so
+    //    the table can only be read once the shard releases its lock at
+    //    shutdown, which is why we settle here rather than poll.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     server.stop().await;
     let paths = ShardPaths::at(data_dir.path().join("0"));
     let metadata_path = paths.metadata_db();
 
-    // 4a. Memory 1 — both extractors dispatched: pattern Success
-    //     with item count, classifier Failure with the staged
-    //     "runtime not wired" reason.
-    let rows = read_audit_rows_after_stop(&metadata_path, memory_id);
-    assert_eq!(rows.len(), 2, "two extractors dispatched on memory 1");
-
-    let pattern_row = rows
-        .iter()
-        .find(|r| r.extractor_id == 1)
-        .expect("pattern extractor audit row");
-    assert_eq!(pattern_row.status, extraction_status::SUCCESS);
+    // 4a. Memory 1 — the worker ran every enabled tier and committed one
+    //     pipeline audit row. The pattern tier RAN and the deterministic
+    //     entity_mentions regex matched "Alice Cooper", so the combined item
+    //     count carries at least one entity. The classifier / llm tiers may
+    //     or may not add items depending on which models are present, so we
+    //     assert only the deterministic pattern outcome.
+    let entry = read_pipeline_audit_after_stop(&metadata_path, memory_id)
+        .expect("extractor worker must write a pipeline audit row for memory 1");
     assert!(
-        pattern_row.status_reason.contains("items produced"),
-        "got: {:?}",
-        pattern_row.status_reason
+        matches!(
+            entry.status,
+            pipeline_status::SUCCESS | pipeline_status::PARTIAL_FAILURE
+        ),
+        "memory 1 pipeline must reach a committed outcome, got status {} reason {:?}",
+        entry.status,
+        entry.status_reason,
     );
-    assert_eq!(pattern_row.schema_version, 1);
-    assert_eq!(pattern_row.memory_id(), memory_id);
-
-    let classifier_row = rows
-        .iter()
-        .find(|r| r.extractor_id == 2)
-        .expect("classifier extractor audit row");
-    assert_eq!(classifier_row.status, extraction_status::FAILURE);
+    assert_eq!(
+        entry.tier_pattern,
+        tier_status::RAN,
+        "pattern tier must have run for memory 1",
+    );
     assert!(
-        classifier_row.status_reason.contains("runtime not wired")
-            || classifier_row.status_reason.contains("not loaded"),
-        "expected runtime-not-wired hint, got: {:?}",
-        classifier_row.status_reason
+        entry.item_counts.entities >= 1,
+        "pattern extractor must surface at least one entity for memory 1, got {:?}",
+        entry.item_counts,
     );
+    assert_eq!(entry.memory_id(), memory_id);
 
-    // 4b. Memory 2 — only the classifier wrote an audit row,
-    //     because the pattern extractor was disabled mid-test.
-    let rows2 = read_audit_rows_after_stop(&metadata_path, memory2);
-    assert_eq!(rows2.len(), 1, "disabled pattern is skipped on memory 2");
-    assert_eq!(rows2[0].extractor_id, 2, "only classifier dispatched");
+    // 4b. Memory 2 — the worker still ran (the remaining tiers process every
+    //     encode), so a pipeline audit row exists. The entity_mentions
+    //     disable itself is verified at the wire level in step 3.
+    let entry2 = read_pipeline_audit_after_stop(&metadata_path, memory2)
+        .expect("extractor worker must write a pipeline audit row for memory 2");
+    assert_eq!(entry2.memory_id(), memory2);
 
     drop(data_dir);
 }

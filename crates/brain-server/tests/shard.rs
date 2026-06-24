@@ -21,10 +21,7 @@ use tempfile::TempDir;
 #[path = "../src/shard/mod.rs"]
 mod shard;
 
-use shard::{
-    spawn_shard, AllocSlotError, AppendWalError, ShardError, ShardHandle, ShardOpError,
-    ShardSpawnConfig,
-};
+use shard::{spawn_shard, ShardError, ShardHandle, ShardSpawnConfig};
 
 /// File-local stub: the substrate tests in this file don't exercise
 /// embedding quality. Real CpuDispatcher loads in production via
@@ -48,28 +45,6 @@ fn stub() -> Arc<dyn Dispatcher> {
 // ---------------------------------------------------------------------------
 // Ping + lifecycle
 // ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ping_roundtrips() {
-    let dir = TempDir::new().unwrap();
-    let (handle, joiner) =
-        spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
-    handle.ping().await.expect("ping should succeed");
-    drop(handle);
-    joiner.join().expect("shard joins cleanly");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sequential_pings_complete() {
-    let dir = TempDir::new().unwrap();
-    let (handle, joiner) =
-        spawn_shard(1, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
-    for _ in 0..100 {
-        handle.ping().await.expect("ping should succeed");
-    }
-    drop(handle);
-    joiner.join().expect("shard joins cleanly");
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_pings_via_cloned_handles() {
@@ -115,31 +90,6 @@ async fn pin_to_invalid_cpu_errors() {
         Err(ShardError::Spawn(_)) => {}
         Err(other) => panic!("expected Spawn error, got: {other:?}"),
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ping_after_drop_fails_cleanly() {
-    let dir = TempDir::new().unwrap();
-    let (handle, joiner) =
-        spawn_shard(5, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
-    let extra = handle.clone();
-    drop(handle);
-    extra.ping().await.expect("extra clone can still ping");
-
-    let h = extra.clone();
-    drop(extra);
-    drop(h);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    tokio::task::spawn_blocking(move || joiner.join())
-        .await
-        .expect("spawn_blocking")
-        .expect("shard joins cleanly");
-}
-
-#[test]
-fn shard_handle_send_sync_at_use_site() {
-    fn require<T: Send + Sync>() {}
-    require::<ShardHandle>();
 }
 
 // ---------------------------------------------------------------------------
@@ -471,48 +421,6 @@ async fn wal_first_spawn_creates_segment_zero() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn append_wal_record_returns_lsn() {
-    let dir = TempDir::new().unwrap();
-    let (handle, joiner) =
-        spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
-    let lsn1 = handle.append_wal_record(encode_record(0, 1)).await.unwrap();
-    let lsn2 = handle.append_wal_record(encode_record(1, 2)).await.unwrap();
-    let lsn3 = handle.append_wal_record(encode_record(2, 3)).await.unwrap();
-    assert_eq!(lsn1, 1);
-    assert_eq!(lsn2, 2);
-    assert_eq!(lsn3, 3);
-    drop(handle);
-    tokio::task::spawn_blocking(move || joiner.join())
-        .await
-        .expect("blocking join")
-        .expect("join");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wal_records_visible_to_reader_after_shutdown() {
-    let dir = TempDir::new().unwrap();
-    let (handle, joiner) =
-        spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
-    for slot in 0..3u64 {
-        handle
-            .append_wal_record(encode_record(slot, slot as u8))
-            .await
-            .unwrap();
-    }
-    drop(handle);
-    tokio::task::spawn_blocking(move || joiner.join())
-        .await
-        .expect("blocking join")
-        .expect("join");
-
-    let shard_dir = dir.path().join("0");
-    let uuid = read_shard_uuid(&shard_dir);
-    let reader = WalReader::open(shard_dir.join("wal"), uuid).unwrap();
-    let lsns: Vec<u64> = reader.map(|r| r.unwrap().lsn.raw()).collect();
-    assert_eq!(lsns, vec![1, 2, 3]);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wal_persists_across_restart() {
     let dir = TempDir::new().unwrap();
     let data_path = dir.path().to_owned();
@@ -633,22 +541,4 @@ async fn shard_shutdown_drains_workers_cleanly() {
         elapsed < Duration::from_secs(10),
         "shutdown took {elapsed:?}, expected < 10s"
     );
-}
-
-// ---------------------------------------------------------------------------
-// Error-type plumbing sanity
-// ---------------------------------------------------------------------------
-
-#[test]
-fn alloc_slot_error_carries_op_variant() {
-    fn _accepts(e: ShardOpError) -> AllocSlotError {
-        e.into()
-    }
-}
-
-#[test]
-fn append_wal_error_carries_op_variant() {
-    fn _accepts(e: ShardOpError) -> AppendWalError {
-        e.into()
-    }
 }

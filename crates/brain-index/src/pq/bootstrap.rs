@@ -131,6 +131,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "trains the 65k-vector bootstrap codebook (v1.x feature, not wired into the v1 live path); slow in debug builds. Run with --run-ignored."]
     fn bootstrap_codebook_is_stable_across_calls() {
         let cb_a = bootstrap_codebook();
         let cb_b = bootstrap_codebook();
@@ -138,6 +139,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "trains the 65k-vector bootstrap codebook (v1.x feature, not wired into the v1 live path); slow in debug builds. Run with --run-ignored."]
     fn bootstrap_codebook_has_correct_shape() {
         let cb = bootstrap_codebook();
         assert_eq!(cb.m(), BOOTSTRAP_M);

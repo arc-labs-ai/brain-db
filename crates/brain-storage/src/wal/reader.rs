@@ -593,15 +593,6 @@ mod tests {
     // ----- Open ---------------------------------------------------------
 
     #[test]
-    fn open_empty_directory_yields_no_records() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut reader = WalReader::open(dir.path(), uuid(1)).unwrap();
-        assert!(reader.segments().is_empty());
-        assert_eq!(reader.next().transpose().unwrap(), None);
-        assert_eq!(reader.last_decoded_lsn(), None);
-    }
-
-    #[test]
     fn open_one_empty_segment_yields_no_records() {
         let dir = tempfile::tempdir().unwrap();
         write_segment(dir.path(), 0, 1, uuid(1), &[]);

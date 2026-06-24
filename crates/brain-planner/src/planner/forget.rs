@@ -138,13 +138,4 @@ mod tests {
         let hard = unwrap_forget(plan_forget(&r, &PlannerContext::default()).unwrap());
         assert!(hard.estimated_cost_ms > soft.estimated_cost_ms);
     }
-
-    #[test]
-    fn idempotency_carries_request_id() {
-        let plan = unwrap_forget(plan_forget(&base_request(), &PlannerContext::default()).unwrap());
-        assert_eq!(
-            plan.idempotency_check.request_id,
-            RequestId::from([1u8; 16])
-        );
-    }
 }

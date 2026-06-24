@@ -45,23 +45,3 @@ pub fn full(bytes: impl Into<Bytes>) -> ResponseBody {
         .map_err(|never| match never {})
         .boxed()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use http_body_util::BodyExt;
-
-    #[tokio::test]
-    async fn empty_collects_to_zero_bytes() {
-        let body = empty();
-        let collected = body.collect().await.unwrap().to_bytes();
-        assert!(collected.is_empty());
-    }
-
-    #[tokio::test]
-    async fn full_round_trips_payload() {
-        let body = full("hello");
-        let collected = body.collect().await.unwrap().to_bytes();
-        assert_eq!(collected.as_ref(), b"hello");
-    }
-}

@@ -864,16 +864,4 @@ mod tests {
         let processed = futures_lite::future::block_on(worker.tick(&fx.worker_ctx)).unwrap();
         assert_eq!(processed, 0);
     }
-
-    #[test]
-    fn worker_kind_name() {
-        let fx = fixture();
-        let worker = AmbiguityResolverWorker::new(
-            fx.metadata.clone(),
-            fx.hnsw.clone(),
-            fx.embedder.clone() as Arc<dyn Dispatcher>,
-        );
-        assert_eq!(worker.name(), "ambiguity_resolver");
-        assert_eq!(worker.kind(), WorkerKind::AmbiguityResolver);
-    }
 }

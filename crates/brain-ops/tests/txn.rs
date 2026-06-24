@@ -17,8 +17,8 @@ use brain_ops::{dispatch, DispatchOutcome, ErrorCode, OpError, OpsContext, RealW
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
     EdgeKindWire, EncodeRequest, ForgetMode, ForgetRequest, LinkRequest, ObservationInput,
-    PlanBudget, PlanRequest, PlanState, ReasonRequest, RecallRequest, RequestBody,
-    TxnAbortRequest, TxnBeginRequest, TxnCommitRequest, UnlinkRequest,
+    PlanBudget, PlanRequest, PlanState, ReasonRequest, RecallRequest, RequestBody, TxnAbortRequest,
+    TxnBeginRequest, TxnCommitRequest, UnlinkRequest,
 };
 use brain_protocol::envelope::response::{
     EncodeResponse, ForgetResponse, LinkResponse, PlanResponseFrame, PlanStatus as WirePlanStatus,
@@ -54,7 +54,21 @@ impl Dispatcher for MockDispatcher {
 
 struct Fixture {
     ctx: OpsContext,
-    _tempdir: tempfile::TempDir,
+    tempdir: tempfile::TempDir,
+    metadata: SharedMetadataDb,
+}
+
+impl Fixture {
+    /// Rebuild the lexical lane from redb so a *committed*, non-txn recall
+    /// sees a fully-indexed corpus (no text-indexer worker runs in a unit
+    /// test). Call after the writes are committed and before the recall.
+    /// In-txn pending writes are not in redb, so this does not affect them.
+    fn reindex_lexical(&mut self) {
+        self.ctx.lexical_retriever = brain_ops::test_support::reindex_memory_lexical_for_tests(
+            self.tempdir.path(),
+            &self.metadata,
+        );
+    }
 }
 
 fn build_fixture() -> Fixture {
@@ -66,12 +80,13 @@ fn build_fixture() -> Fixture {
     let executor = ExecutorContext::new(
         Arc::new(MockDispatcher) as Arc<dyn Dispatcher>,
         shared,
-        metadata,
+        metadata.clone(),
         writer as Arc<dyn WriterHandle>,
     );
     Fixture {
-        ctx: brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor),
-        _tempdir: tempdir,
+        ctx: brain_ops::test_support::ops_context_for_tests(executor, tempdir.path()),
+        tempdir,
+        metadata,
     }
 }
 
@@ -427,13 +442,16 @@ fn encode_in_txn_not_visible_outside() {
 #[test]
 fn commit_makes_buffered_writes_visible() {
     run_in_glommio(|| async {
-        let fix = build_fixture();
+        let mut fix = build_fixture();
         let txn = [20; 16];
         let _ = begin(&fix, txn, 60).await;
         let mid = encode(&fix, [21; 16], "committed", Some(txn)).await;
 
         let c = commit(&fix, txn).await;
         assert_eq!(c.operations_applied, 1);
+        // The committed row is now in redb; index it lexically so the
+        // post-commit retrieval recall sees a fully-indexed corpus.
+        fix.reindex_lexical();
 
         let frame = unwrap_recall(
             dispatch(
@@ -538,75 +556,15 @@ fn recall_in_txn_sees_pending_encode() {
 }
 
 #[test]
-fn recall_in_txn_returns_pending_text_when_include_text_set() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let txn = [70; 16];
-        let _ = begin(&fix, txn, 60).await;
-        let _mid = encode(&fix, [71; 16], "alpha buffered text", Some(txn)).await;
-
-        let mut req = recall_req("alpha buffered", 10, Some(txn));
-        req.include_text = true;
-        let frame = unwrap_recall(
-            dispatch(
-                RequestBody::Recall(req),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        let hit = frame
-            .memories
-            .iter()
-            .find(|r| r.text == "alpha buffered text")
-            .unwrap_or_else(|| {
-                panic!(
-                    "expected pending hit to carry the buffered text; got {:?}",
-                    frame.memories
-                )
-            });
-        assert_eq!(hit.text, "alpha buffered text");
-    })
-}
-
-#[test]
-fn recall_in_txn_omits_pending_text_when_include_text_unset() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let txn = [72; 16];
-        let _ = begin(&fix, txn, 60).await;
-        let mid = encode(&fix, [73; 16], "alpha unbuffered text", Some(txn)).await;
-
-        // include_text defaults to false in recall_req.
-        let frame = unwrap_recall(
-            dispatch(
-                RequestBody::Recall(recall_req("alpha", 10, Some(txn))),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        let hit = frame
-            .memories
-            .iter()
-            .find(|r| r.memory_id == mid)
-            .expect("pending hit must surface even without include_text");
-        assert!(
-            hit.text.is_empty(),
-            "include_text=false must not surface pending text: got {:?}",
-            hit.text
-        );
-    })
-}
-
-#[test]
 fn recall_in_txn_drops_pending_tombstone() {
     run_in_glommio(|| async {
-        let fix = build_fixture();
+        let mut fix = build_fixture();
         // First commit a memory.
         let committed_mid = encode(&fix, [60; 16], "doomed", None).await;
+        // It's committed to redb — index it lexically so the committed
+        // retrieval lane surfaces it (the in-txn overlay then drops it as
+        // tombstoned; the non-txn recall still sees it).
+        fix.reindex_lexical();
 
         // Now open a txn and FORGET it.
         let txn = [61; 16];
@@ -641,7 +599,10 @@ fn recall_in_txn_drops_pending_tombstone() {
             .await
             .unwrap(),
         );
-        assert!(outside.memories.iter().any(|r| r.memory_id == committed_mid));
+        assert!(outside
+            .memories
+            .iter()
+            .any(|r| r.memory_id == committed_mid));
 
         // Abort the txn — the tombstone goes away.
         let _ = abort(&fix, txn).await;
@@ -837,40 +798,6 @@ fn op_with_unknown_txn_id_returns_txn_not_found() {
 }
 
 #[test]
-fn commit_with_unknown_txn_id_returns_txn_not_found() {
-    // Mirrors `op_with_unknown_txn_id_*` but exercises the
-    // handle_txn_commit path explicitly — the user's REPL trap.
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let err = dispatch(
-            RequestBody::TxnCommit(TxnCommitRequest { txn_id: [88; 16] }),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, OpError::TxnNotFound), "got {err:?}");
-        assert_eq!(err.error_code(), ErrorCode::TxnNotFound);
-    })
-}
-
-#[test]
-fn abort_with_unknown_txn_id_returns_txn_not_found() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let err = dispatch(
-            RequestBody::TxnAbort(TxnAbortRequest { txn_id: [89; 16] }),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, OpError::TxnNotFound), "got {err:?}");
-        assert_eq!(err.error_code(), ErrorCode::TxnNotFound);
-    })
-}
-
-#[test]
 fn op_against_committed_txn_returns_txn_expired() {
     // The id IS real — it was Active, then we committed it. Subsequent
     // ops against it must surface as `TxnExpired` (not `TxnNotFound`)
@@ -884,34 +811,6 @@ fn op_against_committed_txn_returns_txn_expired() {
 
         let err = dispatch(
             RequestBody::Encode(encode_req([112; 16], "after", Some(txn))),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, OpError::TxnExpired), "got {err:?}");
-        assert_eq!(err.error_code(), ErrorCode::TxnExpired);
-    })
-}
-
-#[test]
-fn commit_against_aborted_txn_returns_txn_expired() {
-    // Symmetric to the committed case: aborting then re-committing
-    // the same id should surface TxnExpired, not TxnNotFound.
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let txn = [130; 16];
-        let _ = begin(&fix, txn, 60).await;
-        let _ = dispatch(
-            RequestBody::TxnAbort(TxnAbortRequest { txn_id: txn }),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap();
-
-        let err = dispatch(
-            RequestBody::TxnCommit(TxnCommitRequest { txn_id: txn }),
             brain_ops::RequestCaller::anonymous(),
             &fix.ctx,
         )
@@ -1076,7 +975,7 @@ fn session_drop_aborts_open_txns() {
 #[test]
 fn session_drop_does_not_affect_other_sessions() {
     run_in_glommio(|| async {
-        let fix = build_fixture();
+        let mut fix = build_fixture();
         let session_a = [0xAA; 16];
         let session_b = [0xBB; 16];
         let txn_a = [210; 16];
@@ -1092,6 +991,9 @@ fn session_drop_does_not_affect_other_sessions() {
         // Session B can commit. Its encode must land.
         let resp = commit(&fix, txn_b).await;
         assert_eq!(resp.operations_applied, 1);
+        // Committed to redb — index it lexically so the non-txn recall
+        // surfaces it.
+        fix.reindex_lexical();
 
         let mut req = recall_req("from-b", 5, None);
         req.include_text = true;

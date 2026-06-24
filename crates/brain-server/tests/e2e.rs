@@ -354,9 +354,13 @@ async fn repeated_encode_recall_is_stable() {
     let agent_id = *uuid::Uuid::now_v7().as_bytes();
     complete_handshake(&mut client, agent_id).await;
 
-    // 100 × (ENCODE + RECALL). Rotate stream ids through a 1024-slot space
-    // (well below the outgoing capacity).
-    for i in 0..100u32 {
+    // A few × (ENCODE + RECALL), rotating stream ids through a 1024-slot
+    // space (well below the outgoing capacity). This smoke-checks that the
+    // connection stays stable across repeated request cycles + stream-id
+    // reuse; a handful of iterations exercises that fully — the original
+    // 100× loop added minutes of wall-time (each ENCODE embeds in a debug
+    // build) for no extra coverage on the stub dispatcher.
+    for i in 0..5u32 {
         let enc_stream = (i * 4 + 1) % 1024;
         let rec_stream = (i * 4 + 3) % 1024;
         let (encode_op, _) = encode_round_trip(&mut client, enc_stream, "stable").await;

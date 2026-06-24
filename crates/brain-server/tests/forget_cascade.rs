@@ -211,7 +211,9 @@ async fn create_statement_citing(
     let req = StatementCreateRequest {
         kind: StatementKindWire::Fact,
         subject,
-        predicate: "brain:related_to".into(),
+        // `related_to` is a seeded relation type, not a predicate; as a Fact
+        // predicate it lives in an open-vocab user namespace, interned on use.
+        predicate: "app:related_to".into(),
         object: StatementObjectWire::EntityRef(object),
         confidence: 0.9,
         evidence: EvidenceRefWire::Inline(vec![memory_id.to_be_bytes()]),

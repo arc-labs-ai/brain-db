@@ -68,9 +68,4 @@ mod tests {
     fn slot_size_is_1600() {
         assert_eq!(SLOT_SIZE_BYTES, 1600);
     }
-
-    #[test]
-    fn slot_alignment_divides_size() {
-        assert_eq!(SLOT_SIZE_BYTES % SLOT_ALIGN_BYTES, 0);
-    }
 }

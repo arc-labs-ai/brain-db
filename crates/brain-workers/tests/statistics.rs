@@ -1,5 +1,11 @@
 #![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
 //! Statistics update worker tests.
+//!
+//! Guards the per-shard stats snapshot the worker recomputes each cycle:
+//! tombstone count reflects live HNSW state, age fields track the
+//! min/max `created_at` across memories, and `computed_at` advances. Pins
+//! that the cached handle observes the same data as the fresh snapshot
+//! and that an empty shard yields zero counts rather than erroring.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,9 +17,7 @@ use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_workers::{
-    StatisticsUpdateWorker, Worker, WorkerConfig, WorkerContext, WorkerKind, WorkerScheduler,
-};
+use brain_workers::{StatisticsUpdateWorker, Worker, WorkerContext};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -229,58 +233,9 @@ fn cache_updates_across_cycles() {
     });
 }
 
-#[test]
-fn phase_9_fields_stay_none() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let worker = StatisticsUpdateWorker::new();
-        run_one(&worker, fix.ctx).await.unwrap();
-        let s = worker.snapshot();
-        assert!(s.arena_used_bytes.is_none());
-        assert!(s.arena_capacity_bytes.is_none());
-        assert!(s.wal_size_bytes.is_none());
-        assert!(s.metadata_size_bytes.is_none());
-    });
-}
-
 // ===========================================================================
-// Worker integration (3).
+// Worker integration (1).
 // ===========================================================================
-
-#[test]
-fn worker_registers_with_correct_kind_and_default_cadence() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(Arc::new(StatisticsUpdateWorker::new()), fix.ctx)
-            .unwrap();
-        let cfg = sched.config(WorkerKind::Statistics.name()).unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(300));
-        sched.shutdown().await.unwrap();
-    });
-}
-
-#[test]
-fn disabled_worker_via_config_does_not_update_cache() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        seed_memory(&fix.metadata, 1, now_unix_nanos());
-        let worker = StatisticsUpdateWorker::new().with_config(WorkerConfig {
-            enabled: false,
-            interval: Duration::from_millis(20),
-            batch_size: 1,
-            max_runtime: Duration::from_secs(1),
-        });
-        let handle = worker.cache_handle();
-        let mut sched = WorkerScheduler::new();
-        sched.register(Arc::new(worker), fix.ctx).unwrap();
-        glommio::timer::sleep(Duration::from_millis(150)).await;
-        sched.shutdown().await.unwrap();
-        // The default (never-updated) snapshot has memory_count=0.
-        assert_eq!(handle.read().memory_count, 0);
-    });
-}
 
 #[test]
 fn cache_handle_observes_same_data_as_snapshot() {

@@ -396,12 +396,14 @@ impl SnapshotSource for ShardSnapshotSource {
                     .metadata
                     .read_txn()
                     .map_err(|e| SnapshotSourceError::Failed(format!("metadata read_txn: {e}")))?;
-                brain_storage::reflink_or_copy(&self.metadata_path, &metadata_dst).map_err(|e| {
-                    SnapshotSourceError::Failed(format!(
-                        "reflink metadata.redb → {}: {e}",
-                        metadata_dst.display()
-                    ))
-                })?;
+                brain_storage::reflink_or_copy(&self.metadata_path, &metadata_dst).map_err(
+                    |e| {
+                        SnapshotSourceError::Failed(format!(
+                            "reflink metadata.redb → {}: {e}",
+                            metadata_dst.display()
+                        ))
+                    },
+                )?;
             }
 
             // 6a. Copy shard.uuid so the bundle is self-describing and a
@@ -484,10 +486,9 @@ impl SnapshotSource for ShardSnapshotSource {
             //    triple is intentionally excluded: it's rebuilt on
             //    restore, never trusted from the bundle.
             let mut files = std::collections::BTreeMap::new();
-            for rel in
-                std::iter::once("arena.bin".to_string())
-                    .chain(std::iter::once("metadata.redb".to_string()))
-                    .chain(wal_segment_rel_paths.iter().cloned())
+            for rel in std::iter::once("arena.bin".to_string())
+                .chain(std::iter::once("metadata.redb".to_string()))
+                .chain(wal_segment_rel_paths.iter().cloned())
             {
                 let path = dir.join(&rel);
                 let size = std::fs::metadata(&path)

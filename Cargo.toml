@@ -215,7 +215,15 @@ tempfile = "3"
 
 [profile.dev]
 opt-level = 0
-debug = true
+# Line-tables only, not full debuginfo. `cargo test`/`nextest` link the heavy
+# integration-test binaries (e.g. brain-server's, ~250 dep rlibs) under this
+# profile; full debuginfo makes a single `ld` invocation exceed the dev
+# container's ~8 GiB ceiling and the linker is OOM-killed (signal 9), so the
+# test suite can't even build. Line tables keep panic backtraces with
+# file:line while shrinking the link enough to fit. For an interactive
+# debugging session that needs full locals, override transiently with
+# `RUSTFLAGS="-C debuginfo=2"` or bump the container's RAM.
+debug = "line-tables-only"
 
 [profile.release]
 opt-level = 3

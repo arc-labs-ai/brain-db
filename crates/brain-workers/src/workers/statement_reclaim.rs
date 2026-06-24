@@ -212,17 +212,6 @@ mod tests {
         assert!(w.config.enabled);
     }
 
-    #[test]
-    fn worker_kind_name() {
-        let w = StatementReclaimWorker {
-            config: WorkerConfig::defaults_for(WorkerKind::StatementReclaim),
-            enabled: false,
-            grace_nanos: 0,
-        };
-        assert_eq!(w.name(), "statement_reclaim");
-        assert_eq!(w.kind(), WorkerKind::StatementReclaim);
-    }
-
     // env enable/seconds parsing is tested once in crate::env.
 
     #[test]

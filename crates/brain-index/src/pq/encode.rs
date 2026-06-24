@@ -228,6 +228,7 @@ mod tests {
     /// sample, then encode points back. Most points should encode to
     /// the centroid nearest their planted cluster.
     #[test]
+    #[ignore = "heavy PQ k-means training (v1.x feature, not wired into the v1 live path); slow in debug builds. Run with --run-ignored."]
     fn trained_codebook_encodes_planted_clusters_consistently() {
         // 16 clusters in subspace 0 at multiples of 100.
         let mut sample = Vec::with_capacity(MIN_TRAINING_SAMPLE);

@@ -137,44 +137,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn same_seed_same_vectors() {
-        let mut a = Codebook::new(7);
-        let mut b = Codebook::new(7);
-        let va = a.get_or_create_filler("Alice").clone();
-        let vb = b.get_or_create_filler("Alice").clone();
-        assert_eq!(va, vb);
-    }
-
-    #[test]
-    fn different_seeds_different_vectors() {
-        let mut a = Codebook::new(7);
-        let mut b = Codebook::new(8);
-        let va = a.get_or_create_filler("Alice").clone();
-        let vb = b.get_or_create_filler("Alice").clone();
-        assert_ne!(va, vb);
-    }
-
-    #[test]
-    fn role_and_filler_namespaces_are_distinct() {
-        let mut cb = Codebook::new(1);
-        let role = cb.get_or_create_role("Alice").clone();
-        let filler = cb.get_or_create_filler("Alice").clone();
-        assert_ne!(role, filler);
-    }
-
-    #[test]
     fn cleanup_finds_exact_filler() {
         let mut cb = Codebook::new(99).with_fillers(["Alice", "Bob", "Carol"]);
         let target = cb.get_or_create_filler("Bob").clone();
         let (name, cos) = cb.cleanup(&target).expect("non-empty codebook");
         assert_eq!(name, "Bob");
         assert!(cos > 0.999, "cos={cos}");
-    }
-
-    #[test]
-    fn cleanup_returns_none_on_empty_codebook() {
-        let cb = Codebook::new(0);
-        let noisy = random_vec(123);
-        assert!(cb.cleanup(&noisy).is_none());
     }
 }

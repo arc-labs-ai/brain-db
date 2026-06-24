@@ -125,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn normalises_crlf() {
+    fn crlf_data_normalises_to_one_data_line_per_logical_line() {
         let e = SseEvent::new().with_data("a\r\nb\r\nc");
         let b = encode(&e);
         assert_eq!(
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_only() {
+    fn retry_only_event_emits_empty_data_and_retry_field() {
         let e = SseEvent::new().with_retry(Duration::from_secs(3));
         let b = encode(&e);
         assert_eq!(std::str::from_utf8(&b).unwrap(), "data: \nretry: 3000\n\n");

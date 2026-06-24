@@ -61,7 +61,6 @@ use brain_extractors::{
     EntityMention, ExtractedItem, ExtractionContext, ExtractionFailureClass, ExtractionResult,
     ExtractionStatus, Extractor, ExtractorContext, ExtractorRegistry, StatementMention,
 };
-use brain_metadata::{hype_has_vectors, pipeline_has_extracted};
 use brain_metadata::relation::types::relation_type_intern_or_get;
 use brain_metadata::schema::predicate::predicate_intern_or_get;
 use brain_metadata::tables::edge::{
@@ -73,6 +72,7 @@ use brain_metadata::tables::extractor_audit::{
 };
 use brain_metadata::tables::predicate::{PREDICATES_TABLE, PREDICATE_EMBEDDINGS_TABLE};
 use brain_metadata::tables::relation::RELATION_TYPE_EMBEDDINGS_TABLE;
+use brain_metadata::{hype_has_vectors, pipeline_has_extracted};
 use brain_ops::apply::encode_helpers::{
     fetch_extractor_context, ExtractorContextFetchConfig, DEFAULT_EXTRACTOR_CONTEXT_TOP_M,
 };
@@ -224,8 +224,9 @@ pub struct ExtractorWorker {
     /// in the ambiguous band. `None` means the resolver keeps its
     /// existing behaviour (Create + enqueue merge proposal) for every
     /// partial match. Production shards stamp this with the
-    /// `EntityDisambiguator` built from the shared LLM client when
-    /// `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are present at startup.
+    /// `EntityDisambiguator` built from the shared LLM client when the
+    /// single credential (`[llm] api_key` / `BRAIN__LLM__API_KEY`) is
+    /// present at startup.
     entity_disambiguator: Option<Arc<EntityDisambiguator>>,
     /// Optional write-time HyPE generator. `None` (the default) skips
     /// hypothetical-question generation entirely — substrate-only
@@ -1088,7 +1089,9 @@ async fn run_hype_refresh_sweep(worker: &ExtractorWorker, ctx: &WorkerContext) {
             last_examined = memory_id.to_be_bytes();
             continue;
         }
-        let outcome = hype.refresh_for(*memory_id, text.as_str(), &neighborhood).await;
+        let outcome = hype
+            .refresh_for(*memory_id, text.as_str(), &neighborhood)
+            .await;
         if outcome.cost_micro_usd > 0 {
             let mut spend = worker.llm_spend.lock();
             *spend = spend.saturating_add(outcome.cost_micro_usd);
@@ -2124,7 +2127,8 @@ async fn apply_outcome(
                             // may mint the type if absent (harmless throwaway) — then
                             // there's simply nothing to retire.
                             if let StatementObject::Entity(to_id) = &object {
-                                if let Ok(rt) = relation_type_intern_or_get(&wtxn, ns, name, 0, now) {
+                                if let Ok(rt) = relation_type_intern_or_get(&wtxn, ns, name, 0, now)
+                                {
                                     if let Ok(rels) = brain_metadata::relation_list_from(
                                         &snap,
                                         subject,
@@ -2134,7 +2138,8 @@ async fn apply_outcome(
                                             limit: 0,
                                         },
                                     ) {
-                                        for r in rels.into_iter().filter(|r| r.to_entity == *to_id) {
+                                        for r in rels.into_iter().filter(|r| r.to_entity == *to_id)
+                                        {
                                             if brain_metadata::relation_tombstone(&wtxn, r.id, now)
                                                 .is_ok()
                                             {
@@ -2188,15 +2193,23 @@ async fn apply_outcome(
                         kind = StatementKind::Fact;
                     }
 
-                    // Entity↔entity routing: ANY triple whose object is itself an
-                    // entity is a graph EDGE, not a property fact — it must live in
-                    // the relations table so it is queryable from BOTH endpoints
-                    // (reverse-edge reads like "who founded NeuraCorp"). Gating this
-                    // on `kind == Relation` was a bug: a Fact/Event with an entity
-                    // object (`founded`, `acquired_by`) stayed a subject-keyed
-                    // statement, invisible from the object node. Only value-object
-                    // statements (`favorite_color` "blue") keep the statement path.
-                    if let StatementObject::Entity(to_id) = object {
+                    // Axis-faithful entity-object routing (spec §02 data model).
+                    // `StatementObject::Entity` is a first-class statement object:
+                    // `manages`, `is_a`, `met_with`, `traveled_to` are entity-object
+                    // *statements*, read from the subject. Only a `kind=Relation`
+                    // triple is a typed graph EDGE that belongs in the relations
+                    // table (queryable from both endpoints, cardinality-enforced).
+                    // A Fact / Event / Preference with an entity object stays a
+                    // statement — it falls through to `statement_create` below,
+                    // persisted with its `StatementObject::Entity`. The emitted
+                    // kind, not the object's shape, decides the axis.
+                    let entity_link = match object {
+                        StatementObject::Entity(to_id) if kind == StatementKind::Relation => {
+                            Some(to_id)
+                        }
+                        _ => None,
+                    };
+                    if let Some(to_id) = entity_link {
                         let rt = match relation_type_intern_or_get(&wtxn, ns, name, 0, now) {
                             Ok(rt) => rt,
                             Err(e) => {
@@ -2834,7 +2847,9 @@ fn resolve_statement_object(
             return Ok(StatementObject::Entity(id));
         }
     }
-    Ok(StatementObject::Value(StatementValue::Text(text.to_string())))
+    Ok(StatementObject::Value(StatementValue::Text(
+        text.to_string(),
+    )))
 }
 
 /// Default entity type for a coined statement subject the classifier never
@@ -3873,7 +3888,12 @@ mod tests {
                 stmt("李明", "brain:作用于", "warfarin", StatementKind::Fact),
                 // Entity-subject Event with no event time — must downgrade to
                 // Fact and persist (not drop).
-                stmt("李明", "brain:traveled_to", "Shanghai", StatementKind::Event),
+                stmt(
+                    "李明",
+                    "brain:traveled_to",
+                    "Shanghai",
+                    StatementKind::Event,
+                ),
                 // Pronoun subject — un-anchorable; skipped + counted, must not
                 // abort the others.
                 stmt("they", "brain:likes", "noise", StatementKind::Fact),
@@ -3903,7 +3923,10 @@ mod tests {
         // Two entity-subject statements landed (作用于 + traveled_to-as-Fact);
         // the pronoun triple did not.
         assert_eq!(applied.counts.statements, 2, "both real facts must persist");
-        assert_eq!(applied.counts.relations, 1, "object-only relation must persist");
+        assert_eq!(
+            applied.counts.relations, 1,
+            "object-only relation must persist"
+        );
 
         let (zuoyongyu, traveled_to, collaborates) = {
             let wtxn = metadata.write_txn().unwrap();
@@ -3941,7 +3964,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(trav.len(), 1, "mis-kinded Event must persist as Fact, not drop");
+        assert_eq!(
+            trav.len(),
+            1,
+            "mis-kinded Event must persist as Fact, not drop"
+        );
         assert_eq!(
             trav[0].kind,
             StatementKind::Fact,
@@ -4078,9 +4105,21 @@ mod tests {
                 // Entity object (Tokyo) the LLM flags but that wasn't separately
                 // surfaced → minted + linked as an Entity object. Also an Event
                 // WITH a resolved time → persists as an Event carrying event_at.
-                stmt("brain:traveled_to", "Tokyo", true, StatementKind::Event, Some(T)),
+                stmt(
+                    "brain:traveled_to",
+                    "Tokyo",
+                    true,
+                    StatementKind::Event,
+                    Some(T),
+                ),
                 // Literal object → stays a text Value, never minted as an entity.
-                stmt("brain:favorite_color", "blue", false, StatementKind::Fact, None),
+                stmt(
+                    "brain:favorite_color",
+                    "blue",
+                    false,
+                    StatementKind::Fact,
+                    None,
+                ),
                 // Event WITHOUT a time → downgraded to Fact (still persists).
                 stmt("brain:visited", "Berlin", true, StatementKind::Event, None),
             ],
@@ -4118,13 +4157,21 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(v.len(), 1, "expected exactly one statement for the predicate");
+            assert_eq!(
+                v.len(),
+                1,
+                "expected exactly one statement for the predicate"
+            );
             v.into_iter().next().unwrap()
         };
 
         // #2: Event with a time persists as an Event carrying event_at.
         let trav = one(traveled_to);
-        assert_eq!(trav.kind, StatementKind::Event, "kept as Event (has a time)");
+        assert_eq!(
+            trav.kind,
+            StatementKind::Event,
+            "kept as Event (has a time)"
+        );
         assert_eq!(trav.event_at_unix_nanos, Some(T), "event_at plumbed");
         // #1: the flagged entity object (Tokyo) is minted + linked as an Entity.
         assert!(
@@ -4156,7 +4203,11 @@ mod tests {
         // #2: an Event with no time downgrades to Fact but still persists (and
         // its flagged entity object is still minted/linked).
         let vis = one(visited);
-        assert_eq!(vis.kind, StatementKind::Fact, "timeless Event downgraded to Fact");
+        assert_eq!(
+            vis.kind,
+            StatementKind::Fact,
+            "timeless Event downgraded to Fact"
+        );
         assert_eq!(vis.event_at_unix_nanos, None);
         assert!(
             matches!(vis.object, StatementObject::Entity(_)),

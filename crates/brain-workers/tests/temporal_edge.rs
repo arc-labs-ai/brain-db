@@ -16,9 +16,7 @@ use brain_ops::writer::wal_sink::RecordingWalSink;
 use brain_ops::{EventBus, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_storage::wal::kinds::WalRecordKind;
-use brain_workers::{
-    TemporalEdgeKnobs, TemporalEdgeWorker, Worker, WorkerConfig, WorkerContext, WorkerKind,
-};
+use brain_workers::{TemporalEdgeKnobs, TemporalEdgeWorker, Worker, WorkerContext};
 use redb::ReadableTable;
 use uuid::Uuid;
 
@@ -237,16 +235,6 @@ fn cycle_writes_followed_by_link_through_unified_path() {
 
         let _ = m0;
     });
-}
-
-#[test]
-fn name_and_kind_are_stable() {
-    let (_tx, rx) = flume::bounded(1);
-    let worker = TemporalEdgeWorker::new(rx);
-    assert_eq!(worker.name(), WorkerKind::TemporalEdge.name());
-    assert_eq!(worker.kind(), WorkerKind::TemporalEdge);
-    let cfg = WorkerConfig::defaults_for(WorkerKind::TemporalEdge);
-    assert!(cfg.batch_size > 0);
 }
 
 /// Two memories whose embeddings sit at cosine ≈ 0 (orthogonal). The

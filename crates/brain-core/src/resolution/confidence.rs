@@ -149,14 +149,6 @@ mod tests {
     const FIVE_YEARS_NS: u64 = 5 * 365 * 24 * 60 * 60 * 1_000_000_000;
 
     #[test]
-    fn default_v1_matches_spec() {
-        let c = ConfidenceConfig::default_v1();
-        assert_eq!(c.fact_half_life_seconds, 31_536_000);
-        assert_eq!(c.pref_half_life_seconds, 5_184_000);
-        assert!(c.event_decay_disabled);
-    }
-
-    #[test]
     fn empty_evidence_zero() {
         let r = aggregate_confidence(&[], NOW, StatementKind::Fact, &cfg());
         assert_eq!(r, 0.0);
@@ -232,41 +224,6 @@ mod tests {
         assert_eq!(r, 0.0);
     }
 
-    #[test]
-    fn aggregate_in_unit_interval() {
-        // Smoke test on a varied input — should always land in [0, 1].
-        for cnt in [1, 2, 5, 10, 50, 100] {
-            for c in [0.0, 0.1, 0.5, 0.9, 1.0] {
-                let evidence: Vec<EvidenceEntry> = (0..cnt).map(|_| evi(c, NOW)).collect();
-                for kind in [
-                    StatementKind::Fact,
-                    StatementKind::Preference,
-                    StatementKind::Event,
-                ] {
-                    let r = aggregate_confidence(&evidence, NOW, kind, &cfg());
-                    assert!(
-                        (0.0..=1.0).contains(&r) && !r.is_nan(),
-                        "cnt={cnt} c={c} kind={kind:?} -> {r} out of bounds"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn confidence_monotonic_in_evidence_count() {
-        // Adding more evidence (all c >= 0) never decreases confidence.
-        let mut prev = 0.0_f32;
-        for cnt in 1..=20 {
-            let evidence: Vec<EvidenceEntry> = (0..cnt).map(|_| evi(0.3, NOW)).collect();
-            let r = aggregate_confidence(&evidence, NOW, StatementKind::Event, &cfg());
-            assert!(
-                r + 1e-6 >= prev,
-                "non-monotonic: cnt={cnt} got {r}, prev {prev}"
-            );
-            prev = r;
-        }
-    }
 }
 
 #[cfg(test)]

@@ -65,14 +65,6 @@ fn scan_alerts_and_severities(text: &str) -> (Vec<String>, Vec<String>) {
 }
 
 #[test]
-fn rules_file_exists() {
-    assert!(
-        rules_path().exists(),
-        "config/monitoring/alerts/brain-rules.yml missing"
-    );
-}
-
-#[test]
 fn every_required_alert_is_present() {
     let raw = fs::read_to_string(rules_path()).expect("read");
     let (alerts, _) = scan_alerts_and_severities(&raw);

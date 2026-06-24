@@ -47,11 +47,11 @@ impl Provider {
 
 /// Routes a `model` field to one of the configured clients.
 ///
-/// Built at shard startup: the server reads env vars
-/// (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) and constructs the
-/// matching clients; missing keys produce `None` slots. The
-/// extractor materializer asks the router for a client at
-/// `materialize_llm_extractor` time.
+/// Built at shard startup from the single resolved credential
+/// (`[llm] api_key` / `BRAIN__LLM__API_KEY`); the provider is derived
+/// from the model id, so exactly one client slot is populated and a
+/// missing key produces all-`None` slots. The extractor materializer
+/// asks the router for a client at `materialize_llm_extractor` time.
 #[derive(Default)]
 pub struct ModelRouter {
     anthropic: Option<Arc<dyn LlmClient>>,

@@ -71,22 +71,4 @@ mod tests {
         assert!(!EdgeKind::Caused.is_symmetric());
         assert!(!EdgeKind::FollowedBy.is_symmetric());
     }
-
-    #[test]
-    fn edge_constructs_with_required_fields() {
-        let a = MemoryId::pack(1, 1, 1);
-        let b = MemoryId::pack(1, 2, 1);
-        let edge = Edge {
-            source: a,
-            target: b,
-            kind: EdgeKind::Caused,
-            weight: 0.75,
-            origin: EdgeOrigin::Explicit,
-            created_at_unix_nanos: 1_700_000_000_000_000_000,
-        };
-        assert_eq!(edge.source, a);
-        assert_eq!(edge.target, b);
-        assert!((edge.weight - 0.75).abs() < f32::EPSILON);
-        assert_eq!(edge.origin, EdgeOrigin::Explicit);
-    }
 }

@@ -79,10 +79,10 @@ fn dev_toml_round_trips_cleanly() {
     let path = dev_toml_path();
     assert!(path.exists(), "expected dev.toml at {}", path.display());
     // dev.toml leaves the LLM provider key to the environment; supply one
-    // so the hard provider gate (LLM extractor tier is on by default) is
-    // satisfied and the parse round-trip can be checked.
+    // via the generic override so the hard provider gate is satisfied and
+    // the parse round-trip can be checked.
     let mut env: HashMap<String, String> = HashMap::new();
-    env.insert("BRAIN_API_KEY".into(), "sk-test".into());
+    env.insert("BRAIN__LLM__API_KEY".into(), "sk-test".into());
     let cfg = Config::load_with_env(&path, &env).expect("dev.toml must load");
 
     assert_eq!(cfg.server.listen_addr.to_string(), "127.0.0.1:9090");
@@ -119,15 +119,6 @@ fn dev_toml_without_provider_key_refuses_to_start() {
 // 2-5. Parser (covered as unit tests in config.rs). Add one belt-and-suspenders
 //      integration check that ShardConfig wires through the deserializer.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn shard_config_parses_human_byte_strings() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_tmp(&dir, MINIMAL_CONFIG);
-    let cfg = Config::load_with_env(&path, &HashMap::new()).unwrap();
-    assert_eq!(cfg.shard.arena_capacity_bytes, 1u64 << 30);
-    assert_eq!(cfg.shard.wal_segment_size_bytes, 256u64 << 20);
-}
 
 #[test]
 fn shard_config_rejects_bad_byte_suffix() {

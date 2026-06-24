@@ -263,7 +263,7 @@ async fn complete_handshake(
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn handshake_completes() {
+async fn handshake_binds_client_to_shard_and_echoes_agent_id() {
     let server = start_with_shards(1, ConnectionLimits::default()).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
     let agent_id = *uuid::Uuid::now_v7().as_bytes();

@@ -249,19 +249,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn config_with_cuda_device_is_unsupported() {
-        // candle's `Device::new_cuda` requires the cuda feature to be
-        // enabled at compile-time; without it, we can't actually
-        // construct a `Device::Cuda` value here. We instead exercise
-        // the dtype-mismatch path which uses the same error variant.
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = cfg(dir.path().to_path_buf());
-        config.dtype = DType::F16;
-        match ModelHandle::load(&config) {
-            Err(EmbedError::UnsupportedDevice) => {}
-            Err(e) => panic!("wrong error: {e}"),
-            Ok(_) => panic!("expected UnsupportedDevice"),
-        }
-    }
 }

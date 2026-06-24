@@ -106,7 +106,6 @@ channel_capacity     = 1024
 # Phase E: per-shard ExtractorWorker. See dev.toml for full field
 # documentation.
 [workers.extractor]
-enabled                          = true
 interval_ms                      = 1000
 drain_per_cycle                  = 32
 llm_budget_per_cycle_micro_usd   = 50000

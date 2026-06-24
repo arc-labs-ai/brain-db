@@ -534,6 +534,46 @@ fn multiple_workers_run_independently() {
     });
 }
 
+// ===========================================================================
+// Default cadence table (1 test).
+//
+// Pins each WorkerKind's default interval + enabled flag in one place
+// so the per-worker test files don't each re-assert their own cadence.
+// ===========================================================================
+
+#[test]
+fn default_cadence_table_is_pinned() {
+    let cases: &[(WorkerKind, Duration, bool)] = &[
+        (WorkerKind::Decay, Duration::from_secs(3600), true),
+        (WorkerKind::AccessBoost, Duration::from_secs(10), true),
+        (WorkerKind::Consolidation, Duration::from_secs(300), true),
+        (WorkerKind::HnswMaintenance, Duration::from_secs(300), true),
+        (WorkerKind::IdempotencyCleanup, Duration::from_secs(3600), true),
+        (WorkerKind::SlotReclamation, Duration::from_secs(600), true),
+        (WorkerKind::WalRetention, Duration::from_secs(60), true),
+        (WorkerKind::EdgeScrub, Duration::from_secs(1800), true),
+        (WorkerKind::CounterReconcile, Duration::from_secs(3600), true),
+        (WorkerKind::Statistics, Duration::from_secs(300), true),
+        (WorkerKind::EmbedderCacheEvict, Duration::from_secs(60), true),
+        (WorkerKind::Snapshot, Duration::from_secs(3600), true),
+    ];
+    for (kind, interval, enabled) in cases {
+        let cfg = WorkerConfig::defaults_for(*kind);
+        assert_eq!(
+            cfg.interval,
+            *interval,
+            "{} default interval drifted",
+            kind.name()
+        );
+        assert_eq!(
+            cfg.enabled,
+            *enabled,
+            "{} default enabled flag drifted",
+            kind.name()
+        );
+    }
+}
+
 fn glommio_run<F, Fut, T>(f: F) -> T
 where
     F: FnOnce() -> Fut + Send + 'static,

@@ -54,6 +54,25 @@ pub fn tantivy_for_tests(dir: &Path) -> Arc<dyn LexicalRetriever> {
     )
 }
 
+/// Rebuild the memory-text lexical index from redb and return a fresh
+/// retriever over it. Fixtures encode through the writer (redb + HNSW)
+/// but no background text-indexer runs in a unit test, so the lexical
+/// lane would otherwise stay empty. Production keeps it populated (the
+/// indexer worker, or `rebuild_memory_text` on cold start), and the read
+/// path's structural abstention relies on that: a stored memory's own
+/// words confirm it lexically, so a genuine hit is never dropped as
+/// unanchored semantic noise. Call this after seeding and before recall
+/// so the fixture matches a fully-indexed shard.
+#[must_use]
+pub fn reindex_memory_lexical_for_tests(
+    dir: &Path,
+    metadata: &MetadataDb,
+) -> Arc<dyn LexicalRetriever> {
+    crate::index::text_indexer::rebuild_memory_text(dir, metadata)
+        .expect("rebuild_memory_text on a tempdir must succeed");
+    tantivy_for_tests(dir)
+}
+
 /// Build a real `SemanticRetriever` over the in-memory HNSW. The
 /// statement-side HNSW is left `None` — the integration tests that
 /// exercise statement-semantic paths build the index themselves.

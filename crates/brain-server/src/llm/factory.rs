@@ -36,8 +36,8 @@ pub(crate) enum BuildSummarizerError {
     )]
     OllamaFeatureMissing,
     #[error(
-        "summarizer.backend = \"openai\" requires an OpenAI key: set \
-         summarizer.openai_api_key in config or the OPENAI_API_KEY environment variable"
+        "summarizer.backend = \"openai\" requires the shared LLM key: set \
+         BRAIN__LLM__API_KEY in the environment or `[llm] api_key` in the config"
     )]
     OpenAiKeyMissing,
     #[error("summarizer bridge runtime initialisation failed: {0}")]
@@ -58,18 +58,15 @@ pub(crate) fn build_summarizer(cfg: &Config) -> Result<Arc<dyn Summarizer>, Buil
 
 #[cfg(feature = "summarizer-openai")]
 fn build_openai(cfg: &Config) -> Result<Arc<dyn Summarizer>, BuildSummarizerError> {
-    // Same resolution as the LLM extractor tier: env-first
-    // (`OPENAI_API_KEY`), config-fallback (`summarizer.openai_api_key`).
-    // Empty strings count as unset on both sides.
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .ok()
+    // The summarizer shares the single LLM credential like every other
+    // consumer: `[llm] api_key`, into which the generic
+    // `BRAIN__LLM__API_KEY` override has already folded. Empty strings
+    // count as unset.
+    let api_key = cfg
+        .llm
+        .api_key
+        .clone()
         .filter(|v| !v.is_empty())
-        .or_else(|| {
-            cfg.summarizer
-                .openai_api_key
-                .clone()
-                .filter(|v| !v.is_empty())
-        })
         .ok_or(BuildSummarizerError::OpenAiKeyMissing)?;
     let bridge = crate::llm::bridge::SummarizerBridge::new(Duration::from_secs(u64::from(
         cfg.summarizer.request_timeout_sec,

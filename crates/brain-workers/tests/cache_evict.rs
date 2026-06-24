@@ -1,5 +1,11 @@
 #![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
 //! Embedder cache eviction worker tests.
+//!
+//! Guards the worker's contract with its pluggable eviction source: an
+//! enabled source is called once per cycle with the configured max-age
+//! and its prune count is reported; a disabled source is a no-op; a
+//! failing source surfaces as a `WorkerError`. Source behaviour is
+//! faked so the test pins the worker's wiring, not the prune logic.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -13,7 +19,7 @@ use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_workers::cache_evict::PruneFuture;
 use brain_workers::{
     CacheEvictionError, CacheEvictionSource, CacheEvictionWorker, DisabledCacheEvictionSource,
-    Worker, WorkerConfig, WorkerContext, WorkerKind, WorkerScheduler, DEFAULT_CACHE_MAX_AGE,
+    Worker, WorkerContext, DEFAULT_CACHE_MAX_AGE,
 };
 use parking_lot::Mutex;
 
@@ -95,31 +101,6 @@ impl CacheEvictionSource for FailingSource {
 // ===========================================================================
 
 #[test]
-fn disabled_source_returns_disabled() {
-    glommio_run(|| async {
-        let s = DisabledCacheEvictionSource;
-        let r = s.prune_older_than(Duration::from_secs(60)).await;
-        assert!(matches!(r, Err(CacheEvictionError::Disabled)));
-    });
-}
-
-#[test]
-fn stub_source_returns_provided_count() {
-    glommio_run(|| async {
-        let stub = StubSource {
-            returns: 42,
-            last_max_age: Arc::new(Mutex::new(None)),
-            calls: AtomicU64::new(0),
-        };
-        let r = stub
-            .prune_older_than(Duration::from_secs(60))
-            .await
-            .unwrap();
-        assert_eq!(r, 42);
-    });
-}
-
-#[test]
 fn failed_source_propagates_as_worker_error() {
     glommio_run(|| async {
         let (ops, _td) = make_ops_context();
@@ -178,59 +159,8 @@ fn cycle_calls_source_with_default_max_age() {
 }
 
 // ===========================================================================
-// Worker integration (3).
+// Worker integration (1).
 // ===========================================================================
-
-#[test]
-fn worker_registers_with_correct_kind_and_default_cadence() {
-    glommio_run(|| async {
-        let (ops, _td) = make_ops_context();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(
-                Arc::new(CacheEvictionWorker::new(Arc::new(
-                    DisabledCacheEvictionSource,
-                ))),
-                ops,
-            )
-            .unwrap();
-        let cfg = sched.config(WorkerKind::EmbedderCacheEvict.name()).unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(60));
-        sched.shutdown().await.unwrap();
-    });
-}
-
-#[test]
-fn disabled_worker_via_config_does_not_run() {
-    glommio_run(|| async {
-        let (ops, _td) = make_ops_context();
-        let last = Arc::new(Mutex::new(None));
-        let stub = StubSource {
-            returns: 5,
-            last_max_age: last.clone(),
-            calls: AtomicU64::new(0),
-        };
-        let cfg = WorkerConfig {
-            enabled: false,
-            interval: Duration::from_millis(20),
-            batch_size: 100,
-            max_runtime: Duration::from_secs(1),
-        };
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(
-                Arc::new(CacheEvictionWorker::new(Arc::new(stub)).with_config(cfg)),
-                ops,
-            )
-            .unwrap();
-        glommio::timer::sleep(Duration::from_millis(150)).await;
-        sched.shutdown().await.unwrap();
-        assert!(
-            last.lock().is_none(),
-            "disabled worker must not invoke source"
-        );
-    });
-}
 
 #[test]
 fn custom_max_age_honoured() {

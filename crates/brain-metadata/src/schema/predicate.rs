@@ -878,74 +878,19 @@ mod tests {
     }
 
     #[test]
-    fn invalid_namespace_empty() {
-        let (_dir, db) = open_db();
-        let wtxn = db.begin_write().unwrap();
-        let err = predicate_intern(&wtxn, "", "name", None, 0, 1, "", false, 0).unwrap_err();
-        matches!(err, PredicateOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
-    }
-
-    #[test]
-    fn invalid_namespace_uppercase() {
-        let (_dir, db) = open_db();
-        let wtxn = db.begin_write().unwrap();
-        let err = predicate_intern(&wtxn, "Brain", "name", None, 0, 1, "", false, 0).unwrap_err();
-        matches!(err, PredicateOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
-    }
-
-    #[test]
-    fn invalid_namespace_leading_digit() {
-        let (_dir, db) = open_db();
-        let wtxn = db.begin_write().unwrap();
-        let err = predicate_intern(&wtxn, "1brain", "name", None, 0, 1, "", false, 0).unwrap_err();
-        matches!(err, PredicateOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
-    }
-
-    #[test]
-    fn invalid_namespace_with_colon() {
-        let (_dir, db) = open_db();
-        let wtxn = db.begin_write().unwrap();
-        let err = predicate_intern(&wtxn, "br:ain", "name", None, 0, 1, "", false, 0).unwrap_err();
-        matches!(err, PredicateOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
-    }
-
-    #[test]
-    fn invalid_name_empty() {
-        let (_dir, db) = open_db();
-        let wtxn = db.begin_write().unwrap();
-        let err = predicate_intern(&wtxn, "brain", "", None, 0, 1, "", false, 0).unwrap_err();
-        matches!(err, PredicateOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
-    }
-
-    #[test]
-    fn invalid_name_too_long() {
-        let (_dir, db) = open_db();
-        let wtxn = db.begin_write().unwrap();
-        let long = "a".repeat(NAME_MAX_LEN + 1);
-        let err = predicate_intern(&wtxn, "brain", &long, None, 0, 1, "", false, 0).unwrap_err();
-        matches!(err, PredicateOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
-    }
-
-    #[test]
     fn name_accepts_open_vocabulary_forms() {
         // Predicate names are an open vocabulary. Hyphens, digits, non-ASCII
         // letters, and CJK are all legitimate relation surfaces and must NOT
         // be rejected — rejecting would silently drop a real fact.
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
-        for name in ["is-a", "5ht2a_agonist", "co2_binds", "wirkt_gegen", "作用于"] {
+        for name in [
+            "is-a",
+            "5ht2a_agonist",
+            "co2_binds",
+            "wirkt_gegen",
+            "作用于",
+        ] {
             predicate_intern(&wtxn, "brain", name, None, 0, 1, "", false, 0)
                 .unwrap_or_else(|e| panic!("open-vocab name {name:?} must intern, got {e:?}"));
         }

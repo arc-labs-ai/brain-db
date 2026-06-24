@@ -118,8 +118,7 @@ fn recover_rebuilds_statements_with_join() {
     }
     let pred: PredicateId = {
         let wtxn = metadata.write_txn().expect("wtxn");
-        let id =
-            predicate_intern_or_get(&wtxn, "brain", "knows", 0, 0).expect("predicate");
+        let id = predicate_intern_or_get(&wtxn, "brain", "knows", 0, 0).expect("predicate");
         wtxn.commit().expect("commit");
         id
     };

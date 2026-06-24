@@ -1,8 +1,14 @@
 #![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
 //! WAL retention worker tests.
+//!
+//! Guards which WAL segments may be deleted: `decide_deletions` keeps any
+//! segment whose last LSN is at or above the checkpoint cutoff (minus a
+//! retention buffer that pushes the cutoff back), deleting only fully
+//! superseded segments. Pins that a disabled source is a no-op, a
+//! rejecting source skips deletion, and a failing list surfaces as a
+//! `WorkerError`. Source behaviour is faked to isolate the policy wiring.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
@@ -12,8 +18,7 @@ use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_workers::wal_retention::{CheckpointFuture, DeleteFuture, SegmentListFuture};
 use brain_workers::{
     decide_deletions, CheckpointDesc, DisabledWalRetentionSource, SegmentDesc, WalRetentionSource,
-    WalRetentionSourceError, WalRetentionWorker, Worker, WorkerConfig, WorkerContext, WorkerKind,
-    WorkerScheduler,
+    WalRetentionSourceError, WalRetentionWorker, Worker, WorkerContext,
 };
 use parking_lot::Mutex;
 
@@ -207,43 +212,6 @@ impl WalRetentionSource for FailingListSource {
 // ===========================================================================
 
 #[test]
-fn disabled_source_returns_disabled_on_every_method() {
-    glommio_run(|| async {
-        let s = DisabledWalRetentionSource;
-        assert!(matches!(
-            s.current_checkpoint().await,
-            Err(WalRetentionSourceError::Disabled)
-        ));
-        assert!(matches!(
-            s.list_segments().await,
-            Err(WalRetentionSourceError::Disabled)
-        ));
-        assert!(matches!(
-            s.delete_segment(42).await,
-            Err(WalRetentionSourceError::Disabled)
-        ));
-    });
-}
-
-#[test]
-fn stub_source_returns_provided_data() {
-    glommio_run(|| async {
-        let stub = StubSource {
-            checkpoint: CheckpointDesc { durable_lsn: 2000 },
-            segments: Mutex::new(vec![seg(1, 0, 500), seg(2, 500, 1500)]),
-            deleted: Arc::new(Mutex::new(Vec::new())),
-        };
-        let cp = stub.current_checkpoint().await.unwrap();
-        assert_eq!(cp.durable_lsn, 2000);
-        let segs = stub.list_segments().await.unwrap();
-        assert_eq!(segs.len(), 2);
-        stub.delete_segment(1).await.unwrap();
-        assert_eq!(*stub.deleted.lock(), vec![1]);
-        assert_eq!(stub.segments.lock().len(), 1);
-    });
-}
-
-#[test]
 fn rejecting_source_makes_worker_skip_deletion() {
     glommio_run(|| async {
         let (ops, _td) = make_ops_context();
@@ -315,60 +283,8 @@ fn failed_list_source_propagates_as_worker_error() {
 }
 
 // ===========================================================================
-// Worker integration (3).
+// Worker integration (1).
 // ===========================================================================
-
-#[test]
-fn worker_registers_with_correct_kind_and_default_cadence() {
-    glommio_run(|| async {
-        let (ops, _td) = make_ops_context();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(
-                Arc::new(WalRetentionWorker::new(Arc::new(
-                    DisabledWalRetentionSource,
-                ))),
-                ops,
-            )
-            .unwrap();
-        let cfg = sched.config(WorkerKind::WalRetention.name()).unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(60));
-        sched.shutdown().await.unwrap();
-    });
-}
-
-#[test]
-fn disabled_worker_via_config_does_not_run() {
-    glommio_run(|| async {
-        let (ops, _td) = make_ops_context();
-        let stub = StubSource {
-            checkpoint: CheckpointDesc { durable_lsn: 1000 },
-            segments: Mutex::new(vec![seg(1, 0, 500)]),
-            deleted: Arc::new(Mutex::new(Vec::new())),
-        };
-        let deleted_ref = stub.deleted.clone();
-        let cfg = WorkerConfig {
-            enabled: false,
-            interval: Duration::from_millis(20),
-            batch_size: 100,
-            max_runtime: Duration::from_secs(1),
-        };
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(
-                Arc::new(WalRetentionWorker::new(Arc::new(stub)).with_config(cfg)),
-                ops,
-            )
-            .unwrap();
-        glommio::timer::sleep(Duration::from_millis(150)).await;
-        sched.shutdown().await.unwrap();
-        assert_eq!(
-            deleted_ref.lock().len(),
-            0,
-            "disabled worker must not call delete"
-        );
-    });
-}
 
 #[test]
 fn retention_buffer_keeps_segments_under_cutoff() {

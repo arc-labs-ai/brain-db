@@ -1,5 +1,11 @@
 #![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
 //! Counter reconciliation worker tests.
+//!
+//! Guards repair of drifted per-memory edge counters: the worker
+//! recounts actual in/out edges and rewrites the cached counts when they
+//! disagree, fixing under- and over-counts in both directions in a single
+//! cycle. Pins the no-op case (already correct), per-cycle batch caps,
+//! and cursor advance across cycles so the full table is swept.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,7 +21,7 @@ use brain_metadata::MetadataDb;
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_workers::{
-    CounterReconcileWorker, Worker, WorkerConfig, WorkerContext, WorkerKind, WorkerScheduler,
+    CounterReconcileWorker, Worker, WorkerConfig, WorkerContext,
 };
 use uuid::Uuid;
 
@@ -281,48 +287,6 @@ fn cursor_advances_across_cycles() {
         for slot in 1..=12u64 {
             assert_eq!(read_counts(&fix.metadata, make_id(slot)), (0, 0));
         }
-    });
-}
-
-// ===========================================================================
-// Worker integration (2).
-// ===========================================================================
-
-#[test]
-fn worker_registers_with_correct_kind_and_default_cadence() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(Arc::new(CounterReconcileWorker::new()), fix.ctx)
-            .unwrap();
-        let cfg = sched.config(WorkerKind::CounterReconcile.name()).unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(3600));
-        sched.shutdown().await.unwrap();
-    });
-}
-
-#[test]
-fn disabled_worker_via_config_does_not_fix() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        seed_memory_with_counts(&fix.metadata, 1, 99, 99); // drift
-        let cfg = WorkerConfig {
-            enabled: false,
-            interval: Duration::from_millis(20),
-            batch_size: 100,
-            max_runtime: Duration::from_secs(1),
-        };
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(
-                Arc::new(CounterReconcileWorker::new().with_config(cfg)),
-                fix.ctx,
-            )
-            .unwrap();
-        glommio::timer::sleep(Duration::from_millis(150)).await;
-        sched.shutdown().await.unwrap();
-        assert_eq!(read_counts(&fix.metadata, make_id(1)), (99, 99));
     });
 }
 

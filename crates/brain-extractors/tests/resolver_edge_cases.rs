@@ -120,16 +120,20 @@ fn unrelated_names_do_not_dedup_via_fuzzy() {
 }
 
 #[test]
-fn type_qname_isolates_namespaces() {
-    // Same surface form under two different entity types → two distinct
-    // entities (the canonical-name index is keyed on type).
+fn cross_type_exact_name_reuses_entity_on_first_collision() {
+    // Same surface form first seen as a Person, then as an Organization.
+    // With exactly one prior cross-type match the resolver reuses that
+    // node instead of fragmenting the referent across types (Tier 1b
+    // cross-type exact reuse — extractor tiers routinely assign different
+    // type ids to the same referent). The homograph guard only forks once
+    // two same-name entities already exist, so the first collision reuses.
     let (_dir, db) = open_db();
     let wtxn = db.write_txn().unwrap();
     let p = resolve_or_create(&wtxn, "Acme", "brain:Person", 0.9, NOW).unwrap();
     let o = resolve_or_create(&wtxn, "Acme", "brain:Organization", 0.9, NOW + 1).unwrap();
     wtxn.commit().unwrap();
-    assert_ne!(
+    assert_eq!(
         p.entity_id, o.entity_id,
-        "type qname must partition the canonical-name index"
+        "exactly one prior cross-type match → reuse, not fragment"
     );
 }

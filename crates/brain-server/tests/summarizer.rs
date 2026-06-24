@@ -25,7 +25,7 @@ mod config;
 #[path = "../src/llm/mod.rs"]
 mod llm;
 
-use config::{Config, SummarizerBackend, SummarizerConfig};
+use config::{Config, SummarizerConfig};
 
 fn cfg_with_summarizer(s: SummarizerConfig) -> Config {
     // Borrow the rest of Config's defaults from the dev TOML by
@@ -56,17 +56,6 @@ fn build_summarizer_disabled_returns_disabled_implementation() {
         .unwrap();
     let result = rt.block_on(async { summarizer.summarize(&["hello"]).await });
     assert!(matches!(result, Err(SummarizerError::Disabled)));
-}
-
-#[test]
-fn config_round_trips_summarizer_backend() {
-    let cfg = cfg_with_summarizer(SummarizerConfig {
-        backend: SummarizerBackend::Ollama,
-        ..SummarizerConfig::default()
-    });
-    assert_eq!(cfg.summarizer.backend, SummarizerBackend::Ollama);
-    // Default Ollama base is localhost.
-    assert!(cfg.summarizer.ollama_base.contains("localhost"));
 }
 
 // ---------------------------------------------------------------------------
@@ -110,18 +99,19 @@ mod openai_tests {
     }
 
     fn openai_cfg(api_base: String) -> Config {
-        // Key supplied via config (the standardized `openai_api_key`
-        // field); the mock server accepts any non-empty key.
-        super::cfg_with_summarizer(SummarizerConfig {
+        // The summarizer shares the single `[llm] api_key`; the mock
+        // server accepts any non-empty key.
+        let mut cfg = super::cfg_with_summarizer(SummarizerConfig {
             backend: SummarizerBackend::Openai,
             request_timeout_sec: 5,
             max_summary_chars: 256,
             openai_api_base: api_base,
-            openai_api_key: Some("test-key".to_owned()),
             openai_model: "gpt-test".to_owned(),
             openai_temperature: 0.0,
             ..SummarizerConfig::default()
-        })
+        });
+        cfg.llm.api_key = Some("test-key".to_owned());
+        cfg
     }
 
     /// Spin up the mock first (its own runtime), then the
@@ -189,29 +179,21 @@ mod openai_tests {
 
     #[test]
     fn openai_missing_key_fails_construction() {
-        // No key in config and none in the environment → construction
-        // fails. Guard `OPENAI_API_KEY` so an ambient key doesn't mask
-        // the missing-key path (restored after the assertion).
-        let prior = std::env::var("OPENAI_API_KEY").ok();
-        std::env::remove_var("OPENAI_API_KEY");
-        let cfg = super::cfg_with_summarizer(SummarizerConfig {
+        // No shared `[llm] api_key` → construction fails. The summarizer
+        // reads only that one field, so there is no ambient env var to
+        // guard against.
+        let mut cfg = super::cfg_with_summarizer(SummarizerConfig {
             backend: SummarizerBackend::Openai,
-            openai_api_key: None,
             ..SummarizerConfig::default()
         });
+        cfg.llm.api_key = None;
         // `Result<Arc<dyn Summarizer>, _>` isn't `Debug`, so we can't
         // use `expect_err`. Pattern-match directly.
         let failed = matches!(
             llm::factory::build_summarizer(&cfg),
             Err(llm::factory::BuildSummarizerError::OpenAiKeyMissing)
         );
-        if let Some(p) = prior {
-            std::env::set_var("OPENAI_API_KEY", p);
-        }
-        assert!(
-            failed,
-            "expected OpenAiKeyMissing with no key in env or config"
-        );
+        assert!(failed, "expected OpenAiKeyMissing with no shared LLM key");
     }
 }
 

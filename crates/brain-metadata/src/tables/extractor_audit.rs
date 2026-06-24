@@ -316,6 +316,18 @@ pub fn extraction_attempts(
         .unwrap_or(0))
 }
 
+/// Read the full pipeline audit entry for `memory_id`, if one exists.
+/// Returns the owned [`ExtractorPipelineAuditEntry`] so callers can inspect
+/// per-tier status and item counts (e.g. to confirm which tiers ran and what
+/// they produced). Absent row → `None`.
+pub fn pipeline_audit_entry(
+    rtxn: &ReadTransaction,
+    memory_id: MemoryId,
+) -> Result<Option<ExtractorPipelineAuditEntry>, ExtractorPipelineAuditError> {
+    let table = rtxn.open_table(EXTRACTOR_PIPELINE_AUDIT_TABLE)?;
+    Ok(table.get(&memory_id.to_be_bytes())?.map(|r| r.value()))
+}
+
 /// Commit the pipeline outcome for one memory. Idempotent under
 /// repeated calls (later write overwrites prior).
 pub fn record_extracted(

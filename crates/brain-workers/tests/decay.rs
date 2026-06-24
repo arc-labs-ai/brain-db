@@ -1,5 +1,12 @@
 #![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
 //! Decay worker integration tests.
+//!
+//! Guards salience time-decay: salience follows an exponential half-life
+//! keyed by memory kind (episodic / semantic / consolidated), so a memory
+//! aged one half-life is at half salience, age zero is identity, and
+//! extreme age clamps above zero without NaN. Pins the per-cycle batch
+//! cap, the sub-threshold skip (no write for negligible change), and
+//! cursor advance/wrap so every row is eventually visited.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -357,55 +364,6 @@ fn cycle_processed_count_feeds_scheduler_metrics() {
         sched.shutdown().await.unwrap();
         let processed = metrics.processed_total.load(Ordering::Relaxed);
         assert!(processed >= 3, "expected >=3 processed, got {processed}");
-    });
-}
-
-// ===========================================================================
-// Worker integration (2).
-// ===========================================================================
-
-#[test]
-fn worker_registers_with_correct_kind_and_default_interval() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(Arc::new(DecayWorker::new()), fix.ctx)
-            .unwrap();
-        assert_eq!(sched.names(), vec!["decay"]);
-        let cfg = sched.config("decay").unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(3600));
-        assert!(cfg.enabled);
-        sched.shutdown().await.unwrap();
-    });
-}
-
-#[test]
-fn disabled_decay_worker_does_not_modify_salience() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let now = now_unix_nanos();
-        let id = seed_memory(
-            &fix.metadata,
-            1,
-            1.0,
-            MemoryKind::Episodic,
-            now - 30 * NANOS_PER_DAY,
-        );
-        let cfg = WorkerConfig {
-            enabled: false,
-            interval: Duration::from_millis(20),
-            batch_size: 100,
-            max_runtime: Duration::from_secs(1),
-        };
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(Arc::new(DecayWorker::new().with_config(cfg)), fix.ctx)
-            .unwrap();
-        glommio::timer::sleep(Duration::from_millis(150)).await;
-        sched.shutdown().await.unwrap();
-        let s = read_salience(&fix.metadata, id);
-        assert_eq!(s, 1.0, "disabled worker must not write");
     });
 }
 

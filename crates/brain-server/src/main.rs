@@ -149,7 +149,7 @@ mod linux_main {
         ConfidenceSweepSpawnConfig, ExtractorSpawnConfig, ExtractorTierSpawnConfig,
         ExtractorTuningSpawnConfig, IndexSpawnConfig, LlmCacheSweepSpawnConfig, RerankSpawnConfig,
         ShardHandle, ShardJoiner, ShardSpawnConfig, StatementReclaimSpawnConfig,
-        TemporalEdgeSpawnConfig,
+        SupersessionSweeperSpawnConfig, TemporalEdgeSpawnConfig,
     };
 
     /// Errors surfaced by [`build_dispatcher`]. Hand-rolled `Display`
@@ -490,12 +490,11 @@ mod linux_main {
                 ef_search: cfg.workers.auto_edge.ef_search,
                 channel_capacity: cfg.workers.auto_edge.channel_capacity,
             };
-            // Ferry the operator's `[workers.extractor]`
-            // overrides into the per-shard spawn config so the
-            // ExtractorWorker registers with the configured knobs (or
-            // stays unwired when disabled).
+            // Ferry the operator's `[workers.extractor]` TUNING overrides into
+            // the per-shard spawn config. The worker's existence is derived
+            // from the extractor tier gates (`[extractors.<tier>].enabled`),
+            // not a separate flag here — so only tuning knobs are ferried.
             spawn_cfg.extractor = ExtractorSpawnConfig {
-                enabled: cfg.workers.extractor.enabled,
                 interval_ms: cfg.workers.extractor.interval_ms,
                 drain_per_cycle: cfg.workers.extractor.drain_per_cycle,
                 llm_budget_per_cycle_micro_usd: cfg
@@ -580,13 +579,22 @@ mod linux_main {
                 grace_seconds: cfg.workers.statement_reclaim.grace_seconds,
                 period_seconds: cfg.workers.statement_reclaim.period_seconds,
             };
+            spawn_cfg.supersession_sweeper = SupersessionSweeperSpawnConfig {
+                enabled: cfg.workers.supersession_sweeper.enabled,
+                retention_seconds: cfg.workers.supersession_sweeper.retention_seconds,
+                period_seconds: cfg.workers.supersession_sweeper.period_seconds,
+                dry_run: cfg.workers.supersession_sweeper.dry_run,
+            };
             spawn_cfg.ambiguity_resolver = AmbiguityResolverSpawnConfig {
+                enabled: cfg.workers.ambiguity_resolver.enabled,
                 interval_secs: cfg.workers.ambiguity_resolver.interval_secs,
             };
             spawn_cfg.confidence_sweep = ConfidenceSweepSpawnConfig {
+                enabled: cfg.workers.confidence_sweep.enabled,
                 interval_secs: cfg.workers.confidence_sweep.interval_secs,
             };
             spawn_cfg.llm_cache_sweep = LlmCacheSweepSpawnConfig {
+                enabled: cfg.workers.llm_cache_sweep.enabled,
                 interval_secs: cfg.workers.llm_cache_sweep.interval_secs,
             };
             // Ferry the extractor-pipeline tuning (resolver / classifier
@@ -596,6 +604,7 @@ mod linux_main {
                 classifier_model_path: cfg.extractors.classifier.model_path.clone(),
                 classifier_threshold: cfg.extractors.classifier.threshold,
                 hype_num_questions: cfg.extractors.hype.num_questions,
+                statement_question_bridge_enabled: cfg.extractors.statement_question_bridge.enabled,
             };
             // Ferry the tantivy commit cadence.
             spawn_cfg.index = IndexSpawnConfig {

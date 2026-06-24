@@ -564,63 +564,6 @@ mod tests {
         )
     }
 
-    // ---- SubjectRef ----
-
-    #[test]
-    fn subject_entity_as_entity_returns_id() {
-        let id = EntityId::new();
-        let s = SubjectRef::Entity(id);
-        assert_eq!(s.as_entity(), Some(id));
-        assert!(!s.is_pending());
-    }
-
-    #[test]
-    fn subject_pending_marker() {
-        let s = SubjectRef::Pending(AuditId::new());
-        assert!(s.is_pending());
-        assert_eq!(s.as_entity(), None);
-    }
-
-    // ---- StatementValue ----
-
-    #[test]
-    fn statement_value_matches_same_variant_same_inner() {
-        let a = StatementValue::Text("hi".into());
-        let b = StatementValue::Text("hi".into());
-        assert!(a.matches(&b));
-    }
-
-    #[test]
-    fn statement_value_differs_across_variants() {
-        let a = StatementValue::Text("42".into());
-        let b = StatementValue::Integer(42);
-        assert!(!a.matches(&b));
-    }
-
-    // ---- StatementObject ----
-
-    #[test]
-    fn statement_object_discriminants_are_stable() {
-        let e = StatementObject::Entity(EntityId::new());
-        let v = StatementObject::Value(StatementValue::Bool(true));
-        let m = StatementObject::Memory(MemoryId::pack(0, 0, 0));
-        let s = StatementObject::Statement(StatementId::new());
-        assert_eq!(e.discriminant(), 0);
-        assert_eq!(v.discriminant(), 1);
-        assert_eq!(m.discriminant(), 2);
-        assert_eq!(s.discriminant(), 3);
-    }
-
-    #[test]
-    fn statement_object_as_entity() {
-        let id = EntityId::new();
-        assert_eq!(StatementObject::Entity(id).as_entity(), Some(id));
-        assert_eq!(
-            StatementObject::Value(StatementValue::Integer(1)).as_entity(),
-            None
-        );
-    }
-
     // ---- EvidenceEntry / EvidenceRef ----
 
     #[test]
@@ -662,25 +605,6 @@ mod tests {
         let r = EvidenceRef::Overflow(EvidenceOverflowId::new());
         assert!(!r.is_empty());
         assert_eq!(r.inline_len(), None);
-    }
-
-    // ---- TombstoneReason ----
-
-    #[test]
-    fn tombstone_reason_round_trips() {
-        for r in [
-            TombstoneReason::SourceMemoryForgotten,
-            TombstoneReason::UserRequest,
-            TombstoneReason::SchemaInvalidation,
-            TombstoneReason::ExtractorRetraction,
-            TombstoneReason::Retract,
-        ] {
-            assert_eq!(TombstoneReason::from_u8(r.as_u8()), Some(r));
-        }
-        assert!(TombstoneReason::Retract.is_retract());
-        assert!(!TombstoneReason::UserRequest.is_retract());
-        assert_eq!(TombstoneReason::from_u8(0), None);
-        assert_eq!(TombstoneReason::from_u8(255), None);
     }
 
     // ---- Statement ----

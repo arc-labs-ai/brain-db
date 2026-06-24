@@ -10,7 +10,9 @@ This file is the **high-level milestone index**. The per-phase landing record li
 
 **Pre-release: v0.1.0.** No external users. Wire protocol, redb tables, and schema model are still in flux. Breaking changes land in place without back-compat shims until v1.0 ships.
 
-Implementation coverage is broad — the substrate (vector memory, WAL, HNSW, wire protocol, write/read pipelines, observability) and the typed-graph layer (entities, statements, relations, schema DSL, three-tier extractors, retrieval) both have code landing on every crate the spec calls for. What remains for **v1.0** is **convergence**, not new feature work: the combined acceptance suite at [`spec/19_benchmarks/06_complete_acceptance.md`](spec/19_benchmarks/06_complete_acceptance.md) must pass end-to-end on reference hardware, several scope-cuts from the implementation phases need closing, and the documentation surface needs a final pass.
+Implementation coverage is broad — the substrate (vector memory, WAL, HNSW, wire protocol, write/read pipelines, observability) and the typed-graph layer (entities, statements, relations, schema DSL, three-tier extractors, retrieval) both have code landing on every crate the spec calls for. What remains for **v1.0** is **convergence**, not new feature work: the combined acceptance suite at [`spec/19_benchmarks/06_complete_acceptance.md`](spec/19_benchmarks/06_complete_acceptance.md) must pass end-to-end on reference hardware, the test suite's pre-existing red baseline must be brought green, and the documentation surface needs a final pass.
+
+Recent convergence closures: an operator readiness probe (`GET /readyz` — `503` until every shard serves), the superseded-statement reclamation worker wired into shard spawn (off by default), and backfill re-extraction made functional (it re-enqueues onto the durable extraction queue rather than failing). The test suite was also pruned of redundant/dead coverage (~340–400 functions removed, all with named survivors) and given a documented naming convention (see [`CONTRIBUTING.md`](CONTRIBUTING.md)).
 
 ---
 
@@ -32,6 +34,7 @@ What's pending before the acceptance suite can run green:
 
 | Area | What's needed |
 |---|---|
+| **Green test baseline** | The first full `nextest` run to build to completion surfaced a pre-existing red baseline (~40 failures) dominated by the recall-test-harness family — `recall`/`txn`/`encode` unit + e2e tests that return zero hits *in the test harness* while recall works in the live server and the eval rig. These (and a couple of resolver/e2e cases) must be diagnosed and made green before the acceptance log can be green. Not introduced by recent work — verified against a clean baseline. |
 | **Acceptance suite execution** | The end-to-end harness now lives in the `brain-eval` rig (`brain-eval acceptance --scale 1m` / `soak`) — latency / throughput / recall@K / system scenarios / restart-recovery, gated. What remains is running it on quiet reference hardware and capturing wall-time numbers across all 50+ checks. |
 | **Classifier inference latency** | The candle forward pass is **implemented and functionally validated** — the real GLiNER pipeline (DeBERTa-v3 backbone → projection → label MLP → BiLSTM → markerV0 span head → einsum scoring → sigmoid decode) runs end-to-end and is dispatched live (ENCODE → near-foreground ExtractorWorker → resolver → persisted entities/statements). The `#[ignore]`d real-weight tests pass against `urchade/gliner_small-v2.1`. What remains is **latency/throughput characterization on reference hardware**: on the dev box (aarch64, opt-level=2) a short memory takes ~60–80 ms, over the §11/01 p99 15 ms budget. Because classification is enqueued (ENCODE does not block on it), this is a worker-throughput ceiling, not an ENCODE-p99 blocker — but the reference-hardware number (x86_64, opt-level=3 + LTO, optionally the `mkl` candle feature) must be captured, and the `mkl`/F16 perf paths are still optional. |
 | **Live LLM provider validation** | Anthropic + OpenAI clients are wired through a mock-client integration suite. Live-provider end-to-end runs (real API keys, real cost accounting) need a pass before v1.0. |
@@ -98,9 +101,23 @@ Documented up front so the scope is honest:
 - **No first-party SDK.** Brain is a standalone database; the public interface is the §04 wire protocol (CBOR payloads). Clients are third-party.
 - **Linux only.** Glommio + `io_uring` don't run elsewhere.
 - **English text only.** `bge-small-en-v1.5` is English; multilingual support requires a different embedding model and re-embedding. v2.
-- **Single embedding model per deployment.** Hot-swapping the model requires `ADMIN_MIGRATE_EMBEDDINGS` (offline).
+- **Single embedding model per deployment.** A deployment is pinned to the embedding model it was created with. There is no in-place model migration in v1 — changing the model means standing up a fresh deployment and re-ingesting against it. (An offline `ADMIN_MIGRATE_EMBEDDINGS` re-embed path is deferred to a future version; the opcode is reserved but not implemented, and v1 ships no register-model / retire-fingerprint admin surface.)
 - **No query language.** Wire protocol is typed RPC; a SQL-like text language is v2 at earliest.
-- **Fine-grained access control out of scope.** Brain has authentication and shard-level authorization; per-memory ACLs, field-level security, and time-bounded permissions are v2 if at all.
+- **Secure-by-deployment, not secure-by-default.** v1's default posture is permissive (any client may claim any `agent_id`; the admin HTTP listener is unauthenticated and loopback-bound). This is intentional for a single-tenant box behind a trusted boundary. Exposing a server beyond `localhost`/a trusted LAN requires walking the hardening runbook in [`SECURITY.md`](SECURITY.md#production-deployment-hardening) (scoped API keys, wire TLS, loopback/reverse-proxied admin). The server logs a loud startup `WARN` while permissive.
+- **Fine-grained access control out of scope.** Brain has authentication and shard-level authorization; per-memory ACLs, field-level security, and time-bounded permissions are deferred to a future version.
+
+### Deferred capabilities (reserved, not in v1)
+
+Each of these is a *conscious* deferral with a safe disposition — the code either errors loudly or is a dormant no-op, never a silent wrong answer. Listed so the boundary is explicit:
+
+- **Entity garbage collection.** `EntityGc` ships as a dormant no-op (its inbound-reference count returns "always referenced") and is not spawned. Entity rows are append-mostly in v1; orphaned entities are not reclaimed. No path depends on its output.
+- **Subscribe by similarity.** A `SUBSCRIBE` with a `similar_to` vector filter is rejected with a structured `NotYetImplemented` error. v1 subscriptions filter by agent / context / kind only.
+- **Hot on-demand tantivy reindex.** The lexical (tantivy) index rebuilds automatically from authoritative redb at startup whenever `open` reports corruption / schema-mismatch (an operator forces it by removing the index dir and restarting). A *live* reindex-without-restart admin call is deferred — it needs the writer quiesced, since the rebuild swaps the index directory. The vector (HNSW) index *does* have an on-demand rebuild (`POST /v1/rebuild-ann`).
+- **Scheduled full-shard snapshots.** Operator-triggered full backup + restore over HTTP (`/v1/snapshots`) is the v1 backup story. The periodic background snapshot worker captures the HNSW graph only; automatic periodic *full* bundles are deferred.
+- **Statement-level semantic retrieval lane.** The statement-text embedding index is populated (`StatementEmbed` worker) but is not yet wired as a retrieval lane; statement retrieval in v1 is lexical + graph. Deferred per the spec's retrieval roadmap.
+- **Consolidation by vector clustering.** The consolidation worker uses window-based clustering in v1; vector-DBSCAN consolidation is shipped but unwired, deferred.
+- **Per-row stale-extraction flags.** Stale (schema-version-behind) statements are counted via metrics; a durable per-row stale flag (needs a row-schema bump) is deferred. Re-extraction itself is handled by the schema-migration worker.
+- **Slot-version free-list reclamation.** The `SlotAllocator` (free-list + version-bump-on-realloc) is implemented and exercised by recovery, but the writer mints slots via a `next_slot` atomic and live occupancy is read from redb — so the allocator's free-list reclamation is not on the live path (its unit tests are `#[ignore]`'d). The spec-mandated **slot version** is still enforced via the `MemoryId` encoding; only physical slot *reuse* is deferred.
 
 These aren't bugs — they're scope boundaries. Don't accidentally implement them.
 

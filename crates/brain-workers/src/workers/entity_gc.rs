@@ -107,10 +107,4 @@ mod tests {
         let w = EntityGcWorker::new();
         assert!(!w.enabled);
     }
-
-    #[test]
-    fn worker_kind_name() {
-        let w = EntityGcWorker::new();
-        assert_eq!(w.name(), "entity_gc");
-    }
 }

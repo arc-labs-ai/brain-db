@@ -291,3 +291,69 @@ impl HnswIndex {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a normalized 384-dim vector with a single "1.0" peak at
+    /// index `seed % VECTOR_DIM`, matching the entity/statement HNSW
+    /// fixtures (BGE outputs are L2-normalised; one-hot approximates it).
+    fn one_hot(seed: usize) -> [f32; VECTOR_DIM] {
+        let mut v = [0.0; VECTOR_DIM];
+        v[seed % VECTOR_DIM] = 1.0;
+        v
+    }
+
+    fn mid(n: u64) -> MemoryId {
+        MemoryId::pack(1, n, 1)
+    }
+
+    /// End-to-end scenario over the live `HnswIndex`: insert →
+    /// contains → search returns it → tombstone excludes → tombstone
+    /// of an unknown id errors. Mirrors the entity/statement HNSW
+    /// matrix against `MemoryId`. (`HnswIndex` has no in-place
+    /// `rebuild`; tombstone compaction happens via snapshot reload.)
+    #[test]
+    fn insert_search_tombstone_rebuild_scenario() {
+        let mut idx = HnswIndex::new(IndexParams::default()).unwrap();
+
+        let a = mid(1);
+        let b = mid(2);
+        let c = mid(3);
+        idx.insert(a, &one_hot(0)).unwrap();
+        idx.insert(b, &one_hot(1)).unwrap();
+        idx.insert(c, &one_hot(2)).unwrap();
+
+        // contains
+        assert!(idx.contains(a));
+        assert!(!idx.contains(mid(99)));
+        assert_eq!(idx.len(), 3);
+
+        // search returns the self-match with ~1.0 similarity
+        let r = idx.search_all(&one_hot(1), 1, None);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0, b);
+        assert!(
+            r[0].1 > 0.99,
+            "self-search similarity should be ~1.0; got {}",
+            r[0].1
+        );
+
+        // tombstone excludes from search
+        idx.mark_tombstoned(b).unwrap();
+        assert!(idx.is_tombstoned(b));
+        assert_eq!(idx.tombstone_count(), 1);
+        let r = idx.search_all(&one_hot(1), 3, None);
+        let ids: Vec<MemoryId> = r.iter().map(|(id, _)| *id).collect();
+        assert!(!ids.contains(&b), "tombstoned id surfaced in search");
+
+        // tombstone on an unknown id errors
+        let err = idx.mark_tombstoned(mid(99)).expect_err("unknown id");
+        assert!(matches!(err, HnswError::MemoryIdNotFound { .. }));
+    }
+}

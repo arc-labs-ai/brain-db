@@ -198,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn contains_pin() {
+    fn contains_reports_membership_only_for_inserted_ids() {
         let mut m = IdMap::new();
         assert!(!m.contains(mid(7)));
         m.insert(mid(7)).unwrap();

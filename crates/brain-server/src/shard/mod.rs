@@ -96,21 +96,6 @@ use flume::{Receiver, Sender};
 use glommio::{ExecutorJoinHandle, LocalExecutorBuilder, Placement};
 use tracing::{error, info, warn, Instrument as _};
 
-/// Whether the per-statement question bridge is enabled (env
-/// `BRAIN_STATEMENT_QUESTION_BRIDGE`). Default OFF: when set, each shard
-/// constructs the question-bridge HNSW, the embed worker generates templated
-/// questions for every eligible statement, and the semantic retriever probes
-/// the pool on statement-scope search. Default-off keeps write-time cost at
-/// zero until the bridge is measured.
-fn statement_question_bridge_enabled() -> bool {
-    matches!(
-        std::env::var("BRAIN_STATEMENT_QUESTION_BRIDGE")
-            .ok()
-            .as_deref(),
-        Some("1" | "true" | "TRUE" | "on" | "ON")
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Request type.
 // ---------------------------------------------------------------------------
@@ -338,6 +323,8 @@ pub struct ShardSpawnConfig {
     pub causal_edge: CausalEdgeSpawnConfig,
     /// Retracted-statement GC worker knobs. Off by default.
     pub statement_reclaim: StatementReclaimSpawnConfig,
+    /// Superseded-statement GC worker knobs. Off by default.
+    pub supersession_sweeper: SupersessionSweeperSpawnConfig,
     /// Entity merge-review-queue sweeper cadence.
     pub ambiguity_resolver: AmbiguityResolverSpawnConfig,
     /// Statement confidence-refresh sweep cadence.
@@ -444,9 +431,11 @@ impl Default for AutoEdgeSpawnConfig {
 }
 
 /// Knobs ferried from `Config.workers.extractor` into the spawn path.
+/// Tuning for the extraction pipeline worker. The worker's existence is
+/// DERIVED from the tier gates (`ExtractorTierSpawnConfig`) — it is spawned
+/// iff ≥1 tier is enabled — so there is no separate `enabled` knob here.
 #[derive(Clone, Debug)]
 pub struct ExtractorSpawnConfig {
-    pub enabled: bool,
     pub interval_ms: u64,
     pub drain_per_cycle: usize,
     pub llm_budget_per_cycle_micro_usd: u64,
@@ -460,7 +449,6 @@ pub struct ExtractorSpawnConfig {
 impl Default for ExtractorSpawnConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             interval_ms: 1000,
             drain_per_cycle: 32,
             llm_budget_per_cycle_micro_usd: 50_000,
@@ -562,15 +550,40 @@ impl Default for StatementReclaimSpawnConfig {
     }
 }
 
+/// Knobs ferried from `Config.workers.supersession_sweeper` into the
+/// spawn path. The superseded-statement GC worker is off by default
+/// (`retention_seconds == 0`): superseded rows are filtered from every
+/// read regardless, so this only controls physical disk reclamation.
+#[derive(Clone, Copy, Debug)]
+pub struct SupersessionSweeperSpawnConfig {
+    pub enabled: bool,
+    pub retention_seconds: u64,
+    pub period_seconds: u64,
+    pub dry_run: bool,
+}
+
+impl Default for SupersessionSweeperSpawnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            retention_seconds: 0,
+            period_seconds: brain_workers::workers::supersession_sweeper::DEFAULT_PERIOD_SECONDS,
+            dry_run: false,
+        }
+    }
+}
+
 /// Knobs ferried from `Config.workers.ambiguity_resolver`.
 #[derive(Clone, Copy, Debug)]
 pub struct AmbiguityResolverSpawnConfig {
+    pub enabled: bool,
     pub interval_secs: u64,
 }
 
 impl Default for AmbiguityResolverSpawnConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             interval_secs: brain_workers::workers::ambiguity_resolver::DEFAULT_INTERVAL_SECS,
         }
     }
@@ -579,12 +592,14 @@ impl Default for AmbiguityResolverSpawnConfig {
 /// Knobs ferried from `Config.workers.confidence_sweep`.
 #[derive(Clone, Copy, Debug)]
 pub struct ConfidenceSweepSpawnConfig {
+    pub enabled: bool,
     pub interval_secs: u64,
 }
 
 impl Default for ConfidenceSweepSpawnConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             interval_secs: brain_workers::workers::confidence_sweep::DEFAULT_INTERVAL_SECS,
         }
     }
@@ -593,12 +608,14 @@ impl Default for ConfidenceSweepSpawnConfig {
 /// Knobs ferried from `Config.workers.llm_cache_sweep`.
 #[derive(Clone, Copy, Debug)]
 pub struct LlmCacheSweepSpawnConfig {
+    pub enabled: bool,
     pub interval_secs: u64,
 }
 
 impl Default for LlmCacheSweepSpawnConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             interval_secs: brain_workers::workers::llm_cache_sweeper::DEFAULT_INTERVAL_SECS,
         }
     }
@@ -617,6 +634,9 @@ pub struct ExtractorTuningSpawnConfig {
     pub classifier_threshold: f32,
     /// Hypothetical questions generated per memory at write time.
     pub hype_num_questions: usize,
+    /// Whether the per-statement question bridge is provisioned (HNSW +
+    /// templated-question generation + statement-scope probe). Off by default.
+    pub statement_question_bridge_enabled: bool,
 }
 
 impl Default for ExtractorTuningSpawnConfig {
@@ -626,6 +646,7 @@ impl Default for ExtractorTuningSpawnConfig {
             classifier_model_path: None,
             classifier_threshold: brain_extractors::classifier::DEFAULT_GLINER_THRESHOLD,
             hype_num_questions: 6,
+            statement_question_bridge_enabled: false,
         }
     }
 }
@@ -666,6 +687,7 @@ impl ShardSpawnConfig {
             temporal_edge: TemporalEdgeSpawnConfig::default(),
             causal_edge: CausalEdgeSpawnConfig::default(),
             statement_reclaim: StatementReclaimSpawnConfig::default(),
+            supersession_sweeper: SupersessionSweeperSpawnConfig::default(),
             ambiguity_resolver: AmbiguityResolverSpawnConfig::default(),
             confidence_sweep: ConfidenceSweepSpawnConfig::default(),
             llm_cache_sweep: LlmCacheSweepSpawnConfig::default(),
@@ -850,6 +872,19 @@ impl ShardHandle {
     #[must_use]
     pub fn shard_id(&self) -> ShardId {
         self.shard_id
+    }
+
+    /// Whether this shard's executor loop is still draining requests.
+    ///
+    /// The request channel's receiver lives on the shard executor; if
+    /// that thread exits (panic, leaked drain on a hung shutdown), the
+    /// flume `Sender` reports `is_disconnected()` and no further request
+    /// can ever be served. The readiness probe (`GET /readyz`) flips the
+    /// node to `503` when any shard fails this check so a load balancer
+    /// drains it instead of routing to a dead shard.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        !self.tx.is_disconnected()
     }
 
     /// Read-only handle to the AutoEdgeWorker metric
@@ -1522,6 +1557,7 @@ pub fn spawn_shard(
     let temporal_edge_spawn_cfg_for_closure = cfg.temporal_edge.clone();
     let causal_edge_spawn_cfg_for_closure = cfg.causal_edge.clone();
     let statement_reclaim_spawn_cfg = cfg.statement_reclaim;
+    let supersession_sweeper_spawn_cfg = cfg.supersession_sweeper;
     let ambiguity_resolver_spawn_cfg = cfg.ambiguity_resolver;
     let confidence_sweep_spawn_cfg = cfg.confidence_sweep;
     let llm_cache_sweep_spawn_cfg = cfg.llm_cache_sweep;
@@ -1594,6 +1630,14 @@ pub fn spawn_shard(
         llm: brain_extractors::TierState::from_enabled(cfg.extractors.llm_enabled),
     };
     let tier_gate_for_closure = tier_gate;
+    // The extraction pipeline (worker + queue drain) is provisioned iff at
+    // least one tier is enabled — the worker is DERIVED from the tier gates,
+    // not a separate master switch. This removes the trap where a standalone
+    // worker-off flag could silently dead-letter every enabled tier (ENCODE
+    // enqueues but nothing drains). "Disable extraction" = disable the tiers.
+    let extractor_pipeline_enabled = cfg.extractors.pattern_enabled
+        || cfg.extractors.classifier_enabled
+        || cfg.extractors.llm_enabled;
     // Provider credentials / model overrides for the LLM extractor
     // tier, resolved env-first / config-fallback inside the closure.
     let llm_config_for_closure = cfg.llm.clone();
@@ -1609,7 +1653,7 @@ pub fn spawn_shard(
             None
         };
     let extractor_metrics_for_handle: Option<Arc<brain_ops::ExtractorMetrics>> =
-        if cfg.extractor.enabled {
+        if extractor_pipeline_enabled {
             Some(Arc::new(brain_ops::ExtractorMetrics::new()))
         } else {
             None
@@ -1716,14 +1760,14 @@ pub fn spawn_shard(
                 ),
             );
             // Per-shard per-statement question-bridge pool. Gated on
-            // BRAIN_STATEMENT_QUESTION_BRIDGE so the default path pays no
-            // generation cost: `None` leaves both the embed worker and the
-            // semantic retriever without it (statement search stays
+            // `[extractors.statement_question_bridge].enabled` so the default
+            // path pays no generation cost: `None` leaves both the embed worker
+            // and the semantic retriever without it (statement search stays
             // direct-cosine only). When enabled it is rebuilt below from the
             // durable `statement_question_vectors` rows.
             let statement_question_hnsw_for_shard: Option<
                 Arc<parking_lot::RwLock<StatementQuestionHnswIndex>>,
-            > = if statement_question_bridge_enabled() {
+            > = if extractor_tuning_spawn_cfg.statement_question_bridge_enabled {
                 Some(Arc::new(parking_lot::RwLock::new(
                     StatementQuestionHnswIndex::new(
                         brain_index::statement_question_hnsw::statement_question_default_params(),
@@ -1795,12 +1839,12 @@ pub fn spawn_shard(
                 (None, None)
             };
 
-            // Per-shard ExtractorWorker channel. Same shape
-            // as auto-edge — disabled means no channel, no worker, no
-            // overhead. The writer stores the Sender; the Receiver
+            // Per-shard ExtractorWorker channel. Provisioned iff the extraction
+            // pipeline is enabled (≥1 tier on) — no tiers means no channel, no
+            // worker, no overhead. The writer stores the Sender; the Receiver
             // moves into the worker we register below.
             let extractor_spawn_cfg = extractor_spawn_cfg_for_closure.clone();
-            let (extractor_sender, extractor_receiver) = if extractor_spawn_cfg.enabled {
+            let (extractor_sender, extractor_receiver) = if extractor_pipeline_enabled {
                 let (tx, rx) = flume::bounded::<brain_ops::ExtractorEnqueue>(
                     extractor_spawn_cfg.channel_capacity.max(1),
                 );
@@ -1866,10 +1910,10 @@ pub fn spawn_shard(
             // MetadataDb::open) into a runtime ExtractorRegistry.
             //
             // The LLM-tier deps the materializer
-            // needs: a `ModelRouter` built from the provider key (env
-            // BRAIN_API_KEY first, then the `[llm]` config section) and
-            // the per-shard `llm_cache.redb`. Both slots default to
-            // `None` so shards started without an LLM cache or any key
+            // needs: a `ModelRouter` built from the single provider key
+            // (`[llm] api_key`, into which `BRAIN__LLM__API_KEY` folds at
+            // load) and the per-shard `llm_cache.redb`. Both slots default
+            // to `None` so shards started without an LLM cache or any key
             // configured stay unchanged.
             let llm_deps =
                 llm_setup::build_llm_deps(&shard_dir_for_executor, &llm_config_for_closure);
@@ -1885,7 +1929,7 @@ pub fn spawn_shard(
                     target: "brain_server::shard",
                     shard_id,
                     "no LLM provider key resolved; HyPE (mandatory) and the LLM write \
-                     path are inoperative on this shard. Set BRAIN_API_KEY or \
+                     path are inoperative on this shard. Set BRAIN__LLM__API_KEY or \
                      `[llm] api_key`. The server entry point enforces this as a hard \
                      startup error (Config::validate_llm_provider)",
                 );
@@ -2577,10 +2621,10 @@ pub fn spawn_shard(
             )
             .expect("register Phase-8 workers");
 
-            // LLM cache sweeper. Only register when the shard actually
-            // has an LLM cache — without one the worker is a no-op and
-            // wiring it adds nothing but a wakeup every hour.
-            if ops.llm_cache.is_some() {
+            // LLM cache sweeper. Registered when enabled AND the shard
+            // actually has an LLM cache — without a cache the worker is a
+            // no-op, and the operator can opt out via `enabled = false`.
+            if llm_cache_sweep_spawn_cfg.enabled && ops.llm_cache.is_some() {
                 let sweeper = LlmCacheSweeper::new()
                     .with_interval_secs(llm_cache_sweep_spawn_cfg.interval_secs)
                     .with_metrics(llm_cache_sweep_metrics_for_closure.clone());
@@ -2622,10 +2666,10 @@ pub fn spawn_shard(
             // deployments accumulate over-confident stale Facts and
             // Preferences whose evidence has aged out.
             //
-            // Registered unconditionally: substrate-only shards find an
-            // empty STATEMENTS_TABLE every cycle and return 0 with
-            // negligible cost.
-            {
+            // On by default (low-cost maintenance); operator can opt out via
+            // `[workers.confidence_sweep] enabled = false`, which skips
+            // registration entirely.
+            if confidence_sweep_spawn_cfg.enabled {
                 let worker = brain_workers::ConfidenceSweepWorker::new(metadata.clone())
                     .with_interval_secs(confidence_sweep_spawn_cfg.interval_secs)
                     .with_metrics(confidence_sweep_metrics_for_closure.clone());
@@ -2637,20 +2681,42 @@ pub fn spawn_shard(
             // StatementReclaimWorker — physically reclaims retracted
             // statement rows (plus their secondary-index + evidence-
             // overflow entries) after the retract grace period. Off by
-            // default; gated on `[workers.statement_reclaim] enabled`,
-            // so registering it unconditionally costs nothing when the
-            // operator hasn't opted in (the scheduler skips run_cycle on
-            // a disabled worker). Closes the tombstone-grace-then-reclaim
-            // loop on the statement side, mirroring slot reclamation for
-            // memories.
-            {
+            // default (`[workers.statement_reclaim] enabled = false`); gated by
+            // skip-registration like every other optional worker — a disabled
+            // worker is simply not registered. `set_enabled(true)` overrides the
+            // worker's own off-by-default so that, once provisioned, it actually
+            // runs. Closes the tombstone-grace-then-reclaim loop on the
+            // statement side, mirroring slot reclamation for memories.
+            if statement_reclaim_spawn_cfg.enabled {
                 let worker = brain_workers::workers::statement_reclaim::StatementReclaimWorker::new()
-                    .set_enabled(statement_reclaim_spawn_cfg.enabled)
+                    .set_enabled(true)
                     .with_grace_seconds(statement_reclaim_spawn_cfg.grace_seconds)
                     .with_period_seconds(statement_reclaim_spawn_cfg.period_seconds);
                 scheduler
                     .register(Arc::new(worker), ops.clone())
                     .expect("register StatementReclaimWorker");
+            }
+
+            // SupersessionSweeper — physically reclaims superseded
+            // statement rows after the configured retention window. Off
+            // by default and gated on `[workers.supersession_sweeper]
+            // enabled`: superseded rows are filtered from every read
+            // regardless, so this is purely a disk-reclamation opt-in.
+            // Mirrors StatementReclaimWorker for the supersession side,
+            // closing the supersede-then-reclaim loop instead of letting
+            // superseded rows accumulate on disk forever. `retention_seconds`
+            // is now tuning (how old before delete), not the on/off gate.
+            if supersession_sweeper_spawn_cfg.enabled {
+                let mut worker =
+                    brain_workers::workers::supersession_sweeper::SupersessionSweeper::new()
+                        .with_retention_seconds(supersession_sweeper_spawn_cfg.retention_seconds)
+                        .with_period_seconds(supersession_sweeper_spawn_cfg.period_seconds);
+                if supersession_sweeper_spawn_cfg.dry_run {
+                    worker = worker.dry_run();
+                }
+                scheduler
+                    .register(Arc::new(worker), ops.clone())
+                    .expect("register SupersessionSweeper");
             }
 
             // Register the AutoEdgeWorker when the channel was
@@ -2760,9 +2826,10 @@ pub fn spawn_shard(
             // AmbiguityResolverWorker — promotes / expires entries in the
             // entity-merge review queue using the per-shard entity HNSW +
             // embedder. Without it ambiguous resolutions accumulate and
-            // entity-resolution quality decays over time. Cheap ticking
-            // no-op on shards with no pending review rows.
-            {
+            // entity-resolution quality decays over time. On by default
+            // (low-cost maintenance); operator can opt out via
+            // `[workers.ambiguity_resolver] enabled = false`.
+            if ambiguity_resolver_spawn_cfg.enabled {
                 let worker = brain_workers::AmbiguityResolverWorker::new(
                     metadata.clone(),
                     entity_hnsw_for_shard.clone(),
@@ -2775,14 +2842,16 @@ pub fn spawn_shard(
             }
 
             // Register the ExtractorWorker when its channel was
-            // created above (i.e. when `cfg.extractor.enabled` is true).
-            // The worker drains the writer's post-encode channel and
-            // runs the three-tier extractor pipeline against each
-            // memory's text, writing entities / statements / relations /
-            // mention edges through brain-metadata.
+            // created above (i.e. when the extraction pipeline is enabled —
+            // ≥1 tier on). The worker drains the writer's post-encode channel
+            // and runs the three-tier extractor pipeline against each memory's
+            // text, writing entities / statements / relations / mention edges
+            // through brain-metadata.
             if let Some(rx) = extractor_receiver {
                 let worker_cfg = WorkerConfig {
-                    enabled: extractor_spawn_cfg.enabled,
+                    // The receiver only exists when the pipeline is enabled, so
+                    // the worker is unconditionally enabled within this branch.
+                    enabled: true,
                     interval: std::time::Duration::from_millis(
                         extractor_spawn_cfg.interval_ms.max(1),
                     ),

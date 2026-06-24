@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn extraction_status_bytes_are_stable() {
+    fn discriminant_bytes_are_stable() {
         // These bytes are part of the on-disk format. Never renumber.
         assert_eq!(extraction_status::SUCCESS, 1);
         assert_eq!(extraction_status::FAILURE, 2);
@@ -355,10 +355,7 @@ mod tests {
         assert_eq!(extraction_status::SKIPPED_FILTER, 4);
         assert_eq!(extraction_status::SKIPPED_DUPLICATE, 5);
         assert_eq!(extraction_status::SKIPPED_DISABLED, 6);
-    }
 
-    #[test]
-    fn output_kind_bytes_are_stable() {
         assert_eq!(output_kind::ENTITY, 1);
         assert_eq!(output_kind::STATEMENT, 2);
         assert_eq!(output_kind::RELATION, 3);

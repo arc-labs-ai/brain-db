@@ -20,12 +20,12 @@ use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
-use brain_protocol::envelope::request::RequestBody;
+use brain_protocol::envelope::request::{EncodeRequest, RequestBody};
 use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
 use brain_protocol::{
     QueryExplainRequest, QueryRequest, QueryTextRequest, QueryTraceRequest, RetrieverSelectionWire,
-    RetrieverWire,
+    RetrieverWire, SchemaUploadRequest,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -162,6 +162,28 @@ async fn round_trip(
 
 fn sample_request_id() -> [u8; 16] {
     *uuid::Uuid::now_v7().as_bytes()
+}
+
+const ACME_V1: &str = "namespace acme\n\
+                       define entity_type Foo { attributes {} }\n";
+
+fn upload_schema_request() -> RequestBody {
+    RequestBody::SchemaUpload(SchemaUploadRequest {
+        schema_document: ACME_V1.into(),
+        dry_run: false,
+        allow_breaking: false,
+        request_id: *uuid::Uuid::now_v7().as_bytes(),
+    })
+}
+
+fn encode_request(text: &str) -> RequestBody {
+    RequestBody::Encode(EncodeRequest {
+        text: text.into(),
+        context_id: 0,
+        request_id: *uuid::Uuid::now_v7().as_bytes(),
+        txn_id: None,
+        occurred_at_unix_nanos: None,
+    })
 }
 
 fn text_only_query(text: &str) -> QueryRequest {
@@ -341,6 +363,54 @@ async fn query_no_signal_returns_error() {
             );
         }
         other => panic!("expected Error, got {other:?}"),
+    }
+
+    server.stop().await;
+}
+
+/// QUERY end-to-end after a schema is declared and one memory is
+/// indexed. The auto-router picks Semantic + Lexical for text-only
+/// queries; the HNSW write is synchronous on ENCODE so the semantic
+/// retriever surfaces the hit immediately.
+#[tokio::test(flavor = "current_thread")]
+async fn retrieval_surfaces_an_indexed_memory() {
+    let server = start(1).await;
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
+    complete_handshake(&mut client).await;
+
+    let (opcode, _) = round_trip(&mut client, 1, upload_schema_request()).await;
+    assert_eq!(opcode, Opcode::SchemaUploadResp.as_u16());
+
+    let (opcode, _) = round_trip(
+        &mut client,
+        3,
+        encode_request("ticket budget pushback meeting"),
+    )
+    .await;
+    assert_eq!(opcode, Opcode::EncodeResp.as_u16());
+
+    let (opcode, body) = round_trip(
+        &mut client,
+        5,
+        RequestBody::Query(text_only_query("budget meeting")),
+    )
+    .await;
+    assert_eq!(opcode, Opcode::QueryResp.as_u16());
+    match body {
+        ResponseBody::Query(r) => {
+            assert!(
+                !r.items.is_empty(),
+                "expected at least one hit after ENCODE, got 0",
+            );
+            assert!(
+                !r.retriever_outcomes.is_empty(),
+                "router must pick at least one retriever for a text query",
+            );
+            assert!(r.total_latency_ms >= 0.0);
+        }
+        other => panic!("expected QueryResp, got {other:?}"),
     }
 
     server.stop().await;

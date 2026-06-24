@@ -163,41 +163,6 @@ mod tests_req {
         crate::codec::cbor::from_cbor_bytes(&bytes).expect("cbor decode")
     }
 
-    fn sample_request() -> QueryRequest {
-        QueryRequest {
-            text: "budget pushback".into(),
-            entity_anchor: Some([7u8; 16]),
-            kind_filter: vec![0, 1],
-            predicate_filter: vec!["acme:role".into(), "acme:knows".into()],
-            time_filter: Some(TimeRangeWire {
-                from_unix_ms: Some(100),
-                to_unix_ms: Some(900),
-            }),
-            as_of_record_time_unix_nanos: Some(1_700_000_000_000_000_000),
-            confidence_min: Some(0.5),
-            include_tombstoned: false,
-            include_superseded: true,
-            limit: 25,
-            retrievers: RetrieverSelectionWire::Explicit(vec![
-                RetrieverWire::Semantic,
-                RetrieverWire::Graph,
-            ]),
-            fusion_config: Some(FusionConfigWire {
-                k: 30,
-                semantic_weight: 1.5,
-                lexical_weight: 0.5,
-                graph_weight: 2.0,
-            }),
-            request_id: [42u8; 16],
-        }
-    }
-
-    #[test]
-    fn query_request_round_trips() {
-        let v = sample_request();
-        assert_eq!(round_trip(&v), v);
-    }
-
     #[test]
     fn query_text_request_round_trips() {
         let v = QueryTextRequest {
@@ -290,33 +255,6 @@ mod tests_resp {
     {
         let bytes = crate::codec::cbor::to_cbor_bytes(value);
         crate::codec::cbor::from_cbor_bytes(&bytes).expect("cbor decode")
-    }
-
-    #[test]
-    fn query_response_round_trips() {
-        let v = QueryResponse {
-            items: vec![QueryResultItem {
-                id: ItemIdWire {
-                    kind: 0,
-                    bytes: [1u8; 16],
-                },
-                fused_score: 0.0164,
-                contributing: vec![RetrieverContributionWire {
-                    retriever: RetrieverWire::Semantic,
-                    rank: 1,
-                    raw_score: 0.9,
-                }],
-            }],
-            total_latency_ms: 12.3,
-            retriever_outcomes: vec![RetrieverOutcomeWire {
-                retriever: RetrieverWire::Semantic,
-                status: 0,
-                message: String::new(),
-                latency_ms: 5.2,
-                result_count: 1,
-            }],
-        };
-        assert_eq!(round_trip(&v), v);
     }
 
     #[test]

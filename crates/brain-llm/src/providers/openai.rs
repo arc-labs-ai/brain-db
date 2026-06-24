@@ -1,7 +1,7 @@
 //! OpenAI Chat Completions client.
 //!
-//! POST `https://api.openai.com/v1/chat/completions`. Reads
-//! `OPENAI_API_KEY` at construction.
+//! POST `https://api.openai.com/v1/chat/completions`. Constructed with
+//! the single resolved credential (`[llm] api_key` / `BRAIN__LLM__API_KEY`).
 //!
 //! ## Wire shape (request)
 //!
@@ -83,20 +83,10 @@ impl std::fmt::Debug for OpenAIClient {
 }
 
 impl OpenAIClient {
-    /// Construct from the `OPENAI_API_KEY` env var. Returns
-    /// `None` if unset.
-    pub fn from_env(model: impl Into<String>) -> Option<Self> {
-        let key = std::env::var("OPENAI_API_KEY").ok()?;
-        if key.is_empty() {
-            return None;
-        }
-        Some(Self::new(model, key, DEFAULT_BASE_URL))
-    }
-
-    /// Construct with an explicit API key against the default
-    /// endpoint. For config-provided keys (`[llm] openai_api_key`);
-    /// `from_env` remains the environment path. Returns `None` for an
-    /// empty key so callers can fall back uniformly.
+    /// Construct with an explicit API key against the default endpoint.
+    /// The key comes from the single resolved credential (`[llm] api_key`
+    /// / `BRAIN__LLM__API_KEY`). Returns `None` for an empty key so
+    /// callers can fall back uniformly.
     pub fn with_key(model: impl Into<String>, api_key: impl Into<String>) -> Option<Self> {
         let key = api_key.into();
         if key.is_empty() {
@@ -361,24 +351,6 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> u64 {
 mod tests {
     use super::*;
     use crate::types::{LlmMessage, LlmRole};
-
-    #[test]
-    fn from_env_returns_none_when_key_unset() {
-        let prior = std::env::var("OPENAI_API_KEY").ok();
-        std::env::remove_var("OPENAI_API_KEY");
-        let client = OpenAIClient::from_env("gpt-4o-mini");
-        assert!(client.is_none());
-        if let Some(p) = prior {
-            std::env::set_var("OPENAI_API_KEY", p);
-        }
-    }
-
-    #[test]
-    fn with_endpoint_sets_fields() {
-        let c = OpenAIClient::with_endpoint("gpt-4o-mini", "test-key", "http://localhost:1234");
-        assert_eq!(c.model(), "gpt-4o-mini");
-        assert_ne!(c.model_id_hash(), 0);
-    }
 
     #[test]
     fn request_body_minimal_shape() {

@@ -16,6 +16,7 @@ pub mod diagnostics;
 pub mod extract;
 pub mod healthz;
 pub mod metrics;
+pub mod readyz;
 pub mod rebuild;
 pub mod shard;
 pub mod snapshot;

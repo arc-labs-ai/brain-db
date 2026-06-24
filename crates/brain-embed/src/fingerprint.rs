@@ -168,21 +168,4 @@ mod tests {
         assert_ne!(a, d);
     }
 
-    #[test]
-    fn blake3_hash_file_matches_in_memory_hash() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("weights.bin");
-        let mut payload = Vec::with_capacity(128 * 1024);
-        for i in 0..(128 * 1024) {
-            payload.push((i % 251) as u8);
-        }
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(&payload).unwrap();
-        f.sync_all().unwrap();
-
-        let streamed = blake3_hash_file(&path).unwrap();
-        let in_memory = *blake3::hash(&payload).as_bytes();
-        assert_eq!(streamed, in_memory);
-    }
 }

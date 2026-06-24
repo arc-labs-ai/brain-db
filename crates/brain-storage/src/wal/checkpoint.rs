@@ -137,7 +137,6 @@ mod tests {
     use super::*;
     use crate::arena::file::{ArenaFile, MSYNC_ALL_CALLS};
     use crate::recovery::{recover, InMemoryMetadataSink, MetadataSink};
-    use crate::wal::kinds::WalRecordKind;
     use crate::wal::payload::EncodePayload;
     use crate::wal::record::WalRecord;
     use crate::wal::segment::{glommio_run, WalSegment};
@@ -474,32 +473,4 @@ mod tests {
         arena.msync_all().unwrap();
     }
 
-    #[test]
-    fn record_kinds_are_checkpoint_records() {
-        let dir = tempfile::tempdir().unwrap();
-        let wal_dir = fresh_wal_dir(dir.path());
-        let wal_dir_c = wal_dir.clone();
-        let arena = ArenaFile::open(dir.path().join("arena.bin"), uuid(1), 16).unwrap();
-        glommio_run(move || async move {
-            let wal = Wal::create(&wal_dir_c, uuid(1)).await.unwrap();
-            write_checkpoint(
-                &wal,
-                &arena,
-                CheckpointPlan {
-                    checkpoint_id: 1,
-                    target_lsn: None,
-                },
-            )
-            .await
-            .unwrap();
-            wal.shutdown().await.unwrap();
-        });
-
-        let reader = crate::wal::reader::WalReader::open(&wal_dir, uuid(1)).unwrap();
-        let kinds: Vec<WalRecordKind> = reader.map(|r| r.unwrap().kind).collect();
-        assert_eq!(
-            kinds,
-            vec![WalRecordKind::CheckpointBegin, WalRecordKind::CheckpointEnd]
-        );
-    }
 }

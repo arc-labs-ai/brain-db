@@ -24,7 +24,7 @@ The substrate does **not** bundle or auto-download the model.
 ## Layout the substrate expects
 
 ```
-${BRAIN_NER_MODEL_PATH}/
+<classifier model_path>/      # [extractors.classifier] model_path, else XDG default
 ├── pytorch_model.bin     # GLiNER pickle weights (~611 MiB, fp32)
 ├── tokenizer.json        # DeBERTa-v3 SPM tokenizer (vanilla; [ENT] added at load)
 ├── spm.model             # SentencePiece source

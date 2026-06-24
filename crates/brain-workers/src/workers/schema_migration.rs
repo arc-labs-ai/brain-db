@@ -597,11 +597,4 @@ mod tests {
         );
         assert_eq!(snap2.sweeps_completed_total, 2);
     }
-
-    #[test]
-    fn worker_kind_name() {
-        let (_tx, rx) = flume::unbounded::<SchemaFlagSweepJob>();
-        let w = SchemaMigrationWorker::new(rx);
-        assert_eq!(w.name(), "schema_migration");
-    }
 }

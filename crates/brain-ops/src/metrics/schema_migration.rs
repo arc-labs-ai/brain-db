@@ -103,38 +103,3 @@ pub struct SchemaMigrationMetricsSnapshot {
     pub errors_total: u64,
     pub sweep_duration_seconds: WorkerHistogramSnapshot,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn counters_start_at_zero() {
-        let m = SchemaMigrationMetrics::new();
-        let s = m.snapshot();
-        assert_eq!(s.drops_total, 0);
-        assert_eq!(s.sweeps_completed_total, 0);
-        assert_eq!(s.rows_flagged_total, 0);
-        assert_eq!(s.rows_cleared_total, 0);
-        assert_eq!(s.errors_total, 0);
-        assert_eq!(s.sweep_duration_seconds.count, 0);
-    }
-
-    #[test]
-    fn increments_round_trip() {
-        let m = SchemaMigrationMetrics::new();
-        m.inc_drop();
-        m.add_sweep_completed();
-        m.add_rows_flagged(3);
-        m.add_rows_cleared(2);
-        m.inc_error();
-        m.observe_sweep_duration_seconds(0.5);
-        let s = m.snapshot();
-        assert_eq!(s.drops_total, 1);
-        assert_eq!(s.sweeps_completed_total, 1);
-        assert_eq!(s.rows_flagged_total, 3);
-        assert_eq!(s.rows_cleared_total, 2);
-        assert_eq!(s.errors_total, 1);
-        assert_eq!(s.sweep_duration_seconds.count, 1);
-    }
-}

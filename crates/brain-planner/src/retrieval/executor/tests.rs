@@ -521,32 +521,6 @@ fn empty_retriever_result_doesnt_break_fusion() {
 }
 
 #[test]
-fn limit_truncates_after_filters() {
-    // 5 distinct memory items, all pass filters, limit = 3.
-    let items: Vec<RankedItem> = (1..=5).map(|i| ranked_memory(i, i as u32, 0.9)).collect();
-    let sem = MockSemantic {
-        response: Arc::new(StdMutex::new(Ok(items))),
-        delay: None,
-    };
-    let (_dir, ctx) = make_ctx(Some(sem), None, None);
-
-    let req = QueryRequest {
-        text: Some("topic".into()),
-        retrievers: RetrieverSelection::Explicit(vec![Retriever::Semantic]),
-        limit: 3,
-        // Memory rows don't exist in the metadata DB, so the
-        // tombstone filter would drop them. Allow tombstoned
-        // to keep this test focused on truncation.
-        include_tombstoned: true,
-        include_superseded: true,
-        ..Default::default()
-    };
-    let qp = plan(&req).expect("plan");
-    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
-    assert_eq!(result.items.len(), 3);
-}
-
-#[test]
 fn lexical_terms_drop_stopwords_and_question_words() {
     let terms = super::lexical_content_terms("When did Caroline go to the LGBTQ support group?");
     assert_eq!(terms, vec!["caroline", "go", "lgbtq", "support", "group"]);

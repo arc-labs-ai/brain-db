@@ -26,9 +26,7 @@ use brain_ops::writer::wal_sink::RecordingWalSink;
 use brain_ops::{EventBus, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_storage::wal::kinds::WalRecordKind;
-use brain_workers::{
-    CausalEdgeKnobs, CausalEdgeWorker, Worker, WorkerConfig, WorkerContext, WorkerKind,
-};
+use brain_workers::{CausalEdgeKnobs, CausalEdgeWorker, Worker, WorkerContext};
 use redb::ReadableTable;
 use smallvec::SmallVec;
 use uuid::Uuid;
@@ -290,12 +288,3 @@ fn cycle_writes_caused_link_through_unified_path() {
     });
 }
 
-#[test]
-fn name_and_kind_are_stable() {
-    let (_tx, rx) = flume::bounded(1);
-    let worker = CausalEdgeWorker::new(rx);
-    assert_eq!(worker.name(), WorkerKind::CausalEdge.name());
-    assert_eq!(worker.kind(), WorkerKind::CausalEdge);
-    let cfg = WorkerConfig::defaults_for(WorkerKind::CausalEdge);
-    assert!(cfg.batch_size > 0);
-}

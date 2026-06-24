@@ -58,7 +58,10 @@ pub async fn handle(
         match serde_json::from_slice(&body) {
             Ok(r) => r,
             Err(e) => {
-                return text_response(StatusCode::BAD_REQUEST, &format!("invalid JSON body: {e}\n"))
+                return text_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("invalid JSON body: {e}\n"),
+                )
             }
         }
     };
@@ -82,7 +85,9 @@ pub async fn handle(
             "cannot derive shard root from wal dir\n",
         );
     };
-    let snapshot_dir = shard_root.join("snapshots").join(format!("{snapshot_id:020}"));
+    let snapshot_dir = shard_root
+        .join("snapshots")
+        .join(format!("{snapshot_id:020}"));
     if !snapshot_dir.is_dir() {
         return text_response(
             StatusCode::NOT_FOUND,

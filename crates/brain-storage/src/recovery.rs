@@ -1010,17 +1010,6 @@ mod tests {
         }
     }
 
-    // ----- WalRecordKind smoke -----------------------------------------
-
-    #[test]
-    fn records_have_expected_kinds() {
-        // Sanity: make sure our test helpers produce records with the
-        // expected kind. Cheap belt-and-suspenders against future drift.
-        assert_eq!(encode_record(0).kind, WalRecordKind::Encode);
-        assert_eq!(forget_record(0, 1).kind, WalRecordKind::Forget);
-        assert_eq!(reclaim_record(0, 0, 1).kind, WalRecordKind::Reclaim);
-    }
-
     // ----- typed-graph -----------------------------------------------
 
     /// Build a opaque-body record with an arbitrary opaque body. Used

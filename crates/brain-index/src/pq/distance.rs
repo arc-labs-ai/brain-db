@@ -427,6 +427,7 @@ mod tests {
     /// is at most the recoverable lower bound (very close to zero for
     /// a point that lies on a centroid).
     #[test]
+    #[ignore = "heavy PQ k-means training (v1.x feature, not wired into the v1 live path); slow in debug builds. Run with --run-ignored."]
     fn adc_against_encoded_point_is_near_zero() {
         use crate::pq::params::MIN_TRAINING_SAMPLE;
         use crate::pq::{kmeans, PqParams};

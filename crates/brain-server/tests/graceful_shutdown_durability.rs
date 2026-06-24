@@ -212,6 +212,28 @@ async fn recall_ids(client: &mut TcpStream, stream_id: u32, cue: &str) -> Vec<u1
     }
 }
 
+/// Retry a recall until it surfaces `wanted` or a deadline passes. After
+/// restart the lexical index is repopulated asynchronously, so a recall fired
+/// immediately can race ahead of it; durability is about the write surviving,
+/// which it does once the index catches up. Each attempt mints a fresh
+/// request_id (in `recall_ids`) so idempotency never pins an early empty.
+async fn recall_ids_until_contains(
+    client: &mut TcpStream,
+    mut stream_id: u32,
+    cue: &str,
+    wanted: u128,
+) -> Vec<u128> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let ids = recall_ids(client, stream_id, cue).await;
+        if ids.contains(&wanted) || std::time::Instant::now() >= deadline {
+            return ids;
+        }
+        stream_id += 2;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -268,7 +290,7 @@ async fn acknowledged_writes_survive_graceful_shutdown_and_restart() {
         handshake(&mut client, agent_id).await;
 
         for (i, cue) in cues.iter().enumerate() {
-            let got = recall_ids(&mut client, 1 + (i as u32) * 2, cue).await;
+            let got = recall_ids_until_contains(&mut client, 1 + (i as u32) * 2, cue, ids[i]).await;
             assert!(
                 got.contains(&ids[i]),
                 "DATA LOSS: memory {} (\"{}\") encoded before graceful shutdown was not \

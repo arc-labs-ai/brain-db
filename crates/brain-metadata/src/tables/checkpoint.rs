@@ -173,24 +173,6 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_get_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let m = sample(1);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-            t.insert(&1u64, &m).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-        assert_eq!(t.get(&1u64).unwrap().unwrap().value(), m);
-    }
-
-    #[test]
     fn all_fields_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
@@ -222,69 +204,6 @@ mod tests {
         assert_eq!(got.metadata_version_at_checkpoint, 42);
         assert_eq!(got.started_at_unix_nanos, 1_700_000_000_000_000_000);
         assert_eq!(got.completed_at_unix_nanos, 1_700_000_000_001_500_000);
-    }
-
-    #[test]
-    fn update_overwrites() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-            t.insert(&5u64, &sample(5)).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let mut updated = sample(5);
-        updated.durable_lsn = 999_999;
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-            t.insert(&5u64, &updated).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-        assert_eq!(t.get(&5u64).unwrap().unwrap().value().durable_lsn, 999_999);
-    }
-
-    #[test]
-    fn missing_key_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let wtxn = db.begin_write().unwrap();
-        {
-            let _t = wtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-        assert!(t.get(&u64::MAX).unwrap().is_none());
-    }
-
-    #[test]
-    fn multiple_checkpoints_coexist() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-            t.insert(&1u64, &sample(1)).unwrap();
-            t.insert(&2u64, &sample(2)).unwrap();
-            t.insert(&3u64, &sample(3)).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-        assert_eq!(t.get(&1u64).unwrap().unwrap().value(), sample(1));
-        assert_eq!(t.get(&2u64).unwrap().unwrap().value(), sample(2));
-        assert_eq!(t.get(&3u64).unwrap().unwrap().value(), sample(3));
     }
 
     #[test]

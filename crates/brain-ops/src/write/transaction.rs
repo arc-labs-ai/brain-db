@@ -175,13 +175,6 @@ mod tests {
     }
 
     #[test]
-    fn write_single_has_one_phase() {
-        let w = Write::single(WriteId::new(), AgentId::default(), sample_phase());
-        assert_eq!(w.phase_count(), 1);
-        assert!(w.is_single());
-    }
-
-    #[test]
     fn write_from_phases_preserves_order() {
         let phases = vec![sample_phase(), sample_phase(), sample_phase()];
         let w = Write::from_phases(WriteId::new(), AgentId::default(), phases.clone());

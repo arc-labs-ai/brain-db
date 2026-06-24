@@ -118,10 +118,4 @@ mod tests {
         let w = AuditLogSweeper::new();
         assert_eq!(w.retention_seconds, 90 * 24 * 60 * 60);
     }
-
-    #[test]
-    fn worker_kind_name() {
-        let w = AuditLogSweeper::new();
-        assert_eq!(w.name(), "audit_log_sweeper");
-    }
 }

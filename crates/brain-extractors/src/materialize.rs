@@ -114,7 +114,8 @@ pub fn materialize_classifier_extractor(
             ast.target,
             def.schema_version,
             threshold,
-            "classifier model not loaded — set BRAIN_NER_MODEL_PATH",
+            "classifier model not loaded — set [extractors.classifier] model_path \
+             (or BRAIN__EXTRACTORS__CLASSIFIER__MODEL_PATH)",
         ),
     };
     Ok(ext)
@@ -189,7 +190,7 @@ pub fn materialize_llm_extractor(
             target,
             version,
             threshold,
-            "no llm clients configured (set ANTHROPIC_API_KEY or OPENAI_API_KEY)",
+            "no llm clients configured (set BRAIN__LLM__API_KEY or [llm] api_key)",
         ));
     };
     let Some(client) = router.resolve(model) else {

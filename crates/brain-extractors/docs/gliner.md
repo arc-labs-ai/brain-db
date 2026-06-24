@@ -99,10 +99,11 @@ are present, the shard wires the classifier tier automatically — no
 environment variable required. Run `./.devcontainer/bootstrap-model.sh` to
 populate this location.
 
-Set `BRAIN_NER_MODEL_PATH=<dir>` to point at a different directory.
-When set, the env var wins unconditionally and the XDG cascade is
-skipped; if the loader can't open that directory the server
-fail-stops rather than silently degrading to pattern-only.
+Set `[extractors.classifier] model_path = "<dir>"` (or the env override
+`BRAIN__EXTRACTORS__CLASSIFIER__MODEL_PATH=<dir>`) to point at a different
+directory. When set, the override wins unconditionally and the XDG cascade
+is skipped; if the loader can't open that directory the server fail-stops
+rather than silently degrading to pattern-only.
 
 The `[ENT]` special token is added to the tokenizer at load time
 (`tokenizers::AddedToken::from("[ENT]", true)`); the trained pickle's

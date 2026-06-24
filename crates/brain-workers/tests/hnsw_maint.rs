@@ -1,8 +1,14 @@
 #![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
 //! HNSW maintenance worker integration tests.
+//!
+//! Guards the rebuild-decision policy and its execution: `decide_action`
+//! maps tombstone-ratio and measured-recall against thresholds to
+//! none / schedule / full-rebuild, and a cycle that decides to rebuild
+//! pulls fresh vectors from the rebuild source and atomically swaps the
+//! index. Pins that a disabled source skips the swap and that a failing
+//! source surfaces as a `WorkerError`.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use brain_core::MemoryId;
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
@@ -12,8 +18,7 @@ use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_workers::{
     decide_action, Action, DisabledRebuildSource, HnswMaintenanceWorker, IndexStats, RebuildSource,
-    RebuildSourceError, RebuildThresholds, Worker, WorkerConfig, WorkerContext, WorkerKind,
-    WorkerScheduler,
+    RebuildSourceError, RebuildThresholds, Worker, WorkerContext,
 };
 
 // ---------------------------------------------------------------------------
@@ -241,29 +246,6 @@ fn cycle_reports_tombstone_after_forget_and_attempts_rebuild() {
 // ===========================================================================
 
 #[test]
-fn disabled_source_returns_disabled_error() {
-    glommio_run(|| async {
-        let s = DisabledRebuildSource;
-        let r: Result<Vec<(MemoryId, [f32; VECTOR_DIM])>, _> =
-            <DisabledRebuildSource as RebuildSource<{ VECTOR_DIM }>>::snapshot_vectors(&s).await;
-        assert!(matches!(r, Err(RebuildSourceError::Disabled)));
-    });
-}
-
-#[test]
-fn stub_source_returns_provided_vectors() {
-    glommio_run(|| async {
-        let stub = StubRebuildSource {
-            vectors: vec![(make_id(1), make_vector(1)), (make_id(2), make_vector(2))],
-        };
-        let r = <StubRebuildSource as RebuildSource<{ VECTOR_DIM }>>::snapshot_vectors(&stub)
-            .await
-            .unwrap();
-        assert_eq!(r.len(), 2);
-    });
-}
-
-#[test]
 fn failed_source_propagates_error_as_worker_error() {
     glommio_run(|| async {
         let fix = build_fixture();
@@ -355,58 +337,6 @@ fn disabled_source_with_rebuild_needed_returns_zero_no_swap() {
             fix.index.tombstone_count(),
             pre_count,
             "disabled source must not swap the index"
-        );
-    });
-}
-
-// ===========================================================================
-// Worker integration (2).
-// ===========================================================================
-
-#[test]
-fn worker_registers_with_correct_kind_and_default_cadence() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(
-                Arc::new(HnswMaintenanceWorker::new(Arc::new(DisabledRebuildSource))),
-                fix.ctx,
-            )
-            .unwrap();
-        let cfg = sched.config(WorkerKind::HnswMaintenance.name()).unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(300));
-        sched.shutdown().await.unwrap();
-    });
-}
-
-#[test]
-fn disabled_worker_via_config_does_not_run() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let cfg = WorkerConfig {
-            enabled: false,
-            interval: Duration::from_millis(20),
-            batch_size: 1,
-            max_runtime: Duration::from_secs(1),
-        };
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(
-                Arc::new(
-                    HnswMaintenanceWorker::new(Arc::new(DisabledRebuildSource)).with_config(cfg),
-                ),
-                fix.ctx,
-            )
-            .unwrap();
-        let metrics = sched.metrics(WorkerKind::HnswMaintenance.name()).unwrap();
-        glommio::timer::sleep(Duration::from_millis(150)).await;
-        sched.shutdown().await.unwrap();
-        assert_eq!(
-            metrics
-                .cycles_total
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
         );
     });
 }

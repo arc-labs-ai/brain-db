@@ -157,8 +157,55 @@ the sole author of these commits.
 - Chaos tests for recovery (kill-during-operation).
 - Benchmarks with `criterion` per phase.
 
+**Runner.** Unit + integration tests run under
+[`cargo-nextest`](https://nexte.st) (`just test` — process-per-test,
+parallel, faster on the large suite); doctests stay on
+`cargo test --doc` (nextest doesn't run them). The dev container bakes
+nextest in; install for host use with
+`cargo install --locked cargo-nextest`.
+
+**`#[ignore]` is for *gated* tests, not dead ones.** Reserve it for
+tests that genuinely can't run in the default suite — they need a real
+model (`BRAIN_NER_MODEL_PATH`, `BRAIN_RERANK_MODEL_DIR`), a live API
+key, long wall-time (chaos sweeps, load tests), or are
+workstation-tuned perf gates. Always give a reason
+(`#[ignore = "requires …"]`) and run them on demand with
+`cargo nextest run --run-ignored all` (CI runs them in its live tier).
+Don't `#[ignore]` a test to silence a failure — fix it or delete it.
+
 New behaviour → new test. Spec change → corresponding test
 change.
+
+### Naming tests
+
+A test name is documentation: a reader scanning failures should know
+what broke and why **without opening the file**. Two rules.
+
+**Test functions — name the behaviour, not the mechanism.** Use
+`<subject>_<scenario>_<expected_outcome>` (a lowercase snake_case
+sentence). The name states the *problem the test guards*, and the
+body's assertions should read back as that sentence.
+
+- ✅ `forget_memory_not_found_returns_flag_not_error`
+- ✅ `per_ip_connection_cap_rejects_beyond_max`
+- ✅ `recency_breaks_relevance_ties_toward_recent_event_time`
+- ❌ `round_trip` — round-trip of *what*, expecting *what*?
+- ❌ `two_hop`, `type_filter`, `exact_match` — a mechanism, not a
+  behaviour; relies entirely on the module for meaning.
+
+A bare mechanism word (`round_trip`, `rebuild`, `dispatch`) is only
+acceptable with a subject and an outcome attached
+(`encode_payload_round_trips_preserving_request_hash`). If you can't
+say the outcome in the name, you don't yet know what the test proves.
+
+**Test files — group by the unit/feature under test (Rust norm), and
+open with a `//!` header stating the problem-space.** Keep filenames
+like `encode.rs`, `recall.rs`, `statement_wire.rs`,
+`recovery_integration.rs` — a reader expects `tests/encode.rs` to test
+ENCODE. The *"what problem does this cover"* lives in the file's `//!`
+header (the invariants it guards + any non-obvious setup), not in the
+filename. Every test file — `src` module-test blocks and `tests/*.rs`
+integration files alike — gets a `//!` header.
 
 ## Reporting bugs / security issues
 

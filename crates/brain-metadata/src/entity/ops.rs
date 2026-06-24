@@ -312,10 +312,7 @@ pub fn entity_resolve_scored(
     }
 
     let mut out: Vec<(EntityId, f32)> = best.into_iter().collect();
-    out.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     out.truncate(max_candidates);
     Ok(out)
 }
@@ -910,7 +907,10 @@ mod tests {
         assert_ne!(composed, decomposed, "byte-distinct inputs");
         assert_eq!(normalize_name(composed), normalize_name(decomposed));
         // Same for an accented Latin name and a precomposed/decomposed é.
-        assert_eq!(normalize_name("Jos\u{00E9}"), normalize_name("Jose\u{0301}"));
+        assert_eq!(
+            normalize_name("Jos\u{00E9}"),
+            normalize_name("Jose\u{0301}")
+        );
     }
 
     #[test]
@@ -1135,7 +1135,9 @@ mod tests {
         );
 
         // A surface with no canonical/alias/trigram overlap resolves to nothing.
-        assert!(entity_resolve_scored(&rtxn, "Zzxqwv", 8).unwrap().is_empty());
+        assert!(entity_resolve_scored(&rtxn, "Zzxqwv", 8)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1187,8 +1189,9 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let scored = entity_resolve_scored(&rtxn, "John", 8).unwrap();
         assert!(
-            !scored.iter().any(|(id, s)| (*id == smith_id || *id == doe_id)
-                && (*s - 0.9).abs() < f32::EPSILON),
+            !scored.iter().any(
+                |(id, s)| (*id == smith_id || *id == doe_id) && (*s - 0.9).abs() < f32::EPSILON
+            ),
             "ambiguous partial name must not resolve to either full entity: {scored:?}"
         );
     }
@@ -1537,9 +1540,11 @@ mod tests {
             .into_iter()
             .next()
             .expect("bravo has trigrams");
-        assert!(lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, bravo_tg)
-            .unwrap()
-            .contains(&id));
+        assert!(
+            lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, bravo_tg)
+                .unwrap()
+                .contains(&id)
+        );
         // An "alpha" trigram remains: the old canonical_name moves into
         // aliases on rename, so its trigrams stay indexed (resolver
         // continuity).

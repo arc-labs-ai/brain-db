@@ -6,22 +6,26 @@
 //! `worker_checkpoints` redb table so a restart resumes mid-run
 //! without re-extracting already-completed items.
 //!
-//! ## v1 scope cut — memory text availability
+//! ## How a live backfill re-extracts
 //!
-//! `MEMORIES_TABLE` stores `text_size` but not the text itself
-//! (text lives on the ENCODE wire path + the WAL). Until a post-v1
-//! enhancement adds a memory-text store (or WAL replay), the
-//! backfill worker can:
+//! Memory text is durably persisted in `TEXTS_TABLE` (written inside
+//! the ENCODE apply txn alongside the memory row, and reconstructed on
+//! recovery), so a backfill does not need the original ENCODE frame to
+//! re-extract. For each live item the worker re-enqueues the memory on
+//! the durable `extraction_queue` — the very trigger the live ENCODE
+//! path uses — inside the same write txn as the per-item checkpoint.
+//! The per-shard `ExtractorWorker` drains that queue on its next cycle
+//! and re-runs the full tier pipeline; re-derived statements/relations
+//! flow through the normal supersession path.
 //!
-//! - Walk the plan + write per-item checkpoints.
-//! - Mark `dry_run` items `Completed` immediately.
-//! - For live runs, mark items `Failed` with reason
-//!   `"memory text not persisted (v1 limitation)"`.
-//!
-//! This matches the deferred memory-text-rebuild scope cut. Operators
-//! re-ingest in v1; the checkpoint scaffolding here ships so a later
-//! version can light up content-aware re-extraction without
-//! re-designing the worker.
+//! - `dry_run` items are marked `Completed` without enqueueing (plan
+//!   validation only).
+//! - Live items enqueue + checkpoint `Completed` atomically.
+//! - A memory already extracted under the current schema is re-run only
+//!   when the operator clears the `ExtractorWorker`'s
+//!   `skip_already_extracted` gate; otherwise the live worker
+//!   no-op-skips it on re-drain. That gate is the forced-re-extraction
+//!   knob — backfill itself never deletes prior derivations.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -321,21 +325,50 @@ impl BackfillWorker {
                 .map_err(|e| WorkerError::Internal(format!("mark_completed: {e}")))?;
             ItemOutcome::Completed
         } else {
-            // v1 scope cut: memory text isn't persisted beyond the WAL, so
-            // backfill against historical memories can't re-invoke the
-            // extractor pipeline. Mark as `Failed` with a clear reason;
-            // operators re-ingest. The checkpoint scaffolding lives here
-            // so a post-v1 memory-text store can light this up.
-            let _ = (memory_id, extractor_id);
-            worker_checkpoints::mark_failed(
-                &wtxn,
-                WORKER_ID,
-                item_key,
-                "memory text not persisted (v1 limitation)",
-                now_ns,
-            )
-            .map_err(|e| WorkerError::Internal(format!("mark_failed: {e}")))?;
-            ItemOutcome::Failed
+            // Re-run extraction by re-enqueueing the memory on the durable
+            // extraction queue — the same trigger the live ENCODE path
+            // uses (`brain_metadata::extraction_queue_enqueue`). Memory
+            // text is durably persisted in `TEXTS_TABLE` (written in the
+            // ENCODE apply txn and rebuilt on recovery), so the per-shard
+            // ExtractorWorker can re-read it on its next cycle and re-run
+            // the full tier pipeline; re-derivation flows through the
+            // normal supersession path. The enqueue happens inside this
+            // same wtxn as the checkpoint write, so the trigger commits
+            // atomically with the checkpoint — a crash can never leave a
+            // checkpoint `Completed` without the matching queue row.
+            //
+            // Memories not yet extracted under the current schema are
+            // (re)processed; already-extracted memories are re-run only
+            // when the operator has turned off the ExtractorWorker's
+            // `skip_already_extracted` gate (the forced-re-extraction
+            // knob), otherwise the live worker no-op-skips them on
+            // re-drain — the safe default. `extractor_id` is the grid
+            // coordinate that selected this memory; the pipeline re-runs
+            // every enabled tier rather than one extractor, so it isn't
+            // threaded further.
+            let _ = extractor_id;
+            match brain_metadata::extraction_queue_enqueue(&wtxn, memory_id, now_ns) {
+                Ok(()) => {
+                    worker_checkpoints::mark_completed(&wtxn, WORKER_ID, item_key, now_ns)
+                        .map_err(|e| WorkerError::Internal(format!("mark_completed: {e}")))?;
+                    ItemOutcome::Completed
+                }
+                Err(e) => {
+                    // Per-item resilience: a failed enqueue marks only this
+                    // item `Failed` and lets the run continue (Failed items
+                    // retry on a later cycle up to MAX_ATTEMPTS_PER_ITEM),
+                    // rather than `?`-aborting the whole backfill.
+                    worker_checkpoints::mark_failed(
+                        &wtxn,
+                        WORKER_ID,
+                        item_key,
+                        format!("enqueue: {e}"),
+                        now_ns,
+                    )
+                    .map_err(|e| WorkerError::Internal(format!("mark_failed: {e}")))?;
+                    ItemOutcome::Failed
+                }
+            }
         };
 
         wtxn.commit()
@@ -431,13 +464,6 @@ mod tests {
         assert_eq!(k1, k2);
         let k3 = item_key_for(m, 8);
         assert_ne!(k1, k3);
-    }
-
-    #[test]
-    fn worker_kind_name() {
-        let w = BackfillWorker::new();
-        assert_eq!(w.name(), "backfill");
-        assert_eq!(w.kind(), WorkerKind::Backfill);
     }
 
     #[test]

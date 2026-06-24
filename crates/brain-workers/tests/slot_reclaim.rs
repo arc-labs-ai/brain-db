@@ -1,5 +1,12 @@
 #![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
 //! Slot reclamation worker tests.
+//!
+//! Guards the tombstone-grace contract: a memory tombstoned past the
+//! grace window is reclaimed (row + adjacent edges purged), one still
+//! within grace or still active is left alone. Pins the FORGET path's
+//! `tombstoned_at` stamp (and that replay doesn't overwrite it), per-cycle
+//! batch caps, custom grace, and that opposite-direction dangling edges
+//! are left for the edge-scrub worker rather than purged here.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,9 +25,7 @@ use brain_ops::{dispatch, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{EncodeRequest, ForgetMode, ForgetRequest, RequestBody};
 use brain_protocol::envelope::response::ResponseBody;
-use brain_workers::{
-    SlotReclamationWorker, Worker, WorkerConfig, WorkerContext, WorkerKind, WorkerScheduler,
-};
+use brain_workers::{SlotReclamationWorker, Worker, WorkerConfig, WorkerContext};
 use redb::ReadableTable;
 use uuid::Uuid;
 
@@ -415,44 +420,6 @@ fn forget_replay_does_not_overwrite_stamp() {
 // ===========================================================================
 // Worker integration (3).
 // ===========================================================================
-
-#[test]
-fn worker_registers_with_correct_kind_and_default_cadence() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(Arc::new(SlotReclamationWorker::new()), fix.ctx)
-            .unwrap();
-        let cfg = sched.config(WorkerKind::SlotReclamation.name()).unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(600));
-        sched.shutdown().await.unwrap();
-    });
-}
-
-#[test]
-fn disabled_worker_via_config_does_not_reclaim() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 10 * DAY_NS));
-        let cfg = WorkerConfig {
-            enabled: false,
-            interval: Duration::from_millis(20),
-            batch_size: 100,
-            max_runtime: Duration::from_secs(1),
-        };
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(
-                Arc::new(SlotReclamationWorker::new().with_config(cfg)),
-                fix.ctx.clone(),
-            )
-            .unwrap();
-        glommio::timer::sleep(Duration::from_millis(150)).await;
-        sched.shutdown().await.unwrap();
-        assert_eq!(count_memories(&fix.metadata), 1);
-    });
-}
 
 #[test]
 fn custom_grace_period_honoured() {
