@@ -372,20 +372,15 @@ pub struct LlmSpawnConfig {
 }
 
 /// Knobs ferried from `Config.rerank` into the spawn path.
-#[derive(Clone, Debug)]
+///
+/// The derived `Default` is `enabled: false` (model-free): the cross-encoder
+/// needs an on-disk model an operator provides, and an enabled-but-unloadable
+/// capability is a hard shard-spawn failure. Production overrides this
+/// explicitly from `Config.rerank.enabled` (see main.rs); the default only
+/// feeds `ShardSpawnConfig::new`, used by tests, so it must spawn without models.
+#[derive(Clone, Debug, Default)]
 pub struct RerankSpawnConfig {
     pub enabled: bool,
-}
-
-impl Default for RerankSpawnConfig {
-    // Model-free default: the cross-encoder needs an on-disk model that only an
-    // operator provides, and an enabled-but-unloadable capability is a hard
-    // shard-spawn failure. Production overrides this explicitly from
-    // `Config.rerank.enabled` (see main.rs); this default only feeds
-    // `ShardSpawnConfig::new`, which tests use, so it must spawn without models.
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 /// Knobs ferried from `Config.extractors` into the spawn path. One
