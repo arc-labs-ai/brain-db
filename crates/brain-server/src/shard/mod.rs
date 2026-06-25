@@ -378,8 +378,13 @@ pub struct RerankSpawnConfig {
 }
 
 impl Default for RerankSpawnConfig {
+    // Model-free default: the cross-encoder needs an on-disk model that only an
+    // operator provides, and an enabled-but-unloadable capability is a hard
+    // shard-spawn failure. Production overrides this explicitly from
+    // `Config.rerank.enabled` (see main.rs); this default only feeds
+    // `ShardSpawnConfig::new`, which tests use, so it must spawn without models.
     fn default() -> Self {
-        Self { enabled: true }
+        Self { enabled: false }
     }
 }
 
@@ -393,11 +398,18 @@ pub struct ExtractorTierSpawnConfig {
 }
 
 impl Default for ExtractorTierSpawnConfig {
+    // Model-free default: pattern needs nothing, but the classifier (GLiNER)
+    // needs an on-disk model and the LLM tier a provider key — an enabled tier
+    // that can't load is a hard shard-spawn failure. Production overrides all
+    // three explicitly from `Config.extractors.*` (see main.rs); this default
+    // only feeds `ShardSpawnConfig::new`, used by tests, so it must spawn
+    // without models. The full-pipeline corpus harness re-enables them and is
+    // gated on the model being present.
     fn default() -> Self {
         Self {
             pattern_enabled: true,
-            classifier_enabled: true,
-            llm_enabled: true,
+            classifier_enabled: false,
+            llm_enabled: false,
         }
     }
 }

@@ -112,21 +112,13 @@ pub async fn start(n_shards: usize) -> Server {
 /// caller owns the directory's lifetime — useful when a test wants to
 /// inspect on-disk state after `Server::stop()` returns.
 pub async fn start_in(data_dir: &Path, n_shards: usize) -> Server {
+    // ShardSpawnConfig::new defaults the model/key-dependent capabilities
+    // (classifier, llm, rerank) to OFF so a shard spawns without GLiNER /
+    // cross-encoder models or an LLM key — see their Default impls. The tests
+    // on this harness exercise the wire / dispatch / storage / recall paths,
+    // not extraction quality, so the model-free pattern tier is enough.
     start_in_with(data_dir, n_shards, |dd| {
-        let mut cfg = ShardSpawnConfig::new(dd, stub_dispatcher());
-        // Pattern-only extraction. The classifier (GLiNER) and LLM tiers need
-        // an on-disk model / API key that CI doesn't provide, and an enabled-
-        // but-unloadable tier is a hard shard-spawn failure. The tests on this
-        // default harness exercise the wire / dispatch / storage / recall paths,
-        // not extraction quality, so the model-free pattern tier is enough.
-        // Extraction-specific tests opt the heavier tiers back in and skip when
-        // the model / key is absent.
-        cfg.extractors = ExtractorTierSpawnConfig {
-            pattern_enabled: true,
-            classifier_enabled: false,
-            llm_enabled: false,
-        };
-        cfg
+        ShardSpawnConfig::new(dd, stub_dispatcher())
     })
     .await
 }
