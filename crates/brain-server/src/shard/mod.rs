@@ -357,6 +357,13 @@ pub struct ShardSpawnConfig {
     /// tier, ferried from `Config.llm`. Resolved env-first /
     /// config-fallback at shard spawn (`llm_setup::build_llm_deps`).
     pub llm: LlmSpawnConfig,
+    /// Namespace permissive (`auth.mode = "none"`) connections are scoped
+    /// to, ferried from `Config.auth.default_namespace`. Interned into the
+    /// shard's namespace registry at spawn so the dispatch lookup resolves
+    /// it to a real `NamespaceId`. `None` leaves only the seeded `brain`
+    /// system namespace, so permissive callers resolve to the system
+    /// namespace (legacy behavior).
+    pub default_namespace: Option<String>,
 }
 
 /// Knobs ferried from `Config.llm` into the spawn path: the single
@@ -704,6 +711,7 @@ impl ShardSpawnConfig {
             rerank: RerankSpawnConfig::default(),
             extractors: ExtractorTierSpawnConfig::default(),
             llm: LlmSpawnConfig::default(),
+            default_namespace: None,
         }
     }
 }
@@ -753,6 +761,9 @@ pub enum ShardError {
 
     #[error("metadata open failed: {0}")]
     MetadataOpen(#[from] brain_metadata::MetadataDbError),
+
+    #[error("permissive default namespace seed failed: {0}")]
+    NamespaceSeed(String),
 
     #[error("LLM cache open failed: {0}")]
     LlmCache(#[from] brain_metadata::LlmCacheError),
@@ -1484,6 +1495,27 @@ pub fn spawn_shard(
     // brings nothing). The durable redb-backed MetadataDb is the sink.
     let metadata_path = paths.metadata_db();
     let mut metadata_db = MetadataDb::open(&metadata_path)?;
+
+    // Intern the operator's permissive default namespace (if any) into this
+    // shard's registry so the dispatch lookup resolves it to a real
+    // `NamespaceId` — permissive writes/reads then land in that tenant
+    // instead of the reserved `brain` system namespace. Idempotent
+    // (intern-or-get by name), so it's safe on every restart. Skipped when
+    // unset, where permissive callers keep resolving to the system namespace.
+    if let Some(ns) = cfg.default_namespace.as_deref().filter(|s| !s.is_empty()) {
+        let wtxn = metadata_db
+            .write_txn()
+            .map_err(|e| ShardError::NamespaceSeed(format!("write_txn for {ns:?}: {e}")))?;
+        brain_metadata::namespace::namespace_intern_or_get(&wtxn, ns, 0)
+            .map_err(|e| ShardError::NamespaceSeed(format!("intern {ns:?}: {e}")))?;
+        wtxn.commit()
+            .map_err(|e| ShardError::NamespaceSeed(format!("commit {ns:?}: {e}")))?;
+        info!(
+            shard_id,
+            namespace = ns,
+            "interned permissive default namespace"
+        );
+    }
 
     // The LLM extractor cache (`llm_cache.redb`) is opened exactly
     // once per shard — inside the Glommio executor closure below via

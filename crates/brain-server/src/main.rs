@@ -248,7 +248,7 @@ mod linux_main {
         let strict_scope = crate::auth::require_scoped_keys_from_env();
         let auth_store_path = cfg.storage.data_dir.join("api_keys.redb");
         let auth_store = match crate::auth::AuthStore::open(&auth_store_path, strict_scope) {
-            Ok(s) => Arc::new(s),
+            Ok(s) => Arc::new(s.with_default_namespace(cfg.auth.default_namespace.clone())),
             Err(e) => {
                 tracing::error!(
                     error = %e,
@@ -477,6 +477,10 @@ mod linux_main {
                 api_key: cfg.llm.api_key.clone(),
                 model: cfg.llm.model.clone(),
             };
+            // Ferry the operator's permissive default namespace so each
+            // shard interns it and permissive callers resolve to that
+            // tenant instead of the system namespace.
+            spawn_cfg.default_namespace = cfg.auth.default_namespace.clone();
             // Ferry the operator's `[workers.auto_edge]`
             // overrides into the per-shard spawn config so the
             // AutoEdgeWorker registers with the configured knobs

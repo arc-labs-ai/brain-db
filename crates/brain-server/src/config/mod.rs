@@ -1024,12 +1024,22 @@ fn default_service_name() -> String {
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     pub mode: AuthMode,
+    /// Namespace that permissive (`mode = "none"`) connections are scoped
+    /// to. Interned into every shard at spawn so the dispatch lookup
+    /// resolves it to a real `NamespaceId` — permissive writes/reads then
+    /// land in this operator-named tenant instead of the reserved `brain`
+    /// system namespace. `None` keeps the legacy behavior (permissive
+    /// callers resolve to the system namespace). Ignored under
+    /// `mode = "apikey"`, where each key carries its own namespace.
+    #[serde(default)]
+    pub default_namespace: Option<String>,
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             mode: AuthMode::None,
+            default_namespace: None,
         }
     }
 }

@@ -109,6 +109,17 @@ impl RequestCaller {
         self
     }
 
+    /// Set the addressable namespace WITHOUT enabling scope enforcement.
+    /// The permissive path uses this to scope `auth=none` connections to an
+    /// operator-configured namespace: dispatch resolves + stamps the
+    /// namespace so writes land in that tenant, while the cross-namespace
+    /// and agent-filter guards stay off (`scope_enforced` remains false).
+    #[must_use]
+    pub fn with_namespace(mut self, namespace: String) -> Self {
+        self.namespace = namespace;
+        self
+    }
+
     /// True iff every bit in `op` is set on this caller's permission
     /// bitfield. In permissive mode this is always true.
     #[must_use]

@@ -64,14 +64,17 @@ pub struct RequestScope {
 }
 
 impl RequestScope {
-    /// Build a permissive scope carrying the agent the client claimed.
+    /// Build a permissive scope carrying the agent the client claimed and
+    /// the operator-configured default namespace (empty = none, resolves to
+    /// the system namespace). Scope binding stays off — the namespace is
+    /// carried only so dispatch stamps writes into that tenant.
     #[must_use]
-    pub fn permissive(agent_id: AgentId) -> Self {
+    pub fn permissive(agent_id: AgentId, namespace: String) -> Self {
         Self {
             agent_id,
             org_id: [0u8; 16],
             user_id: [0u8; 16],
-            namespace: String::new(),
+            namespace,
             permissions: bits::FULL,
             scope_enforced: false,
             key_hash: [0u8; 32],
@@ -124,7 +127,15 @@ impl RequestScope {
                 self.permissions,
             )
         } else {
-            brain_ops::RequestCaller::new(self.agent_id)
+            // Permissive: carry the configured default namespace (if any)
+            // so dispatch stamps writes into that tenant, but leave scope
+            // enforcement off.
+            let caller = brain_ops::RequestCaller::new(self.agent_id);
+            if self.namespace.is_empty() {
+                caller
+            } else {
+                caller.with_namespace(self.namespace.clone())
+            }
         };
         base.with_session_id(session_id)
     }
@@ -159,6 +170,11 @@ pub enum AuthError {
 pub struct AuthStore {
     db: RwLock<ApiKeyDb>,
     strict: bool,
+    /// Namespace permissive (`auth=none`) connections are scoped to.
+    /// `None` keeps legacy behavior (permissive callers resolve to the
+    /// system namespace). Ignored in strict mode, where each key carries
+    /// its own namespace.
+    default_namespace: Option<String>,
 }
 
 impl AuthStore {
@@ -170,7 +186,21 @@ impl AuthStore {
         Ok(Self {
             db: RwLock::new(db),
             strict,
+            default_namespace: None,
         })
+    }
+
+    /// Set the permissive default namespace (from `[auth] default_namespace`).
+    #[must_use]
+    pub fn with_default_namespace(mut self, namespace: Option<String>) -> Self {
+        self.default_namespace = namespace.filter(|s| !s.is_empty());
+        self
+    }
+
+    /// The permissive default namespace, if configured.
+    #[must_use]
+    pub fn default_namespace(&self) -> Option<&str> {
+        self.default_namespace.as_deref()
     }
 
     /// True iff scope binding is enforced for new connections.
@@ -310,10 +340,12 @@ pub fn derive_scope_from_handshake(
 ) -> Result<RequestScope, AuthError> {
     if !store.strict() {
         // Permissive: token (if any) is opaque, we just trust the
-        // client-supplied agent. No store hit on the hot path.
-        return Ok(RequestScope::permissive(AgentId(uuid::Uuid::from_bytes(
-            auth.agent_id,
-        ))));
+        // client-supplied agent. No store hit on the hot path. The caller
+        // is scoped to the operator-configured default namespace (if any).
+        return Ok(RequestScope::permissive(
+            AgentId(uuid::Uuid::from_bytes(auth.agent_id)),
+            store.default_namespace().unwrap_or_default().to_string(),
+        ));
     }
 
     let secret = match (&auth.method, &auth.credentials) {
@@ -397,6 +429,41 @@ mod tests {
         assert!(!scope.scope_enforced);
         assert_eq!(scope.permissions, bits::FULL);
         assert_eq!(scope.agent_id, AgentId(uuid::Uuid::from_bytes(agent(7))));
+        // No configured default namespace → empty (resolves to the system
+        // namespace at dispatch). The caller carries no namespace.
+        assert_eq!(scope.namespace, "");
+        assert_eq!(scope.to_caller([0u8; 16]).namespace, "");
+    }
+
+    #[test]
+    fn permissive_default_namespace_flows_to_scope_and_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        // Permissive store configured with an operator default namespace.
+        let store = Arc::new(
+            AuthStore::open(dir.path().join("api_keys.redb"), false)
+                .unwrap()
+                .with_default_namespace(Some("acme".to_string())),
+        );
+        let scope =
+            derive_scope_from_handshake(&auth_none(agent(3)), &store).expect("permissive accepts");
+        // Scope binding stays OFF, but the configured namespace is carried
+        // so dispatch stamps writes into that tenant.
+        assert!(!scope.scope_enforced);
+        assert_eq!(scope.namespace, "acme");
+        let caller = scope.to_caller([0u8; 16]);
+        assert_eq!(caller.namespace, "acme");
+        assert!(!caller.scope_enforced);
+    }
+
+    #[test]
+    fn permissive_empty_default_namespace_is_ignored() {
+        // An empty string is normalized to "no default" so it can't be
+        // confused with a real namespace named "".
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::open(dir.path().join("api_keys.redb"), false)
+            .unwrap()
+            .with_default_namespace(Some(String::new()));
+        assert_eq!(store.default_namespace(), None);
     }
 
     #[test]
