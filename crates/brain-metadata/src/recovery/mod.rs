@@ -245,6 +245,7 @@ mod tests {
             memory_id: mid(slot, 1),
             request_id: rid(byte),
             agent_id: aid(byte),
+            namespace_id: brain_core::NamespaceId::from(u32::from(byte)),
             context_id: ContextId(42),
             kind: MemoryKind::Episodic,
             salience_initial: 0.5,
@@ -884,6 +885,7 @@ mod tests {
             is_symmetric: false,
             properties_blob: vec![1, 2, 3],
             agent_id: aid(1),
+            namespace_id: brain_core::NamespaceId::from(5),
             relation_type_intern_hint: None,
         }
     }
@@ -909,6 +911,10 @@ mod tests {
         let sidecar = rtxn.open_table(RELATION_METADATA_TABLE).unwrap();
         let meta = sidecar.get(&rid_bytes).unwrap().unwrap().value();
         assert_eq!(meta.relation_type_id, 101);
+        // The owning namespace rides the RelationLink WAL payload, so the
+        // recovered sidecar carries the real tenant (sample uses ns 5),
+        // never the SYSTEM fallback.
+        assert_eq!(meta.namespace_id, 5);
         assert!((meta.confidence - 0.92).abs() < 1e-6);
         assert_eq!(meta.is_current, 1);
         assert_eq!(meta.tombstoned, 0);

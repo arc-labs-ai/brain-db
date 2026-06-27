@@ -371,6 +371,7 @@ fn encode_record(slot: u64, byte: u8) -> WalRecord {
         memory_id: MemoryId::pack(1, slot, 1),
         request_id: RequestId::from([byte; 16]),
         agent_id: AgentId::from([byte; 16]),
+        namespace_id: brain_core::NamespaceId::from(u32::from(byte)),
         context_id: ContextId(0),
         kind: MemoryKind::Episodic,
         salience_initial: 0.5,

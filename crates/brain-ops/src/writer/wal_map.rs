@@ -91,6 +91,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             // this field.
             request_id: brain_core::RequestId(write.write_id.as_uuid()),
             agent_id: write.agent_id,
+            namespace_id: write.namespace,
             context_id: *context,
             kind: *kind,
             salience_initial: salience.raw(),
@@ -311,6 +312,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
                 is_symmetric: new_rel.is_symmetric,
                 properties_blob: new_rel.properties_blob.clone(),
                 agent_id: write.agent_id,
+                namespace_id: write.namespace,
                 relation_type_intern_hint: None,
             },
         })),
@@ -348,6 +350,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             is_symmetric: *is_symmetric,
             properties_blob: properties_blob.clone(),
             agent_id: write.agent_id,
+            namespace_id: write.namespace,
             relation_type_intern_hint: relation_type_intern_hint.clone(),
         })),
 

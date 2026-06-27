@@ -98,6 +98,7 @@ fn gen_record(rng: &mut u64, slot: u64) -> WalRecord {
         memory_id: MemoryId::pack(1, slot, 1),
         request_id: RequestId::from(bytes16_from(r1)),
         agent_id: AgentId::from(bytes16_from(r2)),
+        namespace_id: brain_core::NamespaceId::SYSTEM,
         context_id: ContextId(r3),
         kind: MemoryKind::Episodic,
         salience_initial: 0.5,

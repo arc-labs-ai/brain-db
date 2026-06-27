@@ -168,6 +168,7 @@ mod tests {
             memory_id,
             request_id: RequestId::from([0u8; 16]),
             agent_id: AgentId::from([0u8; 16]),
+            namespace_id: brain_core::NamespaceId::SYSTEM,
             context_id: ContextId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.5,

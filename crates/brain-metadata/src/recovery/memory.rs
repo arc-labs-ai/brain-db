@@ -47,16 +47,12 @@ impl MetadataDb {
             // Stamp the dedup back-reference on the memory row when the
             // originating ENCODE opted in. Forget reads it to evict the
             // matching FINGERPRINTS entry in the same write txn.
-            // FAIL-CLOSED FOLLOW-UP: recovery must preserve the original
-            // owning namespace, which means the WAL Encode payload has to
-            // carry `namespace_id` (brain-storage). Until that lands,
-            // rebuild under the system namespace — benign while all live
-            // data is still SYSTEM (pre-AUTH), but MUST be replaced with
-            // `p.namespace_id` before namespaces carry real tenant data,
-            // or recovery will mis-bucket. Tracked in the namespace plan.
+            // The owning namespace rides the WAL Encode payload, so recovery
+            // rebuilds the row under its real tenant — never the SYSTEM
+            // fallback — and cross-tenant isolation survives a restart.
             let mut mem = MemoryMetadata::new_active(
                 memory_id,
-                brain_core::NamespaceId::SYSTEM,
+                p.namespace_id,
                 p.agent_id,
                 p.context_id,
                 slot_id,

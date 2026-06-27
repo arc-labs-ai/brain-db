@@ -536,6 +536,7 @@ mod tests {
             memory_id,
             request_id: rid(0),
             agent_id: aid(0),
+            namespace_id: brain_core::NamespaceId::SYSTEM,
             context_id: ContextId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.5,

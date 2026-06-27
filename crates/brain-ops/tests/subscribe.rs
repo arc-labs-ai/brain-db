@@ -668,6 +668,7 @@ mod wal_record_projection {
             is_symmetric: false,
             properties_blob: vec![],
             agent_id: AgentId::default(),
+            namespace_id: brain_core::NamespaceId::SYSTEM,
             relation_type_intern_hint: None,
         };
         let r = rec(WalPayload::RelationLink(p));
@@ -698,6 +699,7 @@ mod wal_record_projection {
             is_symmetric: false,
             properties_blob: vec![],
             agent_id: AgentId::default(),
+            namespace_id: brain_core::NamespaceId::SYSTEM,
             relation_type_intern_hint: None,
         };
         let r = rec(WalPayload::RelationSupersede(RelationSupersedePayload {
@@ -733,6 +735,7 @@ mod wal_record_projection {
             memory_id: mid(1),
             request_id: RequestId::default(),
             agent_id: AgentId::default(),
+            namespace_id: brain_core::NamespaceId::SYSTEM,
             context_id: ContextId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.5,

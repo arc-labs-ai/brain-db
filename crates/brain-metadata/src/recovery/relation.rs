@@ -213,14 +213,11 @@ fn write_relation_link(
         Some(_) => 2,
         None => 1,
     };
-    // The WAL payload carries the owning `agent_id`; the namespace is not
-    // yet on the relation payload (the write-layer phase adds it alongside
-    // the producers). Until then recovery stamps the system namespace +
-    // the recorded agent. See the deviation note in the slice report.
-    let scope = RowScope::from_bytes(
-        brain_core::NamespaceId::SYSTEM.raw(),
-        <[u8; 16]>::from(p.agent_id),
-    );
+    // The WAL payload carries the owning `(namespace, agent)`, so recovery
+    // rebuilds the relation sidecar (and its scope-prefixed evidence index)
+    // under the real tenant — cross-tenant isolation on the typed-graph
+    // holds across a restart.
+    let scope = RowScope::from_bytes(p.namespace_id.raw(), <[u8; 16]>::from(p.agent_id));
     let meta = RelationMetadata {
         namespace_id: scope.namespace_id,
         agent_id_bytes: scope.agent_id_bytes,

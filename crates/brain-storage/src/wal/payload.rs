@@ -19,8 +19,8 @@
 //!   the `flags` bit at this layer.
 
 use brain_core::{
-    AgentId, ContextId, EdgeKindRef, EdgeKindRefError, EdgeOrigin, MemoryId, MemoryKind, NodeRef,
-    NodeRefError, RelationId, RelationTypeId, RequestId, TxnId,
+    AgentId, ContextId, EdgeKindRef, EdgeKindRefError, EdgeOrigin, MemoryId, MemoryKind,
+    NamespaceId, NodeRef, NodeRefError, RelationId, RelationTypeId, RequestId, TxnId,
 };
 
 /// Opaque 16-byte fingerprint of an embedding model.
@@ -35,6 +35,11 @@ pub struct EncodePayload {
     pub memory_id: MemoryId,
     pub request_id: RequestId,
     pub agent_id: AgentId,
+    /// Owning tenant. Carried in the WAL so recovery rebuilds the memory
+    /// row under its real namespace — without it, replay would re-persist
+    /// every memory under the SYSTEM namespace and silently break tenant
+    /// isolation across a restart.
+    pub namespace_id: NamespaceId,
     pub context_id: ContextId,
     pub kind: MemoryKind,
     pub salience_initial: f32,
@@ -260,6 +265,11 @@ pub struct RelationLinkPayload {
     /// without it, a multi-tenant subscriber would silently drop every
     /// replayed relation create.
     pub agent_id: AgentId,
+    /// Owning tenant. Carried so recovery rebuilds the relation sidecar
+    /// under its real namespace instead of SYSTEM — the relation's
+    /// `(namespace, agent)` scope must survive a restart for cross-tenant
+    /// isolation to hold on the typed-graph after recovery.
+    pub namespace_id: NamespaceId,
     /// Schemaless-path intern hint: `Some((namespace, name))` when the
     /// relation type was not declared at write time, so `relation_type_id`
     /// holds the pre-intern placeholder and recovery re-resolves it
@@ -820,6 +830,7 @@ fn encode_encode(p: &EncodePayload, out: &mut Vec<u8>) {
     put_memory_id(out, p.memory_id);
     put_uuid_bytes(out, p.request_id.into());
     put_uuid_bytes(out, p.agent_id.into());
+    put_u32_le(out, p.namespace_id.raw());
     put_u64_le(out, p.context_id.raw());
     out.push(memory_kind_to_u8(p.kind));
     put_f32_le(out, p.salience_initial);
@@ -848,6 +859,7 @@ fn decode_encode(r: &mut Reader<'_>) -> Result<EncodePayload, WalPayloadError> {
     let memory_id = r.memory_id()?;
     let request_id: RequestId = r.array16()?.into();
     let agent_id: AgentId = r.array16()?.into();
+    let namespace_id = NamespaceId::from(r.u32_le()?);
     let context_id = ContextId::from(r.u64_le()?);
     let kind = memory_kind_from_u8(r.u8()?)?;
     let salience_initial = r.f32_le()?;
@@ -890,6 +902,7 @@ fn decode_encode(r: &mut Reader<'_>) -> Result<EncodePayload, WalPayloadError> {
         memory_id,
         request_id,
         agent_id,
+        namespace_id,
         context_id,
         kind,
         salience_initial,
@@ -1192,7 +1205,8 @@ fn encode_relation_link(p: &RelationLinkPayload, out: &mut Vec<u8>) {
     //   supersedes Option<RelationId> (1 or 17) ||
     //   evidence_count (4 LE) + evidence_ids (16 * N) ||
     //   extractor_id (4 LE) || is_symmetric (1) ||
-    //   properties_blob (4 LE len + bytes) || agent_id (16).
+    //   properties_blob (4 LE len + bytes) || agent_id (16) ||
+    //   namespace_id (4 LE).
     out.extend_from_slice(&p.relation_id.to_bytes());
     put_node_ref(out, p.from);
     put_node_ref(out, p.to);
@@ -1211,6 +1225,7 @@ fn encode_relation_link(p: &RelationLinkPayload, out: &mut Vec<u8>) {
     out.push(u8::from(p.is_symmetric));
     put_blob(out, &p.properties_blob);
     put_uuid_bytes(out, p.agent_id.into());
+    put_u32_le(out, p.namespace_id.raw());
     // relation_type_intern_hint: tag byte then two length-prefixed strings.
     match &p.relation_type_intern_hint {
         None => out.push(0),
@@ -1244,6 +1259,7 @@ fn decode_relation_link(r: &mut Reader<'_>) -> Result<RelationLinkPayload, WalPa
     let is_symmetric = r.u8()? != 0;
     let properties_blob = read_blob(r)?;
     let agent_id: AgentId = r.array16()?.into();
+    let namespace_id = NamespaceId::from(r.u32_le()?);
     let relation_type_intern_hint = match r.u8()? {
         0 => None,
         1 => {
@@ -1269,6 +1285,7 @@ fn decode_relation_link(r: &mut Reader<'_>) -> Result<RelationLinkPayload, WalPa
         is_symmetric,
         properties_blob,
         agent_id,
+        namespace_id,
         relation_type_intern_hint,
     })
 }
@@ -1377,6 +1394,9 @@ mod tests {
                 memory_id: mid(7),
                 request_id: rid(1),
                 agent_id: aid(2),
+                // Non-system namespace so the round-trip proves the field
+                // survives encode→decode (a field-order bug would mismatch).
+                namespace_id: NamespaceId::from(5),
                 context_id: ContextId(0xCAFE),
                 kind: MemoryKind::Episodic,
                 salience_initial: 0.5,
@@ -1504,6 +1524,9 @@ mod tests {
             is_symmetric: false,
             properties_blob: vec![1, 2, 3, 4, 5],
             agent_id: aid(0xC5),
+            // Non-system namespace so the round-trip proves the field
+            // survives the relation-link codec.
+            namespace_id: NamespaceId::from(9),
             relation_type_intern_hint: None,
         }
     }
@@ -1634,6 +1657,7 @@ mod tests {
             memory_id: mid(1),
             request_id: rid(0),
             agent_id: aid(0),
+            namespace_id: NamespaceId::SYSTEM,
             context_id: ContextId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.0,
@@ -1648,9 +1672,10 @@ mod tests {
         });
         let mut bytes = p.encode_to_bytes();
         // Text starts after MemoryId(16) + RequestId(16) + AgentId(16)
-        //   + ContextId(8) + kind(1) + salience(4) + fp(16) + text_len(4)
-        // = 81. Replace the 2-byte text with an invalid UTF-8 lead byte.
-        let text_start = 16 + 16 + 16 + 8 + 1 + 4 + 16 + 4;
+        //   + NamespaceId(4) + ContextId(8) + kind(1) + salience(4) + fp(16)
+        //   + text_len(4) = 85. Replace the 2-byte text with an invalid
+        // UTF-8 lead byte.
+        let text_start = 16 + 16 + 16 + 4 + 8 + 1 + 4 + 16 + 4;
         bytes[text_start] = 0xC0; // illegal UTF-8 lead
         bytes[text_start + 1] = 0xC0;
         assert_eq!(
@@ -1690,6 +1715,7 @@ mod tests {
             memory_id: mid(1),
             request_id: rid(0),
             agent_id: aid(0),
+            namespace_id: NamespaceId::SYSTEM,
             context_id: ContextId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.0,
@@ -1716,6 +1742,7 @@ mod tests {
             memory_id: mid(1),
             request_id: rid(0),
             agent_id: aid(0),
+            namespace_id: NamespaceId::SYSTEM,
             context_id: ContextId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.0,
@@ -1744,6 +1771,7 @@ mod tests {
             memory_id: mid(1),
             request_id: rid(0),
             agent_id: aid(0),
+            namespace_id: NamespaceId::SYSTEM,
             context_id: ContextId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.0,
@@ -1773,6 +1801,7 @@ mod tests {
             memory_id: mid(1),
             request_id: rid(0),
             agent_id: aid(0),
+            namespace_id: NamespaceId::SYSTEM,
             context_id: ContextId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.0,
@@ -1972,6 +2001,7 @@ mod tests {
             memory_id: mid(1),
             request_id: rid(1),
             agent_id: aid(1),
+            namespace_id: NamespaceId::SYSTEM,
             context_id: ContextId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.5,
@@ -2070,6 +2100,7 @@ mod tests {
                 memory_id: mid(1),
                 request_id: rid(0),
                 agent_id: aid(0),
+                namespace_id: NamespaceId::SYSTEM,
                 context_id: ContextId(0),
                 kind: MemoryKind::Episodic,
                 salience_initial: 0.0,
@@ -2115,6 +2146,7 @@ mod tests {
                 is_symmetric,
                 properties_blob,
                 agent_id: aid(0x09),
+                namespace_id: NamespaceId::from(3),
                 relation_type_intern_hint: None,
             };
             let p = WalPayload::RelationLink(rl);

@@ -131,6 +131,9 @@ fn encode_payload(slot: u64, byte: u8) -> EncodePayload {
         memory_id: mid(slot, 1),
         request_id: rid(byte),
         agent_id: aid(byte),
+        // Derive a distinct, non-system namespace per fixture byte so a
+        // recovery scenario can assert the owner namespace survives replay.
+        namespace_id: brain_core::NamespaceId::from(u32::from(byte)),
         context_id: ContextId(42),
         kind: MemoryKind::Episodic,
         salience_initial: 0.5,
@@ -185,8 +188,21 @@ fn scenario_a_basic_write_then_recover() {
     let rtxn = meta.read_txn().unwrap();
     // memories
     let mems = rtxn.open_table(MEMORIES_TABLE).unwrap();
-    assert!(mems.get(&id1.to_be_bytes()).unwrap().is_some());
-    assert!(mems.get(&id2.to_be_bytes()).unwrap().is_some());
+    let m1 = mems
+        .get(&id1.to_be_bytes())
+        .unwrap()
+        .expect("id1 recovered");
+    let m2 = mems
+        .get(&id2.to_be_bytes())
+        .unwrap()
+        .expect("id2 recovered");
+    // The owning namespace rides the WAL Encode payload, so recovery must
+    // rebuild each row under its real tenant (fixture byte N → namespace N),
+    // never the SYSTEM fallback — cross-tenant isolation survives a restart.
+    assert_eq!(m1.value().namespace().raw(), 1);
+    assert_eq!(m2.value().namespace().raw(), 2);
+    drop(m1);
+    drop(m2);
     // texts
     let texts = rtxn.open_table(TEXTS_TABLE).unwrap();
     assert_eq!(
@@ -752,6 +768,7 @@ fn relation_link_payload(
         is_symmetric: false,
         properties_blob: vec![],
         agent_id: aid(1),
+        namespace_id: brain_core::NamespaceId::from(9),
         relation_type_intern_hint: None,
     }
 }

@@ -134,6 +134,7 @@ fn encode_payload(slot: u64, byte: u8) -> EncodePayload {
         memory_id: mid(slot, 1),
         request_id: rid(byte),
         agent_id: aid(byte),
+        namespace_id: brain_core::NamespaceId::from(u32::from(byte)),
         context_id: ContextId(42),
         kind: MemoryKind::Episodic,
         salience_initial: 0.5,
@@ -164,6 +165,7 @@ fn sample_relation_link(rid_byte: u8) -> RelationLinkPayload {
         is_symmetric: false,
         properties_blob: vec![0xDE, 0xAD, 0xBE, 0xEF],
         agent_id: aid(7),
+        namespace_id: brain_core::NamespaceId::from(7),
         relation_type_intern_hint: None,
     }
 }
