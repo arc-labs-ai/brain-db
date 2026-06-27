@@ -165,7 +165,7 @@ pub struct AuthPayload {
 /// — server's acknowledgment of successful authentication.
 /// After this frame, the connection is in the "established" state and
 /// operations can flow.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AuthOkPayload {
     /// Confirmed agent_id (echoed from AUTH).
     #[serde(with = "serde_bytes")]
@@ -173,6 +173,12 @@ pub struct AuthOkPayload {
     /// Runtime shard ID this agent is bound to.
     pub bound_shard_id: u16,
     pub permissions: AgentPermissions,
+    /// Owning tenant the connection resolved to (server-derived from auth:
+    /// the API key's namespace in strict mode, or the operator-configured
+    /// permissive default). Empty when the connection resolves to the
+    /// reserved `brain` system namespace (no user tenant). The client never
+    /// sends this — it only surfaces what the server bound the connection to.
+    pub namespace: String,
     /// Server's current time, for the client to detect clock skew
     pub server_time_unix_nanos: u64,
 }
@@ -466,6 +472,7 @@ mod tests {
                 can_forget: true,
                 can_admin: false,
             },
+            namespace: "acme".to_string(),
             server_time_unix_nanos: 1_700_000_000_000_000_000,
         };
         assert_eq!(AuthOkPayload::decode(&original.encode()).unwrap(), original);

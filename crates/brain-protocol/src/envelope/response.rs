@@ -1016,6 +1016,7 @@ mod tests {
                 can_forget: true,
                 can_admin: false,
             },
+            namespace: "acme".to_string(),
             server_time_unix_nanos: 1_700_000_000_000_000_000,
         });
 

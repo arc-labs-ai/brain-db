@@ -26,5 +26,6 @@
     "can_forget": true,
     "can_admin": false
   },
+  "namespace": "acme",
   "server_time_unix_nanos": 1700000000000000000
 }

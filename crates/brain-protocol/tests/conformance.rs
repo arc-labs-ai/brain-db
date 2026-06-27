@@ -684,11 +684,12 @@ fn corpus() -> Vec<Case> {
             can_forget: true,
             can_admin: false,
         },
+        namespace: "acme".to_string(),
         server_time_unix_nanos: 1_700_000_000_000_000_000,
     };
     cases.push(resp_case(
         "resp_auth_ok",
-        ResponseBody::AuthOk(auth_ok),
+        ResponseBody::AuthOk(auth_ok.clone()),
         &auth_ok,
     ));
 

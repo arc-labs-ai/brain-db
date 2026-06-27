@@ -444,6 +444,10 @@ fn on_auth(frame: Frame, state: &mut ConnState, topology: &Topology) -> Action {
         agent_id: *agent.0.as_bytes(),
         bound_shard_id: bound_shard,
         permissions,
+        // Surface the tenant the connection resolved to (strict: the key's
+        // namespace; permissive: the operator default; empty = system). The
+        // client only displays this — it never sends a namespace.
+        namespace: scope.namespace.clone(),
         server_time_unix_nanos: now_unix_nanos(),
     };
     Action::Inline(build_response_frame(0, true, ResponseBody::AuthOk(auth_ok)))

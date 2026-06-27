@@ -81,7 +81,7 @@
     "name": "resp_auth_ok",
     "opcode": "0x0082",
     "kind": "response",
-    "payload_len": 157
+    "payload_len": 172
   },
   {
     "name": "resp_encode",
