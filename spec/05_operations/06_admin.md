@@ -279,6 +279,20 @@ Every credential (API key) binds a `(namespace, agent, permissions)` scope plus 
 
 The wire protocol carries the scope + credential type in the connection's session state, derived from the key at AUTH (never client-supplied). Admin requests on a non-admin session return `Unauthorized`; a write that resolves to no provisioned namespace is rejected fail-closed (`NamespaceRequired` / `NamespaceUnknown`).
 
+### 16.1 Key provisioning is the bootstrap
+
+Identity enters Brain in exactly one place: the admin HTTP surface mints API keys, and minting a key is what creates identity. There is no anonymous access and no self-service identity on the data plane — a data-plane connection can only *prove* a key, never *create* one.
+
+Minting a key:
+
+- **Creates / interns its namespace.** The first key minted for a namespace name brings that tenant into existence; later keys for the same name join it. There is no implicit or default namespace.
+- **Binds its agent** within that namespace, and **binds its permissions** (including whether the key is admin).
+- Returns the opaque key material once, out-of-band, for the operator to hand to the application.
+
+The admin HTTP surface is itself gated by an **operator admin secret**, presented as a request header (the bearer admin token). Without that secret, the provisioning routes reject the request — so the ability to create identity is held by the operator, not by any agent. Keys are revoked the same way; a revoked key fails AUTH (`Unauthenticated`).
+
+The data plane never creates identity: no opcode mints, names, or elevates a key, a namespace, or an agent. The full provisioning flow and the header-based admin-secret gate are specified in [`../17_observability/04_admin_ops.md`](../17_observability/04_admin_ops.md).
+
 ## 17. Audit logging
 
 All admin operations are logged with:

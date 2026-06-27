@@ -312,35 +312,37 @@ export BRAIN_ADMIN_TOKEN="..."
 curl -s -H "Authorization: Bearer $BRAIN_ADMIN_TOKEN" http://127.0.0.1:9092/v1/shards
 ```
 
-Tokens are configured at deployment. Multiple tokens supported (per-operator). Issue and revoke them via the API-key routes:
+The admin token is the operator **admin secret**: it gates the whole admin surface, including key provisioning. Multiple tokens supported (per-operator). Mint and revoke agent-facing keys via the API-key routes — these require the admin secret in the `Authorization` header:
 
 ```bash
-# Issue a scoped key
-curl -s -X POST http://127.0.0.1:9092/v1/api-keys -d '{"permissions":["encode","recall"]}'
+# Mint a scoped key (creates/interns the namespace, binds the agent + permissions)
+curl -s -X POST http://127.0.0.1:9092/v1/api-keys \
+  -H "Authorization: Bearer $BRAIN_ADMIN_TOKEN" \
+  -d '{"namespace":"acme","agent":"support-bot","permissions":["encode","recall"]}'
 # Revoke a key
-curl -s -X DELETE http://127.0.0.1:9092/v1/api-keys/<key-id>
+curl -s -X DELETE http://127.0.0.1:9092/v1/api-keys/<key-id> \
+  -H "Authorization: Bearer $BRAIN_ADMIN_TOKEN"
 ```
 
 ### 12.1 Scope-bound API keys
 
-For agent-facing (non-admin) traffic, API keys are issued with an explicit scope claim bound to the key at issuance time. The server derives the connection's effective `(org_id, user_id, namespace_id, agent_id, permissions)` from the AUTH header rather than trusting any client-supplied `agent_id` on the wire:
+Authentication is **mandatory** on every data-plane connection, and identity is derived 100% from the key. There is no anonymous mode, no default agent, and no default namespace. The server reads the connection's effective `(namespace, agent, permissions)` — plus a non-authoritative `user` audit tag — from the key resolved at AUTH; it never trusts a client-supplied `agent_id` or `namespace` on the wire. A connection with no key, an unresolvable key, or a revoked key is rejected at AUTH (`Unauthenticated`).
+
+Minting binds the scope to the key at issuance time:
 
 ```jsonc
 {
   "key_id": "...",
-  "org_id": "...",
-  "user_id": "...",
-  "namespace_id": "...",
-  "agent_id": "...",
+  "namespace": "acme",        // tenant boundary; interned (created) if new
+  "agent": "support-bot",     // application within the namespace
+  "user": "...",              // optional, non-authoritative audit tag
   "permissions": ["encode", "recall", "subscribe"]
 }
 ```
 
-This closes the agent-impersonation surface: an authenticated client at one `agent_id` cannot construct a request claiming a different `agent_id` and have the server honor it. Every shard-side handler reads the bound `agent_id` from the connection's session state, not from the request payload.
+This closes the agent-impersonation surface: an authenticated client at one `agent` cannot construct a request claiming a different `agent` (or another `namespace`) and have the server honor it. Every shard-side handler reads the bound scope from the connection's session state, not from the request payload.
 
-**v1.0 rollout posture: opt-in via env flag.** Existing deployments don't break — the default-permissive code path is preserved behind `BRAIN_AUTH_SCOPE_BINDING_REQUIRED=false`. Operators opt in by flipping the flag once their key-issuance pipeline emits scope claims.
-
-**v1.1: default-deny.** The flag inverts; operators opt out explicitly if they have a reason to. This is the security target.
+**Provisioning is the only way identity enters the system.** Minting a key creates/interns its namespace and binds its agent; the data plane never creates identity. The mint route itself is gated by the operator admin secret (above), so identity creation is an operator privilege, not an agent one.
 
 The key-issuance flow + the `api_keys` redb table live under `crates/brain-server/src/admin/api_key.rs`; operator UX for key rotation rides on the `/v1/api-keys` routes.
 

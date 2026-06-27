@@ -1,6 +1,6 @@
 # 04.04 Handshake
 
-The connection handshake establishes the protocol version, the session, and the authenticated agent. This file specifies the four frames involved: `HELLO`, `WELCOME`, `AUTH`, `AUTH_OK`.
+The connection handshake establishes the protocol version, the session, and the authenticated scope. Authentication is **mandatory**: every data-plane connection must present a valid credential, and the connection's identity `(namespace, agent, permissions)` is derived entirely from that credential. There is no anonymous mode, no default agent, and no default namespace. This file specifies the four frames involved: `HELLO`, `WELCOME`, `AUTH`, `AUTH_OK`.
 
 ## 1. The handshake sequence
 
@@ -15,7 +15,8 @@ Client                                    Server
   │ ◄──────────────────────────── WELCOME   │
   │                                         │
   │ AUTH ─────────────────────────────────► │
-  │                                         │ (validate credentials, look up agent)
+  │                                         │ (validate credential, resolve scope;
+  │                                         │  reject if missing/unknown/revoked)
   │ ◄────────────────────────── AUTH_OK     │
   │                                         │
   │     [authenticated; operations flow]    │
@@ -96,7 +97,6 @@ struct ServerFeatures {
 enum AuthMethod {
     Token,
     Mtls,
-    None,                            // for test/dev only
 }
 ```
 
@@ -137,23 +137,21 @@ Server-declared parameters that affect client behavior:
 - `max_payload_size` — clients MUST NOT send frames with payload exceeding this size. Default 16 MiB.
 - `max_concurrent_streams` — clients SHOULD limit concurrent stream count to this. Default 1024.
 - `idle_timeout_seconds` — after this much idle time, server sends `SERVER_PING`. Default 300 (5 min).
-- `auth_methods` — which methods the server accepts in `AUTH`.
+- `auth_methods` — which methods the server accepts in `AUTH`. Always non-empty (`Token`, `Mtls`, or both); there is no anonymous method.
 
 ## 4. AUTH
 
-The client's authentication credentials. Sent immediately after `WELCOME`.
+The client's authentication credential. Required, and sent immediately after `WELCOME`. The client does **not** assert who it is — it presents only a credential, and the server resolves identity from it.
 
 ```rust
 struct AuthPayload {
     method: AuthMethod,
-    agent_id: AgentId,                       // 16 bytes; the agent claiming identity
     credentials: AuthCredentials,
 }
 
 enum AuthCredentials {
-    Token(Vec<u8>),                          // bearer token
+    Token(Vec<u8>),                          // bearer token / API key
     Mtls(MtlsClaim),                         // mTLS-presented certificate
-    None,                                    // for test/dev only
 }
 
 struct MtlsClaim {
@@ -173,19 +171,17 @@ Frame layout:
 
 The auth method the client is using. Must be one of those declared in `WELCOME.auth_methods`.
 
-### 4.2 agent_id
+### 4.2 No client-asserted identity
 
-The agent the client is identifying as. The server's authentication backend confirms (or denies) that the credentials authorize this `agent_id`.
-
-This is the field that binds the connection to an agent. From this point on, every operation is authorized as this agent.
+The client carries no `agent_id`, `namespace`, or other identity field in `AUTH`. Identity is resolved server-side from the credential — the API key (or mTLS-bound subject) names exactly one `(namespace, agent, permissions)` scope, set when the key was minted (see [`../05_operations/06_admin.md`](../05_operations/06_admin.md)). A connection cannot claim to be an agent; it proves possession of a key, and the key *is* the agent.
 
 ### 4.3 Token authentication
 
 For `method = Token`:
 
-- The token is opaque to the protocol — it's whatever the operator's auth system issued.
-- Token validation is delegated to a configurable backend (JWT verification, OAuth introspection, or static-token tables).
-- The server verifies the token and binds the agent_id.
+- The token is the API key the operator minted out-of-band via the admin HTTP surface.
+- The server looks the key up in its key store and reads off the bound `(namespace, agent, permissions)`.
+- A token that resolves to no key, or to a revoked key, is rejected — see §6.2.
 
 ### 4.4 mTLS authentication
 
@@ -193,23 +189,16 @@ For `method = Mtls`:
 
 - The server already received the client's certificate during the TLS handshake.
 - The `MtlsClaim` confirms the client's expected cert fingerprint and asserted subject.
-- The server matches the asserted subject against its agent_id mapping (typically Subject Alternative Name or Common Name).
-
-### 4.5 None
-
-For `method = None`:
-
-- No credentials. Allowed only when the server's policy permits.
-- Used for test, dev, and trusted-network deployments.
-- Server still binds the connection to the requested `agent_id`; trust is transitive from the network.
+- The server matches the cert/subject against the minted key store and reads off the bound `(namespace, agent, permissions)`. An unmatched or revoked subject is rejected — see §6.2.
 
 ## 5. AUTH_OK
 
-The server's acknowledgment of successful authentication.
+The server's acknowledgment of successful authentication. Its payload carries the server-resolved scope — `(agent_id, namespace, permissions)` — and that scope is the **only** source of the connection's identity. The client did not supply it; the server derived it from the credential and returns it so the client knows who it is acting as.
 
 ```rust
 struct AuthOkPayload {
-    agent_id: AgentId,                       // confirmed agent_id
+    agent_id: AgentId,                       // resolved from the credential
+    namespace: NamespaceId,                  // resolved from the credential (tenant boundary)
     bound_shard_id: u16,                     // runtime shard ID for this agent
     permissions: AgentPermissions,
     server_time_unix_nanos: u64,             // server's current time, for clock-skew check
@@ -260,15 +249,21 @@ S: closes connection
 
 ### 6.2 Bad AUTH
 
-If authentication fails, the server sends `ERROR` and closes:
+Authentication is mandatory, so every connection must clear this step. The server rejects with `Unauthenticated` and closes the connection on any of:
+
+- **Missing credential** — `AUTH` carried no usable credential (there is no anonymous fallback).
+- **Unknown key** — the token / mTLS subject resolves to no minted key.
+- **Revoked key** — the key once existed but has been revoked via the admin surface.
 
 ```
 S → C: ERROR(stream_id=0, EOS)
-       payload: {code: Unauthenticated, message: "token rejected"}
+       payload: {code: Unauthenticated, message: "credential rejected"}
 S: closes connection
 ```
 
-The error message MAY include detail about why auth failed (token expired, no matching agent, etc.) but SHOULD NOT include sensitive information.
+A key that authenticates but resolves to no provisioned namespace is a separate failure (`NamespaceUnknown`); see [`./07_error_handling.md`](./07_error_handling.md). If the auth backend is itself unreachable, the server returns `AuthBackendUnavailable` rather than `Unauthenticated`.
+
+The error message MAY include detail about why auth failed (token expired, no matching key, etc.) but SHOULD NOT include sensitive information.
 
 ### 6.3 Timeout
 
@@ -296,7 +291,7 @@ For multi-tenant proxies, the recommended pattern is one connection per identity
 
 ## 10. Identity is bound to the API key, not carried in requests
 
-Brain derives the caller's identity from the authenticated API key, not from per-request fields. The AUTH step issues a scope binding whose **authoritative claims are `(namespace, agent, permissions)`**: `namespace` is the tenant (company) data boundary, `agent` is the application within it, and the two together (`(namespace, agent)`) scope every operation on the connection. The key additionally carries a **non-authoritative `user` tag** — a human/service-account identity stamped onto audit rows for traceability ("who did it"); it is never an isolation boundary and never gates access. (The earlier `org` claim is removed: namespace *is* the company boundary.) Clients never construct or send a scope object; the server fills it from the key and resolves the namespace name to its interned `NamespaceId` once at AUTH.
+Brain derives the caller's identity from the authenticated API key, not from per-request fields. Because authentication is mandatory, this scope is **always present** on an established connection and is **always key-derived** — there is no anonymous connection that lacks one, and no default scope to fall back to. The AUTH step issues a scope binding whose **authoritative claims are `(namespace, agent, permissions)`**: `namespace` is the tenant (company) data boundary, `agent` is the application within it, and the two together (`(namespace, agent)`) scope every operation on the connection. The key additionally carries a **non-authoritative `user` tag** — a human/service-account identity stamped onto audit rows for traceability ("who did it"); it is never an isolation boundary and never gates access. (The earlier `org` claim is removed: namespace *is* the company boundary.) Clients never construct or send a scope object; the server fills it from the key and resolves the namespace name to its interned `NamespaceId` once at AUTH.
 
 This closes a class of impersonation bugs at the wire boundary. With identity carried in the request, a client that constructs the wrong `agent_id` or `namespace` could write into another tenant's space; with identity bound to the key, the same request is rejected at the handshake. Operations that legitimately act across agents *within a namespace* (admin migration, snapshot scope) require an admin key with explicit permissions; **no key can act across namespaces** — cross-tenant isolation is absolute.
 

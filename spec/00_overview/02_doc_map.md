@@ -134,7 +134,7 @@ For each section, this file gives a one-paragraph summary, key dependencies, and
 
 ## 17. Observability
 
-**Summary.** Signals (Prometheus metrics, structured JSON logs, OpenTelemetry tracing). Dashboards, alerts, admin ops, runbooks, capacity planning. Security model (TLS, authentication, per-tenant scope binding: `(org_id, user_id, namespace_id, agent_id, permissions)`).
+**Summary.** Signals (Prometheus metrics, structured JSON logs, OpenTelemetry tracing). Dashboards, alerts, admin ops, runbooks, capacity planning. Security model (TLS, mandatory authentication, per-tenant scope binding: `(namespace, agent, permissions)`).
 
 **Depends on.** [01](../01_architecture/00_purpose.md), [16](../16_sharding/00_purpose.md). **Depended on by.** [18](../18_failure_recovery/00_purpose.md).
 

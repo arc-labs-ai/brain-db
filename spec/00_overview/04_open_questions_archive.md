@@ -46,6 +46,10 @@ non-authoritative audit tag; `org` removed). This supersedes the
 "tenant = agent by convention" framing (DM-OQ-6 / OQ-1.6) for the
 namespace-as-tenant case.
 
+## OQ-V2-16: Anonymous / permissive auth posture — RESOLVED
+
+**Resolution (2026-06):** authentication is **mandatory** on every data-plane connection — no anonymous mode, no default agent, no default namespace, no client-claimed identity. Identity `(namespace, agent, permissions)` is derived 100% from the API key resolved at AUTH; a connection with no key, an unresolvable key, or a revoked key is rejected (`Unauthenticated`). Keys are provisioned out-of-band via the admin HTTP surface (gated by the operator admin secret); minting interns the namespace and binds the agent. This **reverses** the earlier "v1.0 ships permissive / scope-binding opt-in behind `BRAIN_AUTH_SCOPE_BINDING_REQUIRED`, token/mTLS deferred" posture. See [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) and [`../05_operations/06_admin.md`](../05_operations/06_admin.md) §16.
+
 ## OQ-V2-5: Statement derivation chains (meta-statements)
 
 **Current:** statements can have statement IDs in their evidence, with depth cap 3. But active derivation rules are not in the typed graph.

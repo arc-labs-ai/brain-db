@@ -111,7 +111,7 @@ Level 3: Per-operation health.
   Are encodes/recalls/etc. fast and successful?
 
 Level 4: Per-tenant health.
-  Are specific agents (scoped by org_id / user_id / namespace_id / agent_id) experiencing issues?
+  Are specific agents (scoped by namespace / agent) experiencing issues?
 ```
 
 Operators monitor at all levels; alerts fire at the level appropriate to the issue.

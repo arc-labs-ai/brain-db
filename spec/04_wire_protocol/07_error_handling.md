@@ -61,6 +61,16 @@ A more specific error code accompanies each category. The complete table:
 | `AuthBackendUnavailable` | Auth backend (e.g., token service) unreachable |
 | `SessionExpired` | Session timed out (rare; sessions are connection-lifetime) |
 
+Authentication is mandatory on every data-plane connection — there is no anonymous mode. The auth-required failure modes all map onto the codes above; no new numbers are needed:
+
+- **Missing credential** (`AUTH` presented nothing) → `Unauthenticated`. There is no anonymous fallback to accept the connection.
+- **Unknown key** (credential resolves to no minted key) → `Unauthenticated`.
+- **Revoked key** (credential names a key that was revoked via the admin surface) → `Unauthenticated`.
+- **Anonymous not allowed** (a client attempts to skip AUTH or asserts identity without a credential) → `Unauthenticated`; an operation sent before `AUTH_OK` is the separate `NotAuthenticated`.
+- A credential that authenticates but resolves to no provisioned namespace → `NamespaceUnknown` (§3.3), not `Unauthenticated`.
+
+The error `message` MAY distinguish these for the operator but the code is the same — clients treat any `Unauthenticated` as "refresh the credential and reconnect".
+
 #### 3.3 Authorization (Category: `Authorization`)
 
 | Code | Meaning |
