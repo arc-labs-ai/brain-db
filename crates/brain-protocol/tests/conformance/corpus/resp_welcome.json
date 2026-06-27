@@ -30,7 +30,7 @@
     "idle_timeout_seconds": 300,
     "auth_methods": [
       0,
-      2
+      1
     ]
   }
 }

@@ -49,8 +49,9 @@ pub struct ServerFeatures {
 
 /// — supported authentication method.
 ///
-/// Numeric repr is stable wire-side: `Token = 0`, `Mtls = 1`, `None = 2`.
-/// Adding a new method requires a wire-version bump.
+/// Numeric repr is stable wire-side: `Token = 0`, `Mtls = 1`. Auth is
+/// mandatory — there is no anonymous method. Adding a new method requires
+/// a wire-version bump.
 #[derive(
     Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
 )]
@@ -60,8 +61,6 @@ pub enum AuthMethod {
     Token = 0,
     /// Mutual-TLS — the cert was presented during the TLS handshake.
     Mtls = 1,
-    /// No credentials — test/dev only; trusted-network deployments.
-    None = 2,
 }
 
 /// — credentials carried in the AUTH frame.
@@ -71,8 +70,6 @@ pub enum AuthCredentials {
     Token(Vec<u8>),
     /// mTLS-presented certificate claim.
     Mtls(MtlsClaim),
-    /// No credentials.
-    None,
 }
 
 /// — mTLS claim accompanying an mTLS auth.
@@ -152,9 +149,8 @@ pub struct AuthPayload {
     /// `WelcomePayload.server_features.auth_methods` (validated at the
     /// AUTH-frame handler in the connection layer, not by [`negotiate`]).
     pub method: AuthMethod,
-    /// The agent the client is identifying as.
-    #[serde(with = "serde_bytes")]
-    pub agent_id: WireUuid,
+    /// The credential. Identity `(namespace, agent, permissions)` is derived
+    /// entirely from this by the server — the client does NOT claim an agent.
     pub credentials: AuthCredentials,
 }
 
@@ -167,17 +163,16 @@ pub struct AuthPayload {
 /// operations can flow.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AuthOkPayload {
-    /// Confirmed agent_id (echoed from AUTH).
+    /// Server-assigned agent_id. The client learns its identity here — it is
+    /// derived from the presented credential, never claimed by the client.
     #[serde(with = "serde_bytes")]
     pub agent_id: WireUuid,
     /// Runtime shard ID this agent is bound to.
     pub bound_shard_id: u16,
     pub permissions: AgentPermissions,
     /// Owning tenant the connection resolved to (server-derived from auth:
-    /// the API key's namespace in strict mode, or the operator-configured
-    /// permissive default). Empty when the connection resolves to the
-    /// reserved `brain` system namespace (no user tenant). The client never
-    /// sends this — it only surfaces what the server bound the connection to.
+    /// the API key's namespace). The client never sends this — it only
+    /// surfaces what the server bound the connection to.
     pub namespace: String,
     /// Server's current time, for the client to detect clock skew
     pub server_time_unix_nanos: u64,
@@ -428,7 +423,6 @@ mod tests {
     fn auth_payload_round_trips_token() {
         let original = AuthPayload {
             method: AuthMethod::Token,
-            agent_id: sample_uuid(3),
             credentials: AuthCredentials::Token(b"opaque-token-bytes".to_vec()),
         };
         assert_eq!(AuthPayload::decode(&original.encode()).unwrap(), original);
@@ -438,21 +432,10 @@ mod tests {
     fn auth_payload_round_trips_mtls() {
         let original = AuthPayload {
             method: AuthMethod::Mtls,
-            agent_id: sample_uuid(4),
             credentials: AuthCredentials::Mtls(MtlsClaim {
                 cert_fingerprint: sample_token(5),
                 asserted_subject: "CN=client.example.com".into(),
             }),
-        };
-        assert_eq!(AuthPayload::decode(&original.encode()).unwrap(), original);
-    }
-
-    #[test]
-    fn auth_payload_round_trips_none() {
-        let original = AuthPayload {
-            method: AuthMethod::None,
-            agent_id: sample_uuid(6),
-            credentials: AuthCredentials::None,
         };
         assert_eq!(AuthPayload::decode(&original.encode()).unwrap(), original);
     }
@@ -488,7 +471,7 @@ mod tests {
             capabilities: v1_caps(),
             client_session_token: None,
         };
-        let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::None]);
+        let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
         server.supported_versions = vec![1, 2];
         let session = negotiate(&client, &server).expect("overlap on 1, 2");
         assert_eq!(session.chosen_version, 2);
@@ -502,7 +485,7 @@ mod tests {
             capabilities: v1_caps(),
             client_session_token: None,
         };
-        let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::None]);
+        let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
         server.supported_versions = vec![1, 2];
         // Client only speaks the current wire version; server speaks
         // both 1 and the current. Negotiation must pick the current,
@@ -520,7 +503,7 @@ mod tests {
             capabilities: v1_caps(),
             client_session_token: None,
         };
-        let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::None]);
+        let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
         server.supported_versions = vec![1, 2];
         let err = negotiate(&client, &server).expect_err("no overlap");
         assert!(matches!(
@@ -546,7 +529,7 @@ mod tests {
             },
             client_session_token: None,
         };
-        let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::None]);
+        let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
         server.capabilities = HelloCapabilities {
             streaming: true,
             compression_zstd: false, // server doesn't
@@ -569,7 +552,7 @@ mod tests {
             capabilities: v1_caps(),
             client_session_token: None,
         };
-        let server = ServerCapabilities::v1_default("s", vec![AuthMethod::None]);
+        let server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
         let session = negotiate(&client, &server).expect("happy path");
         assert!(session.capabilities.streaming);
     }

@@ -748,21 +748,14 @@ mod tests {
             }),
             RequestBody::Auth(AuthPayload {
                 method: AuthMethod::Token,
-                agent_id: sample_uuid(11),
                 credentials: AuthCredentials::Token(b"opaque".to_vec()),
             }),
             RequestBody::Auth(AuthPayload {
                 method: AuthMethod::Mtls,
-                agent_id: sample_uuid(12),
                 credentials: AuthCredentials::Mtls(MtlsClaim {
                     cert_fingerprint: [9u8; 32],
                     asserted_subject: "CN=client".into(),
                 }),
-            }),
-            RequestBody::Auth(AuthPayload {
-                method: AuthMethod::None,
-                agent_id: sample_uuid(13),
-                credentials: AuthCredentials::None,
             }),
         ] {
             let bytes = body.encode();

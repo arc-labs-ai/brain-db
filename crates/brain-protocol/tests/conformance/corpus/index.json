@@ -9,7 +9,7 @@
     "name": "req_auth",
     "opcode": "0x0002",
     "kind": "request",
-    "payload_len": 79
+    "payload_len": 53
   },
   {
     "name": "req_encode",

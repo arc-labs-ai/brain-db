@@ -57,11 +57,9 @@ fn main() {
         w.server_id, w.chosen_version
     );
 
-    let agent_id = [0x5Au8; 16];
     let auth = AuthPayload {
-        method: AuthMethod::None,
-        agent_id,
-        credentials: AuthCredentials::None,
+        method: AuthMethod::Token,
+        credentials: AuthCredentials::Token(b"smoke-token".to_vec()),
     };
     send(
         &mut stream,
@@ -115,7 +113,7 @@ fn main() {
         include_text: true,
         request_id: Some([0x22u8; 16]),
         txn_id: None,
-        agent_filter: vec![agent_id],
+        agent_filter: vec![],
         include_other_agents: false,
     };
     send(

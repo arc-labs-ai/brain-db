@@ -1002,7 +1002,7 @@ mod tests {
                 max_payload_size: 16 * 1024 * 1024 - 1,
                 max_concurrent_streams: 1024,
                 idle_timeout_seconds: 300,
-                auth_methods: vec![AuthMethod::Token, AuthMethod::None],
+                auth_methods: vec![AuthMethod::Token, AuthMethod::Mtls],
             },
         });
         let auth_ok = ResponseBody::AuthOk(AuthOkPayload {

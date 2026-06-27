@@ -258,7 +258,7 @@ fn sample_welcome() -> WelcomePayload {
             max_payload_size: 16 * 1024 * 1024 - 1,
             max_concurrent_streams: 1024,
             idle_timeout_seconds: 300,
-            auth_methods: vec![AuthMethod::Token, AuthMethod::None],
+            auth_methods: vec![AuthMethod::Token, AuthMethod::Mtls],
         },
     }
 }
@@ -564,7 +564,6 @@ fn corpus() -> Vec<Case> {
     ));
     let auth = AuthPayload {
         method: AuthMethod::Token,
-        agent_id: AGENT,
         credentials: AuthCredentials::Token(b"opaque-token".to_vec()),
     };
     cases.push(req_case("req_auth", RequestBody::Auth(auth.clone()), &auth));
