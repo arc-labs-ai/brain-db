@@ -13,7 +13,7 @@ use std::path::PathBuf;
 #[path = "../src/config/mod.rs"]
 mod config;
 
-use config::{AuthMode, Config, ConfigError, LoggingConfig};
+use config::{Config, ConfigError, LoggingConfig};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -94,7 +94,7 @@ fn dev_toml_round_trips_cleanly() {
     assert_eq!(cfg.hnsw.ef_construction, 200);
     assert_eq!(cfg.hnsw.ef_search, 64);
     assert_eq!(cfg.embedder.model, "bge-small-en-v1.5");
-    assert_eq!(cfg.auth.mode, AuthMode::None);
+    assert_eq!(cfg.admin.token.as_deref(), Some("dev-admin-token"));
     assert!(!cfg.server.tls.enabled);
     assert_eq!(cfg.monitoring.logging.format, "json");
 }
@@ -273,6 +273,6 @@ fn omitted_optional_sections_use_defaults() {
     assert_eq!(cfg.workers, Default::default());
     assert_eq!(cfg.monitoring.logging, LoggingConfig::default());
     assert!(!cfg.monitoring.tracing.enabled);
-    assert_eq!(cfg.auth.mode, AuthMode::None);
+    assert!(cfg.admin.token.is_none());
     assert!(!cfg.server.tls.enabled);
 }

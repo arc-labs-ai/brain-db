@@ -54,10 +54,11 @@ cache_size       = 10000
 batch_size       = 32
 batch_window_ms  = 5
 
-[auth]
-# v1.0 ships only `none`. Token / mTLS are deferred.
-# Until then: never expose listen_addr to the public internet.
-mode = "none"
+[admin]
+# Operator admin secret gating the /v1/* admin HTTP plane (key mint /
+# revoke / stats). The admin listener refuses to start without it. Override
+# with BRAIN__ADMIN__TOKEN; never reuse this placeholder in production.
+token = "docker-admin-token"
 
 [monitoring.logging]
 level  = "info"

@@ -14,10 +14,12 @@
 //! - **Admin** (constructed via [`AdminServer::admin`], bound to
 //!   `cfg.server.admin_addr`, default `127.0.0.1:9092` — loopback):
 //!   every `/v1/*` route (snapshots, rebuild-ann, workers, config,
-//!   audit, agents, shards, diagnostics). Operationally sensitive;
-//!   v1 has no built-in authentication so the loopback default
-//!   matters. Front with mTLS / a token-checking reverse proxy if
-//!   you bind it to a public interface.
+//!   audit, agents, shards, diagnostics). Operationally sensitive and the
+//!   bootstrap channel for minting data-plane API keys, so every `/v1/*`
+//!   request is gated on the operator admin secret (`[admin] token` /
+//!   `BRAIN__ADMIN__TOKEN`) presented as `Authorization: Bearer <token>`.
+//!   The server refuses to start the admin listener when no token is
+//!   configured (fail-closed).
 //!
 //! Unknown paths → `404 Not Found`. Routes
 //! that exist on the "other" listener also 404 — `/v1/workers` on

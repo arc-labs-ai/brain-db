@@ -194,9 +194,12 @@ enabled = false
 sampler = "ratio"
 sample_ratio = 0.01
 
-[auth]
-# Dev mode: no auth. Set this for production.
-mode = "none"
+[admin]
+# Operator admin secret. Gates every /v1/* admin HTTP request (key mint /
+# revoke / stats) as `Authorization: Bearer <token>`. The admin listener
+# refuses to start without it. Prefer the environment (BRAIN__ADMIN__TOKEN)
+# for production secrets; this dev value is for local use only.
+token = "dev-admin-token"
 
 [summarizer]
 # Sub-task 9.15. Consolidation worker stays a no-op until an LLM

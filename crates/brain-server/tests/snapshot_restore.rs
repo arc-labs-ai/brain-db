@@ -121,7 +121,7 @@ async fn round_trip(
     (resp_opcode, body)
 }
 
-async fn handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
+async fn handshake(client: &mut TcpStream, token: &[u8]) {
     let hello = HelloPayload {
         client_id: "snapshot-restore-tester".into(),
         supported_versions: vec![brain_protocol::VERSION],
@@ -146,9 +146,8 @@ async fn handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
     assert_eq!(welcome.header.opcode_u16(), Opcode::Welcome.as_u16());
 
     let auth = AuthPayload {
-        method: AuthMethod::None,
-        agent_id,
-        credentials: AuthCredentials::None,
+        method: AuthMethod::Token,
+        credentials: AuthCredentials::Token(token.to_vec()),
     };
     send_frame(
         client,
@@ -185,8 +184,11 @@ async fn encode(client: &mut TcpStream, stream_id: u32, text: &str) -> u128 {
 
 async fn http_request(addr: SocketAddr, method: &str, path: &str, body: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).await.expect("connect admin");
+    // Admin /v1 routes are gated on the operator secret; Config::for_tests
+    // sets it to "test-admin-token".
     let req = format!(
         "{method} {path} HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n\
+         authorization: Bearer test-admin-token\r\n\
          content-length: {len}\r\nconnection: close\r\n\r\n{body}",
         len = body.len(),
     );
@@ -308,7 +310,11 @@ async fn restore_returns_shard_to_snapshot_state() {
         let mut client = TcpStream::connect(server.data_plane_addr)
             .await
             .expect("connect 1");
-        handshake(&mut client, agent_id).await;
+        handshake(
+            &mut client,
+            &server.mint("test", agent_id, brain_metadata::api_keys::bits::FULL),
+        )
+        .await;
 
         for (i, text) in pre_snapshot.iter().enumerate() {
             encode(&mut client, 1 + (i as u32) * 2, text).await;
@@ -370,7 +376,11 @@ async fn restore_rejects_corrupt_bundle() {
         let mut client = TcpStream::connect(server.data_plane_addr)
             .await
             .expect("connect");
-        handshake(&mut client, agent_id).await;
+        handshake(
+            &mut client,
+            &server.mint("test", agent_id, brain_metadata::api_keys::bits::FULL),
+        )
+        .await;
         encode(
             &mut client,
             1,

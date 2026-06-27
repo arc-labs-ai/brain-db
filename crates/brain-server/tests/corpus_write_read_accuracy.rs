@@ -173,7 +173,7 @@ async fn send_frame(client: &mut TcpStream, frame: Frame) {
     client.flush().await.expect("flush");
 }
 
-async fn complete_handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
+async fn complete_handshake(client: &mut TcpStream, token: &[u8]) {
     let hello = HelloPayload {
         client_id: "corpus-e2e".into(),
         supported_versions: vec![brain_protocol::VERSION],
@@ -198,9 +198,8 @@ async fn complete_handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
     assert_eq!(welcome.header.opcode_u16(), Opcode::Welcome.as_u16());
 
     let auth = AuthPayload {
-        method: AuthMethod::None,
-        agent_id,
-        credentials: AuthCredentials::None,
+        method: AuthMethod::Token,
+        credentials: AuthCredentials::Token(token.to_vec()),
     };
     send_frame(
         client,
@@ -384,7 +383,11 @@ async fn corpus_write_then_read_is_accurate() {
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
         .expect("connect");
-    complete_handshake(&mut client, [7u8; 16]).await;
+    complete_handshake(
+        &mut client,
+        &server.mint("test", [7u8; 16], brain_metadata::api_keys::bits::FULL),
+    )
+    .await;
 
     println!("== ENCODE {} memories ==", CORPUS.len());
     let mut ids = Vec::new();

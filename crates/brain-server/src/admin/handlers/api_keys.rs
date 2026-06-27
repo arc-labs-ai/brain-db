@@ -2,10 +2,11 @@
 //!
 //! Three actions:
 //!
-//! - `POST /v1/api-keys` — mint a key. Body is JSON with `org_id`,
-//!   `agent_id`, `namespace`, `permissions` (string array or `u32`
-//!   bitfield), optional `user_id`. The reply carries the raw secret
-//!   once — never again.
+//! - `POST /v1/api-keys` — mint a key. Body is JSON with `agent_id`,
+//!   `namespace`, `permissions` (string array or `u32` bitfield), and
+//!   optional `user_id` / `org_id` (both reserved audit tags, default
+//!   all-zero). Minting interns the namespace and binds the agent +
+//!   permissions. The reply carries the raw secret once — never again.
 //! - `GET /v1/api-keys?agent=…` — list keys for the given agent.
 //! - `DELETE /v1/api-keys/<hex>` — revoke a key by hex key-hash.
 //!
@@ -30,8 +31,10 @@ use crate::auth::hex32;
 /// JSON body of `POST /v1/api-keys`.
 #[derive(Debug, Deserialize)]
 struct MintBody {
-    /// 32 hex chars = 16 bytes.
-    org_id_hex: String,
+    /// 32 hex chars; optional. Reserved audit tag, all-zero when omitted
+    /// (the locked design dropped org_id as an identity dimension).
+    #[serde(default)]
+    org_id_hex: Option<String>,
     /// 32 hex chars; optional. All-zero when omitted.
     #[serde(default)]
     user_id_hex: Option<String>,
@@ -141,9 +144,12 @@ async fn mint(
             ))
         }
     };
-    let org_id = match parse_16(&parsed.org_id_hex) {
-        Ok(b) => b,
-        Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &msg)),
+    let org_id = match parsed.org_id_hex.as_deref() {
+        Some(s) => match parse_16(s) {
+            Ok(b) => b,
+            Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &msg)),
+        },
+        None => [0u8; 16],
     };
     let user_id = match parsed.user_id_hex.as_deref() {
         Some(s) => match parse_16(s) {

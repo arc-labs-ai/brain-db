@@ -95,7 +95,7 @@ async fn send_frame(client: &mut TcpStream, frame: Frame) {
     client.flush().await.expect("flush");
 }
 
-async fn handshake(client: &mut TcpStream) {
+async fn handshake(client: &mut TcpStream, token: &[u8]) {
     let hello = HelloPayload {
         client_id: "extract-backfill-tester".into(),
         supported_versions: vec![brain_protocol::VERSION],
@@ -120,9 +120,8 @@ async fn handshake(client: &mut TcpStream) {
     assert_eq!(welcome.header.opcode_u16(), Opcode::Welcome.as_u16());
 
     let auth = AuthPayload {
-        method: AuthMethod::None,
-        agent_id: *Uuid::now_v7().as_bytes(),
-        credentials: AuthCredentials::None,
+        method: AuthMethod::Token,
+        credentials: AuthCredentials::Token(token.to_vec()),
     };
     send_frame(
         client,
@@ -182,8 +181,11 @@ fn http_post_no_body(admin_addr: &str, path: &str) -> (u16, String) {
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .unwrap();
+    // Admin /v1 routes are gated on the operator secret; Config::for_tests
+    // sets it to "test-admin-token".
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: {admin_addr}\r\nContent-Length: 0\r\n\
+         Authorization: Bearer test-admin-token\r\n\
          Connection: close\r\nAccept: */*\r\n\r\n",
     );
     stream.write_all(req.as_bytes()).unwrap();
@@ -222,7 +224,7 @@ async fn backfill_all_enqueues_every_memory() {
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
         .expect("connect");
-    handshake(&mut client).await;
+    handshake(&mut client, &server.token).await;
 
     // Client op streams must be non-zero and ODD (1, 3, 5…).
     let _ = encode_one(&mut client, 1, "alpha memory one").await;
@@ -261,7 +263,7 @@ async fn backfill_since_zero_matches_all_active() {
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
         .expect("connect");
-    handshake(&mut client).await;
+    handshake(&mut client, &server.token).await;
 
     let _ = encode_one(&mut client, 1, "alpha").await;
     let _ = encode_one(&mut client, 3, "beta").await;
@@ -293,7 +295,7 @@ async fn backfill_memory_id_targets_one_row() {
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
         .expect("connect");
-    handshake(&mut client).await;
+    handshake(&mut client, &server.token).await;
 
     let mem = encode_one(&mut client, 1, "single memory body").await;
     let mem_u128: u128 = u128::from_be_bytes(mem.to_be_bytes());

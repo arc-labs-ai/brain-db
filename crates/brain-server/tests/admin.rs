@@ -106,7 +106,7 @@ async fn start_admin_only() -> Bringup {
     let auth_store = {
         let tmp = tempfile::TempDir::new().expect("tmpdir");
         let p = tmp.path().join("api_keys.redb");
-        let store = Arc::new(crate::auth::AuthStore::open(&p, false).expect("open auth store"));
+        let store = Arc::new(crate::auth::AuthStore::open(&p).expect("open auth store"));
         std::mem::forget(tmp);
         store
     };
@@ -155,8 +155,7 @@ async fn start_admin_with_shards(n_shards: usize) -> Bringup {
     let __auth_store = {
         let tmp = tempfile::TempDir::new().expect("tmpdir");
         let p = tmp.path().join("api_keys.redb");
-        let store =
-            std::sync::Arc::new(crate::auth::AuthStore::open(&p, false).expect("open auth store"));
+        let store = std::sync::Arc::new(crate::auth::AuthStore::open(&p).expect("open auth store"));
         std::mem::forget(tmp);
         store
     };
@@ -165,7 +164,7 @@ async fn start_admin_with_shards(n_shards: usize) -> Bringup {
         routing,
         server_caps: Arc::new(ServerCapabilities::v1_default(
             "brain-server/test",
-            vec![AuthMethod::None],
+            vec![AuthMethod::Token],
         )),
         request_metrics: request_metrics.clone(),
         auth_store: __auth_store.clone(),

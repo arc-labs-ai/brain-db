@@ -31,6 +31,32 @@ pub fn text_response(status: StatusCode, body: &str) -> Response<ResponseBody> {
         .expect("static response always builds")
 }
 
+/// Uniform `401 Unauthorized` response for admin requests that fail the
+/// operator admin-secret check.
+pub fn unauthorized() -> Response<ResponseBody> {
+    json_response(
+        StatusCode::UNAUTHORIZED,
+        "{\"error\":\"unauthorized\",\"detail\":\"admin requests require \
+         Authorization: Bearer <admin token>\"}\n"
+            .to_string(),
+    )
+}
+
+/// Constant-time byte-slice equality. Returns `false` immediately on a
+/// length mismatch (the only timing signal it leaks is the secret length,
+/// which is not sensitive for a bearer token).
+#[must_use]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Uniform `501 Not Implemented` body shape used by routes whose CLI
 /// surface is wired but whose server-side primitive lands later.
 ///

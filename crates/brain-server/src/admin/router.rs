@@ -58,8 +58,29 @@ pub fn build_unified(state: Arc<AdminState>) -> Router<Incoming> {
     attach_v1_routes(r, state)
 }
 
+/// True iff `req` presents the operator admin secret as
+/// `Authorization: Bearer <token>`. Fail-closed: if no admin token is
+/// configured, or the header is missing / malformed / wrong, returns
+/// `false`. The token comparison is constant-time.
+fn admin_authorized(req: &Request<Incoming>, state: &AdminState) -> bool {
+    let Some(expected) = state.config.admin.token.as_deref() else {
+        return false;
+    };
+    let Some(value) = req.headers().get(http::header::AUTHORIZATION) else {
+        return false;
+    };
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let Some(presented) = value.strip_prefix("Bearer ") else {
+        return false;
+    };
+    crate::admin::util::constant_time_eq(presented.as_bytes(), expected.as_bytes())
+}
+
 /// Register every `/v1/*` route on `r`. Shared between
-/// [`build_admin`] and [`build_unified`].
+/// [`build_admin`] and [`build_unified`]. Every route is gated on the
+/// operator admin secret.
 fn attach_v1_routes(r: Router<Incoming>, state: Arc<AdminState>) -> Router<Incoming> {
     // ──────── Snapshot family (POST / GET / DELETE) ────────────────────
     // One handler dispatches on (method, path) internally.
@@ -199,7 +220,9 @@ fn attach_v1_routes(r: Router<Incoming>, state: Arc<AdminState>) -> Router<Incom
     )
 }
 
-/// Register an exact-match route bound to an `Arc<AdminState>`.
+/// Register an exact-match route bound to an `Arc<AdminState>`. Routes
+/// under `/v1` are gated on the operator admin secret; public routes
+/// (`/healthz`, `/readyz`, `/metrics`) are not.
 fn with_state<F, Fut>(
     r: Router<Incoming>,
     method: Method,
@@ -211,13 +234,20 @@ where
     F: Fn(Request<Incoming>, Arc<AdminState>) -> Fut + Send + Sync + Copy + 'static,
     Fut: std::future::Future<Output = brain_http::Result<Response<ResponseBody>>> + Send + 'static,
 {
+    let gated = path.starts_with("/v1");
     r.route(method, path, move |req| {
         let s = state.clone();
-        handler(req, s)
+        async move {
+            if gated && !admin_authorized(&req, &s) {
+                return Ok(crate::admin::util::unauthorized());
+            }
+            handler(req, s).await
+        }
     })
 }
 
-/// Register a prefix-match route bound to an `Arc<AdminState>`.
+/// Register a prefix-match route bound to an `Arc<AdminState>`. Routes
+/// under `/v1` are gated on the operator admin secret.
 fn with_state_prefix<F, Fut>(
     r: Router<Incoming>,
     method: Method,
@@ -229,8 +259,14 @@ where
     F: Fn(Request<Incoming>, Arc<AdminState>) -> Fut + Send + Sync + Copy + 'static,
     Fut: std::future::Future<Output = brain_http::Result<Response<ResponseBody>>> + Send + 'static,
 {
+    let gated = prefix.starts_with("/v1");
     r.route_prefix(method, prefix, move |req| {
         let s = state.clone();
-        handler(req, s)
+        async move {
+            if gated && !admin_authorized(&req, &s) {
+                return Ok(crate::admin::util::unauthorized());
+            }
+            handler(req, s).await
+        }
     })
 }
