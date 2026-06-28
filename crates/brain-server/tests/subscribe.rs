@@ -246,12 +246,16 @@ async fn complete_handshake(client: &mut TcpStream, token: &[u8]) {
     let _ = read_one_frame(client).await.expect("AUTH_OK");
 }
 
-fn open_filter() -> SubscriptionFilter {
+/// A filter scoped to the caller's own agent. Under mandatory auth a
+/// subscriber may only receive its own agent's events, so `agents` must
+/// name exactly the connection's bound agent (a bare `None`/empty filter
+/// is rejected as a cross-tenant leak).
+fn own_filter(agent: [u8; 16]) -> SubscriptionFilter {
     SubscriptionFilter {
         contexts: None,
         kinds: None,
         similar_to: None,
-        agents: None,
+        agents: Some(vec![agent]),
     }
 }
 
@@ -314,7 +318,7 @@ async fn subscribe_receives_encode_events() {
             Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             sub_stream,
-            RequestBody::Subscribe(subscribe_request(open_filter())).encode(),
+            RequestBody::Subscribe(subscribe_request(own_filter(agent_id))).encode(),
         ),
     )
     .await;
@@ -373,7 +377,7 @@ async fn unsubscribe_emits_final_eos_and_response() {
             Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             sub_stream,
-            RequestBody::Subscribe(subscribe_request(open_filter())).encode(),
+            RequestBody::Subscribe(subscribe_request(own_filter(agent_id))).encode(),
         ),
     )
     .await;
@@ -434,7 +438,7 @@ async fn cancel_stream_terminates_subscription() {
             Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             sub_stream,
-            RequestBody::Subscribe(subscribe_request(open_filter())).encode(),
+            RequestBody::Subscribe(subscribe_request(own_filter(agent_id))).encode(),
         ),
     )
     .await;
@@ -490,7 +494,7 @@ async fn subscribe_from_lsn_past_tail_is_accepted() {
     complete_handshake(&mut client, &server.mint(agent_id)).await;
 
     let req = SubscribeRequest {
-        filter: open_filter(),
+        filter: own_filter(agent_id),
         include_history: true,
         from_lsn: Some(123),
         max_inflight: 100,
@@ -532,7 +536,7 @@ async fn double_subscribe_with_same_stream_id_errors() {
     complete_handshake(&mut client, &server.mint(agent_id)).await;
 
     let sub_stream = 15u32;
-    let req = RequestBody::Subscribe(subscribe_request(open_filter())).encode();
+    let req = RequestBody::Subscribe(subscribe_request(own_filter(agent_id))).encode();
     send_frame(
         &mut client,
         Frame::new(
@@ -623,7 +627,7 @@ async fn subscribe_from_lsn_replays_historical_encodes() {
             FLAG_EOS,
             sub_stream,
             RequestBody::Subscribe(SubscribeRequest {
-                filter: open_filter(),
+                filter: own_filter(agent_id),
                 include_history: false,
                 from_lsn: Some(1),
                 max_inflight: 100,
@@ -791,7 +795,7 @@ async fn subscribe_from_lsn_zero_replays_everything_in_wal() {
             FLAG_EOS,
             sub_stream,
             RequestBody::Subscribe(SubscribeRequest {
-                filter: open_filter(),
+                filter: own_filter(agent_id),
                 include_history: false,
                 from_lsn: Some(0),
                 max_inflight: 100,
@@ -850,7 +854,7 @@ async fn subscribe_over_stream_cap_returns_stream_limit_exceeded() {
                 Opcode::SubscribeReq.as_u16(),
                 FLAG_EOS,
                 stream,
-                RequestBody::Subscribe(subscribe_request(open_filter())).encode(),
+                RequestBody::Subscribe(subscribe_request(own_filter(agent_id))).encode(),
             ),
         )
         .await;
@@ -862,7 +866,7 @@ async fn subscribe_over_stream_cap_returns_stream_limit_exceeded() {
             Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             5,
-            RequestBody::Subscribe(subscribe_request(open_filter())).encode(),
+            RequestBody::Subscribe(subscribe_request(own_filter(agent_id))).encode(),
         ),
     )
     .await;
