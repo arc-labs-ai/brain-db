@@ -205,7 +205,11 @@ where
     let auth_store =
         Arc::new(crate::auth::AuthStore::open(&auth_store_path).expect("open auth store"));
     // Mandatory auth: mint a default FULL-permission key so tests can
-    // connect. Multi-agent tests mint more via `Server::mint`.
+    // connect. The default key carries an EMPTY namespace (no namespace
+    // lock) so the broad wire/schema tests address any namespace freely,
+    // as they did before mandatory auth — the key still binds a real agent
+    // and auth is still required. Namespace-scoped tests mint their own
+    // keys via `Server::mint`.
     let default_agent = *uuid::Uuid::now_v7().as_bytes();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -215,7 +219,7 @@ where
         .mint(
             [0u8; 16],
             [0u8; 16],
-            "test".to_string(),
+            String::new(),
             default_agent,
             brain_metadata::api_keys::bits::FULL,
             now,
