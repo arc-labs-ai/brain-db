@@ -26,4 +26,12 @@
 # x86_64 hosts read a different `[target.*]` section (none here = stock
 # rustc defaults). macOS hosts target `aarch64-apple-darwin`, also unaffected.
 [target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=neoverse-n1"]
+# `-fuse-ld=mold`: link with mold instead of the default bfd `ld`. mold is
+# multithreaded and far faster + lighter on memory than bfd, which matters for
+# the heavy brain-server / brain-ops test binaries (bfd link was slow and
+# OOM-prone in the Docker VM — the origin of the old `debuginfo=0` workaround).
+# Requires `mold` in the image (.devcontainer/Dockerfile) and gcc >= 12.1
+# (rust:1-bookworm ships gcc 12), which supports `-fuse-ld=mold` natively.
+# Lives here (per-target) so it scopes to the Linux container only and never
+# touches the macOS host build, which has no mold.
+rustflags = ["-C", "target-cpu=neoverse-n1", "-C", "link-arg=-fuse-ld=mold"]

@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         less \
         lldb \
         man-db \
+        mold \
         sudo \
     && rm -rf /var/lib/apt/lists/*
 
