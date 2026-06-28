@@ -205,20 +205,52 @@ pub async fn dispatch(
     } else {
         let mut owned = ctx.clone();
         owned.executor = owned.executor.with_caller_agent(caller.agent_id);
-        // Resolve the caller's namespace (the company/tenant boundary)
-        // to its interned id. An empty namespace (test-only callers) or
-        // one not yet interned stays the system namespace; the AUTH path
-        // interns a key's namespace at mint so the lookup resolves.
-        // Read-only: the dispatch path never mints.
-        if !caller.namespace.is_empty() {
-            if let Ok(rtxn) = owned.executor.metadata.read_txn() {
-                if let Ok(Some(ns)) =
-                    brain_metadata::namespace::namespace_lookup_by_name(&rtxn, &caller.namespace)
-                {
-                    owned.executor = owned.executor.with_caller_namespace(ns);
+        // Fail-closed tenancy: an authenticated caller MUST carry a namespace
+        // that resolves to a real per-shard NamespaceId. There is no SYSTEM
+        // default for user data — falling back to the reserved system namespace
+        // would silently cross tenant boundaries. The namespace name is the
+        // cross-shard identity; NamespaceId is the shard-local interning, which
+        // key-mint performs in a separate store, so the namespace may not yet
+        // exist in this shard's metadata DB on first use here. Resolve via a
+        // read fast-path, then intern-or-get on a miss.
+        if caller.namespace.is_empty() {
+            return Err(OpError::Unauthorized(
+                "authenticated connection has no namespace; the API key must be bound to one"
+                    .into(),
+            ));
+        }
+        let ns = {
+            let read = owned.executor.metadata.read_txn().ok().and_then(|rtxn| {
+                brain_metadata::namespace::namespace_lookup_by_name(&rtxn, &caller.namespace)
+                    .ok()
+                    .flatten()
+            });
+            match read {
+                Some(ns) => ns,
+                None => {
+                    let wtxn = owned
+                        .executor
+                        .metadata
+                        .write_txn()
+                        .map_err(|e| OpError::Internal(format!("namespace intern txn: {e}")))?;
+                    let ns = brain_metadata::namespace::namespace_intern_or_get(
+                        &wtxn,
+                        &caller.namespace,
+                        0,
+                    )
+                    .map_err(|e| OpError::Internal(format!("namespace intern: {e}")))?;
+                    wtxn.commit()
+                        .map_err(|e| OpError::Internal(format!("namespace intern commit: {e}")))?;
+                    ns
                 }
             }
+        };
+        if ns == brain_core::NamespaceId::SYSTEM {
+            return Err(OpError::Unauthorized(
+                "namespace resolved to the reserved system namespace; user data requires a real namespace".into(),
+            ));
         }
+        owned.executor = owned.executor.with_caller_namespace(ns);
         Some(owned)
     };
     let ctx = per_request_ctx.as_ref().unwrap_or(ctx);
@@ -700,7 +732,13 @@ fn enforce_namespace(caller: &RequestCaller, req: &RequestBody) -> Result<(), Op
     // `SchemaReplace` carries the namespace inside the DSL; the
     // namespace-bound caller check runs at handler time after parse.
     if let Some(ns) = target {
-        caller.require_namespace(ns, "namespace")?;
+        // The seeded `brain` system namespace is shared, read-only system
+        // vocabulary: any authenticated caller may read it via SCHEMA_GET /
+        // SCHEMA_LIST regardless of which tenant they're bound to. Only
+        // user-namespace schema reads must match the caller's namespace.
+        if ns != brain_metadata::system_schema::SYSTEM_SCHEMA_NAMESPACE {
+            caller.require_namespace(ns, "namespace")?;
+        }
     }
     Ok(())
 }
