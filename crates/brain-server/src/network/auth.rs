@@ -278,7 +278,9 @@ pub fn derive_scope_from_handshake(
     // before hashing — the store keys on BLAKE3(secret_bytes), not the display
     // string. Fall back to the raw bytes for a caller that presents the
     // pre-decoded secret directly.
-    let decoded = std::str::from_utf8(token).ok().and_then(parse_formatted_key);
+    let decoded = std::str::from_utf8(token)
+        .ok()
+        .and_then(parse_formatted_key);
     let secret: &[u8] = decoded.as_deref().unwrap_or(token);
 
     let row = store.lookup(secret)?.ok_or(AuthError::Unknown)?;
