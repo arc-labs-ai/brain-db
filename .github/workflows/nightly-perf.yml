@@ -11,6 +11,15 @@ on:
     - cron: "0 3 * * *"
   workflow_dispatch: {}
 
+permissions:
+  contents: read
+
+# Don't let a manual dispatch pile up behind an in-flight scheduled run (or
+# vice versa) — only one perf run needs to be in flight at a time.
+concurrency:
+  group: nightly-perf
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -22,9 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust
 
       # relation_traverse.rs asserts spec §16/02 §2.4 p50 targets
       # in-process (d1 ≤ 5 ms, d2 ≤ 15 ms, d3 ≤ 30 ms). A regression

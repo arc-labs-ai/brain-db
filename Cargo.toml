@@ -1,7 +1,7 @@
 # Workspace root for the Brain cognitive substrate.
 #
 # Individual crates live under crates/. Add new members both here and in
-# the relevant CLAUDE.md / ROADMAP.md sections.
+# the relevant CLAUDE.md section.
 
 [workspace]
 resolver = "2"
@@ -29,7 +29,7 @@ edition = "2021"
 version = "0.1.0"
 rust-version = "1.95"
 license = "Apache-2.0"
-repository = "https://github.com/brain-db-io/brain-db"
+repository = "https://github.com/arc-labs-ai/brain-db"
 
 # Centralize dependency versions here. Crates inherit with `dep.workspace = true`.
 [workspace.dependencies]

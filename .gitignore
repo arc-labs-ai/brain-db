@@ -26,11 +26,8 @@ CLAUDE.md
 *.arena
 *.redb
 
-# Local seed / scratch fixtures (per-machine, never committed)
-/.seed-tmp/
-
 # Polyglot SDK scratch (Python / TypeScript). Real homes are
-# per-language repos under brain-db-io; the local /clients/ tree
+# per-language repos under arc-labs-ai; the local /clients/ tree
 # is for working-set experiments only.
 /clients/
 

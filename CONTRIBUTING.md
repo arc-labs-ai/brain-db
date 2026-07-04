@@ -18,7 +18,7 @@ constraints — read this end-to-end before you start.
    is the supported path; the server can't build natively
    (glommio / `io_uring`).
 
-See [`AUTONOMY.md`](AUTONOMY.md) for the full operating
+See [`AUTONOMY.md`](.claude/AUTONOMY.md) for the full operating
 contract Brain's autonomous mode runs under — much of it
 applies to human contributors too.
 
@@ -41,9 +41,8 @@ three-tier extractor pipeline.
 - [`README.md`](README.md) — what Brain is + capability tour.
 - [`spec/00_overview/`](spec/00_overview/00_index.md) — design
   start.
-- [`ROADMAP.md`](ROADMAP.md) — phase index.
 - [`CLAUDE.md`](CLAUDE.md) — operating rules + invariants.
-- [`AUTONOMY.md`](AUTONOMY.md) — contributor workflow + commit
+- [`AUTONOMY.md`](.claude/AUTONOMY.md) — contributor workflow + commit
   conventions.
 
 ## Core invariants — DO NOT violate
@@ -79,9 +78,9 @@ Code that violates these is wrong regardless of test results:
 
 ### 1. Pick a sub-task
 
-A task from [`ROADMAP.md`](ROADMAP.md)'s convergence list, or an
-open issue. The numbered implementation phases are complete;
-remaining work to v1.0 is convergence (see ROADMAP).
+A task from [`README.md`](README.md#future-scope)'s "Future scope"
+section, or an open issue. The numbered implementation phases are
+complete; remaining work is convergence.
 
 ### 2. Read the spec
 

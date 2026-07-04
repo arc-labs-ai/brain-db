@@ -121,7 +121,7 @@ gate_integration() {
 }
 
 gate_e2e() {
-  # SDK/CLI-driven e2e lives in the clients repo (brain-db-io); the
+  # SDK/CLI-driven e2e lives in the clients repo (arc-labs-ai); the
   # wire-direct suite here is the in-repo end-to-end gate.
   just docker-test -p brain-server --test e2e --test opaque_body_compat \
       --test entity_wire --test statement_wire --test relation_wire \
@@ -138,7 +138,7 @@ gate_performance() {
   # release run replaces this with a full `cargo bench` on quiet hardware
   # and a diff against the prior release baseline. The end-to-end
   # performance-at-scale run (100K/1M latency + throughput + recall@K)
-  # lives in the brain-eval rig (brain-db-io/brain-eval), which drives a
+  # lives in the brain-eval rig (arc-labs-ai/brain-eval), which drives a
   # running server over the wire on reference hardware.
   cargo bench --workspace --no-run 2>&1 | tail -3
 }
@@ -149,8 +149,8 @@ gate_chaos() {
 
 gate_soak() {
   # The 48 h soak runs on operator infrastructure; the soak rig lives
-  # in the clients repo (brain-db-io) alongside the SDK it drives.
-  echo "soak rig runs on operator infra (brain-db-io); skipped here"
+  # in the clients repo (arc-labs-ai) alongside the SDK it drives.
+  echo "soak rig runs on operator infra (arc-labs-ai); skipped here"
 }
 
 gate_compliance() {

@@ -3,6 +3,19 @@ name: CI
 on:
   push:
     branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+# Fork PRs get a read-only GITHUB_TOKEN by default under this trigger, so
+# adding pull_request here doesn't expose secrets to untrusted code.
+permissions:
+  contents: read
+
+# Cancel a stale run when a newer commit lands on the same branch/PR —
+# no point finishing a CI run for a diff that's already superseded.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,12 +28,11 @@ jobs:
   build-and-test:
     name: Build & test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -60,6 +72,7 @@ jobs:
   miri:
     name: Miri (storage layer)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       # The byte-logic tests miri DOES run (slot/payload) use proptest, which
       # calls getcwd for its failure-persistence file; default miri isolation
@@ -68,30 +81,31 @@ jobs:
       # behind #[cfg(all(test, not(miri)))].
       MIRIFLAGS: -Zmiri-disable-isolation
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: ./.github/actions/setup-rust
         with:
+          toolchain: nightly
           components: miri
-      - uses: Swatinem/rust-cache@v2
       - name: Miri test
         # --lib only: miri checks the unsafe byte-logic units (slot/record/
         # payload layout + CRC). The integration tests (tests/*.rs) drive real
         # arena/WAL file I/O (mmap, fallocate) that miri cannot model; they're
-        # covered by the normal Test job. Skip if the crate doesn't exist yet.
-        run: |
-          if [ -d "crates/brain-storage" ]; then
-            cargo +nightly miri test -p brain-storage --lib
-          else
-            echo "brain-storage not yet present; skipping miri."
-          fi
+        # covered by the normal Test job.
+        run: cargo +nightly miri test -p brain-storage --lib
 
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache: "false"
+      # Prebuilt, checksum-verified binary instead of `cargo install
+      # --locked` (which compiles cargo-audit and its deps from source on
+      # every run) — seconds instead of minutes.
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
       - name: Audit
         run: cargo audit

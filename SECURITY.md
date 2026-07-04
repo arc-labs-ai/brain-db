@@ -18,7 +18,7 @@ new minor lands.
 Email security disclosures to the maintainer at the address
 listed on the GitHub profile, or open a private security
 advisory via GitHub's
-[Security Advisories](https://github.com/nirajgeorgian/brain/security/advisories)
+[Security Advisories](https://github.com/arc-labs-ai/brain-db/security/advisories)
 tab. Include:
 
 - A description of the issue + impact.
@@ -72,28 +72,41 @@ Threats out of scope:
 
 ## Production deployment hardening
 
-Brain's v1.0 default posture is **permissive** — convenient for a
-single-tenant deployment behind a trusted network boundary, unsafe
-when exposed. Before exposing a server beyond `localhost` / a trusted
-LAN, walk this checklist:
+Brain **fails closed on authentication** — there is no permissive or
+anonymous mode, and none can be configured. What's still on the
+operator is mostly about network exposure and resource limits. Before
+exposing a server beyond `localhost` / a trusted LAN, walk this
+checklist:
 
-- **Require scoped authentication.** With auth left at its default
-  (`[auth] mode = "none"` and `BRAIN_REQUIRE_SCOPED_API_KEYS` unset),
-  any client can claim any `agent_id` and is granted full scope. The
-  server logs a loud startup `WARN` in this state. To harden, set
-  `BRAIN_REQUIRE_SCOPED_API_KEYS=1` (and/or `[auth] mode = "apikey"`)
-  so every connection must present a valid scoped API key. **Never run
-  the permissive default outside a trusted boundary.** Mint and revoke
-  keys via the admin HTTP surface.
+- **Data-plane auth can't be turned off, but keys still need
+  managing.** Every connection must present a valid, resolvable,
+  non-revoked API key in the wire AUTH frame; the server resolves
+  `(namespace, agent_id, permissions)` strictly from the looked-up key
+  row, never from anything the client claims. There's no `[auth] mode`
+  config and no env var that weakens this. Mint and revoke keys via
+  the admin HTTP surface, and treat every minted key as a capability
+  grant — scope and rotate them deliberately.
+- **The admin bootstrap secret is required at startup.** Set
+  `[admin] token` (or `BRAIN__ADMIN__TOKEN`) before starting the
+  server — the admin listener mints and revokes data-plane API keys,
+  so it must never run unauthenticated. If the secret is unset, the
+  server refuses to start (a hard error and nonzero exit) rather than
+  come up open. Every `/v1/*` admin call must present that secret as
+  `Authorization: Bearer <token>`; a missing or wrong token is
+  rejected. `/healthz`, `/readyz`, and `/metrics` are intentionally
+  unauthenticated by design and live on the separate public listener
+  (`server.metrics_addr`, default `127.0.0.1:9091`) — they carry no
+  sensitive data.
 - **Enable TLS across a trust boundary.** Set `[server.tls] enabled =
   true` with `cert` and `key` paths whenever traffic leaves the host
   or trusted LAN. Without TLS, wire frames (including API-key tokens)
   travel in cleartext.
-- **Keep the admin listener loopback-only.** The admin HTTP endpoint
-  (`/v1/*`, including API-key mint/revoke) has no built-in auth and
-  defaults to loopback. Do not bind `admin_addr` to a routable
-  interface; front it with a reverse proxy that adds authentication if
-  remote admin access is genuinely required.
+- **Keep the admin listener loopback-only regardless.** The admin HTTP
+  endpoint (`server.admin_addr`, default `127.0.0.1:9092`) is
+  Bearer-token-gated, but a leaked admin token is a full deployment
+  compromise — don't compound that risk by also binding it to a
+  routable interface. Front it with a reverse proxy that adds a second
+  authentication layer if remote admin access is genuinely required.
 - **Respect the trusted-disk / trusted-operator assumptions.** The
   data directory must sit on a trusted filesystem and anyone with shell
   access to it has full authority over the deployment (see the threat

@@ -50,6 +50,7 @@ RECALL  "what's Priya working on?"  include_graph=true
 - [Architecture in 30 seconds](#architecture-in-30-seconds)
 - [Performance targets](#performance-targets)
 - [Status](#status)
+- [Future scope](#future-scope)
 - [Documentation](#documentation)
 - [Repository layout](#repository-layout)
 - [Tech stack](#tech-stack)
@@ -144,7 +145,7 @@ define extractor preferences {
 **Requires:** Docker, [`@devcontainers/cli`](https://github.com/devcontainers/cli) (`npm install -g @devcontainers/cli`).
 
 ```bash
-git clone https://github.com/brain-db-io/brain-db
+git clone https://github.com/arc-labs-ai/brain-db
 cd brain-db
 just docker-up            # builds image, starts container, runs post-create
 just docker-shell         # bash inside the dev container
@@ -300,7 +301,78 @@ Brain optimizes for predictable tails, not minimum averages. The combined accept
 
 The v1.0 release ships when the combined acceptance suite passes — functional, performance, storage, operational, and schemaless mode tests, end-to-end.
 
-For the high-level milestone index, see [`ROADMAP.md`](ROADMAP.md); the per-phase landing record is in the git history.
+The per-phase landing record is in the git history (`git log --oneline`); what's still outstanding is tracked below, flat and unversioned, in [Future scope](#future-scope).
+
+---
+
+## Future scope
+
+Work that isn't done yet. Kept flat on purpose — no milestone tags, no version gates. Items get promoted out of this list as they land; nothing here is a commitment or a scheduled date.
+
+### Outstanding work
+
+- **Green test baseline.** A handful of pre-existing failures remain in the recall/txn/encode test-harness family — tests that return zero hits in the harness while recall works correctly in the live server and the eval rig.
+- **Acceptance suite on reference hardware.** The end-to-end harness lives in the `brain-eval` rig (`brain-eval acceptance --scale 1m` / `soak`) — latency, throughput, recall@K, system scenarios, restart-recovery. It runs; what's left is a quiet run on reference hardware (16-core x86_64, 64 GiB RAM, NVMe SSD) with the wall-time numbers captured against [`spec/19_benchmarks/02_performance_targets.md`](spec/19_benchmarks/02_performance_targets.md).
+- **Classifier inference latency on reference hardware.** The GLiNER forward pass (DeBERTa-v3 backbone → projection → label MLP → BiLSTM → markerV0 span head → einsum scoring → sigmoid decode) is implemented, validated against real weights, and dispatched live. On the dev box (aarch64, opt-level=2) it runs ~60–80 ms per short memory against a §11/01 p99 budget of 15 ms; because classification is enqueued off the ENCODE hot path this isn't a blocker, but the reference-hardware number (x86_64, opt-level=3 + LTO, optionally the `mkl` candle feature) hasn't been captured.
+- **Live LLM provider validation.** Anthropic and OpenAI clients are wired through a mock-client integration suite; a pass with real API keys and real cost accounting is still needed.
+- **Production-scale benches.** In-crate criterion benches run at 10K corpus scale in CI; the 1M-per-shard mixed-workload run is driven by `brain-eval` on reference hardware.
+- **Spec consistency pass.** One more sweep to confirm every cross-reference resolves, numerical claims agree (latency targets, HNSW parameters, slot sizes, grace periods), and any remaining stub sections in §17–§19 are filled.
+- **Tutorial polish.** The end-to-end tutorial (blank deployment → working query) needs one "follow it on a fresh laptop" pass.
+
+### Planned improvements
+
+- **Resolver tier 4 (LLM).** Tiers 1–3 (exact+alias / fuzzy / embedding) ship today; an LLM-assisted tier for ambiguous entity disambiguation is planned.
+- **Per-statement-kind retention policies.** Retention today is decay-based per-kind; explicit policies (e.g. per-namespace TTL) are planned.
+- **`ADMIN_BACKFILL` / `ADMIN_CANCEL` wire opcodes.** Backfill is operational via direct enqueue today; an operator-facing wire surface is planned.
+- **`SCHEMA_DROP` opcode.** In-place schema downgrade — today's revert is a manual runbook step.
+- **Cascade audit rows + soft-cascade revert.** FORGET cascade itself works; an audit log of cascaded writes plus a revert path is planned.
+- **Per-row stale-extraction flag.** Stale (schema-version-behind) statements are counted via a metric today; a durable per-row flag needs a row-schema bump.
+- **Streaming retrieval query results.** `limit > 100` would stream across multiple `QueryResponse` frames — today's response is single-frame.
+- **Retrieval + transactional read-your-writes, richer lensing.** RECALL inside a transaction already overlays pending writes on committed data; deeper lens layering across statements + relations is planned.
+- **Multi-frame cursor pagination.** `ENTITY_LIST`, `STATEMENT_LIST`, `STATEMENT_HISTORY`, `RELATION_LIST_FROM` are single-frame snapshots today.
+- **Wire-protocol conformance corpus.** A language-agnostic round-trip corpus (recorded request/response frames with CBOR payloads) that any client implementation can replay to verify §04 conformance — Brain ships no first-party SDK, so this is the drift guard for third-party clients.
+- **`ADMIN_TANTIVY_REBUILD` wire op.** Hot tantivy rebuild from the admin CLI — today's rebuild is startup-only.
+- **Schema migration plan computation.** The `keep` / `re-extract` / `tombstone` action vocabulary is specified in [`spec/03_schema/05_versioning.md`](spec/03_schema/05_versioning.md); computation and execution are planned.
+- **Hot tantivy rebuild while the writer is running.** Today's rebuild requires a shard restart.
+- **Partial WAL replay on tantivy recovery.** Today's rebuild on `NeedsRebuild` starts from scratch; partial replay via indexer cursors is planned.
+- **Cross-shard retrieval result merging.** Retrieval today is per-shard; router-level fan-out and merge for cross-shard agents is planned.
+- **Live-registry sync on `SCHEMA_UPLOAD`.** Uploaded extractors are observable via `EXTRACTOR_LIST` today, but the dispatching registry only rebuilds at shard spawn.
+
+### Larger architectural changes
+
+Capability changes that would touch the wire protocol, on-disk formats, or cluster architecture — each a multi-month design in its own right, and each gated on a demonstrated operator need the current single-node architecture can't satisfy:
+
+- **Multi-node clustering.** Distributed coordination, range-based sharding, cross-node query fan-out.
+- **Replication.** Today, node loss means restore-from-snapshot. Synchronous WAL streaming and asynchronous follower replication are both candidates, with different trade-offs.
+- **Tenant offloading / lazy loading.** Cold tenants serialized to object storage, lazy-loaded on first query.
+- **Storage-compute separation with a freshness layer.** Blob storage as source of truth plus an in-memory freshness layer for recent writes — a Pinecone-serverless-style architecture.
+- **IVF + PQ on top of HNSW.** For billion-vector scale; today's HNSW is RAM-heavy past ~10⁷ vectors per shard.
+- **Range-based sharding with Raft replication.** CockroachDB-style auto-split/auto-merge ranges; today's `hash(agent_id) % shard_count` caps tenant scale at single-shard throughput.
+- **Decoupled roles.** FoundationDB-style coordinator / proxy / log / resolver / storage as separate processes.
+- **Multi-region active-active.** Cross-region writes with replication.
+- **Federated knowledge graphs.** Cross-node entity/statement queries — a different system from Brain's local-first design.
+
+These directions (offloading, storage-compute split, IVF+PQ, range sharding, decoupled roles) are documented in more depth as future-direction candidates in [`spec/01_architecture/07_wedges_and_roadmap.md`](spec/01_architecture/07_wedges_and_roadmap.md) §Roadmap. None are commitments.
+
+### Known limitations today
+
+- **Single-node only, no replication.** Snapshots (full backup/restore over HTTP, `/v1/snapshots`) are the backup story; the periodic background snapshot worker captures the HNSW graph only, not a full bundle.
+- **No first-party SDK.** Brain is a standalone database; the public interface is the §04 wire protocol (CBOR payloads). [`brain-sdk`](https://github.com/arc-labs-ai/brain-sdk) and [`brain-shell`](https://github.com/arc-labs-ai/brain-shell) are separate, actively maintained repos, not part of this one.
+- **Linux only.** Glommio + `io_uring` don't run elsewhere.
+- **English text only.** `bge-small-en-v1.5` is English; multilingual support needs a different embedding model and re-embedding.
+- **Single embedding model per deployment, pinned at creation.** There's no in-place model migration — changing the model means standing up a fresh deployment and re-ingesting against it. An offline `ADMIN_MIGRATE_EMBEDDINGS` re-embed path is a reserved-but-unimplemented opcode; there's no register-model / retire-fingerprint admin surface yet.
+- **No query language.** The wire protocol is typed RPC; a SQL-like text language would be a separate, larger effort.
+- **Auth is mandatory and fail-closed, but loopback is still trust-boundary-dependent.** Every data-plane connection must present a valid, resolvable, non-revoked API key — there's no permissive/anonymous mode and no config knob to disable it. The admin HTTP listener requires its own bootstrap secret (`[admin] token` / `BRAIN__ADMIN__TOKEN`); if it's unset the server refuses to start rather than come up unauthenticated, and every admin call must present it as `Authorization: Bearer <token>`. What's still on the operator: both listeners default to loopback-only, and exposing either beyond `localhost`/a trusted LAN needs the hardening runbook in [`SECURITY.md`](SECURITY.md#production-deployment-hardening) (wire TLS, reverse-proxied admin, resource bounds).
+- **Fine-grained access control is out of scope today.** Brain has authentication and shard-level authorization; per-memory ACLs, field-level security, and time-bounded permissions aren't built.
+- **Entity garbage collection is a dormant no-op.** `EntityGc` always reports its inbound-reference count as "referenced" and isn't spawned; orphaned entities aren't reclaimed. Entity rows are append-mostly.
+- **Subscribe by similarity is rejected.** A `SUBSCRIBE` with a `similar_to` vector filter returns a structured `NotYetImplemented`; subscriptions filter by agent / context / kind only.
+- **No hot on-demand tantivy reindex.** The lexical index rebuilds automatically from authoritative redb at startup whenever `open` reports corruption or a schema mismatch (an operator can force this by removing the index dir and restarting). A live reindex-without-restart call needs the writer quiesced, since the rebuild swaps the index directory. The vector (HNSW) index does have an on-demand rebuild (`POST /v1/rebuild-ann`).
+- **Statement-level semantic retrieval lane isn't wired.** The statement-text embedding index is populated (`StatementEmbed` worker), but statement retrieval today is lexical + graph only.
+- **Consolidation by vector clustering is shipped but unwired.** The consolidation worker uses window-based clustering today.
+- **Per-row stale-extraction flags aren't durable.** Stale (schema-version-behind) statements are counted via metrics only; a durable per-row flag needs a row-schema bump. Re-extraction itself is already handled by the schema-migration worker.
+- **Slot-version free-list reclamation isn't on the live path.** The `SlotAllocator` (free-list + version-bump-on-realloc) is implemented and exercised by recovery, but the writer mints slots via a `next_slot` atomic and live occupancy is read from redb — so the allocator's free-list reclamation isn't wired into the write path (its unit tests are `#[ignore]`'d). The slot version itself is still enforced via the `MemoryId` encoding; only physical slot *reuse* is deferred.
+
+None of the above are bugs — they're scope boundaries, listed so they're not mistaken for gaps.
 
 ---
 
@@ -315,9 +387,9 @@ For the high-level milestone index, see [`ROADMAP.md`](ROADMAP.md); the per-phas
 | Wire protocol (frames + opcodes + handshake) | [`spec/04_wire_protocol/`](spec/04_wire_protocol/00_purpose.md) |
 | Schema DSL grammar | [`spec/03_schema/`](spec/03_schema/00_purpose.md) |
 | Acceptance gate for v1.0 | [`spec/19_benchmarks/06_complete_acceptance.md`](spec/19_benchmarks/06_complete_acceptance.md) |
-| Roadmap (milestone index) | [`ROADMAP.md`](ROADMAP.md) |
-| Client SDKs (Rust / Python / TS) + interactive shell | [`brain-sdk`](https://github.com/brain-db-io/brain-sdk), [`brain-shell`](https://github.com/brain-db-io/brain-shell) — separate repos |
-| Evaluation, perf/scale-run, soak & acceptance harness | [`brain-eval`](https://github.com/brain-db-io/brain-eval) — separate repo |
+| Outstanding work, planned improvements, known limitations | [Future scope](#future-scope) (this file) |
+| Client SDKs (Rust / Python / TS) + interactive shell | [`brain-sdk`](https://github.com/arc-labs-ai/brain-sdk), [`brain-shell`](https://github.com/arc-labs-ai/brain-shell) — separate repos |
+| Evaluation, perf/scale-run, soak & acceptance harness | [`brain-eval`](https://github.com/arc-labs-ai/brain-eval) — separate repo |
 
 ---
 
@@ -341,8 +413,7 @@ brain/
 │   ├── brain-plugins/      Plugin surface (enricher + connector)
 │   ├── brain-http/         HTTP transport for the admin listener
 │   └── brain-server/       Server binary
-├── spec/                   The 148-file specification (authoritative)
-└── ROADMAP.md              Milestone index
+└── spec/                   The 148-file specification (authoritative)
 ```
 
 ---
@@ -399,4 +470,4 @@ By submitting a pull request, you agree your contribution is licensed under the 
 
 [Apache-2.0](LICENSE). Source code, spec, and documentation are all under the same license.
 
-Repository: <https://github.com/brain-db-io/brain-db>
+Repository: <https://github.com/arc-labs-ai/brain-db>
