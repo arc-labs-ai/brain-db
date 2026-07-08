@@ -301,9 +301,6 @@ pub enum Phase {
         at_unix_nanos: u64,
     },
 
-    /// Toggle an extractor's enabled flag.
-    SetExtractorEnabled { id: ExtractorId, enabled: bool },
-
     /// Free physical storage for the given memory slots. Triggered by
     /// the reclamation worker after grace period.
     ReclaimSlots { slots: Vec<u64> },
@@ -453,10 +450,6 @@ pub enum PhaseAck {
     MergeProposalRejected {
         proposal_id: MergeId,
     },
-    ExtractorEnabledSet {
-        id: ExtractorId,
-        enabled: bool,
-    },
     SlotsReclaimed {
         count: usize,
     },
@@ -486,7 +479,6 @@ impl Phase {
             Self::MergeEntities { .. } => "merge_entities",
             Self::ApproveMerge { .. } => "approve_merge",
             Self::RejectMerge { .. } => "reject_merge",
-            Self::SetExtractorEnabled { .. } => "set_extractor_enabled",
             Self::ReclaimSlots { .. } => "reclaim_slots",
         }
     }
@@ -594,13 +586,6 @@ mod tests {
                 },
             ),
             ("reclaim_slots", Phase::ReclaimSlots { slots: vec![1, 2] }),
-            (
-                "set_extractor_enabled",
-                Phase::SetExtractorEnabled {
-                    id: ExtractorId::from(7),
-                    enabled: true,
-                },
-            ),
         ];
         for (expected_tag, phase) in cases {
             assert_eq!(phase.tag(), expected_tag);

@@ -1,6 +1,6 @@
 # 04.09 Typed-Graph Operation Frames
 
-Request/response body schemas for the typed-graph "operation" opcodes — schema management (`0x0120–0x0126`), SUBSCRIBE event payloads carrying typed-graph deltas, the schema-optional / schemaless dispatch gate, retrieval query (`0x0160–0x0163`), and admin operations (`0x0170–0x0177`). These opcodes orchestrate the noun-frame surface defined in [`./08_typed_graph_frames.md`](./08_typed_graph_frames.md).
+Request/response body schemas for the typed-graph "operation" opcodes — schema management (`0x0120–0x0126`), SUBSCRIBE event payloads carrying typed-graph deltas, the schema-optional / schemaless dispatch gate, query introspection (`0x0161–0x0162`), and admin operations (`0x0170–0x0177`). These opcodes orchestrate the noun-frame surface defined in [`./08_typed_graph_frames.md`](./08_typed_graph_frames.md).
 
 Brain's wire protocol — 32-byte header, opcode framing, CRC32C, payload encoding — is covered in [`./02_wire_format.md`](./02_wire_format.md), [`./03_opcodes.md`](./03_opcodes.md), and [`./05_frame_layouts.md`](./05_frame_layouts.md). This file specifies only the CBOR field schemas of the request/response payloads for the operation opcodes.
 
@@ -24,8 +24,6 @@ Request/response body schemas for every opcode in the `0x0120–0x012F` schema r
 | `0x0122` | `SCHEMA_LIST` | "SCHEMA_LIST" | spec-only |
 | `0x0123` | `SCHEMA_VALIDATE` | "SCHEMA_VALIDATE" | spec-only |
 | `0x0124` | `EXTRACTOR_LIST` | "EXTRACTOR_LIST" | spec-only |
-| `0x0125` | `EXTRACTOR_DISABLE` | "EXTRACTOR_DISABLE/ENABLE" | spec-only |
-| `0x0126` | `EXTRACTOR_ENABLE` | "EXTRACTOR_DISABLE/ENABLE" | spec-only |
 
 Responses live at `0x01A0–0x01A6` (low byte with high bit set).
 
@@ -163,9 +161,7 @@ Same shape as `SchemaUploadResponse`, but `schema_version` is always 0 (no commi
 #### Request — `ExtractorListRequest`
 
 ```rust
-pub struct ExtractorListRequest {
-    pub include_disabled: bool,
-}
+pub struct ExtractorListRequest {}   // no arguments — extractors are always-on
 ```
 
 #### Response — streaming, per-item `ExtractorListItem`
@@ -175,7 +171,6 @@ pub struct ExtractorListItem {
     pub extractor_id: u32,
     pub name: String,                  // e.g. "pattern:role-assignment"
     pub tier: u8,                      // 1=pattern, 2=classifier, 3=llm
-    pub enabled: bool,
     pub schema_version: u32,           // version this extractor binds to
     pub last_run_unix_nanos: u64,
     pub statements_produced_lifetime: u64,
@@ -189,47 +184,15 @@ pub struct ExtractorListResponseTail {
 
 Cross-ref: [`../11_extractors/00_purpose.md`](../11_extractors/00_purpose.md) defines the tier model.
 
-### EXTRACTOR_DISABLE (0x0125) / EXTRACTOR_ENABLE (0x0126)
-
-#### Requests
-
-```rust
-pub struct ExtractorDisableRequest {
-    pub extractor_id: u32,
-    pub reason: String,                // ≤ 4 KiB
-    pub request_id: WireUuid,
-}
-
-pub struct ExtractorEnableRequest {
-    pub extractor_id: u32,
-    pub request_id: WireUuid,
-}
-```
-
-#### Responses
-
-```rust
-pub struct ExtractorDisableResponse {
-    pub previously_enabled: bool,
-    pub disabled_at_unix_nanos: u64,
-}
-
-pub struct ExtractorEnableResponse {
-    pub previously_disabled: bool,
-    pub enabled_at_unix_nanos: u64,
-}
-```
-
-#### Errors
-
-- `INVALID_ARGUMENT` — `extractor_id` not registered.
-- `EXTRACTOR_DISABLED` — `EXTRACTOR_DISABLE` on an already-disabled extractor returns success (idempotent); `EXTRACTOR_ENABLE` on a non-existent id returns this code.
-
-Disabling an extractor takes effect on the *next* ENCODE; in-flight extractions complete. The server emits no `EXTRACTION_FAILED` event for in-flight cancellations — disabling is non-disruptive.
+Extraction is always-on and cannot be paused: there is no `EXTRACTOR_DISABLE` /
+`EXTRACTOR_ENABLE` op. A write with extraction disabled would leave the typed
+graph empty and make graph-backed reads silently incoherent, so the toggle was
+removed at both deploy-time (no `[extractors.<tier>].enabled` config) and
+runtime (no wire op). `EXTRACTOR_LIST` remains for read-only introspection.
 
 ### Schema authorization
 
-All schema-namespace opcodes (`0x0120–0x0123`) and extractor-governance opcodes (`0x0125–0x0126`) require **admin** permissions in the agent's `AgentPermissions` (see [`04_handshake.md`](./04_handshake.md)). `SCHEMA_GET`, `SCHEMA_LIST`, `EXTRACTOR_LIST` are readable by any authenticated agent.
+All schema-namespace opcodes (`0x0120–0x0123`) require **admin** permissions in the agent's `AgentPermissions` (see [`04_handshake.md`](./04_handshake.md)). `SCHEMA_GET`, `SCHEMA_LIST`, `EXTRACTOR_LIST` are readable by any authenticated agent.
 
 Unauthorized requests return substrate `ErrorCategory::Authorization` with code `AdminPermissionRequired`.
 
@@ -597,9 +560,22 @@ Reconnect after schema change is **client-driven**; the server does not push sch
 
 The wire shape is identical (`SchemaUploadRequest`). The server's behavior diverges only in (a) the migration summary the response carries and (b) whether `SCHEMA_UPDATED` event is emitted (always emitted for evolution; not emitted for initial declaration since no subscribers can have been waiting).
 
-## Query frames
+## Query introspection frames
 
-Request/response body schemas for `0x0160–0x0163` — the retrieval-query opcodes. These are the primary read API of the typed graph and accept traffic regardless of schema state.
+Request/response body schemas for `0x0161`/`0x0162` — the query-introspection
+opcodes. These are the **operator debug surface** over the shared retrieval
+engine, not a client read path. They accept traffic regardless of schema state.
+
+There is no client-facing bulk-query opcode. `RECALL_REQ` (`0x0021`) is the sole
+primary read; it returns the answer as a membership shape (Single / Many / None
+— see [`../05_operations/03_read_pipeline.md`](../05_operations/03_read_pipeline.md)),
+not a ranked candidate list. `QUERY_EXPLAIN` renders the planner's execution
+plan without running it; `QUERY_TRACE` executes and returns the per-retriever
+candidate breakdown for diagnosing "why did the engine rank it this way." Both
+accept the internal `QueryRequest` (retriever selection, fusion overrides,
+filters) precisely because they are diagnostic tools. Structured typed-graph
+lookup is served by the LIST ops (`STATEMENT_LIST`, `RELATION_LIST_FROM/TO`,
+`ENTITY_RESOLVE` / `ENTITY_LIST`), not a fused ranked list.
 
 Cross-references:
 - [`../13_retrievers/`](../13_retrievers/00_purpose.md) — three retrievers (semantic / lexical / graph) + RRF fusion.
@@ -609,16 +585,14 @@ Cross-references:
 
 | Opcode | Name | Section | Status |
 |---|---|---|---|
-| `0x0160` | `QUERY` | "QUERY" | spec-only |
 | `0x0161` | `QUERY_EXPLAIN` | "QUERY_EXPLAIN" | spec-only |
 | `0x0162` | `QUERY_TRACE` | "QUERY_TRACE" | spec-only |
-| `0x0163` | `QUERY_TEXT` | "QUERY_TEXT" | spec-only |
 
-Responses live at `0x01E0–0x01E3`.
+Responses live at `0x01E1–0x01E2`.
 
-`QUERY` (`0x0160`) is the primary structured query opcode. `QUERY_TEXT` (`0x0163`) is the simple-text fast path used by clients that just want text-only retrieval without an explicit query language.
-
-Brain's `RECALL_REQ` (`0x0021`) runs the retrieval path by default in every deployment (see §"Schema-optional mode" §"RECALL routing"). The wire response carries `contributing_retrievers` and `fused_score` populated whether or not a schema has been declared.
+`RECALL_REQ` (`0x0021`) runs the retrieval path by default in every deployment
+(see §"Schema-optional mode" §"RECALL routing"). The engine that
+`QUERY_EXPLAIN` / `QUERY_TRACE` introspect is the same one `RECALL` runs on.
 
 ### Shared query types
 
@@ -670,12 +644,13 @@ pub struct RetrieverSelection {
 }
 ```
 
-Semantics:
+Semantics (this request is the introspection input to `QUERY_EXPLAIN` /
+`QUERY_TRACE`, never a client read):
 
-- The query DSL is structured — combinations of entity / predicate / time / confidence conditions. For text-only queries the client builds the DSL (or use `QUERY_TEXT` below).
-- `RetrieverSelection` lets clients disable retrievers or override per-retriever depth. Setting all three to false → `INVALID_ARGUMENT`.
-- `top_k` is the **final fused** top-K. Per-retriever `top_k`s are typically larger to give RRF a useful candidate pool (default: `4 * top_k`).
-- `budget_wall_time_ms` is a soft budget. The server returns whatever it has when exceeded with `QUERY_TIMEOUT` on the final frame.
+- The query DSL is structured — combinations of entity / predicate / time / confidence conditions. The operator building a trace supplies it directly.
+- `RetrieverSelection` lets the operator disable retrievers or override per-retriever depth to isolate a lane's behaviour. Setting all three to false → `INVALID_ARGUMENT`.
+- `top_k` is the **final fused** top-K of the trace output. Per-retriever `top_k`s are typically larger to give RRF a useful candidate pool (default: `4 * top_k`). `QUERY_EXPLAIN` ignores it (no execution).
+- `budget_wall_time_ms` is a soft budget on `QUERY_TRACE` execution. The server returns whatever it has when exceeded with `QUERY_TIMEOUT` on the final frame.
 
 #### `QueryResult` — streamed per-frame item
 
@@ -731,38 +706,6 @@ pub const RETRIEVER_GRAPH: u8    = 0b100;
 
 A `QueryResultItem.contributing_retrievers = vec![0b011]` means semantic + lexical ranked this result; graph did not. Each contributor contributes one entry to the vector with a separate flag — `vec![0b001, 0b010]` is also valid encoding meaning "two separate retriever hits" with provenance.
 
-### QUERY (0x0160)
-
-#### Request
-
-`QueryRequest` directly.
-
-#### Response — streaming
-
-Multiple `QueryResultItem` frames sharing `stream_id`, followed by a tail frame:
-
-```text
-S → C  frame: opcode=0x01E0 stream_id=N        body: QueryResultItem  (intermediate)
-S → C  frame: opcode=0x01E0 stream_id=N        body: QueryResultItem  (intermediate)
-...
-S → C  frame: opcode=0x01E0 stream_id=N EOS    body: QueryResultTail  (tail)
-```
-
-Substrate streaming model: per-frame, `EOS` on the tail. The tail body is a different CBOR shape than the per-item bodies — clients dispatch on `is_final` (set when EOS is set) and decode accordingly.
-
-#### Errors
-
-- `QUERY_TIMEOUT` (substrate `Unavailable`) — wall budget exceeded. Tail frame carries whatever results were ready; clients see a partial result with `QueryResultTail.truncated_by = 2`.
-- `QUERY_OVER_BUDGET` (substrate `ResourceExhausted`) — per-shard memory or candidate-pool cap blown. Frame stream ends without an EOS tail; an `ERROR` frame closes the stream.
-- `PredicateNotInSchema` (0x004B) — strict mode only; `filters.predicate_filter` contains a qname not declared in the active schema.
-- `RelationTypeNotInSchema` (0x004C) — strict mode only; the DSL or graph step referenced an unknown relation type.
-- `RetrievalUnavailable` (0x0083) — a required retriever component is not currently servable (e.g. inside a transaction, during index rebuild).
-- `INVALID_ARGUMENT` — DSL parse failure, `top_k > 1000`, all retrievers disabled.
-
-#### Cancellation
-
-Clients send `CANCEL_STREAM` (`0x0050`) with the offending `stream_id`. Server emits a `CANCEL_STREAM_ACK` (`0x00D0`) on a different stream; the query's frame stream ends with EOS-flagged empty tail.
-
 ### QUERY_EXPLAIN (0x0161)
 
 Returns the planner's execution plan **without running it**. Useful for debugging and cost-bounded clients.
@@ -808,11 +751,24 @@ Same as `QUERY` minus the timeout / over-budget set (no execution happens).
 
 ### QUERY_TRACE (0x0162)
 
-Identical to `QUERY` but the response carries **per-retriever debug info**. Treats `include_trace = true` internally regardless of the request's setting.
+Executes the plan `QUERY_EXPLAIN` would render and returns the results **plus
+per-retriever debug info**. Treats `include_trace = true` internally regardless
+of the request's setting. Operator diagnostic only — not a client read.
+
+#### Request
+
+`QueryRequest` directly.
 
 #### Response — streaming with extended tail
 
-Per-item frames are `QueryResultItem` plus a `trace` field. The tail body is extended:
+Multiple per-item frames sharing `stream_id`, each a `QueryResultItem` plus a
+`trace` field, followed by a tail frame carrying the extended trace:
+
+```text
+S → C  frame: opcode=0x01E2 stream_id=N        body: QueryResultItem  (intermediate)
+...
+S → C  frame: opcode=0x01E2 stream_id=N EOS    body: QueryTraceTail   (tail)
+```
 
 ```rust
 pub struct QueryTraceTail {
@@ -830,78 +786,60 @@ pub struct RetrieverTrace {
 }
 ```
 
-#### Performance note
-
-`QUERY_TRACE` is **noticeably slower** than `QUERY` because of the trace bookkeeping. Clients should expose it as a debug-only operation. Production hot paths use `QUERY` (`0x0160`).
-
-### QUERY_TEXT (0x0163)
-
-Text-only fast path. The server's planner builds a default `QueryRequest` from the text + minimal filters and runs it.
-
-#### Request — `QueryTextRequest`
-
-```rust
-pub struct QueryTextRequest {
-    pub text: String,                       // non-empty; ≤ 4 KiB
-    pub top_k: u32,                         // 1..=1000
-    pub min_confidence: f32,
-    pub context_ids: Vec<u64>,              // empty = no filter
-    pub time_range_start_unix_nanos: u64,
-    pub time_range_end_unix_nanos: u64,
-    pub budget_wall_time_ms: u32,
-    pub request_id: WireUuid,
-    pub txn_id: WireUuid,
-}
-```
-
-#### Response
-
-Same shape as `QUERY` (streamed `QueryResultItem` frames + `QueryResultTail`). Clients that want both substrate-style memory results and typed-graph entity / statement / relation results use this opcode.
-
-#### Relationship to substrate `RECALL_REQ`
-
-`RECALL_REQ` (`0x0021`) returns **only** `MemoryResult`s — its substrate contract.
-
-`QUERY_TEXT` (`0x0163`) returns a mix of `MemoryResult`, `EntityView`, `StatementView`, `RelationView` — leveraging the entity / statement / relation indexes alongside the memory HNSW.
-
-Both deployment postures may use either: the substrate `RECALL_REQ` returns memory results from the retrieval path; `QUERY_TEXT` additionally surfaces typed entity / statement / relation results that have been populated from prior typed-graph writes (open-vocabulary or schema-declared).
-
 #### Errors
 
-Same as `QUERY`, plus `INVALID_ARGUMENT` for empty `text`.
+- `QUERY_TIMEOUT` (substrate `Unavailable`) — wall budget exceeded. Tail frame carries whatever results were ready; `QueryResultTail.truncated_by = 2`.
+- `QUERY_OVER_BUDGET` (substrate `ResourceExhausted`) — per-shard memory or candidate-pool cap blown. Frame stream ends without an EOS tail; an `ERROR` frame closes the stream.
+- `PredicateNotInSchema` (0x004B) — strict mode only; `filters.predicate_filter` contains a qname not declared in the active schema.
+- `RelationTypeNotInSchema` (0x004C) — strict mode only; the DSL or graph step referenced an unknown relation type.
+- `RetrievalUnavailable` (0x0083) — a required retriever component is not currently servable (e.g. inside a transaction, during index rebuild).
+- `INVALID_ARGUMENT` — DSL parse failure, `top_k > 1000`, all retrievers disabled.
 
-### Idempotency for queries
+#### Cancellation
 
-Queries with `request_id != [0;16]` populate the idempotency cache (same shape as substrate; 24h TTL). Cached responses are byte-identical, **including** the full streamed result sequence. Re-issuing the same `request_id` replays the entire stream from cache.
+The operator sends `CANCEL_STREAM` (`0x0050`) with the offending `stream_id`. Server emits a `CANCEL_STREAM_ACK` (`0x00D0`) on a different stream; the trace's frame stream ends with an EOS-flagged empty tail.
 
-Idempotency for queries is unusual but useful for:
+#### Performance note
 
-- Retries after transient network failure on long-running queries.
-- Reproducibility in test suites.
+`QUERY_TRACE` is **noticeably slower** than a plain `RECALL` because of the
+trace bookkeeping — it exists to diagnose the engine, not to serve reads. The
+production read path is `RECALL` (`0x0021`).
 
-Clients that want **fresh** results every time pass `request_id = [0;16]`.
+### Idempotency for the introspection ops
 
-### Query transactions
+`QUERY_TRACE` with `request_id != [0;16]` populates the idempotency cache (same
+shape as substrate; 24h TTL). Cached responses are byte-identical, **including**
+the full streamed result sequence. Re-issuing the same `request_id` replays the
+entire stream from cache — useful for reproducibility in test suites. An
+operator wanting **fresh** trace output every time passes `request_id = [0;16]`.
+`QUERY_EXPLAIN` does not execute, so idempotency is moot.
 
-`QueryRequest.txn_id != [0;16]` makes the query observe a read snapshot that includes the transaction's pending writes — same semantics as substrate `RecallRequest.txn_id`.
+### Introspection transactions
 
-Reads inside a transaction are visible to the same transaction's subsequent writes (read-your-writes).
+`QueryRequest.txn_id != [0;16]` makes `QUERY_TRACE` observe a read snapshot that
+includes the transaction's pending writes — same semantics as substrate
+`RecallRequest.txn_id`. This lets an operator trace how the engine would rank a
+transaction's not-yet-committed state.
 
 ### Multi-shard fan-out
 
-A `QUERY` typically fans out to **all** shards unless filters scope it to a specific shard (e.g. `filters.entity_type_id` + a subject filter that the planner can route).
+A `QUERY_TRACE` typically fans out to **all** shards unless filters scope it to
+a specific shard (e.g. `filters.entity_type_id` + a subject filter the planner
+can route).
 
-Per-shard results are streamed to the coordinator (the agent's bound shard); the coordinator runs RRF fusion across the union and streams the final fused result to the client. The per-shard streaming back-pressure handling applies — if one shard is slow, the coordinator buffers within its budget.
+Per-shard results are streamed to the coordinator (the agent's bound shard); the
+coordinator runs RRF fusion across the union and streams the final fused result.
+The per-shard streaming back-pressure handling applies — if one shard is slow,
+the coordinator buffers within its budget. `QUERY_TRACE`'s
+`RetrieverTrace.debug_notes` may include per-shard breakdown when run on
+multi-shard deployments.
 
-The wire shape doesn't expose which shard contributed which result — that's an internal detail. `QUERY_TRACE`'s `RetrieverTrace.debug_notes` may include per-shard breakdown when run on multi-shard deployments.
-
-### Query open questions
+### Query introspection open questions
 
 Notably:
 
 - Cross-shard error aggregation: what if 1 of 8 shards fails? Currently the planner returns a partial result with a warning. Should there be a strict-mode flag for "all-or-nothing"?
 - Planner cost model exposure: should `QueryPlanStep.cost` be `f32` (current) or a richer structured cost?
-- Stable cursor semantics for `QUERY` streaming pagination (current spec assumes single-shot streaming; resumable queries are deferred).
 
 ## Admin frames
 

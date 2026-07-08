@@ -178,8 +178,6 @@ fn recall_req(cue: &str) -> RecallRequest {
         // agent-scoping admits both rows on the agent axis and only the
         // namespace wall can separate them. Cross-agent opt-in is rejected
         // under scoped auth anyway, so we keep the default here.
-        agent_filter: Vec::new(),
-        include_other_agents: false,
     }
 }
 

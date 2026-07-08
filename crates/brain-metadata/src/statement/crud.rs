@@ -201,13 +201,14 @@ pub(super) fn validate_statement_shape(s: &Statement) -> Result<(), StatementOpE
         ));
     }
     match s.kind {
-        StatementKind::Event => {
-            if s.event_at_unix_nanos.is_none() {
-                return Err(StatementOpError::InvalidArgument(
-                    "Event requires event_at_unix_nanos",
-                ));
-            }
-        }
+        // An Event MAY carry no distinct event_at: a dateless or same-day action
+        // (whose only resolved date equals the memory's own message anchor) still
+        // IS an event — it happened at a time we simply couldn't pin to a distinct
+        // calendar date. Storing it as an Event with `event_at = None` keeps the
+        // temporal role available so the read answers "when" from the evidence
+        // memory's own `occurred_at`, instead of losing the fact by demoting it to
+        // a timeless Fact. Only a NON-Event is forbidden a time.
+        StatementKind::Event => {}
         _ => {
             if s.event_at_unix_nanos.is_some() {
                 return Err(StatementOpError::InvalidArgument(
@@ -798,6 +799,26 @@ mod tests {
         id
     }
 
+    /// Intern a single-valued Attribute predicate with `stateful: false`,
+    /// so any supersession observed is driven by the KIND, not the flag.
+    fn intern_attribute_value_pred(db: &mut crate::MetadataDb, name: &str) -> PredicateId {
+        let wtxn = db.write_txn().unwrap();
+        let id = predicate_intern(
+            &wtxn,
+            "test",
+            name,
+            Some(StatementKind::Attribute),
+            /* object: Value */ 2,
+            /* schema_version */ 1,
+            "",
+            /* is_stateful */ false,
+            1_700_000_000_000_000_000,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
     fn intern_event_any_pred(db: &mut crate::MetadataDb, name: &str) -> PredicateId {
         let wtxn = db.write_txn().unwrap();
         let id = predicate_intern(
@@ -836,6 +857,21 @@ mod tests {
         Statement::new_root(
             StatementId::new(),
             StatementKind::Preference,
+            SubjectRef::Entity(subject),
+            predicate,
+            StatementObject::Value(StatementValue::Text(value.into())),
+            0.9,
+            EvidenceRef::default(),
+            brain_core::ExtractorId::from(0),
+            1_700_000_000_000_000_000,
+            1,
+        )
+    }
+
+    fn fresh_attr(subject: EntityId, predicate: PredicateId, value: &str) -> Statement {
+        Statement::new_root(
+            StatementId::new(),
+            StatementKind::Attribute,
             SubjectRef::Entity(subject),
             predicate,
             StatementObject::Value(StatementValue::Text(value.into())),
@@ -1037,7 +1073,70 @@ mod tests {
     }
 
     #[test]
-    fn create_event_requires_event_at() {
+    fn create_attribute_auto_supersedes_by_kind() {
+        // An Attribute is single-valued (cardinality: single), so a new
+        // value for the same (subject, predicate) supersedes the prior one —
+        // "what is X's Y now". The predicate here is `stateful: false`, so
+        // the supersession is driven by the KIND, not the flag.
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "priya");
+        let pred = intern_attribute_value_pred(&mut db, "city");
+
+        let a1 = fresh_attr(subj, pred, "Paris");
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), &a1, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let a2 = fresh_attr(subj, pred, "Berlin");
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), &a2, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let a1_back = statement_get(&rtxn, a1.id).unwrap().unwrap();
+        let a2_back = statement_get(&rtxn, a2.id).unwrap().unwrap();
+        assert_eq!(a1_back.superseded_by, Some(a2.id));
+        assert_eq!(a2_back.supersedes, Some(a1.id));
+        assert_eq!(a2_back.version, 2);
+        assert_eq!(a2_back.chain_root, a1.id);
+        assert!(!a1_back.is_current(1_800_000_000_000_000_000));
+        assert!(a2_back.is_current(1_800_000_000_000_000_000));
+    }
+
+    #[test]
+    fn create_event_keeps_event_at_and_accumulates() {
+        // Events are Set + append-only: each carries its own `event_at` and a
+        // second Event for the same (subject, predicate) does NOT supersede —
+        // both stay current so "when" and enumeration read off the same rows.
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "priya");
+        let pred = intern_event_any_pred(&mut db, "traveled_to");
+
+        let e1 = fresh_event(subj, pred, 1_700_000_000);
+        let e2 = fresh_event(subj, pred, 1_800_000_000);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), &e1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), &e2, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let e1_back = statement_get(&rtxn, e1.id).unwrap().unwrap();
+        let e2_back = statement_get(&rtxn, e2.id).unwrap().unwrap();
+        // Time is owned by the fact.
+        assert_eq!(e1_back.event_at_unix_nanos, Some(1_700_000_000));
+        assert_eq!(e2_back.event_at_unix_nanos, Some(1_800_000_000));
+        // No supersession — both current.
+        assert_eq!(e1_back.superseded_by, None);
+        assert_eq!(e2_back.supersedes, None);
+        assert!(e1_back.is_current(1_900_000_000_000_000_000));
+        assert!(e2_back.is_current(1_900_000_000_000_000_000));
+    }
+
+    #[test]
+    fn create_event_allows_missing_event_at() {
+        // A dateless/same-day Event persists as an Event with `event_at = None`
+        // (no longer rejected, no longer demoted to Fact) so the read keeps its
+        // temporal role and answers "when" from the memory's own occurred_at.
         let (_dir, mut db) = open_db();
         let subj = make_entity(&mut db, "priya");
         let pred = intern_event_any_pred(&mut db, "scheduled");
@@ -1045,10 +1144,13 @@ mod tests {
         let mut s = fresh_event(subj, pred, 1_700_000_000);
         s.event_at_unix_nanos = None;
         let wtxn = db.write_txn().unwrap();
-        let err = statement_create(&wtxn, test_scope(), &s, 0).unwrap_err();
-        matches!(err, StatementOpError::InvalidArgument(_))
-            .then_some(())
-            .expect("expected InvalidArgument");
+        let id = statement_create(&wtxn, test_scope(), &s, 0).expect("dateless Event should persist");
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let back = statement_get(&rtxn, id).unwrap().unwrap();
+        assert_eq!(back.kind, StatementKind::Event);
+        assert_eq!(back.event_at_unix_nanos, None);
     }
 
     #[test]

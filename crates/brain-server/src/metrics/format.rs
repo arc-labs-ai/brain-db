@@ -935,6 +935,24 @@ fn emit_extractor_metrics(out: &mut String, shards: &[ShardHandle]) {
 
     emit_header(
         out,
+        "brain_extractor_predicate_consolidated_total",
+        "Open-vocab predicate surface forms folded onto an existing near-synonym predicate id by embedding consolidation.",
+        "counter",
+    );
+    for shard in shards {
+        if let Some(m) = shard.extractor_metrics() {
+            let snap = m.snapshot();
+            let labels = format!("{{shard=\"{}\"}}", shard.shard_id());
+            let _ = writeln!(
+                out,
+                "brain_extractor_predicate_consolidated_total{labels} {}",
+                snap.predicate_consolidated_total
+            );
+        }
+    }
+
+    emit_header(
+        out,
         "brain_extractor_items_written_total",
         "Typed-graph rows persisted by the extractor worker, by item kind.",
         "counter",

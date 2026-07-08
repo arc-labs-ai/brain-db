@@ -187,12 +187,10 @@ pub async fn dispatch(
     // checks for schema-touching ops happen inside the namespace-bound
     // handlers (SCHEMA_UPLOAD, etc.).
     enforce_namespace(&caller, &req)?;
-    // Third gate: a RECALL's explicit cross-agent knobs (`agent_filter`,
-    // `include_other_agents`) widen the read scope past the caller's own
-    // memories. The empty-filter default already scopes to the caller, but a
-    // scoped API key — bound to exactly one agent — must not be able to name
-    // another agent or opt into the across-agents view.
-    enforce_agent_filter(&caller, &req)?;
+    // Reads are structurally isolated to the caller's own agent: RECALL no
+    // longer carries any client-supplied agent filter, so the handlers scope
+    // to `caller.agent_id` unconditionally. There is no cross-agent read path
+    // to gate here.
 
     // Per-request override: stamp the caller's agent onto a clone
     // of the shared ctx so handlers that build writer Ops can pull
@@ -520,36 +518,20 @@ pub async fn dispatch(
                 .map(|b| single(ResponseBody::SchemaReplace(b)))
         }
 
-        // Extractor governance ops.
+        // Extractor introspection (read-only).
         RequestBody::ExtractorList(r) => {
             crate::handlers::extractor_admin::handle_extractor_list(r, ctx)
                 .await
                 .map(|b| single(ResponseBody::ExtractorList(b)))
         }
-        RequestBody::ExtractorDisable(r) => {
-            crate::handlers::extractor_admin::handle_extractor_disable(r, ctx)
-                .await
-                .map(|b| single(ResponseBody::ExtractorDisable(b)))
-        }
-        RequestBody::ExtractorEnable(r) => {
-            crate::handlers::extractor_admin::handle_extractor_enable(r, ctx)
-                .await
-                .map(|b| single(ResponseBody::ExtractorEnable(b)))
-        }
 
-        // Retrieval query ops.
-        RequestBody::Query(r) => crate::query::handle_query(r, ctx)
-            .await
-            .map(|b| single(ResponseBody::Query(b))),
+        // Retrieval query introspection ops.
         RequestBody::QueryExplain(r) => crate::query::handle_query_explain(r, ctx)
             .await
             .map(|b| single(ResponseBody::QueryExplain(b))),
         RequestBody::QueryTrace(r) => crate::query::handle_query_trace(r, ctx)
             .await
             .map(|b| single(ResponseBody::QueryTrace(b))),
-        RequestBody::QueryText(r) => crate::query::handle_query_text(r, ctx)
-            .await
-            .map(|b| single(ResponseBody::QueryText(b))),
 
         // Procedural-memory materialization (W3.1, wire v2).
         RequestBody::MaterializeProcedural(r) => {
@@ -673,16 +655,12 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
         | RequestBody::RelationListFrom(_)
         | RequestBody::RelationListTo(_)
         | RequestBody::RelationTraverse(_)
-        | RequestBody::Query(_)
         | RequestBody::QueryExplain(_)
         | RequestBody::QueryTrace(_)
-        | RequestBody::QueryText(_)
         | RequestBody::MaterializeProcedural(_) => (perm_bits::RECALL, "GRAPH_READ"),
 
-        // Extractor governance — admin-only.
-        RequestBody::ExtractorList(_)
-        | RequestBody::ExtractorDisable(_)
-        | RequestBody::ExtractorEnable(_) => (perm_bits::ADMIN, "EXTRACTOR_ADMIN"),
+        // Extractor introspection — admin-only.
+        RequestBody::ExtractorList(_) => (perm_bits::ADMIN, "EXTRACTOR_ADMIN"),
 
         // Admin ops — admin-only.
         RequestBody::AdminStats(_)
@@ -743,33 +721,6 @@ fn enforce_namespace(caller: &RequestCaller, req: &RequestBody) -> Result<(), Op
     Ok(())
 }
 
-/// Reject a RECALL whose explicit cross-agent scope would read outside the
-/// caller's bound agent. The key is bound to exactly one agent, so the only
-/// `agent_filter` it may name is its own agent, and it may not set
-/// `include_other_agents` (which drops the implicit caller scope and reads
-/// across every agent).
-///
-/// The common path — empty `agent_filter`, `include_other_agents == false` —
-/// passes here and is scoped to the caller downstream in the RECALL handler.
-fn enforce_agent_filter(caller: &RequestCaller, req: &RequestBody) -> Result<(), OpError> {
-    let RequestBody::Recall(r) = req else {
-        return Ok(());
-    };
-    if r.include_other_agents {
-        return Err(OpError::Unauthorized(
-            "recall: include_other_agents is not permitted under scoped API-key auth".into(),
-        ));
-    }
-    for bytes in &r.agent_filter {
-        if AgentId::from(*bytes) != caller.agent_id {
-            return Err(OpError::Unauthorized(
-                "recall: agent_filter may only name the API key's own agent".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Tests (pure permission / namespace checks).
 // ---------------------------------------------------------------------------
@@ -778,7 +729,7 @@ fn enforce_agent_filter(caller: &RequestCaller, req: &RequestBody) -> Result<(),
 mod tests {
     use super::*;
     use brain_protocol::EncodeRequest;
-    use brain_protocol::{RecallRequest, SchemaGetRequest, SchemaListRequest};
+    use brain_protocol::{SchemaGetRequest, SchemaListRequest};
 
     fn agent(byte: u8) -> AgentId {
         let mut a = [0u8; 16];
@@ -889,61 +840,5 @@ mod tests {
         let p = full_caller();
         assert!(p.require_agent(agent(99), "test").is_err());
         assert!(p.require_agent(agent(1), "test").is_ok());
-    }
-
-    fn recall_with(agent_filter: Vec<[u8; 16]>, include_other_agents: bool) -> RequestBody {
-        RequestBody::Recall(RecallRequest {
-            cue_text: "x".into(),
-            subject_name: String::new(),
-            max_results: 5,
-            confidence_threshold: 0.0,
-            context_filter: None,
-            age_bound_unix_nanos: None,
-            as_of_record_time_unix_nanos: None,
-            kind_filter: None,
-            salience_floor: 0.0,
-            include_edges: false,
-            include_graph: false,
-            include_text: false,
-            request_id: None,
-            txn_id: None,
-            agent_filter,
-            include_other_agents,
-        })
-    }
-
-    fn agent_bytes(byte: u8) -> [u8; 16] {
-        *agent(byte).0.as_bytes()
-    }
-
-    #[test]
-    fn strict_recall_allows_own_agent_and_empty_filter() {
-        let caller = strict(perm_bits::RECALL, "ns", agent(1));
-        // Default scope (empty filter, no cross-agent) passes.
-        assert!(enforce_agent_filter(&caller, &recall_with(Vec::new(), false)).is_ok());
-        // Naming exactly the caller's own agent passes.
-        assert!(enforce_agent_filter(&caller, &recall_with(vec![agent_bytes(1)], false)).is_ok());
-    }
-
-    #[test]
-    fn strict_recall_rejects_other_agent_filter() {
-        let caller = strict(perm_bits::RECALL, "ns", agent(1));
-        let err =
-            enforce_agent_filter(&caller, &recall_with(vec![agent_bytes(2)], false)).unwrap_err();
-        assert!(matches!(err, OpError::Unauthorized(_)));
-        // A filter mixing self with another agent is still rejected.
-        let err = enforce_agent_filter(
-            &caller,
-            &recall_with(vec![agent_bytes(1), agent_bytes(2)], false),
-        )
-        .unwrap_err();
-        assert!(matches!(err, OpError::Unauthorized(_)));
-    }
-
-    #[test]
-    fn strict_recall_rejects_include_other_agents() {
-        let caller = strict(perm_bits::RECALL, "ns", agent(1));
-        let err = enforce_agent_filter(&caller, &recall_with(Vec::new(), true)).unwrap_err();
-        assert!(matches!(err, OpError::Unauthorized(_)));
     }
 }

@@ -131,11 +131,9 @@ On classifier queue overflow:
 
 Brain does not implement adaptive throttling.
 
-### Disabled extractors
+### Always-on extractors
 
-`extractor.enabled = false` (set via `EXTRACTOR_DISABLE`) means dispatch skips the extractor entirely at the eligibility filter. In-flight items already in the queue dequeue and run to completion ("disabling is non-disruptive").
-
-The audit row a disabled extractor would have written becomes `Skipped(reason: "disabled")` if the dispatcher caught it; in-flight items run normally and write `Success` / `Failure`.
+Extraction is always-on and non-configurable — there is no per-tier enable flag and no `EXTRACTOR_DISABLE` / `EXTRACTOR_ENABLE` op. Every registered extractor runs on every eligible item; there is no "disabled" eligibility-filter branch. A tier whose model can't load is a hard shard-spawn failure, not a silent skip (see [`../11_extractors/00_purpose.md`](../11_extractors/00_purpose.md)).
 
 ### Graceful shutdown
 
@@ -151,7 +149,7 @@ Brain ships steps 1+2; step 3 (timeout stub-writing) is deferred to avoid touchi
 Per [`./00_purpose.md`](./00_purpose.md) (Observability) plus extractor-specific:
 
 - `extractor_dispatch_total{tier, extractor_id}` — items dispatched.
-- `extractor_skipped_total{tier, extractor_id, reason}` — filter / disabled / queue-full / dep-not-ready.
+- `extractor_skipped_total{tier, extractor_id, reason}` — filter / queue-full / dep-not-ready.
 - `extractor_run_seconds{tier, extractor_id}` — histogram.
 - `extractor_audit_writes_total{status}` — Success / Failure / Skipped* / SkippedDuplicate.
 
@@ -161,7 +159,6 @@ Brain's tests verify:
 
 - All three tiers dispatch through the single extractor queue (no in-ENCODE synchronous path).
 - Classifier queue overflow drops + writes audit + emits metric.
-- `enabled = false` causes dispatch to skip.
 - `depends_on` chain blocks dequeue until parent's audit row appears.
 - Shutdown drains within 30 s timeout.
 

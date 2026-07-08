@@ -28,9 +28,7 @@ use brain_protocol::connection::handshake::{
 use brain_protocol::envelope::request::RequestBody;
 use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
-use brain_protocol::{
-    ExtractorDisableRequest, ExtractorEnableRequest, ExtractorListRequest, SchemaUploadRequest,
-};
+use brain_protocol::{ExtractorListRequest, SchemaUploadRequest};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -215,9 +213,7 @@ async fn schema_upload_registers_llm_extractor_in_list() {
     let (opcode, body) = round_trip(
         &mut client,
         3,
-        RequestBody::ExtractorList(ExtractorListRequest {
-            include_disabled: true,
-        }),
+        RequestBody::ExtractorList(ExtractorListRequest {}),
     )
     .await;
     assert_eq!(opcode, Opcode::ExtractorListResp.as_u16());
@@ -232,7 +228,6 @@ async fn schema_upload_registers_llm_extractor_in_list() {
         .find(|i| i.namespace == "acme" && i.name == "llm_prefs")
         .expect("acme:llm_prefs registered");
     assert_eq!(llm_row.kind, 2, "kind byte 2 == llm");
-    assert!(llm_row.enabled, "newly uploaded extractor is enabled");
 
     server.stop().await;
 }
@@ -259,70 +254,3 @@ async fn schema_upload_registers_llm_extractor_in_list() {
 // at the unit level by `crates/brain-extractors/tests/
 // llm_pipeline.rs`.
 // ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "current_thread")]
-async fn extractor_disable_then_enable_round_trip_for_llm_row() {
-    let data_dir = TempDir::new().expect("tmp");
-    let server = start_in(data_dir.path(), 1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr)
-        .await
-        .expect("connect");
-    complete_handshake(&mut client, &server.token).await;
-
-    let (_, _) = round_trip(&mut client, 1, upload_request(ACME_LLM_SCHEMA)).await;
-
-    // Resolve the LLM extractor's id via LIST.
-    let (_, body) = round_trip(
-        &mut client,
-        3,
-        RequestBody::ExtractorList(ExtractorListRequest {
-            include_disabled: true,
-        }),
-    )
-    .await;
-    let llm_id = match body {
-        ResponseBody::ExtractorList(r) => {
-            r.items
-                .iter()
-                .find(|i| i.namespace == "acme" && i.name == "llm_prefs")
-                .expect("acme:llm_prefs present")
-                .extractor_id
-        }
-        _ => unreachable!(),
-    };
-
-    // DISABLE.
-    let (opcode, body) = round_trip(
-        &mut client,
-        5,
-        RequestBody::ExtractorDisable(ExtractorDisableRequest {
-            extractor_id: llm_id,
-            reason: "test disable".into(),
-            request_id: *uuid::Uuid::now_v7().as_bytes(),
-        }),
-    )
-    .await;
-    assert_eq!(opcode, Opcode::ExtractorDisableResp.as_u16());
-    match body {
-        ResponseBody::ExtractorDisable(r) => assert!(r.previously_enabled),
-        other => panic!("expected ExtractorDisableResp, got {other:?}"),
-    }
-
-    // ENABLE.
-    let (opcode, body) = round_trip(
-        &mut client,
-        7,
-        RequestBody::ExtractorEnable(ExtractorEnableRequest {
-            extractor_id: llm_id,
-            request_id: *uuid::Uuid::now_v7().as_bytes(),
-        }),
-    )
-    .await;
-    assert_eq!(opcode, Opcode::ExtractorEnableResp.as_u16());
-    match body {
-        ResponseBody::ExtractorEnable(r) => assert!(r.previously_disabled),
-        other => panic!("expected ExtractorEnableResp, got {other:?}"),
-    }
-
-    server.stop().await;
-}

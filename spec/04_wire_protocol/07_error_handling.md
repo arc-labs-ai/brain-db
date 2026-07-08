@@ -187,7 +187,7 @@ Cardinality violations on RELATION_CREATE surface as the substrate-wide `Cardina
 
 ##### 3.10.2 Schema-not-declared mode
 
-When no schema has been declared for a namespace, typed-graph writes (`STATEMENT_CREATE`, `RELATION_CREATE`) and reads (`QUERY`, etc.) accept any predicate / relation-type qname — the registry interns it on first use with `SchemaOrigin::ImplicitFromWrite` / `RelationTypeOrigin::ImplicitFromWrite`. No `SchemaNotDeclared` error is returned for these opcodes.
+When no schema has been declared for a namespace, typed-graph writes (`STATEMENT_CREATE`, `RELATION_CREATE`) and reads (`RECALL`, `STATEMENT_LIST`, the `QUERY_TRACE` introspection op, etc.) accept any predicate / relation-type qname — the registry interns it on first use with `SchemaOrigin::ImplicitFromWrite` / `RelationTypeOrigin::ImplicitFromWrite`. No `SchemaNotDeclared` error is returned for these opcodes.
 
 `SchemaNotDeclared` remains reserved for explicit schema-introspection opcodes (e.g. `SCHEMA_GET` against a namespace that has never had one), where there is nothing to return. Its category is `Conflict`.
 
@@ -605,12 +605,14 @@ Aliases are deduplicated server-side on the normalized form before insertion. A 
 - `from`, `to`: must be existing entities; for schema-declared types, endpoint entity types must match the relation's declared signature → `EntityTypeMismatch`. Implicit types skip this check.
 - cardinality (`one_to_one` / `one_to_many` / etc.): enforced server-side on schema-declared types only → `CardinalityViolation` (0x0065).
 
-##### 16.9.6 Query opcodes (`0x0160–0x0163`)
+##### 16.9.6 Query introspection opcodes (`0x0161–0x0162`)
 
-- `top_k`: 1 ≤ top_k ≤ 1000.
+Validation of the `QueryRequest` accepted by `QUERY_EXPLAIN` / `QUERY_TRACE`:
+
+- `top_k`: 1 ≤ top_k ≤ 1000 (the trace-output head size; ignored by EXPLAIN).
 - `depth` (for `RELATION_TRAVERSE`-shaped queries): 1 ≤ depth ≤ 8.
 - `budget_wall_time_ms`: 1 ≤ budget ≤ 60000 (60 s ceiling).
-- empty filter clauses are allowed (no-op); empty `text` for `QUERY_TEXT` rejected.
+- empty filter clauses are allowed (no-op).
 
 ##### 16.9.7 Admin opcodes (`0x0170–0x0177`)
 

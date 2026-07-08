@@ -4,12 +4,16 @@ The read-side cognitive primitives: RECALL (similarity search), PLAN (graph path
 
 ## RECALL
 
-The RECALL primitive: find memories by similarity. **One verb, one code path** — every request walks the same pipeline regardless of whether a user schema has been declared.
+The RECALL primitive is Brain's **sole primary read verb**: ask the memory a
+question, get the answer. **One verb, one code path** — every request walks the
+same pipeline regardless of whether a user schema has been declared. There is no
+second client read verb; RECALL returns the answer as a membership shape
+(Single / Many / None), not a ranked candidate list the caller has to sift.
 
 ### 1. Semantic contract
 
 ```
-RECALL(cue_text, agent_id, k, filter, ...) → Vec<RecallResult>
+RECALL(cue_text, agent_id, filter, max_results, ...) → RecallAnswer
 ```
 
 Brain runs a single pipeline on every request:
@@ -21,12 +25,24 @@ RECALL → validate → embed cue → fan out to three retrievers
        → filter chain (tombstone, kind, context, temporal,
          confidence, salience, supersession)
        → metadata enrichment from redb
-       → optional cross-encoder rerank
-         (if request.rerank == true AND CrossEncoderSlot::Enabled)
+       → cross-encoder rerank (always-on when the model is loaded)
+       → membership: keep the answer set inside a relevance band,
+         shape by cardinality → Single / Many / None
        → wire response
 ```
 
-The three retrievers are mandatory shard wiring — they are never `None`. If `request.rerank == true` and the cross-encoder is `Disabled` (operator opt-out), the request fails fast with `CapabilityNotEnabled { capability: "rerank" }`; there is no silent fallback. Schema declarations do not gate any stage of this pipeline. They only narrow what `STATEMENT_CREATE` / `RELATION_CREATE` and predicate-aware filters accept.
+The three retrievers are mandatory shard wiring — they are never `None`. The
+cross-encoder rerank runs on every read whenever the model is loaded; there is
+no request flag. The only control is the deploy-time `config.rerank.enabled`
+load gate — when the operator opts out, no model loads and the pipeline returns
+RRF-only ordering (no error). Schema declarations do not gate any stage of this
+pipeline. They only narrow what `STATEMENT_CREATE` / `RELATION_CREATE` and
+predicate-aware filters accept.
+
+Crucially, membership is computed over the **full filtered candidate pool**, not
+a fixed top-K window. The relevance band (not a count) decides which memories
+belong to the answer; `max_results` is only a safety ceiling on how many members
+are returned, never the criterion that shapes the answer.
 
 #### In-transaction read-your-writes overlay
 
@@ -34,7 +50,7 @@ When `req.txn_id` is set, the txn's pending ENCODE buffer is overlaid on the com
 
 - Tombstoned ids in the buffer drop committed hits.
 - Pending encodes are scored against the cue vector and merged with the committed list.
-- The combined list is re-sorted by similarity (descending) and trimmed to `top_k`.
+- The combined list is re-sorted by similarity (descending); membership shaping then runs over it, bounded only by the `max_results` safety ceiling.
 
 This is the single read-your-writes path; the same overlay runs whether or not a schema is active.
 
@@ -50,9 +66,13 @@ The cue can be a single word, a sentence, a longer document — whatever the age
 
 The owning agent. Returns are scoped to this agent's memories.
 
-#### k
+#### max_results
 
-How many results. Default 10. Max 1000.
+A **safety ceiling** on how many members a `Many` answer may carry — not a
+ranking knob and not the criterion that shapes the answer. `0` ⇒ server default;
+an explicit value caps the returned member count. Max 1000. The answer's shape
+(Single / Many / None) comes from the relevance band over the full candidate
+pool (§3), never from this number.
 
 #### filter
 
@@ -94,16 +114,28 @@ Optional. Filter results with similarity score below this threshold. Useful when
 
 ### 3. The response
 
+RECALL answers with memories — one, several, or none. The `answer_kind`
+carries which; the memory list holds the members. There is no
+retrieval-mechanism vocabulary in the response (no "episodic", no "grounded") —
+how the router found the memories is an internal concern the caller never sees.
+
 ```rust
-struct RecallResponse {
-    results: Vec<RecallResult>,
+struct RecallAnswer {
+    answer_kind: AnswerKind,          // Single | Many | None
+    memories: Vec<RecallResult>,      // 1 for Single, 2+ for Many, 0 for None
     partial: bool,                    // True if some shards failed
     total_candidates: usize,          // Pre-filter count (for diagnostics)
 }
 
+enum AnswerKind {
+    Single,                           // exactly one memory is the answer
+    Many,                             // several memories together are the answer
+    None,                             // no memory answers the cue (explicit absence)
+}
+
 struct RecallResult {
     memory_id: MemoryId,
-    score: f32,                       // [-1, 1]; higher = more similar
+    score: f32,                       // [-1, 1]; higher = more similar (provenance)
     text: Option<String>,             // If include_text
     metadata: Option<MemoryMetadata>, // If include_metadata
     context_id: ContextId,
@@ -111,7 +143,26 @@ struct RecallResult {
 }
 ```
 
-Results are sorted by score, descending.
+#### The membership band (how the shape is decided)
+
+The answer set is the memories that fall inside a **relevance band** over the
+full filtered candidate pool, not the top-K by rank:
+
+- Let `top` = the best relevance score in the pool. A candidate belongs to the
+  answer iff it clears both an absolute floor and a relative band around `top`
+  (`score ≥ ABS_FLOOR` **and** `score ≥ top × REL_BAND`). Lexical- or
+  graph-confirmed hits, and grounded source memories for a resolved
+  subject/predicate, are admitted the same way.
+- `answer_kind` is then pure cardinality of that set: `0 → None`, `1 → Single`,
+  `2+ → Many`. When several members all assert the same value, the router may
+  collapse them to a single `Single`.
+- `max_results` (§2) only caps the size of a `Many`; it never turns a `Many`
+  into a `Single` by truncation, and never suppresses the band.
+
+Absence is explicit (`None`, empty list), never a fabricated guess.
+`RecallResult.score` and the other retrieval fields are **provenance** — they
+say why a member surfaced; they are not a ranking the caller is expected to
+re-sort or threshold.
 
 ### 4. Score semantics
 
@@ -127,18 +178,21 @@ Heuristic interpretation:
 
 These aren't strict thresholds; they depend on the model and the corpus. Agents tune `confidence_min` to their use case.
 
-### 5. The "fewer than K" case
+### 5. The small-answer case
 
-If Brain finds fewer than K matching memories, the response has fewer than K results. This is normal for:
+A `Single` answer, or a `Many` with only a handful of members, is normal — the
+band admits exactly the memories that answer the cue, however few. This is
+common for:
 - Small or new agents.
 - Selective filters.
 - Very specific cues.
 
-It's not an error.
+It's not an error, and it is not "fewer than requested" — there is no requested
+count. `max_results` only caps the upper end.
 
-### 6. The "empty result" case
+### 6. The `None` case
 
-Zero results. Possible if:
+`answer_kind = None`, empty member list. Possible if:
 - The agent has no memories.
 - All memories are tombstoned.
 - All memories have a different model fingerprint (after a model upgrade).
@@ -184,13 +238,10 @@ If the agent wants recent-favoring, it can:
 
 ### 11. The "context boost" effect
 
-The agent might want memories in the current context to rank higher. Brain doesn't do this automatically. The agent can:
-
-1. RECALL with no context filter; get K results.
-2. RECALL with the context filter; get K results.
-3. Merge in the agent layer with weights.
-
-Or use a single RECALL with explicit `contexts: Some([current])`.
+The agent might want to restrict the answer to the current context. Use a single
+RECALL with explicit `contexts: Some([current])` — the filter chain scopes the
+candidate pool before membership runs. The agent does not merge or re-rank result
+lists in its own layer; the DB returns the answer.
 
 ### 12. The "across-shard" recall
 
@@ -199,18 +250,20 @@ For agents whose data spans multiple shards (rare), RECALL fans out:
 - Each shard runs its sub-recall in parallel.
 - Results are merged by score.
 
-The response is the global top K.
+The membership answer is computed over the merged global candidate pool.
 
-This is transparent to the agent — it sees a single result list.
+This is transparent to the agent — it sees a single answer.
 
 ### 13. Latency
 
-For typical workloads (single-shard, K=10, no complex filter):
+For typical workloads (single-shard, no complex filter):
 
 - p50: ~10 ms.
 - p99: ~25 ms.
 
-For larger K or complex filters: latency rises proportionally. K=100 takes ~15 ms typical; K=1000 takes ~30 ms.
+Latency scales with the candidate-pool size the retrievers fan out over and the
+filter complexity, not with a caller-chosen result count — there isn't one. A
+larger answer set (a broad `Many`) costs marginally more to project.
 
 For cross-shard recalls (2-3 shards): p99 rises to ~30-50 ms.
 
@@ -227,9 +280,8 @@ For higher throughput, scale shards.
 
 Including text fetches each result's text from the metadata store:
 
-- Per-result cost: ~5-20 µs (cache-dependent).
-- For K=10: ~100 µs additional.
-- For K=100: ~1 ms additional.
+- Per-member cost: ~5-20 µs (cache-dependent).
+- A handful of members: ~100 µs additional; a broad `Many`: proportionally more.
 
 For very large texts (~MB each), the response size grows correspondingly.
 
@@ -253,26 +305,26 @@ Tags are filtered post-search; selective tag filters need higher ef_search (the 
 
 For agents that want just IDs and scores (no text, no metadata), the default is fine — text and metadata are off by default. The response is small and fast.
 
-### 19. The "no result" semantics
+### 19. The `None` semantics
 
-If the agent gets zero results, possible interpretations:
+`answer_kind = None` is Brain's explicit "no memory answers this" — absence is a
+first-class answer, never a fabricated guess. Possible causes:
 
 - The agent has no relevant memories.
-- The cue is unusual (no similar memories).
+- The cue is unusual (nothing clears the relevance band).
 - The filter is too tight.
 
-Brain doesn't distinguish these. The agent decides what to do — broaden the cue, relax the filter, or accept no results.
+Brain doesn't distinguish these causes on the wire. The agent decides what to do
+— broaden the cue, relax the filter, or accept the `None`.
 
-### 20. The "two-stage" pattern
+### 20. No client-side re-ranking
 
-Some agents do:
-
-1. RECALL with K=100 to get a broad set.
-2. Re-rank with custom logic on the agent side.
-
-Brain's K=100 isn't much more expensive than K=10. The agent gets flexibility.
-
-For very large K (>100), make sure to consider cost (K=1000 is ~3× the cost of K=10).
+Brain does not expose a "fetch a broad top-K and re-rank on the agent side"
+pattern — that is the SaaS-search shape this DB rejects. The heavy lifting
+(fusion, rerank, membership) happens server-side at read time; the answer comes
+back already shaped (Single / Many / None). The agent consumes the answer, it
+does not re-sort or threshold a candidate list. `RecallResult.score` is
+provenance, not a ranking the caller is expected to act on.
 
 ## PLAN
 

@@ -124,6 +124,19 @@ pub async fn handle_encode(
         .map_err(|e| OpError::ExecError(brain_planner::ExecError::WriterFailed(e)))?;
     let created_at = now_unix_nanos();
 
+    // Stage journal (S1 embed). The embed itself ran above, before the id
+    // was reserved; we log it here so every write stage shares one
+    // `memory_id` key and the eval probe can stitch a single write's
+    // stages back together. Debug-level, so it costs nothing in prod.
+    tracing::debug!(
+        target: "brain_debug::stage",
+        stage = "S1_embed",
+        memory_id = memory_id.raw(),
+        text_len = req.text.len(),
+        vector_dim = vector.len(),
+        "write stage: text embedded",
+    );
+
     // 5. Build the single-phase Write: UpsertMemory. ENCODE carries no
     // client edges — auto/temporal-edge derivation is the workers' job,
     // enqueued post-commit by submit(). `req.text` is no longer read
@@ -160,6 +173,19 @@ pub async fn handle_encode(
         .await
         .map_err(|e| OpError::ExecError(brain_planner::ExecError::WriterFailed(e)))?;
     debug_assert!(matches!(ack.phase_acks[0], PhaseAck::UpsertedMemory(_)));
+
+    // Stage journal (S2 WAL fsync + S3 arena/redb/HNSW persist). The ack
+    // returning at all is the durability signal: WAL-before-ack means the
+    // record is fsynced and the memory row + arena slot + HNSW point are
+    // live. `lsn` is the durable log position; the extractor stages fire
+    // asynchronously off `pending_stages`.
+    tracing::debug!(
+        target: "brain_debug::stage",
+        stage = "S2_S3_durable",
+        memory_id = memory_id.raw(),
+        lsn = ack.lsn_first.raw(),
+        "write stage: WAL durable + memory persisted",
+    );
 
     // Project the write's pending background stages onto the wire
     // response. Clients waiting via `--wait` decrement this list as

@@ -49,8 +49,7 @@ use crate::connection::{
 };
 use crate::routing::RoutingTable;
 use crate::shard::{
-    spawn_shard, ExtractorTierSpawnConfig, LlmSpawnConfig, RerankSpawnConfig, ShardHandle,
-    ShardJoiner, ShardSpawnConfig,
+    spawn_shard, LlmSpawnConfig, RerankSpawnConfig, ShardHandle, ShardJoiner, ShardSpawnConfig,
 };
 
 /// Integration-test stub dispatcher. The harness never exercises
@@ -168,11 +167,6 @@ pub async fn start_full_pipeline_in(
 ) -> Server {
     start_in_with(data_dir, 1, move |dd| {
         let mut cfg = ShardSpawnConfig::new(dd, dispatcher.clone());
-        cfg.extractors = ExtractorTierSpawnConfig {
-            pattern_enabled: true,
-            classifier_enabled: true,
-            llm_enabled: true,
-        };
         cfg.llm = LlmSpawnConfig {
             api_key: api_key.clone(),
             model: None,

@@ -25,11 +25,10 @@ use crate::entity::ops::{
     entity_get_inside_wtxn, entity_put, entity_rename, entity_tombstone, entity_update,
     normalize_name,
 };
-use crate::extractor::ops::extractor_set_enabled;
 use crate::recovery::phase_bodies::{
     decode_entity_create, decode_entity_merge, decode_entity_rename, decode_entity_tombstone,
-    decode_entity_unmerge, decode_entity_update, decode_extractor_toggle, decode_schema_update,
-    decode_statement_create, decode_statement_supersede, decode_statement_tombstone,
+    decode_entity_unmerge, decode_entity_update, decode_schema_update, decode_statement_create,
+    decode_statement_supersede, decode_statement_tombstone,
 };
 use crate::schema::predicate::predicate_intern_or_get;
 use crate::schema::store::{schema_get, schema_upload};
@@ -243,26 +242,6 @@ impl MetadataDb {
                 unmerge_entity(&wtxn, merged, actor, b.at_unix_nanos)
                     .map_err(|e| MetadataSinkError::Corruption(format!("unmerge_entity: {e}")))?;
             }
-            self.bump_next_lsn_in_txn(&wtxn, lsn)?;
-        }
-        wtxn.commit().map_err(transient)?;
-        Ok(())
-    }
-
-    /// Replay an `ExtractorToggle` body via `extractor_set_enabled`
-    /// (idempotent — setting the flag to the same value is a no-op).
-    pub(super) fn apply_extractor_toggle(
-        &self,
-        lsn: u64,
-        body: &[u8],
-    ) -> Result<(), MetadataSinkError> {
-        let b = decode_extractor_toggle(body)
-            .map_err(|e| MetadataSinkError::Corruption(format!("extractor_toggle decode: {e}")))?;
-        let wtxn = self.db.begin_write().map_err(transient)?;
-        {
-            extractor_set_enabled(&wtxn, brain_core::ExtractorId::from(b.id), b.enabled).map_err(
-                |e| MetadataSinkError::Corruption(format!("extractor_set_enabled: {e}")),
-            )?;
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
         }
         wtxn.commit().map_err(transient)?;

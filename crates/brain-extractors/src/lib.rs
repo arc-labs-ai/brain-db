@@ -39,7 +39,6 @@ pub mod llm;
 pub mod materialize;
 pub mod pattern;
 pub mod resolver;
-pub mod resolver_llm;
 pub mod supersede_source;
 
 pub use classifier::{
@@ -48,10 +47,10 @@ pub use classifier::{
 };
 pub use enricher_hook::{run_pipeline_enrichers, EnricherHook, EnricherHookOutcome};
 pub use framework::{
-    EntityMention, ExtractedItem, ExtractionContext, ExtractionFailureClass, ExtractionFuture,
-    ExtractionResult, ExtractionStatus, Extractor, ExtractorContext, ExtractorError,
-    ExtractorRegistry, ExtractorRunOptions, NeighborMemory, RelationMention, StatementMention,
-    TierGate, TierState,
+    evaluate_trigger_on_encode, EntityMention, ExtractedItem, ExtractionContext,
+    ExtractionFailureClass, ExtractionFuture, ExtractionResult, ExtractionStatus, Extractor,
+    ExtractorContext, ExtractorError, ExtractorRegistry, ExtractorRunOptions, NeighborMemory,
+    RelationMention, StatementMention, TierGate, TierState, TriggerDecision, SYSTEM_NAMESPACE,
 };
 pub use idempotency::{hash_memory_text, IdempotencyKey};
 pub use llm::{estimate_cost, CostBudget, LlmExtractor, LlmExtractorInner, Pricing};
@@ -61,8 +60,8 @@ pub use materialize::{
 };
 pub use pattern::{CompiledRegex, PatternExtractor, TemporalExtractor};
 pub use resolver::{
-    resolve_or_create, EntityDisambiguator, MatchVerdict, Resolution, ResolutionTier,
-    ResolverError, DEFAULT_DISAMBIGUATOR_MIN_CONFIDENCE,
+    is_temporal_expression_surface, resolve_or_create, strip_leading_vocative, EntityDisambiguator,
+    LlmCandidateView, MatchVerdict, Resolution, ResolutionTier, ResolverError,
+    DEFAULT_DISAMBIGUATOR_MIN_CONFIDENCE,
 };
-pub use resolver_llm::{BrainLlmDisambiguator, LlmCandidateView};
 pub use supersede_source::StatementHnswSource;

@@ -143,17 +143,13 @@ pub enum ResponseBody {
     SchemaValidate(SchemaValidateResponse),
     SchemaReplace(SchemaReplaceResponse),
 
-    // Extractor governance ops.
+    // Extractor introspection (read-only).
     /// Single-frame snapshot in v1.
     ExtractorList(ExtractorListResponseFrame),
-    ExtractorDisable(ExtractorDisableResponse),
-    ExtractorEnable(ExtractorEnableResponse),
 
     // Retrieval query ops.
-    Query(QueryResponse),
     QueryExplain(QueryExplainResponse),
     QueryTrace(QueryTraceResponse),
-    QueryText(QueryTextResponse),
 
     // Procedural-memory materialization. Carries the rendered system
     // block plus the statement ids that contributed.
@@ -228,12 +224,8 @@ impl ResponseBody {
             Self::SchemaValidate(_) => Opcode::SchemaValidateResp,
             Self::SchemaReplace(_) => Opcode::SchemaReplaceResp,
             Self::ExtractorList(_) => Opcode::ExtractorListResp,
-            Self::ExtractorDisable(_) => Opcode::ExtractorDisableResp,
-            Self::ExtractorEnable(_) => Opcode::ExtractorEnableResp,
-            Self::Query(_) => Opcode::QueryResp,
             Self::QueryExplain(_) => Opcode::QueryExplainResp,
             Self::QueryTrace(_) => Opcode::QueryTraceResp,
-            Self::QueryText(_) => Opcode::QueryTextResp,
             Self::MaterializeProcedural(_) => Opcode::MaterializeProceduralResp,
             Self::Error(_) => Opcode::Error,
         }
@@ -328,12 +320,8 @@ impl ResponseBody {
             Self::SchemaValidate(r) => to_cbor_bytes(r),
             Self::SchemaReplace(r) => to_cbor_bytes(r),
             Self::ExtractorList(r) => to_cbor_bytes(r),
-            Self::ExtractorDisable(r) => to_cbor_bytes(r),
-            Self::ExtractorEnable(r) => to_cbor_bytes(r),
-            Self::Query(r) => to_cbor_bytes(r),
             Self::QueryExplain(r) => to_cbor_bytes(r),
             Self::QueryTrace(r) => to_cbor_bytes(r),
-            Self::QueryText(r) => to_cbor_bytes(r),
             Self::MaterializeProcedural(r) => to_cbor_bytes(r),
             Self::Error(r) => to_cbor_bytes(r),
         }
@@ -409,12 +397,8 @@ impl ResponseBody {
             Opcode::SchemaValidateResp => Self::SchemaValidate(from_cbor_bytes(bytes)?),
             Opcode::SchemaReplaceResp => Self::SchemaReplace(from_cbor_bytes(bytes)?),
             Opcode::ExtractorListResp => Self::ExtractorList(from_cbor_bytes(bytes)?),
-            Opcode::ExtractorDisableResp => Self::ExtractorDisable(from_cbor_bytes(bytes)?),
-            Opcode::ExtractorEnableResp => Self::ExtractorEnable(from_cbor_bytes(bytes)?),
-            Opcode::QueryResp => Self::Query(from_cbor_bytes(bytes)?),
             Opcode::QueryExplainResp => Self::QueryExplain(from_cbor_bytes(bytes)?),
             Opcode::QueryTraceResp => Self::QueryTrace(from_cbor_bytes(bytes)?),
-            Opcode::QueryTextResp => Self::QueryText(from_cbor_bytes(bytes)?),
             Opcode::MaterializeProceduralResp => {
                 Self::MaterializeProcedural(from_cbor_bytes(bytes)?)
             }

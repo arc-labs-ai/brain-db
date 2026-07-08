@@ -117,9 +117,6 @@ impl MetadataSink for MetadataDb {
                         self.apply_statement_tombstone(lsn, &record.body)
                     }
                     WalRecordKind::SchemaUpdate => self.apply_schema_update(lsn, &record.body),
-                    WalRecordKind::ExtractorToggle => {
-                        self.apply_extractor_toggle(lsn, &record.body)
-                    }
                     // Other typed-graph kinds aren't WAL-mapped on the write
                     // side yet (durability still rides the redb commit for
                     // them); bump next_lsn so checkpointing and

@@ -25,25 +25,18 @@ schema has been declared. Schema declarations narrow what
 predicate-aware filters accept; they do not gate any stage of this
 pipeline.
 
+This pipeline is the **engine**, not a client verb. The sole client entry point
+is `RECALL` (§05.03), which runs this engine and returns a membership answer
+(Single / Many / None). The engine's raw fused output is exposed on the wire
+only through the operator debug ops `QUERY_EXPLAIN` (plan, no execution) and
+`QUERY_TRACE` (execute + per-retriever breakdown). There is no client-facing
+bulk-query verb that returns the raw ranked list.
+
 ## Query shape
 
-Two surfaces, same engine:
-
-### Fluent client API (illustrative)
-
-```rust
-let results = brain.query()
-    .recall("budget pushback")                              // text query
-    .with_entity::<Person>("Priya")                         // entity anchor
-    .of_kind(StatementKind::Preference)                     // type filter
-    .where_time(TimeRange::last(Duration::days(30)))        // temporal filter
-    .with_min_confidence(0.7)                               // confidence filter
-    .limit(20)
-    .execute()
-    .await?;
-```
-
-### Structured request (wire protocol)
+The engine's internal request. `RECALL` builds it from the cue; `QUERY_TRACE`
+accepts it directly so an operator can drive the engine for diagnosis. It is
+not a client query language.
 
 ```rust
 struct QueryRequest {
@@ -55,9 +48,10 @@ struct QueryRequest {
     confidence_min: Option<f32>,
     include_tombstoned: bool,
     include_superseded: bool,
-    limit: u32,
-    retrievers: RetrieverSelection,    // Auto | Explicit
-    fusion_config: Option<FusionConfig>,
+    limit: u32,                        // safety cap on returned members, NOT a
+                                       // ranking top_k; RECALL feeds max_results
+    retrievers: RetrieverSelection,    // Auto | Explicit (debug-override only)
+    fusion_config: Option<FusionConfig>, // debug-override only
 }
 ```
 
@@ -119,13 +113,14 @@ Rule 6: List / aggregation query  (internal — never client-selected)
 ```
 
 **The client never selects this.** Brain is a database: the caller asks
-`recall(cue, top_k)` and the router decides — from the cue text alone —
-whether the answer is one memory or a set, and quietly does the extra
-coverage + merge work behind the scenes. There is no `diversity` / "list
-mode" knob on the wire; the caller cannot know in advance whether their
-question has one answer or many, so the DB owns that decision. `top_k`
-still bounds what is returned — list handling changes *which* results
-fill those slots, not how many.
+`recall(cue)` and the router decides — from the cue text alone — whether the
+answer is one memory or a set, and quietly does the extra coverage + merge work
+behind the scenes. There is no `diversity` / "list mode" knob on the wire; the
+caller cannot know in advance whether their question has one answer or many, so
+the DB owns that decision. There is no `top_k` either: the membership band over
+the full candidate pool decides which memories belong to the answer, and
+`max_results` is only a safety cap on the returned member count — list handling
+changes *which* results the band admits, not a caller-chosen count.
 
 Rules are applied non-exclusively: a query can match multiple rules. The router unions selected retrievers and uses the maximum weight per retriever across matching rules.
 
@@ -137,16 +132,20 @@ The router enforces:
 - Query timeout: default 1 second; cancellable.
 - Cost estimate: if estimated cost exceeds threshold, query is degraded (smaller top_n or fewer retrievers).
 
-### Per-query override
+### Per-query override (debug only)
 
-The client can override the router's decision:
+The router's decision can be overridden through the `retrievers` /
+`fusion_config` fields of the internal `QueryRequest` — but only via the
+operator debug ops (`QUERY_EXPLAIN` / `QUERY_TRACE`), never on the `RECALL`
+client read:
 
 ```rust
 .retrievers(Explicit(vec![Retriever::Semantic, Retriever::Graph]))
 .fusion_config(FusionConfig { k: 30, ..default })
 ```
 
-The override is logged for audit.
+The override is logged for audit. A client RECALL cannot reach these knobs — the
+router owns retriever/weight selection for the read path.
 
 ## Filter chain
 
@@ -160,7 +159,7 @@ fused candidates
   → Confidence filter (confidence ≥ threshold)
   → Tombstone filter (exclude tombstoned unless explicitly included)
   → Supersession filter (exclude superseded unless explicitly included)
-  → Limit
+  → Membership band + max_results safety cap
 ```
 
 ### The as_of(record_time) filter
@@ -169,7 +168,7 @@ fused candidates
 
 The filter answers "what did Brain believe on date X" without resurrecting tombstoned rows — the row stays in the table with `record_invalidated_at` set, and this filter picks it up when the target time falls inside the record window.
 
-Wire surface: exposed on the client wire as `as_of_record_time_unix_nanos` on both `RECALL_REQ` and `QUERY_REQ` (`None`/0 = current state). Besides driving this record-time filter, a set anchor becomes the reference point for the recency-ranking decay (see [`./01_rrf_fusion.md`](./01_rrf_fusion.md) §"Recency ranking"). It applies to statement/relation results; memory hits have no record-time axis and pass the filter unchanged.
+Wire surface: exposed on the client wire as `as_of_record_time_unix_nanos` on `RECALL_REQ` (`None`/0 = current state); also present on the internal `QueryRequest` that the `QUERY_TRACE` debug op accepts. Besides driving this record-time filter, a set anchor becomes the reference point for the recency-ranking decay (see [`./01_rrf_fusion.md`](./01_rrf_fusion.md) §"Recency ranking"). It applies to statement/relation results; memory hits have no record-time axis and pass the filter unchanged.
 
 Filters are applied in this order because:
 - Type and confidence are cheap and aggressive (early dropout).
@@ -263,6 +262,13 @@ async fn execute(plan: &QueryPlan, ctx: &Ctx) -> QueryResult {
     QueryResult { items: limited, debug: ... }
 }
 ```
+
+`plan.limit` here is a **safety ceiling**, not a caller-chosen top_k. For the
+`RECALL` read path the ceiling is set large (a full recall-candidate budget) so
+the membership stage downstream sees the whole filtered pool and the relevance
+band — not a pre-truncated head — decides the answer set. The `take` only guards
+against a runaway pool; `max_results` caps the final member count after
+membership shaping.
 
 ## Streaming results
 

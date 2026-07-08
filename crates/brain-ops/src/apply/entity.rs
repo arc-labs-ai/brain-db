@@ -392,10 +392,7 @@ mod tests {
         Write::single(
             WriteId::new(),
             brain_core::AgentId::default(),
-            Phase::SetExtractorEnabled {
-                id: brain_core::ExtractorId::from(0),
-                enabled: true,
-            },
+            Phase::ReclaimSlots { slots: Vec::new() },
         )
     }
 

@@ -27,7 +27,7 @@
     "name": "req_recall",
     "opcode": "0x0021",
     "kind": "request",
-    "payload_len": 316
+    "payload_len": 280
   },
   {
     "name": "req_forget",
@@ -58,12 +58,6 @@
     "opcode": "0x0120",
     "kind": "request",
     "payload_len": 130
-  },
-  {
-    "name": "req_query",
-    "opcode": "0x0160",
-    "kind": "request",
-    "payload_len": 278
   },
   {
     "name": "req_materialize_procedural",
@@ -124,12 +118,6 @@
     "opcode": "0x01A0",
     "kind": "response",
     "payload_len": 95
-  },
-  {
-    "name": "resp_query",
-    "opcode": "0x01E0",
-    "kind": "response",
-    "payload_len": 48
   },
   {
     "name": "resp_materialize_procedural",

@@ -206,8 +206,6 @@ async fn recall_round_trip(client: &mut TcpStream, stream_id: u32, cue: &str) ->
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id: None,
-        agent_filter: Vec::new(),
-        include_other_agents: false,
     };
     send_frame(
         client,

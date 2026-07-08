@@ -93,6 +93,53 @@ static RE_WEEKDAY: LazyLock<regex::Regex> = LazyLock::new(|| {
         .expect("invariant: weekday regex")
 });
 
+/// Month-name alternation (full names + 3-letter abbreviations, plus the
+/// common four-letter `sept`). Full names precede abbreviations so the
+/// longer form is preferred; the regex engine backtracks either way.
+const MONTH_ALT: &str = r"(?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec)";
+
+/// `D Month YYYY` / `D Month, YYYY` — day, then month name, then a
+/// 4-digit year. Groups: 1=day, 2=month, 3=year.
+static RE_DMY: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::RegexBuilder::new(&format!(
+        r"\b(\d{{1,2}})\s+({MONTH_ALT})\.?,?\s+((?:19|20)\d{{2}})\b"
+    ))
+    .case_insensitive(true)
+    .build()
+    .expect("invariant: D-Month-Year regex")
+});
+
+/// `Month D YYYY` / `Month D, YYYY` — month name, then day (with optional
+/// ordinal suffix), then a 4-digit year. Groups: 1=month, 2=day, 3=year.
+static RE_MDY: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::RegexBuilder::new(&format!(
+        r"\b({MONTH_ALT})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+((?:19|20)\d{{2}})\b"
+    ))
+    .case_insensitive(true)
+    .build()
+    .expect("invariant: Month-D-Year regex")
+});
+
+/// `Month YYYY` — month name directly followed by a 4-digit year (no day).
+/// Resolves to the 1st of that month. Groups: 1=month, 2=year.
+static RE_MY: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::RegexBuilder::new(&format!(r"\b({MONTH_ALT})\.?,?\s+((?:19|20)\d{{2}})\b"))
+        .case_insensitive(true)
+        .build()
+        .expect("invariant: Month-Year regex")
+});
+
+/// `Month D` — month name plus a day, no year. Resolves against the
+/// anchor's year. Groups: 1=month, 2=day.
+static RE_MD: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::RegexBuilder::new(&format!(
+        r"\b({MONTH_ALT})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?\b"
+    ))
+    .case_insensitive(true)
+    .build()
+    .expect("invariant: Month-D regex")
+});
+
 /// Native temporal-expressions extractor.
 #[derive(Debug, Default)]
 pub struct TemporalExtractor;
@@ -163,21 +210,88 @@ fn extract(mem: &Memory, now_unix_nanos: u64) -> Vec<ExtractedItem> {
     let mut seen: Vec<u64> = Vec::new();
     let mut items: Vec<ExtractedItem> = Vec::new();
 
-    // Track byte spans already consumed by an ISO match so the bare-year
-    // pass doesn't double-emit the year embedded in "2020-01-15".
-    let mut iso_spans: Vec<(usize, usize)> = Vec::new();
+    // Track byte spans already consumed by an ISO or natural-language
+    // date so the bare-year pass doesn't double-emit the year embedded in
+    // "2020-01-15" or "8 May 2023".
+    let mut consumed_spans: Vec<(usize, usize)> = Vec::new();
 
     // 1. ISO dates.
     for m in RE_ISO.find_iter(text) {
-        iso_spans.push((m.start(), m.end()));
+        consumed_spans.push((m.start(), m.end()));
         if let Some(ts) = parse_iso(m.as_str()) {
             push_unique(&mut items, &mut seen, ts);
         }
     }
 
-    // 2. Bare 4-digit years (skip any overlapping an ISO span).
+    // 2. Natural-language dates. Run before the bare-year pass and record
+    // each match's span so the year inside "8 May 2023" isn't re-emitted
+    // as a Jan-1 bare year. Ordering within this group goes from most to
+    // least specific (day+month+year, then month+year, then month+day);
+    // the span-suppression check keeps a broader match from firing again
+    // on the substring a narrower one already consumed.
+
+    // 2a. "D Month YYYY" / "D Month, YYYY".
+    for caps in RE_DMY.captures_iter(text) {
+        let span = caps.get(0).expect("invariant: whole match");
+        if overlaps(&consumed_spans, span.start(), span.end()) {
+            continue;
+        }
+        if let (Some(day), Some(month)) = (caps[1].parse::<u8>().ok(), parse_month_name(&caps[2])) {
+            if let Some(ts) = natural_date_nanos(&caps[3], month, day) {
+                consumed_spans.push((span.start(), span.end()));
+                push_unique(&mut items, &mut seen, ts);
+            }
+        }
+    }
+
+    // 2b. "Month D YYYY" / "Month D, YYYY".
+    for caps in RE_MDY.captures_iter(text) {
+        let span = caps.get(0).expect("invariant: whole match");
+        if overlaps(&consumed_spans, span.start(), span.end()) {
+            continue;
+        }
+        if let (Some(month), Some(day)) = (parse_month_name(&caps[1]), caps[2].parse::<u8>().ok()) {
+            if let Some(ts) = natural_date_nanos(&caps[3], month, day) {
+                consumed_spans.push((span.start(), span.end()));
+                push_unique(&mut items, &mut seen, ts);
+            }
+        }
+    }
+
+    // 2c. "Month YYYY" → the 1st of that month.
+    for caps in RE_MY.captures_iter(text) {
+        let span = caps.get(0).expect("invariant: whole match");
+        if overlaps(&consumed_spans, span.start(), span.end()) {
+            continue;
+        }
+        if let Some(month) = parse_month_name(&caps[1]) {
+            if let Some(ts) = natural_date_nanos(&caps[2], month, 1) {
+                consumed_spans.push((span.start(), span.end()));
+                push_unique(&mut items, &mut seen, ts);
+            }
+        }
+    }
+
+    // 2d. "Month D" with no year → resolve against the anchor's year.
+    for caps in RE_MD.captures_iter(text) {
+        let span = caps.get(0).expect("invariant: whole match");
+        if overlaps(&consumed_spans, span.start(), span.end()) {
+            continue;
+        }
+        if let (Some(month), Some(day)) = (parse_month_name(&caps[1]), caps[2].parse::<u8>().ok()) {
+            let year = anchor.year();
+            if let Ok(date) = Date::from_calendar_date(year, month, day) {
+                if let Some(ts) = date_to_unix_nanos(date) {
+                    consumed_spans.push((span.start(), span.end()));
+                    push_unique(&mut items, &mut seen, ts);
+                }
+            }
+        }
+    }
+
+    // 3. Bare 4-digit years (skip any overlapping a consumed span).
     for m in RE_YEAR.find_iter(text) {
-        if iso_spans.iter().any(|&(s, e)| m.start() < e && m.end() > s) {
+        if overlaps(&consumed_spans, m.start(), m.end()) {
             continue;
         }
         if let Some(ts) = parse_year(m.as_str()) {
@@ -185,7 +299,7 @@ fn extract(mem: &Memory, now_unix_nanos: u64) -> Vec<ExtractedItem> {
         }
     }
 
-    // 3. yesterday / today / tomorrow.
+    // 4. yesterday / today / tomorrow.
     for caps in RE_DEICTIC.captures_iter(text) {
         let word = caps[1].to_ascii_lowercase();
         let resolved = match word.as_str() {
@@ -199,7 +313,7 @@ fn extract(mem: &Memory, now_unix_nanos: u64) -> Vec<ExtractedItem> {
         }
     }
 
-    // 4. last/this/next week|month|year.
+    // 5. last/this/next week|month|year.
     for caps in RE_RELATIVE_PERIOD.captures_iter(text) {
         let direction = caps[1].to_ascii_lowercase();
         let unit = caps[2].to_ascii_lowercase();
@@ -214,7 +328,7 @@ fn extract(mem: &Memory, now_unix_nanos: u64) -> Vec<ExtractedItem> {
         }
     }
 
-    // 5a. "N units ago".
+    // 6a. "N units ago".
     for caps in RE_AGO.captures_iter(text) {
         let Ok(n) = caps[1].parse::<i64>() else {
             continue;
@@ -225,7 +339,7 @@ fn extract(mem: &Memory, now_unix_nanos: u64) -> Vec<ExtractedItem> {
         }
     }
 
-    // 5b. "in N units".
+    // 6b. "in N units".
     for caps in RE_IN.captures_iter(text) {
         let Ok(n) = caps[1].parse::<i64>() else {
             continue;
@@ -236,7 +350,7 @@ fn extract(mem: &Memory, now_unix_nanos: u64) -> Vec<ExtractedItem> {
         }
     }
 
-    // 6. Weekday names → nearest prior such weekday relative to anchor.
+    // 7. Weekday names → nearest prior such weekday relative to anchor.
     for caps in RE_WEEKDAY.captures_iter(text) {
         if let Some(ts) = prior_weekday(anchor, &caps[1].to_ascii_lowercase()) {
             push_unique(&mut items, &mut seen, ts);
@@ -311,6 +425,42 @@ fn parse_iso(s: &str) -> Option<u64> {
 fn parse_year(s: &str) -> Option<u64> {
     let y: i32 = s.parse().ok()?;
     let date = Date::from_calendar_date(y, Month::January, 1).ok()?;
+    date_to_unix_nanos(date)
+}
+
+/// True when the half-open byte range `[s, e)` overlaps any span already
+/// consumed by an earlier date pass.
+fn overlaps(spans: &[(usize, usize)], s: usize, e: usize) -> bool {
+    spans.iter().any(|&(a, b)| s < b && e > a)
+}
+
+/// Resolve a full month name or 3-letter abbreviation (case-insensitive,
+/// with an optional trailing `.`) to a [`Month`]. `sept` is accepted as a
+/// common four-letter form for September.
+fn parse_month_name(s: &str) -> Option<Month> {
+    let s = s.trim().trim_end_matches('.').to_ascii_lowercase();
+    Some(match s.as_str() {
+        "january" | "jan" => Month::January,
+        "february" | "feb" => Month::February,
+        "march" | "mar" => Month::March,
+        "april" | "apr" => Month::April,
+        "may" => Month::May,
+        "june" | "jun" => Month::June,
+        "july" | "jul" => Month::July,
+        "august" | "aug" => Month::August,
+        "september" | "sep" | "sept" => Month::September,
+        "october" | "oct" => Month::October,
+        "november" | "nov" => Month::November,
+        "december" | "dec" => Month::December,
+        _ => return None,
+    })
+}
+
+/// Resolve a `(year-string, month, day)` calendar date to unix-nanos at
+/// midnight UTC. `None` on an out-of-range component (e.g. Feb 30).
+fn natural_date_nanos(year_s: &str, month: Month, day: u8) -> Option<u64> {
+    let y: i32 = year_s.parse().ok()?;
+    let date = Date::from_calendar_date(y, month, day).ok()?;
     date_to_unix_nanos(date)
 }
 
@@ -432,7 +582,8 @@ mod tests {
 
     fn ctx(reg: &ExtractorRegistry) -> ExtractionContext<'_> {
         ExtractionContext {
-            declared_predicates: None,
+            declared_entity_types: None,
+            candidate_predicates: None,
             declared_kinds: None,
             entity_type_labels: None,
             schema_version: 1,
@@ -691,5 +842,81 @@ mod tests {
         let items = run("YESTERDAY", anchor);
         assert_eq!(items.len(), 1);
         assert_eq!(object_nanos(&items[0]), anchor - 86_400_000_000_000);
+    }
+
+    #[test]
+    fn natural_day_month_year_resolves() {
+        // "8 May, 2023" must resolve to 2023-05-08, NOT the bare-year
+        // fallback of 2023-01-01.
+        let items = run("we met on 8 May, 2023 downtown", anchor_2024_06_01());
+        assert_eq!(items.len(), 1);
+        assert_eq!(object_nanos(&items[0]), utc_midnight(2023, 5, 8));
+    }
+
+    #[test]
+    fn natural_day_month_year_no_comma() {
+        let items = run("we met on 8 May 2023 downtown", anchor_2024_06_01());
+        assert_eq!(items.len(), 1);
+        assert_eq!(object_nanos(&items[0]), utc_midnight(2023, 5, 8));
+    }
+
+    #[test]
+    fn natural_month_day_year_resolves() {
+        let items = run("shipped May 8, 2023 finally", anchor_2024_06_01());
+        assert_eq!(items.len(), 1);
+        assert_eq!(object_nanos(&items[0]), utc_midnight(2023, 5, 8));
+    }
+
+    #[test]
+    fn natural_month_day_year_no_comma() {
+        let items = run("shipped May 8 2023 finally", anchor_2024_06_01());
+        assert_eq!(items.len(), 1);
+        assert_eq!(object_nanos(&items[0]), utc_midnight(2023, 5, 8));
+    }
+
+    #[test]
+    fn two_natural_dates_no_spurious_years() {
+        // Both dates resolve; neither embedded year leaks a Jan-1 mention.
+        let items = run(
+            "went on 8 May 2023 and again 9 June 2023",
+            anchor_2024_06_01(),
+        );
+        let resolved: Vec<u64> = items.iter().map(object_nanos).collect();
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.contains(&utc_midnight(2023, 5, 8)));
+        assert!(resolved.contains(&utc_midnight(2023, 6, 9)));
+        // No Jan-1-2023 from the embedded years.
+        assert!(!resolved.contains(&utc_midnight(2023, 1, 1)));
+    }
+
+    #[test]
+    fn month_year_resolves_to_first_of_month() {
+        let items = run("sometime in May 2023 it happened", anchor_2024_06_01());
+        assert_eq!(items.len(), 1);
+        assert_eq!(object_nanos(&items[0]), utc_midnight(2023, 5, 1));
+    }
+
+    #[test]
+    fn natural_date_year_not_double_emitted() {
+        // "8 May 2023" must yield exactly one mention — the bare-year pass
+        // must not also emit "2023".
+        let items = run("8 May 2023", anchor_2024_06_01());
+        assert_eq!(items.len(), 1);
+        assert_eq!(object_nanos(&items[0]), utc_midnight(2023, 5, 8));
+    }
+
+    #[test]
+    fn three_letter_month_abbreviation() {
+        let items = run("logged 8 Jun 2023", anchor_2024_06_01());
+        assert_eq!(items.len(), 1);
+        assert_eq!(object_nanos(&items[0]), utc_midnight(2023, 6, 8));
+    }
+
+    #[test]
+    fn month_day_without_year_uses_anchor_year() {
+        // Anchor is 2024 → "May 8" resolves to 2024-05-08.
+        let items = run("due May 8", anchor_2024_06_01());
+        assert_eq!(items.len(), 1);
+        assert_eq!(object_nanos(&items[0]), utc_midnight(2024, 5, 8));
     }
 }

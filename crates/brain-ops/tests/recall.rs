@@ -124,8 +124,6 @@ fn recall_req(cue: &str, max_results: u32) -> RecallRequest {
         include_text: false,
         request_id: None,
         txn_id: None,
-        agent_filter: Vec::new(),
-        include_other_agents: false,
     }
 }
 

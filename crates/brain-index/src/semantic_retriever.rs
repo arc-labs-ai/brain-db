@@ -52,6 +52,52 @@ pub trait SemanticRetriever: Send + Sync {
     fn vector_for(&self, _id: brain_core::MemoryId) -> Option<[f32; VECTOR_DIM]> {
         None
     }
+
+    /// Best HyPE (hypothetical-question) cosine per memory for `query`.
+    ///
+    /// Each returned `(MemoryId, cosine)` is the strongest match between the
+    /// query vector and any hypothetical question generated *from* that memory
+    /// at write time — i.e. how well the memory ANSWERS the query, independent
+    /// of the passage↔query topical cosine that governs the direct semantic
+    /// lane. The read path uses this as a deterministic, no-LLM answer-lead
+    /// signal: a memory whose stored question closely matches the cue is, by
+    /// construction, an answering memory and should lead the result even when a
+    /// topically-adjacent memory has a higher raw passage cosine.
+    ///
+    /// This is scope-agnostic (no namespace / agent push-down): callers use it
+    /// only to look up scores for candidates *already* admitted by the filtered
+    /// membership set, so a hit for an out-of-scope memory is simply never read.
+    /// Default empty: retrievers without a HyPE pool contribute no answer-lead
+    /// signal and the caller leaves the existing order unchanged.
+    fn hype_scores_for_query(
+        &self,
+        _query: &[f32; VECTOR_DIM],
+        _k: usize,
+    ) -> Vec<(brain_core::MemoryId, f32)> {
+        Vec::new()
+    }
+
+    /// Best per-statement question-bridge hits for `query`, each carrying the
+    /// reified-fact [`Slot`](brain_core::Slot) it leaves unbound.
+    ///
+    /// Each returned `(StatementId, Slot, cosine)` is the strongest match
+    /// between the query vector and any bridge question generated *from* that
+    /// statement's slot at write time. Because the omitted slot is known by
+    /// construction, the tag names EXACTLY which slot the question asked for —
+    /// the read path projects that slot's value (object / event time / subject)
+    /// rather than always returning the object. Returned descending by cosine.
+    ///
+    /// Scope-agnostic (no namespace / agent push-down): callers project only
+    /// statements they can already see, so an out-of-scope hit is never read.
+    /// Default empty: retrievers without a statement-question pool contribute no
+    /// slot-projection signal and the caller leaves the grounded path unchanged.
+    fn statement_slot_hits_for_query(
+        &self,
+        _query: &[f32; VECTOR_DIM],
+        _k: usize,
+    ) -> Vec<(brain_core::StatementId, brain_core::Slot, f32)> {
+        Vec::new()
+    }
 }
 
 /// Query input — either a pre-embedded 384-d vector or raw

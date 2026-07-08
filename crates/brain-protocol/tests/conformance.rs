@@ -48,14 +48,13 @@ use brain_protocol::{
     EntityListResponseFrame, EntityResolveResponse, EntityView, EventType, EvidenceRefWire,
     ForgetMode, ForgetRequest, ForgetResponse, Frame, InferenceKind, InferenceStep, LinkResponse,
     MaterializeProceduralRequest, MaterializeProceduralResponse, MemoryKindWire, Opcode,
-    PlanResponseFrame, PlanStatus, PlanStep, PongResponse, QueryRequest, QueryResponse,
-    ReasonResponseFrame, ReasonStatus, RecallRequest, RecallResponseFrame, RelationCreateRequest,
-    RelationCreateResponse, RelationListFromResponseFrame, RelationView, RequestBody,
-    ResolutionOutcomeWire, ResponseBody, RetrieverSelectionWire, SchemaUploadRequest,
-    SchemaUploadResponse, ServerPingResponse, StageKind, StatementCreateRequest,
-    StatementCreateResponse, StatementGetResponse, StatementKindWire, StatementListResponseFrame,
-    StatementObjectWire, StatementValueWire, StatementView, SubscriptionEvent, TransitionKind,
-    TxnAbortResponse, TxnBeginResponse, TxnCommitResponse,
+    PlanResponseFrame, PlanStatus, PlanStep, PongResponse, ReasonResponseFrame, ReasonStatus,
+    RecallRequest, RecallResponseFrame, RelationCreateRequest, RelationCreateResponse,
+    RelationListFromResponseFrame, RelationView, RequestBody, ResolutionOutcomeWire, ResponseBody,
+    SchemaUploadRequest, SchemaUploadResponse, ServerPingResponse, StageKind,
+    StatementCreateRequest, StatementCreateResponse, StatementGetResponse, StatementKindWire,
+    StatementListResponseFrame, StatementObjectWire, StatementValueWire, StatementView,
+    SubscriptionEvent, TransitionKind, TxnAbortResponse, TxnBeginResponse, TxnCommitResponse,
 };
 
 // Fixed byte patterns. No clock, no randomness — fixtures are reproducible.
@@ -338,24 +337,6 @@ fn sample_relation_create() -> RelationCreateRequest {
     }
 }
 
-fn sample_query() -> QueryRequest {
-    QueryRequest {
-        text: "who works on brain".into(),
-        entity_anchor: Some(EID),
-        kind_filter: vec![0],
-        predicate_filter: vec!["org:works_on".into()],
-        time_filter: None,
-        as_of_record_time_unix_nanos: Some(1_710_000_000_000_000_000),
-        confidence_min: Some(0.25),
-        include_tombstoned: false,
-        include_superseded: false,
-        limit: 25,
-        retrievers: RetrieverSelectionWire::Auto,
-        fusion_config: None,
-        request_id: RID,
-    }
-}
-
 fn sample_entity_view() -> EntityView {
     EntityView {
         entity_id: EID,
@@ -597,8 +578,6 @@ fn corpus() -> Vec<Case> {
         include_text: true,
         request_id: Some(RID),
         txn_id: None,
-        agent_filter: Vec::new(),
-        include_other_agents: false,
     };
     cases.push(req_case(
         "req_recall",
@@ -646,11 +625,6 @@ fn corpus() -> Vec<Case> {
         "req_schema_upload",
         RequestBody::SchemaUpload(schema_upload.clone()),
         &schema_upload,
-    ));
-    cases.push(req_case(
-        "req_query",
-        RequestBody::Query(sample_query()),
-        &sample_query(),
     ));
     let materialize = MaterializeProceduralRequest {
         agent_id: AGENT,
@@ -755,16 +729,6 @@ fn corpus() -> Vec<Case> {
         "resp_schema_upload",
         ResponseBody::SchemaUpload(schema_upload_resp.clone()),
         &schema_upload_resp,
-    ));
-    let query_resp = QueryResponse {
-        items: Vec::new(),
-        total_latency_ms: 12.5,
-        retriever_outcomes: Vec::new(),
-    };
-    cases.push(resp_case(
-        "resp_query",
-        ResponseBody::Query(query_resp.clone()),
-        &query_resp,
     ));
     let materialize_resp = MaterializeProceduralResponse {
         system_block: "## Behaviors\n- step 1".into(),
@@ -1049,8 +1013,6 @@ fn required_families() -> Vec<(&'static str, Opcode)> {
         ("graph.relation_create_resp", Opcode::RelationCreateResp),
         ("schema.upload", Opcode::SchemaUploadReq),
         ("schema.upload_resp", Opcode::SchemaUploadResp),
-        ("query.query", Opcode::QueryReq),
-        ("query.query_resp", Opcode::QueryResp),
         ("procedural.materialize", Opcode::MaterializeProceduralReq),
         (
             "procedural.materialize_resp",

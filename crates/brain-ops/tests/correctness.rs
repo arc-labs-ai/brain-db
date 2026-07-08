@@ -139,8 +139,6 @@ async fn recall(fix: &Fixture, cue: &str, max_results: u32) -> RecallResponseFra
         include_text: false,
         request_id: None,
         txn_id: None,
-        agent_filter: Vec::new(),
-        include_other_agents: false,
     };
     match single_body(
         dispatch(

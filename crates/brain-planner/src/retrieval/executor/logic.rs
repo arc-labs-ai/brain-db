@@ -682,7 +682,37 @@ async fn rerank_stage(
         }
     };
     let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+    // Capture the pre-rerank head before `fused` is consumed by the
+    // re-sort. `head_ids` is exactly the RRF-order head fed to the
+    // cross-encoder.
+    let pre_head: Vec<u128> = head_ids.iter().map(|m| m.raw()).collect();
     let reranked = rerank_top_n(&scores, fused, &candidates);
+
+    // Stage journal (R6 rerank). This is the one read stage logged
+    // nowhere else — neither the wire trace nor any other log exposes the
+    // ordering. Emit pre/post head ids so the eval probe can see whether
+    // the cross-encoder actually reordered the list or merely confirmed
+    // RRF. Guarded so prod (stage target off) pays no allocation.
+    if tracing::enabled!(target: "brain_debug::stage", tracing::Level::DEBUG) {
+        let post_head: Vec<u128> = reranked
+            .iter()
+            .take(RERANK_TOP_N)
+            .filter_map(|item| match item.id {
+                RankedItemId::Memory(m) => Some(m.raw()),
+                _ => None,
+            })
+            .collect();
+        tracing::debug!(
+            target: "brain_debug::stage",
+            stage = "R6_rerank",
+            candidates = candidate_count,
+            latency_ms,
+            pre_head = ?pre_head,
+            post_head = ?post_head,
+            reordered = (pre_head != post_head),
+            "read stage: cross-encoder rerank applied",
+        );
+    }
 
     (
         reranked,

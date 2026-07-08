@@ -140,6 +140,11 @@ pub struct ExtractorMetrics {
     /// lose signal silently — any nonzero value here is a fact that did not
     /// land, surfaced for alerting rather than buried in a trace log.
     apply_dropped_total: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
+    /// Open-vocab predicate surface forms folded onto an existing near-
+    /// synonym predicate id by embedding-cosine consolidation instead of
+    /// minting a fragmenting duplicate. A rising count means the extractor
+    /// vocabulary is converging rather than sprawling.
+    predicate_consolidated_total: AtomicU64,
     /// Indexed by [`ExtractorItemKind`].
     items_written_total: Vec<AtomicU64>,
     llm_micro_usd_spent_total: AtomicU64,
@@ -180,6 +185,7 @@ impl ExtractorMetrics {
             drops_total: AtomicU64::new(0),
             schema_filtered_total: parking_lot::Mutex::new(std::collections::HashMap::new()),
             apply_dropped_total: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            predicate_consolidated_total: AtomicU64::new(0),
             items_written_total,
             llm_micro_usd_spent_total: AtomicU64::new(0),
             cycle_duration_seconds: WorkerHistogram::new(DEFAULT_CYCLE_BUCKETS_SECONDS),
@@ -213,6 +219,13 @@ impl ExtractorMetrics {
     pub fn inc_apply_dropped(&self, reason: &str) {
         let mut guard = self.apply_dropped_total.lock();
         *guard.entry(reason.to_string()).or_insert(0) += 1;
+    }
+
+    /// Bumped when a would-be-fresh open-vocab predicate is folded onto an
+    /// existing near-synonym predicate id instead of minting a duplicate.
+    pub fn inc_predicate_consolidated(&self) {
+        self.predicate_consolidated_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Bumped by the worker per successfully-written item, by kind.
@@ -292,6 +305,7 @@ impl ExtractorMetrics {
             drops_total: self.drops_total.load(Ordering::Relaxed),
             schema_filtered_total,
             apply_dropped_total,
+            predicate_consolidated_total: self.predicate_consolidated_total.load(Ordering::Relaxed),
             items_written_total,
             llm_micro_usd_spent_total: self.llm_micro_usd_spent_total.load(Ordering::Relaxed),
             cycle_duration_seconds: self.cycle_duration_seconds.snapshot(),
@@ -318,6 +332,9 @@ pub struct ExtractorMetricsSnapshot {
     /// Apply-pass signal loss keyed by `reason`. Any nonzero entry is a real
     /// extracted item that did not persist.
     pub apply_dropped_total: std::collections::HashMap<String, u64>,
+    /// Open-vocab predicate surface forms folded onto an existing near-
+    /// synonym id by embedding consolidation.
+    pub predicate_consolidated_total: u64,
     /// Indexed in the same order as [`ITEM_KIND_LABELS`].
     pub items_written_total: Vec<u64>,
     pub llm_micro_usd_spent_total: u64,

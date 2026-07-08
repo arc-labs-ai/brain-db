@@ -106,7 +106,7 @@ Clients sensitive to RECALL latency leave `include_graph` off and issue targeted
 
 ## Rerank
 
-A first-class, always-on post-fusion stage that re-ranks the top of the RRF-fused list with a cross-encoder model. Whenever the cross-encoder is loaded on a shard, every RECALL and QUERY reranks automatically — there is no per-request flag. The only control is the deploy-time `config.rerank.enabled` load gate: when the operator turns it off, no model loads and the pipeline returns RRF-only ordering (no error).
+A first-class, always-on post-fusion stage that re-ranks the top of the RRF-fused list with a cross-encoder model. Whenever the cross-encoder is loaded on a shard, every RECALL (and the `QUERY_TRACE` debug op) reranks automatically — there is no per-request flag. The only control is the deploy-time `config.rerank.enabled` load gate: when the operator turns it off, no model loads and the pipeline returns RRF-only ordering (no error).
 
 Where it sits in the pipeline:
 
@@ -114,7 +114,7 @@ Where it sits in the pipeline:
 retrievers → RRF fusion → filter chain → [recency boost] → [rerank, if cross-encoder loaded] → [merge/diversity, if list intent] → limit
 ```
 
-The rerank fires on the top-50 fused candidates only. It surfaces a re-ordered head that the limit then cuts to `top_k`.
+The rerank fires on the top-50 fused candidates only. It surfaces a re-ordered head that the membership stage then shapes into the answer set (bounded by the `max_results` safety cap, not a caller `top_k`).
 
 ## Merge / diversity (MMR) — internal, list-intent only
 
@@ -138,7 +138,7 @@ member that never reached fusion can't be diversified into the result).
   Only positions 2..N are reordered, and only on detected list intent —
   a factoid that slips the detector keeps its top hit. (Resolves
   OQ-AN-9, which nominated MMR for this slot.)
-- `top_k` still bounds the returned count; MMR changes *which* items
+- the membership band still decides the returned set; MMR changes *which* items
   fill the slots.
 
 ## Model
@@ -202,15 +202,20 @@ The load gate plus the top-50 cut are what bound the always-on rerank's cost: op
 [recall.rerank]
 model = "bge-reranker-base"
 top_n_in = 50           # candidates fed into the reranker
-top_k_out = 10          # candidates emitted to the filter chain
+rerank_head = 10        # size of the re-ordered head the reranker promotes
 batch_size = 50         # one forward pass per call by default
 ```
 
-`top_n_in` and `top_k_out` can be tuned per deployment; the defaults reflect the design point above.
+`top_n_in` and `rerank_head` can be tuned per deployment; the defaults reflect
+the design point above. `rerank_head` is the size of the head the cross-encoder
+re-orders and promotes — **not** a final result cap. Candidates below the head
+keep their RRF order and stay in the filtered pool that the membership stage
+shapes; the answer size is decided by the relevance band and bounded only by
+`max_results`.
 
 ## Observability
 
-Per-call metrics on every RECALL / QUERY served by a rerank-enabled shard:
+Per-call metrics on every RECALL (and `QUERY_TRACE`) served by a rerank-enabled shard:
 
 - `rerank_latency_seconds` — histogram of the rerank step's wall time.
 - `rerank_input_count` — how many candidates entered the reranker (usually 50, sometimes less if fusion returned fewer).

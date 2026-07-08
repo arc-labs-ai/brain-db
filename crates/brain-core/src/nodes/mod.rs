@@ -17,6 +17,6 @@ pub use kinds::{
 pub use memory::{Memory, MemoryKind, Salience};
 pub use relation::{canonical_pair, Relation, RelationType};
 pub use statement::{
-    EvidenceEntry, EvidenceRef, Predicate, Statement, StatementObject, StatementValue, SubjectRef,
-    TombstoneReason, INLINE_EVIDENCE_CAP,
+    EvidenceEntry, EvidenceRef, Predicate, Slot, Statement, StatementObject, StatementValue,
+    SubjectRef, TombstoneReason, INLINE_EVIDENCE_CAP,
 };

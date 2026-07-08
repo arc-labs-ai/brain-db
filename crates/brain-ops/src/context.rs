@@ -11,6 +11,7 @@
 //! single-threaded usage is enforced by the per-shard Glommio
 //! executor, not by the field types.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -99,9 +100,20 @@ pub struct OpsContext {
     pub access_buffer: Arc<AccessBuffer>,
     /// Live extractor registry. Populated at server startup by the
     /// system-schema bootstrap; defaults to empty.
-    /// Wrapped in `RwLock` because `EXTRACTOR_DISABLE` / `_ENABLE`
-    /// wire ops mutate it.
+    /// Wrapped in `RwLock` because a `SCHEMA_UPLOAD` that declares a
+    /// new extractor rebuilds and swaps the registry live (via the
+    /// extractor worker; see [`Self::extractors_dirty`]).
     pub extractor_registry: Arc<RwLock<ExtractorRegistry>>,
+    /// Set by the `SCHEMA_UPLOAD` handler after a schema that may have
+    /// added or changed extractor rows commits durably. The per-shard
+    /// extractor worker consumes this at the top of its next cycle:
+    /// when set, it rebuilds the registry from the freshly-persisted
+    /// `EXTRACTORS_TABLE` rows and swaps it into `extractor_registry`,
+    /// so a newly-declared extractor fires without a shard restart.
+    /// Rebuilding off the request path keeps the heavy materialize
+    /// dependencies (classifier model, LLM router) off the hot handler
+    /// path — the handler only flips this flag.
+    pub extractors_dirty: Arc<AtomicBool>,
     /// Per-deployment classifier config (operator-provided NER
     /// model path). Defaults to `unloaded`; operators wire
     /// `[extractors.classifier] model_path` via `with_classifier_config`.
@@ -198,6 +210,7 @@ impl OpsContext {
             subscribe_poll_window: DEFAULT_SUBSCRIBE_POLL_WINDOW,
             access_buffer: Arc::new(AccessBuffer::default()),
             extractor_registry: Arc::new(RwLock::new(ExtractorRegistry::new())),
+            extractors_dirty: Arc::new(AtomicBool::new(false)),
             classifier_config: Arc::new(ClassifierConfig::unloaded()),
             llm_cache: None,
             tantivy: None,

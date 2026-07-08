@@ -35,7 +35,12 @@ use redb::{Database, ReadableDatabase, TableDefinition};
 /// not readable by a v1 binary, and a v1 DB is not readable by a v2
 /// binary — operators must run the migration tool to copy data into a
 /// fresh v2 directory.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+///
+/// v3 prepends a `slot` byte to each `statement_question_vectors` value
+/// (reified slot-filling): the stored value width changed from 1536 to
+/// 1537 bytes, so a v2 file's rows are not readable under the v3 fixed-size
+/// value type. No migration tool — pre-user, fresh-start on bump.
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Singleton key inside [`SCHEMA_META_TABLE`].
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -239,7 +244,7 @@ mod tests {
             SchemaError::SchemaTooOld { found, current } => {
                 assert_eq!(found, 1);
                 assert_eq!(current, CURRENT_SCHEMA_VERSION);
-                assert_eq!(current, 2);
+                assert_eq!(current, 3);
             }
             other => panic!("expected SchemaTooOld, got {other:?}"),
         }

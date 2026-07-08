@@ -24,7 +24,8 @@ use std::sync::{Arc, Mutex};
 use brain_core::{Entity, EntityId, EntityType, EntityTypeId};
 use brain_embed::{Dispatcher, EmbedError};
 use brain_extractors::resolver::{
-    resolve_or_create_with_deps, EmbeddingDeps, EntityDisambiguator, ResolutionTier,
+    resolve_or_create_with_deps, Disambiguation, EmbeddingDeps, EntityDisambiguator,
+    PrecomputedVerdicts, Resolution, ResolutionTier,
 };
 use brain_index::entity_hnsw::{EntityHnswIndex, EntityHnswParams};
 use brain_index::VECTOR_DIM;
@@ -258,6 +259,65 @@ fn auto_alias_band_scenario(
     seed_entity(db, hnsw, EntityType::PERSON_ID, "Tokyo", seed_v)
 }
 
+/// Drive the production two-phase disambiguation flow against `db`, exactly
+/// as `apply_outcome` does: a `Collect` plan pass (rolled back) discovers the
+/// ambiguous-band candidate, that candidate is `confirm`-ed off the txn, and a
+/// `Replay` apply pass commits the result. With no disambiguator it degrades to
+/// a single `Off` pass (cosine-only). The resolver itself never calls the LLM.
+fn two_phase_resolve(
+    db: &MetadataDb,
+    embed_deps: &EmbeddingDeps,
+    disambiguator: Option<&EntityDisambiguator>,
+    surface: &str,
+) -> Resolution {
+    let verdicts = if let Some(dis) = disambiguator {
+        let mut pending = Vec::new();
+        {
+            let plan_txn = db.write_txn().unwrap();
+            resolve_or_create_with_deps(
+                &plan_txn,
+                test_scope(),
+                surface,
+                "brain:Person",
+                0.9,
+                NOW + 1,
+                Some(embed_deps),
+                &mut Disambiguation::Collect(&mut pending),
+            )
+            .unwrap();
+            // drop plan_txn → rollback (its writes were only for discovery)
+        }
+        let mut v = PrecomputedVerdicts::new();
+        for p in pending {
+            let verdict = futures_lite::future::block_on(dis.confirm(&p.view, &p.raw_surface));
+            v.insert(p.norm_surface, p.candidate, verdict);
+        }
+        v
+    } else {
+        PrecomputedVerdicts::new()
+    };
+
+    let mut mode = if disambiguator.is_some() {
+        Disambiguation::Replay(&verdicts)
+    } else {
+        Disambiguation::Off
+    };
+    let wtxn = db.write_txn().unwrap();
+    let res = resolve_or_create_with_deps(
+        &wtxn,
+        test_scope(),
+        surface,
+        "brain:Person",
+        0.9,
+        NOW + 1,
+        Some(embed_deps),
+        &mut mode,
+    )
+    .unwrap();
+    wtxn.commit().unwrap();
+    res
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
@@ -276,19 +336,7 @@ fn auto_alias_rejected_by_disambiguator_creates_distinct_entity() {
     let disambiguator = Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
     let embed_deps = embed_deps_for(embedder, hnsw);
 
-    let wtxn = db.write_txn().unwrap();
-    let res = resolve_or_create_with_deps(
-        &wtxn,
-        test_scope(),
-        "Japan",
-        "brain:Person",
-        0.9,
-        NOW + 1,
-        Some(&embed_deps),
-        Some(disambiguator.as_ref()),
-    )
-    .unwrap();
-    wtxn.commit().unwrap();
+    let res = two_phase_resolve(&db, &embed_deps, Some(disambiguator.as_ref()), "Japan");
 
     assert_eq!(
         res.tier,
@@ -342,19 +390,7 @@ fn auto_alias_confirmed_by_disambiguator_still_merges() {
     let disambiguator = Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
     let embed_deps = embed_deps_for(embedder, hnsw);
 
-    let wtxn = db.write_txn().unwrap();
-    let res = resolve_or_create_with_deps(
-        &wtxn,
-        test_scope(),
-        "Japan",
-        "brain:Person",
-        0.9,
-        NOW + 1,
-        Some(&embed_deps),
-        Some(disambiguator.as_ref()),
-    )
-    .unwrap();
-    wtxn.commit().unwrap();
+    let res = two_phase_resolve(&db, &embed_deps, Some(disambiguator.as_ref()), "Japan");
 
     assert_eq!(res.entity_id, seed_id, "confirmed -> alias onto seed");
     assert_eq!(res.tier, ResolutionTier::Disambiguated);
@@ -380,19 +416,7 @@ fn auto_alias_with_no_disambiguator_merges_on_threshold_alone() {
 
     let embed_deps = embed_deps_for(embedder, hnsw);
 
-    let wtxn = db.write_txn().unwrap();
-    let res = resolve_or_create_with_deps(
-        &wtxn,
-        test_scope(),
-        "Japan",
-        "brain:Person",
-        0.9,
-        NOW + 1,
-        Some(&embed_deps),
-        None,
-    )
-    .unwrap();
-    wtxn.commit().unwrap();
+    let res = two_phase_resolve(&db, &embed_deps, None, "Japan");
 
     assert_eq!(res.entity_id, seed_id);
     assert_eq!(res.tier, ResolutionTier::Embedding);
@@ -409,19 +433,12 @@ fn confirmed_verdict_aliases_onto_existing_entity() {
     let disambiguator = Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
     let embed_deps = embed_deps_for(embedder, hnsw);
 
-    let wtxn = db.write_txn().unwrap();
-    let res = resolve_or_create_with_deps(
-        &wtxn,
-        test_scope(),
-        "Acme Holdings",
-        "brain:Person",
-        0.9,
-        NOW + 1,
-        Some(&embed_deps),
+    let res = two_phase_resolve(
+        &db,
+        &embed_deps,
         Some(disambiguator.as_ref()),
-    )
-    .unwrap();
-    wtxn.commit().unwrap();
+        "Acme Holdings",
+    );
 
     assert_eq!(res.entity_id, closer_id, "should alias onto closer seed");
     assert_eq!(res.tier, ResolutionTier::Disambiguated);
@@ -461,19 +478,12 @@ fn rejected_verdict_creates_fresh_entity_without_merge_proposal() {
     let disambiguator = Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
     let embed_deps = embed_deps_for(embedder, hnsw);
 
-    let wtxn = db.write_txn().unwrap();
-    let res = resolve_or_create_with_deps(
-        &wtxn,
-        test_scope(),
-        "Acme Holdings",
-        "brain:Person",
-        0.9,
-        NOW + 1,
-        Some(&embed_deps),
+    let res = two_phase_resolve(
+        &db,
+        &embed_deps,
         Some(disambiguator.as_ref()),
-    )
-    .unwrap();
-    wtxn.commit().unwrap();
+        "Acme Holdings",
+    );
 
     assert_eq!(
         res.tier,
@@ -510,19 +520,12 @@ fn uncertain_verdict_falls_through_to_create_plus_merge_proposal() {
     let disambiguator = Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
     let embed_deps = embed_deps_for(embedder, hnsw);
 
-    let wtxn = db.write_txn().unwrap();
-    let res = resolve_or_create_with_deps(
-        &wtxn,
-        test_scope(),
-        "Acme Holdings",
-        "brain:Person",
-        0.9,
-        NOW + 1,
-        Some(&embed_deps),
+    let res = two_phase_resolve(
+        &db,
+        &embed_deps,
         Some(disambiguator.as_ref()),
-    )
-    .unwrap();
-    wtxn.commit().unwrap();
+        "Acme Holdings",
+    );
 
     assert_eq!(res.tier, ResolutionTier::Created);
     assert_ne!(res.entity_id, closer_id);

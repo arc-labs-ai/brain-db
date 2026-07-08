@@ -108,7 +108,8 @@ fn memory(text: &str) -> Memory {
 
 fn ctx<'a>(reg: &'a ExtractorRegistry) -> ExtractionContext<'a> {
     ExtractionContext {
-        declared_predicates: None,
+        declared_entity_types: None,
+        candidate_predicates: None,
         declared_kinds: None,
         entity_type_labels: None,
         schema_version: 1,

@@ -226,7 +226,6 @@ mod tests {
         assert!(names.contains(&"llm_predicate"));
         for ext in &all {
             assert_eq!(ext.namespace, "brain");
-            assert!(ext.is_enabled());
         }
     }
 
@@ -405,7 +404,6 @@ mod tests {
             .expect("gliner restored by reconciliation");
         assert_eq!(restored.namespace, "brain");
         assert_eq!(restored.name, "gliner");
-        assert!(restored.is_enabled());
     }
 
     /// Reconciliation is a no-op when the table already matches
@@ -462,7 +460,6 @@ mod tests {
                     "brain".into(),
                     "entity_mentions".into(),
                     brain_core::ExtractorKind::Pattern,
-                    true,
                     1,
                     b"tampered-definition".to_vec(),
                     0,

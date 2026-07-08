@@ -1,16 +1,10 @@
-//! Extractor governance wire-op smoke.
+//! Extractor introspection wire-op smoke.
 //!
-//! Drives `EXTRACTOR_LIST` / `EXTRACTOR_DISABLE` / `EXTRACTOR_ENABLE`
-//! through the full data-plane stack and asserts:
-//!
-//! - LIST returns the built-in extractors registered by the system
-//!   schema bootstrap (`brain.entity_mentions`, `brain.gliner`,
-//!   `brain.llm_predicate`).
-//! - `include_disabled = false` filters out disabled rows.
-//! - DISABLE flips a row from enabled → disabled, returns
-//!   `previously_enabled = true`.
-//! - ENABLE flips it back, returns `previously_disabled = true`.
-//! - Unknown extractor_id → ERROR with NotFound category.
+//! Drives `EXTRACTOR_LIST` through the full data-plane stack and
+//! asserts it returns the built-in extractors registered by the
+//! system-schema bootstrap (`brain.entity_mentions`, `brain.gliner`,
+//! `brain.llm_predicate`). Extraction is always-on — there is no
+//! runtime enable/disable.
 
 #![cfg(target_os = "linux")]
 
@@ -20,8 +14,8 @@ use brain_protocol::connection::handshake::{
 };
 use brain_protocol::envelope::request::RequestBody;
 use brain_protocol::envelope::response::ResponseBody;
+use brain_protocol::ExtractorListRequest;
 use brain_protocol::Frame;
-use brain_protocol::{ExtractorDisableRequest, ExtractorEnableRequest, ExtractorListRequest};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -165,9 +159,7 @@ async fn extractor_list_returns_seeded_builtins() {
     let (opcode, body) = round_trip(
         &mut client,
         1,
-        RequestBody::ExtractorList(ExtractorListRequest {
-            include_disabled: true,
-        }),
+        RequestBody::ExtractorList(ExtractorListRequest {}),
     )
     .await;
     assert_eq!(opcode, Opcode::ExtractorListResp.as_u16());
@@ -183,238 +175,10 @@ async fn extractor_list_returns_seeded_builtins() {
             assert!(names.contains(&"llm_predicate"));
             for item in &r.items {
                 assert_eq!(item.namespace, "brain");
-                assert!(item.enabled, "built-ins enabled by default");
             }
         }
         other => panic!("expected ExtractorListResp, got {other:?}"),
     }
-
-    server.stop().await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn extractor_disable_then_list_excludes_disabled() {
-    let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr)
-        .await
-        .expect("connect");
-    complete_handshake(&mut client, &server.token).await;
-
-    // Resolve the entity_mentions id via LIST.
-    let (_, body) = round_trip(
-        &mut client,
-        1,
-        RequestBody::ExtractorList(ExtractorListRequest {
-            include_disabled: true,
-        }),
-    )
-    .await;
-    let entity_mentions_id = match body {
-        ResponseBody::ExtractorList(r) => {
-            r.items
-                .iter()
-                .find(|i| i.name == "entity_mentions")
-                .expect("entity_mentions exists")
-                .extractor_id
-        }
-        _ => unreachable!(),
-    };
-
-    // DISABLE it.
-    let (opcode, body) = round_trip(
-        &mut client,
-        3,
-        RequestBody::ExtractorDisable(ExtractorDisableRequest {
-            extractor_id: entity_mentions_id,
-            reason: "test disable".into(),
-            request_id: *uuid::Uuid::now_v7().as_bytes(),
-        }),
-    )
-    .await;
-    assert_eq!(opcode, Opcode::ExtractorDisableResp.as_u16());
-    match body {
-        ResponseBody::ExtractorDisable(r) => {
-            assert!(r.previously_enabled);
-        }
-        other => panic!("expected ExtractorDisableResp, got {other:?}"),
-    }
-
-    // LIST with include_disabled=false: the two still-enabled built-ins,
-    // entity_mentions filtered out.
-    let (_, body) = round_trip(
-        &mut client,
-        5,
-        RequestBody::ExtractorList(ExtractorListRequest {
-            include_disabled: false,
-        }),
-    )
-    .await;
-    match body {
-        ResponseBody::ExtractorList(r) => {
-            assert_eq!(r.items.len(), 2);
-            assert!(
-                !r.items.iter().any(|i| i.name == "entity_mentions"),
-                "disabled extractor must be filtered out"
-            );
-        }
-        _ => unreachable!(),
-    }
-
-    // LIST with include_disabled=true: all three, entity_mentions disabled.
-    let (_, body) = round_trip(
-        &mut client,
-        7,
-        RequestBody::ExtractorList(ExtractorListRequest {
-            include_disabled: true,
-        }),
-    )
-    .await;
-    match body {
-        ResponseBody::ExtractorList(r) => {
-            assert_eq!(r.items.len(), 3);
-            let entity_mentions = r
-                .items
-                .iter()
-                .find(|i| i.name == "entity_mentions")
-                .unwrap();
-            assert!(!entity_mentions.enabled);
-        }
-        _ => unreachable!(),
-    }
-
-    server.stop().await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn extractor_enable_after_disable_returns_previously_disabled() {
-    let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr)
-        .await
-        .expect("connect");
-    complete_handshake(&mut client, &server.token).await;
-
-    let (_, body) = round_trip(
-        &mut client,
-        1,
-        RequestBody::ExtractorList(ExtractorListRequest {
-            include_disabled: true,
-        }),
-    )
-    .await;
-    let id = match body {
-        ResponseBody::ExtractorList(r) => {
-            r.items
-                .iter()
-                .find(|i| i.name == "gliner")
-                .unwrap()
-                .extractor_id
-        }
-        _ => unreachable!(),
-    };
-
-    // Disable.
-    let (_, _) = round_trip(
-        &mut client,
-        3,
-        RequestBody::ExtractorDisable(ExtractorDisableRequest {
-            extractor_id: id,
-            reason: "test".into(),
-            request_id: *uuid::Uuid::now_v7().as_bytes(),
-        }),
-    )
-    .await;
-
-    // Enable.
-    let (opcode, body) = round_trip(
-        &mut client,
-        5,
-        RequestBody::ExtractorEnable(ExtractorEnableRequest {
-            extractor_id: id,
-            request_id: *uuid::Uuid::now_v7().as_bytes(),
-        }),
-    )
-    .await;
-    assert_eq!(opcode, Opcode::ExtractorEnableResp.as_u16());
-    match body {
-        ResponseBody::ExtractorEnable(r) => {
-            assert!(r.previously_disabled);
-        }
-        other => panic!("expected ExtractorEnableResp, got {other:?}"),
-    }
-
-    server.stop().await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn extractor_disable_unknown_id_returns_error_frame() {
-    let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr)
-        .await
-        .expect("connect");
-    complete_handshake(&mut client, &server.token).await;
-
-    let (opcode, body) = round_trip(
-        &mut client,
-        1,
-        RequestBody::ExtractorDisable(ExtractorDisableRequest {
-            extractor_id: 99999,
-            reason: "test".into(),
-            request_id: *uuid::Uuid::now_v7().as_bytes(),
-        }),
-    )
-    .await;
-    assert_eq!(opcode, Opcode::Error.as_u16());
-    match body {
-        ResponseBody::Error(_) => {}
-        other => panic!("expected Error frame, got {other:?}"),
-    }
-
-    server.stop().await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn extractor_disable_zero_id_returns_error_frame() {
-    let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr)
-        .await
-        .expect("connect");
-    complete_handshake(&mut client, &server.token).await;
-
-    let (opcode, _) = round_trip(
-        &mut client,
-        1,
-        RequestBody::ExtractorDisable(ExtractorDisableRequest {
-            extractor_id: 0,
-            reason: "x".into(),
-            request_id: *uuid::Uuid::now_v7().as_bytes(),
-        }),
-    )
-    .await;
-    assert_eq!(opcode, Opcode::Error.as_u16());
-
-    server.stop().await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn extractor_disable_oversized_reason_returns_error_frame() {
-    let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr)
-        .await
-        .expect("connect");
-    complete_handshake(&mut client, &server.token).await;
-
-    let big = "x".repeat(4097);
-    let (opcode, _) = round_trip(
-        &mut client,
-        1,
-        RequestBody::ExtractorDisable(ExtractorDisableRequest {
-            extractor_id: 1,
-            reason: big,
-            request_id: *uuid::Uuid::now_v7().as_bytes(),
-        }),
-    )
-    .await;
-    assert_eq!(opcode, Opcode::Error.as_u16());
 
     server.stop().await;
 }

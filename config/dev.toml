@@ -7,8 +7,10 @@ admin_addr = "127.0.0.1:9092"
 listen_addr = "127.0.0.1:9090"
 metrics_addr = "127.0.0.1:9091"
 
+# Single shard so the eval's ingested corpus lives in one shard dir and
+# survives restarts under a persistent volume without shard-routing skew.
 [storage]
-shard_count = 2
+shard_count = 1
 data_dir = "./data"
 
 [shard]
@@ -69,9 +71,9 @@ channel_capacity = 1024
 # entity resolver gauntlet and written as entities / statements /
 # relations / mention edges.
 #
-# There is no master switch here: the worker is DERIVED from the per-tier
-# gates under `[extractors.{pattern,classifier,llm}]` — it is provisioned
-# iff at least one tier is enabled. This section only tunes the worker.
+# There is no master switch here: extraction is always-on and
+# non-configurable, so the worker is always provisioned. This section only
+# tunes the worker.
 [workers.extractor]
 # Scheduler tick. Extraction is heavier than auto-edge (LLM round-trip
 # dominates), so the default is 1s vs 100ms.
@@ -163,13 +165,13 @@ max_related_statements_per_entity = 5
 # [workers.llm_cache_sweep]
 # interval_secs = 3600      # 1 hour
 
-# Extractor pipeline tuning. The per-tier on/off gates live under each
-# sub-section; the knobs below tune resolution / classification / HyPE.
+# Extractor pipeline tuning. Extraction is always-on and non-configurable —
+# there are no per-tier on/off gates; the knobs below tune resolution /
+# classification / HyPE only.
 # [extractors.resolver]
 # embed_threshold = 0.78    # tier-3 entity-alias cosine floor
 
 # [extractors.classifier]
-# enabled = true
 # model_path = "/abs/path/to/gliner-model"   # override; default = XDG discovery
 # threshold = 0.5           # GLiNER post-sigmoid acceptance floor
 

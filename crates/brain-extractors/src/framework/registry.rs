@@ -1,11 +1,12 @@
 //! In-memory extractor registry.
 //!
 //! One per shard. Built from the `EXTRACTORS_TABLE` rows on shard
-//! open and updated whenever `SCHEMA_UPLOAD` / `EXTRACTOR_ENABLE`
-//! / `EXTRACTOR_DISABLE` lands. Reads only — write access is the
-//! shard executor's responsibility.
+//! open and refreshed whenever `SCHEMA_UPLOAD` lands. Reads only —
+//! write access is the shard executor's responsibility. Extraction is
+//! always-on; the only per-extractor gate is the deploy-time tier gate
+//! (`extractors.{pattern,classifier,llm}.enabled`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use brain_core::ExtractorId;
@@ -16,8 +17,7 @@ use crate::framework::extractor::Extractor;
 /// Per-tier capability gate stamped on the registry at shard spawn.
 /// Mirrors the operator's `extractors.{pattern,classifier,llm}.enabled`
 /// config: a tier marked `Disabled` here is dropped at registration
-/// time and never re-enabled by `EXTRACTOR_ENABLE`. The `Enabled`
-/// variant is the silent default.
+/// time. The `Enabled` variant is the silent default.
 ///
 /// "Disabled by config" is silent (operator opt-out); "enabled but
 /// failed to load the model" is a spawn failure handled in the shard
@@ -78,7 +78,6 @@ impl TierGate {
 #[derive(Default)]
 pub struct ExtractorRegistry {
     by_id: HashMap<ExtractorId, Arc<dyn Extractor>>,
-    enabled: HashSet<ExtractorId>,
     /// Per-tier capability gates. Built at shard spawn from operator
     /// config; immutable for the lifetime of the registry instance.
     tier_gate: TierGate,
@@ -96,29 +95,25 @@ impl ExtractorRegistry {
     pub fn with_tier_gate(gate: TierGate) -> Self {
         Self {
             by_id: HashMap::default(),
-            enabled: HashSet::default(),
             tier_gate: gate,
         }
     }
 
     /// The tier gate this registry was built with. The materialiser
     /// passes through here at build-time; runtime callers (the
-    /// extractor worker, EXTRACTOR_ENABLE handler) read it to honour
-    /// the operator's opt-out without re-deriving from config.
+    /// extractor worker) read it to honour the operator's opt-out
+    /// without re-deriving from config.
     #[must_use]
     pub fn tier_gate(&self) -> TierGate {
         self.tier_gate
     }
 
-    /// Register an extractor. New registrations default to
-    /// `enabled = true`. Replaces any prior entry with the same id
-    /// (used when a `SCHEMA_UPLOAD` bumps `extractor_version` —
-    /// the registry swaps in the new impl, preserves the prior
-    /// `enabled` flag).
+    /// Register an extractor. Replaces any prior entry with the same id
+    /// (used when a `SCHEMA_UPLOAD` bumps `extractor_version` — the
+    /// registry swaps in the new impl).
     pub fn register(&mut self, ext: Arc<dyn Extractor>) {
         let id = ext.id();
         self.by_id.insert(id, ext);
-        self.enabled.insert(id);
     }
 
     #[must_use]
@@ -126,44 +121,14 @@ impl ExtractorRegistry {
         self.by_id.get(&id)
     }
 
-    #[must_use]
-    pub fn is_enabled(&self, id: ExtractorId) -> bool {
-        self.enabled.contains(&id)
-    }
-
-    /// Toggle a per-extractor enabled flag. The tier gate still
-    /// applies — re-enabling an extractor whose tier is `Disabled` is
-    /// a no-op from [`Self::iter_enabled`]'s perspective. We honour
-    /// the flag in `enabled` regardless so an `EXTRACTOR_LIST` over
-    /// the wire surfaces the per-row state separately from the gate.
-    pub fn set_enabled(&mut self, id: ExtractorId, enabled: bool) {
-        if enabled {
-            self.enabled.insert(id);
-        } else {
-            self.enabled.remove(&id);
-        }
-    }
-
-    /// Iterate all enabled extractors. Order is unspecified; the
-    /// dispatcher applies its own ordering rules (e.g. dependency
-    /// topology). Tier-gated extractors are excluded unconditionally
-    /// regardless of their per-row flag.
+    /// Iterate every extractor whose tier is enabled. Order is
+    /// unspecified; the dispatcher applies its own ordering rules
+    /// (e.g. dependency topology). Tier-gated extractors are excluded.
     pub fn iter_enabled(&self) -> impl Iterator<Item = &Arc<dyn Extractor>> {
         let gate = self.tier_gate;
         self.by_id
-            .iter()
-            .filter(move |(id, ext)| {
-                self.enabled.contains(id) && gate.state(ext.kind()).is_enabled()
-            })
-            .map(|(_, ext)| ext)
-    }
-
-    /// Iterate every registered extractor regardless of enabled
-    /// state. Used by `EXTRACTOR_LIST` over the wire.
-    pub fn iter_all(&self) -> impl Iterator<Item = (&Arc<dyn Extractor>, bool)> {
-        self.by_id
-            .iter()
-            .map(|(id, ext)| (ext, self.enabled.contains(id)))
+            .values()
+            .filter(move |ext| gate.state(ext.kind()).is_enabled())
     }
 
     #[must_use]
@@ -234,22 +199,12 @@ mod tests {
     }
 
     #[test]
-    fn enabled_defaults_true_on_register() {
-        let mut r = ExtractorRegistry::new();
-        r.register(stub(1, "acme:p1"));
-        assert!(r.is_enabled(ExtractorId::from(1)));
-    }
-
-    #[test]
-    fn set_enabled_false_excludes_from_iter() {
+    fn register_is_visible_in_iter_enabled() {
         let mut r = ExtractorRegistry::new();
         r.register(stub(1, "acme:p1"));
         r.register(stub(2, "acme:p2"));
-        r.set_enabled(ExtractorId::from(2), false);
-        let enabled_names: Vec<_> = r.iter_enabled().map(|e| e.name().to_string()).collect();
-        assert_eq!(enabled_names, vec!["acme:p1".to_string()]);
-        // iter_all still sees both.
-        assert_eq!(r.iter_all().count(), 2);
+        let names: Vec<_> = r.iter_enabled().map(|e| e.name().to_string()).collect();
+        assert_eq!(names.len(), 2);
     }
 
     #[test]
@@ -259,15 +214,10 @@ mod tests {
     }
 
     #[test]
-    fn re_register_replaces_impl_but_preserves_enabled() {
+    fn re_register_replaces_impl() {
         let mut r = ExtractorRegistry::new();
         r.register(stub(1, "v1"));
-        r.set_enabled(ExtractorId::from(1), false);
         r.register(stub(1, "v2"));
-        // New impl is in.
         assert_eq!(r.lookup(ExtractorId::from(1)).unwrap().name(), "v2");
-        // Re-register flips enabled back to true (this is the
-        // documented semantic — new versions activate by default).
-        assert!(r.is_enabled(ExtractorId::from(1)));
     }
 }

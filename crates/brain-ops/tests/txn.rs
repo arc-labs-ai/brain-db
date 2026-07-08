@@ -163,8 +163,6 @@ fn recall_req(cue: &str, max_results: u32, txn: Option<[u8; 16]>) -> RecallReque
         include_text: false,
         request_id: None,
         txn_id: txn,
-        agent_filter: Vec::new(),
-        include_other_agents: false,
     }
 }
 

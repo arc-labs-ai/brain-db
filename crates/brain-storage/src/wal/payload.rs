@@ -489,7 +489,6 @@ impl WalPayload {
             | WalRecordKind::StatementSupersede
             | WalRecordKind::StatementTombstone
             | WalRecordKind::SchemaUpdate
-            | WalRecordKind::ExtractorToggle
             | WalRecordKind::Audit => {
                 // Layout: agent_id (16 B) || opaque body. The body
                 // remains opaque to the framing layer; phases 16+

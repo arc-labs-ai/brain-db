@@ -28,11 +28,11 @@ pub struct Config {
     /// `CapabilityNotEnabled` instead of silently falling back to RRF.
     #[serde(default)]
     pub rerank: RerankConfig,
-    /// Per-tier extractor capability gates. Each tier (pattern,
-    /// classifier, LLM) defaults to enabled; when disabled the tier is
-    /// skipped silently at extraction time (operator opted out, not a
-    /// degradation). An enabled tier that fails to load is a shard
-    /// spawn failure.
+    /// Extractor-pipeline tuning. Extraction itself is always-on and
+    /// non-configurable — the three tiers (pattern, classifier, LLM)
+    /// populate the typed graph that reads fuse, so there is no per-tier
+    /// on/off gate. This section only carries per-tier tuning (classifier
+    /// model path / threshold, resolver threshold, HyPE question count).
     #[serde(default)]
     pub extractors: ExtractorsConfig,
     #[serde(default)]
@@ -225,56 +225,29 @@ fn default_rerank_enabled() -> bool {
     false
 }
 
-/// `[extractors]` TOML section. Per-tier on/off knobs for the
-/// extractor pipeline. Each tier defaults to enabled.
+/// `[extractors]` TOML section. Per-tier tuning for the extractor
+/// pipeline. Extraction is always-on and non-configurable — there is no
+/// per-tier on/off gate; the pattern / classifier / LLM tiers always run.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExtractorsConfig {
     #[serde(default)]
-    pub pattern: ExtractorTierConfig,
-    #[serde(default)]
     pub classifier: ClassifierExtractorConfig,
-    #[serde(default)]
-    pub llm: ExtractorTierConfig,
     /// Entity-resolution embedding tier tuning.
     #[serde(default)]
     pub resolver: ResolverExtractorConfig,
     /// Write-time HyPE (hypothetical-question) generation tuning.
     #[serde(default)]
     pub hype: HypeExtractorConfig,
-    /// Write-time per-statement question-bridge (off by default until
-    /// measured). Sibling to HyPE but for the statement corpus.
-    #[serde(default)]
-    pub statement_question_bridge: StatementQuestionBridgeConfig,
-}
-
-/// `[extractors.statement_question_bridge]` TOML sub-section. When enabled,
-/// each shard builds the statement-question HNSW, the embed worker generates
-/// templated questions for every eligible statement, and the semantic
-/// retriever probes that pool on statement-scope search. Off by default: a
-/// write-time generation cost paid only once the bridge is measured. Replaces
-/// the former `BRAIN_STATEMENT_QUESTION_BRIDGE` env var — all toggles live in
-/// structured TOML.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct StatementQuestionBridgeConfig {
-    /// Off by default. `true` provisions the bridge.
-    #[serde(default)]
-    pub enabled: bool,
 }
 
 /// `[extractors.classifier]` TOML sub-section. The classifier tier's
-/// on/off gate plus an explicit NER model override and confidence
-/// threshold. The model path defaults to XDG auto-discovery at shard
-/// spawn; the field is an explicit override only.
+/// tuning: an explicit NER model override and confidence threshold. The
+/// tier is always-on (no gate); the model path defaults to XDG
+/// auto-discovery at shard spawn — the field is an explicit override only.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ClassifierExtractorConfig {
-    /// Master switch. `true` (default) materialises this tier;
-    /// `false` skips registration. Enabled-but-failed-to-init is a
-    /// spawn failure.
-    #[serde(default = "default_extractor_tier_enabled")]
-    pub enabled: bool,
     /// Explicit NER model directory. `None` (default) falls back to the
     /// XDG-cascade auto-discovery the bootstrap script writes to.
     #[serde(default)]
@@ -288,7 +261,6 @@ pub struct ClassifierExtractorConfig {
 impl Default for ClassifierExtractorConfig {
     fn default() -> Self {
         Self {
-            enabled: default_extractor_tier_enabled(),
             model_path: None,
             threshold: default_classifier_threshold(),
         }
@@ -346,32 +318,6 @@ impl Default for HypeExtractorConfig {
 
 fn default_hype_num_questions() -> usize {
     6
-}
-
-/// `[extractors.<tier>]` TOML sub-section. Operator gate on a single
-/// extractor tier. Tiered config keeps the on/off decision separate
-/// from the materialise-time wiring inside `brain-extractors`.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct ExtractorTierConfig {
-    /// Master switch. `true` (default) materialises this tier into
-    /// the registry at shard spawn; `false` skips registration so
-    /// the tier never contributes. Enabled-but-failed-to-init is a
-    /// spawn failure.
-    #[serde(default = "default_extractor_tier_enabled")]
-    pub enabled: bool,
-}
-
-impl Default for ExtractorTierConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_extractor_tier_enabled(),
-        }
-    }
-}
-
-fn default_extractor_tier_enabled() -> bool {
-    true
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -897,11 +843,10 @@ fn default_causal_edge_channel_capacity() -> usize {
 }
 
 /// `[workers.extractor]` TOML section — TUNING for the extraction-pipeline
-/// worker. The worker is NOT enabled/disabled here: its existence is derived
-/// from the extractor tier gates (`[extractors.<tier>].enabled`) — it runs iff
-/// ≥1 tier is enabled. To turn extraction off, disable the tiers. This avoids
-/// the trap where a separate worker switch could silently dead-letter every
-/// enabled tier.
+/// worker. The worker is NOT enabled/disabled here: extraction is always-on
+/// and non-configurable, so the worker is always provisioned. This section
+/// only carries per-worker tuning (interval, drain-per-cycle, budget, queue
+/// depth).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExtractorWorkerConfig {
@@ -1426,9 +1371,9 @@ impl Config {
     /// generic `BRAIN__LLM__API_KEY` env override has already folded into
     /// `self.llm` by this point, so there is exactly one source to check.
     ///
-    /// `[extractors.llm] enabled` no longer gates this requirement: the
-    /// LLM is required regardless of the tier flag, and a missing key is
-    /// always a hard startup error.
+    /// There is no `[extractors.llm]` on/off gate — extraction is always-on
+    /// — so nothing can lift this requirement: the LLM is mandatory and a
+    /// missing key is always a hard startup error.
     fn validate_llm_provider(&self) -> Result<(), ConfigError> {
         let have_provider = self
             .llm
@@ -1487,20 +1432,6 @@ mod tests {
         // Whitespace-only key does not count.
         cfg.llm.api_key = Some("   ".to_string());
         assert!(cfg.validate_llm_provider().is_err());
-    }
-
-    #[test]
-    fn llm_provider_gate_has_no_substrate_only_optout() {
-        // The LLM is mandatory and HyPE is always-on. Disabling the
-        // `extractors.llm` tier does NOT lift the key requirement — a
-        // keyless boot must still fail.
-        let mut cfg = Config::for_tests();
-        cfg.extractors.llm.enabled = false;
-        cfg.llm.api_key = None;
-        assert!(
-            cfg.validate_llm_provider().is_err(),
-            "disabling the llm tier must not bypass the mandatory LLM key gate"
-        );
     }
 
     #[test]

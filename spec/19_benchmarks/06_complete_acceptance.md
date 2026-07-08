@@ -64,16 +64,16 @@ What "the typed graph is done" means. Concrete tests that must pass.
 - [ ] LLM extractor (over budget): skips with metric.
 - [ ] Extractor idempotency: re-running on same memory produces identical results (modulo LLM cache TTL).
 
-### Query
+### Read (RECALL) and query introspection
 
-- [ ] Free-text query: semantic + lexical retrievers invoked, fused.
-- [ ] Entity-anchored query: graph retriever invoked, weighted appropriately.
-- [ ] Time-filtered query: temporal filter applied post-fusion.
-- [ ] Type-filtered query: kind/predicate filter applied.
+- [ ] Free-text RECALL: semantic + lexical retrievers invoked, fused, shaped to a membership answer.
+- [ ] Entity-anchored RECALL: graph retriever invoked, weighted appropriately.
+- [ ] Time-filtered RECALL: temporal filter applied post-fusion.
+- [ ] Type-filtered RECALL: kind/predicate filter applied.
 - [ ] Confidence filter: respected.
-- [ ] EXPLAIN: returns plan without execution.
-- [ ] TRACE: returns plan + execution metadata + per-retriever ranks.
-- [ ] Streaming results: large queries stream, client cancellation works.
+- [ ] Membership shape: RECALL returns Single / Many / None from the relevance band over the full pool, not a caller top-K; `max_results` caps a `Many` only.
+- [ ] EXPLAIN (debug op): returns plan without execution.
+- [ ] TRACE (debug op): returns plan + execution metadata + per-retriever ranks.
 
 ### Provenance and versioning
 
@@ -95,8 +95,8 @@ Targets below assume the default text-input path (CPU embedding ~5–10 ms). The
 - [ ] ENCODE + classifier extractors (post-encode async): P50 ≤ 5 ms added to extractor-completion event, P99 ≤ 20 ms.
 - [ ] STATEMENT_CREATE: P50 ≤ 1 ms, P99 ≤ 5 ms.
 - [ ] RELATION_CREATE: P50 ≤ 1 ms, P99 ≤ 5 ms.
-- [ ] QUERY (retrieval, default top_n): P50 ≤ 10 ms, P99 ≤ 50 ms.
-- [ ] QUERY (entity-anchored, 2-hop graph): P50 ≤ 15 ms, P99 ≤ 100 ms.
+- [ ] RECALL (retrieval, default candidate pool): P50 ≤ 10 ms, P99 ≤ 50 ms.
+- [ ] RECALL (entity-anchored, 2-hop graph): P50 ≤ 15 ms, P99 ≤ 100 ms.
 - [ ] Entity resolution (tiers 1–2, exact+fuzzy): P50 ≤ 1 ms.
 - [ ] Entity resolution (tier 3, embedding HNSW): P50 ≤ 10 ms.
 
@@ -108,7 +108,7 @@ Per-shard sustained, distinguishing CPU vs GPU embedding paths (matching [`../01
 - [ ] ENCODE throughput (text, GPU embedding): ≥ 1K/s per shard.
 - [ ] ENCODE_VECTOR_DIRECT throughput (storage-only): ≥ 100K/s per shard.
 - [ ] STATEMENT_CREATE throughput: ≥ 10K/s per shard.
-- [ ] QUERY throughput (mixed workload): ≥ 1K/s per shard.
+- [ ] RECALL throughput (mixed workload): ≥ 1K/s per shard.
 
 ### LLM extraction throughput
 

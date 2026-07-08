@@ -104,6 +104,16 @@ impl PatternExtractor {
 
     fn project(&self, text: String, start: usize, end: usize) -> Option<ExtractedItem> {
         let id_raw = self.id.raw();
+        // A pure date / relative-time span ("Last Friday", "yesterday") names
+        // no entity — drop it before it mints a phantom node. Statement /
+        // relation targets are unaffected (a temporal object stays text).
+        if matches!(
+            self.target,
+            ExtractorTarget::Entity { .. } | ExtractorTarget::EntityOrStatement
+        ) && crate::resolver::is_temporal_expression_surface(&text)
+        {
+            return None;
+        }
         match &self.target {
             ExtractorTarget::Entity { entity_type } => {
                 Some(ExtractedItem::EntityMention(EntityMention {
@@ -288,7 +298,8 @@ mod tests {
 
     fn ctx<'a>(reg: &'a ExtractorRegistry) -> ExtractionContext<'a> {
         ExtractionContext {
-            declared_predicates: None,
+            declared_entity_types: None,
+            candidate_predicates: None,
             declared_kinds: None,
             entity_type_labels: None,
             schema_version: 1,

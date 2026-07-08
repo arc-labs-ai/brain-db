@@ -39,8 +39,7 @@ pub enum ExtractorOpError {
 /// Intern (or look up) an extractor by its `(namespace, name)`
 /// qname.
 ///
-/// - No prior row: allocate fresh id, write row + qname index,
-///   `enabled = 1`.
+/// - No prior row: allocate fresh id, write row + qname index.
 /// - Prior row with identical kind + schema_version +
 ///   definition_blob: return the existing id (idempotent).
 /// - Prior row with diverging kind / definition_blob /
@@ -106,7 +105,6 @@ pub fn extractor_intern(
         namespace.to_string(),
         name.to_string(),
         kind,
-        true, // enabled by default
         schema_version,
         definition_blob,
         now_unix_nanos,
@@ -121,34 +119,6 @@ pub fn extractor_intern(
         idx.insert(&q.as_str(), &next_id_raw)?;
     }
     Ok(ExtractorId::from(next_id_raw))
-}
-
-/// Flip the `enabled` flag on an extractor. Returns the **previous**
-/// state, mirroring the `EXTRACTOR_DISABLE` / `_ENABLE` wire
-/// semantics (`previously_enabled` / `previously_disabled`).
-///
-/// Idempotent: setting an already-`enabled` extractor to enabled
-/// returns `true` (the previous state) and writes the row again
-/// (which redb deduplicates) without changing meaning.
-pub fn extractor_set_enabled(
-    wtxn: &WriteTransaction,
-    id: ExtractorId,
-    enabled: bool,
-) -> Result<bool, ExtractorOpError> {
-    let id_raw = id.raw();
-    let mut row = {
-        let t = wtxn.open_table(EXTRACTORS_TABLE)?;
-        let guard = t.get(&id_raw)?;
-        match guard {
-            Some(g) => g.value(),
-            None => return Err(ExtractorOpError::NotFound { id }),
-        }
-    };
-    let previous = row.is_enabled();
-    row.enabled = u8::from(enabled);
-    let mut t = wtxn.open_table(EXTRACTORS_TABLE)?;
-    t.insert(&id_raw, &row)?;
-    Ok(previous)
 }
 
 // ---------------------------------------------------------------------------
@@ -398,68 +368,6 @@ mod tests {
         let rtxn = db.begin_read().unwrap();
         let all = extractor_list(&rtxn).unwrap();
         assert_eq!(all.len(), 2);
-    }
-
-    #[test]
-    fn set_enabled_toggles_and_returns_previous() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = open_db(&dir);
-        let id = {
-            let wtxn = db.begin_write().unwrap();
-            let id = intern_pattern(&wtxn, "acme", "p1", b"x").unwrap();
-            wtxn.commit().unwrap();
-            id
-        };
-        // Initial state: enabled = true.
-        {
-            let wtxn = db.begin_write().unwrap();
-            let prev = extractor_set_enabled(&wtxn, id, false).unwrap();
-            assert!(prev, "first call: extractor was enabled");
-            wtxn.commit().unwrap();
-        }
-        // Now disabled.
-        {
-            let rtxn = db.begin_read().unwrap();
-            let got = extractor_get(&rtxn, id).unwrap().unwrap();
-            assert!(!got.is_enabled());
-        }
-        // Re-enable.
-        {
-            let wtxn = db.begin_write().unwrap();
-            let prev = extractor_set_enabled(&wtxn, id, true).unwrap();
-            assert!(!prev, "second call: extractor was disabled");
-            wtxn.commit().unwrap();
-        }
-    }
-
-    #[test]
-    fn set_enabled_unknown_id_returns_not_found() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = open_db(&dir);
-        let wtxn = db.begin_write().unwrap();
-        let err = extractor_set_enabled(&wtxn, ExtractorId::from(99), false).unwrap_err();
-        assert!(matches!(err, ExtractorOpError::NotFound { .. }));
-        wtxn.commit().unwrap();
-    }
-
-    #[test]
-    fn set_enabled_idempotent_on_same_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = open_db(&dir);
-        let id = {
-            let wtxn = db.begin_write().unwrap();
-            let id = intern_pattern(&wtxn, "acme", "p1", b"x").unwrap();
-            wtxn.commit().unwrap();
-            id
-        };
-        // Enable an already-enabled extractor.
-        let wtxn = db.begin_write().unwrap();
-        let prev = extractor_set_enabled(&wtxn, id, true).unwrap();
-        assert!(prev);
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        assert!(extractor_get(&rtxn, id).unwrap().unwrap().is_enabled());
     }
 
     #[test]

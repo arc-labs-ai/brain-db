@@ -140,6 +140,18 @@ pub async fn handle_schema_upload(
         }
     };
 
+    // The upload committed and may have added or changed extractor
+    // rows. Flag the registry dirty so the extractor worker rebuilds it
+    // from the freshly-persisted `EXTRACTORS_TABLE` on its next cycle;
+    // a newly-declared extractor then fires without a shard restart. We
+    // only flip the flag here (cheap) — the actual rebuild, which needs
+    // the classifier model / LLM router, runs off the request path in
+    // the worker. Reaching this point means the merge was non-idempotent
+    // (the all-idempotent short-circuit above already returned), so a
+    // byte-equal re-upload never thrashes the registry.
+    ctx.extractors_dirty
+        .store(true, std::sync::atomic::Ordering::Release);
+
     // 5. Emit event post-commit.
     emit_graph_event(
         ctx,

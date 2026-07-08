@@ -133,7 +133,7 @@ All typed-graph opcodes live in the `0x01xx` namespace. Within `0x01xx`, low-byt
 0x0130–0x013F   entity operations
 0x0140–0x014F   statement operations
 0x0150–0x015F   relation operations
-0x0160–0x016F   query operations (retrieval)
+0x0160–0x016F   query introspection + procedural materialization
 0x0170–0x017F   admin operations (extraction + index maintenance)
 0x0180–0x018F   reserved future
 ```
@@ -148,9 +148,7 @@ The low byte's high bit selects direction within this namespace, mirroring the s
 | 0x0121 | `SCHEMA_GET` | version_id (latest if 0) | schema document |
 | 0x0122 | `SCHEMA_LIST` | (none) | list of versions with timestamps |
 | 0x0123 | `SCHEMA_VALIDATE` | schema document | validation_errors (without commit) |
-| 0x0124 | `EXTRACTOR_LIST` | (none) | active extractors |
-| 0x0125 | `EXTRACTOR_DISABLE` | extractor_id | confirmation |
-| 0x0126 | `EXTRACTOR_ENABLE` | extractor_id | confirmation |
+| 0x0124 | `EXTRACTOR_LIST` | (none) | active extractors (read-only introspection) |
 | 0x0127 | `SCHEMA_REPLACE` | schema document + `force_drop_existing: true` | namespace, schema_version, dropped_count, validation_errors |
 
 `SCHEMA_REPLACE` (request `0x0127`, response `0x01A7`) is the destructive counterpart to the additive-merge `SCHEMA_UPLOAD`. It tombstones every schema-declared predicate, relation_type, and extractor row in the target namespace and re-runs the apply path against a clean slate inside a single redb wtxn. Entity types are **not** dropped (they are global in v1; see [`../03_schema/05_versioning.md`](../03_schema/05_versioning.md) §1c). Admin-only; the handler rejects the call unless `force_drop_existing` is exactly `true`. See [`../03_schema/05_versioning.md`](../03_schema/05_versioning.md) §9.
@@ -193,17 +191,25 @@ The low byte's high bit selects direction within this namespace, mirroring the s
 | 0x0155 | `RELATION_LIST_TO` | EntityId, type_filter, time_filter | RelationIds |
 | 0x0156 | `RELATION_TRAVERSE` | start, types, depth, direction | path/subgraph |
 
-### 2.5 Query operations (0x0160–0x016F)
+### 2.5 Query introspection operations (0x0160–0x016F)
 
 | Opcode | Name | Body | Response |
 |---|---|---|---|
-| 0x0160 | `QUERY` | QueryRequest | QueryResult (streamed if large) |
 | 0x0161 | `QUERY_EXPLAIN` | QueryRequest | QueryPlan (no execution) |
 | 0x0162 | `QUERY_TRACE` | QueryRequest | QueryResult + per-retriever debug |
-| 0x0163 | `QUERY_TEXT` | text, filters, retriever_selection | RecallResult |
 | 0x0164 | `MATERIALIZE_PROCEDURAL` | agent_id, target_predicates | ProceduralBlock (rendered system prompt) |
 
-`QUERY` is the primary structured query opcode. `QUERY_TEXT` is the simple-text fast path used by clients that just want text-only retrieval with no entity anchoring.
+There is **no client-facing bulk-query verb.** `RECALL` (`0x0021`) is the sole
+primary read; it returns the answer as a membership shape (Single / Many /
+None), not a ranked candidate list. `QUERY_EXPLAIN` and `QUERY_TRACE` are the
+**operator debug/introspection surface** over the same shared retrieval engine:
+EXPLAIN renders the plan without executing, TRACE executes and returns the
+per-retriever candidate breakdown for diagnosing "why did the engine rank it
+this way." They accept the internal `QueryRequest` (retriever selection, fusion
+overrides, filters) precisely because they are a debugging tool, not the agent
+read path. Structured typed-graph lookup ("list every statement with predicate
+X on entity Y") is served by the LIST ops (`STATEMENT_LIST`, `RELATION_LIST_*`,
+`ENTITY_RESOLVE` / `ENTITY_LIST`), not a fused ranked list.
 
 `MATERIALIZE_PROCEDURAL` (`0x0164` request, `0x01E4` response) renders the agent's procedural-memory predicates (`brain:behavior_*` — see [`../03_schema/06_system_schema.md`](../03_schema/06_system_schema.md)) into a single system-prompt block the agent can re-inject at conversation start. Semantically a read-only structured query under the hood; conceptually a memory primitive because the agent treats the materialised block as a separate handle.
 
@@ -248,7 +254,7 @@ What user declarations control is **per-type acceptance** on explicit typed-grap
 - `STATEMENT_CREATE` with an undeclared predicate qname → `PredicateNotInSchema` (or open-vocabulary intern with `SchemaOrigin::ImplicitFromWrite` if the deployment runs in open-vocabulary mode; see §07/error-handling).
 - `RELATION_CREATE` with an undeclared relation_type qname → `RelationTypeNotInSchema` (same open-vocabulary rule).
 
-Extracted candidates whose types are not in any active schema are dropped silently (extractor best-effort; see [`../11_extractors/00_purpose.md`](../11_extractors/00_purpose.md)). `RECALL`, `QUERY`, `QUERY_TEXT`, and the fan-out pipeline always run regardless of which user namespaces are present.
+Extracted candidates whose types are not in any active schema are dropped silently (extractor best-effort; see [`../11_extractors/00_purpose.md`](../11_extractors/00_purpose.md)). `RECALL`, the `QUERY_EXPLAIN` / `QUERY_TRACE` introspection ops, and the fan-out pipeline always run regardless of which user namespaces are present.
 
 There is no `SCHEMA_NOT_DECLARED` error any more — the gate is per-type, not per-namespace.
 

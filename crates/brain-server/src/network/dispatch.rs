@@ -268,8 +268,8 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
             // Under scoped API-key auth, a subscriber may only receive its
             // own agent's events. `filter.agents == None`/empty means "all
             // agents" (a cross-tenant leak on a shared shard), and any id
-            // other than the caller's own agent is likewise forbidden —
-            // mirrors RECALL's `enforce_agent_filter`.
+            // other than the caller's own agent is likewise forbidden — the
+            // SUBSCRIBE analogue of RECALL/QUERY per-agent read isolation.
             if !subscribe_agents_allowed(scope.agent_id, sub_req.filter.agents.as_deref()) {
                 return Action::Inline(error_frame(
                     stream_id,
@@ -608,8 +608,9 @@ fn build_response_frame(stream_id: u32, eos: bool, body: ResponseBody) -> Frame 
 ///
 /// A subscriber may only receive its own agent's events, so `agents` must
 /// be a non-empty list naming only the caller's own agent — `None`/empty
-/// (= all agents on the shard) is a cross-tenant leak and is rejected.
-/// Mirrors RECALL's `enforce_agent_filter`.
+/// (= all agents on the shard) is a cross-tenant leak and is rejected. This
+/// is the SUBSCRIBE analogue of the per-agent read isolation RECALL / QUERY
+/// enforce structurally.
 fn subscribe_agents_allowed(own: AgentId, agents: Option<&[[u8; 16]]>) -> bool {
     agents.is_some_and(|a| !a.is_empty() && a.iter().all(|b| AgentId::from(*b) == own))
 }

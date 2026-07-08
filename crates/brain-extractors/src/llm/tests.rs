@@ -23,8 +23,9 @@ use parking_lot::Mutex;
 use serde_json::Value;
 
 use super::extractor::{
-    collect_prior_entities, find_unfilled_placeholder, parse_verdict, relative_time_hint,
-    render_prompt, truncate_chars, LlmExtractor, LlmExtractorInner, LLM_INPUT_TOKEN_BUDGET,
+    anchor_date_iso, collect_prior_entities, find_unfilled_placeholder, parse_verdict,
+    relative_time_hint, render_prompt, truncate_chars, LlmExtractor, LlmExtractorInner,
+    LLM_INPUT_TOKEN_BUDGET,
 };
 use super::pricing::{estimate_cost, CostBudget, Pricing};
 use crate::framework::extractor::{
@@ -109,7 +110,8 @@ fn memory(text: &str) -> Memory {
 
 fn ctx<'a>(reg: &'a ExtractorRegistry) -> ExtractionContext<'a> {
     ExtractionContext {
-        declared_predicates: None,
+        declared_entity_types: None,
+        candidate_predicates: None,
         declared_kinds: None,
         entity_type_labels: None,
         schema_version: 1,
@@ -344,6 +346,8 @@ fn build_request_injects_prior_entities_into_prompt() {
         None,
         None,
         None,
+        None,
+        None,
         0,
     );
     let body = &req.messages[0].content;
@@ -374,6 +378,77 @@ fn build_request_injects_prior_entities_into_prompt() {
 }
 
 #[test]
+fn build_request_substitutes_anchor_date_placeholder() {
+    let prompt = "Recorded on {ANCHOR_DATE}. Text: {TEXT}";
+    let ext = ext_with_prompt(prompt);
+    let inner = ext.inner.as_ref().unwrap().clone();
+    let (req, _) = ext.build_request(
+        &inner,
+        brain_core::MemoryId::pack(0, 1, 0),
+        "Ran a race last Saturday.",
+        &[],
+        None,
+        None,
+        None,
+        None,
+        Some("2023-05-25"),
+        0,
+    );
+    let body = &req.messages[0].content;
+    assert!(
+        body.contains("Recorded on 2023-05-25."),
+        "anchor date must be substituted into the prompt: {body}",
+    );
+    assert!(
+        !body.contains("{ANCHOR_DATE}"),
+        "placeholder must be consumed: {body}",
+    );
+}
+
+#[test]
+fn build_request_anchor_date_empty_when_absent() {
+    let prompt = "Recorded on {ANCHOR_DATE}. Text: {TEXT}";
+    let ext = ext_with_prompt(prompt);
+    let inner = ext.inner.as_ref().unwrap().clone();
+    let (req, _) = ext.build_request(
+        &inner,
+        brain_core::MemoryId::pack(0, 1, 0),
+        "No date here.",
+        &[],
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+    );
+    let body = &req.messages[0].content;
+    assert!(
+        body.contains("Recorded on . Text:"),
+        "absent anchor renders empty (rule no-ops): {body}",
+    );
+}
+
+#[test]
+fn anchor_date_iso_prefers_occurred_at_then_created_at() {
+    // occurred_at set -> that date wins over created_at.
+    let mut m = memory("x");
+    m.created_at_unix_ms = 1_700_000_000_000; // 2023-11-14
+    m.occurred_at_unix_nanos = Some(1_684_540_800_000_000_000); // 2023-05-20
+    assert_eq!(anchor_date_iso(&m).as_deref(), Some("2023-05-20"));
+
+    // No occurred_at -> fall back to created_at.
+    let mut m2 = memory("x");
+    m2.created_at_unix_ms = 1_684_540_800_000; // 2023-05-20 (ms)
+    m2.occurred_at_unix_nanos = None;
+    assert_eq!(anchor_date_iso(&m2).as_deref(), Some("2023-05-20"));
+
+    // Neither usable -> None (placeholder renders empty).
+    let m3 = memory("x"); // created_at_unix_ms = 0, occurred_at = None
+    assert_eq!(anchor_date_iso(&m3), None);
+}
+
+#[test]
 fn build_request_with_empty_prior_entities_omits_section() {
     let prompt = "DO YOUR JOB.\n{PRIOR_ENTITIES}\nText: {TEXT}";
     let ext = ext_with_prompt(prompt);
@@ -384,6 +459,8 @@ fn build_request_with_empty_prior_entities_omits_section() {
         brain_core::MemoryId::pack(0, 2, 0),
         "Plain text.",
         &priors,
+        None,
+        None,
         None,
         None,
         None,
@@ -416,6 +493,8 @@ fn build_request_filters_non_entity_items_from_prior() {
         None,
         None,
         None,
+        None,
+        None,
         0,
     );
     let body = &req.messages[0].content;
@@ -443,7 +522,8 @@ fn build_request_filters_non_entity_items_from_prior() {
     );
     let reg = ExtractorRegistry::new();
     let ctx = ExtractionContext {
-        declared_predicates: None,
+        declared_entity_types: None,
+        candidate_predicates: None,
         declared_kinds: None,
         entity_type_labels: None,
         schema_version: 1,
@@ -501,6 +581,8 @@ fn build_request_splits_into_cached_blocks() {
         brain_core::MemoryId::pack(0, 1, 0),
         "Alice met Bob.",
         &[],
+        None,
+        None,
         None,
         None,
         None,
@@ -572,6 +654,8 @@ fn build_request_without_examples_emits_role_block_only() {
         brain_core::MemoryId::pack(0, 1, 0),
         "Hello.",
         &[],
+        None,
+        None,
         None,
         None,
         None,
@@ -856,6 +940,8 @@ fn extract_with_context_includes_neighbors_in_prompt() {
         Some(&ec),
         None,
         None,
+        None,
+        None,
         now,
     );
     let body = &req.messages[0].content;
@@ -897,7 +983,18 @@ fn extract_with_context_drops_summary_when_over_budget() {
         // 600-char summary (truncated to 500 in the render).
         summary: Some("Summary that pushes us over the cap. ".repeat(20)),
     };
-    let (_req, stats) = ext.build_request(&inner, mid, &memory_text, &[], Some(&ec), None, None, 0);
+    let (_req, stats) = ext.build_request(
+        &inner,
+        mid,
+        &memory_text,
+        &[],
+        Some(&ec),
+        None,
+        None,
+        None,
+        None,
+        0,
+    );
     assert!(
         !stats.summary_included,
         "summary must be dropped when over budget (got {} tokens)",
@@ -941,7 +1038,18 @@ fn extract_with_context_drops_lowest_similarity_neighbors_when_over_budget() {
         neighbors,
         summary: None,
     };
-    let (req, stats) = ext.build_request(&inner, mid, &memory_text, &[], Some(&ec), None, None, 0);
+    let (req, stats) = ext.build_request(
+        &inner,
+        mid,
+        &memory_text,
+        &[],
+        Some(&ec),
+        None,
+        None,
+        None,
+        None,
+        0,
+    );
     let body = &req.messages[0].content;
     assert!(
         stats.neighbors_included < 30,
@@ -982,6 +1090,8 @@ fn extract_with_context_includes_summary_when_under_budget() {
         Some(&ec),
         None,
         None,
+        None,
+        None,
         1_000_000_000,
     );
     let body = &req.messages[0].content;
@@ -1003,6 +1113,8 @@ fn extract_with_context_skips_sections_when_context_is_empty() {
         "first memory ever",
         &[],
         Some(&ec),
+        None,
+        None,
         None,
         None,
         0,

@@ -194,8 +194,6 @@ async fn recall_ids(client: &mut TcpStream, stream_id: u32, cue: &str) -> Vec<u1
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id: None,
-        agent_filter: Vec::new(),
-        include_other_agents: false,
     };
     let (opcode, body) = round_trip(client, stream_id, RequestBody::Recall(req)).await;
     assert_eq!(

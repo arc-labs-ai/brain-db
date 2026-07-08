@@ -1,14 +1,11 @@
 //! Multi-agent isolation on the RECALL read path.
 //!
 //! The most important correctness property of a multi-tenant memory store:
-//! one agent's RECALL must not return another agent's memories by default.
-//! Brain enforces this at the filter level — every memory row carries its
-//! owning `agent_id`, and when a RECALL arrives with an empty `agent_filter`
-//! and `include_other_agents == false` the handler injects the caller's
-//! authenticated agent as the scope. These tests prove that scoping holds, and
-//! that under mandatory key auth the cross-agent escape hatches
-//! (`include_other_agents`, an `agent_filter` naming another agent) are
-//! rejected rather than honored.
+//! one agent's RECALL must not return another agent's memories. Brain enforces
+//! this structurally — every memory row carries its owning `agent_id`, RECALL
+//! carries no client-supplied agent filter, and the handler scopes every read
+//! to the caller's authenticated agent. There is no cross-agent read path to
+//! opt into. This test proves that scoping holds.
 //!
 //! A single shard (`start(1)`) forces both agents onto shard 0 — `hash(agent)
 //! % 1 == 0` — so what's under test is the *logical* per-agent filter, not the
@@ -176,14 +173,9 @@ async fn encode(client: &mut TcpStream, stream_id: u32, text: &str) -> u128 {
     }
 }
 
-/// Recall with explicit scope knobs; returns the `memory_id`s in the result set.
-async fn recall_ids(
-    client: &mut TcpStream,
-    stream_id: u32,
-    cue: &str,
-    agent_filter: Vec<[u8; 16]>,
-    include_other_agents: bool,
-) -> Vec<u128> {
+/// Recall the caller's own memories; returns the `memory_id`s in the result
+/// set. Scope is always the caller's own agent — there is no client filter.
+async fn recall_ids(client: &mut TcpStream, stream_id: u32, cue: &str) -> Vec<u128> {
     let req = RecallRequest {
         cue_text: cue.into(),
         subject_name: String::new(),
@@ -199,8 +191,6 @@ async fn recall_ids(
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id: None,
-        agent_filter,
-        include_other_agents,
     };
     let (opcode, body) = round_trip(client, stream_id, RequestBody::Recall(req)).await;
     assert_eq!(
@@ -217,44 +207,14 @@ async fn recall_ids(
     }
 }
 
-/// Fire a recall and return the raw `(opcode, body)` without asserting a
-/// RecallResp — used to check that a forbidden cross-agent recall is rejected.
-async fn recall_raw(
-    client: &mut TcpStream,
-    stream_id: u32,
-    cue: &str,
-    agent_filter: Vec<[u8; 16]>,
-    include_other_agents: bool,
-) -> (u16, ResponseBody) {
-    let req = RecallRequest {
-        cue_text: cue.into(),
-        subject_name: String::new(),
-        max_results: 50,
-        confidence_threshold: 0.0,
-        context_filter: None,
-        age_bound_unix_nanos: None,
-        as_of_record_time_unix_nanos: None,
-        kind_filter: None,
-        salience_floor: 0.0,
-        include_edges: false,
-        include_graph: false,
-        include_text: false,
-        request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
-        txn_id: None,
-        agent_filter,
-        include_other_agents,
-    };
-    round_trip(client, stream_id, RequestBody::Recall(req)).await
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-/// The core isolation guarantee: with the default scope (empty `agent_filter`,
-/// `include_other_agents == false`), agent B's RECALL never returns a memory
-/// that agent A encoded — even though both agents live on the same shard and
-/// share one HNSW/tantivy index.
+/// The core isolation guarantee: agent B's RECALL never returns a memory that
+/// agent A encoded — even though both agents live on the same shard and share
+/// one HNSW/tantivy index. The scope is the caller's authenticated agent,
+/// applied unconditionally; there is no wire field that could widen it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn default_recall_does_not_leak_other_agents_memories() {
     let server = start(1).await; // one shard → both agents collocated
@@ -285,7 +245,7 @@ async fn default_recall_does_not_leak_other_agents_memories() {
 
     // Agent B stores its own, then recalls under the default scope.
     let b1 = encode(&mut b, 1, "agent B note: review the design doc").await;
-    let b_ids = recall_ids(&mut b, 3, "private launch code doc", Vec::new(), false).await;
+    let b_ids = recall_ids(&mut b, 3, "private launch code doc").await;
 
     // B must not see A's memories...
     assert!(
@@ -302,67 +262,10 @@ async fn default_recall_does_not_leak_other_agents_memories() {
     }
 
     // Symmetrically, A must not see B's memory.
-    let a_ids = recall_ids(&mut a, 5, "review design doc note", Vec::new(), false).await;
+    let a_ids = recall_ids(&mut a, 5, "review design doc note").await;
     assert!(
         !a_ids.contains(&b1),
-        "ISOLATION BREACH: agent A's default recall returned agent B's memory {b1}; got {a_ids:?}"
-    );
-
-    server.stop().await;
-}
-
-/// Under mandatory key auth a connection is bound to exactly the key's agent,
-/// so the cross-agent escape hatches are rejected, not honored: a scoped key
-/// may neither set `include_other_agents = true` nor name another agent in
-/// `agent_filter`. Both come back as a `PermissionDenied` error frame, never a
-/// RecallResp that leaks another agent's data.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cross_agent_recall_knobs_are_rejected() {
-    let server = start(1).await;
-
-    let agent_a = [0x11u8; 16];
-    let agent_b = [0x22u8; 16];
-
-    let mut a = TcpStream::connect(server.data_plane_addr)
-        .await
-        .expect("connect a");
-    let mut b = TcpStream::connect(server.data_plane_addr)
-        .await
-        .expect("connect b");
-    handshake_as(
-        &mut a,
-        &server.mint("test", agent_a, brain_metadata::api_keys::bits::FULL),
-    )
-    .await;
-    handshake_as(
-        &mut b,
-        &server.mint("test", agent_b, brain_metadata::api_keys::bits::FULL),
-    )
-    .await;
-
-    let _a1 = encode(&mut a, 1, "shared-visible: quarterly numbers are up").await;
-
-    // Default scope still works (and is scoped to B's own agent).
-    let scoped = recall_ids(&mut b, 1, "quarterly numbers", Vec::new(), false).await;
-    assert!(
-        !scoped.contains(&_a1),
-        "default scope must hide agent A's memory from B; got {scoped:?}"
-    );
-
-    // include_other_agents = true → rejected.
-    let (opcode, body) = recall_raw(&mut b, 3, "quarterly numbers", Vec::new(), true).await;
-    assert_eq!(
-        opcode,
-        Opcode::Error.as_u16(),
-        "include_other_agents must be rejected under scoped auth, got {body:?}"
-    );
-
-    // Naming another agent in agent_filter → rejected.
-    let (opcode, body) = recall_raw(&mut b, 5, "quarterly numbers", vec![agent_a], false).await;
-    assert_eq!(
-        opcode,
-        Opcode::Error.as_u16(),
-        "agent_filter naming another agent must be rejected, got {body:?}"
+        "ISOLATION BREACH: agent A's recall returned agent B's memory {b1}; got {a_ids:?}"
     );
 
     server.stop().await;

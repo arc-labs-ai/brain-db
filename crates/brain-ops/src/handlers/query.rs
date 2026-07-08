@@ -1,20 +1,17 @@
-//! Retrieval query handlers.
+//! Retrieval query introspection handlers.
 //!
-//! Wire entry points for the four retrieval-query opcodes:
+//! Wire entry points for the two retrieval-query introspection opcodes:
 //!
-//! - `Query`         (0x0160 / 0x01E0) — plan + execute; return fused items.
 //! - `QueryExplain`  (0x0161 / 0x01E1) — plan only; return rendered plan text.
 //! - `QueryTrace`    (0x0162 / 0x01E2) — plan + execute; return rendered
 //!   plan-with-execution text.
-//! - `QueryText`     (0x0163 / 0x01E3) — narrow projection: text → list of
-//!   Memory ids + fused scores.
 //!
 //! Each handler does three things:
 //!
-//! 1. Translate the wire request into the planner's
+//! 1. Translate the embedded wire query into the planner's
 //!    `brain_planner::retrieval::router::QueryRequest`.
-//! 2. Call `plan(&req)` and (for non-EXPLAIN paths) `execute(...)`.
-//! 3. Project the planner's `QueryResult` back onto a wire response.
+//! 2. Call `plan(&req)` and (for TRACE) `execute(...)`.
+//! 3. Render the plan / trace text back onto a wire response.
 //!
 //! The handler reuses the per-shard retriever slots already
 //! installed on [`OpsContext`] (semantic / lexical / graph) and
@@ -22,24 +19,18 @@
 
 use brain_core::StatementKind;
 use brain_core::{EntityId, PredicateId};
-use brain_index::RankedItemId;
 use brain_metadata::schema::predicate::predicate_lookup_by_qname;
 use brain_metadata::schema::store::schema_active;
-use brain_planner::retrieval::executor::{
-    execute, ExecutionError, QueryMetadata, QueryResult, RetrievalExecutorContext, RetrieverStatus,
-};
+use brain_planner::retrieval::executor::{execute, ExecutionError, RetrievalExecutorContext};
 use brain_planner::retrieval::explain::{render_plan, render_trace};
-use brain_planner::retrieval::fusion::FusedItem;
 use brain_planner::retrieval::planner::{plan, PlanError};
 use brain_planner::retrieval::router::{
     FusionConfig, PerRetrieverWeights, QueryRequest as PlannerQueryRequest, Retriever,
     RetrieverSelection, TimeRange,
 };
 use brain_protocol::{
-    FusionConfigWire, ItemIdWire, MemoryHit, QueryExplainRequest, QueryExplainResponse,
-    QueryRequest as WireQueryRequest, QueryResponse, QueryResultItem, QueryTextRequest,
-    QueryTextResponse, QueryTraceRequest, QueryTraceResponse, RetrieverContributionWire,
-    RetrieverOutcomeWire, RetrieverSelectionWire, RetrieverWire, TimeRangeWire,
+    FusionConfigWire, QueryExplainRequest, QueryExplainResponse, QueryRequest as WireQueryRequest,
+    QueryTraceRequest, QueryTraceResponse, RetrieverSelectionWire, RetrieverWire, TimeRangeWire,
 };
 
 use crate::context::OpsContext;
@@ -82,33 +73,6 @@ enum PredicateResolution {
     EmptyResultSet,
 }
 
-/// Run a full retrieval query: plan + execute, project to wire.
-pub async fn handle_query(
-    req: WireQueryRequest,
-    ctx: &OpsContext,
-) -> Result<QueryResponse, OpError> {
-    validate_text_length(&req.text)?;
-    let predicate_ids = match resolve_predicate_filter(&req.predicate_filter, ctx)? {
-        PredicateResolution::Ok(v) => v,
-        PredicateResolution::EmptyResultSet => {
-            return Ok(QueryResponse {
-                items: Vec::new(),
-                total_latency_ms: 0.0,
-                retriever_outcomes: Vec::new(),
-            });
-        }
-    };
-    let planner_req = wire_to_planner_request(req, predicate_ids)?;
-    let qp = plan(&planner_req).map_err(map_plan_error)?;
-    let exec_ctx = build_executor_context(ctx)?;
-    // QUERY is the typed-graph query: it surfaces statement results, so
-    // the statement corpus is searched (passing `true`).
-    let result = execute(&qp, &planner_req, true, &exec_ctx)
-        .await
-        .map_err(map_executor_error)?;
-    Ok(project_query_response(&result))
-}
-
 /// EXPLAIN — plan only, return rendered plan text.
 pub async fn handle_query_explain(
     req: QueryExplainRequest,
@@ -122,7 +86,7 @@ pub async fn handle_query_explain(
         // build with no predicate constraint applied.
         PredicateResolution::EmptyResultSet => Vec::new(),
     };
-    let planner_req = wire_to_planner_request(req.query, predicate_ids)?;
+    let planner_req = wire_to_planner_request(req.query, predicate_ids, ctx)?;
     let qp = plan(&planner_req).map_err(map_plan_error)?;
     Ok(QueryExplainResponse {
         plan_text: render_plan(&qp),
@@ -147,10 +111,10 @@ pub async fn handle_query_trace(
             });
         }
     };
-    let planner_req = wire_to_planner_request(req.query, predicate_ids)?;
+    let planner_req = wire_to_planner_request(req.query, predicate_ids, ctx)?;
     let qp = plan(&planner_req).map_err(map_plan_error)?;
     let exec_ctx = build_executor_context(ctx)?;
-    // TRACE mirrors QUERY's execution, statement corpus included.
+    // TRACE executes the full retrieval, statement corpus included.
     let result = execute(&qp, &planner_req, true, &exec_ctx)
         .await
         .map_err(map_executor_error)?;
@@ -218,47 +182,6 @@ fn resolve_predicate_filter(
     Ok(PredicateResolution::Ok(out))
 }
 
-/// QUERY_TEXT — narrow projection over the retrieval path: text → memory ids.
-pub async fn handle_query_text(
-    req: QueryTextRequest,
-    ctx: &OpsContext,
-) -> Result<QueryTextResponse, OpError> {
-    validate_text_length(&req.text)?;
-    let planner_req = PlannerQueryRequest {
-        text: Some(req.text),
-        entity_anchor: None,
-        kind_filter: Vec::new(),
-        predicate_filter: Vec::new(),
-        context_filter: Vec::new(),
-        // Wire-level QUERY/QUERY_TEXT is the low-level retrieval API
-        // used by explore/admin tooling — no implicit caller-agent
-        // isolation. Callers that want agent scope pass it through the
-        // higher-level RECALL path.
-        agent_filter: Vec::new(),
-        time_filter: None,
-        confidence_min: None,
-        include_tombstoned: false,
-        include_superseded: false,
-        as_of_record_time_unix_nanos: None,
-        limit: req.limit,
-        retrievers: RetrieverSelection::Auto,
-        fusion_config: None,
-    };
-    let qp = plan(&planner_req).map_err(map_plan_error)?;
-    let exec_ctx = build_executor_context(ctx)?;
-    // QUERY_TEXT projects to memory ids only (`memory_hit_from_fused`
-    // drops non-memory hits), so the statement corpus is not searched.
-    let result = execute(&qp, &planner_req, false, &exec_ctx)
-        .await
-        .map_err(map_executor_error)?;
-    let items = result
-        .items
-        .iter()
-        .filter_map(memory_hit_from_fused)
-        .collect();
-    Ok(QueryTextResponse { items })
-}
-
 // ---------------------------------------------------------------------------
 // Validation / translation helpers.
 // ---------------------------------------------------------------------------
@@ -275,6 +198,7 @@ fn validate_text_length(text: &str) -> Result<(), OpError> {
 fn wire_to_planner_request(
     req: WireQueryRequest,
     predicate_filter: Vec<PredicateId>,
+    ctx: &OpsContext,
 ) -> Result<PlannerQueryRequest, OpError> {
     let text = if req.text.is_empty() {
         None
@@ -306,9 +230,10 @@ fn wire_to_planner_request(
         // Wire-level QUERY does not yet expose a context filter — the
         // funnel will pick it up once the wire shape gains the field.
         context_filter: Vec::new(),
-        // Low-level QUERY API: no implicit caller-agent isolation
-        // (the RECALL path owns that default).
-        agent_filter: Vec::new(),
+        // Strict per-agent isolation: every row belongs to exactly one agent,
+        // so QUERY is scoped to the caller's own agent (from the key), never
+        // widened by a client field.
+        agent_filter: vec![ctx.executor.caller_agent],
         confidence_min: req.confidence_min,
         include_tombstoned: req.include_tombstoned,
         include_superseded: req.include_superseded,
@@ -355,14 +280,6 @@ fn retriever_from_wire(w: RetrieverWire) -> Retriever {
     }
 }
 
-fn retriever_to_wire(r: Retriever) -> RetrieverWire {
-    match r {
-        Retriever::Semantic => RetrieverWire::Semantic,
-        Retriever::Lexical => RetrieverWire::Lexical,
-        Retriever::Graph => RetrieverWire::Graph,
-    }
-}
-
 fn fusion_config_from_wire(w: FusionConfigWire) -> FusionConfig {
     FusionConfig {
         k: w.k,
@@ -398,110 +315,6 @@ fn build_executor_context(ctx: &OpsContext) -> Result<RetrievalExecutorContext, 
 // (The above mirrors the analogous block in `handle_recall`; the
 // retrievers are now mandatory Arcs so each `clone()` is just an
 // Arc bump.)
-
-// ---------------------------------------------------------------------------
-// Result projection.
-// ---------------------------------------------------------------------------
-
-fn project_query_response(result: &QueryResult) -> QueryResponse {
-    let items = result.items.iter().map(project_item).collect();
-    let retriever_outcomes = project_outcomes(&result.metadata);
-    QueryResponse {
-        items,
-        total_latency_ms: result.metadata.total_latency_ms,
-        retriever_outcomes,
-    }
-}
-
-fn project_item(item: &FusedItem) -> QueryResultItem {
-    let id = item_id_to_wire(item.id);
-    let contributing = item
-        .contributing
-        .iter()
-        .map(|c| RetrieverContributionWire {
-            retriever: retriever_to_wire(c.retriever),
-            rank: c.rank,
-            raw_score: c.raw_score,
-        })
-        .collect();
-    QueryResultItem {
-        id,
-        fused_score: item.fused_score,
-        contributing,
-    }
-}
-
-fn item_id_to_wire(id: RankedItemId) -> ItemIdWire {
-    match id {
-        RankedItemId::Memory(m) => ItemIdWire {
-            kind: 0,
-            bytes: u128_to_be_bytes(m.raw()),
-        },
-        RankedItemId::Statement(s) => ItemIdWire {
-            kind: 1,
-            bytes: s.to_bytes(),
-        },
-        RankedItemId::Entity(e) => ItemIdWire {
-            kind: 2,
-            bytes: e.to_bytes(),
-        },
-        RankedItemId::Relation(r) => ItemIdWire {
-            kind: 3,
-            bytes: r.to_bytes(),
-        },
-    }
-}
-
-fn u128_to_be_bytes(v: u128) -> [u8; 16] {
-    v.to_be_bytes()
-}
-
-fn project_outcomes(meta: &QueryMetadata) -> Vec<RetrieverOutcomeWire> {
-    meta.retriever_outcomes
-        .iter()
-        .map(|o| {
-            let latency_ms = meta
-                .retriever_latencies_ms
-                .iter()
-                .find(|(r, _)| *r == o.retriever)
-                .map(|(_, ms)| *ms)
-                .unwrap_or(0.0);
-            let result_count = meta
-                .retriever_total_results
-                .iter()
-                .find(|(r, _)| *r == o.retriever)
-                .map(|(_, c)| *c as u32)
-                .unwrap_or(0);
-            let (status, message) = status_to_wire(&o.status);
-            RetrieverOutcomeWire {
-                retriever: retriever_to_wire(o.retriever),
-                status,
-                message,
-                latency_ms,
-                result_count,
-            }
-        })
-        .collect()
-}
-
-fn status_to_wire(s: &RetrieverStatus) -> (u8, String) {
-    match s {
-        RetrieverStatus::Success => (0, String::new()),
-        RetrieverStatus::Skipped(reason) => (1, (*reason).to_string()),
-        RetrieverStatus::Timeout => (2, String::new()),
-        RetrieverStatus::Failure(msg) => (3, msg.clone()),
-    }
-}
-
-fn memory_hit_from_fused(item: &FusedItem) -> Option<MemoryHit> {
-    match item.id {
-        RankedItemId::Memory(m) => Some(MemoryHit {
-            memory_id: u128_to_be_bytes(m.raw()),
-            fused_score: item.fused_score,
-        }),
-        _ => None,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Error mapping.

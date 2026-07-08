@@ -556,7 +556,10 @@ Clients that want contradictions:
 - Call `STATEMENT_LIST` with `subject + predicate + only_current=true`.
 - Inspect the returned set; if more than one distinct `object`, the set is contradictory.
 
-The query router exposes contradictions in `QUERY_TRACE` debug output. Production callers route there.
+Production callers detect contradictions through `STATEMENT_LIST` (above) or a
+`RECALL` that returns a `Many` answer with conflicting members. The query router
+additionally surfaces them in `QUERY_TRACE` debug output for operators diagnosing
+the engine.
 
 ### Resolving contradictions
 
@@ -812,7 +815,7 @@ When confidence is recomputed and the bucket changes, the index entry must be re
 
 The default `STATEMENT_LIST` order is by confidence descending — high-confidence facts surface first. The query router uses confidence as one input to RRF fusion alongside semantic similarity, lexical relevance, and graph proximity.
 
-`min_confidence` filter on `STATEMENT_LIST` and `QUERY` opcodes lets callers gate on a threshold. Default threshold per-deployment, configurable via `brain.query.min_confidence`.
+`min_confidence` filter on `STATEMENT_LIST` (and, for operators, the `QUERY_TRACE` introspection op) lets callers gate on a threshold. Default threshold per-deployment, configurable via `brain.query.min_confidence`.
 
 ### Confidence tests
 
@@ -962,7 +965,7 @@ Evidence to memories in OTHER shards is allowed. The cross-shard reverse-index e
 Brain uses `extractor_id` for:
 
 - **Audit** — "which extractor's output drove this claim?"
-- **Per-extractor governance** — when an extractor is retracted (`EXTRACTOR_DISABLE`), all its evidence remains but downstream consumers see the `extractor_id` and can filter or down-weight.
+- **Provenance filtering** — evidence records the `extractor_id`, so downstream consumers (and future re-extraction / backfill passes) can filter or down-weight a specific extractor's output without losing the underlying evidence.
 - **Confidence calibration** — different extractors have different reliability profiles; future versions weight by extractor.
 
 ### Evidence tests

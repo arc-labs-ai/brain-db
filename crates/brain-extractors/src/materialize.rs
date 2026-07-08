@@ -16,7 +16,9 @@ use brain_core::ExtractorKind;
 use brain_llm::ModelRouter;
 use brain_metadata::tables::extractor::ExtractorDefinition;
 use brain_metadata::LlmCacheDb;
-use brain_protocol::schema::ast::{CacheConfig, CostExpr, CostUnit, DurationAst, DurationUnit};
+use brain_protocol::schema::ast::{
+    CacheConfig, CostExpr, CostUnit, DurationAst, DurationUnit, TriggerExpr,
+};
 use brain_protocol::schema::{ExtractorDef, ExtractorField, ExtractorKindAst, ExtractorTarget};
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -132,6 +134,24 @@ pub fn materialize_classifier_extractor(
 /// registry stays populated; ENCODE stays non-blocking, and a
 /// missing API key does not look like a runtime failure.
 pub fn materialize_llm_extractor(
+    def: &ExtractorDefinition,
+    deps: &MaterializeDeps,
+) -> Result<LlmExtractor, ExtractorError> {
+    let ext = materialize_llm_extractor_core(def, deps)?;
+    // Thread the declared ENCODE-path trigger onto the built extractor so
+    // the worker's LLM tier can honor `on encode where <cond>` (and stay
+    // inert for `on demand` / `periodic` / `on schema_change`). The core
+    // already validated the blob; re-decoding here just to read the
+    // trigger is a once-at-startup cost. Absent trigger → the constructor
+    // default (`OnEncode`, run on every encode) stands.
+    let trigger = decode_definition_blob(&def.definition_blob)
+        .ok()
+        .and_then(|ast| extract_trigger(&ast))
+        .unwrap_or(TriggerExpr::OnEncode);
+    Ok(ext.with_trigger(trigger))
+}
+
+fn materialize_llm_extractor_core(
     def: &ExtractorDefinition,
     deps: &MaterializeDeps,
 ) -> Result<LlmExtractor, ExtractorError> {
@@ -329,11 +349,6 @@ pub fn build_registry_with_gate(
                 },
             )),
         }
-
-        // Respect the persisted `enabled` flag.
-        if !def.is_enabled() {
-            registry.set_enabled(id, false);
-        }
     }
 
     (registry, errors)
@@ -407,6 +422,15 @@ fn extract_response_schema(ast: &ExtractorDef) -> Option<Value> {
     for f in &ast.fields {
         if let ExtractorField::Schema(v) = f {
             return Some(v.clone());
+        }
+    }
+    None
+}
+
+fn extract_trigger(ast: &ExtractorDef) -> Option<TriggerExpr> {
+    for f in &ast.fields {
+        if let ExtractorField::Trigger(t) = f {
+            return Some(t.clone());
         }
     }
     None
@@ -547,7 +571,6 @@ mod tests {
             "brain".into(),
             "test".into(),
             kind,
-            true,
             1,
             blob,
             0,
@@ -733,7 +756,8 @@ mod tests {
         };
         let reg = ExtractorRegistry::new();
         let ctx = ExtractionContext {
-            declared_predicates: None,
+            declared_entity_types: None,
+            candidate_predicates: None,
             declared_kinds: None,
             entity_type_labels: None,
             schema_version: 1,
@@ -785,19 +809,8 @@ mod tests {
         let (reg, errs) = build_registry_from_definitions(&defs, &MaterializeDeps::default());
         assert_eq!(reg.len(), 1);
         assert!(errs.is_empty());
-        // It registers but iter_enabled returns it (enabled by default
-        // from the row's `is_enabled` flag).
+        // It registers and iter_enabled returns it.
         assert_eq!(reg.iter_enabled().count(), 1);
-    }
-
-    #[test]
-    fn build_registry_respects_disabled_flag() {
-        let mut def = row(1, ExtractorKind::Pattern, pattern_def_blob());
-        def.enabled = 0;
-        let defs = vec![def];
-        let (reg, _) = build_registry_from_definitions(&defs, &MaterializeDeps::default());
-        assert_eq!(reg.iter_enabled().count(), 0);
-        assert_eq!(reg.iter_all().count(), 1);
     }
 
     // ----- 21.4 LLM materialization -----------------------------------------
@@ -906,7 +919,8 @@ mod tests {
             occurred_at_unix_nanos: None,
         };
         let ctx = crate::framework::extractor::ExtractionContext {
-            declared_predicates: None,
+            declared_entity_types: None,
+            candidate_predicates: None,
             declared_kinds: None,
             entity_type_labels: None,
             schema_version: 1,

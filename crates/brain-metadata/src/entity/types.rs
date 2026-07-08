@@ -93,6 +93,31 @@ pub fn entity_type_label_qnames(rtxn: &ReadTransaction) -> Result<Vec<String>, E
         .collect())
 }
 
+/// Render the active entity-type labels as an LLM-prompt block — one
+/// `- brain:<Name>` bullet per declared type, stable-sorted so the block
+/// (and any prompt cache keyed on it) is deterministic across cycles.
+/// Substituted into the LLM extractor prompt's `{DECLARED_ENTITY_TYPES}`
+/// placeholder so the extractor's entity-type vocabulary tracks the ACTIVE
+/// schema (system core + user `SCHEMA_UPLOAD`) at runtime instead of a
+/// list baked into the prompt text.
+///
+/// Reuses [`entity_type_label_qnames`] for the label surface (`brain:<Name>`),
+/// then re-sorts lexicographically so the block order is independent of id
+/// allocation order.
+pub fn render_declared_entity_types_block(
+    rtxn: &ReadTransaction,
+) -> Result<String, EntityTypeOpError> {
+    let mut labels = entity_type_label_qnames(rtxn)?;
+    labels.sort();
+    let mut out = String::new();
+    for label in labels {
+        out.push_str("- ");
+        out.push_str(&label);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// Intern an entity_type by name. Idempotent on identical
 /// `schema_blob`; refuses to clobber a pre-existing row with a
 /// diverging blob.
@@ -140,4 +165,56 @@ pub fn entity_type_intern(
         t.insert(&row.entity_type_id, &row)?;
     }
     Ok(EntityTypeId::from(next_id_raw))
+}
+
+#[cfg(all(test, not(miri)))]
+mod tests {
+    use super::*;
+    use crate::tables::fresh_db;
+    use redb::ReadableDatabase;
+
+    const NOW: u64 = 1_700_000_000_000_000_000;
+
+    #[test]
+    fn render_block_lists_labels_sorted_with_brain_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        {
+            let wtxn = db.begin_write().unwrap();
+            // Intern out of lexical order so the sort is exercised.
+            entity_type_intern(&wtxn, "Person", Vec::new(), NOW).unwrap();
+            entity_type_intern(&wtxn, "Drug", Vec::new(), NOW).unwrap();
+            entity_type_intern(&wtxn, "Organization", Vec::new(), NOW).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.begin_read().unwrap();
+        let block = render_declared_entity_types_block(&rtxn).unwrap();
+
+        // Every declared type appears as a `- brain:<Name>` bullet.
+        assert!(block.contains("- brain:Person\n"), "{block}");
+        assert!(block.contains("- brain:Drug\n"), "{block}");
+        assert!(block.contains("- brain:Organization\n"), "{block}");
+
+        // Lexicographic order regardless of id allocation order.
+        let drug = block.find("brain:Drug").unwrap();
+        let org = block.find("brain:Organization").unwrap();
+        let person = block.find("brain:Person").unwrap();
+        assert!(drug < org && org < person, "not sorted: {block}");
+    }
+
+    #[test]
+    fn render_block_empty_when_no_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        // Touch the table so it exists, but intern nothing.
+        {
+            let wtxn = db.begin_write().unwrap();
+            let _ = wtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.begin_read().unwrap();
+        assert!(render_declared_entity_types_block(&rtxn)
+            .unwrap()
+            .is_empty());
+    }
 }

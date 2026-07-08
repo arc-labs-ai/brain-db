@@ -311,7 +311,6 @@ mod tests {
         assert_eq!(row.namespace, "acme");
         assert_eq!(row.name, "person_mentions");
         assert_eq!(row.kind, brain_core::ExtractorKind::Pattern.as_u8());
-        assert!(row.is_enabled());
 
         // `definition_blob` decodes back to the same ExtractorDef AST.
         let decoded: ExtractorDef = serde_json::from_slice(&row.definition_blob).unwrap();

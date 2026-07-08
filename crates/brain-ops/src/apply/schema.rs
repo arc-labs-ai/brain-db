@@ -1,4 +1,4 @@
-//! Apply schema-shaped phases: `UpsertSchema`, `SetExtractorEnabled`.
+//! Apply schema-shaped phases: `UpsertSchema`.
 //!
 //! `UpsertSchema` re-parses the DSL source text the handler stuffed
 //! into `Phase::UpsertSchema.blob`, re-validates it (a cheap
@@ -8,10 +8,7 @@
 //! fans out predicate/relation-type/entity-type/extractor interns, and
 //! re-flags pre-existing statements outside the new vocabulary —
 //! all inside the same wtxn.
-//!
-//! `SetExtractorEnabled` is a one-row flag flip.
 
-use brain_metadata::extractor::ops::extractor_set_enabled;
 use brain_metadata::schema::store::schema_upload;
 use brain_protocol::schema::{parse_schema, validate};
 use redb::WriteTransaction;
@@ -59,77 +56,13 @@ pub fn apply_upsert_schema(
     Ok(PhaseAck::UpsertedSchema { namespace, version })
 }
 
-pub fn apply_set_extractor_enabled(
-    wtxn: &WriteTransaction,
-    phase: &Phase,
-    _write: &Write,
-) -> Result<PhaseAck, ApplyError> {
-    let Phase::SetExtractorEnabled { id, enabled } = phase else {
-        return Err(ApplyError::PhaseMisShape("expected SetExtractorEnabled"));
-    };
-    extractor_set_enabled(wtxn, *id, *enabled)
-        .map_err(|e| ApplyError::Metadata(format!("extractor_set_enabled: {e}")))?;
-    Ok(PhaseAck::ExtractorEnabledSet {
-        id: *id,
-        enabled: *enabled,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_metadata::extractor::ops::extractor_intern;
     use brain_metadata::MetadataDb;
     use tempfile::TempDir;
 
     use crate::write::{Phase, Write, WriteId};
-
-    #[test]
-    fn set_extractor_enabled_round_trips() {
-        let dir = TempDir::new().unwrap();
-        let db = MetadataDb::open(dir.path().join("meta.redb")).unwrap();
-
-        // Seed an extractor row.
-        let id;
-        {
-            let wtxn = db.write_txn().unwrap();
-            id = extractor_intern(
-                &wtxn,
-                "test",
-                "pat",
-                brain_core::ExtractorKind::Pattern,
-                1,
-                Vec::new(),
-                1_700_000_000_000,
-            )
-            .unwrap();
-            wtxn.commit().unwrap();
-        }
-
-        // Disable via the apply function.
-        let phase = Phase::SetExtractorEnabled { id, enabled: false };
-        let write = Write::single(
-            WriteId::new(),
-            brain_core::AgentId::default(),
-            phase.clone(),
-        );
-        {
-            let wtxn = db.write_txn().unwrap();
-            let ack = apply_set_extractor_enabled(&wtxn, &phase, &write).unwrap();
-            assert!(matches!(
-                ack,
-                PhaseAck::ExtractorEnabledSet { enabled: false, .. }
-            ));
-            wtxn.commit().unwrap();
-        }
-
-        // Confirm: row.enabled is a u8 byte (0 disabled, 1 enabled).
-        let rtxn = db.read_txn().unwrap();
-        let row = brain_metadata::extractor::ops::extractor_get(&rtxn, id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.enabled, 0);
-    }
 
     #[test]
     fn upsert_schema_round_trips_and_increments_version() {

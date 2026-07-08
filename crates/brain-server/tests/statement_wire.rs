@@ -339,7 +339,10 @@ async fn create_attribute_auto_supersedes() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn create_event_requires_event_at() {
+async fn create_event_allows_missing_event_at() {
+    // A dateless Event (wire `event_at = 0` → None) now persists as an Event
+    // rather than being rejected: a same-day/undated action still IS an event, and
+    // the read answers "when" from the evidence memory's own occurred_at.
     let server = start(1).await;
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
@@ -347,20 +350,20 @@ async fn create_event_requires_event_at() {
     complete_handshake(&mut client, &server.token).await;
 
     let priya = make_entity(&mut client, 1, "Priya").await;
-    let mut req = event_request(priya, 0); // event_at = 0 → invalid
+    let mut req = event_request(priya, 0); // event_at = 0 → None (undated)
     req.event_at_unix_nanos = 0;
 
     let (op, body) = round_trip(&mut client, 3, RequestBody::StatementCreate(req)).await;
-    assert_eq!(op, Opcode::Error.as_u16(), "missing event_at → ERROR");
+    assert_eq!(
+        op,
+        Opcode::StatementCreateResp.as_u16(),
+        "dateless Event should persist, not error"
+    );
     match body {
-        ResponseBody::Error(e) => {
-            assert!(
-                e.message.to_lowercase().contains("event"),
-                "error mentions event: {:?}",
-                e.message
-            );
+        ResponseBody::StatementCreate(r) => {
+            assert_ne!(r.statement_id, [0u8; 16], "created statement has an id");
         }
-        other => panic!("{other:?}"),
+        other => panic!("expected StatementCreateResp, got {other:?}"),
     }
 
     server.stop().await;

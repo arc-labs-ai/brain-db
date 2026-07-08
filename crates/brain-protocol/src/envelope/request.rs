@@ -139,16 +139,12 @@ pub enum RequestBody {
     SchemaValidate(SchemaValidateRequest),
     SchemaReplace(SchemaReplaceRequest),
 
-    // Extractor governance ops.
+    // Extractor introspection (read-only).
     ExtractorList(ExtractorListRequest),
-    ExtractorDisable(ExtractorDisableRequest),
-    ExtractorEnable(ExtractorEnableRequest),
 
     // Retrieval query ops.
-    Query(QueryRequest),
     QueryExplain(QueryExplainRequest),
     QueryTrace(QueryTraceRequest),
-    QueryText(QueryTextRequest),
 
     // Procedural-memory materialization. Reads an agent's stored
     // `brain:behavior_*` Preferences and renders a system block for
@@ -223,12 +219,8 @@ impl RequestBody {
             Self::SchemaValidate(_) => Opcode::SchemaValidateReq,
             Self::SchemaReplace(_) => Opcode::SchemaReplaceReq,
             Self::ExtractorList(_) => Opcode::ExtractorListReq,
-            Self::ExtractorDisable(_) => Opcode::ExtractorDisableReq,
-            Self::ExtractorEnable(_) => Opcode::ExtractorEnableReq,
-            Self::Query(_) => Opcode::QueryReq,
             Self::QueryExplain(_) => Opcode::QueryExplainReq,
             Self::QueryTrace(_) => Opcode::QueryTraceReq,
-            Self::QueryText(_) => Opcode::QueryTextReq,
             Self::MaterializeProcedural(_) => Opcode::MaterializeProceduralReq,
         }
     }
@@ -305,12 +297,8 @@ impl RequestBody {
             Self::SchemaValidate(r) => to_cbor_bytes(r),
             Self::SchemaReplace(r) => to_cbor_bytes(r),
             Self::ExtractorList(r) => to_cbor_bytes(r),
-            Self::ExtractorDisable(r) => to_cbor_bytes(r),
-            Self::ExtractorEnable(r) => to_cbor_bytes(r),
-            Self::Query(r) => to_cbor_bytes(r),
             Self::QueryExplain(r) => to_cbor_bytes(r),
             Self::QueryTrace(r) => to_cbor_bytes(r),
-            Self::QueryText(r) => to_cbor_bytes(r),
             Self::MaterializeProcedural(r) => to_cbor_bytes(r),
         }
     }
@@ -392,12 +380,8 @@ impl RequestBody {
             Opcode::SchemaValidateReq => Self::SchemaValidate(from_cbor_bytes(bytes)?),
             Opcode::SchemaReplaceReq => Self::SchemaReplace(from_cbor_bytes(bytes)?),
             Opcode::ExtractorListReq => Self::ExtractorList(from_cbor_bytes(bytes)?),
-            Opcode::ExtractorDisableReq => Self::ExtractorDisable(from_cbor_bytes(bytes)?),
-            Opcode::ExtractorEnableReq => Self::ExtractorEnable(from_cbor_bytes(bytes)?),
-            Opcode::QueryReq => Self::Query(from_cbor_bytes(bytes)?),
             Opcode::QueryExplainReq => Self::QueryExplain(from_cbor_bytes(bytes)?),
             Opcode::QueryTraceReq => Self::QueryTrace(from_cbor_bytes(bytes)?),
-            Opcode::QueryTextReq => Self::QueryText(from_cbor_bytes(bytes)?),
             Opcode::MaterializeProceduralReq => {
                 Self::MaterializeProcedural(from_cbor_bytes(bytes)?)
             }
@@ -487,30 +471,6 @@ mod tests {
             include_text: true,
             request_id: Some(sample_uuid(7)),
             txn_id: None,
-            agent_filter: Vec::new(),
-            include_other_agents: false,
-        }));
-    }
-
-    #[test]
-    fn recall_round_trips_with_agent_scope() {
-        round_trip(RequestBody::Recall(RecallRequest {
-            cue_text: "cross-agent budgets".into(),
-            subject_name: String::new(),
-            max_results: 10,
-            confidence_threshold: 0.3,
-            context_filter: None,
-            age_bound_unix_nanos: None,
-            as_of_record_time_unix_nanos: None,
-            kind_filter: None,
-            salience_floor: 0.0,
-            include_edges: false,
-            include_graph: false,
-            include_text: false,
-            request_id: Some(sample_uuid(7)),
-            txn_id: None,
-            agent_filter: vec![sample_uuid(11), sample_uuid(22)],
-            include_other_agents: true,
         }));
     }
 

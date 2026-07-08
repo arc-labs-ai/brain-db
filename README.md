@@ -33,9 +33,9 @@ RECALL  "conflicts with Alex"  top_k=5
   #   — not just vector distance.
 
 # RECALL always fuses semantic + lexical + entity-graph via RRF — one
-# read path. A declared schema adds entity-anchored graph traversal and
-# typed enrichment on each hit.
-RECALL  "what's Priya working on?"  include_graph=true
+# read path. The typed graph is always live; declaring your own entity
+# and relation types extends entity-anchored traversal to your vocabulary.
+RECALL  "what's Priya working on?"
 ```
 
 ---
@@ -44,7 +44,7 @@ RECALL  "what's Priya working on?"  include_graph=true
 
 - [Why Brain](#why-brain)
 - [What Brain stores](#what-brain-stores)
-- [Schemaless vs schema-declared](#schemaless-vs-schema-declared)
+- [Schema is always on](#schema-is-always-on)
 - [Quickstart](#quickstart)
 - [Cognitive operations](#cognitive-operations)
 - [Architecture in 30 seconds](#architecture-in-30-seconds)
@@ -87,22 +87,24 @@ Four record types, one database:
 | **Statement** | Typed claim about entities — `Fact` / `Preference` / `Event` — with confidence and bi-temporal validity | `Event(subject=alex, predicate=pushed, object="deadline to Friday", valid_from=t0, confidence=0.92)` |
 | **Relation** | Typed binary edge between entities, with cardinality and evidence | `reports_to(alex, priya)` |
 
-Entities, Statements, and Relations are derived from Memories by a three-tier extractor pipeline (pattern → GLiNER classifier → LLM with prompt cache) when a schema is declared.
+Entities, Statements, and Relations are derived from Memories by a three-tier extractor pipeline (pattern → GLiNER classifier → LLM with prompt cache). The pipeline runs on every shard; a candidate persists only if its type is declared in an active schema. The seeded `brain:` system schema is always present, and declaring your own types (below) widens what gets admitted.
 
 The full data model is in [`spec/02_data_model/`](spec/02_data_model/00_purpose.md).
 
 ---
 
-## Schemaless vs schema-declared
+## Schema is always on
 
-The same Brain binary serves both modes; the runtime gate is whether the per-shard `SCHEMA_ACTIVE_VERSIONS_TABLE` is empty.
+Schema is not a mode you switch into — it is active from byte zero. Every shard seeds the reserved `brain:` system namespace, so the full pipeline (typed extraction, entity/statement/relation writes, entity-anchored retrieval) runs on every deployment. There is no memory-only mode to opt out of and no runtime gate that turns the typed graph on.
 
-| Mode | What's active | Use it when |
+What a schema controls is **admission**, not activation. A write — explicit or extractor-driven — persists a typed row only if its entity type, predicate, or relation type is declared in some active schema; the seeded system namespace is always one of them. Declaring your **own** types is optional and purely additive: `SCHEMA_UPLOAD` merges your declarations into the active set, widening what gets admitted and enabling typed queries over your vocabulary. It never gates any retrieval, extraction, or index path.
+
+| Posture | What persists | Use it when |
 |---|---|---|
-| **Schemaless** (default) | Memory record only. `ENCODE`, `RECALL`, `PLAN`, `REASON`, `FORGET`, `SUBSCRIBE`, `TXN_*` over vector memory. | Prototyping; semantic memory without typed-graph overhead; small agents. |
-| **Schema-declared** | All of the above + typed extraction + entity/statement/relation writes + entity-anchored retrieval over the typed graph. | Production agents that need provenance, temporal reasoning, supersession, or entity-anchored queries. |
+| **System schema only** (default) | Extraction runs, but only candidates matching the seeded `brain:` types are admitted; everything is recallable as memory + whatever the system types cover. | Prototyping; semantic memory without a domain vocabulary; small agents. |
+| **Your types declared** | All of the above + your entity/statement/relation types admitted, so extraction persists domain rows and entity-anchored queries range over your graph. | Production agents that need provenance, temporal reasoning, supersession, or entity-anchored queries over your own vocabulary. |
 
-A deployment can move in either direction. Declaring a schema after months of schemaless use kicks off a backfill. Schema is not a legacy or minimal mode — both postures are first-class.
+You can declare types at any time; a declaration after months of use kicks off a backfill over already-stored memories. Declaring your own vocabulary is first-class, not a heavier "mode."
 
 The DSL is documented in [`spec/03_schema/`](spec/03_schema/00_purpose.md). Example:
 
@@ -155,11 +157,14 @@ Inside the container:
 
 ```bash
 just verify                                            # fmt + build + clippy + nextest + doctests
+export BRAIN__LLM__API_KEY=sk-...                      # REQUIRED — Brain refuses to boot without an LLM key
 cargo run --bin brain-server -- --config config/dev.toml   # the database
 curl -s http://127.0.0.1:9091/healthz                  # liveness (public)
 curl -s http://127.0.0.1:9091/readyz                   # readiness — 200 when all shards serve, 503 otherwise
 curl -s http://127.0.0.1:9092/v1/stats                 # admin via curl (loopback)
 ```
+
+**An LLM provider key is mandatory.** Write-time HyPE (hypothetical-question generation) is always-on and the write path (entity / statement / relation extraction) is built on it — there is no substrate-only mode. The server hard-fails at startup if `[llm] api_key` is empty; set `BRAIN__LLM__API_KEY` and point `[llm] model` at a provider you hold a key for. This is independent of the `[extractors.llm] enabled` tier flag: disabling that tier skips LLM-based extraction but does not remove the boot requirement.
 
 Tests run under [`cargo-nextest`](https://nexte.st) (`just test`); doctests stay on `cargo test --doc`. Some tests are `#[ignore]`-gated (need a real model, a live API key, or are long/perf gates) — run them with `cargo nextest run --run-ignored all`.
 
@@ -167,9 +172,9 @@ One binary:
 
 - **`brain-server`** — the database. Binary wire protocol on the data port; a loopback HTTP admin listener (stats, snapshots, audit, worker control) reachable with `curl`. Brain ships no client/SDK/CLI — speak the wire protocol from any language; a `brainctl` migration tool is future work.
 
-A persistent agent identity is opt-in; a client supplies its `agent_id` at handshake, and by default the server mints an ephemeral one per connection if none is given.
+Authentication is mandatory. A connection presents an API key at handshake; the server resolves it to a `(namespace, agent, permissions)` scope from the key's own record. Identity is never client-claimed — the `agent_id` a request operates under comes entirely from the authenticated key, not from a field the client sets.
 
-**Memory is isolated per agent.** `RECALL` returns only the calling agent's own memories by default — one tenant never sees another's. Cross-agent reads are explicit: a request scopes to a named agent set, or opts into the shared view. Each hit carries its owning `agent_id` so provenance is always legible.
+**Memory is strictly isolated per agent.** `RECALL` returns only the calling agent's own memories — there is no wire field, flag, or shared view that widens a read to another agent. One tenant can never see another's data. Each hit still carries its owning `agent_id` so provenance stays legible.
 
 ---
 
@@ -244,7 +249,7 @@ Encoding the same content twice is a no-op by default — pass `--allow-duplicat
                                     ▼
                     BACKGROUND WORKERS (per-shard, dedicated cores)
                     decay · consolidation · HNSW maintenance · GC
-                    schema-declared: extractors · text indexer · sweepers
+                    extractors · text indexer · sweepers (always on)
 ```
 
 **Two runtimes, one host.** Connection layer on Tokio (many tasks, accept TCP, decode 32-byte frame, dispatch). Shard layer on Glommio (thread-per-core, `io_uring`, single writer per shard). The two communicate via channels carrying messages — per-shard data never crosses the boundary.
@@ -285,8 +290,8 @@ Hard targets from [`spec/01_architecture/05_hardware_and_targets.md`](spec/01_ar
 | `ENCODE` (text, CPU embedding) | ≤ 12 ms | ≤ 25 ms |
 | `ENCODE` (text, GPU embedding) | ≤ 3 ms | ≤ 8 ms |
 | `ENCODE_VECTOR_DIRECT` (pre-supplied vector) | ≤ 1 ms | ≤ 5 ms |
-| `RECALL` (top-k = 10, schemaless) | ≤ 8 ms | ≤ 20 ms |
-| `RECALL` (top-k = 10, schema-declared, +graph) | ≤ 10 ms | ≤ 50 ms |
+| `RECALL` (top-k = 10, no text payload) | ≤ 5 ms | ≤ 20 ms |
+| `RECALL` (top-k = 10, with text payload) | ≤ 7 ms | ≤ 30 ms |
 | `FORGET` | ≤ 3 ms | ≤ 10 ms |
 | `PLAN` (simple) | ≤ 50 ms | ≤ 200 ms |
 | `REASON` | ≤ 100 ms | ≤ 500 ms |
@@ -299,7 +304,7 @@ Brain optimizes for predictable tails, not minimum averages. The combined accept
 
 **Pre-release (v0.1.0).** No external users. The wire protocol, redb tables, and schema model are still in flux. Until v1.0 ships, breaking changes happen in place without back-compat shims.
 
-The v1.0 release ships when the combined acceptance suite passes — functional, performance, storage, operational, and schemaless mode tests, end-to-end.
+The v1.0 release ships when the combined acceptance suite passes — functional, performance, storage, operational, and durability tests, end-to-end.
 
 The per-phase landing record is in the git history (`git log --oneline`); what's still outstanding is tracked below, flat and unversioned, in [Future scope](#future-scope).
 

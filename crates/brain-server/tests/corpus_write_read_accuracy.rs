@@ -279,8 +279,6 @@ async fn recall(client: &mut TcpStream, stream_id: u32, cue: &str) -> RecallResp
         txn_id: None,
         // Empty + include_other_agents=false ⇒ server scopes to the
         // calling connection's agent (the [7;16] write agent).
-        agent_filter: Vec::new(),
-        include_other_agents: false,
     };
     send_frame(
         client,
