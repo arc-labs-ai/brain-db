@@ -198,6 +198,18 @@
     "payload_len": 47
   },
   {
+    "name": "req_extractor_list",
+    "opcode": "0x0124",
+    "kind": "request",
+    "payload_len": 1
+  },
+  {
+    "name": "resp_extractor_list",
+    "opcode": "0x01A4",
+    "kind": "response",
+    "payload_len": 124
+  },
+  {
     "name": "resp_get_capabilities",
     "opcode": "0x00B2",
     "kind": "response",

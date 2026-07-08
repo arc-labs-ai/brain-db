@@ -46,6 +46,7 @@ use brain_protocol::{
     AnswerKindWire, EdgeKindWire, EncodeRequest, EncodeResponse, EncodeVectorDirectRequest,
     EntityCreateRequest, EntityCreateResponse, EntityGetResponse, EntityListItem,
     EntityListResponseFrame, EntityResolveResponse, EntityView, EventType, EvidenceRefWire,
+    ExtractorListItem, ExtractorListRequest, ExtractorListResponseFrame,
     ForgetMode, ForgetRequest, ForgetResponse, Frame, InferenceKind, InferenceStep, LinkResponse,
     MaterializeProceduralRequest, MaterializeProceduralResponse, MemoryKindWire, Opcode,
     PlanResponseFrame, PlanStatus, PlanStep, PongResponse, ReasonResponseFrame, ReasonStatus,
@@ -512,6 +513,21 @@ fn sample_get_capabilities() -> GetCapabilitiesResponse {
     }
 }
 
+fn sample_extractor_list() -> ExtractorListResponseFrame {
+    ExtractorListResponseFrame {
+        items: vec![ExtractorListItem {
+            extractor_id: 7,
+            namespace: "org".into(),
+            name: "org.default".into(),
+            kind: 2,
+            schema_version: 1,
+            created_at_unix_nanos: 1_700_000_000_000_000_000,
+        }],
+        total: 1,
+        is_final: true,
+    }
+}
+
 fn sample_subscribe_event() -> SubscriptionEvent {
     SubscriptionEvent {
         event_type: EventType::Encoded,
@@ -822,6 +838,19 @@ fn corpus() -> Vec<Case> {
         &txn_abort_resp,
     ));
 
+    // ---- Extractor introspection ----
+    let extractor_list_req = ExtractorListRequest {};
+    cases.push(req_case(
+        "req_extractor_list",
+        RequestBody::ExtractorList(extractor_list_req),
+        &extractor_list_req,
+    ));
+    cases.push(resp_case(
+        "resp_extractor_list",
+        ResponseBody::ExtractorList(sample_extractor_list()),
+        &sample_extractor_list(),
+    ));
+
     // ---- Capabilities + subscription event ----
     cases.push(resp_case(
         "resp_get_capabilities",
@@ -1034,6 +1063,8 @@ fn required_families() -> Vec<(&'static str, Opcode)> {
         ("txn.commit_resp", Opcode::TxnCommitResp),
         ("txn.abort_resp", Opcode::TxnAbortResp),
         ("capabilities.get_resp", Opcode::GetCapabilitiesResp),
+        ("extractor.list_req", Opcode::ExtractorListReq),
+        ("extractor.list_resp", Opcode::ExtractorListResp),
         ("subscribe.event", Opcode::SubscribeEvent),
         ("keepalive.pong", Opcode::Pong),
         ("keepalive.server_ping", Opcode::ServerPing),
