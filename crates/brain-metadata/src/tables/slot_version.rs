@@ -58,6 +58,42 @@ pub enum SlotVersionError {
     Exhausted { slot_id: u64 },
 }
 
+/// Highest arena slot index ever assigned on this shard: the maximum over
+/// present memory rows AND the recycled-slot version records (a reclaimed
+/// slot's memory row is gone but its version row remains). Fresh slots have
+/// no version row, so `MEMORIES_TABLE` is the source for those; reclaimed
+/// slots have no memory row, so `SLOT_VERSIONS_TABLE` is the source for those.
+///
+/// The writer's in-process slot counter resets to 1 on every boot, so a
+/// restart on a non-empty data dir would otherwise re-issue live slots —
+/// colliding `memory_id`s (silently overwriting rows AND tripping the
+/// extractor's `has_extracted` gate so new writes never extract). Boot seeds
+/// the counter to `max_assigned_slot + 1` so slots stay monotonic across
+/// restarts.
+pub fn max_assigned_slot(
+    rtxn: &redb::ReadTransaction,
+) -> Result<u64, SlotVersionError> {
+    use crate::tables::memory::MEMORIES_TABLE;
+    use redb::ReadableTable;
+
+    let mut hi = 0u64;
+    // Present memories: keyed by `memory_id` big-endian, so the last key holds
+    // the greatest `(shard, slot, version)`; its slot is the max present slot.
+    // (Each shard's redb only holds its own shard's rows.)
+    if let Ok(mem) = rtxn.open_table(MEMORIES_TABLE) {
+        if let Some((k, _)) = mem.last()? {
+            hi = hi.max(brain_core::MemoryId::from_be_bytes(k.value()).slot());
+        }
+    }
+    // Recycled slots: `slot_id` is the key directly.
+    if let Ok(sv) = rtxn.open_table(SLOT_VERSIONS_TABLE) {
+        if let Some((k, _)) = sv.last()? {
+            hi = hi.max(k.value());
+        }
+    }
+    Ok(hi)
+}
+
 /// Atomic read-modify-write of `slot_versions[slot_id]`. Returns the
 /// new version.
 ///
@@ -88,6 +124,60 @@ mod tests {
 
     fn fresh_db(dir: &tempfile::TempDir) -> Database {
         Database::create(dir.path().join("test.redb")).expect("create redb")
+    }
+
+    #[test]
+    fn max_assigned_slot_covers_memories_and_recycled_slots() {
+        use crate::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
+        use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, NamespaceId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+
+        // Empty shard → high-water 0 (writer will seed to 1).
+        {
+            let rtxn = db.begin_read().unwrap();
+            assert_eq!(max_assigned_slot(&rtxn).unwrap(), 0);
+        }
+
+        let mem = |slot: u64| {
+            MemoryMetadata::new_active(
+                MemoryId::pack(0, slot, 1),
+                NamespaceId::SYSTEM,
+                AgentId::from([0u8; 16]),
+                ContextId(0),
+                slot,
+                1,
+                MemoryKind::Episodic,
+                [0u8; 16],
+                0.5,
+                1,
+                1_700_000_000_000,
+            )
+        };
+
+        let wtxn = db.begin_write().unwrap();
+        {
+            let mut mt = wtxn.open_table(MEMORIES_TABLE).unwrap();
+            for slot in [1u64, 7, 42] {
+                let m = mem(slot);
+                let key = m.memory_id_bytes;
+                mt.insert(&key, m).unwrap();
+            }
+            // A reclaimed slot 100: its memory row is gone but the version
+            // record survives, so it must still count toward the high-water.
+            let mut sv = wtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
+            sv.insert(&100u64, &3u32).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        assert_eq!(
+            max_assigned_slot(&rtxn).unwrap(),
+            100,
+            "high-water must be the max over present memories (42) AND recycled \
+             slot records (100)",
+        );
     }
 
     #[test]

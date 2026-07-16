@@ -225,6 +225,34 @@ mod linux_main {
             }
         };
 
+        // Cheap boot-time LLM credential probe. An LLM is mandatory (HyPE +
+        // extraction are always-on), and an EMPTY key is already rejected at
+        // config validation — but a present-but-invalid key used to boot fine
+        // and then silently extract nothing. One 1-token completion catches a
+        // rejected key here and refuses to start; a transient/network failure
+        // only warns so a correctly-configured deploy isn't bricked by a
+        // provider hiccup.
+        {
+            use crate::shard::llm_setup::{preflight_llm_auth, LlmPreflight};
+            let llm_cfg = crate::shard::LlmSpawnConfig {
+                api_key: cfg.llm.api_key.clone(),
+                model: cfg.llm.model.clone(),
+            };
+            match preflight_llm_auth(&llm_cfg) {
+                LlmPreflight::Ok => {
+                    tracing::info!("LLM provider credential verified (boot preflight)");
+                }
+                LlmPreflight::Skipped => {}
+                LlmPreflight::Inconclusive(msg) => {
+                    tracing::warn!(detail = %msg, "LLM credential preflight inconclusive; proceeding");
+                }
+                LlmPreflight::InvalidKey(msg) => {
+                    tracing::error!(detail = %msg, "LLM credential rejected — refusing to start");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+
         // Spawn one Glommio shard per `cfg.storage.shard_count`,
         // then build a `Topology` (shards + `RoutingTable` + `ServerCapabilities`)
         // and feed it into the `ConnectionListener`.

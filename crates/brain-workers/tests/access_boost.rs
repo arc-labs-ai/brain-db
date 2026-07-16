@@ -343,6 +343,8 @@ fn recall_fills_buffer_then_boost_worker_applies() {
             request_id: rid,
             txn_id: None,
             occurred_at_unix_nanos: None,
+            act_as: None,
+            trace: false,
         };
         let _ = dispatch(
             RequestBody::Encode(encode_req([1; 16], "alpha")),
@@ -374,6 +376,7 @@ fn recall_fills_buffer_then_boost_worker_applies() {
 
         // RECALL fills the buffer.
         let recall = RecallRequest {
+            trace: false,
             cue_text: "alpha".into(),
             subject_name: String::new(),
             max_results: 5,
@@ -388,6 +391,7 @@ fn recall_fills_buffer_then_boost_worker_applies() {
             include_text: false,
             request_id: None,
             txn_id: None,
+            act_as: None,
         };
         let outcome = dispatch(
             RequestBody::Recall(recall),

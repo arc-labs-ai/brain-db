@@ -119,6 +119,9 @@ pub use tables::extractor_audit::{
     ExtractorItemCounts, ExtractorPipelineAuditEntry, ExtractorPipelineAuditError,
     EXTRACTOR_PIPELINE_AUDIT_TABLE,
 };
+pub use tables::memory::{
+    memory_timeline_page, MemoryListError, MemoryTimelineFilter, MemoryTimelinePage,
+};
 pub use tables::schema_version::{
     SchemaVersionRow, SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE, VALIDATOR_VERSION,
 };

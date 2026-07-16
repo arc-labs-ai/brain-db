@@ -121,6 +121,7 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
             weight: 1.0,
             request_id,
             txn_id: None,
+            act_as: None,
         };
         let _ = dispatch(
             RequestBody::Link(req),
@@ -151,6 +152,7 @@ fn plan_request(start: MemoryId, goal: MemoryId, max_depth: u32) -> PlanRequest 
         context_filter: None,
         request_id: None,
         txn_id: None,
+        act_as: None,
     }
 }
 

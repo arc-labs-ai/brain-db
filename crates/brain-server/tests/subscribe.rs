@@ -96,6 +96,7 @@ impl Server {
                 "test".to_string(),
                 agent_id,
                 brain_metadata::api_keys::bits::FULL,
+                Vec::new(),
                 now,
             )
             .expect("mint test key")
@@ -277,6 +278,8 @@ fn encode_request(text: &str, _kind: MemoryKindWire) -> EncodeRequest {
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     }
 }
 

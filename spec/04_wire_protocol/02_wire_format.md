@@ -335,6 +335,8 @@ Senders MUST use a **reproducible deterministic** encoding: definite-length item
 
 The CBOR data model is stable (RFC 8949 obsoletes RFC 7049 without breaking the core encoding). The wire-protocol version field (§3.2) covers the *schema* of each payload — which fields exist for each opcode — not the CBOR encoding itself. Adding or changing a field in an opcode's schema bumps the wire version.
 
+**Pre-release exception (v0.1.0).** Brain is pre-release with no published wire and no external clients, so schema changes are made **in place** without a version bump or back-compat shim. The optional `act_as` field on the data-plane op schemas (`ENCODE_REQ` / `RECALL_REQ` / `FORGET_REQ`; see [`04_handshake.md`](04_handshake.md) §10a) and the `can_act_as` permission were added this way — the wire version stays **`1`**. Once v1.0 ships, the bump-on-schema-change rule above applies to every subsequent change.
+
 #### 11.4 Validation
 
 Receivers MUST validate every payload before acting on it: the CBOR MUST be well-formed (RFC 8949 §5.3.1), MUST decode to the map shape the opcode's schema specifies, and MUST NOT carry unknown keys. A payload that fails any of these is a protocol error (`MalformedPayload`), not garbage to be best-effort-parsed. The validation cost is small and is paid on every frame.

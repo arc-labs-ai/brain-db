@@ -234,6 +234,78 @@ fn build_client(llm_cfg: &LlmSpawnConfig) -> Option<(Arc<dyn LlmClient>, String)
     Some((bridge(client), model))
 }
 
+/// Outcome of the boot-time LLM credential probe.
+pub enum LlmPreflight {
+    /// No key configured. (The empty-key case is already a hard error at
+    /// config validation; this arm just means "nothing to probe".)
+    Skipped,
+    /// The provider accepted the credential — extraction/HyPE will work.
+    Ok,
+    /// The provider REJECTED the credential (401/403). The server must not
+    /// start: every write would silently produce no statements/relations
+    /// and no HyPE, leaving the graph empty and reads incoherent.
+    InvalidKey(String),
+    /// The probe could not complete for a non-auth reason (network down,
+    /// timeout, rate limit, provider 5xx). Not necessarily a bad key, so
+    /// the server proceeds with a warning rather than bricking a correctly
+    /// configured deploy over a transient provider hiccup.
+    Inconclusive(String),
+}
+
+/// Cheap boot-time check that the configured LLM credential actually works:
+/// one 1-token completion against the provider (≈free, ~sub-second). A
+/// definitively-rejected key stops the server before it ingests memories
+/// with silently-empty extraction; a transient failure only warns.
+///
+/// Runs on a throwaway current-thread Tokio runtime with the RAW provider
+/// client (not the Glommio bridge, which expects a shard executor).
+pub fn preflight_llm_auth(llm_cfg: &LlmSpawnConfig) -> LlmPreflight {
+    let Some(key) = llm_cfg.api_key.clone().filter(|s| !s.is_empty()) else {
+        return LlmPreflight::Skipped;
+    };
+    let model = ai_model(llm_cfg);
+    let client: Arc<dyn LlmClient> = match provider_for_model(&model) {
+        Provider::Anthropic => match AnthropicClient::with_key(model.clone(), key) {
+            Some(c) => Arc::new(c),
+            None => return LlmPreflight::Inconclusive("could not build Anthropic client".into()),
+        },
+        Provider::OpenAI => match OpenAIClient::with_key(model.clone(), key) {
+            Some(c) => Arc::new(c),
+            None => return LlmPreflight::Inconclusive("could not build OpenAI client".into()),
+        },
+    };
+
+    let mut req = LlmRequest::new(model.clone(), "ping");
+    req.max_tokens = 1;
+    req.timeout = std::time::Duration::from_secs(10);
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => return LlmPreflight::Inconclusive(format!("could not build probe runtime: {e}")),
+    };
+    match rt.block_on(client.complete(req)) {
+        Ok(_) => LlmPreflight::Ok,
+        Err(LlmError::Auth { provider }) => LlmPreflight::InvalidKey(format!(
+            "provider `{provider}` rejected the [llm] api_key (model={model}): the key is \
+             missing, invalid, expired, or revoked. Extraction and write-time HyPE would \
+             silently produce nothing. Set a valid BRAIN__LLM__API_KEY (or [llm] api_key) \
+             for model `{model}` and restart."
+        )),
+        Err(LlmError::ProviderError { status, message }) if status == 401 || status == 403 => {
+            LlmPreflight::InvalidKey(format!(
+                "provider returned {status} for the [llm] api_key (model={model}): {message}. \
+                 Fix BRAIN__LLM__API_KEY and restart."
+            ))
+        }
+        Err(other) => {
+            LlmPreflight::Inconclusive(format!("preflight call failed (model={model}): {other}"))
+        }
+    }
+}
+
 /// Pick the primary client for single-call surfaces (today: the
 /// partial-match disambiguator).
 ///

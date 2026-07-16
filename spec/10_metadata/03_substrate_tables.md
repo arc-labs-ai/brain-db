@@ -674,6 +674,12 @@ fn handle_encode(request: EncodeRequest) -> EncodeResponse {
 
 The lookup is in a read transaction (cheap, MVCC). The act is in a write transaction (atomic with the rest of the encode).
 
+### 3a. Key scoping under `act_as`
+
+The lookup above shows a bare-`RequestId` key, which is correct **only** because a connection's identity is fixed for its whole life. When a request carries the `act_as` field — a trusted service principal running the op on behalf of a tenant agent, defined in [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §"Per-request identity (`act_as`)" — that assumption no longer holds: one service principal issues ops for many effective identities over one shared connection.
+
+Therefore, under `act_as`, the idempotency key MUST be scoped by the **effective** `(namespace_id, agent_id)` named in `act_as`, not by the connection principal — the key is the composite `(namespace_id, agent_id, RequestId)`, and shard routing likewise keys on the effective agent (see §12). Consistent with [`../05_operations/02_write_pipeline.md`](../05_operations/02_write_pipeline.md) §4. This is a load-bearing safety rule: with a bare-RequestId key, a service principal that reuses a RequestId across two tenants would **collide**, replaying tenant A's cached response to tenant B — a cross-tenant data leak, invisible because the pool and the idempotency table are shared. Scoping the key by the effective identity makes the collision impossible; the two tenants land on disjoint keys.
+
 ### 4. The replay safety
 
 When replaying, Brain returns the original response — same MemoryId, same metadata. The client gets exactly what it would have gotten on the original successful response.

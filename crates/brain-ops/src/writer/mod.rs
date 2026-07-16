@@ -292,6 +292,16 @@ impl RealWriterHandle {
         }
     }
 
+    /// Seed the in-process slot counter from the persisted high-water mark at
+    /// boot. The counter resets to `1` in [`Self::new`], so without this a
+    /// restart on a non-empty shard re-issues live arena slots — colliding
+    /// `memory_id`s (silently overwriting rows AND tripping the extractor's
+    /// `has_extracted` gate so new writes never extract). `fetch_max` keeps
+    /// the counter monotonic: it only ever moves forward, never below `1`.
+    pub fn seed_next_slot(&self, next_slot: u64) {
+        self.next_slot.fetch_max(next_slot.max(1), Ordering::Relaxed);
+    }
+
     /// Accessor for the writer-level metric family. Production wires
     /// the shared `Arc<WriterMetrics>` from this getter into the
     /// `/metrics` exposition layer; tests use it to assert hot-path

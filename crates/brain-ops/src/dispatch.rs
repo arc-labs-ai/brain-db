@@ -305,6 +305,13 @@ pub async fn dispatch(
             .await
             .map(|b| single(ResponseBody::Unlink(b))),
 
+        RequestBody::MemoryList(r) => crate::handlers::memory_list::handle_memory_list(r, ctx)
+            .await
+            .map(|b| single(ResponseBody::MemoryList(b))),
+
+        RequestBody::GraphFetch(r) => crate::handlers::graph_fetch::handle_graph_fetch(r, ctx)
+            .map(|b| single(ResponseBody::GraphFetch(b))),
+
         // -----------------------------------------------------------
         // Streaming. First-event shape only; subsequent
         // events ride a broadcast channel.
@@ -605,6 +612,9 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
         // Edge mutation.
         RequestBody::Link(_) | RequestBody::Unlink(_) => (perm_bits::LINK, "LINK"),
 
+        // Enumeration read — same capability as RECALL.
+        RequestBody::MemoryList(_) => (perm_bits::RECALL, "MEMORY_LIST"),
+
         // Streaming reads.
         RequestBody::Subscribe(_) | RequestBody::Unsubscribe(_) | RequestBody::CancelStream(_) => {
             (perm_bits::RECALL, "SUBSCRIBE")
@@ -657,6 +667,7 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
         | RequestBody::RelationTraverse(_)
         | RequestBody::QueryExplain(_)
         | RequestBody::QueryTrace(_)
+        | RequestBody::GraphFetch(_)
         | RequestBody::MaterializeProcedural(_) => (perm_bits::RECALL, "GRAPH_READ"),
 
         // Extractor introspection — admin-only.
@@ -759,6 +770,8 @@ mod tests {
             request_id: [0u8; 16],
             txn_id: None,
             occurred_at_unix_nanos: None,
+            act_as: None,
+            trace: false,
         })
     }
 

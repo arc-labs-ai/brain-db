@@ -162,6 +162,7 @@ mod tests {
             context_filter: None,
             request_id: None,
             txn_id: None,
+            act_as: None,
         }
     }
 

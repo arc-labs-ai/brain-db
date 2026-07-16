@@ -168,7 +168,8 @@ pub async fn handle_statement_create(
     // apply function runs (optional) predicate intern + statement_create
     // + (optional) IMPLICIT_PREDICATE flag stamp in one wtxn.
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
     let request_hash = hash_statement_create_request(&req);
 
     let statement_value = build_statement_from_create(&req, predicate_id, now, kind)?;
@@ -399,7 +400,8 @@ pub async fn handle_statement_supersede(
     let new_statement = build_statement_from_create(&req.new_statement, predicate_id, now, kind)?;
 
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
     let request_hash = hash_statement_supersede_request(&req);
 
     let phase = Phase::Supersede {
@@ -482,7 +484,8 @@ pub async fn handle_statement_tombstone(
     let now = crate::txn::now_unix_nanos_pub();
 
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
     let request_hash = hash_statement_tombstone_request(&req);
 
     let phase = Phase::Tombstone {
@@ -556,7 +559,8 @@ pub async fn handle_statement_retract(
     // `Retract` reason byte that lets the GC worker reclaim the row
     // after the grace period.
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
     let request_hash = hash_statement_retract_request(&req);
 
     let phase = Phase::Tombstone {

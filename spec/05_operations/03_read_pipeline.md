@@ -44,6 +44,39 @@ a fixed top-K window. The relevance band (not a count) decides which memories
 belong to the answer; `max_results` is only a safety ceiling on how many members
 are returned, never the criterion that shapes the answer.
 
+### MEMORY_LIST — enumeration, not search
+
+`MEMORY_LIST` (`0x0027`) is a distinct read *kind*: a non-ranked, paginated
+enumeration of the caller's `(namespace, agent)` memories in a stable order. It
+does **not** run the retrieval pipeline — no cue, no embedding, no RRF, no
+rerank, no relevance suppression. Where RECALL answers *"what is relevant to this
+query"*, MEMORY_LIST answers *"what is stored here"*: it walks the tenant-scoped
+`created_at` timeline index and returns a page plus an opaque, signed keyset
+cursor (seek pagination, never offset — page N costs the same as page 1 and pages
+are stable under concurrent writes). Filters (kind, tombstone state, created-time
+range, salience range) are applied during the scan; changing any filter or the
+sort invalidates an in-flight cursor (`stale_cursor`). It never crosses the
+`(namespace, agent)` boundary and never aggregates or counts the whole pool.
+
+### GRAPH_FETCH — typed-graph export, not search
+
+`GRAPH_FETCH` (`0x0163`) is the enumeration analogue for the *typed graph*: a
+non-ranked, paginated export of the caller's `(namespace, agent)` entities and
+the edges between them, shaped as a node/edge set a graph-explorer UI renders
+directly. Like MEMORY_LIST it does **not** run the retrieval pipeline. It
+paginates over the subject-anchored statement index — the one typed-graph index
+that is `(namespace, agent)`-prefixed — and *derives* the entity set from
+traversal (statement subjects/objects, plus the relation and mention neighbours
+of those entities) rather than a dedicated per-agent entity index; a
+fully-isolated entity therefore does not surface. The default layer is the
+concept map (entity nodes + `Relation`/`Fact` edges); `include_statements` adds
+value-object statement nodes and `include_memories` adds source-memory nodes
+with `Mentions` edges. The cursor is opaque and signed over the layer toggles.
+Because an entity can be reached on more than one page, the response guarantees
+**completeness, not disjointness**: every node/edge appears in at least one page,
+may repeat across pages, and carries a stable 16-byte id so the client dedups by
+id. It never crosses the `(namespace, agent)` boundary.
+
 #### In-transaction read-your-writes overlay
 
 When `req.txn_id` is set, the txn's pending ENCODE buffer is overlaid on the committed retrieval result before the response is built:
@@ -65,6 +98,8 @@ The cue can be a single word, a sentence, a longer document — whatever the age
 #### agent_id
 
 The owning agent. Returns are scoped to this agent's memories.
+
+**Under `act_as` the scope is the effective agent.** When the request carries the `act_as` field (a trusted service principal reading on behalf of a tenant agent; defined in [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §"Per-request identity (`act_as`)"), the `agent_filter` isolation scopes to the **effective** `(namespace, agent_id)` named in `act_as`, never to the connection principal. A `RECALL` under `act_as` therefore returns the **effective identity's** memories only — never the service principal's own, and never any other tenant's. The isolation boundary follows the effective identity for every read, exactly as the write path stamps rows with it.
 
 #### max_results
 

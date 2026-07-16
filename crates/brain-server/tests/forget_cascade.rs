@@ -171,6 +171,8 @@ async fn encode(client: &mut TcpStream, stream_id: u32, text: &str) -> u128 {
         request_id: rid(),
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     };
     let (op, body) = round_trip(client, stream_id, RequestBody::Encode(req)).await;
     match body {
@@ -186,6 +188,7 @@ async fn create_entity(client: &mut TcpStream, stream_id: u32, name: &str) -> [u
         aliases: vec![],
         attributes_blob: Vec::new(),
         request_id: rid(),
+        act_as: None,
     };
     let (op, body) = round_trip(client, stream_id, RequestBody::EntityCreate(req)).await;
     assert_eq!(
@@ -222,6 +225,7 @@ async fn create_statement_citing(
         event_at_unix_nanos: 0,
         schema_version: 0,
         request_id: rid(),
+        act_as: None,
     };
     let (op, body) = round_trip(client, stream_id, RequestBody::StatementCreate(req)).await;
     assert_eq!(
@@ -241,6 +245,7 @@ async fn forget(client: &mut TcpStream, stream_id: u32, memory_id: u128) {
         mode: ForgetMode::Hard,
         request_id: rid(),
         txn_id: None,
+        act_as: None,
     };
     let (op, body) = round_trip(client, stream_id, RequestBody::Forget(req)).await;
     assert_eq!(op, Opcode::ForgetResp.as_u16(), "forget failed: {body:?}");
@@ -251,6 +256,7 @@ async fn statement_tombstoned(client: &mut TcpStream, stream_id: u32, stmt_id: [
     let req = StatementGetRequest {
         statement_id: stmt_id,
         follow_supersession: false,
+        act_as: None,
     };
     let (op, body) = round_trip(client, stream_id, RequestBody::StatementGet(req)).await;
     assert_eq!(

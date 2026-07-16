@@ -43,19 +43,26 @@ use brain_protocol::envelope::response::{ErrorCategoryWire, ErrorCodeWire};
 use brain_protocol::error::{ErrorCategory, ErrorCode};
 use brain_protocol::ops::capabilities::{Capabilities, GetCapabilitiesResponse};
 use brain_protocol::{
-    AnswerKindWire, EdgeKindWire, EncodeRequest, EncodeResponse, EncodeVectorDirectRequest,
-    EntityCreateRequest, EntityCreateResponse, EntityGetResponse, EntityListItem,
-    EntityListResponseFrame, EntityResolveResponse, EntityView, EventType, EvidenceRefWire,
-    ExtractorListItem, ExtractorListRequest, ExtractorListResponseFrame,
-    ForgetMode, ForgetRequest, ForgetResponse, Frame, InferenceKind, InferenceStep, LinkResponse,
-    MaterializeProceduralRequest, MaterializeProceduralResponse, MemoryKindWire, Opcode,
-    PlanResponseFrame, PlanStatus, PlanStep, PongResponse, ReasonResponseFrame, ReasonStatus,
-    RecallRequest, RecallResponseFrame, RelationCreateRequest, RelationCreateResponse,
-    RelationListFromResponseFrame, RelationView, RequestBody, ResolutionOutcomeWire, ResponseBody,
-    SchemaUploadRequest, SchemaUploadResponse, ServerPingResponse, StageKind,
-    StatementCreateRequest, StatementCreateResponse, StatementGetResponse, StatementKindWire,
-    StatementListResponseFrame, StatementObjectWire, StatementValueWire, StatementView,
-    SubscriptionEvent, TransitionKind, TxnAbortResponse, TxnBeginResponse, TxnCommitResponse,
+    ActAs, AnswerKindWire, EdgeKindWire, EncodeRequest, EncodeResponse, EncodeTrace,
+    EncodeTraceArtifacts, EncodeTraceDedup, EncodeTraceEntity, EncodeTraceIndex,
+    EncodeTraceRelation, EncodeTraceStage, EncodeTraceStageStatus, EncodeTraceStatement,
+    EncodeVectorDirectRequest, EntityCreateRequest, EntityCreateResponse, EntityGetResponse,
+    EntityListItem, EntityListResponseFrame, EntityResolveResponse, EntityView, EventType,
+    EvidenceRefWire, ExtractorListItem, ExtractorListRequest, ExtractorListResponseFrame,
+    ForgetMode, ForgetRequest, ForgetResponse, Frame, GraphEdge, GraphFetchRequest,
+    GraphFetchResponseFrame, GraphNode, InferenceKind, InferenceStep, LinkResponse,
+    MaterializeProceduralRequest, MaterializeProceduralResponse, MemoryKindWire, MemoryListDirWire,
+    MemoryListItem, MemoryListRequest, MemoryListResponseFrame, MemoryListSortWire,
+    MemoryListTimeAxisWire, ObservationInput, Opcode, PlanBudget, PlanRequest, PlanResponseFrame,
+    PlanState, PlanStatus, PlanStep, PongResponse, ReasonRequest, ReasonResponseFrame,
+    ReasonStatus, RecallRequest, RecallResponseFrame, RecallTrace, RecallTraceFilterChain,
+    RecallTraceRerank, RecallTraceRetriever, RecallTraceRetrieverStatus, RelationCreateRequest,
+    RelationCreateResponse, RelationListFromResponseFrame, RelationView, RequestBody,
+    ResolutionOutcomeWire, ResponseBody, RetrieverNameWire, SchemaUploadRequest,
+    SchemaUploadResponse, ServerPingResponse, StageKind, StatementCreateRequest,
+    StatementCreateResponse, StatementGetResponse, StatementKindWire, StatementListResponseFrame,
+    StatementObjectWire, StatementValueWire, StatementView, SubscriptionEvent, TransitionKind,
+    TxnAbortResponse, TxnBeginResponse, TxnCommitResponse,
 };
 
 // Fixed byte patterns. No clock, no randomness — fixtures are reproducible.
@@ -270,6 +277,25 @@ fn sample_encode() -> EncodeRequest {
         request_id: RID,
         txn_id: None,
         occurred_at_unix_nanos: Some(1_700_000_000_000_000_000),
+        act_as: None,
+        trace: false,
+    }
+}
+
+/// An ENCODE carrying an `act_as` effective-identity selector. Exercises
+/// the impersonation wire path from a trusted service principal.
+fn sample_encode_act_as() -> EncodeRequest {
+    EncodeRequest {
+        text: "on behalf of a tenant".into(),
+        context_id: 1,
+        request_id: RID,
+        txn_id: None,
+        occurred_at_unix_nanos: None,
+        act_as: Some(ActAs {
+            namespace: "tenant-acme".into(),
+            agent_id: AGENT,
+        }),
+        trace: false,
     }
 }
 
@@ -303,7 +329,94 @@ fn sample_encode_response() -> EncodeResponse {
         embedding_model_fp: FP,
         pending_stages: vec![StageKind::AutoEdge],
         has_active_schema: true,
+        trace: None,
     }
+}
+
+/// An ENCODE response carrying a populated `trace` — the synchronous
+/// write-analysis timeline plus the artifacts the write produced. Mirrors
+/// `resp_recall_trace`: exercises the opt-in `trace = true` wire path.
+fn sample_encode_response_trace() -> EncodeResponse {
+    let mut resp = sample_encode_response();
+    resp.trace = Some(EncodeTrace {
+        stages: vec![
+            EncodeTraceStage {
+                name: "validate".into(),
+                status: EncodeTraceStageStatus::Ok,
+                latency_us: 3,
+                detail: String::new(),
+            },
+            EncodeTraceStage {
+                name: "embed".into(),
+                status: EncodeTraceStageStatus::Ok,
+                latency_us: 1200,
+                detail: "dim=384".into(),
+            },
+            EncodeTraceStage {
+                name: "reserve".into(),
+                status: EncodeTraceStageStatus::Ok,
+                latency_us: 5,
+                detail: String::new(),
+            },
+            EncodeTraceStage {
+                name: "persist".into(),
+                status: EncodeTraceStageStatus::Ok,
+                latency_us: 800,
+                detail: "lsn=42".into(),
+            },
+            EncodeTraceStage {
+                name: "extractor".into(),
+                status: EncodeTraceStageStatus::Ok,
+                latency_us: 42_000,
+                detail: "entities=2 statements=1 relations=0 audit=Succeeded".into(),
+            },
+            EncodeTraceStage {
+                name: "auto_edge".into(),
+                status: EncodeTraceStageStatus::Timeout,
+                latency_us: 0,
+                detail: "stage did not complete within the trace wait window".into(),
+            },
+        ],
+        artifacts: EncodeTraceArtifacts {
+            entities: vec![EncodeTraceEntity {
+                id: EID,
+                name: "brain".into(),
+                type_qname: "org:project".into(),
+            }],
+            statements: vec![EncodeTraceStatement {
+                id: mid().to_be_bytes(),
+                subject_name: "niraj".into(),
+                predicate: "org:works_on".into(),
+                object_name: "brain".into(),
+                confidence: 0.9,
+            }],
+            relations: vec![EncodeTraceRelation {
+                source_name: "niraj".into(),
+                predicate: "org:member_of".into(),
+                target_name: "arc-labs".into(),
+            }],
+            indexes: vec![
+                EncodeTraceIndex {
+                    name: "memory_hnsw".into(),
+                    status: EncodeTraceStageStatus::Ok,
+                },
+                EncodeTraceIndex {
+                    name: "memory_text".into(),
+                    status: EncodeTraceStageStatus::Ok,
+                },
+                EncodeTraceIndex {
+                    name: "statement_text".into(),
+                    status: EncodeTraceStageStatus::Ok,
+                },
+            ],
+            dedup: EncodeTraceDedup {
+                was_deduplicated: false,
+                matched_memory_id: None,
+            },
+        },
+        total_latency_us: 44_010,
+    });
+    resp
 }
 
 fn sample_statement_create() -> StatementCreateRequest {
@@ -320,6 +433,7 @@ fn sample_statement_create() -> StatementCreateRequest {
         event_at_unix_nanos: 0,
         schema_version: 1,
         request_id: RID,
+        act_as: None,
     }
 }
 
@@ -335,6 +449,7 @@ fn sample_relation_create() -> RelationCreateRequest {
         valid_from_unix_nanos: 1_700_000_000_000_000_000,
         valid_to_unix_nanos: 0,
         request_id: RID,
+        act_as: None,
     }
 }
 
@@ -528,6 +643,97 @@ fn sample_extractor_list() -> ExtractorListResponseFrame {
     }
 }
 
+fn sample_memory_list_request() -> MemoryListRequest {
+    MemoryListRequest {
+        sort: MemoryListSortWire::Created,
+        dir: MemoryListDirWire::Desc,
+        limit: 50,
+        // Non-empty on purpose: `cursor` is `Vec<u8>` (no `serde_bytes`), so
+        // it must encode as a CBOR array of ints, not a byte string. The
+        // byte values straddle the CBOR 1-byte/2-byte int boundary (>= 24)
+        // so the array encoding is unmistakably distinct from a byte string.
+        cursor: vec![0x2a, 0x00, 0xff, 0x18, 0x7b],
+        kinds: vec![MemoryKindWire::Episodic],
+        include_tombstoned: false,
+        time_axis: MemoryListTimeAxisWire::Created,
+        from_unix_nanos: 0,
+        to_unix_nanos: 0,
+        salience_min: 0.0,
+        salience_max: 1.0,
+        text_contains: String::new(),
+        act_as: None,
+    }
+}
+
+fn sample_memory_list_response() -> MemoryListResponseFrame {
+    MemoryListResponseFrame {
+        items: vec![MemoryListItem {
+            memory_id: EID,
+            text: "the sky is blue".into(),
+            kind: 0,
+            state: 0,
+            created_at_unix_nanos: 1_700_000_000_000_000_000,
+            occurred_at_unix_nanos: 0,
+            last_accessed_at_unix_nanos: 1_700_000_001_000_000_000,
+            salience: 0.5,
+            access_count: 3,
+            source_request_id: RID,
+            statement_count: 0,
+            entity_count: 0,
+            relation_count: 0,
+        }],
+        // Non-empty: exercises the `Vec<u8>` array-of-ints encoding on the
+        // response side too (a byte-string encoding would mismatch this
+        // golden — see `sample_memory_list_request`).
+        next_cursor: vec![0x2a, 0x00, 0xff, 0x18, 0x7b],
+        cumulative_count: 1,
+        is_final: true,
+    }
+}
+
+fn sample_graph_fetch_request() -> GraphFetchRequest {
+    GraphFetchRequest {
+        limit: 200,
+        // Non-empty on purpose: `cursor` is `Vec<u8>` (no `serde_bytes`), so
+        // it must encode as a CBOR array of ints, not a byte string — same
+        // cross-language contract as MEMORY_LIST's cursor.
+        cursor: vec![0x2a, 0x00, 0xff, 0x18, 0x7b],
+        include_statements: true,
+        include_memories: false,
+        include_tombstoned: false,
+        act_as: None,
+    }
+}
+
+fn sample_graph_fetch_response() -> GraphFetchResponseFrame {
+    GraphFetchResponseFrame {
+        nodes: vec![
+            GraphNode {
+                id: EID,
+                kind: 0,
+                label: "Sarah Chen".into(),
+                type_qname: "brain:Person".into(),
+            },
+            GraphNode {
+                id: RID,
+                kind: 0,
+                label: "Aurora Robotics".into(),
+                type_qname: "brain:Organization".into(),
+            },
+        ],
+        edges: vec![GraphEdge {
+            from_id: EID,
+            to_id: RID,
+            kind: 0,
+            label: "brain:works_at".into(),
+        }],
+        // Non-empty: exercises the `Vec<u8>` array-of-ints cursor on the
+        // response side too.
+        next_cursor: vec![0x2a, 0x00, 0xff, 0x18, 0x7b],
+        is_final: true,
+    }
+}
+
 fn sample_subscribe_event() -> SubscriptionEvent {
     SubscriptionEvent {
         event_type: EventType::Encoded,
@@ -571,6 +777,16 @@ fn corpus() -> Vec<Case> {
         RequestBody::Encode(sample_encode()),
         &sample_encode(),
     ));
+    // ENCODE opting into the synchronous write-analysis trace.
+    let encode_trace = EncodeRequest {
+        trace: true,
+        ..sample_encode()
+    };
+    cases.push(req_case(
+        "req_encode_trace",
+        RequestBody::Encode(encode_trace.clone()),
+        &encode_trace,
+    ));
     // EncodeVectorDirect's JSON mirror carries the vector field; its wire
     // payload is CBOR (without vector) + a trailing LE-f32 section appended by
     // RequestBody::encode. The mirror documents the full logical value.
@@ -580,6 +796,7 @@ fn corpus() -> Vec<Case> {
         &sample_encode_vector_direct(),
     ));
     let recall = RecallRequest {
+        trace: true,
         cue_text: "what color is the sky".into(),
         subject_name: "sky".into(),
         max_results: 10,
@@ -594,19 +811,115 @@ fn corpus() -> Vec<Case> {
         include_text: true,
         request_id: Some(RID),
         txn_id: None,
+        act_as: None,
     };
     cases.push(req_case(
         "req_recall",
         RequestBody::Recall(recall.clone()),
         &recall,
     ));
+    let recall_act_as = RecallRequest {
+        trace: false,
+        cue_text: "what color is the sky".into(),
+        subject_name: "sky".into(),
+        max_results: 10,
+        confidence_threshold: 0.3,
+        context_filter: Some(vec![1]),
+        age_bound_unix_nanos: None,
+        as_of_record_time_unix_nanos: None,
+        kind_filter: None,
+        salience_floor: 0.0,
+        include_edges: false,
+        include_graph: false,
+        include_text: false,
+        request_id: Some(RID),
+        txn_id: None,
+        act_as: Some(ActAs {
+            namespace: "tenant-acme".into(),
+            agent_id: AGENT,
+        }),
+    };
+    cases.push(req_case(
+        "req_recall_act_as",
+        RequestBody::Recall(recall_act_as.clone()),
+        &recall_act_as,
+    ));
     let forget = ForgetRequest {
         memory_id: mid(),
         mode: ForgetMode::Soft,
         request_id: RID,
         txn_id: None,
+        act_as: None,
     };
-    cases.push(req_case("req_forget", RequestBody::Forget(forget), &forget));
+    cases.push(req_case(
+        "req_forget",
+        RequestBody::Forget(forget.clone()),
+        &forget,
+    ));
+    let forget_act_as = ForgetRequest {
+        memory_id: mid(),
+        mode: ForgetMode::Soft,
+        request_id: RID,
+        txn_id: None,
+        act_as: Some(ActAs {
+            namespace: "tenant-acme".into(),
+            agent_id: AGENT,
+        }),
+    };
+    cases.push(req_case(
+        "req_forget_act_as",
+        RequestBody::Forget(forget_act_as.clone()),
+        &forget_act_as,
+    ));
+    cases.push(req_case(
+        "req_encode_act_as",
+        RequestBody::Encode(sample_encode_act_as()),
+        &sample_encode_act_as(),
+    ));
+    // PLAN on behalf of a tenant — a data-plane read verb that now
+    // carries the shared `act_as` selector.
+    let plan_act_as = PlanRequest {
+        start: PlanState::ByText("origin".into()),
+        goal: PlanState::ByText("destination".into()),
+        budget: PlanBudget {
+            max_steps: 8,
+            max_wall_time_ms: 1_000,
+            max_branches_explored: 64,
+        },
+        strategy_hint: None,
+        context_filter: None,
+        request_id: Some(RID),
+        txn_id: None,
+        act_as: Some(ActAs {
+            namespace: "tenant-acme".into(),
+            agent_id: AGENT,
+        }),
+    };
+    cases.push(req_case(
+        "req_plan_act_as",
+        RequestBody::Plan(plan_act_as.clone()),
+        &plan_act_as,
+    ));
+    // REASON on behalf of a tenant.
+    let reason_act_as = ReasonRequest {
+        observation: ObservationInput::ByText("the cat sat".into()),
+        depth: 3,
+        confidence_threshold: 0.5,
+        context_filter: None,
+        max_inferences: 5,
+        budget_wall_time_ms: 1_000,
+        request_id: Some(RID),
+        txn_id: None,
+        act_as: Some(ActAs {
+            namespace: "tenant-acme".into(),
+            agent_id: AGENT,
+        }),
+    };
+    cases.push(req_case(
+        "req_reason_act_as",
+        RequestBody::Reason(reason_act_as.clone()),
+        &reason_act_as,
+    ));
 
     // ---- Typed-graph requests ----
     let entity_create = EntityCreateRequest {
@@ -615,11 +928,30 @@ fn corpus() -> Vec<Case> {
         aliases: vec!["Ada L.".into()],
         attributes_blob: b"role=engineer".to_vec(),
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_entity_create",
         RequestBody::EntityCreate(entity_create.clone()),
         &entity_create,
+    ));
+    // Typed-graph write on behalf of a tenant — proves `act_as` rides
+    // the entity-create map when the principal is a multi-tenant gateway.
+    let entity_create_act_as = EntityCreateRequest {
+        entity_type_id: 1,
+        canonical_name: "Ada".into(),
+        aliases: vec!["Ada L.".into()],
+        attributes_blob: b"role=engineer".to_vec(),
+        request_id: RID,
+        act_as: Some(ActAs {
+            namespace: "tenant-acme".into(),
+            agent_id: AGENT,
+        }),
+    };
+    cases.push(req_case(
+        "req_entity_create_act_as",
+        RequestBody::EntityCreate(entity_create_act_as.clone()),
+        &entity_create_act_as,
     ));
     cases.push(req_case(
         "req_statement_create",
@@ -656,6 +988,20 @@ fn corpus() -> Vec<Case> {
         &materialize,
     ));
 
+    // ---- Memory enumeration (MEMORY_LIST) ----
+    cases.push(req_case(
+        "req_memory_list",
+        RequestBody::MemoryList(sample_memory_list_request()),
+        &sample_memory_list_request(),
+    ));
+
+    // ---- Typed-graph export (GRAPH_FETCH) ----
+    cases.push(req_case(
+        "req_graph_fetch",
+        RequestBody::GraphFetch(sample_graph_fetch_request()),
+        &sample_graph_fetch_request(),
+    ));
+
     // ---- Handshake responses ----
     cases.push(resp_case(
         "resp_welcome",
@@ -672,6 +1018,7 @@ fn corpus() -> Vec<Case> {
             can_reason: true,
             can_forget: true,
             can_admin: false,
+            can_act_as: false,
         },
         namespace: "acme".to_string(),
         server_time_unix_nanos: 1_700_000_000_000_000_000,
@@ -681,6 +1028,28 @@ fn corpus() -> Vec<Case> {
         ResponseBody::AuthOk(auth_ok.clone()),
         &auth_ok,
     ));
+    // A trusted service principal that holds the `can_act_as` grant —
+    // the edge/gateway identity that fronts many tenants.
+    let auth_ok_act_as = AuthOkPayload {
+        agent_id: AGENT,
+        bound_shard_id: 5,
+        permissions: AgentPermissions {
+            can_encode: true,
+            can_recall: true,
+            can_plan: true,
+            can_reason: true,
+            can_forget: true,
+            can_admin: false,
+            can_act_as: true,
+        },
+        namespace: "acme".to_string(),
+        server_time_unix_nanos: 1_700_000_000_000_000_000,
+    };
+    cases.push(resp_case(
+        "resp_auth_ok_act_as",
+        ResponseBody::AuthOk(auth_ok_act_as.clone()),
+        &auth_ok_act_as,
+    ));
 
     // ---- Memory substrate responses ----
     cases.push(resp_case(
@@ -688,7 +1057,15 @@ fn corpus() -> Vec<Case> {
         ResponseBody::Encode(sample_encode_response()),
         &sample_encode_response(),
     ));
+    // Response to a `trace = true` ENCODE: carries the full synchronous
+    // write-analysis timeline plus the produced artifacts.
+    cases.push(resp_case(
+        "resp_encode_trace",
+        ResponseBody::Encode(sample_encode_response_trace()),
+        &sample_encode_response_trace(),
+    ));
     let recall_resp = RecallResponseFrame {
+        trace: None,
         answer_kind: AnswerKindWire::None,
         memories: Vec::new(),
         is_final: true,
@@ -699,6 +1076,54 @@ fn corpus() -> Vec<Case> {
         "resp_recall",
         ResponseBody::Recall(recall_resp.clone()),
         &recall_resp,
+    ));
+    // Final frame of a `trace = true` recall: carries a populated
+    // `RecallTrace` mirroring the read pipeline's per-stage observability.
+    let recall_trace_resp = RecallResponseFrame {
+        answer_kind: AnswerKindWire::None,
+        memories: Vec::new(),
+        is_final: true,
+        cumulative_count: 0,
+        estimated_remaining: Some(0),
+        trace: Some(RecallTrace {
+            retrievers: vec![
+                RecallTraceRetriever {
+                    name: RetrieverNameWire::Semantic,
+                    status: RecallTraceRetrieverStatus::Success,
+                    status_detail: String::new(),
+                    latency_ms: 1.5,
+                    candidate_count: 12,
+                },
+                RecallTraceRetriever {
+                    name: RetrieverNameWire::Graph,
+                    status: RecallTraceRetrieverStatus::Skipped,
+                    status_detail: "no anchor".into(),
+                    latency_ms: 0.0,
+                    candidate_count: 0,
+                },
+            ],
+            filter_chain: RecallTraceFilterChain {
+                before: 12,
+                after_type: 12,
+                after_temporal: 10,
+                after_confidence: 8,
+                after_tombstone: 8,
+                after_supersession: 7,
+                after_as_of: 7,
+                after_limit: 5,
+            },
+            rerank: Some(RecallTraceRerank {
+                applied: true,
+                candidates: 5,
+                latency_ms: 2.25,
+            }),
+            total_latency_ms: 4.75,
+        }),
+    };
+    cases.push(resp_case(
+        "resp_recall_trace",
+        ResponseBody::Recall(recall_trace_resp.clone()),
+        &recall_trace_resp,
     ));
     let forget_resp = ForgetResponse {
         memory_id: mid(),
@@ -788,6 +1213,18 @@ fn corpus() -> Vec<Case> {
         "resp_relation_list",
         ResponseBody::RelationListFrom(sample_relation_list()),
         &sample_relation_list(),
+    ));
+
+    cases.push(resp_case(
+        "resp_memory_list",
+        ResponseBody::MemoryList(sample_memory_list_response()),
+        &sample_memory_list_response(),
+    ));
+
+    cases.push(resp_case(
+        "resp_graph_fetch",
+        ResponseBody::GraphFetch(sample_graph_fetch_response()),
+        &sample_graph_fetch_response(),
     ));
 
     // ---- Cognitive read-side responses ----
@@ -944,6 +1381,21 @@ fn corpus() -> Vec<Case> {
         cases.push(resp_case(name, ResponseBody::Error(err.clone()), &err));
     }
 
+    // Dedicated ActAsDenied case: a per-request-identity denial, distinct
+    // from the generic PermissionDenied authorization error above.
+    let act_as_denied = ErrorResponse {
+        code: ErrorCodeWire::from(ErrorCode::ActAsDenied),
+        category: ErrorCategoryWire::from(ErrorCategory::Authorization),
+        message: "principal not entitled to act_as".into(),
+        details: None,
+        retry_after_ms: None,
+    };
+    cases.push(resp_case(
+        "resp_error_act_as_denied",
+        ResponseBody::Error(act_as_denied.clone()),
+        &act_as_denied,
+    ));
+
     // ---- Full frames (header + payload), incl. the vector-trailer case ----
     cases.push(frame_case(
         "frame_hello",
@@ -998,6 +1450,7 @@ fn corpus() -> Vec<Case> {
         0x80,
         2,
         ResponseBody::Recall(RecallResponseFrame {
+            trace: None,
             answer_kind: AnswerKindWire::None,
             memories: Vec::new(),
             is_final: true,
@@ -1034,6 +1487,10 @@ fn required_families() -> Vec<(&'static str, Opcode)> {
         ("memory.recall_resp", Opcode::RecallResp),
         ("memory.forget", Opcode::ForgetReq),
         ("memory.forget_resp", Opcode::ForgetResp),
+        ("memory.list", Opcode::MemoryListReq),
+        ("memory.list_resp", Opcode::MemoryListResp),
+        ("graph.fetch", Opcode::GraphFetchReq),
+        ("graph.fetch_resp", Opcode::GraphFetchResp),
         ("graph.entity_create", Opcode::EntityCreateReq),
         ("graph.entity_create_resp", Opcode::EntityCreateResp),
         ("graph.statement_create", Opcode::StatementCreateReq),

@@ -44,6 +44,14 @@ struct MintBody {
     namespace: String,
     /// Either a list of named permissions or a raw `u32` bitfield.
     permissions: PermissionsSpec,
+    /// Allowlist of namespaces this key may act *for* under the `ACT_AS`
+    /// grant. Only meaningful when the resolved permission set carries the
+    /// `ACT_AS` bit; empty (the default) for every ordinary key. A single
+    /// `"*"` entry is the wildcard grant — the key may act as *any*
+    /// namespace, the trusted-front-door case for a gateway/edge that fronts
+    /// every tenant and can't enumerate an allowlist that grows per tenant.
+    #[serde(default)]
+    may_act: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +75,7 @@ impl PermissionsSpec {
                         "LINK" => bits::LINK,
                         "SCHEMA_UPLOAD" => bits::SCHEMA_UPLOAD,
                         "ADMIN" => bits::ADMIN,
+                        "ACT_AS" => bits::ACT_AS,
                         "STANDARD_AGENT" => bits::STANDARD_AGENT,
                         "READ_ONLY" => bits::READ_ONLY,
                         "READ_WRITE" => bits::READ_WRITE,
@@ -166,6 +175,24 @@ async fn mint(
         Ok(b) => b,
         Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &format!("{msg}\n"))),
     };
+    // `may_act` is only meaningful under the ACT_AS grant. Reject the two
+    // incoherent shapes: a `may_act` list without ACT_AS (the allowlist
+    // would never be consulted), and an ACT_AS grant with an empty
+    // allowlist (the key could never act for anyone — a useless, and
+    // likely mistaken, grant).
+    let has_act_as = permissions & bits::ACT_AS != 0;
+    if !parsed.may_act.is_empty() && !has_act_as {
+        return Ok(text_response(
+            StatusCode::BAD_REQUEST,
+            "may_act is only valid together with the ACT_AS permission\n",
+        ));
+    }
+    if has_act_as && parsed.may_act.is_empty() {
+        return Ok(text_response(
+            StatusCode::BAD_REQUEST,
+            "ACT_AS grant requires a non-empty may_act allowlist\n",
+        ));
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -177,6 +204,7 @@ async fn mint(
         parsed.namespace,
         agent_id,
         permissions,
+        parsed.may_act,
         now,
     ) {
         Ok(m) => m,

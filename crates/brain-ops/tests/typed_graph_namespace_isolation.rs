@@ -147,6 +147,7 @@ async fn create_entity(
         aliases: Vec::new(),
         attributes_blob: Vec::new(),
         request_id,
+        act_as: None,
     };
     let outcome = dispatch(RequestBody::EntityCreate(req), c, &fix.ctx)
         .await
@@ -178,6 +179,7 @@ async fn create_statement(
         event_at_unix_nanos: 0,
         schema_version: 0,
         request_id,
+        act_as: None,
     };
     let outcome = dispatch(RequestBody::StatementCreate(req), c, &fix.ctx)
         .await
@@ -207,6 +209,7 @@ async fn create_relation(
         valid_from_unix_nanos: 0,
         valid_to_unix_nanos: 0,
         request_id,
+        act_as: None,
     };
     let outcome = dispatch(RequestBody::RelationCreate(req), c, &fix.ctx)
         .await
@@ -224,6 +227,7 @@ async fn resolve_entity(fix: &Fixture, c: RequestCaller, name: &str) -> EntityRe
         entity_type_hint: 0,
         allow_create: false,
         request_id: [0u8; 16],
+        act_as: None,
     };
     let outcome = dispatch(RequestBody::EntityResolve(req), c, &fix.ctx)
         .await
@@ -237,7 +241,10 @@ async fn resolve_entity(fix: &Fixture, c: RequestCaller, name: &str) -> EntityRe
 /// `Ok(())` if ENTITY_GET returned the entity; `Err(())` if it was walled
 /// off (NotFound). Used to prove a foreign id is never readable.
 async fn entity_get_visible(fix: &Fixture, c: RequestCaller, id: [u8; 16]) -> bool {
-    let req = EntityGetRequest { entity_id: id };
+    let req = EntityGetRequest {
+        entity_id: id,
+        act_as: None,
+    };
     let outcome = dispatch(RequestBody::EntityGet(req), c, &fix.ctx).await;
     matches!(outcome.map(single_body), Ok(ResponseBody::EntityGet(_)))
 }
@@ -258,6 +265,7 @@ async fn list_statement_subjects(
         include_tombstoned: false,
         limit: 100,
         cursor: Vec::new(),
+        act_as: None,
     };
     let outcome = dispatch(RequestBody::StatementList(req), c, &fix.ctx)
         .await
@@ -280,6 +288,7 @@ async fn list_relations_from(fix: &Fixture, c: RequestCaller, from: [u8; 16]) ->
         include_tombstoned: false,
         limit: 100,
         cursor: Vec::new(),
+        act_as: None,
     };
     let outcome = dispatch(RequestBody::RelationListFrom(req), c, &fix.ctx)
         .await

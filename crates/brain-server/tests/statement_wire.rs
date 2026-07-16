@@ -163,6 +163,7 @@ async fn make_entity(client: &mut TcpStream, stream_id: u32, name: &str) -> [u8;
             aliases: vec![],
             attributes_blob: Vec::new(),
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;
@@ -195,6 +196,7 @@ fn fact_request(subject: [u8; 16], object: [u8; 16]) -> StatementCreateRequest {
         event_at_unix_nanos: 0,
         schema_version: 0,
         request_id: rid(),
+        act_as: None,
     }
 }
 
@@ -217,6 +219,7 @@ fn attr_request(subject: [u8; 16], value: &str) -> StatementCreateRequest {
         event_at_unix_nanos: 0,
         schema_version: 0,
         request_id: rid(),
+        act_as: None,
     }
 }
 
@@ -234,6 +237,7 @@ fn event_request(subject: [u8; 16], when: u64) -> StatementCreateRequest {
         event_at_unix_nanos: when,
         schema_version: 0,
         request_id: rid(),
+        act_as: None,
     }
 }
 
@@ -278,6 +282,7 @@ async fn create_fact_round_trips() {
         RequestBody::StatementGet(StatementGetRequest {
             statement_id: sid,
             follow_supersession: false,
+            act_as: None,
         }),
     )
     .await;
@@ -415,6 +420,7 @@ async fn get_missing_statement_returns_error() {
         RequestBody::StatementGet(StatementGetRequest {
             statement_id: rid(),
             follow_supersession: false,
+            act_as: None,
         }),
     )
     .await;
@@ -518,6 +524,7 @@ async fn tombstone_returns_timestamp() {
         RequestBody::StatementGet(StatementGetRequest {
             statement_id: sid,
             follow_supersession: false,
+            act_as: None,
         }),
     )
     .await;
@@ -679,6 +686,7 @@ async fn list_subject_predicate_filter() {
             include_tombstoned: false,
             limit: 100,
             cursor: Vec::new(),
+            act_as: None,
         }),
     )
     .await;
@@ -716,6 +724,7 @@ async fn list_limit_zero_returns_error() {
             include_tombstoned: false,
             limit: 0,
             cursor: Vec::new(),
+            act_as: None,
         }),
     )
     .await;

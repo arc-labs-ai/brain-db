@@ -103,7 +103,8 @@ pub async fn handle_entity_create(
     let attributes = EntityAttributes::from(req.attributes_blob.clone());
 
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
     let request_hash = hash_entity_create_request(&req);
 
     let phase = Phase::UpsertEntity {
@@ -205,7 +206,8 @@ pub async fn handle_entity_update(
     let now = crate::txn::now_unix_nanos_pub();
 
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
     let request_hash = hash_entity_update_request(&req, id);
 
     let phase = Phase::UpdateEntity {
@@ -271,7 +273,8 @@ pub async fn handle_entity_rename(
     let now = crate::txn::now_unix_nanos_pub();
 
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
     let request_hash = hash_entity_rename_request(&req, id);
 
     let phase = Phase::RenameEntity {
@@ -330,7 +333,8 @@ pub async fn handle_entity_merge(
     let now = crate::txn::now_unix_nanos_pub();
 
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
     let request_hash = hash_entity_merge_request(&req);
     // Wire-initiated merges always carry the caller's agent_id (operator
     // merge). The `System` actor is reserved for resolver / background
@@ -395,7 +399,8 @@ pub async fn handle_entity_unmerge(
     let now = crate::txn::now_unix_nanos_pub();
 
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
     let request_hash = hash_entity_unmerge_request(&req, merged);
 
     // Operator-initiated unmerges attribute to the caller's agent —
@@ -453,7 +458,8 @@ pub async fn handle_entity_tombstone(
     let now = crate::txn::now_unix_nanos_pub();
 
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
     let request_hash = hash_entity_tombstone_request(&req, id);
 
     // Pre-check existence so we return NotFound at the handler edge

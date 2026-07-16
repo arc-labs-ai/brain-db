@@ -4,6 +4,19 @@ The payload layout for every request and response frame. Frame headers are docum
 
 ## Request Frames
 
+### Shared request field: `act_as`
+
+Data-plane op requests carry one shared, **optional** identity field, `act_as`. When present it names the **effective identity** the op runs as, on behalf of the authenticated connection principal; when absent (the common case) the op runs as the connection's own key-bound identity. The full model — the connection-principal-vs-effective-identity distinction, the `can_act_as` grant, and the six invariants R1–R6 — is defined in [`04_handshake.md`](04_handshake.md) §10a. This file only fixes the wire layout.
+
+```rust
+struct ActAs {
+    namespace: String,                       // effective namespace; must be within the principal's may_act allowlist
+    agent_id: WireUuid,                       // 16-byte effective agent id
+}
+```
+
+`act_as: Option<ActAs>` appears on every data-plane op request: `ENCODE_REQ`, `RECALL_REQ`, `FORGET_REQ`, `LINK_REQ`, `UNLINK_REQ`, `PLAN_REQ`, `REASON_REQ`, `ENTITY_CREATE_REQ`, `STATEMENT_CREATE_REQ`, and `RELATION_CREATE_REQ`. It is honored only if the connection principal holds `can_act_as` and `act_as.namespace` is within its `may_act` allowlist — otherwise the op is rejected with `ActAsDenied` (see [`07_error_handling.md`](07_error_handling.md) §3.3). It is absent from every connection-management, introspection, schema, and admin frame, and it never appears in `AUTH`.
+
 ### 1. ENCODE_REQ (0x20)
 
 ```rust
@@ -17,6 +30,7 @@ struct EncodeRequest {
     txn_id: Option<TxnId>,                   // 16 bytes; if part of a transaction
     deduplicate: bool,                       // if true, exact-text duplicates return existing memory_id
     occurred_at_unix_nanos: Option<u64>,     // client event time; None when unknown
+    act_as: Option<ActAs>,                   // effective identity; None = the connection's own identity
 }
 
 struct EdgeRequest {
@@ -82,6 +96,7 @@ struct RecallRequest {
     include_vectors: bool,                   // include vectors in results
     include_edges: bool,                     // include edges in results
     request_id: Option<RequestId>,           // optional; for tracing
+    act_as: Option<ActAs>,                   // effective identity; None = the connection's own identity
 }
 ```
 
@@ -114,6 +129,7 @@ struct PlanRequest {
     strategy_hint: Option<PlanStrategy>,
     context_filter: Option<Vec<ContextId>>,
     request_id: Option<RequestId>,
+    act_as: Option<ActAs>,                   // effective identity; None = the connection's own identity
 }
 
 enum PlanState {
@@ -152,6 +168,7 @@ struct ReasonRequest {
     max_inferences: u32,                     // max inference steps to emit
     budget_wall_time_ms: u32,                // wall-clock cap
     request_id: Option<RequestId>,
+    act_as: Option<ActAs>,                   // effective identity; None = the connection's own identity
 }
 
 enum ObservationInput {
@@ -176,6 +193,7 @@ struct ForgetRequest {
     mode: ForgetMode,                        // Soft or Hard
     request_id: RequestId,                   // required for idempotency
     txn_id: Option<TxnId>,
+    act_as: Option<ActAs>,                   // effective identity; None = the connection's own identity
 }
 
 enum ForgetMode {

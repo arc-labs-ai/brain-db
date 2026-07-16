@@ -82,6 +82,8 @@ fn encode_req(request_id: [u8; 16], text: &str) -> EncodeRequest {
         request_id,
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     }
 }
 
@@ -114,6 +116,89 @@ fn encode_full_pipeline_returns_memory_id() {
         assert!(!enc.was_deduplicated);
         assert_eq!(enc.salience, 0.5, "salience is the router default");
         assert_eq!(enc.auto_edges_added, 0);
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in synchronous write-analysis trace. `trace = false` leaves the
+// response's `trace` field `None` (zero-cost, unchanged payload); `trace =
+// true` populates an `EncodeTrace` — the synchronous phase timeline plus the
+// artifacts the write produced. The unit fixture wires no background workers,
+// so no async stages are queued: the drain returns immediately and the trace
+// carries only the synchronous phases (no timeout wait).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn encode_trace_absent_when_not_requested() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let enc = unwrap_encode_resp(
+            dispatch(
+                RequestBody::Encode(encode_req([0xE0; 16], "no trace please")),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            enc.trace.is_none(),
+            "trace=false must leave the response trace unpopulated",
+        );
+    })
+}
+
+#[test]
+fn encode_trace_populated_when_requested() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let mut req = encode_req([0xE1; 16], "trace this write");
+        req.trace = true;
+        let enc = unwrap_encode_resp(
+            dispatch(
+                RequestBody::Encode(req),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let trace = enc
+            .trace
+            .expect("trace=true must populate the response trace");
+        assert!(
+            !trace.stages.is_empty(),
+            "trace must record the synchronous write phases",
+        );
+        let names: Vec<&str> = trace.stages.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"embed"),
+            "trace must include the embed phase"
+        );
+        assert!(
+            names.contains(&"persist"),
+            "trace must include the persist phase",
+        );
+        // Every recorded phase carries a status and a latency reading.
+        assert!(
+            trace.stages.iter().all(|s| s.latency_us < u64::MAX),
+            "each phase latency is a real microsecond reading",
+        );
+        // The memory landed in the mandatory HNSW; the artifacts section is
+        // always present (possibly empty) so a caller can render it.
+        assert!(
+            trace
+                .artifacts
+                .indexes
+                .iter()
+                .any(|i| i.name == "memory_hnsw"),
+            "artifacts must record the memory HNSW insertion",
+        );
+        assert!(
+            !trace.artifacts.dedup.was_deduplicated,
+            "a fresh write is not a dedup hit",
+        );
     })
 }
 
@@ -223,6 +308,8 @@ fn encode_req_with_dedup(request_id: [u8; 16], text: &str, context_id: u64) -> E
         request_id,
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     }
 }
 
@@ -319,6 +406,7 @@ fn dedup_after_forget_evicts_and_misses() {
             mode: brain_protocol::envelope::request::ForgetMode::Soft,
             request_id: [0xAA; 16],
             txn_id: None,
+            act_as: None,
         };
         dispatch(
             RequestBody::Forget(forget),

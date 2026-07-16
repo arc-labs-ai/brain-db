@@ -24,7 +24,8 @@
     "can_plan": true,
     "can_reason": true,
     "can_forget": true,
-    "can_admin": false
+    "can_admin": false,
+    "can_act_as": false
   },
   "namespace": "acme",
   "server_time_unix_nanos": 1700000000000000000

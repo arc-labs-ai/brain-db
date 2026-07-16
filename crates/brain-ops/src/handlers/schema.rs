@@ -109,7 +109,8 @@ pub async fn handle_schema_upload(
     let from_version = current_active(ctx, &namespace)?.unwrap_or(0);
 
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
     let request_hash = hash_schema_upload_request(&req);
     let phase = Phase::UpsertSchema {
         namespace: namespace.clone(),

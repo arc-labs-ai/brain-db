@@ -139,6 +139,8 @@ async fn encode_text(client: &mut TcpStream, stream_id: u32, text: &str) {
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     };
     let body = RequestBody::Encode(req);
     let opcode = body.opcode().as_u16();
@@ -170,6 +172,7 @@ async fn seed_fixture(client: &mut TcpStream) {
 
 fn recall_request() -> RecallRequest {
     RecallRequest {
+        trace: false,
         cue_text: "meeting preferences".into(),
         subject_name: String::new(),
         max_results: 5,
@@ -184,6 +187,7 @@ fn recall_request() -> RecallRequest {
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id: None,
+        act_as: None,
     }
 }
 

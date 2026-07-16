@@ -81,6 +81,8 @@ fn main() {
         request_id: [0x11u8; 16],
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     };
     send(
         &mut stream,
@@ -99,6 +101,7 @@ fn main() {
 
     // ---- RECALL the just-encoded memory ----
     let recall = RecallRequest {
+        trace: false,
         cue_text: "what color did the evening sky turn".into(),
         subject_name: String::new(),
         max_results: 5,
@@ -113,6 +116,7 @@ fn main() {
         include_text: true,
         request_id: Some([0x22u8; 16]),
         txn_id: None,
+        act_as: None,
     };
     send(
         &mut stream,

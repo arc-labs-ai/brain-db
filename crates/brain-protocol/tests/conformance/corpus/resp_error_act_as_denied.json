@@ -1,0 +1,7 @@
+{
+  "code": 51,
+  "category": 2,
+  "message": "principal not entitled to act_as",
+  "details": null,
+  "retry_after_ms": null
+}

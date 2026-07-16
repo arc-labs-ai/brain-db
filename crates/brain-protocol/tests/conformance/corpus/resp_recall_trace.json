@@ -1,0 +1,41 @@
+{
+  "answer_kind": "None",
+  "memories": [],
+  "is_final": true,
+  "cumulative_count": 0,
+  "estimated_remaining": 0,
+  "trace": {
+    "retrievers": [
+      {
+        "name": 0,
+        "status": 0,
+        "status_detail": "",
+        "latency_ms": 1.5,
+        "candidate_count": 12
+      },
+      {
+        "name": 2,
+        "status": 1,
+        "status_detail": "no anchor",
+        "latency_ms": 0.0,
+        "candidate_count": 0
+      }
+    ],
+    "filter_chain": {
+      "before": 12,
+      "after_type": 12,
+      "after_temporal": 10,
+      "after_confidence": 8,
+      "after_tombstone": 8,
+      "after_supersession": 7,
+      "after_as_of": 7,
+      "after_limit": 5
+    },
+    "rerank": {
+      "applied": true,
+      "candidates": 5,
+      "latency_ms": 2.25
+    },
+    "total_latency_ms": 4.75
+  }
+}

@@ -50,6 +50,7 @@ pub use crate::ops::admin::*;
 pub use crate::ops::capabilities::*;
 pub use crate::ops::entity::*;
 pub use crate::ops::extractor::*;
+pub use crate::ops::graph::*;
 pub use crate::ops::memory::*;
 pub use crate::ops::procedural::*;
 pub use crate::ops::query::*;
@@ -79,6 +80,8 @@ pub enum RequestBody {
     Forget(ForgetRequest),
     Link(LinkRequest),
     Unlink(UnlinkRequest),
+    MemoryList(MemoryListRequest),
+    GraphFetch(GraphFetchRequest),
     Subscribe(SubscribeRequest),
     Unsubscribe(UnsubscribeRequest),
     GetCapabilities(GetCapabilitiesRequest),
@@ -167,6 +170,8 @@ impl RequestBody {
             Self::Forget(_) => Opcode::ForgetReq,
             Self::Link(_) => Opcode::LinkReq,
             Self::Unlink(_) => Opcode::UnlinkReq,
+            Self::MemoryList(_) => Opcode::MemoryListReq,
+            Self::GraphFetch(_) => Opcode::GraphFetchReq,
             Self::Subscribe(_) => Opcode::SubscribeReq,
             Self::Unsubscribe(_) => Opcode::UnsubscribeReq,
             Self::GetCapabilities(_) => Opcode::GetCapabilitiesReq,
@@ -245,6 +250,8 @@ impl RequestBody {
             Self::Forget(r) => to_cbor_bytes(r),
             Self::Link(r) => to_cbor_bytes(r),
             Self::Unlink(r) => to_cbor_bytes(r),
+            Self::MemoryList(r) => to_cbor_bytes(r),
+            Self::GraphFetch(r) => to_cbor_bytes(r),
             Self::Subscribe(r) => to_cbor_bytes(r),
             Self::Unsubscribe(r) => to_cbor_bytes(r),
             Self::GetCapabilities(r) => to_cbor_bytes(r),
@@ -324,6 +331,8 @@ impl RequestBody {
             Opcode::ForgetReq => Self::Forget(from_cbor_bytes(bytes)?),
             Opcode::LinkReq => Self::Link(from_cbor_bytes(bytes)?),
             Opcode::UnlinkReq => Self::Unlink(from_cbor_bytes(bytes)?),
+            Opcode::MemoryListReq => Self::MemoryList(from_cbor_bytes(bytes)?),
+            Opcode::GraphFetchReq => Self::GraphFetch(from_cbor_bytes(bytes)?),
             Opcode::SubscribeReq => Self::Subscribe(from_cbor_bytes(bytes)?),
             Opcode::UnsubscribeReq => Self::Unsubscribe(from_cbor_bytes(bytes)?),
             Opcode::GetCapabilitiesReq => Self::GetCapabilities(from_cbor_bytes(bytes)?),
@@ -390,6 +399,73 @@ impl RequestBody {
     }
 }
 
+/// Borrow the effective-identity selector (`act_as`) carried by a
+/// request body, if the op is one of the three data-plane verbs that
+/// support acting on behalf of another `(namespace, agent_id)`:
+/// `Encode`, `Recall`, and `Forget`. Every other variant returns
+/// `None` — those ops always run as the connection's own key-bound
+/// identity and carry no `act_as` field on the wire.
+///
+/// This is the single point the server consults to decide whether a
+/// request wants to override its effective identity; keeping it here
+/// (next to `RequestBody`) means new act-as-capable ops are added in
+/// exactly one place.
+///
+/// # Examples
+///
+/// ```
+/// use brain_protocol::{act_as_of, RequestBody, EncodeRequest, ActAs};
+///
+/// let no_override = RequestBody::Encode(EncodeRequest {
+///     text: "hi".into(),
+///     context_id: 0,
+///     request_id: [0; 16],
+///     txn_id: None,
+///     occurred_at_unix_nanos: None,
+///     act_as: None,
+///     trace: false,
+/// });
+/// assert!(act_as_of(&no_override).is_none());
+///
+/// let with_override = RequestBody::Encode(EncodeRequest {
+///     text: "hi".into(),
+///     context_id: 0,
+///     request_id: [0; 16],
+///     txn_id: None,
+///     occurred_at_unix_nanos: None,
+///     act_as: Some(ActAs { namespace: "acme".into(), agent_id: [1; 16] }),
+///     trace: false,
+/// });
+/// assert_eq!(act_as_of(&with_override).map(|a| a.namespace.as_str()), Some("acme"));
+/// ```
+#[must_use]
+pub fn act_as_of(body: &RequestBody) -> Option<&ActAs> {
+    match body {
+        RequestBody::Encode(r) => r.act_as.as_ref(),
+        RequestBody::Recall(r) => r.act_as.as_ref(),
+        RequestBody::Forget(r) => r.act_as.as_ref(),
+        RequestBody::Plan(r) => r.act_as.as_ref(),
+        RequestBody::Reason(r) => r.act_as.as_ref(),
+        RequestBody::Link(r) => r.act_as.as_ref(),
+        RequestBody::Unlink(r) => r.act_as.as_ref(),
+        RequestBody::MemoryList(r) => r.act_as.as_ref(),
+        RequestBody::GraphFetch(r) => r.act_as.as_ref(),
+        RequestBody::EntityCreate(r) => r.act_as.as_ref(),
+        RequestBody::EntityGet(r) => r.act_as.as_ref(),
+        RequestBody::EntityList(r) => r.act_as.as_ref(),
+        RequestBody::EntityResolve(r) => r.act_as.as_ref(),
+        RequestBody::StatementCreate(r) => r.act_as.as_ref(),
+        RequestBody::StatementGet(r) => r.act_as.as_ref(),
+        RequestBody::StatementList(r) => r.act_as.as_ref(),
+        RequestBody::RelationCreate(r) => r.act_as.as_ref(),
+        RequestBody::RelationGet(r) => r.act_as.as_ref(),
+        RequestBody::RelationListFrom(r) => r.act_as.as_ref(),
+        RequestBody::RelationListTo(r) => r.act_as.as_ref(),
+        RequestBody::RelationTraverse(r) => r.act_as.as_ref(),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
@@ -428,6 +504,24 @@ mod tests {
             request_id: sample_uuid(2),
             txn_id: Some(sample_uuid(3)),
             occurred_at_unix_nanos: Some(1_700_000_000_000_000_000),
+            act_as: None,
+            trace: false,
+        }));
+    }
+
+    #[test]
+    fn encode_round_trips_with_act_as() {
+        round_trip(RequestBody::Encode(EncodeRequest {
+            text: "hello brain".into(),
+            context_id: 1_u64,
+            request_id: sample_uuid(2),
+            txn_id: None,
+            occurred_at_unix_nanos: None,
+            act_as: Some(ActAs {
+                namespace: "acme".into(),
+                agent_id: sample_uuid(9),
+            }),
+            trace: false,
         }));
     }
 
@@ -471,6 +565,8 @@ mod tests {
             include_text: true,
             request_id: Some(sample_uuid(7)),
             txn_id: None,
+            trace: true,
+            act_as: None,
         }));
     }
 
@@ -496,6 +592,7 @@ mod tests {
                 context_filter: None,
                 request_id: None,
                 txn_id: None,
+                act_as: None,
             }));
         }
     }
@@ -515,6 +612,7 @@ mod tests {
                 budget_wall_time_ms: 5_000,
                 request_id: None,
                 txn_id: None,
+                act_as: None,
             }));
         }
     }
@@ -527,8 +625,23 @@ mod tests {
                 mode,
                 request_id: sample_uuid(8),
                 txn_id: None,
+                act_as: None,
             }));
         }
+    }
+
+    #[test]
+    fn forget_round_trips_with_act_as() {
+        round_trip(RequestBody::Forget(ForgetRequest {
+            memory_id: sample_memory_id(),
+            mode: ForgetMode::Hard,
+            request_id: sample_uuid(8),
+            txn_id: None,
+            act_as: Some(ActAs {
+                namespace: "acme".into(),
+                agent_id: sample_uuid(9),
+            }),
+        }));
     }
 
     #[test]
@@ -722,6 +835,263 @@ mod tests {
             let decoded = RequestBody::decode(body.opcode(), &bytes).unwrap();
             assert_eq!(decoded, body);
         }
+    }
+
+    #[test]
+    fn act_as_of_returns_selector_for_supported_ops() {
+        let selector = ActAs {
+            namespace: "acme".into(),
+            agent_id: sample_uuid(9),
+        };
+
+        let encode = RequestBody::Encode(EncodeRequest {
+            text: "x".into(),
+            context_id: 0,
+            request_id: sample_uuid(1),
+            txn_id: None,
+            occurred_at_unix_nanos: None,
+            act_as: Some(selector.clone()),
+            trace: false,
+        });
+        assert_eq!(act_as_of(&encode), Some(&selector));
+
+        let recall = RequestBody::Recall(RecallRequest {
+            cue_text: "x".into(),
+            subject_name: String::new(),
+            max_results: 1,
+            confidence_threshold: 0.0,
+            context_filter: None,
+            age_bound_unix_nanos: None,
+            as_of_record_time_unix_nanos: None,
+            kind_filter: None,
+            salience_floor: 0.0,
+            include_edges: false,
+            include_graph: false,
+            include_text: false,
+            request_id: None,
+            txn_id: None,
+            trace: false,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&recall), Some(&selector));
+
+        let forget = RequestBody::Forget(ForgetRequest {
+            memory_id: sample_memory_id(),
+            mode: ForgetMode::Soft,
+            request_id: sample_uuid(1),
+            txn_id: None,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&forget), Some(&selector));
+
+        let plan = RequestBody::Plan(PlanRequest {
+            start: PlanState::ByText("a".into()),
+            goal: PlanState::ByText("b".into()),
+            budget: PlanBudget {
+                max_steps: 1,
+                max_wall_time_ms: 1,
+                max_branches_explored: 1,
+            },
+            strategy_hint: None,
+            context_filter: None,
+            request_id: None,
+            txn_id: None,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&plan), Some(&selector));
+
+        let reason = RequestBody::Reason(ReasonRequest {
+            observation: ObservationInput::ByText("x".into()),
+            depth: 1,
+            confidence_threshold: 0.0,
+            context_filter: None,
+            max_inferences: 1,
+            budget_wall_time_ms: 1,
+            request_id: None,
+            txn_id: None,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&reason), Some(&selector));
+
+        let link = RequestBody::Link(LinkRequest {
+            source: sample_memory_id(),
+            target: sample_memory_id(),
+            kind: EdgeKindWire::Caused,
+            weight: 1.0,
+            request_id: sample_uuid(1),
+            txn_id: None,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&link), Some(&selector));
+
+        let unlink = RequestBody::Unlink(UnlinkRequest {
+            source: sample_memory_id(),
+            target: sample_memory_id(),
+            kind: EdgeKindWire::Caused,
+            request_id: sample_uuid(1),
+            txn_id: None,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&unlink), Some(&selector));
+
+        let entity_create = RequestBody::EntityCreate(EntityCreateRequest {
+            entity_type_id: 1,
+            canonical_name: "Ada".into(),
+            aliases: Vec::new(),
+            attributes_blob: Vec::new(),
+            request_id: sample_uuid(1),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&entity_create), Some(&selector));
+
+        let entity_resolve = RequestBody::EntityResolve(EntityResolveRequest {
+            candidate_name: "Ada".into(),
+            context: String::new(),
+            entity_type_hint: 0,
+            allow_create: false,
+            request_id: sample_uuid(1),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&entity_resolve), Some(&selector));
+
+        let entity_get = RequestBody::EntityGet(EntityGetRequest {
+            entity_id: sample_uuid(1),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&entity_get), Some(&selector));
+
+        let entity_list = RequestBody::EntityList(EntityListRequest {
+            entity_type_id: 0,
+            name_prefix: String::new(),
+            mention_count_min: 0,
+            include_tombstoned: false,
+            include_merged: false,
+            limit: 100,
+            cursor: Vec::new(),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&entity_list), Some(&selector));
+
+        let statement_create = RequestBody::StatementCreate(StatementCreateRequest {
+            kind: StatementKindWire::Fact,
+            subject: sample_uuid(1),
+            predicate: "p".into(),
+            object: StatementObjectWire::Value(StatementValueWire::Text("v".into())),
+            confidence: 1.0,
+            evidence: EvidenceRefWire::Inline(Vec::new()),
+            extractor_id: 0,
+            valid_from_unix_nanos: 0,
+            valid_to_unix_nanos: 0,
+            event_at_unix_nanos: 0,
+            schema_version: 0,
+            request_id: sample_uuid(1),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&statement_create), Some(&selector));
+
+        let relation_create = RequestBody::RelationCreate(RelationCreateRequest {
+            relation_type: "r".into(),
+            from_entity: sample_uuid(1),
+            to_entity: sample_uuid(2),
+            properties_blob: Vec::new(),
+            evidence: EvidenceRefWire::Inline(Vec::new()),
+            extractor_id: 0,
+            confidence: 1.0,
+            valid_from_unix_nanos: 0,
+            valid_to_unix_nanos: 0,
+            request_id: sample_uuid(1),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&relation_create), Some(&selector));
+
+        let relation_traverse = RequestBody::RelationTraverse(RelationTraverseRequest {
+            start_entity: sample_uuid(1),
+            relation_types: Vec::new(),
+            direction: 0,
+            max_depth: 3,
+            max_nodes: 100,
+            time_at_unix_nanos: 0,
+            include_superseded: false,
+            request_id: sample_uuid(1),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&relation_traverse), Some(&selector));
+
+        let statement_get = RequestBody::StatementGet(StatementGetRequest {
+            statement_id: sample_uuid(1),
+            follow_supersession: false,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&statement_get), Some(&selector));
+
+        let statement_list = RequestBody::StatementList(StatementListRequest {
+            subject: sample_uuid(1),
+            predicate: String::new(),
+            kind: 0,
+            min_confidence: 0.0,
+            time_range_start_unix_nanos: 0,
+            time_range_end_unix_nanos: 0,
+            only_current: false,
+            include_tombstoned: false,
+            limit: 100,
+            cursor: Vec::new(),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&statement_list), Some(&selector));
+
+        let relation_get = RequestBody::RelationGet(RelationGetRequest {
+            relation_id: sample_uuid(1),
+            follow_supersession: false,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&relation_get), Some(&selector));
+
+        let relation_list_from = RequestBody::RelationListFrom(RelationListFromRequest {
+            from_entity: sample_uuid(1),
+            relation_type_filter: String::new(),
+            time_range_start_unix_nanos: 0,
+            time_range_end_unix_nanos: 0,
+            include_superseded: false,
+            include_tombstoned: false,
+            limit: 100,
+            cursor: Vec::new(),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&relation_list_from), Some(&selector));
+
+        let relation_list_to = RequestBody::RelationListTo(RelationListToRequest {
+            to_entity: sample_uuid(1),
+            relation_type_filter: String::new(),
+            time_range_start_unix_nanos: 0,
+            time_range_end_unix_nanos: 0,
+            include_superseded: false,
+            include_tombstoned: false,
+            limit: 100,
+            cursor: Vec::new(),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&relation_list_to), Some(&selector));
+    }
+
+    #[test]
+    fn act_as_of_returns_none_when_absent_or_unsupported() {
+        // Supported op, but no override set.
+        let encode = RequestBody::Encode(EncodeRequest {
+            text: "x".into(),
+            context_id: 0,
+            request_id: sample_uuid(1),
+            txn_id: None,
+            occurred_at_unix_nanos: None,
+            act_as: None,
+            trace: false,
+        });
+        assert!(act_as_of(&encode).is_none());
+
+        // Op that does not carry an `act_as` field at all.
+        let ping = RequestBody::Ping(PingRequest {
+            client_timestamp_unix_nanos: 0,
+        });
+        assert!(act_as_of(&ping).is_none());
     }
 
     #[test]

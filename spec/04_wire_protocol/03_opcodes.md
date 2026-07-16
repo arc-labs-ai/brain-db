@@ -38,6 +38,8 @@ The opcode is a big-endian `u16` in the frame header (bytes 5–6). The high byt
 | 0x00A5 | `LINK_RESP` | S → C | Link acknowledgment |
 | 0x0026 | `UNLINK_REQ` | C → S | Remove an edge between two memories |
 | 0x00A6 | `UNLINK_RESP` | S → C | Unlink acknowledgment |
+| 0x0027 | `MEMORY_LIST_REQ` | C → S | Paginated enumeration of the caller's memories (non-ranked) |
+| 0x00A7 | `MEMORY_LIST_RESP` | S → C | Enumeration page + keyset cursor |
 | 0x002A | `ENCODE_VECTOR_DIRECT_REQ` | C → S | Power-user encode with pre-supplied vector |
 | 0x00AA | `ENCODE_VECTOR_DIRECT_RESP` | S → C | (Same response shape as ENCODE_RESP) |
 
@@ -197,7 +199,24 @@ The low byte's high bit selects direction within this namespace, mirroring the s
 |---|---|---|---|
 | 0x0161 | `QUERY_EXPLAIN` | QueryRequest | QueryPlan (no execution) |
 | 0x0162 | `QUERY_TRACE` | QueryRequest | QueryResult + per-retriever debug |
+| 0x0163 | `GRAPH_FETCH` | cursor, layer toggles, page size | Typed-graph nodes + edges page + keyset cursor |
+| 0x00E3 → 0x01E3 | `GRAPH_FETCH_RESP` | S → C | nodes[], edges[], next_cursor |
 | 0x0164 | `MATERIALIZE_PROCEDURAL` | agent_id, target_predicates | ProceduralBlock (rendered system prompt) |
+
+`GRAPH_FETCH` (`0x0163` / resp `0x01E3`) is a paginated export of the caller's
+whole `(namespace, agent)` typed graph as a node/edge set — the read that
+backs a graph-explorer UI. It is not `RECALL`: no cue, no ranking. It paginates
+over the subject-anchored statement index (the one typed-graph index that is
+`(namespace, agent)`-prefixed) and derives the entity set from traversal, so a
+fully-isolated entity (never a statement subject/object and with no relation to
+a statemented entity) does not surface. Nodes are entities (always), plus
+value-object statement nodes when `include_statements` and source-memory nodes
+when `include_memories`; edges are `Relation` (entity↔entity, relations table),
+`Fact` (entity↔entity, from an entity-object statement), `HasStatement`
+(entity→value statement), and `Mentions` (memory→entity). The cursor is opaque
+and signed over the layer toggles; the response contract is **completeness, not
+disjointness** — every node/edge appears in ≥1 page and may repeat across
+pages, each carrying a stable 16-byte id for client-side dedup.
 
 There is **no client-facing bulk-query verb.** `RECALL` (`0x0021`) is the sole
 primary read; it returns the answer as a membership shape (Single / Many /
@@ -403,6 +422,8 @@ Adding new opcodes is a wire-protocol-version bump (see §"Versioning" below). T
 - Negotiation at handshake gives both sides a chance to know what the other supports.
 
 A future major-version bump might add opcodes for replication-related operations, multi-modal operations, etc.
+
+**Per-request identity (`act_as`) adds no opcode.** The `act_as` mechanism (see [`04_handshake.md`](04_handshake.md) §10a) is an **optional field on existing data-plane op requests** (`ENCODE_REQ` / `RECALL_REQ` / `FORGET_REQ`), not a new operation. The `can_act_as` grant is minted over the admin HTTP surface, not a wire op. Because Brain is pre-release (v0.1.0) with no published wire, this field was added **in place** — no new opcode, and no wire-version bump (the version stays `1`; see [`02_wire_format.md`](02_wire_format.md) §11.3).
 
 ## Versioning
 

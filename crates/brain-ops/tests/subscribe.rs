@@ -118,6 +118,8 @@ fn encode_req(
         request_id,
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     }
 }
 
@@ -159,6 +161,7 @@ async fn do_forget(ctx: &OpsContext, memory_id: u128, request_id: [u8; 16]) {
         mode: ForgetMode::Soft,
         request_id,
         txn_id: None,
+        act_as: None,
     };
     let outcome = dispatch(
         RequestBody::Forget(req),
@@ -317,6 +320,8 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
                     request_id: [0xA; 16],
                     txn_id: Some(txn_id),
                     occurred_at_unix_nanos: None,
+                    act_as: None,
+                    trace: false,
                 }),
                 brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
@@ -335,6 +340,8 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
                     request_id: [0xB; 16],
                     txn_id: Some(txn_id),
                     occurred_at_unix_nanos: None,
+                    act_as: None,
+                    trace: false,
                 }),
                 brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,

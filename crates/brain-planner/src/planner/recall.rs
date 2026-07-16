@@ -171,6 +171,7 @@ mod tests {
 
     fn base_request() -> RecallRequest {
         RecallRequest {
+            trace: false,
             cue_text: "hello".into(),
             subject_name: String::new(),
             max_results: 10,
@@ -185,6 +186,7 @@ mod tests {
             include_text: false,
             request_id: None,
             txn_id: None,
+            act_as: None,
         }
     }
 

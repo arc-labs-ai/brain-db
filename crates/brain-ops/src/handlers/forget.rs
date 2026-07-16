@@ -29,7 +29,10 @@ pub async fn handle_forget(
 
     let memory_id = MemoryId::from(memory_id_wire);
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(brain_core::RequestId::from(req.request_id));
+    let write_id = WriteId::from_request(
+        brain_core::RequestId::from(req.request_id),
+        ctx.executor.caller_agent,
+    );
     let request_hash = hash_forget_request(&ForgetOp {
         request_id: brain_core::RequestId::from(req.request_id),
         memory_id,

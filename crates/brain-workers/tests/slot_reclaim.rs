@@ -335,6 +335,8 @@ fn forget_stamps_tombstoned_at_unix_nanos() {
             request_id: [1; 16],
             txn_id: None,
             occurred_at_unix_nanos: None,
+            act_as: None,
+            trace: false,
         };
         let memory_id = match single_body(
             dispatch(
@@ -353,6 +355,7 @@ fn forget_stamps_tombstoned_at_unix_nanos() {
             mode: ForgetMode::Soft,
             request_id: [2; 16],
             txn_id: None,
+            act_as: None,
         };
         let _ = dispatch(
             RequestBody::Forget(forget),
@@ -380,6 +383,8 @@ fn forget_replay_does_not_overwrite_stamp() {
             request_id: [10; 16],
             txn_id: None,
             occurred_at_unix_nanos: None,
+            act_as: None,
+            trace: false,
         };
         let memory_id = match single_body(
             dispatch(
@@ -402,6 +407,7 @@ fn forget_replay_does_not_overwrite_stamp() {
                     mode: ForgetMode::Soft,
                     request_id: rid,
                     txn_id: None,
+                    act_as: None,
                 }),
                 brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,

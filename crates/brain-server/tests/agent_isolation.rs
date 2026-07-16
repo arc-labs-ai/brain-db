@@ -165,6 +165,8 @@ async fn encode(client: &mut TcpStream, stream_id: u32, text: &str) -> u128 {
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     };
     let (opcode, body) = round_trip(client, stream_id, RequestBody::Encode(req)).await;
     match body {
@@ -177,6 +179,7 @@ async fn encode(client: &mut TcpStream, stream_id: u32, text: &str) -> u128 {
 /// set. Scope is always the caller's own agent — there is no client filter.
 async fn recall_ids(client: &mut TcpStream, stream_id: u32, cue: &str) -> Vec<u128> {
     let req = RecallRequest {
+        trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),
         max_results: 50,
@@ -191,6 +194,7 @@ async fn recall_ids(client: &mut TcpStream, stream_id: u32, cue: &str) -> Vec<u1
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id: None,
+        act_as: None,
     };
     let (opcode, body) = round_trip(client, stream_id, RequestBody::Recall(req)).await;
     assert_eq!(

@@ -25,7 +25,8 @@ pub async fn handle_link(req: LinkRequest, ctx: &OpsContext) -> Result<LinkRespo
     let kind = EdgeKind::from(req.kind);
 
     let real_writer = downcast_writer(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
     let request_hash = hash_link_request(&LinkOp {
         request_id: RequestId::from(req.request_id),
         source,
@@ -179,7 +180,8 @@ pub async fn handle_unlink(
     let kind = EdgeKind::from(req.kind);
 
     let real_writer = downcast_writer(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
     let request_hash = hash_unlink_request(&UnlinkOp {
         request_id: RequestId::from(req.request_id),
         source,

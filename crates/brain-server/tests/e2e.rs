@@ -166,6 +166,8 @@ async fn encode_round_trip(
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     };
     send_frame(
         client,
@@ -192,6 +194,7 @@ async fn encode_round_trip(
 
 async fn recall_round_trip(client: &mut TcpStream, stream_id: u32, cue: &str) -> u16 {
     let req = RecallRequest {
+        trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),
         max_results: 5,
@@ -206,6 +209,7 @@ async fn recall_round_trip(client: &mut TcpStream, stream_id: u32, cue: &str) ->
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id: None,
+        act_as: None,
     };
     send_frame(
         client,
@@ -232,6 +236,7 @@ async fn forget_round_trip(client: &mut TcpStream, stream_id: u32, memory_id: u1
         mode: ForgetMode::Soft,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
+        act_as: None,
     };
     send_frame(
         client,

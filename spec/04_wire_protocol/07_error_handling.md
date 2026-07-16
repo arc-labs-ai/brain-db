@@ -81,6 +81,9 @@ The error `message` MAY distinguish these for the operator but the code is the s
 | `NamespaceRequired` | A write resolved to no owning namespace — fail-closed; namespace is required and there is no implicit/default namespace |
 | `NamespaceUnknown` | The connection's key (or a referenced namespace) names a namespace that has not been provisioned |
 | `WriteToSystemNamespace` | Attempt to own/modify data in the reserved read-only `brain` system namespace |
+| `ActAsDenied` | A request carried an `act_as` field the connection principal is not entitled to honor — either the principal lacks the `can_act_as` grant (invariant R1) or `act_as.namespace` is outside its `may_act` allowlist (invariant R2) |
+
+`ActAsDenied` is the dedicated code for a per-request-identity denial (see [`04_handshake.md`](04_handshake.md) §10a). It is distinct from `PermissionDenied` so that "this principal may not impersonate / may not act for that namespace" is never confused with "the effective agent lacks permission for this op" — the latter is resolved against the effective identity and surfaces as ordinary `PermissionDenied` (invariant R4). Per R1, an `act_as` the principal cannot honor is **hard-rejected** with `ActAsDenied`; the server never silently downgrades the op to the connection's own identity. Like every `Authorization`-category error it is **not** retryable. The transport precondition (R6 — `act_as` honored only over mTLS / a trusted network) is a deployment guarantee, not a per-request error code.
 
 #### 3.4 Validation (Category: `Validation`)
 

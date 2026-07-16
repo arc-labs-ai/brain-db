@@ -41,6 +41,11 @@ pub struct RequestScope {
     pub user_id: [u8; 16],
     pub namespace: String,
     pub permissions: u32,
+    /// Allowlist of namespaces this connection principal may act *for*
+    /// under the `ACT_AS` grant. A request's `act_as.namespace` is
+    /// validated against this set before the effective caller is built.
+    /// Empty for every non-`ACT_AS` key.
+    pub may_act: Vec<String>,
     /// BLAKE3 of the secret used to authenticate. Useful for
     /// `last_used_at` background touches.
     pub key_hash: [u8; 32],
@@ -56,6 +61,7 @@ impl RequestScope {
             user_id: resolved.user_id,
             namespace: resolved.namespace,
             permissions: resolved.permissions,
+            may_act: resolved.may_act,
             key_hash: resolved.key_hash,
         }
     }
@@ -71,6 +77,7 @@ impl RequestScope {
             can_reason: self.permissions & bits::RECALL != 0,
             can_forget: self.permissions & bits::FORGET != 0,
             can_admin: self.permissions & bits::ADMIN != 0,
+            can_act_as: self.permissions & bits::ACT_AS != 0,
         }
     }
 
@@ -89,6 +96,38 @@ impl RequestScope {
             self.user_id,
             self.namespace.clone(),
             self.permissions,
+        )
+        .with_session_id(session_id)
+    }
+
+    /// Materialize the EFFECTIVE `brain_ops::RequestCaller` for an
+    /// `act_as` request.
+    ///
+    /// The op runs as the target `(namespace, agent_id)`, not the
+    /// connection principal's own identity. Effective permissions are the
+    /// fixed `STANDARD_AGENT` mask — never the principal's bits, and never
+    /// `ADMIN` / `ACT_AS` — because Brain has no per-agent permission
+    /// store to consult for the impersonated identity. The principal's
+    /// `org_id` / `user_id` are retained for the audit trail (the acting
+    /// party is never erased; see RFC 8693 delegation), and the wire
+    /// `session_id` rides along so the connection-drop sweep still finds
+    /// buffered work.
+    ///
+    /// Callers MUST validate the request's `act_as` against
+    /// `permissions & ACT_AS` and `may_act` before calling this — this
+    /// constructor performs no authorization.
+    #[must_use]
+    pub fn to_effective_caller(
+        &self,
+        act_as: &brain_protocol::ActAs,
+        session_id: [u8; 16],
+    ) -> brain_ops::RequestCaller {
+        brain_ops::RequestCaller::from_scope(
+            AgentId(uuid::Uuid::from_bytes(act_as.agent_id)),
+            self.org_id,
+            self.user_id,
+            act_as.namespace.clone(),
+            bits::STANDARD_AGENT,
         )
         .with_session_id(session_id)
     }
@@ -157,6 +196,7 @@ impl AuthStore {
 
     /// Mint a fresh scope-bound API key. Returns the raw secret bytes
     /// to surface once to the operator (never stored).
+    #[allow(clippy::too_many_arguments)]
     pub fn mint(
         &self,
         org_id: [u8; 16],
@@ -164,6 +204,7 @@ impl AuthStore {
         namespace: String,
         agent_id: [u8; 16],
         permissions: u32,
+        may_act: Vec<String>,
         now_unix_nanos: u64,
     ) -> Result<MintedKey, ApiKeyError> {
         // 32 bytes of CSPRNG output. Concatenate two v7 UUIDs and run
@@ -183,6 +224,7 @@ impl AuthStore {
             namespace,
             agent_id,
             permissions,
+            may_act,
             now_unix_nanos,
         )?;
         wtxn.commit()?;
@@ -370,6 +412,7 @@ mod tests {
                 "acme".into(),
                 agent(7),
                 bits::STANDARD_AGENT,
+                Vec::new(),
                 1_700_000_000_000_000_000,
             )
             .unwrap();
@@ -397,6 +440,7 @@ mod tests {
                 "acme".into(),
                 agent(7),
                 bits::STANDARD_AGENT,
+                Vec::new(),
                 1_700_000_000_000_000_000,
             )
             .unwrap();
@@ -425,6 +469,7 @@ mod tests {
                 "acme".into(),
                 agent(7),
                 bits::STANDARD_AGENT,
+                Vec::new(),
                 1,
             )
             .unwrap();
@@ -446,6 +491,7 @@ mod tests {
                 "acme".into(),
                 key_agent,
                 bits::STANDARD_AGENT,
+                Vec::new(),
                 1,
             )
             .unwrap();
@@ -463,6 +509,7 @@ mod tests {
             namespace: "n".into(),
             agent_id: agent(1),
             permissions: bits::ENCODE | bits::RECALL,
+            may_act: Vec::new(),
         });
         let p = scope.to_agent_permissions();
         assert!(p.can_encode);
@@ -483,6 +530,7 @@ mod tests {
                 "n".into(),
                 agent(1),
                 bits::STANDARD_AGENT,
+                Vec::new(),
                 1,
             )
             .unwrap();

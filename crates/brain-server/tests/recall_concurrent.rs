@@ -159,6 +159,7 @@ async fn round_trip(
 
 fn recall_request(cue: &str, txn_id: Option<[u8; 16]>) -> RecallRequest {
     RecallRequest {
+        trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),
         max_results: 5,
@@ -173,6 +174,7 @@ fn recall_request(cue: &str, txn_id: Option<[u8; 16]>) -> RecallRequest {
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id,
+        act_as: None,
     }
 }
 
@@ -183,6 +185,8 @@ async fn encode_text(client: &mut TcpStream, stream_id: u32, text: &str) {
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     };
     let (opcode, body) = round_trip(client, stream_id, RequestBody::Encode(req)).await;
     if opcode != Opcode::EncodeResp.as_u16() {

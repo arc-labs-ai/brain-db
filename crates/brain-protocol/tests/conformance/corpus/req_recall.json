@@ -33,5 +33,6 @@
     17,
     17
   ],
-  "txn_id": null
+  "txn_id": null,
+  "trace": true
 }

@@ -85,6 +85,8 @@ async fn encode_one(ctx: &OpsContext, rid: u32, text: &str) {
         request_id,
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     };
     let _ = dispatch(
         RequestBody::Encode(req),
@@ -97,6 +99,7 @@ async fn encode_one(ctx: &OpsContext, rid: u32, text: &str) {
 
 async fn recall_one(ctx: &OpsContext, cue: &str) -> usize {
     let req = RecallRequest {
+        trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),
         max_results: 5,
@@ -111,6 +114,7 @@ async fn recall_one(ctx: &OpsContext, cue: &str) -> usize {
         include_text: false,
         request_id: None,
         txn_id: None,
+        act_as: None,
     };
     let outcome = dispatch(
         RequestBody::Recall(req),

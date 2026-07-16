@@ -107,7 +107,10 @@ pub async fn handle_encode_vector_direct(
     //    text-encode so a request_id that hops between the two paths
     //    is detected as a conflict.
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(brain_core::RequestId::from(req.request_id));
+    let write_id = WriteId::from_request(
+        brain_core::RequestId::from(req.request_id),
+        ctx.executor.caller_agent,
+    );
     let context_id = ContextId::from(req.context_id);
     let kind = MemoryKind::from(req.kind);
     // For dedup we need a stable content hash. When `text` is present
@@ -154,6 +157,7 @@ pub async fn handle_encode_vector_direct(
                 embedding_model_fp: server_fp,
                 pending_stages: Vec::new(),
                 has_active_schema: true,
+                trace: None,
             });
         }
     }
@@ -246,6 +250,7 @@ pub async fn handle_encode_vector_direct(
         embedding_model_fp: server_fp,
         pending_stages,
         has_active_schema: true,
+        trace: None,
     })
 }
 
@@ -449,6 +454,7 @@ fn reconstruct_response(
         embedding_model_fp,
         pending_stages,
         has_active_schema: true,
+        trace: None,
     })
 }
 

@@ -2102,6 +2102,25 @@ pub fn spawn_shard(
                 .with_shard_id(shard_id)
                 .with_event_bus(event_bus.clone())
                 .with_wal_sink(wal_sink);
+            // Seed the slot counter from the persisted high-water mark so a
+            // restart on a non-empty shard never re-issues a live arena slot.
+            // (The counter resets to 1 in-process; without this, restart-reuse
+            // collides memory_ids — overwriting rows and skipping extraction.)
+            match metadata.read_txn() {
+                Ok(rtxn) => {
+                    match brain_metadata::tables::slot_version::max_assigned_slot(&rtxn) {
+                        Ok(hi) => real_writer.seed_next_slot(hi.saturating_add(1)),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "slot high-water recovery failed; slot counter starts at 1"
+                        ),
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "slot high-water recovery read_txn failed; slot counter starts at 1"
+                ),
+            }
             if let Some(tx) = auto_edge_sender {
                 real_writer.set_auto_edge_sender(tx);
             }

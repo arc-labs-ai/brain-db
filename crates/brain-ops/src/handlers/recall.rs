@@ -20,14 +20,18 @@ use brain_index::RankedItemId;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_planner::retrieval::executor::{
-    execute as retrieval_execute, ExecutionError, QueryResult, RetrievalExecutorContext,
+    execute as retrieval_execute, ExecutionError, QueryMetadata, QueryResult, RerankOutcome,
+    RetrievalExecutorContext, RetrieverStatus,
 };
 use brain_planner::retrieval::planner::{plan as retrieval_plan, PlanError};
 use brain_planner::retrieval::router::{
     QueryRequest as PlannerQueryRequest, Retriever, RetrieverSelection,
 };
 use brain_protocol::envelope::request::{MemoryKindWire, RecallRequest};
-use brain_protocol::envelope::response::{AnswerKindWire, MemoryResult, RecallResponseFrame};
+use brain_protocol::envelope::response::{
+    AnswerKindWire, MemoryResult, RecallResponseFrame, RecallTrace, RecallTraceFilterChain,
+    RecallTraceRerank, RecallTraceRetriever, RecallTraceRetrieverStatus,
+};
 use brain_protocol::RetrieverNameWire;
 
 use crate::context::OpsContext;
@@ -146,12 +150,15 @@ pub async fn handle_recall(
     // structural walk can't re-introduce the subject-dump flood. No flags: every
     // read traverses everything the write built, ranked by relevance to the cue.
     let anchor = resolve_graph_anchor(&req, ctx);
-    let memories = retrieve_memories(&req, ctx, anchor, cue_vec.as_ref()).await?;
+    // `trace` is `Some` only when the caller opted in (`req.trace`); it carries
+    // the read pipeline's per-stage observability the executor already computed
+    // and otherwise discards. It rides through to the final frame untouched.
+    let (memories, trace) = retrieve_memories(&req, ctx, anchor, cue_vec.as_ref()).await?;
 
     let Some(cue_vec) = cue_vec else {
         // No cue embedding → no grounding overlay, so no committed shape; the
         // answer cardinality falls back to the member count.
-        return Ok(recall_frame(memories, None));
+        return Ok(recall_frame(memories, None, trace));
     };
 
     let grounded = best_grounded_for_cue(&req, ctx, &cue_vec)?;
@@ -215,7 +222,7 @@ pub async fn handle_recall(
         apply_kind_presence_abstention(membership, anchor, &grounded, max_support)
     };
 
-    Ok(recall_frame(membership, committed_shape))
+    Ok(recall_frame(membership, committed_shape, trace))
 }
 
 /// Honest abstention by structural anchor — unconditional, no flag/knob (FIX C).
@@ -426,12 +433,14 @@ fn order_by_answer_relevance(
     if (hi - lo) <= f32::EPSILON {
         return out;
     }
-    let c =
-        |m: &MemoryResult| cos.get(&m.memory_id).copied().unwrap_or_else(|| m.similarity_score.max(0.0));
+    let c = |m: &MemoryResult| {
+        cos.get(&m.memory_id)
+            .copied()
+            .unwrap_or_else(|| m.similarity_score.max(0.0))
+    };
     // Stable sort: equal (hype, cos) members keep their incoming relative order.
     out.sort_by(|a, b| {
-        h(b)
-            .partial_cmp(&h(a))
+        h(b).partial_cmp(&h(a))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| c(b).partial_cmp(&c(a)).unwrap_or(std::cmp::Ordering::Equal))
     });
@@ -573,8 +582,9 @@ fn apply_grounded_commit(
     cos: &HashMap<u128, f32>,
 ) -> Vec<MemoryResult> {
     let lead_set: HashSet<u128> = lead.ids.iter().copied().collect();
-    let (mut leads, rest): (Vec<MemoryResult>, Vec<MemoryResult>) =
-        out.into_iter().partition(|m| lead_set.contains(&m.memory_id));
+    let (mut leads, rest): (Vec<MemoryResult>, Vec<MemoryResult>) = out
+        .into_iter()
+        .partition(|m| lead_set.contains(&m.memory_id));
     // Leads in grounded (recency) order: index into `lead.ids`.
     leads.sort_by_key(|m| {
         lead.ids
@@ -1053,6 +1063,7 @@ fn keyed_membership_ceiling(req: &RecallRequest, client_requested_count: bool) -
 fn recall_frame(
     memories: Vec<MemoryResult>,
     committed_shape: Option<AnswerKindWire>,
+    trace: Option<RecallTrace>,
 ) -> RecallResponseFrame {
     let answer_kind = if memories.is_empty() {
         AnswerKindWire::None
@@ -1069,6 +1080,7 @@ fn recall_frame(
         is_final: true,
         cumulative_count,
         estimated_remaining: None,
+        trace,
     }
 }
 
@@ -1768,7 +1780,7 @@ async fn retrieve_memories(
     ctx: &OpsContext,
     entity_anchor: Option<EntityId>,
     cue_vec: Option<&[f32; brain_embed::VECTOR_DIM]>,
-) -> Result<Vec<MemoryResult>, OpError> {
+) -> Result<(Vec<MemoryResult>, Option<RecallTrace>), OpError> {
     let planner_req = build_planner_request(req, ctx.executor.caller_agent, entity_anchor);
 
     let plan = retrieval_plan(&planner_req).map_err(map_plan_error)?;
@@ -1869,6 +1881,17 @@ async fn retrieve_memories(
         );
     }
 
+    // Structured per-stage trace, opt-in. The executor already computed
+    // `result.metadata` (per-lane latencies/outcomes/counts, filter-chain
+    // survivor counts, rerank outcome, total wall-time) for its own
+    // observability; without `req.trace` we drop it exactly as before, so the
+    // common path pays nothing. When asked, we hand it to the final frame.
+    let trace = if req.trace {
+        Some(build_recall_trace(&result.metadata))
+    } else {
+        None
+    };
+
     let memory_results = project_memory_results(&result, req, ctx)?;
 
     // In-txn read-your-writes: overlay the txn's pending ENCODE
@@ -1896,7 +1919,95 @@ async fn retrieve_memories(
         ctx.access_buffer.record(MemoryId::from_raw(r.memory_id));
     }
 
-    Ok(memory_results)
+    Ok((memory_results, trace))
+}
+
+/// Structure the executor's `QueryMetadata` into the wire `RecallTrace` the
+/// `trace = true` caller receives. Pure re-shape — the same per-lane
+/// latencies/outcomes/counts, filter-chain survivor counts, rerank outcome,
+/// and total wall-time the read pipeline already produced, surfaced as data
+/// instead of the rendered text `QUERY_TRACE` emits.
+fn build_recall_trace(meta: &QueryMetadata) -> RecallTrace {
+    let latency_of = |r: Retriever| -> f64 {
+        meta.retriever_latencies_ms
+            .iter()
+            .find(|(rr, _)| *rr == r)
+            .map(|(_, ms)| *ms)
+            .unwrap_or(0.0)
+    };
+    let count_of = |r: Retriever| -> u32 {
+        meta.retriever_total_results
+            .iter()
+            .find(|(rr, _)| *rr == r)
+            .map(|(_, c)| u32::try_from(*c).unwrap_or(u32::MAX))
+            .unwrap_or(0)
+    };
+
+    let retrievers = meta
+        .retriever_outcomes
+        .iter()
+        .map(|o| {
+            let (status, status_detail) = match &o.status {
+                RetrieverStatus::Success => (RecallTraceRetrieverStatus::Success, String::new()),
+                RetrieverStatus::Skipped(reason) => {
+                    (RecallTraceRetrieverStatus::Skipped, (*reason).to_string())
+                }
+                RetrieverStatus::Timeout => (RecallTraceRetrieverStatus::Timeout, String::new()),
+                RetrieverStatus::Failure(msg) => (RecallTraceRetrieverStatus::Failure, msg.clone()),
+            };
+            RecallTraceRetriever {
+                name: retriever_name_wire(o.retriever),
+                status,
+                status_detail,
+                latency_ms: latency_of(o.retriever),
+                candidate_count: count_of(o.retriever),
+            }
+        })
+        .collect();
+
+    let s = &meta.filter_stats;
+    let filter_chain = RecallTraceFilterChain {
+        before: s.before,
+        after_type: s.after_type,
+        after_temporal: s.after_temporal,
+        after_confidence: s.after_confidence,
+        after_tombstone: s.after_tombstone,
+        after_supersession: s.after_supersession,
+        after_as_of: s.after_as_of,
+        after_limit: s.after_limit,
+    };
+
+    let rerank = meta.rerank.as_ref().map(|r| match r {
+        RerankOutcome::Applied {
+            candidates,
+            latency_ms,
+        } => RecallTraceRerank {
+            applied: true,
+            candidates: u32::try_from(*candidates).unwrap_or(u32::MAX),
+            latency_ms: *latency_ms,
+        },
+        RerankOutcome::SkippedNoCandidates => RecallTraceRerank {
+            applied: false,
+            candidates: 0,
+            latency_ms: 0.0,
+        },
+    });
+
+    RecallTrace {
+        retrievers,
+        filter_chain,
+        rerank,
+        total_latency_ms: meta.total_latency_ms,
+    }
+}
+
+/// Map the planner's internal `Retriever` discriminant to the wire lane name.
+fn retriever_name_wire(r: Retriever) -> RetrieverNameWire {
+    match r {
+        Retriever::Semantic => RetrieverNameWire::Semantic,
+        Retriever::Lexical => RetrieverNameWire::Lexical,
+        Retriever::Graph => RetrieverNameWire::Graph,
+    }
 }
 
 /// Env gate for autocut (`BRAIN_AUTOCUT`). Default OFF.
@@ -2106,7 +2217,7 @@ fn cosine(a: &[f32; brain_embed::VECTOR_DIM], b: &[f32; brain_embed::VECTOR_DIM]
 ///   * relations  — top 5 by `created_at_unix_nanos` desc, both
 ///     incoming and outgoing typed edges incident to mentioned
 ///     entities
-fn fetch_enrichment_for(
+pub(crate) fn fetch_enrichment_for(
     memory_ids: &[MemoryId],
     scope: brain_metadata::RowScope,
     rtxn: &redb::ReadTransaction,
@@ -2254,8 +2365,13 @@ fn fetch_enrichment_for(
 
         // 3. Typed relations incident to any mentioned entity. Both
         // directions; top RELATION_CAP by created_at desc across the
-        // pool.
+        // pool. A relation whose BOTH endpoints are mentioned by this
+        // memory is reachable twice — once as an outgoing edge from one
+        // endpoint, once as an incoming edge to the other — so dedup on
+        // the edge identity `(from, type, to)` to emit each relation once.
         let mut all_rels: Vec<(u64, EnrichedRelation)> = Vec::new();
+        let mut seen_rels: std::collections::HashSet<([u8; 16], u32, [u8; 16])> =
+            std::collections::HashSet::new();
         for eid in &entity_ids {
             for outgoing in [true, false] {
                 let rows = if outgoing {
@@ -2284,6 +2400,11 @@ fn fetch_enrichment_for(
                     } else {
                         (other_entity, *eid)
                     };
+                    // Skip the mirror image of a relation already recorded
+                    // from its other endpoint.
+                    if !seen_rels.insert((from_id.to_bytes(), typed_id.raw(), to_id.to_bytes())) {
+                        continue;
+                    }
                     let from_name = entity_get(rtxn, from_id)
                         .ok()
                         .flatten()
@@ -2730,7 +2851,11 @@ mod tests {
         let id = EntityId::new();
         let other = EntityId::new();
         let anchors: HashSet<EntityId> = [id].into_iter().collect();
-        assert!(slot_hit_projectable(Slot::Time, SubjectRef::Entity(id), &anchors));
+        assert!(slot_hit_projectable(
+            Slot::Time,
+            SubjectRef::Entity(id),
+            &anchors
+        ));
         assert!(!slot_hit_projectable(
             Slot::Time,
             SubjectRef::Entity(other),
@@ -2761,6 +2886,8 @@ mod tests {
             include_text: true,
             request_id: None,
             txn_id: None,
+            trace: false,
+            act_as: None,
         }
     }
 
@@ -3152,7 +3279,11 @@ mod tests {
         }
     }
 
-    fn outcome(kind: AnswerKind, values: Vec<GroundedValue>, anchor_scoped: bool) -> GroundedOutcome {
+    fn outcome(
+        kind: AnswerKind,
+        values: Vec<GroundedValue>,
+        anchor_scoped: bool,
+    ) -> GroundedOutcome {
         GroundedOutcome::Answer(GroundedAnswer { kind, values }, anchor_scoped)
     }
 

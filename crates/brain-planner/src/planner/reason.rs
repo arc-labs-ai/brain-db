@@ -183,6 +183,7 @@ mod tests {
             budget_wall_time_ms: 100,
             request_id: None,
             txn_id: None,
+            act_as: None,
         }
     }
 

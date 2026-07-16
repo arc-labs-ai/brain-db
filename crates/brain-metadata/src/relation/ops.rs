@@ -878,7 +878,11 @@ mod tests {
         let t = {
             let wtxn = db.write_txn().unwrap();
             let t = crate::relation::types::relation_type_intern_or_get(
-                &wtxn, "brain", "camped_at", 0, 1,
+                &wtxn,
+                "brain",
+                "camped_at",
+                0,
+                1,
             )
             .unwrap();
             wtxn.commit().unwrap();

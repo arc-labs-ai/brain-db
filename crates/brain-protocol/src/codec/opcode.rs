@@ -58,6 +58,8 @@ pub enum Opcode {
     LinkResp = 0x00A5,
     UnlinkReq = 0x0026,
     UnlinkResp = 0x00A6,
+    MemoryListReq = 0x0027,
+    MemoryListResp = 0x00A7,
     EncodeVectorDirectReq = 0x002A,
     EncodeVectorDirectResp = 0x00AA,
 
@@ -206,11 +208,14 @@ pub enum Opcode {
     RelationTraverseReq = 0x0156,
     RelationTraverseResp = 0x01D6,
 
-    // Retrieval query operations (0x0161-0x0162).
+    // Retrieval query operations (0x0161-0x0163).
     QueryExplainReq = 0x0161,
     QueryExplainResp = 0x01E1,
     QueryTraceReq = 0x0162,
     QueryTraceResp = 0x01E2,
+    /// Paginated export of the caller's whole typed graph (nodes + edges).
+    GraphFetchReq = 0x0163,
+    GraphFetchResp = 0x01E3,
 
     // Procedural-memory materialization. Renders an agent's stored
     // `brain:behavior_*` Preferences into a system block for LLM prompt
@@ -255,6 +260,8 @@ impl Opcode {
             0x00A5 => Self::LinkResp,
             0x0026 => Self::UnlinkReq,
             0x00A6 => Self::UnlinkResp,
+            0x0027 => Self::MemoryListReq,
+            0x00A7 => Self::MemoryListResp,
             0x002A => Self::EncodeVectorDirectReq,
             0x00AA => Self::EncodeVectorDirectResp,
 
@@ -366,6 +373,8 @@ impl Opcode {
             0x01E1 => Self::QueryExplainResp,
             0x0162 => Self::QueryTraceReq,
             0x01E2 => Self::QueryTraceResp,
+            0x0163 => Self::GraphFetchReq,
+            0x01E3 => Self::GraphFetchResp,
 
             0x0164 => Self::MaterializeProceduralReq,
             0x01E4 => Self::MaterializeProceduralResp,
@@ -508,6 +517,8 @@ mod tests {
         (0x00A5, Opcode::LinkResp),
         (0x0026, Opcode::UnlinkReq),
         (0x00A6, Opcode::UnlinkResp),
+        (0x0027, Opcode::MemoryListReq),
+        (0x00A7, Opcode::MemoryListResp),
         (0x002A, Opcode::EncodeVectorDirectReq),
         (0x00AA, Opcode::EncodeVectorDirectResp),
         // Subscription
@@ -632,6 +643,8 @@ mod tests {
         (0x01E1, Opcode::QueryExplainResp),
         (0x0162, Opcode::QueryTraceReq),
         (0x01E2, Opcode::QueryTraceResp),
+        (0x0163, Opcode::GraphFetchReq),
+        (0x01E3, Opcode::GraphFetchResp),
         // Typed-graph — procedural memory materialization
         (0x0164, Opcode::MaterializeProceduralReq),
         (0x01E4, Opcode::MaterializeProceduralResp),

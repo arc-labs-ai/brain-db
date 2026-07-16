@@ -32,6 +32,19 @@ use crate::writer::WalSink;
 /// path. The long-lived stream bypasses this entirely.
 pub const DEFAULT_SUBSCRIBE_POLL_WINDOW: Duration = Duration::from_secs(5);
 
+/// Default window a traced ENCODE (`trace = true`) waits for this write's
+/// async background stages — extractor, auto-edge, temporal-edge — to
+/// publish their completion before the trace gives up and marks the
+/// stragglers `Timeout`. The wait is event-driven and returns the instant
+/// the last stage completes, so this bounds only the pathological
+/// never-completes case; the common path returns in extraction latency
+/// (~1–10s). Sized to comfortably cover the LLM extractor's own 30s
+/// per-call timeout plus queue + apply, so a slow-but-succeeding extraction
+/// is captured in the trace instead of being misreported as a timeout.
+/// Trace is opt-in, so this only ever blocks a caller that explicitly asked
+/// to observe the drained stages.
+pub const DEFAULT_ENCODE_TRACE_DRAIN_WINDOW: Duration = Duration::from_secs(35);
+
 /// Per-shard cross-encoder slot. Replaces an earlier
 /// `Option<Arc<CrossEncoder>>` whose `None` conflated "model failed to
 /// load" with "operator turned this off" — two different failure modes
@@ -96,6 +109,11 @@ pub struct OpsContext {
     /// One-shot dispatcher poll window for `handle_subscribe`. Tests
     /// override this to keep the timeout-path test fast.
     pub subscribe_poll_window: Duration,
+    /// How long a traced ENCODE waits for this write's async background
+    /// stages to drain before marking the stragglers `Timeout`. See
+    /// [`DEFAULT_ENCODE_TRACE_DRAIN_WINDOW`]. Tests override this to keep
+    /// the timeout-path fast.
+    pub encode_trace_drain_window: Duration,
     /// Recently-accessed memory ids.
     pub access_buffer: Arc<AccessBuffer>,
     /// Live extractor registry. Populated at server startup by the
@@ -208,6 +226,7 @@ impl OpsContext {
             events,
             subscriptions,
             subscribe_poll_window: DEFAULT_SUBSCRIBE_POLL_WINDOW,
+            encode_trace_drain_window: DEFAULT_ENCODE_TRACE_DRAIN_WINDOW,
             access_buffer: Arc::new(AccessBuffer::default()),
             extractor_registry: Arc::new(RwLock::new(ExtractorRegistry::new())),
             extractors_dirty: Arc::new(AtomicBool::new(false)),
@@ -230,6 +249,15 @@ impl OpsContext {
     #[must_use]
     pub fn with_subscribe_poll_window(mut self, window: Duration) -> Self {
         self.subscribe_poll_window = window;
+        self
+    }
+
+    /// Override how long a traced ENCODE waits for async background stages
+    /// to drain. Tests set a short window so the timeout path is fast; the
+    /// server leaves the default.
+    #[must_use]
+    pub fn with_encode_trace_drain_window(mut self, window: Duration) -> Self {
+        self.encode_trace_drain_window = window;
         self
     }
 

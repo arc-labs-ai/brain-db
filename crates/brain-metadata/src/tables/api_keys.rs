@@ -35,6 +35,12 @@ pub mod permissions {
     pub const SCHEMA_UPLOAD: u32 = 1 << 4;
     /// May call ADMIN_* ops (including key minting and revocation).
     pub const ADMIN: u32 = 1 << 5;
+    /// May run data-plane ops on behalf of another identity via the
+    /// per-request `act_as` field, bounded by the key's `may_act`
+    /// allowlist. Held only by a trusted service principal (edge or
+    /// gateway) — never a normal agent key, and never part of a default
+    /// bundle; it is always explicitly granted.
+    pub const ACT_AS: u32 = 1 << 6;
 
     /// Common bundles. A standard agent gets read + write + link.
     pub const STANDARD_AGENT: u32 = ENCODE | RECALL | FORGET | LINK;
@@ -71,6 +77,15 @@ pub struct ApiKeyRow {
     pub agent_id: [u8; 16],
     /// Permission bitfield (see [`permissions`]).
     pub permissions: u32,
+    /// Allowlist of namespaces this key may act *for* when it carries the
+    /// [`permissions::ACT_AS`] bit and a request supplies an `act_as`
+    /// target. Brain honors an `act_as` request only when the target
+    /// namespace is in this set; a principal can never act as a namespace
+    /// outside it. Empty for every non-`ACT_AS` key. A single `"*"` entry
+    /// is the wildcard grant: the key may act as any namespace (the trusted
+    /// gateway/edge front-door case, where the tenant set grows at runtime
+    /// and can't be enumerated at mint time).
+    pub may_act: Vec<String>,
     pub created_at_unix_nanos: u64,
     /// Updated by the auth path; eventually consistent (single
     /// background touch). Zero on a never-used key.
@@ -98,6 +113,7 @@ impl ApiKeyRow {
             namespace,
             agent_id,
             permissions,
+            may_act: Vec::new(),
             created_at_unix_nanos,
             last_used_at_unix_nanos: 0,
             revoked: false,

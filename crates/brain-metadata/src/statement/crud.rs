@@ -1144,7 +1144,8 @@ mod tests {
         let mut s = fresh_event(subj, pred, 1_700_000_000);
         s.event_at_unix_nanos = None;
         let wtxn = db.write_txn().unwrap();
-        let id = statement_create(&wtxn, test_scope(), &s, 0).expect("dateless Event should persist");
+        let id =
+            statement_create(&wtxn, test_scope(), &s, 0).expect("dateless Event should persist");
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();

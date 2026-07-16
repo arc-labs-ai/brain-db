@@ -371,3 +371,31 @@ proper filtering + pagination over the wire.
 - The audit row's `outputs: Vec<OutputRefRow>` is captured AFTER
   the output writes but BEFORE the wtxn commit, so the IDs in
   `outputs` are guaranteed durable.
+
+## 10. Caller provenance under `act_as` — dual principal
+
+Every audit row that attributes an operation to an actor records **who
+acted**. Ordinarily that is a single identity: the connection's
+key-derived `(namespace, agent)` plus the non-authoritative `user` tag
+([`../17_observability/04_admin_ops.md`](../17_observability/04_admin_ops.md)
+§12.1). Under the per-request `act_as` field — a trusted service
+principal running an op on behalf of a tenant agent, defined in
+[`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md)
+§"Per-request identity (`act_as`)" — one identity is **not enough**.
+
+The audit provenance MUST record **both** principals:
+
+- the **acting service principal** — the connection's own key-derived
+  identity (the `can_act_as` holder), taken from the authenticated
+  session, never from the request payload; and
+- the **effective identity** — the `(namespace, agent_id)` named in
+  `act_as`, under which the op actually ran.
+
+This is delegation for audit (RFC 8693): impersonation collapses the two
+identities for authorization and isolation, but the acting party is
+**never erased** from the record. An `act_as` op is therefore always
+traceable to the edge/gateway that issued it *and* the tenant it acted
+for — the two facts needed to investigate a compromised service
+principal fanning across tenants. When `act_as` is absent, the acting
+principal and the effective identity are the same, and the row records
+that single identity as today (no dual-principal row for ordinary ops).

@@ -222,10 +222,7 @@ fn first_evidence_memory(ev: &EvidenceRef) -> Option<MemoryId> {
 /// same-day event's resolved date is compared against), so an Event with no
 /// distinct `event_at` answers "when" with the same instant the write treated
 /// as the message time. Returns `None` only when the memory row is absent.
-fn memory_time_anchor(
-    rtxn: &ReadTransaction,
-    mid: MemoryId,
-) -> Result<Option<u64>, GroundedError> {
+fn memory_time_anchor(rtxn: &ReadTransaction, mid: MemoryId) -> Result<Option<u64>, GroundedError> {
     use brain_metadata::tables::memory::MEMORIES_TABLE;
     let table = rtxn
         .open_table(MEMORIES_TABLE)
@@ -1323,9 +1320,11 @@ mod tests {
         // Two DISTINCT current values under a single-valued kind → contradiction,
         // surfaced as a Set of the competing claims.
         let b = StatementKind::Attribute.builtin_behavior().unwrap();
-        let a =
-            shape_answer_for_kind(vec![val("brain:city", "Berlin"), val("brain:city", "Paris")], b)
-                .unwrap();
+        let a = shape_answer_for_kind(
+            vec![val("brain:city", "Berlin"), val("brain:city", "Paris")],
+            b,
+        )
+        .unwrap();
         assert_eq!(a.kind, AnswerKind::Set);
         assert_eq!(a.values.len(), 2);
     }
@@ -1365,17 +1364,27 @@ mod tests {
         let pref = StatementKind::Preference.builtin_behavior().unwrap();
         assert!(pref.polarity);
         let split = shape_answer_for_kind(
-            vec![val("brain:likes", "coffee"), val("brain:dislikes", "coffee")],
+            vec![
+                val("brain:likes", "coffee"),
+                val("brain:dislikes", "coffee"),
+            ],
             pref,
         )
         .unwrap();
         assert_eq!(split.kind, AnswerKind::Set);
-        assert_eq!(split.values.len(), 2, "polarity keeps like/dislike distinct");
+        assert_eq!(
+            split.values.len(),
+            2,
+            "polarity keeps like/dislike distinct"
+        );
 
         // Same two rows under a non-polar Set kind collapse on object → one member.
         let nonpolar = behavior(KindCardinality::Set, TemporalModel::State, false);
         let merged = shape_answer_for_kind(
-            vec![val("brain:likes", "coffee"), val("brain:dislikes", "coffee")],
+            vec![
+                val("brain:likes", "coffee"),
+                val("brain:dislikes", "coffee"),
+            ],
             nonpolar,
         )
         .unwrap();
@@ -1456,7 +1465,11 @@ mod tests {
         // The occupation predicate EQUALS the cue (cosine 1.0): a strong answer
         // at Y that only the walk can reach.
         let p_occ = brain_metadata::schema::predicate::predicate_intern_or_get(
-            &wtxn, "test", "occupation", 0, 1,
+            &wtxn,
+            "test",
+            "occupation",
+            0,
+            1,
         )
         .unwrap();
         brain_metadata::schema::predicate::predicate_embedding_put(&wtxn, p_occ, &cue).unwrap();
@@ -1513,10 +1526,9 @@ mod tests {
             &Entity::new_active(x, EntityType::PERSON_ID, "X".into(), "x".into(), 1),
         )
         .unwrap();
-        let p_city = brain_metadata::schema::predicate::predicate_intern_or_get(
-            &wtxn, "test", "city", 0, 1,
-        )
-        .unwrap();
+        let p_city =
+            brain_metadata::schema::predicate::predicate_intern_or_get(&wtxn, "test", "city", 0, 1)
+                .unwrap();
         brain_metadata::schema::predicate::predicate_embedding_put(&wtxn, p_city, &cue).unwrap();
         let s_city = statement_with(
             x,

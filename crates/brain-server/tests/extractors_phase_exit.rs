@@ -165,6 +165,8 @@ fn encode_request(text: &str) -> RequestBody {
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     })
 }
 
