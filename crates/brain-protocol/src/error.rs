@@ -98,6 +98,14 @@ pub enum ErrorCode {
     PermissionDenied,
     AdminPermissionRequired,
     WrongShard,
+    /// A request carried an `act_as` field the connection principal is
+    /// not entitled to honor — either the principal lacks the
+    /// `can_act_as` grant (invariant R1) or `act_as.namespace` is
+    /// outside its `may_act` allowlist (invariant R2). Distinct from
+    /// `PermissionDenied` (which is resolved against the *effective*
+    /// identity per R4). Hard-rejected; never silently downgraded to the
+    /// connection's own identity.
+    ActAsDenied,
 
     // Validation
     InvalidArgument,
@@ -248,9 +256,10 @@ impl ErrorCode {
             | Self::SessionExpired => ErrorCategory::Authentication,
 
             // Authorization codes.
-            Self::PermissionDenied | Self::AdminPermissionRequired | Self::WrongShard => {
-                ErrorCategory::Authorization
-            }
+            Self::PermissionDenied
+            | Self::AdminPermissionRequired
+            | Self::WrongShard
+            | Self::ActAsDenied => ErrorCategory::Authorization,
 
             // Validation codes.
             Self::InvalidArgument

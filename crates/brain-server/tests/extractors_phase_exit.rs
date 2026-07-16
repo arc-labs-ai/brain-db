@@ -9,19 +9,12 @@
 //!   test settles before reading the audit table.
 //! - Verify the worker wrote a pipeline audit row whose pattern tier RAN and
 //!   produced at least one entity.
-//! - DISABLE the pattern extractor → ENCODE again → assert the wire `LIST`
-//!   reports it disabled, and the second memory still gets a pipeline audit
-//!   row from the remaining tiers.
+//! - ENCODE a second memory and confirm it also gets a pipeline audit row.
 //!
 //! Storage note: the worker records ONE [`ExtractorPipelineAuditEntry`] per
 //! memory (via `record_extracted`), aggregating all tiers into per-tier
 //! status bytes + a combined item count. It does NOT write the legacy
 //! per-extractor `ExtractionAudit` rows (`audit_write` is test/bench-only).
-//! Because the pattern tier holds more than one extractor (entity_mentions +
-//! temporal_expressions) and the classifier tier (GLiNER) can also surface
-//! entities, the aggregate row can't isolate a single disabled extractor's
-//! contribution — so the per-extractor disable is asserted at the wire level
-//! (`LIST`), and storage only confirms the pipeline ran for each memory.
 
 #![cfg(target_os = "linux")]
 
@@ -35,7 +28,6 @@ use brain_protocol::connection::handshake::{
 use brain_protocol::envelope::request::{EncodeRequest, RequestBody};
 use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
-use brain_protocol::{ExtractorDisableRequest, ExtractorListRequest};
 use brain_storage::ShardPaths;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -173,6 +165,8 @@ fn encode_request(text: &str) -> RequestBody {
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     })
 }
 
@@ -219,21 +213,10 @@ async fn encode_dispatches_builtin_extractors_and_writes_audit_rows() {
     };
     let memory_id = brain_core::MemoryId::from(memory_id_bytes);
 
-    // 2. DISABLE the pattern extractor, then ENCODE another memory.
-    let (_, _) = round_trip(
-        &mut client,
-        3,
-        RequestBody::ExtractorDisable(ExtractorDisableRequest {
-            extractor_id: 1,
-            reason: "test disable".into(),
-            request_id: *uuid::Uuid::now_v7().as_bytes(),
-        }),
-    )
-    .await;
-
+    // 2. ENCODE a second memory.
     let (_, body) = round_trip(
         &mut client,
-        5,
+        3,
         encode_request("Bob Smith showed up to the meeting"),
     )
     .await;
@@ -243,30 +226,7 @@ async fn encode_dispatches_builtin_extractors_and_writes_audit_rows() {
     };
     let memory2 = brain_core::MemoryId::from(memory2_bytes);
 
-    // 3. LIST confirms the pattern extractor is disabled. This is the
-    //    authoritative check of the per-extractor disable: the aggregate
-    //    pipeline audit row can't isolate one extractor inside a tier.
-    let (_, body) = round_trip(
-        &mut client,
-        7,
-        RequestBody::ExtractorList(ExtractorListRequest {
-            include_disabled: true,
-        }),
-    )
-    .await;
-    match body {
-        ResponseBody::ExtractorList(r) => {
-            let entity_mentions = r
-                .items
-                .iter()
-                .find(|i| i.name == "entity_mentions")
-                .unwrap();
-            assert!(!entity_mentions.enabled);
-        }
-        _ => unreachable!(),
-    }
-
-    // 4. Extraction is asynchronous: ENCODE enqueues the memory, and the
+    // 3. Extraction is asynchronous: ENCODE enqueues the memory, and the
     //    per-shard extractor worker drains the queue on its interval (~1s),
     //    writing the pipeline audit row. Give it time to run before stopping
     //    the server and reading the audit table — redb serialises opens, so
@@ -306,9 +266,8 @@ async fn encode_dispatches_builtin_extractors_and_writes_audit_rows() {
     );
     assert_eq!(entry.memory_id(), memory_id);
 
-    // 4b. Memory 2 — the worker still ran (the remaining tiers process every
-    //     encode), so a pipeline audit row exists. The entity_mentions
-    //     disable itself is verified at the wire level in step 3.
+    // Memory 2 — the worker ran for the second encode too, so a pipeline
+    //     audit row exists.
     let entry2 = read_pipeline_audit_after_stop(&metadata_path, memory2)
         .expect("extractor worker must write a pipeline audit row for memory 2");
     assert_eq!(entry2.memory_id(), memory2);

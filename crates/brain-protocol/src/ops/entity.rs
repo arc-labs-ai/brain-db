@@ -1,6 +1,7 @@
 //! Entity-op request payloads.
 
 use crate::envelope::request::WireUuid;
+use crate::ops::memory::ActAs;
 
 /// `ENTITY_CREATE` (0x0130).
 ///
@@ -17,13 +18,26 @@ pub struct EntityCreateRequest {
     pub attributes_blob: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Effective identity this entity-create runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `ENTITY_GET` (0x0131).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EntityGetRequest {
     #[serde(with = "serde_bytes")]
     pub entity_id: WireUuid,
+    /// Effective identity this get runs as, on behalf of the authenticated
+    /// connection principal. `None` (the common case, and omitted on the wire)
+    /// means the op runs as the connection's own key-bound identity. The get is
+    /// scoped to the effective `(namespace, agent)` — a foreign tenant's entity
+    /// id reads as `NotFound`, never across the boundary.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `ENTITY_UPDATE` (0x0132).
@@ -93,6 +107,15 @@ pub struct EntityResolveRequest {
     pub allow_create: bool,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Effective identity this resolve runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity. Resolution is scoped to the effective
+    /// `(namespace, agent)`, so a multi-tenant front-door can resolve a
+    /// name inside a tenant's own entity space without leaking across
+    /// tenants.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `ENTITY_LIST` (0x0137).
@@ -110,6 +133,13 @@ pub struct EntityListRequest {
     /// Empty on first page; opaque continuation token from a previous
     /// response's tail.
     pub cursor: Vec<u8>,
+    /// Effective identity this list runs as, on behalf of the authenticated
+    /// connection principal. `None` (the common case, and omitted on the wire)
+    /// means the op runs as the connection's own key-bound identity. The list
+    /// is scoped to the effective `(namespace, agent)`, so it enumerates only
+    /// that tenant's entities.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `ENTITY_TOMBSTONE` (0x0138).

@@ -101,6 +101,8 @@ fn encode_req(request_id: [u8; 16], text: &str, txn: Option<[u8; 16]>) -> Encode
         request_id,
         txn_id: txn,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     }
 }
 
@@ -119,6 +121,7 @@ fn link_req(
         weight,
         request_id,
         txn_id: txn,
+        act_as: None,
     }
 }
 
@@ -135,6 +138,7 @@ fn unlink_req(
         kind,
         request_id,
         txn_id: txn,
+        act_as: None,
     }
 }
 
@@ -144,11 +148,13 @@ fn forget_req(memory_id: u128, request_id: [u8; 16], txn: Option<[u8; 16]>) -> F
         mode: ForgetMode::Soft,
         request_id,
         txn_id: txn,
+        act_as: None,
     }
 }
 
 fn recall_req(cue: &str, max_results: u32, txn: Option<[u8; 16]>) -> RecallRequest {
     RecallRequest {
+        trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),
         max_results,
@@ -163,8 +169,7 @@ fn recall_req(cue: &str, max_results: u32, txn: Option<[u8; 16]>) -> RecallReque
         include_text: false,
         request_id: None,
         txn_id: txn,
-        agent_filter: Vec::new(),
-        include_other_agents: false,
+        act_as: None,
     }
 }
 
@@ -181,6 +186,7 @@ fn plan_req(start: u128, goal: u128, max_depth: u32, txn: Option<[u8; 16]>) -> P
         context_filter: None,
         request_id: None,
         txn_id: txn,
+        act_as: None,
     }
 }
 
@@ -194,6 +200,7 @@ fn reason_req(base: u128, depth: u32, txn: Option<[u8; 16]>) -> ReasonRequest {
         budget_wall_time_ms: 1000,
         request_id: None,
         txn_id: txn,
+        act_as: None,
     }
 }
 

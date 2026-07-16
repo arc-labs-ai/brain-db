@@ -1,0 +1,14 @@
+{
+  "items": [
+    {
+      "extractor_id": 7,
+      "namespace": "org",
+      "name": "org.default",
+      "kind": 2,
+      "schema_version": 1,
+      "created_at_unix_nanos": 1700000000000000000
+    }
+  ],
+  "total": 1,
+  "is_final": true
+}

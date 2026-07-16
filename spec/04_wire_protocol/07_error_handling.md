@@ -81,6 +81,9 @@ The error `message` MAY distinguish these for the operator but the code is the s
 | `NamespaceRequired` | A write resolved to no owning namespace — fail-closed; namespace is required and there is no implicit/default namespace |
 | `NamespaceUnknown` | The connection's key (or a referenced namespace) names a namespace that has not been provisioned |
 | `WriteToSystemNamespace` | Attempt to own/modify data in the reserved read-only `brain` system namespace |
+| `ActAsDenied` | A request carried an `act_as` field the connection principal is not entitled to honor — either the principal lacks the `can_act_as` grant (invariant R1) or `act_as.namespace` is outside its `may_act` allowlist (invariant R2) |
+
+`ActAsDenied` is the dedicated code for a per-request-identity denial (see [`04_handshake.md`](04_handshake.md) §10a). It is distinct from `PermissionDenied` so that "this principal may not impersonate / may not act for that namespace" is never confused with "the effective agent lacks permission for this op" — the latter is resolved against the effective identity and surfaces as ordinary `PermissionDenied` (invariant R4). Per R1, an `act_as` the principal cannot honor is **hard-rejected** with `ActAsDenied`; the server never silently downgrades the op to the connection's own identity. Like every `Authorization`-category error it is **not** retryable. The transport precondition (R6 — `act_as` honored only over mTLS / a trusted network) is a deployment guarantee, not a per-request error code.
 
 #### 3.4 Validation (Category: `Validation`)
 
@@ -187,7 +190,7 @@ Cardinality violations on RELATION_CREATE surface as the substrate-wide `Cardina
 
 ##### 3.10.2 Schema-not-declared mode
 
-When no schema has been declared for a namespace, typed-graph writes (`STATEMENT_CREATE`, `RELATION_CREATE`) and reads (`QUERY`, etc.) accept any predicate / relation-type qname — the registry interns it on first use with `SchemaOrigin::ImplicitFromWrite` / `RelationTypeOrigin::ImplicitFromWrite`. No `SchemaNotDeclared` error is returned for these opcodes.
+When no schema has been declared for a namespace, typed-graph writes (`STATEMENT_CREATE`, `RELATION_CREATE`) and reads (`RECALL`, `STATEMENT_LIST`, the `QUERY_TRACE` introspection op, etc.) accept any predicate / relation-type qname — the registry interns it on first use with `SchemaOrigin::ImplicitFromWrite` / `RelationTypeOrigin::ImplicitFromWrite`. No `SchemaNotDeclared` error is returned for these opcodes.
 
 `SchemaNotDeclared` remains reserved for explicit schema-introspection opcodes (e.g. `SCHEMA_GET` against a namespace that has never had one), where there is nothing to return. Its category is `Conflict`.
 
@@ -605,12 +608,14 @@ Aliases are deduplicated server-side on the normalized form before insertion. A 
 - `from`, `to`: must be existing entities; for schema-declared types, endpoint entity types must match the relation's declared signature → `EntityTypeMismatch`. Implicit types skip this check.
 - cardinality (`one_to_one` / `one_to_many` / etc.): enforced server-side on schema-declared types only → `CardinalityViolation` (0x0065).
 
-##### 16.9.6 Query opcodes (`0x0160–0x0163`)
+##### 16.9.6 Query introspection opcodes (`0x0161–0x0162`)
 
-- `top_k`: 1 ≤ top_k ≤ 1000.
+Validation of the `QueryRequest` accepted by `QUERY_EXPLAIN` / `QUERY_TRACE`:
+
+- `top_k`: 1 ≤ top_k ≤ 1000 (the trace-output head size; ignored by EXPLAIN).
 - `depth` (for `RELATION_TRAVERSE`-shaped queries): 1 ≤ depth ≤ 8.
 - `budget_wall_time_ms`: 1 ≤ budget ≤ 60000 (60 s ceiling).
-- empty filter clauses are allowed (no-op); empty `text` for `QUERY_TEXT` rejected.
+- empty filter clauses are allowed (no-op).
 
 ##### 16.9.7 Admin opcodes (`0x0170–0x0177`)
 

@@ -182,7 +182,8 @@ pub async fn handle_relation_create(
     };
 
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
     let request_hash = hash_relation_create_request(&req);
     let phase = Phase::UpsertRelation {
         id: new_id,
@@ -359,7 +360,8 @@ pub async fn handle_relation_supersede(
     let new_relation = build_relation_from_create(&req.new_relation, &rt, now)?;
 
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
     let request_hash = hash_relation_supersede_request(&req);
     let phase = Phase::Supersede {
         target: SupersedeTarget::Relation(old_id),
@@ -435,7 +437,8 @@ pub async fn handle_relation_tombstone(
     peek_relation_exists(ctx, id)?;
 
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
     let request_hash = hash_relation_tombstone_request(&req);
     let phase = Phase::Tombstone {
         target: TombstoneTarget::Relation(id),

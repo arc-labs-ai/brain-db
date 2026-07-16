@@ -21,7 +21,7 @@ use std::convert::TryFrom;
 
 use brain_core::MemoryId;
 use brain_core::{
-    Entity, EntityAttributes, EntityId, EntityTypeId, ExtractorId, MergeId, RelationId, StatementId,
+    Entity, EntityAttributes, EntityId, EntityTypeId, MergeId, RelationId, StatementId,
 };
 use brain_storage::wal::record::Lsn;
 
@@ -130,7 +130,6 @@ mod tag {
     pub const ENTITY_RENAMED: u8 = 15;
     pub const ENTITIES_UNMERGED: u8 = 16;
     pub const ENTITY_MERGED: u8 = 17;
-    pub const EXTRACTOR_ENABLED_SET: u8 = 18;
     pub const SLOTS_RECLAIMED: u8 = 19;
     pub const MERGE_PROPOSAL_APPROVED: u8 = 20;
     pub const MERGE_PROPOSAL_REJECTED: u8 = 21;
@@ -227,11 +226,6 @@ fn write_phase_ack(out: &mut Vec<u8>, pa: &PhaseAck) {
             out.extend_from_slice(&target.to_bytes());
             out.extend_from_slice(&audit_id.to_bytes());
         }
-        PhaseAck::ExtractorEnabledSet { id, enabled } => {
-            out.push(tag::EXTRACTOR_ENABLED_SET);
-            write_u32(out, id.raw());
-            out.push(u8::from(*enabled));
-        }
         PhaseAck::SlotsReclaimed { count } => {
             out.push(tag::SLOTS_RECLAIMED);
             write_u64(out, *count as u64);
@@ -322,11 +316,6 @@ fn read_phase_ack(c: &mut Cursor<'_>) -> Result<PhaseAck, CodecError> {
                 target,
                 audit_id,
             }
-        }
-        tag::EXTRACTOR_ENABLED_SET => {
-            let id = ExtractorId::from(c.u32()?);
-            let enabled = c.u8()? != 0;
-            PhaseAck::ExtractorEnabledSet { id, enabled }
         }
         tag::SLOTS_RECLAIMED => {
             let count = c.u64()? as usize;

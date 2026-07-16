@@ -45,7 +45,7 @@ pub use codec::opcode::Opcode;
 
 // -- Envelope layer --
 pub use envelope::error::{ErrorDetails, ErrorResponse};
-pub use envelope::request::{RequestBody, WireContextId, WireMemoryId, WireUuid};
+pub use envelope::request::{act_as_of, RequestBody, WireContextId, WireMemoryId, WireUuid};
 pub use envelope::response::ResponseBody;
 
 // -- Error taxonomy --
@@ -71,6 +71,7 @@ pub use shared::primitives::*;
 pub use ops::admin::*;
 pub use ops::entity::*;
 pub use ops::extractor::*;
+pub use ops::graph::*;
 pub use ops::memory::*;
 pub use ops::procedural::*;
 pub use ops::query::*;

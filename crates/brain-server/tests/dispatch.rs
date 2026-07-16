@@ -107,6 +107,7 @@ impl Server {
                 "test".to_string(),
                 agent_id,
                 brain_metadata::api_keys::bits::FULL,
+                Vec::new(),
                 now,
             )
             .expect("mint test key")
@@ -361,6 +362,8 @@ async fn ops_before_auth_are_rejected() {
         request_id: [0u8; 16],
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     };
     send_frame(
         &mut client,
@@ -492,6 +495,8 @@ async fn encode_round_trips_through_shard() {
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     };
     send_frame(
         &mut client,
@@ -546,6 +551,7 @@ async fn forget_routes_by_memory_id() {
         mode: ForgetMode::Soft,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
+        act_as: None,
     };
     send_frame(
         &mut client,
@@ -586,6 +592,7 @@ async fn recall_returns_single_frame_eos_in_v1() {
     complete_handshake(&mut client, &server.mint(agent_id)).await;
 
     let recall = RecallRequest {
+        trace: false,
         cue_text: "anything".into(),
         subject_name: String::new(),
         max_results: 5,
@@ -600,8 +607,7 @@ async fn recall_returns_single_frame_eos_in_v1() {
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id: None,
-        agent_filter: Vec::new(),
-        include_other_agents: false,
+        act_as: None,
     };
     send_frame(
         &mut client,

@@ -105,11 +105,14 @@ fn encode_req(request_id: [u8; 16], text: &str, _kind: MemoryKindWire) -> Encode
         request_id,
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     }
 }
 
 fn recall_req(cue: &str, max_results: u32) -> RecallRequest {
     RecallRequest {
+        trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),
         max_results,
@@ -124,8 +127,7 @@ fn recall_req(cue: &str, max_results: u32) -> RecallRequest {
         include_text: false,
         request_id: None,
         txn_id: None,
-        agent_filter: Vec::new(),
-        include_other_agents: false,
+        act_as: None,
     }
 }
 
@@ -239,6 +241,8 @@ fn recall_echoes_client_supplied_occurred_at() {
             request_id: [9; 16],
             txn_id: None,
             occurred_at_unix_nanos: Some(event_time),
+            act_as: None,
+            trace: false,
         };
         dispatch(
             RequestBody::Encode(req),
@@ -298,6 +302,8 @@ fn recency_breaks_relevance_ties_toward_recent_event_time() {
             request_id: [21; 16],
             txn_id: None,
             occurred_at_unix_nanos: Some(reference - day), // yesterday
+            act_as: None,
+            trace: false,
         };
         let old = EncodeRequest {
             occurred_at_unix_nanos: Some(reference - 400 * day), // >1 year ago
@@ -732,6 +738,75 @@ fn handle_recall_no_txn_fuses_retrieval_lanes() {
         assert!(
             any_nonzero_fused,
             "retrieval path must produce a non-zero fused_score on at least one hit",
+        );
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in per-stage trace. `trace = false` leaves the frame's `trace` field
+// `None` (zero-cost, unchanged payload); `trace = true` populates a
+// `RecallTrace` from the pipeline's already-computed metadata: one entry per
+// retriever lane, filter-chain survivor counts, and total wall-time.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recall_trace_absent_when_not_requested() {
+    run_in_glommio(|| async {
+        let mut fix = build_fixture();
+        encode(&fix, [0xB0; 16], "delta", MemoryKindWire::Episodic).await;
+        fix.reindex_lexical();
+
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(recall_req("delta", 5)),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            frame.trace.is_none(),
+            "trace=false must leave the frame trace unpopulated",
+        );
+    })
+}
+
+#[test]
+fn recall_trace_populated_when_requested() {
+    run_in_glommio(|| async {
+        let mut fix = build_fixture();
+        encode(&fix, [0xC0; 16], "delta", MemoryKindWire::Episodic).await;
+        encode(&fix, [0xC1; 16], "epsilon", MemoryKindWire::Episodic).await;
+        encode(&fix, [0xC2; 16], "zeta", MemoryKindWire::Episodic).await;
+        fix.reindex_lexical();
+
+        let mut req = recall_req("delta", 5);
+        req.trace = true;
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(req),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let trace = frame
+            .trace
+            .expect("trace=true must populate the frame trace");
+        assert!(
+            !trace.retrievers.is_empty(),
+            "trace must record at least one retriever lane",
+        );
+        assert!(
+            trace.filter_chain.before >= trace.filter_chain.after_limit,
+            "filter chain survivors never exceed the pre-filter count",
+        );
+        assert!(
+            trace.total_latency_ms >= 0.0,
+            "total latency is a non-negative wall-time",
         );
     })
 }

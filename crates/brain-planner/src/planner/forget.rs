@@ -77,6 +77,7 @@ mod tests {
             mode: ForgetMode::Soft,
             request_id: [1u8; 16],
             txn_id: None,
+            act_as: None,
         }
     }
 

@@ -17,7 +17,7 @@
 //! each phase to its payload.
 //!
 //! Typed-graph + schema phases (UpsertEntity / UpsertStatement /
-//! UpsertRelation / Supersede / UpsertSchema / SetExtractorEnabled /
+//! UpsertRelation / Supersede / UpsertSchema /
 //! MergeEntities) are WAL-durable via `WalPayload::PhaseBody`, which
 //! carries the rkyv-encoded phase body; recovery decodes and re-applies
 //! it. (See the `PhaseBody` arms below.)
@@ -31,11 +31,10 @@
 use brain_core::{EdgeOrigin, NodeRef};
 use brain_metadata::recovery::phase_bodies::{
     encode_entity_create, encode_entity_merge, encode_entity_rename, encode_entity_tombstone,
-    encode_entity_unmerge, encode_entity_update, encode_extractor_toggle, encode_schema_update,
-    encode_statement_create, encode_statement_supersede, encode_statement_tombstone,
-    EntityMergeBody, EntityRenameBody, EntityTombstoneBody, EntityUnmergeBody, EntityUpdateBody,
-    ExtractorToggleBody, SchemaUpdateBody, StatementCreateBody, StatementSupersedeBody,
-    StatementTombstoneBody,
+    encode_entity_unmerge, encode_entity_update, encode_schema_update, encode_statement_create,
+    encode_statement_supersede, encode_statement_tombstone, EntityMergeBody, EntityRenameBody,
+    EntityTombstoneBody, EntityUnmergeBody, EntityUpdateBody, SchemaUpdateBody,
+    StatementCreateBody, StatementSupersedeBody, StatementTombstoneBody,
 };
 use brain_metadata::tables::entity::EntityMetadata;
 use brain_metadata::tables::statement::metadata_from_statement;
@@ -480,19 +479,6 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             )))
         }
 
-        // Extractor enable/disable rides the PhaseBody envelope.
-        Phase::SetExtractorEnabled { id, enabled } => {
-            let body = encode_extractor_toggle(&ExtractorToggleBody {
-                id: id.raw(),
-                enabled: *enabled,
-            });
-            Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
-                WalRecordKind::ExtractorToggle,
-                write.agent_id,
-                body,
-            )))
-        }
-
         // ApproveMerge / RejectMerge resolve a merge proposal at apply
         // time, so they need a handler-side pre-resolution before they can
         // be WAL-mapped — durability still rides the redb commit for now.
@@ -651,20 +637,6 @@ mod tests {
             panic!("expected PhaseBody payload")
         };
         assert_eq!(rec.kind, WalRecordKind::EntityUnmerge);
-    }
-
-    #[test]
-    fn set_extractor_enabled_maps_to_graph_extractor_toggle() {
-        let phase = Phase::SetExtractorEnabled {
-            id: brain_core::ExtractorId::from(3),
-            enabled: false,
-        };
-        let w = write_for(phase.clone());
-        let WalPayload::PhaseBody(rec) = phase_to_wal_payload(&phase, &w).expect("should map")
-        else {
-            panic!("expected PhaseBody payload")
-        };
-        assert_eq!(rec.kind, WalRecordKind::ExtractorToggle);
     }
 
     #[test]

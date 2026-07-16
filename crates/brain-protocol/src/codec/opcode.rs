@@ -58,6 +58,8 @@ pub enum Opcode {
     LinkResp = 0x00A5,
     UnlinkReq = 0x0026,
     UnlinkResp = 0x00A6,
+    MemoryListReq = 0x0027,
+    MemoryListResp = 0x00A7,
     EncodeVectorDirectReq = 0x002A,
     EncodeVectorDirectResp = 0x00AA,
 
@@ -144,13 +146,9 @@ pub enum Opcode {
     SchemaValidateReq = 0x0123,
     SchemaValidateResp = 0x01A3,
 
-    // Extractor governance (0x0124-0x0126 low-byte range).
+    // Extractor introspection (read-only).
     ExtractorListReq = 0x0124,
     ExtractorListResp = 0x01A4,
-    ExtractorDisableReq = 0x0125,
-    ExtractorDisableResp = 0x01A5,
-    ExtractorEnableReq = 0x0126,
-    ExtractorEnableResp = 0x01A6,
 
     // Destructive schema replace (admin-only). Tombstones every
     // schema-declared predicate / relation_type / extractor row in
@@ -210,15 +208,14 @@ pub enum Opcode {
     RelationTraverseReq = 0x0156,
     RelationTraverseResp = 0x01D6,
 
-    // Retrieval query operations (0x0160-0x0163).
-    QueryReq = 0x0160,
-    QueryResp = 0x01E0,
+    // Retrieval query operations (0x0161-0x0163).
     QueryExplainReq = 0x0161,
     QueryExplainResp = 0x01E1,
     QueryTraceReq = 0x0162,
     QueryTraceResp = 0x01E2,
-    QueryTextReq = 0x0163,
-    QueryTextResp = 0x01E3,
+    /// Paginated export of the caller's whole typed graph (nodes + edges).
+    GraphFetchReq = 0x0163,
+    GraphFetchResp = 0x01E3,
 
     // Procedural-memory materialization. Renders an agent's stored
     // `brain:behavior_*` Preferences into a system block for LLM prompt
@@ -263,6 +260,8 @@ impl Opcode {
             0x00A5 => Self::LinkResp,
             0x0026 => Self::UnlinkReq,
             0x00A6 => Self::UnlinkResp,
+            0x0027 => Self::MemoryListReq,
+            0x00A7 => Self::MemoryListResp,
             0x002A => Self::EncodeVectorDirectReq,
             0x00AA => Self::EncodeVectorDirectResp,
 
@@ -370,14 +369,12 @@ impl Opcode {
             0x0156 => Self::RelationTraverseReq,
             0x01D6 => Self::RelationTraverseResp,
 
-            0x0160 => Self::QueryReq,
-            0x01E0 => Self::QueryResp,
             0x0161 => Self::QueryExplainReq,
             0x01E1 => Self::QueryExplainResp,
             0x0162 => Self::QueryTraceReq,
             0x01E2 => Self::QueryTraceResp,
-            0x0163 => Self::QueryTextReq,
-            0x01E3 => Self::QueryTextResp,
+            0x0163 => Self::GraphFetchReq,
+            0x01E3 => Self::GraphFetchResp,
 
             0x0164 => Self::MaterializeProceduralReq,
             0x01E4 => Self::MaterializeProceduralResp,
@@ -396,10 +393,6 @@ impl Opcode {
 
             0x0124 => Self::ExtractorListReq,
             0x01A4 => Self::ExtractorListResp,
-            0x0125 => Self::ExtractorDisableReq,
-            0x01A5 => Self::ExtractorDisableResp,
-            0x0126 => Self::ExtractorEnableReq,
-            0x01A6 => Self::ExtractorEnableResp,
 
             0x0127 => Self::SchemaReplaceReq,
             0x01A7 => Self::SchemaReplaceResp,
@@ -524,6 +517,8 @@ mod tests {
         (0x00A5, Opcode::LinkResp),
         (0x0026, Opcode::UnlinkReq),
         (0x00A6, Opcode::UnlinkResp),
+        (0x0027, Opcode::MemoryListReq),
+        (0x00A7, Opcode::MemoryListResp),
         (0x002A, Opcode::EncodeVectorDirectReq),
         (0x00AA, Opcode::EncodeVectorDirectResp),
         // Subscription
@@ -591,10 +586,6 @@ mod tests {
         // Typed-graph — extractor governance
         (0x0124, Opcode::ExtractorListReq),
         (0x01A4, Opcode::ExtractorListResp),
-        (0x0125, Opcode::ExtractorDisableReq),
-        (0x01A5, Opcode::ExtractorDisableResp),
-        (0x0126, Opcode::ExtractorEnableReq),
-        (0x01A6, Opcode::ExtractorEnableResp),
         // Typed-graph — destructive schema replace
         (0x0127, Opcode::SchemaReplaceReq),
         (0x01A7, Opcode::SchemaReplaceResp),
@@ -648,14 +639,12 @@ mod tests {
         (0x0156, Opcode::RelationTraverseReq),
         (0x01D6, Opcode::RelationTraverseResp),
         // Typed-graph — retrieval query
-        (0x0160, Opcode::QueryReq),
-        (0x01E0, Opcode::QueryResp),
         (0x0161, Opcode::QueryExplainReq),
         (0x01E1, Opcode::QueryExplainResp),
         (0x0162, Opcode::QueryTraceReq),
         (0x01E2, Opcode::QueryTraceResp),
-        (0x0163, Opcode::QueryTextReq),
-        (0x01E3, Opcode::QueryTextResp),
+        (0x0163, Opcode::GraphFetchReq),
+        (0x01E3, Opcode::GraphFetchResp),
         // Typed-graph — procedural memory materialization
         (0x0164, Opcode::MaterializeProceduralReq),
         (0x01E4, Opcode::MaterializeProceduralResp),
@@ -734,7 +723,7 @@ mod tests {
         assert!(Opcode::EntityCreateReq.is_typed_graph());
         assert!(Opcode::EntityRenameResp.is_typed_graph());
         assert!(Opcode::StatementCreateReq.is_typed_graph());
-        assert!(Opcode::QueryReq.is_typed_graph());
+        assert!(Opcode::QueryExplainReq.is_typed_graph());
     }
 
     #[test]

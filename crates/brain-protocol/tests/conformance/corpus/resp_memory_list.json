@@ -1,0 +1,62 @@
+{
+  "items": [
+    {
+      "memory_id": [
+        68,
+        68,
+        68,
+        68,
+        68,
+        68,
+        68,
+        68,
+        68,
+        68,
+        68,
+        68,
+        68,
+        68,
+        68,
+        68
+      ],
+      "text": "the sky is blue",
+      "kind": 0,
+      "state": 0,
+      "created_at_unix_nanos": 1700000000000000000,
+      "occurred_at_unix_nanos": 0,
+      "last_accessed_at_unix_nanos": 1700000001000000000,
+      "salience": 0.5,
+      "access_count": 3,
+      "source_request_id": [
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17
+      ],
+      "statement_count": 0,
+      "entity_count": 0,
+      "relation_count": 0
+    }
+  ],
+  "next_cursor": [
+    42,
+    0,
+    255,
+    24,
+    123
+  ],
+  "cumulative_count": 1,
+  "is_final": true
+}

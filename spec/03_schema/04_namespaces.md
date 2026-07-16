@@ -125,7 +125,7 @@ atomically inside one redb txn, only for the caller's own namespace.
 
 Every read path filters to the caller's `(namespace, agent)` scope:
 
-- `RECALL` / `QUERY` return only rows owned by the caller's namespace;
+- `RECALL` returns only rows owned by the caller's namespace;
   `agent_filter` / `include_other_agents` widen only *within* it.
 - `STATEMENT_LIST` / `RELATION_LIST` by subject/entity return only rows
   in the caller's scope — the by-subject/by-entity indexes are
@@ -171,7 +171,7 @@ This section verifies:
 - Qualified reference to another *user* namespace in schema source →
   `UnresolvedTypeRef`; `brain:` references accepted.
 - **Cross-namespace isolation:** two namespaces on one shard; no
-  RECALL / QUERY / STATEMENT_LIST / RELATION_LIST / ENTITY_RESOLVE /
+  RECALL / STATEMENT_LIST / RELATION_LIST / ENTITY_RESOLVE /
   capabilities result crosses the namespace boundary; the same entity
   name resolves to distinct entities per `(namespace, agent)`.
 - A write whose namespace can't be resolved is rejected

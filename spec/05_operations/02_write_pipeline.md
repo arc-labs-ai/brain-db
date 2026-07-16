@@ -111,6 +111,8 @@ If the same RequestId is sent twice (e.g., due to network retry):
 
 This is Brain's commitment: at-most-once execution per RequestId, with replay-safe responses. Idempotency replay is **transparent** — `was_deduplicated` reports whatever the original response carried, not whether the wire-level replay occurred.
 
+**Under `act_as` the key is the effective identity, not the connection principal.** When a request carries the `act_as` field (a trusted service principal running the op on behalf of a tenant agent; defined in [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §"Per-request identity (`act_as`)"), both the idempotency key **and** the shard-routing key MUST be scoped by the **effective** `(namespace, agent_id)` — the identity named in `act_as` — never by the connection principal. This is a load-bearing safety rule, not an optimization. The idempotency key is otherwise the bare 16-byte RequestId: a single service principal issuing ops for many tenants over one shared connection could reuse a RequestId across distinct effective identities, and a bare-RequestId key would then **collide across tenants** — serving one tenant's cached acknowledgement to another. Because the idempotency pool and the connection are shared, the leak is invisible at the wire. Keying on the effective `(namespace_id, agent_id)` + RequestId, and routing to the shard by the effective agent, makes the collision impossible: two tenants reusing one RequestId land on disjoint keys.
+
 ### 4a. Fingerprint deduplication
 
 A distinct mechanism from §4 idempotency. Idempotency dedupes by *request identity* (same `RequestId`); fingerprint dedup dedupes by *content identity* (same `BLAKE3(text)` under the same `agent_id` + `context_id`).

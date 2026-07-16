@@ -157,9 +157,6 @@ pub fn dispatch(
         Phase::MergeEntities { .. } => entity::apply_merge_entities(wtxn, phase, write),
         Phase::ApproveMerge { .. } => entity::apply_approve_merge(wtxn, phase, write),
         Phase::RejectMerge { .. } => entity::apply_reject_merge(wtxn, phase, write),
-        Phase::SetExtractorEnabled { .. } => {
-            schema::apply_set_extractor_enabled(wtxn, phase, write)
-        }
         Phase::ReclaimSlots { .. } => reclaim::apply_reclaim_slots(wtxn, phase, write),
     }
 }

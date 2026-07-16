@@ -30,7 +30,7 @@ For each section, this file gives a one-paragraph summary, key dependencies, and
 
 ## 04. Wire Protocol
 
-**Summary.** The binary protocol over TCP. 32-byte fixed header, self-describing CBOR structured payloads, little-endian `f32` raw-vector trailing section. One unified opcode space — substrate opcodes (`0x00xx`) plus typed-graph opcodes (`0x01xx`). Handshake, streaming, error handling, and typed-graph frames (entity / statement / relation / schema / query / admin). Portable: any language speaks it with a stock CBOR library; Brain ships no client.
+**Summary.** The binary protocol over TCP. 32-byte fixed header, self-describing CBOR structured payloads, little-endian `f32` raw-vector trailing section. One unified opcode space — substrate opcodes (`0x00xx`) plus typed-graph opcodes (`0x01xx`). Handshake, streaming, error handling, and typed-graph frames (entity / statement / relation / schema / query-introspection / admin). Portable: any language speaks it with a stock CBOR library; Brain ships no client.
 
 **Depends on.** [01](../01_architecture/00_purpose.md), [02](../02_data_model/00_purpose.md). **Depended on by.** [05](../05_operations/00_purpose.md), [06](../06_sdk/00_purpose.md), [07](../07_embedding/00_purpose.md).
 

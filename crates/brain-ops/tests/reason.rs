@@ -107,6 +107,7 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
             weight: 1.0,
             request_id,
             txn_id: None,
+            act_as: None,
         };
         let _ = dispatch(
             RequestBody::Link(req),
@@ -134,6 +135,7 @@ fn reason_req(observation: ObservationInput, depth: u32, max_inferences: u32) ->
         budget_wall_time_ms: 1000,
         request_id: None,
         txn_id: None,
+        act_as: None,
     }
 }
 

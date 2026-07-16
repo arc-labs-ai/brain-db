@@ -86,7 +86,7 @@ fn dev_toml_round_trips_cleanly() {
     let cfg = Config::load_with_env(&path, &env).expect("dev.toml must load");
 
     assert_eq!(cfg.server.listen_addr.to_string(), "127.0.0.1:9090");
-    assert_eq!(cfg.storage.shard_count, 2);
+    assert_eq!(cfg.storage.shard_count, 1);
     assert_eq!(cfg.shard.arena_capacity_bytes, 1u64 << 30);
     assert_eq!(cfg.shard.wal_segment_size_bytes, 256u64 << 20);
     assert_eq!(cfg.shard.wal_retention_segments, 4);

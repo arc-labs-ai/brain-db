@@ -177,6 +177,8 @@ mod tests {
             request_id: [1u8; 16],
             txn_id: None,
             occurred_at_unix_nanos: None,
+            act_as: None,
+            trace: false,
         }
     }
 

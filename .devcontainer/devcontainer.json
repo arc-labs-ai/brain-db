@@ -47,6 +47,10 @@
   // Phase 9 unlock: io_uring (Glommio executor) needs both the memlock
   // rlimit raised and seccomp permissions for io_uring_setup/enter/register.
   "runArgs": [
+    // Stable, human-readable container name instead of Docker's random
+    // "romantic_nightingale". `docker ps` / Docker Desktop show `brain-dev`.
+    "--name",
+    "brain-dev",
     "--ulimit",
     "memlock=-1",
     "--security-opt",

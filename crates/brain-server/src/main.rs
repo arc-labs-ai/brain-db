@@ -66,7 +66,7 @@ fn main() -> ExitCode {
     }
 
     #[cfg(target_os = "linux")]
-    logging::init_pre_config();
+    let log_handle = logging::init_pre_config();
     #[cfg(not(target_os = "linux"))]
     init_tracing_pre_config_portable();
 
@@ -78,9 +78,11 @@ fn main() -> ExitCode {
         }
     };
 
+    // Apply the configured formatter + level immediately, so the startup
+    // logs below already honor `[monitoring.logging]`. OTel is attached
+    // later, from inside the Tokio runtime (its exporter needs one).
     #[cfg(target_os = "linux")]
-    let _tracer_provider =
-        logging::reinit_from_config(&cfg.monitoring.logging, &cfg.monitoring.tracing);
+    log_handle.reconfigure(&cfg.monitoring.logging);
 
     tracing::info!(
         version = %VERSION,
@@ -112,7 +114,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        linux_main::run(cfg, dispatcher)
+        linux_main::run(cfg, dispatcher, log_handle)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -146,10 +148,10 @@ mod linux_main {
     use crate::routing::RoutingTable;
     use crate::shard::{
         spawn_shard, AmbiguityResolverSpawnConfig, AutoEdgeSpawnConfig, CausalEdgeSpawnConfig,
-        ConfidenceSweepSpawnConfig, ExtractorSpawnConfig, ExtractorTierSpawnConfig,
-        ExtractorTuningSpawnConfig, IndexSpawnConfig, LlmCacheSweepSpawnConfig, RerankSpawnConfig,
-        ShardHandle, ShardJoiner, ShardSpawnConfig, StatementReclaimSpawnConfig,
-        SupersessionSweeperSpawnConfig, TemporalEdgeSpawnConfig,
+        ConfidenceSweepSpawnConfig, ExtractorSpawnConfig, ExtractorTuningSpawnConfig,
+        IndexSpawnConfig, LlmCacheSweepSpawnConfig, RerankSpawnConfig, ShardHandle, ShardJoiner,
+        ShardSpawnConfig, StatementReclaimSpawnConfig, SupersessionSweeperSpawnConfig,
+        TemporalEdgeSpawnConfig,
     };
 
     /// Errors surfaced by [`build_dispatcher`]. Hand-rolled `Display`
@@ -206,7 +208,11 @@ mod linux_main {
         Ok(Arc::new(cached))
     }
 
-    pub fn run(cfg: Config, dispatcher: Arc<dyn brain_embed::Dispatcher>) -> ExitCode {
+    pub fn run(
+        cfg: Config,
+        dispatcher: Arc<dyn brain_embed::Dispatcher>,
+        log_handle: crate::logging::LoggingHandle,
+    ) -> ExitCode {
         // Build the configured Summarizer (default
         // `DisabledSummarizer`). Construction happens once and the
         // resulting `Arc<dyn Summarizer>` is cloned into each shard's
@@ -218,6 +224,34 @@ mod linux_main {
                 return ExitCode::FAILURE;
             }
         };
+
+        // Cheap boot-time LLM credential probe. An LLM is mandatory (HyPE +
+        // extraction are always-on), and an EMPTY key is already rejected at
+        // config validation — but a present-but-invalid key used to boot fine
+        // and then silently extract nothing. One 1-token completion catches a
+        // rejected key here and refuses to start; a transient/network failure
+        // only warns so a correctly-configured deploy isn't bricked by a
+        // provider hiccup.
+        {
+            use crate::shard::llm_setup::{preflight_llm_auth, LlmPreflight};
+            let llm_cfg = crate::shard::LlmSpawnConfig {
+                api_key: cfg.llm.api_key.clone(),
+                model: cfg.llm.model.clone(),
+            };
+            match preflight_llm_auth(&llm_cfg) {
+                LlmPreflight::Ok => {
+                    tracing::info!("LLM provider credential verified (boot preflight)");
+                }
+                LlmPreflight::Skipped => {}
+                LlmPreflight::Inconclusive(msg) => {
+                    tracing::warn!(detail = %msg, "LLM credential preflight inconclusive; proceeding");
+                }
+                LlmPreflight::InvalidKey(msg) => {
+                    tracing::error!(detail = %msg, "LLM credential rejected — refusing to start");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
 
         // Spawn one Glommio shard per `cfg.storage.shard_count`,
         // then build a `Topology` (shards + `RoutingTable` + `ServerCapabilities`)
@@ -303,6 +337,13 @@ mod linux_main {
         };
 
         let rc = runtime.block_on(async move {
+            // Attach the OpenTelemetry exporter now that we're inside the
+            // Tokio runtime — its OTLP batch processor spawns a background
+            // task here. Held for the whole serving block so buffered spans
+            // flush when it drops at shutdown.
+            let _otel_provider =
+                log_handle.attach_otel(&cfg.monitoring.logging, &cfg.monitoring.tracing);
+
             let (trigger, signal) = ShutdownSignal::channel();
             spawn_signal_listener(trigger);
 
@@ -554,17 +595,13 @@ mod linux_main {
                     .max_related_statements_per_entity,
                 channel_capacity: cfg.workers.causal_edge.channel_capacity,
             };
-            // Cross-encoder + per-tier extractor capability gates.
-            // Operator opt-outs ride the same config plumbing the
-            // worker knobs above use; spawn_shard hard-fails when an
-            // enabled capability can't be brought up.
+            // Cross-encoder rerank capability gate. The operator opt-out
+            // rides the same config plumbing the worker knobs above use;
+            // spawn_shard hard-fails when an enabled capability can't be
+            // brought up. Extraction has no such gate — all three tiers are
+            // always-on (see `spawn_shard`'s tier gate).
             spawn_cfg.rerank = RerankSpawnConfig {
                 enabled: cfg.rerank.enabled,
-            };
-            spawn_cfg.extractors = ExtractorTierSpawnConfig {
-                pattern_enabled: cfg.extractors.pattern.enabled,
-                classifier_enabled: cfg.extractors.classifier.enabled,
-                llm_enabled: cfg.extractors.llm.enabled,
             };
             // Ferry the per-worker cadence / gate knobs that previously
             // only had bespoke `BRAIN_*` env vars.
@@ -598,7 +635,6 @@ mod linux_main {
                 classifier_model_path: cfg.extractors.classifier.model_path.clone(),
                 classifier_threshold: cfg.extractors.classifier.threshold,
                 hype_num_questions: cfg.extractors.hype.num_questions,
-                statement_question_bridge_enabled: cfg.extractors.statement_question_bridge.enabled,
             };
             // Ferry the tantivy commit cadence.
             spawn_cfg.index = IndexSpawnConfig {

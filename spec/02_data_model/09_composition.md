@@ -99,7 +99,7 @@ This is detailed in [`../03_schema/`](../03_schema/00_purpose.md) and [`../10_me
 
 A user can deploy Brain and never declare a schema. In this case:
 
-- ENCODE, RECALL, and the knowledge opcodes (STATEMENT_CREATE, RELATION_CREATE, QUERY) all accept traffic.
+- ENCODE, RECALL, and the knowledge opcodes (STATEMENT_CREATE, RELATION_CREATE, STATEMENT_LIST) all accept traffic.
 - The Entity, Statement, and Relation tables populate from writes against an open vocabulary — predicates and relation types are interned on first use with origin `ImplicitFromWrite`.
 - The lexical (tantivy) index and statement HNSW are populated by the extractors as memories arrive.
 - The query router runs in both modes — it is the default RECALL path for every deployment.

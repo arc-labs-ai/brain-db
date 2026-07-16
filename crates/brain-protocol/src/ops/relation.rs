@@ -6,6 +6,7 @@
 //! [`RelationView`] in this module.
 
 use crate::envelope::request::WireUuid;
+use crate::ops::memory::ActAs;
 use crate::ops::statement::EvidenceRefWire;
 
 // ---------------------------------------------------------------------------
@@ -32,14 +33,27 @@ pub struct RelationCreateRequest {
     pub valid_to_unix_nanos: u64,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Effective identity this relation-create runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `RELATION_GET` (`0x0151`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RelationGetRequest {
     #[serde(with = "serde_bytes")]
     pub relation_id: WireUuid,
     pub follow_supersession: bool,
+    /// Effective identity this get runs as, on behalf of the authenticated
+    /// connection principal. `None` (the common case, and omitted on the wire)
+    /// means the op runs as the connection's own key-bound identity. Scoped to
+    /// the effective `(namespace, agent)` — a foreign tenant's relation id reads
+    /// as `NotFound`, never across the boundary.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `RELATION_SUPERSEDE` (`0x0152`).
@@ -77,6 +91,11 @@ pub struct RelationListFromRequest {
     pub include_tombstoned: bool,
     pub limit: u32,
     pub cursor: Vec<u8>,
+    /// Effective identity this list runs as. `None` (omitted on the wire) means
+    /// the op runs as the connection's own key-bound identity. Scoped to the
+    /// effective `(namespace, agent)`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `RELATION_LIST_TO` (`0x0155`).
@@ -93,6 +112,11 @@ pub struct RelationListToRequest {
     pub include_tombstoned: bool,
     pub limit: u32,
     pub cursor: Vec<u8>,
+    /// Effective identity this list runs as. `None` (omitted on the wire) means
+    /// the op runs as the connection's own key-bound identity. Scoped to the
+    /// effective `(namespace, agent)`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `RELATION_TRAVERSE` (`0x0156`).
@@ -112,6 +136,13 @@ pub struct RelationTraverseRequest {
     pub include_superseded: bool,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Effective identity this traversal runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity. The walk is scoped to the effective
+    /// `(namespace, agent)`, so it only follows that tenant's relations.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 // ---------------------------------------------------------------------------

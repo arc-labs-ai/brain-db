@@ -28,13 +28,14 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use brain_core::AgentId;
+use brain_metadata::api_keys::bits;
 use brain_ops::error::OpError;
 use brain_protocol::connection::handshake::{
     AgentPermissions, AuthOkPayload, AuthPayload, HelloPayload, ServerCapabilities, WelcomePayload,
 };
 use brain_protocol::error::ErrorCode;
 
-use crate::auth::{derive_scope_from_handshake, AuthError, AuthStore, RequestScope};
+use crate::auth::{derive_scope_from_handshake, hex32, AuthError, AuthStore, RequestScope};
 use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::envelope::request::RequestBody;
 use brain_protocol::envelope::response::{
@@ -112,6 +113,12 @@ pub struct Topology {
 /// task. `OpDispatch` carries everything needed to await a shard reply
 /// in a spawned sub-task. `CloseWith` emits a final frame and closes;
 /// `Close` closes without sending anything.
+// `Action` is an ephemeral per-frame decision returned by value from
+// `dispatch_frame` and matched immediately by the connection loop. Boxing
+// the largest variant to satisfy `large_enum_variant` would add a heap
+// allocation on the dispatch hot path (every op) — which the perf guidance
+// forbids — so we keep the variant inline and accept the size spread.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Action {
     Inline(Frame),
     OpDispatch(OpDispatch),
@@ -144,6 +151,14 @@ pub(crate) struct OpDispatch {
     /// the originating connection — drives the connection-drop
     /// auto-abort sweep.
     pub(crate) session_id: [u8; 16],
+    /// Effective-identity selector, present iff the request carried an
+    /// `act_as` field that passed the R1/R2 authorization checks in
+    /// `dispatch_frame`. When `Some`, `run_op_dispatch` builds the
+    /// EFFECTIVE caller (target `(namespace, agent)` under the fixed
+    /// `STANDARD_AGENT` mask) instead of the principal's own caller, and
+    /// records both principals on the request span. `None` = the op runs
+    /// as the connection's own key-bound identity.
+    pub(crate) act_as: Option<brain_protocol::ActAs>,
 }
 
 pub(crate) struct SubscribeStart {
@@ -268,8 +283,8 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
             // Under scoped API-key auth, a subscriber may only receive its
             // own agent's events. `filter.agents == None`/empty means "all
             // agents" (a cross-tenant leak on a shared shard), and any id
-            // other than the caller's own agent is likewise forbidden —
-            // mirrors RECALL's `enforce_agent_filter`.
+            // other than the caller's own agent is likewise forbidden — the
+            // SUBSCRIBE analogue of RECALL/QUERY per-agent read isolation.
             if !subscribe_agents_allowed(scope.agent_id, sub_req.filter.agents.as_deref()) {
                 return Action::Inline(error_frame(
                     stream_id,
@@ -298,10 +313,46 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
         other => other,
     };
 
-    // Route + dispatch. Memory-bearing requests route to the memory's
-    // shard; everything else lands on the agent's bound shard.
+    // Effective-identity (`act_as`) enforcement, fully generic over
+    // whichever op variants `act_as_of` matches — no verb is special-cased
+    // here. When a request carries an `act_as` selector, the connection
+    // principal must (R1) hold the ACT_AS grant and (R2) name a target
+    // namespace inside its `may_act` allowlist. Denials are hard: a
+    // failed act_as request is rejected with `ActAsDenied`, never silently
+    // downgraded to the principal's own identity.
+    if let Some(a) = brain_protocol::act_as_of(&req) {
+        if scope.permissions & bits::ACT_AS == 0 {
+            return Action::Inline(error_frame(
+                stream_id,
+                ErrorCode::ActAsDenied,
+                "act_as: connection principal lacks the ACT_AS grant",
+            ));
+        }
+        // A `"*"` entry is the wildcard grant: the principal may act as any
+        // namespace. This is the trusted-front-door case — a gateway/edge that
+        // fronts every tenant can't enumerate a `may_act` allowlist that grows
+        // with each new tenant, so it holds `["*"]` and Brain admits any target.
+        // Named entries still match exactly; the two forms compose.
+        let namespace_allowed = scope.may_act.iter().any(|ns| ns == "*" || ns == &a.namespace);
+        if !namespace_allowed {
+            return Action::Inline(error_frame(
+                stream_id,
+                ErrorCode::ActAsDenied,
+                "act_as: target namespace is not in the principal's may_act allowlist",
+            ));
+        }
+    }
+
+    // Route + dispatch. `act_as` ops route to the TARGET agent's shard so
+    // the impersonated op lands on that identity's real timeline /
+    // idempotency domain; memory-bearing requests route to the memory's
+    // shard; everything else lands on the principal's bound shard.
     let routing = topology.routing.load_full();
-    let target_shard = pick_target_shard(&req, bound_shard, &routing).unwrap_or(bound_shard);
+    let target_shard = pick_target_shard(&req, bound_shard, &routing, brain_protocol::act_as_of(&req))
+        .unwrap_or(bound_shard);
+    // Capture the effective-identity selector for the dispatch task, which
+    // builds the effective caller and records the delegation on the span.
+    let act_as = brain_protocol::act_as_of(&req).cloned();
 
     Action::OpDispatch(OpDispatch {
         stream_id: frame.header.stream_id_u32(),
@@ -317,6 +368,7 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
         // on the new entry; the connection-drop sweep needs it to
         // find buffered work owned by a dying connection.
         session_id: state.session_id,
+        act_as,
     })
 }
 
@@ -503,11 +555,23 @@ pub(crate) async fn run_op_dispatch(op: OpDispatch, shards: Arc<Vec<ShardHandle>
             )];
         }
     };
-    let caller = op.scope.to_caller(op.session_id);
+    // Build the caller. For an `act_as` request the effective caller runs
+    // as the target `(namespace, agent)` under the fixed STANDARD_AGENT
+    // mask; otherwise the op runs as the connection principal's own
+    // key-bound identity. Authorization (R1/R2) was already enforced in
+    // `dispatch_frame`; this only materializes the identity.
+    let caller = match &op.act_as {
+        Some(a) => op.scope.to_effective_caller(a, op.session_id),
+        None => op.scope.to_caller(op.session_id),
+    };
     // Root of the per-request trace. Held open for the whole op; the shard
     // re-enters a clone via `.instrument()` so `brain.encode` nests under it
     // across the Tokio→Glommio hop. In Phase 1 this is a trace root; once the
     // wire carries `traceparent` it becomes a child of the remote context.
+    //
+    // `brain.agent_id` is the EFFECTIVE identity (the target under act_as).
+    // Under delegation we also record the acting connection principal —
+    // per RFC 8693 the acting party is never erased from the audit trail.
     let request_span = tracing::info_span!(
         "client.request",
         brain.operation = ?op.req.opcode(),
@@ -516,7 +580,26 @@ pub(crate) async fn run_op_dispatch(op: OpDispatch, shards: Arc<Vec<ShardHandle>
         brain.stream_id = stream_id,
         trace_id = tracing::field::Empty,
         span_id = tracing::field::Empty,
+        brain.act_as = tracing::field::Empty,
+        brain.principal_agent_id = tracing::field::Empty,
+        brain.principal_key_hash = tracing::field::Empty,
+        brain.effective_namespace = tracing::field::Empty,
     );
+    if let Some(a) = &op.act_as {
+        request_span.record("brain.act_as", true);
+        request_span.record(
+            "brain.principal_agent_id",
+            tracing::field::display(op.scope.agent_id.0),
+        );
+        request_span.record(
+            "brain.principal_key_hash",
+            tracing::field::display(hex32(&op.scope.key_hash)),
+        );
+        request_span.record(
+            "brain.effective_namespace",
+            tracing::field::display(&a.namespace),
+        );
+    }
     // Surface the OTel trace/span id on the request span so the JSON log
     // formatter (which emits span fields) carries them — operators pivot
     // trace↔logs by id. The id is assigned synchronously when the OTel layer
@@ -562,7 +645,21 @@ pub(crate) async fn run_op_dispatch(op: OpDispatch, shards: Arc<Vec<ShardHandle>
 // Routing helpers
 // ---------------------------------------------------------------------------
 
-fn pick_target_shard(req: &RequestBody, bound_shard: u16, routing: &RoutingTable) -> Option<u16> {
+fn pick_target_shard(
+    req: &RequestBody,
+    bound_shard: u16,
+    routing: &RoutingTable,
+    act_as: Option<&brain_protocol::ActAs>,
+) -> Option<u16> {
+    // `act_as` ops route to the TARGET agent's shard, unconditionally and
+    // generically over every act-as-capable op — the impersonated op must
+    // land on the target identity's timeline / idempotency domain, not the
+    // memory's or the principal's. This takes precedence over the
+    // memory-shard routing below; for a target's own memories the two
+    // agree (the MemoryId was minted on that same shard at write time).
+    if let Some(a) = act_as {
+        return Some(routing.shard_for_agent(AgentId::from(a.agent_id)));
+    }
     // Requests carrying a target MemoryId route by memory shard; other
     // requests use the agent's bound shard. The `source` end of LINK /
     // UNLINK is the routing anchor; the `target`
@@ -608,8 +705,9 @@ fn build_response_frame(stream_id: u32, eos: bool, body: ResponseBody) -> Frame 
 ///
 /// A subscriber may only receive its own agent's events, so `agents` must
 /// be a non-empty list naming only the caller's own agent — `None`/empty
-/// (= all agents on the shard) is a cross-tenant leak and is rejected.
-/// Mirrors RECALL's `enforce_agent_filter`.
+/// (= all agents on the shard) is a cross-tenant leak and is rejected. This
+/// is the SUBSCRIBE analogue of the per-agent read isolation RECALL / QUERY
+/// enforce structurally.
 fn subscribe_agents_allowed(own: AgentId, agents: Option<&[[u8; 16]]>) -> bool {
     agents.is_some_and(|a| !a.is_empty() && a.iter().all(|b| AgentId::from(*b) == own))
 }
@@ -802,6 +900,8 @@ mod tests {
             request_id: [0u8; 16],
             txn_id: None,
             occurred_at_unix_nanos: None,
+            act_as: None,
+            trace: false,
         });
         let frame = Frame::new(Opcode::EncodeReq.as_u16(), FLAG_EOS, 1, body.encode());
         let action = dispatch_frame(frame, &mut state, &topo);

@@ -82,6 +82,8 @@ fn encode_req(request_id: [u8; 16], text: &str) -> EncodeRequest {
         request_id,
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     }
 }
 
@@ -99,6 +101,7 @@ fn link_req(
         weight,
         request_id,
         txn_id: None,
+        act_as: None,
     }
 }
 
@@ -114,6 +117,7 @@ fn unlink_req(
         kind,
         request_id,
         txn_id: None,
+        act_as: None,
     }
 }
 
@@ -216,7 +220,7 @@ fn link_replays_same_request_id() {
         let req = link_req(a, b, EdgeKindWire::Caused, 0.5, [10; 16]);
         let first = unwrap_link(
             dispatch(
-                RequestBody::Link(req),
+                RequestBody::Link(req.clone()),
                 brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
@@ -433,7 +437,7 @@ fn unlink_idempotent_replay() {
         let req = unlink_req(a, b, EdgeKindWire::Caused, [20; 16]);
         let first = unwrap_unlink(
             dispatch(
-                RequestBody::Unlink(req),
+                RequestBody::Unlink(req.clone()),
                 brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )

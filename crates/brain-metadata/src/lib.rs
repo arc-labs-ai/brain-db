@@ -59,15 +59,15 @@ pub use entity::trigram::{
     lookup_candidates_by_trigram, remove_entity_trigrams, trigrams_of_entity, TrigramOpError,
 };
 pub use entity::types::{
-    entity_type_intern, entity_type_label_qnames, entity_type_lookup_by_name, EntityTypeOpError,
+    entity_type_intern, entity_type_label_qnames, entity_type_lookup_by_name,
+    render_declared_entity_types_block, EntityTypeOpError,
 };
 pub use extraction::queue::{
     extraction_queue_drain, extraction_queue_enqueue, extraction_queue_len,
     extraction_queue_remove, ExtractionQueueError,
 };
 pub use extractor::ops::{
-    extractor_get, extractor_intern, extractor_list, extractor_lookup_by_qname,
-    extractor_set_enabled, ExtractorOpError,
+    extractor_get, extractor_intern, extractor_list, extractor_lookup_by_qname, ExtractorOpError,
 };
 pub use hype::ops::{
     hype_has_vectors, hype_iter_all_vectors, hype_neighborhood_hash_get,
@@ -118,6 +118,9 @@ pub use tables::extractor_audit::{
     record_extracted as pipeline_record_extracted, retry_backoff_nanos, tier_status,
     ExtractorItemCounts, ExtractorPipelineAuditEntry, ExtractorPipelineAuditError,
     EXTRACTOR_PIPELINE_AUDIT_TABLE,
+};
+pub use tables::memory::{
+    memory_timeline_page, MemoryListError, MemoryTimelineFilter, MemoryTimelinePage,
 };
 pub use tables::schema_version::{
     SchemaVersionRow, SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE, VALIDATOR_VERSION,

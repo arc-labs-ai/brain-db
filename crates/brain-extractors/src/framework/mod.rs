@@ -6,11 +6,14 @@ pub mod extractor;
 pub mod item;
 pub mod options;
 pub mod registry;
+pub mod trigger;
 
 pub use extractor::{
     ExtractionContext, ExtractionFailureClass, ExtractionFuture, ExtractionResult,
     ExtractionStatus, Extractor, ExtractorContext, ExtractorError, NeighborMemory,
+    SYSTEM_NAMESPACE,
 };
 pub use item::{EntityMention, ExtractedItem, RelationMention, StatementMention};
 pub use options::ExtractorRunOptions;
 pub use registry::{ExtractorRegistry, TierGate, TierState};
+pub use trigger::{evaluate_trigger_on_encode, TriggerDecision};

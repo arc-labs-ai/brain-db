@@ -6,11 +6,11 @@
 //! that drains the queue). Callers commit themselves. Mirrors
 //! [`crate::hype::ops`], keyed by `StatementId` instead of `MemoryId`.
 
-use brain_core::StatementId;
+use brain_core::{Slot, StatementId};
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
 use crate::tables::statement_question::{
-    STATEMENT_QUESTION_VECTORS_TABLE, STATEMENT_QUESTION_VECTOR_BYTES,
+    STATEMENT_QUESTION_VALUE_BYTES, STATEMENT_QUESTION_VECTORS_TABLE,
 };
 
 /// Errors from the statement question-bridge CRUD layer.
@@ -23,25 +23,32 @@ pub enum StatementQuestionOpError {
     Table(#[from] redb::TableError),
 }
 
-/// Little-endian byte image of a question vector.
-fn vector_to_bytes(vector: &[f32; 384]) -> [u8; STATEMENT_QUESTION_VECTOR_BYTES] {
-    let mut out = [0u8; STATEMENT_QUESTION_VECTOR_BYTES];
+/// Encode a stored value: `[slot] ++ little-endian [f32; 384]`.
+fn value_to_bytes(slot: Slot, vector: &[f32; 384]) -> [u8; STATEMENT_QUESTION_VALUE_BYTES] {
+    let mut out = [0u8; STATEMENT_QUESTION_VALUE_BYTES];
+    out[0] = slot.as_u8();
+    let vec_bytes = &mut out[1..];
     for (i, v) in vector.iter().enumerate() {
-        out[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes());
+        vec_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes());
     }
     out
 }
 
-/// Inverse of [`vector_to_bytes`].
-fn bytes_to_vector(bytes: &[u8; STATEMENT_QUESTION_VECTOR_BYTES]) -> [f32; 384] {
-    let mut out = [0.0f32; 384];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let chunk: [u8; 4] = bytes[i * 4..(i + 1) * 4]
+/// Inverse of [`value_to_bytes`]. An unrecognized slot byte falls back to
+/// [`Slot::Object`] rather than dropping the point — a corrupt tag should
+/// still yield an object-slot question (the historical behavior), not lose
+/// recall.
+fn bytes_to_value(bytes: &[u8; STATEMENT_QUESTION_VALUE_BYTES]) -> (Slot, [f32; 384]) {
+    let slot = Slot::from_u8(bytes[0]).unwrap_or(Slot::Object);
+    let vec_bytes = &bytes[1..];
+    let mut vector = [0.0f32; 384];
+    for (i, out) in vector.iter_mut().enumerate() {
+        let chunk: [u8; 4] = vec_bytes[i * 4..(i + 1) * 4]
             .try_into()
             .expect("invariant: fixed slice");
-        *slot = f32::from_le_bytes(chunk);
+        *out = f32::from_le_bytes(chunk);
     }
-    out
+    (slot, vector)
 }
 
 /// Build the 17-byte row key: `statement_id (16) ++ question_index (1)`.
@@ -52,15 +59,17 @@ fn row_key(statement_id: StatementId, question_index: u8) -> [u8; 17] {
     key
 }
 
-/// Persist one question vector for `statement_id` at slot `question_index`.
+/// Persist one question vector for `statement_id` at row `question_index`,
+/// tagged with the `slot` of the reified fact the question leaves unbound.
 /// Idempotent on the (statement_id, index) key.
 pub fn statement_question_put(
     wtxn: &WriteTransaction,
     statement_id: StatementId,
     question_index: u8,
+    slot: Slot,
     vector: &[f32; 384],
 ) -> Result<(), StatementQuestionOpError> {
-    let bytes = vector_to_bytes(vector);
+    let bytes = value_to_bytes(slot, vector);
     let mut t = wtxn.open_table(STATEMENT_QUESTION_VECTORS_TABLE)?;
     t.insert(&row_key(statement_id, question_index), &bytes)?;
     Ok(())
@@ -113,12 +122,13 @@ pub fn statement_question_delete(
 }
 
 /// One row yielded by [`statement_question_iter_all`]:
-/// `(StatementId, vector)`. Several rows may share a `StatementId`.
-pub type StatementQuestionRebuildRow = (StatementId, [f32; 384]);
+/// `(StatementId, Slot, vector)`. Several rows may share a `StatementId`
+/// (and even a `StatementId` may own several slots).
+pub type StatementQuestionRebuildRow = (StatementId, Slot, [f32; 384]);
 
-/// Iterate every stored question vector in key order. The boot rebuild
-/// feeds these straight into a fresh `StatementQuestionHnswIndex` — no
-/// embedder, no templating.
+/// Iterate every stored question vector in key order, decoding each row's
+/// slot tag. The boot rebuild feeds these straight into a fresh
+/// `StatementQuestionHnswIndex` — no embedder, no templating.
 pub fn statement_question_iter_all(
     rtxn: &ReadTransaction,
 ) -> Result<Vec<StatementQuestionRebuildRow>, StatementQuestionOpError> {
@@ -129,10 +139,8 @@ pub fn statement_question_iter_all(
         let key = k.value();
         let mut id_bytes = [0u8; 16];
         id_bytes.copy_from_slice(&key[..16]);
-        out.push((
-            StatementId::from_bytes(id_bytes),
-            bytes_to_vector(&v.value()),
-        ));
+        let (slot, vector) = bytes_to_value(&v.value());
+        out.push((StatementId::from_bytes(id_bytes), slot, vector));
     }
     Ok(out)
 }
@@ -165,9 +173,9 @@ mod tests {
     fn put_iter_has_delete_round_trip() {
         let (_d, db) = open();
         let wtxn = db.begin_write().unwrap();
-        statement_question_put(&wtxn, sid(1), 0, &vec_seed(0.5)).unwrap();
-        statement_question_put(&wtxn, sid(1), 1, &vec_seed(0.7)).unwrap();
-        statement_question_put(&wtxn, sid(2), 0, &vec_seed(0.9)).unwrap();
+        statement_question_put(&wtxn, sid(1), 0, Slot::Object, &vec_seed(0.5)).unwrap();
+        statement_question_put(&wtxn, sid(1), 1, Slot::Time, &vec_seed(0.7)).unwrap();
+        statement_question_put(&wtxn, sid(2), 0, Slot::Subject, &vec_seed(0.9)).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
@@ -183,5 +191,27 @@ mod tests {
         let rtxn = db.begin_read().unwrap();
         assert!(!statement_question_has_vectors(&rtxn, sid(1)).unwrap());
         assert!(statement_question_has_vectors(&rtxn, sid(2)).unwrap());
+    }
+
+    #[test]
+    fn put_reads_back_slot_and_vector() {
+        let (_d, db) = open();
+        let wtxn = db.begin_write().unwrap();
+        statement_question_put(&wtxn, sid(1), 0, Slot::Object, &vec_seed(0.11)).unwrap();
+        statement_question_put(&wtxn, sid(1), 1, Slot::Subject, &vec_seed(0.22)).unwrap();
+        statement_question_put(&wtxn, sid(1), 2, Slot::Time, &vec_seed(0.33)).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let rows = statement_question_iter_all(&rtxn).unwrap();
+        // Key order is by (statement_id, question_index), so rows are in
+        // the insertion order above for a single statement.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].1, Slot::Object);
+        assert!((rows[0].2[0] - 0.11).abs() < 1e-6);
+        assert_eq!(rows[1].1, Slot::Subject);
+        assert!((rows[1].2[0] - 0.22).abs() < 1e-6);
+        assert_eq!(rows[2].1, Slot::Time);
+        assert!((rows[2].2[0] - 0.33).abs() < 1e-6);
     }
 }

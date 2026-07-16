@@ -194,18 +194,6 @@ pub struct SchemaUpdateBody {
     pub created_at_unix_nanos: u64,
 }
 
-/// Extractor enable/disable toggle. There is no dedicated
-/// `WalRecordKind` for extractor toggles — the only opaque-body kind
-/// that could carry this is `Audit` (0x50). This body is defined so the
-/// schema is ready, but wiring it to a kind is deferred to the work that
-/// decides whether toggles ride `Audit` or get their own kind.
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
-pub struct ExtractorToggleBody {
-    pub id: u32,
-    pub enabled: bool,
-}
-
 // ---------------------------------------------------------------------------
 // Encode / decode.
 // ---------------------------------------------------------------------------
@@ -285,11 +273,6 @@ body_codec!(
     StatementTombstoneBody
 );
 body_codec!(encode_schema_update, decode_schema_update, SchemaUpdateBody);
-body_codec!(
-    encode_extractor_toggle,
-    decode_extractor_toggle,
-    ExtractorToggleBody
-);
 
 // ---------------------------------------------------------------------------
 // Tests.
@@ -495,17 +478,6 @@ mod tests {
         assert_eq!(got, body);
         assert_eq!(got.blob, b"entity Person { name: text }".to_vec());
         assert_eq!(got.version, 3);
-    }
-
-    #[test]
-    fn extractor_toggle_body_round_trips() {
-        let body = ExtractorToggleBody {
-            id: 42,
-            enabled: true,
-        };
-        let bytes = encode_extractor_toggle(&body);
-        let got = decode_extractor_toggle(&bytes).unwrap();
-        assert_eq!(got, body);
     }
 
     #[test]

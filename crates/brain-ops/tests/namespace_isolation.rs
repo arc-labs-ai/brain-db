@@ -154,11 +154,14 @@ fn encode_req(request_id: [u8; 16], text: &str) -> EncodeRequest {
         request_id,
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     }
 }
 
 fn recall_req(cue: &str) -> RecallRequest {
     RecallRequest {
+        trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),
         max_results: 50,
@@ -178,8 +181,7 @@ fn recall_req(cue: &str) -> RecallRequest {
         // agent-scoping admits both rows on the agent axis and only the
         // namespace wall can separate them. Cross-agent opt-in is rejected
         // under scoped auth anyway, so we keep the default here.
-        agent_filter: Vec::new(),
-        include_other_agents: false,
+        act_as: None,
     }
 }
 

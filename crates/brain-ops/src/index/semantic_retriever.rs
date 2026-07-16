@@ -225,6 +225,14 @@ impl BrainSemanticRetriever {
                 .read()
                 .search(vector, config.top_k)
                 .unwrap_or_default();
+            // Retrieval boosting only needs "which statement is relevant", not
+            // which slot — the slot is consumed by the separate slot-projection
+            // grounded path (`statement_slot_hits_for_query`), not this
+            // recall-additive statement union. Drop the slot here.
+            let raw: Vec<(brain_core::StatementId, f32)> = raw
+                .into_iter()
+                .map(|(id, _slot, score)| (id, score))
+                .collect();
             merge_statement_hits(&mut direct, raw, config.similarity_threshold, config.top_k);
         }
         Ok(direct)
@@ -308,6 +316,36 @@ impl SemanticRetriever for BrainSemanticRetriever {
         let row = table.get(&id.to_be_bytes()).ok()??;
         let text = String::from_utf8_lossy(row.value());
         self.embedder.embed(&text).ok()
+    }
+
+    fn hype_scores_for_query(
+        &self,
+        query: &[f32; SEMANTIC_VECTOR_DIM],
+        k: usize,
+    ) -> Vec<(MemoryId, f32)> {
+        // One HNSW probe of the hypothetical-question pool, collapsed to the
+        // best cosine per memory. `None` (no HyPE index wired: disabled, or no
+        // LLM tier) yields no answer-lead signal — the read path then keeps its
+        // existing order untouched.
+        let Some(hype) = self.hype_index.as_ref() else {
+            return Vec::new();
+        };
+        hype.read().search(query, k).unwrap_or_default()
+    }
+
+    fn statement_slot_hits_for_query(
+        &self,
+        query: &[f32; SEMANTIC_VECTOR_DIM],
+        k: usize,
+    ) -> Vec<(brain_core::StatementId, brain_core::Slot, f32)> {
+        // One probe of the per-statement question-bridge pool, collapsed to the
+        // best cosine per (statement, slot). `None` (no bridge index wired)
+        // yields no slot-projection signal, so the grounded read keeps its
+        // existing predicate-embedding path.
+        let Some(bridge) = self.statement_question_index.as_ref() else {
+            return Vec::new();
+        };
+        bridge.read().search(query, k).unwrap_or_default()
     }
 }
 

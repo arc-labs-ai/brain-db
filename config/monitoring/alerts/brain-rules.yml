@@ -1,8 +1,12 @@
 # Prometheus alerting rules for Brain.
 #
-# Validated in CI by crates/brain-server/tests/alerts.rs (shape + required
-# alerts + severity set). `promtool check rules config/monitoring/alerts/brain-rules.yml`
-# is the authoritative check when the Prometheus toolchain is available.
+# Validated in CI by crates/brain-server/tests/alerts.rs, which checks the
+# file's shape, the required-alert set, the severity set, AND that every
+# metric an expr references is one the server actually emits (parsed from
+# crates/brain-server/src/metrics/format.rs) — so an alert can never again
+# silently reference a metric that does not exist.
+# `promtool check rules config/monitoring/alerts/brain-rules.yml` is the
+# authoritative PromQL check when the Prometheus toolchain is available.
 #
 # Severities: critical (page now), high (page in hours), medium (ticket),
 # low (informational). Thresholds are starting points — tune per deployment.
@@ -16,27 +20,35 @@ groups:
           severity: critical
         annotations:
           summary: "Brain server is unreachable"
-          description: "No successful scrape of {{ $labels.instance }} for 1m — the server is down or the metrics port is unreachable."
+          description: >-
+            No successful scrape of {{ $labels.instance }} for 1m — the server
+            is down, wedged, or fail-stopped. Brain halts the process on a
+            fail-stop invariant violation (CRC mismatch, WAL fsync failure),
+            so a hard halt surfaces here as a scrape failure.
 
       - alert: BrainHighErrorRate
         expr: |
-          sum(rate(brain_frame_send_total{opcode="error"}[5m]))
-            / clamp_min(sum(rate(brain_frame_recv_total[5m])), 1) > 0.05
+          sum(rate(brain_request_total{status="error"}[5m]))
+            / clamp_min(sum(rate(brain_request_total[5m])), 1) > 0.05
         for: 5m
         labels:
           severity: critical
         annotations:
           summary: "Brain error-response rate above 5%"
-          description: "Over 5% of requests are returning ERROR frames over the last 5m."
+          description: "Over 5% of dispatched requests terminated in an ERROR status over the last 5m."
 
-      - alert: BrainCheckpointFailing
-        expr: increase(brain_snapshot_failures_total[1h]) > 0
+      - alert: BrainWorkerErrors
+        expr: increase(brain_worker_errors_total[15m]) > 0
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "Brain snapshot/checkpoint is failing"
-          description: "At least one snapshot has failed in the last hour — durability/recovery posture is degraded."
+          summary: "A Brain correctness/maintenance worker is erroring"
+          description: >-
+            Worker {{ $labels.worker }} on shard {{ $labels.shard }} reported
+            cycle errors in the last 15m. The always-on set includes
+            correctness workers (ForgetCascade, SchemaMigration, StatementEmbed);
+            errors here degrade durability/correctness posture.
 
   - name: brain-high
     rules:
@@ -50,13 +62,26 @@ groups:
           description: "p99 request latency has exceeded the 50ms target for 10m."
 
       - alert: BrainWorkerStuck
-        expr: sum without (worker) (rate(brain_extractor_cycle_duration_seconds_count[15m])) == 0
+        expr: sum(rate(brain_worker_cycles_total[15m])) == 0
         for: 15m
         labels:
           severity: high
         annotations:
-          summary: "A Brain background worker has stalled"
-          description: "No worker cycles completed in the last 15m — decay/consolidation/extraction may be wedged."
+          summary: "Brain background workers have stalled"
+          description: "No worker cycle completed anywhere in the last 15m — decay/consolidation/extraction/embed may be wedged."
+
+      - alert: BrainExtractorApplyDropping
+        expr: increase(brain_extractor_apply_dropped_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: high
+        annotations:
+          summary: "Extracted typed-graph items are failing to persist"
+          description: >-
+            The apply pass dropped real extracted items on shard
+            {{ $labels.shard }} (reason={{ $labels.reason }}) in the last 15m.
+            Any nonzero value is signal loss — memories were written but their
+            derived statements/relations did not land.
 
   - name: brain-medium
     rules:
@@ -69,23 +94,28 @@ groups:
           summary: "HNSW tombstone ratio above 30%"
           description: "Index is accumulating tombstones — recall latency/quality will degrade until maintenance compacts it."
 
-      - alert: BrainRecallQualityDegraded
-        expr: brain_hnsw_recall_estimate < 0.9
-        for: 30m
-        labels:
-          severity: medium
-        annotations:
-          summary: "HNSW recall estimate below 0.9"
-          description: "Estimated approximate-recall has dropped below 0.9 — consider raising ef_search or rebuilding the index."
-
-      - alert: BrainEmbedderSlow
-        expr: histogram_quantile(0.99, sum by (le) (rate(brain_embedder_duration_ms_bucket[5m]))) > 100
+      - alert: BrainArenaNearCapacity
+        expr: brain_arena_used_bytes / clamp_min(brain_arena_capacity_bytes, 1) > 0.9
         for: 15m
         labels:
           severity: medium
         annotations:
-          summary: "Embedder p99 above 100ms"
-          description: "Embedding the query/text is slow — encode and recall throughput will suffer."
+          summary: "Arena above 90% capacity"
+          description: >-
+            Shard {{ $labels.shard }} arena is over 90% full. When the arena
+            fills, encodes fail — provision more capacity or age out memories.
+
+      - alert: BrainStatementEmbedErrors
+        expr: increase(brain_statement_embed_errors_total[15m]) > 0
+        for: 15m
+        labels:
+          severity: medium
+        annotations:
+          summary: "Statement-embed worker is failing"
+          description: >-
+            The StatementEmbedWorker hit embedder batch failures on shard
+            {{ $labels.shard }} in the last 15m — new statements are not
+            entering the statement HNSW, so graph recall degrades.
 
       - alert: BrainConnectionsChurning
         expr: rate(brain_connections_closed_total[5m]) > 20
@@ -107,11 +137,22 @@ groups:
           summary: "Brain configuration changed"
           description: "The running config fingerprint changed in the last hour — confirm the change was intentional."
 
-      - alert: BrainWorkerErrorsWarning
+      - alert: BrainExtractorBackpressure
         expr: increase(brain_extractor_drops_total[1h]) > 0
         for: 0m
         labels:
           severity: low
         annotations:
-          summary: "Background worker dropped items"
-          description: "An extractor/edge worker dropped items from its queue in the last hour (back-pressure or transient error)."
+          summary: "Extractor queue dropped items"
+          description: "The extractor worker dropped enqueues in the last hour (back-pressure or a full channel)."
+
+      - alert: BrainTraceExportFailing
+        expr: increase(brain_tracing_export_errors_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: low
+        annotations:
+          summary: "OTLP trace export is failing"
+          description: >-
+            The OpenTelemetry exporter reported failed/timed-out export
+            attempts in the last 15m — traces are not reaching the collector.

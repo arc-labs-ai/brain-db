@@ -19,8 +19,12 @@
 //! page. We defer that until profiling identifies a hot read path;
 //! owned reads are simpler to reason about and test.
 
+use std::ops::Bound;
+
 use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, NamespaceId};
-use redb::TableDefinition;
+use redb::{ReadTransaction, TableDefinition};
+
+use crate::tables::scope::RowScope;
 
 // ---------------------------------------------------------------------------
 // Table definition.
@@ -105,6 +109,217 @@ pub fn agent_timeline_prefix_agent_time(
     p[4..20].copy_from_slice(&agent_id_bytes);
     p[20..28].copy_from_slice(&created_at_unix_nanos.to_be_bytes());
     p
+}
+
+// ---------------------------------------------------------------------------
+// MEMORY_LIST keyset enumeration.
+// ---------------------------------------------------------------------------
+
+/// Errors from the memory enumeration scan.
+#[derive(thiserror::Error, Debug)]
+pub enum MemoryListError {
+    #[error("redb table: {0}")]
+    Table(#[from] redb::TableError),
+    #[error("redb storage: {0}")]
+    Storage(#[from] redb::StorageError),
+}
+
+/// Row-level predicates applied during a [`memory_timeline_page`] scan.
+/// Time bounds are on the `created_at` axis (the axis the timeline index
+/// orders by); the `occurred_at` axis has no memory index yet.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryTimelineFilter {
+    /// Empty = all kinds; otherwise only these raw kind bytes (0/1/2) pass.
+    pub kinds: Vec<u8>,
+    /// When false, tombstoned rows are skipped.
+    pub include_tombstoned: bool,
+    /// Inclusive `created_at` lower bound (unix-nanos); `None` = no bound.
+    pub created_from: Option<u64>,
+    /// Inclusive `created_at` upper bound (unix-nanos); `None` = no bound.
+    pub created_to: Option<u64>,
+    /// Inclusive salience floor.
+    pub salience_min: f32,
+    /// Inclusive salience ceiling.
+    pub salience_max: f32,
+}
+
+impl MemoryTimelineFilter {
+    /// True when `row` passes every predicate.
+    fn admits(&self, row: &MemoryMetadata) -> bool {
+        if !self.include_tombstoned && !row.is_active() {
+            return false;
+        }
+        if !self.kinds.is_empty() && !self.kinds.contains(&row.kind) {
+            return false;
+        }
+        if let Some(from) = self.created_from {
+            if row.created_at_unix_nanos < from {
+                return false;
+            }
+        }
+        if let Some(to) = self.created_to {
+            if row.created_at_unix_nanos > to {
+                return false;
+            }
+        }
+        if row.salience < self.salience_min || row.salience > self.salience_max {
+            return false;
+        }
+        true
+    }
+}
+
+/// One page of the timeline enumeration: the matching rows plus a flag
+/// telling the caller whether more matching rows exist beyond this page.
+pub struct MemoryTimelinePage {
+    pub rows: Vec<MemoryMetadata>,
+    /// True when the scan found at least one more matching row after the
+    /// page limit — the caller should mint a resume cursor from
+    /// [`Self::last_key`].
+    pub has_more: bool,
+    /// The exact timeline-index key bytes of the last returned row. The
+    /// resume cursor MUST be built from this, not reconstructed from the
+    /// row's fields: the index key and the row can disagree on
+    /// `created_at_unix_nanos` (they are stamped from separate reads at
+    /// write time), and a reconstructed key would land between real keys —
+    /// breaking the exclusive-resume boundary (descending re-emits it).
+    pub last_key: Option<[u8; AGENT_TIMELINE_KEY_LEN]>,
+}
+
+/// Lexicographic successor of `prefix`: the smallest byte string strictly
+/// greater than every string that starts with `prefix`. `None` when the
+/// prefix is all `0xFF` (no finite successor — the range is unbounded
+/// above). Used to bound a prefix scan without a trailing sentinel.
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut out = prefix.to_vec();
+    while let Some(last) = out.last_mut() {
+        if *last != 0xFF {
+            *last += 1;
+            return Some(out);
+        }
+        out.pop();
+    }
+    None
+}
+
+/// Keyset (seek) page over one `(namespace, agent)`'s memory timeline.
+///
+/// Ranges [`MEMORIES_BY_AGENT_TIMELINE_TABLE`] within the tenant's
+/// contiguous keyspace and, for each timeline key, loads the memory row
+/// and applies `filter`. `descending` walks newest-first; `after_key`,
+/// when present, resumes strictly after that timeline key (the previous
+/// page's last key) — so page N costs the same as page 1 and pages stay
+/// stable under concurrent writes.
+///
+/// Returns up to `limit` rows in scan order and a `has_more` flag (the
+/// scan peeks one row past the limit to set it). The trailing
+/// `memory_id` in the timeline key disambiguates rows written at the
+/// same nanosecond, so pagination is exact even under created-time ties.
+pub fn memory_timeline_page(
+    rtxn: &ReadTransaction,
+    scope: RowScope,
+    descending: bool,
+    after_key: Option<&[u8]>,
+    limit: usize,
+    filter: &MemoryTimelineFilter,
+) -> Result<MemoryTimelinePage, MemoryListError> {
+    let timeline_t = rtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE)?;
+    let memories_t = rtxn.open_table(MEMORIES_TABLE)?;
+
+    let prefix = agent_timeline_prefix_agent(scope.namespace_id, scope.agent_id_bytes).to_vec();
+    let upper = prefix_successor(&prefix);
+
+    // Build the range bounds. The scan is always confined to the tenant's
+    // 20-byte `(namespace, agent)` prefix; `after_key` narrows one end so
+    // the resume is strictly exclusive of the previous page's last key.
+    let (lower_bound, upper_bound): (Bound<&[u8]>, Bound<&[u8]>) = if descending {
+        // Newest-first: keys below `after_key` (exclusive) down to the
+        // tenant prefix.
+        let lo = Bound::Included(prefix.as_slice());
+        let hi = match after_key {
+            Some(k) => Bound::Excluded(k),
+            None => match &upper {
+                Some(u) => Bound::Excluded(u.as_slice()),
+                None => Bound::Unbounded,
+            },
+        };
+        (lo, hi)
+    } else {
+        // Oldest-first: keys above `after_key` (exclusive) up to the
+        // tenant prefix successor.
+        let lo = match after_key {
+            Some(k) => Bound::Excluded(k),
+            None => Bound::Included(prefix.as_slice()),
+        };
+        let hi = match &upper {
+            Some(u) => Bound::Excluded(u.as_slice()),
+            None => Bound::Unbounded,
+        };
+        (lo, hi)
+    };
+
+    let range = timeline_t.range::<&[u8]>((lower_bound, upper_bound))?;
+
+    // Peek one past `limit` so `has_more` reflects a genuine next page,
+    // not merely a full page.
+    let mut rows: Vec<MemoryMetadata> = Vec::with_capacity(limit.min(128));
+    let mut has_more = false;
+    let mut last_key: Option<[u8; AGENT_TIMELINE_KEY_LEN]> = None;
+
+    // A closure over one timeline entry: load the row, tenant-check,
+    // filter, and either push or signal has_more. Returns true to stop.
+    let mut consume = |key: &[u8]| -> Result<bool, MemoryListError> {
+        if key.len() != AGENT_TIMELINE_KEY_LEN {
+            return Ok(false);
+        }
+        let mut id_bytes = [0u8; 16];
+        id_bytes.copy_from_slice(&key[36..52]);
+        let Some(row) = memories_t.get(&id_bytes)?.map(|g| g.value()) else {
+            return Ok(false);
+        };
+        // Tenant wall (defense-in-depth): the range prefix already
+        // isolates the scope, but re-check the row's own owner so a
+        // corrupt index key can never leak a foreign row.
+        if row.namespace_id != scope.namespace_id || row.agent_id_bytes != scope.agent_id_bytes {
+            return Ok(false);
+        }
+        if !filter.admits(&row) {
+            return Ok(false);
+        }
+        if rows.len() == limit {
+            has_more = true;
+            return Ok(true);
+        }
+        // Record the exact key bytes so the resume cursor is the real
+        // index key (see `MemoryTimelinePage::last_key`).
+        let mut kb = [0u8; AGENT_TIMELINE_KEY_LEN];
+        kb.copy_from_slice(key);
+        last_key = Some(kb);
+        rows.push(row);
+        Ok(false)
+    };
+
+    if descending {
+        for entry in range.rev() {
+            let (k, _) = entry?;
+            if consume(k.value())? {
+                break;
+            }
+        }
+    } else {
+        for entry in range {
+            let (k, _) = entry?;
+            if consume(k.value())? {
+                break;
+            }
+        }
+    }
+
+    Ok(MemoryTimelinePage {
+        rows,
+        has_more,
+        last_key,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +712,107 @@ mod tests {
         m.set_flag(flags::HARD_FORGOTTEN | flags::STALE, true);
         assert!(m.is_hard_forgotten());
         assert!(m.is_stale());
+    }
+
+    // ----- Keyset pagination: exclusive resume in both directions --------
+
+    #[test]
+    fn timeline_pagination_no_duplicates_both_directions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        let ns = NamespaceId::SYSTEM;
+        let mut agent_b = [0u8; 16];
+        agent_b[15] = 0x55;
+        let agent: AgentId = agent_b.into();
+        const N: u64 = 25;
+        const BASE: u64 = 1_700_000_000_000_000_000;
+
+        let wtxn = db.begin_write().unwrap();
+        {
+            let mut mt = wtxn.open_table(MEMORIES_TABLE).unwrap();
+            let mut tt = wtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE).unwrap();
+            for i in 0..N {
+                // Reproduce the real write-path hazard: the timeline index key
+                // and the memory row are stamped from SEPARATE `created_at`
+                // reads a few nanos apart, so the key's created_at is NOT the
+                // row's created_at. A resume cursor reconstructed from the
+                // row's fields would then miss the real key and the descending
+                // page would re-emit its boundary row. The key is built with
+                // `key_created`; the row stores `row_created` (offset by +37).
+                let key_created = BASE + i * 1_000;
+                let row_created = key_created + 37;
+                let m = MemoryMetadata::new_active(
+                    MemoryId::pack(1, i, 1),
+                    ns,
+                    agent,
+                    ContextId(0),
+                    i,
+                    1,
+                    MemoryKind::Episodic,
+                    [0xAB; 16],
+                    0.5,
+                    42,
+                    row_created,
+                );
+                mt.insert(&m.memory_id_bytes, &m).unwrap();
+                let tk = agent_timeline_key(
+                    m.namespace_id,
+                    m.agent_id_bytes,
+                    key_created, // deliberately != m.created_at_unix_nanos
+                    m.context_id,
+                    m.memory_id_bytes,
+                );
+                tt.insert(tk.as_slice(), &()).unwrap();
+            }
+        }
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let scope = RowScope::from_bytes(ns.raw(), agent_b);
+        let filter = MemoryTimelineFilter {
+            salience_max: 1.0,
+            ..Default::default()
+        };
+
+        // A full keyset walk must return every row exactly once regardless of
+        // direction. The resume cursor is taken from `page.last_key` (the
+        // real index key) — not reconstructed from the row — so the
+        // key/row `created_at` divergence above does not corrupt the boundary.
+        for descending in [false, true] {
+            let mut ids: Vec<[u8; 16]> = Vec::new();
+            let mut after: Option<[u8; AGENT_TIMELINE_KEY_LEN]> = None;
+            loop {
+                let page = memory_timeline_page(
+                    &rtxn,
+                    scope,
+                    descending,
+                    after.as_ref().map(|k| k.as_slice()),
+                    10,
+                    &filter,
+                )
+                .unwrap();
+                for r in &page.rows {
+                    ids.push(r.memory_id_bytes);
+                }
+                if !page.has_more {
+                    break;
+                }
+                after = page.last_key;
+            }
+            let unique: std::collections::HashSet<_> = ids.iter().collect();
+            assert_eq!(
+                ids.len(),
+                N as usize,
+                "descending={descending}: returned {} rows, expected {N}",
+                ids.len()
+            );
+            assert_eq!(
+                unique.len(),
+                N as usize,
+                "descending={descending}: {} duplicate rows",
+                ids.len() - unique.len()
+            );
+        }
     }
 
     #[test]

@@ -1,15 +1,24 @@
 //! Tracing/log subscriber installation.
 //!
-//! Two entry points:
+//! The global subscriber is installed **exactly once**, in
+//! [`init_pre_config`], and everything after that reconfigures the same
+//! subscriber through a [`tracing_subscriber::reload`] handle. This is the
+//! fix for the old two-phase design, where a second `try_init` after
+//! config load silently failed (a subscriber already existed), leaving the
+//! configured log level, JSON formatter, and OpenTelemetry exporter dead.
 //!
-//! - [`init_pre_config`] — called before the config is loaded so
-//!   startup errors are still captured. Defaults to a `compact`
-//!   formatter at `info` level; honors `BRAIN_LOG`.
-//! - [`reinit_from_config`] — called after `Config::load`. Switches
-//!   the formatter and level per the `[monitoring.logging]` section. Because
-//!   `tracing` only allows one global subscriber, this is a no-op if
-//!   `init_pre_config` already installed one — but the values are
-//!   logged for operator visibility.
+//! The lifecycle is:
+//!
+//! 1. [`init_pre_config`] — installs a minimal `compact` / `info`
+//!    subscriber before the config is loaded so startup errors are still
+//!    captured, and returns a [`LoggingHandle`].
+//! 2. [`LoggingHandle::reconfigure`] — called after `Config::load`. Swaps
+//!    in the configured formatter (compact / JSON) and level via the reload
+//!    handle. This runs before the Tokio runtime exists.
+//! 3. [`LoggingHandle::attach_otel`] — called from *inside* the Tokio
+//!    runtime. Builds the OTLP pipeline (its batch exporter needs a running
+//!    Tokio runtime) and reloads it into the subscriber, so traces actually
+//!    export.
 //!
 //! ## Formats supported
 //!
@@ -32,14 +41,30 @@
 
 use opentelemetry_sdk::trace::TracerProvider;
 use tracing::info;
-use tracing_subscriber::fmt;
-use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::layer::{Layered, SubscriberExt as _};
 use tracing_subscriber::util::SubscriberInitExt as _;
-use tracing_subscriber::{EnvFilter, Registry};
+use tracing_subscriber::{fmt, reload, EnvFilter, Layer, Registry};
 
 use crate::config::{LoggingConfig, TracingConfig};
 
 use super::tracing as otel;
+
+/// The concrete OpenTelemetry layer type built by [`super::tracing::build`].
+type OtelLayer = OpenTelemetryLayer<Registry, opentelemetry_sdk::trace::Tracer>;
+
+/// Type-erased *output* layer over the root `Registry`. Erasing to
+/// `Box<dyn Layer>` lets one reload slot swap between the compact and JSON
+/// formatters (different concrete types) and add the OTel layer later. The
+/// box carries NO per-layer filter — level filtering is a separate, global
+/// `EnvFilter` layer (see below), because a per-layer `Filtered` reloaded
+/// into the subscriber has no registered `FilterId` and panics at first use.
+type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
+
+/// The subscriber the global filter layers onto: `Registry` plus the
+/// reloadable output slot.
+type OutputReload = reload::Layer<BoxedLayer, Registry>;
+type FilterSubscriber = Layered<OutputReload, Registry>;
 
 /// Resolved log format — one of `compact`, `json`. Unrecognised
 /// strings fall back to `Compact` with a warning at install time.
@@ -79,73 +104,112 @@ fn build_filter(default_level: &str) -> EnvFilter {
     EnvFilter::new(default_level)
 }
 
-/// Install a minimal subscriber before the config is loaded. Idempotent
-/// via `try_init` — only the first call succeeds.
-pub fn init_pre_config() {
-    let filter = build_filter("info");
-    let _ = fmt().with_env_filter(filter).with_target(true).try_init();
+/// Assemble the reconfigurable *output* layer: a formatter (compact or JSON)
+/// plus an optional OTel layer, as sibling layers with no filter of their
+/// own. Type-erased so one reload slot can hold any formatter / OTel combo.
+/// Level filtering is applied globally by a separate `EnvFilter` layer.
+fn build_output(format: LogFormat, otel: Option<OtelLayer>) -> BoxedLayer {
+    let fmt_layer: BoxedLayer = match format {
+        LogFormat::Compact => Box::new(fmt::layer().with_target(true)),
+        LogFormat::Json => Box::new(fmt::layer().with_target(true).json()),
+    };
+    let mut layers: Vec<BoxedLayer> = vec![fmt_layer];
+    if let Some(o) = otel {
+        layers.push(Box::new(o));
+    }
+    Box::new(layers)
 }
 
-/// Re-install or update the subscriber from `[monitoring.logging]` + `[monitoring.tracing]`.
+/// Handle to the single installed subscriber. Reconfiguring logging (and
+/// attaching the trace exporter) goes through the two reload slots here
+/// rather than trying to install a second global subscriber.
 ///
-/// Composes three layers:
-/// - `EnvFilter` (env-driven level filter).
-/// - Format layer (compact or JSON).
-/// - Optional OpenTelemetry layer (built by
-///   `bootstrap::tracing::build` when `[monitoring.tracing] enabled = true`).
-///
-/// Returns the `TracerProvider` when the OTel pipeline installed —
-/// callers must keep it alive (drop on shutdown to flush). Returns
-/// `None` when tracing is disabled or the OTel exporter failed to
-/// build (failure is logged via `warn!`, not propagated — tracing
-/// degrades to a no-trace fallback rather than failing startup).
-#[must_use = "drop the returned TracerProvider on shutdown to flush spans"]
-pub fn reinit_from_config(
-    logging: &LoggingConfig,
-    tracing_cfg: &TracingConfig,
-) -> Option<TracerProvider> {
-    let (format, warn) = LogFormat::parse(&logging.format);
-    let filter = build_filter(logging.level.as_str());
+/// Two slots because the concerns reload independently: `filter` is a global
+/// `EnvFilter` layer (the level knob), `output` is the fmt/OTel box. Keeping
+/// the filter global — rather than a per-layer `Filtered` on `output` —
+/// avoids the unregistered-`FilterId` panic a reloaded `Filtered` triggers.
+#[derive(Clone)]
+pub struct LoggingHandle {
+    output: reload::Handle<BoxedLayer, Registry>,
+    filter: reload::Handle<EnvFilter, FilterSubscriber>,
+}
 
-    let (otel_layer, provider) = match otel::build(tracing_cfg) {
-        Ok(Some(built)) => (Some(built.layer), Some(built.provider)),
-        Ok(None) => (None, None),
-        Err(e) => {
-            tracing::warn!(error = %e, "OTel layer build failed; tracing disabled");
-            (None, None)
+/// Install the single global subscriber with reload handles. Defaults to a
+/// `compact` formatter at `info` (honoring `BRAIN_LOG`) so startup errors
+/// before config load are captured. Idempotent: only the first call wins;
+/// the returned handle reconfigures whichever subscriber is live.
+#[must_use = "reconfigure the returned handle after loading config, or logging stays at the compact/info default"]
+pub fn init_pre_config() -> LoggingHandle {
+    let (output_layer, output) = reload::Layer::new(build_output(LogFormat::Compact, None));
+    let (filter_layer, filter) = reload::Layer::new(build_filter("info"));
+    let _ = Registry::default()
+        .with(output_layer)
+        .with(filter_layer)
+        .try_init();
+    LoggingHandle { output, filter }
+}
+
+impl LoggingHandle {
+    /// Swap the live subscriber to the configured formatter + level. Called
+    /// after `Config::load`, before the Tokio runtime exists, so the
+    /// startup logs that follow already honor `[monitoring.logging]`. The
+    /// OTel layer is attached separately (it needs the runtime).
+    pub fn reconfigure(&self, logging: &LoggingConfig) {
+        let (format, warn) = LogFormat::parse(&logging.format);
+        let filter_applied = self
+            .filter
+            .reload(build_filter(logging.level.as_str()))
+            .is_ok();
+        let output_applied = self.output.reload(build_output(format, None)).is_ok();
+        if let Some(msg) = warn {
+            tracing::warn!("{msg}");
         }
-    };
-
-    // Compose layers per format. OTel layer is attached first so its
-    // `S = Registry` parameter matches; filter + fmt layers (generic
-    // over `S`) wrap around it.
-    let installed = match format {
-        LogFormat::Compact => Registry::default()
-            .with(otel_layer)
-            .with(filter)
-            .with(fmt::layer().with_target(true))
-            .try_init()
-            .is_ok(),
-        LogFormat::Json => Registry::default()
-            .with(otel_layer)
-            .with(filter)
-            .with(fmt::layer().with_target(true).json())
-            .try_init()
-            .is_ok(),
-    };
-
-    if let Some(msg) = warn {
-        tracing::warn!("{msg}");
+        info!(
+            format = ?format,
+            level = %logging.level,
+            output = %logging.output,
+            applied = filter_applied && output_applied,
+            "logging subscriber reconfigured from config"
+        );
     }
-    info!(
-        format = ?format,
-        level = %logging.level,
-        output = %logging.output,
-        otel_enabled = provider.is_some(),
-        installed,
-        "logging subscriber configured"
-    );
-    provider
+
+    /// Build the OpenTelemetry pipeline and reload it into the live
+    /// subscriber. MUST be called from inside a running Tokio runtime — the
+    /// OTLP batch exporter spawns its background task there.
+    ///
+    /// Returns the `TracerProvider` when tracing installed — callers keep it
+    /// alive and drop it on shutdown to flush spans. Returns `None` when
+    /// tracing is disabled, the sampler is `always_off`, or the exporter
+    /// failed to build (logged via `warn!`, never fatal).
+    #[must_use = "drop the returned TracerProvider on shutdown to flush spans"]
+    pub fn attach_otel(
+        &self,
+        logging: &LoggingConfig,
+        tracing_cfg: &TracingConfig,
+    ) -> Option<TracerProvider> {
+        let built = match otel::build(tracing_cfg) {
+            Ok(Some(built)) => built,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(error = %e, "OTel layer build failed; tracing disabled");
+                return None;
+            }
+        };
+        // Rebuild the output slot preserving the configured formatter so the
+        // reload doesn't regress logging back to compact. (The filter slot is
+        // untouched — the level was already applied in `reconfigure`.)
+        let (format, _) = LogFormat::parse(&logging.format);
+        if self
+            .output
+            .reload(build_output(format, Some(built.layer)))
+            .is_err()
+        {
+            tracing::warn!("failed to attach OTel layer (subscriber unavailable)");
+            return None;
+        }
+        info!(endpoint = %tracing_cfg.endpoint, "OpenTelemetry trace exporter attached");
+        Some(built.provider)
+    }
 }
 
 #[cfg(test)]
@@ -171,5 +235,14 @@ mod tests {
         assert_eq!(fmt, LogFormat::Compact);
         assert!(warn.is_some(), "unknown format must surface a warning");
         assert!(warn.unwrap().contains("yaml"));
+    }
+
+    #[test]
+    fn build_output_is_reloadable_across_formats() {
+        // Exercises the type-erasure: compact and JSON must both produce the
+        // same BoxedLayer type so one reload slot can hold either. (Compile-
+        // time proof; asserts it constructs.)
+        let _compact = build_output(LogFormat::Compact, None);
+        let _json = build_output(LogFormat::Json, None);
     }
 }

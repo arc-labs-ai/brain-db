@@ -34,6 +34,5 @@
     17
   ],
   "txn_id": null,
-  "agent_filter": [],
-  "include_other_agents": false
+  "trace": true
 }

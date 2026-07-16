@@ -348,11 +348,6 @@ pub struct ShardSpawnConfig {
     /// surface as `CapabilityNotEnabled`. Enabled-but-fails-to-load is
     /// a hard spawn failure (see [`ShardError::CrossEncoderInitFailed`]).
     pub rerank: RerankSpawnConfig,
-    /// Per-tier extractor gates. `Disabled` skips the materialiser
-    /// for that tier; rows of that kind never make it into the
-    /// registry. `Enabled` lets the materialiser run; init-time
-    /// errors there propagate as [`ShardError::ExtractorInitFailed`].
-    pub extractors: ExtractorTierSpawnConfig,
     /// Provider credentials / model overrides for the LLM extractor
     /// tier, ferried from `Config.llm`. Resolved env-first /
     /// config-fallback at shard spawn (`llm_setup::build_llm_deps`).
@@ -381,32 +376,6 @@ pub struct LlmSpawnConfig {
 #[derive(Clone, Debug, Default)]
 pub struct RerankSpawnConfig {
     pub enabled: bool,
-}
-
-/// Knobs ferried from `Config.extractors` into the spawn path. One
-/// `enabled` bit per tier; the materialiser honours each in turn.
-#[derive(Clone, Copy, Debug)]
-pub struct ExtractorTierSpawnConfig {
-    pub pattern_enabled: bool,
-    pub classifier_enabled: bool,
-    pub llm_enabled: bool,
-}
-
-impl Default for ExtractorTierSpawnConfig {
-    // Model-free default: pattern needs nothing, but the classifier (GLiNER)
-    // needs an on-disk model and the LLM tier a provider key — an enabled tier
-    // that can't load is a hard shard-spawn failure. Production overrides all
-    // three explicitly from `Config.extractors.*` (see main.rs); this default
-    // only feeds `ShardSpawnConfig::new`, used by tests, so it must spawn
-    // without models. The full-pipeline corpus harness re-enables them and is
-    // gated on the model being present.
-    fn default() -> Self {
-        Self {
-            pattern_enabled: true,
-            classifier_enabled: false,
-            llm_enabled: false,
-        }
-    }
 }
 
 /// Knobs ferried from `Config.workers.auto_edge` into the spawn path.
@@ -438,9 +407,9 @@ impl Default for AutoEdgeSpawnConfig {
 }
 
 /// Knobs ferried from `Config.workers.extractor` into the spawn path.
-/// Tuning for the extraction pipeline worker. The worker's existence is
-/// DERIVED from the tier gates (`ExtractorTierSpawnConfig`) — it is spawned
-/// iff ≥1 tier is enabled — so there is no separate `enabled` knob here.
+/// Tuning for the extraction pipeline worker. The worker is always
+/// provisioned — extraction is a non-configurable, always-on capability
+/// (like the embedder) — so there is no separate `enabled` knob here.
 #[derive(Clone, Debug)]
 pub struct ExtractorSpawnConfig {
     pub interval_ms: u64,
@@ -641,9 +610,6 @@ pub struct ExtractorTuningSpawnConfig {
     pub classifier_threshold: f32,
     /// Hypothetical questions generated per memory at write time.
     pub hype_num_questions: usize,
-    /// Whether the per-statement question bridge is provisioned (HNSW +
-    /// templated-question generation + statement-scope probe). Off by default.
-    pub statement_question_bridge_enabled: bool,
 }
 
 impl Default for ExtractorTuningSpawnConfig {
@@ -653,7 +619,6 @@ impl Default for ExtractorTuningSpawnConfig {
             classifier_model_path: None,
             classifier_threshold: brain_extractors::classifier::DEFAULT_GLINER_THRESHOLD,
             hype_num_questions: 6,
-            statement_question_bridge_enabled: false,
         }
     }
 }
@@ -702,7 +667,6 @@ impl ShardSpawnConfig {
             index: IndexSpawnConfig::default(),
             dispatcher,
             rerank: RerankSpawnConfig::default(),
-            extractors: ExtractorTierSpawnConfig::default(),
             llm: LlmSpawnConfig::default(),
         }
     }
@@ -1624,27 +1588,19 @@ pub fn spawn_shard(
     };
     let cross_encoder_for_closure = cross_encoder_slot.clone();
 
-    // Per-tier extractor gate — used inside the closure when the
-    // materialiser walks persisted definitions. Disabled tiers skip
-    // materialisation silently (operator opt-out, not a degradation);
-    // enabled tiers that fail to init surface as
-    // `ShardError::ExtractorInitFailed` (the materialiser already
-    // returns per-row errors; we promote any LLM / classifier error
-    // there into a hard spawn failure when the tier is enabled).
-    let tier_gate = brain_extractors::TierGate {
-        pattern: brain_extractors::TierState::from_enabled(cfg.extractors.pattern_enabled),
-        classifier: brain_extractors::TierState::from_enabled(cfg.extractors.classifier_enabled),
-        llm: brain_extractors::TierState::from_enabled(cfg.extractors.llm_enabled),
-    };
+    // Extraction is always-on. All three tiers materialise
+    // unconditionally — extraction populates the typed graph that reads
+    // fuse, so a shard serving with extraction off would return incoherent
+    // graph-backed reads. There is no per-tier config gate (like the
+    // embedder and HyPE). A materialiser init error surfaces as
+    // `ShardError::ExtractorInitFailed` (hard spawn failure); a tier whose
+    // dep (GLiNER model / LLM client) is absent materialises degraded and
+    // emits `SkippedDisabled` audit rows rather than failing to spawn.
+    let tier_gate = brain_extractors::TierGate::all_enabled();
     let tier_gate_for_closure = tier_gate;
-    // The extraction pipeline (worker + queue drain) is provisioned iff at
-    // least one tier is enabled — the worker is DERIVED from the tier gates,
-    // not a separate master switch. This removes the trap where a standalone
-    // worker-off flag could silently dead-letter every enabled tier (ENCODE
-    // enqueues but nothing drains). "Disable extraction" = disable the tiers.
-    let extractor_pipeline_enabled = cfg.extractors.pattern_enabled
-        || cfg.extractors.classifier_enabled
-        || cfg.extractors.llm_enabled;
+    // The extraction pipeline (worker + queue drain) is always provisioned:
+    // extraction is a non-configurable always-on capability.
+    let extractor_pipeline_enabled = true;
     // Provider credentials / model overrides for the LLM extractor
     // tier, resolved env-first / config-fallback inside the closure.
     let llm_config_for_closure = cfg.llm.clone();
@@ -1766,41 +1722,35 @@ pub fn spawn_shard(
                         .expect("HypeHnswIndex::new"),
                 ),
             );
-            // Per-shard per-statement question-bridge pool. Gated on
-            // `[extractors.statement_question_bridge].enabled` so the default
-            // path pays no generation cost: `None` leaves both the embed worker
-            // and the semantic retriever without it (statement search stays
-            // direct-cosine only). When enabled it is rebuilt below from the
-            // durable `statement_question_vectors` rows.
-            let statement_question_hnsw_for_shard: Option<
-                Arc<parking_lot::RwLock<StatementQuestionHnswIndex>>,
-            > = if extractor_tuning_spawn_cfg.statement_question_bridge_enabled {
-                Some(Arc::new(parking_lot::RwLock::new(
-                    StatementQuestionHnswIndex::new(
-                        brain_index::statement_question_hnsw::statement_question_default_params(),
-                    )
-                    .expect("StatementQuestionHnswIndex::new"),
-                )))
-            } else {
-                None
-            };
+            // Per-shard per-statement question-bridge pool. Always
+            // constructed: the bridge is load-bearing for slot / temporal
+            // reads exactly like HyPE — a write step that populates it and a
+            // read step that probes it must always agree, so there is no
+            // provisioning gate. Rebuilt below from the durable
+            // `statement_question_vectors` rows; probing an empty pool is a
+            // cheap no-op on a shard that hasn't generated any yet.
+            let statement_question_hnsw_for_shard: Arc<
+                parking_lot::RwLock<StatementQuestionHnswIndex>,
+            > = Arc::new(parking_lot::RwLock::new(
+                StatementQuestionHnswIndex::new(
+                    brain_index::statement_question_hnsw::statement_question_default_params(),
+                )
+                .expect("StatementQuestionHnswIndex::new"),
+            ));
             // Per-shard semantic retriever. Reuses the executor's
             // embedder + the shared memory HNSW reader. The statement
             // HNSW handle lets the retriever fan out to the statement
             // corpus when `SemanticScope::Statement` or
             // `SemanticScope::Both` is requested.
-            let mut semantic_retriever_concrete =
+            let semantic_retriever_concrete =
                 brain_ops::index::semantic_retriever::BrainSemanticRetriever::new(
                     dispatcher.clone(),
                     hnsw_shared.clone(),
                     Some(statement_hnsw_for_shard.clone()),
                     metadata.clone(),
                 )
-                .with_hype_index(hype_hnsw_for_shard.clone());
-            if let Some(ref sq) = statement_question_hnsw_for_shard {
-                semantic_retriever_concrete =
-                    semantic_retriever_concrete.with_statement_question_index(sq.clone());
-            }
+                .with_hype_index(hype_hnsw_for_shard.clone())
+                .with_statement_question_index(statement_question_hnsw_for_shard.clone());
             let semantic_retriever_for_ops: Arc<dyn brain_index::SemanticRetriever> =
                 Arc::new(semantic_retriever_concrete);
             // Per-shard graph retriever. Reads from the entity /
@@ -2029,6 +1979,12 @@ pub fn spawn_shard(
                     None
                 };
 
+            // Captured out of the registry-build block below so the
+            // extractor worker can rebuild the registry live on a
+            // SCHEMA_UPLOAD without a restart (see
+            // `ExtractorWorker::with_registry_rebuild_deps`). Assigned
+            // unconditionally inside the block before it returns.
+            let extractor_rebuild_deps: brain_extractors::MaterializeDeps;
             let extractor_registry = {
                 let rtxn = metadata
                     .read_txn()
@@ -2048,19 +2004,22 @@ pub fn spawn_shard(
 
                 let materialize_deps = llm_deps
                     .into_materialize_deps(classifier_model, entity_type_qnames);
+                // Stash a clone for the worker's live rebuild path; the
+                // build below only borrows it.
+                extractor_rebuild_deps = materialize_deps.clone();
                 let (mut reg, errors) = brain_extractors::build_registry_with_gate(
                     &defs,
                     &materialize_deps,
                     tier_gate_for_closure,
                 );
                 if !errors.is_empty() {
-                    // An *enabled* extractor tier that fails to materialise
-                    // is a hard spawn failure, not a silent degrade: a shard
-                    // serving with a quietly-missing tier returns wrong audit
-                    // status on every ENCODE and hides the misconfiguration.
-                    // Disabled tiers never reach here — the materialiser skips
-                    // them before any fallible work — so every error is an
-                    // opted-in tier that broke or a corrupt definition.
+                    // An extractor tier that fails to materialise is a hard
+                    // spawn failure, not a silent degrade: a shard serving
+                    // with a quietly-missing tier returns wrong audit status
+                    // on every ENCODE and hides the misconfiguration. All
+                    // three tiers are always materialised (extraction is
+                    // always-on), so every error is a genuine init failure or
+                    // a corrupt definition — never an operator opt-out.
                     // Fail-stop, the same convention the classifier-model load
                     // above uses.
                     let detail = errors
@@ -2143,6 +2102,25 @@ pub fn spawn_shard(
                 .with_shard_id(shard_id)
                 .with_event_bus(event_bus.clone())
                 .with_wal_sink(wal_sink);
+            // Seed the slot counter from the persisted high-water mark so a
+            // restart on a non-empty shard never re-issues a live arena slot.
+            // (The counter resets to 1 in-process; without this, restart-reuse
+            // collides memory_ids — overwriting rows and skipping extraction.)
+            match metadata.read_txn() {
+                Ok(rtxn) => {
+                    match brain_metadata::tables::slot_version::max_assigned_slot(&rtxn) {
+                        Ok(hi) => real_writer.seed_next_slot(hi.saturating_add(1)),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "slot high-water recovery failed; slot counter starts at 1"
+                        ),
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "slot high-water recovery read_txn failed; slot counter starts at 1"
+                ),
+            }
             if let Some(tx) = auto_edge_sender {
                 real_writer.set_auto_edge_sender(tx);
             }
@@ -2523,41 +2501,39 @@ pub fn spawn_shard(
                 ),
             }
 
-            // Statement question-bridge rebuild (only when wired): re-insert
-            // every persisted per-statement question vector. Same durable-
-            // source-of-truth model as the HyPE pool.
-            if let Some(ref sq) = statement_question_hnsw_for_shard {
-                match metadata.read_txn() {
-                    Ok(rtxn) => {
-                        match brain_metadata::statement_question::ops::statement_question_iter_all(
-                            &rtxn,
-                        ) {
-                            Ok(points) if !points.is_empty() => {
-                                let report = sq.write().rebuild(points);
-                                info!(
-                                    shard_id,
-                                    inserted = report.inserted,
-                                    statements = report.statements,
-                                    "statement question-bridge rebuilt from metadata on startup"
-                                );
-                            }
-                            Ok(_) => info!(
+            // Statement question-bridge rebuild: re-insert every persisted
+            // per-statement question vector. Same durable-source-of-truth
+            // model as the HyPE pool.
+            match metadata.read_txn() {
+                Ok(rtxn) => {
+                    match brain_metadata::statement_question::ops::statement_question_iter_all(
+                        &rtxn,
+                    ) {
+                        Ok(points) if !points.is_empty() => {
+                            let report = statement_question_hnsw_for_shard.write().rebuild(points);
+                            info!(
                                 shard_id,
-                                "no statement question vectors to rebuild; pool starts empty"
-                            ),
-                            Err(e) => info!(
-                                shard_id,
-                                error = ?e,
-                                "statement question-bridge empty or table absent; starts empty"
-                            ),
+                                inserted = report.inserted,
+                                statements = report.statements,
+                                "statement question-bridge rebuilt from metadata on startup"
+                            );
                         }
+                        Ok(_) => info!(
+                            shard_id,
+                            "no statement question vectors to rebuild; pool starts empty"
+                        ),
+                        Err(e) => info!(
+                            shard_id,
+                            error = ?e,
+                            "statement question-bridge empty or table absent; starts empty"
+                        ),
                     }
-                    Err(e) => error!(
-                        shard_id,
-                        error = ?e,
-                        "statement question-bridge startup rebuild: read_txn failed"
-                    ),
                 }
+                Err(e) => error!(
+                    shard_id,
+                    error = ?e,
+                    "statement question-bridge startup rebuild: read_txn failed"
+                ),
             }
 
             // Recovery: re-enqueue every live statement so the
@@ -2652,15 +2628,13 @@ pub fn spawn_shard(
             // create / supersede events) and the worker is a 1 s
             // ticking no-op.
             {
-                let mut worker = brain_workers::StatementEmbedWorker::new(
+                let worker = brain_workers::StatementEmbedWorker::new(
                     metadata.clone(),
                     statement_hnsw_for_shard.clone(),
                     dispatcher.clone(),
                 )
-                .with_metrics(statement_embed_metrics_for_closure.clone());
-                if let Some(ref sq) = statement_question_hnsw_for_shard {
-                    worker = worker.with_question_bridge(sq.clone());
-                }
+                .with_metrics(statement_embed_metrics_for_closure.clone())
+                .with_question_bridge(statement_question_hnsw_for_shard.clone());
                 scheduler
                     .register(Arc::new(worker), ops.clone())
                     .expect("register StatementEmbedWorker");
@@ -2882,6 +2856,13 @@ pub fn spawn_shard(
                         embedder: dispatcher.clone(),
                         embed_threshold: extractor_tuning_spawn_cfg.resolver_embed_threshold,
                     });
+                // Give the worker the deps to rebuild the registry live when a
+                // SCHEMA_UPLOAD declares a new extractor — no restart needed.
+                // The tier gate is the same one the boot-time build used.
+                extractor_worker = extractor_worker.with_registry_rebuild_deps(
+                    extractor_rebuild_deps.clone(),
+                    tier_gate_for_closure,
+                );
                 if let Some(d) = entity_disambiguator_for_worker.clone() {
                     extractor_worker = extractor_worker.with_entity_disambiguator(d);
                 }

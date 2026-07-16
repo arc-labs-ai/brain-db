@@ -189,6 +189,8 @@ async fn encode(client: &mut TcpStream, stream_id: u32, text: &str) -> u128 {
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     };
     let (opcode, body) = round_trip(client, stream_id, RequestBody::Encode(req)).await;
     match body {
@@ -208,6 +210,7 @@ async fn create_entity(client: &mut TcpStream, stream_id: u32, name: &str) -> [u
             aliases: vec![],
             attributes_blob: Vec::new(),
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;
@@ -237,6 +240,7 @@ async fn resolve_entity(
             entity_type_hint: 0,
             allow_create: false,
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;
@@ -257,7 +261,10 @@ async fn entity_get_visible(client: &mut TcpStream, stream_id: u32, entity_id: [
     let (opcode, _body) = round_trip(
         client,
         stream_id,
-        RequestBody::EntityGet(EntityGetRequest { entity_id }),
+        RequestBody::EntityGet(EntityGetRequest {
+            entity_id,
+            act_as: None,
+        }),
     )
     .await;
     opcode == Opcode::EntityGetResp.as_u16()

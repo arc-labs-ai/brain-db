@@ -98,6 +98,8 @@ fn encode_req(rid: [u8; 16], text: &str) -> EncodeRequest {
         request_id: rid,
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     }
 }
 
@@ -125,6 +127,7 @@ async fn encode(fix: &Fixture, rid: [u8; 16], text: &str) -> u128 {
 
 async fn recall(fix: &Fixture, cue: &str, max_results: u32) -> RecallResponseFrame {
     let req = RecallRequest {
+        trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),
         max_results,
@@ -139,8 +142,7 @@ async fn recall(fix: &Fixture, cue: &str, max_results: u32) -> RecallResponseFra
         include_text: false,
         request_id: None,
         txn_id: None,
-        agent_filter: Vec::new(),
-        include_other_agents: false,
+        act_as: None,
     };
     match single_body(
         dispatch(

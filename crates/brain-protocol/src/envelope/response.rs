@@ -43,6 +43,7 @@ pub use crate::ops::admin::*;
 pub use crate::ops::capabilities::*;
 pub use crate::ops::entity::*;
 pub use crate::ops::extractor::*;
+pub use crate::ops::graph::*;
 pub use crate::ops::memory::*;
 pub use crate::ops::procedural::*;
 pub use crate::ops::query::*;
@@ -76,6 +77,12 @@ pub enum ResponseBody {
     Forget(ForgetResponse),
     Link(LinkResponse),
     Unlink(UnlinkResponse),
+    /// Paginated enumeration page. Single-frame in v1; a later cut may
+    /// split into per-batch streaming.
+    MemoryList(MemoryListResponseFrame),
+    /// Paginated typed-graph export page (nodes + edges). Single-frame in
+    /// v1; nodes/edges may repeat across pages (dedup by id).
+    GraphFetch(GraphFetchResponseFrame),
     SubscribeEvent(SubscriptionEvent),
     Unsubscribe(UnsubscribeResponse),
     GetCapabilities(GetCapabilitiesResponse),
@@ -143,17 +150,13 @@ pub enum ResponseBody {
     SchemaValidate(SchemaValidateResponse),
     SchemaReplace(SchemaReplaceResponse),
 
-    // Extractor governance ops.
+    // Extractor introspection (read-only).
     /// Single-frame snapshot in v1.
     ExtractorList(ExtractorListResponseFrame),
-    ExtractorDisable(ExtractorDisableResponse),
-    ExtractorEnable(ExtractorEnableResponse),
 
     // Retrieval query ops.
-    Query(QueryResponse),
     QueryExplain(QueryExplainResponse),
     QueryTrace(QueryTraceResponse),
-    QueryText(QueryTextResponse),
 
     // Procedural-memory materialization. Carries the rendered system
     // block plus the statement ids that contributed.
@@ -177,6 +180,8 @@ impl ResponseBody {
             Self::Forget(_) => Opcode::ForgetResp,
             Self::Link(_) => Opcode::LinkResp,
             Self::Unlink(_) => Opcode::UnlinkResp,
+            Self::MemoryList(_) => Opcode::MemoryListResp,
+            Self::GraphFetch(_) => Opcode::GraphFetchResp,
             Self::SubscribeEvent(_) => Opcode::SubscribeEvent,
             Self::Unsubscribe(_) => Opcode::UnsubscribeResp,
             Self::GetCapabilities(_) => Opcode::GetCapabilitiesResp,
@@ -228,12 +233,8 @@ impl ResponseBody {
             Self::SchemaValidate(_) => Opcode::SchemaValidateResp,
             Self::SchemaReplace(_) => Opcode::SchemaReplaceResp,
             Self::ExtractorList(_) => Opcode::ExtractorListResp,
-            Self::ExtractorDisable(_) => Opcode::ExtractorDisableResp,
-            Self::ExtractorEnable(_) => Opcode::ExtractorEnableResp,
-            Self::Query(_) => Opcode::QueryResp,
             Self::QueryExplain(_) => Opcode::QueryExplainResp,
             Self::QueryTrace(_) => Opcode::QueryTraceResp,
-            Self::QueryText(_) => Opcode::QueryTextResp,
             Self::MaterializeProcedural(_) => Opcode::MaterializeProceduralResp,
             Self::Error(_) => Opcode::Error,
         }
@@ -258,6 +259,8 @@ impl ResponseBody {
             Self::RelationTraverse(r) => Some(r.is_final),
             Self::SchemaList(r) => Some(r.is_final),
             Self::ExtractorList(r) => Some(r.is_final),
+            Self::MemoryList(r) => Some(r.is_final),
+            Self::GraphFetch(r) => Some(r.is_final),
             _ => None,
         }
     }
@@ -277,6 +280,8 @@ impl ResponseBody {
             Self::Forget(r) => to_cbor_bytes(r),
             Self::Link(r) => to_cbor_bytes(r),
             Self::Unlink(r) => to_cbor_bytes(r),
+            Self::MemoryList(r) => to_cbor_bytes(r),
+            Self::GraphFetch(r) => to_cbor_bytes(r),
             Self::SubscribeEvent(r) => to_cbor_bytes(r),
             Self::Unsubscribe(r) => to_cbor_bytes(r),
             Self::GetCapabilities(r) => to_cbor_bytes(r),
@@ -328,12 +333,8 @@ impl ResponseBody {
             Self::SchemaValidate(r) => to_cbor_bytes(r),
             Self::SchemaReplace(r) => to_cbor_bytes(r),
             Self::ExtractorList(r) => to_cbor_bytes(r),
-            Self::ExtractorDisable(r) => to_cbor_bytes(r),
-            Self::ExtractorEnable(r) => to_cbor_bytes(r),
-            Self::Query(r) => to_cbor_bytes(r),
             Self::QueryExplain(r) => to_cbor_bytes(r),
             Self::QueryTrace(r) => to_cbor_bytes(r),
-            Self::QueryText(r) => to_cbor_bytes(r),
             Self::MaterializeProcedural(r) => to_cbor_bytes(r),
             Self::Error(r) => to_cbor_bytes(r),
         }
@@ -354,6 +355,8 @@ impl ResponseBody {
             Opcode::ForgetResp => Self::Forget(from_cbor_bytes(bytes)?),
             Opcode::LinkResp => Self::Link(from_cbor_bytes(bytes)?),
             Opcode::UnlinkResp => Self::Unlink(from_cbor_bytes(bytes)?),
+            Opcode::MemoryListResp => Self::MemoryList(from_cbor_bytes(bytes)?),
+            Opcode::GraphFetchResp => Self::GraphFetch(from_cbor_bytes(bytes)?),
             Opcode::SubscribeEvent => Self::SubscribeEvent(from_cbor_bytes(bytes)?),
             Opcode::UnsubscribeResp => Self::Unsubscribe(from_cbor_bytes(bytes)?),
             Opcode::GetCapabilitiesResp => Self::GetCapabilities(from_cbor_bytes(bytes)?),
@@ -409,12 +412,8 @@ impl ResponseBody {
             Opcode::SchemaValidateResp => Self::SchemaValidate(from_cbor_bytes(bytes)?),
             Opcode::SchemaReplaceResp => Self::SchemaReplace(from_cbor_bytes(bytes)?),
             Opcode::ExtractorListResp => Self::ExtractorList(from_cbor_bytes(bytes)?),
-            Opcode::ExtractorDisableResp => Self::ExtractorDisable(from_cbor_bytes(bytes)?),
-            Opcode::ExtractorEnableResp => Self::ExtractorEnable(from_cbor_bytes(bytes)?),
-            Opcode::QueryResp => Self::Query(from_cbor_bytes(bytes)?),
             Opcode::QueryExplainResp => Self::QueryExplain(from_cbor_bytes(bytes)?),
             Opcode::QueryTraceResp => Self::QueryTrace(from_cbor_bytes(bytes)?),
-            Opcode::QueryTextResp => Self::QueryText(from_cbor_bytes(bytes)?),
             Opcode::MaterializeProceduralResp => {
                 Self::MaterializeProcedural(from_cbor_bytes(bytes)?)
             }
@@ -474,6 +473,7 @@ mod tests {
                 StageKind::Extractor,
             ],
             has_active_schema: true,
+            trace: None,
         }));
     }
 
@@ -496,12 +496,14 @@ mod tests {
             embedding_model_fp: [0xBB; 16],
             pending_stages: Vec::new(),
             has_active_schema: false,
+            trace: None,
         }));
     }
 
     #[test]
     fn recall_response_round_trips() {
         round_trip(ResponseBody::Recall(RecallResponseFrame {
+            trace: None,
             answer_kind: AnswerKindWire::Single,
             memories: vec![MemoryResult {
                 memory_id: sample_memory_id(),
@@ -538,6 +540,55 @@ mod tests {
             is_final: false,
             cumulative_count: 1,
             estimated_remaining: Some(9),
+        }));
+    }
+
+    #[test]
+    fn recall_response_round_trips_with_trace() {
+        use crate::ops::memory::{
+            RecallTrace, RecallTraceFilterChain, RecallTraceRerank, RecallTraceRetriever,
+            RecallTraceRetrieverStatus,
+        };
+        round_trip(ResponseBody::Recall(RecallResponseFrame {
+            answer_kind: AnswerKindWire::None,
+            memories: Vec::new(),
+            is_final: true,
+            cumulative_count: 0,
+            estimated_remaining: Some(0),
+            trace: Some(RecallTrace {
+                retrievers: vec![
+                    RecallTraceRetriever {
+                        name: crate::shared::enums::RetrieverNameWire::Semantic,
+                        status: RecallTraceRetrieverStatus::Success,
+                        status_detail: String::new(),
+                        latency_ms: 1.5,
+                        candidate_count: 12,
+                    },
+                    RecallTraceRetriever {
+                        name: crate::shared::enums::RetrieverNameWire::Graph,
+                        status: RecallTraceRetrieverStatus::Skipped,
+                        status_detail: "no anchor".into(),
+                        latency_ms: 0.0,
+                        candidate_count: 0,
+                    },
+                ],
+                filter_chain: RecallTraceFilterChain {
+                    before: 12,
+                    after_type: 12,
+                    after_temporal: 10,
+                    after_confidence: 8,
+                    after_tombstone: 8,
+                    after_supersession: 7,
+                    after_as_of: 7,
+                    after_limit: 5,
+                },
+                rerank: Some(RecallTraceRerank {
+                    applied: true,
+                    candidates: 5,
+                    latency_ms: 2.25,
+                }),
+                total_latency_ms: 4.75,
+            }),
         }));
     }
 
@@ -886,6 +937,7 @@ mod tests {
         // 3-frame sequence and verify ordering survives.
         let seq: Vec<ResponseBody> = vec![
             ResponseBody::Recall(RecallResponseFrame {
+                trace: None,
                 answer_kind: AnswerKindWire::None,
                 memories: vec![],
                 is_final: false,
@@ -893,6 +945,7 @@ mod tests {
                 estimated_remaining: Some(10),
             }),
             ResponseBody::Recall(RecallResponseFrame {
+                trace: None,
                 answer_kind: AnswerKindWire::None,
                 memories: vec![],
                 is_final: false,
@@ -900,6 +953,7 @@ mod tests {
                 estimated_remaining: Some(5),
             }),
             ResponseBody::Recall(RecallResponseFrame {
+                trace: None,
                 answer_kind: AnswerKindWire::None,
                 memories: vec![],
                 is_final: true,
@@ -928,6 +982,7 @@ mod tests {
         // Streaming variants report Some(...).
         assert_eq!(
             ResponseBody::Recall(RecallResponseFrame {
+                trace: None,
                 answer_kind: AnswerKindWire::None,
                 memories: vec![],
                 is_final: true,
@@ -1015,6 +1070,7 @@ mod tests {
                 can_reason: true,
                 can_forget: true,
                 can_admin: false,
+                can_act_as: false,
             },
             namespace: "acme".to_string(),
             server_time_unix_nanos: 1_700_000_000_000_000_000,

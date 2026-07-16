@@ -78,7 +78,7 @@ The algebra module is small and standalone — it's worth shipping early because
 PLAN / REASON integration is deferred because:
 
 1. The cost-model integration (where does VSA-similarity sit relative to RRF in the planner's cost estimator?) needs more bench data.
-2. The wire-level exposure (an `analogy` opcode, or a new field on `QUERY`?) is an open design call that's better made after the algebra has been used in anger.
+2. The wire-level exposure (an `analogy` opcode, or a new field on the `RECALL` read / the `QUERY_TRACE` debug op?) is an open design call that's better made after the algebra has been used in anger.
 
 Until that integration lands, the algebra module is callable from in-process consumers and from tests but does not appear on the wire. The integration's wire surface will require a wire-version bump if it warrants one.
 

@@ -1,30 +1,12 @@
-//! Extractor-op request payloads.
+//! Extractor introspection request/response payloads.
+//!
+//! Extraction is always-on; there is no runtime enable/disable. The
+//! only extractor wire op is the read-only `EXTRACTOR_LIST`.
 
-use crate::envelope::request::WireUuid;
-
-/// `EXTRACTOR_LIST` (`0x0124`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ExtractorListRequest {
-    pub include_disabled: bool,
-}
-
-/// `EXTRACTOR_DISABLE` (`0x0125`).
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ExtractorDisableRequest {
-    pub extractor_id: u32,
-    /// Free-form reason recorded in the audit; ≤ 4 KiB.
-    pub reason: String,
-    #[serde(with = "serde_bytes")]
-    pub request_id: WireUuid,
-}
-
-/// `EXTRACTOR_ENABLE` (`0x0126`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ExtractorEnableRequest {
-    pub extractor_id: u32,
-    #[serde(with = "serde_bytes")]
-    pub request_id: WireUuid,
-}
+/// `EXTRACTOR_LIST` (`0x0124`). Takes no arguments — every registered
+/// extractor is returned.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExtractorListRequest {}
 
 // ============================================================
 // Response payloads
@@ -38,7 +20,6 @@ pub struct ExtractorListItem {
     pub name: String,
     /// `0`=pattern, `1`=classifier, `2`=llm.
     pub kind: u8,
-    pub enabled: bool,
     pub schema_version: u32,
     pub created_at_unix_nanos: u64,
 }
@@ -52,18 +33,4 @@ pub struct ExtractorListResponseFrame {
     /// Always `true` in v1. A later streaming cut may set `false` on
     /// intermediate frames.
     pub is_final: bool,
-}
-
-/// `EXTRACTOR_DISABLE_RESP` (`0x01A5`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ExtractorDisableResponse {
-    pub previously_enabled: bool,
-    pub disabled_at_unix_nanos: u64,
-}
-
-/// `EXTRACTOR_ENABLE_RESP` (`0x01A6`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ExtractorEnableResponse {
-    pub previously_disabled: bool,
-    pub enabled_at_unix_nanos: u64,
 }

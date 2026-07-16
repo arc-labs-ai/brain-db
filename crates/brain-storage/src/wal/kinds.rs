@@ -66,8 +66,6 @@ pub enum WalRecordKind {
     RelationTombstone = 0x32,
     /// 0x40 — schema document uploaded.
     SchemaUpdate = 0x40,
-    /// 0x41 — extractor enable/disable toggle (schema-adjacent).
-    ExtractorToggle = 0x41,
     /// 0x50 — extractor / resolution audit entry.
     Audit = 0x50,
 }
@@ -108,7 +106,6 @@ impl WalRecordKind {
             0x31 => Self::RelationSupersede,
             0x32 => Self::RelationTombstone,
             0x40 => Self::SchemaUpdate,
-            0x41 => Self::ExtractorToggle,
             0x50 => Self::Audit,
             _ => return None,
         })
@@ -160,7 +157,6 @@ pub const ALL_KINDS: &[WalRecordKind] = &[
     WalRecordKind::RelationSupersede,
     WalRecordKind::RelationTombstone,
     WalRecordKind::SchemaUpdate,
-    WalRecordKind::ExtractorToggle,
     WalRecordKind::Audit,
 ];
 
@@ -200,6 +196,7 @@ mod tests {
                                                      // Gaps inside the opaque-body block (entity 0x16..=0x1F, etc.).
         assert_eq!(WalRecordKind::from_u8(0x16), None);
         assert_eq!(WalRecordKind::from_u8(0x23), None);
+        assert_eq!(WalRecordKind::from_u8(0x41), None); // extractor toggle removed
         assert_eq!(WalRecordKind::from_u8(0x60), None); // beyond 0x50 audit
         assert_eq!(WalRecordKind::from_u8(96), None); // 0x60 in decimal
         assert_eq!(WalRecordKind::from_u8(128), None); // reserved for v2+
@@ -211,7 +208,7 @@ mod tests {
         // If a new variant is added without updating ALL_KINDS, this
         // catches it via the byte set.
         let seen: std::collections::HashSet<u8> = ALL_KINDS.iter().map(|k| k.as_u8()).collect();
-        assert_eq!(seen.len(), 30, "15 substrate + 15 typed-graph = 30 kinds");
+        assert_eq!(seen.len(), 29, "15 substrate + 14 typed-graph = 29 kinds");
         for v in 1..=15u8 {
             assert!(
                 seen.contains(&v),
@@ -219,8 +216,7 @@ mod tests {
             );
         }
         for v in [
-            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x20, 0x21, 0x22, 0x30, 0x31, 0x32, 0x40, 0x41,
-            0x50,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x20, 0x21, 0x22, 0x30, 0x31, 0x32, 0x40, 0x50,
         ] {
             assert!(
                 seen.contains(&v),

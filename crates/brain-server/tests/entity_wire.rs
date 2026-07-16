@@ -177,6 +177,7 @@ async fn entity_create_get_update_rename_lifecycle() {
             aliases: vec![],
             attributes_blob: Vec::new(),
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;
@@ -197,7 +198,10 @@ async fn entity_create_get_update_rename_lifecycle() {
     let (get_opcode, body) = round_trip(
         &mut client,
         3,
-        RequestBody::EntityGet(EntityGetRequest { entity_id }),
+        RequestBody::EntityGet(EntityGetRequest {
+            entity_id,
+            act_as: None,
+        }),
     )
     .await;
     assert_eq!(get_opcode, Opcode::EntityGetResp.as_u16());
@@ -269,7 +273,10 @@ async fn entity_create_get_update_rename_lifecycle() {
     let (_, body) = round_trip(
         &mut client,
         9,
-        RequestBody::EntityGet(EntityGetRequest { entity_id }),
+        RequestBody::EntityGet(EntityGetRequest {
+            entity_id,
+            act_as: None,
+        }),
     )
     .await;
     match body {
@@ -296,6 +303,7 @@ async fn entity_get_missing_returns_error() {
         1,
         RequestBody::EntityGet(EntityGetRequest {
             entity_id: bogus_id,
+            act_as: None,
         }),
     )
     .await;
@@ -336,6 +344,7 @@ async fn entity_create_unknown_type_returns_error() {
             aliases: vec![],
             attributes_blob: Vec::new(),
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;

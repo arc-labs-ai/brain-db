@@ -153,6 +153,7 @@ async fn make_entity(client: &mut TcpStream, stream_id: u32, name: &str) -> [u8;
             aliases: vec![],
             attributes_blob: Vec::new(),
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;
@@ -178,6 +179,7 @@ fn create_request(relation_type: &str, from: [u8; 16], to: [u8; 16]) -> Relation
         valid_from_unix_nanos: 0,
         valid_to_unix_nanos: 0,
         request_id: rid(),
+        act_as: None,
     }
 }
 
@@ -214,6 +216,7 @@ async fn create_asymmetric_round_trips() {
         RequestBody::RelationGet(RelationGetRequest {
             relation_id: rel_id,
             follow_supersession: false,
+            act_as: None,
         }),
     )
     .await;
@@ -311,6 +314,7 @@ async fn create_symmetric_canonicalises() {
         RequestBody::RelationGet(RelationGetRequest {
             relation_id: rel_id,
             follow_supersession: false,
+            act_as: None,
         }),
     )
     .await;
@@ -367,6 +371,7 @@ async fn create_many_to_one_auto_supersedes() {
             include_tombstoned: false,
             limit: 100,
             cursor: Vec::new(),
+            act_as: None,
         }),
     )
     .await;
@@ -396,6 +401,7 @@ async fn get_missing_returns_error() {
         RequestBody::RelationGet(RelationGetRequest {
             relation_id: rid(),
             follow_supersession: false,
+            act_as: None,
         }),
     )
     .await;
@@ -496,6 +502,7 @@ async fn tombstone_flips_current_state() {
             include_tombstoned: false,
             limit: 100,
             cursor: Vec::new(),
+            act_as: None,
         }),
     )
     .await;
@@ -517,6 +524,7 @@ async fn tombstone_flips_current_state() {
             include_tombstoned: true,
             limit: 100,
             cursor: Vec::new(),
+            act_as: None,
         }),
     )
     .await;
@@ -567,6 +575,7 @@ async fn list_to_filters_by_type() {
             include_tombstoned: false,
             limit: 100,
             cursor: Vec::new(),
+            act_as: None,
         }),
     )
     .await;
@@ -610,6 +619,7 @@ async fn traverse_one_hop() {
             time_at_unix_nanos: 0,
             include_superseded: false,
             request_id: rid(),
+            act_as: None,
         }),
     )
     .await;
@@ -669,6 +679,7 @@ async fn traverse_two_hop() {
             time_at_unix_nanos: 0,
             include_superseded: false,
             request_id: rid(),
+            act_as: None,
         }),
     )
     .await;
@@ -714,6 +725,7 @@ async fn traverse_two_hop() {
             time_at_unix_nanos: 0,
             include_superseded: false,
             request_id: rid(),
+            act_as: None,
         }),
     )
     .await;
@@ -748,6 +760,7 @@ async fn traverse_invalid_depth_returns_error() {
             time_at_unix_nanos: 0,
             include_superseded: false,
             request_id: rid(),
+            act_as: None,
         }),
     )
     .await;

@@ -114,10 +114,11 @@ pub fn api_key_create(
     namespace: String,
     agent_id: [u8; 16],
     permissions: u32,
+    may_act: Vec<String>,
     now_unix_nanos: u64,
 ) -> Result<ApiKeyRow, ApiKeyError> {
     let key_hash = hash_secret(secret);
-    let row = ApiKeyRow::new(
+    let mut row = ApiKeyRow::new(
         key_hash,
         org_id,
         user_id,
@@ -126,6 +127,7 @@ pub fn api_key_create(
         permissions,
         now_unix_nanos,
     );
+    row.may_act = may_act;
 
     // Provision the tenant: interning the key's namespace makes it a
     // real, resolvable owner so the dispatch path resolves it to a
@@ -244,6 +246,11 @@ pub struct ResolvedScope {
     pub namespace: String,
     pub agent_id: [u8; 16],
     pub permissions: u32,
+    /// Allowlist of namespaces this scope may act *for* under the
+    /// [`permissions::ACT_AS`] grant. Carried verbatim from the key row so
+    /// the dispatch path can validate a request's `act_as` target against
+    /// it. Empty for every non-`ACT_AS` key.
+    pub may_act: Vec<String>,
 }
 
 impl ResolvedScope {
@@ -257,6 +264,7 @@ impl ResolvedScope {
             namespace: row.namespace.clone(),
             agent_id: row.agent_id,
             permissions: row.permissions,
+            may_act: row.may_act.clone(),
         }
     }
 
@@ -272,6 +280,7 @@ impl ResolvedScope {
             namespace: String::new(),
             agent_id,
             permissions: permissions::FULL,
+            may_act: Vec::new(),
         }
     }
 
@@ -322,6 +331,7 @@ mod tests {
                 "acme".into(),
                 agent(7),
                 bits::STANDARD_AGENT,
+                Vec::new(),
                 1_700_000_000_000_000_000,
             )
             .unwrap();
@@ -362,6 +372,7 @@ mod tests {
                 "acme".into(),
                 agent(2),
                 bits::READ_ONLY,
+                Vec::new(),
                 1_700_000_000_000_000_000,
             )
             .unwrap();
@@ -402,6 +413,7 @@ mod tests {
                 "acme".into(),
                 agent(who),
                 bits::STANDARD_AGENT,
+                Vec::new(),
                 1_700_000_000_000_000_000,
             )
             .unwrap();
@@ -433,6 +445,7 @@ mod tests {
             "n".into(),
             agent(1),
             bits::STANDARD_AGENT,
+            Vec::new(),
             1,
         )
         .unwrap();
@@ -447,6 +460,7 @@ mod tests {
             "n".into(),
             agent(1),
             bits::STANDARD_AGENT,
+            Vec::new(),
             2,
         );
         assert!(matches!(err, Err(ApiKeyError::Duplicate)));
@@ -467,6 +481,7 @@ mod tests {
                 "n".into(),
                 agent(1),
                 bits::STANDARD_AGENT,
+                Vec::new(),
                 1_000,
             )
             .unwrap();

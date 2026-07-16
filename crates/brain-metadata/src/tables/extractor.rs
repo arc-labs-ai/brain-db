@@ -36,7 +36,6 @@ pub struct ExtractorDefinition {
     pub namespace: String,
     pub name: String,
     pub kind: u8,
-    pub enabled: u8,
     pub schema_version: u32,
     pub definition_blob: Vec<u8>,
     pub created_at_unix_nanos: u64,
@@ -50,7 +49,6 @@ impl ExtractorDefinition {
         namespace: String,
         name: String,
         kind: ExtractorKind,
-        enabled: bool,
         schema_version: u32,
         definition_blob: Vec<u8>,
         created_at_unix_nanos: u64,
@@ -60,7 +58,6 @@ impl ExtractorDefinition {
             namespace,
             name,
             kind: kind.as_u8(),
-            enabled: u8::from(enabled),
             schema_version,
             definition_blob,
             created_at_unix_nanos,
@@ -75,11 +72,6 @@ impl ExtractorDefinition {
     #[must_use]
     pub fn kind(&self) -> Option<ExtractorKind> {
         ExtractorKind::from_u8(self.kind)
-    }
-
-    #[must_use]
-    pub fn is_enabled(&self) -> bool {
-        self.enabled != 0
     }
 
     /// Canonical `"namespace:name"` qname.
@@ -106,7 +98,6 @@ mod tests {
             "acme".into(),
             "person_mentions".into(),
             ExtractorKind::Pattern,
-            true,
             1,
             vec![1, 2, 3, 4],
             1_700_000_000_000_000_000,
@@ -128,7 +119,6 @@ mod tests {
         let got = t.get(&ex.extractor_id).unwrap().unwrap().value();
         assert_eq!(got, ex);
         assert_eq!(got.kind(), Some(ExtractorKind::Pattern));
-        assert!(got.is_enabled());
         assert_eq!(got.qname(), "acme:person_mentions");
 
         let idx = rtxn.open_table(EXTRACTORS_BY_QNAME_TABLE).unwrap();

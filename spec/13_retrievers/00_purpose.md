@@ -16,7 +16,9 @@
 
 The retrieval surface activated when a schema is declared. Three retrievers (semantic, lexical, graph) run in parallel; their ranked outputs are fused with weighted Reciprocal Rank Fusion (RRF, k=60). A cross-encoder reranker (bge-reranker-base) then reorders the top-K — always-on whenever the model is loaded, gated only by the deploy-time `config.rerank.enabled` switch, with no per-request flag. A rule-based query router decides per-query which retrievers to invoke and with what weights.
 
-`RECALL` transparently uses this path when a schema is active; the response shape is identical to the schemaless path with extra `contributing_retrievers` and `fused_score` metadata.
+`RECALL` — Brain's sole client read verb — runs this engine on every request. It
+does not return the raw fused ranking; it shapes the fused-and-filtered pool into
+a membership answer (Single / Many / None, see [`../05_operations/03_read_pipeline.md`](../05_operations/03_read_pipeline.md)) via a relevance band, not a top-K cut. The per-member `contributing_retrievers` and `fused_score` fields ride along as provenance. The raw ranked list is reachable only through the operator debug ops `QUERY_EXPLAIN` / `QUERY_TRACE`.
 
 ## The retrieval architecture
 

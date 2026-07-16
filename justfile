@@ -247,6 +247,46 @@ compose-up:
 compose-down *ARGS:
     docker compose -f config/docker-compose.yml down {{ARGS}}
 
+# Generate config/.env.eval (0600) from ~/.brain_llm_key. Sourced by
+# `docker-serve` inside the dev container to satisfy the mandatory [llm] api_key
+# (write-time HyPE). The key never touches argv or stdout — piped into the file.
+eval-env:
+    @umask 077 && printf 'BRAIN__LLM__API_KEY=%s\nBRAIN__LLM__MODEL=gpt-4o-mini\n' "$(cat ${HOME}/.brain_llm_key | tr -d '[:space:]')" > config/.env.eval && chmod 600 config/.env.eval
+    @echo "wrote config/.env.eval (0600) from ~/.brain_llm_key"
+
+# ONE container, native logs. Two rules baked in:
+#   1. Never two — every existing container from the devcontainer image is
+#      removed before a new one starts (`docker ps --filter ancestor`).
+#   2. Logs visible — brain-server runs as the container's MAIN process via
+#      `docker run` (NOT `devcontainer exec`), so its stdout IS the container's
+#      stdout: `docker logs -f brain` and Docker Desktop's Logs tab show the full
+#      server output. The old `devcontainer exec` path sent logs to the exec
+#      caller, leaving the container Logs tab empty ("Container started" only).
+# The repo is bind-mounted; dev.toml `data_dir = "./data"` resolves to ./data on
+# the host, so writes persist across restarts (wipe ./data for a fresh schema).
+# Detached: `docker logs -f brain` to watch; `docker stop brain` for a graceful
+# stop (brain-server is `exec`'d, so it gets SIGTERM directly). Run the eval from
+# the HOST against 127.0.0.1:9090 (admin 127.0.0.1:9092, token eval-admin-secret).
+docker-serve:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test -f config/.env.eval || { echo "missing config/.env.eval — run: just eval-env"; exit 1; }
+    # Stable tag (not parsed from `docker images` — that output is reformatted by
+    # the rtk proxy and unscriptable). Tag once: docker tag <vsc-brain-…> brain-dev:latest
+    IMG=brain-dev:latest
+    docker image inspect "$IMG" >/dev/null 2>&1 || { echo "image $IMG missing — tag it once: docker tag <vsc-brain-devcontainer-image> brain-dev:latest"; exit 1; }
+    docker ps -aq --filter "ancestor=$IMG" | xargs -r docker rm -f >/dev/null 2>&1 || true
+    docker rm -f brain >/dev/null 2>&1 || true
+    docker run -d --name brain --security-opt seccomp=unconfined \
+      -p 127.0.0.1:9090:9090 -p 127.0.0.1:9091:9091 -p 127.0.0.1:9092:9092 \
+      -v "$PWD":/workspaces/brain -w /workspaces/brain --env-file config/.env.eval \
+      -v "$HOME/.local/share/brain/models":/root/.local/share/brain/models:ro \
+      -e CARGO_HOME=/usr/local/cargo -e RUSTUP_HOME=/usr/local/rustup \
+      -e BRAIN__SERVER__LISTEN_ADDR=0.0.0.0:9090 -e BRAIN__SERVER__METRICS_ADDR=0.0.0.0:9091 \
+      -e BRAIN__SERVER__ADMIN_ADDR=0.0.0.0:9092 -e BRAIN__ADMIN__TOKEN=eval-admin-secret \
+      "$IMG" bash -lc 'export PATH=/usr/local/cargo/bin:$PATH; cargo build --release --bin brain-server && exec ./target/release/brain-server --config config/dev.toml'
+    echo "container 'brain' started (single, native logs). Watch: docker logs -f brain"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Local serve — run the production image on macOS/Docker Desktop so native
 # (non-container) clients (brain-shell, the SDKs) can reach it. Differs from

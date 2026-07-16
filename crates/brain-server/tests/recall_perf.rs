@@ -187,6 +187,8 @@ async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str) -> u128 {
         request_id,
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     };
     let outcome = brain_ops::dispatch(
         RequestBody::Encode(req),
@@ -223,6 +225,7 @@ async fn seed(fix: &Fixture) -> u128 {
 
 fn recall_req(txn_id: Option<[u8; 16]>) -> RecallRequest {
     RecallRequest {
+        trace: false,
         cue_text: "meeting preferences".into(),
         subject_name: String::new(),
         max_results: 5,
@@ -237,8 +240,7 @@ fn recall_req(txn_id: Option<[u8; 16]>) -> RecallRequest {
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id,
-        agent_filter: Vec::new(),
-        include_other_agents: false,
+        act_as: None,
     }
 }
 

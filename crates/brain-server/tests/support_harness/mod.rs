@@ -49,8 +49,7 @@ use crate::connection::{
 };
 use crate::routing::RoutingTable;
 use crate::shard::{
-    spawn_shard, ExtractorTierSpawnConfig, LlmSpawnConfig, RerankSpawnConfig, ShardHandle,
-    ShardJoiner, ShardSpawnConfig,
+    spawn_shard, LlmSpawnConfig, RerankSpawnConfig, ShardHandle, ShardJoiner, ShardSpawnConfig,
 };
 
 /// Integration-test stub dispatcher. The harness never exercises
@@ -100,6 +99,20 @@ impl Server {
     /// Mint an API key for `(namespace, agent)` with the given permission
     /// bitfield and return the raw secret bytes to present in AUTH.
     pub fn mint(&self, namespace: &str, agent: [u8; 16], permissions: u32) -> Vec<u8> {
+        self.mint_with_may_act(namespace, agent, permissions, Vec::new())
+    }
+
+    /// Like [`Server::mint`] but attaches a `may_act` allowlist — the set of
+    /// namespaces an `ACT_AS`-bearing service principal is permitted to run
+    /// on behalf of. Used by the `act_as` isolation test to mint a trusted
+    /// gateway/edge principal.
+    pub fn mint_with_may_act(
+        &self,
+        namespace: &str,
+        agent: [u8; 16],
+        permissions: u32,
+        may_act: Vec<String>,
+    ) -> Vec<u8> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -111,6 +124,7 @@ impl Server {
                 namespace.to_string(),
                 agent,
                 permissions,
+                may_act,
                 now,
             )
             .expect("mint test key")
@@ -168,11 +182,6 @@ pub async fn start_full_pipeline_in(
 ) -> Server {
     start_in_with(data_dir, 1, move |dd| {
         let mut cfg = ShardSpawnConfig::new(dd, dispatcher.clone());
-        cfg.extractors = ExtractorTierSpawnConfig {
-            pattern_enabled: true,
-            classifier_enabled: true,
-            llm_enabled: true,
-        };
         cfg.llm = LlmSpawnConfig {
             api_key: api_key.clone(),
             model: None,
@@ -222,6 +231,7 @@ where
             "test".to_string(),
             default_agent,
             brain_metadata::api_keys::bits::FULL,
+            Vec::new(),
             now,
         )
         .expect("mint default test key")

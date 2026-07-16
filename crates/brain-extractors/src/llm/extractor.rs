@@ -27,7 +27,7 @@ use brain_metadata::entity::ops::entity_get;
 use brain_metadata::schema::predicate::predicate_get;
 use brain_metadata::statement::{JudgeError, JudgeFuture, JudgeVerdict, StatementJudge};
 use brain_metadata::LlmCacheDb;
-use brain_protocol::schema::ast::StatementKindAst;
+use brain_protocol::schema::ast::{StatementKindAst, TriggerExpr};
 use brain_protocol::schema::ExtractorTarget;
 use jsonschema::JSONSchema;
 use parking_lot::Mutex;
@@ -42,6 +42,7 @@ use crate::framework::extractor::{
     ExtractionStatus, Extractor, ExtractorContext, NeighborMemory,
 };
 use crate::framework::item::{EntityMention, ExtractedItem, RelationMention, StatementMention};
+use crate::framework::trigger::{evaluate_trigger_on_encode, TriggerDecision};
 use crate::idempotency::hash_memory_text;
 
 const DEFAULT_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days.
@@ -78,6 +79,12 @@ pub struct LlmExtractor {
     cache_ttl: Duration,
     pub(super) inner: Option<Arc<LlmExtractorInner>>,
     degraded_reason: Option<String>,
+    /// When this extractor fires on the ENCODE path. Threaded from the
+    /// `ExtractorDef`'s `trigger` field by the materializer; defaults to
+    /// [`TriggerExpr::OnEncode`] (run on every encode) when the
+    /// declaration omits a trigger. The worker's LLM tier consults this
+    /// per memory via [`Extractor::encode_trigger_decision`].
+    trigger: TriggerExpr,
 }
 
 /// Fully-wired inner state. Held behind `Option` so degraded
@@ -120,7 +127,20 @@ impl LlmExtractor {
             cache_ttl,
             inner: Some(Arc::new(inner)),
             degraded_reason: None,
+            trigger: TriggerExpr::OnEncode,
         }
+    }
+
+    /// Attach the declared ENCODE-path trigger. The materializer calls
+    /// this only when the `ExtractorDef` carried a `trigger` field;
+    /// otherwise the default [`TriggerExpr::OnEncode`] set by the
+    /// constructors stands. Builder-style so the many existing
+    /// constructor call sites (tests, benches, the degraded paths) don't
+    /// have to thread a trigger they never set.
+    #[must_use]
+    pub fn with_trigger(mut self, trigger: TriggerExpr) -> Self {
+        self.trigger = trigger;
+        self
     }
 
     /// Flat constructor used by `materialize_llm_extractor`. All
@@ -189,6 +209,7 @@ impl LlmExtractor {
             cache_ttl: Duration::from_secs(DEFAULT_CACHE_TTL_SECS),
             inner: None,
             degraded_reason: Some(reason.into()),
+            trigger: TriggerExpr::OnEncode,
         }
     }
 
@@ -219,19 +240,35 @@ impl LlmExtractor {
         memory_text: &str,
         prior_entities: &[&EntityMention],
         extractor_context: Option<&ExtractorContext>,
-        declared_predicates: Option<&str>,
+        declared_entity_types: Option<&str>,
+        candidate_predicates: Option<&str>,
         declared_kinds: Option<&str>,
+        anchor_date: Option<&str>,
         now_unix_nanos: u64,
     ) -> (LlmRequest, BuildRequestStats) {
-        // Fill the active-schema predicate block once, before the
-        // per-memory render. Closed-vocab extraction tracks the active
-        // schema (system + user uploads) without baking the predicate
-        // list into the template. A template without the placeholder is
-        // left unchanged; an unfilled placeholder renders empty.
+        // Fill the active-schema blocks before the per-memory render so the
+        // extractor's vocabulary tracks the active schema (system + user
+        // uploads) without baking any list into the template. The
+        // entity-type + kind blocks are batch-level (identical for every
+        // memory); the candidate-predicate block is per-memory (the top-K
+        // existing predicates nearest THIS memory's text). A template
+        // without a placeholder is left unchanged; an unfilled placeholder
+        // renders empty.
         let prompt = inner
             .prompt
-            .replace("{DECLARED_PREDICATES}", declared_predicates.unwrap_or(""))
-            .replace("{DECLARED_KINDS}", declared_kinds.unwrap_or(""));
+            .replace(
+                "{DECLARED_ENTITY_TYPES}",
+                declared_entity_types.unwrap_or(""),
+            )
+            .replace("{CANDIDATE_PREDICATES}", candidate_predicates.unwrap_or(""))
+            .replace("{DECLARED_KINDS}", declared_kinds.unwrap_or(""))
+            // Complement to the deterministic apply-time date->fact join (which is
+            // the primary Time-slot mechanism): the anchor date helps the LLM
+            // classify actions as Event and set `event_at` for relative
+            // expressions ("last Saturday", "in June") the pattern extractor
+            // missed. Empty when the memory carries no usable timestamp — the
+            // prompt rule then harmlessly no-ops.
+            .replace("{ANCHOR_DATE}", anchor_date.unwrap_or(""));
         let (user_body, stats) = render_prompt_with_context(
             &prompt,
             memory_text,
@@ -651,6 +688,30 @@ fn format_rolling_summary_section(summary: &str) -> String {
     s
 }
 
+/// Render a memory's anchor date as an ISO `YYYY-MM-DD` string for the
+/// LLM prompt's `{ANCHOR_DATE}` placeholder. Prefers the client-supplied
+/// event time (`occurred_at`), falling back to the server write time
+/// (`created_at`), so a memory ingested today about a past event resolves
+/// its relative expressions against when the event happened, not the ingest
+/// date. Returns `None` when neither timestamp is usable (both zero, or the
+/// instant falls outside the representable range) — the caller then renders
+/// the placeholder empty and the prompt rule no-ops.
+pub(super) fn anchor_date_iso(mem: &Memory) -> Option<String> {
+    let nanos = mem.occurred_at_unix_nanos.filter(|n| *n > 0).or_else(|| {
+        mem.created_at_unix_ms
+            .checked_mul(1_000_000)
+            .filter(|n| *n > 0)
+    })?;
+    let dt = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(nanos)).ok()?;
+    let date = dt.date();
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        u8::from(date.month()),
+        date.day()
+    ))
+}
+
 /// Render a "T-Nh" / "T-Nm" / "T-Ns" relative-time hint between two
 /// monotonic timestamps. Both arguments are unix nanos; an `older >
 /// now` case (clock skew) collapses to "T+0".
@@ -992,6 +1053,12 @@ fn project_entity(
     } else {
         read_str(v, "name").or_else(|| read_str(v, "text"))?
     };
+    // Drop temporal spans the model tags as entities ("Last Friday", "Last
+    // Fri", "yesterday"). A date/relative-time phrase names no referent; left
+    // in, it mints a phantom Person node and pollutes the entity graph.
+    if crate::resolver::is_temporal_expression_surface(&text) {
+        return None;
+    }
     Some(ExtractedItem::EntityMention(EntityMention {
         entity_type_qname: entity_type.to_string(),
         text,
@@ -1130,6 +1197,10 @@ impl Extractor for LlmExtractor {
         self.inner.is_some()
     }
 
+    fn encode_trigger_decision(&self, mem: &Memory) -> TriggerDecision {
+        evaluate_trigger_on_encode(&self.trigger, mem)
+    }
+
     /// Run the whole micro-batch's LLM calls CONCURRENTLY rather than the
     /// default serial loop. Each memory's `run` is an independent network
     /// round-trip (build prompt → `client.complete().await` → cache →
@@ -1207,14 +1278,28 @@ impl Extractor for LlmExtractor {
             // may be `None` (no neighbours computed) or absent for
             // this memory (no relevant neighbours found).
             let extractor_context = ctx.extractor_context.and_then(|map| map.get(&mem.id));
+            // The candidate-predicate block is keyed by memory id: its top-K
+            // nearest-predicate list depends on this memory's text embedding,
+            // so it can't be shared batch-wide like the schema blocks.
+            let candidate_predicates = ctx
+                .candidate_predicates
+                .and_then(|map| map.get(&mem.id))
+                .map(String::as_str);
+            // Anchor date the LLM resolves relative event expressions against:
+            // the memory's client-supplied event time (`occurred_at`) if present,
+            // else its server write time (`created_at`). Empty when neither is
+            // usable — the prompt rule no-ops (see `{ANCHOR_DATE}` in build_request).
+            let anchor_date = anchor_date_iso(mem);
             let (mut request, _stats) = self.build_request(
                 &inner,
                 mem.id,
                 text,
                 &prior_entities,
                 extractor_context,
-                ctx.declared_predicates,
+                ctx.declared_entity_types,
+                candidate_predicates,
                 ctx.declared_kinds,
+                anchor_date.as_deref(),
                 started,
             );
             if let Some(budget) = self.cost_budget {

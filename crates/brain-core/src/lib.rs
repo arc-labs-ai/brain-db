@@ -41,18 +41,13 @@ pub use nodes::{
     memory::{Memory, MemoryKind, Salience},
     relation::{canonical_pair, Relation, RelationType},
     statement::{
-        EvidenceEntry, EvidenceRef, Predicate, Statement, StatementObject, StatementValue,
+        EvidenceEntry, EvidenceRef, Predicate, Slot, Statement, StatementObject, StatementValue,
         SubjectRef, TombstoneReason, INLINE_EVIDENCE_CAP,
     },
 };
 pub use resolution::{
     confidence::{aggregate_confidence, ConfidenceConfig},
     referential::is_non_referential_surface,
-    resolver::{
-        resolve_entity, ResolutionOutcome, ResolverConfig, ResolverEmbedder, ResolverError,
-        ResolverIndex, ResolverLlm, ResolverLlmDecision, ResolverStorage, ResolverTier,
-        TypeConstraint, VECTOR_DIM,
-    },
     trigrams::{extract_trigrams, jaccard},
 };
 pub use worker_state::{

@@ -466,6 +466,52 @@ mod tests {
         assert!(timeline_t.get(key.as_slice()).unwrap().is_some());
     }
 
+    /// Invariant guard: the timeline index key and the memory row must agree
+    /// on `created_at_unix_nanos` (and every other key component). If they
+    /// diverge — e.g. a future refactor reads the clock twice, once for the
+    /// row and once for the key — a resume cursor reconstructed from a row's
+    /// fields would miss the real key and MEMORY_LIST descending pagination
+    /// would re-emit boundary rows. This asserts the key derived from the
+    /// stored row is exactly the key that was written.
+    #[test]
+    fn upsert_memory_index_key_matches_row_fields() {
+        let (_dir, db) = open_db();
+        let id = MemoryId::pack(0, 1, 0);
+        let agent = AgentId::new();
+        let write = fresh_write_for(agent);
+
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_upsert_memory(&wtxn, &fixture_phase(id), &write).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let row = rtxn
+            .open_table(MEMORIES_TABLE)
+            .unwrap()
+            .get(&id.to_be_bytes())
+            .unwrap()
+            .unwrap()
+            .value();
+
+        // Reconstruct the key purely from the row (as the MEMORY_LIST cursor
+        // does) and require the real stored index entry to sit at that key.
+        let derived = agent_timeline_key(
+            row.namespace_id,
+            row.agent_id_bytes,
+            row.created_at_unix_nanos,
+            row.context_id,
+            row.memory_id_bytes,
+        );
+        let timeline_t = rtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE).unwrap();
+        assert!(
+            timeline_t.get(derived.as_slice()).unwrap().is_some(),
+            "index key derived from the row must equal the stored key \
+             (row and key must share one created_at)",
+        );
+    }
+
     #[test]
     fn tombstone_memory_clears_active_flag_and_timeline() {
         let (_dir, db) = open_db();

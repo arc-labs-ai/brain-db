@@ -212,26 +212,35 @@ define extractor llm_predicate {
     model: "gpt-4o-mini"
     prompt: """You extract durable, factual knowledge from one memory at a time as clean subject–predicate–object triples for a memory database. Extract only genuine, lasting facts, preferences, and relationships about the entities — NOT conversational filler, greetings, reactions, or in-the-moment feelings.
 
-The active schema declares these entity types:
-- brain:Person
-- brain:Organization
-- brain:Project
-- brain:Event
-- brain:Place
-- brain:Concept
+The active schema declares these entity types — use them when classifying an entity:
+{DECLARED_ENTITY_TYPES}
 
-PREDICATES ARE OPEN. Capture the real relation as a short snake_case predicate taken from the text — do NOT restrict yourself to a fixed list, and NEVER omit a genuine fact just because no predefined predicate fits. Examples: "works at" -> works_at; "lives in" -> lives_in; "donated bone marrow to" -> donated; "is allergic to" -> allergic_to; "favorite color is" -> favorite_color. Reuse a common name when natural so the same relation isn't spelled two different ways. Emit each predicate as `brain:<snake_case>`.
+PREDICATES ARE OPEN. Capture the real relation as a short snake_case predicate taken from the text — do NOT restrict yourself to a fixed list, and NEVER omit a genuine fact just because no predefined predicate fits. Emit each predicate as `brain:<snake_case>` (e.g. "works at" -> `brain:works_at`, "is allergic to" -> `brain:allergic_to`).
 
-Classify each statement into exactly ONE kind from the list below. The kind is the *shape* of the fact, not its topic. If none truly fits, use Fact.
+These predicates already exist in this database — REUSE the exact name when your relation means the same thing, so all facts about an entity converge on one name instead of fragmenting across synonyms:
+{CANDIDATE_PREDICATES}
+
+CANONICALIZE by MEANING so the SAME relation is always spelled the SAME way — consistent predicate names are what let all the facts about an entity be found together. Name the relation for what it means, not for how this sentence happened to word it:
+- Same meaning -> one name. Different phrasings of one relation collapse to a SINGLE simplest base form; do not mint a separate predicate per wording. Strip tense, aspect, and manner from the name — a fact that no longer holds is marked with `retract` (below), never by baking "used_to_", "will_", or an "-ing" form into the predicate.
+- Different meaning -> different name; relatedness is NOT sameness. A relation and its OPPOSITE (its negation) are different predicates, and a relation and its INVERSE (the same link read from the other participant) are different predicates. Preserve polarity and direction even when both concern the same subject.
+Choose the shortest faithful name; when a later memory expresses a relation you have named before, reuse that exact name rather than coining a near-duplicate.
+
+Classify each statement into exactly ONE kind from the list below. The kind is the *shape* of the fact, not its topic. Pick the kind whose description fits; if none truly fits, use Fact.
 
 Kinds — `Name (cardinality, temporal): what belongs here`:
 {DECLARED_KINDS}
+
+Choosing the kind — go by the fact's SHAPE, not its topic:
+- If the fact describes something that HAPPENED at or over a time — an action, occurrence, or change (e.g. "ran", "moved", "met", "was born", "graduated") — it is an Event: set `event_at`. Prefer Event over Fact for ANY action or occurrence; under-classifying an action as Fact loses its time.
+- If the fact is a single-valued current property of one entity (its city, role, age, name, status), it is an Attribute: the new value replaces the old.
+- If the fact links the subject to ANOTHER entity (e.g. "works_at", "knows", "married_to", "has_child", "located_in"), it is a Relation and its object is that entity — it accumulates as a set.
+- If the fact is something the subject likes, wants, or avoids, it is a Preference: keep the +/- polarity — a dislike is NOT a like.
+- Use Fact ONLY when none of the above fits — it is the fallback, never the default.
 
 Output STRICT JSON matching this shape, and nothing else:
 {
   "statements": [
     { "subject": "Alice Wong", "predicate": "brain:works_at", "object": "Acme Corp", "object_is_entity": true, "kind": "Relation", "confidence": 0.92 },
-    { "subject": "Bob Smith", "predicate": "brain:lives_in", "object": "Berlin", "object_is_entity": true, "kind": "Attribute", "confidence": 0.9 },
     { "subject": "Eve Adams", "predicate": "brain:favorite_color", "object": "blue", "object_is_entity": false, "kind": "Attribute", "confidence": 0.88 },
     { "subject": "Frank Brown", "predicate": "brain:traveled_to", "object": "Paris", "object_is_entity": true, "kind": "Event", "event_at": "2020-01-15", "confidence": 0.9 },
     { "subject": "I", "predicate": "brain:prefers", "object": "dark roast coffee", "object_is_entity": false, "subject_is_self": true, "kind": "Preference", "confidence": 0.95 },
@@ -241,16 +250,17 @@ Output STRICT JSON matching this shape, and nothing else:
 
 Rules:
 - Decompose each assertion into a clean (subject, predicate, object). The predicate is the relation; the object is the entity or a short clean value it acts on — NEVER a verb phrase or sentence fragment. "Alice works at Acme" -> predicate "brain:works_at", object "Acme Corp" (NOT "works at Acme").
+- Objects must be ATOMIC. One fact per object: never join multiple things with "and"/"or"/commas. "interested in counseling and mental health" -> emit TWO triples, object "counseling" and object "mental health" (NOT one object "counseling and mental health"). Strip filler words so the object is the bare thing itself ("mental health jobs" -> "mental health"). The object is a single entity name or a bare value — NEVER a clause, description, or sentence fragment. If the object still reads like part of a sentence (it contains a verb, a preposition phrase, or a relative clause), reduce it to the bare thing it names, or drop the triple.
+- Locations are RELATIONS to a place, not prose. When the fact states where an entity is (lives, works, is based) or where an event happened, emit it as a Relation whose object is the place itself, with `object_is_entity: true` (e.g. predicate "brain:lives_in" object "Paris", predicate "brain:located_in" object "Paris") — never bury the place inside a longer value so "where" can be answered as the object of that relation.
+- Objects must be SPECIFIC. The object must name a particular thing. If the only object you can form is a generic placeholder or a bare category rather than a specific named thing, drop the triple — a vague object is worse than no triple.
 - `object_is_entity`: set true when the object names a thing (a person, organization, place, product, concept — something that could have its own facts), e.g. "Acme Corp", "Paris", "aspirin"; set false when the object is a literal value, e.g. "blue", "42", "Senior Engineer". When unsure, prefer false.
-- `event_at`: for Event-kind statements ONLY, the date it happened as an ISO date string ("YYYY-MM-DD", or just "YYYY" if only the year is known). Omit it for non-Events and when no date is stated — do NOT invent one.
+- `event_at`: for Event-kind statements ONLY, the date it happened as an ISO date string ("YYYY-MM-DD", or just "YYYY" if only the year is known). This memory was recorded on {ANCHOR_DATE}. Set `event_at` to when the event actually happened — resolve relative expressions (yesterday, last week, last Saturday, in June) against {ANCHOR_DATE}, and attach the date only to the specific event it modifies, never to unrelated facts in the same text. Omit it for non-Events and when no date is stated or resolvable — do NOT invent one.
 - `subject_is_self`: set true when the subject is the speaker / author of this memory referring to THEMSELVES — first person in ANY language ("I", "me", "my", "yo", "私", "ich", "moi", …). Keep the original surface in `subject`; the system attributes the fact to the writing agent. Set false (or omit) for everyone else, including the person the author is addressing ("you").
-- Predicates are open: capture the real relation verbatim in snake_case. Do NOT omit a genuine, durable fact just because its relation is unusual — that is exactly what open predicates are for ("donated", "allergic_to", "favorite_color").
-- Choosing the kind: Attribute = a single-valued property of the entity (current city, role, age, favorite color); Relation = a link to another entity (works_at, knows, manages, married_to); Preference = likes / wants / avoids something; Event = something that happened at a point in time (donated, traveled, met, shipped); Directive = how the agent should behave; Fact = anything that fits none of the above (the catch-all).
 - Negation & change: when the text says a fact NO LONGER holds ("not at Google anymore", "no longer drinks coffee", "used to live in Paris but moved"), emit that former fact as a triple marked `"retract": true` (subject, predicate, and the OLD object — e.g. works_at Google with retract:true) so the database retires the prior record. If a NEW current value is also stated ("now works at OpenAI"), emit it too as a normal triple (no retract). A plain statement with no `retract` key is a normal current assertion; only set `retract` when the text explicitly denies/ends a fact.
 - Resolve pronouns before emitting. Replace "it / he / she / they / this / that" with the actual entity they refer to within this text; never output a bare pronoun, and never leave a pronoun stuck to a value ("usually drinks it black" -> predicate "brain:usually_drinks", object "black" — the manner — NOT "it black"). If a pronoun's referent is genuinely unclear, drop that triple rather than emit the pronoun.
 - Quality over coverage. Extract durable facts / preferences / relationships / events, not conversational noise: skip greetings, reactions ("that's awesome"), momentary feelings, and vague statements. Emitting nothing is better than a wrong or vague triple.
 - Extract assertions about possessive or implied subjects too ("Melanie's kids love dinosaurs" -> subject "Melanie's kids").
-- Every entity gets its OWN attributes. When a sentence states a fact about an entity that appears as the object, in an apposition, or in a subordinate clause — not just the grammatical subject — emit a separate triple with THAT entity as the subject. An apposition ("Rohan, a lawyer", "Meera's husband Rohan, who studied at NLSIU") describes the named entity: emit "Rohan -> brain:occupation -> lawyer" and "Rohan -> brain:studied_at -> NLSIU", in addition to any relation tying it to the main subject ("Meera -> brain:spouse -> Rohan"). A role-at-org clause ("Niraj is a senior engineer at NeuraCorp") yields BOTH the role as an attribute ("Niraj -> brain:role -> senior engineer") AND the affiliation as a relation ("Niraj -> brain:works_at -> NeuraCorp"). Decompose so each entity becomes a complete, independently-queryable subject — never leave an entity's stated attribute attached only to the sentence that introduced it.
+- Every entity gets its OWN triples. When a fact is stated about an entity that appears as the object, in an apposition, or in a subordinate clause — not just the grammatical subject — emit a separate triple with THAT entity as the subject. Decompose so each entity becomes a complete, independently-queryable subject, never leaving an entity's stated attribute attached only to the sentence that introduced it. (E.g. "Ann, a lawyer at Acme" yields both "Ann -> brain:occupation -> lawyer" and "Ann -> brain:works_at -> Acme".)
 - Use the entity surface forms verbatim from the "Previously extracted entities" section below as `subject` / `object` whenever the assertion involves one of them. Do not invent new surface forms for those concepts.
 - If the text contains no durable assertion, return `{ "statements": [] }`.
 {PRIOR_ENTITIES}

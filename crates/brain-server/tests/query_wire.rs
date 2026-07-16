@@ -1,18 +1,14 @@
-//! Retrieval query wire-op smoke tests.
+//! Retrieval query introspection wire-op smoke tests.
 //!
-//! Drives the four query opcodes through the full data-plane
-//! stack:
+//! Drives the two query-introspection opcodes through the full
+//! data-plane stack:
 //!
-//! - `QUERY`          (0x0160) — plan + execute → `QueryResponse`.
 //! - `QUERY_EXPLAIN`  (0x0161) — plan only → plan text.
 //! - `QUERY_TRACE`    (0x0162) — plan + execute → trace text.
-//! - `QUERY_TEXT`     (0x0163) — narrow projection → memory ids.
 //!
 //! These tests run against the shared in-process harness (one shard,
 //! empty fixture). Retrievers are wired automatically by `spawn_shard`,
-//! so a text-only auto-routed query is expected
-//! to return an empty result set with the per-retriever outcome list
-//! populated.
+//! so a text-only auto-routed query plans across the retriever set.
 
 #![cfg(target_os = "linux")]
 
@@ -20,12 +16,11 @@ use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
-use brain_protocol::envelope::request::{EncodeRequest, RequestBody};
+use brain_protocol::envelope::request::RequestBody;
 use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
 use brain_protocol::{
-    QueryExplainRequest, QueryRequest, QueryTextRequest, QueryTraceRequest, RetrieverSelectionWire,
-    RetrieverWire, SchemaUploadRequest,
+    QueryExplainRequest, QueryRequest, QueryTraceRequest, RetrieverSelectionWire, RetrieverWire,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -163,28 +158,6 @@ fn sample_request_id() -> [u8; 16] {
     *uuid::Uuid::now_v7().as_bytes()
 }
 
-const ACME_V1: &str = "namespace acme\n\
-                       define entity_type Foo { attributes {} }\n";
-
-fn upload_schema_request() -> RequestBody {
-    RequestBody::SchemaUpload(SchemaUploadRequest {
-        schema_document: ACME_V1.into(),
-        dry_run: false,
-        allow_breaking: false,
-        request_id: *uuid::Uuid::now_v7().as_bytes(),
-    })
-}
-
-fn encode_request(text: &str) -> RequestBody {
-    RequestBody::Encode(EncodeRequest {
-        text: text.into(),
-        context_id: 0,
-        request_id: *uuid::Uuid::now_v7().as_bytes(),
-        txn_id: None,
-        occurred_at_unix_nanos: None,
-    })
-}
-
 fn text_only_query(text: &str) -> QueryRequest {
     QueryRequest {
         text: text.into(),
@@ -206,34 +179,6 @@ fn text_only_query(text: &str) -> QueryRequest {
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "current_thread")]
-async fn query_smoke_round_trips_a_simple_request() {
-    let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr)
-        .await
-        .expect("connect");
-    complete_handshake(&mut client, &server.token).await;
-
-    let (opcode, body) =
-        round_trip(&mut client, 1, RequestBody::Query(text_only_query("topic"))).await;
-    assert_eq!(opcode, Opcode::QueryResp.as_u16());
-    match body {
-        ResponseBody::Query(r) => {
-            // Empty fixture — no hits expected; but the per-retriever
-            // outcome list still surfaces what the planner picked.
-            assert!(r.items.is_empty(), "no data indexed in fixture");
-            assert!(
-                !r.retriever_outcomes.is_empty(),
-                "router must pick at least one retriever for a text query",
-            );
-            assert!(r.total_latency_ms >= 0.0);
-        }
-        other => panic!("expected QueryResp, got {other:?}"),
-    }
-
-    server.stop().await;
-}
 
 #[tokio::test(flavor = "current_thread")]
 async fn query_explain_returns_plan_text_without_execution() {
@@ -308,37 +253,6 @@ async fn query_trace_returns_execution_block() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn query_text_returns_memory_only_results() {
-    let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr)
-        .await
-        .expect("connect");
-    complete_handshake(&mut client, &server.token).await;
-
-    let (opcode, body) = round_trip(
-        &mut client,
-        1,
-        RequestBody::QueryText(QueryTextRequest {
-            text: "anything".into(),
-            agent_id_filter: None,
-            limit: 5,
-            request_id: sample_request_id(),
-        }),
-    )
-    .await;
-    assert_eq!(opcode, Opcode::QueryTextResp.as_u16());
-    match body {
-        ResponseBody::QueryText(r) => {
-            // Empty fixture; just verify the wire path and shape.
-            assert!(r.items.is_empty());
-        }
-        other => panic!("expected QueryTextResp, got {other:?}"),
-    }
-
-    server.stop().await;
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn query_no_signal_returns_error() {
     let server = start(1).await;
     let mut client = TcpStream::connect(server.data_plane_addr)
@@ -350,7 +264,12 @@ async fn query_no_signal_returns_error() {
     // handler maps to InvalidRequest → server returns ERROR frame.
     let mut req = text_only_query("");
     req.text.clear();
-    let (opcode, body) = round_trip(&mut client, 1, RequestBody::Query(req)).await;
+    let (opcode, body) = round_trip(
+        &mut client,
+        1,
+        RequestBody::QueryExplain(QueryExplainRequest { query: req }),
+    )
+    .await;
     assert_eq!(opcode, Opcode::Error.as_u16());
     match body {
         ResponseBody::Error(e) => {
@@ -362,54 +281,6 @@ async fn query_no_signal_returns_error() {
             );
         }
         other => panic!("expected Error, got {other:?}"),
-    }
-
-    server.stop().await;
-}
-
-/// QUERY end-to-end after a schema is declared and one memory is
-/// indexed. The auto-router picks Semantic + Lexical for text-only
-/// queries; the HNSW write is synchronous on ENCODE so the semantic
-/// retriever surfaces the hit immediately.
-#[tokio::test(flavor = "current_thread")]
-async fn retrieval_surfaces_an_indexed_memory() {
-    let server = start(1).await;
-    let mut client = TcpStream::connect(server.data_plane_addr)
-        .await
-        .expect("connect");
-    complete_handshake(&mut client, &server.token).await;
-
-    let (opcode, _) = round_trip(&mut client, 1, upload_schema_request()).await;
-    assert_eq!(opcode, Opcode::SchemaUploadResp.as_u16());
-
-    let (opcode, _) = round_trip(
-        &mut client,
-        3,
-        encode_request("ticket budget pushback meeting"),
-    )
-    .await;
-    assert_eq!(opcode, Opcode::EncodeResp.as_u16());
-
-    let (opcode, body) = round_trip(
-        &mut client,
-        5,
-        RequestBody::Query(text_only_query("budget meeting")),
-    )
-    .await;
-    assert_eq!(opcode, Opcode::QueryResp.as_u16());
-    match body {
-        ResponseBody::Query(r) => {
-            assert!(
-                !r.items.is_empty(),
-                "expected at least one hit after ENCODE, got 0",
-            );
-            assert!(
-                !r.retriever_outcomes.is_empty(),
-                "router must pick at least one retriever for a text query",
-            );
-            assert!(r.total_latency_ms >= 0.0);
-        }
-        other => panic!("expected QueryResp, got {other:?}"),
     }
 
     server.stop().await;
@@ -431,7 +302,12 @@ async fn query_explicit_retriever_list_overflow_is_rejected() {
         RetrieverWire::Graph,
         RetrieverWire::Semantic,
     ]);
-    let (opcode, body) = round_trip(&mut client, 1, RequestBody::Query(req)).await;
+    let (opcode, body) = round_trip(
+        &mut client,
+        1,
+        RequestBody::QueryExplain(QueryExplainRequest { query: req }),
+    )
+    .await;
     assert_eq!(opcode, Opcode::Error.as_u16());
     match body {
         ResponseBody::Error(e) => {

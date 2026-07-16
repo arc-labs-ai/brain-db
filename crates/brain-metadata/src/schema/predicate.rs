@@ -635,6 +635,158 @@ pub fn predicate_intern_or_get(
     Ok(PredicateId::from(next_id_raw))
 }
 
+/// Look up a predicate id by its `(namespace, name)` qname inside a live
+/// write transaction, WITHOUT minting. Returns `None` for an unknown
+/// qname.
+///
+/// The extractor's consolidation path needs to tell an exact repeat
+/// mention (fast path — return the id untouched) apart from a would-be-
+/// fresh predicate (a consolidation candidate) before deciding to mint,
+/// and `predicate_intern_or_get` would mint on the miss.
+pub fn predicate_id_by_qname(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<PredicateId>, PredicateOpError> {
+    validate_namespace(namespace)?;
+    validate_name(name)?;
+    let q = qname(namespace, name);
+    let idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+    // Bind before returning so the borrow of `idx` (the access guard) drops
+    // at the semicolon, ahead of `idx` itself.
+    let found = idx.get(q.as_str())?.map(|g| PredicateId::from(g.value()));
+    Ok(found)
+}
+
+/// Point a fresh open-vocab qname at an already-interned predicate id,
+/// creating NO new `PREDICATES_TABLE` row and NO new embedding.
+///
+/// This is the write half of embedding-based predicate consolidation: a
+/// near-synonym surface form (`keen_about`) is aliased onto the canonical
+/// predicate (`keen_on`) so future exact lookups of the variant hit the
+/// fast path and the typed graph converges on one predicate id instead of
+/// fragmenting across morphological variants.
+///
+/// Refuses to alias onto a schema-declared target: declared vocabulary is
+/// authoritative and must never silently absorb open-vocab drift — merging
+/// a free predicate into, say, the seeded `brain:occurred_at` would corrupt
+/// the meaning of every statement that predicate keys.
+pub fn predicate_alias_qname(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+    target: PredicateId,
+) -> Result<(), PredicateOpError> {
+    validate_namespace(namespace)?;
+    validate_name(name)?;
+
+    // The target must exist and be open-vocab. A vanished or declared
+    // target means the caller's candidate scan raced or was buggy; refuse
+    // rather than mint a dangling / meaning-corrupting alias.
+    {
+        let t = wtxn.open_table(PREDICATES_TABLE)?;
+        // Materialize the row before matching so the access guard drops here,
+        // not held across the `t` binding's lifetime.
+        let row = t.get(&target.raw())?.map(|g| g.value());
+        match row {
+            None => {
+                return Err(PredicateOpError::InvalidIdentifier {
+                    reason: "alias target predicate does not exist",
+                })
+            }
+            Some(row) if row.origin().is_schema_declared() => {
+                return Err(PredicateOpError::InvalidIdentifier {
+                    reason: "cannot alias onto a schema-declared predicate",
+                })
+            }
+            Some(_) => {}
+        }
+    }
+
+    let q = qname(namespace, name);
+    let mut idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+    idx.insert(q.as_str(), &target.raw())?;
+    Ok(())
+}
+
+/// One embedding-consolidation candidate: `(id, name, embedding,
+/// is_schema_declared)`. See [`predicate_consolidation_candidates`].
+pub type PredicateConsolidationCandidate = (PredicateId, String, Vec<f32>, bool);
+
+/// Gather the consolidation candidate set for `namespace`: every predicate
+/// that carries a stored embedding, as `(id, name, embedding,
+/// is_schema_declared)`. The extractor compares a would-be-fresh
+/// predicate's embedding against these to reuse a near-synonym's id.
+///
+/// Rows without an embedding are omitted — they can't be compared. The
+/// `is_schema_declared` flag is returned rather than filtered here so the
+/// caller's selection logic can enforce the "never merge into declared
+/// vocabulary" rule (and unit-test it in isolation).
+pub fn predicate_consolidation_candidates(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+) -> Result<Vec<PredicateConsolidationCandidate>, PredicateOpError> {
+    validate_namespace(namespace)?;
+    let preds = wtxn.open_table(PREDICATES_TABLE)?;
+    let embs = wtxn.open_table(PREDICATE_EMBEDDINGS_TABLE)?;
+    let mut out = Vec::new();
+    for entry in preds.iter()? {
+        let (k, v) = entry?;
+        let row = v.value();
+        if row.namespace != namespace {
+            continue;
+        }
+        let Some(g) = embs.get(k.value())? else {
+            continue;
+        };
+        out.push(decode_candidate(&row, g.value()));
+    }
+    Ok(out)
+}
+
+/// Read-transaction counterpart to [`predicate_consolidation_candidates`].
+///
+/// The extractor's per-memory prompt build runs under a read txn (it only
+/// reads the active vocabulary to render the candidate-predicate block); a
+/// write txn would be both wrong for that context and needlessly contended.
+/// Same rows, same `(id, name, embedding, is_declared)` shape.
+pub fn predicate_consolidation_candidates_rtxn(
+    rtxn: &ReadTransaction,
+    namespace: &str,
+) -> Result<Vec<PredicateConsolidationCandidate>, PredicateOpError> {
+    validate_namespace(namespace)?;
+    let preds = rtxn.open_table(PREDICATES_TABLE)?;
+    let embs = rtxn.open_table(PREDICATE_EMBEDDINGS_TABLE)?;
+    let mut out = Vec::new();
+    for entry in preds.iter()? {
+        let (k, v) = entry?;
+        let row = v.value();
+        if row.namespace != namespace {
+            continue;
+        }
+        let Some(g) = embs.get(k.value())? else {
+            continue;
+        };
+        out.push(decode_candidate(&row, g.value()));
+    }
+    Ok(out)
+}
+
+/// Decode one `(row, embedding-bytes)` pair into a consolidation candidate.
+/// The embedding is stored as little-endian `f32`s.
+fn decode_candidate(row: &PredicateDefinition, bytes: &[u8]) -> PredicateConsolidationCandidate {
+    let mut vec = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    (
+        PredicateId::from(row.predicate_id),
+        row.name.clone(),
+        vec,
+        row.origin().is_schema_declared(),
+    )
+}
+
 /// Drop every schema-declared predicate row in `namespace`. Implicit-
 /// from-write rows are preserved — they belong to the open-vocabulary
 /// world, not the declared schema. Used by `SCHEMA_REPLACE`: callers
@@ -1112,6 +1264,85 @@ mod tests {
             }
             other => panic!("expected AlreadyExists, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn id_by_qname_probes_without_minting() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        // Unknown qname → None, and no row minted.
+        assert!(predicate_id_by_qname(&wtxn, "acme", "keen_on")
+            .unwrap()
+            .is_none());
+        let id = predicate_intern_or_get(&wtxn, "acme", "keen_on", 0, 0).unwrap();
+        assert_eq!(
+            predicate_id_by_qname(&wtxn, "acme", "keen_on").unwrap(),
+            Some(id)
+        );
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        // The probe must not have created rows: only the one real intern.
+        assert_eq!(predicate_list(&rtxn, Some("acme")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn alias_qname_points_variant_at_canonical_without_new_row() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let canonical = predicate_intern_or_get(&wtxn, "acme", "keen_on", 0, 0).unwrap();
+        predicate_alias_qname(&wtxn, "acme", "keen_about", canonical).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        // The variant qname resolves to the canonical id...
+        let by_qname = predicate_lookup_by_qname(&rtxn, "acme", "keen_about")
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_qname.id, canonical);
+        // ...but its NAME is still the canonical's — no second PREDICATES_TABLE
+        // row was minted, so the qname index simply aliases.
+        assert_eq!(by_qname.name, "keen_on");
+        assert_eq!(predicate_list(&rtxn, Some("acme")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn alias_qname_refuses_schema_declared_target() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let declared =
+            predicate_intern(&wtxn, "brain", "occurred_at", None, 2, 1, "", false, 0).unwrap();
+        let err = predicate_alias_qname(&wtxn, "brain", "happened_at", declared).unwrap_err();
+        matches!(err, PredicateOpError::InvalidIdentifier { .. })
+            .then_some(())
+            .expect("declared target must be refused");
+    }
+
+    #[test]
+    fn consolidation_candidates_yields_only_embedded_rows_with_flags() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let implicit = predicate_intern_or_get(&wtxn, "acme", "keen_on", 0, 0).unwrap();
+        predicate_embedding_put(&wtxn, implicit, &[1.0, 0.0, 0.0]).unwrap();
+        let declared =
+            predicate_intern(&wtxn, "acme", "manages", None, 1, 1, "", false, 0).unwrap();
+        predicate_embedding_put(&wtxn, declared, &[0.0, 1.0, 0.0]).unwrap();
+        // No embedding → excluded from candidates.
+        let _bare = predicate_intern_or_get(&wtxn, "acme", "unembedded", 0, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let wtxn = db.begin_write().unwrap();
+        let cands = predicate_consolidation_candidates(&wtxn, "acme").unwrap();
+        assert_eq!(cands.len(), 2, "only the two embedded rows are candidates");
+        let implicit_c = cands.iter().find(|c| c.0 == implicit).unwrap();
+        assert_eq!(implicit_c.1, "keen_on");
+        assert_eq!(implicit_c.2, vec![1.0, 0.0, 0.0]);
+        assert!(!implicit_c.3, "implicit-from-write row is not declared");
+        let declared_c = cands.iter().find(|c| c.0 == declared).unwrap();
+        assert!(
+            declared_c.3,
+            "schema-declared row carries the declared flag"
+        );
     }
 
     #[test]

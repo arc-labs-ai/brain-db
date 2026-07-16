@@ -163,6 +163,12 @@ impl ClassifierExtractor {
             if is_non_referential_span(&span.text) {
                 continue;
             }
+            // Drop temporal spans ("Last Friday", "yesterday") the model
+            // tags as entities: a date/relative-time phrase names no
+            // referent, so it must not become a Person / entity node.
+            if crate::resolver::is_temporal_expression_surface(&span.text) {
+                continue;
+            }
             if let Some(item) = self.project(span) {
                 match item {
                     // GLiNER frequently tags conjoined names ("Alice and

@@ -163,6 +163,7 @@ async fn make_entity(client: &mut TcpStream, stream_id: u32, name: &str) -> [u8;
             aliases: vec![],
             attributes_blob: Vec::new(),
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;
@@ -195,6 +196,7 @@ fn fact_request(subject: [u8; 16], object: [u8; 16]) -> StatementCreateRequest {
         event_at_unix_nanos: 0,
         schema_version: 0,
         request_id: rid(),
+        act_as: None,
     }
 }
 
@@ -217,6 +219,7 @@ fn attr_request(subject: [u8; 16], value: &str) -> StatementCreateRequest {
         event_at_unix_nanos: 0,
         schema_version: 0,
         request_id: rid(),
+        act_as: None,
     }
 }
 
@@ -234,6 +237,7 @@ fn event_request(subject: [u8; 16], when: u64) -> StatementCreateRequest {
         event_at_unix_nanos: when,
         schema_version: 0,
         request_id: rid(),
+        act_as: None,
     }
 }
 
@@ -278,6 +282,7 @@ async fn create_fact_round_trips() {
         RequestBody::StatementGet(StatementGetRequest {
             statement_id: sid,
             follow_supersession: false,
+            act_as: None,
         }),
     )
     .await;
@@ -339,7 +344,10 @@ async fn create_attribute_auto_supersedes() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn create_event_requires_event_at() {
+async fn create_event_allows_missing_event_at() {
+    // A dateless Event (wire `event_at = 0` → None) now persists as an Event
+    // rather than being rejected: a same-day/undated action still IS an event, and
+    // the read answers "when" from the evidence memory's own occurred_at.
     let server = start(1).await;
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
@@ -347,20 +355,20 @@ async fn create_event_requires_event_at() {
     complete_handshake(&mut client, &server.token).await;
 
     let priya = make_entity(&mut client, 1, "Priya").await;
-    let mut req = event_request(priya, 0); // event_at = 0 → invalid
+    let mut req = event_request(priya, 0); // event_at = 0 → None (undated)
     req.event_at_unix_nanos = 0;
 
     let (op, body) = round_trip(&mut client, 3, RequestBody::StatementCreate(req)).await;
-    assert_eq!(op, Opcode::Error.as_u16(), "missing event_at → ERROR");
+    assert_eq!(
+        op,
+        Opcode::StatementCreateResp.as_u16(),
+        "dateless Event should persist, not error"
+    );
     match body {
-        ResponseBody::Error(e) => {
-            assert!(
-                e.message.to_lowercase().contains("event"),
-                "error mentions event: {:?}",
-                e.message
-            );
+        ResponseBody::StatementCreate(r) => {
+            assert_ne!(r.statement_id, [0u8; 16], "created statement has an id");
         }
-        other => panic!("{other:?}"),
+        other => panic!("expected StatementCreateResp, got {other:?}"),
     }
 
     server.stop().await;
@@ -412,6 +420,7 @@ async fn get_missing_statement_returns_error() {
         RequestBody::StatementGet(StatementGetRequest {
             statement_id: rid(),
             follow_supersession: false,
+            act_as: None,
         }),
     )
     .await;
@@ -515,6 +524,7 @@ async fn tombstone_returns_timestamp() {
         RequestBody::StatementGet(StatementGetRequest {
             statement_id: sid,
             follow_supersession: false,
+            act_as: None,
         }),
     )
     .await;
@@ -676,6 +686,7 @@ async fn list_subject_predicate_filter() {
             include_tombstoned: false,
             limit: 100,
             cursor: Vec::new(),
+            act_as: None,
         }),
     )
     .await;
@@ -713,6 +724,7 @@ async fn list_limit_zero_returns_error() {
             include_tombstoned: false,
             limit: 0,
             cursor: Vec::new(),
+            act_as: None,
         }),
     )
     .await;

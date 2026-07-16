@@ -6,6 +6,26 @@ use crate::shared::primitives::{
     EdgeKindWire, ForgetMode, MemoryKindWire, ObservationInput, PlanState, PlanStrategy,
 };
 
+/// Per-request effective-identity selector carried on data-plane op
+/// requests. When present, the op runs as this `(namespace, agent_id)`
+/// on behalf of the authenticated connection principal; when the field
+/// is absent the op runs as the connection's own key-bound identity.
+///
+/// Honored only when the connection principal holds `can_act_as` and
+/// `namespace` lies within its granted `may_act` allowlist — otherwise
+/// the op is rejected with `ActAsDenied`. This is the wire form only;
+/// the trust model (connection-principal-vs-effective-identity, the six
+/// invariants) is enforced server-side, not by this codec.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ActAs {
+    /// Effective namespace. Must be within the principal's `may_act`
+    /// allowlist; anything outside it is rejected.
+    pub namespace: String,
+    /// 16-byte effective agent id.
+    #[serde(with = "serde_bytes")]
+    pub agent_id: WireUuid,
+}
+
 /// `ENCODE_REQ` body. Expresses client *intent* only: the text to
 /// remember, where it belongs, and when its content happened. Brain's
 /// write router decides everything mechanical — the memory kind,
@@ -25,6 +45,25 @@ pub struct EncodeRequest {
     /// `None` when the client doesn't know it. Lets time-aware clients
     /// store the real timeline instead of cramming dates into the text.
     pub occurred_at_unix_nanos: Option<u64>,
+    /// Effective identity this encode runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
+    /// Opt-in synchronous write-analysis trace. When `true`, the ENCODE
+    /// response carries a populated `trace: EncodeTrace` describing the
+    /// full write timeline — the synchronous phases (validate / embed /
+    /// reserve / persist) AND the async derivation stages (auto-edge /
+    /// temporal-edge / extractor), which the handler synchronously waits
+    /// to drain before replying — plus the artifacts the write produced
+    /// (entities / statements / relations / indexes / dedup). When `false`
+    /// (the default) the write stays fully asynchronous and pays nothing:
+    /// the handler returns as soon as the WAL record is durable and the
+    /// async stages flow through SUBSCRIBE as before, `trace` omitted from
+    /// the wire map.
+    #[serde(default)]
+    pub trace: bool,
 }
 
 /// Admin / bulk-import encode path — NOT a primary client verb. Brain
@@ -132,23 +171,23 @@ pub struct RecallRequest {
     /// txn's pending writes (read-your-writes).
     #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
-    /// Explicit agent-id scope for the recall. Controls cross-agent
-    /// isolation together with `include_other_agents`:
-    ///   * empty + `include_other_agents == false` (the default) —
-    ///     the server fills in the calling connection's agent, so
-    ///     recall is isolated to the caller's own memories.
-    ///   * non-empty — recall is scoped to exactly this set of agents,
-    ///     regardless of who the caller is.
-    ///   * any value + `include_other_agents == true` — see that flag;
-    ///     no implicit caller filter is applied.
-    #[serde(with = "crate::codec::cbor::vec_byte_array16")]
-    pub agent_filter: Vec<WireUuid>,
-    /// When true, the server does NOT inject the implicit
-    /// caller-agent filter, yielding the across-agents view. Combined
-    /// with an empty `agent_filter` this returns hits from every
-    /// agent; combined with a non-empty `agent_filter` it still scopes
-    /// to that explicit set. Defaults to false (caller-isolated).
-    pub include_other_agents: bool,
+    /// Opt-in per-stage observability. When `true`, the FINAL response
+    /// frame carries a populated `trace: RecallTrace` describing each
+    /// retriever lane's outcome/latency/count, the filter-chain survivor
+    /// counts, the rerank outcome, and the total wall-time — the same data
+    /// the read pipeline already computes internally. When `false` (the
+    /// default) the pipeline discards that data as before, so the flag is
+    /// zero-cost on the hot path. Distinct from the debug-only
+    /// `QUERY_TRACE` op, which returns rendered text rather than structured
+    /// data on the read itself.
+    #[serde(default)]
+    pub trace: bool,
+    /// Effective identity this recall runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -162,6 +201,12 @@ pub struct PlanRequest {
     pub request_id: Option<WireUuid>,
     #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
+    /// Effective identity this plan runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// — plan budget.
@@ -184,9 +229,15 @@ pub struct ReasonRequest {
     pub request_id: Option<WireUuid>,
     #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
+    /// Effective identity this reason runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ForgetRequest {
     pub memory_id: WireMemoryId,
     pub mode: ForgetMode,
@@ -194,6 +245,147 @@ pub struct ForgetRequest {
     pub request_id: WireUuid,
     #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
+    /// Effective identity this forget runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
+}
+
+// ============================================================
+// MEMORY_LIST — paginated enumeration read
+// ============================================================
+
+/// Sort axis for `MEMORY_LIST`. `Created` is the only axis backed by a
+/// tenant-scoped index today; the others are declared here so the wire
+/// shape is stable while their server-side index support lands.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
+#[repr(u8)]
+pub enum MemoryListSortWire {
+    Created = 0,
+    Salience = 1,
+    Occurred = 2,
+    LastAccessed = 3,
+}
+
+/// Sort direction for `MEMORY_LIST`.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
+#[repr(u8)]
+pub enum MemoryListDirWire {
+    Asc = 0,
+    Desc = 1,
+}
+
+/// Which time field a `from`/`to` range filters on. `Created` is the
+/// write time (indexed); `Occurred` is the client-supplied event time
+/// (not indexed for memories yet).
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
+#[repr(u8)]
+pub enum MemoryListTimeAxisWire {
+    Created = 0,
+    Occurred = 1,
+}
+
+/// `MEMORY_LIST` (0x0027) — a pure paginated enumeration of the caller's
+/// `(namespace, agent)` memories. This is not RECALL: there is no query,
+/// no ranking, no relevance suppression. It walks the tenant timeline in
+/// a stable order and returns a page plus an opaque keyset cursor.
+///
+/// The cursor is opaque and signed: it encodes the sort, direction, the
+/// last key seen, and a signature over the active filters. Echoing a
+/// cursor back after changing any filter or the sort is rejected
+/// (`stale_cursor`), because the resumed page would otherwise belong to a
+/// different result set.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryListRequest {
+    pub sort: MemoryListSortWire,
+    pub dir: MemoryListDirWire,
+    /// Page size, validated server-side to `1..=100`.
+    pub limit: u32,
+    /// Empty on the first page; otherwise the opaque `next_cursor` from a
+    /// previous response.
+    pub cursor: Vec<u8>,
+    /// Empty = all kinds; otherwise only these memory kinds are returned.
+    pub kinds: Vec<MemoryKindWire>,
+    /// When false (the default), tombstoned memories are excluded; when
+    /// true, both active and tombstoned rows are enumerated.
+    pub include_tombstoned: bool,
+    /// Which time field the `from`/`to` bounds apply to.
+    pub time_axis: MemoryListTimeAxisWire,
+    /// Inclusive lower time bound in unix-nanos; `0` = no lower bound.
+    pub from_unix_nanos: u64,
+    /// Inclusive upper time bound in unix-nanos; `0` = no upper bound.
+    pub to_unix_nanos: u64,
+    /// Inclusive salience floor in `[0, 1]`.
+    pub salience_min: f32,
+    /// Inclusive salience ceiling in `[0, 1]`.
+    pub salience_max: f32,
+    /// Substring/token filter over memory text; empty = no filter.
+    pub text_contains: String,
+    /// Effective identity this list runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity. The list is scoped to the effective
+    /// `(namespace, agent)`, so it enumerates only that tenant's memories.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
+}
+
+/// One memory in a `MEMORY_LIST` response batch. Carries the
+/// enumeration-relevant fields plus relationship-handle counts so a UI
+/// row can show link counts without a second call.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryListItem {
+    #[serde(with = "serde_bytes")]
+    pub memory_id: [u8; 16],
+    pub text: String,
+    /// Raw memory-kind byte (0 = Episodic, 1 = Semantic, 2 = Consolidated).
+    pub kind: u8,
+    /// Lifecycle state byte (0 = active, 1 = tombstoned).
+    pub state: u8,
+    pub created_at_unix_nanos: u64,
+    /// Client-supplied event time; `0` when the memory has none.
+    pub occurred_at_unix_nanos: u64,
+    pub last_accessed_at_unix_nanos: u64,
+    /// Point-in-time salience — it decays, so callers must treat it as a
+    /// snapshot, not a stored constant.
+    pub salience: f32,
+    pub access_count: u32,
+    #[serde(with = "serde_bytes")]
+    pub source_request_id: [u8; 16],
+    pub statement_count: u32,
+    pub entity_count: u32,
+    pub relation_count: u32,
+}
+
+/// Response body for `MEMORY_LIST` (`0x00A7`). One frame carries a page
+/// of items; a single frame with `is_final = true` is the whole page.
+/// Empty `next_cursor` means the enumeration is exhausted; a non-empty
+/// `next_cursor` is the opaque token to resume from.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryListResponseFrame {
+    pub items: Vec<MemoryListItem>,
+    /// Empty when exhausted; otherwise the keyset token to resume with.
+    pub next_cursor: Vec<u8>,
+    /// Cumulative count of items emitted across this stream so far.
+    pub cumulative_count: u32,
+    pub is_final: bool,
+}
+
+impl MemoryListResponseFrame {
+    /// True for the final tail frame. Mirrors the body-side `is_final`
+    /// signal used by the other streaming list responses.
+    #[must_use]
+    pub fn is_final(&self) -> bool {
+        self.is_final
+    }
 }
 
 // ============================================================
@@ -252,6 +444,149 @@ pub struct EncodeResponse {
     /// distinction matters because (a) is a deployment-time
     /// configuration story and (b) is a per-memory content story.
     pub has_active_schema: bool,
+    /// Full synchronous write-analysis trace. Populated only when the
+    /// request set `trace = true`; `None` otherwise (and omitted from the
+    /// wire map so `trace = false` encodes pay nothing). The async
+    /// derivation stages are ALSO available on SUBSCRIBE keyed by `lsn` +
+    /// `pending_stages` — this field is the synchronous alternative for a
+    /// caller (e.g. a playground) that wants the whole timeline back in
+    /// one response without opening a subscribe stream.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub trace: Option<EncodeTrace>,
+}
+
+/// Full synchronous write-analysis trace for one ENCODE, surfaced on the
+/// response when the request opted in with `trace = true`. Two halves:
+/// `stages` is the per-phase timeline (the synchronous validate / embed /
+/// reserve / persist phases plus the async auto-edge / temporal-edge /
+/// extractor phases the handler synchronously waited to drain), and
+/// `artifacts` is what the write actually produced (entities, statements,
+/// relations, the indexes it landed in, and the dedup verdict). This is
+/// the ENCODE analog of `RecallTrace`: it lets a caller render "here is
+/// exactly what your write produced" without a second round-trip.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EncodeTrace {
+    /// The write timeline, in execution order: the synchronous phases
+    /// first, then each async derivation stage as it completed (or a
+    /// `Timeout` entry for a stage that didn't finish within the wait
+    /// window).
+    pub stages: Vec<EncodeTraceStage>,
+    /// What the write produced — resolved from the typed-graph rows and
+    /// index state after the async stages drained.
+    pub artifacts: EncodeTraceArtifacts,
+    /// End-to-end wall-time of the whole synchronous path (validation
+    /// through the async-stage drain), in microseconds.
+    pub total_latency_us: u64,
+}
+
+/// One phase in an `EncodeTrace` timeline.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EncodeTraceStage {
+    /// Phase name — one of the synchronous phases (`validate`, `embed`,
+    /// `reserve`, `persist`) or an async stage (`auto_edge`,
+    /// `temporal_edge`, `extractor`).
+    pub name: String,
+    /// Terminal status of the phase.
+    pub status: EncodeTraceStageStatus,
+    /// Phase wall-time in microseconds. For an async stage this is the
+    /// time from write-durable to the stage's `StageCompleted` event; `0`
+    /// for a stage that timed out.
+    pub latency_us: u64,
+    /// Human-readable detail: for the sync phases a short summary (e.g.
+    /// the embedding dimension), for an async stage the produced counts /
+    /// audit status, and for a `Timeout`/`Failed` stage the reason.
+    pub detail: String,
+}
+
+/// Terminal status of an `EncodeTrace` phase.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
+#[repr(u8)]
+pub enum EncodeTraceStageStatus {
+    /// The phase ran and completed (produced output or ran cleanly).
+    Ok = 0,
+    /// The phase was not applicable / not provisioned (e.g. an index the
+    /// write didn't touch, or a stage that was never queued).
+    Skipped = 1,
+    /// The phase errored. `detail` carries the reason.
+    Failed = 2,
+    /// An async stage that was queued but did not complete within the
+    /// handler's bounded wait window. Its `StageCompleted` event will
+    /// still arrive on SUBSCRIBE later.
+    Timeout = 3,
+}
+
+/// What an ENCODE produced, resolved after the async stages drained. Empty
+/// vectors are valid (the write went through extraction but produced no
+/// typed-graph rows).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EncodeTraceArtifacts {
+    /// Entities the extraction pipeline identified / resolved for this
+    /// memory.
+    pub entities: Vec<EncodeTraceEntity>,
+    /// Statements the write generated.
+    pub statements: Vec<EncodeTraceStatement>,
+    /// Typed relations incident to the entities this memory mentions.
+    pub relations: Vec<EncodeTraceRelation>,
+    /// Which indexes the memory (and its derived rows) landed in.
+    pub indexes: Vec<EncodeTraceIndex>,
+    /// The dedup verdict for this write.
+    pub dedup: EncodeTraceDedup,
+}
+
+/// One entity artifact in an `EncodeTrace`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EncodeTraceEntity {
+    #[serde(with = "serde_bytes")]
+    pub id: [u8; 16],
+    pub name: String,
+    /// Human-readable `"namespace:typename"` (or bare `"typename"` for the
+    /// default namespace).
+    pub type_qname: String,
+}
+
+/// One statement artifact in an `EncodeTrace`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EncodeTraceStatement {
+    #[serde(with = "serde_bytes")]
+    pub id: [u8; 16],
+    pub subject_name: String,
+    pub predicate: String,
+    /// Stringified object — entity canonical name for entity objects,
+    /// formatted scalar for literal objects.
+    pub object_name: String,
+    pub confidence: f32,
+}
+
+/// One relation artifact in an `EncodeTrace`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EncodeTraceRelation {
+    pub source_name: String,
+    pub predicate: String,
+    pub target_name: String,
+}
+
+/// One index the write landed in.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EncodeTraceIndex {
+    /// Index name — e.g. `memory_hnsw`, `memory_text`, `statement_text`.
+    pub name: String,
+    /// Whether the memory was inserted (`Ok`) or the index was not
+    /// applicable to this write (`Skipped`).
+    pub status: EncodeTraceStageStatus,
+}
+
+/// The dedup verdict carried on an `EncodeTrace`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EncodeTraceDedup {
+    /// `true` when the write collapsed onto an existing memory instead of
+    /// creating a new row.
+    pub was_deduplicated: bool,
+    /// The memory the write deduplicated against, when
+    /// `was_deduplicated`; `None` for a fresh write.
+    #[serde(with = "crate::codec::cbor::opt_byte_array16")]
+    pub matched_memory_id: Option<[u8; 16]>,
 }
 
 /// The shape of a RECALL answer — pure cardinality, decided by the server's
@@ -283,6 +618,94 @@ pub struct RecallResponseFrame {
     pub is_final: bool,
     pub cumulative_count: u32,
     pub estimated_remaining: Option<u32>,
+    /// Per-stage read-pipeline trace. Populated only on the FINAL frame and
+    /// only when the request set `trace = true`; `None` otherwise (and
+    /// omitted from the wire map so `trace = false` recalls pay nothing).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub trace: Option<RecallTrace>,
+}
+
+/// Per-stage observability for one RECALL, surfaced on the final frame when
+/// the request opted in with `trace = true`. Mirrors the read pipeline's
+/// internal `QueryMetadata` as structured data: one entry per retriever lane,
+/// the filter-chain survivor counts, the rerank outcome, and the total
+/// wall-time. Callers use it to see which lane was slow, which filter step
+/// narrowed the pool most, and whether the cross-encoder re-sorted the list.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RecallTrace {
+    /// One entry per retriever lane the plan invoked, in plan order.
+    pub retrievers: Vec<RecallTraceRetriever>,
+    /// Survivor counts after each filter-chain step.
+    pub filter_chain: RecallTraceFilterChain,
+    /// The rerank stage's outcome. `None` when the cross-encoder isn't
+    /// loaded on this shard (operator opted out of rerank), so the result
+    /// is RRF-only ordered.
+    pub rerank: Option<RecallTraceRerank>,
+    /// End-to-end wall-time of the retrieval execution, in milliseconds.
+    pub total_latency_ms: f64,
+}
+
+/// What one retriever lane did during a traced RECALL.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RecallTraceRetriever {
+    /// Which lane this is (semantic / lexical / graph).
+    pub name: RetrieverNameWire,
+    /// Terminal status of the lane.
+    pub status: RecallTraceRetrieverStatus,
+    /// Human-readable detail for the non-terminal statuses: the skip reason
+    /// for `Skipped`, the error message for `Failure`. Empty for `Success`
+    /// and `Timeout`.
+    pub status_detail: String,
+    /// Lane wall-time in milliseconds. `0.0` when the lane was skipped.
+    pub latency_ms: f64,
+    /// Raw candidate count this lane contributed before fusion.
+    pub candidate_count: u32,
+}
+
+/// Terminal status of a retriever lane in a RECALL trace.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
+#[repr(u8)]
+pub enum RecallTraceRetrieverStatus {
+    /// The lane ran and contributed its candidates.
+    Success = 0,
+    /// The lane was skipped because the request lacked its required signal
+    /// (e.g. graph with no resolved anchor). `status_detail` carries why.
+    Skipped = 1,
+    /// The lane exceeded its per-lane timeout. Its items were still fused.
+    Timeout = 2,
+    /// The lane returned an error and was dropped from fusion.
+    /// `status_detail` carries the message.
+    Failure = 3,
+}
+
+/// Filter-chain survivor counts after each step, mirroring the pipeline's
+/// internal `FilterChainStats`. Each field is the number of candidates that
+/// survived that step; `before` is the pre-filter fused count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RecallTraceFilterChain {
+    pub before: u32,
+    pub after_type: u32,
+    pub after_temporal: u32,
+    pub after_confidence: u32,
+    pub after_tombstone: u32,
+    pub after_supersession: u32,
+    pub after_as_of: u32,
+    pub after_limit: u32,
+}
+
+/// Outcome of the cross-encoder rerank stage in a RECALL trace.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RecallTraceRerank {
+    /// `true` when the cross-encoder ran and re-sorted the fused list;
+    /// `false` when it was loaded but had no candidates with fetchable text
+    /// (RRF order returned unchanged).
+    pub applied: bool,
+    /// Number of candidates the cross-encoder scored. `0` when not applied.
+    pub candidates: u32,
+    /// Rerank wall-time in milliseconds. `0.0` when not applied.
+    pub latency_ms: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -293,9 +716,9 @@ pub struct MemoryResult {
     pub confidence: f32,
     pub salience: f32,
     pub kind: MemoryKindWire,
-    /// Agent that owns this memory row. Lets the client see provenance
-    /// and, on a cross-agent recall (`include_other_agents == true` or
-    /// an explicit `agent_filter`), tell whose memory each hit is.
+    /// Agent that owns this memory row — always the calling key's own
+    /// agent, since recall is isolated to the caller. Echoed for
+    /// provenance / routing verification.
     #[serde(with = "serde_bytes")]
     pub agent_id: WireUuid,
     pub context_id: WireContextId,
@@ -470,7 +893,7 @@ pub struct ForgetResponse {
 // ============================================================
 
 /// — `LINK_REQ` body. Creates an edge between two memories.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LinkRequest {
     pub source: WireMemoryId,
     pub target: WireMemoryId,
@@ -481,11 +904,17 @@ pub struct LinkRequest {
     pub request_id: WireUuid,
     #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
+    /// Effective identity this link runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// — `UNLINK_REQ` body. Removes an edge identified by the
 /// `(source, kind, target)` triple.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UnlinkRequest {
     pub source: WireMemoryId,
     pub target: WireMemoryId,
@@ -494,6 +923,12 @@ pub struct UnlinkRequest {
     pub request_id: WireUuid,
     #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
+    /// Effective identity this unlink runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 // ============================================================
@@ -522,6 +957,97 @@ pub struct UnlinkResponse {
     /// `true` if the edge existed and was removed; `false` if it
     /// didn't exist (UNLINK is idempotent — non-existent = no-op).
     pub removed: bool,
+}
+
+#[cfg(test)]
+mod memory_list_tests {
+    use super::*;
+    use crate::codec::opcode::Opcode;
+    use crate::envelope::request::RequestBody;
+    use crate::envelope::response::ResponseBody;
+
+    fn sample_request() -> MemoryListRequest {
+        MemoryListRequest {
+            sort: MemoryListSortWire::Created,
+            dir: MemoryListDirWire::Desc,
+            limit: 50,
+            cursor: vec![1, 2, 3, 4],
+            kinds: vec![MemoryKindWire::Episodic, MemoryKindWire::Semantic],
+            include_tombstoned: true,
+            time_axis: MemoryListTimeAxisWire::Created,
+            from_unix_nanos: 1_700_000_000_000_000_000,
+            to_unix_nanos: 1_710_000_000_000_000_000,
+            salience_min: 0.1,
+            salience_max: 0.9,
+            text_contains: String::new(),
+            act_as: None,
+        }
+    }
+
+    #[test]
+    fn memory_list_request_round_trips() {
+        let body = RequestBody::MemoryList(sample_request());
+        let bytes = body.encode();
+        let decoded = RequestBody::decode(Opcode::MemoryListReq, &bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn memory_list_request_round_trips_with_act_as() {
+        let mut req = sample_request();
+        req.act_as = Some(ActAs {
+            namespace: "acme".into(),
+            agent_id: [7u8; 16],
+        });
+        req.cursor = Vec::new();
+        let body = RequestBody::MemoryList(req);
+        let bytes = body.encode();
+        let decoded = RequestBody::decode(Opcode::MemoryListReq, &bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn memory_list_response_round_trips() {
+        let frame = MemoryListResponseFrame {
+            items: vec![MemoryListItem {
+                memory_id: [0x11; 16],
+                text: "the sky is blue".into(),
+                kind: 0,
+                state: 0,
+                created_at_unix_nanos: 1_700_000_000_000_000_000,
+                occurred_at_unix_nanos: 0,
+                last_accessed_at_unix_nanos: 1_700_000_001_000_000_000,
+                salience: 0.5,
+                access_count: 3,
+                source_request_id: [0x22; 16],
+                statement_count: 0,
+                entity_count: 0,
+                relation_count: 0,
+            }],
+            next_cursor: vec![9, 8, 7],
+            cumulative_count: 1,
+            is_final: true,
+        };
+        let body = ResponseBody::MemoryList(frame);
+        let bytes = body.encode();
+        let decoded = ResponseBody::decode(Opcode::MemoryListResp, &bytes).expect("decode");
+        assert_eq!(decoded, body);
+        assert_eq!(body.is_final(), Some(true));
+    }
+
+    #[test]
+    fn empty_page_round_trips() {
+        let frame = MemoryListResponseFrame {
+            items: Vec::new(),
+            next_cursor: Vec::new(),
+            cumulative_count: 0,
+            is_final: true,
+        };
+        let body = ResponseBody::MemoryList(frame);
+        let bytes = body.encode();
+        let decoded = ResponseBody::decode(Opcode::MemoryListResp, &bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
 }
 
 #[cfg(test)]
@@ -592,5 +1118,107 @@ mod serde_smoke {
             RequestBody::EncodeVectorDirect(r) => assert_eq!(r.vector, vector),
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    // The opt-in `trace` flag round-trips on the request, and the populated
+    // `EncodeTrace` (sync + async stages, artifacts) round-trips on the
+    // response. A `trace = false` request / `trace: None` response omit the
+    // field from the wire map (proven by the existing `resp_encode`
+    // conformance fixture being byte-identical), so this only pins the
+    // opted-in shape.
+    #[test]
+    fn encode_trace_round_trips_request_and_response() {
+        use crate::codec::opcode::Opcode;
+        use crate::envelope::request::RequestBody;
+        use crate::envelope::response::ResponseBody;
+
+        let req = EncodeRequest {
+            text: "trace me".into(),
+            context_id: 3,
+            request_id: [7u8; 16],
+            txn_id: None,
+            occurred_at_unix_nanos: None,
+            act_as: None,
+            trace: true,
+        };
+        let body = RequestBody::Encode(req.clone());
+        let bytes = body.encode();
+        let decoded = RequestBody::decode(Opcode::EncodeReq, &bytes).expect("decode");
+        assert_eq!(decoded, body);
+        match decoded {
+            RequestBody::Encode(r) => assert!(r.trace),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let trace = EncodeTrace {
+            stages: vec![
+                EncodeTraceStage {
+                    name: "embed".into(),
+                    status: EncodeTraceStageStatus::Ok,
+                    latency_us: 1200,
+                    detail: "dim=384".into(),
+                },
+                EncodeTraceStage {
+                    name: "persist".into(),
+                    status: EncodeTraceStageStatus::Ok,
+                    latency_us: 800,
+                    detail: "lsn=9".into(),
+                },
+                EncodeTraceStage {
+                    name: "extractor".into(),
+                    status: EncodeTraceStageStatus::Timeout,
+                    latency_us: 0,
+                    detail: "stage did not complete within the trace wait window".into(),
+                },
+            ],
+            artifacts: EncodeTraceArtifacts {
+                entities: vec![EncodeTraceEntity {
+                    id: [1u8; 16],
+                    name: "brain".into(),
+                    type_qname: "org:project".into(),
+                }],
+                statements: vec![EncodeTraceStatement {
+                    id: [2u8; 16],
+                    subject_name: "niraj".into(),
+                    predicate: "org:works_on".into(),
+                    object_name: "brain".into(),
+                    confidence: 0.9,
+                }],
+                relations: vec![EncodeTraceRelation {
+                    source_name: "niraj".into(),
+                    predicate: "org:member_of".into(),
+                    target_name: "arc-labs".into(),
+                }],
+                indexes: vec![EncodeTraceIndex {
+                    name: "memory_hnsw".into(),
+                    status: EncodeTraceStageStatus::Ok,
+                }],
+                dedup: EncodeTraceDedup {
+                    was_deduplicated: false,
+                    matched_memory_id: None,
+                },
+            },
+            total_latency_us: 44_000,
+        };
+        let resp = EncodeResponse {
+            memory_id: 9,
+            was_deduplicated: false,
+            salience: 0.5,
+            auto_edges_added: 0,
+            lsn: 9,
+            agent_id: [0u8; 16],
+            context_id: 3,
+            kind: MemoryKindWire::Episodic,
+            created_at_unix_nanos: 1,
+            edges_out_count: 0,
+            embedding_model_fp: [0u8; 16],
+            pending_stages: vec![StageKind::Extractor],
+            has_active_schema: true,
+            trace: Some(trace),
+        };
+        let body = ResponseBody::Encode(resp);
+        let bytes = body.encode();
+        let decoded = ResponseBody::decode(Opcode::EncodeResp, &bytes).expect("decode");
+        assert_eq!(decoded, body);
     }
 }

@@ -928,8 +928,7 @@ fn phase_to_envelope(
         | Phase::UnmergeEntities { .. }
         | Phase::MergeEntities { .. }
         | Phase::ApproveMerge { .. }
-        | Phase::RejectMerge { .. }
-        | Phase::SetExtractorEnabled { .. } => None,
+        | Phase::RejectMerge { .. } => None,
 
         // Substrate phases without a subscribe-feed surface — their
         // observability is metrics-only. SalienceUpdated / KindUpdated /

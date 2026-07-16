@@ -10,9 +10,12 @@
 //! full question (not a bare predicate name) is what keeps this off the
 //! confident-wrong-answer trap of short-name cosine.
 //!
-//! Like the HyPE index the mapping is **many-to-one** (a statement owns
-//! several question points), so [`StatementQuestionHnswIndex::search`]
-//! collapses raw question hits to the best similarity per statement.
+//! Each question point is tagged with the [`Slot`] of the reified fact it
+//! leaves unbound, so a hit yields `(StatementId, Slot)` — the read path can
+//! then project the matched slot. The mapping is **many-to-one per
+//! (statement, slot)** (a statement owns several question points per slot,
+//! and several slots), so [`StatementQuestionHnswIndex::search`] collapses
+//! raw question hits to the best similarity per `(StatementId, Slot)` pair.
 //!
 //! - In-memory only; the vectors persist in redb
 //!   (`statement_question_vectors`) and this index is rebuilt on boot.
@@ -20,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use brain_core::StatementId;
+use brain_core::{Slot, StatementId};
 use hnsw_rs::prelude::{DistCosine, Hnsw, Neighbour};
 use thiserror::Error;
 
@@ -70,9 +73,14 @@ pub struct RebuildReport {
 pub struct StatementQuestionHnswIndex {
     inner: Hnsw<'static, f32, DistCosine>,
     params: EntityHnswParams,
-    /// Internal u32 point id → owning `StatementId`.
-    forward: Vec<StatementId>,
-    /// `StatementId` → the internal point ids it owns.
+    /// Internal u32 point id → the `(StatementId, Slot)` the point answers.
+    /// A statement legitimately owns several slots (Object / Subject /
+    /// Time), each with its own question points, so the target carries the
+    /// slot alongside the statement.
+    forward: Vec<(StatementId, Slot)>,
+    /// `StatementId` → the internal point ids it owns, across ALL slots.
+    /// Kept statement-scoped (not slot-scoped) so a tombstone / FORGET /
+    /// supersession cascade drops every one of a statement's points at once.
     by_statement: HashMap<StatementId, Vec<u32>>,
     tombstones: TombstoneBitmap,
 }
@@ -97,11 +105,12 @@ impl StatementQuestionHnswIndex {
         })
     }
 
-    /// Insert one question `vector` owned by `statement_id`.
-    pub fn insert(&mut self, statement_id: StatementId, vector: &[f32; VECTOR_DIM]) {
+    /// Insert one question `vector` owned by `statement_id`, tagged with the
+    /// `slot` of the reified fact the question leaves unbound.
+    pub fn insert(&mut self, statement_id: StatementId, slot: Slot, vector: &[f32; VECTOR_DIM]) {
         let internal_id = u32::try_from(self.forward.len())
             .expect("invariant: statement-question point count never reaches u32::MAX");
-        self.forward.push(statement_id);
+        self.forward.push((statement_id, slot));
         self.by_statement
             .entry(statement_id)
             .or_default()
@@ -116,15 +125,18 @@ impl StatementQuestionHnswIndex {
         self.by_statement.contains_key(&statement_id)
     }
 
-    /// Search the top-`k` nearest **statements** to `query`, collapsing raw
-    /// question hits to the best similarity per statement. Returns
-    /// `(StatementId, similarity)` sorted descending. Tombstoned points
-    /// excluded.
+    /// Search the top-`k` nearest **(statement, slot)** targets to `query`,
+    /// collapsing raw question hits to the best similarity per
+    /// `(StatementId, Slot)` pair. A single statement's Object / Subject /
+    /// Time questions are DISTINCT targets and each survives independently —
+    /// collapse is per-pair, not per-statement. Returns
+    /// `(StatementId, Slot, similarity)` sorted descending. Tombstoned
+    /// points excluded.
     pub fn search(
         &self,
         query: &[f32; VECTOR_DIM],
         k: usize,
-    ) -> Result<Vec<(StatementId, f32)>, StatementQuestionHnswError> {
+    ) -> Result<Vec<(StatementId, Slot, f32)>, StatementQuestionHnswError> {
         self.search_with_ef(query, k, None)
     }
 
@@ -134,7 +146,7 @@ impl StatementQuestionHnswIndex {
         query: &[f32; VECTOR_DIM],
         k: usize,
         ef: Option<usize>,
-    ) -> Result<Vec<(StatementId, f32)>, StatementQuestionHnswError> {
+    ) -> Result<Vec<(StatementId, Slot, f32)>, StatementQuestionHnswError> {
         if k == 0 || self.forward.is_empty() {
             return Ok(Vec::new());
         }
@@ -153,7 +165,7 @@ impl StatementQuestionHnswIndex {
         };
 
         let neighbours: Vec<Neighbour> = self.inner.search(query.as_slice(), fetch_k, ef);
-        let mut best: HashMap<StatementId, f32> = HashMap::new();
+        let mut best: HashMap<(StatementId, Slot), f32> = HashMap::new();
         for n in neighbours {
             let Ok(internal_id) = u32::try_from(n.d_id) else {
                 continue;
@@ -161,11 +173,11 @@ impl StatementQuestionHnswIndex {
             if self.tombstones.is_set(internal_id) {
                 continue;
             }
-            let Some(statement_id) = self.forward.get(internal_id as usize).copied() else {
+            let Some(target) = self.forward.get(internal_id as usize).copied() else {
                 continue;
             };
             let sim = 1.0 - n.distance;
-            best.entry(statement_id)
+            best.entry(target)
                 .and_modify(|cur| {
                     if sim > *cur {
                         *cur = sim;
@@ -174,11 +186,15 @@ impl StatementQuestionHnswIndex {
                 .or_insert(sim);
         }
 
-        let mut out: Vec<(StatementId, f32)> = best.into_iter().collect();
+        let mut out: Vec<(StatementId, Slot, f32)> = best
+            .into_iter()
+            .map(|((id, slot), sim)| (id, slot, sim))
+            .collect();
         out.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
+            b.2.partial_cmp(&a.2)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.to_bytes().cmp(&b.0.to_bytes()))
+                .then_with(|| a.1.as_u8().cmp(&b.1.as_u8()))
         });
         out.truncate(k);
         Ok(out)
@@ -221,12 +237,12 @@ impl StatementQuestionHnswIndex {
         self.params
     }
 
-    /// Discard the current index and re-insert every `(StatementId,
+    /// Discard the current index and re-insert every `(StatementId, Slot,
     /// vector)` from `points`. Callers pre-filter points of tombstoned /
     /// superseded statements.
     pub fn rebuild<I>(&mut self, points: I) -> RebuildReport
     where
-        I: IntoIterator<Item = (StatementId, [f32; VECTOR_DIM])>,
+        I: IntoIterator<Item = (StatementId, Slot, [f32; VECTOR_DIM])>,
     {
         self.inner = Hnsw::<f32, DistCosine>::new(
             self.params.m,
@@ -240,8 +256,8 @@ impl StatementQuestionHnswIndex {
         self.tombstones.clear();
 
         let mut report = RebuildReport::default();
-        for (statement_id, vector) in points {
-            self.insert(statement_id, &vector);
+        for (statement_id, slot, vector) in points {
+            self.insert(statement_id, slot, &vector);
             report.inserted += 1;
         }
         report.statements = self.by_statement.len();
@@ -269,35 +285,56 @@ mod tests {
     fn insert_search_collapse_and_tombstone() {
         let mut idx = StatementQuestionHnswIndex::new(statement_question_default_params()).unwrap();
         let a = sid(1);
-        idx.insert(a, &one_hot(1));
-        idx.insert(a, &one_hot(200)); // same statement, two questions
-        idx.insert(sid(2), &one_hot(50));
+        idx.insert(a, Slot::Object, &one_hot(1));
+        idx.insert(a, Slot::Object, &one_hot(200)); // same (statement, slot), two questions
+        idx.insert(sid(2), Slot::Object, &one_hot(50));
         assert_eq!(idx.len(), 3);
         assert_eq!(idx.statement_count(), 2);
 
         let r = idx.search(&one_hot(1), 5).unwrap();
         assert_eq!(r[0].0, a, "best-matching statement first");
+        assert_eq!(r[0].1, Slot::Object, "slot tag preserved");
         assert!(
-            r.iter().filter(|(s, _)| *s == a).count() == 1,
-            "collapsed per statement"
+            r.iter()
+                .filter(|(s, sl, _)| *s == a && *sl == Slot::Object)
+                .count()
+                == 1,
+            "collapsed per (statement, slot)"
         );
 
         idx.mark_statement_tombstoned(a);
         let r = idx.search(&one_hot(1), 5).unwrap();
         assert!(
-            !r.iter().any(|(s, _)| *s == a),
+            !r.iter().any(|(s, _, _)| *s == a),
             "tombstoned statement excluded"
         );
     }
 
     #[test]
+    fn same_statement_distinct_slots_survive_independently() {
+        // The same statement owns an Object question and a Time question at
+        // different vectors; each must surface as its own target — collapse
+        // is per (statement, slot), not per statement.
+        let mut idx = StatementQuestionHnswIndex::new(statement_question_default_params()).unwrap();
+        let a = sid(7);
+        idx.insert(a, Slot::Object, &one_hot(1));
+        idx.insert(a, Slot::Time, &one_hot(300));
+        assert_eq!(idx.statement_count(), 1);
+
+        let obj = idx.search(&one_hot(1), 5).unwrap();
+        assert!(obj.iter().any(|(s, sl, _)| *s == a && *sl == Slot::Object));
+        let time = idx.search(&one_hot(300), 5).unwrap();
+        assert!(time.iter().any(|(s, sl, _)| *s == a && *sl == Slot::Time));
+    }
+
+    #[test]
     fn rebuild_discards_prior_entries_and_loads_new_set() {
         let mut idx = StatementQuestionHnswIndex::new(statement_question_default_params()).unwrap();
-        idx.insert(sid(1), &one_hot(1));
+        idx.insert(sid(1), Slot::Object, &one_hot(1));
         let rep = idx.rebuild([
-            (sid(2), one_hot(2)),
-            (sid(2), one_hot(3)),
-            (sid(3), one_hot(4)),
+            (sid(2), Slot::Object, one_hot(2)),
+            (sid(2), Slot::Time, one_hot(3)),
+            (sid(3), Slot::Object, one_hot(4)),
         ]);
         assert_eq!(rep.inserted, 3);
         assert_eq!(rep.statements, 2);

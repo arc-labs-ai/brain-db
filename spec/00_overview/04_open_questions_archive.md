@@ -1265,11 +1265,13 @@ c) **Backpressure-aware streaming.** Server emits a frame, waits for ACK, emits 
 
 ---
 
-## OQ-WP-7: Client identity in multi-tenant deployments
+## OQ-WP-7: Client identity in multi-tenant deployments — RESOLVED
 
-**Issue.** The handshake authenticates a session to an `agent_id`. Some deployments may have multiple agents per session (an admin tool that operates across agents). The current protocol requires one agent per connection.
+**Resolution (2026-07):** adopt **per-request identity** — options (b)/(c) combined — **reversing** the v1 "status quo" deferral (the way OQ-V2-16 reversed permissive auth). A connection authenticates once as a trusted service principal (an edge or gateway); each data-plane op may carry an optional `act_as: { namespace, agent_id }` field naming the effective identity it runs as. `act_as` is honored **only** if the principal holds the `can_act_as` grant (permission bit `ACT_AS = 1 << 6`) **and** the target namespace is in the principal's minted `may_act` allowlist; otherwise it is hard-rejected (`Authorization`). When honored, the op runs under the effective `(namespace, agent_id)` for **all** scoping — write attribution, read `agent_filter` isolation, permission checks, idempotency key + shard routing, and audit — with **dual-principal audit** recording both the acting service principal and the effective identity (RFC 8693 delegation; the acting party is never erased). This is the standard impersonation pattern (Kubernetes API impersonation + RFC 8693 `act`/`may_act` + GCP/STS actor-permission), expressed as a stateless per-request wire field so one shared connection pool serves every tenant without pinning and the raw client secret is never forwarded. Cross-namespace acting beyond the `may_act` allowlist stays forbidden (`OQ-V2-4`). This is a breaking change made **in place** (pre-1.0, no back-compat shim). See [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §"Per-request identity (`act_as`)" (the canonical contract — `can_act_as`, `act_as`, `may_act`), [`../05_operations/02_write_pipeline.md`](../05_operations/02_write_pipeline.md) §4 + [`../05_operations/03_read_pipeline.md`](../05_operations/03_read_pipeline.md) (effective-identity scoping), [`../10_metadata/03_substrate_tables.md`](../10_metadata/03_substrate_tables.md) §3a + [`../10_metadata/05_failure_and_audit.md`](../10_metadata/05_failure_and_audit.md) §10 (idempotency key + dual-principal audit), and [`../17_observability/04_admin_ops.md`](../17_observability/04_admin_ops.md) §12.1 (the `ACT_AS` mint + `may_act` allowlist).
 
-**Options.**
+**Original issue.** The handshake authenticates a session to an `agent_id`. Some deployments may have multiple agents per session (an admin tool that operates across agents). The current protocol requires one agent per connection.
+
+**Options considered.**
 
 a) **One agent per connection.** Status quo. Admin tools open multiple connections.
 
@@ -1277,7 +1279,7 @@ b) **Multi-agent sessions.** AUTH establishes a "principal" who can speak as mul
 
 c) **Principal + impersonation.** A principal authenticates; subsequent operations may include an "impersonate" agent_id, which is checked at the authorization layer.
 
-**Recommendation.** Status quo for v1. The added complexity isn't justified for the workloads we're targeting. Operations admin tools that span agents should use multiple connections — the cost is small.
+The v1 recommendation was status quo (a); the resolution above adopts (b)/(c) once the multi-tenant edge/gateway workload made the per-tenant-connection-pool cost load-bearing.
 
 ---
 

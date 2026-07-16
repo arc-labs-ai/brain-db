@@ -9,6 +9,7 @@ pub mod admin;
 pub mod capabilities;
 pub mod entity;
 pub mod extractor;
+pub mod graph;
 pub mod memory;
 pub mod procedural;
 pub mod query;

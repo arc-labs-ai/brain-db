@@ -6,6 +6,7 @@
 //! module.
 
 use crate::envelope::request::WireUuid;
+use crate::ops::memory::ActAs;
 
 // ---------------------------------------------------------------------------
 // Shared types (used by requests + StatementView in statement_resp.rs).
@@ -157,10 +158,16 @@ pub struct StatementCreateRequest {
     pub schema_version: u32,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Effective identity this statement-create runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `STATEMENT_GET` (`0x0141`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatementGetRequest {
     #[serde(with = "serde_bytes")]
     pub statement_id: WireUuid,
@@ -168,6 +175,13 @@ pub struct StatementGetRequest {
     /// current statement in the chain (with
     /// `returned_via_supersession = true` in the response).
     pub follow_supersession: bool,
+    /// Effective identity this get runs as, on behalf of the authenticated
+    /// connection principal. `None` (the common case, and omitted on the wire)
+    /// means the op runs as the connection's own key-bound identity. The get is
+    /// scoped to the effective `(namespace, agent)` — a foreign tenant's
+    /// statement id reads as `NotFound`, never across the boundary.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `STATEMENT_SUPERSEDE` (`0x0142`).
@@ -247,6 +261,13 @@ pub struct StatementListRequest {
     pub include_tombstoned: bool,
     pub limit: u32,
     pub cursor: Vec<u8>,
+    /// Effective identity this list runs as, on behalf of the authenticated
+    /// connection principal. `None` (the common case, and omitted on the wire)
+    /// means the op runs as the connection's own key-bound identity. The list
+    /// is scoped to the effective `(namespace, agent)`, so it enumerates only
+    /// that tenant's statements.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +301,7 @@ mod tests_req {
             event_at_unix_nanos: 0,
             schema_version: 1,
             request_id: sample_uuid(2),
+            act_as: None,
         }
     }
 
@@ -331,6 +353,7 @@ mod tests_req {
             include_tombstoned: false,
             limit: 100,
             cursor: vec![1, 2, 3],
+            act_as: None,
         }));
         // Empty-filter case.
         req_round_trip(RequestBody::StatementList(StatementListRequest {
@@ -344,6 +367,7 @@ mod tests_req {
             include_tombstoned: false,
             limit: 100,
             cursor: Vec::new(),
+            act_as: None,
         }));
     }
 }

@@ -92,6 +92,13 @@ pub struct AgentPermissions {
     pub can_forget: bool,
     /// Typically `false` for normal agents; required for any `ADMIN_*` op.
     pub can_admin: bool,
+    /// Authorizes the connection to run an op *on behalf of another
+    /// identity* via the per-request `act_as` field. Distinct from the
+    /// other bits: it does not widen what the connection's own agent may
+    /// do. Held only by a trusted service principal (an edge/gateway);
+    /// a normal agent's key never carries it. Backed by the minted-key
+    /// bit `ACT_AS = 1 << 6`.
+    pub can_act_as: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +461,7 @@ mod tests {
                 can_reason: true,
                 can_forget: true,
                 can_admin: false,
+                can_act_as: false,
             },
             namespace: "acme".to_string(),
             server_time_unix_nanos: 1_700_000_000_000_000_000,

@@ -22,13 +22,13 @@
 use std::collections::HashMap;
 
 use brain_core::{
-    EntityId, EvidenceRef, MemoryId, PredicateId, RelationTypeId, Statement, StatementObject,
-    StatementValue,
+    EntityId, EvidenceRef, KindBehavior, KindCardinality, MemoryId, PredicateId, RelationTypeId,
+    Slot, Statement, StatementKind, StatementObject, StatementValue, SubjectRef, TemporalModel,
 };
 use brain_metadata::{
-    entity_get, predicate_embedding_get, predicate_get, relation_list_from, relation_list_to,
-    relation_type_embedding_get, relation_type_get, statement_list, RelationListFilter, RowScope,
-    StatementListFilter,
+    entity_get, kind_behavior, predicate_embedding_get, predicate_get, relation_list_from,
+    relation_list_to, relation_type_embedding_get, relation_type_get, statement_list,
+    RelationListFilter, RowScope, StatementListFilter,
 };
 use redb::ReadTransaction;
 
@@ -134,67 +134,80 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     dot / (na.sqrt() * nb.sqrt())
 }
 
-/// Compare two stored objects for value equality. Two single-valued rows
-/// that assert the same object are agreement / duplicates, not a conflict;
-/// distinct objects under a single-valued predicate ARE a contradiction.
-/// `StatementObject` derives `PartialEq`, so this is a direct comparison —
-/// named for intent at the call site.
-fn same_object(a: &StatementObject, b: &StatementObject) -> bool {
-    a == b
-}
-
-/// Shape a set of matched, blank-filtered, confidence-sorted candidate
-/// values into a `GroundedAnswer`, following the actual stored rows rather
-/// than blindly trusting the kind's cardinality.
-///
-/// The shaping rules (apply to BOTH the statement and relation paths):
-/// - 0 rows: `None`.
-/// - exactly 1 row: `Single`.
-/// - more than 1 row that all share the same object: collapse to `Single`
-///   (the rows agree / are duplicates; the cardinality is honored).
-/// - more than 1 row with differing objects: a `Set` of all of them,
-///   confidence-descending. For a single-valued kind this is deliberate: a
-///   normally-single predicate that holds two disagreeing current rows is a
-///   contradiction, and Brain surfaces contradictions rather than silently
-///   resolving them. There is no wire change. A multi-value `Set` returned
-///   for a normally-single predicate IS the surfaced conflict; the caller
-///   reads the extra members as the competing claims, ranked most-confident
-///   first.
-///
-/// `values` must already be sorted confidence-descending and free of blank
-/// objects. The matched kind's declared cardinality no longer drives the
-/// shape — the stored rows do — so it is intentionally not a parameter:
-/// even a single-valued kind yields a `Set` when two current rows disagree,
-/// which is how a contradiction is surfaced.
-fn shape_answer(mut values: Vec<GroundedValue>) -> Option<GroundedAnswer> {
-    match values.len() {
-        0 => None,
-        1 => Some(GroundedAnswer {
-            kind: AnswerKind::Single,
-            values,
-        }),
-        _ => {
-            let all_agree = values
-                .iter()
-                .all(|v| same_object(&v.object, &values[0].object));
-            if all_agree {
-                // Duplicates / agreement: collapse to the most-confident one.
-                values.truncate(1);
-                Some(GroundedAnswer {
-                    kind: AnswerKind::Single,
-                    values,
-                })
-            } else {
-                // Differing objects. For a cumulative kind this is the natural
-                // member list; for a single-valued kind it is a surfaced
-                // contradiction. Either way: a confidence-ranked Set.
-                Some(GroundedAnswer {
-                    kind: AnswerKind::Set,
-                    values,
-                })
-            }
+/// Collapse a recency-ranked value list to its distinct MEMBERS, order-
+/// preserving (so the head stays "most current"). Two values are the same
+/// member when they assert the same object — EXCEPT under a polarity kind
+/// (Preference), where the member key also includes the predicate so a
+/// "likes X" and a "dislikes X" (same object, opposite polarity carried by
+/// the predicate) are never merged into one. The polarity distinction comes
+/// from the KIND's `KindBehavior`, never from parsing the predicate string.
+fn dedup_members(values: Vec<GroundedValue>, polarity: bool) -> Vec<GroundedValue> {
+    let mut out: Vec<GroundedValue> = Vec::with_capacity(values.len());
+    for v in values {
+        let dup = out
+            .iter()
+            .any(|e| e.object == v.object && (!polarity || e.predicate == v.predicate));
+        if !dup {
+            out.push(v);
         }
     }
+    out
+}
+
+/// Shape matched, blank-filtered, recency-sorted candidate values into a
+/// `GroundedAnswer` driven by the matched fact's KIND — its `KindBehavior`,
+/// not the raw row count, is the primary signal. `values` must already be
+/// recency-ranked (head = current) and free of blank objects.
+///
+/// Cardinality is the driver:
+/// - **Single** (Attribute / Directive): one current value. Supersession has
+///   already left the latest current row at the head, so the head is "now".
+///   The stored-row contradiction refinement is kept: two DISTINCT current
+///   values under a single-valued kind is a contradiction Brain surfaces (a
+///   recency-ranked `Set` of the competing claims) rather than silently
+///   resolving.
+/// - **Set** (Relation / Preference / Event / Fact): enumerate ALL current
+///   members so a downstream "how many" is simply `|members|`. True
+///   duplicates (same member key) collapse; a lone member is a `Single`, two
+///   or more a `Set`. A polarity kind keys members on `(predicate, object)`
+///   so likes and dislikes both survive (see [`dedup_members`]).
+///
+/// Returns `None` for an empty input (no memory).
+fn shape_answer_for_kind(
+    values: Vec<GroundedValue>,
+    behavior: KindBehavior,
+) -> Option<GroundedAnswer> {
+    if values.is_empty() {
+        return None;
+    }
+    let members = dedup_members(values, behavior.polarity);
+    let kind = match behavior.cardinality {
+        // Single: one value unless the graph disagrees with itself (contradiction → Set).
+        KindCardinality::Single if members.len() > 1 => AnswerKind::Set,
+        KindCardinality::Single => AnswerKind::Single,
+        // Set: a lone member is a Single; two or more distinct members are the Set.
+        KindCardinality::Set if members.len() > 1 => AnswerKind::Set,
+        KindCardinality::Set => AnswerKind::Single,
+    };
+    Some(GroundedAnswer {
+        kind,
+        values: members,
+    })
+}
+
+/// The `KindBehavior` for entity↔entity links (the relations table). Every
+/// row there is a `Relation` kind by construction — a set-valued, stateful,
+/// non-polar link — so the read shapes them with that behavior directly
+/// rather than resolving a per-row kind. A built-in kind always has a
+/// behavior, so the fallback is unreachable but kept non-panicking.
+fn relation_behavior() -> KindBehavior {
+    StatementKind::Relation
+        .builtin_behavior()
+        .unwrap_or(KindBehavior::new(
+            KindCardinality::Set,
+            TemporalModel::State,
+            false,
+        ))
 }
 
 fn first_evidence_memory(ev: &EvidenceRef) -> Option<MemoryId> {
@@ -202,6 +215,25 @@ fn first_evidence_memory(ev: &EvidenceRef) -> Option<MemoryId> {
         EvidenceRef::Inline(v) => v.first().map(|e| e.memory_id),
         EvidenceRef::Overflow(_) => None,
     }
+}
+
+/// A memory's own time anchor: its client-supplied `occurred_at`, else its
+/// record `created_at`. This mirrors the write path's anchor (the date a
+/// same-day event's resolved date is compared against), so an Event with no
+/// distinct `event_at` answers "when" with the same instant the write treated
+/// as the message time. Returns `None` only when the memory row is absent.
+fn memory_time_anchor(rtxn: &ReadTransaction, mid: MemoryId) -> Result<Option<u64>, GroundedError> {
+    use brain_metadata::tables::memory::MEMORIES_TABLE;
+    let table = rtxn
+        .open_table(MEMORIES_TABLE)
+        .map_err(|e| GroundedError::Metadata(format!("{e}")))?;
+    let row = table
+        .get(&mid.to_be_bytes())
+        .map_err(|e| GroundedError::Metadata(format!("{e}")))?;
+    Ok(row.map(|g| {
+        let m = g.value();
+        m.occurred_at_unix_nanos.unwrap_or(m.created_at_unix_nanos)
+    }))
 }
 
 /// Whether an object carries real content. A blank/whitespace text value
@@ -214,6 +246,118 @@ fn is_meaningful_object(o: &StatementObject) -> bool {
         StatementObject::Value(brain_core::StatementValue::Blob(b)) => !b.is_empty(),
         _ => true,
     }
+}
+
+/// Minimum statement-question cosine for the reified slot-projection overlay to
+/// fire. Deliberately above the loose [`GROUNDED_MATCH_FLOOR`] (0.5): projecting
+/// a specific slot's value AS the grounded answer is a stronger claim than
+/// boosting on a predicate-name cosine, so it demands a strong, unambiguous
+/// question match. Set to match `GROUNDED_SINGLE_STRONG_MATCH` (0.6) — the same
+/// bar the downstream consensus collapse uses before it may shrink the set.
+pub const SLOT_PROJECTION_STRONG_FLOOR: f32 = 0.6;
+
+/// Project the matched [`Slot`] of a reified statement into a [`GroundedValue`].
+///
+/// A bridge question is generated by omitting exactly one slot, so a
+/// question-index hit carries the slot the cue asked for — and "return the
+/// object" is just one case of "return the requested slot":
+///   - [`Slot::Object`] → the statement's stored object (as the object path
+///     does today). A blank object is not a memory → `None`.
+///   - [`Slot::Time`] → the Event fact's `event_at_unix_nanos`, rendered as a
+///     `UnixNanos` value. When an Event carries no distinct `event_at` (a same-
+///     day event whose resolved date equalled the memory anchor, so the write
+///     left it unstamped), fall back to the evidence memory's own time anchor —
+///     the honest message-time estimate for "when". Only an Event exposes a Time
+///     role; a State/Atemporal fact → `None` (never fabricate a record
+///     timestamp), and an Event with no memory date behind it → `None`.
+///   - [`Slot::Subject`] → the statement's subject entity, resolved to its
+///     canonical name. A pending/unnamed subject → `None`.
+///
+/// `match_score` is the statement-question cosine; `source_memory` is the
+/// statement's first evidence memory. Pure projection over one loaded
+/// statement, so the slot-selection logic is unit-testable without a populated
+/// question index.
+pub fn project_statement_slot(
+    rtxn: &ReadTransaction,
+    s: &Statement,
+    slot: Slot,
+    match_score: f32,
+) -> Result<Option<GroundedValue>, GroundedError> {
+    let object = match slot {
+        Slot::Object => {
+            if !is_meaningful_object(&s.object) {
+                return Ok(None);
+            }
+            s.object.clone()
+        }
+        Slot::Time => {
+            // The Time role exists ONLY for an Event kind. A State/Atemporal fact
+            // has no time role, so a "when …" cue must not be answered by
+            // fabricating a record timestamp — the gate is kind-driven (Event ⇒
+            // TemporalModel::Event), never a guess from whether `event_at` happens
+            // to be populated on a non-Event row.
+            let behavior =
+                kind_behavior(rtxn, s.kind).map_err(|e| GroundedError::Metadata(format!("{e}")))?;
+            if !behavior.temporal.is_event() {
+                return Ok(None);
+            }
+            // Explicit temporal keys: prefer the Event fact's own resolved event
+            // time. When it carries none — a same-day event whose resolved date
+            // equalled the memory anchor, so the write deliberately left no
+            // distinct `event_at` — fall back to the evidence memory's own time
+            // anchor (its `occurred_at`, else `created_at`): the honest message-
+            // time estimate for "when". Never invent a time with no memory behind
+            // it (absent memory row → `None`).
+            //
+            // This fallback is now REACHABLE for real "when" reads: it goes live
+            // the moment the write side stops downgrading a dateless action from
+            // Event to Fact, so an Event with no distinct `event_at` reaches this
+            // branch (a Fact would have failed the `is_event()` gate above and
+            // returned `None`). The logic below is deliberately unchanged.
+            let t = match s.event_at_unix_nanos {
+                Some(t) => t,
+                None => {
+                    let Some(mid) = first_evidence_memory(&s.evidence) else {
+                        return Ok(None);
+                    };
+                    match memory_time_anchor(rtxn, mid)? {
+                        Some(t) => t,
+                        None => return Ok(None),
+                    }
+                }
+            };
+            StatementObject::Value(StatementValue::UnixNanos(t))
+        }
+        Slot::Subject => {
+            let SubjectRef::Entity(subject_id) = s.subject else {
+                return Ok(None);
+            };
+            let Some(name) = entity_get(rtxn, subject_id)
+                .map_err(|e| GroundedError::Metadata(format!("{e}")))?
+                .map(|e| e.canonical_name)
+            else {
+                return Ok(None);
+            };
+            if name.trim().is_empty() {
+                return Ok(None);
+            }
+            StatementObject::Value(StatementValue::Text(name))
+        }
+    };
+
+    let predicate = predicate_get(rtxn, s.predicate)
+        .ok()
+        .flatten()
+        .map(|p| p.canonical())
+        .unwrap_or_default();
+    Ok(Some(GroundedValue {
+        predicate,
+        object,
+        confidence: s.confidence,
+        source_memory: first_evidence_memory(&s.evidence),
+        match_score,
+        recency: s.event_at_unix_nanos.unwrap_or(s.extracted_at_unix_nanos),
+    }))
 }
 
 /// Answer a grounded relation question for one resolved subject.
@@ -281,6 +425,13 @@ const GROUNDED_WALK_BEAM: usize = 4;
 /// answer still beats a weak shallow one.
 const GROUNDED_WALK_DEPTH_DISCOUNT: f32 = 0.9;
 
+/// The winning answer together with the hop DEPTH at which it was found (0 = the
+/// anchor itself). The caller uses the depth to tell a genuine multi-hop chain
+/// (`depth >= 1`, reached by descending an edge) from a shallow single-hop answer
+/// sitting on the anchor — so a real multi-hop walk answer can win over the
+/// single-hop slot projection without any interrogative-word heuristic.
+pub type WalkAnswer = (GroundedAnswer, usize);
+
 /// Multi-hop grounded answer: a bounded beam walk over the typed graph from
 /// `anchor`, running the 1-hop [`grounded_answer`] at every reachable node and
 /// returning the single best-scoring answer found.
@@ -302,14 +453,17 @@ const GROUNDED_WALK_DEPTH_DISCOUNT: f32 = 0.9;
 /// per-hop discount to beat a nearer one, so "…work before?" still follows
 /// reports_to → prior-employer (the deep predicate scores high), while a bare
 /// "where does X work?" keeps X's own 1-hop employer instead of chaining into a
-/// relative's. Returns `AnswerKind::None` when nothing on the walk clears the
-/// floor — the boost is then a no-op and the episodic read stands alone.
+/// relative's. Returns `AnswerKind::None` (depth 0) when nothing on the walk
+/// clears the floor — the boost is then a no-op and the episodic read stands
+/// alone. The returned depth (see [`WalkAnswer`]) is the hop distance of the
+/// chosen answer, so the caller can distinguish a genuine multi-hop chain from a
+/// shallow single-hop answer on the anchor.
 pub fn grounded_answer_walk(
     rtxn: &ReadTransaction,
     scope: RowScope,
     anchor: EntityId,
     cue_vec: &[f32; brain_embed::VECTOR_DIM],
-) -> Result<GroundedAnswer, GroundedError> {
+) -> Result<WalkAnswer, GroundedError> {
     use std::collections::{HashMap, HashSet};
 
     let mut visited: HashSet<EntityId> = HashSet::new();
@@ -327,17 +481,47 @@ pub fn grounded_answer_walk(
     for hop in 0..GROUNDED_WALK_MAX_HOPS {
         let mut next: Vec<EntityId> = Vec::new();
         for &node in &frontier {
-            // Score every incident edge (both directions) by cue↔relation-type
-            // cosine; the surfaced neighbor is always the OTHER endpoint.
-            let filter = RelationListFilter {
+            // Score every incident edge by cue↔edge cosine and expand only the
+            // top-beam neighbors; the surfaced neighbor is always the OTHER
+            // endpoint. Two edge KINDS are unified here, because a hop in the
+            // typed graph is encoded either as a relations-table row (an
+            // entity↔entity link, scored by its relation-type embedding) OR as a
+            // statement whose object is an entity (a Fact/Event about the node
+            // pointing at another entity, scored by its predicate embedding). A
+            // chain that mixes the two — "X --friend(statement)--> Y
+            // --works_at(relation)--> Z" — stays connected only when BOTH kinds
+            // are walkable; scoring an entity-object statement by its predicate
+            // embedding is exactly the statement-side analogue of the relation
+            // path, so both feed one beam under the same cue↔edge cosine. Without
+            // this, any hop encoded as a statement silently broke the chain.
+            //
+            // When a neighbor is reachable by more than one edge we keep its BEST
+            // edge score, so a strong link isn't crowded out of the beam by a
+            // weaker parallel one.
+            let mut best_edge: HashMap<EntityId, f32> = HashMap::new();
+            let mut consider = |other: EntityId, score: f32| {
+                if other == node || visited.contains(&other) {
+                    return;
+                }
+                best_edge
+                    .entry(other)
+                    .and_modify(|e| {
+                        if score > *e {
+                            *e = score;
+                        }
+                    })
+                    .or_insert(score);
+            };
+
+            // Relation-table edges (both directions), scored by the relation type.
+            let rel_filter = RelationListFilter {
                 relation_type: None,
                 current_only: true,
                 limit: 0,
             };
-            let mut scored: Vec<(EntityId, f32)> = Vec::new();
-            let outgoing = relation_list_from(rtxn, scope, node, &filter)
+            let outgoing = relation_list_from(rtxn, scope, node, &rel_filter)
                 .map_err(|e| GroundedError::Metadata(format!("{e}")))?;
-            let incoming = relation_list_to(rtxn, scope, node, &filter)
+            let incoming = relation_list_to(rtxn, scope, node, &rel_filter)
                 .map_err(|e| GroundedError::Metadata(format!("{e}")))?;
             for r in outgoing.iter().chain(incoming.iter()) {
                 let other = if r.from_entity == node {
@@ -345,18 +529,45 @@ pub fn grounded_answer_walk(
                 } else {
                     r.from_entity
                 };
-                if visited.contains(&other) {
-                    continue;
-                }
                 let edge_score = relation_type_embedding_get(rtxn, r.relation_type)
                     .map_err(|e| GroundedError::Metadata(format!("{e}")))?
                     .map(|emb| cosine(cue_vec, &emb))
                     .unwrap_or(0.0);
-                scored.push((other, edge_score));
+                consider(other, edge_score);
             }
-            // Strongest-first; expand only the top-beam neighbors.
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            scored.dedup_by_key(|(id, _)| *id);
+
+            // Statement edges: the node's current statements whose OBJECT is an
+            // entity are hops too, scored by the statement's predicate embedding
+            // (the same signal the relation path reads off the relation type).
+            let stmts = statement_list(
+                rtxn,
+                scope,
+                &StatementListFilter {
+                    subject: Some(node),
+                    current_only: true,
+                    limit: 0,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| GroundedError::Metadata(format!("{e}")))?;
+            for s in &stmts {
+                let Some(other) = s.object.as_entity() else {
+                    continue;
+                };
+                let edge_score = predicate_embedding_get(rtxn, s.predicate)
+                    .map_err(|e| GroundedError::Metadata(format!("{e}")))?
+                    .map(|emb| cosine(cue_vec, &emb))
+                    .unwrap_or(0.0);
+                consider(other, edge_score);
+            }
+
+            // Strongest-first, id tie-break for deterministic beam selection.
+            let mut scored: Vec<(EntityId, f32)> = best_edge.into_iter().collect();
+            scored.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.to_bytes().cmp(&b.0.to_bytes()))
+            });
             for (other, _) in scored.into_iter().take(GROUNDED_WALK_BEAM) {
                 if !visited.insert(other) {
                     continue;
@@ -404,7 +615,7 @@ pub fn grounded_answer_walk(
 fn select_walk_winner(
     answers: &HashMap<EntityId, (GroundedAnswer, usize)>,
     anchor: EntityId,
-) -> GroundedAnswer {
+) -> WalkAnswer {
     let score_of = |a: &GroundedAnswer| a.values.first().map(|v| v.match_score).unwrap_or(0.0);
     let eff = |raw: f32, depth: usize| raw * GROUNDED_WALK_DEPTH_DISCOUNT.powi(depth as i32);
     let is_path = |id: EntityId, ans: &GroundedAnswer, depth: usize| -> bool {
@@ -445,9 +656,9 @@ fn select_walk_winner(
             for v in &mut ans.values {
                 v.match_score *= factor;
             }
-            ans
+            (ans, *depth)
         }
-        None => GroundedAnswer::none(),
+        None => (GroundedAnswer::none(), 0),
     }
 }
 
@@ -485,10 +696,10 @@ fn best_statement_answer(
 
     // Match each distinct predicate by EMBEDDING cosine against the cue; keep
     // the single best-scoring predicate that clears the floor. The matched
-    // predicate's declared cardinality no longer decides the answer shape —
-    // the actual stored rows do (see `shape_answer`), so a single-valued
-    // predicate with two disagreeing current rows surfaces both as a
-    // contradiction. A predicate with no stored embedding (older rows, or
+    // fact's KIND drives the answer shape (`shape_answer_for_kind`): a
+    // single-valued kind with two disagreeing current rows surfaces both as a
+    // contradiction, a set-valued kind enumerates its members. A predicate with
+    // no stored embedding (older rows, or
     // written when the embedder was absent) can't match semantically and is
     // skipped — never a panic.
     let mut best: Option<(PredicateId, f32)> = None;
@@ -521,8 +732,8 @@ fn best_statement_answer(
     // Most-RECENT first (event time if known, else record time), confidence
     // breaking ties. When two current rows disagree (e.g. an older
     // "works_at Google" and a newer "works_at OpenAI"), the present-tense
-    // answer is the latest assertion; `shape_answer` keeps this order both to
-    // rank a surfaced contradiction and to pick the survivor when rows agree.
+    // answer is the latest assertion; the kind-aware shaper keeps this order
+    // both to rank a surfaced contradiction and to pick the survivor.
     let recency = |s: &Statement| s.event_at_unix_nanos.unwrap_or(s.extracted_at_unix_nanos);
     group.sort_by(|a, b| {
         recency(b).cmp(&recency(a)).then(
@@ -531,6 +742,16 @@ fn best_statement_answer(
                 .unwrap_or(std::cmp::Ordering::Equal),
         )
     });
+
+    // The answer's SHAPE derives from the matched fact's KIND, not the raw row
+    // count. All rows in this group share the predicate, so they share the kind
+    // (statements of one predicate carry one kind); the head after the recency
+    // sort is the representative. `Custom` kinds resolve their behavior via the
+    // metadata kind registry the read txn reaches; a missing declaration degrades
+    // to Set/Atemporal (never a panic).
+    let kind = group.first().map(|s| s.kind).unwrap_or(StatementKind::Fact);
+    let behavior =
+        kind_behavior(rtxn, kind).map_err(|e| GroundedError::Metadata(format!("{e}")))?;
 
     let values: Vec<GroundedValue> = group
         .into_iter()
@@ -544,7 +765,7 @@ fn best_statement_answer(
         })
         .collect();
 
-    Ok(shape_answer(values))
+    Ok(shape_answer_for_kind(values, behavior))
 }
 
 /// Best relation-backed answer for the subject, or `None` when no current
@@ -554,9 +775,10 @@ fn best_statement_answer(
 /// not in the statements table. We match the question against each distinct
 /// relation-type *name* by exact membership, same as the predicate path.
 ///
-/// A winning relation type yields its current edges shaped by the actual
-/// rows (see `shape_answer`): each edge's object is the `to_entity`'s
-/// canonical name. Relation cardinality governs supersession at write time
+/// A winning relation type yields its current edges shaped by the Relation
+/// kind (`shape_answer_for_kind`, set-valued): each edge's object is the
+/// `to_entity`'s canonical name. Relation cardinality governs supersession at
+/// write time
 /// (stale edges are already non-current), so the read surfaces every current
 /// member — and when two current edges resolve to the same target name they
 /// collapse to a single value, while distinct targets form the natural Set.
@@ -657,8 +879,8 @@ fn best_relation_answer(
     }
     // Most-RECENT first (confidence breaks ties), matching the statement
     // path: a present-tense question surfaces the latest edge, and this is the
-    // order `shape_answer` ranks a Set in / picks the survivor from when edges
-    // agree on a target.
+    // order `shape_answer_for_kind` ranks a Set in / picks the survivor from
+    // when edges agree on a target.
     values.sort_by(|a, b| {
         b.recency.cmp(&a.recency).then(
             b.confidence
@@ -667,11 +889,10 @@ fn best_relation_answer(
         )
     });
 
-    // Entity links accumulate (one subject may work_at / know many targets),
-    // so distinct targets form a Set; two current edges to the same-named
-    // target collapse to a single value — the data, not the cardinality,
-    // decides (see `shape_answer`).
-    Ok(shape_answer(values))
+    // Entity links are the Relation kind — set-valued by construction: one
+    // subject may work_at / know many targets, so distinct targets form a Set,
+    // while two current edges to the same-named target collapse to one member.
+    Ok(shape_answer_for_kind(values, relation_behavior()))
 }
 
 #[cfg(test)]
@@ -747,7 +968,7 @@ mod tests {
         answers.insert(anchor, (ans_entity(0.78, neura), 0)); // works_at→NeuraCorp
         answers.insert(neura, (ans_value(0.55, "Pune"), 1)); // headquarters (weaker)
         answers.insert(air_india, (ans_value(0.78, "Air India"), 3)); // far works_at leaf
-        let w = select_walk_winner(&answers, anchor);
+        let (w, _depth) = select_walk_winner(&answers, anchor);
         assert_eq!(
             w.values.first().and_then(|v| v.object.as_entity()),
             Some(neura),
@@ -765,7 +986,8 @@ mod tests {
         let mut answers: HashMap<EntityId, (GroundedAnswer, usize)> = HashMap::new();
         answers.insert(anchor, (ans_entity(0.70, priya), 0)); // sibling_of→Priya
         answers.insert(priya, (ans_value(0.82, "cardiologist"), 1)); // occupation
-        let w = select_walk_winner(&answers, anchor);
+        let (w, depth) = select_walk_winner(&answers, anchor);
+        assert_eq!(depth, 1, "the deeper attribute is reached at hop 1");
         assert!(
             matches!(
                 w.values.first().map(|v| &v.object),
@@ -786,9 +1008,9 @@ mod tests {
         answers.insert(eid(7), (ans_value(0.80, "seven"), 2));
         answers.insert(eid(4), (ans_value(0.80, "four"), 2));
         answers.insert(eid(9), (ans_value(0.80, "nine"), 2));
-        let first = select_walk_winner(&answers, anchor);
+        let (first, _) = select_walk_winner(&answers, anchor);
         for _ in 0..20 {
-            let again = select_walk_winner(&answers, anchor);
+            let (again, _) = select_walk_winner(&answers, anchor);
             assert_eq!(
                 first.values.first().map(|v| &v.object),
                 again.values.first().map(|v| &v.object),
@@ -799,6 +1021,531 @@ mod tests {
         assert!(matches!(
             first.values.first().map(|v| &v.object),
             Some(StatementObject::Value(StatementValue::Text(t))) if t == "four"
+        ));
+    }
+
+    /// Build a temp metadata db with one subject entity + one predicate, and a
+    /// statement builder over them. Returns `(dir, db, scope, subject, build)`.
+    #[allow(clippy::type_complexity)]
+    fn slot_projection_fixture() -> (
+        tempfile::TempDir,
+        brain_metadata::MetadataDb,
+        RowScope,
+        EntityId,
+        PredicateId,
+    ) {
+        use brain_core::{Entity, EntityType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = brain_metadata::MetadataDb::open(dir.path().join("m.redb")).unwrap();
+        let scope = RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xB2; 16]);
+        let subject = EntityId::new();
+        let wtxn = db.write_txn().unwrap();
+        brain_metadata::entity::ops::entity_put(
+            &wtxn,
+            scope,
+            &Entity::new_active(
+                subject,
+                EntityType::PERSON_ID,
+                "Melanie".into(),
+                "melanie".into(),
+                1,
+            ),
+        )
+        .unwrap();
+        let pid =
+            brain_metadata::schema::predicate::predicate_intern_or_get(&wtxn, "test", "ran", 0, 1)
+                .unwrap();
+        wtxn.commit().unwrap();
+        (dir, db, scope, subject, pid)
+    }
+
+    fn statement_with(
+        subject: EntityId,
+        pid: PredicateId,
+        kind: brain_core::StatementKind,
+        object: StatementObject,
+        event_at: Option<u64>,
+    ) -> Statement {
+        let mut s = Statement::new_root(
+            brain_core::StatementId::new(),
+            kind,
+            SubjectRef::Entity(subject),
+            pid,
+            object,
+            0.9,
+            EvidenceRef::default(),
+            brain_core::ExtractorId::from(0),
+            1,
+            1,
+        );
+        s.event_at_unix_nanos = event_at;
+        s
+    }
+
+    #[test]
+    fn slot_projection_object_returns_object() {
+        let (_dir, db, _scope, subject, pid) = slot_projection_fixture();
+        let rtxn = db.read_txn().unwrap();
+        let s = statement_with(
+            subject,
+            pid,
+            brain_core::StatementKind::Fact,
+            StatementObject::Value(StatementValue::Text("charity race".into())),
+            None,
+        );
+        let v = project_statement_slot(&rtxn, &s, Slot::Object, 0.8)
+            .unwrap()
+            .expect("object slot projects");
+        assert_eq!(
+            v.object,
+            StatementObject::Value(StatementValue::Text("charity race".into()))
+        );
+        assert!((v.match_score - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn slot_projection_object_skips_blank() {
+        let (_dir, db, _scope, subject, pid) = slot_projection_fixture();
+        let rtxn = db.read_txn().unwrap();
+        let s = statement_with(
+            subject,
+            pid,
+            brain_core::StatementKind::Fact,
+            StatementObject::Value(StatementValue::Text("   ".into())),
+            None,
+        );
+        assert!(project_statement_slot(&rtxn, &s, Slot::Object, 0.8)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn slot_projection_time_returns_event_at() {
+        let (_dir, db, _scope, subject, pid) = slot_projection_fixture();
+        let rtxn = db.read_txn().unwrap();
+        const T: u64 = 1_577_836_800_000_000_000;
+        let s = statement_with(
+            subject,
+            pid,
+            brain_core::StatementKind::Event,
+            StatementObject::Value(StatementValue::Text("charity race".into())),
+            Some(T),
+        );
+        let v = project_statement_slot(&rtxn, &s, Slot::Time, 0.7)
+            .unwrap()
+            .expect("time slot projects when event_at set");
+        assert_eq!(
+            v.object,
+            StatementObject::Value(StatementValue::UnixNanos(T))
+        );
+    }
+
+    #[test]
+    fn slot_projection_time_none_without_event_at() {
+        let (_dir, db, _scope, subject, pid) = slot_projection_fixture();
+        let rtxn = db.read_txn().unwrap();
+        let s = statement_with(
+            subject,
+            pid,
+            brain_core::StatementKind::Fact,
+            StatementObject::Value(StatementValue::Text("charity race".into())),
+            None,
+        );
+        assert!(
+            project_statement_slot(&rtxn, &s, Slot::Time, 0.7)
+                .unwrap()
+                .is_none(),
+            "a fact with no event time cannot answer a when-question"
+        );
+    }
+
+    /// Insert a memory row carrying an explicit event time, so a same-day
+    /// Event with no distinct `event_at` can fall back to it for "when".
+    fn put_memory(
+        db: &brain_metadata::MetadataDb,
+        id: MemoryId,
+        occurred_at: Option<u64>,
+        created_at: u64,
+    ) {
+        use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
+        let row = MemoryMetadata::new_active(
+            id,
+            brain_core::NamespaceId::SYSTEM,
+            brain_core::AgentId::new(),
+            brain_core::ContextId::from(0),
+            id.slot(),
+            id.version(),
+            brain_core::MemoryKind::Episodic,
+            [0u8; 16],
+            0.5,
+            0,
+            created_at,
+        )
+        .with_occurred_at(occurred_at);
+        let wtxn = db.write_txn().unwrap();
+        {
+            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
+            t.insert(&id.to_be_bytes(), &row).unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+
+    fn statement_with_evidence(
+        subject: EntityId,
+        pid: PredicateId,
+        kind: brain_core::StatementKind,
+        object: StatementObject,
+        event_at: Option<u64>,
+        evidence: EvidenceRef,
+    ) -> Statement {
+        let mut s = Statement::new_root(
+            brain_core::StatementId::new(),
+            kind,
+            SubjectRef::Entity(subject),
+            pid,
+            object,
+            0.9,
+            evidence,
+            brain_core::ExtractorId::from(0),
+            1,
+            1,
+        );
+        s.event_at_unix_nanos = event_at;
+        s
+    }
+
+    #[test]
+    fn slot_projection_time_event_falls_back_to_memory_occurred_at() {
+        // A same-day Event carries no distinct event_at (its resolved date
+        // equalled the memory anchor). The Time role still answers "when" with
+        // the evidence memory's own occurred_at — the honest message-time.
+        let (_dir, db, _scope, subject, pid) = slot_projection_fixture();
+        const OCCURRED: u64 = 1_684_972_800_000_000_000; // 2023-05-25.
+        let mid = MemoryId::pack(0, 1, 0);
+        put_memory(&db, mid, Some(OCCURRED), 1);
+        let ev = EvidenceRef::inline_from_slice(&[brain_core::EvidenceEntry::from_parts(
+            mid,
+            0.9,
+            0,
+            brain_core::ExtractorId::from(0),
+        )]);
+        let rtxn = db.read_txn().unwrap();
+        let s = statement_with_evidence(
+            subject,
+            pid,
+            brain_core::StatementKind::Event,
+            StatementObject::Value(StatementValue::Text("charity race".into())),
+            None,
+            ev,
+        );
+        let v = project_statement_slot(&rtxn, &s, Slot::Time, 0.7)
+            .unwrap()
+            .expect("event with no event_at falls back to memory occurred_at");
+        assert_eq!(
+            v.object,
+            StatementObject::Value(StatementValue::UnixNanos(OCCURRED))
+        );
+    }
+
+    #[test]
+    fn slot_projection_time_event_no_evidence_is_none() {
+        // An Event with no event_at AND no evidence memory has no time to give.
+        let (_dir, db, _scope, subject, pid) = slot_projection_fixture();
+        let rtxn = db.read_txn().unwrap();
+        let s = statement_with_evidence(
+            subject,
+            pid,
+            brain_core::StatementKind::Event,
+            StatementObject::Value(StatementValue::Text("charity race".into())),
+            None,
+            EvidenceRef::default(),
+        );
+        assert!(
+            project_statement_slot(&rtxn, &s, Slot::Time, 0.7)
+                .unwrap()
+                .is_none(),
+            "no event_at and no evidence memory → no when"
+        );
+    }
+
+    #[test]
+    fn slot_projection_subject_returns_entity_name() {
+        let (_dir, db, _scope, subject, pid) = slot_projection_fixture();
+        let rtxn = db.read_txn().unwrap();
+        let s = statement_with(
+            subject,
+            pid,
+            brain_core::StatementKind::Fact,
+            StatementObject::Value(StatementValue::Text("charity race".into())),
+            None,
+        );
+        let v = project_statement_slot(&rtxn, &s, Slot::Subject, 0.9)
+            .unwrap()
+            .expect("subject slot projects to the subject entity name");
+        assert_eq!(
+            v.object,
+            StatementObject::Value(StatementValue::Text("Melanie".into()))
+        );
+    }
+
+    // ── Kind-anchored answer shaping ────────────────────────────────────────
+
+    fn val(predicate: &str, object: &str) -> GroundedValue {
+        GroundedValue {
+            predicate: predicate.into(),
+            object: StatementObject::Value(StatementValue::Text(object.into())),
+            confidence: 1.0,
+            source_memory: None,
+            match_score: 0.7,
+            recency: 0,
+        }
+    }
+
+    fn behavior(card: KindCardinality, temporal: TemporalModel, polarity: bool) -> KindBehavior {
+        KindBehavior::new(card, temporal, polarity)
+    }
+
+    #[test]
+    fn attribute_single_returns_one_current_value() {
+        // Attribute is Single/State: one current value even with agreeing
+        // duplicate rows (supersession left the head as "now").
+        let b = StatementKind::Attribute.builtin_behavior().unwrap();
+        let a = shape_answer_for_kind(vec![val("brain:city", "Berlin")], b).unwrap();
+        assert_eq!(a.kind, AnswerKind::Single);
+        assert_eq!(a.values.len(), 1);
+    }
+
+    #[test]
+    fn attribute_single_surfaces_contradiction_as_set() {
+        // Two DISTINCT current values under a single-valued kind → contradiction,
+        // surfaced as a Set of the competing claims.
+        let b = StatementKind::Attribute.builtin_behavior().unwrap();
+        let a = shape_answer_for_kind(
+            vec![val("brain:city", "Berlin"), val("brain:city", "Paris")],
+            b,
+        )
+        .unwrap();
+        assert_eq!(a.kind, AnswerKind::Set);
+        assert_eq!(a.values.len(), 2);
+    }
+
+    #[test]
+    fn relation_set_enumerates_all_members() {
+        // Relation is Set: distinct targets all survive so a downstream count works.
+        let b = StatementKind::Relation.builtin_behavior().unwrap();
+        let a = shape_answer_for_kind(
+            vec![
+                val("brain:knows", "Alice"),
+                val("brain:knows", "Bob"),
+                val("brain:knows", "Carol"),
+            ],
+            b,
+        )
+        .unwrap();
+        assert_eq!(a.kind, AnswerKind::Set);
+        assert_eq!(a.values.len(), 3, "all current members enumerated");
+    }
+
+    #[test]
+    fn fact_set_dedups_true_duplicates() {
+        // Same object twice = one member → Single (count 1); recency head kept.
+        let b = StatementKind::Fact.builtin_behavior().unwrap();
+        let a =
+            shape_answer_for_kind(vec![val("brain:p", "same"), val("brain:p", "same")], b).unwrap();
+        assert_eq!(a.kind, AnswerKind::Single);
+        assert_eq!(a.values.len(), 1);
+    }
+
+    #[test]
+    fn preference_polarity_splits_like_and_dislike() {
+        // Preference carries polarity: "likes X" and "dislikes X" share the
+        // object but differ by predicate → two members, never merged. A non-
+        // polar kind with the same rows WOULD collapse them.
+        let pref = StatementKind::Preference.builtin_behavior().unwrap();
+        assert!(pref.polarity);
+        let split = shape_answer_for_kind(
+            vec![
+                val("brain:likes", "coffee"),
+                val("brain:dislikes", "coffee"),
+            ],
+            pref,
+        )
+        .unwrap();
+        assert_eq!(split.kind, AnswerKind::Set);
+        assert_eq!(
+            split.values.len(),
+            2,
+            "polarity keeps like/dislike distinct"
+        );
+
+        // Same two rows under a non-polar Set kind collapse on object → one member.
+        let nonpolar = behavior(KindCardinality::Set, TemporalModel::State, false);
+        let merged = shape_answer_for_kind(
+            vec![
+                val("brain:likes", "coffee"),
+                val("brain:dislikes", "coffee"),
+            ],
+            nonpolar,
+        )
+        .unwrap();
+        assert_eq!(merged.values.len(), 1, "non-polar kind merges on object");
+    }
+
+    #[test]
+    fn empty_values_is_none() {
+        let b = StatementKind::Fact.builtin_behavior().unwrap();
+        assert!(shape_answer_for_kind(Vec::new(), b).is_none());
+    }
+
+    #[test]
+    fn slot_projection_time_refused_on_non_event_even_with_event_at() {
+        // A non-Event kind must NEVER expose a Time role, even if the row happens
+        // to carry an event_at — the gate is kind-driven, not populated-field-driven.
+        let (_dir, db, _scope, subject, pid) = slot_projection_fixture();
+        let rtxn = db.read_txn().unwrap();
+        const T: u64 = 1_577_836_800_000_000_000;
+        let s = statement_with(
+            subject,
+            pid,
+            brain_core::StatementKind::Attribute,
+            StatementObject::Value(StatementValue::Text("charity race".into())),
+            Some(T),
+        );
+        assert!(
+            project_statement_slot(&rtxn, &s, Slot::Time, 0.7)
+                .unwrap()
+                .is_none(),
+            "a State/Attribute fact has no time role even with event_at set"
+        );
+    }
+
+    /// A `VECTOR_DIM` unit vector with `1.0` at index `i`, `0.0` elsewhere — a
+    /// controllable basis so cue↔embedding cosines are exact (equal index → 1.0,
+    /// different index → 0.0).
+    fn unit_at(i: usize) -> [f32; brain_embed::VECTOR_DIM] {
+        let mut v = [0.0f32; brain_embed::VECTOR_DIM];
+        v[i] = 1.0;
+        v
+    }
+
+    #[test]
+    fn walk_traverses_entity_object_statement_to_a_deeper_answer() {
+        // A hop encoded as a STATEMENT (not a relations-table edge) must be
+        // walkable: "what does X's friend do" needs X --friend(statement)--> Y,
+        // then Y's occupation. The friend link is a Fact whose object is the
+        // entity Y, so before this fix Y was unreachable and the walk returned
+        // nothing. The anchor X itself has NO cue-matching predicate, so the ONLY
+        // way to answer is by traversing the statement edge to Y and matching
+        // Y's occupation there (depth 1).
+        use brain_core::{Entity, EntityType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = brain_metadata::MetadataDb::open(dir.path().join("m.redb")).unwrap();
+        let scope = RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xB3; 16]);
+        let x = EntityId::new();
+        let y = EntityId::new();
+
+        let cue = unit_at(0);
+        let wtxn = db.write_txn().unwrap();
+        for (id, name) in [(x, "X"), (y, "Y")] {
+            brain_metadata::entity::ops::entity_put(
+                &wtxn,
+                scope,
+                &Entity::new_active(id, EntityType::PERSON_ID, name.into(), name.into(), 1),
+            )
+            .unwrap();
+        }
+        // The friend predicate is ORTHOGONAL to the cue (cosine 0): it is a
+        // walkable edge but never itself an answer, so the anchor produces none.
+        let p_friend = brain_metadata::schema::predicate::predicate_intern_or_get(
+            &wtxn, "test", "friend", 0, 1,
+        )
+        .unwrap();
+        brain_metadata::schema::predicate::predicate_embedding_put(&wtxn, p_friend, &unit_at(1))
+            .unwrap();
+        // The occupation predicate EQUALS the cue (cosine 1.0): a strong answer
+        // at Y that only the walk can reach.
+        let p_occ = brain_metadata::schema::predicate::predicate_intern_or_get(
+            &wtxn,
+            "test",
+            "occupation",
+            0,
+            1,
+        )
+        .unwrap();
+        brain_metadata::schema::predicate::predicate_embedding_put(&wtxn, p_occ, &cue).unwrap();
+
+        let s_friend = statement_with(
+            x,
+            p_friend,
+            brain_core::StatementKind::Fact,
+            StatementObject::Entity(y),
+            None,
+        );
+        brain_metadata::statement::crud::statement_create(&wtxn, scope, &s_friend, 1).unwrap();
+        let s_occ = statement_with(
+            y,
+            p_occ,
+            brain_core::StatementKind::Fact,
+            StatementObject::Value(StatementValue::Text("doctor".into())),
+            None,
+        );
+        brain_metadata::statement::crud::statement_create(&wtxn, scope, &s_occ, 1).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let (answer, depth) = grounded_answer_walk(&rtxn, scope, x, &cue).unwrap();
+        assert_eq!(
+            depth, 1,
+            "the answer is found one statement-hop away from the anchor"
+        );
+        assert!(
+            matches!(
+                answer.values.first().map(|v| &v.object),
+                Some(StatementObject::Value(StatementValue::Text(t))) if t == "doctor"
+            ),
+            "walking the entity-object statement reaches Y's occupation: {:?}",
+            answer.values.first().map(|v| &v.object)
+        );
+    }
+
+    #[test]
+    fn walk_single_hop_answer_stays_at_the_anchor() {
+        // A single-hop cue whose answer sits on the anchor must return depth 0
+        // even now that statement edges are walkable — the deeper traversal must
+        // never hijack a genuine single-hop answer.
+        use brain_core::{Entity, EntityType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = brain_metadata::MetadataDb::open(dir.path().join("m.redb")).unwrap();
+        let scope = RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xB4; 16]);
+        let x = EntityId::new();
+        let cue = unit_at(0);
+        let wtxn = db.write_txn().unwrap();
+        brain_metadata::entity::ops::entity_put(
+            &wtxn,
+            scope,
+            &Entity::new_active(x, EntityType::PERSON_ID, "X".into(), "x".into(), 1),
+        )
+        .unwrap();
+        let p_city =
+            brain_metadata::schema::predicate::predicate_intern_or_get(&wtxn, "test", "city", 0, 1)
+                .unwrap();
+        brain_metadata::schema::predicate::predicate_embedding_put(&wtxn, p_city, &cue).unwrap();
+        let s_city = statement_with(
+            x,
+            p_city,
+            brain_core::StatementKind::Fact,
+            StatementObject::Value(StatementValue::Text("Berlin".into())),
+            None,
+        );
+        brain_metadata::statement::crud::statement_create(&wtxn, scope, &s_city, 1).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let (answer, depth) = grounded_answer_walk(&rtxn, scope, x, &cue).unwrap();
+        assert_eq!(depth, 0, "a single-hop answer is found at the anchor");
+        assert!(matches!(
+            answer.values.first().map(|v| &v.object),
+            Some(StatementObject::Value(StatementValue::Text(t))) if t == "Berlin"
         ));
     }
 

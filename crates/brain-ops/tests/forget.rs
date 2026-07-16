@@ -76,6 +76,8 @@ fn encode_req(request_id: [u8; 16], text: &str) -> EncodeRequest {
         request_id,
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     }
 }
 
@@ -85,6 +87,7 @@ fn forget_req(memory_id: u128, request_id: [u8; 16]) -> ForgetRequest {
         mode: ForgetMode::Soft,
         request_id,
         txn_id: None,
+        act_as: None,
     }
 }
 
@@ -209,7 +212,7 @@ fn forget_idempotent_replay_returns_cached_response() {
         let req = forget_req(memory_id, [31; 16]);
         let first = unwrap_forget_resp(
             dispatch(
-                RequestBody::Forget(req),
+                RequestBody::Forget(req.clone()),
                 brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )

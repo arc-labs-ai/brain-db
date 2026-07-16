@@ -11,6 +11,16 @@ use brain_core::MemoryId;
 
 use crate::framework::item::ExtractedItem;
 use crate::framework::registry::ExtractorRegistry;
+use crate::framework::trigger::TriggerDecision;
+
+/// The reserved system-schema namespace (`brain`). Every seeded
+/// extractor is declared under it; a runtime extractor whose qname
+/// carries no namespace prefix defaults to it. Kept in lockstep with
+/// `brain_metadata::system_schema::SYSTEM_SCHEMA_NAMESPACE` — the
+/// framework can't depend on brain-metadata, so the literal is mirrored
+/// here (a divergence would only surface as a namespace-selection miss,
+/// caught by the worker's fallback-to-system default).
+pub const SYSTEM_NAMESPACE: &str = "brain";
 
 // ---------------------------------------------------------------------------
 // Bounded LLM context.
@@ -94,6 +104,34 @@ pub trait Extractor: Send + Sync {
     /// Canonical qname, e.g. `"acme:person_mentions"`.
     fn name(&self) -> &str;
     fn extractor_version(&self) -> u32;
+
+    /// The namespace this extractor was declared under (`brain` for the
+    /// seeded system extractors, the uploader's namespace for user
+    /// `SCHEMA_UPLOAD`s). Derived from the qname's `namespace:name`
+    /// prefix — every concrete extractor is constructed with its qname,
+    /// so no separate field is needed. The LLM tier reads this to scope
+    /// selection to a memory's own namespace: a namespace's own LLM
+    /// extractor replaces the system default for that namespace's
+    /// memories, which both kills the double-LLM cost and stops one
+    /// tenant's extractor running over another's rows.
+    fn namespace(&self) -> &str {
+        self.name()
+            .split_once(':')
+            .map_or(SYSTEM_NAMESPACE, |(ns, _)| ns)
+    }
+
+    /// Whether this extractor fires for `mem` on the ENCODE path, given
+    /// its declared `trigger`. The default is unconditional [`Run`] —
+    /// an extractor without a trigger (and the pattern/classifier tiers,
+    /// which don't honor triggers) always runs. The LLM tier overrides
+    /// this to evaluate its `on encode where <cond>` clause and to stay
+    /// inert for non-encode triggers (`on demand`, `periodic`,
+    /// `on schema_change`).
+    ///
+    /// [`Run`]: TriggerDecision::Run
+    fn encode_trigger_decision(&self, _mem: &Memory) -> TriggerDecision {
+        TriggerDecision::Run
+    }
     /// Run over `mem`. Returns a populated [`ExtractionResult`]
     /// including `started_at` / `completed_at` timestamps; the
     /// caller writes the audit row from these.
@@ -160,13 +198,24 @@ pub struct ExtractionContext<'a> {
     /// means context-free extraction. Pattern + classifier tiers
     /// ignore this field.
     pub extractor_context: Option<&'a HashMap<MemoryId, ExtractorContext>>,
-    /// The active schema's declared predicates, pre-rendered as a prompt
-    /// block (`brain_metadata::render_declared_predicates_block`). The LLM
-    /// tier substitutes this into its `{DECLARED_PREDICATES}` placeholder so
-    /// its closed vocabulary tracks the active schema (system core + user
-    /// `SCHEMA_UPLOAD`) at runtime. `None` = no block injected (the
-    /// placeholder renders empty); pattern + classifier tiers ignore it.
-    pub declared_predicates: Option<&'a str>,
+    /// The active schema's declared entity types, pre-rendered as a prompt
+    /// block (`brain_metadata::render_declared_entity_types_block`): one
+    /// `- brain:<Name>` bullet per active type. The LLM tier substitutes
+    /// this into its `{DECLARED_ENTITY_TYPES}` placeholder so its entity-type
+    /// vocabulary tracks the active schema (system core + user
+    /// `SCHEMA_UPLOAD`) at runtime. Batch-level (same for every memory).
+    /// `None` = no block injected (the placeholder renders empty); pattern +
+    /// classifier tiers ignore it.
+    pub declared_entity_types: Option<&'a str>,
+    /// Per-memory candidate-predicate blocks: for each memory id, the top-K
+    /// existing `brain:` predicates nearest that memory's text, pre-rendered
+    /// as `- brain:<name>` bullets. The LLM tier looks up its memory here and
+    /// substitutes the block into `{CANDIDATE_PREDICATES}` so it reuses this
+    /// DB's real relation vocabulary instead of coining a near-duplicate.
+    /// Unlike the batch-level schema blocks this is per-memory (it depends on
+    /// the memory-text embedding). `None`, or an absent memory id, injects an
+    /// empty block; pattern + classifier tiers ignore it.
+    pub candidate_predicates: Option<&'a HashMap<MemoryId, String>>,
     /// The active schema's declared statement kinds, pre-rendered as a
     /// prompt block (`brain_metadata::render_declared_kinds_block`): the
     /// six builtin kinds plus any user-declared ones. The LLM tier

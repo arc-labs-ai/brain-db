@@ -163,6 +163,7 @@ async fn create_person(
             aliases,
             attributes_blob: Vec::new(),
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;
@@ -215,7 +216,10 @@ async fn merge_and_unmerge_round_trip() {
     let (_, body) = round_trip(
         &mut client,
         7,
-        RequestBody::EntityGet(EntityGetRequest { entity_id: alyss }),
+        RequestBody::EntityGet(EntityGetRequest {
+            entity_id: alyss,
+            act_as: None,
+        }),
     )
     .await;
     match body {
@@ -231,7 +235,10 @@ async fn merge_and_unmerge_round_trip() {
     let (_, body) = round_trip(
         &mut client,
         9,
-        RequestBody::EntityGet(EntityGetRequest { entity_id: alice }),
+        RequestBody::EntityGet(EntityGetRequest {
+            entity_id: alice,
+            act_as: None,
+        }),
     )
     .await;
     match body {
@@ -270,7 +277,10 @@ async fn merge_and_unmerge_round_trip() {
     let (_, body) = round_trip(
         &mut client,
         13,
-        RequestBody::EntityGet(EntityGetRequest { entity_id: alyss }),
+        RequestBody::EntityGet(EntityGetRequest {
+            entity_id: alyss,
+            act_as: None,
+        }),
     )
     .await;
     match body {
@@ -285,7 +295,10 @@ async fn merge_and_unmerge_round_trip() {
     let (_, body) = round_trip(
         &mut client,
         15,
-        RequestBody::EntityGet(EntityGetRequest { entity_id: alice }),
+        RequestBody::EntityGet(EntityGetRequest {
+            entity_id: alice,
+            act_as: None,
+        }),
     )
     .await;
     match body {
@@ -393,7 +406,10 @@ async fn tombstone_then_get_shows_flag() {
     let (_, body) = round_trip(
         &mut client,
         5,
-        RequestBody::EntityGet(EntityGetRequest { entity_id: alice }),
+        RequestBody::EntityGet(EntityGetRequest {
+            entity_id: alice,
+            act_as: None,
+        }),
     )
     .await;
     match body {
@@ -425,6 +441,7 @@ async fn resolve_exact_match_via_canonical_name() {
             entity_type_hint: PERSON_TYPE_ID,
             allow_create: false,
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;
@@ -461,6 +478,7 @@ async fn resolve_unknown_returns_not_found() {
             entity_type_hint: PERSON_TYPE_ID,
             allow_create: false,
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;
@@ -497,6 +515,7 @@ async fn list_returns_created_entities() {
             include_merged: false,
             limit: 100,
             cursor: Vec::new(),
+            act_as: None,
         }),
     )
     .await;
@@ -541,6 +560,7 @@ async fn list_with_name_prefix_filters() {
             include_merged: false,
             limit: 100,
             cursor: Vec::new(),
+            act_as: None,
         }),
     )
     .await;
@@ -576,6 +596,7 @@ async fn list_cursor_rejected_in_v1() {
             include_merged: false,
             limit: 100,
             cursor: vec![0xAB, 0xCD],
+            act_as: None,
         }),
     )
     .await;

@@ -863,6 +863,54 @@ mod tests {
     }
 
     #[test]
+    fn open_vocab_relation_accumulates_as_set() {
+        // The extraction apply path mints open-vocab relation types via
+        // `relation_type_intern_or_get`, which defaults to ManyToMany. A
+        // subject linked to several distinct places (e.g. several `camped_at`
+        // sites) must therefore yield several CURRENT rows — none superseded —
+        // so both enumerate and count read off the same live set.
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "camper");
+        let p1 = make_entity(&mut db, "lake");
+        let p2 = make_entity(&mut db, "ridge");
+        let p3 = make_entity(&mut db, "valley");
+
+        let t = {
+            let wtxn = db.write_txn().unwrap();
+            let t = crate::relation::types::relation_type_intern_or_get(
+                &wtxn,
+                "brain",
+                "camped_at",
+                0,
+                1,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+            t
+        };
+
+        for (lsn, place) in [p1, p2, p3].into_iter().enumerate() {
+            let r = fresh_rel(t, subj, place, false);
+            let wtxn = db.write_txn().unwrap();
+            relation_create(&wtxn, test_scope(), &r, lsn as u64).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let filter = RelationListFilter {
+            current_only: true,
+            ..Default::default()
+        };
+        let current = relation_list_from(&rtxn, test_scope(), subj, &filter).unwrap();
+        // All three places remain current — enumerate + count both work.
+        assert_eq!(current.len(), 3);
+        let tos: Vec<_> = current.iter().map(|r| r.to_entity).collect();
+        assert!(tos.contains(&p1));
+        assert!(tos.contains(&p2));
+        assert!(tos.contains(&p3));
+    }
+
+    #[test]
     fn tombstone_drops_from_current_listing() {
         let (_dir, mut db) = open_db();
         let a = make_entity(&mut db, "ta");

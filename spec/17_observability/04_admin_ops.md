@@ -324,6 +324,62 @@ curl -s -X DELETE http://127.0.0.1:9092/v1/api-keys/<key-id> \
   -H "Authorization: Bearer $BRAIN_ADMIN_TOKEN"
 ```
 
+#### The `ACT_AS` permission and the `may_act` allowlist
+
+`permissions` may include `"ACT_AS"` — the service-principal grant that lets a
+key run data-plane ops **on behalf of another identity** via the per-request
+`act_as` field (defined in
+[`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md)
+§"Per-request identity (`act_as`)"; backed by the permission bit
+`ACT_AS = 1 << 6`). It is held only by a trusted service principal — an edge or
+gateway — never a normal agent key.
+
+An `ACT_AS` key MUST carry a **`may_act` allowlist**: the set of namespaces the
+principal may impersonate within. It is stored as a field on the key's row in
+the `api_keys` table (alongside `namespace`, `agent`, `permissions`), and Brain
+honors an `act_as` request **only** when the target namespace is in this
+allowlist. A principal can never act as a namespace outside its `may_act` set,
+and the mint never crosses its own namespace boundary — cross-tenant isolation
+stays absolute (`OQ-V2-4`). K8s's unbounded impersonation is a documented
+God-credential; the `may_act` allowlist is the bound that avoids inheriting it.
+
+A single **`"*"` entry** is the **wildcard grant**: the principal may act as
+*any* namespace. This is the trusted multi-tenant front-door case — a
+gateway/edge that fronts every tenant cannot enumerate an allowlist that grows
+with each new signup, so it holds `["*"]` and Brain admits any target namespace
+(exactly as a fixed allowlist admits its named members). Named entries and the
+wildcard compose: `["*"]` grants all, `["acme", "globex"]` grants those two.
+The wildcard is the deliberate, auditable escape hatch for a front-door
+principal; it does **not** relax the per-request effective-identity isolation —
+each `act_as` op still runs strictly as its own `(namespace, agent)`, and the
+dual-principal audit records that a `"*"` service key performed it. Grant `"*"`
+only to a genuinely trusted service principal (mTLS/private transport, per
+`R6`), never to a tenant key.
+
+```jsonc
+// Mint an edge/gateway service principal that may act for two named tenants:
+{
+  "namespace": "edge",             // the principal's own home namespace
+  "agent": "arc-gateway",
+  "permissions": ["encode", "recall", "forget", "ACT_AS"],
+  "may_act": ["acme", "globex"]    // the namespaces it may impersonate within
+}
+
+// Or a front-door principal that may act for ANY tenant (multi-tenant SaaS):
+{
+  "namespace": "edge",
+  "agent": "arc-gateway",
+  "permissions": ["encode", "recall", "forget", "ACT_AS"],
+  "may_act": ["*"]                 // wildcard: any namespace, resolved per request
+}
+```
+
+**Observability.** Emit and track `act_as` ops per
+`(service_principal → target namespace)`. A sudden fan-out — one principal
+acting across many namespaces, or across namespaces it rarely touches — is the
+signature of a compromised edge fanning across tenants; alert on it. This is the
+analogue of Kubernetes impersonation auditing.
+
 ### 12.1 Scope-bound API keys
 
 Authentication is **mandatory** on every data-plane connection, and identity is derived 100% from the key. There is no anonymous mode, no default agent, and no default namespace. The server reads the connection's effective `(namespace, agent, permissions)` — plus a non-authoritative `user` audit tag — from the key resolved at AUTH; it never trusts a client-supplied `agent_id` or `namespace` on the wire. A connection with no key, an unresolvable key, or a revoked key is rejected at AUTH (`Unauthenticated`).

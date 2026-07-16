@@ -341,6 +341,7 @@ pub enum ErrorCodeWire {
     PermissionDenied = 0x0030,
     AdminPermissionRequired = 0x0031,
     WrongShard = 0x0032,
+    ActAsDenied = 0x0033,
     // Validation
     InvalidArgument = 0x0040,
     MissingRequiredField = 0x0041,
@@ -433,6 +434,7 @@ impl From<ErrorCode> for ErrorCodeWire {
             ErrorCode::PermissionDenied => Self::PermissionDenied,
             ErrorCode::AdminPermissionRequired => Self::AdminPermissionRequired,
             ErrorCode::WrongShard => Self::WrongShard,
+            ErrorCode::ActAsDenied => Self::ActAsDenied,
             ErrorCode::InvalidArgument => Self::InvalidArgument,
             ErrorCode::MissingRequiredField => Self::MissingRequiredField,
             ErrorCode::TextTooLarge => Self::TextTooLarge,
@@ -519,6 +521,7 @@ impl From<ErrorCodeWire> for ErrorCode {
             ErrorCodeWire::PermissionDenied => Self::PermissionDenied,
             ErrorCodeWire::AdminPermissionRequired => Self::AdminPermissionRequired,
             ErrorCodeWire::WrongShard => Self::WrongShard,
+            ErrorCodeWire::ActAsDenied => Self::ActAsDenied,
             ErrorCodeWire::InvalidArgument => Self::InvalidArgument,
             ErrorCodeWire::MissingRequiredField => Self::MissingRequiredField,
             ErrorCodeWire::TextTooLarge => Self::TextTooLarge,

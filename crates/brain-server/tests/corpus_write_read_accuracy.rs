@@ -226,6 +226,8 @@ async fn encode_round_trip(
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
+        act_as: None,
+        trace: false,
     };
     send_frame(
         client,
@@ -259,6 +261,7 @@ async fn encode_round_trip(
 /// a `RECALL_RESP` and returns the decoded frame.
 async fn recall(client: &mut TcpStream, stream_id: u32, cue: &str) -> RecallResponseFrame {
     let req = RecallRequest {
+        trace: false,
         cue_text: cue.into(),
         // Empty subject: Brain resolves subject + relation from the cue
         // alone (the read-path mandate). First-person cues bind to the
@@ -279,8 +282,7 @@ async fn recall(client: &mut TcpStream, stream_id: u32, cue: &str) -> RecallResp
         txn_id: None,
         // Empty + include_other_agents=false ⇒ server scopes to the
         // calling connection's agent (the [7;16] write agent).
-        agent_filter: Vec::new(),
-        include_other_agents: false,
+        act_as: None,
     };
     send_frame(
         client,

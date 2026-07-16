@@ -1,0 +1,50 @@
+{
+  "observation": {
+    "ByText": "the cat sat"
+  },
+  "depth": 3,
+  "confidence_threshold": 0.5,
+  "context_filter": null,
+  "max_inferences": 5,
+  "budget_wall_time_ms": 1000,
+  "request_id": [
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17
+  ],
+  "txn_id": null,
+  "act_as": {
+    "namespace": "tenant-acme",
+    "agent_id": [
+      34,
+      34,
+      34,
+      34,
+      34,
+      34,
+      34,
+      34,
+      34,
+      34,
+      34,
+      34,
+      34,
+      34,
+      34,
+      34
+    ]
+  }
+}
