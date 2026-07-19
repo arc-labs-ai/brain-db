@@ -77,6 +77,34 @@ Because an entity can be reached on more than one page, the response guarantees
 may repeat across pages, and carries a stable 16-byte id so the client dedups by
 id. It never crosses the `(namespace, agent)` boundary.
 
+### MEMORY_INSPECT — one memory's write story, not search
+
+`MEMORY_INSPECT` (`0x0028`) is a single-memory point read: given one
+`memory_id`, it returns that memory's text plus the durable **write-artifact
+bundle** — the per-stage record of what the write built. It does **not** run
+the retrieval pipeline; it is a keyed lookup, not a query. Where RECALL answers
+*"what is relevant"* and MEMORY_LIST answers *"what is stored"*, MEMORY_INSPECT
+answers *"how was this one memory built"*.
+
+The response carries `found`, the `memory_id`, the `text`, and an
+`EncodeStageArtifact` bundle with the same shape the live ENCODE trace uses for
+its per-stage `artifact`: the embedding `vector`, the stored `record` (kind,
+salience, times, dims, text length), the analyzed `keyword_fields` (the exact
+terms the `memory_text` index matches on), the generated `hype_questions`, and
+the typed `graph` (nodes + edges). The bundle is persisted in the
+`memory_artifacts` table (§10.9a) and populated incrementally: the sync fields
+(vector, record, keywords) are present the instant the write acks; the graph and
+HyPE fields fill in as the async workers settle. A memory whose async stages
+have not yet run therefore returns `found = true` with those fields still empty
+— the same "how far along is this write" signal the ENCODE trace's drain window
+exposes, but readable for any memory at any later time.
+
+Scope is enforced by the memory's own `(namespace, agent)` owner: a
+`memory_id` owned by another tenant reads as `found = false`, indistinguishable
+from a missing one — an id never leaks cross-tenant. Requires the `RECALL`
+capability bit. A hard-forgotten or reclaimed memory returns `found = false`;
+its bundle is purged with the memory (§10.9a).
+
 #### In-transaction read-your-writes overlay
 
 When `req.txn_id` is set, the txn's pending ENCODE buffer is overlaid on the committed retrieval result before the response is built:

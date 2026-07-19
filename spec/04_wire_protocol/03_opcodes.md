@@ -40,6 +40,8 @@ The opcode is a big-endian `u16` in the frame header (bytes 5–6). The high byt
 | 0x00A6 | `UNLINK_RESP` | S → C | Unlink acknowledgment |
 | 0x0027 | `MEMORY_LIST_REQ` | C → S | Paginated enumeration of the caller's memories (non-ranked) |
 | 0x00A7 | `MEMORY_LIST_RESP` | S → C | Enumeration page + keyset cursor |
+| 0x0028 | `MEMORY_INSPECT_REQ` | C → S | Fetch one memory's durable write-artifact bundle |
+| 0x00A8 | `MEMORY_INSPECT_RESP` | S → C | Text + per-stage artifact bundle (vector, record, keywords, HyPE, graph) |
 | 0x002A | `ENCODE_VECTOR_DIRECT_REQ` | C → S | Power-user encode with pre-supplied vector |
 | 0x00AA | `ENCODE_VECTOR_DIRECT_RESP` | S → C | (Same response shape as ENCODE_RESP) |
 

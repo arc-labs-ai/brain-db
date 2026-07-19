@@ -43,16 +43,19 @@ use brain_protocol::envelope::response::{ErrorCategoryWire, ErrorCodeWire};
 use brain_protocol::error::{ErrorCategory, ErrorCode};
 use brain_protocol::ops::capabilities::{Capabilities, GetCapabilitiesResponse};
 use brain_protocol::{
-    ActAs, AnswerKindWire, EdgeKindWire, EncodeRequest, EncodeResponse, EncodeTrace,
-    EncodeTraceArtifacts, EncodeTraceDedup, EncodeTraceEntity, EncodeTraceIndex,
-    EncodeTraceRelation, EncodeTraceStage, EncodeTraceStageStatus, EncodeTraceStatement,
+    ActAs, AnswerKindWire, EdgeKindWire, EncodeGraphEdge, EncodeGraphNode, EncodeRequest,
+    EncodeResponse, EncodeStageArtifact, EncodeStageGraph, EncodeStageKeywordField,
+    EncodeStageRecord, EncodeTrace, EncodeTraceArtifacts, EncodeTraceDedup, EncodeTraceEntity,
+    EncodeTraceIndex, EncodeTraceRelation, EncodeTraceStage, EncodeTraceStageStatus,
+    EncodeTraceStatement,
     EncodeVectorDirectRequest, EntityCreateRequest, EntityCreateResponse, EntityGetResponse,
     EntityListItem, EntityListResponseFrame, EntityResolveResponse, EntityView, EventType,
     EvidenceRefWire, ExtractorListItem, ExtractorListRequest, ExtractorListResponseFrame,
     ForgetMode, ForgetRequest, ForgetResponse, Frame, GraphEdge, GraphFetchRequest,
     GraphFetchResponseFrame, GraphNode, InferenceKind, InferenceStep, LinkResponse,
     MaterializeProceduralRequest, MaterializeProceduralResponse, MemoryKindWire, MemoryListDirWire,
-    MemoryListItem, MemoryListRequest, MemoryListResponseFrame, MemoryListSortWire,
+    MemoryInspectRequest, MemoryInspectResponse, MemoryListItem, MemoryListRequest,
+    MemoryListResponseFrame, MemoryListSortWire,
     MemoryListTimeAxisWire, ObservationInput, Opcode, PlanBudget, PlanRequest, PlanResponseFrame,
     PlanState, PlanStatus, PlanStep, PongResponse, ReasonRequest, ReasonResponseFrame,
     ReasonStatus, RecallRequest, RecallResponseFrame, RecallTrace, RecallTraceFilterChain,
@@ -278,7 +281,8 @@ fn sample_encode() -> EncodeRequest {
         txn_id: None,
         occurred_at_unix_nanos: Some(1_700_000_000_000_000_000),
         act_as: None,
-        trace: false,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     }
 }
 
@@ -295,7 +299,8 @@ fn sample_encode_act_as() -> EncodeRequest {
             namespace: "tenant-acme".into(),
             agent_id: AGENT,
         }),
-        trace: false,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     }
 }
 
@@ -345,36 +350,90 @@ fn sample_encode_response_trace() -> EncodeResponse {
                 status: EncodeTraceStageStatus::Ok,
                 latency_us: 3,
                 detail: String::new(),
+                artifact: None,
             },
             EncodeTraceStage {
                 name: "embed".into(),
                 status: EncodeTraceStageStatus::Ok,
                 latency_us: 1200,
                 detail: "dim=384".into(),
+                artifact: Some(EncodeStageArtifact {
+                    vector: vec![0.1, -0.2, 0.3, 0.4],
+                    ..Default::default()
+                }),
             },
             EncodeTraceStage {
                 name: "reserve".into(),
                 status: EncodeTraceStageStatus::Ok,
                 latency_us: 5,
                 detail: String::new(),
+                artifact: None,
             },
             EncodeTraceStage {
                 name: "persist".into(),
                 status: EncodeTraceStageStatus::Ok,
                 latency_us: 800,
                 detail: "lsn=42".into(),
+                artifact: Some(EncodeStageArtifact {
+                    record: Some(EncodeStageRecord {
+                        memory_id: mid().to_be_bytes(),
+                        kind: 0,
+                        salience: 0.5,
+                        created_at_unix_nanos: 1_700_000_000_000_000_000,
+                        occurred_at_unix_nanos: 0,
+                        vector_dim: 384,
+                        text_len: 42,
+                        lsn: 42,
+                    }),
+                    ..Default::default()
+                }),
             },
             EncodeTraceStage {
                 name: "extractor".into(),
                 status: EncodeTraceStageStatus::Ok,
                 latency_us: 42_000,
                 detail: "entities=2 statements=1 relations=0 audit=Succeeded".into(),
+                artifact: Some(EncodeStageArtifact {
+                    hype_questions: vec![
+                        "Who works on brain?".into(),
+                        "What does niraj work on?".into(),
+                    ],
+                    keyword_fields: vec![EncodeStageKeywordField {
+                        field: "memory_text".into(),
+                        terms: vec!["niraj".into(), "brain".into(), "works".into()],
+                    }],
+                    graph: Some(EncodeStageGraph {
+                        nodes: vec![
+                            EncodeGraphNode {
+                                id: EID,
+                                name: "niraj".into(),
+                                kind: "entity".into(),
+                                type_qname: "org:person".into(),
+                            },
+                            EncodeGraphNode {
+                                id: mid().to_be_bytes(),
+                                name: "brain".into(),
+                                kind: "entity".into(),
+                                type_qname: "org:project".into(),
+                            },
+                        ],
+                        edges: vec![EncodeGraphEdge {
+                            source: EID,
+                            target: mid().to_be_bytes(),
+                            predicate: "org:works_on".into(),
+                            kind: "statement".into(),
+                            confidence: 0.9,
+                        }],
+                    }),
+                    ..Default::default()
+                }),
             },
             EncodeTraceStage {
                 name: "auto_edge".into(),
                 status: EncodeTraceStageStatus::Timeout,
                 latency_us: 0,
                 detail: "stage did not complete within the trace wait window".into(),
+                artifact: None,
             },
         ],
         artifacts: EncodeTraceArtifacts {
@@ -643,6 +702,54 @@ fn sample_extractor_list() -> ExtractorListResponseFrame {
     }
 }
 
+fn sample_memory_inspect_request() -> MemoryInspectRequest {
+    MemoryInspectRequest {
+        memory_id: mid().to_be_bytes(),
+        act_as: None,
+    }
+}
+
+fn sample_memory_inspect_response() -> MemoryInspectResponse {
+    MemoryInspectResponse {
+        found: true,
+        memory_id: mid().to_be_bytes(),
+        text: "niraj works on brain".into(),
+        artifact: EncodeStageArtifact {
+            vector: vec![0.1, -0.2, 0.3, 0.4],
+            record: Some(EncodeStageRecord {
+                memory_id: mid().to_be_bytes(),
+                kind: 0,
+                salience: 0.5,
+                created_at_unix_nanos: 1_700_000_000_000_000_000,
+                occurred_at_unix_nanos: 0,
+                vector_dim: 384,
+                text_len: 20,
+                lsn: 42,
+            }),
+            hype_questions: vec!["Who works on brain?".into()],
+            keyword_fields: vec![EncodeStageKeywordField {
+                field: "memory_text".into(),
+                terms: vec!["niraj".into(), "brain".into(), "works".into()],
+            }],
+            graph: Some(EncodeStageGraph {
+                nodes: vec![EncodeGraphNode {
+                    id: EID,
+                    name: "niraj".into(),
+                    kind: "entity".into(),
+                    type_qname: "org:person".into(),
+                }],
+                edges: vec![EncodeGraphEdge {
+                    source: EID,
+                    target: mid().to_be_bytes(),
+                    predicate: "org:works_on".into(),
+                    kind: "statement".into(),
+                    confidence: 0.9,
+                }],
+            }),
+        },
+    }
+}
+
 fn sample_memory_list_request() -> MemoryListRequest {
     MemoryListRequest {
         sort: MemoryListSortWire::Created,
@@ -779,13 +886,25 @@ fn corpus() -> Vec<Case> {
     ));
     // ENCODE opting into the synchronous write-analysis trace.
     let encode_trace = EncodeRequest {
-        trace: true,
+        wait: brain_protocol::WaitMode::Derived,
         ..sample_encode()
     };
     cases.push(req_case(
         "req_encode_trace",
         RequestBody::Encode(encode_trace.clone()),
         &encode_trace,
+    ));
+    // ENCODE opting out of content dedup. `allow_duplicates` is skip-when-false,
+    // so this is the only fixture that carries the key on the wire — it pins the
+    // opt-out path so an SDK that forgets to emit the flag drifts loudly.
+    let encode_allow_dups = EncodeRequest {
+        allow_duplicates: true,
+        ..sample_encode()
+    };
+    cases.push(req_case(
+        "req_encode_allow_duplicates",
+        RequestBody::Encode(encode_allow_dups.clone()),
+        &encode_allow_dups,
     ));
     // EncodeVectorDirect's JSON mirror carries the vector field; its wire
     // payload is CBOR (without vector) + a trailing LE-f32 section appended by
@@ -993,6 +1112,13 @@ fn corpus() -> Vec<Case> {
         "req_memory_list",
         RequestBody::MemoryList(sample_memory_list_request()),
         &sample_memory_list_request(),
+    ));
+
+    // ---- Per-memory inspection (MEMORY_INSPECT) ----
+    cases.push(req_case(
+        "req_memory_inspect",
+        RequestBody::MemoryInspect(sample_memory_inspect_request()),
+        &sample_memory_inspect_request(),
     ));
 
     // ---- Typed-graph export (GRAPH_FETCH) ----
@@ -1219,6 +1345,11 @@ fn corpus() -> Vec<Case> {
         "resp_memory_list",
         ResponseBody::MemoryList(sample_memory_list_response()),
         &sample_memory_list_response(),
+    ));
+    cases.push(resp_case(
+        "resp_memory_inspect",
+        ResponseBody::MemoryInspect(sample_memory_inspect_response()),
+        &sample_memory_inspect_response(),
     ));
 
     cases.push(resp_case(

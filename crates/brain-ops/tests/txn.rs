@@ -102,7 +102,8 @@ fn encode_req(request_id: [u8; 16], text: &str, txn: Option<[u8; 16]>) -> Encode
         txn_id: txn,
         occurred_at_unix_nanos: None,
         act_as: None,
-        trace: false,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     }
 }
 

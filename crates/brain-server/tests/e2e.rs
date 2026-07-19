@@ -167,7 +167,8 @@ async fn encode_round_trip(
         txn_id: None,
         occurred_at_unix_nanos: None,
         act_as: None,
-        trace: false,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     };
     send_frame(
         client,

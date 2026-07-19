@@ -80,6 +80,7 @@ pub enum ResponseBody {
     /// Paginated enumeration page. Single-frame in v1; a later cut may
     /// split into per-batch streaming.
     MemoryList(MemoryListResponseFrame),
+    MemoryInspect(MemoryInspectResponse),
     /// Paginated typed-graph export page (nodes + edges). Single-frame in
     /// v1; nodes/edges may repeat across pages (dedup by id).
     GraphFetch(GraphFetchResponseFrame),
@@ -181,6 +182,7 @@ impl ResponseBody {
             Self::Link(_) => Opcode::LinkResp,
             Self::Unlink(_) => Opcode::UnlinkResp,
             Self::MemoryList(_) => Opcode::MemoryListResp,
+            Self::MemoryInspect(_) => Opcode::MemoryInspectResp,
             Self::GraphFetch(_) => Opcode::GraphFetchResp,
             Self::SubscribeEvent(_) => Opcode::SubscribeEvent,
             Self::Unsubscribe(_) => Opcode::UnsubscribeResp,
@@ -281,6 +283,7 @@ impl ResponseBody {
             Self::Link(r) => to_cbor_bytes(r),
             Self::Unlink(r) => to_cbor_bytes(r),
             Self::MemoryList(r) => to_cbor_bytes(r),
+            Self::MemoryInspect(r) => to_cbor_bytes(r),
             Self::GraphFetch(r) => to_cbor_bytes(r),
             Self::SubscribeEvent(r) => to_cbor_bytes(r),
             Self::Unsubscribe(r) => to_cbor_bytes(r),
@@ -356,6 +359,7 @@ impl ResponseBody {
             Opcode::LinkResp => Self::Link(from_cbor_bytes(bytes)?),
             Opcode::UnlinkResp => Self::Unlink(from_cbor_bytes(bytes)?),
             Opcode::MemoryListResp => Self::MemoryList(from_cbor_bytes(bytes)?),
+            Opcode::MemoryInspectResp => Self::MemoryInspect(from_cbor_bytes(bytes)?),
             Opcode::GraphFetchResp => Self::GraphFetch(from_cbor_bytes(bytes)?),
             Opcode::SubscribeEvent => Self::SubscribeEvent(from_cbor_bytes(bytes)?),
             Opcode::UnsubscribeResp => Self::Unsubscribe(from_cbor_bytes(bytes)?),

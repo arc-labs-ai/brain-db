@@ -336,7 +336,8 @@ fn forget_stamps_tombstoned_at_unix_nanos() {
             txn_id: None,
             occurred_at_unix_nanos: None,
             act_as: None,
-            trace: false,
+            wait: brain_protocol::WaitMode::Ack,
+            allow_duplicates: false,
         };
         let memory_id = match single_body(
             dispatch(
@@ -384,7 +385,8 @@ fn forget_replay_does_not_overwrite_stamp() {
             txn_id: None,
             occurred_at_unix_nanos: None,
             act_as: None,
-            trace: false,
+            wait: brain_protocol::WaitMode::Ack,
+            allow_duplicates: false,
         };
         let memory_id = match single_body(
             dispatch(

@@ -8,6 +8,7 @@ The tables in the metadata store. Each table is a typed B-tree maintained by red
 |---|---|---|---|
 | `memories` | `MemoryId` | `MemoryMetadata` | Per-memory metadata |
 | `texts` | `MemoryId` | `Vec<u8>` | Memory text content (UTF-8) |
+| `memory_artifacts` | `MemoryId` | `&str` (JSON) | Durable per-memory write-artifact bundle for `MEMORY_INSPECT` (§9a) |
 | `edges_out` | `(MemoryId, EdgeKind, MemoryId)` | `EdgeData` | Outgoing edges, indexed by (source, kind, target) |
 | `edges_in` | `(MemoryId, EdgeKind, MemoryId)` | `EdgeData` | Incoming edges, indexed by (target, kind, source) |
 | `contexts` | `ContextId` | `ContextMetadata` | Context records |
@@ -74,6 +75,12 @@ Values are encoded with **rkyv** (Brain's internal on-disk storage encoding). rk
 
 For variable-length values (text, edge lists), rkyv handles the indirection via offsets within the value blob.
 
+Two tables are exceptions, by design: `texts` stores raw UTF-8 bytes, and
+`memory_artifacts` stores a JSON string (§9a). Both are read-mostly, human-facing
+payloads whose consumers want the plain form, not a zero-copy typed view — the
+inspection bundle in particular is denormalized precisely so it can be handed to
+a UI as-is.
+
 ## 6. Schema evolution
 
 Each table has a format version embedded in its metadata. When Brain opens the metadata store:
@@ -112,6 +119,45 @@ Text is read on demand:
 - For migration (re-embedding from the original text).
 
 Detailed in [`03_substrate_tables.md`](03_substrate_tables.md) § Text Storage.
+
+## 9a. The memory_artifacts table
+
+The `memory_artifacts` table holds a durable, denormalized **write-artifact
+bundle** per memory — the friendly, per-stage view `MEMORY_INSPECT` returns for
+*any* memory, not just the one just written via the live ENCODE trace.
+
+- Key: MemoryId.
+- Value: JSON text of the wire `EncodeStageArtifact` — `{ vector, record,
+  keyword_fields, hype_questions, graph }`.
+
+The bundle exists because most stages' derived data is otherwise discarded
+once consumed: the embedding lives in the arena (not readable as a friendly
+vector), the analyzed lexical terms and the HyPE question *text* are dropped
+after indexing/embedding (only their tokens/vectors survive), and the graph is
+scattered across the entity/statement/relation tables. `memory_artifacts` keeps
+one renderable copy.
+
+**Incremental population, one row, no lost update.** Several producers write
+different portions at different times, each via a read-modify-write inside a
+single redb write txn (redb's exclusive write lock serializes them):
+
+- **Sync**, on the ENCODE ack txn (`apply_upsert_memory`): `vector`, `record`,
+  and `keyword_fields` (the exact terms the shared `memory_text` analyzer
+  produces). Committed atomically with the memory row — no extra transaction on
+  the ack path.
+- **Async**, off the ack path: the extractor worker merges `graph` after its
+  typed-graph commit (read back through the same enrichment resolver RECALL
+  uses); the HyPE worker merges `hype_questions`.
+
+So `MEMORY_INSPECT` returns `found = true` with the sync fields immediately,
+and the graph / HyPE fields fill in as the workers settle.
+
+**Lifecycle.** The bundle carries the vector + derived graph — recoverable
+information about the memory — so it is purged alongside the text on hard
+FORGET, and alongside the memory row on slot reclamation (soft-forget after
+grace). `record.lsn` is `0` in the durable bundle (the WAL position isn't
+assigned until the ENCODE `submit` append); the live ENCODE trace's `persist`
+stage carries the real LSN.
 
 ## 10. Context lookup
 
@@ -155,7 +201,7 @@ The table maps `slot_id → current_version`. Looked up:
 
 In the v1 spec:
 
-- 16 always-present tables (the 13 original substrate tables + the two namespace-registry tables + the per-tenant memory timeline index).
+- 17 always-present tables (the 13 original substrate tables + the two namespace-registry tables + the per-tenant memory timeline index + the `memory_artifacts` inspection bundle).
 
 Adding a table is a schema change — it requires a format version bump in the metadata store. Tables are not added lightly.
 

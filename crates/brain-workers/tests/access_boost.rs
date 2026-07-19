@@ -344,7 +344,8 @@ fn recall_fills_buffer_then_boost_worker_applies() {
             txn_id: None,
             occurred_at_unix_nanos: None,
             act_as: None,
-            trace: false,
+            wait: brain_protocol::WaitMode::Ack,
+            allow_duplicates: false,
         };
         let _ = dispatch(
             RequestBody::Encode(encode_req([1; 16], "alpha")),

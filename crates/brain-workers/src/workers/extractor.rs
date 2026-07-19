@@ -2350,6 +2350,25 @@ async fn apply_outcome(
         }
     }
 
+    // Merge the freshly-committed typed graph into this memory's durable
+    // write-artifact bundle (MEMORY_INSPECT), reading it back through the same
+    // enrichment resolver RECALL uses. Post-commit only, so the read sees the
+    // rows we just wrote. Gated on non-empty extraction so a memory that
+    // produced no graph costs no extra transaction; the sync bundle already
+    // holds vector + record. Best-effort: a failure is logged, never fatal —
+    // the durable graph itself already committed.
+    if counts.entities + counts.statements + counts.relations > 0 {
+        let metadata = ctx.ops.executor.metadata.as_ref();
+        if let Err(e) = brain_ops::memory_artifact::merge_graph_from_committed(metadata, memory_id) {
+            warn!(
+                target: "brain_workers::extractor",
+                memory_id = ?memory_id,
+                error = %e,
+                "artifact graph merge failed (durable graph is committed; bundle graph deferred)",
+            );
+        }
+    }
+
     Ok(ApplyOutcome {
         counts,
         status_byte,

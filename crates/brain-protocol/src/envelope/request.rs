@@ -81,6 +81,7 @@ pub enum RequestBody {
     Link(LinkRequest),
     Unlink(UnlinkRequest),
     MemoryList(MemoryListRequest),
+    MemoryInspect(MemoryInspectRequest),
     GraphFetch(GraphFetchRequest),
     Subscribe(SubscribeRequest),
     Unsubscribe(UnsubscribeRequest),
@@ -171,6 +172,7 @@ impl RequestBody {
             Self::Link(_) => Opcode::LinkReq,
             Self::Unlink(_) => Opcode::UnlinkReq,
             Self::MemoryList(_) => Opcode::MemoryListReq,
+            Self::MemoryInspect(_) => Opcode::MemoryInspectReq,
             Self::GraphFetch(_) => Opcode::GraphFetchReq,
             Self::Subscribe(_) => Opcode::SubscribeReq,
             Self::Unsubscribe(_) => Opcode::UnsubscribeReq,
@@ -251,6 +253,7 @@ impl RequestBody {
             Self::Link(r) => to_cbor_bytes(r),
             Self::Unlink(r) => to_cbor_bytes(r),
             Self::MemoryList(r) => to_cbor_bytes(r),
+            Self::MemoryInspect(r) => to_cbor_bytes(r),
             Self::GraphFetch(r) => to_cbor_bytes(r),
             Self::Subscribe(r) => to_cbor_bytes(r),
             Self::Unsubscribe(r) => to_cbor_bytes(r),
@@ -332,6 +335,7 @@ impl RequestBody {
             Opcode::LinkReq => Self::Link(from_cbor_bytes(bytes)?),
             Opcode::UnlinkReq => Self::Unlink(from_cbor_bytes(bytes)?),
             Opcode::MemoryListReq => Self::MemoryList(from_cbor_bytes(bytes)?),
+            Opcode::MemoryInspectReq => Self::MemoryInspect(from_cbor_bytes(bytes)?),
             Opcode::GraphFetchReq => Self::GraphFetch(from_cbor_bytes(bytes)?),
             Opcode::SubscribeReq => Self::Subscribe(from_cbor_bytes(bytes)?),
             Opcode::UnsubscribeReq => Self::Unsubscribe(from_cbor_bytes(bytes)?),
@@ -414,7 +418,7 @@ impl RequestBody {
 /// # Examples
 ///
 /// ```
-/// use brain_protocol::{act_as_of, RequestBody, EncodeRequest, ActAs};
+/// use brain_protocol::{act_as_of, RequestBody, EncodeRequest, ActAs, WaitMode};
 ///
 /// let no_override = RequestBody::Encode(EncodeRequest {
 ///     text: "hi".into(),
@@ -423,7 +427,8 @@ impl RequestBody {
 ///     txn_id: None,
 ///     occurred_at_unix_nanos: None,
 ///     act_as: None,
-///     trace: false,
+///     wait: WaitMode::Ack,
+///     allow_duplicates: false,
 /// });
 /// assert!(act_as_of(&no_override).is_none());
 ///
@@ -434,7 +439,8 @@ impl RequestBody {
 ///     txn_id: None,
 ///     occurred_at_unix_nanos: None,
 ///     act_as: Some(ActAs { namespace: "acme".into(), agent_id: [1; 16] }),
-///     trace: false,
+///     wait: WaitMode::Ack,
+///     allow_duplicates: false,
 /// });
 /// assert_eq!(act_as_of(&with_override).map(|a| a.namespace.as_str()), Some("acme"));
 /// ```
@@ -449,6 +455,7 @@ pub fn act_as_of(body: &RequestBody) -> Option<&ActAs> {
         RequestBody::Link(r) => r.act_as.as_ref(),
         RequestBody::Unlink(r) => r.act_as.as_ref(),
         RequestBody::MemoryList(r) => r.act_as.as_ref(),
+        RequestBody::MemoryInspect(r) => r.act_as.as_ref(),
         RequestBody::GraphFetch(r) => r.act_as.as_ref(),
         RequestBody::EntityCreate(r) => r.act_as.as_ref(),
         RequestBody::EntityGet(r) => r.act_as.as_ref(),
@@ -505,7 +512,8 @@ mod tests {
             txn_id: Some(sample_uuid(3)),
             occurred_at_unix_nanos: Some(1_700_000_000_000_000_000),
             act_as: None,
-            trace: false,
+            wait: WaitMode::Ack,
+            allow_duplicates: false,
         }));
     }
 
@@ -521,7 +529,8 @@ mod tests {
                 namespace: "acme".into(),
                 agent_id: sample_uuid(9),
             }),
-            trace: false,
+            wait: WaitMode::Ack,
+            allow_duplicates: false,
         }));
     }
 
@@ -851,7 +860,8 @@ mod tests {
             txn_id: None,
             occurred_at_unix_nanos: None,
             act_as: Some(selector.clone()),
-            trace: false,
+            wait: WaitMode::Ack,
+            allow_duplicates: false,
         });
         assert_eq!(act_as_of(&encode), Some(&selector));
 
@@ -1083,7 +1093,8 @@ mod tests {
             txn_id: None,
             occurred_at_unix_nanos: None,
             act_as: None,
-            trace: false,
+            wait: WaitMode::Ack,
+            allow_duplicates: false,
         });
         assert!(act_as_of(&encode).is_none());
 

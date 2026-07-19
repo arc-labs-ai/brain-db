@@ -93,8 +93,9 @@ pub fn plan_encode_inner(
             persistent_id: true,
         },
         estimated_cost_ms: estimated,
-        // Dedup is a DB policy, always on for text encode.
-        deduplicate: true,
+        // Dedup is a DB policy, on by default for text encode; the client can
+        // opt out per request to force a distinct memory.
+        deduplicate: !req.allow_duplicates,
     })
 }
 
@@ -178,7 +179,8 @@ mod tests {
             txn_id: None,
             occurred_at_unix_nanos: None,
             act_as: None,
-            trace: false,
+            wait: brain_protocol::ops::memory::WaitMode::Ack,
+            allow_duplicates: false,
         }
     }
 

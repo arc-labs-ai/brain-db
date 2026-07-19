@@ -542,6 +542,7 @@ dependencies = [
  "proptest",
  "redb",
  "rkyv",
+ "serde_json",
  "smallvec",
  "tantivy",
  "tempfile",

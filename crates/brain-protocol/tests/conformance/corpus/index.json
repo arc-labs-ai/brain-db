@@ -15,13 +15,19 @@
     "name": "req_encode",
     "opcode": "0x0020",
     "kind": "request",
-    "payload_len": 109
+    "payload_len": 102
   },
   {
     "name": "req_encode_trace",
     "opcode": "0x0020",
     "kind": "request",
-    "payload_len": 109
+    "payload_len": 108
+  },
+  {
+    "name": "req_encode_allow_duplicates",
+    "opcode": "0x0020",
+    "kind": "request",
+    "payload_len": 120
   },
   {
     "name": "req_encode_vector_direct",
@@ -57,7 +63,7 @@
     "name": "req_encode_act_as",
     "opcode": "0x0020",
     "kind": "request",
-    "payload_len": 163
+    "payload_len": 156
   },
   {
     "name": "req_plan_act_as",
@@ -114,6 +120,12 @@
     "payload_len": 155
   },
   {
+    "name": "req_memory_inspect",
+    "opcode": "0x0028",
+    "kind": "request",
+    "payload_len": 28
+  },
+  {
     "name": "req_graph_fetch",
     "opcode": "0x0163",
     "kind": "request",
@@ -147,7 +159,7 @@
     "name": "resp_encode_trace",
     "opcode": "0x00A0",
     "kind": "response",
-    "payload_len": 1048
+    "payload_len": 1624
   },
   {
     "name": "resp_recall",
@@ -238,6 +250,12 @@
     "opcode": "0x00A7",
     "kind": "response",
     "payload_len": 321
+  },
+  {
+    "name": "resp_memory_inspect",
+    "opcode": "0x00A8",
+    "kind": "response",
+    "payload_len": 523
   },
   {
     "name": "resp_graph_fetch",
@@ -393,7 +411,7 @@
     "name": "frame_encode",
     "opcode": "0x0020",
     "kind": "frame",
-    "payload_len": 141
+    "payload_len": 134
   },
   {
     "name": "frame_encode_vector_direct",

@@ -20,6 +20,7 @@ pub mod hype;
 pub mod idempotency;
 pub mod kind;
 pub mod memory;
+pub mod memory_artifacts;
 pub mod merge;
 pub mod merge_review_queue;
 pub mod model_fingerprint;

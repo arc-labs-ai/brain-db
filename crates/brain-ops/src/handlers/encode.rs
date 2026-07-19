@@ -18,9 +18,9 @@ use brain_metadata::tables::memory::MemoryMetadata;
 use brain_planner::plan_encode_inner;
 use brain_protocol::envelope::request::EncodeRequest;
 use brain_protocol::envelope::response::{
-    EncodeResponse, EncodeTrace, EncodeTraceArtifacts, EncodeTraceDedup, EncodeTraceEntity,
-    EncodeTraceIndex, EncodeTraceRelation, EncodeTraceStage, EncodeTraceStageStatus,
-    EncodeTraceStatement,
+    EncodeResponse, EncodeStageArtifact, EncodeStageGraph, EncodeStageRecord, EncodeTrace,
+    EncodeTraceArtifacts, EncodeTraceDedup, EncodeTraceEntity, EncodeTraceIndex,
+    EncodeTraceRelation, EncodeTraceStage, EncodeTraceStageStatus, EncodeTraceStatement,
 };
 use brain_protocol::StageKind;
 
@@ -53,16 +53,6 @@ const DEFAULT_KIND: MemoryKind = MemoryKind::Episodic;
 /// supplies a hint; the write router decides it.
 const DEFAULT_SALIENCE: f32 = 0.5;
 
-/// Router policy: the write path stores faithfully — it does NOT collapse
-/// distinct encodes that happen to share text. Exact request *replays* are
-/// already deduplicated by `request_id` (idempotency); two genuinely
-/// separate observations of the same text (e.g. the same fact re-stated at
-/// a different `occurred_at`) are distinct memories and must both persist.
-/// Redundancy across near-duplicate memories is reconciled asynchronously
-/// by the near-dup consolidation worker, not by dropping writes here. The
-/// DB owns this decision; the client cannot toggle it.
-const ROUTER_DEDUPLICATE: bool = false;
-
 #[tracing::instrument(name = "brain.encode", skip_all)]
 pub async fn handle_encode(
     mut req: EncodeRequest,
@@ -78,7 +68,10 @@ pub async fn handle_encode(
     // response. When unset every `.then(...)` below is `None`, so the hot
     // path allocates nothing and takes no timestamps — `trace = false` is
     // byte-identical to before.
-    let trace_enabled = req.trace;
+    // Write-completion mode: `Derived` blocks for async derivation + returns
+    // the full trace; `Ack` (default) returns after the durable sync ack. This
+    // is the single write knob (the `trace` bool is reads-only).
+    let trace_enabled = req.wait == brain_protocol::WaitMode::Derived;
     let pipeline_start = trace_enabled.then(Instant::now);
     let mut trace_stages: Vec<EncodeTraceStage> = Vec::new();
     // Subscribe to the stage bus BEFORE the write so no `StageCompleted`
@@ -98,6 +91,7 @@ pub async fn handle_encode(
             status: EncodeTraceStageStatus::Ok,
             latency_us: elapsed_us(start),
             detail: String::new(),
+            artifact: None,
         });
     }
     let salience = DEFAULT_SALIENCE;
@@ -137,20 +131,35 @@ pub async fn handle_encode(
         .embedder
         .embed(&req.text)
         .map_err(|e| OpError::ExecError(brain_planner::ExecError::EmbedFailed(e)))?;
+    // Captured before `vector`/`req.text` are moved into the write phase, so
+    // the persist stage's record artifact can report the stored dimensions.
+    let vector_dim = vector.len();
+    let text_len = req.text.len();
     if let Some(start) = t_embed {
+        // embed → the actual embedding this stage produced. Trace-only clone
+        // (the vector is moved into the write phase below); skipped entirely
+        // when `trace = false`.
         trace_stages.push(EncodeTraceStage {
             name: "embed".into(),
             status: EncodeTraceStageStatus::Ok,
             latency_us: elapsed_us(start),
             detail: format!("dim={}", vector.len()),
+            artifact: Some(EncodeStageArtifact {
+                vector: vector.to_vec(),
+                ..Default::default()
+            }),
         });
     }
     let content_hash = *blake3::hash(req.text.as_bytes()).as_bytes();
 
-    // 3. Dedup check — DB policy is always-on dedup. Look up
+    // Content dedup is on by default; the client can opt out per request
+    // (`allow_duplicates`) to force a distinct memory for byte-identical text.
+    let deduplicate = !req.allow_duplicates;
+
+    // 3. Dedup check — default policy is content dedup. Look up
     // (agent, context, content_hash). On hit, return the existing
     // memory id without submitting a Write.
-    if ROUTER_DEDUPLICATE {
+    if deduplicate {
         if let Some(existing) = lookup_fingerprint(ctx, content_hash, context_id)? {
             return Ok(EncodeResponse {
                 memory_id: existing.raw(),
@@ -187,6 +196,7 @@ pub async fn handle_encode(
             status: EncodeTraceStageStatus::Ok,
             latency_us: elapsed_us(start),
             detail: format!("memory_id={}", memory_id.raw()),
+            artifact: None,
         });
     }
     let created_at = now_unix_nanos();
@@ -223,12 +233,12 @@ pub async fn handle_encode(
         occurred_at_unix_nanos: req.occurred_at_unix_nanos,
         arena_slot: memory_id.slot(),
         embedding_model_fp,
-        content_hash: if ROUTER_DEDUPLICATE {
+        content_hash: if deduplicate {
             Some(content_hash)
         } else {
             None
         },
-        deduplicate: ROUTER_DEDUPLICATE,
+        deduplicate,
     }];
 
     // 6. Submit.
@@ -242,11 +252,31 @@ pub async fn handle_encode(
         .map_err(|e| OpError::ExecError(brain_planner::ExecError::WriterFailed(e)))?;
     debug_assert!(matches!(ack.phase_acks[0], PhaseAck::UpsertedMemory(_)));
     if let Some(start) = t_persist {
+        // persist → the durable metadata row this stage wrote, carrying the
+        // real WAL log-sequence number the write landed at.
+        let kind_byte = match kind {
+            MemoryKind::Episodic => 0,
+            MemoryKind::Semantic => 1,
+            MemoryKind::Consolidated => 2,
+        };
         trace_stages.push(EncodeTraceStage {
             name: "persist".into(),
             status: EncodeTraceStageStatus::Ok,
             latency_us: elapsed_us(start),
             detail: format!("lsn={}", ack.lsn_first.raw()),
+            artifact: Some(EncodeStageArtifact {
+                record: Some(EncodeStageRecord {
+                    memory_id: memory_id.to_be_bytes(),
+                    kind: kind_byte,
+                    salience,
+                    created_at_unix_nanos: created_at,
+                    occurred_at_unix_nanos: req.occurred_at_unix_nanos.unwrap_or(0),
+                    vector_dim: vector_dim as u32,
+                    text_len: text_len as u32,
+                    lsn: ack.lsn_first.raw(),
+                }),
+                ..Default::default()
+            }),
         });
     }
 
@@ -292,6 +322,73 @@ pub async fn handle_encode(
             .await;
         }
         let artifacts = build_encode_artifacts(ctx, memory_id, false, None);
+        // extractor → the typed graph this write produced. Attach it to the
+        // async `extractor` stage so the trace is per-stage (embed→vector,
+        // persist→record, extractor→graph), mirroring the durable bundle the
+        // extractor worker persists for later MEMORY_INSPECT.
+        // Wait for the async HyPE producer to settle, then fold the durable
+        // bundle (analyzed keyword terms + generated HyPE questions) back into
+        // the live trace so `trace = true` returns the same complete picture
+        // MEMORY_INSPECT does — one write, everything in the stream. The caller
+        // opted into the added latency (a HyPE LLM roundtrip after the ack).
+        wait_for_hype(ctx, memory_id).await;
+        let bundle =
+            crate::memory_artifact::read_memory_artifact(ctx.executor.metadata.as_ref(), memory_id)
+                .ok()
+                .flatten();
+
+        // extractor → the derived knowledge graph.
+        let graph = encode_artifacts_to_graph(&artifacts);
+        if let Some(stage) = trace_stages
+            .iter_mut()
+            .find(|s| s.name == stage_kind_name(StageKind::Extractor))
+        {
+            stage.artifact = Some(EncodeStageArtifact {
+                graph: Some(graph),
+                ..Default::default()
+            });
+        }
+        // persist → also carry the analyzed keyword terms (the exact tokens the
+        // memory_text index matches on), read from the durable bundle.
+        if let Some(kw) = bundle
+            .as_ref()
+            .map(|b| b.keyword_fields.clone())
+            .filter(|k| !k.is_empty())
+        {
+            if let Some(stage) = trace_stages.iter_mut().find(|s| s.name == "persist") {
+                match stage.artifact.as_mut() {
+                    Some(art) => art.keyword_fields = kw,
+                    None => {
+                        stage.artifact = Some(EncodeStageArtifact {
+                            keyword_fields: kw,
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+        // Synthetic HyPE stage → the hypothetical questions the write-time HyPE
+        // worker generated (async, post-ack). `Timeout` when it hadn't settled
+        // within the wait; the questions still land in MEMORY_INSPECT later.
+        let hype = bundle
+            .as_ref()
+            .map(|b| b.hype_questions.clone())
+            .unwrap_or_default();
+        trace_stages.push(EncodeTraceStage {
+            name: "hype".into(),
+            status: if hype.is_empty() {
+                EncodeTraceStageStatus::Timeout
+            } else {
+                EncodeTraceStageStatus::Ok
+            },
+            latency_us: 0,
+            detail: format!("questions={}", hype.len()),
+            artifact: (!hype.is_empty()).then(|| EncodeStageArtifact {
+                hype_questions: hype,
+                ..Default::default()
+            }),
+        });
+
         Some(EncodeTrace {
             stages: trace_stages,
             artifacts,
@@ -318,6 +415,35 @@ pub async fn handle_encode(
         trace,
     })
 }
+
+/// Wait for the write-time HyPE worker to populate this memory's durable
+/// artifact bundle, so a traced ENCODE can fold the generated questions into
+/// the stream. HyPE is async (an LLM call that runs after the ack) and is not a
+/// `StageKind`, so it can't be awaited via the stage bus — we poll the durable
+/// `memory_artifacts` bundle instead, bounded by the trace drain window. Returns
+/// the instant `hype_questions` is non-empty, else at the deadline (the caller
+/// then records the HyPE stage as `Timeout`; the questions still land in
+/// MEMORY_INSPECT later).
+#[cfg(target_os = "linux")]
+async fn wait_for_hype(ctx: &OpsContext, memory_id: MemoryId) {
+    let deadline = Instant::now() + ctx.encode_trace_drain_window;
+    loop {
+        if let Ok(Some(b)) =
+            crate::memory_artifact::read_memory_artifact(ctx.executor.metadata.as_ref(), memory_id)
+        {
+            if !b.hype_questions.is_empty() {
+                return;
+            }
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        glommio::timer::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn wait_for_hype(_ctx: &OpsContext, _memory_id: MemoryId) {}
 
 /// Wait for THIS write's queued async stages (`pending`) to publish their
 /// `StageCompleted` events on the per-shard bus, appending one
@@ -376,6 +502,7 @@ async fn await_stage_completions(
                     status: stage_status_from_env(&env),
                     latency_us: elapsed_us(stage_start),
                     detail: stage_detail_from_env(&env),
+                    artifact: None,
                 });
             }
             // A lagged trace subscriber just retries — the write is already
@@ -393,6 +520,7 @@ async fn await_stage_completions(
             status: EncodeTraceStageStatus::Timeout,
             latency_us: 0,
             detail: "stage did not complete within the trace wait window".into(),
+            artifact: None,
         });
     }
 }
@@ -413,6 +541,7 @@ async fn await_stage_completions(
             status: EncodeTraceStageStatus::Timeout,
             latency_us: 0,
             detail: "stage drain unavailable off Linux".into(),
+            artifact: None,
         });
     }
 }
@@ -449,6 +578,56 @@ fn stage_detail_from_env(env: &crate::subscribe::EventEnvelope) -> String {
         Some(StagePayload::TemporalEdge(p)) => format!("edges={}", p.edges_written),
         None => String::new(),
     }
+}
+
+/// Fold the trace's already-resolved [`EncodeTraceArtifacts`] (entities /
+/// statements / relations) into a renderable [`EncodeStageGraph`] for the
+/// `extractor` stage's per-stage artifact. Entities become nodes (they carry
+/// ids); statement objects and relation endpoints are matched back to those
+/// node ids by canonical name — an endpoint that isn't a mentioned entity (a
+/// literal object, or one beyond the enrichment cap) resolves to the zero id.
+fn encode_artifacts_to_graph(artifacts: &EncodeTraceArtifacts) -> EncodeStageGraph {
+    use brain_protocol::envelope::response::{EncodeGraphEdge, EncodeGraphNode};
+
+    let nodes: Vec<EncodeGraphNode> = artifacts
+        .entities
+        .iter()
+        .map(|e| EncodeGraphNode {
+            id: e.id,
+            name: e.name.clone(),
+            kind: "entity".to_string(),
+            type_qname: e.type_qname.clone(),
+        })
+        .collect();
+
+    let id_by_name: std::collections::HashMap<&str, [u8; 16]> = artifacts
+        .entities
+        .iter()
+        .map(|e| (e.name.as_str(), e.id))
+        .collect();
+    let lookup = |name: &str| id_by_name.get(name).copied().unwrap_or([0u8; 16]);
+
+    let mut edges: Vec<EncodeGraphEdge> = Vec::new();
+    for s in &artifacts.statements {
+        edges.push(EncodeGraphEdge {
+            source: lookup(&s.subject_name),
+            target: lookup(&s.object_name),
+            predicate: s.predicate.clone(),
+            kind: "statement".to_string(),
+            confidence: s.confidence,
+        });
+    }
+    for r in &artifacts.relations {
+        edges.push(EncodeGraphEdge {
+            source: lookup(&r.source_name),
+            target: lookup(&r.target_name),
+            predicate: r.predicate.clone(),
+            kind: "relation".to_string(),
+            confidence: 1.0,
+        });
+    }
+
+    EncodeStageGraph { nodes, edges }
 }
 
 /// Resolve the typed-graph rows + index state this write produced into the
@@ -600,7 +779,7 @@ fn encode_request_hash(
         salience_initial: DEFAULT_SALIENCE,
         fingerprint: embedding_model_fp,
         edges: Vec::new(),
-        deduplicate: ROUTER_DEDUPLICATE,
+        deduplicate: !req.allow_duplicates,
         content_hash: *blake3::hash(req.text.as_bytes()).as_bytes(),
         agent_id: agent,
     };

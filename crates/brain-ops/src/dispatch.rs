@@ -309,6 +309,12 @@ pub async fn dispatch(
             .await
             .map(|b| single(ResponseBody::MemoryList(b))),
 
+        RequestBody::MemoryInspect(r) => {
+            crate::handlers::memory_inspect::handle_memory_inspect(r, ctx)
+                .await
+                .map(|b| single(ResponseBody::MemoryInspect(b)))
+        }
+
         RequestBody::GraphFetch(r) => crate::handlers::graph_fetch::handle_graph_fetch(r, ctx)
             .map(|b| single(ResponseBody::GraphFetch(b))),
 
@@ -614,6 +620,8 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
 
         // Enumeration read — same capability as RECALL.
         RequestBody::MemoryList(_) => (perm_bits::RECALL, "MEMORY_LIST"),
+        // Per-memory inspection — same read capability.
+        RequestBody::MemoryInspect(_) => (perm_bits::RECALL, "MEMORY_INSPECT"),
 
         // Streaming reads.
         RequestBody::Subscribe(_) | RequestBody::Unsubscribe(_) | RequestBody::CancelStream(_) => {
@@ -771,7 +779,8 @@ mod tests {
             txn_id: None,
             occurred_at_unix_nanos: None,
             act_as: None,
-            trace: false,
+            wait: brain_protocol::WaitMode::Ack,
+            allow_duplicates: false,
         })
     }
 

@@ -23,7 +23,7 @@ pub fn apply_upsert_memory(
     let Phase::UpsertMemory {
         id,
         text,
-        vector: _,
+        vector,
         kind,
         salience,
         context,
@@ -109,6 +109,37 @@ pub fn apply_upsert_memory(
     // wakeup hint. `created_at` is the enqueue stamp.
     brain_metadata::extraction_queue_enqueue(wtxn, *id, *created_at_unix_nanos)
         .map_err(|e| ApplyError::Storage(format!("extraction_queue enqueue: {e:?}")))?;
+
+    // Sync half of the durable write-artifact bundle (MEMORY_INSPECT): the
+    // embedding vector + the record fields, written into the SAME wtxn so
+    // they commit atomically with the memory row at no extra transaction
+    // cost. The async workers (extractor → graph, text-indexer → keywords,
+    // HyPE → questions) merge the rest of the bundle in later.
+    {
+        let kind_byte = match kind {
+            MemoryKind::Episodic => 0,
+            MemoryKind::Semantic => 1,
+            MemoryKind::Consolidated => 2,
+        };
+        let record = crate::memory_artifact::sync_record(
+            id.to_be_bytes(),
+            kind_byte,
+            salience.raw(),
+            *created_at_unix_nanos,
+            occurred_at_unix_nanos.unwrap_or(0),
+            vector.len() as u32,
+            text.len() as u32,
+        );
+        let keyword_fields = crate::memory_artifact::analyze_memory_keywords(text);
+        crate::memory_artifact::put_sync_artifact(
+            wtxn,
+            id.to_be_bytes(),
+            vector.to_vec(),
+            record,
+            keyword_fields,
+        )
+        .map_err(|e| ApplyError::Storage(format!("artifact sync write: {e}")))?;
+    }
 
     // FINGERPRINTS_TABLE entry when the encode opted into content-
     // hash dedup. The row keys (agent_id, context_id, content_hash) →
@@ -235,6 +266,12 @@ pub fn apply_tombstone_memory(
         let _ = texts_t
             .remove(&id.to_be_bytes())
             .map_err(|e| ApplyError::Storage(format!("TEXTS remove (hard forget): {e:?}")))?;
+
+        // The write-artifact bundle carries the embedding vector + the
+        // derived graph — recoverable information about the memory — so a
+        // hard forget purges it in the same wtxn as the text.
+        crate::memory_artifact::delete_memory_artifact(wtxn, id.to_be_bytes())
+            .map_err(|e| ApplyError::Storage(format!("artifact remove (hard forget): {e}")))?;
     }
 
     Ok(PhaseAck::Tombstoned {

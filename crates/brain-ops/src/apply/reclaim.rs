@@ -34,8 +34,12 @@ pub fn apply_reclaim_slots(
     let mut count = 0usize;
 
     // Snapshot the (slot_id, content_hash) pairs to evict first so we
-    // don't iterate the table while mutating it.
+    // don't iterate the table while mutating it. Also snapshot the
+    // matching rows' memory ids so we can reclaim their write-artifact
+    // bundles (MEMORY_INSPECT) in the same pass — the bundle's vector +
+    // derived graph must not outlive the reclaimed memory.
     let mut evictions: Vec<[u8; 56]> = Vec::new();
+    let mut bundle_ids: Vec<[u8; 16]> = Vec::new();
     {
         let memories_t = wtxn
             .open_table(MEMORIES_TABLE)
@@ -59,6 +63,7 @@ pub fn apply_reclaim_slots(
                         &ch,
                     ));
                 }
+                bundle_ids.push(row.memory_id_bytes);
                 count += 1;
             }
         }
@@ -73,6 +78,11 @@ pub fn apply_reclaim_slots(
                 .remove(&key)
                 .map_err(|e| ApplyError::Storage(format!("FINGERPRINTS remove: {e:?}")))?;
         }
+    }
+
+    for mid in bundle_ids {
+        crate::memory_artifact::delete_memory_artifact(wtxn, mid)
+            .map_err(|e| ApplyError::Storage(format!("artifact remove (reclaim): {e}")))?;
     }
 
     Ok(PhaseAck::SlotsReclaimed { count })

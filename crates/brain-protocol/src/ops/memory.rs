@@ -51,19 +51,78 @@ pub struct EncodeRequest {
     /// key-bound identity.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
-    /// Opt-in synchronous write-analysis trace. When `true`, the ENCODE
-    /// response carries a populated `trace: EncodeTrace` describing the
-    /// full write timeline — the synchronous phases (validate / embed /
-    /// reserve / persist) AND the async derivation stages (auto-edge /
-    /// temporal-edge / extractor), which the handler synchronously waits
-    /// to drain before replying — plus the artifacts the write produced
-    /// (entities / statements / relations / indexes / dedup). When `false`
-    /// (the default) the write stays fully asynchronous and pays nothing:
-    /// the handler returns as soon as the WAL record is durable and the
-    /// async stages flow through SUBSCRIBE as before, `trace` omitted from
-    /// the wire map.
-    #[serde(default)]
-    pub trace: bool,
+    /// How long the write blocks before replying. This is the single
+    /// completion knob for writes (reads use `trace` instead — see the API
+    /// convention on [`WaitMode`]).
+    ///
+    /// - [`WaitMode::Ack`] (the default, omitted on the wire): return as soon
+    ///   as the WAL record is durable — the synchronous ack. The async
+    ///   derivation stages (auto-edge / temporal-edge / extractor / HyPE) run
+    ///   in the background and flow through SUBSCRIBE; the response carries
+    ///   `lsn` + `pending_stages` to follow them, and `trace` is `None`.
+    /// - [`WaitMode::Derived`]: block until the async derivation completes,
+    ///   then return a populated `trace: EncodeTrace` — the full per-stage
+    ///   timeline plus every artifact the write produced (vector, record,
+    ///   keyword terms, HyPE questions, entities / statements / relations /
+    ///   graph). Bounded by the shard's trace drain window so a stalled worker
+    ///   can't hang the call; stragglers are marked `Timeout` and still land
+    ///   in `MEMORY_INSPECT` later.
+    #[serde(default, skip_serializing_if = "WaitMode::is_ack")]
+    pub wait: WaitMode,
+    /// Opt out of content dedup and force a distinct memory. Default `false`:
+    /// Brain dedupes text ENCODE on (agent_id, context_id, BLAKE3(text)) — a
+    /// repeat of byte-identical text returns the existing MemoryId
+    /// (was_deduplicated = true) and writes nothing new. Set `true` when the
+    /// same text is a genuinely distinct observation that must coexist (e.g. the
+    /// same fact re-stated at a different occurred_at). Omitted on the wire in
+    /// the default (dedup-on) case.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_duplicates: bool,
+}
+
+/// `skip_serializing_if` predicate — omit `false` from the CBOR map so the
+/// default (dedup-on) encode stays byte-minimal and wire-compatible.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Write-completion mode — how long a write op blocks before it returns.
+///
+/// **API convention:** writes take `wait` (this enum); reads take `trace:
+/// bool`. They are never both on one op. On a write, waiting and the trace
+/// payload are one decision — the only reason to wait for async derivation is
+/// to observe it, and the only way to observe it is to wait — so a single
+/// `wait` knob controls both (its payload follows its timing). On a read there
+/// is no async to wait for, so `trace` is a pure observability toggle with no
+/// timing effect.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde_repr::Serialize_repr,
+    serde_repr::Deserialize_repr,
+)]
+#[repr(u8)]
+pub enum WaitMode {
+    /// Return after the durable sync ack; async derivation runs in the
+    /// background. The fast default.
+    #[default]
+    Ack = 0,
+    /// Block until async derivation completes, then return the full trace.
+    Derived = 1,
+}
+
+impl WaitMode {
+    /// `true` for the default [`WaitMode::Ack`] — used to omit the field from
+    /// the wire map in the common case.
+    #[must_use]
+    pub fn is_ack(&self) -> bool {
+        matches!(self, WaitMode::Ack)
+    }
 }
 
 /// Admin / bulk-import encode path — NOT a primary client verb. Brain
@@ -388,6 +447,32 @@ impl MemoryListResponseFrame {
     }
 }
 
+/// `MEMORY_INSPECT_REQ` — fetch the durable write-artifact bundle for one
+/// memory. Single-shot (not paginated): the reply carries the whole bundle.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryInspectRequest {
+    #[serde(with = "serde_bytes")]
+    pub memory_id: [u8; 16],
+    /// Effective identity for the read, on behalf of the connection principal.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
+}
+
+/// `MEMORY_INSPECT_RESP` — the durable per-memory artifact bundle: what each
+/// write stage produced (embedding vector, redb record, analyzed keyword terms,
+/// write-time HyPE questions, the extracted knowledge graph), plus the memory
+/// text. Reuses [`EncodeStageArtifact`] as the bundle shape so the live ENCODE
+/// trace and the stored inspection view are one type. `found = false` (with an
+/// empty `artifact`) when no memory / no bundle exists for the id.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryInspectResponse {
+    pub found: bool,
+    #[serde(with = "serde_bytes")]
+    pub memory_id: [u8; 16],
+    pub text: String,
+    pub artifact: EncodeStageArtifact,
+}
+
 // ============================================================
 // Response payloads (cognitive)
 // ============================================================
@@ -496,6 +581,120 @@ pub struct EncodeTraceStage {
     /// the embedding dimension), for an async stage the produced counts /
     /// audit status, and for a `Timeout`/`Failed` stage the reason.
     pub detail: String,
+    /// The concrete data this stage produced — the embedding vector (`embed`),
+    /// the redb metadata row (`persist`), the write-time HyPE questions, the
+    /// analyzed keyword terms (text-index stages), or the extracted knowledge
+    /// graph (`extractor`). Present only when the caller set `wait = Derived`
+    /// and the stage produced inspectable output; `None` otherwise (and absent
+    /// from the wire map). Lets a caller show *what was built* at each step, not
+    /// just its latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<EncodeStageArtifact>,
+}
+
+/// The concrete output one ENCODE stage produced behind the scenes, for
+/// `wait = Derived` callers that want to inspect *what each step built* — not
+/// just its latency. This is a per-stage output bag: every field is optional and
+/// each stage populates only the subset it generated (`embed` → `vector`,
+/// `persist` → `record`, the HyPE step → `hype_questions`, a text-index stage →
+/// `keyword_fields`, the extractor → `graph`, an edge stage → `graph.edges`).
+/// Empty/absent fields are omitted from the wire map. Reused by
+/// [`MemoryInspectResponse`] so the live ENCODE trace and the stored inspection
+/// view are one type.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EncodeStageArtifact {
+    /// The embedding vector the `embed` stage produced (full width, e.g. 384
+    /// `f32`s).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vector: Vec<f32>,
+    /// The metadata row the `persist` stage committed to redb.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<EncodeStageRecord>,
+    /// Hypothetical questions the write-time HyPE step generated for this memory
+    /// (the alternate phrasings it also embeds so recall can match a question).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hype_questions: Vec<String>,
+    /// The analyzed keyword terms a text-index stage derived, per index field —
+    /// the actual tokens tantivy will match on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keyword_fields: Vec<EncodeStageKeywordField>,
+    /// The knowledge-graph fragment this stage produced — the extractor stage
+    /// carries the full nodes + edges it derived; an edge stage
+    /// (`auto_edge` / `temporal_edge`) carries just the edges it added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<EncodeStageGraph>,
+}
+
+/// The redb metadata row a `persist` stage wrote — the durable record fields.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EncodeStageRecord {
+    #[serde(with = "serde_bytes")]
+    pub memory_id: [u8; 16],
+    /// Memory kind discriminant (as stored).
+    pub kind: u8,
+    /// Salience the write assigned.
+    pub salience: f32,
+    /// Record (ingest) time, unix nanoseconds.
+    pub created_at_unix_nanos: u64,
+    /// Event time, when the caller supplied `occurred_at`; `0` otherwise.
+    pub occurred_at_unix_nanos: u64,
+    /// Stored embedding dimension.
+    pub vector_dim: u32,
+    /// Byte length of the stored memory text.
+    pub text_len: u32,
+    /// WAL log-sequence number the write landed at.
+    pub lsn: u64,
+}
+
+/// One text-index field and the analyzed terms the write produced for it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EncodeStageKeywordField {
+    /// Index field name — e.g. `memory_text`, `statement_text`.
+    pub field: String,
+    /// The analyzed tokens (post-tokenizer) the field will match on.
+    pub terms: Vec<String>,
+}
+
+/// A node in the knowledge graph an ENCODE produced — an entity, the memory
+/// itself, or a literal object value.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EncodeGraphNode {
+    /// Stable node id: the entity id, the memory id, or a synthetic id for a
+    /// literal value node.
+    #[serde(with = "serde_bytes")]
+    pub id: [u8; 16],
+    /// Display name / value.
+    pub name: String,
+    /// `"entity"`, `"memory"`, or `"literal"`.
+    pub kind: String,
+    /// For entity nodes, the `"namespace:typename"` (empty otherwise).
+    pub type_qname: String,
+}
+
+/// A directed edge in the knowledge graph an ENCODE produced.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EncodeGraphEdge {
+    /// Source node id (subject).
+    #[serde(with = "serde_bytes")]
+    pub source: [u8; 16],
+    /// Target node id (object / relation target).
+    #[serde(with = "serde_bytes")]
+    pub target: [u8; 16],
+    /// Predicate qname.
+    pub predicate: String,
+    /// `"statement"` or `"relation"`.
+    pub kind: String,
+    /// Extraction confidence, when applicable.
+    pub confidence: f32,
+}
+
+/// The knowledge graph an ENCODE produced — nodes (entities, the memory,
+/// literal values) and the directed edges (statements, relations) between them.
+/// A renderable view of what the write added to the typed graph.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EncodeStageGraph {
+    pub nodes: Vec<EncodeGraphNode>,
+    pub edges: Vec<EncodeGraphEdge>,
 }
 
 /// Terminal status of an `EncodeTrace` phase.
@@ -1139,14 +1338,15 @@ mod serde_smoke {
             txn_id: None,
             occurred_at_unix_nanos: None,
             act_as: None,
-            trace: true,
+            wait: WaitMode::Derived,
+            allow_duplicates: false,
         };
         let body = RequestBody::Encode(req.clone());
         let bytes = body.encode();
         let decoded = RequestBody::decode(Opcode::EncodeReq, &bytes).expect("decode");
         assert_eq!(decoded, body);
         match decoded {
-            RequestBody::Encode(r) => assert!(r.trace),
+            RequestBody::Encode(r) => assert_eq!(r.wait, WaitMode::Derived),
             other => panic!("wrong variant: {other:?}"),
         }
 
@@ -1157,18 +1357,21 @@ mod serde_smoke {
                     status: EncodeTraceStageStatus::Ok,
                     latency_us: 1200,
                     detail: "dim=384".into(),
+                    artifact: None,
                 },
                 EncodeTraceStage {
                     name: "persist".into(),
                     status: EncodeTraceStageStatus::Ok,
                     latency_us: 800,
                     detail: "lsn=9".into(),
+                    artifact: None,
                 },
                 EncodeTraceStage {
                     name: "extractor".into(),
                     status: EncodeTraceStageStatus::Timeout,
                     latency_us: 0,
                     detail: "stage did not complete within the trace wait window".into(),
+                    artifact: None,
                 },
             ],
             artifacts: EncodeTraceArtifacts {

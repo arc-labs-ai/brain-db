@@ -173,7 +173,8 @@ async fn encode_as(
         txn_id: None,
         occurred_at_unix_nanos: None,
         act_as,
-        trace: false,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     };
     let (opcode, body) = round_trip(client, stream_id, RequestBody::Encode(req)).await;
     match body {
@@ -350,7 +351,8 @@ async fn act_as_without_grant_is_denied() {
         txn_id: None,
         occurred_at_unix_nanos: None,
         act_as: Some(act_as("tenant_a", [0xA1u8; 16])),
-        trace: false,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     };
     let (opcode, body) = round_trip(&mut client, 1, RequestBody::Encode(req)).await;
     assert_eq!(
@@ -477,7 +479,8 @@ async fn act_as_outside_allowlist_is_denied() {
         txn_id: None,
         occurred_at_unix_nanos: None,
         act_as: Some(act_as("tenant_x", [0x99u8; 16])),
-        trace: false,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     };
     let (opcode, body) = round_trip(&mut svc, 1, RequestBody::Encode(req)).await;
     assert_eq!(
