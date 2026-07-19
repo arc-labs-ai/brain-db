@@ -106,7 +106,8 @@ fn encode_req(request_id: [u8; 16], text: &str, _kind: MemoryKindWire) -> Encode
         txn_id: None,
         occurred_at_unix_nanos: None,
         act_as: None,
-        trace: false,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     }
 }
 
@@ -242,7 +243,8 @@ fn recall_echoes_client_supplied_occurred_at() {
             txn_id: None,
             occurred_at_unix_nanos: Some(event_time),
             act_as: None,
-            trace: false,
+            wait: brain_protocol::WaitMode::Ack,
+            allow_duplicates: false,
         };
         dispatch(
             RequestBody::Encode(req),
@@ -303,7 +305,8 @@ fn recency_breaks_relevance_ties_toward_recent_event_time() {
             txn_id: None,
             occurred_at_unix_nanos: Some(reference - day), // yesterday
             act_as: None,
-            trace: false,
+            wait: brain_protocol::WaitMode::Ack,
+            allow_duplicates: false,
         };
         let old = EncodeRequest {
             occurred_at_unix_nanos: Some(reference - 400 * day), // >1 year ago

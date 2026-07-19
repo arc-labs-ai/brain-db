@@ -119,7 +119,8 @@ fn encode_req(
         txn_id: None,
         occurred_at_unix_nanos: None,
         act_as: None,
-        trace: false,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     }
 }
 
@@ -321,7 +322,8 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
                     txn_id: Some(txn_id),
                     occurred_at_unix_nanos: None,
                     act_as: None,
-                    trace: false,
+                    wait: brain_protocol::WaitMode::Ack,
+                    allow_duplicates: false,
                 }),
                 brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
@@ -341,7 +343,8 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
                     txn_id: Some(txn_id),
                     occurred_at_unix_nanos: None,
                     act_as: None,
-                    trace: false,
+                    wait: brain_protocol::WaitMode::Ack,
+                    allow_duplicates: false,
                 }),
                 brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,

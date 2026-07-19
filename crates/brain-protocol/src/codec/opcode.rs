@@ -60,6 +60,8 @@ pub enum Opcode {
     UnlinkResp = 0x00A6,
     MemoryListReq = 0x0027,
     MemoryListResp = 0x00A7,
+    MemoryInspectReq = 0x0028,
+    MemoryInspectResp = 0x00A8,
     EncodeVectorDirectReq = 0x002A,
     EncodeVectorDirectResp = 0x00AA,
 
@@ -262,6 +264,8 @@ impl Opcode {
             0x00A6 => Self::UnlinkResp,
             0x0027 => Self::MemoryListReq,
             0x00A7 => Self::MemoryListResp,
+            0x0028 => Self::MemoryInspectReq,
+            0x00A8 => Self::MemoryInspectResp,
             0x002A => Self::EncodeVectorDirectReq,
             0x00AA => Self::EncodeVectorDirectResp,
 
@@ -519,6 +523,8 @@ mod tests {
         (0x00A6, Opcode::UnlinkResp),
         (0x0027, Opcode::MemoryListReq),
         (0x00A7, Opcode::MemoryListResp),
+        (0x0028, Opcode::MemoryInspectReq),
+        (0x00A8, Opcode::MemoryInspectResp),
         (0x002A, Opcode::EncodeVectorDirectReq),
         (0x00AA, Opcode::EncodeVectorDirectResp),
         // Subscription

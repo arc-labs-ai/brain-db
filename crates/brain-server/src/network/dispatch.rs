@@ -901,7 +901,8 @@ mod tests {
             txn_id: None,
             occurred_at_unix_nanos: None,
             act_as: None,
-            trace: false,
+            wait: brain_protocol::WaitMode::Ack,
+            allow_duplicates: false,
         });
         let frame = Frame::new(Opcode::EncodeReq.as_u16(), FLAG_EOS, 1, body.encode());
         let action = dispatch_frame(frame, &mut state, &topo);

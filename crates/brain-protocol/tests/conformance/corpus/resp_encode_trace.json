@@ -60,7 +60,15 @@
         "name": "embed",
         "status": 0,
         "latency_us": 1200,
-        "detail": "dim=384"
+        "detail": "dim=384",
+        "artifact": {
+          "vector": [
+            0.1,
+            -0.2,
+            0.3,
+            0.4
+          ]
+        }
       },
       {
         "name": "reserve",
@@ -72,13 +80,151 @@
         "name": "persist",
         "status": 0,
         "latency_us": 800,
-        "detail": "lsn=42"
+        "detail": "lsn=42",
+        "artifact": {
+          "record": {
+            "memory_id": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              7,
+              0,
+              42,
+              0,
+              0,
+              0,
+              0,
+              18,
+              52,
+              86
+            ],
+            "kind": 0,
+            "salience": 0.5,
+            "created_at_unix_nanos": 1700000000000000000,
+            "occurred_at_unix_nanos": 0,
+            "vector_dim": 384,
+            "text_len": 42,
+            "lsn": 42
+          }
+        }
       },
       {
         "name": "extractor",
         "status": 0,
         "latency_us": 42000,
-        "detail": "entities=2 statements=1 relations=0 audit=Succeeded"
+        "detail": "entities=2 statements=1 relations=0 audit=Succeeded",
+        "artifact": {
+          "hype_questions": [
+            "Who works on brain?",
+            "What does niraj work on?"
+          ],
+          "keyword_fields": [
+            {
+              "field": "memory_text",
+              "terms": [
+                "niraj",
+                "brain",
+                "works"
+              ]
+            }
+          ],
+          "graph": {
+            "nodes": [
+              {
+                "id": [
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68
+                ],
+                "name": "niraj",
+                "kind": "entity",
+                "type_qname": "org:person"
+              },
+              {
+                "id": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  7,
+                  0,
+                  42,
+                  0,
+                  0,
+                  0,
+                  0,
+                  18,
+                  52,
+                  86
+                ],
+                "name": "brain",
+                "kind": "entity",
+                "type_qname": "org:project"
+              }
+            ],
+            "edges": [
+              {
+                "source": [
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68
+                ],
+                "target": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  7,
+                  0,
+                  42,
+                  0,
+                  0,
+                  0,
+                  0,
+                  18,
+                  52,
+                  86
+                ],
+                "predicate": "org:works_on",
+                "kind": "statement",
+                "confidence": 0.9
+              }
+            ]
+          }
+        }
       },
       {
         "name": "auto_edge",

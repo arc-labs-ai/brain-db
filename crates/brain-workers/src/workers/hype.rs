@@ -193,6 +193,22 @@ impl HypeGenerator {
             }
         }
 
+        // Capture the generated question TEXT into this memory's durable
+        // write-artifact bundle (MEMORY_INSPECT). The vectors are the
+        // retrieval artifact; the question strings are otherwise discarded
+        // here, so the bundle is the only place they survive for inspection.
+        // Best-effort — a failure never fails HyPE generation itself.
+        if let Err(e) =
+            brain_ops::memory_artifact::merge_hype_questions(&self.metadata, memory_id, questions)
+        {
+            tracing::warn!(
+                target: "brain_workers::hype",
+                memory_id = ?memory_id,
+                error = %e,
+                "artifact hype-question merge failed (vectors persisted; bundle questions deferred)",
+            );
+        }
+
         HypeGenOutcome {
             questions_written: vectors.len(),
             cost_micro_usd: cost_micro,

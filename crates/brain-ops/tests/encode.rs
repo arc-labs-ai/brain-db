@@ -83,7 +83,8 @@ fn encode_req(request_id: [u8; 16], text: &str) -> EncodeRequest {
         txn_id: None,
         occurred_at_unix_nanos: None,
         act_as: None,
-        trace: false,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     }
 }
 
@@ -153,7 +154,7 @@ fn encode_trace_populated_when_requested() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let mut req = encode_req([0xE1; 16], "trace this write");
-        req.trace = true;
+        req.wait = brain_protocol::WaitMode::Derived;
         let enc = unwrap_encode_resp(
             dispatch(
                 RequestBody::Encode(req),
@@ -296,10 +297,12 @@ fn encode_conflict_returns_conflict_error_code() {
 // 5b. Fingerprint dedup (a).
 // ---------------------------------------------------------------------------
 //
-// Dedup is now a DB policy — always on for text ENCODE, scoped per
-// `(shard, agent_id, context_id)`, tombstone-aware. The client can no
-// longer toggle it, so the builder always produces a router-default
-// (dedup-on) encode; only the request_id / text / context vary.
+// Dedup is a DB policy — on by default for text ENCODE, scoped per
+// `(shard, agent_id, context_id)`, tombstone-aware. The client's only
+// control is the per-request `allow_duplicates` opt-out; the default
+// builder produces a dedup-on encode (only request_id / text / context
+// vary), and `encode_req_allow_dup` sets the opt-out to force a distinct
+// memory for byte-identical text.
 
 fn encode_req_with_dedup(request_id: [u8; 16], text: &str, context_id: u64) -> EncodeRequest {
     EncodeRequest {
@@ -309,17 +312,30 @@ fn encode_req_with_dedup(request_id: [u8; 16], text: &str, context_id: u64) -> E
         txn_id: None,
         occurred_at_unix_nanos: None,
         act_as: None,
-        trace: false,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
+    }
+}
+
+fn encode_req_allow_dup(request_id: [u8; 16], text: &str, context_id: u64) -> EncodeRequest {
+    EncodeRequest {
+        text: text.into(),
+        context_id,
+        request_id,
+        txn_id: None,
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: true,
     }
 }
 
 #[test]
-fn same_text_distinct_request_ids_create_two_memories() {
-    // The write path stores faithfully: two separate observations of the
-    // same text under different request_ids are two distinct memories, and
-    // neither reports a dedup hit. Collapsing genuine near-duplicates is an
-    // asynchronous consolidation concern, never a synchronous write-time
-    // drop — the client cannot lose a write to an implicit dedup.
+fn same_text_dedupes_to_one_memory() {
+    // Content dedup is on by default: byte-identical text under the same
+    // `(agent_id, context_id)` collapses to one memory even across distinct
+    // request_ids. The second encode reports `was_deduplicated = true` and
+    // returns the first memory's id — no new slot, WAL record, or index node.
     run_in_glommio(|| async {
         let fix = build_fixture();
         let first = unwrap_encode_resp(
@@ -333,7 +349,7 @@ fn same_text_distinct_request_ids_create_two_memories() {
         );
         assert!(!first.was_deduplicated);
 
-        // Same text + same context, different request_id.
+        // Same text + same context, different request_id → dedup hit.
         let second = unwrap_encode_resp(
             dispatch(
                 RequestBody::Encode(encode_req_with_dedup([4; 16], "dedup me", 1)),
@@ -343,10 +359,51 @@ fn same_text_distinct_request_ids_create_two_memories() {
             .await
             .unwrap(),
         );
-        assert!(!second.was_deduplicated);
+        assert!(
+            second.was_deduplicated,
+            "byte-identical text under the same context must dedup",
+        );
+        assert_eq!(
+            first.memory_id, second.memory_id,
+            "dedup returns the existing memory id",
+        );
+    })
+}
+
+#[test]
+fn allow_duplicates_forces_distinct_memories() {
+    // The `allow_duplicates` opt-out bypasses content dedup: byte-identical
+    // text under the same context becomes two distinct memories, neither
+    // reporting a dedup hit.
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let first = unwrap_encode_resp(
+            dispatch(
+                RequestBody::Encode(encode_req_allow_dup([7; 16], "keep both", 1)),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(!first.was_deduplicated);
+
+        let second = unwrap_encode_resp(
+            dispatch(
+                RequestBody::Encode(encode_req_allow_dup([8; 16], "keep both", 1)),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            !second.was_deduplicated,
+            "allow_duplicates must not dedup byte-identical text",
+        );
         assert_ne!(
             first.memory_id, second.memory_id,
-            "same text under a new request_id is a distinct memory",
+            "allow_duplicates yields a distinct memory",
         );
     })
 }
@@ -591,7 +648,7 @@ fn same_text_second_encode_leaves_first_text_row_intact() {
 
         let first = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([0x70; 16], original_text, 9)),
+                RequestBody::Encode(encode_req_allow_dup([0x70; 16], original_text, 9)),
                 brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
@@ -604,12 +661,13 @@ fn same_text_second_encode_leaves_first_text_row_intact() {
             Some(original_text.as_bytes().to_vec())
         );
 
-        // Same text + context under a different request_id: the write path
-        // stores it faithfully as a second, independent memory — the first
-        // memory's text row is never mutated or collapsed.
+        // Same text + context under a different request_id, opting OUT of
+        // dedup (`allow_duplicates`): the write path stores it faithfully as a
+        // second, independent memory — the first memory's text row is never
+        // mutated or collapsed.
         let second = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([0x71; 16], original_text, 9)),
+                RequestBody::Encode(encode_req_allow_dup([0x71; 16], original_text, 9)),
                 brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
