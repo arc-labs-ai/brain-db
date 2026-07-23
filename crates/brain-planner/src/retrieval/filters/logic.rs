@@ -78,6 +78,13 @@ pub struct FilterChain {
 }
 
 /// Per-step survivor counts. Surfaces in EXPLAIN/TRACE.
+///
+/// The `dropped_by_*` fields are the per-item complement of the
+/// `after_*` counts: exactly which ids that step removed, not just how
+/// many survived. They are populated only when `apply_filter_chain` is
+/// called with `trace_detail = true` (the opt-in full-detail trace
+/// mode) — on the default fast path they stay empty `Vec`s and no item
+/// id is ever collected, so the common case pays no extra allocation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FilterChainStats {
     pub before: u32,
@@ -88,6 +95,22 @@ pub struct FilterChainStats {
     pub after_supersession: u32,
     pub after_as_of: u32,
     pub after_limit: u32,
+    /// Ids the type filter (kind / memory_kind / predicate) dropped.
+    /// Full-detail trace only; empty otherwise.
+    pub dropped_by_type: Vec<RankedItemId>,
+    /// Ids the temporal filter dropped. Full-detail trace only.
+    pub dropped_by_temporal: Vec<RankedItemId>,
+    /// Ids the confidence/salience filter dropped. Full-detail trace only.
+    pub dropped_by_confidence: Vec<RankedItemId>,
+    /// Ids the tombstone filter dropped. Full-detail trace only.
+    pub dropped_by_tombstone: Vec<RankedItemId>,
+    /// Ids the supersession filter dropped. Full-detail trace only.
+    pub dropped_by_supersession: Vec<RankedItemId>,
+    /// Ids the as-of (bi-temporal time-travel) filter dropped.
+    /// Full-detail trace only.
+    pub dropped_by_as_of: Vec<RankedItemId>,
+    /// Ids the final limit truncation dropped. Full-detail trace only.
+    pub dropped_by_limit: Vec<RankedItemId>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -98,11 +121,19 @@ pub enum FilterError {
 
 /// Apply the filter chain in order, then truncate to
 /// `limit`. `limit == 0` means "no limit".
+///
+/// `trace_detail` gates the per-item `dropped_by_*` fields on the
+/// returned `FilterChainStats`: `false` (the default/fast path) skips
+/// collecting dropped ids entirely — each step's dropped `Vec` stays
+/// empty and never allocates. `true` (the opt-in full-detail trace)
+/// records exactly which id each step removed, on top of the survivor
+/// counts that are always computed.
 pub fn apply_filter_chain(
     items: Vec<FusedItem>,
     chain: &FilterChain,
     metadata: &MetadataDb,
     limit: u32,
+    trace_detail: bool,
 ) -> Result<(Vec<FusedItem>, FilterChainStats), FilterError> {
     let mut stats = FilterChainStats {
         before: items.len() as u32,
@@ -113,25 +144,34 @@ pub fn apply_filter_chain(
         .read_txn()
         .map_err(|e| FilterError::Metadata(format!("read_txn: {e}")))?;
 
-    let items = filter_type(items, chain, &rtxn)?;
+    let (items, dropped) = filter_type(items, chain, &rtxn, trace_detail)?;
     stats.after_type = items.len() as u32;
+    stats.dropped_by_type = dropped;
 
-    let items = filter_temporal(items, chain, &rtxn)?;
+    let (items, dropped) = filter_temporal(items, chain, &rtxn, trace_detail)?;
     stats.after_temporal = items.len() as u32;
+    stats.dropped_by_temporal = dropped;
 
-    let items = filter_confidence(items, chain, &rtxn)?;
+    let (items, dropped) = filter_confidence(items, chain, &rtxn, trace_detail)?;
     stats.after_confidence = items.len() as u32;
+    stats.dropped_by_confidence = dropped;
 
-    let items = filter_tombstone(items, chain, &rtxn)?;
+    let (items, dropped) = filter_tombstone(items, chain, &rtxn, trace_detail)?;
     stats.after_tombstone = items.len() as u32;
+    stats.dropped_by_tombstone = dropped;
 
-    let items = filter_supersession(items, chain, &rtxn)?;
+    let (items, dropped) = filter_supersession(items, chain, &rtxn, trace_detail)?;
     stats.after_supersession = items.len() as u32;
+    stats.dropped_by_supersession = dropped;
 
-    let mut items = filter_as_of(items, chain, &rtxn)?;
+    let (mut items, dropped) = filter_as_of(items, chain, &rtxn, trace_detail)?;
     stats.after_as_of = items.len() as u32;
+    stats.dropped_by_as_of = dropped;
 
     if limit > 0 && items.len() > limit as usize {
+        if trace_detail {
+            stats.dropped_by_limit = items[limit as usize..].iter().map(|i| i.id).collect();
+        }
         items.truncate(limit as usize);
     }
     stats.after_limit = items.len() as u32;
@@ -143,18 +183,24 @@ pub fn apply_filter_chain(
 // Per-filter helpers.
 // ---------------------------------------------------------------------------
 
+/// Result of one filter step: survivors plus (only when `trace_detail`
+/// is set) the ids that step dropped.
+type FilterStepResult = Result<(Vec<FusedItem>, Vec<RankedItemId>), FilterError>;
+
 fn filter_type(
     items: Vec<FusedItem>,
     chain: &FilterChain,
     rtxn: &ReadTransaction,
-) -> Result<Vec<FusedItem>, FilterError> {
+    trace_detail: bool,
+) -> FilterStepResult {
     if chain.kind_filter.is_empty()
         && chain.memory_kind_filter.is_empty()
         && chain.predicate_filter.is_empty()
     {
-        return Ok(items);
+        return Ok((items, Vec::new()));
     }
     let mut out = Vec::with_capacity(items.len());
+    let mut dropped = Vec::new();
     for item in items {
         let keep = match item.id {
             RankedItemId::Memory(id) => {
@@ -168,6 +214,9 @@ fn filter_type(
                 let Some(stmt) = statement_get(rtxn, id)
                     .map_err(|e| FilterError::Metadata(format!("statement_get: {e}")))?
                 else {
+                    if trace_detail {
+                        dropped.push(item.id);
+                    }
                     continue;
                 };
                 let kind_ok =
@@ -180,24 +229,31 @@ fn filter_type(
         };
         if keep {
             out.push(item);
+        } else if trace_detail {
+            dropped.push(item.id);
         }
     }
-    Ok(out)
+    Ok((out, dropped))
 }
 
 fn filter_temporal(
     items: Vec<FusedItem>,
     chain: &FilterChain,
     rtxn: &ReadTransaction,
-) -> Result<Vec<FusedItem>, FilterError> {
+    trace_detail: bool,
+) -> FilterStepResult {
     let Some(range) = chain.time_filter else {
-        return Ok(items);
+        return Ok((items, Vec::new()));
     };
     let mut out = Vec::with_capacity(items.len());
+    let mut dropped = Vec::new();
     for item in items {
         let keep = match item.id {
             RankedItemId::Memory(id) => {
                 let Some(ms) = memory_created_at_ms(rtxn, id)? else {
+                    if trace_detail {
+                        dropped.push(item.id);
+                    }
                     continue;
                 };
                 in_range(&range, ms)
@@ -206,12 +262,18 @@ fn filter_temporal(
                 let Some(stmt) = statement_get(rtxn, id)
                     .map_err(|e| FilterError::Metadata(format!("statement_get: {e}")))?
                 else {
+                    if trace_detail {
+                        dropped.push(item.id);
+                    }
                     continue;
                 };
                 statement_temporal_match(&stmt, &range)
             }
             RankedItemId::Relation(id) => {
                 let Some((vf, vt)) = relation_validity_ms(rtxn, id)? else {
+                    if trace_detail {
+                        dropped.push(item.id);
+                    }
                     continue;
                 };
                 window_overlaps(vf, vt, &range)
@@ -220,20 +282,24 @@ fn filter_temporal(
         };
         if keep {
             out.push(item);
+        } else if trace_detail {
+            dropped.push(item.id);
         }
     }
-    Ok(out)
+    Ok((out, dropped))
 }
 
 fn filter_confidence(
     items: Vec<FusedItem>,
     chain: &FilterChain,
     rtxn: &ReadTransaction,
-) -> Result<Vec<FusedItem>, FilterError> {
+    trace_detail: bool,
+) -> FilterStepResult {
     let Some(min) = chain.confidence_min else {
-        return Ok(items);
+        return Ok((items, Vec::new()));
     };
     let mut out = Vec::with_capacity(items.len());
+    let mut dropped = Vec::new();
     for item in items {
         let keep = match item.id {
             RankedItemId::Memory(id) => {
@@ -244,6 +310,9 @@ fn filter_confidence(
                 // has `salience_floor`; this filter is the importance cut. Do
                 // not "correct" this to similarity to match older spec text.
                 let Some(salience) = memory_salience(rtxn, id)? else {
+                    if trace_detail {
+                        dropped.push(item.id);
+                    }
                     continue;
                 };
                 salience >= min
@@ -252,12 +321,18 @@ fn filter_confidence(
                 let Some(stmt) = statement_get(rtxn, id)
                     .map_err(|e| FilterError::Metadata(format!("statement_get: {e}")))?
                 else {
+                    if trace_detail {
+                        dropped.push(item.id);
+                    }
                     continue;
                 };
                 stmt.confidence >= min
             }
             RankedItemId::Relation(id) => {
                 let Some(conf) = relation_confidence(rtxn, id)? else {
+                    if trace_detail {
+                        dropped.push(item.id);
+                    }
                     continue;
                 };
                 conf >= min
@@ -266,20 +341,24 @@ fn filter_confidence(
         };
         if keep {
             out.push(item);
+        } else if trace_detail {
+            dropped.push(item.id);
         }
     }
-    Ok(out)
+    Ok((out, dropped))
 }
 
 fn filter_tombstone(
     items: Vec<FusedItem>,
     chain: &FilterChain,
     rtxn: &ReadTransaction,
-) -> Result<Vec<FusedItem>, FilterError> {
+    trace_detail: bool,
+) -> FilterStepResult {
     if chain.include_tombstoned {
-        return Ok(items);
+        return Ok((items, Vec::new()));
     }
     let mut out = Vec::with_capacity(items.len());
+    let mut dropped = Vec::new();
     for item in items {
         let keep = match item.id {
             RankedItemId::Memory(id) => memory_active(rtxn, id)?.unwrap_or(false),
@@ -287,6 +366,9 @@ fn filter_tombstone(
                 let Some(stmt) = statement_get(rtxn, id)
                     .map_err(|e| FilterError::Metadata(format!("statement_get: {e}")))?
                 else {
+                    if trace_detail {
+                        dropped.push(item.id);
+                    }
                     continue;
                 };
                 !stmt.tombstoned
@@ -296,26 +378,33 @@ fn filter_tombstone(
         };
         if keep {
             out.push(item);
+        } else if trace_detail {
+            dropped.push(item.id);
         }
     }
-    Ok(out)
+    Ok((out, dropped))
 }
 
 fn filter_supersession(
     items: Vec<FusedItem>,
     chain: &FilterChain,
     rtxn: &ReadTransaction,
-) -> Result<Vec<FusedItem>, FilterError> {
+    trace_detail: bool,
+) -> FilterStepResult {
     if chain.include_superseded {
-        return Ok(items);
+        return Ok((items, Vec::new()));
     }
     let mut out = Vec::with_capacity(items.len());
+    let mut dropped = Vec::new();
     for item in items {
         let keep = match item.id {
             RankedItemId::Statement(id) => {
                 let Some(stmt) = statement_get(rtxn, id)
                     .map_err(|e| FilterError::Metadata(format!("statement_get: {e}")))?
                 else {
+                    if trace_detail {
+                        dropped.push(item.id);
+                    }
                     continue;
                 };
                 stmt.superseded_by.is_none()
@@ -326,26 +415,33 @@ fn filter_supersession(
         };
         if keep {
             out.push(item);
+        } else if trace_detail {
+            dropped.push(item.id);
         }
     }
-    Ok(out)
+    Ok((out, dropped))
 }
 
 fn filter_as_of(
     items: Vec<FusedItem>,
     chain: &FilterChain,
     rtxn: &ReadTransaction,
-) -> Result<Vec<FusedItem>, FilterError> {
+    trace_detail: bool,
+) -> FilterStepResult {
     let Some(record_time) = chain.as_of_record_time_unix_nanos else {
-        return Ok(items);
+        return Ok((items, Vec::new()));
     };
     let mut out = Vec::with_capacity(items.len());
+    let mut dropped = Vec::new();
     for item in items {
         let keep = match item.id {
             RankedItemId::Statement(id) => {
                 let Some(stmt) = statement_get(rtxn, id)
                     .map_err(|e| FilterError::Metadata(format!("statement_get: {e}")))?
                 else {
+                    if trace_detail {
+                        dropped.push(item.id);
+                    }
                     continue;
                 };
                 as_of_matches(&stmt, record_time)
@@ -359,9 +455,11 @@ fn filter_as_of(
         };
         if keep {
             out.push(item);
+        } else if trace_detail {
+            dropped.push(item.id);
         }
     }
-    Ok(out)
+    Ok((out, dropped))
 }
 
 /// `true` if the substrate believed `stmt` at record-time `record_time`.

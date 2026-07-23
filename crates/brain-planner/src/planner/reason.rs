@@ -184,6 +184,7 @@ mod tests {
             request_id: None,
             txn_id: None,
             act_as: None,
+            trace: false,
         }
     }
 

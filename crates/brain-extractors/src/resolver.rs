@@ -22,11 +22,14 @@
 //!    paraphrases trigrams miss (e.g. "Stripe Inc." vs
 //!    "Stripe Payments").
 //! 5. **Create** — mint a fresh UUIDv7 EntityId, intern the type if
-//!    needed, embed the canonical name (when an HNSW is wired), and
-//!    write the entity row + the HNSW slot. Synchronous population
-//!    means subsequent resolves can hit the embedding tier immediately;
-//!    a worker-driven HNSW backfill isn't required because entity
-//!    creation is rare relative to statement creation.
+//!    needed, embed the canonical name (when an HNSW is wired), write
+//!    the entity row + the durable vector row, and STAGE the HNSW
+//!    insert in a [`StagedEntityVectors`] the caller flushes after its
+//!    write txn commits. Staged vectors are visible to the embedding
+//!    tier for the rest of the pass, so subsequent resolves still
+//!    short-circuit immediately; a worker-driven HNSW backfill isn't
+//!    required because entity creation is rare relative to statement
+//!    creation.
 //!
 //! Determinism comes from the lookup contract: given the same DB
 //! state + same surface form, the resolver always returns the same
@@ -259,23 +262,27 @@ pub fn strip_leading_vocative(surface: &str) -> Option<String> {
 
 /// True when `surface` is, in its entirety, a date or relative-time phrase
 /// — "Last Friday", "Last Fri", "yesterday", "next week", "3 days ago",
-/// "in 2 weeks", an ISO date — and therefore names no entity. The extractor
-/// tiers call this to drop temporal spans the LLM / classifier occasionally
-/// tag as Person / entity surfaces.
+/// "in 2 weeks", "January 2026", "January 5, 2026", "2026", an ISO date —
+/// and therefore names no entity. The extractor tiers call this to drop
+/// temporal spans the LLM / classifier occasionally tag as Person / entity
+/// surfaces; such a span belongs in the graph as an Event statement, never
+/// as a node of its own.
 ///
 /// Conservative on the axis that matters: it never rejects a BARE weekday
 /// or month name ("Friday", "Sun", "May"), any of which can legitimately be
 /// a person name. It rejects only forms that are unambiguously temporal — a
 /// deictic, a relative lead ("last / this / next / …") before a weekday or
-/// period, an explicit offset ("N units ago", "in N units"), or a full ISO
-/// date.
+/// period, an explicit offset ("N units ago", "in N units"), or a calendar
+/// date that pins a year.
 ///
 /// ```
 /// use brain_extractors::resolver::is_temporal_expression_surface;
 /// assert!(is_temporal_expression_surface("Last Friday"));
 /// assert!(is_temporal_expression_surface("yesterday"));
+/// assert!(is_temporal_expression_surface("January 2026"));
 /// assert!(!is_temporal_expression_surface("Melanie"));
 /// assert!(!is_temporal_expression_surface("Friday")); // could be a name
+/// assert!(!is_temporal_expression_surface("January")); // could be a name
 /// ```
 #[must_use]
 pub fn is_temporal_expression_surface(surface: &str) -> bool {
@@ -285,12 +292,38 @@ pub fn is_temporal_expression_surface(surface: &str) -> bool {
     }
     const DEICTIC: &[&str] = &["yesterday", "today", "tomorrow", "tonight", "tonite"];
     const WEEKDAY: &[&str] = &[
-        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "mon", "tue",
-        "tues", "wed", "weds", "thu", "thur", "thurs", "fri", "sat", "sun",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+        "mon",
+        "tue",
+        "tues",
+        "wed",
+        "weds",
+        "thu",
+        "thur",
+        "thurs",
+        "fri",
+        "sat",
+        "sun",
     ];
     const PERIOD: &[&str] = &["week", "weekend", "month", "year", "quarter"];
-    const RELATIVE_LEAD: &[&str] =
-        &["last", "this", "next", "past", "coming", "previous", "upcoming"];
+    const RELATIVE_LEAD: &[&str] = &[
+        "last", "this", "next", "past", "coming", "previous", "upcoming",
+    ];
+    // Full calendar dates — "January 2026", "January 5, 2026", "8 May 2023",
+    // "2020-01-15", a bare "2026". Delegated to the pattern tier's date
+    // recognizers, the one authority on what parses as a date here, rather
+    // than re-deriving the forms token-wise (the comma in "January 5, 2026"
+    // alone defeats whitespace splitting). Whole-surface anchored there, so a
+    // year embedded in a name ("Room 2026") still passes.
+    if crate::pattern::temporal::is_full_date_surface(&lowered) {
+        return true;
+    }
     // Match ergonomics on `&[&str]` bind `one`/`unit`/… as `&&str`. `contains`
     // takes `&&str` directly; the `is_*` helpers take `&str` and get it via the
     // `&&str` -> `&str` deref coercion at the argument position.
@@ -482,6 +515,139 @@ impl std::fmt::Debug for EmbeddingDeps {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EmbeddingDeps").finish_non_exhaustive()
     }
+}
+
+/// Entity-HNSW insertions produced by one resolver pass, held back until
+/// that pass's write transaction commits.
+///
+/// The entity HNSW is in-RAM and NOT transactional, and `hnsw_rs` has no
+/// point removal — an insert made while a write txn is open can never be
+/// taken back if that txn rolls back, leaving a vector that points at an
+/// entity id redb never kept. Rollback is a live path, not a theoretical
+/// one: the extractor's two-phase disambiguation discards its plan pass
+/// whenever an ambiguous candidate needs an LLM verdict, and any error
+/// out of an apply body drops the txn too. So tier-4 stages here and the
+/// caller flushes with [`flush_into_hnsw`](Self::flush_into_hnsw) after
+/// `commit()` returns; a rolled-back pass just drops the staging area.
+///
+/// Staging is per-pass and must never be shared between passes — that is
+/// exactly what makes "drop it" a correct rollback.
+///
+/// Within a pass the staged vectors stay visible to the embedding tier
+/// (see [`tier_embedding`]), so two paraphrases inside one memory still
+/// collapse onto a single entity, as they did when the insert was inline.
+///
+/// ```no_run
+/// # use brain_extractors::resolver::{
+/// #     resolve_or_create_with_deps, Disambiguation, EmbeddingDeps, StagedEntityVectors,
+/// # };
+/// # use brain_metadata::RowScope;
+/// # fn demo(wtxn: redb::WriteTransaction, scope: RowScope, deps: &EmbeddingDeps, now: u64) {
+/// let mut staged = StagedEntityVectors::new();
+/// let res = resolve_or_create_with_deps(
+///     &wtxn,
+///     scope,
+///     "Stripe Payments",
+///     "brain:Organization",
+///     0.9,
+///     now,
+///     Some(deps),
+///     &mut staged,
+///     &mut Disambiguation::Off,
+/// );
+/// if wtxn.commit().is_ok() {
+///     // Durable now — safe to publish the vectors to the in-RAM index.
+///     staged.flush_into_hnsw(deps);
+/// }
+/// # let _ = res;
+/// # }
+/// ```
+#[derive(Debug, Default)]
+pub struct StagedEntityVectors(Vec<(EntityId, [f32; VECTOR_DIM])>);
+
+impl StagedEntityVectors {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Publish every staged vector into the entity HNSW. Call ONLY once
+    /// the transaction that wrote the corresponding entity rows has
+    /// committed. Returns the number of points actually inserted.
+    ///
+    /// Consumes `self` so a staging area cannot be flushed twice, and
+    /// skips ids the index already carries, so an entity can never end up
+    /// with two points (the `(id, vector)` pair is also idempotent — the
+    /// same entity staged twice inserts once).
+    pub fn flush_into_hnsw(self, deps: &EmbeddingDeps) -> usize {
+        if self.0.is_empty() {
+            return 0;
+        }
+        let mut hnsw = deps.hnsw.write();
+        let mut inserted = 0usize;
+        for (entity_id, vector) in self.0 {
+            if hnsw.contains(entity_id) {
+                continue;
+            }
+            match hnsw.insert(entity_id, &vector) {
+                Ok(()) => inserted += 1,
+                Err(e) => tracing::warn!(
+                    target: "brain_extractors::resolver",
+                    ?entity_id,
+                    error = %e,
+                    "entity-HNSW insert failed; entity is durable but unreachable via tier-3b until a rebuild",
+                ),
+            }
+        }
+        inserted
+    }
+
+    fn stage(&mut self, entity_id: EntityId, vector: [f32; VECTOR_DIM]) {
+        self.0.push((entity_id, vector));
+    }
+
+    /// Cosine-score every staged vector against `query` and return the
+    /// best `k`, descending. Brute force is right here: a staging area
+    /// holds the handful of entities one memory minted, and an exact scan
+    /// avoids the approximate index entirely for them.
+    fn probe(&self, query: &[f32; VECTOR_DIM], k: usize) -> Vec<(EntityId, f32)> {
+        let mut scored: Vec<(EntityId, f32)> = self
+            .0
+            .iter()
+            .map(|(id, v)| (*id, cosine(query, v)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        scored
+    }
+}
+
+/// Cosine similarity of two equal-length vectors. The embedder returns
+/// L2-normalised output so this is usually just the dot product, but the
+/// normalisation is cheap and keeps the score honest for any dispatcher.
+fn cosine(a: &[f32; VECTOR_DIM], b: &[f32; VECTOR_DIM]) -> f32 {
+    let mut dot = 0.0_f32;
+    let mut na = 0.0_f32;
+    let mut nb = 0.0_f32;
+    for i in 0..VECTOR_DIM {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
 }
 
 /// Per-shard handle to a disambiguator capable of distinguishing
@@ -719,7 +885,10 @@ pub fn resolve_or_create(
     confidence: f32,
     now_unix_nanos: u64,
 ) -> Result<Resolution, ResolverError> {
-    resolve_or_create_with_deps(
+    // No embedding deps means tier-4 has nothing to embed, so this
+    // staging area always comes back empty and there is nothing to flush.
+    let mut staged = StagedEntityVectors::new();
+    let res = resolve_or_create_with_deps(
         wtxn,
         scope,
         surface_form,
@@ -727,33 +896,11 @@ pub fn resolve_or_create(
         confidence,
         now_unix_nanos,
         None,
+        &mut staged,
         &mut Disambiguation::Off,
-    )
-}
-
-/// Transitional alias: existing callers wired before the disambiguator
-/// landed pass only the embedding bundle here. Forwards to
-/// [`resolve_or_create_with_deps`] with the disambiguator slot empty.
-/// New code should call [`resolve_or_create_with_deps`] directly.
-pub fn resolve_or_create_with_hnsw(
-    wtxn: &WriteTransaction,
-    scope: RowScope,
-    surface_form: &str,
-    entity_type_qname: &str,
-    confidence: f32,
-    now_unix_nanos: u64,
-    embed_deps: Option<&EmbeddingDeps>,
-) -> Result<Resolution, ResolverError> {
-    resolve_or_create_with_deps(
-        wtxn,
-        scope,
-        surface_form,
-        entity_type_qname,
-        confidence,
-        now_unix_nanos,
-        embed_deps,
-        &mut Disambiguation::Off,
-    )
+    );
+    debug_assert!(staged.is_empty(), "invariant: no embed deps, no staging");
+    res
 }
 
 /// Resolve `surface_form` against the entity registry, creating a new
@@ -762,12 +909,16 @@ pub fn resolve_or_create_with_hnsw(
 /// downstream writes (mention edges, statement creation).
 ///
 /// When `embed_deps` is `Some`, the resolver consults the entity
-/// HNSW between the trigram-fuzzy tier and the create tier, and
-/// inserts the canonical-name embedding of every newly-minted entity
-/// into the HNSW so the next resolve of a paraphrase can short-circuit
-/// at the embedding tier. Failures inside the embedding path (embedder
-/// errors, HNSW lock contention) degrade gracefully: the resolver logs
-/// at `warn` and falls through to the next tier, never aborts the txn.
+/// HNSW between the trigram-fuzzy tier and the create tier, and stages
+/// the canonical-name embedding of every newly-minted entity in
+/// `staged` so the next resolve of a paraphrase can short-circuit at the
+/// embedding tier. The caller MUST call
+/// [`StagedEntityVectors::flush_into_hnsw`] once — and only once — the
+/// txn has committed; a rolled-back pass drops its staging area instead
+/// (the HNSW cannot un-insert). Failures inside the embedding path
+/// (embedder errors, HNSW lock contention) degrade gracefully: the
+/// resolver logs at `warn` and falls through to the next tier, never
+/// aborts the txn.
 ///
 /// When the embedding probe lands a candidate in the ambiguous band, the
 /// `disambiguation` mode decides the verdict WITHOUT calling the LLM
@@ -791,6 +942,7 @@ pub fn resolve_or_create_with_deps(
     _confidence: f32,
     now_unix_nanos: u64,
     embed_deps: Option<&EmbeddingDeps>,
+    staged: &mut StagedEntityVectors,
     disambiguation: &mut Disambiguation<'_>,
 ) -> Result<Resolution, ResolverError> {
     // Greeting / vocative phantom guard (Person only). "Hey Mel", "Thanks
@@ -1058,12 +1210,7 @@ pub fn resolve_or_create_with_deps(
                 if !ambiguous {
                     if let Some((cid, nick_tok)) = nickname {
                         if nickname_entity_free_for_fuller(wtxn, cid, &nick_tok, q_first)? {
-                            entity_add_alias(
-                                wtxn,
-                                cid,
-                                surface_form.to_string(),
-                                now_unix_nanos,
-                            )?;
+                            entity_add_alias(wtxn, cid, surface_form.to_string(), now_unix_nanos)?;
                             return Ok(Resolution {
                                 entity_id: cid,
                                 tier: ResolutionTier::Alias,
@@ -1086,7 +1233,7 @@ pub fn resolve_or_create_with_deps(
     // worker, which re-checks them as the HNSW grows.
     let mut partial_match: Option<(EntityId, f32)> = None;
     if let Some(deps) = embed_deps {
-        match tier_embedding(deps, scope, type_id, surface_form, wtxn) {
+        match tier_embedding(deps, staged, scope, type_id, surface_form, wtxn) {
             Ok(EmbeddingProbe::AutoAlias { entity_id, .. }) => {
                 // A high cosine alone is not proof of identity: two
                 // distinct same-type entities ("Japan" vs "Tokyo", both
@@ -1252,24 +1399,25 @@ pub fn resolve_or_create_with_deps(
         "all resolver tiers missed; created a new entity",
     );
 
-    // Populate the entity HNSW so the next paraphrase can hit tier-3b.
-    // Failures here are non-fatal: the entity row is durable; the
-    // worst case is a near-miss future resolve.
+    // Feed the entity to tier-3b so the next paraphrase can match it:
+    // the durable vector row goes into `wtxn` (committing or rolling back
+    // with the entity row it describes), the in-RAM HNSW insert is staged
+    // for the caller to flush after commit. Failures here are non-fatal:
+    // the entity row is durable; the worst case is a near-miss future
+    // resolve until the next boot rebuild.
     //
-    // Skip during a Collect (plan) pass: that pass's redb writes are
-    // rolled back, but the in-memory HNSW is NOT transactional — an insert
-    // here would leave a vector pointing at an entity id the rollback
-    // erased. Only the committing apply pass populates the HNSW.
-    if !matches!(disambiguation, Disambiguation::Collect(_)) {
-        if let Some(deps) = embed_deps {
-            if let Err(reason) = insert_into_entity_hnsw(wtxn, deps, new_id, surface_form) {
-                tracing::warn!(
-                    target: "brain_extractors::resolver",
-                    entity_id = ?new_id,
-                    reason,
-                    "tier-4 entity-HNSW population failed; entity is durable but unreachable via tier-3b until a rebuild",
-                );
-            }
+    // Staged in EVERY disambiguation mode. The HNSW cannot un-insert, so
+    // an inline insert would outlive any rollback — the two-phase
+    // disambiguation's discarded plan pass, or an error out of the apply
+    // body — and point at an entity id no committed txn ever wrote.
+    if let Some(deps) = embed_deps {
+        if let Err(reason) = stage_entity_vector(wtxn, deps, staged, new_id, surface_form) {
+            tracing::warn!(
+                target: "brain_extractors::resolver",
+                entity_id = ?new_id,
+                reason,
+                "tier-4 entity-vector staging failed; entity is durable but unreachable via tier-3b until a rebuild",
+            );
         }
     }
 
@@ -1313,9 +1461,10 @@ enum EmbeddingProbe {
     None,
 }
 
-/// Tier-3b worker: embed the surface form, ask the HNSW for the top-K
-/// nearest entities, type-filter, classify the top score against the
-/// auto-alias / partial-match / drop thresholds.
+/// Tier-3b worker: embed the surface form, ask the HNSW (plus the
+/// pass-local staging area) for the top-K nearest entities, type-filter,
+/// classify the top score against the auto-alias / partial-match / drop
+/// thresholds.
 ///
 /// - `score >= EMBED_RESOLVE_THRESHOLD` → [`EmbeddingProbe::AutoAlias`].
 /// - `PARTIAL_MATCH_FLOOR <= score < EMBED_RESOLVE_THRESHOLD`
@@ -1324,6 +1473,7 @@ enum EmbeddingProbe {
 /// - `Err(reason)` for transient backend failures (embedder, HNSW lock).
 fn tier_embedding(
     deps: &EmbeddingDeps,
+    staged: &StagedEntityVectors,
     scope: RowScope,
     type_id: EntityTypeId,
     surface_form: &str,
@@ -1334,14 +1484,26 @@ fn tier_embedding(
         .embedder
         .embed(surface_form)
         .map_err(|e| format!("embedder failed: {e}"))?;
-    let hits = {
+    let mut hits = {
         let hnsw = deps.hnsw.read();
         if hnsw.is_empty() {
-            return Ok(EmbeddingProbe::None);
+            Vec::new()
+        } else {
+            hnsw.search(&vector, EMBED_RESOLVE_TOP_K)
+                .map_err(|e| format!("hnsw search failed: {e}"))?
         }
-        hnsw.search(&vector, EMBED_RESOLVE_TOP_K)
-            .map_err(|e| format!("hnsw search failed: {e}"))?
     };
+    // Entities minted earlier in THIS pass aren't in the index yet — their
+    // insert is held back until the txn commits — but their rows are in
+    // `wtxn`, so they're legitimate candidates for a later surface in the
+    // same memory. Scan them alongside the index hits and re-sort.
+    if !staged.is_empty() {
+        hits.extend(staged.probe(&vector, EMBED_RESOLVE_TOP_K));
+        hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut seen = HashSet::with_capacity(hits.len());
+        hits.retain(|(id, _)| seen.insert(*id));
+        hits.truncate(EMBED_RESOLVE_TOP_K);
+    }
     if hits.is_empty() {
         return Ok(EmbeddingProbe::None);
     }
@@ -1451,14 +1613,16 @@ fn nickname_entity_free_for_fuller(
     Ok(true)
 }
 
-/// Embed the entity's canonical name and insert into the HNSW. Best-
-/// effort: returns `Err(reason)` so the caller can decide whether to
-/// log or proceed. The resolver currently logs at `warn` and proceeds
-/// (the entity row is already committed; tier-3b becomes unreachable
-/// for paraphrases of this entity until a future HNSW rebuild).
-fn insert_into_entity_hnsw(
+/// Embed the entity's canonical name, persist the vector in `wtxn`, and
+/// stage the HNSW insert for post-commit publication. Best-effort:
+/// returns `Err(reason)` so the caller can decide whether to log or
+/// proceed. The resolver logs at `warn` and proceeds (the entity row
+/// still lands; tier-3b is merely unreachable for paraphrases of this
+/// entity until a future HNSW rebuild).
+fn stage_entity_vector(
     wtxn: &redb::WriteTransaction,
     deps: &EmbeddingDeps,
+    staged: &mut StagedEntityVectors,
     entity_id: EntityId,
     canonical_name: &str,
 ) -> Result<(), String> {
@@ -1466,13 +1630,12 @@ fn insert_into_entity_hnsw(
         .embedder
         .embed(canonical_name)
         .map_err(|e| format!("embedder failed: {e}"))?;
-    // Persist the vector before inserting into the in-RAM HNSW. The
-    // persist is the durability hook for restart: on next boot the
-    // entity HNSW rebuilds from these stored vectors without
-    // re-embedding. A failure here is
-    // non-fatal — log + fall through to the HNSW insert so the entity
-    // is at least immediately resolvable in this process; on restart
-    // the absent row drops back to the re-embed fallback.
+    // The stored vector is the durability hook for restart: on next boot
+    // the entity HNSW rebuilds from these rows without re-embedding. It
+    // is written INSIDE `wtxn`, so it lands exactly when the entity row
+    // does. A failure here is non-fatal — log + still stage, so the
+    // entity is resolvable for the rest of this process; on restart the
+    // absent row drops back to the re-embed fallback.
     if let Err(e) = entity_vector_put(wtxn, entity_id, &vector) {
         tracing::warn!(
             target: "brain_extractors::resolver",
@@ -1481,12 +1644,7 @@ fn insert_into_entity_hnsw(
             "entity_vector_put failed; HNSW will reseed via re-embed on next restart",
         );
     }
-    let mut hnsw = deps.hnsw.write();
-    if hnsw.contains(entity_id) {
-        return Ok(());
-    }
-    hnsw.insert(entity_id, &vector)
-        .map_err(|e| format!("hnsw insert failed: {e}"))?;
+    staged.stage(entity_id, vector);
     Ok(())
 }
 
@@ -1824,7 +1982,10 @@ mod tests {
         let wtxn = d.write_txn().unwrap();
         let res =
             resolve_or_create(&wtxn, test_scope(), "Mel", "brain:Person", 0.8, NOW + 1).unwrap();
-        assert_ne!(res.entity_id, caroline_id, "Mel must not merge onto Caroline");
+        assert_ne!(
+            res.entity_id, caroline_id,
+            "Mel must not merge onto Caroline"
+        );
         assert_eq!(res.tier, ResolutionTier::Created);
         wtxn.commit().unwrap();
     }
@@ -1847,8 +2008,8 @@ mod tests {
             res.entity_id
         };
         let wtxn = d.write_txn().unwrap();
-        let res =
-            resolve_or_create(&wtxn, test_scope(), "Melanie", "brain:Person", 0.8, NOW + 1).unwrap();
+        let res = resolve_or_create(&wtxn, test_scope(), "Melanie", "brain:Person", 0.8, NOW + 1)
+            .unwrap();
         assert_eq!(
             res.entity_id, mel_id,
             "Melanie should retroactively absorb the earlier Mel node"
@@ -1892,7 +2053,8 @@ mod tests {
         };
         let wtxn = d.write_txn().unwrap();
         let melissa =
-            resolve_or_create(&wtxn, test_scope(), "Melissa", "brain:Person", 0.8, NOW + 2).unwrap();
+            resolve_or_create(&wtxn, test_scope(), "Melissa", "brain:Person", 0.8, NOW + 2)
+                .unwrap();
         assert_eq!(
             melissa.tier,
             ResolutionTier::Created,
@@ -1928,8 +2090,8 @@ mod tests {
             wtxn.commit().unwrap();
         }
         let wtxn = d.write_txn().unwrap();
-        let res =
-            resolve_or_create(&wtxn, test_scope(), "Melanie", "brain:Person", 0.8, NOW + 1).unwrap();
+        let res = resolve_or_create(&wtxn, test_scope(), "Melanie", "brain:Person", 0.8, NOW + 1)
+            .unwrap();
         assert_eq!(
             res.tier,
             ResolutionTier::Created,
@@ -1948,14 +2110,15 @@ mod tests {
         let d = db(&dir);
         let gibson_id = {
             let wtxn = d.write_txn().unwrap();
-            let res = resolve_or_create(&wtxn, test_scope(), "Mel Gibson", "brain:Person", 0.8, NOW)
-                .unwrap();
+            let res =
+                resolve_or_create(&wtxn, test_scope(), "Mel Gibson", "brain:Person", 0.8, NOW)
+                    .unwrap();
             wtxn.commit().unwrap();
             res.entity_id
         };
         let wtxn = d.write_txn().unwrap();
-        let res =
-            resolve_or_create(&wtxn, test_scope(), "Melanie", "brain:Person", 0.8, NOW + 1).unwrap();
+        let res = resolve_or_create(&wtxn, test_scope(), "Melanie", "brain:Person", 0.8, NOW + 1)
+            .unwrap();
         assert_ne!(
             res.entity_id, gibson_id,
             "Melanie must not absorb the multi-token full name Mel Gibson"
@@ -1973,14 +2136,14 @@ mod tests {
         let d = db(&dir);
         let melanie_id = {
             let wtxn = d.write_txn().unwrap();
-            let res =
-                resolve_or_create(&wtxn, test_scope(), "Melanie", "brain:Person", 0.8, NOW).unwrap();
+            let res = resolve_or_create(&wtxn, test_scope(), "Melanie", "brain:Person", 0.8, NOW)
+                .unwrap();
             wtxn.commit().unwrap();
             res.entity_id
         };
         let wtxn = d.write_txn().unwrap();
-        let res =
-            resolve_or_create(&wtxn, test_scope(), "Melissa", "brain:Person", 0.8, NOW + 1).unwrap();
+        let res = resolve_or_create(&wtxn, test_scope(), "Melissa", "brain:Person", 0.8, NOW + 1)
+            .unwrap();
         assert_ne!(
             res.entity_id, melanie_id,
             "Melissa and Melanie share a stem but neither is a prefix of the other"
@@ -2010,9 +2173,8 @@ mod tests {
         }
         for surface in ["Hey Mel", "Thanks Mel", "Yeah Mel", "Wow Mel"] {
             let wtxn = d.write_txn().unwrap();
-            let res =
-                resolve_or_create(&wtxn, test_scope(), surface, "brain:Person", 0.8, NOW + 1)
-                    .unwrap();
+            let res = resolve_or_create(&wtxn, test_scope(), surface, "brain:Person", 0.8, NOW + 1)
+                .unwrap();
             assert_eq!(res.entity_id, mel_id, "{surface} should resolve to Mel");
             assert_eq!(res.tier, ResolutionTier::Exact);
             wtxn.commit().unwrap();
@@ -2088,6 +2250,17 @@ mod tests {
             "3 days ago",
             "in 2 weeks",
             "2020-01-15",
+            // Full calendar dates: the forms that used to slip through and
+            // become orphan Event-typed entity nodes.
+            "January 2026",
+            "january 2026",
+            "Jan 2026",
+            "January 5, 2026",
+            "January 5 2026",
+            "5 January 2026",
+            "8 May, 2023",
+            "2026",
+            "  January 2026  ",
         ] {
             assert!(
                 is_temporal_expression_surface(t),
@@ -2101,7 +2274,42 @@ mod tests {
         // Bare weekday / month names can be people — never reject them; and
         // real names are obviously not temporal.
         for t in [
-            "Friday", "Sun", "May", "June", "Melanie", "Mel", "Last Name", "next door",
+            "Friday",
+            "Sun",
+            "May",
+            "June",
+            // A bare month name stays eligible: it can be a person or a
+            // product. Only a month paired with a year is a date.
+            "January",
+            "Jan",
+            "Melanie",
+            "Mel",
+            "Last Name",
+            "next door",
+        ] {
+            assert!(
+                !is_temporal_expression_surface(t),
+                "{t} must not be treated as temporal"
+            );
+        }
+    }
+
+    #[test]
+    fn is_temporal_expression_surface_does_not_over_match_names_containing_dates() {
+        // The date recognizers are whole-surface anchored, so a year or month
+        // merely embedded in a longer name is not a date — these are genuine
+        // entities and must survive the guard.
+        for t in [
+            "Room 2026",
+            "Project 2026",
+            "Apollo 1969",
+            "2026 Roadmap",
+            "Q1 2026",
+            "Diego",
+            "billing team",
+            "Stripe",
+            "May Fourth Movement",
+            "January Jones",
         ] {
             assert!(
                 !is_temporal_expression_surface(t),
@@ -2403,6 +2611,37 @@ mod tests {
         }
     }
 
+    /// Resolve with the embedding tier wired and publish whatever tier-4
+    /// staged, mirroring the production `commit()`-then-flush sequence
+    /// (these tests commit on the next line and never roll back, so the
+    /// flush is ordered with the commit either way).
+    fn resolve_and_publish(
+        wtxn: &WriteTransaction,
+        scope: RowScope,
+        surface_form: &str,
+        entity_type_qname: &str,
+        confidence: f32,
+        now_unix_nanos: u64,
+        embed_deps: Option<&EmbeddingDeps>,
+    ) -> Result<Resolution, ResolverError> {
+        let mut staged = StagedEntityVectors::new();
+        let res = resolve_or_create_with_deps(
+            wtxn,
+            scope,
+            surface_form,
+            entity_type_qname,
+            confidence,
+            now_unix_nanos,
+            embed_deps,
+            &mut staged,
+            &mut Disambiguation::Off,
+        );
+        if let Some(deps) = embed_deps {
+            staged.flush_into_hnsw(deps);
+        }
+        res
+    }
+
     /// Stage an entity in redb + the HNSW with a chosen embedding.
     fn seed_entity(
         d: &mut MetadataDb,
@@ -2450,7 +2689,7 @@ mod tests {
 
         let deps = deps(embedder, hnsw);
         let wtxn = d.write_txn().unwrap();
-        let res = resolve_or_create_with_hnsw(
+        let res = resolve_and_publish(
             &wtxn,
             test_scope(),
             "Stripe Payments",
@@ -2499,7 +2738,7 @@ mod tests {
 
         let deps = deps(embedder, hnsw.clone());
         let wtxn = d.write_txn().unwrap();
-        let res = resolve_or_create_with_hnsw(
+        let res = resolve_and_publish(
             &wtxn,
             test_scope(),
             "Bitcoin",
@@ -2565,7 +2804,7 @@ mod tests {
 
         let deps = deps(embedder, hnsw);
         let wtxn = d.write_txn().unwrap();
-        let res = resolve_or_create_with_hnsw(
+        let res = resolve_and_publish(
             &wtxn,
             test_scope(),
             "Wong Group",
@@ -2599,7 +2838,7 @@ mod tests {
 
         let deps = deps(embedder, hnsw.clone());
         let wtxn = d.write_txn().unwrap();
-        let r1 = resolve_or_create_with_hnsw(
+        let r1 = resolve_and_publish(
             &wtxn,
             test_scope(),
             "Brand New Co",
@@ -2615,7 +2854,7 @@ mod tests {
 
         // Second resolve with a paraphrase hits tier-3b.
         let wtxn = d.write_txn().unwrap();
-        let r2 = resolve_or_create_with_hnsw(
+        let r2 = resolve_and_publish(
             &wtxn,
             test_scope(),
             "Brand New Company",
@@ -2663,7 +2902,7 @@ mod tests {
 
         let deps_holder = deps(embedder, hnsw.clone());
         let wtxn = d.write_txn().unwrap();
-        let res = resolve_or_create_with_hnsw(
+        let res = resolve_and_publish(
             &wtxn,
             test_scope(),
             "Acme Holdings",
@@ -2713,16 +2952,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let d = db(&dir);
         let wtxn = d.write_txn().unwrap();
-        let res = resolve_or_create_with_hnsw(
-            &wtxn,
-            test_scope(),
-            "Solo",
-            "brain:Person",
-            0.9,
-            NOW,
-            None,
-        )
-        .unwrap();
+        let res = resolve_and_publish(&wtxn, test_scope(), "Solo", "brain:Person", 0.9, NOW, None)
+            .unwrap();
         assert_eq!(res.tier, ResolutionTier::Created);
         wtxn.commit().unwrap();
     }

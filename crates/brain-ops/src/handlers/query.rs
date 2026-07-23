@@ -115,7 +115,10 @@ pub async fn handle_query_trace(
     let qp = plan(&planner_req).map_err(map_plan_error)?;
     let exec_ctx = build_executor_context(ctx)?;
     // TRACE executes the full retrieval, statement corpus included.
-    let result = execute(&qp, &planner_req, true, &exec_ctx)
+    // `trace_detail = false`: QUERY_TRACE renders text from the always-on
+    // count/latency fields already on `QueryMetadata`; it doesn't build a
+    // wire `RecallTrace`, so it has no use for the opt-in per-item detail.
+    let result = execute(&qp, &planner_req, true, false, &exec_ctx)
         .await
         .map_err(map_executor_error)?;
     Ok(QueryTraceResponse {

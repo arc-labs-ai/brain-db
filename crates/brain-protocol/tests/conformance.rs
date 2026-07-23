@@ -47,18 +47,20 @@ use brain_protocol::{
     EncodeResponse, EncodeStageArtifact, EncodeStageGraph, EncodeStageKeywordField,
     EncodeStageRecord, EncodeTrace, EncodeTraceArtifacts, EncodeTraceDedup, EncodeTraceEntity,
     EncodeTraceIndex, EncodeTraceRelation, EncodeTraceStage, EncodeTraceStageStatus,
-    EncodeTraceStatement,
-    EncodeVectorDirectRequest, EntityCreateRequest, EntityCreateResponse, EntityGetResponse,
-    EntityListItem, EntityListResponseFrame, EntityResolveResponse, EntityView, EventType,
-    EvidenceRefWire, ExtractorListItem, ExtractorListRequest, ExtractorListResponseFrame,
-    ForgetMode, ForgetRequest, ForgetResponse, Frame, GraphEdge, GraphFetchRequest,
-    GraphFetchResponseFrame, GraphNode, InferenceKind, InferenceStep, LinkResponse,
-    MaterializeProceduralRequest, MaterializeProceduralResponse, MemoryKindWire, MemoryListDirWire,
-    MemoryInspectRequest, MemoryInspectResponse, MemoryListItem, MemoryListRequest,
-    MemoryListResponseFrame, MemoryListSortWire,
-    MemoryListTimeAxisWire, ObservationInput, Opcode, PlanBudget, PlanRequest, PlanResponseFrame,
-    PlanState, PlanStatus, PlanStep, PongResponse, ReasonRequest, ReasonResponseFrame,
-    ReasonStatus, RecallRequest, RecallResponseFrame, RecallTrace, RecallTraceFilterChain,
+    EncodeTraceStatement, EncodeVectorDirectRequest, EntityCreateRequest, EntityCreateResponse,
+    EntityGetResponse, EntityListItem, EntityListResponseFrame, EntityResolveResponse, EntityView,
+    EventType, EvidenceRefWire, ExtractorListItem, ExtractorListRequest,
+    ExtractorListResponseFrame, ForgetMode, ForgetRequest, ForgetResponse, Frame, GraphEdge,
+    GraphFetchRequest, GraphFetchResponseFrame, GraphNode, InferenceKind, InferenceStep,
+    LinkResponse, MaterializeProceduralRequest, MaterializeProceduralResponse,
+    MemoryInspectRequest, MemoryInspectResponse, MemoryKindWire, MemoryListDirWire, MemoryListItem,
+    MemoryListRequest, MemoryListResponseFrame, MemoryListSortWire, MemoryListTimeAxisWire,
+    ObservationInput, Opcode, PlanBudget, PlanRequest, PlanResponseFrame, PlanState, PlanStatus,
+    PlanStep, PlanTrace, PlanTraceDirection, PlanTraceMeetingPoint, PlanTraceNode, PongResponse,
+    RankedItemKindWire, ReasonRequest, ReasonResponseFrame, ReasonStatus, ReasonTrace,
+    ReasonTraceBase, ReasonTraceCandidate, ReasonTraceCentroid, ReasonTraceEdgeCandidate,
+    ReasonTraceIdWithText, ReasonTraceScoreBreakdown, ReasonTraceScoredId, ReasonTraceWalk,
+    RecallRequest, RecallResponseFrame, RecallTrace, RecallTraceDroppedId, RecallTraceFilterChain,
     RecallTraceRerank, RecallTraceRetriever, RecallTraceRetrieverStatus, RelationCreateRequest,
     RelationCreateResponse, RelationListFromResponseFrame, RelationView, RequestBody,
     ResolutionOutcomeWire, ResponseBody, RetrieverNameWire, SchemaUploadRequest,
@@ -74,6 +76,8 @@ const AGENT: [u8; 16] = [0x22; 16];
 const FP: [u8; 16] = [0x33; 16];
 const EID: [u8; 16] = [0x44; 16];
 const SID: [u8; 16] = [0x55; 16];
+/// Fixed statement event time — 2026-01-01T00:00:00Z in unix nanos.
+const EVENT_AT: u64 = 1_767_225_600_000_000_000;
 
 /// Equivalent of a packed `MemoryId` with fixed shard / slot / version.
 fn mid() -> u128 {
@@ -423,6 +427,7 @@ fn sample_encode_response_trace() -> EncodeResponse {
                             predicate: "org:works_on".into(),
                             kind: "statement".into(),
                             confidence: 0.9,
+                            event_at_unix_nanos: Some(EVENT_AT),
                         }],
                     }),
                     ..Default::default()
@@ -448,6 +453,7 @@ fn sample_encode_response_trace() -> EncodeResponse {
                 predicate: "org:works_on".into(),
                 object_name: "brain".into(),
                 confidence: 0.9,
+                event_at_unix_nanos: Some(EVENT_AT),
             }],
             relations: vec![EncodeTraceRelation {
                 source_name: "niraj".into(),
@@ -645,6 +651,7 @@ fn sample_plan() -> PlanResponseFrame {
         }],
         is_final: true,
         plan_status: Some(PlanStatus::GoalReached),
+        trace: None,
     }
 }
 
@@ -660,7 +667,106 @@ fn sample_reason() -> ReasonResponseFrame {
         }],
         is_final: true,
         reason_status: Some(ReasonStatus::Complete),
+        trace: None,
     }
+}
+
+/// Final frame of a `trace = true` PLAN: carries a populated `PlanTrace`
+/// with the full bidirectional-BFS visited map (both directions) and every
+/// meeting point found, including the one dropped by the `max_paths` cap.
+fn sample_plan_trace() -> PlanResponseFrame {
+    let mut resp = sample_plan();
+    resp.trace = Some(PlanTrace {
+        explored: vec![
+            PlanTraceNode {
+                memory_id: mid(),
+                text: "origin: the trip begins in paris".into(),
+                direction: PlanTraceDirection::Forward,
+                depth: 0,
+                parent_edge: None,
+                alignment_score: None,
+            },
+            PlanTraceNode {
+                memory_id: mid(),
+                text: "destination: the trip ends in rome".into(),
+                direction: PlanTraceDirection::Backward,
+                depth: 1,
+                parent_edge: Some(mid()),
+                alignment_score: Some(0.62),
+            },
+        ],
+        meeting_points: vec![
+            PlanTraceMeetingPoint {
+                memory_id: mid(),
+                text: "layover in milan connects both legs".into(),
+                included_in_result: true,
+            },
+            PlanTraceMeetingPoint {
+                memory_id: mid(),
+                text: "layover in zurich, discarded by the max_paths cap".into(),
+                included_in_result: false,
+            },
+        ],
+    });
+    resp
+}
+
+/// Final frame of a `trace = true` REASON: carries a populated
+/// `ReasonTrace` un-collapsing the base candidate set, the outward evidence
+/// walk's considered/dropped edges, the per-item score breakdown, and the
+/// centroid computation outcome.
+fn sample_reason_trace() -> ReasonResponseFrame {
+    let mut resp = sample_reason();
+    resp.trace = Some(ReasonTrace {
+        base: ReasonTraceBase {
+            candidates: vec![ReasonTraceCandidate {
+                memory_id: mid(),
+                text: "the sky is blue".into(),
+                score: 0.9,
+            }],
+        },
+        walk: ReasonTraceWalk {
+            considered: vec![ReasonTraceEdgeCandidate {
+                memory_id: mid(),
+                text: "the sky turned dark before the storm".into(),
+                edge_kind: EdgeKindWire::Caused,
+                depth: 1,
+                from_memory_id: mid(),
+                raw_score: 0.7,
+            }],
+            dropped_by_edge_kind: Vec::new(),
+            dropped_by_tombstone: vec![ReasonTraceIdWithText {
+                memory_id: mid(),
+                text: "the sky was blue yesterday, later retracted".into(),
+            }],
+            dropped_by_visited: Vec::new(),
+            dropped_by_confidence: vec![ReasonTraceScoredId {
+                memory_id: mid(),
+                text: "some clouds were visible in the distance".into(),
+                score: 0.2,
+            }],
+            dropped_by_max_supporting: Vec::new(),
+            dropped_by_max_contradicting: vec![ReasonTraceIdWithText {
+                memory_id: mid(),
+                text: "the sky is actually green, per one outlier report".into(),
+            }],
+        },
+        scoring: vec![ReasonTraceScoreBreakdown {
+            memory_id: mid(),
+            text: "the sky is blue".into(),
+            base_similarity: 0.9,
+            decay: 0.95,
+            weight_product: 1.0,
+            alignment: 0.8,
+            analogical_fit: 1.15,
+            final_score: 0.7866,
+        }],
+        centroid: ReasonTraceCentroid {
+            computed: false,
+            skipped_reason: Some("singleton base".into()),
+        },
+    });
+    resp
 }
 
 fn sample_link() -> LinkResponse {
@@ -744,6 +850,10 @@ fn sample_memory_inspect_response() -> MemoryInspectResponse {
                     predicate: "org:works_on".into(),
                     kind: "statement".into(),
                     confidence: 0.9,
+                    // Left undated on purpose: this fixture pins the
+                    // omitted-key encoding of an event-less edge, the
+                    // counterpart to the dated edge in `resp_encode_trace`.
+                    event_at_unix_nanos: None,
                 }],
             }),
         },
@@ -806,13 +916,18 @@ fn sample_graph_fetch_request() -> GraphFetchRequest {
         // cross-language contract as MEMORY_LIST's cursor.
         cursor: vec![0x2a, 0x00, 0xff, 0x18, 0x7b],
         include_statements: true,
-        include_memories: false,
+        include_memories: true,
+        include_memory_edges: true,
         include_tombstoned: false,
         act_as: None,
     }
 }
 
 fn sample_graph_fetch_response() -> GraphFetchResponseFrame {
+    // Two memory ids for the memory layer; distinct from EID/RID so the
+    // node-kind byte is what disambiguates the id-space, not the bytes.
+    const MEM_A: [u8; 16] = [0x66; 16];
+    const MEM_B: [u8; 16] = [0x77; 16];
     GraphFetchResponseFrame {
         nodes: vec![
             GraphNode {
@@ -827,13 +942,48 @@ fn sample_graph_fetch_response() -> GraphFetchResponseFrame {
                 label: "Aurora Robotics".into(),
                 type_qname: "brain:Organization".into(),
             },
+            GraphNode {
+                id: MEM_A,
+                kind: 2,
+                label: "Sarah Chen works at Aurora Robotics".into(),
+                type_qname: String::new(),
+            },
+            GraphNode {
+                id: MEM_B,
+                kind: 2,
+                label: "Sarah joined Aurora in March".into(),
+                type_qname: String::new(),
+            },
         ],
-        edges: vec![GraphEdge {
-            from_id: EID,
-            to_id: RID,
-            kind: 0,
-            label: "brain:works_at".into(),
-        }],
+        edges: vec![
+            GraphEdge {
+                from_id: EID,
+                to_id: RID,
+                kind: 0,
+                label: "brain:works_at".into(),
+            },
+            GraphEdge {
+                from_id: MEM_A,
+                to_id: EID,
+                kind: 3,
+                label: String::new(),
+            },
+            // Memory↔memory builtin edges: one symmetric (SimilarTo = 7),
+            // one directional (FollowedBy = 5). The kind byte alone tells
+            // them apart — there is no companion field.
+            GraphEdge {
+                from_id: MEM_A,
+                to_id: MEM_B,
+                kind: 7,
+                label: "similar_to".into(),
+            },
+            GraphEdge {
+                from_id: MEM_A,
+                to_id: MEM_B,
+                kind: 5,
+                label: "followed_by".into(),
+            },
+        ],
         // Non-empty: exercises the `Vec<u8>` array-of-ints cursor on the
         // response side too.
         next_cursor: vec![0x2a, 0x00, 0xff, 0x18, 0x7b],
@@ -1009,6 +1159,7 @@ fn corpus() -> Vec<Case> {
         context_filter: None,
         request_id: Some(RID),
         txn_id: None,
+        trace: true,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
             agent_id: AGENT,
@@ -1029,6 +1180,7 @@ fn corpus() -> Vec<Case> {
         budget_wall_time_ms: 1_000,
         request_id: Some(RID),
         txn_id: None,
+        trace: true,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
             agent_id: AGENT,
@@ -1219,6 +1371,7 @@ fn corpus() -> Vec<Case> {
                     status_detail: String::new(),
                     latency_ms: 1.5,
                     candidate_count: 12,
+                    candidates: Vec::new(),
                 },
                 RecallTraceRetriever {
                     name: RetrieverNameWire::Graph,
@@ -1226,6 +1379,7 @@ fn corpus() -> Vec<Case> {
                     status_detail: "no anchor".into(),
                     latency_ms: 0.0,
                     candidate_count: 0,
+                    candidates: Vec::new(),
                 },
             ],
             filter_chain: RecallTraceFilterChain {
@@ -1237,13 +1391,32 @@ fn corpus() -> Vec<Case> {
                 after_supersession: 7,
                 after_as_of: 7,
                 after_limit: 5,
+                dropped_by_type: Vec::new(),
+                dropped_by_temporal: Vec::new(),
+                dropped_by_confidence: Vec::new(),
+                dropped_by_tombstone: Vec::new(),
+                dropped_by_supersession: vec![RecallTraceDroppedId {
+                    kind: RankedItemKindWire::Statement,
+                    id: mid(),
+                }],
+                dropped_by_as_of: vec![RecallTraceDroppedId {
+                    kind: RankedItemKindWire::Relation,
+                    id: mid(),
+                }],
+                dropped_by_limit: vec![RecallTraceDroppedId {
+                    kind: RankedItemKindWire::Memory,
+                    id: mid(),
+                }],
             },
             rerank: Some(RecallTraceRerank {
                 applied: true,
                 candidates: 5,
                 latency_ms: 2.25,
+                before_order: Vec::new(),
+                after_order: Vec::new(),
             }),
             total_latency_ms: 4.75,
+            fusion: None,
         }),
     };
     cases.push(resp_case(
@@ -1368,6 +1541,18 @@ fn corpus() -> Vec<Case> {
         "resp_reason",
         ResponseBody::Reason(sample_reason()),
         &sample_reason(),
+    ));
+    // Final frame of a `trace = true` PLAN/REASON: exercises the opt-in
+    // per-stage trace wire path, mirroring `resp_recall_trace`.
+    cases.push(resp_case(
+        "resp_plan_trace",
+        ResponseBody::Plan(sample_plan_trace()),
+        &sample_plan_trace(),
+    ));
+    cases.push(resp_case(
+        "resp_reason_trace",
+        ResponseBody::Reason(sample_reason_trace()),
+        &sample_reason_trace(),
     ));
     cases.push(resp_case(
         "resp_link",

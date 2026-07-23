@@ -489,7 +489,8 @@ impl WalPayload {
             | WalRecordKind::StatementSupersede
             | WalRecordKind::StatementTombstone
             | WalRecordKind::SchemaUpdate
-            | WalRecordKind::Audit => {
+            | WalRecordKind::Audit
+            | WalRecordKind::StageCompleted => {
                 // Layout: agent_id (16 B) || opaque body. The body
                 // remains opaque to the framing layer; phases 16+
                 // supply typed parsers via their own sinks.

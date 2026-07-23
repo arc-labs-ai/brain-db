@@ -3,7 +3,9 @@
 //! Handles per-op index write paths plus evidence handling: the inline
 //! cap, overflow spill, and reverse-index population.
 
-use brain_core::{EntityId, EvidenceOverflowId, PredicateId, StatementId, StatementKind};
+use brain_core::{
+    EntityId, EntityTypeId, EvidenceOverflowId, PredicateId, StatementId, StatementKind,
+};
 use brain_core::{EvidenceEntry, EvidenceRef, Predicate, Statement, StatementObject, SubjectRef};
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
@@ -114,7 +116,7 @@ pub fn statement_create(
     // Predicate must be registered. Validate against its constraints.
     let pred = predicate_get_via(wtxn, s.predicate)?
         .ok_or(StatementOpError::UnknownPredicate(s.predicate.raw()))?;
-    validate_against_predicate(s, &pred)?;
+    validate_against_predicate(wtxn, s, &pred)?;
 
     // ID uniqueness.
     {
@@ -228,7 +230,11 @@ pub(super) fn validate_statement_shape(s: &Statement) -> Result<(), StatementOpE
 }
 
 /// Per-predicate constraint enforcement.
-fn validate_against_predicate(s: &Statement, p: &Predicate) -> Result<(), StatementOpError> {
+fn validate_against_predicate(
+    wtxn: &WriteTransaction,
+    s: &Statement,
+    p: &Predicate,
+) -> Result<(), StatementOpError> {
     if let Some(want_kind) = p.kind_constraint {
         if want_kind != s.kind {
             return Err(StatementOpError::InvalidArgument(
@@ -246,6 +252,22 @@ fn validate_against_predicate(s: &Statement, p: &Predicate) -> Result<(), Statem
             return Err(StatementOpError::InvalidArgument(
                 "statement object variant violates predicate object_type_constraint",
             ));
+        }
+    }
+    // A declared `object: Entity<Type>` range narrows the variant check
+    // to one entity type. `0` means the declaration was a bare `Entity`
+    // (or another variant entirely) and admits any type.
+    if p.object_entity_type_id != 0 {
+        if let StatementObject::Entity(eid) = s.object {
+            let actual =
+                entity_type_of(wtxn, eid)?.ok_or(StatementOpError::UnknownObjectEntity(eid))?;
+            if actual.raw() != p.object_entity_type_id {
+                return Err(StatementOpError::ObjectEntityTypeMismatch {
+                    entity: eid,
+                    expected: EntityTypeId::from(p.object_entity_type_id),
+                    actual,
+                });
+            }
         }
     }
     Ok(())
@@ -701,6 +723,18 @@ fn entity_get_via(txn: TxnAsRead<'_>, id: EntityId) -> Result<bool, StatementOpE
             Ok(row.is_some())
         }
     }
+}
+
+/// The registered entity type of `id`, or `None` when the entity row
+/// doesn't exist. Used by the declared-`Entity<Type>` object check.
+fn entity_type_of(
+    wtxn: &WriteTransaction,
+    id: EntityId,
+) -> Result<Option<EntityTypeId>, StatementOpError> {
+    use crate::tables::entity::{EntityMetadata, ENTITIES_TABLE};
+    let t = wtxn.open_table(ENTITIES_TABLE)?;
+    let row: Option<EntityMetadata> = t.get(&id.to_bytes())?.map(|g| g.value());
+    Ok(row.map(|r| EntityTypeId::from(r.entity_type_id)))
 }
 
 fn predicate_get_via(
@@ -1195,6 +1229,110 @@ mod tests {
         matches!(err, StatementOpError::UnknownSubject(_))
             .then_some(())
             .expect("expected UnknownSubject");
+    }
+
+    // ----- Declared `object: Entity<Type>` range enforcement. -----
+
+    const ORGANIZATION_ID: brain_core::EntityTypeId = brain_core::EntityTypeId(2);
+
+    fn make_entity_typed(
+        db: &mut crate::MetadataDb,
+        name: &str,
+        entity_type: brain_core::EntityTypeId,
+    ) -> EntityId {
+        let id = EntityId::new();
+        let normalized = crate::entity::ops::normalize_name(name);
+        let e = Entity::new_active(
+            id,
+            entity_type,
+            name.to_string(),
+            normalized,
+            1_700_000_000_000_000_000,
+        );
+        let wtxn = db.write_txn().unwrap();
+        crate::entity::ops::entity_put(&wtxn, test_scope(), &e).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    /// Intern a Fact predicate declaring `object: Entity<entity_type>`.
+    fn intern_fact_entity_typed_pred(
+        db: &mut crate::MetadataDb,
+        name: &str,
+        entity_type: brain_core::EntityTypeId,
+    ) -> PredicateId {
+        use crate::schema::predicate::ObjectConstraint;
+        let wtxn = db.write_txn().unwrap();
+        let id = predicate_intern(
+            &wtxn,
+            "test",
+            name,
+            Some(StatementKind::Fact),
+            ObjectConstraint::entity(entity_type.raw()),
+            /* schema_version */ 1,
+            "",
+            false,
+            1_700_000_000_000_000_000,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    #[test]
+    fn declared_object_entity_type_accepts_conforming_object() {
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "typed-subject");
+        let org = make_entity_typed(&mut db, "typed-org", ORGANIZATION_ID);
+        let pred = intern_fact_entity_typed_pred(&mut db, "works_at_typed", ORGANIZATION_ID);
+
+        let s = fresh_fact(subj, pred, org);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), &s, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_get(&rtxn, s.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn declared_object_entity_type_rejects_wrong_type() {
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "typed-subject-2");
+        let person_object = make_entity(&mut db, "not-an-org");
+        let pred = intern_fact_entity_typed_pred(&mut db, "works_at_typed2", ORGANIZATION_ID);
+
+        let s = fresh_fact(subj, pred, person_object);
+        let wtxn = db.write_txn().unwrap();
+        let err = statement_create(&wtxn, test_scope(), &s, 0).unwrap_err();
+        match err {
+            StatementOpError::ObjectEntityTypeMismatch {
+                entity,
+                expected,
+                actual,
+            } => {
+                assert_eq!(entity, person_object);
+                assert_eq!(expected, ORGANIZATION_ID);
+                assert_eq!(actual, EntityType::PERSON_ID);
+            }
+            other => panic!("expected ObjectEntityTypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn untyped_entity_object_declaration_permits_any_entity_type() {
+        // `object: Entity<Any>` (and every implicit-from-write
+        // predicate) constrains the variant only — the pre-existing
+        // behaviour must not tighten.
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "bare-subject");
+        let concept = make_entity_typed(&mut db, "bare-concept", brain_core::EntityTypeId(6));
+        let pred = intern_fact_entity_pred(&mut db, "relates_bare");
+
+        let s = fresh_fact(subj, pred, concept);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), &s, 0).unwrap();
+        wtxn.commit().unwrap();
     }
 
     #[test]

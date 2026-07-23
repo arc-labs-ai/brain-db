@@ -252,9 +252,20 @@ fn is_meaningful_object(o: &StatementObject) -> bool {
 /// fire. Deliberately above the loose [`GROUNDED_MATCH_FLOOR`] (0.5): projecting
 /// a specific slot's value AS the grounded answer is a stronger claim than
 /// boosting on a predicate-name cosine, so it demands a strong, unambiguous
-/// question match. Set to match `GROUNDED_SINGLE_STRONG_MATCH` (0.6) — the same
-/// bar the downstream consensus collapse uses before it may shrink the set.
-pub const SLOT_PROJECTION_STRONG_FLOOR: f32 = 0.6;
+/// question match.
+///
+/// Raised from 0.6 to 0.66 as the grounded half of the honest-abstention fix. A
+/// grounded `Answer` makes the read bypass BOTH abstention gates (the typed
+/// graph is presumed to hold the fact), so a *spurious* slot-projection answer
+/// is not merely a wrong result — it suppresses `None` entirely. Measured: an
+/// off-topic cue ("asdfghjkl qwerty") slot-matched at 0.626 and cleared the old
+/// 0.6 bar, shipping the whole band as `Many`. BGE-small's compressed geometry
+/// puts even gibberish slot-matches in the low 0.6s, so the projection bar must
+/// sit above that noise floor. Genuine slot answers score well clear of it (the
+/// passage-level gap between real and off-topic cues is ~2×). Calibrated against
+/// the read fixtures; the robust long-term fix is a cross-encoder verifier
+/// (rerank is off by default here), tracked as follow-up.
+pub const SLOT_PROJECTION_STRONG_FLOOR: f32 = 0.66;
 
 /// Project the matched [`Slot`] of a reified statement into a [`GroundedValue`].
 ///

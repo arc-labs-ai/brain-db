@@ -193,9 +193,13 @@ fn graph_counts(
         .unwrap_or(0);
 
     // Entities this memory mentions (Mentions edges out of the memory node).
-    let entities = walk_outgoing(rtxn, NodeRef::Memory(memory_id), Some(EdgeKindRef::Mentions))
-        .map(|v| v.len())
-        .unwrap_or(0);
+    let entities = walk_outgoing(
+        rtxn,
+        NodeRef::Memory(memory_id),
+        Some(EdgeKindRef::Mentions),
+    )
+    .map(|v| v.len())
+    .unwrap_or(0);
 
     // Relations sourced by this memory (evidence reverse index).
     let relations = brain_metadata::relations_with_evidence(rtxn, scope, memory_id)
@@ -270,7 +274,11 @@ fn filter_signature(req: &MemoryListRequest) -> [u8; 8] {
     out
 }
 
-fn encode_cursor(req: &MemoryListRequest, sig: &[u8; 8], key: &[u8; AGENT_TIMELINE_KEY_LEN]) -> Vec<u8> {
+fn encode_cursor(
+    req: &MemoryListRequest,
+    sig: &[u8; 8],
+    key: &[u8; AGENT_TIMELINE_KEY_LEN],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(CURSOR_LEN);
     out.push(CURSOR_VERSION);
     out.push(req.sort as u8);

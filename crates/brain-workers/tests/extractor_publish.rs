@@ -14,13 +14,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brain_core::ExtractorKind;
-use brain_core::{ExtractorId, Memory as CoreMemory, MemoryId};
+use brain_core::{AgentId, ExtractorId, Memory as CoreMemory, MemoryId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_extractors::{
     ExtractedItem, ExtractionContext, ExtractionFuture, ExtractionResult, Extractor,
     ExtractorRegistry,
 };
 use brain_index::{IndexParams, SharedHnsw};
+use brain_llm::client::{model_id_hash, LlmFuture};
+use brain_llm::{LlmClient, LlmRequest, LlmResponse};
+use brain_metadata::llm_cache::LlmCacheDb;
 use brain_metadata::tables::extractor_audit::{
     pipeline_status, record_extracted, tier_status, ExtractorItemCounts,
     ExtractorPipelineAuditEntry,
@@ -29,9 +32,10 @@ use brain_metadata::MetadataDb;
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::shared::enums::{
-    EventType, StageAuditStatus, StageKind, StageOutcome, StagePayload,
+    EventType, StageAuditStatus, StageHypePayload, StageKind, StageOutcome, StagePayload,
 };
-use brain_workers::{ExtractorWorker, Worker, WorkerContext};
+use brain_workers::{ExtractorWorker, HypeGenerator, Worker, WorkerContext};
+use parking_lot::{Mutex as PLMutex, RwLock as PLRwLock};
 use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -83,6 +87,17 @@ impl Fixture {
 }
 
 fn build_fixture_with_registry(registry: ExtractorRegistry) -> Fixture {
+    build_fixture_with_registry_and_hype(registry, None)
+}
+
+/// Same as [`build_fixture_with_registry`], plus optionally wires a
+/// [`HypeGenerator`] onto the worker so `run_cycle`'s trailing
+/// `run_hype_pass` actually generates (rather than silently no-op'ing
+/// with `worker.hype = None`).
+fn build_fixture_with_registry_and_hype(
+    registry: ExtractorRegistry,
+    hype: Option<HypeGenerator>,
+) -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
     let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
@@ -99,7 +114,10 @@ fn build_fixture_with_registry(registry: ExtractorRegistry) -> Fixture {
     let ops = Arc::new(ops);
 
     let (tx, rx) = flume::bounded::<brain_ops::ExtractorEnqueue>(64);
-    let worker = ExtractorWorker::new(rx);
+    let mut worker = ExtractorWorker::new(rx);
+    if let Some(hype) = hype {
+        worker = worker.with_hype(hype);
+    }
 
     let ctx = WorkerContext {
         ops: ops.clone(),
@@ -127,6 +145,35 @@ fn now_unix_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u64
+}
+
+/// Seed a `MEMORIES_TABLE` row for `memory_id` owned by `agent_id`, so the
+/// worker's `memory_scope` / `memory_agent_id` lookups resolve the real
+/// owner instead of falling back to the system-scope default. Real ENCODE
+/// always writes this row before enqueueing extraction/HyPE work; a
+/// synthetic test id needs it planted explicitly.
+fn seed_memory_row(metadata: &SharedMetadataDb, memory_id: MemoryId, agent_id: AgentId) {
+    use brain_core::{ContextId, MemoryKind, NamespaceId};
+    use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
+    let row = MemoryMetadata::new_active(
+        memory_id,
+        NamespaceId::SYSTEM,
+        agent_id,
+        ContextId(0),
+        0,
+        0,
+        MemoryKind::Episodic,
+        [0u8; 16],
+        1.0,
+        0,
+        now_unix_nanos(),
+    );
+    let wtxn = metadata.write_txn().unwrap();
+    {
+        let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
+        t.insert(&memory_id.to_be_bytes(), &row).unwrap();
+    }
+    wtxn.commit().unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +567,41 @@ async fn drain_already_extracted_publishes_one_empty_event() {
     let _ = Uuid::nil();
 }
 
+/// The `StageCompleted{Extractor}` envelope carries the memory's REAL
+/// owning `agent_id` — not `AgentId::default()` — so an agent-scoped
+/// SUBSCRIBE filter (`filter.agents: [agent]`) actually matches the
+/// event. Regression coverage for the bug where every publish site
+/// stamped the nil agent, silently dropping the event for every
+/// real (non-default-agent) subscriber.
+#[tokio::test(flavor = "current_thread")]
+async fn drain_success_publishes_real_owning_agent_id() {
+    let mut registry = ExtractorRegistry::new();
+    registry.register(Arc::new(EmptySuccessStub {
+        id: ExtractorId::from(1),
+    }));
+    let fixture = build_fixture_with_registry(registry);
+    let mut rx = fixture.ops.events.receiver();
+
+    let owner = AgentId::new();
+    let memory_id = make_memory_id(300);
+    seed_memory_row(&fixture.metadata, memory_id, owner);
+    fixture.enqueue(memory_id, "hello world, owned memory");
+
+    let drained = run_cycle(&fixture).await;
+    assert_eq!(drained, 1);
+    tokio::time::sleep(Duration::from_millis(0)).await;
+
+    let events = drain_bus(&mut rx);
+    let stage = stage_completed_for(&events, memory_id);
+    assert_eq!(stage.len(), 1);
+    assert_eq!(
+        stage[0].agent_id, owner,
+        "StageCompleted{{Extractor}} must carry the memory's real owning \
+         agent_id, not AgentId::default()",
+    );
+    assert_ne!(stage[0].agent_id, AgentId::default());
+}
+
 /// Read the durable extraction-queue depth.
 fn queue_len(metadata: &SharedMetadataDb) -> u64 {
     let rtxn = metadata.read_txn().unwrap();
@@ -629,4 +711,216 @@ async fn already_audited_memory_removes_stale_queue_row_without_reextracting() {
         "stale queue row must be removed via the audit-gate cleanup path",
     );
     assert_eq!(queue_len(&fixture.metadata), 0);
+}
+
+// ---------------------------------------------------------------------------
+// HyPE publish.
+// ---------------------------------------------------------------------------
+
+/// Fake LLM client that always replies with a fixed newline-delimited
+/// question list at a fixed cost, regardless of the request. Enough to
+/// drive [`HypeGenerator::generate_for`] through its real generate →
+/// embed → persist → index path without a network call.
+struct FakeHypeLlmClient {
+    reply: String,
+    cost_micro_usd: u64,
+}
+
+impl LlmClient for FakeHypeLlmClient {
+    fn complete<'a>(&'a self, _request: LlmRequest) -> LlmFuture<'a> {
+        let content = self.reply.clone();
+        let cost_micro_usd = self.cost_micro_usd;
+        Box::pin(async move {
+            Ok(LlmResponse {
+                content,
+                tokens_in: 10,
+                tokens_out: 20,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                cost_micro_usd,
+                model_version: "fake-hype-model-v1".to_string(),
+            })
+        })
+    }
+
+    fn model(&self) -> &str {
+        "fake-hype-model"
+    }
+
+    fn model_id_hash(&self) -> u64 {
+        model_id_hash("fake-hype-model")
+    }
+}
+
+fn build_hype_generator(
+    metadata: SharedMetadataDb,
+    tempdir: &tempfile::TempDir,
+    reply: &str,
+    cost_micro_usd: u64,
+) -> HypeGenerator {
+    let cache_path = tempdir.path().join("llm_cache.redb");
+    let cache = LlmCacheDb::open(&cache_path).expect("open llm cache");
+    let index = Arc::new(PLRwLock::new(
+        brain_index::HypeHnswIndex::new(brain_index::hype_default_params())
+            .expect("HypeHnswIndex::new"),
+    ));
+    let client: Arc<dyn LlmClient> = Arc::new(FakeHypeLlmClient {
+        reply: reply.to_string(),
+        cost_micro_usd,
+    });
+    HypeGenerator::new(
+        client,
+        "fake-hype-model".to_string(),
+        Arc::new(NopDispatcher) as Arc<dyn Dispatcher>,
+        index,
+        metadata,
+        Arc::new(PLMutex::new(cache)),
+        6,
+    )
+}
+
+/// A cycle whose worker has HyPE wired publishes exactly one
+/// `StageCompleted{Hype, Ok}` event per drained memory, carrying the
+/// memory-identifying `memory_id` field on the envelope (the same field
+/// the extractor's own `StageCompleted{Extractor}` publish uses) plus a
+/// `StagePayload::Hype` with the real question count and LLM cost the
+/// fake client reported. This is the event a `memory_ids`-scoped
+/// SUBSCRIBE filter matches against.
+#[tokio::test(flavor = "current_thread")]
+async fn hype_pass_publishes_one_ok_event_with_questions_and_cost() {
+    let registry = ExtractorRegistry::new();
+    let tempdir = tempfile::tempdir().unwrap();
+    let db_path = tempdir.path().join("metadata.redb");
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    let hype = build_hype_generator(
+        metadata.clone(),
+        &tempdir,
+        "Where does Priya work?\nWhat city is Priya based in?\nWhat is Priya's title?",
+        777,
+    );
+
+    let fixture = build_fixture_with_registry_and_hype(registry, Some(hype));
+    let mut rx = fixture.ops.events.receiver();
+
+    let memory_id = make_memory_id(200);
+    fixture.enqueue(memory_id, "Priya Sharma works at Stripe in San Francisco");
+
+    let drained = run_cycle(&fixture).await;
+    assert_eq!(drained, 1);
+    tokio::time::sleep(Duration::from_millis(0)).await;
+
+    let events = drain_bus(&mut rx);
+    let hype_events: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.event_type == EventType::StageCompleted && e.stage_kind == Some(StageKind::Hype)
+        })
+        .collect();
+    assert_eq!(
+        hype_events.len(),
+        1,
+        "expected exactly one StageCompleted{{Hype}}; got {}",
+        hype_events.len(),
+    );
+    let env = hype_events[0];
+    // The memory-identifying field: same `memory_id` field the sibling
+    // AutoEdge/TemporalEdge/Extractor `StageCompleted` publishes use, and
+    // the field a `memory_ids`-scoped SUBSCRIBE filter matches against.
+    assert_eq!(env.memory_id, memory_id);
+    assert_eq!(env.stage_outcome, Some(StageOutcome::Ok));
+    match env.stage_payload.as_ref().expect("payload populated") {
+        StagePayload::Hype(StageHypePayload {
+            questions_written,
+            cost_micro_usd,
+        }) => {
+            assert_eq!(*questions_written, 3, "fake client returns 3 questions");
+            assert_eq!(*cost_micro_usd, 777, "fake client's cost, not a cache hit");
+        }
+        other => panic!("unexpected stage payload: {other:?}"),
+    }
+}
+
+/// A memory whose HyPE pass yields zero questions (empty LLM reply)
+/// still publishes exactly one `StageCompleted{Hype, Empty}` event —
+/// mirroring how AutoEdge/TemporalEdge publish `Empty` rather than
+/// dropping the publish on a zero-output cycle, so a `--wait` caller
+/// never hangs.
+#[tokio::test(flavor = "current_thread")]
+async fn hype_pass_with_empty_reply_publishes_one_empty_event() {
+    let registry = ExtractorRegistry::new();
+    let tempdir = tempfile::tempdir().unwrap();
+    let db_path = tempdir.path().join("metadata.redb");
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    let hype = build_hype_generator(metadata.clone(), &tempdir, "", 0);
+
+    let fixture = build_fixture_with_registry_and_hype(registry, Some(hype));
+    let mut rx = fixture.ops.events.receiver();
+
+    let memory_id = make_memory_id(201);
+    fixture.enqueue(memory_id, "text with no parseable questions");
+
+    let drained = run_cycle(&fixture).await;
+    assert_eq!(drained, 1);
+    tokio::time::sleep(Duration::from_millis(0)).await;
+
+    let events = drain_bus(&mut rx);
+    let hype_events: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.event_type == EventType::StageCompleted && e.stage_kind == Some(StageKind::Hype)
+        })
+        .collect();
+    assert_eq!(hype_events.len(), 1);
+    let env = hype_events[0];
+    assert_eq!(env.memory_id, memory_id);
+    assert_eq!(env.stage_outcome, Some(StageOutcome::Empty));
+    match env.stage_payload.as_ref().expect("payload populated") {
+        StagePayload::Hype(StageHypePayload {
+            questions_written, ..
+        }) => {
+            assert_eq!(*questions_written, 0);
+        }
+        other => panic!("unexpected stage payload: {other:?}"),
+    }
+}
+
+/// The `StageCompleted{Hype}` envelope carries the memory's real owning
+/// `agent_id`, matching the sibling extractor-publish guarantee above —
+/// both publishers share the same `memory_scope` lookup in
+/// `run_hype_pass`, so this pins that the scope's agent (not
+/// `AgentId::default()`) actually reaches the envelope.
+#[tokio::test(flavor = "current_thread")]
+async fn hype_pass_publishes_real_owning_agent_id() {
+    let registry = ExtractorRegistry::new();
+    let tempdir = tempfile::tempdir().unwrap();
+    let db_path = tempdir.path().join("metadata.redb");
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    let hype = build_hype_generator(metadata.clone(), &tempdir, "Where does Priya work?", 42);
+
+    let fixture = build_fixture_with_registry_and_hype(registry, Some(hype));
+    let mut rx = fixture.ops.events.receiver();
+
+    let owner = AgentId::new();
+    let memory_id = make_memory_id(202);
+    seed_memory_row(&fixture.metadata, memory_id, owner);
+    fixture.enqueue(memory_id, "Priya Sharma works at Stripe in San Francisco");
+
+    let drained = run_cycle(&fixture).await;
+    assert_eq!(drained, 1);
+    tokio::time::sleep(Duration::from_millis(0)).await;
+
+    let events = drain_bus(&mut rx);
+    let hype_events: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.event_type == EventType::StageCompleted && e.stage_kind == Some(StageKind::Hype)
+        })
+        .collect();
+    assert_eq!(hype_events.len(), 1);
+    assert_eq!(
+        hype_events[0].agent_id, owner,
+        "StageCompleted{{Hype}} must carry the memory's real owning \
+         agent_id, not AgentId::default()",
+    );
+    assert_ne!(hype_events[0].agent_id, AgentId::default());
 }

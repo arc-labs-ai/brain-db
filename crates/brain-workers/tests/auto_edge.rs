@@ -99,6 +99,19 @@ fn make_id(slot: u64) -> MemoryId {
 }
 
 async fn seed_memory_with_vec(fixture: &Fixture, slot: u64, vector: [f32; VECTOR_DIM]) -> MemoryId {
+    seed_memory_with_vec_agent(fixture, slot, vector, AgentId::default()).await
+}
+
+/// Same as [`seed_memory_with_vec`], but stamps the memory's owning agent
+/// explicitly. `apply_upsert_memory` derives `MEMORIES_TABLE.agent_id_bytes`
+/// from the enclosing `Write`'s `agent_id` — this is what lets the
+/// `StageCompleted{AutoEdge}` agent-id tests seed a real, non-default owner.
+async fn seed_memory_with_vec_agent(
+    fixture: &Fixture,
+    slot: u64,
+    vector: [f32; VECTOR_DIM],
+    agent_id: AgentId,
+) -> MemoryId {
     use brain_core::Salience;
     use brain_ops::{Phase, Write, WriteId};
 
@@ -117,7 +130,7 @@ async fn seed_memory_with_vec(fixture: &Fixture, slot: u64, vector: [f32; VECTOR
         content_hash: None,
         deduplicate: false,
     };
-    let write = Write::single(WriteId::new(), AgentId::default(), phase);
+    let write = Write::single(WriteId::new(), agent_id, phase);
     fixture.writer.submit(write).await.expect("seed submit");
     id
 }
@@ -216,6 +229,53 @@ fn cycle_writes_link_phase_through_unified_path() {
             found >= 2,
             "symmetric SimilarTo writes two forward rows, got {found}"
         );
+    });
+}
+
+/// The `StageCompleted{AutoEdge}` envelope carries the source memory's
+/// REAL owning `agent_id` — not `AgentId::default()` — so an agent-scoped
+/// SUBSCRIBE filter (`filter.agents: [agent]`) actually matches the
+/// event. Regression coverage for the bug where the publish site stamped
+/// the nil agent unconditionally.
+#[test]
+fn cycle_publishes_stage_completed_with_real_owning_agent_id() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let v = unit_vec(0);
+        let owner = AgentId::new();
+
+        let m1 = seed_memory_with_vec_agent(&fix, 1, v, owner).await;
+        let _m2 = seed_memory_with_vec_agent(&fix, 2, v, owner).await;
+
+        let mut rx = fix.bus.receiver();
+        fix.sender.try_send((m1, v)).expect("enqueue");
+
+        let worker = AutoEdgeWorker::new(fix.receiver.clone()).with_knobs(AutoEdgeKnobs {
+            top_k: 5,
+            similarity_threshold: 0.5,
+            ef_search: Some(64),
+        });
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wctx = WorkerContext {
+            ops: fix.ctx.clone(),
+            shutdown,
+        };
+        let processed = worker.run_cycle(&wctx).await.unwrap();
+        assert!(processed > 0);
+
+        let mut found = false;
+        while let Ok(env) = rx.try_recv() {
+            if env.event_type == brain_protocol::EventType::StageCompleted && env.memory_id == m1 {
+                assert_eq!(
+                    env.agent_id, owner,
+                    "StageCompleted{{AutoEdge}} must carry the memory's real \
+                     owning agent_id, not AgentId::default()",
+                );
+                assert_ne!(env.agent_id, AgentId::default());
+                found = true;
+            }
+        }
+        assert!(found, "expected a StageCompleted{{AutoEdge}} for m1");
     });
 }
 
@@ -348,6 +408,66 @@ fn worker_drains_within_100ms_despite_5s_interval() {
         // parked in `recv_async`. The test's assertion is already
         // proven; clean shutdown timing isn't what we're pinning.
         drop(sched);
+    });
+}
+
+/// The cycle must merge the real derived-edge detail (target memory id +
+/// cosine similarity) into the source memory's durable write-artifact
+/// bundle — not just bump a count — so `MEMORY_INSPECT` can show which
+/// specific memory got linked and how strongly. Regression coverage for the
+/// gap where `auto_edge` never called into `brain_ops::memory_artifact`.
+#[test]
+fn cycle_merges_real_target_and_weight_into_artifact_bundle() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let v = unit_vec(0);
+
+        let m1 = seed_memory_with_vec(&fix, 1, v).await;
+        let m2 = seed_memory_with_vec(&fix, 2, v).await;
+
+        fix.sender.try_send((m1, v)).expect("enqueue");
+
+        let worker = AutoEdgeWorker::new(fix.receiver.clone()).with_knobs(AutoEdgeKnobs {
+            top_k: 5,
+            similarity_threshold: 0.5,
+            ef_search: Some(64),
+        });
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wctx = WorkerContext {
+            ops: fix.ctx.clone(),
+            shutdown,
+        };
+        let processed = worker.run_cycle(&wctx).await.unwrap();
+        assert!(processed > 0);
+
+        let bundle = brain_ops::memory_artifact::read_memory_artifact(&fix.metadata, m1)
+            .unwrap()
+            .expect("artifact read must succeed");
+        let graph = bundle
+            .graph
+            .expect("auto_edge must merge a graph fragment into m1's bundle");
+
+        let edge = graph
+            .edges
+            .iter()
+            .find(|e| e.kind == "similar_to")
+            .expect("bundle must carry a similar_to edge, not just a count");
+        assert_eq!(edge.source, m1.to_be_bytes());
+        assert_eq!(
+            edge.target,
+            m2.to_be_bytes(),
+            "bundle must name the real linked memory"
+        );
+        assert!(
+            edge.confidence > 0.9,
+            "bundle must carry the real cosine similarity (identical vectors), got {}",
+            edge.confidence
+        );
+
+        assert!(
+            graph.nodes.iter().any(|n| n.id == m2.to_be_bytes()),
+            "linked memory must appear as a node"
+        );
     });
 }
 

@@ -26,6 +26,7 @@
     17
   ],
   "txn_id": null,
+  "trace": true,
   "act_as": {
     "namespace": "tenant-acme",
     "agent_id": [

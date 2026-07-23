@@ -29,17 +29,28 @@ use brain_core::{EdgeKind, MemoryId};
 use brain_embed::VECTOR_DIM;
 use brain_metadata::tables::edge::list_memory_edges_from;
 use brain_metadata::tables::text::TEXTS_TABLE;
+use brain_metadata::RowScope;
 use brain_protocol::envelope::request::ObservationInput;
 
 use crate::plan::reason::ReasonPlan;
-use crate::vsa::{cosine_to_centroid, semantic_centroid};
+use crate::vsa::{cosine_to_centroid, semantic_centroid, Codebook};
 
+use super::analogical::{self, EvidenceTriple};
 use super::context::ExecutorContext;
 use super::error::ExecError;
 use super::result::{
-    EvidenceItem, InferenceStep, InferenceStream, InferenceStreamTerminal, ReasonResult,
-    ReasonStatus,
+    EvidenceItem, InferenceKind, InferenceStep, InferenceStream, InferenceStreamTerminal,
+    ReasonResult, ReasonStatus, ReasonTrace, ReasonTraceBase, ReasonTraceCandidate,
+    ReasonTraceCentroid, ReasonTraceEdgeCandidate, ReasonTraceScoreBreakdown, ReasonTraceTrim,
+    ReasonTraceWalk,
 };
+
+/// Absolute-confidence shift (post-nudge vs. evidence-only) above
+/// which a step is tagged `InferenceKind::AnalogicalInference` instead
+/// of `EvidenceAccumulation`. `0.01` is comfortably above float noise
+/// (`1e-6`) and requires the analogical-fit nudge to have actually
+/// moved the aggregate, not just touched one item at the margin.
+const ANALOGICAL_TAG_THRESHOLD: f32 = 0.01;
 
 const BASE_RECALL_EF: usize = 32;
 
@@ -53,13 +64,22 @@ const BASE_RECALL_EF: usize = 32;
 /// is empty); the multi-frame framing is in place so future passes
 /// that split walks per traversal can emit a step per pass without
 /// changing the wire contract.
+///
+/// `trace` mirrors RECALL's `trace_detail` convention: `false` (the
+/// default) is the fast path with zero extra per-item capture; `true`
+/// additionally populates [`InferenceStreamTerminal::trace`] (and, via
+/// `execute_reason`, [`ReasonResult::trace`]) with the full per-stage
+/// detail described on [`ReasonTrace`].
 pub async fn execute_reason_stream(
     plan: ReasonPlan,
     ctx: &ExecutorContext,
+    trace: bool,
 ) -> Result<InferenceStream, ExecError> {
-    let result = execute_reason(plan, ctx).await?;
+    let result = execute_reason(plan, ctx, trace).await?;
     let confidence = result.confidence;
     let status = result.status;
+    let trace_out = result.trace;
+    let inference_kind = result.inference_kind;
     let mut steps: Vec<InferenceStep> = Vec::new();
     if !result.base_memories.is_empty() {
         steps.push(InferenceStep {
@@ -68,6 +88,7 @@ pub async fn execute_reason_stream(
             supporting: result.supporting,
             contradicting: result.contradicting,
             confidence,
+            inference_kind,
         });
     }
     let steps_emitted = u32::try_from(steps.len()).unwrap_or(u32::MAX);
@@ -77,6 +98,7 @@ pub async fn execute_reason_stream(
             status,
             confidence,
             steps_emitted,
+            trace: trace_out,
         },
     })
 }
@@ -84,9 +106,10 @@ pub async fn execute_reason_stream(
 pub async fn execute_reason(
     plan: ReasonPlan,
     ctx: &ExecutorContext,
+    trace: bool,
 ) -> Result<ReasonResult, ExecError> {
     // 1. Base resolution.
-    let (base_scores, base_memories) = resolve_base(&plan, ctx)?;
+    let (base_scores, base_memories, base_trace) = resolve_base(&plan, ctx, trace)?;
     if base_scores.is_empty() {
         return Ok(ReasonResult {
             base_memories,
@@ -94,6 +117,11 @@ pub async fn execute_reason(
             contradicting: Vec::new(),
             confidence: 0.0,
             status: ReasonStatus::Complete,
+            trace: trace.then_some(ReasonTrace {
+                base: base_trace,
+                ..ReasonTrace::default()
+            }),
+            inference_kind: InferenceKind::EvidenceAccumulation,
         });
     }
 
@@ -103,7 +131,8 @@ pub async fn execute_reason(
     // un-aligned baseline. `None` when the base is a singleton, when
     // any required text row is missing, or when an embed errors;
     // walk_outward then proceeds with neutral alignment (factor = 1).
-    let base_centroid = build_base_centroid(&plan.observation, &base_scores, ctx);
+    let (base_centroid, centroid_trace) =
+        build_base_centroid(&plan.observation, &base_scores, ctx, trace);
 
     let started = Instant::now();
     let wall_ms = u64::from(plan.budget_wall_time_ms);
@@ -119,7 +148,7 @@ pub async fn execute_reason(
         .copied()
         .collect();
 
-    let mut supporting = walk_outward(
+    let (mut supporting, supports_walk_trace, mut scoring_trace) = walk_outward(
         &base_scores,
         &supports_kinds,
         plan.supports_traversal.max_depth,
@@ -128,6 +157,7 @@ pub async fn execute_reason(
         started,
         wall_ms,
         base_centroid.as_ref(),
+        trace,
     )?;
 
     // Direct-similarity supporting items: every base memory is a
@@ -140,9 +170,20 @@ pub async fn execute_reason(
             edge_weights: Vec::new(),
             distance: 0,
         });
+        if trace {
+            scoring_trace.push(ReasonTraceScoreBreakdown {
+                memory_id: id,
+                base_similarity: sim,
+                decay: 1.0,
+                weight_product: 1.0,
+                alignment: 1.0,
+                analogical_fit: 1.0,
+                final_score: sim,
+            });
+        }
     }
 
-    let contradicting = walk_outward(
+    let (contradicting, contradicts_walk_trace, contradicting_scoring_trace) = walk_outward(
         &base_scores,
         &contradicts_kinds,
         plan.contradicts_traversal.max_depth,
@@ -151,15 +192,79 @@ pub async fn execute_reason(
         started,
         wall_ms,
         base_centroid.as_ref(),
+        trace,
     )?;
+    if trace {
+        scoring_trace.extend(contradicting_scoring_trace);
+    }
 
     // 3+4. Apply confidence floor + trim.
     let floor = plan.confidence_threshold;
-    let mut supporting = filter_and_trim(supporting, floor, plan.aggregation.max_supporting);
-    let mut contradicting =
-        filter_and_trim(contradicting, floor, plan.aggregation.max_contradicting);
+    let (mut supporting, supports_trim_trace) =
+        filter_and_trim(supporting, floor, plan.aggregation.max_supporting, trace);
+    let (mut contradicting, contradicts_trim_trace) = filter_and_trim(
+        contradicting,
+        floor,
+        plan.aggregation.max_contradicting,
+        trace,
+    );
 
-    // Sort by score descending for a deterministic result order.
+    // Evidence-only confidence — computed on the pre-nudge scores that
+    // `filter_and_trim` just floored/capped against. Used only below
+    // to decide the "which kind wins" tag; the analogical-fit pass
+    // that follows can only re-rank these same survivors, never
+    // resurrect anything the floor already cut.
+    let sum_s0: f32 = supporting.iter().map(|e| e.score).sum();
+    let sum_c0: f32 = contradicting.iter().map(|e| e.score).sum();
+    let confidence_evidence_only = if sum_s0 + sum_c0 <= 0.0 {
+        0.0
+    } else {
+        (sum_s0 - sum_c0) / (sum_s0 + sum_c0)
+    };
+
+    // VSA analogical-inference nudge (bounded re-rank only — see
+    // `executor::analogical`). One fresh, deterministically seeded
+    // `Codebook` per call, dropped at the end of this function; never
+    // a shared/global mutable singleton.
+    let scope = RowScope::new(ctx.caller_namespace, ctx.caller_agent);
+    let analogical_rtxn = ctx.metadata.read_txn().ok();
+    let observation_triple: Option<EvidenceTriple> =
+        analogical_rtxn
+            .as_ref()
+            .and_then(|rtxn| match &plan.observation {
+                ObservationInput::ByMemoryId(raw) => {
+                    analogical::resolve_statement_triple(rtxn, scope, MemoryId::from(*raw))
+                }
+                // No natural memory id to bridge to a statement for a
+                // ByText observation; analogical fit stays neutral for
+                // every item in this call (handled by `analogical_fit`'s
+                // None-either-side fallback).
+                ObservationInput::ByText(_) => None,
+            });
+    if let Some(rtxn) = &analogical_rtxn {
+        let mut codebook = Codebook::new(analogical::ANALOGICAL_CODEBOOK_SEED);
+        apply_analogical_fit(
+            &mut supporting,
+            rtxn,
+            scope,
+            observation_triple.as_ref(),
+            &mut codebook,
+            &mut scoring_trace,
+            trace,
+        );
+        apply_analogical_fit(
+            &mut contradicting,
+            rtxn,
+            scope,
+            observation_triple.as_ref(),
+            &mut codebook,
+            &mut scoring_trace,
+            trace,
+        );
+    }
+
+    // Sort by (possibly nudged) score descending for a deterministic
+    // result order.
     supporting.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -180,10 +285,32 @@ pub async fn execute_reason(
         (sum_s - sum_c) / (sum_s + sum_c)
     };
 
+    // Which kind wins: tag the step `AnalogicalInference` only when the
+    // nudge moved the aggregate confidence materially away from its
+    // evidence-only baseline; otherwise it's the plain evidence-
+    // accumulation walk (today's only other reachable value —
+    // `CausalExplanation` is reserved for a future executor path).
+    let inference_kind = if (confidence - confidence_evidence_only).abs() > ANALOGICAL_TAG_THRESHOLD
+    {
+        InferenceKind::AnalogicalInference
+    } else {
+        InferenceKind::EvidenceAccumulation
+    };
+
     // Status: if the wall-clock or inference budget was exceeded mid-walk
     // it's already encoded in `walk_outward`'s early-return. We use a
     // conservative default of Complete here; future precision is fine.
     let status = ReasonStatus::Complete;
+
+    let reason_trace = trace.then_some(ReasonTrace {
+        base: base_trace,
+        supports_walk: supports_walk_trace,
+        contradicts_walk: contradicts_walk_trace,
+        supports_trim: supports_trim_trace,
+        contradicts_trim: contradicts_trim_trace,
+        scoring: scoring_trace,
+        centroid: centroid_trace,
+    });
 
     Ok(ReasonResult {
         base_memories,
@@ -191,6 +318,8 @@ pub async fn execute_reason(
         contradicting,
         confidence,
         status,
+        trace: reason_trace,
+        inference_kind,
     })
 }
 
@@ -198,10 +327,13 @@ pub async fn execute_reason(
 // Base resolution.
 // ---------------------------------------------------------------------------
 
-fn resolve_base(
-    plan: &ReasonPlan,
-    ctx: &ExecutorContext,
-) -> Result<(HashMap<MemoryId, f32>, Vec<MemoryId>), ExecError> {
+/// `(base_scores, base_memory_ids, base_trace)` — the base-similarity
+/// map, the same ids in ANN-rank order, and the full-detail candidate
+/// trace (empty unless `resolve_base` was called with `trace = true`).
+type ResolveBaseResult =
+    Result<(HashMap<MemoryId, f32>, Vec<MemoryId>, ReasonTraceBase), ExecError>;
+
+fn resolve_base(plan: &ReasonPlan, ctx: &ExecutorContext, trace: bool) -> ResolveBaseResult {
     match &plan.observation {
         ObservationInput::ByMemoryId(raw) => {
             let id = MemoryId::from(*raw);
@@ -209,11 +341,23 @@ fn resolve_base(
             // BFS short-circuits to an empty result set, matching
             // `search_active`'s silent-filter for ByText seeds.
             if ctx.index.is_tombstoned(id) {
-                return Ok((HashMap::new(), Vec::new()));
+                return Ok((HashMap::new(), Vec::new(), ReasonTraceBase::default()));
             }
             let mut map = HashMap::with_capacity(1);
             map.insert(id, 1.0_f32);
-            Ok((map, vec![id]))
+            let base_trace = if trace {
+                let texts = fetch_trace_texts(&[id], ctx);
+                ReasonTraceBase {
+                    candidates: vec![ReasonTraceCandidate {
+                        memory_id: id,
+                        text: texts.get(&id).cloned(),
+                        score: 1.0,
+                    }],
+                }
+            } else {
+                ReasonTraceBase::default()
+            };
+            Ok((map, vec![id], base_trace))
         }
         ObservationInput::ByText(text) => {
             // Caller-supplied observation text — query side of BGE
@@ -225,11 +369,52 @@ fn resolve_base(
                 .saturating_add(plan.aggregation.max_contradicting)
                 .max(1);
             let hits = ctx.index.search_active(&vector, k, Some(BASE_RECALL_EF));
+            let base_trace = if trace {
+                let ids: Vec<MemoryId> = hits.iter().map(|(id, _)| *id).collect();
+                let texts = fetch_trace_texts(&ids, ctx);
+                ReasonTraceBase {
+                    candidates: hits
+                        .iter()
+                        .map(|(id, score)| ReasonTraceCandidate {
+                            memory_id: *id,
+                            text: texts.get(id).cloned(),
+                            score: *score,
+                        })
+                        .collect(),
+                }
+            } else {
+                ReasonTraceBase::default()
+            };
             let order: Vec<MemoryId> = hits.iter().map(|(id, _)| *id).collect();
             let map: HashMap<MemoryId, f32> = hits.into_iter().collect();
-            Ok((map, order))
+            Ok((map, order, base_trace))
         }
     }
+}
+
+/// Batched text lookup for the full-detail base-candidate trace. Best-
+/// effort: misses (tombstoned row races, non-UTF8, no text row) are
+/// silently skipped, matching `fetch_texts`'s precedent in the RECALL
+/// executor (`retrieval::executor::logic`). Only called when
+/// `trace = true`.
+fn fetch_trace_texts(ids: &[MemoryId], ctx: &ExecutorContext) -> HashMap<MemoryId, String> {
+    let mut out = HashMap::with_capacity(ids.len());
+    let Ok(rtxn) = ctx.metadata.read_txn() else {
+        return out;
+    };
+    let Ok(table) = rtxn.open_table(TEXTS_TABLE) else {
+        return out;
+    };
+    for id in ids {
+        if let Ok(Some(guard)) = table.get(id.to_be_bytes()) {
+            if let Ok(s) = std::str::from_utf8(guard.value()) {
+                if !s.is_empty() {
+                    out.insert(*id, s.to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -255,9 +440,20 @@ fn walk_outward(
     started: Instant,
     wall_ms: u64,
     base_centroid: Option<&[f32; VECTOR_DIM]>,
-) -> Result<Vec<EvidenceItem>, ExecError> {
+    trace: bool,
+) -> Result<
+    (
+        Vec<EvidenceItem>,
+        ReasonTraceWalk,
+        Vec<ReasonTraceScoreBreakdown>,
+    ),
+    ExecError,
+> {
+    let mut walk_trace = ReasonTraceWalk::default();
+    let mut scoring_trace: Vec<ReasonTraceScoreBreakdown> = Vec::new();
+
     if edge_kinds.is_empty() || max_depth == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), walk_trace, scoring_trace));
     }
 
     let rtxn = ctx
@@ -294,19 +490,61 @@ fn walk_outward(
         if crumb.depth >= max_depth {
             continue;
         }
+        let candidate_depth = crumb.depth + 1;
 
-        let mut neighbours: Vec<(EdgeKind, MemoryId, f32)> =
-            list_memory_edges_from(&rtxn, node, None)
-                .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?
-                .into_iter()
-                .filter(|(k, _, _)| edge_kinds.contains(k))
-                .map(|(k, t, data)| (k, t, data.weight))
-                .collect();
+        let raw_edges = list_memory_edges_from(&rtxn, node, None)
+            .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
+
+        let mut neighbours: Vec<(EdgeKind, MemoryId, f32)> = Vec::with_capacity(raw_edges.len());
+        for (k, t, data) in raw_edges {
+            if trace {
+                walk_trace.considered.push(ReasonTraceEdgeCandidate {
+                    memory_id: t,
+                    edge_kind: k,
+                    depth: candidate_depth,
+                    from_memory_id: node,
+                    raw_score: data.weight,
+                });
+            }
+            if edge_kinds.contains(&k) {
+                neighbours.push((k, t, data.weight));
+            } else if trace {
+                walk_trace
+                    .dropped_by_edge_kind
+                    .push(ReasonTraceEdgeCandidate {
+                        memory_id: t,
+                        edge_kind: k,
+                        depth: candidate_depth,
+                        from_memory_id: node,
+                        raw_score: data.weight,
+                    });
+            }
+        }
 
         // Drop committed tombstoned memories from REASON traversals.
         // Outside an active txn this is the only filter; inside one,
         // the snap retain below layers in-flight tombstones on top.
-        neighbours.retain(|(_, t, _)| !ctx.index.is_tombstoned(*t));
+        if trace {
+            let mut kept = Vec::with_capacity(neighbours.len());
+            for (k, t, w) in neighbours {
+                if ctx.index.is_tombstoned(t) {
+                    walk_trace
+                        .dropped_by_tombstone
+                        .push(ReasonTraceEdgeCandidate {
+                            memory_id: t,
+                            edge_kind: k,
+                            depth: candidate_depth,
+                            from_memory_id: node,
+                            raw_score: w,
+                        });
+                } else {
+                    kept.push((k, t, w));
+                }
+            }
+            neighbours = kept;
+        } else {
+            neighbours.retain(|(_, t, _)| !ctx.index.is_tombstoned(*t));
+        }
 
         if let Some(snap) = &ctx.txn {
             for (src, kind, tgt, w) in &snap.pending_links {
@@ -320,6 +558,17 @@ fn walk_outward(
 
         for (kind, next, weight) in neighbours {
             if visited.contains_key(&next) {
+                if trace {
+                    walk_trace
+                        .dropped_by_visited
+                        .push(ReasonTraceEdgeCandidate {
+                            memory_id: next,
+                            edge_kind: kind,
+                            depth: candidate_depth,
+                            from_memory_id: node,
+                            raw_score: weight,
+                        });
+                }
                 continue;
             }
             let new_depth = crumb.depth + 1;
@@ -357,6 +606,17 @@ fn walk_outward(
                 .max(0.0);
             let alignment = topic_alignment_factor(next, base_centroid, &rtxn, ctx);
             let score = crumb.base_similarity * decay * weight_product * alignment;
+            if trace {
+                scoring_trace.push(ReasonTraceScoreBreakdown {
+                    memory_id: next,
+                    base_similarity: crumb.base_similarity,
+                    decay,
+                    weight_product,
+                    alignment,
+                    analogical_fit: 1.0,
+                    final_score: score,
+                });
+            }
             evidence.push(EvidenceItem {
                 memory_id: next,
                 score,
@@ -371,7 +631,7 @@ fn walk_outward(
         }
     }
 
-    Ok(evidence)
+    Ok((evidence, walk_trace, scoring_trace))
 }
 
 fn reconstruct_path(
@@ -396,15 +656,84 @@ fn reconstruct_path(
     (path, weights)
 }
 
-fn filter_and_trim(items: Vec<EvidenceItem>, floor: f32, max: usize) -> Vec<EvidenceItem> {
-    let mut filtered: Vec<EvidenceItem> = items.into_iter().filter(|e| e.score >= floor).collect();
+/// Drop items below `floor`, sort by score descending, then truncate to
+/// `max`. `trace` gates the two `ReasonTraceTrim` drop lists: `false`
+/// keeps this a plain filter/sort/truncate with no extra collection.
+fn filter_and_trim(
+    items: Vec<EvidenceItem>,
+    floor: f32,
+    max: usize,
+    trace: bool,
+) -> (Vec<EvidenceItem>, ReasonTraceTrim) {
+    let mut trim = ReasonTraceTrim::default();
+    let mut filtered: Vec<EvidenceItem> = Vec::with_capacity(items.len());
+    for item in items {
+        if item.score >= floor {
+            filtered.push(item);
+        } else if trace {
+            trim.dropped_by_confidence
+                .push((item.memory_id, item.score));
+        }
+    }
     filtered.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    filtered.truncate(max);
-    filtered
+    if filtered.len() > max {
+        if trace {
+            trim.dropped_by_trim_cap = filtered[max..]
+                .iter()
+                .map(|e| (e.memory_id, e.score))
+                .collect();
+        }
+        filtered.truncate(max);
+    }
+    (filtered, trim)
+}
+
+// ---------------------------------------------------------------------------
+// VSA analogical-inference nudge. Runs strictly after `filter_and_trim`
+// (see the call site in `execute_reason`) so it can only re-rank
+// survivors — a confidence-floor drop can never be un-dropped by a
+// favourable analogical fit. See `executor::analogical` for the triple
+// resolution and the bounded-multiplier math.
+// ---------------------------------------------------------------------------
+
+/// Multiply each item's `score` by its analogical-fit factor against
+/// `observation_triple`, in place. `scoring_trace` is best-effort
+/// updated to match (keyed by `memory_id`, same assumption the rest of
+/// `ReasonTrace::scoring` already makes) so the nudge is inspectable
+/// in trace mode; a lookup miss there (item wasn't captured in the
+/// trace, e.g. `trace = false`) is silently skipped.
+fn apply_analogical_fit(
+    items: &mut [EvidenceItem],
+    rtxn: &redb::ReadTransaction,
+    scope: RowScope,
+    observation_triple: Option<&EvidenceTriple>,
+    codebook: &mut Codebook,
+    scoring_trace: &mut [ReasonTraceScoreBreakdown],
+    trace: bool,
+) {
+    for item in items.iter_mut() {
+        let candidate_triple = analogical::resolve_statement_triple(rtxn, scope, item.memory_id);
+        let fit =
+            analogical::analogical_fit(observation_triple, candidate_triple.as_ref(), codebook);
+        item.score *= fit;
+        if trace {
+            if let Some(entry) = scoring_trace
+                .iter_mut()
+                .find(|e| e.memory_id == item.memory_id)
+            {
+                entry.analogical_fit = fit;
+                entry.final_score = entry.base_similarity
+                    * entry.decay
+                    * entry.weight_product
+                    * entry.alignment
+                    * fit;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -430,26 +759,40 @@ fn build_base_centroid(
     observation: &ObservationInput,
     base: &HashMap<MemoryId, f32>,
     ctx: &ExecutorContext,
-) -> Option<[f32; VECTOR_DIM]> {
+    trace: bool,
+) -> (Option<[f32; VECTOR_DIM]>, ReasonTraceCentroid) {
+    let mut out = ReasonTraceCentroid::default();
+    // Small helper so every early-return path stamps the trace's
+    // `skipped_reason` (only when `trace` is set — the `&str` itself is
+    // free, `.to_string()` is the only allocation and it's gated).
+    macro_rules! skip {
+        ($reason:expr) => {{
+            if trace {
+                out.skipped_reason = Some($reason.to_string());
+            }
+            return (None, out);
+        }};
+    }
+
     if base.len() < 2 {
-        return None;
+        skip!("singleton_base");
     }
     if matches!(observation, ObservationInput::ByText(_)) {
-        return None;
+        skip!("by_text_observation");
     }
 
     let rtxn = match ctx.metadata.read_txn() {
         Ok(t) => t,
         Err(e) => {
             tracing::debug!(error = %e, "REASON base-centroid: read txn failed; skipping");
-            return None;
+            skip!(format!("read_txn_failed: {e}"));
         }
     };
     let table = match rtxn.open_table(TEXTS_TABLE) {
         Ok(t) => t,
         Err(e) => {
             tracing::debug!(error = %e, "REASON base-centroid: texts table open failed; skipping");
-            return None;
+            skip!(format!("table_open_failed: {e}"));
         }
     };
 
@@ -459,7 +802,7 @@ fn build_base_centroid(
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(?id, error = %e, "REASON base-centroid: text lookup failed; skipping");
-                return None;
+                skip!(format!("text_lookup_failed: {e}"));
             }
         };
         let Some(guard) = row else { continue };
@@ -475,14 +818,17 @@ fn build_base_centroid(
         }
     }
     if vectors.len() < 2 {
-        return None;
+        skip!("missing_text_rows");
     }
     let refs: Vec<&[f32; VECTOR_DIM]> = vectors.iter().collect();
     match semantic_centroid::<VECTOR_DIM>(&refs) {
-        Ok(c) => Some(c),
+        Ok(c) => {
+            out.computed = true;
+            (Some(c), out)
+        }
         Err(e) => {
             tracing::debug!(error = ?e, "REASON base-centroid: bundle failed; skipping");
-            None
+            skip!(format!("bundle_failed: {e:?}"));
         }
     }
 }

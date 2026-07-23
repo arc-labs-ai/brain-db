@@ -1075,4 +1075,76 @@ mod tests {
             .count();
         assert_eq!(graph_count, 3);
     }
+
+    /// Build a flagged `StageCompleted` notification record the way
+    /// `OpsContext::publish_notification` does: opaque-body kind,
+    /// `FLAG_SUBSCRIBE_EVENT` set, arbitrary CBOR-shaped body (recovery
+    /// never decodes it — the flag alone routes it to skip).
+    fn stage_completed_record(body: Vec<u8>) -> WalRecord {
+        use crate::wal::payload::PhaseBodyRecord;
+        let mut rec = WalRecord::from_typed(
+            Lsn(0),
+            0,
+            1_700_000_000_000_000_003,
+            0xF00D,
+            &WalPayload::PhaseBody(PhaseBodyRecord::new(
+                WalRecordKind::StageCompleted,
+                brain_core::AgentId::default(),
+                body,
+            )),
+        );
+        rec.flags = FLAG_SUBSCRIBE_EVENT;
+        rec
+    }
+
+    #[test]
+    fn recovery_skips_flagged_stage_completed_records() {
+        // Unlike typed-graph kinds, `StageCompleted` has no separate
+        // durable write record at all — the flagged notification record
+        // IS the only WAL trace of the event. Recovery must still skip
+        // it (it's not state to hydrate into any table): this is the
+        // crash-recovery guard mirroring the typed-graph
+        // `FLAG_SUBSCRIBE_EVENT` skip precedent
+        // (`brain-metadata/tests/recovery_integration.rs`), scoped to
+        // this crate's own `InMemoryMetadataSink` harness.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = fresh_wal_dir(&dir);
+        // A body that would fail to rkyv-decode as any substrate row —
+        // proves recovery never attempts to interpret it, just skips on
+        // the flag.
+        let cbor_like_body = b"\xa1istage_kindA".to_vec();
+        let records = vec![
+            encode_record(0),
+            stage_completed_record(cbor_like_body),
+            encode_record(1),
+        ];
+        write_via_wal(&wal_dir, records);
+
+        let mut arena = fresh_arena(&dir, 16);
+        let mut sink = InMemoryMetadataSink::new();
+        let (report, _alloc) = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap();
+
+        assert_eq!(
+            report.records_replayed, 2,
+            "only the two substrate Encode records replay"
+        );
+        assert_eq!(
+            report.records_skipped, 1,
+            "the flagged StageCompleted notification record is skipped, not applied"
+        );
+        assert_eq!(report.records_discarded, 0);
+
+        // Substrate slots 0/1 populated normally; the flagged record
+        // never reached the sink.
+        for slot in 0..2u64 {
+            let s = arena.slot(slot);
+            assert!(s.is_occupied(), "slot {slot} should be occupied");
+        }
+        let applied = sink.applied();
+        assert_eq!(applied.len(), 2, "sink sees only the two Encode records");
+        assert!(
+            applied.values().all(|p| matches!(p, WalPayload::Encode(_))),
+            "no StageCompleted payload reached the sink"
+        );
+    }
 }

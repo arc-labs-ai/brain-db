@@ -185,7 +185,9 @@ how the router found the memories is an internal concern the caller never sees.
 ```rust
 struct RecallAnswer {
     answer_kind: AnswerKind,          // Single | Many | None
-    memories: Vec<RecallResult>,      // 1 for Single, 2+ for Many, 0 for None
+    memories: Vec<RecallResult>,      // 0 for None; see §"Lead vs. retained
+                                       // membership" below for Single/Many —
+                                       // the count is NOT always 1 / 2+
     partial: bool,                    // True if some shards failed
     total_candidates: usize,          // Pre-filter count (for diagnostics)
 }
@@ -221,6 +223,43 @@ full filtered candidate pool, not the top-K by rank:
   collapse them to a single `Single`.
 - `max_results` (§2) only caps the size of a `Many`; it never turns a `Many`
   into a `Single` by truncation, and never suppresses the band.
+
+#### Lead vs. retained membership (grounded commit)
+
+When the typed-graph (grounded) answer is anchor-scoped, clears the strong-match
+floor, and its source memory is cross-lane corroborated, its value is
+**committed** as the lead: `answer_kind` is set from the committed shape
+(`Single` for one committed value, `Many` for a committed enumerated set)
+independently of the raw membership count, and the committed memory (or
+memories, for a `Many` commit) is moved to the **front** of `memories` in
+committed order.
+
+Critically, the rest of the relevance-band membership is **retained below the
+lead, never discarded** — a `Single` answer's `memories` can therefore contain
+more than one entry. This is deliberate, not a defect: an incorrect commit
+(wrong subject, stale value) can only **mis-order** the response, because the
+real answer — if it's anywhere in the band — is still present in the retained
+tail. Silently dropping the tail was tried and reverted after it caused a
+grounded-first regression (a loose predicate-name match on the wrong subject
+hijacked the answer with no episodic fallback to catch it).
+
+The caller-facing contract is therefore:
+
+- **`Single`**: `memories[0]` is the committed answer. Any further entries
+  (`memories[1..]`) are retained relevance-band context, not part of the
+  answer — present for provenance/fallback, not for display as additional
+  results. A client that wants "the answer, nothing else" reads only index 0.
+- **`Many` via an uncommitted band** (no grounded commit fired): every entry in
+  `memories` is part of the answer, per the pure-cardinality rule above — this
+  is the common case and matches the original contract.
+- **`Many` via a committed enumerated set**: the committed set leads (in
+  committed/recency order); anything appended after it is retained context,
+  not part of the enumerated answer. The wire does not currently carry an
+  explicit boundary count between the committed set and the retained tail — a
+  client that needs to draw that line precisely should treat this case the
+  same as the uncommitted `Many` (all of `memories` as answer-relevant) until a
+  `lead_count`-style field is added; this is an open follow-up, not yet
+  implemented.
 
 Absence is explicit (`None`, empty list), never a fabricated guess.
 `RecallResult.score` and the other retrieval fields are **provenance** — they
@@ -388,6 +427,198 @@ pattern — that is the SaaS-search shape this DB rejects. The heavy lifting
 back already shaped (Single / Many / None). The agent consumes the answer, it
 does not re-sort or threshold a candidate list. `RecallResult.score` is
 provenance, not a ranking the caller is expected to act on.
+
+### 21. The RECALL trace (`trace: true`)
+
+RECALL carries the same `trace: bool` observability toggle used across the read
+primitives (see [`02_write_pipeline.md`](02_write_pipeline.md) §17, "API
+convention — `wait` for writes, `trace` for reads" — a read has nothing to wait
+for, so it carries a single boolean rather than a `wait`-shaped enum). The
+default, `trace: false` (the common case, omitted from the wire map), is the
+fast path described in §1-§20 above, unchanged: the response's trace field is
+`None`, and the pipeline pays nothing for it — no per-item collection, no extra
+allocation, no shape change to the hot path.
+
+`trace: true` returns a populated `RecallTrace` describing every stage of the
+pipeline in full per-item detail: not just the aggregate counts a caller could
+already infer from the final answer, but which specific candidate each
+retriever lane surfaced, which specific memory each filter step dropped, and
+exactly what the cross-encoder reordered. There is one knob, not two — a caller
+opting into tracing always gets the full per-item picture; there is no
+separate size-minimized or id-only detail level to request instead.
+
+```rust
+struct RecallTrace {
+    retrievers: Vec<RecallTraceRetriever>,
+    filter_chain: RecallTraceFilterChain,
+    rerank: Option<RecallTraceRerank>,  // None when no cross-encoder is loaded
+    total_latency_ms: f64,
+    fusion: Option<RecallTraceFusion>,  // full-detail only; None if fusion produced nothing
+}
+```
+
+#### 21a. Per-retriever candidates
+
+Each of the three always-wired lanes (semantic / lexical / graph) already
+reported its terminal status, latency, and an aggregate `candidate_count`. It
+now also reports the candidates themselves:
+
+```rust
+struct RecallTraceRetriever {
+    name: RetrieverNameWire,
+    status: RecallTraceRetrieverStatus,     // Success | Skipped | Timeout | Failure
+    status_detail: String,                  // skip reason / error message
+    latency_ms: f64,                        // 0.0 when skipped
+    candidate_count: u32,                   // aggregate count, always present
+    candidates: Vec<RecallTraceCandidate>,  // full-detail only
+}
+
+struct RecallTraceCandidate {
+    memory_id: WireMemoryId,
+    text: String,      // full-detail only; truncated server-side
+    score: f32,        // this lane's own raw score for this item
+}
+```
+
+`candidates` is empty on `trace: false` and holds the lane's raw hits **before**
+RRF fusion, in the lane's own rank order, on `trace: true` — the same
+population `candidate_count` already summarized, now with id, text, and score
+attached instead of collapsed to a length. This is what makes it possible to
+see, e.g., that the lexical lane surfaced memory X at rank 3 with its own
+BM25-derived score of 0.42, independent of whatever rank X ended up at after
+fusion.
+
+#### 21b. Per-filter-step drops
+
+The filter chain's survivor counts (`before`, `after_type`, `after_temporal`,
+`after_confidence`, `after_tombstone`, `after_supersession`, `after_as_of`,
+`after_limit`) are unchanged — always present, regardless of `trace`. Each step
+now also carries exactly which ids it removed. Four of the seven drop lists are
+plain memory-id lists; the last three are kind-tagged, because they can drop
+`Statement` and `Relation` items too — not just `Memory` ones:
+
+```rust
+struct RecallTraceFilterChain {
+    before: u32,
+    after_type: u32,
+    after_temporal: u32,
+    after_confidence: u32,
+    after_tombstone: u32,
+    after_supersession: u32,
+    after_as_of: u32,
+    after_limit: u32,
+    // full-detail only; empty on trace: false and on any step that dropped nothing
+    dropped_by_type: Vec<WireMemoryId>,
+    dropped_by_temporal: Vec<WireMemoryId>,
+    dropped_by_confidence: Vec<WireMemoryId>,
+    dropped_by_tombstone: Vec<WireMemoryId>,
+    // kind-tagged — see below
+    dropped_by_supersession: Vec<RecallTraceDroppedId>,
+    dropped_by_as_of: Vec<RecallTraceDroppedId>,
+    dropped_by_limit: Vec<RecallTraceDroppedId>,
+}
+
+/// One id a filter-chain step dropped, tagged with which item-kind
+/// id-space it belongs to.
+struct RecallTraceDroppedId {
+    kind: RankedItemKindWire,
+    id: u128,
+}
+
+enum RankedItemKindWire {
+    Memory = 0,
+    Statement = 1,
+    Entity = 2,
+    Relation = 3,
+}
+```
+
+An empty `dropped_by_*` Vec means that step removed nothing at all (the
+survivor count didn't shrink between the prior step and this one); a non-empty
+one names precisely which ids that step removed. This is the difference
+between knowing "confidence filtering went from 26 to 25" and knowing
+"confidence filtering dropped memory `<id>`" — the latter is what turns "why
+didn't memory X make the answer" from a guess into a lookup.
+
+**Why the split.** The filter chain (`crates/brain-planner/src/retrieval/filters/logic.rs`)
+runs over the fused set produced by RECALL's three retriever lanes, and that
+set is not Memory-only — the graph lane can surface `Statement`- and
+`Relation`-backed candidates alongside the semantic/lexical lanes' `Memory`
+hits, so every filter step is written generically over the full
+`RankedItemId` union (`Memory` / `Statement` / `Entity` / `Relation`).
+`dropped_by_type` / `dropped_by_temporal` / `dropped_by_confidence` /
+`dropped_by_tombstone` stay plain `Vec<WireMemoryId>` because, for RECALL,
+these four steps only ever drop `Memory` items in practice. The remaining
+three are different in kind, not just in practice:
+
+- **Supersession** is a concept the filter code defines as not applying to
+  `Memory` / `Entity` at all — `filter_supersession` passes those two kinds
+  through unconditionally ("Memory / Entity have no supersession concept"),
+  so any live supersession drop is definitionally a `Statement` or
+  `Relation`.
+- **As-of** (bi-temporal record-time filtering) is scoped narrower still:
+  only `Statement` carries a record-time invalidation timestamp today —
+  `filter_as_of` passes `Memory` / `Entity` / `Relation` through because
+  bi-temporal validity is "a statement-layer property today" — so an as-of
+  drop is definitionally a `Statement`.
+- **Limit** truncation runs last, after all six filters, over the fully
+  fused-and-filtered survivor list, which by then can hold any item kind
+  that made it through the chain — so its drops need the same kind tag as
+  supersession and as-of, for the same reason (a plain `WireMemoryId` can't
+  represent a dropped `Statement` or `Relation`).
+
+#### 21c. Pre-/post-rerank order
+
+```rust
+struct RecallTraceRerank {
+    applied: bool,
+    candidates: u32,
+    latency_ms: f64,
+    before_order: Vec<WireMemoryId>,  // full-detail only: fused order immediately before rerank
+    after_order: Vec<WireMemoryId>,   // full-detail only: final order after the cross-encoder
+}
+```
+
+`before_order` and `after_order` show exactly what the cross-encoder moved —
+not just that it ran (`applied`) and how many candidates it scored
+(`candidates`), but the concrete before/after permutation. Both are empty on
+`trace: false`, when `rerank` is `None` (no cross-encoder loaded on this
+shard), and when `applied = false` (loaded, but nothing in the fused list had
+fetchable text to score).
+
+#### 21d. Per-fused-item lane contribution
+
+```rust
+struct RecallTraceFusion {
+    items: Vec<RecallTraceFusionItem>,
+}
+
+struct RecallTraceFusionItem {
+    memory_id: WireMemoryId,
+    rrf_score: f32,
+    lane_scores: Vec<(RetrieverNameWire, f32)>,
+}
+```
+
+`RecallTrace.fusion` has no aggregate-count precedent — nothing in the
+`trace: false`-equivalent counts summarized fusion below the per-retriever
+level at all. On `trace: true`, for each item RRF admitted to the candidate
+pool, `lane_scores` lists which of the three lanes contributed to it and that
+lane's own raw score, so a caller can see that a given fused item was surfaced
+by both semantic (0.81) and graph (0.65) but not lexical, and how that
+combination produced its `rrf_score`. `fusion` is `None` when tracing wasn't
+requested or when fusion produced no items.
+
+#### 21e. Why full detail, not counts-only or id-only
+
+Tracing exists to debug recall accuracy — to answer "why did memory X end up
+in, or stay out of, the answer," which an aggregate count can never answer.
+Because `trace: true` is opt-in and only exercised by a caller who has already
+decided the extra cost is worth it (an eval harness, a debugging console — never
+the default production path), the trace returns full per-item detail, including
+text, rather than a size-minimized id-only variant. This mirrors
+`include_text`'s existing per-final-result fetch (§2, "include_text"), just
+applied to every stage's candidates instead of only the final answer set.
 
 ## PLAN
 
@@ -582,15 +813,17 @@ The latency is dominated by:
 
 For deeper PLAN (max_depth=8): can reach 200+ ms. Brain's cost-budget check (in [12.03 Cost Estimation](../12_query_optimizer/03_cost_estimation.md)) may reject overly-expensive plans.
 
-### 13. The "explain" option
+### 13. The "explain" option (superseded)
 
-With `explain=true`, the response includes:
-
-- The intermediate frontier expansions.
-- Paths that were considered but didn't make the top results.
-- The scoring breakdown for each returned path.
-
-Useful for debugging or showing reasoning to a human.
+This section originally described an `explain=true` option returning the
+intermediate frontier expansions, paths considered but not returned, and a
+per-path scoring breakdown. No such field was ever implemented on
+`PlanRequest`. The real, shipped mechanism for this is the `trace: bool`
+flag — see §19, "The PLAN trace (`trace: true`)" — which returns the full
+BFS-explored node set (both directions) and every meeting point found,
+including ones the `max_paths` cap excluded from the result. Kept here only
+so old references to "the explain option" land somewhere; new integrations
+should read §19 directly.
 
 ### 14. The "actionable edges" default
 
@@ -642,6 +875,67 @@ PLAN is most useful when:
 For sparse graphs (few edges), PLAN often returns no paths. The agent should use RECALL or REASON instead.
 
 For text-only memories without edges, PLAN is mostly useless. The graph is the planning substrate.
+
+### 19. The PLAN trace (`trace: true`)
+
+PLAN carries the same `trace: bool` opt-in observability toggle as RECALL
+(§21 above) and REASON (§20 below): `pub trace: bool` on `PlanRequest`,
+defaulting to `false` and omitted from the wire map in that case. The default
+path is byte-for-byte unchanged — the bidirectional BFS already tracks full
+per-node visited-map state and per-neighbor alignment scores internally, but
+today collapses them to a scalar `nodes_explored` count and a capped
+`meeting_points` list before they reach the wire; `trace: false` continues to
+discard that detail with zero extra allocation.
+
+`trace: true` populates `PlanResponseFrame.trace: Option<PlanTrace>` on the
+**final** frame only (`is_final: true`); intermediate streamed `PlanStep`
+frames are unaffected.
+
+```rust
+struct PlanTrace {
+    explored: Vec<PlanTraceNode>,
+    meeting_points: Vec<PlanTraceMeetingPoint>,
+}
+```
+
+#### 19a. Explored nodes (both BFS directions)
+
+```rust
+struct PlanTraceNode {
+    memory_id: WireMemoryId,
+    text: String,
+    direction: PlanTraceDirection,   // Forward (rooted at start) | Backward (rooted at goal)
+    depth: u32,
+    parent_edge: Option<WireMemoryId>,  // None for the root of each direction
+    alignment_score: Option<f32>,       // set when order_by_goal_proximity scored this node
+}
+```
+
+`explored` is the full visited-map contents of `run_bidirectional_bfs`
+(`brain-planner/src/executor/path.rs`), from **both** the forward search
+(rooted at `start`) and the backward search (rooted at `goal`) — not just the
+scalar `nodes_explored` count the non-traced response already reports. Each
+entry carries which direction found it, its BFS depth, the id of the parent
+node it was reached from (`None` only for the two roots), and — when
+`order_by_goal_proximity` scored it — the per-neighbor alignment score that
+today is used only to reorder candidates and otherwise discarded.
+
+#### 19b. Meeting points (found vs. included)
+
+```rust
+struct PlanTraceMeetingPoint {
+    memory_id: WireMemoryId,
+    text: String,
+    included_in_result: bool,
+}
+```
+
+Every node where the forward and backward frontiers connected is listed,
+whether or not it survived the `max_paths` cap. `included_in_result: true`
+marks the meeting points that made it into a returned `Path`; `false` marks
+ones the cap dropped. This turns "why didn't the shorter path show up" into a
+lookup instead of a guess — the meeting point is visible in the trace even
+when the response's `paths` list doesn't contain it.
 
 ## REASON
 
@@ -797,15 +1091,17 @@ Brain does not currently do this. CONTRADICTS edges (explicitly created by the a
 
 A future enhancement: integrate with an LLM-based contradiction detector. Brain would generate candidate pairs (query + memory) and let an external LLM judge contradiction. Out of scope at present.
 
-### 13. The "explain" option
+### 13. The "explain" option (superseded)
 
-With `explain=true`, the response includes:
-
-- Why each evidence item was selected.
-- Which edges were traversed.
-- Per-edge confidence.
-
-Useful for showing reasoning chains to humans or other systems.
+This section originally described an `explain=true` option returning why
+each evidence item was selected, which edges were traversed, and per-edge
+confidence. No such field was ever implemented on `ReasonRequest`. The real,
+shipped mechanism for this is the `trace: bool` flag — see §20, "The REASON
+trace (`trace: true`)" — which returns the full considered/dropped edge
+walk, the per-item score breakdown (base similarity, decay, weight product,
+alignment), and whether the topic-alignment centroid was computed at all.
+Kept here only so old references to "the explain option" land somewhere;
+new integrations should read §20 directly.
 
 ### 14. The "different from PLAN" semantic
 
@@ -866,6 +1162,130 @@ For agents with few memories on a topic, REASON returns weak evidence:
 - Confidence near zero either way.
 
 The agent can use this as a signal to seek more information (encode more memories from external sources, do web searches, etc.).
+
+### 20. The REASON trace (`trace: true`)
+
+REASON carries the same `trace: bool` toggle as RECALL (§21 above) and PLAN
+(§19 above): `pub trace: bool` on `ReasonRequest`, defaulting to `false` and
+omitted from the wire map in that case. The fast default path (§1-§19 above)
+is unchanged — `resolve_base`, `walk_outward`, `filter_and_trim`, and
+`topic_alignment_factor` already compute this detail internally and discard
+it today; `trace: false` keeps discarding it with zero extra allocation.
+
+> **Note on §13's `explain` option:** §13 above describes an `explain=true`
+> option with similar intent ("why each evidence item was selected, which
+> edges were traversed, per-edge confidence") but no such field exists on the
+> implemented `ReasonRequest` — it was never built under that name. `trace`
+> is the real, shipped mechanism for this; §13 should likely be reconciled
+> or marked superseded by the owner rather than left as a second,
+> unimplemented description of the same capability.
+
+`trace: true` populates `ReasonResponseFrame.trace: Option<ReasonTrace>` on
+the **final** frame only; intermediate streamed `InferenceStep` frames are
+unaffected.
+
+```rust
+struct ReasonTrace {
+    base: ReasonTraceBase,
+    walk: ReasonTraceWalk,
+    scoring: Vec<ReasonTraceScoreBreakdown>,
+    centroid: ReasonTraceCentroid,
+}
+```
+
+#### 20a. Base candidates
+
+```rust
+struct ReasonTraceBase {
+    candidates: Vec<ReasonTraceCandidate>,
+}
+struct ReasonTraceCandidate {
+    memory_id: WireMemoryId,
+    text: String,
+    score: f32,
+}
+```
+
+`base.candidates` is the full HNSW hit set `resolve_base` returns, not just
+the subset that seeded `walk_outward` — the same "everything a lane
+surfaced, not the collapsed count" precedent as RECALL's per-retriever
+`candidates` (§21a).
+
+#### 20b. The edge walk: considered and dropped-by-kind
+
+```rust
+struct ReasonTraceWalk {
+    considered: Vec<ReasonTraceEdgeCandidate>,
+    dropped_by_edge_kind: Vec<ReasonTraceEdgeCandidate>,
+    dropped_by_tombstone: Vec<ReasonTraceIdWithText>,
+    dropped_by_visited: Vec<ReasonTraceIdWithText>,
+    dropped_by_confidence: Vec<ReasonTraceScoredId>,
+    dropped_by_max_supporting: Vec<ReasonTraceIdWithText>,
+    dropped_by_max_contradicting: Vec<ReasonTraceIdWithText>,
+}
+struct ReasonTraceEdgeCandidate {
+    memory_id: WireMemoryId,
+    text: String,
+    edge_kind: EdgeKindWire,
+    depth: u32,
+    from_memory_id: WireMemoryId,
+    raw_score: f32,
+}
+struct ReasonTraceIdWithText { memory_id: WireMemoryId, text: String }
+struct ReasonTraceScoredId { memory_id: WireMemoryId, text: String, score: f32 }
+```
+
+`considered` is every edge `walk_outward` visited at every node, from both
+the supporting-side and contradicting-side traversals, before any pruning —
+the walk's own analogue of a retriever lane's raw candidate list; a caller
+can tell supporting from contradicting entries by `edge_kind`. The remaining
+fields are that same walk's prune reasons, one bucket per prune point in the
+executor: edge-kind filter, tombstoned target, an already-visited target,
+sub-`confidence_threshold` score (in `filter_and_trim`), and the two post-hoc
+trim caps on the surviving supporting/contradicting sets per inference step.
+Every bucket carries the dropped memory's real text, not a bare id — same
+"understand why, not just which id" rationale as RECALL's trace (§21e).
+
+#### 20c. Score breakdown
+
+```rust
+struct ReasonTraceScoreBreakdown {
+    memory_id: WireMemoryId,
+    text: String,
+    base_similarity: f32,
+    decay: f32,
+    weight_product: f32,
+    alignment: f32,
+    final_score: f32,
+}
+```
+
+One entry per surviving evidence item, un-collapsing the multiplicative
+score `topic_alignment_factor` folds into the single `EvidenceItem.score` /
+`InferenceStep.confidence` value the non-traced response reports. This
+exposes, e.g., that a low final score came from a weak `alignment` term
+rather than a stale `decay` term, without the caller having to guess at the
+factorization.
+
+#### 20d. Centroid computed/skipped
+
+```rust
+struct ReasonTraceCentroid {
+    computed: bool,
+    skipped_reason: Option<String>,
+}
+```
+
+`build_base_centroid` silently returns `None` on several paths (a singleton
+base set, a `ByText` observation, missing text, or an embed error), logged
+only at `tracing::debug!` today. The trace surfaces that outcome on the wire:
+`computed: false` plus a `skipped_reason` string names which of those paths
+fired, instead of leaving the caller to infer from an absent alignment term
+whether topic-alignment scoring ran at all.
+
+Both PLAN's and REASON's trace payload follow the same "full detail,
+including text, not a size-minimized id-only variant" rationale as RECALL's
+trace — see §21e above.
 
 ---
 

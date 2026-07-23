@@ -24,7 +24,7 @@
 
 use brain_core::{canonical_pair, Relation};
 use brain_core::{
-    Cardinality, EdgeKindRef, EntityId, MemoryId, NodeRef, RelationId, RelationTypeId,
+    Cardinality, EdgeKindRef, EntityId, EntityTypeId, MemoryId, NodeRef, RelationId, RelationTypeId,
 };
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
@@ -93,6 +93,19 @@ pub enum RelationOpError {
     CardinalityViolation {
         variant: Cardinality,
         conflicting: usize,
+    },
+
+    /// The relation type declares a concrete `from` / `to` entity type
+    /// and the supplied endpoint has a different one. `side` is
+    /// `"from"` or `"to"`.
+    #[error(
+        "entity type violation on {side}: relation type requires {expected:?} but entity {entity:?} is {actual:?}"
+    )]
+    EndpointTypeViolation {
+        side: &'static str,
+        entity: EntityId,
+        expected: EntityTypeId,
+        actual: EntityTypeId,
     },
 
     #[error("relation type op: {0}")]
@@ -279,6 +292,13 @@ pub fn relations_with_evidence(
 // ---------------------------------------------------------------------------
 
 /// Create a new relation.
+///
+/// Endpoints are validated against the entity types the relation type
+/// declares. An inverted relation — one whose endpoints are the exact
+/// mirror image of a concretely declared `from` / `to` pair — is
+/// corrected by exchanging them (and logged); any other violation is
+/// rejected with [`RelationOpError::EndpointTypeViolation`]. See
+/// [`resolve_endpoint_direction`].
 pub fn relation_create(
     wtxn: &WriteTransaction,
     scope: RowScope,
@@ -291,9 +311,17 @@ pub fn relation_create(
         ));
     }
 
-    require_entity_exists(wtxn, r.from_entity)?;
-    require_entity_exists(wtxn, r.to_entity)?;
-    let (cardinality, is_symmetric) = lookup_type(wtxn, r.relation_type)?;
+    let from_entity_type = require_entity_exists(wtxn, r.from_entity)?;
+    let to_entity_type = require_entity_exists(wtxn, r.to_entity)?;
+    let declared = lookup_type(wtxn, r.relation_type)?;
+    let (cardinality, is_symmetric) = (declared.cardinality, declared.is_symmetric);
+
+    // Declared endpoint types are enforced on write, exactly like the
+    // declared cardinality below. Checked before the symmetric
+    // canonicalisation so `from` / `to` still mean what the caller
+    // said. A relation type with no declared type (`Any`, or an
+    // implicit-from-write type) constrains nothing.
+    let direction = resolve_endpoint_direction(r, from_entity_type, to_entity_type, &declared)?;
 
     {
         let t = wtxn.open_table(RELATION_METADATA_TABLE)?;
@@ -303,6 +331,25 @@ pub fn relation_create(
     }
 
     let mut to_insert = r.clone();
+    if direction == EndpointDirection::Swapped {
+        // Extraction inverts relation direction often enough that the
+        // declared types are the only signal that can catch it. A swap
+        // rewrites what the caller asked for, so it is never silent.
+        tracing::warn!(
+            target: "brain_metadata::relation",
+            relation = ?r.id,
+            relation_type = ?r.relation_type,
+            from_entity = ?r.from_entity,
+            to_entity = ?r.to_entity,
+            from_actual_type = ?from_entity_type,
+            to_actual_type = ?to_entity_type,
+            declared_from_type = ?declared.from_type,
+            declared_to_type = ?declared.to_type,
+            "relation_create: endpoints violate declared from/to types but conform when \
+             exchanged; swapping from/to"
+        );
+        std::mem::swap(&mut to_insert.from_entity, &mut to_insert.to_entity);
+    }
     to_insert.is_symmetric = is_symmetric;
     if is_symmetric {
         let (a, b) = canonical_pair(to_insert.from_entity, to_insert.to_entity);
@@ -426,28 +473,123 @@ pub fn relation_tombstone(
 // Internal helpers.
 // ---------------------------------------------------------------------------
 
-fn require_entity_exists(wtxn: &WriteTransaction, id: EntityId) -> Result<(), RelationOpError> {
+/// Assert the endpoint entity exists and return its entity type.
+fn require_entity_exists(
+    wtxn: &WriteTransaction,
+    id: EntityId,
+) -> Result<EntityTypeId, RelationOpError> {
     use crate::tables::entity::{EntityMetadata, ENTITIES_TABLE};
     let t = wtxn.open_table(ENTITIES_TABLE)?;
     let row: Option<EntityMetadata> = t.get(&id.to_bytes())?.map(|g| g.value());
-    if row.is_none() {
-        return Err(RelationOpError::UnknownEntity(id));
-    }
-    Ok(())
+    let row = row.ok_or(RelationOpError::UnknownEntity(id))?;
+    Ok(EntityTypeId::from(row.entity_type_id))
+}
+
+/// The write-time constraints a relation type declares.
+struct DeclaredConstraints {
+    cardinality: Cardinality,
+    is_symmetric: bool,
+    /// `None` = declared `Any` (or an implicit-from-write type): the
+    /// endpoint may be any entity type.
+    from_type: Option<EntityTypeId>,
+    to_type: Option<EntityTypeId>,
 }
 
 fn lookup_type(
     wtxn: &WriteTransaction,
     id: RelationTypeId,
-) -> Result<(Cardinality, bool), RelationOpError> {
-    use crate::tables::relation_type::{RelationTypeDefinition, RELATION_TYPES_TABLE};
+) -> Result<DeclaredConstraints, RelationOpError> {
+    use crate::tables::relation_type::{
+        decode_entity_type_id, RelationTypeDefinition, RELATION_TYPES_TABLE,
+    };
     let t = wtxn.open_table(RELATION_TYPES_TABLE)?;
     let row: Option<RelationTypeDefinition> = t.get(&id.raw())?.map(|g| g.value());
     let row = row.ok_or(RelationOpError::UnknownRelationType(id))?;
     let cardinality = Cardinality::from_u8(row.cardinality).ok_or(
         RelationOpError::InvalidArgument("relation type has unknown cardinality"),
     )?;
-    Ok((cardinality, row.is_symmetric != 0))
+    Ok(DeclaredConstraints {
+        cardinality,
+        is_symmetric: row.is_symmetric != 0,
+        from_type: decode_entity_type_id(row.from_entity_type_id),
+        to_type: decode_entity_type_id(row.to_entity_type_id),
+    })
+}
+
+/// Which way round the endpoints go into storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndpointDirection {
+    /// The supplied endpoints satisfy the declared types.
+    AsGiven,
+    /// The supplied endpoints violate the declared types, and
+    /// exchanging them satisfies both.
+    Swapped,
+}
+
+/// Validate the endpoints against the entity types the relation type
+/// declares, and decide whether an inverted relation should be
+/// corrected rather than rejected.
+///
+/// `declared == None` (the `Any` sentinel) is fully permissive — the
+/// seeded `brain:` relation types rely on it.
+///
+/// The swap rule is deliberately narrow:
+///
+/// - Both declared sides must be concrete. An `Any` side carries no
+///   directional information, so it can never be the evidence that a
+///   relation is inverted: with `from: Person / to: Any`, every
+///   `(NonPerson, Person)` pair would become "fixable", and a correctly
+///   directed relation whose subject merely has the wrong type would be
+///   silently reversed. When one side declares nothing, there is no
+///   well-defined "right way round" to swap into, so the violation is
+///   reported instead.
+/// - The exchange must satisfy *both* declared sides. A partial
+///   improvement (one side would now match, the other still would not)
+///   is not a direction error and is rejected as before.
+///
+/// Together these make the swap unambiguous: it fires only when the
+/// declared pair is concrete, asymmetric in type, and the supplied
+/// endpoints are exactly its mirror image.
+///
+/// The check runs *before* the symmetric `canonical_pair`
+/// canonicalisation, so `from` / `to` still mean what the caller said.
+/// The two compose without double-swapping: `canonical_pair` sorts by
+/// [`EntityId`] and is therefore order-insensitive, so for a symmetric
+/// relation type the stored row is byte-identical whether or not the
+/// swap fired — the swap only turns a would-be rejection into an
+/// accepted write, which is the correct outcome for a relation type
+/// whose endpoints are interchangeable by definition.
+fn resolve_endpoint_direction(
+    r: &Relation,
+    from_actual: EntityTypeId,
+    to_actual: EntityTypeId,
+    declared: &DeclaredConstraints,
+) -> Result<EndpointDirection, RelationOpError> {
+    let from_ok = declared.from_type.is_none_or(|want| want == from_actual);
+    let to_ok = declared.to_type.is_none_or(|want| want == to_actual);
+    if from_ok && to_ok {
+        return Ok(EndpointDirection::AsGiven);
+    }
+
+    if let (Some(want_from), Some(want_to)) = (declared.from_type, declared.to_type) {
+        if want_from == to_actual && want_to == from_actual {
+            return Ok(EndpointDirection::Swapped);
+        }
+    }
+
+    // Not fixable by exchange — report the violating side, `from` first
+    // so the error is deterministic when both sides are wrong.
+    let (side, entity, expected, actual) = if from_ok {
+        ("to", r.to_entity, declared.to_type, to_actual)
+    } else {
+        ("from", r.from_entity, declared.from_type, from_actual)
+    };
+    Err(RelationOpError::EndpointTypeViolation {
+        side,
+        entity,
+        expected: expected.expect("invariant: the violating side has a concrete declared type"),
+        actual,
+    })
 }
 
 /// Cardinality probe.
@@ -662,6 +804,37 @@ mod tests {
         id
     }
 
+    /// Insert an entity of an arbitrary entity type (the `make_entity`
+    /// helper always makes a Person).
+    fn make_entity_typed(
+        db: &mut crate::MetadataDb,
+        name: &str,
+        entity_type: brain_core::EntityTypeId,
+    ) -> EntityId {
+        let id = EntityId::new();
+        let n = normalize_name(name);
+        let e = Entity::new_active(id, entity_type, name.into(), n, 1_700_000_000_000_000_000);
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, test_scope(), &e).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    /// Insert an entity with both a chosen id and a chosen entity type.
+    fn make_entity_typed_with(
+        db: &mut crate::MetadataDb,
+        id: EntityId,
+        name: &str,
+        entity_type: brain_core::EntityTypeId,
+    ) -> EntityId {
+        let n = normalize_name(name);
+        let e = Entity::new_active(id, entity_type, name.into(), n, 1_700_000_000_000_000_000);
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, test_scope(), &e).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
     fn make_entity_with(db: &mut crate::MetadataDb, id: EntityId, name: &str) -> EntityId {
         let n = normalize_name(name);
         let e = Entity::new_active(
@@ -692,6 +865,32 @@ mod tests {
             None,
             cardinality,
             symmetric,
+            1,
+            "",
+            1_700_000_000_000_000_000,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    /// Intern a relation type that declares concrete `from` / `to`
+    /// entity types.
+    fn intern_typed_endpoints(
+        db: &mut crate::MetadataDb,
+        name: &str,
+        from_type: brain_core::EntityTypeId,
+        to_type: brain_core::EntityTypeId,
+    ) -> RelationTypeId {
+        let wtxn = db.write_txn().unwrap();
+        let id = relation_type_intern(
+            &wtxn,
+            "test",
+            name,
+            Some(from_type),
+            Some(to_type),
+            Cardinality::ManyToMany,
+            false,
             1,
             "",
             1_700_000_000_000_000_000,
@@ -789,6 +988,405 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         let err = relation_create(&wtxn, test_scope(), &r, 0).unwrap_err();
         assert!(matches!(err, RelationOpError::UnknownEntity(_)));
+    }
+
+    // ----- Declared from / to entity type enforcement. -----
+
+    const ORGANIZATION_ID: brain_core::EntityTypeId = brain_core::EntityTypeId(2);
+
+    /// Intern a relation type with per-side control over the declared
+    /// entity types and the symmetric flag.
+    #[allow(clippy::too_many_arguments)]
+    fn intern_endpoints_full(
+        db: &mut crate::MetadataDb,
+        name: &str,
+        from_type: Option<brain_core::EntityTypeId>,
+        to_type: Option<brain_core::EntityTypeId>,
+        symmetric: bool,
+    ) -> RelationTypeId {
+        let wtxn = db.write_txn().unwrap();
+        let id = relation_type_intern(
+            &wtxn,
+            "test",
+            name,
+            from_type,
+            to_type,
+            Cardinality::ManyToMany,
+            symmetric,
+            1,
+            "",
+            1_700_000_000_000_000_000,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    #[test]
+    fn declared_endpoint_types_accept_conforming_relation() {
+        let (_dir, mut db) = open_db();
+        let person = make_entity(&mut db, "conforming-person");
+        let org = make_entity_typed(&mut db, "conforming-org", ORGANIZATION_ID);
+        let t = intern_typed_endpoints(
+            &mut db,
+            "works_at_ok",
+            EntityType::PERSON_ID,
+            ORGANIZATION_ID,
+        );
+
+        let r = fresh_rel(t, person, org, false);
+        let wtxn = db.write_txn().unwrap();
+        relation_create(&wtxn, test_scope(), &r, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        // Conforming endpoints are stored exactly as supplied — the
+        // direction defence must never fire on a correct relation.
+        let rtxn = db.read_txn().unwrap();
+        let got = relation_get(&rtxn, r.id).unwrap().unwrap();
+        assert_eq!(got.from_entity, person);
+        assert_eq!(got.to_entity, org);
+    }
+
+    // ----- Auto-swap of inverted relations. -----
+
+    #[test]
+    fn inverted_endpoints_are_swapped_not_rejected() {
+        // The published mitigation for extractor direction errors: when
+        // the violation is fixable by exchanging subject and object,
+        // exchange them.
+        let (_dir, mut db) = open_db();
+        let person = make_entity(&mut db, "inverted-person");
+        let org = make_entity_typed(&mut db, "inverted-org", ORGANIZATION_ID);
+        let t = intern_typed_endpoints(
+            &mut db,
+            "works_at_swap",
+            EntityType::PERSON_ID,
+            ORGANIZATION_ID,
+        );
+
+        // Supplied backwards: (Organization, Person).
+        let r = fresh_rel(t, org, person, false);
+        let wtxn = db.write_txn().unwrap();
+        let id = relation_create(&wtxn, test_scope(), &r, 0).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(id, r.id, "the swap keeps the caller's relation id");
+
+        let rtxn = db.read_txn().unwrap();
+        let got = relation_get(&rtxn, id).unwrap().unwrap();
+        assert_eq!(got.from_entity, person, "from is now the Person");
+        assert_eq!(got.to_entity, org, "to is now the Organization");
+
+        // …and the corrected relation is reachable from the corrected
+        // side of the unified edge table, not the supplied one.
+        let out = relation_list_from(
+            &rtxn,
+            test_scope(),
+            person,
+            &RelationListFilter {
+                relation_type: Some(t),
+                current_only: true,
+                limit: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, id);
+    }
+
+    #[test]
+    fn partial_match_does_not_swap() {
+        // from conforms, to does not, and exchanging would break the
+        // side that currently conforms. Not a direction error — reject.
+        let (_dir, mut db) = open_db();
+        let person = make_entity(&mut db, "partial-person");
+        let other_person = make_entity(&mut db, "partial-person-2");
+        let t = intern_typed_endpoints(
+            &mut db,
+            "works_at_partial",
+            EntityType::PERSON_ID,
+            ORGANIZATION_ID,
+        );
+
+        let r = fresh_rel(t, person, other_person, false);
+        let wtxn = db.write_txn().unwrap();
+        let err = relation_create(&wtxn, test_scope(), &r, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            RelationOpError::EndpointTypeViolation { side: "to", .. }
+        ));
+        drop(wtxn);
+
+        let rtxn = db.read_txn().unwrap();
+        assert!(relation_get(&rtxn, r.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn unfixable_violation_still_rejected() {
+        // Neither side matches and exchanging fixes neither.
+        let (_dir, mut db) = open_db();
+        let place_a = make_entity_typed(&mut db, "unfixable-a", brain_core::EntityTypeId(5));
+        let place_b = make_entity_typed(&mut db, "unfixable-b", brain_core::EntityTypeId(5));
+        let t = intern_typed_endpoints(
+            &mut db,
+            "works_at_unfixable",
+            EntityType::PERSON_ID,
+            ORGANIZATION_ID,
+        );
+
+        let r = fresh_rel(t, place_a, place_b, false);
+        let wtxn = db.write_txn().unwrap();
+        let err = relation_create(&wtxn, test_scope(), &r, 0).unwrap_err();
+        match err {
+            RelationOpError::EndpointTypeViolation {
+                side,
+                entity,
+                expected,
+                actual,
+            } => {
+                assert_eq!(side, "from", "both sides wrong reports `from` first");
+                assert_eq!(entity, place_a);
+                assert_eq!(expected, EntityType::PERSON_ID);
+                assert_eq!(actual, brain_core::EntityTypeId(5));
+            }
+            other => panic!("expected EndpointTypeViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn any_side_never_grounds_a_swap() {
+        // `from: Person / to: Any`. An `Any` side carries no directional
+        // information, so a from-side violation is not evidence of an
+        // inversion — reject rather than silently reverse the caller.
+        let (_dir, mut db) = open_db();
+        let person = make_entity(&mut db, "any-side-person");
+        let org = make_entity_typed(&mut db, "any-side-org", ORGANIZATION_ID);
+        let t = intern_endpoints_full(
+            &mut db,
+            "half_declared",
+            Some(EntityType::PERSON_ID),
+            None,
+            false,
+        );
+
+        let r = fresh_rel(t, org, person, false);
+        let wtxn = db.write_txn().unwrap();
+        let err = relation_create(&wtxn, test_scope(), &r, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            RelationOpError::EndpointTypeViolation { side: "from", .. }
+        ));
+        drop(wtxn);
+
+        let rtxn = db.read_txn().unwrap();
+        assert!(relation_get(&rtxn, r.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn swap_composes_with_symmetric_canonicalisation() {
+        // The type check runs before `canonical_pair`. Because
+        // `canonical_pair` sorts by id it is order-insensitive, so the
+        // swap can never double-apply: the stored pair is the canonical
+        // one either way, and the only effect of the swap is that the
+        // write is accepted at all.
+        let (_dir, mut db) = open_db();
+        // Ids chosen so canonical (ascending) order puts the Org first —
+        // i.e. the opposite of the declared from/to order.
+        let org = make_entity_typed_with(
+            &mut db,
+            EntityId::from([1u8; 16]),
+            "sym-org",
+            ORGANIZATION_ID,
+        );
+        let person = make_entity_typed_with(
+            &mut db,
+            EntityId::from([2u8; 16]),
+            "sym-person",
+            EntityType::PERSON_ID,
+        );
+        let t = intern_endpoints_full(
+            &mut db,
+            "sym_works_at",
+            Some(EntityType::PERSON_ID),
+            Some(ORGANIZATION_ID),
+            true,
+        );
+
+        // Supplied backwards relative to the declaration.
+        let r = fresh_rel(t, org, person, true);
+        let wtxn = db.write_txn().unwrap();
+        relation_create(&wtxn, test_scope(), &r, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let got = relation_get(&rtxn, r.id).unwrap().unwrap();
+        let (a, b) = canonical_pair(person, org);
+        assert_eq!((got.from_entity, got.to_entity), (a, b));
+        assert!(got.is_symmetric);
+    }
+
+    #[test]
+    fn declared_from_type_rejects_mismatch() {
+        let (_dir, mut db) = open_db();
+        let org_as_from = make_entity_typed(&mut db, "bad-from-org", ORGANIZATION_ID);
+        let org = make_entity_typed(&mut db, "target-org", ORGANIZATION_ID);
+        let t = intern_typed_endpoints(
+            &mut db,
+            "works_at_from",
+            EntityType::PERSON_ID,
+            ORGANIZATION_ID,
+        );
+
+        let r = fresh_rel(t, org_as_from, org, false);
+        let wtxn = db.write_txn().unwrap();
+        let err = relation_create(&wtxn, test_scope(), &r, 0).unwrap_err();
+        match err {
+            RelationOpError::EndpointTypeViolation {
+                side,
+                entity,
+                expected,
+                actual,
+            } => {
+                assert_eq!(side, "from");
+                assert_eq!(entity, org_as_from);
+                assert_eq!(expected, EntityType::PERSON_ID);
+                assert_eq!(actual, ORGANIZATION_ID);
+            }
+            other => panic!("expected EndpointTypeViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declared_to_type_rejects_mismatch() {
+        let (_dir, mut db) = open_db();
+        let person = make_entity(&mut db, "bad-to-person");
+        let other_person = make_entity(&mut db, "person-as-org");
+        let t = intern_typed_endpoints(
+            &mut db,
+            "works_at_to",
+            EntityType::PERSON_ID,
+            ORGANIZATION_ID,
+        );
+
+        let r = fresh_rel(t, person, other_person, false);
+        let wtxn = db.write_txn().unwrap();
+        let err = relation_create(&wtxn, test_scope(), &r, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            RelationOpError::EndpointTypeViolation { side: "to", .. }
+        ));
+    }
+
+    #[test]
+    fn any_endpoint_type_permits_every_entity_type() {
+        // `from: Any / to: Any` — the shape every seeded `brain:`
+        // relation type but `family_of` uses. Must stay unconstrained.
+        let (_dir, mut db) = open_db();
+        let concept = make_entity_typed(&mut db, "a-concept", brain_core::EntityTypeId(6));
+        let place = make_entity_typed(&mut db, "a-place", brain_core::EntityTypeId(5));
+        let t = intern_type(&mut db, "any_to_any", Cardinality::ManyToMany, false);
+
+        let r = fresh_rel(t, concept, place, false);
+        let wtxn = db.write_txn().unwrap();
+        relation_create(&wtxn, test_scope(), &r, 0).unwrap();
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn open_vocab_type_has_no_endpoint_constraint() {
+        // Implicit-from-write types carry no from / to declaration, so
+        // extraction-minted relations are never type-rejected.
+        let (_dir, mut db) = open_db();
+        let concept = make_entity_typed(&mut db, "implicit-concept", brain_core::EntityTypeId(6));
+        let person = make_entity(&mut db, "implicit-person");
+        let t = {
+            let wtxn = db.write_txn().unwrap();
+            let t =
+                crate::relation::types::relation_type_intern_or_get(&wtxn, "test", "coined", 0, 1)
+                    .unwrap();
+            wtxn.commit().unwrap();
+            t
+        };
+
+        let r = fresh_rel(t, concept, person, false);
+        let wtxn = db.write_txn().unwrap();
+        relation_create(&wtxn, test_scope(), &r, 0).unwrap();
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn seeded_brain_schema_relations_still_write() {
+        // Highest-risk regression of endpoint-type enforcement: a fresh
+        // boot must keep accepting normal writes. `brain:related_to` is
+        // `Any / Any` (anything goes); `brain:family_of` is
+        // `Person / Person` (only people).
+        let (_dir, mut db) = open_db();
+        let person_a = make_entity(&mut db, "seeded-person-a");
+        let person_b = make_entity(&mut db, "seeded-person-b");
+        let place = make_entity_typed(&mut db, "seeded-place", brain_core::EntityTypeId(5));
+
+        let (related_to, family_of) = {
+            let rtxn = db.read_txn().unwrap();
+            let related =
+                crate::relation::types::relation_type_lookup_by_qname(&rtxn, "brain", "related_to")
+                    .unwrap()
+                    .expect("brain:related_to is seeded at open");
+            let family =
+                crate::relation::types::relation_type_lookup_by_qname(&rtxn, "brain", "family_of")
+                    .unwrap()
+                    .expect("brain:family_of is seeded at open");
+            (related, family)
+        };
+        assert_eq!(related_to.from_type, None, "seeded Any stays unconstrained");
+        assert_eq!(related_to.to_type, None);
+
+        // Any / Any accepts a Person → Place edge.
+        let r = fresh_rel(related_to.id, person_a, place, related_to.is_symmetric);
+        let wtxn = db.write_txn().unwrap();
+        relation_create(&wtxn, test_scope(), &r, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        // Person / Person accepts two people.
+        let r = fresh_rel(family_of.id, person_a, person_b, family_of.is_symmetric);
+        let wtxn = db.write_txn().unwrap();
+        relation_create(&wtxn, test_scope(), &r, 1).unwrap();
+        wtxn.commit().unwrap();
+
+        // …and rejects a non-Person endpoint. `Person / Person` can
+        // never be fixed by exchanging endpoints, so the auto-swap is
+        // unreachable for the one seeded type that declares anything.
+        let r = fresh_rel(family_of.id, person_a, place, family_of.is_symmetric);
+        let wtxn = db.write_txn().unwrap();
+        let err = relation_create(&wtxn, test_scope(), &r, 2).unwrap_err();
+        assert!(matches!(
+            err,
+            RelationOpError::EndpointTypeViolation { side: "to", .. }
+        ));
+        drop(wtxn);
+
+        // Every other seeded relation type is `Any / Any`: a fresh boot
+        // must neither reject nor swap. `reports_to` is asymmetric, so
+        // the stored row proves the caller's direction survived intact.
+        let reports_to = {
+            let rtxn = db.read_txn().unwrap();
+            crate::relation::types::relation_type_lookup_by_qname(&rtxn, "brain", "reports_to")
+                .unwrap()
+                .expect("brain:reports_to is seeded at open")
+        };
+        assert_eq!(reports_to.from_type, None);
+        assert_eq!(reports_to.to_type, None);
+        assert!(!reports_to.is_symmetric);
+
+        // A Place → Person edge is nonsense semantically but the seeded
+        // declaration constrains nothing, so it must be stored verbatim.
+        let r = fresh_rel(reports_to.id, place, person_b, reports_to.is_symmetric);
+        let wtxn = db.write_txn().unwrap();
+        relation_create(&wtxn, test_scope(), &r, 3).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let got = relation_get(&rtxn, r.id).unwrap().unwrap();
+        assert_eq!(got.from_entity, place, "Any/Any must not swap");
+        assert_eq!(got.to_entity, person_b, "Any/Any must not swap");
     }
 
     #[test]

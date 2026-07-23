@@ -42,6 +42,7 @@ fn stage_kind_name(kind: StageKind) -> &'static str {
         StageKind::AutoEdge => "auto_edge",
         StageKind::TemporalEdge => "temporal_edge",
         StageKind::Extractor => "extractor",
+        StageKind::Hype => "hype",
     }
 }
 
@@ -325,13 +326,14 @@ pub async fn handle_encode(
         // extractor → the typed graph this write produced. Attach it to the
         // async `extractor` stage so the trace is per-stage (embed→vector,
         // persist→record, extractor→graph), mirroring the durable bundle the
-        // extractor worker persists for later MEMORY_INSPECT.
-        // Wait for the async HyPE producer to settle, then fold the durable
-        // bundle (analyzed keyword terms + generated HyPE questions) back into
-        // the live trace so `trace = true` returns the same complete picture
-        // MEMORY_INSPECT does — one write, everything in the stream. The caller
-        // opted into the added latency (a HyPE LLM roundtrip after the ack).
-        wait_for_hype(ctx, memory_id).await;
+        // extractor worker persists for later MEMORY_INSPECT. HyPE's own
+        // `hype` stage is folded into `pending_stages` alongside auto_edge /
+        // temporal_edge / extractor (it runs over every item the extractor
+        // batch processes, so it's enqueued 1:1 with `extractor`) and was
+        // already awaited by `await_stage_completions` above; by the time
+        // that event fires the HyPE questions are already durable
+        // (`HypeGenerator::generate_for` persists before publishing), so
+        // reading the bundle now sees them.
         let bundle =
             crate::memory_artifact::read_memory_artifact(ctx.executor.metadata.as_ref(), memory_id)
                 .ok()
@@ -367,27 +369,29 @@ pub async fn handle_encode(
                 }
             }
         }
-        // Synthetic HyPE stage → the hypothetical questions the write-time HyPE
-        // worker generated (async, post-ack). `Timeout` when it hadn't settled
-        // within the wait; the questions still land in MEMORY_INSPECT later.
-        let hype = bundle
+        // hype → the hypothetical questions the write-time HyPE worker
+        // generated, read back from the durable bundle and attached to the
+        // `hype` trace stage `await_stage_completions` already recorded
+        // above (real `Ok`/`Empty`/`Timeout` status from the genuine
+        // `StageCompleted{Hype}` event, not a synthetic one). Absent
+        // entirely when HyPE was never enqueued for this write (extraction
+        // itself didn't enqueue — see the `pending_stages` construction in
+        // `writer::submit`), same as any other stage that never queued.
+        if let Some(hype) = bundle
             .as_ref()
             .map(|b| b.hype_questions.clone())
-            .unwrap_or_default();
-        trace_stages.push(EncodeTraceStage {
-            name: "hype".into(),
-            status: if hype.is_empty() {
-                EncodeTraceStageStatus::Timeout
-            } else {
-                EncodeTraceStageStatus::Ok
-            },
-            latency_us: 0,
-            detail: format!("questions={}", hype.len()),
-            artifact: (!hype.is_empty()).then(|| EncodeStageArtifact {
-                hype_questions: hype,
-                ..Default::default()
-            }),
-        });
+            .filter(|h| !h.is_empty())
+        {
+            if let Some(stage) = trace_stages
+                .iter_mut()
+                .find(|s| s.name == stage_kind_name(StageKind::Hype))
+            {
+                stage.artifact = Some(EncodeStageArtifact {
+                    hype_questions: hype,
+                    ..Default::default()
+                });
+            }
+        }
 
         Some(EncodeTrace {
             stages: trace_stages,
@@ -415,35 +419,6 @@ pub async fn handle_encode(
         trace,
     })
 }
-
-/// Wait for the write-time HyPE worker to populate this memory's durable
-/// artifact bundle, so a traced ENCODE can fold the generated questions into
-/// the stream. HyPE is async (an LLM call that runs after the ack) and is not a
-/// `StageKind`, so it can't be awaited via the stage bus — we poll the durable
-/// `memory_artifacts` bundle instead, bounded by the trace drain window. Returns
-/// the instant `hype_questions` is non-empty, else at the deadline (the caller
-/// then records the HyPE stage as `Timeout`; the questions still land in
-/// MEMORY_INSPECT later).
-#[cfg(target_os = "linux")]
-async fn wait_for_hype(ctx: &OpsContext, memory_id: MemoryId) {
-    let deadline = Instant::now() + ctx.encode_trace_drain_window;
-    loop {
-        if let Ok(Some(b)) =
-            crate::memory_artifact::read_memory_artifact(ctx.executor.metadata.as_ref(), memory_id)
-        {
-            if !b.hype_questions.is_empty() {
-                return;
-            }
-        }
-        if Instant::now() >= deadline {
-            return;
-        }
-        glommio::timer::sleep(Duration::from_millis(150)).await;
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn wait_for_hype(_ctx: &OpsContext, _memory_id: MemoryId) {}
 
 /// Wait for THIS write's queued async stages (`pending`) to publish their
 /// `StageCompleted` events on the per-shard bus, appending one
@@ -576,6 +551,7 @@ fn stage_detail_from_env(env: &crate::subscribe::EventEnvelope) -> String {
         }
         Some(StagePayload::AutoEdge(p)) => format!("edges={}", p.edges_written),
         Some(StagePayload::TemporalEdge(p)) => format!("edges={}", p.edges_written),
+        Some(StagePayload::Hype(p)) => format!("questions={}", p.questions_written),
         None => String::new(),
     }
 }
@@ -584,12 +560,22 @@ fn stage_detail_from_env(env: &crate::subscribe::EventEnvelope) -> String {
 /// statements / relations) into a renderable [`EncodeStageGraph`] for the
 /// `extractor` stage's per-stage artifact. Entities become nodes (they carry
 /// ids); statement objects and relation endpoints are matched back to those
-/// node ids by canonical name — an endpoint that isn't a mentioned entity (a
-/// literal object, or one beyond the enrichment cap) resolves to the zero id.
+/// node ids by canonical name. A statement object that isn't a mentioned
+/// entity in this write is a literal value (e.g. "manages **the billing
+/// platform team**") — it gets a synthetic `"literal"` node (deduped by id
+/// within this call) instead of the all-zero placeholder, so the rendered
+/// graph carries the real value. A relation endpoint beyond the enrichment
+/// cap still falls back to the zero id — relations are always entity-to-
+/// entity by schema, so an unresolved endpoint there is a cap miss, not a
+/// literal. The synthetic id comes from the shared
+/// [`literal_node_id`](crate::memory_artifact::literal_node_id), so this live
+/// trace and the durable `MEMORY_INSPECT` bundle agree on one id per fact.
 fn encode_artifacts_to_graph(artifacts: &EncodeTraceArtifacts) -> EncodeStageGraph {
     use brain_protocol::envelope::response::{EncodeGraphEdge, EncodeGraphNode};
 
-    let nodes: Vec<EncodeGraphNode> = artifacts
+    use crate::memory_artifact::literal_node_id;
+
+    let mut nodes: Vec<EncodeGraphNode> = artifacts
         .entities
         .iter()
         .map(|e| EncodeGraphNode {
@@ -605,25 +591,45 @@ fn encode_artifacts_to_graph(artifacts: &EncodeTraceArtifacts) -> EncodeStageGra
         .iter()
         .map(|e| (e.name.as_str(), e.id))
         .collect();
-    let lookup = |name: &str| id_by_name.get(name).copied().unwrap_or([0u8; 16]);
+    let lookup = |name: &str| id_by_name.get(name).copied();
 
+    let mut seen_literals: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
     let mut edges: Vec<EncodeGraphEdge> = Vec::new();
     for s in &artifacts.statements {
+        let source = lookup(&s.subject_name).unwrap_or([0u8; 16]);
+        let target = match lookup(&s.object_name) {
+            Some(id) => id,
+            None => {
+                let lit_id = literal_node_id(&source, &s.predicate, &s.object_name);
+                if seen_literals.insert(lit_id) {
+                    nodes.push(EncodeGraphNode {
+                        id: lit_id,
+                        name: s.object_name.clone(),
+                        kind: "literal".to_string(),
+                        type_qname: String::new(),
+                    });
+                }
+                lit_id
+            }
+        };
         edges.push(EncodeGraphEdge {
-            source: lookup(&s.subject_name),
-            target: lookup(&s.object_name),
+            source,
+            target,
             predicate: s.predicate.clone(),
             kind: "statement".to_string(),
             confidence: s.confidence,
+            event_at_unix_nanos: s.event_at_unix_nanos,
         });
     }
     for r in &artifacts.relations {
         edges.push(EncodeGraphEdge {
-            source: lookup(&r.source_name),
-            target: lookup(&r.target_name),
+            source: lookup(&r.source_name).unwrap_or([0u8; 16]),
+            target: lookup(&r.target_name).unwrap_or([0u8; 16]),
             predicate: r.predicate.clone(),
             kind: "relation".to_string(),
             confidence: 1.0,
+            // A typed relation row carries no event time of its own.
+            event_at_unix_nanos: None,
         });
     }
 
@@ -677,6 +683,7 @@ fn build_encode_artifacts(
                             predicate: s.predicate,
                             object_name: s.object_label,
                             confidence: s.confidence,
+                            event_at_unix_nanos: s.event_at_unix_nanos,
                         })
                         .collect();
                     let relations: Vec<EncodeTraceRelation> = g
@@ -1039,4 +1046,209 @@ fn hex_short(bytes: &[u8; 16]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brain_protocol::envelope::response::{
+        EncodeTraceDedup, EncodeTraceEntity, EncodeTraceStatement,
+    };
+
+    fn priya_id() -> [u8; 16] {
+        [1u8; 16]
+    }
+
+    /// Fixture: "Priya manages the billing platform team" — a subject
+    /// entity, a `manages` statement whose object is a literal value with
+    /// no matching entity in this write (the case a parallel fix in
+    /// `brain-workers` ensures the object text is genuinely captured for,
+    /// rather than left empty).
+    fn literal_object_artifacts() -> EncodeTraceArtifacts {
+        EncodeTraceArtifacts {
+            entities: vec![EncodeTraceEntity {
+                id: priya_id(),
+                name: "Priya".into(),
+                type_qname: "brain:person".into(),
+            }],
+            statements: vec![EncodeTraceStatement {
+                id: [2u8; 16],
+                subject_name: "Priya".into(),
+                predicate: "manages".into(),
+                object_name: "the billing platform team".into(),
+                confidence: 0.9,
+                event_at_unix_nanos: None,
+            }],
+            relations: Vec::new(),
+            indexes: Vec::new(),
+            dedup: EncodeTraceDedup {
+                was_deduplicated: false,
+                matched_memory_id: None,
+            },
+        }
+    }
+
+    #[test]
+    fn literal_statement_object_renders_as_literal_node() {
+        let artifacts = literal_object_artifacts();
+        let graph = encode_artifacts_to_graph(&artifacts);
+
+        let literal_node = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == "literal")
+            .expect("a literal node must be synthesized for the literal-object statement");
+        assert_eq!(literal_node.name, "the billing platform team");
+        assert_eq!(literal_node.type_qname, "");
+        assert_ne!(
+            literal_node.id, [0u8; 16],
+            "must not be the zero placeholder"
+        );
+
+        let edge = &graph.edges[0];
+        assert_eq!(edge.kind, "statement");
+        assert_eq!(edge.source, priya_id());
+        assert_eq!(
+            edge.target, literal_node.id,
+            "edge target must point at the synthetic literal node, not the zero id"
+        );
+
+        // Exactly one entity node (Priya) plus one literal node.
+        assert_eq!(graph.nodes.len(), 2);
+    }
+
+    #[test]
+    fn literal_node_id_is_deterministic() {
+        let artifacts = literal_object_artifacts();
+        let first = encode_artifacts_to_graph(&artifacts);
+        let second = encode_artifacts_to_graph(&artifacts);
+
+        let first_id = first
+            .nodes
+            .iter()
+            .find(|n| n.kind == "literal")
+            .expect("literal node")
+            .id;
+        let second_id = second
+            .nodes
+            .iter()
+            .find(|n| n.kind == "literal")
+            .expect("literal node")
+            .id;
+        assert_eq!(
+            first_id, second_id,
+            "the same fact inspected twice must synthesize the same literal node id"
+        );
+    }
+
+    #[test]
+    fn repeated_literal_value_dedupes_to_one_node() {
+        let mut artifacts = literal_object_artifacts();
+        // A second statement with the same subject/predicate/object — the
+        // same literal fact restated — must not mint a second node.
+        artifacts.statements.push(artifacts.statements[0].clone());
+        let graph = encode_artifacts_to_graph(&artifacts);
+
+        let literal_nodes: Vec<_> = graph.nodes.iter().filter(|n| n.kind == "literal").collect();
+        assert_eq!(
+            literal_nodes.len(),
+            1,
+            "duplicate literal facts dedupe to one node"
+        );
+        assert_eq!(
+            graph.edges.len(),
+            2,
+            "both statement edges are still emitted"
+        );
+        assert_eq!(graph.edges[0].target, graph.edges[1].target);
+    }
+
+    /// The live ENCODE trace and the durable `MEMORY_INSPECT` bundle render
+    /// the same fact through different functions over different DTOs. Both
+    /// must mint the SAME synthetic literal id, or one literal would appear
+    /// under two ids depending on which path the caller inspected.
+    #[test]
+    fn literal_node_id_agrees_across_trace_and_bundle_paths() {
+        use brain_protocol::envelope::response::{
+            EnrichedEntity, EnrichedStatement, GraphEnrichment,
+        };
+
+        let artifacts = literal_object_artifacts();
+        let s = &artifacts.statements[0];
+        let enr = GraphEnrichment {
+            entities: vec![EnrichedEntity {
+                id: priya_id(),
+                name: artifacts.entities[0].name.clone(),
+                type_qname: artifacts.entities[0].type_qname.clone(),
+            }],
+            statements: vec![EnrichedStatement {
+                id: s.id,
+                subject_name: s.subject_name.clone(),
+                predicate: s.predicate.clone(),
+                object_label: s.object_name.clone(),
+                confidence: s.confidence,
+                event_at_unix_nanos: s.event_at_unix_nanos,
+            }],
+            relations: Vec::new(),
+        };
+
+        let trace_graph = encode_artifacts_to_graph(&artifacts);
+        let bundle_graph = crate::memory_artifact::enrichment_to_graph(Some(enr));
+
+        let literal_of = |g: &EncodeStageGraph| {
+            g.nodes
+                .iter()
+                .find(|n| n.kind == "literal")
+                .expect("literal node")
+                .clone()
+        };
+        let from_trace = literal_of(&trace_graph);
+        let from_bundle = literal_of(&bundle_graph);
+
+        assert_eq!(
+            from_trace.id, from_bundle.id,
+            "both renderers must derive the same synthetic id for the same fact"
+        );
+        assert_eq!(from_trace.name, from_bundle.name);
+        assert_eq!(trace_graph.edges[0].target, bundle_graph.edges[0].target);
+    }
+
+    #[test]
+    fn entity_statement_object_resolves_to_real_entity_node() {
+        let artifacts = EncodeTraceArtifacts {
+            entities: vec![
+                EncodeTraceEntity {
+                    id: priya_id(),
+                    name: "Priya".into(),
+                    type_qname: "brain:person".into(),
+                },
+                EncodeTraceEntity {
+                    id: [3u8; 16],
+                    name: "Stripe".into(),
+                    type_qname: "brain:org".into(),
+                },
+            ],
+            statements: vec![EncodeTraceStatement {
+                id: [2u8; 16],
+                subject_name: "Priya".into(),
+                predicate: "works_at".into(),
+                object_name: "Stripe".into(),
+                confidence: 0.95,
+                event_at_unix_nanos: None,
+            }],
+            relations: Vec::new(),
+            indexes: Vec::new(),
+            dedup: EncodeTraceDedup {
+                was_deduplicated: false,
+                matched_memory_id: None,
+            },
+        };
+        let graph = encode_artifacts_to_graph(&artifacts);
+
+        assert!(
+            graph.nodes.iter().all(|n| n.kind != "literal"),
+            "an entity-object statement must not synthesize a literal node"
+        );
+        assert_eq!(graph.edges[0].target, [3u8; 16]);
+    }
 }

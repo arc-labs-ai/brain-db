@@ -19,13 +19,16 @@ use brain_core::{Cardinality, RequestId, StatementKind};
 use brain_metadata::entity::types::entity_type_lookup_by_name_rtxn;
 use brain_metadata::extractor::ops::extractor_lookup_by_qname;
 use brain_metadata::relation::types::relation_type_lookup_by_qname;
+// One encoding of an object declaration, shared with the apply path, so
+// the pre-flight can't classify a re-upload differently than apply does.
+use brain_metadata::schema::apply::{declared_object_entity_type, object_type_constraint_byte};
 use brain_metadata::schema::predicate::predicate_lookup_by_qname;
 use brain_metadata::schema::store::{schema_active, schema_get, schema_list, SchemaStoreError};
 use brain_planner::WriterError;
 use brain_protocol::envelope::response::EventType;
 use brain_protocol::schema::{parse_schema, validate, ParseError, ValidationError};
 use brain_protocol::schema::{
-    CardinalityAst, ExtractorKindAst, ObjectTypeDecl, SchemaItem, StatementKindAst, ValidatedSchema,
+    CardinalityAst, ExtractorKindAst, SchemaItem, StatementKindAst, ValidatedSchema,
 };
 use brain_protocol::{
     GraphEventPayload, SchemaGetRequest, SchemaGetResponse, SchemaListItemWire, SchemaListRequest,
@@ -489,10 +492,23 @@ fn classify_schema_merge(
                     Some(row) => {
                         let new_kind = map_statement_kind(p.kind);
                         let new_object = object_type_constraint_byte(&p.object);
+                        // A declared `Entity<Type>` range resolves to the
+                        // same id apply will store; an unknown name
+                        // resolves to `0` there too, so the comparison
+                        // stays exact.
+                        let new_object_entity_type = match declared_object_entity_type(&p.object) {
+                            Some(name) => entity_type_lookup_by_name_rtxn(&rtxn, name)
+                                .map_err(|err| {
+                                    OpError::Internal(format!("entity_type lookup: {err}"))
+                                })?
+                                .map_or(0, |d| d.id().raw()),
+                            None => 0,
+                        };
                         let new_description = p.description.as_deref().unwrap_or("");
                         let new_stateful = p.resolved_stateful();
                         if row.kind_constraint != new_kind
                             || row.object_type_constraint_byte != new_object
+                            || row.object_entity_type_id != new_object_entity_type
                             || row.description != new_description
                             || row.is_stateful != new_stateful
                         {
@@ -507,6 +523,12 @@ fn classify_schema_merge(
                                 diff.push(format!(
                                     "object_type: stored={} new={}",
                                     row.object_type_constraint_byte, new_object
+                                ));
+                            }
+                            if row.object_entity_type_id != new_object_entity_type {
+                                diff.push(format!(
+                                    "object entity_type: stored={} new={}",
+                                    row.object_entity_type_id, new_object_entity_type
                                 ));
                             }
                             if row.description != new_description {
@@ -625,16 +647,6 @@ fn map_statement_kind(k: StatementKindAst) -> Option<StatementKind> {
         StatementKindAst::Relation => Some(StatementKind::Relation),
         StatementKindAst::Directive => Some(StatementKind::Directive),
         StatementKindAst::Any => None,
-    }
-}
-
-fn object_type_constraint_byte(o: &ObjectTypeDecl) -> u8 {
-    match o {
-        ObjectTypeDecl::Any => 0,
-        ObjectTypeDecl::Entity { .. } => 1,
-        ObjectTypeDecl::Value { .. } => 2,
-        ObjectTypeDecl::Memory => 3,
-        ObjectTypeDecl::Statement => 4,
     }
 }
 

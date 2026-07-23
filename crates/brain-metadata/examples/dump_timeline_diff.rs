@@ -18,7 +18,9 @@ fn be64(b: &[u8]) -> u64 {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: <metadata.redb> [agent_hex]");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: <metadata.redb> [agent_hex]");
     let agent_filter: Option<[u8; 16]> = std::env::args().nth(2).map(|h| {
         let mut a = [0u8; 16];
         for (i, s) in a.iter_mut().enumerate() {
@@ -29,7 +31,9 @@ fn main() {
 
     let db = Database::open(&path).expect("open redb");
     let rtxn = db.begin_read().expect("read txn");
-    let tt = rtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE).expect("timeline");
+    let tt = rtxn
+        .open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE)
+        .expect("timeline");
     let mt = rtxn.open_table(MEMORIES_TABLE).expect("memories");
 
     let mut checked = 0u64;

@@ -39,6 +39,60 @@ pub enum PredicateOpError {
 }
 
 // ---------------------------------------------------------------------------
+// Object-type constraint.
+// ---------------------------------------------------------------------------
+
+/// The object-type constraint a predicate declaration carries.
+///
+/// `object_type_byte` selects the `StatementObject` variant (`0` any /
+/// `1` Entity / `2` Value / `3` Memory / `4` Statement).
+/// `entity_type_id` narrows the `Entity` case to a single declared
+/// entity type — `object: Entity<Person>` stores Person's
+/// `EntityTypeId`, a bare `Entity` stores `0` (any).
+///
+/// ```
+/// # use brain_metadata::schema::predicate::ObjectConstraint;
+/// // `object: Value<text>` — variant only, nothing to narrow.
+/// assert_eq!(ObjectConstraint::from(2), ObjectConstraint { object_type_byte: 2, entity_type_id: 0 });
+/// // `object: Entity<Person>` where Person is EntityTypeId(1).
+/// assert_eq!(ObjectConstraint::entity(1).entity_type_id, 1);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObjectConstraint {
+    pub object_type_byte: u8,
+    pub entity_type_id: u32,
+}
+
+impl ObjectConstraint {
+    /// No constraint at all — any object variant, any entity type.
+    pub const ANY: Self = Self {
+        object_type_byte: 0,
+        entity_type_id: 0,
+    };
+
+    /// An `Entity` object narrowed to `entity_type_id` (`0` = any
+    /// entity type).
+    #[must_use]
+    pub fn entity(entity_type_id: u32) -> Self {
+        Self {
+            object_type_byte: 1,
+            entity_type_id,
+        }
+    }
+}
+
+/// A bare variant byte with no entity-type narrowing. Lets call sites
+/// that only pin the object variant keep passing the byte directly.
+impl From<u8> for ObjectConstraint {
+    fn from(object_type_byte: u8) -> Self {
+        Self {
+            object_type_byte,
+            entity_type_id: 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Identifier validation.
 // ---------------------------------------------------------------------------
 
@@ -401,7 +455,7 @@ pub fn predicate_intern(
     namespace: &str,
     name: &str,
     kind_constraint: Option<StatementKind>,
-    object_type_constraint_byte: u8,
+    object_constraint: impl Into<ObjectConstraint>,
     schema_version: u32,
     description: &str,
     is_stateful: bool,
@@ -409,6 +463,11 @@ pub fn predicate_intern(
 ) -> Result<PredicateId, PredicateOpError> {
     validate_namespace(namespace)?;
     validate_name(name)?;
+
+    let ObjectConstraint {
+        object_type_byte: object_type_constraint_byte,
+        entity_type_id: object_entity_type_id,
+    } = object_constraint.into();
 
     let q = qname(namespace, name);
 
@@ -446,6 +505,7 @@ pub fn predicate_intern(
         let constraints_match = row.kind_constraint
             == crate::tables::predicate::encode_kind_constraint(kind_constraint)
             && row.object_type_constraint_byte == object_type_constraint_byte
+            && row.object_entity_type_id == object_entity_type_id
             && row.description == description
             && row.is_stateful == is_stateful;
 
@@ -465,6 +525,7 @@ pub fn predicate_intern(
                 name: name.to_string(),
                 kind_constraint,
                 object_type_constraint_byte,
+                object_entity_type_id,
                 schema_version,
                 description: description.to_string(),
                 is_stateful,
@@ -491,6 +552,7 @@ pub fn predicate_intern(
                 name: name.to_string(),
                 kind_constraint,
                 object_type_constraint_byte,
+                object_entity_type_id,
                 schema_version,
                 description: description.to_string(),
                 is_stateful,
@@ -532,6 +594,7 @@ pub fn predicate_intern(
         name: name.to_string(),
         kind_constraint,
         object_type_constraint_byte,
+        object_entity_type_id,
         schema_version,
         description: description.to_string(),
         is_stateful,
@@ -609,6 +672,7 @@ pub fn predicate_intern_or_get(
         // tighten this on a subsequent SCHEMA_UPLOAD.
         kind_constraint: None,
         object_type_constraint_byte: 0,
+        object_entity_type_id: 0,
         // `schema_version = 0` reserves the slot for "not declared
         // by any schema yet". The origin tag carries the real
         // provenance via `ImplicitFromWrite`.

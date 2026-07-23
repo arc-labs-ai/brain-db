@@ -25,7 +25,7 @@ use brain_core::{Entity, EntityId, EntityType, EntityTypeId};
 use brain_embed::{Dispatcher, EmbedError};
 use brain_extractors::resolver::{
     resolve_or_create_with_deps, Disambiguation, EmbeddingDeps, EntityDisambiguator,
-    PrecomputedVerdicts, Resolution, ResolutionTier,
+    PrecomputedVerdicts, Resolution, ResolutionTier, StagedEntityVectors,
 };
 use brain_index::entity_hnsw::{EntityHnswIndex, EntityHnswParams};
 use brain_index::VECTOR_DIM;
@@ -274,6 +274,11 @@ fn two_phase_resolve(
         let mut pending = Vec::new();
         {
             let plan_txn = db.write_txn().unwrap();
+            // The plan pass's staged entity vectors are NEVER flushed: they
+            // describe rows this rollback erases, and the HNSW cannot
+            // un-insert. Dropping the staging area with the txn is the
+            // rollback.
+            let mut plan_staged = StagedEntityVectors::new();
             resolve_or_create_with_deps(
                 &plan_txn,
                 test_scope(),
@@ -282,6 +287,7 @@ fn two_phase_resolve(
                 0.9,
                 NOW + 1,
                 Some(embed_deps),
+                &mut plan_staged,
                 &mut Disambiguation::Collect(&mut pending),
             )
             .unwrap();
@@ -303,6 +309,7 @@ fn two_phase_resolve(
         Disambiguation::Off
     };
     let wtxn = db.write_txn().unwrap();
+    let mut staged = StagedEntityVectors::new();
     let res = resolve_or_create_with_deps(
         &wtxn,
         test_scope(),
@@ -311,10 +318,13 @@ fn two_phase_resolve(
         0.9,
         NOW + 1,
         Some(embed_deps),
+        &mut staged,
         &mut mode,
     )
     .unwrap();
     wtxn.commit().unwrap();
+    // Committed → safe to publish into the in-RAM index.
+    staged.flush_into_hnsw(embed_deps);
     res
 }
 

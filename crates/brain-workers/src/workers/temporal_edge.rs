@@ -58,7 +58,7 @@ use brain_protocol::shared::enums::{
 };
 use futures_lite::FutureExt;
 use glommio::timer::sleep;
-use tracing::trace;
+use tracing::{trace, warn};
 
 use crate::config::{WorkerConfig, WorkerKind};
 use crate::context::WorkerContext;
@@ -233,6 +233,11 @@ async fn do_temporal_edge_cycle(
     // commit for each source.
     let mut drained_sources: Vec<MemoryId> = Vec::new();
     let mut per_source_edges: HashMap<MemoryId, u32> = HashMap::new();
+    // Real owning agent for each drained source, carried through from the
+    // writer's enqueue payload — the `StageCompleted{TemporalEdge}`
+    // publish below stamps this instead of `AgentId::default()` so an
+    // agent-scoped SUBSCRIBE filter actually matches the event.
+    let mut source_agents: HashMap<MemoryId, AgentId> = HashMap::new();
 
     while processed < cfg.batch_size {
         if started.elapsed() >= cfg.max_runtime {
@@ -265,6 +270,7 @@ async fn do_temporal_edge_cycle(
         let (new_memory_id, agent_id, context_id, new_ts, new_vector) = item;
         processed += 1;
         drained_sources.push(new_memory_id);
+        source_agents.insert(new_memory_id, agent_id);
 
         // Look up the predecessor via the agent-timeline index in
         // its own read txn. One tiny rtxn per enqueue keeps the
@@ -419,6 +425,42 @@ async fn do_temporal_edge_cycle(
         to_link.len()
     };
 
+    // Merge the real per-edge detail (predecessor memory id + real decay
+    // weight, not just the count) into the successor's durable
+    // write-artifact bundle, so `MEMORY_INSPECT` can show it later —
+    // mirroring `extractor`'s `merge_graph_from_committed` and `hype`'s
+    // `merge_hype_questions`. Keyed by successor (`new_memory_id`, the
+    // second tuple element) to match `per_source_edges`'s / the
+    // `StageCompleted` publish's grouping below. Best-effort: a merge
+    // failure is logged and never blocks the cycle — the edges themselves
+    // already committed via `submit(Write)` above.
+    if written > 0 {
+        let metadata = ctx.ops.executor.metadata.as_ref();
+        let mut by_successor: HashMap<MemoryId, Vec<(MemoryId, MemoryId, f32)>> = HashMap::new();
+        for (prev_id, new_memory_id, weight) in &to_link {
+            by_successor.entry(*new_memory_id).or_default().push((
+                *prev_id,
+                *new_memory_id,
+                *weight,
+            ));
+        }
+        for (successor, links) in by_successor {
+            if let Err(e) = brain_ops::memory_artifact::merge_edge_links(
+                metadata,
+                successor,
+                "followed_by",
+                &links,
+            ) {
+                warn!(
+                    target: "brain_workers::temporal_edge",
+                    memory_id = ?successor,
+                    error = %e,
+                    "artifact edge merge failed (durable edges are committed; bundle detail deferred)",
+                );
+            }
+        }
+    }
+
     let elapsed = started.elapsed();
     worker.metrics.add_edges_written(written as u64);
     worker.metrics.observe_cycle_duration(elapsed.as_secs_f64());
@@ -449,9 +491,9 @@ async fn do_temporal_edge_cycle(
             stage_payload: Some(StagePayload::TemporalEdge(StageTemporalEdgePayload {
                 edges_written,
             })),
-            agent_id: AgentId::default(),
+            agent_id: source_agents.get(&memory_id).copied().unwrap_or_default(),
         };
-        let _ = ctx.ops.events.publish(envelope);
+        ctx.ops.publish_stage_event(envelope).await;
     }
 
     trace!(

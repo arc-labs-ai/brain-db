@@ -187,6 +187,7 @@ fn plan_req(start: u128, goal: u128, max_depth: u32, txn: Option<[u8; 16]>) -> P
         context_filter: None,
         request_id: None,
         txn_id: txn,
+        trace: false,
         act_as: None,
     }
 }
@@ -201,6 +202,7 @@ fn reason_req(base: u128, depth: u32, txn: Option<[u8; 16]>) -> ReasonRequest {
         budget_wall_time_ms: 1000,
         request_id: None,
         txn_id: txn,
+        trace: false,
         act_as: None,
     }
 }
@@ -298,6 +300,7 @@ fn unwrap_plan(outcome: DispatchOutcome) -> PlanResponseFrame {
         steps,
         is_final: t.is_final,
         plan_status: t.plan_status,
+        trace: t.trace,
     }
 }
 
@@ -324,6 +327,7 @@ fn unwrap_reason(outcome: DispatchOutcome) -> ReasonResponseFrame {
         inferences,
         is_final: t.is_final,
         reason_status: t.reason_status,
+        trace: t.trace,
     }
 }
 

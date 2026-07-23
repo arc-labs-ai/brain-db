@@ -37,7 +37,7 @@ use crate::subscribe::EventEnvelope;
 /// are zero-filled. Called post-commit by every
 /// typed-graph handler that mutates state.
 ///
-/// Routes through [`OpsContext::publish_graph`] so the event is
+/// Routes through [`OpsContext::publish_notification`] so the event is
 /// **also** WAL-recorded — letting subscribe-replay (`--start-lsn`)
 /// reconstruct typed-graph events the same way it reconstructs
 /// substrate events. The WAL append is post-commit (redb is the
@@ -77,7 +77,7 @@ pub(crate) async fn emit_graph_event(
         let _ = ctx.events.publish(envelope);
         return;
     };
-    ctx.publish_graph(kind, payload, agent_id, move |lsn, payload| EventEnvelope {
+    ctx.publish_notification(kind, payload, agent_id, move |lsn, payload| EventEnvelope {
         lsn,
         event_type,
         memory_id: MemoryId::NULL,

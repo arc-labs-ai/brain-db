@@ -18,7 +18,13 @@ use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
     EncodeRequest, MemoryKindWire, RecallRequest, RequestBody,
 };
-use brain_protocol::envelope::response::{EncodeResponse, RecallResponseFrame, ResponseBody};
+use brain_protocol::envelope::response::{
+    EncodeResponse, RankedItemKindWire, RecallResponseFrame, ResponseBody,
+};
+use brain_protocol::{
+    EntityCreateRequest, EntityCreateResponse, EvidenceRefWire, StatementCreateRequest,
+    StatementCreateResponse, StatementKindWire, StatementObjectWire, StatementValueWire,
+};
 
 // ---------------------------------------------------------------------------
 // Mock dispatcher: text-driven deterministic vectors.
@@ -810,6 +816,165 @@ fn recall_trace_populated_when_requested() {
         assert!(
             trace.total_latency_ms >= 0.0,
             "total latency is a non-negative wall-time",
+        );
+
+        // `trace = true` is the one full-detail knob (no separate
+        // `trace_detail` field on the wire) — at least one retriever lane
+        // must carry its raw per-item candidates (id + text + score), not
+        // just a count, and every carried candidate must have its text
+        // fetched.
+        let any_candidates = trace.retrievers.iter().any(|r| !r.candidates.is_empty());
+        assert!(
+            any_candidates,
+            "full-detail trace must carry per-lane candidates, not just counts",
+        );
+        for r in &trace.retrievers {
+            for c in &r.candidates {
+                assert!(
+                    !c.text.is_empty(),
+                    "full-detail candidate must carry its fetched text",
+                );
+            }
+        }
+
+        // Fusion breakdown: every fused item's per-lane score contribution.
+        let fusion = trace
+            .fusion
+            .expect("full-detail trace must carry a fusion breakdown");
+        assert!(
+            !fusion.items.is_empty(),
+            "fusion breakdown must carry at least one fused item",
+        );
+        assert!(
+            fusion.items.iter().any(|i| !i.lane_scores.is_empty()),
+            "at least one fused item must carry a per-lane score breakdown",
+        );
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 10. RECALL trace kind-tags dropped Statement/Relation ids (regression for
+//    the bug where `dropped_by_supersession`/`dropped_by_as_of`/
+//    `dropped_by_limit` silently discarded non-Memory drops instead of
+//    surfacing them with their real kind).
+// ---------------------------------------------------------------------------
+
+async fn create_entity(fix: &Fixture, request_id: [u8; 16], canonical: &str) -> [u8; 16] {
+    let req = EntityCreateRequest {
+        // brain:Person is seeded by the system schema at id = 1.
+        entity_type_id: 1,
+        canonical_name: canonical.to_string(),
+        aliases: Vec::new(),
+        attributes_blob: Vec::new(),
+        request_id,
+        act_as: None,
+    };
+    let outcome = dispatch(
+        RequestBody::EntityCreate(req),
+        brain_ops::RequestCaller::for_tests(),
+        &fix.ctx,
+    )
+    .await
+    .expect("entity_create dispatch");
+    match single_body(outcome) {
+        ResponseBody::EntityCreate(EntityCreateResponse { entity_id }) => entity_id,
+        other => panic!("expected EntityCreate response, got {other:?}"),
+    }
+}
+
+async fn create_statement(
+    fix: &Fixture,
+    request_id: [u8; 16],
+    subject: [u8; 16],
+    predicate: &str,
+    value: &str,
+) -> [u8; 16] {
+    let req = StatementCreateRequest {
+        kind: StatementKindWire::Fact,
+        subject,
+        predicate: predicate.to_string(),
+        object: StatementObjectWire::Value(StatementValueWire::Text(value.to_string())),
+        confidence: 0.95,
+        evidence: EvidenceRefWire::Inline(Vec::new()),
+        extractor_id: 0,
+        valid_from_unix_nanos: 0,
+        valid_to_unix_nanos: 0,
+        event_at_unix_nanos: 0,
+        schema_version: 0,
+        request_id,
+        act_as: None,
+    };
+    let outcome = dispatch(
+        RequestBody::StatementCreate(req),
+        brain_ops::RequestCaller::for_tests(),
+        &fix.ctx,
+    )
+    .await
+    .expect("statement_create dispatch");
+    match single_body(outcome) {
+        ResponseBody::StatementCreate(StatementCreateResponse { statement_id, .. }) => statement_id,
+        other => panic!("expected StatementCreate response, got {other:?}"),
+    }
+}
+
+#[test]
+fn recall_trace_dropped_by_as_of_kind_tags_statement_drop() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+
+        // A reference point strictly BEFORE the statement is extracted:
+        // `filter_as_of` drops any statement whose `extracted_at_unix_nanos`
+        // is later than the request's `as_of_record_time_unix_nanos`. The
+        // graph lane's `push_statements` only filters by supersession
+        // (`current_only`), not by extraction time, so this current,
+        // never-superseded statement still reaches the fused pool and gets
+        // cut by `filter_as_of` specifically — the real drop this test
+        // targets, not a supersession or type-filter side effect.
+        let before_creation = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos() as u64;
+
+        let acme = create_entity(&fix, [0xD0; 16], "Acme Corp").await;
+        let stmt_id = create_statement(&fix, [0xD1; 16], acme, "app:worksAt", "engineering").await;
+
+        // Anchor the graph lane directly on the entity via `subject_name`
+        // (bypassing cue-text surface mining) so the walk is deterministic.
+        let mut req = recall_req("engineering department", 5);
+        req.subject_name = "Acme Corp".to_string();
+        req.trace = true;
+        req.as_of_record_time_unix_nanos = Some(before_creation);
+
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(req),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let trace = frame
+            .trace
+            .expect("trace=true must populate the frame trace");
+        let want_id = u128::from_be_bytes(stmt_id);
+        let hit = trace
+            .filter_chain
+            .dropped_by_as_of
+            .iter()
+            .find(|d| d.id == want_id);
+        let hit = hit.unwrap_or_else(|| {
+            panic!(
+                "expected the statement to be dropped by as_of, got dropped_by_as_of={:?}",
+                trace.filter_chain.dropped_by_as_of
+            )
+        });
+        assert_eq!(
+            hit.kind,
+            RankedItemKindWire::Statement,
+            "the dropped id must be kind-tagged Statement, not silently discarded or \
+             mistagged as Memory",
         );
     })
 }

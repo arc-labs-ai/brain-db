@@ -130,6 +130,7 @@ fn empty_filter() -> SubscriptionFilter {
         kinds: None,
         similar_to: None,
         agents: None,
+        memory_ids: None,
     }
 }
 
@@ -139,6 +140,7 @@ fn sub_req(filter: SubscriptionFilter) -> SubscribeRequest {
         include_history: false,
         from_lsn: None,
         max_inflight: 100,
+        act_as: None,
     }
 }
 
@@ -419,6 +421,59 @@ fn filter_context_drops_off_context_events() {
             }
         }
         assert_eq!(matched, 1);
+    })
+}
+
+#[test]
+fn filter_memory_ids_drops_off_target_memory_events() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+
+        // Encode first so we know the exact memory_id to scope the
+        // subscription to — the filter must only admit events for THAT
+        // memory, not the other one in flight on the same shard (this is
+        // the scoped-progress-watch use case: a client wants to observe
+        // one specific write's derivation without unrelated traffic).
+        let target_id = do_encode(
+            &fix.ctx,
+            encode_req([1; 16], "target", 1, MemoryKindWire::Episodic),
+        )
+        .await;
+
+        let mut filter = empty_filter();
+        filter.memory_ids = Some(vec![target_id]);
+        let handle = fix.ctx.subscriptions.register(&sub_req(filter)).unwrap();
+        let mut rx = handle.receiver;
+
+        do_encode(
+            &fix.ctx,
+            encode_req([2; 16], "other", 1, MemoryKindWire::Episodic),
+        )
+        .await;
+        do_encode(
+            &fix.ctx,
+            encode_req([3; 16], "yet-another", 1, MemoryKindWire::Episodic),
+        )
+        .await;
+        // A follow-up write against the SAME target memory_id (a forget —
+        // a distinct event from the original encode) also matches — the
+        // filter is keyed on memory_id, not on which write produced it.
+        do_forget(&fix.ctx, target_id, [4; 16]).await;
+
+        let mut matched_ids = Vec::new();
+        for _ in 0..3 {
+            if let Some(env) = try_recv(&mut rx, Duration::from_millis(200)).await {
+                if handle.filter.matches(&env) {
+                    matched_ids.push(env.memory_id);
+                }
+            }
+        }
+        assert_eq!(
+            matched_ids,
+            vec![MemoryId::from(target_id)],
+            "only the forget event for the filtered memory_id must pass \
+             (the other two memories' encodes must be dropped)",
+        );
     })
 }
 
@@ -855,5 +910,205 @@ mod wal_record_projection {
             EventEnvelope::from_wal_record(&r).is_empty(),
             "unflagged opaque-body records must not project to events"
         );
+    }
+
+    // ----- StageCompleted notification records (publish_stage_event) ----
+    //
+    // Same durable-notification pattern as the typed-graph events above,
+    // extended to a 4th event category (auto_edge / temporal_edge /
+    // extractor / hype completion). Unlike typed-graph events there is no
+    // separate durable write record for a stage completion — this flagged
+    // record is the event's only WAL trace — so `from_wal_record` needs
+    // its own decode arm (`StageCompletedEventBody`, keyed on real
+    // `memory_id`) rather than reusing `GraphEventPayload`.
+
+    fn stage_completed_event_record(
+        memory_id: MemoryId,
+        outcome: brain_protocol::StageOutcome,
+        agent_id: [u8; 16],
+        flags: u8,
+    ) -> WalRecord {
+        use brain_protocol::{
+            StageAutoEdgePayload, StageCompletedEventBody, StageKind, StagePayload,
+        };
+        let body = StageCompletedEventBody {
+            memory_id: memory_id.into(),
+            stage_kind: StageKind::AutoEdge,
+            stage_outcome: outcome,
+            stage_payload: StagePayload::AutoEdge(StageAutoEdgePayload { edges_written: 0 }),
+        };
+        // Mirror publish_notification: agent_id (16 B) prefix, then CBOR.
+        let mut payload = Vec::with_capacity(16);
+        payload.extend_from_slice(&agent_id);
+        ciborium::into_writer(&body, &mut payload).unwrap();
+        WalRecord {
+            lsn: Lsn(9),
+            kind: brain_storage::wal::kinds::WalRecordKind::StageCompleted,
+            flags,
+            timestamp_ns: 1_700_000_000_000_000_001,
+            agent_id_lo64: 0,
+            payload,
+        }
+    }
+
+    #[test]
+    fn flagged_stage_completed_record_projects_to_stage_completed_event() {
+        let mid = mid(11);
+        let r = stage_completed_event_record(
+            mid,
+            brain_protocol::StageOutcome::Empty,
+            [0xCD; 16],
+            brain_storage::wal::record::FLAG_SUBSCRIBE_EVENT,
+        );
+        let envs = EventEnvelope::from_wal_record(&r);
+        assert_eq!(envs.len(), 1, "one StageCompleted event");
+        let env = &envs[0];
+        assert_eq!(env.event_type, EventType::StageCompleted);
+        assert_eq!(
+            env.memory_id, mid,
+            "real memory_id round-trips, unlike graph events"
+        );
+        assert_eq!(env.stage_kind, Some(brain_protocol::StageKind::AutoEdge));
+        assert_eq!(
+            env.stage_outcome,
+            Some(brain_protocol::StageOutcome::Empty),
+            "a genuine zero-result outcome round-trips, not just Ok"
+        );
+        match &env.stage_payload {
+            Some(brain_protocol::StagePayload::AutoEdge(p)) => assert_eq!(p.edges_written, 0),
+            other => panic!("expected AutoEdge payload, got {other:?}"),
+        }
+        assert_eq!(
+            env.agent_id,
+            AgentId::from([0xCDu8; 16]),
+            "agent_id recovers from the record's 16-byte prefix"
+        );
+        assert!(env.graph_payload.is_none());
+        assert!(env.edge_payload.is_none());
+    }
+
+    #[test]
+    fn unflagged_stage_completed_record_is_not_projected() {
+        let r = stage_completed_event_record(mid(11), brain_protocol::StageOutcome::Ok, [0; 16], 0);
+        assert!(
+            EventEnvelope::from_wal_record(&r).is_empty(),
+            "unflagged StageCompleted records must not project to events"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StageCompleted WAL durability — the actual regression test for the
+// ack-then-subscribe race auto_edge (and friends) hit.
+// ---------------------------------------------------------------------------
+
+mod stage_completed_durability {
+    use brain_core::AgentId;
+    use brain_ops::writer::wal_sink::{RecordingWalSink, WalSink};
+    use brain_protocol::{StageAutoEdgePayload, StageKind, StageOutcome, StagePayload};
+
+    use super::*;
+
+    fn stage_env(memory_id: MemoryId, outcome: StageOutcome, edges_written: u32) -> EventEnvelope {
+        EventEnvelope {
+            lsn: 0,
+            event_type: EventType::StageCompleted,
+            memory_id,
+            context_id: ContextId::default(),
+            kind: MemoryKind::Episodic,
+            salience: 0.0,
+            timestamp_unix_nanos: 1_700_000_000_000_000_002,
+            text: None,
+            graph_payload: None,
+            edge_payload: None,
+            stage_kind: Some(StageKind::AutoEdge),
+            stage_outcome: Some(outcome),
+            stage_payload: Some(StagePayload::AutoEdge(StageAutoEdgePayload {
+                edges_written,
+            })),
+            agent_id: AgentId::default(),
+        }
+    }
+
+    #[test]
+    fn stage_completed_survives_wal_tail_replay_with_no_live_subscriber() {
+        run_in_glommio(|| async {
+            let fixture = build_fixture();
+            let sink = Arc::new(RecordingWalSink::new());
+            let wal_sink: Arc<dyn WalSink> = sink.clone();
+            let ctx = fixture.ctx.with_wal_sink(Some(wal_sink));
+
+            // The exact race: nobody is subscribed when the stage
+            // publishes. A bus-only publish would be dropped on the
+            // floor here — `subscriber_count() == 0` means `send()`
+            // returns `Err` and the event is gone forever for any
+            // future subscriber.
+            assert_eq!(ctx.events.subscriber_count(), 0);
+
+            let mid = MemoryId::pack(1, 77, 2);
+            // The zero-result case specifically — this is the outcome
+            // that made the scan-based alternative unworkable (no
+            // artifacts bundle is written for a genuine empty result)
+            // and is exactly the case a real client must not hang on.
+            ctx.publish_stage_event(stage_env(mid, StageOutcome::Empty, 0))
+                .await;
+
+            let appended = sink.appended();
+            assert_eq!(appended.len(), 1, "exactly one WAL record appended");
+            let rec = &appended[0];
+            assert_eq!(
+                rec.kind,
+                brain_storage::wal::kinds::WalRecordKind::StageCompleted
+            );
+            assert_ne!(
+                rec.flags & brain_storage::wal::record::FLAG_SUBSCRIBE_EVENT,
+                0,
+                "must be flagged so crash recovery skips it"
+            );
+
+            // The actual regression proof: a subscriber that registers
+            // AFTER the stage already completed (simulating the
+            // ack-then-subscribe race) recovers the event purely by
+            // replaying this WAL record — not via the live bus.
+            let envs = EventEnvelope::from_wal_record(rec);
+            assert_eq!(envs.len(), 1);
+            let recovered = &envs[0];
+            assert_eq!(recovered.event_type, EventType::StageCompleted);
+            assert_eq!(recovered.memory_id, mid);
+            assert_eq!(recovered.stage_kind, Some(StageKind::AutoEdge));
+            assert_eq!(
+                recovered.stage_outcome,
+                Some(StageOutcome::Empty),
+                "the zero-result outcome recovers, not just success"
+            );
+            match &recovered.stage_payload {
+                Some(StagePayload::AutoEdge(p)) => assert_eq!(p.edges_written, 0),
+                other => panic!("expected AutoEdge payload, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn stage_completed_ok_outcome_also_survives_replay() {
+        run_in_glommio(|| async {
+            let fixture = build_fixture();
+            let sink = Arc::new(RecordingWalSink::new());
+            let wal_sink: Arc<dyn WalSink> = sink.clone();
+            let ctx = fixture.ctx.with_wal_sink(Some(wal_sink));
+
+            let mid = MemoryId::pack(1, 78, 2);
+            ctx.publish_stage_event(stage_env(mid, StageOutcome::Ok, 3))
+                .await;
+
+            let appended = sink.appended();
+            assert_eq!(appended.len(), 1);
+            let envs = EventEnvelope::from_wal_record(&appended[0]);
+            assert_eq!(envs.len(), 1);
+            assert_eq!(envs[0].stage_outcome, Some(StageOutcome::Ok));
+            match &envs[0].stage_payload {
+                Some(StagePayload::AutoEdge(p)) => assert_eq!(p.edges_written, 3),
+                other => panic!("expected AutoEdge payload, got {other:?}"),
+            }
+        });
     }
 }

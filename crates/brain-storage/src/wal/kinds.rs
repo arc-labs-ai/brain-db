@@ -6,9 +6,9 @@
 //! ## Discriminant ranges
 //!
 //! - **1..=15**  — substrate kinds.
-//! - **16..=80** — opaque-body kinds ("WAL frame types"),
+//! - **16..=81** — opaque-body kinds ("WAL frame types"),
 //!   with reserved gaps inside the block for future grouping.
-//! - **81..=127** — reserved for v1 minor versions.
+//! - **82..=127** — reserved for v1 minor versions.
 //! - **128..**   — reserved for v2+ (incompatible format).
 //!
 //! opaque-body bodies are treated as opaque `Vec<u8>` payloads by
@@ -68,6 +68,14 @@ pub enum WalRecordKind {
     SchemaUpdate = 0x40,
     /// 0x50 — extractor / resolution audit entry.
     Audit = 0x50,
+    /// 0x51 — background-stage completion notification (auto_edge /
+    /// temporal_edge / extractor / hype). Opaque-body, always flagged
+    /// `FLAG_SUBSCRIBE_EVENT` — this is a subscribe-replay change-feed
+    /// record, not state to replay into the DB (there is no durable
+    /// counterpart record the way typed-graph writes have one).
+    /// Recovery skips it exactly like the flagged typed-graph event
+    /// records.
+    StageCompleted = 0x51,
 }
 
 impl WalRecordKind {
@@ -107,6 +115,7 @@ impl WalRecordKind {
             0x32 => Self::RelationTombstone,
             0x40 => Self::SchemaUpdate,
             0x50 => Self::Audit,
+            0x51 => Self::StageCompleted,
             _ => return None,
         })
     }
@@ -115,13 +124,13 @@ impl WalRecordKind {
         self as u8
     }
 
-    /// `true` for opaque-body kinds (discriminant `0x10..=0x50`).
+    /// `true` for opaque-body kinds (discriminant `0x10..=0x51`).
     /// The substrate WAL apply-paths ignore these; opaque-body
     /// hydration is performed by later phases via their own sinks.
     #[must_use]
     pub const fn has_opaque_body(self) -> bool {
         let d = self as u8;
-        d >= 0x10 && d <= 0x50
+        d >= 0x10 && d <= 0x51
     }
 }
 
@@ -158,6 +167,7 @@ pub const ALL_KINDS: &[WalRecordKind] = &[
     WalRecordKind::RelationTombstone,
     WalRecordKind::SchemaUpdate,
     WalRecordKind::Audit,
+    WalRecordKind::StageCompleted,
 ];
 
 #[cfg(test)]
@@ -180,6 +190,7 @@ mod tests {
         assert_eq!(WalRecordKind::RelationCreate.as_u8(), 0x30);
         assert_eq!(WalRecordKind::SchemaUpdate.as_u8(), 0x40);
         assert_eq!(WalRecordKind::Audit.as_u8(), 0x50);
+        assert_eq!(WalRecordKind::StageCompleted.as_u8(), 0x51);
     }
 
     #[test]
@@ -197,7 +208,8 @@ mod tests {
         assert_eq!(WalRecordKind::from_u8(0x16), None);
         assert_eq!(WalRecordKind::from_u8(0x23), None);
         assert_eq!(WalRecordKind::from_u8(0x41), None); // extractor toggle removed
-        assert_eq!(WalRecordKind::from_u8(0x60), None); // beyond 0x50 audit
+        assert_eq!(WalRecordKind::from_u8(0x52), None); // beyond 0x51 stage-completed
+        assert_eq!(WalRecordKind::from_u8(0x60), None);
         assert_eq!(WalRecordKind::from_u8(96), None); // 0x60 in decimal
         assert_eq!(WalRecordKind::from_u8(128), None); // reserved for v2+
         assert_eq!(WalRecordKind::from_u8(255), None);
@@ -208,7 +220,7 @@ mod tests {
         // If a new variant is added without updating ALL_KINDS, this
         // catches it via the byte set.
         let seen: std::collections::HashSet<u8> = ALL_KINDS.iter().map(|k| k.as_u8()).collect();
-        assert_eq!(seen.len(), 29, "15 substrate + 14 typed-graph = 29 kinds");
+        assert_eq!(seen.len(), 30, "15 substrate + 15 opaque-body = 30 kinds");
         for v in 1..=15u8 {
             assert!(
                 seen.contains(&v),
@@ -217,10 +229,11 @@ mod tests {
         }
         for v in [
             0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x20, 0x21, 0x22, 0x30, 0x31, 0x32, 0x40, 0x50,
+            0x51,
         ] {
             assert!(
                 seen.contains(&v),
-                "typed-graph kind 0x{v:02X} missing from ALL_KINDS"
+                "opaque-body kind 0x{v:02X} missing from ALL_KINDS"
             );
         }
     }
@@ -240,6 +253,7 @@ mod tests {
             WalRecordKind::EntityCreate,
             WalRecordKind::StatementSupersede,
             WalRecordKind::Audit,
+            WalRecordKind::StageCompleted,
         ] {
             assert!(k.has_opaque_body(), "{k:?} should have opaque body");
         }

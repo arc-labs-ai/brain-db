@@ -49,7 +49,7 @@ pub use supersede::{
 };
 pub use tombstone::{statement_retract, statement_tombstone};
 
-use brain_core::{EntityId, StatementId, StatementKind};
+use brain_core::{EntityId, EntityTypeId, StatementId, StatementKind};
 
 // ---------------------------------------------------------------------------
 // Errors.
@@ -77,6 +77,20 @@ pub enum StatementOpError {
 
     #[error("subject {0:?} not registered")]
     UnknownSubject(EntityId),
+
+    #[error("object entity {0:?} not registered")]
+    UnknownObjectEntity(EntityId),
+
+    /// The predicate declares `object: Entity<Type>` and the object
+    /// entity has a different entity type.
+    #[error(
+        "object entity {entity:?} has entity type {actual:?} but predicate requires {expected:?}"
+    )]
+    ObjectEntityTypeMismatch {
+        entity: EntityId,
+        expected: EntityTypeId,
+        actual: EntityTypeId,
+    },
 
     #[error("invalid argument: {0}")]
     InvalidArgument(&'static str),

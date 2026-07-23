@@ -23,6 +23,7 @@ struct SubscribeFilter {
     kinds: Option<Vec<MemoryKind>>,      // Limit to specific kinds
     event_types: Option<Vec<EventType>>, // Encode, forget, link, etc.
     min_salience: Option<f32>,
+    memory_ids: Option<Vec<MemoryId>>,   // Limit to specific memories (e.g. watching one write's derivation)
 }
 
 enum EventType {
@@ -31,10 +32,21 @@ enum EventType {
     MemoryUpdated,         // Salience, kind change, etc.
     EdgeAdded,
     EdgeRemoved,
+    StageCompleted,        // one async ENCODE derivation stage finished (auto_edge / temporal_edge / extractor / hype)
 }
 ```
 
 All conditions are AND-combined. If a filter is None, that dimension is unrestricted.
+
+`memory_ids` is the narrowest filter dimension: scoping a subscription to one
+or a handful of memory ids turns SUBSCRIBE into a point-observer for those
+specific writes, rather than a stream over an agent's whole activity. This is
+the mechanism behind the write-pipeline-progress pattern documented in
+[02_write_pipeline.md](02_write_pipeline.md) §17e: `ENCODE` with `wait: ack`,
+then `SUBSCRIBE` with `memory_ids: [that memory_id]`, to watch that one
+write's `StageCompleted` events arrive live. On the wire this field is named
+`memory_ids` on `SubscriptionFilter` — see
+[04. Wire Protocol](../04_wire_protocol/05_frame_layouts.md) §7.
 
 ### start_lsn
 
@@ -182,6 +194,7 @@ This is the recommended pattern for replication-like use cases.
 - **Replication**: keep a hot standby in sync.
 - **Reactive workflows**: trigger external systems on specific events.
 - **Data warehouse export**: ETL events to analytics systems.
+- **Live write-pipeline progress**: pair `ENCODE(wait: ack)` with a `memory_ids`-scoped subscription to watch one write's async derivation stages (`auto_edge`/`temporal_edge`/`extractor`/`hype`) complete in real time, without paying the blocking cost of `wait: derived`. See [02_write_pipeline.md](02_write_pipeline.md) §17e.
 
 ## 15. The "no historical" mode
 
@@ -206,6 +219,10 @@ The requested start_lsn is in a deleted WAL segment.
 ### Unauthorized
 
 The client doesn't have permission for the requested agent's data.
+
+### ActAsDenied
+
+The request carried `act_as` but the connection principal lacks `can_act_as`, or `act_as.namespace` falls outside its `may_act` allowlist. See [04. Wire Protocol](../04_wire_protocol/04_handshake.md) §10a.3 (R1/R2) and [`07_error_handling.md`](../04_wire_protocol/07_error_handling.md) §3.3.
 
 ### TooManySubscribers
 
@@ -247,6 +264,68 @@ SUBSCRIBE is more efficient than polling:
 - Latency near zero.
 
 For applications that need updates "now and then" (every few seconds), polling RECALL with a recency filter is fine. For applications that need every event, SUBSCRIBE is the right tool.
+
+## 21. Implementation status: the real streaming path vs. a dead-code poller
+
+§6's WAL-tail description is the actual behavior on the wire path clients use
+today, not a future item. `brain-server`'s connection layer
+(`SubscriptionRegistry` / `run_subscription_task`) bridges each shard's real
+event bus into a persistent per-connection stream: WAL-tail history replay
+cuts over to live delivery with the boundary invisible to the client, exactly
+as §6 describes, and `UNSUBSCRIBE` / stream cancellation are handled
+properly. This is the code path every real client connection goes through.
+
+A second SUBSCRIBE implementation exists inside the `brain-ops` crate
+(`handlers/subscribe.rs`) — a bounded, single-shot poll (default 5s) that
+registers with the same underlying registry, waits for one matching event,
+and returns. It shares the filter-parsing logic (`ParsedFilter`) with the
+real path, which is how filter additions like `memory_ids` (above) reach both
+implementations from one code change. But it is **not** reachable from a real
+client connection — `brain-server` bypasses it and calls the registry
+directly. Do not take this handler's shape, or its module doc, as a
+description of what a connected client experiences; §1–§20 above (and this
+section) are authoritative.
+
+## 22. Per-request identity (`act_as`)
+
+`SubscribeRequest` carries the same optional `act_as` field every other
+data-plane op does — see [04. Wire Protocol](../04_wire_protocol/04_handshake.md)
+§10a for the full mechanism (the connection-principal-vs-effective-identity
+model, the `can_act_as` grant, and invariants R1–R6). When present, the
+subscription observes the effective `(namespace, agent_id)` named by `act_as`
+rather than the connection principal's own identity, subject to the same R1
+(`can_act_as` gate) and R2 (`may_act` allowlist) checks as every other op.
+This is what lets a shared service-principal connection pool — one
+credential, `act_as` varying per request — subscribe on behalf of whichever
+tenant it's currently serving, the same pattern it already uses for ENCODE /
+RECALL / PLAN / REASON.
+
+### 22.1 Why this needed a dedicated fix
+
+Unlike those four primitives, SUBSCRIBE's dispatch was, until this fix,
+structurally separate from the normal `act_as`-aware dispatch path:
+`SUBSCRIBE`, `UNSUBSCRIBE`, and `CANCEL_STREAM` bypassed the shared
+op-dispatch / `act_as_of` resolution entirely, and the wire
+`SubscribeRequest` carried no `act_as` field at all — a genuine wire-schema
+gap, not just a server-logic one. The permission check that gates a
+subscription's agent scope hardcoded the caller's own raw connection
+identity, with no `act_as` concept reachable from that branch. This is why
+SUBSCRIBE needed a dedicated fix rather than "just working" the way a normal
+op picks up `act_as` support — the security machinery itself (the R1/R2
+checks, the effective-identity resolution) was already fully reusable; only
+the branch that reaches it needed to change.
+
+With `act_as` absent (the common case, and the only case before this fix),
+SUBSCRIBE's behavior is unchanged: it observes the connection's own identity
+exactly as before.
+
+### 22.2 Related gap, not fixed here
+
+`TXN_BEGIN` / `TXN_COMMIT` / `TXN_ABORT` (§8 in
+[03_primitives.md](../01_architecture/03_primitives.md)) have the same
+missing-`act_as`-field gap, but they go through normal op dispatch, not a
+structural bypass like SUBSCRIBE's. Out of scope for this fix; noted here as
+a known follow-up.
 
 ---
 

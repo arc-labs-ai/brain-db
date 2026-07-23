@@ -30,7 +30,10 @@ use crate::vsa::{cosine_to_centroid, semantic_centroid};
 
 use super::context::ExecutorContext;
 use super::error::ExecError;
-use super::result::{Path, PathFrame, PathResult, PathStream, PathStreamTerminal, PlanStatus};
+use super::result::{
+    Path, PathFrame, PathResult, PathStream, PathStreamTerminal, PlanExecutionMetadata, PlanStatus,
+    PlanTraceDirection, PlanTraceMeetingPoint, PlanTraceNode,
+};
 
 const ENDPOINT_RECALL_K: usize = 5;
 const ENDPOINT_RECALL_EF: usize = 32;
@@ -42,12 +45,19 @@ const ENDPOINT_RECALL_EF: usize = 32;
 ///
 /// Truncation to `scoring.top_n` still applies — the stream caps at
 /// that count regardless of how many meeting points the BFS found.
+///
+/// `trace` mirrors RECALL's `trace_detail` / REASON's `trace`: `false`
+/// (the default) is the fast path, byte-for-byte unchanged from
+/// before full-detail tracing existed. `true` additionally populates
+/// `PathStreamTerminal.trace` with the full per-stage BFS detail (see
+/// [`PlanExecutionMetadata`]).
 pub async fn execute_path_stream(
     plan: PathPlan,
     ctx: &ExecutorContext,
+    trace: bool,
 ) -> Result<PathStream, ExecError> {
     let top_n = plan.scoring.top_n.max(1);
-    let result = execute_path(plan, ctx).await?;
+    let result = execute_path(plan, ctx, trace).await?;
     let paths_emitted = u32::try_from(result.paths.len().min(top_n)).unwrap_or(u32::MAX);
     let frames: Vec<PathFrame> = result
         .paths
@@ -64,11 +74,21 @@ pub async fn execute_path_stream(
         terminal: PathStreamTerminal {
             status: result.status,
             paths_emitted,
+            trace: result.trace,
         },
     })
 }
 
-pub async fn execute_path(plan: PathPlan, ctx: &ExecutorContext) -> Result<PathResult, ExecError> {
+/// `trace` gates the opt-in full-detail trace (see
+/// [`PlanExecutionMetadata`]): `false` is today's behavior with zero
+/// extra capture or allocation; `true` additionally populates
+/// `PathResult.trace` with the full BFS visited-map contents and
+/// meeting-point cap detail.
+pub async fn execute_path(
+    plan: PathPlan,
+    ctx: &ExecutorContext,
+    trace: bool,
+) -> Result<PathResult, ExecError> {
     // 1. Resolve endpoints. ByMemoryId is direct; ByText runs a
     //    small ANN search; ByVector isn't wired yet.
     let starts = resolve_endpoint(&plan.start, ctx)?;
@@ -78,6 +98,7 @@ pub async fn execute_path(plan: PathPlan, ctx: &ExecutorContext) -> Result<PathR
         return Ok(PathResult {
             paths: Vec::new(),
             status: PlanStatus::NoPathFound,
+            trace: None,
         });
     }
 
@@ -101,12 +122,14 @@ pub async fn execute_path(plan: PathPlan, ctx: &ExecutorContext) -> Result<PathR
         plan.traversal.max_paths,
         goal_centroid.as_ref(),
         ctx,
+        trace,
     )?;
 
     if bfs.paths.is_empty() {
         return Ok(PathResult {
             paths: Vec::new(),
             status: bfs.status,
+            trace: bfs.trace,
         });
     }
 
@@ -127,6 +150,7 @@ pub async fn execute_path(plan: PathPlan, ctx: &ExecutorContext) -> Result<PathR
     Ok(PathResult {
         paths,
         status: bfs.status,
+        trace: bfs.trace,
     })
 }
 
@@ -187,6 +211,10 @@ struct BfsRaw {
     /// start to a goal.
     paths: Vec<(Vec<MemoryId>, Vec<EdgeKind>, Vec<f32>)>,
     status: PlanStatus,
+    /// Full-detail BFS trace. `Some` only when `trace = true` **and**
+    /// the BFS actually ran (the trivial start == goal short-circuit
+    /// below has nothing to trace); `None` otherwise.
+    trace: Option<PlanExecutionMetadata>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -200,6 +228,7 @@ fn run_bidirectional_bfs(
     max_paths: usize,
     goal_centroid: Option<&[f32; VECTOR_DIM]>,
     ctx: &ExecutorContext,
+    trace: bool,
 ) -> Result<BfsRaw, ExecError> {
     // Quick win: any start == any goal.
     let trivial: Vec<MemoryId> = starts.intersection(goals).copied().collect();
@@ -210,6 +239,7 @@ fn run_bidirectional_bfs(
                 .map(|id| (vec![id], Vec::new(), Vec::new()))
                 .collect(),
             status: PlanStatus::GoalReached,
+            trace: None,
         });
     }
 
@@ -252,6 +282,18 @@ fn run_bidirectional_bfs(
 
     let mut meeting_points: Vec<MemoryId> = Vec::new();
     let mut status = PlanStatus::NoPathFound;
+
+    // Full-detail trace accumulators. Unused (never inserted into) on
+    // the `trace = false` fast path, so the empty `HashMap`/`Vec`
+    // allocate nothing.
+    //
+    // `alignment_scores` is filled by `order_by_goal_proximity` for
+    // whichever forward-frontier neighbours it actually scores.
+    // `trace_meeting_points` records every meeting point found,
+    // including ones beyond `max_paths` that `meeting_points` (the
+    // capped list driving the real `paths` result) never receives.
+    let mut alignment_scores: HashMap<MemoryId, f32> = HashMap::new();
+    let mut trace_meeting_points: Vec<(MemoryId, bool)> = Vec::new();
 
     // Open one read txn for the whole BFS — repeated `read_txn()` calls
     // are cheap but not free, and the BFS may do hundreds of lookups.
@@ -344,7 +386,17 @@ fn run_bidirectional_bfs(
             // The backward frontier is already at the goal; sorting it
             // by goal proximity is a no-op.
             if is_forward {
-                neighbours = order_by_goal_proximity(neighbours, goal_centroid, &rtxn, ctx);
+                neighbours = order_by_goal_proximity(
+                    neighbours,
+                    goal_centroid,
+                    &rtxn,
+                    ctx,
+                    if trace {
+                        Some(&mut alignment_scores)
+                    } else {
+                        None
+                    },
+                );
             }
 
             for (kind, next, weight) in neighbours {
@@ -364,8 +416,22 @@ fn run_bidirectional_bfs(
                 nodes_explored += 1;
 
                 if other_visited.contains_key(&next) {
-                    meeting_points.push(next);
-                    if meeting_points.len() >= max_paths {
+                    // Every meeting point beyond `max_paths` is
+                    // silently dropped from `meeting_points` (and thus
+                    // from `paths`) exactly as before — `included`
+                    // captures that same cap decision. In full-detail
+                    // mode we additionally keep looking past the cap
+                    // (skip the early `break` below) so
+                    // `trace_meeting_points` sees every meeting point
+                    // this level actually finds.
+                    let included = meeting_points.len() < max_paths;
+                    if included {
+                        meeting_points.push(next);
+                    }
+                    if trace {
+                        trace_meeting_points.push((next, included));
+                    }
+                    if !trace && meeting_points.len() >= max_paths {
                         break;
                     }
                 }
@@ -375,7 +441,7 @@ fn run_bidirectional_bfs(
                     break;
                 }
             }
-            if meeting_points.len() >= max_paths || status != PlanStatus::NoPathFound {
+            if (!trace && meeting_points.len() >= max_paths) || status != PlanStatus::NoPathFound {
                 break;
             }
         }
@@ -386,13 +452,63 @@ fn run_bidirectional_bfs(
         }
     }
 
+    // Full-detail trace: snapshot every node in both visited maps, plus
+    // the meeting points found (capped and dropped alike). Built after
+    // the BFS loop so it reflects everything actually explored,
+    // including the extra level-tail exploration `trace = true` didn't
+    // cut short above.
+    let trace_metadata = if trace {
+        let mut explored = Vec::with_capacity(fwd.len() + bwd.len());
+        for (&id, crumb) in &fwd {
+            explored.push(PlanTraceNode {
+                memory_id: id,
+                direction: PlanTraceDirection::Forward,
+                depth: crumb.depth,
+                parent_edge: crumb.edge,
+                parent_id: crumb.parent,
+                alignment_score: alignment_scores.get(&id).copied(),
+            });
+        }
+        for (&id, crumb) in &bwd {
+            explored.push(PlanTraceNode {
+                memory_id: id,
+                direction: PlanTraceDirection::Backward,
+                depth: crumb.depth,
+                parent_edge: crumb.edge,
+                parent_id: crumb.parent,
+                // The goal-direction heuristic only ever sorts the
+                // forward frontier (see `order_by_goal_proximity`'s
+                // is_forward gate above) — backward nodes are never
+                // scored against the goal centroid.
+                alignment_score: None,
+            });
+        }
+        let meeting_points = trace_meeting_points
+            .into_iter()
+            .map(|(memory_id, included_in_result)| PlanTraceMeetingPoint {
+                memory_id,
+                included_in_result,
+            })
+            .collect();
+        Some(PlanExecutionMetadata {
+            explored,
+            meeting_points,
+        })
+    } else {
+        None
+    };
+
     // Reconstruct paths from each meeting point.
     let paths = meeting_points
         .into_iter()
         .filter_map(|m| reconstruct(m, &fwd, &bwd))
         .collect();
 
-    Ok(BfsRaw { paths, status })
+    Ok(BfsRaw {
+        paths,
+        status,
+        trace: trace_metadata,
+    })
 }
 
 /// Walk parent pointers from a meeting node out to the seeds on
@@ -694,11 +810,19 @@ fn collect_endpoint_text_vectors(
 /// the executor holds the metadata mutex for the lifetime of the BFS
 /// (single read txn shared across all neighbour lookups), and
 /// `parking_lot::Mutex` is non-reentrant.
+///
+/// `trace_scores` is the opt-in full-detail sink: when `Some`, every
+/// neighbour's raw alignment score is recorded into it (keyed by
+/// memory id) before the score is consumed for sort order — the
+/// direct analogue of REASON's `topic_alignment_factor` un-collapse.
+/// `None` on the default fast path costs nothing extra; the scores
+/// are already computed unconditionally below for the sort itself.
 fn order_by_goal_proximity(
     mut neighbours: Vec<(EdgeKind, MemoryId, f32)>,
     goal_centroid: Option<&[f32; VECTOR_DIM]>,
     rtxn: &redb::ReadTransaction,
     ctx: &ExecutorContext,
+    trace_scores: Option<&mut HashMap<MemoryId, f32>>,
 ) -> Vec<(EdgeKind, MemoryId, f32)> {
     let Some(centroid) = goal_centroid else {
         return neighbours;
@@ -714,6 +838,12 @@ fn order_by_goal_proximity(
             return neighbours;
         }
     };
+
+    if let Some(acc) = trace_scores {
+        for ((_, id, _), &score) in neighbours.iter().zip(scores.iter()) {
+            acc.insert(*id, score);
+        }
+    }
 
     // Stable sort by alignment descending. Equal scores preserve the
     // original insertion order so the centroid only re-ranks where it

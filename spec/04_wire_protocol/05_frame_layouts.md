@@ -15,7 +15,7 @@ struct ActAs {
 }
 ```
 
-`act_as: Option<ActAs>` appears on every data-plane op request: `ENCODE_REQ`, `RECALL_REQ`, `FORGET_REQ`, `LINK_REQ`, `UNLINK_REQ`, `PLAN_REQ`, `REASON_REQ`, `ENTITY_CREATE_REQ`, `STATEMENT_CREATE_REQ`, and `RELATION_CREATE_REQ`. It is honored only if the connection principal holds `can_act_as` and `act_as.namespace` is within its `may_act` allowlist — otherwise the op is rejected with `ActAsDenied` (see [`07_error_handling.md`](07_error_handling.md) §3.3). It is absent from every connection-management, introspection, schema, and admin frame, and it never appears in `AUTH`.
+`act_as: Option<ActAs>` appears on every data-plane op request: `ENCODE_REQ`, `RECALL_REQ`, `FORGET_REQ`, `LINK_REQ`, `UNLINK_REQ`, `PLAN_REQ`, `REASON_REQ`, `ENTITY_CREATE_REQ`, `STATEMENT_CREATE_REQ`, `RELATION_CREATE_REQ`, and `SUBSCRIBE_REQ`. It is honored only if the connection principal holds `can_act_as` and `act_as.namespace` is within its `may_act` allowlist — otherwise the op is rejected with `ActAsDenied` (see [`07_error_handling.md`](07_error_handling.md) §3.3). It is absent from every connection-management, introspection, schema, and admin frame, and it never appears in `AUTH`. (`SUBSCRIBE_REQ`'s `act_as` support has a structural history worth knowing — see the note under §7 below.)
 
 ### 1. ENCODE_REQ (0x20)
 
@@ -215,12 +215,15 @@ struct SubscribeRequest {
     include_history: bool,                   // start with snapshot of matching memories
     from_lsn: Option<u64>,                   // resume from a specific LSN
     max_inflight: u32,                       // server stops sending after this many unacked events
+    act_as: Option<ActAs>,                   // effective identity; None = the connection's own identity
 }
 
 struct SubscriptionFilter {
     contexts: Option<Vec<ContextId>>,        // None = all contexts
     kinds: Option<Vec<MemoryKind>>,          // None = all kinds
+    agents: Option<Vec<WireUuid>>,           // scopes the stream to specific agents; see note below
     similar_to: Option<SimilarityFilter>,    // optional similarity match
+    memory_ids: Option<Vec<WireMemoryId>>,   // None = no memory-id restriction; scopes the stream to specific memories
 }
 
 struct SimilarityFilter {
@@ -234,6 +237,9 @@ Notes:
 - The subscription's `stream_id` is the one the client allocates for the SUBSCRIBE_REQ frame; all SUBSCRIBE_EVENT frames use the same stream_id.
 - `from_lsn` resumes a previously-disconnected subscription (per-shard LSN).
 - `max_inflight` is per-subscription rate control. The server stops sending events after this many unacked.
+- `agents` is also an authorization boundary, not just a filter dimension: the server requires it to resolve to exactly the caller's own effective agent (the connection principal's agent, or — with `act_as` present — the effective identity's agent named by `act_as`). Subscribing across agents is not supported.
+- `memory_ids` scopes the stream to specific memories — e.g. watching one write's async derivation as it happens. This is the mechanism behind the live write-progress pattern: `ENCODE` with `wait: ack`, then `SUBSCRIBE` with `filter.memory_ids: [that memory_id]`, to receive that write's `StageCompleted` events (§32.2) as `auto_edge`/`temporal_edge`/`extractor`/`hype` each complete. See [05. Operations](../05_operations/02_write_pipeline.md) §17e.
+- `act_as` follows the standard mechanism (§10a of [`04_handshake.md`](04_handshake.md)), with one structural note: `SUBSCRIBE`/`UNSUBSCRIBE`/`CANCEL_STREAM` historically dispatched through a code path separate from the normal `act_as`-aware dispatch, so support here required resolving the effective identity explicitly in that branch rather than falling out of the shared mechanism for free. Behavior when `act_as` is absent is unchanged from before this support existed.
 
 ### 8. UNSUBSCRIBE_REQ (0x31)
 
@@ -597,6 +603,8 @@ struct SubscriptionEvent {
     timestamp_unix_nanos: u64,
     lsn: u64,                                // log sequence number; for resumption
     knowledge_payload: Option<KnowledgeEventPayload>,  // typed-graph body; None for substrate events
+    stage_kind: Option<StageKind>,           // which write-pipeline stage completed; populated only for StageCompleted
+    stage_payload: Option<StagePayload>,     // per-stage detail; populated only for StageCompleted
 }
 
 enum EventType {
@@ -605,6 +613,10 @@ enum EventType {
     Forgotten,                               // memory forgotten
     Reclaimed,                               // slot reclaimed (rare; only seen with low filter sensitivity)
     KindChanged,                             // memory's kind changed
+
+    // Write-pipeline observability: one async ENCODE derivation stage
+    // finished. See §32.2 below.
+    StageCompleted,
 
     // typed-graph events; knowledge_payload is populated.
     EntityCreated,
@@ -633,6 +645,56 @@ For substrate events (`Encoded`, `Forgotten`, `Reclaimed`, `KindChanged`), `know
 For typed-graph events, the standard fields are zero-filled where they don't apply (e.g. `memory_id = MemoryId::zero()` for `EntityCreated`), and the typed `KnowledgeEventPayload` carries the event-specific data. The payload's shape per event type is defined in [`09_typed_graph_admin.md`](09_typed_graph_admin.md) §3.
 
 The optional payload field carries the knowledge body inline; substrate event types and the knowledge event types share one envelope on the wire.
+
+#### 32.2 `StageCompleted` events (write-pipeline observability)
+
+For `EventType::StageCompleted`, `stage_kind` and `stage_payload` are
+populated and the standard fields (`text`, `salience`, `kind`, ...) are
+zero-filled the same way typed-graph events zero-fill them; `memory_id` and
+`lsn` are always meaningful (they identify which write the stage belongs to
+and its WAL position).
+
+```rust
+enum StageKind {
+    AutoEdge,      // `SimilarTo` edges derived from HNSW k-NN of the new memory
+    TemporalEdge,  // `FollowedBy` edges derived from session adjacency
+    Extractor,     // entities/statements/relations extracted via the three-tier pipeline
+    Hype,          // write-time hypothetical questions generated, embedded, and indexed
+}
+
+enum StagePayload {
+    AutoEdge(StageAutoEdgePayload),
+    TemporalEdge(StageTemporalEdgePayload),
+    Extractor(StageExtractorPayload),
+    Hype(StageHypePayload),
+}
+
+struct StageAutoEdgePayload { edges_written: u32 }
+struct StageTemporalEdgePayload { edges_written: u32 }
+struct StageHypePayload {
+    questions_written: u32,
+    cost_micro_usd: u64,                    // LLM cost; 0 on a cache hit
+}
+struct StageExtractorPayload {
+    entity_count: u32,
+    statement_count: u32,
+    relation_count: u32,
+    audit_status: StageAuditStatus,          // Succeeded | PartiallyApplied | Failed | Skipped
+    error_message: String,                   // populated only when audit_status = Failed
+}
+```
+
+A write triggers exactly one `StageCompleted` event per `StageKind` — four per
+`ENCODE` (`AutoEdge`, `TemporalEdge`, `Extractor`, `Hype`) — published by the
+background worker that owns that stage as soon as it commits, in whatever
+order the workers actually finish (they are independent; a subscriber MUST
+NOT assume a fixed sequence). This is the live counterpart to the
+`EncodeTrace` returned by `ENCODE(wait: derived)` (see
+[05. Operations](../05_operations/02_write_pipeline.md) §17): `wait: derived`
+blocks for the same events and returns one populated snapshot afterward,
+while a `memory_ids`-scoped SUBSCRIBE (§7) surfaces each one live as it
+happens, without blocking the write. See §17e there for the recommended
+pattern combining `wait: ack` with a scoped SUBSCRIBE.
 
 ### 33. UNSUBSCRIBE_RESP (0xB1)
 

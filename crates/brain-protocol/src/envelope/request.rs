@@ -404,11 +404,10 @@ impl RequestBody {
 }
 
 /// Borrow the effective-identity selector (`act_as`) carried by a
-/// request body, if the op is one of the three data-plane verbs that
-/// support acting on behalf of another `(namespace, agent_id)`:
-/// `Encode`, `Recall`, and `Forget`. Every other variant returns
-/// `None` — those ops always run as the connection's own key-bound
-/// identity and carry no `act_as` field on the wire.
+/// request body, if the op is one of the verbs that support acting on
+/// behalf of another `(namespace, agent_id)`. Every other variant
+/// returns `None` — those ops always run as the connection's own
+/// key-bound identity and carry no `act_as` field on the wire.
 ///
 /// This is the single point the server consults to decide whether a
 /// request wants to override its effective identity; keeping it here
@@ -469,6 +468,7 @@ pub fn act_as_of(body: &RequestBody) -> Option<&ActAs> {
         RequestBody::RelationListFrom(r) => r.act_as.as_ref(),
         RequestBody::RelationListTo(r) => r.act_as.as_ref(),
         RequestBody::RelationTraverse(r) => r.act_as.as_ref(),
+        RequestBody::Subscribe(r) => r.act_as.as_ref(),
         _ => None,
     }
 }
@@ -601,6 +601,7 @@ mod tests {
                 context_filter: None,
                 request_id: None,
                 txn_id: None,
+                trace: false,
                 act_as: None,
             }));
         }
@@ -621,6 +622,7 @@ mod tests {
                 budget_wall_time_ms: 5_000,
                 request_id: None,
                 txn_id: None,
+                trace: false,
                 act_as: None,
             }));
         }
@@ -664,10 +666,32 @@ mod tests {
                     threshold: 0.85,
                 }),
                 agents: None,
+                memory_ids: None,
             },
             include_history: true,
             from_lsn: Some(42),
             max_inflight: 16,
+            act_as: None,
+        }));
+    }
+
+    #[test]
+    fn subscribe_round_trips_with_act_as() {
+        round_trip(RequestBody::Subscribe(SubscribeRequest {
+            filter: SubscriptionFilter {
+                contexts: None,
+                kinds: None,
+                similar_to: None,
+                agents: None,
+                memory_ids: None,
+            },
+            include_history: false,
+            from_lsn: None,
+            max_inflight: 16,
+            act_as: Some(ActAs {
+                namespace: "acme".into(),
+                agent_id: sample_uuid(11),
+            }),
         }));
     }
 
@@ -906,6 +930,7 @@ mod tests {
             context_filter: None,
             request_id: None,
             txn_id: None,
+            trace: false,
             act_as: Some(selector.clone()),
         });
         assert_eq!(act_as_of(&plan), Some(&selector));
@@ -919,6 +944,7 @@ mod tests {
             budget_wall_time_ms: 1,
             request_id: None,
             txn_id: None,
+            trace: false,
             act_as: Some(selector.clone()),
         });
         assert_eq!(act_as_of(&reason), Some(&selector));

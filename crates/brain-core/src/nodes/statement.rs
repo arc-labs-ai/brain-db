@@ -540,10 +540,15 @@ pub struct Predicate {
     pub name: String,
     /// `None` means any kind is allowed for this predicate.
     pub kind_constraint: Option<StatementKind>,
-    /// Per-predicate object-type constraint. Currently a coarse byte;
-    /// the schema DSL will later replace this with a richer typed
-    /// constraint.
+    /// Per-predicate object-type constraint: which `StatementObject`
+    /// variant the object must be. `0` = any.
     pub object_type_constraint_byte: u8,
+    /// Narrows [`Self::object_type_constraint_byte`] when it selects
+    /// `Entity`: the `EntityTypeId` the object entity must have, from a
+    /// declared `object: Entity<SomeType>` range. `0` = any entity type
+    /// (a bare `Entity` declaration, or an object variant other than
+    /// `Entity`).
+    pub object_entity_type_id: u32,
     pub schema_version: u32,
     pub description: String,
     /// When true, a new statement with the same `(subject, predicate)`
@@ -727,6 +732,7 @@ mod tests {
             name: "is_a".into(),
             kind_constraint: Some(StatementKind::Fact),
             object_type_constraint_byte: 0,
+            object_entity_type_id: 0,
             schema_version: 1,
             description: "entity type assertion".into(),
             is_stateful: false,

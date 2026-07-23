@@ -257,6 +257,7 @@ fn own_filter(agent: [u8; 16]) -> SubscriptionFilter {
         kinds: None,
         similar_to: None,
         agents: Some(vec![agent]),
+        memory_ids: None,
     }
 }
 
@@ -266,6 +267,7 @@ fn subscribe_request(filter: SubscriptionFilter) -> SubscribeRequest {
         include_history: false,
         from_lsn: None,
         max_inflight: 100,
+        act_as: None,
     }
 }
 
@@ -502,6 +504,7 @@ async fn subscribe_from_lsn_past_tail_is_accepted() {
         include_history: true,
         from_lsn: Some(123),
         max_inflight: 100,
+        act_as: None,
     };
     let sub_stream = 13u32;
     send_frame(
@@ -635,6 +638,7 @@ async fn subscribe_from_lsn_replays_historical_encodes() {
                 include_history: false,
                 from_lsn: Some(1),
                 max_inflight: 100,
+                act_as: None,
             })
             .encode(),
         ),
@@ -701,6 +705,7 @@ async fn subscribe_agents_filter_isolates_per_agent() {
         kinds: None,
         similar_to: None,
         agents: Some(vec![agent_a]),
+        memory_ids: None,
     };
     send_frame(
         &mut sub_a,
@@ -803,6 +808,7 @@ async fn subscribe_from_lsn_zero_replays_everything_in_wal() {
                 include_history: false,
                 from_lsn: Some(0),
                 max_inflight: 100,
+                act_as: None,
             })
             .encode(),
         ),

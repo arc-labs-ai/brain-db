@@ -440,6 +440,17 @@ impl RealWriterHandle {
                         memory_id: *id,
                         stage_kind: brain_protocol::StageKind::Extractor,
                     });
+                    // HyPE runs over every item the extractor batch
+                    // processes (idempotent on the memory's own question
+                    // vectors, independent of the extraction-audit gate —
+                    // see `run_hype_pass` in brain-workers), so it's
+                    // enqueued 1:1 with `Extractor`: whenever this memory
+                    // reaches the extractor pipeline, HyPE will eventually
+                    // publish its own `StageCompleted{Hype}` for it too.
+                    pending_stages.push(crate::write::PendingStage {
+                        memory_id: *id,
+                        stage_kind: brain_protocol::StageKind::Hype,
+                    });
                 }
                 // Index the memory text into tantivy so the lexical
                 // retriever can find it. Backpressures (awaits) rather

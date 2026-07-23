@@ -11,14 +11,16 @@
         "status": 0,
         "status_detail": "",
         "latency_ms": 1.5,
-        "candidate_count": 12
+        "candidate_count": 12,
+        "candidates": []
       },
       {
         "name": 2,
         "status": 1,
         "status_detail": "no anchor",
         "latency_ms": 0.0,
-        "candidate_count": 0
+        "candidate_count": 0,
+        "candidates": []
       }
     ],
     "filter_chain": {
@@ -29,13 +31,38 @@
       "after_tombstone": 8,
       "after_supersession": 7,
       "after_as_of": 7,
-      "after_limit": 5
+      "after_limit": 5,
+      "dropped_by_type": [],
+      "dropped_by_temporal": [],
+      "dropped_by_confidence": [],
+      "dropped_by_tombstone": [],
+      "dropped_by_supersession": [
+        {
+          "kind": 1,
+          "id": 33059591799037110662230
+        }
+      ],
+      "dropped_by_as_of": [
+        {
+          "kind": 3,
+          "id": 33059591799037110662230
+        }
+      ],
+      "dropped_by_limit": [
+        {
+          "kind": 0,
+          "id": 33059591799037110662230
+        }
+      ]
     },
     "rerank": {
       "applied": true,
       "candidates": 5,
-      "latency_ms": 2.25
+      "latency_ms": 2.25,
+      "before_order": [],
+      "after_order": []
     },
-    "total_latency_ms": 4.75
+    "total_latency_ms": 4.75,
+    "fusion": null
   }
 }

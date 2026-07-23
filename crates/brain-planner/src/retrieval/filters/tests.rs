@@ -224,7 +224,7 @@ fn empty_chain_passes_all() {
         fused(RankedItemId::Memory(id2), 2),
     ];
     let (out, stats) =
-        apply_filter_chain(items, &FilterChain::default(), &metadata, 0).expect("ok");
+        apply_filter_chain(items, &FilterChain::default(), &metadata, 0, false).expect("ok");
     assert_eq!(out.len(), 2);
     assert_eq!(stats.before, 2);
     assert_eq!(stats.after_limit, 2);
@@ -246,7 +246,7 @@ fn memory_kind_filter_narrows() {
         memory_kind_filter: vec![MemoryKind::Episodic],
         ..Default::default()
     };
-    let (out, _) = apply_filter_chain(items, &chain, &metadata, 0).expect("ok");
+    let (out, _) = apply_filter_chain(items, &chain, &metadata, 0, false).expect("ok");
     assert_eq!(out.len(), 1);
     assert!(matches!(out[0].id, RankedItemId::Memory(m) if m == id1));
 }
@@ -283,7 +283,7 @@ fn statement_kind_and_predicate_filter() {
         kind_filter: vec![StatementKind::Preference],
         ..Default::default()
     };
-    let (out, _) = apply_filter_chain(items.clone(), &by_kind, &metadata, 0).expect("ok");
+    let (out, _) = apply_filter_chain(items.clone(), &by_kind, &metadata, 0, false).expect("ok");
     assert_eq!(out.len(), 1);
     assert!(matches!(out[0].id, RankedItemId::Statement(id) if id == s_pref));
 
@@ -291,7 +291,7 @@ fn statement_kind_and_predicate_filter() {
         predicate_filter: vec![p_lives],
         ..Default::default()
     };
-    let (out, _) = apply_filter_chain(items, &by_pred, &metadata, 0).expect("ok");
+    let (out, _) = apply_filter_chain(items, &by_pred, &metadata, 0, false).expect("ok");
     assert_eq!(out.len(), 1);
     assert!(matches!(out[0].id, RankedItemId::Statement(id) if id == s_fact));
 }
@@ -318,7 +318,7 @@ fn time_filter_for_memory_uses_created_at() {
         }),
         ..Default::default()
     };
-    let (out, _) = apply_filter_chain(items, &chain, &metadata, 0).expect("ok");
+    let (out, _) = apply_filter_chain(items, &chain, &metadata, 0, false).expect("ok");
     assert_eq!(out.len(), 1);
     assert!(matches!(out[0].id, RankedItemId::Memory(m) if m == id2));
 }
@@ -343,7 +343,7 @@ fn time_filter_for_event_statement_uses_event_at() {
         }),
         ..Default::default()
     };
-    let (out, _) = apply_filter_chain(items, &chain, &metadata, 0).expect("ok");
+    let (out, _) = apply_filter_chain(items, &chain, &metadata, 0, false).expect("ok");
     assert_eq!(out.len(), 1);
     assert!(matches!(out[0].id, RankedItemId::Statement(id) if id == s_in));
 }
@@ -367,7 +367,7 @@ fn confidence_filter_for_statement() {
         confidence_min: Some(0.5),
         ..Default::default()
     };
-    let (out, _) = apply_filter_chain(items, &chain, &metadata, 0).expect("ok");
+    let (out, _) = apply_filter_chain(items, &chain, &metadata, 0, false).expect("ok");
     assert_eq!(out.len(), 2);
 }
 
@@ -387,7 +387,7 @@ fn confidence_filter_for_memory_uses_salience() {
         confidence_min: Some(0.5),
         ..Default::default()
     };
-    let (out, _) = apply_filter_chain(items, &chain, &metadata, 0).expect("ok");
+    let (out, _) = apply_filter_chain(items, &chain, &metadata, 0, false).expect("ok");
     assert_eq!(out.len(), 1);
     assert!(matches!(out[0].id, RankedItemId::Memory(m) if m == id_hi));
 }
@@ -404,8 +404,8 @@ fn tombstone_filter_drops_inactive_memory() {
         fused(RankedItemId::Memory(id_a), 1),
         fused(RankedItemId::Memory(id_t), 2),
     ];
-    let (out, _) =
-        apply_filter_chain(items.clone(), &FilterChain::default(), &metadata, 0).expect("ok");
+    let (out, _) = apply_filter_chain(items.clone(), &FilterChain::default(), &metadata, 0, false)
+        .expect("ok");
     assert_eq!(out.len(), 1);
     assert!(matches!(out[0].id, RankedItemId::Memory(m) if m == id_a));
 
@@ -413,7 +413,7 @@ fn tombstone_filter_drops_inactive_memory() {
         include_tombstoned: true,
         ..Default::default()
     };
-    let (out, _) = apply_filter_chain(items, &with_tomb, &metadata, 0).expect("ok");
+    let (out, _) = apply_filter_chain(items, &with_tomb, &metadata, 0, false).expect("ok");
     assert_eq!(out.len(), 2);
 }
 
@@ -431,7 +431,8 @@ fn tombstone_filter_drops_tombstoned_statement() {
         fused(RankedItemId::Statement(s_live), 1),
         fused(RankedItemId::Statement(s_dead), 2),
     ];
-    let (out, _) = apply_filter_chain(items, &FilterChain::default(), &metadata, 0).expect("ok");
+    let (out, _) =
+        apply_filter_chain(items, &FilterChain::default(), &metadata, 0, false).expect("ok");
     assert_eq!(out.len(), 1);
     assert!(matches!(out[0].id, RankedItemId::Statement(id) if id == s_live));
 }
@@ -452,7 +453,7 @@ fn entity_passes_unfiltered() {
         }),
         ..Default::default()
     };
-    let (out, _) = apply_filter_chain(items, &chain, &metadata, 0).expect("ok");
+    let (out, _) = apply_filter_chain(items, &chain, &metadata, 0, false).expect("ok");
     assert_eq!(out.len(), 1);
     assert!(matches!(out[0].id, RankedItemId::Entity(e) if e == alice));
 }
@@ -466,7 +467,8 @@ fn relation_passes_tombstone_and_supersession_when_clean() {
     let r = create_relation(&mut metadata, type_id, a, b, "knows", 0.9);
 
     let items = vec![fused(RankedItemId::Relation(r), 1)];
-    let (out, _) = apply_filter_chain(items, &FilterChain::default(), &metadata, 0).expect("ok");
+    let (out, _) =
+        apply_filter_chain(items, &FilterChain::default(), &metadata, 0, false).expect("ok");
     assert_eq!(out.len(), 1);
 }
 
@@ -497,11 +499,122 @@ fn filter_chain_stats_reflect_drops_per_step() {
         confidence_min: Some(0.5),
         ..Default::default()
     };
-    let (out, stats) = apply_filter_chain(items, &chain, &metadata, 0).expect("ok");
+    let (out, stats) = apply_filter_chain(items, &chain, &metadata, 0, false).expect("ok");
     assert_eq!(stats.before, 3);
     assert_eq!(stats.after_type, 2, "wrong-kind dropped");
     assert_eq!(stats.after_confidence, 1, "low-confidence dropped");
     assert_eq!(out.len(), 1);
+}
+
+#[test]
+fn trace_detail_false_leaves_dropped_ids_empty() {
+    // Default fast path: same drop-per-step scenario as
+    // `filter_chain_stats_reflect_drops_per_step`, but with
+    // `trace_detail = false` the survivor counts should still be
+    // correct while none of the `dropped_by_*` id lists collect
+    // anything.
+    let (_dir, mut metadata) = fresh();
+    let type_id = ensure_person_type(&mut metadata);
+    let alice = put_entity(&mut metadata, "Alice", type_id);
+    let p = intern_predicate(&mut metadata, "test", "lives_in");
+    let s_pass = create_statement(&mut metadata, alice, p, StatementKind::Fact, 0.9, "Paris");
+    let s_low_conf = create_statement(&mut metadata, alice, p, StatementKind::Fact, 0.2, "London");
+    let s_wrong_kind = create_statement(
+        &mut metadata,
+        alice,
+        p,
+        StatementKind::Preference,
+        0.9,
+        "tea",
+    );
+
+    let items = vec![
+        fused(RankedItemId::Statement(s_pass), 1),
+        fused(RankedItemId::Statement(s_low_conf), 2),
+        fused(RankedItemId::Statement(s_wrong_kind), 3),
+    ];
+    let chain = FilterChain {
+        kind_filter: vec![StatementKind::Fact],
+        confidence_min: Some(0.5),
+        ..Default::default()
+    };
+    let (out, stats) = apply_filter_chain(items, &chain, &metadata, 0, false).expect("ok");
+    assert_eq!(out.len(), 1);
+    assert_eq!(stats.after_type, 2);
+    assert_eq!(stats.after_confidence, 1);
+    assert!(stats.dropped_by_type.is_empty());
+    assert!(stats.dropped_by_confidence.is_empty());
+}
+
+#[test]
+fn trace_detail_true_reports_dropped_ids_per_step() {
+    // Same scenario as `filter_chain_stats_reflect_drops_per_step`, but
+    // asserting the actual dropped ids (not just survivor counts) when
+    // `trace_detail = true` — the regression guard that the per-item
+    // capture isn't a silent no-op.
+    let (_dir, mut metadata) = fresh();
+    let type_id = ensure_person_type(&mut metadata);
+    let alice = put_entity(&mut metadata, "Alice", type_id);
+    let p = intern_predicate(&mut metadata, "test", "lives_in");
+    let s_pass = create_statement(&mut metadata, alice, p, StatementKind::Fact, 0.9, "Paris");
+    let s_low_conf = create_statement(&mut metadata, alice, p, StatementKind::Fact, 0.2, "London");
+    let s_wrong_kind = create_statement(
+        &mut metadata,
+        alice,
+        p,
+        StatementKind::Preference,
+        0.9,
+        "tea",
+    );
+
+    let items = vec![
+        fused(RankedItemId::Statement(s_pass), 1),
+        fused(RankedItemId::Statement(s_low_conf), 2),
+        fused(RankedItemId::Statement(s_wrong_kind), 3),
+    ];
+    let chain = FilterChain {
+        kind_filter: vec![StatementKind::Fact],
+        confidence_min: Some(0.5),
+        ..Default::default()
+    };
+    let (out, stats) = apply_filter_chain(items, &chain, &metadata, 0, true).expect("ok");
+    assert_eq!(out.len(), 1);
+    // The type filter dropped exactly the wrong-kind statement.
+    assert_eq!(
+        stats.dropped_by_type,
+        vec![RankedItemId::Statement(s_wrong_kind)]
+    );
+    // The confidence filter (running after type has already narrowed
+    // the set) dropped exactly the low-confidence survivor.
+    assert_eq!(
+        stats.dropped_by_confidence,
+        vec![RankedItemId::Statement(s_low_conf)]
+    );
+    assert!(stats.dropped_by_tombstone.is_empty());
+    assert!(stats.dropped_by_supersession.is_empty());
+}
+
+#[test]
+fn trace_detail_true_reports_dropped_ids_by_limit() {
+    // The final limit truncation should surface the truncated ids too,
+    // not just the survivor count.
+    let (_dir, mut metadata) = fresh();
+    let mut items = Vec::new();
+    for slot in 1u64..=5 {
+        let id = MemoryId::pack(0, slot, 0);
+        put_memory_row(&mut metadata, id, MemoryKind::Episodic, 0.9, 100, true);
+        items.push(fused(RankedItemId::Memory(id), slot as u32));
+    }
+    let (out, stats) =
+        apply_filter_chain(items, &FilterChain::default(), &metadata, 3, true).expect("ok");
+    assert_eq!(out.len(), 3);
+    assert_eq!(stats.dropped_by_limit.len(), 2);
+    assert!(stats
+        .dropped_by_limit
+        .contains(&RankedItemId::Memory(MemoryId::pack(0, 4, 0))));
+    assert!(stats
+        .dropped_by_limit
+        .contains(&RankedItemId::Memory(MemoryId::pack(0, 5, 0))));
 }
 
 #[test]
@@ -514,7 +627,7 @@ fn limit_applied_after_filters() {
         items.push(fused(RankedItemId::Memory(id), slot as u32));
     }
     let (out, stats) =
-        apply_filter_chain(items, &FilterChain::default(), &metadata, 3).expect("ok");
+        apply_filter_chain(items, &FilterChain::default(), &metadata, 3, false).expect("ok");
     assert_eq!(out.len(), 3);
     assert_eq!(stats.after_supersession, 5, "all five passed filters");
     assert_eq!(stats.after_limit, 3, "limit truncated post-filter");
@@ -631,7 +744,7 @@ fn as_of_filter_in_chain_drops_invalidated_statement() {
         as_of_record_time_unix_nanos: Some(1_500),
         ..Default::default()
     };
-    let (out, stats) = apply_filter_chain(items, &chain, &metadata, 0).expect("ok");
+    let (out, stats) = apply_filter_chain(items, &chain, &metadata, 0, false).expect("ok");
     assert_eq!(stats.after_supersession, 2);
     assert_eq!(stats.after_as_of, 1);
     let only: Vec<_> = out.iter().map(|f| f.id).collect();

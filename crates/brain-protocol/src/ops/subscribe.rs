@@ -1,6 +1,7 @@
 //! SUBSCRIBE / UNSUBSCRIBE plus filter sub-structs.
 
 use crate::envelope::request::{WireContextId, WireMemoryId, WireUuid};
+use crate::ops::memory::ActAs;
 use crate::shared::primitives::MemoryKindWire;
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -9,6 +10,12 @@ pub struct SubscribeRequest {
     pub include_history: bool,
     pub from_lsn: Option<u64>,
     pub max_inflight: u32,
+    /// Effective identity this subscription runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -24,6 +31,12 @@ pub struct SubscriptionFilter {
     /// `HashSet::contains` per event.
     #[serde(with = "crate::codec::cbor::opt_vec_byte_array16")]
     pub agents: Option<Vec<WireUuid>>,
+    /// Subset of memory ids whose events the subscriber wants. `None`
+    /// or empty = all memories. Lets a client scope a subscription to
+    /// a single in-flight write (e.g. to watch that write's async
+    /// derivation stages complete) without seeing unrelated traffic
+    /// on a busy shard.
+    pub memory_ids: Option<Vec<WireMemoryId>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -162,6 +175,31 @@ pub enum GraphEventPayload {
 
     // Schema events.
     SchemaUpdated(SchemaUpdatedEvent),
+}
+
+/// Durable WAL-body counterpart to a `StageCompleted` subscribe event.
+///
+/// Typed-graph events (above) don't carry a real `memory_id` — they
+/// zero-fill it and rely on their own typed body for identity. Stage
+/// events are keyed on the real source memory, so unlike
+/// [`GraphEventPayload`] this body carries `memory_id` itself rather
+/// than depending on substrate fields the durable record framing
+/// otherwise supplies.
+///
+/// CBOR-encoded and appended as an opaque-body WAL record (kind
+/// `StageCompleted`, always flagged `FLAG_SUBSCRIBE_EVENT`) alongside
+/// the live bus publish, mirroring how typed-graph events get a
+/// durable, subscribe-replayable counterpart. There is no separate
+/// "durable write record" for a stage completion the way there is for
+/// typed-graph mutations — this WAL record *is* the sole durable
+/// trace of the event, so recovery must still skip it via the flag
+/// (it is not state to hydrate into any table).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StageCompletedEventBody {
+    pub memory_id: WireMemoryId,
+    pub stage_kind: StageKind,
+    pub stage_outcome: StageOutcome,
+    pub stage_payload: StagePayload,
 }
 
 // ---------------------------------------------------------------------------

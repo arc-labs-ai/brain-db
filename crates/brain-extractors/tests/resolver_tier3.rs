@@ -11,7 +11,8 @@ use brain_core::Entity;
 use brain_core::{EntityId, EntityType, EntityTypeId};
 use brain_embed::{Dispatcher, EmbedError};
 use brain_extractors::resolver::{
-    resolve_or_create_with_hnsw, EmbeddingDeps, ResolutionTier, EMBED_RESOLVE_THRESHOLD,
+    resolve_or_create_with_deps, Disambiguation, EmbeddingDeps, Resolution, ResolutionTier,
+    ResolverError, StagedEntityVectors, EMBED_RESOLVE_THRESHOLD,
 };
 use brain_index::entity_hnsw::{EntityHnswIndex, EntityHnswParams};
 use brain_index::VECTOR_DIM;
@@ -109,6 +110,37 @@ fn deps_for(embedder: Arc<ScriptedEmbedder>, hnsw: Arc<RwLock<EntityHnswIndex>>)
     }
 }
 
+/// Resolve with the embedding tier wired and publish whatever tier-4
+/// staged, mirroring the production `commit()`-then-flush sequence (these
+/// tests commit on the next line and never roll back, so the flush is
+/// ordered with the commit either way).
+fn resolve_and_publish(
+    wtxn: &redb::WriteTransaction,
+    scope: brain_metadata::RowScope,
+    surface_form: &str,
+    entity_type_qname: &str,
+    confidence: f32,
+    now_unix_nanos: u64,
+    embed_deps: Option<&EmbeddingDeps>,
+) -> Result<Resolution, ResolverError> {
+    let mut staged = StagedEntityVectors::new();
+    let res = resolve_or_create_with_deps(
+        wtxn,
+        scope,
+        surface_form,
+        entity_type_qname,
+        confidence,
+        now_unix_nanos,
+        embed_deps,
+        &mut staged,
+        &mut Disambiguation::Off,
+    );
+    if let Some(deps) = embed_deps {
+        staged.flush_into_hnsw(deps);
+    }
+    res
+}
+
 fn seed_entity(
     db: &mut MetadataDb,
     hnsw: &Arc<RwLock<EntityHnswIndex>>,
@@ -157,7 +189,7 @@ fn tier_embedding_resolves_near_paraphrase_and_writes_alias() {
 
     let deps = deps_for(embedder, hnsw.clone());
     let wtxn = db.write_txn().unwrap();
-    let res = resolve_or_create_with_hnsw(
+    let res = resolve_and_publish(
         &wtxn,
         test_scope(),
         "Stripe Payments",
@@ -201,7 +233,7 @@ fn tier_embedding_below_threshold_creates_new_entity() {
 
     let deps = deps_for(embedder, hnsw.clone());
     let wtxn = db.write_txn().unwrap();
-    let res = resolve_or_create_with_hnsw(
+    let res = resolve_and_publish(
         &wtxn,
         test_scope(),
         "Bitcoin",
@@ -268,7 +300,7 @@ fn tier_embedding_respects_entity_type() {
 
     let deps = deps_for(embedder, hnsw);
     let wtxn = db.write_txn().unwrap();
-    let res = resolve_or_create_with_hnsw(
+    let res = resolve_and_publish(
         &wtxn,
         test_scope(),
         "Wong Group",
@@ -302,7 +334,7 @@ fn tier_create_populates_hnsw_for_next_paraphrase() {
     let deps = deps_for(embedder, hnsw.clone());
 
     let wtxn = db.write_txn().unwrap();
-    let r1 = resolve_or_create_with_hnsw(
+    let r1 = resolve_and_publish(
         &wtxn,
         test_scope(),
         "Brand New Co",
@@ -317,7 +349,7 @@ fn tier_create_populates_hnsw_for_next_paraphrase() {
     assert!(hnsw.read().contains(r1.entity_id));
 
     let wtxn = db.write_txn().unwrap();
-    let r2 = resolve_or_create_with_hnsw(
+    let r2 = resolve_and_publish(
         &wtxn,
         test_scope(),
         "Brand New Company",

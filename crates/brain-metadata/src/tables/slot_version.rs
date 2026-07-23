@@ -70,9 +70,7 @@ pub enum SlotVersionError {
 /// extractor's `has_extracted` gate so new writes never extract). Boot seeds
 /// the counter to `max_assigned_slot + 1` so slots stay monotonic across
 /// restarts.
-pub fn max_assigned_slot(
-    rtxn: &redb::ReadTransaction,
-) -> Result<u64, SlotVersionError> {
+pub fn max_assigned_slot(rtxn: &redb::ReadTransaction) -> Result<u64, SlotVersionError> {
     use crate::tables::memory::MEMORIES_TABLE;
     use redb::ReadableTable;
 

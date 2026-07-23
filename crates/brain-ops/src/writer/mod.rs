@@ -299,7 +299,8 @@ impl RealWriterHandle {
     /// `has_extracted` gate so new writes never extract). `fetch_max` keeps
     /// the counter monotonic: it only ever moves forward, never below `1`.
     pub fn seed_next_slot(&self, next_slot: u64) {
-        self.next_slot.fetch_max(next_slot.max(1), Ordering::Relaxed);
+        self.next_slot
+            .fetch_max(next_slot.max(1), Ordering::Relaxed);
     }
 
     /// Accessor for the writer-level metric family. Production wires

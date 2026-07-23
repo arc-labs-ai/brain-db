@@ -50,6 +50,14 @@ pub(crate) const ENCODE_RESPONSE_MS: f32 = 0.05;
 pub(crate) const CROSS_SHARD_MERGE_MS: f32 = 0.05;
 pub(crate) const CROSS_SHARD_PER_SHARD_SERIALISATION_MS: f32 = 0.1;
 
+// REASON's VSA analogical-fit nudge (`executor::analogical`). Per
+// spec §7's order-of-magnitude estimate: ~10 µs for the bind/unbind
+// pair that builds a triple's HRR vector, plus ~5 ms for the
+// `Codebook::cleanup` argmax cosine-rank over the call's filler
+// vocabulary. One lookup per surviving evidence item.
+pub(crate) const ANALOGICAL_BIND_UNBIND_MS: f32 = 0.01;
+pub(crate) const ANALOGICAL_COSINE_RANK_MS: f32 = 5.0;
+
 // Budget thresholds.
 /// Above this, the planner logs a `tracing::warn!`.
 pub(crate) const BUDGET_WARN_MS: f32 = 100.0;
@@ -303,14 +311,21 @@ pub fn cost_path(max_depth: usize, max_branches: usize, ctx: &PlannerContext) ->
 }
 
 /// REASON cost: one embedding + base RECALL + two parallel traversals
-/// (supports + contradicts) cites 30-50 ms.
+/// (supports + contradicts) cites 30-50 ms, plus the VSA analogical-fit
+/// nudge (one bind/unbind + cosine-rank lookup per surviving evidence
+/// item, bounded by `max_inferences`; see `ANALOGICAL_*_MS`). REASON has
+/// no RRF dependency, so this is a plain additive term — no cost-model
+/// redesign, just one more phase in the same heuristic sum.
 #[must_use]
 pub fn cost_reason(depth: usize, max_inferences: usize, ctx: &PlannerContext) -> f32 {
     let embed = embedding_cost(false);
     let recall = cost_recall(20, 1.0, /* cache_hit */ false, ctx);
     #[allow(clippy::cast_precision_loss)]
     let traversal = 2.0 * (depth as f32) * (max_inferences as f32) * METADATA_POINT_LOOKUP_MS * 4.0;
-    embed + recall + traversal
+    #[allow(clippy::cast_precision_loss)]
+    let analogical =
+        (max_inferences as f32) * (ANALOGICAL_BIND_UNBIND_MS + ANALOGICAL_COSINE_RANK_MS);
+    embed + recall + traversal + analogical
 }
 
 // ---------------------------------------------------------------------------

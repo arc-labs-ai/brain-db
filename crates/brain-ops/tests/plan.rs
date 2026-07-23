@@ -16,6 +16,7 @@ use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
+use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_metadata::MetadataDb;
 use brain_ops::test_support::run_in_glommio;
 use brain_ops::{dispatch, DispatchOutcome, ErrorCode, OpError, OpsContext, RealWriterHandle};
@@ -24,7 +25,8 @@ use brain_protocol::envelope::request::{
     EdgeKindWire, LinkRequest, PlanBudget, PlanRequest, PlanState, RequestBody,
 };
 use brain_protocol::envelope::response::{
-    PlanResponseFrame, PlanStatus as WirePlanStatus, ResponseBody, TransitionKind,
+    PlanResponseFrame, PlanStatus as WirePlanStatus, PlanTraceDirection, ResponseBody,
+    TransitionKind,
 };
 use uuid::Uuid;
 
@@ -76,6 +78,7 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
     let wtxn = metadata.write_txn().unwrap();
     {
         let mut table = wtxn.open_table(MEMORIES_TABLE).unwrap();
+        let mut texts = wtxn.open_table(TEXTS_TABLE).unwrap();
         for i in 0..n_memories {
             let id = make_id((i as u64) + 1);
             ids.push(id);
@@ -93,6 +96,8 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
                 1_000_000 + i as u64,
             );
             table.insert(id.to_be_bytes(), meta).unwrap();
+            let text = format!("plan fixture memory {i}");
+            texts.insert(id.to_be_bytes(), text.as_bytes()).unwrap();
         }
     }
     wtxn.commit().unwrap();
@@ -140,6 +145,15 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
 }
 
 fn plan_request(start: MemoryId, goal: MemoryId, max_depth: u32) -> PlanRequest {
+    plan_request_traced(start, goal, max_depth, false)
+}
+
+fn plan_request_traced(
+    start: MemoryId,
+    goal: MemoryId,
+    max_depth: u32,
+    trace: bool,
+) -> PlanRequest {
     PlanRequest {
         start: PlanState::ByMemoryId(start.into()),
         goal: PlanState::ByMemoryId(goal.into()),
@@ -152,6 +166,7 @@ fn plan_request(start: MemoryId, goal: MemoryId, max_depth: u32) -> PlanRequest 
         context_filter: None,
         request_id: None,
         txn_id: None,
+        trace,
         act_as: None,
     }
 }
@@ -176,6 +191,7 @@ fn collect_plan_outcome(outcome: DispatchOutcome) -> PlanResponseFrame {
         steps,
         is_final: terminal.is_final,
         plan_status: terminal.plan_status,
+        trace: terminal.trace,
     }
 }
 
@@ -322,5 +338,83 @@ fn plan_by_memory_id_skips_recall() {
         let id1: u128 = fix.ids[1].into();
         assert_eq!(frame.steps[0].memory_id, id0);
         assert_eq!(frame.steps[1].memory_id, id1);
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 6. trace = false (default): terminal frame carries no trace payload.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plan_trace_false_omits_trace_payload() {
+    run_in_glommio(|| async {
+        let fix = build_fixture(3, &[(0, EdgeKind::Caused, 1), (1, EdgeKind::FollowedBy, 2)]).await;
+        let req = plan_request(fix.ids[0], fix.ids[2], 4);
+        let frame = collect_plan_outcome(
+            dispatch(
+                RequestBody::Plan(req),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(frame.trace.is_none());
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 7. trace = true: terminal frame carries the full bidirectional-BFS trace,
+//    with real (non-empty) text on every explored node and meeting point.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plan_trace_true_populates_explored_and_meeting_points() {
+    run_in_glommio(|| async {
+        let fix = build_fixture(3, &[(0, EdgeKind::Caused, 1), (1, EdgeKind::FollowedBy, 2)]).await;
+        let req = plan_request_traced(fix.ids[0], fix.ids[2], 4, true);
+        let frame = collect_plan_outcome(
+            dispatch(
+                RequestBody::Plan(req),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(frame.plan_status, Some(WirePlanStatus::GoalReached));
+
+        let trace = frame
+            .trace
+            .expect("trace = true must populate the trace payload");
+        assert!(!trace.explored.is_empty());
+        assert!(!trace.meeting_points.is_empty());
+
+        let id0: u128 = fix.ids[0].raw();
+        let id2: u128 = fix.ids[2].raw();
+
+        // The forward seed (start) is explored at depth 0 with no parent.
+        let seed = trace
+            .explored
+            .iter()
+            .find(|n| n.memory_id == id0 && n.direction == PlanTraceDirection::Forward)
+            .expect("forward seed must be in the explored set");
+        assert_eq!(seed.depth, 0);
+        assert!(seed.parent_edge.is_none());
+        assert!(!seed.text.is_empty());
+
+        // Every explored node carries real text.
+        for n in &trace.explored {
+            assert!(!n.text.is_empty(), "explored node missing text");
+        }
+
+        // The goal node is a meeting point that made it into the result.
+        let meet = trace
+            .meeting_points
+            .iter()
+            .find(|m| m.memory_id == id2)
+            .expect("goal node must be a meeting point");
+        assert!(meet.included_in_result);
+        assert!(!meet.text.is_empty());
     })
 }

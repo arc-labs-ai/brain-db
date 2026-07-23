@@ -119,8 +119,8 @@ pub enum EventType {
     RelationSuperseded = 26,
     /// One *stage* of a write's pipeline completed. The same envelope
     /// is published by every background worker (auto-edge, temporal-
-    /// edge, extractor) once it has committed its derived phases for
-    /// a memory. Subscribers waiting on a write's completion count
+    /// edge, extractor, HyPE) once it has committed its derived phases
+    /// for a memory. Subscribers waiting on a write's completion count
     /// down their `pending_stages` checklist as `StageCompleted`
     /// events arrive. `stage_payload` carries the per-stage detail
     /// (extractor counts + audit status, edge stages: the count of
@@ -165,6 +165,9 @@ pub enum StageKind {
     /// Entities, statements, relations extracted from memory text via
     /// the three-tier pipeline (pattern → classifier → LLM).
     Extractor = 2,
+    /// Hypothetical questions generated for the new memory (write-time
+    /// HyPE), embedded and inserted into the memory HNSW index.
+    Hype = 3,
 }
 
 /// Verdict of a completed stage. Carried on every `StageCompleted`
@@ -194,6 +197,7 @@ pub enum StagePayload {
     AutoEdge(StageAutoEdgePayload),
     TemporalEdge(StageTemporalEdgePayload),
     Extractor(StageExtractorPayload),
+    Hype(StageHypePayload),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -206,6 +210,16 @@ pub struct StageAutoEdgePayload {
 pub struct StageTemporalEdgePayload {
     /// How many `FollowedBy` rows the worker wrote.
     pub edges_written: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StageHypePayload {
+    /// How many hypothetical questions were embedded, persisted, and
+    /// inserted into the memory HNSW index.
+    pub questions_written: u32,
+    /// LLM micro-USD spent generating the questions (`0` on a cache
+    /// hit).
+    pub cost_micro_usd: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

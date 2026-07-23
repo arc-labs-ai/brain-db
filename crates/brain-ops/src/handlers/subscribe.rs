@@ -12,11 +12,19 @@
 //!   `target_stream_id`, caches the parsed filter, and remembers the
 //!   `started_at_lsn` and the last-delivered `final_lsn` per stream.
 //! - **Dispatcher**: [`handle_subscribe`] registers + awaits the
-//!   first matching event (bounded poll, default 5s). The wire
-//!   response shape is a single event today; the long-lived push
-//!   path lands later, calling
-//!   [`SubscriptionRegistry::register`] directly and framing events
-//!   out of the returned receiver.
+//!   first matching event (bounded poll, default 5s), then returns.
+//!   This single-event, bounded-poll shape is **not** what real
+//!   client connections experience: `brain-server`'s connection
+//!   layer (`SubscriptionRegistry` / `run_subscription_task`) calls
+//!   [`SubscriptionRegistry::register`] directly and bypasses this
+//!   dispatcher entirely, framing a genuine long-lived event stream
+//!   out of the returned receiver, with WAL-tail replay-then-live
+//!   cutover and proper `UNSUBSCRIBE`/cancel handling — that is the
+//!   real, live-today implementation. This handler exists only to
+//!   satisfy the shared `brain-ops` dispatch surface and shares its
+//!   filter parsing (`ParsedFilter`) with the real path; it is not
+//!   itself reachable from a real client connection. See
+//!   `spec/05_operations/05_subscribe.md` §21 for the full picture.
 //! - **Backpressure**: a lagged subscriber returns
 //!   [`broadcast::error::RecvError::Lagged`], which is surfaced as
 //!   `OpError::Overloaded` from the dispatcher path; the registry's
@@ -401,19 +409,55 @@ impl EventEnvelope {
             }],
             WalPayload::PhaseBody(body_record) => {
                 // Only the subscribe-event records carry a CBOR
-                // `GraphEventPayload` body; the durable write records share
-                // these kinds but hold an rkyv row instead. Project only the
-                // flagged change-feed records — the durable ones are
+                // `GraphEventPayload` / `StageCompletedEventBody` body; the
+                // durable write records share these kinds but hold an rkyv
+                // row instead. Project only the flagged change-feed
+                // records — the durable ones (where they exist) are
                 // reconstructed by recovery, not surfaced as subscribe
                 // events here. Pair with `wal_kind_for_event` /
-                // `publish_graph` (which sets the flag).
+                // `OpsContext::publish_notification` (which sets the flag).
                 if !is_subscribe_event {
                     return Vec::new();
+                }
+                // `StageCompleted` has no durable write-record counterpart
+                // (unlike the typed-graph kinds below) — the flagged
+                // notification record decoded here is the sole durable
+                // trace of the event. Its body shape differs from
+                // `GraphEventPayload` (it carries `memory_id` directly), so
+                // it gets its own decode arm ahead of the generic one.
+                if body_record.kind == brain_storage::wal::kinds::WalRecordKind::StageCompleted {
+                    let Ok(stage_body) = ciborium::from_reader::<
+                        brain_protocol::StageCompletedEventBody,
+                        _,
+                    >(&body_record.body[..]) else {
+                        return Vec::new();
+                    };
+                    return vec![Self {
+                        lsn,
+                        event_type: EventType::StageCompleted,
+                        memory_id: MemoryId::from(stage_body.memory_id),
+                        context_id: ContextId::default(),
+                        kind: MemoryKind::Episodic,
+                        salience: 0.0,
+                        timestamp_unix_nanos,
+                        text: None,
+                        graph_payload: None,
+                        edge_payload: None,
+                        stage_kind: Some(stage_body.stage_kind),
+                        stage_outcome: Some(stage_body.stage_outcome),
+                        stage_payload: Some(stage_body.stage_payload),
+                        // Real agent, unlike the typed-graph arm below —
+                        // the notification record carries it in the same
+                        // 16-byte prefix `publish_notification` writes, and
+                        // `PhaseBodyRecord::agent_id` is already populated
+                        // from that prefix by `WalPayload::decode`.
+                        agent_id: body_record.agent_id,
+                    }];
                 }
                 // Decode the CBOR body back into the typed-graph
                 // event so subscribers see the same shape as a live
                 // publish. Pair with `wal_kind_for_event` in
-                // `crate::handlers::entity`.
+                // `crate::handlers::entity` and `OpsContext::publish_notification`.
                 let Ok(payload) =
                     ciborium::from_reader::<GraphEventPayload, _>(&body_record.body[..])
                 else {
@@ -583,6 +627,12 @@ pub struct ParsedFilter {
     /// the difference between "I see only my agent" and "I see
     /// every agent on this shard.".
     pub agents: Option<HashSet<brain_core::AgentId>>,
+    /// Subset of memory ids the subscriber wants events for. `None`
+    /// = all memories. Lets a client scope a subscription to a
+    /// single in-flight write (e.g. to watch that write's async
+    /// derivation stages complete) without seeing unrelated traffic
+    /// on a busy shard.
+    pub memory_ids: Option<HashSet<MemoryId>>,
     /// Reserved slot. Wire `SubscriptionFilter` doesn't carry
     /// `min_salience` today lists it as desirable. Always
     /// `None` in v1.
@@ -604,6 +654,11 @@ impl ParsedFilter {
         }
         if let Some(ks) = &self.kinds {
             if !ks.contains(&env.kind) {
+                return false;
+            }
+        }
+        if let Some(ids) = &self.memory_ids {
+            if !ids.contains(&env.memory_id) {
                 return false;
             }
         }
@@ -646,6 +701,13 @@ pub fn parse_filter(req: &SubscribeRequest) -> Result<ParsedFilter, OpError> {
             )));
         }
     }
+    if let Some(ref v) = req.filter.memory_ids {
+        if v.len() > MAX_SUBSCRIBE_FILTER_ENTRIES {
+            return Err(OpError::InvalidRequest(format!(
+                "subscribe: filter.memory_ids must have <= {MAX_SUBSCRIBE_FILTER_ENTRIES} entries"
+            )));
+        }
+    }
     let contexts = req
         .filter
         .contexts
@@ -673,10 +735,26 @@ pub fn parse_filter(req: &SubscribeRequest) -> Result<ParsedFilter, OpError> {
             )
         }
     });
+    // An empty memory_ids list is "no filter" (same as None), mirroring
+    // the `agents` handling above — an empty allowlist would silently
+    // drop every event.
+    let memory_ids = req.filter.memory_ids.as_ref().and_then(|v| {
+        if v.is_empty() {
+            None
+        } else {
+            Some(
+                v.iter()
+                    .copied()
+                    .map(MemoryId::from)
+                    .collect::<HashSet<_>>(),
+            )
+        }
+    });
     Ok(ParsedFilter {
         contexts,
         kinds,
         agents,
+        memory_ids,
         min_salience: None,
     })
 }

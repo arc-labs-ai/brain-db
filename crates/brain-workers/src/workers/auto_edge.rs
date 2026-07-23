@@ -52,6 +52,7 @@ use brain_core::{AgentId, ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind
 use brain_metadata::tables::edge::{
     derived_by, list_memory_edges_from, origin, zero_disambiguator,
 };
+use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_ops::{
     AutoEdgeEnqueue, AutoEdgeMetrics, EventEnvelope, Phase, RealWriterHandle, Write, WriteId,
 };
@@ -60,7 +61,7 @@ use brain_protocol::shared::enums::{
 };
 use futures_lite::FutureExt;
 use glommio::timer::sleep;
-use tracing::trace;
+use tracing::{trace, warn};
 
 use crate::config::{WorkerConfig, WorkerKind};
 use crate::context::WorkerContext;
@@ -411,6 +412,37 @@ async fn do_auto_edge_cycle(
         to_link.len()
     };
 
+    // Merge the real per-source edge detail (target memory id + cosine
+    // similarity, not just the count) into each source's durable
+    // write-artifact bundle, so `MEMORY_INSPECT` can show it later —
+    // mirroring `extractor`'s `merge_graph_from_committed` and `hype`'s
+    // `merge_hype_questions`. Grouped by source so one bundle merge covers
+    // every edge that source produced this cycle. Best-effort: a merge
+    // failure is logged and never blocks the cycle — the edges themselves
+    // already committed via `submit(Write)` above.
+    if written > 0 {
+        let metadata = ctx.ops.executor.metadata.as_ref();
+        let mut by_source: HashMap<MemoryId, Vec<(MemoryId, MemoryId, f32)>> = HashMap::new();
+        for (source, neighbour, similarity) in &to_link {
+            by_source
+                .entry(*source)
+                .or_default()
+                .push((*source, *neighbour, *similarity));
+        }
+        for (source, links) in by_source {
+            if let Err(e) =
+                brain_ops::memory_artifact::merge_edge_links(metadata, source, "similar_to", &links)
+            {
+                warn!(
+                    target: "brain_workers::auto_edge",
+                    memory_id = ?source,
+                    error = %e,
+                    "artifact edge merge failed (durable edges are committed; bundle detail deferred)",
+                );
+            }
+        }
+    }
+
     let elapsed = started.elapsed();
     worker.metrics.add_edges_written(written as u64);
     worker.metrics.observe_neighbours_found(neighbours_found);
@@ -444,9 +476,9 @@ async fn do_auto_edge_cycle(
             stage_payload: Some(StagePayload::AutoEdge(StageAutoEdgePayload {
                 edges_written,
             })),
-            agent_id: AgentId::default(),
+            agent_id: memory_agent_id(ctx, source_id),
         };
-        let _ = ctx.ops.events.publish(envelope);
+        ctx.ops.publish_stage_event(envelope).await;
     }
 
     trace!(
@@ -463,6 +495,29 @@ fn now_unix_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+/// Read a memory's real owning agent from `MEMORIES_TABLE`, for stamping
+/// onto the `StageCompleted{AutoEdge}` publish — `AutoEdgeEnqueue` carries
+/// only `(memory_id, vector)`, so unlike the temporal-edge worker (whose
+/// enqueue payload already threads `agent_id` through) this needs its own
+/// lookup. Falls back to [`AgentId::default`] (the nil agent) when the row
+/// is absent — shouldn't happen for a memory the writer just committed,
+/// but a missing row here isn't reason to fail the whole publish loop.
+fn memory_agent_id(ctx: &WorkerContext, memory_id: MemoryId) -> AgentId {
+    ctx.ops
+        .executor
+        .metadata
+        .as_ref()
+        .read_txn()
+        .ok()
+        .and_then(|rtxn| {
+            rtxn.open_table(MEMORIES_TABLE)
+                .ok()
+                .and_then(|t| t.get(&memory_id.to_be_bytes()).ok().flatten())
+                .map(|g| g.value().agent_id())
+        })
+        .unwrap_or_default()
 }
 
 /// Deterministic hash of a batch of `(source, target, weight)` tuples.

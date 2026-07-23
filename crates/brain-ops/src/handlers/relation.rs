@@ -1088,6 +1088,10 @@ fn map_relation_op_error(err: RelationOpError) -> OpError {
             existing: conflicting as u32,
             limit: cardinality_limit(variant),
         },
+        // Declared `from` / `to` entity type violated. Same layer as
+        // the cardinality arm above; surfaced as an invalid request
+        // because the client fixes it by picking a conforming endpoint.
+        e @ RelationOpError::EndpointTypeViolation { .. } => OpError::InvalidRequest(e.to_string()),
         RelationOpError::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
         RelationOpError::Table(e) => OpError::Internal(format!("redb table: {e}")),
         RelationOpError::EdgeOp(e) => OpError::Internal(format!("edge op: {e}")),

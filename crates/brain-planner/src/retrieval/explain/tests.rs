@@ -152,9 +152,11 @@ fn sample_metadata() -> QueryMetadata {
             after_supersession: 5,
             after_as_of: 5,
             after_limit: 3,
+            ..Default::default()
         },
         total_latency_ms: 22.4,
         rerank: None,
+        ..Default::default()
     }
 }
 

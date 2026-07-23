@@ -320,7 +320,7 @@ The connection principal never changes within a connection; the effective identi
 
 ### 10a.2 The `act_as` field
 
-`act_as` is an **optional**, uniform field on every data-plane op request: `ENCODE`, `RECALL`, `FORGET`, `LINK`, `UNLINK`, `PLAN`, `REASON`, `ENTITY_CREATE`, `STATEMENT_CREATE`, and `RELATION_CREATE`. Its layout is defined once in [`05_frame_layouts.md`](05_frame_layouts.md):
+`act_as` is an **optional**, uniform field on every data-plane op request: `ENCODE`, `RECALL`, `FORGET`, `LINK`, `UNLINK`, `PLAN`, `REASON`, `ENTITY_CREATE`, `STATEMENT_CREATE`, `RELATION_CREATE`, and `SUBSCRIBE`. Its layout is defined once in [`05_frame_layouts.md`](05_frame_layouts.md):
 
 ```rust
 act_as: Option<ActAs>                        // absent = run as the connection's own identity
@@ -334,6 +334,8 @@ struct ActAs {
 Absent (`None`) is the normal case: the op runs as the connection principal's own agent. Present, it selects the effective identity for that one op only.
 
 `act_as` **never appears in the AUTH frame.** Identity at AUTH is still key-derived and non-negotiable (§10); putting an identity *selector* in AUTH would re-introduce client-claimed identity, which §10 forbids. `act_as` is not a claim of who the caller *is* — the caller has already proven that as the service principal — it is a privileged request to run *as someone else*, honored only because the proven principal holds `can_act_as`. For the same reason, the §10 rule that rejects a redundant self-`agent_id`/`namespace` on a request is unaffected: `act_as` is not a redundant restatement of the connection's own identity, it is a distinct, privilege-gated impersonation selector.
+
+**A structural note on `SUBSCRIBE`.** Unlike the other nine ops in this list, `SUBSCRIBE` (along with `UNSUBSCRIBE` and `CANCEL_STREAM`) historically dispatched through a code path separate from the normal `act_as`-aware dispatch — a genuine architectural quirk of how streaming ops were wired, not a deliberate design choice — so `act_as` support for `SUBSCRIBE` required a dedicated fix rather than falling out of this general mechanism for free. See [`../05_operations/05_subscribe.md`](../05_operations/05_subscribe.md) §22 for the detail. `act_as` support for `TXN_BEGIN`/`TXN_COMMIT`/`TXN_ABORT` remains a known, smaller gap (those already go through normal dispatch) — not yet implemented.
 
 ### 10a.3 Invariants
 

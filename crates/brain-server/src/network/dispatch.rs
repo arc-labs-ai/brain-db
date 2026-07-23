@@ -280,22 +280,48 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
     let stream_id = frame.header.stream_id_u32();
     let req = match req {
         RequestBody::Subscribe(sub_req) => {
+            // SUBSCRIBE supports `act_as` the same way every other
+            // act-as-capable op does, but reaches the R1/R2 checks here
+            // instead of via the normal `act_as_of` block below (this
+            // branch returns before that point) because SUBSCRIBE
+            // structurally bypasses `brain_ops::dispatch` entirely. The
+            // checks themselves — and the effective-identity / shard
+            // routing they gate — are the exact same logic the normal
+            // path runs; see `check_act_as` and `pick_target_shard`'s
+            // `act_as` branch.
+            let (effective_agent, target_shard) = match &sub_req.act_as {
+                Some(a) => {
+                    if let Err((code, message)) = check_act_as(&scope, a) {
+                        return Action::Inline(error_frame(stream_id, code, message));
+                    }
+                    let routing = topology.routing.load_full();
+                    (
+                        AgentId::from(a.agent_id),
+                        routing.shard_for_agent(AgentId::from(a.agent_id)),
+                    )
+                }
+                None => (scope.agent_id, bound_shard),
+            };
             // Under scoped API-key auth, a subscriber may only receive its
-            // own agent's events. `filter.agents == None`/empty means "all
-            // agents" (a cross-tenant leak on a shared shard), and any id
-            // other than the caller's own agent is likewise forbidden — the
-            // SUBSCRIBE analogue of RECALL/QUERY per-agent read isolation.
-            if !subscribe_agents_allowed(scope.agent_id, sub_req.filter.agents.as_deref()) {
+            // own (effective) agent's events. `filter.agents == None`/empty
+            // means "all agents" (a cross-tenant leak on a shared shard),
+            // and any id other than the effective agent is likewise
+            // forbidden — the SUBSCRIBE analogue of RECALL/QUERY per-agent
+            // read isolation. Compared against the EFFECTIVE agent (the
+            // act_as target when present) so a `may_act`-permitted caller
+            // can scope a subscription to the identity it's acting as,
+            // never to some third agent.
+            if !subscribe_agents_allowed(effective_agent, sub_req.filter.agents.as_deref()) {
                 return Action::Inline(error_frame(
                     stream_id,
                     ErrorCode::PermissionDenied,
-                    "subscribe: filter.agents must name only the API key's own agent",
+                    "subscribe: filter.agents must name only the effective agent",
                 ));
             }
             return Action::Subscribe(SubscribeStart {
                 stream_id,
                 req: sub_req,
-                target_shard: bound_shard,
+                target_shard,
             });
         }
         RequestBody::Unsubscribe(un_req) => {
@@ -321,25 +347,8 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
     // failed act_as request is rejected with `ActAsDenied`, never silently
     // downgraded to the principal's own identity.
     if let Some(a) = brain_protocol::act_as_of(&req) {
-        if scope.permissions & bits::ACT_AS == 0 {
-            return Action::Inline(error_frame(
-                stream_id,
-                ErrorCode::ActAsDenied,
-                "act_as: connection principal lacks the ACT_AS grant",
-            ));
-        }
-        // A `"*"` entry is the wildcard grant: the principal may act as any
-        // namespace. This is the trusted-front-door case — a gateway/edge that
-        // fronts every tenant can't enumerate a `may_act` allowlist that grows
-        // with each new tenant, so it holds `["*"]` and Brain admits any target.
-        // Named entries still match exactly; the two forms compose.
-        let namespace_allowed = scope.may_act.iter().any(|ns| ns == "*" || ns == &a.namespace);
-        if !namespace_allowed {
-            return Action::Inline(error_frame(
-                stream_id,
-                ErrorCode::ActAsDenied,
-                "act_as: target namespace is not in the principal's may_act allowlist",
-            ));
+        if let Err((code, message)) = check_act_as(&scope, a) {
+            return Action::Inline(error_frame(stream_id, code, message));
         }
     }
 
@@ -348,8 +357,9 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
     // idempotency domain; memory-bearing requests route to the memory's
     // shard; everything else lands on the principal's bound shard.
     let routing = topology.routing.load_full();
-    let target_shard = pick_target_shard(&req, bound_shard, &routing, brain_protocol::act_as_of(&req))
-        .unwrap_or(bound_shard);
+    let target_shard =
+        pick_target_shard(&req, bound_shard, &routing, brain_protocol::act_as_of(&req))
+            .unwrap_or(bound_shard);
     // Capture the effective-identity selector for the dispatch task, which
     // builds the effective caller and records the delegation on the span.
     let act_as = brain_protocol::act_as_of(&req).cloned();
@@ -644,6 +654,41 @@ pub(crate) async fn run_op_dispatch(op: OpDispatch, shards: Arc<Vec<ShardHandle>
 // ---------------------------------------------------------------------------
 // Routing helpers
 // ---------------------------------------------------------------------------
+
+/// R1 (`ACT_AS` grant) + R2 (`may_act` allowlist, wildcard-`"*"`-aware)
+/// authorization for an `act_as` selector. Returns `Err((code,
+/// message))` on denial — always `ErrorCode::ActAsDenied`, the same
+/// code and the same two checks every act-as-capable op's normal
+/// dispatch path enforces. The single point both the normal
+/// `act_as_of` block and SUBSCRIBE's structurally-separate branch
+/// call into, so the two can never drift.
+fn check_act_as(
+    scope: &RequestScope,
+    a: &brain_protocol::ActAs,
+) -> Result<(), (ErrorCode, &'static str)> {
+    if scope.permissions & bits::ACT_AS == 0 {
+        return Err((
+            ErrorCode::ActAsDenied,
+            "act_as: connection principal lacks the ACT_AS grant",
+        ));
+    }
+    // A `"*"` entry is the wildcard grant: the principal may act as any
+    // namespace. This is the trusted-front-door case — a gateway/edge that
+    // fronts every tenant can't enumerate a `may_act` allowlist that grows
+    // with each new tenant, so it holds `["*"]` and Brain admits any target.
+    // Named entries still match exactly; the two forms compose.
+    let namespace_allowed = scope
+        .may_act
+        .iter()
+        .any(|ns| ns == "*" || ns == &a.namespace);
+    if !namespace_allowed {
+        return Err((
+            ErrorCode::ActAsDenied,
+            "act_as: target namespace is not in the principal's may_act allowlist",
+        ));
+    }
+    Ok(())
+}
 
 fn pick_target_shard(
     req: &RequestBody,

@@ -324,6 +324,14 @@ impl From<brain_metadata::statement::StatementOpError> for OpError {
                 what: "subject entity",
                 detail: format!("{id:?}"),
             },
+            E::UnknownObjectEntity(id) => OpError::NotFound {
+                what: "entity",
+                detail: format!("{id:?}"),
+            },
+            // A declared `object: Entity<Type>` range the write
+            // violated — the client can fix it by pointing at an
+            // entity of the declared type.
+            e @ E::ObjectEntityTypeMismatch { .. } => OpError::InvalidRequest(e.to_string()),
             E::InvalidArgument(s) => OpError::InvalidRequest(s.to_string()),
             E::AlreadySuperseded(id, by) => {
                 OpError::Conflict(format!("statement {id:?} already superseded by {by:?}"))

@@ -247,7 +247,7 @@ fn executes_single_semantic_retriever() {
     };
     let qp = plan(&req).expect("plan");
     let result: QueryResult =
-        futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
+        futures_lite::future::block_on(execute(&qp, &req, false, false, &ctx)).expect("execute");
 
     assert_eq!(result.items.len(), 2);
     assert_eq!(result.metadata.retriever_latencies_ms.len(), 1);
@@ -291,11 +291,206 @@ fn executes_three_retrievers_and_fuses() {
         ..Default::default()
     };
     let qp = plan(&req).expect("plan");
-    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
+    let result =
+        futures_lite::future::block_on(execute(&qp, &req, false, false, &ctx)).expect("execute");
 
     assert_eq!(result.items.len(), 1);
     assert_eq!(result.items[0].contributing.len(), 3);
     assert_eq!(result.metadata.retriever_outcomes.len(), 3);
+}
+
+#[test]
+fn trace_detail_false_leaves_full_detail_fields_empty() {
+    // Same three-retriever fixture as `executes_three_retrievers_and_fuses`.
+    // With `trace_detail = false` (the default/fast path) none of the
+    // opt-in full-detail fields should collect anything — this is the
+    // zero-cost-when-off guarantee.
+    let same_id = MemoryId::pack(0, 7, 0);
+    let item = |rank: u32| RankedItem {
+        id: RankedItemId::Memory(same_id),
+        rank,
+        score: 0.9,
+        snippet: None,
+    };
+    let sem = MockSemantic {
+        response: Arc::new(StdMutex::new(Ok(vec![item(1)]))),
+        delay: None,
+    };
+    let lex = MockLexical {
+        response: Arc::new(StdMutex::new(Ok(vec![item(2)]))),
+    };
+    let gr = MockGraph {
+        response: Arc::new(StdMutex::new(Ok(vec![item(3)]))),
+    };
+    let (_dir, ctx) = make_ctx(Some(sem), Some(lex), Some(gr));
+
+    let req = QueryRequest {
+        text: Some("topic".into()),
+        entity_anchor: Some(EntityId::new()),
+        retrievers: RetrieverSelection::Explicit(vec![
+            Retriever::Semantic,
+            Retriever::Lexical,
+            Retriever::Graph,
+        ]),
+        ..Default::default()
+    };
+    let qp = plan(&req).expect("plan");
+    let result =
+        futures_lite::future::block_on(execute(&qp, &req, false, false, &ctx)).expect("execute");
+
+    assert!(result.metadata.retriever_candidates.is_empty());
+    assert!(result.metadata.fusion_breakdown.is_empty());
+    assert!(result.metadata.rerank_before_order.is_empty());
+    assert!(result.metadata.rerank_after_order.is_empty());
+    assert!(result.metadata.filter_stats.dropped_by_type.is_empty());
+    assert!(result.metadata.filter_stats.dropped_by_tombstone.is_empty());
+}
+
+#[test]
+fn trace_detail_true_populates_per_item_fields() {
+    // Same fixture as `executes_three_retrievers_and_fuses`, but with
+    // `trace_detail = true`: the executor should surface the raw
+    // per-lane candidates and the per-fused-item lane breakdown, not
+    // just counts.
+    let same_id = MemoryId::pack(0, 7, 0);
+    let item = |rank: u32, score: f32| RankedItem {
+        id: RankedItemId::Memory(same_id),
+        rank,
+        score,
+        snippet: None,
+    };
+    let sem = MockSemantic {
+        response: Arc::new(StdMutex::new(Ok(vec![item(1, 0.9)]))),
+        delay: None,
+    };
+    let lex = MockLexical {
+        response: Arc::new(StdMutex::new(Ok(vec![item(2, 0.8)]))),
+    };
+    let gr = MockGraph {
+        response: Arc::new(StdMutex::new(Ok(vec![item(3, 0.7)]))),
+    };
+    let (_dir, ctx) = make_ctx(Some(sem), Some(lex), Some(gr));
+
+    let req = QueryRequest {
+        text: Some("topic".into()),
+        entity_anchor: Some(EntityId::new()),
+        retrievers: RetrieverSelection::Explicit(vec![
+            Retriever::Semantic,
+            Retriever::Lexical,
+            Retriever::Graph,
+        ]),
+        ..Default::default()
+    };
+    let qp = plan(&req).expect("plan");
+    let result =
+        futures_lite::future::block_on(execute(&qp, &req, false, true, &ctx)).expect("execute");
+
+    // Every lane's raw (id, score) candidate surfaced, not just a count.
+    assert_eq!(result.metadata.retriever_candidates.len(), 3);
+    for (retriever, candidates) in &result.metadata.retriever_candidates {
+        assert_eq!(
+            candidates.len(),
+            1,
+            "lane {retriever:?} should have one raw hit"
+        );
+        assert_eq!(candidates[0].0, RankedItemId::Memory(same_id));
+        let expected_score = match retriever {
+            Retriever::Semantic => 0.9,
+            Retriever::Lexical => 0.8,
+            Retriever::Graph => 0.7,
+        };
+        assert!(
+            (candidates[0].1 - expected_score).abs() < 1e-6,
+            "lane {retriever:?} score mismatch: {}",
+            candidates[0].1
+        );
+    }
+
+    // One fused item, three contributing lanes with their own raw scores.
+    assert_eq!(result.metadata.fusion_breakdown.len(), 1);
+    let (id, fused_score, lanes) = &result.metadata.fusion_breakdown[0];
+    assert_eq!(*id, RankedItemId::Memory(same_id));
+    assert!(*fused_score > 0.0);
+    assert_eq!(lanes.len(), 3);
+    let mut lane_scores: Vec<(Retriever, f32)> = lanes.clone();
+    lane_scores.sort_by_key(|(r, _)| format!("{r:?}"));
+    assert!(lane_scores.contains(&(Retriever::Semantic, 0.9)));
+    assert!(lane_scores.contains(&(Retriever::Lexical, 0.8)));
+    assert!(lane_scores.contains(&(Retriever::Graph, 0.7)));
+
+    // No cross-encoder loaded in this ctx, so the rerank-order fields
+    // stay empty even under full-detail trace.
+    assert!(result.metadata.rerank_before_order.is_empty());
+    assert!(result.metadata.rerank_after_order.is_empty());
+}
+
+#[test]
+fn trace_detail_true_populates_dropped_by_limit_at_real_truncation() {
+    // `apply_filter_chain` runs with `limit = 0` so rerank can see the full
+    // filtered set (its own dead `dropped_by_limit` capture never fires on
+    // this path); the real cut is the bare `items.truncate(plan.limit)`
+    // right before the executor returns. This proves that real cut now
+    // snapshots what it drops when `trace_detail = true`.
+    let sem = MockSemantic {
+        response: Arc::new(StdMutex::new(Ok(vec![
+            ranked_memory(1, 1, 0.95),
+            ranked_memory(2, 2, 0.80),
+            ranked_memory(3, 3, 0.60),
+        ]))),
+        delay: None,
+    };
+    let (_dir, ctx) = make_ctx(Some(sem), None, None);
+
+    let req = QueryRequest {
+        text: Some("budget".into()),
+        retrievers: RetrieverSelection::Explicit(vec![Retriever::Semantic]),
+        limit: 1,
+        ..Default::default()
+    };
+    let qp = plan(&req).expect("plan");
+    let result =
+        futures_lite::future::block_on(execute(&qp, &req, false, true, &ctx)).expect("execute");
+
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(result.metadata.filter_stats.dropped_by_limit.len(), 2);
+    let dropped: std::collections::HashSet<RankedItemId> = result
+        .metadata
+        .filter_stats
+        .dropped_by_limit
+        .iter()
+        .copied()
+        .collect();
+    assert!(dropped.contains(&RankedItemId::Memory(MemoryId::pack(0, 2, 0))));
+    assert!(dropped.contains(&RankedItemId::Memory(MemoryId::pack(0, 3, 0))));
+    assert!(!dropped.contains(&RankedItemId::Memory(MemoryId::pack(0, 1, 0))));
+}
+
+#[test]
+fn trace_detail_false_leaves_dropped_by_limit_empty_at_real_truncation() {
+    // Same fixture, `trace_detail = false`: the real truncation site must
+    // not pay the snapshot cost on the default fast path.
+    let sem = MockSemantic {
+        response: Arc::new(StdMutex::new(Ok(vec![
+            ranked_memory(1, 1, 0.95),
+            ranked_memory(2, 2, 0.80),
+            ranked_memory(3, 3, 0.60),
+        ]))),
+        delay: None,
+    };
+    let (_dir, ctx) = make_ctx(Some(sem), None, None);
+
+    let req = QueryRequest {
+        text: Some("budget".into()),
+        retrievers: RetrieverSelection::Explicit(vec![Retriever::Semantic]),
+        limit: 1,
+        ..Default::default()
+    };
+    let qp = plan(&req).expect("plan");
+    let result =
+        futures_lite::future::block_on(execute(&qp, &req, false, false, &ctx)).expect("execute");
+
+    assert_eq!(result.items.len(), 1);
+    assert!(result.metadata.filter_stats.dropped_by_limit.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -332,7 +527,8 @@ fn graph_runs_in_memory_mode_when_no_entity_anchor() {
         ..Default::default()
     };
     let qp = plan(&req).expect("plan");
-    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
+    let result =
+        futures_lite::future::block_on(execute(&qp, &req, false, false, &ctx)).expect("execute");
 
     assert_eq!(
         outcome_status(&result.metadata, Retriever::Graph),
@@ -364,7 +560,8 @@ fn memory_anchor_graph_skips_when_semantic_returns_nothing() {
         ..Default::default()
     };
     let qp = plan(&req).expect("plan");
-    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
+    let result =
+        futures_lite::future::block_on(execute(&qp, &req, false, false, &ctx)).expect("execute");
 
     assert_eq!(
         outcome_status(&result.metadata, Retriever::Graph),
@@ -391,7 +588,8 @@ fn skips_semantic_when_no_text() {
         ..Default::default()
     };
     let qp = plan(&req).expect("plan");
-    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
+    let result =
+        futures_lite::future::block_on(execute(&qp, &req, false, false, &ctx)).expect("execute");
     assert_eq!(
         outcome_status(&result.metadata, Retriever::Semantic),
         Some(RetrieverStatus::Skipped("no query text"))
@@ -420,7 +618,8 @@ fn failing_retriever_returns_partial_results() {
         ..Default::default()
     };
     let qp = plan(&req).expect("plan");
-    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
+    let result =
+        futures_lite::future::block_on(execute(&qp, &req, false, false, &ctx)).expect("execute");
 
     // Semantic succeeds with one hit; lexical failed →
     // partial fused result.
@@ -453,7 +652,8 @@ fn timeout_records_status() {
             *timeout_ms = 10;
         }
     }
-    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
+    let result =
+        futures_lite::future::block_on(execute(&qp, &req, false, false, &ctx)).expect("execute");
     assert_eq!(
         outcome_status(&result.metadata, Retriever::Semantic),
         Some(RetrieverStatus::Timeout)
@@ -483,7 +683,8 @@ fn total_latency_at_least_sum_of_per_retriever() {
         ..Default::default()
     };
     let qp = plan(&req).expect("plan");
-    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
+    let result =
+        futures_lite::future::block_on(execute(&qp, &req, false, false, &ctx)).expect("execute");
 
     let sum: f64 = result
         .metadata
@@ -516,7 +717,8 @@ fn empty_retriever_result_doesnt_break_fusion() {
         ..Default::default()
     };
     let qp = plan(&req).expect("plan");
-    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
+    let result =
+        futures_lite::future::block_on(execute(&qp, &req, false, false, &ctx)).expect("execute");
     assert_eq!(result.items.len(), 1);
     assert_eq!(
         outcome_status(&result.metadata, Retriever::Semantic),
@@ -602,7 +804,8 @@ fn dynamic_k_deepens_when_filters_thin_the_pool() {
         }
     }
 
-    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
+    let result =
+        futures_lite::future::block_on(execute(&qp, &req, false, false, &ctx)).expect("execute");
 
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -656,7 +859,8 @@ fn dynamic_k_no_deepen_when_first_pass_fills_limit() {
         }
     }
 
-    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
+    let result =
+        futures_lite::future::block_on(execute(&qp, &req, false, false, &ctx)).expect("execute");
 
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -940,7 +1144,8 @@ fn prf_reprobes_lexical_with_expansion_on_low_specificity_query() {
 
     let req = prf_request("Where did Caroline move from?");
     let qp = plan(&req).expect("plan");
-    let result = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
+    let result =
+        futures_lite::future::block_on(execute(&qp, &req, false, false, &ctx)).expect("execute");
 
     let calls = captured.lock().expect("lock").clone();
     assert_eq!(calls.len(), 2, "bare probe + one PRF re-probe: {calls:?}");
@@ -989,7 +1194,8 @@ fn prf_skips_high_specificity_query() {
     // Six content words → above the low-specificity gate → no PRF pass.
     let req = prf_request("What special gift did grandma send Caroline from Sweden");
     let qp = plan(&req).expect("plan");
-    let _ = futures_lite::future::block_on(execute(&qp, &req, false, &ctx)).expect("execute");
+    let _ =
+        futures_lite::future::block_on(execute(&qp, &req, false, false, &ctx)).expect("execute");
 
     assert_eq!(
         captured.lock().expect("lock").len(),
@@ -1004,4 +1210,53 @@ fn __ts() -> brain_metadata::RowScope {
     // are reachable by the cue-anchor / graph-expansion read paths,
     // which read under `ctx.caller_scope()`.
     brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0u8; 16])
+}
+
+#[test]
+fn correct_derived_lexical_partitions_by_provenance() {
+    use crate::retrieval::fusion::{FusedItem, RetrieverContribution};
+    use std::collections::HashSet;
+
+    // Each item carries a Semantic lane plus one Lexical lane; provenance
+    // decides what happens to that Lexical tag.
+    let mk = |slot: u64| FusedItem {
+        id: RankedItemId::Memory(MemoryId::pack(0, slot, 0)),
+        fused_score: 1.0,
+        contributing: vec![
+            RetrieverContribution {
+                retriever: Retriever::Semantic,
+                rank: 1,
+                raw_score: 0.5,
+            },
+            RetrieverContribution {
+                retriever: Retriever::Lexical,
+                rank: 1,
+                raw_score: 0.5,
+            },
+        ],
+        rerank_score: None,
+    };
+    let id = |slot: u64| RankedItemId::Memory(MemoryId::pack(0, slot, 0));
+    // slot 1: genuine original-query lexical hit; slot 2: PRF-only (echo);
+    // slot 3: graph-expansion hit.
+    let mut fused = vec![mk(1), mk(2), mk(3)];
+    let orig: HashSet<RankedItemId> = [id(1)].into_iter().collect();
+    let graph_added: HashSet<RankedItemId> = [id(3)].into_iter().collect();
+
+    super::correct_derived_lexical(&mut fused, &orig, &graph_added);
+
+    let lanes = |f: &FusedItem| {
+        f.contributing
+            .iter()
+            .map(|c| c.retriever)
+            .collect::<Vec<_>>()
+    };
+    // Original lexical hit keeps its independent Lexical lane.
+    assert_eq!(lanes(&fused[0]), vec![Retriever::Semantic, Retriever::Lexical]);
+    // PRF-only echo loses the Lexical tag entirely (circular, not independent).
+    assert_eq!(lanes(&fused[1]), vec![Retriever::Semantic]);
+    // Graph-expansion hit is re-tagged Graph (independent graph signal).
+    assert_eq!(lanes(&fused[2]), vec![Retriever::Semantic, Retriever::Graph]);
+    // fused_score is never touched — recall/ranking preserved.
+    assert!(fused.iter().all(|f| (f.fused_score - 1.0).abs() < f32::EPSILON as f64));
 }

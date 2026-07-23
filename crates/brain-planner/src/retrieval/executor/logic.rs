@@ -104,9 +104,25 @@ pub struct QueryResult {
     pub metadata: QueryMetadata,
 }
 
+/// One entry of [`QueryMetadata::fusion_breakdown`]: a fused item's id,
+/// its fused score, and the per-lane raw score of each retriever that
+/// contributed to it.
+pub type FusionBreakdownEntry = (RankedItemId, f64, Vec<(Retriever, f32)>);
+
 /// Per-execution observability data — surfaces in EXPLAIN/TRACE.
 /// Operators read this to see which retriever was slow, which filter
 /// narrowed results most, total wall-time, etc.
+///
+/// The `retriever_candidates`, `fusion_breakdown`, `rerank_before_order`
+/// and `rerank_after_order` fields are the opt-in full-detail trace:
+/// they carry real per-item data (not just counts) but are only
+/// populated when `execute`/`execute_once` is called with
+/// `trace_detail = true`. On the default (`false`) fast path every one
+/// of them stays an empty `Vec` and nothing extra is allocated or
+/// cloned — the data they would hold (raw retriever hits, fused
+/// contributions, rerank order) is already computed unconditionally
+/// elsewhere in the pipeline; `trace_detail` only gates whether it gets
+/// copied into `QueryMetadata` for a caller to inspect.
 #[derive(Debug, Clone, Default)]
 pub struct QueryMetadata {
     pub retriever_latencies_ms: Vec<(Retriever, f64)>,
@@ -118,6 +134,30 @@ pub struct QueryMetadata {
     /// means the cross-encoder isn't loaded on this shard (operator
     /// opted out, or no model on disk) so the result is RRF-only.
     pub rerank: Option<RerankOutcome>,
+    /// Each retriever lane's raw `(id, score)` candidates, in that
+    /// lane's own rank order (best first), captured just before fusion
+    /// consumes them — i.e. after PRF / graph-expansion lane merging,
+    /// so this reflects exactly what `fuse()` received. Full-detail
+    /// trace only (`trace_detail = true`); empty otherwise.
+    pub retriever_candidates: Vec<(Retriever, Vec<(RankedItemId, f32)>)>,
+    /// Per-fused-item breakdown, in fusion order (highest fused score
+    /// first), from right after `fuse()` runs — before the post-fusion
+    /// filter chain or rerank touch the list. Each entry is `(id,
+    /// fused_score, per_lane_component_scores)`, where the per-lane
+    /// scores are that item's raw score in each retriever lane that
+    /// contributed to it. Full-detail trace only; empty otherwise.
+    pub fusion_breakdown: Vec<FusionBreakdownEntry>,
+    /// The post-filter, pre-rerank id order, captured immediately
+    /// before the rerank stage runs. Full-detail trace only, and only
+    /// when the cross-encoder is loaded (the stage that would reorder
+    /// anything); empty otherwise.
+    pub rerank_before_order: Vec<RankedItemId>,
+    /// The id order right after the rerank stage returns (before the
+    /// list/diversity reorder or the final `limit` truncation). Pairs
+    /// with `rerank_before_order` so a caller can see exactly what
+    /// the cross-encoder moved. Full-detail trace only; empty
+    /// otherwise.
+    pub rerank_after_order: Vec<RankedItemId>,
 }
 
 /// What the rerank stage did. Surfaces in trace output so callers
@@ -180,10 +220,17 @@ pub enum ExecutionError {
 /// when the shallow pass would otherwise under-fill the request, so it
 /// can never trade away a hit the shallow pass already found. The cost
 /// is one extra fan-out, bounded to the under-recall case.
+///
+/// `trace_detail` mirrors how `include_statements` is already threaded
+/// through this function: `false` (the default) is the fast path with
+/// zero extra per-item collection; `true` additionally populates the
+/// full-detail fields on the returned `QueryResult.metadata` (see
+/// [`QueryMetadata`]) for callers that opted into a detailed trace.
 pub async fn execute(
     plan: &QueryPlan,
     request: &QueryRequest,
     include_statements: bool,
+    trace_detail: bool,
     ctx: &RetrievalExecutorContext,
 ) -> Result<QueryResult, ExecutionError> {
     // Cue→anchor: when the router left a blind memory-from-semantic graph
@@ -194,7 +241,7 @@ pub async fn execute(
     let rewritten = resolve_cue_anchor(plan, request, ctx);
     let plan = rewritten.as_ref().unwrap_or(plan);
 
-    let result = execute_once(plan, request, include_statements, ctx).await?;
+    let result = execute_once(plan, request, include_statements, trace_detail, ctx).await?;
 
     let ceiling = if plan.routing.list_intent {
         LIST_MAX_TOP_N
@@ -223,7 +270,7 @@ pub async fn execute(
                 *ef_search = (*ef_search).max(ceiling);
             }
         }
-        let retry = execute_once(&deepened, request, include_statements, ctx).await?;
+        let retry = execute_once(&deepened, request, include_statements, trace_detail, ctx).await?;
         if retry.items.len() > result.items.len() {
             return Ok(retry);
         }
@@ -313,6 +360,7 @@ async fn execute_once(
     plan: &QueryPlan,
     request: &QueryRequest,
     include_statements: bool,
+    trace_detail: bool,
     ctx: &RetrievalExecutorContext,
 ) -> Result<QueryResult, ExecutionError> {
     let total_started = Instant::now();
@@ -459,6 +507,22 @@ async fn execute_once(
         }
     }
 
+    // Lexical-lane PROVENANCE tracking across the two read-time expansions.
+    // Both PRF and graph-expansion MERGE their hits into the lexical lane, so
+    // after them the fusion can no longer tell a genuine query-term match from a
+    // derived one. That distinction is load-bearing for honest abstention: a
+    // PRF hit is the SEMANTIC top-hits' own terms echoed back (circular — not
+    // independent evidence), whereas a graph-expansion hit is an independent
+    // typed-graph signal. Snapshot the lexical id-set before/after each pass so
+    // `correct_derived_lexical` (below, post-fusion) can re-tag accordingly.
+    let lex_ids = |outs: &[(Retriever, Vec<RankedItem>)]| -> std::collections::HashSet<RankedItemId> {
+        outs.iter()
+            .find(|(r, _)| *r == Retriever::Lexical)
+            .map(|(_, v)| v.iter().map(|i| i.id).collect())
+            .unwrap_or_default()
+    };
+    let orig_lex_ids = lex_ids(&outputs);
+
     // Non-LLM read-time query expansion (pseudo-relevance feedback) for
     // the lexical lane. Fires only on low-specificity queries, where the
     // bare BM25 term set is too thin to bridge the query↔memory phrasing
@@ -466,6 +530,7 @@ async fn execute_once(
     // hits and re-probes lexical. Fail-open: leaves `outputs` untouched
     // on any miss, so it can never regress a hit the bare pass found.
     maybe_apply_lexical_prf(&mut outputs, plan, request, ctx, include_statements);
+    let post_prf_lex_ids = lex_ids(&outputs);
 
     // Read-side multi-hop: walk the typed graph N hops from the cue's anchor
     // and inject the connected entities' names into the lexical lane, so a
@@ -474,6 +539,12 @@ async fn execute_once(
     // tantivy + RRF; no read-side LLM, no client knowledge of the graph.
     let graph_expanded =
         maybe_apply_graph_expansion(&mut outputs, plan, request, ctx, include_statements);
+    // Ids the graph walk (not PRF) added to the lexical lane — an independent
+    // graph signal, kept as corroboration (re-tagged Graph post-fusion).
+    let graph_lex_added: std::collections::HashSet<RankedItemId> = lex_ids(&outputs)
+        .difference(&post_prf_lex_ids)
+        .copied()
+        .collect();
 
     // Adaptive RRF k from the actual candidate-pool size (small pools →
     // smaller k → sharper top ranks). Falls back to the plan's k for
@@ -493,8 +564,51 @@ async fn execute_once(
     // signal the bare lanes don't carry — i.e. cross-encoder rerank, which is a
     // deploy-time gate — not a fusion-weight cut here.
     let _ = graph_expanded;
-    let fused = fuse(&outputs, fusion_k, &plan.fusion.weights, plan.fusion.method);
+
+    // Full-detail trace: snapshot each lane's raw candidates exactly as
+    // `fuse()` is about to consume them (post PRF / graph-expansion
+    // merge). `outputs` is only borrowed by `fuse`, so this clone (when
+    // requested) doesn't disturb the fan-out below it. `false` skips
+    // this entirely — no allocation on the fast path.
+    let retriever_candidates: Vec<(Retriever, Vec<(RankedItemId, f32)>)> = if trace_detail {
+        outputs
+            .iter()
+            .map(|(r, items)| (*r, items.iter().map(|i| (i.id, i.score)).collect()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut fused = fuse(&outputs, fusion_k, &plan.fusion.weights, plan.fusion.method);
+    // Correct derived-lexical provenance before anything downstream (trace,
+    // filter, rerank, and the caller's corroboration/abstention) consumes it.
+    // Edits only `contributing` (the lane tags); `fused_score` is untouched, so
+    // recall/ranking from PRF and graph-expansion is preserved.
+    correct_derived_lexical(&mut fused, &orig_lex_ids, &graph_lex_added);
     let fused_len = fused.len();
+
+    // Full-detail trace: per-fused-item lane breakdown, captured right
+    // after fusion and before the filter chain / rerank consume the
+    // list. `FusedItem.contributing` is always computed by `fuse()`
+    // regardless of `trace_detail` (it's not new work); this just
+    // copies it into `QueryMetadata` when a caller asked for it.
+    let fusion_breakdown: Vec<FusionBreakdownEntry> = if trace_detail {
+        fused
+            .iter()
+            .map(|f| {
+                (
+                    f.id,
+                    f.fused_score,
+                    f.contributing
+                        .iter()
+                        .map(|c| (c.retriever, c.raw_score))
+                        .collect(),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Per-candidate fusion breakdown for deep diagnosis: which
     // retrievers brought each top hit in, at what rank and raw score.
@@ -523,8 +637,13 @@ async fn execute_once(
     // rerank the survivors, then truncate to `limit` — applying the limit
     // before rerank would collapse the rerank window whenever `limit` is
     // smaller than it.
-    let (mut filtered, mut filter_stats) =
-        apply_filter_chain(fused, &plan.post_filters, ctx.metadata.as_ref(), 0)?;
+    let (mut filtered, mut filter_stats) = apply_filter_chain(
+        fused,
+        &plan.post_filters,
+        ctx.metadata.as_ref(),
+        0,
+        trace_detail,
+    )?;
 
     // Recency ranking (soft, additive, RRF-scale). Only when the query
     // carries a temporal signal — a temporal expression / explicit time
@@ -545,6 +664,16 @@ async fn execute_once(
         )?;
     }
 
+    // Full-detail trace: the id order the rerank stage is about to
+    // receive. Only worth capturing when the cross-encoder is loaded
+    // (the branch below actually runs the stage); otherwise there's
+    // nothing to compare a "before" order against.
+    let rerank_before_order: Vec<RankedItemId> = if trace_detail && ctx.cross_encoder.is_some() {
+        filtered.iter().map(|f| f.id).collect()
+    } else {
+        Vec::new()
+    };
+
     // Rerank is always-on: the stage fires whenever the shard has a
     // cross-encoder loaded, regardless of any request field. When
     // the operator disabled the load (`cross_encoder` is `None`),
@@ -553,6 +682,14 @@ async fn execute_once(
         rerank_stage(filtered, request, ctx).await
     } else {
         (filtered, None)
+    };
+
+    // Full-detail trace: the id order right after the rerank stage
+    // returned, before diversity/limit touch it further.
+    let rerank_after_order: Vec<RankedItemId> = if trace_detail && ctx.cross_encoder.is_some() {
+        reranked.iter().map(|f| f.id).collect()
+    } else {
+        Vec::new()
     };
 
     // Merge / diversity stage — internal, router-decided. Runs only when
@@ -566,6 +703,15 @@ async fn execute_once(
     }
 
     if plan.limit > 0 && items.len() > plan.limit as usize {
+        // Full-detail trace: snapshot exactly which ids this truncation
+        // drops. `apply_filter_chain` above ran with `limit=0` (so rerank
+        // could see the full filtered set) — its own dead `dropped_by_limit`
+        // capture never fires on this path, so this is the one place the
+        // real limit cut needs to record what it removed.
+        if trace_detail {
+            filter_stats.dropped_by_limit =
+                items[plan.limit as usize..].iter().map(|f| f.id).collect();
+        }
         items.truncate(plan.limit as usize);
     }
     filter_stats.after_limit = items.len() as u32;
@@ -607,6 +753,10 @@ async fn execute_once(
             filter_stats,
             total_latency_ms,
             rerank: rerank_outcome,
+            retriever_candidates,
+            fusion_breakdown,
+            rerank_before_order,
+            rerank_after_order,
         },
     })
 }
@@ -1081,6 +1231,51 @@ fn maybe_apply_lexical_prf(
             lexical_after = lex_out.len(),
             "PRF expansion applied",
         );
+    }
+}
+
+/// Correct the lexical provenance of fused items after read-time query
+/// expansion, so corroboration/abstention keys only on INDEPENDENT evidence.
+///
+/// A `Lexical` contribution is independent only when the query's OWN terms
+/// matched the doc (`id ∈ orig_lex_ids` — the bare BM25 pass). Two derived cases
+/// are demoted:
+///   * a graph-expansion hit (`id ∈ graph_lex_added`) is re-tagged `Graph` — a
+///     typed-graph walk is an independent signal, and multi-hop recall depends
+///     on it still corroborating; skipped if the item already carries a Graph
+///     lane (no double-count);
+///   * a PRF-only hit is the semantic top-hits' terms echoed back, so its
+///     lexical tag is dropped — counting a semantic echo as an independent lane
+///     is circular and is exactly what let an off-topic cue dodge abstention.
+///
+/// Only `contributing` (the provenance used for corroboration, consensus, and
+/// display) is edited; `fused_score` is left intact, so PRF/graph-expansion keep
+/// boosting recall/ranking unchanged.
+fn correct_derived_lexical(
+    fused: &mut [FusedItem],
+    orig_lex_ids: &std::collections::HashSet<RankedItemId>,
+    graph_lex_added: &std::collections::HashSet<RankedItemId>,
+) {
+    for f in fused.iter_mut() {
+        if orig_lex_ids.contains(&f.id) {
+            continue; // genuine query-term lexical hit — independent, keep it
+        }
+        let promote_to_graph = graph_lex_added.contains(&f.id)
+            && !f
+                .contributing
+                .iter()
+                .any(|c| c.retriever == Retriever::Graph);
+        f.contributing.retain_mut(|c| {
+            if c.retriever != Retriever::Lexical {
+                return true;
+            }
+            if promote_to_graph {
+                c.retriever = Retriever::Graph;
+                true
+            } else {
+                false // PRF echo (or graph-expansion dup) — not independent
+            }
+        });
     }
 }
 

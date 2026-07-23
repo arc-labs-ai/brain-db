@@ -1157,3 +1157,216 @@ fn truncate_chars_caps_long_strings_utf8_safe() {
     assert_eq!(out.chars().count(), 11); // 10 + ellipsis
     assert!(out.ends_with('…'));
 }
+
+// ------------------------------------------------------------------
+// The shipped `brain:llm_predicate` extractor's declared response
+// schema — end-to-end check that a missing/malformed "object" field
+// is a genuine schema-validation failure (retry, then clean drop),
+// not a silent `None` that flows unvalidated into projection.
+// ------------------------------------------------------------------
+
+/// Pull the real `schema:` JSON off the system-schema's `llm_predicate`
+/// extractor definition, exactly as `materialize_llm_extractor` does —
+/// so this test exercises the actual shipped declaration, not a
+/// hand-rolled stand-in that could drift from it.
+fn system_llm_predicate_schema() -> Value {
+    let schema = brain_protocol::schema::parse_schema(brain_metadata::SYSTEM_SCHEMA_SOURCE)
+        .expect("system schema source parses");
+    for item in &schema.items {
+        if let brain_protocol::schema::SchemaItem::Extractor(ext) = item {
+            if ext.name == "llm_predicate" {
+                for f in &ext.fields {
+                    if let brain_protocol::schema::ExtractorField::Schema(v) = f {
+                        return v.clone();
+                    }
+                }
+                panic!("llm_predicate extractor has no `schema:` field declared");
+            }
+        }
+    }
+    panic!("llm_predicate extractor not found in system schema");
+}
+
+fn build_ext_with_target(
+    client: Arc<dyn LlmClient>,
+    schema: Value,
+    target: ExtractorTarget,
+) -> LlmExtractor {
+    let schema_compiled = LlmExtractor::compile_schema(Some(&schema)).unwrap();
+    LlmExtractor::new(
+        ExtractorId::from(3),
+        "brain:llm_predicate".into(),
+        target,
+        1,
+        0.0,
+        None,
+        Duration::from_secs(60),
+        LlmExtractorInner {
+            client,
+            cache: None,
+            prompt: "ignored in mock".into(),
+            examples: None,
+            response_schema: Some(schema),
+            schema_compiled,
+            pricing: Pricing::for_model("gpt-4o-mini"),
+            max_tokens: 1024,
+            temperature: 0.0,
+            timeout: Duration::from_secs(30),
+        },
+    )
+}
+
+/// Recursively assert every `"type": "object"` node with a `properties`
+/// map satisfies OpenAI's Structured Outputs "strict" mode: every
+/// object must set `additionalProperties: false` and its `required`
+/// array must list every key that appears in `properties` (strict mode
+/// treats all properties as mandatory — optionality is expressed via a
+/// nullable type, not omission from `required`). A schema that violates
+/// this is rejected by the OpenAI API itself with a 400 before the
+/// model ever runs, which defeats the validate → retry → drop pipeline
+/// entirely (the call never completes at all). This guards the exact
+/// regression hit live: `compile_schema` and `jsonschema` accept a
+/// schema missing `additionalProperties: false`, but OpenAI does not.
+fn assert_openai_strict_compatible(node: &Value) {
+    if let Value::Object(map) = node {
+        if map.get("type").and_then(Value::as_str) == Some("object") {
+            if let Some(Value::Object(props)) = map.get("properties") {
+                assert_eq!(
+                    map.get("additionalProperties").and_then(Value::as_bool),
+                    Some(false),
+                    "object node must set additionalProperties: false for OpenAI strict mode: {node}"
+                );
+                let required: std::collections::HashSet<&str> = map
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                for key in props.keys() {
+                    assert!(
+                        required.contains(key.as_str()),
+                        "property {key:?} must be listed in `required` for OpenAI strict mode: {node}"
+                    );
+                }
+            }
+        }
+        for v in map.values() {
+            assert_openai_strict_compatible(v);
+        }
+    } else if let Value::Array(arr) = node {
+        for v in arr {
+            assert_openai_strict_compatible(v);
+        }
+    }
+}
+
+#[test]
+fn system_schema_llm_predicate_schema_is_openai_strict_mode_compatible() {
+    // `OpenAIClient` sends the declared schema straight through as
+    // `response_format = {"type": "json_schema", "json_schema": {"strict":
+    // true, "schema": ...}}` (see `providers/openai.rs`). A schema that
+    // isn't strict-mode-shaped fails the OpenAI request itself, which is
+    // a distinct, earlier failure mode than a schema-validation miss on
+    // our side — catch it here so it can't ship silently again.
+    let schema = system_llm_predicate_schema();
+    assert_openai_strict_compatible(&schema);
+}
+
+#[test]
+fn system_schema_llm_predicate_declares_a_response_schema() {
+    // The core regression this whole test module guards: the shipped
+    // default extractor must declare a schema at all, or
+    // `compile_schema(None)` disables validation entirely and the
+    // retry/drop safety net never engages.
+    let schema = system_llm_predicate_schema();
+    assert!(
+        LlmExtractor::compile_schema(Some(&schema))
+            .unwrap()
+            .is_some(),
+        "declared schema must compile",
+    );
+}
+
+#[test]
+fn system_schema_missing_object_fails_validation_then_retry_recovers() {
+    let schema = system_llm_predicate_schema();
+    // First response: model half-complies, keeps subject+predicate,
+    // silently drops "object" — exactly the failure mode this schema
+    // exists to catch. (OpenAI strict-mode shape: every declared key
+    // present, "object" specifically omitted here to simulate the
+    // real-world half-comply failure this schema guards against.)
+    let bad = r#"{"statements": [
+        {"subject": "Priya", "predicate": "brain:manages", "kind": "Relation",
+         "confidence": 0.9, "object_is_entity": false, "event_at": null,
+         "subject_is_self": false, "retract": false, "is_stateful": false}
+    ]}"#;
+    // Second response (the retry): model corrects itself.
+    let good = r#"{"statements": [
+        {"subject": "Priya", "predicate": "brain:manages", "object": "the billing platform team",
+         "object_is_entity": false, "kind": "Relation", "confidence": 0.9, "event_at": null,
+         "subject_is_self": false, "retract": false, "is_stateful": false}
+    ]}"#;
+    let client = Arc::new(MockClient::new(
+        "gpt-4o-mini",
+        vec![Ok(ok_response(bad, 100)), Ok(ok_response(good, 100))],
+    ));
+    let calls = client.calls.clone();
+    let ext = build_ext_with_target(client, schema, ExtractorTarget::EntityOrStatement);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(
+        &ctx(&reg),
+        &memory("Priya manages the billing platform team at Stripe."),
+    ));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "missing object must trigger exactly one retry call"
+    );
+    assert_eq!(r.status, ExtractionStatus::Success);
+    assert_eq!(r.items.len(), 1);
+    match &r.items[0] {
+        ExtractedItem::StatementMention(m) => {
+            assert_eq!(m.object_text.as_deref(), Some("the billing platform team"));
+        }
+        other => panic!("expected statement mention, got {other:?}"),
+    }
+}
+
+#[test]
+fn system_schema_missing_object_twice_drops_cleanly_never_fabricates() {
+    let schema = system_llm_predicate_schema();
+    // Both the original call and the retry omit "object" — a genuine,
+    // unrecoverable model failure. The extractor must terminate the
+    // extraction as a clean Failure, never synthesize an empty-object
+    // statement mention.
+    let bad = r#"{"statements": [
+        {"subject": "Priya", "predicate": "brain:manages", "kind": "Relation",
+         "confidence": 0.9, "object_is_entity": false, "event_at": null,
+         "subject_is_self": false, "retract": false, "is_stateful": false}
+    ]}"#;
+    let client = Arc::new(MockClient::new(
+        "gpt-4o-mini",
+        vec![Ok(ok_response(bad, 100)), Ok(ok_response(bad, 100))],
+    ));
+    let calls = client.calls.clone();
+    let ext = build_ext_with_target(client, schema, ExtractorTarget::EntityOrStatement);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(
+        &ctx(&reg),
+        &memory("Priya manages the billing platform team at Stripe."),
+    ));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "exactly one retry, no loop"
+    );
+    assert_eq!(r.status, ExtractionStatus::Failure);
+    assert!(
+        r.status_reason.contains("schema validation failed twice"),
+        "status reason should explain the terminal validation failure: {}",
+        r.status_reason
+    );
+    assert!(
+        r.items.is_empty(),
+        "a twice-invalid response must yield zero items, never a fabricated empty-object statement"
+    );
+}

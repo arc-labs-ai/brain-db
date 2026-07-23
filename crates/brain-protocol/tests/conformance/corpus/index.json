@@ -69,13 +69,13 @@
     "name": "req_plan_act_as",
     "opcode": "0x0022",
     "kind": "request",
-    "payload_len": 233
+    "payload_len": 240
   },
   {
     "name": "req_reason_act_as",
     "opcode": "0x0023",
     "kind": "request",
-    "payload_len": 211
+    "payload_len": 218
   },
   {
     "name": "req_entity_create",
@@ -129,7 +129,7 @@
     "name": "req_graph_fetch",
     "opcode": "0x0163",
     "kind": "request",
-    "payload_len": 84
+    "payload_len": 106
   },
   {
     "name": "resp_welcome",
@@ -159,7 +159,7 @@
     "name": "resp_encode_trace",
     "opcode": "0x00A0",
     "kind": "response",
-    "payload_len": 1624
+    "payload_len": 1682
   },
   {
     "name": "resp_recall",
@@ -171,7 +171,7 @@
     "name": "resp_recall_trace",
     "opcode": "0x00A1",
     "kind": "response",
-    "payload_len": 421
+    "payload_len": 690
   },
   {
     "name": "resp_forget",
@@ -261,7 +261,7 @@
     "name": "resp_graph_fetch",
     "opcode": "0x01E3",
     "kind": "response",
-    "payload_len": 270
+    "payload_len": 634
   },
   {
     "name": "resp_plan",
@@ -274,6 +274,18 @@
     "opcode": "0x00A3",
     "kind": "response",
     "payload_len": 182
+  },
+  {
+    "name": "resp_plan_trace",
+    "opcode": "0x00A2",
+    "kind": "response",
+    "payload_len": 606
+  },
+  {
+    "name": "resp_reason_trace",
+    "opcode": "0x00A3",
+    "kind": "response",
+    "payload_len": 990
   },
   {
     "name": "resp_link",

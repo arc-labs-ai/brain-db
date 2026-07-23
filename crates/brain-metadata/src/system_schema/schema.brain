@@ -249,6 +249,7 @@ Output STRICT JSON matching this shape, and nothing else:
 }
 
 Rules:
+- EVERY TRIPLE MUST READ AS A TRUE SENTENCE ON ITS OWN. Before emitting, read "<subject> <predicate> <object>" back: if that is not a true, complete statement, the triple is WRONG — reshape it. A role, title, rank, or capacity attached to a verb ("joined X as a <job title>", "hired as <job title>", "serves as <job title>") is NOT an object of that verb — "<person> joined <job title>" is not a sentence and must never be emitted. Split it into TWO triples and emit BOTH: the verb keeps ONLY the thing it actually acts on, and you MUST ALSO emit the role as its own triple — subject, a role/occupation-shaped predicate, and the title as a VALUE (`object_is_entity: false`). Never emit one subject+predicate pair twice with two objects that mean different kinds of thing; that is the signature of a qualifier you failed to split. Splitting is mandatory: dropping the role is a LOSS of a stated fact, and only the malformed pairing is ever discarded, never the fact itself.
 - Decompose each assertion into a clean (subject, predicate, object). The predicate is the relation; the object is the entity or a short clean value it acts on — NEVER a verb phrase or sentence fragment. "Alice works at Acme" -> predicate "brain:works_at", object "Acme Corp" (NOT "works at Acme").
 - Objects must be ATOMIC. One fact per object: never join multiple things with "and"/"or"/commas. "interested in counseling and mental health" -> emit TWO triples, object "counseling" and object "mental health" (NOT one object "counseling and mental health"). Strip filler words so the object is the bare thing itself ("mental health jobs" -> "mental health"). The object is a single entity name or a bare value — NEVER a clause, description, or sentence fragment. If the object still reads like part of a sentence (it contains a verb, a preposition phrase, or a relative clause), reduce it to the bare thing it names, or drop the triple.
 - Locations are RELATIONS to a place, not prose. When the fact states where an entity is (lives, works, is based) or where an event happened, emit it as a Relation whose object is the place itself, with `object_is_entity: true` (e.g. predicate "brain:lives_in" object "Paris", predicate "brain:located_in" object "Paris") — never bury the place inside a longer value so "where" can be answered as the object of that relation.
@@ -268,5 +269,51 @@ Input text:
 ```
 {TEXT}
 ```"""
+    schema: {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["statements"],
+        "properties": {
+            "statements": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "subject", "predicate", "object", "object_is_entity",
+                        "kind", "confidence", "event_at", "subject_is_self",
+                        "retract", "is_stateful"
+                    ],
+                    "properties": {
+                        "subject": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "The entity this fact is about, as a bare name or possessive phrase — never a clause and never a bare pronoun."
+                        },
+                        "predicate": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "The relation, as brain:<snake_case>. Read 'subject predicate object' back as a sentence: if it is not a true, complete statement, this triple is malformed — reshape it or drop it."
+                        },
+                        "object": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "The single thing the predicate acts on: one entity name or one bare value. Never a clause, a verb phrase, or several things joined by 'and'. A role, title, rank, or capacity stated as a qualifier (as a senior engineer, as CFO) is NOT the object of the main verb — it belongs on its own role-shaped predicate as a value."
+                        },
+                        "object_is_entity": {
+                            "type": "boolean",
+                            "description": "A deliberate choice for every triple; never guessed. true when the object names a thing that could carry its own facts (a person, organization, place, product, concept). false when the object is a literal value — job titles, roles and ranks (senior engineer, staff architect) are values, as are colors, numbers, and free text. When unsure, false."
+                        },
+                        "kind": {"type": ["string", "null"], "minLength": 1},
+                        "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+                        "event_at": {"type": ["string", "null"]},
+                        "subject_is_self": {"type": ["boolean", "null"]},
+                        "retract": {"type": ["boolean", "null"]},
+                        "is_stateful": {"type": ["boolean", "null"]}
+                    }
+                }
+            }
+        }
+    }
     confidence_threshold: 0.7
 }

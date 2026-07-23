@@ -5,6 +5,7 @@
 //! ForgetOutcome that wire handlers use for outcome classification.
 //! Writes are owned by `brain_ops::RealWriterHandle::submit(Write)`.
 
+pub mod analogical;
 pub mod context;
 pub mod error;
 pub mod path;
@@ -19,9 +20,12 @@ pub use path::{execute_path, execute_path_stream};
 pub use reason::{execute_reason, execute_reason_stream};
 pub use recall::execute_recall;
 pub use result::{
-    EncodeResult, EvidenceItem, ForgetResult, InferenceStep, InferenceStream,
+    EncodeResult, EvidenceItem, ForgetResult, InferenceKind, InferenceStep, InferenceStream,
     InferenceStreamTerminal, Path, PathFrame, PathResult, PathStream, PathStreamTerminal,
-    PlanStatus, ReasonResult, ReasonStatus, RecallHit, RecallResult,
+    PlanExecutionMetadata, PlanStatus, PlanTraceDirection, PlanTraceMeetingPoint, PlanTraceNode,
+    ReasonResult, ReasonStatus, ReasonTrace, ReasonTraceBase, ReasonTraceCandidate,
+    ReasonTraceCentroid, ReasonTraceEdgeCandidate, ReasonTraceScoreBreakdown, ReasonTraceTrim,
+    ReasonTraceWalk, RecallHit, RecallResult,
 };
 pub use writer::{
     EdgeOutcome, EncodeOp, EncodeOpEdge, ForgetOp, ForgetOutcome, LinkOp, UnlinkOp, WriterError,

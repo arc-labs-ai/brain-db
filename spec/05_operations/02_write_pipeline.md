@@ -304,21 +304,27 @@ it is observable live on SUBSCRIBE keyed by the write's `lsn`.
 | `reserve` | Allocates the arena slot + mints the version-stamped `MemoryId`. | (id in `detail`) |
 | `persist` | Writes the vector to the arena, **fsyncs the WAL** (the ack barrier), commits the redb metadata row, inserts the memory HNSW point. | the redb `record` (id, kind, salience, created/occurred time, vector dim, text length, lsn) |
 
-**Asynchronous stages** (post-ack; the three first-class `StageKind`s that emit
+**Asynchronous stages** (post-ack; the four first-class `StageKind`s that emit
 `StageCompleted` events):
 
 | Stage | `StageKind` | What it does | Stage output (`artifact`) |
 |---|---|---|---|
 | `auto_edge` | `AutoEdge` | HNSW k-NN of the new vector → `SimilarTo` edges. | edges (in `graph`) |
 | `temporal_edge` | `TemporalEdge` | Session adjacency → `FollowedBy` edges. | edges (in `graph`) |
-| `extractor` | `Extractor` | Three-tier pipeline (pattern → classifier → LLM): entities, statements, relations → the typed graph; statement-text indexing. | the knowledge `graph` (nodes + edges), plus the `keyword_fields` (analyzed text-index terms) and `hype_questions` (write-time hypothetical questions) generated alongside it |
+| `extractor` | `Extractor` | Three-tier pipeline (pattern → classifier → LLM): entities, statements, relations → the typed graph; statement-text indexing. | the knowledge `graph` (nodes + edges), plus the `keyword_fields` (analyzed text-index terms) |
+| `hype` | `Hype` | Write-time HyPE: hypothetical questions generated for the new memory, embedded, and inserted into the memory HNSW index. | `hype_questions` (the generated question text) |
 
-Two derivations run asynchronously but are **not** `StageKind`s (they do not emit
-`StageCompleted`): the `memory_text` tantivy index upsert, and write-time **HyPE**
-question generation (`hype` / per-statement question bridge). Their outputs
-(`keyword_fields`, `hype_questions`) are captured at generation time and attached
-to the trace; note the question *text* is not otherwise persisted (only its
-embedding is), so it is available only through the trace.
+One derivation runs asynchronously but is **not** a `StageKind` (it does not
+emit `StageCompleted`): the `memory_text` tantivy index upsert. Its output
+isn't captured as a stage artifact.
+
+Note the question *text* in `hype_questions` is not otherwise persisted (only
+its embedding is), so it is available only through the trace or
+`MEMORY_INSPECT` (§17d) — the live `StageCompleted` event for `Hype` carries
+only a compact summary (`questions_written`, `cost_micro_usd`), not the text
+itself. See [04. Wire Protocol](../04_wire_protocol/05_frame_layouts.md)
+§32.2 for the wire payload shapes and §17e below for the live-progress
+pattern built on top of them.
 
 #### 17b. The per-stage artifact contract
 
@@ -383,6 +389,41 @@ of a `Timeout` stage in the live trace. The one intentional divergence:
 `record.lsn` is `0` in the durable bundle (the WAL position isn't known at apply
 time), whereas the live trace's `persist` stage carries the real LSN from the
 ack.
+
+#### 17e. The recommended live-progress pattern (`wait: ack` + scoped SUBSCRIBE)
+
+A client wanting genuine per-stage progress on a write — not the batched,
+post-hoc view `wait: derived` gives, and without paying its blocking cost —
+combines two calls instead of leaning on `wait` alone:
+
+1. `ENCODE` with `wait: ack` (the default). The handler returns as soon as
+   the WAL record is durable, with `memory_id` and `lsn` in hand, before any
+   async stage has even started.
+2. Immediately `SUBSCRIBE` with `filter.memory_ids: [that memory_id]` (no
+   other filter dimension is needed — the stream only ever concerns this one
+   write). Each of the four async stages (`auto_edge`, `temporal_edge`,
+   `extractor`, `hype`) publishes its own `StageCompleted` event (§32.2 of
+   [04. Wire Protocol](../04_wire_protocol/05_frame_layouts.md)) onto the
+   same event bus the instant it commits; the client renders each as it
+   arrives instead of waiting for all of them. Because the four stages are
+   independent background workers, they do **not** complete in a fixed
+   order — a client MUST NOT assume `auto_edge` → `temporal_edge` →
+   `extractor` → `hype` sequencing.
+3. The client considers the write's derivation complete once it has received
+   a `StageCompleted` for all four `StageKind`s, or applies its own bounded
+   timeout as a safety cap. A stage that doesn't report within the timeout
+   should be surfaced honestly as "unknown" / "timed out" — never silently
+   marked complete.
+
+If the connection is a shared service-principal pool (one credential, many
+tenants), scope the SUBSCRIBE the same way any other op does: pass `act_as`
+(see [04. Wire Protocol](../04_wire_protocol/04_handshake.md) §10a and
+[05_subscribe.md](05_subscribe.md) §22) naming the effective
+`(namespace, agent_id)` the subscription should observe.
+
+This is a general-purpose pattern, not tied to any particular client — any
+caller that wants live write-pipeline observability without the blocking
+cost of `wait: derived` should use it.
 
 ## FORGET
 

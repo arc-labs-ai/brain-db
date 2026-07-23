@@ -17,6 +17,15 @@
 //!      identity), and a principal WITH the grant that names a namespace
 //!      outside its `may_act` allowlist is likewise rejected.
 //!
+//!   3. **SUBSCRIBE honors the same `act_as` contract.** Unlike every other
+//!      data-plane op, SUBSCRIBE bypasses the normal `run_op_dispatch` /
+//!      `act_as_of` path structurally (it mutates the connection-layer
+//!      `SubscriptionRegistry`, not `brain_ops`). It still runs the exact
+//!      same R1/R2 checks and routes to the effective agent, so a
+//!      shared-pool caller can scope a subscription to a different agent
+//!      it's permitted to `act_as` for — see the `subscribe_act_as_*` tests
+//!      below.
+//!
 //! A single shard (`start(1)`) collocates every identity on shard 0, so what's
 //! under test is the logical effective-identity scoping, not incidental
 //! physical shard separation. The stub dispatcher embeds zero vectors, so
@@ -24,13 +33,17 @@
 
 #![cfg(target_os = "linux")]
 
+use std::time::Duration;
+
 use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
-use brain_protocol::envelope::request::{EncodeRequest, RecallRequest, RequestBody};
+use brain_protocol::envelope::request::{
+    EncodeRequest, RecallRequest, RequestBody, SubscribeRequest, SubscriptionFilter,
+};
 use brain_protocol::envelope::response::{ErrorCodeWire, ResponseBody};
-use brain_protocol::{ActAs, Frame};
+use brain_protocol::{ActAs, EventType, Frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -99,13 +112,26 @@ async fn send_frame(client: &mut TcpStream, frame: Frame) {
     client.flush().await.expect("flush");
 }
 
+/// Read one frame within `within`; `None` on timeout. SUBSCRIBE_EVENT
+/// frames are server-pushed with no synchronous ack, so subscribe tests
+/// can't use `round_trip` — they poll the raw stream instead.
+async fn read_frame_within(client: &mut TcpStream, within: Duration) -> Option<Frame> {
+    tokio::time::timeout(within, read_one_frame(client))
+        .await
+        .ok()
+}
+
 async fn round_trip(
     client: &mut TcpStream,
     stream_id: u32,
     req: RequestBody,
 ) -> (u16, ResponseBody) {
     let opcode = req.opcode().as_u16();
-    send_frame(client, Frame::new(opcode, FLAG_EOS, stream_id, req.encode())).await;
+    send_frame(
+        client,
+        Frame::new(opcode, FLAG_EOS, stream_id, req.encode()),
+    )
+    .await;
     let resp = read_one_frame(client).await;
     let resp_opcode = resp.header.opcode_u16();
     let body = ResponseBody::decode(
@@ -483,6 +509,213 @@ async fn act_as_outside_allowlist_is_denied() {
         allow_duplicates: false,
     };
     let (opcode, body) = round_trip(&mut svc, 1, RequestBody::Encode(req)).await;
+    assert_eq!(
+        opcode,
+        Opcode::Error.as_u16(),
+        "expected an Error frame, got 0x{opcode:04x}: {body:?}"
+    );
+    match body {
+        ResponseBody::Error(e) => assert_eq!(
+            e.code,
+            ErrorCodeWire::ActAsDenied,
+            "expected ActAsDenied, got {:?}: {}",
+            e.code,
+            e.message
+        ),
+        other => panic!("expected Error body, got {other:?}"),
+    }
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// SUBSCRIBE act_as (item 7a)
+// ---------------------------------------------------------------------------
+
+/// Positive: a service-principal connection issues SUBSCRIBE with `act_as`
+/// targeting a DIFFERENT agent it's permitted to `may_act` for, and receives
+/// that agent's events — not its own raw connection identity's. Two
+/// connections authenticated with the SAME shared-pool key: one subscribes
+/// (act_as = target), the other encodes (act_as = the SAME target), proving
+/// the subscription is scoped to the effective identity end-to-end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_act_as_receives_target_agents_events() {
+    let server = start(1).await;
+
+    let svc_agent = *uuid::Uuid::now_v7().as_bytes();
+    let target_agent = [0xF6u8; 16];
+
+    let svc_token = server.mint_with_may_act(
+        "svc",
+        svc_agent,
+        brain_metadata::api_keys::bits::ACT_AS | brain_metadata::api_keys::bits::STANDARD_AGENT,
+        vec!["tenant_sub".to_string()],
+    );
+
+    // Subscriber connection: SUBSCRIBE act_as = the target agent. The
+    // `filter.agents` is checked against the EFFECTIVE agent, so it must
+    // name the target, never the connection's own raw agent.
+    let mut sub = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect sub");
+    handshake_as(&mut sub, &svc_token).await;
+
+    let sub_req = SubscribeRequest {
+        filter: SubscriptionFilter {
+            contexts: None,
+            kinds: None,
+            similar_to: None,
+            agents: Some(vec![target_agent]),
+            memory_ids: None,
+        },
+        include_history: false,
+        from_lsn: None,
+        max_inflight: 100,
+        act_as: Some(act_as("tenant_sub", target_agent)),
+    };
+    send_frame(
+        &mut sub,
+        Frame::new(
+            Opcode::SubscribeReq.as_u16(),
+            FLAG_EOS,
+            1,
+            RequestBody::Subscribe(sub_req).encode(),
+        ),
+    )
+    .await;
+    // A successful SUBSCRIBE sends no synchronous opener frame; give the
+    // registry a moment to register before the writer fires.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Writer connection, same shared-pool key: ENCODE act_as = the SAME
+    // target agent, so the event is published under the effective identity
+    // the subscription is scoped to.
+    let mut writer = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect writer");
+    handshake_as(&mut writer, &svc_token).await;
+    let memory_id = encode_as(
+        &mut writer,
+        1,
+        "act_as-scoped subscribe: real-time delegated event",
+        Some(act_as("tenant_sub", target_agent)),
+    )
+    .await;
+
+    let mut got_event = false;
+    for _ in 0..5 {
+        let Some(frame) = read_frame_within(&mut sub, Duration::from_secs(2)).await else {
+            break;
+        };
+        if frame.header.opcode_u16() == Opcode::Error.as_u16() {
+            let body = ResponseBody::decode(Opcode::Error, &frame.payload).expect("decode");
+            panic!("unexpected Error frame on act_as-scoped subscription: {body:?}");
+        }
+        if frame.header.opcode_u16() == Opcode::SubscribeEvent.as_u16() {
+            let body = ResponseBody::decode(Opcode::SubscribeEvent, &frame.payload)
+                .expect("decode subscribe event");
+            if let ResponseBody::SubscribeEvent(ev) = body {
+                if ev.event_type == EventType::Encoded && ev.memory_id == memory_id {
+                    got_event = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        got_event,
+        "act_as-scoped SUBSCRIBE did not receive the target agent's ENCODE event"
+    );
+
+    server.stop().await;
+}
+
+/// R1: a principal WITHOUT the `ACT_AS` grant that supplies a SUBSCRIBE
+/// `act_as` selector is hard-rejected with `ActAsDenied` — the same code
+/// and the same check `act_as_without_grant_is_denied` proves for ENCODE.
+/// SUBSCRIBE reaches this check from its own structurally-separate dispatch
+/// branch, so this proves the branch didn't silently skip R1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_act_as_without_grant_is_denied() {
+    let server = start(1).await;
+
+    let agent = [0xC4u8; 16];
+    // FULL deliberately excludes ACT_AS.
+    let token = server.mint("plain", agent, brain_metadata::api_keys::bits::FULL);
+
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
+    handshake_as(&mut client, &token).await;
+
+    let req = SubscribeRequest {
+        filter: SubscriptionFilter {
+            contexts: None,
+            kinds: None,
+            similar_to: None,
+            agents: Some(vec![[0xA1u8; 16]]),
+            memory_ids: None,
+        },
+        include_history: false,
+        from_lsn: None,
+        max_inflight: 100,
+        act_as: Some(act_as("tenant_a", [0xA1u8; 16])),
+    };
+    let (opcode, body) = round_trip(&mut client, 1, RequestBody::Subscribe(req)).await;
+    assert_eq!(
+        opcode,
+        Opcode::Error.as_u16(),
+        "expected an Error frame, got 0x{opcode:04x}: {body:?}"
+    );
+    match body {
+        ResponseBody::Error(e) => assert_eq!(
+            e.code,
+            ErrorCodeWire::ActAsDenied,
+            "expected ActAsDenied, got {:?}: {}",
+            e.code,
+            e.message
+        ),
+        other => panic!("expected Error body, got {other:?}"),
+    }
+
+    server.stop().await;
+}
+
+/// R2: a principal WITH the `ACT_AS` grant that names a SUBSCRIBE `act_as`
+/// namespace OUTSIDE its `may_act` allowlist is hard-rejected with
+/// `ActAsDenied` — the same code and the same check
+/// `act_as_outside_allowlist_is_denied` proves for ENCODE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_act_as_outside_allowlist_is_denied() {
+    let server = start(1).await;
+
+    let svc_agent = *uuid::Uuid::now_v7().as_bytes();
+    let svc_token = server.mint_with_may_act(
+        "svc",
+        svc_agent,
+        brain_metadata::api_keys::bits::ACT_AS | brain_metadata::api_keys::bits::STANDARD_AGENT,
+        vec!["tenant_a".to_string()],
+    );
+
+    let mut svc = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect svc");
+    handshake_as(&mut svc, &svc_token).await;
+
+    let req = SubscribeRequest {
+        filter: SubscriptionFilter {
+            contexts: None,
+            kinds: None,
+            similar_to: None,
+            agents: Some(vec![[0x99u8; 16]]),
+            memory_ids: None,
+        },
+        include_history: false,
+        from_lsn: None,
+        max_inflight: 100,
+        act_as: Some(act_as("tenant_x", [0x99u8; 16])),
+    };
+    let (opcode, body) = round_trip(&mut svc, 1, RequestBody::Subscribe(req)).await;
     assert_eq!(
         opcode,
         Opcode::Error.as_u16(),

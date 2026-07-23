@@ -61,7 +61,7 @@ pub use materialize::{
 pub use pattern::{CompiledRegex, PatternExtractor, TemporalExtractor};
 pub use resolver::{
     is_temporal_expression_surface, resolve_or_create, strip_leading_vocative, EntityDisambiguator,
-    LlmCandidateView, MatchVerdict, Resolution, ResolutionTier, ResolverError,
+    LlmCandidateView, MatchVerdict, Resolution, ResolutionTier, ResolverError, StagedEntityVectors,
     DEFAULT_DISAMBIGUATOR_MIN_CONFIDENCE,
 };
 pub use supersede_source::StatementHnswSource;

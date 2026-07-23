@@ -396,30 +396,38 @@ impl OpsContext {
         self
     }
 
-    /// Publish a opaque-body event: WAL-append the CBOR-encoded
-    /// payload (if a sink is wired), then publish to the bus with
-    /// the assigned LSN. The `kind` discriminates the WAL record
-    /// type so subscribe-replay can decode it back into the matching
-    /// `GraphEventPayload` variant.
+    /// Publish a opaque-body notification event: WAL-append the
+    /// CBOR-encoded payload (if a sink is wired), then publish to the
+    /// bus with the assigned LSN. The `kind` discriminates the WAL
+    /// record type so subscribe-replay can decode it back into the
+    /// matching payload variant.
+    ///
+    /// Generic over the payload type so every category of durable,
+    /// subscribe-replayable notification (typed-graph events today,
+    /// `StageCompleted` events as of this method) shares one
+    /// append-then-publish path instead of each growing its own copy.
+    /// There's nothing graph-specific left in the body of this
+    /// function — `P` only needs to be CBOR-serialisable.
     ///
     /// `make_envelope` builds the bus envelope from the assigned LSN.
     /// Most callers will just stamp `lsn` and clone their payload in.
-    pub async fn publish_graph<F>(
+    pub async fn publish_notification<F, P>(
         &self,
         kind: brain_storage::wal::kinds::WalRecordKind,
-        payload: brain_protocol::GraphEventPayload,
+        payload: P,
         agent_id: brain_core::AgentId,
         make_envelope: F,
     ) where
-        F: FnOnce(u64, brain_protocol::GraphEventPayload) -> EventEnvelope,
+        P: serde::Serialize,
+        F: FnOnce(u64, P) -> EventEnvelope,
     {
         debug_assert!(
             kind.has_opaque_body(),
-            "publish_graph expects a opaque-body WalRecordKind, got {kind:?}"
+            "publish_notification expects a opaque-body WalRecordKind, got {kind:?}"
         );
         let lsn = if let Some(sink) = &self.wal_sink {
-            // CBOR-encode the typed-graph event, then frame it in the same
-            // opaque-body envelope every other typed-graph record uses:
+            // CBOR-encode the notification event, then frame it in the same
+            // opaque-body envelope every other opaque-body record uses:
             // `agent_id (16 B) || body`. `WalPayload::decode` strips that
             // 16-byte prefix before handing the body to subscribe-replay's
             // `from_wal_record`, so the prefix is mandatory — without it the
@@ -430,7 +438,7 @@ impl OpsContext {
                 match ciborium::into_writer(&payload, &mut buf) {
                     Ok(()) => buf,
                     Err(e) => {
-                        tracing::warn!(error = %e, "CBOR encode of typed-graph event failed; publishing bus-only");
+                        tracing::warn!(error = %e, "CBOR encode of notification event failed; publishing bus-only");
                         let _ = self.events.publish(make_envelope(0, payload));
                         return;
                     }
@@ -441,7 +449,8 @@ impl OpsContext {
                 lsn: brain_storage::wal::record::Lsn(0),
                 kind,
                 // Mark as a subscribe-replay change-feed event so recovery
-                // skips it — the durable write record carries the state.
+                // skips it — the durable write record (if this notification
+                // has one, as typed-graph events do) carries the state.
                 // Without this flag, recovery would try to rkyv-decode this
                 // CBOR body as a row and fail (kinds collide across the two
                 // record classes).
@@ -456,12 +465,12 @@ impl OpsContext {
                         ?kind,
                         body_len,
                         lsn = lsn.raw(),
-                        "typed-graph event WAL-recorded"
+                        "notification event WAL-recorded"
                     );
                     lsn.raw()
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "typed-graph event WAL append failed; bus-only publish");
+                    tracing::warn!(error = %e, "notification event WAL append failed; bus-only publish");
                     self.events.current_lsn().saturating_add(1)
                 }
             }
@@ -475,6 +484,53 @@ impl OpsContext {
         } else {
             self.events.publish_prestamped(env);
         }
+    }
+
+    /// Publish a `StageCompleted` event durably: WAL-append a
+    /// [`brain_protocol::StageCompletedEventBody`] notification record
+    /// (via [`Self::publish_notification`]) and publish to the bus, so
+    /// a subscriber that registers *after* the stage already finished
+    /// can still recover the event through WAL-tail replay — closing
+    /// the same ack-then-subscribe race that typed-graph events solved
+    /// via [`Self::publish_notification`] already.
+    ///
+    /// Callers (background workers) build the full [`EventEnvelope`]
+    /// themselves — same shape as their current bus-only
+    /// `ctx.ops.events.publish(envelope)` call — and hand it here
+    /// instead. `env.stage_kind` / `env.stage_outcome` /
+    /// `env.stage_payload` MUST all be `Some(_)`; every real stage
+    /// publisher populates all three together (see
+    /// [`EventEnvelope::stage_kind`]'s doc). The `lsn` field is
+    /// overwritten with the assigned LSN before publishing —
+    /// callers don't need to pre-stamp it.
+    pub async fn publish_stage_event(&self, mut env: EventEnvelope) {
+        let (Some(stage_kind), Some(stage_outcome), Some(stage_payload)) =
+            (env.stage_kind, env.stage_outcome, env.stage_payload.clone())
+        else {
+            tracing::warn!(
+                "publish_stage_event: envelope missing stage_kind/stage_outcome/stage_payload; \
+                 publishing bus-only (not durable, replay can't recover this event)"
+            );
+            self.events.publish(env);
+            return;
+        };
+        let body = brain_protocol::StageCompletedEventBody {
+            memory_id: env.memory_id.into(),
+            stage_kind,
+            stage_outcome,
+            stage_payload,
+        };
+        let agent_id = env.agent_id;
+        self.publish_notification(
+            brain_storage::wal::kinds::WalRecordKind::StageCompleted,
+            body,
+            agent_id,
+            move |lsn, _body| {
+                env.lsn = lsn;
+                env
+            },
+        )
+        .await;
     }
 }
 

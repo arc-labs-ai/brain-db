@@ -464,6 +464,42 @@ fn natural_date_nanos(year_s: &str, month: Month, day: u8) -> Option<u64> {
     date_to_unix_nanos(date)
 }
 
+/// True when `surface`, in its entirety, is a calendar date that pins a
+/// specific year — an ISO date, `D Month YYYY`, `Month D, YYYY`,
+/// `Month YYYY`, or a bare 4-digit year. This is the single authority on
+/// "is this whole string a date", shared with the entity-resolution guard
+/// so both agree on what counts as one; it reuses the same recognizers the
+/// extraction pass above runs on free text.
+///
+/// **Whole-surface anchored**: a recognizer's match must cover the trimmed
+/// input end to end. A year merely *embedded* in a name ("Room 2026",
+/// "Project Apollo 1969") therefore is not a date and stays eligible to be
+/// an entity.
+///
+/// Deliberately excludes the year-less `Month D` form and bare month /
+/// weekday names: "May" and "May 8" can plausibly name a person or product,
+/// and the guard's contract is to reject only unambiguous dates.
+#[must_use]
+pub(crate) fn is_full_date_surface(surface: &str) -> bool {
+    let s = surface.trim();
+    if s.is_empty() {
+        return false;
+    }
+    // Most specific first; `any` short-circuits, so "2020-01-15" is claimed
+    // by the ISO recognizer rather than tested against the bare-year one.
+    [&*RE_ISO, &*RE_DMY, &*RE_MDY, &*RE_MY, &*RE_YEAR]
+        .into_iter()
+        .any(|re| matches_whole(re, s))
+}
+
+/// True when `re`'s leftmost match spans all of `s`. The date regexes are
+/// `\b`-delimited, so a leftmost match that starts at 0 and ends at the
+/// input length means the entire surface parsed as that form.
+fn matches_whole(re: &regex::Regex, s: &str) -> bool {
+    re.find(s)
+        .is_some_and(|m| m.start() == 0 && m.end() == s.len())
+}
+
 /// Parse an event-date string to unix-nanos at midnight UTC. Accepts an ISO
 /// `YYYY-MM-DD` date or a bare `YYYY` year. Shared with the LLM tier, which
 /// asks the model for an ISO date (models are reliable at dates, not at raw
@@ -910,6 +946,50 @@ mod tests {
         let items = run("logged 8 Jun 2023", anchor_2024_06_01());
         assert_eq!(items.len(), 1);
         assert_eq!(object_nanos(&items[0]), utc_midnight(2023, 6, 8));
+    }
+
+    #[test]
+    fn full_date_surface_recognizes_year_bearing_forms() {
+        for s in [
+            "2020-01-15",
+            "January 2026",
+            "jan 2026",
+            "Sept. 2026",
+            "January 5, 2026",
+            "January 5 2026",
+            "January 5th, 2026",
+            "5 January 2026",
+            "8 May, 2023",
+            "2026",
+            "  January 2026  ",
+        ] {
+            assert!(is_full_date_surface(s), "{s} should be a full date");
+        }
+    }
+
+    #[test]
+    fn full_date_surface_rejects_partial_and_embedded_forms() {
+        for s in [
+            "",
+            "   ",
+            // No year → deliberately not a full date; could name a referent.
+            "January",
+            "May 8",
+            "Friday",
+            // A year embedded in a longer surface is part of a name.
+            "Room 2026",
+            "Project 2026",
+            "Q1 2026",
+            "2026 Roadmap",
+            "January 2026 retro",
+            "Diego",
+            "Stripe",
+            // Three digits / five digits are not years.
+            "202",
+            "20260",
+        ] {
+            assert!(!is_full_date_surface(s), "{s} should not be a full date");
+        }
     }
 
     #[test]

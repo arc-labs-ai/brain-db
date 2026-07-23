@@ -8,6 +8,7 @@
     123
   ],
   "include_statements": true,
-  "include_memories": false,
+  "include_memories": true,
+  "include_memory_edges": true,
   "include_tombstoned": false
 }

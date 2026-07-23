@@ -550,8 +550,8 @@ mod tests {
     #[test]
     fn recall_response_round_trips_with_trace() {
         use crate::ops::memory::{
-            RecallTrace, RecallTraceFilterChain, RecallTraceRerank, RecallTraceRetriever,
-            RecallTraceRetrieverStatus,
+            RankedItemKindWire, RecallTrace, RecallTraceDroppedId, RecallTraceFilterChain,
+            RecallTraceRerank, RecallTraceRetriever, RecallTraceRetrieverStatus,
         };
         round_trip(ResponseBody::Recall(RecallResponseFrame {
             answer_kind: AnswerKindWire::None,
@@ -567,6 +567,7 @@ mod tests {
                         status_detail: String::new(),
                         latency_ms: 1.5,
                         candidate_count: 12,
+                        candidates: Vec::new(),
                     },
                     RecallTraceRetriever {
                         name: crate::shared::enums::RetrieverNameWire::Graph,
@@ -574,6 +575,7 @@ mod tests {
                         status_detail: "no anchor".into(),
                         latency_ms: 0.0,
                         candidate_count: 0,
+                        candidates: Vec::new(),
                     },
                 ],
                 filter_chain: RecallTraceFilterChain {
@@ -585,13 +587,32 @@ mod tests {
                     after_supersession: 7,
                     after_as_of: 7,
                     after_limit: 5,
+                    dropped_by_type: Vec::new(),
+                    dropped_by_temporal: Vec::new(),
+                    dropped_by_confidence: Vec::new(),
+                    dropped_by_tombstone: Vec::new(),
+                    dropped_by_supersession: vec![RecallTraceDroppedId {
+                        kind: RankedItemKindWire::Statement,
+                        id: sample_memory_id(),
+                    }],
+                    dropped_by_as_of: vec![RecallTraceDroppedId {
+                        kind: RankedItemKindWire::Relation,
+                        id: sample_memory_id(),
+                    }],
+                    dropped_by_limit: vec![RecallTraceDroppedId {
+                        kind: RankedItemKindWire::Memory,
+                        id: sample_memory_id(),
+                    }],
                 },
                 rerank: Some(RecallTraceRerank {
                     applied: true,
                     candidates: 5,
                     latency_ms: 2.25,
+                    before_order: Vec::new(),
+                    after_order: Vec::new(),
                 }),
                 total_latency_ms: 4.75,
+                fusion: None,
             }),
         }));
     }
@@ -616,12 +637,14 @@ mod tests {
                 }],
                 is_final: false,
                 plan_status: None,
+                trace: None,
             }));
         }
         round_trip(ResponseBody::Plan(PlanResponseFrame {
             steps: vec![],
             is_final: true,
             plan_status: Some(PlanStatus::GoalReached),
+            trace: None,
         }));
     }
 
@@ -638,11 +661,13 @@ mod tests {
             }],
             is_final: false,
             reason_status: None,
+            trace: None,
         }));
         round_trip(ResponseBody::Reason(ReasonResponseFrame {
             inferences: vec![],
             is_final: true,
             reason_status: Some(ReasonStatus::Complete),
+            trace: None,
         }));
     }
 

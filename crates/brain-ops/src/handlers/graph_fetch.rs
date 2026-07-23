@@ -24,11 +24,27 @@
 //! server guarantees each node/edge appears in *at least one* page, not that
 //! pages are disjoint — this is what lets the cursor stay a single keyset
 //! position instead of a growing "seen" set.
+//!
+//! ## Memory edges
+//!
+//! `include_memory_edges` adds the stored memory↔memory links (`SimilarTo`,
+//! `FollowedBy`, …). Those hang off *memories*, which sit two hops off the
+//! statement spine: page statements → subject/object entities → mentioning
+//! memories. So the flag requires `include_memories` — that is the layer
+//! that puts memory nodes on the page at all — and is rejected without it.
+//!
+//! An edge may point at a memory that mentions no entity on this page. Rather
+//! than drop it (a lost edge violates completeness) or emit it dangling (the
+//! client cannot render an unknown endpoint), the far memory is emitted as a
+//! node too. That is exactly the completeness-not-disjointness contract: the
+//! node set widens, the client dedups by id. The walk is one hop — far
+//! memories are endpoints, not new seeds — so the page stays bounded.
 
 use std::collections::HashSet;
 
 use brain_core::{
-    EdgeKindRef, EntityId, NodeRef, StatementId, StatementObject, StatementValue, SubjectRef,
+    EdgeKind, EdgeKindRef, EntityId, MemoryId, NodeRef, StatementId, StatementObject,
+    StatementValue, SubjectRef,
 };
 use brain_metadata::entity::ops::entity_get;
 use brain_metadata::relation::types::relation_type_get;
@@ -39,7 +55,9 @@ use brain_metadata::tables::entity_type::ENTITY_TYPES_TABLE;
 use brain_metadata::tables::statement::STATEMENTS_BY_SUBJECT_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_metadata::RowScope;
-use brain_protocol::{GraphEdge, GraphFetchRequest, GraphFetchResponseFrame, GraphNode};
+use brain_protocol::{
+    GraphEdge, GraphEdgeKindWire, GraphFetchRequest, GraphFetchResponseFrame, GraphNode,
+};
 
 use crate::context::OpsContext;
 use crate::error::OpError;
@@ -65,20 +83,29 @@ const MAX_LIMIT: u32 = 500;
 /// on later pages that re-reach it (completeness-not-disjointness).
 const MAX_EDGES_PER_ENTITY: usize = 512;
 
+/// Per-memory cap on builtin memory↔memory edges walked in one page — the
+/// memory-side counterpart of [`MAX_EDGES_PER_ENTITY`], and deliberately the
+/// same number so one hub memory can't outweigh a hub entity. Truncation is
+/// safe for the same reason: a later page that re-reaches the memory emits
+/// the rest.
+const MAX_EDGES_PER_MEMORY: usize = MAX_EDGES_PER_ENTITY;
+
 /// Node kind bytes (mirror `GraphNodeKindWire`).
 const NODE_ENTITY: u8 = 0;
 const NODE_STATEMENT: u8 = 1;
 const NODE_MEMORY: u8 = 2;
 
-/// Edge kind bytes (mirror `GraphEdgeKindWire`).
+/// Edge kind bytes (mirror `GraphEdgeKindWire`). The memory↔memory kinds are
+/// derived from `EdgeKind` via `GraphEdgeKindWire::from`, not spelled here.
 const EDGE_RELATION: u8 = 0;
 const EDGE_FACT: u8 = 1;
 const EDGE_HAS_STATEMENT: u8 = 2;
 const EDGE_MENTIONS: u8 = 3;
 
-const FLAG_STATEMENTS: u8 = 0b001;
-const FLAG_MEMORIES: u8 = 0b010;
-const FLAG_TOMBSTONED: u8 = 0b100;
+const FLAG_STATEMENTS: u8 = 0b0001;
+const FLAG_MEMORIES: u8 = 0b0010;
+const FLAG_TOMBSTONED: u8 = 0b0100;
+const FLAG_MEMORY_EDGES: u8 = 0b1000;
 
 type StmtKey = (u32, [u8; 16], [u8; 16], u8, u32, u8, [u8; 16]);
 
@@ -90,6 +117,14 @@ pub fn handle_graph_fetch(
         return Err(OpError::InvalidRequest(format!(
             "limit must be in 1..={MAX_LIMIT}"
         )));
+    }
+    // Memory edges hang off memory nodes. Without the layer that emits those
+    // nodes there is nothing for the edges to attach to, so reject rather
+    // than silently returning edges the client cannot place.
+    if req.include_memory_edges && !req.include_memories {
+        return Err(OpError::InvalidRequest(
+            "include_memory_edges requires include_memories".into(),
+        ));
     }
 
     let flags = req_flags(&req);
@@ -114,7 +149,15 @@ pub fn handle_graph_fetch(
     let ag = scope.agent_id_bytes;
     // Whole-agent range over the subject-anchored index.
     let lo_key: StmtKey = (ns, ag, [0u8; 16], 0, 0, 0, [0u8; 16]);
-    let hi_key: StmtKey = (ns, ag, [0xffu8; 16], u8::MAX, u32::MAX, u8::MAX, [0xffu8; 16]);
+    let hi_key: StmtKey = (
+        ns,
+        ag,
+        [0xffu8; 16],
+        u8::MAX,
+        u32::MAX,
+        u8::MAX,
+        [0xffu8; 16],
+    );
     let lower = match &after_key {
         // Resume strictly after the last key returned.
         Some(k) => std::ops::Bound::Excluded(*k),
@@ -124,7 +167,11 @@ pub fn handle_graph_fetch(
         .range((lower, std::ops::Bound::Included(hi_key)))
         .map_err(|e| OpError::Internal(format!("statement range: {e}")))?;
 
-    let mut builder = GraphBuilder::new(req.include_statements, req.include_memories);
+    let mut builder = GraphBuilder::new(
+        req.include_statements,
+        req.include_memories,
+        req.include_memory_edges,
+    );
     let mut consumed = 0u32;
     let mut last_key: Option<StmtKey> = None;
     let mut has_more = false;
@@ -207,6 +254,16 @@ pub fn handle_graph_fetch(
         }
     }
 
+    // Builtin memory↔memory edges for every memory the mention walk put on
+    // the page. One hop only: `emit_memory_edges` may add far-endpoint memory
+    // nodes, and those are not themselves walked.
+    if builder.include_memory_edges {
+        let page_memories: Vec<MemoryId> = builder.memories_this_page.clone();
+        for mid in page_memories {
+            builder.emit_memory_edges(&rtxn, mid)?;
+        }
+    }
+
     let next_cursor = if has_more {
         match last_key {
             Some(k) => encode_cursor(flags, &k),
@@ -229,6 +286,7 @@ pub fn handle_graph_fetch(
 struct GraphBuilder {
     include_statements: bool,
     include_memories: bool,
+    include_memory_edges: bool,
     nodes: Vec<GraphNode>,
     edges: Vec<GraphEdge>,
     seen_nodes: HashSet<[u8; 16]>,
@@ -237,19 +295,27 @@ struct GraphBuilder {
     /// relation/mention walk.
     entities_this_page: Vec<EntityId>,
     seen_entity_seeds: HashSet<[u8; 16]>,
+    /// Memories emitted by the mention walk — the seeds for the memory-edge
+    /// walk. Far endpoints pulled in *by* that walk are deliberately not
+    /// added here, so the traversal stays one hop.
+    memories_this_page: Vec<MemoryId>,
+    seen_memory_seeds: HashSet<[u8; 16]>,
 }
 
 impl GraphBuilder {
-    fn new(include_statements: bool, include_memories: bool) -> Self {
+    fn new(include_statements: bool, include_memories: bool, include_memory_edges: bool) -> Self {
         Self {
             include_statements,
             include_memories,
+            include_memory_edges,
             nodes: Vec::new(),
             edges: Vec::new(),
             seen_nodes: HashSet::new(),
             seen_edges: HashSet::new(),
             entities_this_page: Vec::new(),
             seen_entity_seeds: HashSet::new(),
+            memories_this_page: Vec::new(),
+            seen_memory_seeds: HashSet::new(),
         }
     }
 
@@ -271,11 +337,7 @@ impl GraphBuilder {
     }
 
     /// Emit an entity node (deduped) and record it as a walk seed.
-    fn emit_entity(
-        &mut self,
-        rtxn: &redb::ReadTransaction,
-        eid: EntityId,
-    ) -> Result<(), OpError> {
+    fn emit_entity(&mut self, rtxn: &redb::ReadTransaction, eid: EntityId) -> Result<(), OpError> {
         if self.seen_entity_seeds.insert(eid.to_bytes()) {
             self.entities_this_page.push(eid);
         }
@@ -334,7 +396,11 @@ impl GraphBuilder {
                 else {
                     continue;
                 };
-                let (from_id, to_id) = if outgoing { (eid, other_id) } else { (other_id, eid) };
+                let (from_id, to_id) = if outgoing {
+                    (eid, other_id)
+                } else {
+                    (other_id, eid)
+                };
                 walked += 1;
                 // The far endpoint may be an entity we haven't emitted yet.
                 self.emit_entity(rtxn, other_id)?;
@@ -367,21 +433,122 @@ impl GraphBuilder {
                 continue;
             };
             let mem_bytes = mem_id.to_be_bytes();
-            let label = texts
-                .as_ref()
-                .and_then(|t| t.get(&mem_bytes).ok().flatten())
-                .and_then(|g| String::from_utf8(g.value().to_vec()).ok())
-                .map(|s| snippet(&s))
-                .unwrap_or_default();
-            self.emit_node(GraphNode {
-                id: mem_bytes,
-                kind: NODE_MEMORY,
-                label,
-                type_qname: String::new(),
-            });
+            self.emit_memory_node(texts.as_ref(), mem_id);
+            // Only mentioned memories seed the memory-edge walk.
+            if self.seen_memory_seeds.insert(mem_bytes) {
+                self.memories_this_page.push(mem_id);
+            }
             self.emit_edge(mem_bytes, eid.to_bytes(), EDGE_MENTIONS, String::new());
         }
         Ok(())
+    }
+
+    /// Emit a memory node (deduped), labelled with a snippet of its stored
+    /// text when the `texts` table is readable.
+    fn emit_memory_node(&mut self, texts: Option<&MemoryTexts>, mem_id: MemoryId) {
+        let mem_bytes = mem_id.to_be_bytes();
+        if self.seen_nodes.contains(&mem_bytes) {
+            return;
+        }
+        let label = texts
+            .and_then(|t| t.get(&mem_bytes).ok().flatten())
+            .and_then(|g| String::from_utf8(g.value().to_vec()).ok())
+            .map(|s| snippet(&s))
+            .unwrap_or_default();
+        self.emit_node(GraphNode {
+            id: mem_bytes,
+            kind: NODE_MEMORY,
+            label,
+            type_qname: String::new(),
+        });
+    }
+
+    /// Emit the stored memory↔memory edges incident to `mem_id` (both
+    /// directions), plus the far-endpoint memory node for each so no edge
+    /// dangles. Symmetric kinds are canonicalised to one direction per pair —
+    /// the edge table stores those twice by design, and emitting both rows
+    /// would render as a spurious bidirectional pair. Bounded by
+    /// [`MAX_EDGES_PER_MEMORY`].
+    fn emit_memory_edges(
+        &mut self,
+        rtxn: &redb::ReadTransaction,
+        mem_id: MemoryId,
+    ) -> Result<(), OpError> {
+        let texts = rtxn.open_table(TEXTS_TABLE).ok();
+        let mut walked = 0usize;
+        for outgoing in [true, false] {
+            let rows = if outgoing {
+                walk_outgoing(rtxn, NodeRef::Memory(mem_id), None)
+            } else {
+                walk_incoming(rtxn, NodeRef::Memory(mem_id), None)
+            }
+            .map_err(|e| OpError::Internal(format!("walk memory edges: {e}")))?;
+            for (kind, other, _disamb, _data) in rows {
+                if walked >= MAX_EDGES_PER_MEMORY {
+                    return Ok(());
+                }
+                // Builtin kinds are memory↔memory by construction; Mentions
+                // and Typed rows on this anchor belong to other layers.
+                let EdgeKindRef::Builtin(edge_kind) = kind else {
+                    continue;
+                };
+                let NodeRef::Memory(other_id) = other else {
+                    continue;
+                };
+                let (from, to) = memory_edge_endpoints(edge_kind, mem_id, other_id, outgoing);
+                walked += 1;
+                self.emit_memory_node(texts.as_ref(), other_id);
+                self.emit_edge(
+                    from.to_be_bytes(),
+                    to.to_be_bytes(),
+                    GraphEdgeKindWire::from(edge_kind) as u8,
+                    builtin_edge_label(edge_kind).to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The `texts` table as opened for label lookups.
+type MemoryTexts = redb::ReadOnlyTable<[u8; 16], &'static [u8]>;
+
+/// Orient one memory edge for the wire. Asymmetric kinds keep the stored
+/// direction; symmetric kinds (`SimilarTo`, `Contradicts`) are collapsed onto
+/// a single id-ordered representative so the pair yields one edge regardless
+/// of which endpoint the page reached first.
+fn memory_edge_endpoints(
+    kind: EdgeKind,
+    anchor: MemoryId,
+    other: MemoryId,
+    outgoing: bool,
+) -> (MemoryId, MemoryId) {
+    if kind.is_symmetric() {
+        if anchor.to_be_bytes() <= other.to_be_bytes() {
+            (anchor, other)
+        } else {
+            (other, anchor)
+        }
+    } else if outgoing {
+        (anchor, other)
+    } else {
+        (other, anchor)
+    }
+}
+
+/// Human-facing label for a builtin memory edge. The `kind` byte is already
+/// authoritative; the label spares a generic renderer a mapping table, the
+/// same way `Relation` / `Fact` edges carry their predicate name.
+fn builtin_edge_label(kind: EdgeKind) -> &'static str {
+    match kind {
+        EdgeKind::Caused => "caused",
+        EdgeKind::FollowedBy => "followed_by",
+        EdgeKind::DerivedFrom => "derived_from",
+        EdgeKind::SimilarTo => "similar_to",
+        EdgeKind::Contradicts => "contradicts",
+        EdgeKind::Supports => "supports",
+        EdgeKind::References => "references",
+        EdgeKind::PartOf => "part_of",
     }
 }
 
@@ -412,6 +579,7 @@ fn req_flags(req: &GraphFetchRequest) -> u8 {
     (u8::from(req.include_statements) * FLAG_STATEMENTS)
         | (u8::from(req.include_memories) * FLAG_MEMORIES)
         | (u8::from(req.include_tombstoned) * FLAG_TOMBSTONED)
+        | (u8::from(req.include_memory_edges) * FLAG_MEMORY_EDGES)
 }
 
 fn key_to_bytes(k: &StmtKey) -> [u8; STMT_KEY_LEN] {
@@ -466,15 +634,7 @@ mod tests {
     use brain_protocol::GraphFetchRequest;
 
     fn key() -> StmtKey {
-        (
-            7,
-            [1u8; 16],
-            [0xABu8; 16],
-            3,
-            0x00C0_FFEE,
-            1,
-            [0x42u8; 16],
-        )
+        (7, [1u8; 16], [0xABu8; 16], 3, 0x00C0_FFEE, 1, [0x42u8; 16])
     }
 
     #[test]
@@ -517,6 +677,7 @@ mod tests {
             cursor: Vec::new(),
             include_statements: false,
             include_memories: false,
+            include_memory_edges: false,
             include_tombstoned: false,
             act_as: None,
         };
@@ -532,11 +693,86 @@ mod tests {
             req_flags(&GraphFetchRequest {
                 include_memories: true,
                 include_tombstoned: true,
-                ..base
+                ..base.clone()
             }),
             FLAG_MEMORIES | FLAG_TOMBSTONED
         );
+        assert_eq!(
+            req_flags(&GraphFetchRequest {
+                include_memories: true,
+                include_memory_edges: true,
+                ..base
+            }),
+            FLAG_MEMORIES | FLAG_MEMORY_EDGES
+        );
     }
+
+    /// Toggling the memory-edge layer mid-scroll must invalidate the cursor
+    /// for the same reason the other layers do: the resumed page would
+    /// belong to a differently-shaped export.
+    #[test]
+    fn cursor_rejects_memory_edge_toggle_mid_scroll() {
+        let with = FLAG_MEMORIES | FLAG_MEMORY_EDGES;
+        let cur = encode_cursor(with, &key());
+        assert_eq!(decode_cursor(&cur, with).unwrap(), key());
+        assert!(decode_cursor(&cur, FLAG_MEMORIES).is_err());
+
+        let without = encode_cursor(FLAG_MEMORIES, &key());
+        assert!(decode_cursor(&without, with).is_err());
+    }
+
+    /// Every builtin kind must map to its own wire byte, and none may
+    /// collide with the four typed-graph edge bytes emitted by the same
+    /// export. Without this a client could not tell `SimilarTo` from
+    /// `FollowedBy` — the whole point of the layer.
+    #[test]
+    fn builtin_edge_kinds_have_distinct_non_colliding_wire_bytes() {
+        let mut seen = std::collections::HashSet::new();
+        for k in ALL_EDGE_KINDS {
+            let byte = GraphEdgeKindWire::from(k) as u8;
+            assert!(seen.insert(byte), "{k:?} duplicate wire byte {byte}");
+            assert!(
+                ![EDGE_RELATION, EDGE_FACT, EDGE_HAS_STATEMENT, EDGE_MENTIONS].contains(&byte),
+                "{k:?} collides with a typed-graph edge byte"
+            );
+            assert!(!builtin_edge_label(k).is_empty());
+        }
+        assert_eq!(seen.len(), 8);
+    }
+
+    /// Symmetric kinds collapse onto one id-ordered representative, so the
+    /// pair yields a single edge whichever endpoint the page reached first.
+    /// Asymmetric kinds keep the stored direction.
+    #[test]
+    fn memory_edge_endpoints_canonicalise_only_symmetric_kinds() {
+        let lo = MemoryId::pack(0, 1, 1);
+        let hi = MemoryId::pack(0, 2, 1);
+        assert!(lo.to_be_bytes() < hi.to_be_bytes());
+
+        for k in [EdgeKind::SimilarTo, EdgeKind::Contradicts] {
+            assert_eq!(memory_edge_endpoints(k, lo, hi, true), (lo, hi));
+            assert_eq!(memory_edge_endpoints(k, lo, hi, false), (lo, hi));
+            assert_eq!(memory_edge_endpoints(k, hi, lo, true), (lo, hi));
+            assert_eq!(memory_edge_endpoints(k, hi, lo, false), (lo, hi));
+        }
+        for k in ALL_EDGE_KINDS.into_iter().filter(|k| !k.is_symmetric()) {
+            // Anchor is the source when the row came from the forward table,
+            // the target when it came from the reverse one.
+            assert_eq!(memory_edge_endpoints(k, hi, lo, true), (hi, lo));
+            assert_eq!(memory_edge_endpoints(k, hi, lo, false), (lo, hi));
+        }
+    }
+
+    const ALL_EDGE_KINDS: [EdgeKind; 8] = [
+        EdgeKind::Caused,
+        EdgeKind::FollowedBy,
+        EdgeKind::DerivedFrom,
+        EdgeKind::SimilarTo,
+        EdgeKind::Contradicts,
+        EdgeKind::Supports,
+        EdgeKind::References,
+        EdgeKind::PartOf,
+    ];
 
     #[test]
     fn snippet_truncates_long_text() {

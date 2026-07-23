@@ -220,7 +220,8 @@
                 ],
                 "predicate": "org:works_on",
                 "kind": "statement",
-                "confidence": 0.9
+                "confidence": 0.9,
+                "event_at_unix_nanos": 1767225600000000000
               }
             ]
           }
@@ -281,7 +282,8 @@
           "subject_name": "niraj",
           "predicate": "org:works_on",
           "object_name": "brain",
-          "confidence": 0.9
+          "confidence": 0.9,
+          "event_at_unix_nanos": 1767225600000000000
         }
       ],
       "relations": [

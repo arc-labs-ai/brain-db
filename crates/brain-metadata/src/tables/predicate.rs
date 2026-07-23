@@ -114,6 +114,8 @@ impl SchemaOrigin {
 /// 1). `object_type_constraint_byte`: `0` means "any object type", else
 /// `1=Entity / 2=Value / 3=Memory / 4=Statement` (matches
 /// `StatementObject::discriminant()` offset by 1).
+/// `object_entity_type_id` narrows the `Entity` case to one declared
+/// entity type (`object: Entity<Person>`); `0` means any entity type.
 ///
 /// `origin_tag` + `origin_payload` encode the [`SchemaOrigin`].
 /// Implicit-from-write rows are how Brain supports open-vocabulary
@@ -126,6 +128,9 @@ pub struct PredicateDefinition {
     pub name: String,
     pub kind_constraint: u8,
     pub object_type_constraint_byte: u8,
+    /// Declared entity type of the object when
+    /// `object_type_constraint_byte == 1`. `0` = any entity type.
+    pub object_entity_type_id: u32,
     pub schema_version: u32,
     pub description: String,
     pub created_at_unix_nanos: u64,
@@ -168,6 +173,7 @@ impl PredicateDefinition {
             name: p.name.clone(),
             kind_constraint: encode_kind_constraint(p.kind_constraint),
             object_type_constraint_byte: p.object_type_constraint_byte,
+            object_entity_type_id: p.object_entity_type_id,
             schema_version: p.schema_version,
             description: p.description.clone(),
             created_at_unix_nanos,
@@ -192,6 +198,7 @@ impl PredicateDefinition {
             name: self.name.clone(),
             kind_constraint: decode_kind_constraint(self.kind_constraint),
             object_type_constraint_byte: self.object_type_constraint_byte,
+            object_entity_type_id: self.object_entity_type_id,
             schema_version: self.schema_version,
             description: self.description.clone(),
             is_stateful: self.is_stateful,
@@ -249,6 +256,7 @@ mod tests {
             name: "reports_to".into(),
             kind_constraint: Some(StatementKind::Fact),
             object_type_constraint_byte: 1,
+            object_entity_type_id: 5,
             schema_version: 3,
             description: "Reports-to relation".into(),
             is_stateful: false,

@@ -29,8 +29,9 @@ use brain_planner::retrieval::router::{
 };
 use brain_protocol::envelope::request::{MemoryKindWire, RecallRequest};
 use brain_protocol::envelope::response::{
-    AnswerKindWire, MemoryResult, RecallResponseFrame, RecallTrace, RecallTraceFilterChain,
-    RecallTraceRerank, RecallTraceRetriever, RecallTraceRetrieverStatus,
+    AnswerKindWire, MemoryResult, RankedItemKindWire, RecallResponseFrame, RecallTrace,
+    RecallTraceCandidate, RecallTraceDroppedId, RecallTraceFilterChain, RecallTraceFusion,
+    RecallTraceFusionItem, RecallTraceRerank, RecallTraceRetriever, RecallTraceRetrieverStatus,
 };
 use brain_protocol::RetrieverNameWire;
 
@@ -187,7 +188,7 @@ pub async fn handle_recall(
     // committed value leads, episodic retained below), else it follows the set's
     // cardinality: 0 → None, 1 → Single, N → Many. There is no caller-supplied
     // count anywhere in this path.
-    let (membership, committed_shape, max_support) = build_membership(
+    let (membership, committed_shape, any_belongs) = build_membership(
         memories,
         &grounded,
         &req,
@@ -207,19 +208,22 @@ pub async fn handle_recall(
     let membership = if req.txn_id.is_some() {
         membership
     } else {
-        // Both gates now key on the ONE corroboration signal ([`support`]): they
-        // abstain (empty → None) only when NO surviving member has any cross-lane
-        // support (`max_support == 0`) and the grounded layer produced no answer.
-        // When any member is supported — even by a single lane — the facts ship
-        // (never an empty answer over real support). This is FIX C: it stops the
-        // over-abstention that dropped answerable questions, while still letting a
-        // genuinely unsupported adversarial cue fall to None. The two gates keep
-        // their distinct anchor-state preconditions so each only acts in its own
-        // domain (no-anchor vs subject-resolved).
+        // Both gates key on `any_belongs`: at least one surviving member carries a
+        // belonging signal BEYOND the raw passage cosine (strong HyPE / lexical /
+        // graph / grounded). They abstain (empty → None) only when NO member does
+        // and the grounded layer produced no answer. A lone semantic-cosine
+        // member never blocks abstention — under BGE compression a nonsense cue
+        // reaches the same low-0.6 cosine as a weak-but-real hit, so passage
+        // magnitude alone can't tell them apart; corroboration across an
+        // independent lane can. This keeps genuinely answerable cues (which
+        // corroborate across lanes, or match the HyPE question-bridge) while
+        // letting an unsupported adversarial/nonsense cue fall to None. The two
+        // gates keep their distinct anchor-state preconditions so each only acts
+        // in its own domain (no-anchor vs subject-resolved).
         // 1. No subject resolved at all.
-        let membership = apply_anchor_abstention(membership, anchor, &grounded, max_support);
+        let membership = apply_anchor_abstention(membership, anchor, &grounded, any_belongs);
         // 2. Subject resolved but no fact of the matching KIND/role for it.
-        apply_kind_presence_abstention(membership, anchor, &grounded, max_support)
+        apply_kind_presence_abstention(membership, anchor, &grounded, any_belongs)
     };
 
     Ok(recall_frame(membership, committed_shape, trace))
@@ -227,26 +231,27 @@ pub async fn handle_recall(
 
 /// Honest abstention by structural anchor — unconditional, no flag/knob (FIX C).
 /// This gate owns the NO-ANCHOR case: the cue resolved no subject entity and the
-/// grounded layer produced no answer. It drops to an empty (None) answer only
-/// when NO surviving member has any cross-lane support (`max_support == 0`) — the
-/// unifying [`support`] signal. When any member is supported (even by a single
-/// lane) the facts ship: the read never emits an empty answer over real support.
-/// Substrate-safe by construction: a stored subject's own memory is confirmed by
-/// at least one lane, so its support is ≥ 1 and this never fires; it triggers
-/// only when the cue's answer is nowhere in the store.
+/// grounded layer produced no answer. It drops to an empty (None) answer when NO
+/// surviving member belongs (`!any_belongs`) — i.e. no member carries a belonging
+/// signal beyond the raw passage cosine (strong HyPE / lexical / graph /
+/// grounded). When some member does, the facts ship: the read never emits an
+/// empty answer over corroborated belonging. Substrate-safe: a stored subject's
+/// own memory is confirmed by a real lane (lexical/graph/grounded), so it belongs
+/// and this never fires; it triggers only when the cue's answer is nowhere in the
+/// store and only a lone passage-cosine echo remains.
 fn apply_anchor_abstention(
     members: Vec<MemoryResult>,
     anchor: Option<EntityId>,
     grounded: &GroundedOutcome,
-    max_support: u8,
+    any_belongs: bool,
 ) -> Vec<MemoryResult> {
     if anchor.is_some() || matches!(grounded, GroundedOutcome::Answer(..)) {
         return members;
     }
-    if max_support == 0 {
-        Vec::new()
-    } else {
+    if any_belongs {
         members
+    } else {
+        Vec::new()
     }
 }
 
@@ -260,14 +265,14 @@ fn apply_anchor_abstention(
 ///   * wrong-kind — the subject has facts, but none of the kind the cue asks
 ///     for, so its own memories don't actually answer the question.
 ///
-/// Keyed on the ONE corroboration signal ([`support`]): the set is KEPT whenever
-/// some surviving member has any cross-lane support (`max_support > 0`), and
-/// ABSTAINS (→ `None`) only when NO member is supported at all. A truly
-/// adversarial cue — a resolved subject whose only surfaced memories are
-/// off-cue buried facts (no semantic band, no lexical/graph lane, no grounded
-/// source, no HyPE answer-lead) — has `max_support == 0` and abstains; a real
-/// episodic answer grounded simply hadn't extracted lands in some lane, so it is
-/// supported and kept.
+/// Keyed on `any_belongs`: the set is KEPT whenever some surviving member carries
+/// a belonging signal beyond the raw passage cosine (strong HyPE / lexical /
+/// graph / grounded), and ABSTAINS (→ `None`) only when none does. A truly
+/// adversarial cue — a resolved subject whose only surfaced memories are off-cue
+/// buried facts (no lexical/graph lane, no grounded source, no strong HyPE, only
+/// a lone passage cosine) — does not belong and abstains; a real episodic answer
+/// grounded simply hadn't extracted lands in some independent lane, so it belongs
+/// and is kept.
 ///
 /// Never fires when the grounded layer DID answer (the typed graph has the
 /// fact) or when no subject resolved (that is [`apply_anchor_abstention`]'s
@@ -276,16 +281,16 @@ fn apply_kind_presence_abstention(
     members: Vec<MemoryResult>,
     anchor: Option<EntityId>,
     grounded: &GroundedOutcome,
-    max_support: u8,
+    any_belongs: bool,
 ) -> Vec<MemoryResult> {
     // Only the "subject resolved, but no matching-kind fact" case is ours.
     if anchor.is_none() || matches!(grounded, GroundedOutcome::Answer(..)) {
         return members;
     }
-    if max_support == 0 {
-        Vec::new()
-    } else {
+    if any_belongs {
         members
+    } else {
+        Vec::new()
     }
 }
 
@@ -334,14 +339,6 @@ fn consensus_collapse(
     out
 }
 
-/// The HyPE answer-lead a memory must clear to count as an independent
-/// supporting lane in [`support`]. This is the loose "does this memory answer
-/// the cue at all" bar (the same 0.5 the grounded overlay uses as its match
-/// floor), NOT a strong lead — support is a COUNT of corroborating lanes, so
-/// each lane's own bar is deliberately loose: corroboration comes from AGREEMENT
-/// across lanes, never from any one lane being strong.
-const ANSWER_LEAD_FLOOR: f32 = 0.5;
-
 /// The support count at which a memory is CROSS-LANE CORROBORATED — two or more
 /// independent lanes agree it belongs to the cue. This is the single
 /// corroboration gate the grounded commit (FIX B) requires before a value may
@@ -349,35 +346,71 @@ const ANSWER_LEAD_FLOOR: f32 = 0.5;
 /// (semantic / lexical / graph / HyPE) must confirm it.
 const SUPPORT_CORROBORATED: u8 = 2;
 
+/// Belonging-cosine floor at which the SEMANTIC lane counts as corroborating
+/// [`support`] — deliberately far above the membership band's `MEMBERSHIP_ABS_FLOOR`
+/// (0.20). The band floor is a junk cutoff for RECALL (which passages to keep);
+/// this is a PRECISION cutoff for ABSTENTION (which passages actually *confirm*
+/// belonging). They must differ because BGE-small cosines are compressed: an
+/// off-topic cue scores ~0.45 against everything, clearing the recall floor but
+/// confirming nothing. Set at the grounded strong-match sibling (`0.6`) so a
+/// nonsense cue's ~0.45 top no longer counts as support (→ `None`) while a real
+/// cue's strong top (or its HyPE / lexical / graph lane) still does. Calibrated
+/// against the read fixtures; NOT independently tuned per corpus (see the
+/// full-eval follow-up).
+const STRONG_SEMANTIC_SUPPORT: f32 = 0.6;
+
+/// HyPE answer-lead floor at which the HyPE lane counts as corroborating
+/// [`support`]. HyPE cosine is cue↔hypothetical-question and suffers the same BGE
+/// compression as the passage lane: an off-topic cue still matches *some*
+/// generated question at ~0.5, so — once the semantic lane was strong-gated —
+/// a loose HyPE match was the remaining signal keeping the abstention gate from
+/// ever reaching `None`. Only a genuinely strong lead now CORROBORATES (blocks
+/// abstention / feeds a grounded commit). This refines the original "every lane's
+/// bar is loose; trust agreement across lanes" design for the COSINE lanes only:
+/// under BGE compression a loose cosine lane is not real evidence, whereas the
+/// discrete lanes (lexical / graph / grounded) still corroborate at their natural
+/// bar. Answer-relevance ORDERING is unaffected — it sorts by raw HyPE score with
+/// no floor. Same value as the semantic bar (one compressed-cosine problem);
+/// calibrated against the read fixtures, full-eval sweep is the follow-up.
+const STRONG_HYPE_SUPPORT: f32 = 0.6;
+
 /// Count the INDEPENDENT lanes that confirm a memory belongs to the cue — the
 /// ONE unifying corroboration signal the read path keys its belonging decisions
 /// on (FIX A/B/C). Each lane is a distinct, independently-computed source of
 /// evidence, so a memory two of them agree on is corroborated in a way no single
 /// lane (however strong) can be:
-///   * semantic — inside the verified-semantic band (`in_semantic_set`), or a
-///     Semantic fan-out lane;
+///   * semantic — a STRONG semantic match (`strong_semantic`): the belonging
+///     cosine clears `STRONG_SEMANTIC_SUPPORT`, NOT merely the membership band's
+///     junk floor. This is deliberate. The old rule counted any band member or
+///     any Semantic fan-out lane, both true above the 0.20 floor — but BGE-small
+///     cosines are compressed, so an off-topic cue still scores ~0.45 against
+///     everything and would count as "supported", defeating the abstention gate
+///     (a nonsense cue could never fall to `None`). Requiring a strong cosine
+///     makes the semantic lane a real belonging signal; genuinely answerable
+///     paraphrase cues that sit below the strong bar are caught by the HyPE
+///     answer-lead / lexical / graph lanes below, which are unchanged.
 ///   * lexical  — a Lexical fan-out lane (keyword / paraphrase surface match);
 ///   * graph    — a Graph fan-out lane (reached by the entity-graph walk);
 ///   * grounded — the memory is a source of the grounded typed-graph answer;
-///   * HyPE     — its write-time hypothetical question answers the cue
-///     (`hype >= ANSWER_LEAD_FLOOR`).
+///   * HyPE     — its write-time hypothetical question answers the cue with a
+///     STRONG lead (`hype >= STRONG_HYPE_SUPPORT`), for the same reason.
 ///
 /// `lanes` MUST be the REAL fan-out contributions, not the synthetic `Graph`
 /// lane that structured / anchor-direct hydration stamps on a row it fabricated
 /// — otherwise the graph lane would double-count the grounded signal. The caller
 /// (`build_membership`) passes `by_id`'s real lanes and leaves `lanes` empty for
 /// a hydrate-only row, so such a row is supported only by its grounded / HyPE /
-/// semantic-band signals. Pure: unit-testable.
+/// strong-semantic signals. Pure: unit-testable.
 fn support(
     id: u128,
     lanes: &[RetrieverNameWire],
-    in_semantic_set: bool,
+    strong_semantic: bool,
     grounded_sources: &HashSet<u128>,
     hype: &HashMap<u128, f32>,
 ) -> u8 {
     let has = |want: RetrieverNameWire| lanes.contains(&want);
     let mut n = 0u8;
-    if in_semantic_set || has(RetrieverNameWire::Semantic) {
+    if strong_semantic {
         n += 1;
     }
     if has(RetrieverNameWire::Lexical) {
@@ -389,7 +422,7 @@ fn support(
     if grounded_sources.contains(&id) {
         n += 1;
     }
-    if hype.get(&id).copied().unwrap_or(0.0) >= ANSWER_LEAD_FLOOR {
+    if hype.get(&id).copied().unwrap_or(0.0) >= STRONG_HYPE_SUPPORT {
         n += 1;
     }
     n
@@ -627,9 +660,11 @@ fn apply_grounded_commit(
 ///   5. ABSTENTION (FIX C, applied by the caller): abstain only when the max
 ///      support across members is 0 — hence this returns that scalar.
 ///
-/// Returns `(members, committed_shape, max_support)`: `committed_shape` is `Some`
-/// only when a grounded commit fired; `max_support` is the maximum [`support`]
-/// count across the returned members, which the caller's abstention gates key on.
+/// Returns `(members, committed_shape, any_belongs)`: `committed_shape` is `Some`
+/// only when a grounded commit fired; `any_belongs` is true when at least one
+/// returned member carries a non-passage-cosine belonging signal (strong HyPE,
+/// lexical, graph, or grounded) — the corroboration the caller's abstention gates
+/// key on. A lone semantic-cosine member does NOT set it.
 #[allow(clippy::too_many_arguments)]
 fn build_membership(
     ranked: Vec<MemoryResult>,
@@ -640,7 +675,7 @@ fn build_membership(
     anchor: Option<EntityId>,
     client_requested_count: bool,
     hype_scores: &HashMap<u128, f32>,
-) -> (Vec<MemoryResult>, Option<AnswerKindWire>, u8) {
+) -> (Vec<MemoryResult>, Option<AnswerKindWire>, bool) {
     // Membership = candidates within the query-relative cosine band of the best
     // match. Recall-safe; shape-loose on dense single-subject corpora and cannot
     // abstain (BGE cosines too compressed). A reliable belonging/abstention
@@ -834,13 +869,15 @@ fn build_membership(
             .get(&id)
             .map(|b| b.contributing_retrievers.as_slice())
             .unwrap_or(&[]);
-        support(
-            id,
-            lanes,
-            verified_sem_ids.contains(&id),
-            grounded_sources,
-            hype_scores,
-        )
+        // Semantic counts as SUPPORT only when the belonging cosine is genuinely
+        // strong — not merely inside the recall band. `verified_sem_ids` admits
+        // anything above the 0.20 junk floor, which BGE compression makes true
+        // even for an off-topic cue; gating on `STRONG_SEMANTIC_SUPPORT` here is
+        // what lets the abstention gate reach `None`. Membership (recall) is
+        // untouched: the member still belongs; it just doesn't *corroborate*.
+        let strong_semantic = verified_sem_ids.contains(&id)
+            && cos_by_id.get(&id).copied().unwrap_or(0.0) >= STRONG_SEMANTIC_SUPPORT;
+        support(id, lanes, strong_semantic, grounded_sources, hype_scores)
     };
 
     // ── LEAD + ORDER (grounded commit, then answer-relevance) ───────────────
@@ -911,13 +948,32 @@ fn build_membership(
     // FIX C: the caller abstains only when NO returned member has any cross-lane
     // support. Compute the max support over the FINAL member set with the same
     // corroboration seam the commit used (real fan-out lanes, not synthetic).
-    let max_support = out
-        .iter()
-        .map(|m| support_of(m.memory_id))
-        .max()
-        .unwrap_or(0);
+    // Belonging for the abstention decision: a member belongs to the cue only
+    // when it carries evidence BEYOND the raw passage cosine. Under BGE-small
+    // compression an off-topic / nonsense cue still passage-cosines a doc into
+    // the low 0.6s — indistinguishable by magnitude from a genuinely weak-but-
+    // real hit — so a LONE semantic lane cannot establish belonging no matter how
+    // strong it looks. A non-passage signal must corroborate: a strong HyPE
+    // answer-lead (the write-time question bridge), an ORIGINAL-query lexical hit
+    // (the query's own terms matched — PRF echoes were already stripped from
+    // `contributing_retrievers`), a graph hit, or a grounded typed-graph fact.
+    // This is the structural discriminator the data shows (real cues corroborate
+    // across independent lanes; nonsense gets one lone cosine), and it needs no
+    // corpus-specific cosine bar.
+    let belongs_of = |id: u128| -> bool {
+        let lanes: &[RetrieverNameWire] = by_id
+            .get(&id)
+            .map(|b| b.contributing_retrievers.as_slice())
+            .unwrap_or(&[]);
+        let strong_hype = hype_scores.get(&id).copied().unwrap_or(0.0) >= STRONG_HYPE_SUPPORT;
+        strong_hype
+            || lanes.contains(&RetrieverNameWire::Lexical)
+            || lanes.contains(&RetrieverNameWire::Graph)
+            || grounded_sources.contains(&id)
+    };
+    let any_belongs = out.iter().any(|m| belongs_of(m.memory_id));
 
-    (out, committed_shape, max_support)
+    (out, committed_shape, any_belongs)
 }
 
 /// Runaway guard on the anchor-direct EXACT pull (entity→statements +
@@ -1800,7 +1856,11 @@ async fn retrieve_memories(
     // its SOURCE memory (the projector maps `Statement` items back through
     // evidence). The flooding risk was only ever the subject-anchored graph
     // walk, never these cue-conditioned statement lanes.
-    let mut result = retrieval_execute(&plan, &planner_req, true, &exec_ctx)
+    // `trace_detail` mirrors `req.trace` exactly: `trace: true` is the one
+    // opt-in knob for full per-stage observability, so the caller that asked
+    // for a `RecallTrace` at all is the same caller who wants the per-item
+    // detail inside it. The fast (untraced) default pays nothing extra.
+    let mut result = retrieval_execute(&plan, &planner_req, true, req.trace, &exec_ctx)
         .await
         .map_err(map_execution_error)?;
 
@@ -1887,7 +1947,7 @@ async fn retrieve_memories(
     // observability; without `req.trace` we drop it exactly as before, so the
     // common path pays nothing. When asked, we hand it to the final frame.
     let trace = if req.trace {
-        Some(build_recall_trace(&result.metadata))
+        Some(build_recall_trace(&result.metadata, ctx)?)
     } else {
         None
     };
@@ -1927,7 +1987,17 @@ async fn retrieve_memories(
 /// latencies/outcomes/counts, filter-chain survivor counts, rerank outcome,
 /// and total wall-time the read pipeline already produced, surfaced as data
 /// instead of the rendered text `QUERY_TRACE` emits.
-fn build_recall_trace(meta: &QueryMetadata) -> RecallTrace {
+///
+/// `trace = true` also means full-detail mode (there is no third knob — see
+/// the module doc on [`RecallRequest::trace`]), so this additionally
+/// surfaces the per-item fields: each lane's raw candidates (with text,
+/// mirroring the `include_text` final-result fetch), which specific memory
+/// id each filter step dropped, the per-fused-item lane-score breakdown, and
+/// the rerank stage's before/after order. `meta`'s full-detail fields are
+/// empty `Vec`s when the executor ran with `trace_detail = false`, so this
+/// degrades to the count-only shape automatically — it never has to guess
+/// which mode produced `meta`.
+fn build_recall_trace(meta: &QueryMetadata, ctx: &OpsContext) -> Result<RecallTrace, OpError> {
     let latency_of = |r: Retriever| -> f64 {
         meta.retriever_latencies_ms
             .iter()
@@ -1943,6 +2013,23 @@ fn build_recall_trace(meta: &QueryMetadata) -> RecallTrace {
             .unwrap_or(0)
     };
 
+    // Full-detail mode only: one batched text fetch for every memory id any
+    // retriever lane surfaced pre-fusion, mirroring the existing
+    // `include_text` per-final-result fetch (`project_memory_results`)
+    // applied here to the (larger) per-stage candidate set. `meta
+    // .retriever_candidates` stays empty when `trace_detail = false`, so
+    // this is a no-op (no read txn opened) on the fast path.
+    let candidate_ids: HashSet<MemoryId> = meta
+        .retriever_candidates
+        .iter()
+        .flat_map(|(_, cands)| cands.iter())
+        .filter_map(|(id, _)| match id {
+            RankedItemId::Memory(mid) => Some(*mid),
+            _ => None,
+        })
+        .collect();
+    let candidate_texts = fetch_candidate_texts(&candidate_ids, ctx)?;
+
     let retrievers = meta
         .retriever_outcomes
         .iter()
@@ -1955,12 +2042,31 @@ fn build_recall_trace(meta: &QueryMetadata) -> RecallTrace {
                 RetrieverStatus::Timeout => (RecallTraceRetrieverStatus::Timeout, String::new()),
                 RetrieverStatus::Failure(msg) => (RecallTraceRetrieverStatus::Failure, msg.clone()),
             };
+            let candidates = meta
+                .retriever_candidates
+                .iter()
+                .find(|(rr, _)| *rr == o.retriever)
+                .map(|(_, cands)| {
+                    cands
+                        .iter()
+                        .filter_map(|(id, score)| match id {
+                            RankedItemId::Memory(mid) => Some(RecallTraceCandidate {
+                                memory_id: mid.raw(),
+                                text: candidate_texts.get(mid).cloned().unwrap_or_default(),
+                                score: *score,
+                            }),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             RecallTraceRetriever {
                 name: retriever_name_wire(o.retriever),
                 status,
                 status_detail,
                 latency_ms: latency_of(o.retriever),
                 candidate_count: count_of(o.retriever),
+                candidates,
             }
         })
         .collect();
@@ -1975,30 +2081,160 @@ fn build_recall_trace(meta: &QueryMetadata) -> RecallTrace {
         after_supersession: s.after_supersession,
         after_as_of: s.after_as_of,
         after_limit: s.after_limit,
+        dropped_by_type: memory_ids_wire(&s.dropped_by_type),
+        dropped_by_temporal: memory_ids_wire(&s.dropped_by_temporal),
+        dropped_by_confidence: memory_ids_wire(&s.dropped_by_confidence),
+        dropped_by_tombstone: memory_ids_wire(&s.dropped_by_tombstone),
+        dropped_by_supersession: dropped_ids_wire(&s.dropped_by_supersession),
+        dropped_by_as_of: dropped_ids_wire(&s.dropped_by_as_of),
+        dropped_by_limit: dropped_ids_wire(&s.dropped_by_limit),
     };
 
-    let rerank = meta.rerank.as_ref().map(|r| match r {
-        RerankOutcome::Applied {
+    let rerank = meta.rerank.as_ref().map(|r| {
+        let (applied, candidates, latency_ms) = match r {
+            RerankOutcome::Applied {
+                candidates,
+                latency_ms,
+            } => (
+                true,
+                u32::try_from(*candidates).unwrap_or(u32::MAX),
+                *latency_ms,
+            ),
+            RerankOutcome::SkippedNoCandidates => (false, 0, 0.0),
+        };
+        RecallTraceRerank {
+            applied,
             candidates,
             latency_ms,
-        } => RecallTraceRerank {
-            applied: true,
-            candidates: u32::try_from(*candidates).unwrap_or(u32::MAX),
-            latency_ms: *latency_ms,
-        },
-        RerankOutcome::SkippedNoCandidates => RecallTraceRerank {
-            applied: false,
-            candidates: 0,
-            latency_ms: 0.0,
-        },
+            before_order: memory_ids_wire(&meta.rerank_before_order),
+            after_order: memory_ids_wire(&meta.rerank_after_order),
+        }
     });
 
-    RecallTrace {
+    // Full-detail mode only: per-fused-item lane-score breakdown. `None`
+    // when `trace_detail` wasn't requested (empty `fusion_breakdown`) or
+    // fusion produced nothing.
+    let fusion = if meta.fusion_breakdown.is_empty() {
+        None
+    } else {
+        Some(RecallTraceFusion {
+            items: meta
+                .fusion_breakdown
+                .iter()
+                .filter_map(|(id, rrf_score, lane_scores)| match id {
+                    RankedItemId::Memory(mid) => Some(RecallTraceFusionItem {
+                        memory_id: mid.raw(),
+                        #[allow(clippy::cast_possible_truncation)]
+                        rrf_score: *rrf_score as f32,
+                        lane_scores: lane_scores
+                            .iter()
+                            .map(|(r, score)| (retriever_name_wire(*r), *score))
+                            .collect(),
+                    }),
+                    _ => None,
+                })
+                .collect(),
+        })
+    };
+
+    Ok(RecallTrace {
         retrievers,
         filter_chain,
         rerank,
         total_latency_ms: meta.total_latency_ms,
+        fusion,
+    })
+}
+
+/// Filter a filter-chain / rerank-order list of the union `RankedItemId`
+/// down to memory ids only, mapped to their `u128` wire form. This trace
+/// path only ever needs to bridge the executor's cross-kind id union
+/// (memory / statement / entity / relation, since the same executor also
+/// serves the typed-graph QUERY path) down to RECALL's memory-only wire
+/// shape — non-`Memory` variants are silently dropped here exactly as
+/// `project_memory_results` already drops them from the answer set.
+fn memory_ids_wire(ids: &[RankedItemId]) -> Vec<u128> {
+    ids.iter()
+        .filter_map(|id| match id {
+            RankedItemId::Memory(mid) => Some(mid.raw()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Kind-preserving counterpart to [`memory_ids_wire`] for filter steps that
+/// can drop non-`Memory` items (supersession, as-of, and the final limit
+/// truncation all operate on the fused `RankedItemId` set, which includes
+/// `Statement`/`Entity`/`Relation` alongside `Memory`). Unlike
+/// `memory_ids_wire`, nothing is discarded here — every variant maps to a
+/// tagged `RecallTraceDroppedId` so the wire trace can tell a dropped
+/// statement from a dropped memory.
+fn dropped_ids_wire(ids: &[RankedItemId]) -> Vec<RecallTraceDroppedId> {
+    ids.iter()
+        .map(|id| match id {
+            RankedItemId::Memory(mid) => RecallTraceDroppedId {
+                kind: RankedItemKindWire::Memory,
+                id: mid.raw(),
+            },
+            RankedItemId::Statement(sid) => RecallTraceDroppedId {
+                kind: RankedItemKindWire::Statement,
+                id: sid.0.as_u128(),
+            },
+            RankedItemId::Entity(eid) => RecallTraceDroppedId {
+                kind: RankedItemKindWire::Entity,
+                id: eid.0.as_u128(),
+            },
+            RankedItemId::Relation(rid) => RecallTraceDroppedId {
+                kind: RankedItemKindWire::Relation,
+                id: rid.0.as_u128(),
+            },
+        })
+        .collect()
+}
+
+/// Fetch stored text for a set of memory ids in one batched redb read,
+/// mirroring the `include_text` final-result fetch in
+/// `project_memory_results` — applied here to the (larger, opt-in)
+/// full-detail trace candidate set. A missing/tombstoned-since-fusion row
+/// maps to an empty string rather than a fatal error: an observability
+/// payload losing one candidate's text is not the same failure class as a
+/// missing final answer row.
+fn fetch_candidate_texts(
+    ids: &HashSet<MemoryId>,
+    ctx: &OpsContext,
+) -> Result<HashMap<MemoryId, String>, OpError> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
     }
+    let rtxn = ctx
+        .executor
+        .metadata
+        .read_txn()
+        .map_err(|e| OpError::Internal(format!("recall trace read_txn: {e}")))?;
+    let texts_table = rtxn
+        .open_table(TEXTS_TABLE)
+        .map_err(|e| OpError::Internal(format!("recall trace open TEXTS_TABLE: {e}")))?;
+
+    let mut out = HashMap::with_capacity(ids.len());
+    for &id in ids {
+        let text = match texts_table.get(&id.to_be_bytes()) {
+            Ok(Some(guard)) => std::str::from_utf8(guard.value())
+                .map(str::to_owned)
+                .map_err(|e| {
+                    OpError::Internal(format!(
+                        "recall trace TEXTS_TABLE non-UTF-8 for {id:?}: {e}"
+                    ))
+                })?,
+            Ok(None) => String::new(),
+            Err(e) => {
+                return Err(OpError::Internal(format!(
+                    "recall trace TEXTS_TABLE get: {e}"
+                )));
+            }
+        };
+        out.insert(id, text);
+    }
+    Ok(out)
 }
 
 /// Map the planner's internal `Retriever` discriminant to the wire lane name.
@@ -2359,6 +2595,7 @@ pub(crate) fn fetch_enrichment_for(
                     predicate,
                     object_label,
                     confidence: stmt.confidence,
+                    event_at_unix_nanos: stmt.event_at_unix_nanos,
                 });
             }
         }
@@ -2801,6 +3038,64 @@ mod tests {
     use brain_planner::retrieval::router::Retriever;
 
     #[test]
+    fn memory_ids_wire_keeps_only_memory_variants() {
+        let mem = MemoryId::from_raw(0x42);
+        let ids = vec![
+            RankedItemId::Memory(mem),
+            RankedItemId::Statement(brain_core::StatementId::new()),
+            RankedItemId::Entity(EntityId::new()),
+            RankedItemId::Relation(brain_core::RelationId::new()),
+        ];
+        assert_eq!(memory_ids_wire(&ids), vec![mem.raw()]);
+    }
+
+    #[test]
+    fn memory_ids_wire_empty_input_is_empty_output() {
+        assert!(memory_ids_wire(&[]).is_empty());
+    }
+
+    #[test]
+    fn dropped_ids_wire_kind_tags_every_variant() {
+        let mem = MemoryId::from_raw(0x42);
+        let sid = brain_core::StatementId::new();
+        let eid = EntityId::new();
+        let rid = brain_core::RelationId::new();
+        let ids = vec![
+            RankedItemId::Memory(mem),
+            RankedItemId::Statement(sid),
+            RankedItemId::Entity(eid),
+            RankedItemId::Relation(rid),
+        ];
+        let wire = dropped_ids_wire(&ids);
+        assert_eq!(
+            wire,
+            vec![
+                RecallTraceDroppedId {
+                    kind: RankedItemKindWire::Memory,
+                    id: mem.raw(),
+                },
+                RecallTraceDroppedId {
+                    kind: RankedItemKindWire::Statement,
+                    id: sid.0.as_u128(),
+                },
+                RecallTraceDroppedId {
+                    kind: RankedItemKindWire::Entity,
+                    id: eid.0.as_u128(),
+                },
+                RecallTraceDroppedId {
+                    kind: RankedItemKindWire::Relation,
+                    id: rid.0.as_u128(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dropped_ids_wire_empty_input_is_empty_output() {
+        assert!(dropped_ids_wire(&[]).is_empty());
+    }
+
+    #[test]
     fn capitalized_runs_extracts_proper_noun_surfaces() {
         // Single capitalized token.
         assert_eq!(capitalized_runs("who founded NeuraCorp"), vec!["NeuraCorp"]);
@@ -3037,7 +3332,7 @@ mod tests {
             members,
             Some(brain_core::EntityId::new()),
             &GroundedOutcome::NoAnswer,
-            0,
+            false,
         );
         assert_eq!(kept.len(), 1, "a resolved anchor suppresses this gate");
     }
@@ -3047,8 +3342,8 @@ mod tests {
         // No anchor, grounded NoAnswer, and NO member has any cross-lane support
         // (max_support == 0) → abstain (FIX C).
         let members = vec![mr(1, &[Semantic]), mr(2, &[Semantic])];
-        let kept = apply_anchor_abstention(members, None, &GroundedOutcome::NoAnswer, 0);
-        assert!(kept.is_empty(), "zero cross-lane support → abstain");
+        let kept = apply_anchor_abstention(members, None, &GroundedOutcome::NoAnswer, false);
+        assert!(kept.is_empty(), "nothing belongs (lone passage cosine) → abstain");
     }
 
     #[test]
@@ -3056,7 +3351,7 @@ mod tests {
         // Any support (>=1) means the facts ship — FIX C never empties a set that
         // has real support, even without an anchor or a grounded answer.
         let members = vec![mr(1, &[Semantic]), mr(2, &[Semantic])];
-        let kept = apply_anchor_abstention(members, None, &GroundedOutcome::NoAnswer, 1);
+        let kept = apply_anchor_abstention(members, None, &GroundedOutcome::NoAnswer, true);
         assert_eq!(
             kept.len(),
             2,
@@ -3078,7 +3373,7 @@ mod tests {
             true,
         );
         let kept =
-            apply_kind_presence_abstention(members, Some(brain_core::EntityId::new()), &g, 0);
+            apply_kind_presence_abstention(members, Some(brain_core::EntityId::new()), &g, false);
         assert_eq!(kept.len(), 1, "grounded answer present → keep");
     }
 
@@ -3086,7 +3381,7 @@ mod tests {
     fn kind_presence_keeps_set_without_anchor() {
         // No subject resolved → the other gate handles it, not this one.
         let members = vec![mr(1, &[Semantic])];
-        let kept = apply_kind_presence_abstention(members, None, &GroundedOutcome::NoAnswer, 0);
+        let kept = apply_kind_presence_abstention(members, None, &GroundedOutcome::NoAnswer, false);
         assert_eq!(kept.len(), 1, "no anchor → this gate is a no-op");
     }
 
@@ -3100,7 +3395,7 @@ mod tests {
             members,
             Some(brain_core::EntityId::new()),
             &GroundedOutcome::NoAnswer,
-            0,
+            false,
         );
         assert!(
             kept.is_empty(),
@@ -3117,9 +3412,9 @@ mod tests {
             members,
             Some(brain_core::EntityId::new()),
             &GroundedOutcome::NoAnswer,
-            2,
+            true,
         );
-        assert_eq!(kept.len(), 2, "supported member → keep the set");
+        assert_eq!(kept.len(), 2, "a belonging member → keep the set");
     }
 
     // ── Slot-projection subject scoping (wrong-subject rejection) ────────────
@@ -3181,7 +3476,7 @@ mod tests {
             members,
             Some(EntityId::new()),      // Melanie resolved
             &GroundedOutcome::NoAnswer, // no spurious wrong-subject answer
-            0,
+            false,                      // nothing belongs (lone off-cue fact)
         );
         assert!(
             kept.is_empty(),
@@ -3431,17 +3726,24 @@ mod tests {
     fn support_counts_each_independent_lane_once() {
         let none: HashSet<u128> = HashSet::new();
         let no_hype: HashMap<u128, f32> = HashMap::new();
-        // No lanes, not in the semantic band, not grounded, no HyPE → 0.
+        // No lanes, not a strong semantic match, not grounded, no HyPE → 0.
         assert_eq!(support(1, &[], false, &none, &no_hype), 0);
-        // The semantic band alone → 1.
+        // A STRONG semantic match alone → 1.
         assert_eq!(support(1, &[], true, &none, &no_hype), 1);
-        // A semantic lane alone (even without the band flag) → 1.
-        assert_eq!(support(1, &[Semantic], false, &none, &no_hype), 1);
-        // The band and a semantic lane are ONE lane, never double-counted → 1.
+        // A Semantic fan-out lane WITHOUT a strong cosine no longer counts → 0.
+        // This is the abstention fix: a weak (below-strong-bar) semantic hit —
+        // the BGE-compression case a nonsense cue produces — corroborates nothing.
+        assert_eq!(support(1, &[Semantic], false, &none, &no_hype), 0);
+        // Strong semantic; the Semantic lane doesn't double-count → 1.
         assert_eq!(support(1, &[Semantic], true, &none, &no_hype), 1);
-        // Three distinct real lanes → 3.
+        // Lexical + Graph are real lanes; a non-strong Semantic lane adds nothing → 2.
         assert_eq!(
             support(1, &[Semantic, Lexical, Graph], false, &none, &no_hype),
+            2
+        );
+        // With a strong semantic match, all three lanes count → 3.
+        assert_eq!(
+            support(1, &[Semantic, Lexical, Graph], true, &none, &no_hype),
             3
         );
     }
@@ -3450,16 +3752,23 @@ mod tests {
     fn support_counts_grounded_and_hype_lanes() {
         let grounded: HashSet<u128> = [1u128].into_iter().collect();
         let no_grounded: HashSet<u128> = HashSet::new();
-        let at_floor: HashMap<u128, f32> = [(1u128, ANSWER_LEAD_FLOOR)].into_iter().collect();
-        let below: HashMap<u128, f32> = [(1u128, ANSWER_LEAD_FLOOR - 0.01)].into_iter().collect();
+        let at_strong: HashMap<u128, f32> = [(1u128, STRONG_HYPE_SUPPORT)].into_iter().collect();
+        // A weak lead below the strong support bar (the old 0.5 ordering floor).
+        let weak: HashMap<u128, f32> = [(1u128, STRONG_HYPE_SUPPORT - 0.1)].into_iter().collect();
         let empty: HashMap<u128, f32> = HashMap::new();
         // Grounded source alone → 1.
         assert_eq!(support(1, &[], false, &grounded, &empty), 1);
-        // HyPE at/above the floor alone → 1; below the floor → 0.
-        assert_eq!(support(1, &[], false, &no_grounded, &at_floor), 1);
-        assert_eq!(support(1, &[], false, &no_grounded, &below), 0);
-        // Grounded + one independent lane = corroborated.
-        assert!(support(1, &[Semantic], false, &grounded, &empty) >= SUPPORT_CORROBORATED);
+        // HyPE at/above the STRONG support bar alone → 1. A weak lead (at the
+        // looser ordering floor, below the strong bar) corroborates nothing → 0:
+        // this is the HyPE half of the abstention fix.
+        assert_eq!(support(1, &[], false, &no_grounded, &at_strong), 1);
+        assert_eq!(support(1, &[], false, &no_grounded, &weak), 0);
+        // Grounded + one independent lane = corroborated. A real Lexical lane
+        // corroborates; a non-strong Semantic lane would NOT (it must clear the
+        // strong-support bar), so this uses Lexical to express the invariant.
+        assert!(support(1, &[Lexical], false, &grounded, &empty) >= SUPPORT_CORROBORATED);
+        // Grounded + a STRONG semantic match also corroborates.
+        assert!(support(1, &[], true, &grounded, &empty) >= SUPPORT_CORROBORATED);
     }
 
     #[test]

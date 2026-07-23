@@ -36,12 +36,21 @@ pub enum GraphNodeKindWire {
     /// object is a literal, not another entity). Only emitted when the
     /// request sets `include_statements`. `label` is `predicate: value`.
     Statement = 1,
-    /// A source memory that mentions an entity. Only emitted when the
-    /// request sets `include_memories`. `label` is a text snippet.
+    /// A source memory. Emitted when the request sets `include_memories`
+    /// (as the source of a `Mentions` edge) or, with
+    /// `include_memory_edges`, as the far endpoint of a memory↔memory
+    /// edge. `label` is a text snippet.
     Memory = 2,
 }
 
 /// Kind of a graph edge.
+///
+/// The first four variants are the typed-graph projections. The remaining
+/// eight are the stored memory↔memory edge kinds, one variant each, so a
+/// `SimilarTo` link is distinguishable from a `FollowedBy` link by the
+/// single `kind` byte alone — no companion field. Their discriminants are
+/// `4 + brain_core::EdgeKind as u8`, i.e. they preserve `EdgeKind`'s own
+/// ordering.
 #[derive(
     Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
 )]
@@ -61,6 +70,29 @@ pub enum GraphEdgeKindWire {
     /// Memory→entity provenance link. Only present with `include_memories`.
     /// `label` is empty.
     Mentions = 3,
+    /// Memory→memory: the source memory caused the target. Only present
+    /// with `include_memory_edges`; `label` is `"caused"`.
+    Caused = 4,
+    /// Memory→memory: the source memory happened before the target.
+    /// `label` is `"followed_by"`.
+    FollowedBy = 5,
+    /// Memory→memory: the target was derived from the source (consolidation,
+    /// summarisation). `label` is `"derived_from"`.
+    DerivedFrom = 6,
+    /// Memory↔memory similarity (symmetric; emitted once per pair).
+    /// `label` is `"similar_to"`.
+    SimilarTo = 7,
+    /// Memory↔memory contradiction (symmetric; emitted once per pair).
+    /// `label` is `"contradicts"`.
+    Contradicts = 8,
+    /// Memory→memory: the source is evidence for the target. `label` is
+    /// `"supports"`.
+    Supports = 9,
+    /// Memory→memory citation/link. `label` is `"references"`.
+    References = 10,
+    /// Memory→memory: the source is part of the target. `label` is
+    /// `"part_of"`.
+    PartOf = 11,
 }
 
 /// One graph node. `id` is the 16-byte entity / statement / memory id; the
@@ -85,8 +117,8 @@ pub struct GraphEdge {
     pub from_id: [u8; 16],
     #[serde(with = "serde_bytes")]
     pub to_id: [u8; 16],
-    /// 0 = Relation, 1 = Fact, 2 = HasStatement, 3 = Mentions (see
-    /// [`GraphEdgeKindWire`]).
+    /// 0 = Relation, 1 = Fact, 2 = HasStatement, 3 = Mentions, 4..=11 = the
+    /// memory↔memory builtin kinds (see [`GraphEdgeKindWire`]).
     pub kind: u8,
     /// Predicate / relation-type label; empty for `Mentions`.
     pub label: String,
@@ -99,7 +131,8 @@ pub struct GraphEdge {
 /// `Relation` and `Fact` edges that link them. `include_statements` adds
 /// value-object statement nodes (attributes / preferences with literal
 /// objects) and their `HasStatement` edges; `include_memories` adds source
-/// memory nodes and their `Mentions` edges.
+/// memory nodes and their `Mentions` edges; `include_memory_edges` adds the
+/// stored memory↔memory links between those memories.
 ///
 /// The cursor is opaque and signed: it encodes the active layer toggles and
 /// the last statement-index key seen. Echoing a cursor back after changing a
@@ -117,6 +150,18 @@ pub struct GraphFetchRequest {
     pub include_statements: bool,
     /// Emit source memory nodes + their `Mentions` edges.
     pub include_memories: bool,
+    /// Emit the stored memory↔memory edges (`SimilarTo`, `FollowedBy`, …)
+    /// incident to the memory nodes on the page, one `GraphEdgeKindWire`
+    /// variant per kind. Requires `include_memories`: memory edges hang off
+    /// memory nodes, and emitting them without the layer that produces those
+    /// nodes would return edges whose endpoints the client cannot render.
+    /// Setting this without `include_memories` is rejected.
+    ///
+    /// The far endpoint of such an edge is emitted as a `Memory` node even
+    /// when it is not itself mentioned by a page entity, so no edge dangles.
+    /// The walk is one hop — the far memory's own memory-edges are not
+    /// followed from here.
+    pub include_memory_edges: bool,
     /// Include tombstoned statements/relations in the export. Default false.
     pub include_tombstoned: bool,
     /// Effective identity this export runs as, on behalf of the
