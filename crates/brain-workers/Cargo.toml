@@ -26,6 +26,10 @@ uuid.workspace = true
 # After sub-task 9.7: per-shard scheduler runs on Glommio.
 glommio.workspace = true
 futures-lite.workspace = true
+# Concurrent fan-out of independent per-memory HyPE LLM calls (spec §05/17a:
+# the hype stage is independent + unordered), matching the extraction tier's
+# join_all. Already a workspace dependency; wired here for `join_all`.
+futures-util.workspace = true
 # F-13: per-worker run-now wakeup channel (Glommio-compatible).
 flume.workspace = true
 

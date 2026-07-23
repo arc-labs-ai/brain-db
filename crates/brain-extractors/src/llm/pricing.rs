@@ -45,6 +45,21 @@ impl Pricing {
                 input_micro_usd_per_token: 3.0,
                 output_micro_usd_per_token: 15.0,
             }
+        } else if model.starts_with("gpt-4.1-nano") {
+            Self {
+                input_micro_usd_per_token: 0.1,
+                output_micro_usd_per_token: 0.4,
+            }
+        } else if model.starts_with("gpt-4.1-mini") {
+            Self {
+                input_micro_usd_per_token: 0.4,
+                output_micro_usd_per_token: 1.6,
+            }
+        } else if model.starts_with("gpt-4.1") {
+            Self {
+                input_micro_usd_per_token: 2.0,
+                output_micro_usd_per_token: 8.0,
+            }
         } else if model.starts_with("gpt-4o-mini") {
             Self {
                 input_micro_usd_per_token: 0.15,

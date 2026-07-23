@@ -436,7 +436,12 @@ async fn do_extractor_cycle(
         );
     }
 
-    let cycle_cap = worker.knobs.drain_per_cycle.min(cfg.batch_size);
+    // Drain up to the full `drain_per_cycle` each cycle, processing it in
+    // `batch_size` micro-batches (the `while processed < cycle_cap` loop
+    // below). Previously this was `min(drain_per_cycle, batch_size)`, which
+    // silently pinned throughput to one micro-batch (8) even though
+    // `drain_per_cycle` was 32 — starving derivation under a write burst.
+    let cycle_cap = worker.knobs.drain_per_cycle;
     let micro_batch = worker.knobs.batch_size.max(1);
 
     // The durable work surface is `EXTRACTION_QUEUE_TABLE`, not the
@@ -1092,63 +1097,73 @@ async fn drain_batch(
             _ => None,
         };
 
-    let outcomes = run_pipeline_batch(
-        extractors,
-        &live_mems,
-        &mem_namespaces,
-        skip_llm_budget_exhausted,
-        extractor_context_map,
-        declared_entity_types,
-        candidate_predicate_map.as_ref(),
-        declared_kinds,
-        entity_type_labels,
-    )
-    .await;
+    // Extraction and HyPE are independent, unordered async stages (spec
+    // §05/17a). `build_neighborhood` resolves the entities a memory mentions
+    // against the *persisted* registry, not this batch's just-written graph,
+    // so HyPE needs only the memory text — it does not depend on extraction's
+    // output. Run the two LLM round-trips CONCURRENTLY instead of
+    // extraction-then-HyPE: on this single glommio task they interleave only
+    // at await points, so the network round-trips overlap while every redb /
+    // HNSW write stays serialized (single-writer preserved). This roughly
+    // halves the full write-path latency. The only thing given up is a
+    // memory's own just-extracted facts feeding its own bridge questions;
+    // prior-graph bridging is unaffected.
+    let extract_and_apply = async {
+        let outcomes = run_pipeline_batch(
+            extractors,
+            &live_mems,
+            &mem_namespaces,
+            skip_llm_budget_exhausted,
+            extractor_context_map,
+            declared_entity_types,
+            candidate_predicate_map.as_ref(),
+            declared_kinds,
+            entity_type_labels,
+        )
+        .await;
 
-    // Cycle-LLM-budget bookkeeping + per-tier-run metrics.
-    let mut total_llm_micro: u64 = 0;
-    for outcome in &outcomes {
-        total_llm_micro = total_llm_micro.saturating_add(outcome.llm_cost_micro_usd);
-        publish_tier_run_metrics(&worker.metrics, outcome);
-    }
-    if total_llm_micro > 0 {
-        let mut spend = worker.llm_spend.lock();
-        *spend = spend.saturating_add(total_llm_micro);
-        worker.metrics.add_llm_micro_usd(total_llm_micro);
-    }
+        // Cycle-LLM-budget bookkeeping + per-tier-run metrics.
+        let mut total_llm_micro: u64 = 0;
+        for outcome in &outcomes {
+            total_llm_micro = total_llm_micro.saturating_add(outcome.llm_cost_micro_usd);
+            publish_tier_run_metrics(&worker.metrics, outcome);
+        }
+        if total_llm_micro > 0 {
+            let mut spend = worker.llm_spend.lock();
+            *spend = spend.saturating_add(total_llm_micro);
+            worker.metrics.add_llm_micro_usd(total_llm_micro);
+        }
 
-    // Apply each outcome and fold into the per-memory decision slot.
-    for ((idx, memory_id, _), outcome) in live.into_iter().zip(outcomes) {
-        let decision = match apply_outcome(worker, ctx, memory_id, &outcome).await {
-            Ok(applied) => StageDecision::Applied {
-                counts: applied.counts,
-                status_byte: applied.status_byte,
-                retry_pending: applied.retry_pending,
-            },
-            Err(e) => {
-                // A per-item data-shape problem (bad predicate, rejected
-                // create) is handled inside `apply_outcome` (skip + count),
-                // so a returned Err is a TRANSIENT infra failure: the apply
-                // wtxn rolled back, nothing persisted. Do NOT write a FAILURE
-                // audit — that would bar re-extraction via the idempotency
-                // gate and permanently abandon a real memory's graph for a
-                // momentary hiccup. Leave the durable queue row in place so
-                // the next cycle retries.
-                warn!(
-                    memory_id = ?memory_id,
-                    error = %e,
-                    "extractor apply failed (transient); leaving queued for retry",
-                );
-                StageDecision::AppliedFailed
-            }
-        };
-        decisions[idx] = decision;
-    }
+        // Apply each outcome and fold into the per-memory decision slot.
+        for ((idx, memory_id, _), outcome) in live.into_iter().zip(outcomes) {
+            let decision = match apply_outcome(worker, ctx, memory_id, &outcome).await {
+                Ok(applied) => StageDecision::Applied {
+                    counts: applied.counts,
+                    status_byte: applied.status_byte,
+                    retry_pending: applied.retry_pending,
+                },
+                Err(e) => {
+                    // A per-item data-shape problem (bad predicate, rejected
+                    // create) is handled inside `apply_outcome` (skip + count),
+                    // so a returned Err is a TRANSIENT infra failure: the apply
+                    // wtxn rolled back, nothing persisted. Do NOT write a
+                    // FAILURE audit — that would bar re-extraction via the
+                    // idempotency gate and permanently abandon a real memory's
+                    // graph for a momentary hiccup. Leave the durable queue row
+                    // in place so the next cycle retries.
+                    warn!(
+                        memory_id = ?memory_id,
+                        error = %e,
+                        "extractor apply failed (transient); leaving queued for retry",
+                    );
+                    StageDecision::AppliedFailed
+                }
+            };
+            decisions[idx] = decision;
+        }
+    };
 
-    // Now that the batch's entities, statements, and relations are written,
-    // generate graph-aware HyPE questions over every item — the neighborhood
-    // each memory is conditioned on now reflects the just-applied graph.
-    run_hype_pass(worker, ctx, items).await;
+    futures_lite::future::zip(extract_and_apply, run_hype_pass(worker, ctx, items)).await;
 
     decisions
 }
@@ -1170,9 +1185,17 @@ async fn run_hype_pass(worker: &ExtractorWorker, ctx: &WorkerContext, items: &[E
         return;
     };
     let cycle_budget = worker.knobs.llm_budget_per_cycle_micro_usd;
-    for (memory_id, text) in items {
+    // Per-memory HyPE generation is independent (spec §05/17a): fan the LLM
+    // calls out concurrently so a whole micro-batch costs ~one round-trip
+    // instead of N serial ones. Every future runs on this single glommio task
+    // and interleaves only at await points — the network round-trips overlap
+    // while redb reads and HNSW index inserts stay serialized (single-writer
+    // preserved). The per-cycle LLM budget is a soft cap here: a concurrent
+    // fan-out can overshoot by at most the in-flight set (bounded by the
+    // micro-batch size), which is the intended trade for the latency win.
+    let futs = items.iter().map(|(memory_id, text)| async move {
         if cycle_budget > 0 && *worker.llm_spend.lock() >= cycle_budget {
-            break;
+            return;
         }
         // Skip memories that already own question vectors — HyPE generates
         // once per memory, idempotent across re-ingest, and a second insert
@@ -1182,7 +1205,7 @@ async fn run_hype_pass(worker: &ExtractorWorker, ctx: &WorkerContext, items: &[E
             Err(_) => false,
         };
         if already {
-            continue;
+            return;
         }
         // Render the typed-graph facts already known about the entities this
         // memory mentions, so HyPE can write multi-hop bridge questions that
@@ -1223,7 +1246,8 @@ async fn run_hype_pass(worker: &ExtractorWorker, ctx: &WorkerContext, items: &[E
         // pending-stage checklist — mirrors `publish_extracted_graph`'s
         // per-memory publish below.
         publish_hype_completed(ctx, *memory_id, scope.agent(), outcome).await;
-    }
+    });
+    futures_util::future::join_all(futs).await;
 }
 
 /// Graph-aware HyPE refresh sweep — the Phase-3 path that keeps a memory's

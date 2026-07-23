@@ -714,6 +714,7 @@ dependencies = [
  "brain-storage",
  "flume 0.11.1",
  "futures-lite 2.6.1",
+ "futures-util",
  "glommio",
  "parking_lot",
  "proptest",
