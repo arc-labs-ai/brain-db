@@ -1,6 +1,6 @@
 //! Types shared across the per-request plan modules.
 
-use brain_core::{ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{SessionId, EdgeKind, MemoryId, MemoryKind};
 
 /// Logical shard reference: the plan is at a level of abstraction
 /// above transport. The executor maps shard references to actual
@@ -31,7 +31,7 @@ pub enum SortKey {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterRule {
     KindIn(Vec<MemoryKind>),
-    ContextIn(Vec<ContextId>),
+    SessionIn(Vec<SessionId>),
     SalienceFloor(f32),
     AgeBound { not_older_than_unix_nanos: u64 },
     ConfidenceFloor(f32),

@@ -1,6 +1,6 @@
 //! # brain-metadata
 //!
-//! redb-backed metadata store: spaces, contexts, memory metadata, edges,
+//! redb-backed metadata store: spaces, sessions, memory metadata, edges,
 //! idempotency table, and the durable LSN checkpoint. WAL recovery
 //! lives in `recovery/` (one file per WalPayload family), implementing
 //! `brain_storage::recovery::MetadataSink` for `MetadataDb`.

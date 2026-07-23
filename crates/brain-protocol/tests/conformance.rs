@@ -254,7 +254,7 @@ fn sample_hello() -> HelloPayload {
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     }
 }
 
@@ -262,7 +262,7 @@ fn sample_welcome() -> WelcomePayload {
     WelcomePayload {
         server_id: "brain-server/conformance".into(),
         chosen_version: 1,
-        session_id: SID,
+        connection_id: SID,
         capabilities: HelloCapabilities {
             streaming: true,
             compression_zstd: false,
@@ -280,7 +280,7 @@ fn sample_welcome() -> WelcomePayload {
 fn sample_encode() -> EncodeRequest {
     EncodeRequest {
         text: "the sky is blue".into(),
-        context_id: 1,
+        session_id: 1,
         request_id: RID,
         txn_id: None,
         occurred_at_unix_nanos: Some(1_700_000_000_000_000_000),
@@ -295,7 +295,7 @@ fn sample_encode() -> EncodeRequest {
 fn sample_encode_act_as() -> EncodeRequest {
     EncodeRequest {
         text: "on behalf of a tenant".into(),
-        context_id: 1,
+        session_id: 1,
         request_id: RID,
         txn_id: None,
         occurred_at_unix_nanos: None,
@@ -313,7 +313,7 @@ fn sample_encode_vector_direct() -> EncodeVectorDirectRequest {
         text: "precomputed".into(),
         vector: vec![1.0, 0.5, -0.25, 0.125],
         model_fingerprint: FP,
-        context_id: 1,
+        session_id: 1,
         kind: MemoryKindWire::Episodic,
         salience_hint: 0.25,
         edges: Vec::new(),
@@ -331,7 +331,7 @@ fn sample_encode_response() -> EncodeResponse {
         auto_edges_added: 1,
         lsn: 42,
         space_id: SPACE,
-        context_id: 1,
+        session_id: 1,
         kind: MemoryKindWire::Episodic,
         created_at_unix_nanos: 1_700_000_000_000_000_000,
         edges_out_count: 1,
@@ -886,6 +886,8 @@ fn sample_memory_list_response() -> MemoryListResponseFrame {
     MemoryListResponseFrame {
         items: vec![MemoryListItem {
             memory_id: EID,
+            space_id: SPACE,
+            session_id: 1,
             text: "the sky is blue".into(),
             kind: 0,
             state: 0,
@@ -995,7 +997,7 @@ fn sample_subscribe_event() -> SubscriptionEvent {
     SubscriptionEvent {
         event_type: EventType::Encoded,
         memory_id: mid(),
-        context_id: 1,
+        session_id: 1,
         text: "the sky is blue".into(),
         kind: MemoryKindWire::Episodic,
         salience: 0.5,
@@ -1070,7 +1072,7 @@ fn corpus() -> Vec<Case> {
         subject_name: "sky".into(),
         max_results: 10,
         confidence_threshold: 0.3,
-        context_filter: Some(vec![1]),
+        session_filter: Some(vec![1]),
         age_bound_unix_nanos: None,
         as_of_record_time_unix_nanos: Some(1_710_000_000_000_000_000),
         kind_filter: Some(vec![MemoryKindWire::Episodic]),
@@ -1093,7 +1095,7 @@ fn corpus() -> Vec<Case> {
         subject_name: "sky".into(),
         max_results: 10,
         confidence_threshold: 0.3,
-        context_filter: Some(vec![1]),
+        session_filter: Some(vec![1]),
         age_bound_unix_nanos: None,
         as_of_record_time_unix_nanos: None,
         kind_filter: None,
@@ -1156,7 +1158,7 @@ fn corpus() -> Vec<Case> {
             max_branches_explored: 64,
         },
         strategy_hint: None,
-        context_filter: None,
+        session_filter: None,
         request_id: Some(RID),
         txn_id: None,
         trace: true,
@@ -1175,7 +1177,7 @@ fn corpus() -> Vec<Case> {
         observation: ObservationInput::ByText("the cat sat".into()),
         depth: 3,
         confidence_threshold: 0.5,
-        context_filter: None,
+        session_filter: None,
         max_inferences: 5,
         budget_wall_time_ms: 1_000,
         request_id: Some(RID),
@@ -1247,7 +1249,7 @@ fn corpus() -> Vec<Case> {
     ));
     let materialize = MaterializeProceduralRequest {
         space_id: SPACE,
-        context_filter: 0,
+        session_filter: Some(vec![7]),
         top_k: 20,
         min_confidence: 0.5,
         categories: vec!["tone".into()],

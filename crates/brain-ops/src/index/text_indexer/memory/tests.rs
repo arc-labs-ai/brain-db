@@ -76,7 +76,7 @@ fn dispatch_upsert_then_query_returns_hit() {
                 space: SpaceId::new(),
                 kind: MemoryKind::Episodic,
                 created_at_unix_ms: 0,
-                context: 0,
+                session: 0,
             })
             .await;
 
@@ -111,7 +111,7 @@ fn forget_removes_doc() {
                 space: SpaceId::new(),
                 kind: MemoryKind::Episodic,
                 created_at_unix_ms: 0,
-                context: 0,
+                session: 0,
             })
             .await;
         dispatcher.dispatch(MemoryTextOp::Forget { id }).await;
@@ -138,7 +138,7 @@ fn commit_by_time_flushes_below_n() {
                 space: SpaceId::new(),
                 kind: MemoryKind::Episodic,
                 created_at_unix_ms: 0,
-                context: 0,
+                session: 0,
             })
             .await;
 
@@ -166,7 +166,7 @@ fn commit_by_count_flushes_at_n() {
                     space: SpaceId::new(),
                     kind: MemoryKind::Episodic,
                     created_at_unix_ms: 0,
-                    context: 0,
+                    session: 0,
                 })
                 .await;
         }
@@ -205,7 +205,7 @@ fn payload_stamped_on_commit_survives_reopen() {
                     space: SpaceId::new(),
                     kind: MemoryKind::Episodic,
                     created_at_unix_ms: 0,
-                    context: 0,
+                    session: 0,
                 })
                 .await;
             drop(dispatcher);
@@ -239,7 +239,7 @@ fn dispatching_without_drain_eventually_blocks() {
             space: SpaceId::new(),
             kind: MemoryKind::Episodic,
             created_at_unix_ms: 0,
-            context: 0,
+            session: 0,
         };
         dispatcher.dispatch(op()).await;
         dispatcher.dispatch(op()).await;
@@ -276,7 +276,7 @@ fn upsert_round_trips_metadata_fields() {
                 space,
                 kind: MemoryKind::Semantic,
                 created_at_unix_ms: 1_700_000_000_000,
-                context: 0,
+                session: 0,
             })
             .await;
         drop(dispatcher);
@@ -348,7 +348,7 @@ fn end_to_end_indexer_to_retriever() {
                 space: SpaceId::new(),
                 kind: MemoryKind::Episodic,
                 created_at_unix_ms: 0,
-                context: 0,
+                session: 0,
             })
             .await;
         drop(dispatcher);

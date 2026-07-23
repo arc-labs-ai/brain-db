@@ -99,7 +99,7 @@ async fn complete_handshake(client: &mut TcpStream, token: &[u8]) {
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send_frame(
         client,
@@ -164,6 +164,7 @@ fn text_only_query(text: &str) -> QueryRequest {
         entity_anchor: None,
         kind_filter: Vec::new(),
         predicate_filter: Vec::new(),
+        session_filter: None,
         time_filter: None,
         as_of_record_time_unix_nanos: None,
         confidence_min: None,

@@ -256,7 +256,7 @@ mod tests {
     fn encode_req() -> brain_protocol::envelope::request::EncodeRequest {
         brain_protocol::envelope::request::EncodeRequest {
             text: "hi".into(),
-            context_id: 1,
+            session_id: 1,
             request_id: [1; 16],
             txn_id: None,
             occurred_at_unix_nanos: None,

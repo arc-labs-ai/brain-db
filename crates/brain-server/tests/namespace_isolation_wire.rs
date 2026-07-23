@@ -140,7 +140,7 @@ async fn handshake_authok(client: &mut TcpStream, token: &[u8]) -> AuthOkPayload
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send_frame(
         client,
@@ -185,7 +185,7 @@ async fn handshake_authok(client: &mut TcpStream, token: &[u8]) -> AuthOkPayload
 async fn encode(client: &mut TcpStream, stream_id: u32, text: &str) -> u128 {
     let req = EncodeRequest {
         text: text.into(),
-        context_id: 0,
+        session_id: 0,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
@@ -237,7 +237,7 @@ async fn resolve_entity(
         stream_id,
         RequestBody::EntityResolve(EntityResolveRequest {
             candidate_name: name.into(),
-            context: String::new(),
+            resolution_context: String::new(),
             entity_type_hint: 0,
             allow_create: false,
             request_id: *uuid::Uuid::now_v7().as_bytes(),

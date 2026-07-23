@@ -642,7 +642,7 @@ mod reclaim_tests {
         let subj = make_entity(&mut db, "subj-tables");
         let obj = make_entity(&mut db, "obj-tables");
         let p = intern_fact(&mut db, "p_tables", false);
-        let mem = MemoryId::pack(7, brain_core::ContextId::DEFAULT.into(), 0);
+        let mem = MemoryId::pack(7, brain_core::SessionId::DEFAULT.into(), 0);
         let mut s = fresh_fact(subj, p, obj);
         let mut sv = SmallVec::<[EvidenceEntry; INLINE_EVIDENCE_CAP]>::new();
         sv.push(EvidenceEntry::from_parts(

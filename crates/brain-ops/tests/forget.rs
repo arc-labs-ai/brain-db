@@ -72,7 +72,7 @@ fn build_fixture() -> Fixture {
 fn encode_req(request_id: [u8; 16], text: &str) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
-        context_id: 42,
+        session_id: 42,
         request_id,
         txn_id: None,
         occurred_at_unix_nanos: None,

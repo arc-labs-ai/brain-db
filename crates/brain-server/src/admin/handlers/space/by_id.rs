@@ -23,7 +23,7 @@ pub async fn by_id(
         )),
         m if m == Method::DELETE => Ok(not_implemented(
             "phase-11/space-cascade-delete",
-            "space cascade delete (memories + edges + contexts)",
+            "space cascade delete (memories + edges + sessions)",
         )),
         _ => Ok(text_response(
             StatusCode::METHOD_NOT_ALLOWED,

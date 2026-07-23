@@ -6,7 +6,7 @@
 //! Ships single-shard today; the cross-shard branch later lights up
 //! using the same `RecallPlan { shards: Vec<_> }` envelope.
 
-use brain_core::ContextId;
+use brain_core::SessionId;
 use brain_protocol::envelope::request::RecallRequest;
 
 use crate::config::PlannerConfig;
@@ -140,14 +140,14 @@ fn build_filter_rules(req: &RecallRequest) -> Vec<FilterRule> {
         }
     }
 
-    if let Some(contexts) = &req.context_filter {
-        if !contexts.is_empty() {
-            let mapped = contexts
+    if let Some(sessions) = &req.session_filter {
+        if !sessions.is_empty() {
+            let mapped = sessions
                 .iter()
                 .copied()
-                .map(ContextId::from)
+                .map(SessionId::from)
                 .collect::<Vec<_>>();
-            rules.push(FilterRule::ContextIn(mapped));
+            rules.push(FilterRule::SessionIn(mapped));
         }
     }
 
@@ -176,7 +176,7 @@ mod tests {
             subject_name: String::new(),
             max_results: 10,
             confidence_threshold: 0.0,
-            context_filter: None,
+            session_filter: None,
             age_bound_unix_nanos: None,
             as_of_record_time_unix_nanos: None,
             kind_filter: None,

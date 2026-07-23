@@ -104,7 +104,7 @@ async fn handshake(client: &mut TcpStream, token: &[u8]) {
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send_frame(
         client,
@@ -153,7 +153,7 @@ async fn round_trip(client: &mut TcpStream, stream_id: u32, req: RequestBody) ->
 async fn encode_one(client: &mut TcpStream, stream_id: u32, text: &str) -> MemoryId {
     let req = EncodeRequest {
         text: text.into(),
-        context_id: 1,
+        session_id: 1,
         request_id: *Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,

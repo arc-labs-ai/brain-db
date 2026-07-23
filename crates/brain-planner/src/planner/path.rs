@@ -159,7 +159,7 @@ mod tests {
                 max_branches_explored: 64,
             },
             strategy_hint: None,
-            context_filter: None,
+            session_filter: None,
             request_id: None,
             txn_id: None,
             act_as: None,

@@ -605,7 +605,7 @@ fn weekday_from_name(name: &str) -> Option<Weekday> {
 mod tests {
     use super::*;
     use crate::framework::registry::ExtractorRegistry;
-    use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, Salience};
+    use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, Salience};
 
     /// Build the unix-nanos of a civil date at midnight UTC. Used in
     /// place of `time::macros::datetime!` so the tests don't require the
@@ -638,7 +638,7 @@ mod tests {
         Memory {
             id: MemoryId::pack(0, 1, 0),
             space: SpaceId::new(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
             text: Some(text.to_string()),
@@ -735,7 +735,7 @@ mod tests {
         let mem = Memory {
             id: MemoryId::pack(0, 1, 0),
             space: SpaceId::new(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
             text: Some("4 years ago".to_string()),
@@ -757,7 +757,7 @@ mod tests {
         let mem = Memory {
             id: MemoryId::pack(0, 1, 0),
             space: SpaceId::new(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
             text: Some("4 years ago".to_string()),

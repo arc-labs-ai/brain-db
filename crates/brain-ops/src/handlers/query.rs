@@ -230,9 +230,9 @@ fn wire_to_planner_request(
         kind_filter,
         predicate_filter,
         time_filter,
-        // Wire-level QUERY does not yet expose a context filter — the
-        // funnel will pick it up once the wire shape gains the field.
-        context_filter: Vec::new(),
+        // Optional per-session scoping, mirroring RECALL. `None` or an
+        // empty set means no session restriction.
+        session_filter: req.session_filter.clone().unwrap_or_default(),
         // Strict per-space isolation: every row belongs to exactly one space,
         // so QUERY is scoped to the caller's own space (from the key), never
         // widened by a client field.

@@ -475,7 +475,7 @@ fn ranks_are_dense_and_one_based() {
 mod memory_anchor {
     use super::*;
 
-    use brain_core::{SpaceId, ContextId, EdgeKind, MemoryId, MemoryKind};
+    use brain_core::{SpaceId, SessionId, EdgeKind, MemoryId, MemoryKind};
     use brain_metadata::tables::edge::{
         derived_by, link, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
     };
@@ -491,7 +491,7 @@ mod memory_anchor {
             id,
             brain_core::NamespaceId::SYSTEM,
             SpaceId::from([0u8; 16]),
-            ContextId(0),
+            SessionId(0),
             id.slot(),
             id.version(),
             MemoryKind::Episodic,
@@ -719,7 +719,7 @@ mod unified_walk {
 
     use std::collections::{HashMap, HashSet};
 
-    use brain_core::{SpaceId, ContextId, EdgeKind, MemoryId, MemoryKind};
+    use brain_core::{SpaceId, SessionId, EdgeKind, MemoryId, MemoryKind};
     use brain_metadata::tables::edge::{
         derived_by, link, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
     };
@@ -734,7 +734,7 @@ mod unified_walk {
             id,
             brain_core::NamespaceId::SYSTEM,
             SpaceId::from([0u8; 16]),
-            ContextId(0),
+            SessionId(0),
             id.slot(),
             id.version(),
             MemoryKind::Episodic,
@@ -1261,7 +1261,7 @@ mod property {
 
     use std::collections::{HashMap, HashSet, VecDeque};
 
-    use brain_core::{SpaceId, ContextId, EdgeKind, MemoryId, MemoryKind};
+    use brain_core::{SpaceId, SessionId, EdgeKind, MemoryId, MemoryKind};
     use brain_index::{proximity_score, RankedItemId};
     use brain_metadata::tables::edge::{
         derived_by, link, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
@@ -1279,7 +1279,7 @@ mod property {
             id,
             brain_core::NamespaceId::SYSTEM,
             SpaceId::from([0u8; 16]),
-            ContextId(0),
+            SessionId(0),
             id.slot(),
             id.version(),
             MemoryKind::Episodic,

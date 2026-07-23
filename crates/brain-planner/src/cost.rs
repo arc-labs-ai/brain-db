@@ -159,9 +159,9 @@ fn per_rule_selectivity(rule: &FilterRule) -> f32 {
             let r = (kinds.len() as f32 / 3.0).clamp(SELECTIVITY_FLOOR, 1.0);
             r
         }
-        FilterRule::ContextIn(contexts) => {
+        FilterRule::SessionIn(sessions) => {
             #[allow(clippy::cast_precision_loss)]
-            let r = (contexts.len() as f32 / 10.0).clamp(SELECTIVITY_FLOOR, 1.0);
+            let r = (sessions.len() as f32 / 10.0).clamp(SELECTIVITY_FLOOR, 1.0);
             r
         }
         FilterRule::SalienceFloor(threshold) => (1.0 - threshold).clamp(0.05, 1.0),

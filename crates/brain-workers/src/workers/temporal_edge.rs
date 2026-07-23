@@ -12,7 +12,7 @@
 //! ## Flow
 //!
 //! 1. The writer's ENCODE handler pushes
-//!    `(memory_id, space_id, context_id, created_at_unix_nanos)`
+//!    `(memory_id, space_id, session_id, created_at_unix_nanos)`
 //!    into a per-shard `flume::Sender` after redb commit. Non-blocking;
 //!    full channel drops with a counter bump.
 //! 2. The worker drains the receiver in bounded batches every
@@ -31,7 +31,7 @@
 //! ## What's *not* in scope
 //!
 //! - Cross-space edges (different space_id → no edge).
-//! - Cross-context by default (`cross_context = true` knob to opt in).
+//! - Cross-session by default (`cross_session = true` knob to opt in).
 //! - Multi-strand temporal threading. If three memories arrive in
 //!   rapid succession this worker builds a chain, not a fan.
 //! - Backfilling existing memories. Migration is for the timeline
@@ -43,7 +43,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use brain_core::{SpaceId, ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
+use brain_core::{SpaceId, SessionId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
 use brain_metadata::tables::edge::{derived_by, origin, zero_disambiguator, EdgeKey};
 use brain_metadata::tables::memory::{
     space_timeline_prefix_space, space_timeline_prefix_space_time, SPACE_TIMELINE_KEY_LEN,
@@ -76,9 +76,9 @@ pub struct TemporalEdgeKnobs {
     /// get written; keeps the table from filling with near-zero
     /// weight rows.
     pub weight_min: f32,
-    /// Allow `FollowedBy` across context boundaries. Defaults to
-    /// `false` — most narratives are scoped to a single context.
-    pub cross_context: bool,
+    /// Allow `FollowedBy` across session boundaries. Defaults to
+    /// `false` — most narratives are scoped to a single session.
+    pub cross_session: bool,
     /// Minimum cosine similarity between the new memory and its
     /// candidate predecessor for the edge to be written.
     ///
@@ -101,7 +101,7 @@ pub struct TemporalEdgeKnobs {
 /// the thread between genuinely separate sittings.
 pub const DEFAULT_WINDOW_SECONDS: u64 = 1800;
 pub const DEFAULT_WEIGHT_MIN: f32 = 0.1;
-pub const DEFAULT_CROSS_CONTEXT: bool = false;
+pub const DEFAULT_CROSS_SESSION: bool = false;
 pub const DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD: f32 = 0.4;
 
 impl Default for TemporalEdgeKnobs {
@@ -109,7 +109,7 @@ impl Default for TemporalEdgeKnobs {
         Self {
             window_seconds: DEFAULT_WINDOW_SECONDS,
             weight_min: DEFAULT_WEIGHT_MIN,
-            cross_context: DEFAULT_CROSS_CONTEXT,
+            cross_session: DEFAULT_CROSS_SESSION,
             topical_threshold: DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD,
         }
     }
@@ -267,7 +267,7 @@ async fn do_temporal_edge_cycle(
                 Err(_) => break,
             }
         };
-        let (new_memory_id, space_id, context_id, new_ts, new_vector) = item;
+        let (new_memory_id, space_id, session_id, new_ts, new_vector) = item;
         processed += 1;
         drained_sources.push(new_memory_id);
         source_spaces.insert(new_memory_id, space_id);
@@ -278,10 +278,10 @@ async fn do_temporal_edge_cycle(
         let prev_lookup = lookup_predecessor(
             ctx,
             space_id,
-            context_id,
+            session_id,
             new_ts,
             new_memory_id,
-            knobs.cross_context,
+            knobs.cross_session,
         );
         let (prev_id, prev_ts) = match prev_lookup {
             PredecessorOutcome::Found(id, ts) => (id, ts),
@@ -479,7 +479,7 @@ async fn do_temporal_edge_cycle(
             lsn: 0,
             event_type: EventType::StageCompleted,
             memory_id,
-            context_id: ContextId::default(),
+            session_id: SessionId::default(),
             kind: MemoryKind::Episodic,
             salience: 0.0,
             timestamp_unix_nanos: ts,
@@ -540,10 +540,10 @@ enum PredecessorOutcome {
 fn lookup_predecessor(
     ctx: &WorkerContext,
     space_id: SpaceId,
-    context_id: ContextId,
+    session_id: SessionId,
     new_ts: u64,
     new_memory_id: MemoryId,
-    cross_context: bool,
+    cross_session: bool,
 ) -> PredecessorOutcome {
     use brain_metadata::tables::memory::flags as memory_flags;
 
@@ -576,7 +576,7 @@ fn lookup_predecessor(
     // Range scan: from the start of this (namespace, space)'s rows up to
     // (but not including) the new memory's key. The last entry in that
     // range is the most recent predecessor. The timeline key is:
-    //   [namespace(4)] [space(16)] [created_at_be(8)] [context(8)] [memory_id(16)]
+    //   [namespace(4)] [space(16)] [created_at_be(8)] [session(8)] [memory_id(16)]
     // so a prefix `[namespace(4)] [space(16)] [new_ts_be(8)]` and a `..`
     // exclusive upper bound is exactly what we want.
     let lower = space_timeline_prefix_space(namespace_id, space_id.0.into_bytes());
@@ -609,9 +609,9 @@ fn lookup_predecessor(
     }
 
     // Decode the key (namespace-prefixed layout: ns(4) space(16)
-    // ts(8) context(8) memory_id(16)).
+    // ts(8) session(8) memory_id(16)).
     let prev_ts = u64::from_be_bytes(last_key_bytes[20..28].try_into().unwrap_or([0; 8]));
-    let prev_context = u64::from_be_bytes(last_key_bytes[28..36].try_into().unwrap_or([0; 8]));
+    let prev_session = u64::from_be_bytes(last_key_bytes[28..36].try_into().unwrap_or([0; 8]));
     let mut prev_mem_bytes = [0u8; 16];
     prev_mem_bytes.copy_from_slice(&last_key_bytes[36..52]);
     let prev_id = MemoryId::from_be_bytes(prev_mem_bytes);
@@ -627,7 +627,7 @@ fn lookup_predecessor(
         // belt-and-suspenders.
         return PredecessorOutcome::Skip(TemporalSkipReason::OutOfOrder);
     }
-    if !cross_context && prev_context != context_id.0 {
+    if !cross_session && prev_session != session_id.0 {
         return PredecessorOutcome::Skip(TemporalSkipReason::CrossContext);
     }
 
@@ -665,7 +665,7 @@ mod tests {
         );
         assert_eq!(k.window_seconds, DEFAULT_WINDOW_SECONDS);
         assert!((k.weight_min - DEFAULT_WEIGHT_MIN).abs() < f32::EPSILON);
-        assert_eq!(k.cross_context, DEFAULT_CROSS_CONTEXT);
+        assert_eq!(k.cross_session, DEFAULT_CROSS_SESSION);
     }
 
     #[test]

@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use brain_core::{SpaceId, ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{SpaceId, SessionId, EdgeKind, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
@@ -86,7 +86,7 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
                 id,
                 brain_core::NamespaceId::SYSTEM,
                 space,
-                ContextId(42),
+                SessionId(42),
                 (i + 1) as u64,
                 1,
                 MemoryKind::Episodic,
@@ -163,7 +163,7 @@ fn plan_request_traced(
             max_branches_explored: 256,
         },
         strategy_hint: None,
-        context_filter: None,
+        session_filter: None,
         request_id: None,
         txn_id: None,
         trace,

@@ -6,7 +6,7 @@
 //! - **Publication**: encode and forget publish events with
 //!   monotonically increasing LSNs; TXN_COMMIT publishes all
 //!   buffered events in order; TXN_ABORT publishes nothing.
-//! - **Filter**: contexts / kinds / null / combined.
+//! - **Filter**: session_filter / kinds / null / combined.
 //! - **Dispatcher** (`handle_subscribe`): first-event match,
 //!   timeout, `LsnTooOld` for `from_lsn=Some`.
 //! - **Backpressure**: a lagged subscriber surfaces `Overloaded`,
@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use brain_core::{ContextId, MemoryId, MemoryKind};
+use brain_core::{SessionId, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
@@ -109,12 +109,12 @@ fn build_fixture_with(bus: EventBus) -> Fixture {
 fn encode_req(
     request_id: [u8; 16],
     text: &str,
-    context_id: u64,
+    session_id: u64,
     _kind: MemoryKindWire,
 ) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
-        context_id,
+        session_id,
         request_id,
         txn_id: None,
         occurred_at_unix_nanos: None,
@@ -126,7 +126,7 @@ fn encode_req(
 
 fn empty_filter() -> SubscriptionFilter {
     SubscriptionFilter {
-        contexts: None,
+        session_filter: None,
         kinds: None,
         similar_to: None,
         spaces: None,
@@ -289,7 +289,7 @@ fn publish_encode_emits_event_with_increasing_lsn() {
             e1.lsn,
             e2.lsn
         );
-        assert_eq!(e1.context_id, ContextId(42));
+        assert_eq!(e1.session_id, SessionId(42));
         assert_eq!(e1.kind, MemoryKind::Episodic);
         assert_eq!(e1.text.as_deref(), Some("alpha"));
     })
@@ -319,7 +319,7 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
             dispatch(
                 RequestBody::Encode(EncodeRequest {
                     text: "one".into(),
-                    context_id: 100,
+                    session_id: 100,
                     request_id: [0xA; 16],
                     txn_id: Some(txn_id),
                     occurred_at_unix_nanos: None,
@@ -340,7 +340,7 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
             dispatch(
                 RequestBody::Encode(EncodeRequest {
                     text: "two".into(),
-                    context_id: 100,
+                    session_id: 100,
                     request_id: [0xB; 16],
                     txn_id: Some(txn_id),
                     occurred_at_unix_nanos: None,
@@ -396,7 +396,7 @@ fn filter_context_drops_off_context_events() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let mut filter = empty_filter();
-        filter.contexts = Some(vec![42]);
+        filter.session_filter = Some(vec![42]);
         let handle = fix.ctx.subscriptions.register(&sub_req(filter)).unwrap();
         let mut rx = handle.receiver;
 
@@ -416,7 +416,7 @@ fn filter_context_drops_off_context_events() {
             if let Some(env) = try_recv(&mut rx, Duration::from_millis(200)).await {
                 if handle.filter.matches(&env) {
                     matched += 1;
-                    assert_eq!(env.context_id, ContextId(42));
+                    assert_eq!(env.session_id, SessionId(42));
                 }
             }
         }
@@ -582,7 +582,7 @@ fn lagged_subscriber_freezes_final_lsn_and_reports_overloaded() {
                 lsn: 0,
                 event_type: EventType::Encoded,
                 memory_id: MemoryId::from(1u128),
-                context_id: ContextId(1),
+                session_id: SessionId(1),
                 kind: MemoryKind::Episodic,
                 salience: 0.5,
                 timestamp_unix_nanos: 0,
@@ -801,7 +801,7 @@ mod wal_record_projection {
             request_id: RequestId::default(),
             space_id: SpaceId::default(),
             namespace_id: brain_core::NamespaceId::SYSTEM,
-            context_id: ContextId(0),
+            session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.5,
             embedding_model_fp: [0xAB; 16],
@@ -1014,7 +1014,7 @@ mod stage_completed_durability {
             lsn: 0,
             event_type: EventType::StageCompleted,
             memory_id,
-            context_id: ContextId::default(),
+            session_id: SessionId::default(),
             kind: MemoryKind::Episodic,
             salience: 0.0,
             timestamp_unix_nanos: 1_700_000_000_000_000_002,

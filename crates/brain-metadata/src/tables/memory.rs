@@ -21,7 +21,7 @@
 
 use std::ops::Bound;
 
-use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, NamespaceId};
+use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, NamespaceId};
 use redb::{ReadTransaction, TableDefinition};
 
 use crate::tables::scope::RowScope;
@@ -36,7 +36,7 @@ pub const MEMORIES_TABLE: TableDefinition<'static, [u8; 16], MemoryMetadata> =
     TableDefinition::new("memories");
 
 /// Secondary timeline index keyed `(space_id_bytes, created_at_unix_nanos
-/// BE bytes, context_id BE bytes, memory_id BE bytes)` → `()`.
+/// BE bytes, session_id BE bytes, memory_id BE bytes)` → `()`.
 ///
 /// The TemporalEdgeWorker (`FollowedBy` auto-derivation) needs
 /// to answer "most-recent memory by space A within context C and
@@ -72,14 +72,14 @@ pub fn space_timeline_key(
     namespace_id: u32,
     space_id_bytes: [u8; 16],
     created_at_unix_nanos: u64,
-    context_id: u64,
+    session_id: u64,
     memory_id_bytes: [u8; 16],
 ) -> [u8; SPACE_TIMELINE_KEY_LEN] {
     let mut k = [0u8; SPACE_TIMELINE_KEY_LEN];
     k[0..4].copy_from_slice(&namespace_id.to_be_bytes());
     k[4..20].copy_from_slice(&space_id_bytes);
     k[20..28].copy_from_slice(&created_at_unix_nanos.to_be_bytes());
-    k[28..36].copy_from_slice(&context_id.to_be_bytes());
+    k[28..36].copy_from_slice(&session_id.to_be_bytes());
     k[36..52].copy_from_slice(&memory_id_bytes);
     k
 }
@@ -391,7 +391,7 @@ pub struct MemoryMetadata {
     /// [`Self::with_namespace`].
     pub namespace_id: u32,
     pub space_id_bytes: [u8; 16],
-    pub context_id: u64,
+    pub session_id: u64,
     pub slot_id: u64,
     pub slot_version: u32,
 
@@ -460,7 +460,7 @@ impl MemoryMetadata {
         memory_id: MemoryId,
         namespace_id: NamespaceId,
         space_id: SpaceId,
-        context_id: ContextId,
+        session_id: SessionId,
         slot_id: u64,
         slot_version: u32,
         kind: MemoryKind,
@@ -477,7 +477,7 @@ impl MemoryMetadata {
             // without naming its namespace (fail-closed by construction).
             namespace_id: namespace_id.raw(),
             space_id_bytes: space_id.into(),
-            context_id: context_id.raw(),
+            session_id: session_id.raw(),
             slot_id,
             slot_version,
             kind: memory_kind_to_u8(kind),
@@ -550,8 +550,8 @@ impl MemoryMetadata {
     }
 
     #[must_use]
-    pub fn context(&self) -> ContextId {
-        ContextId(self.context_id)
+    pub fn session(&self) -> SessionId {
+        SessionId(self.session_id)
     }
 
     pub fn kind(&self) -> Result<MemoryKind, BadMemoryKind> {
@@ -644,7 +644,7 @@ impl redb::Value for MemoryMetadata {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, NamespaceId};
+    use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, NamespaceId};
     use redb::{Database, ReadableDatabase};
 
     fn aid(byte: u8) -> SpaceId {
@@ -658,7 +658,7 @@ mod tests {
             MemoryId::pack(1, slot, 1),
             NamespaceId::SYSTEM,
             aid(slot as u8),
-            ContextId(0xCAFE),
+            SessionId(0xCAFE),
             slot,
             1,
             MemoryKind::Episodic,
@@ -745,7 +745,7 @@ mod tests {
                     MemoryId::pack(1, i, 1),
                     ns,
                     space,
-                    ContextId(0),
+                    SessionId(0),
                     i,
                     1,
                     MemoryKind::Episodic,
@@ -759,7 +759,7 @@ mod tests {
                     m.namespace_id,
                     m.space_id_bytes,
                     key_created, // deliberately != m.created_at_unix_nanos
-                    m.context_id,
+                    m.session_id,
                     m.memory_id_bytes,
                 );
                 tt.insert(tk.as_slice(), &()).unwrap();
@@ -819,7 +819,7 @@ mod tests {
     fn brain_core_type_round_trip() {
         let memory_id = MemoryId::pack(7, 0x1234_5678, 42);
         let space_id = aid(0x33);
-        let context = ContextId(99);
+        let context = SessionId(99);
 
         let m = MemoryMetadata::new_active(
             memory_id,
@@ -836,7 +836,7 @@ mod tests {
         );
         assert_eq!(m.memory_id(), memory_id);
         assert_eq!(m.space_id(), space_id);
-        assert_eq!(m.context(), context);
+        assert_eq!(m.session(), context);
         assert_eq!(m.kind().unwrap(), MemoryKind::Semantic);
     }
 }

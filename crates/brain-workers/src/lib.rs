@@ -96,7 +96,7 @@ pub use workers::snapshot::{
 pub use workers::statement_embed::{StatementEmbedKnobs, StatementEmbedWorker};
 pub use workers::statistics::{StatisticsUpdateWorker, Stats};
 pub use workers::temporal_edge::{
-    TemporalEdgeKnobs, TemporalEdgeWorker, DEFAULT_CROSS_CONTEXT,
+    TemporalEdgeKnobs, TemporalEdgeWorker, DEFAULT_CROSS_SESSION,
     DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD, DEFAULT_WEIGHT_MIN, DEFAULT_WINDOW_SECONDS,
 };
 pub use workers::wal_retention::{

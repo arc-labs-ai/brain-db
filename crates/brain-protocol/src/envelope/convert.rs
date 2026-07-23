@@ -2,7 +2,7 @@
 //! wire-mirror enums.
 //!
 //! The primitive-aliased conversions (`MemoryId ⇄ WireMemoryId`,
-//! `ContextId ⇄ WireContextId`, `SpaceId / RequestId / TxnId ⇄ WireUuid`)
+//! `SessionId ⇄ WireSessionId`, `SpaceId / RequestId / TxnId ⇄ WireUuid`)
 //! live in `brain_core` rather than here — the wire-domain aliases are
 //! type-aliases for primitives, so the From impls must live where the
 //! domain types are local (orphan rules).
@@ -104,10 +104,10 @@ impl From<EdgeKind> for GraphEdgeKindWire {
 
 #[cfg(test)]
 mod tests {
-    use brain_core::{SpaceId, ContextId, EdgeKind, MemoryId, MemoryKind, RequestId, TxnId};
+    use brain_core::{SpaceId, SessionId, EdgeKind, MemoryId, MemoryKind, RequestId, TxnId};
 
     use super::*;
-    use crate::envelope::request::{WireContextId, WireMemoryId, WireUuid};
+    use crate::envelope::request::{WireSessionId, WireMemoryId, WireUuid};
 
     #[test]
     fn memory_id_round_trips_via_wire() {
@@ -121,10 +121,10 @@ mod tests {
     }
 
     #[test]
-    fn context_id_round_trips_via_wire() {
-        let id = ContextId(0x0123_4567_89AB_CDEF);
-        let wire: WireContextId = id.into();
-        let back: ContextId = wire.into();
+    fn session_id_round_trips_via_wire() {
+        let id = SessionId(0x0123_4567_89AB_CDEF);
+        let wire: WireSessionId = id.into();
+        let back: SessionId = wire.into();
         assert_eq!(back, id);
     }
 

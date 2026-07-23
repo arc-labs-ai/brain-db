@@ -534,7 +534,7 @@ where
     // The receiver loop returns the session id it minted at
     // HELLO/WELCOME (or all-zero when the connection died pre-handshake).
     // We need it post-loop to drive the auto-abort sweep below.
-    let (result, session_id) = receiver_loop(
+    let (result, connection_id) = receiver_loop(
         &mut read_half,
         &topology,
         &limits,
@@ -558,8 +558,8 @@ where
     // this session opened (TXN_BEGIN without a matching COMMIT/ABORT)
     // is still buffering work on its target shard; sweep every shard
     // and discard the buffer. Pre-handshake disconnects carry an
-    // all-zero session_id; the sweep is a cheap no-op in that case.
-    abort_orphaned_transactions(&topology, session_id).await;
+    // all-zero connection_id; the sweep is a cheap no-op in that case.
+    abort_orphaned_transactions(&topology, connection_id).await;
 
     result
 }
@@ -570,17 +570,17 @@ where
 /// abort count when at least one txn was swept; stays silent on the
 /// common "session never opened a txn" path.
 ///
-/// All-zero `session_id` (pre-handshake disconnect, in-process tests)
-/// short-circuits to a no-op — `TxnStore::abort_orphaned_for_session`
+/// All-zero `connection_id` (pre-handshake disconnect, in-process tests)
+/// short-circuits to a no-op — `TxnStore::abort_orphaned_for_connection`
 /// enforces the same guard, but skipping the cross-runtime hop saves
 /// a per-shard message per connection close.
-async fn abort_orphaned_transactions(topology: &Topology, session_id: [u8; 16]) {
-    if session_id == [0u8; 16] {
+async fn abort_orphaned_transactions(topology: &Topology, connection_id: [u8; 16]) {
+    if connection_id == [0u8; 16] {
         return;
     }
     let mut total_aborted = 0usize;
     for shard in topology.shards.iter() {
-        match shard.abort_orphaned_for_session(session_id).await {
+        match shard.abort_orphaned_for_connection(connection_id).await {
             Ok(n) => total_aborted += n,
             Err(e) => {
                 debug!(
@@ -592,7 +592,7 @@ async fn abort_orphaned_transactions(topology: &Topology, session_id: [u8; 16]) 
     }
     if total_aborted > 0 {
         info!(
-            session_id = %uuid::Uuid::from_bytes(session_id),
+            connection_id = %uuid::Uuid::from_bytes(connection_id),
             aborted = total_aborted,
             "auto-aborted orphaned transactions on disconnect"
         );
@@ -658,7 +658,7 @@ where
     // caller needs for the disconnect-time txn sweep.
     macro_rules! exit {
         ($result:expr) => {{
-            return ($result, state.session_id);
+            return ($result, state.connection_id);
         }};
     }
 

@@ -43,7 +43,7 @@ pub struct RequestCaller {
     /// drops before TXN_COMMIT. All-zero means "no session" (in-process
     /// test path or pre-handshake dispatch); the auto-abort sweep
     /// treats all-zero as a no-op.
-    pub session_id: [u8; 16],
+    pub connection_id: [u8; 16],
 }
 
 impl RequestCaller {
@@ -63,7 +63,7 @@ impl RequestCaller {
             user_id,
             namespace,
             permissions,
-            session_id: [0u8; 16],
+            connection_id: [0u8; 16],
         }
     }
 
@@ -80,7 +80,7 @@ impl RequestCaller {
             user_id: [0u8; 16],
             namespace: String::new(),
             permissions: perm_bits::FULL,
-            session_id: [0u8; 16],
+            connection_id: [0u8; 16],
         }
     }
 
@@ -88,8 +88,8 @@ impl RequestCaller {
     /// connection layer calls this after `to_caller()` so the txn store
     /// can link buffered work back to the originating connection.
     #[must_use]
-    pub fn with_session_id(mut self, session_id: [u8; 16]) -> Self {
-        self.session_id = session_id;
+    pub fn with_session_id(mut self, connection_id: [u8; 16]) -> Self {
+        self.connection_id = connection_id;
         self
     }
 
@@ -349,7 +349,7 @@ pub async fn dispatch(
         // the connection-drop sweep (on connection drop
         // before commit, none of the operations take effect) can
         // identify which buffered work belongs to a dying connection.
-        RequestBody::TxnBegin(r) => crate::txn::handle_txn_begin(r, caller.session_id, ctx)
+        RequestBody::TxnBegin(r) => crate::txn::handle_txn_begin(r, caller.connection_id, ctx)
             .await
             .map(|b| single(ResponseBody::TxnBegin(b))),
 
@@ -396,8 +396,8 @@ pub async fn dispatch(
         | RequestBody::AdminRestore(_)
         | RequestBody::AdminIntegrityCheck(_)
         | RequestBody::AdminMigrateEmbeddings(_)
-        | RequestBody::AdminCreateContext(_)
-        | RequestBody::AdminRenameContext(_)
+        | RequestBody::AdminCreateSession(_)
+        | RequestBody::AdminRenameSession(_)
         | RequestBody::AdminMoveMemory(_)
         | RequestBody::AdminReclassify(_)
         | RequestBody::AdminListTombstoned(_)
@@ -687,8 +687,8 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
         | RequestBody::AdminRestore(_)
         | RequestBody::AdminIntegrityCheck(_)
         | RequestBody::AdminMigrateEmbeddings(_)
-        | RequestBody::AdminCreateContext(_)
-        | RequestBody::AdminRenameContext(_)
+        | RequestBody::AdminCreateSession(_)
+        | RequestBody::AdminRenameSession(_)
         | RequestBody::AdminMoveMemory(_)
         | RequestBody::AdminReclassify(_)
         | RequestBody::AdminListTombstoned(_)
@@ -774,7 +774,7 @@ mod tests {
     fn encode_req() -> RequestBody {
         RequestBody::Encode(EncodeRequest {
             text: "hi".into(),
-            context_id: 0,
+            session_id: 0,
             request_id: [0u8; 16],
             txn_id: None,
             occurred_at_unix_nanos: None,

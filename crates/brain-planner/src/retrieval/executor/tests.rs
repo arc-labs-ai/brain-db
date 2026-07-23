@@ -5,7 +5,7 @@ use std::sync::Mutex as StdMutex;
 use std::thread;
 use std::time::Duration;
 
-use brain_core::{SpaceId, ContextId, Entity, EntityId, EntityType, MemoryId, MemoryKind};
+use brain_core::{SpaceId, SessionId, Entity, EntityId, EntityType, MemoryId, MemoryKind};
 use brain_index::{
     GraphError, GraphQuery, GraphRetriever, GraphRetrieverConfig, LexicalError, LexicalQuery,
     LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItem, RankedItemId,
@@ -129,7 +129,7 @@ fn seed_active_slots(metadata: &mut MetadataDb, slots: impl IntoIterator<Item = 
                 id,
                 brain_core::NamespaceId::SYSTEM,
                 SpaceId::new(),
-                ContextId::from(0),
+                SessionId::from(0),
                 id.slot(),
                 id.version(),
                 MemoryKind::Semantic,
@@ -158,7 +158,7 @@ fn seed_active_memories(metadata: &mut MetadataDb, slots: std::ops::Range<u64>) 
                 id,
                 brain_core::NamespaceId::SYSTEM,
                 SpaceId::new(),
-                ContextId::from(0),
+                SessionId::from(0),
                 id.slot(),
                 id.version(),
                 MemoryKind::Semantic,

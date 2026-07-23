@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use brain_core::{SpaceId, ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{SpaceId, SessionId, EdgeKind, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::edge::{
@@ -90,7 +90,7 @@ fn seed_memory(metadata: &SharedMetadataDb, slot: u64) -> MemoryId {
             id,
             brain_core::NamespaceId::SYSTEM,
             SpaceId(Uuid::nil()),
-            ContextId(1),
+            SessionId(1),
             slot,
             1,
             MemoryKind::Episodic,

@@ -27,7 +27,7 @@
 //!
 //! Add a one-shot test against that exact seed to reproduce.
 
-use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, RequestId};
+use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, RequestId};
 use brain_storage::arena::ArenaFile;
 use brain_storage::recovery::{recover, InMemoryMetadataSink};
 use brain_storage::wal::{EncodePayload, Lsn, Wal, WalPayload, WalRecord, WAL_SEGMENT_HEADER_LEN};
@@ -99,7 +99,7 @@ fn gen_record(rng: &mut u64, slot: u64) -> WalRecord {
         request_id: RequestId::from(bytes16_from(r1)),
         space_id: SpaceId::from(bytes16_from(r2)),
         namespace_id: brain_core::NamespaceId::SYSTEM,
-        context_id: ContextId(r3),
+        session_id: SessionId(r3),
         kind: MemoryKind::Episodic,
         salience_initial: 0.5,
         embedding_model_fp: bytes16_from(r4),

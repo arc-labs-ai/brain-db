@@ -101,7 +101,7 @@ pub struct EntityUnmergeRequest {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityResolveRequest {
     pub candidate_name: String,
-    pub context: String,
+    pub resolution_context: String,
     /// `0` = no hint; otherwise an EntityTypeId.
     pub entity_type_hint: u32,
     pub allow_create: bool,

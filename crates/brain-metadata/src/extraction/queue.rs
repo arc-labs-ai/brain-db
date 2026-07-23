@@ -94,11 +94,11 @@ pub fn extraction_queue_len(rtxn: &ReadTransaction) -> Result<u64, ExtractionQue
 mod tests {
     use super::*;
     use crate::tables::fresh_db;
-    use brain_core::ContextId;
+    use brain_core::SessionId;
     use redb::ReadableDatabase;
 
     fn mem(byte: u16) -> MemoryId {
-        MemoryId::pack(byte, ContextId::DEFAULT.into(), 0)
+        MemoryId::pack(byte, SessionId::DEFAULT.into(), 0)
     }
 
     #[test]

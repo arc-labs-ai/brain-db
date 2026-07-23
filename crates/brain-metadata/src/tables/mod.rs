@@ -7,7 +7,6 @@ pub mod space;
 pub mod api_keys;
 pub mod audit;
 pub mod checkpoint;
-pub mod context;
 pub mod contradiction;
 pub mod edge;
 pub mod entity;
@@ -31,6 +30,7 @@ pub mod relation;
 pub mod relation_type;
 pub mod schema_version;
 pub mod scope;
+pub mod session;
 pub mod slot_version;
 pub mod statement;
 pub mod statement_question;
@@ -102,8 +102,8 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
         EXTRACTOR_AUDIT_BY_MEMORY_TABLE, EXTRACTOR_AUDIT_BY_TIME_TABLE, EXTRACTOR_AUDIT_TABLE,
     };
     use checkpoint::CHECKPOINTS_TABLE;
-    use context::{SPACE_CONTEXTS_TABLE, CONTEXTS_TABLE, CONTEXT_NAMES_TABLE};
     use contradiction::STATEMENT_CONTRADICTION_AUDIT_TABLE;
+    use session::{SPACE_SESSIONS_TABLE, SESSIONS_TABLE, SESSION_NAMES_TABLE};
     use edge::{EDGES_REVERSE_TABLE, EDGES_TABLE};
     use entity::{
         ENTITIES_TABLE, ENTITY_ALIASES_TABLE, ENTITY_BY_CANONICAL_NAME_TABLE,
@@ -147,9 +147,9 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     let _ = wtxn.open_table(ENTITY_RESOLUTION_AUDIT_TABLE)?;
     let _ = wtxn.open_table(STATEMENT_CONTRADICTION_AUDIT_TABLE)?;
     let _ = wtxn.open_table(CHECKPOINTS_TABLE)?;
-    let _ = wtxn.open_table(CONTEXTS_TABLE)?;
-    let _ = wtxn.open_table(CONTEXT_NAMES_TABLE)?;
-    let _ = wtxn.open_table(SPACE_CONTEXTS_TABLE)?;
+    let _ = wtxn.open_table(SESSIONS_TABLE)?;
+    let _ = wtxn.open_table(SESSION_NAMES_TABLE)?;
+    let _ = wtxn.open_table(SPACE_SESSIONS_TABLE)?;
     let _ = wtxn.open_table(EDGES_TABLE)?;
     let _ = wtxn.open_table(EDGES_REVERSE_TABLE)?;
     let _ = wtxn.open_table(ENTITY_TYPES_TABLE)?;

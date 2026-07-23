@@ -128,7 +128,7 @@ fn exp_decay(age_secs: f32, half_life_seconds: u64) -> f32 {
 mod tests {
     use super::*;
     use crate::ids::ExtractorId;
-    use crate::{ContextId, MemoryId};
+    use crate::{SessionId, MemoryId};
 
     fn cfg() -> ConfidenceConfig {
         ConfidenceConfig::default_v1()
@@ -136,7 +136,7 @@ mod tests {
 
     fn evi(confidence: f32, timestamp_unix_nanos: u64) -> EvidenceEntry {
         EvidenceEntry::from_parts(
-            MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+            MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
             confidence,
             timestamp_unix_nanos,
             ExtractorId::from(0),
@@ -229,13 +229,13 @@ mod tests {
 mod proptests {
     use super::*;
     use crate::ids::ExtractorId;
-    use crate::{ContextId, MemoryId};
+    use crate::{SessionId, MemoryId};
     use proptest::prelude::*;
 
     fn evi_strategy() -> impl Strategy<Value = EvidenceEntry> {
         (0.0f32..=1.0f32, 0u64..2_000_000_000_000_000_000u64).prop_map(|(c, ts)| {
             EvidenceEntry::from_parts(
-                MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+                MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
                 c,
                 ts,
                 ExtractorId::from(0),

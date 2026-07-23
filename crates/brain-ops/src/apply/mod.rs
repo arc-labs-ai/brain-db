@@ -149,7 +149,7 @@ pub fn dispatch(
         },
         Phase::UpdateSalience { .. } => memory::apply_update_salience(wtxn, phase, write),
         Phase::UpdateKind { .. } => memory::apply_update_kind(wtxn, phase, write),
-        Phase::UpdateContext { .. } => memory::apply_update_context(wtxn, phase, write),
+        Phase::UpdateSession { .. } => memory::apply_update_session(wtxn, phase, write),
         Phase::UpdateEmbedding { .. } => memory::apply_update_embedding(wtxn, phase, write),
         Phase::UpdateEntity { .. } => entity::apply_update_entity(wtxn, phase, write),
         Phase::RenameEntity { .. } => entity::apply_rename_entity(wtxn, phase, write),

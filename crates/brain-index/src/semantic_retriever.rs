@@ -139,11 +139,11 @@ pub struct SemanticFilters {
     pub created_at_ms: Option<RangeInclusive<u64>>,
     pub extracted_at_ms: Option<RangeInclusive<u64>>,
     /// Front-gate scope tag: when non-empty, the closure restricts
-    /// HNSW visits to memories whose `context_id` is in this set. The
+    /// HNSW visits to memories whose `session_id` is in this set. The
     /// closure already reads `MemoryMetadata` per visit (for space /
     /// kind / created_at), so checking context costs nothing extra and
     /// stays bounded by HNSW visits — sublinear in the corpus size.
-    pub context_ids: Vec<u64>,
+    pub session_ids: Vec<u64>,
 }
 
 /// HNSW search config + post-search cuts.

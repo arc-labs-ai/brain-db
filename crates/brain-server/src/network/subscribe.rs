@@ -696,7 +696,7 @@ fn empty_subscription_event_frame(stream_id: u32, last_lsn: u64) -> Frame {
     let payload = ResponseBody::SubscribeEvent(SubscriptionEvent {
         event_type: brain_protocol::envelope::response::EventType::Forgotten,
         memory_id: MemoryId::NULL.raw(),
-        context_id: 0,
+        session_id: 0,
         text: String::new(),
         kind: brain_protocol::envelope::request::MemoryKindWire::Episodic,
         salience: 0.0,

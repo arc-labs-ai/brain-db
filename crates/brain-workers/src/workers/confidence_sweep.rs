@@ -504,7 +504,7 @@ fn materialise_evidence(
 #[allow(dead_code)] // tests use these helpers
 fn evidence_entry(memory_byte: u8, confidence: f32, timestamp_unix_nanos: u64) -> EvidenceEntry {
     EvidenceEntry::from_parts(
-        MemoryId::pack(memory_byte as u16, brain_core::ContextId::DEFAULT.into(), 0),
+        MemoryId::pack(memory_byte as u16, brain_core::SessionId::DEFAULT.into(), 0),
         confidence,
         timestamp_unix_nanos,
         ExtractorId::from(0),
@@ -543,7 +543,7 @@ mod tests {
 
     use super::*;
     use brain_core::{
-        ContextId, EntityId, EvidenceOverflowId, ExtractorId, MemoryId, PredicateId, StatementId,
+        SessionId, EntityId, EvidenceOverflowId, ExtractorId, MemoryId, PredicateId, StatementId,
     };
     use brain_core::{Entity, EntityType, EvidenceRef, Statement, StatementObject, SubjectRef};
     use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
@@ -754,7 +754,7 @@ mod tests {
         // is older than the row by `offset` nanos).
         let evidence_ts = extracted_at.saturating_sub(evidence_age_offset_ns);
         let evidence = EvidenceRef::inline_from_slice(&[EvidenceEntry::from_parts(
-            MemoryId::pack(n as u16, ContextId::DEFAULT.into(), 0),
+            MemoryId::pack(n as u16, SessionId::DEFAULT.into(), 0),
             evidence_confidence,
             evidence_ts,
             ExtractorId::from(0),
@@ -994,7 +994,7 @@ mod tests {
             let entries: Vec<EvidenceEntry> = (0..12)
                 .map(|i| {
                     EvidenceEntry::from_parts(
-                        MemoryId::pack(i as u16 + 1, ContextId::DEFAULT.into(), 0),
+                        MemoryId::pack(i as u16 + 1, SessionId::DEFAULT.into(), 0),
                         0.5,
                         extracted_at,
                         ExtractorId::from(0),

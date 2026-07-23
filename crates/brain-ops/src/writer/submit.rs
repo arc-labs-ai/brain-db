@@ -26,7 +26,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use brain_core::{ContextId, MemoryId, MemoryKind, NodeRef};
+use brain_core::{SessionId, MemoryId, MemoryKind, NodeRef};
 use brain_planner::WriterError;
 use brain_protocol::EventType;
 use brain_storage::wal::payload::WalPayload;
@@ -404,7 +404,7 @@ impl RealWriterHandle {
                 text,
                 vector,
                 kind,
-                context,
+                session_id,
                 created_at_unix_nanos,
                 ..
             } = phase
@@ -419,7 +419,7 @@ impl RealWriterHandle {
                     self,
                     *id,
                     write.space_id,
-                    *context,
+                    *session_id,
                     *created_at_unix_nanos,
                     vector.as_ref(),
                 ) {
@@ -466,7 +466,7 @@ impl RealWriterHandle {
                             space: write.space_id,
                             kind: *kind,
                             created_at_unix_ms: *created_at_unix_nanos / 1_000_000,
-                            context: context.raw(),
+                            session: session_id.raw(),
                         })
                         .await;
                 }
@@ -770,7 +770,7 @@ fn publish_events_for(writer: &RealWriterHandle, write: &Write, committed_at_uni
         let Some(mut env) = phase_to_envelope(phase, write, committed_at_unix_nanos) else {
             continue;
         };
-        // Tombstone(Memory) needs the original row's context_id +
+        // Tombstone(Memory) needs the original row's session_id +
         // kind in the envelope so subscribers can filter properly.
         // Read it back post-commit — the row is still present (soft
         // tombstone keeps it during the grace window).
@@ -779,8 +779,8 @@ fn publish_events_for(writer: &RealWriterHandle, write: &Write, committed_at_uni
             ..
         } = phase
         {
-            if let Some((ctx, kind)) = read_memory_context_and_kind(writer, *id) {
-                env.context_id = ctx;
+            if let Some((ctx, kind)) = read_memory_session_and_kind(writer, *id) {
+                env.session_id = ctx;
                 env.kind = kind;
             }
         }
@@ -788,15 +788,15 @@ fn publish_events_for(writer: &RealWriterHandle, write: &Write, committed_at_uni
     }
 }
 
-/// Read MEMORIES_TABLE for the row's context_id + kind. Used by the
+/// Read MEMORIES_TABLE for the row's session_id + kind. Used by the
 /// post-commit event publisher to stamp Tombstone events with the
 /// values the subscriber filter actually compares against. Returns
 /// `None` if the row went away between commit and publish (shouldn't
 /// happen — single-writer-per-shard — but defensive).
-fn read_memory_context_and_kind(
+fn read_memory_session_and_kind(
     writer: &RealWriterHandle,
     id: brain_core::MemoryId,
-) -> Option<(ContextId, MemoryKind)> {
+) -> Option<(SessionId, MemoryKind)> {
     let rtxn = writer.metadata().read_txn().ok()?;
     let t = rtxn
         .open_table(brain_metadata::tables::memory::MEMORIES_TABLE)
@@ -808,7 +808,7 @@ fn read_memory_context_and_kind(
         2 => MemoryKind::Consolidated,
         _ => MemoryKind::Episodic,
     };
-    Some((ContextId(row.context_id), kind))
+    Some((SessionId(row.session_id), kind))
 }
 
 /// Map a single phase into an [`EventEnvelope`] for the bus. Returns
@@ -826,13 +826,13 @@ fn phase_to_envelope(
             text,
             kind,
             salience,
-            context,
+            session_id,
             ..
         } => Some(EventEnvelope {
             lsn: 0,
             event_type: EventType::Encoded,
             memory_id: *id,
-            context_id: *context,
+            session_id: *session_id,
             kind: *kind,
             salience: salience.raw(),
             timestamp_unix_nanos: committed_at_unix_nanos,
@@ -850,7 +850,7 @@ fn phase_to_envelope(
                 lsn: 0,
                 event_type: EventType::Forgotten,
                 memory_id: *id,
-                context_id: ContextId::default(),
+                session_id: SessionId::default(),
                 kind: MemoryKind::Episodic,
                 salience: 0.0,
                 timestamp_unix_nanos: committed_at_unix_nanos,
@@ -880,7 +880,7 @@ fn phase_to_envelope(
             lsn: 0,
             event_type: EventType::EdgeAdded,
             memory_id: memory_id_from_node_ref(*from),
-            context_id: ContextId::default(),
+            session_id: SessionId::default(),
             kind: MemoryKind::Episodic,
             salience: 0.0,
             timestamp_unix_nanos: committed_at_unix_nanos,
@@ -905,7 +905,7 @@ fn phase_to_envelope(
             lsn: 0,
             event_type: EventType::EdgeRemoved,
             memory_id: memory_id_from_node_ref(*from),
-            context_id: ContextId::default(),
+            session_id: SessionId::default(),
             kind: MemoryKind::Episodic,
             salience: 0.0,
             timestamp_unix_nanos: committed_at_unix_nanos,
@@ -948,7 +948,7 @@ fn phase_to_envelope(
         // internal-ish maintenance op.
         Phase::UpdateSalience { .. }
         | Phase::UpdateKind { .. }
-        | Phase::UpdateContext { .. }
+        | Phase::UpdateSession { .. }
         | Phase::UpdateEmbedding { .. }
         | Phase::ReclaimSlots { .. } => None,
     }
@@ -989,7 +989,7 @@ mod tests {
     use super::*;
     use crate::write::{Phase, Write, WriteId};
     use crate::writer::RealWriterHandle;
-    use brain_core::{SpaceId, ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
+    use brain_core::{SpaceId, SessionId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
     use brain_embed::VECTOR_DIM;
     use brain_index::{IndexParams, SharedHnsw};
     use brain_metadata::tables::edge::zero_disambiguator;
@@ -1108,7 +1108,7 @@ mod tests {
             vector: Box::new([0.0_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: brain_core::Salience::default(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             created_at_unix_nanos: 1_700_000_000_000,
             arena_slot: 1,
             embedding_model_fp: [0xAA; 16],
@@ -1180,7 +1180,7 @@ mod tests {
             vector: Box::new([0.0_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: brain_core::Salience::default(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             created_at_unix_nanos: 1_700_000_000_000,
             arena_slot: 1,
             embedding_model_fp: [0xAA; 16],
@@ -1211,7 +1211,7 @@ mod tests {
             vector: Box::new([0.5_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: brain_core::Salience::default(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             created_at_unix_nanos: 1_700_000_000_000,
             arena_slot: 1,
             embedding_model_fp: [0xAA; 16],
@@ -1238,7 +1238,7 @@ mod tests {
             vector: Box::new([0.5_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: brain_core::Salience::default(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             created_at_unix_nanos: 0,
             arena_slot: 1,
             embedding_model_fp: [0; 16],
@@ -1470,7 +1470,7 @@ mod tests {
             vector: Box::new([0.0_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: brain_core::Salience::default(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             created_at_unix_nanos: 1_700_000_000_000,
             arena_slot: 1,
             embedding_model_fp: [0xAA; 16],
@@ -1577,7 +1577,7 @@ mod tests {
             vector: Box::new([0.0_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: brain_core::Salience::default(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             created_at_unix_nanos: 1_700_000_000_000,
             arena_slot: 1,
             embedding_model_fp: [0xAA; 16],

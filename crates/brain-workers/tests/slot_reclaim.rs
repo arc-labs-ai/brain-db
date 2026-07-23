@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use brain_core::{SpaceId, ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{SpaceId, SessionId, EdgeKind, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::edge::{
@@ -103,7 +103,7 @@ fn seed_memory(
             id,
             brain_core::NamespaceId::SYSTEM,
             SpaceId(Uuid::nil()),
-            ContextId(1),
+            SessionId(1),
             slot,
             1,
             MemoryKind::Episodic,
@@ -331,7 +331,7 @@ fn forget_stamps_tombstoned_at_unix_nanos() {
         // Real ENCODE → real FORGET via dispatcher.
         let encode = EncodeRequest {
             text: "doomed".into(),
-            context_id: 1,
+            session_id: 1,
             request_id: [1; 16],
             txn_id: None,
             occurred_at_unix_nanos: None,
@@ -380,7 +380,7 @@ fn forget_replay_does_not_overwrite_stamp() {
         let fix = build_fixture();
         let encode = EncodeRequest {
             text: "doomed-twice".into(),
-            context_id: 1,
+            session_id: 1,
             request_id: [10; 16],
             txn_id: None,
             occurred_at_unix_nanos: None,

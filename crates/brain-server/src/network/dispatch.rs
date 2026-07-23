@@ -68,7 +68,7 @@ pub(crate) enum ConnPhase {
 /// Mutable per-connection state. Lives on the receiver-loop stack.
 pub(crate) struct ConnState {
     pub(crate) phase: ConnPhase,
-    pub(crate) session_id: [u8; 16],
+    pub(crate) connection_id: [u8; 16],
     pub(crate) negotiated_version: u8,
 }
 
@@ -76,7 +76,7 @@ impl ConnState {
     pub(crate) fn new() -> Self {
         Self {
             phase: ConnPhase::AwaitingHello,
-            session_id: [0u8; 16],
+            connection_id: [0u8; 16],
             negotiated_version: 0,
         }
     }
@@ -150,7 +150,7 @@ pub(crate) struct OpDispatch {
     /// `RequestCaller` so TXN_BEGIN can link the new entry back to
     /// the originating connection — drives the connection-drop
     /// auto-abort sweep.
-    pub(crate) session_id: [u8; 16],
+    pub(crate) connection_id: [u8; 16],
     /// Effective-identity selector, present iff the request carried an
     /// `act_as` field that passed the R1/R2 authorization checks in
     /// `dispatch_frame`. When `Some`, `run_op_dispatch` builds the
@@ -377,7 +377,7 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
         // Wire session id rides alongside so TXN_BEGIN can stamp it
         // on the new entry; the connection-drop sweep needs it to
         // find buffered work owned by a dying connection.
-        session_id: state.session_id,
+        connection_id: state.connection_id,
         act_as,
     })
 }
@@ -418,16 +418,16 @@ fn on_hello(frame: Frame, state: &mut ConnState, topology: &Topology) -> Action 
             }
         };
 
-    // Allocate a fresh session_id. uuid v7 + the bytes is fine.
-    let session_id = *uuid::Uuid::now_v7().as_bytes();
-    state.session_id = session_id;
+    // Allocate a fresh connection_id. uuid v7 + the bytes is fine.
+    let connection_id = *uuid::Uuid::now_v7().as_bytes();
+    state.connection_id = connection_id;
     state.negotiated_version = negotiated.chosen_version;
     state.phase = ConnPhase::AwaitingAuth;
 
     let welcome = WelcomePayload {
         server_id: topology.server_caps.server_id.clone(),
         chosen_version: negotiated.chosen_version,
-        session_id,
+        connection_id,
         capabilities: negotiated.capabilities,
         server_features: topology.server_caps.server_features.clone(),
     };
@@ -571,8 +571,8 @@ pub(crate) async fn run_op_dispatch(op: OpDispatch, shards: Arc<Vec<ShardHandle>
     // key-bound identity. Authorization (R1/R2) was already enforced in
     // `dispatch_frame`; this only materializes the identity.
     let caller = match &op.act_as {
-        Some(a) => op.scope.to_effective_caller(a, op.session_id),
-        None => op.scope.to_caller(op.session_id),
+        Some(a) => op.scope.to_effective_caller(a, op.connection_id),
+        None => op.scope.to_caller(op.connection_id),
     };
     // Root of the per-request trace. Held open for the whole op; the shard
     // re-enters a clone via `.instrument()` so `brain.encode` nests under it
@@ -912,7 +912,7 @@ mod tests {
                 compression_zstd: false,
                 server_push: false,
             },
-            client_session_token: None,
+            client_connection_token: None,
         };
         Frame::new(Opcode::Hello.as_u16(), FLAG_EOS, 0, hello.encode())
     }
@@ -927,7 +927,7 @@ mod tests {
                 assert_eq!(f.header.opcode_u16(), Opcode::Welcome.as_u16());
                 assert!(matches!(state.phase, ConnPhase::AwaitingAuth));
                 assert_eq!(state.negotiated_version, 1);
-                assert_ne!(state.session_id, [0u8; 16]);
+                assert_ne!(state.connection_id, [0u8; 16]);
             }
             _ => panic!("expected Inline(WELCOME)"),
         }
@@ -941,7 +941,7 @@ mod tests {
         // Try an ENCODE while still AwaitingAuth.
         let body = RequestBody::Encode(brain_protocol::envelope::request::EncodeRequest {
             text: "hello".into(),
-            context_id: 0,
+            session_id: 0,
             request_id: [0u8; 16],
             txn_id: None,
             occurred_at_unix_nanos: None,
@@ -971,7 +971,7 @@ mod tests {
                 compression_zstd: false,
                 server_push: false,
             },
-            client_session_token: None,
+            client_connection_token: None,
         };
         let frame = Frame::new(Opcode::Hello.as_u16(), FLAG_EOS, 0, bad.encode());
         match dispatch_frame(frame, &mut state, &topo) {

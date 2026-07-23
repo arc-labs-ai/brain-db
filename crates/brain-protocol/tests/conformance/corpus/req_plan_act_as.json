@@ -11,7 +11,7 @@
     "max_branches_explored": 64
   },
   "strategy_hint": null,
-  "context_filter": null,
+  "session_filter": null,
   "request_id": [
     17,
     17,

@@ -23,7 +23,7 @@
 //! aren't useful. A non-None `txn_id` is rejected so we don't
 //! silently degrade the user's intent.
 
-use brain_core::{ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience};
+use brain_core::{SessionId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience};
 use brain_embed::VECTOR_DIM;
 use brain_planner::{EdgeOutcome, EncodeOp, EncodeOpEdge};
 use brain_protocol::envelope::request::EncodeVectorDirectRequest;
@@ -111,7 +111,7 @@ pub async fn handle_encode_vector_direct(
         brain_core::RequestId::from(req.request_id),
         ctx.executor.caller_space,
     );
-    let context_id = ContextId::from(req.context_id);
+    let session_id = SessionId::from(req.session_id);
     let kind = MemoryKind::from(req.kind);
     // For dedup we need a stable content hash. When `text` is present
     // (the common case), hash it — that matches the text-encode path
@@ -142,7 +142,7 @@ pub async fn handle_encode_vector_direct(
 
     // 5. Dedup against the fingerprint table (same as text-encode).
     if req.deduplicate {
-        if let Some(existing) = lookup_fingerprint(ctx, content_hash, context_id)? {
+        if let Some(existing) = lookup_fingerprint(ctx, content_hash, session_id)? {
             return Ok(EncodeResponse {
                 memory_id: existing.raw(),
                 was_deduplicated: true,
@@ -150,7 +150,7 @@ pub async fn handle_encode_vector_direct(
                 auto_edges_added: 0,
                 lsn: 0,
                 space_id: ctx.executor.caller_space.into(),
-                context_id: req.context_id,
+                session_id: req.session_id,
                 kind: req.kind,
                 created_at_unix_nanos: 0,
                 edges_out_count: 0,
@@ -190,7 +190,7 @@ pub async fn handle_encode_vector_direct(
         vector: Box::new(vector_arr),
         kind,
         salience: Salience::new(salience),
-        context: context_id,
+        session_id,
         created_at_unix_nanos: created_at,
         // EncodeVectorDirect carries no event-time field on the wire;
         // power-user vector writes default the timeline to write time.
@@ -243,7 +243,7 @@ pub async fn handle_encode_vector_direct(
         auto_edges_added,
         lsn: ack.lsn_first.raw(),
         space_id: ctx.executor.caller_space.into(),
-        context_id: req.context_id,
+        session_id: req.session_id,
         kind: req.kind,
         created_at_unix_nanos: created_at,
         edges_out_count: auto_edges_added,
@@ -294,7 +294,7 @@ fn validate_common(req: &EncodeVectorDirectRequest, ctx: &OpsContext) -> Result<
 fn lookup_fingerprint(
     ctx: &OpsContext,
     content_hash: [u8; 32],
-    context_id: ContextId,
+    session_id: SessionId,
 ) -> Result<Option<MemoryId>, OpError> {
     let rtxn = ctx.executor.metadata.read_txn().map_err(|e| {
         OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
@@ -306,7 +306,7 @@ fn lookup_fingerprint(
         })?;
     let key = brain_metadata::tables::fingerprint::fingerprint_key(
         ctx.executor.caller_space,
-        context_id,
+        session_id,
         &content_hash,
     );
     Ok(t.get(&key).ok().flatten().map(|g| g.value().memory_id()))
@@ -359,7 +359,7 @@ fn encode_vector_direct_request_hash(
 ) -> [u8; 32] {
     let op = EncodeOp {
         request_id: brain_core::RequestId::from(req.request_id),
-        context_id: ContextId::from(req.context_id),
+        session_id: SessionId::from(req.session_id),
         kind: MemoryKind::from(req.kind),
         text: req.text.clone(),
         vector: [0.0; VECTOR_DIM],
@@ -447,7 +447,7 @@ fn reconstruct_response(
         auto_edges_added,
         lsn: cached.lsn_first.raw(),
         space_id: ctx.executor.caller_space.into(),
-        context_id: req.context_id,
+        session_id: req.session_id,
         kind: req.kind,
         created_at_unix_nanos: created_at,
         edges_out_count: auto_edges_added,

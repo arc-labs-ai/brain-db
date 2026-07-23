@@ -130,7 +130,7 @@ async fn handshake(client: &mut TcpStream, token: &[u8]) {
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send_frame(
         client,
@@ -166,7 +166,7 @@ async fn handshake(client: &mut TcpStream, token: &[u8]) {
 async fn encode(client: &mut TcpStream, stream_id: u32, text: &str) -> u128 {
     let req = EncodeRequest {
         text: text.into(),
-        context_id: 0,
+        session_id: 0,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,

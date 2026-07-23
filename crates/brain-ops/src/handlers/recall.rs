@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use brain_core::{ContextId, EntityId, MemoryId, Slot, SubjectRef};
+use brain_core::{SessionId, EntityId, MemoryId, Slot, SubjectRef};
 use brain_index::RankedItemId;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
@@ -67,7 +67,7 @@ pub const DEFAULT_RECALL_RESULTS: u32 = 50;
 pub const RECALL_CANDIDATE_POOL: u32 = MAX_RECALL_RESULTS;
 
 /// Upper bound on the entry count of any one recall filter list
-/// (`context_filter`, `kind_filter`). These are only bounded by the 16 MiB
+/// (`session_filter`, `kind_filter`). These are only bounded by the 16 MiB
 /// payload cap otherwise; an explicit cap turns a crafted oversized filter
 /// into a clear `InvalidRequest` instead of silently building a large
 /// `HashSet` for the post-filter pass. The bound is generous — far above any
@@ -108,10 +108,10 @@ pub async fn handle_recall(
     // wants set to false; force it on regardless of what the client sent.
     // (The wire field is retained for now; a later lockstep pass drops it.)
     req.include_text = true;
-    if let Some(ref ctxs) = req.context_filter {
+    if let Some(ref ctxs) = req.session_filter {
         if ctxs.len() > MAX_RECALL_FILTER_ENTRIES {
             return Err(OpError::InvalidRequest(format!(
-                "recall: context_filter must have <= {MAX_RECALL_FILTER_ENTRIES} entries"
+                "recall: session_filter must have <= {MAX_RECALL_FILTER_ENTRIES} entries"
             )));
         }
     }
@@ -1575,8 +1575,8 @@ fn hydrate_memories_by_id(
         .kind_filter
         .as_ref()
         .map(|v| v.iter().copied().collect());
-    let context_filter: Option<HashSet<u64>> = req
-        .context_filter
+    let session_filter: Option<HashSet<u64>> = req
+        .session_filter
         .as_ref()
         .map(|v| v.iter().copied().collect());
 
@@ -1627,8 +1627,8 @@ fn hydrate_memories_by_id(
                 continue;
             }
         }
-        if let Some(allowed) = &context_filter {
-            if !allowed.contains(&row.context().raw()) {
+        if let Some(allowed) = &session_filter {
+            if !allowed.contains(&row.session().raw()) {
                 continue;
             }
         }
@@ -1669,7 +1669,7 @@ fn hydrate_memories_by_id(
             salience: row.salience,
             kind: wire_kind,
             space_id: row.space_id_bytes,
-            context_id: ContextId(row.context_id).into(),
+            session_id: SessionId(row.session_id).into(),
             created_at_unix_nanos: row.created_at_unix_nanos,
             last_accessed_at_unix_nanos: row.last_accessed_at_unix_nanos,
             edges: if req.include_edges {
@@ -2460,8 +2460,8 @@ fn overlay_txn_buffer(
         .kind_filter
         .as_ref()
         .map(|v| v.iter().copied().collect());
-    let context_filter: Option<HashSet<u64>> = req
-        .context_filter
+    let session_filter: Option<HashSet<u64>> = req
+        .session_filter
         .as_ref()
         .map(|v| v.iter().copied().collect());
 
@@ -2475,8 +2475,8 @@ fn overlay_txn_buffer(
                 continue;
             }
         }
-        if let Some(ref contexts) = context_filter {
-            if !contexts.contains(&p.context_id.raw()) {
+        if let Some(ref sessions) = session_filter {
+            if !sessions.contains(&p.session_id.raw()) {
                 continue;
             }
         }
@@ -2525,7 +2525,7 @@ fn pending_to_memory_result(p: &BufferedEncode, req: &RecallRequest, score: f32)
         salience: p.salience_initial,
         kind: MemoryKindWire::from(p.kind),
         space_id: p.space_id.into(),
-        context_id: p.context_id.into(),
+        session_id: p.session_id.into(),
         created_at_unix_nanos: p.created_at_unix_nanos,
         last_accessed_at_unix_nanos: p.created_at_unix_nanos,
         // Edges and graph enrichment from buffered writes aren't
@@ -2829,7 +2829,7 @@ fn build_planner_request(
         // Push the memory-context scope into the front gate so the
         // retrievers run on the eligible universe instead of pruning
         // post-projection (the historical gap this turn closes).
-        context_filter: req.context_filter.as_ref().cloned().unwrap_or_default(),
+        session_filter: req.session_filter.as_ref().cloned().unwrap_or_default(),
         space_filter,
         confidence_min: if req.confidence_threshold > 0.0 {
             Some(req.confidence_threshold)
@@ -2860,8 +2860,8 @@ fn project_memory_results(
         .kind_filter
         .as_ref()
         .map(|v| v.iter().copied().collect());
-    let context_filter: Option<HashSet<u64>> = req
-        .context_filter
+    let session_filter: Option<HashSet<u64>> = req
+        .session_filter
         .as_ref()
         .map(|v| v.iter().copied().collect());
 
@@ -2966,8 +2966,8 @@ fn project_memory_results(
                 continue;
             }
         }
-        if let Some(allowed) = &context_filter {
-            if !allowed.contains(&row.context().raw()) {
+        if let Some(allowed) = &session_filter {
+            if !allowed.contains(&row.session().raw()) {
                 continue;
             }
         }
@@ -3063,7 +3063,7 @@ fn project_memory_results(
             salience: row.salience,
             kind: wire_kind,
             space_id: row.space_id_bytes,
-            context_id: ContextId(row.context_id).into(),
+            session_id: SessionId(row.session_id).into(),
             created_at_unix_nanos: row.created_at_unix_nanos,
             last_accessed_at_unix_nanos: row.last_accessed_at_unix_nanos,
             edges,
@@ -3298,7 +3298,7 @@ mod tests {
             subject_name: String::new(),
             max_results,
             confidence_threshold: 0.0,
-            context_filter: None,
+            session_filter: None,
             age_bound_unix_nanos: None,
             as_of_record_time_unix_nanos: None,
             kind_filter: None,
@@ -3382,7 +3382,7 @@ mod tests {
             salience: 0.0,
             kind: MemoryKindWire::Episodic,
             space_id: [0u8; 16],
-            context_id: 0,
+            session_id: 0,
             created_at_unix_nanos: 0,
             last_accessed_at_unix_nanos: 0,
             edges: None,

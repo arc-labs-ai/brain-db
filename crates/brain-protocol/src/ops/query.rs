@@ -11,7 +11,7 @@
 //! `FusionConfigWire`) live here because the request needs them to be
 //! parsed.
 
-use crate::envelope::request::WireUuid;
+use crate::envelope::request::{WireSessionId, WireUuid};
 
 // ---------------------------------------------------------------------------
 // Shared wire-domain types — used by the query request body.
@@ -68,6 +68,10 @@ pub struct QueryRequest {
     /// schemaless mode and a `PredicateNotInSchema` error in strict
     /// mode.
     pub predicate_filter: Vec<String>,
+    /// Optional set of sessions to scope the query to. `None` or empty =
+    /// no session restriction (all sessions in the caller's space).
+    /// Mirrors `RecallRequest::session_filter`.
+    pub session_filter: Option<Vec<WireSessionId>>,
     pub time_filter: Option<TimeRangeWire>,
     /// Bi-temporal time-travel anchor (record-time). When `Some(t)`,
     /// statement/relation results are filtered to the state the

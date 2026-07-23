@@ -361,7 +361,7 @@ async fn data_dir_under_nested_path() {
 // Real WAL hookup
 // ---------------------------------------------------------------------------
 
-use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, RequestId};
+use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, RequestId};
 use brain_storage::wal::payload::{EncodePayload, WalPayload};
 use brain_storage::wal::reader::WalReader;
 use brain_storage::wal::record::{Lsn, WalRecord};
@@ -372,7 +372,7 @@ fn encode_record(slot: u64, byte: u8) -> WalRecord {
         request_id: RequestId::from([byte; 16]),
         space_id: SpaceId::from([byte; 16]),
         namespace_id: brain_core::NamespaceId::from(u32::from(byte)),
-        context_id: ContextId(0),
+        session_id: SessionId(0),
         kind: MemoryKind::Episodic,
         salience_initial: 0.5,
         embedding_model_fp: [byte; 16],

@@ -83,7 +83,7 @@ fn vector_direct_req(request_id: [u8; 16], slot: usize) -> EncodeVectorDirectReq
         text: format!("vector-direct slot {slot}"),
         vector: unit_vector(slot),
         model_fingerprint: MOCK_FP,
-        context_id: 42,
+        session_id: 42,
         kind: MemoryKindWire::Episodic,
         salience_hint: 0.5,
         edges: vec![],

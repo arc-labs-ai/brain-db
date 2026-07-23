@@ -91,7 +91,7 @@ pub enum ReasonStatus {
 ///
 /// Carries 14 typed-graph event variants ([`Self::EntityCreated`]
 /// through [`Self::SchemaUpdated`]). For typed-graph events the
-/// cognitive fields on `SubscriptionEvent` (`memory_id`, `context_id`,
+/// cognitive fields on `SubscriptionEvent` (`memory_id`, `session_id`,
 /// `kind`, `salience`, `text`) are zero-filled and `graph_payload`
 /// carries the typed body.
 #[derive(
@@ -361,7 +361,7 @@ pub enum ErrorCodeWire {
     MissingRequiredField = 0x0041,
     TextTooLarge = 0x0042,
     TextEmpty = 0x0043,
-    BadContextId = 0x0044,
+    BadSessionId = 0x0044,
     BadMemoryKind = 0x0045,
     BadEdgeKind = 0x0046,
     BadStrategyHint = 0x0047,
@@ -453,7 +453,7 @@ impl From<ErrorCode> for ErrorCodeWire {
             ErrorCode::MissingRequiredField => Self::MissingRequiredField,
             ErrorCode::TextTooLarge => Self::TextTooLarge,
             ErrorCode::TextEmpty => Self::TextEmpty,
-            ErrorCode::BadContextId => Self::BadContextId,
+            ErrorCode::BadSessionId => Self::BadSessionId,
             ErrorCode::BadMemoryKind => Self::BadMemoryKind,
             ErrorCode::BadEdgeKind => Self::BadEdgeKind,
             ErrorCode::BadStrategyHint => Self::BadStrategyHint,
@@ -540,7 +540,7 @@ impl From<ErrorCodeWire> for ErrorCode {
             ErrorCodeWire::MissingRequiredField => Self::MissingRequiredField,
             ErrorCodeWire::TextTooLarge => Self::TextTooLarge,
             ErrorCodeWire::TextEmpty => Self::TextEmpty,
-            ErrorCodeWire::BadContextId => Self::BadContextId,
+            ErrorCodeWire::BadSessionId => Self::BadSessionId,
             ErrorCodeWire::BadMemoryKind => Self::BadMemoryKind,
             ErrorCodeWire::BadEdgeKind => Self::BadEdgeKind,
             ErrorCodeWire::BadStrategyHint => Self::BadStrategyHint,

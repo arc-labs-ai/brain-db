@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use brain_core::{
-    ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, RequestId, Salience,
+    SessionId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, RequestId, Salience,
 };
 use brain_embed::VECTOR_DIM;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
@@ -289,7 +289,7 @@ async fn do_consolidation_cycle(
     let started = Instant::now();
     let mut consolidations = 0usize;
 
-    for (context_id, candidates) in by_context {
+    for (session_id, candidates) in by_context {
         if started.elapsed() >= cfg.max_runtime {
             break;
         }
@@ -369,7 +369,7 @@ async fn do_consolidation_cycle(
                 vector: Box::new(vector),
                 kind: MemoryKind::Consolidated,
                 salience: Salience::new(worker.initial_salience),
-                context: context_id,
+                session_id,
                 created_at_unix_nanos: created_at,
                 // Consolidated memories synthesise content from their
                 // sources; they carry no single client event time.
@@ -430,7 +430,7 @@ async fn do_consolidation_cycle(
 fn collect_candidates_by_context(
     ctx: &WorkerContext,
     recency_floor_nanos: u64,
-) -> Result<BTreeMap<ContextId, Vec<WindowCandidate>>, WorkerError> {
+) -> Result<BTreeMap<SessionId, Vec<WindowCandidate>>, WorkerError> {
     let metadata = ctx.ops.executor.metadata.clone();
     let rtxn = metadata
         .read_txn()
@@ -439,7 +439,7 @@ fn collect_candidates_by_context(
         .open_table(MEMORIES_TABLE)
         .map_err(|e| WorkerError::Ops(format!("open MEMORIES: {e:?}")))?;
 
-    let mut by_context: BTreeMap<ContextId, Vec<WindowCandidate>> = BTreeMap::new();
+    let mut by_context: BTreeMap<SessionId, Vec<WindowCandidate>> = BTreeMap::new();
     for entry in table
         .iter()
         .map_err(|e| WorkerError::Ops(format!("iter MEMORIES: {e:?}")))?
@@ -460,7 +460,7 @@ fn collect_candidates_by_context(
             continue;
         }
         by_context
-            .entry(meta.context())
+            .entry(meta.session())
             .or_default()
             .push(WindowCandidate {
                 memory_id: meta.memory_id(),

@@ -5,7 +5,7 @@
 //! - [`ForgetPayload`] — flag HARD_FORGOTTEN, evict dedup fingerprint
 //! - [`UpdateSaliencePayload`] — batched salience writes
 //! - [`UpdateKindPayload`] — change a memory's kind
-//! - [`UpdateContextPayload`] — change a memory's context_id
+//! - [`UpdateSessionPayload`] — change a memory's session_id
 //! - [`MigrateEmbeddingPayload`] — swap the embedding fingerprint (re-encode)
 //!
 //! Every helper opens its own write txn, applies, calls
@@ -13,7 +13,7 @@
 
 use brain_storage::recovery::MetadataSinkError;
 use brain_storage::wal::payload::{
-    EncodePayload, ForgetPayload, MigrateEmbeddingPayload, SalienceUpdate, UpdateContextPayload,
+    EncodePayload, ForgetPayload, MigrateEmbeddingPayload, SalienceUpdate, UpdateSessionPayload,
     UpdateKindPayload, UpdateSaliencePayload,
 };
 use redb::ReadableTable;
@@ -54,7 +54,7 @@ impl MetadataDb {
                 memory_id,
                 p.namespace_id,
                 p.space_id,
-                p.context_id,
+                p.session_id,
                 slot_id,
                 slot_version,
                 p.kind,
@@ -113,9 +113,9 @@ impl MetadataDb {
 
             // fingerprints — restore the dedup index for opt-in ENCODEs
             // so future ENCODE+dedup requests for the same text in the
-            // same (space, context) collapse onto the existing memory.
+            // same (space, session) collapse onto the existing memory.
             if let Some(hash) = content_hash {
-                let key = fingerprint_key(p.space_id, p.context_id, &hash);
+                let key = fingerprint_key(p.space_id, p.session_id, &hash);
                 let entry = FingerprintEntry::new(memory_id, timestamp_ns);
                 let mut t = wtxn.open_table(FINGERPRINTS_TABLE).map_err(transient)?;
                 t.insert(&key, &entry).map_err(transient)?;
@@ -176,17 +176,17 @@ impl MetadataDb {
             let key = p.memory_id.to_be_bytes();
 
             // Update memory: set HARD_FORGOTTEN flag + forgot_at. Capture
-            // (space, context, hash) for the matching FINGERPRINTS row so
+            // (space, session, hash) for the matching FINGERPRINTS row so
             // we can evict it in the same write txn (—
             // the dedup index must never reference a forgotten memory).
-            let dedup_key: Option<(brain_core::SpaceId, brain_core::ContextId, [u8; 32])> = {
+            let dedup_key: Option<(brain_core::SpaceId, brain_core::SessionId, [u8; 32])> = {
                 let mut t = wtxn.open_table(MEMORIES_TABLE).map_err(transient)?;
                 let existing = t.get(&key).map_err(transient)?.map(|a| a.value());
                 if let Some(mut mem) = existing {
                     let captured = mem.content_hash.map(|h| {
                         (
                             brain_core::SpaceId::from(mem.space_id_bytes),
-                            brain_core::ContextId(mem.context_id),
+                            brain_core::SessionId(mem.session_id),
                             h,
                         )
                     });
@@ -272,11 +272,11 @@ impl MetadataDb {
         Ok(())
     }
 
-    pub(super) fn apply_update_context(
+    pub(super) fn apply_update_session(
         &self,
         lsn: u64,
         timestamp_ns: u64,
-        p: &UpdateContextPayload,
+        p: &UpdateSessionPayload,
     ) -> Result<(), MetadataSinkError> {
         let wtxn = self.db.begin_write().map_err(transient)?;
         {
@@ -285,7 +285,7 @@ impl MetadataDb {
                 let mut t = wtxn.open_table(MEMORIES_TABLE).map_err(transient)?;
                 let existing = t.get(&key).map_err(transient)?.map(|a| a.value());
                 if let Some(mut mem) = existing {
-                    mem.context_id = p.new_context_id.raw();
+                    mem.session_id = p.new_session_id.raw();
                     t.insert(&key, &mem).map_err(transient)?;
                 }
             }

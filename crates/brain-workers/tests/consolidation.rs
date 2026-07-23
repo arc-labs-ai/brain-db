@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use brain_core::{SpaceId, ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{SpaceId, SessionId, EdgeKind, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::edge::list_memory_edges_from;
@@ -91,7 +91,7 @@ fn make_id(slot: u64) -> MemoryId {
 fn seed_memory(
     metadata: &SharedMetadataDb,
     slot: u64,
-    context_id: u64,
+    session_id: u64,
     kind: MemoryKind,
     salience: f32,
     created_at_unix_nanos: u64,
@@ -106,7 +106,7 @@ fn seed_memory(
             id,
             brain_core::NamespaceId::SYSTEM,
             SpaceId(Uuid::nil()),
-            ContextId(context_id),
+            SessionId(session_id),
             slot,
             1,
             kind,
@@ -479,7 +479,7 @@ fn already_consolidated_sources_are_skipped() {
 }
 
 #[test]
-fn cross_context_memories_do_not_cluster() {
+fn cross_session_memories_do_not_cluster() {
     glommio_run(|| async {
         let fix = build_fixture();
         let now = now_unix_nanos();

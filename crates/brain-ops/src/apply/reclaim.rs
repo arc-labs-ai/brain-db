@@ -5,7 +5,7 @@
 //! evict any FINGERPRINTS rows that referenced the reclaimed slots so
 //! a future encode with the same content can dedupe-or-not freely.
 
-use brain_core::{SpaceId, ContextId};
+use brain_core::{SpaceId, SessionId};
 use brain_metadata::tables::fingerprint::{fingerprint_key, FINGERPRINTS_TABLE};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use redb::{ReadableTable, WriteTransaction};
@@ -55,11 +55,11 @@ pub fn apply_reclaim_slots(
                     // Reconstruct the EXACT fingerprint key from the row's own
                     // (space, context, hash) — the same triple the encode path
                     // keyed it under. A zeroed space/context placeholder would
-                    // prefix-collide: two spaces (or contexts) sharing a content
+                    // prefix-collide: two spaces (or sessions) sharing a content
                     // hash would evict each other's fingerprint.
                     evictions.push(fingerprint_key(
                         SpaceId::from(row.space_id_bytes),
-                        ContextId(row.context_id),
+                        SessionId(row.session_id),
                         &ch,
                     ));
                 }
@@ -122,7 +122,7 @@ mod tests {
     /// spaces. Reclaiming one space's slot must evict ONLY that space's
     /// fingerprint — the other space's identical-hash fingerprint must
     /// survive. Guards the zeroed-key bug, where reclaim keyed by
-    /// content-hash alone could collide across spaces/contexts.
+    /// content-hash alone could collide across spaces/sessions.
     #[test]
     fn reclaim_evicts_only_the_matching_space_fingerprint() {
         use brain_core::{MemoryId, MemoryKind};
@@ -133,7 +133,7 @@ mod tests {
         let (_dir, db) = open_db();
         let space_a = SpaceId(Uuid::from_bytes([1u8; 16]));
         let space_b = SpaceId(Uuid::from_bytes([2u8; 16]));
-        let ctx = ContextId(7);
+        let ctx = SessionId(7);
         let hash = content_hash("identical text stored under two spaces");
 
         let mem_a = MemoryMetadata::new_active(

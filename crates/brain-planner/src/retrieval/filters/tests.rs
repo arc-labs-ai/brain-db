@@ -1,7 +1,7 @@
 //! Unit tests for the post-fusion filter chain.
 
 use brain_core::{
-    SpaceId, Cardinality, ContextId, Entity, EntityId, EntityTypeId, ExtractorId, MemoryId,
+    SpaceId, Cardinality, SessionId, Entity, EntityId, EntityTypeId, ExtractorId, MemoryId,
     MemoryKind, PredicateId, RelationId, StatementId,
 };
 use brain_core::{
@@ -130,7 +130,7 @@ fn put_memory_row(
         id,
         brain_core::NamespaceId::SYSTEM,
         SpaceId::new(),
-        ContextId::from(0),
+        SessionId::from(0),
         id.slot(),
         id.version(),
         kind,

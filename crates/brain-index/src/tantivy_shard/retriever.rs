@@ -56,7 +56,7 @@ pub struct LexicalFilters {
     /// Front-gate scope tag for memory text. When non-empty, the
     /// boolean query adds a MUST clause matching any `context` in the
     /// list — BM25 ranks within that universe only.
-    pub context_ids: Vec<u64>,
+    pub session_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -301,15 +301,15 @@ fn build_query(
                     .map_err(|e| LexicalError::Internal(format!("created_at field: {e}")))?;
                 clauses.push((Occur::Must, range_query_u64(field, range)));
             }
-            if !f.context_ids.is_empty() {
+            if !f.session_ids.is_empty() {
                 let field = schema
-                    .get_field("context")
+                    .get_field("session")
                     .map_err(|e| LexicalError::Internal(format!("context field: {e}")))?;
                 // `context IN [..]` = OR-group of TermQuery, wrapped as
                 // a single MUST so the BM25 scoring stays inside the
                 // requested context universe.
                 let inner: Vec<(Occur, Box<dyn tantivy::query::Query>)> = f
-                    .context_ids
+                    .session_ids
                     .iter()
                     .map(|cid| -> (Occur, Box<dyn tantivy::query::Query>) {
                         let term = Term::from_field_u64(field, *cid);

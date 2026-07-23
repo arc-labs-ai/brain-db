@@ -253,7 +253,7 @@ mod tests {
 
     use super::*;
     use brain_core::{
-        SpaceId, ContextId, EntityId, ExtractorId as CoreExtractorId, MemoryId, MemoryKind,
+        SpaceId, SessionId, EntityId, ExtractorId as CoreExtractorId, MemoryId, MemoryKind,
     };
     use brain_core::{
         Entity, EntityType, EvidenceEntry, EvidenceRef, PredicateId, Statement, StatementId,
@@ -282,7 +282,7 @@ mod tests {
             memory_id,
             brain_core::NamespaceId::SYSTEM,
             SpaceId::default(),
-            ContextId::DEFAULT,
+            SessionId::DEFAULT,
             /* arena_slot */ memory_id.slot(),
             memory_id.version(),
             MemoryKind::Episodic,

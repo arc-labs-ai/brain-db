@@ -1183,7 +1183,7 @@ mod tests {
             id,
             brain_core::NamespaceId::SYSTEM,
             brain_core::SpaceId::new(),
-            brain_core::ContextId::from(0),
+            brain_core::SessionId::from(0),
             id.slot(),
             id.version(),
             brain_core::MemoryKind::Episodic,

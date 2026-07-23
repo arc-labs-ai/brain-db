@@ -10,7 +10,7 @@
 //! - UpsertMemory → WalPayload::Encode
 //! - Tombstone(Memory) → WalPayload::Forget
 //! - Link / Unlink → WalPayload::Link / Unlink
-//! - UpdateSalience / UpdateKind / UpdateContext → matching payloads
+//! - UpdateSalience / UpdateKind / UpdateSession → matching payloads
 //!
 //! Multi-phase wrapping in TxnBegin/TxnCommit is handled by the
 //! caller (`submit::wal_append_for_write`) — this module just maps
@@ -42,7 +42,7 @@ use brain_storage::wal::kinds::WalRecordKind;
 use brain_storage::wal::payload::{
     EncodePayload, ForgetPayload, ForgetReason, LinkPayload, PhaseBodyRecord, RelationLinkPayload,
     RelationSupersedePayload, RelationTombstonePayload, SalienceReason, SalienceUpdate,
-    UnlinkPayload, UpdateContextPayload, UpdateKindPayload, UpdateSaliencePayload, WalPayload,
+    UnlinkPayload, UpdateSessionPayload, UpdateKindPayload, UpdateSaliencePayload, WalPayload,
 };
 
 use crate::apply::entity::entity_from_upsert_phase;
@@ -77,7 +77,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             vector,
             kind,
             salience,
-            context,
+            session_id,
             embedding_model_fp,
             content_hash: _,
             deduplicate,
@@ -91,7 +91,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             request_id: brain_core::RequestId(write.write_id.as_uuid()),
             space_id: write.space_id,
             namespace_id: write.namespace,
-            context_id: *context,
+            session_id: *session_id,
             kind: *kind,
             salience_initial: salience.raw(),
             embedding_model_fp: *embedding_model_fp,
@@ -219,10 +219,10 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             new_kind: *new_kind,
         })),
 
-        Phase::UpdateContext { id, new_context } => {
-            Some(WalPayload::UpdateContext(UpdateContextPayload {
+        Phase::UpdateSession { id, new_session_id } => {
+            Some(WalPayload::UpdateSession(UpdateSessionPayload {
                 memory_id: *id,
-                new_context_id: *new_context,
+                new_session_id: *new_session_id,
             }))
         }
 
@@ -506,7 +506,7 @@ fn edge_origin_from_byte(byte: u8) -> EdgeOrigin {
 mod tests {
     use super::*;
     use brain_core::{
-        SpaceId, ContextId, EdgeKind, EdgeKindRef, EntityAttributes, EntityId, EntityTypeId,
+        SpaceId, SessionId, EdgeKind, EdgeKindRef, EntityAttributes, EntityId, EntityTypeId,
         MemoryId, MemoryKind, Salience,
     };
     use brain_metadata::tables::edge::zero_disambiguator;
@@ -882,17 +882,17 @@ mod tests {
     }
 
     #[test]
-    fn update_context_maps_through() {
-        let phase = Phase::UpdateContext {
+    fn update_session_maps_through() {
+        let phase = Phase::UpdateSession {
             id: MemoryId::pack(0, 1, 0),
-            new_context: ContextId(42),
+            new_session_id: SessionId(42),
         };
         let w = write_for(phase.clone());
-        let WalPayload::UpdateContext(p) = phase_to_wal_payload(&phase, &w).unwrap() else {
+        let WalPayload::UpdateSession(p) = phase_to_wal_payload(&phase, &w).unwrap() else {
             panic!()
         };
         assert_eq!(p.memory_id, MemoryId::pack(0, 1, 0));
-        assert_eq!(p.new_context_id, ContextId(42));
+        assert_eq!(p.new_session_id, SessionId(42));
     }
 
     #[test]
@@ -904,7 +904,7 @@ mod tests {
             vector: Box::new([0.5_f32; brain_embed::VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: Salience::new(0.7),
-            context: ContextId(3),
+            session_id: SessionId(3),
             created_at_unix_nanos: 1_700_000_000_000,
             occurred_at_unix_nanos: None,
             arena_slot: 7,
@@ -917,7 +917,7 @@ mod tests {
             panic!("expected Encode payload")
         };
         assert_eq!(ep.memory_id, id);
-        assert_eq!(ep.context_id, ContextId(3));
+        assert_eq!(ep.session_id, SessionId(3));
         assert_eq!(ep.kind, MemoryKind::Episodic);
         assert!((ep.salience_initial - 0.7).abs() < 1e-6);
         assert_eq!(ep.embedding_model_fp, [0xCC; 16]);

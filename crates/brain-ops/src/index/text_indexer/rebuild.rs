@@ -102,9 +102,9 @@ fn iterate_memories(
     let created_at_field = schema
         .get_field("created_at")
         .map_err(|e| RebuildError::Metadata(format!("created_at: {e}")))?;
-    let context_field = schema
-        .get_field("context")
-        .map_err(|e| RebuildError::Metadata(format!("context: {e}")))?;
+    let session_field = schema
+        .get_field("session")
+        .map_err(|e| RebuildError::Metadata(format!("session: {e}")))?;
 
     let rtxn = metadata
         .read_txn()
@@ -144,7 +144,7 @@ fn iterate_memories(
         doc.add_bytes(space_id_field, &meta.space_id_bytes);
         doc.add_u64(kind_field, u64::from(meta.kind));
         doc.add_u64(created_at_field, meta.created_at_unix_nanos / 1_000_000);
-        doc.add_u64(context_field, meta.context_id);
+        doc.add_u64(session_field, meta.session_id);
         writer.add_document(doc)?;
 
         count += 1;

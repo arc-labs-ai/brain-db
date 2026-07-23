@@ -77,12 +77,12 @@ pub struct TxnEntry {
     pub final_response: Option<TxnFinalResponse>,
     pub buffer: Option<TxnBuffer>,
     /// Wire-level session that opened this txn. The connection layer
-    /// fans out [`TxnStore::abort_orphaned_for_session`] when this
+    /// fans out [`TxnStore::abort_orphaned_for_connection`] when this
     /// session's TCP/TLS connection drops, so buffered work doesn't
     /// linger occupying RAM until the per-txn expiry sweep. All-zero
     /// means "no session" (in-process tests) — the sweep treats it as
     /// "never owned by any disconnect" and leaves the entry alone.
-    pub session_id: [u8; 16],
+    pub connection_id: [u8; 16],
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +99,7 @@ pub struct BufferedEncode {
     pub vector: [f32; brain_embed::VECTOR_DIM],
     pub edges: Vec<BufferedEdgeSpec>,
     pub kind: brain_core::MemoryKind,
-    pub context_id: brain_core::ContextId,
+    pub session_id: brain_core::SessionId,
     pub salience_initial: f32,
     pub fingerprint: [u8; 16],
     pub request_id: [u8; 16],
@@ -280,19 +280,19 @@ impl TxnStore {
     /// the entries would otherwise occupy RAM for up to
     /// `timeout_seconds` after the socket closed.
     ///
-    /// `session_id == [0u8; 16]` is treated as a no-op so in-process
+    /// `connection_id == [0u8; 16]` is treated as a no-op so in-process
     /// callers (tests, embedded harnesses) can't accidentally wipe
     /// their own txns by passing the default.
     ///
     /// Returns the list of txn ids that were aborted (for logging).
-    pub fn abort_orphaned_for_session(&self, session_id: [u8; 16]) -> Vec<TxnId> {
-        if session_id == [0u8; 16] {
+    pub fn abort_orphaned_for_connection(&self, connection_id: [u8; 16]) -> Vec<TxnId> {
+        if connection_id == [0u8; 16] {
             return Vec::new();
         }
         let mut entries = self.entries.lock();
         let mut aborted = Vec::new();
         for (txn_id, entry) in entries.iter_mut() {
-            if entry.session_id != session_id {
+            if entry.connection_id != connection_id {
                 continue;
             }
             if !matches!(entry.state, TxnState::Active) {
@@ -346,7 +346,7 @@ fn now_unix_nanos() -> u64 {
 
 pub async fn handle_txn_begin(
     req: TxnBeginRequest,
-    session_id: [u8; 16],
+    connection_id: [u8; 16],
     ctx: &OpsContext,
 ) -> Result<TxnBeginResponse, OpError> {
     let timeout_seconds = clamp_timeout(req.timeout_seconds);
@@ -372,7 +372,7 @@ pub async fn handle_txn_begin(
         timeout_seconds,
         final_response: None,
         buffer: Some(TxnBuffer::default()),
-        session_id,
+        connection_id,
     };
     entries.insert(req.txn_id, entry);
 
@@ -560,7 +560,7 @@ pub(crate) fn build_phases(buffer: &TxnBuffer) -> Vec<crate::write::Phase> {
             vector: Box::new(e.vector),
             kind: e.kind,
             salience: Salience::new(e.salience_initial),
-            context: e.context_id,
+            session_id: e.session_id,
             created_at_unix_nanos: e.created_at_unix_nanos,
             occurred_at_unix_nanos: e.occurred_at_unix_nanos,
             arena_slot: e.memory_id.slot(),

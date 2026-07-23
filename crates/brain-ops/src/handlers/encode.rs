@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use brain_core::{ContextId, MemoryId, MemoryKind, Salience};
+use brain_core::{SessionId, MemoryId, MemoryKind, Salience};
 use brain_metadata::tables::memory::MemoryMetadata;
 use brain_planner::plan_encode_inner;
 use brain_protocol::envelope::request::EncodeRequest;
@@ -108,7 +108,7 @@ pub async fn handle_encode(
         brain_core::RequestId::from(req.request_id),
         ctx.executor.caller_space,
     );
-    let context_id = ContextId::from(req.context_id);
+    let session_id = SessionId::from(req.session_id);
     let kind = DEFAULT_KIND;
     let embedding_model_fp = ctx.executor.embedder.fingerprint();
     let request_hash = encode_request_hash(&req, embedding_model_fp, ctx.executor.caller_space);
@@ -161,7 +161,7 @@ pub async fn handle_encode(
     // (space, context, content_hash). On hit, return the existing
     // memory id without submitting a Write.
     if deduplicate {
-        if let Some(existing) = lookup_fingerprint(ctx, content_hash, context_id)? {
+        if let Some(existing) = lookup_fingerprint(ctx, content_hash, session_id)? {
             return Ok(EncodeResponse {
                 memory_id: existing.raw(),
                 was_deduplicated: true,
@@ -169,7 +169,7 @@ pub async fn handle_encode(
                 auto_edges_added: 0,
                 lsn: 0,
                 space_id: ctx.executor.caller_space.into(),
-                context_id: req.context_id,
+                session_id: req.session_id,
                 kind: kind.into(),
                 created_at_unix_nanos: 0,
                 edges_out_count: 0,
@@ -229,7 +229,7 @@ pub async fn handle_encode(
         vector: Box::new(vector),
         kind,
         salience: Salience::new(salience),
-        context: context_id,
+        session_id,
         created_at_unix_nanos: created_at,
         occurred_at_unix_nanos: req.occurred_at_unix_nanos,
         arena_slot: memory_id.slot(),
@@ -409,7 +409,7 @@ pub async fn handle_encode(
         auto_edges_added,
         lsn: ack.lsn_first.raw(),
         space_id: ctx.executor.caller_space.into(),
-        context_id: req.context_id,
+        session_id: req.session_id,
         kind: kind.into(),
         created_at_unix_nanos: created_at,
         edges_out_count: auto_edges_added,
@@ -745,7 +745,7 @@ fn build_encode_artifacts(
 fn lookup_fingerprint(
     ctx: &OpsContext,
     content_hash: [u8; 32],
-    context_id: ContextId,
+    session_id: SessionId,
 ) -> Result<Option<MemoryId>, OpError> {
     let rtxn = ctx.executor.metadata.read_txn().map_err(|e| {
         OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
@@ -757,7 +757,7 @@ fn lookup_fingerprint(
         })?;
     let key = brain_metadata::tables::fingerprint::fingerprint_key(
         ctx.executor.caller_space,
-        context_id,
+        session_id,
         &content_hash,
     );
     Ok(t.get(&key).ok().flatten().map(|g| g.value().memory_id()))
@@ -779,7 +779,7 @@ fn encode_request_hash(
 ) -> [u8; 32] {
     let op = brain_planner::EncodeOp {
         request_id: brain_core::RequestId::from(req.request_id),
-        context_id: ContextId::from(req.context_id),
+        session_id: SessionId::from(req.session_id),
         kind: DEFAULT_KIND,
         text: req.text.clone(),
         vector: [0.0; brain_embed::VECTOR_DIM],
@@ -856,7 +856,7 @@ fn reconstruct_encode_response(
         auto_edges_added,
         lsn: cached.lsn_first.raw(),
         space_id: ctx.executor.caller_space.into(),
-        context_id: req.context_id,
+        session_id: req.session_id,
         kind: DEFAULT_KIND.into(),
         created_at_unix_nanos: created_at,
         edges_out_count: auto_edges_added,
@@ -928,7 +928,7 @@ async fn handle_encode_in_txn(
             // txn must subscribe after COMMIT instead.
             lsn: 0,
             space_id: ctx.executor.caller_space.into(),
-            context_id: req.context_id,
+            session_id: req.session_id,
             kind: DEFAULT_KIND.into(),
             created_at_unix_nanos: 0,
             edges_out_count: auto_edges_added,
@@ -978,7 +978,7 @@ async fn handle_encode_in_txn(
         memory_id,
         ctx.executor.caller_namespace,
         brain_core::SpaceId(uuid::Uuid::nil()),
-        ContextId::from(req.context_id),
+        SessionId::from(req.session_id),
         memory_id.slot(),
         memory_id.version(),
         DEFAULT_KIND,
@@ -996,7 +996,7 @@ async fn handle_encode_in_txn(
         vector,
         edges: Vec::new(),
         kind: DEFAULT_KIND,
-        context_id: ContextId::from(req.context_id),
+        session_id: SessionId::from(req.session_id),
         salience_initial: salience,
         fingerprint: ctx.executor.embedder.fingerprint(),
         request_id: req.request_id,
@@ -1027,7 +1027,7 @@ async fn handle_encode_in_txn(
         // Buffered op — durable LSN lands at TXN_COMMIT.
         lsn: 0,
         space_id: ctx.executor.caller_space.into(),
-        context_id: req.context_id,
+        session_id: req.session_id,
         kind: DEFAULT_KIND.into(),
         created_at_unix_nanos: created_at,
         edges_out_count: auto_edges_added,

@@ -10,7 +10,7 @@
 //! references resolve.
 
 use brain_core::{
-    ContextId, EntityId, EntityTypeId, ExtractorId, MemoryId, StatementId, StatementKind,
+    SessionId, EntityId, EntityTypeId, ExtractorId, MemoryId, StatementId, StatementKind,
 };
 use brain_core::{
     Entity, EvidenceEntry, EvidenceRef, Statement, StatementObject, StatementValue, SubjectRef,
@@ -125,7 +125,7 @@ proptest! {
         // suppressing the noisy-OR aggregation path so the
         // statement's explicit `confidence` survives the write.
         let evidence_entry = EvidenceEntry {
-            memory_id: MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+            memory_id: MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
             confidence_milli: 0,
             timestamp_unix_nanos: 0,
             extractor_id: ExtractorId::default(),
@@ -210,7 +210,7 @@ fn known_text_value_roundtrips() {
 
     let sid = StatementId::new();
     let evidence_entry = EvidenceEntry::from_parts(
-        MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+        MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
         1.0,
         0,
         ExtractorId::default(),

@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use brain_core::{ContextId, EntityId, PredicateId, StatementKind};
+use brain_core::{SessionId, EntityId, PredicateId, StatementKind};
 use brain_core::{Statement, StatementObject, StatementValue};
 use brain_metadata::schema::predicate::{predicate_get, predicate_lookup_by_qname};
 use brain_metadata::statement::{statement_list, StatementListFilter};
@@ -116,10 +116,11 @@ pub async fn handle_materialize_procedural(
     };
     let subject_entity = EntityId::from(space_bytes);
 
-    let context_filter = if req.context_filter == 0 {
-        None
-    } else {
-        Some(ContextId(req.context_filter))
+    let session_filter: Option<std::collections::HashSet<SessionId>> = match &req.session_filter {
+        Some(ids) if !ids.is_empty() => {
+            Some(ids.iter().map(|id| SessionId(*id)).collect())
+        }
+        _ => None,
     };
 
     // ── Resolve the procedural predicate set ─────────────────────
@@ -208,8 +209,8 @@ pub async fn handle_materialize_procedural(
                 if row.superseded_by.is_some() {
                     continue;
                 }
-                if let Some(ctx_id) = context_filter {
-                    if !statement_touches_context(&row, ctx_id) {
+                if let Some(ref sessions) = session_filter {
+                    if !statement_touches_session(&row, sessions) {
                         continue;
                     }
                 }
@@ -306,16 +307,19 @@ fn render_object(obj: &StatementObject) -> Option<String> {
     }
 }
 
-fn statement_touches_context(s: &Statement, context: ContextId) -> bool {
+fn statement_touches_session(
+    s: &Statement,
+    sessions: &std::collections::HashSet<SessionId>,
+) -> bool {
     // Procedural memory is inherently space-scoped; the per-memory
-    // ContextId lives in the `memories` redb row, not on the
+    // SessionId lives in the `memories` redb row, not on the
     // statement itself, so a precise filter would require an
     // O(n_evidence) row-by-row lookup against the rtxn. For v1 we
-    // treat the context filter as advisory and accept every row —
-    // an space's `behavior_*` claim doesn't shift meaning across
-    // contexts the way a Fact would. A later pass can fold per-
-    // evidence context lookups in if a use case emerges.
-    let _ = (s, context);
+    // treat the session filter as advisory and accept every row —
+    // a space's `behavior_*` claim doesn't shift meaning across
+    // sessions the way a Fact would. A later pass can fold per-
+    // evidence session lookups in if a use case emerges.
+    let _ = (s, sessions);
     true
 }
 

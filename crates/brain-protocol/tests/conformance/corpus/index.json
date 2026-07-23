@@ -3,7 +3,7 @@
     "name": "req_hello",
     "opcode": "0x0001",
     "kind": "request",
-    "payload_len": 130
+    "payload_len": 133
   },
   {
     "name": "req_auth",
@@ -111,7 +111,7 @@
     "name": "req_materialize_procedural",
     "opcode": "0x0164",
     "kind": "request",
-    "payload_len": 113
+    "payload_len": 114
   },
   {
     "name": "req_memory_list",
@@ -135,7 +135,7 @@
     "name": "resp_welcome",
     "opcode": "0x0081",
     "kind": "response",
-    "payload_len": 242
+    "payload_len": 245
   },
   {
     "name": "resp_auth_ok",
@@ -249,7 +249,7 @@
     "name": "resp_memory_list",
     "opcode": "0x00A7",
     "kind": "response",
-    "payload_len": 321
+    "payload_len": 359
   },
   {
     "name": "resp_memory_inspect",
@@ -411,13 +411,13 @@
     "name": "frame_hello",
     "opcode": "0x0001",
     "kind": "frame",
-    "payload_len": 162
+    "payload_len": 165
   },
   {
     "name": "frame_welcome",
     "opcode": "0x0081",
     "kind": "frame",
-    "payload_len": 274
+    "payload_len": 277
   },
   {
     "name": "frame_encode",

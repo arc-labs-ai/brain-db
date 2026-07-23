@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind};
+use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
@@ -98,7 +98,7 @@ fn seed_memory(
             id,
             brain_core::NamespaceId::SYSTEM,
             SpaceId(Uuid::nil()),
-            ContextId(1),
+            SessionId(1),
             slot,
             1,
             kind,

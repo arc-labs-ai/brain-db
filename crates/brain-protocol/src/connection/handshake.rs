@@ -109,8 +109,8 @@ pub struct SpacePermissions {
 ///
 /// `client_id` and `supported_versions` are the negotiation inputs; the
 /// server intersects against its own capabilities and replies with
-/// `WelcomePayload`. `client_session_token` is reserved for future
-/// session-resumption (not used in v1).
+/// `WelcomePayload`. `client_connection_token` is reserved for future
+/// connection-resumption (not used in v1).
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HelloPayload {
     /// Free-form client identifier (≤ 256 bytes).
@@ -118,9 +118,9 @@ pub struct HelloPayload {
     /// Wire-protocol versions the client can speak.
     pub supported_versions: Vec<u8>,
     pub capabilities: HelloCapabilities,
-    /// Reserved for v2 session-resumption.
+    /// Reserved for v2 connection-resumption.
     #[serde(with = "serde_bytes")]
-    pub client_session_token: Option<[u8; 32]>,
+    pub client_connection_token: Option<[u8; 32]>,
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +128,7 @@ pub struct HelloPayload {
 // ---------------------------------------------------------------------------
 
 /// — server's response to `HELLO`. The connection is bound
-/// to `chosen_version` and `session_id` once this frame is received.
+/// to `chosen_version` and `connection_id` once this frame is received.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WelcomePayload {
     /// Free-form server identifier (≤ 256 bytes).
@@ -138,7 +138,7 @@ pub struct WelcomePayload {
     pub chosen_version: u8,
     /// 16 cryptographically-random bytes; per-connection identifier
     #[serde(with = "serde_bytes")]
-    pub session_id: [u8; 16],
+    pub connection_id: [u8; 16],
     /// Mutually-supported feature flags (intersection of client and
     /// server `HelloCapabilities`).
     pub capabilities: HelloCapabilities,
@@ -385,7 +385,7 @@ mod tests {
             client_id: "example-client/1.0".into(),
             supported_versions: vec![1, 2],
             capabilities: full_caps(),
-            client_session_token: Some(sample_token(1)),
+            client_connection_token: Some(sample_token(1)),
         };
         let bytes = original.encode();
         let decoded = HelloPayload::decode(&bytes).expect("hello round-trip");
@@ -398,7 +398,7 @@ mod tests {
             client_id: "client".into(),
             supported_versions: vec![crate::VERSION],
             capabilities: v1_caps(),
-            client_session_token: None,
+            client_connection_token: None,
         };
         assert_eq!(HelloPayload::decode(&original.encode()).unwrap(), original);
     }
@@ -410,7 +410,7 @@ mod tests {
         let original = WelcomePayload {
             server_id: "brain-server/0.5.0".into(),
             chosen_version: 1,
-            session_id: sample_session_id(2),
+            connection_id: sample_session_id(2),
             capabilities: v1_caps(),
             server_features: ServerFeatures {
                 max_payload_size: crate::MAX_PAYLOAD_BYTES as u32,
@@ -477,7 +477,7 @@ mod tests {
             client_id: "c".into(),
             supported_versions: vec![1, 2, 3],
             capabilities: v1_caps(),
-            client_session_token: None,
+            client_connection_token: None,
         };
         let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
         server.supported_versions = vec![1, 2];
@@ -491,7 +491,7 @@ mod tests {
             client_id: "c".into(),
             supported_versions: vec![crate::VERSION],
             capabilities: v1_caps(),
-            client_session_token: None,
+            client_connection_token: None,
         };
         let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
         server.supported_versions = vec![1, 2];
@@ -509,7 +509,7 @@ mod tests {
             client_id: "c".into(),
             supported_versions: vec![3, 4],
             capabilities: v1_caps(),
-            client_session_token: None,
+            client_connection_token: None,
         };
         let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
         server.supported_versions = vec![1, 2];
@@ -535,7 +535,7 @@ mod tests {
                 compression_zstd: true, // client supports
                 server_push: true,
             },
-            client_session_token: None,
+            client_connection_token: None,
         };
         let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
         server.capabilities = HelloCapabilities {
@@ -558,7 +558,7 @@ mod tests {
             client_id: "c".into(),
             supported_versions: vec![VERSION],
             capabilities: v1_caps(),
-            client_session_token: None,
+            client_connection_token: None,
         };
         let server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
         let session = negotiate(&client, &server).expect("happy path");

@@ -46,7 +46,7 @@ pub const DEFAULT_EXTRACTOR_CONTEXT_TOP_M: usize = 10;
 const NEIGHBOR_TEXT_CHAR_CAP: usize = 200;
 
 /// Knobs for [`fetch_extractor_context`]. Defaults come from
-/// [`DEFAULT_EXTRACTOR_CONTEXT_TOP_M`] and `same_context_only = true`;
+/// [`DEFAULT_EXTRACTOR_CONTEXT_TOP_M`] and `same_session_only = true`;
 /// callers override per-deployment as needed.
 #[derive(Debug, Clone, Copy)]
 pub struct ExtractorContextFetchConfig {
@@ -54,18 +54,18 @@ pub struct ExtractorContextFetchConfig {
     /// is asked for `top_m + 1` rows so the self-match (the memory
     /// being extracted) can be dropped without sacrificing a slot.
     pub top_m: usize,
-    /// When true, restrict neighbors to the same `context_id` as the
+    /// When true, restrict neighbors to the same `session_id` as the
     /// memory being extracted. The LLM's "this user / this thread"
     /// signal is the high-value channel — cross-context noise dilutes
     /// the prompt.
-    pub same_context_only: bool,
+    pub same_session_only: bool,
 }
 
 impl Default for ExtractorContextFetchConfig {
     fn default() -> Self {
         Self {
             top_m: DEFAULT_EXTRACTOR_CONTEXT_TOP_M,
-            same_context_only: true,
+            same_session_only: true,
         }
     }
 }
@@ -87,14 +87,14 @@ pub enum ExtractorContextError {
 /// Build the bounded LLM extractor context for `memory_id`.
 ///
 /// Steps:
-///   1. Look up the memory row to find its `context_id` (needed for
-///      the `same_context_only` filter — `SemanticRetriever` doesn't
+///   1. Look up the memory row to find its `session_id` (needed for
+///      the `same_session_only` filter — `SemanticRetriever` doesn't
 ///      key on context, so we filter post-search).
 ///   2. Run the semantic retriever with `cue_text` against the memory
 ///      HNSW for `top_m + 1` hits.
 ///   3. Drop the self-match (the memory being extracted is often the
 ///      top result — including it as its own context is noise).
-///   4. Drop hits from other contexts when `same_context_only`.
+///   4. Drop hits from other sessions when `same_session_only`.
 ///   5. For each surviving hit, fetch the neighbor's text body from
 ///      `TEXTS_TABLE` and its `created_at_unix_nanos` from
 ///      `MEMORIES_TABLE`. Both reads happen in the same `read_txn`
@@ -117,7 +117,7 @@ pub async fn fetch_extractor_context(
     // `Arc<MetadataDb>` lets every reader path open its own redb read
     // txn without serialising on a wrapping mutex.
     let metadata = ctx.executor.metadata.clone();
-    let memory_context_id: u64 = {
+    let memory_session_id: u64 = {
         let rtxn = metadata
             .read_txn()
             .map_err(|e| ExtractorContextError::Metadata(format!("read_txn: {e}")))?;
@@ -129,7 +129,7 @@ pub async fn fetch_extractor_context(
             .get(&key)
             .map_err(|e| ExtractorContextError::Metadata(format!("memory get: {e}")))?
             .ok_or(ExtractorContextError::MemoryNotFound(memory_id))?;
-        row.value().context_id
+        row.value().session_id
     };
 
     // Step 2: top_m + 1 semantic hits over the memory HNSW. The "+1"
@@ -195,7 +195,7 @@ pub async fn fetch_extractor_context(
             None => continue,
         };
         let row = row.value();
-        if config.same_context_only && row.context_id != memory_context_id {
+        if config.same_session_only && row.session_id != memory_session_id {
             continue;
         }
         let text_bytes = match texts_t
@@ -253,7 +253,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, Salience};
+    use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, Salience};
     use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
     use brain_index::{IndexParams, RankedItem, SemanticError, SemanticRetriever, SharedHnsw};
     use brain_metadata::tables::memory::MemoryMetadata;
@@ -321,7 +321,7 @@ mod tests {
     fn insert_memory(
         ctx: &OpsContext,
         id: MemoryId,
-        context_id: ContextId,
+        session_id: SessionId,
         text: &str,
         created_at_unix_nanos: u64,
     ) {
@@ -332,7 +332,7 @@ mod tests {
                 id,
                 brain_core::NamespaceId::SYSTEM,
                 SpaceId::new(),
-                context_id,
+                session_id,
                 0,
                 id.version(),
                 MemoryKind::Episodic,
@@ -368,7 +368,7 @@ mod tests {
         let n1 = MemoryId::pack(0, 2, 0);
         let n2 = MemoryId::pack(0, 3, 0);
         let n3 = MemoryId::pack(0, 4, 0);
-        let cx = ContextId(7);
+        let cx = SessionId(7);
         insert_memory(&ops, self_id, cx, "self", 100);
         insert_memory(&ops, n1, cx, "neighbor one", 200);
         insert_memory(&ops, n2, cx, "neighbor two", 300);
@@ -386,7 +386,7 @@ mod tests {
 
         let cfg = ExtractorContextFetchConfig {
             top_m: 10,
-            same_context_only: true,
+            same_session_only: true,
         };
         let ec = futures_lite::future::block_on(fetch_extractor_context(&ops, self_id, "cue", cfg))
             .expect("fetch succeeds");
@@ -406,14 +406,14 @@ mod tests {
     }
 
     #[test]
-    fn fetch_extractor_context_respects_same_context_only() {
+    fn fetch_extractor_context_respects_same_session_only() {
         let (_dir, mut ops) = fresh_ctx();
         let self_id = MemoryId::pack(0, 1, 0);
         let near_ctx = MemoryId::pack(0, 2, 0);
         let far_ctx = MemoryId::pack(0, 3, 0);
-        insert_memory(&ops, self_id, ContextId(7), "self", 100);
-        insert_memory(&ops, near_ctx, ContextId(7), "same-context neighbor", 200);
-        insert_memory(&ops, far_ctx, ContextId(8), "other-context neighbor", 300);
+        insert_memory(&ops, self_id, SessionId(7), "self", 100);
+        insert_memory(&ops, near_ctx, SessionId(7), "same-context neighbor", 200);
+        insert_memory(&ops, far_ctx, SessionId(8), "other-context neighbor", 300);
 
         let stub = Arc::new(StubRetriever {
             hits: vec![hit(near_ctx, 0.9), hit(far_ctx, 0.8)],
@@ -422,17 +422,17 @@ mod tests {
 
         let cfg = ExtractorContextFetchConfig {
             top_m: 10,
-            same_context_only: true,
+            same_session_only: true,
         };
         let ec = futures_lite::future::block_on(fetch_extractor_context(&ops, self_id, "cue", cfg))
             .expect("fetch succeeds");
         assert_eq!(ec.neighbors.len(), 1, "cross-context neighbor dropped");
         assert_eq!(ec.neighbors[0].memory_id, near_ctx);
 
-        // Same fixture, same_context_only=false → far-context neighbor lands too.
+        // Same fixture, same_session_only=false → far-context neighbor lands too.
         let cfg = ExtractorContextFetchConfig {
             top_m: 10,
-            same_context_only: false,
+            same_session_only: false,
         };
         let ec = futures_lite::future::block_on(fetch_extractor_context(&ops, self_id, "cue", cfg))
             .expect("fetch succeeds");
@@ -443,7 +443,7 @@ mod tests {
     fn fetch_extractor_context_returns_empty_for_first_memory() {
         let (_dir, mut ops) = fresh_ctx();
         let self_id = MemoryId::pack(0, 1, 0);
-        insert_memory(&ops, self_id, ContextId(7), "only memory", 100);
+        insert_memory(&ops, self_id, SessionId(7), "only memory", 100);
 
         // Retriever returns only the self-match — which we drop.
         let stub = Arc::new(StubRetriever {
@@ -466,18 +466,18 @@ mod tests {
     fn fetch_extractor_context_caps_at_top_m() {
         let (_dir, mut ops) = fresh_ctx();
         let self_id = MemoryId::pack(0, 1, 0);
-        insert_memory(&ops, self_id, ContextId(7), "self", 100);
+        insert_memory(&ops, self_id, SessionId(7), "self", 100);
         let mut hits = vec![hit(self_id, 0.99)];
         for slot in 2..=15u64 {
             let id = MemoryId::pack(0, slot, 0);
-            insert_memory(&ops, id, ContextId(7), &format!("n{slot}"), 100 + slot);
+            insert_memory(&ops, id, SessionId(7), &format!("n{slot}"), 100 + slot);
             hits.push(hit(id, 0.9 - (slot as f32) * 0.01));
         }
         ops.semantic_retriever = Arc::new(StubRetriever { hits });
 
         let cfg = ExtractorContextFetchConfig {
             top_m: 5,
-            same_context_only: true,
+            same_session_only: true,
         };
         let ec = futures_lite::future::block_on(fetch_extractor_context(&ops, self_id, "cue", cfg))
             .expect("fetch succeeds");

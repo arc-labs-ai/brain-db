@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use brain_core::{SpaceId, ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{SpaceId, SessionId, EdgeKind, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::edge::{origin as edge_origin, EDGES_TABLE};
@@ -122,7 +122,7 @@ async fn seed_memory_with_vec_space(
         vector: Box::new(vector),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),
-        context: ContextId(1),
+        session_id: SessionId(1),
         created_at_unix_nanos: now_unix_nanos(),
         occurred_at_unix_nanos: None,
         arena_slot: slot,

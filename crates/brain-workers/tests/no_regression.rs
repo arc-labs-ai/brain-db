@@ -81,7 +81,7 @@ async fn encode_one(ctx: &OpsContext, rid: u32, text: &str) {
     request_id[..4].copy_from_slice(&rid.to_be_bytes());
     let req = EncodeRequest {
         text: text.into(),
-        context_id: 1,
+        session_id: 1,
         request_id,
         txn_id: None,
         occurred_at_unix_nanos: None,
@@ -105,7 +105,7 @@ async fn recall_one(ctx: &OpsContext, cue: &str) -> usize {
         subject_name: String::new(),
         max_results: 5,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         age_bound_unix_nanos: None,
         as_of_record_time_unix_nanos: None,
         kind_filter: None,

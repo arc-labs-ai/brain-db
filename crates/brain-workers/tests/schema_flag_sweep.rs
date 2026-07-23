@@ -15,7 +15,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use brain_core::{SpaceId, ContextId, EntityId, ExtractorId, MemoryId};
+use brain_core::{SpaceId, SessionId, EntityId, ExtractorId, MemoryId};
 use brain_core::{
     Entity, EntityType, EvidenceEntry, EvidenceRef, Statement, StatementId, StatementKind,
     StatementObject, StatementValue, SubjectRef,
@@ -121,7 +121,7 @@ fn write_statement(
     let wtxn = metadata.write_txn().unwrap();
     let pid = predicate_intern_or_get(&wtxn, namespace, predicate_name, 0, NOW).unwrap();
     let evidence_entry = EvidenceEntry::from_parts(
-        MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+        MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
         1.0,
         0,
         ExtractorId::default(),

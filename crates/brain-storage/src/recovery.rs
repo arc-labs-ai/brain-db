@@ -326,7 +326,7 @@ fn apply_to_arena(
         | WalPayload::Unlink(_)
         | WalPayload::UpdateSalience(_)
         | WalPayload::UpdateKind(_)
-        | WalPayload::UpdateContext(_)
+        | WalPayload::UpdateSession(_)
         | WalPayload::CheckpointBegin(_)
         | WalPayload::CheckpointEnd(_)
         | WalPayload::TxnBegin(_)
@@ -495,7 +495,7 @@ mod tests {
     use crate::wal::record::{Lsn, WalRecord};
     use crate::wal::segment::WalSegment;
     use crate::wal::wal::Wal;
-    use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, RequestId, TxnId};
+    use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, RequestId, TxnId};
     use std::path::{Path, PathBuf};
 
     fn uuid(byte: u8) -> [u8; 16] {
@@ -537,7 +537,7 @@ mod tests {
             request_id: rid(0),
             space_id: aid(0),
             namespace_id: brain_core::NamespaceId::SYSTEM,
-            context_id: ContextId(0),
+            session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.5,
             embedding_model_fp: [0xAB; 16],

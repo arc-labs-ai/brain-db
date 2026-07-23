@@ -758,7 +758,7 @@ mod tests {
     use super::super::tombstone::statement_tombstone;
     use super::*;
     use crate::schema::predicate::predicate_intern;
-    use brain_core::{ContextId, MemoryId};
+    use brain_core::{SessionId, MemoryId};
     use brain_core::{Entity, EntityType, StatementValue, TombstoneReason, INLINE_EVIDENCE_CAP};
     use smallvec::SmallVec;
     fn test_scope() -> RowScope {
@@ -1527,7 +1527,7 @@ mod tests {
         let subj = make_entity(&mut db, "priya");
         let obj = make_entity(&mut db, "x");
         let pred = intern_fact_entity_pred(&mut db, "role8");
-        let mem = MemoryId::pack(7, ContextId::DEFAULT.into(), 0);
+        let mem = MemoryId::pack(7, SessionId::DEFAULT.into(), 0);
         let mut f = fresh_fact(subj, pred, obj);
         f.evidence = EvidenceRef::Inline(Box::new({
             let entry = EvidenceEntry::from_parts(
@@ -1663,7 +1663,7 @@ mod tests {
         let entries: Vec<EvidenceEntry> = (1..=10)
             .map(|i| {
                 EvidenceEntry::from_parts(
-                    MemoryId::pack(i as u16, ContextId::DEFAULT.into(), 0),
+                    MemoryId::pack(i as u16, SessionId::DEFAULT.into(), 0),
                     0.7,
                     1_700_000_000_000_000_000,
                     brain_core::ExtractorId::from(0),
@@ -1719,7 +1719,7 @@ mod tests {
         s.confidence = 0.5; // caller's wire-level value, should be overwritten
         let entry = |conf: f32| {
             EvidenceEntry::from_parts(
-                MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+                MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
                 conf,
                 1_700_000_000_000_000_000,
                 brain_core::ExtractorId::from(0),
@@ -1757,7 +1757,7 @@ mod tests {
         let mut s = fresh_fact(subj, pred, obj);
         s.confidence = 0.42;
         let entry_zero = EvidenceEntry {
-            memory_id: MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+            memory_id: MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
             confidence_milli: 0,
             timestamp_unix_nanos: 0,
             extractor_id: brain_core::ExtractorId::from(0),

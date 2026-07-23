@@ -100,7 +100,7 @@ pub struct RealWriterHandle {
     extractor_tx: Option<flume::Sender<ExtractorEnqueue>>,
     /// Optional non-blocking sender feeding the per-shard
     /// TemporalEdgeWorker. Each successful ENCODE enqueues
-    /// `(memory_id, space_id, context_id, created_at_unix_nanos)`
+    /// `(memory_id, space_id, session_id, created_at_unix_nanos)`
     /// post-commit; the worker looks up the previous memory for the
     /// same space + context in `MEMORIES_BY_SPACE_TIMELINE_TABLE`
     /// and writes a `FollowedBy` auto-edge with decay-weighted
@@ -191,7 +191,7 @@ pub type ExtractorEnqueue = (brain_core::MemoryId, std::sync::Arc<str>);
 
 /// What the writer pushes into the TemporalEdgeWorker's channel after
 /// a successful ENCODE. The worker uses
-/// `(memory_id, space_id, context_id, created_at_unix_nanos)` to look
+/// `(memory_id, space_id, session_id, created_at_unix_nanos)` to look
 /// up the predecessor via `MEMORIES_BY_SPACE_TIMELINE_TABLE`, and the
 /// inline `vector` to topical-gate the candidate edge (cosine
 /// similarity against the predecessor; below the configured floor →
@@ -200,7 +200,7 @@ pub type ExtractorEnqueue = (brain_core::MemoryId, std::sync::Arc<str>);
 pub type TemporalEdgeEnqueue = (
     brain_core::MemoryId,
     brain_core::SpaceId,
-    brain_core::ContextId,
+    brain_core::SessionId,
     u64,
     [f32; brain_embed::VECTOR_DIM],
 );
@@ -489,7 +489,7 @@ impl RealWriterHandle {
 
     /// Wire the TemporalEdgeWorker's feed channel. After this call
     /// every successful ENCODE enqueues
-    /// `(memory_id, space_id, context_id, created_at_unix_nanos)`
+    /// `(memory_id, space_id, session_id, created_at_unix_nanos)`
     /// post-commit. Without this call the enqueue path is a no-op
     /// (matches `set_auto_edge_sender`).
     pub fn set_temporal_edge_sender(&mut self, sender: flume::Sender<TemporalEdgeEnqueue>) {
@@ -719,7 +719,7 @@ pub(crate) fn try_enqueue_auto_edge(
     }
 }
 
-/// Enqueue `(memory_id, space_id, context_id, created_at_unix_nanos)`
+/// Enqueue `(memory_id, space_id, session_id, created_at_unix_nanos)`
 /// onto the TemporalEdgeWorker channel if one is wired. Mirrors
 /// [`try_enqueue_auto_edge`] semantics — full channel drops with a
 /// counter bump; disconnected logs at debug.
@@ -727,7 +727,7 @@ pub(crate) fn try_enqueue_temporal_edge(
     writer: &RealWriterHandle,
     memory_id: MemoryId,
     space_id: brain_core::SpaceId,
-    context_id: brain_core::ContextId,
+    session_id: brain_core::SessionId,
     created_at_unix_nanos: u64,
     vector: &[f32; brain_embed::VECTOR_DIM],
 ) -> bool {
@@ -737,7 +737,7 @@ pub(crate) fn try_enqueue_temporal_edge(
     let payload: TemporalEdgeEnqueue = (
         memory_id,
         space_id,
-        context_id,
+        session_id,
         created_at_unix_nanos,
         *vector,
     );

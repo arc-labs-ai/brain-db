@@ -40,7 +40,7 @@ fn main() {
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send(
         &mut stream,
@@ -77,7 +77,7 @@ fn main() {
     let text = "the devcontainer wire smoke memory: the evening sky turned teal";
     let encode = EncodeRequest {
         text: text.into(),
-        context_id: 1,
+        session_id: 1,
         request_id: [0x11u8; 16],
         txn_id: None,
         occurred_at_unix_nanos: None,
@@ -107,7 +107,7 @@ fn main() {
         subject_name: String::new(),
         max_results: 5,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         age_bound_unix_nanos: None,
         as_of_record_time_unix_nanos: None,
         kind_filter: None,

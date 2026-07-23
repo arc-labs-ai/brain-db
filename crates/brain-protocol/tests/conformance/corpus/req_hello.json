@@ -8,5 +8,5 @@
     "compression_zstd": false,
     "server_push": false
   },
-  "client_session_token": null
+  "client_connection_token": null
 }

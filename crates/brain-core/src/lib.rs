@@ -26,7 +26,7 @@ pub use edges::{
 };
 pub use error::{Error, Result};
 pub use ids::{
-    SpaceId, AuditId, ContextId, EntityId, EntityTypeId, EvidenceOverflowId, ExtractorId, MemoryId,
+    SpaceId, AuditId, SessionId, EntityId, EntityTypeId, EvidenceOverflowId, ExtractorId, MemoryId,
     MergeId, NamespaceId, PredicateId, RelationId, RelationTypeId, RequestId, ShardId, SlotIndex,
     SlotVersion, StatementId, TxnId, MAX_SLOT_INDEX,
 };

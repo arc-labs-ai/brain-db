@@ -11,13 +11,13 @@
 //!
 //! ```text
 //!   0..16   space_id          (UUID bytes)
-//!  16..24   context_id        (u64 BE)
+//!  16..24   session_id        (u64 BE)
 //!  24..56   content_hash      (BLAKE3(canonical_utf8(text))[..32])
 //! ```
 //!
 //! Partitioning by `space_id` is privacy + ownership: one space's
 //! encoded text never matches against another's index. Partitioning
-//! by `context_id` matches — the same utterance in
+//! by `session_id` matches — the same utterance in
 //! different episodic contexts is a different memory.
 //!
 //! ## Value
@@ -37,7 +37,7 @@
 //! - Tombstone state. The eviction discipline keeps this table
 //!   Active-only by construction.
 
-use brain_core::{SpaceId, ContextId, MemoryId};
+use brain_core::{SpaceId, SessionId, MemoryId};
 use redb::TableDefinition;
 
 /// The `fingerprints` table. See module docs for key layout.
@@ -113,18 +113,18 @@ impl redb::Value for FingerprintEntry {
     }
 }
 
-/// Pack the `(space_id, context_id, content_hash)` triple into the
+/// Pack the `(space_id, session_id, content_hash)` triple into the
 /// 56-byte key used by [`FINGERPRINTS_TABLE`].
 #[must_use]
 pub fn fingerprint_key(
     space_id: SpaceId,
-    context_id: ContextId,
+    session_id: SessionId,
     content_hash: &[u8; 32],
 ) -> [u8; 56] {
     let mut key = [0u8; 56];
     let space_bytes: [u8; 16] = space_id.into();
     key[0..16].copy_from_slice(&space_bytes);
-    key[16..24].copy_from_slice(&context_id.0.to_be_bytes());
+    key[16..24].copy_from_slice(&session_id.0.to_be_bytes());
     key[24..56].copy_from_slice(content_hash);
     key
 }
@@ -162,15 +162,15 @@ mod tests {
 
     #[test]
     fn key_packing_is_deterministic_and_disjoint() {
-        let a = fingerprint_key(space(1), ContextId(7), &content_hash("hello"));
-        let b = fingerprint_key(space(1), ContextId(7), &content_hash("hello"));
+        let a = fingerprint_key(space(1), SessionId(7), &content_hash("hello"));
+        let b = fingerprint_key(space(1), SessionId(7), &content_hash("hello"));
         assert_eq!(a, b);
 
-        let c = fingerprint_key(space(2), ContextId(7), &content_hash("hello"));
+        let c = fingerprint_key(space(2), SessionId(7), &content_hash("hello"));
         assert_ne!(a, c, "different space → different key");
-        let d = fingerprint_key(space(1), ContextId(8), &content_hash("hello"));
+        let d = fingerprint_key(space(1), SessionId(8), &content_hash("hello"));
         assert_ne!(a, d, "different context → different key");
-        let e = fingerprint_key(space(1), ContextId(7), &content_hash("world"));
+        let e = fingerprint_key(space(1), SessionId(7), &content_hash("world"));
         assert_ne!(a, e, "different content → different key");
     }
 
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn round_trip_insert_get_remove() {
         let (_dir, db) = fresh_db();
-        let key = fingerprint_key(space(1), ContextId(7), &content_hash("hello"));
+        let key = fingerprint_key(space(1), SessionId(7), &content_hash("hello"));
         let mid = memory(0, 42);
         let entry = FingerprintEntry::new(mid, 1_700_000_000_000_000_000);
 

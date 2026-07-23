@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, StatementId};
+use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, StatementId};
 use brain_core::{
     EntityId, EntityTypeId, EvidenceEntry, EvidenceRef, ExtractorId, Statement, StatementKind,
     StatementObject, SubjectRef,
@@ -114,7 +114,7 @@ async fn seed_memory(fixture: &Fixture, slot: u64) -> MemoryId {
         vector: Box::new([0.0_f32; VECTOR_DIM]),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),
-        context: ContextId(1),
+        session_id: SessionId(1),
         created_at_unix_nanos: now_unix_nanos(),
         occurred_at_unix_nanos: None,
         arena_slot: slot,

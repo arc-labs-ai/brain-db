@@ -226,7 +226,7 @@ pub fn reclaim_evidence_overflow(
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use brain_core::ContextId;
+    use brain_core::SessionId;
     use redb::ReadableDatabase;
 
     fn fresh_db() -> (tempfile::TempDir, redb::Database) {
@@ -237,7 +237,7 @@ mod tests {
 
     fn ids(n: usize) -> Vec<MemoryId> {
         (0..n)
-            .map(|i| MemoryId::pack(i as u16, ContextId::DEFAULT.into(), 0))
+            .map(|i| MemoryId::pack(i as u16, SessionId::DEFAULT.into(), 0))
             .collect()
     }
 
@@ -394,7 +394,7 @@ mod tests {
         let entries: Vec<EvidenceEntry> = (0..12)
             .map(|i| {
                 EvidenceEntry::from_parts(
-                    MemoryId::pack(i, ContextId::DEFAULT.into(), 0),
+                    MemoryId::pack(i, SessionId::DEFAULT.into(), 0),
                     0.5 + (i as f32) * 0.01,
                     1_700_000_000 + i as u64,
                     ExtractorId::from(i as u32),

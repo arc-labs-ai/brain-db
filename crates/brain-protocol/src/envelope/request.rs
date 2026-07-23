@@ -32,8 +32,8 @@ use crate::error::ProtocolError;
 /// 16-byte UUID-shaped identifier (`SpaceId`, `RequestId`, `TxnId`).
 pub type WireUuid = [u8; 16];
 
-/// Wire-side `ContextId` — 8 bytes / `u64`.
-pub type WireContextId = u64;
+/// Wire-side `SessionId` — 8 bytes / `u64`.
+pub type WireSessionId = u64;
 
 /// Packed `MemoryId` (shard 16 + slot 48 + version 32 + reserved 32,
 /// all rolled into a `u128`).
@@ -98,8 +98,8 @@ pub enum RequestBody {
     AdminRestore(AdminRestoreRequest),
     AdminIntegrityCheck(AdminIntegrityCheckRequest),
     AdminMigrateEmbeddings(AdminMigrateEmbeddingsRequest),
-    AdminCreateContext(AdminCreateContextRequest),
-    AdminRenameContext(AdminRenameContextRequest),
+    AdminCreateSession(AdminCreateSessionRequest),
+    AdminRenameSession(AdminRenameSessionRequest),
     AdminMoveMemory(AdminMoveMemoryRequest),
     AdminReclassify(AdminReclassifyRequest),
     AdminListTombstoned(AdminListTombstonedRequest),
@@ -189,8 +189,8 @@ impl RequestBody {
             Self::AdminRestore(_) => Opcode::AdminRestoreReq,
             Self::AdminIntegrityCheck(_) => Opcode::AdminIntegrityCheckReq,
             Self::AdminMigrateEmbeddings(_) => Opcode::AdminMigrateEmbeddingsReq,
-            Self::AdminCreateContext(_) => Opcode::AdminCreateContextReq,
-            Self::AdminRenameContext(_) => Opcode::AdminRenameContextReq,
+            Self::AdminCreateSession(_) => Opcode::AdminCreateSessionReq,
+            Self::AdminRenameSession(_) => Opcode::AdminRenameSessionReq,
             Self::AdminMoveMemory(_) => Opcode::AdminMoveMemoryReq,
             Self::AdminReclassify(_) => Opcode::AdminReclassifyReq,
             Self::AdminListTombstoned(_) => Opcode::AdminListTombstonedReq,
@@ -270,8 +270,8 @@ impl RequestBody {
             Self::AdminRestore(r) => to_cbor_bytes(r),
             Self::AdminIntegrityCheck(r) => to_cbor_bytes(r),
             Self::AdminMigrateEmbeddings(r) => to_cbor_bytes(r),
-            Self::AdminCreateContext(r) => to_cbor_bytes(r),
-            Self::AdminRenameContext(r) => to_cbor_bytes(r),
+            Self::AdminCreateSession(r) => to_cbor_bytes(r),
+            Self::AdminRenameSession(r) => to_cbor_bytes(r),
             Self::AdminMoveMemory(r) => to_cbor_bytes(r),
             Self::AdminReclassify(r) => to_cbor_bytes(r),
             Self::AdminListTombstoned(r) => to_cbor_bytes(r),
@@ -354,8 +354,8 @@ impl RequestBody {
             Opcode::AdminMigrateEmbeddingsReq => {
                 Self::AdminMigrateEmbeddings(from_cbor_bytes(bytes)?)
             }
-            Opcode::AdminCreateContextReq => Self::AdminCreateContext(from_cbor_bytes(bytes)?),
-            Opcode::AdminRenameContextReq => Self::AdminRenameContext(from_cbor_bytes(bytes)?),
+            Opcode::AdminCreateSessionReq => Self::AdminCreateSession(from_cbor_bytes(bytes)?),
+            Opcode::AdminRenameSessionReq => Self::AdminRenameSession(from_cbor_bytes(bytes)?),
             Opcode::AdminMoveMemoryReq => Self::AdminMoveMemory(from_cbor_bytes(bytes)?),
             Opcode::AdminReclassifyReq => Self::AdminReclassify(from_cbor_bytes(bytes)?),
             Opcode::AdminListTombstonedReq => Self::AdminListTombstoned(from_cbor_bytes(bytes)?),
@@ -421,7 +421,7 @@ impl RequestBody {
 ///
 /// let no_override = RequestBody::Encode(EncodeRequest {
 ///     text: "hi".into(),
-///     context_id: 0,
+///     session_id: 0,
 ///     request_id: [0; 16],
 ///     txn_id: None,
 ///     occurred_at_unix_nanos: None,
@@ -433,7 +433,7 @@ impl RequestBody {
 ///
 /// let with_override = RequestBody::Encode(EncodeRequest {
 ///     text: "hi".into(),
-///     context_id: 0,
+///     session_id: 0,
 ///     request_id: [0; 16],
 ///     txn_id: None,
 ///     occurred_at_unix_nanos: None,
@@ -507,7 +507,7 @@ mod tests {
     fn encode_round_trips() {
         round_trip(RequestBody::Encode(EncodeRequest {
             text: "hello brain".into(),
-            context_id: 1_u64,
+            session_id: 1_u64,
             request_id: sample_uuid(2),
             txn_id: Some(sample_uuid(3)),
             occurred_at_unix_nanos: Some(1_700_000_000_000_000_000),
@@ -521,7 +521,7 @@ mod tests {
     fn encode_round_trips_with_act_as() {
         round_trip(RequestBody::Encode(EncodeRequest {
             text: "hello brain".into(),
-            context_id: 1_u64,
+            session_id: 1_u64,
             request_id: sample_uuid(2),
             txn_id: None,
             occurred_at_unix_nanos: None,
@@ -543,7 +543,7 @@ mod tests {
             text: "hello brain".into(),
             vector: vec![1.0, 0.0, 0.0, 0.0],
             model_fingerprint: [0xAB; 16],
-            context_id: 1_u64,
+            session_id: 1_u64,
             kind: MemoryKindWire::Episodic,
             salience_hint: 0.25,
             edges: vec![EdgeRequest {
@@ -564,7 +564,7 @@ mod tests {
             subject_name: "Alice".into(),
             max_results: 10,
             confidence_threshold: 0.3,
-            context_filter: Some(vec![1_u64, 2_u64]),
+            session_filter: Some(vec![1_u64, 2_u64]),
             age_bound_unix_nanos: Some(1_700_000_000_000_000_000),
             as_of_record_time_unix_nanos: Some(1_710_000_000_000_000_000),
             kind_filter: Some(vec![MemoryKindWire::Episodic, MemoryKindWire::Semantic]),
@@ -598,7 +598,7 @@ mod tests {
                     max_branches_explored: 100,
                 },
                 strategy_hint: Some(PlanStrategy::AStar),
-                context_filter: None,
+                session_filter: None,
                 request_id: None,
                 txn_id: None,
                 trace: false,
@@ -617,7 +617,7 @@ mod tests {
                 observation: obs,
                 depth: 5,
                 confidence_threshold: 0.4,
-                context_filter: None,
+                session_filter: None,
                 max_inferences: 50,
                 budget_wall_time_ms: 5_000,
                 request_id: None,
@@ -659,7 +659,7 @@ mod tests {
     fn subscribe_round_trips() {
         round_trip(RequestBody::Subscribe(SubscribeRequest {
             filter: SubscriptionFilter {
-                contexts: Some(vec![9_u64]),
+                session_filter: Some(vec![9_u64]),
                 kinds: None,
                 similar_to: Some(SimilarityFilter {
                     reference_memory_id: sample_memory_id(),
@@ -679,7 +679,7 @@ mod tests {
     fn subscribe_round_trips_with_act_as() {
         round_trip(RequestBody::Subscribe(SubscribeRequest {
             filter: SubscriptionFilter {
-                contexts: None,
+                session_filter: None,
                 kinds: None,
                 similar_to: None,
                 spaces: None,
@@ -785,18 +785,18 @@ mod tests {
                 rate_limit_qps: 0,
             },
         ));
-        round_trip(RequestBody::AdminCreateContext(AdminCreateContextRequest {
+        round_trip(RequestBody::AdminCreateSession(AdminCreateSessionRequest {
             name: "personal".into(),
             description: "personal notes".into(),
             request_id: sample_uuid(14),
         }));
-        round_trip(RequestBody::AdminRenameContext(AdminRenameContextRequest {
-            context_id: 15_u64,
+        round_trip(RequestBody::AdminRenameSession(AdminRenameSessionRequest {
+            session_id: 15_u64,
             new_name: "renamed".into(),
         }));
         round_trip(RequestBody::AdminMoveMemory(AdminMoveMemoryRequest {
             memory_id: sample_memory_id(),
-            new_context_id: 16_u64,
+            new_session_id: 16_u64,
         }));
         round_trip(RequestBody::AdminReclassify(AdminReclassifyRequest {
             memory_id: sample_memory_id(),
@@ -804,7 +804,7 @@ mod tests {
         }));
         round_trip(RequestBody::AdminListTombstoned(
             AdminListTombstonedRequest {
-                context_id: Some(17_u64),
+                session_id: Some(17_u64),
                 max_age_seconds: 3600,
                 limit: 100,
             },
@@ -850,7 +850,7 @@ mod tests {
                     compression_zstd: false,
                     server_push: false,
                 },
-                client_session_token: None,
+                client_connection_token: None,
             }),
             RequestBody::Auth(AuthPayload {
                 method: AuthMethod::Token,
@@ -879,7 +879,7 @@ mod tests {
 
         let encode = RequestBody::Encode(EncodeRequest {
             text: "x".into(),
-            context_id: 0,
+            session_id: 0,
             request_id: sample_uuid(1),
             txn_id: None,
             occurred_at_unix_nanos: None,
@@ -894,7 +894,7 @@ mod tests {
             subject_name: String::new(),
             max_results: 1,
             confidence_threshold: 0.0,
-            context_filter: None,
+            session_filter: None,
             age_bound_unix_nanos: None,
             as_of_record_time_unix_nanos: None,
             kind_filter: None,
@@ -927,7 +927,7 @@ mod tests {
                 max_branches_explored: 1,
             },
             strategy_hint: None,
-            context_filter: None,
+            session_filter: None,
             request_id: None,
             txn_id: None,
             trace: false,
@@ -939,7 +939,7 @@ mod tests {
             observation: ObservationInput::ByText("x".into()),
             depth: 1,
             confidence_threshold: 0.0,
-            context_filter: None,
+            session_filter: None,
             max_inferences: 1,
             budget_wall_time_ms: 1,
             request_id: None,
@@ -982,7 +982,7 @@ mod tests {
 
         let entity_resolve = RequestBody::EntityResolve(EntityResolveRequest {
             candidate_name: "Ada".into(),
-            context: String::new(),
+            resolution_context: String::new(),
             entity_type_hint: 0,
             allow_create: false,
             request_id: sample_uuid(1),
@@ -1114,7 +1114,7 @@ mod tests {
         // Supported op, but no override set.
         let encode = RequestBody::Encode(EncodeRequest {
             text: "x".into(),
-            context_id: 0,
+            session_id: 0,
             request_id: sample_uuid(1),
             txn_id: None,
             occurred_at_unix_nanos: None,

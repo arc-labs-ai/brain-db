@@ -229,6 +229,8 @@ fn build_filter(req: &MemoryListRequest) -> MemoryTimelineFilter {
 fn row_to_item(row: &MemoryMetadata, text: String) -> MemoryListItem {
     MemoryListItem {
         memory_id: row.memory_id_bytes,
+        space_id: row.space_id_bytes,
+        session_id: row.session_id,
         text,
         kind: row.kind,
         state: u8::from(!row.is_active()),

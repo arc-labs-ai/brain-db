@@ -9,7 +9,7 @@
 //! Both share the property that they leave the arena slot in a new
 //! version; recovery just lays down the post-state.
 
-use brain_core::{SpaceId, ContextId, MemoryKind};
+use brain_core::{SpaceId, SessionId, MemoryKind};
 use brain_storage::recovery::MetadataSinkError;
 use brain_storage::wal::payload::{ConsolidatePayload, ReclaimPayload};
 
@@ -65,7 +65,7 @@ impl MetadataDb {
             let slot_version = memory_id.version();
 
             // For Consolidated memories: the source-derived space_id /
-            // context_id aren't in the payload. Consolidation is
+            // session_id aren't in the payload. Consolidation is
             // space-scoped — every source shares an space. Storage uses
             // the brain-core NULL sentinels here; the wire layer
             // populates these via a richer payload. This is a pure
@@ -74,7 +74,7 @@ impl MetadataDb {
                 memory_id_bytes: memory_id.to_be_bytes(),
                 namespace_id: brain_core::NamespaceId::SYSTEM.raw(),
                 space_id_bytes: <[u8; 16]>::from(SpaceId::default()),
-                context_id: ContextId::default().raw(),
+                session_id: SessionId::default().raw(),
                 slot_id,
                 slot_version,
                 kind: memory_kind_to_u8(MemoryKind::Consolidated),

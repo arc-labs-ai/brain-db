@@ -67,11 +67,11 @@ pub struct QueryRequest {
     pub include_tombstoned: bool,
     pub include_superseded: bool,
     /// Memory-context scope. When non-empty the front gate restricts
-    /// every retriever to memories with `context_id` in this set —
+    /// every retriever to memories with `session_id` in this set —
     /// pushed into the semantic closure and the lexical query's
     /// boolean MUST clause so the filter scopes the search universe
     /// before any expensive stage, not as a post-projection prune.
-    pub context_filter: Vec<u64>,
+    pub session_filter: Vec<u64>,
     /// Space-scope filter. When non-empty the front gate restricts
     /// every retriever to memories whose `space_id` is in this set.
     /// The recall handler defaults this to `[caller_space]` so each

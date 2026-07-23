@@ -171,7 +171,7 @@ impl WriteAck {
 mod tests {
     use super::*;
     use crate::write::phase::Phase;
-    use brain_core::{ContextId, MemoryId, MemoryKind, Salience};
+    use brain_core::{SessionId, MemoryId, MemoryKind, Salience};
     use brain_embed::VECTOR_DIM;
 
     fn sample_phase() -> Phase {
@@ -181,7 +181,7 @@ mod tests {
             vector: Box::new([0.0_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             created_at_unix_nanos: 1_700_000_000_000,
             occurred_at_unix_nanos: None,
             arena_slot: 1,

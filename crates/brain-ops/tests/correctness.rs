@@ -94,7 +94,7 @@ fn build_fixture() -> Fixture {
 fn encode_req(rid: [u8; 16], text: &str) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
-        context_id: 42,
+        session_id: 42,
         request_id: rid,
         txn_id: None,
         occurred_at_unix_nanos: None,
@@ -133,7 +133,7 @@ async fn recall(fix: &Fixture, cue: &str, max_results: u32) -> RecallResponseFra
         subject_name: String::new(),
         max_results,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         age_bound_unix_nanos: None,
         as_of_record_time_unix_nanos: None,
         kind_filter: None,

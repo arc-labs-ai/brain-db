@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use brain_core::{
-    SpaceId, ContextId, EdgeKind, EdgeKindRef, Entity, EntityId, EntityType, EvidenceEntry,
+    SpaceId, SessionId, EdgeKind, EdgeKindRef, Entity, EntityId, EntityType, EvidenceEntry,
     EvidenceRef, ExtractorId, MemoryId, MemoryKind, NodeRef, PredicateId, Statement, StatementId,
     StatementKind, StatementObject, SubjectRef,
 };
@@ -241,7 +241,7 @@ fn build_fixture(
                 id,
                 brain_core::NamespaceId::SYSTEM,
                 space,
-                ContextId(7),
+                SessionId(7),
                 (i + 1) as u64,
                 1,
                 MemoryKind::Episodic,

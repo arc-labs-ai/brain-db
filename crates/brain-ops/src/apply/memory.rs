@@ -1,9 +1,9 @@
 //! Apply functions for memory-shaped phases.
 //!
-//! Covers: UpsertMemory, UpdateSalience, UpdateKind, UpdateContext,
+//! Covers: UpsertMemory, UpdateSalience, UpdateKind, UpdateSession,
 //! UpdateEmbedding, and Tombstone(Memory).
 
-use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind};
+use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind};
 use brain_metadata::tables::memory::{
     space_timeline_key, MemoryMetadata, MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE,
 };
@@ -26,7 +26,7 @@ pub fn apply_upsert_memory(
         vector,
         kind,
         salience,
-        context,
+        session_id,
         created_at_unix_nanos,
         occurred_at_unix_nanos,
         arena_slot,
@@ -42,7 +42,7 @@ pub fn apply_upsert_memory(
         *id,
         write.namespace,
         write.space_id,
-        *context,
+        *session_id,
         *arena_slot,
         id.version(),
         *kind,
@@ -81,7 +81,7 @@ pub fn apply_upsert_memory(
             namespace_id,
             space_id_bytes(write.space_id),
             *created_at_unix_nanos,
-            context.raw(),
+            session_id.raw(),
             id.to_be_bytes(),
         );
         timeline_t
@@ -142,7 +142,7 @@ pub fn apply_upsert_memory(
     }
 
     // FINGERPRINTS_TABLE entry when the encode opted into content-
-    // hash dedup. The row keys (space_id, context_id, content_hash) →
+    // hash dedup. The row keys (space_id, session_id, content_hash) →
     // this memory id, so a future ENCODE with matching text/space/ctx
     // can dedupe-to-existing without minting a fresh row.
     if *deduplicate {
@@ -150,7 +150,7 @@ pub fn apply_upsert_memory(
             use brain_metadata::tables::fingerprint::{
                 fingerprint_key, FingerprintEntry, FINGERPRINTS_TABLE,
             };
-            let key = fingerprint_key(write.space_id, *context, ch);
+            let key = fingerprint_key(write.space_id, *session_id, ch);
             let entry = FingerprintEntry::new(*id, *created_at_unix_nanos);
             let mut fp_t = wtxn
                 .open_table(FINGERPRINTS_TABLE)
@@ -206,7 +206,7 @@ pub fn apply_tombstone_memory(
     let created_at = row.created_at_unix_nanos;
     let namespace_id = row.namespace_id;
     let space_bytes = row.space_id_bytes;
-    let ctx_raw = row.context_id;
+    let ctx_raw = row.session_id;
     let mid_bytes = row.memory_id_bytes;
     let dedup_hash = row.content_hash;
 
@@ -243,7 +243,7 @@ pub fn apply_tombstone_memory(
             .map_err(|e| ApplyError::Storage(format!("open FINGERPRINTS: {e:?}")))?;
         let key = fingerprint_key(
             brain_core::SpaceId::from(space_bytes),
-            ContextId(ctx_raw),
+            SessionId(ctx_raw),
             &hash,
         );
         let _ = fp_t
@@ -310,22 +310,22 @@ pub fn apply_update_kind(
     Ok(PhaseAck::KindUpdated)
 }
 
-/// Apply [`Phase::UpdateContext`].
-pub fn apply_update_context(
+/// Apply [`Phase::UpdateSession`].
+pub fn apply_update_session(
     wtxn: &WriteTransaction,
     phase: &Phase,
     _write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
-    let Phase::UpdateContext { id, new_context } = phase else {
-        return Err(ApplyError::PhaseMisShape("expected UpdateContext"));
+    let Phase::UpdateSession { id, new_session_id } = phase else {
+        return Err(ApplyError::PhaseMisShape("expected UpdateSession"));
     };
     let mut row = load_memory(wtxn, *id)?;
-    let old_context = ContextId(row.context_id);
+    let old_session_id = SessionId(row.session_id);
     let old_created = row.created_at_unix_nanos;
-    row.context_id = new_context.raw();
+    row.session_id = new_session_id.raw();
     write_memory(wtxn, *id, row.clone())?;
 
-    // Update the timeline index — the key includes context_id, so we
+    // Update the timeline index — the key includes session_id, so we
     // remove the old entry and insert the new one.
     {
         let mut timeline_t = wtxn
@@ -335,22 +335,22 @@ pub fn apply_update_context(
             row.namespace_id,
             row.space_id_bytes,
             old_created,
-            old_context.raw(),
+            old_session_id.raw(),
             id.to_be_bytes(),
         );
         let _ = timeline_t
             .remove(old_key.as_slice())
-            .map_err(|e| ApplyError::Storage(format!("TIMELINE remove (context change): {e:?}")))?;
+            .map_err(|e| ApplyError::Storage(format!("TIMELINE remove (session change): {e:?}")))?;
         let new_key = space_timeline_key(
             row.namespace_id,
             row.space_id_bytes,
             old_created,
-            new_context.raw(),
+            new_session_id.raw(),
             id.to_be_bytes(),
         );
         timeline_t
             .insert(new_key.as_slice(), ())
-            .map_err(|e| ApplyError::Storage(format!("TIMELINE insert (context change): {e:?}")))?;
+            .map_err(|e| ApplyError::Storage(format!("TIMELINE insert (session change): {e:?}")))?;
     }
 
     Ok(PhaseAck::ContextUpdated)
@@ -445,7 +445,7 @@ mod tests {
             vector: Box::new([0.0_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: brain_core::Salience::default(),
-            context: ContextId(7),
+            session_id: SessionId(7),
             created_at_unix_nanos: 1_700_000_000_000,
             occurred_at_unix_nanos: None,
             arena_slot: 42,
@@ -487,7 +487,7 @@ mod tests {
         let row = t.get(&id.to_be_bytes()).unwrap().unwrap().value();
         assert_eq!(row.memory_id(), id);
         assert_eq!(row.space_id(), space);
-        assert_eq!(row.context(), ContextId(7));
+        assert_eq!(row.session(), SessionId(7));
         assert_eq!(row.created_at_unix_nanos, 1_700_000_000_000);
         assert!(row.flags & brain_metadata::tables::memory::flags::ACTIVE != 0);
 
@@ -538,7 +538,7 @@ mod tests {
             row.namespace_id,
             row.space_id_bytes,
             row.created_at_unix_nanos,
-            row.context_id,
+            row.session_id,
             row.memory_id_bytes,
         );
         let timeline_t = rtxn.open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE).unwrap();

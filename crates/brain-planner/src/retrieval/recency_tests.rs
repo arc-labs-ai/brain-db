@@ -1,6 +1,6 @@
 //! Unit tests for the event-time recency boost.
 
-use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind};
+use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind};
 use brain_index::RankedItemId;
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
@@ -23,7 +23,7 @@ fn put_memory(metadata: &MetadataDb, id: MemoryId, occurred_at: Option<u64>, cre
         id,
         brain_core::NamespaceId::SYSTEM,
         SpaceId::new(),
-        ContextId::from(0),
+        SessionId::from(0),
         id.slot(),
         id.version(),
         MemoryKind::Episodic,

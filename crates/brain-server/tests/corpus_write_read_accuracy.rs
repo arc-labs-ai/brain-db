@@ -182,7 +182,7 @@ async fn complete_handshake(client: &mut TcpStream, token: &[u8]) {
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send_frame(
         client,
@@ -222,7 +222,7 @@ async fn encode_round_trip(
 ) -> (u16, Option<u128>) {
     let req = EncodeRequest {
         text: text.into(),
-        context_id: 0,
+        session_id: 0,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
@@ -271,7 +271,7 @@ async fn recall(client: &mut TcpStream, stream_id: u32, cue: &str) -> RecallResp
         subject_name: String::new(),
         max_results: 10,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         age_bound_unix_nanos: None,
         as_of_record_time_unix_nanos: None,
         kind_filter: None,

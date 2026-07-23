@@ -16,7 +16,7 @@
 //!   no LLM, no network. Strategies (the things that compute derived
 //!   phases) do that ahead of submit; apply functions only mutate redb.
 
-use brain_core::{ContextId, EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience};
+use brain_core::{SessionId, EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience};
 use brain_core::{
     Entity, EntityAttributes, EntityId, EntityTypeId, EvidenceEntry, EvidenceOverflowId,
     ExtractorId, MergeId, PredicateId, Relation, RelationId, RelationTypeId, Statement,
@@ -51,7 +51,7 @@ pub enum Phase {
         vector: Box<[f32; VECTOR_DIM]>,
         kind: MemoryKind,
         salience: Salience,
-        context: ContextId,
+        session_id: SessionId,
         created_at_unix_nanos: u64,
         /// Client-supplied event time (when the content actually
         /// happened), distinct from `created_at_unix_nanos` (server write
@@ -217,9 +217,9 @@ pub enum Phase {
     UpdateKind { id: MemoryId, new_kind: MemoryKind },
 
     /// Mutate a memory's context.
-    UpdateContext {
+    UpdateSession {
         id: MemoryId,
-        new_context: ContextId,
+        new_session_id: SessionId,
     },
 
     /// Replace a memory's embedding (used by `MigrateEmbeddings`).
@@ -471,7 +471,7 @@ impl Phase {
             Self::Supersede { .. } => "supersede",
             Self::UpdateSalience { .. } => "update_salience",
             Self::UpdateKind { .. } => "update_kind",
-            Self::UpdateContext { .. } => "update_context",
+            Self::UpdateSession { .. } => "update_session",
             Self::UpdateEmbedding { .. } => "update_embedding",
             Self::UpdateEntity { .. } => "update_entity",
             Self::RenameEntity { .. } => "rename_entity",
@@ -557,7 +557,7 @@ mod tests {
             vector: Box::new([0.0_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
-            context: ContextId(7),
+            session_id: SessionId(7),
             created_at_unix_nanos: 1_700_000_000_000,
             occurred_at_unix_nanos: None,
             arena_slot: 42,
@@ -600,7 +600,7 @@ mod tests {
             vector: Box::new([0.0_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             created_at_unix_nanos: 0,
             occurred_at_unix_nanos: None,
             arena_slot: 0,

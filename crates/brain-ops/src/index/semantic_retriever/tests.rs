@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind};
+use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{
     IndexParams, RankedItemId, SemanticError, SemanticFilters, SemanticFiltersConfigSlot,
@@ -84,7 +84,7 @@ fn write_memory_row_ns(
         id,
         namespace,
         space,
-        ContextId::from(0),
+        SessionId::from(0),
         id.slot(),
         id.version(),
         kind,

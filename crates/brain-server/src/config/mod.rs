@@ -696,9 +696,9 @@ pub struct TemporalEdgeWorkerConfig {
     /// Writer → worker queue depth.
     #[serde(default = "default_temporal_edge_channel_capacity")]
     pub channel_capacity: usize,
-    /// Allow `FollowedBy` edges across context boundaries.
-    #[serde(default = "default_temporal_edge_cross_context")]
-    pub cross_context: bool,
+    /// Allow `FollowedBy` edges across session boundaries.
+    #[serde(default = "default_temporal_edge_cross_session")]
+    pub cross_session: bool,
     /// Cosine similarity floor for the topical gate. Below this, the
     /// candidate predecessor is dropped — preserves narrative threads
     /// without writing spurious "followed by" edges between
@@ -717,7 +717,7 @@ impl Default for TemporalEdgeWorkerConfig {
             window_seconds: default_temporal_edge_window_seconds(),
             weight_min: default_temporal_edge_weight_min(),
             channel_capacity: default_temporal_edge_channel_capacity(),
-            cross_context: default_temporal_edge_cross_context(),
+            cross_session: default_temporal_edge_cross_session(),
             topical_threshold: default_temporal_edge_topical_threshold(),
         }
     }
@@ -744,7 +744,7 @@ fn default_temporal_edge_weight_min() -> f32 {
 fn default_temporal_edge_channel_capacity() -> usize {
     1024
 }
-fn default_temporal_edge_cross_context() -> bool {
+fn default_temporal_edge_cross_session() -> bool {
     false
 }
 fn default_temporal_edge_topical_threshold() -> f32 {

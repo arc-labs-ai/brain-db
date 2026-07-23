@@ -549,7 +549,7 @@ mod linux_main {
                 window_seconds: cfg.workers.temporal_edge.window_seconds,
                 weight_min: cfg.workers.temporal_edge.weight_min,
                 channel_capacity: cfg.workers.temporal_edge.channel_capacity,
-                cross_context: cfg.workers.temporal_edge.cross_context,
+                cross_session: cfg.workers.temporal_edge.cross_session,
                 topical_threshold: cfg.workers.temporal_edge.topical_threshold,
             };
             // Ferry the operator's `[workers.causal_edge]`

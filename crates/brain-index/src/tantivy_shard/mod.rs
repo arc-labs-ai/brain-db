@@ -146,7 +146,7 @@ pub fn memory_text_schema() -> Schema {
     // lets the front filter narrow a query to a single context before
     // any expensive stage runs. INDEXED for exact term filter, FAST
     // for selectivity-driven set ops.
-    sb.add_u64_field("context", INDEXED | FAST);
+    sb.add_u64_field("session", INDEXED | FAST);
     sb.build()
 }
 

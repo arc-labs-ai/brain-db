@@ -1,6 +1,6 @@
 //! SUBSCRIBE / UNSUBSCRIBE plus filter sub-structs.
 
-use crate::envelope::request::{WireContextId, WireMemoryId, WireUuid};
+use crate::envelope::request::{WireSessionId, WireMemoryId, WireUuid};
 use crate::ops::memory::ActAs;
 use crate::shared::primitives::MemoryKindWire;
 
@@ -20,7 +20,7 @@ pub struct SubscribeRequest {
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SubscriptionFilter {
-    pub contexts: Option<Vec<WireContextId>>,
+    pub session_filter: Option<Vec<WireSessionId>>,
     pub kinds: Option<Vec<MemoryKindWire>>,
     pub similar_to: Option<SimilarityFilter>,
     /// Subset of space ids whose events the subscriber wants. `None`
@@ -61,14 +61,14 @@ use crate::shared::enums::{EventType, StageKind, StageOutcome, StagePayload};
 /// Body carries `graph_payload`, an optional typed sidecar with
 /// typed-graph event data. For cognitive events (`Encoded`,
 /// `Forgotten`, `Reclaimed`, `KindChanged`) the field is `None`. For
-/// typed-graph events the cognitive fields (`memory_id`, `context_id`,
+/// typed-graph events the cognitive fields (`memory_id`, `session_id`,
 /// `kind`, `salience`, `text`) are zero-filled and `graph_payload`
 /// carries the data.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SubscriptionEvent {
     pub event_type: EventType,
     pub memory_id: WireMemoryId,
-    pub context_id: WireContextId,
+    pub session_id: WireSessionId,
     pub text: String,
     pub kind: MemoryKindWire,
     pub salience: f32,

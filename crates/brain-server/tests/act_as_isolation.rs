@@ -151,7 +151,7 @@ async fn handshake_as(client: &mut TcpStream, token: &[u8]) {
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send_frame(
         client,
@@ -194,7 +194,7 @@ async fn encode_as(
 ) -> u128 {
     let req = EncodeRequest {
         text: text.into(),
-        context_id: 0,
+        session_id: 0,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
@@ -224,7 +224,7 @@ async fn recall_ids_as(
         subject_name: String::new(),
         max_results: 50,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         age_bound_unix_nanos: None,
         as_of_record_time_unix_nanos: None,
         kind_filter: None,
@@ -372,7 +372,7 @@ async fn act_as_without_grant_is_denied() {
 
     let req = EncodeRequest {
         text: "should be rejected before it ever writes".into(),
-        context_id: 0,
+        session_id: 0,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
@@ -500,7 +500,7 @@ async fn act_as_outside_allowlist_is_denied() {
 
     let req = EncodeRequest {
         text: "target namespace is not in may_act".into(),
-        context_id: 0,
+        session_id: 0,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
@@ -562,7 +562,7 @@ async fn subscribe_act_as_receives_target_spaces_events() {
 
     let sub_req = SubscribeRequest {
         filter: SubscriptionFilter {
-            contexts: None,
+            session_filter: None,
             kinds: None,
             similar_to: None,
             spaces: Some(vec![target_space]),
@@ -650,7 +650,7 @@ async fn subscribe_act_as_without_grant_is_denied() {
 
     let req = SubscribeRequest {
         filter: SubscriptionFilter {
-            contexts: None,
+            session_filter: None,
             kinds: None,
             similar_to: None,
             spaces: Some(vec![[0xA1u8; 16]]),
@@ -704,7 +704,7 @@ async fn subscribe_act_as_outside_allowlist_is_denied() {
 
     let req = SubscribeRequest {
         filter: SubscriptionFilter {
-            contexts: None,
+            session_filter: None,
             kinds: None,
             similar_to: None,
             spaces: Some(vec![[0x99u8; 16]]),

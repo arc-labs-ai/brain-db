@@ -45,7 +45,7 @@ pub use codec::opcode::Opcode;
 
 // -- Envelope layer --
 pub use envelope::error::{ErrorDetails, ErrorResponse};
-pub use envelope::request::{act_as_of, RequestBody, WireContextId, WireMemoryId, WireUuid};
+pub use envelope::request::{act_as_of, RequestBody, WireSessionId, WireMemoryId, WireUuid};
 pub use envelope::response::ResponseBody;
 
 // -- Error taxonomy --

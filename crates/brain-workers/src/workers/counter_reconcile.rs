@@ -6,8 +6,8 @@
 //! rate indicates a bug worth investigating.
 //!
 //! v1 reconciles **only** per-memory edge counts. Other counters
-//! (`ContextMetadata.memory_count`, `SpaceMetadata` counters, per-shard
-//! cluster totals) lack the v1 plumbing — no CONTEXTS_TABLE, no space
+//! (`SessionMetadata.memory_count`, `SpaceMetadata` counters, per-shard
+//! cluster totals) lack the v1 plumbing — no SESSIONS_TABLE, no space
 //! admin ops, no cluster layer.
 
 use std::future::Future;

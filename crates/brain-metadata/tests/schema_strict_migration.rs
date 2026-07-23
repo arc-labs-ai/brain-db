@@ -17,7 +17,7 @@
 //!   clears the flag on rows that point at it.
 
 use brain_core::{
-    ContextId, EntityId, EntityTypeId, ExtractorId, MemoryId, StatementId, StatementKind,
+    SessionId, EntityId, EntityTypeId, ExtractorId, MemoryId, StatementId, StatementKind,
 };
 use brain_core::{
     Entity, EvidenceEntry, EvidenceRef, Statement, StatementObject, StatementValue, SubjectRef,
@@ -83,7 +83,7 @@ fn write_statement(
     let wtxn = db.begin_write().unwrap();
     let pid = predicate_intern_or_get(&wtxn, predicate_ns, predicate_name, 0, T0).unwrap();
     let evidence_entry = EvidenceEntry::from_parts(
-        MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+        MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
         1.0,
         0,
         ExtractorId::default(),

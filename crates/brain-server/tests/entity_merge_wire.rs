@@ -97,7 +97,7 @@ async fn complete_handshake(client: &mut TcpStream, token: &[u8]) {
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send_frame(
         client,
@@ -437,7 +437,7 @@ async fn resolve_exact_match_via_canonical_name() {
         3,
         RequestBody::EntityResolve(EntityResolveRequest {
             candidate_name: "Alice".into(),
-            context: String::new(),
+            resolution_context: String::new(),
             entity_type_hint: PERSON_TYPE_ID,
             allow_create: false,
             request_id: *uuid::Uuid::now_v7().as_bytes(),
@@ -474,7 +474,7 @@ async fn resolve_unknown_returns_not_found() {
         3,
         RequestBody::EntityResolve(EntityResolveRequest {
             candidate_name: "Zelda".into(),
-            context: String::new(),
+            resolution_context: String::new(),
             entity_type_hint: PERSON_TYPE_ID,
             allow_create: false,
             request_id: *uuid::Uuid::now_v7().as_bytes(),

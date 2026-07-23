@@ -19,7 +19,7 @@
 //!   the `flags` bit at this layer.
 
 use brain_core::{
-    SpaceId, ContextId, EdgeKindRef, EdgeKindRefError, EdgeOrigin, MemoryId, MemoryKind,
+    SpaceId, SessionId, EdgeKindRef, EdgeKindRefError, EdgeOrigin, MemoryId, MemoryKind,
     NamespaceId, NodeRef, NodeRefError, RelationId, RelationTypeId, RequestId, TxnId,
 };
 
@@ -40,7 +40,7 @@ pub struct EncodePayload {
     /// every memory under the SYSTEM namespace and silently break tenant
     /// isolation across a restart.
     pub namespace_id: NamespaceId,
-    pub context_id: ContextId,
+    pub session_id: SessionId,
     pub kind: MemoryKind,
     pub salience_initial: f32,
     pub embedding_model_fp: EmbeddingModelFp,
@@ -191,9 +191,9 @@ pub struct UpdateKindPayload {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UpdateContextPayload {
+pub struct UpdateSessionPayload {
     pub memory_id: MemoryId,
-    pub new_context_id: ContextId,
+    pub new_session_id: SessionId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,7 +355,7 @@ pub enum WalPayload {
     Reclaim(ReclaimPayload),
     Consolidate(ConsolidatePayload),
     UpdateKind(UpdateKindPayload),
-    UpdateContext(UpdateContextPayload),
+    UpdateSession(UpdateSessionPayload),
     CheckpointBegin(CheckpointBeginPayload),
     CheckpointEnd(CheckpointEndPayload),
     TxnBegin(TxnBeginPayload),
@@ -390,7 +390,7 @@ impl WalPayload {
             Self::Reclaim(_) => WalRecordKind::Reclaim,
             Self::Consolidate(_) => WalRecordKind::Consolidate,
             Self::UpdateKind(_) => WalRecordKind::UpdateKind,
-            Self::UpdateContext(_) => WalRecordKind::UpdateContext,
+            Self::UpdateSession(_) => WalRecordKind::UpdateSession,
             Self::CheckpointBegin(_) => WalRecordKind::CheckpointBegin,
             Self::CheckpointEnd(_) => WalRecordKind::CheckpointEnd,
             Self::TxnBegin(_) => WalRecordKind::TxnBegin,
@@ -417,7 +417,7 @@ impl WalPayload {
             Self::Reclaim(p) => encode_reclaim(p, &mut out),
             Self::Consolidate(p) => encode_consolidate(p, &mut out),
             Self::UpdateKind(p) => encode_update_kind(p, &mut out),
-            Self::UpdateContext(p) => encode_update_context(p, &mut out),
+            Self::UpdateSession(p) => encode_update_session(p, &mut out),
             Self::CheckpointBegin(p) => encode_checkpoint_begin(p, &mut out),
             Self::CheckpointEnd(p) => encode_checkpoint_end(p, &mut out),
             Self::TxnBegin(p) => encode_txn_begin(p, &mut out),
@@ -452,7 +452,7 @@ impl WalPayload {
             WalRecordKind::Reclaim => Self::Reclaim(decode_reclaim(&mut r)?),
             WalRecordKind::Consolidate => Self::Consolidate(decode_consolidate(&mut r)?),
             WalRecordKind::UpdateKind => Self::UpdateKind(decode_update_kind(&mut r)?),
-            WalRecordKind::UpdateContext => Self::UpdateContext(decode_update_context(&mut r)?),
+            WalRecordKind::UpdateSession => Self::UpdateSession(decode_update_session(&mut r)?),
             WalRecordKind::CheckpointBegin => {
                 Self::CheckpointBegin(decode_checkpoint_begin(&mut r)?)
             }
@@ -831,7 +831,7 @@ fn encode_encode(p: &EncodePayload, out: &mut Vec<u8>) {
     put_uuid_bytes(out, p.request_id.into());
     put_uuid_bytes(out, p.space_id.into());
     put_u32_le(out, p.namespace_id.raw());
-    put_u64_le(out, p.context_id.raw());
+    put_u64_le(out, p.session_id.raw());
     out.push(memory_kind_to_u8(p.kind));
     put_f32_le(out, p.salience_initial);
     out.extend_from_slice(&p.embedding_model_fp);
@@ -860,7 +860,7 @@ fn decode_encode(r: &mut Reader<'_>) -> Result<EncodePayload, WalPayloadError> {
     let request_id: RequestId = r.array16()?.into();
     let space_id: SpaceId = r.array16()?.into();
     let namespace_id = NamespaceId::from(r.u32_le()?);
-    let context_id = ContextId::from(r.u64_le()?);
+    let session_id = SessionId::from(r.u64_le()?);
     let kind = memory_kind_from_u8(r.u8()?)?;
     let salience_initial = r.f32_le()?;
     let embedding_model_fp = r.array16()?;
@@ -903,7 +903,7 @@ fn decode_encode(r: &mut Reader<'_>) -> Result<EncodePayload, WalPayloadError> {
         request_id,
         space_id,
         namespace_id,
-        context_id,
+        session_id,
         kind,
         salience_initial,
         embedding_model_fp,
@@ -1063,15 +1063,15 @@ fn decode_update_kind(r: &mut Reader<'_>) -> Result<UpdateKindPayload, WalPayloa
     })
 }
 
-fn encode_update_context(p: &UpdateContextPayload, out: &mut Vec<u8>) {
+fn encode_update_session(p: &UpdateSessionPayload, out: &mut Vec<u8>) {
     put_memory_id(out, p.memory_id);
-    put_u64_le(out, p.new_context_id.raw());
+    put_u64_le(out, p.new_session_id.raw());
 }
 
-fn decode_update_context(r: &mut Reader<'_>) -> Result<UpdateContextPayload, WalPayloadError> {
-    Ok(UpdateContextPayload {
+fn decode_update_session(r: &mut Reader<'_>) -> Result<UpdateSessionPayload, WalPayloadError> {
+    Ok(UpdateSessionPayload {
         memory_id: r.memory_id()?,
-        new_context_id: ContextId::from(r.u64_le()?),
+        new_session_id: SessionId::from(r.u64_le()?),
     })
 }
 
@@ -1397,7 +1397,7 @@ mod tests {
                 // Non-system namespace so the round-trip proves the field
                 // survives encode→decode (a field-order bug would mismatch).
                 namespace_id: NamespaceId::from(5),
-                context_id: ContextId(0xCAFE),
+                session_id: SessionId(0xCAFE),
                 kind: MemoryKind::Episodic,
                 salience_initial: 0.5,
                 embedding_model_fp: fp(0xAA),
@@ -1466,9 +1466,9 @@ mod tests {
                 memory_id: mid(21),
                 new_kind: MemoryKind::Semantic,
             }),
-            WalPayload::UpdateContext(UpdateContextPayload {
+            WalPayload::UpdateSession(UpdateSessionPayload {
                 memory_id: mid(22),
-                new_context_id: ContextId(99),
+                new_session_id: SessionId(99),
             }),
             WalPayload::CheckpointBegin(CheckpointBeginPayload {
                 checkpoint_id: 100,
@@ -1658,7 +1658,7 @@ mod tests {
             request_id: rid(0),
             space_id: aid(0),
             namespace_id: NamespaceId::SYSTEM,
-            context_id: ContextId(0),
+            session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.0,
             embedding_model_fp: fp(0),
@@ -1672,7 +1672,7 @@ mod tests {
         });
         let mut bytes = p.encode_to_bytes();
         // Text starts after MemoryId(16) + RequestId(16) + SpaceId(16)
-        //   + NamespaceId(4) + ContextId(8) + kind(1) + salience(4) + fp(16)
+        //   + NamespaceId(4) + SessionId(8) + kind(1) + salience(4) + fp(16)
         //   + text_len(4) = 85. Replace the 2-byte text with an invalid
         // UTF-8 lead byte.
         let text_start = 16 + 16 + 16 + 4 + 8 + 1 + 4 + 16 + 4;
@@ -1716,7 +1716,7 @@ mod tests {
             request_id: rid(0),
             space_id: aid(0),
             namespace_id: NamespaceId::SYSTEM,
-            context_id: ContextId(0),
+            session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.0,
             embedding_model_fp: fp(0),
@@ -1743,7 +1743,7 @@ mod tests {
             request_id: rid(0),
             space_id: aid(0),
             namespace_id: NamespaceId::SYSTEM,
-            context_id: ContextId(0),
+            session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.0,
             embedding_model_fp: fp(0),
@@ -1772,7 +1772,7 @@ mod tests {
             request_id: rid(0),
             space_id: aid(0),
             namespace_id: NamespaceId::SYSTEM,
-            context_id: ContextId(0),
+            session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.0,
             embedding_model_fp: fp(0),
@@ -1802,7 +1802,7 @@ mod tests {
             request_id: rid(0),
             space_id: aid(0),
             namespace_id: NamespaceId::SYSTEM,
-            context_id: ContextId(0),
+            session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.0,
             embedding_model_fp: fp(0),
@@ -2002,7 +2002,7 @@ mod tests {
             request_id: rid(1),
             space_id: aid(1),
             namespace_id: NamespaceId::SYSTEM,
-            context_id: ContextId(0),
+            session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.5,
             embedding_model_fp: fp(0),
@@ -2101,7 +2101,7 @@ mod tests {
                 request_id: rid(0),
                 space_id: aid(0),
                 namespace_id: NamespaceId::SYSTEM,
-                context_id: ContextId(0),
+                session_id: SessionId(0),
                 kind: MemoryKind::Episodic,
                 salience_initial: 0.0,
                 embedding_model_fp: fp(0),

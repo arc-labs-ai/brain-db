@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind};
+use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
@@ -96,7 +96,7 @@ fn seed_memory(metadata: &SharedMetadataDb, slot: u64, salience: f32) -> MemoryI
             id,
             brain_core::NamespaceId::SYSTEM,
             SpaceId(Uuid::nil()),
-            ContextId(1),
+            SessionId(1),
             slot,
             1,
             MemoryKind::Episodic,
@@ -339,7 +339,7 @@ fn recall_fills_buffer_then_boost_worker_applies() {
         // Encode two memories.
         let encode_req = |rid: [u8; 16], text: &str| EncodeRequest {
             text: text.into(),
-            context_id: 1,
+            session_id: 1,
             request_id: rid,
             txn_id: None,
             occurred_at_unix_nanos: None,
@@ -382,7 +382,7 @@ fn recall_fills_buffer_then_boost_worker_applies() {
             subject_name: String::new(),
             max_results: 5,
             confidence_threshold: 0.0,
-            context_filter: None,
+            session_filter: None,
             age_bound_unix_nanos: None,
             as_of_record_time_unix_nanos: None,
             kind_filter: None,

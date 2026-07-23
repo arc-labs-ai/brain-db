@@ -573,7 +573,7 @@ impl Predicate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ContextId;
+    use crate::SessionId;
 
     fn sample_subject() -> SubjectRef {
         SubjectRef::Entity(EntityId::new())
@@ -581,7 +581,7 @@ mod tests {
 
     fn sample_evidence() -> EvidenceRef {
         let entry = EvidenceEntry::from_parts(
-            MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+            MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
             0.9,
             1_700_000_000_000_000_000,
             ExtractorId::default(),

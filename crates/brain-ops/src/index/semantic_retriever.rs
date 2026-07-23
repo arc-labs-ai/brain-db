@@ -134,7 +134,7 @@ impl BrainSemanticRetriever {
             filters.space_ids.iter().map(|a| (*a).into()).collect();
         let kind_filter = filters.memory_kind.map(memory_kind_to_u8);
         let created_range = filters.created_at_ms.clone();
-        let context_filter = filters.context_ids.clone();
+        let session_filter = filters.session_ids.clone();
 
         let id_passes = |id: MemoryId| -> bool {
             let key = id.raw().to_be_bytes();
@@ -147,7 +147,7 @@ impl BrainSemanticRetriever {
                 &space_filter,
                 kind_filter,
                 created_range.as_ref(),
-                &context_filter,
+                &session_filter,
             )
         };
 
@@ -180,7 +180,7 @@ impl BrainSemanticRetriever {
                                     &space_filter,
                                     kind_filter,
                                     created_range.as_ref(),
-                                    &context_filter,
+                                    &session_filter,
                                 )
                             })
                             .unwrap_or(false)
@@ -358,7 +358,7 @@ fn memory_row_passes(
     space_filter: &HashSet<[u8; 16]>,
     kind_filter: Option<u8>,
     created_range: Option<&std::ops::RangeInclusive<u64>>,
-    context_filter: &[u64],
+    session_filter: &[u64],
 ) -> bool {
     // Tenant wall: unconditional. A row from a different namespace never
     // surfaces in the vector lane, regardless of any other filter.
@@ -379,7 +379,7 @@ fn memory_row_passes(
             return false;
         }
     }
-    if !context_filter.is_empty() && !context_filter.contains(&row.context_id) {
+    if !session_filter.is_empty() && !session_filter.contains(&row.session_id) {
         return false;
     }
     true

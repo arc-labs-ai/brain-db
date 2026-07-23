@@ -83,13 +83,13 @@ impl RequestScope {
 
     /// Materialize a `brain_ops::RequestCaller` for dispatch.
     ///
-    /// The caller is stamped with the wire-level `session_id` minted
+    /// The caller is stamped with the wire-level `connection_id` minted
     /// at HELLO/WELCOME so the txn store can link buffered work back
     /// to the originating connection — disconnect-time cleanup
-    /// fans out on session_id, not on space_id, because a
+    /// fans out on connection_id, not on space_id, because a
     /// single space may hold many concurrent sessions.
     #[must_use]
-    pub fn to_caller(&self, session_id: [u8; 16]) -> brain_ops::RequestCaller {
+    pub fn to_caller(&self, connection_id: [u8; 16]) -> brain_ops::RequestCaller {
         brain_ops::RequestCaller::from_scope(
             self.space_id,
             self.org_id,
@@ -97,7 +97,7 @@ impl RequestScope {
             self.namespace.clone(),
             self.permissions,
         )
-        .with_session_id(session_id)
+        .with_session_id(connection_id)
     }
 
     /// Materialize the EFFECTIVE `brain_ops::RequestCaller` for an
@@ -110,7 +110,7 @@ impl RequestScope {
     /// store to consult for the impersonated identity. The principal's
     /// `org_id` / `user_id` are retained for the audit trail (the acting
     /// party is never erased; see RFC 8693 delegation), and the wire
-    /// `session_id` rides along so the connection-drop sweep still finds
+    /// `connection_id` rides along so the connection-drop sweep still finds
     /// buffered work.
     ///
     /// Callers MUST validate the request's `act_as` against
@@ -120,7 +120,7 @@ impl RequestScope {
     pub fn to_effective_caller(
         &self,
         act_as: &brain_protocol::ActAs,
-        session_id: [u8; 16],
+        connection_id: [u8; 16],
     ) -> brain_ops::RequestCaller {
         brain_ops::RequestCaller::from_scope(
             SpaceId(uuid::Uuid::from_bytes(act_as.space_id)),
@@ -129,7 +129,7 @@ impl RequestScope {
             act_as.namespace.clone(),
             bits::STANDARD_SPACE,
         )
-        .with_session_id(session_id)
+        .with_session_id(connection_id)
     }
 }
 

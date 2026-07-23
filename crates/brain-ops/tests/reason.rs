@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use brain_core::{
-    SpaceId, ContextId, EdgeKind, Entity, EntityId, EntityType, EvidenceEntry, EvidenceRef,
+    SpaceId, SessionId, EdgeKind, Entity, EntityId, EntityType, EvidenceEntry, EvidenceRef,
     ExtractorId, MemoryId, MemoryKind, NamespaceId, Statement, StatementKind, StatementObject,
     StatementValue, SubjectRef,
 };
@@ -78,7 +78,7 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
                 id,
                 brain_core::NamespaceId::SYSTEM,
                 space,
-                ContextId(42),
+                SessionId(42),
                 (i + 1) as u64,
                 1,
                 MemoryKind::Episodic,
@@ -148,7 +148,7 @@ fn reason_req_traced(
         observation,
         depth,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         max_inferences,
         budget_wall_time_ms: 1000,
         request_id: None,

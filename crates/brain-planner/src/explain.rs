@@ -367,7 +367,7 @@ fn substep_one_liner(s: &Option<RecallSubStep>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_core::{ContextId, MemoryId, MemoryKind, RequestId};
+    use brain_core::{SessionId, MemoryId, MemoryKind, RequestId};
     use brain_protocol::envelope::request::{
         ForgetMode, ObservationInput, PlanBudget, PlanState, PlanStrategy,
     };
@@ -439,7 +439,7 @@ mod tests {
                 text: "hello".into(),
                 cache_lookup: true,
             },
-            context_resolution: crate::plan::encode::ContextResolutionStep::Explicit(ContextId(42)),
+            context_resolution: crate::plan::encode::ContextResolutionStep::Explicit(SessionId(42)),
             allocation: SlotAllocationStep {
                 arena_grow_if_needed: true,
             },

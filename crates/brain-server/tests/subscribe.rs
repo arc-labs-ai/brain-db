@@ -216,7 +216,7 @@ async fn complete_handshake(client: &mut TcpStream, token: &[u8]) {
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send_frame(
         client,
@@ -253,7 +253,7 @@ async fn complete_handshake(client: &mut TcpStream, token: &[u8]) {
 /// is rejected as a cross-tenant leak).
 fn own_filter(space: [u8; 16]) -> SubscriptionFilter {
     SubscriptionFilter {
-        contexts: None,
+        session_filter: None,
         kinds: None,
         similar_to: None,
         spaces: Some(vec![space]),
@@ -276,7 +276,7 @@ fn subscribe_request(filter: SubscriptionFilter) -> SubscribeRequest {
 fn encode_request(text: &str, _kind: MemoryKindWire) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
-        context_id: 0,
+        session_id: 0,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
@@ -701,7 +701,7 @@ async fn subscribe_spaces_filter_isolates_per_space() {
     complete_handshake(&mut sub_a, &server.mint(space_a)).await;
     let sub_stream = 21u32;
     let filter = SubscriptionFilter {
-        contexts: None,
+        session_filter: None,
         kinds: None,
         similar_to: None,
         spaces: Some(vec![space_a]),

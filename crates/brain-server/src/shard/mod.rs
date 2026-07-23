@@ -184,13 +184,13 @@ pub(crate) enum ShardRequest {
         selector: brain_protocol::BackfillSelector,
         reply_tx: Sender<Result<ExtractBackfillReport, String>>,
     },
-    /// Auto-abort every Active txn owned by `session_id`. Fanned out
+    /// Auto-abort every Active txn owned by `connection_id`. Fanned out
     /// by the connection layer the moment a TCP/TLS connection drops
     /// before TXN_COMMIT. Reply carries the
     /// count of aborted entries for connection-layer logging; the
     /// individual `TxnId`s stay on the shard.
     AbortOrphanedTxns {
-        session_id: [u8; 16],
+        connection_id: [u8; 16],
         reply_tx: Sender<usize>,
     },
 }
@@ -446,7 +446,7 @@ pub struct TemporalEdgeSpawnConfig {
     pub window_seconds: u64,
     pub weight_min: f32,
     pub channel_capacity: usize,
-    pub cross_context: bool,
+    pub cross_session: bool,
     /// Cosine similarity floor for the topical gate. See
     /// [`brain_workers::TemporalEdgeKnobs::topical_threshold`].
     /// Ferried from `[workers.temporal_edge] topical_threshold`.
@@ -464,7 +464,7 @@ impl Default for TemporalEdgeSpawnConfig {
             window_seconds: 1800,
             weight_min: 0.1,
             channel_capacity: 1024,
-            cross_context: false,
+            cross_session: false,
             topical_threshold: brain_workers::DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD,
         }
     }
@@ -1179,14 +1179,14 @@ impl ShardHandle {
     ///
     /// Returns `Ok(0)` when no txns belonged to that session (the
     /// common case — most connections don't open a txn).
-    pub async fn abort_orphaned_for_session(
+    pub async fn abort_orphaned_for_connection(
         &self,
-        session_id: [u8; 16],
+        connection_id: [u8; 16],
     ) -> Result<usize, DispatchError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.tx
             .send_async(ShardRequest::AbortOrphanedTxns {
-                session_id,
+                connection_id,
                 reply_tx,
             })
             .await
@@ -2746,7 +2746,7 @@ pub fn spawn_shard(
                 let knobs = brain_workers::TemporalEdgeKnobs {
                     window_seconds: temporal_edge_spawn_cfg.window_seconds,
                     weight_min: temporal_edge_spawn_cfg.weight_min,
-                    cross_context: temporal_edge_spawn_cfg.cross_context,
+                    cross_session: temporal_edge_spawn_cfg.cross_session,
                     topical_threshold: temporal_edge_spawn_cfg.topical_threshold,
                 };
                 let mut temporal_edge_worker = brain_workers::TemporalEdgeWorker::new(rx)
@@ -3185,7 +3185,7 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                 }
             }
             ShardRequest::AbortOrphanedTxns {
-                session_id,
+                connection_id,
                 reply_tx,
             } => {
                 // Synchronous on the shard executor: `TxnStore` is a
@@ -3195,7 +3195,7 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                 let aborted = shard
                     .ops
                     .txn_store
-                    .abort_orphaned_for_session(session_id)
+                    .abort_orphaned_for_connection(connection_id)
                     .len();
                 if reply_tx.send_async(aborted).await.is_err() {
                     warn!(

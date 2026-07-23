@@ -153,13 +153,13 @@ fn now_unix_nanos() -> u64 {
 /// always writes this row before enqueueing extraction/HyPE work; a
 /// synthetic test id needs it planted explicitly.
 fn seed_memory_row(metadata: &SharedMetadataDb, memory_id: MemoryId, space_id: SpaceId) {
-    use brain_core::{ContextId, MemoryKind, NamespaceId};
+    use brain_core::{SessionId, MemoryKind, NamespaceId};
     use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
     let row = MemoryMetadata::new_active(
         memory_id,
         NamespaceId::SYSTEM,
         space_id,
-        ContextId(0),
+        SessionId(0),
         0,
         0,
         MemoryKind::Episodic,

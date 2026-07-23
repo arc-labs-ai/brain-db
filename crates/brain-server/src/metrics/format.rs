@@ -642,7 +642,7 @@ fn emit_temporal_edge_metrics(out: &mut String, shards: &[ShardHandle]) {
                 ("no_prev", snap.skipped_no_prev),
                 ("out_of_order", snap.skipped_out_of_order),
                 ("tombstoned", snap.skipped_tombstoned),
-                ("cross_context", snap.skipped_cross_context),
+                ("cross_session", snap.skipped_cross_session),
                 ("window_exceeded", snap.skipped_window_exceeded),
             ] {
                 let labels = format!("{{shard=\"{}\",reason=\"{reason}\"}}", shard.shard_id());

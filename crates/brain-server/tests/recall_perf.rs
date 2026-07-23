@@ -183,7 +183,7 @@ async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str) -> u128 {
 
     let req = EncodeRequest {
         text: text.into(),
-        context_id: 0,
+        session_id: 0,
         request_id,
         txn_id: None,
         occurred_at_unix_nanos: None,
@@ -231,7 +231,7 @@ fn recall_req(txn_id: Option<[u8; 16]>) -> RecallRequest {
         subject_name: String::new(),
         max_results: 5,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         age_bound_unix_nanos: None,
         as_of_record_time_unix_nanos: None,
         kind_filter: None,

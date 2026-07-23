@@ -796,14 +796,14 @@ impl StatementListResponseFrame {
 mod tests_resp {
     use super::*;
     use brain_core::{
-        ContextId, EntityId, EvidenceEntry, EvidenceOverflowId, EvidenceRef, ExtractorId, MemoryId,
+        SessionId, EntityId, EvidenceEntry, EvidenceOverflowId, EvidenceRef, ExtractorId, MemoryId,
         PredicateId, Statement, StatementId, StatementKind, StatementObject, SubjectRef,
     };
     use brain_core::{StatementValue, INLINE_EVIDENCE_CAP};
     use smallvec::SmallVec;
 
     fn mem(byte: u16) -> MemoryId {
-        MemoryId::pack(byte, ContextId::DEFAULT.into(), 0)
+        MemoryId::pack(byte, SessionId::DEFAULT.into(), 0)
     }
 
     fn sample_statement(object: StatementObject) -> Statement {

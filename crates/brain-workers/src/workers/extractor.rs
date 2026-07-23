@@ -50,7 +50,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::workers::hype::{HypeGenOutcome, HypeGenerator};
 use brain_core::{
-    SpaceId, ContextId, EntityId, ExtractorId, Memory as CoreMemory, MemoryId, MemoryKind, Salience,
+    SpaceId, SessionId, EntityId, ExtractorId, Memory as CoreMemory, MemoryId, MemoryKind, Salience,
 };
 use brain_core::{StatementKind, StatementObject, StatementValue, SubjectRef};
 use brain_extractors::{
@@ -945,7 +945,7 @@ async fn drain_batch(
             CoreMemory {
                 id: *mid,
                 space: SpaceId::new(),
-                context: ContextId(0),
+                session_id: SessionId(0),
                 kind,
                 salience: Salience::default(),
                 text: Some(text.to_string()),
@@ -1766,7 +1766,7 @@ async fn fetch_extractor_context_for_batch(
 ) -> HashMap<MemoryId, ExtractorContext> {
     let cfg = ExtractorContextFetchConfig {
         top_m: DEFAULT_EXTRACTOR_CONTEXT_TOP_M,
-        same_context_only: true,
+        same_session_only: true,
     };
     let mut out = HashMap::with_capacity(mems.len());
     for m in mems {
@@ -3478,7 +3478,7 @@ async fn publish_extracted_graph(
         lsn: 0,
         event_type: EventType::StageCompleted,
         memory_id,
-        context_id: ContextId::default(),
+        session_id: SessionId::default(),
         kind: MemoryKind::Episodic,
         salience: 0.0,
         timestamp_unix_nanos: now_unix_nanos(),
@@ -3523,7 +3523,7 @@ async fn publish_hype_completed(
         lsn: 0,
         event_type: EventType::StageCompleted,
         memory_id,
-        context_id: ContextId::default(),
+        session_id: SessionId::default(),
         kind: MemoryKind::Episodic,
         salience: 0.0,
         timestamp_unix_nanos: now_unix_nanos(),
@@ -4905,13 +4905,13 @@ mod tests {
         memory_id: brain_core::MemoryId,
         scope: brain_metadata::RowScope,
     ) {
-        use brain_core::{ContextId, MemoryKind};
+        use brain_core::{SessionId, MemoryKind};
         use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
         let row = MemoryMetadata::new_active(
             memory_id,
             scope.namespace(),
             scope.space(),
-            ContextId(0),
+            SessionId(0),
             0,
             0,
             MemoryKind::Episodic,
@@ -4937,13 +4937,13 @@ mod tests {
         scope: brain_metadata::RowScope,
         occurred_at: u64,
     ) {
-        use brain_core::{ContextId, MemoryKind};
+        use brain_core::{SessionId, MemoryKind};
         use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
         let row = MemoryMetadata::new_active(
             memory_id,
             scope.namespace(),
             scope.space(),
-            ContextId(0),
+            SessionId(0),
             0,
             0,
             MemoryKind::Episodic,
@@ -5267,7 +5267,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     use brain_core::{
-        SpaceId as TestSpaceId, ContextId as TestContextId, MemoryId as TestMemoryId, MemoryKind,
+        SpaceId as TestSpaceId, SessionId as TestSessionId, MemoryId as TestMemoryId, MemoryKind,
         Salience,
     };
     use brain_extractors::{
@@ -5310,7 +5310,7 @@ mod tests {
         CoreMemory {
             id: TestMemoryId::pack(0, id_seq, 0),
             space: TestSpaceId::new(),
-            context: TestContextId(0),
+            session_id: TestSessionId(0),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
             text: Some(text.into()),
@@ -6495,7 +6495,7 @@ mod tests {
         use std::sync::Arc;
 
         use brain_core::{
-            SpaceId, ContextId, EntityType, Memory, MemoryId, MemoryKind, Salience, StatementKind,
+            SpaceId, SessionId, EntityType, Memory, MemoryId, MemoryKind, Salience, StatementKind,
         };
         use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
         use brain_index::{IndexParams, SharedHnsw};
@@ -6537,7 +6537,7 @@ mod tests {
         let memory = Memory {
             id: MemoryId::pack(0, 1, 1),
             space: SpaceId::new(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
             text: Some(TEXT.to_string()),
@@ -6703,7 +6703,7 @@ mod tests {
         use std::sync::Arc;
 
         use brain_core::{
-            SpaceId, ContextId, EntityType, Memory, MemoryId, MemoryKind, Salience, StatementKind,
+            SpaceId, SessionId, EntityType, Memory, MemoryId, MemoryKind, Salience, StatementKind,
         };
         use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
         use brain_index::{IndexParams, SharedHnsw};
@@ -6747,7 +6747,7 @@ mod tests {
         let memory = Memory {
             id: MemoryId::pack(0, 1, 1),
             space: SpaceId::new(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
             text: Some(TEXT.to_string()),

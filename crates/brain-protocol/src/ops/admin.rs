@@ -1,6 +1,6 @@
 //! Admin-surface requests.
 
-use crate::envelope::request::{WireContextId, WireMemoryId, WireUuid};
+use crate::envelope::request::{WireSessionId, WireMemoryId, WireUuid};
 use crate::shared::primitives::{CheckScope, ForgetMode, MemoryKindWire, StatsDetail};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -46,7 +46,7 @@ pub struct ModelIdentifier {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AdminCreateContextRequest {
+pub struct AdminCreateSessionRequest {
     pub name: String,
     pub description: String,
     #[serde(with = "serde_bytes")]
@@ -54,15 +54,15 @@ pub struct AdminCreateContextRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AdminRenameContextRequest {
-    pub context_id: WireContextId,
+pub struct AdminRenameSessionRequest {
+    pub session_id: WireSessionId,
     pub new_name: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminMoveMemoryRequest {
     pub memory_id: WireMemoryId,
-    pub new_context_id: WireContextId,
+    pub new_session_id: WireSessionId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -73,7 +73,7 @@ pub struct AdminReclassifyRequest {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminListTombstonedRequest {
-    pub context_id: Option<WireContextId>,
+    pub session_id: Option<WireSessionId>,
     pub max_age_seconds: u32,
     pub limit: u32,
 }
@@ -267,7 +267,7 @@ use crate::shared::enums::{IntegrityIssueType, MigrationStatus};
 pub struct AdminStatsResponse {
     pub summary: StatsSummary,
     pub per_shard: Option<Vec<ShardStats>>,
-    pub per_context: Option<Vec<ContextStats>>,
+    pub per_session: Option<Vec<SessionStats>>,
     pub server_uptime_seconds: u64,
     pub server_version: String,
 }
@@ -277,7 +277,7 @@ pub struct StatsSummary {
     pub total_memories: u64,
     pub total_active_memories: u64,
     pub total_tombstoned_memories: u64,
-    pub total_contexts: u32,
+    pub total_sessions: u32,
     pub encode_qps: f32,
     pub recall_qps: f32,
     pub p99_encode_latency_ms: f32,
@@ -303,8 +303,8 @@ pub struct SalienceHistogram {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ContextStats {
-    pub context_id: WireContextId,
+pub struct SessionStats {
+    pub session_id: WireSessionId,
     pub name: String,
     pub memory_count: u64,
     pub last_encoded_at_unix_nanos: u64,
@@ -366,14 +366,14 @@ pub struct MigrationProgress {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AdminCreateContextResponse {
-    pub context_id: WireContextId,
+pub struct AdminCreateSessionResponse {
+    pub session_id: WireSessionId,
     pub name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AdminRenameContextResponse {
-    pub context_id: WireContextId,
+pub struct AdminRenameSessionResponse {
+    pub session_id: WireSessionId,
     pub new_name: String,
     pub old_name: String,
 }
@@ -381,8 +381,8 @@ pub struct AdminRenameContextResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminMoveMemoryResponse {
     pub memory_id: WireMemoryId,
-    pub new_context_id: WireContextId,
-    pub old_context_id: WireContextId,
+    pub new_session_id: WireSessionId,
+    pub old_session_id: WireSessionId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

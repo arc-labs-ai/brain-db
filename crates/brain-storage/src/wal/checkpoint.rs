@@ -140,7 +140,7 @@ mod tests {
     use crate::wal::payload::EncodePayload;
     use crate::wal::record::WalRecord;
     use crate::wal::segment::{glommio_run, WalSegment};
-    use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, RequestId};
+    use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, RequestId};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
 
@@ -169,7 +169,7 @@ mod tests {
             request_id: RequestId::from([0u8; 16]),
             space_id: SpaceId::from([0u8; 16]),
             namespace_id: brain_core::NamespaceId::SYSTEM,
-            context_id: ContextId(0),
+            session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.5,
             embedding_model_fp: [0; 16],

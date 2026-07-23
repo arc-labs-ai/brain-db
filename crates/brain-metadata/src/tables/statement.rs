@@ -727,12 +727,12 @@ pub fn statement_from_metadata(m: &StatementMetadata) -> Option<Statement> {
 mod tests {
     use super::*;
     use crate::tables::fresh_db;
-    use brain_core::{ContextId, EntityId, MemoryId};
+    use brain_core::{SessionId, EntityId, MemoryId};
     use redb::ReadableDatabase;
 
     fn sample_evidence_entry(byte: u8, confidence_milli: u16) -> EvidenceEntry {
         EvidenceEntry {
-            memory_id: MemoryId::pack(byte as u16, ContextId::DEFAULT.into(), 0),
+            memory_id: MemoryId::pack(byte as u16, SessionId::DEFAULT.into(), 0),
             confidence_milli,
             timestamp_unix_nanos: 1_700_000_000_000_000_000,
             extractor_id: ExtractorId::from(0),
@@ -749,7 +749,7 @@ mod tests {
             StatementObject::Value(StatementValue::Bool(true)),
             StatementObject::Value(StatementValue::UnixNanos(1_700_000_000)),
             StatementObject::Value(StatementValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF])),
-            StatementObject::Memory(MemoryId::pack(7, ContextId::DEFAULT.into(), 0)),
+            StatementObject::Memory(MemoryId::pack(7, SessionId::DEFAULT.into(), 0)),
             StatementObject::Statement(StatementId::new()),
         ];
         for o in cases {

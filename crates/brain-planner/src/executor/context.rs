@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use brain_core::{ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{SessionId, EdgeKind, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, VECTOR_DIM};
 use brain_index::SharedHnsw;
 use brain_metadata::MetadataDb;
@@ -53,7 +53,7 @@ pub struct PendingMemorySnapshot {
     pub vector: [f32; VECTOR_DIM],
     pub salience: f32,
     pub kind: MemoryKind,
-    pub context_id: ContextId,
+    pub session_id: SessionId,
     pub created_at_unix_nanos: u64,
 }
 

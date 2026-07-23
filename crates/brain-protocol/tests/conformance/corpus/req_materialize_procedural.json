@@ -17,7 +17,9 @@
     34,
     34
   ],
-  "context_filter": 0,
+  "session_filter": [
+    7
+  ],
   "top_k": 20,
   "min_confidence": 0.5,
   "categories": [

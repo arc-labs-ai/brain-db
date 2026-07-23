@@ -150,7 +150,7 @@ fn caller_for(namespace: &str) -> RequestCaller {
 fn encode_req(request_id: [u8; 16], text: &str) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
-        context_id: 0,
+        session_id: 0,
         request_id,
         txn_id: None,
         occurred_at_unix_nanos: None,
@@ -167,7 +167,7 @@ fn recall_req(cue: &str) -> RecallRequest {
         subject_name: String::new(),
         max_results: 50,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         age_bound_unix_nanos: None,
         as_of_record_time_unix_nanos: None,
         kind_filter: None,

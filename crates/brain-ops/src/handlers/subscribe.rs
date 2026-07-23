@@ -49,7 +49,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use brain_core::{ContextId, MemoryId, MemoryKind};
+use brain_core::{SessionId, MemoryId, MemoryKind};
 use brain_protocol::envelope::request::{SubscribeRequest, UnsubscribeRequest};
 use brain_protocol::envelope::response::{
     EdgeEventPayload, EventType, SubscriptionEvent, UnsubscribeResponse,
@@ -66,7 +66,7 @@ use crate::error::OpError;
 pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 /// Upper bound on the entry count of any one subscription filter list
-/// (`contexts`, `kinds`, `spaces`). Otherwise bounded only by the 16 MiB
+/// (`session_filter`, `kinds`, `spaces`). Otherwise bounded only by the 16 MiB
 /// payload cap; an explicit cap rejects a crafted oversized filter with
 /// a clear `InvalidRequest` instead of building a large `HashSet`. The
 /// bound is generous — far above any legitimate subscription scope.
@@ -123,7 +123,7 @@ pub struct EventEnvelope {
     pub lsn: u64,
     pub event_type: EventType,
     pub memory_id: MemoryId,
-    pub context_id: ContextId,
+    pub session_id: SessionId,
     pub kind: MemoryKind,
     pub salience: f32,
     pub timestamp_unix_nanos: u64,
@@ -158,7 +158,7 @@ impl EventEnvelope {
         SubscriptionEvent {
             event_type: self.event_type,
             memory_id: self.memory_id.into(),
-            context_id: self.context_id.into(),
+            session_id: self.session_id.into(),
             text: self.text.clone().unwrap_or_default(),
             kind: self.kind.into(),
             salience: self.salience,
@@ -203,13 +203,13 @@ impl EventEnvelope {
             WalPayload::Encode(p) => {
                 let mut out = Vec::with_capacity(1 + p.edges.len());
                 let space_id = p.space_id;
-                let context_id = p.context_id;
+                let session_id = p.session_id;
                 let kind = p.kind;
                 out.push(Self {
                     lsn,
                     event_type: EventType::Encoded,
                     memory_id: p.memory_id,
-                    context_id,
+                    session_id,
                     kind,
                     salience: p.salience_initial,
                     timestamp_unix_nanos,
@@ -226,7 +226,7 @@ impl EventEnvelope {
                         lsn,
                         event_type: EventType::EdgeAdded,
                         memory_id: MemoryId::NULL,
-                        context_id,
+                        session_id,
                         kind: MemoryKind::Episodic,
                         salience: 0.0,
                         timestamp_unix_nanos,
@@ -258,7 +258,7 @@ impl EventEnvelope {
                 // are still useful (memory_id + event_type), and a
                 // subscriber that needs richer metadata can resolve
                 // via RECALL after observing the event.
-                context_id: ContextId::default(),
+                session_id: SessionId::default(),
                 kind: MemoryKind::Episodic,
                 salience: 0.0,
                 timestamp_unix_nanos,
@@ -277,7 +277,7 @@ impl EventEnvelope {
                 lsn,
                 event_type: EventType::EdgeAdded,
                 memory_id: MemoryId::NULL,
-                context_id: ContextId::default(),
+                session_id: SessionId::default(),
                 kind: MemoryKind::Episodic,
                 salience: 0.0,
                 timestamp_unix_nanos,
@@ -304,7 +304,7 @@ impl EventEnvelope {
                 lsn,
                 event_type: EventType::EdgeRemoved,
                 memory_id: MemoryId::NULL,
-                context_id: ContextId::default(),
+                session_id: SessionId::default(),
                 kind: MemoryKind::Episodic,
                 salience: 0.0,
                 timestamp_unix_nanos,
@@ -328,7 +328,7 @@ impl EventEnvelope {
                 lsn,
                 event_type: EventType::EdgeAdded,
                 memory_id: MemoryId::NULL,
-                context_id: ContextId::default(),
+                session_id: SessionId::default(),
                 kind: MemoryKind::Episodic,
                 salience: 0.0,
                 timestamp_unix_nanos,
@@ -352,7 +352,7 @@ impl EventEnvelope {
                 lsn,
                 event_type: EventType::EdgeSuperseded,
                 memory_id: MemoryId::NULL,
-                context_id: ContextId::default(),
+                session_id: SessionId::default(),
                 kind: MemoryKind::Episodic,
                 salience: 0.0,
                 timestamp_unix_nanos,
@@ -376,7 +376,7 @@ impl EventEnvelope {
                 lsn,
                 event_type: EventType::EdgeRemoved,
                 memory_id: MemoryId::NULL,
-                context_id: ContextId::default(),
+                session_id: SessionId::default(),
                 kind: MemoryKind::Episodic,
                 salience: 0.0,
                 timestamp_unix_nanos,
@@ -436,7 +436,7 @@ impl EventEnvelope {
                         lsn,
                         event_type: EventType::StageCompleted,
                         memory_id: MemoryId::from(stage_body.memory_id),
-                        context_id: ContextId::default(),
+                        session_id: SessionId::default(),
                         kind: MemoryKind::Episodic,
                         salience: 0.0,
                         timestamp_unix_nanos,
@@ -482,7 +482,7 @@ impl EventEnvelope {
                     lsn,
                     event_type,
                     memory_id: MemoryId::NULL,
-                    context_id: ContextId::default(),
+                    session_id: SessionId::default(),
                     kind: MemoryKind::Episodic,
                     salience: 0.0,
                     timestamp_unix_nanos,
@@ -620,7 +620,7 @@ impl Default for EventBus {
 /// so per-event matching is cheap (set lookups, no wire conversions).
 #[derive(Clone, Debug, Default)]
 pub struct ParsedFilter {
-    pub contexts: Option<HashSet<ContextId>>,
+    pub session_filter: Option<HashSet<SessionId>>,
     pub kinds: Option<HashSet<MemoryKind>>,
     /// Subset of space ids the subscriber wants events for. `None`
     /// = all spaces (substrate-wide). On a shared shard this is
@@ -647,8 +647,13 @@ impl ParsedFilter {
                 return false;
             }
         }
-        if let Some(ctxs) = &self.contexts {
-            if !ctxs.contains(&env.context_id) {
+        if let Some(sessions) = &self.session_filter {
+            // Typed-graph events are stamped with the unscoped default
+            // session (`SessionId(0)`) until per-event session tagging
+            // lands. Deliver those to any session-filtered subscriber
+            // rather than dropping them, so a filter never silently
+            // swallows graph events.
+            if env.session_id != SessionId(0) && !sessions.contains(&env.session_id) {
                 return false;
             }
         }
@@ -680,10 +685,10 @@ pub fn parse_filter(req: &SubscribeRequest) -> Result<ParsedFilter, OpError> {
             "subscribe: similarity-based filtering (similar_to) is not yet supported",
         ));
     }
-    if let Some(ref v) = req.filter.contexts {
+    if let Some(ref v) = req.filter.session_filter {
         if v.len() > MAX_SUBSCRIBE_FILTER_ENTRIES {
             return Err(OpError::InvalidRequest(format!(
-                "subscribe: filter.contexts must have <= {MAX_SUBSCRIBE_FILTER_ENTRIES} entries"
+                "subscribe: filter.session_filter must have <= {MAX_SUBSCRIBE_FILTER_ENTRIES} entries"
             )));
         }
     }
@@ -708,11 +713,11 @@ pub fn parse_filter(req: &SubscribeRequest) -> Result<ParsedFilter, OpError> {
             )));
         }
     }
-    let contexts = req
+    let session_filter = req
         .filter
-        .contexts
+        .session_filter
         .as_ref()
-        .map(|v| v.iter().copied().map(ContextId).collect::<HashSet<_>>());
+        .map(|v| v.iter().copied().map(SessionId).collect::<HashSet<_>>());
     let kinds = req.filter.kinds.as_ref().map(|v| {
         v.iter()
             .copied()
@@ -751,7 +756,7 @@ pub fn parse_filter(req: &SubscribeRequest) -> Result<ParsedFilter, OpError> {
         }
     });
     Ok(ParsedFilter {
-        contexts,
+        session_filter,
         kinds,
         spaces,
         memory_ids,

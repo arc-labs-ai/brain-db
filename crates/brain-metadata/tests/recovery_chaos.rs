@@ -11,7 +11,7 @@ use std::fs::OpenOptions;
 use std::path::PathBuf;
 
 use brain_core::{
-    SpaceId, ContextId, EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, MemoryId, MemoryKind, NodeRef,
+    SpaceId, SessionId, EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, MemoryId, MemoryKind, NodeRef,
     RelationId, RelationTypeId, RequestId,
 };
 use brain_metadata::tables::edge::EDGES_TABLE;
@@ -135,7 +135,7 @@ fn encode_payload(slot: u64, byte: u8) -> EncodePayload {
         request_id: rid(byte),
         space_id: aid(byte),
         namespace_id: brain_core::NamespaceId::from(u32::from(byte)),
-        context_id: ContextId(42),
+        session_id: SessionId(42),
         kind: MemoryKind::Episodic,
         salience_initial: 0.5,
         embedding_model_fp: [byte; 16],

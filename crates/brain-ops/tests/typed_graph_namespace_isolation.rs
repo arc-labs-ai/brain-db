@@ -223,7 +223,7 @@ async fn create_relation(
 async fn resolve_entity(fix: &Fixture, c: RequestCaller, name: &str) -> EntityResolveResponse {
     let req = EntityResolveRequest {
         candidate_name: name.to_string(),
-        context: String::new(),
+        resolution_context: String::new(),
         entity_type_hint: 0,
         allow_create: false,
         request_id: [0u8; 16],

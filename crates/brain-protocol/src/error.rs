@@ -112,7 +112,7 @@ pub enum ErrorCode {
     MissingRequiredField,
     TextTooLarge,
     TextEmpty,
-    BadContextId,
+    BadSessionId,
     BadMemoryKind,
     BadEdgeKind,
     BadStrategyHint,
@@ -266,7 +266,7 @@ impl ErrorCode {
             | Self::MissingRequiredField
             | Self::TextTooLarge
             | Self::TextEmpty
-            | Self::BadContextId
+            | Self::BadSessionId
             | Self::BadMemoryKind
             | Self::BadEdgeKind
             | Self::BadStrategyHint

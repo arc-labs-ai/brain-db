@@ -25,7 +25,7 @@
 //!
 //! ## What's *not* in SlotMeta
 //!
-//! `space_id`, `context_id`, `kind`, `salience`, and `text` live in the
+//! `space_id`, `session_id`, `kind`, `salience`, and `text` live in the
 //! metadata store (redb), not the arena. The arena holds the vector and
 //! the bookkeeping needed to validate it (version, flags, fp, timestamps,
 //! CRC).

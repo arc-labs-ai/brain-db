@@ -98,8 +98,8 @@ pub enum ResponseBody {
     AdminRestore(AdminRestoreResponse),
     AdminIntegrityCheck(AdminIntegrityCheckResponse),
     AdminMigrateEmbeddings(AdminMigrateEmbeddingsResponseFrame),
-    AdminCreateContext(AdminCreateContextResponse),
-    AdminRenameContext(AdminRenameContextResponse),
+    AdminCreateSession(AdminCreateSessionResponse),
+    AdminRenameSession(AdminRenameSessionResponse),
     AdminMoveMemory(AdminMoveMemoryResponse),
     AdminReclassify(AdminReclassifyResponse),
     AdminListTombstoned(AdminListTombstonedResponseFrame),
@@ -198,8 +198,8 @@ impl ResponseBody {
             Self::AdminRestore(_) => Opcode::AdminRestoreResp,
             Self::AdminIntegrityCheck(_) => Opcode::AdminIntegrityCheckResp,
             Self::AdminMigrateEmbeddings(_) => Opcode::AdminMigrateEmbeddingsResp,
-            Self::AdminCreateContext(_) => Opcode::AdminCreateContextResp,
-            Self::AdminRenameContext(_) => Opcode::AdminRenameContextResp,
+            Self::AdminCreateSession(_) => Opcode::AdminCreateSessionResp,
+            Self::AdminRenameSession(_) => Opcode::AdminRenameSessionResp,
             Self::AdminMoveMemory(_) => Opcode::AdminMoveMemoryResp,
             Self::AdminReclassify(_) => Opcode::AdminReclassifyResp,
             Self::AdminListTombstoned(_) => Opcode::AdminListTombstonedResp,
@@ -299,8 +299,8 @@ impl ResponseBody {
             Self::AdminRestore(r) => to_cbor_bytes(r),
             Self::AdminIntegrityCheck(r) => to_cbor_bytes(r),
             Self::AdminMigrateEmbeddings(r) => to_cbor_bytes(r),
-            Self::AdminCreateContext(r) => to_cbor_bytes(r),
-            Self::AdminRenameContext(r) => to_cbor_bytes(r),
+            Self::AdminCreateSession(r) => to_cbor_bytes(r),
+            Self::AdminRenameSession(r) => to_cbor_bytes(r),
             Self::AdminMoveMemory(r) => to_cbor_bytes(r),
             Self::AdminReclassify(r) => to_cbor_bytes(r),
             Self::AdminListTombstoned(r) => to_cbor_bytes(r),
@@ -377,8 +377,8 @@ impl ResponseBody {
             Opcode::AdminMigrateEmbeddingsResp => {
                 Self::AdminMigrateEmbeddings(from_cbor_bytes(bytes)?)
             }
-            Opcode::AdminCreateContextResp => Self::AdminCreateContext(from_cbor_bytes(bytes)?),
-            Opcode::AdminRenameContextResp => Self::AdminRenameContext(from_cbor_bytes(bytes)?),
+            Opcode::AdminCreateSessionResp => Self::AdminCreateSession(from_cbor_bytes(bytes)?),
+            Opcode::AdminRenameSessionResp => Self::AdminRenameSession(from_cbor_bytes(bytes)?),
             Opcode::AdminMoveMemoryResp => Self::AdminMoveMemory(from_cbor_bytes(bytes)?),
             Opcode::AdminReclassifyResp => Self::AdminReclassify(from_cbor_bytes(bytes)?),
             Opcode::AdminListTombstonedResp => Self::AdminListTombstoned(from_cbor_bytes(bytes)?),
@@ -466,7 +466,7 @@ mod tests {
             auto_edges_added: 3,
             lsn: 42,
             space_id: [0xAA; 16],
-            context_id: 7,
+            session_id: 7,
             kind: MemoryKindWire::Episodic,
             created_at_unix_nanos: 1_700_000_000_000_000_000,
             edges_out_count: 3,
@@ -493,7 +493,7 @@ mod tests {
             auto_edges_added: 0,
             lsn: 99,
             space_id: [0xAA; 16],
-            context_id: 7,
+            session_id: 7,
             kind: MemoryKindWire::Episodic,
             created_at_unix_nanos: 1_700_000_000_000_000_000,
             edges_out_count: 0,
@@ -517,7 +517,7 @@ mod tests {
                 salience: 0.5,
                 kind: MemoryKindWire::Episodic,
                 space_id: sample_uuid(42),
-                context_id: 1_u64,
+                session_id: 1_u64,
                 created_at_unix_nanos: 1_700_000_000_000_000_000,
                 last_accessed_at_unix_nanos: 1_700_000_001_000_000_000,
                 contributing_retrievers: vec![
@@ -685,7 +685,7 @@ mod tests {
         round_trip(ResponseBody::SubscribeEvent(SubscriptionEvent {
             event_type: EventType::Encoded,
             memory_id: sample_memory_id(),
-            context_id: 2_u64,
+            session_id: 2_u64,
             text: "new memory".into(),
             kind: MemoryKindWire::Episodic,
             salience: 0.5,
@@ -778,7 +778,7 @@ mod tests {
                 total_memories: 1_000_000,
                 total_active_memories: 999_000,
                 total_tombstoned_memories: 1_000,
-                total_contexts: 10,
+                total_sessions: 10,
                 encode_qps: 100.5,
                 recall_qps: 50.25,
                 p99_encode_latency_ms: 2.0,
@@ -794,8 +794,8 @@ mod tests {
                 last_checkpoint_lsn: 1_000_000,
                 arena_used_bytes: 1024 * 1024,
             }]),
-            per_context: Some(vec![ContextStats {
-                context_id: 4_u64,
+            per_session: Some(vec![SessionStats {
+                session_id: 4_u64,
                 name: "default".into(),
                 memory_count: 100,
                 last_encoded_at_unix_nanos: 1,
@@ -859,23 +859,23 @@ mod tests {
                 status: Some(MigrationStatus::Completed),
             },
         ));
-        round_trip(ResponseBody::AdminCreateContext(
-            AdminCreateContextResponse {
-                context_id: 6_u64,
+        round_trip(ResponseBody::AdminCreateSession(
+            AdminCreateSessionResponse {
+                session_id: 6_u64,
                 name: "personal".into(),
             },
         ));
-        round_trip(ResponseBody::AdminRenameContext(
-            AdminRenameContextResponse {
-                context_id: 7_u64,
+        round_trip(ResponseBody::AdminRenameSession(
+            AdminRenameSessionResponse {
+                session_id: 7_u64,
                 new_name: "renamed".into(),
                 old_name: "original".into(),
             },
         ));
         round_trip(ResponseBody::AdminMoveMemory(AdminMoveMemoryResponse {
             memory_id: sample_memory_id(),
-            new_context_id: 8_u64,
-            old_context_id: 9_u64,
+            new_session_id: 8_u64,
+            old_session_id: 9_u64,
         }));
         round_trip(ResponseBody::AdminReclassify(AdminReclassifyResponse {
             memory_id: sample_memory_id(),
@@ -1035,7 +1035,7 @@ mod tests {
             ResponseBody::SubscribeEvent(SubscriptionEvent {
                 event_type: EventType::Encoded,
                 memory_id: 0,
-                context_id: 0,
+                session_id: 0,
                 text: String::new(),
                 kind: MemoryKindWire::Episodic,
                 salience: 0.0,
@@ -1076,7 +1076,7 @@ mod tests {
         let welcome = ResponseBody::Welcome(WelcomePayload {
             server_id: "brain-server/0.5.0".into(),
             chosen_version: 1,
-            session_id: sample_uuid(20),
+            connection_id: sample_uuid(20),
             capabilities: HelloCapabilities {
                 streaming: true,
                 compression_zstd: false,

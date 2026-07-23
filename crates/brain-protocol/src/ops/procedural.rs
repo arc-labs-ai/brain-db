@@ -8,7 +8,7 @@
 //!
 //! The response side lives in the envelope response module.
 
-use crate::envelope::request::{WireContextId, WireUuid};
+use crate::envelope::request::{WireSessionId, WireUuid};
 
 /// `MATERIALIZE_PROCEDURAL` (`0x0164`).
 ///
@@ -16,8 +16,8 @@ use crate::envelope::request::{WireContextId, WireUuid};
 /// - `space_id` — the space whose learned behaviors are rendered. The
 ///   handler resolves the entity for this space and filters statements
 ///   whose `subject == SpaceEntity(space_id)`.
-/// - `context_filter` — when set, restrict to evidence sourced from
-///   memories in this context. `0` means no restriction.
+/// - `session_filter` — when set (a non-empty set), restrict to evidence
+///   sourced from memories in those sessions. `None` means no restriction.
 /// - `top_k` — hard cap on rendered statements. Must be in `1..=100`.
 ///   Defaults to 20 when the client passes `0`.
 /// - `min_confidence` — floor for inclusion; rows with `confidence`
@@ -30,7 +30,7 @@ use crate::envelope::request::{WireContextId, WireUuid};
 pub struct MaterializeProceduralRequest {
     #[serde(with = "serde_bytes")]
     pub space_id: WireUuid,
-    pub context_filter: WireContextId,
+    pub session_filter: Option<Vec<WireSessionId>>,
     pub top_k: u32,
     pub min_confidence: f32,
     pub categories: Vec<String>,
@@ -56,7 +56,7 @@ mod tests_req {
     fn request_round_trips_through_request_body() {
         let req = MaterializeProceduralRequest {
             space_id: sample_uuid(5),
-            context_filter: 0,
+            session_filter: None,
             top_k: 0,
             min_confidence: 0.0,
             categories: Vec::new(),

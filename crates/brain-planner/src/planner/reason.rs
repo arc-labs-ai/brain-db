@@ -178,7 +178,7 @@ mod tests {
             observation: ObservationInput::ByText("the cat sat".into()),
             depth: 3,
             confidence_threshold: 0.5,
-            context_filter: None,
+            session_filter: None,
             max_inferences: 5,
             budget_wall_time_ms: 100,
             request_id: None,

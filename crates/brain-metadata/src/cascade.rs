@@ -834,7 +834,7 @@ mod statement_cascade_overflow_tests {
     use crate::tables::statement::{StatementMetadata, EVIDENCE_OVERFLOW_TABLE, STATEMENTS_TABLE};
     use crate::MetadataDb;
     use brain_core::{
-        ContextId, Entity, EntityType, EvidenceRef, ExtractorId, PredicateId, Statement,
+        SessionId, Entity, EntityType, EvidenceRef, ExtractorId, PredicateId, Statement,
         StatementId, StatementKind, StatementObject, StatementValue, SubjectRef,
     };
 
@@ -917,7 +917,7 @@ mod statement_cascade_overflow_tests {
 
     fn ids(n: usize) -> Vec<MemoryId> {
         (0..n)
-            .map(|i| MemoryId::pack(i as u16 + 1, ContextId::DEFAULT.into(), 0))
+            .map(|i| MemoryId::pack(i as u16 + 1, SessionId::DEFAULT.into(), 0))
             .collect()
     }
 

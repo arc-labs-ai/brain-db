@@ -1630,7 +1630,7 @@ mod tests {
         let a = make_entity(&mut db, "ev-a");
         let b = make_entity(&mut db, "ev-b");
         let t = intern_type(&mut db, "ev_type", Cardinality::ManyToMany, false);
-        let mem = MemoryId::pack(1, brain_core::ContextId::DEFAULT.into(), 0);
+        let mem = MemoryId::pack(1, brain_core::SessionId::DEFAULT.into(), 0);
         let mut r = fresh_rel(t, a, b, false);
         r.evidence = vec![mem];
 

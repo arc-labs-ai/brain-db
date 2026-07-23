@@ -97,7 +97,7 @@ fn build_fixture() -> Fixture {
 fn encode_req(request_id: [u8; 16], text: &str, txn: Option<[u8; 16]>) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
-        context_id: 42,
+        session_id: 42,
         request_id,
         txn_id: txn,
         occurred_at_unix_nanos: None,
@@ -160,7 +160,7 @@ fn recall_req(cue: &str, max_results: u32, txn: Option<[u8; 16]>) -> RecallReque
         subject_name: String::new(),
         max_results,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         age_bound_unix_nanos: None,
         as_of_record_time_unix_nanos: None,
         kind_filter: None,
@@ -184,7 +184,7 @@ fn plan_req(start: u128, goal: u128, max_depth: u32, txn: Option<[u8; 16]>) -> P
             max_branches_explored: 256,
         },
         strategy_hint: None,
-        context_filter: None,
+        session_filter: None,
         request_id: None,
         txn_id: txn,
         trace: false,
@@ -197,7 +197,7 @@ fn reason_req(base: u128, depth: u32, txn: Option<[u8; 16]>) -> ReasonRequest {
         observation: ObservationInput::ByMemoryId(base),
         depth,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         max_inferences: 10,
         budget_wall_time_ms: 1000,
         request_id: None,
@@ -905,21 +905,21 @@ fn txn_expires_after_idle_window() {
 //
 // A client whose TCP/TLS connection dies before TXN_COMMIT must see
 // none of its buffered operations applied. The connection layer fans
-// `TxnStore::abort_orphaned_for_session` across every shard the
+// `TxnStore::abort_orphaned_for_connection` across every shard the
 // moment it observes the disconnect; these tests exercise that sweep
 // directly against `TxnStore`.
 // =============================================================================
 
-/// Open a txn that's linked to the given wire `session_id`. Mirrors
+/// Open a txn that's linked to the given wire `connection_id`. Mirrors
 /// `begin` but carries a non-anonymous caller so the entry inherits
 /// the session linkage the connection layer would stamp in production.
-async fn begin_with_session(
+async fn begin_with_connection(
     fix: &Fixture,
     txn_id: [u8; 16],
     timeout_seconds: u32,
-    session_id: [u8; 16],
+    connection_id: [u8; 16],
 ) -> TxnBeginResponse {
-    let caller = brain_ops::RequestCaller::for_tests().with_session_id(session_id);
+    let caller = brain_ops::RequestCaller::for_tests().with_session_id(connection_id);
     unwrap_begin(
         dispatch(
             RequestBody::TxnBegin(TxnBeginRequest {
@@ -940,15 +940,15 @@ fn session_drop_aborts_open_txns() {
         let fix = build_fixture();
         let session = [0xAA; 16];
         let txn = [200; 16];
-        let _ = begin_with_session(&fix, txn, 30, session).await;
+        let _ = begin_with_connection(&fix, txn, 30, session).await;
         // Buffer some work — these must NOT land after the sweep.
         let _ = encode(&fix, [201; 16], "draft-1", Some(txn)).await;
         let _ = encode(&fix, [202; 16], "draft-2", Some(txn)).await;
 
         // Simulate the connection drop hook: connection layer fans
-        // `abort_orphaned_for_session` to every shard. Here we hit
+        // `abort_orphaned_for_connection` to every shard. Here we hit
         // the single shard directly.
-        let aborted = fix.ctx.txn_store.abort_orphaned_for_session(session);
+        let aborted = fix.ctx.txn_store.abort_orphaned_for_connection(session);
         assert_eq!(aborted, vec![txn], "exactly the dropped session's txn");
 
         // Subsequent ops on the txn must see it as Expired (the
@@ -992,12 +992,12 @@ fn session_drop_does_not_affect_other_sessions() {
         let session_b = [0xBB; 16];
         let txn_a = [210; 16];
         let txn_b = [211; 16];
-        let _ = begin_with_session(&fix, txn_a, 30, session_a).await;
-        let _ = begin_with_session(&fix, txn_b, 30, session_b).await;
+        let _ = begin_with_connection(&fix, txn_a, 30, session_a).await;
+        let _ = begin_with_connection(&fix, txn_b, 30, session_b).await;
         let _ = encode(&fix, [212; 16], "from-b", Some(txn_b)).await;
 
         // Drop session A. Session B's txn must keep working.
-        let aborted = fix.ctx.txn_store.abort_orphaned_for_session(session_a);
+        let aborted = fix.ctx.txn_store.abort_orphaned_for_connection(session_a);
         assert_eq!(aborted, vec![txn_a]);
 
         // Session B can commit. Its encode must land.
@@ -1033,18 +1033,18 @@ fn reconnect_after_drop_sees_clean_state() {
         let session_1 = [0xAA; 16];
         let session_2 = [0xCC; 16];
         let old_txn = [220; 16];
-        let _ = begin_with_session(&fix, old_txn, 30, session_1).await;
+        let _ = begin_with_connection(&fix, old_txn, 30, session_1).await;
         let _ = encode(&fix, [221; 16], "lost-draft", Some(old_txn)).await;
 
         // Original connection dies.
-        let aborted = fix.ctx.txn_store.abort_orphaned_for_session(session_1);
+        let aborted = fix.ctx.txn_store.abort_orphaned_for_connection(session_1);
         assert_eq!(aborted, vec![old_txn]);
 
         // Client reconnects with a brand-new session + a brand-new
         // txn id. The fresh begin must succeed and operate on a
         // clean buffer — the previous draft must not leak through.
         let new_txn = [222; 16];
-        let _ = begin_with_session(&fix, new_txn, 30, session_2).await;
+        let _ = begin_with_connection(&fix, new_txn, 30, session_2).await;
         let _ = encode(&fix, [223; 16], "fresh-draft", Some(new_txn)).await;
 
         // Recall inside the new txn sees only its own pending encode,
@@ -1082,14 +1082,14 @@ fn auto_abort_sweep_is_noop_for_zero_session_id() {
         let fix = build_fixture();
         let txn = [230; 16];
         // Default begin() uses the anonymous caller, which carries
-        // session_id == [0; 16]. The sweep must not touch such entries
+        // connection_id == [0; 16]. The sweep must not touch such entries
         // — otherwise in-process embedded callers (tests, harnesses)
         // would wipe their own txns by accident.
         let _ = begin(&fix, txn, 30).await;
         let _ = encode(&fix, [231; 16], "still-here", Some(txn)).await;
 
-        let aborted = fix.ctx.txn_store.abort_orphaned_for_session([0u8; 16]);
-        assert!(aborted.is_empty(), "zero session_id must be a no-op");
+        let aborted = fix.ctx.txn_store.abort_orphaned_for_connection([0u8; 16]);
+        assert!(aborted.is_empty(), "zero connection_id must be a no-op");
 
         // Txn is still committable.
         let resp = commit(&fix, txn).await;

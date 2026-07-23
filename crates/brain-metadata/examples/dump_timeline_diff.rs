@@ -66,7 +66,7 @@ fn main() {
             row.namespace_id,
             row.space_id_bytes,
             row.created_at_unix_nanos,
-            row.context_id,
+            row.session_id,
             row.memory_id_bytes,
         );
         checked += 1;
@@ -93,7 +93,7 @@ fn main() {
                 examples += 1;
                 println!(
                     "MISMATCH: key(ns={key_ns} created={key_created} ctx={key_ctx}) vs row(ns={} created={} ctx={})",
-                    row.namespace_id, row.created_at_unix_nanos, row.context_id
+                    row.namespace_id, row.created_at_unix_nanos, row.session_id
                 );
             }
         }

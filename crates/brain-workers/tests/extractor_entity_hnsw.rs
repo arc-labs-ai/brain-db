@@ -224,7 +224,7 @@ impl Fixture {
     /// Mirror `apply_upsert_memory`: memory row + text + durable queue
     /// row in one commit, then nudge the worker's wakeup channel.
     fn enqueue(&self, memory_id: MemoryId, text: &str) {
-        use brain_core::{ContextId, MemoryKind, NamespaceId};
+        use brain_core::{SessionId, MemoryKind, NamespaceId};
         use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
         use brain_metadata::tables::text::TEXTS_TABLE;
 
@@ -233,7 +233,7 @@ impl Fixture {
             memory_id,
             NamespaceId::SYSTEM,
             SpaceId(uuid::Uuid::from_bytes([0xC3; 16])),
-            ContextId(0),
+            SessionId(0),
             0,
             0,
             MemoryKind::Episodic,

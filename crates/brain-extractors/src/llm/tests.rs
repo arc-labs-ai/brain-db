@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brain_core::{
-    SpaceId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience, Statement,
+    SpaceId, SessionId, ExtractorId, Memory, MemoryId, MemoryKind, Salience, Statement,
     StatementObject, StatementValue, SubjectRef,
 };
 use brain_llm::client::LlmFuture;
@@ -98,7 +98,7 @@ fn memory(text: &str) -> Memory {
     Memory {
         id: MemoryId::pack(0, 1, 0),
         space: SpaceId::new(),
-        context: ContextId(0),
+        session_id: SessionId(0),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),
         text: Some(text.into()),

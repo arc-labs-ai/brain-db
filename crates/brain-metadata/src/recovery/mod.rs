@@ -12,7 +12,7 @@
 //! into the appropriate family function (each implemented as an `impl
 //! MetadataDb` block in its own file).
 //!
-//! - [`memory`] — Encode / Forget / UpdateSalience / UpdateKind / UpdateContext / MigrateEmbedding
+//! - [`memory`] — Encode / Forget / UpdateSalience / UpdateKind / UpdateSession / MigrateEmbedding
 //! - [`edge`] — Link / Unlink
 //! - [`relation`] — RelationLink / RelationSupersede / RelationTombstone
 //! - [`reclaim`] — Reclaim / Consolidate
@@ -76,7 +76,7 @@ impl MetadataSink for MetadataDb {
             WalPayload::Reclaim(p) => self.apply_reclaim(lsn, p),
             WalPayload::Consolidate(p) => self.apply_consolidate(lsn, timestamp_ns, p),
             WalPayload::UpdateKind(p) => self.apply_update_kind(lsn, timestamp_ns, p),
-            WalPayload::UpdateContext(p) => self.apply_update_context(lsn, timestamp_ns, p),
+            WalPayload::UpdateSession(p) => self.apply_update_session(lsn, timestamp_ns, p),
             WalPayload::MigrateEmbedding(p) => self.apply_migrate_embedding(lsn, p),
             WalPayload::CheckpointBegin(p) => {
                 // In-memory state only; no persistent write.
@@ -208,11 +208,11 @@ mod tests {
     use crate::tables::relation::{RELATION_BY_EVIDENCE_TABLE, RELATION_METADATA_TABLE};
     use crate::tables::slot_version::SLOT_VERSIONS_TABLE;
     use crate::tables::text::TEXTS_TABLE;
-    use brain_core::{SpaceId, ContextId, EdgeKind, EdgeOrigin, MemoryId, MemoryKind, RequestId};
+    use brain_core::{SpaceId, SessionId, EdgeKind, EdgeOrigin, MemoryId, MemoryKind, RequestId};
     use brain_storage::wal::payload::{
         CheckpointBeginPayload, CheckpointEndPayload, EdgePayload, EncodePayload, ForgetMode,
         ForgetPayload, ForgetReason, LinkPayload, MigrateEmbeddingPayload, ReclaimPayload,
-        SalienceReason, SalienceUpdate, TxnBeginPayload, UnlinkPayload, UpdateContextPayload,
+        SalienceReason, SalienceUpdate, TxnBeginPayload, UnlinkPayload, UpdateSessionPayload,
         UpdateKindPayload, UpdateSaliencePayload, WalPayload,
     };
     use std::path::PathBuf;
@@ -243,7 +243,7 @@ mod tests {
             request_id: rid(byte),
             space_id: aid(byte),
             namespace_id: brain_core::NamespaceId::from(u32::from(byte)),
-            context_id: ContextId(42),
+            session_id: SessionId(42),
             kind: MemoryKind::Episodic,
             salience_initial: 0.5,
             embedding_model_fp: [byte; 16],
@@ -618,7 +618,7 @@ mod tests {
         assert_eq!(m.consolidated_at_unix_nanos, Some(TS));
     }
 
-    // ---------- UpdateKind / UpdateContext ----------
+    // ---------- UpdateKind / UpdateSession ----------
 
     #[test]
     fn update_kind_changes_memory_kind() {
@@ -649,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn update_context_changes_memory_context() {
+    fn update_session_changes_memory_session() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MetadataDb::open(db_path(&dir)).unwrap();
         let enc = sample_encode(1, 1);
@@ -658,9 +658,9 @@ mod tests {
         db.apply(
             2,
             TS + 1,
-            &WalPayload::UpdateContext(UpdateContextPayload {
+            &WalPayload::UpdateSession(UpdateSessionPayload {
                 memory_id: id,
-                new_context_id: ContextId(999),
+                new_session_id: SessionId(999),
             }),
         )
         .unwrap();
@@ -673,7 +673,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .value();
-        assert_eq!(m.context_id, 999);
+        assert_eq!(m.session_id, 999);
     }
 
     // ---------- MigrateEmbedding ----------

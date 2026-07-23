@@ -356,7 +356,7 @@ mod tests {
         use crate::schema::predicate::{predicate_intern_or_get, predicates_active_for_schema};
         use crate::statement::crud::statement_create;
         use crate::tables::statement::{statement_flags, STATEMENTS_TABLE};
-        use brain_core::{ContextId, EntityId, ExtractorId, MemoryId, StatementId, StatementKind};
+        use brain_core::{SessionId, EntityId, ExtractorId, MemoryId, StatementId, StatementKind};
         use brain_core::{
             EvidenceEntry, EvidenceRef, Statement, StatementObject, StatementValue, SubjectRef,
         };
@@ -393,7 +393,7 @@ mod tests {
             let mk_stmt = |pid| {
                 let id = StatementId::new();
                 let evidence_entry = EvidenceEntry::from_parts(
-                    MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+                    MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
                     1.0,
                     0,
                     ExtractorId::default(),

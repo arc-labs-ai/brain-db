@@ -2,7 +2,7 @@
 //! these into the wire `ResponseBody` variants; for now they're the
 //! integration-test assertion targets.
 
-use brain_core::{ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{SessionId, EdgeKind, MemoryId, MemoryKind};
 
 use super::writer::{EdgeOutcome, ForgetOutcome};
 
@@ -18,7 +18,7 @@ pub struct RecallHit {
     /// equals the dot product / cosine similarity.
     pub score: f32,
     pub kind: MemoryKind,
-    pub context_id: ContextId,
+    pub session_id: SessionId,
     pub salience: f32,
     pub created_at_unix_nanos: u64,
     /// `None` until a wire-level `include_text` flag lands and the

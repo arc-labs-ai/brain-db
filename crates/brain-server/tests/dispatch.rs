@@ -231,7 +231,7 @@ async fn complete_handshake(
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send_frame(
         client,
@@ -304,7 +304,7 @@ async fn hello_with_unsupported_version_errors_and_closes() {
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send_frame(
         &mut client,
@@ -341,7 +341,7 @@ async fn ops_before_auth_are_rejected() {
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send_frame(
         &mut client,
@@ -358,7 +358,7 @@ async fn ops_before_auth_are_rejected() {
     // Now send ENCODE — should get ERROR(NotAuthenticated).
     let encode = EncodeRequest {
         text: "hello".into(),
-        context_id: 0,
+        session_id: 0,
         request_id: [0u8; 16],
         txn_id: None,
         occurred_at_unix_nanos: None,
@@ -492,7 +492,7 @@ async fn encode_round_trips_through_shard() {
 
     let encode = EncodeRequest {
         text: "hello world".into(),
-        context_id: 0,
+        session_id: 0,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
@@ -599,7 +599,7 @@ async fn recall_returns_single_frame_eos_in_v1() {
         subject_name: String::new(),
         max_results: 5,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         age_bound_unix_nanos: None,
         as_of_record_time_unix_nanos: None,
         kind_filter: None,

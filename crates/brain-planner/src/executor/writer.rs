@@ -10,7 +10,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use brain_core::{ContextId, EdgeKind, MemoryId, MemoryKind, RequestId};
+use brain_core::{SessionId, EdgeKind, MemoryId, MemoryKind, RequestId};
 use brain_protocol::envelope::request::ForgetMode;
 use thiserror::Error;
 
@@ -81,7 +81,7 @@ pub trait WriterHandle {
 #[derive(Debug, Clone)]
 pub struct EncodeOp {
     pub request_id: RequestId,
-    pub context_id: ContextId,
+    pub session_id: SessionId,
     pub kind: MemoryKind,
     pub text: String,
     pub vector: [f32; brain_embed::VECTOR_DIM],
@@ -92,7 +92,7 @@ pub struct EncodeOp {
     pub fingerprint: [u8; 16],
     pub edges: Vec<EncodeOpEdge>,
     /// When `true`, the writer consults the per-shard `fingerprints`
-    /// table keyed by `(space_id, context_id, content_hash)` and, on a
+    /// table keyed by `(space_id, session_id, content_hash)` and, on a
     /// hit, returns the existing `MemoryId` without allocating a new
     /// slot.
     pub deduplicate: bool,

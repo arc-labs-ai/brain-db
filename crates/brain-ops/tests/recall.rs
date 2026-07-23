@@ -107,7 +107,7 @@ fn build_fixture_with_embedder(embedder: Arc<dyn Dispatcher>) -> Fixture {
 fn encode_req(request_id: [u8; 16], text: &str, _kind: MemoryKindWire) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
-        context_id: 42,
+        session_id: 42,
         request_id,
         txn_id: None,
         occurred_at_unix_nanos: None,
@@ -124,7 +124,7 @@ fn recall_req(cue: &str, max_results: u32) -> RecallRequest {
         subject_name: String::new(),
         max_results,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         age_bound_unix_nanos: None,
         as_of_record_time_unix_nanos: None,
         kind_filter: None,
@@ -200,7 +200,7 @@ fn recall_cue_hit_returns_member_with_fields_plumbed() {
         // Fields plumbed through.
         let top = &frame.memories[0];
         assert_ne!(top.memory_id, 0);
-        assert_eq!(top.context_id, 42);
+        assert_eq!(top.session_id, 42);
         assert_eq!(top.kind, MemoryKindWire::Episodic);
         assert!((top.salience - 0.5).abs() < 1e-6);
         // The retrieval pipeline carries two distinct scores per hit:
@@ -244,7 +244,7 @@ fn recall_echoes_client_supplied_occurred_at() {
 
         let req = EncodeRequest {
             text: "moved to berlin".into(),
-            context_id: 42,
+            session_id: 42,
             request_id: [9; 16],
             txn_id: None,
             occurred_at_unix_nanos: Some(event_time),
@@ -306,7 +306,7 @@ fn recency_breaks_relevance_ties_toward_recent_event_time() {
         let text = "team offsite in lisbon";
         let recent = EncodeRequest {
             text: text.into(),
-            context_id: 42,
+            session_id: 42,
             request_id: [21; 16],
             txn_id: None,
             occurred_at_unix_nanos: Some(reference - day), // yesterday

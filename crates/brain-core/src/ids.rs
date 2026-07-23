@@ -16,7 +16,7 @@
 //!   tens-to-hundreds of each, not millions — and small keys keep
 //!   secondary indexes compact.
 //!
-//! Other tiny aliases live here too: `ShardId` (`u16`), `ContextId`
+//! Other tiny aliases live here too: `ShardId` (`u16`), `SessionId`
 //! (`u64`), `SlotIndex` (`u64`), `SlotVersion` (`u32`).
 
 use serde::{Deserialize, Serialize};
@@ -70,16 +70,16 @@ impl Default for SpaceId {
     }
 }
 
-/// Server-assigned context identifier. Space-scoped
-/// — two spaces can both have `ContextId(1)` and they are unrelated.
-/// `ContextId(0)` is reserved for the default context.
+/// Client-supplied session (conversation) identifier. Space-scoped
+/// — two spaces can both have `SessionId(1)` and they are unrelated.
+/// `SessionId(0)` is reserved for the default session.
 #[derive(
     Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
-pub struct ContextId(pub u64);
+pub struct SessionId(pub u64);
 
-impl ContextId {
-    /// The default context, automatically present for every space.
+impl SessionId {
+    /// The default session, automatically present for every space.
     pub const DEFAULT: Self = Self(0);
 
     #[must_use]
@@ -216,9 +216,9 @@ impl MemoryId {
 // Primitive-representation conversions.
 //
 // These are placed here (rather than in `brain-protocol`'s `convert` module)
-// so the orphan rules cooperate: `MemoryId` / `ContextId` / `SpaceId` / etc.
+// so the orphan rules cooperate: `MemoryId` / `SessionId` / `SpaceId` / etc.
 // are local to brain-core, and the "wire-domain" aliases in brain-protocol
-// (`WireMemoryId = u128`, `WireUuid = [u8; 16]`, `WireContextId = u64`)
+// (`WireMemoryId = u128`, `WireUuid = [u8; 16]`, `WireSessionId = u64`)
 // are just type aliases for primitives — so impls written here against the
 // primitives apply transparently in brain-protocol.
 // ---------------------------------------------------------------------------
@@ -237,17 +237,17 @@ impl From<u128> for MemoryId {
     }
 }
 
-impl From<ContextId> for u64 {
+impl From<SessionId> for u64 {
     #[inline]
-    fn from(c: ContextId) -> Self {
+    fn from(c: SessionId) -> Self {
         c.0
     }
 }
 
-impl From<u64> for ContextId {
+impl From<u64> for SessionId {
     #[inline]
     fn from(raw: u64) -> Self {
-        ContextId(raw)
+        SessionId(raw)
     }
 }
 
@@ -549,9 +549,9 @@ mod tests {
     }
 
     #[test]
-    fn context_id_default_is_zero() {
-        assert_eq!(ContextId::default(), ContextId::DEFAULT);
-        assert_eq!(ContextId::DEFAULT.raw(), 0);
+    fn session_id_default_is_zero() {
+        assert_eq!(SessionId::default(), SessionId::DEFAULT);
+        assert_eq!(SessionId::DEFAULT.raw(), 0);
     }
 
     proptest! {

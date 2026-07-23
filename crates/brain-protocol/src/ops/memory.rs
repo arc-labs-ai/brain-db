@@ -1,7 +1,7 @@
 //! Cognitive-op requests: ENCODE / ENCODE_VECTOR_DIRECT / RECALL / PLAN /
 //! REASON / FORGET.
 
-use crate::envelope::request::{WireContextId, WireMemoryId, WireUuid};
+use crate::envelope::request::{WireSessionId, WireMemoryId, WireUuid};
 use crate::shared::primitives::{
     EdgeKindWire, ForgetMode, MemoryKindWire, ObservationInput, PlanState, PlanStrategy,
 };
@@ -35,7 +35,7 @@ pub struct ActAs {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EncodeRequest {
     pub text: String,
-    pub context_id: WireContextId,
+    pub session_id: WireSessionId,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
     #[serde(with = "crate::codec::cbor::opt_byte_array16")]
@@ -70,7 +70,7 @@ pub struct EncodeRequest {
     #[serde(default, skip_serializing_if = "WaitMode::is_ack")]
     pub wait: WaitMode,
     /// Opt out of content dedup and force a distinct memory. Default `false`:
-    /// Brain dedupes text ENCODE on (space_id, context_id, BLAKE3(text)) — a
+    /// Brain dedupes text ENCODE on (space_id, session_id, BLAKE3(text)) — a
     /// repeat of byte-identical text returns the existing MemoryId
     /// (was_deduplicated = true) and writes nothing new. Set `true` when the
     /// same text is a genuinely distinct observation that must coexist (e.g. the
@@ -166,7 +166,7 @@ pub struct EncodeVectorDirectRequest {
     /// against future text-cued recalls.
     #[serde(with = "serde_bytes")]
     pub model_fingerprint: [u8; 16],
-    pub context_id: WireContextId,
+    pub session_id: WireSessionId,
     pub kind: MemoryKindWire,
     pub salience_hint: f32,
     pub edges: Vec<EdgeRequest>,
@@ -200,7 +200,7 @@ pub struct RecallRequest {
     /// from a caller count. `0` ⇒ server default.
     pub max_results: u32,
     pub confidence_threshold: f32,
-    pub context_filter: Option<Vec<WireContextId>>,
+    pub session_filter: Option<Vec<WireSessionId>>,
     pub age_bound_unix_nanos: Option<u64>,
     /// Bi-temporal time-travel anchor. When `Some(t)`, the read is
     /// resolved against the state the substrate believed at record-time
@@ -255,7 +255,7 @@ pub struct PlanRequest {
     pub goal: PlanState,
     pub budget: PlanBudget,
     pub strategy_hint: Option<PlanStrategy>,
-    pub context_filter: Option<Vec<WireContextId>>,
+    pub session_filter: Option<Vec<WireSessionId>>,
     #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub request_id: Option<WireUuid>,
     #[serde(with = "crate::codec::cbor::opt_byte_array16")]
@@ -289,7 +289,7 @@ pub struct ReasonRequest {
     pub observation: ObservationInput,
     pub depth: u32,
     pub confidence_threshold: f32,
-    pub context_filter: Option<Vec<WireContextId>>,
+    pub session_filter: Option<Vec<WireSessionId>>,
     pub max_inferences: u32,
     pub budget_wall_time_ms: u32,
     #[serde(with = "crate::codec::cbor::opt_byte_array16")]
@@ -421,6 +421,11 @@ pub struct MemoryListRequest {
 pub struct MemoryListItem {
     #[serde(with = "serde_bytes")]
     pub memory_id: [u8; 16],
+    /// Owner space (16-byte storage key) the row belongs to.
+    #[serde(with = "serde_bytes")]
+    pub space_id: [u8; 16],
+    /// Session (conversation) the memory was encoded under; `0` = default.
+    pub session_id: WireSessionId,
     pub text: String,
     /// Raw memory-kind byte (0 = Episodic, 1 = Semantic, 2 = Consolidated).
     pub kind: u8,
@@ -516,8 +521,8 @@ pub struct EncodeResponse {
     #[serde(with = "serde_bytes")]
     pub space_id: WireUuid,
     /// Context the row was filed under. Echoes the request's
-    /// `context_id`.
-    pub context_id: WireContextId,
+    /// `session_id`.
+    pub session_id: WireSessionId,
     /// Memory kind that was stored.
     pub kind: MemoryKindWire,
     /// Server unix-nanos at write time. Useful when client clock
@@ -1092,7 +1097,7 @@ pub struct MemoryResult {
     /// provenance / routing verification.
     #[serde(with = "serde_bytes")]
     pub space_id: WireUuid,
-    pub context_id: WireContextId,
+    pub session_id: WireSessionId,
     pub created_at_unix_nanos: u64,
     pub last_accessed_at_unix_nanos: u64,
     pub edges: Option<Vec<EdgeView>>,
@@ -1572,6 +1577,8 @@ mod memory_list_tests {
         let frame = MemoryListResponseFrame {
             items: vec![MemoryListItem {
                 memory_id: [0x11; 16],
+                space_id: [0x33; 16],
+                session_id: 0,
                 text: "the sky is blue".into(),
                 kind: 0,
                 state: 0,
@@ -1635,7 +1642,7 @@ mod serde_smoke {
             text: "precomputed".into(),
             vector: vector.clone(),
             model_fingerprint: [0xAB; 16],
-            context_id: 9,
+            session_id: 9,
             kind: MemoryKindWire::Semantic,
             salience_hint: 0.5,
             edges: vec![],
@@ -1695,7 +1702,7 @@ mod serde_smoke {
 
         let req = EncodeRequest {
             text: "trace me".into(),
-            context_id: 3,
+            session_id: 3,
             request_id: [7u8; 16],
             txn_id: None,
             occurred_at_unix_nanos: None,
@@ -1773,7 +1780,7 @@ mod serde_smoke {
             auto_edges_added: 0,
             lsn: 9,
             space_id: [0u8; 16],
-            context_id: 3,
+            session_id: 3,
             kind: MemoryKindWire::Episodic,
             created_at_unix_nanos: 1,
             edges_out_count: 0,

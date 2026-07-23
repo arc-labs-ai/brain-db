@@ -18,7 +18,7 @@
 //! pipeline is synchronous from the planner's perspective; yield
 //! points are introduced when Glommio's runtime arrives.
 
-use brain_core::{ContextId, MemoryId, MemoryKind};
+use brain_core::{SessionId, MemoryId, MemoryKind};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::tables::text::TEXTS_TABLE;
 
@@ -151,7 +151,7 @@ fn build_hit(
         memory_id,
         score,
         kind,
-        context_id: ContextId::from(meta.context_id),
+        session_id: SessionId::from(meta.session_id),
         salience: meta.salience,
         created_at_unix_nanos: meta.created_at_unix_nanos,
         text: None,
@@ -169,7 +169,7 @@ fn build_hit(
 fn rule_matches(rule: &FilterRule, hit: &RecallHit) -> bool {
     match rule {
         FilterRule::KindIn(kinds) => kinds.contains(&hit.kind),
-        FilterRule::ContextIn(ctx_ids) => ctx_ids.contains(&hit.context_id),
+        FilterRule::SessionIn(ctx_ids) => ctx_ids.contains(&hit.session_id),
         FilterRule::SalienceFloor(threshold) => hit.salience >= *threshold,
         FilterRule::AgeBound {
             not_older_than_unix_nanos,

@@ -1,33 +1,33 @@
-//! Three interlocked context tables, co-located because every
-//! context-create touches all three:
+//! Three interlocked session tables, co-located because every
+//! session-create touches all three:
 //!
-//! - [`CONTEXTS_TABLE`] — `ContextId` → [`ContextMetadata`]: the full
+//! - [`SESSIONS_TABLE`] — `SessionId` → [`SessionMetadata`]: the full
 //!   record, looked up by ID.
-//! - [`CONTEXT_NAMES_TABLE`] — `(SpaceId, &str)` → `ContextId`: the
+//! - [`SESSION_NAMES_TABLE`] — `(SpaceId, &str)` → `SessionId`: the
 //!   name index, scoped to space.
-//! - [`SPACE_CONTEXTS_TABLE`] — `(SpaceId, ContextId)` → `()`: the
-//!   membership index, supporting "list contexts for space A" via a
+//! - [`SPACE_SESSIONS_TABLE`] — `(SpaceId, SessionId)` → `()`: the
+//!   membership index, supporting "list sessions for space A" via a
 //!   prefix range scan.
 
-use brain_core::{SpaceId, ContextId};
+use brain_core::{SpaceId, SessionId};
 use redb::TableDefinition;
 
 // ---------------------------------------------------------------------------
 // Tables.
 // ---------------------------------------------------------------------------
 
-/// `ContextId` → full [`ContextMetadata`] record.
-pub const CONTEXTS_TABLE: TableDefinition<'static, u64, ContextMetadata> =
-    TableDefinition::new("contexts");
+/// `SessionId` → full [`SessionMetadata`] record.
+pub const SESSIONS_TABLE: TableDefinition<'static, u64, SessionMetadata> =
+    TableDefinition::new("sessions");
 
-/// `(SpaceId, name)` → `ContextId`. Index for name-based lookup.
-pub const CONTEXT_NAMES_TABLE: TableDefinition<'static, (&'static [u8; 16], &'static str), u64> =
-    TableDefinition::new("context_names");
+/// `(SpaceId, name)` → `SessionId`. Index for name-based lookup.
+pub const SESSION_NAMES_TABLE: TableDefinition<'static, (&'static [u8; 16], &'static str), u64> =
+    TableDefinition::new("session_names");
 
-/// `(SpaceId, ContextId)` → `()`. Index for "list contexts of space" via
+/// `(SpaceId, SessionId)` → `()`. Index for "list sessions of space" via
 /// prefix range scan over the leading 16 bytes.
-pub const SPACE_CONTEXTS_TABLE: TableDefinition<'static, ([u8; 16], u64), ()> =
-    TableDefinition::new("space_contexts");
+pub const SPACE_SESSIONS_TABLE: TableDefinition<'static, ([u8; 16], u64), ()> =
+    TableDefinition::new("space_sessions");
 
 // ---------------------------------------------------------------------------
 // Naming conventions.
@@ -37,20 +37,20 @@ pub const SPACE_CONTEXTS_TABLE: TableDefinition<'static, ([u8; 16], u64), ()> =
 /// against client input; the storage layer itself doesn't validate.
 pub const RESERVED_NAME_PREFIX: &str = "_";
 
-/// The implicit "default" context name created on first ENCODE if no
-/// context is specified.
-pub const DEFAULT_CONTEXT_NAME: &str = "_default";
+/// The implicit "default" session name created on first ENCODE if no
+/// session is specified.
+pub const DEFAULT_SESSION_NAME: &str = "_default";
 
 // ---------------------------------------------------------------------------
-// ContextMetadata.
+// SessionMetadata.
 // ---------------------------------------------------------------------------
 
-/// Per-context metadata row.
+/// Per-session metadata row.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
-pub struct ContextMetadata {
+pub struct SessionMetadata {
     /// Mirrors the table key for convenience.
-    pub context_id: u64,
+    pub session_id: u64,
     pub space_id_bytes: [u8; 16],
     pub name: String,
     pub created_at_unix_nanos: u64,
@@ -61,16 +61,16 @@ pub struct ContextMetadata {
     pub tags: Vec<String>,
 }
 
-impl ContextMetadata {
+impl SessionMetadata {
     #[must_use]
     pub fn new(
-        context_id: ContextId,
+        session_id: SessionId,
         space_id: SpaceId,
         name: String,
         created_at_unix_nanos: u64,
     ) -> Self {
         Self {
-            context_id: context_id.raw(),
+            session_id: session_id.raw(),
             space_id_bytes: space_id.into(),
             name,
             created_at_unix_nanos,
@@ -82,8 +82,8 @@ impl ContextMetadata {
     }
 
     #[must_use]
-    pub fn context_id(&self) -> ContextId {
-        ContextId(self.context_id)
+    pub fn session_id(&self) -> SessionId {
+        SessionId(self.session_id)
     }
 
     #[must_use]
@@ -92,8 +92,8 @@ impl ContextMetadata {
     }
 }
 
-impl redb::Value for ContextMetadata {
-    type SelfType<'a> = ContextMetadata;
+impl redb::Value for SessionMetadata {
+    type SelfType<'a> = SessionMetadata;
     type AsBytes<'a> = Vec<u8>;
 
     fn fixed_width() -> Option<usize> {
@@ -108,8 +108,8 @@ impl redb::Value for ContextMetadata {
         // at arbitrary alignment, so copy into an AlignedVec first.
         let mut buf = rkyv::AlignedVec::with_capacity(data.len());
         buf.extend_from_slice(data);
-        rkyv::from_bytes::<ContextMetadata>(&buf)
-            .expect("ContextMetadata bytes failed rkyv validation; redb file is corrupt")
+        rkyv::from_bytes::<SessionMetadata>(&buf)
+            .expect("SessionMetadata bytes failed rkyv validation; redb file is corrupt")
     }
 
     fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
@@ -118,12 +118,12 @@ impl redb::Value for ContextMetadata {
         Self: 'b,
     {
         rkyv::to_bytes::<_, 256>(value)
-            .expect("ContextMetadata is rkyv-serializable")
+            .expect("SessionMetadata is rkyv-serializable")
             .into_vec()
     }
 
     fn type_name() -> redb::TypeName {
-        redb::TypeName::new("brain_metadata::ContextMetadata")
+        redb::TypeName::new("brain_metadata::SessionMetadata")
     }
 }
 
@@ -134,7 +134,7 @@ impl redb::Value for ContextMetadata {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use brain_core::{SpaceId, ContextId};
+    use brain_core::{SpaceId, SessionId};
     use redb::{Database, ReadableDatabase};
 
     fn aid(byte: u8) -> SpaceId {
@@ -147,42 +147,42 @@ mod tests {
         Database::create(dir.path().join("test.redb")).expect("create redb")
     }
 
-    fn sample(context_id: u64, space_byte: u8, name: &str) -> ContextMetadata {
-        ContextMetadata::new(
-            ContextId(context_id),
+    fn sample(session_id: u64, space_byte: u8, name: &str) -> SessionMetadata {
+        SessionMetadata::new(
+            SessionId(session_id),
             aid(space_byte),
             name.to_string(),
             1_700_000_000_000_000_000,
         )
     }
 
-    // ----- contexts table ------------------------------------------------
+    // ----- sessions table ------------------------------------------------
 
     #[test]
-    fn contexts_insert_get_by_id() {
+    fn sessions_insert_get_by_id() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
         let m = sample(100, 0x42, "alpha");
 
         let wtxn = db.begin_write().unwrap();
         {
-            let mut t = wtxn.open_table(CONTEXTS_TABLE).unwrap();
+            let mut t = wtxn.open_table(SESSIONS_TABLE).unwrap();
             t.insert(&100u64, &m).unwrap();
         }
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(CONTEXTS_TABLE).unwrap();
+        let t = rtxn.open_table(SESSIONS_TABLE).unwrap();
         let got = t.get(&100u64).unwrap().unwrap().value();
         assert_eq!(got, m);
-        assert_eq!(got.context_id(), ContextId(100));
+        assert_eq!(got.session_id(), SessionId(100));
         assert_eq!(got.space_id(), aid(0x42));
     }
 
-    // ----- context_names index ------------------------------------------
+    // ----- session_names index ------------------------------------------
 
     #[test]
-    fn context_names_lookup_by_space_and_name() {
+    fn session_names_lookup_by_space_and_name() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
         let space_a = aid(0xAA);
@@ -190,14 +190,14 @@ mod tests {
 
         let wtxn = db.begin_write().unwrap();
         {
-            let mut t = wtxn.open_table(CONTEXT_NAMES_TABLE).unwrap();
+            let mut t = wtxn.open_table(SESSION_NAMES_TABLE).unwrap();
             t.insert(&(&space_a_bytes, "personal"), &101u64).unwrap();
             t.insert(&(&space_a_bytes, "work"), &102u64).unwrap();
         }
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(CONTEXT_NAMES_TABLE).unwrap();
+        let t = rtxn.open_table(SESSION_NAMES_TABLE).unwrap();
         let v = t.get(&(&space_a_bytes, "personal")).unwrap().unwrap();
         assert_eq!(v.value(), 101);
         let v = t.get(&(&space_a_bytes, "work")).unwrap().unwrap();
@@ -206,10 +206,10 @@ mod tests {
         assert!(t.get(&(&space_a_bytes, "nonexistent")).unwrap().is_none());
     }
 
-    // ----- space_contexts index -----------------------------------------
+    // ----- space_sessions index -----------------------------------------
 
     #[test]
-    fn space_contexts_range_scan_for_space() {
+    fn space_sessions_range_scan_for_space() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
         let space_a: [u8; 16] = aid(0xAA).into();
@@ -217,7 +217,7 @@ mod tests {
 
         let wtxn = db.begin_write().unwrap();
         {
-            let mut t = wtxn.open_table(SPACE_CONTEXTS_TABLE).unwrap();
+            let mut t = wtxn.open_table(SPACE_SESSIONS_TABLE).unwrap();
             t.insert(&(space_a, 100u64), &()).unwrap();
             t.insert(&(space_a, 200u64), &()).unwrap();
             t.insert(&(space_a, 300u64), &()).unwrap();
@@ -226,7 +226,7 @@ mod tests {
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(SPACE_CONTEXTS_TABLE).unwrap();
+        let t = rtxn.open_table(SPACE_SESSIONS_TABLE).unwrap();
         // Range scan: all entries for space_a.
         let start = (space_a, 0u64);
         let end = (space_a, u64::MAX);
@@ -246,8 +246,8 @@ mod tests {
 
     #[test]
     fn cross_space_name_isolation() {
-        // two spaces can each have a context named
-        // "personal"; they're distinct (different ContextIds).
+        // two spaces can each have a session named
+        // "personal"; they're distinct (different SessionIds).
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
         let space_a: [u8; 16] = aid(0xAA).into();
@@ -255,14 +255,14 @@ mod tests {
 
         let wtxn = db.begin_write().unwrap();
         {
-            let mut t = wtxn.open_table(CONTEXT_NAMES_TABLE).unwrap();
+            let mut t = wtxn.open_table(SESSION_NAMES_TABLE).unwrap();
             t.insert(&(&space_a, "personal"), &1001u64).unwrap();
             t.insert(&(&space_b, "personal"), &2002u64).unwrap();
         }
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(CONTEXT_NAMES_TABLE).unwrap();
+        let t = rtxn.open_table(SESSION_NAMES_TABLE).unwrap();
         assert_eq!(
             t.get(&(&space_a, "personal")).unwrap().unwrap().value(),
             1001
@@ -289,13 +289,13 @@ mod tests {
 
         let wtxn = db.begin_write().unwrap();
         {
-            let mut t = wtxn.open_table(CONTEXTS_TABLE).unwrap();
+            let mut t = wtxn.open_table(SESSIONS_TABLE).unwrap();
             t.insert(&500u64, &m).unwrap();
         }
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(CONTEXTS_TABLE).unwrap();
+        let t = rtxn.open_table(SESSIONS_TABLE).unwrap();
         let got = t.get(&500u64).unwrap().unwrap().value();
         assert_eq!(
             got.description.as_deref(),
@@ -308,7 +308,7 @@ mod tests {
     // ----- Naming constants sanity --------------------------------------
 
     #[test]
-    fn default_context_name_uses_reserved_prefix() {
-        assert!(DEFAULT_CONTEXT_NAME.starts_with(RESERVED_NAME_PREFIX));
+    fn default_session_name_uses_reserved_prefix() {
+        assert!(DEFAULT_SESSION_NAME.starts_with(RESERVED_NAME_PREFIX));
     }
 }

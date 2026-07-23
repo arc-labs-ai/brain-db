@@ -48,7 +48,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use brain_core::{SpaceId, ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
+use brain_core::{SpaceId, SessionId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
 use brain_metadata::tables::edge::{
     derived_by, list_memory_edges_from, origin, zero_disambiguator,
 };
@@ -464,7 +464,7 @@ async fn do_auto_edge_cycle(
             lsn: 0,
             event_type: EventType::StageCompleted,
             memory_id: source_id,
-            context_id: ContextId::default(),
+            session_id: SessionId::default(),
             kind: MemoryKind::Episodic,
             salience: 0.0,
             timestamp_unix_nanos: ts,

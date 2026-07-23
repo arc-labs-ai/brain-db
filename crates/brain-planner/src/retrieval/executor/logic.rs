@@ -1021,7 +1021,7 @@ fn invoke_semantic(
     // restrict every HNSW visit to that context set. The semantic
     // closure already reads MemoryMetadata per visit, so adding the
     // check is free; cost stays bounded by HNSW visits, not corpus N.
-    filters.context_ids = req.context_filter.clone();
+    filters.session_ids = req.session_filter.clone();
 
     // Adaptive `ef` for filtered ANN. When a structural filter is
     // active the graph traversal can land on ineligible nodes and
@@ -1031,7 +1031,7 @@ fn invoke_semantic(
     // cause graph rider hits to outrank semantic on near-ties). 500
     // is the spec-range hard ceiling for `ef_search`, so clamp.
     const FILTERED_EF_CEILING: usize = 500;
-    let ef_search_effective = if filters.context_ids.is_empty() {
+    let ef_search_effective = if filters.session_ids.is_empty() {
         ef_search
     } else {
         ef_search.saturating_mul(4).min(FILTERED_EF_CEILING)
@@ -1628,7 +1628,7 @@ fn invoke_lexical(
     apply_pre_filter_to_lexical(&planned.pre_filter, &mut filters);
     // Same front gate as the semantic invocation — BM25 ranks within
     // the requested context universe only.
-    filters.context_ids = req.context_filter.clone();
+    filters.session_ids = req.session_filter.clone();
 
     let mut terms = lexical_content_terms(text);
     for extra in extra_terms {
@@ -1662,7 +1662,7 @@ fn invoke_lexical(
     // (Memory vs Statement), so fusion merges them without collision.
     if include_statements {
         let mut stmt_filters = LexicalFilters {
-            context_ids: req.context_filter.clone(),
+            session_ids: req.session_filter.clone(),
             ..Default::default()
         };
         apply_pre_filter_to_lexical_statement(&planned.pre_filter, &mut stmt_filters);

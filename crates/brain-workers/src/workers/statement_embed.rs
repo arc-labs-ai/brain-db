@@ -648,7 +648,7 @@ mod tests {
     }
 
     use super::*;
-    use brain_core::{ContextId, EntityId, ExtractorId, MemoryId, PredicateId, StatementKind};
+    use brain_core::{SessionId, EntityId, ExtractorId, MemoryId, PredicateId, StatementKind};
     use brain_core::{Entity, EntityType, EvidenceEntry, EvidenceRef};
     use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
     use brain_index::statement_hnsw::StatementHnswParams;
@@ -808,7 +808,7 @@ mod tests {
 
         let stmt_id = StatementId::new();
         let evidence = EvidenceRef::inline_from_slice(&[EvidenceEntry::from_parts(
-            MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+            MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
             0.9,
             now(),
             ExtractorId::from(0),
@@ -907,7 +907,7 @@ mod tests {
         let pred_id = predicate_intern_or_get(&wtxn, "test", "ran", 0, now()).unwrap();
         let stmt_id = StatementId::new();
         let evidence = EvidenceRef::inline_from_slice(&[EvidenceEntry::from_parts(
-            MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+            MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
             0.9,
             now(),
             ExtractorId::from(0),
@@ -1020,7 +1020,7 @@ mod tests {
             wtxn.commit().unwrap();
         }
         let evidence = EvidenceRef::inline_from_slice(&[EvidenceEntry::from_parts(
-            MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+            MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
             0.9,
             now(),
             ExtractorId::from(0),

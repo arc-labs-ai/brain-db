@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use brain_core::{
-    SpaceId, ContextId, EntityId, ExtractorId, MemoryId, MemoryKind, NodeRef, Salience,
+    SpaceId, SessionId, EntityId, ExtractorId, MemoryId, MemoryKind, NodeRef, Salience,
 };
 use brain_core::{
     Entity, EntityType, EvidenceEntry, EvidenceRef, PredicateId, Statement, StatementId,
@@ -167,7 +167,7 @@ fn upsert_memory(writer: &RealWriterHandle, id: MemoryId) {
         vector: Box::new([0.0f32; VECTOR_DIM]),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),
-        context: ContextId::DEFAULT,
+        session_id: SessionId::DEFAULT,
         created_at_unix_nanos: NOW,
         occurred_at_unix_nanos: None,
         arena_slot: id.slot(),

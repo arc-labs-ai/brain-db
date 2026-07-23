@@ -49,7 +49,7 @@ pub fn build_executor_with_lens(
                     vector: enc.vector,
                     salience: enc.salience_initial,
                     kind: enc.kind,
-                    context_id: enc.context_id,
+                    session_id: enc.session_id,
                     created_at_unix_nanos: enc.created_at_unix_nanos,
                 },
             );

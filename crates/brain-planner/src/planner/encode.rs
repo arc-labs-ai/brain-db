@@ -13,7 +13,7 @@
 //! 7. Edges
 //! 8. Response
 
-use brain_core::{ContextId, EdgeKind, MemoryId, MemoryKind, RequestId};
+use brain_core::{SessionId, EdgeKind, MemoryId, MemoryKind, RequestId};
 use brain_protocol::envelope::request::EncodeRequest;
 
 use crate::config::PlannerConfig;
@@ -73,7 +73,7 @@ pub fn plan_encode_inner(
             text: req.text.clone(),
             cache_lookup: true,
         },
-        context_resolution: ContextResolutionStep::Explicit(ContextId::from(req.context_id)),
+        context_resolution: ContextResolutionStep::Explicit(SessionId::from(req.session_id)),
         allocation: SlotAllocationStep {
             arena_grow_if_needed: true,
         },
@@ -174,7 +174,7 @@ mod tests {
     fn base_request() -> EncodeRequest {
         EncodeRequest {
             text: "hello".into(),
-            context_id: 42,
+            session_id: 42,
             request_id: [1u8; 16],
             txn_id: None,
             occurred_at_unix_nanos: None,
@@ -196,7 +196,7 @@ mod tests {
         let plan = unwrap_encode(plan_encode(&base_request(), &PlannerContext::default()).unwrap());
         assert_eq!(plan.shard, 0);
         match plan.context_resolution {
-            ContextResolutionStep::Explicit(id) => assert_eq!(id, ContextId(42)),
+            ContextResolutionStep::Explicit(id) => assert_eq!(id, SessionId(42)),
             other => panic!("expected Explicit, got {other:?}"),
         }
         assert_eq!(
