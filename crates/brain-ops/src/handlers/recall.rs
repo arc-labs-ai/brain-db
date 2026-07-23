@@ -2030,6 +2030,21 @@ fn build_recall_trace(meta: &QueryMetadata, ctx: &OpsContext) -> Result<RecallTr
         .collect();
     let candidate_texts = fetch_candidate_texts(&candidate_ids, ctx)?;
 
+    // The graph lane surfaces typed items (entities / relations), not memories —
+    // resolving those to display labels needs the metadata tables. Open one read
+    // txn for the whole trace build, but only when a non-memory candidate is
+    // actually present (so the memory-only fast case opens nothing extra).
+    let has_typed = meta.retriever_candidates.iter().any(|(_, cands)| {
+        cands
+            .iter()
+            .any(|(id, _)| !matches!(id, RankedItemId::Memory(_)))
+    });
+    let typed_rtxn = if has_typed {
+        ctx.executor.metadata.read_txn().ok()
+    } else {
+        None
+    };
+
     let retrievers = meta
         .retriever_outcomes
         .iter()
@@ -2049,13 +2064,13 @@ fn build_recall_trace(meta: &QueryMetadata, ctx: &OpsContext) -> Result<RecallTr
                 .map(|(_, cands)| {
                     cands
                         .iter()
-                        .filter_map(|(id, score)| match id {
-                            RankedItemId::Memory(mid) => Some(RecallTraceCandidate {
-                                memory_id: mid.raw(),
-                                text: candidate_texts.get(mid).cloned().unwrap_or_default(),
-                                score: *score,
-                            }),
-                            _ => None,
+                        .map(|(id, score)| {
+                            candidate_from_ranked(
+                                typed_rtxn.as_ref(),
+                                id,
+                                *score,
+                                &candidate_texts,
+                            )
                         })
                         .collect()
                 })
@@ -2199,6 +2214,118 @@ fn dropped_ids_wire(ids: &[RankedItemId]) -> Vec<RecallTraceDroppedId> {
 /// maps to an empty string rather than a fatal error: an observability
 /// payload losing one candidate's text is not the same failure class as a
 /// missing final answer row.
+/// Turn one ranked retriever candidate into its wire trace form, resolving a
+/// display label per item kind. Memory labels come from the batched
+/// `memory_texts`; the graph lane's typed items (entity / relation / statement)
+/// are resolved against `typed_rtxn` (opened once by the caller, `None` on the
+/// memory-only fast path). Every lookup is best-effort — a missing row degrades
+/// to an empty/partial label rather than dropping the candidate, so the count
+/// shown in the pipeline always matches the list.
+fn candidate_from_ranked(
+    typed_rtxn: Option<&redb::ReadTransaction>,
+    id: &RankedItemId,
+    score: f32,
+    memory_texts: &HashMap<MemoryId, String>,
+) -> RecallTraceCandidate {
+    use brain_protocol::ops::memory::RecallCandidateKind;
+    match id {
+        RankedItemId::Memory(mid) => RecallTraceCandidate {
+            item_id: mid.raw(),
+            kind: RecallCandidateKind::Memory,
+            text: memory_texts.get(mid).cloned().unwrap_or_default(),
+            score,
+        },
+        RankedItemId::Entity(eid) => RecallTraceCandidate {
+            item_id: u128::from_be_bytes(eid.to_bytes()),
+            kind: RecallCandidateKind::Entity,
+            text: typed_rtxn
+                .and_then(|r| brain_metadata::entity_get(r, *eid).ok().flatten())
+                .map(|e| e.canonical_name)
+                .unwrap_or_default(),
+            score,
+        },
+        RankedItemId::Relation(rid) => RecallTraceCandidate {
+            item_id: u128::from_be_bytes(rid.to_bytes()),
+            kind: RecallCandidateKind::Relation,
+            text: typed_rtxn
+                .map(|r| render_relation_label(r, *rid))
+                .unwrap_or_default(),
+            score,
+        },
+        RankedItemId::Statement(sid) => RecallTraceCandidate {
+            item_id: u128::from_be_bytes(sid.to_bytes()),
+            kind: RecallCandidateKind::Statement,
+            text: typed_rtxn
+                .map(|r| render_statement_label(r, *sid))
+                .unwrap_or_default(),
+            score,
+        },
+    }
+}
+
+/// "From —namespace:name→ To" for a relation candidate; partial when a lookup
+/// misses.
+fn render_relation_label(rtxn: &redb::ReadTransaction, rid: brain_core::RelationId) -> String {
+    let Ok(Some(rel)) = brain_metadata::relation_get(rtxn, rid) else {
+        return String::new();
+    };
+    let name = |eid| {
+        brain_metadata::entity_get(rtxn, eid)
+            .ok()
+            .flatten()
+            .map(|e| e.canonical_name)
+            .unwrap_or_default()
+    };
+    let pred = brain_metadata::relation_type_get(rtxn, rel.relation_type)
+        .ok()
+        .flatten()
+        .map(|rt| format!("{}:{}", rt.namespace, rt.name))
+        .unwrap_or_else(|| "related_to".to_string());
+    format!("{} —{}→ {}", name(rel.from_entity), pred, name(rel.to_entity))
+}
+
+/// "Subject predicate Object" for a statement candidate; partial when a lookup
+/// misses.
+fn render_statement_label(rtxn: &redb::ReadTransaction, sid: brain_core::StatementId) -> String {
+    use brain_core::nodes::statement::{StatementObject, StatementValue, SubjectRef};
+    let Ok(Some(st)) = brain_metadata::statement_get(rtxn, sid) else {
+        return String::new();
+    };
+    let ent_name = |eid| {
+        brain_metadata::entity_get(rtxn, eid)
+            .ok()
+            .flatten()
+            .map(|e| e.canonical_name)
+            .unwrap_or_default()
+    };
+    let subject = match st.subject {
+        SubjectRef::Entity(e) => ent_name(e),
+        SubjectRef::Memory(_) => "(memory)".to_string(),
+        _ => String::new(),
+    };
+    let predicate = brain_metadata::predicate_get(rtxn, st.predicate)
+        .ok()
+        .flatten()
+        .map(|p| format!("{}:{}", p.namespace, p.name))
+        .unwrap_or_default();
+    let object = match st.object {
+        StatementObject::Entity(e) => ent_name(e),
+        StatementObject::Value(v) => match v {
+            StatementValue::Text(s) => s,
+            StatementValue::Integer(i) => i.to_string(),
+            StatementValue::Float(f) => f.to_string(),
+            StatementValue::Bool(b) => b.to_string(),
+            StatementValue::UnixNanos(n) => n.to_string(),
+            StatementValue::Blob(_) => "(blob)".to_string(),
+        },
+        StatementObject::Memory(_) => "(memory)".to_string(),
+        StatementObject::Statement(_) => "(statement)".to_string(),
+    };
+    format!("{subject} {predicate} {object}")
+        .trim()
+        .to_string()
+}
+
 fn fetch_candidate_texts(
     ids: &HashSet<MemoryId>,
     ctx: &OpsContext,

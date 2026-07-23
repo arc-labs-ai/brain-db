@@ -918,11 +918,32 @@ pub struct RecallTraceRetriever {
     pub candidates: Vec<RecallTraceCandidate>,
 }
 
-/// One retriever-lane candidate surfaced in full-detail trace mode.
+/// The kind of typed-graph item a retriever lane surfaced. The graph lane
+/// emits entities and relations (not memories), so a candidate is not always a
+/// `Memory` — `kind` tells the client how to interpret `item_id` and render it.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
+#[repr(u8)]
+pub enum RecallCandidateKind {
+    Memory = 0,
+    Statement = 1,
+    Entity = 2,
+    Relation = 3,
+}
+
+/// One retriever-lane candidate surfaced in full-detail trace mode. The
+/// semantic and lexical lanes surface memories; the graph lane surfaces typed
+/// items (entities / relations), so `item_id` is interpreted against `kind`.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RecallTraceCandidate {
-    pub memory_id: WireMemoryId,
-    /// Full-detail mode only; truncated server-side.
+    /// Raw id of the surfaced item — a `MemoryId`, `StatementId`, `EntityId`,
+    /// or `RelationId` depending on `kind`. All are `u128` on the wire.
+    pub item_id: WireMemoryId,
+    /// How to interpret `item_id`.
+    pub kind: RecallCandidateKind,
+    /// A human-readable label for the item — the memory text, entity name, or a
+    /// rendered statement/relation. Full-detail mode only; truncated server-side.
     pub text: String,
     /// This lane's raw score for this item.
     pub score: f32,
