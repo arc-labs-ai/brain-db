@@ -35,7 +35,7 @@ pub enum StatementKind {
     Attribute,
     /// An entity is linked to another entity. Accumulates as a set.
     Relation,
-    /// How the agent should behave for/about a subject. Single per key.
+    /// How the space should behave for/about a subject. Single per key.
     Directive,
     /// A user-declared kind (byte `>= 6`), resolved against the kind
     /// registry for its [`KindBehavior`].

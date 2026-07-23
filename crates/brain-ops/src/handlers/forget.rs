@@ -31,13 +31,13 @@ pub async fn handle_forget(
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id = WriteId::from_request(
         brain_core::RequestId::from(req.request_id),
-        ctx.executor.caller_agent,
+        ctx.executor.caller_space,
     );
     let request_hash = hash_forget_request(&ForgetOp {
         request_id: brain_core::RequestId::from(req.request_id),
         memory_id,
         mode: req.mode,
-        agent_id: ctx.executor.caller_agent,
+        space_id: ctx.executor.caller_space,
     });
 
     // Idempotency: a true replay (same hash) returns the cached
@@ -95,7 +95,7 @@ pub async fn handle_forget(
             reason: 1, // ClientRequest
             at_unix_nanos: now_unix_nanos(),
         };
-        let write = Write::single(write_id, ctx.executor.caller_agent, phase)
+        let write = Write::single(write_id, ctx.executor.caller_space, phase)
             .with_request_hash(request_hash);
         let ack = real_writer
             .submit(write)
@@ -170,7 +170,7 @@ async fn handle_forget_in_txn(
         request_id: brain_core::RequestId::from(req.request_id),
         memory_id,
         mode: req.mode,
-        agent_id: ctx.executor.caller_agent,
+        space_id: ctx.executor.caller_space,
     });
 
     // Replay check.
@@ -244,7 +244,7 @@ async fn handle_forget_in_txn(
         request_id: req.request_id,
         request_hash,
         created_at_unix_nanos: crate::txn::now_unix_nanos_pub(),
-        agent_id: ctx.executor.caller_agent,
+        space_id: ctx.executor.caller_space,
     };
     ctx.txn_store.with_buffer(txn_id, |buf| {
         buf.forgets.push(buffered);

@@ -213,14 +213,14 @@ fn write_relation_link(
         Some(_) => 2,
         None => 1,
     };
-    // The WAL payload carries the owning `(namespace, agent)`, so recovery
+    // The WAL payload carries the owning `(namespace, space)`, so recovery
     // rebuilds the relation sidecar (and its scope-prefixed evidence index)
     // under the real tenant — cross-tenant isolation on the typed-graph
     // holds across a restart.
-    let scope = RowScope::from_bytes(p.namespace_id.raw(), <[u8; 16]>::from(p.agent_id));
+    let scope = RowScope::from_bytes(p.namespace_id.raw(), <[u8; 16]>::from(p.space_id));
     let meta = RelationMetadata {
         namespace_id: scope.namespace_id,
-        agent_id_bytes: scope.agent_id_bytes,
+        space_id_bytes: scope.space_id_bytes,
         from_tag: p.from.tag(),
         from_bytes: p.from.id_bytes(),
         to_tag: p.to.tag(),
@@ -260,7 +260,7 @@ fn write_relation_link(
             t.insert(
                 &(
                     scope.namespace_id,
-                    scope.agent_id_bytes,
+                    scope.space_id_bytes,
                     mem.to_be_bytes(),
                     p.relation_id.to_bytes(),
                 ),

@@ -109,7 +109,7 @@ pub async fn handle_encode_vector_direct(
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id = WriteId::from_request(
         brain_core::RequestId::from(req.request_id),
-        ctx.executor.caller_agent,
+        ctx.executor.caller_space,
     );
     let context_id = ContextId::from(req.context_id);
     let kind = MemoryKind::from(req.kind);
@@ -125,7 +125,7 @@ pub async fn handle_encode_vector_direct(
         *blake3::hash(req.text.as_bytes()).as_bytes()
     };
     let request_hash =
-        encode_vector_direct_request_hash(&req, server_fp, ctx.executor.caller_agent);
+        encode_vector_direct_request_hash(&req, server_fp, ctx.executor.caller_space);
     match real_writer.idempotency_lookup(write_id, Some(request_hash)) {
         crate::writer::submit::CacheLookup::Hit(cached) => {
             return reconstruct_response(ctx, &req, &cached, salience, server_fp);
@@ -149,7 +149,7 @@ pub async fn handle_encode_vector_direct(
                 salience,
                 auto_edges_added: 0,
                 lsn: 0,
-                agent_id: ctx.executor.caller_agent.into(),
+                space_id: ctx.executor.caller_space.into(),
                 context_id: req.context_id,
                 kind: req.kind,
                 created_at_unix_nanos: 0,
@@ -221,7 +221,7 @@ pub async fn handle_encode_vector_direct(
     }
 
     // 9. Submit.
-    let write = Write::from_phases(write_id, ctx.executor.caller_agent, phases)
+    let write = Write::from_phases(write_id, ctx.executor.caller_space, phases)
         .with_request_hash(request_hash);
     let ack = real_writer
         .submit(write)
@@ -242,7 +242,7 @@ pub async fn handle_encode_vector_direct(
         salience,
         auto_edges_added,
         lsn: ack.lsn_first.raw(),
-        agent_id: ctx.executor.caller_agent.into(),
+        space_id: ctx.executor.caller_space.into(),
         context_id: req.context_id,
         kind: req.kind,
         created_at_unix_nanos: created_at,
@@ -305,7 +305,7 @@ fn lookup_fingerprint(
             OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
         })?;
     let key = brain_metadata::tables::fingerprint::fingerprint_key(
-        ctx.executor.caller_agent,
+        ctx.executor.caller_space,
         context_id,
         &content_hash,
     );
@@ -355,7 +355,7 @@ fn compute_edge_outcomes(
 fn encode_vector_direct_request_hash(
     req: &EncodeVectorDirectRequest,
     embedding_model_fp: [u8; 16],
-    agent: brain_core::AgentId,
+    space: brain_core::SpaceId,
 ) -> [u8; 32] {
     let op = EncodeOp {
         request_id: brain_core::RequestId::from(req.request_id),
@@ -380,7 +380,7 @@ fn encode_vector_direct_request_hash(
         } else {
             *blake3::hash(req.text.as_bytes()).as_bytes()
         },
-        agent_id: agent,
+        space_id: space,
     };
     hash_encode_request(&op)
 }
@@ -446,7 +446,7 @@ fn reconstruct_response(
         salience,
         auto_edges_added,
         lsn: cached.lsn_first.raw(),
-        agent_id: ctx.executor.caller_agent.into(),
+        space_id: ctx.executor.caller_space.into(),
         context_id: req.context_id,
         kind: req.kind,
         created_at_unix_nanos: created_at,

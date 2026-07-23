@@ -1,12 +1,12 @@
 //! `GRAPH_FETCH` handler — paginated export of the caller's typed graph.
 //!
 //! Not RECALL: no cue, no ranking, no relevance suppression. It walks the
-//! caller's `(namespace, agent)` typed-graph state and returns a page of
+//! caller's `(namespace, space)` typed-graph state and returns a page of
 //! nodes + edges plus an opaque keyset cursor.
 //!
 //! ## Pagination spine
 //!
-//! The one typed-graph index that is `(namespace, agent)`-prefixed is
+//! The one typed-graph index that is `(namespace, space)`-prefixed is
 //! `STATEMENTS_BY_SUBJECT_TABLE`, so that is the pagination spine: each page
 //! ranges it forward from the cursor and takes up to `limit` statements. The
 //! entity set is *derived from traversal* — subjects and entity-objects of
@@ -66,7 +66,7 @@ use crate::error::OpError;
 /// minted by an incompatible server build → treat as stale.
 const CURSOR_VERSION: u8 = 1;
 
-/// Serialized `STATEMENTS_BY_SUBJECT` key: `ns(4) + agent(16) + subject(16)
+/// Serialized `STATEMENTS_BY_SUBJECT` key: `ns(4) + space(16) + subject(16)
 /// + kind(1) + predicate(4) + is_current(1) + statement_id(16)`.
 const STMT_KEY_LEN: usize = 4 + 16 + 16 + 1 + 4 + 1 + 16;
 
@@ -134,7 +134,7 @@ pub fn handle_graph_fetch(
         Some(decode_cursor(&req.cursor, flags)?)
     };
 
-    let scope = RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_agent);
+    let scope = RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
     let rtxn = ctx
         .executor
         .metadata
@@ -146,8 +146,8 @@ pub fn handle_graph_fetch(
         .map_err(|e| OpError::Internal(format!("open statements_by_subject: {e}")))?;
 
     let ns = scope.namespace_id;
-    let ag = scope.agent_id_bytes;
-    // Whole-agent range over the subject-anchored index.
+    let ag = scope.space_id_bytes;
+    // Whole-space range over the subject-anchored index.
     let lo_key: StmtKey = (ns, ag, [0u8; 16], 0, 0, 0, [0u8; 16]);
     let hi_key: StmtKey = (
         ns,

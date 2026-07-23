@@ -21,7 +21,7 @@ fn memory_text_schema_matches_spec() {
     let expected = &[
         ("memory_id", "bytes"),
         ("text", "text"),
-        ("agent_id", "bytes"),
+        ("space_id", "bytes"),
         ("kind", "u64"),
         ("created_at", "u64"),
         ("context", "u64"),

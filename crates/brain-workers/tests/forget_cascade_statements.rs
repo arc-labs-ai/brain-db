@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use brain_core::{
-    AgentId, ContextId, EntityId, ExtractorId, MemoryId, MemoryKind, NodeRef, Salience,
+    SpaceId, ContextId, EntityId, ExtractorId, MemoryId, MemoryKind, NodeRef, Salience,
 };
 use brain_core::{
     Entity, EntityType, EvidenceEntry, EvidenceRef, PredicateId, Statement, StatementId,
@@ -175,7 +175,7 @@ fn upsert_memory(writer: &RealWriterHandle, id: MemoryId) {
         content_hash: None,
         deduplicate: false,
     };
-    let write = Write::single(WriteId::new(), AgentId::default(), phase);
+    let write = Write::single(WriteId::new(), SpaceId::default(), phase);
     // We block on the future via a dummy tokio runtime — the writer
     // returns immediately for the in-process test path.
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -192,7 +192,7 @@ fn tombstone_memory(writer: &RealWriterHandle, id: MemoryId, mode: TombstoneMode
         reason: 0,
         at_unix_nanos: NOW + 1,
     };
-    let write = Write::single(WriteId::new(), AgentId::default(), phase);
+    let write = Write::single(WriteId::new(), SpaceId::default(), phase);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

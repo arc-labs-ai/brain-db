@@ -1,25 +1,25 @@
-//! `agents` table: per-agent metadata.
+//! `spaces` table: per-space metadata.
 //!
 //! ## Minimal shape
 //!
-//! The row stores the load-bearing fields — AgentId, display name,
+//! The row stores the load-bearing fields — SpaceId, display name,
 //! created_at, and stats (memory/context counts) — and defers
 //! "configuration overrides". Typical workloads don't use overrides,
 //! and an `Option<config>` can be added later without a migration.
 
-use brain_core::AgentId;
+use brain_core::SpaceId;
 use redb::TableDefinition;
 
-/// The `agents` table. Key is the `AgentId`'s 16-byte UUID raw form;
-/// value is [`AgentMetadata`].
-pub const AGENTS_TABLE: TableDefinition<'static, [u8; 16], AgentMetadata> =
-    TableDefinition::new("agents");
+/// The `spaces` table. Key is the `SpaceId`'s 16-byte UUID raw form;
+/// value is [`SpaceMetadata`].
+pub const SPACES_TABLE: TableDefinition<'static, [u8; 16], SpaceMetadata> =
+    TableDefinition::new("spaces");
 
-/// Per-agent metadata row.
+/// Per-space metadata row.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
-pub struct AgentMetadata {
-    pub agent_id_bytes: [u8; 16],
+pub struct SpaceMetadata {
+    pub space_id_bytes: [u8; 16],
     pub display_name: Option<String>,
     pub created_at_unix_nanos: u64,
     pub last_active_at_unix_nanos: u64,
@@ -29,15 +29,15 @@ pub struct AgentMetadata {
     pub context_count: u32,
 }
 
-impl AgentMetadata {
+impl SpaceMetadata {
     #[must_use]
     pub fn new(
-        agent_id: AgentId,
+        space_id: SpaceId,
         display_name: Option<String>,
         created_at_unix_nanos: u64,
     ) -> Self {
         Self {
-            agent_id_bytes: agent_id.into(),
+            space_id_bytes: space_id.into(),
             display_name,
             created_at_unix_nanos,
             last_active_at_unix_nanos: created_at_unix_nanos,
@@ -47,13 +47,13 @@ impl AgentMetadata {
     }
 
     #[must_use]
-    pub fn agent_id(&self) -> AgentId {
-        AgentId::from(self.agent_id_bytes)
+    pub fn space_id(&self) -> SpaceId {
+        SpaceId::from(self.space_id_bytes)
     }
 }
 
-impl redb::Value for AgentMetadata {
-    type SelfType<'a> = AgentMetadata;
+impl redb::Value for SpaceMetadata {
+    type SelfType<'a> = SpaceMetadata;
     type AsBytes<'a> = Vec<u8>;
 
     fn fixed_width() -> Option<usize> {
@@ -68,8 +68,8 @@ impl redb::Value for AgentMetadata {
         // at arbitrary alignment, so copy into an AlignedVec first.
         let mut buf = rkyv::AlignedVec::with_capacity(data.len());
         buf.extend_from_slice(data);
-        rkyv::from_bytes::<AgentMetadata>(&buf)
-            .expect("AgentMetadata bytes failed rkyv validation; redb file is corrupt")
+        rkyv::from_bytes::<SpaceMetadata>(&buf)
+            .expect("SpaceMetadata bytes failed rkyv validation; redb file is corrupt")
     }
 
     fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
@@ -78,22 +78,22 @@ impl redb::Value for AgentMetadata {
         Self: 'b,
     {
         rkyv::to_bytes::<_, 256>(value)
-            .expect("AgentMetadata is rkyv-serializable")
+            .expect("SpaceMetadata is rkyv-serializable")
             .into_vec()
     }
 
     fn type_name() -> redb::TypeName {
-        redb::TypeName::new("brain_metadata::AgentMetadata")
+        redb::TypeName::new("brain_metadata::SpaceMetadata")
     }
 }
 
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use brain_core::AgentId;
+    use brain_core::SpaceId;
     use redb::{Database, ReadableDatabase};
 
-    fn aid(byte: u8) -> AgentId {
+    fn aid(byte: u8) -> SpaceId {
         let mut b = [0u8; 16];
         b[15] = byte;
         b.into()
@@ -103,10 +103,10 @@ mod tests {
         Database::create(dir.path().join("test.redb")).expect("create redb")
     }
 
-    fn sample(byte: u8) -> AgentMetadata {
-        AgentMetadata::new(
+    fn sample(byte: u8) -> SpaceMetadata {
+        SpaceMetadata::new(
             aid(byte),
-            Some(format!("agent-{byte:02x}")),
+            Some(format!("space-{byte:02x}")),
             1_700_000_000_000_000_000,
         )
     }
@@ -116,17 +116,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
         let m = sample(7);
-        let key = m.agent_id_bytes;
+        let key = m.space_id_bytes;
 
         let wtxn = db.begin_write().unwrap();
         {
-            let mut t = wtxn.open_table(AGENTS_TABLE).unwrap();
+            let mut t = wtxn.open_table(SPACES_TABLE).unwrap();
             t.insert(&key, &m).unwrap();
         }
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(AGENTS_TABLE).unwrap();
+        let t = rtxn.open_table(SPACES_TABLE).unwrap();
         let got = t.get(&key).unwrap().unwrap().value();
         assert_eq!(got, m);
     }
@@ -135,21 +135,21 @@ mod tests {
     fn brain_core_type_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
-        let agent = aid(0x42);
-        let m = AgentMetadata::new(agent, None, 1_700_000_000_000_000_000);
-        let key = m.agent_id_bytes;
+        let space = aid(0x42);
+        let m = SpaceMetadata::new(space, None, 1_700_000_000_000_000_000);
+        let key = m.space_id_bytes;
 
         let wtxn = db.begin_write().unwrap();
         {
-            let mut t = wtxn.open_table(AGENTS_TABLE).unwrap();
+            let mut t = wtxn.open_table(SPACES_TABLE).unwrap();
             t.insert(&key, &m).unwrap();
         }
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(AGENTS_TABLE).unwrap();
+        let t = rtxn.open_table(SPACES_TABLE).unwrap();
         let got = t.get(&key).unwrap().unwrap().value();
-        assert_eq!(got.agent_id(), agent);
+        assert_eq!(got.space_id(), space);
         assert_eq!(got.display_name, None);
     }
 }

@@ -82,21 +82,21 @@ pub struct MtlsClaim {
     pub asserted_subject: String,
 }
 
-/// — the agent's permitted operations after AUTH_OK.
+/// — the space's permitted operations after AUTH_OK.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct AgentPermissions {
+pub struct SpacePermissions {
     pub can_encode: bool,
     pub can_recall: bool,
     pub can_plan: bool,
     pub can_reason: bool,
     pub can_forget: bool,
-    /// Typically `false` for normal agents; required for any `ADMIN_*` op.
+    /// Typically `false` for normal spaces; required for any `ADMIN_*` op.
     pub can_admin: bool,
     /// Authorizes the connection to run an op *on behalf of another
     /// identity* via the per-request `act_as` field. Distinct from the
-    /// other bits: it does not widen what the connection's own agent may
+    /// other bits: it does not widen what the connection's own space may
     /// do. Held only by a trusted service principal (an edge/gateway);
-    /// a normal agent's key never carries it. Backed by the minted-key
+    /// a normal space's key never carries it. Backed by the minted-key
     /// bit `ACT_AS = 1 << 6`.
     pub can_act_as: bool,
 }
@@ -149,15 +149,15 @@ pub struct WelcomePayload {
 // AUTH (0x02) — client → server.
 // ---------------------------------------------------------------------------
 
-/// — credentials for the agent claiming identity.
+/// — credentials for the space claiming identity.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AuthPayload {
     /// Auth method. MUST be one of the methods declared in
     /// `WelcomePayload.server_features.auth_methods` (validated at the
     /// AUTH-frame handler in the connection layer, not by [`negotiate`]).
     pub method: AuthMethod,
-    /// The credential. Identity `(namespace, agent, permissions)` is derived
-    /// entirely from this by the server — the client does NOT claim an agent.
+    /// The credential. Identity `(namespace, space, permissions)` is derived
+    /// entirely from this by the server — the client does NOT claim an space.
     pub credentials: AuthCredentials,
 }
 
@@ -170,13 +170,13 @@ pub struct AuthPayload {
 /// operations can flow.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AuthOkPayload {
-    /// Server-assigned agent_id. The client learns its identity here — it is
+    /// Server-assigned space_id. The client learns its identity here — it is
     /// derived from the presented credential, never claimed by the client.
     #[serde(with = "serde_bytes")]
-    pub agent_id: WireUuid,
-    /// Runtime shard ID this agent is bound to.
+    pub space_id: WireUuid,
+    /// Runtime shard ID this space is bound to.
     pub bound_shard_id: u16,
-    pub permissions: AgentPermissions,
+    pub permissions: SpacePermissions,
     /// Owning tenant the connection resolved to (server-derived from auth:
     /// the API key's namespace). The client never sends this — it only
     /// surfaces what the server bound the connection to.
@@ -452,9 +452,9 @@ mod tests {
     #[test]
     fn auth_ok_payload_round_trips() {
         let original = AuthOkPayload {
-            agent_id: sample_uuid(7),
+            space_id: sample_uuid(7),
             bound_shard_id: 3,
-            permissions: AgentPermissions {
+            permissions: SpacePermissions {
                 can_encode: true,
                 can_recall: true,
                 can_plan: true,

@@ -4,7 +4,7 @@
 //! - The request itself (passed as an argument, not here).
 //! - Per-shard statistics ([`crate::ShardStats`]).
 //! - Configuration ([`crate::PlannerConfig`]).
-//! - Agent metadata (quotas) — deferred until the wiring is added.
+//! - Space metadata (quotas) — deferred until the wiring is added.
 //!
 //! The planner does **not** have access to the storage layer —
 //! planning is computation only; no I/O. The executor's context holds

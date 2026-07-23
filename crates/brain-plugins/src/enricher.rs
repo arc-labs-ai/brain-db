@@ -13,7 +13,7 @@
 
 use crate::errors::PluginResult;
 use crate::recall::RecallPlugin;
-use brain_core::AgentId;
+use brain_core::SpaceId;
 use brain_extractors::framework::item::ExtractedItem;
 
 /// Inputs handed to [`EnricherPlugin::enrich`].
@@ -21,10 +21,10 @@ use brain_extractors::framework::item::ExtractedItem;
 /// The `items` vector is borrowed mutably so the plugin can edit in
 /// place — push to add, retain to drop, mutate fields to enrich.
 pub struct EnricherInput<'a> {
-    /// Agent that originated the source text. Plugins can use this for
-    /// per-agent policy (e.g. apply only to certain agents) or for
-    /// per-agent state (per-agent vocabularies).
-    pub agent_id: AgentId,
+    /// Space that originated the source text. Plugins can use this for
+    /// per-space policy (e.g. apply only to certain spaces) or for
+    /// per-space state (per-space vocabularies).
+    pub space_id: SpaceId,
     /// Candidate items produced by the upstream extractor tiers. The
     /// plugin may push new items, mutate existing ones, or remove
     /// items by retaining a filtered subset.

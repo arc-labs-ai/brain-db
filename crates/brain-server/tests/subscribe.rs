@@ -83,8 +83,8 @@ struct Server {
 }
 
 impl Server {
-    /// Mint a FULL-permission key for `agent_id` (namespace "test").
-    fn mint(&self, agent_id: [u8; 16]) -> Vec<u8> {
+    /// Mint a FULL-permission key for `space_id` (namespace "test").
+    fn mint(&self, space_id: [u8; 16]) -> Vec<u8> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -94,7 +94,7 @@ impl Server {
                 [0u8; 16],
                 [0u8; 16],
                 "test".to_string(),
-                agent_id,
+                space_id,
                 brain_metadata::api_keys::bits::FULL,
                 Vec::new(),
                 now,
@@ -247,16 +247,16 @@ async fn complete_handshake(client: &mut TcpStream, token: &[u8]) {
     let _ = read_one_frame(client).await.expect("AUTH_OK");
 }
 
-/// A filter scoped to the caller's own agent. Under mandatory auth a
-/// subscriber may only receive its own agent's events, so `agents` must
-/// name exactly the connection's bound agent (a bare `None`/empty filter
+/// A filter scoped to the caller's own space. Under mandatory auth a
+/// subscriber may only receive its own space's events, so `spaces` must
+/// name exactly the connection's bound space (a bare `None`/empty filter
 /// is rejected as a cross-tenant leak).
-fn own_filter(agent: [u8; 16]) -> SubscriptionFilter {
+fn own_filter(space: [u8; 16]) -> SubscriptionFilter {
     SubscriptionFilter {
         contexts: None,
         kinds: None,
         similar_to: None,
-        agents: Some(vec![agent]),
+        spaces: Some(vec![space]),
         memory_ids: None,
     }
 }
@@ -305,16 +305,16 @@ async fn read_event_within(client: &mut TcpStream, within: Duration) -> Option<F
 async fn subscribe_receives_encode_events() {
     let server = start_with_shards(1).await;
 
-    // Open two connections under the SAME agent_id so encodes land on
+    // Open two connections under the SAME space_id so encodes land on
     // the same shard.
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
     let mut sub_client = TcpStream::connect(server.addr).await.expect("connect sub");
-    complete_handshake(&mut sub_client, &server.mint(agent_id)).await;
+    complete_handshake(&mut sub_client, &server.mint(space_id)).await;
 
     let mut writer_client = TcpStream::connect(server.addr)
         .await
         .expect("connect writer");
-    complete_handshake(&mut writer_client, &server.mint(agent_id)).await;
+    complete_handshake(&mut writer_client, &server.mint(space_id)).await;
 
     // SUBSCRIBE.
     let sub_stream = 5u32;
@@ -324,7 +324,7 @@ async fn subscribe_receives_encode_events() {
             Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             sub_stream,
-            RequestBody::Subscribe(subscribe_request(own_filter(agent_id))).encode(),
+            RequestBody::Subscribe(subscribe_request(own_filter(space_id))).encode(),
         ),
     )
     .await;
@@ -373,8 +373,8 @@ async fn subscribe_receives_encode_events() {
 async fn unsubscribe_emits_final_eos_and_response() {
     let server = start_with_shards(1).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, &server.mint(agent_id)).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     let sub_stream = 7u32;
     send_frame(
@@ -383,7 +383,7 @@ async fn unsubscribe_emits_final_eos_and_response() {
             Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             sub_stream,
-            RequestBody::Subscribe(subscribe_request(own_filter(agent_id))).encode(),
+            RequestBody::Subscribe(subscribe_request(own_filter(space_id))).encode(),
         ),
     )
     .await;
@@ -434,8 +434,8 @@ async fn unsubscribe_emits_final_eos_and_response() {
 async fn cancel_stream_terminates_subscription() {
     let server = start_with_shards(1).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, &server.mint(agent_id)).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     let sub_stream = 3u32;
     send_frame(
@@ -444,7 +444,7 @@ async fn cancel_stream_terminates_subscription() {
             Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             sub_stream,
-            RequestBody::Subscribe(subscribe_request(own_filter(agent_id))).encode(),
+            RequestBody::Subscribe(subscribe_request(own_filter(space_id))).encode(),
         ),
     )
     .await;
@@ -496,11 +496,11 @@ async fn subscribe_from_lsn_past_tail_is_accepted() {
     // a placeholder while WAL replay was unimplemented.
     let server = start_with_shards(1).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, &server.mint(agent_id)).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     let req = SubscribeRequest {
-        filter: own_filter(agent_id),
+        filter: own_filter(space_id),
         include_history: true,
         from_lsn: Some(123),
         max_inflight: 100,
@@ -539,11 +539,11 @@ async fn double_subscribe_with_same_stream_id_errors() {
     // (— stream IDs in use).
     let server = start_with_shards(1).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, &server.mint(agent_id)).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     let sub_stream = 15u32;
-    let req = RequestBody::Subscribe(subscribe_request(own_filter(agent_id))).encode();
+    let req = RequestBody::Subscribe(subscribe_request(own_filter(space_id))).encode();
     send_frame(
         &mut client,
         Frame::new(
@@ -590,14 +590,14 @@ async fn double_subscribe_with_same_stream_id_errors() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subscribe_from_lsn_replays_historical_encodes() {
     let server = start_with_shards(1).await;
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
 
     // 1. ENCODE two memories on a writer connection BEFORE any
     //    subscriber exists. The live event bus has no listeners, so
     //    these events are only durable in the WAL — making this a
     //    real replay test, not a live-tail test in disguise.
     let mut writer = TcpStream::connect(server.addr).await.expect("writer");
-    complete_handshake(&mut writer, &server.mint(agent_id)).await;
+    complete_handshake(&mut writer, &server.mint(space_id)).await;
     for (i, text) in ["alpha", "beta"].iter().enumerate() {
         let stream_id = ((i * 2) + 1) as u32; // 1, 3 — odd
         send_frame(
@@ -625,7 +625,7 @@ async fn subscribe_from_lsn_replays_historical_encodes() {
 
     // 2. Now open a fresh subscriber and request --start-lsn=1.
     let mut sub = TcpStream::connect(server.addr).await.expect("sub");
-    complete_handshake(&mut sub, &server.mint(agent_id)).await;
+    complete_handshake(&mut sub, &server.mint(space_id)).await;
     let sub_stream = 11u32;
     send_frame(
         &mut sub,
@@ -634,7 +634,7 @@ async fn subscribe_from_lsn_replays_historical_encodes() {
             FLAG_EOS,
             sub_stream,
             RequestBody::Subscribe(SubscribeRequest {
-                filter: own_filter(agent_id),
+                filter: own_filter(space_id),
                 include_history: false,
                 from_lsn: Some(1),
                 max_inflight: 100,
@@ -678,33 +678,33 @@ async fn subscribe_from_lsn_replays_historical_encodes() {
     server.stop().await;
 }
 
-/// `agents` filter — encodes from agent A and B; subscriber listening
-/// only to agent A receives ONLY A's events even though B's events
+/// `spaces` filter — encodes from space A and B; subscriber listening
+/// only to space A receives ONLY A's events even though B's events
 /// hit the same shard. Without this filter, a multi-tenant shard
-/// leaks every agent's events to every subscriber.
+/// leaks every space's events to every subscriber.
 ///
-/// Enabled after the per-request agent flow landed: each op now
-/// carries `agent_id` (populated from `ConnPhase::Established.agent`
-/// via `dispatch(req, caller, ctx)` → `ExecutorContext.caller_agent`
-/// → `EncodeOp.agent_id` → `EventEnvelope.agent_id`). The
-/// `SubscriptionFilter.agents` set filters server-side; subscribers
-/// only see events from agents they declared interest in.
+/// Enabled after the per-request space flow landed: each op now
+/// carries `space_id` (populated from `ConnPhase::Established.space`
+/// via `dispatch(req, caller, ctx)` → `ExecutorContext.caller_space`
+/// → `EncodeOp.space_id` → `EventEnvelope.space_id`). The
+/// `SubscriptionFilter.spaces` set filters server-side; subscribers
+/// only see events from spaces they declared interest in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subscribe_agents_filter_isolates_per_agent() {
+async fn subscribe_spaces_filter_isolates_per_space() {
     let server = start_with_shards(1).await;
 
-    let agent_a = *uuid::Uuid::now_v7().as_bytes();
-    let agent_b = *uuid::Uuid::now_v7().as_bytes();
+    let space_a = *uuid::Uuid::now_v7().as_bytes();
+    let space_b = *uuid::Uuid::now_v7().as_bytes();
 
-    // SUBSCRIBE with agents=[A] on a connection authed as A.
+    // SUBSCRIBE with spaces=[A] on a connection authed as A.
     let mut sub_a = TcpStream::connect(server.addr).await.expect("sub_a");
-    complete_handshake(&mut sub_a, &server.mint(agent_a)).await;
+    complete_handshake(&mut sub_a, &server.mint(space_a)).await;
     let sub_stream = 21u32;
     let filter = SubscriptionFilter {
         contexts: None,
         kinds: None,
         similar_to: None,
-        agents: Some(vec![agent_a]),
+        spaces: Some(vec![space_a]),
         memory_ids: None,
     };
     send_frame(
@@ -720,10 +720,10 @@ async fn subscribe_agents_filter_isolates_per_agent() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Encode from B first, then from A — both land on shard 0
-    // (single-shard test). Without the agents filter, sub_a would
+    // (single-shard test). Without the spaces filter, sub_a would
     // observe both.
     let mut writer_b = TcpStream::connect(server.addr).await.expect("writer_b");
-    complete_handshake(&mut writer_b, &server.mint(agent_b)).await;
+    complete_handshake(&mut writer_b, &server.mint(space_b)).await;
     send_frame(
         &mut writer_b,
         Frame::new(
@@ -737,7 +737,7 @@ async fn subscribe_agents_filter_isolates_per_agent() {
     let _ = read_one_frame(&mut writer_b).await.expect("enc B resp");
 
     let mut writer_a = TcpStream::connect(server.addr).await.expect("writer_a");
-    complete_handshake(&mut writer_a, &server.mint(agent_a)).await;
+    complete_handshake(&mut writer_a, &server.mint(space_a)).await;
     send_frame(
         &mut writer_a,
         Frame::new(
@@ -766,7 +766,7 @@ async fn subscribe_agents_filter_isolates_per_agent() {
     }
     assert_eq!(
         a_events, 1,
-        "agents=[A] filter should let through exactly the A event, not B's"
+        "spaces=[A] filter should let through exactly the A event, not B's"
     );
 
     server.stop().await;
@@ -777,10 +777,10 @@ async fn subscribe_from_lsn_zero_replays_everything_in_wal() {
     // from_lsn=0 means "everything still in the WAL"
     // says this is not an error.
     let server = start_with_shards(1).await;
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
 
     let mut writer = TcpStream::connect(server.addr).await.expect("writer");
-    complete_handshake(&mut writer, &server.mint(agent_id)).await;
+    complete_handshake(&mut writer, &server.mint(space_id)).await;
     send_frame(
         &mut writer,
         Frame::new(
@@ -795,7 +795,7 @@ async fn subscribe_from_lsn_zero_replays_everything_in_wal() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let mut sub = TcpStream::connect(server.addr).await.expect("sub");
-    complete_handshake(&mut sub, &server.mint(agent_id)).await;
+    complete_handshake(&mut sub, &server.mint(space_id)).await;
     let sub_stream = 17u32;
     send_frame(
         &mut sub,
@@ -804,7 +804,7 @@ async fn subscribe_from_lsn_zero_replays_everything_in_wal() {
             FLAG_EOS,
             sub_stream,
             RequestBody::Subscribe(SubscribeRequest {
-                filter: own_filter(agent_id),
+                filter: own_filter(space_id),
                 include_history: false,
                 from_lsn: Some(0),
                 max_inflight: 100,
@@ -848,9 +848,9 @@ async fn subscribe_over_stream_cap_returns_stream_limit_exceeded() {
     };
     let server = start_with_shards_and_limits(1, limits).await;
 
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    complete_handshake(&mut client, &server.mint(agent_id)).await;
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     // The receiver loop awaits each SUBSCRIBE's registration inline
     // before reading the next frame, so by the time stream 5 is handled
@@ -864,7 +864,7 @@ async fn subscribe_over_stream_cap_returns_stream_limit_exceeded() {
                 Opcode::SubscribeReq.as_u16(),
                 FLAG_EOS,
                 stream,
-                RequestBody::Subscribe(subscribe_request(own_filter(agent_id))).encode(),
+                RequestBody::Subscribe(subscribe_request(own_filter(space_id))).encode(),
             ),
         )
         .await;
@@ -876,7 +876,7 @@ async fn subscribe_over_stream_cap_returns_stream_limit_exceeded() {
             Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             5,
-            RequestBody::Subscribe(subscribe_request(own_filter(agent_id))).encode(),
+            RequestBody::Subscribe(subscribe_request(own_filter(space_id))).encode(),
         ),
     )
     .await;

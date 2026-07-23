@@ -10,7 +10,7 @@
 //! Stub handlers return `OpError::NotYetImplemented` until a real
 //! implementation replaces each one.
 
-use brain_core::AgentId;
+use brain_core::SpaceId;
 use brain_metadata::api_keys::bits as perm_bits;
 use brain_protocol::envelope::request::RequestBody;
 use brain_protocol::envelope::response::ResponseBody;
@@ -19,7 +19,7 @@ use crate::context::OpsContext;
 use crate::error::OpError;
 
 /// Per-request caller context. Carries the AUTH-bound scope
-/// (org / user / namespace / agent / permissions) derived from the
+/// (org / user / namespace / space / permissions) derived from the
 /// API key the client presented — handlers read scope from here
 /// instead of trusting client-supplied fields. Every caller is fully
 /// scoped: there is no anonymous or permissive variant. Production
@@ -27,8 +27,8 @@ use crate::error::OpError;
 /// tests use [`RequestCaller::for_tests`].
 #[derive(Debug, Clone)]
 pub struct RequestCaller {
-    /// Authenticated agent, resolved from the API key.
-    pub agent_id: AgentId,
+    /// Authenticated space, resolved from the API key.
+    pub space_id: SpaceId,
     /// Tenant identity (reserved audit tag; currently zeroed).
     pub org_id: [u8; 16],
     /// User identity (optional human/service). Zero when not bound.
@@ -51,14 +51,14 @@ impl RequestCaller {
     /// only production path — identity is always the credential.
     #[must_use]
     pub fn from_scope(
-        agent_id: AgentId,
+        space_id: SpaceId,
         org_id: [u8; 16],
         user_id: [u8; 16],
         namespace: String,
         permissions: u32,
     ) -> Self {
         Self {
-            agent_id,
+            space_id,
             org_id,
             user_id,
             namespace,
@@ -75,7 +75,7 @@ impl RequestCaller {
     #[must_use]
     pub fn for_tests() -> Self {
         Self {
-            agent_id: AgentId::default(),
+            space_id: SpaceId::default(),
             org_id: [0u8; 16],
             user_id: [0u8; 16],
             namespace: String::new(),
@@ -114,13 +114,13 @@ impl RequestCaller {
     }
 
     /// Returns `Err(OpError::Unauthorized)` when the request's claimed
-    /// agent doesn't match the key's agent.
-    pub fn require_agent(&self, claimed: AgentId, what: &'static str) -> Result<(), OpError> {
-        if self.agent_id == claimed {
+    /// space doesn't match the key's space.
+    pub fn require_space(&self, claimed: SpaceId, what: &'static str) -> Result<(), OpError> {
+        if self.space_id == claimed {
             Ok(())
         } else {
             Err(OpError::Unauthorized(format!(
-                "{what}: API key is bound to a different agent_id"
+                "{what}: API key is bound to a different space_id"
             )))
         }
     }
@@ -182,27 +182,27 @@ pub async fn dispatch(
     // First gate: every op carries a required-permission tag. An API
     // key without the bit gets rejected before any work is done.
     enforce_permission(&caller, &req)?;
-    // Second gate: handlers that act as a specific agent_id must see
+    // Second gate: handlers that act as a specific space_id must see
     // the AUTH-bound one, not whatever the client claimed. Namespace
     // checks for schema-touching ops happen inside the namespace-bound
     // handlers (SCHEMA_UPLOAD, etc.).
     enforce_namespace(&caller, &req)?;
-    // Reads are structurally isolated to the caller's own agent: RECALL no
-    // longer carries any client-supplied agent filter, so the handlers scope
-    // to `caller.agent_id` unconditionally. There is no cross-agent read path
+    // Reads are structurally isolated to the caller's own space: RECALL no
+    // longer carries any client-supplied space filter, so the handlers scope
+    // to `caller.space_id` unconditionally. There is no cross-space read path
     // to gate here.
 
-    // Per-request override: stamp the caller's agent onto a clone
+    // Per-request override: stamp the caller's space onto a clone
     // of the shared ctx so handlers that build writer Ops can pull
-    // it via `ctx.executor.caller_agent` without taking another
+    // it via `ctx.executor.caller_space` without taking another
     // function param. The clone is cheap — every field is Arc'd.
-    let per_request_ctx = if caller.agent_id == brain_core::AgentId::default() {
-        // Test-only default-agent caller — no override needed; reuse the
+    let per_request_ctx = if caller.space_id == brain_core::SpaceId::default() {
+        // Test-only default-space caller — no override needed; reuse the
         // shared ctx (zero-cost on the hot path).
         None
     } else {
         let mut owned = ctx.clone();
-        owned.executor = owned.executor.with_caller_agent(caller.agent_id);
+        owned.executor = owned.executor.with_caller_space(caller.space_id);
         // Fail-closed tenancy: an authenticated caller MUST carry a namespace
         // that resolves to a real per-shard NamespaceId. There is no SYSTEM
         // default for user data — falling back to the reserved system namespace
@@ -257,8 +257,8 @@ pub async fn dispatch(
     match req {
         // -----------------------------------------------------------
         // Cognitive primitives.
-        // Handlers read `ctx.executor.caller_agent` to populate
-        // `agent_id` on the writer Ops they build; the per-request
+        // Handlers read `ctx.executor.caller_space` to populate
+        // `space_id` on the writer Ops they build; the per-request
         // clone above ensures they see the auth-time value, not the
         // shared per-shard default.
         // -----------------------------------------------------------
@@ -750,16 +750,16 @@ mod tests {
     use brain_protocol::EncodeRequest;
     use brain_protocol::{SchemaGetRequest, SchemaListRequest};
 
-    fn agent(byte: u8) -> AgentId {
+    fn space(byte: u8) -> SpaceId {
         let mut a = [0u8; 16];
         a[15] = byte;
-        AgentId(uuid::Uuid::from_bytes(a))
+        SpaceId(uuid::Uuid::from_bytes(a))
     }
 
     /// A fully-scoped caller with FULL permissions and no namespace lock.
     fn full_caller() -> RequestCaller {
         RequestCaller::from_scope(
-            agent(1),
+            space(1),
             [0u8; 16],
             [0u8; 16],
             String::new(),
@@ -767,8 +767,8 @@ mod tests {
         )
     }
 
-    fn strict(perms: u32, namespace: &str, agent_id: AgentId) -> RequestCaller {
-        RequestCaller::from_scope(agent_id, [1u8; 16], [0u8; 16], namespace.into(), perms)
+    fn strict(perms: u32, namespace: &str, space_id: SpaceId) -> RequestCaller {
+        RequestCaller::from_scope(space_id, [1u8; 16], [0u8; 16], namespace.into(), perms)
     }
 
     fn encode_req() -> RequestBody {
@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn strict_caller_without_encode_rejects_encode() {
-        let caller = strict(perm_bits::RECALL, "acme", agent(1));
+        let caller = strict(perm_bits::RECALL, "acme", space(1));
         let err = enforce_permission(&caller, &encode_req()).unwrap_err();
         assert!(matches!(err, OpError::Unauthorized(_)));
     }
@@ -807,7 +807,7 @@ mod tests {
         // Full-permission caller holds ADMIN — passes the gate.
         assert!(enforce_permission(&full_caller(), &req).is_ok());
         // RECALL-only caller is rejected.
-        let caller = strict(perm_bits::RECALL, "acme", agent(1));
+        let caller = strict(perm_bits::RECALL, "acme", space(1));
         assert!(matches!(
             enforce_permission(&caller, &req).unwrap_err(),
             OpError::Unauthorized(_)
@@ -816,7 +816,7 @@ mod tests {
 
     #[test]
     fn strict_caller_with_encode_passes() {
-        let caller = strict(perm_bits::ENCODE | perm_bits::RECALL, "acme", agent(1));
+        let caller = strict(perm_bits::ENCODE | perm_bits::RECALL, "acme", space(1));
         assert!(enforce_permission(&caller, &encode_req()).is_ok());
     }
 
@@ -825,7 +825,7 @@ mod tests {
         let caller = strict(
             perm_bits::RECALL | perm_bits::SCHEMA_UPLOAD,
             "brain",
-            agent(1),
+            space(1),
         );
         let req = RequestBody::SchemaGet(SchemaGetRequest {
             namespace: "acme".into(),
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn strict_caller_with_empty_namespace_is_open() {
-        let caller = strict(perm_bits::RECALL, "", agent(1));
+        let caller = strict(perm_bits::RECALL, "", space(1));
         let req = RequestBody::SchemaList(SchemaListRequest {
             namespace: "anywhere".into(),
             limit: 0,
@@ -853,14 +853,14 @@ mod tests {
     }
 
     #[test]
-    fn caller_is_bound_to_its_own_agent() {
-        let caller = strict(perm_bits::ENCODE, "ns", agent(1));
-        assert!(caller.require_agent(agent(1), "test").is_ok());
-        assert!(caller.require_agent(agent(2), "test").is_err());
+    fn caller_is_bound_to_its_own_space() {
+        let caller = strict(perm_bits::ENCODE, "ns", space(1));
+        assert!(caller.require_space(space(1), "test").is_ok());
+        assert!(caller.require_space(space(2), "test").is_err());
 
-        // A caller bound to agent(1) cannot act as another agent.
+        // A caller bound to space(1) cannot act as another space.
         let p = full_caller();
-        assert!(p.require_agent(agent(99), "test").is_err());
-        assert!(p.require_agent(agent(1), "test").is_ok());
+        assert!(p.require_space(space(99), "test").is_err());
+        assert!(p.require_space(space(1), "test").is_ok());
     }
 }

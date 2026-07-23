@@ -42,7 +42,7 @@ impl EdgeKind {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum EdgeOrigin {
-    /// Explicitly created by an agent (e.g. supplied with `ENCODE_REQ.edges`).
+    /// Explicitly created by an space (e.g. supplied with `ENCODE_REQ.edges`).
     Explicit = 0,
     /// Auto-derived by the substrate (e.g. similarity edges added at encode time).
     AutoDerived = 1,

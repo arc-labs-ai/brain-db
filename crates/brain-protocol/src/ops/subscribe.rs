@@ -23,14 +23,14 @@ pub struct SubscriptionFilter {
     pub contexts: Option<Vec<WireContextId>>,
     pub kinds: Option<Vec<MemoryKindWire>>,
     pub similar_to: Option<SimilarityFilter>,
-    /// Subset of agent ids whose events the subscriber wants. `None`
-    /// or empty = all agents (server-wide / shard-wide). The single
+    /// Subset of space ids whose events the subscriber wants. `None`
+    /// or empty = all spaces (server-wide / shard-wide). The single
     /// most useful filter on a multi-tenant shard — without it, a
-    /// subscriber sees every other agent's events that happen to
+    /// subscriber sees every other space's events that happen to
     /// route to the same shard. Server-side matching is a
     /// `HashSet::contains` per event.
     #[serde(with = "crate::codec::cbor::opt_vec_byte_array16")]
-    pub agents: Option<Vec<WireUuid>>,
+    pub spaces: Option<Vec<WireUuid>>,
     /// Subset of memory ids whose events the subscriber wants. `None`
     /// or empty = all memories. Lets a client scope a subscription to
     /// a single in-flight write (e.g. to watch that write's async
@@ -132,7 +132,7 @@ pub struct EdgeEventPayload {
     /// `0` = `EXPLICIT` (LINK / RELATION_LINK / WAL replay of either),
     /// `1` = `AUTO_DERIVED` (worker-inferred, e.g. AutoEdgeWorker's
     /// `SimilarTo`).
-    /// Agents driving on the change feed filter by this so they can
+    /// Spaces driving on the change feed filter by this so they can
     /// distinguish edges they wrote from edges the server inferred.
     pub origin: u8,
 }

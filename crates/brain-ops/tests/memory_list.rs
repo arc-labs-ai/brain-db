@@ -1,7 +1,7 @@
 //! Integration tests for `handle_memory_list` (MEMORY_LIST).
 //!
 //! MEMORY_LIST is a pure paginated enumeration read: it walks the
-//! caller's `(namespace, agent)` timeline in a stable order and returns
+//! caller's `(namespace, space)` timeline in a stable order and returns
 //! keyset pages. These tests drive the real `dispatch` → handler path —
 //! the same code the wire layer calls — over an in-process fixture with a
 //! deterministic mock embedder.
@@ -95,16 +95,16 @@ fn build_fixture() -> Fixture {
     }
 }
 
-/// Two agents inside one namespace so the scope-isolation test proves the
-/// agent wall, and one shared namespace so time/kind/salience tests share
+/// Two spaces inside one namespace so the scope-isolation test proves the
+/// space wall, and one shared namespace so time/kind/salience tests share
 /// a tenant.
-const AGENT_A: [u8; 16] = [0xA1; 16];
-const AGENT_B: [u8; 16] = [0xB2; 16];
+const SPACE_A: [u8; 16] = [0xA1; 16];
+const SPACE_B: [u8; 16] = [0xB2; 16];
 
-fn caller_for(namespace: &str, agent: [u8; 16]) -> RequestCaller {
-    let agent = brain_core::AgentId(uuid::Uuid::from_bytes(agent));
+fn caller_for(namespace: &str, space: [u8; 16]) -> RequestCaller {
+    let space = brain_core::SpaceId(uuid::Uuid::from_bytes(space));
     RequestCaller::from_scope(
-        agent,
+        space,
         [0u8; 16],
         [0u8; 16],
         namespace.to_string(),
@@ -208,7 +208,7 @@ fn paginates_full_corpus_without_dup_or_skip() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let _ns = fix.intern_namespace("acme");
-        let caller = || caller_for("acme", AGENT_A);
+        let caller = || caller_for("acme", SPACE_A);
 
         const N: usize = 25;
         let mut encoded = Vec::new();
@@ -278,7 +278,7 @@ fn stale_cursor_rejected_on_filter_change() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let _ns = fix.intern_namespace("acme");
-        let caller = || caller_for("acme", AGENT_A);
+        let caller = || caller_for("acme", SPACE_A);
 
         for i in 0..10 {
             encode(&fix, caller(), [i as u8 + 1; 16], &format!("item {i}")).await;
@@ -317,7 +317,7 @@ fn kind_filter_narrows_results() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let _ns = fix.intern_namespace("acme");
-        let caller = || caller_for("acme", AGENT_A);
+        let caller = || caller_for("acme", SPACE_A);
 
         for i in 0..5 {
             encode(&fix, caller(), [i as u8 + 1; 16], &format!("fact {i}")).await;
@@ -364,7 +364,7 @@ fn tombstoned_memory_excluded() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let _ns = fix.intern_namespace("acme");
-        let caller = || caller_for("acme", AGENT_A);
+        let caller = || caller_for("acme", SPACE_A);
 
         let keep = encode(&fix, caller(), [1; 16], "keep this memory").await;
         let drop = encode(&fix, caller(), [2; 16], "forget this memory").await;
@@ -398,7 +398,7 @@ fn created_time_range_filter() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let _ns = fix.intern_namespace("acme");
-        let caller = || caller_for("acme", AGENT_A);
+        let caller = || caller_for("acme", SPACE_A);
 
         for i in 0..6 {
             encode(&fix, caller(), [i as u8 + 1; 16], &format!("dated {i}")).await;
@@ -443,7 +443,7 @@ fn salience_range_filter() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let _ns = fix.intern_namespace("acme");
-        let caller = || caller_for("acme", AGENT_A);
+        let caller = || caller_for("acme", SPACE_A);
 
         for i in 0..4 {
             encode(&fix, caller(), [i as u8 + 1; 16], &format!("sal {i}")).await;
@@ -473,31 +473,31 @@ fn salience_range_filter() {
     })
 }
 
-/// A second agent's memories are never returned to the first agent, even
+/// A second space's memories are never returned to the first space, even
 /// inside the same namespace.
 #[test]
-fn scope_isolation_between_agents() {
+fn scope_isolation_between_spaces() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let _ns = fix.intern_namespace("acme");
 
         let a_mem = encode(
             &fix,
-            caller_for("acme", AGENT_A),
+            caller_for("acme", SPACE_A),
             [1; 16],
-            "agent A private",
+            "space A private",
         )
         .await;
         let b_mem = encode(
             &fix,
-            caller_for("acme", AGENT_B),
+            caller_for("acme", SPACE_B),
             [2; 16],
-            "agent B private",
+            "space B private",
         )
         .await;
         assert_ne!(a_mem, b_mem);
 
-        let a_view = list(&fix, caller_for("acme", AGENT_A), list_req()).await;
+        let a_view = list(&fix, caller_for("acme", SPACE_A), list_req()).await;
         let a_ids: Vec<u128> = a_view.items.iter().map(item_id).collect();
         assert!(a_ids.contains(&a_mem), "A must see its own memory");
         assert!(
@@ -505,7 +505,7 @@ fn scope_isolation_between_agents() {
             "SCOPE BREACH: A's list returned B's memory"
         );
 
-        let b_view = list(&fix, caller_for("acme", AGENT_B), list_req()).await;
+        let b_view = list(&fix, caller_for("acme", SPACE_B), list_req()).await;
         let b_ids: Vec<u128> = b_view.items.iter().map(item_id).collect();
         assert!(b_ids.contains(&b_mem), "B must see its own memory");
         assert!(
@@ -515,7 +515,7 @@ fn scope_isolation_between_agents() {
     })
 }
 
-/// Enumerating an agent with no memories yields an empty page with an
+/// Enumerating an space with no memories yields an empty page with an
 /// empty cursor.
 #[test]
 fn empty_result_when_no_memories() {
@@ -523,7 +523,7 @@ fn empty_result_when_no_memories() {
         let fix = build_fixture();
         let _ns = fix.intern_namespace("acme");
 
-        let frame = list(&fix, caller_for("acme", AGENT_A), list_req()).await;
+        let frame = list(&fix, caller_for("acme", SPACE_A), list_req()).await;
         assert!(frame.items.is_empty(), "no memories → empty page");
         assert!(
             frame.next_cursor.is_empty(),
@@ -545,7 +545,7 @@ fn rejects_bad_limit() {
         req.limit = 0;
         let err = dispatch(
             RequestBody::MemoryList(req),
-            caller_for("acme", AGENT_A),
+            caller_for("acme", SPACE_A),
             &fix.ctx,
         )
         .await
@@ -556,7 +556,7 @@ fn rejects_bad_limit() {
         req.limit = 101;
         let err = dispatch(
             RequestBody::MemoryList(req),
-            caller_for("acme", AGENT_A),
+            caller_for("acme", SPACE_A),
             &fix.ctx,
         )
         .await

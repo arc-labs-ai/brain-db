@@ -202,7 +202,7 @@ mod tests {
     fn empty_write() -> Write {
         Write::single(
             WriteId::new(),
-            brain_core::AgentId::default(),
+            brain_core::SpaceId::default(),
             Phase::Link {
                 from: NodeRef::Memory(MemoryId::pack(0, 1, 0)),
                 to: NodeRef::Memory(MemoryId::pack(0, 2, 0)),

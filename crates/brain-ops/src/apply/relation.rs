@@ -19,7 +19,7 @@ pub fn apply_upsert_relation(
     phase: &Phase,
     write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
-    let scope = brain_metadata::RowScope::new(write.namespace, write.agent_id);
+    let scope = brain_metadata::RowScope::new(write.namespace, write.space_id);
     let Phase::UpsertRelation {
         id,
         ty,
@@ -116,7 +116,7 @@ pub fn apply_supersede_relation(
     phase: &Phase,
     write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
-    let scope = brain_metadata::RowScope::new(write.namespace, write.agent_id);
+    let scope = brain_metadata::RowScope::new(write.namespace, write.space_id);
     let Phase::Supersede {
         target,
         replacement,

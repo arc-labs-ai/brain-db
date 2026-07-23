@@ -111,8 +111,8 @@ pub(crate) enum ShardRequest {
     /// return the resulting `ResponseBody`. The
     /// frame-dispatcher's primary boundary primitive.
     ///
-    /// `caller` carries the authenticated agent from the
-    /// connection's `ConnPhase::Established.agent`. The shard
+    /// `caller` carries the authenticated space from the
+    /// connection's `ConnPhase::Established.space`. The shard
     /// passes it to `brain_ops::dispatch`, which stamps it onto
     /// the per-request `ExecutorContext` so the writer-built Ops
     /// know who they belong to.
@@ -1139,8 +1139,8 @@ impl ShardHandle {
     /// `brain_ops::dispatch`). The frame-dispatcher's
     /// boundary primitive.
     ///
-    /// `caller` carries the authenticated agent from the
-    /// connection's `ConnPhase::Established.agent`. The shard
+    /// `caller` carries the authenticated space from the
+    /// connection's `ConnPhase::Established.space`. The shard
     /// passes it through to `brain_ops::dispatch`, which stamps it
     /// onto the per-request `ExecutorContext` so the writer-built
     /// Ops know who they belong to — closing the multi-tenant leak
@@ -2732,7 +2732,7 @@ pub fn spawn_shard(
 
             // Register the TemporalEdgeWorker when its
             // channel was created above. Drains the writer's post-
-            // encode channel, looks up the agent's prior memory, and
+            // encode channel, looks up the space's prior memory, and
             // writes a decay-weighted `FollowedBy` edge.
             if let Some(rx) = temporal_edge_receiver {
                 let worker_cfg = WorkerConfig {

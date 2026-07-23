@@ -8,7 +8,7 @@
 
 use crate::impl_redb_rkyv_value;
 use crate::tables::scope::RowScope;
-use brain_core::{AgentId, Entity, EntityAttributes, EntityId, EntityTypeId, NamespaceId};
+use brain_core::{SpaceId, Entity, EntityAttributes, EntityId, EntityTypeId, NamespaceId};
 use redb::TableDefinition;
 
 // ---------------------------------------------------------------------------
@@ -16,28 +16,28 @@ use redb::TableDefinition;
 // ---------------------------------------------------------------------------
 //
 // Every secondary index below carries a LEADING `(namespace_id,
-// agent_id_bytes)` scope prefix so a range scan for one `(namespace,
-// agent)` can physically never traverse another tenant's rows. The
+// space_id_bytes)` scope prefix so a range scan for one `(namespace,
+// space)` can physically never traverse another tenant's rows. The
 // primary `ENTITIES_TABLE` stays keyed by the (globally-unique)
 // `EntityId`; the scope lives on the row and is the discriminator that
 // makes the same NAME resolve to DISTINCT entity ids per scope.
 
 // Scope-prefixed secondary-index key shapes. Factored into aliases so the
-// `(namespace, agent)` prefix doesn't push the `TableDefinition` generics
+// `(namespace, space)` prefix doesn't push the `TableDefinition` generics
 // past clippy's type-complexity threshold — and so each key reads as a
 // named shape rather than an anonymous tuple.
 
-/// `(namespace_id, agent_id_bytes, entity_type_id, normalized_alias, EntityId)`.
+/// `(namespace_id, space_id_bytes, entity_type_id, normalized_alias, EntityId)`.
 type AliasKey = (u32, [u8; 16], u32, &'static str, [u8; 16]);
-/// `(namespace_id, agent_id_bytes, entity_type_id, trigram, EntityId)`.
+/// `(namespace_id, space_id_bytes, entity_type_id, trigram, EntityId)`.
 type TrigramKey = (u32, [u8; 16], u32, [u8; 3], [u8; 16]);
-/// `(namespace_id, agent_id_bytes, EntityId, MemoryId)`.
+/// `(namespace_id, space_id_bytes, EntityId, MemoryId)`.
 type MentionKey = (u32, [u8; 16], [u8; 16], [u8; 16]);
 
 pub const ENTITIES_TABLE: TableDefinition<'static, [u8; 16], EntityMetadata> =
     TableDefinition::new("entities");
 
-/// `(namespace_id, agent_id_bytes, entity_type_id, normalized_name)` →
+/// `(namespace_id, space_id_bytes, entity_type_id, normalized_name)` →
 /// `EntityId.to_bytes()`. The leading scope makes each tenant's exact-name
 /// space private: the same canonical name under two scopes maps to two
 /// distinct entity ids.
@@ -47,13 +47,13 @@ pub const ENTITY_BY_CANONICAL_NAME_TABLE: TableDefinition<
     [u8; 16],
 > = TableDefinition::new("entity_by_canonical_name");
 
-/// `(namespace_id, agent_id_bytes, entity_type_id, normalized_alias,
+/// `(namespace_id, space_id_bytes, entity_type_id, normalized_alias,
 /// EntityId.to_bytes())` → `()`. The trailing EntityId lets one alias map
 /// to multiple entities (ambiguity surfaces to the resolver).
 pub const ENTITY_ALIASES_TABLE: TableDefinition<'static, AliasKey, ()> =
     TableDefinition::new("entity_aliases");
 
-/// `(namespace_id, agent_id_bytes, entity_type_id, trigram,
+/// `(namespace_id, space_id_bytes, entity_type_id, trigram,
 /// EntityId.to_bytes())` → `()`.
 ///
 /// Trigrams are fixed 3-byte windows (pg_trgm-style, byte-level),
@@ -61,7 +61,7 @@ pub const ENTITY_ALIASES_TABLE: TableDefinition<'static, AliasKey, ()> =
 pub const ENTITY_TRIGRAMS_TABLE: TableDefinition<'static, TrigramKey, ()> =
     TableDefinition::new("entity_trigrams");
 
-/// `(namespace_id, agent_id_bytes, EntityId.to_bytes(),
+/// `(namespace_id, space_id_bytes, EntityId.to_bytes(),
 /// MemoryId.to_be_bytes())` → [`MentionMetadata`].
 pub const ENTITY_MENTIONS_TABLE: TableDefinition<'static, MentionKey, MentionMetadata> =
     TableDefinition::new("entity_mentions");
@@ -134,12 +134,12 @@ pub mod mention_context {
 pub struct EntityMetadata {
     pub entity_id_bytes: [u8; 16],
     /// Owning namespace (tenant) — the outer half of the
-    /// `(namespace, agent)` scope key. `0` is the reserved `brain`
+    /// `(namespace, space)` scope key. `0` is the reserved `brain`
     /// system namespace. Required; stamped from the authenticated
     /// caller's scope at create time (fail-closed by construction).
     pub namespace_id: u32,
-    /// Owning agent (app) — the inner half of the scope key.
-    pub agent_id_bytes: [u8; 16],
+    /// Owning space (app) — the inner half of the scope key.
+    pub space_id_bytes: [u8; 16],
     pub entity_type_id: u32,
     pub canonical_name: String,
     pub normalized_name: String,
@@ -172,7 +172,7 @@ impl EntityMetadata {
         Self {
             entity_id_bytes: entity_id.to_bytes(),
             namespace_id: scope.namespace_id,
-            agent_id_bytes: scope.agent_id_bytes,
+            space_id_bytes: scope.space_id_bytes,
             entity_type_id: entity_type_id.raw(),
             canonical_name,
             normalized_name,
@@ -189,13 +189,13 @@ impl EntityMetadata {
 
     /// Build a row from a brain-core [`Entity`] plus the owning scope.
     /// Replaces the old `From<&Entity>` impl, which couldn't carry the
-    /// scope (brain-core has no namespace/agent slot).
+    /// scope (brain-core has no namespace/space slot).
     #[must_use]
     pub fn from_entity(e: &Entity, scope: RowScope) -> Self {
         Self {
             entity_id_bytes: e.id.to_bytes(),
             namespace_id: scope.namespace_id,
-            agent_id_bytes: scope.agent_id_bytes,
+            space_id_bytes: scope.space_id_bytes,
             entity_type_id: e.entity_type.raw(),
             canonical_name: e.canonical_name.clone(),
             normalized_name: e.normalized_name.clone(),
@@ -221,16 +221,16 @@ impl EntityMetadata {
         NamespaceId::from(self.namespace_id)
     }
 
-    /// The owning agent of this entity.
+    /// The owning space of this entity.
     #[must_use]
-    pub fn agent_id(&self) -> AgentId {
-        AgentId::from(self.agent_id_bytes)
+    pub fn space_id(&self) -> SpaceId {
+        SpaceId::from(self.space_id_bytes)
     }
 
-    /// The `(namespace, agent)` scope this entity belongs to.
+    /// The `(namespace, space)` scope this entity belongs to.
     #[must_use]
     pub fn scope(&self) -> RowScope {
-        RowScope::from_bytes(self.namespace_id, self.agent_id_bytes)
+        RowScope::from_bytes(self.namespace_id, self.space_id_bytes)
     }
 
     #[must_use]
@@ -259,7 +259,7 @@ impl_redb_rkyv_value!(EntityMetadata, "brain_metadata::EntityMetadata");
 
 // `EntityMetadata::from_entity(&Entity, RowScope)` replaces the old
 // `From<&Entity>` impl — the scope can't be reconstructed from a
-// brain-core `Entity` (it has no namespace/agent slot), so it must be
+// brain-core `Entity` (it has no namespace/space slot), so it must be
 // supplied explicitly. The reverse projection drops the scope (again,
 // brain-core has nowhere to put it).
 
@@ -321,7 +321,7 @@ mod tests {
     use brain_core::MemoryId;
     use redb::ReadableDatabase;
 
-    /// Fixed test scope: system namespace + a stable test agent.
+    /// Fixed test scope: system namespace + a stable test space.
     fn test_scope() -> RowScope {
         RowScope::from_bytes(NamespaceId::SYSTEM.raw(), [0xAB; 16])
     }
@@ -429,7 +429,7 @@ mod tests {
         let db = fresh_db(&dir);
         let id = EntityId::new();
         let s = test_scope();
-        let key = (s.namespace_id, s.agent_id_bytes, 1u32, "priya patel");
+        let key = (s.namespace_id, s.space_id_bytes, 1u32, "priya patel");
 
         let wtxn = db.begin_write().unwrap();
         {
@@ -455,14 +455,14 @@ mod tests {
         let s = test_scope();
         let k_a = (
             s.namespace_id,
-            s.agent_id_bytes,
+            s.space_id_bytes,
             entity_type,
             alias,
             id_a.to_bytes(),
         );
         let k_b = (
             s.namespace_id,
-            s.agent_id_bytes,
+            s.space_id_bytes,
             entity_type,
             alias,
             id_b.to_bytes(),
@@ -491,7 +491,7 @@ mod tests {
         // Trigram component is `[u8; 3]`, not `&str`.
         let key = (
             s.namespace_id,
-            s.agent_id_bytes,
+            s.space_id_bytes,
             1u32,
             *b"pri",
             id.to_bytes(),
@@ -519,7 +519,7 @@ mod tests {
         let m = MentionMetadata::new(1_700_000_000_000_000_000, mention_context::SUBJECT_OF, 0.95);
         let key = (
             s.namespace_id,
-            s.agent_id_bytes,
+            s.space_id_bytes,
             id.to_bytes(),
             memory.to_be_bytes(),
         );

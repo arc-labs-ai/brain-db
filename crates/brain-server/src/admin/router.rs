@@ -22,7 +22,7 @@ use http::{Method, Request, Response};
 use hyper::body::Incoming;
 
 use crate::admin::handlers::{
-    agent, api_keys, audit, config, diagnostics, extract, healthz, metrics, readyz, rebuild, shard,
+    space, api_keys, audit, config, diagnostics, extract, healthz, metrics, readyz, rebuild, shard,
     snapshot, worker,
 };
 use crate::admin::AdminState;
@@ -178,18 +178,18 @@ fn attach_v1_routes(r: Router<Incoming>, state: Arc<AdminState>) -> Router<Incom
         api_keys::handle,
     );
 
-    // ──────── /v1/agents ───────────────────────────────────────────────
-    let r = with_state(r, Method::GET, "/v1/agents", state.clone(), agent::list);
-    // /v1/agents/{id} prefix handler dispatches GET vs DELETE internally.
+    // ──────── /v1/spaces ───────────────────────────────────────────────
+    let r = with_state(r, Method::GET, "/v1/spaces", state.clone(), space::list);
+    // /v1/spaces/{id} prefix handler dispatches GET vs DELETE internally.
     // brain-http's match_route(MethodMismatch) handles wrong method;
     // we register both methods on the same prefix so they hit `by_id`.
-    let r = with_state_prefix(r, Method::GET, "/v1/agents/", state.clone(), agent::by_id);
+    let r = with_state_prefix(r, Method::GET, "/v1/spaces/", state.clone(), space::by_id);
     let r = with_state_prefix(
         r,
         Method::DELETE,
-        "/v1/agents/",
+        "/v1/spaces/",
         state.clone(),
-        agent::by_id,
+        space::by_id,
     );
 
     // ──────── /v1/shards ───────────────────────────────────────────────

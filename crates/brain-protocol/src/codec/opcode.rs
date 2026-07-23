@@ -219,7 +219,7 @@ pub enum Opcode {
     GraphFetchReq = 0x0163,
     GraphFetchResp = 0x01E3,
 
-    // Procedural-memory materialization. Renders an agent's stored
+    // Procedural-memory materialization. Renders an space's stored
     // `brain:behavior_*` Preferences into a system block for LLM prompt
     // injection.
     MaterializeProceduralReq = 0x0164,

@@ -560,7 +560,7 @@ mod tests {
             kind,
             flags: 0,
             timestamp_ns: 1_700_000_000_000_000_000,
-            agent_id_lo64: 0xAA55_AA55_AA55_AA55,
+            space_id_lo64: 0xAA55_AA55_AA55_AA55,
             payload,
         }
     }

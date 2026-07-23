@@ -26,7 +26,7 @@ use proptest::collection::vec as pvec;
 use proptest::prelude::*;
 use tempfile::TempDir;
 
-/// Fixed (namespace, agent) scope for resolver tests.
+/// Fixed (namespace, space) scope for resolver tests.
 fn test_scope() -> brain_metadata::RowScope {
     brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
 }

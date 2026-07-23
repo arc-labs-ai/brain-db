@@ -158,7 +158,7 @@ pub fn relation_history(
     // A supersession chain never crosses a tenant boundary, so the
     // anchor's own scope bounds the whole chain — filter the scan to it.
     let anchor_ns = anchor_row.namespace_id;
-    let anchor_agent = anchor_row.agent_id_bytes;
+    let anchor_space = anchor_row.space_id_bytes;
 
     // Linear scan: chains are short (1–3 entries typical). A
     // chain-root secondary index can be added if this becomes hot.
@@ -168,7 +168,7 @@ pub fn relation_history(
         let m = v.value();
         if m.chain_root_bytes == chain_root_bytes
             && m.namespace_id == anchor_ns
-            && m.agent_id_bytes == anchor_agent
+            && m.space_id_bytes == anchor_space
         {
             let id = RelationId::from(k.value());
             chain.push(relation_from_metadata(id, &m));
@@ -236,7 +236,7 @@ fn list_directional(
         // re-keyed by scope, so the directional walk can surface an edge
         // owned by another tenant; the sidecar carries the owning scope
         // and is the authority that filters it out.
-        if meta.namespace_id != scope.namespace_id || meta.agent_id_bytes != scope.agent_id_bytes {
+        if meta.namespace_id != scope.namespace_id || meta.space_id_bytes != scope.space_id_bytes {
             continue;
         }
         if filter.current_only && !meta.is_current() {
@@ -265,21 +265,21 @@ pub fn relations_with_evidence(
     let mem_bytes = memory_id.to_be_bytes();
     let lo = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         mem_bytes,
         [0u8; 16],
     );
     let hi = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         mem_bytes,
         [0xFFu8; 16],
     );
     let mut out = Vec::new();
     for entry in t.range(lo..=hi)? {
         let (k, _) = entry?;
-        let (k_ns, k_agent, k_mem, k_rel) = k.value();
-        if k_ns != scope.namespace_id || k_agent != scope.agent_id_bytes || k_mem != mem_bytes {
+        let (k_ns, k_space, k_mem, k_rel) = k.value();
+        if k_ns != scope.namespace_id || k_space != scope.space_id_bytes || k_mem != mem_bytes {
             continue;
         }
         out.push(RelationId::from(k_rel));
@@ -679,7 +679,7 @@ fn collect_typed_conflicts(
         // be superseded by (or block) a `globex` one. The shared edge
         // table can surface a foreign-tenant edge; the sidecar scope is
         // the wall.
-        if meta.namespace_id != scope.namespace_id || meta.agent_id_bytes != scope.agent_id_bytes {
+        if meta.namespace_id != scope.namespace_id || meta.space_id_bytes != scope.space_id_bytes {
             continue;
         }
         if meta.is_current() && !out.contains(&candidate) {
@@ -755,7 +755,7 @@ fn insert_new_relation(
             t.insert(
                 &(
                     scope.namespace_id,
-                    scope.agent_id_bytes,
+                    scope.space_id_bytes,
                     mem.to_be_bytes(),
                     r.id.to_bytes(),
                 ),

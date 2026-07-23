@@ -114,12 +114,12 @@ async fn complete_handshake(client: &mut TcpStream, client_id: &str, token: &[u8
     let welcome = read_one_frame(client).await;
     assert_eq!(welcome.header.opcode_u16(), Opcode::Welcome.as_u16());
 
-    // Recall is ALWAYS agent-scoped. A real client is one agent opening many
-    // connections; modelling each concurrent connection as a fresh random agent
-    // would mean every task recalls memories no agent of its own ever wrote, so
+    // Recall is ALWAYS space-scoped. A real client is one space opening many
+    // connections; modelling each concurrent connection as a fresh random space
+    // would mean every task recalls memories no space of its own ever wrote, so
     // it would read empty regardless of routing. All connections in this test —
     // the seeding setup client and every concurrent task — therefore share one
-    // fixed agent, which is what lets the test actually exercise concurrent
+    // fixed space, which is what lets the test actually exercise concurrent
     // recall routing over a common corpus.
     let auth = AuthPayload {
         method: AuthMethod::Token,
@@ -270,7 +270,7 @@ async fn concurrent_txn_and_non_txn_recalls_route_correctly() {
     }
 
     // Concurrent recalls, alternating txn-attached and non-txn, all as the one
-    // shared agent. Kept modest: every recall runs the full membership pipeline
+    // shared space. Kept modest: every recall runs the full membership pipeline
     // and the shard processes them on one executor, so this stresses concurrent
     // routing safety (no response empty/garbled/misrouted under overlap), not
     // raw throughput. A large fan-out only makes the wall-time balloon on
@@ -280,7 +280,7 @@ async fn concurrent_txn_and_non_txn_recalls_route_correctly() {
     for i in 0..TASKS {
         let use_txn = i % 2 == 0;
         let addr = server.data_plane_addr;
-        // All tasks act as the one shared default agent.
+        // All tasks act as the one shared default space.
         let token = server.token.clone();
         handles.push(tokio::spawn(async move {
             let mut client = TcpStream::connect(addr).await.expect("connect task");

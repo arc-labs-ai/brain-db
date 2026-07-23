@@ -1,18 +1,18 @@
-//! Cross-namespace + cross-agent isolation for the TYPED-GRAPH layer
+//! Cross-namespace + cross-space isolation for the TYPED-GRAPH layer
 //! (entities, statements, relations) — the sibling of the memory-layer
 //! proof in `namespace_isolation.rs`.
 //!
-//! The typed-graph scope key is `(namespace_id, agent_id)`: namespace is
-//! the outer (tenant/company) wall, agent the inner (app) wall. Every
+//! The typed-graph scope key is `(namespace_id, space_id)`: namespace is
+//! the outer (tenant/company) wall, space the inner (app) wall. Every
 //! typed-graph row carries that scope and every secondary index is
-//! prefixed by it, so a read as one `(namespace, agent)` must never
+//! prefixed by it, so a read as one `(namespace, space)` must never
 //! surface another scope's entity, statement, or relation — on ANY
 //! typed-graph read path (`ENTITY_RESOLVE` / `ENTITY_GET` /
 //! `STATEMENT_LIST` / `RELATION_LIST_FROM` / `QUERY`).
 //!
 //! Like the memory proof, this drives the *real* `dispatch` → handler
 //! path (the same code the wire layer calls), constructing strict-mode
-//! `RequestCaller`s with distinct interned namespaces + agents directly,
+//! `RequestCaller`s with distinct interned namespaces + spaces directly,
 //! because the shared wire harness can't mint namespaced keys into a
 //! running shard. The assertions are pure membership (which ids appear),
 //! never score ordering.
@@ -23,8 +23,8 @@
 //!  2. The same entity NAME ("John Smith") created under `acme/chatbot`
 //!     and `globex` resolves to DISTINCT entity ids, and `globex`
 //!     ENTITY_RESOLVE / ENTITY_GET never returns acme's entity.
-//!  3. Within `acme`, agents `chatbot` and `research` are isolated too
-//!     (the inner agent wall) for the typed graph.
+//!  3. Within `acme`, spaces `chatbot` and `research` are isolated too
+//!     (the inner space wall) for the typed graph.
 
 #![cfg(target_os = "linux")]
 
@@ -113,16 +113,16 @@ fn build_fixture() -> Fixture {
     Fixture { ctx, metadata }
 }
 
-/// The two agents inside `acme`, plus globex's agent. Distinct so the
-/// agent inner wall can be exercised independently of the namespace wall.
+/// The two spaces inside `acme`, plus globex's space. Distinct so the
+/// space inner wall can be exercised independently of the namespace wall.
 const ACME_CHATBOT: [u8; 16] = [0xC1; 16];
 const ACME_RESEARCH: [u8; 16] = [0xC2; 16];
 const GLOBEX_BOT: [u8; 16] = [0x6B; 16];
 
-fn caller(namespace: &str, agent_bytes: [u8; 16]) -> RequestCaller {
-    let agent = brain_core::AgentId(uuid::Uuid::from_bytes(agent_bytes));
+fn caller(namespace: &str, space_bytes: [u8; 16]) -> RequestCaller {
+    let space = brain_core::SpaceId(uuid::Uuid::from_bytes(space_bytes));
     RequestCaller::from_scope(
-        agent,
+        space,
         [0u8; 16],
         [0u8; 16],
         namespace.to_string(),
@@ -419,32 +419,32 @@ fn relation_does_not_leak_across_namespaces() {
     })
 }
 
-/// Within ONE namespace, two agents (chatbot, research) are isolated for
+/// Within ONE namespace, two spaces (chatbot, research) are isolated for
 /// the typed graph: the same name mints distinct entities, and each
-/// agent's statements/relations are invisible to the other. This proves
-/// the inner (agent) wall, holding namespace constant.
+/// space's statements/relations are invisible to the other. This proves
+/// the inner (space) wall, holding namespace constant.
 #[test]
-fn agents_isolated_within_one_namespace() {
+fn spaces_isolated_within_one_namespace() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let _acme = fix.intern_namespace("acme");
         let chatbot = caller("acme", ACME_CHATBOT);
         let research = caller("acme", ACME_RESEARCH);
 
-        // Same name, same namespace, different agent → distinct entities.
+        // Same name, same namespace, different space → distinct entities.
         let cb_john = create_entity(&fix, chatbot.clone(), [1; 16], "John Smith").await;
         let rs_john = create_entity(&fix, research.clone(), [2; 16], "John Smith").await;
         assert_ne!(
             cb_john, rs_john,
-            "same name under distinct agents must mint distinct entities"
+            "same name under distinct spaces must mint distinct entities"
         );
 
-        // Each agent resolves to its own John.
+        // Each space resolves to its own John.
         let cb_res = resolve_entity(&fix, chatbot.clone(), "John Smith").await;
         assert_eq!(cb_res.resolved_entity, cb_john);
         let rs_res = resolve_entity(&fix, research.clone(), "John Smith").await;
         assert_eq!(rs_res.resolved_entity, rs_john);
-        assert_ne!(rs_res.resolved_entity, cb_john, "AGENT BREACH (resolve)");
+        assert_ne!(rs_res.resolved_entity, cb_john, "SPACE BREACH (resolve)");
 
         // chatbot's statement is invisible to research.
         let cb_stmt =
@@ -454,13 +454,13 @@ fn agents_isolated_within_one_namespace() {
         let rs_view = list_statement_subjects(&fix, research.clone(), cb_john).await;
         assert!(
             rs_view.is_empty(),
-            "AGENT BREACH: research saw chatbot's statements {rs_view:?}"
+            "SPACE BREACH: research saw chatbot's statements {rs_view:?}"
         );
 
         // chatbot's entity is unreadable by research via ENTITY_GET.
         assert!(
             !entity_get_visible(&fix, research, cb_john).await,
-            "AGENT BREACH: research read chatbot's entity via ENTITY_GET"
+            "SPACE BREACH: research read chatbot's entity via ENTITY_GET"
         );
     })
 }

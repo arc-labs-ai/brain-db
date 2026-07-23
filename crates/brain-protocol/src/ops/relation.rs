@@ -50,7 +50,7 @@ pub struct RelationGetRequest {
     /// Effective identity this get runs as, on behalf of the authenticated
     /// connection principal. `None` (the common case, and omitted on the wire)
     /// means the op runs as the connection's own key-bound identity. Scoped to
-    /// the effective `(namespace, agent)` — a foreign tenant's relation id reads
+    /// the effective `(namespace, space)` — a foreign tenant's relation id reads
     /// as `NotFound`, never across the boundary.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
@@ -93,7 +93,7 @@ pub struct RelationListFromRequest {
     pub cursor: Vec<u8>,
     /// Effective identity this list runs as. `None` (omitted on the wire) means
     /// the op runs as the connection's own key-bound identity. Scoped to the
-    /// effective `(namespace, agent)`.
+    /// effective `(namespace, space)`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
 }
@@ -114,7 +114,7 @@ pub struct RelationListToRequest {
     pub cursor: Vec<u8>,
     /// Effective identity this list runs as. `None` (omitted on the wire) means
     /// the op runs as the connection's own key-bound identity. Scoped to the
-    /// effective `(namespace, agent)`.
+    /// effective `(namespace, space)`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
 }
@@ -140,7 +140,7 @@ pub struct RelationTraverseRequest {
     /// authenticated connection principal. `None` (the common case, and
     /// omitted on the wire) means the op runs as the connection's own
     /// key-bound identity. The walk is scoped to the effective
-    /// `(namespace, agent)`, so it only follows that tenant's relations.
+    /// `(namespace, space)`, so it only follows that tenant's relations.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
 }

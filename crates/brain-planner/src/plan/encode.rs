@@ -13,7 +13,7 @@
 //! Single-shard only for now; the `shard` field is always the local
 //! shard.
 
-use brain_core::{AgentId, ContextId, MemoryKind, RequestId};
+use brain_core::{SpaceId, ContextId, MemoryKind, RequestId};
 
 use super::common::{EdgeSpec, ShardId};
 use super::recall::EmbeddingStep;
@@ -46,7 +46,7 @@ pub struct IdempotencyCheckStep {
 #[derive(Debug, Clone)]
 pub enum ContextResolutionStep {
     Explicit(ContextId),
-    GetOrCreate { agent_id: AgentId, name: String },
+    GetOrCreate { space_id: SpaceId, name: String },
 }
 
 /// The arena grows asynchronously if near full; this step doesn't

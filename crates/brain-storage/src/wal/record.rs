@@ -10,7 +10,7 @@
 //!   10..12  reserved          [u8; 2]   (zero)
 //!   12..16  payload_length    u32
 //!   16..24  timestamp_ns      u64
-//!   24..32  agent_id_lo64     u64
+//!   24..32  space_id_lo64     u64
 //!
 //! payload (variable, exactly payload_length bytes)
 //!
@@ -94,7 +94,7 @@ pub struct WalRecord {
     pub kind: WalRecordKind,
     pub flags: u8,
     pub timestamp_ns: u64,
-    pub agent_id_lo64: u64,
+    pub space_id_lo64: u64,
     pub payload: Vec<u8>,
 }
 
@@ -132,7 +132,7 @@ impl WalRecord {
         out.extend_from_slice(&[0u8, 0u8]); // reserved
         out.extend_from_slice(&payload_len_u32.to_le_bytes());
         out.extend_from_slice(&self.timestamp_ns.to_le_bytes());
-        out.extend_from_slice(&self.agent_id_lo64.to_le_bytes());
+        out.extend_from_slice(&self.space_id_lo64.to_le_bytes());
 
         // Payload.
         out.extend_from_slice(&self.payload);
@@ -173,7 +173,7 @@ impl WalRecord {
         let reserved_hi = &buf[10..12];
         let payload_length = read_u32_le(&buf[12..16]);
         let timestamp_ns = read_u64_le(&buf[16..24]);
-        let agent_id_lo64 = read_u64_le(&buf[24..32]);
+        let space_id_lo64 = read_u64_le(&buf[24..32]);
 
         if reserved_hi != [0, 0] {
             return Err(WalRecordError::NonZeroReserved);
@@ -213,7 +213,7 @@ impl WalRecord {
                 kind,
                 flags,
                 timestamp_ns,
-                agent_id_lo64,
+                space_id_lo64,
                 payload,
             },
             consumed: total,
@@ -229,7 +229,7 @@ impl WalRecord {
         lsn: Lsn,
         flags: u8,
         timestamp_ns: u64,
-        agent_id_lo64: u64,
+        space_id_lo64: u64,
         payload: &crate::wal::payload::WalPayload,
     ) -> Self {
         Self {
@@ -237,7 +237,7 @@ impl WalRecord {
             kind: payload.kind(),
             flags,
             timestamp_ns,
-            agent_id_lo64,
+            space_id_lo64,
             payload: payload.encode_to_bytes(),
         }
     }
@@ -307,7 +307,7 @@ mod tests {
             kind,
             flags: 0b0000_0011,
             timestamp_ns: 1_700_000_000_000_000_000,
-            agent_id_lo64: 0xDEAD_BEEF_CAFE_F00D,
+            space_id_lo64: 0xDEAD_BEEF_CAFE_F00D,
             payload,
         }
     }
@@ -558,7 +558,7 @@ mod tests {
             let body: Vec<u8> = (0..48u8).map(|i| i.wrapping_mul(kind.as_u8())).collect();
             let payload = WalPayload::PhaseBody(PhaseBodyRecord::new(
                 kind,
-                brain_core::AgentId::default(),
+                brain_core::SpaceId::default(),
                 body.clone(),
             ));
             let record = WalRecord::from_typed(Lsn(7), 0, 9999, 0xBB, &payload);

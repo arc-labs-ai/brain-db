@@ -472,20 +472,20 @@ pub fn cascade_forget_to_edges(
         let mem_bytes = memory_id.to_be_bytes();
         let lo = (
             scope.namespace_id,
-            scope.agent_id_bytes,
+            scope.space_id_bytes,
             mem_bytes,
             [0u8; 16],
         );
         let hi = (
             scope.namespace_id,
-            scope.agent_id_bytes,
+            scope.space_id_bytes,
             mem_bytes,
             [0xFFu8; 16],
         );
         for entry in by_ev.range(lo..=hi)? {
             let (k, _) = entry?;
-            let (k_ns, k_agent, k_mem, k_rel) = k.value();
-            if k_ns != scope.namespace_id || k_agent != scope.agent_id_bytes || k_mem != mem_bytes {
+            let (k_ns, k_space, k_mem, k_rel) = k.value();
+            if k_ns != scope.namespace_id || k_space != scope.space_id_bytes || k_mem != mem_bytes {
                 continue;
             }
             relation_ids.push(RelationId::from(k_rel));
@@ -501,7 +501,7 @@ pub fn cascade_forget_to_edges(
             let rel_bytes = rel_id.to_bytes();
             by_ev.remove(&(
                 scope.namespace_id,
-                scope.agent_id_bytes,
+                scope.space_id_bytes,
                 mem_bytes,
                 rel_bytes,
             ))?;
@@ -754,7 +754,7 @@ mod edge_cascade_tests {
         assert!(by_ev
             .get(&(
                 sc.namespace_id,
-                sc.agent_id_bytes,
+                sc.space_id_bytes,
                 m1.to_be_bytes(),
                 rid.to_bytes()
             ))
@@ -763,7 +763,7 @@ mod edge_cascade_tests {
         assert!(by_ev
             .get(&(
                 sc.namespace_id,
-                sc.agent_id_bytes,
+                sc.space_id_bytes,
                 m2.to_be_bytes(),
                 rid.to_bytes()
             ))

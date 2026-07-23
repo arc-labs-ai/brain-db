@@ -66,7 +66,7 @@ use crate::error::OpError;
 pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 /// Upper bound on the entry count of any one subscription filter list
-/// (`contexts`, `kinds`, `agents`). Otherwise bounded only by the 16 MiB
+/// (`contexts`, `kinds`, `spaces`). Otherwise bounded only by the 16 MiB
 /// payload cap; an explicit cap rejects a crafted oversized filter with
 /// a clear `InvalidRequest` instead of building a large `HashSet`. The
 /// bound is generous — far above any legitimate subscription scope.
@@ -143,12 +143,12 @@ pub struct EventEnvelope {
     pub stage_kind: Option<brain_protocol::StageKind>,
     pub stage_outcome: Option<brain_protocol::StageOutcome>,
     pub stage_payload: Option<brain_protocol::StagePayload>,
-    /// Agent the event was attributed to. Substrate writers stamp
-    /// their bound agent; typed-graph handlers stamp the auth-time
-    /// agent the request ran under. Default (nil) for tests +
+    /// Space the event was attributed to. Substrate writers stamp
+    /// their bound space; typed-graph handlers stamp the auth-time
+    /// space the request ran under. Default (nil) for tests +
     /// events synthesized from WAL records that didn't capture an
-    /// agent (none today — every WAL payload carries agent_id).
-    pub agent_id: brain_core::AgentId,
+    /// space (none today — every WAL payload carries space_id).
+    pub space_id: brain_core::SpaceId,
 }
 
 impl EventEnvelope {
@@ -202,7 +202,7 @@ impl EventEnvelope {
         match payload {
             WalPayload::Encode(p) => {
                 let mut out = Vec::with_capacity(1 + p.edges.len());
-                let agent_id = p.agent_id;
+                let space_id = p.space_id;
                 let context_id = p.context_id;
                 let kind = p.kind;
                 out.push(Self {
@@ -219,7 +219,7 @@ impl EventEnvelope {
                     stage_kind: None,
                     stage_outcome: None,
                     stage_payload: None,
-                    agent_id,
+                    space_id,
                 });
                 for e in p.edges {
                     out.push(Self {
@@ -244,7 +244,7 @@ impl EventEnvelope {
                         stage_kind: None,
                         stage_outcome: None,
                         stage_payload: None,
-                        agent_id,
+                        space_id,
                     });
                 }
                 out
@@ -265,13 +265,13 @@ impl EventEnvelope {
                 text: None,
                 graph_payload: None,
                 edge_payload: None,
-                // ForgetPayload doesn't carry agent_id today; replay
-                // can't route through the per-agent allowlist for
-                // forgets. Live forgets stamp it via `writer.agent_id`.
+                // ForgetPayload doesn't carry space_id today; replay
+                // can't route through the per-space allowlist for
+                // forgets. Live forgets stamp it via `writer.space_id`.
                 stage_kind: None,
                 stage_outcome: None,
                 stage_payload: None,
-                agent_id: brain_core::AgentId::default(),
+                space_id: brain_core::SpaceId::default(),
             }],
             WalPayload::Link(p) => vec![Self {
                 lsn,
@@ -292,13 +292,13 @@ impl EventEnvelope {
                     None,
                     brain_metadata::tables::edge::origin::EXPLICIT,
                 )),
-                // LinkPayload has no agent_id today; replay can't
-                // route to a per-agent allowlist. Live writes stamp
+                // LinkPayload has no space_id today; replay can't
+                // route to a per-space allowlist. Live writes stamp
                 // via WalSink.
                 stage_kind: None,
                 stage_outcome: None,
                 stage_payload: None,
-                agent_id: brain_core::AgentId::default(),
+                space_id: brain_core::SpaceId::default(),
             }],
             WalPayload::Unlink(p) => vec![Self {
                 lsn,
@@ -322,7 +322,7 @@ impl EventEnvelope {
                 stage_kind: None,
                 stage_outcome: None,
                 stage_payload: None,
-                agent_id: brain_core::AgentId::default(),
+                space_id: brain_core::SpaceId::default(),
             }],
             WalPayload::RelationLink(p) => vec![Self {
                 lsn,
@@ -346,7 +346,7 @@ impl EventEnvelope {
                 stage_kind: None,
                 stage_outcome: None,
                 stage_payload: None,
-                agent_id: p.agent_id,
+                space_id: p.space_id,
             }],
             WalPayload::RelationSupersede(p) => vec![Self {
                 lsn,
@@ -370,7 +370,7 @@ impl EventEnvelope {
                 stage_kind: None,
                 stage_outcome: None,
                 stage_payload: None,
-                agent_id: p.new.agent_id,
+                space_id: p.new.space_id,
             }],
             WalPayload::RelationTombstone(p) => vec![Self {
                 lsn,
@@ -405,7 +405,7 @@ impl EventEnvelope {
                 stage_kind: None,
                 stage_outcome: None,
                 stage_payload: None,
-                agent_id: p.agent_id,
+                space_id: p.space_id,
             }],
             WalPayload::PhaseBody(body_record) => {
                 // Only the subscribe-event records carry a CBOR
@@ -446,12 +446,12 @@ impl EventEnvelope {
                         stage_kind: Some(stage_body.stage_kind),
                         stage_outcome: Some(stage_body.stage_outcome),
                         stage_payload: Some(stage_body.stage_payload),
-                        // Real agent, unlike the typed-graph arm below —
+                        // Real space, unlike the typed-graph arm below —
                         // the notification record carries it in the same
                         // 16-byte prefix `publish_notification` writes, and
-                        // `PhaseBodyRecord::agent_id` is already populated
+                        // `PhaseBodyRecord::space_id` is already populated
                         // from that prefix by `WalPayload::decode`.
-                        agent_id: body_record.agent_id,
+                        space_id: body_record.space_id,
                     }];
                 }
                 // Decode the CBOR body back into the typed-graph
@@ -492,7 +492,7 @@ impl EventEnvelope {
                     stage_kind: None,
                     stage_outcome: None,
                     stage_payload: None,
-                    agent_id: brain_core::AgentId::default(),
+                    space_id: brain_core::SpaceId::default(),
                 }]
             }
             // TXN brackets, checkpoints, salience updates, reclaims,
@@ -622,11 +622,11 @@ impl Default for EventBus {
 pub struct ParsedFilter {
     pub contexts: Option<HashSet<ContextId>>,
     pub kinds: Option<HashSet<MemoryKind>>,
-    /// Subset of agent ids the subscriber wants events for. `None`
-    /// = all agents (substrate-wide). On a shared shard this is
-    /// the difference between "I see only my agent" and "I see
-    /// every agent on this shard.".
-    pub agents: Option<HashSet<brain_core::AgentId>>,
+    /// Subset of space ids the subscriber wants events for. `None`
+    /// = all spaces (substrate-wide). On a shared shard this is
+    /// the difference between "I see only my space" and "I see
+    /// every space on this shard.".
+    pub spaces: Option<HashSet<brain_core::SpaceId>>,
     /// Subset of memory ids the subscriber wants events for. `None`
     /// = all memories. Lets a client scope a subscription to a
     /// single in-flight write (e.g. to watch that write's async
@@ -642,8 +642,8 @@ pub struct ParsedFilter {
 impl ParsedFilter {
     #[must_use]
     pub fn matches(&self, env: &EventEnvelope) -> bool {
-        if let Some(agents) = &self.agents {
-            if !agents.contains(&env.agent_id) {
+        if let Some(spaces) = &self.spaces {
+            if !spaces.contains(&env.space_id) {
                 return false;
             }
         }
@@ -694,10 +694,10 @@ pub fn parse_filter(req: &SubscribeRequest) -> Result<ParsedFilter, OpError> {
             )));
         }
     }
-    if let Some(ref v) = req.filter.agents {
+    if let Some(ref v) = req.filter.spaces {
         if v.len() > MAX_SUBSCRIBE_FILTER_ENTRIES {
             return Err(OpError::InvalidRequest(format!(
-                "subscribe: filter.agents must have <= {MAX_SUBSCRIBE_FILTER_ENTRIES} entries"
+                "subscribe: filter.spaces must have <= {MAX_SUBSCRIBE_FILTER_ENTRIES} entries"
             )));
         }
     }
@@ -719,24 +719,24 @@ pub fn parse_filter(req: &SubscribeRequest) -> Result<ParsedFilter, OpError> {
             .map(MemoryKind::from)
             .collect::<HashSet<_>>()
     });
-    // An empty agent list is "no filter" (same as None) — the wire
+    // An empty space list is "no filter" (same as None) — the wire
     // encoding can't tell them apart cleanly, and an empty allowlist
     // would silently drop every event, which is rarely what a
     // subscriber means.
-    let agents = req.filter.agents.as_ref().and_then(|v| {
+    let spaces = req.filter.spaces.as_ref().and_then(|v| {
         if v.is_empty() {
             None
         } else {
             Some(
                 v.iter()
                     .copied()
-                    .map(brain_core::AgentId::from)
+                    .map(brain_core::SpaceId::from)
                     .collect::<HashSet<_>>(),
             )
         }
     });
     // An empty memory_ids list is "no filter" (same as None), mirroring
-    // the `agents` handling above — an empty allowlist would silently
+    // the `spaces` handling above — an empty allowlist would silently
     // drop every event.
     let memory_ids = req.filter.memory_ids.as_ref().and_then(|v| {
         if v.is_empty() {
@@ -753,7 +753,7 @@ pub fn parse_filter(req: &SubscribeRequest) -> Result<ParsedFilter, OpError> {
     Ok(ParsedFilter {
         contexts,
         kinds,
-        agents,
+        spaces,
         memory_ids,
         min_salience: None,
     })

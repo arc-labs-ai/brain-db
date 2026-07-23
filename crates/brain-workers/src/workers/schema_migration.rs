@@ -303,7 +303,7 @@ mod tests {
 
     use super::*;
     use brain_core::{
-        AgentId, ContextId, EntityId, ExtractorId, MemoryId, PredicateId, StatementId,
+        SpaceId, ContextId, EntityId, ExtractorId, MemoryId, PredicateId, StatementId,
         StatementKind,
     };
     use brain_core::{
@@ -398,8 +398,8 @@ mod tests {
         ))
     }
 
-    fn put_subject(metadata: &SharedMetadataDb, agent: AgentId) -> EntityId {
-        let _ = agent;
+    fn put_subject(metadata: &SharedMetadataDb, space: SpaceId) -> EntityId {
+        let _ = space;
         let id = EntityId::new();
         let wtxn = metadata.write_txn().unwrap();
         entity_put(
@@ -499,7 +499,7 @@ mod tests {
         // predicate `acme:ghost`. Then upload a schema that declares
         // only `prefers`. The worker's sweep must flag the ghost row.
         let fx = build_fixture();
-        let subject = put_subject(&fx.metadata, AgentId::default());
+        let subject = put_subject(&fx.metadata, SpaceId::default());
         let (sid_ghost, _) = write_statement(&fx.metadata, subject, "acme", "ghost");
 
         let v = upload_schema(&fx.metadata, &schema_with_predicates("acme", &["prefers"]));
@@ -532,7 +532,7 @@ mod tests {
         // — sweep flags it. v2 schema adds `ghost`. Sweep against v2
         // must CLEAR the flag.
         let fx = build_fixture();
-        let subject = put_subject(&fx.metadata, AgentId::default());
+        let subject = put_subject(&fx.metadata, SpaceId::default());
         let (sid_ghost, _) = write_statement(&fx.metadata, subject, "acme", "ghost");
 
         // v1: ghost is OUT.
@@ -575,7 +575,7 @@ mod tests {
         // Two ticks on the same enqueued job: the second is a no-op
         // (every row is already at its correct flag state).
         let fx = build_fixture();
-        let subject = put_subject(&fx.metadata, AgentId::default());
+        let subject = put_subject(&fx.metadata, SpaceId::default());
         let (sid, _) = write_statement(&fx.metadata, subject, "acme", "ghost");
         let v = upload_schema(&fx.metadata, &schema_with_predicates("acme", &["prefers"]));
 

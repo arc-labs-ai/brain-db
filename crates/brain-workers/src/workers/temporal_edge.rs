@@ -1,9 +1,9 @@
 //! TemporalEdgeWorker — derives `FollowedBy` substrate edges by
-//! walking the per-agent timeline index after every ENCODE.
+//! walking the per-space timeline index after every ENCODE.
 //!
 //! ## Why this exists
 //!
-//! Real agents stream observations in order. Each new memory almost
+//! Real spaces stream observations in order. Each new memory almost
 //! always *follows* a previous one in a narrative sense — but until
 //! this worker landed every `FollowedBy` edge had to be hand-attached
 //! by the caller via `--edge followed_by:<prev_id>`. The
@@ -12,13 +12,13 @@
 //! ## Flow
 //!
 //! 1. The writer's ENCODE handler pushes
-//!    `(memory_id, agent_id, context_id, created_at_unix_nanos)`
+//!    `(memory_id, space_id, context_id, created_at_unix_nanos)`
 //!    into a per-shard `flume::Sender` after redb commit. Non-blocking;
 //!    full channel drops with a counter bump.
 //! 2. The worker drains the receiver in bounded batches every
 //!    `interval_ms`. For each enqueue it walks
-//!    `MEMORIES_BY_AGENT_TIMELINE_TABLE` backwards from the new
-//!    memory's timestamp to find the predecessor in the same agent +
+//!    `MEMORIES_BY_SPACE_TIMELINE_TABLE` backwards from the new
+//!    memory's timestamp to find the predecessor in the same space +
 //!    context, computes a linear-decay weight from the gap, and writes
 //!    a `FollowedBy` edge from predecessor → new memory.
 //! 3. The worker builds a single `Write { phases: Vec<Phase::Link> }`
@@ -30,7 +30,7 @@
 //!
 //! ## What's *not* in scope
 //!
-//! - Cross-agent edges (different agent_id → no edge).
+//! - Cross-space edges (different space_id → no edge).
 //! - Cross-context by default (`cross_context = true` knob to opt in).
 //! - Multi-strand temporal threading. If three memories arrive in
 //!   rapid succession this worker builds a chain, not a fan.
@@ -43,11 +43,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use brain_core::{AgentId, ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
+use brain_core::{SpaceId, ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
 use brain_metadata::tables::edge::{derived_by, origin, zero_disambiguator, EdgeKey};
 use brain_metadata::tables::memory::{
-    agent_timeline_prefix_agent, agent_timeline_prefix_agent_time, AGENT_TIMELINE_KEY_LEN,
-    MEMORIES_BY_AGENT_TIMELINE_TABLE, MEMORIES_TABLE,
+    space_timeline_prefix_space, space_timeline_prefix_space_time, SPACE_TIMELINE_KEY_LEN,
+    MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE,
 };
 use brain_ops::{
     EventEnvelope, Phase, RealWriterHandle, TemporalEdgeEnqueue, TemporalEdgeMetrics,
@@ -86,7 +86,7 @@ pub struct TemporalEdgeKnobs {
     /// `FollowedBy` edge regardless of content — "I had lunch" then
     /// "deployed to prod" would link despite zero shared topic.
     ///
-    /// Strict (≥0.5): tight thematic chains; the agent's narrative
+    /// Strict (≥0.5): tight thematic chains; the space's narrative
     /// stays on-topic. Loose (~0.3): broader narrative; cross-topic
     /// adjacency captured. 0.4 is the operator-tunable middle.
     pub topical_threshold: f32,
@@ -94,7 +94,7 @@ pub struct TemporalEdgeKnobs {
 
 /// Maximum gap between two memories for the later one to be linked as
 /// `FollowedBy` the earlier. 30 minutes, not 5: a single conversational
-/// session has natural pauses — the agent reads a doc, the human steps
+/// session has natural pauses — the space reads a doc, the human steps
 /// away — and a 5-minute window slices that one session into
 /// disconnected fragments, breaking the narrative chain the retriever
 /// walks. 30 minutes keeps a session's turns linked while still cutting
@@ -233,11 +233,11 @@ async fn do_temporal_edge_cycle(
     // commit for each source.
     let mut drained_sources: Vec<MemoryId> = Vec::new();
     let mut per_source_edges: HashMap<MemoryId, u32> = HashMap::new();
-    // Real owning agent for each drained source, carried through from the
+    // Real owning space for each drained source, carried through from the
     // writer's enqueue payload — the `StageCompleted{TemporalEdge}`
-    // publish below stamps this instead of `AgentId::default()` so an
-    // agent-scoped SUBSCRIBE filter actually matches the event.
-    let mut source_agents: HashMap<MemoryId, AgentId> = HashMap::new();
+    // publish below stamps this instead of `SpaceId::default()` so an
+    // space-scoped SUBSCRIBE filter actually matches the event.
+    let mut source_spaces: HashMap<MemoryId, SpaceId> = HashMap::new();
 
     while processed < cfg.batch_size {
         if started.elapsed() >= cfg.max_runtime {
@@ -267,17 +267,17 @@ async fn do_temporal_edge_cycle(
                 Err(_) => break,
             }
         };
-        let (new_memory_id, agent_id, context_id, new_ts, new_vector) = item;
+        let (new_memory_id, space_id, context_id, new_ts, new_vector) = item;
         processed += 1;
         drained_sources.push(new_memory_id);
-        source_agents.insert(new_memory_id, agent_id);
+        source_spaces.insert(new_memory_id, space_id);
 
-        // Look up the predecessor via the agent-timeline index in
+        // Look up the predecessor via the space-timeline index in
         // its own read txn. One tiny rtxn per enqueue keeps the
         // lock contention surface minimal.
         let prev_lookup = lookup_predecessor(
             ctx,
-            agent_id,
+            space_id,
             context_id,
             new_ts,
             new_memory_id,
@@ -325,7 +325,7 @@ async fn do_temporal_edge_cycle(
         if !new_vector.iter().all(|c| *c == 0.0) {
             // K = 64 matches default ef_search. The widest practical
             // case is "the predecessor is a top-64 neighbour" — true
-            // for any topical link in agent-journaling workloads;
+            // for any topical link in space-journaling workloads;
             // very-distant predecessors are precisely the ones we
             // want to drop.
             const TOPICAL_KNN_K: usize = 64;
@@ -407,7 +407,7 @@ async fn do_temporal_edge_cycle(
             })
             .collect();
         let request_hash = hash_temporal_batch(&to_link);
-        let write = Write::from_phases(WriteId::new(), AgentId::default(), phases)
+        let write = Write::from_phases(WriteId::new(), SpaceId::default(), phases)
             .with_request_hash(request_hash);
         let real_writer = ctx
             .ops
@@ -491,7 +491,7 @@ async fn do_temporal_edge_cycle(
             stage_payload: Some(StagePayload::TemporalEdge(StageTemporalEdgePayload {
                 edges_written,
             })),
-            agent_id: source_agents.get(&memory_id).copied().unwrap_or_default(),
+            space_id: source_spaces.get(&memory_id).copied().unwrap_or_default(),
         };
         ctx.ops.publish_stage_event(envelope).await;
     }
@@ -539,7 +539,7 @@ enum PredecessorOutcome {
 
 fn lookup_predecessor(
     ctx: &WorkerContext,
-    agent_id: AgentId,
+    space_id: SpaceId,
     context_id: ContextId,
     new_ts: u64,
     new_memory_id: MemoryId,
@@ -552,7 +552,7 @@ fn lookup_predecessor(
         Ok(t) => t,
         Err(_) => return PredecessorOutcome::Skip(TemporalSkipReason::NoPrev),
     };
-    let timeline_t = match rtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE) {
+    let timeline_t = match rtxn.open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE) {
         Ok(t) => t,
         Err(_) => return PredecessorOutcome::Skip(TemporalSkipReason::NoPrev),
     };
@@ -573,14 +573,14 @@ fn lookup_predecessor(
         }
     };
 
-    // Range scan: from the start of this (namespace, agent)'s rows up to
+    // Range scan: from the start of this (namespace, space)'s rows up to
     // (but not including) the new memory's key. The last entry in that
     // range is the most recent predecessor. The timeline key is:
-    //   [namespace(4)] [agent(16)] [created_at_be(8)] [context(8)] [memory_id(16)]
-    // so a prefix `[namespace(4)] [agent(16)] [new_ts_be(8)]` and a `..`
+    //   [namespace(4)] [space(16)] [created_at_be(8)] [context(8)] [memory_id(16)]
+    // so a prefix `[namespace(4)] [space(16)] [new_ts_be(8)]` and a `..`
     // exclusive upper bound is exactly what we want.
-    let lower = agent_timeline_prefix_agent(namespace_id, agent_id.0.into_bytes());
-    let upper_24 = agent_timeline_prefix_agent_time(namespace_id, agent_id.0.into_bytes(), new_ts);
+    let lower = space_timeline_prefix_space(namespace_id, space_id.0.into_bytes());
+    let upper_24 = space_timeline_prefix_space_time(namespace_id, space_id.0.into_bytes(), new_ts);
 
     let lower_slice = lower.as_slice();
     let upper_slice = upper_24.as_slice();
@@ -589,9 +589,9 @@ fn lookup_predecessor(
         Err(_) => return PredecessorOutcome::Skip(TemporalSkipReason::NoPrev),
     };
 
-    // Walk to the last row by consuming the iterator. Most agents
+    // Walk to the last row by consuming the iterator. Most spaces
     // produce ≤1 memory per cycle; the iterator length is bounded by
-    // how many rows the agent has within the window-equivalent slice.
+    // how many rows the space has within the window-equivalent slice.
     // For tighter performance once it's a hot path we can add a
     // reverse-iter API to redb; for now, forward + last() is fine.
     let mut last_key: Option<Vec<u8>> = None;
@@ -603,12 +603,12 @@ fn lookup_predecessor(
     let Some(last_key_bytes) = last_key else {
         return PredecessorOutcome::Skip(TemporalSkipReason::NoPrev);
     };
-    if last_key_bytes.len() != AGENT_TIMELINE_KEY_LEN {
+    if last_key_bytes.len() != SPACE_TIMELINE_KEY_LEN {
         // Corrupt key length — treat as no predecessor.
         return PredecessorOutcome::Skip(TemporalSkipReason::NoPrev);
     }
 
-    // Decode the key (namespace-prefixed layout: ns(4) agent(16)
+    // Decode the key (namespace-prefixed layout: ns(4) space(16)
     // ts(8) context(8) memory_id(16)).
     let prev_ts = u64::from_be_bytes(last_key_bytes[20..28].try_into().unwrap_or([0; 8]));
     let prev_context = u64::from_be_bytes(last_key_bytes[28..36].try_into().unwrap_or([0; 8]));
@@ -617,7 +617,7 @@ fn lookup_predecessor(
     let prev_id = MemoryId::from_be_bytes(prev_mem_bytes);
 
     // Order check — the range scan is upper-exclusive on the
-    // (agent, ts)-prefix, so prev_ts < new_ts MUST hold. Defensive.
+    // (space, ts)-prefix, so prev_ts < new_ts MUST hold. Defensive.
     if prev_ts >= new_ts {
         return PredecessorOutcome::Skip(TemporalSkipReason::OutOfOrder);
     }

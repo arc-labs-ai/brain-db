@@ -213,7 +213,7 @@ mod tests {
         // trailing statement id (multi-value). Build the exact key.
         let pkey = (
             sc.namespace_id,
-            sc.agent_id_bytes,
+            sc.space_id_bytes,
             pred.raw(),
             StatementKind::Fact.as_u8(),
             bucket,

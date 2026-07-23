@@ -298,7 +298,7 @@ fn encode_conflict_returns_conflict_error_code() {
 // ---------------------------------------------------------------------------
 //
 // Dedup is a DB policy — on by default for text ENCODE, scoped per
-// `(shard, agent_id, context_id)`, tombstone-aware. The client's only
+// `(shard, space_id, context_id)`, tombstone-aware. The client's only
 // control is the per-request `allow_duplicates` opt-out; the default
 // builder produces a dedup-on encode (only request_id / text / context
 // vary), and `encode_req_allow_dup` sets the opt-out to force a distinct
@@ -333,7 +333,7 @@ fn encode_req_allow_dup(request_id: [u8; 16], text: &str, context_id: u64) -> En
 #[test]
 fn same_text_dedupes_to_one_memory() {
     // Content dedup is on by default: byte-identical text under the same
-    // `(agent_id, context_id)` collapses to one memory even across distinct
+    // `(space_id, context_id)` collapses to one memory even across distinct
     // request_ids. The second encode reports `was_deduplicated = true` and
     // returns the first memory's id — no new slot, WAL record, or index node.
     run_in_glommio(|| async {

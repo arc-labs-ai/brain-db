@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 
 use brain_core::{
-    AgentId, ContextId, EdgeKind, EdgeOrigin, MemoryId, MemoryKind, RequestId, TxnId,
+    SpaceId, ContextId, EdgeKind, EdgeOrigin, MemoryId, MemoryKind, RequestId, TxnId,
 };
 use brain_metadata::tables::checkpoint::{latest as latest_checkpoint, CHECKPOINTS_TABLE};
 use brain_metadata::tables::edge::EDGES_TABLE;
@@ -108,7 +108,7 @@ fn mid(slot: u64, version: u32) -> MemoryId {
     MemoryId::pack(1, slot, version)
 }
 
-fn aid(byte: u8) -> AgentId {
+fn aid(byte: u8) -> SpaceId {
     let mut b = [0u8; 16];
     b[15] = byte;
     b.into()
@@ -130,7 +130,7 @@ fn encode_payload(slot: u64, byte: u8) -> EncodePayload {
     EncodePayload {
         memory_id: mid(slot, 1),
         request_id: rid(byte),
-        agent_id: aid(byte),
+        space_id: aid(byte),
         // Derive a distinct, non-system namespace per fixture byte so a
         // recovery scenario can assert the owner namespace survives replay.
         namespace_id: brain_core::NamespaceId::from(u32::from(byte)),
@@ -626,7 +626,7 @@ fn run_iteration(seed: u64) {
                             WalPayload::Forget(ForgetPayload {
                                 memory_id: mid(slot, 1),
                                 request_id: rid(seed_byte ^ 0xFF),
-                                agent_id: brain_core::AgentId::default(),
+                                space_id: brain_core::SpaceId::default(),
                                 mode: ForgetMode::Soft,
                                 reason: ForgetReason::ClientRequest,
                             }),
@@ -767,7 +767,7 @@ fn relation_link_payload(
         extractor_id: 3,
         is_symmetric: false,
         properties_blob: vec![],
-        agent_id: aid(1),
+        space_id: aid(1),
         namespace_id: brain_core::NamespaceId::from(9),
         relation_type_intern_hint: None,
     }
@@ -809,7 +809,7 @@ fn scenario_h_relation_link_supersede_tombstone_replays() {
                 relation_id: r3,
                 reason: "stale".into(),
                 at_unix_nanos: T0 + 300,
-                agent_id: aid(2),
+                space_id: aid(2),
             }),
             T0 + 300,
         ),

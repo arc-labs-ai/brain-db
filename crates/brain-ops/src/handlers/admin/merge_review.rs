@@ -118,14 +118,14 @@ pub async fn handle_admin_approve_merge(
     }
 
     let now = crate::txn::now_unix_nanos_pub();
-    let actor = MergeActor::Agent(ctx.executor.caller_agent.into());
+    let actor = MergeActor::Space(ctx.executor.caller_space.into());
     let phase = Phase::ApproveMerge {
         proposal_id,
         actor,
         grace_seconds: DEFAULT_ADMIN_APPROVE_GRACE_SECS,
         at_unix_nanos: now,
     };
-    let write = Write::single(WriteId::new(), ctx.executor.caller_agent, phase);
+    let write = Write::single(WriteId::new(), ctx.executor.caller_space, phase);
     let real_writer = downcast_writer_pub(ctx)?;
     let ack = real_writer
         .submit(write)
@@ -178,7 +178,7 @@ pub async fn handle_admin_reject_merge(
         proposal_id,
         at_unix_nanos: now,
     };
-    let write = Write::single(WriteId::new(), ctx.executor.caller_agent, phase);
+    let write = Write::single(WriteId::new(), ctx.executor.caller_space, phase);
     let real_writer = downcast_writer_pub(ctx)?;
     let ack = real_writer
         .submit(write)

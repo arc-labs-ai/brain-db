@@ -253,7 +253,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, Salience};
+    use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, Salience};
     use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
     use brain_index::{IndexParams, RankedItem, SemanticError, SemanticRetriever, SharedHnsw};
     use brain_metadata::tables::memory::MemoryMetadata;
@@ -331,7 +331,7 @@ mod tests {
             let row = MemoryMetadata::new_active(
                 id,
                 brain_core::NamespaceId::SYSTEM,
-                AgentId::new(),
+                SpaceId::new(),
                 context_id,
                 0,
                 id.version(),

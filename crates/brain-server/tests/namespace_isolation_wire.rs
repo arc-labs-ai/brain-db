@@ -6,12 +6,12 @@
 //! reserved SYSTEM namespace, which would collapse all tenants into one bucket.
 //!
 //! To make these assertions about the *namespace* boundary specifically (and
-//! not the orthogonal per-agent filter that `agent_isolation.rs` already
-//! covers), every connection here binds the SAME agent_id under DIFFERENT
-//! namespaces. With the agent held constant, the only thing that can keep one
+//! not the orthogonal per-space filter that `space_isolation.rs` already
+//! covers), every connection here binds the SAME space_id under DIFFERENT
+//! namespaces. With the space held constant, the only thing that can keep one
 //! tenant's data out of another's is the namespace scope. If dispatch resolved
 //! both keys to SYSTEM (the bug), the two tenants would share one
-//! (namespace, agent) bucket: a foreign `ENTITY_GET` would succeed and a name
+//! (namespace, space) bucket: a foreign `ENTITY_GET` would succeed and a name
 //! shared across tenants would resolve across the boundary — both asserted
 //! against here.
 //!
@@ -276,19 +276,19 @@ async fn entity_get_visible(client: &mut TcpStream, stream_id: u32, entity_id: [
 // ---------------------------------------------------------------------------
 
 /// The end-to-end tenancy gate. Two keys bound to DIFFERENT namespaces but the
-/// SAME agent must be fully isolated: AUTH_OK echoes each tenant, a name shared
+/// SAME space must be fully isolated: AUTH_OK echoes each tenant, a name shared
 /// across tenants resolves only within each tenant, and a foreign entity id is
-/// unreadable. Holding the agent constant pins the assertion to the namespace
+/// unreadable. Holding the space constant pins the assertion to the namespace
 /// boundary — the exact path the dispatch SYSTEM-fallback bug defeated (under
-/// which both keys share one (SYSTEM, agent) bucket and these all leak).
+/// which both keys share one (SYSTEM, space) bucket and these all leak).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn distinct_namespaces_are_isolated_end_to_end() {
     let server = start(1).await; // one shard → both tenants collocated
 
-    // Same agent under both tenants, so only the namespace can separate them.
-    let agent = [0xCCu8; 16];
-    let acme_key = server.mint("acme", agent, brain_metadata::api_keys::bits::FULL);
-    let globex_key = server.mint("globex", agent, brain_metadata::api_keys::bits::FULL);
+    // Same space under both tenants, so only the namespace can separate them.
+    let space = [0xCCu8; 16];
+    let acme_key = server.mint("acme", space, brain_metadata::api_keys::bits::FULL);
+    let globex_key = server.mint("globex", space, brain_metadata::api_keys::bits::FULL);
 
     let mut acme = TcpStream::connect(server.data_plane_addr)
         .await
@@ -355,15 +355,15 @@ async fn distinct_namespaces_are_isolated_end_to_end() {
 
 /// The same tenant is reachable by a second key: an entity created under the
 /// `acme` tenant by one key is resolvable and readable by a SECOND `acme` key
-/// (same agent). This proves the key → namespace → data path lands in one
+/// (same space). This proves the key → namespace → data path lands in one
 /// stable per-shard tenant bucket, not a fresh fallback per connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn same_tenant_is_reachable_by_a_second_key() {
     let server = start(1).await;
 
-    let agent = [0xDDu8; 16];
-    let key1 = server.mint("acme", agent, brain_metadata::api_keys::bits::FULL);
-    let key2 = server.mint("acme", agent, brain_metadata::api_keys::bits::FULL);
+    let space = [0xDDu8; 16];
+    let key1 = server.mint("acme", space, brain_metadata::api_keys::bits::FULL);
+    let key2 = server.mint("acme", space, brain_metadata::api_keys::bits::FULL);
 
     let mut conn1 = TcpStream::connect(server.data_plane_addr)
         .await
@@ -372,7 +372,7 @@ async fn same_tenant_is_reachable_by_a_second_key() {
     assert_eq!(authok1.namespace, "acme");
     let entity = create_entity(&mut conn1, 1, "Acme Vault").await;
 
-    // A fresh connection with a DIFFERENT key for the SAME (namespace, agent).
+    // A fresh connection with a DIFFERENT key for the SAME (namespace, space).
     let mut conn2 = TcpStream::connect(server.data_plane_addr)
         .await
         .expect("connect 2");

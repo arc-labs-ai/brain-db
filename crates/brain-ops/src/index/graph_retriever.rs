@@ -154,7 +154,7 @@ fn walk(
     // constrained to it so the walk cannot surface another tenant's
     // typed-graph rows.
     let scope =
-        brain_metadata::RowScope::from_bytes(config.caller_namespace, config.caller_agent_bytes);
+        brain_metadata::RowScope::from_bytes(config.caller_namespace, config.caller_space_bytes);
 
     let mut visited: HashSet<NodeRef> = HashSet::new();
     // `(node, hop, edge_weight_into_node)`. Anchor enters with
@@ -320,14 +320,14 @@ fn typed_edge_is_current(
         .get(&rel_id.to_bytes())
         .map_err(|e| GraphError::IndexUnavailable(format!("sidecar get: {e}")))?;
     // Tenant wall (defense in depth): a relation whose sidecar belongs
-    // to a different `(namespace, agent)` is treated as absent, so the
+    // to a different `(namespace, space)` is treated as absent, so the
     // unified edge table — which is not scope-keyed — can never leak a
     // foreign tenant's typed relation into the walk.
     Ok(row
         .map(|g| {
             let m = g.value();
             m.namespace_id == scope.namespace_id
-                && m.agent_id_bytes == scope.agent_id_bytes
+                && m.space_id_bytes == scope.space_id_bytes
                 && m.is_current()
         })
         .unwrap_or(false))
@@ -391,7 +391,7 @@ fn run_path(
     check_entity_anchor(rtxn, to)?;
 
     let scope =
-        brain_metadata::RowScope::from_bytes(config.caller_namespace, config.caller_agent_bytes);
+        brain_metadata::RowScope::from_bytes(config.caller_namespace, config.caller_space_bytes);
 
     // Single-source BFS from `from`. Tracks parent for each
     // discovered entity so we can reconstruct the path once `to`

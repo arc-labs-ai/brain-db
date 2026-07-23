@@ -495,14 +495,14 @@ mod tests {
     use crate::wal::record::{Lsn, WalRecord};
     use crate::wal::segment::WalSegment;
     use crate::wal::wal::Wal;
-    use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, RequestId, TxnId};
+    use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, RequestId, TxnId};
     use std::path::{Path, PathBuf};
 
     fn uuid(byte: u8) -> [u8; 16] {
         [byte; 16]
     }
 
-    fn aid(byte: u8) -> AgentId {
+    fn aid(byte: u8) -> SpaceId {
         let mut b = [0u8; 16];
         b[15] = byte;
         b.into()
@@ -535,7 +535,7 @@ mod tests {
         let p = EncodePayload {
             memory_id,
             request_id: rid(0),
-            agent_id: aid(0),
+            space_id: aid(0),
             namespace_id: brain_core::NamespaceId::SYSTEM,
             context_id: ContextId(0),
             kind: MemoryKind::Episodic,
@@ -563,7 +563,7 @@ mod tests {
         let p = ForgetPayload {
             memory_id,
             request_id: rid(0),
-            agent_id: brain_core::AgentId::default(),
+            space_id: brain_core::SpaceId::default(),
             mode: ForgetMode::Soft,
             reason: ForgetReason::ClientRequest,
         };
@@ -581,7 +581,7 @@ mod tests {
         let p = ForgetPayload {
             memory_id,
             request_id: rid(0),
-            agent_id: brain_core::AgentId::default(),
+            space_id: brain_core::SpaceId::default(),
             mode: ForgetMode::Hard,
             reason: ForgetReason::ClientRequest,
         };
@@ -961,7 +961,7 @@ mod tests {
             Lsn(1),
             0,
             rec.timestamp_ns,
-            rec.agent_id_lo64,
+            rec.space_id_lo64,
             &WalPayload::Encode(payload),
         );
         write_via_segment(&wal_dir, &[rec]);
@@ -994,7 +994,7 @@ mod tests {
             Lsn(1),
             0,
             rec.timestamp_ns,
-            rec.agent_id_lo64,
+            rec.space_id_lo64,
             &WalPayload::Encode(payload),
         );
         write_via_segment(&wal_dir, &[rec]);
@@ -1025,7 +1025,7 @@ mod tests {
             0xBEEF,
             &WalPayload::PhaseBody(PhaseBodyRecord::new(
                 kind,
-                brain_core::AgentId::default(),
+                brain_core::SpaceId::default(),
                 body,
             )),
         )
@@ -1089,7 +1089,7 @@ mod tests {
             0xF00D,
             &WalPayload::PhaseBody(PhaseBodyRecord::new(
                 WalRecordKind::StageCompleted,
-                brain_core::AgentId::default(),
+                brain_core::SpaceId::default(),
                 body,
             )),
         );

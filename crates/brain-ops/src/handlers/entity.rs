@@ -43,10 +43,10 @@ use crate::write::{Phase, PhaseAck, TombstoneTarget, Write, WriteId};
 const DEFAULT_MERGE_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Whether `id`'s primary row belongs to the caller's `(namespace,
-/// agent)` scope. The brain-core [`Entity`] returned by `entity_get`
+/// space)` scope. The brain-core [`Entity`] returned by `entity_get`
 /// drops the scope (brain-core has no slot for it), so the tenant wall
 /// is enforced here by re-reading the row's `namespace_id` /
-/// `agent_id_bytes` from [`ENTITIES_TABLE`]. Returns `false` (deny) on
+/// `space_id_bytes` from [`ENTITIES_TABLE`]. Returns `false` (deny) on
 /// a missing row or any read error — fail-closed.
 fn entity_id_in_caller_scope(ctx: &OpsContext, id: EntityId) -> bool {
     use brain_metadata::tables::entity::{EntityMetadata, ENTITIES_TABLE};
@@ -60,7 +60,7 @@ fn entity_id_in_caller_scope(ctx: &OpsContext, id: EntityId) -> bool {
     match row {
         Some(m) => {
             m.namespace_id == ctx.executor.caller_namespace.raw()
-                && m.agent_id_bytes == <[u8; 16]>::from(ctx.executor.caller_agent)
+                && m.space_id_bytes == <[u8; 16]>::from(ctx.executor.caller_space)
         }
         None => false,
     }
@@ -104,7 +104,7 @@ pub async fn handle_entity_create(
 
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
-        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_create_request(&req);
 
     let phase = Phase::UpsertEntity {
@@ -116,7 +116,7 @@ pub async fn handle_entity_create(
         attributes,
         created_at_unix_nanos: now,
     };
-    let write = Write::single(write_id, ctx.executor.caller_agent, phase)
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
@@ -169,7 +169,7 @@ pub async fn handle_entity_get(
         detail: format!("{id:?}"),
     })?;
     // Tenant wall (unconditional). `entity_get` is id-keyed and does not
-    // scope-check, so a caller naming a foreign `(namespace, agent)`'s
+    // scope-check, so a caller naming a foreign `(namespace, space)`'s
     // EntityId would otherwise read across the boundary. Reject it as a
     // plain NotFound — the caller must not be able to distinguish "no such
     // entity" from "exists but belongs to another tenant".
@@ -207,7 +207,7 @@ pub async fn handle_entity_update(
 
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
-        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_update_request(&req, id);
 
     let phase = Phase::UpdateEntity {
@@ -217,7 +217,7 @@ pub async fn handle_entity_update(
         attributes_blob: req.attributes_blob.clone(),
         at_unix_nanos: now,
     };
-    let write = Write::single(write_id, ctx.executor.caller_agent, phase)
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
@@ -274,7 +274,7 @@ pub async fn handle_entity_rename(
 
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
-        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_rename_request(&req, id);
 
     let phase = Phase::RenameEntity {
@@ -282,7 +282,7 @@ pub async fn handle_entity_rename(
         new_canonical_name: req.new_canonical_name.clone(),
         at_unix_nanos: now,
     };
-    let write = Write::single(write_id, ctx.executor.caller_agent, phase)
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
@@ -334,12 +334,12 @@ pub async fn handle_entity_merge(
 
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
-        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_merge_request(&req);
-    // Wire-initiated merges always carry the caller's agent_id (operator
+    // Wire-initiated merges always carry the caller's space_id (operator
     // merge). The `System` actor is reserved for resolver / background
     // workers.
-    let actor = MergeActor::Agent(ctx.executor.caller_agent.into());
+    let actor = MergeActor::Space(ctx.executor.caller_space.into());
 
     let phase = Phase::MergeEntities {
         source: merged,
@@ -352,7 +352,7 @@ pub async fn handle_entity_merge(
         actor,
         grace_seconds: DEFAULT_MERGE_GRACE_SECS,
     };
-    let write = Write::single(write_id, ctx.executor.caller_agent, phase)
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
@@ -400,18 +400,18 @@ pub async fn handle_entity_unmerge(
 
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
-        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_unmerge_request(&req, merged);
 
-    // Operator-initiated unmerges attribute to the caller's agent —
+    // Operator-initiated unmerges attribute to the caller's space —
     // mirrors handle_entity_merge. `System` is reserved for resolver /
     // background workers that auto-unmerge after a heuristic.
     let phase = Phase::UnmergeEntities {
         merged,
-        actor: MergeActor::Agent(ctx.executor.caller_agent.into()),
+        actor: MergeActor::Space(ctx.executor.caller_space.into()),
         at_unix_nanos: now,
     };
-    let write = Write::single(write_id, ctx.executor.caller_agent, phase)
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
@@ -459,7 +459,7 @@ pub async fn handle_entity_tombstone(
 
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
-        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_tombstone_request(&req, id);
 
     // Pre-check existence so we return NotFound at the handler edge
@@ -487,7 +487,7 @@ pub async fn handle_entity_tombstone(
         reason: 1,
         at_unix_nanos: now,
     };
-    let write = Write::single(write_id, ctx.executor.caller_agent, phase)
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
@@ -665,7 +665,7 @@ pub async fn handle_entity_list(
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
         entity_list_by_type(
             &rtxn,
-            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_agent),
+            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space),
             type_id,
         )
         .map_err(OpError::from)?
@@ -739,7 +739,7 @@ pub async fn handle_entity_resolve(
     // none → not found. Typed fuzzy tiers (trigram/alias) need a specific
     // type, so the no-hint path stays exact-only — precise and fast.
     let scope =
-        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_agent);
+        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
     if req.entity_type_hint == 0 {
         let rtxn = ctx
             .executor

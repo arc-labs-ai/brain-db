@@ -12,7 +12,7 @@
 
 use std::fmt;
 
-use brain_core::AgentId;
+use brain_core::SpaceId;
 
 use crate::framework::item::ExtractedItem;
 
@@ -49,7 +49,7 @@ pub trait EnricherHook: Send + Sync {
     /// plugin (failures included).
     fn run(
         &self,
-        agent_id: AgentId,
+        space_id: SpaceId,
         items: &mut Vec<ExtractedItem>,
         source_text: &str,
         now_unix_nanos: u64,
@@ -71,7 +71,7 @@ impl fmt::Debug for dyn EnricherHook {
 /// into metrics + the audit log.
 pub fn run_pipeline_enrichers(
     hook: Option<&std::sync::Arc<dyn EnricherHook>>,
-    agent_id: AgentId,
+    space_id: SpaceId,
     items: &mut Vec<ExtractedItem>,
     source_text: &str,
     now_unix_nanos: u64,
@@ -79,7 +79,7 @@ pub fn run_pipeline_enrichers(
     let Some(hook) = hook else {
         return Vec::new();
     };
-    hook.run(agent_id, items, source_text, now_unix_nanos)
+    hook.run(space_id, items, source_text, now_unix_nanos)
 }
 
 #[cfg(test)]
@@ -91,7 +91,7 @@ mod tests {
     impl EnricherHook for UppercasingHook {
         fn run(
             &self,
-            _agent_id: AgentId,
+            _space_id: SpaceId,
             items: &mut Vec<ExtractedItem>,
             _source_text: &str,
             _now_unix_nanos: u64,
@@ -132,7 +132,7 @@ mod tests {
     fn run_pipeline_enrichers_noop_when_hook_is_none() {
         let mut items = vec![em("alice")];
         let outcomes =
-            run_pipeline_enrichers(None, brain_core::AgentId::NIL, &mut items, "alice", 0);
+            run_pipeline_enrichers(None, brain_core::SpaceId::NIL, &mut items, "alice", 0);
         assert!(outcomes.is_empty());
         if let ExtractedItem::EntityMention(m) = &items[0] {
             assert_eq!(m.text, "alice");
@@ -147,7 +147,7 @@ mod tests {
         let mut items = vec![em("alice")];
         let outcomes = run_pipeline_enrichers(
             Some(&hook),
-            brain_core::AgentId::NIL,
+            brain_core::SpaceId::NIL,
             &mut items,
             "alice",
             0,

@@ -283,7 +283,7 @@ pub(super) fn insert_new_statement(
 ) -> Result<(), StatementOpError> {
     let m = metadata_from_statement(s, scope);
     let ns = scope.namespace_id;
-    let ag = scope.agent_id_bytes;
+    let ag = scope.space_id_bytes;
 
     // 1. Primary row.
     {
@@ -451,7 +451,7 @@ pub fn remove_from_predicate_index(
     let mut t = wtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE)?;
     let key = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         predicate_id,
         kind,
         confidence_bucket(confidence),
@@ -486,7 +486,7 @@ pub fn rekey_predicate_index(
     let mut t = wtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE)?;
     let old_key = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         predicate_id,
         kind,
         old_bucket,
@@ -498,7 +498,7 @@ pub fn rekey_predicate_index(
     t.insert(
         &(
             scope.namespace_id,
-            scope.agent_id_bytes,
+            scope.space_id_bytes,
             predicate_id,
             kind,
             new_bucket,
@@ -548,7 +548,7 @@ pub(super) fn flip_by_subject_to_noncurrent(
     let mut bys = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
     bys.remove(&(
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         subject_entity_bytes,
         kind,
         predicate_id,
@@ -558,7 +558,7 @@ pub(super) fn flip_by_subject_to_noncurrent(
     bys.insert(
         &(
             scope.namespace_id,
-            scope.agent_id_bytes,
+            scope.space_id_bytes,
             subject_entity_bytes,
             kind,
             predicate_id,
@@ -587,7 +587,7 @@ fn find_current_statement(
     // the first (and only) value.
     let lo = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         subject.to_bytes(),
         kind.as_u8(),
         predicate.raw(),
@@ -596,7 +596,7 @@ fn find_current_statement(
     );
     let hi = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         subject.to_bytes(),
         kind.as_u8(),
         predicate.raw(),
@@ -626,7 +626,7 @@ fn load_active_facts_for_subject_predicate_wtxn(
     // is_current=1 prefix.
     let lo = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         subject.to_bytes(),
         StatementKind::Fact.as_u8(),
         predicate.raw(),
@@ -635,7 +635,7 @@ fn load_active_facts_for_subject_predicate_wtxn(
     );
     let hi = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         subject.to_bytes(),
         StatementKind::Fact.as_u8(),
         predicate.raw(),
@@ -972,7 +972,7 @@ mod tests {
         let bys = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE).unwrap();
         let lo = (
             sc.namespace_id,
-            sc.agent_id_bytes,
+            sc.space_id_bytes,
             subj.to_bytes(),
             StatementKind::Fact.as_u8(),
             pred.raw(),
@@ -981,7 +981,7 @@ mod tests {
         );
         let hi = (
             sc.namespace_id,
-            sc.agent_id_bytes,
+            sc.space_id_bytes,
             subj.to_bytes(),
             StatementKind::Fact.as_u8(),
             pred.raw(),
@@ -994,7 +994,7 @@ mod tests {
         assert!(byp
             .get(&(
                 sc.namespace_id,
-                sc.agent_id_bytes,
+                sc.space_id_bytes,
                 pred.raw(),
                 StatementKind::Fact.as_u8(),
                 confidence_bucket(0.9),
@@ -1007,7 +1007,7 @@ mod tests {
         assert!(byo
             .get(&(
                 sc.namespace_id,
-                sc.agent_id_bytes,
+                sc.space_id_bytes,
                 obj.to_bytes(),
                 StatementKind::Fact.as_u8(),
                 s.id.to_bytes(),
@@ -1017,7 +1017,7 @@ mod tests {
         // chain
         let cht = rtxn.open_table(STATEMENT_CHAIN_TABLE).unwrap();
         assert!(cht
-            .get(&(sc.namespace_id, sc.agent_id_bytes, s.id.to_bytes(), 1u32))
+            .get(&(sc.namespace_id, sc.space_id_bytes, s.id.to_bytes(), 1u32))
             .unwrap()
             .is_some());
     }
@@ -1477,7 +1477,7 @@ mod tests {
         let bys = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE).unwrap();
         let cur_lo = (
             sc.namespace_id,
-            sc.agent_id_bytes,
+            sc.space_id_bytes,
             subj.to_bytes(),
             StatementKind::Fact.as_u8(),
             pred.raw(),
@@ -1486,7 +1486,7 @@ mod tests {
         );
         let cur_hi = (
             sc.namespace_id,
-            sc.agent_id_bytes,
+            sc.space_id_bytes,
             subj.to_bytes(),
             StatementKind::Fact.as_u8(),
             pred.raw(),
@@ -1499,7 +1499,7 @@ mod tests {
         );
         let stale_lo = (
             sc.namespace_id,
-            sc.agent_id_bytes,
+            sc.space_id_bytes,
             subj.to_bytes(),
             StatementKind::Fact.as_u8(),
             pred.raw(),
@@ -1508,7 +1508,7 @@ mod tests {
         );
         let stale_hi = (
             sc.namespace_id,
-            sc.agent_id_bytes,
+            sc.space_id_bytes,
             subj.to_bytes(),
             StatementKind::Fact.as_u8(),
             pred.raw(),
@@ -1555,7 +1555,7 @@ mod tests {
         assert!(evi
             .get(&(
                 sc.namespace_id,
-                sc.agent_id_bytes,
+                sc.space_id_bytes,
                 mem.to_be_bytes(),
                 f.id.to_bytes()
             ))
@@ -1694,7 +1694,7 @@ mod tests {
             assert!(evi
                 .get(&(
                     sc.namespace_id,
-                    sc.agent_id_bytes,
+                    sc.space_id_bytes,
                     e.memory_id.to_be_bytes(),
                     s.id.to_bytes(),
                 ))

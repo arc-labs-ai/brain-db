@@ -93,9 +93,9 @@ struct Server {
 }
 
 impl Server {
-    /// Mint a FULL-permission key for `agent_id` (namespace "test") and
+    /// Mint a FULL-permission key for `space_id` (namespace "test") and
     /// return the raw secret bytes to present in AUTH.
-    fn mint(&self, agent_id: [u8; 16]) -> Vec<u8> {
+    fn mint(&self, space_id: [u8; 16]) -> Vec<u8> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -105,7 +105,7 @@ impl Server {
                 [0u8; 16],
                 [0u8; 16],
                 "test".to_string(),
-                agent_id,
+                space_id,
                 brain_metadata::api_keys::bits::FULL,
                 Vec::new(),
                 now,
@@ -282,12 +282,12 @@ async fn complete_handshake(
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn handshake_binds_client_to_shard_and_echoes_agent_id() {
+async fn handshake_binds_client_to_shard_and_echoes_space_id() {
     let server = start_with_shards(1, ConnectionLimits::default()).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    let (_welcome, auth_ok) = complete_handshake(&mut client, &server.mint(agent_id)).await;
-    assert_eq!(auth_ok.agent_id, agent_id);
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    let (_welcome, auth_ok) = complete_handshake(&mut client, &server.mint(space_id)).await;
+    assert_eq!(auth_ok.space_id, space_id);
     assert_eq!(auth_ok.bound_shard_id, 0, "only 1 shard → bound shard 0");
     server.stop().await;
 }
@@ -386,8 +386,8 @@ async fn ops_before_auth_are_rejected() {
 async fn ping_pong_with_timestamp() {
     let server = start_with_shards(1, ConnectionLimits::default()).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, &server.mint(agent_id)).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     let ts = 1_234_567_890u64;
     send_frame(
@@ -423,8 +423,8 @@ async fn ping_pong_with_timestamp() {
 async fn bye_echoes_and_closes() {
     let server = start_with_shards(1, ConnectionLimits::default()).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, &server.mint(agent_id)).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     send_frame(
         &mut client,
@@ -454,8 +454,8 @@ async fn bye_echoes_and_closes() {
 async fn bad_opcode_errors_stream_not_connection() {
     let server = start_with_shards(1, ConnectionLimits::default()).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, &server.mint(agent_id)).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     // Send a *response* opcode (client→server is disallowed) on stream 1.
     let bogus = Frame::new(Opcode::EncodeResp.as_u16(), FLAG_EOS, 1, Vec::new());
@@ -487,8 +487,8 @@ async fn bad_opcode_errors_stream_not_connection() {
 async fn encode_round_trips_through_shard() {
     let server = start_with_shards(1, ConnectionLimits::default()).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, &server.mint(agent_id)).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     let encode = EncodeRequest {
         text: "hello world".into(),
@@ -540,12 +540,12 @@ async fn encode_round_trips_through_shard() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forget_routes_by_memory_id() {
     // Two shards. Forge a memory_id whose top-16-bit shard == 1; the
-    // dispatcher should route to shard 1, not the agent's bound shard
-    // (which could be either, depending on the agent_id hash).
+    // dispatcher should route to shard 1, not the space's bound shard
+    // (which could be either, depending on the space_id hash).
     let server = start_with_shards(2, ConnectionLimits::default()).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, &server.mint(agent_id)).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     let memory_id = brain_core::MemoryId::pack(1, 7, 1).raw();
     let forget = ForgetRequest {
@@ -590,8 +590,8 @@ async fn forget_routes_by_memory_id() {
 async fn recall_returns_single_frame_eos_in_v1() {
     let server = start_with_shards(1, ConnectionLimits::default()).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, &server.mint(agent_id)).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     let recall = RecallRequest {
         trace: false,
@@ -646,8 +646,8 @@ async fn server_ping_fires_after_idle_timeout() {
     };
     let server = start_with_shards(1, limits).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, &server.mint(agent_id)).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     // Stay idle past idle_timeout. Server should emit SERVER_PING.
     let resp = tokio::time::timeout(Duration::from_secs(3), read_one_frame(&mut client))

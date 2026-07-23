@@ -306,10 +306,10 @@ async fn encode_recall_forget_recall_round_trip() {
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
         .expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
     complete_handshake(
         &mut client,
-        &server.mint("test", agent_id, brain_metadata::api_keys::bits::FULL),
+        &server.mint("test", space_id, brain_metadata::api_keys::bits::FULL),
     )
     .await;
 
@@ -357,10 +357,10 @@ async fn repeated_encode_recall_is_stable() {
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
         .expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
     complete_handshake(
         &mut client,
-        &server.mint("test", agent_id, brain_metadata::api_keys::bits::FULL),
+        &server.mint("test", space_id, brain_metadata::api_keys::bits::FULL),
     )
     .await;
 
@@ -401,15 +401,15 @@ async fn metrics_endpoint_reflects_traffic() {
     let mut c2 = TcpStream::connect(server.data_plane_addr)
         .await
         .expect("connect 2");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
     complete_handshake(
         &mut c1,
-        &server.mint("test", agent_id, brain_metadata::api_keys::bits::FULL),
+        &server.mint("test", space_id, brain_metadata::api_keys::bits::FULL),
     )
     .await;
     complete_handshake(
         &mut c2,
-        &server.mint("test", agent_id, brain_metadata::api_keys::bits::FULL),
+        &server.mint("test", space_id, brain_metadata::api_keys::bits::FULL),
     )
     .await;
 
@@ -455,10 +455,10 @@ async fn bye_and_shutdown_drain_cleanly() {
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
         .expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
     complete_handshake(
         &mut client,
-        &server.mint("test", agent_id, brain_metadata::api_keys::bits::FULL),
+        &server.mint("test", space_id, brain_metadata::api_keys::bits::FULL),
     )
     .await;
 

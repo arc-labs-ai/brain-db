@@ -592,7 +592,7 @@ mod tests {
             kind: WalRecordKind::Encode,
             flags: 0,
             timestamp_ns: 1_700_000_000_000_000_000,
-            agent_id_lo64: 0xCAFE_BABE_DEAD_BEEF,
+            space_id_lo64: 0xCAFE_BABE_DEAD_BEEF,
             payload: vec![0xAB; payload_bytes],
         }
     }

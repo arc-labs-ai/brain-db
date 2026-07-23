@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn max_assigned_slot_covers_memories_and_recycled_slots() {
         use crate::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
-        use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, NamespaceId};
+        use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, NamespaceId};
 
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
@@ -142,7 +142,7 @@ mod tests {
             MemoryMetadata::new_active(
                 MemoryId::pack(0, slot, 1),
                 NamespaceId::SYSTEM,
-                AgentId::from([0u8; 16]),
+                SpaceId::from([0u8; 16]),
                 ContextId(0),
                 slot,
                 1,

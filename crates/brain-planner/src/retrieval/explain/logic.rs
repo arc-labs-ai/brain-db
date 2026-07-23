@@ -103,7 +103,7 @@ fn render_pre_filters(s: &mut String, plan: &QueryPlan) {
                     range.from_unix_ms, range.to_unix_ms,
                 )
             }
-            Some(PreFilter::AgentIds(ids)) => format!("agent_ids({} items)", ids.len()),
+            Some(PreFilter::SpaceIds(ids)) => format!("space_ids({} items)", ids.len()),
             Some(PreFilter::MemoryKind(ks)) => format!("memory_kind({ks:?})"),
             Some(PreFilter::StatementKind(ks)) => format!("statement_kind({ks:?})"),
             Some(PreFilter::PredicateId(ps)) => format!("predicate_id({ps:?})"),

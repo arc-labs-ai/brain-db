@@ -71,13 +71,13 @@ pub struct RetrievalExecutorContext {
     /// visit closure admits only rows belonging to this namespace — the
     /// tenant wall is unconditional and has no widening escape.
     pub caller_namespace: u32,
-    /// The authenticated caller's agent (app) — the inner wall. Paired
-    /// with `caller_namespace` it forms the `(namespace, agent)`
+    /// The authenticated caller's space (app) — the inner wall. Paired
+    /// with `caller_namespace` it forms the `(namespace, space)`
     /// [`RowScope`] under which every typed-graph read (entity anchor
     /// resolution, relation-graph expansion) is constrained: a query as
     /// `acme/chatbot` can never anchor on or expand into `acme/research`'s
     /// or `globex`'s typed-graph rows.
-    pub caller_agent: brain_core::AgentId,
+    pub caller_space: brain_core::SpaceId,
     /// Off-core cross-encoder handle for the always-on rerank pass.
     /// When `Some`, the executor reranks the top fused candidates on
     /// every query — there is no per-request opt-in. The forward pass
@@ -89,11 +89,11 @@ pub struct RetrievalExecutorContext {
 }
 
 impl RetrievalExecutorContext {
-    /// The caller's `(namespace, agent)` [`RowScope`] — the unconditional
+    /// The caller's `(namespace, space)` [`RowScope`] — the unconditional
     /// wall threaded into every typed-graph read on the retrieval path.
     #[must_use]
     pub fn caller_scope(&self) -> brain_metadata::RowScope {
-        brain_metadata::RowScope::from_bytes(self.caller_namespace, self.caller_agent.into())
+        brain_metadata::RowScope::from_bytes(self.caller_namespace, self.caller_space.into())
     }
 }
 
@@ -1067,7 +1067,7 @@ fn apply_pre_filter_to_semantic(pre: &Option<PreFilter>, filters: &mut SemanticF
         return;
     };
     match pf {
-        PreFilter::AgentIds(ids) => filters.agent_ids = ids.clone(),
+        PreFilter::SpaceIds(ids) => filters.space_ids = ids.clone(),
         PreFilter::MemoryKind(ks) => filters.memory_kind = ks.first().copied(),
         PreFilter::StatementKind(ks) => filters.statement_kind = ks.first().copied(),
         PreFilter::PredicateId(ps) => filters.predicate_id = ps.first().copied(),
@@ -1655,7 +1655,7 @@ fn invoke_lexical(
         .map_err(|e| RetrieverInvocationError::Failure(e.to_string()))?;
 
     // Typed-graph QUERY also searches the statement-text index. The
-    // StatementText scope rejects the memory-only filters (agent_id,
+    // StatementText scope rejects the memory-only filters (space_id,
     // memory_kind, created_at_ms), so build a statement-scoped filter
     // carrying only the predicate / statement-kind pre-filter and the
     // shared context scope. The two corpora return disjoint id variants
@@ -1682,7 +1682,7 @@ fn invoke_lexical(
 
 /// Project a pre-filter onto the statement-text lexical scope. Only the
 /// statement-relevant predicates carry over; the memory-only filters
-/// (agent_id / memory_kind / created_at_ms) would be rejected by the
+/// (space_id / memory_kind / created_at_ms) would be rejected by the
 /// StatementText scope, so they are dropped here.
 fn apply_pre_filter_to_lexical_statement(pre: &Option<PreFilter>, filters: &mut LexicalFilters) {
     let Some(pf) = pre else {
@@ -1692,7 +1692,7 @@ fn apply_pre_filter_to_lexical_statement(pre: &Option<PreFilter>, filters: &mut 
         PreFilter::StatementKind(ks) => filters.statement_kind = ks.first().copied(),
         PreFilter::PredicateId(ps) => filters.predicate_id = ps.first().map(|p| p.raw()),
         // Memory-only pre-filters don't apply to the statement corpus.
-        PreFilter::AgentIds(_) | PreFilter::MemoryKind(_) | PreFilter::Temporal(_) => {}
+        PreFilter::SpaceIds(_) | PreFilter::MemoryKind(_) | PreFilter::Temporal(_) => {}
     }
 }
 
@@ -1701,7 +1701,7 @@ fn apply_pre_filter_to_lexical(pre: &Option<PreFilter>, filters: &mut LexicalFil
         return;
     };
     match pf {
-        PreFilter::AgentIds(ids) => filters.agent_ids = ids.clone(),
+        PreFilter::SpaceIds(ids) => filters.space_ids = ids.clone(),
         PreFilter::MemoryKind(ks) => filters.memory_kind = ks.first().copied(),
         PreFilter::StatementKind(ks) => filters.statement_kind = ks.first().copied(),
         PreFilter::PredicateId(ps) => filters.predicate_id = ps.first().map(|p| p.raw()),
@@ -1740,9 +1740,9 @@ fn invoke_graph(
         max_branching: *max_branching,
         timeout_ms: *timeout_ms,
         // Tenant wall: the graph lane walks only the caller's
-        // `(namespace, agent)` typed-graph rows.
+        // `(namespace, space)` typed-graph rows.
         caller_namespace: ctx.caller_namespace,
-        caller_agent_bytes: ctx.caller_agent.into(),
+        caller_space_bytes: ctx.caller_space.into(),
     };
 
     match anchor_mode {

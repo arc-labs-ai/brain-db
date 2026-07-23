@@ -3,7 +3,7 @@
 //! Every data-plane connection MUST present a valid, resolvable,
 //! non-revoked API key. The AUTH frame carries `AuthMethod::Token` — the
 //! bytes of a previously-minted key. The server hashes them, looks up the
-//! scope row, and stamps the resolved `(namespace, agent, permissions)` on
+//! scope row, and stamps the resolved `(namespace, space, permissions)` on
 //! the connection. Every subsequent request reads identity from this scope,
 //! never from the wire request. There is no anonymous / permissive mode and
 //! no default namespace: a missing / unknown / revoked key — or an mTLS
@@ -19,24 +19,24 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use brain_core::AgentId;
+use brain_core::SpaceId;
 use brain_metadata::api_keys::{bits, hash_secret, ResolvedScope};
 use brain_metadata::{
-    api_key_create, api_key_list_for_agent, api_key_lookup_by_secret, api_key_revoke, ApiKeyDb,
+    api_key_create, api_key_list_for_space, api_key_lookup_by_secret, api_key_revoke, ApiKeyDb,
     ApiKeyError,
 };
 use brain_protocol::connection::handshake::{
-    AgentPermissions, AuthCredentials, AuthMethod, AuthPayload,
+    SpacePermissions, AuthCredentials, AuthMethod, AuthPayload,
 };
 use parking_lot::RwLock;
 use tracing::{debug, warn};
 
 /// Resolved scope a connection inherits from its AUTH credential.
-/// Wraps [`ResolvedScope`] alongside a typed [`AgentId`] for fast
+/// Wraps [`ResolvedScope`] alongside a typed [`SpaceId`] for fast
 /// shard-routing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestScope {
-    pub agent_id: AgentId,
+    pub space_id: SpaceId,
     pub org_id: [u8; 16],
     pub user_id: [u8; 16],
     pub namespace: String,
@@ -56,7 +56,7 @@ impl RequestScope {
     #[must_use]
     pub fn from_resolved(resolved: ResolvedScope) -> Self {
         Self {
-            agent_id: AgentId(uuid::Uuid::from_bytes(resolved.agent_id)),
+            space_id: SpaceId(uuid::Uuid::from_bytes(resolved.space_id)),
             org_id: resolved.org_id,
             user_id: resolved.user_id,
             namespace: resolved.namespace,
@@ -66,11 +66,11 @@ impl RequestScope {
         }
     }
 
-    /// Project these scope claims onto the `AgentPermissions` wire
+    /// Project these scope claims onto the `SpacePermissions` wire
     /// shape carried by `AUTH_OK`.
     #[must_use]
-    pub fn to_agent_permissions(&self) -> AgentPermissions {
-        AgentPermissions {
+    pub fn to_space_permissions(&self) -> SpacePermissions {
+        SpacePermissions {
             can_encode: self.permissions & bits::ENCODE != 0,
             can_recall: self.permissions & bits::RECALL != 0,
             can_plan: self.permissions & bits::RECALL != 0,
@@ -86,12 +86,12 @@ impl RequestScope {
     /// The caller is stamped with the wire-level `session_id` minted
     /// at HELLO/WELCOME so the txn store can link buffered work back
     /// to the originating connection — disconnect-time cleanup
-    /// fans out on session_id, not on agent_id, because a
-    /// single agent may hold many concurrent sessions.
+    /// fans out on session_id, not on space_id, because a
+    /// single space may hold many concurrent sessions.
     #[must_use]
     pub fn to_caller(&self, session_id: [u8; 16]) -> brain_ops::RequestCaller {
         brain_ops::RequestCaller::from_scope(
-            self.agent_id,
+            self.space_id,
             self.org_id,
             self.user_id,
             self.namespace.clone(),
@@ -103,10 +103,10 @@ impl RequestScope {
     /// Materialize the EFFECTIVE `brain_ops::RequestCaller` for an
     /// `act_as` request.
     ///
-    /// The op runs as the target `(namespace, agent_id)`, not the
+    /// The op runs as the target `(namespace, space_id)`, not the
     /// connection principal's own identity. Effective permissions are the
-    /// fixed `STANDARD_AGENT` mask — never the principal's bits, and never
-    /// `ADMIN` / `ACT_AS` — because Brain has no per-agent permission
+    /// fixed `STANDARD_SPACE` mask — never the principal's bits, and never
+    /// `ADMIN` / `ACT_AS` — because Brain has no per-space permission
     /// store to consult for the impersonated identity. The principal's
     /// `org_id` / `user_id` are retained for the audit trail (the acting
     /// party is never erased; see RFC 8693 delegation), and the wire
@@ -123,11 +123,11 @@ impl RequestScope {
         session_id: [u8; 16],
     ) -> brain_ops::RequestCaller {
         brain_ops::RequestCaller::from_scope(
-            AgentId(uuid::Uuid::from_bytes(act_as.agent_id)),
+            SpaceId(uuid::Uuid::from_bytes(act_as.space_id)),
             self.org_id,
             self.user_id,
             act_as.namespace.clone(),
-            bits::STANDARD_AGENT,
+            bits::STANDARD_SPACE,
         )
         .with_session_id(session_id)
     }
@@ -202,7 +202,7 @@ impl AuthStore {
         org_id: [u8; 16],
         user_id: [u8; 16],
         namespace: String,
-        agent_id: [u8; 16],
+        space_id: [u8; 16],
         permissions: u32,
         may_act: Vec<String>,
         now_unix_nanos: u64,
@@ -222,7 +222,7 @@ impl AuthStore {
             org_id,
             user_id,
             namespace,
-            agent_id,
+            space_id,
             permissions,
             may_act,
             now_unix_nanos,
@@ -243,15 +243,15 @@ impl AuthStore {
         Ok(found)
     }
 
-    /// List every key issued to `agent_id`. Returns the rows verbatim
+    /// List every key issued to `space_id`. Returns the rows verbatim
     /// — admin views should redact `key_hash` if surfacing publicly.
-    pub fn list_for_agent(
+    pub fn list_for_space(
         &self,
-        agent_id: &[u8; 16],
+        space_id: &[u8; 16],
     ) -> Result<Vec<brain_metadata::tables::api_keys::ApiKeyRow>, ApiKeyError> {
         let guard = self.db.read();
         let rtxn = guard.read_txn()?;
-        api_key_list_for_agent(&rtxn, agent_id)
+        api_key_list_for_space(&rtxn, space_id)
     }
 
     /// Look up a secret. Returns `None` when the secret hashes to a row
@@ -332,7 +332,7 @@ pub fn derive_scope_from_handshake(
     }
     debug!(
         key_hash = %hex32(&row.key_hash),
-        agent_id = ?row.agent_id,
+        space_id = ?row.space_id,
         namespace = %row.namespace,
         "AUTH resolved scope from API key",
     );
@@ -365,7 +365,7 @@ mod tests {
         (dir, Arc::new(s))
     }
 
-    fn agent(byte: u8) -> [u8; 16] {
+    fn space(byte: u8) -> [u8; 16] {
         let mut a = [0u8; 16];
         a[15] = byte;
         a
@@ -407,11 +407,11 @@ mod tests {
         let (_dir, store) = store();
         let minted = store
             .mint(
-                agent(2),
+                space(2),
                 [0u8; 16],
                 "acme".into(),
-                agent(7),
-                bits::STANDARD_AGENT,
+                space(7),
+                bits::STANDARD_SPACE,
                 Vec::new(),
                 1_700_000_000_000_000_000,
             )
@@ -419,7 +419,7 @@ mod tests {
         let payload = auth_token(minted.secret_bytes.clone());
         let scope = derive_scope_from_handshake(&payload, &store).expect("accepts");
         assert_eq!(scope.namespace, "acme");
-        assert_eq!(scope.agent_id, AgentId(uuid::Uuid::from_bytes(agent(7))));
+        assert_eq!(scope.space_id, SpaceId(uuid::Uuid::from_bytes(space(7))));
         assert!(scope.permissions & bits::ENCODE != 0);
         assert!(scope.permissions & bits::ADMIN == 0);
         // The caller inherits the key's namespace; identity is the credential.
@@ -435,11 +435,11 @@ mod tests {
         let (_dir, store) = store();
         let minted = store
             .mint(
-                agent(2),
+                space(2),
                 [0u8; 16],
                 "acme".into(),
-                agent(7),
-                bits::STANDARD_AGENT,
+                space(7),
+                bits::STANDARD_SPACE,
                 Vec::new(),
                 1_700_000_000_000_000_000,
             )
@@ -448,7 +448,7 @@ mod tests {
         let scope = derive_scope_from_handshake(&payload, &store)
             .expect("the formatted brain_ token must resolve");
         assert_eq!(scope.namespace, "acme");
-        assert_eq!(scope.agent_id, AgentId(uuid::Uuid::from_bytes(agent(7))));
+        assert_eq!(scope.space_id, SpaceId(uuid::Uuid::from_bytes(space(7))));
     }
 
     #[test]
@@ -464,11 +464,11 @@ mod tests {
         let (_dir, store) = store();
         let minted = store
             .mint(
-                agent(2),
+                space(2),
                 [0u8; 16],
                 "acme".into(),
-                agent(7),
-                bits::STANDARD_AGENT,
+                space(7),
+                bits::STANDARD_SPACE,
                 Vec::new(),
                 1,
             )
@@ -480,24 +480,24 @@ mod tests {
     }
 
     #[test]
-    fn resolves_agent_from_key() {
-        // The resolved scope's agent comes entirely from the API key row.
+    fn resolves_space_from_key() {
+        // The resolved scope's space comes entirely from the API key row.
         let (_dir, store) = store();
-        let key_agent = agent(7);
+        let key_space = space(7);
         let minted = store
             .mint(
-                agent(2),
+                space(2),
                 [0u8; 16],
                 "acme".into(),
-                key_agent,
-                bits::STANDARD_AGENT,
+                key_space,
+                bits::STANDARD_SPACE,
                 Vec::new(),
                 1,
             )
             .unwrap();
         let payload = auth_token(minted.secret_bytes);
         let scope = derive_scope_from_handshake(&payload, &store).unwrap();
-        assert_eq!(scope.agent_id, AgentId(uuid::Uuid::from_bytes(key_agent)));
+        assert_eq!(scope.space_id, SpaceId(uuid::Uuid::from_bytes(key_space)));
     }
 
     #[test]
@@ -507,11 +507,11 @@ mod tests {
             org_id: [0u8; 16],
             user_id: [0u8; 16],
             namespace: "n".into(),
-            agent_id: agent(1),
+            space_id: space(1),
             permissions: bits::ENCODE | bits::RECALL,
             may_act: Vec::new(),
         });
-        let p = scope.to_agent_permissions();
+        let p = scope.to_space_permissions();
         assert!(p.can_encode);
         assert!(p.can_recall);
         assert!(p.can_plan);
@@ -525,11 +525,11 @@ mod tests {
         let (_dir, store) = store();
         let minted = store
             .mint(
-                agent(1),
+                space(1),
                 [0u8; 16],
                 "n".into(),
-                agent(1),
-                bits::STANDARD_AGENT,
+                space(1),
+                bits::STANDARD_SPACE,
                 Vec::new(),
                 1,
             )

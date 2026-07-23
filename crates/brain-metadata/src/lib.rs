@@ -1,6 +1,6 @@
 //! # brain-metadata
 //!
-//! redb-backed metadata store: agents, contexts, memory metadata, edges,
+//! redb-backed metadata store: spaces, contexts, memory metadata, edges,
 //! idempotency table, and the durable LSN checkpoint. WAL recovery
 //! lives in `recovery/` (one file per WalPayload family), implementing
 //! `brain_storage::recovery::MetadataSink` for `MetadataDb`.
@@ -35,7 +35,7 @@ pub mod tables;
 // crate root so callers can import them directly instead of walking the
 // per-domain directories on every import.
 pub use api_keys::{
-    api_key_create, api_key_list_for_agent, api_key_lookup_by_hash, api_key_lookup_by_secret,
+    api_key_create, api_key_list_for_space, api_key_lookup_by_hash, api_key_lookup_by_secret,
     api_key_revoke, api_key_touch_last_used, hash_secret, ApiKeyDb, ApiKeyError, ResolvedScope,
 };
 pub use audit::ops::{

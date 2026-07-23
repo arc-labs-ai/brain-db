@@ -27,7 +27,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, RequestId};
+use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, RequestId};
 use brain_storage::arena::ArenaFile;
 use brain_storage::recovery::{recover, InMemoryMetadataSink};
 use brain_storage::wal::{EncodePayload, Lsn, Wal, WalPayload, WalRecord, WAL_SEGMENT_HEADER_LEN};
@@ -56,7 +56,7 @@ fn gen_record(slot: u64) -> WalRecord {
     let payload = EncodePayload {
         memory_id: MemoryId::pack(1, slot, 1),
         request_id: RequestId::from(bytes16_from(slot * 7 + 1)),
-        agent_id: AgentId::from(bytes16_from(slot * 11 + 2)),
+        space_id: SpaceId::from(bytes16_from(slot * 11 + 2)),
         namespace_id: brain_core::NamespaceId::SYSTEM,
         context_id: ContextId(slot * 13 + 3),
         kind: MemoryKind::Episodic,

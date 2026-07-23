@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use brain_core::{AgentId, MemoryId, MemoryKind};
+use brain_core::{SpaceId, MemoryId, MemoryKind};
 use brain_index::{schema_payload_json, IndexHandle, LexicalScope};
 use flume::{bounded, Receiver, Sender};
 use tantivy::schema::Field;
@@ -22,7 +22,7 @@ pub enum MemoryTextOp {
     Upsert {
         id: MemoryId,
         text: String,
-        agent: AgentId,
+        space: SpaceId,
         kind: MemoryKind,
         created_at_unix_ms: u64,
         /// Session/conversation scope tag indexed as a tantivy fast
@@ -85,7 +85,7 @@ pub enum IndexerError {
 struct MemoryFields {
     memory_id: Field,
     text: Field,
-    agent_id: Field,
+    space_id: Field,
     kind: Field,
     created_at: Field,
     context: Field,
@@ -102,7 +102,7 @@ impl MemoryFields {
         Ok(Self {
             memory_id: get("memory_id")?,
             text: get("text")?,
-            agent_id: get("agent_id")?,
+            space_id: get("space_id")?,
             kind: get("kind")?,
             created_at: get("created_at")?,
             context: get("context")?,
@@ -262,7 +262,7 @@ fn apply_op(
 
     if let MemoryTextOp::Upsert {
         text,
-        agent,
+        space,
         kind,
         created_at_unix_ms,
         context,
@@ -272,7 +272,7 @@ fn apply_op(
         let mut doc = TantivyDocument::default();
         doc.add_bytes(fields.memory_id, &id_bytes);
         doc.add_text(fields.text, text);
-        doc.add_bytes(fields.agent_id, &agent_bytes(*agent));
+        doc.add_bytes(fields.space_id, &space_bytes(*space));
         doc.add_u64(fields.kind, kind_to_u64(*kind));
         doc.add_u64(fields.created_at, *created_at_unix_ms);
         doc.add_u64(fields.context, *context);
@@ -285,8 +285,8 @@ fn memory_id_bytes(id: MemoryId) -> [u8; 16] {
     id.raw().to_be_bytes()
 }
 
-fn agent_bytes(agent: AgentId) -> [u8; 16] {
-    agent.into()
+fn space_bytes(space: SpaceId) -> [u8; 16] {
+    space.into()
 }
 
 fn kind_to_u64(kind: MemoryKind) -> u64 {

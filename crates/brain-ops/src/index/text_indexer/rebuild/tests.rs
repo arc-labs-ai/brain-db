@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use brain_core::{
-    AgentId, ContextId, Entity, EntityId, EntityTypeId, ExtractorId, MemoryId, MemoryKind,
+    SpaceId, ContextId, Entity, EntityId, EntityTypeId, ExtractorId, MemoryId, MemoryKind,
     PredicateId, StatementId,
 };
 use brain_core::{
@@ -56,7 +56,7 @@ fn put_memory(metadata: &mut MetadataDb, slot: u64, text: &str, kind: MemoryKind
     let meta = MemoryMetadata::new_active(
         id,
         brain_core::NamespaceId::SYSTEM,
-        AgentId::from([7u8; 16]),
+        SpaceId::from([7u8; 16]),
         ContextId::from(42),
         slot,
         1,

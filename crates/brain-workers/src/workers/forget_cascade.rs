@@ -165,7 +165,7 @@ impl ForgetCascadeWorker {
             // evidence was that memory. Splitting these would leave a
             // dangling edge / orphan relation past the FORGET visibility
             // boundary if the second txn failed.
-            // The forgotten memory's `(namespace, agent)` scope, read from
+            // The forgotten memory's `(namespace, space)` scope, read from
             // its row so the edge cascade tombstones only this tenant's
             // typed relations. Falls back to system scope if the row is
             // already gone (the statement cascade above is the primary
@@ -178,7 +178,7 @@ impl ForgetCascadeWorker {
                     .and_then(|t| {
                         t.get(&job.memory_id.to_be_bytes()).ok().flatten().map(|g| {
                             let m = g.value();
-                            brain_metadata::RowScope::from_bytes(m.namespace_id, m.agent_id_bytes)
+                            brain_metadata::RowScope::from_bytes(m.namespace_id, m.space_id_bytes)
                         })
                     })
                     .unwrap_or_else(|| {
@@ -253,7 +253,7 @@ mod tests {
 
     use super::*;
     use brain_core::{
-        AgentId, ContextId, EntityId, ExtractorId as CoreExtractorId, MemoryId, MemoryKind,
+        SpaceId, ContextId, EntityId, ExtractorId as CoreExtractorId, MemoryId, MemoryKind,
     };
     use brain_core::{
         Entity, EntityType, EvidenceEntry, EvidenceRef, PredicateId, Statement, StatementId,
@@ -281,7 +281,7 @@ mod tests {
         let row = MemoryMetadata::new_active(
             memory_id,
             brain_core::NamespaceId::SYSTEM,
-            AgentId::default(),
+            SpaceId::default(),
             ContextId::DEFAULT,
             /* arena_slot */ memory_id.slot(),
             memory_id.version(),

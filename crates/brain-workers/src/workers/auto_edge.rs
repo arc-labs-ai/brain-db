@@ -48,7 +48,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use brain_core::{AgentId, ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
+use brain_core::{SpaceId, ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
 use brain_metadata::tables::edge::{
     derived_by, list_memory_edges_from, origin, zero_disambiguator,
 };
@@ -95,7 +95,7 @@ pub const DEFAULT_TOP_K: usize = 5;
 /// Cosine similarity floor for auto-derived `SimilarTo` edges.
 ///
 /// 0.85 is the classical "near-duplicate" floor — paraphrases of the
-/// same sentence, or an agent restating itself. Below it, BGE-small
+/// same sentence, or an space restating itself. Below it, BGE-small
 /// embeddings still score 0.75–0.80 for pairs that are merely
 /// topically near but semantically distinct ("Priya works at Stripe"
 /// vs. "Priya now works at OpenAI" — same entity, contradictory
@@ -394,7 +394,7 @@ async fn do_auto_edge_cycle(
             })
             .collect();
         let request_hash = hash_link_batch(&to_link);
-        let write = Write::from_phases(WriteId::new(), AgentId::default(), phases)
+        let write = Write::from_phases(WriteId::new(), SpaceId::default(), phases)
             .with_request_hash(request_hash);
         let real_writer = ctx
             .ops
@@ -476,7 +476,7 @@ async fn do_auto_edge_cycle(
             stage_payload: Some(StagePayload::AutoEdge(StageAutoEdgePayload {
                 edges_written,
             })),
-            agent_id: memory_agent_id(ctx, source_id),
+            space_id: memory_space_id(ctx, source_id),
         };
         ctx.ops.publish_stage_event(envelope).await;
     }
@@ -497,14 +497,14 @@ fn now_unix_nanos() -> u64 {
         .unwrap_or(0)
 }
 
-/// Read a memory's real owning agent from `MEMORIES_TABLE`, for stamping
+/// Read a memory's real owning space from `MEMORIES_TABLE`, for stamping
 /// onto the `StageCompleted{AutoEdge}` publish — `AutoEdgeEnqueue` carries
 /// only `(memory_id, vector)`, so unlike the temporal-edge worker (whose
-/// enqueue payload already threads `agent_id` through) this needs its own
-/// lookup. Falls back to [`AgentId::default`] (the nil agent) when the row
+/// enqueue payload already threads `space_id` through) this needs its own
+/// lookup. Falls back to [`SpaceId::default`] (the nil space) when the row
 /// is absent — shouldn't happen for a memory the writer just committed,
 /// but a missing row here isn't reason to fail the whole publish loop.
-fn memory_agent_id(ctx: &WorkerContext, memory_id: MemoryId) -> AgentId {
+fn memory_space_id(ctx: &WorkerContext, memory_id: MemoryId) -> SpaceId {
     ctx.ops
         .executor
         .metadata
@@ -515,7 +515,7 @@ fn memory_agent_id(ctx: &WorkerContext, memory_id: MemoryId) -> AgentId {
             rtxn.open_table(MEMORIES_TABLE)
                 .ok()
                 .and_then(|t| t.get(&memory_id.to_be_bytes()).ok().flatten())
-                .map(|g| g.value().agent_id())
+                .map(|g| g.value().space_id())
         })
         .unwrap_or_default()
 }

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
-use brain_core::AgentId;
+use brain_core::SpaceId;
 use brain_extractors::enricher_hook::{EnricherHook, EnricherHookOutcome};
 use brain_extractors::framework::item::ExtractedItem;
 
@@ -98,7 +98,7 @@ impl PluginRegistry {
     /// not — so the caller can fold metrics + audit rows.
     pub fn run_enrichers(&self, input: EnricherInput<'_>) -> Vec<EnricherOutcome> {
         let EnricherInput {
-            agent_id,
+            space_id,
             items,
             source_text,
             now_unix_nanos,
@@ -111,7 +111,7 @@ impl PluginRegistry {
             // borrow only lives for the duration of this iteration so
             // successive plugins see prior plugins' mutations.
             let per_plugin_input = EnricherInput {
-                agent_id,
+                space_id,
                 items,
                 source_text,
                 now_unix_nanos,
@@ -243,13 +243,13 @@ impl PluginRegistry {
 impl EnricherHook for PluginRegistry {
     fn run(
         &self,
-        agent_id: AgentId,
+        space_id: SpaceId,
         items: &mut Vec<ExtractedItem>,
         source_text: &str,
         now_unix_nanos: u64,
     ) -> Vec<EnricherHookOutcome> {
         let outcomes = self.run_enrichers(EnricherInput {
-            agent_id,
+            space_id,
             items,
             source_text,
             now_unix_nanos,
@@ -293,14 +293,14 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 mod tests {
     use super::*;
     use crate::recall::RecallPlugin;
-    use brain_core::AgentId;
+    use brain_core::SpaceId;
     use brain_extractors::framework::item::{EntityMention, ExtractedItem};
     use serde_json::Value;
 
     // -- helpers -----------------------------------------------------
 
-    fn agent() -> AgentId {
-        AgentId::NIL
+    fn space() -> SpaceId {
+        SpaceId::NIL
     }
 
     fn em(text: &str) -> ExtractedItem {
@@ -491,7 +491,7 @@ mod tests {
 
         let mut items = vec![em("a rocket-shaped object")];
         let outcomes = reg.run_enrichers(EnricherInput {
-            agent_id: agent(),
+            space_id: space(),
             items: &mut items,
             source_text: "irrelevant",
             now_unix_nanos: 1_000,
@@ -527,7 +527,7 @@ mod tests {
 
         let mut items = Vec::<ExtractedItem>::new();
         let outcomes = reg.run_enrichers(EnricherInput {
-            agent_id: agent(),
+            space_id: space(),
             items: &mut items,
             source_text: "irrelevant",
             now_unix_nanos: 1_000,
@@ -550,7 +550,7 @@ mod tests {
 
         let mut items = Vec::<ExtractedItem>::new();
         let outcomes = reg.run_enrichers(EnricherInput {
-            agent_id: agent(),
+            space_id: space(),
             items: &mut items,
             source_text: "irrelevant",
             now_unix_nanos: 1_000,
@@ -594,7 +594,7 @@ mod tests {
 
         let reg_arc: Arc<dyn brain_extractors::enricher_hook::EnricherHook> = Arc::new(reg);
         let mut items = vec![em("a rocket-shaped object")];
-        let outcomes = EnricherHook::run(&*reg_arc, agent(), &mut items, "irrelevant", 1_000);
+        let outcomes = EnricherHook::run(&*reg_arc, space(), &mut items, "irrelevant", 1_000);
 
         assert_eq!(outcomes.len(), 2);
         assert_eq!(outcomes[0].plugin_id, "test:mutator");
@@ -616,7 +616,7 @@ mod tests {
         let reg_arc: Arc<dyn brain_extractors::enricher_hook::EnricherHook> = Arc::new(reg);
 
         let mut items = Vec::<ExtractedItem>::new();
-        let outcomes = EnricherHook::run(&*reg_arc, agent(), &mut items, "irrelevant", 0);
+        let outcomes = EnricherHook::run(&*reg_arc, space(), &mut items, "irrelevant", 0);
         assert_eq!(outcomes.len(), 2);
         assert!(!outcomes[0].ok);
         assert!(outcomes[1].ok);

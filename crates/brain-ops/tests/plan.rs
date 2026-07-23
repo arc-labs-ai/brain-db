@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{SpaceId, ContextId, EdgeKind, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
@@ -71,7 +71,7 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
     let db_path = tempdir.path().join("metadata.redb");
     let metadata = MetadataDb::open(&db_path).unwrap();
 
-    let agent = AgentId(Uuid::nil());
+    let space = SpaceId(Uuid::nil());
     let mut ids = Vec::with_capacity(n_memories);
 
     // Insert memory rows directly so we can pin specific MemoryIds.
@@ -85,7 +85,7 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
             let meta = MemoryMetadata::new_active(
                 id,
                 brain_core::NamespaceId::SYSTEM,
-                agent,
+                space,
                 ContextId(42),
                 (i + 1) as u64,
                 1,

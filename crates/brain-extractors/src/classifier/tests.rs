@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use brain_core::{AgentId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
+use brain_core::{SpaceId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
 use brain_protocol::schema::ExtractorTarget;
 use candle_core::Device;
 
@@ -31,7 +31,7 @@ fn entity_target() -> ExtractorTarget {
 fn memory(text: &str) -> Memory {
     Memory {
         id: MemoryId::pack(0, 1, 0),
-        agent: AgentId::new(),
+        space: SpaceId::new(),
         context: ContextId(0),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),

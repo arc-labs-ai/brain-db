@@ -484,7 +484,7 @@ fn lookup_current_statement(
     // (scope, subject, kind, predicate, is_current=1) prefix yields it.
     let lo = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         subject.to_bytes(),
         kind.as_u8(),
         predicate.raw(),
@@ -493,7 +493,7 @@ fn lookup_current_statement(
     );
     let hi = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         subject.to_bytes(),
         kind.as_u8(),
         predicate.raw(),
@@ -713,7 +713,7 @@ mod tests {
         let at_old = t
             .get(&(
                 sc.namespace_id,
-                sc.agent_id_bytes,
+                sc.space_id_bytes,
                 pred.raw(),
                 StatementKind::Fact.as_u8(),
                 old_bucket,
@@ -730,7 +730,7 @@ mod tests {
         let at_new = t
             .get(&(
                 sc.namespace_id,
-                sc.agent_id_bytes,
+                sc.space_id_bytes,
                 pred.raw(),
                 StatementKind::Fact.as_u8(),
                 new_bucket,

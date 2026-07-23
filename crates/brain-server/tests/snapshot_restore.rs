@@ -296,7 +296,7 @@ fn run_recovery(dir: &Path, uuid: [u8; 16]) -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_returns_shard_to_snapshot_state() {
     let dir = TempDir::new().expect("tmp");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
 
     let pre_snapshot = [
         "the orbital relay station broadcasts on band gamma four",
@@ -315,7 +315,7 @@ async fn restore_returns_shard_to_snapshot_state() {
             .expect("connect 1");
         handshake(
             &mut client,
-            &server.mint("test", agent_id, brain_metadata::api_keys::bits::FULL),
+            &server.mint("test", space_id, brain_metadata::api_keys::bits::FULL),
         )
         .await;
 
@@ -371,7 +371,7 @@ async fn restore_returns_shard_to_snapshot_state() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_rejects_corrupt_bundle() {
     let dir = TempDir::new().expect("tmp");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
 
     let snapshot_id;
     {
@@ -381,7 +381,7 @@ async fn restore_rejects_corrupt_bundle() {
             .expect("connect");
         handshake(
             &mut client,
-            &server.mint("test", agent_id, brain_metadata::api_keys::bits::FULL),
+            &server.mint("test", space_id, brain_metadata::api_keys::bits::FULL),
         )
         .await;
         encode(

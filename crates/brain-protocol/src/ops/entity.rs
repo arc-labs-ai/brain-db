@@ -34,7 +34,7 @@ pub struct EntityGetRequest {
     /// Effective identity this get runs as, on behalf of the authenticated
     /// connection principal. `None` (the common case, and omitted on the wire)
     /// means the op runs as the connection's own key-bound identity. The get is
-    /// scoped to the effective `(namespace, agent)` — a foreign tenant's entity
+    /// scoped to the effective `(namespace, space)` — a foreign tenant's entity
     /// id reads as `NotFound`, never across the boundary.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
@@ -111,7 +111,7 @@ pub struct EntityResolveRequest {
     /// authenticated connection principal. `None` (the common case, and
     /// omitted on the wire) means the op runs as the connection's own
     /// key-bound identity. Resolution is scoped to the effective
-    /// `(namespace, agent)`, so a multi-tenant front-door can resolve a
+    /// `(namespace, space)`, so a multi-tenant front-door can resolve a
     /// name inside a tenant's own entity space without leaking across
     /// tenants.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -136,7 +136,7 @@ pub struct EntityListRequest {
     /// Effective identity this list runs as, on behalf of the authenticated
     /// connection principal. `None` (the common case, and omitted on the wire)
     /// means the op runs as the connection's own key-bound identity. The list
-    /// is scoped to the effective `(namespace, agent)`, so it enumerates only
+    /// is scoped to the effective `(namespace, space)`, so it enumerates only
     /// that tenant's entities.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,

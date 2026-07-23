@@ -188,7 +188,7 @@ impl MetadataDb {
         let actor = if b.actor_kind == 0 {
             MergeActor::System
         } else {
-            MergeActor::Agent(b.actor_agent)
+            MergeActor::Space(b.actor_space)
         };
         let wtxn = self.db.begin_write().map_err(transient)?;
         {
@@ -230,7 +230,7 @@ impl MetadataDb {
         let actor = if b.actor_kind == 0 {
             MergeActor::System
         } else {
-            MergeActor::Agent(b.actor_agent)
+            MergeActor::Space(b.actor_space)
         };
         let wtxn = self.db.begin_write().map_err(transient)?;
         {
@@ -594,7 +594,7 @@ mod tests {
             confidence: 0.95,
             reason: "duplicate".into(),
             actor_kind: 0,
-            actor_agent: [0u8; 16],
+            actor_space: [0u8; 16],
             grace_seconds: 7 * 24 * 60 * 60,
         });
         db.apply_entity_merge(14, &body).unwrap();
@@ -636,7 +636,7 @@ mod tests {
                 confidence: 0.95,
                 reason: "dup".into(),
                 actor_kind: 0,
-                actor_agent: [0u8; 16],
+                actor_space: [0u8; 16],
                 grace_seconds: 7 * 24 * 60 * 60,
             }),
         )
@@ -645,7 +645,7 @@ mod tests {
         let body = encode_entity_unmerge(&EntityUnmergeBody {
             merged: merged_id.to_bytes(),
             actor_kind: 0,
-            actor_agent: [0u8; 16],
+            actor_space: [0u8; 16],
             at_unix_nanos: NOW + 200,
         });
         db.apply_entity_unmerge(15, &body).unwrap();

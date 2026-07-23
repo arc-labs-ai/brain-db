@@ -9,7 +9,7 @@ use std::ops::{Bound, RangeInclusive};
 use std::sync::Arc;
 
 use brain_core::StatementKind;
-use brain_core::{AgentId, EntityId, MemoryId, MemoryKind, RelationId, StatementId};
+use brain_core::{SpaceId, EntityId, MemoryId, MemoryKind, RelationId, StatementId};
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery, TermQuery};
 use tantivy::schema::{IndexRecordOption, Value};
@@ -46,7 +46,7 @@ pub struct LexicalQuery {
 
 #[derive(Debug, Clone, Default)]
 pub struct LexicalFilters {
-    pub agent_ids: Vec<AgentId>,
+    pub space_ids: Vec<SpaceId>,
     pub memory_kind: Option<MemoryKind>,
     pub statement_kind: Option<StatementKind>,
     pub predicate_id: Option<u32>,
@@ -208,9 +208,9 @@ fn validate_filters_for_scope(
             }
         }
         LexicalScope::StatementText => {
-            if !filters.agent_ids.is_empty() {
+            if !filters.space_ids.is_empty() {
                 return Err(LexicalError::QueryParseFailed(
-                    "agent_id filter applies only to MemoryText scope".into(),
+                    "space_id filter applies only to MemoryText scope".into(),
                 ));
             }
             if filters.memory_kind.is_some() {
@@ -264,18 +264,18 @@ fn build_query(
     let f = &query.filters;
     match scope {
         LexicalScope::MemoryText => {
-            if !f.agent_ids.is_empty() {
+            if !f.space_ids.is_empty() {
                 let field = schema
-                    .get_field("agent_id")
-                    .map_err(|e| LexicalError::Internal(format!("agent_id field: {e}")))?;
-                // `agent_id IN [..]` = OR-group of TermQuery, wrapped as
+                    .get_field("space_id")
+                    .map_err(|e| LexicalError::Internal(format!("space_id field: {e}")))?;
+                // `space_id IN [..]` = OR-group of TermQuery, wrapped as
                 // a single MUST so the BM25 scoring stays inside the
-                // requested agent universe.
+                // requested space universe.
                 let inner: Vec<(Occur, Box<dyn tantivy::query::Query>)> = f
-                    .agent_ids
+                    .space_ids
                     .iter()
-                    .map(|agent| -> (Occur, Box<dyn tantivy::query::Query>) {
-                        let bytes: [u8; 16] = (*agent).into();
+                    .map(|space| -> (Occur, Box<dyn tantivy::query::Query>) {
+                        let bytes: [u8; 16] = (*space).into();
                         let term = Term::from_field_bytes(field, &bytes);
                         (
                             Occur::Should,

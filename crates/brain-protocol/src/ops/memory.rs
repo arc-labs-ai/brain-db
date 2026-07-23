@@ -7,7 +7,7 @@ use crate::shared::primitives::{
 };
 
 /// Per-request effective-identity selector carried on data-plane op
-/// requests. When present, the op runs as this `(namespace, agent_id)`
+/// requests. When present, the op runs as this `(namespace, space_id)`
 /// on behalf of the authenticated connection principal; when the field
 /// is absent the op runs as the connection's own key-bound identity.
 ///
@@ -21,9 +21,9 @@ pub struct ActAs {
     /// Effective namespace. Must be within the principal's `may_act`
     /// allowlist; anything outside it is rejected.
     pub namespace: String,
-    /// 16-byte effective agent id.
+    /// 16-byte effective space id.
     #[serde(with = "serde_bytes")]
-    pub agent_id: WireUuid,
+    pub space_id: WireUuid,
 }
 
 /// `ENCODE_REQ` body. Expresses client *intent* only: the text to
@@ -70,7 +70,7 @@ pub struct EncodeRequest {
     #[serde(default, skip_serializing_if = "WaitMode::is_ack")]
     pub wait: WaitMode,
     /// Opt out of content dedup and force a distinct memory. Default `false`:
-    /// Brain dedupes text ENCODE on (agent_id, context_id, BLAKE3(text)) — a
+    /// Brain dedupes text ENCODE on (space_id, context_id, BLAKE3(text)) — a
     /// repeat of byte-identical text returns the existing MemoryId
     /// (was_deduplicated = true) and writes nothing new. Set `true` when the
     /// same text is a genuinely distinct observation that must coexist (e.g. the
@@ -370,7 +370,7 @@ pub enum MemoryListTimeAxisWire {
 }
 
 /// `MEMORY_LIST` (0x0027) — a pure paginated enumeration of the caller's
-/// `(namespace, agent)` memories. This is not RECALL: there is no query,
+/// `(namespace, space)` memories. This is not RECALL: there is no query,
 /// no ranking, no relevance suppression. It walks the tenant timeline in
 /// a stable order and returns a page plus an opaque keyset cursor.
 ///
@@ -409,7 +409,7 @@ pub struct MemoryListRequest {
     /// authenticated connection principal. `None` (the common case, and
     /// omitted on the wire) means the op runs as the connection's own
     /// key-bound identity. The list is scoped to the effective
-    /// `(namespace, agent)`, so it enumerates only that tenant's memories.
+    /// `(namespace, space)`, so it enumerates only that tenant's memories.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
 }
@@ -511,10 +511,10 @@ pub struct EncodeResponse {
     /// Production clients chain `encode → subscribe --start-lsn lsn+1`
     /// to follow downstream events from this point.
     pub lsn: u64,
-    /// Agent the row was attributed to. Echoes the connection's
-    /// AUTH-time agent so the client can verify routing.
+    /// Space the row was attributed to. Echoes the connection's
+    /// AUTH-time space so the client can verify routing.
     #[serde(with = "serde_bytes")]
-    pub agent_id: WireUuid,
+    pub space_id: WireUuid,
     /// Context the row was filed under. Echoes the request's
     /// `context_id`.
     pub context_id: WireContextId,
@@ -1087,11 +1087,11 @@ pub struct MemoryResult {
     pub confidence: f32,
     pub salience: f32,
     pub kind: MemoryKindWire,
-    /// Agent that owns this memory row — always the calling key's own
-    /// agent, since recall is isolated to the caller. Echoed for
+    /// Space that owns this memory row — always the calling key's own
+    /// space, since recall is isolated to the caller. Echoed for
     /// provenance / routing verification.
     #[serde(with = "serde_bytes")]
-    pub agent_id: WireUuid,
+    pub space_id: WireUuid,
     pub context_id: WireContextId,
     pub created_at_unix_nanos: u64,
     pub last_accessed_at_unix_nanos: u64,
@@ -1558,7 +1558,7 @@ mod memory_list_tests {
         let mut req = sample_request();
         req.act_as = Some(ActAs {
             namespace: "acme".into(),
-            agent_id: [7u8; 16],
+            space_id: [7u8; 16],
         });
         req.cursor = Vec::new();
         let body = RequestBody::MemoryList(req);
@@ -1772,7 +1772,7 @@ mod serde_smoke {
             salience: 0.5,
             auto_edges_added: 0,
             lsn: 9,
-            agent_id: [0u8; 16],
+            space_id: [0u8; 16],
             context_id: 3,
             kind: MemoryKindWire::Episodic,
             created_at_unix_nanos: 1,

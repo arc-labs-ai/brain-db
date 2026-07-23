@@ -39,7 +39,7 @@
   ],
   "act_as": {
     "namespace": "tenant-acme",
-    "agent_id": [
+    "space_id": [
       34,
       34,
       34,

@@ -9,7 +9,7 @@
 //!
 //! ## Four-timestamp bi-temporal model
 //!
-//! Every statement carries four independent timestamps so an agent can
+//! Every statement carries four independent timestamps so an space can
 //! answer both "what was true on date X" and "what did I believe on
 //! date X" without resurrecting tombstones (Zep / Graphiti's bi-temporal
 //! model, applied to a typed graph):
@@ -431,7 +431,7 @@ pub struct Statement {
     /// diverge under late-arriving corrections — e.g., if we learn in
     /// May that Alice changed jobs in February, `valid_to` is set to
     /// February but `record_invalidated_at` is May. This enables
-    /// time-travel queries of the form "what did the agent believe on
+    /// time-travel queries of the form "what did the space believe on
     /// date X" without resurrecting tombstones.
     pub record_invalidated_at_unix_nanos: Option<u64>,
 

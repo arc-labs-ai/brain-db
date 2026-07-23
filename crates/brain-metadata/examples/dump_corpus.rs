@@ -121,10 +121,10 @@ fn main() {
     let name_of = |id: brain_core::EntityId| -> String {
         let t = rtxn.open_table(ENTITIES_TABLE).ok();
         t.and_then(|t| t.get(&id.to_bytes()).ok().flatten().map(|g| g.value().canonical_name))
-            // An entity id with no row is the agent self-entity (first-person
-            // facts use `EntityId::from(agent_id)` without minting a row, the
+            // An entity id with no row is the space self-entity (first-person
+            // facts use `EntityId::from(space_id)` without minting a row, the
             // same identity MATERIALIZE_PROCEDURAL reads) or another unrooted id.
-            .unwrap_or_else(|| format!("<self/agent {id:?}>"))
+            .unwrap_or_else(|| format!("<self/space {id:?}>"))
     };
     for s in &stmts {
         let subj = match s.subject {

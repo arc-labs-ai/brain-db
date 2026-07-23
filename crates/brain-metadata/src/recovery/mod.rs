@@ -208,7 +208,7 @@ mod tests {
     use crate::tables::relation::{RELATION_BY_EVIDENCE_TABLE, RELATION_METADATA_TABLE};
     use crate::tables::slot_version::SLOT_VERSIONS_TABLE;
     use crate::tables::text::TEXTS_TABLE;
-    use brain_core::{AgentId, ContextId, EdgeKind, EdgeOrigin, MemoryId, MemoryKind, RequestId};
+    use brain_core::{SpaceId, ContextId, EdgeKind, EdgeOrigin, MemoryId, MemoryKind, RequestId};
     use brain_storage::wal::payload::{
         CheckpointBeginPayload, CheckpointEndPayload, EdgePayload, EncodePayload, ForgetMode,
         ForgetPayload, ForgetReason, LinkPayload, MigrateEmbeddingPayload, ReclaimPayload,
@@ -221,7 +221,7 @@ mod tests {
         dir.path().join("sink.redb")
     }
 
-    fn aid(byte: u8) -> AgentId {
+    fn aid(byte: u8) -> SpaceId {
         let mut b = [0u8; 16];
         b[15] = byte;
         b.into()
@@ -241,7 +241,7 @@ mod tests {
         EncodePayload {
             memory_id: mid(slot, 1),
             request_id: rid(byte),
-            agent_id: aid(byte),
+            space_id: aid(byte),
             namespace_id: brain_core::NamespaceId::from(u32::from(byte)),
             context_id: ContextId(42),
             kind: MemoryKind::Episodic,
@@ -410,7 +410,7 @@ mod tests {
             &WalPayload::Forget(ForgetPayload {
                 memory_id: id,
                 request_id: rid(2),
-                agent_id: brain_core::AgentId::default(),
+                space_id: brain_core::SpaceId::default(),
                 mode: ForgetMode::Soft,
                 reason: ForgetReason::ClientRequest,
             }),
@@ -881,7 +881,7 @@ mod tests {
             extractor_id: 7,
             is_symmetric: false,
             properties_blob: vec![1, 2, 3],
-            agent_id: aid(1),
+            space_id: aid(1),
             namespace_id: brain_core::NamespaceId::from(5),
             relation_type_intern_hint: None,
         }
@@ -992,7 +992,7 @@ mod tests {
                 relation_id: p.relation_id,
                 reason: "test".into(),
                 at_unix_nanos: TS + 2_000,
-                agent_id: aid(9),
+                space_id: aid(9),
             }),
         )
         .unwrap();
@@ -1031,7 +1031,7 @@ mod tests {
                     relation_id: relid(99),
                     reason: "ghost".into(),
                     at_unix_nanos: TS + 1,
-                    agent_id: aid(9),
+                    space_id: aid(9),
                 }),
             )
             .unwrap_err();

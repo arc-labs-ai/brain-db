@@ -1,8 +1,8 @@
 //! Procedural-memory materialization — request side (wire v2).
 //!
-//! Procedural memory is a `Statement{ kind: Preference, subject: Agent,
+//! Procedural memory is a `Statement{ kind: Preference, subject: Space,
 //! predicate: brain:behavior_*, object: prompt_fragment }`. The
-//! `MATERIALIZE_PROCEDURAL` op walks the agent's active behavior_*
+//! `MATERIALIZE_PROCEDURAL` op walks the space's active behavior_*
 //! Preferences and renders them as a single system block ready to
 //! drop into an LLM prompt.
 //!
@@ -13,9 +13,9 @@ use crate::envelope::request::{WireContextId, WireUuid};
 /// `MATERIALIZE_PROCEDURAL` (`0x0164`).
 ///
 /// Fields:
-/// - `agent_id` — the agent whose learned behaviors are rendered. The
-///   handler resolves the entity for this agent and filters statements
-///   whose `subject == AgentEntity(agent_id)`.
+/// - `space_id` — the space whose learned behaviors are rendered. The
+///   handler resolves the entity for this space and filters statements
+///   whose `subject == SpaceEntity(space_id)`.
 /// - `context_filter` — when set, restrict to evidence sourced from
 ///   memories in this context. `0` means no restriction.
 /// - `top_k` — hard cap on rendered statements. Must be in `1..=100`.
@@ -29,7 +29,7 @@ use crate::envelope::request::{WireContextId, WireUuid};
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MaterializeProceduralRequest {
     #[serde(with = "serde_bytes")]
-    pub agent_id: WireUuid,
+    pub space_id: WireUuid,
     pub context_filter: WireContextId,
     pub top_k: u32,
     pub min_confidence: f32,
@@ -55,7 +55,7 @@ mod tests_req {
     #[test]
     fn request_round_trips_through_request_body() {
         let req = MaterializeProceduralRequest {
-            agent_id: sample_uuid(5),
+            space_id: sample_uuid(5),
             context_filter: 0,
             top_k: 0,
             min_confidence: 0.0,

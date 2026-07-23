@@ -59,7 +59,7 @@ pub fn statement_history(
     let chain_table = rtxn.open_table(STATEMENT_CHAIN_TABLE)?;
     let anchor_bytes = anchor.to_bytes();
     let is_chain_root = chain_table
-        .get(&(scope.namespace_id, scope.agent_id_bytes, anchor_bytes, 1u32))?
+        .get(&(scope.namespace_id, scope.space_id_bytes, anchor_bytes, 1u32))?
         .is_some();
 
     let chain_root_bytes = if is_chain_root {
@@ -76,13 +76,13 @@ pub fn statement_history(
 
     let lo = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         chain_root_bytes,
         0u32,
     );
     let hi = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         chain_root_bytes,
         u32::MAX,
     );
@@ -137,7 +137,7 @@ pub fn statement_list(
         filter.limit.min(DEFAULT_LIST_LIMIT)
     };
     let ns = scope.namespace_id;
-    let ag = scope.agent_id_bytes;
+    let ag = scope.space_id_bytes;
 
     let ids: Vec<[u8; 16]> = match (filter.subject, filter.predicate, filter.kind) {
         (Some(subject), Some(predicate), Some(kind)) => {
@@ -239,7 +239,7 @@ pub fn statement_list(
             for entry in t.iter()? {
                 let (k, v) = entry?;
                 let m: StatementMetadata = v.value();
-                if m.namespace_id != ns || m.agent_id_bytes != ag {
+                if m.namespace_id != ns || m.space_id_bytes != ag {
                     continue;
                 }
                 ids.push(k.value());
@@ -258,7 +258,7 @@ pub fn statement_list(
         if let Some(m) = row {
             // Unconditional scope wall — a row whose scope differs from
             // the caller's is never returned, on any index path.
-            if m.namespace_id != ns || m.agent_id_bytes != ag {
+            if m.namespace_id != ns || m.space_id_bytes != ag {
                 continue;
             }
             if filter.current_only && (m.is_current == 0 || m.is_tombstoned()) {
@@ -349,7 +349,7 @@ fn load_active_facts_for_subject_predicate(
     // is part of the key now, so an exact get can't address one row).
     let lo = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         subject.to_bytes(),
         StatementKind::Fact.as_u8(),
         predicate.raw(),
@@ -358,7 +358,7 @@ fn load_active_facts_for_subject_predicate(
     );
     let hi = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         subject.to_bytes(),
         StatementKind::Fact.as_u8(),
         predicate.raw(),

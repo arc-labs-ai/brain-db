@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use brain_protocol::connection::handshake::{
-    AgentPermissions, AuthCredentials, AuthMethod, AuthOkPayload, AuthPayload, HelloCapabilities,
+    SpacePermissions, AuthCredentials, AuthMethod, AuthOkPayload, AuthPayload, HelloCapabilities,
     HelloPayload, ServerFeatures, WelcomePayload,
 };
 use brain_protocol::envelope::error::{ErrorDetails, ErrorResponse};
@@ -72,7 +72,7 @@ use brain_protocol::{
 
 // Fixed byte patterns. No clock, no randomness — fixtures are reproducible.
 const RID: [u8; 16] = [0x11; 16];
-const AGENT: [u8; 16] = [0x22; 16];
+const SPACE: [u8; 16] = [0x22; 16];
 const FP: [u8; 16] = [0x33; 16];
 const EID: [u8; 16] = [0x44; 16];
 const SID: [u8; 16] = [0x55; 16];
@@ -301,7 +301,7 @@ fn sample_encode_act_as() -> EncodeRequest {
         occurred_at_unix_nanos: None,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            agent_id: AGENT,
+            space_id: SPACE,
         }),
         wait: brain_protocol::WaitMode::Ack,
         allow_duplicates: false,
@@ -330,7 +330,7 @@ fn sample_encode_response() -> EncodeResponse {
         salience: 0.5,
         auto_edges_added: 1,
         lsn: 42,
-        agent_id: AGENT,
+        space_id: SPACE,
         context_id: 1,
         kind: MemoryKindWire::Episodic,
         created_at_unix_nanos: 1_700_000_000_000_000_000,
@@ -506,7 +506,7 @@ fn sample_relation_create() -> RelationCreateRequest {
     RelationCreateRequest {
         relation_type: "org:mentors".into(),
         from_entity: EID,
-        to_entity: AGENT,
+        to_entity: SPACE,
         properties_blob: Vec::new(),
         evidence: EvidenceRefWire::Inline(vec![mid().to_be_bytes()]),
         extractor_id: 0,
@@ -613,7 +613,7 @@ fn sample_relation_view() -> RelationView {
         chain_root: RID,
         relation_type: "org:mentors".into(),
         from_entity: EID,
-        to_entity: AGENT,
+        to_entity: SPACE,
         properties_blob: Vec::new(),
         evidence: EvidenceRefWire::Inline(vec![mid().to_be_bytes()]),
         extractor_id: 0,
@@ -1105,7 +1105,7 @@ fn corpus() -> Vec<Case> {
         txn_id: None,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            agent_id: AGENT,
+            space_id: SPACE,
         }),
     };
     cases.push(req_case(
@@ -1132,7 +1132,7 @@ fn corpus() -> Vec<Case> {
         txn_id: None,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            agent_id: AGENT,
+            space_id: SPACE,
         }),
     };
     cases.push(req_case(
@@ -1162,7 +1162,7 @@ fn corpus() -> Vec<Case> {
         trace: true,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            agent_id: AGENT,
+            space_id: SPACE,
         }),
     };
     cases.push(req_case(
@@ -1183,7 +1183,7 @@ fn corpus() -> Vec<Case> {
         trace: true,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            agent_id: AGENT,
+            space_id: SPACE,
         }),
     };
     cases.push(req_case(
@@ -1216,7 +1216,7 @@ fn corpus() -> Vec<Case> {
         request_id: RID,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            agent_id: AGENT,
+            space_id: SPACE,
         }),
     };
     cases.push(req_case(
@@ -1246,7 +1246,7 @@ fn corpus() -> Vec<Case> {
         &schema_upload,
     ));
     let materialize = MaterializeProceduralRequest {
-        agent_id: AGENT,
+        space_id: SPACE,
         context_filter: 0,
         top_k: 20,
         min_confidence: 0.5,
@@ -1287,9 +1287,9 @@ fn corpus() -> Vec<Case> {
         &sample_welcome(),
     ));
     let auth_ok = AuthOkPayload {
-        agent_id: AGENT,
+        space_id: SPACE,
         bound_shard_id: 5,
-        permissions: AgentPermissions {
+        permissions: SpacePermissions {
             can_encode: true,
             can_recall: true,
             can_plan: true,
@@ -1309,9 +1309,9 @@ fn corpus() -> Vec<Case> {
     // A trusted service principal that holds the `can_act_as` grant —
     // the edge/gateway identity that fronts many tenants.
     let auth_ok_act_as = AuthOkPayload {
-        agent_id: AGENT,
+        space_id: SPACE,
         bound_shard_id: 5,
-        permissions: AgentPermissions {
+        permissions: SpacePermissions {
             can_encode: true,
             can_recall: true,
             can_plan: true,

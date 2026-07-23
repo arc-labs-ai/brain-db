@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, ContextId, MemoryId};
+use crate::ids::{SpaceId, ContextId, MemoryId};
 
 /// Three durable kinds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -47,7 +47,7 @@ impl Default for Salience {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Memory {
     pub id: MemoryId,
-    pub agent: AgentId,
+    pub space: SpaceId,
     pub context: ContextId,
     pub kind: MemoryKind,
     pub salience: Salience,

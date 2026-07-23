@@ -14,7 +14,7 @@
 //! - EXPLAIN / TRACE — renders the plan without executing.
 
 use brain_core::StatementKind;
-use brain_core::{AgentId, MemoryKind, PredicateId, RelationTypeId};
+use brain_core::{SpaceId, MemoryKind, PredicateId, RelationTypeId};
 use brain_index::Direction as GraphDirection;
 
 use crate::retrieval::filters::FilterChain;
@@ -141,10 +141,10 @@ pub enum RetrieverConfig {
 #[derive(Debug, Clone)]
 pub enum PreFilter {
     /// Restrict the retriever's candidate universe to memories
-    /// owned by any of these agent ids. Empty `Vec` is invalid —
+    /// owned by any of these space ids. Empty `Vec` is invalid —
     /// the planner only emits this variant when the caller asked
-    /// for an agent scope.
-    AgentIds(Vec<AgentId>),
+    /// for an space scope.
+    SpaceIds(Vec<SpaceId>),
     MemoryKind(Vec<MemoryKind>),
     StatementKind(Vec<StatementKind>),
     PredicateId(Vec<PredicateId>),
@@ -298,12 +298,12 @@ fn retriever_config_for(
 }
 
 /// Decide the single push-down pre-filter for this retriever,
-/// per the v1 precedence: agent > temporal > predicate > kind.
+/// per the v1 precedence: space > temporal > predicate > kind.
 ///
-/// Agent scope is the most-selective, identity-based axis — it
+/// Space scope is the most-selective, identity-based axis — it
 /// defines *which memories are even visible* to this caller, so
 /// every other filter (temporal, predicate, kind) is a refinement
-/// inside the already-isolated agent universe. We push it first so
+/// inside the already-isolated space universe. We push it first so
 /// the retriever's candidate set is bounded by ownership before any
 /// of the type / time / predicate refinements have to run.
 fn pre_filter_for(
@@ -311,11 +311,11 @@ fn pre_filter_for(
     retriever: Retriever,
     routing: &RoutingDecision,
 ) -> Option<PreFilter> {
-    // Agent scope first — most selective, identity-based axis.
+    // Space scope first — most selective, identity-based axis.
     // Applies to every retriever; the rest are refinements inside
-    // the already-isolated agent universe.
-    if !req.agent_filter.is_empty() {
-        return Some(PreFilter::AgentIds(req.agent_filter.clone()));
+    // the already-isolated space universe.
+    if !req.space_filter.is_empty() {
+        return Some(PreFilter::SpaceIds(req.space_filter.clone()));
     }
 
     // Temporal — works on every retriever.

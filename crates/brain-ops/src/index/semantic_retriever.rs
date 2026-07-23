@@ -130,8 +130,8 @@ impl BrainSemanticRetriever {
             .map_err(|e| SemanticError::Internal(format!("open MEMORIES_TABLE: {e}")))?;
 
         let namespace_id = filters.namespace_id;
-        let agent_filter: HashSet<[u8; 16]> =
-            filters.agent_ids.iter().map(|a| (*a).into()).collect();
+        let space_filter: HashSet<[u8; 16]> =
+            filters.space_ids.iter().map(|a| (*a).into()).collect();
         let kind_filter = filters.memory_kind.map(memory_kind_to_u8);
         let created_range = filters.created_at_ms.clone();
         let context_filter = filters.context_ids.clone();
@@ -144,7 +144,7 @@ impl BrainSemanticRetriever {
             memory_row_passes(
                 &row_guard.value(),
                 namespace_id,
-                &agent_filter,
+                &space_filter,
                 kind_filter,
                 created_range.as_ref(),
                 &context_filter,
@@ -177,7 +177,7 @@ impl BrainSemanticRetriever {
                                 memory_row_passes(
                                     &g.value(),
                                     namespace_id,
-                                    &agent_filter,
+                                    &space_filter,
                                     kind_filter,
                                     created_range.as_ref(),
                                     &context_filter,
@@ -351,11 +351,11 @@ impl SemanticRetriever for BrainSemanticRetriever {
 
 /// Whether a memory row clears the active semantic filters. Shared by the
 /// direct HNSW visit closure and the HyPE-hit post-filter so both lanes
-/// apply identical namespace / agent / kind / created-range / context scoping.
+/// apply identical namespace / space / kind / created-range / context scoping.
 fn memory_row_passes(
     row: &MemoryMetadata,
     namespace_id: u32,
-    agent_filter: &HashSet<[u8; 16]>,
+    space_filter: &HashSet<[u8; 16]>,
     kind_filter: Option<u8>,
     created_range: Option<&std::ops::RangeInclusive<u64>>,
     context_filter: &[u64],
@@ -365,7 +365,7 @@ fn memory_row_passes(
     if row.namespace_id != namespace_id {
         return false;
     }
-    if !agent_filter.is_empty() && !agent_filter.contains(&row.agent_id_bytes) {
+    if !space_filter.is_empty() && !space_filter.contains(&row.space_id_bytes) {
         return false;
     }
     if let Some(kind) = kind_filter {

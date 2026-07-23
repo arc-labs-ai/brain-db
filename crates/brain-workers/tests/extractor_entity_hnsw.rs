@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use brain_core::ExtractorKind;
-use brain_core::{AgentId, EntityId, ExtractorId, Memory as CoreMemory, MemoryId};
+use brain_core::{SpaceId, EntityId, ExtractorId, Memory as CoreMemory, MemoryId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_extractors::resolver::{EmbeddingDeps, EntityDisambiguator, EMBED_RESOLVE_THRESHOLD};
 use brain_extractors::{
@@ -232,7 +232,7 @@ impl Fixture {
         let row = MemoryMetadata::new_active(
             memory_id,
             NamespaceId::SYSTEM,
-            AgentId(uuid::Uuid::from_bytes([0xC3; 16])),
+            SpaceId(uuid::Uuid::from_bytes([0xC3; 16])),
             ContextId(0),
             0,
             0,

@@ -30,10 +30,10 @@ pub const ENTITY_MERGE_AUDIT_OVERFLOW: TableDefinition<
 
 /// Actor-kind byte values for [`MergeRecord::actor_kind`] and
 /// [`MergeRecord::unmerged_by_actor_kind`]. `System` is the resolver /
-/// background worker; `Agent` is an operator agent_id over the wire.
+/// background worker; `Space` is an operator space_id over the wire.
 pub mod actor_kind {
     pub const SYSTEM: u8 = 0;
-    pub const AGENT: u8 = 1;
+    pub const SPACE: u8 = 1;
 }
 
 /// Conflict-resolution policy byte values for [`AttributeConflictRecord::policy`].
@@ -100,7 +100,7 @@ pub struct MergeRecord {
     /// See [`actor_kind`].
     pub actor_kind: u8,
     /// `[0; 16]` when `actor_kind == SYSTEM`.
-    pub actor_agent_bytes: [u8; 16],
+    pub actor_space_bytes: [u8; 16],
 
     // Diffs against the survivor (replayed in reverse by unmerge).
     /// Aliases that were `merged`'s but weren't already on `survivor`
@@ -126,7 +126,7 @@ pub struct MergeRecord {
     /// See [`actor_kind`]; `0` if not unmerged.
     pub unmerged_by_actor_kind: u8,
     /// `[0; 16]` if not unmerged or unmerge actor is `SYSTEM`.
-    pub unmerged_by_agent_bytes: [u8; 16],
+    pub unmerged_by_space_bytes: [u8; 16],
 }
 
 impl MergeRecord {
@@ -144,7 +144,7 @@ impl MergeRecord {
         confidence: f32,
         reason: String,
         actor_kind: u8,
-        actor_agent_bytes: [u8; 16],
+        actor_space_bytes: [u8; 16],
     ) -> Self {
         Self {
             merge_id_bytes: merge_id.to_bytes(),
@@ -155,7 +155,7 @@ impl MergeRecord {
             confidence,
             reason,
             actor_kind,
-            actor_agent_bytes,
+            actor_space_bytes,
             aliases_added: Vec::new(),
             trigrams_added: Vec::new(),
             attribute_conflicts: Vec::new(),
@@ -165,7 +165,7 @@ impl MergeRecord {
             finalized: 0,
             unmerged_at_unix_nanos: 0,
             unmerged_by_actor_kind: 0,
-            unmerged_by_agent_bytes: [0; 16],
+            unmerged_by_space_bytes: [0; 16],
         }
     }
 
@@ -242,7 +242,7 @@ mod tests {
             1_700_604_800_000_000_000,
             0.92,
             "duplicate detected".to_owned(),
-            actor_kind::AGENT,
+            actor_kind::SPACE,
             [7u8; 16],
         );
         rec.aliases_added = vec!["P. Patel".into(), "Priya P".into()];
@@ -304,8 +304,8 @@ mod tests {
 
         // Simulate an unmerge.
         rec.unmerged_at_unix_nanos = rec.merged_at_unix_nanos + 60_000_000_000;
-        rec.unmerged_by_actor_kind = actor_kind::AGENT;
-        rec.unmerged_by_agent_bytes = [9u8; 16];
+        rec.unmerged_by_actor_kind = actor_kind::SPACE;
+        rec.unmerged_by_space_bytes = [9u8; 16];
         rec.finalized = 1;
         {
             let wtxn = db.begin_write().unwrap();
@@ -321,8 +321,8 @@ mod tests {
         let got = t.get(&key).unwrap().unwrap().value();
         assert!(got.is_unmerged());
         assert!(got.is_finalized());
-        assert_eq!(got.unmerged_by_actor_kind, actor_kind::AGENT);
-        assert_eq!(got.unmerged_by_agent_bytes, [9u8; 16]);
+        assert_eq!(got.unmerged_by_actor_kind, actor_kind::SPACE);
+        assert_eq!(got.unmerged_by_space_bytes, [9u8; 16]);
     }
 
     #[test]

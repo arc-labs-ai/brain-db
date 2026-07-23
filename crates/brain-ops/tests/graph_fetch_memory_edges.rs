@@ -127,11 +127,11 @@ impl Fixture {
     }
 }
 
-const AGENT: [u8; 16] = [0xA1; 16];
+const SPACE: [u8; 16] = [0xA1; 16];
 
 fn caller() -> RequestCaller {
     RequestCaller::from_scope(
-        brain_core::AgentId(uuid::Uuid::from_bytes(AGENT)),
+        brain_core::SpaceId(uuid::Uuid::from_bytes(SPACE)),
         [0u8; 16],
         [0u8; 16],
         "acme".to_string(),

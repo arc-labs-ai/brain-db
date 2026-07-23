@@ -33,12 +33,12 @@ pub trait WriterHandle {
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<MemoryId, WriterError>> + 'a>>;
 
-    /// Agent the writer stamps on every memory it creates. Surfaced
-    /// to handlers so the wire response can echo the bound agent
+    /// Space the writer stamps on every memory it creates. Surfaced
+    /// to handlers so the wire response can echo the bound space
     /// without threading it through the request. Default is `nil`
-    /// (`AgentId::default`) for impls that don't bind an agent.
-    fn agent_id(&self) -> brain_core::AgentId {
-        brain_core::AgentId::default()
+    /// (`SpaceId::default`) for impls that don't bind an space.
+    fn space_id(&self) -> brain_core::SpaceId {
+        brain_core::SpaceId::default()
     }
 
     /// Push `(memory_id, text)` onto the per-shard ExtractorWorker
@@ -92,7 +92,7 @@ pub struct EncodeOp {
     pub fingerprint: [u8; 16],
     pub edges: Vec<EncodeOpEdge>,
     /// When `true`, the writer consults the per-shard `fingerprints`
-    /// table keyed by `(agent_id, context_id, content_hash)` and, on a
+    /// table keyed by `(space_id, context_id, content_hash)` and, on a
     /// hit, returns the existing `MemoryId` without allocating a new
     /// slot.
     pub deduplicate: bool,
@@ -100,14 +100,14 @@ pub struct EncodeOp {
     /// the executor (cheap); the writer only reads it when
     /// `deduplicate` is set.
     pub content_hash: [u8; 32],
-    /// **The caller's authenticated agent.** Stamped by the
-    /// dispatcher from `ConnPhase::Established.agent` — not from
+    /// **The caller's authenticated space.** Stamped by the
+    /// dispatcher from `ConnPhase::Established.space` — not from
     /// the wire request. Used by the writer to populate the
     /// memory row, the WAL payload, and the published event so the
-    /// subscribe `agents` filter can isolate per-tenant on a
-    /// shared shard. Defaults to `AgentId::default()` in tests
+    /// subscribe `spaces` filter can isolate per-tenant on a
+    /// shared shard. Defaults to `SpaceId::default()` in tests
     /// that bypass the dispatcher.
-    pub agent_id: brain_core::AgentId,
+    pub space_id: brain_core::SpaceId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -145,8 +145,8 @@ pub struct ForgetOp {
     pub request_id: RequestId,
     pub memory_id: MemoryId,
     pub mode: ForgetMode,
-    /// Caller's authenticated agent (see [`EncodeOp::agent_id`]).
-    pub agent_id: brain_core::AgentId,
+    /// Caller's authenticated space (see [`EncodeOp::space_id`]).
+    pub space_id: brain_core::SpaceId,
 }
 
 /// Per-memory outcome's per-memory error tolerance:
@@ -172,8 +172,8 @@ pub struct LinkOp {
     pub kind: EdgeKind,
     /// `[0, 1]` for most kinds; `[-1, 1]` for `Contradicts`.
     pub weight: f32,
-    /// Caller's authenticated agent (see [`EncodeOp::agent_id`]).
-    pub agent_id: brain_core::AgentId,
+    /// Caller's authenticated space (see [`EncodeOp::space_id`]).
+    pub space_id: brain_core::SpaceId,
 }
 
 /// UNLINK operation payload.
@@ -183,6 +183,6 @@ pub struct UnlinkOp {
     pub source: MemoryId,
     pub target: MemoryId,
     pub kind: EdgeKind,
-    /// Caller's authenticated agent (see [`EncodeOp::agent_id`]).
-    pub agent_id: brain_core::AgentId,
+    /// Caller's authenticated space (see [`EncodeOp::space_id`]).
+    pub space_id: brain_core::SpaceId,
 }

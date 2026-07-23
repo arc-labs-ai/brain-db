@@ -724,7 +724,7 @@ mod tests {
         use crate::framework::extractor::ExtractionContext;
         use crate::framework::item::ExtractedItem;
         use crate::framework::registry::ExtractorRegistry;
-        use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, Salience};
+        use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, Salience};
         use brain_metadata::MetadataDb;
         use tempfile::TempDir;
 
@@ -745,7 +745,7 @@ mod tests {
 
         let mem = brain_core::Memory {
             id: MemoryId::pack(0, 1, 0),
-            agent: AgentId::new(),
+            space: SpaceId::new(),
             context: ContextId(0),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
@@ -909,7 +909,7 @@ mod tests {
         let reg = ExtractorRegistry::new();
         let mem = brain_core::Memory {
             id: brain_core::MemoryId::pack(0, 1, 0),
-            agent: brain_core::AgentId::new(),
+            space: brain_core::SpaceId::new(),
             context: brain_core::ContextId(0),
             kind: brain_core::MemoryKind::Episodic,
             salience: brain_core::Salience::default(),

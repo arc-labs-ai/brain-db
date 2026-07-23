@@ -35,7 +35,7 @@ use crate::retrieval::fusion::{sort_by_fused_score, FusedItem};
 
 /// Half-life of the recency boost, in days. A memory whose event time is
 /// one half-life in the past receives half the freshness boost a
-/// just-now memory would. Chosen for episodic agent memory where
+/// just-now memory would. Chosen for episodic space memory where
 /// "recent" means weeks-to-months, not seconds; large enough that the
 /// decay is gentle within a conversation's lifetime, small enough that
 /// year-old memories stop competing on recency alone.

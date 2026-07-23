@@ -346,7 +346,7 @@ pub struct WorkersConfig {
     #[serde(default)]
     pub extractor: ExtractorWorkerConfig,
     /// Substrate auto-derived `FollowedBy` edges keyed on
-    /// per-agent temporal adjacency. Defaults kick in when the
+    /// per-space temporal adjacency. Defaults kick in when the
     /// section is omitted from TOML.
     #[serde(default)]
     pub temporal_edge: TemporalEdgeWorkerConfig,

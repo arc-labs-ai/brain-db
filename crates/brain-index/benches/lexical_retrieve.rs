@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use brain_core::StatementKind;
-use brain_core::{AgentId, MemoryId, MemoryKind, StatementId};
+use brain_core::{SpaceId, MemoryId, MemoryKind, StatementId};
 use brain_index::{
     LexicalFilters, LexicalQuery, LexicalRetriever, LexicalRetrieverConfig, LexicalScope,
     TantivyLexicalRetriever, TantivyShard,
@@ -42,7 +42,7 @@ fn build_memory_corpus() -> (TempDir, Arc<TantivyShard>) {
     let schema = shard.memory_text.index.schema();
     let mem_id = schema.get_field("memory_id").unwrap();
     let text = schema.get_field("text").unwrap();
-    let agent = schema.get_field("agent_id").unwrap();
+    let space = schema.get_field("space_id").unwrap();
     let kind = schema.get_field("kind").unwrap();
     let created = schema.get_field("created_at").unwrap();
 
@@ -51,7 +51,7 @@ fn build_memory_corpus() -> (TempDir, Arc<TantivyShard>) {
         .index
         .writer_with_num_threads(1, 200_000_000)
         .expect("writer");
-    let agent_bytes: [u8; 16] = AgentId::new().into();
+    let space_bytes: [u8; 16] = SpaceId::new().into();
 
     for i in 0..CORPUS {
         let mut doc = TantivyDocument::default();
@@ -64,7 +64,7 @@ fn build_memory_corpus() -> (TempDir, Arc<TantivyShard>) {
             i
         );
         doc.add_text(text, &body);
-        doc.add_bytes(agent, &agent_bytes);
+        doc.add_bytes(space, &space_bytes);
         doc.add_u64(kind, 0);
         doc.add_u64(created, (i as u64) * 1000);
         writer.add_document(doc).expect("add");

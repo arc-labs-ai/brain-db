@@ -50,7 +50,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::workers::hype::{HypeGenOutcome, HypeGenerator};
 use brain_core::{
-    AgentId, ContextId, EntityId, ExtractorId, Memory as CoreMemory, MemoryId, MemoryKind, Salience,
+    SpaceId, ContextId, EntityId, ExtractorId, Memory as CoreMemory, MemoryId, MemoryKind, Salience,
 };
 use brain_core::{StatementKind, StatementObject, StatementValue, SubjectRef};
 use brain_extractors::{
@@ -571,8 +571,8 @@ async fn do_extractor_cycle(
                 }
             }
             let produced_statements = counts.statements > 0;
-            let agent_id = memory_scope(ctx, *memory_id).agent();
-            publish_extracted_graph(ctx, *memory_id, agent_id, counts, audit_status).await;
+            let space_id = memory_scope(ctx, *memory_id).space();
+            publish_extracted_graph(ctx, *memory_id, space_id, counts, audit_status).await;
             // Reclassify the memory kind from what extraction produced: an
             // Event-shaped statement → Episodic, timeless facts/preferences →
             // Semantic. Only on a terminal apply (`!keep_queued`) that produced
@@ -944,7 +944,7 @@ async fn drain_batch(
                 .unwrap_or((0, None, MemoryKind::Episodic));
             CoreMemory {
                 id: *mid,
-                agent: AgentId::new(),
+                space: SpaceId::new(),
                 context: ContextId(0),
                 kind,
                 salience: Salience::default(),
@@ -1245,7 +1245,7 @@ async fn run_hype_pass(worker: &ExtractorWorker, ctx: &WorkerContext, items: &[E
         // caller watching this memory's derivation can tick HyPE off its
         // pending-stage checklist — mirrors `publish_extracted_graph`'s
         // per-memory publish below.
-        publish_hype_completed(ctx, *memory_id, scope.agent(), outcome).await;
+        publish_hype_completed(ctx, *memory_id, scope.space(), outcome).await;
     });
     futures_util::future::join_all(futs).await;
 }
@@ -1397,7 +1397,7 @@ async fn run_hype_refresh_sweep(worker: &ExtractorWorker, ctx: &WorkerContext) {
 /// Best-effort and strictly bounded: any error yields an empty string (the
 /// pre-graph-aware behavior), and the entity / line / character caps keep the
 /// HyPE prompt from ballooning on a densely-connected hub.
-/// Read a memory's `(namespace, agent)` scope from `MEMORIES_TABLE`.
+/// Read a memory's `(namespace, space)` scope from `MEMORIES_TABLE`.
 /// Falls back to the system scope when the row is absent — the
 /// neighborhood enrichment it feeds is best-effort prompt context, so a
 /// miss simply yields an empty (system-scoped) neighborhood rather than
@@ -1414,7 +1414,7 @@ fn memory_scope(ctx: &WorkerContext, memory_id: MemoryId) -> brain_metadata::Row
             rtxn.open_table(MEMORIES_TABLE).ok().and_then(|t| {
                 t.get(&memory_id.to_be_bytes()).ok().flatten().map(|g| {
                     let m = g.value();
-                    brain_metadata::RowScope::from_bytes(m.namespace_id, m.agent_id_bytes)
+                    brain_metadata::RowScope::from_bytes(m.namespace_id, m.space_id_bytes)
                 })
             })
         })
@@ -1463,8 +1463,8 @@ fn writeback_memory_kind(ctx: &WorkerContext, memory_id: MemoryId) {
         ) else {
             return;
         };
-        let lo = (scope.namespace_id, scope.agent_id_bytes, mid, [0u8; 16]);
-        let hi = (scope.namespace_id, scope.agent_id_bytes, mid, [0xFFu8; 16]);
+        let lo = (scope.namespace_id, scope.space_id_bytes, mid, [0u8; 16]);
+        let hi = (scope.namespace_id, scope.space_id_bytes, mid, [0xFFu8; 16]);
         let Ok(range) = by_ev.range(lo..=hi) else {
             return;
         };
@@ -2598,31 +2598,31 @@ fn run_apply_body(
         Err(_) => 0,
     };
 
-    // The writing agent's self-entity. First-person statement subjects
-    // ("I prefer dark roast") resolve to `EntityId::from(agent_id)` — the
-    // SAME identity `MATERIALIZE_PROCEDURAL` reads — so an agent's facts
+    // The writing space's self-entity. First-person statement subjects
+    // ("I prefer dark roast") resolve to `EntityId::from(space_id)` — the
+    // SAME identity `MATERIALIZE_PROCEDURAL` reads — so an space's facts
     // about itself persist and stay queryable instead of being dropped as
-    // non-referential pronouns. Per-agent by construction (the id is the
-    // agent's), so multi-agent deployments never collapse onto one node.
+    // non-referential pronouns. Per-space by construction (the id is the
+    // space's), so multi-space deployments never collapse onto one node.
     // A missing memory row (shouldn't happen for a queued memory) yields a
-    // zero agent; first-person routing simply falls back to the drop path.
+    // zero space; first-person routing simply falls back to the drop path.
     let self_entity_id: Option<EntityId> = {
         use brain_metadata::tables::memory::MEMORIES_TABLE;
         wtxn.open_table(MEMORIES_TABLE)
             .ok()
-            // Copy the agent bytes out while the table guard is still alive —
+            // Copy the space bytes out while the table guard is still alive —
             // returning the guard itself would borrow the dropped table.
             .and_then(|t| {
                 t.get(&memory_id.to_be_bytes())
                     .ok()
                     .flatten()
-                    .map(|g| g.value().agent_id_bytes)
+                    .map(|g| g.value().space_id_bytes)
             })
             .filter(|b| *b != [0u8; 16])
             .map(EntityId::from)
     };
 
-    // The source memory's `(namespace, agent)` scope. Every typed-graph
+    // The source memory's `(namespace, space)` scope. Every typed-graph
     // row this extraction writes — entities, statements, relations — is
     // stamped with the SAME scope as the memory it was extracted from,
     // so an extracted fact can never escape its source tenant. A missing
@@ -2635,7 +2635,7 @@ fn run_apply_body(
             .and_then(|t| {
                 t.get(&memory_id.to_be_bytes()).ok().flatten().map(|g| {
                     let m = g.value();
-                    brain_metadata::RowScope::from_bytes(m.namespace_id, m.agent_id_bytes)
+                    brain_metadata::RowScope::from_bytes(m.namespace_id, m.space_id_bytes)
                 })
             })
             .unwrap_or_else(|| {
@@ -3447,7 +3447,7 @@ fn audit_status_from_byte(byte: u8) -> StageAuditStatus {
 async fn publish_extracted_graph(
     ctx: &WorkerContext,
     memory_id: MemoryId,
-    agent_id: AgentId,
+    space_id: SpaceId,
     counts: ExtractorItemCounts,
     audit_status: StageAuditStatus,
 ) {
@@ -3488,7 +3488,7 @@ async fn publish_extracted_graph(
         stage_kind: Some(StageKind::Extractor),
         stage_outcome: Some(outcome),
         stage_payload: Some(payload),
-        agent_id,
+        space_id,
     };
     ctx.ops.publish_stage_event(envelope).await;
 }
@@ -3507,7 +3507,7 @@ async fn publish_extracted_graph(
 async fn publish_hype_completed(
     ctx: &WorkerContext,
     memory_id: MemoryId,
-    agent_id: AgentId,
+    space_id: SpaceId,
     outcome: HypeGenOutcome,
 ) {
     let stage_outcome = if outcome.questions_written > 0 {
@@ -3533,7 +3533,7 @@ async fn publish_hype_completed(
         stage_kind: Some(StageKind::Hype),
         stage_outcome: Some(stage_outcome),
         stage_payload: Some(payload),
-        agent_id,
+        space_id,
     };
     ctx.ops.publish_stage_event(envelope).await;
 }
@@ -4088,7 +4088,7 @@ fn resolve_statement_object(
     };
     if want_entity {
         // An object already surfaced as an entity this cycle links straight
-        // through. A first-person object the subject pass cached (the agent
+        // through. A first-person object the subject pass cached (the space
         // self-entity) lands here too — a standalone first-person object
         // ("report to me") is follow-up; the dominant first-person case is the
         // subject ("I prefer …"), handled in `resolve_statement_subject`.
@@ -4680,7 +4680,7 @@ fn resolve_statement_subject(
     let entity_id = if let Some(id) = entity_map.get(text).copied() {
         id
     } else if let Some(self_id) = self_entity_id.filter(|_| sm.subject_is_self) {
-        // First person ("I prefer …") refers to the writing agent — route to
+        // First person ("I prefer …") refers to the writing space — route to
         // its self-entity rather than dropping it as a non-referential pronoun.
         // The judgment is the LLM's (`subject_is_self`), so it holds across any
         // language with NO hardcoded pronoun list — "I", "yo", "私", "ich" all
@@ -4689,8 +4689,8 @@ fn resolve_statement_subject(
         // later object/endpoint reuses the same id.
         //
         // statement_create requires the subject entity to exist, so
-        // materialize the agent's self-entity row on first use (idempotent).
-        ensure_agent_self_entity(wtxn, scope, self_id, now)?;
+        // materialize the space's self-entity row on first use (idempotent).
+        ensure_space_self_entity(wtxn, scope, self_id, now)?;
         entity_map.insert(text.to_string(), self_id);
         self_id
     } else if !statement_subject_mintable(text) {
@@ -4726,14 +4726,14 @@ fn resolve_statement_subject(
     Ok(Some(entity_id))
 }
 
-/// Idempotently materialize the writing agent's self-entity row so that
-/// first-person statements (which use `EntityId::from(agent_id)` as their
+/// Idempotently materialize the writing space's self-entity row so that
+/// first-person statements (which use `EntityId::from(space_id)` as their
 /// subject) pass `statement_create`'s subject-existence check. The canonical
-/// name is the agent's own id in hex (`agent:<32 hex>`) — globally unique per
-/// agent, so multi-agent self-entities never collide, and it can never clash
-/// with a real extracted person's name. Typed `Person`: the agent/user is a
+/// name is the space's own id in hex (`space:<32 hex>`) — globally unique per
+/// space, so multi-space self-entities never collide, and it can never clash
+/// with a real extracted person's name. Typed `Person`: the space/user is a
 /// person-like referent. A no-op when the row already exists.
-fn ensure_agent_self_entity(
+fn ensure_space_self_entity(
     wtxn: &redb::WriteTransaction,
     scope: brain_metadata::RowScope,
     self_id: EntityId,
@@ -4754,7 +4754,7 @@ fn ensure_agent_self_entity(
     if exists {
         return Ok(());
     }
-    let canonical = format!("agent:{:032x}", u128::from_be_bytes(self_id.to_bytes()));
+    let canonical = format!("space:{:032x}", u128::from_be_bytes(self_id.to_bytes()));
     let entity = brain_core::Entity::new_active(
         self_id,
         brain_core::EntityType::PERSON_ID,
@@ -4896,10 +4896,10 @@ mod tests {
     }
 
     /// Seed a `MEMORIES_TABLE` row for `memory_id` owned by `scope`, so the
-    /// apply pass derives the same `(namespace, agent)` it was extracted under
+    /// apply pass derives the same `(namespace, space)` it was extracted under
     /// (real ENCODE always has the row; a synthetic id needs it planted, else
     /// apply hits the degenerate missing-row fallback and stamps a different
-    /// agent than the test reads back with).
+    /// space than the test reads back with).
     fn __seed_memory_row(
         metadata: &brain_metadata::MetadataDb,
         memory_id: brain_core::MemoryId,
@@ -4910,7 +4910,7 @@ mod tests {
         let row = MemoryMetadata::new_active(
             memory_id,
             scope.namespace(),
-            scope.agent(),
+            scope.space(),
             ContextId(0),
             0,
             0,
@@ -4942,7 +4942,7 @@ mod tests {
         let row = MemoryMetadata::new_active(
             memory_id,
             scope.namespace(),
-            scope.agent(),
+            scope.space(),
             ContextId(0),
             0,
             0,
@@ -5267,7 +5267,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     use brain_core::{
-        AgentId as TestAgentId, ContextId as TestContextId, MemoryId as TestMemoryId, MemoryKind,
+        SpaceId as TestSpaceId, ContextId as TestContextId, MemoryId as TestMemoryId, MemoryKind,
         Salience,
     };
     use brain_extractors::{
@@ -5309,7 +5309,7 @@ mod tests {
     fn make_mem(id_seq: u64, text: &str) -> CoreMemory {
         CoreMemory {
             id: TestMemoryId::pack(0, id_seq, 0),
-            agent: TestAgentId::new(),
+            space: TestSpaceId::new(),
             context: TestContextId(0),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
@@ -6495,7 +6495,7 @@ mod tests {
         use std::sync::Arc;
 
         use brain_core::{
-            AgentId, ContextId, EntityType, Memory, MemoryId, MemoryKind, Salience, StatementKind,
+            SpaceId, ContextId, EntityType, Memory, MemoryId, MemoryKind, Salience, StatementKind,
         };
         use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
         use brain_index::{IndexParams, SharedHnsw};
@@ -6536,7 +6536,7 @@ mod tests {
         let registry = ExtractorRegistry::new();
         let memory = Memory {
             id: MemoryId::pack(0, 1, 1),
-            agent: AgentId::new(),
+            space: SpaceId::new(),
             context: ContextId(0),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
@@ -6703,7 +6703,7 @@ mod tests {
         use std::sync::Arc;
 
         use brain_core::{
-            AgentId, ContextId, EntityType, Memory, MemoryId, MemoryKind, Salience, StatementKind,
+            SpaceId, ContextId, EntityType, Memory, MemoryId, MemoryKind, Salience, StatementKind,
         };
         use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
         use brain_index::{IndexParams, SharedHnsw};
@@ -6746,7 +6746,7 @@ mod tests {
         let registry = ExtractorRegistry::new();
         let memory = Memory {
             id: MemoryId::pack(0, 1, 1),
-            agent: AgentId::new(),
+            space: SpaceId::new(),
             context: ContextId(0),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),

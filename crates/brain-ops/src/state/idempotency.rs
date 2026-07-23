@@ -122,7 +122,7 @@ mod tests {
             }],
             deduplicate: false,
             content_hash: [0u8; 32],
-            agent_id: brain_core::AgentId::default(),
+            space_id: brain_core::SpaceId::default(),
         }
     }
 
@@ -158,7 +158,7 @@ mod tests {
             request_id: brain_core::RequestId::from([1u8; 16]),
             memory_id: brain_core::MemoryId::from(7u128),
             mode: ForgetMode::Soft,
-            agent_id: brain_core::AgentId::default(),
+            space_id: brain_core::SpaceId::default(),
         };
         let a = hash_forget_request(&op);
         let b = hash_forget_request(&op);
@@ -171,7 +171,7 @@ mod tests {
             request_id: brain_core::RequestId::from([1u8; 16]),
             memory_id: brain_core::MemoryId::from(7u128),
             mode: ForgetMode::Soft,
-            agent_id: brain_core::AgentId::default(),
+            space_id: brain_core::SpaceId::default(),
         };
         let soft = hash_forget_request(&op);
         op.mode = ForgetMode::Hard;

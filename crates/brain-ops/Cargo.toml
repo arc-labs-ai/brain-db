@@ -56,7 +56,7 @@ futures-lite = { workspace = true }
 tempfile.workspace = true
 uuid.workspace = true
 # Subscribe wal-record-projection tests build the exact CBOR event body
-# `publish_graph` emits, to pin the agent-prefix framing contract against
+# `publish_graph` emits, to pin the space-prefix framing contract against
 # the real encoding.
 ciborium.workspace = true
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }

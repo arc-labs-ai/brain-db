@@ -15,7 +15,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use brain_core::{AgentId, ContextId, EntityId, ExtractorId, MemoryId};
+use brain_core::{SpaceId, ContextId, EntityId, ExtractorId, MemoryId};
 use brain_core::{
     Entity, EntityType, EvidenceEntry, EvidenceRef, Statement, StatementId, StatementKind,
     StatementObject, StatementValue, SubjectRef,
@@ -161,7 +161,7 @@ fn submit_upload(writer: &RealWriterHandle, source: &str) {
         declared_entity_types: Vec::new(),
         created_at_unix_nanos: NOW,
     };
-    let write = Write::single(WriteId::new(), AgentId::default(), phase);
+    let write = Write::single(WriteId::new(), SpaceId::default(), phase);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

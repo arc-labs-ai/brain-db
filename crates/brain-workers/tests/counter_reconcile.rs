@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{SpaceId, ContextId, EdgeKind, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::edge::{
@@ -92,7 +92,7 @@ fn seed_memory_with_counts(
         let mut meta = MemoryMetadata::new_active(
             id,
             brain_core::NamespaceId::SYSTEM,
-            AgentId(Uuid::nil()),
+            SpaceId(Uuid::nil()),
             ContextId(1),
             slot,
             1,

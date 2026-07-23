@@ -1017,7 +1017,7 @@ fn read_object_is_entity(v: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether the LLM marked this statement's subject as the writing agent
+/// Whether the LLM marked this statement's subject as the writing space
 /// itself (first person, in any language). The model judges this from
 /// meaning — there is no pronoun list anywhere — so it is language-neutral.
 fn read_subject_is_self(v: &Value) -> bool {

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use brain_core::StatementKind;
-use brain_core::{AgentId, MemoryId, MemoryKind, StatementId};
+use brain_core::{SpaceId, MemoryId, MemoryKind, StatementId};
 use tantivy::TantivyDocument;
 use tempfile::TempDir;
 
@@ -26,14 +26,14 @@ fn write_memory(
     shard: &TantivyShard,
     id: MemoryId,
     text: &str,
-    agent: AgentId,
+    space: SpaceId,
     kind: MemoryKind,
     created_at_ms: u64,
 ) {
     let schema = shard.memory_text.index.schema();
     let id_field = schema.get_field("memory_id").unwrap();
     let text_field = schema.get_field("text").unwrap();
-    let agent_field = schema.get_field("agent_id").unwrap();
+    let space_field = schema.get_field("space_id").unwrap();
     let kind_field = schema.get_field("kind").unwrap();
     let created_field = schema.get_field("created_at").unwrap();
 
@@ -45,8 +45,8 @@ fn write_memory(
     let mut doc = TantivyDocument::default();
     doc.add_bytes(id_field, &id.raw().to_be_bytes());
     doc.add_text(text_field, text);
-    let a: [u8; 16] = agent.into();
-    doc.add_bytes(agent_field, &a);
+    let a: [u8; 16] = space.into();
+    doc.add_bytes(space_field, &a);
     doc.add_u64(
         kind_field,
         match kind {
@@ -125,7 +125,7 @@ fn terms_query_returns_hits_in_memory_scope() {
         &shard,
         MemoryId::pack(0, 1, 0),
         "the quick brown fox",
-        AgentId::new(),
+        SpaceId::new(),
         MemoryKind::Episodic,
         0,
     );
@@ -161,7 +161,7 @@ fn empty_result_is_ok_not_error() {
 #[test]
 fn ranks_are_dense_and_one_based() {
     let (_dir, shard, retriever) = fresh();
-    let agent = AgentId::new();
+    let space = SpaceId::new();
     for (slot, text) in [
         (1u64, "alpha alpha alpha alpha"),
         (2u64, "alpha beta gamma"),
@@ -171,7 +171,7 @@ fn ranks_are_dense_and_one_based() {
             &shard,
             MemoryId::pack(0, slot, 0),
             text,
-            agent,
+            space,
             MemoryKind::Episodic,
             slot * 1000,
         );
@@ -198,10 +198,10 @@ fn ranks_are_dense_and_one_based() {
 }
 
 #[test]
-fn agent_id_filter_includes_matches() {
+fn space_id_filter_includes_matches() {
     let (_dir, shard, retriever) = fresh();
-    let a = AgentId::new();
-    let b = AgentId::new();
+    let a = SpaceId::new();
+    let b = SpaceId::new();
     write_memory(
         &shard,
         MemoryId::pack(0, 1, 0),
@@ -224,7 +224,7 @@ fn agent_id_filter_includes_matches() {
             &LexicalQuery {
                 terms: vec!["common".into()],
                 filters: LexicalFilters {
-                    agent_ids: vec![a],
+                    space_ids: vec![a],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -245,11 +245,11 @@ fn agent_id_filter_includes_matches() {
 }
 
 #[test]
-fn agent_ids_filter_or_groups_match_any() {
+fn space_ids_filter_or_groups_match_any() {
     let (_dir, shard, retriever) = fresh();
-    let a1 = AgentId::new();
-    let a2 = AgentId::new();
-    let a3 = AgentId::new();
+    let a1 = SpaceId::new();
+    let a2 = SpaceId::new();
+    let a3 = SpaceId::new();
     write_memory(
         &shard,
         MemoryId::pack(0, 1, 0),
@@ -280,7 +280,7 @@ fn agent_ids_filter_or_groups_match_any() {
             &LexicalQuery {
                 terms: vec!["common".into()],
                 filters: LexicalFilters {
-                    agent_ids: vec![a1, a2],
+                    space_ids: vec![a1, a2],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -309,12 +309,12 @@ fn agent_ids_filter_or_groups_match_any() {
 #[test]
 fn created_at_range_filter_narrows() {
     let (_dir, shard, retriever) = fresh();
-    let agent = AgentId::new();
+    let space = SpaceId::new();
     write_memory(
         &shard,
         MemoryId::pack(0, 1, 0),
         "hello",
-        agent,
+        space,
         MemoryKind::Episodic,
         100,
     );
@@ -322,7 +322,7 @@ fn created_at_range_filter_narrows() {
         &shard,
         MemoryId::pack(0, 2, 0),
         "hello",
-        agent,
+        space,
         MemoryKind::Episodic,
         500,
     );
@@ -330,7 +330,7 @@ fn created_at_range_filter_narrows() {
         &shard,
         MemoryId::pack(0, 3, 0),
         "hello",
-        agent,
+        space,
         MemoryKind::Episodic,
         900,
     );
@@ -380,7 +380,7 @@ fn min_score_filter_drops_low_hits() {
         &shard,
         MemoryId::pack(0, 1, 0),
         "rare match here",
-        AgentId::new(),
+        SpaceId::new(),
         MemoryKind::Episodic,
         0,
     );
@@ -388,7 +388,7 @@ fn min_score_filter_drops_low_hits() {
         &shard,
         MemoryId::pack(0, 2, 0),
         "rare rare rare rare",
-        AgentId::new(),
+        SpaceId::new(),
         MemoryKind::Episodic,
         0,
     );
@@ -506,14 +506,14 @@ fn confidence_bucket_range_filter() {
 }
 
 #[test]
-fn agent_id_filter_on_statement_scope_errors() {
+fn space_id_filter_on_statement_scope_errors() {
     let (_dir, _shard, retriever) = fresh();
     let err = retriever
         .retrieve(
             &LexicalQuery {
                 terms: vec!["x".into()],
                 filters: LexicalFilters {
-                    agent_ids: vec![AgentId::new()],
+                    space_ids: vec![SpaceId::new()],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -576,7 +576,7 @@ fn empty_query_returns_empty_result() {
         &shard,
         MemoryId::pack(0, 1, 0),
         "anything",
-        AgentId::new(),
+        SpaceId::new(),
         MemoryKind::Episodic,
         0,
     );

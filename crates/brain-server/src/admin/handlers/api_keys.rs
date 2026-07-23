@@ -2,12 +2,12 @@
 //!
 //! Three actions:
 //!
-//! - `POST /v1/api-keys` — mint a key. Body is JSON with `agent_id`,
+//! - `POST /v1/api-keys` — mint a key. Body is JSON with `space_id`,
 //!   `namespace`, `permissions` (string array or `u32` bitfield), and
 //!   optional `user_id` / `org_id` (both reserved audit tags, default
-//!   all-zero). Minting interns the namespace and binds the agent +
+//!   all-zero). Minting interns the namespace and binds the space +
 //!   permissions. The reply carries the raw secret once — never again.
-//! - `GET /v1/api-keys?agent=…` — list keys for the given agent.
+//! - `GET /v1/api-keys?space=…` — list keys for the given space.
 //! - `DELETE /v1/api-keys/<hex>` — revoke a key by hex key-hash.
 //!
 //! All three are admin-only and intended to be reached over the
@@ -39,7 +39,7 @@ struct MintBody {
     #[serde(default)]
     user_id_hex: Option<String>,
     /// 32 hex chars = 16 bytes.
-    agent_id_hex: String,
+    space_id_hex: String,
     /// Schema namespace ("acme", "brain", …).
     namespace: String,
     /// Either a list of named permissions or a raw `u32` bitfield.
@@ -76,7 +76,7 @@ impl PermissionsSpec {
                         "SCHEMA_UPLOAD" => bits::SCHEMA_UPLOAD,
                         "ADMIN" => bits::ADMIN,
                         "ACT_AS" => bits::ACT_AS,
-                        "STANDARD_AGENT" => bits::STANDARD_AGENT,
+                        "STANDARD_SPACE" => bits::STANDARD_SPACE,
                         "READ_ONLY" => bits::READ_ONLY,
                         "READ_WRITE" => bits::READ_WRITE,
                         "FULL" => bits::FULL,
@@ -100,13 +100,13 @@ struct MintReply {
     key_hash_hex: String,
 }
 
-/// Single row in `GET /v1/api-keys?agent=…`.
+/// Single row in `GET /v1/api-keys?space=…`.
 #[derive(Debug, Serialize)]
 struct ApiKeyView {
     key_hash_hex: String,
     org_id_hex: String,
     user_id_hex: String,
-    agent_id_hex: String,
+    space_id_hex: String,
     namespace: String,
     permissions: u32,
     created_at_unix_nanos: u64,
@@ -167,7 +167,7 @@ async fn mint(
         },
         None => [0u8; 16],
     };
-    let agent_id = match parse_16(&parsed.agent_id_hex) {
+    let space_id = match parse_16(&parsed.space_id_hex) {
         Ok(b) => b,
         Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &msg)),
     };
@@ -202,7 +202,7 @@ async fn mint(
         org_id,
         user_id,
         parsed.namespace,
-        agent_id,
+        space_id,
         permissions,
         parsed.may_act,
         now,
@@ -228,21 +228,21 @@ async fn list(
     state: Arc<AdminState>,
 ) -> brain_http::Result<Response<ResponseBody>> {
     let query = req.uri().query().unwrap_or("");
-    let agent_hex = query
+    let space_hex = query
         .split('&')
-        .find_map(|kv| kv.strip_prefix("agent="))
+        .find_map(|kv| kv.strip_prefix("space="))
         .unwrap_or("");
-    if agent_hex.is_empty() {
+    if space_hex.is_empty() {
         return Ok(text_response(
             StatusCode::BAD_REQUEST,
-            "missing ?agent=<32-hex-agent-id>\n",
+            "missing ?space=<32-hex-space-id>\n",
         ));
     }
-    let agent_id = match parse_16(agent_hex) {
+    let space_id = match parse_16(space_hex) {
         Ok(b) => b,
         Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &msg)),
     };
-    let rows = match state.auth_store.list_for_agent(&agent_id) {
+    let rows = match state.auth_store.list_for_space(&space_id) {
         Ok(r) => r,
         Err(e) => {
             return Ok(text_response(
@@ -257,7 +257,7 @@ async fn list(
             key_hash_hex: hex32(&r.key_hash),
             org_id_hex: hex16(&r.org_id),
             user_id_hex: hex16(&r.user_id),
-            agent_id_hex: hex16(&r.agent_id),
+            space_id_hex: hex16(&r.space_id),
             namespace: r.namespace,
             permissions: r.permissions,
             created_at_unix_nanos: r.created_at_unix_nanos,

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use brain_core::{AgentId, ContextId, MemoryId, MemoryKind};
+use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::edge::{origin as edge_origin, EDGES_TABLE};
@@ -95,14 +95,14 @@ fn make_id(slot: u64) -> MemoryId {
 async fn seed_memory(
     fixture: &Fixture,
     slot: u64,
-    agent: AgentId,
+    space: SpaceId,
     context_id: ContextId,
     created_at: u64,
 ) -> MemoryId {
     seed_memory_with_vec(
         fixture,
         slot,
-        agent,
+        space,
         context_id,
         created_at,
         [0.0; VECTOR_DIM],
@@ -113,7 +113,7 @@ async fn seed_memory(
 async fn seed_memory_with_vec(
     fixture: &Fixture,
     slot: u64,
-    agent: AgentId,
+    space: SpaceId,
     context_id: ContextId,
     created_at: u64,
     vec: [f32; VECTOR_DIM],
@@ -135,8 +135,8 @@ async fn seed_memory_with_vec(
         content_hash: None,
         deduplicate: false,
     };
-    let mut write = Write::single(WriteId::new(), agent, phase);
-    write.agent_id = agent;
+    let mut write = Write::single(WriteId::new(), space, phase);
+    write.space_id = space;
     fixture.writer.submit(write).await.expect("seed submit");
     id
 }
@@ -156,14 +156,14 @@ where
 fn cycle_writes_followed_by_link_through_unified_path() {
     glommio_run(|| async {
         let fix = build_fixture();
-        let agent = AgentId(Uuid::nil());
+        let space = SpaceId(Uuid::nil());
         let context_id = ContextId(1);
 
-        // Two memories on the same agent + context, 1 second apart.
+        // Two memories on the same space + context, 1 second apart.
         let t0 = now_unix_nanos();
         let t1 = t0 + 1_000_000_000; // +1 s
-        let m0 = seed_memory(&fix, 1, agent, context_id, t0).await;
-        let m1 = seed_memory(&fix, 2, agent, context_id, t1).await;
+        let m0 = seed_memory(&fix, 1, space, context_id, t0).await;
+        let m1 = seed_memory(&fix, 2, space, context_id, t1).await;
 
         let mut rx = fix.bus.receiver();
 
@@ -173,7 +173,7 @@ fn cycle_writes_followed_by_link_through_unified_path() {
         // present, so this fixture exercises the same logical path it
         // did before the gate was added.
         fix.sender
-            .try_send((m1, agent, context_id, t1, [0.0_f32; VECTOR_DIM]))
+            .try_send((m1, space, context_id, t1, [0.0_f32; VECTOR_DIM]))
             .expect("enqueue");
 
         let worker = TemporalEdgeWorker::new(fix.receiver.clone()).with_knobs(TemporalEdgeKnobs {
@@ -238,26 +238,26 @@ fn cycle_writes_followed_by_link_through_unified_path() {
 }
 
 /// The `StageCompleted{TemporalEdge}` envelope carries the enqueue's real
-/// owning `agent_id` — not `AgentId::default()` — so an agent-scoped
-/// SUBSCRIBE filter (`filter.agents: [agent]`) actually matches the
+/// owning `space_id` — not `SpaceId::default()` — so an space-scoped
+/// SUBSCRIBE filter (`filter.spaces: [space]`) actually matches the
 /// event. Regression coverage for the bug where the publish site stamped
-/// the nil agent unconditionally, even when the enqueue payload already
-/// carried the real agent through `TemporalEdgeEnqueue`.
+/// the nil space unconditionally, even when the enqueue payload already
+/// carried the real space through `TemporalEdgeEnqueue`.
 #[test]
-fn cycle_publishes_stage_completed_with_real_owning_agent_id() {
+fn cycle_publishes_stage_completed_with_real_owning_space_id() {
     glommio_run(|| async {
         let fix = build_fixture();
-        let agent = AgentId::new();
+        let space = SpaceId::new();
         let context_id = ContextId(1);
 
         let t0 = now_unix_nanos();
         let t1 = t0 + 1_000_000_000;
-        let _m0 = seed_memory(&fix, 1, agent, context_id, t0).await;
-        let m1 = seed_memory(&fix, 2, agent, context_id, t1).await;
+        let _m0 = seed_memory(&fix, 1, space, context_id, t0).await;
+        let m1 = seed_memory(&fix, 2, space, context_id, t1).await;
 
         let mut rx = fix.bus.receiver();
         fix.sender
-            .try_send((m1, agent, context_id, t1, [0.0_f32; VECTOR_DIM]))
+            .try_send((m1, space, context_id, t1, [0.0_f32; VECTOR_DIM]))
             .expect("enqueue");
 
         let worker = TemporalEdgeWorker::new(fix.receiver.clone()).with_knobs(TemporalEdgeKnobs {
@@ -278,11 +278,11 @@ fn cycle_publishes_stage_completed_with_real_owning_agent_id() {
         while let Ok(env) = rx.try_recv() {
             if env.event_type == brain_protocol::EventType::StageCompleted && env.memory_id == m1 {
                 assert_eq!(
-                    env.agent_id, agent,
+                    env.space_id, space,
                     "StageCompleted{{TemporalEdge}} must carry the enqueue's real \
-                     owning agent_id, not AgentId::default()",
+                     owning space_id, not SpaceId::default()",
                 );
-                assert_ne!(env.agent_id, AgentId::default());
+                assert_ne!(env.space_id, SpaceId::default());
                 found = true;
             }
         }
@@ -291,13 +291,13 @@ fn cycle_publishes_stage_completed_with_real_owning_agent_id() {
 }
 
 /// Two memories whose embeddings sit at cosine ≈ 0 (orthogonal). The
-/// topical gate must refuse the `FollowedBy` derivation: same agent +
+/// topical gate must refuse the `FollowedBy` derivation: same space +
 /// same context + in-window, but the content has no overlap.
 #[test]
 fn temporal_edge_drops_candidate_below_topical_threshold() {
     glommio_run(|| async {
         let fix = build_fixture();
-        let agent = AgentId(Uuid::nil());
+        let space = SpaceId(Uuid::nil());
         let context_id = ContextId(1);
 
         // Orthogonal vectors (cosine = 0): m0 is "one in slot 0", m1
@@ -310,11 +310,11 @@ fn temporal_edge_drops_candidate_below_topical_threshold() {
 
         let t0 = now_unix_nanos();
         let t1 = t0 + 1_000_000_000; // +1 s — well inside the window
-        let _m0 = seed_memory_with_vec(&fix, 1, agent, context_id, t0, v0).await;
-        let m1 = seed_memory_with_vec(&fix, 2, agent, context_id, t1, v1).await;
+        let _m0 = seed_memory_with_vec(&fix, 1, space, context_id, t0, v0).await;
+        let m1 = seed_memory_with_vec(&fix, 2, space, context_id, t1, v1).await;
 
         fix.sender
-            .try_send((m1, agent, context_id, t1, v1))
+            .try_send((m1, space, context_id, t1, v1))
             .expect("enqueue");
 
         let worker = TemporalEdgeWorker::new(fix.receiver.clone()).with_knobs(TemporalEdgeKnobs {
@@ -373,7 +373,7 @@ fn temporal_edge_drops_candidate_below_topical_threshold() {
 fn temporal_edge_keeps_candidate_above_topical_threshold() {
     glommio_run(|| async {
         let fix = build_fixture();
-        let agent = AgentId(Uuid::nil());
+        let space = SpaceId(Uuid::nil());
         let context_id = ContextId(1);
 
         let mut v = [0.0_f32; VECTOR_DIM];
@@ -381,11 +381,11 @@ fn temporal_edge_keeps_candidate_above_topical_threshold() {
 
         let t0 = now_unix_nanos();
         let t1 = t0 + 1_000_000_000;
-        let _m0 = seed_memory_with_vec(&fix, 1, agent, context_id, t0, v).await;
-        let m1 = seed_memory_with_vec(&fix, 2, agent, context_id, t1, v).await;
+        let _m0 = seed_memory_with_vec(&fix, 1, space, context_id, t0, v).await;
+        let m1 = seed_memory_with_vec(&fix, 2, space, context_id, t1, v).await;
 
         fix.sender
-            .try_send((m1, agent, context_id, t1, v))
+            .try_send((m1, space, context_id, t1, v))
             .expect("enqueue");
 
         let worker = TemporalEdgeWorker::new(fix.receiver.clone()).with_knobs(TemporalEdgeKnobs {
@@ -419,7 +419,7 @@ fn temporal_edge_keeps_candidate_above_topical_threshold() {
 fn cycle_merges_real_predecessor_and_weight_into_artifact_bundle() {
     glommio_run(|| async {
         let fix = build_fixture();
-        let agent = AgentId(Uuid::nil());
+        let space = SpaceId(Uuid::nil());
         let context_id = ContextId(1);
 
         let mut v = [0.0_f32; VECTOR_DIM];
@@ -427,11 +427,11 @@ fn cycle_merges_real_predecessor_and_weight_into_artifact_bundle() {
 
         let t0 = now_unix_nanos();
         let t1 = t0 + 1_000_000_000;
-        let m0 = seed_memory_with_vec(&fix, 1, agent, context_id, t0, v).await;
-        let m1 = seed_memory_with_vec(&fix, 2, agent, context_id, t1, v).await;
+        let m0 = seed_memory_with_vec(&fix, 1, space, context_id, t0, v).await;
+        let m1 = seed_memory_with_vec(&fix, 2, space, context_id, t1, v).await;
 
         fix.sender
-            .try_send((m1, agent, context_id, t1, v))
+            .try_send((m1, space, context_id, t1, v))
             .expect("enqueue");
 
         let worker = TemporalEdgeWorker::new(fix.receiver.clone()).with_knobs(TemporalEdgeKnobs {

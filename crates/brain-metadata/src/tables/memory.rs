@@ -5,7 +5,7 @@
 //! ## Storage representation
 //!
 //! `MemoryMetadata` derives `rkyv::Archive`/`Serialize`/`Deserialize`.
-//! Brain-core types (`MemoryId`, `AgentId`, `MemoryKind`) don't derive
+//! Brain-core types (`MemoryId`, `SpaceId`, `MemoryKind`) don't derive
 //! rkyv — that would couple the data-model layer to a particular
 //! encoding. Instead, the struct stores their byte representations
 //! (`[u8; 16]`, `u64`, `u8`) and exposes typed getters that convert at
@@ -21,7 +21,7 @@
 
 use std::ops::Bound;
 
-use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, NamespaceId};
+use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, NamespaceId};
 use redb::{ReadTransaction, TableDefinition};
 
 use crate::tables::scope::RowScope;
@@ -35,17 +35,17 @@ use crate::tables::scope::RowScope;
 pub const MEMORIES_TABLE: TableDefinition<'static, [u8; 16], MemoryMetadata> =
     TableDefinition::new("memories");
 
-/// Secondary timeline index keyed `(agent_id_bytes, created_at_unix_nanos
+/// Secondary timeline index keyed `(space_id_bytes, created_at_unix_nanos
 /// BE bytes, context_id BE bytes, memory_id BE bytes)` → `()`.
 ///
 /// The TemporalEdgeWorker (`FollowedBy` auto-derivation) needs
-/// to answer "most-recent memory by agent A within context C and
+/// to answer "most-recent memory by space A within context C and
 /// timestamp window" cheaply. Without this index the worker would
 /// either full-scan `MEMORIES_TABLE` per encode or maintain an
 /// in-memory shadow that can't survive recovery.
 ///
 /// Key layout (48 bytes total) is chosen so a backward range scan
-/// from `(agent, t_now, ctx, *)` yields rows in descending-time order;
+/// from `(space, t_now, ctx, *)` yields rows in descending-time order;
 /// the worker stops at the first hit that satisfies its window. The
 /// trailing `memory_id` is purely a disambiguator so two memories
 /// committed at exactly the same nanos can both index without
@@ -54,59 +54,59 @@ pub const MEMORIES_TABLE: TableDefinition<'static, [u8; 16], MemoryMetadata> =
 /// On encode commit the writer inserts a row here; on forget /
 /// tombstone the writer must delete it so a tombstoned memory never
 /// surfaces as a temporal predecessor.
-pub const MEMORIES_BY_AGENT_TIMELINE_TABLE: TableDefinition<'static, &[u8], ()> =
-    TableDefinition::new("memories_by_agent_timeline");
+pub const MEMORIES_BY_SPACE_TIMELINE_TABLE: TableDefinition<'static, &[u8], ()> =
+    TableDefinition::new("memories_by_space_timeline");
 
 /// Encoded length:
-/// `namespace(4) + agent(16) + created_at(8) + context(8) + memory_id(16)`.
+/// `namespace(4) + space(16) + created_at(8) + context(8) + memory_id(16)`.
 /// The leading `namespace_id` makes each tenant's timeline a contiguous
-/// keyspace, so a scan for one `(namespace, agent)` never traverses
+/// keyspace, so a scan for one `(namespace, space)` never traverses
 /// another tenant's rows.
-pub const AGENT_TIMELINE_KEY_LEN: usize = 4 + 16 + 8 + 8 + 16;
+pub const SPACE_TIMELINE_KEY_LEN: usize = 4 + 16 + 8 + 8 + 16;
 
 /// Pack the discriminators into the canonical key bytes.
 /// `created_at_unix_nanos` is encoded big-endian so a redb range
 /// scan in lexicographic order yields chronological order.
 #[must_use]
-pub fn agent_timeline_key(
+pub fn space_timeline_key(
     namespace_id: u32,
-    agent_id_bytes: [u8; 16],
+    space_id_bytes: [u8; 16],
     created_at_unix_nanos: u64,
     context_id: u64,
     memory_id_bytes: [u8; 16],
-) -> [u8; AGENT_TIMELINE_KEY_LEN] {
-    let mut k = [0u8; AGENT_TIMELINE_KEY_LEN];
+) -> [u8; SPACE_TIMELINE_KEY_LEN] {
+    let mut k = [0u8; SPACE_TIMELINE_KEY_LEN];
     k[0..4].copy_from_slice(&namespace_id.to_be_bytes());
-    k[4..20].copy_from_slice(&agent_id_bytes);
+    k[4..20].copy_from_slice(&space_id_bytes);
     k[20..28].copy_from_slice(&created_at_unix_nanos.to_be_bytes());
     k[28..36].copy_from_slice(&context_id.to_be_bytes());
     k[36..52].copy_from_slice(&memory_id_bytes);
     k
 }
 
-/// Prefix matching every row for a `(namespace, agent)` — useful for
+/// Prefix matching every row for a `(namespace, space)` — useful for
 /// cleanup and for the in-context worker scan that further narrows by
 /// `created_at`.
 #[must_use]
-pub fn agent_timeline_prefix_agent(namespace_id: u32, agent_id_bytes: [u8; 16]) -> [u8; 20] {
+pub fn space_timeline_prefix_space(namespace_id: u32, space_id_bytes: [u8; 16]) -> [u8; 20] {
     let mut p = [0u8; 20];
     p[0..4].copy_from_slice(&namespace_id.to_be_bytes());
-    p[4..20].copy_from_slice(&agent_id_bytes);
+    p[4..20].copy_from_slice(&space_id_bytes);
     p
 }
 
-/// Prefix matching every row for (namespace, agent, time) — useful for
+/// Prefix matching every row for (namespace, space, time) — useful for
 /// the worker's "what was the predecessor" probe (a backward range scan
 /// stops at the first key strictly less than the prefix).
 #[must_use]
-pub fn agent_timeline_prefix_agent_time(
+pub fn space_timeline_prefix_space_time(
     namespace_id: u32,
-    agent_id_bytes: [u8; 16],
+    space_id_bytes: [u8; 16],
     created_at_unix_nanos: u64,
 ) -> [u8; 28] {
     let mut p = [0u8; 28];
     p[0..4].copy_from_slice(&namespace_id.to_be_bytes());
-    p[4..20].copy_from_slice(&agent_id_bytes);
+    p[4..20].copy_from_slice(&space_id_bytes);
     p[20..28].copy_from_slice(&created_at_unix_nanos.to_be_bytes());
     p
 }
@@ -183,7 +183,7 @@ pub struct MemoryTimelinePage {
     /// `created_at_unix_nanos` (they are stamped from separate reads at
     /// write time), and a reconstructed key would land between real keys —
     /// breaking the exclusive-resume boundary (descending re-emits it).
-    pub last_key: Option<[u8; AGENT_TIMELINE_KEY_LEN]>,
+    pub last_key: Option<[u8; SPACE_TIMELINE_KEY_LEN]>,
 }
 
 /// Lexicographic successor of `prefix`: the smallest byte string strictly
@@ -202,9 +202,9 @@ fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Keyset (seek) page over one `(namespace, agent)`'s memory timeline.
+/// Keyset (seek) page over one `(namespace, space)`'s memory timeline.
 ///
-/// Ranges [`MEMORIES_BY_AGENT_TIMELINE_TABLE`] within the tenant's
+/// Ranges [`MEMORIES_BY_SPACE_TIMELINE_TABLE`] within the tenant's
 /// contiguous keyspace and, for each timeline key, loads the memory row
 /// and applies `filter`. `descending` walks newest-first; `after_key`,
 /// when present, resumes strictly after that timeline key (the previous
@@ -223,14 +223,14 @@ pub fn memory_timeline_page(
     limit: usize,
     filter: &MemoryTimelineFilter,
 ) -> Result<MemoryTimelinePage, MemoryListError> {
-    let timeline_t = rtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE)?;
+    let timeline_t = rtxn.open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)?;
     let memories_t = rtxn.open_table(MEMORIES_TABLE)?;
 
-    let prefix = agent_timeline_prefix_agent(scope.namespace_id, scope.agent_id_bytes).to_vec();
+    let prefix = space_timeline_prefix_space(scope.namespace_id, scope.space_id_bytes).to_vec();
     let upper = prefix_successor(&prefix);
 
     // Build the range bounds. The scan is always confined to the tenant's
-    // 20-byte `(namespace, agent)` prefix; `after_key` narrows one end so
+    // 20-byte `(namespace, space)` prefix; `after_key` narrows one end so
     // the resume is strictly exclusive of the previous page's last key.
     let (lower_bound, upper_bound): (Bound<&[u8]>, Bound<&[u8]>) = if descending {
         // Newest-first: keys below `after_key` (exclusive) down to the
@@ -264,12 +264,12 @@ pub fn memory_timeline_page(
     // not merely a full page.
     let mut rows: Vec<MemoryMetadata> = Vec::with_capacity(limit.min(128));
     let mut has_more = false;
-    let mut last_key: Option<[u8; AGENT_TIMELINE_KEY_LEN]> = None;
+    let mut last_key: Option<[u8; SPACE_TIMELINE_KEY_LEN]> = None;
 
     // A closure over one timeline entry: load the row, tenant-check,
     // filter, and either push or signal has_more. Returns true to stop.
     let mut consume = |key: &[u8]| -> Result<bool, MemoryListError> {
-        if key.len() != AGENT_TIMELINE_KEY_LEN {
+        if key.len() != SPACE_TIMELINE_KEY_LEN {
             return Ok(false);
         }
         let mut id_bytes = [0u8; 16];
@@ -280,7 +280,7 @@ pub fn memory_timeline_page(
         // Tenant wall (defense-in-depth): the range prefix already
         // isolates the scope, but re-check the row's own owner so a
         // corrupt index key can never leak a foreign row.
-        if row.namespace_id != scope.namespace_id || row.agent_id_bytes != scope.agent_id_bytes {
+        if row.namespace_id != scope.namespace_id || row.space_id_bytes != scope.space_id_bytes {
             return Ok(false);
         }
         if !filter.admits(&row) {
@@ -292,7 +292,7 @@ pub fn memory_timeline_page(
         }
         // Record the exact key bytes so the resume cursor is the real
         // index key (see `MemoryTimelinePage::last_key`).
-        let mut kb = [0u8; AGENT_TIMELINE_KEY_LEN];
+        let mut kb = [0u8; SPACE_TIMELINE_KEY_LEN];
         kb.copy_from_slice(key);
         last_key = Some(kb);
         rows.push(row);
@@ -386,11 +386,11 @@ pub struct MemoryMetadata {
     // -- Identity --
     pub memory_id_bytes: [u8; 16],
     /// Owning namespace (tenant) — the outer half of the
-    /// `(namespace, agent)` scope key. `0` is the reserved `brain`
+    /// `(namespace, space)` scope key. `0` is the reserved `brain`
     /// system namespace; stamped by the writer via
     /// [`Self::with_namespace`].
     pub namespace_id: u32,
-    pub agent_id_bytes: [u8; 16],
+    pub space_id_bytes: [u8; 16],
     pub context_id: u64,
     pub slot_id: u64,
     pub slot_version: u32,
@@ -459,7 +459,7 @@ impl MemoryMetadata {
     pub fn new_active(
         memory_id: MemoryId,
         namespace_id: NamespaceId,
-        agent_id: AgentId,
+        space_id: SpaceId,
         context_id: ContextId,
         slot_id: u64,
         slot_version: u32,
@@ -473,10 +473,10 @@ impl MemoryMetadata {
             memory_id_bytes: memory_id.to_be_bytes(),
             // The owning tenant — required, never defaulted. The server
             // derives it from the authenticated connection's `(namespace,
-            // agent)` scope and threads it here; a row can never be built
+            // space)` scope and threads it here; a row can never be built
             // without naming its namespace (fail-closed by construction).
             namespace_id: namespace_id.raw(),
-            agent_id_bytes: agent_id.into(),
+            space_id_bytes: space_id.into(),
             context_id: context_id.raw(),
             slot_id,
             slot_version,
@@ -540,8 +540,8 @@ impl MemoryMetadata {
     }
 
     #[must_use]
-    pub fn agent_id(&self) -> AgentId {
-        AgentId::from(self.agent_id_bytes)
+    pub fn space_id(&self) -> SpaceId {
+        SpaceId::from(self.space_id_bytes)
     }
 
     #[must_use]
@@ -644,10 +644,10 @@ impl redb::Value for MemoryMetadata {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, NamespaceId};
+    use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, NamespaceId};
     use redb::{Database, ReadableDatabase};
 
-    fn aid(byte: u8) -> AgentId {
+    fn aid(byte: u8) -> SpaceId {
         let mut b = [0u8; 16];
         b[15] = byte;
         b.into()
@@ -721,16 +721,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
         let ns = NamespaceId::SYSTEM;
-        let mut agent_b = [0u8; 16];
-        agent_b[15] = 0x55;
-        let agent: AgentId = agent_b.into();
+        let mut space_b = [0u8; 16];
+        space_b[15] = 0x55;
+        let space: SpaceId = space_b.into();
         const N: u64 = 25;
         const BASE: u64 = 1_700_000_000_000_000_000;
 
         let wtxn = db.begin_write().unwrap();
         {
             let mut mt = wtxn.open_table(MEMORIES_TABLE).unwrap();
-            let mut tt = wtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE).unwrap();
+            let mut tt = wtxn.open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE).unwrap();
             for i in 0..N {
                 // Reproduce the real write-path hazard: the timeline index key
                 // and the memory row are stamped from SEPARATE `created_at`
@@ -744,7 +744,7 @@ mod tests {
                 let m = MemoryMetadata::new_active(
                     MemoryId::pack(1, i, 1),
                     ns,
-                    agent,
+                    space,
                     ContextId(0),
                     i,
                     1,
@@ -755,9 +755,9 @@ mod tests {
                     row_created,
                 );
                 mt.insert(&m.memory_id_bytes, &m).unwrap();
-                let tk = agent_timeline_key(
+                let tk = space_timeline_key(
                     m.namespace_id,
-                    m.agent_id_bytes,
+                    m.space_id_bytes,
                     key_created, // deliberately != m.created_at_unix_nanos
                     m.context_id,
                     m.memory_id_bytes,
@@ -768,7 +768,7 @@ mod tests {
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let scope = RowScope::from_bytes(ns.raw(), agent_b);
+        let scope = RowScope::from_bytes(ns.raw(), space_b);
         let filter = MemoryTimelineFilter {
             salience_max: 1.0,
             ..Default::default()
@@ -780,7 +780,7 @@ mod tests {
         // key/row `created_at` divergence above does not corrupt the boundary.
         for descending in [false, true] {
             let mut ids: Vec<[u8; 16]> = Vec::new();
-            let mut after: Option<[u8; AGENT_TIMELINE_KEY_LEN]> = None;
+            let mut after: Option<[u8; SPACE_TIMELINE_KEY_LEN]> = None;
             loop {
                 let page = memory_timeline_page(
                     &rtxn,
@@ -818,13 +818,13 @@ mod tests {
     #[test]
     fn brain_core_type_round_trip() {
         let memory_id = MemoryId::pack(7, 0x1234_5678, 42);
-        let agent_id = aid(0x33);
+        let space_id = aid(0x33);
         let context = ContextId(99);
 
         let m = MemoryMetadata::new_active(
             memory_id,
             NamespaceId::SYSTEM,
-            agent_id,
+            space_id,
             context,
             0x1234_5678,
             42,
@@ -835,7 +835,7 @@ mod tests {
             0,
         );
         assert_eq!(m.memory_id(), memory_id);
-        assert_eq!(m.agent_id(), agent_id);
+        assert_eq!(m.space_id(), space_id);
         assert_eq!(m.context(), context);
         assert_eq!(m.kind().unwrap(), MemoryKind::Semantic);
     }

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{SpaceId, ContextId, EdgeKind, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::edge::{origin as edge_origin, EDGES_TABLE};
@@ -99,18 +99,18 @@ fn make_id(slot: u64) -> MemoryId {
 }
 
 async fn seed_memory_with_vec(fixture: &Fixture, slot: u64, vector: [f32; VECTOR_DIM]) -> MemoryId {
-    seed_memory_with_vec_agent(fixture, slot, vector, AgentId::default()).await
+    seed_memory_with_vec_space(fixture, slot, vector, SpaceId::default()).await
 }
 
-/// Same as [`seed_memory_with_vec`], but stamps the memory's owning agent
-/// explicitly. `apply_upsert_memory` derives `MEMORIES_TABLE.agent_id_bytes`
-/// from the enclosing `Write`'s `agent_id` — this is what lets the
-/// `StageCompleted{AutoEdge}` agent-id tests seed a real, non-default owner.
-async fn seed_memory_with_vec_agent(
+/// Same as [`seed_memory_with_vec`], but stamps the memory's owning space
+/// explicitly. `apply_upsert_memory` derives `MEMORIES_TABLE.space_id_bytes`
+/// from the enclosing `Write`'s `space_id` — this is what lets the
+/// `StageCompleted{AutoEdge}` space-id tests seed a real, non-default owner.
+async fn seed_memory_with_vec_space(
     fixture: &Fixture,
     slot: u64,
     vector: [f32; VECTOR_DIM],
-    agent_id: AgentId,
+    space_id: SpaceId,
 ) -> MemoryId {
     use brain_core::Salience;
     use brain_ops::{Phase, Write, WriteId};
@@ -130,7 +130,7 @@ async fn seed_memory_with_vec_agent(
         content_hash: None,
         deduplicate: false,
     };
-    let write = Write::single(WriteId::new(), agent_id, phase);
+    let write = Write::single(WriteId::new(), space_id, phase);
     fixture.writer.submit(write).await.expect("seed submit");
     id
 }
@@ -233,19 +233,19 @@ fn cycle_writes_link_phase_through_unified_path() {
 }
 
 /// The `StageCompleted{AutoEdge}` envelope carries the source memory's
-/// REAL owning `agent_id` — not `AgentId::default()` — so an agent-scoped
-/// SUBSCRIBE filter (`filter.agents: [agent]`) actually matches the
+/// REAL owning `space_id` — not `SpaceId::default()` — so an space-scoped
+/// SUBSCRIBE filter (`filter.spaces: [space]`) actually matches the
 /// event. Regression coverage for the bug where the publish site stamped
-/// the nil agent unconditionally.
+/// the nil space unconditionally.
 #[test]
-fn cycle_publishes_stage_completed_with_real_owning_agent_id() {
+fn cycle_publishes_stage_completed_with_real_owning_space_id() {
     glommio_run(|| async {
         let fix = build_fixture();
         let v = unit_vec(0);
-        let owner = AgentId::new();
+        let owner = SpaceId::new();
 
-        let m1 = seed_memory_with_vec_agent(&fix, 1, v, owner).await;
-        let _m2 = seed_memory_with_vec_agent(&fix, 2, v, owner).await;
+        let m1 = seed_memory_with_vec_space(&fix, 1, v, owner).await;
+        let _m2 = seed_memory_with_vec_space(&fix, 2, v, owner).await;
 
         let mut rx = fix.bus.receiver();
         fix.sender.try_send((m1, v)).expect("enqueue");
@@ -267,11 +267,11 @@ fn cycle_publishes_stage_completed_with_real_owning_agent_id() {
         while let Ok(env) = rx.try_recv() {
             if env.event_type == brain_protocol::EventType::StageCompleted && env.memory_id == m1 {
                 assert_eq!(
-                    env.agent_id, owner,
+                    env.space_id, owner,
                     "StageCompleted{{AutoEdge}} must carry the memory's real \
-                     owning agent_id, not AgentId::default()",
+                     owning space_id, not SpaceId::default()",
                 );
-                assert_ne!(env.agent_id, AgentId::default());
+                assert_ne!(env.space_id, SpaceId::default());
                 found = true;
             }
         }
@@ -321,7 +321,7 @@ fn deterministic_batch_hash_makes_retries_idempotent() {
         created_at_unix_nanos: now_unix_nanos(),
     };
     let id = WriteId::new();
-    let write = Write::single(id, AgentId::default(), phase).with_request_hash(hash_a);
+    let write = Write::single(id, SpaceId::default(), phase).with_request_hash(hash_a);
     assert_eq!(write.request_hash, Some(hash_a));
 }
 

@@ -465,7 +465,7 @@ mod tests {
             salience: 0.5,
             auto_edges_added: 3,
             lsn: 42,
-            agent_id: [0xAA; 16],
+            space_id: [0xAA; 16],
             context_id: 7,
             kind: MemoryKindWire::Episodic,
             created_at_unix_nanos: 1_700_000_000_000_000_000,
@@ -492,7 +492,7 @@ mod tests {
             salience: 0.5,
             auto_edges_added: 0,
             lsn: 99,
-            agent_id: [0xAA; 16],
+            space_id: [0xAA; 16],
             context_id: 7,
             kind: MemoryKindWire::Episodic,
             created_at_unix_nanos: 1_700_000_000_000_000_000,
@@ -516,7 +516,7 @@ mod tests {
                 confidence: 0.85,
                 salience: 0.5,
                 kind: MemoryKindWire::Episodic,
-                agent_id: sample_uuid(42),
+                space_id: sample_uuid(42),
                 context_id: 1_u64,
                 created_at_unix_nanos: 1_700_000_000_000_000_000,
                 last_accessed_at_unix_nanos: 1_700_000_001_000_000_000,
@@ -1069,7 +1069,7 @@ mod tests {
     #[test]
     fn handshake_response_bodies_round_trip() {
         use crate::connection::handshake::{
-            AgentPermissions, AuthMethod, AuthOkPayload, HelloCapabilities, ServerFeatures,
+            SpacePermissions, AuthMethod, AuthOkPayload, HelloCapabilities, ServerFeatures,
             WelcomePayload,
         };
 
@@ -1090,9 +1090,9 @@ mod tests {
             },
         });
         let auth_ok = ResponseBody::AuthOk(AuthOkPayload {
-            agent_id: sample_uuid(21),
+            space_id: sample_uuid(21),
             bound_shard_id: 5,
-            permissions: AgentPermissions {
+            permissions: SpacePermissions {
                 can_encode: true,
                 can_recall: true,
                 can_plan: true,

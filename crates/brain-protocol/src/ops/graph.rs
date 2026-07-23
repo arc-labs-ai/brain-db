@@ -1,13 +1,13 @@
 //! `GRAPH_FETCH` — paginated export of the caller's typed graph.
 //!
-//! A read-only projection over the typed-graph state a `(namespace, agent)`
+//! A read-only projection over the typed-graph state a `(namespace, space)`
 //! already owns: entities, the relations and entity-object facts that link
 //! them, and — behind opt-in layers — value-object statements and the
 //! memories that mention entities. It is the "see my whole memory as a
 //! graph" read: no cue, no ranking, no relevance suppression.
 //!
 //! Pagination spines on the subject-anchored statement index (the one
-//! typed-graph index that is `(namespace, agent)`-prefixed), so the entity
+//! typed-graph index that is `(namespace, space)`-prefixed), so the entity
 //! set is *derived from traversal* rather than a dedicated entity index.
 //! Because an entity can be reached on more than one page, the response
 //! contract is **completeness, not disjointness**: every node and edge
@@ -19,7 +19,7 @@
 use super::memory::ActAs;
 
 // ============================================================
-// GRAPH_FETCH — full-agent graph export
+// GRAPH_FETCH — full-space graph export
 // ============================================================
 
 /// Kind of a graph node. The id width is uniform (16 bytes) across kinds;
@@ -125,7 +125,7 @@ pub struct GraphEdge {
 }
 
 /// `GRAPH_FETCH` (`0x0163`) — a paginated export of the caller's
-/// `(namespace, agent)` typed graph.
+/// `(namespace, space)` typed graph.
 ///
 /// The default layer is the *concept map*: entity nodes plus the
 /// `Relation` and `Fact` edges that link them. `include_statements` adds
@@ -167,7 +167,7 @@ pub struct GraphFetchRequest {
     /// Effective identity this export runs as, on behalf of the
     /// authenticated connection principal. `None` (the common case, omitted
     /// on the wire) runs as the connection's own key-bound identity. The
-    /// export is scoped to the effective `(namespace, agent)`.
+    /// export is scoped to the effective `(namespace, space)`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
 }

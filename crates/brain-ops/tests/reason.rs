@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use brain_core::{
-    AgentId, ContextId, EdgeKind, Entity, EntityId, EntityType, EvidenceEntry, EvidenceRef,
+    SpaceId, ContextId, EdgeKind, Entity, EntityId, EntityType, EvidenceEntry, EvidenceRef,
     ExtractorId, MemoryId, MemoryKind, NamespaceId, Statement, StatementKind, StatementObject,
     StatementValue, SubjectRef,
 };
@@ -64,7 +64,7 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
     let db_path = tempdir.path().join("metadata.redb");
     let metadata = MetadataDb::open(&db_path).unwrap();
 
-    let agent = AgentId(Uuid::nil());
+    let space = SpaceId(Uuid::nil());
     let mut ids = Vec::with_capacity(n_memories);
 
     let wtxn = metadata.write_txn().unwrap();
@@ -77,7 +77,7 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
             let meta = MemoryMetadata::new_active(
                 id,
                 brain_core::NamespaceId::SYSTEM,
-                agent,
+                space,
                 ContextId(42),
                 (i + 1) as u64,
                 1,
@@ -487,7 +487,7 @@ fn reason_analogical_fit_populates_trace_and_can_tag_inference_kind() {
         )
         .await;
 
-        let scope = RowScope::new(NamespaceId::SYSTEM, AgentId(Uuid::nil()));
+        let scope = RowScope::new(NamespaceId::SYSTEM, SpaceId(Uuid::nil()));
         let wtxn = fix.ctx.executor.metadata.write_txn().expect("write txn");
         let alice = seed_entity(&wtxn, scope, "Alice");
         let bob = seed_entity(&wtxn, scope, "Bob");

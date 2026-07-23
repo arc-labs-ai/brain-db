@@ -113,7 +113,7 @@ pub async fn handle_schema_upload(
 
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
-        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_schema_upload_request(&req);
     let phase = Phase::UpsertSchema {
         namespace: namespace.clone(),
@@ -133,7 +133,7 @@ pub async fn handle_schema_upload(
         created_at_unix_nanos: now,
     };
     let write =
-        Write::single(write_id, ctx.executor.caller_agent, phase).with_request_hash(request_hash);
+        Write::single(write_id, ctx.executor.caller_space, phase).with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
     let new_version = match ack.single_phase() {
         PhaseAck::UpsertedSchema { version, .. } => *version,

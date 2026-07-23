@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use brain_core::{AgentId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
+use brain_core::{SpaceId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
 use brain_extractors::{
     framework::extractor::{ExtractionContext, ExtractionStatus, Extractor},
     hash_memory_text, CostBudget, ExtractedItem, ExtractionResult, ExtractorRegistry, LlmExtractor,
@@ -101,7 +101,7 @@ fn target() -> ExtractorTarget {
 fn memory(text: &str) -> Memory {
     Memory {
         id: MemoryId::pack(0, 1, 0),
-        agent: AgentId::new(),
+        space: SpaceId::new(),
         context: ContextId(0),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),

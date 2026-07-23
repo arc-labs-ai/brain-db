@@ -14,7 +14,7 @@
 //! - **Admin** (constructed via [`AdminServer::admin`], bound to
 //!   `cfg.server.admin_addr`, default `127.0.0.1:9092` — loopback):
 //!   every `/v1/*` route (snapshots, rebuild-ann, workers, config,
-//!   audit, agents, shards, diagnostics). Operationally sensitive and the
+//!   audit, spaces, shards, diagnostics). Operationally sensitive and the
 //!   bootstrap channel for minting data-plane API keys, so every `/v1/*`
 //!   request is gated on the operator admin secret (`[admin] token` /
 //!   `BRAIN__ADMIN__TOKEN`) presented as `Authorization: Bearer <token>`.

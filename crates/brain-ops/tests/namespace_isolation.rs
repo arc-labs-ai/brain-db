@@ -6,9 +6,9 @@
 //!
 //! ## Why this test lives at the brain-ops (handler/dispatch) layer
 //!
-//! The analogous per-*agent* proof (`brain-server/tests/agent_isolation.rs`)
+//! The analogous per-*space* proof (`brain-server/tests/space_isolation.rs`)
 //! runs over the wire because the permissive (`AuthMethod::None`) handshake
-//! lets a connection bind an arbitrary `agent_id` directly. Namespace is
+//! lets a connection bind an arbitrary `space_id` directly. Namespace is
 //! different: the caller's namespace is resolved at dispatch from the
 //! *interned* namespace name carried on the API key (strict mode), and the
 //! name must already be interned in the shard's metadata for the lookup to
@@ -126,20 +126,20 @@ fn build_fixture() -> Fixture {
     }
 }
 
-/// Both tenants share ONE agent id so default agent-scoping can never be
+/// Both tenants share ONE space id so default space-scoping can never be
 /// what hides the foreign memory — only the namespace wall can. This makes the
 /// proof specifically about the tenant boundary, not the (separately tested)
-/// per-agent boundary.
-const SHARED_AGENT: [u8; 16] = [0xCD; 16];
+/// per-space boundary.
+const SHARED_SPACE: [u8; 16] = [0xCD; 16];
 
-/// A caller bound to `namespace`, carrying the shared agent. Going through
-/// `from_scope` (the production key-resolution path) with a real agent id makes
+/// A caller bound to `namespace`, carrying the shared space. Going through
+/// `from_scope` (the production key-resolution path) with a real space id makes
 /// `dispatch` resolve the namespace name to its interned id and stamp it onto
 /// the executor — the production tenant-resolution path.
 fn caller_for(namespace: &str) -> RequestCaller {
-    let agent = brain_core::AgentId(uuid::Uuid::from_bytes(SHARED_AGENT));
+    let space = brain_core::SpaceId(uuid::Uuid::from_bytes(SHARED_SPACE));
     RequestCaller::from_scope(
-        agent,
+        space,
         [0u8; 16],
         [0u8; 16],
         namespace.to_string(),
@@ -177,10 +177,10 @@ fn recall_req(cue: &str) -> RecallRequest {
         include_text: false,
         request_id: None,
         txn_id: None,
-        // Default scope. To isolate the NAMESPACE wall from the agent wall,
-        // both tenants share one agent id (see `SHARED_AGENT`), so default
-        // agent-scoping admits both rows on the agent axis and only the
-        // namespace wall can separate them. Cross-agent opt-in is rejected
+        // Default scope. To isolate the NAMESPACE wall from the space wall,
+        // both tenants share one space id (see `SHARED_SPACE`), so default
+        // space-scoping admits both rows on the space axis and only the
+        // namespace wall can separate them. Cross-space opt-in is rejected
         // under scoped auth anyway, so we keep the default here.
         act_as: None,
     }
@@ -218,7 +218,7 @@ async fn recall_ids(fix: &Fixture, caller: RequestCaller, cue: &str) -> Vec<u128
 
 /// Two tenants (`acme`, `globex`) each store a private memory. A default
 /// RECALL as one tenant must never return the other tenant's memory — even
-/// when the cue is chosen to match the foreign memory's text and agent
+/// when the cue is chosen to match the foreign memory's text and space
 /// scoping is fully widened. The recall pipeline fans out to all three lanes
 /// and the assertion holds for whichever lane surfaced a hit, so this covers
 /// both the structured and the semantic vector path.

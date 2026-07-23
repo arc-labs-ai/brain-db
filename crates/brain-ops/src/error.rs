@@ -29,7 +29,7 @@ pub enum OpError {
     #[error("idempotency conflict: {0}")]
     Conflict(String),
 
-    /// — agent limits exceeded.
+    /// — space limits exceeded.
     #[error("quota exceeded: {0}")]
     QuotaExceeded(String),
 
@@ -47,7 +47,7 @@ pub enum OpError {
 
     /// Transaction buffer would exceed the per-transaction op cap.
     /// The cap is fixed at 1000 buffered ops (ENCODE +
-    /// FORGET + LINK + UNLINK). Surfaced at append-time so an agent
+    /// FORGET + LINK + UNLINK). Surfaced at append-time so an space
     /// learns immediately when the 1001st op is buffered, and again at
     /// commit-time as defense-in-depth. The client should split the
     /// work into multiple transactions.

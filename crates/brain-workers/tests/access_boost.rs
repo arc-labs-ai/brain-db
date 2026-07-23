@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use brain_core::{AgentId, ContextId, MemoryId, MemoryKind};
+use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
@@ -95,7 +95,7 @@ fn seed_memory(metadata: &SharedMetadataDb, slot: u64, salience: f32) -> MemoryI
         let meta = MemoryMetadata::new_active(
             id,
             brain_core::NamespaceId::SYSTEM,
-            AgentId(Uuid::nil()),
+            SpaceId(Uuid::nil()),
             ContextId(1),
             slot,
             1,

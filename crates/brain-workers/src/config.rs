@@ -45,9 +45,9 @@ pub enum WorkerKind {
     /// LLM) after each ENCODE, then writes the resolved entities /
     /// statements / relations / mention edges back through brain-metadata.
     Extractor,
-    /// Derives `FollowedBy` edges by walking the per-agent timeline
+    /// Derives `FollowedBy` edges by walking the per-space timeline
     /// index after each ENCODE. Connects each new memory to the
-    /// agent's previous memory in the same context, weighted by
+    /// space's previous memory in the same context, weighted by
     /// elapsed time. The substrate's narrative spine.
     TemporalEdge,
     /// Derives `Caused` edges from extractor-produced causal

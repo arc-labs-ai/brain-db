@@ -129,7 +129,7 @@ fn empty_filter() -> SubscriptionFilter {
         contexts: None,
         kinds: None,
         similar_to: None,
-        agents: None,
+        spaces: None,
         memory_ids: None,
     }
 }
@@ -592,7 +592,7 @@ fn lagged_subscriber_freezes_final_lsn_and_reports_overloaded() {
                 stage_kind: None,
                 stage_outcome: None,
                 stage_payload: None,
-                agent_id: brain_core::AgentId::default(),
+                space_id: brain_core::SpaceId::default(),
             });
         }
 
@@ -648,7 +648,7 @@ fn encode_then_forget_preserve_lsn_order() {
 mod wal_record_projection {
     use super::*;
     use brain_core::{
-        AgentId, EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, NodeRef, RelationId, RelationTypeId,
+        SpaceId, EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, NodeRef, RelationId, RelationTypeId,
         RequestId,
     };
     use brain_storage::wal::payload::{
@@ -732,7 +732,7 @@ mod wal_record_projection {
             extractor_id: 1,
             is_symmetric: false,
             properties_blob: vec![],
-            agent_id: AgentId::default(),
+            space_id: SpaceId::default(),
             namespace_id: brain_core::NamespaceId::SYSTEM,
             relation_type_intern_hint: None,
         };
@@ -763,7 +763,7 @@ mod wal_record_projection {
             extractor_id: 1,
             is_symmetric: false,
             properties_blob: vec![],
-            agent_id: AgentId::default(),
+            space_id: SpaceId::default(),
             namespace_id: brain_core::NamespaceId::SYSTEM,
             relation_type_intern_hint: None,
         };
@@ -785,7 +785,7 @@ mod wal_record_projection {
             relation_id: relid(7),
             reason: "test".into(),
             at_unix_nanos: 1,
-            agent_id: AgentId::default(),
+            space_id: SpaceId::default(),
         }));
         let envs = EventEnvelope::from_wal_record(&r);
         assert_eq!(envs.len(), 1);
@@ -799,7 +799,7 @@ mod wal_record_projection {
         let p = EncodePayload {
             memory_id: mid(1),
             request_id: RequestId::default(),
-            agent_id: AgentId::default(),
+            space_id: SpaceId::default(),
             namespace_id: brain_core::NamespaceId::SYSTEM,
             context_id: ContextId(0),
             kind: MemoryKind::Episodic,
@@ -847,7 +847,7 @@ mod wal_record_projection {
         let r = rec(WalPayload::Forget(ForgetPayload {
             memory_id: mid(1),
             request_id: RequestId::default(),
-            agent_id: AgentId::default(),
+            space_id: SpaceId::default(),
             mode: ForgetMode::Soft,
             reason: ForgetReason::ClientRequest,
         }));
@@ -860,9 +860,9 @@ mod wal_record_projection {
     // ----- typed-graph change-feed event records (publish_graph) --------
     //
     // Entity/statement/schema events ride a separate flagged WAL record
-    // whose body is `agent_id (16 B) || CBOR(GraphEventPayload)` — the same
+    // whose body is `space_id (16 B) || CBOR(GraphEventPayload)` — the same
     // opaque-body envelope the durable records use. These tests pin that
-    // framing: from_wal_record must strip the agent prefix and decode the
+    // framing: from_wal_record must strip the space prefix and decode the
     // CBOR back to the event, and must do so ONLY for flagged records.
 
     fn entity_created_event_record(flags: u8) -> WalRecord {
@@ -872,7 +872,7 @@ mod wal_record_projection {
             entity_type_id: 1,
             canonical_name: "Priya Patel".into(),
         });
-        // Mirror publish_graph: agent_id (16 B) prefix, then CBOR.
+        // Mirror publish_graph: space_id (16 B) prefix, then CBOR.
         let mut body = Vec::with_capacity(16);
         body.extend_from_slice(&[0xAB; 16]);
         ciborium::into_writer(&ev, &mut body).unwrap();
@@ -881,7 +881,7 @@ mod wal_record_projection {
             kind: brain_storage::wal::kinds::WalRecordKind::EntityCreate,
             flags,
             timestamp_ns: 1_700_000_000_000_000_000,
-            agent_id_lo64: 0,
+            space_id_lo64: 0,
             payload: body,
         }
     }
@@ -925,7 +925,7 @@ mod wal_record_projection {
     fn stage_completed_event_record(
         memory_id: MemoryId,
         outcome: brain_protocol::StageOutcome,
-        agent_id: [u8; 16],
+        space_id: [u8; 16],
         flags: u8,
     ) -> WalRecord {
         use brain_protocol::{
@@ -937,16 +937,16 @@ mod wal_record_projection {
             stage_outcome: outcome,
             stage_payload: StagePayload::AutoEdge(StageAutoEdgePayload { edges_written: 0 }),
         };
-        // Mirror publish_notification: agent_id (16 B) prefix, then CBOR.
+        // Mirror publish_notification: space_id (16 B) prefix, then CBOR.
         let mut payload = Vec::with_capacity(16);
-        payload.extend_from_slice(&agent_id);
+        payload.extend_from_slice(&space_id);
         ciborium::into_writer(&body, &mut payload).unwrap();
         WalRecord {
             lsn: Lsn(9),
             kind: brain_storage::wal::kinds::WalRecordKind::StageCompleted,
             flags,
             timestamp_ns: 1_700_000_000_000_000_001,
-            agent_id_lo64: 0,
+            space_id_lo64: 0,
             payload,
         }
     }
@@ -979,9 +979,9 @@ mod wal_record_projection {
             other => panic!("expected AutoEdge payload, got {other:?}"),
         }
         assert_eq!(
-            env.agent_id,
-            AgentId::from([0xCDu8; 16]),
-            "agent_id recovers from the record's 16-byte prefix"
+            env.space_id,
+            SpaceId::from([0xCDu8; 16]),
+            "space_id recovers from the record's 16-byte prefix"
         );
         assert!(env.graph_payload.is_none());
         assert!(env.edge_payload.is_none());
@@ -1003,7 +1003,7 @@ mod wal_record_projection {
 // ---------------------------------------------------------------------------
 
 mod stage_completed_durability {
-    use brain_core::AgentId;
+    use brain_core::SpaceId;
     use brain_ops::writer::wal_sink::{RecordingWalSink, WalSink};
     use brain_protocol::{StageAutoEdgePayload, StageKind, StageOutcome, StagePayload};
 
@@ -1026,7 +1026,7 @@ mod stage_completed_durability {
             stage_payload: Some(StagePayload::AutoEdge(StageAutoEdgePayload {
                 edges_written,
             })),
-            agent_id: AgentId::default(),
+            space_id: SpaceId::default(),
         }
     }
 

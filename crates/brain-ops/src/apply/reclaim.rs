@@ -5,7 +5,7 @@
 //! evict any FINGERPRINTS rows that referenced the reclaimed slots so
 //! a future encode with the same content can dedupe-or-not freely.
 
-use brain_core::{AgentId, ContextId};
+use brain_core::{SpaceId, ContextId};
 use brain_metadata::tables::fingerprint::{fingerprint_key, FINGERPRINTS_TABLE};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use redb::{ReadableTable, WriteTransaction};
@@ -53,12 +53,12 @@ pub fn apply_reclaim_slots(
             if slots.contains(&row.slot_id) {
                 if let Some(ch) = row.content_hash {
                     // Reconstruct the EXACT fingerprint key from the row's own
-                    // (agent, context, hash) — the same triple the encode path
-                    // keyed it under. A zeroed agent/context placeholder would
-                    // prefix-collide: two agents (or contexts) sharing a content
+                    // (space, context, hash) — the same triple the encode path
+                    // keyed it under. A zeroed space/context placeholder would
+                    // prefix-collide: two spaces (or contexts) sharing a content
                     // hash would evict each other's fingerprint.
                     evictions.push(fingerprint_key(
-                        AgentId::from(row.agent_id_bytes),
+                        SpaceId::from(row.space_id_bytes),
                         ContextId(row.context_id),
                         &ch,
                     ));
@@ -110,7 +110,7 @@ mod tests {
         };
         let write = Write::single(
             WriteId::new(),
-            brain_core::AgentId::default(),
+            brain_core::SpaceId::default(),
             phase.clone(),
         );
         let wtxn = db.write_txn().unwrap();
@@ -119,27 +119,27 @@ mod tests {
     }
 
     /// Two memories with the SAME content hash + context but DIFFERENT
-    /// agents. Reclaiming one agent's slot must evict ONLY that agent's
-    /// fingerprint — the other agent's identical-hash fingerprint must
+    /// spaces. Reclaiming one space's slot must evict ONLY that space's
+    /// fingerprint — the other space's identical-hash fingerprint must
     /// survive. Guards the zeroed-key bug, where reclaim keyed by
-    /// content-hash alone could collide across agents/contexts.
+    /// content-hash alone could collide across spaces/contexts.
     #[test]
-    fn reclaim_evicts_only_the_matching_agent_fingerprint() {
+    fn reclaim_evicts_only_the_matching_space_fingerprint() {
         use brain_core::{MemoryId, MemoryKind};
         use brain_metadata::tables::fingerprint::{content_hash, FingerprintEntry};
         use brain_metadata::tables::memory::MemoryMetadata;
         use uuid::Uuid;
 
         let (_dir, db) = open_db();
-        let agent_a = AgentId(Uuid::from_bytes([1u8; 16]));
-        let agent_b = AgentId(Uuid::from_bytes([2u8; 16]));
+        let space_a = SpaceId(Uuid::from_bytes([1u8; 16]));
+        let space_b = SpaceId(Uuid::from_bytes([2u8; 16]));
         let ctx = ContextId(7);
-        let hash = content_hash("identical text stored under two agents");
+        let hash = content_hash("identical text stored under two spaces");
 
         let mem_a = MemoryMetadata::new_active(
             MemoryId::pack(0, 100, 1),
             brain_core::NamespaceId::SYSTEM,
-            agent_a,
+            space_a,
             ctx,
             100,
             1,
@@ -153,7 +153,7 @@ mod tests {
         let mem_b = MemoryMetadata::new_active(
             MemoryId::pack(0, 200, 1),
             brain_core::NamespaceId::SYSTEM,
-            agent_b,
+            space_b,
             ctx,
             200,
             1,
@@ -165,8 +165,8 @@ mod tests {
         )
         .with_content_hash(hash);
 
-        let key_a = fingerprint_key(agent_a, ctx, &hash);
-        let key_b = fingerprint_key(agent_b, ctx, &hash);
+        let key_a = fingerprint_key(space_a, ctx, &hash);
+        let key_b = fingerprint_key(space_b, ctx, &hash);
 
         {
             let wtxn = db.write_txn().unwrap();
@@ -184,7 +184,7 @@ mod tests {
         }
 
         let phase = Phase::ReclaimSlots { slots: vec![100] };
-        let write = Write::single(WriteId::new(), AgentId::default(), phase.clone());
+        let write = Write::single(WriteId::new(), SpaceId::default(), phase.clone());
         {
             let wtxn = db.write_txn().unwrap();
             let ack = apply_reclaim_slots(&wtxn, &phase, &write).unwrap();
@@ -196,11 +196,11 @@ mod tests {
         let fp = rtxn.open_table(FINGERPRINTS_TABLE).unwrap();
         assert!(
             fp.get(&key_a).unwrap().is_none(),
-            "reclaimed agent's fingerprint must be evicted"
+            "reclaimed space's fingerprint must be evicted"
         );
         assert!(
             fp.get(&key_b).unwrap().is_some(),
-            "other agent's same-hash fingerprint must survive (no zeroed-key collision)"
+            "other space's same-hash fingerprint must survive (no zeroed-key collision)"
         );
     }
 }

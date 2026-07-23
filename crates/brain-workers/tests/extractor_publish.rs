@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brain_core::ExtractorKind;
-use brain_core::{AgentId, ExtractorId, Memory as CoreMemory, MemoryId};
+use brain_core::{SpaceId, ExtractorId, Memory as CoreMemory, MemoryId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_extractors::{
     ExtractedItem, ExtractionContext, ExtractionFuture, ExtractionResult, Extractor,
@@ -147,18 +147,18 @@ fn now_unix_nanos() -> u64 {
         .as_nanos() as u64
 }
 
-/// Seed a `MEMORIES_TABLE` row for `memory_id` owned by `agent_id`, so the
-/// worker's `memory_scope` / `memory_agent_id` lookups resolve the real
+/// Seed a `MEMORIES_TABLE` row for `memory_id` owned by `space_id`, so the
+/// worker's `memory_scope` / `memory_space_id` lookups resolve the real
 /// owner instead of falling back to the system-scope default. Real ENCODE
 /// always writes this row before enqueueing extraction/HyPE work; a
 /// synthetic test id needs it planted explicitly.
-fn seed_memory_row(metadata: &SharedMetadataDb, memory_id: MemoryId, agent_id: AgentId) {
+fn seed_memory_row(metadata: &SharedMetadataDb, memory_id: MemoryId, space_id: SpaceId) {
     use brain_core::{ContextId, MemoryKind, NamespaceId};
     use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
     let row = MemoryMetadata::new_active(
         memory_id,
         NamespaceId::SYSTEM,
-        agent_id,
+        space_id,
         ContextId(0),
         0,
         0,
@@ -568,13 +568,13 @@ async fn drain_already_extracted_publishes_one_empty_event() {
 }
 
 /// The `StageCompleted{Extractor}` envelope carries the memory's REAL
-/// owning `agent_id` — not `AgentId::default()` — so an agent-scoped
-/// SUBSCRIBE filter (`filter.agents: [agent]`) actually matches the
+/// owning `space_id` — not `SpaceId::default()` — so an space-scoped
+/// SUBSCRIBE filter (`filter.spaces: [space]`) actually matches the
 /// event. Regression coverage for the bug where every publish site
-/// stamped the nil agent, silently dropping the event for every
-/// real (non-default-agent) subscriber.
+/// stamped the nil space, silently dropping the event for every
+/// real (non-default-space) subscriber.
 #[tokio::test(flavor = "current_thread")]
-async fn drain_success_publishes_real_owning_agent_id() {
+async fn drain_success_publishes_real_owning_space_id() {
     let mut registry = ExtractorRegistry::new();
     registry.register(Arc::new(EmptySuccessStub {
         id: ExtractorId::from(1),
@@ -582,7 +582,7 @@ async fn drain_success_publishes_real_owning_agent_id() {
     let fixture = build_fixture_with_registry(registry);
     let mut rx = fixture.ops.events.receiver();
 
-    let owner = AgentId::new();
+    let owner = SpaceId::new();
     let memory_id = make_memory_id(300);
     seed_memory_row(&fixture.metadata, memory_id, owner);
     fixture.enqueue(memory_id, "hello world, owned memory");
@@ -595,11 +595,11 @@ async fn drain_success_publishes_real_owning_agent_id() {
     let stage = stage_completed_for(&events, memory_id);
     assert_eq!(stage.len(), 1);
     assert_eq!(
-        stage[0].agent_id, owner,
+        stage[0].space_id, owner,
         "StageCompleted{{Extractor}} must carry the memory's real owning \
-         agent_id, not AgentId::default()",
+         space_id, not SpaceId::default()",
     );
-    assert_ne!(stage[0].agent_id, AgentId::default());
+    assert_ne!(stage[0].space_id, SpaceId::default());
 }
 
 /// Read the durable extraction-queue depth.
@@ -885,12 +885,12 @@ async fn hype_pass_with_empty_reply_publishes_one_empty_event() {
 }
 
 /// The `StageCompleted{Hype}` envelope carries the memory's real owning
-/// `agent_id`, matching the sibling extractor-publish guarantee above —
+/// `space_id`, matching the sibling extractor-publish guarantee above —
 /// both publishers share the same `memory_scope` lookup in
-/// `run_hype_pass`, so this pins that the scope's agent (not
-/// `AgentId::default()`) actually reaches the envelope.
+/// `run_hype_pass`, so this pins that the scope's space (not
+/// `SpaceId::default()`) actually reaches the envelope.
 #[tokio::test(flavor = "current_thread")]
-async fn hype_pass_publishes_real_owning_agent_id() {
+async fn hype_pass_publishes_real_owning_space_id() {
     let registry = ExtractorRegistry::new();
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
@@ -900,7 +900,7 @@ async fn hype_pass_publishes_real_owning_agent_id() {
     let fixture = build_fixture_with_registry_and_hype(registry, Some(hype));
     let mut rx = fixture.ops.events.receiver();
 
-    let owner = AgentId::new();
+    let owner = SpaceId::new();
     let memory_id = make_memory_id(202);
     seed_memory_row(&fixture.metadata, memory_id, owner);
     fixture.enqueue(memory_id, "Priya Sharma works at Stripe in San Francisco");
@@ -918,9 +918,9 @@ async fn hype_pass_publishes_real_owning_agent_id() {
         .collect();
     assert_eq!(hype_events.len(), 1);
     assert_eq!(
-        hype_events[0].agent_id, owner,
+        hype_events[0].space_id, owner,
         "StageCompleted{{Hype}} must carry the memory's real owning \
-         agent_id, not AgentId::default()",
+         space_id, not SpaceId::default()",
     );
-    assert_ne!(hype_events[0].agent_id, AgentId::default());
+    assert_ne!(hype_events[0].space_id, SpaceId::default());
 }

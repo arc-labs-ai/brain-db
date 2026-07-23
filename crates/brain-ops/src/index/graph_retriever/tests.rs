@@ -475,7 +475,7 @@ fn ranks_are_dense_and_one_based() {
 mod memory_anchor {
     use super::*;
 
-    use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
+    use brain_core::{SpaceId, ContextId, EdgeKind, MemoryId, MemoryKind};
     use brain_metadata::tables::edge::{
         derived_by, link, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
     };
@@ -490,7 +490,7 @@ mod memory_anchor {
         let row = MemoryMetadata::new_active(
             id,
             brain_core::NamespaceId::SYSTEM,
-            AgentId::from([0u8; 16]),
+            SpaceId::from([0u8; 16]),
             ContextId(0),
             id.slot(),
             id.version(),
@@ -719,7 +719,7 @@ mod unified_walk {
 
     use std::collections::{HashMap, HashSet};
 
-    use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
+    use brain_core::{SpaceId, ContextId, EdgeKind, MemoryId, MemoryKind};
     use brain_metadata::tables::edge::{
         derived_by, link, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
     };
@@ -733,7 +733,7 @@ mod unified_walk {
         let row = MemoryMetadata::new_active(
             id,
             brain_core::NamespaceId::SYSTEM,
-            AgentId::from([0u8; 16]),
+            SpaceId::from([0u8; 16]),
             ContextId(0),
             id.slot(),
             id.version(),
@@ -1261,7 +1261,7 @@ mod property {
 
     use std::collections::{HashMap, HashSet, VecDeque};
 
-    use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
+    use brain_core::{SpaceId, ContextId, EdgeKind, MemoryId, MemoryKind};
     use brain_index::{proximity_score, RankedItemId};
     use brain_metadata::tables::edge::{
         derived_by, link, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
@@ -1278,7 +1278,7 @@ mod property {
         let row = MemoryMetadata::new_active(
             id,
             brain_core::NamespaceId::SYSTEM,
-            AgentId::from([0u8; 16]),
+            SpaceId::from([0u8; 16]),
             ContextId(0),
             id.slot(),
             id.version(),
@@ -1480,7 +1480,7 @@ mod property {
 
 fn __ts() -> brain_metadata::RowScope {
     // Match `GraphRetrieverConfig::default()` (system namespace + zero
-    // agent) so seeded typed-graph rows fall under the scope the walk
+    // space) so seeded typed-graph rows fall under the scope the walk
     // reads with; these tests exercise graph topology, not isolation.
     brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0u8; 16])
 }

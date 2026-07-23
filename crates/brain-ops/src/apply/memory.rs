@@ -3,9 +3,9 @@
 //! Covers: UpsertMemory, UpdateSalience, UpdateKind, UpdateContext,
 //! UpdateEmbedding, and Tombstone(Memory).
 
-use brain_core::{AgentId, ContextId, MemoryId, MemoryKind};
+use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind};
 use brain_metadata::tables::memory::{
-    agent_timeline_key, MemoryMetadata, MEMORIES_BY_AGENT_TIMELINE_TABLE, MEMORIES_TABLE,
+    space_timeline_key, MemoryMetadata, MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE,
 };
 use brain_metadata::tables::text::TEXTS_TABLE;
 use redb::{ReadableTable, WriteTransaction};
@@ -14,7 +14,7 @@ use super::ApplyError;
 use crate::write::{Phase, PhaseAck, TombstoneTarget, Write};
 
 /// Apply [`Phase::UpsertMemory`]. Inserts the memory row + writes the
-/// per-agent timeline index entry inside the same wtxn.
+/// per-space timeline index entry inside the same wtxn.
 pub fn apply_upsert_memory(
     wtxn: &WriteTransaction,
     phase: &Phase,
@@ -41,7 +41,7 @@ pub fn apply_upsert_memory(
     let mut row = MemoryMetadata::new_active(
         *id,
         write.namespace,
-        write.agent_id,
+        write.space_id,
         *context,
         *arena_slot,
         id.version(),
@@ -75,11 +75,11 @@ pub fn apply_upsert_memory(
     // descending-time order to find each new memory's predecessor.
     {
         let mut timeline_t = wtxn
-            .open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE)
+            .open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)
             .map_err(|e| ApplyError::Storage(format!("open TIMELINE: {e:?}")))?;
-        let key = agent_timeline_key(
+        let key = space_timeline_key(
             namespace_id,
-            agent_id_bytes(write.agent_id),
+            space_id_bytes(write.space_id),
             *created_at_unix_nanos,
             context.raw(),
             id.to_be_bytes(),
@@ -142,15 +142,15 @@ pub fn apply_upsert_memory(
     }
 
     // FINGERPRINTS_TABLE entry when the encode opted into content-
-    // hash dedup. The row keys (agent_id, context_id, content_hash) →
-    // this memory id, so a future ENCODE with matching text/agent/ctx
+    // hash dedup. The row keys (space_id, context_id, content_hash) →
+    // this memory id, so a future ENCODE with matching text/space/ctx
     // can dedupe-to-existing without minting a fresh row.
     if *deduplicate {
         if let Some(ch) = content_hash {
             use brain_metadata::tables::fingerprint::{
                 fingerprint_key, FingerprintEntry, FINGERPRINTS_TABLE,
             };
-            let key = fingerprint_key(write.agent_id, *context, ch);
+            let key = fingerprint_key(write.space_id, *context, ch);
             let entry = FingerprintEntry::new(*id, *created_at_unix_nanos);
             let mut fp_t = wtxn
                 .open_table(FINGERPRINTS_TABLE)
@@ -205,7 +205,7 @@ pub fn apply_tombstone_memory(
 
     let created_at = row.created_at_unix_nanos;
     let namespace_id = row.namespace_id;
-    let agent_bytes = row.agent_id_bytes;
+    let space_bytes = row.space_id_bytes;
     let ctx_raw = row.context_id;
     let mid_bytes = row.memory_id_bytes;
     let dedup_hash = row.content_hash;
@@ -224,9 +224,9 @@ pub fn apply_tombstone_memory(
     // surface as a temporal predecessor for future encodes.
     {
         let mut timeline_t = wtxn
-            .open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE)
+            .open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)
             .map_err(|e| ApplyError::Storage(format!("open TIMELINE: {e:?}")))?;
-        let key = agent_timeline_key(namespace_id, agent_bytes, created_at, ctx_raw, mid_bytes);
+        let key = space_timeline_key(namespace_id, space_bytes, created_at, ctx_raw, mid_bytes);
         let _ = timeline_t
             .remove(key.as_slice())
             .map_err(|e| ApplyError::Storage(format!("TIMELINE remove: {e:?}")))?;
@@ -242,7 +242,7 @@ pub fn apply_tombstone_memory(
             .open_table(FINGERPRINTS_TABLE)
             .map_err(|e| ApplyError::Storage(format!("open FINGERPRINTS: {e:?}")))?;
         let key = fingerprint_key(
-            brain_core::AgentId::from(agent_bytes),
+            brain_core::SpaceId::from(space_bytes),
             ContextId(ctx_raw),
             &hash,
         );
@@ -329,11 +329,11 @@ pub fn apply_update_context(
     // remove the old entry and insert the new one.
     {
         let mut timeline_t = wtxn
-            .open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE)
+            .open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)
             .map_err(|e| ApplyError::Storage(format!("open TIMELINE: {e:?}")))?;
-        let old_key = agent_timeline_key(
+        let old_key = space_timeline_key(
             row.namespace_id,
-            row.agent_id_bytes,
+            row.space_id_bytes,
             old_created,
             old_context.raw(),
             id.to_be_bytes(),
@@ -341,9 +341,9 @@ pub fn apply_update_context(
         let _ = timeline_t
             .remove(old_key.as_slice())
             .map_err(|e| ApplyError::Storage(format!("TIMELINE remove (context change): {e:?}")))?;
-        let new_key = agent_timeline_key(
+        let new_key = space_timeline_key(
             row.namespace_id,
-            row.agent_id_bytes,
+            row.space_id_bytes,
             old_created,
             new_context.raw(),
             id.to_be_bytes(),
@@ -411,7 +411,7 @@ fn write_memory(
     Ok(())
 }
 
-fn agent_id_bytes(a: AgentId) -> [u8; 16] {
+fn space_id_bytes(a: SpaceId) -> [u8; 16] {
     a.into()
 }
 
@@ -455,10 +455,10 @@ mod tests {
         }
     }
 
-    fn fresh_write_for(agent: AgentId) -> Write {
+    fn fresh_write_for(space: SpaceId) -> Write {
         Write {
             write_id: WriteId::new(),
-            agent_id: agent,
+            space_id: space,
             namespace: brain_core::NamespaceId::SYSTEM,
             started_at_unix_nanos: 0,
             phases: Vec::new(),
@@ -470,9 +470,9 @@ mod tests {
     fn upsert_memory_writes_row_and_timeline() {
         let (_dir, db) = open_db();
         let id = MemoryId::pack(0, 1, 0);
-        let agent = AgentId::new();
+        let space = SpaceId::new();
         let phase = fixture_phase(id);
-        let write = fresh_write_for(agent);
+        let write = fresh_write_for(space);
 
         {
             let wtxn = db.write_txn().unwrap();
@@ -486,16 +486,16 @@ mod tests {
         let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
         let row = t.get(&id.to_be_bytes()).unwrap().unwrap().value();
         assert_eq!(row.memory_id(), id);
-        assert_eq!(row.agent_id(), agent);
+        assert_eq!(row.space_id(), space);
         assert_eq!(row.context(), ContextId(7));
         assert_eq!(row.created_at_unix_nanos, 1_700_000_000_000);
         assert!(row.flags & brain_metadata::tables::memory::flags::ACTIVE != 0);
 
         // Timeline index has the entry.
-        let timeline_t = rtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE).unwrap();
-        let key = agent_timeline_key(
+        let timeline_t = rtxn.open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE).unwrap();
+        let key = space_timeline_key(
             brain_core::NamespaceId::SYSTEM.raw(),
-            agent_id_bytes(agent),
+            space_id_bytes(space),
             1_700_000_000_000,
             7,
             id.to_be_bytes(),
@@ -514,8 +514,8 @@ mod tests {
     fn upsert_memory_index_key_matches_row_fields() {
         let (_dir, db) = open_db();
         let id = MemoryId::pack(0, 1, 0);
-        let agent = AgentId::new();
-        let write = fresh_write_for(agent);
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
 
         {
             let wtxn = db.write_txn().unwrap();
@@ -534,14 +534,14 @@ mod tests {
 
         // Reconstruct the key purely from the row (as the MEMORY_LIST cursor
         // does) and require the real stored index entry to sit at that key.
-        let derived = agent_timeline_key(
+        let derived = space_timeline_key(
             row.namespace_id,
-            row.agent_id_bytes,
+            row.space_id_bytes,
             row.created_at_unix_nanos,
             row.context_id,
             row.memory_id_bytes,
         );
-        let timeline_t = rtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE).unwrap();
+        let timeline_t = rtxn.open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE).unwrap();
         assert!(
             timeline_t.get(derived.as_slice()).unwrap().is_some(),
             "index key derived from the row must equal the stored key \
@@ -553,8 +553,8 @@ mod tests {
     fn tombstone_memory_clears_active_flag_and_timeline() {
         let (_dir, db) = open_db();
         let id = MemoryId::pack(0, 1, 0);
-        let agent = AgentId::new();
-        let write = fresh_write_for(agent);
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
 
         // Set up: upsert first.
         {
@@ -587,10 +587,10 @@ mod tests {
         assert_eq!(row.tombstoned_at_unix_nanos, Some(1_700_000_001_000));
 
         // Timeline entry gone.
-        let timeline_t = rtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE).unwrap();
-        let key = agent_timeline_key(
+        let timeline_t = rtxn.open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE).unwrap();
+        let key = space_timeline_key(
             brain_core::NamespaceId::SYSTEM.raw(),
-            agent_id_bytes(agent),
+            space_id_bytes(space),
             1_700_000_000_000,
             7,
             id.to_be_bytes(),
@@ -601,8 +601,8 @@ mod tests {
     #[test]
     fn hard_forget_purges_text_row_soft_keeps_it() {
         let (_dir, db) = open_db();
-        let agent = AgentId::new();
-        let write = fresh_write_for(agent);
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
         let soft_id = MemoryId::pack(0, 1, 0);
         let hard_id = MemoryId::pack(0, 2, 0);
 
@@ -656,8 +656,8 @@ mod tests {
     fn update_salience_persists() {
         let (_dir, db) = open_db();
         let id = MemoryId::pack(0, 1, 0);
-        let agent = AgentId::new();
-        let write = fresh_write_for(agent);
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
         {
             let wtxn = db.write_txn().unwrap();
             apply_upsert_memory(&wtxn, &fixture_phase(id), &write).unwrap();
@@ -682,8 +682,8 @@ mod tests {
     fn update_kind_persists() {
         let (_dir, db) = open_db();
         let id = MemoryId::pack(0, 1, 0);
-        let agent = AgentId::new();
-        let write = fresh_write_for(agent);
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
         {
             let wtxn = db.write_txn().unwrap();
             apply_upsert_memory(&wtxn, &fixture_phase(id), &write).unwrap();
@@ -716,7 +716,7 @@ mod tests {
             at_unix_nanos: 0,
         };
         let wtxn = db.write_txn().unwrap();
-        let err = apply_tombstone_memory(&wtxn, &phase, &fresh_write_for(AgentId::default()))
+        let err = apply_tombstone_memory(&wtxn, &phase, &fresh_write_for(SpaceId::default()))
             .unwrap_err();
         assert!(matches!(err, ApplyError::NotFound { what: "memory", .. }));
     }

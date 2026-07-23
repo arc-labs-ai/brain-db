@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use brain_core::{
-    AgentId, ContextId, EdgeKind, EdgeKindRef, Entity, EntityId, EntityType, EvidenceEntry,
+    SpaceId, ContextId, EdgeKind, EdgeKindRef, Entity, EntityId, EntityType, EvidenceEntry,
     EvidenceRef, ExtractorId, MemoryId, MemoryKind, NodeRef, PredicateId, Statement, StatementId,
     StatementKind, StatementObject, SubjectRef,
 };
@@ -39,10 +39,10 @@ use brain_protocol::envelope::request::{ObservationInput, PlanBudget, PlanState,
 use uuid::Uuid;
 
 /// Test-fixture scope — matches `ExecutorContext::new`'s defaults
-/// (`NamespaceId::SYSTEM` + `AgentId::default()` == `AgentId::NIL`),
+/// (`NamespaceId::SYSTEM` + `SpaceId::default()` == `SpaceId::NIL`),
 /// which is also what `build_fixture` stamps onto every memory row.
 fn test_scope() -> RowScope {
-    RowScope::new(brain_core::NamespaceId::SYSTEM, AgentId::default())
+    RowScope::new(brain_core::NamespaceId::SYSTEM, SpaceId::default())
 }
 
 /// Insert a `Person` entity directly via `entity_put` (same minimal
@@ -228,7 +228,7 @@ fn build_fixture(
     let db_path = tempdir.path().join("metadata.redb");
     let metadata = MetadataDb::open(&db_path).unwrap();
 
-    let agent = AgentId(Uuid::nil());
+    let space = SpaceId(Uuid::nil());
     let mut ids = Vec::with_capacity(n_memories);
 
     let wtxn = metadata.write_txn().unwrap();
@@ -240,7 +240,7 @@ fn build_fixture(
             let meta = MemoryMetadata::new_active(
                 id,
                 brain_core::NamespaceId::SYSTEM,
-                agent,
+                space,
                 ContextId(7),
                 (i + 1) as u64,
                 1,

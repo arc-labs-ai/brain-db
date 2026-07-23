@@ -6,7 +6,7 @@
 //!   → Established → Closing).
 //! - Inline handlers for connection-management opcodes (HELLO, AUTH,
 //!   PING, CLIENT_PONG, BYE).
-//! - Op routing: BLAKE3(agent_id) or MemoryId::shard() picks the shard;
+//! - Op routing: BLAKE3(space_id) or MemoryId::shard() picks the shard;
 //!   `ShardHandle::dispatch_op` runs `brain_ops::dispatch` on the
 //!   target shard's Glommio executor.
 //! - Wire-error mapping: `OpError` → `ErrorResponse`.
@@ -17,7 +17,7 @@
 
 #![cfg(target_os = "linux")]
 // Several fields/variants are wired into the response shape but
-// don't fan out into the connection-loop's match arms yet: AGENT id is
+// don't fan out into the connection-loop's match arms yet: SPACE id is
 // captured at AUTH_OK but not yet used to authorize ops;
 // `Action::Close` is the no-frame close case (CLIENT_PONG today) — not
 // yet emitted but reserved. Allow rather than churn the
@@ -27,11 +27,11 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use brain_core::AgentId;
+use brain_core::SpaceId;
 use brain_metadata::api_keys::bits;
 use brain_ops::error::OpError;
 use brain_protocol::connection::handshake::{
-    AgentPermissions, AuthOkPayload, AuthPayload, HelloPayload, ServerCapabilities, WelcomePayload,
+    SpacePermissions, AuthOkPayload, AuthPayload, HelloPayload, ServerCapabilities, WelcomePayload,
 };
 use brain_protocol::error::ErrorCode;
 
@@ -56,9 +56,9 @@ pub(crate) enum ConnPhase {
     AwaitingHello,
     AwaitingAuth,
     Established {
-        agent: AgentId,
+        space: SpaceId,
         bound_shard: u16,
-        permissions: AgentPermissions,
+        permissions: SpacePermissions,
         /// Resolved scope for this connection, derived entirely from the
         /// presented API key.
         scope: RequestScope,
@@ -89,7 +89,7 @@ impl ConnState {
 /// new `RoutingTable` atomically — without restarting connections.
 /// Readers call `routing.load_full`
 /// per request; the refcount bump is ~50 ns and invisible next to
-/// the agent-id hash + shard lookup.
+/// the space-id hash + shard lookup.
 #[derive(Clone)]
 pub struct Topology {
     pub shards: Arc<Vec<ShardHandle>>,
@@ -141,7 +141,7 @@ pub(crate) struct OpDispatch {
     pub(crate) stream_id: u32,
     pub(crate) req: RequestBody,
     pub(crate) target_shard: u16,
-    /// Resolved AUTH-time scope (org / user / namespace / agent /
+    /// Resolved AUTH-time scope (org / user / namespace / space /
     /// permissions). Threaded into `brain_ops::dispatch` as a
     /// `RequestCaller` so handlers read scope from here instead of
     /// trusting client-supplied fields.
@@ -154,8 +154,8 @@ pub(crate) struct OpDispatch {
     /// Effective-identity selector, present iff the request carried an
     /// `act_as` field that passed the R1/R2 authorization checks in
     /// `dispatch_frame`. When `Some`, `run_op_dispatch` builds the
-    /// EFFECTIVE caller (target `(namespace, agent)` under the fixed
-    /// `STANDARD_AGENT` mask) instead of the principal's own caller, and
+    /// EFFECTIVE caller (target `(namespace, space)` under the fixed
+    /// `STANDARD_SPACE` mask) instead of the principal's own caller, and
     /// records both principals on the request span. `None` = the op runs
     /// as the connection's own key-bound identity.
     pub(crate) act_as: Option<brain_protocol::ActAs>,
@@ -289,33 +289,33 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
             // routing they gate — are the exact same logic the normal
             // path runs; see `check_act_as` and `pick_target_shard`'s
             // `act_as` branch.
-            let (effective_agent, target_shard) = match &sub_req.act_as {
+            let (effective_space, target_shard) = match &sub_req.act_as {
                 Some(a) => {
                     if let Err((code, message)) = check_act_as(&scope, a) {
                         return Action::Inline(error_frame(stream_id, code, message));
                     }
                     let routing = topology.routing.load_full();
                     (
-                        AgentId::from(a.agent_id),
-                        routing.shard_for_agent(AgentId::from(a.agent_id)),
+                        SpaceId::from(a.space_id),
+                        routing.shard_for_space(SpaceId::from(a.space_id)),
                     )
                 }
-                None => (scope.agent_id, bound_shard),
+                None => (scope.space_id, bound_shard),
             };
             // Under scoped API-key auth, a subscriber may only receive its
-            // own (effective) agent's events. `filter.agents == None`/empty
-            // means "all agents" (a cross-tenant leak on a shared shard),
-            // and any id other than the effective agent is likewise
-            // forbidden — the SUBSCRIBE analogue of RECALL/QUERY per-agent
-            // read isolation. Compared against the EFFECTIVE agent (the
+            // own (effective) space's events. `filter.spaces == None`/empty
+            // means "all spaces" (a cross-tenant leak on a shared shard),
+            // and any id other than the effective space is likewise
+            // forbidden — the SUBSCRIBE analogue of RECALL/QUERY per-space
+            // read isolation. Compared against the EFFECTIVE space (the
             // act_as target when present) so a `may_act`-permitted caller
             // can scope a subscription to the identity it's acting as,
-            // never to some third agent.
-            if !subscribe_agents_allowed(effective_agent, sub_req.filter.agents.as_deref()) {
+            // never to some third space.
+            if !subscribe_spaces_allowed(effective_space, sub_req.filter.spaces.as_deref()) {
                 return Action::Inline(error_frame(
                     stream_id,
                     ErrorCode::PermissionDenied,
-                    "subscribe: filter.agents must name only the effective agent",
+                    "subscribe: filter.spaces must name only the effective space",
                 ));
             }
             return Action::Subscribe(SubscribeStart {
@@ -352,7 +352,7 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
         }
     }
 
-    // Route + dispatch. `act_as` ops route to the TARGET agent's shard so
+    // Route + dispatch. `act_as` ops route to the TARGET space's shard so
     // the impersonated op lands on that identity's real timeline /
     // idempotency domain; memory-bearing requests route to the memory's
     // shard; everything else lands on the principal's bound shard.
@@ -369,9 +369,9 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
         req,
         target_shard,
         // Stamp the AUTH-bound scope on every dispatched op. Handlers
-        // read agent / namespace / permissions from this object and
+        // read space / namespace / permissions from this object and
         // ignore whatever the client supplied — the shared-shard
-        // cross-agent leak the `agents` subscribe filter needs to
+        // cross-space leak the `spaces` subscribe filter needs to
         // enforce closes here.
         scope,
         // Wire session id rides alongside so TXN_BEGIN can stamp it
@@ -479,23 +479,23 @@ fn on_auth(frame: Frame, state: &mut ConnState, topology: &Topology) -> Action {
         }
     };
 
-    let agent = scope.agent_id;
+    let space = scope.space_id;
     // Refcount-bump load. The published table may swap between AUTH
     // and a later request; both observers see a coherent snapshot.
     let routing = topology.routing.load_full();
-    let bound_shard = routing.shard_for_agent(agent);
-    let permissions = scope.to_agent_permissions();
+    let bound_shard = routing.shard_for_space(space);
+    let permissions = scope.to_space_permissions();
     state.phase = ConnPhase::Established {
-        agent,
+        space,
         bound_shard,
         permissions,
         scope: scope.clone(),
     };
 
     let auth_ok = AuthOkPayload {
-        // The agent is resolved entirely from the key — the client never
+        // The space is resolved entirely from the key — the client never
         // claims one. This is how the client learns its identity.
-        agent_id: *agent.0.as_bytes(),
+        space_id: *space.0.as_bytes(),
         bound_shard_id: bound_shard,
         permissions,
         // Surface the tenant the connection resolved to (the key's
@@ -566,7 +566,7 @@ pub(crate) async fn run_op_dispatch(op: OpDispatch, shards: Arc<Vec<ShardHandle>
         }
     };
     // Build the caller. For an `act_as` request the effective caller runs
-    // as the target `(namespace, agent)` under the fixed STANDARD_AGENT
+    // as the target `(namespace, space)` under the fixed STANDARD_SPACE
     // mask; otherwise the op runs as the connection principal's own
     // key-bound identity. Authorization (R1/R2) was already enforced in
     // `dispatch_frame`; this only materializes the identity.
@@ -579,27 +579,27 @@ pub(crate) async fn run_op_dispatch(op: OpDispatch, shards: Arc<Vec<ShardHandle>
     // across the Tokio→Glommio hop. In Phase 1 this is a trace root; once the
     // wire carries `traceparent` it becomes a child of the remote context.
     //
-    // `brain.agent_id` is the EFFECTIVE identity (the target under act_as).
+    // `brain.space_id` is the EFFECTIVE identity (the target under act_as).
     // Under delegation we also record the acting connection principal —
     // per RFC 8693 the acting party is never erased from the audit trail.
     let request_span = tracing::info_span!(
         "client.request",
         brain.operation = ?op.req.opcode(),
-        brain.agent_id = %caller.agent_id.0,
+        brain.space_id = %caller.space_id.0,
         brain.shard = op.target_shard,
         brain.stream_id = stream_id,
         trace_id = tracing::field::Empty,
         span_id = tracing::field::Empty,
         brain.act_as = tracing::field::Empty,
-        brain.principal_agent_id = tracing::field::Empty,
+        brain.principal_space_id = tracing::field::Empty,
         brain.principal_key_hash = tracing::field::Empty,
         brain.effective_namespace = tracing::field::Empty,
     );
     if let Some(a) = &op.act_as {
         request_span.record("brain.act_as", true);
         request_span.record(
-            "brain.principal_agent_id",
-            tracing::field::display(op.scope.agent_id.0),
+            "brain.principal_space_id",
+            tracing::field::display(op.scope.space_id.0),
         );
         request_span.record(
             "brain.principal_key_hash",
@@ -696,17 +696,17 @@ fn pick_target_shard(
     routing: &RoutingTable,
     act_as: Option<&brain_protocol::ActAs>,
 ) -> Option<u16> {
-    // `act_as` ops route to the TARGET agent's shard, unconditionally and
+    // `act_as` ops route to the TARGET space's shard, unconditionally and
     // generically over every act-as-capable op — the impersonated op must
     // land on the target identity's timeline / idempotency domain, not the
     // memory's or the principal's. This takes precedence over the
     // memory-shard routing below; for a target's own memories the two
     // agree (the MemoryId was minted on that same shard at write time).
     if let Some(a) = act_as {
-        return Some(routing.shard_for_agent(AgentId::from(a.agent_id)));
+        return Some(routing.shard_for_space(SpaceId::from(a.space_id)));
     }
     // Requests carrying a target MemoryId route by memory shard; other
-    // requests use the agent's bound shard. The `source` end of LINK /
+    // requests use the space's bound shard. The `source` end of LINK /
     // UNLINK is the routing anchor; the `target`
     // memory's shard may differ (cross-shard edges land later).
     match req {
@@ -746,15 +746,15 @@ fn build_response_frame(stream_id: u32, eos: bool, body: ResponseBody) -> Frame 
     Frame::new(opcode, flags, stream_id, payload)
 }
 
-/// Whether a SUBSCRIBE's `filter.agents` is allowed for this scope.
+/// Whether a SUBSCRIBE's `filter.spaces` is allowed for this scope.
 ///
-/// A subscriber may only receive its own agent's events, so `agents` must
-/// be a non-empty list naming only the caller's own agent — `None`/empty
-/// (= all agents on the shard) is a cross-tenant leak and is rejected. This
-/// is the SUBSCRIBE analogue of the per-agent read isolation RECALL / QUERY
+/// A subscriber may only receive its own space's events, so `spaces` must
+/// be a non-empty list naming only the caller's own space — `None`/empty
+/// (= all spaces on the shard) is a cross-tenant leak and is rejected. This
+/// is the SUBSCRIBE analogue of the per-space read isolation RECALL / QUERY
 /// enforce structurally.
-fn subscribe_agents_allowed(own: AgentId, agents: Option<&[[u8; 16]]>) -> bool {
-    agents.is_some_and(|a| !a.is_empty() && a.iter().all(|b| AgentId::from(*b) == own))
+fn subscribe_spaces_allowed(own: SpaceId, spaces: Option<&[[u8; 16]]>) -> bool {
+    spaces.is_some_and(|a| !a.is_empty() && a.iter().all(|b| SpaceId::from(*b) == own))
 }
 
 pub(crate) fn error_frame(stream_id: u32, code: ErrorCode, message: &str) -> Frame {
@@ -1031,17 +1031,17 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_agents_scope_guard() {
-        let own = AgentId::from([7u8; 16]);
+    fn subscribe_spaces_scope_guard() {
+        let own = SpaceId::from([7u8; 16]);
         let other = [9u8; 16];
-        // Allowed: a non-empty list naming only the caller's own agent.
-        assert!(subscribe_agents_allowed(own, Some(&[[7u8; 16]])));
-        // Rejected: None (= all), empty (= all), another agent, and any
-        // list that includes another agent.
-        assert!(!subscribe_agents_allowed(own, None));
-        assert!(!subscribe_agents_allowed(own, Some(&[])));
-        assert!(!subscribe_agents_allowed(own, Some(&[other])));
-        assert!(!subscribe_agents_allowed(own, Some(&[[7u8; 16], other])));
+        // Allowed: a non-empty list naming only the caller's own space.
+        assert!(subscribe_spaces_allowed(own, Some(&[[7u8; 16]])));
+        // Rejected: None (= all), empty (= all), another space, and any
+        // list that includes another space.
+        assert!(!subscribe_spaces_allowed(own, None));
+        assert!(!subscribe_spaces_allowed(own, Some(&[])));
+        assert!(!subscribe_spaces_allowed(own, Some(&[other])));
+        assert!(!subscribe_spaces_allowed(own, Some(&[[7u8; 16], other])));
     }
 
     /// Client op on stream_id = 0 is BadFrame.

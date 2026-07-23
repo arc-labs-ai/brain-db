@@ -29,7 +29,7 @@ use crate::error::ProtocolError;
 // Helper aliases for spec-domain primitive types as carried on the wire.
 // ---------------------------------------------------------------------------
 
-/// 16-byte UUID-shaped identifier (`AgentId`, `RequestId`, `TxnId`).
+/// 16-byte UUID-shaped identifier (`SpaceId`, `RequestId`, `TxnId`).
 pub type WireUuid = [u8; 16];
 
 /// Wire-side `ContextId` — 8 bytes / `u64`.
@@ -150,7 +150,7 @@ pub enum RequestBody {
     QueryExplain(QueryExplainRequest),
     QueryTrace(QueryTraceRequest),
 
-    // Procedural-memory materialization. Reads an agent's stored
+    // Procedural-memory materialization. Reads an space's stored
     // `brain:behavior_*` Preferences and renders a system block for
     // LLM prompt injection.
     MaterializeProcedural(MaterializeProceduralRequest),
@@ -405,7 +405,7 @@ impl RequestBody {
 
 /// Borrow the effective-identity selector (`act_as`) carried by a
 /// request body, if the op is one of the verbs that support acting on
-/// behalf of another `(namespace, agent_id)`. Every other variant
+/// behalf of another `(namespace, space_id)`. Every other variant
 /// returns `None` — those ops always run as the connection's own
 /// key-bound identity and carry no `act_as` field on the wire.
 ///
@@ -437,7 +437,7 @@ impl RequestBody {
 ///     request_id: [0; 16],
 ///     txn_id: None,
 ///     occurred_at_unix_nanos: None,
-///     act_as: Some(ActAs { namespace: "acme".into(), agent_id: [1; 16] }),
+///     act_as: Some(ActAs { namespace: "acme".into(), space_id: [1; 16] }),
 ///     wait: WaitMode::Ack,
 ///     allow_duplicates: false,
 /// });
@@ -527,7 +527,7 @@ mod tests {
             occurred_at_unix_nanos: None,
             act_as: Some(ActAs {
                 namespace: "acme".into(),
-                agent_id: sample_uuid(9),
+                space_id: sample_uuid(9),
             }),
             wait: WaitMode::Ack,
             allow_duplicates: false,
@@ -650,7 +650,7 @@ mod tests {
             txn_id: None,
             act_as: Some(ActAs {
                 namespace: "acme".into(),
-                agent_id: sample_uuid(9),
+                space_id: sample_uuid(9),
             }),
         }));
     }
@@ -665,7 +665,7 @@ mod tests {
                     reference_memory_id: sample_memory_id(),
                     threshold: 0.85,
                 }),
-                agents: None,
+                spaces: None,
                 memory_ids: None,
             },
             include_history: true,
@@ -682,7 +682,7 @@ mod tests {
                 contexts: None,
                 kinds: None,
                 similar_to: None,
-                agents: None,
+                spaces: None,
                 memory_ids: None,
             },
             include_history: false,
@@ -690,7 +690,7 @@ mod tests {
             max_inflight: 16,
             act_as: Some(ActAs {
                 namespace: "acme".into(),
-                agent_id: sample_uuid(11),
+                space_id: sample_uuid(11),
             }),
         }));
     }
@@ -874,7 +874,7 @@ mod tests {
     fn act_as_of_returns_selector_for_supported_ops() {
         let selector = ActAs {
             namespace: "acme".into(),
-            agent_id: sample_uuid(9),
+            space_id: sample_uuid(9),
         };
 
         let encode = RequestBody::Encode(EncodeRequest {

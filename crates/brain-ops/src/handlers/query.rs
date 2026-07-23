@@ -233,10 +233,10 @@ fn wire_to_planner_request(
         // Wire-level QUERY does not yet expose a context filter — the
         // funnel will pick it up once the wire shape gains the field.
         context_filter: Vec::new(),
-        // Strict per-agent isolation: every row belongs to exactly one agent,
-        // so QUERY is scoped to the caller's own agent (from the key), never
+        // Strict per-space isolation: every row belongs to exactly one space,
+        // so QUERY is scoped to the caller's own space (from the key), never
         // widened by a client field.
-        agent_filter: vec![ctx.executor.caller_agent],
+        space_filter: vec![ctx.executor.caller_space],
         confidence_min: req.confidence_min,
         include_tombstoned: req.include_tombstoned,
         include_superseded: req.include_superseded,
@@ -306,7 +306,7 @@ fn build_executor_context(ctx: &OpsContext) -> Result<RetrievalExecutorContext, 
         graph: ctx.graph_retriever.clone(),
         metadata: ctx.executor.metadata.clone(),
         caller_namespace: ctx.executor.caller_namespace.raw(),
-        caller_agent: ctx.executor.caller_agent,
+        caller_space: ctx.executor.caller_space,
         // Rerank is always-on for QUERY just as for RECALL: the
         // executor reranks whenever the cross-encoder is loaded. When
         // the operator disabled the load this is `None` and the query

@@ -275,7 +275,7 @@ mod linux_main {
 
         // Mandatory key auth. The store lives in its own redb file under
         // the configured data dir. Every data-plane connection must present
-        // a valid, resolvable, non-revoked key; identity (namespace, agent,
+        // a valid, resolvable, non-revoked key; identity (namespace, space,
         // permissions) is derived entirely from it. Keys are minted via the
         // admin HTTP listener — there is no permissive / anonymous mode.
         let auth_store_path = cfg.storage.data_dir.join("api_keys.redb");

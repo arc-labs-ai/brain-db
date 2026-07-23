@@ -3,7 +3,7 @@
 //! The catalog is 13 domain tables plus one internal `__schema_meta`
 //! from [`crate::storage_version`].
 
-pub mod agent;
+pub mod space;
 pub mod api_keys;
 pub mod audit;
 pub mod checkpoint;
@@ -44,7 +44,7 @@ pub mod worker_checkpoints;
 /// versioned with `::v1`). This macro emits that impl from the type
 /// name and a stable `type_name` string.
 ///
-/// Mirrors the per-file impl in substrate tables (`agent.rs`,
+/// Mirrors the per-file impl in substrate tables (`space.rs`,
 /// `memory.rs`); collapsed into a macro here because 11 opaque-body
 /// value structs share the exact same body.
 #[macro_export]
@@ -96,13 +96,13 @@ macro_rules! impl_redb_rkyv_value {
 /// self-init inside their own `open()` constructors and are NOT listed
 /// here.
 pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::redb::TableError> {
-    use agent::AGENTS_TABLE;
+    use space::SPACES_TABLE;
     use audit::{
         ENTITY_RESOLUTION_AUDIT_TABLE, EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE,
         EXTRACTOR_AUDIT_BY_MEMORY_TABLE, EXTRACTOR_AUDIT_BY_TIME_TABLE, EXTRACTOR_AUDIT_TABLE,
     };
     use checkpoint::CHECKPOINTS_TABLE;
-    use context::{AGENT_CONTEXTS_TABLE, CONTEXTS_TABLE, CONTEXT_NAMES_TABLE};
+    use context::{SPACE_CONTEXTS_TABLE, CONTEXTS_TABLE, CONTEXT_NAMES_TABLE};
     use contradiction::STATEMENT_CONTRADICTION_AUDIT_TABLE;
     use edge::{EDGES_REVERSE_TABLE, EDGES_TABLE};
     use entity::{
@@ -116,7 +116,7 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     use fingerprint::FINGERPRINTS_TABLE;
     use idempotency::IDEMPOTENCY_TABLE;
     use kind::{KINDS_BY_BYTE_TABLE, KINDS_TABLE};
-    use memory::{MEMORIES_BY_AGENT_TIMELINE_TABLE, MEMORIES_TABLE};
+    use memory::{MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE};
     use merge::{ENTITY_MERGE_AUDIT_OVERFLOW, MERGE_LOG_TABLE};
     use merge_review_queue::{MERGE_REVIEW_BY_STATUS_TABLE, MERGE_REVIEW_QUEUE_TABLE};
     use model_fingerprint::MODEL_FINGERPRINTS_TABLE;
@@ -139,7 +139,7 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     use text::TEXTS_TABLE;
     use worker_checkpoints::WORKER_CHECKPOINTS_TABLE;
 
-    let _ = wtxn.open_table(AGENTS_TABLE)?;
+    let _ = wtxn.open_table(SPACES_TABLE)?;
     let _ = wtxn.open_table(EXTRACTOR_AUDIT_TABLE)?;
     let _ = wtxn.open_table(EXTRACTOR_AUDIT_BY_MEMORY_TABLE)?;
     let _ = wtxn.open_table(EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE)?;
@@ -149,7 +149,7 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     let _ = wtxn.open_table(CHECKPOINTS_TABLE)?;
     let _ = wtxn.open_table(CONTEXTS_TABLE)?;
     let _ = wtxn.open_table(CONTEXT_NAMES_TABLE)?;
-    let _ = wtxn.open_table(AGENT_CONTEXTS_TABLE)?;
+    let _ = wtxn.open_table(SPACE_CONTEXTS_TABLE)?;
     let _ = wtxn.open_table(EDGES_TABLE)?;
     let _ = wtxn.open_table(EDGES_REVERSE_TABLE)?;
     let _ = wtxn.open_table(ENTITY_TYPES_TABLE)?;
@@ -168,7 +168,7 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     let _ = wtxn.open_table(KINDS_TABLE)?;
     let _ = wtxn.open_table(KINDS_BY_BYTE_TABLE)?;
     let _ = wtxn.open_table(MEMORIES_TABLE)?;
-    let _ = wtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE)?;
+    let _ = wtxn.open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)?;
     let _ = wtxn.open_table(MERGE_LOG_TABLE)?;
     let _ = wtxn.open_table(ENTITY_MERGE_AUDIT_OVERFLOW)?;
     let _ = wtxn.open_table(MERGE_REVIEW_QUEUE_TABLE)?;

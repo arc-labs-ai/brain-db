@@ -83,7 +83,7 @@ pub mod derived_by {
     pub const CONSOLIDATION_WORKER: u8 = 1;
     pub const SIMILARITY_WORKER: u8 = 2;
     /// TemporalEdgeWorker — writes `FollowedBy` edges keyed on
-    /// `(agent_id, context_id, created_at)` adjacency.
+    /// `(space_id, context_id, created_at)` adjacency.
     pub const TEMPORAL_WORKER: u8 = 3;
     /// CausalEdgeWorker — writes `Caused` edges from extractor-
     /// derived causal statements. Reserved for the v1 implementation.

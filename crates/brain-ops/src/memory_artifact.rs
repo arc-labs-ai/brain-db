@@ -164,7 +164,7 @@ pub fn merge_hype_questions(
 /// statements / relations it just wrote. Uses the same enrichment resolver
 /// RECALL uses, so the content is real (canonical names, predicates,
 /// confidences) rather than raw counts. Derives the memory's `(namespace,
-/// agent)` scope from its own row so the enrichment stays tenant-scoped.
+/// space)` scope from its own row so the enrichment stays tenant-scoped.
 ///
 /// Best-effort: a read or merge failure returns `Err` for the caller to log,
 /// never blocks the durable graph write (which already committed).
@@ -377,7 +377,7 @@ pub fn read_memory_artifact(
         .and_then(|g| serde_json::from_str::<EncodeStageArtifact>(g.value()).ok()))
 }
 
-/// Read a memory's `(namespace, agent)` scope from its metadata row.
+/// Read a memory's `(namespace, space)` scope from its metadata row.
 /// `None` when the row is absent (forgotten / never existed).
 fn memory_scope(
     rtxn: &redb::ReadTransaction,
@@ -392,7 +392,7 @@ fn memory_scope(
         .map_err(|e| format!("memory read: {e}"))?
         .map(|g| {
             let m = g.value();
-            brain_metadata::RowScope::from_bytes(m.namespace_id, m.agent_id_bytes)
+            brain_metadata::RowScope::from_bytes(m.namespace_id, m.space_id_bytes)
         }))
 }
 

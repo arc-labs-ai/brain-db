@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use brain_core::{AgentId, MemoryId, MemoryKind};
+use brain_core::{SpaceId, MemoryId, MemoryKind};
 use brain_index::{IndexStatus, TantivyShard};
 use futures_lite::FutureExt;
 use glommio::timer::sleep;
@@ -73,7 +73,7 @@ fn dispatch_upsert_then_query_returns_hit() {
             .dispatch(MemoryTextOp::Upsert {
                 id: MemoryId::pack(0, 7, 0),
                 text: "ticket ACME-1247 broke production".into(),
-                agent: AgentId::new(),
+                space: SpaceId::new(),
                 kind: MemoryKind::Episodic,
                 created_at_unix_ms: 0,
                 context: 0,
@@ -108,7 +108,7 @@ fn forget_removes_doc() {
             .dispatch(MemoryTextOp::Upsert {
                 id,
                 text: "hello world".into(),
-                agent: AgentId::new(),
+                space: SpaceId::new(),
                 kind: MemoryKind::Episodic,
                 created_at_unix_ms: 0,
                 context: 0,
@@ -135,7 +135,7 @@ fn commit_by_time_flushes_below_n() {
             .dispatch(MemoryTextOp::Upsert {
                 id: MemoryId::pack(0, 1, 0),
                 text: "elapsed timeout flushes".into(),
-                agent: AgentId::new(),
+                space: SpaceId::new(),
                 kind: MemoryKind::Episodic,
                 created_at_unix_ms: 0,
                 context: 0,
@@ -163,7 +163,7 @@ fn commit_by_count_flushes_at_n() {
                 .dispatch(MemoryTextOp::Upsert {
                     id: MemoryId::pack(0, slot, 0),
                     text: format!("batchword{slot}"),
-                    agent: AgentId::new(),
+                    space: SpaceId::new(),
                     kind: MemoryKind::Episodic,
                     created_at_unix_ms: 0,
                     context: 0,
@@ -202,7 +202,7 @@ fn payload_stamped_on_commit_survives_reopen() {
                 .dispatch(MemoryTextOp::Upsert {
                     id: MemoryId::pack(0, 1, 0),
                     text: "payload survives".into(),
-                    agent: AgentId::new(),
+                    space: SpaceId::new(),
                     kind: MemoryKind::Episodic,
                     created_at_unix_ms: 0,
                     context: 0,
@@ -236,7 +236,7 @@ fn dispatching_without_drain_eventually_blocks() {
         let op = || MemoryTextOp::Upsert {
             id: MemoryId::pack(0, 1, 0),
             text: "x".into(),
-            agent: AgentId::new(),
+            space: SpaceId::new(),
             kind: MemoryKind::Episodic,
             created_at_unix_ms: 0,
             context: 0,
@@ -268,12 +268,12 @@ fn upsert_round_trips_metadata_fields() {
         let (dispatcher, task) = spawn_drain(handle.clone(), policy);
 
         let id = MemoryId::pack(7, 13, 4);
-        let agent = AgentId::new();
+        let space = SpaceId::new();
         dispatcher
             .dispatch(MemoryTextOp::Upsert {
                 id,
                 text: "round trip the stored fields".into(),
-                agent,
+                space,
                 kind: MemoryKind::Semantic,
                 created_at_unix_ms: 1_700_000_000_000,
                 context: 0,
@@ -286,7 +286,7 @@ fn upsert_round_trips_metadata_fields() {
         // round-trip.
         let schema = handle.index.schema();
         let mem_id_field = schema.get_field("memory_id").expect("memory_id");
-        let agent_field = schema.get_field("agent_id").expect("agent_id");
+        let space_field = schema.get_field("space_id").expect("space_id");
         let reader = handle.index.reader().expect("reader");
         let searcher = reader.searcher();
         let qp =
@@ -306,13 +306,13 @@ fn upsert_round_trips_metadata_fields() {
         let stored_id = MemoryId::from_raw(u128::from_be_bytes(stored_id_arr));
         assert_eq!(stored_id, id);
 
-        let stored_agent_bytes = doc
-            .get_first(agent_field)
+        let stored_space_bytes = doc
+            .get_first(space_field)
             .and_then(|v| v.as_bytes())
-            .expect("agent_id stored");
-        let stored_agent_arr: [u8; 16] = stored_agent_bytes.try_into().expect("16 bytes");
-        let stored_agent: AgentId = stored_agent_arr.into();
-        assert_eq!(stored_agent, agent);
+            .expect("space_id stored");
+        let stored_space_arr: [u8; 16] = stored_space_bytes.try_into().expect("16 bytes");
+        let stored_space: SpaceId = stored_space_arr.into();
+        assert_eq!(stored_space, space);
 
         // Suppress unused-path warning on macOS-non-linux builds
         let _ = Path::new(".");
@@ -345,7 +345,7 @@ fn end_to_end_indexer_to_retriever() {
             .dispatch(MemoryTextOp::Upsert {
                 id,
                 text: "ticket ACME-1247 reproduces under load".into(),
-                agent: AgentId::new(),
+                space: SpaceId::new(),
                 kind: MemoryKind::Episodic,
                 created_at_unix_ms: 0,
                 context: 0,

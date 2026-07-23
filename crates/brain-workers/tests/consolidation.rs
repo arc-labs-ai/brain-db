@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{SpaceId, ContextId, EdgeKind, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::edge::list_memory_edges_from;
@@ -105,7 +105,7 @@ fn seed_memory(
         let mut meta = MemoryMetadata::new_active(
             id,
             brain_core::NamespaceId::SYSTEM,
-            AgentId(Uuid::nil()),
+            SpaceId(Uuid::nil()),
             ContextId(context_id),
             slot,
             1,

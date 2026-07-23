@@ -6,7 +6,7 @@
 //!
 //! Run: `cargo bench -p brain-extractors --bench pattern_extract`.
 
-use brain_core::{AgentId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
+use brain_core::{SpaceId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
 use brain_extractors::{ExtractionContext, Extractor, ExtractorRegistry, PatternExtractor};
 use brain_protocol::schema::ExtractorTarget;
 use criterion::{black_box, criterion_group, Criterion};
@@ -44,7 +44,7 @@ fn build_memory(size_bytes: usize) -> Memory {
     text.truncate(size_bytes);
     Memory {
         id: MemoryId::pack(0, 1, 0),
-        agent: AgentId::new(),
+        space: SpaceId::new(),
         context: ContextId(0),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),

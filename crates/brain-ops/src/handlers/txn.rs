@@ -109,7 +109,7 @@ pub struct BufferedEncode {
     /// committed `Phase::UpsertMemory` carries the same timeline a
     /// non-transactional encode would.
     pub occurred_at_unix_nanos: Option<u64>,
-    pub agent_id: brain_core::AgentId,
+    pub space_id: brain_core::SpaceId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -128,7 +128,7 @@ pub struct BufferedLink {
     pub request_id: [u8; 16],
     pub request_hash: [u8; 32],
     pub created_at_unix_nanos: u64,
-    pub agent_id: brain_core::AgentId,
+    pub space_id: brain_core::SpaceId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -139,7 +139,7 @@ pub struct BufferedUnlink {
     pub request_id: [u8; 16],
     pub request_hash: [u8; 32],
     pub created_at_unix_nanos: u64,
-    pub agent_id: brain_core::AgentId,
+    pub space_id: brain_core::SpaceId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -149,7 +149,7 @@ pub struct BufferedForget {
     pub request_id: [u8; 16],
     pub request_hash: [u8; 32],
     pub created_at_unix_nanos: u64,
-    pub agent_id: brain_core::AgentId,
+    pub space_id: brain_core::SpaceId,
 }
 
 /// Cached per-`request_id` response within a txn so we can replay
@@ -205,7 +205,7 @@ impl TxnBuffer {
 
     /// Reject a buffer mutation that would push past the per-transaction
     /// op cap. Called at the top of every buffer-mutating in-txn handler
-    /// so the 1001st op fails fast — the agent learns about the cap
+    /// so the 1001st op fails fast — the space learns about the cap
     /// immediately instead of buffering thousands of doomed ops only to
     /// be rejected at TXN_COMMIT. `handle_txn_commit` runs the same
     /// check on the taken buffer as defense-in-depth.
@@ -443,7 +443,7 @@ pub async fn handle_txn_commit(
     // instead of silently returning the cached ack.
     let write_id = write_id_from_txn(req.txn_id);
     let request_hash = hash_txn_commit_request(req.txn_id, &phases);
-    let write = crate::write::Write::from_phases(write_id, ctx.executor.caller_agent, phases)
+    let write = crate::write::Write::from_phases(write_id, ctx.executor.caller_space, phases)
         .with_request_hash(request_hash);
     let real_writer = crate::handlers::link::downcast_writer_pub(ctx)?;
     match real_writer.submit(write).await {
@@ -674,7 +674,7 @@ mod tests {
                 request_id: [0u8; 16],
                 request_hash: [0u8; 32],
                 created_at_unix_nanos: 0,
-                agent_id: brain_core::AgentId(uuid::Uuid::nil()),
+                space_id: brain_core::SpaceId(uuid::Uuid::nil()),
             });
         }
     }
@@ -744,7 +744,7 @@ mod tests {
             request_id: [0u8; 16],
             request_hash: [0u8; 32],
             created_at_unix_nanos: 0,
-            agent_id: brain_core::AgentId(uuid::Uuid::nil()),
+            space_id: brain_core::SpaceId(uuid::Uuid::nil()),
         });
         buf.unlinks.push(BufferedUnlink {
             source: MemoryId::from(3u128),
@@ -753,7 +753,7 @@ mod tests {
             request_id: [0u8; 16],
             request_hash: [0u8; 32],
             created_at_unix_nanos: 0,
-            agent_id: brain_core::AgentId(uuid::Uuid::nil()),
+            space_id: brain_core::SpaceId(uuid::Uuid::nil()),
         });
         assert_eq!(buf.ops_count(), 5);
     }

@@ -406,7 +406,7 @@ fn lookup_canonical_wtxn(
     let bytes: Option<[u8; 16]> = t
         .get(&(
             scope.namespace_id,
-            scope.agent_id_bytes,
+            scope.space_id_bytes,
             type_id.raw(),
             normalized,
         ))?
@@ -424,14 +424,14 @@ fn lookup_alias_wtxn(
     let t = wtxn.open_table(ENTITY_ALIASES_TABLE)?;
     let lo = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         type_id.raw(),
         normalized,
         [0u8; 16],
     );
     let hi = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         type_id.raw(),
         normalized,
         [0xFFu8; 16],
@@ -439,9 +439,9 @@ fn lookup_alias_wtxn(
     let mut out = Vec::new();
     for entry in t.range(lo..=hi)? {
         let (k, _) = entry?;
-        let (k_ns, k_agent, k_type, k_alias, k_id) = k.value();
+        let (k_ns, k_space, k_type, k_alias, k_id) = k.value();
         if k_ns == scope.namespace_id
-            && k_agent == scope.agent_id_bytes
+            && k_space == scope.space_id_bytes
             && k_type == type_id.raw()
             && k_alias == normalized
         {
@@ -467,23 +467,23 @@ fn trigram_candidates_wtxn(
     for tg in qg {
         let lo = (
             scope.namespace_id,
-            scope.agent_id_bytes,
+            scope.space_id_bytes,
             type_id.raw(),
             tg,
             [0u8; 16],
         );
         let hi = (
             scope.namespace_id,
-            scope.agent_id_bytes,
+            scope.space_id_bytes,
             type_id.raw(),
             tg,
             [0xFFu8; 16],
         );
         for entry in t.range(lo..=hi)? {
             let (k, _) = entry?;
-            let (k_ns, k_agent, k_type, k_tg, k_id) = k.value();
+            let (k_ns, k_space, k_type, k_tg, k_id) = k.value();
             if k_ns == scope.namespace_id
-                && k_agent == scope.agent_id_bytes
+                && k_space == scope.space_id_bytes
                 && k_type == type_id.raw()
                 && k_tg == tg
             {
@@ -1508,9 +1508,9 @@ fn tier_embedding(
         return Ok(EmbeddingProbe::None);
     }
     // Filter by (scope, entity_type). The entity HNSW is a single
-    // per-shard index shared across every tenant + agent + type, so a
+    // per-shard index shared across every tenant + space + type, so a
     // probe can surface a neighbour belonging to a foreign
-    // `(namespace, agent)` or a different type. The tenant wall is
+    // `(namespace, space)` or a different type. The tenant wall is
     // unconditional: a candidate from another scope is dropped before
     // the threshold check so `acme/chatbot`'s "John" can never resolve
     // onto `globex`'s or `acme/research`'s "John". The type filter is
@@ -1542,7 +1542,7 @@ fn tier_embedding(
     Ok(EmbeddingProbe::None)
 }
 
-/// Read the `entity_type_id` + `(namespace, agent)` scope for `id`
+/// Read the `entity_type_id` + `(namespace, space)` scope for `id`
 /// inside an existing write txn. Lighter than `entity_get_inside_wtxn`
 /// (no aliases, no blob decoding) — tier-3b only needs the type +
 /// scope filter to drop foreign-type and foreign-tenant HNSW hits.
@@ -1555,7 +1555,7 @@ fn read_entity_type_and_scope(
     Ok(row.map(|m| {
         (
             EntityTypeId::from(m.entity_type_id),
-            RowScope::from_bytes(m.namespace_id, m.agent_id_bytes),
+            RowScope::from_bytes(m.namespace_id, m.space_id_bytes),
         )
     }))
 }
@@ -1779,8 +1779,8 @@ mod tests {
 
     const NOW: u64 = 1_700_000_000_000_000_000;
 
-    /// Fixed `(namespace, agent)` scope for resolver unit tests. The
-    /// system namespace + a stable agent are enough to exercise the
+    /// Fixed `(namespace, space)` scope for resolver unit tests. The
+    /// system namespace + a stable space are enough to exercise the
     /// scoped gauntlet; cross-scope distinctness is proven at the
     /// brain-ops handler layer (`typed_graph_namespace_isolation.rs`).
     fn test_scope() -> RowScope {

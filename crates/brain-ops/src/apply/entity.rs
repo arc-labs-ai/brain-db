@@ -55,7 +55,7 @@ pub fn apply_upsert_entity(
     phase: &Phase,
     write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
-    let scope = brain_metadata::RowScope::new(write.namespace, write.agent_id);
+    let scope = brain_metadata::RowScope::new(write.namespace, write.space_id);
     let e = entity_from_upsert_phase(phase)
         .ok_or(ApplyError::PhaseMisShape("expected UpsertEntity"))?;
     let id = e.id;
@@ -391,7 +391,7 @@ mod tests {
     fn empty_write() -> Write {
         Write::single(
             WriteId::new(),
-            brain_core::AgentId::default(),
+            brain_core::SpaceId::default(),
             Phase::ReclaimSlots { slots: Vec::new() },
         )
     }

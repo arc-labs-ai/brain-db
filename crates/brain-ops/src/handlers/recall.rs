@@ -63,7 +63,7 @@ pub const DEFAULT_RECALL_RESULTS: u32 = 50;
 /// removes). The pool is still bounded: the per-lane `top_n` clamps cap the
 /// fused set well under this ceiling, and `max_results` caps the returned
 /// members after the band runs. Sized to the hard allocation guard so the
-/// executor never truncates a realistic per-agent fused pool.
+/// executor never truncates a realistic per-space fused pool.
 pub const RECALL_CANDIDATE_POOL: u32 = MAX_RECALL_RESULTS;
 
 /// Upper bound on the entry count of any one recall filter list
@@ -835,7 +835,7 @@ fn build_membership(
     //   * memories with a Mentions edge to the subject (Memory→Entity, so we
     //     walk it in reverse from the entity).
     // Hydration reuses `hydrate_memories_by_id`, which re-applies the same
-    // agent/kind/context/salience/age/tombstone filters as every other path, so
+    // space/kind/context/salience/age/tombstone filters as every other path, so
     // this never leaks a memory the caller couldn't otherwise see.
     //
     // Strictly additive and bounded: only ids NOT already placed are appended,
@@ -899,7 +899,7 @@ fn build_membership(
     let (mut out, committed_shape) = match grounded_commit(grounded, &support_of) {
         // Honor the commit only when at least one lead memory is actually present
         // in the visible set: a grounded source filtered out by the visibility
-        // pass (agent/kind/context/tombstone) must not set a shape with no backing
+        // pass (space/kind/context/tombstone) must not set a shape with no backing
         // member. Otherwise fall through to plain answer-relevance ordering.
         Some(lead) if lead.ids.iter().any(|id| placed.contains(id)) => {
             let shape = lead.shape;
@@ -1018,7 +1018,7 @@ fn anchor_direct_memories(
 
     // 1. The subject's own current statements → their first evidence memory.
     let scope =
-        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_agent);
+        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
     if let Ok(stmts) = statement_list(
         &rtxn,
         scope,
@@ -1162,9 +1162,9 @@ enum GroundedOutcome {
 /// `grounded_answer`).
 ///
 /// We pick the **globally best-scoring** match across ALL candidates, not the
-/// first candidate that clears the floor. First-match-wins was a bug: the agent
+/// first candidate that clears the floor. First-match-wins was a bug: the space
 /// self-entity is always candidate[0], and a loose self-predicate (e.g. the
-/// agent's `usually_reviews` against "who does Niraj report to") could clear the
+/// space's `usually_reviews` against "who does Niraj report to") could clear the
 /// floor and short-circuit before the actually-named subject's exact predicate
 /// (`reports_to`, a far higher cosine) was ever tried. Comparing all candidates
 /// by cosine lets the strong, specific match win. On a near-tie we prefer a
@@ -1419,7 +1419,7 @@ fn best_grounded_for_cue(
     // was the trip") the scope is empty and the projection stays global — it
     // can't subject-check, but there is no named anchor to check against.
     let candidates = subject_candidates_from_cue(&rtxn, req, ctx)?;
-    let self_id = EntityId::from(ctx.executor.caller_agent.0.into_bytes());
+    let self_id = EntityId::from(ctx.executor.caller_space.0.into_bytes());
     let anchors: HashSet<EntityId> = candidates
         .iter()
         .copied()
@@ -1452,7 +1452,7 @@ fn best_grounded_for_cue(
     let mut best: Option<(GroundedAnswer, f32, bool, usize)> = None;
     for subject in candidates {
         let grounded_scope =
-            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_agent);
+            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
         let (answer, depth) = grounded_answer_walk(&rtxn, grounded_scope, subject, cue_vec)
             .map_err(|e| OpError::Internal(format!("recall grounded walk: {e}")))?;
         if matches!(answer.kind, AnswerKind::None) {
@@ -1549,7 +1549,7 @@ fn best_grounded_for_cue(
 /// Hydrate `MemoryResult`s straight from `MEMORIES_TABLE` (+ `TEXTS_TABLE`
 /// when `include_text`) for a set of memory ids — the structured branch's
 /// projector, which answers from stored ids rather than a retrieval result.
-/// Applies the same post-filters as the fan-out projector (agent scope, kind,
+/// Applies the same post-filters as the fan-out projector (space scope, kind,
 /// context, salience, age, tombstone) so a structured answer never leaks a
 /// memory the caller could not otherwise see. A structured hit carries no
 /// retrieval score; its `similarity_score`/`confidence`/`fused_score` are
@@ -1562,12 +1562,12 @@ fn hydrate_memories_by_id(
 ) -> Result<Vec<MemoryResult>, OpError> {
     use brain_metadata::tables::memory::MEMORIES_TABLE as MEM_T;
 
-    // Strict per-agent isolation: every row belongs to exactly one agent, and
-    // the scope is the caller's own agent derived from the key. There is no
-    // client-supplied agent filter on the wire, so a key can never reach
-    // another agent's data.
-    let agent_scope: Option<HashSet<[u8; 16]>> = Some(
-        [<[u8; 16]>::from(ctx.executor.caller_agent)]
+    // Strict per-space isolation: every row belongs to exactly one space, and
+    // the scope is the caller's own space derived from the key. There is no
+    // client-supplied space filter on the wire, so a key can never reach
+    // another space's data.
+    let space_scope: Option<HashSet<[u8; 16]>> = Some(
+        [<[u8; 16]>::from(ctx.executor.caller_space)]
             .into_iter()
             .collect(),
     );
@@ -1607,13 +1607,13 @@ fn hydrate_memories_by_id(
             continue;
         }
         // Namespace (tenant) wall — unconditional. A caller can never see
-        // another namespace's memories; agent scope only ever narrows further
+        // another namespace's memories; space scope only ever narrows further
         // WITHIN the caller's own namespace.
         if row.namespace_id != ctx.executor.caller_namespace.raw() {
             continue;
         }
-        if let Some(ref scope) = agent_scope {
-            if !scope.contains(&row.agent_id_bytes) {
+        if let Some(ref scope) = space_scope {
+            if !scope.contains(&row.space_id_bytes) {
                 continue;
             }
         }
@@ -1668,7 +1668,7 @@ fn hydrate_memories_by_id(
             confidence: 1.0,
             salience: row.salience,
             kind: wire_kind,
-            agent_id: row.agent_id_bytes,
+            space_id: row.space_id_bytes,
             context_id: ContextId(row.context_id).into(),
             created_at_unix_nanos: row.created_at_unix_nanos,
             last_accessed_at_unix_nanos: row.last_accessed_at_unix_nanos,
@@ -1703,7 +1703,7 @@ fn hydrate_memories_by_id(
 /// pronoun / stopword list.
 ///
 /// Sources, in order:
-///   1. The caller's agent self-entity — covers every first-person
+///   1. The caller's space self-entity — covers every first-person
 ///      "what are my X" query with zero pronoun parsing.
 ///   2. An explicit `subject_name`, when the client did pass one.
 ///   3. Surfaces mined from the cue: capitalized multi-word runs (Latin
@@ -1713,12 +1713,12 @@ fn hydrate_memories_by_id(
 /// Deduped and capped at `MAX_SUBJECT_CANDIDATES` to bound the per-call
 /// grounded work (each candidate is a few redb point lookups).
 /// The cue's subject entity, used as the always-on graph-lane anchor. We take
-/// the strongest NON-self candidate — the agent self-entity is too broad to
-/// anchor a walk (everything the agent ever said connects to it). `None` when
+/// the strongest NON-self candidate — the space self-entity is too broad to
+/// anchor a walk (everything the space ever said connects to it). `None` when
 /// nothing resolves, in which case the graph lane simply has no seed.
 fn resolve_graph_anchor(req: &RecallRequest, ctx: &OpsContext) -> Option<EntityId> {
     let rtxn = ctx.executor.metadata.read_txn().ok()?;
-    let self_id = EntityId::from(ctx.executor.caller_agent.0.into_bytes());
+    let self_id = EntityId::from(ctx.executor.caller_space.0.into_bytes());
     subject_candidates_from_cue(&rtxn, req, ctx)
         .ok()?
         .into_iter()
@@ -1738,9 +1738,9 @@ fn subject_candidates_from_cue(
         }
     };
 
-    // 1. Agent self-entity (same derivation as MATERIALIZE_PROCEDURAL).
+    // 1. Space self-entity (same derivation as MATERIALIZE_PROCEDURAL).
     push(
-        EntityId::from(ctx.executor.caller_agent.0.into_bytes()),
+        EntityId::from(ctx.executor.caller_space.0.into_bytes()),
         &mut out,
         &mut seen,
     );
@@ -1774,7 +1774,7 @@ fn subject_candidates_from_cue(
         // (score >= 0.9); trigram-fuzzy is too loose for a grounded anchor (a
         // wrong subject yields a wrong fact).
         let scope =
-            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_agent);
+            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
         let ids = brain_metadata::entity_resolve_scored(rtxn, scope, &surface, 5)
             .map_err(OpError::from)?
             .into_iter()
@@ -1837,7 +1837,7 @@ async fn retrieve_memories(
     entity_anchor: Option<EntityId>,
     cue_vec: Option<&[f32; brain_embed::VECTOR_DIM]>,
 ) -> Result<(Vec<MemoryResult>, Option<RecallTrace>), OpError> {
-    let planner_req = build_planner_request(req, ctx.executor.caller_agent, entity_anchor);
+    let planner_req = build_planner_request(req, ctx.executor.caller_space, entity_anchor);
 
     let plan = retrieval_plan(&planner_req).map_err(map_plan_error)?;
     let exec_ctx = RetrievalExecutorContext {
@@ -1846,7 +1846,7 @@ async fn retrieve_memories(
         graph: ctx.graph_retriever.clone(),
         metadata: ctx.executor.metadata.clone(),
         caller_namespace: ctx.executor.caller_namespace.raw(),
-        caller_agent: ctx.executor.caller_agent,
+        caller_space: ctx.executor.caller_space,
         cross_encoder: ctx.cross_encoder.as_arc().cloned(),
     };
     // The statement corpus (statement HNSW + statements.tantivy) is ALWAYS
@@ -2524,7 +2524,7 @@ fn pending_to_memory_result(p: &BufferedEncode, req: &RecallRequest, score: f32)
         confidence: score,
         salience: p.salience_initial,
         kind: MemoryKindWire::from(p.kind),
-        agent_id: p.agent_id.into(),
+        space_id: p.space_id.into(),
         context_id: p.context_id.into(),
         created_at_unix_nanos: p.created_at_unix_nanos,
         last_accessed_at_unix_nanos: p.created_at_unix_nanos,
@@ -2651,11 +2651,11 @@ pub(crate) fn fetch_enrichment_for(
         {
             let mid = memory_id.to_be_bytes();
             // STATEMENTS_BY_EVIDENCE is now scoped: the key is
-            // `(namespace_id, agent_id_bytes, MemoryId, StatementId)`.
+            // `(namespace_id, space_id_bytes, MemoryId, StatementId)`.
             // Restrict the range to the caller's scope so the evidence
             // scan can never cross the tenant boundary.
-            let lo = (scope.namespace_id, scope.agent_id_bytes, mid, [0u8; 16]);
-            let hi = (scope.namespace_id, scope.agent_id_bytes, mid, [0xFFu8; 16]);
+            let lo = (scope.namespace_id, scope.space_id_bytes, mid, [0u8; 16]);
+            let hi = (scope.namespace_id, scope.space_id_bytes, mid, [0xFFu8; 16]);
             let mut stmts: Vec<brain_core::Statement> = Vec::new();
             for entry in evidence_table
                 .range(lo..=hi)
@@ -2663,7 +2663,7 @@ pub(crate) fn fetch_enrichment_for(
             {
                 let (k, _v) = entry
                     .map_err(|e| OpError::Internal(format!("include_graph: evidence row: {e}")))?;
-                let (_ns, _agent, _mem_bytes, sid_bytes) = k.value();
+                let (_ns, _space, _mem_bytes, sid_bytes) = k.value();
                 let sid = StatementId::from_bytes(sid_bytes);
                 if let Some(stmt) = statement_get(rtxn, sid)
                     .map_err(|e| OpError::Internal(format!("include_graph: statement_get: {e}")))?
@@ -2808,14 +2808,14 @@ pub(crate) fn fetch_enrichment_for(
 
 fn build_planner_request(
     req: &RecallRequest,
-    caller_agent: brain_core::AgentId,
+    caller_space: brain_core::SpaceId,
     entity_anchor: Option<EntityId>,
 ) -> PlannerQueryRequest {
-    // Strict per-agent isolation: retrieval is always scoped to the calling
-    // agent (from the key). Every row belongs to exactly one agent, and there
-    // is no client-supplied agent filter on the wire, so a key can never reach
-    // another agent's memories.
-    let agent_filter: Vec<brain_core::AgentId> = vec![caller_agent];
+    // Strict per-space isolation: retrieval is always scoped to the calling
+    // space (from the key). Every row belongs to exactly one space, and there
+    // is no client-supplied space filter on the wire, so a key can never reach
+    // another space's memories.
+    let space_filter: Vec<brain_core::SpaceId> = vec![caller_space];
 
     PlannerQueryRequest {
         text: Some(req.cue_text.clone()),
@@ -2830,7 +2830,7 @@ fn build_planner_request(
         // retrievers run on the eligible universe instead of pruning
         // post-projection (the historical gap this turn closes).
         context_filter: req.context_filter.as_ref().cloned().unwrap_or_default(),
-        agent_filter,
+        space_filter,
         confidence_min: if req.confidence_threshold > 0.0 {
             Some(req.confidence_threshold)
         } else {
@@ -2899,7 +2899,7 @@ fn project_memory_results(
             })
             .collect();
         let scope =
-            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_agent);
+            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
         let enriched = fetch_enrichment_for(&ids, scope, &rtxn)?;
         Some(ids.into_iter().zip(enriched).collect())
     } else {
@@ -3062,7 +3062,7 @@ fn project_memory_results(
             confidence: semantic_score,
             salience: row.salience,
             kind: wire_kind,
-            agent_id: row.agent_id_bytes,
+            space_id: row.space_id_bytes,
             context_id: ContextId(row.context_id).into(),
             created_at_unix_nanos: row.created_at_unix_nanos,
             last_accessed_at_unix_nanos: row.last_accessed_at_unix_nanos,
@@ -3381,7 +3381,7 @@ mod tests {
             confidence: 0.0,
             salience: 0.0,
             kind: MemoryKindWire::Episodic,
-            agent_id: [0u8; 16],
+            space_id: [0u8; 16],
             context_id: 0,
             created_at_unix_nanos: 0,
             last_accessed_at_unix_nanos: 0,

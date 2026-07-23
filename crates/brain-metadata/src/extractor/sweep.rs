@@ -230,7 +230,7 @@ fn reclaim_one(wtxn: &WriteTransaction, row: &StatementMetadata) -> Result<(), S
     let id_bytes = row.statement_id_bytes;
     // Strip the SAME scoped index keys the row was written under.
     let ns = row.namespace_id;
-    let ag = row.agent_id_bytes;
+    let ag = row.space_id_bytes;
 
     // 1. Primary row.
     {
@@ -675,7 +675,7 @@ mod reclaim_tests {
         for bit in [0u8, 1u8] {
             let lo = (
                 sc.namespace_id,
-                sc.agent_id_bytes,
+                sc.space_id_bytes,
                 subj.to_bytes(),
                 StatementKind::Fact.as_u8(),
                 p.raw(),
@@ -684,7 +684,7 @@ mod reclaim_tests {
             );
             let hi = (
                 sc.namespace_id,
-                sc.agent_id_bytes,
+                sc.space_id_bytes,
                 subj.to_bytes(),
                 StatementKind::Fact.as_u8(),
                 p.raw(),
@@ -698,7 +698,7 @@ mod reclaim_tests {
         assert!(byo
             .get(&(
                 sc.namespace_id,
-                sc.agent_id_bytes,
+                sc.space_id_bytes,
                 obj.to_bytes(),
                 StatementKind::Fact.as_u8(),
                 s.id.to_bytes(),
@@ -710,7 +710,7 @@ mod reclaim_tests {
         assert!(bye
             .get(&(
                 sc.namespace_id,
-                sc.agent_id_bytes,
+                sc.space_id_bytes,
                 mem.to_be_bytes(),
                 s.id.to_bytes(),
             ))
@@ -721,7 +721,7 @@ mod reclaim_tests {
         assert!(chain
             .get(&(
                 sc.namespace_id,
-                sc.agent_id_bytes,
+                sc.space_id_bytes,
                 s.chain_root.to_bytes(),
                 1u32,
             ))
@@ -780,7 +780,7 @@ mod reclaim_tests {
             chain
                 .get(&(
                     sc.namespace_id,
-                    sc.agent_id_bytes,
+                    sc.space_id_bytes,
                     chain_root.to_bytes(),
                     1u32
                 ))
@@ -792,7 +792,7 @@ mod reclaim_tests {
             chain
                 .get(&(
                     sc.namespace_id,
-                    sc.agent_id_bytes,
+                    sc.space_id_bytes,
                     chain_root.to_bytes(),
                     2u32
                 ))

@@ -31,7 +31,7 @@
 //!   watch + a final-LSN counter.
 //! - **per-subscription task**: spawned on SUBSCRIBE_REQ. Drains
 //!   broadcast receivers (one per relevant shard — typically the
-//!   agent's bound shard) and pushes filtered events to the per-conn
+//!   space's bound shard) and pushes filtered events to the per-conn
 //!   outgoing-frame queue.
 
 #![cfg(target_os = "linux")]

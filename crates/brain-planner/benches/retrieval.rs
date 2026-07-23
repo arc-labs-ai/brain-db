@@ -140,7 +140,7 @@ fn build_fixture(
         graph: gr,
         metadata,
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
-        caller_agent: brain_core::AgentId::default(),
+        caller_space: brain_core::SpaceId::default(),
         cross_encoder: None,
     };
 
@@ -154,7 +154,7 @@ fn text_anchor_request() -> PlannerQueryRequest {
         kind_filter: Vec::new(),
         predicate_filter: Vec::new(),
         context_filter: Vec::new(),
-        agent_filter: Vec::new(),
+        space_filter: Vec::new(),
         time_filter: None,
         confidence_min: None,
         include_tombstoned: false,
@@ -173,7 +173,7 @@ fn text_only_request() -> PlannerQueryRequest {
         kind_filter: Vec::new(),
         predicate_filter: Vec::new(),
         context_filter: Vec::new(),
-        agent_filter: Vec::new(),
+        space_filter: Vec::new(),
         time_filter: None,
         confidence_min: None,
         include_tombstoned: false,

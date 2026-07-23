@@ -12,7 +12,7 @@
 use std::ops::RangeInclusive;
 
 use brain_core::StatementKind;
-use brain_core::{AgentId, MemoryKind, PredicateId};
+use brain_core::{SpaceId, MemoryKind, PredicateId};
 
 use crate::tantivy_shard::{RankedItem, RankedItemId};
 
@@ -64,7 +64,7 @@ pub trait SemanticRetriever: Send + Sync {
     /// construction, an answering memory and should lead the result even when a
     /// topically-adjacent memory has a higher raw passage cosine.
     ///
-    /// This is scope-agnostic (no namespace / agent push-down): callers use it
+    /// This is scope-agnostic (no namespace / space push-down): callers use it
     /// only to look up scores for candidates *already* admitted by the filtered
     /// membership set, so a hit for an out-of-scope memory is simply never read.
     /// Default empty: retrievers without a HyPE pool contribute no answer-lead
@@ -87,7 +87,7 @@ pub trait SemanticRetriever: Send + Sync {
     /// the read path projects that slot's value (object / event time / subject)
     /// rather than always returning the object. Returned descending by cosine.
     ///
-    /// Scope-agnostic (no namespace / agent push-down): callers project only
+    /// Scope-agnostic (no namespace / space push-down): callers project only
     /// statements they can already see, so an out-of-scope hit is never read.
     /// Default empty: retrievers without a statement-question pool contribute no
     /// slot-projection signal and the caller leaves the grounded path unchanged.
@@ -127,11 +127,11 @@ pub enum SemanticScope {
 #[derive(Debug, Clone, Default)]
 pub struct SemanticFilters {
     /// Tenant data boundary. The caller's namespace; the vector lane admits
-    /// only rows whose `namespace_id` equals this value. Unlike agent scoping
+    /// only rows whose `namespace_id` equals this value. Unlike space scoping
     /// (a soft, optionally-empty filter), the namespace wall is unconditional:
     /// there is no escape that widens recall across tenants.
     pub namespace_id: u32,
-    pub agent_ids: Vec<AgentId>,
+    pub space_ids: Vec<SpaceId>,
     pub memory_kind: Option<MemoryKind>,
     pub statement_kind: Option<StatementKind>,
     pub predicate_id: Option<PredicateId>,
@@ -140,7 +140,7 @@ pub struct SemanticFilters {
     pub extracted_at_ms: Option<RangeInclusive<u64>>,
     /// Front-gate scope tag: when non-empty, the closure restricts
     /// HNSW visits to memories whose `context_id` is in this set. The
-    /// closure already reads `MemoryMetadata` per visit (for agent /
+    /// closure already reads `MemoryMetadata` per visit (for space /
     /// kind / created_at), so checking context costs nothing extra and
     /// stays bounded by HNSW visits — sublinear in the corpus size.
     pub context_ids: Vec<u64>,
@@ -223,9 +223,9 @@ pub fn validate_filters_for_scope(
             }
         }
         SemanticScope::Statement => {
-            if !filters.agent_ids.is_empty() {
+            if !filters.space_ids.is_empty() {
                 return Err(SemanticError::QueryParseFailed(
-                    "agent_id filter applies only to Memory / Both".into(),
+                    "space_id filter applies only to Memory / Both".into(),
                 ));
             }
             if filters.memory_kind.is_some() {

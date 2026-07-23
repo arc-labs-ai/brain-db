@@ -157,7 +157,7 @@ pub enum ErrorCode {
     ConnectionLimitExceeded,
     TransactionLimitExceeded,
     /// Transaction buffer exceeded the per-transaction op cap (1000 ops).
-    /// Surfaced both at append-time (so the agent
+    /// Surfaced both at append-time (so the space
     /// learns immediately when the 1001st op is buffered) and at commit
     /// time (defense-in-depth for any buffer mutation that slipped past
     /// the append guard). The client should split the work into multiple

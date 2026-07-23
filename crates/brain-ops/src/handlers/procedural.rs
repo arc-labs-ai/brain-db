@@ -1,6 +1,6 @@
 //! `MATERIALIZE_PROCEDURAL` handler (W3.1, wire v2).
 //!
-//! Reads the calling agent's stored `brain:behavior_*` Preferences,
+//! Reads the calling space's stored `brain:behavior_*` Preferences,
 //! sorts by confidence, applies the `top_k` cap, and renders a single
 //! Markdown system block ready for LLM prompt injection.
 //!
@@ -105,16 +105,16 @@ pub async fn handle_materialize_procedural(
         req.top_k
     };
 
-    // The wire field is opt-in; an all-zeros agent_id means "use the
+    // The wire field is opt-in; an all-zeros space_id means "use the
     // authenticated caller". Anonymous deployments fall back to
-    // AgentId::NIL which won't have any procedural statements stored
+    // SpaceId::NIL which won't have any procedural statements stored
     // against it — the renderer returns an empty block in that case.
-    let agent_bytes = if req.agent_id == [0u8; 16] {
-        ctx.executor.caller_agent.0.into_bytes()
+    let space_bytes = if req.space_id == [0u8; 16] {
+        ctx.executor.caller_space.0.into_bytes()
     } else {
-        req.agent_id
+        req.space_id
     };
-    let subject_entity = EntityId::from(agent_bytes);
+    let subject_entity = EntityId::from(space_bytes);
 
     let context_filter = if req.context_filter == 0 {
         None
@@ -125,7 +125,7 @@ pub async fn handle_materialize_procedural(
     // ── Resolve the procedural predicate set ─────────────────────
     // Walks the registry once per call (5 lookups). When a schema
     // hasn't been seeded the predicate rows won't exist and we
-    // return an empty block — no agent could have written a
+    // return an empty block — no space could have written a
     // procedural statement without those predicates declared.
     let categories_set: Option<&[String]> = if req.categories.is_empty() {
         None
@@ -196,7 +196,7 @@ pub async fn handle_materialize_procedural(
                 &rtxn,
                 brain_metadata::RowScope::new(
                     ctx.executor.caller_namespace,
-                    ctx.executor.caller_agent,
+                    ctx.executor.caller_space,
                 ),
                 &filter,
             )
@@ -307,12 +307,12 @@ fn render_object(obj: &StatementObject) -> Option<String> {
 }
 
 fn statement_touches_context(s: &Statement, context: ContextId) -> bool {
-    // Procedural memory is inherently agent-scoped; the per-memory
+    // Procedural memory is inherently space-scoped; the per-memory
     // ContextId lives in the `memories` redb row, not on the
     // statement itself, so a precise filter would require an
     // O(n_evidence) row-by-row lookup against the rtxn. For v1 we
     // treat the context filter as advisory and accept every row —
-    // an agent's `behavior_*` claim doesn't shift meaning across
+    // an space's `behavior_*` claim doesn't shift meaning across
     // contexts the way a Fact would. A later pass can fold per-
     // evidence context lookups in if a use case emerges.
     let _ = (s, context);
@@ -337,7 +337,7 @@ fn render_system_block(rows: &[RenderedStatement], total_candidates: u32) -> Str
 
     let mut out = String::new();
     out.push_str("# Learned behaviors (procedural memory)\n\n");
-    out.push_str("The following are behaviors the agent has learned over prior sessions.\n");
+    out.push_str("The following are behaviors the space has learned over prior sessions.\n");
     out.push_str(
         "They are sorted by confidence; ignore any that seem inconsistent with the current request.\n\n",
     );
@@ -394,7 +394,7 @@ fn push_section(out: &mut String, title: &str, rows: &[&RenderedStatement]) {
 
 fn render_empty_block() -> String {
     "# Learned behaviors (procedural memory)\n\n\
-     (no procedural statements stored for this agent yet)\n"
+     (no procedural statements stored for this space yet)\n"
         .to_string()
 }
 

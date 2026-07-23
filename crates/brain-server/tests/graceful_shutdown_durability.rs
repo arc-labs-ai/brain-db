@@ -245,7 +245,7 @@ async fn recall_ids_until_contains(
 async fn acknowledged_writes_survive_graceful_shutdown_and_restart() {
     // Caller-owned dir so it outlives the first server's stop().
     let dir = TempDir::new().expect("tmp");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
 
     // Distinctive phrases so the lexical retriever can re-find each one by a
     // cue that overlaps its text.
@@ -269,7 +269,7 @@ async fn acknowledged_writes_survive_graceful_shutdown_and_restart() {
             .expect("connect 1");
         handshake(
             &mut client,
-            &server.mint("test", agent_id, brain_metadata::api_keys::bits::FULL),
+            &server.mint("test", space_id, brain_metadata::api_keys::bits::FULL),
         )
         .await;
 
@@ -293,7 +293,7 @@ async fn acknowledged_writes_survive_graceful_shutdown_and_restart() {
             .expect("connect 2");
         handshake(
             &mut client,
-            &server.mint("test", agent_id, brain_metadata::api_keys::bits::FULL),
+            &server.mint("test", space_id, brain_metadata::api_keys::bits::FULL),
         )
         .await;
 
@@ -320,7 +320,7 @@ async fn acknowledged_writes_survive_graceful_shutdown_and_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn graceful_shutdown_with_no_writes_restarts_clean() {
     let dir = TempDir::new().expect("tmp");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
 
     {
         let server = start_in(dir.path(), 1).await;
@@ -329,7 +329,7 @@ async fn graceful_shutdown_with_no_writes_restarts_clean() {
             .expect("connect 1");
         handshake(
             &mut client,
-            &server.mint("test", agent_id, brain_metadata::api_keys::bits::FULL),
+            &server.mint("test", space_id, brain_metadata::api_keys::bits::FULL),
         )
         .await;
         drop(client);
@@ -343,7 +343,7 @@ async fn graceful_shutdown_with_no_writes_restarts_clean() {
             .expect("connect 2");
         handshake(
             &mut client,
-            &server.mint("test", agent_id, brain_metadata::api_keys::bits::FULL),
+            &server.mint("test", space_id, brain_metadata::api_keys::bits::FULL),
         )
         .await;
         // The shard recovered to an empty, queryable state.

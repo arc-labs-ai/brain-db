@@ -61,10 +61,10 @@ use crate::write::{Phase, SupersedeReplacement, SupersedeTarget, TombstoneTarget
 #[must_use]
 pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> {
     // The WAL body carries the fully-stamped metadata row so recovery
-    // re-persists it byte-identically; the row's `(namespace, agent)`
+    // re-persists it byte-identically; the row's `(namespace, space)`
     // scope therefore must be stamped here from the same `Write` the
     // live apply path uses.
-    let scope = brain_metadata::RowScope::new(write.namespace, write.agent_id);
+    let scope = brain_metadata::RowScope::new(write.namespace, write.space_id);
     match phase {
         // content_hash isn't an EncodePayload field — the WAL doesn't
         // ship it inline; recovery reconstructs the FINGERPRINTS_TABLE
@@ -89,7 +89,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             // UUIDv7, 16 bytes). Recovery keys the idempotency cache off
             // this field.
             request_id: brain_core::RequestId(write.write_id.as_uuid()),
-            agent_id: write.agent_id,
+            space_id: write.space_id,
             namespace_id: write.namespace,
             context_id: *context,
             kind: *kind,
@@ -144,7 +144,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
                 // idempotency replay (both share the UUIDv7 16-byte
                 // layout).
                 request_id: brain_core::RequestId(write.write_id.as_uuid()),
-                agent_id: write.agent_id,
+                space_id: write.space_id,
                 mode: match mode {
                     crate::write::phase::TombstoneMode::Soft => {
                         brain_storage::wal::payload::ForgetMode::Soft
@@ -170,7 +170,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
                 });
                 Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
                     WalRecordKind::EntityTombstone,
-                    write.agent_id,
+                    write.space_id,
                     body,
                 )))
             }
@@ -184,7 +184,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
                 });
                 Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
                     WalRecordKind::StatementTombstone,
-                    write.agent_id,
+                    write.space_id,
                     body,
                 )))
             }
@@ -196,7 +196,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
                     relation_id: *id,
                     reason: String::new(),
                     at_unix_nanos: *at_unix_nanos,
-                    agent_id: write.agent_id,
+                    space_id: write.space_id,
                 }))
             }
         },
@@ -239,7 +239,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             let body = encode_entity_create(&meta);
             Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
                 WalRecordKind::EntityCreate,
-                write.agent_id,
+                write.space_id,
                 body,
             )))
         }
@@ -260,7 +260,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             });
             Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
                 WalRecordKind::StatementCreate,
-                write.agent_id,
+                write.space_id,
                 body,
             )))
         }
@@ -281,7 +281,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             });
             Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
                 WalRecordKind::StatementSupersede,
-                write.agent_id,
+                write.space_id,
                 body,
             )))
         }
@@ -310,7 +310,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
                 extractor_id: new_rel.extractor_id.raw(),
                 is_symmetric: new_rel.is_symmetric,
                 properties_blob: new_rel.properties_blob.clone(),
-                agent_id: write.agent_id,
+                space_id: write.space_id,
                 namespace_id: write.namespace,
                 relation_type_intern_hint: None,
             },
@@ -348,7 +348,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             extractor_id: extractor.raw(),
             is_symmetric: *is_symmetric,
             properties_blob: properties_blob.clone(),
-            agent_id: write.agent_id,
+            space_id: write.space_id,
             namespace_id: write.namespace,
             relation_type_intern_hint: relation_type_intern_hint.clone(),
         })),
@@ -372,7 +372,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             });
             Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
                 WalRecordKind::EntityUpdate,
-                write.agent_id,
+                write.space_id,
                 body,
             )))
         }
@@ -391,7 +391,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             });
             Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
                 WalRecordKind::EntityRename,
-                write.agent_id,
+                write.space_id,
                 body,
             )))
         }
@@ -409,9 +409,9 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             actor,
             grace_seconds,
         } => {
-            let (actor_kind, actor_agent) = match actor {
+            let (actor_kind, actor_space) = match actor {
                 brain_metadata::entity::merge::MergeActor::System => (0u8, [0u8; 16]),
-                brain_metadata::entity::merge::MergeActor::Agent(bytes) => (1u8, *bytes),
+                brain_metadata::entity::merge::MergeActor::Space(bytes) => (1u8, *bytes),
             };
             let body = encode_entity_merge(&EntityMergeBody {
                 source: source.to_bytes(),
@@ -422,12 +422,12 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
                 confidence: *confidence,
                 reason: reason.clone(),
                 actor_kind,
-                actor_agent,
+                actor_space,
                 grace_seconds: *grace_seconds,
             });
             Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
                 WalRecordKind::EntityMerge,
-                write.agent_id,
+                write.space_id,
                 body,
             )))
         }
@@ -450,7 +450,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             });
             Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
                 WalRecordKind::SchemaUpdate,
-                write.agent_id,
+                write.space_id,
                 body,
             )))
         }
@@ -462,19 +462,19 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             actor,
             at_unix_nanos,
         } => {
-            let (actor_kind, actor_agent) = match actor {
+            let (actor_kind, actor_space) = match actor {
                 brain_metadata::entity::merge::MergeActor::System => (0u8, [0u8; 16]),
-                brain_metadata::entity::merge::MergeActor::Agent(bytes) => (1u8, *bytes),
+                brain_metadata::entity::merge::MergeActor::Space(bytes) => (1u8, *bytes),
             };
             let body = encode_entity_unmerge(&EntityUnmergeBody {
                 merged: merged.to_bytes(),
                 actor_kind,
-                actor_agent,
+                actor_space,
                 at_unix_nanos: *at_unix_nanos,
             });
             Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
                 WalRecordKind::EntityUnmerge,
-                write.agent_id,
+                write.space_id,
                 body,
             )))
         }
@@ -506,7 +506,7 @@ fn edge_origin_from_byte(byte: u8) -> EdgeOrigin {
 mod tests {
     use super::*;
     use brain_core::{
-        AgentId, ContextId, EdgeKind, EdgeKindRef, EntityAttributes, EntityId, EntityTypeId,
+        SpaceId, ContextId, EdgeKind, EdgeKindRef, EntityAttributes, EntityId, EntityTypeId,
         MemoryId, MemoryKind, Salience,
     };
     use brain_metadata::tables::edge::zero_disambiguator;
@@ -514,7 +514,7 @@ mod tests {
     use crate::write::{Phase, Write, WriteId};
 
     fn write_for(phase: Phase) -> Write {
-        Write::single(WriteId::new(), AgentId::default(), phase)
+        Write::single(WriteId::new(), SpaceId::default(), phase)
     }
 
     #[test]
@@ -842,7 +842,7 @@ mod tests {
             at_unix_nanos: 1_700_000_000_000,
         };
         let write_id = WriteId::new();
-        let w = Write::single(write_id, AgentId::default(), phase.clone());
+        let w = Write::single(write_id, SpaceId::default(), phase.clone());
         let WalPayload::Forget(fp) = phase_to_wal_payload(&phase, &w).unwrap() else {
             panic!()
         };

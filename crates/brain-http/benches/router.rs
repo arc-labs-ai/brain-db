@@ -31,7 +31,7 @@ fn build_router() -> Router<Full<Bytes>> {
         .get("/v1/route/5", ok_handler)
         .route_prefix(Method::POST, "/v1/snapshots/", ok_handler)
         .route_prefix(Method::POST, "/v1/workers/", ok_handler)
-        .route_prefix(Method::GET, "/v1/agents/", ok_handler)
+        .route_prefix(Method::GET, "/v1/spaces/", ok_handler)
         .route_prefix(Method::DELETE, "/v1/shards/", ok_handler)
         .fallback(ok_handler)
 }

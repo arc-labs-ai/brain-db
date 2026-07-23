@@ -15,7 +15,7 @@
 //!
 //! ## Not yet wired
 //!
-//! - Per-IP / per-agent connection limits.
+//! - Per-IP / per-space connection limits.
 //! - mTLS — follow-up marks opt-in.
 
 #![cfg(target_os = "linux")]

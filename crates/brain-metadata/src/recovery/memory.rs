@@ -53,7 +53,7 @@ impl MetadataDb {
             let mut mem = MemoryMetadata::new_active(
                 memory_id,
                 p.namespace_id,
-                p.agent_id,
+                p.space_id,
                 p.context_id,
                 slot_id,
                 slot_version,
@@ -113,9 +113,9 @@ impl MetadataDb {
 
             // fingerprints — restore the dedup index for opt-in ENCODEs
             // so future ENCODE+dedup requests for the same text in the
-            // same (agent, context) collapse onto the existing memory.
+            // same (space, context) collapse onto the existing memory.
             if let Some(hash) = content_hash {
-                let key = fingerprint_key(p.agent_id, p.context_id, &hash);
+                let key = fingerprint_key(p.space_id, p.context_id, &hash);
                 let entry = FingerprintEntry::new(memory_id, timestamp_ns);
                 let mut t = wtxn.open_table(FINGERPRINTS_TABLE).map_err(transient)?;
                 t.insert(&key, &entry).map_err(transient)?;
@@ -176,16 +176,16 @@ impl MetadataDb {
             let key = p.memory_id.to_be_bytes();
 
             // Update memory: set HARD_FORGOTTEN flag + forgot_at. Capture
-            // (agent, context, hash) for the matching FINGERPRINTS row so
+            // (space, context, hash) for the matching FINGERPRINTS row so
             // we can evict it in the same write txn (—
             // the dedup index must never reference a forgotten memory).
-            let dedup_key: Option<(brain_core::AgentId, brain_core::ContextId, [u8; 32])> = {
+            let dedup_key: Option<(brain_core::SpaceId, brain_core::ContextId, [u8; 32])> = {
                 let mut t = wtxn.open_table(MEMORIES_TABLE).map_err(transient)?;
                 let existing = t.get(&key).map_err(transient)?.map(|a| a.value());
                 if let Some(mut mem) = existing {
                     let captured = mem.content_hash.map(|h| {
                         (
-                            brain_core::AgentId::from(mem.agent_id_bytes),
+                            brain_core::SpaceId::from(mem.space_id_bytes),
                             brain_core::ContextId(mem.context_id),
                             h,
                         )
@@ -202,8 +202,8 @@ impl MetadataDb {
 
             // Evict FINGERPRINTS row in the same txn as the tombstone so
             // a concurrent ENCODE+dedup can't observe a stale hit.
-            if let Some((agent, ctx, hash)) = dedup_key {
-                let fp_key = fingerprint_key(agent, ctx, &hash);
+            if let Some((space, ctx, hash)) = dedup_key {
+                let fp_key = fingerprint_key(space, ctx, &hash);
                 let mut t = wtxn.open_table(FINGERPRINTS_TABLE).map_err(transient)?;
                 t.remove(&fp_key).map_err(transient)?;
             }

@@ -1,14 +1,14 @@
-//! Multi-agent isolation on the RECALL read path.
+//! Multi-space isolation on the RECALL read path.
 //!
 //! The most important correctness property of a multi-tenant memory store:
-//! one agent's RECALL must not return another agent's memories. Brain enforces
-//! this structurally — every memory row carries its owning `agent_id`, RECALL
-//! carries no client-supplied agent filter, and the handler scopes every read
-//! to the caller's authenticated agent. There is no cross-agent read path to
+//! one space's RECALL must not return another space's memories. Brain enforces
+//! this structurally — every memory row carries its owning `space_id`, RECALL
+//! carries no client-supplied space filter, and the handler scopes every read
+//! to the caller's authenticated space. There is no cross-space read path to
 //! opt into. This test proves that scoping holds.
 //!
-//! A single shard (`start(1)`) forces both agents onto shard 0 — `hash(agent)
-//! % 1 == 0` — so what's under test is the *logical* per-agent filter, not the
+//! A single shard (`start(1)`) forces both spaces onto shard 0 — `hash(space)
+//! % 1 == 0` — so what's under test is the *logical* per-space filter, not the
 //! incidental physical separation that distinct shards would provide.
 //!
 //! The test harness embeds with a zero-vector stub dispatcher, so similarity
@@ -113,8 +113,8 @@ async fn round_trip(
     (resp_opcode, body)
 }
 
-/// Handshake presenting `token` (a key minted for a specific agent), so each
-/// test connection is a distinct, controllable agent. Identity is the key.
+/// Handshake presenting `token` (a key minted for a specific space), so each
+/// test connection is a distinct, controllable space. Identity is the key.
 async fn handshake_as(client: &mut TcpStream, token: &[u8]) {
     let hello = HelloPayload {
         client_id: "isolation-tester".into(),
@@ -177,7 +177,7 @@ async fn encode(client: &mut TcpStream, stream_id: u32, text: &str) -> u128 {
 }
 
 /// Recall the caller's own memories; returns the `memory_id`s in the result
-/// set. Scope is always the caller's own agent — there is no client filter.
+/// set. Scope is always the caller's own space — there is no client filter.
 async fn recall_ids(client: &mut TcpStream, stream_id: u32, cue: &str) -> Vec<u128> {
     let req = RecallRequest {
         trace: false,
@@ -216,16 +216,16 @@ async fn recall_ids(client: &mut TcpStream, stream_id: u32, cue: &str) -> Vec<u1
 // Tests
 // ---------------------------------------------------------------------------
 
-/// The core isolation guarantee: agent B's RECALL never returns a memory that
-/// agent A encoded — even though both agents live on the same shard and share
-/// one HNSW/tantivy index. The scope is the caller's authenticated agent,
+/// The core isolation guarantee: space B's RECALL never returns a memory that
+/// space A encoded — even though both spaces live on the same shard and share
+/// one HNSW/tantivy index. The scope is the caller's authenticated space,
 /// applied unconditionally; there is no wire field that could widen it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn default_recall_does_not_leak_other_agents_memories() {
-    let server = start(1).await; // one shard → both agents collocated
+async fn default_recall_does_not_leak_other_spaces_memories() {
+    let server = start(1).await; // one shard → both spaces collocated
 
-    let agent_a = [0xAAu8; 16];
-    let agent_b = [0xBBu8; 16];
+    let space_a = [0xAAu8; 16];
+    let space_b = [0xBBu8; 16];
 
     let mut a = TcpStream::connect(server.data_plane_addr)
         .await
@@ -235,34 +235,34 @@ async fn default_recall_does_not_leak_other_agents_memories() {
         .expect("connect b");
     handshake_as(
         &mut a,
-        &server.mint("test", agent_a, brain_metadata::api_keys::bits::FULL),
+        &server.mint("test", space_a, brain_metadata::api_keys::bits::FULL),
     )
     .await;
     handshake_as(
         &mut b,
-        &server.mint("test", agent_b, brain_metadata::api_keys::bits::FULL),
+        &server.mint("test", space_b, brain_metadata::api_keys::bits::FULL),
     )
     .await;
 
-    // Agent A stores private memories.
-    let a1 = encode(&mut a, 1, "agent A private: the launch code is hunter2").await;
-    let a2 = encode(&mut a, 3, "agent A private: meet Priya at noon").await;
+    // Space A stores private memories.
+    let a1 = encode(&mut a, 1, "space A private: the launch code is hunter2").await;
+    let a2 = encode(&mut a, 3, "space A private: meet Priya at noon").await;
 
-    // Agent B stores its own, then recalls under the default scope.
-    let b1 = encode(&mut b, 1, "agent B note: review the design doc").await;
+    // Space B stores its own, then recalls under the default scope.
+    let b1 = encode(&mut b, 1, "space B note: review the design doc").await;
     let b_ids = recall_ids(&mut b, 3, "private launch code doc").await;
 
     // B must not see A's memories...
     assert!(
         !b_ids.contains(&a1) && !b_ids.contains(&a2),
-        "ISOLATION BREACH: agent B's default recall returned agent A's memory_id(s); \
+        "ISOLATION BREACH: space B's default recall returned space A's memory_id(s); \
          got {b_ids:?}, A owns [{a1}, {a2}]"
     );
     // ...and the hits B does get must all be B's own.
     for id in &b_ids {
         assert_eq!(
             *id, b1,
-            "agent B's default recall returned an id it doesn't own: {id} (B owns {b1})"
+            "space B's default recall returned an id it doesn't own: {id} (B owns {b1})"
         );
     }
 
@@ -270,7 +270,7 @@ async fn default_recall_does_not_leak_other_agents_memories() {
     let a_ids = recall_ids(&mut a, 5, "review design doc note").await;
     assert!(
         !a_ids.contains(&b1),
-        "ISOLATION BREACH: agent A's recall returned agent B's memory {b1}; got {a_ids:?}"
+        "ISOLATION BREACH: space A's recall returned space B's memory {b1}; got {a_ids:?}"
     );
 
     server.stop().await;

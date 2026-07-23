@@ -99,11 +99,11 @@ pub struct StatementMention {
     /// precise time to anchor). `None` for non-Event statements.
     #[serde(default)]
     pub event_at_unix_nanos: Option<u64>,
-    /// When true, the subject is the *writing agent itself* — a first-person
+    /// When true, the subject is the *writing space itself* — a first-person
     /// statement ("I prefer dark roast", "yo soy vegetariano", "私は…"). The LLM
     /// tier sets this from meaning, NOT a pronoun list, so it is language-neutral.
-    /// The apply pass routes such statements to the agent's self-entity
-    /// (`EntityId::from(agent_id)`) instead of dropping the first-person surface
+    /// The apply pass routes such statements to the space's self-entity
+    /// (`EntityId::from(space_id)`) instead of dropping the first-person surface
     /// as non-referential. Default false preserves entity-subject behaviour.
     #[serde(default)]
     pub subject_is_self: bool,

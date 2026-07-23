@@ -11,15 +11,15 @@
 
 use std::fmt;
 
-use brain_core::{AgentId, EntityId, MemoryId, RelationId, RequestId, StatementId};
+use brain_core::{SpaceId, EntityId, MemoryId, RelationId, RequestId, StatementId};
 use uuid::Uuid;
 
 /// Idempotency key for a [`super::Write`]. Equality determines
 /// "same write, retried".
 ///
 /// For wire-driven single-op writes the id is derived from the pair
-/// `(request_id, effective_agent)` via [`WriteId::from_request`] — it
-/// deliberately folds the effective agent id into the digest so that
+/// `(request_id, effective_space)` via [`WriteId::from_request`] — it
+/// deliberately folds the effective space id into the digest so that
 /// two different effective identities that happen to reuse the same
 /// client `request_id` land on distinct cache entries. Without this,
 /// `act_as` would let one caller's retried `request_id` collide with a
@@ -39,25 +39,25 @@ impl WriteId {
     }
 
     /// Derive deterministically from a wire `RequestId` scoped to the
-    /// *effective* agent the write runs as. The wire surface promises
+    /// *effective* space the write runs as. The wire surface promises
     /// that retried requests carry the same `request_id`; the writer's
     /// idempotency cache uses the matching `WriteId` to short-circuit
     /// re-application.
     ///
-    /// The digest is `blake3(agent_id_bytes || request_id_bytes)`
-    /// truncated to the leading 16 bytes. Folding the agent id in makes
-    /// the key per-effective-identity: the same `(request_id, agent)`
+    /// The digest is `blake3(space_id_bytes || request_id_bytes)`
+    /// truncated to the leading 16 bytes. Folding the space id in makes
+    /// the key per-effective-identity: the same `(request_id, space)`
     /// always yields the same `WriteId`, while two distinct effective
     /// identities reusing one `request_id` get distinct keys — the
     /// isolation that keeps `act_as` from leaking a cached ack across a
-    /// tenancy boundary. Agent ids are globally-unique 16-byte UUIDs, so
-    /// folding the agent alone suffices (the namespace is derivable from
+    /// tenancy boundary. Space ids are globally-unique 16-byte UUIDs, so
+    /// folding the space alone suffices (the namespace is derivable from
     /// it); there is no need to fold the namespace separately.
     #[inline]
     #[must_use]
-    pub fn from_request(req: RequestId, agent: AgentId) -> Self {
+    pub fn from_request(req: RequestId, space: SpaceId) -> Self {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(agent.0.as_bytes());
+        hasher.update(space.0.as_bytes());
         hasher.update(req.0.as_bytes());
         let digest = hasher.finalize();
         let mut bytes = [0u8; 16];
@@ -144,35 +144,35 @@ mod tests {
     #[test]
     fn write_id_from_request_is_deterministic() {
         let req = RequestId(Uuid::now_v7());
-        let agent = AgentId(Uuid::now_v7());
+        let space = SpaceId(Uuid::now_v7());
         assert_eq!(
-            WriteId::from_request(req, agent),
-            WriteId::from_request(req, agent),
-            "same (request_id, agent) must yield the same WriteId"
+            WriteId::from_request(req, space),
+            WriteId::from_request(req, space),
+            "same (request_id, space) must yield the same WriteId"
         );
     }
 
     #[test]
-    fn write_id_from_request_scopes_by_agent() {
+    fn write_id_from_request_scopes_by_space() {
         let req = RequestId(Uuid::now_v7());
-        let agent_a = AgentId(Uuid::now_v7());
-        let agent_b = AgentId(Uuid::now_v7());
+        let space_a = SpaceId(Uuid::now_v7());
+        let space_b = SpaceId(Uuid::now_v7());
         assert_ne!(
-            WriteId::from_request(req, agent_a),
-            WriteId::from_request(req, agent_b),
-            "same request_id under different effective agents must not collide"
+            WriteId::from_request(req, space_a),
+            WriteId::from_request(req, space_b),
+            "same request_id under different effective spaces must not collide"
         );
     }
 
     #[test]
     fn write_id_from_request_scopes_by_request() {
-        let agent = AgentId(Uuid::now_v7());
+        let space = SpaceId(Uuid::now_v7());
         let req_a = RequestId(Uuid::now_v7());
         let req_b = RequestId(Uuid::now_v7());
         assert_ne!(
-            WriteId::from_request(req_a, agent),
-            WriteId::from_request(req_b, agent),
-            "different request_ids under one agent must not collide"
+            WriteId::from_request(req_a, space),
+            WriteId::from_request(req_b, space),
+            "different request_ids under one space must not collide"
         );
     }
 

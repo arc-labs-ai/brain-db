@@ -175,7 +175,7 @@ impl fmt::Display for EncodePlan {
             ContextResolutionStep::Explicit(id) => {
                 writeln!(f, "{BRANCH}context_resolution: Explicit({id:?})")?;
             }
-            ContextResolutionStep::GetOrCreate { agent_id: _, name } => {
+            ContextResolutionStep::GetOrCreate { space_id: _, name } => {
                 writeln!(
                     f,
                     "{BRANCH}context_resolution: GetOrCreate(\"{}\")",

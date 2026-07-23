@@ -178,7 +178,7 @@ pub struct StatementGetRequest {
     /// Effective identity this get runs as, on behalf of the authenticated
     /// connection principal. `None` (the common case, and omitted on the wire)
     /// means the op runs as the connection's own key-bound identity. The get is
-    /// scoped to the effective `(namespace, agent)` — a foreign tenant's
+    /// scoped to the effective `(namespace, space)` — a foreign tenant's
     /// statement id reads as `NotFound`, never across the boundary.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
@@ -264,7 +264,7 @@ pub struct StatementListRequest {
     /// Effective identity this list runs as, on behalf of the authenticated
     /// connection principal. `None` (the common case, and omitted on the wire)
     /// means the op runs as the connection's own key-bound identity. The list
-    /// is scoped to the effective `(namespace, agent)`, so it enumerates only
+    /// is scoped to the effective `(namespace, space)`, so it enumerates only
     /// that tenant's statements.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,

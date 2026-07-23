@@ -107,7 +107,7 @@ impl From<redb::StorageError> for ApplyError {
 /// Apply one [`Phase`] against the writer's [`WriteTransaction`].
 ///
 /// `write` is the parent [`Write`] — handed in so apply functions
-/// have access to `agent_id`, `started_at_unix_nanos`, and the
+/// have access to `space_id`, `started_at_unix_nanos`, and the
 /// `write_id` for stamping audit metadata.
 ///
 /// The match is exhaustive — adding a `Phase` variant fails to compile

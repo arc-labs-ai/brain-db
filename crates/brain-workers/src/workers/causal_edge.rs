@@ -62,7 +62,7 @@ use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use brain_core::{
-    AgentId, EdgeKind, EdgeKindRef, EntityId, MemoryId, NodeRef, PredicateId, StatementId,
+    SpaceId, EdgeKind, EdgeKindRef, EntityId, MemoryId, NodeRef, PredicateId, StatementId,
 };
 use brain_core::{EvidenceRef, Statement, StatementObject};
 use brain_metadata::schema::predicate::predicate_lookup_by_qname;
@@ -346,7 +346,7 @@ async fn do_causal_edge_cycle(
             })
             .collect();
         let request_hash = hash_causal_batch(&pairs);
-        let write = Write::from_phases(WriteId::new(), AgentId::default(), phases)
+        let write = Write::from_phases(WriteId::new(), SpaceId::default(), phases)
             .with_request_hash(request_hash);
         let real_writer = ctx
             .ops
@@ -435,7 +435,7 @@ fn collect_pairs_for_statement(
         }
     };
 
-    // The processed statement's `(namespace, agent)` scope, read from
+    // The processed statement's `(namespace, space)` scope, read from
     // its row, so the related-statement walk stays within this tenant.
     let stmt_scope = {
         use brain_metadata::tables::statement::{StatementMetadata, STATEMENTS_TABLE};
@@ -444,7 +444,7 @@ fn collect_pairs_for_statement(
             .and_then(|t| {
                 t.get(&sid.to_bytes()).ok().flatten().map(|g| {
                     let m: StatementMetadata = g.value();
-                    brain_metadata::RowScope::from_bytes(m.namespace_id, m.agent_id_bytes)
+                    brain_metadata::RowScope::from_bytes(m.namespace_id, m.space_id_bytes)
                 })
             })
             .unwrap_or_else(|| {

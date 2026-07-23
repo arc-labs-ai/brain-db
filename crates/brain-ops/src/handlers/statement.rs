@@ -55,9 +55,9 @@ const PREDICATE_QNAME_MAX: usize = 96;
 const LIST_LIMIT_MAX: u32 = 1000;
 
 /// Whether statement `id`'s row belongs to the caller's `(namespace,
-/// agent)` scope. `statement_get` returns a brain-core `Statement` with
+/// space)` scope. `statement_get` returns a brain-core `Statement` with
 /// the scope dropped, so the tenant wall is enforced here by re-reading
-/// the row's `namespace_id` / `agent_id_bytes` from `STATEMENTS_TABLE`.
+/// the row's `namespace_id` / `space_id_bytes` from `STATEMENTS_TABLE`.
 /// Fail-closed: a missing row or read error denies.
 fn statement_id_in_caller_scope(ctx: &OpsContext, id: StatementId) -> bool {
     use brain_metadata::tables::statement::{StatementMetadata, STATEMENTS_TABLE};
@@ -71,7 +71,7 @@ fn statement_id_in_caller_scope(ctx: &OpsContext, id: StatementId) -> bool {
     match row {
         Some(m) => {
             m.namespace_id == ctx.executor.caller_namespace.raw()
-                && m.agent_id_bytes == <[u8; 16]>::from(ctx.executor.caller_agent)
+                && m.space_id_bytes == <[u8; 16]>::from(ctx.executor.caller_space)
         }
         None => false,
     }
@@ -169,12 +169,12 @@ pub async fn handle_statement_create(
     // + (optional) IMPLICIT_PREDICATE flag stamp in one wtxn.
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
-        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_statement_create_request(&req);
 
     let statement_value = build_statement_from_create(&req, predicate_id, now, kind)?;
     let phase = build_upsert_statement_phase(&statement_value, intern_hint);
-    let write = Write::single(write_id, ctx.executor.caller_agent, phase)
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
@@ -288,7 +288,7 @@ pub async fn handle_statement_get(
         })?;
 
     // Tenant wall (unconditional): a statement named by a foreign
-    // `(namespace, agent)`'s id reads as NotFound, indistinguishable
+    // `(namespace, space)`'s id reads as NotFound, indistinguishable
     // from a genuinely absent row.
     if !statement_id_in_caller_scope(ctx, id) {
         return Err(OpError::NotFound {
@@ -401,7 +401,7 @@ pub async fn handle_statement_supersede(
 
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
-        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_statement_supersede_request(&req);
 
     let phase = Phase::Supersede {
@@ -409,7 +409,7 @@ pub async fn handle_statement_supersede(
         replacement: SupersedeReplacement::Statement(Box::new(new_statement)),
         at_unix_nanos: now,
     };
-    let write = Write::single(write_id, ctx.executor.caller_agent, phase)
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
@@ -485,7 +485,7 @@ pub async fn handle_statement_tombstone(
 
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
-        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_statement_tombstone_request(&req);
 
     let phase = Phase::Tombstone {
@@ -493,7 +493,7 @@ pub async fn handle_statement_tombstone(
         reason: reason.as_u8(),
         at_unix_nanos: now,
     };
-    let write = Write::single(write_id, ctx.executor.caller_agent, phase)
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
@@ -560,7 +560,7 @@ pub async fn handle_statement_retract(
     // after the grace period.
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
-        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_statement_retract_request(&req);
 
     let phase = Phase::Tombstone {
@@ -568,7 +568,7 @@ pub async fn handle_statement_retract(
         reason: TombstoneReason::Retract.as_u8(),
         at_unix_nanos: now,
     };
-    let write = Write::single(write_id, ctx.executor.caller_agent, phase)
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
@@ -630,7 +630,7 @@ pub async fn handle_statement_history(
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
         let chain = statement_history(
             &rtxn,
-            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_agent),
+            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space),
             anchor,
         )
         .map_err(OpError::from)?;
@@ -750,7 +750,7 @@ pub async fn handle_statement_list(
             limit: req.limit as usize,
         };
         let scope =
-            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_agent);
+            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
         let mut rows = statement_list(&rtxn, scope, &filter).map_err(OpError::from)?;
 
         // Wire-level filters not pushed into statement_list.

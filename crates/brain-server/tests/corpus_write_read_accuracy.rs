@@ -4,7 +4,7 @@
 //! classifier + gpt-4o-mini LLM extractor tiers, **rerank OFF** on purpose:
 //! grounded memory must be accurate without a cross-encoder), ENCODEs 10
 //! deliberately-hard memories over the wire, waits for the async extraction
-//! workers to drain, then — over the SAME agent connection — issues a battery
+//! workers to drain, then — over the SAME space connection — issues a battery
 //! of RECALL reads and grades them against an accuracy-first invariant:
 //!
 //! Recall runs behind a smart router: it retrieves over the unified path
@@ -266,8 +266,8 @@ async fn recall(client: &mut TcpStream, stream_id: u32, cue: &str) -> RecallResp
         cue_text: cue.into(),
         // Empty subject: Brain resolves subject + relation from the cue
         // alone (the read-path mandate). First-person cues bind to the
-        // caller's agent self-entity — which is why the read MUST run on
-        // the same agent the corpus was written under.
+        // caller's space self-entity — which is why the read MUST run on
+        // the same space the corpus was written under.
         subject_name: String::new(),
         max_results: 10,
         confidence_threshold: 0.0,
@@ -281,8 +281,8 @@ async fn recall(client: &mut TcpStream, stream_id: u32, cue: &str) -> RecallResp
         include_text: true,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id: None,
-        // Empty + include_other_agents=false ⇒ server scopes to the
-        // calling connection's agent (the [7;16] write agent).
+        // Empty + include_other_spaces=false ⇒ server scopes to the
+        // calling connection's space (the [7;16] write space).
         act_as: None,
     };
     send_frame(
@@ -452,9 +452,9 @@ async fn corpus_write_then_read_is_accurate() {
     assert!(total > 0, "extraction produced no typed-graph items");
 
     // -----------------------------------------------------------------
-    // READ PHASE — same agent connection (writes are owned by [7;16];
-    // first-person recall resolves the caller's agent self-entity, so the
-    // read MUST stay on this connection / agent).
+    // READ PHASE — same space connection (writes are owned by [7;16];
+    // first-person recall resolves the caller's space self-entity, so the
+    // read MUST stay on this connection / space).
     // -----------------------------------------------------------------
     read_phase(&mut client).await;
 

@@ -226,7 +226,7 @@ pub async fn execute_reason(
     // `executor::analogical`). One fresh, deterministically seeded
     // `Codebook` per call, dropped at the end of this function; never
     // a shared/global mutable singleton.
-    let scope = RowScope::new(ctx.caller_namespace, ctx.caller_agent);
+    let scope = RowScope::new(ctx.caller_namespace, ctx.caller_space);
     let analogical_rtxn = ctx.metadata.read_txn().ok();
     let observation_triple: Option<EvidenceTriple> =
         analogical_rtxn

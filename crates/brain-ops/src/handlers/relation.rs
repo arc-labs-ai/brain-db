@@ -58,9 +58,9 @@ const LIST_LIMIT_MAX: u32 = 1000;
 const TRAVERSE_MAX_NODES: u32 = 1000;
 
 /// Whether relation `id`'s sidecar row belongs to the caller's
-/// `(namespace, agent)` scope. `relation_get` returns a brain-core
+/// `(namespace, space)` scope. `relation_get` returns a brain-core
 /// `Relation` with the scope dropped, so the tenant wall is enforced
-/// here by re-reading the sidecar's `namespace_id` / `agent_id_bytes`.
+/// here by re-reading the sidecar's `namespace_id` / `space_id_bytes`.
 /// Fail-closed: a missing row or read error denies.
 fn relation_id_in_caller_scope(ctx: &OpsContext, id: RelationId) -> bool {
     use brain_metadata::tables::relation::{RelationMetadata, RELATION_METADATA_TABLE};
@@ -74,7 +74,7 @@ fn relation_id_in_caller_scope(ctx: &OpsContext, id: RelationId) -> bool {
     match row {
         Some(m) => {
             m.namespace_id == ctx.executor.caller_namespace.raw()
-                && m.agent_id_bytes == <[u8; 16]>::from(ctx.executor.caller_agent)
+                && m.space_id_bytes == <[u8; 16]>::from(ctx.executor.caller_space)
         }
         None => false,
     }
@@ -183,7 +183,7 @@ pub async fn handle_relation_create(
 
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
-        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_relation_create_request(&req);
     let phase = Phase::UpsertRelation {
         id: new_id,
@@ -200,7 +200,7 @@ pub async fn handle_relation_create(
         valid_to_unix_nanos: valid_to_phase,
         relation_type_intern_hint: intern_hint,
     };
-    let write = Write::single(write_id, ctx.executor.caller_agent, phase)
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
@@ -260,7 +260,7 @@ pub async fn handle_relation_get(
         })?;
 
     // Tenant wall (unconditional): a relation named by a foreign
-    // `(namespace, agent)`'s id reads as NotFound.
+    // `(namespace, space)`'s id reads as NotFound.
     if !relation_id_in_caller_scope(ctx, id) {
         return Err(OpError::NotFound {
             what: "relation",
@@ -361,14 +361,14 @@ pub async fn handle_relation_supersede(
 
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
-        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_relation_supersede_request(&req);
     let phase = Phase::Supersede {
         target: SupersedeTarget::Relation(old_id),
         replacement: SupersedeReplacement::Relation(Box::new(new_relation)),
         at_unix_nanos: now,
     };
-    let write = Write::single(write_id, ctx.executor.caller_agent, phase)
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
@@ -438,7 +438,7 @@ pub async fn handle_relation_tombstone(
 
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
-        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_relation_tombstone_request(&req);
     let phase = Phase::Tombstone {
         target: TombstoneTarget::Relation(id),
@@ -448,7 +448,7 @@ pub async fn handle_relation_tombstone(
         reason: 0,
         at_unix_nanos: now,
     };
-    let write = Write::single(write_id, ctx.executor.caller_agent, phase)
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
@@ -587,7 +587,7 @@ fn run_list(
         limit: limit as usize,
     };
     let scope =
-        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_agent);
+        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
     let mut rows = if from_side {
         relation_list_from(&rtxn, scope, entity, &filter).map_err(map_relation_op_error)?
     } else {
@@ -678,7 +678,7 @@ pub async fn handle_relation_traverse(
     };
     let paths = traverse(
         &rtxn,
-        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_agent),
+        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space),
         EntityId::from(req.start_entity),
         &type_ids,
         direction,

@@ -16,7 +16,7 @@
 use crate::impl_redb_rkyv_value;
 use crate::tables::scope::RowScope;
 use brain_core::{
-    AgentId, EntityId, EvidenceOverflowId, ExtractorId, MemoryId, NamespaceId, PredicateId,
+    SpaceId, EntityId, EvidenceOverflowId, ExtractorId, MemoryId, NamespaceId, PredicateId,
     StatementId, StatementKind,
 };
 use brain_core::{
@@ -31,15 +31,15 @@ use smallvec::SmallVec;
 // ---------------------------------------------------------------------------
 //
 // Every secondary index carries a LEADING `(namespace_id,
-// agent_id_bytes)` scope prefix so a range scan for one `(namespace,
-// agent)` can physically never traverse another tenant's rows. The
+// space_id_bytes)` scope prefix so a range scan for one `(namespace,
+// space)` can physically never traverse another tenant's rows. The
 // primary `STATEMENTS_TABLE` stays keyed by `StatementId`; the scope
 // lives on the row.
 
 pub const STATEMENTS_TABLE: TableDefinition<'static, [u8; 16], StatementMetadata> =
     TableDefinition::new("statements");
 
-/// `(namespace_id, agent_id_bytes, EntityId, kind, predicate_id,
+/// `(namespace_id, space_id_bytes, EntityId, kind, predicate_id,
 /// is_current, statement_id)` → `StatementId.to_bytes()`.
 ///
 /// Multi-value index: the statement id is appended to the key so every
@@ -56,7 +56,7 @@ pub const STATEMENTS_BY_SUBJECT_TABLE: TableDefinition<
     [u8; 16],
 > = TableDefinition::new("statements_by_subject");
 
-/// `(namespace_id, agent_id_bytes, predicate_id, kind, confidence_bucket,
+/// `(namespace_id, space_id_bytes, predicate_id, kind, confidence_bucket,
 /// statement_id)` → `StatementId.to_bytes()`.
 /// `confidence_bucket` is `floor(confidence * 10)` clamped to `0..=10`.
 /// The trailing statement_id keeps the index multi-value (two statements
@@ -68,7 +68,7 @@ pub const STATEMENTS_BY_PREDICATE_TABLE: TableDefinition<
     [u8; 16],
 > = TableDefinition::new("statements_by_predicate");
 
-/// `(namespace_id, agent_id_bytes, EntityId, kind, statement_id)` →
+/// `(namespace_id, space_id_bytes, EntityId, kind, statement_id)` →
 /// `StatementId.to_bytes()`. Walk this when answering "what statements have
 /// X as object?". The trailing statement_id keeps the index multi-value.
 #[allow(clippy::type_complexity)]
@@ -78,7 +78,7 @@ pub const STATEMENTS_BY_OBJECT_ENTITY_TABLE: TableDefinition<
     [u8; 16],
 > = TableDefinition::new("statements_by_object_entity");
 
-/// `(namespace_id, agent_id_bytes, event_at_unix_nanos,
+/// `(namespace_id, space_id_bytes, event_at_unix_nanos,
 /// subject_entity_bytes, statement_id)` → `StatementId.to_bytes()`.
 /// Time-range queries scan a prefix; the EntityId + statement_id
 /// disambiguate same-time events for the same subject.
@@ -89,7 +89,7 @@ pub const STATEMENTS_BY_EVENT_TIME_TABLE: TableDefinition<
     [u8; 16],
 > = TableDefinition::new("statements_by_event_time");
 
-/// `(namespace_id, agent_id_bytes, MemoryId, StatementId)` → `()`. Reverse
+/// `(namespace_id, space_id_bytes, MemoryId, StatementId)` → `()`. Reverse
 /// index for FORGET cascade.
 #[allow(clippy::type_complexity)]
 pub const STATEMENTS_BY_EVIDENCE_TABLE: TableDefinition<
@@ -98,7 +98,7 @@ pub const STATEMENTS_BY_EVIDENCE_TABLE: TableDefinition<
     (),
 > = TableDefinition::new("statements_by_evidence");
 
-/// `(namespace_id, agent_id_bytes, chain_root, version)` →
+/// `(namespace_id, space_id_bytes, chain_root, version)` →
 /// `StatementId.to_bytes()`. Walk this to reconstruct the supersession
 /// chain of a statement.
 #[allow(clippy::type_complexity)]
@@ -365,11 +365,11 @@ pub fn confidence_bucket(c: f32) -> u8 {
 pub struct StatementMetadata {
     pub statement_id_bytes: [u8; 16],
     /// Owning namespace (tenant) — the outer half of the
-    /// `(namespace, agent)` scope key. Required; stamped from the
+    /// `(namespace, space)` scope key. Required; stamped from the
     /// caller's scope at create time (fail-closed by construction).
     pub namespace_id: u32,
-    /// Owning agent (app) — the inner half of the scope key.
-    pub agent_id_bytes: [u8; 16],
+    /// Owning space (app) — the inner half of the scope key.
+    pub space_id_bytes: [u8; 16],
     pub chain_root_bytes: [u8; 16],
     pub version: u32,
     /// Fact=0 / Preference=1 / Event=2 per `brain_core::StatementKind`.
@@ -455,16 +455,16 @@ impl StatementMetadata {
         NamespaceId::from(self.namespace_id)
     }
 
-    /// The owning agent of this statement.
+    /// The owning space of this statement.
     #[must_use]
-    pub fn agent_id(&self) -> AgentId {
-        AgentId::from(self.agent_id_bytes)
+    pub fn space_id(&self) -> SpaceId {
+        SpaceId::from(self.space_id_bytes)
     }
 
-    /// The `(namespace, agent)` scope this statement belongs to.
+    /// The `(namespace, space)` scope this statement belongs to.
     #[must_use]
     pub fn scope(&self) -> RowScope {
-        RowScope::from_bytes(self.namespace_id, self.agent_id_bytes)
+        RowScope::from_bytes(self.namespace_id, self.space_id_bytes)
     }
 
     #[must_use]
@@ -626,7 +626,7 @@ pub fn metadata_from_statement(s: &Statement, scope: RowScope) -> StatementMetad
     StatementMetadata {
         statement_id_bytes: s.id.to_bytes(),
         namespace_id: scope.namespace_id,
-        agent_id_bytes: scope.agent_id_bytes,
+        space_id_bytes: scope.space_id_bytes,
         chain_root_bytes: s.chain_root.to_bytes(),
         version: s.version,
         kind: s.kind.as_u8(),

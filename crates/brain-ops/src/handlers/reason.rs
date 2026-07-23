@@ -60,7 +60,7 @@ pub async fn handle_reason(
         frames.push(step_to_wire(step, &claim));
     }
     // "No support, no contradiction" case: the base set was empty (the
-    // agent has no memory near the query). The executor emits no step,
+    // space has no memory near the query). The executor emits no step,
     // but the contract still returns one inference echoing the claim with
     // empty evidence and confidence 0.0 — the client reads that as "I
     // don't know", not an absent answer.

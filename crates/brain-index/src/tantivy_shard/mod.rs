@@ -137,9 +137,9 @@ pub fn memory_text_schema() -> Schema {
     // retriever surfaces it in `RankedItem.id`.
     sb.add_bytes_field("memory_id", INDEXED | STORED);
     sb.add_text_field("text", TEXT);
-    // 16-byte agent UUID — bytes field, indexed for exact-match
+    // 16-byte space UUID — bytes field, indexed for exact-match
     // filter and stored so retrieval round-trips it.
-    sb.add_bytes_field("agent_id", INDEXED | STORED);
+    sb.add_bytes_field("space_id", INDEXED | STORED);
     sb.add_u64_field("kind", INDEXED);
     sb.add_u64_field("created_at", INDEXED | FAST);
     // Context (session/conversation) id — the read-path scope tag that

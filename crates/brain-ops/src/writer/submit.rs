@@ -418,7 +418,7 @@ impl RealWriterHandle {
                 if super::try_enqueue_temporal_edge(
                     self,
                     *id,
-                    write.agent_id,
+                    write.space_id,
                     *context,
                     *created_at_unix_nanos,
                     vector.as_ref(),
@@ -463,7 +463,7 @@ impl RealWriterHandle {
                         .dispatch(crate::index::text_indexer::MemoryTextOp::Upsert {
                             id: *id,
                             text: text.clone(),
-                            agent: write.agent_id,
+                            space: write.space_id,
                             kind: *kind,
                             created_at_unix_ms: *created_at_unix_nanos / 1_000_000,
                             context: context.raw(),
@@ -623,8 +623,8 @@ async fn wal_append_for_write(
         return Ok(None);
     };
 
-    let agent_bytes: [u8; 16] = write.agent_id.into();
-    let agent_id_lo64 = u64::from_be_bytes(agent_bytes[8..16].try_into().unwrap_or([0; 8]));
+    let space_bytes: [u8; 16] = write.space_id.into();
+    let space_id_lo64 = u64::from_be_bytes(space_bytes[8..16].try_into().unwrap_or([0; 8]));
 
     // Partition phases into (mapped payload) and (skipped). Unmapped
     // phases get a debug trace so degraded-durability writes are visible
@@ -660,7 +660,7 @@ async fn wal_append_for_write(
             Lsn(0),
             /* flags */ 0,
             started_at_unix_nanos,
-            agent_id_lo64,
+            space_id_lo64,
             &mapped[0],
         )]
     } else {
@@ -679,7 +679,7 @@ async fn wal_append_for_write(
             Lsn(0),
             0,
             started_at_unix_nanos,
-            agent_id_lo64,
+            space_id_lo64,
             &begin,
         ));
         for payload in &mapped {
@@ -687,7 +687,7 @@ async fn wal_append_for_write(
                 Lsn(0),
                 0,
                 started_at_unix_nanos,
-                agent_id_lo64,
+                space_id_lo64,
                 payload,
             ));
         }
@@ -695,7 +695,7 @@ async fn wal_append_for_write(
             Lsn(0),
             0,
             started_at_unix_nanos,
-            agent_id_lo64,
+            space_id_lo64,
             &commit,
         ));
         batch
@@ -842,7 +842,7 @@ fn phase_to_envelope(
             stage_kind: None,
             stage_outcome: None,
             stage_payload: None,
-            agent_id: write.agent_id,
+            space_id: write.space_id,
         }),
 
         Phase::Tombstone { target, .. } => match target {
@@ -860,7 +860,7 @@ fn phase_to_envelope(
                 stage_kind: None,
                 stage_outcome: None,
                 stage_payload: None,
-                agent_id: write.agent_id,
+                space_id: write.space_id,
             }),
             // Typed-graph tombstones publish through the typed-graph-event
             // path (emit_graph_event), not the memory subscribe bus.
@@ -898,7 +898,7 @@ fn phase_to_envelope(
             stage_kind: None,
             stage_outcome: None,
             stage_payload: None,
-            agent_id: write.agent_id,
+            space_id: write.space_id,
         }),
 
         Phase::Unlink { from, to, kind, .. } => Some(EventEnvelope {
@@ -923,7 +923,7 @@ fn phase_to_envelope(
             stage_kind: None,
             stage_outcome: None,
             stage_payload: None,
-            agent_id: write.agent_id,
+            space_id: write.space_id,
         }),
 
         // typed-graph phases publish through the typed-graph-event channel
@@ -989,7 +989,7 @@ mod tests {
     use super::*;
     use crate::write::{Phase, Write, WriteId};
     use crate::writer::RealWriterHandle;
-    use brain_core::{AgentId, ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
+    use brain_core::{SpaceId, ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
     use brain_embed::VECTOR_DIM;
     use brain_index::{IndexParams, SharedHnsw};
     use brain_metadata::tables::edge::zero_disambiguator;
@@ -1029,7 +1029,7 @@ mod tests {
             disambiguator: zero_disambiguator(),
             created_at_unix_nanos: 1_700_000_000_000,
         };
-        let write = Write::single(WriteId::new(), AgentId::default(), phase);
+        let write = Write::single(WriteId::new(), SpaceId::default(), phase);
         let ack = writer.submit(write).await.expect("submit");
         assert_eq!(ack.phase_acks.len(), 1);
         assert!(matches!(ack.single_phase(), PhaseAck::Linked));
@@ -1049,7 +1049,7 @@ mod tests {
             disambiguator: zero_disambiguator(),
             created_at_unix_nanos: 1_700_000_000_000,
         };
-        let write = Write::single(id, AgentId::default(), phase);
+        let write = Write::single(id, SpaceId::default(), phase);
         let first = writer.submit(write.clone()).await.expect("first submit");
         let second = writer.submit(write).await.expect("second submit");
         assert_eq!(first.write_id, second.write_id);
@@ -1077,7 +1077,7 @@ mod tests {
             disambiguator: zero_disambiguator(),
             created_at_unix_nanos: 1_700_000_000_000,
         };
-        let write = Write::single(id, AgentId::default(), phase);
+        let write = Write::single(id, SpaceId::default(), phase);
         let _ = writer.submit(write.clone()).await.expect("first submit");
         let _ = writer.submit(write).await.expect("replay");
 
@@ -1100,7 +1100,7 @@ mod tests {
     #[tokio::test]
     async fn submit_multi_phase_applies_all_atomically() {
         let (_dir, writer) = build_writer();
-        let agent = AgentId::new();
+        let space = SpaceId::new();
 
         let upsert = Phase::UpsertMemory {
             id: MemoryId::pack(0, 1, 0),
@@ -1127,7 +1127,7 @@ mod tests {
             created_at_unix_nanos: 1_700_000_000_000,
         };
 
-        let write = Write::from_phases(WriteId::new(), agent, vec![upsert, link]);
+        let write = Write::from_phases(WriteId::new(), space, vec![upsert, link]);
         let ack = writer.submit(write).await.expect("submit");
         assert_eq!(ack.phase_acks.len(), 2);
         assert!(matches!(ack.phase_acks[0], PhaseAck::UpsertedMemory(_)));
@@ -1155,7 +1155,7 @@ mod tests {
             disambiguator: zero_disambiguator(),
             created_at_unix_nanos: 1_700_000_000_000,
         };
-        let write = Write::single(WriteId::new(), AgentId::default(), phase);
+        let write = Write::single(WriteId::new(), SpaceId::default(), phase);
         writer.submit(write).await.expect("submit");
 
         // The bus minted at least one LSN — an event was published.
@@ -1188,7 +1188,7 @@ mod tests {
             occurred_at_unix_nanos: None,
             deduplicate: false,
         };
-        let write = Write::single(WriteId::new(), AgentId::new(), phase);
+        let write = Write::single(WriteId::new(), SpaceId::new(), phase);
         writer.submit(write).await.expect("submit");
 
         let lsn_after = bus.current_lsn();
@@ -1219,7 +1219,7 @@ mod tests {
             occurred_at_unix_nanos: None,
             deduplicate: false,
         };
-        let write = Write::single(WriteId::new(), AgentId::new(), phase);
+        let write = Write::single(WriteId::new(), SpaceId::new(), phase);
         writer.submit(write).await.expect("submit");
         assert!(
             shared.contains(id),
@@ -1247,7 +1247,7 @@ mod tests {
             deduplicate: false,
         };
         writer
-            .submit(Write::single(WriteId::new(), AgentId::new(), upsert))
+            .submit(Write::single(WriteId::new(), SpaceId::new(), upsert))
             .await
             .unwrap();
         assert!(!shared.is_tombstoned(id));
@@ -1262,7 +1262,7 @@ mod tests {
             at_unix_nanos: 1_700_000_001_000,
         };
         writer
-            .submit(Write::single(WriteId::new(), AgentId::new(), tomb))
+            .submit(Write::single(WriteId::new(), SpaceId::new(), tomb))
             .await
             .expect("tombstone submit");
         assert!(
@@ -1292,7 +1292,7 @@ mod tests {
         let rtxn = metadata.read_txn().expect("read_txn");
         for table_label in [
             "MEMORIES",
-            "MEMORIES_BY_AGENT_TIMELINE",
+            "MEMORIES_BY_SPACE_TIMELINE",
             "IDEMPOTENCY",
             "EDGES",
             "EDGES_REVERSE",
@@ -1303,8 +1303,8 @@ mod tests {
                 "MEMORIES" => rtxn
                     .open_table(brain_metadata::tables::memory::MEMORIES_TABLE)
                     .map(|_| ()),
-                "MEMORIES_BY_AGENT_TIMELINE" => rtxn
-                    .open_table(brain_metadata::tables::memory::MEMORIES_BY_AGENT_TIMELINE_TABLE)
+                "MEMORIES_BY_SPACE_TIMELINE" => rtxn
+                    .open_table(brain_metadata::tables::memory::MEMORIES_BY_SPACE_TIMELINE_TABLE)
                     .map(|_| ()),
                 "IDEMPOTENCY" => rtxn
                     .open_table(brain_metadata::tables::idempotency::IDEMPOTENCY_TABLE)
@@ -1344,7 +1344,7 @@ mod tests {
             disambiguator: zero_disambiguator(),
             created_at_unix_nanos: 1_700_000_000_000,
         };
-        let write = Write::single(WriteId::new(), AgentId::default(), phase);
+        let write = Write::single(WriteId::new(), SpaceId::default(), phase);
         writer.submit(write).await.expect("submit");
         // No bus → no observable side-effect besides the redb row.
     }
@@ -1438,7 +1438,7 @@ mod tests {
             created_at_unix_nanos: 0,
         };
         let phases = vec![mk_link(1, 2), mk_link(2, 3), mk_link(3, 4)];
-        let write = Write::from_phases(WriteId::new(), AgentId::default(), phases);
+        let write = Write::from_phases(WriteId::new(), SpaceId::default(), phases);
         let ack = writer.submit(write).await.expect("submit");
         assert!(ack.lsn_first.raw() >= 1, "ack should carry a real LSN");
 
@@ -1495,7 +1495,7 @@ mod tests {
 
         let write = Write::from_phases(
             WriteId::new(),
-            AgentId::default(),
+            SpaceId::default(),
             vec![upsert, reclaim, link],
         );
         // The unmapped ReclaimSlots phase is skipped at the WAL layer;
@@ -1540,7 +1540,7 @@ mod tests {
 
         let write = Write::from_phases(
             WriteId::new(),
-            AgentId::default(),
+            SpaceId::default(),
             vec![reclaim, update_embedding],
         );
         // The phases will fail in apply (no rows to update), but the WAL
@@ -1596,7 +1596,7 @@ mod tests {
             created_at_unix_nanos: 1_700_000_000_000,
         };
         let phases = vec![upsert, mk_link(1, 1), mk_link(1, 1), mk_link(1, 1)];
-        let write = Write::from_phases(WriteId::new(), AgentId::default(), phases);
+        let write = Write::from_phases(WriteId::new(), SpaceId::default(), phases);
         let _ = writer.submit(write).await;
 
         // One batched submission, zero single-record submissions.
@@ -1647,7 +1647,7 @@ mod tests {
             disambiguator: zero_disambiguator(),
             created_at_unix_nanos: 0,
         };
-        let write = Write::single(WriteId::new(), AgentId::default(), phase);
+        let write = Write::single(WriteId::new(), SpaceId::default(), phase);
         let _ = writer.submit(write).await;
 
         assert_eq!(sink.append_many_calls(), 1);
@@ -1723,7 +1723,7 @@ mod tests {
                 created_at_unix_nanos: 1_700_000_000_000,
             };
             let write =
-                Write::single(write_id, AgentId::default(), phase).with_request_hash(request_hash);
+                Write::single(write_id, SpaceId::default(), phase).with_request_hash(request_hash);
             writer.submit(write).await.expect("first submit")
             // writer drops here; redb file closes.
         };
@@ -1749,7 +1749,7 @@ mod tests {
             created_at_unix_nanos: 1_700_000_000_000,
         };
         let write =
-            Write::single(write_id, AgentId::default(), phase).with_request_hash(request_hash);
+            Write::single(write_id, SpaceId::default(), phase).with_request_hash(request_hash);
         let second_ack = writer2.submit(write).await.expect("replay submit");
 
         assert_eq!(first_ack.write_id, second_ack.write_id);
@@ -1792,7 +1792,7 @@ mod tests {
                 created_at_unix_nanos: 1_700_000_000_000,
             };
             let write =
-                Write::single(write_id, AgentId::default(), phase).with_request_hash(hash_a);
+                Write::single(write_id, SpaceId::default(), phase).with_request_hash(hash_a);
             writer.submit(write).await.expect("first submit");
         }
 
@@ -1807,7 +1807,7 @@ mod tests {
             disambiguator: zero_disambiguator(),
             created_at_unix_nanos: 1_700_000_000_000,
         };
-        let write = Write::single(write_id, AgentId::default(), phase).with_request_hash(hash_b);
+        let write = Write::single(write_id, SpaceId::default(), phase).with_request_hash(hash_b);
         let err = writer2.submit(write).await.expect_err("must conflict");
         assert!(
             matches!(err, WriterError::Conflict(_)),
@@ -1844,7 +1844,7 @@ mod tests {
                 created_at_unix_nanos: 1_700_000_000_000,
             };
             let write =
-                Write::single(write_id, AgentId::default(), phase).with_request_hash(request_hash);
+                Write::single(write_id, SpaceId::default(), phase).with_request_hash(request_hash);
             let ack = writer.submit(write).await.expect("first submit");
             assert_eq!(
                 ack.committed_at_unix_nanos, t0,
@@ -1870,7 +1870,7 @@ mod tests {
             created_at_unix_nanos: 1_700_000_000_000,
         };
         let write =
-            Write::single(write_id, AgentId::default(), phase).with_request_hash(request_hash);
+            Write::single(write_id, SpaceId::default(), phase).with_request_hash(request_hash);
         let second_ack = writer2.submit(write).await.expect("re-executed submit");
         assert_ne!(
             second_ack.committed_at_unix_nanos, first_committed_at,

@@ -26,14 +26,14 @@ pub async fn handle_link(req: LinkRequest, ctx: &OpsContext) -> Result<LinkRespo
 
     let real_writer = downcast_writer(ctx)?;
     let write_id =
-        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_link_request(&LinkOp {
         request_id: RequestId::from(req.request_id),
         source,
         target,
         kind,
         weight: req.weight,
-        agent_id: ctx.executor.caller_agent,
+        space_id: ctx.executor.caller_space,
     });
 
     // Idempotency replay short-circuit + conflict detection.
@@ -90,7 +90,7 @@ pub async fn handle_link(req: LinkRequest, ctx: &OpsContext) -> Result<LinkRespo
         created_at_unix_nanos: created_at,
     };
     let write =
-        Write::single(write_id, ctx.executor.caller_agent, phase).with_request_hash(request_hash);
+        Write::single(write_id, ctx.executor.caller_space, phase).with_request_hash(request_hash);
     let ack = real_writer
         .submit(write)
         .await
@@ -181,13 +181,13 @@ pub async fn handle_unlink(
 
     let real_writer = downcast_writer(ctx)?;
     let write_id =
-        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_agent);
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_unlink_request(&UnlinkOp {
         request_id: RequestId::from(req.request_id),
         source,
         target,
         kind,
-        agent_id: ctx.executor.caller_agent,
+        space_id: ctx.executor.caller_space,
     });
 
     match real_writer.idempotency_lookup(write_id, Some(request_hash)) {
@@ -224,7 +224,7 @@ pub async fn handle_unlink(
         disambiguator: brain_metadata::tables::edge::zero_disambiguator(),
     };
     let write =
-        Write::single(write_id, ctx.executor.caller_agent, phase).with_request_hash(request_hash);
+        Write::single(write_id, ctx.executor.caller_space, phase).with_request_hash(request_hash);
     let ack = real_writer
         .submit(write)
         .await
@@ -281,7 +281,7 @@ async fn handle_link_in_txn(
         target,
         kind,
         weight: req.weight,
-        agent_id: ctx.executor.caller_agent,
+        space_id: ctx.executor.caller_space,
     };
     let request_hash = hash_link_request(&op);
 
@@ -408,7 +408,7 @@ async fn handle_link_in_txn(
         request_id: req.request_id,
         request_hash,
         created_at_unix_nanos: created_at,
-        agent_id: ctx.executor.caller_agent,
+        space_id: ctx.executor.caller_space,
     };
     ctx.txn_store.with_buffer(txn_id, |buf| {
         buf.links.push(buffered);
@@ -454,7 +454,7 @@ async fn handle_unlink_in_txn(
         source,
         target,
         kind,
-        agent_id: ctx.executor.caller_agent,
+        space_id: ctx.executor.caller_space,
     };
     let request_hash = hash_unlink_request(&op);
 
@@ -540,7 +540,7 @@ async fn handle_unlink_in_txn(
         request_id: req.request_id,
         request_hash,
         created_at_unix_nanos: created_at,
-        agent_id: ctx.executor.caller_agent,
+        space_id: ctx.executor.caller_space,
     };
     ctx.txn_store.with_buffer(txn_id, |buf| {
         buf.unlinks.push(buffered);

@@ -3,13 +3,13 @@
 //!
 //! - [`CONTEXTS_TABLE`] — `ContextId` → [`ContextMetadata`]: the full
 //!   record, looked up by ID.
-//! - [`CONTEXT_NAMES_TABLE`] — `(AgentId, &str)` → `ContextId`: the
-//!   name index, scoped to agent.
-//! - [`AGENT_CONTEXTS_TABLE`] — `(AgentId, ContextId)` → `()`: the
-//!   membership index, supporting "list contexts for agent A" via a
+//! - [`CONTEXT_NAMES_TABLE`] — `(SpaceId, &str)` → `ContextId`: the
+//!   name index, scoped to space.
+//! - [`SPACE_CONTEXTS_TABLE`] — `(SpaceId, ContextId)` → `()`: the
+//!   membership index, supporting "list contexts for space A" via a
 //!   prefix range scan.
 
-use brain_core::{AgentId, ContextId};
+use brain_core::{SpaceId, ContextId};
 use redb::TableDefinition;
 
 // ---------------------------------------------------------------------------
@@ -20,14 +20,14 @@ use redb::TableDefinition;
 pub const CONTEXTS_TABLE: TableDefinition<'static, u64, ContextMetadata> =
     TableDefinition::new("contexts");
 
-/// `(AgentId, name)` → `ContextId`. Index for name-based lookup.
+/// `(SpaceId, name)` → `ContextId`. Index for name-based lookup.
 pub const CONTEXT_NAMES_TABLE: TableDefinition<'static, (&'static [u8; 16], &'static str), u64> =
     TableDefinition::new("context_names");
 
-/// `(AgentId, ContextId)` → `()`. Index for "list contexts of agent" via
+/// `(SpaceId, ContextId)` → `()`. Index for "list contexts of space" via
 /// prefix range scan over the leading 16 bytes.
-pub const AGENT_CONTEXTS_TABLE: TableDefinition<'static, ([u8; 16], u64), ()> =
-    TableDefinition::new("agent_contexts");
+pub const SPACE_CONTEXTS_TABLE: TableDefinition<'static, ([u8; 16], u64), ()> =
+    TableDefinition::new("space_contexts");
 
 // ---------------------------------------------------------------------------
 // Naming conventions.
@@ -51,7 +51,7 @@ pub const DEFAULT_CONTEXT_NAME: &str = "_default";
 pub struct ContextMetadata {
     /// Mirrors the table key for convenience.
     pub context_id: u64,
-    pub agent_id_bytes: [u8; 16],
+    pub space_id_bytes: [u8; 16],
     pub name: String,
     pub created_at_unix_nanos: u64,
     pub last_active_at_unix_nanos: u64,
@@ -65,13 +65,13 @@ impl ContextMetadata {
     #[must_use]
     pub fn new(
         context_id: ContextId,
-        agent_id: AgentId,
+        space_id: SpaceId,
         name: String,
         created_at_unix_nanos: u64,
     ) -> Self {
         Self {
             context_id: context_id.raw(),
-            agent_id_bytes: agent_id.into(),
+            space_id_bytes: space_id.into(),
             name,
             created_at_unix_nanos,
             last_active_at_unix_nanos: created_at_unix_nanos,
@@ -87,8 +87,8 @@ impl ContextMetadata {
     }
 
     #[must_use]
-    pub fn agent_id(&self) -> AgentId {
-        AgentId::from(self.agent_id_bytes)
+    pub fn space_id(&self) -> SpaceId {
+        SpaceId::from(self.space_id_bytes)
     }
 }
 
@@ -134,10 +134,10 @@ impl redb::Value for ContextMetadata {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use brain_core::{AgentId, ContextId};
+    use brain_core::{SpaceId, ContextId};
     use redb::{Database, ReadableDatabase};
 
-    fn aid(byte: u8) -> AgentId {
+    fn aid(byte: u8) -> SpaceId {
         let mut b = [0u8; 16];
         b[15] = byte;
         b.into()
@@ -147,10 +147,10 @@ mod tests {
         Database::create(dir.path().join("test.redb")).expect("create redb")
     }
 
-    fn sample(context_id: u64, agent_byte: u8, name: &str) -> ContextMetadata {
+    fn sample(context_id: u64, space_byte: u8, name: &str) -> ContextMetadata {
         ContextMetadata::new(
             ContextId(context_id),
-            aid(agent_byte),
+            aid(space_byte),
             name.to_string(),
             1_700_000_000_000_000_000,
         )
@@ -176,60 +176,60 @@ mod tests {
         let got = t.get(&100u64).unwrap().unwrap().value();
         assert_eq!(got, m);
         assert_eq!(got.context_id(), ContextId(100));
-        assert_eq!(got.agent_id(), aid(0x42));
+        assert_eq!(got.space_id(), aid(0x42));
     }
 
     // ----- context_names index ------------------------------------------
 
     #[test]
-    fn context_names_lookup_by_agent_and_name() {
+    fn context_names_lookup_by_space_and_name() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
-        let agent_a = aid(0xAA);
-        let agent_a_bytes: [u8; 16] = agent_a.into();
+        let space_a = aid(0xAA);
+        let space_a_bytes: [u8; 16] = space_a.into();
 
         let wtxn = db.begin_write().unwrap();
         {
             let mut t = wtxn.open_table(CONTEXT_NAMES_TABLE).unwrap();
-            t.insert(&(&agent_a_bytes, "personal"), &101u64).unwrap();
-            t.insert(&(&agent_a_bytes, "work"), &102u64).unwrap();
+            t.insert(&(&space_a_bytes, "personal"), &101u64).unwrap();
+            t.insert(&(&space_a_bytes, "work"), &102u64).unwrap();
         }
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
         let t = rtxn.open_table(CONTEXT_NAMES_TABLE).unwrap();
-        let v = t.get(&(&agent_a_bytes, "personal")).unwrap().unwrap();
+        let v = t.get(&(&space_a_bytes, "personal")).unwrap().unwrap();
         assert_eq!(v.value(), 101);
-        let v = t.get(&(&agent_a_bytes, "work")).unwrap().unwrap();
+        let v = t.get(&(&space_a_bytes, "work")).unwrap().unwrap();
         assert_eq!(v.value(), 102);
         // Missing name returns None.
-        assert!(t.get(&(&agent_a_bytes, "nonexistent")).unwrap().is_none());
+        assert!(t.get(&(&space_a_bytes, "nonexistent")).unwrap().is_none());
     }
 
-    // ----- agent_contexts index -----------------------------------------
+    // ----- space_contexts index -----------------------------------------
 
     #[test]
-    fn agent_contexts_range_scan_for_agent() {
+    fn space_contexts_range_scan_for_space() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
-        let agent_a: [u8; 16] = aid(0xAA).into();
-        let agent_b: [u8; 16] = aid(0xBB).into();
+        let space_a: [u8; 16] = aid(0xAA).into();
+        let space_b: [u8; 16] = aid(0xBB).into();
 
         let wtxn = db.begin_write().unwrap();
         {
-            let mut t = wtxn.open_table(AGENT_CONTEXTS_TABLE).unwrap();
-            t.insert(&(agent_a, 100u64), &()).unwrap();
-            t.insert(&(agent_a, 200u64), &()).unwrap();
-            t.insert(&(agent_a, 300u64), &()).unwrap();
-            t.insert(&(agent_b, 400u64), &()).unwrap();
+            let mut t = wtxn.open_table(SPACE_CONTEXTS_TABLE).unwrap();
+            t.insert(&(space_a, 100u64), &()).unwrap();
+            t.insert(&(space_a, 200u64), &()).unwrap();
+            t.insert(&(space_a, 300u64), &()).unwrap();
+            t.insert(&(space_b, 400u64), &()).unwrap();
         }
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(AGENT_CONTEXTS_TABLE).unwrap();
-        // Range scan: all entries for agent_a.
-        let start = (agent_a, 0u64);
-        let end = (agent_a, u64::MAX);
+        let t = rtxn.open_table(SPACE_CONTEXTS_TABLE).unwrap();
+        // Range scan: all entries for space_a.
+        let start = (space_a, 0u64);
+        let end = (space_a, u64::MAX);
         let mut ctx_ids: Vec<u64> = t
             .range(start..=end)
             .unwrap()
@@ -242,33 +242,33 @@ mod tests {
         assert_eq!(ctx_ids, vec![100, 200, 300]);
     }
 
-    // ----- Cross-agent isolation ----------------------------------------
+    // ----- Cross-space isolation ----------------------------------------
 
     #[test]
-    fn cross_agent_name_isolation() {
-        // two agents can each have a context named
+    fn cross_space_name_isolation() {
+        // two spaces can each have a context named
         // "personal"; they're distinct (different ContextIds).
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
-        let agent_a: [u8; 16] = aid(0xAA).into();
-        let agent_b: [u8; 16] = aid(0xBB).into();
+        let space_a: [u8; 16] = aid(0xAA).into();
+        let space_b: [u8; 16] = aid(0xBB).into();
 
         let wtxn = db.begin_write().unwrap();
         {
             let mut t = wtxn.open_table(CONTEXT_NAMES_TABLE).unwrap();
-            t.insert(&(&agent_a, "personal"), &1001u64).unwrap();
-            t.insert(&(&agent_b, "personal"), &2002u64).unwrap();
+            t.insert(&(&space_a, "personal"), &1001u64).unwrap();
+            t.insert(&(&space_b, "personal"), &2002u64).unwrap();
         }
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
         let t = rtxn.open_table(CONTEXT_NAMES_TABLE).unwrap();
         assert_eq!(
-            t.get(&(&agent_a, "personal")).unwrap().unwrap().value(),
+            t.get(&(&space_a, "personal")).unwrap().unwrap().value(),
             1001
         );
         assert_eq!(
-            t.get(&(&agent_b, "personal")).unwrap().unwrap().value(),
+            t.get(&(&space_b, "personal")).unwrap().unwrap().value(),
             2002
         );
     }

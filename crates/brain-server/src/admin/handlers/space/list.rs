@@ -1,4 +1,4 @@
-//! `GET /v1/agents` — deferred (needs agent_id secondary index).
+//! `GET /v1/spaces` — deferred (needs space_id secondary index).
 
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ pub async fn list(
     _state: Arc<AdminState>,
 ) -> brain_http::Result<Response<ResponseBody>> {
     Ok(not_implemented(
-        "phase-11/agent-index",
-        "agent list (needs agent_id secondary index)",
+        "phase-11/space-index",
+        "space list (needs space_id secondary index)",
     ))
 }

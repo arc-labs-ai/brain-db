@@ -50,12 +50,12 @@ pub(crate) async fn emit_graph_event(
     payload: GraphEventPayload,
     timestamp_unix_nanos: u64,
 ) {
-    // Stamp the writer's bound agent on the envelope so the
-    // subscribe `agents` filter routes typed-graph events the same
+    // Stamp the writer's bound space on the envelope so the
+    // subscribe `spaces` filter routes typed-graph events the same
     // way it routes substrate events. Without this, a
-    // schema-on subscriber filtering for "my agent" would silently
+    // schema-on subscriber filtering for "my space" would silently
     // miss every typed-graph event.
-    let agent_id = ctx.executor.writer.agent_id();
+    let space_id = ctx.executor.writer.space_id();
     let Some(kind) = wal_kind_for_event(&payload) else {
         // Variants without a WAL record kind: bus-only publish.
         let envelope = EventEnvelope {
@@ -72,12 +72,12 @@ pub(crate) async fn emit_graph_event(
             stage_kind: None,
             stage_outcome: None,
             stage_payload: None,
-            agent_id,
+            space_id,
         };
         let _ = ctx.events.publish(envelope);
         return;
     };
-    ctx.publish_notification(kind, payload, agent_id, move |lsn, payload| EventEnvelope {
+    ctx.publish_notification(kind, payload, space_id, move |lsn, payload| EventEnvelope {
         lsn,
         event_type,
         memory_id: MemoryId::NULL,
@@ -91,7 +91,7 @@ pub(crate) async fn emit_graph_event(
         stage_kind: None,
         stage_outcome: None,
         stage_payload: None,
-        agent_id,
+        space_id,
     })
     .await;
 }

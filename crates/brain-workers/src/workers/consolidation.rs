@@ -401,8 +401,8 @@ async fn do_consolidation_cycle(
                     WorkerError::Ops("consolidation: unified path requires RealWriterHandle".into())
                 })?;
             let write = Write::from_phases(
-                WriteId::from_request(request_id, brain_core::AgentId::default()),
-                brain_core::AgentId::default(),
+                WriteId::from_request(request_id, brain_core::SpaceId::default()),
+                brain_core::SpaceId::default(),
                 phases,
             );
             let _ack = real_writer

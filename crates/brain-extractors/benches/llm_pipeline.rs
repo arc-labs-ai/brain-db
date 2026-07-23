@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use brain_core::{AgentId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
+use brain_core::{SpaceId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
 use brain_extractors::{
     framework::extractor::ExtractionContext, CostBudget, Extractor, ExtractorRegistry, LlmExtractor,
 };
@@ -104,7 +104,7 @@ fn memory_text() -> &'static str {
 fn build_memory() -> Memory {
     Memory {
         id: MemoryId::pack(0, 1, 0),
-        agent: AgentId::new(),
+        space: SpaceId::new(),
         context: ContextId(0),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),
@@ -255,7 +255,7 @@ fn bench_llm_mock_miss(c: &mut Criterion) {
             counter = counter.wrapping_add(1);
             let mem = Memory {
                 id: MemoryId::pack(0, counter.wrapping_add(1), 0),
-                agent: AgentId::new(),
+                space: SpaceId::new(),
                 context: ContextId(0),
                 kind: MemoryKind::Episodic,
                 salience: Salience::default(),

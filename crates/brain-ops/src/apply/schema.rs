@@ -86,7 +86,7 @@ define entity_type Project {
         };
         let write = Write::single(
             WriteId::new(),
-            brain_core::AgentId::default(),
+            brain_core::SpaceId::default(),
             phase.clone(),
         );
 

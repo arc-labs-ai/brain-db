@@ -267,7 +267,7 @@ fn statement_kind_byte(k: StatementKindAst) -> u8 {
 mod tests {
     use super::*;
     use crate::framework::registry::ExtractorRegistry;
-    use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, Salience};
+    use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, Salience};
 
     fn build(target: ExtractorTarget, patterns: &[&str], confidence: f32) -> PatternExtractor {
         let raw: Vec<String> = patterns.iter().map(|p| (*p).to_string()).collect();
@@ -285,7 +285,7 @@ mod tests {
     fn memory(text: &str) -> Memory {
         Memory {
             id: MemoryId::pack(0, 1, 0),
-            agent: AgentId::new(),
+            space: SpaceId::new(),
             context: ContextId(0),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),

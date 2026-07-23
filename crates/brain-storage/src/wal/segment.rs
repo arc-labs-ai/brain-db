@@ -400,7 +400,7 @@ mod tests {
             kind,
             flags: 0,
             timestamp_ns: 1_700_000_000_000_000_000,
-            agent_id_lo64: 0xDEAD_BEEF_CAFE_F00D,
+            space_id_lo64: 0xDEAD_BEEF_CAFE_F00D,
             payload,
         }
     }

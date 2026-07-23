@@ -1,7 +1,7 @@
 //! Unit tests for the query planner.
 
 use brain_core::StatementKind;
-use brain_core::{AgentId, EntityId, PredicateId};
+use brain_core::{SpaceId, EntityId, PredicateId};
 
 use super::{
     plan, PlanError, PreFilter, QueryPlan, Retriever, RetrieverConfig, MAX_TOP_N, MIN_TOP_N,
@@ -156,11 +156,11 @@ fn temporal_pushdown_takes_precedence_over_predicate() {
 }
 
 #[test]
-fn agent_filter_emits_pre_filter() {
-    let agent = AgentId::new();
+fn space_filter_emits_pre_filter() {
+    let space = SpaceId::new();
     let req = QueryRequest {
         text: Some("budget".into()),
-        agent_filter: vec![agent],
+        space_filter: vec![space],
         ..Default::default()
     };
     let p = plan(&req).expect("plan");
@@ -171,8 +171,8 @@ fn agent_filter_emits_pre_filter() {
         .find(|r| r.retriever == Retriever::Semantic)
         .expect("semantic present");
     match &semantic.pre_filter {
-        Some(PreFilter::AgentIds(ids)) => assert_eq!(ids.as_slice(), &[agent]),
-        other => panic!("expected AgentIds pre-filter on semantic, got {other:?}"),
+        Some(PreFilter::SpaceIds(ids)) => assert_eq!(ids.as_slice(), &[space]),
+        other => panic!("expected SpaceIds pre-filter on semantic, got {other:?}"),
     }
 
     let lexical = p
@@ -181,8 +181,8 @@ fn agent_filter_emits_pre_filter() {
         .find(|r| r.retriever == Retriever::Lexical)
         .expect("lexical present");
     match &lexical.pre_filter {
-        Some(PreFilter::AgentIds(ids)) => assert_eq!(ids.as_slice(), &[agent]),
-        other => panic!("expected AgentIds pre-filter on lexical, got {other:?}"),
+        Some(PreFilter::SpaceIds(ids)) => assert_eq!(ids.as_slice(), &[space]),
+        other => panic!("expected SpaceIds pre-filter on lexical, got {other:?}"),
     }
 }
 

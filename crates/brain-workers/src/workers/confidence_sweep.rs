@@ -367,7 +367,7 @@ impl ConfidenceSweepWorker {
         // itself, and redb forbids holding two handles to one table.
         // Tuple: (scope, predicate_id, kind, old_confidence, new_confidence, id).
         // The scope is captured from each row so the predicate-index
-        // re-key targets the same `(namespace, agent)` keyspace the row
+        // re-key targets the same `(namespace, space)` keyspace the row
         // lives in — the index is scope-prefixed.
         let mut rekey_moves: Vec<(brain_metadata::RowScope, u32, u8, f32, f32, [u8; 16])> =
             Vec::new();
@@ -393,7 +393,7 @@ impl ConfidenceSweepWorker {
                 }
                 let old_conf = meta.confidence;
                 let row_scope =
-                    brain_metadata::RowScope::from_bytes(meta.namespace_id, meta.agent_id_bytes);
+                    brain_metadata::RowScope::from_bytes(meta.namespace_id, meta.space_id_bytes);
                 meta.confidence = u.new_confidence;
                 s_table
                     .insert(key, meta)
@@ -622,7 +622,7 @@ mod tests {
         let mut meta = StatementMetadata {
             statement_id_bytes: [0u8; 16],
             namespace_id: brain_core::NamespaceId::SYSTEM.raw(),
-            agent_id_bytes: [0xA1; 16],
+            space_id_bytes: [0xA1; 16],
             chain_root_bytes: [0u8; 16],
             version: 1,
             kind: StatementKind::Fact.as_u8(),

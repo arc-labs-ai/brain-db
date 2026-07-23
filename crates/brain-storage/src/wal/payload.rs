@@ -19,7 +19,7 @@
 //!   the `flags` bit at this layer.
 
 use brain_core::{
-    AgentId, ContextId, EdgeKindRef, EdgeKindRefError, EdgeOrigin, MemoryId, MemoryKind,
+    SpaceId, ContextId, EdgeKindRef, EdgeKindRefError, EdgeOrigin, MemoryId, MemoryKind,
     NamespaceId, NodeRef, NodeRefError, RelationId, RelationTypeId, RequestId, TxnId,
 };
 
@@ -34,7 +34,7 @@ pub type EmbeddingModelFp = [u8; 16];
 pub struct EncodePayload {
     pub memory_id: MemoryId,
     pub request_id: RequestId,
-    pub agent_id: AgentId,
+    pub space_id: SpaceId,
     /// Owning tenant. Carried in the WAL so recovery rebuilds the memory
     /// row under its real namespace — without it, replay would re-persist
     /// every memory under the SYSTEM namespace and silently break tenant
@@ -88,12 +88,12 @@ pub struct EdgePayload {
 pub struct ForgetPayload {
     pub memory_id: MemoryId,
     pub request_id: RequestId,
-    /// Agent the FORGET ran under. Carried in the WAL so subscribe-
-    /// replay can route Forgotten events through the same per-agent
+    /// Space the FORGET ran under. Carried in the WAL so subscribe-
+    /// replay can route Forgotten events through the same per-space
     /// allowlist that filters live publishes — without it, a
-    /// multi-tenant subscriber filtering by `agents` would silently
+    /// multi-tenant subscriber filtering by `spaces` would silently
     /// drop every replayed forget.
-    pub agent_id: AgentId,
+    pub space_id: SpaceId,
     pub mode: ForgetMode,
     pub reason: ForgetReason,
 }
@@ -260,14 +260,14 @@ pub struct RelationLinkPayload {
     pub extractor_id: u32,
     pub is_symmetric: bool,
     pub properties_blob: Vec<u8>,
-    /// Agent the relation create ran under. Subscribe-replay routes the
-    /// EdgeAdded event through the per-agent allowlist using this id;
+    /// Space the relation create ran under. Subscribe-replay routes the
+    /// EdgeAdded event through the per-space allowlist using this id;
     /// without it, a multi-tenant subscriber would silently drop every
     /// replayed relation create.
-    pub agent_id: AgentId,
+    pub space_id: SpaceId,
     /// Owning tenant. Carried so recovery rebuilds the relation sidecar
     /// under its real namespace instead of SYSTEM — the relation's
-    /// `(namespace, agent)` scope must survive a restart for cross-tenant
+    /// `(namespace, space)` scope must survive a restart for cross-tenant
     /// isolation to hold on the typed-graph after recovery.
     pub namespace_id: NamespaceId,
     /// Schemaless-path intern hint: `Some((namespace, name))` when the
@@ -294,7 +294,7 @@ pub struct RelationTombstonePayload {
     pub relation_id: RelationId,
     pub reason: String,
     pub at_unix_nanos: u64,
-    pub agent_id: AgentId,
+    pub space_id: SpaceId,
 }
 
 // ---------------------------------------------------------------------------
@@ -316,13 +316,13 @@ use crate::wal::kinds::WalRecordKind;
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhaseBodyRecord {
     pub kind: WalRecordKind,
-    /// Agent the typed-graph mutation ran under. Carried in the WAL
+    /// Space the typed-graph mutation ran under. Carried in the WAL
     /// alongside the opaque body so subscribe-replay can route
-    /// typed-graph events through the per-agent `agents` filter the
+    /// typed-graph events through the per-space `spaces` filter the
     /// same way it routes substrate events. Without it, a multi-
     /// tenant subscriber would silently drop every replayed
     /// typed-graph event.
-    pub agent_id: AgentId,
+    pub space_id: SpaceId,
     pub body: Vec<u8>,
 }
 
@@ -331,14 +331,14 @@ impl PhaseBodyRecord {
     /// `kind.has_opaque_body()`; passing a substrate kind is a programmer
     /// error and panics in debug builds.
     #[must_use]
-    pub fn new(kind: WalRecordKind, agent_id: AgentId, body: Vec<u8>) -> Self {
+    pub fn new(kind: WalRecordKind, space_id: SpaceId, body: Vec<u8>) -> Self {
         debug_assert!(
             kind.has_opaque_body(),
             "PhaseBodyRecord requires a opaque-body kind (0x10..=0x50); got {kind:?}"
         );
         Self {
             kind,
-            agent_id,
+            space_id,
             body,
         }
     }
@@ -428,8 +428,8 @@ impl WalPayload {
             Self::RelationSupersede(p) => encode_relation_supersede(p, &mut out),
             Self::RelationTombstone(p) => encode_relation_tombstone(p, &mut out),
             Self::PhaseBody(r) => {
-                // Layout: agent_id (16 B) || opaque body.
-                put_uuid_bytes(&mut out, r.agent_id.into());
+                // Layout: space_id (16 B) || opaque body.
+                put_uuid_bytes(&mut out, r.space_id.into());
                 out.extend_from_slice(&r.body);
             }
         }
@@ -491,14 +491,14 @@ impl WalPayload {
             | WalRecordKind::SchemaUpdate
             | WalRecordKind::Audit
             | WalRecordKind::StageCompleted => {
-                // Layout: agent_id (16 B) || opaque body. The body
+                // Layout: space_id (16 B) || opaque body. The body
                 // remains opaque to the framing layer; phases 16+
                 // supply typed parsers via their own sinks.
-                let agent_id: AgentId = r.array16()?.into();
+                let space_id: SpaceId = r.array16()?.into();
                 let body = bytes[r.cursor..].to_vec();
                 return Ok(Self::PhaseBody(PhaseBodyRecord {
                     kind,
-                    agent_id,
+                    space_id,
                     body,
                 }));
             }
@@ -829,7 +829,7 @@ fn salience_reason_from_u8(b: u8) -> Result<SalienceReason, WalPayloadError> {
 fn encode_encode(p: &EncodePayload, out: &mut Vec<u8>) {
     put_memory_id(out, p.memory_id);
     put_uuid_bytes(out, p.request_id.into());
-    put_uuid_bytes(out, p.agent_id.into());
+    put_uuid_bytes(out, p.space_id.into());
     put_u32_le(out, p.namespace_id.raw());
     put_u64_le(out, p.context_id.raw());
     out.push(memory_kind_to_u8(p.kind));
@@ -858,7 +858,7 @@ fn encode_encode(p: &EncodePayload, out: &mut Vec<u8>) {
 fn decode_encode(r: &mut Reader<'_>) -> Result<EncodePayload, WalPayloadError> {
     let memory_id = r.memory_id()?;
     let request_id: RequestId = r.array16()?.into();
-    let agent_id: AgentId = r.array16()?.into();
+    let space_id: SpaceId = r.array16()?.into();
     let namespace_id = NamespaceId::from(r.u32_le()?);
     let context_id = ContextId::from(r.u64_le()?);
     let kind = memory_kind_from_u8(r.u8()?)?;
@@ -901,7 +901,7 @@ fn decode_encode(r: &mut Reader<'_>) -> Result<EncodePayload, WalPayloadError> {
     Ok(EncodePayload {
         memory_id,
         request_id,
-        agent_id,
+        space_id,
         namespace_id,
         context_id,
         kind,
@@ -920,7 +920,7 @@ fn decode_encode(r: &mut Reader<'_>) -> Result<EncodePayload, WalPayloadError> {
 fn encode_forget(p: &ForgetPayload, out: &mut Vec<u8>) {
     put_memory_id(out, p.memory_id);
     put_uuid_bytes(out, p.request_id.into());
-    put_uuid_bytes(out, p.agent_id.into());
+    put_uuid_bytes(out, p.space_id.into());
     out.push(p.mode as u8);
     out.push(p.reason as u8);
 }
@@ -929,7 +929,7 @@ fn decode_forget(r: &mut Reader<'_>) -> Result<ForgetPayload, WalPayloadError> {
     Ok(ForgetPayload {
         memory_id: r.memory_id()?,
         request_id: r.array16()?.into(),
-        agent_id: r.array16()?.into(),
+        space_id: r.array16()?.into(),
         mode: forget_mode_from_u8(r.u8()?)?,
         reason: forget_reason_from_u8(r.u8()?)?,
     })
@@ -1205,7 +1205,7 @@ fn encode_relation_link(p: &RelationLinkPayload, out: &mut Vec<u8>) {
     //   supersedes Option<RelationId> (1 or 17) ||
     //   evidence_count (4 LE) + evidence_ids (16 * N) ||
     //   extractor_id (4 LE) || is_symmetric (1) ||
-    //   properties_blob (4 LE len + bytes) || agent_id (16) ||
+    //   properties_blob (4 LE len + bytes) || space_id (16) ||
     //   namespace_id (4 LE).
     out.extend_from_slice(&p.relation_id.to_bytes());
     put_node_ref(out, p.from);
@@ -1224,7 +1224,7 @@ fn encode_relation_link(p: &RelationLinkPayload, out: &mut Vec<u8>) {
     put_u32_le(out, p.extractor_id);
     out.push(u8::from(p.is_symmetric));
     put_blob(out, &p.properties_blob);
-    put_uuid_bytes(out, p.agent_id.into());
+    put_uuid_bytes(out, p.space_id.into());
     put_u32_le(out, p.namespace_id.raw());
     // relation_type_intern_hint: tag byte then two length-prefixed strings.
     match &p.relation_type_intern_hint {
@@ -1258,7 +1258,7 @@ fn decode_relation_link(r: &mut Reader<'_>) -> Result<RelationLinkPayload, WalPa
     let extractor_id = r.u32_le()?;
     let is_symmetric = r.u8()? != 0;
     let properties_blob = read_blob(r)?;
-    let agent_id: AgentId = r.array16()?.into();
+    let space_id: SpaceId = r.array16()?.into();
     let namespace_id = NamespaceId::from(r.u32_le()?);
     let relation_type_intern_hint = match r.u8()? {
         0 => None,
@@ -1284,7 +1284,7 @@ fn decode_relation_link(r: &mut Reader<'_>) -> Result<RelationLinkPayload, WalPa
         extractor_id,
         is_symmetric,
         properties_blob,
-        agent_id,
+        space_id,
         namespace_id,
         relation_type_intern_hint,
     })
@@ -1309,11 +1309,11 @@ fn decode_relation_supersede(
 
 fn encode_relation_tombstone(p: &RelationTombstonePayload, out: &mut Vec<u8>) {
     // Layout: relation_id (16) || reason (text) || at_unix_nanos (8 LE)
-    //   || agent_id (16).
+    //   || space_id (16).
     out.extend_from_slice(&p.relation_id.to_bytes());
     put_text(out, &p.reason);
     put_u64_le(out, p.at_unix_nanos);
-    put_uuid_bytes(out, p.agent_id.into());
+    put_uuid_bytes(out, p.space_id.into());
 }
 
 fn decode_relation_tombstone(
@@ -1323,7 +1323,7 @@ fn decode_relation_tombstone(
         relation_id: RelationId::from_bytes(r.array16()?),
         reason: read_text(r)?,
         at_unix_nanos: r.u64_le()?,
-        agent_id: r.array16()?.into(),
+        space_id: r.array16()?.into(),
     })
 }
 
@@ -1335,7 +1335,7 @@ fn decode_relation_tombstone(
 mod tests {
     use super::*;
     use brain_core::{
-        AgentId, EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, MemoryId, NodeRef, RelationId,
+        SpaceId, EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, MemoryId, NodeRef, RelationId,
         RelationTypeId, RequestId, TxnId,
     };
     use proptest::prelude::*;
@@ -1360,7 +1360,7 @@ mod tests {
         b.into()
     }
 
-    fn aid(byte: u8) -> AgentId {
+    fn aid(byte: u8) -> SpaceId {
         let mut b = [0u8; 16];
         b[15] = byte;
         b.into()
@@ -1393,7 +1393,7 @@ mod tests {
             WalPayload::Encode(EncodePayload {
                 memory_id: mid(7),
                 request_id: rid(1),
-                agent_id: aid(2),
+                space_id: aid(2),
                 // Non-system namespace so the round-trip proves the field
                 // survives encode→decode (a field-order bug would mismatch).
                 namespace_id: NamespaceId::from(5),
@@ -1418,7 +1418,7 @@ mod tests {
             WalPayload::Forget(ForgetPayload {
                 memory_id: mid(9),
                 request_id: rid(3),
-                agent_id: aid(4),
+                space_id: aid(4),
                 mode: ForgetMode::Hard,
                 reason: ForgetReason::Eviction,
             }),
@@ -1503,7 +1503,7 @@ mod tests {
                 relation_id: relid(0xA2),
                 reason: "duplicate".into(),
                 at_unix_nanos: 1_800_000_000_000_000_000,
-                agent_id: aid(0xA3),
+                space_id: aid(0xA3),
             }),
         ]
     }
@@ -1523,7 +1523,7 @@ mod tests {
             extractor_id: 7,
             is_symmetric: false,
             properties_blob: vec![1, 2, 3, 4, 5],
-            agent_id: aid(0xC5),
+            space_id: aid(0xC5),
             // Non-system namespace so the round-trip proves the field
             // survives the relation-link codec.
             namespace_id: NamespaceId::from(9),
@@ -1656,7 +1656,7 @@ mod tests {
         let p = WalPayload::Encode(EncodePayload {
             memory_id: mid(1),
             request_id: rid(0),
-            agent_id: aid(0),
+            space_id: aid(0),
             namespace_id: NamespaceId::SYSTEM,
             context_id: ContextId(0),
             kind: MemoryKind::Episodic,
@@ -1671,7 +1671,7 @@ mod tests {
             occurred_at_unix_nanos: None,
         });
         let mut bytes = p.encode_to_bytes();
-        // Text starts after MemoryId(16) + RequestId(16) + AgentId(16)
+        // Text starts after MemoryId(16) + RequestId(16) + SpaceId(16)
         //   + NamespaceId(4) + ContextId(8) + kind(1) + salience(4) + fp(16)
         //   + text_len(4) = 85. Replace the 2-byte text with an invalid
         // UTF-8 lead byte.
@@ -1714,7 +1714,7 @@ mod tests {
         let p = WalPayload::Encode(EncodePayload {
             memory_id: mid(1),
             request_id: rid(0),
-            agent_id: aid(0),
+            space_id: aid(0),
             namespace_id: NamespaceId::SYSTEM,
             context_id: ContextId(0),
             kind: MemoryKind::Episodic,
@@ -1741,7 +1741,7 @@ mod tests {
         let p = WalPayload::Encode(EncodePayload {
             memory_id: mid(1),
             request_id: rid(0),
-            agent_id: aid(0),
+            space_id: aid(0),
             namespace_id: NamespaceId::SYSTEM,
             context_id: ContextId(0),
             kind: MemoryKind::Episodic,
@@ -1770,7 +1770,7 @@ mod tests {
         let p = WalPayload::Encode(EncodePayload {
             memory_id: mid(1),
             request_id: rid(0),
-            agent_id: aid(0),
+            space_id: aid(0),
             namespace_id: NamespaceId::SYSTEM,
             context_id: ContextId(0),
             kind: MemoryKind::Episodic,
@@ -1800,7 +1800,7 @@ mod tests {
         let p = WalPayload::Encode(EncodePayload {
             memory_id: mid(1),
             request_id: rid(0),
-            agent_id: aid(0),
+            space_id: aid(0),
             namespace_id: NamespaceId::SYSTEM,
             context_id: ContextId(0),
             kind: MemoryKind::Episodic,
@@ -1850,18 +1850,18 @@ mod tests {
             WalRecordKind::Audit,
         ] {
             let body: Vec<u8> = (0..32u8).map(|i| i ^ kind.as_u8()).collect();
-            let agent = aid(kind.as_u8());
-            let payload = WalPayload::PhaseBody(PhaseBodyRecord::new(kind, agent, body.clone()));
+            let space = aid(kind.as_u8());
+            let payload = WalPayload::PhaseBody(PhaseBodyRecord::new(kind, space, body.clone()));
             assert_eq!(payload.kind(), kind);
             let bytes = payload.encode_to_bytes();
-            // Layout: 16-byte agent_id, then the opaque body.
+            // Layout: 16-byte space_id, then the opaque body.
             assert_eq!(bytes.len(), 16 + body.len());
             assert_eq!(&bytes[16..], body.as_slice());
             let decoded = WalPayload::decode(kind, &bytes).expect("decode typed-graph");
             match decoded {
                 WalPayload::PhaseBody(r) => {
                     assert_eq!(r.kind, kind);
-                    assert_eq!(r.agent_id, agent);
+                    assert_eq!(r.space_id, space);
                     assert_eq!(r.body, body);
                 }
                 other => panic!("expected PhaseBody, got {other:?}"),
@@ -1872,15 +1872,15 @@ mod tests {
     #[test]
     fn graph_decode_empty_body_is_ok() {
         // An empty body is a legal opaque payload (a tombstone marker,
-        // for instance, may carry no fields). The 16-byte agent_id
+        // for instance, may carry no fields). The 16-byte space_id
         // prefix is still mandatory.
-        let agent_bytes = [0u8; 16];
-        let payload = WalPayload::decode(WalRecordKind::EntityTombstone, &agent_bytes)
+        let space_bytes = [0u8; 16];
+        let payload = WalPayload::decode(WalRecordKind::EntityTombstone, &space_bytes)
             .expect("empty body decodes");
         match payload {
             WalPayload::PhaseBody(r) => {
                 assert_eq!(r.kind, WalRecordKind::EntityTombstone);
-                assert_eq!(r.agent_id, AgentId::from(agent_bytes));
+                assert_eq!(r.space_id, SpaceId::from(space_bytes));
                 assert!(r.body.is_empty());
             }
             other => panic!("expected PhaseBody, got {other:?}"),
@@ -1889,7 +1889,7 @@ mod tests {
 
     #[test]
     fn graph_decode_rejects_short_prefix() {
-        // Anything shorter than the 16-byte agent_id prefix must
+        // Anything shorter than the 16-byte space_id prefix must
         // underrun rather than silently succeeding.
         for n in 0..16 {
             match WalPayload::decode(WalRecordKind::EntityTombstone, &vec![0u8; n]) {
@@ -1903,7 +1903,7 @@ mod tests {
     fn graph_decode_skips_trailing_bytes_check() {
         // For substrate kinds, trailing bytes after the structured tail
         // are an error. For typed-graph kinds the bytes following the
-        // 16-byte agent_id prefix are the opaque body — no such check
+        // 16-byte space_id prefix are the opaque body — no such check
         // applies. Verify by feeding garbage past the prefix.
         let mut bytes = vec![0u8; 16];
         bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE]);
@@ -1923,7 +1923,7 @@ mod tests {
         // substrate kind panics. (In release builds the debug_assert is
         // elided; that's intentional — callers are not expected to feed
         // adversarial kinds.)
-        let _ = PhaseBodyRecord::new(WalRecordKind::Encode, AgentId::default(), vec![]);
+        let _ = PhaseBodyRecord::new(WalRecordKind::Encode, SpaceId::default(), vec![]);
     }
 
     // -----------------------------------------------------------------
@@ -2000,7 +2000,7 @@ mod tests {
         let p = WalPayload::Encode(EncodePayload {
             memory_id: mid(1),
             request_id: rid(1),
-            agent_id: aid(1),
+            space_id: aid(1),
             namespace_id: NamespaceId::SYSTEM,
             context_id: ContextId(0),
             kind: MemoryKind::Episodic,
@@ -2099,7 +2099,7 @@ mod tests {
             let p = WalPayload::Encode(EncodePayload {
                 memory_id: mid(1),
                 request_id: rid(0),
-                agent_id: aid(0),
+                space_id: aid(0),
                 namespace_id: NamespaceId::SYSTEM,
                 context_id: ContextId(0),
                 kind: MemoryKind::Episodic,
@@ -2145,7 +2145,7 @@ mod tests {
                 extractor_id,
                 is_symmetric,
                 properties_blob,
-                agent_id: aid(0x09),
+                space_id: aid(0x09),
                 namespace_id: NamespaceId::from(3),
                 relation_type_intern_hint: None,
             };
@@ -2191,13 +2191,13 @@ mod tests {
             rid_byte in any::<u8>(),
             reason in ".*",
             at in any::<u64>(),
-            agent_byte in any::<u8>(),
+            space_byte in any::<u8>(),
         ) {
             let p = WalPayload::RelationTombstone(RelationTombstonePayload {
                 relation_id: relid(rid_byte),
                 reason,
                 at_unix_nanos: at,
-                agent_id: aid(agent_byte),
+                space_id: aid(space_byte),
             });
             let bytes = p.encode_to_bytes();
             prop_assert_eq!(
@@ -2208,26 +2208,26 @@ mod tests {
     }
 
     #[test]
-    fn forget_payload_agent_id_round_trips() {
-        // The new `agent_id` field on ForgetPayload must survive a
+    fn forget_payload_space_id_round_trips() {
+        // The new `space_id` field on ForgetPayload must survive a
         // full encode_to_bytes → decode round-trip so subscribe-
-        // replay can populate EventEnvelope.agent_id from a
+        // replay can populate EventEnvelope.space_id from a
         // non-default value (the live-publish path already stamps
         // it from the writer; replay used to fall back to nil and
-        // silently drop forgets for any `agents`-filtered
+        // silently drop forgets for any `spaces`-filtered
         // subscriber).
-        let agent = aid(0x42);
+        let space = aid(0x42);
         let payload = WalPayload::Forget(ForgetPayload {
             memory_id: mid(99),
             request_id: rid(7),
-            agent_id: agent,
+            space_id: space,
             mode: ForgetMode::Hard,
             reason: ForgetReason::ClientRequest,
         });
         let bytes = payload.encode_to_bytes();
         match WalPayload::decode(WalRecordKind::Forget, &bytes).unwrap() {
             WalPayload::Forget(p) => {
-                assert_eq!(p.agent_id, agent);
+                assert_eq!(p.space_id, space);
                 assert_eq!(p.memory_id, mid(99));
                 assert_eq!(p.mode, ForgetMode::Hard);
                 assert_eq!(p.reason, ForgetReason::ClientRequest);

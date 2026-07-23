@@ -77,7 +77,7 @@ pub fn trigrams_of_components(canonical_name: &str, aliases: &[String]) -> HashS
 // ---------------------------------------------------------------------------
 
 /// Insert one `entity_trigrams` row per trigram in `trigrams`, under the
-/// owning `(namespace, agent)` scope.
+/// owning `(namespace, space)` scope.
 pub fn index_entity_trigrams(
     wtxn: &WriteTransaction,
     scope: RowScope,
@@ -94,7 +94,7 @@ pub fn index_entity_trigrams(
         t.insert(
             &(
                 scope.namespace_id,
-                scope.agent_id_bytes,
+                scope.space_id_bytes,
                 type_id.raw(),
                 *tg,
                 id_bytes,
@@ -123,7 +123,7 @@ pub fn remove_entity_trigrams(
     for tg in trigrams {
         t.remove(&(
             scope.namespace_id,
-            scope.agent_id_bytes,
+            scope.space_id_bytes,
             type_id.raw(),
             *tg,
             id_bytes,
@@ -138,7 +138,7 @@ pub fn remove_entity_trigrams(
 
 /// All EntityIds whose trigram set contains `trigram` under
 /// `(scope, type_id)`. Range-scans the multi-value index at prefix
-/// `(namespace, agent, type_id, trigram, *)`.
+/// `(namespace, space, type_id, trigram, *)`.
 pub fn lookup_candidates_by_trigram(
     rtxn: &ReadTransaction,
     scope: RowScope,
@@ -148,14 +148,14 @@ pub fn lookup_candidates_by_trigram(
     let t = rtxn.open_table(ENTITY_TRIGRAMS_TABLE)?;
     let lo = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         type_id.raw(),
         trigram,
         [0u8; 16],
     );
     let hi = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         type_id.raw(),
         trigram,
         [0xFFu8; 16],
@@ -163,9 +163,9 @@ pub fn lookup_candidates_by_trigram(
     let mut out = Vec::new();
     for entry in t.range(lo..=hi)? {
         let (k, _) = entry?;
-        let (k_ns, k_agent, k_type, k_tg, k_id) = k.value();
+        let (k_ns, k_space, k_type, k_tg, k_id) = k.value();
         if k_ns == scope.namespace_id
-            && k_agent == scope.agent_id_bytes
+            && k_space == scope.space_id_bytes
             && k_type == type_id.raw()
             && k_tg == trigram
         {
@@ -197,23 +197,23 @@ pub fn candidates_for_query(
     for tg in qg {
         let lo = (
             scope.namespace_id,
-            scope.agent_id_bytes,
+            scope.space_id_bytes,
             type_id.raw(),
             tg,
             [0u8; 16],
         );
         let hi = (
             scope.namespace_id,
-            scope.agent_id_bytes,
+            scope.space_id_bytes,
             type_id.raw(),
             tg,
             [0xFFu8; 16],
         );
         for entry in t.range(lo..=hi)? {
             let (k, _) = entry?;
-            let (k_ns, k_agent, k_type, k_tg, k_id) = k.value();
+            let (k_ns, k_space, k_type, k_tg, k_id) = k.value();
             if k_ns == scope.namespace_id
-                && k_agent == scope.agent_id_bytes
+                && k_space == scope.space_id_bytes
                 && k_type == type_id.raw()
                 && k_tg == tg
             {

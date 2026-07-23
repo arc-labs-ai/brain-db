@@ -122,19 +122,19 @@ pub struct EntityRenameBody {
 }
 
 /// `EntityUnmerge` (0x15) body. Mirrors `unmerge_entity`'s inputs.
-/// `actor_kind`: `0` = System (`actor_agent` is `[0; 16]`), `1` = Agent.
+/// `actor_kind`: `0` = System (`actor_space` is `[0; 16]`), `1` = Space.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 pub struct EntityUnmergeBody {
     pub merged: [u8; 16],
     pub actor_kind: u8,
-    pub actor_agent: [u8; 16],
+    pub actor_space: [u8; 16],
     pub at_unix_nanos: u64,
 }
 
 /// `EntityMerge` (0x12) body. Mirrors the `merge_entity` helper's
 /// inputs. `actor_kind` encodes `MergeActor`: `0` = `System` (and
-/// `actor_agent` is `[0; 16]`), `1` = `Agent(actor_agent)`.
+/// `actor_space` is `[0; 16]`), `1` = `Space(actor_space)`.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 pub struct EntityMergeBody {
@@ -145,10 +145,10 @@ pub struct EntityMergeBody {
     pub at_unix_nanos: u64,
     pub confidence: f32,
     pub reason: String,
-    /// `0` = System, `1` = Agent. See [`MergeActor`](crate::entity::merge::MergeActor).
+    /// `0` = System, `1` = Space. See [`MergeActor`](crate::entity::merge::MergeActor).
     pub actor_kind: u8,
     /// `[0; 16]` when `actor_kind == 0` (System).
-    pub actor_agent: [u8; 16],
+    pub actor_space: [u8; 16],
     pub grace_seconds: u64,
 }
 
@@ -381,7 +381,7 @@ mod tests {
         let body = EntityUnmergeBody {
             merged: EntityId::new().to_bytes(),
             actor_kind: 1,
-            actor_agent: [3u8; 16],
+            actor_space: [3u8; 16],
             at_unix_nanos: 1_700_000_000_000_000_456,
         };
         let bytes = encode_entity_unmerge(&body);
@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn entity_merge_body_round_trips_agent_actor() {
+    fn entity_merge_body_round_trips_space_actor() {
         let body = EntityMergeBody {
             source: EntityId::new().to_bytes(),
             target: EntityId::new().to_bytes(),
@@ -400,7 +400,7 @@ mod tests {
             confidence: 0.95,
             reason: "duplicate detected by resolver".into(),
             actor_kind: 1,
-            actor_agent: [7u8; 16],
+            actor_space: [7u8; 16],
             grace_seconds: 7 * 24 * 60 * 60,
         };
         let bytes = encode_entity_merge(&body);
@@ -421,7 +421,7 @@ mod tests {
             confidence: 0.7,
             reason: String::new(),
             actor_kind: 0,
-            actor_agent: [0u8; 16],
+            actor_space: [0u8; 16],
             grace_seconds: 0,
         };
         let bytes = encode_entity_merge(&body);
@@ -537,7 +537,7 @@ mod tests {
             confidence: 0.95,
             reason: "duplicate detected by resolver".into(),
             actor_kind: 1,
-            actor_agent: [7u8; 16],
+            actor_space: [7u8; 16],
             grace_seconds: 7 * 24 * 60 * 60,
         };
         let bytes = encode_entity_merge(&body);

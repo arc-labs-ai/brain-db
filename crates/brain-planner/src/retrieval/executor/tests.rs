@@ -5,7 +5,7 @@ use std::sync::Mutex as StdMutex;
 use std::thread;
 use std::time::Duration;
 
-use brain_core::{AgentId, ContextId, Entity, EntityId, EntityType, MemoryId, MemoryKind};
+use brain_core::{SpaceId, ContextId, Entity, EntityId, EntityType, MemoryId, MemoryKind};
 use brain_index::{
     GraphError, GraphQuery, GraphRetriever, GraphRetrieverConfig, LexicalError, LexicalQuery,
     LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItem, RankedItemId,
@@ -128,7 +128,7 @@ fn seed_active_slots(metadata: &mut MetadataDb, slots: impl IntoIterator<Item = 
             let row = MemoryMetadata::new_active(
                 id,
                 brain_core::NamespaceId::SYSTEM,
-                AgentId::new(),
+                SpaceId::new(),
                 ContextId::from(0),
                 id.slot(),
                 id.version(),
@@ -157,7 +157,7 @@ fn seed_active_memories(metadata: &mut MetadataDb, slots: std::ops::Range<u64>) 
             let row = MemoryMetadata::new_active(
                 id,
                 brain_core::NamespaceId::SYSTEM,
-                AgentId::new(),
+                SpaceId::new(),
                 ContextId::from(0),
                 id.slot(),
                 id.version(),
@@ -211,7 +211,7 @@ fn make_ctx(
         graph: graph_arc,
         metadata: Arc::new(metadata),
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
-        caller_agent: brain_core::AgentId::default(),
+        caller_space: brain_core::SpaceId::default(),
         cross_encoder: None,
     };
     (dir, ctx)
@@ -784,7 +784,7 @@ fn dynamic_k_deepens_when_filters_thin_the_pool() {
         }),
         metadata: Arc::new(metadata),
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
-        caller_agent: brain_core::AgentId::default(),
+        caller_space: brain_core::SpaceId::default(),
         cross_encoder: None,
     };
 
@@ -895,7 +895,7 @@ fn cue_ctx(metadata: MetadataDb) -> RetrievalExecutorContext {
         }),
         metadata: Arc::new(metadata),
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
-        caller_agent: brain_core::AgentId::default(),
+        caller_space: brain_core::SpaceId::default(),
         cross_encoder: None,
     }
 }
@@ -1138,7 +1138,7 @@ fn prf_reprobes_lexical_with_expansion_on_low_specificity_query() {
         }),
         metadata: Arc::new(metadata),
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
-        caller_agent: brain_core::AgentId::default(),
+        caller_space: brain_core::SpaceId::default(),
         cross_encoder: None,
     };
 
@@ -1187,7 +1187,7 @@ fn prf_skips_high_specificity_query() {
         }),
         metadata: Arc::new(metadata),
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
-        caller_agent: brain_core::AgentId::default(),
+        caller_space: brain_core::SpaceId::default(),
         cross_encoder: None,
     };
 
@@ -1206,7 +1206,7 @@ fn prf_skips_high_specificity_query() {
 
 fn __ts() -> brain_metadata::RowScope {
     // Match the executor context's default caller scope (system
-    // namespace + default/zero agent) so seeded entities + statements
+    // namespace + default/zero space) so seeded entities + statements
     // are reachable by the cue-anchor / graph-expansion read paths,
     // which read under `ctx.caller_scope()`.
     brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0u8; 16])

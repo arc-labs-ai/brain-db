@@ -36,7 +36,7 @@ use brain_metadata::entity::ops::{entity_get, entity_put, normalize_name};
 use brain_metadata::MetadataDb;
 use brain_metadata::RowScope;
 
-/// Fixed (namespace, agent) scope for these resolver e2e tests.
+/// Fixed (namespace, space) scope for these resolver e2e tests.
 fn test_scope() -> RowScope {
     RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
 }

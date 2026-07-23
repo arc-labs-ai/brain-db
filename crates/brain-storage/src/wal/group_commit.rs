@@ -367,7 +367,7 @@ mod tests {
             kind: WalRecordKind::Encode,
             flags: 0,
             timestamp_ns: 1_700_000_000_000_000_000,
-            agent_id_lo64: 0x1234_5678_9ABC_DEF0,
+            space_id_lo64: 0x1234_5678_9ABC_DEF0,
             payload: vec![(lsn & 0xFF) as u8; 32],
         }
     }

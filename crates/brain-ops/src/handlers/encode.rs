@@ -106,12 +106,12 @@ pub async fn handle_encode(
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id = WriteId::from_request(
         brain_core::RequestId::from(req.request_id),
-        ctx.executor.caller_agent,
+        ctx.executor.caller_space,
     );
     let context_id = ContextId::from(req.context_id);
     let kind = DEFAULT_KIND;
     let embedding_model_fp = ctx.executor.embedder.fingerprint();
-    let request_hash = encode_request_hash(&req, embedding_model_fp, ctx.executor.caller_agent);
+    let request_hash = encode_request_hash(&req, embedding_model_fp, ctx.executor.caller_space);
     match real_writer.idempotency_lookup(write_id, Some(request_hash)) {
         crate::writer::submit::CacheLookup::Hit(cached) => {
             return reconstruct_encode_response(ctx, &req, &cached, salience, embedding_model_fp);
@@ -158,7 +158,7 @@ pub async fn handle_encode(
     let deduplicate = !req.allow_duplicates;
 
     // 3. Dedup check — default policy is content dedup. Look up
-    // (agent, context, content_hash). On hit, return the existing
+    // (space, context, content_hash). On hit, return the existing
     // memory id without submitting a Write.
     if deduplicate {
         if let Some(existing) = lookup_fingerprint(ctx, content_hash, context_id)? {
@@ -168,7 +168,7 @@ pub async fn handle_encode(
                 salience,
                 auto_edges_added: 0,
                 lsn: 0,
-                agent_id: ctx.executor.caller_agent.into(),
+                space_id: ctx.executor.caller_space.into(),
                 context_id: req.context_id,
                 kind: kind.into(),
                 created_at_unix_nanos: 0,
@@ -244,7 +244,7 @@ pub async fn handle_encode(
 
     // 6. Submit.
     let t_persist = trace_enabled.then(Instant::now);
-    let write = Write::from_phases(write_id, ctx.executor.caller_agent, phases)
+    let write = Write::from_phases(write_id, ctx.executor.caller_space, phases)
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
     let ack = real_writer
@@ -408,7 +408,7 @@ pub async fn handle_encode(
         salience,
         auto_edges_added,
         lsn: ack.lsn_first.raw(),
-        agent_id: ctx.executor.caller_agent.into(),
+        space_id: ctx.executor.caller_space.into(),
         context_id: req.context_id,
         kind: kind.into(),
         created_at_unix_nanos: created_at,
@@ -654,7 +654,7 @@ fn build_encode_artifacts(
         Ok(rtxn) => {
             let scope = brain_metadata::RowScope::new(
                 ctx.executor.caller_namespace,
-                ctx.executor.caller_agent,
+                ctx.executor.caller_space,
             );
             match crate::handlers::recall::fetch_enrichment_for(&[memory_id], scope, &rtxn) {
                 Ok(mut enr) => {
@@ -741,7 +741,7 @@ fn build_encode_artifacts(
 
 /// Look up a content-hash fingerprint to deduplicate against an
 /// existing memory. Returns `Some(MemoryId)` if a
-/// row exists for `(caller_agent, context, content_hash)`.
+/// row exists for `(caller_space, context, content_hash)`.
 fn lookup_fingerprint(
     ctx: &OpsContext,
     content_hash: [u8; 32],
@@ -756,7 +756,7 @@ fn lookup_fingerprint(
             OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
         })?;
     let key = brain_metadata::tables::fingerprint::fingerprint_key(
-        ctx.executor.caller_agent,
+        ctx.executor.caller_space,
         context_id,
         &content_hash,
     );
@@ -775,7 +775,7 @@ fn lookup_fingerprint(
 fn encode_request_hash(
     req: &EncodeRequest,
     embedding_model_fp: [u8; 16],
-    agent: brain_core::AgentId,
+    space: brain_core::SpaceId,
 ) -> [u8; 32] {
     let op = brain_planner::EncodeOp {
         request_id: brain_core::RequestId::from(req.request_id),
@@ -788,7 +788,7 @@ fn encode_request_hash(
         edges: Vec::new(),
         deduplicate: !req.allow_duplicates,
         content_hash: *blake3::hash(req.text.as_bytes()).as_bytes(),
-        agent_id: agent,
+        space_id: space,
     };
     crate::state::idempotency::hash_encode_request(&op)
 }
@@ -855,7 +855,7 @@ fn reconstruct_encode_response(
         salience,
         auto_edges_added,
         lsn: cached.lsn_first.raw(),
-        agent_id: ctx.executor.caller_agent.into(),
+        space_id: ctx.executor.caller_space.into(),
         context_id: req.context_id,
         kind: DEFAULT_KIND.into(),
         created_at_unix_nanos: created_at,
@@ -887,7 +887,7 @@ async fn handle_encode_in_txn(
     let request_hash = encode_request_hash(
         &req,
         ctx.executor.embedder.fingerprint(),
-        ctx.executor.caller_agent,
+        ctx.executor.caller_space,
     );
 
     // 4. Intra-txn replay check.
@@ -927,7 +927,7 @@ async fn handle_encode_in_txn(
             // it. Clients chaining subscribe-from-encode inside a
             // txn must subscribe after COMMIT instead.
             lsn: 0,
-            agent_id: ctx.executor.caller_agent.into(),
+            space_id: ctx.executor.caller_space.into(),
             context_id: req.context_id,
             kind: DEFAULT_KIND.into(),
             created_at_unix_nanos: 0,
@@ -977,7 +977,7 @@ async fn handle_encode_in_txn(
     let metadata = MemoryMetadata::new_active(
         memory_id,
         ctx.executor.caller_namespace,
-        brain_core::AgentId(uuid::Uuid::nil()),
+        brain_core::SpaceId(uuid::Uuid::nil()),
         ContextId::from(req.context_id),
         memory_id.slot(),
         memory_id.version(),
@@ -1003,7 +1003,7 @@ async fn handle_encode_in_txn(
         request_hash,
         created_at_unix_nanos: created_at,
         occurred_at_unix_nanos: req.occurred_at_unix_nanos,
-        agent_id: ctx.executor.caller_agent,
+        space_id: ctx.executor.caller_space,
     };
 
     ctx.txn_store.with_buffer(txn_id, |buf| {
@@ -1026,7 +1026,7 @@ async fn handle_encode_in_txn(
         auto_edges_added,
         // Buffered op — durable LSN lands at TXN_COMMIT.
         lsn: 0,
-        agent_id: ctx.executor.caller_agent.into(),
+        space_id: ctx.executor.caller_space.into(),
         context_id: req.context_id,
         kind: DEFAULT_KIND.into(),
         created_at_unix_nanos: created_at,

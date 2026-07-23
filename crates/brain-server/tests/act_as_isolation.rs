@@ -21,8 +21,8 @@
 //!      data-plane op, SUBSCRIBE bypasses the normal `run_op_dispatch` /
 //!      `act_as_of` path structurally (it mutates the connection-layer
 //!      `SubscriptionRegistry`, not `brain_ops`). It still runs the exact
-//!      same R1/R2 checks and routes to the effective agent, so a
-//!      shared-pool caller can scope a subscription to a different agent
+//!      same R1/R2 checks and routes to the effective space, so a
+//!      shared-pool caller can scope a subscription to a different space
 //!      it's permitted to `act_as` for — see the `subscribe_act_as_*` tests
 //!      below.
 //!
@@ -82,7 +82,7 @@ use support_harness::start;
 const FLAG_EOS: u8 = 1 << 7;
 
 // ---------------------------------------------------------------------------
-// Wire helpers (mirrors agent_isolation.rs)
+// Wire helpers (mirrors space_isolation.rs)
 // ---------------------------------------------------------------------------
 
 async fn read_one_frame<S>(stream: &mut S) -> Frame
@@ -251,10 +251,10 @@ async fn recall_ids_as(
     }
 }
 
-fn act_as(namespace: &str, agent: [u8; 16]) -> ActAs {
+fn act_as(namespace: &str, space: [u8; 16]) -> ActAs {
     ActAs {
         namespace: namespace.to_string(),
-        agent_id: agent,
+        space_id: space,
     }
 }
 
@@ -270,16 +270,16 @@ fn act_as(namespace: &str, agent: [u8; 16]) -> ActAs {
 async fn act_as_isolates_two_tenants_on_one_connection() {
     let server = start(1).await; // one shard → every identity collocated
 
-    let agent_a = [0xA1u8; 16];
-    let agent_b = [0xB2u8; 16];
-    let svc_agent = *uuid::Uuid::now_v7().as_bytes();
+    let space_a = [0xA1u8; 16];
+    let space_b = [0xB2u8; 16];
+    let svc_space = *uuid::Uuid::now_v7().as_bytes();
 
     // One trusted service principal: ACT_AS grant + an allowlist covering both
     // tenant namespaces. This is the only credential the "gateway" holds.
     let svc_token = server.mint_with_may_act(
         "svc",
-        svc_agent,
-        brain_metadata::api_keys::bits::ACT_AS | brain_metadata::api_keys::bits::STANDARD_AGENT,
+        svc_space,
+        brain_metadata::api_keys::bits::ACT_AS | brain_metadata::api_keys::bits::STANDARD_SPACE,
         vec!["tenant_a".to_string(), "tenant_b".to_string()],
     );
 
@@ -293,21 +293,21 @@ async fn act_as_isolates_two_tenants_on_one_connection() {
         &mut svc,
         1,
         "tenant A private: the launch code is hunter2",
-        Some(act_as("tenant_a", agent_a)),
+        Some(act_as("tenant_a", space_a)),
     )
     .await;
     let a2 = encode_as(
         &mut svc,
         3,
         "tenant A private: meet Priya at noon",
-        Some(act_as("tenant_a", agent_a)),
+        Some(act_as("tenant_a", space_a)),
     )
     .await;
     let b1 = encode_as(
         &mut svc,
         5,
         "tenant B note: review the design doc",
-        Some(act_as("tenant_b", agent_b)),
+        Some(act_as("tenant_b", space_b)),
     )
     .await;
 
@@ -316,7 +316,7 @@ async fn act_as_isolates_two_tenants_on_one_connection() {
         &mut svc,
         7,
         "private launch code doc",
-        Some(act_as("tenant_b", agent_b)),
+        Some(act_as("tenant_b", space_b)),
     )
     .await;
     assert!(
@@ -336,7 +336,7 @@ async fn act_as_isolates_two_tenants_on_one_connection() {
         &mut svc,
         9,
         "review design doc launch code",
-        Some(act_as("tenant_a", agent_a)),
+        Some(act_as("tenant_a", space_a)),
     )
     .await;
     assert!(
@@ -360,10 +360,10 @@ async fn act_as_isolates_two_tenants_on_one_connection() {
 async fn act_as_without_grant_is_denied() {
     let server = start(1).await;
 
-    let agent = [0xC3u8; 16];
+    let space = [0xC3u8; 16];
     // FULL = ENCODE|RECALL|FORGET|LINK|SCHEMA_UPLOAD|ADMIN — deliberately no
     // ACT_AS bit, and no may_act allowlist.
-    let token = server.mint("plain", agent, brain_metadata::api_keys::bits::FULL);
+    let token = server.mint("plain", space, brain_metadata::api_keys::bits::FULL);
 
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
@@ -409,15 +409,15 @@ async fn act_as_without_grant_is_denied() {
 async fn act_as_wildcard_allows_any_namespace() {
     let server = start(1).await;
 
-    let agent_x = [0xD4u8; 16];
-    let agent_y = [0xE5u8; 16];
-    let svc_agent = *uuid::Uuid::now_v7().as_bytes();
+    let space_x = [0xD4u8; 16];
+    let space_y = [0xE5u8; 16];
+    let svc_space = *uuid::Uuid::now_v7().as_bytes();
 
     // Wildcard grant: ACT_AS + may_act = ["*"]. No tenant namespace is named.
     let svc_token = server.mint_with_may_act(
         "svc",
-        svc_agent,
-        brain_metadata::api_keys::bits::ACT_AS | brain_metadata::api_keys::bits::STANDARD_AGENT,
+        svc_space,
+        brain_metadata::api_keys::bits::ACT_AS | brain_metadata::api_keys::bits::STANDARD_SPACE,
         vec!["*".to_string()],
     );
 
@@ -435,14 +435,14 @@ async fn act_as_wildcard_allows_any_namespace() {
         &mut svc,
         1,
         "tenant X (unlisted): the vault combination is 4-2-9",
-        Some(act_as("brand_new_tenant_x", agent_x)),
+        Some(act_as("brand_new_tenant_x", space_x)),
     )
     .await;
     let y1 = encode_as(
         &mut svc,
         3,
         "tenant Y (unlisted): standup is at 9am",
-        Some(act_as("brand_new_tenant_y", agent_y)),
+        Some(act_as("brand_new_tenant_y", space_y)),
     )
     .await;
 
@@ -454,7 +454,7 @@ async fn act_as_wildcard_allows_any_namespace() {
         &mut svc,
         5,
         "vault combination standup",
-        Some(act_as("brand_new_tenant_x", agent_x)),
+        Some(act_as("brand_new_tenant_x", space_x)),
     )
     .await;
     assert!(
@@ -466,7 +466,7 @@ async fn act_as_wildcard_allows_any_namespace() {
         &mut svc,
         7,
         "vault combination standup",
-        Some(act_as("brand_new_tenant_y", agent_y)),
+        Some(act_as("brand_new_tenant_y", space_y)),
     )
     .await;
     assert!(
@@ -484,12 +484,12 @@ async fn act_as_wildcard_allows_any_namespace() {
 async fn act_as_outside_allowlist_is_denied() {
     let server = start(1).await;
 
-    let svc_agent = *uuid::Uuid::now_v7().as_bytes();
+    let svc_space = *uuid::Uuid::now_v7().as_bytes();
     // Grant ACT_AS but only for "tenant_a"; the request targets "tenant_x".
     let svc_token = server.mint_with_may_act(
         "svc",
-        svc_agent,
-        brain_metadata::api_keys::bits::ACT_AS | brain_metadata::api_keys::bits::STANDARD_AGENT,
+        svc_space,
+        brain_metadata::api_keys::bits::ACT_AS | brain_metadata::api_keys::bits::STANDARD_SPACE,
         vec!["tenant_a".to_string()],
     );
 
@@ -533,28 +533,28 @@ async fn act_as_outside_allowlist_is_denied() {
 // ---------------------------------------------------------------------------
 
 /// Positive: a service-principal connection issues SUBSCRIBE with `act_as`
-/// targeting a DIFFERENT agent it's permitted to `may_act` for, and receives
-/// that agent's events — not its own raw connection identity's. Two
+/// targeting a DIFFERENT space it's permitted to `may_act` for, and receives
+/// that space's events — not its own raw connection identity's. Two
 /// connections authenticated with the SAME shared-pool key: one subscribes
 /// (act_as = target), the other encodes (act_as = the SAME target), proving
 /// the subscription is scoped to the effective identity end-to-end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subscribe_act_as_receives_target_agents_events() {
+async fn subscribe_act_as_receives_target_spaces_events() {
     let server = start(1).await;
 
-    let svc_agent = *uuid::Uuid::now_v7().as_bytes();
-    let target_agent = [0xF6u8; 16];
+    let svc_space = *uuid::Uuid::now_v7().as_bytes();
+    let target_space = [0xF6u8; 16];
 
     let svc_token = server.mint_with_may_act(
         "svc",
-        svc_agent,
-        brain_metadata::api_keys::bits::ACT_AS | brain_metadata::api_keys::bits::STANDARD_AGENT,
+        svc_space,
+        brain_metadata::api_keys::bits::ACT_AS | brain_metadata::api_keys::bits::STANDARD_SPACE,
         vec!["tenant_sub".to_string()],
     );
 
-    // Subscriber connection: SUBSCRIBE act_as = the target agent. The
-    // `filter.agents` is checked against the EFFECTIVE agent, so it must
-    // name the target, never the connection's own raw agent.
+    // Subscriber connection: SUBSCRIBE act_as = the target space. The
+    // `filter.spaces` is checked against the EFFECTIVE space, so it must
+    // name the target, never the connection's own raw space.
     let mut sub = TcpStream::connect(server.data_plane_addr)
         .await
         .expect("connect sub");
@@ -565,13 +565,13 @@ async fn subscribe_act_as_receives_target_agents_events() {
             contexts: None,
             kinds: None,
             similar_to: None,
-            agents: Some(vec![target_agent]),
+            spaces: Some(vec![target_space]),
             memory_ids: None,
         },
         include_history: false,
         from_lsn: None,
         max_inflight: 100,
-        act_as: Some(act_as("tenant_sub", target_agent)),
+        act_as: Some(act_as("tenant_sub", target_space)),
     };
     send_frame(
         &mut sub,
@@ -588,7 +588,7 @@ async fn subscribe_act_as_receives_target_agents_events() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Writer connection, same shared-pool key: ENCODE act_as = the SAME
-    // target agent, so the event is published under the effective identity
+    // target space, so the event is published under the effective identity
     // the subscription is scoped to.
     let mut writer = TcpStream::connect(server.data_plane_addr)
         .await
@@ -598,7 +598,7 @@ async fn subscribe_act_as_receives_target_agents_events() {
         &mut writer,
         1,
         "act_as-scoped subscribe: real-time delegated event",
-        Some(act_as("tenant_sub", target_agent)),
+        Some(act_as("tenant_sub", target_space)),
     )
     .await;
 
@@ -624,7 +624,7 @@ async fn subscribe_act_as_receives_target_agents_events() {
     }
     assert!(
         got_event,
-        "act_as-scoped SUBSCRIBE did not receive the target agent's ENCODE event"
+        "act_as-scoped SUBSCRIBE did not receive the target space's ENCODE event"
     );
 
     server.stop().await;
@@ -639,9 +639,9 @@ async fn subscribe_act_as_receives_target_agents_events() {
 async fn subscribe_act_as_without_grant_is_denied() {
     let server = start(1).await;
 
-    let agent = [0xC4u8; 16];
+    let space = [0xC4u8; 16];
     // FULL deliberately excludes ACT_AS.
-    let token = server.mint("plain", agent, brain_metadata::api_keys::bits::FULL);
+    let token = server.mint("plain", space, brain_metadata::api_keys::bits::FULL);
 
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
@@ -653,7 +653,7 @@ async fn subscribe_act_as_without_grant_is_denied() {
             contexts: None,
             kinds: None,
             similar_to: None,
-            agents: Some(vec![[0xA1u8; 16]]),
+            spaces: Some(vec![[0xA1u8; 16]]),
             memory_ids: None,
         },
         include_history: false,
@@ -689,11 +689,11 @@ async fn subscribe_act_as_without_grant_is_denied() {
 async fn subscribe_act_as_outside_allowlist_is_denied() {
     let server = start(1).await;
 
-    let svc_agent = *uuid::Uuid::now_v7().as_bytes();
+    let svc_space = *uuid::Uuid::now_v7().as_bytes();
     let svc_token = server.mint_with_may_act(
         "svc",
-        svc_agent,
-        brain_metadata::api_keys::bits::ACT_AS | brain_metadata::api_keys::bits::STANDARD_AGENT,
+        svc_space,
+        brain_metadata::api_keys::bits::ACT_AS | brain_metadata::api_keys::bits::STANDARD_SPACE,
         vec!["tenant_a".to_string()],
     );
 
@@ -707,7 +707,7 @@ async fn subscribe_act_as_outside_allowlist_is_denied() {
             contexts: None,
             kinds: None,
             similar_to: None,
-            agents: Some(vec![[0x99u8; 16]]),
+            spaces: Some(vec![[0x99u8; 16]]),
             memory_ids: None,
         },
         include_history: false,

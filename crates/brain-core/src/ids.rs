@@ -7,7 +7,7 @@
 //!   lookup, and detects stale references after slot reclamation via the
 //!   version.
 //! - **UUIDv7** (16 bytes) for first-class records that need globally
-//!   unique IDs with time-ordering: `AgentId`, `RequestId`, `TxnId`,
+//!   unique IDs with time-ordering: `SpaceId`, `RequestId`, `TxnId`,
 //!   `EntityId`, `StatementId`, `RelationId`, `AuditId`, `MergeId`,
 //!   `EvidenceOverflowId`.
 //! - **u32 interned** for registry entries that are user-declared and
@@ -37,14 +37,14 @@ pub type SlotVersion = u32;
 /// Maximum representable slot index: `(1 << 48) - 1`.
 pub const MAX_SLOT_INDEX: u64 = (1u64 << 48) - 1;
 
-/// Externally-supplied agent identifier.
+/// Externally-supplied space identifier.
 ///
 /// Brain treats this as opaque bytes. Most clients use UUIDv7.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct AgentId(pub Uuid);
+pub struct SpaceId(pub Uuid);
 
-impl AgentId {
-    /// All-zero "anonymous / unauthenticated" agent. Stable across
+impl SpaceId {
+    /// All-zero "anonymous / unauthenticated" space. Stable across
     /// calls — unlike [`Self::new`] which mints a fresh v7 UUID
     /// every time. Use this for:
     /// - Test fixtures that don't authenticate a connection
@@ -61,17 +61,17 @@ impl AgentId {
     }
 }
 
-/// `Default::default()` returns [`AgentId::NIL`] — the stable
+/// `Default::default()` returns [`SpaceId::NIL`] — the stable
 /// anonymous sentinel, NOT a fresh UUID. Code that wanted a fresh
-/// agent id should call [`Self::new`] explicitly.
-impl Default for AgentId {
+/// space id should call [`Self::new`] explicitly.
+impl Default for SpaceId {
     fn default() -> Self {
         Self::NIL
     }
 }
 
-/// Server-assigned context identifier. Agent-scoped
-/// — two agents can both have `ContextId(1)` and they are unrelated.
+/// Server-assigned context identifier. Space-scoped
+/// — two spaces can both have `ContextId(1)` and they are unrelated.
 /// `ContextId(0)` is reserved for the default context.
 #[derive(
     Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
@@ -79,7 +79,7 @@ impl Default for AgentId {
 pub struct ContextId(pub u64);
 
 impl ContextId {
-    /// The default context, automatically present for every agent.
+    /// The default context, automatically present for every space.
     pub const DEFAULT: Self = Self(0);
 
     #[must_use]
@@ -216,7 +216,7 @@ impl MemoryId {
 // Primitive-representation conversions.
 //
 // These are placed here (rather than in `brain-protocol`'s `convert` module)
-// so the orphan rules cooperate: `MemoryId` / `ContextId` / `AgentId` / etc.
+// so the orphan rules cooperate: `MemoryId` / `ContextId` / `SpaceId` / etc.
 // are local to brain-core, and the "wire-domain" aliases in brain-protocol
 // (`WireMemoryId = u128`, `WireUuid = [u8; 16]`, `WireContextId = u64`)
 // are just type aliases for primitives — so impls written here against the
@@ -251,17 +251,17 @@ impl From<u64> for ContextId {
     }
 }
 
-impl From<AgentId> for [u8; 16] {
+impl From<SpaceId> for [u8; 16] {
     #[inline]
-    fn from(id: AgentId) -> Self {
+    fn from(id: SpaceId) -> Self {
         *id.0.as_bytes()
     }
 }
 
-impl From<[u8; 16]> for AgentId {
+impl From<[u8; 16]> for SpaceId {
     #[inline]
     fn from(bytes: [u8; 16]) -> Self {
-        AgentId(Uuid::from_bytes(bytes))
+        SpaceId(Uuid::from_bytes(bytes))
     }
 }
 
@@ -458,8 +458,8 @@ u32_id! {
 u32_id! {
     /// Interned namespace (tenant) identifier — the company-level data
     /// boundary. Every memory, entity, statement, and relation is owned
-    /// by exactly one namespace; combined with the owning `AgentId` it
-    /// forms the `(namespace, agent)` scope key under which all data is
+    /// by exactly one namespace; combined with the owning `SpaceId` it
+    /// forms the `(namespace, space)` scope key under which all data is
     /// isolated. Distinct from the *schema* namespace prefix on a type
     /// name (`acme:Person`): a row owned by namespace `acme` may still
     /// reference a shared `brain:`-namespace type. The reserved system

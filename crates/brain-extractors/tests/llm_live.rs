@@ -41,7 +41,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use brain_core::{AgentId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
+use brain_core::{SpaceId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
 use brain_extractors::{
     hash_memory_text, ExtractedItem, ExtractionContext, ExtractionStatus, Extractor,
     ExtractorRegistry, LlmExtractor,
@@ -95,7 +95,7 @@ prose.";
 fn memory(text: &str) -> Memory {
     Memory {
         id: MemoryId::pack(0, 1, 0),
-        agent: AgentId::new(),
+        space: SpaceId::new(),
         context: ContextId(0),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),

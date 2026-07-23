@@ -1156,7 +1156,7 @@ fn txn_at_exactly_1000_commits_fine() {
 #[test]
 fn txn_rejects_op_beyond_1000_cap() {
     // Append-time check: the 1000th op succeeds, the 1001st returns
-    // TransactionTooLarge. The agent learns about the cap immediately
+    // TransactionTooLarge. The space learns about the cap immediately
     // rather than burning thousands of doomed ops only to be rejected
     // at TXN_COMMIT.
     run_in_glommio(|| async {
@@ -1197,7 +1197,7 @@ fn txn_replay_still_works_when_buffer_is_full() {
     // Edge case: at the cap, an idempotent re-submit of an already-
     // buffered request_id MUST still replay (return cached response)
     // — the replay path doesn't grow the buffer, so the cap doesn't
-    // apply. Otherwise an agent's automatic retry on a flaky
+    // apply. Otherwise an space's automatic retry on a flaky
     // connection would fail the moment it hit the cap.
     run_in_glommio(|| async {
         let fix = build_fixture();

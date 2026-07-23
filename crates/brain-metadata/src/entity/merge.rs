@@ -43,26 +43,26 @@ use crate::tables::merge::{actor_kind, MergeRecord, MERGE_LOG_TABLE};
 /// Who initiated the merge.
 ///
 /// `System` is for the resolver / background workers (e.g. LLM-tier
-/// merge suggestions). `Agent` is an operator agent_id over the wire
+/// merge suggestions). `Space` is an operator space_id over the wire
 /// (the `ENTITY_MERGE` opcode).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MergeActor {
     System,
-    Agent([u8; 16]),
+    Space([u8; 16]),
 }
 
 impl MergeActor {
     fn kind_byte(self) -> u8 {
         match self {
             Self::System => actor_kind::SYSTEM,
-            Self::Agent(_) => actor_kind::AGENT,
+            Self::Space(_) => actor_kind::SPACE,
         }
     }
 
-    fn agent_bytes(self) -> [u8; 16] {
+    fn space_bytes(self) -> [u8; 16] {
         match self {
             Self::System => [0; 16],
-            Self::Agent(bytes) => bytes,
+            Self::Space(bytes) => bytes,
         }
     }
 }
@@ -242,7 +242,7 @@ pub fn merge_entity(
         let mut t = wtxn.open_table(ENTITY_BY_CANONICAL_NAME_TABLE)?;
         t.remove(&(
             scope.namespace_id,
-            scope.agent_id_bytes,
+            scope.space_id_bytes,
             merged_row.entity_type_id,
             merged_canonical_norm.as_str(),
         ))?;
@@ -253,7 +253,7 @@ pub fn merge_entity(
             let n = normalize_name(a);
             t.remove(&(
                 scope.namespace_id,
-                scope.agent_id_bytes,
+                scope.space_id_bytes,
                 merged_row.entity_type_id,
                 n.as_str(),
                 merged_row.entity_id_bytes,
@@ -272,7 +272,7 @@ pub fn merge_entity(
             t.insert(
                 &(
                     scope.namespace_id,
-                    scope.agent_id_bytes,
+                    scope.space_id_bytes,
                     survivor_row.entity_type_id,
                     n.as_str(),
                     survivor_row.entity_id_bytes,
@@ -322,7 +322,7 @@ pub fn merge_entity(
         confidence,
         reason,
         actor.kind_byte(),
-        actor.agent_bytes(),
+        actor.space_bytes(),
     );
     audit.aliases_added = aliases_added;
     audit.trigrams_added = trigrams_added;
@@ -402,7 +402,7 @@ pub fn unmerge_entity(
             let n = normalize_name(a);
             t.remove(&(
                 scope.namespace_id,
-                scope.agent_id_bytes,
+                scope.space_id_bytes,
                 survivor_row.entity_type_id,
                 n.as_str(),
                 survivor_row.entity_id_bytes,
@@ -424,7 +424,7 @@ pub fn unmerge_entity(
         t.insert(
             &(
                 scope.namespace_id,
-                scope.agent_id_bytes,
+                scope.space_id_bytes,
                 merged_row.entity_type_id,
                 normalize_name(&merged_row.canonical_name).as_str(),
             ),
@@ -438,7 +438,7 @@ pub fn unmerge_entity(
             t.insert(
                 &(
                     scope.namespace_id,
-                    scope.agent_id_bytes,
+                    scope.space_id_bytes,
                     merged_row.entity_type_id,
                     n.as_str(),
                     merged_row.entity_id_bytes,
@@ -463,7 +463,7 @@ pub fn unmerge_entity(
     // 7. Mark the audit row as unmerged + finalized.
     audit.unmerged_at_unix_nanos = now_unix_nanos;
     audit.unmerged_by_actor_kind = actor.kind_byte();
-    audit.unmerged_by_agent_bytes = actor.agent_bytes();
+    audit.unmerged_by_space_bytes = actor.space_bytes();
     audit.finalized = 1;
     {
         let mut t = wtxn.open_table(MERGE_LOG_TABLE)?;
@@ -600,7 +600,7 @@ mod tests {
                 alyss.id,
                 0.92,
                 "duplicate".into(),
-                MergeActor::Agent([1u8; 16]),
+                MergeActor::Space([1u8; 16]),
                 GRACE_SECS,
                 LATER,
             )
@@ -649,7 +649,7 @@ mod tests {
             alice.id,
             0.9,
             "self".into(),
-            MergeActor::Agent([1; 16]),
+            MergeActor::Space([1; 16]),
             GRACE_SECS,
             LATER,
         )
@@ -672,7 +672,7 @@ mod tests {
             bob.id,
             0.5,
             "low".into(),
-            MergeActor::Agent([1; 16]),
+            MergeActor::Space([1; 16]),
             GRACE_SECS,
             LATER,
         )
@@ -700,7 +700,7 @@ mod tests {
                 bob.id,
                 0.9,
                 "first".into(),
-                MergeActor::Agent([1; 16]),
+                MergeActor::Space([1; 16]),
                 GRACE_SECS,
                 LATER,
             )
@@ -716,7 +716,7 @@ mod tests {
             bob.id,
             0.9,
             "second".into(),
-            MergeActor::Agent([1; 16]),
+            MergeActor::Space([1; 16]),
             GRACE_SECS,
             LATER,
         )
@@ -745,7 +745,7 @@ mod tests {
                 alyss.id,
                 0.9,
                 "test".into(),
-                MergeActor::Agent([1; 16]),
+                MergeActor::Space([1; 16]),
                 GRACE_SECS,
                 merge_at,
             )
@@ -759,7 +759,7 @@ mod tests {
             let restored = unmerge_entity(
                 &wtxn,
                 alyss.id,
-                MergeActor::Agent([2; 16]),
+                MergeActor::Space([2; 16]),
                 merge_at + 60_000_000_000,
             )
             .unwrap();
@@ -806,7 +806,7 @@ mod tests {
                 alyss.id,
                 0.9,
                 "test".into(),
-                MergeActor::Agent([1; 16]),
+                MergeActor::Space([1; 16]),
                 grace,
                 merge_at,
             )
@@ -819,7 +819,7 @@ mod tests {
         let err = unmerge_entity(
             &wtxn,
             alyss.id,
-            MergeActor::Agent([2; 16]),
+            MergeActor::Space([2; 16]),
             merge_at + 2_000_000_000, // 2 seconds — past grace
         )
         .unwrap_err();
@@ -834,7 +834,7 @@ mod tests {
         put(&mut db, &alice);
 
         let wtxn = db.write_txn().unwrap();
-        let err = unmerge_entity(&wtxn, alice.id, MergeActor::Agent([1; 16]), LATER).unwrap_err();
+        let err = unmerge_entity(&wtxn, alice.id, MergeActor::Space([1; 16]), LATER).unwrap_err();
         assert!(matches!(err, EntityMergeOpError::NotMerged(_)));
     }
 
@@ -861,7 +861,7 @@ mod tests {
             bob.id,
             0.9,
             "test".into(),
-            MergeActor::Agent([1; 16]),
+            MergeActor::Space([1; 16]),
             GRACE_SECS,
             LATER,
         )

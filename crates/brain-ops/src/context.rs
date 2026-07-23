@@ -415,7 +415,7 @@ impl OpsContext {
         &self,
         kind: brain_storage::wal::kinds::WalRecordKind,
         payload: P,
-        agent_id: brain_core::AgentId,
+        space_id: brain_core::SpaceId,
         make_envelope: F,
     ) where
         P: serde::Serialize,
@@ -428,13 +428,13 @@ impl OpsContext {
         let lsn = if let Some(sink) = &self.wal_sink {
             // CBOR-encode the notification event, then frame it in the same
             // opaque-body envelope every other opaque-body record uses:
-            // `agent_id (16 B) || body`. `WalPayload::decode` strips that
+            // `space_id (16 B) || body`. `WalPayload::decode` strips that
             // 16-byte prefix before handing the body to subscribe-replay's
             // `from_wal_record`, so the prefix is mandatory — without it the
             // CBOR body would be decoded starting 16 bytes in and fail.
             let body = {
                 let mut buf = Vec::with_capacity(16);
-                buf.extend_from_slice(&<[u8; 16]>::from(agent_id));
+                buf.extend_from_slice(&<[u8; 16]>::from(space_id));
                 match ciborium::into_writer(&payload, &mut buf) {
                     Ok(()) => buf,
                     Err(e) => {
@@ -456,7 +456,7 @@ impl OpsContext {
                 // record classes).
                 flags: brain_storage::wal::record::FLAG_SUBSCRIBE_EVENT,
                 timestamp_ns: now_unix_nanos_ctx(),
-                agent_id_lo64: 0,
+                space_id_lo64: 0,
                 payload: body,
             };
             match sink.append(record).await {
@@ -520,11 +520,11 @@ impl OpsContext {
             stage_outcome,
             stage_payload,
         };
-        let agent_id = env.agent_id;
+        let space_id = env.space_id;
         self.publish_notification(
             brain_storage::wal::kinds::WalRecordKind::StageCompleted,
             body,
-            agent_id,
+            space_id,
             move |lsn, _body| {
                 env.lsn = lsn;
                 env

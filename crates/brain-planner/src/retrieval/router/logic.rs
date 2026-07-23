@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use brain_core::StatementKind;
-use brain_core::{AgentId, EntityId, PredicateId};
+use brain_core::{SpaceId, EntityId, PredicateId};
 use regex::Regex;
 
 // ---------------------------------------------------------------------------
@@ -72,13 +72,13 @@ pub struct QueryRequest {
     /// boolean MUST clause so the filter scopes the search universe
     /// before any expensive stage, not as a post-projection prune.
     pub context_filter: Vec<u64>,
-    /// Agent-scope filter. When non-empty the front gate restricts
-    /// every retriever to memories whose `agent_id` is in this set.
-    /// The recall handler defaults this to `[caller_agent]` so each
-    /// agent sees only its own memories without any explicit flag —
-    /// `--include-other-agents` on the wire side empties the list to
-    /// recover the across-agents view.
-    pub agent_filter: Vec<AgentId>,
+    /// Space-scope filter. When non-empty the front gate restricts
+    /// every retriever to memories whose `space_id` is in this set.
+    /// The recall handler defaults this to `[caller_space]` so each
+    /// space sees only its own memories without any explicit flag —
+    /// `--include-other-spaces` on the wire side empties the list to
+    /// recover the across-spaces view.
+    pub space_filter: Vec<SpaceId>,
     /// Bi-temporal time-travel — return only statements the substrate
     /// believed at this record-time unix-nanos. `None` is the default
     /// "current state" query. Server-internal in v1.0: not exposed on

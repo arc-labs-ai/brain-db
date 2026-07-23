@@ -9,7 +9,7 @@ ultimately `brain-server`. Apache-2.0.
 ## What it does
 
 The redb-backed metadata and typed-graph store for a shard. It holds memory
-metadata, agents/contexts, the idempotency table, and the durable LSN
+metadata, spaces/contexts, the idempotency table, and the durable LSN
 checkpoint, alongside the full typed-graph tables — entities, statements (with
 evidence overflow), relations, predicates, schema/predicate type interning, and
 the audit log. It encodes rows via `rkyv`/`bytemuck`, drives schema upload and

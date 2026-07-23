@@ -73,10 +73,10 @@ pub fn resolve_statement_triple(
     let evidence_table = rtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE).ok()?;
     let mid = memory_id.to_be_bytes();
     // STATEMENTS_BY_EVIDENCE_TABLE keys are `(namespace_id,
-    // agent_id_bytes, MemoryId, StatementId)` — same scoped range
+    // space_id_bytes, MemoryId, StatementId)` — same scoped range
     // shape as `fetch_enrichment_for`'s evidence-table scan.
-    let lo = (scope.namespace_id, scope.agent_id_bytes, mid, [0u8; 16]);
-    let hi = (scope.namespace_id, scope.agent_id_bytes, mid, [0xFFu8; 16]);
+    let lo = (scope.namespace_id, scope.space_id_bytes, mid, [0u8; 16]);
+    let hi = (scope.namespace_id, scope.space_id_bytes, mid, [0xFFu8; 16]);
     let Ok(range) = evidence_table.range(lo..=hi) else {
         return None;
     };
@@ -84,7 +84,7 @@ pub fn resolve_statement_triple(
     let mut best: Option<Statement> = None;
     for entry in range {
         let Ok((k, _v)) = entry else { continue };
-        let (_ns, _agent, _mem, sid_bytes) = k.value();
+        let (_ns, _space, _mem, sid_bytes) = k.value();
         let sid = StatementId::from_bytes(sid_bytes);
         let Ok(Some(stmt)) = statement_get(rtxn, sid) else {
             continue;

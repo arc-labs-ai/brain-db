@@ -274,7 +274,7 @@ pub enum Phase {
         confidence: f32,
         /// Free-form reason for the audit row.
         reason: String,
-        /// Who initiated the merge — typically the caller agent's
+        /// Who initiated the merge — typically the caller space's
         /// id bytes, or a system identifier.
         actor: brain_metadata::entity::merge::MergeActor,
         /// Grace window before `source` is reclaimed.

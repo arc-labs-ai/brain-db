@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, StatementId};
+use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, StatementId};
 use brain_core::{
     EntityId, EntityTypeId, EvidenceEntry, EvidenceRef, ExtractorId, Statement, StatementKind,
     StatementObject, SubjectRef,
@@ -122,7 +122,7 @@ async fn seed_memory(fixture: &Fixture, slot: u64) -> MemoryId {
         content_hash: None,
         deduplicate: false,
     };
-    let write = Write::single(WriteId::new(), AgentId::default(), phase);
+    let write = Write::single(WriteId::new(), SpaceId::default(), phase);
     fixture.writer.submit(write).await.expect("seed submit");
     id
 }

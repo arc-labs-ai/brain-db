@@ -8,7 +8,7 @@
 //! ## v1 simplifications
 //!
 //! - **Memory text rebuild is content-complete.** The memory text
-//!   lives in `TEXTS_TABLE` (keyed by memory id); agent / kind /
+//!   lives in `TEXTS_TABLE` (keyed by memory id); space / kind /
 //!   created_at come from `MEMORIES_TABLE`. Rebuild reconstructs
 //!   every active memory's lexical doc from authoritative storage,
 //!   so the lexical lane survives a restart without re-ingestion.
@@ -80,7 +80,7 @@ pub fn rebuild_memory_text(
 /// Iterate `MEMORIES_TABLE`, join `TEXTS_TABLE`, and index every
 /// active memory's lexical doc. Doc shape mirrors the live indexer
 /// (`text_indexer::memory`): `memory_id` (key bytes), `text`,
-/// `agent_id` (bytes), `kind` (u64), `created_at` (unix ms).
+/// `space_id` (bytes), `kind` (u64), `created_at` (unix ms).
 fn iterate_memories(
     writer: &mut IndexWriter,
     index: &Index,
@@ -93,9 +93,9 @@ fn iterate_memories(
     let text_field = schema
         .get_field("text")
         .map_err(|e| RebuildError::Metadata(format!("text: {e}")))?;
-    let agent_id_field = schema
-        .get_field("agent_id")
-        .map_err(|e| RebuildError::Metadata(format!("agent_id: {e}")))?;
+    let space_id_field = schema
+        .get_field("space_id")
+        .map_err(|e| RebuildError::Metadata(format!("space_id: {e}")))?;
     let kind_field = schema
         .get_field("kind")
         .map_err(|e| RebuildError::Metadata(format!("kind: {e}")))?;
@@ -141,7 +141,7 @@ fn iterate_memories(
         let mut doc = TantivyDocument::default();
         doc.add_bytes(memory_id_field, &key_bytes);
         doc.add_text(text_field, &text);
-        doc.add_bytes(agent_id_field, &meta.agent_id_bytes);
+        doc.add_bytes(space_id_field, &meta.space_id_bytes);
         doc.add_u64(kind_field, u64::from(meta.kind));
         doc.add_u64(created_at_field, meta.created_at_unix_nanos / 1_000_000);
         doc.add_u64(context_field, meta.context_id);

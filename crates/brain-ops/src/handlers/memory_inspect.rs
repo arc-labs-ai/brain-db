@@ -2,7 +2,7 @@
 //! memory, so any memory can be inspected in a friendly per-stage view (not just
 //! the one just written via the ENCODE trace).
 //!
-//! Read-only. It resolves the memory under the caller's `(namespace, agent)`
+//! Read-only. It resolves the memory under the caller's `(namespace, space)`
 //! scope (cross-tenant ids read as "not found", never leak), then returns the
 //! memory text plus the stored artifact bundle. The bundle is populated
 //! incrementally by the write path + async workers; a memory whose bundle has
@@ -30,7 +30,7 @@ pub async fn handle_memory_inspect(
     };
 
     let caller_ns = u32::from(ctx.executor.caller_namespace);
-    let caller_agent: [u8; 16] = ctx.executor.caller_agent.into();
+    let caller_space: [u8; 16] = ctx.executor.caller_space.into();
 
     let rtxn = ctx
         .executor
@@ -39,7 +39,7 @@ pub async fn handle_memory_inspect(
         .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
 
     // Tenancy: the memory must exist and be owned by the caller. A memory id
-    // that belongs to another `(namespace, agent)` is indistinguishable from a
+    // that belongs to another `(namespace, space)` is indistinguishable from a
     // missing one to this caller.
     {
         let memories = rtxn
@@ -50,7 +50,7 @@ pub async fn handle_memory_inspect(
             .map_err(|e| OpError::Internal(format!("memory read: {e}")))?
             .map(|g| {
                 let m = g.value();
-                m.namespace_id == caller_ns && m.agent_id_bytes == caller_agent
+                m.namespace_id == caller_ns && m.space_id_bytes == caller_space
             })
             .unwrap_or(false);
         if !owned {

@@ -84,11 +84,11 @@ pub struct Server {
     /// resolves credentials against. Tests mint keys via [`Server::mint`].
     pub auth_store: Arc<crate::auth::AuthStore>,
     /// A pre-minted FULL-permission token (raw secret bytes) for a default
-    /// `(namespace="test", agent=default_agent)`. Most tests just present
-    /// this; multi-agent tests call [`Server::mint`] for more.
+    /// `(namespace="test", space=default_space)`. Most tests just present
+    /// this; multi-space tests call [`Server::mint`] for more.
     pub token: Vec<u8>,
-    /// The agent_id bound to [`Server::token`].
-    pub default_agent: [u8; 16],
+    /// The space_id bound to [`Server::token`].
+    pub default_space: [u8; 16],
     /// `Some` when [`start`] owns the data dir (auto-cleanup on `stop`);
     /// `None` when [`start_in`] was used and the caller holds the
     /// `TempDir` (so the data dir survives `stop` for inspection).
@@ -96,10 +96,10 @@ pub struct Server {
 }
 
 impl Server {
-    /// Mint an API key for `(namespace, agent)` with the given permission
+    /// Mint an API key for `(namespace, space)` with the given permission
     /// bitfield and return the raw secret bytes to present in AUTH.
-    pub fn mint(&self, namespace: &str, agent: [u8; 16], permissions: u32) -> Vec<u8> {
-        self.mint_with_may_act(namespace, agent, permissions, Vec::new())
+    pub fn mint(&self, namespace: &str, space: [u8; 16], permissions: u32) -> Vec<u8> {
+        self.mint_with_may_act(namespace, space, permissions, Vec::new())
     }
 
     /// Like [`Server::mint`] but attaches a `may_act` allowlist — the set of
@@ -109,7 +109,7 @@ impl Server {
     pub fn mint_with_may_act(
         &self,
         namespace: &str,
-        agent: [u8; 16],
+        space: [u8; 16],
         permissions: u32,
         may_act: Vec<String>,
     ) -> Vec<u8> {
@@ -122,7 +122,7 @@ impl Server {
                 [0u8; 16],
                 [0u8; 16],
                 namespace.to_string(),
-                agent,
+                space,
                 permissions,
                 may_act,
                 now,
@@ -219,7 +219,7 @@ where
     // dispatch (no SYSTEM fallback for user data), so the harness key must
     // carry one. Namespace-scoped tests mint their own keys via
     // `Server::mint` for other tenants.
-    let default_agent = *uuid::Uuid::now_v7().as_bytes();
+    let default_space = *uuid::Uuid::now_v7().as_bytes();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -229,7 +229,7 @@ where
             [0u8; 16],
             [0u8; 16],
             "test".to_string(),
-            default_agent,
+            default_space,
             brain_metadata::api_keys::bits::FULL,
             Vec::new(),
             now,
@@ -284,7 +284,7 @@ where
         joiners,
         auth_store,
         token,
-        default_agent,
+        default_space,
         _data_dir: None,
     }
 }

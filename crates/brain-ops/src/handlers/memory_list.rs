@@ -1,7 +1,7 @@
 //! `MEMORY_LIST` handler — paginated enumeration of the caller's memories.
 //!
 //! This is not RECALL. There is no cue, no ranking, no relevance
-//! suppression: it walks the caller's `(namespace, agent)` timeline in a
+//! suppression: it walks the caller's `(namespace, space)` timeline in a
 //! stable order and returns one keyset page plus an opaque resume cursor.
 //!
 //! Tombstone note: the timeline index drops a memory's row when it is
@@ -12,14 +12,14 @@
 //! secondary index. The exclude path is exact.
 //!
 //! v1 ships the `created_at` sort axis with real keyset pagination over
-//! [`brain_metadata::tables::memory::MEMORIES_BY_AGENT_TIMELINE_TABLE`].
+//! [`brain_metadata::tables::memory::MEMORIES_BY_SPACE_TIMELINE_TABLE`].
 //! The other sort axes (salience / occurred / last_accessed) and the
 //! `text_contains` filter have no tenant-scoped index yet and are
 //! rejected with a precise `InvalidRequest` rather than served by an
 //! O(N) full scan.
 
 use brain_metadata::tables::memory::{
-    memory_timeline_page, MemoryMetadata, MemoryTimelineFilter, AGENT_TIMELINE_KEY_LEN,
+    memory_timeline_page, MemoryMetadata, MemoryTimelineFilter, SPACE_TIMELINE_KEY_LEN,
 };
 use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_metadata::RowScope;
@@ -36,7 +36,7 @@ use crate::error::OpError;
 const CURSOR_VERSION: u8 = 1;
 
 /// `[version(1)][sort(1)][dir(1)][filter_sig(8)][timeline_key(52)]`.
-const CURSOR_LEN: usize = 1 + 1 + 1 + 8 + AGENT_TIMELINE_KEY_LEN;
+const CURSOR_LEN: usize = 1 + 1 + 1 + 8 + SPACE_TIMELINE_KEY_LEN;
 
 const MAX_LIMIT: u32 = 100;
 
@@ -86,13 +86,13 @@ pub async fn handle_memory_list(
 
     // A non-empty cursor must match the current sort/dir/filters exactly,
     // or the resumed page would silently belong to a different result set.
-    let after_key: Option<[u8; AGENT_TIMELINE_KEY_LEN]> = if req.cursor.is_empty() {
+    let after_key: Option<[u8; SPACE_TIMELINE_KEY_LEN]> = if req.cursor.is_empty() {
         None
     } else {
         Some(decode_cursor(&req.cursor, &req, &filter_sig)?)
     };
 
-    let scope = RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_agent);
+    let scope = RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
 
     let rtxn = ctx
         .executor
@@ -178,13 +178,13 @@ fn graph_counts(
         .and_then(|t| {
             let lo = (
                 scope.namespace_id,
-                scope.agent_id_bytes,
+                scope.space_id_bytes,
                 memory_id_bytes,
                 [0u8; 16],
             );
             let hi = (
                 scope.namespace_id,
-                scope.agent_id_bytes,
+                scope.space_id_bytes,
                 memory_id_bytes,
                 [0xFFu8; 16],
             );
@@ -277,7 +277,7 @@ fn filter_signature(req: &MemoryListRequest) -> [u8; 8] {
 fn encode_cursor(
     req: &MemoryListRequest,
     sig: &[u8; 8],
-    key: &[u8; AGENT_TIMELINE_KEY_LEN],
+    key: &[u8; SPACE_TIMELINE_KEY_LEN],
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(CURSOR_LEN);
     out.push(CURSOR_VERSION);
@@ -292,7 +292,7 @@ fn decode_cursor(
     cursor: &[u8],
     req: &MemoryListRequest,
     sig: &[u8; 8],
-) -> Result<[u8; AGENT_TIMELINE_KEY_LEN], OpError> {
+) -> Result<[u8; SPACE_TIMELINE_KEY_LEN], OpError> {
     let stale = || OpError::InvalidRequest("stale_cursor: filters changed".into());
     if cursor.len() != CURSOR_LEN || cursor[0] != CURSOR_VERSION {
         return Err(stale());
@@ -303,7 +303,7 @@ fn decode_cursor(
     if &cursor[3..11] != sig.as_slice() {
         return Err(stale());
     }
-    let mut key = [0u8; AGENT_TIMELINE_KEY_LEN];
+    let mut key = [0u8; SPACE_TIMELINE_KEY_LEN];
     key.copy_from_slice(&cursor[11..]);
     Ok(key)
 }

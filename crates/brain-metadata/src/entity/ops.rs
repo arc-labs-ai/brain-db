@@ -150,7 +150,7 @@ pub fn entity_lookup_by_canonical_name(
     let bytes: Option<[u8; 16]> = t
         .get(&(
             scope.namespace_id,
-            scope.agent_id_bytes,
+            scope.space_id_bytes,
             type_id.raw(),
             normalized.as_str(),
         ))?
@@ -356,7 +356,7 @@ pub fn entity_resolve_canonical_all_types_wtxn(
     for tid in type_ids {
         if let Some(g) = canon_t.get(&(
             scope.namespace_id,
-            scope.agent_id_bytes,
+            scope.space_id_bytes,
             tid,
             normalized.as_str(),
         ))? {
@@ -383,14 +383,14 @@ pub fn entity_lookup_by_alias(
     let t = rtxn.open_table(ENTITY_ALIASES_TABLE)?;
     let lo = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         type_id.raw(),
         normalized.as_str(),
         [0u8; 16],
     );
     let hi = (
         scope.namespace_id,
-        scope.agent_id_bytes,
+        scope.space_id_bytes,
         type_id.raw(),
         normalized.as_str(),
         [0xFFu8; 16],
@@ -398,12 +398,12 @@ pub fn entity_lookup_by_alias(
     let mut out = Vec::new();
     for entry in t.range(lo..=hi)? {
         let (k, _) = entry?;
-        let (k_ns, k_agent, k_type, k_alias, k_id) = k.value();
+        let (k_ns, k_space, k_type, k_alias, k_id) = k.value();
         // Defensive guard: range bounds carry the same scope+type+alias,
         // so any entry inside the range must match all. Skip otherwise to
         // be robust against future key-shape changes.
         if k_ns == scope.namespace_id
-            && k_agent == scope.agent_id_bytes
+            && k_space == scope.space_id_bytes
             && k_type == type_id.raw()
             && k_alias == normalized
         {
@@ -428,10 +428,10 @@ pub fn entity_list_by_type(
         let (_, v) = entry?;
         let m = v.value();
         // Tenant wall (unconditional): a list never crosses the caller's
-        // `(namespace, agent)`. The primary table is a flat keyspace
+        // `(namespace, space)`. The primary table is a flat keyspace
         // shared across tenants, so the scope check is what isolates it.
         if m.namespace_id == scope.namespace_id
-            && m.agent_id_bytes == scope.agent_id_bytes
+            && m.space_id_bytes == scope.space_id_bytes
             && m.entity_type_id == type_id.raw()
         {
             out.push((&m).into());
@@ -576,14 +576,14 @@ pub fn entity_put(
     let normalized = normalize_name(&entity.canonical_name);
     // Reject duplicate canonical_name within the same (scope, type). The
     // index is keyed single-value PER SCOPE; the same name under a
-    // different `(namespace, agent)` is a distinct entity, not a
+    // different `(namespace, space)` is a distinct entity, not a
     // collision.
     {
         let t = wtxn.open_table(ENTITY_BY_CANONICAL_NAME_TABLE)?;
         let existing: Option<[u8; 16]> = t
             .get(&(
                 scope.namespace_id,
-                scope.agent_id_bytes,
+                scope.space_id_bytes,
                 entity.entity_type.raw(),
                 normalized.as_str(),
             ))?
@@ -614,7 +614,7 @@ pub fn entity_put(
         t.insert(
             &(
                 scope.namespace_id,
-                scope.agent_id_bytes,
+                scope.space_id_bytes,
                 entity.entity_type.raw(),
                 normalized.as_str(),
             ),
@@ -630,7 +630,7 @@ pub fn entity_put(
             t.insert(
                 &(
                     scope.namespace_id,
-                    scope.agent_id_bytes,
+                    scope.space_id_bytes,
                     entity.entity_type.raw(),
                     na.as_str(),
                     m.entity_id_bytes,
@@ -706,14 +706,14 @@ pub fn entity_update(
         let mut t = wtxn.open_table(ENTITY_BY_CANONICAL_NAME_TABLE)?;
         t.remove(&(
             scope.namespace_id,
-            scope.agent_id_bytes,
+            scope.space_id_bytes,
             current.entity_type_id,
             normalized_old.as_str(),
         ))?;
         let existing: Option<[u8; 16]> = t
             .get(&(
                 scope.namespace_id,
-                scope.agent_id_bytes,
+                scope.space_id_bytes,
                 next.entity_type.raw(),
                 normalized_new.as_str(),
             ))?
@@ -728,7 +728,7 @@ pub fn entity_update(
         t.insert(
             &(
                 scope.namespace_id,
-                scope.agent_id_bytes,
+                scope.space_id_bytes,
                 next.entity_type.raw(),
                 normalized_new.as_str(),
             ),
@@ -745,7 +745,7 @@ pub fn entity_update(
         for removed in old_norms.difference(&new_norms) {
             t.remove(&(
                 scope.namespace_id,
-                scope.agent_id_bytes,
+                scope.space_id_bytes,
                 current.entity_type_id,
                 removed.as_str(),
                 current.entity_id_bytes,
@@ -755,7 +755,7 @@ pub fn entity_update(
             t.insert(
                 &(
                     scope.namespace_id,
-                    scope.agent_id_bytes,
+                    scope.space_id_bytes,
                     next.entity_type.raw(),
                     added.as_str(),
                     next.id.to_bytes(),
@@ -868,7 +868,7 @@ pub fn entity_tombstone(
         let mut t = wtxn.open_table(ENTITY_BY_CANONICAL_NAME_TABLE)?;
         t.remove(&(
             scope.namespace_id,
-            scope.agent_id_bytes,
+            scope.space_id_bytes,
             current.entity_type_id,
             normalized.as_str(),
         ))?;
@@ -880,7 +880,7 @@ pub fn entity_tombstone(
             let na = normalize_name(alias);
             t.remove(&(
                 scope.namespace_id,
-                scope.agent_id_bytes,
+                scope.space_id_bytes,
                 current.entity_type_id,
                 na.as_str(),
                 current.entity_id_bytes,

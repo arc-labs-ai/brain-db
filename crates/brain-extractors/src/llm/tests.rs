@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brain_core::{
-    AgentId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience, Statement,
+    SpaceId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience, Statement,
     StatementObject, StatementValue, SubjectRef,
 };
 use brain_llm::client::LlmFuture;
@@ -97,7 +97,7 @@ fn entity_target() -> ExtractorTarget {
 fn memory(text: &str) -> Memory {
     Memory {
         id: MemoryId::pack(0, 1, 0),
-        agent: AgentId::new(),
+        space: SpaceId::new(),
         context: ContextId(0),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),

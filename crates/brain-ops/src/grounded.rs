@@ -1182,7 +1182,7 @@ mod tests {
         let row = MemoryMetadata::new_active(
             id,
             brain_core::NamespaceId::SYSTEM,
-            brain_core::AgentId::new(),
+            brain_core::SpaceId::new(),
             brain_core::ContextId::from(0),
             id.slot(),
             id.version(),

@@ -9,7 +9,7 @@
 //! The writer doesn't distinguish among these origins. One queue,
 //! one apply path, one WAL envelope, one event burst.
 
-use brain_core::{AgentId, MemoryId, NamespaceId};
+use brain_core::{SpaceId, MemoryId, NamespaceId};
 use brain_storage::wal::record::Lsn;
 
 use super::id::WriteId;
@@ -33,10 +33,10 @@ pub struct PendingStage {
 pub struct Write {
     pub write_id: WriteId,
     /// Authenticated caller. Stamped onto audit rows and event
-    /// envelopes; `AgentId::default()` for anonymous / test paths.
-    pub agent_id: AgentId,
+    /// envelopes; `SpaceId::default()` for anonymous / test paths.
+    pub space_id: SpaceId,
     /// Owning namespace (tenant) — the outer half of the
-    /// `(namespace, agent)` scope key stamped onto every row this write
+    /// `(namespace, space)` scope key stamped onto every row this write
     /// produces. Defaults to [`NamespaceId::SYSTEM`]; the wire handler
     /// sets it from the authenticated connection via
     /// [`Self::with_namespace`].
@@ -62,10 +62,10 @@ impl Write {
     /// Build a single-phase write. The most common shape — every
     /// non-TXN wire request after the migration produces one of these.
     #[must_use]
-    pub fn single(write_id: WriteId, agent_id: AgentId, phase: Phase) -> Self {
+    pub fn single(write_id: WriteId, space_id: SpaceId, phase: Phase) -> Self {
         Self {
             write_id,
-            agent_id,
+            space_id,
             namespace: NamespaceId::SYSTEM,
             started_at_unix_nanos: 0,
             phases: vec![phase],
@@ -76,10 +76,10 @@ impl Write {
     /// Build from a vec of phases. Used by the TXN_COMMIT path and by
     /// workers that derive multiple phases per drained trigger.
     #[must_use]
-    pub fn from_phases(write_id: WriteId, agent_id: AgentId, phases: Vec<Phase>) -> Self {
+    pub fn from_phases(write_id: WriteId, space_id: SpaceId, phases: Vec<Phase>) -> Self {
         Self {
             write_id,
-            agent_id,
+            space_id,
             namespace: NamespaceId::SYSTEM,
             started_at_unix_nanos: 0,
             phases,
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn write_from_phases_preserves_order() {
         let phases = vec![sample_phase(), sample_phase(), sample_phase()];
-        let w = Write::from_phases(WriteId::new(), AgentId::default(), phases.clone());
+        let w = Write::from_phases(WriteId::new(), SpaceId::default(), phases.clone());
         assert_eq!(w.phase_count(), 3);
         assert!(!w.is_single());
         for (i, p) in w.phases.iter().enumerate() {
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn write_started_at_chainable() {
-        let w = Write::single(WriteId::new(), AgentId::default(), sample_phase()).started_at(42);
+        let w = Write::single(WriteId::new(), SpaceId::default(), sample_phase()).started_at(42);
         assert_eq!(w.started_at_unix_nanos, 42);
     }
 }

@@ -1,22 +1,22 @@
 //! Routing.
 //!
-//! Pure functions that map an `AgentId` or `MemoryId` to the `ShardId`
+//! Pure functions that map an `SpaceId` or `MemoryId` to the `ShardId`
 //! that owns the request. Two routing modes:
 //!
 //! - **Memory-based**: `MemoryId` already encodes its shard in the high
 //!   16 bits. O(1) bit extraction.
-//! - **Agent-based**: BLAKE3 hash of the agent's UUID bytes, modulo
+//! - **Space-based**: BLAKE3 hash of the space's UUID bytes, modulo
 //!   `shard_count`. Optionally overridden via a startup-time map for
-//!   VIP / extra-large agents.
+//!   VIP / extra-large spaces.
 //!
 //! Out of scope for v1 (deferred to v2):
-//!   - Multi-shard agents.
+//!   - Multi-shard spaces.
 //!   - "WrongShard" handling — connection layer's concern.
 //!   - Consistent hashing for elastic shard counts.
 
 use std::collections::HashMap;
 
-use brain_core::{AgentId, MemoryId, ShardId};
+use brain_core::{SpaceId, MemoryId, ShardId};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -28,11 +28,11 @@ pub enum RoutingError {
     ZeroShardCount,
 
     #[error(
-        "override for agent {agent:?} maps to shard {shard}, \
+        "override for space {space:?} maps to shard {shard}, \
          which is out of range [0, {shard_count})"
     )]
     OverrideOutOfRange {
-        agent: AgentId,
+        space: SpaceId,
         shard: ShardId,
         shard_count: u16,
     },
@@ -48,7 +48,7 @@ pub enum RoutingError {
 #[derive(Clone, Debug)]
 pub struct RoutingTable {
     shard_count: u16,
-    overrides: HashMap<AgentId, ShardId>,
+    overrides: HashMap<SpaceId, ShardId>,
 }
 
 impl RoutingTable {
@@ -56,15 +56,15 @@ impl RoutingTable {
     /// override whose target is `>= shard_count`.
     pub fn new(
         shard_count: u16,
-        overrides: HashMap<AgentId, ShardId>,
+        overrides: HashMap<SpaceId, ShardId>,
     ) -> Result<Self, RoutingError> {
         if shard_count == 0 {
             return Err(RoutingError::ZeroShardCount);
         }
-        for (&agent, &shard) in &overrides {
+        for (&space, &shard) in &overrides {
             if shard >= shard_count {
                 return Err(RoutingError::OverrideOutOfRange {
-                    agent,
+                    space,
                     shard,
                     shard_count,
                 });
@@ -82,14 +82,14 @@ impl RoutingTable {
         self.shard_count
     }
 
-    /// Resolve the shard for an agent: overrides
+    /// Resolve the shard for an space: overrides
     /// first, then BLAKE3 modulo `shard_count`.
     #[must_use]
-    pub fn shard_for_agent(&self, agent: AgentId) -> ShardId {
-        if let Some(&s) = self.overrides.get(&agent) {
+    pub fn shard_for_space(&self, space: SpaceId) -> ShardId {
+        if let Some(&s) = self.overrides.get(&space) {
             return s;
         }
-        hash_agent_to_shard(agent, self.shard_count)
+        hash_space_to_shard(space, self.shard_count)
     }
 }
 
@@ -102,9 +102,9 @@ impl RoutingTable {
 /// Panics if `shard_count == 0` (precondition; the typed `RoutingTable`
 /// constructor enforces this — direct callers must validate first).
 #[must_use]
-pub fn hash_agent_to_shard(agent: AgentId, shard_count: u16) -> ShardId {
+pub fn hash_space_to_shard(space: SpaceId, shard_count: u16) -> ShardId {
     assert!(shard_count > 0, "shard_count must be > 0");
-    let bytes = agent.0.as_bytes();
+    let bytes = space.0.as_bytes();
     let h = blake3::hash(bytes);
     let prefix: [u8; 8] = h.as_bytes()[..8]
         .try_into()
@@ -131,10 +131,10 @@ mod tests {
     use brain_core::SlotIndex;
     use uuid::Uuid;
 
-    fn agent(seed: u64) -> AgentId {
+    fn space(seed: u64) -> SpaceId {
         let mut bytes = [0u8; 16];
         bytes[..8].copy_from_slice(&seed.to_le_bytes());
-        AgentId(Uuid::from_bytes(bytes))
+        SpaceId(Uuid::from_bytes(bytes))
     }
 
     #[test]
@@ -146,21 +146,21 @@ mod tests {
     }
 
     #[test]
-    fn hash_agent_to_shard_is_deterministic() {
-        let a = agent(0x1234_5678);
-        let s1 = hash_agent_to_shard(a, 8);
-        let s2 = hash_agent_to_shard(a, 8);
-        let s3 = hash_agent_to_shard(a, 8);
+    fn hash_space_to_shard_is_deterministic() {
+        let a = space(0x1234_5678);
+        let s1 = hash_space_to_shard(a, 8);
+        let s2 = hash_space_to_shard(a, 8);
+        let s3 = hash_space_to_shard(a, 8);
         assert_eq!(s1, s2);
         assert_eq!(s2, s3);
     }
 
     #[test]
-    fn hash_agent_to_shard_respects_shard_count() {
+    fn hash_space_to_shard_respects_shard_count() {
         // For each shard count, every result must be in [0, shard_count).
         for &shard_count in &[1u16, 2, 4, 8, 16, 256, 1024, 65535] {
             for seed in 0..1000u64 {
-                let s = hash_agent_to_shard(agent(seed), shard_count);
+                let s = hash_space_to_shard(space(seed), shard_count);
                 assert!(
                     s < shard_count,
                     "shard {s} out of range for shard_count {shard_count}"
@@ -170,8 +170,8 @@ mod tests {
     }
 
     #[test]
-    fn hash_agent_to_shard_distributes_uniformly() {
-        // 10k agents across 16 shards. Each shard's count should be
+    fn hash_space_to_shard_distributes_uniformly() {
+        // 10k spaces across 16 shards. Each shard's count should be
         // within [0.5 × mean, 1.5 × mean] = [312, 938] of the mean 625.
         // BLAKE3 distribution is much tighter than this in practice;
         // the wide band makes the test flake-free.
@@ -179,7 +179,7 @@ mod tests {
         const SHARDS: u16 = 16;
         let mut buckets = [0u64; SHARDS as usize];
         for seed in 0..N {
-            let s = hash_agent_to_shard(agent(seed), SHARDS) as usize;
+            let s = hash_space_to_shard(space(seed), SHARDS) as usize;
             buckets[s] += 1;
         }
         let mean = N / u64::from(SHARDS);
@@ -188,29 +188,29 @@ mod tests {
         for (i, &c) in buckets.iter().enumerate() {
             assert!(
                 c >= lo && c <= hi,
-                "shard {i} got {c} agents, expected within [{lo}, {hi}]"
+                "shard {i} got {c} spaces, expected within [{lo}, {hi}]"
             );
         }
     }
 
     #[test]
     fn routing_table_honors_override() {
-        let a = agent(42);
-        let natural = hash_agent_to_shard(a, 8);
+        let a = space(42);
+        let natural = hash_space_to_shard(a, 8);
         // Pick an override that's not equal to the natural hash so
         // we know the override path actually executed.
         let forced: ShardId = if natural == 3 { 5 } else { 3 };
         let mut overrides = HashMap::new();
         overrides.insert(a, forced);
         let table = RoutingTable::new(8, overrides).unwrap();
-        assert_eq!(table.shard_for_agent(a), forced);
+        assert_eq!(table.shard_for_space(a), forced);
     }
 
     #[test]
     fn routing_table_falls_back_to_hash_when_no_override() {
-        let a = agent(99);
+        let a = space(99);
         let table = RoutingTable::new(8, HashMap::new()).unwrap();
-        assert_eq!(table.shard_for_agent(a), hash_agent_to_shard(a, 8));
+        assert_eq!(table.shard_for_space(a), hash_space_to_shard(a, 8));
     }
 
     #[test]
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn routing_table_rejects_override_out_of_range() {
-        let a = agent(1);
+        let a = space(1);
         let mut overrides = HashMap::new();
         overrides.insert(a, 8); // shard_count = 4; 8 is out of range.
         let err = RoutingTable::new(4, overrides).unwrap_err();

@@ -53,7 +53,7 @@ pub use error::{ErrorCategory, ErrorCode, ProtocolError};
 
 // -- Connection layer --
 pub use connection::handshake::{
-    negotiate, AgentPermissions, AuthCredentials, AuthMethod, AuthOkPayload, AuthPayload,
+    negotiate, SpacePermissions, AuthCredentials, AuthMethod, AuthOkPayload, AuthPayload,
     HelloCapabilities, HelloPayload, MtlsClaim, NegotiatedSession, ServerCapabilities,
     ServerFeatures, WelcomePayload,
 };

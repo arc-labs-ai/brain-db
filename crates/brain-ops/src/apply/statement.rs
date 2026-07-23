@@ -22,7 +22,7 @@ pub fn apply_upsert_statement(
     phase: &Phase,
     write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
-    let scope = brain_metadata::RowScope::new(write.namespace, write.agent_id);
+    let scope = brain_metadata::RowScope::new(write.namespace, write.space_id);
     // Only the fields the apply path needs directly: the predicate
     // resolution + idempotency stamp. The rest of the row is built by
     // `statement_from_upsert_phase` (shared with the WAL-mapping path).
@@ -127,7 +127,7 @@ pub fn apply_supersede_statement(
     phase: &Phase,
     write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
-    let scope = brain_metadata::RowScope::new(write.namespace, write.agent_id);
+    let scope = brain_metadata::RowScope::new(write.namespace, write.space_id);
     let Phase::Supersede {
         target,
         replacement,

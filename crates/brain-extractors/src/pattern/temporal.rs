@@ -392,7 +392,7 @@ fn mention(ts: u64) -> ExtractedItem {
         // the apply pass plumbs `event_at` directly.
         object_is_entity: false,
         event_at_unix_nanos: Some(ts),
-        // Subject is the source memory, not the agent.
+        // Subject is the source memory, not the space.
         subject_is_self: false,
         // A temporal occurrence is an assertion, never a retraction.
         retract: false,
@@ -605,7 +605,7 @@ fn weekday_from_name(name: &str) -> Option<Weekday> {
 mod tests {
     use super::*;
     use crate::framework::registry::ExtractorRegistry;
-    use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, Salience};
+    use brain_core::{SpaceId, ContextId, MemoryId, MemoryKind, Salience};
 
     /// Build the unix-nanos of a civil date at midnight UTC. Used in
     /// place of `time::macros::datetime!` so the tests don't require the
@@ -637,7 +637,7 @@ mod tests {
     fn memory_at(text: &str, occurred_at_unix_nanos: u64) -> Memory {
         Memory {
             id: MemoryId::pack(0, 1, 0),
-            agent: AgentId::new(),
+            space: SpaceId::new(),
             context: ContextId(0),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
@@ -734,7 +734,7 @@ mod tests {
         let ext = TemporalExtractor::new();
         let mem = Memory {
             id: MemoryId::pack(0, 1, 0),
-            agent: AgentId::new(),
+            space: SpaceId::new(),
             context: ContextId(0),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
@@ -756,7 +756,7 @@ mod tests {
         let ext = TemporalExtractor::new();
         let mem = Memory {
             id: MemoryId::pack(0, 1, 0),
-            agent: AgentId::new(),
+            space: SpaceId::new(),
             context: ContextId(0),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
