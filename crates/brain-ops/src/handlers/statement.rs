@@ -836,8 +836,10 @@ fn decode_tombstone_reason(byte: u8) -> Result<TombstoneReason, OpError> {
 }
 
 /// Build a brain-core `Statement` from a wire `StatementCreateRequest`
-/// and the resolved `PredicateId`. Performs per-kind invariant checks
-/// (Event requires event_at; Fact/Preference must not set event_at).
+/// and the resolved `PredicateId`. Performs per-kind invariant checks:
+/// `event_at` is Event-exclusive (only an Event may set it), but a dateless
+/// Event is valid — the read answers "when" from the evidence memory's own
+/// `occurred_at`.
 fn build_statement_from_create(
     req: &StatementCreateRequest,
     predicate: PredicateId,
@@ -846,21 +848,14 @@ fn build_statement_from_create(
 ) -> Result<Statement, OpError> {
     use brain_protocol::{evidence_ref_from_wire, statement_object_from_wire};
 
-    match kind {
-        StatementKind::Event => {
-            if req.event_at_unix_nanos == 0 {
-                return Err(OpError::InvalidRequest(
-                    "Event kind requires non-zero event_at_unix_nanos".into(),
-                ));
-            }
-        }
-        _ => {
-            if req.event_at_unix_nanos != 0 {
-                return Err(OpError::InvalidRequest(
-                    "only Event kind may set event_at_unix_nanos".into(),
-                ));
-            }
-        }
+    // A dateless Event (`event_at_unix_nanos == 0` → `None`) is valid: a
+    // same-day/undated action still IS an event, and the read answers "when"
+    // from the evidence memory's own `occurred_at`. Only a non-Event kind
+    // carrying an event date is rejected — that field is Event-exclusive.
+    if kind != StatementKind::Event && req.event_at_unix_nanos != 0 {
+        return Err(OpError::InvalidRequest(
+            "only Event kind may set event_at_unix_nanos".into(),
+        ));
     }
 
     let evidence = evidence_ref_from_wire(&req.evidence).map_err(|e| match e {
