@@ -47,6 +47,9 @@ concurrency:
 # fine here.
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/brain
+  # Run JavaScript actions (docker/login-action et al.) on Node 24 rather
+  # than the deprecated Node 20, silencing the per-step deprecation warning.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build:

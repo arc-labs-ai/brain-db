@@ -16,6 +16,11 @@ on:
     branches:
       - main
 
+# Run the release-please JavaScript action on Node 24 rather than the
+# deprecated Node 20, silencing the per-run deprecation warning.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 # release-please opens/updates a PR and, on merge, creates a release + tag.
 permissions:
   contents: write

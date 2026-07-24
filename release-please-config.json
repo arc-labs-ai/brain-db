@@ -1,13 +1,12 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
-  "release-type": "rust",
   "bootstrap-sha": "e3aec43dbea10fef82216f3e5a8957ae06043f92",
+  "include-component-in-tag": false,
   "packages": {
     ".": {
-      "release-type": "rust",
-      "component": "brain",
+      "release-type": "simple",
       "changelog-path": "CHANGELOG.md",
-      "extra-files": []
+      "extra-files": ["Cargo.toml"]
     }
   },
   "changelog-sections": [
