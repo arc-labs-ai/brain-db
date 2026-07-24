@@ -58,3 +58,7 @@ CLAUDE.md
 
 # Eval overlay secret (LLM provider key) — never commit
 config/.env.eval
+
+# Deployment secrets (LLM key, admin token) — never commit. `.env.example`
+# is the committed template; `.env` is the operator's real values.
+.env

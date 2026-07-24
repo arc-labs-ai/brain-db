@@ -1,11 +1,17 @@
 name: Docker publish
 
-# Publishes the production brain-server image to Docker Hub. Runs only on
-# version tags (v*) — Brain is pre-release with no external users yet, so we
-# don't want a public image cut from every commit to main. Tag a release
-# only from a commit that already passed the main-branch CI workflow
-# (ci.yml); this workflow builds the image but does not re-run the test
-# suite.
+# Publishes the production brain-server image to GHCR (ghcr.io), the primary
+# release artifact — self-hosters `docker run` it, and our own playground /
+# gateway deploy pins the same tag, so cutting a release and shipping the
+# deploy are one act. Runs only on version tags (v*): Brain is pre-release
+# with no external users yet, so we don't want a public image cut from every
+# commit to main. Tag a release only from a commit that already passed the
+# main-branch CI workflow (ci.yml); this workflow builds the image but does
+# not re-run the test suite.
+#
+# GHCR over Docker Hub: free for public images, GitHub-native auth via the
+# job's GITHUB_TOKEN (no long-lived registry secret to rotate), and no
+# anonymous pull-rate-limit pain for self-hosters.
 #
 # Each platform builds on its own native runner (amd64 on ubuntu-latest,
 # arm64 on the free-for-public-repos ubuntu-24.04-arm) rather than
@@ -15,15 +21,19 @@ name: Docker publish
 # workloads like that are known to blow up from minutes to hours (or time
 # out outright) — native hardware avoids that entirely. Each build job
 # pushes its image by digest only; the `merge` job assembles the two
-# digests into one multi-arch manifest and applies the real tags.
+# digests into one multi-arch manifest, applies the real tags, and cuts the
+# GitHub Release that pins the published digest.
 
 on:
   push:
     tags:
       - "v*"
 
+# `packages: write` lets the job's GITHUB_TOKEN push to GHCR; `contents:
+# write` lets the merge job create the GitHub Release for the tag.
 permissions:
-  contents: read
+  contents: write
+  packages: write
 
 # A release publish shouldn't be interrupted mid-push by a newer tag (there
 # usually isn't one), but group by ref so two accidental pushes of the same
@@ -32,8 +42,11 @@ concurrency:
   group: docker-publish-${{ github.ref }}
   cancel-in-progress: false
 
+# Lowercased owner keeps GHCR happy (ghcr.io rejects uppercase path
+# segments); arc-labs-ai is already lowercase, so a bare interpolation is
+# fine here.
 env:
-  IMAGE: arc-labs/brain
+  IMAGE: ghcr.io/${{ github.repository_owner }}/brain
 
 jobs:
   build:
@@ -59,11 +72,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push by digest
         id: build
@@ -71,7 +85,7 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          outputs: type=image,name=docker.io/${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
 
@@ -106,7 +120,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: docker.io/${{ env.IMAGE }}
+          images: ${{ env.IMAGE }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -115,11 +129,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       # `${{ env.IMAGE }}` is substituted into the format string at the
       # workflow-expression level (before the shell runs), leaving exactly
@@ -132,9 +147,42 @@ jobs:
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf 'docker.io/${{ env.IMAGE }}@sha256:%s ' *)
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
         env:
           DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
 
       - name: Inspect image
-        run: docker buildx imagetools inspect docker.io/${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
+        id: inspect
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+          # The manifest-list digest is the one thing a deploy should pin —
+          # `${IMAGE}@${DIGEST}` is immutable where a tag can be re-pushed.
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+        env:
+          IMAGE: ${{ env.IMAGE }}
+          VERSION: ${{ steps.meta.outputs.version }}
+
+      # Human-facing landing for the version: release-please owns the
+      # changelog body (generate_release_notes fills the rest); here we pin
+      # the exact image coordinates so a reader can copy a digest-pinned
+      # `docker run` straight out of the release.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## Container image
+
+            ```
+            docker pull ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
+            ```
+
+            Digest-pinned (immutable) for deploy manifests:
+
+            ```
+            ${{ env.IMAGE }}@${{ steps.inspect.outputs.digest }}
+            ```
+
+            Multi-arch: `linux/amd64`, `linux/arm64`.
+            See [`DEPLOY.md`](DEPLOY.md) for self-host / compose instructions.

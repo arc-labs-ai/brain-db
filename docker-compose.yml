@@ -1,0 +1,55 @@
+# Brain — single-node deployment.
+#
+# This is the same artifact our own launch pins: `image:` points at a
+# released GHCR tag, never a local source build. Self-hosters run:
+#
+#   cp .env.example .env      # then set BRAIN__LLM__API_KEY
+#   docker compose up -d
+#
+# Pin a real version in production — `latest` is a moving target. Better
+# still, pin the digest from the GitHub Release (immutable):
+#   image: ghcr.io/arc-labs-ai/brain@sha256:...
+#
+# The in-image config lives at /etc/brain/config.toml; override single
+# fields with BRAIN__SECTION__FIELD env vars (see .env.example), or bind-
+# mount your own file over it. See DEPLOY.md for the full guide.
+
+services:
+  brain:
+    image: ghcr.io/arc-labs-ai/brain:${BRAIN_VERSION:-latest}
+    # io_uring (Glommio, thread-per-core) needs the io_uring syscalls the
+    # default Docker seccomp profile blocks. Unconfined is the documented
+    # requirement; a custom profile allowing io_uring_* works too.
+    security_opt:
+      - seccomp=unconfined
+    ports:
+      # Data plane — the binary wire protocol (CBOR). SDKs connect here.
+      - "${BRAIN_WIRE_PORT:-8080}:8080"
+      # Public HTTP — /healthz + /metrics only. The /v1/* admin plane stays
+      # loopback-inside-the-container (reach it via `docker compose exec`).
+      - "${BRAIN_HTTP_PORT:-9091}:9091"
+    environment:
+      # REQUIRED — Brain refuses to boot without a valid provider key.
+      # Provider is derived from BRAIN__LLM__MODEL (default gpt-4o-mini →
+      # OpenAI). Set both in .env.
+      BRAIN__LLM__API_KEY: ${BRAIN__LLM__API_KEY:?set BRAIN__LLM__API_KEY in .env}
+      BRAIN__LLM__MODEL: ${BRAIN__LLM__MODEL:-gpt-4o-mini}
+      # Operator admin secret gating the /v1/* admin plane (key mint,
+      # stats). The admin listener refuses to start without it — override
+      # the image placeholder here.
+      BRAIN__ADMIN__TOKEN: ${BRAIN__ADMIN__TOKEN:?set BRAIN__ADMIN__TOKEN in .env}
+    volumes:
+      # Durable state (WAL, arena, redb). Never bind this to a tmpfs.
+      - brain-data:/var/lib/brain/data
+      # Embedding model, downloaded from HuggingFace on first boot and
+      # cached here so restarts don't re-download.
+      - brain-models:/var/lib/brain/models
+    restart: unless-stopped
+    # The image ships its own HEALTHCHECK (curl /healthz on 9091); compose
+    # surfaces it in `docker compose ps`. Stopping is graceful: tini
+    # forwards SIGTERM so brain-server flushes and shuts down cleanly.
+    stop_grace_period: 30s
+
+volumes:
+  brain-data:
+  brain-models:
