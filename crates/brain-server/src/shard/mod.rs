@@ -91,7 +91,9 @@ use brain_workers::{
     WorkerKind, WorkerScheduler,
 };
 
-use self::adapters::{ArenaRebuildSource, ShardSnapshotSource, WalDirRetentionSource};
+use self::adapters::{
+    ArenaRebuildSource, ArenaSpaceVectorSource, ShardSnapshotSource, WalDirRetentionSource,
+};
 use flume::{Receiver, Sender};
 use glommio::{ExecutorJoinHandle, LocalExecutorBuilder, Placement};
 use tracing::{error, info, warn, Instrument as _};
@@ -2154,12 +2156,21 @@ pub fn spawn_shard(
             real_writer.set_schema_flag_sweep_sender(schema_flag_sweep_sender);
             real_writer.set_schema_flag_sweep_metrics(schema_migration_metrics.clone());
             let writer: Arc<dyn WriterHandle> = Arc::new(real_writer);
+            // Wrap the arena in `Rc<RefCell<…>>` now (rather than after WAL
+            // open below) so the by-slot vector source can be built and
+            // handed to the ExecutorContext here. Single-threaded executor →
+            // sound; the discipline is "drop the borrow before .await", and
+            // `arena` isn't touched again before this point.
+            let arena_cell = Rc::new(RefCell::new(arena));
             let executor_ctx = ExecutorContext::new(
                 dispatcher.clone(),
                 hnsw_shared.clone(),
                 metadata.clone(),
                 writer,
-            );
+            )
+            // Per-space brute-force retrieval lane: exact cosine scan of a
+            // small single-space query's own arena vectors.
+            .with_space_vectors(Rc::new(ArenaSpaceVectorSource::new(arena_cell.clone())));
 
             // The lexical retriever was constructed alongside the
             // tantivy open above and propagated in here pre-built.
@@ -2234,10 +2245,10 @@ pub fn spawn_shard(
                     .expect("Wal::create_with_config")
             };
 
-            // Wrap arena + WAL in `Rc<RefCell<…>>` so adapters can share
-            // handles with the main loop. Single-threaded executor →
+            // Wrap the WAL in `Rc<RefCell<…>>` so adapters can share the
+            // handle with the main loop. `arena_cell` was wrapped earlier
+            // (before the ExecutorContext build). Single-threaded executor →
             // sound; the discipline is "drop the borrow before .await".
-            let arena_cell = Rc::new(RefCell::new(arena));
             let wal_cell = Rc::new(RefCell::new(Some(wal)));
 
             // WAL drain task: forwards every record the writer's

@@ -56,6 +56,7 @@ impl SemanticRetriever for CannedSemanticRetriever {
         _query: &SemanticQuery,
         _scope: SemanticScope,
         _config: &SemanticRetrieverConfig,
+        _arena: Option<&dyn brain_index::SpaceVectorSource>,
     ) -> Result<Vec<RankedItem>, SemanticError> {
         Ok(self.items.clone())
     }
@@ -142,6 +143,7 @@ fn build_fixture(
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
         caller_space: brain_core::SpaceId::default(),
         cross_encoder: None,
+        space_vectors: None,
     };
 
     Fixture { _dir: dir, ctx }

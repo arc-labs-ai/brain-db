@@ -34,11 +34,23 @@ pub const DEFAULT_TIMEOUT_MS: u32 = 50;
 /// The semantic-retrieval trait. Object-safe; consumers hold
 /// an `Arc<dyn SemanticRetriever>`.
 pub trait SemanticRetriever: Send + Sync {
+    /// Run the semantic lane.
+    ///
+    /// `arena` is the borrowed per-space vector source for the
+    /// single-space brute-force lane (see
+    /// [`crate::SpaceVectorSource`]). It is `Some` only on the shard read
+    /// path, where the memory lane may exact-scan a small tenant's own
+    /// vectors instead of walking the shared HNSW graph; it is borrowed
+    /// (never stored), which is why the trait stays `Send + Sync` while
+    /// the arena itself is `!Send`. Pass `None` from tests, mocks, and
+    /// non-arena callers — the retriever then always uses the shared HNSW
+    /// path.
     fn retrieve(
         &self,
         query: &SemanticQuery,
         scope: SemanticScope,
         config: &SemanticRetrieverConfig,
+        arena: Option<&dyn crate::SpaceVectorSource>,
     ) -> Result<Vec<RankedItem>, SemanticError>;
 
     /// Return a memory's stored embedding by id, if obtainable. Used to

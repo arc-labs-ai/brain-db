@@ -24,12 +24,24 @@ use brain_index::statement_question_hnsw::StatementQuestionHnswIndex;
 use brain_index::{
     project_memory_hits, project_statement_hits, validate_semantic_filters, RankedItem,
     RankedItemId, SemanticError, SemanticFilters, SemanticQuery, SemanticRetriever,
-    SemanticRetrieverConfig, SemanticScope, SharedHnsw, SEMANTIC_EF_SEARCH_MAX,
+    SemanticRetrieverConfig, SemanticScope, SharedHnsw, SpaceVectorSource, SEMANTIC_EF_SEARCH_MAX,
     SEMANTIC_VECTOR_DIM,
 };
-use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
+use brain_metadata::tables::memory::{
+    space_timeline_prefix_space, MemoryMetadata, MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE,
+    SPACE_TIMELINE_KEY_LEN,
+};
 use brain_metadata::MetadataDb;
 use parking_lot::RwLock;
+
+/// Cap on a space's live memory count for the exact brute-force lane. At
+/// or below this, a single-space memory query does an exact cosine scan of
+/// only that space's arena vectors (recall = 1.0, the filtered shared-HNSW
+/// walk misses a sparse tenant at high selectivity). Above it, the query
+/// falls through to the shared HNSW path — a lazy per-space HNSW for large
+/// spaces is Phase 2. Phase-1 constant (the `[index]` TOML surface does not
+/// yet carry an index-tuning block); calibrated by the recall probe.
+pub const SPACE_BRUTEFORCE_MAX: u64 = 20_000;
 
 /// Production `SemanticRetriever` impl.
 ///
@@ -120,7 +132,23 @@ impl BrainSemanticRetriever {
         vector: &[f32; SEMANTIC_VECTOR_DIM],
         config: &SemanticRetrieverConfig,
         filters: &SemanticFilters,
+        arena: Option<&dyn SpaceVectorSource>,
     ) -> Result<Vec<RankedItem>, SemanticError> {
+        // Single-space brute-force lane. When the query is scoped to
+        // exactly one space, an arena is wired, and that space is small,
+        // exact-scan only that space's own vectors instead of walking the
+        // shared HNSW graph (which misses a sparse tenant at high
+        // selectivity). Returns `Some` with the final hits (HyPE union
+        // already applied); `None` means "space missing or too large —
+        // use the shared HNSW path below".
+        if filters.space_ids.len() == 1 {
+            if let Some(arena) = arena {
+                if let Some(hits) = self.brute_force_memory(vector, config, filters, arena)? {
+                    return Ok(hits);
+                }
+            }
+        }
+
         let rtxn = self
             .metadata
             .read_txn()
@@ -194,6 +222,161 @@ impl BrainSemanticRetriever {
         Ok(direct)
     }
 
+    /// Exact-cosine scan of one space's own vectors.
+    ///
+    /// Precondition: `filters.space_ids.len() == 1`. Reads the space's
+    /// live `memory_count` from the SPACES registry: absent or
+    /// `> SPACE_BRUTEFORCE_MAX` returns `Ok(None)` (the caller falls
+    /// through to the shared HNSW path — per-space HNSW for large spaces
+    /// is Phase 2). Otherwise it range-scans that space's
+    /// `MEMORIES_BY_SPACE_TIMELINE_TABLE` keyspace, reads each live
+    /// vector from the arena, scores exact cosine, keeps hits clearing
+    /// the threshold, and then applies the **same HyPE union** the shared
+    /// path applies — the entire reason this lane lives in the retriever,
+    /// so single-space paraphrase recall is never dropped.
+    fn brute_force_memory(
+        &self,
+        vector: &[f32; SEMANTIC_VECTOR_DIM],
+        config: &SemanticRetrieverConfig,
+        filters: &SemanticFilters,
+        arena: &dyn SpaceVectorSource,
+    ) -> Result<Option<Vec<RankedItem>>, SemanticError> {
+        let namespace_id = filters.namespace_id;
+        let space_bytes: [u8; 16] = Into::<[u8; 16]>::into(filters.space_ids[0]);
+
+        let rtxn = self
+            .metadata
+            .read_txn()
+            .map_err(|e| SemanticError::Internal(format!("read_txn: {e}")))?;
+
+        // Routing gate: only brute-force a space small enough to scan
+        // exactly. A missing row or an oversized count falls through to
+        // the shared HNSW path.
+        let count = match brain_metadata::space_get(&rtxn, namespace_id, space_bytes)
+            .map_err(|e| SemanticError::Internal(format!("space_get: {e}")))?
+        {
+            Some(meta) => meta.memory_count,
+            None => {
+                tracing::debug!(
+                    target: "brain_ops::semantic_retriever",
+                    namespace_id,
+                    "brute-force fallthrough: space registry row absent",
+                );
+                return Ok(None);
+            }
+        };
+        if count > SPACE_BRUTEFORCE_MAX {
+            tracing::debug!(
+                target: "brain_ops::semantic_retriever",
+                namespace_id,
+                memory_count = count,
+                max = SPACE_BRUTEFORCE_MAX,
+                "brute-force fallthrough: space too large (per-space HNSW is Phase 2)",
+            );
+            return Ok(None);
+        }
+
+        let timeline_t = rtxn
+            .open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)
+            .map_err(|e| SemanticError::Internal(format!("open timeline table: {e}")))?;
+
+        let prefix = space_timeline_prefix_space(namespace_id, space_bytes);
+        let upper = prefix_successor(&prefix);
+        let lower_bound: std::ops::Bound<&[u8]> = std::ops::Bound::Included(&prefix[..]);
+        let upper_bound: std::ops::Bound<&[u8]> = match &upper {
+            Some(u) => std::ops::Bound::Excluded(u.as_slice()),
+            None => std::ops::Bound::Unbounded,
+        };
+
+        let range = timeline_t
+            .range::<&[u8]>((lower_bound, upper_bound))
+            .map_err(|e| SemanticError::Internal(format!("timeline range: {e}")))?;
+
+        let query_norm = l2_norm(vector);
+        let mut hits: Vec<(MemoryId, f32)> = Vec::new();
+        for entry in range {
+            let (k, _v) =
+                entry.map_err(|e| SemanticError::Internal(format!("timeline entry: {e}")))?;
+            let key = k.value();
+            if key.len() != SPACE_TIMELINE_KEY_LEN {
+                continue;
+            }
+            // Session scope is carried inline in the key (bytes 28..36) —
+            // no extra row lookup needed to honour `session_ids`.
+            if !filters.session_ids.is_empty() {
+                let mut sid = [0u8; 8];
+                sid.copy_from_slice(&key[28..36]);
+                if !filters.session_ids.contains(&u64::from_be_bytes(sid)) {
+                    continue;
+                }
+            }
+            let mut idb = [0u8; 16];
+            idb.copy_from_slice(&key[36..52]);
+            let id = MemoryId::from_raw(u128::from_be_bytes(idb));
+            let Some(v) = arena.vector_at(id.slot(), id.version()) else {
+                // Unoccupied / tombstoned / hard-forgotten / stale id.
+                continue;
+            };
+            let cos = cosine_prenorm(vector, query_norm, &v);
+            if cos >= config.similarity_threshold {
+                hits.push((id, cos));
+            }
+        }
+
+        // Exact top-k: sort descending, break ties deterministically on id.
+        hits.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.raw().cmp(&b.0.raw()))
+        });
+        hits.truncate(config.top_k);
+        let mut direct = project_memory_hits(hits, config.similarity_threshold);
+
+        // HyPE union — identical in effect to the shared-HNSW path: probe
+        // the question-vector pool with the same query, keep only hits
+        // passing the same metadata filters, and merge best-per-memory
+        // (recall-additive, non-displacing). Dropping this for single-space
+        // queries would regress paraphrase recall — the keystone reason the
+        // brute-force lane lives inside the retriever.
+        if let Some(hype) = self.hype_index.as_ref() {
+            let memories_t = rtxn
+                .open_table(MEMORIES_TABLE)
+                .map_err(|e| SemanticError::Internal(format!("open MEMORIES_TABLE: {e}")))?;
+            let space_filter: HashSet<[u8; 16]> =
+                filters.space_ids.iter().map(|a| (*a).into()).collect();
+            let kind_filter = filters.memory_kind.map(memory_kind_to_u8);
+            let created_range = filters.created_at_ms.clone();
+            let session_filter = filters.session_ids.clone();
+            let raw = hype.read().search(vector, config.top_k).unwrap_or_default();
+            let filtered: Vec<(MemoryId, f32)> = raw
+                .into_iter()
+                .filter(|(id, score)| {
+                    *score >= config.similarity_threshold && {
+                        memories_t
+                            .get(&id.raw().to_be_bytes())
+                            .ok()
+                            .flatten()
+                            .map(|g| {
+                                memory_row_passes(
+                                    &g.value(),
+                                    namespace_id,
+                                    &space_filter,
+                                    kind_filter,
+                                    created_range.as_ref(),
+                                    &session_filter,
+                                )
+                            })
+                            .unwrap_or(false)
+                    }
+                })
+                .collect();
+            merge_memory_hits(&mut direct, filtered, config.top_k);
+        }
+        drop(rtxn);
+
+        Ok(Some(direct))
+    }
+
     fn search_statement(
         &self,
         vector: &[f32; SEMANTIC_VECTOR_DIM],
@@ -264,6 +447,7 @@ impl SemanticRetriever for BrainSemanticRetriever {
         query: &SemanticQuery,
         scope: SemanticScope,
         config: &SemanticRetrieverConfig,
+        arena: Option<&dyn SpaceVectorSource>,
     ) -> Result<Vec<RankedItem>, SemanticError> {
         validate_semantic_filters(&config.filters.0, scope)?;
         if config.ef_search > SEMANTIC_EF_SEARCH_MAX {
@@ -278,10 +462,13 @@ impl SemanticRetriever for BrainSemanticRetriever {
 
         let t_search = std::time::Instant::now();
         let result = match scope {
-            SemanticScope::Memory => self.search_memory(&vector, config, &config.filters.0),
+            // Brute-force is Memory-only: `Both` (typed-graph QUERY /
+            // entity-anchored) keeps the shared-HNSW path, so it passes
+            // `None` for the arena.
+            SemanticScope::Memory => self.search_memory(&vector, config, &config.filters.0, arena),
             SemanticScope::Statement => self.search_statement(&vector, config, &config.filters.0),
             SemanticScope::Both => {
-                let memory = self.search_memory(&vector, config, &config.filters.0)?;
+                let memory = self.search_memory(&vector, config, &config.filters.0, None)?;
                 let statement = self.search_statement(&vector, config, &config.filters.0)?;
                 Ok(self.merge_and_rerank(memory, statement, config))
             }
@@ -654,6 +841,65 @@ fn merge_statement_hits(
     for (i, item) in direct.iter_mut().enumerate() {
         item.rank = (i as u32) + 1;
     }
+}
+
+/// Lexicographic successor of `prefix`: the smallest byte string strictly
+/// greater than every string starting with `prefix`. `None` when `prefix`
+/// is all `0xFF` (unbounded above). Bounds the space-prefix timeline scan
+/// without a trailing sentinel.
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut out = prefix.to_vec();
+    while let Some(last) = out.last_mut() {
+        if *last != 0xFF {
+            *last += 1;
+            return Some(out);
+        }
+        out.pop();
+    }
+    None
+}
+
+/// L2 norm of a 384-d vector, SIMD-accelerated over 8-wide lanes.
+fn l2_norm(v: &[f32; SEMANTIC_VECTOR_DIM]) -> f32 {
+    use wide::f32x8;
+    let mut acc = f32x8::ZERO;
+    // 384 == 48 * 8, so the whole vector is covered by full lanes.
+    for chunk in v.chunks_exact(8) {
+        let x = f32x8::from([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        acc += x * x;
+    }
+    acc.reduce_add().sqrt()
+}
+
+/// Cosine similarity between the query (with precomputed norm `a_norm`)
+/// and candidate `b`, SIMD-accelerated over 8-wide lanes. Returns 0.0 when
+/// either vector has zero magnitude (degenerate — never a real match).
+fn cosine_prenorm(
+    a: &[f32; SEMANTIC_VECTOR_DIM],
+    a_norm: f32,
+    b: &[f32; SEMANTIC_VECTOR_DIM],
+) -> f32 {
+    use wide::f32x8;
+    let mut dot = f32x8::ZERO;
+    let mut bsq = f32x8::ZERO;
+    for (ca, cb) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
+        let va = f32x8::from([
+            ca[0], ca[1], ca[2], ca[3], ca[4], ca[5], ca[6], ca[7],
+        ]);
+        let vb = f32x8::from([
+            cb[0], cb[1], cb[2], cb[3], cb[4], cb[5], cb[6], cb[7],
+        ]);
+        dot += va * vb;
+        bsq += vb * vb;
+    }
+    let b_norm = bsq.reduce_add().sqrt();
+    let denom = a_norm * b_norm;
+    if denom <= f32::EPSILON {
+        return 0.0;
+    }
+    dot.reduce_add() / denom
 }
 
 fn memory_kind_to_u8(kind: brain_core::MemoryKind) -> u8 {

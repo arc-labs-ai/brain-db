@@ -87,6 +87,7 @@ impl SemanticRetriever for CannedSemantic {
         _query: &SemanticQuery,
         _scope: SemanticScope,
         _config: &SemanticRetrieverConfig,
+        _arena: Option<&dyn brain_index::SpaceVectorSource>,
     ) -> Result<Vec<RankedItem>, SemanticError> {
         Ok(self.items.lock().expect("canned semantic lock").clone())
     }

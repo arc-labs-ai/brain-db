@@ -27,6 +27,8 @@ tracing.workspace = true
 parking_lot.workspace = true
 arc-swap.workspace = true
 blake3.workspace = true
+# SIMD cosine (f32x8) for the single-space brute-force retrieval lane.
+wide.workspace = true
 uuid.workspace = true
 tokio = { version = "1", default-features = false, features = ["sync"] }
 # `test_support::ops_context_for_tests_owning_tempdir` builds a

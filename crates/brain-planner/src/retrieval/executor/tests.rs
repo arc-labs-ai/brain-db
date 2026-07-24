@@ -35,6 +35,7 @@ impl SemanticRetriever for MockSemantic {
         _query: &SemanticQuery,
         _scope: SemanticScope,
         _config: &SemanticRetrieverConfig,
+        _arena: Option<&dyn brain_index::SpaceVectorSource>,
     ) -> Result<Vec<RankedItem>, SemanticError> {
         if let Some(d) = self.delay {
             thread::sleep(d);
@@ -107,6 +108,7 @@ impl SemanticRetriever for CountingSemantic {
         _query: &SemanticQuery,
         _scope: SemanticScope,
         config: &SemanticRetrieverConfig,
+        _arena: Option<&dyn brain_index::SpaceVectorSource>,
     ) -> Result<Vec<RankedItem>, SemanticError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let items = (1..=config.top_k as u64)
@@ -213,6 +215,7 @@ fn make_ctx(
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
         caller_space: brain_core::SpaceId::default(),
         cross_encoder: None,
+        space_vectors: None,
     };
     (dir, ctx)
 }
@@ -786,6 +789,7 @@ fn dynamic_k_deepens_when_filters_thin_the_pool() {
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
         caller_space: brain_core::SpaceId::default(),
         cross_encoder: None,
+        space_vectors: None,
     };
 
     let req = QueryRequest {
@@ -897,6 +901,7 @@ fn cue_ctx(metadata: MetadataDb) -> RetrievalExecutorContext {
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
         caller_space: brain_core::SpaceId::default(),
         cross_encoder: None,
+        space_vectors: None,
     }
 }
 
@@ -1140,6 +1145,7 @@ fn prf_reprobes_lexical_with_expansion_on_low_specificity_query() {
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
         caller_space: brain_core::SpaceId::default(),
         cross_encoder: None,
+        space_vectors: None,
     };
 
     let req = prf_request("Where did Caroline move from?");
@@ -1189,6 +1195,7 @@ fn prf_skips_high_specificity_query() {
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
         caller_space: brain_core::SpaceId::default(),
         cross_encoder: None,
+        space_vectors: None,
     };
 
     // Six content words → above the low-specificity gate → no PRF pass.

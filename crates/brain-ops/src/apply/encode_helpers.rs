@@ -156,7 +156,7 @@ pub async fn fetch_extractor_context(
     };
     let query = SemanticQuery::Text(cue_text.to_string());
     let hits = retriever
-        .retrieve(&query, SemanticScope::Memory, &cfg)
+        .retrieve(&query, SemanticScope::Memory, &cfg, None)
         .map_err(|e| ExtractorContextError::Semantic(format!("{e}")))?;
 
     // Step 3-6: materialise neighbor entries inside a fresh read txn so
@@ -298,6 +298,7 @@ mod tests {
             _query: &SemanticQuery,
             _scope: SemanticScope,
             _config: &SemanticRetrieverConfig,
+            _arena: Option<&dyn brain_index::SpaceVectorSource>,
         ) -> Result<Vec<RankedItem>, SemanticError> {
             Ok(self.hits.clone())
         }

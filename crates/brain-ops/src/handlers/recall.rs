@@ -1848,6 +1848,7 @@ async fn retrieve_memories(
         caller_namespace: ctx.executor.caller_namespace.raw(),
         caller_space: ctx.executor.caller_space,
         cross_encoder: ctx.cross_encoder.as_arc().cloned(),
+        space_vectors: ctx.executor.space_vectors.clone(),
     };
     // The statement corpus (statement HNSW + statements.tantivy) is ALWAYS
     // searched — it is a cue-driven lane like memory semantic/lexical (it

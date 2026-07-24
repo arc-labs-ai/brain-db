@@ -312,6 +312,7 @@ fn build_executor_context(ctx: &OpsContext) -> Result<RetrievalExecutorContext, 
         // the operator disabled the load this is `None` and the query
         // returns RRF-only.
         cross_encoder: ctx.cross_encoder.as_arc().cloned(),
+        space_vectors: ctx.executor.space_vectors.clone(),
     })
 }
 

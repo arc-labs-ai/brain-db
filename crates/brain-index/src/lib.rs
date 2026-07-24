@@ -32,6 +32,7 @@ pub mod pq;
 pub mod rebuild;
 pub mod semantic_retriever;
 pub mod shared;
+pub mod space_vector_source;
 pub mod statement_hnsw;
 pub mod statement_question_hnsw;
 pub mod tantivy_shard;
@@ -69,6 +70,7 @@ pub use semantic_retriever::{
     EF_SEARCH_MAX as SEMANTIC_EF_SEARCH_MAX, VECTOR_DIM as SEMANTIC_VECTOR_DIM,
 };
 pub use shared::{FlushReport, PendingEntry, SharedHnsw, Writer};
+pub use space_vector_source::SpaceVectorSource;
 pub use statement_hnsw::{
     RebuildReport as StatementRebuildReport, StatementHnswError, StatementHnswIndex,
     StatementHnswParams,

@@ -124,6 +124,7 @@ fn statement_scope_without_handle_returns_empty() {
             &SemanticQuery::Vector(Box::new(one_hot(0))),
             SemanticScope::Statement,
             &SemanticRetrieverConfig::default(),
+            None,
         )
         .expect("retrieve");
     assert!(result.is_empty());
@@ -143,6 +144,7 @@ fn ef_search_above_max_errors() {
             &SemanticQuery::Vector(Box::new(one_hot(0))),
             SemanticScope::Memory,
             &cfg,
+            None,
         )
         .expect_err("rejects");
     assert!(matches!(err, SemanticError::QueryParseFailed(_)));
@@ -166,6 +168,7 @@ fn wrong_scope_filter_errors() {
             &SemanticQuery::Vector(Box::new(one_hot(0))),
             SemanticScope::Memory,
             &cfg,
+            None,
         )
         .expect_err("rejects");
     assert!(matches!(err, SemanticError::QueryParseFailed(_)));
@@ -181,6 +184,7 @@ fn empty_memory_corpus_returns_no_hits() {
             &SemanticQuery::Vector(Box::new(one_hot(0))),
             SemanticScope::Memory,
             &SemanticRetrieverConfig::default(),
+            None,
         )
         .expect("retrieve");
     assert!(result.is_empty());
@@ -215,6 +219,7 @@ fn memory_scope_returns_ranked_hits() {
             &SemanticQuery::Vector(Box::new(one_hot(0))),
             SemanticScope::Memory,
             &SemanticRetrieverConfig::default(),
+            None,
         )
         .expect("retrieve");
 
@@ -263,6 +268,7 @@ fn space_id_filter_narrows() {
             &SemanticQuery::Vector(Box::new(one_hot(0))),
             SemanticScope::Memory,
             &cfg,
+            None,
         )
         .expect("retrieve");
 
@@ -324,6 +330,7 @@ fn namespace_filter_excludes_foreign_namespace() {
             &SemanticQuery::Vector(Box::new(one_hot(0))),
             SemanticScope::Memory,
             &cfg,
+            None,
         )
         .expect("retrieve");
 
@@ -382,6 +389,7 @@ fn created_at_range_filter_narrows() {
             &SemanticQuery::Vector(Box::new(one_hot(1))),
             SemanticScope::Memory,
             &cfg,
+            None,
         )
         .expect("retrieve");
 
@@ -412,6 +420,7 @@ fn text_query_path_routes_through_embedder() {
             &SemanticQuery::Text("totally unrelated text".into()),
             SemanticScope::Memory,
             &SemanticRetrieverConfig::default(),
+            None,
         )
         .expect("retrieve");
 
@@ -449,9 +458,247 @@ fn similarity_threshold_drops_low_scores() {
             &SemanticQuery::Vector(Box::new(one_hot(0))),
             SemanticScope::Memory,
             &cfg,
+            None,
         )
         .expect("retrieve");
 
     assert_eq!(result.len(), 1);
     assert!(result[0].score >= 0.95);
+}
+
+// ---------------------------------------------------------------------------
+// Single-space brute-force lane.
+// ---------------------------------------------------------------------------
+
+use brain_index::SpaceVectorSource;
+use brain_metadata::tables::memory::{space_timeline_key, MEMORIES_BY_SPACE_TIMELINE_TABLE};
+use brain_metadata::tables::space::{space_key, SpaceMetadata, SPACES_TABLE};
+
+/// In-memory `SpaceVectorSource` planted with `(slot, version) → vector`.
+/// Stands in for the arena so the brute-force lane can be exercised
+/// without a real mmap.
+struct MockArena {
+    vectors: std::collections::HashMap<(u64, u32), [f32; VECTOR_DIM]>,
+}
+
+impl SpaceVectorSource for MockArena {
+    fn vector_at(&self, slot: u64, expected_version: u32) -> Option<[f32; VECTOR_DIM]> {
+        self.vectors.get(&(slot, expected_version)).copied()
+    }
+}
+
+/// Plant a memory: its `MEMORIES_TABLE` row + its
+/// `MEMORIES_BY_SPACE_TIMELINE_TABLE` key (which the brute-force lane
+/// range-scans). Returns the `MemoryId`.
+fn plant_memory(
+    metadata: &mut MetadataDb,
+    slot: u64,
+    version: u32,
+    space: SpaceId,
+    session_id: u64,
+    created_ms: u64,
+) -> MemoryId {
+    let id = MemoryId::pack(0, slot, version);
+    let ns = brain_core::NamespaceId::SYSTEM;
+    let mem = MemoryMetadata::new_active(
+        id,
+        ns,
+        space,
+        SessionId::from(session_id),
+        id.slot(),
+        id.version(),
+        MemoryKind::Semantic,
+        [0u8; 16],
+        0.5,
+        0,
+        created_ms.saturating_mul(1_000_000),
+    );
+    let space_bytes: [u8; 16] = space.into();
+    let wtxn = metadata.write_txn().expect("wtxn");
+    {
+        let mut t = wtxn.open_table(MEMORIES_TABLE).expect("open memories");
+        t.insert(&id.raw().to_be_bytes(), &mem).expect("insert row");
+        let mut tl = wtxn
+            .open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)
+            .expect("open timeline");
+        let key = space_timeline_key(
+            ns.raw(),
+            space_bytes,
+            created_ms.saturating_mul(1_000_000),
+            session_id,
+            id.raw().to_be_bytes(),
+        );
+        tl.insert(&key[..], &()).expect("insert timeline");
+    }
+    wtxn.commit().expect("commit");
+    id
+}
+
+/// Register a space in the SPACES table with an explicit `memory_count`
+/// (the brute-force routing gate reads this).
+fn register_space(metadata: &mut MetadataDb, space: SpaceId, memory_count: u64) {
+    let space_bytes: [u8; 16] = space.into();
+    let mut meta = SpaceMetadata::new(0, String::new(), None);
+    meta.memory_count = memory_count;
+    let wtxn = metadata.write_txn().expect("wtxn");
+    {
+        let mut t = wtxn.open_table(SPACES_TABLE).expect("open spaces");
+        t.insert(&space_key(brain_core::NamespaceId::SYSTEM.raw(), space_bytes), &meta)
+            .expect("insert space");
+    }
+    wtxn.commit().expect("commit");
+}
+
+fn bruteforce_config(threshold: f32) -> SemanticRetrieverConfig {
+    SemanticRetrieverConfig {
+        similarity_threshold: threshold,
+        top_k: 10,
+        ..Default::default()
+    }
+}
+
+fn filters_for(space: SpaceId, sessions: Vec<u64>) -> SemanticRetrieverConfig {
+    let mut cfg = bruteforce_config(0.5);
+    cfg.filters = SemanticFiltersConfigSlot(SemanticFilters {
+        namespace_id: brain_core::NamespaceId::SYSTEM.raw(),
+        space_ids: vec![space],
+        session_ids: sessions,
+        ..Default::default()
+    });
+    cfg
+}
+
+#[test]
+fn bruteforce_returns_planted_space_exact_topk() {
+    let (_dir, mut metadata) = fresh_metadata();
+
+    let space_a = SpaceId::new();
+    let space_b = SpaceId::new();
+
+    // Space A (sparse, planted): three memories, distinct one-hot vectors.
+    let id_match = plant_memory(&mut metadata, 10, 1, space_a, 0, 100);
+    plant_memory(&mut metadata, 11, 1, space_a, 0, 101);
+    plant_memory(&mut metadata, 12, 1, space_a, 0, 102);
+    register_space(&mut metadata, space_a, 3);
+
+    // Space B (decoy-heavy): many memories at the exact query vector. If
+    // the lane leaked across spaces these would flood the result.
+    for slot in 100..200u64 {
+        plant_memory(&mut metadata, slot, 1, space_b, 0, 50);
+    }
+    register_space(&mut metadata, space_b, 100);
+
+    // The mock arena knows every planted slot's vector. Space A's
+    // slot 10 == query; slots 11/12 orthogonal; space B all == query.
+    let mut vectors = std::collections::HashMap::new();
+    vectors.insert((10u64, 1u32), one_hot(0));
+    vectors.insert((11u64, 1u32), one_hot(1));
+    vectors.insert((12u64, 1u32), one_hot(2));
+    for slot in 100..200u64 {
+        vectors.insert((slot, 1u32), one_hot(0));
+    }
+    let arena = MockArena { vectors };
+
+    // HNSW is empty (never built), so any non-empty result proves the
+    // brute-force lane ran, not the shared graph.
+    let retriever = build_retriever(metadata);
+    let cfg = filters_for(space_a, vec![]);
+    let result = retriever
+        .retrieve(
+            &SemanticQuery::Vector(Box::new(one_hot(0))),
+            SemanticScope::Memory,
+            &cfg,
+            Some(&arena),
+        )
+        .expect("retrieve");
+
+    // Exact recall: only space A's slot-10 clears the 0.5 threshold
+    // (cosine 1.0); slots 11/12 are orthogonal; space B never scanned.
+    assert_eq!(result.len(), 1, "exactly the one on-topic space-A memory");
+    assert_eq!(result[0].id, RankedItemId::Memory(id_match));
+    assert!(result[0].score >= 0.99);
+}
+
+#[test]
+fn bruteforce_respects_threshold_on_nonsense_query() {
+    let (_dir, mut metadata) = fresh_metadata();
+    let space_a = SpaceId::new();
+    plant_memory(&mut metadata, 10, 1, space_a, 0, 100);
+    plant_memory(&mut metadata, 11, 1, space_a, 0, 101);
+    register_space(&mut metadata, space_a, 2);
+
+    let mut vectors = std::collections::HashMap::new();
+    vectors.insert((10u64, 1u32), one_hot(0));
+    vectors.insert((11u64, 1u32), one_hot(1));
+    let arena = MockArena { vectors };
+
+    let retriever = build_retriever(metadata);
+    let cfg = filters_for(space_a, vec![]);
+    // Orthogonal to every planted vector → cosine 0 everywhere.
+    let result = retriever
+        .retrieve(
+            &SemanticQuery::Vector(Box::new(one_hot(50))),
+            SemanticScope::Memory,
+            &cfg,
+            Some(&arena),
+        )
+        .expect("retrieve");
+    assert!(result.is_empty(), "no vector clears the 0.5 threshold");
+}
+
+#[test]
+fn bruteforce_session_filter_applies_inline() {
+    let (_dir, mut metadata) = fresh_metadata();
+    let space_a = SpaceId::new();
+    // Two memories, same vector, different sessions.
+    let id_s1 = plant_memory(&mut metadata, 10, 1, space_a, 1, 100);
+    plant_memory(&mut metadata, 11, 1, space_a, 2, 101);
+    register_space(&mut metadata, space_a, 2);
+
+    let mut vectors = std::collections::HashMap::new();
+    vectors.insert((10u64, 1u32), one_hot(0));
+    vectors.insert((11u64, 1u32), one_hot(0));
+    let arena = MockArena { vectors };
+
+    let retriever = build_retriever(metadata);
+    let cfg = filters_for(space_a, vec![1]);
+    let result = retriever
+        .retrieve(
+            &SemanticQuery::Vector(Box::new(one_hot(0))),
+            SemanticScope::Memory,
+            &cfg,
+            Some(&arena),
+        )
+        .expect("retrieve");
+    assert_eq!(result.len(), 1, "only session 1 survives the inline filter");
+    assert_eq!(result[0].id, RankedItemId::Memory(id_s1));
+}
+
+#[test]
+fn bruteforce_falls_through_when_space_too_large() {
+    let (_dir, mut metadata) = fresh_metadata();
+    let space_a = SpaceId::new();
+    let id = plant_memory(&mut metadata, 10, 1, space_a, 0, 100);
+    // memory_count above the cap → the lane must decline and fall through
+    // to the (empty) shared HNSW path, yielding no results.
+    register_space(&mut metadata, space_a, super::SPACE_BRUTEFORCE_MAX + 1);
+    let _ = id;
+
+    let mut vectors = std::collections::HashMap::new();
+    vectors.insert((10u64, 1u32), one_hot(0));
+    let arena = MockArena { vectors };
+
+    let retriever = build_retriever(metadata);
+    let cfg = filters_for(space_a, vec![]);
+    let result = retriever
+        .retrieve(
+            &SemanticQuery::Vector(Box::new(one_hot(0))),
+            SemanticScope::Memory,
+            &cfg,
+            Some(&arena),
+        )
+        .expect("retrieve");
+    // Shared HNSW is empty, so fallthrough yields nothing — proving the
+    // large-space gate declined the brute-force scan.
+    assert!(result.is_empty(), "oversized space falls through to shared HNSW");
 }

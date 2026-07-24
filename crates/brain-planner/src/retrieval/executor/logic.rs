@@ -38,7 +38,7 @@ use brain_index::{
     GraphAnchor, GraphQuery, GraphRetriever, GraphRetrieverConfig, LexicalFilters, LexicalQuery,
     LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItem, RankedItemId,
     SemanticFilters, SemanticFiltersConfigSlot, SemanticQuery, SemanticRetriever,
-    SemanticRetrieverConfig, SemanticScope,
+    SemanticRetrieverConfig, SemanticScope, SpaceVectorSource,
 };
 use brain_metadata::MetadataDb;
 use brain_rerank::RerankService;
@@ -86,6 +86,14 @@ pub struct RetrievalExecutorContext {
     /// `config.rerank.enabled = false`, or no model is on disk) the
     /// rerank stage is skipped and RRF order wins. No error either way.
     pub cross_encoder: Option<Arc<RerankService>>,
+    /// Per-shard by-slot vector source (the arena), threaded from the
+    /// shard's `ExecutorContext`. `Some` on the live read path; `None` in
+    /// tests. Enables the single-space brute-force semantic lane: an exact
+    /// cosine scan of a small tenant's own vectors, which the filtered
+    /// shared-HNSW walk misses at high selectivity. Held as `Rc<dyn _>`
+    /// (the arena is `!Send`), which keeps this context `!Send` — already
+    /// true of the dispatch path.
+    pub space_vectors: Option<std::rc::Rc<dyn SpaceVectorSource>>,
 }
 
 impl RetrievalExecutorContext {
@@ -1058,7 +1066,7 @@ fn invoke_semantic(
 
     let query = SemanticQuery::Text(text.clone());
     handle
-        .retrieve(&query, scope, &config)
+        .retrieve(&query, scope, &config, ctx.space_vectors.as_deref())
         .map_err(|e| RetrieverInvocationError::Failure(e.to_string()))
 }
 

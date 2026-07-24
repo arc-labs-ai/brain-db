@@ -9,11 +9,12 @@
 //! needs raw arena access — current executors don't.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use brain_core::{SessionId, EdgeKind, MemoryId, MemoryKind};
 use brain_embed::{Dispatcher, VECTOR_DIM};
-use brain_index::SharedHnsw;
+use brain_index::{SharedHnsw, SpaceVectorSource};
 use brain_metadata::MetadataDb;
 
 use super::writer::WriterHandle;
@@ -91,6 +92,15 @@ pub struct ExecutorContext {
     /// registry writes so `SPACE_LIST` surfaces the original string; the
     /// 16-byte `caller_space` is a non-invertible UUIDv5 of it.
     pub caller_space_string: String,
+    /// Per-shard by-slot vector source, wired at shard construction over
+    /// the arena. `Some` on the live shard read path; `None` in tests and
+    /// non-arena callers. Feeds the single-space brute-force retrieval
+    /// lane — an exact cosine scan of a small tenant's own vectors, which
+    /// the filtered shared-HNSW walk misses at high selectivity. Held as
+    /// `Rc<dyn _>` (the arena is `!Send`), which makes this context
+    /// `!Send` — already true of the whole dispatch path (`OpsContext`),
+    /// so no new constraint. `Clone` still holds (`Rc: Clone`).
+    pub space_vectors: Option<Rc<dyn SpaceVectorSource>>,
 }
 
 impl ExecutorContext {
@@ -110,7 +120,16 @@ impl ExecutorContext {
             caller_space: brain_core::SpaceId::default(),
             caller_namespace: brain_core::NamespaceId::SYSTEM,
             caller_space_string: String::new(),
+            space_vectors: None,
         }
+    }
+
+    /// Wire the per-shard by-slot vector source (the arena) for the
+    /// single-space brute-force lane. Called once at shard construction.
+    #[must_use]
+    pub fn with_space_vectors(mut self, src: Rc<dyn SpaceVectorSource>) -> Self {
+        self.space_vectors = Some(src);
+        self
     }
 
     #[must_use]

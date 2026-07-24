@@ -33,8 +33,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use brain_core::{MemoryId, ShardId};
-use brain_index::SharedHnsw;
+use brain_core::{MemoryId, ShardId, SlotIndex, SlotVersion};
+use brain_index::{SpaceVectorSource, SharedHnsw, VECTOR_DIM};
 use brain_planner::SharedMetadataDb;
 use brain_storage::arena::ArenaFile;
 use brain_storage::wal::payload::{CheckpointBeginPayload, CheckpointEndPayload, WalPayload};
@@ -113,6 +113,62 @@ impl<const D: usize> RebuildSource<D> for ArenaRebuildSource<D> {
             }
             Ok(out)
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ArenaSpaceVectorSource — read a live memory's vector by arena slot.
+// ---------------------------------------------------------------------------
+
+/// Backs the per-space brute-force retrieval lane: given an arena slot +
+/// the expected slot version, copy that slot's full-precision vector out
+/// of the mmap'd arena. The retriever range-scans one space's memory ids
+/// from redb, then calls this per surviving id.
+///
+/// Holds an `Rc<RefCell<ArenaFile>>` shared with the main loop; the read
+/// takes a short immutable borrow, copies the vector, and releases it —
+/// no `.await` is held across the borrow. `!Send` by construction (the
+/// mmap), which is why it reaches the retriever as a borrowed
+/// `&dyn SpaceVectorSource`, never stored on the `Send + Sync` retriever.
+pub(crate) struct ArenaSpaceVectorSource {
+    arena: Rc<RefCell<ArenaFile>>,
+}
+
+impl ArenaSpaceVectorSource {
+    pub(crate) fn new(arena: Rc<RefCell<ArenaFile>>) -> Self {
+        Self { arena }
+    }
+}
+
+impl SpaceVectorSource for ArenaSpaceVectorSource {
+    fn vector_at(
+        &self,
+        slot: SlotIndex,
+        expected_version: SlotVersion,
+    ) -> Option<[f32; VECTOR_DIM]> {
+        let arena = self.arena.borrow();
+        if slot >= arena.capacity_slots() {
+            return None;
+        }
+        let s = arena.slot(slot);
+        // A stale id (invariant #4), an unoccupied slot, or a
+        // tombstoned / hard-forgotten memory yields no vector — the
+        // candidate is dropped from the brute-force set.
+        if !s.is_occupied() || s.is_tombstoned() || s.is_hard_forgotten() {
+            return None;
+        }
+        if s.metadata.slot_version != expected_version {
+            return None;
+        }
+        // No per-read CRC. This mirrors `ArenaRebuildSource` — the only
+        // other vector-read path, which feeds every HNSW rebuild — so the
+        // two are consistent; verify-on-read is a deliberate non-goal on
+        // the hot brute-force lane. Copy element-wise: `Slot::vector` and
+        // the return type are both `[f32; VECTOR_DIM]` (384).
+        let mut v = [0.0_f32; VECTOR_DIM];
+        let n = v.len().min(s.vector.len());
+        v[..n].copy_from_slice(&s.vector[..n]);
+        Some(v)
     }
 }
 
