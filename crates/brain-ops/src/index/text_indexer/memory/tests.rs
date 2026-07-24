@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use brain_core::{SpaceId, MemoryId, MemoryKind};
+use brain_core::{MemoryId, MemoryKind, SpaceId};
 use brain_index::{IndexStatus, TantivyShard};
 use futures_lite::FutureExt;
 use glommio::timer::sleep;

@@ -10,10 +10,10 @@
 //! references resolve.
 
 use brain_core::{
-    SessionId, EntityId, EntityTypeId, ExtractorId, MemoryId, StatementId, StatementKind,
+    Entity, EvidenceEntry, EvidenceRef, Statement, StatementObject, StatementValue, SubjectRef,
 };
 use brain_core::{
-    Entity, EvidenceEntry, EvidenceRef, Statement, StatementObject, StatementValue, SubjectRef,
+    EntityId, EntityTypeId, ExtractorId, MemoryId, SessionId, StatementId, StatementKind,
 };
 use brain_metadata::entity::ops::entity_put;
 use brain_metadata::schema::predicate::predicate_intern_or_get;
@@ -37,7 +37,8 @@ fn put_subject(db: &redb::Database) -> EntityId {
     entity_put(
         &wtxn,
         RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16]),
-        brain_core::SessionId::DEFAULT, &Entity::new_active(id, EntityTypeId(1), "anchor".into(), "anchor".into(), T0),
+        brain_core::SessionId::DEFAULT,
+        &Entity::new_active(id, EntityTypeId(1), "anchor".into(), "anchor".into(), T0),
     )
     .unwrap();
     wtxn.commit().unwrap();
@@ -232,7 +233,8 @@ fn known_text_value_roundtrips() {
         statement_create(
             &wtxn,
             RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16]),
-            brain_core::SessionId::DEFAULT, &stmt,
+            brain_core::SessionId::DEFAULT,
+            &stmt,
             T0,
         )
         .unwrap();

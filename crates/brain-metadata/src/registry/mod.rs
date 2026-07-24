@@ -12,15 +12,13 @@
 //! - Isolation is the table key's leading `(namespace_id, space_id)` prefix —
 //!   a range scan for one scope can never traverse another's rows.
 
-use redb::{ReadableTable, ReadTransaction, WriteTransaction};
+use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
 use crate::tables::session::{
     session_key, session_range_bounds, session_scope_key, session_scope_range_bounds,
     SessionMetadata, SESSIONS_TABLE, SESSION_BY_SCOPE_TABLE,
 };
-use crate::tables::space::{
-    space_key, space_range_bounds, SpaceMetadata, SPACES_TABLE,
-};
+use crate::tables::space::{space_key, space_range_bounds, SpaceMetadata, SPACES_TABLE};
 
 /// Failure operating the space/session registry.
 #[derive(thiserror::Error, Debug)]
@@ -63,8 +61,16 @@ pub fn touch_on_write(
     session_id: u64,
     at_unix_nanos: u64,
 ) -> Result<(), RegistryError> {
-    let session_created = touch_session_row(wtxn, namespace_id, space_id, session_id, at_unix_nanos)?;
-    touch_space_row(wtxn, namespace_id, space_id, space_string, at_unix_nanos, session_created)?;
+    let session_created =
+        touch_session_row(wtxn, namespace_id, space_id, session_id, at_unix_nanos)?;
+    touch_space_row(
+        wtxn,
+        namespace_id,
+        space_id,
+        space_string,
+        at_unix_nanos,
+        session_created,
+    )?;
     Ok(())
 }
 
@@ -85,11 +91,15 @@ fn touch_session_row(
     match existing {
         Some(mut m) => {
             if at > m.last_active_unix_nanos {
-                let old = session_scope_key(namespace_id, space_id, m.last_active_unix_nanos, session_id);
+                let old =
+                    session_scope_key(namespace_id, space_id, m.last_active_unix_nanos, session_id);
                 scope.remove(&old).map_err(store)?;
                 m.last_active_unix_nanos = at;
                 scope
-                    .insert(&session_scope_key(namespace_id, space_id, at, session_id), &())
+                    .insert(
+                        &session_scope_key(namespace_id, space_id, at, session_id),
+                        &(),
+                    )
                     .map_err(store)?;
             }
             m.memory_count = m.memory_count.saturating_add(1);
@@ -101,7 +111,10 @@ fn touch_session_row(
             m.memory_count = 1;
             sessions.insert(&key, &m).map_err(store)?;
             scope
-                .insert(&session_scope_key(namespace_id, space_id, at, session_id), &())
+                .insert(
+                    &session_scope_key(namespace_id, space_id, at, session_id),
+                    &(),
+                )
                 .map_err(store)?;
             Ok(true)
         }
@@ -242,7 +255,12 @@ pub fn space_delete_registry(
                 .remove(&session_key(namespace_id, space_id, *session_id))
                 .map_err(store)?;
             scope
-                .remove(&session_scope_key(namespace_id, space_id, *last_active, *session_id))
+                .remove(&session_scope_key(
+                    namespace_id,
+                    space_id,
+                    *last_active,
+                    *session_id,
+                ))
                 .map_err(store)?;
         }
     }
@@ -287,7 +305,10 @@ pub fn session_create(
         sessions.insert(&key, &m).map_err(store)?;
         let mut scope = wtxn.open_table(SESSION_BY_SCOPE_TABLE).map_err(store)?;
         scope
-            .insert(&session_scope_key(namespace_id, space_id, at_unix_nanos, session_id), &())
+            .insert(
+                &session_scope_key(namespace_id, space_id, at_unix_nanos, session_id),
+                &(),
+            )
             .map_err(store)?;
     }
     // Keep the owning space's session_count coherent; create the space row on
@@ -365,7 +386,12 @@ pub fn session_delete_registry(
         sessions.remove(&key).map_err(store)?;
         let mut scope = wtxn.open_table(SESSION_BY_SCOPE_TABLE).map_err(store)?;
         scope
-            .remove(&session_scope_key(namespace_id, space_id, m.last_active_unix_nanos, session_id))
+            .remove(&session_scope_key(
+                namespace_id,
+                space_id,
+                m.last_active_unix_nanos,
+                session_id,
+            ))
             .map_err(store)?;
     }
     let mut spaces = wtxn.open_table(SPACES_TABLE).map_err(store)?;
@@ -404,7 +430,10 @@ mod tests {
 
         let r = db.read_txn().unwrap();
         let s = space_get(&r, 3, space).unwrap().unwrap();
-        assert_eq!(s.space_string, "u:1", "implicit touch records the human string");
+        assert_eq!(
+            s.space_string, "u:1",
+            "implicit touch records the human string"
+        );
         assert_eq!(s.created_at_unix_nanos, 100);
         assert_eq!(s.last_active_unix_nanos, 300);
         assert_eq!(s.memory_count, 3);

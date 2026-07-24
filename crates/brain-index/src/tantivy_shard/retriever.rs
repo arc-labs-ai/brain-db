@@ -9,7 +9,7 @@ use std::ops::{Bound, RangeInclusive};
 use std::sync::Arc;
 
 use brain_core::StatementKind;
-use brain_core::{SpaceId, EntityId, MemoryId, MemoryKind, RelationId, StatementId};
+use brain_core::{EntityId, MemoryId, MemoryKind, RelationId, SpaceId, StatementId};
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery, TermQuery};
 use tantivy::schema::{IndexRecordOption, Value};

@@ -1,7 +1,7 @@
 //! Cognitive-op requests: ENCODE / ENCODE_VECTOR_DIRECT / RECALL / PLAN /
 //! REASON / FORGET.
 
-use crate::envelope::request::{WireSessionId, WireMemoryId, WireUuid};
+use crate::envelope::request::{WireMemoryId, WireSessionId, WireUuid};
 use crate::shared::primitives::{
     EdgeKindWire, ForgetMode, MemoryKindWire, ObservationInput, PlanState, PlanStrategy,
 };

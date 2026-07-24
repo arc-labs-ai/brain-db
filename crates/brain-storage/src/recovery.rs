@@ -495,7 +495,7 @@ mod tests {
     use crate::wal::record::{Lsn, WalRecord};
     use crate::wal::segment::WalSegment;
     use crate::wal::wal::Wal;
-    use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, RequestId, TxnId};
+    use brain_core::{MemoryId, MemoryKind, RequestId, SessionId, SpaceId, TxnId};
     use std::path::{Path, PathBuf};
 
     fn uuid(byte: u8) -> [u8; 16] {

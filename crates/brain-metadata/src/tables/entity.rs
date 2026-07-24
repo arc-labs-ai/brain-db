@@ -8,7 +8,7 @@
 
 use crate::impl_redb_rkyv_value;
 use crate::tables::scope::RowScope;
-use brain_core::{SpaceId, Entity, EntityAttributes, EntityId, EntityTypeId, NamespaceId};
+use brain_core::{Entity, EntityAttributes, EntityId, EntityTypeId, NamespaceId, SpaceId};
 use redb::TableDefinition;
 
 // ---------------------------------------------------------------------------

@@ -1050,7 +1050,13 @@ mod tests {
         let id = aspirin.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &aspirin).unwrap();
+            entity_put(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &aspirin,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
         }
         let wtxn = db.write_txn().unwrap();
@@ -1138,7 +1144,8 @@ mod tests {
         e.entity_type = EntityTypeId(99);
 
         let wtxn = db.write_txn().unwrap();
-        let err = entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).expect_err("should reject");
+        let err = entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e)
+            .expect_err("should reject");
         assert!(matches!(
             err,
             EntityOpError::UnknownEntityType(t) if t == EntityTypeId(99)
@@ -1157,7 +1164,8 @@ mod tests {
 
         let wtxn = db.write_txn().unwrap();
         entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &a).unwrap();
-        let err = entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &b).expect_err("dup");
+        let err =
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &b).expect_err("dup");
         match err {
             EntityOpError::DuplicateCanonicalName {
                 type_id,
@@ -1821,9 +1829,21 @@ mod tests {
 
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &with_vec).unwrap();
+            entity_put(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &with_vec,
+            )
+            .unwrap();
             entity_vector_put(&wtxn, id_with, &v).unwrap();
-            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &without_vec).unwrap();
+            entity_put(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &without_vec,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
         }
 

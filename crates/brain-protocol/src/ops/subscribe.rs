@@ -1,6 +1,6 @@
 //! SUBSCRIBE / UNSUBSCRIBE plus filter sub-structs.
 
-use crate::envelope::request::{WireSessionId, WireMemoryId, WireUuid};
+use crate::envelope::request::{WireMemoryId, WireSessionId, WireUuid};
 use crate::ops::memory::ActAs;
 use crate::shared::primitives::MemoryKindWire;
 

@@ -212,12 +212,12 @@ mod tests {
     use crate::tables::relation::{RELATION_BY_EVIDENCE_TABLE, RELATION_METADATA_TABLE};
     use crate::tables::slot_version::SLOT_VERSIONS_TABLE;
     use crate::tables::text::TEXTS_TABLE;
-    use brain_core::{SpaceId, SessionId, EdgeKind, EdgeOrigin, MemoryId, MemoryKind, RequestId};
+    use brain_core::{EdgeKind, EdgeOrigin, MemoryId, MemoryKind, RequestId, SessionId, SpaceId};
     use brain_storage::wal::payload::{
         CheckpointBeginPayload, CheckpointEndPayload, EdgePayload, EncodePayload, ForgetMode,
         ForgetPayload, ForgetReason, LinkPayload, MigrateEmbeddingPayload, ReclaimPayload,
-        SalienceReason, SalienceUpdate, TxnBeginPayload, UnlinkPayload, UpdateSessionPayload,
-        UpdateKindPayload, UpdateSaliencePayload, WalPayload,
+        SalienceReason, SalienceUpdate, TxnBeginPayload, UnlinkPayload, UpdateKindPayload,
+        UpdateSaliencePayload, UpdateSessionPayload, WalPayload,
     };
     use std::path::PathBuf;
 

@@ -534,7 +534,7 @@ impl std::fmt::Debug for EmbeddingDeps {
 /// exactly what makes "drop it" a correct rollback.
 ///
 /// Within a pass the staged vectors stay visible to the embedding tier
-/// (see [`tier_embedding`]), so two paraphrases inside one memory still
+/// (see `tier_embedding`), so two paraphrases inside one memory still
 /// collapse onto a single entity, as they did when the insert was inline.
 ///
 /// ```no_run
@@ -663,7 +663,7 @@ fn cosine(a: &[f32; VECTOR_DIM], b: &[f32; VECTOR_DIM]) -> f32 {
 /// The current backend is LLM-driven: the disambiguator owns an
 /// [`LlmClient`] + model identifier and issues a single yes/no/uncertain
 /// prompt per ambiguous partial match. The prompt grammar is narrower
-/// than the multi-candidate one [`crate::BrainLlmDisambiguator`] uses because
+/// than the multi-candidate LLM disambiguation path uses because
 /// the resolver's question is binary. Swapping in a heuristic or
 /// classifier backend later is a localised change to
 /// `confirm_partial_match`.
@@ -1810,7 +1810,13 @@ mod tests {
         let existing_id = existing.id;
         {
             let wtxn = d.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &existing).unwrap();
+            entity_put(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &existing,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
         }
         let wtxn = d.write_txn().unwrap();
@@ -1836,7 +1842,13 @@ mod tests {
         let id = existing.id;
         {
             let wtxn = d.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &existing).unwrap();
+            entity_put(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &existing,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
         }
         let wtxn = d.write_txn().unwrap();
@@ -1981,7 +1993,13 @@ mod tests {
         let caroline_id = caroline.id;
         {
             let wtxn = d.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &caroline).unwrap();
+            entity_put(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &caroline,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
         }
         let wtxn = d.write_txn().unwrap();
@@ -2479,7 +2497,13 @@ mod tests {
         );
         let person_id = person_apple.id;
         let wtxn = d.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &person_apple).unwrap();
+        entity_put(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &person_apple,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
         // Now resolve "Apple" under a THIRD type: two cross-type matches exist
         // → ambiguous → mint a fresh entity rather than conflate them.

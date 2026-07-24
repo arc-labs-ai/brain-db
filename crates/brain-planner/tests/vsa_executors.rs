@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use brain_core::{
-    SpaceId, SessionId, EdgeKind, EdgeKindRef, Entity, EntityId, EntityType, EvidenceEntry,
-    EvidenceRef, ExtractorId, MemoryId, MemoryKind, NodeRef, PredicateId, Statement, StatementId,
+    EdgeKind, EdgeKindRef, Entity, EntityId, EntityType, EvidenceEntry, EvidenceRef, ExtractorId,
+    MemoryId, MemoryKind, NodeRef, PredicateId, SessionId, SpaceId, Statement, StatementId,
     StatementKind, StatementObject, SubjectRef,
 };
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
@@ -114,7 +114,14 @@ fn make_test_statement(
     );
     s.evidence = EvidenceRef::inline_from_slice(&[entry]);
     let wtxn = metadata.write_txn().unwrap();
-    let id = statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 1_700_000_000_000_000_001).unwrap();
+    let id = statement_create(
+        &wtxn,
+        test_scope(),
+        brain_core::SessionId::DEFAULT,
+        &s,
+        1_700_000_000_000_000_001,
+    )
+    .unwrap();
     wtxn.commit().unwrap();
     id
 }

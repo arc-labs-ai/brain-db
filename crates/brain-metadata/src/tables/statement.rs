@@ -16,7 +16,7 @@
 use crate::impl_redb_rkyv_value;
 use crate::tables::scope::RowScope;
 use brain_core::{
-    SpaceId, EntityId, EvidenceOverflowId, ExtractorId, MemoryId, NamespaceId, PredicateId,
+    EntityId, EvidenceOverflowId, ExtractorId, MemoryId, NamespaceId, PredicateId, SpaceId,
     StatementId, StatementKind,
 };
 use brain_core::{
@@ -744,7 +744,7 @@ pub fn statement_from_metadata(m: &StatementMetadata) -> Option<Statement> {
 mod tests {
     use super::*;
     use crate::tables::fresh_db;
-    use brain_core::{SessionId, EntityId, MemoryId};
+    use brain_core::{EntityId, MemoryId, SessionId};
     use redb::ReadableDatabase;
 
     fn sample_evidence_entry(byte: u8, confidence_milli: u16) -> EvidenceEntry {

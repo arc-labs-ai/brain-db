@@ -3,7 +3,6 @@
 //! The catalog is 13 domain tables plus one internal `__schema_meta`
 //! from [`crate::storage_version`].
 
-pub mod space;
 pub mod api_keys;
 pub mod audit;
 pub mod checkpoint;
@@ -32,6 +31,7 @@ pub mod schema_version;
 pub mod scope;
 pub mod session;
 pub mod slot_version;
+pub mod space;
 pub mod statement;
 pub mod statement_question;
 pub mod text;
@@ -96,14 +96,12 @@ macro_rules! impl_redb_rkyv_value {
 /// self-init inside their own `open()` constructors and are NOT listed
 /// here.
 pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::redb::TableError> {
-    use space::SPACES_TABLE;
     use audit::{
         ENTITY_RESOLUTION_AUDIT_TABLE, EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE,
         EXTRACTOR_AUDIT_BY_MEMORY_TABLE, EXTRACTOR_AUDIT_BY_TIME_TABLE, EXTRACTOR_AUDIT_TABLE,
     };
     use checkpoint::CHECKPOINTS_TABLE;
     use contradiction::STATEMENT_CONTRADICTION_AUDIT_TABLE;
-    use session::{SESSIONS_TABLE, SESSION_BY_SCOPE_TABLE};
     use edge::{EDGES_REVERSE_TABLE, EDGES_TABLE};
     use entity::{
         ENTITIES_TABLE, ENTITY_ALIASES_TABLE, ENTITY_BY_CANONICAL_NAME_TABLE,
@@ -128,7 +126,9 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     };
     use relation_type::{RELATION_TYPES_BY_QNAME_TABLE, RELATION_TYPES_TABLE};
     use schema_version::{SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE};
+    use session::{SESSIONS_TABLE, SESSION_BY_SCOPE_TABLE};
     use slot_version::SLOT_VERSIONS_TABLE;
+    use space::SPACES_TABLE;
     use statement::{
         EVIDENCE_OVERFLOW_TABLE, STATEMENTS_BY_EVENT_TIME_TABLE, STATEMENTS_BY_EVIDENCE_TABLE,
         STATEMENTS_BY_OBJECT_ENTITY_TABLE, STATEMENTS_BY_PREDICATE_TABLE,

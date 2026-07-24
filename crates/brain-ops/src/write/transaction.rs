@@ -9,7 +9,7 @@
 //! The writer doesn't distinguish among these origins. One queue,
 //! one apply path, one WAL envelope, one event burst.
 
-use brain_core::{SpaceId, MemoryId, NamespaceId};
+use brain_core::{MemoryId, NamespaceId, SpaceId};
 use brain_storage::wal::record::Lsn;
 
 use super::id::WriteId;
@@ -189,7 +189,7 @@ impl WriteAck {
 mod tests {
     use super::*;
     use crate::write::phase::Phase;
-    use brain_core::{SessionId, MemoryId, MemoryKind, Salience};
+    use brain_core::{MemoryId, MemoryKind, Salience, SessionId};
     use brain_embed::VECTOR_DIM;
 
     fn sample_phase() -> Phase {

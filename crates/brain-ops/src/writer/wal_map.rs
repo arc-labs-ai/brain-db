@@ -34,8 +34,8 @@ use brain_metadata::recovery::phase_bodies::{
     encode_entity_unmerge, encode_entity_update, encode_schema_update, encode_session_create,
     encode_session_delete, encode_space_create, encode_space_delete, encode_statement_create,
     encode_statement_supersede, encode_statement_tombstone, EntityMergeBody, EntityRenameBody,
-    EntityTombstoneBody, EntityUnmergeBody, EntityUpdateBody, SchemaUpdateBody,
-    SessionCreateBody, SessionDeleteBody, SpaceCreateBody, SpaceDeleteBody, StatementCreateBody,
+    EntityTombstoneBody, EntityUnmergeBody, EntityUpdateBody, SchemaUpdateBody, SessionCreateBody,
+    SessionDeleteBody, SpaceCreateBody, SpaceDeleteBody, StatementCreateBody,
     StatementSupersedeBody, StatementTombstoneBody,
 };
 use brain_metadata::tables::entity::EntityMetadata;
@@ -44,7 +44,7 @@ use brain_storage::wal::kinds::WalRecordKind;
 use brain_storage::wal::payload::{
     EncodePayload, ForgetPayload, ForgetReason, LinkPayload, PhaseBodyRecord, RelationLinkPayload,
     RelationSupersedePayload, RelationTombstonePayload, SalienceReason, SalienceUpdate,
-    UnlinkPayload, UpdateSessionPayload, UpdateKindPayload, UpdateSaliencePayload, WalPayload,
+    UnlinkPayload, UpdateKindPayload, UpdateSaliencePayload, UpdateSessionPayload, WalPayload,
 };
 
 use crate::apply::entity::entity_from_upsert_phase;
@@ -591,8 +591,8 @@ fn edge_origin_from_byte(byte: u8) -> EdgeOrigin {
 mod tests {
     use super::*;
     use brain_core::{
-        SpaceId, SessionId, EdgeKind, EdgeKindRef, EntityAttributes, EntityId, EntityTypeId,
-        MemoryId, MemoryKind, Salience,
+        EdgeKind, EdgeKindRef, EntityAttributes, EntityId, EntityTypeId, MemoryId, MemoryKind,
+        Salience, SessionId, SpaceId,
     };
     use brain_metadata::tables::edge::zero_disambiguator;
 

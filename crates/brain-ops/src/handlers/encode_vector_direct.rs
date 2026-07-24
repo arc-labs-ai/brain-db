@@ -23,7 +23,7 @@
 //! aren't useful. A non-None `txn_id` is rejected so we don't
 //! silently degrade the user's intent.
 
-use brain_core::{SessionId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience};
+use brain_core::{EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience, SessionId};
 use brain_embed::VECTOR_DIM;
 use brain_planner::{EdgeOutcome, EncodeOp, EncodeOpEdge};
 use brain_protocol::envelope::request::EncodeVectorDirectRequest;

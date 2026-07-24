@@ -329,8 +329,16 @@ body_codec!(
 body_codec!(encode_schema_update, decode_schema_update, SchemaUpdateBody);
 body_codec!(encode_space_create, decode_space_create, SpaceCreateBody);
 body_codec!(encode_space_delete, decode_space_delete, SpaceDeleteBody);
-body_codec!(encode_session_create, decode_session_create, SessionCreateBody);
-body_codec!(encode_session_delete, decode_session_delete, SessionDeleteBody);
+body_codec!(
+    encode_session_create,
+    decode_session_create,
+    SessionCreateBody
+);
+body_codec!(
+    encode_session_delete,
+    decode_session_delete,
+    SessionDeleteBody
+);
 
 // ---------------------------------------------------------------------------
 // Tests.

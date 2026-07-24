@@ -7,7 +7,7 @@
 //!   cargo run -p brain-metadata --example dump_timeline_diff -- <metadata.redb> [space_hex]
 
 use brain_metadata::tables::memory::{
-    space_timeline_key, SPACE_TIMELINE_KEY_LEN, MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE,
+    space_timeline_key, MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE, SPACE_TIMELINE_KEY_LEN,
 };
 use redb::{Database, ReadableDatabase, ReadableTable};
 

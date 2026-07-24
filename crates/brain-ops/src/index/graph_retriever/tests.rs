@@ -88,7 +88,8 @@ fn create_relation(
         false,
     );
     let wtxn = metadata.write_txn().expect("wtxn");
-    let created = relation_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &r, 0).expect("relation_create");
+    let created = relation_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &r, 0)
+        .expect("relation_create");
     wtxn.commit().expect("commit");
     created
 }
@@ -475,7 +476,7 @@ fn ranks_are_dense_and_one_based() {
 mod memory_anchor {
     use super::*;
 
-    use brain_core::{SpaceId, SessionId, EdgeKind, MemoryId, MemoryKind};
+    use brain_core::{EdgeKind, MemoryId, MemoryKind, SessionId, SpaceId};
     use brain_metadata::tables::edge::{
         derived_by, link, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
     };
@@ -719,7 +720,7 @@ mod unified_walk {
 
     use std::collections::{HashMap, HashSet};
 
-    use brain_core::{SpaceId, SessionId, EdgeKind, MemoryId, MemoryKind};
+    use brain_core::{EdgeKind, MemoryId, MemoryKind, SessionId, SpaceId};
     use brain_metadata::tables::edge::{
         derived_by, link, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
     };
@@ -1220,8 +1221,14 @@ mod unified_walk {
         );
         {
             let wtxn = metadata.write_txn().expect("wtxn");
-            statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, 1_700_000_000_000_000_000)
-                .expect("statement_create");
+            statement_create(
+                &wtxn,
+                __ts(),
+                brain_core::SessionId::DEFAULT,
+                &stmt,
+                1_700_000_000_000_000_000,
+            )
+            .expect("statement_create");
             wtxn.commit().expect("commit");
         }
 
@@ -1261,7 +1268,7 @@ mod property {
 
     use std::collections::{HashMap, HashSet, VecDeque};
 
-    use brain_core::{SpaceId, SessionId, EdgeKind, MemoryId, MemoryKind};
+    use brain_core::{EdgeKind, MemoryId, MemoryKind, SessionId, SpaceId};
     use brain_index::{proximity_score, RankedItemId};
     use brain_metadata::tables::edge::{
         derived_by, link, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,

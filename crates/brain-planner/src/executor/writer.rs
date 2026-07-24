@@ -10,7 +10,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use brain_core::{SessionId, EdgeKind, MemoryId, MemoryKind, RequestId};
+use brain_core::{EdgeKind, MemoryId, MemoryKind, RequestId, SessionId};
 use brain_protocol::envelope::request::ForgetMode;
 use thiserror::Error;
 

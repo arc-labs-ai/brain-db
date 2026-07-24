@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use brain_core::{SessionId, MemoryId, MemoryKind};
+use brain_core::{MemoryId, MemoryKind, SessionId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
@@ -648,8 +648,8 @@ fn encode_then_forget_preserve_lsn_order() {
 mod wal_record_projection {
     use super::*;
     use brain_core::{
-        SpaceId, EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, NodeRef, RelationId, RelationTypeId,
-        RequestId,
+        EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, NodeRef, RelationId, RelationTypeId,
+        RequestId, SpaceId,
     };
     use brain_storage::wal::payload::{
         EdgePayload, EncodePayload, ForgetMode, ForgetPayload, ForgetReason, LinkPayload,

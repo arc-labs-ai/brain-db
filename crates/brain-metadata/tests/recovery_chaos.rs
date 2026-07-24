@@ -11,8 +11,8 @@ use std::fs::OpenOptions;
 use std::path::PathBuf;
 
 use brain_core::{
-    SpaceId, SessionId, EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, MemoryId, MemoryKind, NodeRef,
-    RelationId, RelationTypeId, RequestId,
+    EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, MemoryId, MemoryKind, NodeRef, RelationId,
+    RelationTypeId, RequestId, SessionId, SpaceId,
 };
 use brain_metadata::tables::edge::EDGES_TABLE;
 use brain_metadata::tables::memory::MEMORIES_TABLE;

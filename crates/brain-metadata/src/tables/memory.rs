@@ -21,7 +21,7 @@
 
 use std::ops::Bound;
 
-use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, NamespaceId};
+use brain_core::{MemoryId, MemoryKind, NamespaceId, SessionId, SpaceId};
 use redb::{ReadTransaction, TableDefinition};
 
 use crate::tables::scope::RowScope;
@@ -388,7 +388,7 @@ pub struct MemoryMetadata {
     /// Owning namespace (tenant) — the outer half of the
     /// `(namespace, space)` scope key. `0` is the reserved `brain`
     /// system namespace; stamped by the writer via
-    /// [`Self::with_namespace`].
+    /// [`Self::new_active`].
     pub namespace_id: u32,
     pub space_id_bytes: [u8; 16],
     pub session_id: u64,
@@ -644,7 +644,7 @@ impl redb::Value for MemoryMetadata {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, NamespaceId};
+    use brain_core::{MemoryId, MemoryKind, NamespaceId, SessionId, SpaceId};
     use redb::{Database, ReadableDatabase};
 
     fn aid(byte: u8) -> SpaceId {

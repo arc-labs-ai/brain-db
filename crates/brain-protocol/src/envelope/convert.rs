@@ -104,10 +104,10 @@ impl From<EdgeKind> for GraphEdgeKindWire {
 
 #[cfg(test)]
 mod tests {
-    use brain_core::{SpaceId, SessionId, EdgeKind, MemoryId, MemoryKind, RequestId, TxnId};
+    use brain_core::{EdgeKind, MemoryId, MemoryKind, RequestId, SessionId, SpaceId, TxnId};
 
     use super::*;
-    use crate::envelope::request::{WireSessionId, WireMemoryId, WireUuid};
+    use crate::envelope::request::{WireMemoryId, WireSessionId, WireUuid};
 
     #[test]
     fn memory_id_round_trips_via_wire() {

@@ -1,6 +1,6 @@
 //! Unit tests for the event-time recency boost.
 
-use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind};
+use brain_core::{MemoryId, MemoryKind, SessionId, SpaceId};
 use brain_index::RankedItemId;
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;

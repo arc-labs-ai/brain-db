@@ -26,7 +26,7 @@ use brain_metadata::{
     ApiKeyError,
 };
 use brain_protocol::connection::handshake::{
-    SpacePermissions, AuthCredentials, AuthMethod, AuthPayload,
+    AuthCredentials, AuthMethod, AuthPayload, SpacePermissions,
 };
 use parking_lot::RwLock;
 use tracing::{debug, warn};

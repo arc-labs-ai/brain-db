@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind};
+use brain_core::{MemoryId, MemoryKind, SessionId, SpaceId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{
     IndexParams, RankedItemId, SemanticError, SemanticFilters, SemanticFiltersConfigSlot,
@@ -543,8 +543,11 @@ fn register_space(metadata: &mut MetadataDb, space: SpaceId, memory_count: u64) 
     let wtxn = metadata.write_txn().expect("wtxn");
     {
         let mut t = wtxn.open_table(SPACES_TABLE).expect("open spaces");
-        t.insert(&space_key(brain_core::NamespaceId::SYSTEM.raw(), space_bytes), &meta)
-            .expect("insert space");
+        t.insert(
+            &space_key(brain_core::NamespaceId::SYSTEM.raw(), space_bytes),
+            &meta,
+        )
+        .expect("insert space");
     }
     wtxn.commit().expect("commit");
 }
@@ -700,5 +703,8 @@ fn bruteforce_falls_through_when_space_too_large() {
         .expect("retrieve");
     // Shared HNSW is empty, so fallthrough yields nothing — proving the
     // large-space gate declined the brute-force scan.
-    assert!(result.is_empty(), "oversized space falls through to shared HNSW");
+    assert!(
+        result.is_empty(),
+        "oversized space falls through to shared HNSW"
+    );
 }

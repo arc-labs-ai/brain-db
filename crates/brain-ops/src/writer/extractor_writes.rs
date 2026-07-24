@@ -117,7 +117,13 @@ pub fn statement_create_internal(
     if payload.kind == StatementKind::Event {
         s.event_at_unix_nanos = payload.event_at_unix_nanos;
     }
-    statement_create(wtxn, scope, payload.session_id, &s, payload.extracted_at_unix_nanos)
+    statement_create(
+        wtxn,
+        scope,
+        payload.session_id,
+        &s,
+        payload.extracted_at_unix_nanos,
+    )
 }
 
 /// Build a `Relation` value from `payload` and call
@@ -139,7 +145,13 @@ pub fn relation_create_internal(
         payload.extracted_at_unix_nanos,
         payload.is_symmetric,
     );
-    relation_create(wtxn, scope, payload.session_id, &r, payload.extracted_at_unix_nanos)
+    relation_create(
+        wtxn,
+        scope,
+        payload.session_id,
+        &r,
+        payload.extracted_at_unix_nanos,
+    )
 }
 
 // ---------------------------------------------------------------------------

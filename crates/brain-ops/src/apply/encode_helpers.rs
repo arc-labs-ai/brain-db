@@ -253,7 +253,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, Salience};
+    use brain_core::{MemoryId, MemoryKind, Salience, SessionId, SpaceId};
     use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
     use brain_index::{IndexParams, RankedItem, SemanticError, SemanticRetriever, SharedHnsw};
     use brain_metadata::tables::memory::MemoryMetadata;

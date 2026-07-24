@@ -9,11 +9,11 @@
 use std::sync::Arc;
 
 use brain_core::{
-    SpaceId, SessionId, EntityId, ExtractorId, MemoryId, MemoryKind, NodeRef, Salience,
-};
-use brain_core::{
     Entity, EntityType, EvidenceEntry, EvidenceRef, PredicateId, Statement, StatementId,
     StatementKind, StatementObject, StatementValue, SubjectRef,
+};
+use brain_core::{
+    EntityId, ExtractorId, MemoryId, MemoryKind, NodeRef, Salience, SessionId, SpaceId,
 };
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};

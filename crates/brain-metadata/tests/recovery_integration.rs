@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 
 use brain_core::{
-    SpaceId, SessionId, EdgeKind, EdgeOrigin, MemoryId, MemoryKind, RequestId, TxnId,
+    EdgeKind, EdgeOrigin, MemoryId, MemoryKind, RequestId, SessionId, SpaceId, TxnId,
 };
 use brain_metadata::tables::checkpoint::{latest as latest_checkpoint, CHECKPOINTS_TABLE};
 use brain_metadata::tables::edge::EDGES_TABLE;

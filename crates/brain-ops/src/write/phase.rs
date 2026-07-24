@@ -16,7 +16,7 @@
 //!   no LLM, no network. Strategies (the things that compute derived
 //!   phases) do that ahead of submit; apply functions only mutate redb.
 
-use brain_core::{SessionId, EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience};
+use brain_core::{EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience, SessionId};
 use brain_core::{
     Entity, EntityAttributes, EntityId, EntityTypeId, EvidenceEntry, EvidenceOverflowId,
     ExtractorId, MergeId, PredicateId, Relation, RelationId, RelationTypeId, Statement,

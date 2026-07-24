@@ -724,7 +724,7 @@ mod tests {
         use crate::framework::extractor::ExtractionContext;
         use crate::framework::item::ExtractedItem;
         use crate::framework::registry::ExtractorRegistry;
-        use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, Salience};
+        use brain_core::{MemoryId, MemoryKind, Salience, SessionId, SpaceId};
         use brain_metadata::MetadataDb;
         use tempfile::TempDir;
 

@@ -1,6 +1,6 @@
 //! Types shared across the per-request plan modules.
 
-use brain_core::{SessionId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{EdgeKind, MemoryId, MemoryKind, SessionId};
 
 /// Logical shard reference: the plan is at a level of abstraction
 /// above transport. The executor maps shard references to actual

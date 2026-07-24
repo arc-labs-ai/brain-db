@@ -17,10 +17,10 @@
 //!   clears the flag on rows that point at it.
 
 use brain_core::{
-    SessionId, EntityId, EntityTypeId, ExtractorId, MemoryId, StatementId, StatementKind,
+    Entity, EvidenceEntry, EvidenceRef, Statement, StatementObject, StatementValue, SubjectRef,
 };
 use brain_core::{
-    Entity, EvidenceEntry, EvidenceRef, Statement, StatementObject, StatementValue, SubjectRef,
+    EntityId, EntityTypeId, ExtractorId, MemoryId, SessionId, StatementId, StatementKind,
 };
 use brain_metadata::entity::ops::entity_put;
 use brain_metadata::schema::apply::flag_statements_outside_schema;
@@ -67,7 +67,8 @@ fn put_anchor_entity(db: &redb::Database) -> EntityId {
     entity_put(
         &wtxn,
         RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16]),
-        brain_core::SessionId::DEFAULT, &Entity::new_active(id, EntityTypeId(1), "anchor".into(), "anchor".into(), T0),
+        brain_core::SessionId::DEFAULT,
+        &Entity::new_active(id, EntityTypeId(1), "anchor".into(), "anchor".into(), T0),
     )
     .unwrap();
     wtxn.commit().unwrap();
@@ -103,7 +104,8 @@ fn write_statement(
     let sid = statement_create(
         &wtxn,
         RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16]),
-        brain_core::SessionId::DEFAULT, &stmt,
+        brain_core::SessionId::DEFAULT,
+        &stmt,
         T0,
     )
     .unwrap();

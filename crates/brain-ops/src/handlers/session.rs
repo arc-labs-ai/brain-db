@@ -36,7 +36,10 @@ pub async fn handle_session_create(
     let write = build_write(&req.request_id, ctx, phase, b"session_create");
     let writer = downcast_writer_pub(ctx)?;
     let ack = writer.submit(write).await.map_err(writer_err)?;
-    let created = matches!(ack.single_phase(), PhaseAck::SessionCreated { created: true });
+    let created = matches!(
+        ack.single_phase(),
+        PhaseAck::SessionCreated { created: true }
+    );
 
     let rtxn = ctx
         .executor
@@ -111,8 +114,7 @@ pub async fn handle_session_delete(
 
     // Cascade the session's memories (default soft/tombstone like FORGET),
     // then drop the registry row.
-    let memories_forgotten =
-        tombstone_space_memories(ctx, req.hard, Some(req.session_id)).await?;
+    let memories_forgotten = tombstone_space_memories(ctx, req.hard, Some(req.session_id)).await?;
 
     let phase = Phase::SessionDelete {
         session_id: SessionId(req.session_id),
@@ -122,7 +124,10 @@ pub async fn handle_session_delete(
     let write = build_write(&req.request_id, ctx, phase, b"session_delete");
     let writer = downcast_writer_pub(ctx)?;
     let ack = writer.submit(write).await.map_err(writer_err)?;
-    let existed = matches!(ack.single_phase(), PhaseAck::SessionDeleted { existed: true });
+    let existed = matches!(
+        ack.single_phase(),
+        PhaseAck::SessionDeleted { existed: true }
+    );
 
     Ok(SessionDeleteResponse {
         space_id: space.into(),

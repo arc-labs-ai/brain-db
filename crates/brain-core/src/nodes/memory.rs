@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{SpaceId, SessionId, MemoryId};
+use crate::ids::{MemoryId, SessionId, SpaceId};
 
 /// Three durable kinds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]

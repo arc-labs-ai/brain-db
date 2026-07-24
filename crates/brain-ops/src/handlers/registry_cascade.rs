@@ -7,15 +7,15 @@
 //! entity/statement/relation graph rows — so a scope delete reuses the FORGET
 //! machinery rather than re-implementing a graph teardown.
 
-use brain_core::MemoryId;
-use brain_metadata::tables::memory::{
-    space_timeline_prefix_space, SPACE_TIMELINE_KEY_LEN, MEMORIES_BY_SPACE_TIMELINE_TABLE,
-};
 use crate::context::OpsContext;
 use crate::error::OpError;
 use crate::handlers::link::downcast_writer_pub;
 use crate::write::phase::TombstoneMode;
 use crate::write::{Phase, TombstoneTarget, Write, WriteId};
+use brain_core::MemoryId;
+use brain_metadata::tables::memory::{
+    space_timeline_prefix_space, MEMORIES_BY_SPACE_TIMELINE_TABLE, SPACE_TIMELINE_KEY_LEN,
+};
 
 /// Map a writer error to an `OpError`.
 pub(super) fn writer_err(e: brain_planner::WriterError) -> OpError {

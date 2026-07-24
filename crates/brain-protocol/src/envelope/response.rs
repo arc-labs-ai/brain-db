@@ -1097,7 +1097,7 @@ mod tests {
     #[test]
     fn handshake_response_bodies_round_trip() {
         use crate::connection::handshake::{
-            SpacePermissions, AuthMethod, AuthOkPayload, HelloCapabilities, ServerFeatures,
+            AuthMethod, AuthOkPayload, HelloCapabilities, ServerFeatures, SpacePermissions,
             WelcomePayload,
         };
 

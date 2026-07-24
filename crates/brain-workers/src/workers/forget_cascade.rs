@@ -253,11 +253,11 @@ mod tests {
 
     use super::*;
     use brain_core::{
-        SpaceId, SessionId, EntityId, ExtractorId as CoreExtractorId, MemoryId, MemoryKind,
-    };
-    use brain_core::{
         Entity, EntityType, EvidenceEntry, EvidenceRef, PredicateId, Statement, StatementId,
         StatementKind, StatementObject, StatementValue, SubjectRef,
+    };
+    use brain_core::{
+        EntityId, ExtractorId as CoreExtractorId, MemoryId, MemoryKind, SessionId, SpaceId,
     };
     use brain_metadata::entity::ops::{entity_put, normalize_name};
     use brain_metadata::schema::predicate::predicate_intern;

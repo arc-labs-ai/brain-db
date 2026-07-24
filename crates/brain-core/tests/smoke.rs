@@ -4,8 +4,8 @@
 //! test that the public surface is reachable and behaves sanely.
 
 use brain_core::{
-    SpaceId, SessionId, Edge, EdgeKind, EdgeOrigin, Error, Memory, MemoryId, MemoryKind, RequestId,
-    Salience, TxnId,
+    Edge, EdgeKind, EdgeOrigin, Error, Memory, MemoryId, MemoryKind, RequestId, Salience,
+    SessionId, SpaceId, TxnId,
 };
 
 #[test]

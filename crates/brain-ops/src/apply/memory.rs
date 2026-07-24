@@ -3,7 +3,7 @@
 //! Covers: UpsertMemory, UpdateSalience, UpdateKind, UpdateSession,
 //! UpdateEmbedding, and Tombstone(Memory).
 
-use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind};
+use brain_core::{MemoryId, MemoryKind, SessionId, SpaceId};
 use brain_metadata::tables::memory::{
     space_timeline_key, MemoryMetadata, MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE,
 };

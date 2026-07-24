@@ -298,7 +298,7 @@ pub fn relations_with_evidence(
 /// mirror image of a concretely declared `from` / `to` pair — is
 /// corrected by exchanging them (and logged); any other violation is
 /// rejected with [`RelationOpError::EndpointTypeViolation`]. See
-/// [`resolve_endpoint_direction`].
+/// `resolve_endpoint_direction`.
 pub fn relation_create(
     wtxn: &WriteTransaction,
     scope: RowScope,
@@ -364,7 +364,14 @@ pub fn relation_create(
             insert_new_relation(wtxn, scope, session, &to_insert, now_unix_nanos)?;
             Ok(to_insert.id)
         }
-        1 => relation_supersede(wtxn, scope, session, conflicting[0], &to_insert, now_unix_nanos),
+        1 => relation_supersede(
+            wtxn,
+            scope,
+            session,
+            conflicting[0],
+            &to_insert,
+            now_unix_nanos,
+        ),
         _ => Err(RelationOpError::CardinalityViolation {
             variant: cardinality,
             conflicting: conflicting.len(),
@@ -934,7 +941,8 @@ mod tests {
         let r = fresh_rel(t, a, b, false);
 
         let wtxn = db.write_txn().unwrap();
-        let id = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0).unwrap();
+        let id =
+            relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0).unwrap();
         wtxn.commit().unwrap();
         assert_eq!(id, r.id);
 
@@ -982,7 +990,8 @@ mod tests {
         let b = make_entity(&mut db, "b-ut");
         let r = fresh_rel(RelationTypeId::from(9999), a, b, false);
         let wtxn = db.write_txn().unwrap();
-        let err = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0).unwrap_err();
+        let err = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0)
+            .unwrap_err();
         assert!(matches!(err, RelationOpError::UnknownRelationType(_)));
     }
 
@@ -992,7 +1001,8 @@ mod tests {
         let t = intern_type(&mut db, "knows_ue", Cardinality::ManyToMany, false);
         let r = fresh_rel(t, EntityId::new(), EntityId::new(), false);
         let wtxn = db.write_txn().unwrap();
-        let err = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0).unwrap_err();
+        let err = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0)
+            .unwrap_err();
         assert!(matches!(err, RelationOpError::UnknownEntity(_)));
     }
 
@@ -1073,7 +1083,8 @@ mod tests {
         // Supplied backwards: (Organization, Person).
         let r = fresh_rel(t, org, person, false);
         let wtxn = db.write_txn().unwrap();
-        let id = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0).unwrap();
+        let id =
+            relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0).unwrap();
         wtxn.commit().unwrap();
         assert_eq!(id, r.id, "the swap keeps the caller's relation id");
 
@@ -1115,7 +1126,8 @@ mod tests {
 
         let r = fresh_rel(t, person, other_person, false);
         let wtxn = db.write_txn().unwrap();
-        let err = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0).unwrap_err();
+        let err = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0)
+            .unwrap_err();
         assert!(matches!(
             err,
             RelationOpError::EndpointTypeViolation { side: "to", .. }
@@ -1141,7 +1153,8 @@ mod tests {
 
         let r = fresh_rel(t, place_a, place_b, false);
         let wtxn = db.write_txn().unwrap();
-        let err = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0).unwrap_err();
+        let err = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0)
+            .unwrap_err();
         match err {
             RelationOpError::EndpointTypeViolation {
                 side,
@@ -1176,7 +1189,8 @@ mod tests {
 
         let r = fresh_rel(t, org, person, false);
         let wtxn = db.write_txn().unwrap();
-        let err = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0).unwrap_err();
+        let err = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0)
+            .unwrap_err();
         assert!(matches!(
             err,
             RelationOpError::EndpointTypeViolation { side: "from", .. }
@@ -1244,7 +1258,8 @@ mod tests {
 
         let r = fresh_rel(t, org_as_from, org, false);
         let wtxn = db.write_txn().unwrap();
-        let err = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0).unwrap_err();
+        let err = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0)
+            .unwrap_err();
         match err {
             RelationOpError::EndpointTypeViolation {
                 side,
@@ -1275,7 +1290,8 @@ mod tests {
 
         let r = fresh_rel(t, person, other_person, false);
         let wtxn = db.write_txn().unwrap();
-        let err = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0).unwrap_err();
+        let err = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0)
+            .unwrap_err();
         assert!(matches!(
             err,
             RelationOpError::EndpointTypeViolation { side: "to", .. }
@@ -1362,7 +1378,8 @@ mod tests {
         // unreachable for the one seeded type that declares anything.
         let r = fresh_rel(family_of.id, person_a, place, family_of.is_symmetric);
         let wtxn = db.write_txn().unwrap();
-        let err = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 2).unwrap_err();
+        let err = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 2)
+            .unwrap_err();
         assert!(matches!(
             err,
             RelationOpError::EndpointTypeViolation { side: "to", .. }
@@ -1410,7 +1427,8 @@ mod tests {
 
         let r2 = fresh_rel(t, priya, bob, false);
         let wtxn = db.write_txn().unwrap();
-        let result_id = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r2, 1).unwrap();
+        let result_id =
+            relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r2, 1).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1437,7 +1455,8 @@ mod tests {
         let new_employee = make_entity(&mut db, "new-employee");
         let r2 = fresh_rel(t, new_employee, acme, false);
         let wtxn = db.write_txn().unwrap();
-        let result_id = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r2, 1).unwrap();
+        let result_id =
+            relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r2, 1).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1496,7 +1515,14 @@ mod tests {
         for (lsn, place) in [p1, p2, p3].into_iter().enumerate() {
             let r = fresh_rel(t, subj, place, false);
             let wtxn = db.write_txn().unwrap();
-            relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, lsn as u64).unwrap();
+            relation_create(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &r,
+                lsn as u64,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
         }
 

@@ -542,10 +542,10 @@ mod tests {
     }
 
     use super::*;
-    use brain_core::{
-        SessionId, EntityId, EvidenceOverflowId, ExtractorId, MemoryId, PredicateId, StatementId,
-    };
     use brain_core::{Entity, EntityType, EvidenceRef, Statement, StatementObject, SubjectRef};
+    use brain_core::{
+        EntityId, EvidenceOverflowId, ExtractorId, MemoryId, PredicateId, SessionId, StatementId,
+    };
     use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
     use brain_index::statement_hnsw::{StatementHnswIndex, StatementHnswParams};
     use brain_index::{IndexParams, SharedHnsw};
@@ -726,7 +726,8 @@ mod tests {
         entity_put(
             &wtxn,
             __ts(),
-            brain_core::SessionId::DEFAULT, &Entity::new_active(
+            brain_core::SessionId::DEFAULT,
+            &Entity::new_active(
                 subj,
                 EntityType::PERSON_ID,
                 format!("Subject{n}"),
@@ -738,7 +739,8 @@ mod tests {
         entity_put(
             &wtxn,
             __ts(),
-            brain_core::SessionId::DEFAULT, &Entity::new_active(
+            brain_core::SessionId::DEFAULT,
+            &Entity::new_active(
                 obj,
                 EntityType::PERSON_ID,
                 format!("Object{n}"),
@@ -777,7 +779,14 @@ mod tests {
         if matches!(kind, StatementKind::Event) {
             s.event_at_unix_nanos = Some(extracted_at);
         }
-        let id = statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &s, extracted_at).unwrap();
+        let id = statement_create(
+            &wtxn,
+            __ts(),
+            brain_core::SessionId::DEFAULT,
+            &s,
+            extracted_at,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -967,7 +976,8 @@ mod tests {
             entity_put(
                 &wtxn,
                 __ts(),
-                brain_core::SessionId::DEFAULT, &Entity::new_active(
+                brain_core::SessionId::DEFAULT,
+                &Entity::new_active(
                     subj,
                     EntityType::PERSON_ID,
                     "Subject".into(),
@@ -979,7 +989,8 @@ mod tests {
             entity_put(
                 &wtxn,
                 __ts(),
-                brain_core::SessionId::DEFAULT, &Entity::new_active(
+                brain_core::SessionId::DEFAULT,
+                &Entity::new_active(
                     obj,
                     EntityType::PERSON_ID,
                     "Object".into(),
@@ -1018,7 +1029,14 @@ mod tests {
                 extracted_at,
                 1,
             );
-            let id = statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &s, extracted_at).unwrap();
+            let id = statement_create(
+                &wtxn,
+                __ts(),
+                brain_core::SessionId::DEFAULT,
+                &s,
+                extracted_at,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             id
         };

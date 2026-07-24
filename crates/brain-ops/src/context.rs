@@ -188,7 +188,7 @@ pub struct OpsContext {
     pub cross_encoder: CrossEncoderSlot,
     /// WAL append sink for the opaque-body subscribe-replay
     /// pipeline. typed-graph handlers (the `crate::handlers`
-    /// modules) call [`OpsContext::publish_graph`] after their successful
+    /// modules) call the typed-graph WAL-append helper after their successful
     /// redb commit; that helper appends a `WalPayload::PhaseBody`
     /// record carrying the CBOR-encoded
     /// [`brain_protocol::GraphEventPayload`] body, then

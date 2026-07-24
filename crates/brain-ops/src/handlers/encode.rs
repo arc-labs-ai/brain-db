@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use brain_core::{SessionId, MemoryId, MemoryKind, Salience};
+use brain_core::{MemoryId, MemoryKind, Salience, SessionId};
 use brain_metadata::tables::memory::MemoryMetadata;
 use brain_planner::plan_encode_inner;
 use brain_protocol::envelope::request::EncodeRequest;

@@ -50,7 +50,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::workers::hype::{HypeGenOutcome, HypeGenerator};
 use brain_core::{
-    SpaceId, SessionId, EntityId, ExtractorId, Memory as CoreMemory, MemoryId, MemoryKind, Salience,
+    EntityId, ExtractorId, Memory as CoreMemory, MemoryId, MemoryKind, Salience, SessionId, SpaceId,
 };
 use brain_core::{StatementKind, StatementObject, StatementValue, SubjectRef};
 use brain_extractors::{
@@ -1356,8 +1356,11 @@ async fn run_hype_refresh_sweep(worker: &ExtractorWorker, ctx: &WorkerContext) {
         if cycle_budget > 0 && *worker.llm_spend.lock() >= cycle_budget {
             break;
         }
-        let neighborhood =
-            build_neighborhood(ctx, memory_scope_and_session(ctx, *memory_id).0, text.as_str());
+        let neighborhood = build_neighborhood(
+            ctx,
+            memory_scope_and_session(ctx, *memory_id).0,
+            text.as_str(),
+        );
         if neighborhood.is_empty() {
             last_examined = memory_id.to_be_bytes();
             continue;
@@ -4935,7 +4938,7 @@ mod tests {
         memory_id: brain_core::MemoryId,
         scope: brain_metadata::RowScope,
     ) {
-        use brain_core::{SessionId, MemoryKind};
+        use brain_core::{MemoryKind, SessionId};
         use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
         let row = MemoryMetadata::new_active(
             memory_id,
@@ -4967,7 +4970,7 @@ mod tests {
         scope: brain_metadata::RowScope,
         occurred_at: u64,
     ) {
-        use brain_core::{SessionId, MemoryKind};
+        use brain_core::{MemoryKind, SessionId};
         use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
         let row = MemoryMetadata::new_active(
             memory_id,
@@ -5297,8 +5300,8 @@ mod tests {
     // ---------------------------------------------------------------
 
     use brain_core::{
-        SpaceId as TestSpaceId, SessionId as TestSessionId, MemoryId as TestMemoryId, MemoryKind,
-        Salience,
+        MemoryId as TestMemoryId, MemoryKind, Salience, SessionId as TestSessionId,
+        SpaceId as TestSpaceId,
     };
     use brain_extractors::{
         ClassifiedSpan, ClassifierExtractor, ClassifierModel, ExtractorError as TestExtractorError,
@@ -6525,7 +6528,7 @@ mod tests {
         use std::sync::Arc;
 
         use brain_core::{
-            SpaceId, SessionId, EntityType, Memory, MemoryId, MemoryKind, Salience, StatementKind,
+            EntityType, Memory, MemoryId, MemoryKind, Salience, SessionId, SpaceId, StatementKind,
         };
         use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
         use brain_index::{IndexParams, SharedHnsw};
@@ -6733,7 +6736,7 @@ mod tests {
         use std::sync::Arc;
 
         use brain_core::{
-            SpaceId, SessionId, EntityType, Memory, MemoryId, MemoryKind, Salience, StatementKind,
+            EntityType, Memory, MemoryId, MemoryKind, Salience, SessionId, SpaceId, StatementKind,
         };
         use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
         use brain_index::{IndexParams, SharedHnsw};

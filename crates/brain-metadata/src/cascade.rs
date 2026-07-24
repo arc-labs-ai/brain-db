@@ -834,7 +834,7 @@ mod statement_cascade_overflow_tests {
     use crate::tables::statement::{StatementMetadata, EVIDENCE_OVERFLOW_TABLE, STATEMENTS_TABLE};
     use crate::MetadataDb;
     use brain_core::{
-        SessionId, Entity, EntityType, EvidenceRef, ExtractorId, PredicateId, Statement,
+        Entity, EntityType, EvidenceRef, ExtractorId, PredicateId, SessionId, Statement,
         StatementId, StatementKind, StatementObject, StatementValue, SubjectRef,
     };
 

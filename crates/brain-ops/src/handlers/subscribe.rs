@@ -49,7 +49,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use brain_core::{SessionId, MemoryId, MemoryKind};
+use brain_core::{MemoryId, MemoryKind, SessionId};
 use brain_protocol::envelope::request::{SubscribeRequest, UnsubscribeRequest};
 use brain_protocol::envelope::response::{
     EdgeEventPayload, EventType, SubscriptionEvent, UnsubscribeResponse,

@@ -5,7 +5,7 @@ use std::sync::Mutex as StdMutex;
 use std::thread;
 use std::time::Duration;
 
-use brain_core::{SpaceId, SessionId, Entity, EntityId, EntityType, MemoryId, MemoryKind};
+use brain_core::{Entity, EntityId, EntityType, MemoryId, MemoryKind, SessionId, SpaceId};
 use brain_index::{
     GraphError, GraphQuery, GraphRetriever, GraphRetrieverConfig, LexicalError, LexicalQuery,
     LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItem, RankedItemId,
@@ -927,7 +927,8 @@ fn cue_anchor_upgrades_blind_graph_to_resolved_entity() {
     let sarah_id = sarah.id;
     {
         let wtxn = metadata.write_txn().expect("wtxn");
-        brain_metadata::entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &sarah).expect("put");
+        brain_metadata::entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &sarah)
+            .expect("put");
         wtxn.commit().expect("commit");
     }
     let ctx = cue_ctx(metadata);
@@ -1259,11 +1260,19 @@ fn correct_derived_lexical_partitions_by_provenance() {
             .collect::<Vec<_>>()
     };
     // Original lexical hit keeps its independent Lexical lane.
-    assert_eq!(lanes(&fused[0]), vec![Retriever::Semantic, Retriever::Lexical]);
+    assert_eq!(
+        lanes(&fused[0]),
+        vec![Retriever::Semantic, Retriever::Lexical]
+    );
     // PRF-only echo loses the Lexical tag entirely (circular, not independent).
     assert_eq!(lanes(&fused[1]), vec![Retriever::Semantic]);
     // Graph-expansion hit is re-tagged Graph (independent graph signal).
-    assert_eq!(lanes(&fused[2]), vec![Retriever::Semantic, Retriever::Graph]);
+    assert_eq!(
+        lanes(&fused[2]),
+        vec![Retriever::Semantic, Retriever::Graph]
+    );
     // fused_score is never touched — recall/ranking preserved.
-    assert!(fused.iter().all(|f| (f.fused_score - 1.0).abs() < f32::EPSILON as f64));
+    assert!(fused
+        .iter()
+        .all(|f| (f.fused_score - 1.0).abs() < f32::EPSILON as f64));
 }

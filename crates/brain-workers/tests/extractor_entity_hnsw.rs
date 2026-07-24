@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use brain_core::ExtractorKind;
-use brain_core::{SpaceId, EntityId, ExtractorId, Memory as CoreMemory, MemoryId};
+use brain_core::{EntityId, ExtractorId, Memory as CoreMemory, MemoryId, SpaceId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_extractors::resolver::{EmbeddingDeps, EntityDisambiguator, EMBED_RESOLVE_THRESHOLD};
 use brain_extractors::{
@@ -224,7 +224,7 @@ impl Fixture {
     /// Mirror `apply_upsert_memory`: memory row + text + durable queue
     /// row in one commit, then nudge the worker's wakeup channel.
     fn enqueue(&self, memory_id: MemoryId, text: &str) {
-        use brain_core::{SessionId, MemoryKind, NamespaceId};
+        use brain_core::{MemoryKind, NamespaceId, SessionId};
         use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
         use brain_metadata::tables::text::TEXTS_TABLE;
 

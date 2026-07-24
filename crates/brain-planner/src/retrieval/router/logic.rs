@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use brain_core::StatementKind;
-use brain_core::{SpaceId, EntityId, PredicateId};
+use brain_core::{EntityId, PredicateId, SpaceId};
 use regex::Regex;
 
 // ---------------------------------------------------------------------------

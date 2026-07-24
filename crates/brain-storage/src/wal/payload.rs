@@ -19,8 +19,8 @@
 //!   the `flags` bit at this layer.
 
 use brain_core::{
-    SpaceId, SessionId, EdgeKindRef, EdgeKindRefError, EdgeOrigin, MemoryId, MemoryKind,
-    NamespaceId, NodeRef, NodeRefError, RelationId, RelationTypeId, RequestId, TxnId,
+    EdgeKindRef, EdgeKindRefError, EdgeOrigin, MemoryId, MemoryKind, NamespaceId, NodeRef,
+    NodeRefError, RelationId, RelationTypeId, RequestId, SessionId, SpaceId, TxnId,
 };
 
 /// Opaque 16-byte fingerprint of an embedding model.
@@ -1348,8 +1348,8 @@ fn decode_relation_tombstone(
 mod tests {
     use super::*;
     use brain_core::{
-        SpaceId, EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, MemoryId, NodeRef, RelationId,
-        RelationTypeId, RequestId, TxnId,
+        EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, MemoryId, NodeRef, RelationId, RelationTypeId,
+        RequestId, SpaceId, TxnId,
     };
     use proptest::prelude::*;
 

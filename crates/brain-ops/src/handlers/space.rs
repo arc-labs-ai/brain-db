@@ -54,15 +54,7 @@ pub async fn handle_space_create(
                 m.session_count,
             )
         })
-        .unwrap_or_else(|| {
-            (
-                ctx.executor.caller_space_string.clone(),
-                now,
-                now,
-                0,
-                0,
-            )
-        });
+        .unwrap_or_else(|| (ctx.executor.caller_space_string.clone(), now, now, 0, 0));
 
     Ok(SpaceCreateResponse {
         space_id: space_string,
@@ -134,12 +126,7 @@ pub async fn handle_space_delete(
 
 /// Build a single-phase registry write stamped with the caller's scope +
 /// namespace + an idempotency hash over `(domain, request_id, space)`.
-fn build_write(
-    request_id: &[u8; 16],
-    ctx: &OpsContext,
-    phase: Phase,
-    domain: &[u8],
-) -> Write {
+fn build_write(request_id: &[u8; 16], ctx: &OpsContext, phase: Phase, domain: &[u8]) -> Write {
     let space = ctx.executor.caller_space;
     let write_id = WriteId::from_request(brain_core::RequestId::from(*request_id), space);
     let mut h = blake3::Hasher::new();

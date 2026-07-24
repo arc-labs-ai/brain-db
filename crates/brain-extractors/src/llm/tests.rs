@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brain_core::{
-    SpaceId, SessionId, ExtractorId, Memory, MemoryId, MemoryKind, Salience, Statement,
+    ExtractorId, Memory, MemoryId, MemoryKind, Salience, SessionId, SpaceId, Statement,
     StatementObject, StatementValue, SubjectRef,
 };
 use brain_llm::client::LlmFuture;

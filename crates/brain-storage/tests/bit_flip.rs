@@ -27,7 +27,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, RequestId};
+use brain_core::{MemoryId, MemoryKind, RequestId, SessionId, SpaceId};
 use brain_storage::arena::ArenaFile;
 use brain_storage::recovery::{recover, InMemoryMetadataSink};
 use brain_storage::wal::{EncodePayload, Lsn, Wal, WalPayload, WalRecord, WAL_SEGMENT_HEADER_LEN};

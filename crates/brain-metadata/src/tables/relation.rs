@@ -25,7 +25,7 @@ use crate::impl_redb_rkyv_value;
 use crate::tables::scope::RowScope;
 use brain_core::Relation;
 use brain_core::{
-    SpaceId, EntityId, ExtractorId, MemoryId, NamespaceId, NodeRef, RelationId, RelationTypeId,
+    EntityId, ExtractorId, MemoryId, NamespaceId, NodeRef, RelationId, RelationTypeId, SpaceId,
 };
 use redb::TableDefinition;
 

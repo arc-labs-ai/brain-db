@@ -26,7 +26,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use brain_core::{SessionId, MemoryId, MemoryKind, NodeRef};
+use brain_core::{MemoryId, MemoryKind, NodeRef, SessionId};
 use brain_planner::WriterError;
 use brain_protocol::EventType;
 use brain_storage::wal::payload::WalPayload;
@@ -995,7 +995,7 @@ mod tests {
     use super::*;
     use crate::write::{Phase, Write, WriteId};
     use crate::writer::RealWriterHandle;
-    use brain_core::{SpaceId, SessionId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
+    use brain_core::{EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, SessionId, SpaceId};
     use brain_embed::VECTOR_DIM;
     use brain_index::{IndexParams, SharedHnsw};
     use brain_metadata::tables::edge::zero_disambiguator;

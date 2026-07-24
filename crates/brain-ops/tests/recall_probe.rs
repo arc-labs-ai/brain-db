@@ -258,8 +258,7 @@ struct RecallResult {
 /// target spaces, and measure recall@10 for both arms.
 fn run_recall(cfg: RecallConfig) -> RecallResult {
     let mut rng = Rng::new(cfg.seed);
-    let competitors_per_query =
-        ((cfg.occupancy as f32) * cfg.competitor_density).round() as usize;
+    let competitors_per_query = ((cfg.occupancy as f32) * cfg.competitor_density).round() as usize;
 
     let params = IndexParams::default_v1(); // M=16, ef_c=200, ef_search=64, max=500
     let mut index = HnswIndex::new(params).expect("valid params");

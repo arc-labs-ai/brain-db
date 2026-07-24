@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use brain_metadata::tables::memory::{SPACE_TIMELINE_KEY_LEN, MEMORIES_BY_SPACE_TIMELINE_TABLE};
+use brain_metadata::tables::memory::{MEMORIES_BY_SPACE_TIMELINE_TABLE, SPACE_TIMELINE_KEY_LEN};
 use redb::{Database, ReadableDatabase, ReadableTable};
 
 fn main() {

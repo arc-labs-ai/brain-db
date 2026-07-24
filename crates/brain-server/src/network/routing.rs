@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use brain_core::{SpaceId, MemoryId, ShardId};
+use brain_core::{MemoryId, ShardId, SpaceId};
 
 // ---------------------------------------------------------------------------
 // Errors

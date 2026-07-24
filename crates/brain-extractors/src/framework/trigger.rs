@@ -163,7 +163,7 @@ fn memory_kind_str(kind: MemoryKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_core::{SpaceId, SessionId, MemoryId, Salience};
+    use brain_core::{MemoryId, Salience, SessionId, SpaceId};
 
     fn mem_with(text: &str, kind: MemoryKind) -> Memory {
         Memory {

@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use brain_core::{SessionId, EntityId, PredicateId, StatementKind};
+use brain_core::{EntityId, PredicateId, SessionId, StatementKind};
 use brain_core::{Statement, StatementObject, StatementValue};
 use brain_metadata::schema::predicate::{predicate_get, predicate_lookup_by_qname};
 use brain_metadata::statement::{statement_list, StatementListFilter};
@@ -117,9 +117,7 @@ pub async fn handle_materialize_procedural(
     let subject_entity = EntityId::from(space_bytes);
 
     let session_filter: Option<std::collections::HashSet<SessionId>> = match &req.session_filter {
-        Some(ids) if !ids.is_empty() => {
-            Some(ids.iter().map(|id| SessionId(*id)).collect())
-        }
+        Some(ids) if !ids.is_empty() => Some(ids.iter().map(|id| SessionId(*id)).collect()),
         _ => None,
     };
 

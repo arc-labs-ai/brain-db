@@ -20,8 +20,8 @@ pub use payload::{
     EmbeddingModelFp, EncodePayload, ForgetMode, ForgetPayload, ForgetReason, LinkPayload,
     MigrateEmbeddingPayload, ReclaimPayload, RelationLinkPayload, RelationSupersedePayload,
     RelationTombstonePayload, SalienceReason, SalienceUpdate, TxnAbortPayload, TxnBeginPayload,
-    TxnCommitPayload, UnlinkPayload, UpdateSessionPayload, UpdateKindPayload,
-    UpdateSaliencePayload, WalPayload, WalPayloadError, VECTOR_DIMS_MAX,
+    TxnCommitPayload, UnlinkPayload, UpdateKindPayload, UpdateSaliencePayload,
+    UpdateSessionPayload, WalPayload, WalPayloadError, VECTOR_DIMS_MAX,
 };
 pub use reader::{SegmentInfo, WalReadError, WalReader};
 pub use record::{

@@ -14,7 +14,7 @@
 //! construction). Ops thread it explicitly from the authenticated
 //! caller's `(namespace, space)`.
 
-use brain_core::{SpaceId, NamespaceId};
+use brain_core::{NamespaceId, SpaceId};
 
 /// The `(namespace_id, space_id)` ownership key for a typed-graph row.
 ///

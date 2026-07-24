@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use brain_core::{
-    SessionId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, RequestId, Salience,
+    EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, RequestId, Salience, SessionId,
 };
 use brain_embed::VECTOR_DIM;
 use brain_metadata::tables::memory::MEMORIES_TABLE;

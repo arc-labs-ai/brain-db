@@ -12,7 +12,7 @@
 use std::ops::RangeInclusive;
 
 use brain_core::StatementKind;
-use brain_core::{SpaceId, MemoryKind, PredicateId};
+use brain_core::{MemoryKind, PredicateId, SpaceId};
 
 use crate::tantivy_shard::{RankedItem, RankedItemId};
 

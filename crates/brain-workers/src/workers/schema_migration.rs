@@ -303,12 +303,12 @@ mod tests {
 
     use super::*;
     use brain_core::{
-        SpaceId, SessionId, EntityId, ExtractorId, MemoryId, PredicateId, StatementId,
-        StatementKind,
-    };
-    use brain_core::{
         Entity, EntityType, EvidenceEntry, EvidenceRef, Statement, StatementObject, StatementValue,
         SubjectRef,
+    };
+    use brain_core::{
+        EntityId, ExtractorId, MemoryId, PredicateId, SessionId, SpaceId, StatementId,
+        StatementKind,
     };
     use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
     use brain_index::{IndexParams, SharedHnsw};
@@ -405,7 +405,8 @@ mod tests {
         entity_put(
             &wtxn,
             __ts(),
-            brain_core::SessionId::DEFAULT, &Entity::new_active(
+            brain_core::SessionId::DEFAULT,
+            &Entity::new_active(
                 id,
                 EntityType::PERSON_ID,
                 "anchor".into(),
@@ -444,7 +445,8 @@ mod tests {
             NOW,
             1,
         );
-        let sid = statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, NOW).unwrap();
+        let sid =
+            statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, NOW).unwrap();
         wtxn.commit().unwrap();
         (sid, pid)
     }

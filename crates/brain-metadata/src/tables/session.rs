@@ -71,10 +71,7 @@ pub fn session_range_bounds(namespace_id: u32, space_id: [u8; 16]) -> ([u8; 28],
 /// of one `(namespace, space)`. Iterate the result reversed for
 /// newest-first ordering.
 #[must_use]
-pub fn session_scope_range_bounds(
-    namespace_id: u32,
-    space_id: [u8; 16],
-) -> ([u8; 36], [u8; 36]) {
+pub fn session_scope_range_bounds(namespace_id: u32, space_id: [u8; 16]) -> ([u8; 36], [u8; 36]) {
     (
         session_scope_key(namespace_id, space_id, u64::MIN, u64::MIN),
         session_scope_key(namespace_id, space_id, u64::MAX, u64::MAX),
@@ -143,7 +140,7 @@ impl redb::Value for SessionMetadata {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use redb::{Database, ReadableDatabase, ReadableTable};
+    use redb::{Database, ReadableDatabase};
 
     fn fresh_db(dir: &tempfile::TempDir) -> Database {
         Database::create(dir.path().join("test.redb")).expect("create redb")
@@ -177,9 +174,12 @@ mod tests {
         let wtxn = db.begin_write().unwrap();
         {
             let mut t = wtxn.open_table(SESSION_BY_SCOPE_TABLE).unwrap();
-            t.insert(&session_scope_key(1, space, 100, 10), &()).unwrap();
-            t.insert(&session_scope_key(1, space, 300, 30), &()).unwrap();
-            t.insert(&session_scope_key(1, space, 200, 20), &()).unwrap();
+            t.insert(&session_scope_key(1, space, 100, 10), &())
+                .unwrap();
+            t.insert(&session_scope_key(1, space, 300, 30), &())
+                .unwrap();
+            t.insert(&session_scope_key(1, space, 200, 20), &())
+                .unwrap();
             // A different space must not appear in the scan.
             t.insert(&session_scope_key(1, [0xBB; 16], 999, 99), &())
                 .unwrap();

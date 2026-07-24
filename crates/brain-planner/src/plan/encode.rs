@@ -13,7 +13,7 @@
 //! Single-shard only for now; the `shard` field is always the local
 //! shard.
 
-use brain_core::{SpaceId, SessionId, MemoryKind, RequestId};
+use brain_core::{MemoryKind, RequestId, SessionId, SpaceId};
 
 use super::common::{EdgeSpec, ShardId};
 use super::recall::EmbeddingStep;

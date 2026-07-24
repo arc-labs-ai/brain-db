@@ -60,7 +60,11 @@ pub struct SpaceMetadata {
 
 impl SpaceMetadata {
     #[must_use]
-    pub fn new(created_at_unix_nanos: u64, space_string: String, metadata: Option<Vec<u8>>) -> Self {
+    pub fn new(
+        created_at_unix_nanos: u64,
+        space_string: String,
+        metadata: Option<Vec<u8>>,
+    ) -> Self {
         Self {
             space_string,
             created_at_unix_nanos,
@@ -108,7 +112,7 @@ impl redb::Value for SpaceMetadata {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use redb::{Database, ReadableDatabase, ReadableTable};
+    use redb::{Database, ReadableDatabase};
 
     fn fresh_db(dir: &tempfile::TempDir) -> Database {
         Database::create(dir.path().join("test.redb")).expect("create redb")
@@ -141,12 +145,21 @@ mod tests {
         let wtxn = db.begin_write().unwrap();
         {
             let mut t = wtxn.open_table(SPACES_TABLE).unwrap();
-            t.insert(&space_key(1, [0x01; 16]), &SpaceMetadata::new(1, String::new(), None))
-                .unwrap();
-            t.insert(&space_key(1, [0x02; 16]), &SpaceMetadata::new(2, String::new(), None))
-                .unwrap();
-            t.insert(&space_key(2, [0x03; 16]), &SpaceMetadata::new(3, String::new(), None))
-                .unwrap();
+            t.insert(
+                &space_key(1, [0x01; 16]),
+                &SpaceMetadata::new(1, String::new(), None),
+            )
+            .unwrap();
+            t.insert(
+                &space_key(1, [0x02; 16]),
+                &SpaceMetadata::new(2, String::new(), None),
+            )
+            .unwrap();
+            t.insert(
+                &space_key(2, [0x03; 16]),
+                &SpaceMetadata::new(3, String::new(), None),
+            )
+            .unwrap();
         }
         wtxn.commit().unwrap();
 

@@ -140,7 +140,7 @@ mod tests {
     use crate::wal::payload::EncodePayload;
     use crate::wal::record::WalRecord;
     use crate::wal::segment::{glommio_run, WalSegment};
-    use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, RequestId};
+    use brain_core::{MemoryId, MemoryKind, RequestId, SessionId, SpaceId};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
 

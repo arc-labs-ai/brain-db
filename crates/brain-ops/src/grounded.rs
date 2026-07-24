@@ -249,7 +249,7 @@ fn is_meaningful_object(o: &StatementObject) -> bool {
 }
 
 /// Minimum statement-question cosine for the reified slot-projection overlay to
-/// fire. Deliberately above the loose [`GROUNDED_MATCH_FLOOR`] (0.5): projecting
+/// fire. Deliberately above the loose `GROUNDED_MATCH_FLOOR` (0.5): projecting
 /// a specific slot's value AS the grounded answer is a stronger claim than
 /// boosting on a predicate-name cosine, so it demands a strong, unambiguous
 /// question match.
@@ -1054,7 +1054,8 @@ mod tests {
         brain_metadata::entity::ops::entity_put(
             &wtxn,
             scope,
-            brain_core::SessionId::DEFAULT, &Entity::new_active(
+            brain_core::SessionId::DEFAULT,
+            &Entity::new_active(
                 subject,
                 EntityType::PERSON_ID,
                 "Melanie".into(),
@@ -1461,7 +1462,8 @@ mod tests {
             brain_metadata::entity::ops::entity_put(
                 &wtxn,
                 scope,
-                brain_core::SessionId::DEFAULT, &Entity::new_active(id, EntityType::PERSON_ID, name.into(), name.into(), 1),
+                brain_core::SessionId::DEFAULT,
+                &Entity::new_active(id, EntityType::PERSON_ID, name.into(), name.into(), 1),
             )
             .unwrap();
         }
@@ -1492,7 +1494,14 @@ mod tests {
             StatementObject::Entity(y),
             None,
         );
-        brain_metadata::statement::crud::statement_create(&wtxn, scope, brain_core::SessionId::DEFAULT, &s_friend, 1).unwrap();
+        brain_metadata::statement::crud::statement_create(
+            &wtxn,
+            scope,
+            brain_core::SessionId::DEFAULT,
+            &s_friend,
+            1,
+        )
+        .unwrap();
         let s_occ = statement_with(
             y,
             p_occ,
@@ -1500,7 +1509,14 @@ mod tests {
             StatementObject::Value(StatementValue::Text("doctor".into())),
             None,
         );
-        brain_metadata::statement::crud::statement_create(&wtxn, scope, brain_core::SessionId::DEFAULT, &s_occ, 1).unwrap();
+        brain_metadata::statement::crud::statement_create(
+            &wtxn,
+            scope,
+            brain_core::SessionId::DEFAULT,
+            &s_occ,
+            1,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1534,7 +1550,8 @@ mod tests {
         brain_metadata::entity::ops::entity_put(
             &wtxn,
             scope,
-            brain_core::SessionId::DEFAULT, &Entity::new_active(x, EntityType::PERSON_ID, "X".into(), "x".into(), 1),
+            brain_core::SessionId::DEFAULT,
+            &Entity::new_active(x, EntityType::PERSON_ID, "X".into(), "x".into(), 1),
         )
         .unwrap();
         let p_city =
@@ -1548,7 +1565,14 @@ mod tests {
             StatementObject::Value(StatementValue::Text("Berlin".into())),
             None,
         );
-        brain_metadata::statement::crud::statement_create(&wtxn, scope, brain_core::SessionId::DEFAULT, &s_city, 1).unwrap();
+        brain_metadata::statement::crud::statement_create(
+            &wtxn,
+            scope,
+            brain_core::SessionId::DEFAULT,
+            &s_city,
+            1,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();

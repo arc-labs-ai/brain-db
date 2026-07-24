@@ -62,7 +62,7 @@ use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use brain_core::{
-    SpaceId, EdgeKind, EdgeKindRef, EntityId, MemoryId, NodeRef, PredicateId, StatementId,
+    EdgeKind, EdgeKindRef, EntityId, MemoryId, NodeRef, PredicateId, SpaceId, StatementId,
 };
 use brain_core::{EvidenceRef, Statement, StatementObject};
 use brain_metadata::schema::predicate::predicate_lookup_by_qname;

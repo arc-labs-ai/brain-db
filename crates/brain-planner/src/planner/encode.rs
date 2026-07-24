@@ -13,7 +13,7 @@
 //! 7. Edges
 //! 8. Response
 
-use brain_core::{SessionId, EdgeKind, MemoryId, MemoryKind, RequestId};
+use brain_core::{EdgeKind, MemoryId, MemoryKind, RequestId, SessionId};
 use brain_protocol::envelope::request::EncodeRequest;
 
 use crate::config::PlannerConfig;

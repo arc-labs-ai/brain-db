@@ -128,7 +128,7 @@ fn exp_decay(age_secs: f32, half_life_seconds: u64) -> f32 {
 mod tests {
     use super::*;
     use crate::ids::ExtractorId;
-    use crate::{SessionId, MemoryId};
+    use crate::{MemoryId, SessionId};
 
     fn cfg() -> ConfidenceConfig {
         ConfidenceConfig::default_v1()
@@ -229,7 +229,7 @@ mod tests {
 mod proptests {
     use super::*;
     use crate::ids::ExtractorId;
-    use crate::{SessionId, MemoryId};
+    use crate::{MemoryId, SessionId};
     use proptest::prelude::*;
 
     fn evi_strategy() -> impl Strategy<Value = EvidenceEntry> {

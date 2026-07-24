@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use brain_core::{SpaceId, SessionId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
+use brain_core::{ExtractorId, Memory, MemoryId, MemoryKind, Salience, SessionId, SpaceId};
 use brain_extractors::{
     framework::extractor::ExtractionContext, CostBudget, Extractor, ExtractorRegistry, LlmExtractor,
 };

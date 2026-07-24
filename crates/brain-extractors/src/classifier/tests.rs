@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use brain_core::{SpaceId, SessionId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
+use brain_core::{ExtractorId, Memory, MemoryId, MemoryKind, Salience, SessionId, SpaceId};
 use brain_protocol::schema::ExtractorTarget;
 use candle_core::Device;
 

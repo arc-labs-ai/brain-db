@@ -45,7 +45,7 @@ pub use codec::opcode::Opcode;
 
 // -- Envelope layer --
 pub use envelope::error::{ErrorDetails, ErrorResponse};
-pub use envelope::request::{act_as_of, RequestBody, WireSessionId, WireMemoryId, WireUuid};
+pub use envelope::request::{act_as_of, RequestBody, WireMemoryId, WireSessionId, WireUuid};
 pub use envelope::response::ResponseBody;
 
 // -- Error taxonomy --
@@ -53,9 +53,9 @@ pub use error::{ErrorCategory, ErrorCode, ProtocolError};
 
 // -- Connection layer --
 pub use connection::handshake::{
-    negotiate, SpacePermissions, AuthCredentials, AuthMethod, AuthOkPayload, AuthPayload,
-    HelloCapabilities, HelloPayload, MtlsClaim, NegotiatedSession, ServerCapabilities,
-    ServerFeatures, WelcomePayload,
+    negotiate, AuthCredentials, AuthMethod, AuthOkPayload, AuthPayload, HelloCapabilities,
+    HelloPayload, MtlsClaim, NegotiatedSession, ServerCapabilities, ServerFeatures,
+    SpacePermissions, WelcomePayload,
 };
 pub use connection::stream::{
     ByeRequest, CancelStreamAck, CancelStreamRequest, ClientPongRequest, PingRequest, PongResponse,

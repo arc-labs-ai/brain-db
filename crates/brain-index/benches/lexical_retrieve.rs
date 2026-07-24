@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use brain_core::StatementKind;
-use brain_core::{SpaceId, MemoryId, MemoryKind, StatementId};
+use brain_core::{MemoryId, MemoryKind, SpaceId, StatementId};
 use brain_index::{
     LexicalFilters, LexicalQuery, LexicalRetriever, LexicalRetrieverConfig, LexicalScope,
     TantivyLexicalRetriever, TantivyShard,

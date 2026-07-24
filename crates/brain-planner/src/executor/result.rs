@@ -2,7 +2,7 @@
 //! these into the wire `ResponseBody` variants; for now they're the
 //! integration-test assertion targets.
 
-use brain_core::{SessionId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{EdgeKind, MemoryId, MemoryKind, SessionId};
 
 use super::writer::{EdgeOutcome, ForgetOutcome};
 

@@ -43,11 +43,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use brain_core::{SpaceId, SessionId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
+use brain_core::{EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, SessionId, SpaceId};
 use brain_metadata::tables::edge::{derived_by, origin, zero_disambiguator, EdgeKey};
 use brain_metadata::tables::memory::{
-    space_timeline_prefix_space, space_timeline_prefix_space_time, SPACE_TIMELINE_KEY_LEN,
-    MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE,
+    space_timeline_prefix_space, space_timeline_prefix_space_time,
+    MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE, SPACE_TIMELINE_KEY_LEN,
 };
 use brain_ops::{
     EventEnvelope, Phase, RealWriterHandle, TemporalEdgeEnqueue, TemporalEdgeMetrics,

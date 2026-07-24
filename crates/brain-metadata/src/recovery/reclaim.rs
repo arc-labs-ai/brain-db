@@ -9,7 +9,7 @@
 //! Both share the property that they leave the arena slot in a new
 //! version; recovery just lays down the post-state.
 
-use brain_core::{SpaceId, SessionId, MemoryKind};
+use brain_core::{MemoryKind, SessionId, SpaceId};
 use brain_storage::recovery::MetadataSinkError;
 use brain_storage::wal::payload::{ConsolidatePayload, ReclaimPayload};
 

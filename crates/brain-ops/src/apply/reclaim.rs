@@ -5,7 +5,7 @@
 //! evict any FINGERPRINTS rows that referenced the reclaimed slots so
 //! a future encode with the same content can dedupe-or-not freely.
 
-use brain_core::{SpaceId, SessionId};
+use brain_core::{SessionId, SpaceId};
 use brain_metadata::tables::fingerprint::{fingerprint_key, FINGERPRINTS_TABLE};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use redb::{ReadableTable, WriteTransaction};

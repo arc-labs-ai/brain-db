@@ -82,11 +82,9 @@ impl SpaceId {
 /// fixed UUID works — it only needs to be stable forever, because it
 /// seeds [`SpaceId::derive_from_string`] and changing it re-keys every
 /// space in every deployment. Pinned by a golden test; do not edit.
-pub const BRAIN_ROOT_NAMESPACE_UUID: Uuid =
-    Uuid::from_bytes([
-        0x6b, 0x72, 0x61, 0x69, 0x6e, 0x2d, 0x73, 0x70, 0x61, 0x63, 0x65, 0x2d, 0x72, 0x6f, 0x6f,
-        0x74,
-    ]);
+pub const BRAIN_ROOT_NAMESPACE_UUID: Uuid = Uuid::from_bytes([
+    0x6b, 0x72, 0x61, 0x69, 0x6e, 0x2d, 0x73, 0x70, 0x61, 0x63, 0x65, 0x2d, 0x72, 0x6f, 0x6f, 0x74,
+]);
 
 /// `Default::default()` returns [`SpaceId::NIL`] — the stable
 /// anonymous sentinel, NOT a fresh UUID. Code that wanted a fresh
@@ -545,7 +543,10 @@ mod tests {
     fn same_space_string_diverges_across_namespaces() {
         let a = SpaceId::derive_from_string("nsA", "u1");
         let b = SpaceId::derive_from_string("nsB", "u1");
-        assert_ne!(a, b, "equal space strings must not collide across namespaces");
+        assert_ne!(
+            a, b,
+            "equal space strings must not collide across namespaces"
+        );
         // Determinism: the same inputs always reproduce the same id.
         assert_eq!(a, SpaceId::derive_from_string("nsA", "u1"));
         // A real non-empty string never collides with the NIL sentinel.

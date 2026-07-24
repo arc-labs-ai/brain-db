@@ -34,7 +34,7 @@ use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use brain_core::{MemoryId, ShardId, SlotIndex, SlotVersion};
-use brain_index::{SpaceVectorSource, SharedHnsw, VECTOR_DIM};
+use brain_index::{SharedHnsw, SpaceVectorSource, VECTOR_DIM};
 use brain_planner::SharedMetadataDb;
 use brain_storage::arena::ArenaFile;
 use brain_storage::wal::payload::{CheckpointBeginPayload, CheckpointEndPayload, WalPayload};

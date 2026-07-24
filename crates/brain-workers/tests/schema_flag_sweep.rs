@@ -15,11 +15,11 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use brain_core::{SpaceId, SessionId, EntityId, ExtractorId, MemoryId};
 use brain_core::{
     Entity, EntityType, EvidenceEntry, EvidenceRef, Statement, StatementId, StatementKind,
     StatementObject, StatementValue, SubjectRef,
 };
+use brain_core::{EntityId, ExtractorId, MemoryId, SessionId, SpaceId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::entity::ops::{entity_put, normalize_name};
@@ -99,7 +99,8 @@ fn put_subject(metadata: &SharedMetadataDb) -> EntityId {
     entity_put(
         &wtxn,
         __ts(),
-        brain_core::SessionId::DEFAULT, &Entity::new_active(
+        brain_core::SessionId::DEFAULT,
+        &Entity::new_active(
             id,
             EntityType::PERSON_ID,
             "anchor".into(),

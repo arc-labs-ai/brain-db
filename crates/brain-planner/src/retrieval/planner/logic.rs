@@ -14,7 +14,7 @@
 //! - EXPLAIN / TRACE — renders the plan without executing.
 
 use brain_core::StatementKind;
-use brain_core::{SpaceId, MemoryKind, PredicateId, RelationTypeId};
+use brain_core::{MemoryKind, PredicateId, RelationTypeId, SpaceId};
 use brain_index::Direction as GraphDirection;
 
 use crate::retrieval::filters::FilterChain;

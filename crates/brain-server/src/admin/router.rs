@@ -22,8 +22,8 @@ use http::{Method, Request, Response};
 use hyper::body::Incoming;
 
 use crate::admin::handlers::{
-    space, api_keys, audit, config, diagnostics, extract, healthz, metrics, readyz, rebuild, shard,
-    snapshot, worker,
+    api_keys, audit, config, diagnostics, extract, healthz, metrics, readyz, rebuild, shard,
+    snapshot, space, worker,
 };
 use crate::admin::AdminState;
 

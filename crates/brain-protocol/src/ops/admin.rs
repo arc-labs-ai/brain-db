@@ -1,6 +1,6 @@
 //! Admin-surface requests.
 
-use crate::envelope::request::{WireSessionId, WireMemoryId, WireUuid};
+use crate::envelope::request::{WireMemoryId, WireSessionId, WireUuid};
 use crate::shared::primitives::{CheckScope, ForgetMode, MemoryKindWire, StatsDetail};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -13,8 +13,8 @@
 
 use brain_storage::recovery::MetadataSinkError;
 use brain_storage::wal::payload::{
-    EncodePayload, ForgetPayload, MigrateEmbeddingPayload, SalienceUpdate, UpdateSessionPayload,
-    UpdateKindPayload, UpdateSaliencePayload,
+    EncodePayload, ForgetPayload, MigrateEmbeddingPayload, SalienceUpdate, UpdateKindPayload,
+    UpdateSaliencePayload, UpdateSessionPayload,
 };
 use redb::ReadableTable;
 

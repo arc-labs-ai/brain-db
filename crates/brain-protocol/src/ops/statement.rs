@@ -804,8 +804,8 @@ impl StatementListResponseFrame {
 mod tests_resp {
     use super::*;
     use brain_core::{
-        SessionId, EntityId, EvidenceEntry, EvidenceOverflowId, EvidenceRef, ExtractorId, MemoryId,
-        PredicateId, Statement, StatementId, StatementKind, StatementObject, SubjectRef,
+        EntityId, EvidenceEntry, EvidenceOverflowId, EvidenceRef, ExtractorId, MemoryId,
+        PredicateId, SessionId, Statement, StatementId, StatementKind, StatementObject, SubjectRef,
     };
     use brain_core::{StatementValue, INLINE_EVIDENCE_CAP};
     use smallvec::SmallVec;

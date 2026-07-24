@@ -35,8 +35,8 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use brain_protocol::connection::handshake::{
-    SpacePermissions, AuthCredentials, AuthMethod, AuthOkPayload, AuthPayload, HelloCapabilities,
-    HelloPayload, ServerFeatures, WelcomePayload,
+    AuthCredentials, AuthMethod, AuthOkPayload, AuthPayload, HelloCapabilities, HelloPayload,
+    ServerFeatures, SpacePermissions, WelcomePayload,
 };
 use brain_protocol::envelope::error::{ErrorDetails, ErrorResponse};
 use brain_protocol::envelope::response::{ErrorCategoryWire, ErrorCodeWire};

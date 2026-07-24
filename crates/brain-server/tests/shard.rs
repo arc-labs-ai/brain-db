@@ -361,7 +361,7 @@ async fn data_dir_under_nested_path() {
 // Real WAL hookup
 // ---------------------------------------------------------------------------
 
-use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, RequestId};
+use brain_core::{MemoryId, MemoryKind, RequestId, SessionId, SpaceId};
 use brain_storage::wal::payload::{EncodePayload, WalPayload};
 use brain_storage::wal::reader::WalReader;
 use brain_storage::wal::record::{Lsn, WalRecord};

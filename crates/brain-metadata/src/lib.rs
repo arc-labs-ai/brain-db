@@ -78,6 +78,11 @@ pub use hype::ops::{
 pub use llm_cache::{
     sweep_expired as llm_cache_sweep_expired, LlmCacheDb, LlmCacheError, LlmResponse,
 };
+pub use registry::{
+    session_create, session_delete_registry, session_get, session_list, space_create,
+    space_delete_registry, space_get, space_list, touch_on_write, RegistryError, SessionListEntry,
+    SpaceListEntry,
+};
 pub use relation::ops::{
     relation_create, relation_get, relation_history, relation_list_from, relation_list_to,
     relation_supersede, relation_tombstone, relations_with_evidence, RelationListFilter,
@@ -90,11 +95,6 @@ pub use relation::traversal::{
 pub use relation::types::{
     relation_type_embedding_get, relation_type_embedding_put, relation_type_get,
     relation_type_intern, relation_type_list, relation_type_lookup_by_qname, RelationTypeOpError,
-};
-pub use registry::{
-    session_create, session_delete_registry, session_get, session_list, space_create,
-    space_delete_registry, space_get, space_list, touch_on_write, RegistryError, SessionListEntry,
-    SpaceListEntry,
 };
 pub use schema::apply::{apply_schema_definitions, SchemaApplyError};
 pub use schema::kind::{

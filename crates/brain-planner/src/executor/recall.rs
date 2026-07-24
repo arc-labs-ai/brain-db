@@ -18,7 +18,7 @@
 //! pipeline is synchronous from the planner's perspective; yield
 //! points are introduced when Glommio's runtime arrives.
 
-use brain_core::{SessionId, MemoryId, MemoryKind};
+use brain_core::{MemoryId, MemoryKind, SessionId};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::tables::text::TEXTS_TABLE;
 

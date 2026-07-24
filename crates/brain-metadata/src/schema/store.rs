@@ -356,7 +356,7 @@ mod tests {
         use crate::schema::predicate::{predicate_intern_or_get, predicates_active_for_schema};
         use crate::statement::crud::statement_create;
         use crate::tables::statement::{statement_flags, STATEMENTS_TABLE};
-        use brain_core::{SessionId, EntityId, ExtractorId, MemoryId, StatementId, StatementKind};
+        use brain_core::{EntityId, ExtractorId, MemoryId, SessionId, StatementId, StatementKind};
         use brain_core::{
             EvidenceEntry, EvidenceRef, Statement, StatementObject, StatementValue, SubjectRef,
         };
@@ -378,7 +378,8 @@ mod tests {
             entity_put(
                 &wtxn,
                 test_scope(),
-                brain_core::SessionId::DEFAULT, &Entity::new_active(
+                brain_core::SessionId::DEFAULT,
+                &Entity::new_active(
                     subject,
                     brain_core::EntityTypeId(1),
                     "anchor".into(),
@@ -413,8 +414,22 @@ mod tests {
             };
             let s_in = mk_stmt(p_in);
             let s_out = mk_stmt(p_out);
-            let sid_in = statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s_in, 0).unwrap();
-            let sid_out = statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s_out, 0).unwrap();
+            let sid_in = statement_create(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &s_in,
+                0,
+            )
+            .unwrap();
+            let sid_out = statement_create(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &s_out,
+                0,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             (sid_in, sid_out)
         };

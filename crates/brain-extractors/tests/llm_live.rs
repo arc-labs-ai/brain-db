@@ -41,7 +41,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use brain_core::{SpaceId, SessionId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
+use brain_core::{ExtractorId, Memory, MemoryId, MemoryKind, Salience, SessionId, SpaceId};
 use brain_extractors::{
     hash_memory_text, ExtractedItem, ExtractionContext, ExtractionStatus, Extractor,
     ExtractorRegistry, LlmExtractor,

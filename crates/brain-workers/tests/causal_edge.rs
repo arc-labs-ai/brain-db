@@ -9,11 +9,11 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, StatementId};
 use brain_core::{
     EntityId, EntityTypeId, EvidenceEntry, EvidenceRef, ExtractorId, Statement, StatementKind,
     StatementObject, SubjectRef,
 };
+use brain_core::{MemoryId, MemoryKind, SessionId, SpaceId, StatementId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::entity::ops::entity_put;
@@ -191,7 +191,14 @@ fn seed_causal_statement(
         now,
         1,
     );
-    statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &statement, now).expect("statement_create");
+    statement_create(
+        &wtxn,
+        __ts(),
+        brain_core::SessionId::DEFAULT,
+        &statement,
+        now,
+    )
+    .expect("statement_create");
     drop(statement);
     wtxn.commit().unwrap();
     sid

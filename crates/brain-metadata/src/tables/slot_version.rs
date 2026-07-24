@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn max_assigned_slot_covers_memories_and_recycled_slots() {
         use crate::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
-        use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, NamespaceId};
+        use brain_core::{MemoryId, MemoryKind, NamespaceId, SessionId, SpaceId};
 
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);

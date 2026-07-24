@@ -73,7 +73,7 @@ pub struct RetrievalExecutorContext {
     pub caller_namespace: u32,
     /// The authenticated caller's space (app) — the inner wall. Paired
     /// with `caller_namespace` it forms the `(namespace, space)`
-    /// [`RowScope`] under which every typed-graph read (entity anchor
+    /// scope under which every typed-graph read (entity anchor
     /// resolution, relation-graph expansion) is constrained: a query as
     /// `acme/chatbot` can never anchor on or expand into `acme/research`'s
     /// or `globex`'s typed-graph rows.
@@ -97,7 +97,7 @@ pub struct RetrievalExecutorContext {
 }
 
 impl RetrievalExecutorContext {
-    /// The caller's `(namespace, space)` [`RowScope`] — the unconditional
+    /// The caller's `(namespace, space)` scope — the unconditional
     /// wall threaded into every typed-graph read on the retrieval path.
     #[must_use]
     pub fn caller_scope(&self) -> brain_metadata::RowScope {
@@ -523,12 +523,13 @@ async fn execute_once(
     // independent evidence), whereas a graph-expansion hit is an independent
     // typed-graph signal. Snapshot the lexical id-set before/after each pass so
     // `correct_derived_lexical` (below, post-fusion) can re-tag accordingly.
-    let lex_ids = |outs: &[(Retriever, Vec<RankedItem>)]| -> std::collections::HashSet<RankedItemId> {
-        outs.iter()
-            .find(|(r, _)| *r == Retriever::Lexical)
-            .map(|(_, v)| v.iter().map(|i| i.id).collect())
-            .unwrap_or_default()
-    };
+    let lex_ids =
+        |outs: &[(Retriever, Vec<RankedItem>)]| -> std::collections::HashSet<RankedItemId> {
+            outs.iter()
+                .find(|(r, _)| *r == Retriever::Lexical)
+                .map(|(_, v)| v.iter().map(|i| i.id).collect())
+                .unwrap_or_default()
+        };
     let orig_lex_ids = lex_ids(&outputs);
 
     // Non-LLM read-time query expansion (pseudo-relevance feedback) for

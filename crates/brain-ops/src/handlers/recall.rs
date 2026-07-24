@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use brain_core::{SessionId, EntityId, MemoryId, Slot, SubjectRef};
+use brain_core::{EntityId, MemoryId, SessionId, Slot, SubjectRef};
 use brain_index::RankedItemId;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
@@ -57,7 +57,7 @@ pub const DEFAULT_RECALL_RESULTS: u32 = 50;
 
 /// Candidate-pool budget fed to the retrieval executor and the projection loop,
 /// decoupled from `max_results` (the answer-size safety cap). The membership
-/// band in [`build_membership`] must decide the answer over the FULL filtered
+/// band in `build_membership` must decide the answer over the FULL filtered
 /// pool — not a window pre-truncated to the caller's cap — or a genuine answer
 /// ranked below that window would be invisible to the band (the top-K trap this
 /// removes). The pool is still bounded: the per-lane `top_n` clamps cap the
@@ -2066,12 +2066,7 @@ fn build_recall_trace(meta: &QueryMetadata, ctx: &OpsContext) -> Result<RecallTr
                     cands
                         .iter()
                         .map(|(id, score)| {
-                            candidate_from_ranked(
-                                typed_rtxn.as_ref(),
-                                id,
-                                *score,
-                                &candidate_texts,
-                            )
+                            candidate_from_ranked(typed_rtxn.as_ref(), id, *score, &candidate_texts)
                         })
                         .collect()
                 })
@@ -2282,7 +2277,12 @@ fn render_relation_label(rtxn: &redb::ReadTransaction, rid: brain_core::Relation
         .flatten()
         .map(|rt| format!("{}:{}", rt.namespace, rt.name))
         .unwrap_or_else(|| "related_to".to_string());
-    format!("{} —{}→ {}", name(rel.from_entity), pred, name(rel.to_entity))
+    format!(
+        "{} —{}→ {}",
+        name(rel.from_entity),
+        pred,
+        name(rel.to_entity)
+    )
 }
 
 /// "Subject predicate Object" for a statement candidate; partial when a lookup
@@ -2322,9 +2322,7 @@ fn render_statement_label(rtxn: &redb::ReadTransaction, sid: brain_core::Stateme
         StatementObject::Memory(_) => "(memory)".to_string(),
         StatementObject::Statement(_) => "(statement)".to_string(),
     };
-    format!("{subject} {predicate} {object}")
-        .trim()
-        .to_string()
+    format!("{subject} {predicate} {object}").trim().to_string()
 }
 
 fn fetch_candidate_texts(
@@ -2615,9 +2613,9 @@ pub(crate) fn fetch_enrichment_for(
     // read them directly so `session_filter` (already applied to memories)
     // also gates the graph rows — "session N" shows its memories AND its
     // graph. Session is a grouping column, never a key.
-    let statements_table = rtxn.open_table(STATEMENTS_TABLE).map_err(|e| {
-        OpError::Internal(format!("include_graph: open STATEMENTS_TABLE: {e}"))
-    })?;
+    let statements_table = rtxn
+        .open_table(STATEMENTS_TABLE)
+        .map_err(|e| OpError::Internal(format!("include_graph: open STATEMENTS_TABLE: {e}")))?;
     let relation_meta_table = rtxn.open_table(RELATION_METADATA_TABLE).map_err(|e| {
         OpError::Internal(format!("include_graph: open RELATION_METADATA_TABLE: {e}"))
     })?;
@@ -3521,7 +3519,10 @@ mod tests {
         // (max_support == 0) → abstain (FIX C).
         let members = vec![mr(1, &[Semantic]), mr(2, &[Semantic])];
         let kept = apply_anchor_abstention(members, None, &GroundedOutcome::NoAnswer, false);
-        assert!(kept.is_empty(), "nothing belongs (lone passage cosine) → abstain");
+        assert!(
+            kept.is_empty(),
+            "nothing belongs (lone passage cosine) → abstain"
+        );
     }
 
     #[test]
@@ -3978,7 +3979,8 @@ mod tests {
             brain_metadata::entity::ops::entity_put(
                 &wtxn,
                 scope,
-                brain_core::SessionId::DEFAULT, &Entity::new_active(id, EntityType::PERSON_ID, name.into(), name.into(), 1),
+                brain_core::SessionId::DEFAULT,
+                &Entity::new_active(id, EntityType::PERSON_ID, name.into(), name.into(), 1),
             )
             .unwrap();
         }
@@ -4010,7 +4012,14 @@ mod tests {
         let s_chess = mk(x, p_plays, "chess"); // off-cue (its hit is below the floor)
         let s_cricket = mk(y, p_plays, "cricket"); // WRONG subject (Y, not the anchor)
         for s in [&s_soccer, &s_tennis, &s_soccer_dup, &s_chess, &s_cricket] {
-            brain_metadata::statement::crud::statement_create(&wtxn, scope, brain_core::SessionId::DEFAULT, s, 1).unwrap();
+            brain_metadata::statement::crud::statement_create(
+                &wtxn,
+                scope,
+                brain_core::SessionId::DEFAULT,
+                s,
+                1,
+            )
+            .unwrap();
         }
         wtxn.commit().unwrap();
 

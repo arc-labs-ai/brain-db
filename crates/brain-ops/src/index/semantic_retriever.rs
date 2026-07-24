@@ -885,12 +885,8 @@ fn cosine_prenorm(
     let mut dot = f32x8::ZERO;
     let mut bsq = f32x8::ZERO;
     for (ca, cb) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
-        let va = f32x8::from([
-            ca[0], ca[1], ca[2], ca[3], ca[4], ca[5], ca[6], ca[7],
-        ]);
-        let vb = f32x8::from([
-            cb[0], cb[1], cb[2], cb[3], cb[4], cb[5], cb[6], cb[7],
-        ]);
+        let va = f32x8::from([ca[0], ca[1], ca[2], ca[3], ca[4], ca[5], ca[6], ca[7]]);
+        let vb = f32x8::from([cb[0], cb[1], cb[2], cb[3], cb[4], cb[5], cb[6], cb[7]]);
         dot += va * vb;
         bsq += vb * vb;
     }

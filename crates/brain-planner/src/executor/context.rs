@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use brain_core::{SessionId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{EdgeKind, MemoryId, MemoryKind, SessionId};
 use brain_embed::{Dispatcher, VECTOR_DIM};
 use brain_index::{SharedHnsw, SpaceVectorSource};
 use brain_metadata::MetadataDb;
@@ -84,7 +84,7 @@ pub struct ExecutorContext {
     /// Stamped per-request by `brain-ops::dispatch` alongside
     /// `caller_space`; the encode executor passes it to the writer so
     /// every row is owned by the caller's tenant, and the read path
-    /// scopes results to it. Defaults to [`NamespaceId::SYSTEM`].
+    /// scopes results to it. Defaults to [`brain_core::NamespaceId::SYSTEM`].
     pub caller_namespace: brain_core::NamespaceId,
     /// Authenticated caller's human-readable space string for **this
     /// request only** — the structured selector the wire `act_as` carried

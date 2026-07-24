@@ -605,7 +605,7 @@ fn weekday_from_name(name: &str) -> Option<Weekday> {
 mod tests {
     use super::*;
     use crate::framework::registry::ExtractorRegistry;
-    use brain_core::{SpaceId, SessionId, MemoryId, MemoryKind, Salience};
+    use brain_core::{MemoryId, MemoryKind, Salience, SessionId, SpaceId};
 
     /// Build the unix-nanos of a civil date at midnight UTC. Used in
     /// place of `time::macros::datetime!` so the tests don't require the

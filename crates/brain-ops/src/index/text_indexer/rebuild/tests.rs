@@ -4,8 +4,8 @@ use std::fs;
 use std::path::Path;
 
 use brain_core::{
-    SpaceId, SessionId, Entity, EntityId, EntityTypeId, ExtractorId, MemoryId, MemoryKind,
-    PredicateId, StatementId,
+    Entity, EntityId, EntityTypeId, ExtractorId, MemoryId, MemoryKind, PredicateId, SessionId,
+    SpaceId, StatementId,
 };
 use brain_core::{
     EvidenceRef, Statement, StatementKind, StatementObject, StatementValue, SubjectRef,
@@ -110,7 +110,8 @@ fn create_statement(
         1,
     );
     let wtxn = metadata.write_txn().expect("wtxn");
-    let created = statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, 0).expect("create");
+    let created =
+        statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, 0).expect("create");
     wtxn.commit().expect("commit");
     created
 }

@@ -324,8 +324,14 @@ impl MetadataDb {
                 // The WAL body row carries the per-utterance session; replay
                 // it so the recovered statement keeps its session grouping
                 // (statement_from_metadata drops it — brain-core has no slot).
-                statement_create(&wtxn, scope, b.meta.session(), &s, s.extracted_at_unix_nanos)
-                    .map_err(|e| MetadataSinkError::Corruption(format!("statement_create: {e}")))?;
+                statement_create(
+                    &wtxn,
+                    scope,
+                    b.meta.session(),
+                    &s,
+                    s.extracted_at_unix_nanos,
+                )
+                .map_err(|e| MetadataSinkError::Corruption(format!("statement_create: {e}")))?;
                 if b.predicate_intern_hint.is_some() {
                     stamp_implicit_predicate(&wtxn, s.id)?;
                 }
@@ -694,7 +700,13 @@ mod tests {
         let merged_id = merged.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &survivor).unwrap();
+            entity_put(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &survivor,
+            )
+            .unwrap();
             entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &merged).unwrap();
             wtxn.commit().unwrap();
         }
@@ -735,7 +747,13 @@ mod tests {
         let merged_id = merged.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &survivor).unwrap();
+            entity_put(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &survivor,
+            )
+            .unwrap();
             entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &merged).unwrap();
             wtxn.commit().unwrap();
         }

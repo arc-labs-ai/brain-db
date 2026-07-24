@@ -1,7 +1,7 @@
 //! Unit tests for the query planner.
 
 use brain_core::StatementKind;
-use brain_core::{SpaceId, EntityId, PredicateId};
+use brain_core::{EntityId, PredicateId, SpaceId};
 
 use super::{
     plan, PlanError, PreFilter, QueryPlan, Retriever, RetrieverConfig, MAX_TOP_N, MIN_TOP_N,

@@ -31,7 +31,7 @@ use brain_core::SpaceId;
 use brain_metadata::api_keys::bits;
 use brain_ops::error::OpError;
 use brain_protocol::connection::handshake::{
-    SpacePermissions, AuthOkPayload, AuthPayload, HelloPayload, ServerCapabilities, WelcomePayload,
+    AuthOkPayload, AuthPayload, HelloPayload, ServerCapabilities, SpacePermissions, WelcomePayload,
 };
 use brain_protocol::error::ErrorCode;
 

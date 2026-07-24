@@ -136,7 +136,8 @@ fn recover_rebuilds_statements_with_join() {
             1,
         );
         let wtxn = metadata.write_txn().expect("wtxn");
-        let id = statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, 0).expect("create");
+        let id = statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, 0)
+            .expect("create");
         wtxn.commit().expect("commit");
         id
     };

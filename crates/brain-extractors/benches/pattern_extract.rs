@@ -6,7 +6,7 @@
 //!
 //! Run: `cargo bench -p brain-extractors --bench pattern_extract`.
 
-use brain_core::{SpaceId, SessionId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
+use brain_core::{ExtractorId, Memory, MemoryId, MemoryKind, Salience, SessionId, SpaceId};
 use brain_extractors::{ExtractionContext, Extractor, ExtractorRegistry, PatternExtractor};
 use brain_protocol::schema::ExtractorTarget;
 use criterion::{black_box, criterion_group, Criterion};

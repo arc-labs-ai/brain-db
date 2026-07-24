@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use brain_core::{SpaceId, MemoryId, MemoryKind};
+use brain_core::{MemoryId, MemoryKind, SpaceId};
 use brain_index::{schema_payload_json, IndexHandle, LexicalScope};
 use flume::{bounded, Receiver, Sender};
 use tantivy::schema::Field;

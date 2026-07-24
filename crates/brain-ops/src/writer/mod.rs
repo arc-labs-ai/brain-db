@@ -34,7 +34,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use brain_core::{SpaceId, MemoryId, ShardId};
+use brain_core::{MemoryId, ShardId, SpaceId};
 use brain_index::Writer as HnswWriter;
 use brain_planner::{SharedMetadataDb, WriterError, WriterHandle};
 use parking_lot::Mutex;

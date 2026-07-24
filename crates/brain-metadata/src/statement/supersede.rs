@@ -696,7 +696,14 @@ mod tests {
         let old = fresh_fact_value(subj, pred, "v1", true);
         let old_bucket = confidence_bucket(0.9);
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &old, 1_700_000_000_000_000_000).unwrap();
+        statement_create(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &old,
+            1_700_000_000_000_000_000,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
         // New: confidence 0.3 -> bucket 3. Same subject+predicate, so the
@@ -706,8 +713,14 @@ mod tests {
         let new_bucket = confidence_bucket(0.3);
         assert_ne!(old_bucket, new_bucket);
         let wtxn = db.write_txn().unwrap();
-        let new_id =
-            statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &new, 1_700_000_000_000_000_500).unwrap();
+        let new_id = statement_create(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &new,
+            1_700_000_000_000_000_500,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1086,7 +1099,8 @@ mod tests {
         statement_create_with_decision(
             &wtxn,
             test_scope(),
-            brain_core::SessionId::DEFAULT, &p2,
+            brain_core::SessionId::DEFAULT,
+            &p2,
             SupersedeDecision::Supersede(p1.id),
             1_700_000_000_000_000_001,
         )
@@ -1116,7 +1130,14 @@ mod tests {
 
         let p1 = fresh_pref(subj, pred, "async");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p1, 1_700_000_000_000_000_000).unwrap();
+        statement_create(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &p1,
+            1_700_000_000_000_000_000,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
         let supersede_now: u64 = 1_700_000_000_000_000_500;
@@ -1125,7 +1146,8 @@ mod tests {
         statement_create_with_decision(
             &wtxn,
             test_scope(),
-            brain_core::SessionId::DEFAULT, &p2,
+            brain_core::SessionId::DEFAULT,
+            &p2,
             SupersedeDecision::Supersede(p1.id),
             supersede_now,
         )
@@ -1159,8 +1181,15 @@ mod tests {
         let mut p2 = fresh_pref(subj, pred2, "remote");
         p2.is_stateful = false;
         let wtxn = db.write_txn().unwrap();
-        statement_create_with_decision(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p2, SupersedeDecision::Coexist, 0)
-            .unwrap();
+        statement_create_with_decision(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &p2,
+            SupersedeDecision::Coexist,
+            0,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1194,7 +1223,14 @@ mod tests {
         let mut seed_t0 = fresh_fact_value(subj_t0, pred_t0, "alice", false);
         seed_t0.is_stateful = false;
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &seed_t0, 0).unwrap();
+        statement_create(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &seed_t0,
+            0,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1287,7 +1323,14 @@ mod tests {
         let pred_st = intern_pref(&mut db, "g_pred_st", true);
         let seed_st = fresh_pref(subj_st, pred_st, "v1");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &seed_st, 0).unwrap();
+        statement_create(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &seed_st,
+            0,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
         // Tier 0 idempotent — current cumulative Fact exists.
@@ -1296,7 +1339,14 @@ mod tests {
         let mut seed_id = fresh_fact_value(subj_id, pred_id, "alice", false);
         seed_id.is_stateful = false;
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &seed_id, 0).unwrap();
+        statement_create(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &seed_id,
+            0,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
         // Tier 1/2/3 — tombstone the prior so Tier 0 misses but the

@@ -37,7 +37,7 @@
 //! - Tombstone state. The eviction discipline keeps this table
 //!   Active-only by construction.
 
-use brain_core::{SpaceId, SessionId, MemoryId};
+use brain_core::{MemoryId, SessionId, SpaceId};
 use redb::TableDefinition;
 
 /// The `fingerprints` table. See module docs for key layout.

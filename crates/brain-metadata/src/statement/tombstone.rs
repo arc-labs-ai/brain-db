@@ -179,7 +179,14 @@ mod tests {
         let pred = intern_fact(&mut db, "knows");
         let s = fresh_fact(subj, pred, "lovelace");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 1_700_000_000_000_000_000).unwrap();
+        statement_create(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &s,
+            1_700_000_000_000_000_000,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
         let tomb_now: u64 = 1_700_000_000_000_000_750;
@@ -205,7 +212,14 @@ mod tests {
         let stmt_id = s.id;
         let sid_bytes = stmt_id.to_bytes();
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 1_700_000_000_000_000_000).unwrap();
+        statement_create(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &s,
+            1_700_000_000_000_000_000,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
         let sc = test_scope();
@@ -257,7 +271,14 @@ mod tests {
         let pred = intern_fact(&mut db, "knows_double");
         let s = fresh_fact(subj, pred, "lovelace");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 1_700_000_000_000_000_000).unwrap();
+        statement_create(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &s,
+            1_700_000_000_000_000_000,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
         let first: u64 = 1_700_000_000_000_000_500;

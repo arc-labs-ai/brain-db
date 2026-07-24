@@ -8,7 +8,6 @@
 //! Each handler module is internal to `crate::admin` and consumed
 //! from the `crate::admin::router` family of `build_*` functions.
 
-pub mod space;
 pub mod api_keys;
 pub mod audit;
 pub mod config;
@@ -20,4 +19,5 @@ pub mod readyz;
 pub mod rebuild;
 pub mod shard;
 pub mod snapshot;
+pub mod space;
 pub mod worker;

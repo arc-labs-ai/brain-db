@@ -130,11 +130,29 @@ mod tests {
 
         // SPACE_CREATE (idempotent).
         assert!(matches!(
-            apply(&db, Phase::SpaceCreate { created_at_unix_nanos: 100, space_string: "u:9a".into(), metadata: None }, space, ns),
+            apply(
+                &db,
+                Phase::SpaceCreate {
+                    created_at_unix_nanos: 100,
+                    space_string: "u:9a".into(),
+                    metadata: None
+                },
+                space,
+                ns
+            ),
             PhaseAck::SpaceCreated { created: true }
         ));
         assert!(matches!(
-            apply(&db, Phase::SpaceCreate { created_at_unix_nanos: 200, space_string: "u:9a".into(), metadata: None }, space, ns),
+            apply(
+                &db,
+                Phase::SpaceCreate {
+                    created_at_unix_nanos: 200,
+                    space_string: "u:9a".into(),
+                    metadata: None
+                },
+                space,
+                ns
+            ),
             PhaseAck::SpaceCreated { created: false }
         ));
         // SPACE_LIST sees exactly this namespace's space.
@@ -158,8 +176,7 @@ mod tests {
         );
         {
             let r = db.read_txn().unwrap();
-            let sessions =
-                brain_metadata::session_list(&r, ns.raw(), space.into(), 0).unwrap();
+            let sessions = brain_metadata::session_list(&r, ns.raw(), space.into(), 0).unwrap();
             assert_eq!(sessions.len(), 1);
             assert_eq!(sessions[0].session_id, 7);
         }
@@ -168,7 +185,11 @@ mod tests {
         assert!(matches!(
             apply(
                 &db,
-                Phase::SessionDelete { session_id: SessionId(7), hard: false, at_unix_nanos: 400 },
+                Phase::SessionDelete {
+                    session_id: SessionId(7),
+                    hard: false,
+                    at_unix_nanos: 400
+                },
                 space,
                 ns
             ),
@@ -188,7 +209,9 @@ mod tests {
         ));
         {
             let r = db.read_txn().unwrap();
-            assert!(brain_metadata::space_list(&r, ns.raw(), 0).unwrap().is_empty());
+            assert!(brain_metadata::space_list(&r, ns.raw(), 0)
+                .unwrap()
+                .is_empty());
         }
     }
 }
