@@ -1308,6 +1308,17 @@ struct Shard {
     /// The shared HNSW handle. `rebuild-ann` swaps a freshly-
     /// rebuilt index in via `SharedHnsw::swap()`.
     hnsw_shared: SharedHnsw,
+    /// The per-shard event-fanout task. Held (not detached) so the
+    /// drain path can cancel it: it captures its own broadcast
+    /// `EventBus` sender clone, so its `recv()` never observes
+    /// `Closed` and the task would otherwise stay alive forever,
+    /// keeping the Glommio executor from terminating after the main
+    /// loop returns.
+    fanout_task: Option<glommio::Task<()>>,
+    /// The per-shard WAL-drain task. Same rationale as `fanout_task`:
+    /// cancelled explicitly at drain so no live detached task blocks
+    /// executor teardown.
+    wal_drain_task: Option<glommio::Task<()>>,
 }
 
 impl Shard {
@@ -2207,10 +2218,11 @@ pub fn spawn_shard(
             // future inside Glommio is sound. `Lagged` is treated as
             // a transient skip — slow subscribers see gaps, not
             // crashes.
+            let mut __fanout_task: Option<glommio::Task<()>> = None;
             {
                 let event_bus = ops.events.clone();
                 let events_tx = events_tx.clone();
-                glommio::spawn_local(async move {
+                __fanout_task = Some(glommio::spawn_local(async move {
                     let mut rx = event_bus.receiver();
                     loop {
                         match rx.recv().await {
@@ -2225,8 +2237,7 @@ pub fn spawn_shard(
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
                     }
-                })
-                .detach();
+                }));
             }
 
             // Open or create the WAL.
@@ -2266,7 +2277,7 @@ pub fn spawn_shard(
             // at shard shutdown when the `OpsContext` Arc count
             // hits zero.
             let wal_cell_for_drain = wal_cell.clone();
-            glommio::spawn_local(async move {
+            let __wal_drain_task = glommio::spawn_local(async move {
                 while let Ok(msg) = wal_drain_rx.recv_async().await {
                     let outcome = {
                         let guard = wal_cell_for_drain.borrow();
@@ -2279,8 +2290,7 @@ pub fn spawn_shard(
                     };
                     let _ = msg.reply.send(outcome);
                 }
-            })
-            .detach();
+            });
 
             // Build real worker adapters.
             let rebuild_source: Arc<dyn RebuildSource<{ VECTOR_DIM }>> = Arc::new(
@@ -2997,6 +3007,8 @@ pub fn spawn_shard(
                 snapshot_source,
                 rebuild_source: rebuild_source_for_shard,
                 hnsw_shared,
+                fanout_task: __fanout_task,
+                wal_drain_task: Some(__wal_drain_task),
             };
             shard_main_loop(shard, rx).await;
         })
@@ -3341,6 +3353,18 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
             error = %e,
             "msync_all at shutdown failed"
         );
+    }
+    // Cancel the detached per-shard helper tasks. Both capture their
+    // own channel-sender clone, so they never observe a closed channel
+    // and would otherwise stay runnable forever — a live task keeps the
+    // Glommio executor from terminating after this future returns, which
+    // hangs the shard's join. The WAL drain has already flushed above,
+    // so cancelling here loses no durable work.
+    if let Some(t) = shard.wal_drain_task.take() {
+        t.cancel().await;
+    }
+    if let Some(t) = shard.fanout_task.take() {
+        t.cancel().await;
     }
     info!(
         shard_id = shard.shard_id,

@@ -16,6 +16,7 @@
 //! are cancelled (Glommio `Task::cancel`).
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -231,6 +232,16 @@ impl WorkerScheduler {
         let count = handles.len();
         shutdown.store(true, Ordering::Relaxed);
 
+        // Kick every worker's wake channel so a loop parked on
+        // `sleep(cfg.interval)` wakes immediately, observes the
+        // shutdown flag, and exits — instead of sleeping out a long
+        // interval and being force-timed-out below. Without this a
+        // worker with a multi-second interval would consume the whole
+        // drain budget on its own.
+        for handle in handles.values() {
+            let _ = handle.controls.wake_tx.try_send(());
+        }
+
         let drain_start = Instant::now();
         for (name, handle) in handles {
             let remaining = SHUTDOWN_DRAIN_BUDGET.saturating_sub(drain_start.elapsed());
@@ -242,20 +253,30 @@ impl WorkerScheduler {
                 handle.task.cancel().await;
                 continue;
             }
-            // Race the task against a timer. `done` resolves to
-            // `false` (didn't time out) when the worker loop returns;
-            // `timed_out` resolves to `true` after `remaining`.
-            let task = handle.task;
-            let done = async move {
-                task.await;
+            // Give the worker `remaining` to return on its own, then
+            // cancel it. Racing the task-join against a timer must not
+            // *drop* the still-running `Task` on timeout: a dropped
+            // Glommio `Task` detaches and keeps running, and a live
+            // detached task prevents the executor from terminating (the
+            // shard's join would then hang until the outer budget). So
+            // on timeout we keep the handle and `cancel()` it — matching
+            // this method's contract that alive tasks are cancelled.
+            //
+            // `Task` is `Unpin`, so `Pin::new(&mut task)` only *borrows*
+            // it for the race; once the race resolves the borrow ends and
+            // `task` is ours again to cancel.
+            let mut task = handle.task;
+            let join = async {
+                Pin::new(&mut task).await;
                 false
             };
-            let timed_out = async move {
+            let timed_out = async {
                 sleep(remaining).await;
                 true
             };
-            if done.or(timed_out).await {
-                warn!(worker = name, "shutdown drain timed out");
+            if join.or(timed_out).await {
+                warn!(worker = name, "shutdown drain timed out; cancelling task");
+                task.cancel().await;
             } else {
                 debug!(worker = name, "worker exited cleanly");
             }
