@@ -120,7 +120,7 @@ batch_size                       = 256
 window_seconds                   = 300
 weight_min                       = 0.1
 channel_capacity                 = 1024
-cross_context                    = false
+cross_session                    = false
 
 [workers.causal_edge]
 enabled                                  = true
