@@ -324,6 +324,78 @@
     "payload_len": 124
   },
   {
+    "name": "req_space_create",
+    "opcode": "0x0070",
+    "kind": "request",
+    "payload_len": 42
+  },
+  {
+    "name": "resp_space_create",
+    "opcode": "0x00F0",
+    "kind": "response",
+    "payload_len": 128
+  },
+  {
+    "name": "req_space_list",
+    "opcode": "0x0071",
+    "kind": "request",
+    "payload_len": 9
+  },
+  {
+    "name": "resp_space_list",
+    "opcode": "0x00F1",
+    "kind": "response",
+    "payload_len": 151
+  },
+  {
+    "name": "req_space_delete",
+    "opcode": "0x0072",
+    "kind": "request",
+    "payload_len": 29
+  },
+  {
+    "name": "resp_space_delete",
+    "opcode": "0x00F2",
+    "kind": "response",
+    "payload_len": 57
+  },
+  {
+    "name": "req_session_create",
+    "opcode": "0x0073",
+    "kind": "request",
+    "payload_len": 61
+  },
+  {
+    "name": "resp_session_create",
+    "opcode": "0x00F3",
+    "kind": "response",
+    "payload_len": 125
+  },
+  {
+    "name": "req_session_list",
+    "opcode": "0x0074",
+    "kind": "request",
+    "payload_len": 9
+  },
+  {
+    "name": "resp_session_list",
+    "opcode": "0x00F4",
+    "kind": "response",
+    "payload_len": 147
+  },
+  {
+    "name": "req_session_delete",
+    "opcode": "0x0075",
+    "kind": "request",
+    "payload_len": 47
+  },
+  {
+    "name": "resp_session_delete",
+    "opcode": "0x00F5",
+    "kind": "response",
+    "payload_len": 68
+  },
+  {
     "name": "resp_get_capabilities",
     "opcode": "0x00B2",
     "kind": "response",

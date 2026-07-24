@@ -48,6 +48,8 @@ pub use crate::ops::memory::*;
 pub use crate::ops::procedural::*;
 pub use crate::ops::query::*;
 pub use crate::ops::relation::*;
+pub use crate::ops::session::*;
+pub use crate::ops::space::*;
 pub use crate::ops::statement::*;
 pub use crate::ops::subscribe::*;
 pub use crate::ops::txn::*;
@@ -163,6 +165,14 @@ pub enum ResponseBody {
     // block plus the statement ids that contributed.
     MaterializeProcedural(MaterializeProceduralResponse),
 
+    // Space & session registry.
+    SpaceCreate(SpaceCreateResponse),
+    SpaceList(SpaceListResponse),
+    SpaceDelete(SpaceDeleteResponse),
+    SessionCreate(SessionCreateResponse),
+    SessionList(SessionListResponse),
+    SessionDelete(SessionDeleteResponse),
+
     Error(ErrorResponse),
 }
 
@@ -238,6 +248,12 @@ impl ResponseBody {
             Self::QueryExplain(_) => Opcode::QueryExplainResp,
             Self::QueryTrace(_) => Opcode::QueryTraceResp,
             Self::MaterializeProcedural(_) => Opcode::MaterializeProceduralResp,
+            Self::SpaceCreate(_) => Opcode::SpaceCreateResp,
+            Self::SpaceList(_) => Opcode::SpaceListResp,
+            Self::SpaceDelete(_) => Opcode::SpaceDeleteResp,
+            Self::SessionCreate(_) => Opcode::SessionCreateResp,
+            Self::SessionList(_) => Opcode::SessionListResp,
+            Self::SessionDelete(_) => Opcode::SessionDeleteResp,
             Self::Error(_) => Opcode::Error,
         }
     }
@@ -339,6 +355,12 @@ impl ResponseBody {
             Self::QueryExplain(r) => to_cbor_bytes(r),
             Self::QueryTrace(r) => to_cbor_bytes(r),
             Self::MaterializeProcedural(r) => to_cbor_bytes(r),
+            Self::SpaceCreate(r) => to_cbor_bytes(r),
+            Self::SpaceList(r) => to_cbor_bytes(r),
+            Self::SpaceDelete(r) => to_cbor_bytes(r),
+            Self::SessionCreate(r) => to_cbor_bytes(r),
+            Self::SessionList(r) => to_cbor_bytes(r),
+            Self::SessionDelete(r) => to_cbor_bytes(r),
             Self::Error(r) => to_cbor_bytes(r),
         }
     }
@@ -421,6 +443,12 @@ impl ResponseBody {
             Opcode::MaterializeProceduralResp => {
                 Self::MaterializeProcedural(from_cbor_bytes(bytes)?)
             }
+            Opcode::SpaceCreateResp => Self::SpaceCreate(from_cbor_bytes(bytes)?),
+            Opcode::SpaceListResp => Self::SpaceList(from_cbor_bytes(bytes)?),
+            Opcode::SpaceDeleteResp => Self::SpaceDelete(from_cbor_bytes(bytes)?),
+            Opcode::SessionCreateResp => Self::SessionCreate(from_cbor_bytes(bytes)?),
+            Opcode::SessionListResp => Self::SessionList(from_cbor_bytes(bytes)?),
+            Opcode::SessionDeleteResp => Self::SessionDelete(from_cbor_bytes(bytes)?),
             Opcode::Error => Self::Error(from_cbor_bytes(bytes)?),
             other => return Err(ProtocolError::UnknownOpcode(other.as_u16())),
         })

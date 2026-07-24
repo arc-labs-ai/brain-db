@@ -64,7 +64,10 @@ use brain_protocol::{
     RecallTraceRerank, RecallTraceRetriever, RecallTraceRetrieverStatus, RelationCreateRequest,
     RelationCreateResponse, RelationListFromResponseFrame, RelationView, RequestBody,
     ResolutionOutcomeWire, ResponseBody, RetrieverNameWire, SchemaUploadRequest,
-    SchemaUploadResponse, ServerPingResponse, StageKind, StatementCreateRequest,
+    SchemaUploadResponse, ServerPingResponse, SessionCreateRequest, SessionCreateResponse,
+    SessionDeleteRequest, SessionDeleteResponse, SessionListRequest, SessionListResponse,
+    SessionView, SpaceCreateRequest, SpaceCreateResponse, SpaceDeleteRequest, SpaceDeleteResponse,
+    SpaceListRequest, SpaceListResponse, SpaceView, StageKind, StatementCreateRequest,
     StatementCreateResponse, StatementGetResponse, StatementKindWire, StatementListResponseFrame,
     StatementObjectWire, StatementValueWire, StatementView, SubscriptionEvent, TransitionKind,
     TxnAbortResponse, TxnBeginResponse, TxnCommitResponse,
@@ -1610,6 +1613,144 @@ fn corpus() -> Vec<Case> {
         &sample_extractor_list(),
     ));
 
+    // ---- Space & session registry ----
+    let space_create_req = SpaceCreateRequest {
+        metadata: Some(vec![0x01, 0x02, 0x03]),
+        request_id: RID,
+        act_as: None,
+    };
+    cases.push(req_case(
+        "req_space_create",
+        RequestBody::SpaceCreate(space_create_req.clone()),
+        &space_create_req,
+    ));
+    let space_create_resp = SpaceCreateResponse {
+        space_id: SPACE,
+        created: true,
+        created_at_unix_nanos: 1_700_000_000_000_000_000,
+        last_active_unix_nanos: 1_700_000_000_000_000_000,
+        memory_count: 0,
+        session_count: 1,
+    };
+    cases.push(resp_case(
+        "resp_space_create",
+        ResponseBody::SpaceCreate(space_create_resp.clone()),
+        &space_create_resp,
+    ));
+    let space_list_req = SpaceListRequest {
+        limit: 100,
+        act_as: None,
+    };
+    cases.push(req_case(
+        "req_space_list",
+        RequestBody::SpaceList(space_list_req.clone()),
+        &space_list_req,
+    ));
+    let space_list_resp = SpaceListResponse {
+        spaces: vec![SpaceView {
+            space_id: SPACE,
+            created_at_unix_nanos: 1_700_000_000_000_000_000,
+            last_active_unix_nanos: 1_700_000_000_500_000_000,
+            memory_count: 42,
+            session_count: 3,
+        }],
+        cross_shard_complete: false,
+    };
+    cases.push(resp_case(
+        "resp_space_list",
+        ResponseBody::SpaceList(space_list_resp.clone()),
+        &space_list_resp,
+    ));
+    let space_delete_req = SpaceDeleteRequest {
+        request_id: RID,
+        act_as: None,
+    };
+    cases.push(req_case(
+        "req_space_delete",
+        RequestBody::SpaceDelete(space_delete_req.clone()),
+        &space_delete_req,
+    ));
+    let space_delete_resp = SpaceDeleteResponse {
+        space_id: SPACE,
+        existed: true,
+        memories_forgotten: 42,
+    };
+    cases.push(resp_case(
+        "resp_space_delete",
+        ResponseBody::SpaceDelete(space_delete_resp.clone()),
+        &space_delete_resp,
+    ));
+    let session_create_req = SessionCreateRequest {
+        session_id: 7,
+        title: Some("project alpha".into()),
+        request_id: RID,
+        act_as: None,
+    };
+    cases.push(req_case(
+        "req_session_create",
+        RequestBody::SessionCreate(session_create_req.clone()),
+        &session_create_req,
+    ));
+    let session_create_resp = SessionCreateResponse {
+        space_id: SPACE,
+        session_id: 7,
+        created: true,
+        created_at_unix_nanos: 1_700_000_000_000_000_000,
+        last_active_unix_nanos: 1_700_000_000_000_000_000,
+        memory_count: 0,
+    };
+    cases.push(resp_case(
+        "resp_session_create",
+        ResponseBody::SessionCreate(session_create_resp.clone()),
+        &session_create_resp,
+    ));
+    let session_list_req = SessionListRequest {
+        limit: 50,
+        act_as: None,
+    };
+    cases.push(req_case(
+        "req_session_list",
+        RequestBody::SessionList(session_list_req.clone()),
+        &session_list_req,
+    ));
+    let session_list_resp = SessionListResponse {
+        space_id: SPACE,
+        sessions: vec![SessionView {
+            session_id: 7,
+            created_at_unix_nanos: 1_700_000_000_000_000_000,
+            last_active_unix_nanos: 1_700_000_000_900_000_000,
+            title: Some("project alpha".into()),
+            memory_count: 12,
+        }],
+    };
+    cases.push(resp_case(
+        "resp_session_list",
+        ResponseBody::SessionList(session_list_resp.clone()),
+        &session_list_resp,
+    ));
+    let session_delete_req = SessionDeleteRequest {
+        session_id: 7,
+        hard: false,
+        request_id: RID,
+        act_as: None,
+    };
+    cases.push(req_case(
+        "req_session_delete",
+        RequestBody::SessionDelete(session_delete_req.clone()),
+        &session_delete_req,
+    ));
+    let session_delete_resp = SessionDeleteResponse {
+        space_id: SPACE,
+        session_id: 7,
+        existed: true,
+        memories_forgotten: 12,
+    };
+    cases.push(resp_case(
+        "resp_session_delete",
+        ResponseBody::SessionDelete(session_delete_resp.clone()),
+        &session_delete_resp,
+    ));
+
     // ---- Capabilities + subscription event ----
     cases.push(resp_case(
         "resp_get_capabilities",
@@ -1844,6 +1985,18 @@ fn required_families() -> Vec<(&'static str, Opcode)> {
         ("capabilities.get_resp", Opcode::GetCapabilitiesResp),
         ("extractor.list_req", Opcode::ExtractorListReq),
         ("extractor.list_resp", Opcode::ExtractorListResp),
+        ("registry.space_create", Opcode::SpaceCreateReq),
+        ("registry.space_create_resp", Opcode::SpaceCreateResp),
+        ("registry.space_list", Opcode::SpaceListReq),
+        ("registry.space_list_resp", Opcode::SpaceListResp),
+        ("registry.space_delete", Opcode::SpaceDeleteReq),
+        ("registry.space_delete_resp", Opcode::SpaceDeleteResp),
+        ("registry.session_create", Opcode::SessionCreateReq),
+        ("registry.session_create_resp", Opcode::SessionCreateResp),
+        ("registry.session_list", Opcode::SessionListReq),
+        ("registry.session_list_resp", Opcode::SessionListResp),
+        ("registry.session_delete", Opcode::SessionDeleteReq),
+        ("registry.session_delete_resp", Opcode::SessionDeleteResp),
         ("subscribe.event", Opcode::SubscribeEvent),
         ("keepalive.pong", Opcode::Pong),
         ("keepalive.server_ping", Opcode::ServerPing),

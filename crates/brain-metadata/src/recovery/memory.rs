@@ -159,6 +159,18 @@ impl MetadataDb {
                 t.insert(&slot_id, &slot_version).map_err(transient)?;
             }
 
+            // Registry — the same implicit space/session upsert the live
+            // apply path runs, so the derived registry rows survive a crash
+            // and replay cleanly (idempotent bump on re-replay).
+            crate::registry::touch_on_write(
+                &wtxn,
+                p.namespace_id.raw(),
+                p.space_id.into(),
+                p.session_id.raw(),
+                timestamp_ns,
+            )
+            .map_err(|e| MetadataSinkError::Corruption(format!("registry touch: {e}")))?;
+
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
         }
         wtxn.commit().map_err(transient)?;

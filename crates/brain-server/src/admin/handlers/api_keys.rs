@@ -52,6 +52,14 @@ struct MintBody {
     /// every tenant and can't enumerate an allowlist that grows per tenant.
     #[serde(default)]
     may_act: Vec<String>,
+    /// Opt-in marker for minting the internal gateway service principal.
+    /// The wildcard `may_act = ["*"]` grant is reserved for that principal;
+    /// an ordinary (customer-tier) mint MUST NOT carry it, since a wildcard
+    /// customer key is a cross-tenant hole. Defaults to `false`, so the
+    /// customer-facing path rejects wildcard unless the operator explicitly
+    /// asks for the service principal.
+    #[serde(default)]
+    service_principal: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,6 +199,18 @@ async fn mint(
         return Ok(text_response(
             StatusCode::BAD_REQUEST,
             "ACT_AS grant requires a non-empty may_act allowlist\n",
+        ));
+    }
+    // Wildcard `may_act = ["*"]` is reserved for the internal gateway service
+    // principal. A customer-tier mint carrying it would be a cross-tenant
+    // hole (the key could act for every namespace), so reject it unless the
+    // operator explicitly asked for the service principal.
+    if parsed.may_act.iter().any(|ns| ns == "*") && !parsed.service_principal {
+        return Ok(text_response(
+            StatusCode::BAD_REQUEST,
+            "wildcard may_act = [\"*\"] is reserved for the internal gateway service \
+             principal; a customer-tier key must enumerate its namespaces \
+             (set service_principal=true only for the gateway bootstrap)\n",
         ));
     }
     let now = SystemTime::now()

@@ -76,6 +76,8 @@ pub use ops::memory::*;
 pub use ops::procedural::*;
 pub use ops::query::*;
 pub use ops::relation::*;
+pub use ops::session::*;
+pub use ops::space::*;
 pub use ops::statement::*;
 pub use ops::subscribe::*;
 pub use ops::txn::*;

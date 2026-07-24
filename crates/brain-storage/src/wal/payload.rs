@@ -496,7 +496,11 @@ impl WalPayload {
             | WalRecordKind::StatementTombstone
             | WalRecordKind::SchemaUpdate
             | WalRecordKind::Audit
-            | WalRecordKind::StageCompleted => {
+            | WalRecordKind::StageCompleted
+            | WalRecordKind::SpaceCreate
+            | WalRecordKind::SpaceDelete
+            | WalRecordKind::SessionCreate
+            | WalRecordKind::SessionDelete => {
                 // Layout: space_id (16 B) || opaque body. The body
                 // remains opaque to the framing layer; phases 16+
                 // supply typed parsers via their own sinks.

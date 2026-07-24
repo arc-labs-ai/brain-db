@@ -55,6 +55,8 @@ pub use crate::ops::memory::*;
 pub use crate::ops::procedural::*;
 pub use crate::ops::query::*;
 pub use crate::ops::relation::*;
+pub use crate::ops::session::*;
+pub use crate::ops::space::*;
 pub use crate::ops::statement::*;
 pub use crate::ops::subscribe::*;
 pub use crate::ops::txn::*;
@@ -154,6 +156,14 @@ pub enum RequestBody {
     // `brain:behavior_*` Preferences and renders a system block for
     // LLM prompt injection.
     MaterializeProcedural(MaterializeProceduralRequest),
+
+    // Space & session registry.
+    SpaceCreate(SpaceCreateRequest),
+    SpaceList(SpaceListRequest),
+    SpaceDelete(SpaceDeleteRequest),
+    SessionCreate(SessionCreateRequest),
+    SessionList(SessionListRequest),
+    SessionDelete(SessionDeleteRequest),
 }
 
 impl RequestBody {
@@ -229,6 +239,12 @@ impl RequestBody {
             Self::QueryExplain(_) => Opcode::QueryExplainReq,
             Self::QueryTrace(_) => Opcode::QueryTraceReq,
             Self::MaterializeProcedural(_) => Opcode::MaterializeProceduralReq,
+            Self::SpaceCreate(_) => Opcode::SpaceCreateReq,
+            Self::SpaceList(_) => Opcode::SpaceListReq,
+            Self::SpaceDelete(_) => Opcode::SpaceDeleteReq,
+            Self::SessionCreate(_) => Opcode::SessionCreateReq,
+            Self::SessionList(_) => Opcode::SessionListReq,
+            Self::SessionDelete(_) => Opcode::SessionDeleteReq,
         }
     }
 
@@ -310,6 +326,12 @@ impl RequestBody {
             Self::QueryExplain(r) => to_cbor_bytes(r),
             Self::QueryTrace(r) => to_cbor_bytes(r),
             Self::MaterializeProcedural(r) => to_cbor_bytes(r),
+            Self::SpaceCreate(r) => to_cbor_bytes(r),
+            Self::SpaceList(r) => to_cbor_bytes(r),
+            Self::SpaceDelete(r) => to_cbor_bytes(r),
+            Self::SessionCreate(r) => to_cbor_bytes(r),
+            Self::SessionList(r) => to_cbor_bytes(r),
+            Self::SessionDelete(r) => to_cbor_bytes(r),
         }
     }
 
@@ -398,6 +420,12 @@ impl RequestBody {
             Opcode::MaterializeProceduralReq => {
                 Self::MaterializeProcedural(from_cbor_bytes(bytes)?)
             }
+            Opcode::SpaceCreateReq => Self::SpaceCreate(from_cbor_bytes(bytes)?),
+            Opcode::SpaceListReq => Self::SpaceList(from_cbor_bytes(bytes)?),
+            Opcode::SpaceDeleteReq => Self::SpaceDelete(from_cbor_bytes(bytes)?),
+            Opcode::SessionCreateReq => Self::SessionCreate(from_cbor_bytes(bytes)?),
+            Opcode::SessionListReq => Self::SessionList(from_cbor_bytes(bytes)?),
+            Opcode::SessionDeleteReq => Self::SessionDelete(from_cbor_bytes(bytes)?),
             other => return Err(ProtocolError::UnknownOpcode(other.as_u16())),
         })
     }
@@ -469,6 +497,12 @@ pub fn act_as_of(body: &RequestBody) -> Option<&ActAs> {
         RequestBody::RelationListTo(r) => r.act_as.as_ref(),
         RequestBody::RelationTraverse(r) => r.act_as.as_ref(),
         RequestBody::Subscribe(r) => r.act_as.as_ref(),
+        RequestBody::SpaceCreate(r) => r.act_as.as_ref(),
+        RequestBody::SpaceList(r) => r.act_as.as_ref(),
+        RequestBody::SpaceDelete(r) => r.act_as.as_ref(),
+        RequestBody::SessionCreate(r) => r.act_as.as_ref(),
+        RequestBody::SessionList(r) => r.act_as.as_ref(),
+        RequestBody::SessionDelete(r) => r.act_as.as_ref(),
         _ => None,
     }
 }

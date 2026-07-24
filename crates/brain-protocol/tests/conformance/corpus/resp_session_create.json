@@ -1,0 +1,25 @@
+{
+  "space_id": [
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34
+  ],
+  "session_id": 7,
+  "created": true,
+  "created_at_unix_nanos": 1700000000000000000,
+  "last_active_unix_nanos": 1700000000000000000,
+  "memory_count": 0
+}

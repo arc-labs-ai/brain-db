@@ -117,6 +117,10 @@ impl MetadataSink for MetadataDb {
                         self.apply_statement_tombstone(lsn, &record.body)
                     }
                     WalRecordKind::SchemaUpdate => self.apply_schema_update(lsn, &record.body),
+                    WalRecordKind::SpaceCreate => self.apply_space_create(lsn, &record.body),
+                    WalRecordKind::SpaceDelete => self.apply_space_delete(lsn, &record.body),
+                    WalRecordKind::SessionCreate => self.apply_session_create(lsn, &record.body),
+                    WalRecordKind::SessionDelete => self.apply_session_delete(lsn, &record.body),
                     // Other typed-graph kinds aren't WAL-mapped on the write
                     // side yet (durability still rides the redb commit for
                     // them); bump next_lsn so checkpointing and

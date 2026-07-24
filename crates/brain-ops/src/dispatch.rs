@@ -552,6 +552,26 @@ pub async fn dispatch(
                 .await
                 .map(|b| single(ResponseBody::MaterializeProcedural(b)))
         }
+
+        // Space & session registry (non-admin, scoped to caller).
+        RequestBody::SpaceCreate(r) => crate::handlers::space::handle_space_create(r, ctx)
+            .await
+            .map(|b| single(ResponseBody::SpaceCreate(b))),
+        RequestBody::SpaceList(r) => crate::handlers::space::handle_space_list(r, ctx)
+            .await
+            .map(|b| single(ResponseBody::SpaceList(b))),
+        RequestBody::SpaceDelete(r) => crate::handlers::space::handle_space_delete(r, ctx)
+            .await
+            .map(|b| single(ResponseBody::SpaceDelete(b))),
+        RequestBody::SessionCreate(r) => crate::handlers::session::handle_session_create(r, ctx)
+            .await
+            .map(|b| single(ResponseBody::SessionCreate(b))),
+        RequestBody::SessionList(r) => crate::handlers::session::handle_session_list(r, ctx)
+            .await
+            .map(|b| single(ResponseBody::SessionList(b))),
+        RequestBody::SessionDelete(r) => crate::handlers::session::handle_session_delete(r, ctx)
+            .await
+            .map(|b| single(ResponseBody::SessionDelete(b))),
     }
 }
 
@@ -677,6 +697,18 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
         | RequestBody::QueryTrace(_)
         | RequestBody::GraphFetch(_)
         | RequestBody::MaterializeProcedural(_) => (perm_bits::RECALL, "GRAPH_READ"),
+
+        // Space & session registry (non-admin, scoped to the caller).
+        // Provision rides ENCODE, listing rides RECALL, deletion rides FORGET.
+        RequestBody::SpaceCreate(_) | RequestBody::SessionCreate(_) => {
+            (perm_bits::ENCODE, "REGISTRY_CREATE")
+        }
+        RequestBody::SpaceList(_) | RequestBody::SessionList(_) => {
+            (perm_bits::RECALL, "REGISTRY_LIST")
+        }
+        RequestBody::SpaceDelete(_) | RequestBody::SessionDelete(_) => {
+            (perm_bits::FORGET, "REGISTRY_DELETE")
+        }
 
         // Extractor introspection — admin-only.
         RequestBody::ExtractorList(_) => (perm_bits::ADMIN, "EXTRACTOR_ADMIN"),

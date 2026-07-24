@@ -133,6 +133,10 @@ mod tag {
     pub const SLOTS_RECLAIMED: u8 = 19;
     pub const MERGE_PROPOSAL_APPROVED: u8 = 20;
     pub const MERGE_PROPOSAL_REJECTED: u8 = 21;
+    pub const SPACE_CREATED: u8 = 22;
+    pub const SPACE_DELETED: u8 = 23;
+    pub const SESSION_CREATED: u8 = 24;
+    pub const SESSION_DELETED: u8 = 25;
 }
 
 mod tomb_tag {
@@ -242,6 +246,22 @@ fn write_phase_ack(out: &mut Vec<u8>, pa: &PhaseAck) {
             out.push(tag::MERGE_PROPOSAL_REJECTED);
             out.extend_from_slice(&proposal_id.to_bytes());
         }
+        PhaseAck::SpaceCreated { created } => {
+            out.push(tag::SPACE_CREATED);
+            out.push(u8::from(*created));
+        }
+        PhaseAck::SpaceDeleted { existed } => {
+            out.push(tag::SPACE_DELETED);
+            out.push(u8::from(*existed));
+        }
+        PhaseAck::SessionCreated { created } => {
+            out.push(tag::SESSION_CREATED);
+            out.push(u8::from(*created));
+        }
+        PhaseAck::SessionDeleted { existed } => {
+            out.push(tag::SESSION_DELETED);
+            out.push(u8::from(*existed));
+        }
     }
 }
 
@@ -333,6 +353,18 @@ fn read_phase_ack(c: &mut Cursor<'_>) -> Result<PhaseAck, CodecError> {
             let proposal_id = MergeId::from_bytes(c.bytes16()?);
             PhaseAck::MergeProposalRejected { proposal_id }
         }
+        tag::SPACE_CREATED => PhaseAck::SpaceCreated {
+            created: c.u8()? != 0,
+        },
+        tag::SPACE_DELETED => PhaseAck::SpaceDeleted {
+            existed: c.u8()? != 0,
+        },
+        tag::SESSION_CREATED => PhaseAck::SessionCreated {
+            created: c.u8()? != 0,
+        },
+        tag::SESSION_DELETED => PhaseAck::SessionDeleted {
+            existed: c.u8()? != 0,
+        },
         other => return Err(CodecError::UnknownPhaseAckTag(other)),
     })
 }

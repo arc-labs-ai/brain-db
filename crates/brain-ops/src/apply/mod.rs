@@ -26,6 +26,7 @@ pub mod encode_helpers;
 pub mod entity;
 pub mod memory;
 pub mod reclaim;
+pub mod registry;
 pub mod relation;
 pub mod schema;
 pub mod statement;
@@ -158,6 +159,10 @@ pub fn dispatch(
         Phase::ApproveMerge { .. } => entity::apply_approve_merge(wtxn, phase, write),
         Phase::RejectMerge { .. } => entity::apply_reject_merge(wtxn, phase, write),
         Phase::ReclaimSlots { .. } => reclaim::apply_reclaim_slots(wtxn, phase, write),
+        Phase::SpaceCreate { .. } => registry::apply_space_create(wtxn, phase, write),
+        Phase::SpaceDelete { .. } => registry::apply_space_delete(wtxn, phase, write),
+        Phase::SessionCreate { .. } => registry::apply_session_create(wtxn, phase, write),
+        Phase::SessionDelete { .. } => registry::apply_session_delete(wtxn, phase, write),
     }
 }
 

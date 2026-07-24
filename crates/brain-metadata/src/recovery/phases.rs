@@ -27,7 +27,8 @@ use crate::entity::ops::{
 };
 use crate::recovery::phase_bodies::{
     decode_entity_create, decode_entity_merge, decode_entity_rename, decode_entity_tombstone,
-    decode_entity_unmerge, decode_entity_update, decode_schema_update, decode_statement_create,
+    decode_entity_unmerge, decode_entity_update, decode_schema_update, decode_session_create,
+    decode_session_delete, decode_space_create, decode_space_delete, decode_statement_create,
     decode_statement_supersede, decode_statement_tombstone,
 };
 use crate::schema::predicate::predicate_intern_or_get;
@@ -420,6 +421,107 @@ fn stamp_implicit_predicate(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Registry (space / session) recovery.
+//
+// Registry rows are derived/recomputable view state; every helper is
+// idempotent, so re-replay above the checkpoint is a no-op.
+// ---------------------------------------------------------------------------
+
+impl MetadataDb {
+    /// Replay a `SpaceCreate` body via `registry::space_create` (idempotent).
+    pub(super) fn apply_space_create(
+        &self,
+        lsn: u64,
+        body: &[u8],
+    ) -> Result<(), MetadataSinkError> {
+        let b = decode_space_create(body)
+            .map_err(|e| MetadataSinkError::Corruption(format!("space_create decode: {e}")))?;
+        let wtxn = self.db.begin_write().map_err(transient)?;
+        {
+            crate::registry::space_create(
+                &wtxn,
+                b.namespace_id,
+                b.space_id,
+                b.created_at_unix_nanos,
+                b.metadata.clone(),
+            )
+            .map_err(|e| MetadataSinkError::Corruption(format!("space_create: {e}")))?;
+            self.bump_next_lsn_in_txn(&wtxn, lsn)?;
+        }
+        wtxn.commit().map_err(transient)?;
+        Ok(())
+    }
+
+    /// Replay a `SpaceDelete` body via `registry::space_delete_registry`
+    /// (idempotent — deleting an already-gone space is a no-op).
+    pub(super) fn apply_space_delete(
+        &self,
+        lsn: u64,
+        body: &[u8],
+    ) -> Result<(), MetadataSinkError> {
+        let b = decode_space_delete(body)
+            .map_err(|e| MetadataSinkError::Corruption(format!("space_delete decode: {e}")))?;
+        let wtxn = self.db.begin_write().map_err(transient)?;
+        {
+            crate::registry::space_delete_registry(&wtxn, b.namespace_id, b.space_id)
+                .map_err(|e| MetadataSinkError::Corruption(format!("space_delete: {e}")))?;
+            self.bump_next_lsn_in_txn(&wtxn, lsn)?;
+        }
+        wtxn.commit().map_err(transient)?;
+        Ok(())
+    }
+
+    /// Replay a `SessionCreate` body via `registry::session_create`
+    /// (idempotent).
+    pub(super) fn apply_session_create(
+        &self,
+        lsn: u64,
+        body: &[u8],
+    ) -> Result<(), MetadataSinkError> {
+        let b = decode_session_create(body)
+            .map_err(|e| MetadataSinkError::Corruption(format!("session_create decode: {e}")))?;
+        let wtxn = self.db.begin_write().map_err(transient)?;
+        {
+            crate::registry::session_create(
+                &wtxn,
+                b.namespace_id,
+                b.space_id,
+                b.session_id,
+                b.created_at_unix_nanos,
+                b.title.clone(),
+            )
+            .map_err(|e| MetadataSinkError::Corruption(format!("session_create: {e}")))?;
+            self.bump_next_lsn_in_txn(&wtxn, lsn)?;
+        }
+        wtxn.commit().map_err(transient)?;
+        Ok(())
+    }
+
+    /// Replay a `SessionDelete` body via `registry::session_delete_registry`.
+    pub(super) fn apply_session_delete(
+        &self,
+        lsn: u64,
+        body: &[u8],
+    ) -> Result<(), MetadataSinkError> {
+        let b = decode_session_delete(body)
+            .map_err(|e| MetadataSinkError::Corruption(format!("session_delete decode: {e}")))?;
+        let wtxn = self.db.begin_write().map_err(transient)?;
+        {
+            crate::registry::session_delete_registry(
+                &wtxn,
+                b.namespace_id,
+                b.space_id,
+                b.session_id,
+            )
+            .map_err(|e| MetadataSinkError::Corruption(format!("session_delete: {e}")))?;
+            self.bump_next_lsn_in_txn(&wtxn, lsn)?;
+        }
+        wtxn.commit().map_err(transient)?;
+        Ok(())
+    }
 }
 
 #[cfg(all(test, not(miri)))]

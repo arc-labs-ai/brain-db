@@ -128,6 +128,22 @@ pub enum Opcode {
     AdminBackfillCancelReq = 0x006F,
     AdminBackfillCancelResp = 0x00EF,
 
+    // Space & session registry (cognitive namespace, non-admin, scoped to
+    // the caller's (namespace, space)). Allocated from the reserved
+    // 0x70–0x75 / 0xF0–0xF5 low-byte range.
+    SpaceCreateReq = 0x0070,
+    SpaceCreateResp = 0x00F0,
+    SpaceListReq = 0x0071,
+    SpaceListResp = 0x00F1,
+    SpaceDeleteReq = 0x0072,
+    SpaceDeleteResp = 0x00F2,
+    SessionCreateReq = 0x0073,
+    SessionCreateResp = 0x00F3,
+    SessionListReq = 0x0074,
+    SessionListResp = 0x00F4,
+    SessionDeleteReq = 0x0075,
+    SessionDeleteResp = 0x00F5,
+
     // Errors
     Error = 0x00FF,
 
@@ -318,6 +334,19 @@ impl Opcode {
             0x00EE => Self::AdminBackfillResp,
             0x006F => Self::AdminBackfillCancelReq,
             0x00EF => Self::AdminBackfillCancelResp,
+
+            0x0070 => Self::SpaceCreateReq,
+            0x00F0 => Self::SpaceCreateResp,
+            0x0071 => Self::SpaceListReq,
+            0x00F1 => Self::SpaceListResp,
+            0x0072 => Self::SpaceDeleteReq,
+            0x00F2 => Self::SpaceDeleteResp,
+            0x0073 => Self::SessionCreateReq,
+            0x00F3 => Self::SessionCreateResp,
+            0x0074 => Self::SessionListReq,
+            0x00F4 => Self::SessionListResp,
+            0x0075 => Self::SessionDeleteReq,
+            0x00F5 => Self::SessionDeleteResp,
 
             0x00FF => Self::Error,
 
@@ -578,6 +607,19 @@ mod tests {
         (0x00EE, Opcode::AdminBackfillResp),
         (0x006F, Opcode::AdminBackfillCancelReq),
         (0x00EF, Opcode::AdminBackfillCancelResp),
+        // Space & session registry
+        (0x0070, Opcode::SpaceCreateReq),
+        (0x00F0, Opcode::SpaceCreateResp),
+        (0x0071, Opcode::SpaceListReq),
+        (0x00F1, Opcode::SpaceListResp),
+        (0x0072, Opcode::SpaceDeleteReq),
+        (0x00F2, Opcode::SpaceDeleteResp),
+        (0x0073, Opcode::SessionCreateReq),
+        (0x00F3, Opcode::SessionCreateResp),
+        (0x0074, Opcode::SessionListReq),
+        (0x00F4, Opcode::SessionListResp),
+        (0x0075, Opcode::SessionDeleteReq),
+        (0x00F5, Opcode::SessionDeleteResp),
         // Errors
         (0x00FF, Opcode::Error),
         // Typed-graph — schema
@@ -678,10 +720,11 @@ mod tests {
             Opcode::from_u16(0x0000),
             Err(ProtocolError::UnknownOpcode(0x0000))
         ));
-        // 0x0070 is in the reserved server-bound range of the 0x00xx namespace.
+        // 0x0076 is still-unassigned in the server-bound range of the 0x00xx
+        // namespace (the registry ops occupy 0x70–0x75).
         assert!(matches!(
-            Opcode::from_u16(0x0070),
-            Err(ProtocolError::UnknownOpcode(0x0070))
+            Opcode::from_u16(0x0076),
+            Err(ProtocolError::UnknownOpcode(0x0076))
         ));
         // 0x0139 is a not-yet-assigned typed-graph entity opcode.
         assert!(matches!(

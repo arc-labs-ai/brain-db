@@ -315,6 +315,36 @@ pub enum Phase {
     /// Free physical storage for the given memory slots. Triggered by
     /// the reclamation worker after grace period.
     ReclaimSlots { slots: Vec<u64> },
+
+    /// Explicitly provision a space registry row under the write's
+    /// `(namespace, space)` scope. Idempotent — a create for an existing
+    /// space returns the existing row.
+    SpaceCreate {
+        created_at_unix_nanos: u64,
+        /// Opaque caller metadata blob; `None` for a bare provision.
+        metadata: Option<Vec<u8>>,
+    },
+
+    /// Delete the space registry row (and its session rows) under the
+    /// write's `(namespace, space)` scope. The GDPR erasure button; the
+    /// underlying memory/graph data cascade is driven by the handler.
+    SpaceDelete { at_unix_nanos: u64 },
+
+    /// Explicitly provision a session registry row under the write's
+    /// `(namespace, space)` scope. Idempotent.
+    SessionCreate {
+        session_id: SessionId,
+        title: Option<String>,
+        created_at_unix_nanos: u64,
+    },
+
+    /// Delete a session registry row under the write's `(namespace, space)`
+    /// scope. `hard` records the memory-cascade mode the handler chose.
+    SessionDelete {
+        session_id: SessionId,
+        hard: bool,
+        at_unix_nanos: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -464,6 +494,24 @@ pub enum PhaseAck {
     SlotsReclaimed {
         count: usize,
     },
+    /// A space registry row was provisioned. `created` is false on an
+    /// idempotent replay of an existing space.
+    SpaceCreated {
+        created: bool,
+    },
+    /// A space registry row (and its sessions) was removed. `existed` is
+    /// false when the space was already gone.
+    SpaceDeleted {
+        existed: bool,
+    },
+    /// A session registry row was provisioned.
+    SessionCreated {
+        created: bool,
+    },
+    /// A session registry row was removed.
+    SessionDeleted {
+        existed: bool,
+    },
 }
 
 impl Phase {
@@ -491,6 +539,10 @@ impl Phase {
             Self::ApproveMerge { .. } => "approve_merge",
             Self::RejectMerge { .. } => "reject_merge",
             Self::ReclaimSlots { .. } => "reclaim_slots",
+            Self::SpaceCreate { .. } => "space_create",
+            Self::SpaceDelete { .. } => "space_delete",
+            Self::SessionCreate { .. } => "session_create",
+            Self::SessionDelete { .. } => "session_delete",
         }
     }
 

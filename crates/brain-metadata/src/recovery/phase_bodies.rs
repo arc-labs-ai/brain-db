@@ -195,6 +195,56 @@ pub struct SchemaUpdateBody {
 }
 
 // ---------------------------------------------------------------------------
+// Registry bodies (space / session).
+// ---------------------------------------------------------------------------
+
+/// `SpaceCreate` (0x60) body. Recovery replays via `registry::space_create`
+/// (idempotent).
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct SpaceCreateBody {
+    pub namespace_id: u32,
+    pub space_id: [u8; 16],
+    pub created_at_unix_nanos: u64,
+    pub metadata: Option<Vec<u8>>,
+}
+
+/// `SpaceDelete` (0x61) body. Recovery replays via
+/// `registry::space_delete_registry` (idempotent — a re-replay of a deleted
+/// space is a no-op).
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct SpaceDeleteBody {
+    pub namespace_id: u32,
+    pub space_id: [u8; 16],
+}
+
+/// `SessionCreate` (0x62) body. Recovery replays via
+/// `registry::session_create` (idempotent).
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct SessionCreateBody {
+    pub namespace_id: u32,
+    pub space_id: [u8; 16],
+    pub session_id: u64,
+    pub created_at_unix_nanos: u64,
+    pub title: Option<String>,
+}
+
+/// `SessionDelete` (0x63) body. Recovery replays via
+/// `registry::session_delete_registry`. `hard` records the soft/hard mode the
+/// handler chose for the memory cascade; the registry row removal is identical
+/// either way.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct SessionDeleteBody {
+    pub namespace_id: u32,
+    pub space_id: [u8; 16],
+    pub session_id: u64,
+    pub hard: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Encode / decode.
 // ---------------------------------------------------------------------------
 
@@ -273,6 +323,10 @@ body_codec!(
     StatementTombstoneBody
 );
 body_codec!(encode_schema_update, decode_schema_update, SchemaUpdateBody);
+body_codec!(encode_space_create, decode_space_create, SpaceCreateBody);
+body_codec!(encode_space_delete, decode_space_delete, SpaceDeleteBody);
+body_codec!(encode_session_create, decode_session_create, SessionCreateBody);
+body_codec!(encode_session_delete, decode_session_delete, SessionDeleteBody);
 
 // ---------------------------------------------------------------------------
 // Tests.

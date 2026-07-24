@@ -1,0 +1,29 @@
+{
+  "spaces": [
+    {
+      "space_id": [
+        34,
+        34,
+        34,
+        34,
+        34,
+        34,
+        34,
+        34,
+        34,
+        34,
+        34,
+        34,
+        34,
+        34,
+        34,
+        34
+      ],
+      "created_at_unix_nanos": 1700000000000000000,
+      "last_active_unix_nanos": 1700000000500000000,
+      "memory_count": 42,
+      "session_count": 3
+    }
+  ],
+  "cross_shard_complete": false
+}

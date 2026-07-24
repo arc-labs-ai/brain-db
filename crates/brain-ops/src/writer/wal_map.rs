@@ -31,10 +31,12 @@
 use brain_core::{EdgeOrigin, NodeRef};
 use brain_metadata::recovery::phase_bodies::{
     encode_entity_create, encode_entity_merge, encode_entity_rename, encode_entity_tombstone,
-    encode_entity_unmerge, encode_entity_update, encode_schema_update, encode_statement_create,
+    encode_entity_unmerge, encode_entity_update, encode_schema_update, encode_session_create,
+    encode_session_delete, encode_space_create, encode_space_delete, encode_statement_create,
     encode_statement_supersede, encode_statement_tombstone, EntityMergeBody, EntityRenameBody,
     EntityTombstoneBody, EntityUnmergeBody, EntityUpdateBody, SchemaUpdateBody,
-    StatementCreateBody, StatementSupersedeBody, StatementTombstoneBody,
+    SessionCreateBody, SessionDeleteBody, SpaceCreateBody, SpaceDeleteBody, StatementCreateBody,
+    StatementSupersedeBody, StatementTombstoneBody,
 };
 use brain_metadata::tables::entity::EntityMetadata;
 use brain_metadata::tables::statement::metadata_from_statement;
@@ -496,6 +498,74 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
         // time, so they need a handler-side pre-resolution before they can
         // be WAL-mapped — durability still rides the redb commit for now.
         Phase::Supersede { .. } | Phase::ApproveMerge { .. } | Phase::RejectMerge { .. } => None,
+
+        // Registry phases ride the PhaseBody envelope; recovery replays each
+        // through the same idempotent `brain_metadata::registry` helper the
+        // live apply path calls. The body carries the `(namespace, space)`
+        // scope explicitly (recovery decodes the body, not the Write).
+        Phase::SpaceCreate {
+            created_at_unix_nanos,
+            metadata,
+        } => {
+            let body = encode_space_create(&SpaceCreateBody {
+                namespace_id: write.namespace.raw(),
+                space_id: write.space_id.into(),
+                created_at_unix_nanos: *created_at_unix_nanos,
+                metadata: metadata.clone(),
+            });
+            Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
+                WalRecordKind::SpaceCreate,
+                write.space_id,
+                body,
+            )))
+        }
+
+        Phase::SpaceDelete { .. } => {
+            let body = encode_space_delete(&SpaceDeleteBody {
+                namespace_id: write.namespace.raw(),
+                space_id: write.space_id.into(),
+            });
+            Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
+                WalRecordKind::SpaceDelete,
+                write.space_id,
+                body,
+            )))
+        }
+
+        Phase::SessionCreate {
+            session_id,
+            title,
+            created_at_unix_nanos,
+        } => {
+            let body = encode_session_create(&SessionCreateBody {
+                namespace_id: write.namespace.raw(),
+                space_id: write.space_id.into(),
+                session_id: session_id.raw(),
+                created_at_unix_nanos: *created_at_unix_nanos,
+                title: title.clone(),
+            });
+            Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
+                WalRecordKind::SessionCreate,
+                write.space_id,
+                body,
+            )))
+        }
+
+        Phase::SessionDelete {
+            session_id, hard, ..
+        } => {
+            let body = encode_session_delete(&SessionDeleteBody {
+                namespace_id: write.namespace.raw(),
+                space_id: write.space_id.into(),
+                session_id: session_id.raw(),
+                hard: *hard,
+            });
+            Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
+                WalRecordKind::SessionDelete,
+                write.space_id,
+                body,
+            )))
+        }
 
         // No wire-replay semantic — UpdateEmbedding rewrites a vector
         // the HNSW already absorbed pre-commit; ReclaimSlots is derivable

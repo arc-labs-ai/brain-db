@@ -103,7 +103,7 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     };
     use checkpoint::CHECKPOINTS_TABLE;
     use contradiction::STATEMENT_CONTRADICTION_AUDIT_TABLE;
-    use session::{SPACE_SESSIONS_TABLE, SESSIONS_TABLE, SESSION_NAMES_TABLE};
+    use session::{SESSIONS_TABLE, SESSION_BY_SCOPE_TABLE};
     use edge::{EDGES_REVERSE_TABLE, EDGES_TABLE};
     use entity::{
         ENTITIES_TABLE, ENTITY_ALIASES_TABLE, ENTITY_BY_CANONICAL_NAME_TABLE,
@@ -148,8 +148,7 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     let _ = wtxn.open_table(STATEMENT_CONTRADICTION_AUDIT_TABLE)?;
     let _ = wtxn.open_table(CHECKPOINTS_TABLE)?;
     let _ = wtxn.open_table(SESSIONS_TABLE)?;
-    let _ = wtxn.open_table(SESSION_NAMES_TABLE)?;
-    let _ = wtxn.open_table(SPACE_SESSIONS_TABLE)?;
+    let _ = wtxn.open_table(SESSION_BY_SCOPE_TABLE)?;
     let _ = wtxn.open_table(EDGES_TABLE)?;
     let _ = wtxn.open_table(EDGES_REVERSE_TABLE)?;
     let _ = wtxn.open_table(ENTITY_TYPES_TABLE)?;

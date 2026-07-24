@@ -160,6 +160,19 @@ pub fn apply_upsert_memory(
         }
     }
 
+    // Implicit registry upsert — create the space + session registry rows on
+    // first sight and bump last_active + memory_count, in the SAME wtxn as the
+    // memory. Recovery's apply_encode runs the identical touch, so a crash
+    // never desyncs the registry from the memory it summarizes.
+    brain_metadata::touch_on_write(
+        wtxn,
+        namespace_id,
+        space_id_bytes(write.space_id),
+        session_id.raw(),
+        *created_at_unix_nanos,
+    )
+    .map_err(|e| ApplyError::Storage(format!("registry touch: {e}")))?;
+
     Ok(PhaseAck::UpsertedMemory(*id))
 }
 

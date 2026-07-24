@@ -950,7 +950,13 @@ fn phase_to_envelope(
         | Phase::UpdateKind { .. }
         | Phase::UpdateSession { .. }
         | Phase::UpdateEmbedding { .. }
-        | Phase::ReclaimSlots { .. } => None,
+        | Phase::ReclaimSlots { .. }
+        // Registry phases publish no memory-subscribe event; their wire
+        // response comes straight from the handler's WriteAck.
+        | Phase::SpaceCreate { .. }
+        | Phase::SpaceDelete { .. }
+        | Phase::SessionCreate { .. }
+        | Phase::SessionDelete { .. } => None,
     }
 }
 
