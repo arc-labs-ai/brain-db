@@ -92,8 +92,8 @@ channel_capacity = 1024
 skip_already_extracted = true
 
 # Phase T: per-shard TemporalEdgeWorker. Drains the writer's post-encode
-# channel and writes `FollowedBy` edges from the agent's previous memory
-# in the same context within `window_seconds`. Linear decay weight on
+# channel and writes `FollowedBy` edges from the space's previous memory
+# in the same session within `window_seconds`. Linear decay weight on
 # the gap; asymmetric edges (no mirror).
 [workers.temporal_edge]
 # Master switch.
@@ -108,8 +108,8 @@ window_seconds = 300
 weight_min = 0.1
 # Writer→worker queue depth.
 channel_capacity = 1024
-# Allow FollowedBy edges across context boundaries.
-cross_context = false
+# Allow FollowedBy edges across session boundaries.
+cross_session = false
 
 # Phase C: per-shard CausalEdgeWorker. Drains the ExtractorWorker's post-
 # commit channel and writes `Caused` edges from cause-side memories to

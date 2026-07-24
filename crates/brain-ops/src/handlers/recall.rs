@@ -2992,13 +2992,18 @@ fn project_memory_results(
             continue;
         }
 
-        // Namespace (tenant) wall — unconditional, defense-in-depth at the
-        // projector. The semantic lane filters by namespace at the index, but
-        // the lexical and graph lanes do not push the namespace down, so a
-        // fused hit could otherwise carry a foreign-tenant memory into the
-        // answer. Drop any row outside the caller's namespace here so no lane
-        // can leak across the tenant boundary.
+        // Tenant wall — unconditional, defense-in-depth at the projector. The
+        // semantic (and per-space brute-force) lane scopes at the index, but the
+        // lexical and graph lanes do not push the `(namespace, space)` scope
+        // down, so a fused hit could otherwise carry a foreign-tenant OR
+        // foreign-space memory into the answer. Re-check the row's own owner
+        // scope here — both halves — so no lane can leak across the namespace or
+        // the space boundary (spec §20: space is a hard wall, and every
+        // id-keyed read re-verifies `(namespace_id, space_id)`).
         if row.namespace_id != ctx.executor.caller_namespace.raw() {
+            continue;
+        }
+        if row.space_id_bytes != <[u8; 16]>::from(ctx.executor.caller_space) {
             continue;
         }
 
