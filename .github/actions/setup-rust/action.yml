@@ -1,8 +1,10 @@
 name: Set up Rust
 description: >
-  Checkout + Rust toolchain + Swatinem/rust-cache — the sequence every
-  Rust job in this repo's workflows starts with. Centralized here so the
-  toolchain/cache configuration only needs to change in one place.
+  Rust toolchain + Swatinem/rust-cache — the setup every Rust job in this
+  repo's workflows shares. Centralized here so the toolchain/cache
+  configuration only needs to change in one place. Callers MUST run
+  actions/checkout first: a local action can't be located until the repo is
+  checked out, so this composite deliberately does not check itself out.
 
 inputs:
   toolchain:
@@ -21,8 +23,6 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: actions/checkout@v6
-
     # dtolnay/rust-toolchain normally selects the channel via the ref
     # (@stable / @nightly), but that can't be parameterized through an
     # input — `uses:` doesn't accept expressions. `@master` is the one ref

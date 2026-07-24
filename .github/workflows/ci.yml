@@ -30,6 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-rust
         with:
           components: rustfmt, clippy
@@ -81,6 +82,7 @@ jobs:
       # behind #[cfg(all(test, not(miri)))].
       MIRIFLAGS: -Zmiri-disable-isolation
     steps:
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly
@@ -97,6 +99,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-rust
         with:
           cache: "false"

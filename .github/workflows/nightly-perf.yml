@@ -31,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-rust
 
       # relation_traverse.rs asserts spec §16/02 §2.4 p50 targets
