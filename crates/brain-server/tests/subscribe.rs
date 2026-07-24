@@ -734,7 +734,12 @@ async fn subscribe_spaces_filter_isolates_per_space() {
         ),
     )
     .await;
-    let _ = read_one_frame(&mut writer_b).await.expect("enc B resp");
+    let enc_b_frame = read_one_frame(&mut writer_b).await.expect("enc B resp");
+    let b_mem = match ResponseBody::decode(Opcode::EncodeResp, &enc_b_frame.payload).expect("dec B")
+    {
+        ResponseBody::Encode(r) => r.memory_id,
+        other => panic!("expected Encode, got {other:?}"),
+    };
 
     let mut writer_a = TcpStream::connect(server.addr).await.expect("writer_a");
     complete_handshake(&mut writer_a, &server.mint(space_a)).await;
@@ -748,12 +753,26 @@ async fn subscribe_spaces_filter_isolates_per_space() {
         ),
     )
     .await;
-    let _ = read_one_frame(&mut writer_a).await.expect("enc A resp");
+    let enc_a_frame = read_one_frame(&mut writer_a).await.expect("enc A resp");
+    let a_mem = match ResponseBody::decode(Opcode::EncodeResp, &enc_a_frame.payload).expect("dec A")
+    {
+        ResponseBody::Encode(r) => r.memory_id,
+        other => panic!("expected Encode, got {other:?}"),
+    };
 
-    // Collect events on sub_a for up to ~1s. Expect EXACTLY 1 event
-    // (from-A); the B event must be filtered out.
-    let mut a_events = 0;
-    for _ in 0..4 {
+    // Collect events on sub_a for up to ~1s and inspect each one. A
+    // single ENCODE now emits several live-progress events (the
+    // `Encoded` event plus one `StageCompleted` per async derivation
+    // stage), so the count is deliberately NOT asserted — that would be
+    // fragile against the write pipeline's stage set. What the space
+    // wall guarantees is *provenance*: every event sub_a sees must
+    // belong to A's write, and B's write must be invisible. The wire
+    // event carries no space_id, but A's and B's memories have distinct
+    // ids, so the memory_id is a faithful proxy for the originating
+    // space here.
+    let mut saw_a = false;
+    let mut saw_b = false;
+    for _ in 0..6 {
         let Some(frame) = read_event_within(&mut sub_a, Duration::from_millis(500)).await else {
             break;
         };
@@ -761,12 +780,24 @@ async fn subscribe_spaces_filter_isolates_per_space() {
             && frame.header.stream_id_u32() == sub_stream
             && frame.header.flags_u8() & FLAG_EOS == 0
         {
-            a_events += 1;
+            if let Ok(ResponseBody::SubscribeEvent(ev)) =
+                ResponseBody::decode(Opcode::SubscribeEvent, &frame.payload)
+            {
+                if ev.memory_id == a_mem {
+                    saw_a = true;
+                } else if ev.memory_id == b_mem {
+                    saw_b = true;
+                }
+            }
         }
     }
-    assert_eq!(
-        a_events, 1,
-        "spaces=[A] filter should let through exactly the A event, not B's"
+    assert!(
+        saw_a,
+        "spaces=[A] filter must let A's own events through (saw none for a_mem={a_mem})"
+    );
+    assert!(
+        !saw_b,
+        "spaces=[A] filter must NOT leak B's events across the space wall (saw b_mem={b_mem})"
     );
 
     server.stop().await;

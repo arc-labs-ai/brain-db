@@ -312,7 +312,11 @@ fn recency_breaks_relevance_ties_toward_recent_event_time() {
             occurred_at_unix_nanos: Some(reference - day), // yesterday
             act_as: None,
             wait: brain_protocol::WaitMode::Ack,
-            allow_duplicates: false,
+            // Byte-identical text is the whole point of this test: two
+            // memories that tie on cosine so only event-time recency can
+            // separate them. Content dedup (the default) would collapse
+            // the pair into one row, so duplicates must be allowed here.
+            allow_duplicates: true,
         };
         let old = EncodeRequest {
             occurred_at_unix_nanos: Some(reference - 400 * day), // >1 year ago

@@ -424,14 +424,14 @@ mod tests {
             Err(WalRecordError::UnknownRecordType(0))
         );
 
-        // A reserved-future byte (e.g. 0x60 — past the audit kind, still
-        // inside the v1 reserved range) likewise rejected.
-        buf[8] = 0x60;
+        // A reserved-future byte (0x64 — one past the session/space registry
+        // block, which ends at SessionDelete = 0x63) likewise rejected.
+        buf[8] = 0x64;
         let crc = crc32c::crc32c(&buf[..HEADER_LEN]);
         buf[crc_off..crc_off + 4].copy_from_slice(&crc.to_le_bytes());
         assert_eq!(
             WalRecord::decode_one(&buf),
-            Err(WalRecordError::UnknownRecordType(0x60))
+            Err(WalRecordError::UnknownRecordType(0x64))
         );
     }
 
