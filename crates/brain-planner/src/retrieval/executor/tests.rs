@@ -922,7 +922,7 @@ fn cue_anchor_upgrades_blind_graph_to_resolved_entity() {
     let sarah_id = sarah.id;
     {
         let wtxn = metadata.write_txn().expect("wtxn");
-        brain_metadata::entity_put(&wtxn, __ts(), &sarah).expect("put");
+        brain_metadata::entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &sarah).expect("put");
         wtxn.commit().expect("commit");
     }
     let ctx = cue_ctx(metadata);
@@ -968,7 +968,7 @@ fn cue_anchor_falls_back_on_two_distinct_entities() {
             0,
         );
         let wtxn = metadata.write_txn().expect("wtxn");
-        brain_metadata::entity_put(&wtxn, __ts(), &e).expect("put");
+        brain_metadata::entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &e).expect("put");
         wtxn.commit().expect("commit");
     }
     let ctx = cue_ctx(metadata);

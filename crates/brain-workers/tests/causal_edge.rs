@@ -164,7 +164,7 @@ fn seed_causal_statement(
         "outage".into(),
         now,
     );
-    entity_put(&wtxn, __ts(), &entity).expect("entity_put");
+    entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &entity).expect("entity_put");
     // 3. Predicate `brain:caused_by` — matches the default whitelist.
     let predicate =
         predicate_intern_or_get(&wtxn, "brain", "caused_by", 1, now).expect("predicate_intern");
@@ -191,7 +191,7 @@ fn seed_causal_statement(
         now,
         1,
     );
-    statement_create(&wtxn, __ts(), &statement, now).expect("statement_create");
+    statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &statement, now).expect("statement_create");
     drop(statement);
     wtxn.commit().unwrap();
     sid

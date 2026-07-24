@@ -16,6 +16,13 @@ pub struct EntityCreateRequest {
     pub canonical_name: String,
     pub aliases: Vec<String>,
     pub attributes_blob: Vec<u8>,
+    /// Optional session that first mentions this entity. `0`
+    /// (`SessionId::DEFAULT`, the default when omitted) is the default
+    /// session. Recorded as FIRST-MENTION provenance only — entity
+    /// identity is session-agnostic and a later mention never overwrites
+    /// it. A grouping column, never an isolation boundary.
+    #[serde(default)]
+    pub session_id: u64,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
     /// Effective identity this entity-create runs as, on behalf of the

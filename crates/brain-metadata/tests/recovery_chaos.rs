@@ -166,6 +166,7 @@ fn sample_relation_link(rid_byte: u8) -> RelationLinkPayload {
         properties_blob: vec![0xDE, 0xAD, 0xBE, 0xEF],
         space_id: aid(7),
         namespace_id: brain_core::NamespaceId::from(7),
+        session_id: brain_core::SessionId::DEFAULT,
         relation_type_intern_hint: None,
     }
 }

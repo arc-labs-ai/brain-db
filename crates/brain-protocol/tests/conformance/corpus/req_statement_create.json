@@ -52,6 +52,7 @@
   "valid_to_unix_nanos": 0,
   "event_at_unix_nanos": 0,
   "schema_version": 1,
+  "session_id": 7,
   "request_id": [
     17,
     17,

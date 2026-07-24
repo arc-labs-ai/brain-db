@@ -29,6 +29,9 @@ pub(crate) fn entity_from_upsert_phase(phase: &Phase) -> Option<Entity> {
     let Phase::UpsertEntity {
         id,
         ty,
+        // Session is stamped by the apply path (see `apply_upsert_entity`),
+        // not carried on the brain-core `Entity` this builds.
+        session: _,
         canonical,
         normalized,
         aliases,
@@ -56,10 +59,13 @@ pub fn apply_upsert_entity(
     write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
     let scope = brain_metadata::RowScope::new(write.namespace, write.space_id);
+    let Phase::UpsertEntity { session, .. } = phase else {
+        return Err(ApplyError::PhaseMisShape("expected UpsertEntity"));
+    };
     let e = entity_from_upsert_phase(phase)
         .ok_or(ApplyError::PhaseMisShape("expected UpsertEntity"))?;
     let id = e.id;
-    entity_put(wtxn, scope, &e)
+    entity_put(wtxn, scope, *session, &e)
         .map_err(|err| ApplyError::Metadata(format!("entity_put: {err}")))?;
     // Write-path trace: which entity (canonical name) was minted/updated.
     // Subject resolution at read time keys on this canonical name, so a read
@@ -403,6 +409,7 @@ mod tests {
         let phase = Phase::UpsertEntity {
             id,
             ty: EntityType::PERSON_ID,
+            session: brain_core::SessionId::DEFAULT,
             canonical: "Alice".into(),
             normalized: brain_metadata::entity::ops::normalize_name("Alice"),
             aliases: Vec::new(),
@@ -434,7 +441,7 @@ mod tests {
                 brain_metadata::entity::ops::normalize_name("Alice"),
                 1_700_000_000_000,
             );
-            entity_put(&wtxn, __ts(), &e).unwrap();
+            entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &e).unwrap();
             wtxn.commit().unwrap();
         }
         // Tombstone via apply.

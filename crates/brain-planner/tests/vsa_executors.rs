@@ -59,7 +59,7 @@ fn make_test_entity(metadata: &MetadataDb, name: &str) -> EntityId {
         1_700_000_000_000_000_000,
     );
     let wtxn = metadata.write_txn().unwrap();
-    entity_put(&wtxn, test_scope(), &e).unwrap();
+    entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
     wtxn.commit().unwrap();
     id
 }
@@ -114,7 +114,7 @@ fn make_test_statement(
     );
     s.evidence = EvidenceRef::inline_from_slice(&[entry]);
     let wtxn = metadata.write_txn().unwrap();
-    let id = statement_create(&wtxn, test_scope(), &s, 1_700_000_000_000_000_001).unwrap();
+    let id = statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 1_700_000_000_000_000_001).unwrap();
     wtxn.commit().unwrap();
     id
 }

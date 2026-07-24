@@ -28,6 +28,7 @@ pub fn apply_upsert_statement(
     // `statement_from_upsert_phase` (shared with the WAL-mapping path).
     let Phase::UpsertStatement {
         id,
+        session,
         predicate,
         extracted_at_unix_nanos,
         predicate_intern_hint,
@@ -55,7 +56,7 @@ pub fn apply_upsert_statement(
 
     let s = statement_from_upsert_phase(phase, resolved_predicate)
         .ok_or(ApplyError::PhaseMisShape("expected UpsertStatement"))?;
-    statement_create(wtxn, scope, &s, *extracted_at_unix_nanos)
+    statement_create(wtxn, scope, *session, &s, *extracted_at_unix_nanos)
         .map_err(|e| ApplyError::Metadata(format!("statement_create: {e}")))?;
 
     // Write-path trace: the structured fact this ENCODE produced. The
@@ -144,8 +145,18 @@ pub fn apply_supersede_statement(
             "expected Supersede with Statement replacement",
         ));
     };
-    statement_supersede(wtxn, scope, *old_id, new_statement.as_ref(), *at_unix_nanos)
-        .map_err(|e| ApplyError::Metadata(format!("statement_supersede: {e}")))?;
+    // Explicit STATEMENT_SUPERSEDE carries no session on the phase; the
+    // replacement row lands in the default session (session grouping is
+    // driven by the write-path UpsertStatement, not the supersede verb).
+    statement_supersede(
+        wtxn,
+        scope,
+        brain_core::SessionId::DEFAULT,
+        *old_id,
+        new_statement.as_ref(),
+        *at_unix_nanos,
+    )
+    .map_err(|e| ApplyError::Metadata(format!("statement_supersede: {e}")))?;
     Ok(PhaseAck::Superseded(*target, replacement.id()))
 }
 

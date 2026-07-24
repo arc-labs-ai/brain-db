@@ -975,6 +975,7 @@ mod tests {
             canonical_name: "Ada".into(),
             aliases: Vec::new(),
             attributes_blob: Vec::new(),
+            session_id: 0,
             request_id: sample_uuid(1),
             act_as: Some(selector.clone()),
         });
@@ -1020,6 +1021,7 @@ mod tests {
             valid_to_unix_nanos: 0,
             event_at_unix_nanos: 0,
             schema_version: 0,
+            session_id: 0,
             request_id: sample_uuid(1),
             act_as: Some(selector.clone()),
         });
@@ -1035,6 +1037,7 @@ mod tests {
             confidence: 1.0,
             valid_from_unix_nanos: 0,
             valid_to_unix_nanos: 0,
+            session_id: 0,
             request_id: sample_uuid(1),
             act_as: Some(selector.clone()),
         });

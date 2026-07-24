@@ -113,7 +113,7 @@ fn make_entity(metadata: &SharedMetadataDb, name: &str, created: u64) -> EntityI
         created,
     );
     let wtxn = metadata.write_txn().unwrap();
-    entity_put(&wtxn, __ts(), &e).unwrap();
+    entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &e).unwrap();
     wtxn.commit().unwrap();
     id
 }
@@ -164,7 +164,7 @@ fn seed_statement(
     );
     s.confidence = conf;
     let wtxn = metadata.write_txn().unwrap();
-    statement_create(&wtxn, __ts(), &s, created).unwrap();
+    statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &s, created).unwrap();
     wtxn.commit().unwrap();
     id
 }

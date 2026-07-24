@@ -571,7 +571,7 @@ async fn do_extractor_cycle(
                 }
             }
             let produced_statements = counts.statements > 0;
-            let space_id = memory_scope(ctx, *memory_id).space();
+            let space_id = memory_scope_and_session(ctx, *memory_id).0.space();
             publish_extracted_graph(ctx, *memory_id, space_id, counts, audit_status).await;
             // Reclassify the memory kind from what extraction produced: an
             // Event-shaped statement → Episodic, timeless facts/preferences →
@@ -1212,7 +1212,7 @@ async fn run_hype_pass(worker: &ExtractorWorker, ctx: &WorkerContext, items: &[E
         // span more than this one memory (read-side multi-hop then resolves to
         // a single cheap ANN probe — no read LLM). Empty for the first memory
         // about a subject; fills in as the graph grows (and on re-ingest).
-        let scope = memory_scope(ctx, *memory_id);
+        let scope = memory_scope_and_session(ctx, *memory_id).0;
         let neighborhood = build_neighborhood(ctx, scope, text.as_ref());
         let outcome = hype
             .generate_for(*memory_id, text.as_ref(), &neighborhood)
@@ -1356,7 +1356,8 @@ async fn run_hype_refresh_sweep(worker: &ExtractorWorker, ctx: &WorkerContext) {
         if cycle_budget > 0 && *worker.llm_spend.lock() >= cycle_budget {
             break;
         }
-        let neighborhood = build_neighborhood(ctx, memory_scope(ctx, *memory_id), text.as_str());
+        let neighborhood =
+            build_neighborhood(ctx, memory_scope_and_session(ctx, *memory_id).0, text.as_str());
         if neighborhood.is_empty() {
             last_examined = memory_id.to_be_bytes();
             continue;
@@ -1397,12 +1398,15 @@ async fn run_hype_refresh_sweep(worker: &ExtractorWorker, ctx: &WorkerContext) {
 /// Best-effort and strictly bounded: any error yields an empty string (the
 /// pre-graph-aware behavior), and the entity / line / character caps keep the
 /// HyPE prompt from ballooning on a densely-connected hub.
-/// Read a memory's `(namespace, space)` scope from `MEMORIES_TABLE`.
-/// Falls back to the system scope when the row is absent — the
-/// neighborhood enrichment it feeds is best-effort prompt context, so a
-/// miss simply yields an empty (system-scoped) neighborhood rather than
-/// crossing tenants.
-fn memory_scope(ctx: &WorkerContext, memory_id: MemoryId) -> brain_metadata::RowScope {
+/// Read a memory's `(namespace, space)` scope AND its `session_id` from
+/// `MEMORIES_TABLE`. Falls back to the system scope + default session
+/// when the row is absent — the neighborhood enrichment it feeds is
+/// best-effort prompt context, so a miss simply yields an empty
+/// (system-scoped) neighborhood rather than crossing tenants.
+fn memory_scope_and_session(
+    ctx: &WorkerContext,
+    memory_id: MemoryId,
+) -> (brain_metadata::RowScope, brain_core::SessionId) {
     use brain_metadata::tables::memory::MEMORIES_TABLE;
     ctx.ops
         .executor
@@ -1414,12 +1418,21 @@ fn memory_scope(ctx: &WorkerContext, memory_id: MemoryId) -> brain_metadata::Row
             rtxn.open_table(MEMORIES_TABLE).ok().and_then(|t| {
                 t.get(&memory_id.to_be_bytes()).ok().flatten().map(|g| {
                     let m = g.value();
-                    brain_metadata::RowScope::from_bytes(m.namespace_id, m.space_id_bytes)
+                    (
+                        brain_metadata::RowScope::from_bytes(m.namespace_id, m.space_id_bytes),
+                        brain_core::SessionId::from(m.session_id),
+                    )
                 })
             })
         })
         .unwrap_or_else(|| {
-            brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0u8; 16])
+            (
+                brain_metadata::RowScope::from_bytes(
+                    brain_core::NamespaceId::SYSTEM.raw(),
+                    [0u8; 16],
+                ),
+                brain_core::SessionId::DEFAULT,
+            )
         })
 }
 
@@ -1447,7 +1460,7 @@ fn writeback_memory_kind(ctx: &WorkerContext, memory_id: MemoryId) {
     use brain_metadata::tables::memory::MEMORIES_TABLE;
     use brain_metadata::tables::statement::{STATEMENTS_BY_EVIDENCE_TABLE, STATEMENTS_TABLE};
 
-    let scope = memory_scope(ctx, memory_id);
+    let scope = memory_scope_and_session(ctx, memory_id).0;
     let metadata = ctx.ops.executor.metadata.as_ref();
     let mid = memory_id.to_be_bytes();
 
@@ -2628,20 +2641,31 @@ fn run_apply_body(
     // so an extracted fact can never escape its source tenant. A missing
     // memory row (shouldn't happen for a queued memory) falls back to the
     // system scope, which the apply path treats as the `brain` namespace.
-    let source_scope: brain_metadata::RowScope = {
+    // Read the scope AND the per-utterance session together: every typed-
+    // graph row this extraction writes (statements, relations) is stamped
+    // with the SAME session as the memory it came from, so a session-scoped
+    // read sees the memory's facts alongside the memory. (Entities carry
+    // session only as first-mention provenance; see `entity_put`.)
+    let (source_scope, source_session): (brain_metadata::RowScope, brain_core::SessionId) = {
         use brain_metadata::tables::memory::MEMORIES_TABLE;
         wtxn.open_table(MEMORIES_TABLE)
             .ok()
             .and_then(|t| {
                 t.get(&memory_id.to_be_bytes()).ok().flatten().map(|g| {
                     let m = g.value();
-                    brain_metadata::RowScope::from_bytes(m.namespace_id, m.space_id_bytes)
+                    (
+                        brain_metadata::RowScope::from_bytes(m.namespace_id, m.space_id_bytes),
+                        brain_core::SessionId::from(m.session_id),
+                    )
                 })
             })
             .unwrap_or_else(|| {
-                brain_metadata::RowScope::from_bytes(
-                    brain_core::NamespaceId::SYSTEM.raw(),
-                    [0u8; 16],
+                (
+                    brain_metadata::RowScope::from_bytes(
+                        brain_core::NamespaceId::SYSTEM.raw(),
+                        [0u8; 16],
+                    ),
+                    brain_core::SessionId::DEFAULT,
                 )
             })
     };
@@ -3147,6 +3171,7 @@ fn run_apply_body(
                             extractor_id: ExtractorId::from(sm.extractor_id),
                             is_symmetric: false,
                             extracted_at_unix_nanos: now,
+                            session_id: source_session,
                         };
                         match relation_create_internal(&wtxn, source_scope, &payload) {
                             Ok(_) => {
@@ -3193,6 +3218,7 @@ fn run_apply_body(
                         extracted_at_unix_nanos: now,
                         is_stateful,
                         event_at_unix_nanos: event_at,
+                        session_id: source_session,
                     };
                     match statement_create_internal(&wtxn, source_scope, &payload) {
                         Ok(sid) => {
@@ -3318,6 +3344,7 @@ fn run_apply_body(
                     extractor_id: ExtractorId::from(rm.extractor_id),
                     is_symmetric: false,
                     extracted_at_unix_nanos: now,
+                    session_id: source_session,
                 };
                 match relation_create_internal(&wtxn, source_scope, &payload) {
                     Ok(_) => {
@@ -4762,7 +4789,10 @@ fn ensure_space_self_entity(
         brain_metadata::entity::ops::normalize_name(&canonical),
         now,
     );
-    brain_metadata::entity::ops::entity_put(wtxn, scope, &entity)
+    // The space self-entity is a space-level, session-agnostic identity;
+    // its first-mention session is meaningless, so it lands in the default
+    // session.
+    brain_metadata::entity::ops::entity_put(wtxn, scope, brain_core::SessionId::DEFAULT, &entity)
         .map_err(|e| ApplyError::Storage(format!("entity_put(self): {e}")))?;
     Ok(())
 }

@@ -474,7 +474,7 @@ fn seed_entity(wtxn: &redb::WriteTransaction, scope: RowScope, name: &str) -> En
         normalized,
         1_700_000_000_000_000_000,
     );
-    brain_metadata::entity::ops::entity_put(wtxn, scope, &e).expect("seed entity");
+    brain_metadata::entity::ops::entity_put(wtxn, scope, brain_core::SessionId::DEFAULT, &e).expect("seed entity");
     id
 }
 
@@ -526,7 +526,7 @@ fn reason_analogical_fit_populates_trace_and_can_tag_inference_kind() {
             1_700_000_000_000_000_000,
             1,
         );
-        brain_metadata::statement::statement_create(&wtxn, scope, &obs_stmt, 0)
+        brain_metadata::statement::statement_create(&wtxn, scope, brain_core::SessionId::DEFAULT, &obs_stmt, 0)
             .expect("create observation statement");
 
         // Candidate triple, SAME predicate: Bob works_at Stripe, evidenced
@@ -543,7 +543,7 @@ fn reason_analogical_fit_populates_trace_and_can_tag_inference_kind() {
             1_700_000_000_000_000_000,
             1,
         );
-        brain_metadata::statement::statement_create(&wtxn, scope, &cand_stmt, 0)
+        brain_metadata::statement::statement_create(&wtxn, scope, brain_core::SessionId::DEFAULT, &cand_stmt, 0)
             .expect("create candidate statement");
         wtxn.commit().expect("commit seed txn");
 

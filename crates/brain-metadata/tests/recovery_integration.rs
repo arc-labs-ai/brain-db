@@ -769,6 +769,7 @@ fn relation_link_payload(
         properties_blob: vec![],
         space_id: aid(1),
         namespace_id: brain_core::NamespaceId::from(9),
+        session_id: brain_core::SessionId::DEFAULT,
         relation_type_intern_hint: None,
     }
 }

@@ -569,6 +569,7 @@ pub fn entity_iter_all_live_with_vectors(
 pub fn entity_put(
     wtxn: &WriteTransaction,
     scope: RowScope,
+    session: brain_core::SessionId,
     entity: &Entity,
 ) -> Result<(), EntityOpError> {
     require_entity_type_exists(wtxn, entity.entity_type)?;
@@ -597,8 +598,13 @@ pub fn entity_put(
         }
     }
 
-    // Primary row — carries the owning scope.
+    // Primary row — carries the owning scope. `entity_put` only ever
+    // CREATES (it rejects a duplicate canonical above), so the session it
+    // stamps is this entity's FIRST-MENTION provenance. Later mentions
+    // route through `entity_update`, which preserves this value — entity
+    // identity is session-agnostic and the session is never overwritten.
     let mut m = EntityMetadata::from_entity(entity, scope);
+    m.session_id = session.raw();
     // Make sure the on-disk normalized_name matches what we just
     // computed (the caller may have passed a different form;
     // normalize is canonical).
@@ -786,8 +792,12 @@ pub fn entity_update(
     )?;
     crate::entity::trigram::index_entity_trigrams(wtxn, scope, next.entity_type, next.id, &to_add)?;
 
-    // Write back primary row — re-stamp the immutable owning scope.
+    // Write back primary row — re-stamp the immutable owning scope AND
+    // preserve the entity's FIRST-MENTION session: an update is a later
+    // mention and must never overwrite the session that first created the
+    // entity (entity identity is session-agnostic).
     let mut m = EntityMetadata::from_entity(&next, scope);
+    m.session_id = current.session_id;
     m.normalized_name = normalized_new;
     {
         let mut t = wtxn.open_table(ENTITIES_TABLE)?;
@@ -1040,7 +1050,7 @@ mod tests {
         let id = aspirin.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &aspirin).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &aspirin).unwrap();
             wtxn.commit().unwrap();
         }
         let wtxn = db.write_txn().unwrap();
@@ -1070,7 +1080,7 @@ mod tests {
         let id = e.id;
 
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1085,7 +1095,7 @@ mod tests {
         let e = person_entity("Priya Patel");
         let id = e.id;
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1109,7 +1119,7 @@ mod tests {
         let id = e.id;
 
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1128,7 +1138,7 @@ mod tests {
         e.entity_type = EntityTypeId(99);
 
         let wtxn = db.write_txn().unwrap();
-        let err = entity_put(&wtxn, test_scope(), &e).expect_err("should reject");
+        let err = entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).expect_err("should reject");
         assert!(matches!(
             err,
             EntityOpError::UnknownEntityType(t) if t == EntityTypeId(99)
@@ -1146,8 +1156,8 @@ mod tests {
         b.id = b_id;
 
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &a).unwrap();
-        let err = entity_put(&wtxn, test_scope(), &b).expect_err("dup");
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &a).unwrap();
+        let err = entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &b).expect_err("dup");
         match err {
             EntityOpError::DuplicateCanonicalName {
                 type_id,
@@ -1173,7 +1183,7 @@ mod tests {
         let id = e.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &e).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
             wtxn.commit().unwrap();
         }
         let rtxn = db.read_txn().unwrap();
@@ -1207,8 +1217,8 @@ mod tests {
         let (a_id, b_id) = (a.id, b.id);
 
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &a).unwrap();
-        entity_put(&wtxn, test_scope(), &b).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &a).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &b).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1235,8 +1245,8 @@ mod tests {
         let fuzzy_id = fuzzy.id;
 
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &exact).unwrap();
-        entity_put(&wtxn, test_scope(), &fuzzy).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &exact).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &fuzzy).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1278,7 +1288,7 @@ mod tests {
         let full_id = full.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &full).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &full).unwrap();
             wtxn.commit().unwrap();
         }
 
@@ -1307,8 +1317,8 @@ mod tests {
         let (smith_id, doe_id) = (smith.id, doe.id);
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &smith).unwrap();
-            entity_put(&wtxn, test_scope(), &doe).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &smith).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &doe).unwrap();
             wtxn.commit().unwrap();
         }
 
@@ -1333,7 +1343,7 @@ mod tests {
         let original_embedding_version = e.embedding_version;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &e).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
             wtxn.commit().unwrap();
         }
 
@@ -1386,7 +1396,7 @@ mod tests {
         let id = e.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &e).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
             wtxn.commit().unwrap();
         }
 
@@ -1425,7 +1435,7 @@ mod tests {
         let id = e.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &e).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
             wtxn.commit().unwrap();
         }
         {
@@ -1448,7 +1458,7 @@ mod tests {
         let id = e.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &e).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
             wtxn.commit().unwrap();
         }
         {
@@ -1477,7 +1487,7 @@ mod tests {
         let id = e.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &e).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
             wtxn.commit().unwrap();
         }
         {
@@ -1517,7 +1527,7 @@ mod tests {
         let id1 = e1.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &e1).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e1).unwrap();
             wtxn.commit().unwrap();
         }
         {
@@ -1530,7 +1540,7 @@ mod tests {
         let id2 = e2.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &e2).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e2).unwrap();
             wtxn.commit().unwrap();
         }
         assert_ne!(id1, id2);
@@ -1574,9 +1584,9 @@ mod tests {
 
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &p1).unwrap();
-            entity_put(&wtxn, test_scope(), &p2).unwrap();
-            entity_put(&wtxn, test_scope(), &proj).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p1).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p2).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &proj).unwrap();
             wtxn.commit().unwrap();
         }
 
@@ -1598,8 +1608,8 @@ mod tests {
         let bob_id = bob.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &alice).unwrap();
-            entity_put(&wtxn, test_scope(), &bob).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &alice).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &bob).unwrap();
             wtxn.commit().unwrap();
         }
         {
@@ -1626,7 +1636,7 @@ mod tests {
         let id = e.id;
 
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1653,7 +1663,7 @@ mod tests {
         let id = e.id;
 
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1681,7 +1691,7 @@ mod tests {
         let id = e.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &e).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
             wtxn.commit().unwrap();
         }
         {
@@ -1728,7 +1738,7 @@ mod tests {
         let id = e.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &e).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
             wtxn.commit().unwrap();
         }
         {
@@ -1768,7 +1778,7 @@ mod tests {
         let v = fixture_vector(0.5);
 
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         entity_vector_put(&wtxn, id, &v).unwrap();
         wtxn.commit().unwrap();
 
@@ -1790,7 +1800,7 @@ mod tests {
         let id = e.id;
 
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1811,9 +1821,9 @@ mod tests {
 
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &with_vec).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &with_vec).unwrap();
             entity_vector_put(&wtxn, id_with, &v).unwrap();
-            entity_put(&wtxn, test_scope(), &without_vec).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &without_vec).unwrap();
             wtxn.commit().unwrap();
         }
 

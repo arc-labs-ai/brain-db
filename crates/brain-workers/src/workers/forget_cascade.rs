@@ -311,7 +311,7 @@ mod tests {
             NOW,
         );
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, __ts(), &e).unwrap();
+        entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -368,7 +368,7 @@ mod tests {
         );
         s.confidence = stmt_conf;
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, __ts(), &s, NOW).unwrap();
+        statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &s, NOW).unwrap();
         wtxn.commit().unwrap();
         id
     }

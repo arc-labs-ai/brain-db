@@ -162,6 +162,7 @@ async fn create_person(
             canonical_name: name.into(),
             aliases,
             attributes_blob: Vec::new(),
+            session_id: 0,
             request_id: *uuid::Uuid::now_v7().as_bytes(),
             act_as: None,
         }),

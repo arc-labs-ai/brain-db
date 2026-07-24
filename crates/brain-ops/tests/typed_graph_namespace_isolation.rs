@@ -146,6 +146,7 @@ async fn create_entity(
         canonical_name: canonical.to_string(),
         aliases: Vec::new(),
         attributes_blob: Vec::new(),
+        session_id: 0,
         request_id,
         act_as: None,
     };
@@ -178,6 +179,7 @@ async fn create_statement(
         valid_to_unix_nanos: 0,
         event_at_unix_nanos: 0,
         schema_version: 0,
+        session_id: 0,
         request_id,
         act_as: None,
     };
@@ -208,6 +210,7 @@ async fn create_relation(
         confidence: 0.95,
         valid_from_unix_nanos: 0,
         valid_to_unix_nanos: 0,
+        session_id: 0,
         request_id,
         act_as: None,
     };

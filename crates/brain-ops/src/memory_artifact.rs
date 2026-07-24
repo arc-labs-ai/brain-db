@@ -181,7 +181,7 @@ pub fn merge_graph_from_committed(
             // nothing to enrich, and the bundle was purged with the row.
             return Ok(());
         };
-        let enr = crate::handlers::recall::fetch_enrichment_for(&[memory_id], scope, &rtxn)
+        let enr = crate::handlers::recall::fetch_enrichment_for(&[memory_id], scope, None, &rtxn)
             .map_err(|e| format!("graph enrichment: {e}"))?;
         enrichment_to_graph(enr.into_iter().next())
     };

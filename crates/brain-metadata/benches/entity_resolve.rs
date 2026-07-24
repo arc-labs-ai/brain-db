@@ -64,7 +64,7 @@ fn build_fixture(n: usize) -> Fixture {
         let normalized = normalize_name(&name);
         let mut entity = Entity::new_active(id, PERSON, name, normalized, now);
         entity.aliases = vec![format!("alias_{i}")];
-        entity_put(&wtxn, bench_scope(), &entity).expect("entity_put");
+        entity_put(&wtxn, bench_scope(), brain_core::SessionId::DEFAULT, &entity).expect("entity_put");
         ids.push(id);
     }
     wtxn.commit().expect("commit");

@@ -157,7 +157,7 @@ fn seed_entity(
         NOW,
     );
     let wtxn = db.write_txn().unwrap();
-    entity_put(&wtxn, test_scope(), &ent).unwrap();
+    entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &ent).unwrap();
     wtxn.commit().unwrap();
     hnsw.write().insert(id, &vector).unwrap();
     id

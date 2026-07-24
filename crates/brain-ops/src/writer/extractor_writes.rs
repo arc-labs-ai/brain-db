@@ -19,7 +19,8 @@
 //! would re-enter the metadata lock and duplicate events.
 
 use brain_core::{
-    EntityId, ExtractorId, MemoryId, PredicateId, RelationId, RelationTypeId, StatementId,
+    EntityId, ExtractorId, MemoryId, PredicateId, RelationId, RelationTypeId, SessionId,
+    StatementId,
 };
 use brain_core::{Relation, Statement, StatementKind, StatementObject, SubjectRef};
 use brain_metadata::relation::ops::{relation_create, RelationOpError};
@@ -59,6 +60,10 @@ pub struct StatementCreatePayload {
     /// time for temporal (memory-subject) events so they persist instead of
     /// being dropped.
     pub event_at_unix_nanos: Option<u64>,
+    /// The per-utterance session this statement is extracted from — the
+    /// source memory's `session_id`. Stamped onto the statement row so a
+    /// session-scoped read sees this statement with its session's memories.
+    pub session_id: SessionId,
 }
 
 /// Same shape for relations.
@@ -72,6 +77,9 @@ pub struct RelationCreatePayload {
     pub extractor_id: ExtractorId,
     pub is_symmetric: bool,
     pub extracted_at_unix_nanos: u64,
+    /// The per-utterance session this relation is extracted from — the
+    /// source memory's `session_id`. Stamped onto the relation row.
+    pub session_id: SessionId,
 }
 
 /// Build a `Statement` value from `payload` and call
@@ -109,7 +117,7 @@ pub fn statement_create_internal(
     if payload.kind == StatementKind::Event {
         s.event_at_unix_nanos = payload.event_at_unix_nanos;
     }
-    statement_create(wtxn, scope, &s, payload.extracted_at_unix_nanos)
+    statement_create(wtxn, scope, payload.session_id, &s, payload.extracted_at_unix_nanos)
 }
 
 /// Build a `Relation` value from `payload` and call
@@ -131,7 +139,7 @@ pub fn relation_create_internal(
         payload.extracted_at_unix_nanos,
         payload.is_symmetric,
     );
-    relation_create(wtxn, scope, &r, payload.extracted_at_unix_nanos)
+    relation_create(wtxn, scope, payload.session_id, &r, payload.extracted_at_unix_nanos)
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +176,7 @@ mod tests {
         );
         let id = e.id;
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -196,6 +204,7 @@ mod tests {
                 extracted_at_unix_nanos: NOW,
                 is_stateful: false,
                 event_at_unix_nanos: None,
+                session_id: SessionId::DEFAULT,
             };
             let sid = statement_create_internal(&wtxn, test_scope(), &payload).unwrap();
             wtxn.commit().unwrap();
@@ -228,7 +237,7 @@ mod tests {
                 NOW,
             );
             let id = e.id;
-            entity_put(&wtxn, test_scope(), &e).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
             wtxn.commit().unwrap();
             id
         };
@@ -244,6 +253,7 @@ mod tests {
                 extractor_id: ExtractorId::from(12),
                 is_symmetric: false,
                 extracted_at_unix_nanos: NOW,
+                session_id: SessionId::DEFAULT,
             };
             let rid = relation_create_internal(&wtxn, test_scope(), &payload).unwrap();
             wtxn.commit().unwrap();

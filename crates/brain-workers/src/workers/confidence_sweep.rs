@@ -623,6 +623,7 @@ mod tests {
             statement_id_bytes: [0u8; 16],
             namespace_id: brain_core::NamespaceId::SYSTEM.raw(),
             space_id_bytes: [0xA1; 16],
+            session_id: 0,
             chain_root_bytes: [0u8; 16],
             version: 1,
             kind: StatementKind::Fact.as_u8(),
@@ -725,7 +726,7 @@ mod tests {
         entity_put(
             &wtxn,
             __ts(),
-            &Entity::new_active(
+            brain_core::SessionId::DEFAULT, &Entity::new_active(
                 subj,
                 EntityType::PERSON_ID,
                 format!("Subject{n}"),
@@ -737,7 +738,7 @@ mod tests {
         entity_put(
             &wtxn,
             __ts(),
-            &Entity::new_active(
+            brain_core::SessionId::DEFAULT, &Entity::new_active(
                 obj,
                 EntityType::PERSON_ID,
                 format!("Object{n}"),
@@ -776,7 +777,7 @@ mod tests {
         if matches!(kind, StatementKind::Event) {
             s.event_at_unix_nanos = Some(extracted_at);
         }
-        let id = statement_create(&wtxn, __ts(), &s, extracted_at).unwrap();
+        let id = statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &s, extracted_at).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -966,7 +967,7 @@ mod tests {
             entity_put(
                 &wtxn,
                 __ts(),
-                &Entity::new_active(
+                brain_core::SessionId::DEFAULT, &Entity::new_active(
                     subj,
                     EntityType::PERSON_ID,
                     "Subject".into(),
@@ -978,7 +979,7 @@ mod tests {
             entity_put(
                 &wtxn,
                 __ts(),
-                &Entity::new_active(
+                brain_core::SessionId::DEFAULT, &Entity::new_active(
                     obj,
                     EntityType::PERSON_ID,
                     "Object".into(),
@@ -1017,7 +1018,7 @@ mod tests {
                 extracted_at,
                 1,
             );
-            let id = statement_create(&wtxn, __ts(), &s, extracted_at).unwrap();
+            let id = statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &s, extracted_at).unwrap();
             wtxn.commit().unwrap();
             id
         };

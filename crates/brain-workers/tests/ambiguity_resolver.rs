@@ -139,7 +139,7 @@ fn seed_entity(fx: &Fixture, canonical: &str, vec_: [f32; VECTOR_DIM]) -> Entity
     );
     {
         let wtxn = fx.metadata.write_txn().unwrap();
-        entity_put(&wtxn, __ts(), &ent).unwrap();
+        entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &ent).unwrap();
         wtxn.commit().unwrap();
     }
     fx.hnsw.write().insert(id, &vec_).unwrap();

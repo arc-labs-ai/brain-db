@@ -866,6 +866,7 @@ async fn create_entity(fix: &Fixture, request_id: [u8; 16], canonical: &str) -> 
         canonical_name: canonical.to_string(),
         aliases: Vec::new(),
         attributes_blob: Vec::new(),
+        session_id: 0,
         request_id,
         act_as: None,
     };
@@ -901,6 +902,7 @@ async fn create_statement(
         valid_to_unix_nanos: 0,
         event_at_unix_nanos: 0,
         schema_version: 0,
+        session_id: 0,
         request_id,
         act_as: None,
     };

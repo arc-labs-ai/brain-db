@@ -734,12 +734,17 @@ mod wal_record_projection {
             properties_blob: vec![],
             space_id: SpaceId::default(),
             namespace_id: brain_core::NamespaceId::SYSTEM,
+            session_id: brain_core::SessionId::from(88),
             relation_type_intern_hint: None,
         };
         let r = rec(WalPayload::RelationLink(p));
         let envs = EventEnvelope::from_wal_record(&r);
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].event_type, EventType::EdgeAdded);
+        // Stage 3a: the relation-link record carries the per-utterance
+        // session, so the projected event is scoped to it (not the Stage-2
+        // interim 0).
+        assert_eq!(envs[0].session_id, brain_core::SessionId::from(88));
         let ep = envs[0].edge_payload.as_ref().unwrap();
         assert_eq!(ep.edge_kind_tag, 2, "Typed tag");
         assert_eq!(ep.relation_type_id, Some(42));
@@ -765,6 +770,7 @@ mod wal_record_projection {
             properties_blob: vec![],
             space_id: SpaceId::default(),
             namespace_id: brain_core::NamespaceId::SYSTEM,
+            session_id: brain_core::SessionId::from(88),
             relation_type_intern_hint: None,
         };
         let r = rec(WalPayload::RelationSupersede(RelationSupersedePayload {
@@ -774,6 +780,8 @@ mod wal_record_projection {
         let envs = EventEnvelope::from_wal_record(&r);
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].event_type, EventType::EdgeSuperseded);
+        // Stage 3a: the superseding relation row carries the session.
+        assert_eq!(envs[0].session_id, brain_core::SessionId::from(88));
         let ep = envs[0].edge_payload.as_ref().unwrap();
         assert_eq!(ep.relation_id, Some(relid(6).to_bytes()));
         assert_eq!(ep.superseded_relation_id, Some(relid(5).to_bytes()));

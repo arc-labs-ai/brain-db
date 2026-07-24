@@ -23,6 +23,7 @@ pub fn apply_upsert_relation(
     let Phase::UpsertRelation {
         id,
         ty,
+        session,
         from,
         to,
         confidence,
@@ -87,7 +88,7 @@ pub fn apply_upsert_relation(
     r.properties_blob = properties_blob.clone();
     r.valid_from_unix_nanos = *valid_from_unix_nanos;
     r.valid_to_unix_nanos = *valid_to_unix_nanos;
-    relation_create(wtxn, scope, &r, *extracted_at_unix_nanos)
+    relation_create(wtxn, scope, *session, &r, *extracted_at_unix_nanos)
         .map_err(|e| ApplyError::Metadata(format!("relation_create: {e}")))?;
     Ok(PhaseAck::UpsertedRelation(*id, 1))
 }
@@ -133,8 +134,17 @@ pub fn apply_supersede_relation(
             "expected Supersede with Relation replacement",
         ));
     };
-    relation_supersede(wtxn, scope, *old_id, new_relation.as_ref(), *at_unix_nanos)
-        .map_err(|e| ApplyError::Metadata(format!("relation_supersede: {e}")))?;
+    // Explicit RELATION_SUPERSEDE carries no session on the phase; the
+    // replacement row lands in the default session.
+    relation_supersede(
+        wtxn,
+        scope,
+        brain_core::SessionId::DEFAULT,
+        *old_id,
+        new_relation.as_ref(),
+        *at_unix_nanos,
+    )
+    .map_err(|e| ApplyError::Metadata(format!("relation_supersede: {e}")))?;
     Ok(PhaseAck::Superseded(*target, replacement.id()))
 }
 

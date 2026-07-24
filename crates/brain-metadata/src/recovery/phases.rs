@@ -67,7 +67,10 @@ impl MetadataDb {
                 .map_err(|e| MetadataSinkError::Corruption(format!("entity_create lookup: {e}")))?
                 .is_none()
             {
-                entity_put(&wtxn, scope, &entity)
+                // The WAL body row carries the first-mention session; replay
+                // it so the recovered entity keeps its session provenance
+                // (Entity::from drops it — brain-core has no session slot).
+                entity_put(&wtxn, scope, meta.session(), &entity)
                     .map_err(|e| MetadataSinkError::Corruption(format!("entity_put: {e}")))?;
             }
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
@@ -317,7 +320,10 @@ impl MetadataDb {
                     })?;
                     s.predicate = pid;
                 }
-                statement_create(&wtxn, scope, &s, s.extracted_at_unix_nanos)
+                // The WAL body row carries the per-utterance session; replay
+                // it so the recovered statement keeps its session grouping
+                // (statement_from_metadata drops it — brain-core has no slot).
+                statement_create(&wtxn, scope, b.meta.session(), &s, s.extracted_at_unix_nanos)
                     .map_err(|e| MetadataSinkError::Corruption(format!("statement_create: {e}")))?;
                 if b.predicate_intern_hint.is_some() {
                     stamp_implicit_predicate(&wtxn, s.id)?;
@@ -356,10 +362,15 @@ impl MetadataDb {
                 g.is_some()
             };
             if !already {
-                statement_supersede(&wtxn, b.new.scope(), old_id, &new_s, b.at_unix_nanos)
-                    .map_err(|e| {
-                        MetadataSinkError::Corruption(format!("statement_supersede: {e}"))
-                    })?;
+                statement_supersede(
+                    &wtxn,
+                    b.new.scope(),
+                    b.new.session(),
+                    old_id,
+                    &new_s,
+                    b.at_unix_nanos,
+                )
+                .map_err(|e| MetadataSinkError::Corruption(format!("statement_supersede: {e}")))?;
             }
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
         }
@@ -492,7 +503,7 @@ mod tests {
         let id = e.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &e).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
             wtxn.commit().unwrap();
         }
 
@@ -518,7 +529,7 @@ mod tests {
         let id = e.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &e).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
             wtxn.commit().unwrap();
         }
 
@@ -549,7 +560,7 @@ mod tests {
         let id = e.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &e).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
             wtxn.commit().unwrap();
         }
 
@@ -580,8 +591,8 @@ mod tests {
         let merged_id = merged.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &survivor).unwrap();
-            entity_put(&wtxn, test_scope(), &merged).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &survivor).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &merged).unwrap();
             wtxn.commit().unwrap();
         }
 
@@ -621,8 +632,8 @@ mod tests {
         let merged_id = merged.id;
         {
             let wtxn = db.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &survivor).unwrap();
-            entity_put(&wtxn, test_scope(), &merged).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &survivor).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &merged).unwrap();
             wtxn.commit().unwrap();
         }
         db.apply_entity_merge(
@@ -711,7 +722,7 @@ mod tests {
         let e = person_entity("Subject Person");
         let id = e.id;
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
         id
     }

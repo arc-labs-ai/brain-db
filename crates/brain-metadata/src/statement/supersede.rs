@@ -41,6 +41,7 @@ use super::StatementOpError;
 pub fn statement_supersede(
     wtxn: &WriteTransaction,
     _scope: RowScope,
+    session: brain_core::SessionId,
     old_id: StatementId,
     new_statement: &Statement,
     now_unix_nanos: u64,
@@ -175,8 +176,11 @@ pub fn statement_supersede(
         )?;
     }
 
-    // Insert new statement + all indexes.
-    insert_new_statement(wtxn, scope, &new_to_insert)?;
+    // Insert new statement + all indexes. The new row carries the new
+    // utterance's session (auto-supersede within `statement_create` passes
+    // its create session through; the explicit supersede paths pass the
+    // caller's).
+    insert_new_statement(wtxn, scope, session, &new_to_insert)?;
 
     Ok(new_to_insert.id)
 }
@@ -533,13 +537,14 @@ fn lookup_current_statement(
 pub fn statement_create_with_decision(
     wtxn: &WriteTransaction,
     scope: RowScope,
+    session: brain_core::SessionId,
     new_statement: &Statement,
     decision: SupersedeDecision,
     now_unix_nanos: u64,
 ) -> Result<StatementId, StatementOpError> {
     match decision {
         SupersedeDecision::Supersede(prior) => {
-            statement_supersede(wtxn, scope, prior, new_statement, now_unix_nanos)
+            statement_supersede(wtxn, scope, session, prior, new_statement, now_unix_nanos)
         }
         SupersedeDecision::Contradicts(prior) => {
             // Structured trace so operators can hook it. A first-class
@@ -557,10 +562,10 @@ pub fn statement_create_with_decision(
                 "CONTRADICTION_DETECTED: tiered decider returned Contradicts"
             );
             // Fall through to plain create — both rows coexist.
-            super::crud::statement_create(wtxn, scope, new_statement, now_unix_nanos)
+            super::crud::statement_create(wtxn, scope, session, new_statement, now_unix_nanos)
         }
         SupersedeDecision::Coexist => {
-            super::crud::statement_create(wtxn, scope, new_statement, now_unix_nanos)
+            super::crud::statement_create(wtxn, scope, session, new_statement, now_unix_nanos)
         }
     }
 }
@@ -600,7 +605,7 @@ mod tests {
             1_700_000_000_000_000_000,
         );
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -691,7 +696,7 @@ mod tests {
         let old = fresh_fact_value(subj, pred, "v1", true);
         let old_bucket = confidence_bucket(0.9);
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &old, 1_700_000_000_000_000_000).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &old, 1_700_000_000_000_000_000).unwrap();
         wtxn.commit().unwrap();
 
         // New: confidence 0.3 -> bucket 3. Same subject+predicate, so the
@@ -702,7 +707,7 @@ mod tests {
         assert_ne!(old_bucket, new_bucket);
         let wtxn = db.write_txn().unwrap();
         let new_id =
-            statement_create(&wtxn, test_scope(), &new, 1_700_000_000_000_000_500).unwrap();
+            statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &new, 1_700_000_000_000_000_500).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -798,7 +803,7 @@ mod tests {
 
         let p1 = fresh_pref(subj, pred, "async");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &p1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p1, 0).unwrap();
         wtxn.commit().unwrap();
 
         let p2 = fresh_pref(subj, pred, "written");
@@ -822,7 +827,7 @@ mod tests {
         // Fact stays current.
         p1.is_stateful = false;
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &p1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p1, 0).unwrap();
         wtxn.commit().unwrap();
 
         let mut p2 = fresh_fact_value(subj, pred, "bob", false);
@@ -853,7 +858,7 @@ mod tests {
 
         let p1 = fresh_pref(subj, pred, "async");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &p1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p1, 0).unwrap();
         wtxn.commit().unwrap();
         let wtxn = db.write_txn().unwrap();
         statement_tombstone(&wtxn, p1.id, TombstoneReason::UserRequest, 1).unwrap();
@@ -890,7 +895,7 @@ mod tests {
         let pred = intern_pref(db, pred_name, true);
         let p1 = fresh_pref(subj, pred, "async");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &p1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p1, 0).unwrap();
         wtxn.commit().unwrap();
         let wtxn = db.write_txn().unwrap();
         statement_tombstone(&wtxn, p1.id, TombstoneReason::UserRequest, 1).unwrap();
@@ -1018,7 +1023,7 @@ mod tests {
 
         let p1 = fresh_pref(subj, pred, "async");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &p1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p1, 0).unwrap();
         wtxn.commit().unwrap();
 
         // Same predicate → Tier 0 fires regardless of vector.
@@ -1039,7 +1044,7 @@ mod tests {
 
         let f1 = fresh_fact_value(subj, fact_pred, "alice", true);
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &f1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f1, 0).unwrap();
         wtxn.commit().unwrap();
 
         // New Preference is near a Fact in embedding space — must
@@ -1073,7 +1078,7 @@ mod tests {
 
         let p1 = fresh_pref(subj, pred, "async");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &p1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p1, 0).unwrap();
         wtxn.commit().unwrap();
 
         let p2 = fresh_pref(subj, pred, "remote");
@@ -1081,7 +1086,7 @@ mod tests {
         statement_create_with_decision(
             &wtxn,
             test_scope(),
-            &p2,
+            brain_core::SessionId::DEFAULT, &p2,
             SupersedeDecision::Supersede(p1.id),
             1_700_000_000_000_000_001,
         )
@@ -1111,7 +1116,7 @@ mod tests {
 
         let p1 = fresh_pref(subj, pred, "async");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &p1, 1_700_000_000_000_000_000).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p1, 1_700_000_000_000_000_000).unwrap();
         wtxn.commit().unwrap();
 
         let supersede_now: u64 = 1_700_000_000_000_000_500;
@@ -1120,7 +1125,7 @@ mod tests {
         statement_create_with_decision(
             &wtxn,
             test_scope(),
-            &p2,
+            brain_core::SessionId::DEFAULT, &p2,
             SupersedeDecision::Supersede(p1.id),
             supersede_now,
         )
@@ -1146,7 +1151,7 @@ mod tests {
 
         let p1 = fresh_pref(subj, pred, "async");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &p1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p1, 0).unwrap();
         wtxn.commit().unwrap();
 
         // Use a different predicate to avoid Tier 0 in statement_create.
@@ -1154,7 +1159,7 @@ mod tests {
         let mut p2 = fresh_pref(subj, pred2, "remote");
         p2.is_stateful = false;
         let wtxn = db.write_txn().unwrap();
-        statement_create_with_decision(&wtxn, test_scope(), &p2, SupersedeDecision::Coexist, 0)
+        statement_create_with_decision(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p2, SupersedeDecision::Coexist, 0)
             .unwrap();
         wtxn.commit().unwrap();
 
@@ -1189,7 +1194,7 @@ mod tests {
         let mut seed_t0 = fresh_fact_value(subj_t0, pred_t0, "alice", false);
         seed_t0.is_stateful = false;
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &seed_t0, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &seed_t0, 0).unwrap();
         wtxn.commit().unwrap();
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1282,7 +1287,7 @@ mod tests {
         let pred_st = intern_pref(&mut db, "g_pred_st", true);
         let seed_st = fresh_pref(subj_st, pred_st, "v1");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &seed_st, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &seed_st, 0).unwrap();
         wtxn.commit().unwrap();
 
         // Tier 0 idempotent — current cumulative Fact exists.
@@ -1291,7 +1296,7 @@ mod tests {
         let mut seed_id = fresh_fact_value(subj_id, pred_id, "alice", false);
         seed_id.is_stateful = false;
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &seed_id, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &seed_id, 0).unwrap();
         wtxn.commit().unwrap();
 
         // Tier 1/2/3 — tombstone the prior so Tier 0 misses but the

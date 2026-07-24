@@ -778,7 +778,7 @@ mod tests {
         entity_put(
             &wtxn,
             __ts(),
-            &Entity::new_active(
+            brain_core::SessionId::DEFAULT, &Entity::new_active(
                 subj_id,
                 EntityType::PERSON_ID,
                 format!("Subject{n}"),
@@ -790,7 +790,7 @@ mod tests {
         entity_put(
             &wtxn,
             __ts(),
-            &Entity::new_active(
+            brain_core::SessionId::DEFAULT, &Entity::new_active(
                 obj_id,
                 EntityType::PERSON_ID,
                 format!("Object{n}"),
@@ -826,7 +826,7 @@ mod tests {
             1,
         );
 
-        let id = statement_create(&wtxn, __ts(), &s, now()).unwrap();
+        let id = statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &s, now()).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -883,7 +883,7 @@ mod tests {
         entity_put(
             &wtxn,
             __ts(),
-            &Entity::new_active(
+            brain_core::SessionId::DEFAULT, &Entity::new_active(
                 subj_id,
                 EntityType::PERSON_ID,
                 format!("Melanie{n}"),
@@ -895,7 +895,7 @@ mod tests {
         entity_put(
             &wtxn,
             __ts(),
-            &Entity::new_active(
+            brain_core::SessionId::DEFAULT, &Entity::new_active(
                 obj_id,
                 EntityType::PERSON_ID,
                 format!("CharityRace{n}"),
@@ -930,7 +930,7 @@ mod tests {
             1,
         );
         s.event_at_unix_nanos = event_at;
-        let id = statement_create(&wtxn, __ts(), &s, now()).unwrap();
+        let id = statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &s, now()).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -995,7 +995,7 @@ mod tests {
             entity_put(
                 &wtxn,
                 __ts(),
-                &Entity::new_active(
+                brain_core::SessionId::DEFAULT, &Entity::new_active(
                     subj_id,
                     EntityType::PERSON_ID,
                     "Melanie".to_string(),
@@ -1007,7 +1007,7 @@ mod tests {
             entity_put(
                 &wtxn,
                 __ts(),
-                &Entity::new_active(
+                brain_core::SessionId::DEFAULT, &Entity::new_active(
                     obj_id,
                     EntityType::PERSON_ID,
                     "CharityRace".to_string(),

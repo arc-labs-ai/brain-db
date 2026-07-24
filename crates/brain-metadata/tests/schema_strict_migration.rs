@@ -67,7 +67,7 @@ fn put_anchor_entity(db: &redb::Database) -> EntityId {
     entity_put(
         &wtxn,
         RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16]),
-        &Entity::new_active(id, EntityTypeId(1), "anchor".into(), "anchor".into(), T0),
+        brain_core::SessionId::DEFAULT, &Entity::new_active(id, EntityTypeId(1), "anchor".into(), "anchor".into(), T0),
     )
     .unwrap();
     wtxn.commit().unwrap();
@@ -103,7 +103,7 @@ fn write_statement(
     let sid = statement_create(
         &wtxn,
         RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16]),
-        &stmt,
+        brain_core::SessionId::DEFAULT, &stmt,
         T0,
     )
     .unwrap();

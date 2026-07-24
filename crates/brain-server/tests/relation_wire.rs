@@ -152,6 +152,7 @@ async fn make_entity(client: &mut TcpStream, stream_id: u32, name: &str) -> [u8;
             canonical_name: name.into(),
             aliases: vec![],
             attributes_blob: Vec::new(),
+            session_id: 0,
             request_id: *uuid::Uuid::now_v7().as_bytes(),
             act_as: None,
         }),
@@ -178,6 +179,7 @@ fn create_request(relation_type: &str, from: [u8; 16], to: [u8; 16]) -> Relation
         confidence: 0.9,
         valid_from_unix_nanos: 0,
         valid_to_unix_nanos: 0,
+        session_id: 0,
         request_id: rid(),
         act_as: None,
     }

@@ -370,6 +370,13 @@ pub struct StatementMetadata {
     pub namespace_id: u32,
     /// Owning space (app) — the inner half of the scope key.
     pub space_id_bytes: [u8; 16],
+    /// Conversation/run this statement was extracted from — the REAL
+    /// per-utterance `session_id`, copied from the source memory (or the
+    /// explicit `STATEMENT_CREATE` request). A GROUPING/FILTER column,
+    /// NOT part of the `(namespace, space)` isolation prefix: no
+    /// secondary-index key includes it. `0` is the default session.
+    /// Appended after the scope so old rkyv rows still decode (positional).
+    pub session_id: u64,
     pub chain_root_bytes: [u8; 16],
     pub version: u32,
     /// Fact=0 / Preference=1 / Event=2 per `brain_core::StatementKind`.
@@ -465,6 +472,12 @@ impl StatementMetadata {
     #[must_use]
     pub fn scope(&self) -> RowScope {
         RowScope::from_bytes(self.namespace_id, self.space_id_bytes)
+    }
+
+    /// The conversation/run this statement was extracted from.
+    #[must_use]
+    pub fn session(&self) -> brain_core::SessionId {
+        brain_core::SessionId::from(self.session_id)
     }
 
     #[must_use]
@@ -627,6 +640,10 @@ pub fn metadata_from_statement(s: &Statement, scope: RowScope) -> StatementMetad
         statement_id_bytes: s.id.to_bytes(),
         namespace_id: scope.namespace_id,
         space_id_bytes: scope.space_id_bytes,
+        // Default session; the create/supersede helpers stamp the real
+        // per-utterance session onto the row after building it (the
+        // brain-core `Statement` carries no session slot).
+        session_id: brain_core::SessionId::DEFAULT.raw(),
         chain_root_bytes: s.chain_root.to_bytes(),
         version: s.version,
         kind: s.kind.as_u8(),

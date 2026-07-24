@@ -188,6 +188,7 @@ async fn create_entity(client: &mut TcpStream, stream_id: u32, name: &str) -> [u
         canonical_name: name.into(),
         aliases: vec![],
         attributes_blob: Vec::new(),
+        session_id: 0,
         request_id: rid(),
         act_as: None,
     };
@@ -225,6 +226,7 @@ async fn create_statement_citing(
         valid_to_unix_nanos: 0,
         event_at_unix_nanos: 0,
         schema_version: 0,
+        session_id: 0,
         request_id: rid(),
         act_as: None,
     };

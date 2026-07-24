@@ -110,6 +110,7 @@ pub async fn handle_entity_create(
     let phase = Phase::UpsertEntity {
         id,
         ty: entity_type,
+        session: brain_core::SessionId::from(req.session_id),
         canonical: req.canonical_name.clone(),
         normalized,
         aliases: req.aliases.clone(),
@@ -552,6 +553,8 @@ fn hash_entity_create_request(req: &EntityCreateRequest) -> [u8; 32] {
     }
     h.update(b"\0");
     h.update(&req.attributes_blob);
+    h.update(b"\0");
+    h.update(&req.session_id.to_le_bytes());
     *h.finalize().as_bytes()
 }
 

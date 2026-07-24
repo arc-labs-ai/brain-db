@@ -85,6 +85,7 @@ pub fn allocate_evidence_overflow(
 pub fn statement_create(
     wtxn: &WriteTransaction,
     scope: RowScope,
+    session: brain_core::SessionId,
     s: &Statement,
     now_unix_nanos: u64,
 ) -> Result<StatementId, StatementOpError> {
@@ -136,7 +137,7 @@ pub fn statement_create(
     if (kind_single || pred.is_stateful) && s.kind != StatementKind::Event {
         if let Some(e) = subject_entity {
             if let Some(prior) = find_current_statement(wtxn, scope, e, s.predicate, s.kind)? {
-                return statement_supersede(wtxn, scope, prior, s, now_unix_nanos);
+                return statement_supersede(wtxn, scope, session, prior, s, now_unix_nanos);
             }
         }
     }
@@ -187,7 +188,7 @@ pub fn statement_create(
     let mut to_insert = s.clone();
     recompute_confidence_from_evidence(wtxn, &mut to_insert, now_unix_nanos)?;
 
-    insert_new_statement(wtxn, scope, &to_insert)?;
+    insert_new_statement(wtxn, scope, session, &to_insert)?;
     Ok(to_insert.id)
 }
 
@@ -279,9 +280,14 @@ fn validate_against_predicate(
 pub(super) fn insert_new_statement(
     wtxn: &WriteTransaction,
     scope: RowScope,
+    session: brain_core::SessionId,
     s: &Statement,
 ) -> Result<(), StatementOpError> {
-    let m = metadata_from_statement(s, scope);
+    let mut m = metadata_from_statement(s, scope);
+    // Stamp the real per-utterance session onto the row (the brain-core
+    // `Statement` has no session slot, so `metadata_from_statement`
+    // defaulted it to 0). Session is a grouping column, never a key.
+    m.session_id = session.raw();
     let ns = scope.namespace_id;
     let ag = scope.space_id_bytes;
 
@@ -783,7 +789,7 @@ mod tests {
             1_700_000_000_000_000_000,
         );
         let wtxn = db.write_txn().unwrap();
-        crate::entity::ops::entity_put(&wtxn, test_scope(), &e).unwrap();
+        crate::entity::ops::entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -944,7 +950,7 @@ mod tests {
         let s = fresh_fact(subj, pred, obj);
 
         let wtxn = db.write_txn().unwrap();
-        let id = statement_create(&wtxn, test_scope(), &s, 1_700_000_000_000_000_001).unwrap();
+        let id = statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 1_700_000_000_000_000_001).unwrap();
         wtxn.commit().unwrap();
         assert_eq!(id, s.id);
 
@@ -962,7 +968,7 @@ mod tests {
 
         let s = fresh_fact(subj, pred, obj);
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &s, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1031,13 +1037,13 @@ mod tests {
         // First Preference.
         let p1 = fresh_pref(subj, pred, "async");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &p1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p1, 0).unwrap();
         wtxn.commit().unwrap();
 
         // Second Preference — should auto-supersede.
         let p2 = fresh_pref(subj, pred, "written-agendas");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &p2, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p2, 0).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1062,12 +1068,12 @@ mod tests {
 
         let f1 = fresh_fact(subj, pred, employer1);
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &f1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f1, 0).unwrap();
         wtxn.commit().unwrap();
 
         let f2 = fresh_fact(subj, pred, employer2);
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &f2, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f2, 0).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1093,8 +1099,8 @@ mod tests {
         let f1 = fresh_fact(subj, pred, target1);
         let f2 = fresh_fact(subj, pred, target2);
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &f1, 0).unwrap();
-        statement_create(&wtxn, test_scope(), &f2, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f2, 0).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1118,12 +1124,12 @@ mod tests {
 
         let a1 = fresh_attr(subj, pred, "Paris");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &a1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &a1, 0).unwrap();
         wtxn.commit().unwrap();
 
         let a2 = fresh_attr(subj, pred, "Berlin");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &a2, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &a2, 0).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1149,8 +1155,8 @@ mod tests {
         let e1 = fresh_event(subj, pred, 1_700_000_000);
         let e2 = fresh_event(subj, pred, 1_800_000_000);
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &e1, 0).unwrap();
-        statement_create(&wtxn, test_scope(), &e2, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e2, 0).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1179,7 +1185,7 @@ mod tests {
         s.event_at_unix_nanos = None;
         let wtxn = db.write_txn().unwrap();
         let id =
-            statement_create(&wtxn, test_scope(), &s, 0).expect("dateless Event should persist");
+            statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0).expect("dateless Event should persist");
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1198,7 +1204,7 @@ mod tests {
         let mut s = fresh_fact(subj, pred, obj);
         s.event_at_unix_nanos = Some(123);
         let wtxn = db.write_txn().unwrap();
-        let err = statement_create(&wtxn, test_scope(), &s, 0).unwrap_err();
+        let err = statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0).unwrap_err();
         matches!(err, StatementOpError::InvalidArgument(_))
             .then_some(())
             .expect("expected InvalidArgument");
@@ -1211,7 +1217,7 @@ mod tests {
         let obj = make_entity(&mut db, "x");
         let s = fresh_fact(subj, PredicateId::from(9999), obj);
         let wtxn = db.write_txn().unwrap();
-        let err = statement_create(&wtxn, test_scope(), &s, 0).unwrap_err();
+        let err = statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0).unwrap_err();
         matches!(err, StatementOpError::UnknownPredicate(9999))
             .then_some(())
             .expect("expected UnknownPredicate");
@@ -1225,7 +1231,7 @@ mod tests {
         let phantom_obj = EntityId::new();
         let s = fresh_fact(phantom_subj, pred, phantom_obj);
         let wtxn = db.write_txn().unwrap();
-        let err = statement_create(&wtxn, test_scope(), &s, 0).unwrap_err();
+        let err = statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0).unwrap_err();
         matches!(err, StatementOpError::UnknownSubject(_))
             .then_some(())
             .expect("expected UnknownSubject");
@@ -1250,7 +1256,7 @@ mod tests {
             1_700_000_000_000_000_000,
         );
         let wtxn = db.write_txn().unwrap();
-        crate::entity::ops::entity_put(&wtxn, test_scope(), &e).unwrap();
+        crate::entity::ops::entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -1288,7 +1294,7 @@ mod tests {
 
         let s = fresh_fact(subj, pred, org);
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &s, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1304,7 +1310,7 @@ mod tests {
 
         let s = fresh_fact(subj, pred, person_object);
         let wtxn = db.write_txn().unwrap();
-        let err = statement_create(&wtxn, test_scope(), &s, 0).unwrap_err();
+        let err = statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0).unwrap_err();
         match err {
             StatementOpError::ObjectEntityTypeMismatch {
                 entity,
@@ -1331,7 +1337,7 @@ mod tests {
 
         let s = fresh_fact(subj, pred, concept);
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &s, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0).unwrap();
         wtxn.commit().unwrap();
     }
 
@@ -1343,7 +1349,7 @@ mod tests {
         let mut s = fresh_fact(EntityId::new(), pred, obj);
         s.subject = SubjectRef::Pending(brain_core::AuditId::new());
         let wtxn = db.write_txn().unwrap();
-        let err = statement_create(&wtxn, test_scope(), &s, 0).unwrap_err();
+        let err = statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0).unwrap_err();
         matches!(err, StatementOpError::InvalidArgument(_))
             .then_some(())
             .expect("expected InvalidArgument for Pending subject");
@@ -1361,9 +1367,9 @@ mod tests {
         let f2 = fresh_fact(subj, pred, obj_b);
 
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &f1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f1, 0).unwrap();
         // f2 contradicts f1 on object; both must store.
-        statement_create(&wtxn, test_scope(), &f2, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f2, 0).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1393,17 +1399,17 @@ mod tests {
 
         let f1 = fresh_fact(subj, pred, obj);
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &f1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f1, 0).unwrap();
         wtxn.commit().unwrap();
 
         let f2 = fresh_fact(subj, pred, obj);
         let wtxn = db.write_txn().unwrap();
-        statement_supersede(&wtxn, test_scope(), f1.id, &f2, 1).unwrap();
+        statement_supersede(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, f1.id, &f2, 1).unwrap();
         wtxn.commit().unwrap();
 
         let f3 = fresh_fact(subj, pred, obj);
         let wtxn = db.write_txn().unwrap();
-        statement_supersede(&wtxn, test_scope(), f2.id, &f3, 2).unwrap();
+        statement_supersede(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, f2.id, &f3, 2).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1423,12 +1429,12 @@ mod tests {
         let mut f1 = fresh_fact(subj, pred, obj);
         f1.valid_to_unix_nanos = Some(123_000_000);
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &f1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f1, 0).unwrap();
         wtxn.commit().unwrap();
 
         let f2 = fresh_fact(subj, pred, obj);
         let wtxn = db.write_txn().unwrap();
-        statement_supersede(&wtxn, test_scope(), f1.id, &f2, 999_999_999_999).unwrap();
+        statement_supersede(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, f1.id, &f2, 999_999_999_999).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1445,12 +1451,12 @@ mod tests {
 
         let e1 = fresh_event(subj, pred, 1);
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &e1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e1, 0).unwrap();
         wtxn.commit().unwrap();
 
         let e2 = fresh_event(subj, pred, 2);
         let wtxn = db.write_txn().unwrap();
-        let err = statement_supersede(&wtxn, test_scope(), e1.id, &e2, 0).unwrap_err();
+        let err = statement_supersede(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, e1.id, &e2, 0).unwrap_err();
         matches!(err, StatementOpError::EventCannotSupersede)
             .then_some(())
             .expect("expected EventCannotSupersede");
@@ -1465,7 +1471,7 @@ mod tests {
         let f = fresh_fact(subj, pred, obj);
 
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &f, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f, 0).unwrap();
         wtxn.commit().unwrap();
 
         let wtxn = db.write_txn().unwrap();
@@ -1542,7 +1548,7 @@ mod tests {
         }));
 
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &f, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f, 0).unwrap();
         wtxn.commit().unwrap();
 
         let wtxn = db.write_txn().unwrap();
@@ -1571,17 +1577,17 @@ mod tests {
 
         let p1 = fresh_pref(subj, pred, "v1");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &p1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p1, 0).unwrap();
         wtxn.commit().unwrap();
 
         let p2 = fresh_pref(subj, pred, "v2");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &p2, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p2, 0).unwrap();
         wtxn.commit().unwrap();
 
         let p3 = fresh_pref(subj, pred, "v3");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &p3, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p3, 0).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1605,8 +1611,8 @@ mod tests {
         let p2 = fresh_pref(subj, pred, "v2");
 
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &p1, 0).unwrap();
-        statement_create(&wtxn, test_scope(), &p2, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &p2, 0).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1632,7 +1638,7 @@ mod tests {
         s.confidence = 0.3;
 
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &s, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1675,7 +1681,7 @@ mod tests {
         let overflow_id = allocate_evidence_overflow(&wtxn, &entries, 1).unwrap();
         let mut s = fresh_fact(subj, pred, obj);
         s.evidence = EvidenceRef::Overflow(overflow_id);
-        statement_create(&wtxn, test_scope(), &s, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1731,7 +1737,7 @@ mod tests {
         s.evidence = EvidenceRef::Inline(Box::new(sv));
 
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &s, 1_700_000_000_000_000_000).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 1_700_000_000_000_000_000).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1767,7 +1773,7 @@ mod tests {
         s.evidence = EvidenceRef::Inline(Box::new(sv));
 
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &s, 1_700_000_000_000_000_000).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 1_700_000_000_000_000_000).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
@@ -1792,8 +1798,8 @@ mod tests {
 
         let (id1, id2) = {
             let wtxn = db.write_txn().unwrap();
-            let a = statement_create(&wtxn, test_scope(), &f1, 0).unwrap();
-            let b = statement_create(&wtxn, test_scope(), &f2, 0).unwrap();
+            let a = statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f1, 0).unwrap();
+            let b = statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f2, 0).unwrap();
             wtxn.commit().unwrap();
             (a, b)
         };

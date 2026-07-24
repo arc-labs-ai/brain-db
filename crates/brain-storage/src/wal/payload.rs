@@ -270,6 +270,12 @@ pub struct RelationLinkPayload {
     /// `(namespace, space)` scope must survive a restart for cross-tenant
     /// isolation to hold on the typed-graph after recovery.
     pub namespace_id: NamespaceId,
+    /// The per-utterance session this relation was extracted from. A
+    /// grouping column (never part of the isolation prefix); carried so
+    /// recovery rebuilds the sidecar with its session and subscribe-replay
+    /// routes the event to the right session. `SessionId::DEFAULT` (0)
+    /// when the source memory had no explicit session.
+    pub session_id: SessionId,
     /// Schemaless-path intern hint: `Some((namespace, name))` when the
     /// relation type was not declared at write time, so `relation_type_id`
     /// holds the pre-intern placeholder and recovery re-resolves it
@@ -1206,7 +1212,7 @@ fn encode_relation_link(p: &RelationLinkPayload, out: &mut Vec<u8>) {
     //   evidence_count (4 LE) + evidence_ids (16 * N) ||
     //   extractor_id (4 LE) || is_symmetric (1) ||
     //   properties_blob (4 LE len + bytes) || space_id (16) ||
-    //   namespace_id (4 LE).
+    //   namespace_id (4 LE) || session_id (8 LE).
     out.extend_from_slice(&p.relation_id.to_bytes());
     put_node_ref(out, p.from);
     put_node_ref(out, p.to);
@@ -1226,6 +1232,7 @@ fn encode_relation_link(p: &RelationLinkPayload, out: &mut Vec<u8>) {
     put_blob(out, &p.properties_blob);
     put_uuid_bytes(out, p.space_id.into());
     put_u32_le(out, p.namespace_id.raw());
+    put_u64_le(out, p.session_id.raw());
     // relation_type_intern_hint: tag byte then two length-prefixed strings.
     match &p.relation_type_intern_hint {
         None => out.push(0),
@@ -1260,6 +1267,7 @@ fn decode_relation_link(r: &mut Reader<'_>) -> Result<RelationLinkPayload, WalPa
     let properties_blob = read_blob(r)?;
     let space_id: SpaceId = r.array16()?.into();
     let namespace_id = NamespaceId::from(r.u32_le()?);
+    let session_id = SessionId::from(r.u64_le()?);
     let relation_type_intern_hint = match r.u8()? {
         0 => None,
         1 => {
@@ -1286,6 +1294,7 @@ fn decode_relation_link(r: &mut Reader<'_>) -> Result<RelationLinkPayload, WalPa
         properties_blob,
         space_id,
         namespace_id,
+        session_id,
         relation_type_intern_hint,
     })
 }
@@ -1527,6 +1536,9 @@ mod tests {
             // Non-system namespace so the round-trip proves the field
             // survives the relation-link codec.
             namespace_id: NamespaceId::from(9),
+            // Non-default session so the round-trip proves the session
+            // survives the relation-link codec.
+            session_id: SessionId::from(11),
             relation_type_intern_hint: None,
         }
     }
@@ -2147,6 +2159,7 @@ mod tests {
                 properties_blob,
                 space_id: aid(0x09),
                 namespace_id: NamespaceId::from(3),
+                session_id: SessionId::from(u64::from(extractor_id)),
                 relation_type_intern_hint: None,
             };
             let p = WalPayload::RelationLink(rl);

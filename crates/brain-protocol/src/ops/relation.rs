@@ -31,6 +31,12 @@ pub struct RelationCreateRequest {
     pub confidence: f32,
     pub valid_from_unix_nanos: u64,
     pub valid_to_unix_nanos: u64,
+    /// Optional conversation/run this relation belongs to. `0`
+    /// (`SessionId::DEFAULT`, the default when omitted) is the default
+    /// session. A grouping key, not an isolation boundary — the server
+    /// stamps it onto the relation row for session-scoped read coherence.
+    #[serde(default)]
+    pub session_id: u64,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
     /// Effective identity this relation-create runs as, on behalf of the

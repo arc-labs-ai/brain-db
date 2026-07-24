@@ -84,6 +84,13 @@ pub struct RelationMetadata {
     pub namespace_id: u32,
     /// Owning space (app) — the inner half of the scope key.
     pub space_id_bytes: [u8; 16],
+    /// Conversation/run this relation was extracted from — the REAL
+    /// per-utterance `session_id`, copied from the source memory (or the
+    /// explicit `RELATION_CREATE` request). A GROUPING/FILTER column,
+    /// NOT part of the `(namespace, space)` isolation prefix. `0` is the
+    /// default session. Appended after the scope so old rkyv rows still
+    /// decode (positional).
+    pub session_id: u64,
     pub from_tag: u8,
     pub from_bytes: [u8; 16],
     pub to_tag: u8,
@@ -162,6 +169,12 @@ impl RelationMetadata {
         RowScope::from_bytes(self.namespace_id, self.space_id_bytes)
     }
 
+    /// The conversation/run this relation was extracted from.
+    #[must_use]
+    pub fn session(&self) -> brain_core::SessionId {
+        brain_core::SessionId::from(self.session_id)
+    }
+
     /// Project the `(from, to)` pair as [`EntityId`]s. Returns `None`
     /// if either endpoint is not an `Entity` — typed-graph
     /// relations canonically have entity endpoints; a Memory endpoint
@@ -207,6 +220,10 @@ pub fn metadata_from_relation(r: &Relation, scope: RowScope) -> RelationMetadata
     RelationMetadata {
         namespace_id: scope.namespace_id,
         space_id_bytes: scope.space_id_bytes,
+        // Default session; `relation_create`/`relation_supersede` stamp the
+        // real per-utterance session onto the row after building it (the
+        // brain-core `Relation` carries no session slot).
+        session_id: brain_core::SessionId::DEFAULT.raw(),
         from_tag: NodeRef::Entity(r.from_entity).tag(),
         from_bytes: r.from_entity.to_bytes(),
         to_tag: NodeRef::Entity(r.to_entity).tag(),

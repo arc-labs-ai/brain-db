@@ -656,7 +656,7 @@ fn build_encode_artifacts(
                 ctx.executor.caller_namespace,
                 ctx.executor.caller_space,
             );
-            match crate::handlers::recall::fetch_enrichment_for(&[memory_id], scope, &rtxn) {
+            match crate::handlers::recall::fetch_enrichment_for(&[memory_id], scope, None, &rtxn) {
                 Ok(mut enr) => {
                     let g = enr.pop().unwrap_or_else(|| {
                         brain_protocol::envelope::response::GraphEnrichment {

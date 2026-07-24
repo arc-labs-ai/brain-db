@@ -307,7 +307,7 @@ mod tests {
             1_700_000_000_000_000_000,
         );
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -355,7 +355,7 @@ mod tests {
             symmetric,
         );
         let wtxn = db.write_txn().unwrap();
-        let id = relation_create(&wtxn, test_scope(), &r, 0).unwrap();
+        let id = relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0).unwrap();
         wtxn.commit().unwrap();
         id
     }

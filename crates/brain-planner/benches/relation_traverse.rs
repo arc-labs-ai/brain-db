@@ -105,7 +105,7 @@ fn build_entity_fixture() -> EntityFixture {
                 normalize_name(&name),
                 T0,
             );
-            entity_put(&wtxn, __ts(), &e).expect("entity_put");
+            entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &e).expect("entity_put");
             entities.push(id);
         }
         wtxn.commit().expect("commit");
@@ -144,7 +144,7 @@ fn build_entity_fixture() -> EntityFixture {
             // Cardinality conflicts silently auto-supersede or error;
             // both are fine for the bench fixture (we just want
             // realistic row counts).
-            let _ = relation_create(&wtxn, __ts(), &r, T0);
+            let _ = relation_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &r, T0);
         }
         wtxn.commit().expect("commit");
     }

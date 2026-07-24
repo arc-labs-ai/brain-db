@@ -113,7 +113,7 @@ fn recover_rebuilds_statements_with_join() {
     {
         let entity = Entity::new_active(alice, type_id, "Alice".into(), "alice".into(), 0);
         let wtxn = metadata.write_txn().expect("wtxn");
-        entity_put(&wtxn, __ts(), &entity).expect("entity_put");
+        entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &entity).expect("entity_put");
         wtxn.commit().expect("commit");
     }
     let pred: PredicateId = {
@@ -136,7 +136,7 @@ fn recover_rebuilds_statements_with_join() {
             1,
         );
         let wtxn = metadata.write_txn().expect("wtxn");
-        let id = statement_create(&wtxn, __ts(), &stmt, 0).expect("create");
+        let id = statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, 0).expect("create");
         wtxn.commit().expect("commit");
         id
     };

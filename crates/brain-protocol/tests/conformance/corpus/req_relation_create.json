@@ -63,6 +63,7 @@
   "confidence": 0.9,
   "valid_from_unix_nanos": 1700000000000000000,
   "valid_to_unix_nanos": 0,
+  "session_id": 9,
   "request_id": [
     17,
     17,

@@ -240,7 +240,7 @@ fn alias_lookup_normalises_case() {
     let target = e.id;
     {
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
     }
     for variant in ["priya", "PRIYA", "Priya", "  PrIyA  "] {

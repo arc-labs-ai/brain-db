@@ -188,6 +188,7 @@ pub async fn handle_relation_create(
     let phase = Phase::UpsertRelation {
         id: new_id,
         ty: resolved_ty,
+        session: brain_core::SessionId::from(req.session_id),
         from: EntityId::from(req.from_entity),
         to: EntityId::from(req.to_entity),
         confidence: req.confidence,
@@ -976,6 +977,7 @@ fn hash_relation_create_request(req: &RelationCreateRequest) -> [u8; 32] {
     h.update(&req.confidence.to_le_bytes());
     h.update(&req.valid_from_unix_nanos.to_le_bytes());
     h.update(&req.valid_to_unix_nanos.to_le_bytes());
+    h.update(&req.session_id.to_le_bytes());
     *h.finalize().as_bytes()
 }
 

@@ -47,7 +47,7 @@ fn put_entity(metadata: &mut MetadataDb, name: &str, type_id: EntityTypeId) -> E
     let id = EntityId::new();
     let entity = Entity::new_active(id, type_id, name.into(), name.to_lowercase(), 0);
     let wtxn = metadata.write_txn().expect("wtxn");
-    entity_put(&wtxn, __ts(), &entity).expect("entity_put");
+    entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &entity).expect("entity_put");
     wtxn.commit().expect("commit");
     id
 }
@@ -82,7 +82,7 @@ fn create_statement(
         1,
     );
     let wtxn = metadata.write_txn().expect("wtxn");
-    let id = statement_create(&wtxn, __ts(), &stmt, 0).expect("create");
+    let id = statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, 0).expect("create");
     wtxn.commit().expect("commit");
     id
 }
@@ -107,7 +107,7 @@ fn create_event_statement(
     );
     stmt.event_at_unix_nanos = Some(event_at_ms.saturating_mul(1_000_000));
     let wtxn = metadata.write_txn().expect("wtxn");
-    let id = statement_create(&wtxn, __ts(), &stmt, 0).expect("create");
+    let id = statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, 0).expect("create");
     wtxn.commit().expect("commit");
     id
 }
@@ -189,7 +189,7 @@ fn create_relation(
         false,
     );
     let wtxn = metadata.write_txn().expect("wtxn");
-    let id = relation_create(&wtxn, __ts(), &r, 0).expect("relation_create");
+    let id = relation_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &r, 0).expect("relation_create");
     wtxn.commit().expect("commit");
     id
 }
@@ -710,7 +710,7 @@ fn as_of_filter_in_chain_drops_invalidated_statement() {
     );
     p1.is_stateful = true;
     let wtxn = metadata.write_txn().unwrap();
-    let p1_id = brain_metadata::statement::statement_create(&wtxn, __ts(), &p1, 1_000).unwrap();
+    let p1_id = brain_metadata::statement::statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &p1, 1_000).unwrap();
     wtxn.commit().unwrap();
 
     // Supersede at t = 2_000.
@@ -729,7 +729,7 @@ fn as_of_filter_in_chain_drops_invalidated_statement() {
     p2.is_stateful = true;
     let wtxn = metadata.write_txn().unwrap();
     let p2_id =
-        brain_metadata::statement::statement_supersede(&wtxn, __ts(), p1_id, &p2, 2_000).unwrap();
+        brain_metadata::statement::statement_supersede(&wtxn, __ts(), brain_core::SessionId::DEFAULT, p1_id, &p2, 2_000).unwrap();
     wtxn.commit().unwrap();
 
     // as_of = 1_500 → only p1 should pass (p2 didn't exist yet, p1

@@ -99,7 +99,7 @@ fn put_subject(metadata: &SharedMetadataDb) -> EntityId {
     entity_put(
         &wtxn,
         __ts(),
-        &Entity::new_active(
+        brain_core::SessionId::DEFAULT, &Entity::new_active(
             id,
             EntityType::PERSON_ID,
             "anchor".into(),
@@ -139,7 +139,7 @@ fn write_statement(
         1,
     );
     let sid = stmt.id;
-    statement_create(&wtxn, __ts(), &stmt, NOW).unwrap();
+    statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, NOW).unwrap();
     wtxn.commit().unwrap();
     sid
 }

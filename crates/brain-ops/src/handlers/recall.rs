@@ -2583,6 +2583,7 @@ fn cosine(a: &[f32; brain_embed::VECTOR_DIM], b: &[f32; brain_embed::VECTOR_DIM]
 pub(crate) fn fetch_enrichment_for(
     memory_ids: &[MemoryId],
     scope: brain_metadata::RowScope,
+    session_filter: Option<&HashSet<u64>>,
     rtxn: &redb::ReadTransaction,
 ) -> Result<Vec<brain_protocol::envelope::response::GraphEnrichment>, OpError> {
     use brain_core::{EdgeKindRef, NodeRef};
@@ -2590,10 +2591,12 @@ pub(crate) fn fetch_enrichment_for(
     use brain_metadata::entity::ops::entity_get;
     use brain_metadata::relation::types::relation_type_get;
     use brain_metadata::schema::predicate::predicate_get;
-    use brain_metadata::statement::statement_get;
     use brain_metadata::tables::edge::{walk_incoming, walk_outgoing};
     use brain_metadata::tables::entity_type::ENTITY_TYPES_TABLE;
-    use brain_metadata::tables::statement::STATEMENTS_BY_EVIDENCE_TABLE;
+    use brain_metadata::tables::relation::{RelationMetadata, RELATION_METADATA_TABLE};
+    use brain_metadata::tables::statement::{
+        statement_from_metadata, StatementMetadata, STATEMENTS_BY_EVIDENCE_TABLE, STATEMENTS_TABLE,
+    };
     use brain_protocol::envelope::response::{
         EnrichedEntity, EnrichedRelation, EnrichedStatement, GraphEnrichment,
     };
@@ -2606,6 +2609,16 @@ pub(crate) fn fetch_enrichment_for(
         OpError::Internal(format!(
             "include_graph: open STATEMENTS_BY_EVIDENCE_TABLE: {e}"
         ))
+    })?;
+    // The statement/relation sidecars carry the per-utterance `session_id`;
+    // read them directly so `session_filter` (already applied to memories)
+    // also gates the graph rows — "session N" shows its memories AND its
+    // graph. Session is a grouping column, never a key.
+    let statements_table = rtxn.open_table(STATEMENTS_TABLE).map_err(|e| {
+        OpError::Internal(format!("include_graph: open STATEMENTS_TABLE: {e}"))
+    })?;
+    let relation_meta_table = rtxn.open_table(RELATION_METADATA_TABLE).map_err(|e| {
+        OpError::Internal(format!("include_graph: open RELATION_METADATA_TABLE: {e}"))
     })?;
 
     let mut out: Vec<GraphEnrichment> = Vec::with_capacity(memory_ids.len());
@@ -2665,9 +2678,22 @@ pub(crate) fn fetch_enrichment_for(
                     .map_err(|e| OpError::Internal(format!("include_graph: evidence row: {e}")))?;
                 let (_ns, _space, _mem_bytes, sid_bytes) = k.value();
                 let sid = StatementId::from_bytes(sid_bytes);
-                if let Some(stmt) = statement_get(rtxn, sid)
-                    .map_err(|e| OpError::Internal(format!("include_graph: statement_get: {e}")))?
-                {
+                let row: Option<StatementMetadata> = statements_table
+                    .get(&sid.to_bytes())
+                    .map_err(|e| OpError::Internal(format!("include_graph: statement row: {e}")))?
+                    .map(|g| g.value());
+                let Some(m) = row else {
+                    continue;
+                };
+                // Session coherence: drop statements outside the requested
+                // session(s) so a session-scoped read's graph matches its
+                // memories.
+                if let Some(sf) = session_filter {
+                    if !sf.contains(&m.session_id) {
+                        continue;
+                    }
+                }
+                if let Some(stmt) = statement_from_metadata(&m) {
                     if !stmt.tombstoned {
                         stmts.push(stmt);
                     }
@@ -2744,7 +2770,7 @@ pub(crate) fn fetch_enrichment_for(
                     walk_incoming(rtxn, NodeRef::Entity(*eid), None)
                 }
                 .map_err(|e| OpError::Internal(format!("include_graph: walk relation: {e}")))?;
-                for (kind, other, _disamb, data) in rows {
+                for (kind, other, disamb, data) in rows {
                     let typed_id = match kind {
                         EdgeKindRef::Typed(rt_id) => rt_id,
                         _ => continue,
@@ -2753,6 +2779,25 @@ pub(crate) fn fetch_enrichment_for(
                         NodeRef::Entity(oid) => oid,
                         _ => continue,
                     };
+                    // Session coherence: the typed-edge disambiguator is the
+                    // relation id, keying its sidecar (which carries the
+                    // per-utterance session). Drop relations outside the
+                    // requested session(s) so a session-scoped read's graph
+                    // matches its memories.
+                    if let Some(sf) = session_filter {
+                        let sidecar: Option<RelationMetadata> = relation_meta_table
+                            .get(&disamb)
+                            .map_err(|e| {
+                                OpError::Internal(format!("include_graph: relation sidecar: {e}"))
+                            })?
+                            .map(|g| g.value());
+                        match sidecar {
+                            Some(rm) if sf.contains(&rm.session_id) => {}
+                            // Drop both a foreign-session relation and one
+                            // whose sidecar is missing (can't prove it belongs).
+                            _ => continue,
+                        }
+                    }
                     let Some(rt) = relation_type_get(rtxn, typed_id).map_err(|e| {
                         OpError::Internal(format!("include_graph: relation_type_get: {e}"))
                     })?
@@ -2900,7 +2945,7 @@ fn project_memory_results(
             .collect();
         let scope =
             brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
-        let enriched = fetch_enrichment_for(&ids, scope, &rtxn)?;
+        let enriched = fetch_enrichment_for(&ids, scope, session_filter.as_ref(), &rtxn)?;
         Some(ids.into_iter().zip(enriched).collect())
     } else {
         None
@@ -3927,7 +3972,7 @@ mod tests {
             brain_metadata::entity::ops::entity_put(
                 &wtxn,
                 scope,
-                &Entity::new_active(id, EntityType::PERSON_ID, name.into(), name.into(), 1),
+                brain_core::SessionId::DEFAULT, &Entity::new_active(id, EntityType::PERSON_ID, name.into(), name.into(), 1),
             )
             .unwrap();
         }
@@ -3959,7 +4004,7 @@ mod tests {
         let s_chess = mk(x, p_plays, "chess"); // off-cue (its hit is below the floor)
         let s_cricket = mk(y, p_plays, "cricket"); // WRONG subject (Y, not the anchor)
         for s in [&s_soccer, &s_tennis, &s_soccer_dup, &s_chess, &s_cricket] {
-            brain_metadata::statement::crud::statement_create(&wtxn, scope, s, 1).unwrap();
+            brain_metadata::statement::crud::statement_create(&wtxn, scope, brain_core::SessionId::DEFAULT, s, 1).unwrap();
         }
         wtxn.commit().unwrap();
 

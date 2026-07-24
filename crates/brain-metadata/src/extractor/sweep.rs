@@ -475,7 +475,7 @@ mod reclaim_tests {
             T0,
         );
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -520,7 +520,7 @@ mod reclaim_tests {
         let p = intern_fact(db, pred, false);
         let s = fresh_fact(subj, p, obj);
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &s, T0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, T0).unwrap();
         wtxn.commit().unwrap();
         let wtxn = db.write_txn().unwrap();
         statement_retract(&wtxn, s.id, TombstoneReason::Retract, T0).unwrap();
@@ -563,7 +563,7 @@ mod reclaim_tests {
         let p = intern_fact(&mut db, "p_tomb", false);
         let s = fresh_fact(subj, p, obj);
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &s, T0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, T0).unwrap();
         wtxn.commit().unwrap();
         let wtxn = db.write_txn().unwrap();
         statement_tombstone(&wtxn, s.id, TombstoneReason::UserRequest, T0).unwrap();
@@ -588,11 +588,11 @@ mod reclaim_tests {
         let f1 = fresh_fact(subj, p, o1);
         let f2 = fresh_fact(subj, p, o2);
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &f1, T0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f1, T0).unwrap();
         wtxn.commit().unwrap();
         // f2 auto-supersedes f1 (stateful predicate).
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &f2, T0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f2, T0).unwrap();
         wtxn.commit().unwrap();
 
         let now = T0 + GRACE * 10;
@@ -654,7 +654,7 @@ mod reclaim_tests {
         s.evidence = EvidenceRef::Inline(Box::new(sv));
 
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &s, T0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, T0).unwrap();
         wtxn.commit().unwrap();
         let wtxn = db.write_txn().unwrap();
         statement_retract(&wtxn, s.id, TombstoneReason::Retract, T0).unwrap();
@@ -743,11 +743,11 @@ mod reclaim_tests {
         let f1 = fresh_fact(subj, p, o1);
         let f2 = fresh_fact(subj, p, o2);
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &f1, T0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f1, T0).unwrap();
         wtxn.commit().unwrap();
         let wtxn = db.write_txn().unwrap();
         // f2 auto-supersedes f1 → f1 mid-chain, f2 tail.
-        statement_create(&wtxn, test_scope(), &f2, T0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f2, T0).unwrap();
         wtxn.commit().unwrap();
 
         // Confirm chain shape before retract.

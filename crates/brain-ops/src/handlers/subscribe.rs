@@ -328,7 +328,9 @@ impl EventEnvelope {
                 lsn,
                 event_type: EventType::EdgeAdded,
                 memory_id: MemoryId::NULL,
-                session_id: SessionId::default(),
+                // The relation-link record now carries the per-utterance
+                // session; deliver the event scoped to it (Stage 2 filled 0).
+                session_id: p.session_id,
                 kind: MemoryKind::Episodic,
                 salience: 0.0,
                 timestamp_unix_nanos,
@@ -352,7 +354,8 @@ impl EventEnvelope {
                 lsn,
                 event_type: EventType::EdgeSuperseded,
                 memory_id: MemoryId::NULL,
-                session_id: SessionId::default(),
+                // The new relation row carries the per-utterance session.
+                session_id: p.new.session_id,
                 kind: MemoryKind::Episodic,
                 salience: 0.0,
                 timestamp_unix_nanos,

@@ -233,9 +233,12 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
         // full entity row, replayed via `entity_put` (the same helper the
         // live apply path calls). Built through `entity_from_upsert_phase`
         // so the WAL row matches what apply persists.
-        Phase::UpsertEntity { .. } => {
+        Phase::UpsertEntity { session, .. } => {
             let e = entity_from_upsert_phase(phase)?;
-            let meta = EntityMetadata::from_entity(&e, scope);
+            let mut meta = EntityMetadata::from_entity(&e, scope);
+            // Carry the first-mention session on the WAL body so recovery
+            // rebuilds the entity with its session provenance.
+            meta.session_id = session.raw();
             let body = encode_entity_create(&meta);
             Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
                 WalRecordKind::EntityCreate,
@@ -249,13 +252,18 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
         // schemaless intern hint; recovery re-resolves the predicate when
         // the hint is present (see phase_bodies::StatementCreateBody).
         Phase::UpsertStatement {
+            session,
             predicate,
             predicate_intern_hint,
             ..
         } => {
             let s = statement_from_upsert_phase(phase, *predicate)?;
+            // Stamp the per-utterance session on the WAL body row so
+            // recovery replays the statement into the right session.
+            let mut meta = metadata_from_statement(&s, scope);
+            meta.session_id = session.raw();
             let body = encode_statement_create(&StatementCreateBody {
-                meta: metadata_from_statement(&s, scope),
+                meta,
                 predicate_intern_hint: predicate_intern_hint.clone(),
             });
             Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
@@ -312,6 +320,9 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
                 properties_blob: new_rel.properties_blob.clone(),
                 space_id: write.space_id,
                 namespace_id: write.namespace,
+                // Explicit RELATION_SUPERSEDE carries no session on the
+                // phase; the replacement lands in the default session.
+                session_id: brain_core::SessionId::DEFAULT,
                 relation_type_intern_hint: None,
             },
         })),
@@ -323,6 +334,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
         Phase::UpsertRelation {
             id,
             ty,
+            session,
             from,
             to,
             confidence,
@@ -350,6 +362,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             properties_blob: properties_blob.clone(),
             space_id: write.space_id,
             namespace_id: write.namespace,
+            session_id: *session,
             relation_type_intern_hint: relation_type_intern_hint.clone(),
         })),
 
@@ -522,6 +535,7 @@ mod tests {
         let phase = Phase::UpsertEntity {
             id: EntityId::new(),
             ty: EntityTypeId::from(1),
+            session: SessionId::DEFAULT,
             canonical: "Priya Patel".into(),
             normalized: "priya patel".into(),
             aliases: vec!["priya".into()],
@@ -648,6 +662,7 @@ mod tests {
         let phase = Phase::UpsertStatement {
             id: StatementId::new(),
             kind: StatementKind::Fact,
+            session: SessionId::DEFAULT,
             subject: SubjectRef::Entity(EntityId::new()),
             predicate: PredicateId::from(0),
             object: StatementObject::Value(StatementValue::Text("blue".into())),
@@ -691,6 +706,7 @@ mod tests {
         let phase = Phase::UpsertRelation {
             id,
             ty: RelationTypeId::from(0),
+            session: SessionId::DEFAULT,
             from,
             to: EntityId::new(),
             confidence: 0.9,

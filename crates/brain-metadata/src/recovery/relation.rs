@@ -221,6 +221,9 @@ fn write_relation_link(
     let meta = RelationMetadata {
         namespace_id: scope.namespace_id,
         space_id_bytes: scope.space_id_bytes,
+        // The WAL payload carries the per-utterance session; recovery
+        // rebuilds the sidecar with it so the relation keeps its grouping.
+        session_id: p.session_id.raw(),
         from_tag: p.from.tag(),
         from_bytes: p.from.id_bytes(),
         to_tag: p.to.tag(),

@@ -670,7 +670,7 @@ mod tests {
             NOW,
         );
         let wtxn = d.write_txn().unwrap();
-        entity_put(&wtxn, __ts(), &ent).unwrap();
+        entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &ent).unwrap();
         wtxn.commit().unwrap();
         hnsw.write().insert(id, &vector).unwrap();
         id

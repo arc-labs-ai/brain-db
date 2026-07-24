@@ -1385,7 +1385,12 @@ pub fn resolve_or_create_with_deps(
         now_unix_nanos,
     );
     entity.mention_count = 1;
-    entity_put(wtxn, scope, &entity)?;
+    // Entity identity is session-agnostic; the resolver runs the same
+    // gauntlet across every session, so a resolver-minted entity carries
+    // the default session as its (non-load-bearing) first-mention
+    // provenance sentinel. The per-utterance session lives on the
+    // statements/relations that cite this entity, not on the entity.
+    entity_put(wtxn, scope, brain_core::SessionId::DEFAULT, &entity)?;
 
     // Minting a new node is normal much of the time, but it is also the
     // exact event that grows entity cardinality. Record it at debug so a
@@ -1805,7 +1810,7 @@ mod tests {
         let existing_id = existing.id;
         {
             let wtxn = d.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &existing).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &existing).unwrap();
             wtxn.commit().unwrap();
         }
         let wtxn = d.write_txn().unwrap();
@@ -1831,7 +1836,7 @@ mod tests {
         let id = existing.id;
         {
             let wtxn = d.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &existing).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &existing).unwrap();
             wtxn.commit().unwrap();
         }
         let wtxn = d.write_txn().unwrap();
@@ -1856,7 +1861,7 @@ mod tests {
         let full_id = full.id;
         {
             let wtxn = d.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &full).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &full).unwrap();
             wtxn.commit().unwrap();
         }
         // A bare first-name reference must coref onto the full-name entity
@@ -1885,7 +1890,7 @@ mod tests {
                 NOW,
             );
             let wtxn = d.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &e).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
             wtxn.commit().unwrap();
         }
         // "Niraj" is a subset of TWO distinct people → ambiguous → must not
@@ -1918,7 +1923,7 @@ mod tests {
         let full_id = full.id;
         {
             let wtxn = d.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &full).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &full).unwrap();
             wtxn.commit().unwrap();
         }
         let wtxn = d.write_txn().unwrap();
@@ -1945,7 +1950,7 @@ mod tests {
                 NOW,
             );
             let wtxn = d.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &e).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
             wtxn.commit().unwrap();
         }
         let wtxn = d.write_txn().unwrap();
@@ -1976,7 +1981,7 @@ mod tests {
         let caroline_id = caroline.id;
         {
             let wtxn = d.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &caroline).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &caroline).unwrap();
             wtxn.commit().unwrap();
         }
         let wtxn = d.write_txn().unwrap();
@@ -2086,7 +2091,7 @@ mod tests {
                 NOW,
             );
             let wtxn = d.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &e).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
             wtxn.commit().unwrap();
         }
         let wtxn = d.write_txn().unwrap();
@@ -2168,7 +2173,7 @@ mod tests {
         let mel_id = mel.id;
         {
             let wtxn = d.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &mel).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &mel).unwrap();
             wtxn.commit().unwrap();
         }
         for surface in ["Hey Mel", "Thanks Mel", "Yeah Mel", "Wow Mel"] {
@@ -2340,8 +2345,8 @@ mod tests {
         let target_id = target.id;
         {
             let wtxn = d.write_txn().unwrap();
-            entity_put(&wtxn, test_scope(), &target).unwrap();
-            entity_put(&wtxn, test_scope(), &other).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &target).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &other).unwrap();
             wtxn.commit().unwrap();
         }
         // Tier-3 fuzzy: typo'd surface form should resolve to target.
@@ -2474,7 +2479,7 @@ mod tests {
         );
         let person_id = person_apple.id;
         let wtxn = d.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &person_apple).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &person_apple).unwrap();
         wtxn.commit().unwrap();
         // Now resolve "Apple" under a THIRD type: two cross-type matches exist
         // → ambiguous → mint a fresh entity rather than conflate them.
@@ -2659,7 +2664,7 @@ mod tests {
             NOW,
         );
         let wtxn = d.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &ent).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &ent).unwrap();
         wtxn.commit().unwrap();
         hnsw.write().insert(id, &vector).unwrap();
         id

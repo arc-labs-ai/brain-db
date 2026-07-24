@@ -140,6 +140,14 @@ pub struct EntityMetadata {
     pub namespace_id: u32,
     /// Owning space (app) — the inner half of the scope key.
     pub space_id_bytes: [u8; 16],
+    /// FIRST-MENTION provenance only: the session that first created this
+    /// entity. Entity identity is session-AGNOSTIC — the same "Priya"
+    /// appears across sessions 3 and 7 — so this is NOT the per-utterance
+    /// session (statements/relations carry that) and is NEVER overwritten
+    /// on a later mention. A GROUPING/FILTER column, never part of the
+    /// `(namespace, space)` isolation prefix. `0` is the default session.
+    /// Appended after the scope so old rkyv rows still decode (positional).
+    pub session_id: u64,
     pub entity_type_id: u32,
     pub canonical_name: String,
     pub normalized_name: String,
@@ -173,6 +181,9 @@ impl EntityMetadata {
             entity_id_bytes: entity_id.to_bytes(),
             namespace_id: scope.namespace_id,
             space_id_bytes: scope.space_id_bytes,
+            // Default first-mention session; `entity_put` stamps the real
+            // one on create and `entity_update` preserves the existing one.
+            session_id: brain_core::SessionId::DEFAULT.raw(),
             entity_type_id: entity_type_id.raw(),
             canonical_name,
             normalized_name,
@@ -196,6 +207,11 @@ impl EntityMetadata {
             entity_id_bytes: e.id.to_bytes(),
             namespace_id: scope.namespace_id,
             space_id_bytes: scope.space_id_bytes,
+            // Default first-mention session; `entity_put` stamps it on
+            // create and `entity_update` re-stamps the existing row's
+            // session so a later mention never overwrites it (the
+            // brain-core `Entity` carries no session slot).
+            session_id: brain_core::SessionId::DEFAULT.raw(),
             entity_type_id: e.entity_type.raw(),
             canonical_name: e.canonical_name.clone(),
             normalized_name: e.normalized_name.clone(),
@@ -231,6 +247,12 @@ impl EntityMetadata {
     #[must_use]
     pub fn scope(&self) -> RowScope {
         RowScope::from_bytes(self.namespace_id, self.space_id_bytes)
+    }
+
+    /// First-mention session provenance (session-agnostic identity).
+    #[must_use]
+    pub fn session(&self) -> brain_core::SessionId {
+        brain_core::SessionId::from(self.session_id)
     }
 
     #[must_use]

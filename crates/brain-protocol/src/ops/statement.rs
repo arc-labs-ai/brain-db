@@ -156,6 +156,13 @@ pub struct StatementCreateRequest {
     pub valid_to_unix_nanos: u64,
     pub event_at_unix_nanos: u64,
     pub schema_version: u32,
+    /// Optional conversation/run this statement belongs to. `0`
+    /// (`SessionId::DEFAULT`, the default when omitted) is the default
+    /// session. A grouping key, not an isolation boundary — the server
+    /// stamps it onto the statement row so a session-scoped RECALL shows
+    /// this statement alongside its session's memories.
+    #[serde(default)]
+    pub session_id: u64,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
     /// Effective identity this statement-create runs as, on behalf of the
@@ -300,6 +307,7 @@ mod tests_req {
             valid_to_unix_nanos: 0,
             event_at_unix_nanos: 0,
             schema_version: 1,
+            session_id: 0,
             request_id: sample_uuid(2),
             act_as: None,
         }

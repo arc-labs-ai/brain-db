@@ -71,7 +71,7 @@ fn build_fixture(n: usize) -> Fixture {
                 normalize_name(&subj_name),
                 now,
             );
-            entity_put(&wtxn, bench_scope(), &subj).expect("subj entity_put");
+            entity_put(&wtxn, bench_scope(), brain_core::SessionId::DEFAULT, &subj).expect("subj entity_put");
 
             let obj_id = EntityId::new();
             let obj_name = format!("robj_{i}");
@@ -82,7 +82,7 @@ fn build_fixture(n: usize) -> Fixture {
                 normalize_name(&obj_name),
                 now,
             );
-            entity_put(&wtxn, bench_scope(), &obj).expect("obj entity_put");
+            entity_put(&wtxn, bench_scope(), brain_core::SessionId::DEFAULT, &obj).expect("obj entity_put");
 
             let rel_id = RelationId::new();
             let r = Relation::new_root(
@@ -96,7 +96,7 @@ fn build_fixture(n: usize) -> Fixture {
                 now,
                 /* symmetric */ false,
             );
-            relation_create(&wtxn, bench_scope(), &r, now).expect("relation_create");
+            relation_create(&wtxn, bench_scope(), brain_core::SessionId::DEFAULT, &r, now).expect("relation_create");
             seeded.push((subj_id, rel_id));
         }
         wtxn.commit().expect("commit");
@@ -142,8 +142,8 @@ fn bench_relation_create(c: &mut Criterion) {
                 normalize_name(&o_name),
                 now,
             );
-            entity_put(&wtxn, bench_scope(), &se).expect("se");
-            entity_put(&wtxn, bench_scope(), &oe).expect("oe");
+            entity_put(&wtxn, bench_scope(), brain_core::SessionId::DEFAULT, &se).expect("se");
+            entity_put(&wtxn, bench_scope(), brain_core::SessionId::DEFAULT, &oe).expect("oe");
         }
         wtxn.commit().expect("commit");
     }
@@ -166,7 +166,7 @@ fn bench_relation_create(c: &mut Criterion) {
                 false,
             );
             let wtxn = fixture.db.write_txn().expect("write_txn");
-            relation_create(&wtxn, bench_scope(), black_box(&r), now).expect("create");
+            relation_create(&wtxn, bench_scope(), brain_core::SessionId::DEFAULT, black_box(&r), now).expect("create");
             wtxn.commit().expect("commit");
         });
     });

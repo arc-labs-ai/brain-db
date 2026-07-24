@@ -405,7 +405,7 @@ mod tests {
         entity_put(
             &wtxn,
             __ts(),
-            &Entity::new_active(
+            brain_core::SessionId::DEFAULT, &Entity::new_active(
                 id,
                 EntityType::PERSON_ID,
                 "anchor".into(),
@@ -444,7 +444,7 @@ mod tests {
             NOW,
             1,
         );
-        let sid = statement_create(&wtxn, __ts(), &stmt, NOW).unwrap();
+        let sid = statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, NOW).unwrap();
         wtxn.commit().unwrap();
         (sid, pid)
     }

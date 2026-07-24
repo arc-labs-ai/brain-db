@@ -81,25 +81,25 @@
     "name": "req_entity_create",
     "opcode": "0x0130",
     "kind": "request",
-    "payload_len": 123
+    "payload_len": 135
   },
   {
     "name": "req_entity_create_act_as",
     "opcode": "0x0130",
     "kind": "request",
-    "payload_len": 179
+    "payload_len": 191
   },
   {
     "name": "req_statement_create",
     "opcode": "0x0140",
     "kind": "request",
-    "payload_len": 267
+    "payload_len": 279
   },
   {
     "name": "req_relation_create",
     "opcode": "0x0150",
     "kind": "request",
-    "payload_len": 245
+    "payload_len": 257
   },
   {
     "name": "req_schema_upload",

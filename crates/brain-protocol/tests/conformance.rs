@@ -497,6 +497,7 @@ fn sample_statement_create() -> StatementCreateRequest {
         valid_to_unix_nanos: 0,
         event_at_unix_nanos: 0,
         schema_version: 1,
+        session_id: 7,
         request_id: RID,
         act_as: None,
     }
@@ -513,6 +514,7 @@ fn sample_relation_create() -> RelationCreateRequest {
         confidence: 0.9,
         valid_from_unix_nanos: 1_700_000_000_000_000_000,
         valid_to_unix_nanos: 0,
+        session_id: 9,
         request_id: RID,
         act_as: None,
     }
@@ -1200,6 +1202,7 @@ fn corpus() -> Vec<Case> {
         canonical_name: "Ada".into(),
         aliases: vec!["Ada L.".into()],
         attributes_blob: b"role=engineer".to_vec(),
+        session_id: 0,
         request_id: RID,
         act_as: None,
     };
@@ -1215,6 +1218,7 @@ fn corpus() -> Vec<Case> {
         canonical_name: "Ada".into(),
         aliases: vec!["Ada L.".into()],
         attributes_blob: b"role=engineer".to_vec(),
+        session_id: 0,
         request_id: RID,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),

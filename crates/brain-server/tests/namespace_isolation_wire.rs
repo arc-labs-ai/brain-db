@@ -210,6 +210,7 @@ async fn create_entity(client: &mut TcpStream, stream_id: u32, name: &str) -> [u
             canonical_name: name.into(),
             aliases: vec![],
             attributes_blob: Vec::new(),
+            session_id: 0,
             request_id: *uuid::Uuid::now_v7().as_bytes(),
             act_as: None,
         }),

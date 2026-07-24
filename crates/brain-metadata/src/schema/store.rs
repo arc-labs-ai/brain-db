@@ -378,7 +378,7 @@ mod tests {
             entity_put(
                 &wtxn,
                 test_scope(),
-                &Entity::new_active(
+                brain_core::SessionId::DEFAULT, &Entity::new_active(
                     subject,
                     brain_core::EntityTypeId(1),
                     "anchor".into(),
@@ -413,8 +413,8 @@ mod tests {
             };
             let s_in = mk_stmt(p_in);
             let s_out = mk_stmt(p_out);
-            let sid_in = statement_create(&wtxn, test_scope(), &s_in, 0).unwrap();
-            let sid_out = statement_create(&wtxn, test_scope(), &s_out, 0).unwrap();
+            let sid_in = statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s_in, 0).unwrap();
+            let sid_out = statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s_out, 0).unwrap();
             wtxn.commit().unwrap();
             (sid_in, sid_out)
         };

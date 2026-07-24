@@ -45,7 +45,7 @@ fn put_entity(metadata: &Arc<MetadataDb>, name: &str, type_id: EntityTypeId) -> 
     let id = EntityId::new();
     let entity = Entity::new_active(id, type_id, name.into(), name.to_lowercase(), 0);
     let wtxn = metadata.write_txn().expect("wtxn");
-    entity_put(&wtxn, __ts(), &entity).expect("entity_put");
+    entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &entity).expect("entity_put");
     wtxn.commit().expect("commit");
     id
 }
@@ -88,7 +88,7 @@ fn create_relation(
         false,
     );
     let wtxn = metadata.write_txn().expect("wtxn");
-    let created = relation_create(&wtxn, __ts(), &r, 0).expect("relation_create");
+    let created = relation_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &r, 0).expect("relation_create");
     wtxn.commit().expect("commit");
     created
 }
@@ -1220,7 +1220,7 @@ mod unified_walk {
         );
         {
             let wtxn = metadata.write_txn().expect("wtxn");
-            statement_create(&wtxn, __ts(), &stmt, 1_700_000_000_000_000_000)
+            statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, 1_700_000_000_000_000_000)
                 .expect("statement_create");
             wtxn.commit().expect("commit");
         }

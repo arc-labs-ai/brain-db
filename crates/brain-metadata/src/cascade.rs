@@ -592,7 +592,7 @@ mod edge_cascade_tests {
             NOW,
         );
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -687,7 +687,7 @@ mod edge_cascade_tests {
         let rid = r.id;
 
         let wtxn = db.write_txn().unwrap();
-        relation_create(&wtxn, test_scope(), &r, NOW).unwrap();
+        relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, NOW).unwrap();
         wtxn.commit().unwrap();
 
         let wtxn = db.write_txn().unwrap();
@@ -728,7 +728,7 @@ mod edge_cascade_tests {
         let rid = r.id;
 
         let wtxn = db.write_txn().unwrap();
-        relation_create(&wtxn, test_scope(), &r, NOW).unwrap();
+        relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, NOW).unwrap();
         wtxn.commit().unwrap();
 
         // Forget m1 only.
@@ -793,7 +793,7 @@ mod edge_cascade_tests {
         r.is_symmetric = false;
 
         let wtxn = db.write_txn().unwrap();
-        relation_create(&wtxn, test_scope(), &r, NOW).unwrap();
+        relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, NOW).unwrap();
         wtxn.commit().unwrap();
 
         let edges_before = {
@@ -860,7 +860,7 @@ mod statement_cascade_overflow_tests {
             NOW,
         );
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -910,7 +910,7 @@ mod statement_cascade_overflow_tests {
             1,
         );
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &s, NOW).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, NOW).unwrap();
         wtxn.commit().unwrap();
         id
     }

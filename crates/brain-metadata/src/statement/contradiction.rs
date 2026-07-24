@@ -162,7 +162,7 @@ mod tests {
             T0,
         );
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, test_scope(), &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -211,8 +211,8 @@ mod tests {
         let b = fact(subj, pred, "green"); // disagrees with a
 
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &a, T0).unwrap();
-        statement_create(&wtxn, test_scope(), &b, T0).unwrap(); // detects + records contradiction
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &a, T0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &b, T0).unwrap(); // detects + records contradiction
         wtxn.commit().unwrap();
 
         // Listed as one pending contradiction over both ids.
@@ -249,8 +249,8 @@ mod tests {
         let a = fact(subj, pred, "paris");
         let b = fact(subj, pred, "paris"); // same object — not a contradiction
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, test_scope(), &a, T0).unwrap();
-        statement_create(&wtxn, test_scope(), &b, T0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &a, T0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &b, T0).unwrap();
         wtxn.commit().unwrap();
 
         let wtxn = db.write_txn().unwrap();

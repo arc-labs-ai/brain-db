@@ -173,7 +173,11 @@ pub async fn handle_statement_create(
     let request_hash = hash_statement_create_request(&req);
 
     let statement_value = build_statement_from_create(&req, predicate_id, now, kind)?;
-    let phase = build_upsert_statement_phase(&statement_value, intern_hint);
+    let phase = build_upsert_statement_phase(
+        &statement_value,
+        intern_hint,
+        brain_core::SessionId::from(req.session_id),
+    );
     let write = Write::single(write_id, ctx.executor.caller_space, phase)
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
@@ -961,6 +965,7 @@ fn project_view(rtxn: &redb::ReadTransaction, s: &Statement) -> Result<Statement
 fn build_upsert_statement_phase(
     s: &Statement,
     predicate_intern_hint: Option<(String, String)>,
+    session: brain_core::SessionId,
 ) -> Phase {
     let evidence = match &s.evidence {
         brain_core::EvidenceRef::Inline(entries) => {
@@ -972,6 +977,7 @@ fn build_upsert_statement_phase(
     Phase::UpsertStatement {
         id: s.id,
         kind: s.kind,
+        session,
         subject: s.subject,
         predicate: s.predicate,
         object: s.object.clone(),
@@ -1008,6 +1014,7 @@ fn hash_statement_create_request(req: &StatementCreateRequest) -> [u8; 32] {
     h.update(&req.valid_to_unix_nanos.to_le_bytes());
     h.update(&req.event_at_unix_nanos.to_le_bytes());
     h.update(&req.schema_version.to_le_bytes());
+    h.update(&req.session_id.to_le_bytes());
     h.update(b"\0");
     hash_evidence_ref(&mut h, &req.evidence);
     *h.finalize().as_bytes()

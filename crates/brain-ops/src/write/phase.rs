@@ -77,6 +77,11 @@ pub enum Phase {
     UpsertEntity {
         id: EntityId,
         ty: EntityTypeId,
+        /// First-mention session provenance for a fresh entity (session
+        /// is a grouping column, never part of the isolation prefix;
+        /// entity identity is session-agnostic and a later mention never
+        /// overwrites it).
+        session: SessionId,
         canonical: String,
         normalized: String,
         /// Alternate surface forms for entity resolution. Empty
@@ -100,6 +105,9 @@ pub enum Phase {
     UpsertStatement {
         id: StatementId,
         kind: StatementKind,
+        /// The per-utterance session this statement belongs to (grouping
+        /// column, never part of the isolation prefix).
+        session: SessionId,
         subject: SubjectRef,
         predicate: PredicateId,
         object: StatementObject,
@@ -126,6 +134,9 @@ pub enum Phase {
     UpsertRelation {
         id: RelationId,
         ty: RelationTypeId,
+        /// The per-utterance session this relation belongs to (grouping
+        /// column, never part of the isolation prefix).
+        session: SessionId,
         from: EntityId,
         to: EntityId,
         confidence: f32,

@@ -883,6 +883,7 @@ mod tests {
             properties_blob: vec![1, 2, 3],
             space_id: aid(1),
             namespace_id: brain_core::NamespaceId::from(5),
+            session_id: brain_core::SessionId::from(31),
             relation_type_intern_hint: None,
         }
     }
@@ -912,6 +913,9 @@ mod tests {
         // recovered sidecar carries the real tenant (sample uses ns 5),
         // never the SYSTEM fallback.
         assert_eq!(meta.namespace_id, 5);
+        // The per-utterance session rides the RelationLink WAL payload, so
+        // the recovered sidecar carries it (sample uses session 31).
+        assert_eq!(meta.session_id, 31);
         assert!((meta.confidence - 0.92).abs() < 1e-6);
         assert_eq!(meta.is_current, 1);
         assert_eq!(meta.tombstoned, 0);

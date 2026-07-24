@@ -44,7 +44,7 @@ fn put_entity(metadata: &mut MetadataDb, name: &str, type_id: EntityTypeId) -> E
     let id = EntityId::new();
     let entity = Entity::new_active(id, type_id, name.into(), name.to_lowercase(), 0);
     let wtxn = metadata.write_txn().expect("wtxn");
-    entity_put(&wtxn, __ts(), &entity).expect("entity_put");
+    entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &entity).expect("entity_put");
     wtxn.commit().expect("commit");
     id
 }
@@ -110,7 +110,7 @@ fn create_statement(
         1,
     );
     let wtxn = metadata.write_txn().expect("wtxn");
-    let created = statement_create(&wtxn, __ts(), &stmt, 0).expect("create");
+    let created = statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, 0).expect("create");
     wtxn.commit().expect("commit");
     created
 }
