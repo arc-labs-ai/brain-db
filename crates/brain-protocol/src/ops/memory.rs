@@ -21,9 +21,12 @@ pub struct ActAs {
     /// Effective namespace. Must be within the principal's `may_act`
     /// allowlist; anything outside it is rejected.
     pub namespace: String,
-    /// 16-byte effective space id.
-    #[serde(with = "serde_bytes")]
-    pub space_id: WireUuid,
+    /// Structured, opaque effective-space selector (e.g.
+    /// `"support-bot:user123"`). The server derives the 16-byte storage
+    /// `SpaceId = UUIDv5(namespace, space_id)` at request ingress; it is
+    /// never parsed for sub-scopes. An empty string selects the
+    /// connection's key-bound space (single-space keys, zero ceremony).
+    pub space_id: String,
 }
 
 /// `ENCODE_REQ` body. Expresses client *intent* only: the text to
@@ -1563,7 +1566,7 @@ mod memory_list_tests {
         let mut req = sample_request();
         req.act_as = Some(ActAs {
             namespace: "acme".into(),
-            space_id: [7u8; 16],
+            space_id: "acme:space".into(),
         });
         req.cursor = Vec::new();
         let body = RequestBody::MemoryList(req);

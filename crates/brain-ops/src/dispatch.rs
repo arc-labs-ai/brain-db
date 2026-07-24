@@ -37,6 +37,11 @@ pub struct RequestCaller {
     pub namespace: String,
     /// Permission bitfield from [`brain_metadata::api_keys::bits`].
     pub permissions: u32,
+    /// Human-readable structured space string the request selected
+    /// (empty for a raw key-bound space). The server derived
+    /// [`Self::space_id`] from it via `SpaceId::derive_from_string`; the
+    /// registry keeps the string so `SPACE_LIST` can surface it.
+    pub space_string: String,
     /// Wire-level session identifier minted at HELLO/WELCOME. Stamped
     /// onto every open transaction so the connection layer can
     /// auto-abort buffered work when the client's TCP/TLS connection
@@ -63,6 +68,7 @@ impl RequestCaller {
             user_id,
             namespace,
             permissions,
+            space_string: String::new(),
             connection_id: [0u8; 16],
         }
     }
@@ -80,6 +86,7 @@ impl RequestCaller {
             user_id: [0u8; 16],
             namespace: String::new(),
             permissions: perm_bits::FULL,
+            space_string: String::new(),
             connection_id: [0u8; 16],
         }
     }
@@ -90,6 +97,16 @@ impl RequestCaller {
     #[must_use]
     pub fn with_session_id(mut self, connection_id: [u8; 16]) -> Self {
         self.connection_id = connection_id;
+        self
+    }
+
+    /// Stamp the human-readable space string the request selected. The
+    /// network auth layer sets this from the `act_as` selector (empty for
+    /// a key-bound space) so registry writes can record the original
+    /// string.
+    #[must_use]
+    pub fn with_space_string(mut self, space_string: String) -> Self {
+        self.space_string = space_string;
         self
     }
 
@@ -202,7 +219,10 @@ pub async fn dispatch(
         None
     } else {
         let mut owned = ctx.clone();
-        owned.executor = owned.executor.with_caller_space(caller.space_id);
+        owned.executor = owned
+            .executor
+            .with_caller_space(caller.space_id)
+            .with_caller_space_string(caller.space_string.clone());
         // Fail-closed tenancy: an authenticated caller MUST carry a namespace
         // that resolves to a real per-shard NamespaceId. There is no SYSTEM
         // default for user data — falling back to the reserved system namespace

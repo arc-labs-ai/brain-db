@@ -321,6 +321,9 @@ pub enum Phase {
     /// space returns the existing row.
     SpaceCreate {
         created_at_unix_nanos: u64,
+        /// Human-readable structured space string the create resolved
+        /// from (empty for a raw key-bound space).
+        space_string: String,
         /// Opaque caller metadata blob; `None` for a bare provision.
         metadata: Option<Vec<u8>>,
     },

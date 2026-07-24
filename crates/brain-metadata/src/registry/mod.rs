@@ -59,11 +59,12 @@ pub fn touch_on_write(
     wtxn: &WriteTransaction,
     namespace_id: u32,
     space_id: [u8; 16],
+    space_string: &str,
     session_id: u64,
     at_unix_nanos: u64,
 ) -> Result<(), RegistryError> {
     let session_created = touch_session_row(wtxn, namespace_id, space_id, session_id, at_unix_nanos)?;
-    touch_space_row(wtxn, namespace_id, space_id, at_unix_nanos, session_created)?;
+    touch_space_row(wtxn, namespace_id, space_id, space_string, at_unix_nanos, session_created)?;
     Ok(())
 }
 
@@ -111,6 +112,7 @@ fn touch_space_row(
     wtxn: &WriteTransaction,
     namespace_id: u32,
     space_id: [u8; 16],
+    space_string: &str,
     at: u64,
     session_created: bool,
 ) -> Result<(), RegistryError> {
@@ -127,10 +129,15 @@ fn touch_space_row(
             if session_created {
                 m.session_count = m.session_count.saturating_add(1);
             }
+            // Back-fill the human string on a row first created without one
+            // (e.g. an implicit touch that preceded any string-bearing write).
+            if m.space_string.is_empty() && !space_string.is_empty() {
+                m.space_string = space_string.to_string();
+            }
             spaces.insert(&key, &m).map_err(store)?;
         }
         None => {
-            let mut m = SpaceMetadata::new(at, None);
+            let mut m = SpaceMetadata::new(at, space_string.to_string(), None);
             m.memory_count = 1;
             m.session_count = u32::from(session_created);
             spaces.insert(&key, &m).map_err(store)?;
@@ -150,6 +157,7 @@ pub fn space_create(
     wtxn: &WriteTransaction,
     namespace_id: u32,
     space_id: [u8; 16],
+    space_string: String,
     at_unix_nanos: u64,
     metadata: Option<Vec<u8>>,
 ) -> Result<(SpaceMetadata, bool), RegistryError> {
@@ -162,7 +170,7 @@ pub fn space_create(
     if let Some(m) = existing {
         return Ok((m, false));
     }
-    let m = SpaceMetadata::new(at_unix_nanos, metadata);
+    let m = SpaceMetadata::new(at_unix_nanos, space_string, metadata);
     spaces.insert(&key, &m).map_err(store)?;
     Ok((m, true))
 }
@@ -283,8 +291,10 @@ pub fn session_create(
             .map_err(store)?;
     }
     // Keep the owning space's session_count coherent; create the space row on
-    // first sight so a session never dangles without its parent.
-    touch_space_row(wtxn, namespace_id, space_id, at_unix_nanos, true)?;
+    // first sight so a session never dangles without its parent. A session
+    // create carries no space string of its own; the owning space's string is
+    // set by its own create / first string-bearing write.
+    touch_space_row(wtxn, namespace_id, space_id, "", at_unix_nanos, true)?;
     Ok((m, true))
 }
 
@@ -387,13 +397,14 @@ mod tests {
         let (_d, db) = db();
         let space = [0x11; 16];
         let w = db.write_txn().unwrap();
-        touch_on_write(&w, 3, space, 0, 100).unwrap();
-        touch_on_write(&w, 3, space, 0, 200).unwrap();
-        touch_on_write(&w, 3, space, 5, 300).unwrap();
+        touch_on_write(&w, 3, space, "u:1", 0, 100).unwrap();
+        touch_on_write(&w, 3, space, "u:1", 0, 200).unwrap();
+        touch_on_write(&w, 3, space, "u:1", 5, 300).unwrap();
         w.commit().unwrap();
 
         let r = db.read_txn().unwrap();
         let s = space_get(&r, 3, space).unwrap().unwrap();
+        assert_eq!(s.space_string, "u:1", "implicit touch records the human string");
         assert_eq!(s.created_at_unix_nanos, 100);
         assert_eq!(s.last_active_unix_nanos, 300);
         assert_eq!(s.memory_count, 3);
@@ -408,9 +419,9 @@ mod tests {
         let (_d, db) = db();
         let space = [0x22; 16];
         let w = db.write_txn().unwrap();
-        let (_m, created) = space_create(&w, 1, space, 10, None).unwrap();
+        let (_m, created) = space_create(&w, 1, space, "u:22".into(), 10, None).unwrap();
         assert!(created);
-        let (_m, created2) = space_create(&w, 1, space, 20, None).unwrap();
+        let (_m, created2) = space_create(&w, 1, space, "u:22".into(), 20, None).unwrap();
         assert!(!created2, "second create returns existing");
         session_create(&w, 1, space, 7, 30, Some("t".into())).unwrap();
         w.commit().unwrap();

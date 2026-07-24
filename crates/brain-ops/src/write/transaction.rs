@@ -41,6 +41,13 @@ pub struct Write {
     /// sets it from the authenticated connection via
     /// [`Self::with_namespace`].
     pub namespace: NamespaceId,
+    /// Human-readable structured space string the caller's selector
+    /// carried (empty for a raw key-bound space or an internal/worker
+    /// write). The apply layer records it on the space registry row so
+    /// `SPACE_LIST` can surface the original string — the 16-byte
+    /// `space_id` is a non-invertible UUIDv5 of it. Set via
+    /// [`Self::with_space_string`] by the wire handler.
+    pub space_string: String,
     /// When the handler (or worker) began building this write. Used
     /// by the writer for tracing + by audit rows that need a
     /// "submitted_at" timestamp distinct from "committed_at".
@@ -67,6 +74,7 @@ impl Write {
             write_id,
             space_id,
             namespace: NamespaceId::SYSTEM,
+            space_string: String::new(),
             started_at_unix_nanos: 0,
             phases: vec![phase],
             request_hash: None,
@@ -81,6 +89,7 @@ impl Write {
             write_id,
             space_id,
             namespace: NamespaceId::SYSTEM,
+            space_string: String::new(),
             started_at_unix_nanos: 0,
             phases,
             request_hash: None,
@@ -93,6 +102,15 @@ impl Write {
     #[must_use]
     pub fn with_namespace(mut self, namespace: NamespaceId) -> Self {
         self.namespace = namespace;
+        self
+    }
+
+    /// Stamp the human-readable space string; chainable from the builder.
+    /// The wire handler sets this from the caller's effective-space
+    /// selector so the space registry row records the original string.
+    #[must_use]
+    pub fn with_space_string(mut self, space_string: String) -> Self {
+        self.space_string = space_string;
         self
     }
 

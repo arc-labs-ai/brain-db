@@ -445,6 +445,7 @@ impl MetadataDb {
                 &wtxn,
                 b.namespace_id,
                 b.space_id,
+                b.space_string.clone(),
                 b.created_at_unix_nanos,
                 b.metadata.clone(),
             )

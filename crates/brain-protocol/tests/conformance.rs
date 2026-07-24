@@ -76,6 +76,10 @@ use brain_protocol::{
 // Fixed byte patterns. No clock, no randomness — fixtures are reproducible.
 const RID: [u8; 16] = [0x11; 16];
 const SPACE: [u8; 16] = [0x22; 16];
+/// Structured wire space selector string (client-supplied). The server
+/// derives the 16-byte storage id from it; the corpus pins the CBOR of
+/// the string form.
+const SPACE_STR: &str = "support-bot:user123";
 const FP: [u8; 16] = [0x33; 16];
 const EID: [u8; 16] = [0x44; 16];
 const SID: [u8; 16] = [0x55; 16];
@@ -304,7 +308,7 @@ fn sample_encode_act_as() -> EncodeRequest {
         occurred_at_unix_nanos: None,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE,
+            space_id: SPACE_STR.into(),
         }),
         wait: brain_protocol::WaitMode::Ack,
         allow_duplicates: false,
@@ -1112,7 +1116,7 @@ fn corpus() -> Vec<Case> {
         txn_id: None,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE,
+            space_id: SPACE_STR.into(),
         }),
     };
     cases.push(req_case(
@@ -1139,7 +1143,7 @@ fn corpus() -> Vec<Case> {
         txn_id: None,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE,
+            space_id: SPACE_STR.into(),
         }),
     };
     cases.push(req_case(
@@ -1169,7 +1173,7 @@ fn corpus() -> Vec<Case> {
         trace: true,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE,
+            space_id: SPACE_STR.into(),
         }),
     };
     cases.push(req_case(
@@ -1190,7 +1194,7 @@ fn corpus() -> Vec<Case> {
         trace: true,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE,
+            space_id: SPACE_STR.into(),
         }),
     };
     cases.push(req_case(
@@ -1225,7 +1229,7 @@ fn corpus() -> Vec<Case> {
         request_id: RID,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE,
+            space_id: SPACE_STR.into(),
         }),
     };
     cases.push(req_case(
@@ -1625,7 +1629,7 @@ fn corpus() -> Vec<Case> {
         &space_create_req,
     ));
     let space_create_resp = SpaceCreateResponse {
-        space_id: SPACE,
+        space_id: SPACE_STR.into(),
         created: true,
         created_at_unix_nanos: 1_700_000_000_000_000_000,
         last_active_unix_nanos: 1_700_000_000_000_000_000,
@@ -1648,7 +1652,7 @@ fn corpus() -> Vec<Case> {
     ));
     let space_list_resp = SpaceListResponse {
         spaces: vec![SpaceView {
-            space_id: SPACE,
+            space_id: SPACE_STR.into(),
             created_at_unix_nanos: 1_700_000_000_000_000_000,
             last_active_unix_nanos: 1_700_000_000_500_000_000,
             memory_count: 42,
@@ -1671,7 +1675,7 @@ fn corpus() -> Vec<Case> {
         &space_delete_req,
     ));
     let space_delete_resp = SpaceDeleteResponse {
-        space_id: SPACE,
+        space_id: SPACE_STR.into(),
         existed: true,
         memories_forgotten: 42,
     };

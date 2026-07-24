@@ -251,10 +251,10 @@ async fn recall_ids_as(
     }
 }
 
-fn act_as(namespace: &str, space: [u8; 16]) -> ActAs {
+fn act_as(namespace: &str, space: &str) -> ActAs {
     ActAs {
         namespace: namespace.to_string(),
-        space_id: space,
+        space_id: space.to_string(),
     }
 }
 
@@ -270,8 +270,8 @@ fn act_as(namespace: &str, space: [u8; 16]) -> ActAs {
 async fn act_as_isolates_two_tenants_on_one_connection() {
     let server = start(1).await; // one shard → every identity collocated
 
-    let space_a = [0xA1u8; 16];
-    let space_b = [0xB2u8; 16];
+    let space_a = "space-a";
+    let space_b = "space-b";
     let svc_space = *uuid::Uuid::now_v7().as_bytes();
 
     // One trusted service principal: ACT_AS grant + an allowlist covering both
@@ -376,7 +376,7 @@ async fn act_as_without_grant_is_denied() {
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
-        act_as: Some(act_as("tenant_a", [0xA1u8; 16])),
+        act_as: Some(act_as("tenant_a", "space-a")),
         wait: brain_protocol::WaitMode::Ack,
         allow_duplicates: false,
     };
@@ -409,8 +409,8 @@ async fn act_as_without_grant_is_denied() {
 async fn act_as_wildcard_allows_any_namespace() {
     let server = start(1).await;
 
-    let space_x = [0xD4u8; 16];
-    let space_y = [0xE5u8; 16];
+    let space_x = "space-x";
+    let space_y = "space-y";
     let svc_space = *uuid::Uuid::now_v7().as_bytes();
 
     // Wildcard grant: ACT_AS + may_act = ["*"]. No tenant namespace is named.
@@ -504,7 +504,7 @@ async fn act_as_outside_allowlist_is_denied() {
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
         occurred_at_unix_nanos: None,
-        act_as: Some(act_as("tenant_x", [0x99u8; 16])),
+        act_as: Some(act_as("tenant_x", "space-x")),
         wait: brain_protocol::WaitMode::Ack,
         allow_duplicates: false,
     };
@@ -543,7 +543,13 @@ async fn subscribe_act_as_receives_target_spaces_events() {
     let server = start(1).await;
 
     let svc_space = *uuid::Uuid::now_v7().as_bytes();
-    let target_space = [0xF6u8; 16];
+    // The wire selector is a string; the subscribe `spaces` filter is checked
+    // against the 16-byte EFFECTIVE space, which the server derives from the
+    // selector via UUIDv5 — so the filter must name that derived id.
+    let target_str = "tenant_sub_space";
+    let target_space = *brain_core::SpaceId::derive_from_string("tenant_sub", target_str)
+        .0
+        .as_bytes();
 
     let svc_token = server.mint_with_may_act(
         "svc",
@@ -571,7 +577,7 @@ async fn subscribe_act_as_receives_target_spaces_events() {
         include_history: false,
         from_lsn: None,
         max_inflight: 100,
-        act_as: Some(act_as("tenant_sub", target_space)),
+        act_as: Some(act_as("tenant_sub", target_str)),
     };
     send_frame(
         &mut sub,
@@ -598,7 +604,7 @@ async fn subscribe_act_as_receives_target_spaces_events() {
         &mut writer,
         1,
         "act_as-scoped subscribe: real-time delegated event",
-        Some(act_as("tenant_sub", target_space)),
+        Some(act_as("tenant_sub", target_str)),
     )
     .await;
 
@@ -659,7 +665,7 @@ async fn subscribe_act_as_without_grant_is_denied() {
         include_history: false,
         from_lsn: None,
         max_inflight: 100,
-        act_as: Some(act_as("tenant_a", [0xA1u8; 16])),
+        act_as: Some(act_as("tenant_a", "space-a")),
     };
     let (opcode, body) = round_trip(&mut client, 1, RequestBody::Subscribe(req)).await;
     assert_eq!(
@@ -713,7 +719,7 @@ async fn subscribe_act_as_outside_allowlist_is_denied() {
         include_history: false,
         from_lsn: None,
         max_inflight: 100,
-        act_as: Some(act_as("tenant_x", [0x99u8; 16])),
+        act_as: Some(act_as("tenant_x", "space-x")),
     };
     let (opcode, body) = round_trip(&mut svc, 1, RequestBody::Subscribe(req)).await;
     assert_eq!(

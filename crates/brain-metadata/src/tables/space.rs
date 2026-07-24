@@ -39,6 +39,13 @@ pub fn space_range_bounds(namespace_id: u32) -> ([u8; 20], [u8; 20]) {
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 pub struct SpaceMetadata {
+    /// Human-readable structured space string the wire selector carried
+    /// (e.g. `"support-bot:user123"`). The 16-byte storage `space_id` is
+    /// a non-invertible `UUIDv5` of this string, so the registry is the
+    /// only place the original string survives — `SPACE_LIST` surfaces it
+    /// verbatim. Empty when a space was first seen without a string
+    /// (a raw key-bound space).
+    pub space_string: String,
     pub created_at_unix_nanos: u64,
     pub last_active_unix_nanos: u64,
     /// Denormalized live memory count; display-only, reconciled by the
@@ -53,8 +60,9 @@ pub struct SpaceMetadata {
 
 impl SpaceMetadata {
     #[must_use]
-    pub fn new(created_at_unix_nanos: u64, metadata: Option<Vec<u8>>) -> Self {
+    pub fn new(created_at_unix_nanos: u64, space_string: String, metadata: Option<Vec<u8>>) -> Self {
         Self {
+            space_string,
             created_at_unix_nanos,
             last_active_unix_nanos: created_at_unix_nanos,
             memory_count: 0,
@@ -111,7 +119,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
         let key = space_key(7, [0x42; 16]);
-        let m = SpaceMetadata::new(1_700_000_000_000_000_000, Some(vec![1, 2, 3]));
+        let m = SpaceMetadata::new(1_700_000_000_000_000_000, "s:1".into(), Some(vec![1, 2, 3]));
 
         let wtxn = db.begin_write().unwrap();
         {
@@ -133,11 +141,11 @@ mod tests {
         let wtxn = db.begin_write().unwrap();
         {
             let mut t = wtxn.open_table(SPACES_TABLE).unwrap();
-            t.insert(&space_key(1, [0x01; 16]), &SpaceMetadata::new(1, None))
+            t.insert(&space_key(1, [0x01; 16]), &SpaceMetadata::new(1, String::new(), None))
                 .unwrap();
-            t.insert(&space_key(1, [0x02; 16]), &SpaceMetadata::new(2, None))
+            t.insert(&space_key(1, [0x02; 16]), &SpaceMetadata::new(2, String::new(), None))
                 .unwrap();
-            t.insert(&space_key(2, [0x03; 16]), &SpaceMetadata::new(3, None))
+            t.insert(&space_key(2, [0x03; 16]), &SpaceMetadata::new(3, String::new(), None))
                 .unwrap();
         }
         wtxn.commit().unwrap();

@@ -3,7 +3,8 @@
 //! Non-admin, scoped to the caller's `(namespace, space)`. CREATE and
 //! DELETE act on the caller's effective space (selected by `act_as` or the
 //! key's bound space); LIST enumerates the caller's namespace's spaces. The
-//! effective space is echoed back on every response as `space_id`.
+//! effective space is echoed back on every response as `space_id` — the
+//! human-readable string from the registry, not the derived 16-byte id.
 
 use crate::envelope::request::WireUuid;
 use crate::ops::memory::ActAs;
@@ -11,8 +12,9 @@ use crate::ops::memory::ActAs;
 /// One space row in a [`SpaceListResponse`].
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SpaceView {
-    #[serde(with = "serde_bytes")]
-    pub space_id: WireUuid,
+    /// The human-readable structured space string from the registry
+    /// (e.g. `"support-bot:user123"`), not the derived storage id.
+    pub space_id: String,
     pub created_at_unix_nanos: u64,
     pub last_active_unix_nanos: u64,
     pub memory_count: u64,
@@ -39,8 +41,9 @@ pub struct SpaceCreateRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SpaceCreateResponse {
-    #[serde(with = "serde_bytes")]
-    pub space_id: WireUuid,
+    /// The human-readable structured space string this create resolved
+    /// to (as stored in the registry).
+    pub space_id: String,
     /// `false` on an idempotent replay of an existing space.
     pub created: bool,
     pub created_at_unix_nanos: u64,
@@ -87,8 +90,8 @@ pub struct SpaceDeleteRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SpaceDeleteResponse {
-    #[serde(with = "serde_bytes")]
-    pub space_id: WireUuid,
+    /// The human-readable structured space string this delete targeted.
+    pub space_id: String,
     /// `false` when the space had no registry row.
     pub existed: bool,
     /// Number of memories tombstoned by the cascade.

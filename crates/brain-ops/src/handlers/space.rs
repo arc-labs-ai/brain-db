@@ -28,6 +28,7 @@ pub async fn handle_space_create(
 
     let phase = Phase::SpaceCreate {
         created_at_unix_nanos: now,
+        space_string: ctx.executor.caller_space_string.clone(),
         metadata: req.metadata.clone(),
     };
     let write = build_write(&req.request_id, ctx, phase, b"space_create");
@@ -43,19 +44,28 @@ pub async fn handle_space_create(
         .map_err(|e| OpError::Internal(format!("space_create read: {e}")))?;
     let meta = brain_metadata::space_get(&rtxn, ns.raw(), space.into())
         .map_err(|e| OpError::Internal(format!("space_get: {e}")))?;
-    let (created_at, last_active, memory_count, session_count) = meta
+    let (space_string, created_at, last_active, memory_count, session_count) = meta
         .map(|m| {
             (
+                m.space_string,
                 m.created_at_unix_nanos,
                 m.last_active_unix_nanos,
                 m.memory_count,
                 m.session_count,
             )
         })
-        .unwrap_or((now, now, 0, 0));
+        .unwrap_or_else(|| {
+            (
+                ctx.executor.caller_space_string.clone(),
+                now,
+                now,
+                0,
+                0,
+            )
+        });
 
     Ok(SpaceCreateResponse {
-        space_id: space.into(),
+        space_id: space_string,
         created,
         created_at_unix_nanos: created_at,
         last_active_unix_nanos: last_active,
@@ -79,7 +89,7 @@ pub async fn handle_space_list(
     let spaces = rows
         .into_iter()
         .map(|e| SpaceView {
-            space_id: e.space_id,
+            space_id: e.meta.space_string,
             created_at_unix_nanos: e.meta.created_at_unix_nanos,
             last_active_unix_nanos: e.meta.last_active_unix_nanos,
             memory_count: e.meta.memory_count,
@@ -99,8 +109,10 @@ pub async fn handle_space_delete(
     req: SpaceDeleteRequest,
     ctx: &OpsContext,
 ) -> Result<SpaceDeleteResponse, OpError> {
-    let space = ctx.executor.caller_space;
     let now = crate::clock::now_unix_nanos();
+    // The registry row is torn down below, so capture the human string
+    // from the caller's selector for the echo before it's gone.
+    let space_string = ctx.executor.caller_space_string.clone();
 
     // GDPR erasure: hard-tombstone every memory under (namespace, space),
     // reusing the FORGET cascade (which tears down the backing graph rows),
@@ -114,7 +126,7 @@ pub async fn handle_space_delete(
     let existed = matches!(ack.single_phase(), PhaseAck::SpaceDeleted { existed: true });
 
     Ok(SpaceDeleteResponse {
-        space_id: space.into(),
+        space_id: space_string,
         existed,
         memories_forgotten,
     })

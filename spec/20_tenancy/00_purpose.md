@@ -41,9 +41,9 @@ Three nested tiers, plus the records:
 - **MUST:** The wire/SDK carries `space_id` as a **structured opaque string** (e.g.
   `support-bot:user123`). The server MUST NOT parse sub-scopes in v1 — it is opaque.
 - **MUST:** The server derives the 16-byte storage key `SpaceId = UUIDv5(namespace, space_string)`
-  at request ingress, deterministically. A request MAY instead send a raw 16-byte id, which is
-  used verbatim (preserving the opaque-bytes contract). The `uuid5` seed derivation MUST fold the
-  namespace and MUST be pinned by a golden test (changing it re-keys every space).
+  at request ingress, deterministically. The `uuid5` seed derivation MUST fold the namespace (so
+  equal strings under different namespaces diverge at the id level too) and MUST be pinned by a
+  golden test — changing it re-keys every space.
 - **Rationale:** a fixed-width 16-byte storage key keeps every secondary-index prefix
   `(u32, [u8;16], …)` compact and range-scannable, and lets sharding and scope-prefix range-delete
   operate on it directly.

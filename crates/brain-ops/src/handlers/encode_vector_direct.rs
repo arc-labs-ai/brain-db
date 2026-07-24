@@ -222,6 +222,7 @@ pub async fn handle_encode_vector_direct(
 
     // 9. Submit.
     let write = Write::from_phases(write_id, ctx.executor.caller_space, phases)
+        .with_space_string(ctx.executor.caller_space_string.clone())
         .with_request_hash(request_hash);
     let ack = real_writer
         .submit(write)

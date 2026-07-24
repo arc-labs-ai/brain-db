@@ -246,6 +246,7 @@ pub async fn handle_encode(
     let t_persist = trace_enabled.then(Instant::now);
     let write = Write::from_phases(write_id, ctx.executor.caller_space, phases)
         .with_namespace(ctx.executor.caller_namespace)
+        .with_space_string(ctx.executor.caller_space_string.clone())
         .with_request_hash(request_hash);
     let ack = real_writer
         .submit(write)

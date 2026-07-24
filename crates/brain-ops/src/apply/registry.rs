@@ -21,15 +21,22 @@ pub fn apply_space_create(
 ) -> Result<PhaseAck, ApplyError> {
     let Phase::SpaceCreate {
         created_at_unix_nanos,
+        space_string,
         metadata,
     } = phase
     else {
         return Err(ApplyError::PhaseMisShape("expected SpaceCreate"));
     };
     let (ns, space) = scope_bytes(write);
-    let (_, created) =
-        brain_metadata::space_create(wtxn, ns, space, *created_at_unix_nanos, metadata.clone())
-            .map_err(|e| ApplyError::Metadata(format!("space_create: {e}")))?;
+    let (_, created) = brain_metadata::space_create(
+        wtxn,
+        ns,
+        space,
+        space_string.clone(),
+        *created_at_unix_nanos,
+        metadata.clone(),
+    )
+    .map_err(|e| ApplyError::Metadata(format!("space_create: {e}")))?;
     Ok(PhaseAck::SpaceCreated { created })
 }
 
@@ -123,11 +130,11 @@ mod tests {
 
         // SPACE_CREATE (idempotent).
         assert!(matches!(
-            apply(&db, Phase::SpaceCreate { created_at_unix_nanos: 100, metadata: None }, space, ns),
+            apply(&db, Phase::SpaceCreate { created_at_unix_nanos: 100, space_string: "u:9a".into(), metadata: None }, space, ns),
             PhaseAck::SpaceCreated { created: true }
         ));
         assert!(matches!(
-            apply(&db, Phase::SpaceCreate { created_at_unix_nanos: 200, metadata: None }, space, ns),
+            apply(&db, Phase::SpaceCreate { created_at_unix_nanos: 200, space_string: "u:9a".into(), metadata: None }, space, ns),
             PhaseAck::SpaceCreated { created: false }
         ));
         // SPACE_LIST sees exactly this namespace's space.

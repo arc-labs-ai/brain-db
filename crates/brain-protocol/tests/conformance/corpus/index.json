@@ -45,7 +45,7 @@
     "name": "req_recall_act_as",
     "opcode": "0x0021",
     "kind": "request",
-    "payload_len": 332
+    "payload_len": 335
   },
   {
     "name": "req_forget",
@@ -57,25 +57,25 @@
     "name": "req_forget_act_as",
     "opcode": "0x0024",
     "kind": "request",
-    "payload_len": 121
+    "payload_len": 124
   },
   {
     "name": "req_encode_act_as",
     "opcode": "0x0020",
     "kind": "request",
-    "payload_len": 156
+    "payload_len": 159
   },
   {
     "name": "req_plan_act_as",
     "opcode": "0x0022",
     "kind": "request",
-    "payload_len": 240
+    "payload_len": 243
   },
   {
     "name": "req_reason_act_as",
     "opcode": "0x0023",
     "kind": "request",
-    "payload_len": 218
+    "payload_len": 221
   },
   {
     "name": "req_entity_create",
@@ -87,7 +87,7 @@
     "name": "req_entity_create_act_as",
     "opcode": "0x0130",
     "kind": "request",
-    "payload_len": 191
+    "payload_len": 194
   },
   {
     "name": "req_statement_create",
@@ -333,7 +333,7 @@
     "name": "resp_space_create",
     "opcode": "0x00F0",
     "kind": "response",
-    "payload_len": 128
+    "payload_len": 131
   },
   {
     "name": "req_space_list",
@@ -345,7 +345,7 @@
     "name": "resp_space_list",
     "opcode": "0x00F1",
     "kind": "response",
-    "payload_len": 151
+    "payload_len": 154
   },
   {
     "name": "req_space_delete",
@@ -357,7 +357,7 @@
     "name": "resp_space_delete",
     "opcode": "0x00F2",
     "kind": "response",
-    "payload_len": 57
+    "payload_len": 60
   },
   {
     "name": "req_session_create",

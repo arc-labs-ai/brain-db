@@ -168,6 +168,7 @@ pub fn apply_upsert_memory(
         wtxn,
         namespace_id,
         space_id_bytes(write.space_id),
+        &write.space_string,
         session_id.raw(),
         *created_at_unix_nanos,
     )
@@ -473,6 +474,7 @@ mod tests {
             write_id: WriteId::new(),
             space_id: space,
             namespace: brain_core::NamespaceId::SYSTEM,
+            space_string: String::new(),
             started_at_unix_nanos: 0,
             phases: Vec::new(),
             request_hash: None,

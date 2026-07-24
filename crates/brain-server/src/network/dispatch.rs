@@ -295,10 +295,16 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
                         return Action::Inline(error_frame(stream_id, code, message));
                     }
                     let routing = topology.routing.load_full();
-                    (
-                        SpaceId::from(a.space_id),
-                        routing.shard_for_space(SpaceId::from(a.space_id)),
-                    )
+                    // Ingress hashing: derive the 16-byte effective space from
+                    // the structured string selector (namespace folded into the
+                    // seed). An empty selector means the connection's key-bound
+                    // space. Must match `RequestScope::to_effective_caller`.
+                    let eff = if a.space_id.is_empty() {
+                        scope.space_id
+                    } else {
+                        SpaceId::derive_from_string(&a.namespace, &a.space_id)
+                    };
+                    (eff, routing.shard_for_space(eff))
                 }
                 None => (scope.space_id, bound_shard),
             };
@@ -703,7 +709,14 @@ fn pick_target_shard(
     // memory-shard routing below; for a target's own memories the two
     // agree (the MemoryId was minted on that same shard at write time).
     if let Some(a) = act_as {
-        return Some(routing.shard_for_space(SpaceId::from(a.space_id)));
+        // A non-empty selector routes to the derived target space's shard;
+        // an empty selector (key-bound space) falls through to the
+        // memory/space routing below. Must match `to_effective_caller`.
+        if !a.space_id.is_empty() {
+            return Some(
+                routing.shard_for_space(SpaceId::derive_from_string(&a.namespace, &a.space_id)),
+            );
+        }
     }
     // Requests carrying a target MemoryId route by memory shard; other
     // requests use the space's bound shard. The `source` end of LINK /

@@ -174,7 +174,7 @@ smallvec = { version = "1", features = ["const_generics", "union", "serde"] }
 # Hashing / IDs
 blake3 = "1"
 crc32c = "0.6"
-uuid = { version = "1.7", features = ["v7", "serde"] }
+uuid = { version = "1.7", features = ["v5", "v7", "serde"] }
 
 # Errors
 thiserror = "1"

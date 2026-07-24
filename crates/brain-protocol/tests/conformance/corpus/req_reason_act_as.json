@@ -29,23 +29,6 @@
   "trace": true,
   "act_as": {
     "namespace": "tenant-acme",
-    "space_id": [
-      34,
-      34,
-      34,
-      34,
-      34,
-      34,
-      34,
-      34,
-      34,
-      34,
-      34,
-      34,
-      34,
-      34,
-      34,
-      34
-    ]
+    "space_id": "support-bot:user123"
   }
 }

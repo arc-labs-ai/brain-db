@@ -85,6 +85,12 @@ pub struct ExecutorContext {
     /// every row is owned by the caller's tenant, and the read path
     /// scopes results to it. Defaults to [`NamespaceId::SYSTEM`].
     pub caller_namespace: brain_core::NamespaceId,
+    /// Authenticated caller's human-readable space string for **this
+    /// request only** — the structured selector the wire `act_as` carried
+    /// (empty for a raw key-bound space). Handlers stamp it onto space
+    /// registry writes so `SPACE_LIST` surfaces the original string; the
+    /// 16-byte `caller_space` is a non-invertible UUIDv5 of it.
+    pub caller_space_string: String,
 }
 
 impl ExecutorContext {
@@ -103,6 +109,7 @@ impl ExecutorContext {
             txn: None,
             caller_space: brain_core::SpaceId::default(),
             caller_namespace: brain_core::NamespaceId::SYSTEM,
+            caller_space_string: String::new(),
         }
     }
 
@@ -126,6 +133,14 @@ impl ExecutorContext {
     #[must_use]
     pub fn with_caller_namespace(mut self, namespace: brain_core::NamespaceId) -> Self {
         self.caller_namespace = namespace;
+        self
+    }
+
+    /// Stamp the per-request human-readable space string. Called by
+    /// `brain-ops::dispatch` alongside [`Self::with_caller_space`].
+    #[must_use]
+    pub fn with_caller_space_string(mut self, space_string: String) -> Self {
+        self.caller_space_string = space_string;
         self
     }
 }

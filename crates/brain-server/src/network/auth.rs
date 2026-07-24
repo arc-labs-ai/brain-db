@@ -122,14 +122,26 @@ impl RequestScope {
         act_as: &brain_protocol::ActAs,
         connection_id: [u8; 16],
     ) -> brain_ops::RequestCaller {
+        // Ingress hashing: the wire carries a structured opaque space
+        // string; the 16-byte storage id is a deterministic UUIDv5 of it,
+        // with the namespace folded into the seed so equal strings under
+        // different namespaces diverge at the id level. An empty selector
+        // means "use the connection's key-bound space" (single-space keys,
+        // zero ceremony) — there is no human string for that space.
+        let space_id = if act_as.space_id.is_empty() {
+            self.space_id
+        } else {
+            SpaceId::derive_from_string(&act_as.namespace, &act_as.space_id)
+        };
         brain_ops::RequestCaller::from_scope(
-            SpaceId(uuid::Uuid::from_bytes(act_as.space_id)),
+            space_id,
             self.org_id,
             self.user_id,
             act_as.namespace.clone(),
             bits::STANDARD_SPACE,
         )
         .with_session_id(connection_id)
+        .with_space_string(act_as.space_id.clone())
     }
 }
 

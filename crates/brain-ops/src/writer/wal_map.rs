@@ -505,11 +505,13 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
         // scope explicitly (recovery decodes the body, not the Write).
         Phase::SpaceCreate {
             created_at_unix_nanos,
+            space_string,
             metadata,
         } => {
             let body = encode_space_create(&SpaceCreateBody {
                 namespace_id: write.namespace.raw(),
                 space_id: write.space_id.into(),
+                space_string: space_string.clone(),
                 created_at_unix_nanos: *created_at_unix_nanos,
                 metadata: metadata.clone(),
             });

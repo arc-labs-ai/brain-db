@@ -166,6 +166,12 @@ impl MetadataDb {
                 &wtxn,
                 p.namespace_id.raw(),
                 p.space_id.into(),
+                // The ENCODE WAL payload does not carry the human space
+                // string; an implicit space's string is restored from its
+                // own SpaceCreate record (if any). The registry is derived,
+                // recomputable view state, so an empty string here is a
+                // display-only gap the counter-reconcile worker can heal.
+                "",
                 p.session_id.raw(),
                 timestamp_ns,
             )

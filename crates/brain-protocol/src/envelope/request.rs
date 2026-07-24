@@ -465,7 +465,7 @@ impl RequestBody {
 ///     request_id: [0; 16],
 ///     txn_id: None,
 ///     occurred_at_unix_nanos: None,
-///     act_as: Some(ActAs { namespace: "acme".into(), space_id: [1; 16] }),
+///     act_as: Some(ActAs { namespace: "acme".into(), space_id: "acme:u1".into() }),
 ///     wait: WaitMode::Ack,
 ///     allow_duplicates: false,
 /// });
@@ -561,7 +561,7 @@ mod tests {
             occurred_at_unix_nanos: None,
             act_as: Some(ActAs {
                 namespace: "acme".into(),
-                space_id: sample_uuid(9),
+                space_id: "acme:space".into(),
             }),
             wait: WaitMode::Ack,
             allow_duplicates: false,
@@ -684,7 +684,7 @@ mod tests {
             txn_id: None,
             act_as: Some(ActAs {
                 namespace: "acme".into(),
-                space_id: sample_uuid(9),
+                space_id: "acme:space".into(),
             }),
         }));
     }
@@ -724,7 +724,7 @@ mod tests {
             max_inflight: 16,
             act_as: Some(ActAs {
                 namespace: "acme".into(),
-                space_id: sample_uuid(11),
+                space_id: "acme:space".into(),
             }),
         }));
     }
@@ -908,7 +908,7 @@ mod tests {
     fn act_as_of_returns_selector_for_supported_ops() {
         let selector = ActAs {
             namespace: "acme".into(),
-            space_id: sample_uuid(9),
+            space_id: "acme:space".into(),
         };
 
         let encode = RequestBody::Encode(EncodeRequest {

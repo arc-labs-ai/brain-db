@@ -205,6 +205,10 @@ pub struct SchemaUpdateBody {
 pub struct SpaceCreateBody {
     pub namespace_id: u32,
     pub space_id: [u8; 16],
+    /// Human-readable structured space string the create resolved from.
+    /// Carried in the WAL so recovery restores the registry's display
+    /// string verbatim (the 16-byte id is a non-invertible UUIDv5 of it).
+    pub space_string: String,
     pub created_at_unix_nanos: u64,
     pub metadata: Option<Vec<u8>>,
 }
