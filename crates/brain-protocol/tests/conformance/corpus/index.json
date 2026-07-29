@@ -114,6 +114,18 @@
     "payload_len": 114
   },
   {
+    "name": "req_query_explain",
+    "opcode": "0x0161",
+    "kind": "request",
+    "payload_len": 414
+  },
+  {
+    "name": "req_query_trace",
+    "opcode": "0x0162",
+    "kind": "request",
+    "payload_len": 414
+  },
+  {
     "name": "req_memory_list",
     "opcode": "0x0027",
     "kind": "request",
@@ -208,6 +220,18 @@
     "opcode": "0x01E4",
     "kind": "response",
     "payload_len": 105
+  },
+  {
+    "name": "resp_query_explain",
+    "opcode": "0x01E1",
+    "kind": "response",
+    "payload_len": 77
+  },
+  {
+    "name": "resp_query_trace",
+    "opcode": "0x01E2",
+    "kind": "response",
+    "payload_len": 77
   },
   {
     "name": "resp_entity_get",

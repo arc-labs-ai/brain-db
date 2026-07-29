@@ -42,6 +42,10 @@ use brain_protocol::envelope::error::{ErrorDetails, ErrorResponse};
 use brain_protocol::envelope::response::{ErrorCategoryWire, ErrorCodeWire};
 use brain_protocol::error::{ErrorCategory, ErrorCode};
 use brain_protocol::ops::capabilities::{Capabilities, GetCapabilitiesResponse};
+use brain_protocol::ops::query::{
+    FusionConfigWire, QueryExplainRequest, QueryExplainResponse, QueryRequest, QueryTraceRequest,
+    QueryTraceResponse, RetrieverSelectionWire, RetrieverWire, TimeRangeWire,
+};
 use brain_protocol::{
     ActAs, AnswerKindWire, EdgeKindWire, EncodeGraphEdge, EncodeGraphNode, EncodeRequest,
     EncodeResponse, EncodeStageArtifact, EncodeStageGraph, EncodeStageKeywordField,
@@ -1272,6 +1276,64 @@ fn corpus() -> Vec<Case> {
         &materialize,
     ));
 
+    // ---- Query introspection (QUERY_EXPLAIN / QUERY_TRACE) ----
+    //
+    // These two nest a whole QueryRequest, and that struct is where both SDK
+    // bugs found in the July audit lived: `session_filter` was missing from all
+    // three (the server defaults a missing Option to None, so it failed
+    // silently), and `RetrieverWire` was encoded as its discriminant integer
+    // rather than the variant-name string serde actually emits.
+    //
+    // The sample is chosen to pin exactly those two. `session_filter` is
+    // populated rather than None, so an SDK that omits the field produces
+    // different bytes instead of an accidentally-matching short map. And
+    // `retrievers` is Explicit rather than Auto: Auto is a bare string in
+    // either encoding, which is precisely why the pre-existing SDK tests using
+    // it caught nothing.
+    let query = QueryRequest {
+        text: "who mentored whom".into(),
+        entity_anchor: Some(EID),
+        kind_filter: vec![0, 1],
+        predicate_filter: vec!["org:works_on".into()],
+        session_filter: Some(vec![7, 9]),
+        time_filter: Some(TimeRangeWire {
+            from_unix_ms: Some(1_700_000_000_000),
+            to_unix_ms: None,
+        }),
+        as_of_record_time_unix_nanos: Some(1_710_000_000_000_000_000),
+        confidence_min: Some(0.25),
+        include_tombstoned: false,
+        include_superseded: true,
+        limit: 20,
+        retrievers: RetrieverSelectionWire::Explicit(vec![
+            RetrieverWire::Semantic,
+            RetrieverWire::Graph,
+        ]),
+        fusion_config: Some(FusionConfigWire {
+            k: 60,
+            semantic_weight: 0.5,
+            lexical_weight: 0.25,
+            graph_weight: 0.25,
+        }),
+        request_id: RID,
+    };
+    let query_explain = QueryExplainRequest {
+        query: query.clone(),
+    };
+    cases.push(req_case(
+        "req_query_explain",
+        RequestBody::QueryExplain(query_explain.clone()),
+        &query_explain,
+    ));
+    let query_trace = QueryTraceRequest {
+        query: query.clone(),
+    };
+    cases.push(req_case(
+        "req_query_trace",
+        RequestBody::QueryTrace(query_trace.clone()),
+        &query_trace,
+    ));
+
     // ---- Memory enumeration (MEMORY_LIST) ----
     cases.push(req_case(
         "req_memory_list",
@@ -1493,6 +1555,29 @@ fn corpus() -> Vec<Case> {
         "resp_materialize_procedural",
         ResponseBody::MaterializeProcedural(materialize_resp.clone()),
         &materialize_resp,
+    ));
+
+    // ---- Query introspection responses ----
+    let query_explain_resp = QueryExplainResponse {
+        plan_text: "semantic ∪ graph -> rrf(k=60) -> limit 20".into(),
+        estimated_cost_ms: 1.25,
+    };
+    cases.push(resp_case(
+        "resp_query_explain",
+        ResponseBody::QueryExplain(query_explain_resp.clone()),
+        &query_explain_resp,
+    ));
+    // `total_latency_ms` is f64 here where most timing fields are f32 — the
+    // corpus is the only thing that pins which, since both round-trip fine
+    // inside an SDK that picks the wrong one consistently.
+    let query_trace_resp = QueryTraceResponse {
+        trace_text: "semantic 0.4ms -> graph 1.1ms -> fuse 0.2ms".into(),
+        total_latency_ms: 2.5,
+    };
+    cases.push(resp_case(
+        "resp_query_trace",
+        ResponseBody::QueryTrace(query_trace_resp.clone()),
+        &query_trace_resp,
     ));
 
     // ---- Read-side typed-graph responses ----
