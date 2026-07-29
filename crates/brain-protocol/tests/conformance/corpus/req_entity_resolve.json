@@ -1,0 +1,28 @@
+{
+  "candidate_name": "Ada L.",
+  "resolution_context": "standup notes: mentioned alongside Charles Babbage",
+  "entity_type_hint": 7,
+  "allow_create": true,
+  "request_id": [
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17
+  ],
+  "act_as": {
+    "namespace": "tenant-acme",
+    "space_id": "support-bot:user123"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "relation_id": [
+    96,
+    97,
+    98,
+    99,
+    100,
+    101,
+    102,
+    103,
+    104,
+    105,
+    106,
+    107,
+    108,
+    109,
+    110,
+    111
+  ],
+  "follow_supersession": true,
+  "act_as": {
+    "namespace": "tenant-acme",
+    "space_id": "support-bot:user123"
+  }
+}

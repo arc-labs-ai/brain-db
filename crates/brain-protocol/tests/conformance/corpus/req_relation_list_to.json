@@ -1,0 +1,35 @@
+{
+  "to_entity": [
+    115,
+    115,
+    115,
+    115,
+    115,
+    115,
+    115,
+    115,
+    115,
+    115,
+    115,
+    115,
+    115,
+    115,
+    115,
+    115
+  ],
+  "relation_type_filter": "org:reports_to",
+  "time_range_start_unix_nanos": 1767218400000000000,
+  "time_range_end_unix_nanos": 1767227400000000000,
+  "include_superseded": false,
+  "include_tombstoned": true,
+  "limit": 64,
+  "cursor": [
+    2,
+    127,
+    17
+  ],
+  "act_as": {
+    "namespace": "tenant-acme",
+    "space_id": "support-bot:user123"
+  }
+}

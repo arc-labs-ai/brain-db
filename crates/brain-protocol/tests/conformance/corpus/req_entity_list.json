@@ -1,0 +1,33 @@
+{
+  "entity_type_id": 4,
+  "name_prefix": "Ada",
+  "mention_count_min": 3,
+  "include_tombstoned": true,
+  "include_merged": false,
+  "limit": 250,
+  "cursor": [
+    112,
+    97,
+    103,
+    101,
+    58,
+    50,
+    58,
+    97,
+    100,
+    97,
+    45,
+    108,
+    111,
+    118,
+    101,
+    108,
+    97,
+    99,
+    101
+  ],
+  "act_as": {
+    "namespace": "tenant-acme",
+    "space_id": "support-bot:user123"
+  }
+}

@@ -538,5 +538,359 @@
     "opcode": "0x00A1",
     "kind": "frame",
     "payload_len": 109
+  },
+  {
+    "name": "req_entity_get",
+    "opcode": "0x0131",
+    "kind": "request",
+    "payload_len": 87
+  },
+  {
+    "name": "req_entity_update",
+    "opcode": "0x0132",
+    "kind": "request",
+    "payload_len": 233
+  },
+  {
+    "name": "req_entity_rename",
+    "opcode": "0x0133",
+    "kind": "request",
+    "payload_len": 107
+  },
+  {
+    "name": "req_entity_merge",
+    "opcode": "0x0134",
+    "kind": "request",
+    "payload_len": 144
+  },
+  {
+    "name": "req_entity_unmerge",
+    "opcode": "0x0135",
+    "kind": "request",
+    "payload_len": 60
+  },
+  {
+    "name": "req_entity_resolve",
+    "opcode": "0x0136",
+    "kind": "request",
+    "payload_len": 213
+  },
+  {
+    "name": "req_entity_list",
+    "opcode": "0x0137",
+    "kind": "request",
+    "payload_len": 201
+  },
+  {
+    "name": "req_entity_tombstone",
+    "opcode": "0x0138",
+    "kind": "request",
+    "payload_len": 117
+  },
+  {
+    "name": "resp_entity_update",
+    "opcode": "0x01B2",
+    "kind": "response",
+    "payload_len": 390
+  },
+  {
+    "name": "resp_entity_rename",
+    "opcode": "0x01B3",
+    "kind": "response",
+    "payload_len": 411
+  },
+  {
+    "name": "resp_entity_merge",
+    "opcode": "0x01B4",
+    "kind": "response",
+    "payload_len": 53
+  },
+  {
+    "name": "resp_entity_unmerge",
+    "opcode": "0x01B5",
+    "kind": "response",
+    "payload_len": 37
+  },
+  {
+    "name": "resp_entity_tombstone",
+    "opcode": "0x01B8",
+    "kind": "response",
+    "payload_len": 36
+  },
+  {
+    "name": "resp_entity_get_merged",
+    "opcode": "0x01B1",
+    "kind": "response",
+    "payload_len": 314
+  },
+  {
+    "name": "req_relation_get",
+    "opcode": "0x0151",
+    "kind": "request",
+    "payload_len": 110
+  },
+  {
+    "name": "req_relation_supersede",
+    "opcode": "0x0152",
+    "kind": "request",
+    "payload_len": 476
+  },
+  {
+    "name": "req_relation_tombstone",
+    "opcode": "0x0153",
+    "kind": "request",
+    "payload_len": 107
+  },
+  {
+    "name": "req_relation_list_from",
+    "opcode": "0x0154",
+    "kind": "request",
+    "payload_len": 258
+  },
+  {
+    "name": "req_relation_list_to",
+    "opcode": "0x0155",
+    "kind": "request",
+    "payload_len": 257
+  },
+  {
+    "name": "req_relation_traverse",
+    "opcode": "0x0156",
+    "kind": "request",
+    "payload_len": 244
+  },
+  {
+    "name": "resp_relation_get",
+    "opcode": "0x01D1",
+    "kind": "response",
+    "payload_len": 536
+  },
+  {
+    "name": "resp_relation_supersede",
+    "opcode": "0x01D2",
+    "kind": "response",
+    "payload_len": 43
+  },
+  {
+    "name": "resp_relation_tombstone",
+    "opcode": "0x01D3",
+    "kind": "response",
+    "payload_len": 36
+  },
+  {
+    "name": "resp_relation_list_to",
+    "opcode": "0x01D5",
+    "kind": "response",
+    "payload_len": 1031
+  },
+  {
+    "name": "resp_relation_traverse",
+    "opcode": "0x01D6",
+    "kind": "response",
+    "payload_len": 386
+  },
+  {
+    "name": "req_statement_get",
+    "opcode": "0x0141",
+    "kind": "request",
+    "payload_len": 111
+  },
+  {
+    "name": "req_statement_supersede",
+    "opcode": "0x0142",
+    "kind": "request",
+    "payload_len": 458
+  },
+  {
+    "name": "req_statement_tombstone",
+    "opcode": "0x0143",
+    "kind": "request",
+    "payload_len": 127
+  },
+  {
+    "name": "req_statement_retract",
+    "opcode": "0x0144",
+    "kind": "request",
+    "payload_len": 137
+  },
+  {
+    "name": "req_statement_history",
+    "opcode": "0x0145",
+    "kind": "request",
+    "payload_len": 48
+  },
+  {
+    "name": "req_statement_list",
+    "opcode": "0x0146",
+    "kind": "request",
+    "payload_len": 264
+  },
+  {
+    "name": "resp_statement_supersede",
+    "opcode": "0x01C2",
+    "kind": "response",
+    "payload_len": 72
+  },
+  {
+    "name": "resp_statement_tombstone",
+    "opcode": "0x01C3",
+    "kind": "response",
+    "payload_len": 36
+  },
+  {
+    "name": "resp_statement_retract",
+    "opcode": "0x01C4",
+    "kind": "response",
+    "payload_len": 67
+  },
+  {
+    "name": "resp_statement_history",
+    "opcode": "0x01C5",
+    "kind": "response",
+    "payload_len": 1734
+  },
+  {
+    "name": "req_schema_get",
+    "opcode": "0x0121",
+    "kind": "request",
+    "payload_len": 24
+  },
+  {
+    "name": "req_schema_list",
+    "opcode": "0x0122",
+    "kind": "request",
+    "payload_len": 37
+  },
+  {
+    "name": "req_schema_validate",
+    "opcode": "0x0123",
+    "kind": "request",
+    "payload_len": 88
+  },
+  {
+    "name": "req_schema_replace",
+    "opcode": "0x0127",
+    "kind": "request",
+    "payload_len": 148
+  },
+  {
+    "name": "resp_schema_get",
+    "opcode": "0x01A1",
+    "kind": "response",
+    "payload_len": 262
+  },
+  {
+    "name": "resp_schema_list",
+    "opcode": "0x01A2",
+    "kind": "response",
+    "payload_len": 228
+  },
+  {
+    "name": "resp_schema_validate",
+    "opcode": "0x01A3",
+    "kind": "response",
+    "payload_len": 176
+  },
+  {
+    "name": "resp_schema_replace",
+    "opcode": "0x01A7",
+    "kind": "response",
+    "payload_len": 65
+  },
+  {
+    "name": "req_txn_begin",
+    "opcode": "0x0040",
+    "kind": "request",
+    "payload_len": 43
+  },
+  {
+    "name": "req_txn_commit",
+    "opcode": "0x0041",
+    "kind": "request",
+    "payload_len": 25
+  },
+  {
+    "name": "req_txn_abort",
+    "opcode": "0x0042",
+    "kind": "request",
+    "payload_len": 25
+  },
+  {
+    "name": "req_subscribe",
+    "opcode": "0x0030",
+    "kind": "request",
+    "payload_len": 276
+  },
+  {
+    "name": "req_unsubscribe",
+    "opcode": "0x0031",
+    "kind": "request",
+    "payload_len": 19
+  },
+  {
+    "name": "resp_unsubscribe",
+    "opcode": "0x00B1",
+    "kind": "response",
+    "payload_len": 32
+  },
+  {
+    "name": "req_ping",
+    "opcode": "0x0010",
+    "kind": "request",
+    "payload_len": 39
+  },
+  {
+    "name": "req_client_pong",
+    "opcode": "0x0011",
+    "kind": "request",
+    "payload_len": 77
+  },
+  {
+    "name": "req_bye",
+    "opcode": "0x001F",
+    "kind": "request",
+    "payload_len": 46
+  },
+  {
+    "name": "req_cancel_stream",
+    "opcode": "0x0050",
+    "kind": "request",
+    "payload_len": 57
+  },
+  {
+    "name": "req_get_capabilities",
+    "opcode": "0x0032",
+    "kind": "request",
+    "payload_len": 1
+  },
+  {
+    "name": "req_link",
+    "opcode": "0x0025",
+    "kind": "request",
+    "payload_len": 166
+  },
+  {
+    "name": "req_unlink",
+    "opcode": "0x0026",
+    "kind": "request",
+    "payload_len": 156
+  },
+  {
+    "name": "resp_unlink",
+    "opcode": "0x00A6",
+    "kind": "response",
+    "payload_len": 54
+  },
+  {
+    "name": "resp_encode_vector_direct",
+    "opcode": "0x00AA",
+    "kind": "response",
+    "payload_len": 245
+  },
+  {
+    "name": "resp_cancel_stream_ack",
+    "opcode": "0x00D0",
+    "kind": "response",
+    "payload_len": 52
   }
 ]

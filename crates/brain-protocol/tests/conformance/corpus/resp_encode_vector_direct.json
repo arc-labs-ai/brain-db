@@ -1,0 +1,52 @@
+{
+  "memory_id": 42503532131241983733195,
+  "was_deduplicated": true,
+  "salience": 0.82,
+  "auto_edges_added": 3,
+  "lsn": 4711,
+  "space_id": [
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34
+  ],
+  "session_id": 9,
+  "kind": 1,
+  "created_at_unix_nanos": 1767225600000000000,
+  "edges_out_count": 5,
+  "embedding_model_fp": [
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51
+  ],
+  "pending_stages": [
+    2,
+    3
+  ],
+  "has_active_schema": true
+}

@@ -1,0 +1,51 @@
+{
+  "start_entity": [
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68
+  ],
+  "relation_types": [
+    "org:mentors",
+    "org:reports_to"
+  ],
+  "direction": 2,
+  "max_depth": 4,
+  "max_nodes": 500,
+  "time_at_unix_nanos": 1767225600000000000,
+  "include_superseded": true,
+  "request_id": [
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17
+  ],
+  "act_as": {
+    "namespace": "tenant-acme",
+    "space_id": "support-bot:user123"
+  }
+}

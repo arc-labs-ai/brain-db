@@ -1,0 +1,38 @@
+{
+  "subject": [
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68
+  ],
+  "predicate": "org:works_on",
+  "kind": 2,
+  "min_confidence": 0.35,
+  "time_range_start_unix_nanos": 1767225600000000000,
+  "time_range_end_unix_nanos": 1769817600000000000,
+  "only_current": false,
+  "include_tombstoned": true,
+  "limit": 250,
+  "cursor": [
+    4,
+    190,
+    33,
+    9
+  ],
+  "act_as": {
+    "namespace": "tenant-acme",
+    "space_id": "support-bot:user123"
+  }
+}

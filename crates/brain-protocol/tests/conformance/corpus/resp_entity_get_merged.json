@@ -1,0 +1,71 @@
+{
+  "entity": {
+    "entity_id": [
+      102,
+      102,
+      102,
+      102,
+      102,
+      102,
+      102,
+      102,
+      102,
+      102,
+      102,
+      102,
+      102,
+      102,
+      102,
+      102
+    ],
+    "entity_type_id": 4,
+    "canonical_name": "A. Lovelace",
+    "normalized_name": "a. lovelace",
+    "aliases": [
+      "Lovelace, A."
+    ],
+    "attributes_blob": [
+      114,
+      111,
+      108,
+      101,
+      61,
+      109,
+      97,
+      116,
+      104,
+      101,
+      109,
+      97,
+      116,
+      105,
+      99,
+      105,
+      97,
+      110
+    ],
+    "mention_count": 2,
+    "created_at_unix_nanos": 1759500000000000000,
+    "updated_at_unix_nanos": 1767312000000000000,
+    "merged_into": [
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68
+    ],
+    "embedding_version": 3,
+    "flags": 3
+  }
+}
