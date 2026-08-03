@@ -114,14 +114,13 @@ pub fn spawn_statement_text_indexer_local(
     handle: IndexHandle,
     rx: Receiver<StatementTextOp>,
     policy: CommitPolicy,
-) -> Result<(), IndexerError> {
+    shutdown: Receiver<()>,
+) -> Result<glommio::Task<()>, IndexerError> {
     let writer = build_writer(&handle)?;
     let fields = StatementFields::resolve(&handle)?;
-    glommio::spawn_local(async move {
-        run_loop(writer, fields, rx, policy).await;
-    })
-    .detach();
-    Ok(())
+    Ok(glommio::spawn_local(async move {
+        run_loop(writer, fields, rx, policy, shutdown).await;
+    }))
 }
 
 /// Build the writer + resolved fields and run the drain loop on
@@ -132,6 +131,7 @@ pub async fn run_statement_text_indexer(
     handle: IndexHandle,
     rx: Receiver<StatementTextOp>,
     policy: CommitPolicy,
+    shutdown: Receiver<()>,
 ) {
     let writer = match build_writer(&handle) {
         Ok(w) => w,
@@ -147,7 +147,7 @@ pub async fn run_statement_text_indexer(
             return;
         }
     };
-    run_loop(writer, fields, rx, policy).await;
+    run_loop(writer, fields, rx, policy, shutdown).await;
 }
 
 fn build_writer(handle: &IndexHandle) -> Result<IndexWriter, IndexerError> {
@@ -161,10 +161,18 @@ enum NextOp<T> {
     Op(T),
     Disconnected,
     DeadlineHit,
+    /// Shard teardown asked this loop to flush and exit. See the
+    /// matching variant in [`super::memory`] for why a signal is used
+    /// rather than waiting for the op channel to close.
+    Shutdown,
 }
 
 #[cfg(target_os = "linux")]
-async fn wait_next<T: 'static>(rx: &Receiver<T>, remaining: Duration) -> NextOp<T> {
+async fn wait_next<T: 'static>(
+    rx: &Receiver<T>,
+    shutdown: &Receiver<()>,
+    remaining: Duration,
+) -> NextOp<T> {
     use futures_lite::FutureExt;
     let recv = async {
         match rx.recv_async().await {
@@ -172,11 +180,15 @@ async fn wait_next<T: 'static>(rx: &Receiver<T>, remaining: Duration) -> NextOp<
             Err(_) => NextOp::Disconnected,
         }
     };
+    let stop = async {
+        let _ = shutdown.recv_async().await;
+        NextOp::Shutdown
+    };
     let timer = async {
         glommio::timer::sleep(remaining).await;
         NextOp::DeadlineHit
     };
-    recv.or(timer).await
+    recv.or(stop).or(timer).await
 }
 
 #[cfg(target_os = "linux")]
@@ -185,6 +197,7 @@ async fn run_loop(
     fields: StatementFields,
     rx: Receiver<StatementTextOp>,
     policy: CommitPolicy,
+    shutdown: Receiver<()>,
 ) {
     let mut batch: usize = 0;
     let mut last_commit = Instant::now();
@@ -193,7 +206,7 @@ async fn run_loop(
         let deadline = last_commit + policy.interval;
         let remaining = deadline.saturating_duration_since(Instant::now());
 
-        match wait_next(&rx, remaining).await {
+        match wait_next(&rx, &shutdown, remaining).await {
             NextOp::Op(op) => {
                 if let Err(err) = apply_op(&mut writer, &fields, &op) {
                     warn!(
@@ -212,7 +225,20 @@ async fn run_loop(
                     last_commit = Instant::now();
                 }
             }
-            NextOp::Disconnected => {
+            NextOp::Disconnected | NextOp::Shutdown => {
+                // Drain what is still queued before the final commit —
+                // see the matching arm in [`super::memory`].
+                while let Ok(op) = rx.try_recv() {
+                    if let Err(err) = apply_op(&mut writer, &fields, &op) {
+                        warn!(
+                            target: "brain_ops::text_indexer",
+                            error = %err,
+                            "statement text indexer write failed during drain; skipping op",
+                        );
+                    } else {
+                        batch += 1;
+                    }
+                }
                 if batch > 0 {
                     let _ = commit_with_retry(&mut writer);
                 }

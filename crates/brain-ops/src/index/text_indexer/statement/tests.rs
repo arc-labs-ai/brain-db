@@ -35,8 +35,10 @@ fn spawn_drain(
     policy: CommitPolicy,
 ) -> (StatementTextDispatcher, glommio::Task<()>) {
     let (dispatcher, rx) = StatementTextDispatcher::default_channel();
+    let (stop_tx, stop_rx) = flume::bounded::<()>(1);
     let task = glommio::spawn_local(async move {
-        run_statement_text_indexer(handle, rx, policy).await;
+        let _stop_tx = stop_tx;
+        run_statement_text_indexer(handle, rx, policy, stop_rx).await;
     });
     (dispatcher, task)
 }

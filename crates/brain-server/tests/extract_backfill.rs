@@ -168,6 +168,12 @@ async fn encode_one(client: &mut TcpStream, stream_id: u32, text: &str) -> Memor
     }
 }
 
+/// Overall budget for an admin response, independent of the per-read
+/// socket timeout below. Generous on purpose: this suite runs alongside
+/// every other test binary, and a starved executor answering in 15s is a
+/// slow server, not a broken one.
+const HTTP_READ_DEADLINE: Duration = Duration::from_secs(60);
+
 /// Blocking POST that runs inside a `spawn_blocking`. Returns
 /// `(status_code, body_string)`. The admin server uses hyper 1.x but
 /// we want to keep the test's HTTP surface tiny (no axum / hyper-client
@@ -193,12 +199,51 @@ fn http_post_no_body(admin_addr: &str, path: &str) -> (u16, String) {
     );
     stream.write_all(req.as_bytes()).unwrap();
     stream.flush().unwrap();
+
+    // Read to EOF (the request sends `Connection: close`) against an overall
+    // deadline rather than a single `read_to_end`.
+    //
+    // `read_to_end` on a socket carrying `SO_RCVTIMEO` fails the whole call
+    // the first time the timeout expires and **discards the bytes already
+    // read**, so a slow-but-healthy admin response is indistinguishable from
+    // a dead one. On a loaded box that is exactly what happens: the busy
+    // executor takes longer than one read timeout to produce the backfill
+    // report, the `.unwrap()` panics inside `spawn_blocking`, and the test
+    // fails at its `join.unwrap()` with no indication that the server was
+    // merely slow. Retrying around a deadline keeps the partial buffer and
+    // only gives up when the server has genuinely stopped talking.
+    let deadline = std::time::Instant::now() + HTTP_READ_DEADLINE;
     let mut raw = Vec::with_capacity(1024);
-    stream.read_to_end(&mut raw).unwrap();
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("response delimiter");
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "admin {path} produced no response within {HTTP_READ_DEADLINE:?} \
+                     ({} bytes buffered)",
+                    raw.len(),
+                );
+            }
+            Err(e) => panic!("admin {path} read failed after {} bytes: {e}", raw.len()),
+        }
+    }
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or_else(|| {
+        panic!(
+            "admin {path} response has no header/body delimiter ({} bytes): {:?}",
+            raw.len(),
+            String::from_utf8_lossy(&raw[..raw.len().min(256)]),
+        )
+    });
     let head = std::str::from_utf8(&raw[..split]).unwrap();
     let status: u16 = head
         .lines()

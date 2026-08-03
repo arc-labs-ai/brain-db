@@ -1319,6 +1319,16 @@ struct Shard {
     /// cancelled explicitly at drain so no live detached task blocks
     /// executor teardown.
     wal_drain_task: Option<glommio::Task<()>>,
+    /// The per-shard lexical (tantivy) indexer tasks, with the signal
+    /// that tells each to flush and exit.
+    ///
+    /// Unlike `fanout_task` / `wal_drain_task` these are **joined, not
+    /// cancelled**: their final `commit()` is durable work. Detaching
+    /// them lost that commit — a Glommio executor drops pending tasks
+    /// once its main future returns — which left a hard-FORGETten
+    /// memory's text on disk and keyword-searchable.
+    memory_text_task: Option<(flume::Sender<()>, glommio::Task<()>)>,
+    statement_text_task: Option<(flume::Sender<()>, glommio::Task<()>)>,
 }
 
 impl Shard {
@@ -2062,6 +2072,10 @@ pub fn spawn_shard(
             // writer's post-commit hook) can tombstone the row.
             // No-schema deployments (no tantivy handle) skip
             // both.
+            // Held (not detached) so `shard_main_loop` can flush the
+            // lexical indexes before the executor drops pending tasks.
+            let mut __memory_text_task: Option<(flume::Sender<()>, glommio::Task<()>)> = None;
+            let mut __statement_text_task: Option<(flume::Sender<()>, glommio::Task<()>)> = None;
             let (memory_text_dispatcher_for_ops, statement_text_dispatcher_for_ops) = {
                 let policy = brain_ops::index::text_indexer::CommitPolicy::new(
                     index_spawn_cfg.tantivy_commit_n.max(1),
@@ -2071,12 +2085,17 @@ pub fn spawn_shard(
                 let memory_dispatcher = {
                     let (dispatcher, receiver) =
                         brain_ops::index::text_indexer::MemoryTextDispatcher::default_channel();
+                    let (stop_tx, stop_rx) = flume::bounded::<()>(1);
                     match brain_ops::index::text_indexer::memory::spawn_memory_text_indexer_local(
                         tantivy_for_ops.memory_text.clone(),
                         receiver,
                         policy,
+                        stop_rx,
                     ) {
-                        Ok(()) => Some(Arc::new(dispatcher)),
+                        Ok(task) => {
+                            __memory_text_task = Some((stop_tx, task));
+                            Some(Arc::new(dispatcher))
+                        }
                         Err(err) => {
                             tracing::error!(
                                 target: "brain_server::shard",
@@ -2091,12 +2110,17 @@ pub fn spawn_shard(
                 let statement_dispatcher = {
                     let (dispatcher, receiver) =
                         brain_ops::index::text_indexer::StatementTextDispatcher::default_channel();
+                    let (stop_tx, stop_rx) = flume::bounded::<()>(1);
                     match brain_ops::index::text_indexer::statement::spawn_statement_text_indexer_local(
                         tantivy_for_ops.statements.clone(),
                         receiver,
                         policy,
+                        stop_rx,
                     ) {
-                        Ok(()) => Some(Arc::new(dispatcher)),
+                        Ok(task) => {
+                            __statement_text_task = Some((stop_tx, task));
+                            Some(Arc::new(dispatcher))
+                        }
                         Err(err) => {
                             tracing::error!(
                                 target: "brain_server::shard",
@@ -3009,6 +3033,8 @@ pub fn spawn_shard(
                 hnsw_shared,
                 fanout_task: __fanout_task,
                 wal_drain_task: Some(__wal_drain_task),
+                memory_text_task: __memory_text_task,
+                statement_text_task: __statement_text_task,
             };
             shard_main_loop(shard, rx).await;
         })
@@ -3037,6 +3063,11 @@ pub fn spawn_shard(
 // ---------------------------------------------------------------------------
 // Shard main loop
 // ---------------------------------------------------------------------------
+
+/// How long shard teardown waits for a lexical indexer's final commit
+/// before giving up and logging. Generous relative to a tantivy commit
+/// of a single batch; the point is to bound the wait, not to race it.
+const LEXICAL_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
     info!(
@@ -3354,6 +3385,48 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
             "msync_all at shutdown failed"
         );
     }
+    // Flush the lexical indexes before anything else is torn down.
+    //
+    // These are JOINED, not cancelled: their final `commit()` is durable
+    // work, and a Glommio executor drops still-pending tasks once this
+    // future returns. Detaching them lost exactly that commit — a hard
+    // FORGET purges the redb `TEXTS` row inside the tombstone's own write
+    // txn, but its lexical delete rides the indexer queue, so the text
+    // stayed on disk and keyword-searchable after a graceful shutdown.
+    //
+    // The join is bounded. The op channel's senders sit behind `Arc`s in
+    // `OpsContext` and the writer, so this cannot prove the queue is
+    // closed; an unbounded wait would trade a stale index entry for a
+    // hung shard join, which is strictly worse. On expiry we log and move
+    // on — the same posture `bootstrap::shutdown` takes when a shard join
+    // times out.
+    for (label, slot) in [
+        ("memory_text", shard.memory_text_task.take()),
+        ("statement_text", shard.statement_text_task.take()),
+    ] {
+        let Some((stop, task)) = slot else {
+            continue;
+        };
+        // Best-effort: if the loop already exited via `Disconnected`
+        // the send fails and the join below returns immediately.
+        let _ = stop.send(());
+        let flushed = glommio::timer::timeout(LEXICAL_FLUSH_TIMEOUT, async move {
+            task.await;
+            Ok(())
+        })
+        .await
+        .is_ok();
+        if !flushed {
+            error!(
+                shard_id = shard.shard_id,
+                indexer = label,
+                timeout_ms = LEXICAL_FLUSH_TIMEOUT.as_millis() as u64,
+                "lexical indexer did not flush within timeout; \
+                 recently indexed or deleted docs may be missing"
+            );
+        }
+    }
+
     // Cancel the detached per-shard helper tasks. Both capture their
     // own channel-sender clone, so they never observe a closed channel
     // and would otherwise stay runnable forever — a live task keeps the

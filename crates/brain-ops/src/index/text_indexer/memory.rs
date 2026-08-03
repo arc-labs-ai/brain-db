@@ -110,23 +110,31 @@ impl MemoryFields {
     }
 }
 
-/// Spawn the drain loop using `glommio::spawn_local` and return
-/// immediately. Server-side path. Tests spawn
-/// [`run_memory_text_indexer`] themselves inside a `run_in_glommio`
-/// block so they can `.await` the task; production detaches.
+/// Spawn the drain loop using `glommio::spawn_local` and hand the
+/// caller its [`glommio::Task`]. Server-side path.
+///
+/// **The task must be awaited at shard teardown.** It was previously
+/// `.detach()`ed, which loses the final commit: a Glommio executor
+/// polls its main future to completion and then drops whatever tasks
+/// are still pending, so an op applied (or still queued) when the
+/// shard's main loop returned never reached `commit()`. That is
+/// observable — a hard FORGET purges the redb `TEXTS` row in the
+/// tombstone's own write txn, but its lexical delete rode this queue,
+/// so the memory's text stayed on disk and keyword-searchable after a
+/// graceful shutdown. Returning the handle is what lets
+/// `shard_main_loop` wait for the commit instead of racing it.
 #[cfg(target_os = "linux")]
 pub fn spawn_memory_text_indexer_local(
     handle: IndexHandle,
     rx: Receiver<MemoryTextOp>,
     policy: CommitPolicy,
-) -> Result<(), IndexerError> {
+    shutdown: Receiver<()>,
+) -> Result<glommio::Task<()>, IndexerError> {
     let writer = build_writer(&handle)?;
     let fields = MemoryFields::resolve(&handle)?;
-    glommio::spawn_local(async move {
-        run_loop(writer, fields, rx, policy).await;
-    })
-    .detach();
-    Ok(())
+    Ok(glommio::spawn_local(async move {
+        run_loop(writer, fields, rx, policy, shutdown).await;
+    }))
 }
 
 /// Build the writer + resolved fields and run the drain loop. The
@@ -138,6 +146,7 @@ pub async fn run_memory_text_indexer(
     handle: IndexHandle,
     rx: Receiver<MemoryTextOp>,
     policy: CommitPolicy,
+    shutdown: Receiver<()>,
 ) {
     let writer = match build_writer(&handle) {
         Ok(w) => w,
@@ -153,7 +162,7 @@ pub async fn run_memory_text_indexer(
             return;
         }
     };
-    run_loop(writer, fields, rx, policy).await;
+    run_loop(writer, fields, rx, policy, shutdown).await;
 }
 
 fn build_writer(handle: &IndexHandle) -> Result<IndexWriter, IndexerError> {
@@ -172,6 +181,14 @@ enum NextOp<T> {
     Disconnected,
     /// Commit-interval deadline elapsed without any op arriving.
     DeadlineHit,
+    /// Shard teardown asked this loop to flush and exit.
+    ///
+    /// Distinct from [`Disconnected`](Self::Disconnected): the op
+    /// channel's senders live inside `OpsContext` and the writer, both
+    /// reachable through `Arc`s the shard cannot reliably drop before it
+    /// needs the final commit. Waiting for the channel to close would
+    /// mean waiting on refcount discipline; an explicit signal does not.
+    Shutdown,
 }
 
 /// Wait for the next op or the commit deadline. Glommio-only — both
@@ -180,7 +197,11 @@ enum NextOp<T> {
 /// primitives onto a Glommio thread panics looking for a Tokio
 /// reactor (see `crates/brain-ops/src/test_support.rs`).
 #[cfg(target_os = "linux")]
-async fn wait_next<T: 'static>(rx: &Receiver<T>, remaining: Duration) -> NextOp<T> {
+async fn wait_next<T: 'static>(
+    rx: &Receiver<T>,
+    shutdown: &Receiver<()>,
+    remaining: Duration,
+) -> NextOp<T> {
     use futures_lite::FutureExt;
     let recv = async {
         match rx.recv_async().await {
@@ -188,11 +209,17 @@ async fn wait_next<T: 'static>(rx: &Receiver<T>, remaining: Duration) -> NextOp<
             Err(_) => NextOp::Disconnected,
         }
     };
+    // Either a signal or a dropped sender means "shard is going away";
+    // both must flush rather than exit silently.
+    let stop = async {
+        let _ = shutdown.recv_async().await;
+        NextOp::Shutdown
+    };
     let timer = async {
         glommio::timer::sleep(remaining).await;
         NextOp::DeadlineHit
     };
-    recv.or(timer).await
+    recv.or(stop).or(timer).await
 }
 
 #[cfg(target_os = "linux")]
@@ -201,6 +228,7 @@ async fn run_loop(
     fields: MemoryFields,
     rx: Receiver<MemoryTextOp>,
     policy: CommitPolicy,
+    shutdown: Receiver<()>,
 ) {
     let mut batch: usize = 0;
     let mut last_commit = Instant::now();
@@ -209,7 +237,7 @@ async fn run_loop(
         let deadline = last_commit + policy.interval;
         let remaining = deadline.saturating_duration_since(Instant::now());
 
-        match wait_next(&rx, remaining).await {
+        match wait_next(&rx, &shutdown, remaining).await {
             NextOp::Op(op) => {
                 if let Err(err) = apply_op(&mut writer, &fields, &op) {
                     warn!(
@@ -228,8 +256,23 @@ async fn run_loop(
                     last_commit = Instant::now();
                 }
             }
-            NextOp::Disconnected => {
-                // Sender side dropped — drain + final commit + exit.
+            NextOp::Disconnected | NextOp::Shutdown => {
+                // Teardown. Anything still sitting in the queue was
+                // accepted from a caller that already got its ack, so
+                // drain it before the final commit rather than dropping
+                // it — a FORGET's lexical delete is typically the last
+                // op enqueued and would otherwise be the one lost.
+                while let Ok(op) = rx.try_recv() {
+                    if let Err(err) = apply_op(&mut writer, &fields, &op) {
+                        warn!(
+                            target: "brain_ops::text_indexer",
+                            error = %err,
+                            "memory text indexer write failed during drain; skipping op",
+                        );
+                    } else {
+                        batch += 1;
+                    }
+                }
                 if batch > 0 {
                     let _ = commit_with_retry(&mut writer);
                 }

@@ -43,8 +43,13 @@ fn spawn_drain(
     policy: CommitPolicy,
 ) -> (MemoryTextDispatcher, glommio::Task<()>) {
     let (dispatcher, rx) = MemoryTextDispatcher::default_channel();
+    let (stop_tx, stop_rx) = flume::bounded::<()>(1);
     let task = glommio::spawn_local(async move {
-        run_memory_text_indexer(handle, rx, policy).await;
+        // Held for the task's lifetime so the loop never observes a
+        // shutdown signal: these tests drive the drop-of-Sender
+        // (`Disconnected`) path, which must keep working unchanged.
+        let _stop_tx = stop_tx;
+        run_memory_text_indexer(handle, rx, policy, stop_rx).await;
     });
     (dispatcher, task)
 }
