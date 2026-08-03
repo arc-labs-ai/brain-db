@@ -503,7 +503,62 @@ pub fn act_as_of(body: &RequestBody) -> Option<&ActAs> {
         RequestBody::SessionCreate(r) => r.act_as.as_ref(),
         RequestBody::SessionList(r) => r.act_as.as_ref(),
         RequestBody::SessionDelete(r) => r.act_as.as_ref(),
-        _ => None,
+        // Exhaustive on purpose: no `_ => None`.
+        //
+        // Silently dropping an `act_as` is a tenancy violation that returns
+        // success — the op runs as the connection's own identity while the
+        // caller believes it ran as another. A catch-all made forgetting the
+        // arm for a new act-as-capable op invisible; listing every variant
+        // makes the compiler refuse to build until someone decides which of
+        // the two an op is.
+        //
+        // These carry no `act_as` field on the wire and always run as the
+        // connection's key-bound identity.
+        RequestBody::Hello(_) => None,
+        RequestBody::Auth(_) => None,
+        RequestBody::EncodeVectorDirect(_) => None,
+        RequestBody::Unsubscribe(_) => None,
+        RequestBody::GetCapabilities(_) => None,
+        RequestBody::TxnBegin(_) => None,
+        RequestBody::TxnCommit(_) => None,
+        RequestBody::TxnAbort(_) => None,
+        RequestBody::CancelStream(_) => None,
+        RequestBody::Ping(_) => None,
+        RequestBody::ClientPong(_) => None,
+        RequestBody::Bye(_) => None,
+        RequestBody::AdminStats(_) => None,
+        RequestBody::AdminSnapshot(_) => None,
+        RequestBody::AdminRestore(_) => None,
+        RequestBody::AdminIntegrityCheck(_) => None,
+        RequestBody::AdminMigrateEmbeddings(_) => None,
+        RequestBody::AdminCreateSession(_) => None,
+        RequestBody::AdminRenameSession(_) => None,
+        RequestBody::AdminMoveMemory(_) => None,
+        RequestBody::AdminReclassify(_) => None,
+        RequestBody::AdminListTombstoned(_) => None,
+        RequestBody::AdminListPendingContradictions(_) => None,
+        RequestBody::AdminBackfill(_) => None,
+        RequestBody::AdminBackfillCancel(_) => None,
+        RequestBody::EntityUpdate(_) => None,
+        RequestBody::EntityRename(_) => None,
+        RequestBody::EntityMerge(_) => None,
+        RequestBody::EntityUnmerge(_) => None,
+        RequestBody::EntityTombstone(_) => None,
+        RequestBody::StatementSupersede(_) => None,
+        RequestBody::StatementTombstone(_) => None,
+        RequestBody::StatementRetract(_) => None,
+        RequestBody::StatementHistory(_) => None,
+        RequestBody::RelationSupersede(_) => None,
+        RequestBody::RelationTombstone(_) => None,
+        RequestBody::SchemaUpload(_) => None,
+        RequestBody::SchemaGet(_) => None,
+        RequestBody::SchemaList(_) => None,
+        RequestBody::SchemaValidate(_) => None,
+        RequestBody::SchemaReplace(_) => None,
+        RequestBody::ExtractorList(_) => None,
+        RequestBody::QueryExplain(_) => None,
+        RequestBody::QueryTrace(_) => None,
+        RequestBody::MaterializeProcedural(_) => None,
     }
 }
 

@@ -27,7 +27,9 @@ use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
-use brain_protocol::envelope::request::{EncodeRequest, RecallRequest, RequestBody};
+use brain_protocol::envelope::request::{
+    EncodeRequest, MemoryInspectRequest, RecallRequest, RequestBody,
+};
 use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
 use tempfile::TempDir;
@@ -212,6 +214,25 @@ async fn recall_ids(client: &mut TcpStream, stream_id: u32, cue: &str) -> Vec<u1
     }
 }
 
+/// Read a memory back by id, bypassing every search index.
+///
+/// `MEMORY_INSPECT` is a direct metadata lookup, so it answers the durability
+/// question on its own: did the acknowledged write survive the restart? A
+/// recall cannot answer that, because it also depends on the lexical index
+/// having been repopulated — an asynchronous step whose latency has nothing to
+/// do with whether the bytes are on disk.
+async fn inspect_found(client: &mut TcpStream, stream_id: u32, memory_id: u128) -> bool {
+    let req = MemoryInspectRequest {
+        memory_id: memory_id.to_be_bytes(),
+        act_as: None,
+    };
+    let (_opcode, body) = round_trip(client, stream_id, RequestBody::MemoryInspect(req)).await;
+    match body {
+        ResponseBody::MemoryInspect(r) => r.found,
+        other => panic!("expected MEMORY_INSPECT_RESP, got {other:?}"),
+    }
+}
+
 /// Retry a recall until it surfaces `wanted` or a deadline passes. After
 /// restart the lexical index is repopulated asynchronously, so a recall fired
 /// immediately can race ahead of it; durability is about the write surviving,
@@ -297,12 +318,35 @@ async fn acknowledged_writes_survive_graceful_shutdown_and_restart() {
         )
         .await;
 
+        // Durability first, on its own terms. This is the "no data loss"
+        // criterion, and it must not be entangled with index latency: a direct
+        // lookup either finds the acknowledged write or the write was lost.
+        for (i, id) in ids.iter().enumerate() {
+            assert!(
+                inspect_found(&mut client, 1 + (i as u32) * 2, *id).await,
+                "DATA LOSS: memory {} (\"{}\") was acknowledged before graceful \
+                 shutdown and is absent after restart",
+                id,
+                memories[i],
+            );
+        }
+
+        // Then searchability, which is a different property with a different
+        // failure mode. The lexical index is repopulated asynchronously after
+        // restart, so this is a latency assertion — and it used to be the ONLY
+        // assertion, reporting "DATA LOSS" whenever a loaded machine took
+        // longer than its budget. The whole 6491-test suite reproduced that.
+        // Crying wolf on the flagship durability criterion is worse than not
+        // checking it: people learn to ignore the failure, and a real
+        // regression then hides in the noise.
         for (i, cue) in cues.iter().enumerate() {
-            let got = recall_ids_until_contains(&mut client, 1 + (i as u32) * 2, cue, ids[i]).await;
+            let got =
+                recall_ids_until_contains(&mut client, 101 + (i as u32) * 2, cue, ids[i]).await;
             assert!(
                 got.contains(&ids[i]),
-                "DATA LOSS: memory {} (\"{}\") encoded before graceful shutdown was not \
-                 recoverable after restart; recall for \"{}\" returned {:?}",
+                "NOT SEARCHABLE (the write itself survived — the assertion above \
+                 passed): memory {} (\"{}\") did not surface within the index-rebuild \
+                 budget; recall for \"{}\" returned {:?}",
                 ids[i],
                 memories[i],
                 cue,
