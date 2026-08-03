@@ -237,13 +237,16 @@ fn http_post_no_body(admin_addr: &str, path: &str) -> (u16, String) {
             Err(e) => panic!("admin {path} read failed after {} bytes: {e}", raw.len()),
         }
     }
-    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or_else(|| {
-        panic!(
-            "admin {path} response has no header/body delimiter ({} bytes): {:?}",
-            raw.len(),
-            String::from_utf8_lossy(&raw[..raw.len().min(256)]),
-        )
-    });
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or_else(|| {
+            panic!(
+                "admin {path} response has no header/body delimiter ({} bytes): {:?}",
+                raw.len(),
+                String::from_utf8_lossy(&raw[..raw.len().min(256)]),
+            )
+        });
     let head = std::str::from_utf8(&raw[..split]).unwrap();
     let status: u16 = head
         .lines()
