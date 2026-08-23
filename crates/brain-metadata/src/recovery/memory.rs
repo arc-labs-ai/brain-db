@@ -2,7 +2,9 @@
 //!
 //! Covers:
 //! - [`EncodePayload`] — insert memory + text + idempotency + fingerprint + edges
-//! - [`ForgetPayload`] — flag HARD_FORGOTTEN, evict dedup fingerprint
+//! - [`ForgetPayload`] — tombstone (clear ACTIVE + stamp tombstoned_at),
+//!   drop timeline + dedup fingerprint; hard mode also sets HARD_FORGOTTEN
+//!   and purges text + artifact + vector (converges with the live apply)
 //! - [`UpdateSaliencePayload`] — batched salience writes
 //! - [`UpdateKindPayload`] — change a memory's kind
 //! - [`UpdateSessionPayload`] — change a memory's session_id
@@ -13,8 +15,8 @@
 
 use brain_storage::recovery::MetadataSinkError;
 use brain_storage::wal::payload::{
-    EncodePayload, ForgetPayload, MigrateEmbeddingPayload, SalienceUpdate, UpdateKindPayload,
-    UpdateSaliencePayload, UpdateSessionPayload,
+    EncodePayload, ForgetMode, ForgetPayload, MigrateEmbeddingPayload, SalienceUpdate,
+    UpdateKindPayload, UpdateSaliencePayload, UpdateSessionPayload,
 };
 use redb::ReadableTable;
 
@@ -24,7 +26,12 @@ use crate::tables::fingerprint::{
     content_hash as fp_content_hash, fingerprint_key, FingerprintEntry, FINGERPRINTS_TABLE,
 };
 use crate::tables::idempotency::{response_kind, IdempotencyEntry, IDEMPOTENCY_TABLE};
-use crate::tables::memory::{flags, memory_kind_to_u8, MemoryMetadata, MEMORIES_TABLE};
+use crate::tables::memory::{
+    flags, memory_kind_to_u8, space_timeline_key, MemoryMetadata, MEMORIES_BY_SPACE_TIMELINE_TABLE,
+    MEMORIES_TABLE,
+};
+use crate::tables::memory_artifacts::MEMORY_ARTIFACTS_TABLE;
+use crate::tables::memory_vector::MEMORY_VECTORS_TABLE;
 use crate::tables::model_fingerprint::{ModelInfo, MODEL_FINGERPRINTS_TABLE};
 use crate::tables::slot_version::SLOT_VERSIONS_TABLE;
 use crate::tables::text::TEXTS_TABLE;
@@ -192,38 +199,107 @@ impl MetadataDb {
         let wtxn = self.db.begin_write().map_err(transient)?;
         {
             let key = p.memory_id.to_be_bytes();
+            let is_hard = p.mode == ForgetMode::Hard;
 
-            // Update memory: set HARD_FORGOTTEN flag + forgot_at. Capture
-            // (space, session, hash) for the matching FINGERPRINTS row so
-            // we can evict it in the same write txn (—
-            // the dedup index must never reference a forgotten memory).
-            let dedup_key: Option<(brain_core::SpaceId, brain_core::SessionId, [u8; 32])> = {
+            // Converge on the exact redb end-state the live tombstone apply
+            // produces (crates/brain-ops apply_tombstone_memory), so replay is
+            // idempotent and indistinguishable from the live write:
+            //
+            //   Both modes: clear ACTIVE, stamp tombstoned_at, drop the
+            //   timeline-index entry, evict the dedup FINGERPRINTS row.
+            //   Hard mode only: additionally set HARD_FORGOTTEN and purge the
+            //   text row + write-artifact bundle (vector + derived graph).
+            //
+            // The prior implementation set HARD_FORGOTTEN + forgot_at
+            // unconditionally and never cleared ACTIVE — a crash before
+            // checkpoint replayed the FORGET but left the row ACTIVE, so every
+            // is_active()-filtered read resurrected the forgotten memory and
+            // the never-stamped tombstoned_at blocked slot reclamation.
+            //
+            // Capture the timeline/fingerprint coordinates while the row is in
+            // hand so the follow-up index deletes run in this same write txn.
+            struct RowCoords {
+                namespace_id: u32,
+                space_id_bytes: [u8; 16],
+                created_at_unix_nanos: u64,
+                session_id: u64,
+                memory_id_bytes: [u8; 16],
+                content_hash: Option<[u8; 32]>,
+            }
+            let coords: Option<RowCoords> = {
                 let mut t = wtxn.open_table(MEMORIES_TABLE).map_err(transient)?;
                 let existing = t.get(&key).map_err(transient)?.map(|a| a.value());
                 if let Some(mut mem) = existing {
-                    let captured = mem.content_hash.map(|h| {
-                        (
-                            brain_core::SpaceId::from(mem.space_id_bytes),
-                            brain_core::SessionId(mem.session_id),
-                            h,
-                        )
-                    });
-                    mem.flags |= flags::HARD_FORGOTTEN;
-                    mem.forgot_at_unix_nanos = Some(timestamp_ns);
-                    mem.content_hash = None;
+                    let captured = RowCoords {
+                        namespace_id: mem.namespace_id,
+                        space_id_bytes: mem.space_id_bytes,
+                        created_at_unix_nanos: mem.created_at_unix_nanos,
+                        session_id: mem.session_id,
+                        memory_id_bytes: mem.memory_id_bytes,
+                        content_hash: mem.content_hash,
+                    };
+                    mem.flags &= !flags::ACTIVE;
+                    mem.tombstoned_at_unix_nanos = Some(timestamp_ns);
+                    if is_hard {
+                        mem.flags |= flags::HARD_FORGOTTEN;
+                        mem.forgot_at_unix_nanos = Some(timestamp_ns);
+                    }
                     t.insert(&key, &mem).map_err(transient)?;
-                    captured
+                    Some(captured)
                 } else {
                     None
                 }
             };
 
-            // Evict FINGERPRINTS row in the same txn as the tombstone so
-            // a concurrent ENCODE+dedup can't observe a stale hit.
-            if let Some((space, ctx, hash)) = dedup_key {
-                let fp_key = fingerprint_key(space, ctx, &hash);
-                let mut t = wtxn.open_table(FINGERPRINTS_TABLE).map_err(transient)?;
-                t.remove(&fp_key).map_err(transient)?;
+            if let Some(c) = coords {
+                // Drop the timeline-index entry — a tombstoned memory must not
+                // surface as a temporal predecessor for future encodes.
+                {
+                    let mut t = wtxn
+                        .open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)
+                        .map_err(transient)?;
+                    let tkey = space_timeline_key(
+                        c.namespace_id,
+                        c.space_id_bytes,
+                        c.created_at_unix_nanos,
+                        c.session_id,
+                        c.memory_id_bytes,
+                    );
+                    let _ = t.remove(tkey.as_slice()).map_err(transient)?;
+                }
+
+                // Evict the dedup FINGERPRINTS row in the same txn as the
+                // tombstone so a re-encode of the same text can't fold into
+                // the dead memory. Live apply evicts it for both soft and hard
+                // FORGET, so recovery does too.
+                if let Some(hash) = c.content_hash {
+                    let fp_key = fingerprint_key(
+                        brain_core::SpaceId::from(c.space_id_bytes),
+                        brain_core::SessionId(c.session_id),
+                        &hash,
+                    );
+                    let mut t = wtxn.open_table(FINGERPRINTS_TABLE).map_err(transient)?;
+                    let _ = t.remove(&fp_key).map_err(transient)?;
+                }
+
+                // Hard FORGET purges recoverable plaintext-derived data at
+                // rest: the text row + the write-artifact bundle (embedding
+                // vector + derived graph) + the raw by-id vector row. Soft
+                // FORGET keeps them until slot reclamation runs after grace.
+                if is_hard {
+                    {
+                        let mut t = wtxn.open_table(TEXTS_TABLE).map_err(transient)?;
+                        let _ = t.remove(&key).map_err(transient)?;
+                    }
+                    {
+                        let mut t = wtxn.open_table(MEMORY_ARTIFACTS_TABLE).map_err(transient)?;
+                        let _ = t.remove(&key).map_err(transient)?;
+                    }
+                    {
+                        let mut t = wtxn.open_table(MEMORY_VECTORS_TABLE).map_err(transient)?;
+                        let _ = t.remove(&key).map_err(transient)?;
+                    }
+                }
             }
 
             // Idempotency entry.

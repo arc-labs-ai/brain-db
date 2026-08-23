@@ -2,7 +2,9 @@
 //!
 //! Scans for memories whose `tombstoned_at_unix_nanos + grace_period`
 //! is past, and reclaims them: delete the MEMORIES row + adjacent
-//! edges — one wtxn per memory keeps lock duration small.
+//! edges + the plaintext (TEXTS) + the write-artifact bundle (embedding
+//! vector + derived graph) that a soft FORGET deferred to grace expiry —
+//! one wtxn per memory keeps lock duration small.
 //!
 //! ## v1 deviations (documented)
 //!
@@ -40,6 +42,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use brain_core::MemoryId;
 use brain_metadata::tables::edge::{EDGES_REVERSE_TABLE, EDGES_TABLE};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
+use brain_metadata::tables::text::TEXTS_TABLE;
 use redb::ReadableTable;
 use tracing::trace;
 
@@ -221,6 +224,29 @@ fn reclaim_one(
 
     if did_remove {
         purge_adjacent_edges(&wtxn, id)?;
+
+        // Soft FORGET deliberately keeps the plaintext + write-artifact
+        // bundle recoverable during the grace window (only a hard FORGET
+        // purges them at tombstone time). Reclamation is the grace-expiry
+        // path, so it must purge that recoverable data now — otherwise a
+        // default (soft) FORGET would leave plaintext in TEXTS_TABLE and the
+        // embedding + derived graph in MEMORY_ARTIFACTS/MEMORY_VECTORS
+        // forever (breaks invariant #6, grows unbounded, and keeps the
+        // vector resolvable via get_artifact_vector). All in this same wtxn
+        // as the row + edge deletes so the memory disappears atomically.
+        {
+            let mut texts = wtxn
+                .open_table(TEXTS_TABLE)
+                .map_err(|e| WorkerError::Ops(format!("open TEXTS: {e:?}")))?;
+            let _ = texts
+                .remove(&id.to_be_bytes())
+                .map_err(|e| WorkerError::Ops(format!("TEXTS remove: {e:?}")))?;
+        }
+        // Removes the MEMORY_ARTIFACTS bundle AND the raw MEMORY_VECTORS row,
+        // so get_artifact_vector returns None after reclamation.
+        brain_ops::memory_artifact::delete_memory_artifact(&wtxn, id.to_be_bytes())
+            .map_err(|e| WorkerError::Ops(format!("reclaim artifact delete: {e}")))?;
+
         // Idempotent backstop: FORGET already dropped these at tombstone
         // time, but re-run the delete so a memory tombstoned before that
         // path existed can't leave orphan HyPE rows past grace. No-op
@@ -297,4 +323,160 @@ fn now_unix_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use brain_core::{MemoryKind, NamespaceId, SessionId, SpaceId};
+    use brain_metadata::tables::memory::{flags, MemoryMetadata};
+    use brain_metadata::MetadataDb;
+
+    fn open_shared() -> (tempfile::TempDir, Arc<MetadataDb>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(dir.path().join("meta.redb")).unwrap();
+        (dir, Arc::new(db))
+    }
+
+    /// Seed a tombstoned (soft-forgotten) memory: the MEMORIES row (inactive,
+    /// tombstoned_at stamped), its plaintext (TEXTS), and its write-artifact
+    /// bundle (MEMORY_ARTIFACTS + raw MEMORY_VECTORS). This mirrors the state
+    /// a default soft FORGET leaves behind — the text/artifact are deferred to
+    /// reclamation, not purged at tombstone time.
+    fn seed_soft_forgotten(db: &MetadataDb, id: MemoryId, tombstoned_at: u64) {
+        let mut row = MemoryMetadata::new_active(
+            id,
+            NamespaceId::SYSTEM,
+            SpaceId::default(),
+            SessionId(1),
+            id.slot(),
+            id.version(),
+            MemoryKind::Episodic,
+            [0xAB; 16],
+            0.5,
+            11,
+            1_000,
+        );
+        row.flags &= !flags::ACTIVE;
+        row.tombstoned_at_unix_nanos = Some(tombstoned_at);
+
+        let key = id.to_be_bytes();
+        let wtxn = db.write_txn().unwrap();
+        {
+            let mut m = wtxn.open_table(MEMORIES_TABLE).unwrap();
+            m.insert(&key, &row).unwrap();
+        }
+        {
+            let mut t = wtxn.open_table(TEXTS_TABLE).unwrap();
+            t.insert(&key, b"hello world".as_slice()).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        // Write the artifact bundle + raw by-id vector through the ops helper
+        // so get_artifact_vector resolves the seeded memory pre-reclaim.
+        let wtxn = db.write_txn().unwrap();
+        let dim = brain_embed::VECTOR_DIM;
+        let record = brain_ops::memory_artifact::sync_record(key, 0, 0.5, 1_000, 0, dim as u32, 11);
+        brain_ops::memory_artifact::put_sync_artifact(
+            &wtxn,
+            key,
+            vec![0.1_f32; dim],
+            record,
+            Vec::new(),
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+    }
+
+    /// A soft FORGET defers plaintext + artifact purge to grace expiry, so
+    /// reclamation (the grace path) must remove the MEMORIES row, the TEXTS
+    /// row, and the whole artifact bundle (leaving get_artifact_vector at
+    /// None and the raw MEMORY_VECTORS row gone). Otherwise invariant #6 is
+    /// violated and a forgotten memory's vector stays id-resolvable forever.
+    #[test]
+    fn reclaim_purges_text_and_artifact_after_grace() {
+        let (_dir, db) = open_shared();
+        let id = MemoryId::pack(1, 5, 0);
+        let key = id.to_be_bytes();
+        let tombstoned_at = 10_000u64;
+        seed_soft_forgotten(&db, id, tombstoned_at);
+
+        // Pre-reclaim: everything is present.
+        {
+            let rtxn = db.read_txn().unwrap();
+            assert!(rtxn
+                .open_table(MEMORIES_TABLE)
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .is_some());
+            assert!(rtxn
+                .open_table(TEXTS_TABLE)
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .is_some());
+            assert!(brain_ops::memory_artifact::get_artifact_vector(&rtxn, key).is_some());
+        }
+
+        // Grace has expired: cutoff sits strictly after tombstoned_at.
+        let reclaimed = reclaim_one(&db, id, tombstoned_at + 1).unwrap();
+        assert!(reclaimed, "an eligible tombstone must be reclaimed");
+
+        // Post-reclaim: row, text, artifact, and raw vector are all gone.
+        let rtxn = db.read_txn().unwrap();
+        assert!(
+            rtxn.open_table(MEMORIES_TABLE)
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .is_none(),
+            "MEMORIES row must be reclaimed"
+        );
+        assert!(
+            rtxn.open_table(TEXTS_TABLE)
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .is_none(),
+            "plaintext must be purged after grace"
+        );
+        assert!(
+            brain_ops::memory_artifact::get_artifact_vector(&rtxn, key).is_none(),
+            "artifact vector must be unresolvable after grace"
+        );
+        // The raw by-id vector row underlying get_artifact_vector is gone.
+        use brain_metadata::tables::memory_vector::MEMORY_VECTORS_TABLE;
+        assert!(
+            rtxn.open_table(MEMORY_VECTORS_TABLE)
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .is_none(),
+            "raw memory-vector row must be purged after grace"
+        );
+    }
+
+    /// Reclamation is not eligible before grace expires (cutoff <= tombstoned).
+    #[test]
+    fn reclaim_skips_before_grace() {
+        let (_dir, db) = open_shared();
+        let id = MemoryId::pack(1, 6, 0);
+        let tombstoned_at = 10_000u64;
+        seed_soft_forgotten(&db, id, tombstoned_at);
+
+        // cutoff == tombstoned_at → not strictly past grace → skip.
+        let reclaimed = reclaim_one(&db, id, tombstoned_at).unwrap();
+        assert!(!reclaimed, "must not reclaim before grace expiry");
+
+        let rtxn = db.read_txn().unwrap();
+        assert!(rtxn
+            .open_table(TEXTS_TABLE)
+            .unwrap()
+            .get(&id.to_be_bytes())
+            .unwrap()
+            .is_some());
+    }
 }

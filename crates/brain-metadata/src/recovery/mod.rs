@@ -208,6 +208,8 @@ mod tests {
     use crate::tables::edge::{EDGES_REVERSE_TABLE, EDGES_TABLE};
     use crate::tables::idempotency::{response_kind, IDEMPOTENCY_TABLE};
     use crate::tables::memory::{flags, memory_kind_to_u8, MEMORIES_TABLE};
+    use crate::tables::memory_artifacts::MEMORY_ARTIFACTS_TABLE;
+    use crate::tables::memory_vector::MEMORY_VECTORS_TABLE;
     use crate::tables::model_fingerprint::MODEL_FINGERPRINTS_TABLE;
     use crate::tables::relation::{RELATION_BY_EVIDENCE_TABLE, RELATION_METADATA_TABLE};
     use crate::tables::slot_version::SLOT_VERSIONS_TABLE;
@@ -400,24 +402,52 @@ mod tests {
 
     // ---------- Forget ----------
 
+    fn forget_payload(id: MemoryId, byte: u8, mode: ForgetMode) -> ForgetPayload {
+        ForgetPayload {
+            memory_id: id,
+            request_id: rid(byte),
+            space_id: brain_core::SpaceId::default(),
+            mode,
+            reason: ForgetReason::ClientRequest,
+        }
+    }
+
+    /// Seed a MEMORY_ARTIFACTS + MEMORY_VECTORS row for `id`. Recovery's
+    /// `apply_encode` doesn't rebuild these derived tables, so we stand them
+    /// up directly to exercise the hard-forget purge path.
+    fn seed_artifact(db: &MetadataDb, id: MemoryId) {
+        let key = id.to_be_bytes();
+        let wtxn = db.write_txn().unwrap();
+        {
+            let mut a = wtxn.open_table(MEMORY_ARTIFACTS_TABLE).unwrap();
+            a.insert(&key, "{}").unwrap();
+        }
+        {
+            let mut v = wtxn.open_table(MEMORY_VECTORS_TABLE).unwrap();
+            v.insert(&key, [1u8, 2, 3, 4].as_slice()).unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+
+    /// Soft FORGET replay must converge on the live-apply end state:
+    /// ACTIVE cleared, tombstoned_at stamped, HARD_FORGOTTEN NOT set, and
+    /// the plaintext + artifact retained (reclamation purges those after
+    /// grace). The pre-fix bug left ACTIVE set (resurrecting the memory)
+    /// and never stamped tombstoned_at (blocking reclamation).
     #[test]
-    fn forget_marks_memory_tombstoned() {
+    fn soft_forget_deactivates_without_hard_flag() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MetadataDb::open(db_path(&dir)).unwrap();
         let enc = sample_encode(1, 1);
         let id = enc.memory_id;
         let key = id.to_be_bytes();
         db.apply(1, TS, &WalPayload::Encode(enc)).unwrap();
+        seed_artifact(&db, id);
+
         db.apply(
             2,
             TS + 1,
-            &WalPayload::Forget(ForgetPayload {
-                memory_id: id,
-                request_id: rid(2),
-                space_id: brain_core::SpaceId::default(),
-                mode: ForgetMode::Soft,
-                reason: ForgetReason::ClientRequest,
-            }),
+            &WalPayload::Forget(forget_payload(id, 2, ForgetMode::Soft)),
         )
         .unwrap();
 
@@ -429,8 +459,142 @@ mod tests {
             .unwrap()
             .unwrap()
             .value();
+        assert_eq!(m.flags & flags::ACTIVE, 0, "soft forget must clear ACTIVE");
+        assert_eq!(m.tombstoned_at_unix_nanos, Some(TS + 1));
+        assert_eq!(
+            m.flags & flags::HARD_FORGOTTEN,
+            0,
+            "soft forget must NOT set HARD_FORGOTTEN"
+        );
+        assert_eq!(m.forgot_at_unix_nanos, None);
+
+        // Plaintext + artifact + vector retained until grace.
+        assert!(rtxn
+            .open_table(TEXTS_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_some());
+        assert!(rtxn
+            .open_table(MEMORY_ARTIFACTS_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_some());
+        assert!(rtxn
+            .open_table(MEMORY_VECTORS_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_some());
+    }
+
+    /// Hard FORGET replay: same deactivation as soft PLUS HARD_FORGOTTEN set
+    /// and the recoverable plaintext-derived data (text + artifact + vector)
+    /// purged, matching the live hard-forget apply and the arena replay.
+    #[test]
+    fn hard_forget_sets_flag_and_purges_recoverable_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MetadataDb::open(db_path(&dir)).unwrap();
+        let enc = sample_encode(1, 1);
+        let id = enc.memory_id;
+        let key = id.to_be_bytes();
+        db.apply(1, TS, &WalPayload::Encode(enc)).unwrap();
+        seed_artifact(&db, id);
+
+        db.apply(
+            2,
+            TS + 5,
+            &WalPayload::Forget(forget_payload(id, 2, ForgetMode::Hard)),
+        )
+        .unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let m = rtxn
+            .open_table(MEMORIES_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .unwrap()
+            .value();
+        assert_eq!(m.flags & flags::ACTIVE, 0);
         assert_ne!(m.flags & flags::HARD_FORGOTTEN, 0);
-        assert_eq!(m.forgot_at_unix_nanos, Some(TS + 1));
+        assert_eq!(m.tombstoned_at_unix_nanos, Some(TS + 5));
+        assert_eq!(m.forgot_at_unix_nanos, Some(TS + 5));
+
+        // Recoverable data purged now (privacy escape hatch).
+        assert!(rtxn
+            .open_table(TEXTS_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_none());
+        assert!(rtxn
+            .open_table(MEMORY_ARTIFACTS_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_none());
+        assert!(rtxn
+            .open_table(MEMORY_VECTORS_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_none());
+    }
+
+    /// FORGET replay is idempotent: applying the same record twice leaves
+    /// exactly the same row state as applying it once (recovery may replay
+    /// records already reflected in the checkpointed redb state).
+    #[test]
+    fn forget_replay_is_idempotent() {
+        for mode in [ForgetMode::Soft, ForgetMode::Hard] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = MetadataDb::open(db_path(&dir)).unwrap();
+            let enc = sample_encode(1, 1);
+            let id = enc.memory_id;
+            let key = id.to_be_bytes();
+            db.apply(1, TS, &WalPayload::Encode(enc)).unwrap();
+            seed_artifact(&db, id);
+
+            db.apply(2, TS + 7, &WalPayload::Forget(forget_payload(id, 2, mode)))
+                .unwrap();
+            let once = {
+                let rtxn = db.read_txn().unwrap();
+                rtxn.open_table(MEMORIES_TABLE)
+                    .unwrap()
+                    .get(&key)
+                    .unwrap()
+                    .unwrap()
+                    .value()
+            };
+
+            // Replay the identical record.
+            db.apply(2, TS + 7, &WalPayload::Forget(forget_payload(id, 2, mode)))
+                .unwrap();
+            let twice = {
+                let rtxn = db.read_txn().unwrap();
+                rtxn.open_table(MEMORIES_TABLE)
+                    .unwrap()
+                    .get(&key)
+                    .unwrap()
+                    .unwrap()
+                    .value()
+            };
+
+            assert_eq!(
+                once.flags, twice.flags,
+                "flags stable across replay ({mode:?})"
+            );
+            assert_eq!(
+                once.tombstoned_at_unix_nanos, twice.tombstoned_at_unix_nanos,
+                "tombstoned_at stable across replay ({mode:?})"
+            );
+            assert_eq!(
+                once.forgot_at_unix_nanos, twice.forgot_at_unix_nanos,
+                "forgot_at stable across replay ({mode:?})"
+            );
+        }
     }
 
     // ---------- Link / Unlink ----------
