@@ -254,16 +254,23 @@ eval-env:
     @umask 077 && printf 'BRAIN__LLM__API_KEY=%s\nBRAIN__LLM__MODEL=gpt-4o-mini\n' "$(cat ${HOME}/.brain_llm_key | tr -d '[:space:]')" > config/.env.eval && chmod 600 config/.env.eval
     @echo "wrote config/.env.eval (0600) from ~/.brain_llm_key"
 
-# ONE container, native logs. Two rules baked in:
-#   1. Never two — every existing container from the devcontainer image is
-#      removed before a new one starts (`docker ps --filter ancestor`).
+# ONE container, native logs, ONE source of truth for models + data:
+#   1. Shared volumes — models come from the `brain-models` volume and data
+#      persists in the `brain-data` volume, the SAME volumes the devcontainer
+#      mounts. So a single `bootstrap-model.sh` (devcontainer post-create)
+#      fills the model store both dev and serve read, with no host-dir vs.
+#      volume drift.
+#   1b. One container on the ports — serve and the devcontainer both bind
+#      9090-9092, so starting serve removes whatever publishes those ports
+#      (a stale serve container or the devcontainer). Volumes persist, so
+#      `just docker-up` brings the devcontainer back afterward.
 #   2. Logs visible — brain-server runs as the container's MAIN process via
 #      `docker run` (NOT `devcontainer exec`), so its stdout IS the container's
 #      stdout: `docker logs -f brain` and Docker Desktop's Logs tab show the full
-#      server output. The old `devcontainer exec` path sent logs to the exec
-#      caller, leaving the container Logs tab empty ("Container started" only).
-# The repo is bind-mounted; dev.toml `data_dir = "./data"` resolves to ./data on
-# the host, so writes persist across restarts (wipe ./data for a fresh schema).
+#      server output.
+# The repo is bind-mounted for the release build; dev.toml `data_dir = "./data"`
+# resolves to /workspaces/brain/data, which the `brain-data` volume backs — so
+# writes persist across restarts (`docker volume rm brain-data` for a fresh DB).
 # Detached: `docker logs -f brain` to watch; `docker stop brain` for a graceful
 # stop (brain-server is `exec`'d, so it gets SIGTERM directly). Run the eval from
 # the HOST against 127.0.0.1:9090 (admin 127.0.0.1:9092, token eval-admin-secret).
@@ -275,12 +282,19 @@ docker-serve:
     # the rtk proxy and unscriptable). Tag once: docker tag <vsc-brain-…> brain-dev:latest
     IMG=brain-dev:latest
     docker image inspect "$IMG" >/dev/null 2>&1 || { echo "image $IMG missing — tag it once: docker tag <vsc-brain-devcontainer-image> brain-dev:latest"; exit 1; }
-    docker ps -aq --filter "ancestor=$IMG" | xargs -r docker rm -f >/dev/null 2>&1 || true
+    # ONE container on the serve ports: remove whatever currently publishes
+    # them — a stale serve container OR the running devcontainer, which also
+    # binds 9090-9092 and can't coexist. Port-scoped so it's robust whatever
+    # the image is tagged (the old `ancestor=brain-dev:latest` filter only
+    # matched when the devcontainer happened to carry that tag). Volumes
+    # persist, so the devcontainer is a cheap `just docker-up` to bring back.
+    docker ps -aq --filter "publish=9090" | xargs -r docker rm -f >/dev/null 2>&1 || true
     docker rm -f brain >/dev/null 2>&1 || true
     docker run -d --name brain --security-opt seccomp=unconfined \
       -p 127.0.0.1:9090:9090 -p 127.0.0.1:9091:9091 -p 127.0.0.1:9092:9092 \
       -v "$PWD":/workspaces/brain -w /workspaces/brain --env-file config/.env.eval \
-      -v "$HOME/.local/share/brain/models":/root/.local/share/brain/models:ro \
+      -v brain-models:/root/.local/share/brain/models:ro \
+      -v brain-data:/workspaces/brain/data \
       -e CARGO_HOME=/usr/local/cargo -e RUSTUP_HOME=/usr/local/rustup \
       -e BRAIN__SERVER__LISTEN_ADDR=0.0.0.0:9090 -e BRAIN__SERVER__METRICS_ADDR=0.0.0.0:9091 \
       -e BRAIN__SERVER__ADMIN_ADDR=0.0.0.0:9092 -e BRAIN__ADMIN__TOKEN=eval-admin-secret \
