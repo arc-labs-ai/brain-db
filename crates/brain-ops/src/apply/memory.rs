@@ -270,9 +270,12 @@ pub fn apply_tombstone_memory(
     // flushes. The text lives in the metadata (redb) TEXTS_TABLE, so
     // drop that row in the same wtxn as the tombstone — a soft forget
     // keeps it (reclamation handles it after grace), a hard forget
-    // purges it now. The arena-side vector is zeroed by the storage
-    // layer (live-path arena bytes are written only on WAL recovery,
-    // where the recovery replay re-zeroes a hard-forgotten slot).
+    // purges it now. The arena-side vector (only present for a memory
+    // recovered from a prior run — the live encode path never writes the
+    // arena) is zeroed live at the shard/storage boundary via
+    // `ArenaFile::hard_forget_slot`, which this apply layer cannot reach
+    // (it holds only the redb wtxn); the recovery replay re-zeroes it too
+    // so the guarantee also holds across a crash before writeback.
     if matches!(mode, crate::write::phase::TombstoneMode::Hard) {
         let mut texts_t = wtxn
             .open_table(TEXTS_TABLE)
@@ -664,6 +667,82 @@ mod tests {
         assert!(
             texts.get(&hard_id.to_be_bytes()).unwrap().is_none(),
             "hard forget must purge the plaintext text row"
+        );
+    }
+
+    /// Hard forget must leave no plaintext-derived embedding at rest in
+    /// redb: the artifact bundle's `vector` (the write-time embedding)
+    /// must be gone (invariant #6). Soft forget keeps it until grace.
+    #[test]
+    fn hard_forget_purges_artifact_vector_soft_keeps_it() {
+        let (_dir, db) = open_db();
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
+        let soft_id = MemoryId::pack(0, 1, 0);
+        let hard_id = MemoryId::pack(0, 2, 0);
+
+        // Upsert both with a recognizably non-zero embedding.
+        let mut nonzero = Box::new([0.0_f32; VECTOR_DIM]);
+        for (i, x) in nonzero.iter_mut().enumerate() {
+            *x = (i as f32) * 0.001 + 0.5;
+        }
+        {
+            let wtxn = db.write_txn().unwrap();
+            for id in [soft_id, hard_id] {
+                let mut p = fixture_phase(id);
+                if let Phase::UpsertMemory {
+                    id: pid, vector, ..
+                } = &mut p
+                {
+                    *pid = id;
+                    *vector = nonzero.clone();
+                }
+                apply_upsert_memory(&wtxn, &p, &write).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        // Both artifact vectors present pre-forget.
+        {
+            let rtxn = db.read_txn().unwrap();
+            assert!(
+                crate::memory_artifact::get_artifact_vector(&rtxn, soft_id.to_be_bytes()).is_some()
+            );
+            assert!(
+                crate::memory_artifact::get_artifact_vector(&rtxn, hard_id.to_be_bytes()).is_some()
+            );
+        }
+
+        let tombstone = |id, mode| Phase::Tombstone {
+            target: TombstoneTarget::Memory { id, mode },
+            reason: 1,
+            at_unix_nanos: 1_700_000_001_000,
+        };
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_tombstone_memory(
+                &wtxn,
+                &tombstone(soft_id, crate::write::phase::TombstoneMode::Soft),
+                &write,
+            )
+            .unwrap();
+            apply_tombstone_memory(
+                &wtxn,
+                &tombstone(hard_id, crate::write::phase::TombstoneMode::Hard),
+                &write,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        assert!(
+            crate::memory_artifact::get_artifact_vector(&rtxn, soft_id.to_be_bytes()).is_some(),
+            "soft forget must retain the artifact embedding until grace"
+        );
+        assert!(
+            crate::memory_artifact::get_artifact_vector(&rtxn, hard_id.to_be_bytes()).is_none(),
+            "hard forget must purge the artifact embedding at rest"
         );
     }
 

@@ -810,6 +810,7 @@ where
                                     start,
                                     &subscriptions,
                                     &frame_tx,
+                                    topology,
                                 )
                                 .await;
                             }
@@ -912,13 +913,87 @@ async fn handle_subscribe_start(
     start: SubscribeStart,
     subscriptions: &Arc<SubscriptionRegistry>,
     frame_tx: &flume::Sender<OutgoingFrame>,
+    topology: &Topology,
 ) {
     let SubscribeStart {
         stream_id,
         req,
         target_shard,
+        space,
     } = start;
-    match subscriptions.start(stream_id, target_shard, &req, frame_tx.clone()) {
+
+    // Resolve the `similar_to` reference vector ONCE, here at
+    // registration — a single boundary-safe round-trip to the owning
+    // shard. The per-event filter then runs entirely network-side; it
+    // never reaches back into shard state. A missing / tombstoned /
+    // out-of-space reference is rejected with `InvalidRequest` rather
+    // than silently degrading to an all-pass filter.
+    let similarity_reference = match req.filter.similar_to {
+        Some(sim) => {
+            let Some(shard) = topology.shards.get(target_shard as usize) else {
+                let frame = error_frame(
+                    stream_id,
+                    ErrorCode::ShardUnavailable,
+                    "subscribe: target shard unavailable",
+                );
+                let _ = frame_tx
+                    .send_async(OutgoingFrame {
+                        bytes: frame.encode(),
+                        close_after: false,
+                    })
+                    .await;
+                return;
+            };
+            let reference_id = brain_core::MemoryId::from(sim.reference_memory_id);
+            match shard.get_memory_vector(space, reference_id).await {
+                Ok(Some(v)) => Some(v),
+                // A shard-unreachable error is a transient infrastructure
+                // fault, not a client input error — surface it as
+                // ShardUnavailable (retriable) so a client doesn't treat
+                // its valid reference id as permanently bad. Only a
+                // resolved-to-None (Ok(None)) is a genuine bad reference.
+                Err(_) => {
+                    let frame = error_frame(
+                        stream_id,
+                        ErrorCode::ShardUnavailable,
+                        "subscribe: target shard unavailable while resolving \
+                         the similarity reference vector",
+                    );
+                    let _ = frame_tx
+                        .send_async(OutgoingFrame {
+                            bytes: frame.encode(),
+                            close_after: false,
+                        })
+                        .await;
+                    return;
+                }
+                Ok(None) => {
+                    let frame = error_frame(
+                        stream_id,
+                        ErrorCode::InvalidArgument,
+                        "subscribe: filter.similar_to.reference_memory_id does not \
+                         resolve to a live memory in this space",
+                    );
+                    let _ = frame_tx
+                        .send_async(OutgoingFrame {
+                            bytes: frame.encode(),
+                            close_after: false,
+                        })
+                        .await;
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
+
+    match subscriptions.start(
+        stream_id,
+        target_shard,
+        &req,
+        frame_tx.clone(),
+        similarity_reference,
+    ) {
         Ok(_) => {
             // Subscription established. Per-sub task is running; it
             // will start emitting SUBSCRIBE_EVENT frames as events

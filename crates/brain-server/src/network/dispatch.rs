@@ -167,6 +167,11 @@ pub(crate) struct SubscribeStart {
     pub(crate) stream_id: u32,
     pub(crate) req: brain_protocol::envelope::request::SubscribeRequest,
     pub(crate) target_shard: u16,
+    /// Effective space this subscription runs under (the `act_as`
+    /// target when present, else the connection's key-bound space).
+    /// Used to space-wall the one-time `similar_to` reference-vector
+    /// lookup against the owning shard.
+    pub(crate) space: SpaceId,
 }
 
 pub(crate) enum CancelSubscribe {
@@ -328,6 +333,7 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
                 stream_id,
                 req: sub_req,
                 target_shard,
+                space: effective_space,
             });
         }
         RequestBody::Unsubscribe(un_req) => {

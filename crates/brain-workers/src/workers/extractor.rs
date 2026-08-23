@@ -3519,6 +3519,7 @@ async fn publish_extracted_graph(
         stage_outcome: Some(outcome),
         stage_payload: Some(payload),
         space_id,
+        vector: None,
     };
     ctx.ops.publish_stage_event(envelope).await;
 }
@@ -3564,6 +3565,7 @@ async fn publish_hype_completed(
         stage_outcome: Some(stage_outcome),
         stage_payload: Some(payload),
         space_id,
+        vector: None,
     };
     ctx.ops.publish_stage_event(envelope).await;
 }

@@ -35,13 +35,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use brain_core::{MemoryId, ShardId, SlotIndex, SlotVersion};
 use brain_index::{SharedHnsw, SpaceVectorSource, VECTOR_DIM};
+use brain_metadata::tables::memory::MEMORIES_TABLE;
+use brain_ops::memory_artifact::get_artifact_vector;
 use brain_planner::SharedMetadataDb;
 use brain_storage::arena::ArenaFile;
 use brain_storage::wal::payload::{CheckpointBeginPayload, CheckpointEndPayload, WalPayload};
 use brain_storage::wal::reader::WalReader;
 use brain_storage::wal::record::{Lsn, WalRecord};
 use brain_storage::wal::Wal;
-use brain_workers::hnsw_maint::{RebuildSource, SnapshotFuture};
+use brain_workers::hnsw_maint::{RebuildSource, RebuildSourceError, SnapshotFuture};
 use brain_workers::snapshot::{
     DeleteFuture as SnapshotDeleteFuture, ListFuture as SnapshotListFuture, SnapshotDesc,
     SnapshotId, SnapshotSource, SnapshotSourceError, TakeFuture,
@@ -50,6 +52,7 @@ use brain_workers::wal_retention::{
     CheckpointDesc, CheckpointFuture, DeleteFuture as WalDeleteFuture, SegmentDesc,
     SegmentListFuture, WalRetentionSource, WalRetentionSourceError,
 };
+use redb::ReadableTable;
 
 use crate::shard::snapshot_manifest::{blake3_hex, FileDigest, SnapshotManifest, MANIFEST_FILE};
 
@@ -110,6 +113,79 @@ impl<const D: usize> RebuildSource<D> for ArenaRebuildSource<D> {
                 let n = v.len().min(slot.vector.len());
                 v[..n].copy_from_slice(&slot.vector[..n]);
                 out.push((mid, v));
+            }
+            Ok(out)
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RedbRebuildSource — enumerate live vectors from the authoritative redb store.
+// ---------------------------------------------------------------------------
+
+/// Yields a `(MemoryId, vector)` for every live (active, non-hard-forgotten)
+/// memory by joining `MEMORIES_TABLE` (membership + tombstone state) with the
+/// per-memory `MEMORY_ARTIFACTS_TABLE` (the durable write-time vector).
+///
+/// This is the rebuild substrate for **runtime** full rebuilds (the HNSW
+/// maintenance worker and the admin `rebuild-ann` route). Unlike
+/// [`ArenaRebuildSource`], it sees memories encoded in the current run: the
+/// arena is populated only by WAL recovery on restart, so a live encode never
+/// reaches it, whereas its vector is committed to redb on the ENCODE ack path.
+/// Rebuilding from the arena alone would silently drop every same-run memory;
+/// rebuilding from redb yields the complete live set.
+///
+/// Holds the shared `MetadataDb` handle; the scan runs under a single redb
+/// read txn (snapshot-isolated), so a concurrent writer on the shard can't
+/// tear the enumeration.
+pub(crate) struct RedbRebuildSource<const D: usize> {
+    metadata: SharedMetadataDb,
+}
+
+impl<const D: usize> RedbRebuildSource<D> {
+    pub(crate) fn new(metadata: SharedMetadataDb) -> Self {
+        Self { metadata }
+    }
+}
+
+impl<const D: usize> RebuildSource<D> for RedbRebuildSource<D> {
+    fn snapshot_vectors(&self) -> SnapshotFuture<'_, D> {
+        let metadata = self.metadata.clone();
+        Box::pin(async move {
+            let rtxn = metadata
+                .read_txn()
+                .map_err(|e| RebuildSourceError::Failed(format!("read_txn: {e}")))?;
+            let table = rtxn
+                .open_table(MEMORIES_TABLE)
+                .map_err(|e| RebuildSourceError::Failed(format!("open memories: {e}")))?;
+            let mut out = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|e| RebuildSourceError::Failed(format!("memories iter: {e}")))?
+            {
+                let (key_guard, row_guard) =
+                    entry.map_err(|e| RebuildSourceError::Failed(format!("memories row: {e}")))?;
+                let row = row_guard.value();
+                // A tombstoned (inactive) or hard-forgotten memory must not
+                // re-enter the searchable graph. Mirrors ArenaRebuildSource's
+                // occupied-and-live filter.
+                if !row.is_active() || row.is_hard_forgotten() {
+                    continue;
+                }
+                let key = key_guard.value();
+                // The vector lives in the artifact bundle, written on the ack
+                // path. A missing bundle means the memory has no stored vector
+                // (partial write / pre-feature row) — skip rather than insert
+                // a zero vector that would pollute nearest-neighbour scores.
+                let Some(vec) = get_artifact_vector(&rtxn, key) else {
+                    continue;
+                };
+                let mut v = [0.0_f32; D];
+                // D == VECTOR_DIM in every shard monomorphisation; the min
+                // guard keeps a mismatched const from panicking.
+                let n = v.len().min(vec.len());
+                v[..n].copy_from_slice(&vec[..n]);
+                out.push((MemoryId::from_be_bytes(key), v));
             }
             Ok(out)
         })
@@ -747,6 +823,104 @@ mod tests {
         assert_eq!(mid4.shard(), 3);
         assert_eq!(mid4.version(), 7);
         assert!((v4[5] - 0.5).abs() < f32::EPSILON);
+    }
+
+    // ---- RedbRebuildSource ------------------------------------------------
+
+    /// The runtime rebuild source must enumerate the durable redb store, not
+    /// the arena: a memory encoded in the current run has its vector in redb
+    /// (written on the ENCODE ack path) but never in the arena (populated only
+    /// by WAL recovery). This proves the source returns exactly the live
+    /// (active, vector-bearing) memories and skips tombstoned rows and rows
+    /// with no stored vector.
+    #[test]
+    fn redb_rebuild_source_enumerates_live_same_run_memories() {
+        use brain_core::{MemoryId, MemoryKind, NamespaceId, SessionId, SpaceId};
+        use brain_metadata::tables::memory::{flags, MemoryMetadata, MEMORIES_TABLE};
+        use brain_ops::memory_artifact::merge_memory_artifact;
+
+        let tmp = TempDir::new().unwrap();
+        let md_path = tmp.path().join("metadata.redb");
+        let md = MetadataDb::open(&md_path).expect("MetadataDb::open");
+        let metadata: SharedMetadataDb = Arc::new(md);
+
+        let space: SpaceId = [0u8; 16].into();
+        let row = |slot: u64| {
+            MemoryMetadata::new_active(
+                MemoryId::pack(0, slot, 1),
+                NamespaceId::SYSTEM,
+                space,
+                SessionId(1),
+                slot,
+                1,
+                MemoryKind::Episodic,
+                [0u8; 16],
+                0.5,
+                8,
+                1_700_000_000_000_000_000,
+            )
+        };
+        let live_vec = |first: f32| {
+            let mut v = vec![0.0_f32; VECTOR_DIM];
+            v[0] = first;
+            v
+        };
+
+        // slot 1 + 2: active with a stored vector → returned.
+        // slot 3: tombstoned (ACTIVE cleared) but has a vector → skipped.
+        // slot 4: active but no artifact bundle → skipped.
+        {
+            let wtxn = metadata.write_txn().expect("write_txn");
+            {
+                let mut t = wtxn.open_table(MEMORIES_TABLE).expect("open memories");
+                let m1 = row(1);
+                let m2 = row(2);
+                let mut m3 = row(3);
+                m3.set_flag(flags::ACTIVE, false);
+                let m4 = row(4);
+                t.insert(&m1.memory_id_bytes, &m1).unwrap();
+                t.insert(&m2.memory_id_bytes, &m2).unwrap();
+                t.insert(&m3.memory_id_bytes, &m3).unwrap();
+                t.insert(&m4.memory_id_bytes, &m4).unwrap();
+            }
+            for (slot, first) in [(1u64, 0.25_f32), (2, 0.5), (3, 0.75)] {
+                let id = MemoryId::pack(0, slot, 1);
+                merge_memory_artifact(&wtxn, id.to_be_bytes(), |b| {
+                    b.vector = live_vec(first);
+                })
+                .expect("merge artifact");
+            }
+            wtxn.commit().expect("commit");
+        }
+
+        let pairs = glommio_run({
+            let metadata = metadata.clone();
+            move || async move {
+                let src: RedbRebuildSource<{ VECTOR_DIM }> = RedbRebuildSource::new(metadata);
+                src.snapshot_vectors().await
+            }
+        })
+        .expect("snapshot_vectors");
+
+        assert_eq!(pairs.len(), 2, "only the two live vector-bearing memories");
+        let (_m1, v1) = pairs
+            .iter()
+            .find(|(m, _)| m.slot() == 1)
+            .expect("slot 1 present");
+        assert!((v1[0] - 0.25).abs() < f32::EPSILON);
+        let (_m2, v2) = pairs
+            .iter()
+            .find(|(m, _)| m.slot() == 2)
+            .expect("slot 2 present");
+        assert!((v2[0] - 0.5).abs() < f32::EPSILON);
+        assert!(
+            pairs.iter().all(|(m, _)| m.slot() != 3),
+            "tombstoned memory must be excluded"
+        );
+        assert!(
+            pairs.iter().all(|(m, _)| m.slot() != 4),
+            "vectorless memory must be excluded"
+        );
     }
 
     // ---- WalDirRetentionSource --------------------------------------------

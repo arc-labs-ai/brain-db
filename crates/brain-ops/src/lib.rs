@@ -48,8 +48,8 @@ pub use context::{CrossEncoderSlot, OpsContext};
 pub use dispatch::{dispatch, DispatchOutcome, RequestCaller};
 pub use error::{ErrorCode, OpError};
 pub use handlers::subscribe::{
-    parse_filter, EventBus, EventEnvelope, LsnAllocator, ParsedFilter, SubscriptionHandle,
-    SubscriptionRegistry, DEFAULT_EVENT_CHANNEL_CAPACITY,
+    parse_filter, EventBus, EventEnvelope, LsnAllocator, ParsedFilter, SimilarityMatch,
+    SubscriptionHandle, SubscriptionRegistry, DEFAULT_EVENT_CHANNEL_CAPACITY,
 };
 pub use handlers::txn::{TxnId, TxnState, TxnStore};
 pub use metrics::{

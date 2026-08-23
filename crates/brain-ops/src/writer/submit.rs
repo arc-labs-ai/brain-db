@@ -824,6 +824,7 @@ fn phase_to_envelope(
         Phase::UpsertMemory {
             id,
             text,
+            vector,
             kind,
             salience,
             session_id,
@@ -843,6 +844,10 @@ fn phase_to_envelope(
             stage_outcome: None,
             stage_payload: None,
             space_id: write.space_id,
+            // Carry the freshly-embedded vector so a `similar_to`
+            // subscription can be evaluated network-side without a
+            // per-event shard lookup.
+            vector: Some(Arc::from(vector.clone())),
         }),
 
         Phase::Tombstone { target, .. } => match target {
@@ -861,6 +866,7 @@ fn phase_to_envelope(
                 stage_outcome: None,
                 stage_payload: None,
                 space_id: write.space_id,
+                vector: None,
             }),
             // Typed-graph tombstones publish through the typed-graph-event
             // path (emit_graph_event), not the memory subscribe bus.
@@ -899,6 +905,7 @@ fn phase_to_envelope(
             stage_outcome: None,
             stage_payload: None,
             space_id: write.space_id,
+            vector: None,
         }),
 
         Phase::Unlink { from, to, kind, .. } => Some(EventEnvelope {
@@ -924,6 +931,7 @@ fn phase_to_envelope(
             stage_outcome: None,
             stage_payload: None,
             space_id: write.space_id,
+            vector: None,
         }),
 
         // typed-graph phases publish through the typed-graph-event channel

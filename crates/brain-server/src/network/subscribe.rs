@@ -336,8 +336,25 @@ impl SubscriptionRegistry {
         target_shard: ShardId,
         req: &SubscribeRequest,
         frame_tx: flume::Sender<crate::connection::OutgoingFrame>,
+        similarity_reference: Option<[f32; brain_embed::VECTOR_DIM]>,
     ) -> Result<u32, OpError> {
-        let filter = parse_filter(req).map_err(OpError::Ops)?;
+        let mut filter = parse_filter(req).map_err(OpError::Ops)?;
+        // Inject the reference vector resolved by the caller
+        // (`handle_subscribe_start`) via the one-time shard round-trip.
+        // The threshold was already validated by `parse_filter`. A
+        // similarity filter with no resolved reference cannot match
+        // meaningfully, so treat it as a hard rejection rather than a
+        // silent all-pass.
+        if let Some(sim) = req.filter.similar_to {
+            match similarity_reference {
+                Some(reference) => filter.set_similarity_reference(reference, sim.threshold),
+                None => {
+                    return Err(OpError::Ops(brain_ops::OpError::InvalidRequest(
+                        "subscribe: similar_to reference vector was not resolved".into(),
+                    )))
+                }
+            }
+        }
         // Subscribe live FIRST, then replay the WAL — this is the
         // cutover discipline:
         // taking the broadcast Receiver before we read the WAL

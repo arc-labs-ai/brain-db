@@ -134,18 +134,24 @@ impl BrainSemanticRetriever {
         filters: &SemanticFilters,
         arena: Option<&dyn SpaceVectorSource>,
     ) -> Result<Vec<RankedItem>, SemanticError> {
-        // Single-space brute-force lane. When the query is scoped to
-        // exactly one space, an arena is wired, and that space is small,
-        // exact-scan only that space's own vectors instead of walking the
-        // shared HNSW graph (which misses a sparse tenant at high
-        // selectivity). Returns `Some` with the final hits (HyPE union
-        // already applied); `None` means "space missing or too large —
-        // use the shared HNSW path below".
-        if filters.space_ids.len() == 1 {
-            if let Some(arena) = arena {
-                if let Some(hits) = self.brute_force_memory(vector, config, filters, arena)? {
-                    return Ok(hits);
-                }
+        // Single-space brute-force lane. When the query is scoped to exactly
+        // one space, the shard read path is active (`arena.is_some()` — the
+        // arena handle is the read-path marker, not the vector source; see
+        // below), and that space is small, exact-scan only that space's own
+        // vectors instead of walking the shared HNSW graph (which misses a
+        // sparse tenant at high selectivity). Returns `Some` with the final
+        // hits (HyPE union already applied); `None` means "space missing, too
+        // large, or no live vectors resolved — use the shared HNSW path".
+        //
+        // The arena is only the routing signal: its mmap is populated solely
+        // by WAL recovery on restart, so a memory encoded in the current run
+        // is absent from it. The live by-id vectors live in the redb artifact
+        // store (written on the ENCODE ack path), which `brute_force_memory`
+        // reads directly — resolving from the arena would drop every same-run
+        // memory and return a degraded set.
+        if filters.space_ids.len() == 1 && arena.is_some() {
+            if let Some(hits) = self.brute_force_memory(vector, config, filters)? {
+                return Ok(hits);
             }
         }
 
@@ -163,6 +169,7 @@ impl BrainSemanticRetriever {
         let kind_filter = filters.memory_kind.map(memory_kind_to_u8);
         let created_range = filters.created_at_ms.clone();
         let session_filter = filters.session_ids.clone();
+        let include_tombstoned = filters.include_tombstoned;
 
         let id_passes = |id: MemoryId| -> bool {
             let key = id.raw().to_be_bytes();
@@ -176,6 +183,7 @@ impl BrainSemanticRetriever {
                 kind_filter,
                 created_range.as_ref(),
                 &session_filter,
+                include_tombstoned,
             )
         };
 
@@ -209,6 +217,7 @@ impl BrainSemanticRetriever {
                                     kind_filter,
                                     created_range.as_ref(),
                                     &session_filter,
+                                    include_tombstoned,
                                 )
                             })
                             .unwrap_or(false)
@@ -229,17 +238,26 @@ impl BrainSemanticRetriever {
     /// `> SPACE_BRUTEFORCE_MAX` returns `Ok(None)` (the caller falls
     /// through to the shared HNSW path — per-space HNSW for large spaces
     /// is Phase 2). Otherwise it range-scans that space's
-    /// `MEMORIES_BY_SPACE_TIMELINE_TABLE` keyspace, reads each live
-    /// vector from the arena, scores exact cosine, keeps hits clearing
-    /// the threshold, and then applies the **same HyPE union** the shared
-    /// path applies — the entire reason this lane lives in the retriever,
-    /// so single-space paraphrase recall is never dropped.
+    /// `MEMORIES_BY_SPACE_TIMELINE_TABLE` keyspace, resolves each candidate's
+    /// vector from the redb artifact store (the live by-id store — the arena
+    /// mmap holds only WAL-recovered vectors and is empty for same-run
+    /// encodes), drops tombstoned rows unless `include_tombstoned`, scores
+    /// exact cosine, keeps hits clearing the threshold, and then applies the
+    /// **same HyPE union** the shared path applies — the entire reason this
+    /// lane lives in the retriever, so single-space paraphrase recall is
+    /// never dropped.
+    ///
+    /// Returns `Ok(None)` (fall through to the shared HNSW path) when the
+    /// space is missing, too large, or when it had live candidates but none
+    /// resolved to a vector — the latter guards against a degraded empty
+    /// result when the artifact store is momentarily behind the timeline
+    /// index; the shared HNSW (which carries the live vectors in its pending
+    /// buffer) then serves the query.
     fn brute_force_memory(
         &self,
         vector: &[f32; SEMANTIC_VECTOR_DIM],
         config: &SemanticRetrieverConfig,
         filters: &SemanticFilters,
-        arena: &dyn SpaceVectorSource,
     ) -> Result<Option<Vec<RankedItem>>, SemanticError> {
         let namespace_id = filters.namespace_id;
         let space_bytes: [u8; 16] = Into::<[u8; 16]>::into(filters.space_ids[0]);
@@ -292,8 +310,23 @@ impl BrainSemanticRetriever {
             .range::<&[u8]>((lower_bound, upper_bound))
             .map_err(|e| SemanticError::Internal(format!("timeline range: {e}")))?;
 
+        // The tombstone gate needs the row's ACTIVE flag; the timeline key
+        // carries only scope, not liveness. Open the memories table once and
+        // look each candidate up (cheap point gets, bounded by the small
+        // space's candidate count).
+        let memories_t = rtxn
+            .open_table(MEMORIES_TABLE)
+            .map_err(|e| SemanticError::Internal(format!("open MEMORIES_TABLE: {e}")))?;
+
         let query_norm = l2_norm(vector);
         let mut hits: Vec<(MemoryId, f32)> = Vec::new();
+        // Track whether any live candidate resolved a vector. If the space
+        // had candidates but none resolved, the artifact store is behind the
+        // timeline — fall through to the shared HNSW rather than return an
+        // empty set (the bug this lane previously hit: same-run encodes are
+        // absent from the arena, so every candidate was skipped).
+        let mut candidates: usize = 0;
+        let mut resolved: usize = 0;
         for entry in range {
             let (k, _v) =
                 entry.map_err(|e| SemanticError::Internal(format!("timeline entry: {e}")))?;
@@ -313,14 +346,47 @@ impl BrainSemanticRetriever {
             let mut idb = [0u8; 16];
             idb.copy_from_slice(&key[36..52]);
             let id = MemoryId::from_raw(u128::from_be_bytes(idb));
-            let Some(v) = arena.vector_at(id.slot(), id.version()) else {
-                // Unoccupied / tombstoned / hard-forgotten / stale id.
+
+            // Tombstone gate: exclude soft-forgotten rows unless requested,
+            // matching the shared-HNSW lane. A missing row means the memory
+            // is gone (hard forget) — skip it.
+            if !filters.include_tombstoned {
+                match memories_t.get(&id.raw().to_be_bytes()) {
+                    Ok(Some(g)) => {
+                        if !g.value().is_active() {
+                            continue;
+                        }
+                    }
+                    Ok(None) => continue,
+                    Err(e) => return Err(SemanticError::Internal(format!("memory row read: {e}"))),
+                }
+            }
+            candidates += 1;
+
+            // Live by-id vector store (redb artifact), NOT the arena mmap:
+            // the arena is empty for anything encoded this run.
+            let Some(v) = crate::memory_artifact::get_artifact_vector(&rtxn, id.to_be_bytes())
+            else {
                 continue;
             };
+            resolved += 1;
             let cos = cosine_prenorm(vector, query_norm, &v);
             if cos >= config.similarity_threshold {
                 hits.push((id, cos));
             }
+        }
+
+        // Fall through to the shared HNSW when live candidates existed but
+        // none had a resolvable vector — the shared graph holds the live
+        // vectors in its pending buffer and will serve them.
+        if candidates > 0 && resolved == 0 {
+            tracing::debug!(
+                target: "brain_ops::semantic_retriever",
+                namespace_id,
+                candidates,
+                "brute-force fallthrough: no candidate vector resolved from artifact store",
+            );
+            return Ok(None);
         }
 
         // Exact top-k: sort descending, break ties deterministically on id.
@@ -339,9 +405,7 @@ impl BrainSemanticRetriever {
         // queries would regress paraphrase recall — the keystone reason the
         // brute-force lane lives inside the retriever.
         if let Some(hype) = self.hype_index.as_ref() {
-            let memories_t = rtxn
-                .open_table(MEMORIES_TABLE)
-                .map_err(|e| SemanticError::Internal(format!("open MEMORIES_TABLE: {e}")))?;
+            // Reuse the already-open memories table from the direct scan.
             let space_filter: HashSet<[u8; 16]> =
                 filters.space_ids.iter().map(|a| (*a).into()).collect();
             let kind_filter = filters.memory_kind.map(memory_kind_to_u8);
@@ -364,6 +428,7 @@ impl BrainSemanticRetriever {
                                     kind_filter,
                                     created_range.as_ref(),
                                     &session_filter,
+                                    filters.include_tombstoned,
                                 )
                             })
                             .unwrap_or(false)
@@ -546,10 +611,18 @@ fn memory_row_passes(
     kind_filter: Option<u8>,
     created_range: Option<&std::ops::RangeInclusive<u64>>,
     session_filter: &[u64],
+    include_tombstoned: bool,
 ) -> bool {
     // Tenant wall: unconditional. A row from a different namespace never
     // surfaces in the vector lane, regardless of any other filter.
     if row.namespace_id != namespace_id {
+        return false;
+    }
+    // Tombstone gate: a soft-forgotten row's HNSW node lingers until the
+    // next rebuild, so exclude it here (unless explicitly requested) to keep
+    // the semantic lane consistent with the graph/lexical lanes and to stop
+    // tombstoned candidates from crowding live matches out of the ef window.
+    if !include_tombstoned && !row.is_active() {
         return false;
     }
     if !space_filter.is_empty() && !space_filter.contains(&row.space_id_bytes) {
@@ -864,7 +937,7 @@ fn l2_norm(v: &[f32; SEMANTIC_VECTOR_DIM]) -> f32 {
     use wide::f32x8;
     let mut acc = f32x8::ZERO;
     // 384 == 48 * 8, so the whole vector is covered by full lanes.
-    for chunk in v.chunks_exact(8) {
+    for chunk in v.as_chunks::<8>().0.iter() {
         let x = f32x8::from([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
@@ -884,7 +957,7 @@ fn cosine_prenorm(
     use wide::f32x8;
     let mut dot = f32x8::ZERO;
     let mut bsq = f32x8::ZERO;
-    for (ca, cb) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
+    for (ca, cb) in a.as_chunks::<8>().0.iter().zip(b.as_chunks::<8>().0.iter()) {
         let va = f32x8::from([ca[0], ca[1], ca[2], ca[3], ca[4], ca[5], ca[6], ca[7]]);
         let vb = f32x8::from([cb[0], cb[1], cb[2], cb[3], cb[4], cb[5], cb[6], cb[7]]);
         dot += va * vb;

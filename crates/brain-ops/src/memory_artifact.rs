@@ -33,13 +33,14 @@
 
 use brain_core::MemoryId;
 use brain_metadata::tables::memory_artifacts::MEMORY_ARTIFACTS_TABLE;
+use brain_metadata::tables::memory_vector::MEMORY_VECTORS_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_metadata::MetadataDb;
 use brain_protocol::envelope::response::{
     EncodeGraphEdge, EncodeGraphNode, EncodeStageArtifact, EncodeStageGraph,
     EncodeStageKeywordField, EncodeStageRecord,
 };
-use redb::{ReadableTable, WriteTransaction};
+use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
 /// Edge kinds the extractor stage owns. It always recomputes the *full*
 /// current committed entity/statement/relation graph on every call (via
@@ -89,7 +90,24 @@ pub fn delete_memory_artifact(wtxn: &WriteTransaction, memory_id: [u8; 16]) -> R
     table
         .remove(&memory_id)
         .map_err(|e| format!("artifact remove: {e}"))?;
+    // The raw vector is embedding-at-rest too — drop it alongside the
+    // bundle so a reclaim / hard-forget leaves nothing behind.
+    let mut vt = wtxn
+        .open_table(MEMORY_VECTORS_TABLE)
+        .map_err(|e| format!("open memory_vectors: {e}"))?;
+    vt.remove(&memory_id)
+        .map_err(|e| format!("vector remove: {e}"))?;
     Ok(())
+}
+
+/// Encode an embedding as the flat little-endian `f32` byte run the
+/// `memory_vectors` table stores.
+fn vector_to_le_bytes(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(vector.len() * 4);
+    for f in vector {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    bytes
 }
 
 /// Write the **sync** portion (vector + record + analyzed keyword terms) into
@@ -105,6 +123,16 @@ pub fn put_sync_artifact(
     record: EncodeStageRecord,
     keyword_fields: Vec<EncodeStageKeywordField>,
 ) -> Result<(), String> {
+    // Fast by-id vector store: the raw LE-`f32` run, resolved on the hot
+    // recall path (`get_artifact_vector`) with a single point lookup +
+    // decode — no JSON parse of the whole (graph-bearing) bundle.
+    {
+        let mut vt = wtxn
+            .open_table(MEMORY_VECTORS_TABLE)
+            .map_err(|e| format!("open memory_vectors: {e}"))?;
+        vt.insert(&memory_id, vector_to_le_bytes(&vector).as_slice())
+            .map_err(|e| format!("vector write: {e}"))?;
+    }
     merge_memory_artifact(wtxn, memory_id, |bundle| {
         bundle.vector = vector;
         bundle.record = Some(record);
@@ -377,6 +405,53 @@ pub fn read_memory_artifact(
         .and_then(|g| serde_json::from_str::<EncodeStageArtifact>(g.value()).ok()))
 }
 
+/// Read just a memory's stored write-time embedding vector by id, under a
+/// caller-provided read txn. Returns `None` when the row is absent or the
+/// stored vector isn't the expected dimension.
+///
+/// This is the LIVE by-id vector store, written on the ENCODE ack path by
+/// [`put_sync_artifact`] — unlike the memory-mapped arena (populated only
+/// by WAL recovery on shard restart), it is present for a memory encoded
+/// in the current run. Consumers needing a memory's vector by id
+/// (single-space brute-force recall, consolidation clustering, rebuild
+/// sources) must resolve it here, not from the arena.
+///
+/// Fast path: the dedicated `memory_vectors` table — a single point
+/// lookup + little-endian decode, no JSON. Fallback: the JSON artifact
+/// bundle, for rows written before the raw table existed.
+#[must_use]
+pub fn get_artifact_vector(
+    rtxn: &ReadTransaction,
+    memory_id: [u8; 16],
+) -> Option<[f32; brain_embed::VECTOR_DIM]> {
+    // Fast path — raw LE-f32 bytes, no bundle parse.
+    if let Ok(vt) = rtxn.open_table(MEMORY_VECTORS_TABLE) {
+        if let Some(g) = vt.get(&memory_id).ok().flatten() {
+            let bytes = g.value();
+            if bytes.len() == brain_embed::VECTOR_DIM * 4 {
+                let mut v = [0.0_f32; brain_embed::VECTOR_DIM];
+                for (slot, chunk) in v.iter_mut().zip(bytes.as_chunks::<4>().0.iter()) {
+                    *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                }
+                return Some(v);
+            }
+        }
+    }
+    // Fallback — older rows whose vector lives only in the JSON bundle.
+    let table = rtxn.open_table(MEMORY_ARTIFACTS_TABLE).ok()?;
+    let bundle: EncodeStageArtifact = table
+        .get(&memory_id)
+        .ok()
+        .flatten()
+        .and_then(|g| serde_json::from_str(g.value()).ok())?;
+    if bundle.vector.len() != brain_embed::VECTOR_DIM {
+        return None;
+    }
+    let mut v = [0.0_f32; brain_embed::VECTOR_DIM];
+    v.copy_from_slice(&bundle.vector);
+    Some(v)
+}
+
 /// Read a memory's `(namespace, space)` scope from its metadata row.
 /// `None` when the row is absent (forgotten / never existed).
 fn memory_scope(
@@ -571,6 +646,67 @@ mod tests {
         assert_eq!(b.record.as_ref().unwrap().text_len, 12);
         assert_eq!(b.keyword_fields.len(), 1);
         assert!(!b.keyword_fields[0].terms.is_empty());
+    }
+
+    #[test]
+    fn get_artifact_vector_reads_raw_table_and_delete_clears_it() {
+        use brain_metadata::tables::memory_vector::MEMORY_VECTORS_TABLE;
+        let (_dir, db) = open_db();
+        let id = [9u8; 16];
+        let mut vector = vec![0.0f32; brain_embed::VECTOR_DIM];
+        vector[0] = 0.5;
+        vector[brain_embed::VECTOR_DIM - 1] = -0.25;
+        let record = sync_record(id, 0, 1.0, 1, 0, brain_embed::VECTOR_DIM as u32, 4);
+
+        let wtxn = db.write_txn().unwrap();
+        put_sync_artifact(&wtxn, id, vector.clone(), record, Vec::new()).unwrap();
+        wtxn.commit().unwrap();
+
+        // The raw table row exists and is exactly VECTOR_DIM * 4 bytes.
+        {
+            let rtxn = db.read_txn().unwrap();
+            let vt = rtxn.open_table(MEMORY_VECTORS_TABLE).unwrap();
+            let got = vt.get(&id).unwrap().expect("raw vector row present");
+            assert_eq!(got.value().len(), brain_embed::VECTOR_DIM * 4);
+        }
+        // get_artifact_vector resolves it via the raw fast path.
+        {
+            let rtxn = db.read_txn().unwrap();
+            let v = get_artifact_vector(&rtxn, id).expect("vector resolves");
+            assert!((v[0] - 0.5).abs() < f32::EPSILON);
+            assert!((v[brain_embed::VECTOR_DIM - 1] + 0.25).abs() < f32::EPSILON);
+        }
+        // delete_memory_artifact clears both the bundle and the raw row.
+        let wtxn = db.write_txn().unwrap();
+        delete_memory_artifact(&wtxn, id).unwrap();
+        wtxn.commit().unwrap();
+        {
+            let rtxn = db.read_txn().unwrap();
+            assert!(
+                get_artifact_vector(&rtxn, id).is_none(),
+                "vector gone after delete"
+            );
+            let vt = rtxn.open_table(MEMORY_VECTORS_TABLE).unwrap();
+            assert!(vt.get(&id).unwrap().is_none(), "raw row removed");
+        }
+    }
+
+    #[test]
+    fn get_artifact_vector_falls_back_to_json_bundle_when_raw_absent() {
+        // A row whose vector lives only in the JSON bundle (seeded via
+        // merge_memory_artifact, or written before the raw table existed)
+        // must still resolve — via the fallback path.
+        let (_dir, db) = open_db();
+        let id = [11u8; 16];
+        let mut vector = vec![0.0f32; brain_embed::VECTOR_DIM];
+        vector[1] = 0.75;
+        let wtxn = db.write_txn().unwrap();
+        merge_memory_artifact(&wtxn, id, |b| b.vector = vector.clone()).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let v = get_artifact_vector(&rtxn, id).expect("fallback resolves from bundle");
+        assert!((v[1] - 0.75).abs() < f32::EPSILON);
     }
 
     #[test]

@@ -492,6 +492,7 @@ async fn do_temporal_edge_cycle(
                 edges_written,
             })),
             space_id: source_spaces.get(&memory_id).copied().unwrap_or_default(),
+            vector: None,
         };
         ctx.ops.publish_stage_event(envelope).await;
     }

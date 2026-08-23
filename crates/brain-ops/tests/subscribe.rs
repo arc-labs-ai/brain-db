@@ -239,7 +239,7 @@ fn lifecycle_unsubscribe_unknown_stream_id_returns_not_found() {
 }
 
 #[test]
-fn lifecycle_similar_to_filter_returns_not_yet_implemented() {
+fn lifecycle_similar_to_filter_valid_threshold_registers() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let mut filter = empty_filter();
@@ -247,11 +247,30 @@ fn lifecycle_similar_to_filter_returns_not_yet_implemented() {
             reference_memory_id: 1,
             threshold: 0.5,
         });
+        // A well-formed similarity filter now registers cleanly — the
+        // reference vector is resolved shard-side by the connection
+        // layer, not here.
+        fix.ctx
+            .subscriptions
+            .register(&sub_req(filter))
+            .expect("valid similarity filter registers");
+    })
+}
+
+#[test]
+fn lifecycle_similar_to_filter_rejects_nan_threshold() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let mut filter = empty_filter();
+        filter.similar_to = Some(SimilarityFilter {
+            reference_memory_id: 1,
+            threshold: f32::NAN,
+        });
         let err = match fix.ctx.subscriptions.register(&sub_req(filter)) {
             Err(e) => e,
-            Ok(_) => panic!("expected NotYetImplemented"),
+            Ok(_) => panic!("expected InvalidRequest for NaN threshold"),
         };
-        assert!(matches!(err, OpError::NotYetImplemented(_)), "got {err:?}");
+        assert!(matches!(err, OpError::InvalidRequest(_)), "got {err:?}");
     })
 }
 
@@ -593,6 +612,7 @@ fn lagged_subscriber_freezes_final_lsn_and_reports_overloaded() {
                 stage_outcome: None,
                 stage_payload: None,
                 space_id: brain_core::SpaceId::default(),
+                vector: None,
             });
         }
 
@@ -1035,6 +1055,7 @@ mod stage_completed_durability {
                 edges_written,
             })),
             space_id: SpaceId::default(),
+            vector: None,
         }
     }
 

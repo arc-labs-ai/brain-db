@@ -18,16 +18,22 @@
 //!
 //! ## Clustering
 //!
-//! calls for DBSCAN over vector cosine. v1's HNSW backend
-//! doesn't expose `vector_for(memory_id)` (the arena lookup is not yet
-//! available), so the **worker can't run vector-based clustering yet**.
+//! Consolidation clusters recent Episodic memories in the same context
+//! by vector cosine similarity (DBSCAN-style density clustering per the
+//! spec). Each candidate's write-time vector is resolved by id from the
+//! arena via [`SpaceVectorSource::vector_at`] — a verified, fail-soft
+//! read that returns `None` for a stale, tombstoned, or hard-forgotten
+//! slot (invariant #4). Those candidates are dropped, never
+//! mis-clustered. The surviving `(memory_id, vector)` pairs are grouped
+//! by [`cluster_by_similarity`] (single-linkage over cosine, dropping
+//! groups below `min_cluster_size`), and each returned cluster is
+//! consolidated independently.
 //!
-//! The cycle therefore uses **window-based grouping**: within a
-//! (context, recency_window) bucket, the worker treats the candidates
-//! as a single cluster if at least `min_cluster_size` of them aren't
-//! already consolidated. The proper similarity clustering is shipped
-//! as a tested pure helper ([`cluster_by_similarity`]) to wire up once
-//! vectors become id-accessible. Documented v1 deviation
+//! When no vector source is wired (a bootstrap / no-arena shard, or a
+//! test harness that doesn't inject one), the worker falls back to
+//! **window-based grouping**: within a (context, recency_window) bucket
+//! it treats the oldest `min_cluster_size` candidates as a single
+//! cluster. The worker never hard-depends on the arena.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
@@ -300,22 +306,39 @@ async fn do_consolidation_cycle(
             break;
         }
 
-        // v1 window-based grouping. Sort by recency and take the
-        // oldest `min_cluster_size` ids as "the cluster" — older
-        // memories are the ones most likely to benefit from
-        // consolidation. (Similarity clustering is the upgrade;
-        // `cluster_by_similarity` ships as a pure helper for that.)
-        let mut sorted: Vec<WindowCandidate> = candidates;
-        sorted.sort_by_key(|c| c.created_at_unix_nanos);
-        if sorted.len() < worker.min_cluster_size {
-            continue;
-        }
-        let cluster: Vec<MemoryId> = sorted
-            .iter()
-            .take(worker.min_cluster_size)
-            .map(|c| c.memory_id)
-            .collect();
-        let clusters = vec![cluster];
+        // Group this bucket into clusters by cosine similarity
+        // (DBSCAN-style). Resolve each candidate's write-time vector by
+        // id from the LIVE redb artifact store (`get_artifact_vector`) —
+        // NOT the memory-mapped arena, which is populated only by WAL
+        // recovery and is therefore empty for every memory encoded in the
+        // current run. A candidate whose stored vector can't be read
+        // (forgotten / never produced) is dropped fail-soft, never
+        // mis-clustered.
+        let clusters: Vec<Vec<MemoryId>> = {
+            let rtxn =
+                ctx.ops.executor.metadata.read_txn().map_err(|e| {
+                    WorkerError::Ops(format!("consolidation vector read_txn: {e:?}"))
+                })?;
+            let mut resolved: Vec<ClusterCandidate> = Vec::with_capacity(candidates.len());
+            for cand in &candidates {
+                let Some(vector) = brain_ops::memory_artifact::get_artifact_vector(
+                    &rtxn,
+                    cand.memory_id.to_be_bytes(),
+                ) else {
+                    continue; // fail-soft: no stored vector for this id
+                };
+                resolved.push(ClusterCandidate {
+                    memory_id: cand.memory_id,
+                    vector,
+                    created_at_unix_nanos: cand.created_at_unix_nanos,
+                });
+            }
+            cluster_by_similarity(
+                &resolved,
+                worker.similarity_threshold,
+                worker.min_cluster_size,
+            )
+        };
 
         for cluster in clusters {
             if consolidations >= cfg.batch_size {

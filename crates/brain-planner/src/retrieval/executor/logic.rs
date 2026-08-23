@@ -1026,6 +1026,13 @@ fn invoke_semantic(
         ..SemanticFilters::default()
     };
     apply_pre_filter_to_semantic(&planned.pre_filter, &mut filters);
+    // Tombstone gate: mirror the request's include_tombstoned into the vector
+    // lane. A soft-forgotten row's HNSW node lingers until the next rebuild,
+    // so without this the HNSW top-k fills with tombstoned candidates the
+    // downstream filter chain then drops — starving the live matches that sat
+    // just below them in the ef window. Excluding at source keeps the semantic
+    // lane consistent with the graph/lexical lanes and preserves recall.
+    filters.include_tombstoned = req.include_tombstoned;
     // Front-gate scope: when the caller specified a context filter,
     // restrict every HNSW visit to that context set. The semantic
     // closure already reads MemoryMetadata per visit, so adding the

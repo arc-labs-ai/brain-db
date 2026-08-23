@@ -477,6 +477,7 @@ async fn do_auto_edge_cycle(
                 edges_written,
             })),
             space_id: memory_space_id(ctx, source_id),
+            vector: None,
         };
         ctx.ops.publish_stage_event(envelope).await;
     }

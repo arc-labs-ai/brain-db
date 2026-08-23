@@ -60,19 +60,19 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use brain_core::{ShardId, SlotVersion};
+use brain_core::{MemoryId, ShardId, SlotVersion};
 use brain_embed::{Dispatcher, VECTOR_DIM};
 use brain_index::entity_hnsw::{EntityHnswIndex, EntityHnswParams};
 use brain_index::hype_hnsw::HypeHnswIndex;
 use brain_index::statement_hnsw::{StatementHnswIndex, StatementHnswParams};
 use brain_index::statement_question_hnsw::StatementQuestionHnswIndex;
-use brain_index::{IndexParams, SharedHnsw};
+use brain_index::{IndexParams, PendingEntry, SharedHnsw};
 use brain_metadata::MetadataDb;
 use brain_ops::error::OpError;
 use brain_ops::subscribe::EventEnvelope;
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::envelope::request::RequestBody;
+use brain_protocol::envelope::request::{ForgetMode, RequestBody};
 use brain_storage::arena::{
     AllocError, ArenaFile, ArenaOpenError, SlotAllocator, DEFAULT_INITIAL_CAPACITY_SLOTS,
 };
@@ -92,7 +92,8 @@ use brain_workers::{
 };
 
 use self::adapters::{
-    ArenaRebuildSource, ArenaSpaceVectorSource, ShardSnapshotSource, WalDirRetentionSource,
+    ArenaRebuildSource, ArenaSpaceVectorSource, RedbRebuildSource, ShardSnapshotSource,
+    WalDirRetentionSource,
 };
 use flume::{Receiver, Sender};
 use glommio::{ExecutorJoinHandle, LocalExecutorBuilder, Placement};
@@ -105,6 +106,19 @@ use tracing::{error, info, warn, Instrument as _};
 pub(crate) enum ShardRequest {
     /// Trivial round-trip. The shard replies with `()`.
     Ping { reply_tx: Sender<()> },
+    /// Resolve a memory's embedding vector by id, space-walled to
+    /// `space`. Used once at SUBSCRIBE registration to fetch the
+    /// reference vector for a `similar_to` filter — a one-time,
+    /// pure-data round-trip so the per-event filter never reaches into
+    /// shard state. The reply is `Some([f32; VECTOR_DIM])` for a live
+    /// memory owned by `space`, `None` when the memory is missing,
+    /// tombstoned, stale (slot-version mismatch), or belongs to another
+    /// space.
+    GetMemoryVector {
+        space: brain_core::SpaceId,
+        memory_id: brain_core::MemoryId,
+        reply_tx: Sender<Option<[f32; VECTOR_DIM]>>,
+    },
     /// Allocate a fresh slot. Returns `(slot_idx, slot_version)`.
     AllocSlot {
         reply_tx: Sender<Result<(u64, SlotVersion), ShardOpError>>,
@@ -949,6 +963,31 @@ impl ShardHandle {
         Ok(())
     }
 
+    /// Resolve a memory's embedding vector by id, space-walled to
+    /// `space`. One-time round-trip used by SUBSCRIBE to fetch the
+    /// reference vector for a `similar_to` filter. Returns `Ok(None)`
+    /// when the memory is missing, tombstoned, stale, or owned by a
+    /// different space; `Err` only if the shard is unreachable.
+    pub async fn get_memory_vector(
+        &self,
+        space: brain_core::SpaceId,
+        memory_id: brain_core::MemoryId,
+    ) -> Result<Option<[f32; VECTOR_DIM]>, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::GetMemoryVector {
+                space,
+                memory_id,
+                reply_tx,
+            })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)
+    }
+
     /// Ask the shard's allocator for a fresh slot. Returns the slot
     /// index and its version stamp.
     pub async fn alloc_slot(&self) -> Result<(u64, SlotVersion), AllocSlotError> {
@@ -1348,6 +1387,47 @@ impl Shard {
             return 0;
         };
         table.len().unwrap_or(0)
+    }
+
+    /// Resolve a memory's full-precision embedding vector by id,
+    /// space-walled to `space`. Returns `None` when the row is missing,
+    /// tombstoned, belongs to another space, or has no stored text.
+    /// Never a silent cross-tenant read: the caller (SUBSCRIBE
+    /// similarity registration) rejects `None` with `InvalidRequest`.
+    ///
+    /// The vector is produced by re-embedding the memory's stored text
+    /// (`TEXTS_TABLE`) rather than reading the arena: the arena is
+    /// populated only by WAL recovery on shard restart, so a memory
+    /// encoded in the current run has no arena slot yet. The embedder is
+    /// deterministic, so re-embedding reproduces the exact vector indexed
+    /// at encode time.
+    fn memory_vector_for(
+        &self,
+        space: brain_core::SpaceId,
+        memory_id: brain_core::MemoryId,
+    ) -> Option<[f32; VECTOR_DIM]> {
+        use brain_metadata::tables::memory::MEMORIES_TABLE;
+        use brain_metadata::tables::text::TEXTS_TABLE;
+
+        let rtxn = self.ops.executor.metadata.read_txn().ok()?;
+        let table = rtxn.open_table(MEMORIES_TABLE).ok()?;
+        let row = table.get(memory_id.to_be_bytes()).ok().flatten()?.value();
+        // Space wall + liveness: a subscriber may only anchor similarity
+        // on a live memory its own (effective) space owns.
+        if !row.is_active() || row.space_id_bytes != space.0.into_bytes() {
+            return None;
+        }
+        // Resolve the reference vector by re-embedding the memory's stored
+        // text, NOT by reading the arena. The arena is populated only by
+        // WAL recovery on shard restart, so a memory encoded in the
+        // current run has no arena slot yet and would resolve to None —
+        // which silently rejected every same-run similarity subscription.
+        // The embedder is deterministic, so re-embedding the stored text
+        // reproduces the exact vector that was indexed at encode time.
+        let texts = rtxn.open_table(TEXTS_TABLE).ok()?;
+        let stored = texts.get(memory_id.to_be_bytes()).ok().flatten()?;
+        let text = std::str::from_utf8(stored.value()).ok()?;
+        self.ops.executor.embedder.embed(text).ok()
     }
 
     /// Sample the shard's on-disk storage footprint for `/metrics`.
@@ -2317,11 +2397,25 @@ pub fn spawn_shard(
             });
 
             // Build real worker adapters.
+            //
+            // Two rebuild sources, by lifecycle phase:
+            //
+            // - `rebuild_source` (arena) feeds the *boot recovery* rebuild
+            //   below. On restart the arena is the freshly-WAL-replayed image
+            //   of every durable memory, so it is the authoritative substrate
+            //   here.
+            // - `redb_rebuild_source` feeds every *runtime* rebuild (the HNSW
+            //   maintenance worker + the admin `rebuild-ann` route). The arena
+            //   is never written by the live encode path, so a runtime rebuild
+            //   from it would silently drop every same-run memory; redb holds
+            //   the durable write-time vector for the complete live set.
             let rebuild_source: Arc<dyn RebuildSource<{ VECTOR_DIM }>> = Arc::new(
                 ArenaRebuildSource::<{ VECTOR_DIM }>::new(shard_id, arena_cell.clone()),
             );
+            let redb_rebuild_source: Arc<dyn RebuildSource<{ VECTOR_DIM }>> =
+                Arc::new(RedbRebuildSource::<{ VECTOR_DIM }>::new(metadata.clone()));
             // Keep a clone for the admin `rebuild-ann` route.
-            let rebuild_source_for_shard = rebuild_source.clone();
+            let rebuild_source_for_shard = redb_rebuild_source.clone();
 
             // Recovery step 6: restore the memory HNSW.
             // Try snapshot-load first; on any failure (missing, CRC /
@@ -2641,7 +2735,7 @@ pub fn spawn_shard(
             register_phase8_workers(
                 &mut scheduler,
                 ops.clone(),
-                rebuild_source,
+                redb_rebuild_source,
                 wal_retention_source,
                 snapshot_source.clone(),
                 cache_eviction_source,
@@ -3084,6 +3178,19 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     );
                 }
             }
+            ShardRequest::GetMemoryVector {
+                space,
+                memory_id,
+                reply_tx,
+            } => {
+                let vector = shard.memory_vector_for(space, memory_id);
+                if reply_tx.send_async(vector).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "GetMemoryVector reply dropped (caller gone)"
+                    );
+                }
+            }
             ShardRequest::AllocSlot { reply_tx } => {
                 // Borrow mutably for the duration of the (synchronous)
                 // allocator call. The borrow is dropped before the
@@ -3217,15 +3324,21 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                 let result = match shard.rebuild_source.snapshot_vectors().await {
                     Ok(vectors) => {
                         let params = shard.hnsw_shared.params();
-                        match brain_index::rebuild::rebuild_impl(params, vectors) {
-                            Ok((new_idx, _report)) => {
-                                let entries = new_idx.len();
-                                shard.hnsw_shared.swap(new_idx);
-                                Ok(RebuildReport {
-                                    entries,
-                                    elapsed_ms: start.elapsed().as_millis() as u64,
-                                })
-                            }
+                        // Fold the redb snapshot together with the pending
+                        // buffer and publish atomically via flush_with_rebuild.
+                        // A raw `swap` would clear pending, discarding any live
+                        // vector not yet folded into main — the sole home of a
+                        // same-run encode between its ENCODE and the next flush.
+                        let flush = shard.hnsw_shared.flush_with_rebuild(move |pending| {
+                            let combined = fold_pending_into(vectors, pending);
+                            let (idx, _) = brain_index::rebuild::rebuild_impl(params, combined)?;
+                            Ok(idx)
+                        });
+                        match flush {
+                            Ok(report) => Ok(RebuildReport {
+                                entries: report.main_len_after,
+                                elapsed_ms: start.elapsed().as_millis() as u64,
+                            }),
                             Err(e) => Err(format!("rebuild: {e:?}")),
                         }
                     }
@@ -3279,9 +3392,45 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                 // `enter()` guard because the dispatch yields at `.await`
                 // points; a guard held across `.await` would mis-attribute
                 // spans from interleaved work.
+                // Peek for a direct (non-transactional) hard FORGET before
+                // moving `req` into dispatch. Hard forget promises the
+                // plaintext-derived embedding is "no longer recoverable from
+                // the file" immediately (invariant #6). The arena is the one
+                // at-rest home the apply layer can't reach — it holds only
+                // the redb wtxn, whereas the arena lives here on the shard —
+                // so we zero it at this boundary once the forget commits.
+                // Transactional forgets (`txn_id.is_some()`) are buffered and
+                // applied at COMMIT_TXN, and a rollback must not leave a
+                // zeroed slot, so they are covered by the recovery replay
+                // (which re-zeroes hard-forgotten slots) rather than here.
+                let hard_forget_id = match &*req {
+                    RequestBody::Forget(f) if f.mode == ForgetMode::Hard && f.txn_id.is_none() => {
+                        Some(MemoryId::from_raw(f.memory_id))
+                    }
+                    _ => None,
+                };
                 let out = brain_ops::dispatch::dispatch(*req, caller, &shard.ops)
                     .instrument(parent_span)
                     .await;
+                // Zero the arena slot only after a successful commit. FORGET
+                // is lenient (a missing/stale id is a no-op success) and
+                // `hard_forget_slot` is itself guarded on occupancy + slot
+                // version, so an over-eager call is a safe no-op: a same-run
+                // memory (never in the arena) and a slot since reclaimed by a
+                // newer memory (invariant #4) are both left untouched.
+                if let (Some(id), Ok(_)) = (hard_forget_id, &out) {
+                    let zeroed = {
+                        let mut arena = shard.arena.borrow_mut();
+                        arena.hard_forget_slot(id.slot(), id.version())
+                    };
+                    if zeroed {
+                        tracing::debug!(
+                            shard_id = shard.shard_id,
+                            memory_id = ?id,
+                            "hard forget: zeroed arena slot at rest"
+                        );
+                    }
+                }
                 if reply_tx.send_async(out).await.is_err() {
                     warn!(
                         shard_id = shard.shard_id,
@@ -3448,6 +3597,34 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
 // ---------------------------------------------------------------------------
 // Extract-backfill helper
 // ---------------------------------------------------------------------------
+
+/// Merge a rebuild snapshot with the HNSW pending buffer, producing the
+/// complete `(MemoryId, vector)` set to feed a fresh index build. Pending
+/// entries shadow snapshot entries for the same id (latest vector wins) and
+/// new pending ids are appended; tombstoned pending entries are dropped. Used
+/// by the admin `rebuild-ann` path so a rebuild never loses a live vector that
+/// landed in pending after the snapshot read.
+fn fold_pending_into(
+    snapshot: Vec<(brain_core::MemoryId, [f32; VECTOR_DIM])>,
+    pending: &[PendingEntry],
+) -> Vec<(brain_core::MemoryId, [f32; VECTOR_DIM])> {
+    let mut combined = snapshot;
+    let ids: std::collections::HashSet<brain_core::MemoryId> =
+        combined.iter().map(|(id, _)| *id).collect();
+    for entry in pending {
+        if entry.tombstoned {
+            continue;
+        }
+        if ids.contains(&entry.memory_id) {
+            if let Some(slot) = combined.iter_mut().find(|(id, _)| *id == entry.memory_id) {
+                slot.1 = entry.vector;
+            }
+        } else {
+            combined.push((entry.memory_id, entry.vector));
+        }
+    }
+    combined
+}
 
 /// Walk the per-shard `memories` + `texts` redb tables and push each
 /// matching memory onto the `WriterHandle`'s extractor channel. Runs

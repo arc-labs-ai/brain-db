@@ -50,6 +50,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use brain_core::{MemoryId, MemoryKind, SessionId};
+use brain_embed::VECTOR_DIM;
 use brain_protocol::envelope::request::{SubscribeRequest, UnsubscribeRequest};
 use brain_protocol::envelope::response::{
     EdgeEventPayload, EventType, SubscriptionEvent, UnsubscribeResponse,
@@ -149,6 +150,15 @@ pub struct EventEnvelope {
     /// events synthesized from WAL records that didn't capture an
     /// space (none today — every WAL payload carries space_id).
     pub space_id: brain_core::SpaceId,
+    /// Embedding vector of the memory this event is about — `Some`
+    /// only on memory/encode events (the writer has the freshly-
+    /// embedded vector at publish time), `None` for forget / graph /
+    /// edge / stage events. Carried so a similarity subscription
+    /// (`SubscriptionFilter.similar_to`) can be evaluated network-side
+    /// without a per-event shard lookup. `Arc` keeps the broadcast
+    /// clone cheap (one refcount bump per receiver, not a 1536-byte
+    /// copy).
+    pub vector: Option<Arc<[f32; VECTOR_DIM]>>,
 }
 
 impl EventEnvelope {
@@ -220,6 +230,7 @@ impl EventEnvelope {
                     stage_outcome: None,
                     stage_payload: None,
                     space_id,
+                    vector: None,
                 });
                 for e in p.edges {
                     out.push(Self {
@@ -245,6 +256,7 @@ impl EventEnvelope {
                         stage_outcome: None,
                         stage_payload: None,
                         space_id,
+                        vector: None,
                     });
                 }
                 out
@@ -272,6 +284,7 @@ impl EventEnvelope {
                 stage_outcome: None,
                 stage_payload: None,
                 space_id: brain_core::SpaceId::default(),
+                vector: None,
             }],
             WalPayload::Link(p) => vec![Self {
                 lsn,
@@ -299,6 +312,7 @@ impl EventEnvelope {
                 stage_outcome: None,
                 stage_payload: None,
                 space_id: brain_core::SpaceId::default(),
+                vector: None,
             }],
             WalPayload::Unlink(p) => vec![Self {
                 lsn,
@@ -323,6 +337,7 @@ impl EventEnvelope {
                 stage_outcome: None,
                 stage_payload: None,
                 space_id: brain_core::SpaceId::default(),
+                vector: None,
             }],
             WalPayload::RelationLink(p) => vec![Self {
                 lsn,
@@ -349,6 +364,7 @@ impl EventEnvelope {
                 stage_outcome: None,
                 stage_payload: None,
                 space_id: p.space_id,
+                vector: None,
             }],
             WalPayload::RelationSupersede(p) => vec![Self {
                 lsn,
@@ -374,6 +390,7 @@ impl EventEnvelope {
                 stage_outcome: None,
                 stage_payload: None,
                 space_id: p.new.space_id,
+                vector: None,
             }],
             WalPayload::RelationTombstone(p) => vec![Self {
                 lsn,
@@ -409,6 +426,7 @@ impl EventEnvelope {
                 stage_outcome: None,
                 stage_payload: None,
                 space_id: p.space_id,
+                vector: None,
             }],
             WalPayload::PhaseBody(body_record) => {
                 // Only the subscribe-event records carry a CBOR
@@ -455,6 +473,7 @@ impl EventEnvelope {
                         // `PhaseBodyRecord::space_id` is already populated
                         // from that prefix by `WalPayload::decode`.
                         space_id: body_record.space_id,
+                        vector: None,
                     }];
                 }
                 // Decode the CBOR body back into the typed-graph
@@ -496,6 +515,7 @@ impl EventEnvelope {
                     stage_outcome: None,
                     stage_payload: None,
                     space_id: brain_core::SpaceId::default(),
+                    vector: None,
                 }]
             }
             // TXN brackets, checkpoints, salience updates, reclaims,
@@ -640,9 +660,40 @@ pub struct ParsedFilter {
     /// `min_salience` today lists it as desirable. Always
     /// `None` in v1.
     pub min_salience: Option<f32>,
+    /// Similarity gate. `Some` only after the connection layer has
+    /// resolved the reference memory's vector (once, at registration
+    /// time — see [`ParsedFilter::set_similarity_reference`]). When set,
+    /// only events whose envelope carries a vector cosine-similar to the
+    /// reference at or above the threshold match; vector-less events
+    /// (forget / graph / edge / stage) never match. [`parse_filter`]
+    /// validates the wire threshold but leaves this `None`; the
+    /// reference vector is injected shard-side because the network-layer
+    /// registry has no direct access to shard vectors.
+    pub similar_to: Option<SimilarityMatch>,
+}
+
+/// Resolved similarity filter: the reference memory's embedding vector
+/// plus the cosine threshold. Cheap to `Copy` (a fixed array + one f32),
+/// so per-event matching is a single dot-product with no allocation.
+#[derive(Clone, Copy, Debug)]
+pub struct SimilarityMatch {
+    pub reference: [f32; VECTOR_DIM],
+    pub threshold: f32,
 }
 
 impl ParsedFilter {
+    /// Inject the resolved reference vector for a similarity
+    /// subscription. Called by the connection layer after it has fetched
+    /// the reference memory's vector from the owning shard (once, at
+    /// registration). `threshold` was already validated by
+    /// [`parse_filter`].
+    pub fn set_similarity_reference(&mut self, reference: [f32; VECTOR_DIM], threshold: f32) {
+        self.similar_to = Some(SimilarityMatch {
+            reference,
+            threshold,
+        });
+    }
+
     #[must_use]
     pub fn matches(&self, env: &EventEnvelope) -> bool {
         if let Some(spaces) = &self.spaces {
@@ -675,6 +726,18 @@ impl ParsedFilter {
                 return false;
             }
         }
+        if let Some(sim) = &self.similar_to {
+            // Similarity is about memory content: an event without a
+            // vector (forget / graph / edge / stage) can never satisfy a
+            // similarity subscription, so it drops rather than passing
+            // the gate vacuously.
+            match &env.vector {
+                Some(v)
+                    if crate::grounded::cosine(v.as_slice(), sim.reference.as_slice())
+                        >= sim.threshold => {}
+                _ => return false,
+            }
+        }
         true
     }
 }
@@ -683,10 +746,17 @@ impl ParsedFilter {
 /// [`ParsedFilter`]. Public so `brain-server`'s
 /// connection-layer registry can reuse the same shape.
 pub fn parse_filter(req: &SubscribeRequest) -> Result<ParsedFilter, OpError> {
-    if req.filter.similar_to.is_some() {
-        return Err(OpError::NotYetImplemented(
-            "subscribe: similarity-based filtering (similar_to) is not yet supported",
-        ));
+    // Validate the similarity threshold up front. The reference *vector*
+    // is resolved later, shard-side (the network registry has no direct
+    // vector access), so `similar_to` is left `None` here and injected by
+    // `ParsedFilter::set_similarity_reference` after that round-trip.
+    if let Some(sim) = req.filter.similar_to {
+        if !sim.threshold.is_finite() || !(-1.0..=1.0).contains(&sim.threshold) {
+            return Err(OpError::InvalidRequest(format!(
+                "subscribe: filter.similar_to.threshold must be a finite cosine in [-1.0, 1.0], got {}",
+                sim.threshold
+            )));
+        }
     }
     if let Some(ref v) = req.filter.session_filter {
         if v.len() > MAX_SUBSCRIBE_FILTER_ENTRIES {
@@ -764,6 +834,9 @@ pub fn parse_filter(req: &SubscribeRequest) -> Result<ParsedFilter, OpError> {
         spaces,
         memory_ids,
         min_salience: None,
+        // Resolved by the connection layer after the one-time
+        // reference-vector round-trip; see `set_similarity_reference`.
+        similar_to: None,
     })
 }
 
@@ -1018,3 +1091,109 @@ pub async fn handle_unsubscribe(
 // ---------------------------------------------------------------------------
 // Send/Sync guards.
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod similarity_tests {
+    use super::*;
+    use brain_protocol::envelope::request::SubscribeRequest;
+    use brain_protocol::ops::subscribe::{SimilarityFilter, SubscriptionFilter};
+
+    fn envelope_with_vector(vector: Option<[f32; VECTOR_DIM]>) -> EventEnvelope {
+        EventEnvelope {
+            lsn: 1,
+            event_type: EventType::Encoded,
+            memory_id: MemoryId::from(1u128),
+            session_id: SessionId::default(),
+            kind: MemoryKind::Episodic,
+            salience: 0.5,
+            timestamp_unix_nanos: 0,
+            text: None,
+            graph_payload: None,
+            edge_payload: None,
+            stage_kind: None,
+            stage_outcome: None,
+            stage_payload: None,
+            space_id: brain_core::SpaceId::default(),
+            vector: vector.map(Arc::new),
+        }
+    }
+
+    fn unit(index: usize) -> [f32; VECTOR_DIM] {
+        let mut v = [0.0_f32; VECTOR_DIM];
+        v[index] = 1.0;
+        v
+    }
+
+    fn filter_with_similarity(reference: [f32; VECTOR_DIM], threshold: f32) -> ParsedFilter {
+        let mut f = ParsedFilter::default();
+        f.set_similarity_reference(reference, threshold);
+        f
+    }
+
+    #[test]
+    fn matches_when_cosine_at_or_above_threshold() {
+        let filter = filter_with_similarity(unit(0), 0.9);
+        // Identical vector → cosine 1.0 ≥ 0.9.
+        assert!(filter.matches(&envelope_with_vector(Some(unit(0)))));
+    }
+
+    #[test]
+    fn drops_when_cosine_below_threshold() {
+        let filter = filter_with_similarity(unit(0), 0.5);
+        // Orthogonal vector → cosine 0.0 < 0.5.
+        assert!(!filter.matches(&envelope_with_vector(Some(unit(1)))));
+    }
+
+    #[test]
+    fn drops_vector_less_events() {
+        let filter = filter_with_similarity(unit(0), -1.0);
+        // Even at the most permissive threshold, a vector-less event
+        // never satisfies a similarity subscription.
+        assert!(!filter.matches(&envelope_with_vector(None)));
+    }
+
+    fn request_with_threshold(threshold: f32) -> SubscribeRequest {
+        SubscribeRequest {
+            filter: SubscriptionFilter {
+                session_filter: None,
+                kinds: None,
+                similar_to: Some(SimilarityFilter {
+                    reference_memory_id: MemoryId::from(1u128).into(),
+                    threshold,
+                }),
+                spaces: None,
+                memory_ids: None,
+            },
+            include_history: false,
+            from_lsn: None,
+            max_inflight: 0,
+            act_as: None,
+        }
+    }
+
+    #[test]
+    fn parse_filter_rejects_nan_threshold() {
+        let err = parse_filter(&request_with_threshold(f32::NAN));
+        assert!(matches!(err, Err(OpError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn parse_filter_rejects_out_of_range_threshold() {
+        assert!(matches!(
+            parse_filter(&request_with_threshold(1.5)),
+            Err(OpError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            parse_filter(&request_with_threshold(-2.0)),
+            Err(OpError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn parse_filter_accepts_valid_threshold_but_leaves_reference_unresolved() {
+        let parsed = parse_filter(&request_with_threshold(0.5)).expect("valid threshold");
+        // The vector is resolved shard-side, so parse_filter alone
+        // leaves the gate inert.
+        assert!(parsed.similar_to.is_none());
+    }
+}
