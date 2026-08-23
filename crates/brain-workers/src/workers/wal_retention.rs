@@ -55,10 +55,21 @@ pub struct CheckpointDesc {
 // ---------------------------------------------------------------------------
 
 /// Return the ids of segments fully covered by the checkpoint, minus
-/// the retention buffer. A segment is deletable iff `last_lsn <
-/// (durable_lsn - retention_extra_lsns)`: "A segment is
-/// covered when its highest LSN is less than the checkpoint's
-/// `durable_lsn`."
+/// the retention buffer. A segment is deletable iff it is **not** the
+/// active segment **and** its true `last_lsn <
+/// (durable_lsn - retention_extra_lsns)`: every record it holds is
+/// already covered by the checkpoint.
+///
+/// Two safety rails, both about invariant #7 (no silent data loss):
+///
+/// - **Straddlers stay.** The comparison uses the segment's *true*
+///   `last_lsn` (supplied by the source). A segment straddling the
+///   cutoff (`first_lsn < cutoff <= last_lsn`) still holds records past
+///   the checkpoint that live only in the WAL, so it is kept. An
+///   under-reported `last_lsn` would wrongly delete such a segment.
+/// - **Active segment stays.** The highest-seq segment is the live
+///   append target; records appended after the last checkpoint live only
+///   there. It is never eligible, regardless of its reported `last_lsn`.
 ///
 /// The cutoff saturates at 0 when the buffer exceeds the checkpoint
 /// (early life of a shard), so nothing is deleted.
@@ -69,8 +80,10 @@ pub fn decide_deletions(
     retention_extra_lsns: u64,
 ) -> Vec<u64> {
     let safe_cutoff = checkpoint.durable_lsn.saturating_sub(retention_extra_lsns);
+    let active_segment_id = segments.iter().map(|s| s.segment_id).max();
     segments
         .iter()
+        .filter(|s| Some(s.segment_id) != active_segment_id)
         .filter(|s| s.last_lsn < safe_cutoff)
         .map(|s| s.segment_id)
         .collect()

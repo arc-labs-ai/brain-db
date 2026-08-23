@@ -298,27 +298,40 @@ impl WalRetentionSource for WalDirRetentionSource {
     fn list_segments(&self) -> SegmentListFuture<'_> {
         let dir = self.wal_dir.clone();
         let uuid = self.shard_uuid;
+        // The active segment's true highest LSN is only knowable from live
+        // WAL state, which this source doesn't hold. `durable_lsn` is a
+        // safe floor: it is at least as high as any completed segment's
+        // last record and lies within (or just before) the active segment.
+        // Under-reporting the active segment here is harmless — the worker
+        // never deletes it — but reporting the true last_lsn of every
+        // *completed* segment is essential.
+        let durable_lsn =
+            brain_storage::recovery::MetadataSink::durable_lsn(self.metadata.as_ref());
         Box::pin(async move {
             let reader = WalReader::open(&dir, uuid)
                 .map_err(|e| WalRetentionSourceError::Failed(format!("WalReader::open: {e}")))?;
-            let segs = reader
-                .segments()
-                .iter()
-                .map(|s| {
-                    // We don't know `last_lsn` without scanning every
-                    // record. Reporting `starting_lsn` is the safe
-                    // (conservative) lower bound: `decide_deletions`
-                    // compares `last_lsn < safe_cutoff`, so an
-                    // underestimate only *delays* retention — never
-                    // deletes a segment that still covers durable_lsn.
-                    SegmentDesc {
-                        segment_id: s.segment_seq,
-                        first_lsn: s.starting_lsn,
-                        last_lsn: s.starting_lsn,
-                        size_bytes: s.file_size,
-                    }
-                })
-                .collect::<Vec<_>>();
+            let infos = reader.segments();
+            let mut segs = Vec::with_capacity(infos.len());
+            for (i, s) in infos.iter().enumerate() {
+                // Segments carry a contiguous, gap-free LSN range (the
+                // reader enforces `next.starting_lsn == prev.last + 1`), so
+                // a completed segment's true last LSN is the next segment's
+                // `starting_lsn - 1`. The active (highest-seq) segment has
+                // no successor; use `durable_lsn` as a lower bound. Both
+                // are correct for retention: they never *under*-report a
+                // completed segment (which would risk deleting a straddler),
+                // and the active segment is guarded against deletion anyway.
+                let last_lsn = match infos.get(i + 1) {
+                    Some(next) => next.starting_lsn.saturating_sub(1),
+                    None => durable_lsn,
+                };
+                segs.push(SegmentDesc {
+                    segment_id: s.segment_seq,
+                    first_lsn: s.starting_lsn,
+                    last_lsn: last_lsn.max(s.starting_lsn),
+                    size_bytes: s.file_size,
+                });
+            }
             Ok(segs)
         })
     }
@@ -395,6 +408,13 @@ impl ShardSnapshotSource {
             .parent()
             .map(|root| brain_storage::ShardPaths::at(root).wal_dir())
             .unwrap_or_else(|| metadata_path.clone());
+        // Resume the checkpoint counter past the highest snapshot id that
+        // already exists on disk. Snapshot directory names *are* the id
+        // (`snapshots/{id:020}`), and `reflink_or_copy` truncates an
+        // existing destination — so if we restarted at 1 the next cycle
+        // would overwrite the oldest surviving bundle, destroying a valid
+        // backup (invariant #7). A missing/empty dir yields 0 → start at 1.
+        let next_id = scan_max_snapshot_id(&snapshots_root).saturating_add(1);
         Self {
             shard_uuid,
             snapshots_root,
@@ -405,7 +425,7 @@ impl ShardSnapshotSource {
             wal,
             metadata,
             hnsw,
-            next_checkpoint_id: RefCell::new(1),
+            next_checkpoint_id: RefCell::new(next_id),
         }
     }
 
@@ -426,6 +446,33 @@ fn now_unix_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+/// Highest numeric snapshot id present under `root`, or 0 if the
+/// directory is missing, empty, or holds no numerically-named
+/// sub-directories. Non-numeric entries are ignored (mirrors
+/// `list_snapshots`). A read error is treated as "no snapshots" (0) so a
+/// transient stat failure never lets the counter reset and overwrite a
+/// prior bundle — the worst case is a delayed id, never a reused one.
+fn scan_max_snapshot_id(root: &std::path::Path) -> u64 {
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut max_id = 0u64;
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        if let Some(id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            max_id = max_id.max(id);
+        }
+    }
+    max_id
 }
 
 impl SnapshotSource for ShardSnapshotSource {
@@ -1163,5 +1210,63 @@ mod tests {
             }
         });
         assert!(snapshots_root.exists());
+    }
+
+    // ---- HIGH-1: snapshot-id resume across restart ------------------------
+
+    #[test]
+    fn scan_max_snapshot_id_handles_missing_empty_and_populated() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("snapshots");
+        // Missing dir → 0.
+        assert_eq!(scan_max_snapshot_id(&root), 0);
+        // Empty dir → 0.
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(scan_max_snapshot_id(&root), 0);
+        // Populated {1,2,3} using the 20-digit names take_snapshot writes,
+        // plus a stray non-numeric entry that must be ignored.
+        for id in [1u64, 2, 3] {
+            std::fs::create_dir_all(root.join(format!("{id:020}"))).unwrap();
+        }
+        std::fs::create_dir_all(root.join("not-a-snapshot")).unwrap();
+        assert_eq!(scan_max_snapshot_id(&root), 3);
+    }
+
+    /// After a restart the checkpoint counter must resume past the highest
+    /// existing snapshot id — restarting at 1 would let the next cycle's
+    /// `reflink_or_copy` truncate and overwrite bundle #1 (invariant #7).
+    #[test]
+    fn new_resumes_checkpoint_counter_past_existing_snapshots() {
+        let tmp = TempDir::new().unwrap();
+        let tmp_path = tmp.path().to_path_buf();
+        let next_id = glommio_run(move || async move {
+            let snapshots_root = tmp_path.join("snapshots");
+            for id in [1u64, 2, 3] {
+                std::fs::create_dir_all(snapshots_root.join(format!("{id:020}"))).unwrap();
+            }
+            let arena_path = tmp_path.join("arena.bin");
+            let md_path = tmp_path.join("metadata.redb");
+            let uuid: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+            let md = MetadataDb::open(&md_path).expect("MetadataDb::open");
+            let metadata: SharedMetadataDb = Arc::new(md);
+            let arena = ArenaFile::open(&arena_path, uuid, 8).expect("ArenaFile::open");
+            let arena_cell = Rc::new(RefCell::new(arena));
+            let wal_cell = Rc::new(RefCell::new(None));
+            let (hnsw_shared, _w) =
+                brain_index::SharedHnsw::new(brain_index::IndexParams::default_v1()).unwrap();
+            let src = ShardSnapshotSource::new(
+                uuid,
+                snapshots_root,
+                arena_path,
+                md_path,
+                arena_cell,
+                wal_cell,
+                metadata,
+                hnsw_shared,
+            );
+            // The next allocated checkpoint id is 4 → bundle #3 is safe.
+            src.next_ckpt_id()
+        });
+        assert_eq!(next_id, 4);
     }
 }
