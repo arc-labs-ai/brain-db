@@ -150,9 +150,8 @@ impl StatementQuestionHnswIndex {
         if k == 0 || self.forward.is_empty() {
             return Ok(Vec::new());
         }
-        let fetch_k = k.saturating_mul(OVER_FACTOR).min(self.forward.len());
-        let ef = match ef {
-            None => self.params.ef_search.max(fetch_k),
+        let base_ef = match ef {
+            None => self.params.ef_search,
             Some(v) => {
                 if v > self.params.ef_search_max {
                     return Err(StatementQuestionHnswError::EfSearchTooLarge {
@@ -160,30 +159,63 @@ impl StatementQuestionHnswIndex {
                         max: self.params.ef_search_max,
                     });
                 }
-                v.max(fetch_k)
+                v
             }
         };
 
-        let neighbours: Vec<Neighbour> = self.inner.search(query.as_slice(), fetch_k, ef);
+        // Escalate the fetch width (and `ef`) when tombstone attrition —
+        // FORGET / supersession cascades that tombstone a statement's whole
+        // point set — starves the collapsed result. Many question points map
+        // to one `(StatementId, Slot)` target, and a single fixed fetch can
+        // collapse to fewer than `k` live targets if the nearest raw points
+        // are mostly tombstoned; widen until we have `k` live targets or the
+        // graph is exhausted. Termination is guaranteed: `fetch_k` is capped
+        // at the node count and `ef` at `ef_search_max`, and each iteration
+        // advances at least one of them until both saturate.
+        let total_nodes = self.forward.len();
+        let mut fetch_multiplier = OVER_FACTOR;
+        let mut ef = base_ef.min(self.params.ef_search_max);
         let mut best: HashMap<(StatementId, Slot), f32> = HashMap::new();
-        for n in neighbours {
-            let Ok(internal_id) = u32::try_from(n.d_id) else {
-                continue;
-            };
-            if self.tombstones.is_set(internal_id) {
-                continue;
+        loop {
+            best.clear();
+            let fetch_k = k.saturating_mul(fetch_multiplier).min(total_nodes);
+            let effective_ef = ef.max(fetch_k).min(self.params.ef_search_max);
+            let neighbours: Vec<Neighbour> =
+                self.inner.search(query.as_slice(), fetch_k, effective_ef);
+            for n in neighbours {
+                let Ok(internal_id) = u32::try_from(n.d_id) else {
+                    continue;
+                };
+                if self.tombstones.is_set(internal_id) {
+                    continue;
+                }
+                let Some(target) = self.forward.get(internal_id as usize).copied() else {
+                    continue;
+                };
+                let sim = 1.0 - n.distance;
+                best.entry(target)
+                    .and_modify(|cur| {
+                        if sim > *cur {
+                            *cur = sim;
+                        }
+                    })
+                    .or_insert(sim);
             }
-            let Some(target) = self.forward.get(internal_id as usize).copied() else {
-                continue;
-            };
-            let sim = 1.0 - n.distance;
-            best.entry(target)
-                .and_modify(|cur| {
-                    if sim > *cur {
-                        *cur = sim;
-                    }
-                })
-                .or_insert(sim);
+
+            if best.len() >= k {
+                break;
+            }
+            let fetch_saturated = fetch_k >= total_nodes;
+            let ef_saturated = effective_ef >= self.params.ef_search_max;
+            if fetch_saturated && ef_saturated {
+                break;
+            }
+            if !fetch_saturated {
+                fetch_multiplier = fetch_multiplier.saturating_mul(2);
+            }
+            if !ef_saturated {
+                ef = ef.saturating_mul(2).min(self.params.ef_search_max);
+            }
         }
 
         let mut out: Vec<(StatementId, Slot, f32)> = best
@@ -275,6 +307,26 @@ mod tests {
         v
     }
 
+    /// The query / anchor vector the widening tests probe with.
+    fn query() -> [f32; VECTOR_DIM] {
+        one_hot(0)
+    }
+
+    /// A vector in a tight cluster around [`query`]: a dominant query
+    /// component plus a unique perturbation of magnitude `mag` on dimension
+    /// `1 + seed`. Cosine to the query is ~1.0 and every such point occupies
+    /// a distinct location (no duplicate cluster to trap the traversal), so
+    /// the small graphs stay well-connected and HNSW returns them with
+    /// essentially full recall. `mag` sets the (small) distance from the
+    /// query: smaller = nearer. The tests never depend on HNSW surfacing
+    /// genuinely far nodes, which it does not guarantee on tiny graphs.
+    fn near_at(seed: usize, mag: f32) -> [f32; VECTOR_DIM] {
+        let mut v = [0.0; VECTOR_DIM];
+        v[0] = 1.0;
+        v[1 + (seed % (VECTOR_DIM - 1))] = mag;
+        v
+    }
+
     fn sid(seed: u8) -> StatementId {
         let mut b = [0u8; 16];
         b[0] = seed;
@@ -340,5 +392,76 @@ mod tests {
         assert_eq!(rep.statements, 2);
         assert!(!idx.contains_statement(sid(1)));
         assert!(idx.contains_statement(sid(2)));
+    }
+
+    #[test]
+    fn search_widens_past_tombstone_attrition() {
+        // One tombstoned statement owns 24 DISTINCT nearest question points —
+        // exactly the initial fetch window (k*OVER_FACTOR = 3*8 = 24). A
+        // single fixed fetch therefore lands entirely on that statement's
+        // tombstoned points and collapses to zero live targets. Five live
+        // statements sit slightly farther in the same tight near-cluster
+        // (each ~cosine 1.0 to the query, distinct locations so HNSW recalls
+        // them reliably). Escalation must widen the fetch past the tombstoned
+        // front until the k live targets survive.
+        //
+        // Distinct locations (not a duplicate cluster) are load-bearing: a
+        // dense pile of identical tombstoned vectors traps the HNSW traversal
+        // and the live points never surface however wide the fetch.
+        let mut idx = StatementQuestionHnswIndex::new(statement_question_default_params()).unwrap();
+        let tombstoned = sid(1);
+        for p in 0..24 {
+            idx.insert(tombstoned, Slot::Object, &near_at(p, 0.02));
+        }
+        let live: Vec<StatementId> = (0..6).map(|i| sid(i as u8 + 100)).collect();
+        for (i, id) in live.iter().enumerate() {
+            idx.insert(*id, Slot::Object, &near_at(50 + i, 0.025));
+        }
+        idx.mark_statement_tombstoned(tombstoned);
+
+        let r = idx.search(&query(), 3).unwrap();
+        assert_eq!(r.len(), 3, "escalation should still return k live targets");
+        let got: Vec<StatementId> = r.iter().map(|(id, _, _)| *id).collect();
+        assert!(
+            !got.contains(&tombstoned),
+            "tombstoned statement surfaced after widening"
+        );
+        for (id, _, _) in &r {
+            assert!(
+                live.contains(id),
+                "unexpected non-live statement in results"
+            );
+        }
+    }
+
+    #[test]
+    fn search_exhausts_cleanly_when_fewer_than_k_live() {
+        // Only 3 live of 6 total; search(k=5) must return exactly the 3
+        // survivors and terminate (no infinite escalation loop even though it
+        // can never reach k). The 3 live statements sit NEARER the query than
+        // the tombstoned three, so HNSW returns them in the entry region with
+        // full recall — the assertion is on the survivors, not on the graph
+        // surfacing the (irrelevant) tombstoned tail.
+        let mut idx = StatementQuestionHnswIndex::new(statement_question_default_params()).unwrap();
+        let live: Vec<StatementId> = (0..3).map(|i| sid(i as u8 + 1)).collect();
+        for (i, id) in live.iter().enumerate() {
+            idx.insert(*id, Slot::Object, &near_at(i, 0.02));
+        }
+        let tombstoned: Vec<StatementId> = (0..3).map(|i| sid(i as u8 + 100)).collect();
+        for (i, id) in tombstoned.iter().enumerate() {
+            idx.insert(*id, Slot::Object, &near_at(50 + i, 0.05));
+            idx.mark_statement_tombstoned(*id);
+        }
+
+        let r = idx.search(&query(), 5).unwrap();
+        assert_eq!(
+            r.len(),
+            3,
+            "should return exactly the live count on exhaustion"
+        );
+        let got: Vec<StatementId> = r.iter().map(|(id, _, _)| *id).collect();
+        for id in &live {
+            assert!(got.contains(id), "expected surviving statement in results");
+        }
     }
 }

@@ -2489,6 +2489,18 @@ pub fn spawn_shard(
                 ) {
                     Ok((loaded_idx, taken_at_lsn)) => {
                         let loaded_len = loaded_idx.len();
+                        // Capture the snapshot's memory ids BEFORE the swap
+                        // moves the index into the published main. Any of
+                        // these that redb marks inactive as of the recovered
+                        // tail is a memory FORGOTTEN after `taken_at_lsn`:
+                        // the snapshot still holds it active, so it must be
+                        // re-tombstoned below or it becomes a ghost node (a
+                        // live top-k slot diverging from redb indefinitely).
+                        let snapshot_ids: Vec<brain_core::MemoryId> = loaded_idx
+                            .id_map()
+                            .iter_forward()
+                            .map(|(bytes, _)| brain_core::MemoryId::from_be_bytes(bytes))
+                            .collect();
                         hnsw_shared.swap(loaded_idx);
                         // Tail-replay: any arena entry whose memory_id
                         // isn't in the loaded main is a write that
@@ -2518,6 +2530,30 @@ pub fn spawn_shard(
                                 error = ?e,
                                 "memory HNSW: tail-replay arena scan failed; loaded snapshot \
                                  alone may miss writes past taken_at_lsn"
+                            ),
+                        }
+                        // Post-snapshot FORGET reconciliation: re-apply every
+                        // delete that landed after `taken_at_lsn`. The arena
+                        // tail above only carries ACTIVE memories, so an
+                        // inactive redb row for a snapshot id is invisible to
+                        // it; tombstone those ids so the HNSW active set
+                        // converges to the redb active set.
+                        match reconcile_forgotten_memories(
+                            &hnsw_shared,
+                            &metadata,
+                            &snapshot_ids,
+                        ) {
+                            Ok(retombstoned) if retombstoned > 0 => info!(
+                                shard_id,
+                                retombstoned,
+                                "memory HNSW: re-applied post-snapshot FORGETs"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => warn!(
+                                shard_id,
+                                error = %e,
+                                "memory HNSW: FORGET reconciliation failed; snapshot may \
+                                 retain ghost nodes"
                             ),
                         }
                         true
@@ -3859,6 +3895,46 @@ fn find_latest_snapshot_dir(root: &Path) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
+/// Re-apply post-snapshot FORGETs to a freshly-loaded memory HNSW.
+///
+/// A snapshot captures the graph as of `taken_at_lsn`; a FORGET that landed
+/// afterward marks the memory inactive in redb but leaves the loaded main
+/// holding the node active — a ghost that occupies a top-k slot and diverges
+/// from redb until some later full rebuild fires. For every `snapshot_id`
+/// whose redb row is inactive (or entirely absent) this tombstones the node
+/// in `hnsw`, so after reconciliation the HNSW active set equals the redb
+/// active set for the memory index.
+///
+/// Returns the number of nodes re-tombstoned, or an error string when the
+/// redb read could not be set up (so the caller can warn rather than
+/// silently skip reconciliation). A per-row read error is treated as "leave
+/// as loaded" — fail-safe toward keeping a genuinely-live node.
+fn reconcile_forgotten_memories(
+    hnsw: &brain_index::SharedHnsw,
+    metadata: &brain_metadata::MetadataDb,
+    snapshot_ids: &[brain_core::MemoryId],
+) -> Result<usize, String> {
+    let rtxn = metadata.read_txn().map_err(|e| format!("read_txn: {e}"))?;
+    let table = rtxn
+        .open_table(brain_metadata::tables::memory::MEMORIES_TABLE)
+        .map_err(|e| format!("open MEMORIES_TABLE: {e}"))?;
+    let mut retombstoned = 0usize;
+    for mid in snapshot_ids {
+        let inactive = match table.get(mid.to_be_bytes()) {
+            Ok(Some(row)) => !row.value().is_active(),
+            // Row gone entirely → not active.
+            Ok(None) => true,
+            // Per-row read error → leave the node as loaded.
+            Err(_) => false,
+        };
+        if inactive && !hnsw.is_tombstoned(*mid) {
+            hnsw.tombstone_recovery(*mid);
+            retombstoned += 1;
+        }
+    }
+    Ok(retombstoned)
+}
+
 fn read_or_generate_uuid(path: &Path) -> Result<[u8; 16], ShardError> {
     match std::fs::read(path) {
         Ok(bytes) if bytes.len() == 16 => {
@@ -4071,5 +4147,86 @@ mod tests {
             paths.statements_tantivy().join("meta.json").exists(),
             "statements.tantivy/meta.json should exist after spawn (sub-task 22.1)"
         );
+    }
+
+    #[test]
+    fn reconcile_forgotten_tombstones_inactive_snapshot_nodes() {
+        // IDX1 convergence: a memory HNSW loaded from a snapshot holds M1..M3
+        // active; a post-snapshot FORGET marked M2 inactive in redb.
+        // Reconciliation must tombstone exactly M2 so the HNSW active set
+        // converges to the redb active set — M1/M3 stay live, no ghost.
+        use brain_core::{MemoryId, MemoryKind, NamespaceId, SessionId, SpaceId};
+        use brain_index::SharedHnsw;
+        use brain_metadata::tables::memory::{flags, MemoryMetadata, MEMORIES_TABLE};
+
+        fn space(b: u8) -> SpaceId {
+            let mut x = [0u8; 16];
+            x[15] = b;
+            x.into()
+        }
+        fn row(slot: u64) -> MemoryMetadata {
+            MemoryMetadata::new_active(
+                MemoryId::pack(1, slot, 1),
+                NamespaceId::SYSTEM,
+                space(slot as u8),
+                SessionId(1),
+                slot,
+                1,
+                MemoryKind::Episodic,
+                [0xAB; 16],
+                0.5,
+                10,
+                1_700_000_000_000_000_000,
+            )
+        }
+
+        let dir = TempDir::new().unwrap();
+        let md = brain_metadata::MetadataDb::open(dir.path().join("metadata.redb")).unwrap();
+
+        let m1 = MemoryId::pack(1, 1, 1);
+        let m2 = MemoryId::pack(1, 2, 1);
+        let m3 = MemoryId::pack(1, 3, 1);
+
+        let wtxn = md.write_txn().unwrap();
+        {
+            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
+            t.insert(&m1.to_be_bytes(), &row(1)).unwrap();
+            // M2: FORGOTTEN after the snapshot — ACTIVE flag cleared.
+            let mut r2 = row(2);
+            r2.set_flag(flags::ACTIVE, false);
+            assert!(r2.is_tombstoned());
+            t.insert(&m2.to_be_bytes(), &r2).unwrap();
+            t.insert(&m3.to_be_bytes(), &row(3)).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        // Simulate the loaded snapshot: all three active in the graph.
+        let idx = brain_index::HnswIndex::new(brain_index::params::IndexParams::default_v1())
+            .expect("HnswIndex::new");
+        let (hnsw, _writer) = SharedHnsw::from_index(idx);
+        for (i, mid) in [m1, m2, m3].iter().enumerate() {
+            let mut v = [0.0f32; VECTOR_DIM];
+            v[i] = 1.0;
+            hnsw.insert_recovery(*mid, &v);
+        }
+        assert!(hnsw.contains(m2), "M2 active before reconciliation");
+
+        let snapshot_ids = vec![m1, m2, m3];
+        let n = reconcile_forgotten_memories(&hnsw, &md, &snapshot_ids).unwrap();
+        assert_eq!(n, 1, "exactly M2 should be re-tombstoned");
+
+        assert!(
+            hnsw.is_tombstoned(m2),
+            "M2 must be tombstoned after reconcile"
+        );
+        assert!(!hnsw.contains(m2), "M2 must no longer be a live node");
+        assert!(hnsw.contains(m1), "M1 stays live");
+        assert!(hnsw.contains(m3), "M3 stays live");
+        assert!(!hnsw.is_tombstoned(m1));
+        assert!(!hnsw.is_tombstoned(m3));
+
+        // Idempotent: a second pass tombstones nothing more.
+        let n2 = reconcile_forgotten_memories(&hnsw, &md, &snapshot_ids).unwrap();
+        assert_eq!(n2, 0, "reconciliation is idempotent");
     }
 }
