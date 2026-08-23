@@ -81,7 +81,10 @@ pub async fn handle_forget(
     if matches!(outcome, ForgetOutcome::Tombstoned) {
         if let Some(dispatcher) = ctx.memory_text_dispatcher.as_ref() {
             dispatcher
-                .dispatch(MemoryTextOp::Forget { id: memory_id })
+                .dispatch(MemoryTextOp::Forget {
+                    id: memory_id,
+                    hard: matches!(req.mode, ForgetMode::Hard),
+                })
                 .await;
         }
 

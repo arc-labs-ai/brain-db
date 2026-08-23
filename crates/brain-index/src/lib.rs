@@ -81,5 +81,6 @@ pub use tantivy_shard::{
     LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItem, RankedItemId,
     RebuildReason as TantivyRebuildReason, TantivyLexicalRetriever, TantivyShard,
     TantivyShardError, TantivyShardStartup, BRAIN_SCHEMA_VERSION, BRAIN_TOKENIZER_NAME,
+    OLD_SUFFIX as TANTIVY_OLD_SUFFIX, REBUILD_SUFFIX as TANTIVY_REBUILD_SUFFIX,
 };
 pub use tombstones::TombstoneBitmap;

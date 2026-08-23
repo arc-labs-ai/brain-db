@@ -517,10 +517,23 @@ pub async fn handle_txn_commit(
     // tombstoned; both cleanups are idempotent and best-effort, so a
     // memory that was encoded-then-forgotten in the same txn (never
     // indexed) is a harmless no-op.
+    // Which tombstoned ids were hard-forgotten — the lexical indexer must
+    // physically purge their text, not just tombstone the doc. An id
+    // forgotten more than once in the txn counts as hard if any of its
+    // forgets was Hard.
+    let hard_forgotten: HashSet<MemoryId> = buffer
+        .forgets
+        .iter()
+        .filter(|f| matches!(f.mode, ForgetMode::Hard))
+        .map(|f| f.memory_id)
+        .collect();
     for memory_id in &buffer.tombstoned {
         if let Some(dispatcher) = ctx.memory_text_dispatcher.as_ref() {
             dispatcher
-                .dispatch(crate::index::text_indexer::MemoryTextOp::Forget { id: *memory_id })
+                .dispatch(crate::index::text_indexer::MemoryTextOp::Forget {
+                    id: *memory_id,
+                    hard: hard_forgotten.contains(memory_id),
+                })
                 .await;
         }
         crate::handlers::forget::delete_hype_vectors(ctx, *memory_id);

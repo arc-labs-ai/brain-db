@@ -119,11 +119,136 @@ fn forget_removes_doc() {
                 session: 0,
             })
             .await;
-        dispatcher.dispatch(MemoryTextOp::Forget { id }).await;
+        dispatcher
+            .dispatch(MemoryTextOp::Forget { id, hard: false })
+            .await;
         drop(dispatcher);
         task.await;
 
         assert_eq!(count_hits(&handle.index, "hello"), 0);
+    })
+}
+
+/// Sum of tombstoned-but-still-resident docs across all searchable
+/// segments. `delete_term` only marks a doc deleted; its bytes stay on
+/// disk until a merge compacts them out. A hard forget must drive this to
+/// zero (bytes evicted), whereas a soft forget leaves it positive.
+fn total_deleted_docs(index: &tantivy::Index) -> u32 {
+    index
+        .searchable_segment_metas()
+        .expect("segment metas")
+        .iter()
+        .map(tantivy::index::SegmentMeta::num_deleted_docs)
+        .sum()
+}
+
+#[test]
+fn hard_forget_purges_text_from_segments() {
+    run_in_glommio(|| async {
+        let (_dir, handle) = fresh_shard();
+        // n_writes=2 lands both upserts in a single committed segment, so the
+        // forgotten doc shares a segment with a live one. Tantivy auto-drops
+        // *fully*-deleted segments on commit, so co-residency is what forces
+        // the code path under test — the segment survives the delete and only
+        // the hard-forget force-merge can evict the secret's bytes.
+        let policy = CommitPolicy::new(2, Duration::from_secs(60));
+        let (dispatcher, task) = spawn_drain(handle.clone(), policy);
+
+        let secret = MemoryId::pack(0, 100, 0);
+        let keep = MemoryId::pack(0, 101, 0);
+        dispatcher
+            .dispatch(MemoryTextOp::Upsert {
+                id: secret,
+                text: "confidential plaintext alphaword".into(),
+                space: SpaceId::new(),
+                kind: MemoryKind::Episodic,
+                created_at_unix_ms: 0,
+                session: 0,
+            })
+            .await;
+        dispatcher
+            .dispatch(MemoryTextOp::Upsert {
+                id: keep,
+                text: "public record betaword".into(),
+                space: SpaceId::new(),
+                kind: MemoryKind::Episodic,
+                created_at_unix_ms: 0,
+                session: 0,
+            })
+            .await;
+
+        // Hard forget the secret doc — triggers commit + force-merge inline.
+        dispatcher
+            .dispatch(MemoryTextOp::Forget {
+                id: secret,
+                hard: true,
+            })
+            .await;
+        drop(dispatcher);
+        task.await;
+
+        // The secret term is unqueryable, the kept doc survives, and the
+        // segment carries no residual deleted docs — the plaintext bytes were
+        // physically evicted, not merely tombstoned.
+        assert_eq!(count_hits(&handle.index, "alphaword"), 0, "secret purged");
+        assert_eq!(count_hits(&handle.index, "betaword"), 1, "public retained");
+        assert_eq!(
+            total_deleted_docs(&handle.index),
+            0,
+            "hard forget must compact the deleted doc out of the segment",
+        );
+    })
+}
+
+#[test]
+fn soft_forget_tombstones_but_retains_bytes() {
+    run_in_glommio(|| async {
+        let (_dir, handle) = fresh_shard();
+        // Both docs share one segment (see the hard-forget note); the soft
+        // forget must NOT force-merge, so the tombstoned doc stays resident.
+        let policy = CommitPolicy::new(2, Duration::from_secs(60));
+        let (dispatcher, task) = spawn_drain(handle.clone(), policy);
+
+        let drop_me = MemoryId::pack(0, 200, 0);
+        let keep = MemoryId::pack(0, 201, 0);
+        dispatcher
+            .dispatch(MemoryTextOp::Upsert {
+                id: drop_me,
+                text: "recoverable gammaword".into(),
+                space: SpaceId::new(),
+                kind: MemoryKind::Episodic,
+                created_at_unix_ms: 0,
+                session: 0,
+            })
+            .await;
+        dispatcher
+            .dispatch(MemoryTextOp::Upsert {
+                id: keep,
+                text: "retained deltaword".into(),
+                space: SpaceId::new(),
+                kind: MemoryKind::Episodic,
+                created_at_unix_ms: 0,
+                session: 0,
+            })
+            .await;
+        dispatcher
+            .dispatch(MemoryTextOp::Forget {
+                id: drop_me,
+                hard: false,
+            })
+            .await;
+        drop(dispatcher);
+        task.await;
+
+        // Soft forget removes the doc from queries but leaves the deleted
+        // doc resident (grace-window recoverable, no force-merge).
+        assert_eq!(count_hits(&handle.index, "gammaword"), 0);
+        assert_eq!(count_hits(&handle.index, "deltaword"), 1);
+        assert_eq!(
+            total_deleted_docs(&handle.index),
+            1,
+            "soft forget must not force-merge; the tombstoned doc stays resident",
+        );
     })
 }
 

@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use brain_core::{StatementKind, StatementObject, StatementValue, SubjectRef};
 use brain_index::{
     build_analyzer, memory_text_schema, schema_payload_json, statements_schema, LexicalScope,
-    BRAIN_TOKENIZER_NAME,
+    BRAIN_TOKENIZER_NAME, TANTIVY_OLD_SUFFIX, TANTIVY_REBUILD_SUFFIX,
 };
 use brain_metadata::tables::entity::ENTITIES_TABLE;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
@@ -39,8 +39,8 @@ use redb::ReadableTable;
 use tantivy::{Index, IndexWriter, TantivyDocument, TantivyError};
 use thiserror::Error;
 
-const REBUILD_SUFFIX: &str = ".rebuild";
-const OLD_SUFFIX: &str = ".old";
+const REBUILD_SUFFIX: &str = TANTIVY_REBUILD_SUFFIX;
+const OLD_SUFFIX: &str = TANTIVY_OLD_SUFFIX;
 const COMMIT_CHUNK: usize = 1024;
 
 #[derive(Debug, Clone)]
@@ -344,7 +344,12 @@ fn iterate_statements(
         doc.add_u64(predicate_id_field, u64::from(stmt.predicate_id));
         doc.add_text(object_text_field, &object_text);
         doc.add_u64(kind_field, u64::from(kind.as_u8()));
-        doc.add_u64(bucket_field, bucket_for_index(stmt.confidence));
+        doc.add_u64(
+            bucket_field,
+            u64::from(brain_metadata::tables::statement::confidence_bucket(
+                stmt.confidence,
+            )),
+        );
         doc.add_u64(extracted_at_field, stmt.extracted_at_unix_nanos / 1_000_000);
         writer.add_document(doc)?;
 
@@ -391,12 +396,6 @@ fn object_text_from_blob(
             .unwrap_or_default(),
         StatementObject::Memory(_) | StatementObject::Statement(_) => String::new(),
     }
-}
-
-fn bucket_for_index(confidence: f32) -> u64 {
-    let clamped = confidence.clamp(0.0, 1.0);
-    let bucket = (clamped * 10.0).floor() as u64;
-    bucket.min(9)
 }
 
 #[cfg(test)]

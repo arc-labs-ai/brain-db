@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use brain_core::{MemoryId, MemoryKind, SpaceId};
 use brain_index::{schema_payload_json, IndexHandle, LexicalScope};
 use flume::{bounded, Receiver, Sender};
+use tantivy::index::SegmentId;
 use tantivy::schema::Field;
 use tantivy::{IndexWriter, TantivyDocument, TantivyError, Term};
 use thiserror::Error;
@@ -31,6 +32,14 @@ pub enum MemoryTextOp {
     },
     Forget {
         id: MemoryId,
+        /// Hard forget: the caller demands the memory's plaintext be
+        /// physically evicted from the on-disk segments, not merely
+        /// tombstoned. Triggers an inline commit + force-merge of any
+        /// segment carrying deletes so the term/stored text is gone,
+        /// satisfying the hard-forget purge-immediacy invariant. Soft
+        /// forget (`false`) only tombstones the doc, leaving it
+        /// recoverable within the grace window.
+        hard: bool,
     },
 }
 
@@ -239,6 +248,7 @@ async fn run_loop(
 
         match wait_next(&rx, &shutdown, remaining).await {
             NextOp::Op(op) => {
+                let is_hard_forget = matches!(op, MemoryTextOp::Forget { hard: true, .. });
                 if let Err(err) = apply_op(&mut writer, &fields, &op) {
                     warn!(
                         target: "brain_ops::text_indexer",
@@ -248,7 +258,17 @@ async fn run_loop(
                 } else {
                     batch += 1;
                 }
-                if batch >= policy.n_writes {
+                if is_hard_forget {
+                    // Hard forget: don't wait for the batch/interval — commit
+                    // the delete and force-merge so the memory's plaintext is
+                    // physically evicted from the on-disk segments now, not on
+                    // some incidental future merge (invariant #6).
+                    if purge_hard_forget(&mut writer).await.is_err() {
+                        return;
+                    }
+                    batch = 0;
+                    last_commit = Instant::now();
+                } else if batch >= policy.n_writes {
                     if commit_with_retry(&mut writer).is_err() {
                         return;
                     }
@@ -297,7 +317,7 @@ fn apply_op(
     op: &MemoryTextOp,
 ) -> Result<(), TantivyError> {
     let id = match op {
-        MemoryTextOp::Upsert { id, .. } | MemoryTextOp::Forget { id } => *id,
+        MemoryTextOp::Upsert { id, .. } | MemoryTextOp::Forget { id, .. } => *id,
     };
     let id_bytes = memory_id_bytes(id);
     let term = Term::from_field_bytes(fields.memory_id, &id_bytes);
@@ -380,6 +400,69 @@ fn attempt_commit(writer: &mut IndexWriter) -> Result<(), TantivyError> {
     let mut prepared = writer.prepare_commit()?;
     prepared.set_payload(&schema_payload_json());
     prepared.commit()?;
+    Ok(())
+}
+
+/// Physically evict deleted docs after a hard forget.
+///
+/// `delete_term` only tombstones the doc — its term postings and stored
+/// text stay in the on-disk segment until an incidental merge, which may
+/// never come (there is no scheduled force-merge elsewhere). Hard forget
+/// promises immediate purge, so this:
+///
+/// 1. commits the pending delete (so it's reflected in segment metadata),
+/// 2. force-merges every segment that now carries deletes — rewriting them
+///    without the deleted docs' bytes,
+/// 3. garbage-collects the superseded segment files off disk.
+///
+/// Best-effort past the commit: a merge/GC failure is logged, not fatal —
+/// the delete itself is durable (the doc is gone from queries) and a later
+/// merge still reclaims the bytes. Only a failed commit terminates the
+/// drain loop (`Err(())`), matching [`commit_with_retry`].
+#[cfg(target_os = "linux")]
+async fn purge_hard_forget(writer: &mut IndexWriter) -> Result<(), ()> {
+    commit_with_retry(writer)?;
+
+    let with_deletes: Vec<SegmentId> = match writer.index().searchable_segment_metas() {
+        Ok(metas) => metas
+            .iter()
+            .filter(|m| m.num_deleted_docs() > 0)
+            .map(tantivy::index::SegmentMeta::id)
+            .collect(),
+        Err(err) => {
+            warn!(
+                target: "brain_ops::text_indexer",
+                error = %err,
+                "hard forget: could not read segment metas for purge; bytes evicted on next merge",
+            );
+            return Ok(());
+        }
+    };
+
+    if with_deletes.is_empty() {
+        // No segment retained the deleted doc (e.g. it was added and
+        // deleted before ever being committed to a segment) — nothing to
+        // compact.
+        return Ok(());
+    }
+
+    if let Err(err) = writer.merge(&with_deletes).await {
+        warn!(
+            target: "brain_ops::text_indexer",
+            error = %err,
+            "hard forget: force-merge failed; bytes evicted on next merge",
+        );
+        return Ok(());
+    }
+
+    if let Err(err) = writer.garbage_collect_files().await {
+        warn!(
+            target: "brain_ops::text_indexer",
+            error = %err,
+            "hard forget: garbage collect failed; superseded segment files linger until next GC",
+        );
+    }
+
     Ok(())
 }
 
