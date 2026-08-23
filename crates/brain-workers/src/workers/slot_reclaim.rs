@@ -18,9 +18,20 @@
 //!   `source = id` and `EDGES_IN` where `target = id`. Other-direction
 //!   dangling edges (`EDGES_OUT` where `target = id`) survive — the
 //!   edge-scrub worker cleans those up.
-//! - **No HNSW node deletion.** — the HNSW node referencing
-//!   the reclaimed slot is left for the maintenance worker to
-//!   rebuild away.
+//! - **HNSW node: tombstoned at forget, dropped at rebuild.** The
+//!   memory's HNSW node is marked tombstoned when the FORGET commits
+//!   (the writer's `Tombstone(Memory)` side-effect), so the semantic
+//!   lane already excludes it; the tombstoned node itself is dropped
+//!   from the graph on the next HNSW maintenance rebuild. Reclamation
+//!   does not touch the HNSW.
+//! - **HyPE question-vectors purged here as a backstop.** FORGET
+//!   removes a memory's durable HyPE rows promptly, but reclamation
+//!   re-runs the same idempotent delete so a memory tombstoned before
+//!   that path existed (or via a code path that skipped it) can't leave
+//!   the redb rows around past grace. The delete is a no-op when the
+//!   memory owns no HyPE rows. The tiny `(memory_id -> neighborhood
+//!   hash)` gate row is left behind — it's only ever read by the HyPE
+//!   refresh worker, which never runs on a gone memory.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -210,6 +221,12 @@ fn reclaim_one(
 
     if did_remove {
         purge_adjacent_edges(&wtxn, id)?;
+        // Idempotent backstop: FORGET already dropped these at tombstone
+        // time, but re-run the delete so a memory tombstoned before that
+        // path existed can't leave orphan HyPE rows past grace. No-op
+        // (removes 0) when the memory owns none.
+        brain_metadata::hype_vectors_delete_memory(&wtxn, id)
+            .map_err(|e| WorkerError::Ops(format!("reclaim hype delete: {e:?}")))?;
     }
 
     wtxn.commit()

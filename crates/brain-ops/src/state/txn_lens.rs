@@ -23,43 +23,47 @@ pub fn build_executor_with_lens(
     let Some(txn_id) = txn_id else {
         return Ok(ctx.executor.clone());
     };
-    let _ = ctx.txn_store.validate_active(txn_id)?;
-    let snap = ctx.txn_store.with_buffer(txn_id, |buf| {
-        let mut pending_links: Vec<(
-            brain_core::MemoryId,
-            brain_core::EdgeKind,
-            brain_core::MemoryId,
-            f32,
-        )> = buf
-            .links
-            .iter()
-            .map(|l| (l.source, l.kind, l.target, l.weight))
-            .collect();
-        // Inline encode-edges are also pending links.
-        for enc in &buf.encodes {
-            for edge in &enc.edges {
-                pending_links.push((enc.memory_id, edge.kind, edge.target, edge.weight));
+    let _ = ctx
+        .txn_store
+        .validate_active(txn_id, ctx.caller_connection_id)?;
+    let snap = ctx
+        .txn_store
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            let mut pending_links: Vec<(
+                brain_core::MemoryId,
+                brain_core::EdgeKind,
+                brain_core::MemoryId,
+                f32,
+            )> = buf
+                .links
+                .iter()
+                .map(|l| (l.source, l.kind, l.target, l.weight))
+                .collect();
+            // Inline encode-edges are also pending links.
+            for enc in &buf.encodes {
+                for edge in &enc.edges {
+                    pending_links.push((enc.memory_id, edge.kind, edge.target, edge.weight));
+                }
             }
-        }
-        let mut pending_memories = std::collections::HashMap::new();
-        for enc in &buf.encodes {
-            pending_memories.insert(
-                enc.memory_id,
-                PendingMemorySnapshot {
-                    vector: enc.vector,
-                    salience: enc.salience_initial,
-                    kind: enc.kind,
-                    session_id: enc.session_id,
-                    created_at_unix_nanos: enc.created_at_unix_nanos,
-                },
-            );
-        }
-        Ok(TxnSnapshot {
-            pending_links,
-            pending_unlinks: buf.unlinked_edges.clone(),
-            pending_memories,
-            tombstoned: buf.tombstoned.clone(),
-        })
-    })?;
+            let mut pending_memories = std::collections::HashMap::new();
+            for enc in &buf.encodes {
+                pending_memories.insert(
+                    enc.memory_id,
+                    PendingMemorySnapshot {
+                        vector: enc.vector,
+                        salience: enc.salience_initial,
+                        kind: enc.kind,
+                        session_id: enc.session_id,
+                        created_at_unix_nanos: enc.created_at_unix_nanos,
+                    },
+                );
+            }
+            Ok(TxnSnapshot {
+                pending_links,
+                pending_unlinks: buf.unlinked_edges.clone(),
+                pending_memories,
+                tombstoned: buf.tombstoned.clone(),
+            })
+        })?;
     Ok(ctx.executor.clone().with_txn(Arc::new(snap)))
 }

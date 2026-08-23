@@ -2429,10 +2429,14 @@ fn overlay_txn_buffer(
     req: &RecallRequest,
     ctx: &OpsContext,
 ) -> Result<Vec<MemoryResult>, OpError> {
-    let _ = ctx.txn_store.validate_active(txn_id)?;
-    let (pending, tombstoned) = ctx.txn_store.with_buffer(txn_id, |buf| {
-        Ok::<_, OpError>((buf.encodes.clone(), buf.tombstoned.clone()))
-    })?;
+    let _ = ctx
+        .txn_store
+        .validate_active(txn_id, ctx.caller_connection_id)?;
+    let (pending, tombstoned) =
+        ctx.txn_store
+            .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+                Ok::<_, OpError>((buf.encodes.clone(), buf.tombstoned.clone()))
+            })?;
 
     // Drop tombstoned committed hits first — a tombstone in the
     // buffer wins over a committed row for in-txn reads.

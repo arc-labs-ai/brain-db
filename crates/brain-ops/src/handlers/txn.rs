@@ -249,26 +249,43 @@ impl TxnStore {
         }
     }
 
-    /// Validate that `txn_id` exists and is `Active`. Touches the
-    /// sweeper inline so a stale "Active" entry past its expiry is
-    /// observed as `Expired`. Bumps the txn's `expires_at` to
-    /// `now + timeout_seconds` — every in-flight op resets the
-    /// deadline, so an interactive REPL session doesn't expire
-    /// while the user is typing. Returns Ok with the (new) expiry.
-    pub fn validate_active(&self, txn_id: TxnId) -> Result<u64, OpError> {
+    /// Validate that `txn_id` exists, is owned by the calling
+    /// connection, and is `Active`. Touches the sweeper inline so a
+    /// stale "Active" entry past its expiry is observed as `Expired`.
+    /// Bumps the txn's `expires_at` to `now + timeout_seconds` — every
+    /// in-flight op resets the deadline, so an interactive REPL session
+    /// doesn't expire while the user is typing. Returns Ok with the
+    /// (new) expiry.
+    ///
+    /// `caller_connection_id` is the wire-level session issuing the op.
+    /// A txn opened by a *different* connection is reported as
+    /// `TxnNotFound` — the same shape as a never-created id, so a
+    /// connection that guesses another's `txn_id` learns nothing about
+    /// its existence and cannot read its uncommitted writes. See
+    /// [`txn_owned_by`].
+    pub fn validate_active(
+        &self,
+        txn_id: TxnId,
+        caller_connection_id: [u8; 16],
+    ) -> Result<u64, OpError> {
         let mut entries = self.entries.lock();
         let now = now_unix_nanos();
         Self::sweep_expired_locked(&mut entries, now);
         match entries.get_mut(&txn_id) {
             None => Err(OpError::TxnNotFound),
-            Some(e) => match e.state {
-                TxnState::Active => {
-                    e.expires_at_unix_nanos =
-                        now.saturating_add(u64::from(e.timeout_seconds) * 1_000_000_000);
-                    Ok(e.expires_at_unix_nanos)
+            Some(e) => {
+                if !txn_owned_by(e.connection_id, caller_connection_id) {
+                    return Err(OpError::TxnNotFound);
                 }
-                _ => Err(OpError::TxnExpired),
-            },
+                match e.state {
+                    TxnState::Active => {
+                        e.expires_at_unix_nanos =
+                            now.saturating_add(u64::from(e.timeout_seconds) * 1_000_000_000);
+                        Ok(e.expires_at_unix_nanos)
+                    }
+                    _ => Err(OpError::TxnExpired),
+                }
+            }
         }
     }
 
@@ -309,13 +326,15 @@ impl TxnStore {
         aborted
     }
 
-    /// Apply `f` to the mutable buffer of an Active txn. Errors with
-    /// `TxnNotFound` if no such id was ever created, `TxnExpired`
-    /// otherwise. Bumps `expires_at` on success — every buffer
-    /// mutation counts as activity.
+    /// Apply `f` to the mutable buffer of an Active txn owned by the
+    /// calling connection. Errors with `TxnNotFound` if no such id was
+    /// ever created *or* it belongs to another connection (see
+    /// [`txn_owned_by`]), `TxnExpired` otherwise. Bumps `expires_at` on
+    /// success — every buffer mutation counts as activity.
     pub fn with_buffer<R>(
         &self,
         txn_id: TxnId,
+        caller_connection_id: [u8; 16],
         f: impl FnOnce(&mut TxnBuffer) -> Result<R, OpError>,
     ) -> Result<R, OpError> {
         let mut entries = self.entries.lock();
@@ -323,17 +342,36 @@ impl TxnStore {
         Self::sweep_expired_locked(&mut entries, now);
         match entries.get_mut(&txn_id) {
             None => Err(OpError::TxnNotFound),
-            Some(entry) => match (&entry.state, &mut entry.buffer) {
-                (TxnState::Active, Some(buf)) => {
-                    let r = f(buf)?;
-                    entry.expires_at_unix_nanos =
-                        now.saturating_add(u64::from(entry.timeout_seconds) * 1_000_000_000);
-                    Ok(r)
+            Some(entry) => {
+                if !txn_owned_by(entry.connection_id, caller_connection_id) {
+                    return Err(OpError::TxnNotFound);
                 }
-                _ => Err(OpError::TxnExpired),
-            },
+                match (&entry.state, &mut entry.buffer) {
+                    (TxnState::Active, Some(buf)) => {
+                        let r = f(buf)?;
+                        entry.expires_at_unix_nanos =
+                            now.saturating_add(u64::from(entry.timeout_seconds) * 1_000_000_000);
+                        Ok(r)
+                    }
+                    _ => Err(OpError::TxnExpired),
+                }
+            }
         }
     }
+}
+
+/// True iff a connection presenting `caller_connection_id` may act on a
+/// txn opened by `entry_connection_id`.
+///
+/// A txn opened without a session (`entry_connection_id == [0; 16]` — the
+/// in-process test path) imposes no ownership binding, so any caller may
+/// act on it. Once a txn carries a real opener session, only that exact
+/// session may touch it; every other connection (including a session-less
+/// one) is turned away. Callers surface a rejection as `TxnNotFound` so a
+/// foreign connection can't probe for another's transactions.
+#[must_use]
+pub fn txn_owned_by(entry_connection_id: [u8; 16], caller_connection_id: [u8; 16]) -> bool {
+    entry_connection_id == [0u8; 16] || entry_connection_id == caller_connection_id
 }
 
 fn now_unix_nanos() -> u64 {
@@ -395,6 +433,13 @@ pub async fn handle_txn_commit(
         let now = now_unix_nanos();
         TxnStore::sweep_expired_locked(&mut entries, now);
         let entry = entries.get_mut(&req.txn_id).ok_or(OpError::TxnNotFound)?;
+        // Connection ownership: only the connection that opened the txn
+        // may commit it. A foreign connection is turned away as
+        // TxnNotFound before it can learn the txn's state or apply the
+        // opener's buffered writes under its own identity.
+        if !txn_owned_by(entry.connection_id, ctx.caller_connection_id) {
+            return Err(OpError::TxnNotFound);
+        }
         // Replay support.
         if let Some(TxnFinalResponse::Commit(c)) = entry.final_response {
             return Ok(TxnCommitResponse {
@@ -462,6 +507,25 @@ pub async fn handle_txn_commit(
         }
     }
 
+    // Post-commit index cleanup for the txn's tombstones, mirroring the
+    // direct FORGET handler. The writer's Tombstone phase updates redb +
+    // the memory HNSW, but the lexical (tantivy) row and the HyPE
+    // question-vectors are maintained outside the write path — without
+    // this, an in-txn FORGET would leave the memory searchable via the
+    // lexical lane and keep its hypothetical-question vectors live.
+    // `buffer.tombstoned` holds exactly the ids an in-txn FORGET
+    // tombstoned; both cleanups are idempotent and best-effort, so a
+    // memory that was encoded-then-forgotten in the same txn (never
+    // indexed) is a harmless no-op.
+    for memory_id in &buffer.tombstoned {
+        if let Some(dispatcher) = ctx.memory_text_dispatcher.as_ref() {
+            dispatcher
+                .dispatch(crate::index::text_indexer::MemoryTextOp::Forget { id: *memory_id })
+                .await;
+        }
+        crate::handlers::forget::delete_hype_vectors(ctx, *memory_id);
+    }
+
     let committed_at = now_unix_nanos();
     {
         let mut entries = store.entries.lock();
@@ -492,6 +556,13 @@ pub async fn handle_txn_abort(
     TxnStore::sweep_expired_locked(&mut entries, now);
 
     let entry = entries.get_mut(&req.txn_id).ok_or(OpError::TxnNotFound)?;
+    // Connection ownership: only the opening connection may abort. A
+    // foreign connection is rejected as TxnNotFound so it can neither
+    // discard another connection's buffered work nor probe for its
+    // existence.
+    if !txn_owned_by(entry.connection_id, ctx.caller_connection_id) {
+        return Err(OpError::TxnNotFound);
+    }
     if let Some(TxnFinalResponse::Abort(a)) = entry.final_response {
         return Ok(TxnAbortResponse {
             txn_id: req.txn_id,

@@ -96,6 +96,14 @@ pub struct OpsContext {
     /// Inner executor context — embedder, index, metadata, writer.
     /// Handlers borrow this to call brain-planner's `execute_*`.
     pub executor: ExecutorContext,
+    /// Wire-level session that issued **this request**, stamped
+    /// per-request by `brain-ops::dispatch` from the authenticated
+    /// caller. Transaction handlers compare it against the opener's
+    /// `TxnEntry::connection_id` so only the connection that opened a
+    /// txn can read its pending writes, buffer into it, or commit/abort
+    /// it. All-zero means "no session" (in-process test path); a txn
+    /// opened without a session imposes no ownership binding.
+    pub caller_connection_id: [u8; 16],
     /// Planner-side config + budgets. Defaults are fine for v1; the
     /// builder is here so the server can override budgets at startup.
     pub planner_ctx: PlannerContext,
@@ -221,6 +229,7 @@ impl OpsContext {
         let subscriptions = Arc::new(SubscriptionRegistry::new(events.clone()));
         Self {
             executor,
+            caller_connection_id: [0u8; 16],
             planner_ctx: PlannerContext::default(),
             txn_store: Arc::new(TxnStore::new()),
             events,
@@ -270,6 +279,17 @@ impl OpsContext {
     #[must_use]
     pub fn with_txn_store(mut self, store: Arc<TxnStore>) -> Self {
         self.txn_store = store;
+        self
+    }
+
+    /// Stamp the per-request wire-level session id. Called by
+    /// `brain-ops::dispatch` from the authenticated caller so the
+    /// transaction handlers can enforce connection ownership on every
+    /// in-txn op. Tests set it directly to simulate distinct
+    /// connections.
+    #[must_use]
+    pub fn with_caller_connection_id(mut self, connection_id: [u8; 16]) -> Self {
+        self.caller_connection_id = connection_id;
         self
     }
 

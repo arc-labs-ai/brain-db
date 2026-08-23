@@ -270,7 +270,9 @@ async fn handle_link_in_txn(
     txn_id: [u8; 16],
     ctx: &OpsContext,
 ) -> Result<LinkResponse, OpError> {
-    let _ = ctx.txn_store.validate_active(txn_id)?;
+    let _ = ctx
+        .txn_store
+        .validate_active(txn_id, ctx.caller_connection_id)?;
 
     let source = MemoryId::from(req.source);
     let target = MemoryId::from(req.target);
@@ -286,34 +288,36 @@ async fn handle_link_in_txn(
     let request_hash = hash_link_request(&op);
 
     // Replay check.
-    let cached = ctx.txn_store.with_buffer(txn_id, |buf| {
-        if let Some(prior) = buf.request_hashes.get(&req.request_id) {
-            if prior != &request_hash {
-                return Err(OpError::Conflict(
-                    "link in-txn request_id replay with different params".into(),
-                ));
+    let cached = ctx
+        .txn_store
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            if let Some(prior) = buf.request_hashes.get(&req.request_id) {
+                if prior != &request_hash {
+                    return Err(OpError::Conflict(
+                        "link in-txn request_id replay with different params".into(),
+                    ));
+                }
+                if let Some(BufferedReplay::Link {
+                    source,
+                    target,
+                    kind,
+                    weight,
+                    created_at_unix_nanos,
+                    already_existed,
+                }) = buf.request_id_cache.get(&req.request_id)
+                {
+                    return Ok(Some(LinkResponse {
+                        source: (*source).into(),
+                        target: (*target).into(),
+                        kind: EdgeKindWire::from(*kind),
+                        weight: *weight,
+                        created_at_unix_nanos: *created_at_unix_nanos,
+                        already_existed: *already_existed,
+                    }));
+                }
             }
-            if let Some(BufferedReplay::Link {
-                source,
-                target,
-                kind,
-                weight,
-                created_at_unix_nanos,
-                already_existed,
-            }) = buf.request_id_cache.get(&req.request_id)
-            {
-                return Ok(Some(LinkResponse {
-                    source: (*source).into(),
-                    target: (*target).into(),
-                    kind: EdgeKindWire::from(*kind),
-                    weight: *weight,
-                    created_at_unix_nanos: *created_at_unix_nanos,
-                    already_existed: *already_existed,
-                }));
-            }
-        }
-        Ok(None)
-    })?;
+            Ok(None)
+        })?;
     if let Some(resp) = cached {
         return Ok(resp);
     }
@@ -321,7 +325,9 @@ async fn handle_link_in_txn(
     // Reject the 1001st op now — replay-cache hits still replay, but
     // a fresh LINK against a full buffer fails fast.
     ctx.txn_store
-        .with_buffer(txn_id, |buf| buf.check_capacity_for_push())?;
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            buf.check_capacity_for_push()
+        })?;
 
     // Validate both endpoints (committed or pending in-buffer).
     let (src_committed, tgt_committed) = {
@@ -337,11 +343,13 @@ async fn handle_link_in_txn(
         let t = table.get(target.to_be_bytes()).ok().flatten().is_some();
         (s, t)
     };
-    let (src_pending, tgt_pending) = ctx.txn_store.with_buffer(txn_id, |buf| {
-        let ids: std::collections::HashSet<MemoryId> =
-            buf.encodes.iter().map(|e| e.memory_id).collect();
-        Ok((ids.contains(&source), ids.contains(&target)))
-    })?;
+    let (src_pending, tgt_pending) =
+        ctx.txn_store
+            .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+                let ids: std::collections::HashSet<MemoryId> =
+                    buf.encodes.iter().map(|e| e.memory_id).collect();
+                Ok((ids.contains(&source), ids.contains(&target)))
+            })?;
     if !(src_committed || src_pending) {
         return Err(OpError::NotFound {
             what: "memory",
@@ -376,7 +384,7 @@ async fn handle_link_in_txn(
         let key_triple = (source, kind, target);
         let pending_has = ctx
             .txn_store
-            .with_buffer(txn_id, |buf| {
+            .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
                 Ok(buf
                     .links
                     .iter()
@@ -394,7 +402,9 @@ async fn handle_link_in_txn(
         // create (not an overwrite) unless the unlink is removed.
         let pending_unlinked = ctx
             .txn_store
-            .with_buffer(txn_id, |buf| Ok(buf.unlinked_edges.contains(&key_triple)))
+            .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+                Ok(buf.unlinked_edges.contains(&key_triple))
+            })
             .unwrap_or(false);
         (committed_has || pending_has) && !pending_unlinked
     };
@@ -410,24 +420,25 @@ async fn handle_link_in_txn(
         created_at_unix_nanos: created_at,
         space_id: ctx.executor.caller_space,
     };
-    ctx.txn_store.with_buffer(txn_id, |buf| {
-        buf.links.push(buffered);
-        // If this LINK undoes a pending UNLINK, drop the unlink mark.
-        buf.unlinked_edges.remove(&(source, kind, target));
-        buf.request_hashes.insert(req.request_id, request_hash);
-        buf.request_id_cache.insert(
-            req.request_id,
-            BufferedReplay::Link {
-                source,
-                target,
-                kind,
-                weight: req.weight,
-                created_at_unix_nanos: created_at,
-                already_existed,
-            },
-        );
-        Ok(())
-    })?;
+    ctx.txn_store
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            buf.links.push(buffered);
+            // If this LINK undoes a pending UNLINK, drop the unlink mark.
+            buf.unlinked_edges.remove(&(source, kind, target));
+            buf.request_hashes.insert(req.request_id, request_hash);
+            buf.request_id_cache.insert(
+                req.request_id,
+                BufferedReplay::Link {
+                    source,
+                    target,
+                    kind,
+                    weight: req.weight,
+                    created_at_unix_nanos: created_at,
+                    already_existed,
+                },
+            );
+            Ok(())
+        })?;
 
     Ok(LinkResponse {
         source: source.into(),
@@ -444,7 +455,9 @@ async fn handle_unlink_in_txn(
     txn_id: [u8; 16],
     ctx: &OpsContext,
 ) -> Result<UnlinkResponse, OpError> {
-    let _ = ctx.txn_store.validate_active(txn_id)?;
+    let _ = ctx
+        .txn_store
+        .validate_active(txn_id, ctx.caller_connection_id)?;
 
     let source = MemoryId::from(req.source);
     let target = MemoryId::from(req.target);
@@ -458,30 +471,32 @@ async fn handle_unlink_in_txn(
     };
     let request_hash = hash_unlink_request(&op);
 
-    let cached = ctx.txn_store.with_buffer(txn_id, |buf| {
-        if let Some(prior) = buf.request_hashes.get(&req.request_id) {
-            if prior != &request_hash {
-                return Err(OpError::Conflict(
-                    "unlink in-txn request_id replay with different params".into(),
-                ));
+    let cached = ctx
+        .txn_store
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            if let Some(prior) = buf.request_hashes.get(&req.request_id) {
+                if prior != &request_hash {
+                    return Err(OpError::Conflict(
+                        "unlink in-txn request_id replay with different params".into(),
+                    ));
+                }
+                if let Some(BufferedReplay::Unlink {
+                    source,
+                    target,
+                    kind,
+                    removed,
+                }) = buf.request_id_cache.get(&req.request_id)
+                {
+                    return Ok(Some(UnlinkResponse {
+                        source: (*source).into(),
+                        target: (*target).into(),
+                        kind: EdgeKindWire::from(*kind),
+                        removed: *removed,
+                    }));
+                }
             }
-            if let Some(BufferedReplay::Unlink {
-                source,
-                target,
-                kind,
-                removed,
-            }) = buf.request_id_cache.get(&req.request_id)
-            {
-                return Ok(Some(UnlinkResponse {
-                    source: (*source).into(),
-                    target: (*target).into(),
-                    kind: EdgeKindWire::from(*kind),
-                    removed: *removed,
-                }));
-            }
-        }
-        Ok(None)
-    })?;
+            Ok(None)
+        })?;
     if let Some(resp) = cached {
         return Ok(resp);
     }
@@ -489,7 +504,9 @@ async fn handle_unlink_in_txn(
     // Reject the 1001st op now — replay-cache hits still replay, but
     // a fresh UNLINK against a full buffer fails fast.
     ctx.txn_store
-        .with_buffer(txn_id, |buf| buf.check_capacity_for_push())?;
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            buf.check_capacity_for_push()
+        })?;
 
     // Decide `removed` at preview time. An edge "exists" if it's in
     // the committed `edges_out` table OR appears in any pending
@@ -514,21 +531,25 @@ async fn handle_unlink_in_txn(
         .encode();
         table.get(key.as_slice()).ok().flatten().is_some()
     };
-    let pending_has = ctx.txn_store.with_buffer(txn_id, |buf| {
-        Ok(buf
-            .links
-            .iter()
-            .any(|l| (l.source, l.kind, l.target) == key_triple)
-            || buf.encodes.iter().any(|e| {
-                e.memory_id == source
-                    && e.edges
-                        .iter()
-                        .any(|edge| edge.target == target && edge.kind == kind)
-            }))
-    })?;
+    let pending_has = ctx
+        .txn_store
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            Ok(buf
+                .links
+                .iter()
+                .any(|l| (l.source, l.kind, l.target) == key_triple)
+                || buf.encodes.iter().any(|e| {
+                    e.memory_id == source
+                        && e.edges
+                            .iter()
+                            .any(|edge| edge.target == target && edge.kind == kind)
+                }))
+        })?;
     let already_unlinked = ctx
         .txn_store
-        .with_buffer(txn_id, |buf| Ok(buf.unlinked_edges.contains(&key_triple)))?;
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            Ok(buf.unlinked_edges.contains(&key_triple))
+        })?;
 
     let removed = (committed_has || pending_has) && !already_unlinked;
 
@@ -542,23 +563,24 @@ async fn handle_unlink_in_txn(
         created_at_unix_nanos: created_at,
         space_id: ctx.executor.caller_space,
     };
-    ctx.txn_store.with_buffer(txn_id, |buf| {
-        buf.unlinks.push(buffered);
-        if removed {
-            buf.unlinked_edges.insert(key_triple);
-        }
-        buf.request_hashes.insert(req.request_id, request_hash);
-        buf.request_id_cache.insert(
-            req.request_id,
-            BufferedReplay::Unlink {
-                source,
-                target,
-                kind,
-                removed,
-            },
-        );
-        Ok(())
-    })?;
+    ctx.txn_store
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            buf.unlinks.push(buffered);
+            if removed {
+                buf.unlinked_edges.insert(key_triple);
+            }
+            buf.request_hashes.insert(req.request_id, request_hash);
+            buf.request_id_cache.insert(
+                req.request_id,
+                BufferedReplay::Unlink {
+                    source,
+                    target,
+                    kind,
+                    removed,
+                },
+            );
+            Ok(())
+        })?;
 
     Ok(UnlinkResponse {
         source: source.into(),

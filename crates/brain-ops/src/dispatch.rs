@@ -213,12 +213,25 @@ pub async fn dispatch(
     // of the shared ctx so handlers that build writer Ops can pull
     // it via `ctx.executor.caller_space` without taking another
     // function param. The clone is cheap — every field is Arc'd.
+    // Stamp the caller's wire session onto the per-request ctx so the
+    // transaction handlers can enforce connection ownership (an in-txn
+    // op is served only for the connection that opened the txn). This is
+    // stamped even for the default-space test path — the ownership check
+    // reads it directly.
+    let needs_session = caller.connection_id != [0u8; 16];
     let per_request_ctx = if caller.space_id == brain_core::SpaceId::default() {
-        // Test-only default-space caller — no override needed; reuse the
-        // shared ctx (zero-cost on the hot path).
-        None
+        // Test-only default-space caller — no space/namespace override
+        // needed. Only clone when a session id must be stamped.
+        if needs_session {
+            let mut owned = ctx.clone();
+            owned.caller_connection_id = caller.connection_id;
+            Some(owned)
+        } else {
+            None
+        }
     } else {
         let mut owned = ctx.clone();
+        owned.caller_connection_id = caller.connection_id;
         owned.executor = owned
             .executor
             .with_caller_space(caller.space_id)

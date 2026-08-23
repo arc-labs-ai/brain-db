@@ -880,7 +880,9 @@ async fn handle_encode_in_txn(
     let salience = DEFAULT_SALIENCE;
 
     // 2. Validate the txn is Active.
-    let _ = ctx.txn_store.validate_active(txn_id)?;
+    let _ = ctx
+        .txn_store
+        .validate_active(txn_id, ctx.caller_connection_id)?;
 
     // 3. Build an EncodeOp shape for hashing (matches the non-txn
     //    idempotency hash so a cross-txn replay surfaces conflicts).
@@ -892,24 +894,26 @@ async fn handle_encode_in_txn(
     );
 
     // 4. Intra-txn replay check.
-    let replay = ctx.txn_store.with_buffer(txn_id, |buf| {
-        if let Some(prior_hash) = buf.request_hashes.get(&req.request_id) {
-            if prior_hash != &request_hash {
-                return Err(OpError::Conflict(format!(
-                    "encode in-txn request_id replay with different params: txn={}",
-                    hex_short(&txn_id)
-                )));
+    let replay = ctx
+        .txn_store
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            if let Some(prior_hash) = buf.request_hashes.get(&req.request_id) {
+                if prior_hash != &request_hash {
+                    return Err(OpError::Conflict(format!(
+                        "encode in-txn request_id replay with different params: txn={}",
+                        hex_short(&txn_id)
+                    )));
+                }
+                // Same request → return cached preview. ENCODE carries no
+                // client edges, so the replayed auto-edge count is always 0.
+                if let Some(BufferedReplay::Encode { memory_id, .. }) =
+                    buf.request_id_cache.get(&req.request_id)
+                {
+                    return Ok(Some((*memory_id, 0u32)));
+                }
             }
-            // Same request → return cached preview. ENCODE carries no
-            // client edges, so the replayed auto-edge count is always 0.
-            if let Some(BufferedReplay::Encode { memory_id, .. }) =
-                buf.request_id_cache.get(&req.request_id)
-            {
-                return Ok(Some((*memory_id, 0u32)));
-            }
-        }
-        Ok(None)
-    })?;
+            Ok(None)
+        })?;
     if let Some((memory_id, auto_edges_added)) = replay {
         return Ok(EncodeResponse {
             memory_id: memory_id.into(),
@@ -948,7 +952,9 @@ async fn handle_encode_in_txn(
     //     replay) but before we burn embed + writer-reserve work on a
     //     doomed buffer.
     ctx.txn_store
-        .with_buffer(txn_id, |buf| buf.check_capacity_for_push())?;
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            buf.check_capacity_for_push()
+        })?;
 
     // 5. Embed.
     let vector = ctx
@@ -1007,18 +1013,19 @@ async fn handle_encode_in_txn(
         space_id: ctx.executor.caller_space,
     };
 
-    ctx.txn_store.with_buffer(txn_id, |buf| {
-        buf.encodes.push(buffered);
-        buf.request_hashes.insert(req.request_id, request_hash);
-        buf.request_id_cache.insert(
-            req.request_id,
-            BufferedReplay::Encode {
-                memory_id,
-                edge_outcomes: Vec::new(),
-            },
-        );
-        Ok(())
-    })?;
+    ctx.txn_store
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            buf.encodes.push(buffered);
+            buf.request_hashes.insert(req.request_id, request_hash);
+            buf.request_id_cache.insert(
+                req.request_id,
+                BufferedReplay::Encode {
+                    memory_id,
+                    edge_outcomes: Vec::new(),
+                },
+            );
+            Ok(())
+        })?;
 
     Ok(EncodeResponse {
         memory_id: memory_id.into(),

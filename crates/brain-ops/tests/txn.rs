@@ -934,6 +934,44 @@ async fn begin_with_connection(
     )
 }
 
+/// Buffer one ENCODE inside `txn` as the connection that opened it.
+/// The connection-ownership check rejects an in-txn op issued by any
+/// other connection, so a session-bound txn's writes must ride the same
+/// session id.
+async fn encode_on(
+    fix: &Fixture,
+    rid: [u8; 16],
+    text: &str,
+    txn: [u8; 16],
+    connection_id: [u8; 16],
+) -> u128 {
+    match single_body(
+        dispatch(
+            RequestBody::Encode(encode_req(rid, text, Some(txn))),
+            brain_ops::RequestCaller::for_tests().with_session_id(connection_id),
+            &fix.ctx,
+        )
+        .await
+        .unwrap(),
+    ) {
+        ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
+        other => panic!("expected Encode, got {other:?}"),
+    }
+}
+
+/// Commit `txn` as the connection that opened it.
+async fn commit_on(fix: &Fixture, txn: [u8; 16], connection_id: [u8; 16]) -> TxnCommitResponse {
+    unwrap_commit(
+        dispatch(
+            RequestBody::TxnCommit(TxnCommitRequest { txn_id: txn }),
+            brain_ops::RequestCaller::for_tests().with_session_id(connection_id),
+            &fix.ctx,
+        )
+        .await
+        .unwrap(),
+    )
+}
+
 #[test]
 fn session_drop_aborts_open_txns() {
     run_in_glommio(|| async {
@@ -942,8 +980,8 @@ fn session_drop_aborts_open_txns() {
         let txn = [200; 16];
         let _ = begin_with_connection(&fix, txn, 30, session).await;
         // Buffer some work — these must NOT land after the sweep.
-        let _ = encode(&fix, [201; 16], "draft-1", Some(txn)).await;
-        let _ = encode(&fix, [202; 16], "draft-2", Some(txn)).await;
+        let _ = encode_on(&fix, [201; 16], "draft-1", txn, session).await;
+        let _ = encode_on(&fix, [202; 16], "draft-2", txn, session).await;
 
         // Simulate the connection drop hook: connection layer fans
         // `abort_orphaned_for_connection` to every shard. Here we hit
@@ -951,12 +989,12 @@ fn session_drop_aborts_open_txns() {
         let aborted = fix.ctx.txn_store.abort_orphaned_for_connection(session);
         assert_eq!(aborted, vec![txn], "exactly the dropped session's txn");
 
-        // Subsequent ops on the txn must see it as Expired (the
-        // post-sweep state is Aborted, validate_active returns
-        // TxnExpired for any non-Active state).
+        // Subsequent ops on the txn (from the owning session) must see
+        // it as Expired (the post-sweep state is Aborted, validate_active
+        // returns TxnExpired for any non-Active state).
         let err = dispatch(
             RequestBody::TxnCommit(TxnCommitRequest { txn_id: txn }),
-            brain_ops::RequestCaller::for_tests(),
+            brain_ops::RequestCaller::for_tests().with_session_id(session),
             &fix.ctx,
         )
         .await
@@ -994,14 +1032,14 @@ fn session_drop_does_not_affect_other_sessions() {
         let txn_b = [211; 16];
         let _ = begin_with_connection(&fix, txn_a, 30, session_a).await;
         let _ = begin_with_connection(&fix, txn_b, 30, session_b).await;
-        let _ = encode(&fix, [212; 16], "from-b", Some(txn_b)).await;
+        let _ = encode_on(&fix, [212; 16], "from-b", txn_b, session_b).await;
 
         // Drop session A. Session B's txn must keep working.
         let aborted = fix.ctx.txn_store.abort_orphaned_for_connection(session_a);
         assert_eq!(aborted, vec![txn_a]);
 
         // Session B can commit. Its encode must land.
-        let resp = commit(&fix, txn_b).await;
+        let resp = commit_on(&fix, txn_b, session_b).await;
         assert_eq!(resp.operations_applied, 1);
         // Committed to redb — index it lexically so the non-txn recall
         // surfaces it.
@@ -1034,7 +1072,7 @@ fn reconnect_after_drop_sees_clean_state() {
         let session_2 = [0xCC; 16];
         let old_txn = [220; 16];
         let _ = begin_with_connection(&fix, old_txn, 30, session_1).await;
-        let _ = encode(&fix, [221; 16], "lost-draft", Some(old_txn)).await;
+        let _ = encode_on(&fix, [221; 16], "lost-draft", old_txn, session_1).await;
 
         // Original connection dies.
         let aborted = fix.ctx.txn_store.abort_orphaned_for_connection(session_1);
@@ -1045,7 +1083,7 @@ fn reconnect_after_drop_sees_clean_state() {
         // clean buffer — the previous draft must not leak through.
         let new_txn = [222; 16];
         let _ = begin_with_connection(&fix, new_txn, 30, session_2).await;
-        let _ = encode(&fix, [223; 16], "fresh-draft", Some(new_txn)).await;
+        let _ = encode_on(&fix, [223; 16], "fresh-draft", new_txn, session_2).await;
 
         // Recall inside the new txn sees only its own pending encode,
         // not the dropped one.
@@ -1071,7 +1109,7 @@ fn reconnect_after_drop_sees_clean_state() {
         );
 
         // Commit the new session's txn — the encode lands cleanly.
-        let resp = commit(&fix, new_txn).await;
+        let resp = commit_on(&fix, new_txn, session_2).await;
         assert_eq!(resp.operations_applied, 1);
     })
 }
@@ -1225,5 +1263,192 @@ fn txn_replay_still_works_when_buffer_is_full() {
         // Commit still works.
         let c = commit(&fix, txn).await;
         assert_eq!(c.operations_applied, 1000);
+    })
+}
+
+// =============================================================================
+// Connection ownership (isolation between distinct wire connections)
+// =============================================================================
+//
+// A txn is owned by the connection that opened it. Only that connection
+// may read its pending writes, buffer into it, or commit/abort it. A
+// different connection that knows (or guesses) the `txn_id` must be
+// turned away as `TxnNotFound` — never served the uncommitted writes,
+// never allowed to mutate or finalize the txn.
+
+/// A test caller bound to a specific wire-level session id.
+fn caller_on(connection_id: [u8; 16]) -> brain_ops::RequestCaller {
+    brain_ops::RequestCaller::for_tests().with_session_id(connection_id)
+}
+
+const CONN_A: [u8; 16] = [0xAA; 16];
+const CONN_B: [u8; 16] = [0xBB; 16];
+
+#[test]
+fn foreign_connection_cannot_read_pending_writes() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let txn = [170; 16];
+
+        // Connection A opens the txn and buffers a pending encode.
+        let _ = unwrap_begin(
+            dispatch(
+                RequestBody::TxnBegin(TxnBeginRequest {
+                    txn_id: txn,
+                    timeout_seconds: 60,
+                }),
+                caller_on(CONN_A),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        let mid = match single_body(
+            dispatch(
+                RequestBody::Encode(encode_req([171; 16], "a-secret", Some(txn))),
+                caller_on(CONN_A),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        ) {
+            ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
+            other => panic!("expected Encode, got {other:?}"),
+        };
+
+        // Connection B, knowing the txn_id, tries an in-txn RECALL.
+        // It must be rejected as TxnNotFound and see none of A's writes.
+        let err = dispatch(
+            RequestBody::Recall(recall_req("a-secret", 10, Some(txn))),
+            caller_on(CONN_B),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, OpError::TxnNotFound), "got {err:?}");
+        assert_eq!(err.error_code(), ErrorCode::TxnNotFound);
+
+        // A's own in-txn RECALL still sees its pending write (RYOW).
+        let frame = unwrap_recall(
+            dispatch(
+                RequestBody::Recall(recall_req("a-secret", 10, Some(txn))),
+                caller_on(CONN_A),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            frame.memories.iter().any(|r| r.memory_id == mid),
+            "owning connection must still see its pending write; got {:?}",
+            frame.memories
+        );
+    })
+}
+
+#[test]
+fn foreign_connection_cannot_write_into_txn() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let txn = [172; 16];
+        let _ = dispatch(
+            RequestBody::TxnBegin(TxnBeginRequest {
+                txn_id: txn,
+                timeout_seconds: 60,
+            }),
+            caller_on(CONN_A),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
+
+        // B tries to inject a write into A's txn.
+        let err = dispatch(
+            RequestBody::Encode(encode_req([173; 16], "b-injected", Some(txn))),
+            caller_on(CONN_B),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, OpError::TxnNotFound), "got {err:?}");
+
+        // A commits — the buffer must be empty (B's injection never
+        // landed).
+        let c = unwrap_commit(
+            dispatch(
+                RequestBody::TxnCommit(TxnCommitRequest { txn_id: txn }),
+                caller_on(CONN_A),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            c.operations_applied, 0,
+            "foreign write must not enter the txn buffer"
+        );
+    })
+}
+
+#[test]
+fn foreign_connection_cannot_commit_or_abort_txn() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let txn = [174; 16];
+        let _ = dispatch(
+            RequestBody::TxnBegin(TxnBeginRequest {
+                txn_id: txn,
+                timeout_seconds: 60,
+            }),
+            caller_on(CONN_A),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
+        let _ = dispatch(
+            RequestBody::Encode(encode_req([175; 16], "a-pending", Some(txn))),
+            caller_on(CONN_A),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
+
+        // B cannot commit A's txn.
+        let commit_err = dispatch(
+            RequestBody::TxnCommit(TxnCommitRequest { txn_id: txn }),
+            caller_on(CONN_B),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(commit_err, OpError::TxnNotFound),
+            "got {commit_err:?}"
+        );
+
+        // B cannot abort A's txn.
+        let abort_err = dispatch(
+            RequestBody::TxnAbort(TxnAbortRequest { txn_id: txn }),
+            caller_on(CONN_B),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(abort_err, OpError::TxnNotFound),
+            "got {abort_err:?}"
+        );
+
+        // A's own commit still works and applies its buffered op.
+        let c = unwrap_commit(
+            dispatch(
+                RequestBody::TxnCommit(TxnCommitRequest { txn_id: txn }),
+                caller_on(CONN_A),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(c.operations_applied, 1);
     })
 }
