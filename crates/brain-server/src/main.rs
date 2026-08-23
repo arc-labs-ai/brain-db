@@ -388,7 +388,7 @@ mod linux_main {
             // minting data-plane keys, so it must be gated by an operator
             // secret. Without one configured, refuse to start it rather than
             // expose an unauthenticated mint endpoint.
-            if cfg.admin.token.as_deref().unwrap_or("").is_empty() {
+            if !cfg.admin.has_token() {
                 tracing::error!(
                     hint = "set [admin] token or BRAIN__ADMIN__TOKEN",
                     "admin secret not configured: the admin HTTP listener mints \
