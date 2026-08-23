@@ -1511,6 +1511,37 @@ fn register_phase8_workers(
 }
 
 // ---------------------------------------------------------------------------
+// Fanout lag observability
+// ---------------------------------------------------------------------------
+
+/// Process-global count of shard-fanout events skipped because a broadcast
+/// subscriber lagged behind. A non-zero value means at least one live
+/// subscriber missed an LSN and must resync: the per-shard broadcast can no
+/// longer honour the "every event or an explicit resync signal" contract for
+/// that subscriber. Kept observable (never silently swallowed) so the gap is
+/// detectable; PromQL `rate()` over this surfaces sustained overload.
+static FANOUT_LAGGED_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record `skipped` fanout events lost to a lagging broadcast subscriber:
+/// bump the process-global counter and emit a warning. Called from the
+/// per-shard fanout task's `Lagged` arm instead of silently continuing, so a
+/// dropped event is always at least logged and counted.
+fn record_fanout_lag(shard_id: ShardId, skipped: u64) {
+    FANOUT_LAGGED_EVENTS.fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
+    warn!(
+        shard_id,
+        skipped,
+        "shard fanout lagged: broadcast subscriber dropped events; live subscribers see an LSN gap and must resync"
+    );
+}
+
+/// Read the process-global fanout-lag counter. Test/introspection hook.
+#[cfg(test)]
+fn fanout_lagged_events() -> u64 {
+    FANOUT_LAGGED_EVENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
 // Public spawn entry point
 // ---------------------------------------------------------------------------
 
@@ -2328,9 +2359,12 @@ pub fn spawn_shard(
             //
             // `tokio::sync::broadcast::Receiver` is runtime-agnostic
             // (atomics + Waker, no tokio I/O); polling its `recv()`
-            // future inside Glommio is sound. `Lagged` is treated as
-            // a transient skip — slow subscribers see gaps, not
-            // crashes.
+            // future inside Glommio is sound. `Lagged` means this
+            // fanout receiver fell behind and the broadcast buffer
+            // overwrote events before we forwarded them: we can't
+            // recover the dropped envelopes, but we must not swallow
+            // the gap — `record_fanout_lag` counts + warns so a live
+            // subscriber's missing LSN is observable (resync required).
             let mut __fanout_task: Option<glommio::Task<()>> = None;
             {
                 let event_bus = ops.events.clone();
@@ -2346,7 +2380,10 @@ pub fn spawn_shard(
                                     break;
                                 }
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                record_fanout_lag(shard_id, skipped);
+                                continue;
+                            }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
                     }
@@ -3523,27 +3560,6 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
             );
         }
     }
-    // Take the WAL out of its cell. The scheduler is already drained
-    // above, so any snapshot/retention adapter holding an `Rc` clone
-    // of `shard.wal` has finished its last future and dropped its
-    // borrow. `take()` is therefore safe.
-    let wal = shard.wal.borrow_mut().take();
-    if let Some(wal) = wal {
-        if let Err(e) = wal.shutdown().await {
-            warn!(
-                shard_id = shard.shard_id,
-                error = %e,
-                "wal shutdown failed"
-            );
-        }
-    }
-    if let Err(e) = shard.arena.borrow().msync_all() {
-        warn!(
-            shard_id = shard.shard_id,
-            error = %e,
-            "msync_all at shutdown failed"
-        );
-    }
     // Flush the lexical indexes before anything else is torn down.
     //
     // These are JOINED, not cancelled: their final `commit()` is durable
@@ -3586,17 +3602,51 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
         }
     }
 
-    // Cancel the detached per-shard helper tasks. Both capture their
-    // own channel-sender clone, so they never observe a closed channel
-    // and would otherwise stay runnable forever — a live task keeps the
-    // Glommio executor from terminating after this future returns, which
-    // hangs the shard's join. The WAL drain has already flushed above,
-    // so cancelling here loses no durable work.
+    // Cancel the detached per-shard helper tasks BEFORE reclaiming the WAL.
+    //
+    // `wal_drain_task` holds a *shared* `RefCell` borrow of `shard.wal`
+    // across its `wal.append_many(...).await`. It is an independently
+    // spawned Glommio task, not a scheduler-driven adapter, so draining the
+    // scheduler above does *not* guarantee it has dropped that borrow: on a
+    // single-threaded executor it can be parked mid-append (borrow live)
+    // when control returns here. If we called `shard.wal.borrow_mut()` while
+    // that shared borrow was outstanding, the `RefCell` would panic
+    // (`already borrowed`), aborting the shard thread mid-shutdown and
+    // skipping the WAL/arena flush below.
+    //
+    // `cancel().await` drops the task's future — releasing any live borrow —
+    // and joins it, so no shared borrow can be outstanding when we `take()`.
+    // The main loop has already exited (its channel is closed) and the
+    // scheduler is drained, so no new records can enqueue after this point.
+    // Only a not-yet-acked, still-in-flight append is abandoned; every acked
+    // write was fsynced before its LSN was returned, so WAL-before-ack holds
+    // and no durable work is lost. The fanout task touches no shared state
+    // but is cancelled here too so it can't keep the executor runnable.
     if let Some(t) = shard.wal_drain_task.take() {
         t.cancel().await;
     }
     if let Some(t) = shard.fanout_task.take() {
         t.cancel().await;
+    }
+    // Take the WAL out of its cell. The scheduler is drained and the WAL
+    // drain task is cancelled/joined above, so no `Rc` clone of `shard.wal`
+    // holds a live borrow. `take()` is therefore safe.
+    let wal = shard.wal.borrow_mut().take();
+    if let Some(wal) = wal {
+        if let Err(e) = wal.shutdown().await {
+            warn!(
+                shard_id = shard.shard_id,
+                error = %e,
+                "wal shutdown failed"
+            );
+        }
+    }
+    if let Err(e) = shard.arena.borrow().msync_all() {
+        warn!(
+            shard_id = shard.shard_id,
+            error = %e,
+            "msync_all at shutdown failed"
+        );
     }
     info!(
         shard_id = shard.shard_id,
@@ -3873,6 +3923,23 @@ mod tests {
         let mut cfg = ShardSpawnConfig::new(dir, stub_dispatcher());
         cfg.rerank.enabled = false;
         cfg
+    }
+
+    #[test]
+    fn fanout_lag_is_counted_not_silently_swallowed() {
+        // The fanout task's `Lagged` arm routes through `record_fanout_lag`
+        // instead of a bare `continue`; a dropped event must always leave an
+        // observable trace (counter + warn). Assert on a delta because the
+        // counter is process-global and other tests may touch it in parallel.
+        let before = fanout_lagged_events();
+        record_fanout_lag(0, 3);
+        record_fanout_lag(0, 5);
+        let after = fanout_lagged_events();
+        assert_eq!(
+            after - before,
+            8,
+            "fanout lag must accumulate skipped-event counts, not be swallowed"
+        );
     }
 
     #[test]
