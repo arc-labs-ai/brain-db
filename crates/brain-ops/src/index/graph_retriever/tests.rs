@@ -1485,6 +1485,304 @@ mod property {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tenant isolation — the anchor and every emitted node must belong to the
+// caller's `(namespace, space)` scope. A foreign anchor reads as absent (no
+// existence oracle); a foreign neighbour reached over the flat edge table is
+// filtered out.
+// ---------------------------------------------------------------------------
+
+mod tenant_isolation {
+    use super::*;
+
+    use brain_core::{EdgeKind, MemoryId, MemoryKind, NamespaceId, SessionId, SpaceId};
+    use brain_metadata::relation::ops::relation_create;
+    use brain_metadata::tables::edge::{
+        derived_by, link, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
+    };
+    use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
+    use brain_metadata::RowScope;
+
+    const FOREIGN_NS: u32 = 4242;
+    const FOREIGN_SPACE: [u8; 16] = [9u8; 16];
+
+    fn foreign_scope() -> RowScope {
+        RowScope::from_bytes(FOREIGN_NS, FOREIGN_SPACE)
+    }
+
+    /// Caller = the default system namespace + zero space, matching the
+    /// in-scope fixtures written by `put_entity` / `put_memory`.
+    fn caller_config() -> GraphRetrieverConfig {
+        GraphRetrieverConfig::default()
+    }
+
+    fn put_entity_scoped(
+        metadata: &Arc<MetadataDb>,
+        scope: RowScope,
+        name: &str,
+        type_id: EntityTypeId,
+    ) -> EntityId {
+        let id = EntityId::new();
+        let entity =
+            brain_core::Entity::new_active(id, type_id, name.into(), name.to_lowercase(), 0);
+        let wtxn = metadata.write_txn().expect("wtxn");
+        entity_put(&wtxn, scope, SessionId::DEFAULT, &entity).expect("entity_put");
+        wtxn.commit().expect("commit");
+        id
+    }
+
+    fn create_relation_scoped(
+        metadata: &Arc<MetadataDb>,
+        scope: RowScope,
+        relation_type: RelationTypeId,
+        from: EntityId,
+        to: EntityId,
+    ) -> RelationId {
+        let id = RelationId::new();
+        let r = Relation::new_root(
+            id,
+            relation_type,
+            from,
+            to,
+            0.9,
+            Vec::new(),
+            ExtractorId::from(0),
+            0,
+            false,
+        );
+        let wtxn = metadata.write_txn().expect("wtxn");
+        let created = relation_create(&wtxn, scope, SessionId::DEFAULT, &r, 0).expect("relation");
+        wtxn.commit().expect("commit");
+        created
+    }
+
+    fn put_memory_scoped(
+        metadata: &Arc<MetadataDb>,
+        id: MemoryId,
+        ns: NamespaceId,
+        space: [u8; 16],
+    ) {
+        let row = MemoryMetadata::new_active(
+            id,
+            ns,
+            SpaceId::from(space),
+            SessionId(0),
+            id.slot(),
+            id.version(),
+            MemoryKind::Episodic,
+            [0u8; 16],
+            0.5,
+            0,
+            1_700_000_000_000_000_000,
+        );
+        let wtxn = metadata.write_txn().expect("wtxn");
+        {
+            let mut t = wtxn.open_table(MEMORIES_TABLE).expect("open memories");
+            t.insert(&id.to_be_bytes(), &row).expect("insert memory");
+        }
+        wtxn.commit().expect("commit");
+    }
+
+    fn link_mem(metadata: &Arc<MetadataDb>, from: MemoryId, kind: EdgeKind, to: MemoryId) {
+        let data = EdgeData::new(
+            1.0,
+            origin::EXPLICIT,
+            derived_by::CLIENT,
+            1_700_000_000_000_000_000,
+        );
+        let wtxn = metadata.write_txn().expect("wtxn");
+        {
+            let mut out = wtxn.open_table(EDGES_TABLE).expect("out");
+            let mut rev = wtxn.open_table(EDGES_REVERSE_TABLE).expect("rev");
+            link(
+                &mut out,
+                &mut rev,
+                brain_core::NodeRef::Memory(from),
+                brain_core::EdgeKindRef::Builtin(kind),
+                brain_core::NodeRef::Memory(to),
+                zero_disambiguator(),
+                &data,
+            )
+            .expect("link");
+        }
+        wtxn.commit().expect("commit");
+    }
+
+    /// A walk anchored on a FOREIGN-tenant entity — even one with real
+    /// neighbours — must read exactly like a walk on an id that never
+    /// existed: `AnchorNotFound`, no emission. Otherwise QUERY_TRACE /
+    /// QUERY_EXPLAIN would be a cross-tenant existence oracle.
+    #[test]
+    fn foreign_entity_anchor_reads_as_absent_no_oracle() {
+        let (_dir, metadata) = fresh_with_metadata();
+        let type_id = current_person_type(&metadata);
+
+        // A fully-populated foreign subgraph: anchor + neighbour + relation.
+        let f = put_entity_scoped(&metadata, foreign_scope(), "Foreign", type_id);
+        let f2 = put_entity_scoped(&metadata, foreign_scope(), "ForeignTwo", type_id);
+        let rt = intern_relation_type(&metadata, "brain", "knows");
+        create_relation_scoped(&metadata, foreign_scope(), rt, f, f2);
+
+        let retriever = make_retriever_with_db(metadata);
+
+        let foreign_err = retriever
+            .retrieve(
+                &GraphQuery::Star {
+                    anchor: GraphAnchor::Entity(f),
+                    depth: 2,
+                    direction: Direction::Both,
+                    relation_types: None,
+                    include_statements: true,
+                },
+                &caller_config(),
+            )
+            .expect_err("foreign anchor must read as not-found");
+
+        // An id that was never created produces the same variant.
+        let absent = EntityId::new();
+        let absent_err = retriever
+            .retrieve(
+                &GraphQuery::Star {
+                    anchor: GraphAnchor::Entity(absent),
+                    depth: 2,
+                    direction: Direction::Both,
+                    relation_types: None,
+                    include_statements: true,
+                },
+                &caller_config(),
+            )
+            .expect_err("absent anchor is not-found");
+
+        assert!(matches!(foreign_err, GraphError::AnchorNotFound(id) if id == f));
+        assert!(matches!(absent_err, GraphError::AnchorNotFound(id) if id == absent));
+    }
+
+    /// The isolation fix must not regress the common case: a same-tenant
+    /// anchor and its in-scope neighbours still resolve.
+    #[test]
+    fn same_tenant_anchor_and_neighbours_still_returned() {
+        let (_dir, metadata) = fresh_with_metadata();
+        let type_id = current_person_type(&metadata);
+        let a = put_entity(&metadata, "A", type_id);
+        let b = put_entity(&metadata, "B", type_id);
+        let rt = intern_relation_type(&metadata, "brain", "knows");
+        let rel = create_relation(&metadata, rt, a, b);
+
+        let retriever = make_retriever_with_db(metadata);
+        let result = retriever
+            .retrieve(
+                &GraphQuery::Star {
+                    anchor: GraphAnchor::Entity(a),
+                    depth: 1,
+                    direction: Direction::Outgoing,
+                    relation_types: None,
+                    include_statements: false,
+                },
+                &caller_config(),
+            )
+            .expect("retrieve");
+        assert!(result
+            .iter()
+            .any(|h| matches!(h.id, RankedItemId::Entity(e) if e == b)));
+        assert!(result
+            .iter()
+            .any(|h| matches!(h.id, RankedItemId::Relation(r) if r == rel)));
+    }
+
+    /// A `Builtin` neighbour that belongs to another tenant (reached over
+    /// the flat, non-scope-keyed edge table) must be filtered — no node
+    /// emitted — while the in-scope neighbour still is.
+    #[test]
+    fn builtin_neighbour_in_foreign_scope_is_filtered() {
+        let (_dir, metadata) = fresh_with_metadata();
+        let a = MemoryId::pack(1, 1, 1);
+        let good = MemoryId::pack(1, 2, 1);
+        let bad = MemoryId::pack(1, 3, 1);
+        put_memory_scoped(&metadata, a, NamespaceId::SYSTEM, [0u8; 16]);
+        put_memory_scoped(&metadata, good, NamespaceId::SYSTEM, [0u8; 16]);
+        put_memory_scoped(&metadata, bad, NamespaceId::from(FOREIGN_NS), FOREIGN_SPACE);
+        link_mem(&metadata, a, EdgeKind::Caused, good);
+        link_mem(&metadata, a, EdgeKind::Caused, bad);
+
+        let retriever = make_retriever_with_db(metadata);
+        let result = retriever
+            .retrieve(
+                &GraphQuery::Star {
+                    anchor: GraphAnchor::Memory(a),
+                    depth: 1,
+                    direction: Direction::Outgoing,
+                    relation_types: None,
+                    include_statements: false,
+                },
+                &caller_config(),
+            )
+            .expect("retrieve");
+        let ids: Vec<MemoryId> = result
+            .iter()
+            .filter_map(|i| match i.id {
+                RankedItemId::Memory(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert!(ids.contains(&good), "in-scope neighbour returned");
+        assert!(
+            !ids.contains(&bad),
+            "foreign-tenant neighbour must be filtered, got {ids:?}",
+        );
+    }
+
+    /// A dense, cyclic intra-tenant subgraph must terminate and return a
+    /// bounded result — the walk cannot run unbounded even with a high
+    /// branching factor and a tight time budget.
+    #[test]
+    fn dense_cyclic_walk_terminates_bounded() {
+        let (_dir, metadata) = fresh_with_metadata();
+        let nodes: Vec<MemoryId> = (0..16).map(|i| MemoryId::pack(1, 3000 + i, 1)).collect();
+        for &m in &nodes {
+            put_memory_scoped(&metadata, m, NamespaceId::SYSTEM, [0u8; 16]);
+        }
+        // Complete directed graph (every distinct ordered pair) — maximally
+        // dense and riddled with cycles.
+        for (i, &from) in nodes.iter().enumerate() {
+            for (j, &to) in nodes.iter().enumerate() {
+                if i != j {
+                    link_mem(&metadata, from, EdgeKind::Caused, to);
+                }
+            }
+        }
+
+        let retriever = make_retriever_with_db(metadata);
+        let config = GraphRetrieverConfig {
+            max_branching: 10_000,
+            timeout_ms: 5,
+            ..GraphRetrieverConfig::default()
+        };
+        let result = retriever
+            .retrieve(
+                &GraphQuery::Star {
+                    anchor: GraphAnchor::Memory(nodes[0]),
+                    depth: 5,
+                    direction: Direction::Both,
+                    relation_types: None,
+                    include_statements: false,
+                },
+                &config,
+            )
+            .expect("dense walk terminates");
+
+        // Bounded by top_k, and every emitted node is unique (visited dedup
+        // held under the density) and never the anchor.
+        assert!(result.len() <= config.top_k);
+        let mut seen = std::collections::HashSet::new();
+        for item in &result {
+            if let RankedItemId::Memory(m) = item.id {
+                assert!(m != nodes[0], "anchor never emitted");
+                assert!(seen.insert(m), "no duplicate emission");
+            }
+        }
+    }
+}
+
 fn __ts() -> brain_metadata::RowScope {
     // Match `GraphRetrieverConfig::default()` (system namespace + zero
     // space) so seeded typed-graph rows fall under the scope the walk

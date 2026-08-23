@@ -32,6 +32,7 @@
 //!
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use brain_core::SubjectRef;
 use brain_core::{
@@ -125,6 +126,20 @@ impl GraphRetriever for BrainGraphRetriever {
 // Unified BFS.
 // ---------------------------------------------------------------------------
 
+/// Global cap on nodes popped/expanded by a single walk. Past this the
+/// walk stops expanding and ranks what it has already gathered (no error)
+/// — a dense intra-tenant subgraph can never pin the shard in an unbounded
+/// BFS. Mirrors `brain_metadata::relation::traversal::MAX_TOTAL_VISITED`.
+const MAX_TOTAL_VISITED: usize = 100_000;
+
+/// Per-node cap on edges *scanned* (examined, not merely accepted) while
+/// expanding one node. A hub with millions of superseded / foreign /
+/// temporal edges — none of which increment the branching count — cannot
+/// force a full-degree scan: expansion of that node halts once this many
+/// edges have been examined. Set well above `max_branching` so a normal
+/// node (hundreds of edges) is never truncated by it.
+const MAX_SCAN_PER_NODE: usize = 10_000;
+
 /// Per-hit accumulator carrying enough information to rank and
 /// dedupe. We push raw entries and sort once at the end — sorting
 /// per-frontier wastes work because later hops can only score lower
@@ -145,16 +160,23 @@ fn walk(
     include_statements: bool,
     config: &GraphRetrieverConfig,
 ) -> Result<Vec<RankedItem>, GraphError> {
-    // Anchor existence guard. Picks the matching `*AnchorNotFound`
-    // variant so the router can tell entity vs memory misses apart.
-    check_anchor_exists(rtxn, anchor)?;
-
     // Caller's tenant scope, rebuilt from the config's raw fields. Every
-    // scoped read below (statement pivot, sidecar currency check) is
-    // constrained to it so the walk cannot surface another tenant's
-    // typed-graph rows.
+    // scoped read below (anchor guard, node emission, statement pivot,
+    // sidecar currency check) is constrained to it so the walk cannot
+    // surface — or even confirm the existence of — another tenant's rows.
     let scope =
         brain_metadata::RowScope::from_bytes(config.caller_namespace, config.caller_space_bytes);
+
+    // Anchor existence guard. Picks the matching `*AnchorNotFound`
+    // variant so the router can tell entity vs memory misses apart. A
+    // foreign-tenant anchor is reported identically to an absent one — no
+    // cross-tenant existence oracle.
+    check_anchor_exists(rtxn, scope, anchor)?;
+
+    // Bounded latency + memory: the walk stops expanding once the wall
+    // clock or the total-visited budget is spent and ranks what it has.
+    let start = Instant::now();
+    let timeout = Duration::from_millis(u64::from(config.timeout_ms));
 
     let mut visited: HashSet<NodeRef> = HashSet::new();
     // `(node, hop, edge_weight_into_node)`. Anchor enters with
@@ -168,7 +190,30 @@ fn walk(
     let max_branching = config.max_branching as usize;
 
     while let Some((node, d, weight_in)) = frontier.pop_front() {
+        // Termination guards, checked before any work on this node: a
+        // dense subgraph cannot outlast the time budget, and total node
+        // expansion is capped. Both return the partial result rather than
+        // erroring so a legitimate large intra-tenant walk still yields
+        // its top hits.
+        if visited.len() >= MAX_TOTAL_VISITED {
+            break;
+        }
+        if config.timeout_ms > 0 && start.elapsed() >= timeout {
+            break;
+        }
+
         if !visited.insert(node) {
+            continue;
+        }
+
+        // Tenant wall: a neighbour pushed from the unified edge table
+        // (which is not scope-keyed) may belong to another tenant. Skip a
+        // foreign node entirely — no emit, no statement pivot, no
+        // expansion — so a `Builtin` / `Mentions` neighbour cannot leak a
+        // foreign memory/entity, nor can the walk descend into another
+        // tenant's subgraph. The anchor (d == 0) is already scope-checked
+        // by `check_anchor_exists`.
+        if d > 0 && !node_in_scope(rtxn, scope, node)? {
             continue;
         }
 
@@ -210,7 +255,15 @@ fn walk(
         // bytes, disambiguator)` is what `collect_neighbours` returns
         // already, so the truncation is reproducible across runs.
         let mut count = 0usize;
-        for (kind, neighbour, disamb, data) in neighbours {
+        for (scanned, (kind, neighbour, disamb, data)) in neighbours.into_iter().enumerate() {
+            // Per-node scan bound (DoS): count *every* edge examined —
+            // including the temporal / filtered / superseded / foreign
+            // ones skipped below — so a high-degree hub cannot force an
+            // unbounded per-node scan even when none of its edges are
+            // candidate-producing.
+            if scanned >= MAX_SCAN_PER_NODE {
+                break;
+            }
             // Temporal edges record session order, not relevance — they
             // are a filter signal, never candidate-producing. Skip them
             // (without consuming the per-hop branching budget) so the
@@ -333,14 +386,22 @@ fn typed_edge_is_current(
         .unwrap_or(false))
 }
 
-fn check_anchor_exists(rtxn: &ReadTransaction, anchor: NodeRef) -> Result<(), GraphError> {
+fn check_anchor_exists(
+    rtxn: &ReadTransaction,
+    scope: brain_metadata::RowScope,
+    anchor: NodeRef,
+) -> Result<(), GraphError> {
     match anchor {
-        NodeRef::Memory(m) => check_memory_anchor(rtxn, m),
-        NodeRef::Entity(e) => check_entity_anchor(rtxn, e),
+        NodeRef::Memory(m) => check_memory_anchor(rtxn, scope, m),
+        NodeRef::Entity(e) => check_entity_anchor(rtxn, scope, e),
     }
 }
 
-fn check_memory_anchor(rtxn: &ReadTransaction, anchor: MemoryId) -> Result<(), GraphError> {
+fn check_memory_anchor(
+    rtxn: &ReadTransaction,
+    scope: brain_metadata::RowScope,
+    anchor: MemoryId,
+) -> Result<(), GraphError> {
     let memories = rtxn
         .open_table(MEMORIES_TABLE)
         .map_err(|e| GraphError::IndexUnavailable(format!("open memories table: {e}")))?;
@@ -350,23 +411,83 @@ fn check_memory_anchor(rtxn: &ReadTransaction, anchor: MemoryId) -> Result<(), G
     let Some(row) = row else {
         return Err(GraphError::MemoryAnchorNotFound(anchor));
     };
-    if row.value().is_tombstoned() {
+    let m = row.value();
+    // Tenant wall: a foreign-tenant memory anchor is reported identically
+    // to an absent one — the client supplies the anchor raw, so an
+    // out-of-scope hit must not become a cross-tenant existence oracle.
+    if m.is_tombstoned()
+        || m.namespace_id != scope.namespace_id
+        || m.space_id_bytes != scope.space_id_bytes
+    {
         return Err(GraphError::MemoryAnchorNotFound(anchor));
     }
     Ok(())
 }
 
-fn check_entity_anchor(rtxn: &ReadTransaction, anchor: EntityId) -> Result<(), GraphError> {
+fn check_entity_anchor(
+    rtxn: &ReadTransaction,
+    scope: brain_metadata::RowScope,
+    anchor: EntityId,
+) -> Result<(), GraphError> {
     let entities = rtxn
         .open_table(ENTITIES_TABLE)
         .map_err(|e| GraphError::IndexUnavailable(format!("open entities table: {e}")))?;
     let row = entities
         .get(&anchor.to_bytes())
         .map_err(|e| GraphError::IndexUnavailable(format!("entities.get: {e}")))?;
-    if row.is_none() {
+    // Tenant wall: the primary entity table is a flat keyspace, and the
+    // client supplies the anchor raw. Treat a foreign-tenant hit exactly
+    // like a miss so the walk never confirms a foreign entity's existence.
+    let in_scope = row
+        .map(|g| {
+            let m = g.value();
+            m.namespace_id == scope.namespace_id && m.space_id_bytes == scope.space_id_bytes
+        })
+        .unwrap_or(false);
+    if !in_scope {
         return Err(GraphError::AnchorNotFound(anchor));
     }
     Ok(())
+}
+
+/// Whether `node`'s primary row belongs to the caller's tenant. The
+/// unified edge table is not scope-keyed, so a neighbour reached over it
+/// may be another tenant's memory/entity; the primary row carries the
+/// owning `(namespace, space)` and is the authority. A missing row is
+/// treated as out-of-scope (nothing to emit).
+fn node_in_scope(
+    rtxn: &ReadTransaction,
+    scope: brain_metadata::RowScope,
+    node: NodeRef,
+) -> Result<bool, GraphError> {
+    match node {
+        NodeRef::Entity(e) => {
+            let entities = rtxn.open_table(ENTITIES_TABLE).map_err(|err| {
+                GraphError::IndexUnavailable(format!("open entities table: {err}"))
+            })?;
+            Ok(entities
+                .get(&e.to_bytes())
+                .map_err(|err| GraphError::IndexUnavailable(format!("entities.get: {err}")))?
+                .map(|g| {
+                    let m = g.value();
+                    m.namespace_id == scope.namespace_id && m.space_id_bytes == scope.space_id_bytes
+                })
+                .unwrap_or(false))
+        }
+        NodeRef::Memory(m) => {
+            let memories = rtxn.open_table(MEMORIES_TABLE).map_err(|err| {
+                GraphError::IndexUnavailable(format!("open memories table: {err}"))
+            })?;
+            Ok(memories
+                .get(&m.to_be_bytes())
+                .map_err(|err| GraphError::IndexUnavailable(format!("memories.get: {err}")))?
+                .map(|g| {
+                    let r = g.value();
+                    r.namespace_id == scope.namespace_id && r.space_id_bytes == scope.space_id_bytes
+                })
+                .unwrap_or(false))
+        }
+    }
 }
 
 fn node_to_id(n: NodeRef) -> RankedItemId {
@@ -387,11 +508,13 @@ fn run_path(
     max_depth: u8,
     config: &GraphRetrieverConfig,
 ) -> Result<Vec<RankedItem>, GraphError> {
-    check_entity_anchor(rtxn, from)?;
-    check_entity_anchor(rtxn, to)?;
-
     let scope =
         brain_metadata::RowScope::from_bytes(config.caller_namespace, config.caller_space_bytes);
+
+    // Both endpoints are scope-checked: a foreign-tenant endpoint is
+    // reported as absent, never confirmed.
+    check_entity_anchor(rtxn, scope, from)?;
+    check_entity_anchor(rtxn, scope, to)?;
 
     // Single-source BFS from `from`. Tracks parent for each
     // discovered entity so we can reconstruct the path once `to`
