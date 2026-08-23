@@ -1438,6 +1438,12 @@ impl Extractor for LlmExtractor {
             // real spend instead of zero.
             let mut cost_micro: u64 = 0;
 
+            // Total tokens this run consumes, summed across the first call
+            // and any schema-retry call — mirrors `cost_micro`. The cached
+            // row's `token_count` must reflect every token spent, else the
+            // per-extractor cost report undercounts retried extractions.
+            let mut total_tokens: u64 = 0;
+
             // ----- 3. First LLM call -------------------------------------------
             let resp1 = match inner.client.complete(request.clone()).await {
                 Ok(r) => r,
@@ -1447,6 +1453,9 @@ impl Extractor for LlmExtractor {
                 }
             };
             cost_micro = cost_micro.saturating_add(resp1.cost_micro_usd);
+            total_tokens = total_tokens
+                .saturating_add(resp1.tokens_in)
+                .saturating_add(resp1.tokens_out);
 
             // ----- 4. Validate + retry-once ------------------------------------
             let parsed = match inner.schema_compiled.as_ref() {
@@ -1481,6 +1490,9 @@ impl Extractor for LlmExtractor {
                             }
                         };
                         cost_micro = cost_micro.saturating_add(resp2.cost_micro_usd);
+                        total_tokens = total_tokens
+                            .saturating_add(resp2.tokens_in)
+                            .saturating_add(resp2.tokens_out);
                         match validate_against(schema, &resp2.content) {
                             Ok(v) => v,
                             Err(_) => {
@@ -1503,9 +1515,7 @@ impl Extractor for LlmExtractor {
             // ----- 5. Cache write ----------------------------------------------
             if let Some(cache) = inner.cache.as_ref() {
                 let blob = parsed.to_string().into_bytes();
-                let token_count = (resp1.tokens_in + resp1.tokens_out)
-                    .try_into()
-                    .unwrap_or(u32::MAX);
+                let token_count = total_tokens.try_into().unwrap_or(u32::MAX);
                 if let Err(e) = cache_put(
                     cache,
                     input_hash,

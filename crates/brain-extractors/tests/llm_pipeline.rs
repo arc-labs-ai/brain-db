@@ -289,6 +289,61 @@ fn schema_validation_retry_completes_in_two_calls() {
 }
 
 #[test]
+fn retry_cached_token_count_sums_both_calls() {
+    // WK6: when a schema-retry occurs, the cached row's `token_count`
+    // must reflect tokens from *both* the first call and the retry, not
+    // just the first — the value feeds per-extractor cost reporting.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = open_cache_in(dir.path());
+
+    let schema = serde_json::json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {"name": {"type": "string"}},
+        },
+    });
+    // First response fails schema validation (bare string), second passes.
+    // ok_response splits `tokens` evenly across in/out.
+    let client = Arc::new(ScriptedClient::new(
+        "claude-haiku-4-5",
+        vec![
+            Ok(ok_response("[\"bare string\"]", 50)),
+            Ok(ok_response("[{\"name\":\"Alice\"}]", 80)),
+        ],
+    ));
+    let calls = client.calls.clone();
+    let ext = build_extractor(client, Some(cache.clone()), Some(schema), None, 0.0);
+    let reg = ExtractorRegistry::new();
+    let mem = memory("Alice");
+
+    let r = block_on(ext.run(&ctx(&reg), &mem));
+    assert_eq!(r.status, ExtractionStatus::Success);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "retried exactly once");
+
+    // Inspect the cached row's token_count: 50 (first) + 80 (retry) = 130.
+    let key = (
+        ext.cache_input_hash(&ctx(&reg), &mem),
+        EXT_ID_RAW,
+        EXT_VERSION,
+        model_id_hash("claude-haiku-4-5"),
+    );
+    let db = cache.lock();
+    let rtxn = db.read_txn().unwrap();
+    let t = rtxn.open_table(LLM_RESPONSES_TABLE).unwrap();
+    let row = t
+        .get(&key)
+        .unwrap()
+        .expect("cached row present after retry");
+    assert_eq!(
+        row.value().token_count,
+        130,
+        "cached token_count must include both the first call and the retry"
+    );
+}
+
+#[test]
 fn schema_validation_failure_twice_costs_two_calls() {
     let schema = serde_json::json!({
         "type": "array",
