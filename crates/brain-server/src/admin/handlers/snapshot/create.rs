@@ -24,8 +24,12 @@ pub async fn handle(query_str: &str, state: &Arc<AdminState>) -> Response<Respon
             json_response(StatusCode::CREATED, body)
         }
         Err(e) => {
+            // Log the internal detail; return a generic client-safe message.
             warn!(error = %e, "snapshot create failed");
-            text_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}\n"))
+            text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "snapshot creation failed\n",
+            )
         }
     }
 }

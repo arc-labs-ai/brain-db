@@ -8,6 +8,7 @@ use std::sync::Arc;
 use brain_http::body::ResponseBody;
 use http::{Method, Request, Response, StatusCode};
 use hyper::body::Incoming;
+use tracing::warn;
 
 use crate::admin::handlers::worker::{KNOWN_ACTIONS, KNOWN_WORKERS};
 use crate::admin::util::{json_response, text_response};
@@ -70,27 +71,32 @@ pub async fn control(
                 // fatal. Surface as a partial-success.
                 errors.push(format!("shard {shard_idx}: worker not registered"));
             }
-            Err(e) => errors.push(format!("shard {shard_idx}: {e}")),
+            Err(e) => {
+                // Log the internal detail; keep only a generic marker on
+                // the wire so a shard error can't leak host internals.
+                warn!(shard = shard_idx, worker = %name, error = %e, "worker control failed");
+                errors.push(format!("shard {shard_idx}: control failed"));
+            }
         }
     }
 
     if applied == 0 {
-        let detail = errors.join("; ");
         return Ok(text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("no shards applied the action: {detail}\n"),
+            "no shards applied the action\n",
         ));
     }
 
-    let body = format!(
-        "{{\"worker\":\"{name}\",\"action\":\"{action_slug}\",\"applied_shards\":{applied},\"errors\":[{}]}}\n",
-        errors
-            .iter()
-            .map(|e| format!("\"{e}\""))
-            .collect::<Vec<_>>()
-            .join(","),
-    );
-    Ok(json_response(StatusCode::OK, body))
+    // Build the JSON via serde so an error string containing `"`, `\`, or a
+    // newline can't break out of the response document.
+    let body = serde_json::json!({
+        "worker": name,
+        "action": action_slug,
+        "applied_shards": applied,
+        "errors": errors,
+    })
+    .to_string();
+    Ok(json_response(StatusCode::OK, format!("{body}\n")))
 }
 
 #[cfg(test)]
@@ -102,6 +108,28 @@ mod tests {
         assert!(KNOWN_ACTIONS.contains(&"stop"));
         assert!(KNOWN_ACTIONS.contains(&"start"));
         assert!(KNOWN_ACTIONS.contains(&"run-now"));
+    }
+
+    #[test]
+    fn error_strings_produce_valid_json() {
+        // A shard error containing a quote / backslash / newline must not
+        // break out of the JSON document. serde_json escapes it.
+        let errors = vec![
+            r#"shard 0: broke "everything""#.to_string(),
+            "shard 1: back\\slash\nnewline".to_string(),
+        ];
+        let body = serde_json::json!({
+            "worker": "de\"cay",
+            "action": "run-now",
+            "applied_shards": 2u64,
+            "errors": errors,
+        })
+        .to_string();
+        // Round-trips: the document is well-formed and preserves content.
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(parsed["applied_shards"], 2);
+        assert_eq!(parsed["errors"][0], r#"shard 0: broke "everything""#);
+        assert_eq!(parsed["worker"], "de\"cay");
     }
 
     #[test]

@@ -37,10 +37,11 @@ pub async fn handle(
             Ok(json_response(StatusCode::CREATED, body))
         }
         Err(e) => {
+            // Log the internal detail; return a generic client-safe message.
             warn!(error = %e, "rebuild-ann failed");
             Ok(text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("{e}\n"),
+                "index rebuild failed\n",
             ))
         }
     }

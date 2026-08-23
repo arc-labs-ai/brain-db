@@ -182,7 +182,12 @@ where
 
             match result {
                 Ok(resp) => resp,
-                Err(e) => canned(status_for_error(&e), &format!("{{\"error\":\"{e}\"}}\n")),
+                // Escape the message so one containing `"`, `\`, or a
+                // control char can't produce malformed JSON.
+                Err(e) => {
+                    let body = format!("{{\"error\":\"{}\"}}\n", json_escape(&e.to_string()));
+                    canned_json(status_for_error(&e), &body)
+                }
             }
         })
     }
@@ -202,6 +207,36 @@ fn canned(status: StatusCode, body: &str) -> Response<ResponseBody> {
         .header("content-type", "text/plain; charset=utf-8")
         .body(full(Bytes::copy_from_slice(body.as_bytes())))
         .expect("static response always builds")
+}
+
+fn canned_json(status: StatusCode, body: &str) -> Response<ResponseBody> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json; charset=utf-8")
+        .body(full(Bytes::copy_from_slice(body.as_bytes())))
+        .expect("static response always builds")
+}
+
+/// Escape a string for embedding inside a JSON string literal. Handles the
+/// two structural characters (`"`, `\`) plus the control characters JSON
+/// forbids unescaped, so an arbitrary error `Display` can never break the
+/// surrounding document.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -305,5 +340,47 @@ mod tests {
         let (status, body) = collect(r.dispatch(req(Method::GET, "/v1/down")).await).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(body.starts_with(b"{\"error\":"));
+    }
+
+    #[test]
+    fn json_escape_handles_structural_chars() {
+        assert_eq!(json_escape(r#"a"b\c"#), r#"a\"b\\c"#);
+        assert_eq!(json_escape("line1\nline2\t"), "line1\\nline2\\t");
+        assert_eq!(json_escape("\u{01}"), "\\u0001");
+        assert_eq!(json_escape("plain"), "plain");
+    }
+
+    #[tokio::test]
+    async fn handler_error_with_quote_produces_valid_json() {
+        // An error Display containing `"` / `\` / newline must not break
+        // out of the JSON error document. (brain-http has no JSON parser
+        // dependency, so we assert well-formedness structurally.)
+        async fn explode(_req: Request<Full<Bytes>>) -> crate::Result<Response<ResponseBody>> {
+            Err(crate::Error::Upgrade("say \"hi\"\nboom".to_string()))
+        }
+        let r = Router::<Full<Bytes>>::new().get("/v1/boom", explode);
+        let (_status, body) = collect(r.dispatch(req(Method::GET, "/v1/boom")).await).await;
+        let text = std::str::from_utf8(&body).expect("utf8");
+
+        // Exactly the escaped document the dispatcher promises to emit.
+        let display = crate::Error::Upgrade("say \"hi\"\nboom".to_string()).to_string();
+        let expected = format!("{{\"error\":\"{}\"}}\n", json_escape(&display));
+        assert_eq!(text, expected);
+
+        // The value portion carries no raw newline and no bare quote —
+        // both would corrupt the JSON.
+        let inner = text
+            .trim_end()
+            .strip_prefix("{\"error\":\"")
+            .and_then(|s| s.strip_suffix("\"}"))
+            .expect("well-formed error envelope");
+        assert!(!inner.contains('\n'), "raw newline leaked: {text}");
+        // Every quote inside the value is backslash-escaped.
+        let bytes = inner.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'"' {
+                assert!(i > 0 && bytes[i - 1] == b'\\', "bare quote at {i}: {text}");
+            }
+        }
     }
 }

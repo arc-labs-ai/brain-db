@@ -61,9 +61,10 @@ pub async fn handle(
     }
 
     if !shard_errors.is_empty() && enqueued == 0 && skipped == 0 {
+        // Per-shard detail is already logged above; keep it off the wire.
         return Ok(text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("backfill failed: {}\n", shard_errors.join("; ")),
+            "extraction backfill failed\n",
         ));
     }
 
