@@ -664,12 +664,17 @@ async fn execute_once(
     let as_of = plan.post_filters.as_of_record_time_unix_nanos;
     if plan.routing.temporal_pushdown || as_of.is_some() {
         let reference_time = as_of.unwrap_or_else(now_unix_nanos);
+        // Use the SAME `k` that `fuse()` used (adaptive_k for RRF, else the
+        // plan's k). The recency term is one top-rank vote — `1 / (k + 1)` —
+        // so sizing it to the plan's default k=60 while RRF actually fused
+        // at adaptive_k (15/30) would make the boost ~4-7x weaker than the
+        // per-retriever contributions it is meant to tie-break against.
         apply_recency_boost(
             &mut filtered,
             ctx.metadata.as_ref(),
             reference_time,
             plan.fusion.weights.temporal,
-            plan.fusion.k,
+            fusion_k,
         )?;
     }
 
