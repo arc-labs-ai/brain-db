@@ -35,6 +35,27 @@ const WEIGHTS_FILE: &str = "model.safetensors";
 /// with a 512-token cap; we mirror that.
 pub const DEFAULT_MAX_TOKEN_LEN: usize = 512;
 
+/// Truncation parameters for a `(query, passage)` cross-encoder.
+///
+/// Pairs are built as `(query, candidate)` in [`CrossEncoder::score_pairs`],
+/// so the passage is the SECOND sequence. [`TruncationStrategy::OnlySecond`]
+/// keeps the query intact and trims the passage tail to fit `max_length`.
+///
+/// [`TruncationStrategy::OnlyFirst`] would trim the query instead, which is
+/// wrong in two ways: (a) a long passage paired with a short query overshoots
+/// the query length, so tokenizers raises `SequenceTooShort` and fails the
+/// entire `encode_batch` — one long candidate silently collapses rerank to
+/// RRF-only for the whole query; (b) even when it does not error, the query
+/// gets mutilated and the cross-encoder scores garbage logits.
+pub(crate) fn truncation_params(max_len: usize) -> TruncationParams {
+    TruncationParams {
+        max_length: max_len,
+        strategy: tokenizers::TruncationStrategy::OnlySecond,
+        stride: 0,
+        direction: tokenizers::TruncationDirection::Right,
+    }
+}
+
 /// Errors raised by the cross-encoder loader / scorer. Hot-path
 /// callers (the retrieval executor) downgrade `Skipped` returns to
 /// "RRF-only result" with a single `info` log.
@@ -126,12 +147,7 @@ impl CrossEncoder {
             pad_token,
         }));
         tokenizer
-            .with_truncation(Some(TruncationParams {
-                max_length: max_len,
-                strategy: tokenizers::TruncationStrategy::OnlyFirst,
-                stride: 0,
-                direction: tokenizers::TruncationDirection::Right,
-            }))
+            .with_truncation(Some(truncation_params(max_len)))
             .map_err(|e| RerankError::TokenizerParse(e.to_string()))?;
 
         let weights_path = dir.join(WEIGHTS_FILE);
@@ -264,6 +280,148 @@ impl CrossEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
+    use tokenizers::processors::template::TemplateProcessing;
+
+    /// Build a minimal real `Tokenizer` that emits two sequences for a
+    /// `(query, passage)` pair — `<s> query </s></s> passage </s>` — using
+    /// the exact production [`truncation_params`]. This lets us exercise the
+    /// truncation strategy against the pair-building order without loading
+    /// the multi-hundred-MB bge-reranker-base checkout.
+    ///
+    /// `strategy` is a parameter so a single builder can construct both the
+    /// production (`OnlySecond`) tokenizer and a contrasting `OnlyFirst` one
+    /// that reproduces the bug.
+    fn build_pair_tokenizer(max_len: usize, strategy: tokenizers::TruncationStrategy) -> Tokenizer {
+        let words = [
+            "<s>", "</s>", "[UNK]", "where", "does", "alice", "work", "cat", "stripe",
+        ];
+        let vocab_json = {
+            let entries: Vec<String> = words
+                .iter()
+                .enumerate()
+                .map(|(i, w)| format!("{:?}:{i}", *w))
+                .collect();
+            format!("{{{}}}", entries.join(","))
+        };
+        let vocab_dir = tempfile::tempdir().expect("tempdir");
+        let vocab_path = vocab_dir.path().join("vocab.json");
+        std::fs::write(&vocab_path, vocab_json).expect("write vocab.json");
+        let wl = WordLevel::from_file(vocab_path.to_str().expect("utf8 path"), "[UNK]".to_string())
+            .expect("build wordlevel model");
+
+        let mut tok = Tokenizer::new(wl);
+        tok.with_pre_tokenizer(Some(Whitespace {}));
+        let post = TemplateProcessing::builder()
+            .try_single("<s> $A </s>")
+            .expect("single template")
+            .try_pair("<s> $A </s> </s> $B </s>")
+            .expect("pair template")
+            .special_tokens(vec![("<s>", 0u32), ("</s>", 1u32)])
+            .build()
+            .expect("build post-processor");
+        tok.with_post_processor(Some(post));
+
+        let mut params = truncation_params(max_len);
+        params.strategy = strategy;
+        tok.with_truncation(Some(params)).expect("set truncation");
+        tok
+    }
+
+    /// Count how many tokens in an encoding belong to sequence `seq`
+    /// (0 = query, 1 = passage; `None` = an added special token).
+    fn seq_count(enc: &tokenizers::Encoding, seq: usize) -> usize {
+        enc.get_sequence_ids()
+            .iter()
+            .filter(|s| **s == Some(seq))
+            .count()
+    }
+
+    #[test]
+    fn truncation_params_targets_the_passage() {
+        // The load-time choice is `OnlySecond`; pairs are (query, passage),
+        // so the passage (second) is what gets trimmed.
+        let p = truncation_params(DEFAULT_MAX_TOKEN_LEN);
+        assert_eq!(p.strategy, tokenizers::TruncationStrategy::OnlySecond);
+        assert_eq!(p.max_length, DEFAULT_MAX_TOKEN_LEN);
+        assert_eq!(p.stride, 0);
+    }
+
+    #[test]
+    fn long_passage_short_query_keeps_query_and_trims_passage() {
+        let max_len = 32;
+        let tok = build_pair_tokenizer(max_len, tokenizers::TruncationStrategy::OnlySecond);
+
+        let query = "where does alice work"; // 4 tokens
+        let passage_words = 200;
+        let passage = vec!["cat"; passage_words].join(" ");
+
+        // (a) A very-long passage must NOT raise SequenceTooShort.
+        let enc = tok
+            .encode((query, passage.as_str()), true)
+            .expect("encode long-passage pair must succeed");
+
+        // (b) The whole thing fits under the cap.
+        assert!(
+            enc.get_ids().len() <= max_len,
+            "encoding {} exceeds cap {max_len}",
+            enc.get_ids().len()
+        );
+
+        // (c) Every query token survives; the passage was the thing cut.
+        assert_eq!(seq_count(&enc, 0), 4, "all query tokens must be preserved");
+        assert!(
+            seq_count(&enc, 1) < passage_words,
+            "passage should have been truncated"
+        );
+        assert!(seq_count(&enc, 1) > 0, "some passage should remain");
+    }
+
+    #[test]
+    fn batch_with_long_passage_does_not_poison_the_batch() {
+        let max_len = 32;
+        let tok = build_pair_tokenizer(max_len, tokenizers::TruncationStrategy::OnlySecond);
+
+        let query = "where does alice work";
+        let short = "stripe";
+        let long = vec!["cat"; 300].join(" ");
+
+        // Mirrors `score_pairs`: same query, per-candidate passages.
+        let pairs = vec![
+            (query.to_string(), short.to_string()),
+            (query.to_string(), long.clone()),
+        ];
+        let batch = tok
+            .encode_batch(pairs, true)
+            .expect("mixed batch must not fail because one passage is long");
+
+        assert_eq!(batch.len(), 2);
+        for enc in &batch {
+            assert!(
+                enc.get_ids().len() <= max_len,
+                "each encoding must respect the cap"
+            );
+            assert_eq!(seq_count(enc, 0), 4, "query preserved in every pair");
+        }
+    }
+
+    #[test]
+    fn only_first_strategy_reproduces_the_bug() {
+        // Regression guard: this is the OLD behavior. With `OnlyFirst`, a
+        // long passage paired with a short query forces truncation of the
+        // query, and since the amount to remove exceeds the query length,
+        // tokenizers errors — which is exactly what poisoned the batch.
+        let tok = build_pair_tokenizer(32, tokenizers::TruncationStrategy::OnlyFirst);
+        let query = "where does alice work";
+        let passage = vec!["cat"; 200].join(" ");
+        let result = tok.encode((query, passage.as_str()), true);
+        assert!(
+            result.is_err(),
+            "OnlyFirst must fail on a short-query/long-passage pair (SequenceTooShort)"
+        );
+    }
 
     #[test]
     fn load_rejects_missing_dir() {
