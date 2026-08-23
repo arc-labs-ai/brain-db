@@ -465,6 +465,110 @@ pub fn entity_iter_all_live(
     Ok(out)
 }
 
+/// One live entity as the entity-GC sweeper needs it:
+/// `(EntityId, owning scope, created_at_unix_nanos)`. The scope +
+/// created-at are the columns the sweeper tests for grace-window +
+/// inbound-reference eligibility without re-opening the primary row.
+pub type EntityGcCandidate = (EntityId, RowScope, u64);
+
+/// Scan every live (non-tombstoned) entity, yielding the columns the
+/// entity-GC sweeper needs to test eligibility. O(N) over the primary
+/// table; the sweeper runs daily and off by default, so the full scan
+/// is acceptable (mirrors [`entity_iter_all_live`]).
+pub fn entity_iter_live_for_gc(
+    rtxn: &ReadTransaction,
+) -> Result<Vec<EntityGcCandidate>, EntityOpError> {
+    let t = rtxn.open_table(ENTITIES_TABLE)?;
+    let mut out = Vec::new();
+    for entry in t.iter()? {
+        let (_, v) = entry?;
+        let m = v.value();
+        if m.flags & flags::TOMBSTONED != 0 {
+            continue;
+        }
+        out.push((
+            m.entity_id(),
+            RowScope::from_bytes(m.namespace_id, m.space_id_bytes),
+            m.created_at_unix_nanos,
+        ));
+    }
+    Ok(out)
+}
+
+/// Count inbound references to `entity_id` within `scope`, returning as
+/// soon as the running sum exceeds zero.
+///
+/// Inbound references are summed across four sources, in cheapest-first
+/// order so the common case (a referenced entity) exits on the first
+/// hit:
+/// 1. active statements whose **subject** is the entity
+///    ([`STATEMENTS_BY_SUBJECT_TABLE`] range for the scope + entity);
+/// 2. relations **from** the entity ([`relation_list_from`]);
+/// 3. relations **to** the entity ([`relation_list_to`]);
+/// 4. entity **mentions** ([`ENTITY_MENTIONS_TABLE`] range).
+///
+/// Anti-flap: this counts ANY present inbound row — active OR
+/// tombstoned-but-not-yet-reclaimed. A reclaimed row is already
+/// physically gone, so `== 0` means the entity is truly orphaned and safe
+/// to tombstone; a row that is tombstoned-within-grace still counts,
+/// because it may yet be reverted and pointing at a GC'd entity would
+/// orphan it. The return value is therefore a lower bound on the true
+/// reference count — exact only when it is `0`, which is all the caller
+/// needs (eligibility is `== 0`).
+///
+/// The `scope` prefix bounds every range to one `(namespace, space)`, so
+/// the count can never observe another tenant's rows.
+pub fn entity_inbound_reference_count(
+    rtxn: &ReadTransaction,
+    scope: RowScope,
+    entity_id: EntityId,
+) -> Result<u64, crate::relation::ops::RelationOpError> {
+    use crate::relation::ops::{relation_list_from, relation_list_to, RelationListFilter};
+    use crate::tables::entity::ENTITY_MENTIONS_TABLE;
+    use crate::tables::statement::STATEMENTS_BY_SUBJECT_TABLE;
+
+    let ns = scope.namespace_id;
+    let sp = scope.space_id_bytes;
+    let eid = entity_id.to_bytes();
+
+    // 1. Statements where subject == entity. The subject-anchored index
+    // key is `(ns, space, subject, kind, predicate_id, is_current,
+    // statement_id)`; range the whole `(kind, predicate, is_current,
+    // statement)` suffix for this scope + subject and stop on the first
+    // present row.
+    {
+        let t = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
+        let lo = (ns, sp, eid, 0u8, 0u32, 0u8, [0u8; 16]);
+        let hi = (ns, sp, eid, u8::MAX, u32::MAX, 1u8, [0xffu8; 16]);
+        if t.range(lo..=hi)?.next().is_some() {
+            return Ok(1);
+        }
+    }
+
+    // 2 + 3. Relations from / to the entity, via the unified edge table.
+    // The default filter keeps `current_only = false`, so tombstoned-
+    // within-grace relations still count (anti-flap).
+    let filter = RelationListFilter::default();
+    if !relation_list_from(rtxn, scope, entity_id, &filter)?.is_empty() {
+        return Ok(1);
+    }
+    if !relation_list_to(rtxn, scope, entity_id, &filter)?.is_empty() {
+        return Ok(1);
+    }
+
+    // 4. Entity mentions. Key: `(ns, space, entity, memory)`.
+    {
+        let t = rtxn.open_table(ENTITY_MENTIONS_TABLE)?;
+        let lo = (ns, sp, eid, [0u8; 16]);
+        let hi = (ns, sp, eid, [0xffu8; 16]);
+        if t.range(lo..=hi)?.next().is_some() {
+            return Ok(1);
+        }
+    }
+
+    Ok(0)
+}
+
 /// Little-endian byte image of an entity vector. Safe, no-unsafe
 /// conversion (the arena's `bytemuck::Pod` cast lives in `brain-storage`,
 /// the one crate that's allowed `unsafe`). Compile-time array sizing
@@ -1861,6 +1965,198 @@ mod tests {
         assert!(
             vec_for_without.is_none(),
             "absent vector must surface as None so caller re-embeds"
+        );
+    }
+
+    // ----- entity_inbound_reference_count --------------------------------
+
+    fn put_person(db: &MetadataDb, name: &str) -> EntityId {
+        let e = person_entity(name);
+        let id = e.id;
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    /// Intern a Fact predicate with an Entity object.
+    fn intern_fact_pred(db: &MetadataDb, name: &str) -> brain_core::PredicateId {
+        use crate::schema::predicate::predicate_intern;
+        let wtxn = db.write_txn().unwrap();
+        let id = predicate_intern(
+            &wtxn,
+            "test",
+            name,
+            Some(brain_core::StatementKind::Fact),
+            1, // object: Entity
+            1,
+            "",
+            false,
+            NOW,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    #[test]
+    fn inbound_count_zero_for_isolated_entity() {
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let id = put_person(&db, "Isolated Ivy");
+        let rtxn = db.read_txn().unwrap();
+        let n = entity_inbound_reference_count(&rtxn, test_scope(), id).unwrap();
+        assert_eq!(n, 0, "an entity with no inbound rows is orphaned");
+    }
+
+    #[test]
+    fn inbound_count_positive_for_subject_statement() {
+        use crate::statement::crud::statement_create;
+        use brain_core::{
+            EvidenceRef, ExtractorId, Statement, StatementKind, StatementObject, SubjectRef,
+        };
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let subj = put_person(&db, "Subject Sam");
+        let obj = put_person(&db, "Object Olly");
+        let pred = intern_fact_pred(&db, "likes");
+        let s = Statement::new_root(
+            brain_core::StatementId::new(),
+            StatementKind::Fact,
+            SubjectRef::Entity(subj),
+            pred,
+            StatementObject::Entity(obj),
+            0.9,
+            EvidenceRef::default(),
+            ExtractorId::from(0),
+            NOW,
+            1,
+        );
+        {
+            let wtxn = db.write_txn().unwrap();
+            statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, NOW).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.read_txn().unwrap();
+        // subj is referenced (subject of a statement); obj is not (the
+        // subject index keys on subject only).
+        assert!(entity_inbound_reference_count(&rtxn, test_scope(), subj).unwrap() > 0);
+        assert_eq!(
+            entity_inbound_reference_count(&rtxn, test_scope(), obj).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn inbound_count_positive_for_relation_from_and_to() {
+        use crate::relation::ops::relation_create;
+        use crate::relation::types::relation_type_intern;
+        use brain_core::{Cardinality, ExtractorId, Relation, RelationId};
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let from = put_person(&db, "From Fran");
+        let to = put_person(&db, "To Tom");
+        let rel_type = {
+            let wtxn = db.write_txn().unwrap();
+            let id = relation_type_intern(
+                &wtxn,
+                "test",
+                "knows",
+                None,
+                None,
+                Cardinality::ManyToMany,
+                false,
+                1,
+                "",
+                NOW,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+            id
+        };
+        let r = Relation::new_root(
+            RelationId::new(),
+            rel_type,
+            from,
+            to,
+            0.9,
+            vec![],
+            ExtractorId::from(0),
+            NOW,
+            false,
+        );
+        {
+            let wtxn = db.write_txn().unwrap();
+            relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.read_txn().unwrap();
+        // Both endpoints are referenced: `from` via relation_list_from,
+        // `to` via relation_list_to.
+        assert!(entity_inbound_reference_count(&rtxn, test_scope(), from).unwrap() > 0);
+        assert!(entity_inbound_reference_count(&rtxn, test_scope(), to).unwrap() > 0);
+    }
+
+    #[test]
+    fn inbound_count_positive_for_mention() {
+        use crate::tables::entity::{mention_context, MentionMetadata, ENTITY_MENTIONS_TABLE};
+        use brain_core::MemoryId;
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let id = put_person(&db, "Mentioned Mia");
+        let mem = MemoryId::pack(1, 100, 1);
+        let s = test_scope();
+        {
+            let wtxn = db.write_txn().unwrap();
+            {
+                let mut t = wtxn.open_table(ENTITY_MENTIONS_TABLE).unwrap();
+                let key = (
+                    s.namespace_id,
+                    s.space_id_bytes,
+                    id.to_bytes(),
+                    mem.to_be_bytes(),
+                );
+                let m = MentionMetadata::new(NOW, mention_context::IN_TEXT, 0.9);
+                t.insert(&key, &m).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.read_txn().unwrap();
+        assert!(entity_inbound_reference_count(&rtxn, test_scope(), id).unwrap() > 0);
+    }
+
+    #[test]
+    fn inbound_count_isolates_by_scope() {
+        // A mention in a DIFFERENT scope must not count toward the
+        // entity's inbound references in the caller's scope.
+        use crate::tables::entity::{mention_context, MentionMetadata, ENTITY_MENTIONS_TABLE};
+        use brain_core::MemoryId;
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let id = put_person(&db, "Scoped Sue");
+        let other = RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xCD; 16]);
+        let mem = MemoryId::pack(2, 200, 1);
+        {
+            let wtxn = db.write_txn().unwrap();
+            {
+                let mut t = wtxn.open_table(ENTITY_MENTIONS_TABLE).unwrap();
+                let key = (
+                    other.namespace_id,
+                    other.space_id_bytes,
+                    id.to_bytes(),
+                    mem.to_be_bytes(),
+                );
+                let m = MentionMetadata::new(NOW, mention_context::IN_TEXT, 0.9);
+                t.insert(&key, &m).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.read_txn().unwrap();
+        // Counted in `other`, not in `test_scope`.
+        assert!(entity_inbound_reference_count(&rtxn, other, id).unwrap() > 0);
+        assert_eq!(
+            entity_inbound_reference_count(&rtxn, test_scope(), id).unwrap(),
+            0
         );
     }
 }

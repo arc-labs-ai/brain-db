@@ -41,15 +41,15 @@ pub use api_keys::{
 };
 pub use audit::ops::{
     audit_by_extractor, audit_by_memory, audit_get, audit_recent, audit_recent_failures,
-    audit_write, AuditOpError,
+    audit_write, resolution_audit_write, AuditOpError,
 };
 pub use db::{MetadataDb, MetadataDbError};
 pub use entity::ops::{
-    entity_add_alias, entity_get, entity_list_by_type, entity_lookup_by_alias,
-    entity_lookup_by_canonical_name, entity_put, entity_remove_alias, entity_rename,
-    entity_resolve_canonical_all_types, entity_resolve_canonical_all_types_wtxn,
-    entity_resolve_scored, entity_tombstone, entity_update, normalize_name, EntityOpError,
-    READ_RESOLVE_TRIGRAM_FLOOR,
+    entity_add_alias, entity_get, entity_inbound_reference_count, entity_iter_live_for_gc,
+    entity_list_by_type, entity_lookup_by_alias, entity_lookup_by_canonical_name, entity_put,
+    entity_remove_alias, entity_rename, entity_resolve_canonical_all_types,
+    entity_resolve_canonical_all_types_wtxn, entity_resolve_scored, entity_tombstone,
+    entity_update, normalize_name, EntityGcCandidate, EntityOpError, READ_RESOLVE_TRIGRAM_FLOOR,
 };
 pub use entity::review::{
     enqueue_merge_proposal, list_proposals_by_status, proposal_get, proposal_get_inside_wtxn,
