@@ -1133,10 +1133,11 @@ async fn subscribe_similar_to_bad_reference_is_rejected() {
 
     // This is the first shard interaction in the test (no prior encode
     // warms the executor), so the reference-resolution round-trip waits
-    // on the shard's cold main-loop startup — which can exceed a couple
-    // seconds under load. Give it a generous window so the timeout tests
-    // rejection, not cold-start latency.
-    let frame = read_event_within(&mut client, Duration::from_secs(10))
+    // on the shard's cold main-loop startup — which can exceed many seconds
+    // under full-suite CPU contention. Give it a generous window (30s) so
+    // the timeout tests rejection, not cold-start latency; the read returns
+    // the instant the error frame arrives, so a passing case isn't slowed.
+    let frame = read_event_within(&mut client, Duration::from_secs(30))
         .await
         .expect("expected an error frame");
     assert_eq!(
