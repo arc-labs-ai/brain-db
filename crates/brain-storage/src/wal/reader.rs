@@ -7,14 +7,29 @@
 //!
 //! ## Tail-vs-mid-segment rule
 //!
-//! Recovery treats some failures as "clean end of the WAL" and others as
-//! corruption:
+//! Recovery treats some decode failures as "clean end of the WAL" and
+//! others as corruption. The rule depends on whether the failure is in the
+//! **last** segment (the active append target, where a crash can tear the
+//! final write) or an **earlier** segment (a fully-rolled-over segment that
+//! must be intact).
 //!
-//! | Decode outcome | At end of last segment | Elsewhere |
-//! |---|---|---|
-//! | `Truncated` | clean tail → `None` | `MidSegmentCorruption` |
-//! | `CrcMismatch` | clean tail → `None` | `MidSegmentCorruption` (3) |
-//! | `UnknownRecordType` / `NonZeroReserved` / `PayloadTooLarge` | `RecordError` | `RecordError` |
+//! **Last segment — forward-scan for survivors.** On *any* corruption class
+//! (`Truncated`, `CrcMismatch`, `PayloadTooLarge`, `UnknownRecordType`,
+//! `NonZeroReserved`) the reader forward-scans the remaining bytes of the
+//! segment, byte by byte, for a well-formed record that carries acknowledged
+//! data (`lsn >= expected_next_lsn`):
+//!
+//! - none found → genuine torn / garbage final write → clean tail (`None`).
+//!   This covers length / type / reserved garbage at the true tail, so a
+//!   torn final write never bricks boot.
+//! - one found → acknowledged data survives past the corruption →
+//!   `MidSegmentCorruption` (fail-stop; never silently drop it — invariant
+//!   #7, "no silent corruption / no silent loss").
+//!
+//! **Earlier segment — strict.** Any corruption is a hard error:
+//! `Truncated` / `CrcMismatch` → `MidSegmentCorruption`;
+//! `PayloadTooLarge` / `UnknownRecordType` / `NonZeroReserved` →
+//! `RecordError`.
 //!
 //! Plus boundary checks:
 //!
@@ -366,34 +381,54 @@ impl Iterator for WalReader {
                         Some(self.segments[self.current_idx].segment_seq);
                     return Some(Ok(record));
                 }
-                Ok(DecodeOutcome::Truncated) | Err(WalRecordError::CrcMismatch { .. }) => {
+                // Any corruption class: `Truncated`, or one of the
+                // `WalRecordError`s. The header carries no independent
+                // checksum, so a bit-flip in the length / type / reserved
+                // fields can surface as any of these depending on the value;
+                // we treat them uniformly by position.
+                outcome => {
                     let is_last = self.current_idx + 1 >= self.segments.len();
                     let segment_seq = self.segments[self.current_idx].segment_seq;
-                    self.finished = true;
+                    let expected_lsn = self.expected_next_lsn;
+
                     if is_last {
-                        // tail truncation is the expected
-                        // post-crash case. Log once for diagnostics; the
-                        // iterator ends cleanly.
+                        // Decide clean-tail vs fail-stop by forward-scanning
+                        // for acknowledged data past the corruption. Compute
+                        // it while `seg` is still borrowed, before flipping
+                        // `self.finished`.
+                        let survives =
+                            valid_record_survives_after(&seg.bytes[seg.cursor..], expected_lsn);
+                        self.finished = true;
+                        if survives {
+                            // Acknowledged data survives past a corrupt
+                            // record — never drop it (invariant #7).
+                            return Some(Err(WalReadError::MidSegmentCorruption { segment_seq }));
+                        }
+                        // Genuine torn / garbage final write: the expected
+                        // post-crash case. Log once and end cleanly.
                         tracing::info!(
                             segment_seq,
                             last_lsn = ?self.last_decoded_lsn,
                             "WAL tail truncation (clean end)"
                         );
                         return None;
-                    } else {
-                        return Some(Err(WalReadError::MidSegmentCorruption { segment_seq }));
                     }
-                }
-                Err(other) => {
-                    // UnknownRecordType / NonZeroReserved / PayloadTooLarge —
-                    // not confused with truncation regardless of position.
-                    let in_segment = self.segments[self.current_idx].segment_seq;
-                    let expected_lsn = self.expected_next_lsn;
+
+                    // Earlier (fully-rolled-over) segment: strict. Preserve
+                    // the historical classification of each corruption class.
                     self.finished = true;
-                    return Some(Err(WalReadError::RecordError {
-                        in_segment,
-                        expected_lsn,
-                        source: other,
+                    return Some(Err(match outcome {
+                        Ok(DecodeOutcome::Truncated) | Err(WalRecordError::CrcMismatch { .. }) => {
+                            WalReadError::MidSegmentCorruption { segment_seq }
+                        }
+                        Err(source) => WalReadError::RecordError {
+                            in_segment: segment_seq,
+                            expected_lsn,
+                            source,
+                        },
+                        Ok(DecodeOutcome::Record { .. }) => {
+                            unreachable!("Record outcome handled in the arm above")
+                        }
                     }));
                 }
             }
@@ -440,6 +475,44 @@ impl core::fmt::Debug for WalReader {
 // ---------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------
+
+/// Forward-scan `bytes` — the remaining bytes of the *last* segment, from a
+/// corruption cursor to the end of the segment — for a well-formed record
+/// that carries acknowledged data (`lsn >= expected_lsn`).
+///
+/// Returns `true` iff such a record exists anywhere after the corruption,
+/// meaning recovery must fail-stop rather than treat the corruption as a
+/// clean tail. This upholds invariant #7: acknowledged data past a corrupt
+/// record is never silently dropped.
+///
+/// The scan steps byte-by-byte because the corrupt record's own length field
+/// may itself be corrupt, so record-boundary stepping is unreliable. Each
+/// [`WalRecord::decode_one`] short-circuits cheaply unless a full-length,
+/// structurally well-formed record is present, and only yields `Ok(Record)`
+/// after the CRC, valid-kind, and zero-reserved gates pass. Combined with the
+/// `lsn >= expected_lsn` check, a false positive (garbage read as a valid
+/// record) is astronomically unlikely — and even then it only forces an
+/// unnecessary fail-stop, the safe direction (no data loss). A false negative
+/// (missing a record that is really there) cannot happen: every offset is
+/// tried, so a present valid record is always found.
+///
+/// The bound `lsn >= expected_lsn` (rather than strict equality) is
+/// deliberate: a bit-flip in an already-acknowledged record leaves the
+/// records written *after* it intact, and those carry `lsn > expected_lsn`
+/// (the corrupt record consumed the `expected_lsn` slot). Requiring strict
+/// equality would miss them and silently drop acknowledged data — exactly the
+/// failure this policy exists to prevent. `>=` only ever adds fail-stops
+/// relative to `==`, all in the safe direction.
+fn valid_record_survives_after(bytes: &[u8], expected_lsn: u64) -> bool {
+    for start in 0..bytes.len() {
+        if let Ok(DecodeOutcome::Record { record, .. }) = WalRecord::decode_one(&bytes[start..]) {
+            if record.lsn.raw() >= expected_lsn {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 /// Parse the segment_seq from a `wal/0000000000.wal`-style path. Returns an
 /// `InvalidSegmentFilename` error if the stem isn't exactly 10 ASCII digits.
@@ -887,6 +960,193 @@ mod tests {
         let err = reader.next().unwrap().unwrap_err();
         assert!(
             matches!(err, WalReadError::MidSegmentCorruption { segment_seq: 0 }),
+            "got {err:?}"
+        );
+    }
+
+    // ----- Last-segment corruption policy (forward-scan) ----------------
+
+    /// Byte offset within a single-segment file at which record index `i`
+    /// begins (records contiguous, `records[0]` right after the header).
+    fn record_offset(records: &[WalRecord], i: usize) -> usize {
+        WAL_SEGMENT_HEADER_LEN
+            + records[..i]
+                .iter()
+                .map(WalRecord::encoded_len)
+                .sum::<usize>()
+    }
+
+    #[test]
+    fn last_segment_unknown_type_at_true_tail_is_clean_end() {
+        // Corrupting the *last* record's type byte, with nothing valid after
+        // it, used to fail-stop (RecordError). It must now be treated as a
+        // torn-tail clean end so a garbage final write never bricks boot.
+        let dir = tempfile::tempdir().unwrap();
+        let records: Vec<WalRecord> = (1..=3)
+            .map(|i| make_record(i, WalRecordKind::Encode, vec![i as u8; 8]))
+            .collect();
+        write_segment(dir.path(), 0, 1, uuid(20), &records);
+
+        let path = segment_path(dir.path(), 0);
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Record 2 (index 2) type byte → 0x64 (reserved-future, invalid).
+        let type_off = record_offset(&records, 2) + 8;
+        bytes[type_off] = 0x64;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = WalReader::open(dir.path(), uuid(20)).unwrap();
+        let mut got = Vec::new();
+        for item in reader.by_ref() {
+            got.push(item.unwrap()); // no error: clean end
+        }
+        assert_eq!(got, records[0..2]);
+        assert_eq!(reader.last_decoded_lsn(), Some(2));
+    }
+
+    #[test]
+    fn last_segment_length_garbage_at_true_tail_is_clean_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let records: Vec<WalRecord> = (1..=3)
+            .map(|i| make_record(i, WalRecordKind::Encode, vec![i as u8; 8]))
+            .collect();
+        write_segment(dir.path(), 0, 1, uuid(21), &records);
+
+        let path = segment_path(dir.path(), 0);
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Blow up the last record's payload_length (bytes 12..16 of its
+        // header) to a value larger than the bytes that remain → Truncated,
+        // with nothing valid after it.
+        let len_off = record_offset(&records, 2) + 12;
+        bytes[len_off..len_off + 4].copy_from_slice(&10_000u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = WalReader::open(dir.path(), uuid(21)).unwrap();
+        let mut got = Vec::new();
+        for item in reader.by_ref() {
+            got.push(item.unwrap());
+        }
+        assert_eq!(got, records[0..2]);
+        assert_eq!(reader.last_decoded_lsn(), Some(2));
+    }
+
+    #[test]
+    fn last_segment_reserved_garbage_at_true_tail_is_clean_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let records: Vec<WalRecord> = (1..=3)
+            .map(|i| make_record(i, WalRecordKind::Encode, vec![i as u8; 8]))
+            .collect();
+        write_segment(dir.path(), 0, 1, uuid(22), &records);
+
+        let path = segment_path(dir.path(), 0);
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Non-zero header reserved byte (offset 10) of the last record.
+        let reserved_off = record_offset(&records, 2) + 10;
+        bytes[reserved_off] = 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = WalReader::open(dir.path(), uuid(22)).unwrap();
+        let mut got = Vec::new();
+        for item in reader.by_ref() {
+            got.push(item.unwrap());
+        }
+        assert_eq!(got, records[0..2]);
+        assert_eq!(reader.last_decoded_lsn(), Some(2));
+    }
+
+    #[test]
+    fn last_segment_crc_corruption_with_valid_after_fails_stop() {
+        // A CRC hit in the *middle* of the last segment, with intact records
+        // after it, must fail-stop — never silently drop the survivors
+        // (invariant #7). Previously this returned a clean end (silent loss).
+        let dir = tempfile::tempdir().unwrap();
+        let records: Vec<WalRecord> = (1..=5)
+            .map(|i| make_record(i, WalRecordKind::Encode, vec![i as u8; 8]))
+            .collect();
+        write_segment(dir.path(), 0, 1, uuid(23), &records);
+
+        let path = segment_path(dir.path(), 0);
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Flip a payload byte of record index 2 (LSN 3) → CRC mismatch.
+        // Records 3 and 4 (LSN 4, 5) remain intact after it.
+        let payload_off = record_offset(&records, 2) + crate::wal::record::HEADER_LEN;
+        bytes[payload_off] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = WalReader::open(dir.path(), uuid(23)).unwrap();
+        assert_eq!(reader.next().unwrap().unwrap().lsn.raw(), 1);
+        assert_eq!(reader.next().unwrap().unwrap().lsn.raw(), 2);
+        // Record 3 is corrupt but records 4 & 5 survive → fail-stop, not None.
+        let err = reader.next().unwrap().unwrap_err();
+        assert!(
+            matches!(err, WalReadError::MidSegmentCorruption { segment_seq: 0 }),
+            "surviving acknowledged data must fail-stop, not be dropped; got {err:?}"
+        );
+        // Fused after the error.
+        assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn last_segment_length_corruption_with_valid_after_fails_stop() {
+        // Same policy for a torn-tail-*class* failure (Truncated from a
+        // corrupt length field) mid-last-segment: because valid data follows,
+        // it fail-stops. This is the case old code silently dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let records: Vec<WalRecord> = (1..=5)
+            .map(|i| make_record(i, WalRecordKind::Encode, vec![i as u8; 8]))
+            .collect();
+        write_segment(dir.path(), 0, 1, uuid(24), &records);
+
+        let path = segment_path(dir.path(), 0);
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Inflate record index 2's payload_length past the remaining bytes →
+        // Truncated at that cursor, while records 3 & 4 sit intact after it.
+        let len_off = record_offset(&records, 2) + 12;
+        bytes[len_off..len_off + 4].copy_from_slice(&10_000u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = WalReader::open(dir.path(), uuid(24)).unwrap();
+        assert_eq!(reader.next().unwrap().unwrap().lsn.raw(), 1);
+        assert_eq!(reader.next().unwrap().unwrap().lsn.raw(), 2);
+        let err = reader.next().unwrap().unwrap_err();
+        assert!(
+            matches!(err, WalReadError::MidSegmentCorruption { segment_seq: 0 }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn non_last_segment_unknown_type_is_record_error() {
+        // Header-field garbage in an earlier segment keeps the strict
+        // RecordError classification (unchanged by the tail policy).
+        let dir = tempfile::tempdir().unwrap();
+        let seg0: Vec<WalRecord> = (1..=3)
+            .map(|i| make_record(i, WalRecordKind::Encode, vec![i as u8; 8]))
+            .collect();
+        let seg1: Vec<WalRecord> = (4..=6)
+            .map(|i| make_record(i, WalRecordKind::Encode, vec![i as u8; 8]))
+            .collect();
+        write_segment(dir.path(), 0, 1, uuid(25), &seg0);
+        write_segment(dir.path(), 1, 4, uuid(25), &seg1);
+
+        let path = segment_path(dir.path(), 0);
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Corrupt record index 1's type byte in the non-last segment.
+        let type_off = record_offset(&seg0, 1) + 8;
+        bytes[type_off] = 0x64;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = WalReader::open(dir.path(), uuid(25)).unwrap();
+        assert_eq!(reader.next().unwrap().unwrap().lsn.raw(), 1);
+        let err = reader.next().unwrap().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WalReadError::RecordError {
+                    in_segment: 0,
+                    source: WalRecordError::UnknownRecordType(0x64),
+                    ..
+                }
+            ),
             "got {err:?}"
         );
     }
