@@ -856,6 +856,30 @@ pub struct ShardHandle {
 }
 
 impl ShardHandle {
+    /// Test-only constructor: builds a `ShardHandle` around a caller-owned
+    /// request channel so tests can observe the `ShardRequest`s the
+    /// connection layer sends (e.g. the disconnect-time orphan-txn sweep)
+    /// without spawning a real Glommio executor. The caller drains `tx`'s
+    /// receiver to count / reply to requests.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(shard_id: ShardId, tx: Sender<ShardRequest>) -> Self {
+        let (_events_tx, events_rx) = flume::bounded::<EventEnvelope>(1);
+        Self {
+            shard_id,
+            tx,
+            events: events_rx,
+            wal_dir: std::path::PathBuf::new(),
+            shard_uuid: [0u8; 16],
+            auto_edge_metrics: None,
+            extractor_metrics: None,
+            temporal_edge_metrics: None,
+            causal_edge_metrics: None,
+            llm_cache_sweep_metrics: None,
+            statement_embed_metrics: Arc::new(brain_ops::StatementEmbedMetrics::new()),
+            confidence_sweep_metrics: Arc::new(brain_ops::ConfidenceSweepMetrics::new()),
+        }
+    }
+
     #[must_use]
     pub fn shard_id(&self) -> ShardId {
         self.shard_id
@@ -1541,6 +1565,28 @@ fn fanout_lagged_events() -> u64 {
     FANOUT_LAGGED_EVENTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Interpret the WAL-readiness signal the shard executor closure sends back
+/// after it opens (or fails to open) its WAL.
+///
+/// - `Ok(Ok(()))` — WAL open; the shard is building the rest of its stack.
+/// - `Ok(Err(e))` — WAL IO failure; the closure returned early. Surfaced as
+///   [`ShardError::WalInit`] so the spawn fails fast instead of serving a
+///   dead shard.
+/// - `Err(_)` — the sender was dropped before signalling: the executor
+///   thread exited or unwound (e.g. an earlier in-closure `.expect()`
+///   panicked) before reaching WAL init. Also a dead shard, so fail the spawn.
+fn interpret_wal_ready(
+    signal: Result<Result<(), WalError>, flume::RecvError>,
+) -> Result<(), ShardError> {
+    match signal {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(ShardError::WalInit(err)),
+        Err(_) => Err(ShardError::Spawn(
+            "shard executor exited before WAL init completed".to_string(),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public spawn entry point
 // ---------------------------------------------------------------------------
@@ -1819,6 +1865,20 @@ pub fn spawn_shard(
     // The closure can no longer downgrade lexical retrieval to `None`.
     let tantivy_for_closure = tantivy_shard.clone();
     let lexical_retriever_for_closure = lexical_retriever.clone();
+    // WAL open/create runs *inside* the Glommio executor closure below —
+    // it needs the executor's io_uring reactor to `.await`, and it depends
+    // on `next_lsn_after_recovery` / `recovered_tail_offset` produced by the
+    // recovery pass above. That means it can't be hoisted outside the closure
+    // like the tantivy/rerank init. To keep a WAL IO failure (permissions,
+    // ENOSPC, an FS without O_DIRECT/io_uring support) from panicking the
+    // shard thread *after* `spawn` already returned `Ok` — which would leave
+    // `spawn_shard` reporting success while the shard is dead — the closure
+    // reports the outcome of WAL init back over this channel. `spawn_shard`
+    // blocks on it below and fails the spawn (fail-fast) instead of serving a
+    // dead shard. A `RecvError` (sender dropped) means the closure unwound
+    // before signalling — e.g. an earlier in-closure panic — which is also
+    // treated as a spawn failure.
+    let (wal_ready_tx, wal_ready_rx) = flume::bounded::<Result<(), WalError>>(1);
     let join_handle = LocalExecutorBuilder::new(placement)
         .name(&format!("brain-shard-{shard_id}"))
         .spawn(move || async move {
@@ -2401,8 +2461,14 @@ pub fn spawn_shard(
                 }));
             }
 
-            // Open or create the WAL.
-            let wal = if segments_present {
+            // Open or create the WAL. A genuine IO failure here (bad perms,
+            // ENOSPC, an FS without O_DIRECT/io_uring support) must fail the
+            // spawn rather than panic this thread behind an already-returned
+            // `Ok` from `spawn`. Report the outcome over `wal_ready_tx`;
+            // `spawn_shard` blocks on the receiver and turns an `Err` into a
+            // spawn failure. On the error path we end the closure early so the
+            // executor thread exits cleanly instead of unwinding.
+            let wal_open_result = if segments_present {
                 Wal::open_existing(
                     &wal_dir_for_executor,
                     shard_uuid,
@@ -2411,11 +2477,20 @@ pub fn spawn_shard(
                     wal_config,
                 )
                 .await
-                .expect("Wal::open_existing (post-recovery)")
             } else {
-                Wal::create_with_config(&wal_dir_for_executor, shard_uuid, wal_config)
-                    .await
-                    .expect("Wal::create_with_config")
+                Wal::create_with_config(&wal_dir_for_executor, shard_uuid, wal_config).await
+            };
+            let wal = match wal_open_result {
+                Ok(wal) => {
+                    // Best-effort: if the receiver is gone the spawn was
+                    // already abandoned, so there is nothing to serve.
+                    let _ = wal_ready_tx.send(Ok(()));
+                    wal
+                }
+                Err(err) => {
+                    let _ = wal_ready_tx.send(Err(err));
+                    return;
+                }
             };
 
             // Wrap the WAL in `Rc<RefCell<…>>` so adapters can share the
@@ -3228,6 +3303,10 @@ pub fn spawn_shard(
             shard_main_loop(shard, rx).await;
         })
         .map_err(|e| ShardError::Spawn(e.to_string()))?;
+    // Block until the shard signals its WAL is open (fail-fast readiness).
+    // A WAL IO failure, or the executor thread exiting before it signalled,
+    // fails the spawn here instead of leaving a dead shard serving requests.
+    interpret_wal_ready(wal_ready_rx.recv())?;
     let handle = ShardHandle {
         shard_id,
         tx,
@@ -4001,6 +4080,33 @@ mod tests {
 
     fn stub_dispatcher() -> Arc<dyn Dispatcher> {
         Arc::new(TestStubDispatcher)
+    }
+
+    #[test]
+    fn wal_ready_ok_yields_ok() {
+        assert!(interpret_wal_ready(Ok(Ok(()))).is_ok());
+    }
+
+    #[test]
+    fn wal_ready_io_failure_fails_spawn() {
+        // A WAL open/create IO failure reported by the closure must surface
+        // as a spawn error, not a silently-dead serving shard.
+        let err = WalError::NoSegmentsFound {
+            dir: std::path::PathBuf::from("/nonexistent/wal"),
+        };
+        let out = interpret_wal_ready(Ok(Err(err)));
+        assert!(matches!(out, Err(ShardError::WalInit(_))));
+    }
+
+    #[test]
+    fn wal_ready_sender_dropped_fails_spawn() {
+        // If the executor thread exits before signalling (e.g. an earlier
+        // in-closure panic drops the sender), the spawn must still fail
+        // rather than proceed to build a handle over a dead shard.
+        let (tx, rx) = flume::bounded::<Result<(), WalError>>(1);
+        drop(tx);
+        let out = interpret_wal_ready(rx.recv());
+        assert!(matches!(out, Err(ShardError::Spawn(_))));
     }
 
     /// Spawn config for tests that run without real model files. The

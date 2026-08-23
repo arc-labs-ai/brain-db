@@ -46,6 +46,7 @@ use crate::dispatch::{
     build_server_ping_frame, dispatch_frame, error_frame, run_op_dispatch, Action, CancelSubscribe,
     ConnState, IdleTimer, SubscribeStart, Tick,
 };
+use crate::shard::ShardHandle;
 use crate::subscribe::{
     build_cancel_stream_ack_frame, build_unsubscribe_response_frame, ShardEventHub,
     SubscriptionRegistry,
@@ -532,9 +533,10 @@ where
     ));
 
     // The receiver loop returns the session id it minted at
-    // HELLO/WELCOME (or all-zero when the connection died pre-handshake).
-    // We need it post-loop to drive the auto-abort sweep below.
-    let (result, connection_id) = receiver_loop(
+    // HELLO/WELCOME (or all-zero when the connection died pre-handshake)
+    // plus whether the connection ever opened a transaction. We need both
+    // post-loop to drive the auto-abort sweep below.
+    let (result, connection_id, opened_txn) = receiver_loop(
         &mut read_half,
         &topology,
         &limits,
@@ -557,11 +559,25 @@ where
     // operations take effect. Any txn
     // this session opened (TXN_BEGIN without a matching COMMIT/ABORT)
     // is still buffering work on its target shard; sweep every shard
-    // and discard the buffer. Pre-handshake disconnects carry an
-    // all-zero connection_id; the sweep is a cheap no-op in that case.
-    abort_orphaned_transactions(&topology, connection_id).await;
+    // and discard the buffer. A connection that never opened a txn has
+    // nothing to abort, so skip the per-shard sweep entirely (the common
+    // case). Pre-handshake disconnects carry an all-zero connection_id and
+    // can't have opened a txn, so they never reach the sweep either.
+    if needs_orphan_sweep(opened_txn, connection_id) {
+        abort_orphaned_transactions(&topology.shards, connection_id).await;
+    }
 
     result
+}
+
+/// Whether the disconnect-time orphan-txn sweep needs to run for this
+/// connection. Only a connection that actually opened a transaction can
+/// have orphans to abort; everything else (the common case) skips the
+/// per-shard fan-out entirely. An all-zero `connection_id` (pre-handshake
+/// disconnect / in-process test) can never have opened a txn, so it is
+/// excluded too — defense-in-depth alongside the `opened_txn` latch.
+fn needs_orphan_sweep(opened_txn: bool, connection_id: [u8; 16]) -> bool {
+    opened_txn && connection_id != [0u8; 16]
 }
 
 /// Fan an auto-abort sweep across every shard so any txn the
@@ -570,16 +586,17 @@ where
 /// abort count when at least one txn was swept; stays silent on the
 /// common "session never opened a txn" path.
 ///
-/// All-zero `connection_id` (pre-handshake disconnect, in-process tests)
-/// short-circuits to a no-op — `TxnStore::abort_orphaned_for_connection`
-/// enforces the same guard, but skipping the cross-runtime hop saves
-/// a per-shard message per connection close.
-async fn abort_orphaned_transactions(topology: &Topology, connection_id: [u8; 16]) {
+/// Callers gate this on [`needs_orphan_sweep`], so it is only reached for
+/// connections that actually opened a transaction. The all-zero
+/// `connection_id` short-circuit remains as a belt-and-suspenders guard —
+/// `TxnStore::abort_orphaned_for_connection` enforces the same, but skipping
+/// the cross-runtime hop avoids a wasted per-shard message.
+async fn abort_orphaned_transactions(shards: &[ShardHandle], connection_id: [u8; 16]) {
     if connection_id == [0u8; 16] {
         return;
     }
     let mut total_aborted = 0usize;
-    for shard in topology.shards.iter() {
+    for shard in shards.iter() {
         match shard.abort_orphaned_for_connection(connection_id).await {
             Ok(n) => total_aborted += n,
             Err(e) => {
@@ -638,7 +655,7 @@ async fn receiver_loop<R>(
     frame_tx: flume::Sender<OutgoingFrame>,
     subscriptions: Arc<SubscriptionRegistry>,
     metrics: Arc<ConnectionMetrics>,
-) -> (io::Result<()>, [u8; 16])
+) -> (io::Result<()>, [u8; 16], bool)
 where
     R: AsyncRead + Unpin,
 {
@@ -658,7 +675,7 @@ where
     // caller needs for the disconnect-time txn sweep.
     macro_rules! exit {
         ($result:expr) => {{
-            return ($result, state.connection_id);
+            return ($result, state.connection_id, state.opened_txn);
         }};
     }
 
@@ -727,6 +744,16 @@ where
                                 }
                             }
                             Action::OpDispatch(op) => {
+                                // Latch that this connection opened (or tried to
+                                // open) a transaction, so the disconnect-time
+                                // orphan sweep runs for it. Connections that
+                                // never send TXN_BEGIN skip the sweep entirely.
+                                if matches!(
+                                    op.req,
+                                    brain_protocol::envelope::request::RequestBody::TxnBegin(_)
+                                ) {
+                                    state.opened_txn = true;
+                                }
                                 // Enforce the advertised per-connection stream
                                 // cap: take a permit for this op's lifetime, or
                                 // reject with StreamLimitExceeded. try_acquire
@@ -1199,11 +1226,75 @@ fn configure_tcp(stream: &TcpStream) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    use crate::shard::ShardRequest;
 
     #[test]
     fn defaults_match_spec_caps() {
         let limits = ConnectionLimits::default();
         assert_eq!(limits.max_payload_bytes as usize, MAX_PAYLOAD_BYTES);
         assert_eq!(limits.read_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn no_sweep_when_no_txn_opened() {
+        // The common case: a handshook connection that never opened a txn
+        // must skip the sweep entirely.
+        let conn = [7u8; 16];
+        assert!(!needs_orphan_sweep(false, conn));
+    }
+
+    #[test]
+    fn sweep_when_txn_opened() {
+        // A connection that opened a txn must be swept on close.
+        let conn = [7u8; 16];
+        assert!(needs_orphan_sweep(true, conn));
+    }
+
+    #[test]
+    fn no_sweep_for_pre_handshake_connection() {
+        // All-zero id can never have opened a txn; belt-and-suspenders.
+        assert!(!needs_orphan_sweep(true, [0u8; 16]));
+        assert!(!needs_orphan_sweep(false, [0u8; 16]));
+    }
+
+    // Build N mock shards whose request channels are drained by background
+    // tasks that count `AbortOrphanedTxns` messages and reply. Returns the
+    // shard handles and the shared counter.
+    fn mock_shards(n: u16) -> (Vec<ShardHandle>, Arc<AtomicUsize>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut shards = Vec::with_capacity(n as usize);
+        for shard_id in 0..n {
+            let (tx, rx) = flume::unbounded::<ShardRequest>();
+            let counter_for_task = counter.clone();
+            tokio::spawn(async move {
+                while let Ok(req) = rx.recv_async().await {
+                    if let ShardRequest::AbortOrphanedTxns { reply_tx, .. } = req {
+                        counter_for_task.fetch_add(1, AtomicOrdering::SeqCst);
+                        let _ = reply_tx.send_async(0).await;
+                    }
+                }
+            });
+            shards.push(ShardHandle::new_for_test(shard_id, tx));
+        }
+        (shards, counter)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sweep_fans_out_to_every_shard() {
+        // A connection that opened a txn aborts orphans on every shard.
+        let (shards, counter) = mock_shards(4);
+        abort_orphaned_transactions(&shards, [9u8; 16]).await;
+        assert_eq!(counter.load(AtomicOrdering::SeqCst), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sweep_is_noop_for_zero_connection_id() {
+        // The all-zero short-circuit inside the sweep issues no per-shard hop.
+        let (shards, counter) = mock_shards(4);
+        abort_orphaned_transactions(&shards, [0u8; 16]).await;
+        assert_eq!(counter.load(AtomicOrdering::SeqCst), 0);
     }
 }

@@ -77,6 +77,14 @@ pub(crate) struct ConnState {
     /// [`REVOCATION_RECHECK_WINDOW`]; the redb read fires at most once per
     /// window. See [`enforce_live_revocation`].
     pub(crate) last_revocation_check: Instant,
+    /// Set once this connection dispatches a `TXN_BEGIN`. Gates the
+    /// disconnect-time orphan-txn sweep: a connection that never opened a
+    /// transaction has nothing to abort, so it skips the per-shard sweep
+    /// entirely (the common case — most connections never open a txn).
+    /// Conservatively latched on dispatch (not on shard-side success): if
+    /// a `TXN_BEGIN` was sent we sweep, so a txn that did open is never
+    /// missed even if its response never made it back.
+    pub(crate) opened_txn: bool,
 }
 
 impl ConnState {
@@ -86,6 +94,7 @@ impl ConnState {
             connection_id: [0u8; 16],
             negotiated_version: 0,
             last_revocation_check: Instant::now(),
+            opened_txn: false,
         }
     }
 }
