@@ -46,6 +46,7 @@ use brain_metadata::statement::{evidence_overflow_load, rekey_predicate_index};
 use brain_metadata::tables::statement::{EvidenceEntryRow, StatementMetadata, STATEMENTS_TABLE};
 use brain_metadata::MetadataDb;
 use brain_ops::ConfidenceSweepMetrics;
+use parking_lot::Mutex;
 use redb::ReadableTable;
 use tracing::{debug, trace, warn};
 
@@ -70,9 +71,12 @@ pub const DEFAULT_MAX_CHANGE_PER_TICK: f32 = 0.02;
 /// max_runtime`; this struct holds the sweep-specific tuning.
 #[derive(Clone, Copy, Debug)]
 pub struct ConfidenceSweepKnobs {
-    /// Hard cap on rows the worker pulls off the table per cycle.
-    /// Larger caps move the system to steady state faster on a fresh
-    /// deployment; smaller caps keep the redb write txn short.
+    /// Size of the scan window per tick, in rows *scanned* (not rows
+    /// collected). The scan resumes from a persisted cursor, advances by
+    /// up to this many rows, then stops; the next tick continues after
+    /// the last-visited row and wraps to the start on a full pass. Larger
+    /// windows move the system to steady state faster on a fresh
+    /// deployment; smaller windows keep each read txn short.
     pub max_per_tick: usize,
     /// Skip rows whose `extracted_at_unix_nanos > now - this`. Defaults
     /// to 1 day so freshly written rows don't get touched by the next
@@ -109,6 +113,16 @@ pub struct ConfidenceSweepWorker {
     confidence_config: ConfidenceConfig,
     metadata: Arc<MetadataDb>,
     metrics: Option<Arc<ConfidenceSweepMetrics>>,
+    /// Wrapping scan cursor across ticks. `None` means "start from the
+    /// beginning of `STATEMENTS_TABLE`". Each tick resumes strictly
+    /// after this key and advances it to the last row it visited; a tick
+    /// that reaches the end of the table wraps back to `None`. Without
+    /// this, every tick re-scanned the same first `max_per_tick` rows in
+    /// key order and statements past that window were never refreshed.
+    /// In-process only (lost on restart) — that is safe because the
+    /// confidence recompute is idempotent, so a restart merely re-scans
+    /// from the top.
+    cursor: Mutex<Option<StatementId>>,
 }
 
 impl ConfidenceSweepWorker {
@@ -119,8 +133,10 @@ impl ConfidenceSweepWorker {
     pub fn new(metadata: Arc<MetadataDb>) -> Self {
         let mut config = WorkerConfig::defaults_for(WorkerKind::ConfidenceSweep);
         config.interval = Duration::from_secs(DEFAULT_INTERVAL_SECS);
-        // Cap the per-cycle scan at batch_size so the read txn doesn't
-        // sit on the metadata lock arbitrarily long.
+        // NOTE: the per-tick scan window is bounded by `knobs.max_per_tick`,
+        // not `WorkerConfig::batch_size`. `batch_size` is retained here for
+        // scheduler/telemetry uniformity with the other workers but does
+        // not pace this scan; tune the window via `max_per_tick`.
         config.batch_size = DEFAULT_BATCH_SIZE;
         Self {
             config,
@@ -128,6 +144,7 @@ impl ConfidenceSweepWorker {
             confidence_config: ConfidenceConfig::default_v1(),
             metadata,
             metrics: None,
+            cursor: Mutex::new(None),
         }
     }
 
@@ -173,9 +190,9 @@ impl ConfidenceSweepWorker {
             m.inc_cycles();
         }
 
-        // ── Read phase: snapshot up to `max_per_tick` candidates. ───
-        let candidates = match self.collect_candidates(ctx, now_ns, self.knobs.max_per_tick.max(1))
-        {
+        // ── Read phase: scan a moving window of up to `max_per_tick`
+        // rows, resuming from the persisted cursor. ─────────────────
+        let scan = match self.collect_candidates(ctx, now_ns, self.knobs.max_per_tick.max(1)) {
             Ok(c) => c,
             Err(e) => {
                 if let Some(m) = &self.metrics {
@@ -184,6 +201,18 @@ impl ConfidenceSweepWorker {
                 return Err(e);
             }
         };
+        // Advance the cursor before any early return so a window of only
+        // ineligible rows still makes forward progress instead of pinning
+        // the scan at the head of the table forever.
+        {
+            let mut cursor = self.cursor.lock();
+            *cursor = if scan.reached_end {
+                None // wrap: next tick starts a fresh pass
+            } else {
+                scan.last_scanned
+            };
+        }
+        let candidates = scan.candidates;
         let scanned = candidates.len();
         if let Some(m) = &self.metrics {
             m.add_rows_swept(scanned as u64);
@@ -280,17 +309,29 @@ impl ConfidenceSweepWorker {
         Ok(n_updates)
     }
 
-    /// Read-phase: scan `STATEMENTS_TABLE` from the start, pick rows
-    /// that pass the eligibility checks, materialise their evidence.
-    /// Returns up to `cap` rows.
+    /// Read-phase: scan a window of up to `cap` rows of `STATEMENTS_TABLE`,
+    /// resuming strictly after the persisted cursor, pick rows that pass
+    /// the eligibility checks, materialise their evidence. The window is
+    /// bounded by rows *scanned* (not rows collected) so per-tick work is
+    /// bounded and the window advances predictably even when eligible
+    /// rows are sparse — over successive ticks every active statement is
+    /// eventually visited, then the cursor wraps.
     fn collect_candidates(
         &self,
         ctx: &WorkerContext,
         now_ns: u64,
         cap: usize,
-    ) -> Result<Vec<Candidate>, WorkerError> {
+    ) -> Result<ScanResult, WorkerError> {
         let min_age_ns = self.knobs.min_age_seconds.saturating_mul(1_000_000_000);
         let cutoff_ns = now_ns.saturating_sub(min_age_ns);
+
+        let start_cursor: Option<StatementId> = *self.cursor.lock();
+        // redb ranges are half-open (`>= from`); bump the cursor's last
+        // byte so we resume strictly *after* the row we last visited.
+        let from_key: [u8; 16] = match start_cursor {
+            Some(id) => bump_be_u128(id.to_bytes()),
+            None => [0u8; 16],
+        };
 
         let rtxn = self
             .metadata
@@ -301,58 +342,67 @@ impl ConfidenceSweepWorker {
             .map_err(|e| WorkerError::Internal(format!("open STATEMENTS: {e}")))?;
 
         let mut out: Vec<Candidate> = Vec::new();
+        let mut last_scanned: Option<StatementId> = None;
+        let mut scanned = 0usize;
+        let mut reached_end = true;
         let iter = table
-            .iter()
-            .map_err(|e| WorkerError::Internal(format!("iter STATEMENTS: {e}")))?;
+            .range(from_key..)
+            .map_err(|e| WorkerError::Internal(format!("range STATEMENTS: {e}")))?;
         for entry in iter {
             if ctx.is_shutdown() {
+                reached_end = false;
                 break;
             }
             let (key, value) =
                 entry.map_err(|e| WorkerError::Internal(format!("decode STATEMENTS row: {e}")))?;
             let id_bytes = key.value();
             let meta = value.value();
-            if !is_eligible(&meta, cutoff_ns) {
-                continue;
-            }
-            let kind = match meta.kind() {
-                Some(k) => k,
-                None => continue,
-            };
-            // Event rows can't decay — only skip them when decay is
-            // disabled, which is the default. Saves the evidence
-            // materialisation cost.
-            if matches!(kind, StatementKind::Event) && self.confidence_config.event_decay_disabled {
-                continue;
-            }
-            let evidence = match materialise_evidence(&rtxn, &meta) {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(
-                        target: "brain_workers::confidence_sweep",
-                        statement_id = ?StatementId::from(id_bytes),
-                        error = %e,
-                        "could not materialise evidence; skipping row",
-                    );
-                    continue;
+            last_scanned = Some(StatementId::from(id_bytes));
+            scanned += 1;
+
+            if is_eligible(&meta, cutoff_ns) {
+                if let Some(kind) = meta.kind() {
+                    // Event rows can't decay — only skip them when decay
+                    // is disabled, which is the default. Saves the
+                    // evidence materialisation cost.
+                    let skip_event = matches!(kind, StatementKind::Event)
+                        && self.confidence_config.event_decay_disabled;
+                    if !skip_event {
+                        match materialise_evidence(&rtxn, &meta) {
+                            Ok(evidence) if !evidence.is_empty() => out.push(Candidate {
+                                id: StatementId::from(id_bytes),
+                                kind,
+                                kind_byte: meta.kind,
+                                stored_confidence: meta.confidence,
+                                predicate_id: meta.predicate_id,
+                                evidence,
+                            }),
+                            Ok(_) => {} // no evidence — nothing to recompute
+                            Err(e) => {
+                                warn!(
+                                    target: "brain_workers::confidence_sweep",
+                                    statement_id = ?StatementId::from(id_bytes),
+                                    error = %e,
+                                    "could not materialise evidence; skipping row",
+                                );
+                            }
+                        }
+                    }
                 }
-            };
-            if evidence.is_empty() {
-                continue;
             }
-            out.push(Candidate {
-                id: StatementId::from(id_bytes),
-                kind,
-                kind_byte: meta.kind,
-                stored_confidence: meta.confidence,
-                predicate_id: meta.predicate_id,
-                evidence,
-            });
-            if out.len() >= cap {
+
+            // Window is bounded by rows scanned, so the cursor advances a
+            // fixed step each tick regardless of how many rows qualified.
+            if scanned >= cap {
+                reached_end = false;
                 break;
             }
         }
-        Ok(out)
+        Ok(ScanResult {
+            candidates: out,
+            last_scanned,
+            reached_end,
+        })
     }
 
     /// Write-phase: open one wtxn, write each row, fix up the
@@ -509,6 +559,34 @@ fn evidence_entry(memory_byte: u8, confidence: f32, timestamp_unix_nanos: u64) -
         timestamp_unix_nanos,
         ExtractorId::from(0),
     )
+}
+
+/// Big-endian increment by one, saturating at all-ones (no wraparound).
+/// Used to turn redb's half-open `>= from` range into a strict `> cursor`
+/// resume. Saturation is harmless: an all-ones `from` key yields an empty
+/// range, which the caller treats as "reached the end, wrap".
+fn bump_be_u128(mut bytes: [u8; 16]) -> [u8; 16] {
+    for i in (0..16).rev() {
+        let (v, overflow) = bytes[i].overflowing_add(1);
+        bytes[i] = v;
+        if !overflow {
+            return bytes;
+        }
+    }
+    [0xFF; 16]
+}
+
+/// Result of one read-phase window scan.
+#[derive(Debug)]
+struct ScanResult {
+    /// Eligible rows with materialised evidence, ready for recompute.
+    candidates: Vec<Candidate>,
+    /// Key of the last row the scan visited this window, or `None` if the
+    /// window was empty. Drives the cursor forward.
+    last_scanned: Option<StatementId>,
+    /// True iff the scan exhausted the range (a full pass) rather than
+    /// stopping at the per-tick window cap or on shutdown.
+    reached_end: bool,
 }
 
 #[derive(Debug)]
@@ -860,6 +938,78 @@ mod tests {
             (after_first - after_second).abs() < 1e-4,
             "stored confidence drifted between two converged ticks",
         );
+    }
+
+    #[test]
+    fn bump_be_u128_increments_and_saturates() {
+        assert_eq!(bump_be_u128([0; 16])[15], 1);
+        let mut b = [0u8; 16];
+        b[15] = 0xFF;
+        let r = bump_be_u128(b);
+        assert_eq!(r[14], 1);
+        assert_eq!(r[15], 0);
+        assert_eq!(bump_be_u128([0xFF; 16]), [0xFF; 16]);
+    }
+
+    /// With more statements than the per-tick window, successive ticks
+    /// must eventually visit ALL of them (the cursor advances and wraps),
+    /// so no statement is permanently skipped. This is the regression
+    /// guard for the missing-cursor bug: without the cursor, only the
+    /// first `max_per_tick` rows in key order were ever refreshed.
+    #[test]
+    fn cursor_eventually_visits_all_statements() {
+        let fx = fixture();
+        let now = now_unix_nanos();
+        // All rows aged one Fact-half-life so a visit produces a real
+        // update (0.9 → ~0.331) — updates are our proxy for "visited".
+        let age_ns: u64 = 365 * 86_400 * 1_000_000_000;
+        let extracted_at = now.saturating_sub(age_ns);
+
+        let n_rows: u8 = 10;
+        let ids: Vec<StatementId> = (0..n_rows)
+            .map(|n| {
+                seed_statement_with_age(&fx.metadata, n, extracted_at, 0.9, 0, StatementKind::Fact)
+            })
+            .collect();
+
+        // Window of 3 rows/tick, jump straight to target (no clamp).
+        let worker =
+            ConfidenceSweepWorker::new(fx.metadata.clone()).with_knobs(ConfidenceSweepKnobs {
+                max_per_tick: 3,
+                min_age_seconds: 0,
+                min_drift_for_write: 0.001,
+                max_change_per_tick: 0.0,
+            });
+
+        // A single tick can only touch the window; it must NOT touch all
+        // 10 rows at once.
+        let first = futures_lite::future::block_on(worker.tick(&fx.ctx)).unwrap();
+        assert!(
+            first <= 3,
+            "one tick must be bounded by the window, updated {first}",
+        );
+
+        // Run enough ticks to cover the table several times over and
+        // assert every row has moved off its seeded 0.9 (i.e. was
+        // visited at least once).
+        for _ in 0..12 {
+            let visited = ids
+                .iter()
+                .filter(|id| (read_confidence(&fx.metadata, **id) - 0.9).abs() > 1e-4)
+                .count();
+            if visited == ids.len() {
+                break;
+            }
+            let _ = futures_lite::future::block_on(worker.tick(&fx.ctx)).unwrap();
+        }
+
+        for id in &ids {
+            let c = read_confidence(&fx.metadata, *id);
+            assert!(
+                (c - 0.9).abs() > 1e-4,
+                "statement {id:?} was never visited by the sweep (still {c})",
+            );
+        }
     }
 
     #[test]
