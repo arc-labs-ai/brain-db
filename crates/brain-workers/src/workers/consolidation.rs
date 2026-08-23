@@ -42,7 +42,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use brain_core::{
-    EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, RequestId, Salience, SessionId,
+    EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NamespaceId, NodeRef, RequestId, Salience,
+    SessionId, SpaceId,
 };
 use brain_embed::VECTOR_DIM;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
@@ -92,6 +93,30 @@ pub struct ClusterCandidate {
 struct WindowCandidate {
     memory_id: MemoryId,
     created_at_unix_nanos: u64,
+}
+
+/// The full tenant + conversation bucket a candidate belongs to.
+///
+/// Clustering MUST never cross this boundary: a `SessionId` is only
+/// unique within a `(namespace, space)` — two different spaces can both
+/// carry `SessionId(1)`, and `SessionId(0)` is the shared default every
+/// session-less encode uses. Bucketing by session alone would cluster
+/// and summarize memories from different tenants into one row; keying on
+/// the whole tuple keeps each tenant/space/session isolated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BucketKey {
+    namespace_id: u32,
+    space_id_bytes: [u8; 16],
+    session: SessionId,
+}
+
+impl BucketKey {
+    fn namespace(&self) -> NamespaceId {
+        NamespaceId::from(self.namespace_id)
+    }
+    fn space(&self) -> SpaceId {
+        SpaceId::from(self.space_id_bytes)
+    }
 }
 
 /// Compute cosine similarity. Returns 0.0 if either vector is the
@@ -295,7 +320,8 @@ async fn do_consolidation_cycle(
     let started = Instant::now();
     let mut consolidations = 0usize;
 
-    for (session_id, candidates) in by_context {
+    for (bucket, candidates) in by_context {
+        let session_id = bucket.session;
         if started.elapsed() >= cfg.max_runtime {
             break;
         }
@@ -377,6 +403,12 @@ async fn do_consolidation_cycle(
             // → WriteId so a restart-retry hits the writer's
             // idempotency cache instead of minting a duplicate row.
             let request_id = deterministic_request_id(&cluster);
+            // The consolidated memory belongs to the SOURCE cluster's
+            // tenant + space — never NIL/SYSTEM. Folding the source space
+            // into both the WriteId and the Write keeps the summary inside
+            // the same isolation boundary its sources live in.
+            let source_space = bucket.space();
+            let source_namespace = bucket.namespace();
             let memory_id = ctx
                 .ops
                 .executor
@@ -424,10 +456,11 @@ async fn do_consolidation_cycle(
                     WorkerError::Ops("consolidation: unified path requires RealWriterHandle".into())
                 })?;
             let write = Write::from_phases(
-                WriteId::from_request(request_id, brain_core::SpaceId::default()),
-                brain_core::SpaceId::default(),
+                WriteId::from_request(request_id, source_space),
+                source_space,
                 phases,
-            );
+            )
+            .with_namespace(source_namespace);
             let _ack = real_writer
                 .submit(write)
                 .await
@@ -453,7 +486,7 @@ async fn do_consolidation_cycle(
 fn collect_candidates_by_context(
     ctx: &WorkerContext,
     recency_floor_nanos: u64,
-) -> Result<BTreeMap<SessionId, Vec<WindowCandidate>>, WorkerError> {
+) -> Result<BTreeMap<BucketKey, Vec<WindowCandidate>>, WorkerError> {
     let metadata = ctx.ops.executor.metadata.clone();
     let rtxn = metadata
         .read_txn()
@@ -462,7 +495,7 @@ fn collect_candidates_by_context(
         .open_table(MEMORIES_TABLE)
         .map_err(|e| WorkerError::Ops(format!("open MEMORIES: {e:?}")))?;
 
-    let mut by_context: BTreeMap<SessionId, Vec<WindowCandidate>> = BTreeMap::new();
+    let mut by_context: BTreeMap<BucketKey, Vec<WindowCandidate>> = BTreeMap::new();
     for entry in table
         .iter()
         .map_err(|e| WorkerError::Ops(format!("iter MEMORIES: {e:?}")))?
@@ -482,8 +515,15 @@ fn collect_candidates_by_context(
         if kind != MemoryKind::Episodic {
             continue;
         }
+        // Bucket by the full (namespace, space, session) tuple so no two
+        // tenants/spaces are ever clustered together — session alone is
+        // not tenant-unique (see BucketKey).
         by_context
-            .entry(meta.session())
+            .entry(BucketKey {
+                namespace_id: meta.namespace_id,
+                space_id_bytes: meta.space_id_bytes,
+                session: meta.session(),
+            })
             .or_default()
             .push(WindowCandidate {
                 memory_id: meta.memory_id(),

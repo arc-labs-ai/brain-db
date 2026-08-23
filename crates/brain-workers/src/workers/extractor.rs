@@ -159,6 +159,18 @@ pub const DEFAULT_EXTRACTOR_HYPE_REFRESH_PER_CYCLE: usize = 8;
 /// hosts can lift this via `[workers.extractor] batch_size`.
 pub const DEFAULT_EXTRACTOR_BATCH_SIZE: usize = 8;
 
+/// How many rows `load_pending_batch` over-drains per `want`: it scans up
+/// to `want * FACTOR` front rows (bounded by [`EXTRACTION_QUEUE_MAX_SCAN`])
+/// to page past a front window stuck in transient-failure backoff, so a
+/// due row deeper in the queue is still found and processed this cycle
+/// instead of being starved behind the backing-off front.
+const EXTRACTION_QUEUE_OVERDRAIN_FACTOR: usize = 8;
+
+/// Hard ceiling on rows scanned per `load_pending_batch` call so the
+/// over-drain stays bounded even when `want` is large and the whole front
+/// of the queue is backing off.
+const EXTRACTION_QUEUE_MAX_SCAN: usize = 1024;
+
 impl Default for ExtractorKnobs {
     fn default() -> Self {
         Self {
@@ -723,11 +735,28 @@ fn load_pending_batch(ctx: &WorkerContext, limit: usize) -> Result<Vec<MemoryId>
     // failures are reported "due" here and handled by the idempotency gate in
     // `drain_batch` (AlreadyExtracted → queue row removed). First-time and
     // succeeded-then-requeued ids are always due.
+    //
+    // The over-drain is what prevents head-of-line blocking: the queue is
+    // keyed by MemoryId, so a full front window of `limit` rows stuck in
+    // backoff (e.g. the oldest rows that reliably time out, widening their
+    // backoff) would otherwise yield zero due rows and stall every newer
+    // due row behind them. We page past the front, scanning up to a bounded
+    // multiple of `limit` rows, and return the first `limit` DUE rows found
+    // — bounding the total scan per cycle while never starving deeper rows.
     let now = now_unix_nanos();
-    let pending = brain_metadata::extraction_queue_drain(&rtxn, limit)
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let scan_cap = limit
+        .saturating_mul(EXTRACTION_QUEUE_OVERDRAIN_FACTOR)
+        .min(EXTRACTION_QUEUE_MAX_SCAN);
+    let pending = brain_metadata::extraction_queue_drain(&rtxn, scan_cap)
         .map_err(|e| format!("extraction_queue_drain: {e}"))?;
-    let mut due = Vec::with_capacity(pending.len());
+    let mut due = Vec::with_capacity(limit.min(pending.len()));
     for (id, _) in pending {
+        if due.len() >= limit {
+            break;
+        }
         match brain_metadata::pipeline_extraction_retry_due(&rtxn, id, now) {
             Ok(true) => due.push(id),
             Ok(false) => {} // backing off — leave queued, retry when due
@@ -823,6 +852,88 @@ enum StageDecision {
 /// `run_batch` call (amortising the GLiNER forward pass). Pattern +
 /// LLM tiers run per-memory because pattern is fast and LLM
 /// per-memory accounting drives the budget gate.
+/// Row-derived facts about one queued memory, read once per micro-batch.
+///
+/// Carries the event/write timestamps (so the temporal extractor can
+/// anchor relative dates to the real event time), the owning namespace
+/// and space (so the LLM tier scopes extractor selection AND keys its
+/// response cache by the memory's real space), the session, and the real
+/// stored kind (so a trigger `where memory.kind = ...` evaluates against
+/// the stored kind). A row miss omits the id; callers fall back to
+/// anonymous defaults — never a drop.
+struct RowFacts {
+    created_ns: u64,
+    occurred: Option<u64>,
+    namespace_id: u32,
+    space: SpaceId,
+    session_id: SessionId,
+    kind: MemoryKind,
+}
+
+/// Read each live memory's [`RowFacts`] in a single read txn. Ids whose
+/// row is absent (forgotten before extraction ran) are omitted.
+fn load_row_facts(
+    ctx: &WorkerContext,
+    live: &[(usize, MemoryId, Arc<str>)],
+) -> HashMap<MemoryId, RowFacts> {
+    use brain_metadata::tables::memory::MEMORIES_TABLE;
+    let mut m = HashMap::with_capacity(live.len());
+    if let Ok(rtxn) = ctx.ops.executor.metadata.read_txn() {
+        if let Ok(t) = rtxn.open_table(MEMORIES_TABLE) {
+            for (_, mid, _) in live {
+                if let Ok(Some(g)) = t.get(&mid.to_be_bytes()) {
+                    let row = g.value();
+                    m.insert(
+                        *mid,
+                        RowFacts {
+                            created_ns: row.created_at_unix_nanos,
+                            occurred: row.occurred_at_unix_nanos,
+                            namespace_id: row.namespace_id,
+                            space: row.space_id(),
+                            session_id: SessionId::from(row.session_id),
+                            kind: row.kind().unwrap_or(MemoryKind::Episodic),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    m
+}
+
+/// Build the [`CoreMemory`] the extraction tiers see for each live row.
+///
+/// Threads each memory's REAL `(space, session)` from its row facts so
+/// the LLM tier's response-cache key is stable across cycles for the same
+/// `(text, space)`. Minting a fresh space per call would make the key
+/// change every cycle, so the per-shard LLM cache would never hit and the
+/// always-on tier's cost/latency control would be defeated. A row miss
+/// falls back to the anonymous defaults, never a drop.
+fn build_extraction_core_memories(
+    live: &[(usize, MemoryId, Arc<str>)],
+    row_facts: &HashMap<MemoryId, RowFacts>,
+) -> Vec<CoreMemory> {
+    live.iter()
+        .map(|(_, mid, text)| {
+            let (created_ns, occurred, space, session_id, kind) = row_facts
+                .get(mid)
+                .map(|f| (f.created_ns, f.occurred, f.space, f.session_id, f.kind))
+                .unwrap_or((0, None, SpaceId::NIL, SessionId(0), MemoryKind::Episodic));
+            CoreMemory {
+                id: *mid,
+                space,
+                session_id,
+                kind,
+                salience: Salience::default(),
+                text: Some(text.to_string()),
+                created_at_unix_ms: created_ns / 1_000_000,
+                last_accessed_at_unix_ms: 0,
+                occurred_at_unix_nanos: occurred,
+            }
+        })
+        .collect()
+}
+
 async fn drain_batch(
     worker: &ExtractorWorker,
     ctx: &WorkerContext,
@@ -905,56 +1016,8 @@ async fn drain_batch(
     // `where memory.kind = ...` evaluates against the stored kind, not a
     // hardcoded one). A row miss falls back to zero timestamps, the system
     // namespace, and Episodic — never drops the memory.
-    struct RowFacts {
-        created_ns: u64,
-        occurred: Option<u64>,
-        namespace_id: u32,
-        kind: MemoryKind,
-    }
-    let row_facts: HashMap<MemoryId, RowFacts> = {
-        use brain_metadata::tables::memory::MEMORIES_TABLE;
-        let mut m = HashMap::with_capacity(live.len());
-        if let Ok(rtxn) = ctx.ops.executor.metadata.read_txn() {
-            if let Ok(t) = rtxn.open_table(MEMORIES_TABLE) {
-                for (_, mid, _) in &live {
-                    if let Ok(Some(g)) = t.get(&mid.to_be_bytes()) {
-                        let row = g.value();
-                        m.insert(
-                            *mid,
-                            RowFacts {
-                                created_ns: row.created_at_unix_nanos,
-                                occurred: row.occurred_at_unix_nanos,
-                                namespace_id: row.namespace_id,
-                                kind: row.kind().unwrap_or(MemoryKind::Episodic),
-                            },
-                        );
-                    }
-                }
-            }
-        }
-        m
-    };
-
-    let live_mems: Vec<CoreMemory> = live
-        .iter()
-        .map(|(_, mid, text)| {
-            let (created_ns, occurred, kind) = row_facts
-                .get(mid)
-                .map(|f| (f.created_ns, f.occurred, f.kind))
-                .unwrap_or((0, None, MemoryKind::Episodic));
-            CoreMemory {
-                id: *mid,
-                space: SpaceId::new(),
-                session_id: SessionId(0),
-                kind,
-                salience: Salience::default(),
-                text: Some(text.to_string()),
-                created_at_unix_ms: created_ns / 1_000_000,
-                last_accessed_at_unix_ms: 0,
-                occurred_at_unix_nanos: occurred,
-            }
-        })
-        .collect();
+    let row_facts = load_row_facts(ctx, &live);
+    let live_mems: Vec<CoreMemory> = build_extraction_core_memories(&live, &row_facts);
 
     // Resolve each live memory's owning namespace to its name so the LLM
     // tier can scope selection: a namespace's own enabled LLM extractor
@@ -7899,6 +7962,161 @@ mod tests {
             StatementKind::Event,
             "action stays an Event; ambiguous dates just aren't stamped",
         );
+    }
+
+    // ----- Extraction CoreMemory space threading + queue over-drain. -----
+
+    /// Minimal worker fixture: a temp metadata db (seeds the brain: system
+    /// schema) wired into an ops context, plus the metadata handle and the
+    /// tempdir the metadata db lives in (kept alive by the caller).
+    #[allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send by design
+    fn __worker_fixture() -> (
+        crate::context::WorkerContext,
+        brain_planner::SharedMetadataDb,
+        tempfile::TempDir,
+    ) {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
+        use brain_index::{IndexParams, SharedHnsw};
+        use brain_metadata::MetadataDb;
+        use brain_ops::RealWriterHandle;
+        use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
+
+        use crate::context::WorkerContext;
+
+        struct ZeroDispatcher;
+        impl Dispatcher for ZeroDispatcher {
+            fn embed(&self, _t: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+                Ok([0.0; VECTOR_DIM])
+            }
+            fn embed_batch(&self, t: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+                Ok(vec![[0.0; VECTOR_DIM]; t.len()])
+            }
+            fn fingerprint(&self) -> [u8; 16] {
+                [0xCD; 16]
+            }
+        }
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let metadata: SharedMetadataDb =
+            Arc::new(MetadataDb::open(tempdir.path().join("md.redb")).unwrap());
+        let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
+        let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
+        let executor = ExecutorContext::new(
+            Arc::new(ZeroDispatcher) as Arc<dyn Dispatcher>,
+            shared,
+            metadata.clone(),
+            writer as Arc<dyn WriterHandle>,
+        );
+        let ops = Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor));
+        let ctx = WorkerContext {
+            ops,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        (ctx, metadata, tempdir)
+    }
+
+    #[test]
+    fn extraction_core_memory_carries_real_space_for_stable_cache_key() {
+        use brain_core::{MemoryId, NamespaceId, SessionId, SpaceId};
+        use std::sync::Arc;
+
+        let (ctx, metadata, _tempdir) = __worker_fixture();
+
+        // Seed a memory row owning a known, non-NIL space.
+        let ns = NamespaceId::from(9);
+        let space = SpaceId::derive_from_string("tenant9", "space-x");
+        assert_ne!(space, SpaceId::NIL);
+        let mid = MemoryId::pack(0, 42, 1);
+        __seed_memory_row(&metadata, mid, brain_metadata::RowScope::new(ns, space));
+
+        let live: Vec<(usize, MemoryId, Arc<str>)> = vec![(0, mid, Arc::from("hello world"))];
+        let facts = load_row_facts(&ctx, &live);
+        let mems = build_extraction_core_memories(&live, &facts);
+        assert_eq!(mems.len(), 1);
+        assert_eq!(
+            mems[0].space, space,
+            "CoreMemory must carry the memory's REAL space (the LLM cache key folds it), \
+             not a freshly-minted per-call SpaceId"
+        );
+        assert_eq!(mems[0].session_id, SessionId(0));
+
+        // The old bug minted a fresh SpaceId every call, so two builds of the
+        // same id diverged and the response cache never hit across cycles.
+        // With the fix the space is stable, so the cache-key input is stable.
+        let mems2 = build_extraction_core_memories(&live, &facts);
+        assert_eq!(
+            mems[0].space, mems2[0].space,
+            "the extraction CoreMemory space must be stable across cycles"
+        );
+        assert_eq!(
+            <[u8; 16]>::from(mems[0].space),
+            <[u8; 16]>::from(space),
+            "the exact 16 bytes the LLM cache key folds must match the stored space"
+        );
+    }
+
+    #[test]
+    fn load_pending_batch_pages_past_backing_off_front_rows() {
+        use brain_core::MemoryId;
+        use brain_metadata::{
+            extraction_queue_enqueue, failure_class, pipeline_record_extracted, pipeline_status,
+            tier_status, ExtractorItemCounts, ExtractorPipelineAuditEntry,
+        };
+
+        let (ctx, metadata, _tempdir) = __worker_fixture();
+
+        // shard=0 keeps `slot` in the high bytes, so the queue's MemoryId
+        // byte order is slot order: the low-slot front rows come first, the
+        // high-slot due row last.
+        let front: Vec<MemoryId> = (1..=4).map(|s| MemoryId::pack(0, s, 1)).collect();
+        let due_id = MemoryId::pack(0, 100, 1);
+
+        let now = now_unix_nanos();
+        {
+            let wtxn = metadata.write_txn().unwrap();
+            for id in &front {
+                extraction_queue_enqueue(&wtxn, *id, now).unwrap();
+                // A retryable transient LLM failure with a high attempt count:
+                // its exponential backoff (capped at 1h) has NOT elapsed, so
+                // the row is queued-but-not-due this cycle.
+                let entry = ExtractorPipelineAuditEntry::new(
+                    *id,
+                    now,
+                    pipeline_status::FAILURE,
+                    String::new(),
+                    tier_status::SKIPPED,
+                    tier_status::SKIPPED,
+                    tier_status::FAILED,
+                    ExtractorItemCounts::zero(),
+                    0,
+                )
+                .with_attempts(20)
+                .with_failure_class(failure_class::TRANSIENT);
+                pipeline_record_extracted(&wtxn, &entry).unwrap();
+            }
+            // A newer row deeper in the queue with no audit row → due now.
+            extraction_queue_enqueue(&wtxn, due_id, now).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        // `want` is smaller than the backing-off front window: draining exactly
+        // `want` (the old behaviour) would return only front rows, filter them
+        // all out, and make zero progress. The over-drain must page past them
+        // and surface the due row this cycle.
+        let due = load_pending_batch(&ctx, 2).unwrap();
+        assert!(
+            due.contains(&due_id),
+            "a due row behind a backing-off front window must be found this cycle"
+        );
+        for id in &front {
+            assert!(
+                !due.contains(id),
+                "backing-off front rows must not be returned as due"
+            );
+        }
     }
 }
 

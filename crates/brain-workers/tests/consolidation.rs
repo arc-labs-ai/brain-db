@@ -677,6 +677,46 @@ fn seed_packed(
     id
 }
 
+/// Seed an Episodic memory in an explicit `(namespace, space)`. Used by
+/// the tenant-isolation test: two spaces that share a `SessionId` and an
+/// identical vector must still land in separate clusters.
+#[allow(clippy::too_many_arguments)]
+fn seed_scoped(
+    metadata: &SharedMetadataDb,
+    slot: u64,
+    namespace: brain_core::NamespaceId,
+    space: SpaceId,
+    session_id: u64,
+    created_at_unix_nanos: u64,
+    vector: [f32; VECTOR_DIM],
+) -> MemoryId {
+    let id = MemoryId::pack(0, slot, 1);
+    let wtxn = metadata.write_txn().unwrap();
+    {
+        let mut table = wtxn.open_table(MEMORIES_TABLE).unwrap();
+        let meta = MemoryMetadata::new_active(
+            id,
+            namespace,
+            space,
+            SessionId(session_id),
+            slot,
+            1,
+            MemoryKind::Episodic,
+            [0; 16],
+            0.5,
+            16,
+            created_at_unix_nanos,
+        );
+        table.insert(id.to_be_bytes(), meta).unwrap();
+    }
+    brain_ops::memory_artifact::merge_memory_artifact(&wtxn, id.to_be_bytes(), |b| {
+        b.vector = vector.to_vec();
+    })
+    .unwrap();
+    wtxn.commit().unwrap();
+    id
+}
+
 fn count_consolidated(metadata: &SharedMetadataDb) -> usize {
     let rtxn = metadata.read_txn().unwrap();
     let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
@@ -783,6 +823,67 @@ fn missing_artifact_vector_candidates_are_dropped() {
                 .consolidated_at_unix_nanos
                 .is_none(),
             "a candidate with no stored vector must be dropped, not mis-clustered"
+        );
+    });
+}
+
+#[test]
+fn two_spaces_sharing_session_are_not_clustered_and_summary_lands_in_source_space() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        // Two distinct spaces under the same namespace, BOTH using
+        // SessionId(1), and every memory carries the identical vector
+        // (unit_vec(0)) — so cosine is 1.0 across the whole set. Under the
+        // old session-only bucketing these ten would collapse into one
+        // cross-tenant cluster written to the NIL space. With full
+        // (namespace, space, session) bucketing they must form two
+        // separate clusters, each summarised into its own source space.
+        let ns = brain_core::NamespaceId::from(7);
+        let space_a = SpaceId::derive_from_string("tenant7", "space-a");
+        let space_b = SpaceId::derive_from_string("tenant7", "space-b");
+        assert_ne!(space_a, space_b);
+        for slot in 1..=5 {
+            seed_scoped(&fix.metadata, slot, ns, space_a, 1, now, unit_vec(0));
+        }
+        for slot in 6..=10 {
+            seed_scoped(&fix.metadata, slot, ns, space_b, 1, now, unit_vec(0));
+        }
+
+        let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer))
+            .with_min_cluster_size(5)
+            .with_similarity_threshold(0.6);
+        let processed = run_cycle(&worker, fix.ctx.clone()).await.unwrap();
+        assert_eq!(
+            processed, 2,
+            "two spaces sharing a session must NOT be clustered together"
+        );
+
+        // Collect the consolidated rows and check where they landed.
+        let rtxn = fix.metadata.read_txn().unwrap();
+        let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
+        let mut consolidated_spaces = std::collections::HashSet::new();
+        for entry in table.iter().unwrap() {
+            let (_, v) = entry.unwrap();
+            let m = v.value();
+            if m.kind().ok() == Some(MemoryKind::Consolidated) {
+                assert_ne!(
+                    m.space_id(),
+                    SpaceId::NIL,
+                    "consolidated memory must not land in the NIL space"
+                );
+                assert_eq!(
+                    m.namespace(),
+                    ns,
+                    "consolidated memory must inherit the source namespace"
+                );
+                consolidated_spaces.insert(m.space_id());
+            }
+        }
+        assert_eq!(
+            consolidated_spaces,
+            std::collections::HashSet::from([space_a, space_b]),
+            "each summary must land in its own source space, never mixed or NIL"
         );
     });
 }
