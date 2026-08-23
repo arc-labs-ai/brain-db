@@ -23,14 +23,179 @@ use crate::schema::parse_error::ParseError;
 #[grammar = "schema/grammar.pest"]
 struct SchemaParser;
 
+/// Maximum bracket-nesting depth accepted in a schema document.
+///
+/// The grammar has mutually-recursive rules with no built-in bound —
+/// `condition_paren` (`( ... )`) and the JSON capture rules
+/// (`json_nested_object` / `json_nested_array`) each descend once per
+/// bracket. pest parses by recursive descent, so a document with deeply
+/// nested brackets recurses once per level and overflows the native
+/// stack, aborting the whole process (all shards/tenants) — an
+/// availability failure reachable from any low-privilege caller via
+/// `SCHEMA_VALIDATE` / `SCHEMA_UPLOAD`.
+///
+/// A stack overflow cannot be caught, so it must be prevented before the
+/// document reaches pest. 64 is far above anything a legitimate schema
+/// needs — real `where` conditions nest a handful of parens deep and JSON
+/// `schema:` bodies a dozen or so, while the enclosing `define … { }`
+/// blocks never accumulate across items — yet far below the tens of
+/// thousands of frames that would overflow the 8 MiB stack.
+const MAX_NESTING_DEPTH: usize = 64;
+
 // ---------------------------------------------------------------------------
 // Entry point.
 // ---------------------------------------------------------------------------
+
+/// Reject documents whose bracket nesting exceeds [`MAX_NESTING_DEPTH`]
+/// before they reach the recursive-descent pest parser.
+///
+/// A cheap single-pass byte scan that tracks the current `(`/`[`/`{`
+/// nesting depth. Brackets inside string literals, triple-quoted
+/// heredocs, regex literals, and line comments do not count — they are
+/// opaque to the recursive grammar rules, so counting them would falsely
+/// reject legitimate documents (e.g. a prompt heredoc containing many
+/// unbalanced parens). Byte scanning is sound because every relevant
+/// delimiter is ASCII and UTF-8 continuation bytes never collide with
+/// ASCII.
+fn check_nesting_depth(input: &str) -> Result<(), ParseError> {
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut line = 1usize;
+    let mut col = 1usize;
+    let mut depth = 0usize;
+
+    while i < len {
+        match bytes[i] {
+            b'\n' => {
+                line += 1;
+                col = 1;
+                i += 1;
+            }
+            b'#' => {
+                // Line comment: skip to (but not past) the newline.
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                if i + 2 < len && bytes[i + 1] == b'"' && bytes[i + 2] == b'"' {
+                    // Triple-quoted heredoc: opaque until the next `"""`.
+                    i += 3;
+                    col += 3;
+                    while i < len {
+                        if bytes[i] == b'"'
+                            && i + 2 < len
+                            && bytes[i + 1] == b'"'
+                            && bytes[i + 2] == b'"'
+                        {
+                            i += 3;
+                            col += 3;
+                            break;
+                        }
+                        if bytes[i] == b'\n' {
+                            line += 1;
+                            col = 1;
+                        } else {
+                            col += 1;
+                        }
+                        i += 1;
+                    }
+                } else {
+                    // Double-quoted string with backslash escapes.
+                    i += 1;
+                    col += 1;
+                    while i < len {
+                        match bytes[i] {
+                            b'\\' => {
+                                i += 2;
+                                col += 2;
+                            }
+                            b'"' => {
+                                i += 1;
+                                col += 1;
+                                break;
+                            }
+                            b'\n' => {
+                                line += 1;
+                                col = 1;
+                                i += 1;
+                            }
+                            _ => {
+                                col += 1;
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            b'/' => {
+                // Regex literal: opaque until the closing `/` (escapes with
+                // `\`); regex tokens cannot span a newline.
+                i += 1;
+                col += 1;
+                while i < len {
+                    match bytes[i] {
+                        b'\\' => {
+                            i += 2;
+                            col += 2;
+                        }
+                        b'/' => {
+                            i += 1;
+                            col += 1;
+                            break;
+                        }
+                        b'\n' => {
+                            line += 1;
+                            col = 1;
+                            i += 1;
+                            break;
+                        }
+                        _ => {
+                            col += 1;
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                if depth > MAX_NESTING_DEPTH {
+                    return Err(ParseError::Syntax {
+                        line,
+                        col,
+                        message: format!(
+                            "bracket nesting depth exceeds maximum of {MAX_NESTING_DEPTH}"
+                        ),
+                    });
+                }
+                col += 1;
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                col += 1;
+                i += 1;
+            }
+            _ => {
+                col += 1;
+                i += 1;
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// Parse a schema document into an AST. Source text is preserved in
 /// `Schema.source`. Returns a structured [`ParseError`] with 1-based
 /// line/col on failure.
 pub fn parse_schema(input: &str) -> Result<Schema, ParseError> {
+    // Bound recursion before handing untrusted input to pest, which parses
+    // by recursive descent and would otherwise overflow the stack on deeply
+    // nested brackets.
+    check_nesting_depth(input)?;
+
     let mut pairs = SchemaParser::parse(Rule::schema, input).map_err(map_pest_error)?;
     let schema_pair = pairs
         .next()
@@ -1374,6 +1539,60 @@ mod tests {
             }
             other => panic!("expected Syntax error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pathological_nesting_is_rejected_not_crashed() {
+        // A low-privilege client could send this via SCHEMA_VALIDATE. The
+        // guard must return Err rather than letting pest recurse and abort
+        // the process — if this test overflowed, the test runner would crash.
+        let src = "(".repeat(100_000);
+        let err = parse_schema(&src).unwrap_err();
+        match err {
+            ParseError::Syntax { message, .. } => {
+                assert!(
+                    message.contains("nesting depth"),
+                    "expected depth error, got {message:?}"
+                );
+            }
+            other => panic!("expected Syntax depth error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nesting_guard_boundary() {
+        // At the limit the guard passes; one deeper is rejected.
+        assert!(check_nesting_depth(&"(".repeat(MAX_NESTING_DEPTH)).is_ok());
+        let err = check_nesting_depth(&"(".repeat(MAX_NESTING_DEPTH + 1)).unwrap_err();
+        assert!(matches!(err, ParseError::Syntax { .. }));
+    }
+
+    #[test]
+    fn nesting_guard_ignores_brackets_in_opaque_spans() {
+        // Unbalanced brackets inside strings, heredocs, regex literals, and
+        // comments are opaque to the recursive rules and must not accumulate
+        // depth (else legitimate documents would be falsely rejected).
+        let big = "(".repeat(1000);
+        assert!(check_nesting_depth(&format!("\"{big}\"")).is_ok());
+        assert!(check_nesting_depth(&format!("\"\"\"{big}\"\"\"")).is_ok());
+        assert!(check_nesting_depth(&format!("/{big}/")).is_ok());
+        assert!(check_nesting_depth(&format!("# {big}\n")).is_ok());
+    }
+
+    #[test]
+    fn legit_nested_condition_still_parses() {
+        // A few levels of real parens in a where-clause must parse fine.
+        let src = r#"
+            namespace t
+            define extractor x {
+                kind: classifier
+                target: relation reports_to
+                trigger: on encode where ((memory.text matches /a/) and (confidence >= 0.5))
+                model: "m"
+            }
+        "#;
+        let s = parse_ok(src);
+        assert_eq!(s.items.len(), 1);
     }
 
     #[test]
