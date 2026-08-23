@@ -2134,7 +2134,16 @@ fn build_recall_trace(meta: &QueryMetadata, ctx: &OpsContext) -> Result<RecallTr
             _ => None,
         })
         .collect();
-    let candidate_texts = fetch_candidate_texts(&candidate_ids, ctx)?;
+    // Tenant wall for the diagnostic surface. The lexical / graph / statement-
+    // semantic lanes don't push the `(namespace, space)` scope down, so their
+    // pre-fusion candidate sets can carry foreign-tenant ids. The trace must not
+    // render another tenant's content: every candidate id is re-verified against
+    // the caller's scope BEFORE its text / label is fetched — a foreign or
+    // missing candidate surfaces as an opaque id with no content, mirroring the
+    // answer path's per-row `(namespace_id, space_id)` re-check.
+    let caller_scope =
+        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
+    let candidate_texts = fetch_candidate_texts(&candidate_ids, caller_scope, ctx)?;
 
     // The graph lane surfaces typed items (entities / relations), not memories —
     // resolving those to display labels needs the metadata tables. Open one read
@@ -2171,7 +2180,13 @@ fn build_recall_trace(meta: &QueryMetadata, ctx: &OpsContext) -> Result<RecallTr
                     cands
                         .iter()
                         .map(|(id, score)| {
-                            candidate_from_ranked(typed_rtxn.as_ref(), id, *score, &candidate_texts)
+                            candidate_from_ranked(
+                                typed_rtxn.as_ref(),
+                                caller_scope,
+                                id,
+                                *score,
+                                &candidate_texts,
+                            )
                         })
                         .collect()
                 })
@@ -2324,22 +2339,30 @@ fn dropped_ids_wire(ids: &[RankedItemId]) -> Vec<RecallTraceDroppedId> {
 /// shown in the pipeline always matches the list.
 fn candidate_from_ranked(
     typed_rtxn: Option<&redb::ReadTransaction>,
+    caller_scope: brain_metadata::RowScope,
     id: &RankedItemId,
     score: f32,
     memory_texts: &HashMap<MemoryId, String>,
 ) -> RecallTraceCandidate {
     use brain_protocol::ops::memory::RecallCandidateKind;
     match id {
+        // Memory scope is enforced upstream: `fetch_candidate_texts` only
+        // populates `memory_texts` for in-scope rows, so a foreign / missing
+        // memory falls back to an empty (contentless) label here.
         RankedItemId::Memory(mid) => RecallTraceCandidate {
             item_id: mid.raw(),
             kind: RecallCandidateKind::Memory,
             text: memory_texts.get(mid).cloned().unwrap_or_default(),
             score,
         },
+        // Typed items are re-scoped here before their label is rendered: an
+        // out-of-scope (or missing) row yields an empty label, so a foreign
+        // tenant's entity name / relation / statement never reaches the trace.
         RankedItemId::Entity(eid) => RecallTraceCandidate {
             item_id: u128::from_be_bytes(eid.to_bytes()),
             kind: RecallCandidateKind::Entity,
             text: typed_rtxn
+                .filter(|r| entity_in_caller_scope(r, *eid, caller_scope))
                 .and_then(|r| brain_metadata::entity_get(r, *eid).ok().flatten())
                 .map(|e| e.canonical_name)
                 .unwrap_or_default(),
@@ -2349,6 +2372,7 @@ fn candidate_from_ranked(
             item_id: u128::from_be_bytes(rid.to_bytes()),
             kind: RecallCandidateKind::Relation,
             text: typed_rtxn
+                .filter(|r| relation_in_caller_scope(r, *rid, caller_scope))
                 .map(|r| render_relation_label(r, *rid))
                 .unwrap_or_default(),
             score,
@@ -2357,11 +2381,47 @@ fn candidate_from_ranked(
             item_id: u128::from_be_bytes(sid.to_bytes()),
             kind: RecallCandidateKind::Statement,
             text: typed_rtxn
+                .filter(|r| statement_in_caller_scope(r, *sid, caller_scope).unwrap_or(false))
                 .map(|r| render_statement_label(r, *sid))
                 .unwrap_or_default(),
             score,
         },
     }
+}
+
+/// Whether entity `eid`'s row belongs to the caller's `(namespace, space)`
+/// scope, read on the shared trace txn. Fail-closed: a missing row or read
+/// error denies, so a foreign / vanished entity never renders its canonical
+/// name into the trace. Mirrors [`statement_in_caller_scope`] for the graph
+/// lane's entity candidates.
+fn entity_in_caller_scope(
+    rtxn: &redb::ReadTransaction,
+    eid: EntityId,
+    caller_scope: brain_metadata::RowScope,
+) -> bool {
+    use brain_metadata::tables::entity::{EntityMetadata, ENTITIES_TABLE};
+    let Ok(t) = rtxn.open_table(ENTITIES_TABLE) else {
+        return false;
+    };
+    let row: Option<EntityMetadata> = t.get(&eid.to_bytes()).ok().flatten().map(|g| g.value());
+    matches!(row, Some(m) if m.scope() == caller_scope)
+}
+
+/// Whether relation `rid`'s sidecar row belongs to the caller's `(namespace,
+/// space)` scope, read on the shared trace txn. Fail-closed: a missing row or
+/// read error denies. Mirrors [`entity_in_caller_scope`] for the graph lane's
+/// relation candidates.
+fn relation_in_caller_scope(
+    rtxn: &redb::ReadTransaction,
+    rid: brain_core::RelationId,
+    caller_scope: brain_metadata::RowScope,
+) -> bool {
+    use brain_metadata::tables::relation::{RelationMetadata, RELATION_METADATA_TABLE};
+    let Ok(t) = rtxn.open_table(RELATION_METADATA_TABLE) else {
+        return false;
+    };
+    let row: Option<RelationMetadata> = t.get(&rid.to_bytes()).ok().flatten().map(|g| g.value());
+    matches!(row, Some(m) if m.scope() == caller_scope)
 }
 
 /// "From —namespace:name→ To" for a relation candidate; partial when a lookup
@@ -2432,6 +2492,7 @@ fn render_statement_label(rtxn: &redb::ReadTransaction, sid: brain_core::Stateme
 
 fn fetch_candidate_texts(
     ids: &HashSet<MemoryId>,
+    caller_scope: brain_metadata::RowScope,
     ctx: &OpsContext,
 ) -> Result<HashMap<MemoryId, String>, OpError> {
     if ids.is_empty() {
@@ -2445,9 +2506,33 @@ fn fetch_candidate_texts(
     let texts_table = rtxn
         .open_table(TEXTS_TABLE)
         .map_err(|e| OpError::Internal(format!("recall trace open TEXTS_TABLE: {e}")))?;
+    // The memory table carries each row's owner scope; the text table is keyed
+    // by global id with no scope, so text is fetched only after the row's
+    // `(namespace, space)` clears the caller's scope. A foreign / missing row
+    // is left out of the map entirely, so its trace candidate renders with no
+    // text — mirroring `project_memory_results`' per-row re-check.
+    let memories_table = rtxn
+        .open_table(MEMORIES_TABLE)
+        .map_err(|e| OpError::Internal(format!("recall trace open MEMORIES_TABLE: {e}")))?;
 
     let mut out = HashMap::with_capacity(ids.len());
     for &id in ids {
+        let in_scope = match memories_table.get(&id.to_be_bytes()) {
+            Ok(Some(guard)) => {
+                let row = guard.value();
+                row.namespace_id == caller_scope.namespace_id
+                    && row.space_id_bytes == caller_scope.space_id_bytes
+            }
+            Ok(None) => false,
+            Err(e) => {
+                return Err(OpError::Internal(format!(
+                    "recall trace MEMORIES_TABLE get: {e}"
+                )));
+            }
+        };
+        if !in_scope {
+            continue;
+        }
         let text = match texts_table.get(&id.to_be_bytes()) {
             Ok(Some(guard)) => std::str::from_utf8(guard.value())
                 .map(str::to_owned)
@@ -4345,6 +4430,315 @@ mod tests {
             vec!["soccer".to_string()],
             "foreign-space object must be dropped; same-space object still projects"
         );
+    }
+
+    // ── T1: RECALL/QUERY trace cross-tenant leak wall ───────────────────────
+    //
+    // The answer path re-verifies `(namespace_id, space_id)` on every row, but
+    // the opt-in `trace = true` diagnostic surface renders candidate text /
+    // labels for the pre-fusion set of EVERY lane — and the lexical / graph /
+    // statement-semantic lanes don't push scope down. Without a per-candidate
+    // re-check, a caller in space A whose lanes surface space-B rows would read
+    // B's memory text, statement subject-predicate-object, entity canonical
+    // names, and relation labels inside its own trace. These pin the wall at the
+    // exact rendering boundary: a foreign / missing candidate renders as an
+    // opaque id with NO content, while same-space candidates render fully.
+
+    #[allow(clippy::type_complexity)]
+    fn scoped_trace_fixture() -> (
+        tempfile::TempDir,
+        brain_metadata::MetadataDb,
+        brain_metadata::RowScope, // scope A (caller)
+        brain_metadata::RowScope, // scope B (foreign)
+        EntityId,                 // A's entity (Alice)
+        EntityId,                 // B's entity (Bob)
+        brain_core::StatementId,  // A's statement
+        brain_core::StatementId,  // B's statement
+        brain_core::RelationId,   // A's relation
+        brain_core::RelationId,   // B's relation
+    ) {
+        use brain_core::{
+            Entity, EntityType, EvidenceRef, Relation, Statement, StatementKind, StatementObject,
+            StatementValue,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = brain_metadata::MetadataDb::open(dir.path().join("m.redb")).unwrap();
+        // Distinct in BOTH halves of the scope so the test exercises the
+        // namespace wall and the space wall together.
+        let scope_a =
+            brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16]);
+        let scope_b = brain_metadata::RowScope::from_bytes(2, [0xB2; 16]);
+        let ent_a = EntityId::new();
+        let ent_b = EntityId::new();
+        let wtxn = db.write_txn().unwrap();
+        for (scope, id, name) in [(scope_a, ent_a, "Alice"), (scope_b, ent_b, "Bob")] {
+            brain_metadata::entity::ops::entity_put(
+                &wtxn,
+                scope,
+                brain_core::SessionId::DEFAULT,
+                &Entity::new_active(id, EntityType::PERSON_ID, name.into(), name.into(), 1),
+            )
+            .unwrap();
+        }
+        let pid = brain_metadata::schema::predicate::predicate_intern_or_get(
+            &wtxn, "test", "plays", 0, 1,
+        )
+        .unwrap();
+        let rtid = brain_metadata::relation::types::relation_type_intern_or_get(
+            &wtxn, "test", "knows", 0, 1,
+        )
+        .unwrap();
+        let mk_stmt = |subject: EntityId, obj: &str| {
+            Statement::new_root(
+                brain_core::StatementId::new(),
+                StatementKind::Fact,
+                brain_core::SubjectRef::Entity(subject),
+                pid,
+                StatementObject::Value(StatementValue::Text(obj.into())),
+                0.9,
+                EvidenceRef::default(),
+                brain_core::ExtractorId::from(0),
+                1,
+                1,
+            )
+        };
+        let s_a = mk_stmt(ent_a, "soccer");
+        let s_b = mk_stmt(ent_b, "cricket");
+        let (sid_a, sid_b) = (s_a.id, s_b.id);
+        for (scope, s) in [(scope_a, &s_a), (scope_b, &s_b)] {
+            brain_metadata::statement::crud::statement_create(
+                &wtxn,
+                scope,
+                brain_core::SessionId::DEFAULT,
+                s,
+                1,
+            )
+            .unwrap();
+        }
+        let mk_rel = |from: EntityId| {
+            Relation::new_root(
+                brain_core::RelationId::new(),
+                rtid,
+                from,
+                from, // self-edge keeps the fixture to one entity per scope
+                0.9,
+                Vec::new(),
+                brain_core::ExtractorId::from(0),
+                1,
+                false,
+            )
+        };
+        let r_a = mk_rel(ent_a);
+        let r_b = mk_rel(ent_b);
+        let (rid_a, rid_b) = (r_a.id, r_b.id);
+        for (scope, r) in [(scope_a, &r_a), (scope_b, &r_b)] {
+            brain_metadata::relation::ops::relation_create(
+                &wtxn,
+                scope,
+                brain_core::SessionId::DEFAULT,
+                r,
+                1,
+            )
+            .unwrap();
+        }
+        wtxn.commit().unwrap();
+        (
+            dir, db, scope_a, scope_b, ent_a, ent_b, sid_a, sid_b, rid_a, rid_b,
+        )
+    }
+
+    #[test]
+    fn entity_in_caller_scope_walls_foreign_and_missing() {
+        let (_dir, db, scope_a, scope_b, ent_a, ent_b, ..) = scoped_trace_fixture();
+        let rtxn = db.read_txn().unwrap();
+        assert!(entity_in_caller_scope(&rtxn, ent_a, scope_a));
+        assert!(!entity_in_caller_scope(&rtxn, ent_b, scope_a));
+        assert!(entity_in_caller_scope(&rtxn, ent_b, scope_b));
+        // A missing entity is out of scope — never renders a name.
+        assert!(!entity_in_caller_scope(&rtxn, EntityId::new(), scope_a));
+    }
+
+    #[test]
+    fn relation_in_caller_scope_walls_foreign_and_missing() {
+        let (_dir, db, scope_a, scope_b, .., rid_a, rid_b) = scoped_trace_fixture();
+        let rtxn = db.read_txn().unwrap();
+        assert!(relation_in_caller_scope(&rtxn, rid_a, scope_a));
+        assert!(!relation_in_caller_scope(&rtxn, rid_b, scope_a));
+        assert!(relation_in_caller_scope(&rtxn, rid_b, scope_b));
+        assert!(!relation_in_caller_scope(
+            &rtxn,
+            brain_core::RelationId::new(),
+            scope_a
+        ));
+    }
+
+    #[test]
+    fn candidate_from_ranked_walls_foreign_typed_items() {
+        let (_dir, db, scope_a, _scope_b, ent_a, ent_b, sid_a, sid_b, rid_a, rid_b) =
+            scoped_trace_fixture();
+        let rtxn = db.read_txn().unwrap();
+        let empty_texts: HashMap<MemoryId, String> = HashMap::new();
+        let render =
+            |id: RankedItemId| candidate_from_ranked(Some(&rtxn), scope_a, &id, 0.5, &empty_texts);
+
+        // Same-space typed items render their full label.
+        let c_ea = render(RankedItemId::Entity(ent_a));
+        assert_eq!(c_ea.text, "Alice", "same-space entity name must render");
+        let c_sa = render(RankedItemId::Statement(sid_a));
+        assert_eq!(
+            c_sa.text, "Alice test:plays soccer",
+            "same-space statement label must render"
+        );
+        let c_ra = render(RankedItemId::Relation(rid_a));
+        assert_eq!(
+            c_ra.text, "Alice —test:knows→ Alice",
+            "same-space relation label must render"
+        );
+
+        // Foreign-space typed items render as opaque ids with NO content: the
+        // id is preserved for observability, but B's name / label never leaks.
+        let c_eb = render(RankedItemId::Entity(ent_b));
+        assert_eq!(c_eb.item_id, u128::from_be_bytes(ent_b.to_bytes()));
+        assert!(
+            c_eb.text.is_empty(),
+            "foreign entity name must be walled, got {:?}",
+            c_eb.text
+        );
+        let c_sb = render(RankedItemId::Statement(sid_b));
+        assert_eq!(c_sb.item_id, u128::from_be_bytes(sid_b.to_bytes()));
+        assert!(
+            c_sb.text.is_empty(),
+            "foreign statement label must be walled, got {:?}",
+            c_sb.text
+        );
+        // Specifically: none of B's subject / object appears anywhere.
+        assert!(!c_sb.text.contains("Bob") && !c_sb.text.contains("cricket"));
+        let c_rb = render(RankedItemId::Relation(rid_b));
+        assert_eq!(c_rb.item_id, u128::from_be_bytes(rid_b.to_bytes()));
+        assert!(
+            c_rb.text.is_empty(),
+            "foreign relation label must be walled, got {:?}",
+            c_rb.text
+        );
+    }
+
+    #[test]
+    fn candidate_from_ranked_memory_renders_only_walled_map() {
+        // The memory scope wall lives in `fetch_candidate_texts` (which only
+        // populates the map for in-scope rows). At the render boundary a memory
+        // whose id is absent from the map (foreign, missing, or tombstoned since
+        // fusion) must therefore render with no text.
+        let mid_in = MemoryId::pack(1, 7, 1);
+        let mid_out = MemoryId::pack(1, 8, 1);
+        let mut texts: HashMap<MemoryId, String> = HashMap::new();
+        texts.insert(mid_in, "in-scope body".to_string());
+        let scope =
+            brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16]);
+
+        let c_in = candidate_from_ranked(None, scope, &RankedItemId::Memory(mid_in), 0.5, &texts);
+        assert_eq!(c_in.text, "in-scope body");
+        let c_out = candidate_from_ranked(None, scope, &RankedItemId::Memory(mid_out), 0.5, &texts);
+        assert_eq!(c_out.item_id, mid_out.raw());
+        assert!(
+            c_out.text.is_empty(),
+            "a memory absent from the walled map renders no text"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fetch_candidate_texts_walls_foreign_space_memory() {
+        use brain_core::{MemoryId, MemoryKind, NamespaceId, SessionId, SpaceId};
+        use brain_index::{IndexParams, SharedHnsw};
+        use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
+        use brain_metadata::tables::text::TEXTS_TABLE;
+        use brain_metadata::MetadataDb;
+        use brain_planner::{ExecutorContext, WriterHandle};
+        use std::sync::Arc;
+
+        struct ZeroDispatcher;
+        impl brain_embed::Dispatcher for ZeroDispatcher {
+            fn embed(
+                &self,
+                _text: &str,
+            ) -> Result<[f32; brain_embed::VECTOR_DIM], brain_embed::EmbedError> {
+                Ok([0.0; brain_embed::VECTOR_DIM])
+            }
+            fn embed_batch(
+                &self,
+                texts: &[&str],
+            ) -> Result<Vec<[f32; brain_embed::VECTOR_DIM]>, brain_embed::EmbedError> {
+                Ok(texts
+                    .iter()
+                    .map(|_| [0.0; brain_embed::VECTOR_DIM])
+                    .collect())
+            }
+            fn fingerprint(&self) -> [u8; 16] {
+                [0xAB; 16]
+            }
+        }
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let metadata: Arc<MetadataDb> =
+            Arc::new(MetadataDb::open(tempdir.path().join("metadata.redb")).unwrap());
+        let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
+        let writer = Arc::new(crate::RealWriterHandle::new(metadata.clone(), hnsw_writer));
+        let executor = ExecutorContext::new(
+            Arc::new(ZeroDispatcher) as Arc<dyn brain_embed::Dispatcher>,
+            shared,
+            metadata.clone(),
+            writer as Arc<dyn WriterHandle>,
+        );
+        let ctx = crate::test_support::ops_context_for_tests(executor, tempdir.path());
+
+        // Scope A is the caller; scope B is a foreign space in a different
+        // namespace. Seed one memory + text row in each.
+        let space_a = SpaceId::from([0xA1; 16]);
+        let space_b = SpaceId::from([0xB2; 16]);
+        let mid_a = MemoryId::pack(1, 7, 1);
+        let mid_b = MemoryId::pack(1, 8, 1);
+        let wtxn = metadata.write_txn().unwrap();
+        {
+            let mut mt = wtxn.open_table(MEMORIES_TABLE).unwrap();
+            let mut tt = wtxn.open_table(TEXTS_TABLE).unwrap();
+            for (ns, space, mid, body) in [
+                (NamespaceId::SYSTEM, space_a, mid_a, "alice private note"),
+                (NamespaceId::from(2u32), space_b, mid_b, "bob private note"),
+            ] {
+                let m = MemoryMetadata::new_active(
+                    mid,
+                    ns,
+                    space,
+                    SessionId(0),
+                    mid.slot(),
+                    1,
+                    MemoryKind::Episodic,
+                    [0xAB; 16],
+                    0.5,
+                    body.len() as u32,
+                    1_700_000_000_000_000_000,
+                );
+                mt.insert(&mid.to_be_bytes(), &m).unwrap();
+                tt.insert(&mid.to_be_bytes(), body.as_bytes()).unwrap();
+            }
+        }
+        wtxn.commit().unwrap();
+
+        let scope_a = brain_metadata::RowScope::new(NamespaceId::SYSTEM, space_a);
+        let ids: HashSet<MemoryId> = [mid_a, mid_b].into_iter().collect();
+        let texts = fetch_candidate_texts(&ids, scope_a, &ctx).unwrap();
+
+        assert_eq!(
+            texts.get(&mid_a).map(String::as_str),
+            Some("alice private note"),
+            "same-space memory text must be present in the trace"
+        );
+        assert!(
+            !texts.contains_key(&mid_b),
+            "foreign-space memory must be walled out of the trace text map"
+        );
+        // Belt-and-suspenders: B's body never appears in any value.
+        assert!(texts.values().all(|t| !t.contains("bob")));
     }
 
     // ── R4: in-txn read-your-writes confidence semantics ────────────────────
