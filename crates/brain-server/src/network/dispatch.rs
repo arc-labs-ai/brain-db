@@ -25,7 +25,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use brain_core::SpaceId;
 use brain_metadata::api_keys::bits;
@@ -70,6 +70,13 @@ pub(crate) struct ConnState {
     pub(crate) phase: ConnPhase,
     pub(crate) connection_id: [u8; 16],
     pub(crate) negotiated_version: u8,
+    /// Monotonic instant of the last authoritative revocation check for
+    /// this connection's key. Stamped at AUTH (the full credential
+    /// resolution) and refreshed by the live re-check in `dispatch_frame`.
+    /// The common per-op path only compares this against
+    /// [`REVOCATION_RECHECK_WINDOW`]; the redb read fires at most once per
+    /// window. See [`enforce_live_revocation`].
+    pub(crate) last_revocation_check: Instant,
 }
 
 impl ConnState {
@@ -78,6 +85,7 @@ impl ConnState {
             phase: ConnPhase::AwaitingHello,
             connection_id: [0u8; 16],
             negotiated_version: 0,
+            last_revocation_check: Instant::now(),
         }
     }
 }
@@ -256,6 +264,18 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
             ));
         }
     };
+
+    // Live revocation re-check. The key is fully resolved once at AUTH, but
+    // a long-lived connection (notably a wildcard gateway/edge with
+    // `may_act = ["*"]`) can outlive a mid-session revoke; without a live
+    // re-check a revoked key keeps full access until the TCP connection
+    // drops. Re-look-up the key by its hash at a bounded interval so
+    // revocation takes effect promptly while the common per-op path stays a
+    // single monotonic-clock comparison. Fail-closed: a revoked/gone key —
+    // or a store error — denies the in-flight op and closes the connection.
+    if let Some(action) = enforce_live_revocation(state, &scope, topology, stream_id) {
+        return action;
+    }
 
     // Reject opcodes we don't expect from the client (response opcodes,
     // server-pushed events).
@@ -503,6 +523,10 @@ fn on_auth(frame: Frame, state: &mut ConnState, topology: &Topology) -> Action {
         permissions,
         scope: scope.clone(),
     };
+    // AUTH is the authoritative revocation check; anchor the live-re-check
+    // window here so the first post-AUTH op inside the window skips the redb
+    // read.
+    state.last_revocation_check = Instant::now();
 
     let auth_ok = AuthOkPayload {
         // The space is resolved entirely from the key — the client never
@@ -702,6 +726,65 @@ fn check_act_as(
     Ok(())
 }
 
+/// Maximum staleness of a connection's revocation status.
+///
+/// A revoked key loses access on an OPEN connection within this window on
+/// the connection's next op after the window elapses. 5s is short enough
+/// that revocation is effectively prompt for an operator, yet long enough
+/// that the redb read is amortised to at most once per 5s per connection —
+/// every other op on the hot path pays only a monotonic-clock comparison.
+const REVOCATION_RECHECK_WINDOW: Duration = Duration::from_secs(5);
+
+/// Bounded-staleness live revocation re-check for a data-plane op.
+///
+/// Returns `None` to admit the op (window not yet elapsed, or the key is
+/// still active) and `Some(Action::CloseWith(..))` to deny it and tear the
+/// connection down. Off the hot path except for the `Instant` comparison:
+/// the redb read fires only when the window has elapsed, and stamps
+/// `state.last_revocation_check` so the next window starts fresh. Fail-closed
+/// — a revoked row, a missing row, or a store error all deny.
+fn enforce_live_revocation(
+    state: &mut ConnState,
+    scope: &RequestScope,
+    topology: &Topology,
+    stream_id: u32,
+) -> Option<Action> {
+    let now = Instant::now();
+    if now.duration_since(state.last_revocation_check) < REVOCATION_RECHECK_WINDOW {
+        return None;
+    }
+    state.last_revocation_check = now;
+    match topology.auth_store.is_key_active(&scope.key_hash) {
+        Ok(true) => None,
+        Ok(false) => {
+            tracing::warn!(
+                key_hash = %hex32(&scope.key_hash),
+                "revoked key detected on live connection; denying op and closing"
+            );
+            Some(Action::CloseWith(error_frame(
+                stream_id,
+                ErrorCode::Unauthenticated,
+                "API key has been revoked",
+            )))
+        }
+        Err(e) => {
+            // Fail-closed: an unavailable key store means we cannot prove the
+            // key is still valid, so we deny rather than trust the cached
+            // AUTH-time scope.
+            tracing::warn!(
+                key_hash = %hex32(&scope.key_hash),
+                error = %e,
+                "api-key store unavailable during live revocation re-check; closing"
+            );
+            Some(Action::CloseWith(error_frame(
+                stream_id,
+                ErrorCode::Internal,
+                "api-key store unavailable; closing connection",
+            )))
+        }
+    }
+}
+
 fn pick_target_shard(
     req: &RequestBody,
     bound_shard: u16,
@@ -896,7 +979,7 @@ pub(crate) enum Tick {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_protocol::connection::handshake::{AuthMethod, HelloCapabilities};
+    use brain_protocol::connection::handshake::{AuthCredentials, AuthMethod, HelloCapabilities};
 
     fn test_topology() -> Topology {
         let tmp = tempfile::tempdir().expect("tmpdir");
@@ -1075,6 +1158,116 @@ mod tests {
             }
             _ => panic!("expected Inline(ERROR) on stream_id=0 op"),
         }
+    }
+
+    fn space_id_bytes(byte: u8) -> [u8; 16] {
+        let mut a = [0u8; 16];
+        a[15] = byte;
+        a
+    }
+
+    fn encode_op_frame() -> Frame {
+        let body = RequestBody::Encode(brain_protocol::envelope::request::EncodeRequest {
+            text: "hello".into(),
+            session_id: 0,
+            request_id: [0u8; 16],
+            txn_id: None,
+            occurred_at_unix_nanos: None,
+            act_as: None,
+            wait: brain_protocol::WaitMode::Ack,
+            allow_duplicates: false,
+        });
+        Frame::new(Opcode::EncodeReq.as_u16(), FLAG_EOS, 1, body.encode())
+    }
+
+    /// Drive HELLO + AUTH with `secret` and return the established state.
+    fn establish(topo: &Topology, secret: Vec<u8>) -> ConnState {
+        let mut state = ConnState::new();
+        let _ = dispatch_frame(build_hello_frame(), &mut state, topo);
+        let auth = AuthPayload {
+            method: AuthMethod::Token,
+            credentials: AuthCredentials::Token(secret),
+        };
+        let frame = Frame::new(Opcode::Auth.as_u16(), FLAG_EOS, 0, auth.encode());
+        let action = dispatch_frame(frame, &mut state, topo);
+        assert!(
+            matches!(action, Action::Inline(_)),
+            "AUTH should be accepted"
+        );
+        assert!(matches!(state.phase, ConnPhase::Established { .. }));
+        state
+    }
+
+    /// A key revoked mid-connection loses access on the next op once the
+    /// live-re-check staleness window has elapsed, and the connection closes.
+    #[test]
+    fn revoked_key_denied_after_window_on_live_connection() {
+        let topo = test_topology();
+        let minted = topo
+            .auth_store
+            .mint(
+                space_id_bytes(2),
+                [0u8; 16],
+                "acme".into(),
+                space_id_bytes(7),
+                bits::STANDARD_SPACE,
+                Vec::new(),
+                1,
+            )
+            .unwrap();
+        let mut state = establish(&topo, minted.secret_bytes.clone());
+
+        // Within the freshly-anchored window: the op is admitted.
+        match dispatch_frame(encode_op_frame(), &mut state, &topo) {
+            Action::OpDispatch(_) => {}
+            _ => panic!("expected OpDispatch within the re-check window"),
+        }
+
+        // Revoke mid-connection, then force the window to have elapsed.
+        assert!(topo.auth_store.revoke(&minted.key_hash).unwrap());
+        state.last_revocation_check = Instant::now()
+            .checked_sub(REVOCATION_RECHECK_WINDOW * 2)
+            .unwrap();
+
+        // The next op re-looks-up the key, finds it revoked, denies, and closes.
+        match dispatch_frame(encode_op_frame(), &mut state, &topo) {
+            Action::CloseWith(f) => {
+                assert_eq!(f.header.opcode_u16(), Opcode::Error.as_u16());
+            }
+            _ => panic!("expected CloseWith(ERROR) after revoke + elapsed window"),
+        }
+    }
+
+    /// A non-revoked key keeps working across the staleness window: the
+    /// re-check refreshes the timestamp and admits the op.
+    #[test]
+    fn active_key_survives_window_on_live_connection() {
+        let topo = test_topology();
+        let minted = topo
+            .auth_store
+            .mint(
+                space_id_bytes(2),
+                [0u8; 16],
+                "acme".into(),
+                space_id_bytes(7),
+                bits::STANDARD_SPACE,
+                Vec::new(),
+                1,
+            )
+            .unwrap();
+        let mut state = establish(&topo, minted.secret_bytes.clone());
+
+        // Force the window to have elapsed without revoking the key.
+        state.last_revocation_check = Instant::now()
+            .checked_sub(REVOCATION_RECHECK_WINDOW * 2)
+            .unwrap();
+
+        match dispatch_frame(encode_op_frame(), &mut state, &topo) {
+            Action::OpDispatch(_) => {}
+            _ => panic!("expected OpDispatch for an active key across the window"),
+        }
+        // The re-check refreshed the anchor, so the next op stays on the cheap path.
+        assert!(state.last_revocation_check.elapsed() < REVOCATION_RECHECK_WINDOW);
     }
 
     /// Unknown opcode returns BadOpcode but the connection stays

@@ -22,8 +22,8 @@ use std::sync::Arc;
 use brain_core::SpaceId;
 use brain_metadata::api_keys::{bits, hash_secret, ResolvedScope};
 use brain_metadata::{
-    api_key_create, api_key_list_for_space, api_key_lookup_by_secret, api_key_revoke, ApiKeyDb,
-    ApiKeyError,
+    api_key_create, api_key_list_for_space, api_key_lookup_by_hash, api_key_lookup_by_secret,
+    api_key_revoke, ApiKeyDb, ApiKeyError,
 };
 use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, SpacePermissions,
@@ -266,6 +266,24 @@ impl AuthStore {
         api_key_list_for_space(&rtxn, space_id)
     }
 
+    /// Report whether the key identified by `key_hash` is still active
+    /// (present in the store and not revoked).
+    ///
+    /// This is the cheap read the connection layer uses for its live,
+    /// bounded-staleness revocation re-check: keys are validated in full at
+    /// AUTH, but a long-lived connection could outlive a mid-session revoke,
+    /// so we re-look-up the row by its hash periodically. Callers are
+    /// fail-closed — a missing row (`Ok(false)`), a revoked row
+    /// (`Ok(false)`), or a storage error (`Err`) must all deny access.
+    pub fn is_key_active(&self, key_hash: &[u8; 32]) -> Result<bool, ApiKeyError> {
+        let guard = self.db.read();
+        let rtxn = guard.read_txn()?;
+        match api_key_lookup_by_hash(&rtxn, key_hash)? {
+            Some(row) => Ok(!row.revoked),
+            None => Ok(false),
+        }
+    }
+
     /// Look up a secret. Returns `None` when the secret hashes to a row
     /// that doesn't exist.
     pub fn lookup(
@@ -489,6 +507,29 @@ mod tests {
         let payload = auth_token(minted.secret_bytes);
         let err = derive_scope_from_handshake(&payload, &store).unwrap_err();
         assert!(matches!(err, AuthError::Revoked));
+    }
+
+    #[test]
+    fn is_key_active_tracks_revocation() {
+        // The live re-check reads the store by key hash: active before
+        // revoke, inactive after, and inactive for a hash that was never
+        // minted (fail-closed on an unknown key).
+        let (_dir, store) = store();
+        let minted = store
+            .mint(
+                space(2),
+                [0u8; 16],
+                "acme".into(),
+                space(7),
+                bits::STANDARD_SPACE,
+                Vec::new(),
+                1,
+            )
+            .unwrap();
+        assert!(store.is_key_active(&minted.key_hash).unwrap());
+        assert!(store.revoke(&minted.key_hash).unwrap());
+        assert!(!store.is_key_active(&minted.key_hash).unwrap());
+        assert!(!store.is_key_active(&[0xABu8; 32]).unwrap());
     }
 
     #[test]
