@@ -93,9 +93,11 @@ fn now_unix_nanos() -> u64 {
 }
 
 fn make_id(slot: u64) -> MemoryId {
-    let mut b = [0u8; 16];
-    b[8..16].copy_from_slice(&slot.to_be_bytes());
-    MemoryId::from_be_bytes(b)
+    // Pack the slot into the real slot field (bits 64..112). Writing it into
+    // the low bytes instead collapses to `MemoryId::NULL` because
+    // `from_be_bytes` masks the low 32 reserved bits — so `make_id(1)` and
+    // `make_id(2)` would both decode to the same id and seed one memory.
+    MemoryId::pack(0, slot, 1)
 }
 
 async fn seed_memory_with_vec(fixture: &Fixture, slot: u64, vector: [f32; VECTOR_DIM]) -> MemoryId {
@@ -467,6 +469,87 @@ fn cycle_merges_real_target_and_weight_into_artifact_bundle() {
         assert!(
             graph.nodes.iter().any(|n| n.id == m2.to_be_bytes()),
             "linked memory must appear as a node"
+        );
+    });
+}
+
+/// Two similar memories in the SAME (namespace, space) scope must receive a
+/// `SimilarTo` edge. Regression coverage for the bug where the worker
+/// submitted its batch as `SpaceId::default()` (NIL): the apply layer's Link
+/// tenant wall then failed `memory_in_space(real_mem, nil)` for every real
+/// memory and silently dropped every derived edge.
+#[test]
+fn same_scope_similar_memories_get_edge() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let v = unit_vec(0);
+        let owner = SpaceId::new(); // real, non-nil owning space
+
+        let m1 = seed_memory_with_vec_space(&fix, 1, v, owner).await;
+        let _m2 = seed_memory_with_vec_space(&fix, 2, v, owner).await;
+
+        fix.sender.try_send((m1, v)).expect("enqueue");
+
+        let worker = AutoEdgeWorker::new(fix.receiver.clone()).with_knobs(AutoEdgeKnobs {
+            top_k: 5,
+            similarity_threshold: 0.5,
+            ef_search: Some(64),
+        });
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wctx = WorkerContext {
+            ops: fix.ctx.clone(),
+            shutdown,
+        };
+        let processed = worker.run_cycle(&wctx).await.unwrap();
+        assert!(processed > 0, "worker drained the enqueue");
+
+        // Symmetric SimilarTo writes two forward rows for the one logical
+        // pair — the edge must actually exist, no longer no-op'd by the wall.
+        let found = count_auto_derived(&fix);
+        assert!(
+            found >= 2,
+            "same-scope similar memories must produce a SimilarTo edge \
+             (got {found} AUTO_DERIVED rows)"
+        );
+    });
+}
+
+/// Two similar memories in DIFFERENT spaces must NOT be linked: a cross-scope
+/// `SimilarTo` edge is itself a tenancy violation, so the worker drops the
+/// pair before it ever reaches the write path. HNSW is shard-wide (scope
+/// blind), so the neighbour is found — the scope guard is what excludes it.
+#[test]
+fn cross_scope_similar_memories_get_no_edge() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let v = unit_vec(0);
+        let space_a = SpaceId::new();
+        let space_b = SpaceId::new();
+        assert_ne!(space_a, space_b);
+
+        let m1 = seed_memory_with_vec_space(&fix, 1, v, space_a).await;
+        let _m2 = seed_memory_with_vec_space(&fix, 2, v, space_b).await;
+
+        fix.sender.try_send((m1, v)).expect("enqueue");
+
+        let worker = AutoEdgeWorker::new(fix.receiver.clone()).with_knobs(AutoEdgeKnobs {
+            top_k: 5,
+            similarity_threshold: 0.5,
+            ef_search: Some(64),
+        });
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wctx = WorkerContext {
+            ops: fix.ctx.clone(),
+            shutdown,
+        };
+        let processed = worker.run_cycle(&wctx).await.unwrap();
+        assert!(processed > 0, "worker drained the enqueue");
+
+        let found = count_auto_derived(&fix);
+        assert_eq!(
+            found, 0,
+            "cross-scope similar memories must NOT be linked (got {found} \
+             AUTO_DERIVED rows)"
         );
     });
 }
