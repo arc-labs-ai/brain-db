@@ -391,7 +391,7 @@ pub fn predicate_embedding_get(
     };
     let bytes = g.value();
     let mut out = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0.iter() {
         out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     Ok(Some(out))
@@ -840,7 +840,7 @@ pub fn predicate_consolidation_candidates_rtxn(
 /// The embedding is stored as little-endian `f32`s.
 fn decode_candidate(row: &PredicateDefinition, bytes: &[u8]) -> PredicateConsolidationCandidate {
     let mut vec = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0.iter() {
         vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     (
