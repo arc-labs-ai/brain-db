@@ -141,6 +141,31 @@ docker-clippy:
     @devcontainer up --workspace-folder . >/dev/null
     @devcontainer exec --workspace-folder . cargo clippy --workspace --all-targets -- -D warnings
 
+# Bound the volume-backed target cache. cargo never GCs `target/`: every code
+# change mints a fresh artifact hash and the old one is kept forever, so a
+# churny multi-crate/multi-agent workflow accumulates dozens of stale hash
+# variants per crate (this repo hit 68 GiB / ~30 variants of each crate).
+# `cargo sweep --maxsize` removes the OLDEST artifacts until the dir is under
+# the cap — stale variants go first, the current build is kept, so no rebuild
+# is forced. Combined with incremental=false (.cargo/config.toml) this keeps
+# the cache bounded. Pass a size (default 15GB), e.g. `just docker-gc 10GB`.
+docker-gc SIZE='15GB':
+    @devcontainer up --workspace-folder . >/dev/null
+    @devcontainer exec --workspace-folder . bash -lc 'du -sh target 2>/dev/null; cargo sweep --maxsize {{SIZE}} . || { echo "cargo-sweep missing — rebuild the devcontainer image (just docker-rebuild) or: cargo install cargo-sweep"; exit 1; }; echo "after:"; du -sh target 2>/dev/null'
+
+# Hard reset of the target cache: full `cargo clean` in the container. Frees
+# everything (incl. the ~35 GiB dep-artifact accumulation) but forces a full
+# rebuild on the next `just docker …`. Use when the cache has bloated across
+# many dep/toolchain changes; `docker-gc` is the cheaper day-to-day option.
+docker-clean-target:
+    @devcontainer up --workspace-folder . >/dev/null
+    @devcontainer exec --workspace-folder . cargo clean
+
+# Print the current target-cache size (the volume-backed target dir).
+docker-target-size:
+    @devcontainer up --workspace-folder . >/dev/null
+    @devcontainer exec --workspace-folder . du -sh target target/debug/deps target/debug/incremental 2>/dev/null
+
 # The full verification suite — what CI runs.
 verify: fmt-check build clippy test check-skills
 
