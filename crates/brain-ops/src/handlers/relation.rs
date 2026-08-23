@@ -353,10 +353,18 @@ pub async fn handle_relation_supersede(
         rt
     };
 
-    // Pre-submit existence check so a missing `old_relation_id` keeps
-    // its `NotFound { what: "relation", .. }` wire shape — submit-path
-    // failures collapse to `WriterError::Internal`.
-    peek_relation_exists(ctx, old_id)?;
+    // Pre-submit existence + ownership check so a missing OR foreign
+    // `old_relation_id` keeps its `NotFound { what: "relation", .. }`
+    // wire shape (submit-path failures collapse to
+    // `WriterError::Internal`). Scope-aware: another tenant's relation is
+    // indistinguishable from a missing one. The apply-layer wall
+    // re-checks atomically.
+    if !relation_id_in_caller_scope(ctx, old_id) {
+        return Err(OpError::NotFound {
+            what: "relation",
+            detail: format!("{old_id:?}"),
+        });
+    }
 
     let new_relation = build_relation_from_create(&req.new_relation, &rt, now)?;
 
@@ -432,10 +440,17 @@ pub async fn handle_relation_tombstone(
     let id = RelationId::from(req.relation_id);
     let now = crate::txn::now_unix_nanos_pub();
 
-    // Pre-submit existence check — submit-path failures collapse into
-    // WriterError::Internal, so peek first to keep the missing-id
-    // case structured as OpError::NotFound.
-    peek_relation_exists(ctx, id)?;
+    // Pre-submit existence + ownership check — submit-path failures
+    // collapse into WriterError::Internal, so check first to keep the
+    // missing-id case structured as OpError::NotFound. Scope-aware:
+    // another tenant's relation is indistinguishable from a missing one.
+    // The apply-layer wall re-checks atomically.
+    if !relation_id_in_caller_scope(ctx, id) {
+        return Err(OpError::NotFound {
+            what: "relation",
+            detail: format!("{id:?}"),
+        });
+    }
 
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
@@ -934,29 +949,6 @@ fn rt_active_for_schema_rtxn(
         }
     }
     Ok(out)
-}
-
-/// Confirm the relation row exists. Returns `OpError::NotFound` with
-/// the stable `what: "relation"` discriminant when the id has never
-/// been written. Used pre-submit so a missing relation keeps its
-/// wire-level NotFound shape instead of collapsing into Internal via
-/// WriterError.
-fn peek_relation_exists(ctx: &OpsContext, id: RelationId) -> Result<(), OpError> {
-    let rtxn = ctx
-        .executor
-        .metadata
-        .read_txn()
-        .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-    if relation_get(&rtxn, id)
-        .map_err(map_relation_op_error)?
-        .is_none()
-    {
-        return Err(OpError::NotFound {
-            what: "relation",
-            detail: format!("{id:?}"),
-        });
-    }
-    Ok(())
 }
 
 /// BLAKE3 over the canonical RELATION_CREATE request fields. Excludes

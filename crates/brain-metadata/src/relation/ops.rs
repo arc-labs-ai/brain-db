@@ -395,7 +395,7 @@ pub fn relation_create(
 /// Supersede `old_id` with `new_relation`.
 pub fn relation_supersede(
     wtxn: &WriteTransaction,
-    _scope: RowScope,
+    scope: RowScope,
     session: brain_core::SessionId,
     old_id: RelationId,
     new_relation: &Relation,
@@ -412,9 +412,15 @@ pub fn relation_supersede(
         let row = t.get(&old_id.to_bytes())?.map(|g| g.value());
         row.ok_or(RelationOpError::NotFound(old_id))?
     };
-    // The old row's owning scope is authoritative; the new row + evidence
-    // rows inherit it (a supersede can never re-home a relation).
-    let scope = old.scope();
+    // Tenant wall (authoritative). The old row's owning scope is adopted
+    // for the new row + evidence rows, so a caller from another tenant
+    // could otherwise re-home its replacement into the victim's scope.
+    // The caller must own `old`; a row owned by another tenant reads as
+    // NotFound (no existence leak). Past this guard the caller scope and
+    // the row's own scope are identical.
+    if scope != old.scope() {
+        return Err(RelationOpError::NotFound(old_id));
+    }
     if old.is_tombstoned() {
         return Err(RelationOpError::AlreadyTombstoned(old_id));
     }
@@ -1841,5 +1847,44 @@ mod tests {
         let to_b = relation_list_to(&rtxn, test_scope(), b, &filter).unwrap();
         assert_eq!(to_b.len(), 1);
         assert_eq!(to_b[0].id, r.id);
+    }
+
+    #[test]
+    fn cross_scope_supersede_denied_no_row_in_victim_scope() {
+        // A caller in another tenant must not supersede a relation it does
+        // not own: NotFound, and no replacement row lands in the victim's
+        // scope (the W3 re-home defence).
+        let (_dir, mut db) = open_db();
+        let a = make_entity(&mut db, "xs-a");
+        let b = make_entity(&mut db, "xs-b");
+        let t = intern_type(&mut db, "xs_type", Cardinality::ManyToMany, false);
+        let old = fresh_rel(t, a, b, false);
+        let wtxn = db.write_txn().unwrap();
+        relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &old, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let other_scope = RowScope::from_bytes(999, [0xCD; 16]);
+        let new = fresh_rel(t, a, b, false);
+        let new_id = new.id;
+        let wtxn = db.write_txn().unwrap();
+        let err = relation_supersede(
+            &wtxn,
+            other_scope,
+            brain_core::SessionId::DEFAULT,
+            old.id,
+            &new,
+            1,
+        )
+        .expect_err("cross-scope supersede must be denied");
+        assert!(matches!(err, RelationOpError::NotFound(id) if id == old.id));
+        drop(wtxn);
+
+        let rtxn = db.read_txn().unwrap();
+        let old_got = relation_get(&rtxn, old.id).unwrap().unwrap();
+        assert!(old_got.superseded_by.is_none(), "victim row must be intact");
+        assert!(
+            relation_get(&rtxn, new_id).unwrap().is_none(),
+            "no replacement row may be stamped into the victim scope"
+        );
     }
 }

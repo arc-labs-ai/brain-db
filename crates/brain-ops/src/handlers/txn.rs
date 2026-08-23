@@ -489,6 +489,7 @@ pub async fn handle_txn_commit(
     let write_id = write_id_from_txn(req.txn_id);
     let request_hash = hash_txn_commit_request(req.txn_id, &phases);
     let write = crate::write::Write::from_phases(write_id, ctx.executor.caller_space, phases)
+        .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
     let real_writer = crate::handlers::link::downcast_writer_pub(ctx)?;
     match real_writer.submit(write).await {

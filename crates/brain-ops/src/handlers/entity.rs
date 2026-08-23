@@ -206,6 +206,15 @@ pub async fn handle_entity_update(
     let id = EntityId::from(req.entity_id);
     let now = crate::txn::now_unix_nanos_pub();
 
+    // Tenant wall (early): a foreign / absent id reads as NotFound before
+    // the write is built. The apply-layer wall re-checks atomically.
+    if !entity_id_in_caller_scope(ctx, id) {
+        return Err(OpError::NotFound {
+            what: "entity",
+            detail: format!("{id:?}"),
+        });
+    }
+
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
@@ -273,6 +282,15 @@ pub async fn handle_entity_rename(
     let id = EntityId::from(req.entity_id);
     let now = crate::txn::now_unix_nanos_pub();
 
+    // Tenant wall (early): a foreign / absent id reads as NotFound before
+    // the write is built. The apply-layer wall re-checks atomically.
+    if !entity_id_in_caller_scope(ctx, id) {
+        return Err(OpError::NotFound {
+            what: "entity",
+            detail: format!("{id:?}"),
+        });
+    }
+
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
@@ -332,6 +350,16 @@ pub async fn handle_entity_merge(
     let survivor = EntityId::from(req.survivor);
     let merged = EntityId::from(req.merged);
     let now = crate::txn::now_unix_nanos_pub();
+
+    // Tenant wall (early): the caller must own both endpoints. A foreign /
+    // absent endpoint reads as NotFound before the write is built. The
+    // apply-layer wall re-checks both atomically.
+    if !entity_id_in_caller_scope(ctx, survivor) || !entity_id_in_caller_scope(ctx, merged) {
+        return Err(OpError::NotFound {
+            what: "entity",
+            detail: format!("survivor={survivor:?} merged={merged:?}"),
+        });
+    }
 
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
@@ -399,6 +427,15 @@ pub async fn handle_entity_unmerge(
     let merged = EntityId::from(req.merged_entity);
     let now = crate::txn::now_unix_nanos_pub();
 
+    // Tenant wall (early): a foreign / absent id reads as NotFound before
+    // the write is built. The apply-layer wall re-checks atomically.
+    if !entity_id_in_caller_scope(ctx, merged) {
+        return Err(OpError::NotFound {
+            what: "entity",
+            detail: format!("{merged:?}"),
+        });
+    }
+
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
@@ -463,21 +500,16 @@ pub async fn handle_entity_tombstone(
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_tombstone_request(&req, id);
 
-    // Pre-check existence so we return NotFound at the handler edge
-    // before the writer accepts a phase whose apply would surface the
-    // same error from inside the wtxn.
-    {
-        let rtxn = ctx
-            .executor
-            .metadata
-            .read_txn()
-            .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        if entity_get(&rtxn, id).map_err(OpError::from)?.is_none() {
-            return Err(OpError::NotFound {
-                what: "entity",
-                detail: format!("{id:?}"),
-            });
-        }
+    // Pre-check existence AND ownership so we return NotFound at the
+    // handler edge before the writer accepts a phase whose apply would
+    // surface the same error. Scope-aware: an entity owned by another
+    // tenant is indistinguishable from a missing one (no existence leak).
+    // The apply-layer wall re-checks atomically.
+    if !entity_id_in_caller_scope(ctx, id) {
+        return Err(OpError::NotFound {
+            what: "entity",
+            detail: format!("{id:?}"),
+        });
     }
 
     let phase = Phase::Tombstone {

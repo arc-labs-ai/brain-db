@@ -40,7 +40,7 @@ use super::StatementOpError;
 /// the prior row.
 pub fn statement_supersede(
     wtxn: &WriteTransaction,
-    _scope: RowScope,
+    scope: RowScope,
     session: brain_core::SessionId,
     old_id: StatementId,
     new_statement: &Statement,
@@ -54,11 +54,16 @@ pub fn statement_supersede(
         let row: Option<StatementMetadata> = t.get(&old_id.to_bytes())?.map(|g| g.value());
         row.ok_or(StatementOpError::NotFound(old_id))?
     };
-    // The old row's owning scope is authoritative — a supersede can never
-    // re-home a statement into a different tenant. The new row + every
-    // rewritten index key are stamped with this same scope. (The caller
-    // passes its scope for API symmetry; the row's own scope wins.)
-    let scope = old.scope();
+    // Tenant wall (authoritative). The old row's owning scope is adopted
+    // for the new row + every rewritten index key, so a caller from a
+    // different tenant could otherwise re-home its replacement into the
+    // victim's scope. The caller must own `old`; a row owned by another
+    // tenant reads as NotFound (no existence leak), exactly like a
+    // missing one. Once past this guard the caller scope and the row's
+    // own scope are identical, so adopting either is safe.
+    if scope != old.scope() {
+        return Err(StatementOpError::NotFound(old_id));
+    }
 
     // Pre-conditions.
     if old.is_tombstoned() {
@@ -684,6 +689,58 @@ mod tests {
         s.is_stateful = is_stateful;
         s
     }
+
+    #[test]
+    fn cross_scope_supersede_denied_no_row_in_victim_scope() {
+        // A caller in another tenant must not supersede a row it does not
+        // own: the mutator returns NotFound and stamps nothing in the
+        // victim's scope (the W3 re-home defence).
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "ada-xscope");
+        let pred = intern_fact(&mut db, "xscope_pred", /* is_stateful */ true);
+        let old = fresh_fact_value(subj, pred, "v1", true);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &old,
+            NOW_TEST,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+
+        let other_scope = RowScope::from_bytes(999, [0xCD; 16]);
+        let mut new = fresh_fact_value(subj, pred, "v2", true);
+        new.confidence = 0.5;
+        let new_id = new.id;
+        let wtxn = db.write_txn().unwrap();
+        let err = statement_supersede(
+            &wtxn,
+            other_scope,
+            brain_core::SessionId::DEFAULT,
+            old.id,
+            &new,
+            NOW_TEST + 500,
+        )
+        .expect_err("cross-scope supersede must be denied");
+        assert!(matches!(err, StatementOpError::NotFound(id) if id == old.id));
+        drop(wtxn);
+
+        let rtxn = db.read_txn().unwrap();
+        let old_got = crate::statement::crud::statement_get(&rtxn, old.id)
+            .unwrap()
+            .unwrap();
+        assert!(old_got.superseded_by.is_none(), "victim row must be intact");
+        assert!(
+            crate::statement::crud::statement_get(&rtxn, new_id)
+                .unwrap()
+                .is_none(),
+            "no replacement row may be stamped into the victim scope"
+        );
+    }
+
+    const NOW_TEST: u64 = 1_700_000_000_000_000_000;
 
     #[test]
     fn supersede_moves_predicate_bucket_to_new_row() {

@@ -339,6 +339,15 @@ pub async fn handle_statement_supersede(
 
     let old_id = StatementId::from(req.old_statement_id);
     let now = crate::txn::now_unix_nanos_pub();
+    // Tenant wall (early): a caller may only supersede a statement it
+    // owns. A foreign / absent id reads as NotFound before any predicate
+    // intern work. The apply-layer wall re-checks atomically.
+    if !statement_id_in_caller_scope(ctx, old_id) {
+        return Err(OpError::NotFound {
+            what: "statement",
+            detail: format!("{old_id:?}"),
+        });
+    }
     let (namespace, name) = split_qname(&req.new_statement.predicate)?;
 
     // Step A — pre-submit predicate resolution mirror of CREATE.
@@ -487,6 +496,15 @@ pub async fn handle_statement_tombstone(
     let id = StatementId::from(req.statement_id);
     let now = crate::txn::now_unix_nanos_pub();
 
+    // Tenant wall (early): a foreign / absent id reads as NotFound before
+    // the write is built. The apply-layer wall re-checks atomically.
+    if !statement_id_in_caller_scope(ctx, id) {
+        return Err(OpError::NotFound {
+            what: "statement",
+            detail: format!("{id:?}"),
+        });
+    }
+
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
@@ -556,6 +574,15 @@ pub async fn handle_statement_retract(
     decode_tombstone_reason(req.reason)?;
     let id = StatementId::from(req.statement_id);
     let now = crate::txn::now_unix_nanos_pub();
+
+    // Tenant wall (early): a foreign / absent id reads as NotFound before
+    // the write is built. The apply-layer wall re-checks atomically.
+    if !statement_id_in_caller_scope(ctx, id) {
+        return Err(OpError::NotFound {
+            what: "statement",
+            detail: format!("{id:?}"),
+        });
+    }
 
     // RETRACT shares the tombstone apply path; the wire distinction is
     // the post-commit behavior (drops the row from the lexical index
