@@ -3393,15 +3393,21 @@ fn run_apply_body(
     // accumulator drives the cross-memory budget gate separately.
     let (status_byte, reason) = decide_status(outcome, counts);
     let attempts = prior_attempts.saturating_add(1);
-    // A retryable failure is specifically the LLM tier failing (statements are
-    // LLM-only and a failed call wrote zero, so re-running can't duplicate
-    // them) with a transient cause. A TRANSIENT failure (timeout / rate-limit /
-    // 5xx) keeps the memory queued and is retried with backoff until it
-    // succeeds — a passing provider outage must never permanently strip a
-    // memory's grounding. A PERMANENT failure (bad key, no balance, malformed)
-    // is terminal at once: retrying can't help and only hides the problem.
-    // Pattern/classifier-only failures are never retried (their rows already
-    // committed; a re-run would duplicate).
+    // A retryable failure is specifically the LLM tier failing with a
+    // transient cause. A TRANSIENT failure (timeout / rate-limit / 5xx) keeps
+    // the memory queued and is retried with backoff until it succeeds — a
+    // passing provider outage must never permanently strip a memory's
+    // grounding. A PERMANENT failure (bad key, no balance, malformed) is
+    // terminal at once: retrying can't help and only hides the problem.
+    //
+    // A retry re-runs the whole pipeline, so the already-committed
+    // pattern/classifier-tier rows are re-applied. That is safe because
+    // relation/statement creation is content-idempotent at the apply layer:
+    // `relation_create` / `statement_create` no-op on a byte-identical active
+    // tuple rather than minting a duplicate (a user-declared pattern Relation
+    // with `Many` cardinality has no cardinality conflict to catch the repeat,
+    // so the content-dedup is what prevents the leak). Distinct multi-values
+    // still coexist; only exact re-applications collapse.
     let llm_failed = outcome.llm == brain_metadata::tier_status::FAILED;
     let failure_class_byte = match outcome.llm_failure_class {
         ExtractionFailureClass::Transient => brain_metadata::failure_class::TRANSIENT,

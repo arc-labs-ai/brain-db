@@ -142,6 +142,21 @@ pub fn statement_create(
         }
     }
 
+    // Content dedup for cumulative kinds. Single-valued kinds already
+    // returned above via supersession; what falls through here is Fact /
+    // Event / other cumulative kinds, where nothing collapses a
+    // byte-identical repeat. A transient LLM failure re-runs the whole
+    // extractor pipeline and re-applies already-committed pattern-tier
+    // rows, so an identical `(subject, predicate, object, event_at)`
+    // active row means this is a retry: no-op and return the existing id.
+    // Distinct objects (multi-valued Facts) and distinct event times
+    // (separate Events) never match, so legitimate cumulation is kept.
+    if let Some(e) = subject_entity {
+        if let Some(existing) = find_identical_active_statement(wtxn, scope, e, s)? {
+            return Ok(existing);
+        }
+    }
+
     // Fact contradiction probe (read-only; insert proceeds). Only for
     // entity subjects — memory subjects don't participate in the
     // entity-keyed contradiction index (and temporal events are Events,
@@ -618,6 +633,62 @@ fn find_current_statement(
     Ok(first)
 }
 
+/// Find an active statement byte-identical to `s` on its semantic
+/// identity — `(subject, predicate, kind, object, event_at)`.
+///
+/// Used to make cumulative-kind creation idempotent under extractor
+/// retries. Matching includes the object and event time, so distinct
+/// multi-values (different objects) and distinct events (different
+/// `event_at`) never collapse — only an exact repeat does.
+fn find_identical_active_statement(
+    wtxn: &WriteTransaction,
+    scope: RowScope,
+    subject: EntityId,
+    s: &Statement,
+) -> Result<Option<StatementId>, StatementOpError> {
+    let bys = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
+    let lo = (
+        scope.namespace_id,
+        scope.space_id_bytes,
+        subject.to_bytes(),
+        s.kind.as_u8(),
+        s.predicate.raw(),
+        1u8,
+        [0u8; 16],
+    );
+    let hi = (
+        scope.namespace_id,
+        scope.space_id_bytes,
+        subject.to_bytes(),
+        s.kind.as_u8(),
+        s.predicate.raw(),
+        1u8,
+        [0xffu8; 16],
+    );
+    let mut ids: Vec<[u8; 16]> = Vec::new();
+    for entry in bys.range(lo..=hi)? {
+        let (_, v) = entry?;
+        ids.push(v.value());
+    }
+    let st = wtxn.open_table(STATEMENTS_TABLE)?;
+    let self_bytes = s.id.to_bytes();
+    for id in ids {
+        if id == self_bytes {
+            continue;
+        }
+        let Some(m) = st.get(&id)?.map(|g| g.value()) else {
+            continue;
+        };
+        let Some(existing) = statement_from_metadata(&m) else {
+            continue;
+        };
+        if existing.object == s.object && existing.event_at_unix_nanos == s.event_at_unix_nanos {
+            return Ok(Some(existing.id));
+        }
+    }
+    Ok(None)
+}
+
 /// Write-txn variant used by the in-line contradiction probe so it
 /// reads uncommitted state inside the same transaction.
 fn load_active_facts_for_subject_predicate_wtxn(
@@ -1034,6 +1105,121 @@ mod tests {
             .get(&(sc.namespace_id, sc.space_id_bytes, s.id.to_bytes(), 1u32))
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn cumulative_fact_identical_reapply_is_noop() {
+        // On a transient LLM failure the extractor worker re-runs the whole
+        // pipeline and re-applies the already-committed cumulative-kind rows.
+        // An identical `(subject, predicate, object)` Fact must not leak a
+        // second active row: the create is a no-op returning the first id.
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "dup-subj");
+        let obj = make_entity(&mut db, "dup-obj");
+        let pred = intern_fact_entity_pred(&mut db, "role_dup");
+
+        let s1 = fresh_fact(subj, pred, obj);
+        let wtxn = db.write_txn().unwrap();
+        let id1 =
+            statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s1, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        // The retry: identical content, fresh StatementId.
+        let s2 = fresh_fact(subj, pred, obj);
+        assert_ne!(s1.id, s2.id);
+        let wtxn = db.write_txn().unwrap();
+        let id2 =
+            statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s2, 1).unwrap();
+        wtxn.commit().unwrap();
+
+        assert_eq!(id2, id1, "identical re-apply must return the existing id");
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_get(&rtxn, s2.id).unwrap().is_none());
+
+        let filter = StatementListFilter {
+            subject: Some(subj),
+            predicate: Some(pred),
+            kind: Some(StatementKind::Fact),
+            current_only: true,
+            ..Default::default()
+        };
+        let current = statement_list(&rtxn, test_scope(), &filter).unwrap();
+        assert_eq!(current.len(), 1, "retry must not add a second Fact row");
+        assert_eq!(current[0].id, s1.id);
+    }
+
+    #[test]
+    fn cumulative_fact_distinct_objects_coexist() {
+        // Dedup keys on the object, so two Facts with the same
+        // (subject, predicate) but DIFFERENT objects are genuine
+        // multi-values and both stay current.
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "multi-subj");
+        let obj_a = make_entity(&mut db, "obj-a");
+        let obj_b = make_entity(&mut db, "obj-b");
+        let pred = intern_fact_entity_pred(&mut db, "linked_role");
+
+        for obj in [obj_a, obj_b] {
+            let s = fresh_fact(subj, pred, obj);
+            let wtxn = db.write_txn().unwrap();
+            statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let filter = StatementListFilter {
+            subject: Some(subj),
+            predicate: Some(pred),
+            kind: Some(StatementKind::Fact),
+            current_only: true,
+            ..Default::default()
+        };
+        let current = statement_list(&rtxn, test_scope(), &filter).unwrap();
+        assert_eq!(current.len(), 2);
+    }
+
+    #[test]
+    fn event_distinct_times_coexist_identical_time_dedups() {
+        // Events are cumulative but distinguished by event time: two events
+        // with different `event_at` coexist, while re-applying an event with
+        // the same object AND time is a no-op (extractor retry).
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "event-subj");
+        let pred = intern_event_any_pred(&mut db, "scheduled_at");
+
+        let e1 = fresh_event(subj, pred, 1_700_000_100_000_000_000);
+        let e2 = fresh_event(subj, pred, 1_700_000_200_000_000_000);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e2, 1).unwrap();
+        wtxn.commit().unwrap();
+
+        // Retry of e1: same object, same event_at, fresh id → no-op.
+        let e1_retry = fresh_event(subj, pred, 1_700_000_100_000_000_000);
+        let wtxn = db.write_txn().unwrap();
+        let dup_id = statement_create(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &e1_retry,
+            2,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+
+        assert_eq!(dup_id, e1.id, "identical-time event retry is a no-op");
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_get(&rtxn, e1_retry.id).unwrap().is_none());
+
+        let filter = StatementListFilter {
+            subject: Some(subj),
+            predicate: Some(pred),
+            kind: Some(StatementKind::Event),
+            current_only: true,
+            ..Default::default()
+        };
+        let current = statement_list(&rtxn, test_scope(), &filter).unwrap();
+        assert_eq!(current.len(), 2, "two distinct-time events must coexist");
     }
 
     #[test]

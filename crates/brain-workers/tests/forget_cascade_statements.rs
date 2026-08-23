@@ -325,10 +325,16 @@ fn cascade_drains_multiple_pending_jobs() {
     upsert_memory(&fx.writer, m1);
     upsert_memory(&fx.writer, m2);
 
+    // Distinct subjects so the two statements are genuinely different rows.
+    // seed_statement writes the same object/predicate/kind for every call, so
+    // sharing a subject would make s1 and s2 byte-identical — statement_create
+    // legitimately dedups those into one row (extractor-retry idempotency),
+    // which is not what this cascade test means to exercise.
     let pred = intern_predicate(&fx.metadata, "prefers_color");
-    let subj = make_entity(&fx.metadata, "alice-many");
-    let s1 = seed_statement(&fx.metadata, pred, subj, vec![(m1, 0.7)]);
-    let s2 = seed_statement(&fx.metadata, pred, subj, vec![(m2, 0.7)]);
+    let subj1 = make_entity(&fx.metadata, "alice-many-1");
+    let subj2 = make_entity(&fx.metadata, "alice-many-2");
+    let s1 = seed_statement(&fx.metadata, pred, subj1, vec![(m1, 0.7)]);
+    let s2 = seed_statement(&fx.metadata, pred, subj2, vec![(m2, 0.7)]);
 
     tombstone_memory(&fx.writer, m1, TombstoneMode::Hard);
     tombstone_memory(&fx.writer, m2, TombstoneMode::Hard);

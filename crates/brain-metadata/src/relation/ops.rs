@@ -358,6 +358,19 @@ pub fn relation_create(
         to_insert.to_entity = b;
     }
 
+    // Content dedup: a transient LLM failure makes the extractor worker
+    // re-run the whole pipeline and re-apply the already-committed
+    // pattern-tier rows. Cardinality supersession only fires on the sides
+    // a `single`/`One*` cardinality constrains, so a `ManyToMany` (or the
+    // unconstrained side of a `*ToMany`) tuple has nothing to catch a
+    // byte-identical repeat and would leak a duplicate `(from, type, to)`
+    // edge. Skip the insert and return the existing id — a no-op. Distinct
+    // Many tuples (different `from`/`to`) never match here, so legitimate
+    // multi-values are preserved.
+    if let Some(existing) = find_identical_active_relation(wtxn, scope, &to_insert)? {
+        return Ok(existing);
+    }
+
     let conflicting = find_cardinality_conflicts(wtxn, scope, &to_insert, cardinality)?;
     match conflicting.len() {
         0 => {
@@ -641,6 +654,59 @@ fn find_cardinality_conflicts(
         )?;
     }
     Ok(found)
+}
+
+/// Find a byte-identical active relation for the exact `(from_entity,
+/// relation_type, to_entity)` tuple, regardless of cardinality.
+///
+/// Unlike [`find_cardinality_conflicts`], this matches on the full tuple
+/// (both endpoints), so it only ever fires on an exact repeat — never on a
+/// legitimately-distinct Many-cardinality edge that shares one endpoint.
+/// Used to make relation creation idempotent under extractor retries.
+fn find_identical_active_relation(
+    wtxn: &WriteTransaction,
+    scope: RowScope,
+    r: &Relation,
+) -> Result<Option<RelationId>, RelationOpError> {
+    let anchor = NodeRef::Entity(r.from_entity);
+    let target = NodeRef::Entity(r.to_entity);
+
+    let mut prefix = anchor.to_bytes().to_vec();
+    EdgeKindRef::Typed(r.relation_type).encode_into(&mut prefix);
+    let mut hi = prefix.clone();
+    hi.extend_from_slice(&[0xFF; 17 + 16]);
+
+    let table = wtxn.open_table(EDGES_TABLE)?;
+    let sidecar = wtxn.open_table(RELATION_METADATA_TABLE)?;
+    for entry in table.range::<&[u8]>(prefix.as_slice()..=hi.as_slice())? {
+        let (k, _) = entry?;
+        let key = edge::EdgeKey::decode(k.value())?;
+        if key.from != anchor {
+            continue;
+        }
+        if !matches!(key.kind, EdgeKindRef::Typed(rt) if rt == r.relation_type) {
+            continue;
+        }
+        if key.to != target {
+            continue;
+        }
+        let candidate = RelationId::from(key.disambiguator);
+        if candidate == r.id {
+            continue;
+        }
+        let Some(meta) = sidecar.get(&key.disambiguator)?.map(|g| g.value()) else {
+            continue;
+        };
+        // Same scope wall as the cardinality probe — a foreign-tenant edge
+        // surfaced by the shared table is not a duplicate of this one.
+        if meta.namespace_id != scope.namespace_id || meta.space_id_bytes != scope.space_id_bytes {
+            continue;
+        }
+        if meta.is_current() {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1466,13 +1532,17 @@ mod tests {
 
     #[test]
     fn many_to_many_no_supersession() {
+        // Two DISTINCT ManyToMany tuples that share the `from` endpoint but
+        // point at different `to` entities are genuine multi-values: both
+        // stay current, neither supersedes the other.
         let (_dir, mut db) = open_db();
         let a = make_entity(&mut db, "mm-a");
         let b = make_entity(&mut db, "mm-b");
+        let c = make_entity(&mut db, "mm-c");
         let t = intern_type(&mut db, "knows_mm", Cardinality::ManyToMany, false);
 
         let r1 = fresh_rel(t, a, b, false);
-        let r2 = fresh_rel(t, a, b, false);
+        let r2 = fresh_rel(t, a, c, false);
         let wtxn = db.write_txn().unwrap();
         relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r1, 0).unwrap();
         relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r2, 1).unwrap();
@@ -1483,6 +1553,85 @@ mod tests {
         let g2 = relation_get(&rtxn, r2.id).unwrap().unwrap();
         assert!(g1.superseded_by.is_none());
         assert!(g2.superseded_by.is_none());
+    }
+
+    #[test]
+    fn many_to_many_identical_reapply_is_noop() {
+        // A transient LLM failure makes the extractor worker re-run the whole
+        // pipeline, re-applying an already-committed pattern-tier ManyToMany
+        // relation with a freshly-minted RelationId. The exact same
+        // `(from, type, to)` tuple must NOT leak a second edge: the second
+        // create is a no-op returning the first row's id, and only one active
+        // row exists.
+        let (_dir, mut db) = open_db();
+        let a = make_entity(&mut db, "dup-a");
+        let b = make_entity(&mut db, "dup-b");
+        let t = intern_type(&mut db, "knows_dup", Cardinality::ManyToMany, false);
+
+        let r1 = fresh_rel(t, a, b, false);
+        let wtxn = db.write_txn().unwrap();
+        let id1 =
+            relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r1, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        // The retry: same tuple, different minted id.
+        let r2 = fresh_rel(t, a, b, false);
+        assert_ne!(r1.id, r2.id);
+        let wtxn = db.write_txn().unwrap();
+        let id2 =
+            relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r2, 1).unwrap();
+        wtxn.commit().unwrap();
+
+        // No-op: the create returns the pre-existing id and never files r2.
+        assert_eq!(id2, id1);
+        let rtxn = db.read_txn().unwrap();
+        assert!(relation_get(&rtxn, r2.id).unwrap().is_none());
+
+        let filter = RelationListFilter {
+            current_only: true,
+            ..Default::default()
+        };
+        let current = relation_list_from(&rtxn, test_scope(), a, &filter).unwrap();
+        assert_eq!(
+            current.len(),
+            1,
+            "identical retry must not add a second edge"
+        );
+        assert_eq!(current[0].id, r1.id);
+    }
+
+    #[test]
+    fn distinct_many_tuples_coexist_after_dedup() {
+        // Dedup must never collapse legitimately-distinct Many values: three
+        // different `to` entities on a ManyToMany type all stay current.
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "multi-subj");
+        let x = make_entity(&mut db, "multi-x");
+        let y = make_entity(&mut db, "multi-y");
+        let z = make_entity(&mut db, "multi-z");
+        let t = intern_type(&mut db, "linked_to", Cardinality::ManyToMany, false);
+
+        for (lsn, to) in [x, y, z].into_iter().enumerate() {
+            let r = fresh_rel(t, subj, to, false);
+            let wtxn = db.write_txn().unwrap();
+            relation_create(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &r,
+                lsn as u64,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let filter = RelationListFilter {
+            current_only: true,
+            ..Default::default()
+        };
+        let current = relation_list_from(&rtxn, test_scope(), subj, &filter).unwrap();
+        assert_eq!(current.len(), 3);
     }
 
     #[test]
