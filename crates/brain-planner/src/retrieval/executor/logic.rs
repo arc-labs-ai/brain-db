@@ -138,6 +138,12 @@ pub struct QueryMetadata {
     pub retriever_total_results: Vec<(Retriever, usize)>,
     pub filter_stats: FilterChainStats,
     pub total_latency_ms: f64,
+    /// The RRF smoothing constant `fuse()` actually used this execution.
+    /// For RRF this is [`adaptive_k`] applied to the real candidate-pool
+    /// size (not `plan.fusion.k`, which the executor overrides); for
+    /// non-RRF methods it is `plan.fusion.k`. Recorded so EXPLAIN/TRACE
+    /// render the k the engine fused at rather than the plan's nominal k.
+    pub effective_fusion_k: u32,
     /// Outcome of the always-on cross-encoder rerank stage. `None`
     /// means the cross-encoder isn't loaded on this shard (operator
     /// opted out, or no model on disk) so the result is RRF-only.
@@ -279,12 +285,72 @@ pub async fn execute(
             }
         }
         let retry = execute_once(&deepened, request, include_statements, trace_detail, ctx).await?;
-        if retry.items.len() > result.items.len() {
-            return Ok(retry);
-        }
+        // Union the two passes rather than swapping wholesale. The passes
+        // fuse at different adaptive_k (the deeper pool crosses a bucket
+        // boundary), so their orderings aren't comparable and `retry` is
+        // truncated to `limit` — a shallow survivor that ranks past `limit`
+        // under the deep ordering would be dropped even though `retry` is
+        // longer. Unioning keeps every shallow hit while filling the rest
+        // with the deeper pass, honouring the recall-additive invariant.
+        return Ok(union_deepened(result, retry, plan.limit as usize));
     }
 
     Ok(result)
+}
+
+/// Merge a shallow-pass result with a deeper-pass result so the deepening
+/// can never drop a hit the shallow pass already surfaced.
+///
+/// Invariant on entry: `shallow.items.len() < limit` (the deepening only
+/// runs when the shallow pass under-filled the request), so every shallow
+/// hit fits within `limit` alongside some deep-only fill.
+///
+/// The result preserves the deep pass's ordering for the items it keeps,
+/// then appends any shallow-only survivors the deep truncation dropped.
+/// Deep-only items past the remaining budget are cut first — never a
+/// shallow hit. Deterministic given deterministic input passes; the deep
+/// pass's metadata is retained (it reflects the richer execution).
+fn union_deepened(shallow: QueryResult, deep: QueryResult, limit: usize) -> QueryResult {
+    if limit == 0 {
+        return deep;
+    }
+    let shallow_ids: std::collections::HashSet<RankedItemId> =
+        shallow.items.iter().map(|f| f.id).collect();
+    // Reserve one slot per shallow hit; the rest is available to deep-only
+    // items, in deep order. `shallow_ids.len() < limit` by the entry
+    // invariant, so this budget is at least 1.
+    let deep_only_budget = limit.saturating_sub(shallow_ids.len());
+
+    let mut out: Vec<FusedItem> = Vec::with_capacity(limit);
+    let mut seen: std::collections::HashSet<RankedItemId> = std::collections::HashSet::new();
+    let mut deep_only_used = 0usize;
+    for item in deep.items {
+        if shallow_ids.contains(&item.id) {
+            // A shallow hit that the deep pass also surfaced — always keep,
+            // in the deep pass's (rank-appropriate) position.
+            seen.insert(item.id);
+            out.push(item);
+        } else if deep_only_used < deep_only_budget {
+            deep_only_used += 1;
+            seen.insert(item.id);
+            out.push(item);
+        }
+        // else: deep-only beyond budget — drop to reserve room for the
+        // shallow-only survivors appended below.
+    }
+    // Append shallow hits the deep pass dropped, preserving shallow order.
+    for item in shallow.items {
+        if !seen.contains(&item.id) {
+            out.push(item);
+        }
+    }
+
+    let mut metadata = deep.metadata;
+    metadata.filter_stats.after_limit = out.len() as u32;
+    QueryResult {
+        items: out,
+        metadata,
+    }
 }
 
 /// Try to upgrade a blind memory-from-semantic graph lane to an
@@ -515,22 +581,21 @@ async fn execute_once(
         }
     }
 
-    // Lexical-lane PROVENANCE tracking across the two read-time expansions.
-    // Both PRF and graph-expansion MERGE their hits into the lexical lane, so
-    // after them the fusion can no longer tell a genuine query-term match from a
-    // derived one. That distinction is load-bearing for honest abstention: a
-    // PRF hit is the SEMANTIC top-hits' own terms echoed back (circular — not
-    // independent evidence), whereas a graph-expansion hit is an independent
-    // typed-graph signal. Snapshot the lexical id-set before/after each pass so
-    // `correct_derived_lexical` (below, post-fusion) can re-tag accordingly.
-    let lex_ids =
-        |outs: &[(Retriever, Vec<RankedItem>)]| -> std::collections::HashSet<RankedItemId> {
-            outs.iter()
-                .find(|(r, _)| *r == Retriever::Lexical)
-                .map(|(_, v)| v.iter().map(|i| i.id).collect())
-                .unwrap_or_default()
-        };
-    let orig_lex_ids = lex_ids(&outputs);
+    // Lexical-lane PROVENANCE tracking for the PRF pass. PRF MERGES its
+    // hits into the lexical lane, so after it fusion can no longer tell a
+    // genuine query-term match from a derived one. That distinction is
+    // load-bearing for honest abstention: a PRF hit is the SEMANTIC
+    // top-hits' own terms echoed back (circular — not independent
+    // evidence). Snapshot the bare-query lexical id-set so
+    // `correct_derived_lexical` (below, post-fusion) can drop the echo tags.
+    // Graph expansion does NOT need snapshotting: it routes its hits into
+    // the GRAPH lane (see `maybe_apply_graph_expansion`), so those hits are
+    // tagged Graph by fusion directly and never enter the lexical lane.
+    let orig_lex_ids: std::collections::HashSet<RankedItemId> = outputs
+        .iter()
+        .find(|(r, _)| *r == Retriever::Lexical)
+        .map(|(_, v)| v.iter().map(|i| i.id).collect())
+        .unwrap_or_default();
 
     // Non-LLM read-time query expansion (pseudo-relevance feedback) for
     // the lexical lane. Fires only on low-specificity queries, where the
@@ -539,21 +604,15 @@ async fn execute_once(
     // hits and re-probes lexical. Fail-open: leaves `outputs` untouched
     // on any miss, so it can never regress a hit the bare pass found.
     maybe_apply_lexical_prf(&mut outputs, plan, request, ctx, include_statements);
-    let post_prf_lex_ids = lex_ids(&outputs);
 
     // Read-side multi-hop: walk the typed graph N hops from the cue's anchor
-    // and inject the connected entities' names into the lexical lane, so a
-    // question that names neither the bridge nor the answer entity ("Niraj's
-    // manager") still reaches the answer doc ("Meera … Infosys"). Pure graph +
-    // tantivy + RRF; no read-side LLM, no client knowledge of the graph.
+    // and inject the connected entities' names as an independent GRAPH lane,
+    // so a question that names neither the bridge nor the answer entity
+    // ("Niraj's manager") still reaches the answer doc ("Meera … Infosys").
+    // Pure graph + tantivy + RRF; no read-side LLM, no client knowledge of
+    // the graph.
     let graph_expanded =
         maybe_apply_graph_expansion(&mut outputs, plan, request, ctx, include_statements);
-    // Ids the graph walk (not PRF) added to the lexical lane — an independent
-    // graph signal, kept as corroboration (re-tagged Graph post-fusion).
-    let graph_lex_added: std::collections::HashSet<RankedItemId> = lex_ids(&outputs)
-        .difference(&post_prf_lex_ids)
-        .copied()
-        .collect();
 
     // Adaptive RRF k from the actual candidate-pool size (small pools →
     // smaller k → sharper top ranks). Falls back to the plan's k for
@@ -593,7 +652,7 @@ async fn execute_once(
     // filter, rerank, and the caller's corroboration/abstention) consumes it.
     // Edits only `contributing` (the lane tags); `fused_score` is untouched, so
     // recall/ranking from PRF and graph-expansion is preserved.
-    correct_derived_lexical(&mut fused, &orig_lex_ids, &graph_lex_added);
+    correct_derived_lexical(&mut fused, &orig_lex_ids);
     let fused_len = fused.len();
 
     // Full-detail trace: per-fused-item lane breakdown, captured right
@@ -766,6 +825,7 @@ async fn execute_once(
             retriever_total_results: totals,
             filter_stats,
             total_latency_ms,
+            effective_fusion_k: fusion_k,
             rerank: rerank_outcome,
             retriever_candidates,
             fusion_breakdown,
@@ -1255,48 +1315,35 @@ fn maybe_apply_lexical_prf(
     }
 }
 
-/// Correct the lexical provenance of fused items after read-time query
-/// expansion, so corroboration/abstention keys only on INDEPENDENT evidence.
+/// Correct the lexical provenance of fused items after the PRF pass, so
+/// corroboration/abstention keys only on INDEPENDENT evidence.
 ///
 /// A `Lexical` contribution is independent only when the query's OWN terms
-/// matched the doc (`id ∈ orig_lex_ids` — the bare BM25 pass). Two derived cases
-/// are demoted:
-///   * a graph-expansion hit (`id ∈ graph_lex_added`) is re-tagged `Graph` — a
-///     typed-graph walk is an independent signal, and multi-hop recall depends
-///     on it still corroborating; skipped if the item already carries a Graph
-///     lane (no double-count);
-///   * a PRF-only hit is the semantic top-hits' terms echoed back, so its
-///     lexical tag is dropped — counting a semantic echo as an independent lane
-///     is circular and is exactly what let an off-topic cue dodge abstention.
+/// matched the doc (`id ∈ orig_lex_ids` — the bare BM25 pass). Any other
+/// `Lexical` tag is a PRF-only hit: the semantic top-hits' terms echoed
+/// back, so its lexical tag is dropped — counting a semantic echo as an
+/// independent lane is circular and is exactly what let an off-topic cue
+/// dodge abstention.
 ///
-/// Only `contributing` (the provenance used for corroboration, consensus, and
-/// display) is edited; `fused_score` is left intact, so PRF/graph-expansion keep
-/// boosting recall/ranking unchanged.
+/// Graph-expansion hits need no handling here: they are routed into the
+/// GRAPH lane upstream (`maybe_apply_graph_expansion`), so fusion already
+/// tags them `Graph`. Dropping a PRF-echo `Lexical` tag never strips that
+/// independent `Graph` tag.
+///
+/// Only `contributing` (the provenance used for corroboration, consensus,
+/// and display) is edited; `fused_score` is left intact, so PRF and
+/// graph-expansion keep boosting recall/ranking unchanged.
 fn correct_derived_lexical(
     fused: &mut [FusedItem],
     orig_lex_ids: &std::collections::HashSet<RankedItemId>,
-    graph_lex_added: &std::collections::HashSet<RankedItemId>,
 ) {
     for f in fused.iter_mut() {
         if orig_lex_ids.contains(&f.id) {
             continue; // genuine query-term lexical hit — independent, keep it
         }
-        let promote_to_graph = graph_lex_added.contains(&f.id)
-            && !f
-                .contributing
-                .iter()
-                .any(|c| c.retriever == Retriever::Graph);
-        f.contributing.retain_mut(|c| {
-            if c.retriever != Retriever::Lexical {
-                return true;
-            }
-            if promote_to_graph {
-                c.retriever = Retriever::Graph;
-                true
-            } else {
-                false // PRF echo (or graph-expansion dup) — not independent
-            }
-        });
+        // Any remaining Lexical tag is a PRF echo — not independent evidence.
+        // Other lanes (Semantic, Graph) are untouched.
+        f.contributing.retain(|c| c.retriever != Retriever::Lexical);
     }
 }
 
