@@ -24,6 +24,7 @@ use brain_metadata::relation::types::relation_type_lookup_by_qname;
 use brain_metadata::schema::apply::{declared_object_entity_type, object_type_constraint_byte};
 use brain_metadata::schema::predicate::predicate_lookup_by_qname;
 use brain_metadata::schema::store::{schema_active, schema_get, schema_list, SchemaStoreError};
+use brain_metadata::system_schema::SYSTEM_SCHEMA_NAMESPACE;
 use brain_planner::WriterError;
 use brain_protocol::envelope::response::EventType;
 use brain_protocol::schema::{parse_schema, validate, ParseError, ValidationError};
@@ -75,6 +76,21 @@ pub async fn handle_schema_upload(
         }
     };
     let namespace = validated.as_schema().namespace.clone();
+
+    // 2a. Tenant binding. A caller may only declare schema for their own
+    //     namespace. Reject a DSL that targets any other namespace before
+    //     consulting persisted state, so a cross-tenant upload can't use
+    //     the merge-conflict response as an existence oracle for the
+    //     foreign namespace's declarations. The seeded `brain` system
+    //     namespace is never a user's own name (dispatch refuses a caller
+    //     that resolves to SYSTEM), so this also blocks writing the system
+    //     schema.
+    let caller_name = caller_namespace_name(ctx)?;
+    if namespace != caller_name {
+        return Err(OpError::Unauthorized(format!(
+            "schema_upload: caller in namespace {caller_name:?} cannot declare schema for namespace {namespace:?}"
+        )));
+    }
 
     // 3. Dry-run → don't persist.
     if req.dry_run {
@@ -192,6 +208,18 @@ pub async fn handle_schema_get(
             "schema_get: namespace must be non-empty".into(),
         ));
     }
+    // Tenant binding. A caller may read only their own namespace or the
+    // always-public `brain` system namespace. For any other namespace,
+    // return the same `NotFound` a caller would see for a genuinely
+    // absent schema, so the response can't distinguish "foreign namespace
+    // exists" from "foreign namespace doesn't exist".
+    let caller_name = caller_namespace_name(ctx)?;
+    if !caller_may_read_namespace(&caller_name, &req.namespace) {
+        return Err(OpError::NotFound {
+            what: "schema",
+            detail: format!("no active schema for namespace {:?}", req.namespace),
+        });
+    }
     let rtxn = ctx
         .executor
         .metadata
@@ -238,6 +266,21 @@ pub async fn handle_schema_list(
         return Err(OpError::InvalidRequest(
             "schema_list: namespace must be non-empty".into(),
         ));
+    }
+    // Tenant binding. A caller may list only their own namespace or the
+    // always-public `brain` system namespace. For any other namespace,
+    // return the empty-list shape a caller would see for a namespace with
+    // no declared schema, so the response can't be used as an existence
+    // oracle for a foreign tenant's declarations.
+    let caller_name = caller_namespace_name(ctx)?;
+    if !caller_may_read_namespace(&caller_name, &req.namespace) {
+        return Ok(SchemaListResponseFrame {
+            namespace: req.namespace,
+            items: Vec::new(),
+            total: 0,
+            next_cursor: Vec::new(),
+            is_final: true,
+        });
     }
     let rows = {
         let rtxn = ctx
@@ -360,6 +403,34 @@ fn map_writer_err(err: WriterError) -> OpError {
         WriterError::Overloaded => OpError::Overloaded("writer overloaded".into()),
         WriterError::Internal(msg) => OpError::Internal(msg),
     }
+}
+
+/// Resolve the authenticated caller's namespace id to its registered
+/// name, for comparison against a client-supplied namespace string. The
+/// caller namespace is interned at dispatch time, so a live request
+/// always has a registry row; a miss is an internal invariant break
+/// (surfaced as `Internal`, never as a client-visible authz bypass).
+pub(crate) fn caller_namespace_name(ctx: &OpsContext) -> Result<String, OpError> {
+    let caller = ctx.executor.caller_namespace;
+    let rtxn = ctx
+        .executor
+        .metadata
+        .read_txn()
+        .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
+    brain_metadata::namespace::namespace_name(&rtxn, caller)
+        .map_err(|e| OpError::Internal(format!("namespace_name lookup: {e}")))?
+        .ok_or_else(|| {
+            OpError::Internal(format!(
+                "caller namespace id {} has no registry row",
+                caller.raw()
+            ))
+        })
+}
+
+/// True when the client-supplied namespace is one the caller may read:
+/// their own tenant, or the always-public `brain` system namespace.
+fn caller_may_read_namespace(caller_name: &str, requested: &str) -> bool {
+    requested == caller_name || requested == SYSTEM_SCHEMA_NAMESPACE
 }
 
 fn current_active(ctx: &OpsContext, namespace: &str) -> Result<Option<u32>, OpError> {
@@ -676,6 +747,229 @@ fn map_extractor_kind_byte(k: ExtractorKindAst) -> u8 {
 mod tests {
     use super::*;
     use brain_protocol::schema::{SourceSpan, ValidationErrorCode};
+
+    // -----------------------------------------------------------------
+    // Tenant-binding tests. These drive the handlers directly with a
+    // caller-namespace-stamped ctx (no dispatch layer), matching the
+    // schema_replace handler tests.
+    // -----------------------------------------------------------------
+    mod tenant {
+        use super::super::*;
+        use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
+        use brain_index::{IndexParams, SharedHnsw};
+        use brain_metadata::schema::store::schema_upload;
+        use brain_metadata::MetadataDb;
+        use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
+        use brain_protocol::{SchemaGetRequest, SchemaListRequest, SchemaUploadRequest};
+        use std::sync::Arc;
+
+        struct MockDispatcher;
+        impl Dispatcher for MockDispatcher {
+            fn embed(&self, _t: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+                Ok([0.0; VECTOR_DIM])
+            }
+            fn embed_batch(&self, texts: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+                Ok(texts.iter().map(|_| [0.0; VECTOR_DIM]).collect())
+            }
+            fn embed_query(&self, _t: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+                Ok([0.0; VECTOR_DIM])
+            }
+            fn fingerprint(&self) -> [u8; 16] {
+                [0xAB; 16]
+            }
+        }
+
+        const ACME_V1: &str =
+            "namespace acme\ndefine predicate prefers { kind: Preference object: Value<text> }\n";
+        const OTHER_V1: &str =
+            "namespace other\ndefine predicate dislikes { kind: Preference object: Value<text> }\n";
+
+        /// Build a ctx whose authenticated caller is bound to `caller_ns`,
+        /// interning it so the tenant-binding guard resolves its name.
+        fn build_ctx_for(caller_ns: &str) -> (tempfile::TempDir, OpsContext, SharedMetadataDb) {
+            let dir = tempfile::tempdir().unwrap();
+            let metadata: SharedMetadataDb =
+                Arc::new(MetadataDb::open(dir.path().join("meta.redb")).unwrap());
+            let ns_id = {
+                let wtxn = metadata.write_txn().unwrap();
+                let id = brain_metadata::namespace::namespace_intern_or_get(&wtxn, caller_ns, 0)
+                    .unwrap();
+                wtxn.commit().unwrap();
+                id
+            };
+            let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
+            let writer = Arc::new(crate::writer::RealWriterHandle::new(
+                metadata.clone(),
+                hnsw_writer,
+            ));
+            let executor = ExecutorContext::new(
+                Arc::new(MockDispatcher) as Arc<dyn Dispatcher>,
+                shared,
+                metadata.clone(),
+                writer as Arc<dyn WriterHandle>,
+            )
+            .with_caller_namespace(ns_id);
+            let ctx = crate::test_support::ops_context_for_tests(executor, dir.path());
+            (dir, ctx, metadata)
+        }
+
+        /// Seed an active schema directly through the storage helper so a
+        /// read path has rows to (not) find.
+        fn seed_schema(metadata: &SharedMetadataDb, doc: &str) {
+            let parsed = parse_schema(doc).unwrap();
+            let validated = validate(&parsed).unwrap();
+            let wtxn = metadata.write_txn().unwrap();
+            schema_upload(&wtxn, &validated, 1).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        fn upload_req(doc: &str) -> SchemaUploadRequest {
+            SchemaUploadRequest {
+                schema_document: doc.into(),
+                allow_breaking: false,
+                dry_run: false,
+                request_id: [1u8; 16],
+            }
+        }
+
+        #[tokio::test]
+        async fn same_namespace_upload_succeeds() {
+            let (_dir, ctx, _md) = build_ctx_for("acme");
+            let resp = handle_schema_upload(upload_req(ACME_V1), &ctx)
+                .await
+                .expect("same-namespace upload");
+            assert!(resp.validation_errors.is_empty());
+            assert_eq!(resp.namespace, "acme");
+            assert!(resp.schema_version >= 1);
+        }
+
+        #[tokio::test]
+        async fn cross_namespace_upload_is_rejected_and_creates_nothing() {
+            // Caller bound to `acme`; the DSL targets `other`.
+            let (_dir, ctx, metadata) = build_ctx_for("acme");
+            let err = handle_schema_upload(upload_req(OTHER_V1), &ctx)
+                .await
+                .expect_err("cross-namespace upload must be rejected");
+            assert!(
+                matches!(err, OpError::Unauthorized(_)),
+                "expected Unauthorized, got {err:?}"
+            );
+            // No schema landed for the foreign namespace.
+            let rtxn = metadata.read_txn().unwrap();
+            assert_eq!(
+                schema_active(&rtxn, "other").unwrap(),
+                None,
+                "a rejected cross-namespace upload must not create foreign schema"
+            );
+        }
+
+        #[tokio::test]
+        async fn cross_namespace_get_is_notfound_indistinguishable_from_absent() {
+            let (_dir, ctx, metadata) = build_ctx_for("acme");
+            // Foreign namespace `other` HAS an active schema.
+            seed_schema(&metadata, OTHER_V1);
+
+            let existing_foreign = handle_schema_get(
+                SchemaGetRequest {
+                    namespace: "other".into(),
+                    version: 0,
+                },
+                &ctx,
+            )
+            .await
+            .expect_err("cross-namespace get must not return a foreign row");
+            assert!(matches!(existing_foreign, OpError::NotFound { .. }));
+
+            // A foreign namespace that has NO schema yields the same shape.
+            let absent_foreign = handle_schema_get(
+                SchemaGetRequest {
+                    namespace: "never_existed".into(),
+                    version: 0,
+                },
+                &ctx,
+            )
+            .await
+            .expect_err("absent foreign get must be NotFound");
+            assert!(matches!(absent_foreign, OpError::NotFound { .. }));
+        }
+
+        #[tokio::test]
+        async fn cross_namespace_list_is_empty() {
+            let (_dir, ctx, metadata) = build_ctx_for("acme");
+            seed_schema(&metadata, OTHER_V1); // foreign has a schema version
+
+            let resp = handle_schema_list(
+                SchemaListRequest {
+                    namespace: "other".into(),
+                    limit: 0,
+                    cursor: Vec::new(),
+                },
+                &ctx,
+            )
+            .await
+            .expect("list returns a frame");
+            assert_eq!(resp.total, 0, "foreign namespace must list as empty");
+            assert!(resp.items.is_empty());
+        }
+
+        #[tokio::test]
+        async fn same_namespace_get_and_list_work() {
+            let (_dir, ctx, metadata) = build_ctx_for("acme");
+            seed_schema(&metadata, ACME_V1);
+
+            let got = handle_schema_get(
+                SchemaGetRequest {
+                    namespace: "acme".into(),
+                    version: 0,
+                },
+                &ctx,
+            )
+            .await
+            .expect("own-namespace get");
+            assert_eq!(got.namespace, "acme");
+
+            let listed = handle_schema_list(
+                SchemaListRequest {
+                    namespace: "acme".into(),
+                    limit: 0,
+                    cursor: Vec::new(),
+                },
+                &ctx,
+            )
+            .await
+            .expect("own-namespace list");
+            assert!(listed.total >= 1, "own namespace lists its schema versions");
+        }
+
+        #[tokio::test]
+        async fn system_namespace_is_readable_by_any_caller() {
+            // MetadataDb::open seeds the `brain` system schema at v1.
+            let (_dir, ctx, _md) = build_ctx_for("acme");
+
+            let got = handle_schema_get(
+                SchemaGetRequest {
+                    namespace: SYSTEM_SCHEMA_NAMESPACE.into(),
+                    version: 0,
+                },
+                &ctx,
+            )
+            .await
+            .expect("system namespace must be readable by any caller");
+            assert_eq!(got.namespace, SYSTEM_SCHEMA_NAMESPACE);
+
+            let listed = handle_schema_list(
+                SchemaListRequest {
+                    namespace: SYSTEM_SCHEMA_NAMESPACE.into(),
+                    limit: 0,
+                    cursor: Vec::new(),
+                },
+                &ctx,
+            )
+            .await
+            .expect("system namespace list readable by any caller");
+            assert!(listed.total >= 1);
+        }
+    }
 
     #[test]
     fn check_document_cap_rejects_empty_and_oversized() {

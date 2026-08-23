@@ -108,6 +108,21 @@ pub async fn handle_schema_replace(
     };
     let namespace = validated.as_schema().namespace.clone();
 
+    // 3a. Tenant binding. A caller may destructively replace schema only
+    //     for their own namespace. Reject a DSL targeting any other
+    //     namespace before opening the write txn, so a cross-tenant
+    //     replace can neither mutate a foreign tenant's declared
+    //     vocabulary nor use the `dropped_count` / conflict response as an
+    //     existence oracle. The seeded `brain` system namespace is never a
+    //     user's own name (dispatch refuses a caller that resolves to
+    //     SYSTEM), so this also blocks replacing the system schema.
+    let caller_name = crate::handlers::schema::caller_namespace_name(ctx)?;
+    if namespace != caller_name {
+        return Err(OpError::Unauthorized(format!(
+            "schema_replace: caller in namespace {caller_name:?} cannot replace schema for namespace {namespace:?}"
+        )));
+    }
+
     // 4. Idempotency key + request digest, derived exactly like the
     //    unified write path (`WriteId::from_request` + a per-op BLAKE3
     //    request hash). A retried SCHEMA_REPLACE carries the same
@@ -268,10 +283,21 @@ mod tests {
     const V3: &str =
         "namespace acme\ndefine predicate loves { kind: Preference object: Value<text> }\n";
 
-    fn build_ctx() -> (tempfile::TempDir, OpsContext, SharedMetadataDb) {
+    /// Build a ctx whose authenticated caller is bound to the given
+    /// namespace, interning it so the tenant-binding guard can resolve its
+    /// name. The `acme` schemas seeded by these tests are declared under
+    /// that same namespace, so the replace guard admits them.
+    fn build_ctx_for(caller_ns: &str) -> (tempfile::TempDir, OpsContext, SharedMetadataDb) {
         let dir = tempfile::tempdir().unwrap();
         let metadata: SharedMetadataDb =
             Arc::new(MetadataDb::open(dir.path().join("meta.redb")).unwrap());
+        let ns_id = {
+            let wtxn = metadata.write_txn().unwrap();
+            let id =
+                brain_metadata::namespace::namespace_intern_or_get(&wtxn, caller_ns, 0).unwrap();
+            wtxn.commit().unwrap();
+            id
+        };
         let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
         let writer = Arc::new(crate::writer::RealWriterHandle::new(
             metadata.clone(),
@@ -282,9 +308,14 @@ mod tests {
             shared,
             metadata.clone(),
             writer as Arc<dyn WriterHandle>,
-        );
+        )
+        .with_caller_namespace(ns_id);
         let ctx = crate::test_support::ops_context_for_tests(executor, dir.path());
         (dir, ctx, metadata)
+    }
+
+    fn build_ctx() -> (tempfile::TempDir, OpsContext, SharedMetadataDb) {
+        build_ctx_for("acme")
     }
 
     /// Seed an initial active schema directly through the storage helper
@@ -341,6 +372,30 @@ mod tests {
             active(&metadata),
             version_after_first,
             "replay must not bump the schema version a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_namespace_replace_is_rejected_without_mutation() {
+        // Caller bound to `other`; the DSL declares `acme`. The replace
+        // must be refused as Unauthorized before any drop/re-upload, and
+        // acme's seeded schema must survive untouched.
+        let (_dir, ctx, metadata) = build_ctx_for("other");
+        seed_schema(&metadata, V1); // acme active version 1
+        let before = active(&metadata);
+        assert_eq!(before, Some(1));
+
+        let err = handle_schema_replace(replace_req(V2, [3u8; 16]), &ctx)
+            .await
+            .expect_err("cross-namespace replace must be rejected");
+        assert!(
+            matches!(err, OpError::Unauthorized(_)),
+            "expected Unauthorized, got {err:?}"
+        );
+        assert_eq!(
+            active(&metadata),
+            before,
+            "a rejected cross-namespace replace must not mutate the foreign schema"
         );
     }
 
