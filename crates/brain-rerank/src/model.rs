@@ -15,6 +15,7 @@
 //! [`XLMRobertaForSequenceClassification`], which owns the backbone
 //! and the classification head; loading and scoring stay thin.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
@@ -35,6 +36,19 @@ const WEIGHTS_FILE: &str = "model.safetensors";
 /// with a 512-token cap; we mirror that.
 pub const DEFAULT_MAX_TOKEN_LEN: usize = 512;
 
+/// Special tokens the tokenizer injects around a `(query, passage)`
+/// pair (`<s> query </s></s> passage </s>`): four added tokens. The
+/// tokenizer subtracts this from `max_length` before truncating, so
+/// the real content budget for a pair is `max_len - PAIR_SPECIAL_TOKENS`.
+const PAIR_SPECIAL_TOKENS: usize = 4;
+
+/// Passage token budget reserved when clamping an over-long query, so
+/// the cross-encoder always scores the query against a non-empty
+/// passage and `OnlySecond` always has room to trim rather than
+/// erroring with `SequenceTooShort`. Also absorbs any small
+/// decode/re-encode drift from the clamp round-trip.
+const MIN_PASSAGE_BUDGET: usize = 8;
+
 /// Truncation parameters for a `(query, passage)` cross-encoder.
 ///
 /// Pairs are built as `(query, candidate)` in [`CrossEncoder::score_pairs`],
@@ -54,6 +68,75 @@ pub(crate) fn truncation_params(max_len: usize) -> TruncationParams {
         stride: 0,
         direction: tokenizers::TruncationDirection::Right,
     }
+}
+
+/// Resolve the pad `(id, token)` used to fill batch rows.
+///
+/// Prefer the tokenizer's own padding config when present; otherwise
+/// fall back to the model's `pad_token_id` (id 1 = `<pad>` for
+/// XLM-RoBERTa) rather than 0 (`<s>`). A stock bge-reranker-base
+/// `tokenizer.json` configures no padding, so the old `0` fallback
+/// filled batches with the sentence-start token — benign only because
+/// the attention mask zeroes pad positions, but wrong on its face.
+pub(crate) fn resolve_pad_params(
+    tokenizer_padding: Option<(u32, String)>,
+    config_pad_token_id: u32,
+) -> (u32, String) {
+    tokenizer_padding.unwrap_or_else(|| (config_pad_token_id, "<pad>".to_string()))
+}
+
+/// Clamp an over-long query so it can never overflow `max_len` and
+/// poison the whole rerank batch.
+///
+/// The batch tokenizer trims the *passage* (`OnlySecond`), so a query
+/// that alone tokenizes beyond the pair's content budget would leave
+/// nothing to trim and fail `encode_batch` atomically — collapsing
+/// rerank to RRF-only for the entire request. Here we measure the
+/// query with a truncation-free `probe` tokenizer, and if it exceeds
+/// the budget we truncate its token ids and decode them back to a
+/// bounded query string. The budget reserves room for the pair's
+/// special tokens plus a minimum passage, so `OnlySecond` always has
+/// something to trim.
+///
+/// Normal-length queries are returned untouched (`Cow::Borrowed`), so
+/// their tokenisation is byte-identical to before this guard existed.
+pub(crate) fn clamp_query_tokens<'q>(
+    probe: &Tokenizer,
+    query: &'q str,
+    max_len: usize,
+) -> Cow<'q, str> {
+    let budget = max_len.saturating_sub(PAIR_SPECIAL_TOKENS + MIN_PASSAGE_BUDGET);
+    if budget == 0 {
+        return Cow::Borrowed(query);
+    }
+    // `false` = no special tokens: measure the raw query tokens only.
+    let ids = match probe.encode(query, false) {
+        Ok(enc) => enc.get_ids().to_vec(),
+        // If measurement fails, leave the query as-is; the batch path
+        // surfaces any genuine tokenisation error.
+        Err(_) => return Cow::Borrowed(query),
+    };
+    if ids.len() <= budget {
+        return Cow::Borrowed(query);
+    }
+    match probe.decode(&ids[..budget], true) {
+        Ok(s) => Cow::Owned(s),
+        Err(_) => Cow::Borrowed(query),
+    }
+}
+
+/// Reject any non-finite logit, symmetric with the embed path's
+/// NaN/Inf guard. A single non-finite score would corrupt the
+/// caller's re-sort (NaN compares false in every direction) and
+/// propagate through the normalized-fused / `alpha * logit` blend.
+pub(crate) fn check_finite_scores(scores: &[f32]) -> Result<(), RerankError> {
+    if let Some(i) = scores.iter().position(|s| !s.is_finite()) {
+        return Err(RerankError::NumericFailure(format!(
+            "logit {i} is non-finite ({})",
+            scores[i]
+        )));
+    }
+    Ok(())
 }
 
 /// Errors raised by the cross-encoder loader / scorer. Hot-path
@@ -92,6 +175,9 @@ pub enum RerankError {
     #[error("rerank score had unexpected shape: {0}")]
     BadShape(String),
 
+    #[error("rerank score was non-finite (NaN or Inf): {0}")]
+    NumericFailure(String),
+
     #[error("rerank service thread is unavailable (shut down or panicked)")]
     ServiceUnavailable,
 }
@@ -102,6 +188,11 @@ pub enum RerankError {
 pub struct CrossEncoder {
     model: XLMRobertaForSequenceClassification,
     tokenizer: Tokenizer,
+    /// Truncation/padding-free clone of `tokenizer`, used only to
+    /// measure and clamp an over-long query (see [`clamp_query_tokens`]).
+    /// The batch tokenizer trims the passage (`OnlySecond`), which
+    /// cannot measure the query in isolation without erroring.
+    query_probe: Tokenizer,
     device: Device,
     max_len: usize,
 }
@@ -134,10 +225,12 @@ impl CrossEncoder {
         // the offset is applied inside the embeddings, so 512 real
         // tokens stay in-bounds.
         let max_len = std::cmp::min(model_config.max_position_embeddings, DEFAULT_MAX_TOKEN_LEN);
-        let (pad_id, pad_token) = tokenizer
-            .get_padding()
-            .map(|p| (p.pad_id, p.pad_token.clone()))
-            .unwrap_or((0, "[PAD]".to_string()));
+        let (pad_id, pad_token) = resolve_pad_params(
+            tokenizer
+                .get_padding()
+                .map(|p| (p.pad_id, p.pad_token.clone())),
+            model_config.pad_token_id,
+        );
         tokenizer.with_padding(Some(PaddingParams {
             strategy: tokenizers::PaddingStrategy::BatchLongest,
             direction: tokenizers::PaddingDirection::Right,
@@ -149,6 +242,15 @@ impl CrossEncoder {
         tokenizer
             .with_truncation(Some(truncation_params(max_len)))
             .map_err(|e| RerankError::TokenizerParse(e.to_string()))?;
+
+        // A truncation/padding-free clone used solely to measure a
+        // query's true token length when clamping (the batch tokenizer's
+        // `OnlySecond` errors on a lone over-long sequence).
+        let mut query_probe = tokenizer.clone();
+        query_probe
+            .with_truncation(None)
+            .map_err(|e| RerankError::TokenizerParse(e.to_string()))?;
+        query_probe.with_padding(None);
 
         let weights_path = dir.join(WEIGHTS_FILE);
         if !weights_path.is_file() {
@@ -179,6 +281,7 @@ impl CrossEncoder {
         Ok(Self {
             model,
             tokenizer,
+            query_probe,
             device,
             max_len,
         })
@@ -195,6 +298,12 @@ impl CrossEncoder {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
+
+        // Clamp an over-long query so a single pathological cue cannot
+        // fail the atomic `encode_batch` and silently drop rerank to
+        // RRF-only for every candidate. Normal queries pass through
+        // untouched.
+        let query = clamp_query_tokens(&self.query_probe, query, self.max_len);
 
         // Build `(query, candidate)` pairs. bge-reranker's tokenizer
         // injects `<s> query </s></s> candidate </s>`; XLM-RoBERTa
@@ -259,6 +368,7 @@ impl CrossEncoder {
                 scores.len()
             )));
         }
+        check_finite_scores(&scores)?;
         Ok(scores)
     }
 
@@ -421,6 +531,114 @@ mod tests {
             result.is_err(),
             "OnlyFirst must fail on a short-query/long-passage pair (SequenceTooShort)"
         );
+    }
+
+    /// Build a truncation/padding-free probe tokenizer (mirrors the
+    /// `query_probe` built in [`CrossEncoder::load`]).
+    fn build_probe_tokenizer(max_len: usize) -> Tokenizer {
+        let mut probe = build_pair_tokenizer(max_len, tokenizers::TruncationStrategy::OnlySecond);
+        probe.with_truncation(None).expect("disable truncation");
+        probe.with_padding(None);
+        probe
+    }
+
+    #[test]
+    fn overlong_query_is_clamped_and_does_not_poison_batch() {
+        let max_len = 32;
+        let batch_tok = build_pair_tokenizer(max_len, tokenizers::TruncationStrategy::OnlySecond);
+        let probe = build_probe_tokenizer(max_len);
+
+        // A query that alone tokenizes far past the cap.
+        let long_query = vec!["cat"; 200].join(" ");
+
+        // (a) Baseline: WITHOUT clamping, the raw over-long query poisons
+        //     the atomic batch — this is the RR1 bug.
+        let raw_pairs = vec![(long_query.clone(), "stripe".to_string())];
+        assert!(
+            batch_tok.encode_batch(raw_pairs, true).is_err(),
+            "raw over-long query must fail encode_batch (reproduces the bug)"
+        );
+
+        // (b) After clamping, the query shrinks...
+        let clamped = clamp_query_tokens(&probe, &long_query, max_len);
+        assert!(
+            matches!(clamped, Cow::Owned(_)),
+            "an over-long query must be clamped (owned)"
+        );
+        assert!(
+            probe
+                .encode(clamped.as_ref(), false)
+                .expect("encode clamped")
+                .get_ids()
+                .len()
+                <= max_len.saturating_sub(PAIR_SPECIAL_TOKENS + MIN_PASSAGE_BUDGET),
+            "clamped query must fit the reserved budget"
+        );
+
+        // (c) ...and the clamped query paired with candidates encodes
+        //     cleanly — one encoding per candidate, no batch failure.
+        let cands = ["stripe", "where does alice work"];
+        let pairs: Vec<(String, String)> = cands
+            .iter()
+            .map(|c| (clamped.to_string(), (*c).to_string()))
+            .collect();
+        let batch = batch_tok
+            .encode_batch(pairs, true)
+            .expect("clamped query must not poison the batch");
+        assert_eq!(batch.len(), cands.len(), "one encoding per candidate");
+        for enc in &batch {
+            assert!(
+                enc.get_ids().len() <= max_len,
+                "each encoding must respect the cap"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_query_is_returned_byte_identical() {
+        let max_len = 32;
+        let probe = build_probe_tokenizer(max_len);
+        let q = "where does alice work";
+        let clamped = clamp_query_tokens(&probe, q, max_len);
+        assert!(
+            matches!(clamped, Cow::Borrowed(_)),
+            "a normal query must not be reallocated"
+        );
+        assert_eq!(clamped.as_ref(), q, "normal query must be byte-identical");
+    }
+
+    #[test]
+    fn check_finite_scores_accepts_finite_and_rejects_non_finite() {
+        assert!(check_finite_scores(&[]).is_ok());
+        assert!(check_finite_scores(&[-3.5, 0.0, 12.25]).is_ok());
+
+        match check_finite_scores(&[1.0, f32::NAN, 2.0]) {
+            Err(RerankError::NumericFailure(msg)) => assert!(msg.contains("logit 1")),
+            other => panic!("expected NumericFailure on NaN, got {other:?}"),
+        }
+        match check_finite_scores(&[f32::INFINITY]) {
+            Err(RerankError::NumericFailure(msg)) => assert!(msg.contains("logit 0")),
+            other => panic!("expected NumericFailure on Inf, got {other:?}"),
+        }
+        assert!(matches!(
+            check_finite_scores(&[f32::NEG_INFINITY]),
+            Err(RerankError::NumericFailure(_))
+        ));
+    }
+
+    #[test]
+    fn pad_falls_back_to_config_pad_token_id_not_zero() {
+        // Stock bge-reranker-base tokenizer has no padding configured →
+        // None. We must fall back to config.pad_token_id (1 = <pad>),
+        // never the old 0 (<s>).
+        let (id, tok) = resolve_pad_params(None, 1);
+        assert_eq!(id, 1, "pad id must come from config.pad_token_id, not 0");
+        assert_eq!(tok, "<pad>");
+
+        // An explicit tokenizer padding config wins over the fallback.
+        let (id2, tok2) = resolve_pad_params(Some((7, "[PAD]".to_string())), 1);
+        assert_eq!(id2, 7);
+        assert_eq!(tok2, "[PAD]");
     }
 
     #[test]
