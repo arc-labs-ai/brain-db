@@ -55,6 +55,14 @@ impl Default for WalConfig {
 /// Per-shard WAL handle. `!Send` / `!Sync` — lives on one Glommio executor.
 pub struct Wal {
     inner: RefCell<WalInner>,
+    /// Serializes segment rollover. A task performing rollover holds this
+    /// permit for the whole (drain old → create new → install new) sequence.
+    /// A concurrent appender that also chose rollover blocks on this permit
+    /// and, on acquiring it, observes the advanced segment sequence and
+    /// retries against the fresh committer instead of tearing down a
+    /// committer twice. Single unit, local (`!Send`) — lives on the shard
+    /// executor alongside the rest of the WAL state.
+    rollover_lock: glommio::sync::Semaphore,
 }
 
 struct WalInner {
@@ -62,9 +70,32 @@ struct WalInner {
     shard_uuid: [u8; 16],
     next_lsn: u64,
     active_segment_seq: u64,
-    bytes_in_active_segment: usize,
-    committer: Option<GroupCommitter>,
+    segment: SegmentState,
     config: WalConfig,
+}
+
+/// The active-segment slot.
+///
+/// `Open` carries the live committer plus the byte count written to the
+/// current segment. `RollingOver` is the transient state held only while a
+/// rollover task (holding [`Wal::rollover_lock`]) is draining the old
+/// segment and creating the next one.
+///
+/// Modeling this as a sum type — rather than `Option<GroupCommitter>`
+/// paired with a separate byte counter — makes the "no committer during
+/// rollover" window *unrepresentable* on the append enqueue path: a
+/// `RollingOver` slot exposes no committer, so an appender cannot enqueue
+/// against it and there is no `Option::expect` to panic. The one place that
+/// transitions `Open → RollingOver → Open` is [`Wal::rollover`], guarded by
+/// the rollover permit.
+enum SegmentState {
+    Open {
+        committer: GroupCommitter,
+        /// Bytes of records written to the current segment (excludes the
+        /// segment header).
+        bytes: usize,
+    },
+    RollingOver,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -145,10 +176,13 @@ impl Wal {
                 shard_uuid,
                 next_lsn: 1,
                 active_segment_seq: 0,
-                bytes_in_active_segment: 0,
-                committer: Some(committer),
+                segment: SegmentState::Open {
+                    committer,
+                    bytes: 0,
+                },
                 config,
             }),
+            rollover_lock: glommio::sync::Semaphore::new(1),
         })
     }
 
@@ -288,10 +322,13 @@ impl Wal {
                 shard_uuid,
                 next_lsn,
                 active_segment_seq,
-                bytes_in_active_segment: bytes_on_disk_pre,
-                committer: Some(committer),
+                segment: SegmentState::Open {
+                    committer,
+                    bytes: bytes_on_disk_pre,
+                },
                 config,
             }),
+            rollover_lock: glommio::sync::Semaphore::new(1),
         })
     }
 }
@@ -321,44 +358,60 @@ impl Wal {
         // makes the WAL "broken" and every subsequent append errors, so no
         // LSN-reuse window opens. Rollover is the one async step; it runs
         // outside the critical section and the loop re-checks afterward.
+        //
+        // A concurrent appender may observe the segment mid-rollover
+        // (`SegmentState::RollingOver`). It cannot enqueue against it (the
+        // slot exposes no committer), so it routes to `rollover`, which
+        // blocks on the rollover permit until the in-flight rollover
+        // completes and then no-ops (the segment sequence has advanced),
+        // after which the loop retries against the fresh committer.
         loop {
             enum Action {
                 Enqueued { lsn: u64, handle: AppendHandle },
-                Rollover,
+                Rollover { observed_seq: u64 },
             }
             let action = {
                 let mut inner = self.inner.borrow_mut();
-                let segment_capacity_bytes = inner
-                    .config
-                    .max_segment_bytes
-                    .saturating_sub(WAL_SEGMENT_HEADER_LEN);
+                let max_segment_bytes = inner.config.max_segment_bytes;
+                let segment_capacity_bytes =
+                    max_segment_bytes.saturating_sub(WAL_SEGMENT_HEADER_LEN);
                 if record_bytes > segment_capacity_bytes {
                     return Err(WalError::RecordExceedsSegmentLimit {
                         record_bytes,
-                        segment_max: inner.config.max_segment_bytes,
+                        segment_max: max_segment_bytes,
                     });
                 }
-                let lsn = inner.next_lsn;
-                let projected =
-                    WAL_SEGMENT_HEADER_LEN + inner.bytes_in_active_segment + record_bytes;
-                if projected > inner.config.max_segment_bytes {
-                    Action::Rollover
-                } else {
-                    record.lsn = Lsn(lsn);
-                    let committer = inner
-                        .committer
-                        .as_ref()
-                        .expect("committer present between rollovers");
-                    let handle = committer.append(record.clone())?;
-                    inner.bytes_in_active_segment += record_bytes;
-                    inner.next_lsn = lsn + 1;
-                    Action::Enqueued { lsn, handle }
+                let WalInner {
+                    next_lsn,
+                    active_segment_seq,
+                    segment,
+                    ..
+                } = &mut *inner;
+                match segment {
+                    SegmentState::RollingOver => Action::Rollover {
+                        observed_seq: *active_segment_seq,
+                    },
+                    SegmentState::Open { committer, bytes } => {
+                        let projected = WAL_SEGMENT_HEADER_LEN + *bytes + record_bytes;
+                        if projected > max_segment_bytes {
+                            Action::Rollover {
+                                observed_seq: *active_segment_seq,
+                            }
+                        } else {
+                            let lsn = *next_lsn;
+                            record.lsn = Lsn(lsn);
+                            let handle = committer.append(record.clone())?;
+                            *bytes += record_bytes;
+                            *next_lsn = lsn + 1;
+                            Action::Enqueued { lsn, handle }
+                        }
+                    }
                 }
             };
 
             match action {
-                Action::Rollover => {
-                    self.rollover().await?;
+                Action::Rollover { observed_seq } => {
+                    self.rollover(observed_seq).await?;
                     continue;
                 }
                 Action::Enqueued { lsn, handle } => {
@@ -403,39 +456,47 @@ impl Wal {
             // Step A: short borrow — validate size, decide rollover, assign LSN.
             enum Action {
                 Append { lsn: u64 },
-                Rollover,
+                Rollover { observed_seq: u64 },
             }
             let action = {
                 let inner = self.inner.borrow();
-                let segment_capacity_bytes = inner
-                    .config
-                    .max_segment_bytes
-                    .saturating_sub(WAL_SEGMENT_HEADER_LEN);
+                let max_segment_bytes = inner.config.max_segment_bytes;
+                let segment_capacity_bytes =
+                    max_segment_bytes.saturating_sub(WAL_SEGMENT_HEADER_LEN);
                 if record_bytes > segment_capacity_bytes {
                     return Err(WalError::RecordExceedsSegmentLimit {
                         record_bytes,
-                        segment_max: inner.config.max_segment_bytes,
+                        segment_max: max_segment_bytes,
                     });
                 }
-                let lsn = inner.next_lsn;
-                let projected =
-                    WAL_SEGMENT_HEADER_LEN + inner.bytes_in_active_segment + record_bytes;
-                if projected > inner.config.max_segment_bytes {
-                    Action::Rollover
-                } else {
-                    Action::Append { lsn }
+                match &inner.segment {
+                    SegmentState::RollingOver => Action::Rollover {
+                        observed_seq: inner.active_segment_seq,
+                    },
+                    SegmentState::Open { bytes, .. } => {
+                        let projected = WAL_SEGMENT_HEADER_LEN + *bytes + record_bytes;
+                        if projected > max_segment_bytes {
+                            Action::Rollover {
+                                observed_seq: inner.active_segment_seq,
+                            }
+                        } else {
+                            Action::Append {
+                                lsn: inner.next_lsn,
+                            }
+                        }
+                    }
                 }
             };
 
             match action {
-                Action::Rollover => {
+                Action::Rollover { observed_seq } => {
                     // Make sure everything we already submitted lands on
                     // the old segment durably before we tear it down.
                     for h in handles.drain(..) {
                         let durable_lsn = h.wait().await?;
                         let _ = durable_lsn;
                     }
-                    self.rollover().await?;
+                    self.rollover(observed_seq).await?;
                     pending = Some(record);
                     continue;
                 }
@@ -448,19 +509,38 @@ impl Wal {
                     // safe because a flush failure makes the WAL "broken"
                     // and all subsequent appends error — no LSN reuse
                     // window opens.
+                    //
+                    // No `.await` separates step A from this borrow, so on
+                    // this single-threaded executor the slot is still the
+                    // `Open` state step A observed. The `RollingOver` arm is
+                    // therefore unreachable in practice; if it ever fires we
+                    // re-queue this record (without consuming its LSN) rather
+                    // than panic.
                     let handle = {
                         let mut inner = self.inner.borrow_mut();
-                        let committer = inner
-                            .committer
-                            .as_ref()
-                            .expect("committer present between rollovers");
-                        let h = committer.append(record.clone())?;
-                        inner.bytes_in_active_segment += record_bytes;
-                        inner.next_lsn = lsn + 1;
-                        h
+                        let WalInner {
+                            next_lsn, segment, ..
+                        } = &mut *inner;
+                        match segment {
+                            SegmentState::Open { committer, bytes } => {
+                                let h = committer.append(record.clone())?;
+                                *bytes += record_bytes;
+                                *next_lsn = lsn + 1;
+                                Some(h)
+                            }
+                            SegmentState::RollingOver => None,
+                        }
                     };
-                    handles.push(handle);
-                    assigned.push(Lsn(lsn));
+                    match handle {
+                        Some(h) => {
+                            handles.push(h);
+                            assigned.push(Lsn(lsn));
+                        }
+                        None => {
+                            pending = Some(record);
+                            continue;
+                        }
+                    }
                 }
             }
         }
@@ -476,40 +556,95 @@ impl Wal {
         Ok(assigned)
     }
 
-    async fn rollover(&self) -> Result<(), WalError> {
-        // Step A: take the old committer + capture state under a short borrow.
+    /// Roll the active segment over to the next one.
+    ///
+    /// `observed_seq` is the `active_segment_seq` the caller saw when it
+    /// decided a rollover was needed. This makes rollover safe under
+    /// concurrent append on the single shard executor:
+    ///
+    /// 1. Acquire the exclusive rollover permit. A second appender that also
+    ///    chose rollover blocks here until the first finishes.
+    /// 2. Re-check `active_segment_seq`. If it advanced past `observed_seq`,
+    ///    another task already rolled the segment we saw full — this call is
+    ///    a no-op and the caller retries its append against the fresh
+    ///    committer. This prevents a spurious second rollover that would tear
+    ///    down a freshly-installed (empty) committer and create an empty
+    ///    segment.
+    /// 3. Otherwise transition the slot to `RollingOver` (taking the old
+    ///    committer out), drain + close the old segment durably, create the
+    ///    new segment, fsync the directory, then install the fresh committer
+    ///    and bump the sequence — all before releasing the permit.
+    ///
+    /// The old segment is drained and closed *before* the new segment is
+    /// created, preserving the invariant that every record in a lower-seq
+    /// segment is durable before any record lands in a higher-seq one (so
+    /// recovery never sees an LSN gap straddling a segment boundary).
+    async fn rollover(&self, observed_seq: u64) -> Result<(), WalError> {
+        // Step 1: serialize — only one task transitions the segment at a time.
+        let _permit = self
+            .rollover_lock
+            .acquire_permit(1)
+            .await
+            .expect("invariant: rollover semaphore is never closed");
+
+        // Step 2 + 3a: under a short borrow, bail if the segment already
+        // rolled, else take the old committer and mark the slot RollingOver.
         let (old_committer, dir, shard_uuid, new_seq, new_starting_lsn, group_commit_cfg) = {
             let mut inner = self.inner.borrow_mut();
-            let old_committer = inner
-                .committer
-                .take()
-                .expect("committer present at rollover entry");
+            if inner.active_segment_seq != observed_seq {
+                // Someone rolled past the segment we saw full. Nothing to do.
+                return Ok(());
+            }
+            let new_seq = inner.active_segment_seq + 1;
+            let new_starting_lsn = inner.next_lsn;
+            let dir = inner.dir.clone();
+            let shard_uuid = inner.shard_uuid;
+            let group_commit_cfg = inner.config.group_commit;
+            // We hold the exclusive permit and the sequence matched, so the
+            // slot must be `Open` — no other task can be mid-rollover. A
+            // `RollingOver` slot here can only mean a *previous* rollover
+            // failed after taking the committer; treat the WAL as broken
+            // rather than tear down twice.
+            let old_committer =
+                match std::mem::replace(&mut inner.segment, SegmentState::RollingOver) {
+                    SegmentState::Open { committer, .. } => committer,
+                    SegmentState::RollingOver => {
+                        return Err(WalError::Commit(CommitError::WalBroken(
+                            "segment rollover previously failed; WAL is broken".into(),
+                        )));
+                    }
+                };
             (
                 old_committer,
-                inner.dir.clone(),
-                inner.shard_uuid,
-                inner.active_segment_seq + 1,
-                inner.next_lsn,
-                inner.config.group_commit,
+                dir,
+                shard_uuid,
+                new_seq,
+                new_starting_lsn,
+                group_commit_cfg,
             )
         };
 
-        // Step B: shutdown the old committer (await) without any borrow held.
+        // Step 3b: shutdown the old committer (await) without any borrow held.
         let old_segment = old_committer.shutdown().await?;
         old_segment.close().await?;
 
-        // Step C: create the new segment, fsync the directory.
+        // Step 3c: create the new segment, fsync the directory.
         let new_path = segment_path(&dir, new_seq);
         let new_segment =
             WalSegment::create_new(&new_path, new_seq, new_starting_lsn, shard_uuid).await?;
         fsync_dir(&dir)?;
 
-        // Step D: re-install the new committer + state under a short borrow.
+        // Step 3d: install the new committer + advance the sequence under a
+        // short borrow. Resetting bytes to 0 is implicit in the fresh
+        // `Open`; a concurrent appender that was blocked on the permit now
+        // observes the advanced sequence and retries against this committer.
         {
             let mut inner = self.inner.borrow_mut();
-            inner.committer = Some(GroupCommitter::start(new_segment, group_commit_cfg));
+            inner.segment = SegmentState::Open {
+                committer: GroupCommitter::start(new_segment, group_commit_cfg),
+                bytes: 0,
+            };
             inner.active_segment_seq = new_seq;
-            inner.bytes_in_active_segment = 0;
         }
         Ok(())
     }
@@ -545,7 +680,10 @@ impl Wal {
     pub async fn shutdown_in_place(&self) -> Result<(), WalError> {
         let committer = {
             let mut inner = self.inner.borrow_mut();
-            inner.committer.take()
+            match std::mem::replace(&mut inner.segment, SegmentState::RollingOver) {
+                SegmentState::Open { committer, .. } => Some(committer),
+                SegmentState::RollingOver => None,
+            }
         };
         if let Some(committer) = committer {
             let seg = committer.shutdown().await?;
@@ -562,19 +700,27 @@ impl Drop for Wal {
         // via its Drop impl. Tests and the connection layer's graceful
         // shutdown path should call `shutdown().await` explicitly to avoid
         // leaving in-flight records unflushed.
-        let _ = self.inner.borrow_mut().committer.take();
+        //
+        // Overwriting the slot drops any live `Open` committer, signaling its
+        // detached task to wind down.
+        self.inner.borrow_mut().segment = SegmentState::RollingOver;
     }
 }
 
 impl core::fmt::Debug for Wal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let inner = self.inner.borrow();
+        let (rolling_over, bytes_in_active_segment) = match &inner.segment {
+            SegmentState::Open { bytes, .. } => (false, *bytes),
+            SegmentState::RollingOver => (true, 0),
+        };
         f.debug_struct("Wal")
             .field("dir", &inner.dir)
             .field("shard_uuid", &inner.shard_uuid)
             .field("next_lsn", &inner.next_lsn)
             .field("active_segment_seq", &inner.active_segment_seq)
-            .field("bytes_in_active_segment", &inner.bytes_in_active_segment)
+            .field("rolling_over", &rolling_over)
+            .field("bytes_in_active_segment", &bytes_in_active_segment)
             .finish()
     }
 }
@@ -861,6 +1007,86 @@ mod tests {
             assert_eq!(lsns, (1..=20).collect::<Vec<_>>());
             wal.shutdown().await.unwrap();
         });
+    }
+
+    #[test]
+    fn concurrent_appends_across_rollover_stay_contiguous() {
+        // Regression for the rollover concurrency panic. With a SMALL segment
+        // cap, two tasks appending concurrently on the same single-threaded
+        // executor repeatedly straddle segment boundaries. The historical bug:
+        // task A entered rollover, `take()`d the committer, and parked on
+        // `shutdown().await`; while parked, task B saw the still-full byte
+        // counter, also chose rollover, and hit `take().expect(...)` on the
+        // now-absent committer → shard-crashing panic.
+        //
+        // The fix serializes rollover behind a permit and models the slot as
+        // a sum type, so a concurrent appender that observes the mid-rollover
+        // slot blocks on the permit, then finds the segment already advanced
+        // and retries against the fresh committer — no double teardown, no
+        // panic. This test asserts: no panic, distinct+contiguous LSNs, the
+        // segment sequence actually advanced (rollovers happened), and every
+        // record readable back in order after recovery with no dup/loss.
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_owned();
+        let p = path.clone();
+        // ~1–2 records per segment forces heavy concurrent rollover contention.
+        let small_cap = WAL_SEGMENT_HEADER_LEN + 200;
+        let cfg = WalConfig {
+            group_commit: GroupCommitConfig::default(),
+            max_segment_bytes: small_cap,
+        };
+        const PER_TASK: u64 = 50;
+        let final_seq = glommio_run(move || async move {
+            let wal = Rc::new(Wal::create_with_config(&p, uuid(8), cfg).await.unwrap());
+
+            let w1 = wal.clone();
+            let t1 = glommio::spawn_local(async move {
+                let mut got = Vec::new();
+                for _ in 0..PER_TASK {
+                    got.push(w1.append(record_with_payload_size(64)).await.unwrap().raw());
+                }
+                got
+            });
+            let w2 = wal.clone();
+            let t2 = glommio::spawn_local(async move {
+                let mut got = Vec::new();
+                for _ in 0..PER_TASK {
+                    got.push(w2.append(record_with_payload_size(64)).await.unwrap().raw());
+                }
+                got
+            });
+
+            let mut all: Vec<u64> = t1.await;
+            all.extend(t2.await);
+            all.sort_unstable();
+
+            // Distinct + contiguous: no dup, no gap.
+            assert_eq!(
+                all,
+                (1..=2 * PER_TASK).collect::<Vec<_>>(),
+                "concurrent appends across rollover must assign distinct, contiguous LSNs"
+            );
+
+            let seq = wal.active_segment_seq();
+            wal.shutdown_in_place().await.unwrap();
+            seq
+        });
+
+        // Rollovers actually happened (many, given ~1–2 records/segment) and
+        // the sequence advanced monotonically — not the spurious double
+        // rollovers the old race would have produced.
+        assert!(
+            final_seq >= 10,
+            "expected many rollovers under contention, got seq {final_seq}"
+        );
+
+        // Recovery reads every segment in order; a dup or a straddling gap
+        // would surface as LsnGap. All records durable, in order, none lost.
+        let reader = WalReader::open(&path, uuid(8)).unwrap();
+        let lsns: Vec<u64> = reader.into_iter().map(|r| r.unwrap().lsn.raw()).collect();
+        assert_eq!(lsns, (1..=2 * PER_TASK).collect::<Vec<_>>());
     }
 
     #[test]
