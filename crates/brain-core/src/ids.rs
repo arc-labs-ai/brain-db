@@ -212,9 +212,18 @@ impl MemoryId {
         self.0
     }
 
+    /// Mask clearing the 32 reserved low bits (bytes `12..16`). Applied on
+    /// every decode so a client or SDK that echoes an id with junk in the
+    /// reserved field still compares equal to the stored id.
+    const RESERVED_MASK: u128 = !0xFFFF_FFFF_u128;
+
     #[must_use]
     pub const fn from_raw(raw: u128) -> Self {
-        Self(raw)
+        // Normalize on decode: the reserved field must be zero in v1, but a
+        // client may echo it back with junk. Masking (rather than rejecting)
+        // keeps `Eq`/`Hash`/`Ord` robust so RECALL/LINK/inspect don't return
+        // a spurious `NotFound` for a live memory.
+        Self(raw & Self::RESERVED_MASK)
     }
 
     /// On-the-wire bytes, big-endian.
@@ -226,7 +235,8 @@ impl MemoryId {
     /// Inverse of [`Self::to_be_bytes`].
     #[must_use]
     pub const fn from_be_bytes(bytes: [u8; 16]) -> Self {
-        Self(u128::from_be_bytes(bytes))
+        // See `from_raw`: normalize the reserved field to zero on decode.
+        Self(u128::from_be_bytes(bytes) & Self::RESERVED_MASK)
     }
 
     /// Whether this is the null sentinel (`Self::NULL`).
@@ -615,6 +625,30 @@ mod tests {
         );
         // Round-trip through bytes.
         assert_eq!(MemoryId::from_be_bytes(bytes), id);
+    }
+
+    #[test]
+    fn reserved_bits_masked_on_decode() {
+        // A client that echoes an id with junk in the reserved low-32-bits
+        // must still decode equal to the same id with zero reserved bits,
+        // so RECALL/LINK don't return a spurious NotFound for a live memory.
+        let clean = MemoryId::pack(0x0102, 0x0304_0506_0708, 0x090A_0B0C);
+        let dirty = MemoryId::from_raw(clean.raw() | 0xDEAD_BEEF);
+        assert_eq!(clean, dirty);
+        assert_eq!(dirty.reserved(), 0);
+
+        // Same through the byte decoder.
+        let mut bytes = clean.to_be_bytes();
+        bytes[12] = 0xDE;
+        bytes[13] = 0xAD;
+        bytes[14] = 0xBE;
+        bytes[15] = 0xEF;
+        let decoded = MemoryId::from_be_bytes(bytes);
+        assert_eq!(decoded, clean);
+        assert_eq!(decoded.reserved(), 0);
+
+        // Round-trips clean.
+        assert_eq!(MemoryId::from_be_bytes(decoded.to_be_bytes()), clean);
     }
 
     #[test]

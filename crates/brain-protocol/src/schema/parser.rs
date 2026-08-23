@@ -51,12 +51,16 @@ const MAX_NESTING_DEPTH: usize = 64;
 ///
 /// A cheap single-pass byte scan that tracks the current `(`/`[`/`{`
 /// nesting depth. Brackets inside string literals, triple-quoted
-/// heredocs, regex literals, and line comments do not count — they are
-/// opaque to the recursive grammar rules, so counting them would falsely
-/// reject legitimate documents (e.g. a prompt heredoc containing many
-/// unbalanced parens). Byte scanning is sound because every relevant
-/// delimiter is ASCII and UTF-8 continuation bytes never collide with
-/// ASCII.
+/// heredocs, and line comments do not count — they are opaque to the
+/// recursive grammar rules, so counting them would falsely reject
+/// legitimate documents (e.g. a prompt heredoc containing many unbalanced
+/// parens). Brackets inside a *closed* regex literal (`/.../` on a single
+/// line) are likewise skipped, because pest parses the literal as one
+/// atomic token. A lone `/` that does not close before the line ends is
+/// treated as an ordinary byte so that JSON-body brackets following it
+/// are still counted — see the `b'/'` arm. Byte scanning is sound because
+/// every relevant delimiter is ASCII and UTF-8 continuation bytes never
+/// collide with ASCII.
 fn check_nesting_depth(input: &str) -> Result<(), ParseError> {
     let bytes = input.as_bytes();
     let len = bytes.len();
@@ -130,32 +134,48 @@ fn check_nesting_depth(input: &str) -> Result<(), ParseError> {
                 }
             }
             b'/' => {
-                // Regex literal: opaque until the closing `/` (escapes with
-                // `\`); regex tokens cannot span a newline.
-                i += 1;
-                col += 1;
-                while i < len {
-                    match bytes[i] {
-                        b'\\' => {
-                            i += 2;
-                            col += 2;
-                        }
+                // A `/` may open a regex literal (`/.../`) in a trigger/where
+                // clause, where pest parses the whole literal as one atomic
+                // token and never recurses into its brackets — so its
+                // contents are legitimately opaque to the depth cap. But `/`
+                // is also an ordinary byte inside a JSON `schema:`/`examples:`
+                // body, where the grammar *does* recurse once per `{`/`[`. We
+                // may only leave a span uncounted when pest treats it
+                // atomically — i.e. a genuine regex that closes with a
+                // matching `/` before the line ends. If no closing `/` appears
+                // before the next newline or EOF, this `/` is not a regex; the
+                // brackets that follow are real nesting and must be counted, or
+                // a payload like `schema: {/{{{...` would hide unbounded `{`
+                // from the cap and overflow pest's recursive descent.
+                //
+                // The look-ahead never re-scans a span it consumes (a closed
+                // regex is skipped whole; a non-regex `/` advances a single
+                // byte and the main loop counts the rest), so the scan stays
+                // linear overall.
+                let mut j = i + 1;
+                let mut closed = false;
+                while j < len {
+                    match bytes[j] {
+                        b'\\' => j += 2,
                         b'/' => {
-                            i += 1;
-                            col += 1;
+                            closed = true;
                             break;
                         }
-                        b'\n' => {
-                            line += 1;
-                            col = 1;
-                            i += 1;
-                            break;
-                        }
-                        _ => {
-                            col += 1;
-                            i += 1;
-                        }
+                        b'\n' => break,
+                        _ => j += 1,
                     }
+                }
+                if closed {
+                    // Genuine regex literal — atomic to pest. Skip it whole;
+                    // `j` indexes the closing `/`, and a closed regex cannot
+                    // contain a newline, so column advance is the byte count.
+                    col += j - i + 1;
+                    i = j + 1;
+                } else {
+                    // Not a regex — treat `/` as an ordinary byte and let the
+                    // main loop count any brackets that follow.
+                    col += 1;
+                    i += 1;
                 }
             }
             b'(' | b'[' | b'{' => {
@@ -1589,6 +1609,82 @@ mod tests {
                 target: relation reports_to
                 trigger: on encode where ((memory.text matches /a/) and (confidence >= 0.5))
                 model: "m"
+            }
+        "#;
+        let s = parse_ok(src);
+        assert_eq!(s.items.len(), 1);
+    }
+
+    #[test]
+    fn json_body_slash_prefixed_nesting_is_rejected() {
+        // The `/{{{...` bypass: a lone `/` in JSON-value position must not
+        // hide unbounded `{` from the depth cap. Before the fix the scanner
+        // entered regex-skip on the `/` and consumed every brace to EOF,
+        // returning Ok and letting pest recurse one frame per `{` until the
+        // stack overflowed. A few hundred braces is enough to prove the guard
+        // now rejects rather than accepts.
+        let mut src = String::from("namespace t\ndefine extractor x { schema: {/");
+        src.push_str(&"{".repeat(300));
+        let err = parse_schema(&src).unwrap_err();
+        match err {
+            ParseError::Syntax { message, .. } => {
+                assert!(
+                    message.contains("nesting depth"),
+                    "expected depth error, got {message:?}"
+                );
+            }
+            other => panic!("expected Syntax depth error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_terminated_by_newline_still_counts_following_braces() {
+        // A `/` that never closes before the newline is not a regex; braces
+        // after it are real nesting and must count toward the cap.
+        let mut src = String::from("/\n");
+        src.push_str(&"(".repeat(MAX_NESTING_DEPTH + 1));
+        let err = check_nesting_depth(&src).unwrap_err();
+        assert!(matches!(err, ParseError::Syntax { .. }));
+    }
+
+    #[test]
+    fn closed_regex_with_many_brackets_is_skipped() {
+        // A genuine single-line regex literal is atomic to pest; its brackets
+        // (even 1000 of them, closed by `/`) must not accumulate depth.
+        let big = "{".repeat(1000);
+        assert!(check_nesting_depth(&format!("/{big}/")).is_ok());
+        let parens = "(".repeat(1000);
+        assert!(check_nesting_depth(&format!("/{parens}/")).is_ok());
+    }
+
+    #[test]
+    fn regex_with_braces_in_where_still_parses() {
+        // A regex quantifier `{2,4}` in a trigger where-clause is a legit
+        // literal and must not be false-rejected by the depth guard.
+        let src = r#"
+            namespace t
+            define extractor x {
+                kind: classifier
+                target: relation reports_to
+                trigger: on encode where memory.text matches /[A-Z]{2,4}/
+                model: "m"
+            }
+        "#;
+        let s = parse_ok(src);
+        assert_eq!(s.items.len(), 1);
+    }
+
+    #[test]
+    fn regex_pattern_with_literal_braces_parses() {
+        // A pattern matching literal braces `/\{[a-z]+\}/` must parse — the
+        // regex is atomic and its brackets do not count against the cap.
+        let src = r#"
+            namespace t
+            define extractor x {
+                kind: pattern
+                target: entity Person
+                patterns [ /\{[a-z]+\}/ ]
+                confidence: 0.7
             }
         "#;
         let s = parse_ok(src);

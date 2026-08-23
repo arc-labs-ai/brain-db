@@ -76,6 +76,12 @@ pub enum ValidationErrorCode {
 const RESERVED_NAMESPACE: &str = "brain";
 const NAMESPACE_MAX_LEN: usize = 32;
 const ATTRIBUTE_NAME_MAX_LEN: usize = 64;
+/// Upper bound on a declared type name (entity_type / predicate /
+/// relation_type / extractor). These names are interned as redb keys, so
+/// an unbounded name would let a caller write a multi-megabyte key. Set
+/// above the attribute-name cap (64) to leave room for descriptive
+/// compound names while still bounding the key.
+const TYPE_NAME_MAX_LEN: usize = 128;
 const ANY_TYPE_LITERAL: &str = "Any";
 
 // ---------------------------------------------------------------------------
@@ -280,6 +286,25 @@ fn resolves_to_entity(name: &str, entity_names: &[&str]) -> bool {
     name == ANY_TYPE_LITERAL || entity_names.contains(&name)
 }
 
+/// Bound a declared item's own name: reject empty names and names past
+/// [`TYPE_NAME_MAX_LEN`]. `item_label` is the DSL keyword (`entity_type`,
+/// `predicate`, …) used in the error message.
+fn check_type_name(name: &str, item_label: &str, errors: &mut ValidationErrors) {
+    if name.is_empty() {
+        errors.push(ValidationError {
+            code: ValidationErrorCode::NameInvalidIdentifier,
+            message: format!("{item_label} name must not be empty"),
+            source_span: None,
+        });
+    } else if name.len() > TYPE_NAME_MAX_LEN {
+        errors.push(ValidationError {
+            code: ValidationErrorCode::NameTooLong,
+            message: format!("{item_label} name {name:?} exceeds {TYPE_NAME_MAX_LEN} chars"),
+            source_span: None,
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entity attributes.
 // ---------------------------------------------------------------------------
@@ -288,6 +313,7 @@ fn check_entity_attributes(
     entity: &crate::schema::ast::EntityTypeDef,
     errors: &mut ValidationErrors,
 ) {
+    check_type_name(&entity.name, "entity_type", errors);
     for attr in &entity.attributes {
         check_attribute_decl(attr, &entity.name, errors);
     }
@@ -364,6 +390,8 @@ fn default_matches_attr_type(default: &LiteralValue, attr: &AttrType) -> bool {
 // ---------------------------------------------------------------------------
 
 fn check_predicate(pred: &PredicateDef, entity_names: &[&str], errors: &mut ValidationErrors) {
+    check_type_name(&pred.name, "predicate", errors);
+
     // Type ref resolution for Entity<...>.
     if let ObjectTypeDecl::Entity { entity_type } = &pred.object {
         if !resolves_to_entity(entity_type, entity_names) {
@@ -453,6 +481,8 @@ fn check_kind(k: &KindDef, errors: &mut ValidationErrors) {
 // ---------------------------------------------------------------------------
 
 fn check_relation(rel: &RelationTypeDef, entity_names: &[&str], errors: &mut ValidationErrors) {
+    check_type_name(&rel.name, "relation_type", errors);
+
     if !resolves_to_entity(&rel.from_type, entity_names) {
         errors.push(ValidationError {
             code: ValidationErrorCode::UnresolvedTypeRef,
@@ -503,6 +533,8 @@ fn check_extractor(
     relation_names: &[&str],
     errors: &mut ValidationErrors,
 ) {
+    check_type_name(&ext.name, "extractor", errors);
+
     // Target ref resolution.
     match &ext.target {
         ExtractorTarget::Entity { entity_type } => {
@@ -756,6 +788,51 @@ mod tests {
                 "matrix entry kind={kind:?} obj={obj:?}"
             );
         }
+    }
+
+    #[test]
+    fn overlong_predicate_name_rejected() {
+        let mut s = base_schema();
+        s.items.push(SchemaItem::Predicate(PredicateDef {
+            name: "p".repeat(TYPE_NAME_MAX_LEN + 1),
+            kind: StatementKindAst::Fact,
+            object: ObjectTypeDecl::Any,
+            stateful: None,
+            description: None,
+        }));
+        let errs = validate(&s).unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| e.code == ValidationErrorCode::NameTooLong));
+    }
+
+    #[test]
+    fn empty_type_name_rejected() {
+        let mut s = base_schema();
+        s.items.push(SchemaItem::Predicate(PredicateDef {
+            name: String::new(),
+            kind: StatementKindAst::Fact,
+            object: ObjectTypeDecl::Any,
+            stateful: None,
+            description: None,
+        }));
+        let errs = validate(&s).unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| e.code == ValidationErrorCode::NameInvalidIdentifier));
+    }
+
+    #[test]
+    fn normal_type_name_accepted() {
+        let mut s = base_schema();
+        s.items.push(SchemaItem::Predicate(PredicateDef {
+            name: "works_at".into(),
+            kind: StatementKindAst::Fact,
+            object: ObjectTypeDecl::Any,
+            stateful: None,
+            description: None,
+        }));
+        assert!(validate(&s).is_ok());
     }
 
     #[test]

@@ -476,10 +476,18 @@ impl Opcode {
     /// namespace `0x00`. Widened past `0x6D / 0xED` when the
     /// backfill-control opcodes (`ADMIN_BACKFILL`,
     /// `ADMIN_BACKFILL_CANCEL`) landed.
+    ///
+    /// `SchemaReplace` (`0x0127` / `0x01A7`) is admin-only by design — the
+    /// destructive namespace reset — but its low byte falls outside the
+    /// typed-graph admin range, so it is called out explicitly. The
+    /// additive `SchemaUpload`/`SchemaGet`/`SchemaList`/`SchemaValidate`
+    /// and the `Extractor*` introspection ops are intentionally *not*
+    /// admin.
     #[inline]
     #[must_use]
     pub fn is_admin(self) -> bool {
-        (self.namespace() == 0x00 && matches!(self.low_byte(), 0x60..=0x6F | 0xE0..=0xEF))
+        matches!(self, Opcode::SchemaReplaceReq | Opcode::SchemaReplaceResp)
+            || (self.namespace() == 0x00 && matches!(self.low_byte(), 0x60..=0x6F | 0xE0..=0xEF))
             || (self.namespace() == 0x01 && matches!(self.low_byte(), 0x70..=0x7F | 0xF0..=0xFF))
     }
 
@@ -763,6 +771,17 @@ mod tests {
         // ...but typed-graph admin ops (0x017x / 0x01Fx) are.
         assert!(Opcode::AdminListPendingContradictionsReq.is_admin());
         assert!(Opcode::AdminListPendingContradictionsResp.is_admin());
+    }
+
+    #[test]
+    fn schema_replace_is_admin_but_upload_is_not() {
+        // SCHEMA_REPLACE is the destructive namespace reset — admin-only by
+        // design — even though its low byte falls outside the typed-graph
+        // admin range. The additive SCHEMA_UPLOAD must stay non-admin.
+        assert!(Opcode::SchemaReplaceReq.is_admin());
+        assert!(Opcode::SchemaReplaceResp.is_admin());
+        assert!(!Opcode::SchemaUploadReq.is_admin());
+        assert!(!Opcode::SchemaUploadResp.is_admin());
     }
 
     #[test]
