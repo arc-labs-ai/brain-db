@@ -43,7 +43,7 @@ use crate::framework::extractor::{
 };
 use crate::framework::item::{EntityMention, ExtractedItem, RelationMention, StatementMention};
 use crate::framework::trigger::{evaluate_trigger_on_encode, TriggerDecision};
-use crate::idempotency::hash_memory_text;
+use crate::idempotency::hash_prompt_context;
 
 const DEFAULT_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days.
 
@@ -254,21 +254,13 @@ impl LlmExtractor {
         // existing predicates nearest THIS memory's text). A template
         // without a placeholder is left unchanged; an unfilled placeholder
         // renders empty.
-        let prompt = inner
-            .prompt
-            .replace(
-                "{DECLARED_ENTITY_TYPES}",
-                declared_entity_types.unwrap_or(""),
-            )
-            .replace("{CANDIDATE_PREDICATES}", candidate_predicates.unwrap_or(""))
-            .replace("{DECLARED_KINDS}", declared_kinds.unwrap_or(""))
-            // Complement to the deterministic apply-time date->fact join (which is
-            // the primary Time-slot mechanism): the anchor date helps the LLM
-            // classify actions as Event and set `event_at` for relative
-            // expressions ("last Saturday", "in June") the pattern extractor
-            // missed. Empty when the memory carries no usable timestamp — the
-            // prompt rule then harmlessly no-ops.
-            .replace("{ANCHOR_DATE}", anchor_date.unwrap_or(""));
+        let prompt = substitute_schema_placeholders(
+            &inner.prompt,
+            declared_entity_types,
+            candidate_predicates,
+            declared_kinds,
+            anchor_date,
+        );
         let (user_body, stats) = render_prompt_with_context(
             &prompt,
             memory_text,
@@ -296,6 +288,92 @@ impl LlmExtractor {
             timeout: inner.timeout,
         };
         (request, stats)
+    }
+
+    /// Render the exact user-message body that goes into the cache-key
+    /// hash: the same placeholder substitution + context render as
+    /// [`build_request`](Self::build_request), but with the wall-clock
+    /// anchor (`now`) pinned to `0`.
+    ///
+    /// The only wall-clock input to the render is the neighbor recency
+    /// hints (`T-Nh`); pinning `now` to `0` collapses them to a constant
+    /// so the body is stable across calls, while every content-bearing
+    /// input — memory text, prior entities, neighbor text + similarity,
+    /// summary, and the substituted schema/anchor blocks — still flows
+    /// into the body (and therefore the key). `memory_id` is used only
+    /// for diagnostics inside the render, never emitted into the body, so
+    /// two memories with identical text + context still share a key
+    /// (the intended cross-memory dedup).
+    #[allow(clippy::too_many_arguments)]
+    fn render_cache_body(
+        &self,
+        inner: &LlmExtractorInner,
+        memory_id: brain_core::MemoryId,
+        memory_text: &str,
+        prior_entities: &[&EntityMention],
+        extractor_context: Option<&ExtractorContext>,
+        declared_entity_types: Option<&str>,
+        candidate_predicates: Option<&str>,
+        declared_kinds: Option<&str>,
+        anchor_date: Option<&str>,
+    ) -> String {
+        let prompt = substitute_schema_placeholders(
+            &inner.prompt,
+            declared_entity_types,
+            candidate_predicates,
+            declared_kinds,
+            anchor_date,
+        );
+        let (body, _stats) = render_prompt_with_context(
+            &prompt,
+            memory_text,
+            prior_entities,
+            extractor_context,
+            0,
+            memory_id,
+        );
+        body
+    }
+
+    /// The cache-key input hash `run` uses for `mem` under `ctx`.
+    ///
+    /// Folds the owning tenant (`mem.space`), the active schema version,
+    /// and the fully materialized prompt-context body so that any change
+    /// that would change the model's output — text, anchor date, declared
+    /// types/kinds, candidate predicates, prior entities, bounded
+    /// neighbor/summary context — yields a distinct key, and no two
+    /// tenants ever share an entry. Exposed so callers (and tests) can
+    /// address the exact row the extractor reads and writes.
+    ///
+    /// The degraded (no client wired) path never touches the cache, but
+    /// still returns a tenant-isolated, deterministic hash over the
+    /// memory text so the function is total.
+    #[must_use]
+    pub fn cache_input_hash(&self, ctx: &ExtractionContext<'_>, mem: &Memory) -> [u8; 32] {
+        let text = mem.text.as_deref().unwrap_or("");
+        let space: [u8; 16] = mem.space.into();
+        let Some(inner) = self.inner.as_ref() else {
+            return hash_prompt_context(space, ctx.schema_version, text);
+        };
+        let prior_entities = collect_prior_entities(ctx, mem.id);
+        let extractor_context = ctx.extractor_context.and_then(|map| map.get(&mem.id));
+        let candidate_predicates = ctx
+            .candidate_predicates
+            .and_then(|map| map.get(&mem.id))
+            .map(String::as_str);
+        let anchor_date = anchor_date_iso(mem);
+        let body = self.render_cache_body(
+            inner,
+            mem.id,
+            text,
+            &prior_entities,
+            extractor_context,
+            ctx.declared_entity_types,
+            candidate_predicates,
+            ctx.declared_kinds,
+            anchor_date.as_deref(),
+        );
+        hash_prompt_context(space, ctx.schema_version, &body)
     }
 
     fn project_value(&self, parsed: &Value) -> Vec<ExtractedItem> {
@@ -881,6 +959,36 @@ fn approx_tokens_of(s: &str) -> u64 {
 /// landed still see the memory text. `{PRIOR_ENTITIES}` is silently
 /// no-op when absent — when an operator's prompt doesn't anchor on
 /// prior tier output, the LLM falls back to its own extraction.
+/// Substitute the batch/per-memory schema blocks into the prompt
+/// template: declared entity types, candidate predicates, declared
+/// kinds, and the anchor date. Shared by [`LlmExtractor::build_request`]
+/// (for the live call) and [`LlmExtractor::render_cache_body`] (for the
+/// cache key) so the two can never drift — any block that reaches the
+/// model also reaches the key. A template missing a placeholder is left
+/// unchanged; an unfilled placeholder renders empty.
+///
+/// The anchor date is a complement to the deterministic apply-time
+/// date->fact join (the primary Time-slot mechanism): it helps the LLM
+/// classify actions as Event and set `event_at` for relative expressions
+/// ("last Saturday", "in June") the pattern extractor missed. Empty when
+/// the memory carries no usable timestamp — the prompt rule then no-ops.
+pub(super) fn substitute_schema_placeholders(
+    template: &str,
+    declared_entity_types: Option<&str>,
+    candidate_predicates: Option<&str>,
+    declared_kinds: Option<&str>,
+    anchor_date: Option<&str>,
+) -> String {
+    template
+        .replace(
+            "{DECLARED_ENTITY_TYPES}",
+            declared_entity_types.unwrap_or(""),
+        )
+        .replace("{CANDIDATE_PREDICATES}", candidate_predicates.unwrap_or(""))
+        .replace("{DECLARED_KINDS}", declared_kinds.unwrap_or(""))
+        .replace("{ANCHOR_DATE}", anchor_date.unwrap_or(""))
+}
+
 pub(super) fn render_prompt(
     template: &str,
     memory_text: &str,
@@ -1237,7 +1345,14 @@ impl Extractor for LlmExtractor {
             };
             let inner = inner.clone();
             let text = mem.text.as_deref().unwrap_or("");
-            let input_hash = hash_memory_text(text);
+            // Cache key hashes the full materialized prompt context (text +
+            // anchor date + declared types/kinds + candidate predicates +
+            // prior entities + bounded neighbor/summary context), the active
+            // schema version, and the owning tenant (`mem.space`). Hashing
+            // only the text would serve a stale/wrong extraction whenever any
+            // of those changed — and would leak one tenant's extraction to
+            // another for byte-identical text.
+            let input_hash = self.cache_input_hash(ctx, mem);
             let model_id_hash = inner.client.model_id_hash();
             let extractor_id_raw = self.id.raw();
             let extractor_version = self.extractor_version;
