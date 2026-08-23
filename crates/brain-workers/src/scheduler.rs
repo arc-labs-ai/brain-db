@@ -16,6 +16,7 @@
 //! are cancelled (Glommio `Task::cancel`).
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -25,7 +26,7 @@ use brain_ops::OpsContext;
 use futures_lite::FutureExt;
 use glommio::timer::sleep;
 use glommio::Task;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{WorkerConfig, WorkerKind};
 use crate::context::WorkerContext;
@@ -332,8 +333,28 @@ async fn worker_loop(
         let skip_this_cycle = first_iter && skip_first_tick;
         if cfg.enabled && !paused && !skip_this_cycle {
             let start = Instant::now();
-            match worker.run_cycle(&ctx).await {
-                Ok(processed) => {
+            // Isolate the cycle behind `catch_unwind`. A panic in
+            // `run_cycle` (an `expect`, a slice OOB, arithmetic overflow on a
+            // malformed row) would otherwise unwind the whole worker task:
+            // the feature would silently cease with no metric and no restart,
+            // and the panicked `Task` — held in `WorkerHandle` — would re-raise
+            // at shutdown join, aborting the rest of clean shutdown. Instead we
+            // treat a caught panic exactly like an `Err`: bump `errors_total`,
+            // log, and continue to the next tick. The `async` wrapper ensures a
+            // panic during future *construction* is caught too, not only one
+            // during polling.
+            //
+            // UNWIND-SAFETY: `AssertUnwindSafe` asserts the future's captured
+            // state is safe to observe after a panic. That holds here by the
+            // resilience model — a worker cycle is retried on its next tick, and
+            // its durable state is transactional: a panic mid-cycle drops any
+            // open redb write txn uncommitted (ACID rollback, no partial
+            // commit), and any in-memory index left inconsistent is rebuilt by
+            // its maintenance worker. A panicked-then-retried cycle is the
+            // intended failure mode, not a poisoning one.
+            let cycle = AssertUnwindSafe(async { worker.run_cycle(&ctx).await });
+            match futures_util::future::FutureExt::catch_unwind(cycle).await {
+                Ok(Ok(processed)) => {
                     metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
                     metrics
                         .processed_total
@@ -348,9 +369,21 @@ async fn worker_loop(
                         .store(now_unix_secs(), Ordering::Relaxed);
                     debug!(worker = name, processed, duration_ms, "cycle complete");
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     metrics.errors_total.fetch_add(1, Ordering::Relaxed);
                     warn!(worker = name, error = %e, "worker cycle error");
+                }
+                Err(panic) => {
+                    // Caught panic: count it like an error and survive to the
+                    // next tick. The scheduler task must never unwind, so
+                    // shutdown's join can never observe a worker-cycle panic.
+                    metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    let payload = panic_message(&panic);
+                    error!(
+                        worker = name,
+                        panic = %payload,
+                        "worker cycle panicked; isolated and continuing to next tick"
+                    );
                 }
             }
         }
@@ -370,6 +403,19 @@ async fn worker_loop(
         first_iter = false;
     }
     debug!(worker = name, "loop exiting");
+}
+
+/// Best-effort human-readable text for a caught panic payload. The
+/// standard library packages `panic!`/`expect` payloads as `&str` or
+/// `String`; anything else is reported opaquely.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }
 
 fn now_unix_secs() -> u64 {
