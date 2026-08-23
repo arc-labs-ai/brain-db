@@ -46,12 +46,14 @@ use brain_core::{
     EdgeKind, EdgeKindRef, EntityId, MemoryId, NodeRef, StatementId, StatementObject,
     StatementValue, SubjectRef,
 };
-use brain_metadata::entity::ops::entity_get;
 use brain_metadata::relation::types::relation_type_get;
 use brain_metadata::schema::predicate::predicate_get;
 use brain_metadata::statement::statement_get;
 use brain_metadata::tables::edge::{walk_incoming, walk_outgoing};
+use brain_metadata::tables::entity::ENTITIES_TABLE;
 use brain_metadata::tables::entity_type::ENTITY_TYPES_TABLE;
+use brain_metadata::tables::memory::MEMORIES_TABLE;
+use brain_metadata::tables::relation::RELATION_METADATA_TABLE;
 use brain_metadata::tables::statement::STATEMENTS_BY_SUBJECT_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_metadata::RowScope;
@@ -168,6 +170,7 @@ pub fn handle_graph_fetch(
         .map_err(|e| OpError::Internal(format!("statement range: {e}")))?;
 
     let mut builder = GraphBuilder::new(
+        scope,
         req.include_statements,
         req.include_memories,
         req.include_memory_edges,
@@ -284,6 +287,12 @@ pub fn handle_graph_fetch(
 /// Accumulates the page's nodes + edges with per-page dedup so a node/edge
 /// reached twice within one page is emitted once.
 struct GraphBuilder {
+    /// The caller's tenant scope. Every node/edge emitted must belong to
+    /// it: the shared entity / relation-sidecar / memory tables are flat
+    /// keyspaces, so a write in another tenant can attach a relation or
+    /// mention to one of the caller's ids. This scope is the wall that
+    /// keeps the foreign endpoint out of the export.
+    scope: RowScope,
     include_statements: bool,
     include_memories: bool,
     include_memory_edges: bool,
@@ -303,8 +312,14 @@ struct GraphBuilder {
 }
 
 impl GraphBuilder {
-    fn new(include_statements: bool, include_memories: bool, include_memory_edges: bool) -> Self {
+    fn new(
+        scope: RowScope,
+        include_statements: bool,
+        include_memories: bool,
+        include_memory_edges: bool,
+    ) -> Self {
         Self {
+            scope,
             include_statements,
             include_memories,
             include_memory_edges,
@@ -337,31 +352,72 @@ impl GraphBuilder {
     }
 
     /// Emit an entity node (deduped) and record it as a walk seed.
+    ///
+    /// Tenant wall: the primary entity table is a flat keyspace shared
+    /// across tenants, and an entity can be reached as a statement object
+    /// or relation far-endpoint written by another tenant. Load the
+    /// primary row and skip the id entirely — no seed, no node — unless its
+    /// owning `(namespace, space)` is the caller's.
     fn emit_entity(&mut self, rtxn: &redb::ReadTransaction, eid: EntityId) -> Result<(), OpError> {
+        let entities = rtxn
+            .open_table(ENTITIES_TABLE)
+            .map_err(|e| OpError::Internal(format!("open entities: {e}")))?;
+        let Some(meta) = entities
+            .get(&eid.to_bytes())
+            .map_err(|e| OpError::Internal(format!("entity_get: {e}")))?
+            .map(|g| g.value())
+        else {
+            return Ok(());
+        };
+        if meta.namespace_id != self.scope.namespace_id
+            || meta.space_id_bytes != self.scope.space_id_bytes
+        {
+            return Ok(());
+        }
         if self.seen_entity_seeds.insert(eid.to_bytes()) {
             self.entities_this_page.push(eid);
         }
         if self.seen_nodes.contains(&eid.to_bytes()) {
             return Ok(());
         }
-        let Some(ent) =
-            entity_get(rtxn, eid).map_err(|e| OpError::Internal(format!("entity_get: {e}")))?
-        else {
-            return Ok(());
-        };
         let type_qname = rtxn
             .open_table(ENTITY_TYPES_TABLE)
             .ok()
-            .and_then(|t| t.get(&ent.entity_type.raw()).ok().flatten())
+            .and_then(|t| t.get(&meta.entity_type_id).ok().flatten())
             .map(|g| g.value().name)
             .unwrap_or_default();
         self.emit_node(GraphNode {
             id: eid.to_bytes(),
             kind: NODE_ENTITY,
-            label: ent.canonical_name,
+            label: meta.canonical_name,
             type_qname,
         });
         Ok(())
+    }
+
+    /// Whether `mem_id` belongs to the caller's tenant. The mention /
+    /// memory-edge tables are shared keyspaces, so a foreign tenant can
+    /// attach a `Mentions` or memory↔memory edge onto one of the caller's
+    /// ids; the primary memory row carries the owning scope and is the
+    /// authority. A missing row is treated as out-of-scope (nothing to
+    /// emit).
+    fn memory_in_scope(
+        &self,
+        rtxn: &redb::ReadTransaction,
+        mem_id: MemoryId,
+    ) -> Result<bool, OpError> {
+        let t = rtxn
+            .open_table(MEMORIES_TABLE)
+            .map_err(|e| OpError::Internal(format!("open memories: {e}")))?;
+        let Some(meta) = t
+            .get(&mem_id.to_be_bytes())
+            .map_err(|e| OpError::Internal(format!("memory_get: {e}")))?
+            .map(|g| g.value())
+        else {
+            return Ok(false);
+        };
+        Ok(meta.namespace_id == self.scope.namespace_id
+            && meta.space_id_bytes == self.scope.space_id_bytes)
     }
 
     /// Walk the typed relations incident to `eid` (both directions), emitting
@@ -373,6 +429,9 @@ impl GraphBuilder {
         rtxn: &redb::ReadTransaction,
         eid: EntityId,
     ) -> Result<(), OpError> {
+        let sidecar = rtxn
+            .open_table(RELATION_METADATA_TABLE)
+            .map_err(|e| OpError::Internal(format!("open relation metadata: {e}")))?;
         let mut walked = 0usize;
         for outgoing in [true, false] {
             let rows = if outgoing {
@@ -381,7 +440,7 @@ impl GraphBuilder {
                 walk_incoming(rtxn, NodeRef::Entity(eid), None)
             }
             .map_err(|e| OpError::Internal(format!("walk relation: {e}")))?;
-            for (kind, other, _disamb, _data) in rows {
+            for (kind, other, disamb, _data) in rows {
                 if walked >= MAX_EDGES_PER_ENTITY {
                     return Ok(());
                 }
@@ -391,6 +450,23 @@ impl GraphBuilder {
                 let NodeRef::Entity(other_id) = other else {
                     continue;
                 };
+                // Tenant wall: the shared edge table is not scope-keyed, so
+                // the walk can surface a relation another tenant created
+                // incident to this entity. The sidecar (keyed by the
+                // relation's disambiguator) carries the owning scope and is
+                // the authority that filters it out.
+                let Some(meta) = sidecar
+                    .get(&disamb)
+                    .map_err(|e| OpError::Internal(format!("relation sidecar: {e}")))?
+                    .map(|g| g.value())
+                else {
+                    continue;
+                };
+                if meta.namespace_id != self.scope.namespace_id
+                    || meta.space_id_bytes != self.scope.space_id_bytes
+                {
+                    continue;
+                }
                 let Some(rt) = relation_type_get(rtxn, rt_id)
                     .map_err(|e| OpError::Internal(format!("relation_type_get: {e}")))?
                 else {
@@ -432,6 +508,12 @@ impl GraphBuilder {
             let NodeRef::Memory(mem_id) = from else {
                 continue;
             };
+            // Tenant wall: a foreign tenant can mention one of the caller's
+            // entities. Skip the memory (node, seed, and edge) unless it
+            // belongs to the caller's scope.
+            if !self.memory_in_scope(rtxn, mem_id)? {
+                continue;
+            }
             let mem_bytes = mem_id.to_be_bytes();
             self.emit_memory_node(texts.as_ref(), mem_id);
             // Only mentioned memories seed the memory-edge walk.
@@ -495,6 +577,12 @@ impl GraphBuilder {
                 let NodeRef::Memory(other_id) = other else {
                     continue;
                 };
+                // Tenant wall: the far endpoint may be a memory another
+                // tenant linked to this one. Skip it (node and edge) unless
+                // it belongs to the caller's scope.
+                if !self.memory_in_scope(rtxn, other_id)? {
+                    continue;
+                }
                 let (from, to) = memory_edge_endpoints(edge_kind, mem_id, other_id, outgoing);
                 walked += 1;
                 self.emit_memory_node(texts.as_ref(), other_id);

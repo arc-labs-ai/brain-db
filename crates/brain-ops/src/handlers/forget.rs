@@ -202,6 +202,16 @@ fn peek_forget_outcome(ctx: &OpsContext, id: MemoryId) -> Result<ForgetOutcome, 
         return Ok(ForgetOutcome::MemoryNotFound);
     };
     let row = guard.value();
+    // Tenant wall — mirror the read paths: a memory owned by another
+    // `(namespace, space)` is indistinguishable from a missing one to this
+    // caller. FORGET is lenient, so a foreign id reads as MemoryNotFound (a
+    // no-op success), never leaking that the id exists in another tenant. The
+    // apply layer re-checks inside the write txn as the authoritative guard.
+    if row.namespace_id != ctx.executor.caller_namespace.raw()
+        || row.space_id_bytes != <[u8; 16]>::from(ctx.executor.caller_space)
+    {
+        return Ok(ForgetOutcome::MemoryNotFound);
+    }
     if row.flags & brain_metadata::tables::memory::flags::ACTIVE == 0 {
         Ok(ForgetOutcome::AlreadyTombstoned)
     } else {

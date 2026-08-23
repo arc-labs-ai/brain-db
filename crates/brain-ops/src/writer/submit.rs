@@ -1245,6 +1245,9 @@ mod tests {
     async fn submit_tombstone_memory_marks_hnsw() {
         let (_dir, writer, shared) = build_writer_with_shared();
         let id = MemoryId::pack(0, 1, 0);
+        // The upsert and the tombstone must run in the same space — the
+        // tombstone apply guard treats a foreign space as NotFound.
+        let space = SpaceId::new();
         // Set up: insert.
         let upsert = Phase::UpsertMemory {
             id,
@@ -1261,7 +1264,7 @@ mod tests {
             deduplicate: false,
         };
         writer
-            .submit(Write::single(WriteId::new(), SpaceId::new(), upsert))
+            .submit(Write::single(WriteId::new(), space, upsert))
             .await
             .unwrap();
         assert!(!shared.is_tombstoned(id));
@@ -1276,7 +1279,7 @@ mod tests {
             at_unix_nanos: 1_700_000_001_000,
         };
         writer
-            .submit(Write::single(WriteId::new(), SpaceId::new(), tomb))
+            .submit(Write::single(WriteId::new(), space, tomb))
             .await
             .expect("tombstone submit");
         assert!(

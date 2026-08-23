@@ -126,8 +126,26 @@ fn peek_link_state(
         .map_err(|e| {
             OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
         })?;
-    let src_exists = mem_t.get(source.to_be_bytes()).ok().flatten().is_some();
-    let tgt_exists = mem_t.get(target.to_be_bytes()).ok().flatten().is_some();
+    // Tenant wall — an endpoint owned by another `(namespace, space)` reads
+    // as absent to this caller, so a cross-tenant LINK produces the same
+    // NotFound-shaped leniency as a genuinely missing id (no create, no
+    // existence oracle over foreign ids). Mirrors the read paths; the apply
+    // layer re-checks inside the write txn as the authoritative guard.
+    let caller_ns = ctx.executor.caller_namespace.raw();
+    let caller_space: [u8; 16] = ctx.executor.caller_space.into();
+    let owned = |id: MemoryId| -> bool {
+        mem_t
+            .get(id.to_be_bytes())
+            .ok()
+            .flatten()
+            .map(|g| {
+                let m = g.value();
+                m.namespace_id == caller_ns && m.space_id_bytes == caller_space
+            })
+            .unwrap_or(false)
+    };
+    let src_exists = owned(source);
+    let tgt_exists = owned(target);
     drop(mem_t);
 
     let edges_t = rtxn

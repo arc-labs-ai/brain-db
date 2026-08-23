@@ -181,7 +181,7 @@ pub fn apply_upsert_memory(
 pub fn apply_tombstone_memory(
     wtxn: &WriteTransaction,
     phase: &Phase,
-    _write: &Write,
+    write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
     let Phase::Tombstone {
         target,
@@ -210,6 +210,22 @@ pub fn apply_tombstone_memory(
         };
         guard.value()
     };
+
+    // Tenant wall (authoritative, inside the write txn). A MemoryId is an
+    // enumerable packed u128, so without this guard any caller holding the
+    // FORGET bit could delete rows across every tenant by id. A row owned
+    // by another space is indistinguishable from a missing one — FORGET is
+    // lenient, so this reads as NotFound and the handler maps it to a no-op
+    // success (no existence leak). The space id is the complete tenant key:
+    // it is a UUIDv5 that folds the namespace, so a foreign namespace always
+    // yields a disjoint space id, and it is the one scope field threaded
+    // reliably through both the non-txn and TXN_COMMIT write paths.
+    if row.space_id_bytes != <[u8; 16]>::from(write.space_id) {
+        return Err(ApplyError::NotFound {
+            what: "memory",
+            detail: format!("{id:?}"),
+        });
+    }
 
     // Stamp tombstoned_at + clear the ACTIVE flag. The actual slot
     // reclamation happens later via Phase::ReclaimSlots once the
@@ -813,5 +829,66 @@ mod tests {
         let err = apply_tombstone_memory(&wtxn, &phase, &fresh_write_for(SpaceId::default()))
             .unwrap_err();
         assert!(matches!(err, ApplyError::NotFound { what: "memory", .. }));
+    }
+
+    /// Tenant B tombstoning tenant A's MemoryId must NOT touch A's row: the
+    /// apply tenant-wall reads a foreign-space row as NotFound (FORGET's
+    /// lenient no-op), while A's own tombstone still works.
+    #[test]
+    fn tombstone_refuses_cross_tenant_memory() {
+        let (_dir, db) = open_db();
+        let id = MemoryId::pack(0, 1, 0);
+        let space_a = SpaceId::new();
+        let space_b = SpaceId::new();
+        let write_a = fresh_write_for(space_a);
+
+        // A writes the memory.
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_upsert_memory(&wtxn, &fixture_phase(id), &write_a).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let tombstone = Phase::Tombstone {
+            target: TombstoneTarget::Memory {
+                id,
+                mode: crate::write::phase::TombstoneMode::Soft,
+            },
+            reason: 1,
+            at_unix_nanos: 1_700_000_001_000,
+        };
+
+        // B tries to forget A's id — rejected as NotFound, no mutation.
+        {
+            let wtxn = db.write_txn().unwrap();
+            let err =
+                apply_tombstone_memory(&wtxn, &tombstone, &fresh_write_for(space_b)).unwrap_err();
+            assert!(matches!(err, ApplyError::NotFound { what: "memory", .. }));
+            wtxn.commit().unwrap();
+        }
+        {
+            let rtxn = db.read_txn().unwrap();
+            let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
+            let row = t.get(&id.to_be_bytes()).unwrap().unwrap().value();
+            assert!(
+                row.flags & brain_metadata::tables::memory::flags::ACTIVE != 0,
+                "cross-tenant FORGET must leave A's row ACTIVE"
+            );
+            assert_eq!(row.tombstoned_at_unix_nanos, None);
+        }
+
+        // A's own FORGET works.
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_tombstone_memory(&wtxn, &tombstone, &write_a).unwrap();
+            wtxn.commit().unwrap();
+        }
+        {
+            let rtxn = db.read_txn().unwrap();
+            let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
+            let row = t.get(&id.to_be_bytes()).unwrap().unwrap().value();
+            assert_eq!(row.flags & brain_metadata::tables::memory::flags::ACTIVE, 0);
+            assert_eq!(row.tombstoned_at_unix_nanos, Some(1_700_000_001_000));
+        }
     }
 }
