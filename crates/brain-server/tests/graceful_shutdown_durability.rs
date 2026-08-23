@@ -244,7 +244,12 @@ async fn recall_ids_until_contains(
     cue: &str,
     wanted: u128,
 ) -> Vec<u128> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    // 30s, not 3s: the loop returns the instant `wanted` surfaces (50ms poll),
+    // so this ceiling only bites the worst case — the async post-restart lexical
+    // reindex catching up under heavy CPU contention (e.g. the full suite). The
+    // write's durability is already proven synchronously by recovery; this just
+    // waits out the index rebuild rather than flaking when the box is busy.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let ids = recall_ids(client, stream_id, cue).await;
         if ids.contains(&wanted) || std::time::Instant::now() >= deadline {

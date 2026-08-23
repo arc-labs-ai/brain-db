@@ -75,6 +75,17 @@ pub enum WalError {
     #[error("directory {dir:?} contains no *.wal segment files; cannot open_existing")]
     NoSegmentsFound { dir: PathBuf },
 
+    #[error(
+        "recovered tail offset {offset} is out of range for active segment {path:?} \
+         (header {header}, on-disk size {file_size})"
+    )]
+    RecoveredOffsetOutOfRange {
+        path: PathBuf,
+        offset: u64,
+        header: usize,
+        file_size: u64,
+    },
+
     #[error("record encoded size ({record_bytes}) exceeds max_segment_bytes ({segment_max})")]
     RecordExceedsSegmentLimit {
         record_bytes: usize,
@@ -188,17 +199,28 @@ impl Wal {
     /// Open an existing WAL for append, resuming at `next_lsn`.
     ///
     /// Caller must have already run [`crate::recovery::recover`] to determine
-    /// `next_lsn` — supplying a wrong value risks LSN reuse, which the WAL
-    /// reader will then reject as corruption on the next recovery.
+    /// both `next_lsn` and `recovered_tail_offset`
+    /// ([`crate::recovery::RecoveryReport::active_tail_offset`]) — supplying a
+    /// wrong value risks LSN reuse, which the WAL reader will then reject as
+    /// corruption on the next recovery.
     ///
-    /// Selects the highest-`segment_seq` segment as the active one and
-    /// re-opens it for append at the end of its existing on-disk bytes.
-    /// Subsequent appends extend that segment (or roll over to a new one
-    /// per the usual capacity rule).
+    /// Selects the highest-`segment_seq` segment as the active one. Before
+    /// positioning the append cursor it **physically truncates** that
+    /// segment to `recovered_tail_offset` — the byte position after the last
+    /// durably-good, fully-applied record recovery validated. This removes
+    /// any torn-tail bytes or never-committed dangling-transaction prefix a
+    /// crash left on disk, so subsequent appends overwrite the garbage
+    /// rather than following it. Without this, a later recovery would treat
+    /// the buried garbage as a clean end and silently drop everything
+    /// appended after it (and LSNs would be reused).
+    ///
+    /// Subsequent appends extend the truncated segment (or roll over to a
+    /// new one per the usual capacity rule).
     pub async fn open_existing(
         dir: impl AsRef<Path>,
         shard_uuid: [u8; 16],
         next_lsn: u64,
+        recovered_tail_offset: u64,
         config: WalConfig,
     ) -> Result<Self, WalError> {
         let dir_path = dir.as_ref().to_path_buf();
@@ -207,7 +229,7 @@ impl Wal {
         // 4 KB header against shard_uuid + format version + CRC). Pull out
         // only what we need, then drop the reader before opening the
         // segment for async append.
-        let (active_segment_seq, active_starting_lsn, bytes_on_disk_pre) = {
+        let (active_segment_seq, active_starting_lsn, file_size) = {
             let reader = WalReader::open(&dir_path, shard_uuid)?;
             let last = reader
                 .segments()
@@ -215,12 +237,36 @@ impl Wal {
                 .ok_or_else(|| WalError::NoSegmentsFound {
                     dir: dir_path.clone(),
                 })?;
-            let seq = last.segment_seq;
-            let starting_lsn = last.starting_lsn;
-            let bytes = (last.file_size as usize).saturating_sub(WAL_SEGMENT_HEADER_LEN);
-            (seq, starting_lsn, bytes)
+            (last.segment_seq, last.starting_lsn, last.file_size)
         };
         let active_path = segment_path(&dir_path, active_segment_seq);
+
+        // Validate the recovered offset lies within [header, on-disk size].
+        // Recovery derives it from the very bytes on disk, so a value past
+        // EOF (or below the header) signals a caller bug or a mismatched
+        // recover()/open_existing() pairing — fail loud rather than corrupt.
+        if recovered_tail_offset < WAL_SEGMENT_HEADER_LEN as u64
+            || recovered_tail_offset > file_size
+        {
+            return Err(WalError::RecoveredOffsetOutOfRange {
+                path: active_path.clone(),
+                offset: recovered_tail_offset,
+                header: WAL_SEGMENT_HEADER_LEN,
+                file_size,
+            });
+        }
+
+        // Physically drop torn / uncommitted-tail bytes past the validated
+        // logical tail. A committed record can never sit past this offset
+        // (recovery only advances the tail at a commit boundary), so this
+        // truncation is loss-free. `sync_all` makes the shorter length
+        // durable before we resume appending.
+        if recovered_tail_offset < file_size {
+            let f = std::fs::OpenOptions::new().write(true).open(&active_path)?;
+            f.set_len(recovered_tail_offset)?;
+            f.sync_all()?;
+        }
+        let bytes_on_disk_pre = (recovered_tail_offset as usize) - WAL_SEGMENT_HEADER_LEN;
 
         // Re-open the active segment for append. Header was already
         // validated by WalReader above; here we just establish the
@@ -893,10 +939,15 @@ mod tests {
             }
             wal.shutdown().await.unwrap();
         });
-        // Reopen, append more, verify LSN sequence continues.
+        // Reopen, append more, verify LSN sequence continues. A clean
+        // shutdown left no torn tail, so the recovered offset is the full
+        // on-disk size (no truncation).
         let p2 = path.clone();
+        let clean_size = std::fs::metadata(path.join("0000000000.wal"))
+            .unwrap()
+            .len();
         glommio_run(move || async move {
-            let wal = Wal::open_existing(&p2, uuid(20), 4, WalConfig::default())
+            let wal = Wal::open_existing(&p2, uuid(20), 4, clean_size, WalConfig::default())
                 .await
                 .expect("open existing");
             assert_eq!(wal.next_lsn(), 4);
@@ -916,9 +967,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_owned();
         glommio_run(move || async move {
-            let err = Wal::open_existing(&path, uuid(21), 1, WalConfig::default())
-                .await
-                .expect_err("must fail on empty dir");
+            let err = Wal::open_existing(
+                &path,
+                uuid(21),
+                1,
+                WAL_SEGMENT_HEADER_LEN as u64,
+                WalConfig::default(),
+            )
+            .await
+            .expect_err("must fail on empty dir");
             assert!(
                 matches!(err, WalError::NoSegmentsFound { .. } | WalError::Read(_)),
                 "got {err:?}"
@@ -938,9 +995,15 @@ mod tests {
         });
         let p2 = path.clone();
         glommio_run(move || async move {
-            let err = Wal::open_existing(&p2, uuid(99), 2, WalConfig::default())
-                .await
-                .expect_err("uuid mismatch must fail");
+            let err = Wal::open_existing(
+                &p2,
+                uuid(99),
+                2,
+                WAL_SEGMENT_HEADER_LEN as u64,
+                WalConfig::default(),
+            )
+            .await
+            .expect_err("uuid mismatch must fail");
             // WalReader catches the uuid mismatch before we get to
             // open_for_append, so the error surfaces as Read(_).
             assert!(matches!(err, WalError::Read(_)), "got {err:?}");

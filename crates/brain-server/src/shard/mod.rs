@@ -1574,6 +1574,11 @@ pub fn spawn_shard(
                 .unwrap_or(false)
         });
     let next_lsn_after_recovery: u64;
+    // Physical byte length the active WAL segment must be truncated to
+    // before reopening for append — the tail recovery validated. Passed to
+    // `Wal::open_existing` so a crash-left torn tail or never-committed
+    // dangling-transaction prefix is dropped rather than appended past.
+    let recovered_tail_offset: u64;
     let allocator = if segments_present {
         let (report, alloc) = recover(&mut arena, &wal_dir, shard_uuid, &mut metadata_db)?;
         info!(
@@ -1582,12 +1587,16 @@ pub fn spawn_shard(
             records_skipped = report.records_skipped,
             records_discarded = report.records_discarded,
             next_lsn = report.next_lsn,
+            active_tail_offset = report.active_tail_offset,
+            active_segment_seq = ?report.active_segment_seq,
             "WAL recovery complete"
         );
         next_lsn_after_recovery = report.next_lsn;
+        recovered_tail_offset = report.active_tail_offset;
         alloc
     } else {
         next_lsn_after_recovery = 1;
+        recovered_tail_offset = 0;
         SlotAllocator::rebuild_from_arena(&arena)
     };
     let metadata: SharedMetadataDb = Arc::new(metadata_db);
@@ -2350,6 +2359,7 @@ pub fn spawn_shard(
                     &wal_dir_for_executor,
                     shard_uuid,
                     next_lsn_after_recovery,
+                    recovered_tail_offset,
                     wal_config,
                 )
                 .await

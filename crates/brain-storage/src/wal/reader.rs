@@ -62,6 +62,13 @@ pub struct WalReader {
     current: Option<LoadedSegment>,
     expected_next_lsn: u64,
     last_decoded_lsn: Option<u64>,
+    /// Byte offset within its segment file at which the most recently
+    /// yielded record ends (i.e. the position immediately after it). Used
+    /// by recovery to compute the physical tail to truncate to on reopen.
+    last_record_end_offset: Option<usize>,
+    /// `segment_seq` of the segment the most recently yielded record lives
+    /// in. Pairs with `last_record_end_offset`.
+    last_record_segment_seq: Option<u64>,
     finished: bool,
 }
 
@@ -193,6 +200,8 @@ impl WalReader {
             current: None,
             expected_next_lsn,
             last_decoded_lsn: None,
+            last_record_end_offset: None,
+            last_record_segment_seq: None,
             finished,
         })
     }
@@ -237,6 +246,8 @@ impl WalReader {
             .first()
             .map_or(start_lsn, |s| s.starting_lsn);
         reader.last_decoded_lsn = None;
+        reader.last_record_end_offset = None;
+        reader.last_record_segment_seq = None;
         reader.finished = reader.segments.is_empty();
 
         Ok(IterFrom {
@@ -258,6 +269,29 @@ impl WalReader {
     #[must_use]
     pub fn next_expected_lsn(&self) -> u64 {
         self.expected_next_lsn
+    }
+
+    /// Byte offset within its segment file at which the most recently
+    /// yielded record ends. `None` if the reader hasn't yielded any record
+    /// yet. Recovery pairs this with [`Self::last_record_segment_seq`] to
+    /// derive the physical tail to truncate the active segment to on reopen.
+    #[must_use]
+    pub fn last_record_end_offset(&self) -> Option<usize> {
+        self.last_record_end_offset
+    }
+
+    /// `segment_seq` of the segment holding the most recently yielded
+    /// record. `None` if the reader hasn't yielded any record yet.
+    #[must_use]
+    pub fn last_record_segment_seq(&self) -> Option<u64> {
+        self.last_record_segment_seq
+    }
+
+    /// `segment_seq` of the active (highest-seq) segment — the append
+    /// target on reopen. `None` if the WAL has no segments.
+    #[must_use]
+    pub fn active_segment_seq(&self) -> Option<u64> {
+        self.segments.last().map(|s| s.segment_seq)
     }
 }
 
@@ -327,6 +361,9 @@ impl Iterator for WalReader {
                     seg.cursor += consumed;
                     self.expected_next_lsn = lsn + 1;
                     self.last_decoded_lsn = Some(lsn);
+                    self.last_record_end_offset = Some(seg.cursor);
+                    self.last_record_segment_seq =
+                        Some(self.segments[self.current_idx].segment_seq);
                     return Some(Ok(record));
                 }
                 Ok(DecodeOutcome::Truncated) | Err(WalRecordError::CrcMismatch { .. }) => {

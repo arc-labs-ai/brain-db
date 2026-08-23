@@ -37,6 +37,7 @@ use crate::wal::payload::{
 };
 use crate::wal::reader::{WalReadError, WalReader};
 use crate::wal::record::{WalRecord, FLAG_SUBSCRIBE_EVENT};
+use crate::wal::segment::WAL_SEGMENT_HEADER_LEN;
 
 // ---------------------------------------------------------------------------
 // MetadataSink trait + in-memory impl.
@@ -171,6 +172,16 @@ pub enum RecoveryError {
         source: MetadataSinkError,
     },
 
+    #[error(
+        "transaction {txn_id:?} buffered more records ({buffered}) than its declared \
+         expected_record_count ({expected}) without a commit — WAL is corrupt"
+    )]
+    TxnBufferOverflow {
+        txn_id: TxnId,
+        buffered: usize,
+        expected: u32,
+    },
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -186,7 +197,27 @@ pub struct RecoveryReport {
     pub records_discarded: u64,
     /// LSN of the next record the WAL should write. After recovery, the
     /// caller resumes appending starting here.
+    ///
+    /// This is `last_good_lsn + 1` where `last_good_lsn` is the LSN of the
+    /// last record in the durably-good, fully-applied prefix — it excludes
+    /// records that were discarded (a dangling transaction's begin +
+    /// members) or never fully decoded (a torn tail). Resuming here lets
+    /// new appends reuse the LSNs of the truncated-away bytes with no gap.
     pub next_lsn: u64,
+    /// Byte length the **active** (highest-`segment_seq`) segment must be
+    /// truncated to before resuming appends: the file position immediately
+    /// after the last durably-good, fully-applied record in that segment,
+    /// or `WAL_SEGMENT_HEADER_LEN` if every record in the active segment was
+    /// discarded/torn (or the active segment is empty). Everything past this
+    /// offset is torn-tail bytes or a never-committed dangling-transaction
+    /// prefix that a crash left behind; [`crate::wal::wal::Wal::open_existing`]
+    /// physically `set_len`s the segment to this length so new appends
+    /// overwrite rather than follow the garbage.
+    pub active_tail_offset: u64,
+    /// `segment_seq` of the active segment `active_tail_offset` refers to,
+    /// or `None` if the WAL had no segments. Lets the reopen path assert it
+    /// is truncating the same segment recovery validated.
+    pub active_segment_seq: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -202,24 +233,47 @@ pub fn recover(
     sink: &mut dyn MetadataSink,
 ) -> Result<(RecoveryReport, SlotAllocator), RecoveryError> {
     let durable_lsn = sink.durable_lsn();
-    let reader = WalReader::open(wal_dir, shard_uuid)?;
+    let mut reader = WalReader::open(wal_dir, shard_uuid)?;
+    let active_segment_seq = reader.active_segment_seq();
 
     let mut records_replayed: u64 = 0;
     let mut records_skipped: u64 = 0;
     let mut records_discarded: u64 = 0;
-    let mut next_lsn: u64 = durable_lsn + 1;
+
+    // The durably-good, fully-applied tail: the LSN + physical position
+    // (segment_seq, end offset) of the last record we're certain is
+    // committed and applied. Advances only at a clean boundary — never
+    // while a transaction is open — so a dangling `TxnBegin` (+ members)
+    // at the end of the WAL leaves the tail pointing *before* the begin.
+    // `last_good_lsn` seeds at `durable_lsn` so an all-skipped or empty WAL
+    // resumes at `durable_lsn + 1`.
+    let mut last_good_lsn: u64 = durable_lsn;
+    let mut good_tail_offset: Option<usize> = None;
+    let mut good_tail_segment_seq: Option<u64> = None;
 
     // TXN state machine.
     let mut active_txn: Option<TxnId> = None;
+    let mut active_txn_expected: u32 = 0;
     let mut txn_buffer: Vec<(WalRecord, WalPayload)> = Vec::new();
 
-    for item in reader {
+    while let Some(item) = reader.next() {
         let record = item?;
         let lsn = record.lsn.raw();
-        next_lsn = lsn + 1;
 
+        // Records at or below the durable checkpoint are already applied
+        // and committed. They are part of the good prefix, so advance the
+        // tail; but they can never sit inside an open transaction (the
+        // checkpoint boundary is itself a commit boundary), so this is
+        // always a clean boundary.
         if lsn <= durable_lsn {
             records_skipped += 1;
+            advance_tail(
+                &reader,
+                lsn,
+                &mut last_good_lsn,
+                &mut good_tail_offset,
+                &mut good_tail_segment_seq,
+            );
             continue;
         }
 
@@ -227,9 +281,20 @@ pub fn recover(
         // record kinds as the durable write records, distinguished only by
         // this flag. They are not state mutations — the durable record
         // carries the data recovery needs — so skip them here. (Decoding
-        // their CBOR body as a typed-graph row would fail outright.)
+        // their CBOR body as a typed-graph row would fail outright.) A
+        // flagged event outside a transaction is a clean boundary; one
+        // buffered inside an open txn is not, so only advance when idle.
         if record.flags & FLAG_SUBSCRIBE_EVENT != 0 {
             records_skipped += 1;
+            if active_txn.is_none() {
+                advance_tail(
+                    &reader,
+                    lsn,
+                    &mut last_good_lsn,
+                    &mut good_tail_offset,
+                    &mut good_tail_segment_seq,
+                );
+            }
             continue;
         }
 
@@ -245,17 +310,60 @@ pub fn recover(
                     // Replay the whole batch.
                     let buffered = std::mem::take(&mut txn_buffer);
                     active_txn = None;
+                    active_txn_expected = 0;
                     for (b_record, b_payload) in &buffered {
                         apply(arena, sink, b_record, b_payload)?;
                     }
                     records_replayed += buffered.len() as u64;
+                    // Commit closes the txn: this is a clean boundary.
+                    advance_tail(
+                        &reader,
+                        lsn,
+                        &mut last_good_lsn,
+                        &mut good_tail_offset,
+                        &mut good_tail_segment_seq,
+                    );
                 }
                 WalPayload::TxnAbort(p) if p.txn_id == current_txn => {
                     records_discarded += txn_buffer.len() as u64;
                     txn_buffer.clear();
                     active_txn = None;
+                    active_txn_expected = 0;
+                    // Abort closes the txn without applying anything, but
+                    // the abort record itself is durably good — the tail
+                    // may advance to just past it.
+                    advance_tail(
+                        &reader,
+                        lsn,
+                        &mut last_good_lsn,
+                        &mut good_tail_offset,
+                        &mut good_tail_segment_seq,
+                    );
+                }
+                // A second `TxnBegin` while one is open means the first
+                // never committed (dangling). Discard ONLY the first txn's
+                // buffered records, then start the new one — a dangling
+                // txn must never consume unrelated records.
+                WalPayload::TxnBegin(p) => {
+                    records_discarded += txn_buffer.len() as u64;
+                    txn_buffer.clear();
+                    active_txn = Some(p.txn_id);
+                    active_txn_expected = p.expected_record_count;
+                    txn_buffer.push((record, payload));
                 }
                 _ => {
+                    // Defense-in-depth: bound the buffer by the declared
+                    // member count so a corrupt/never-terminated txn can't
+                    // buffer unboundedly (OOM). The buffer legitimately
+                    // holds begin (1) + expected members; a further member
+                    // before commit/abort means the WAL is corrupt.
+                    if txn_buffer.len() > active_txn_expected as usize {
+                        return Err(RecoveryError::TxnBufferOverflow {
+                            txn_id: current_txn,
+                            buffered: txn_buffer.len(),
+                            expected: active_txn_expected,
+                        });
+                    }
                     txn_buffer.push((record, payload));
                 }
             }
@@ -264,20 +372,44 @@ pub fn recover(
             match &payload {
                 WalPayload::TxnBegin(p) => {
                     active_txn = Some(p.txn_id);
+                    active_txn_expected = p.expected_record_count;
                     txn_buffer.push((record, payload));
+                    // Opening a txn is NOT a boundary: the tail stays put
+                    // until we see the matching commit.
                 }
                 _ => {
                     apply(arena, sink, &record, &payload)?;
                     records_replayed += 1;
+                    advance_tail(
+                        &reader,
+                        lsn,
+                        &mut last_good_lsn,
+                        &mut good_tail_offset,
+                        &mut good_tail_segment_seq,
+                    );
                 }
             }
         }
     }
 
-    // Partial transaction at end of WAL: discard.
+    // Partial transaction at end of WAL: discard ONLY its own buffered
+    // records. The tail already points before the dangling begin.
     if active_txn.is_some() {
         records_discarded += txn_buffer.len() as u64;
     }
+
+    // The active segment is truncated to the tail offset iff the tail lives
+    // in that segment. Otherwise the active segment holds only discarded /
+    // torn bytes (or is an empty post-rollover segment) and is cut back to
+    // its header. New appends then resume at `last_good_lsn + 1`, reusing
+    // the truncated LSNs with no gap.
+    let active_tail_offset = match (good_tail_segment_seq, active_segment_seq) {
+        (Some(good_seq), Some(active_seq)) if good_seq == active_seq => {
+            good_tail_offset.unwrap_or(WAL_SEGMENT_HEADER_LEN) as u64
+        }
+        _ => WAL_SEGMENT_HEADER_LEN as u64,
+    };
+    let next_lsn = last_good_lsn + 1;
 
     let allocator = SlotAllocator::rebuild_from_arena(arena);
     Ok((
@@ -286,9 +418,26 @@ pub fn recover(
             records_skipped,
             records_discarded,
             next_lsn,
+            active_tail_offset,
+            active_segment_seq,
         },
         allocator,
     ))
+}
+
+/// Advance the durably-good tail to the record the reader just yielded.
+/// Reads the reader's post-decode cursor position so the offset is the byte
+/// immediately after the record in its segment file.
+fn advance_tail(
+    reader: &WalReader,
+    lsn: u64,
+    last_good_lsn: &mut u64,
+    good_tail_offset: &mut Option<usize>,
+    good_tail_segment_seq: &mut Option<u64>,
+) {
+    *last_good_lsn = lsn;
+    *good_tail_offset = reader.last_record_end_offset();
+    *good_tail_segment_seq = reader.last_record_segment_seq();
 }
 
 // ---------------------------------------------------------------------------
@@ -493,8 +642,8 @@ mod tests {
         TxnCommitPayload,
     };
     use crate::wal::record::{Lsn, WalRecord};
-    use crate::wal::segment::WalSegment;
-    use crate::wal::wal::Wal;
+    use crate::wal::segment::{WalSegment, WAL_SEGMENT_HEADER_LEN};
+    use crate::wal::wal::{Wal, WalConfig};
     use brain_core::{MemoryId, MemoryKind, RequestId, SessionId, SpaceId, TxnId};
     use std::path::{Path, PathBuf};
 
@@ -676,6 +825,57 @@ mod tests {
         assert_eq!(report.records_replayed, 0);
         assert_eq!(report.records_skipped, 10);
         assert!(sink.applied().is_empty());
+    }
+
+    /// Clean-shutdown guard: after a graceful close (no torn tail), the
+    /// recovered tail offset MUST equal the on-disk size of the active
+    /// segment so `open_existing` truncates nothing — otherwise it would
+    /// chop acknowledged, committed records and lose data on restart. This
+    /// is the deterministic unit-level counterpart to the server's
+    /// `acknowledged_writes_survive_graceful_shutdown_and_restart`.
+    #[test]
+    fn clean_shutdown_tail_offset_equals_file_size_no_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = fresh_wal_dir(&dir);
+        let records: Vec<_> = (0..12).map(encode_record).collect();
+        write_via_wal(&wal_dir, records);
+
+        let seg_path = wal_dir.join("0000000000.wal");
+        let file_size = std::fs::metadata(&seg_path).unwrap().len();
+
+        let mut arena = fresh_arena(&dir, 32);
+        let mut sink = InMemoryMetadataSink::new();
+        let (report, _alloc) = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap();
+
+        assert_eq!(report.records_replayed, 12);
+        assert_eq!(report.active_segment_seq, Some(0));
+        assert_eq!(
+            report.active_tail_offset, file_size,
+            "clean shutdown must recover a tail at end-of-file; a shorter \
+             offset would truncate committed records on reopen"
+        );
+        assert!(report.active_tail_offset > WAL_SEGMENT_HEADER_LEN as u64);
+
+        // And reopening with that offset performs no truncation: the file
+        // keeps every byte and all records still read back.
+        let wal_dir2 = wal_dir.clone();
+        let next_lsn = report.next_lsn;
+        let offset = report.active_tail_offset;
+        crate::wal::segment::glommio_run(move || async move {
+            let wal =
+                Wal::open_existing(&wal_dir2, uuid(1), next_lsn, offset, WalConfig::default())
+                    .await
+                    .unwrap();
+            wal.shutdown().await.unwrap();
+        });
+        assert_eq!(
+            std::fs::metadata(&seg_path).unwrap().len(),
+            file_size,
+            "open_existing must not shrink a cleanly-closed segment"
+        );
+        let reader = WalReader::open(&wal_dir, uuid(1)).unwrap();
+        let lsns: Vec<u64> = reader.map(|r| r.unwrap().lsn.raw()).collect();
+        assert_eq!(lsns, (1..=12).collect::<Vec<_>>());
     }
 
     // ----- End-to-end (phase doc done-when) -----------------------------
@@ -1146,5 +1346,208 @@ mod tests {
             applied.values().all(|p| matches!(p, WalPayload::Encode(_))),
             "no StageCompleted payload reached the sink"
         );
+    }
+
+    // ----- Multi-cycle crash consistency (reopen truncates the tail) ----
+    //
+    // The single-cycle torn-tail / dangling-txn tests above prove one
+    // recovery pass. These prove the *reopen boundary*: after recovery
+    // computes a tail offset, `Wal::open_existing` must physically truncate
+    // the active segment to it so records appended after the reopen land on
+    // clean bytes and survive a *second* recovery — with no LSN reuse and no
+    // redb/arena divergence.
+
+    fn begin_record(lsn: u64, txn: TxnId, expected: u32) -> WalRecord {
+        let mut r = WalRecord::from_typed(
+            Lsn(lsn),
+            0,
+            1_700_000_000_000_000_000,
+            0xCAFE,
+            &WalPayload::TxnBegin(TxnBeginPayload {
+                txn_id: txn,
+                expected_record_count: expected,
+            }),
+        );
+        r.lsn = Lsn(lsn);
+        r
+    }
+
+    #[test]
+    fn torn_tail_reopen_truncates_then_second_recovery_keeps_new_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = fresh_wal_dir(&dir);
+
+        // Cycle 1: write 10 records (LSN 1..=10, slots 0..=9) durably.
+        let records: Vec<_> = (0..10).map(encode_record).collect();
+        write_via_wal(&wal_dir, records);
+
+        // Crash A: tear the tail (partial record 10 / slot 9).
+        let seg_path = wal_dir.join("0000000000.wal");
+        let torn_size = std::fs::metadata(&seg_path).unwrap().len() - 30;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&seg_path)
+            .unwrap()
+            .set_len(torn_size)
+            .unwrap();
+
+        // Recover #1: 9 good, torn record dropped.
+        let mut arena = fresh_arena(&dir, 64);
+        let mut sink = InMemoryMetadataSink::new();
+        let (report1, _a) = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap();
+        assert_eq!(report1.records_replayed, 9);
+        assert_eq!(report1.next_lsn, 10);
+        assert_eq!(report1.active_segment_seq, Some(0));
+        // Tail sits strictly before the torn bytes.
+        assert!(report1.active_tail_offset < torn_size);
+        assert!(report1.active_tail_offset >= WAL_SEGMENT_HEADER_LEN as u64);
+
+        // Reopen: open_existing truncates to the recovered tail, then we
+        // append 5 NEW records (LSN 10..=14, slots 10..=14) and shut down
+        // cleanly.
+        let wal_dir2 = wal_dir.clone();
+        let next_lsn1 = report1.next_lsn;
+        let offset1 = report1.active_tail_offset;
+        crate::wal::segment::glommio_run(move || async move {
+            let wal =
+                Wal::open_existing(&wal_dir2, uuid(1), next_lsn1, offset1, WalConfig::default())
+                    .await
+                    .unwrap();
+            for slot in 10..15u64 {
+                let lsn = wal.append(encode_record(slot)).await.unwrap();
+                assert!(lsn.raw() >= 10, "new appends must not reuse LSNs <10");
+            }
+            wal.shutdown().await.unwrap();
+        });
+
+        // The truncation must have overwritten the torn region, not grown
+        // past it: file no longer contains the old torn bytes as garbage.
+        // Recover #2 on a fresh arena.
+        let mut arena2 = fresh_arena(&dir, 64);
+        let mut sink2 = InMemoryMetadataSink::new();
+        let (report2, _a2) = recover(&mut arena2, &wal_dir, uuid(1), &mut sink2).unwrap();
+
+        // BUG 1 regression: all 14 records (9 original + 5 post-reopen)
+        // replay. The old code buried the torn bytes and a second recovery
+        // stopped at record 9, silently dropping the 5 new records.
+        assert_eq!(report2.records_replayed, 14, "post-reopen records lost");
+        assert_eq!(report2.next_lsn, 15);
+
+        // No divergence: slots 0..=8 and 10..=14 occupied; the torn slot 9
+        // never came back.
+        for slot in 0..9u64 {
+            assert!(arena2.slot(slot).is_occupied(), "slot {slot} lost");
+        }
+        assert!(!arena2.slot(9).is_occupied(), "torn slot 9 resurrected");
+        for slot in 10..15u64 {
+            assert!(arena2.slot(slot).is_occupied(), "new slot {slot} lost");
+        }
+
+        // No LSN reuse: contiguous 1..=14 on disk.
+        let reader = WalReader::open(&wal_dir, uuid(1)).unwrap();
+        let lsns: Vec<u64> = reader.map(|r| r.unwrap().lsn.raw()).collect();
+        assert_eq!(lsns, (1..=14).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn dangling_txn_reopen_truncates_then_committed_records_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = fresh_wal_dir(&dir);
+        let txn = tid(77);
+
+        // Cycle 1: one committed encode (LSN 1, slot 0), then a dangling
+        // TxnBegin (LSN 2) + 2 members (LSN 3,4) with NO commit — the
+        // classic "multi-phase write fsynced, crash before commit" case.
+        let mut e0 = encode_record(0);
+        e0.lsn = Lsn(1);
+        let begin = begin_record(2, txn, 2);
+        let mut m1 = encode_record(1);
+        m1.lsn = Lsn(3);
+        let mut m2 = encode_record(2);
+        m2.lsn = Lsn(4);
+        write_via_segment(&wal_dir, &[e0, begin, m1, m2]);
+
+        // Recover #1: LSN 1 applied; the dangling txn (begin + 2 members)
+        // discarded; tail lands after LSN 1, before the begin.
+        let mut arena = fresh_arena(&dir, 16);
+        let mut sink = InMemoryMetadataSink::new();
+        let (report1, _a) = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap();
+        assert_eq!(report1.records_replayed, 1);
+        assert_eq!(report1.records_discarded, 3);
+        assert_eq!(report1.next_lsn, 2, "resume before the dangling begin");
+        assert!(arena.slot(0).is_occupied());
+        assert!(!arena.slot(1).is_occupied());
+        assert!(!arena.slot(2).is_occupied());
+
+        // Reopen: truncate away the dangling prefix, append 2 real
+        // committed encodes (LSN 2,3 / slots 1,2), shut down.
+        let wal_dir2 = wal_dir.clone();
+        let next_lsn1 = report1.next_lsn;
+        let offset1 = report1.active_tail_offset;
+        crate::wal::segment::glommio_run(move || async move {
+            let wal =
+                Wal::open_existing(&wal_dir2, uuid(1), next_lsn1, offset1, WalConfig::default())
+                    .await
+                    .unwrap();
+            let l1 = wal.append(encode_record(1)).await.unwrap();
+            let l2 = wal.append(encode_record(2)).await.unwrap();
+            assert_eq!(
+                (l1.raw(), l2.raw()),
+                (2, 3),
+                "LSNs of dangling txn reused cleanly"
+            );
+            wal.shutdown().await.unwrap();
+        });
+
+        // Recover #2: LSN 1,2,3 → slots 0,1,2. The dangling txn's records
+        // are gone (BUG 2 regression: the old code would have buffered the
+        // post-reopen committed records into the still-open txn and
+        // discarded them at EOL).
+        let mut arena2 = fresh_arena(&dir, 16);
+        let mut sink2 = InMemoryMetadataSink::new();
+        let (report2, _a2) = recover(&mut arena2, &wal_dir, uuid(1), &mut sink2).unwrap();
+        assert_eq!(report2.records_replayed, 3, "committed records lost");
+        assert_eq!(report2.records_discarded, 0, "no dangling txn remains");
+        assert_eq!(report2.next_lsn, 4);
+        for slot in 0..3u64 {
+            assert!(arena2.slot(slot).is_occupied(), "slot {slot} lost");
+        }
+        let reader = WalReader::open(&wal_dir, uuid(1)).unwrap();
+        let lsns: Vec<u64> = reader.map(|r| r.unwrap().lsn.raw()).collect();
+        assert_eq!(lsns, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn dangling_txn_buffer_is_bounded_by_expected_count() {
+        // A TxnBegin declaring 2 members followed by a flood of members and
+        // no commit must halt with TxnBufferOverflow rather than buffering
+        // every record to EOL (OOM protection).
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = fresh_wal_dir(&dir);
+        let txn = tid(88);
+
+        let mut records = vec![begin_record(1, txn, 2)];
+        // 6 members, no commit. The bound trips at member #3.
+        for i in 0..6u64 {
+            let mut m = encode_record(i);
+            m.lsn = Lsn(2 + i);
+            records.push(m);
+        }
+        write_via_segment(&wal_dir, &records);
+
+        let mut arena = fresh_arena(&dir, 16);
+        let mut sink = InMemoryMetadataSink::new();
+        let err = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap_err();
+        match err {
+            RecoveryError::TxnBufferOverflow {
+                buffered, expected, ..
+            } => {
+                assert_eq!(expected, 2);
+                // begin (1) + expected members (2) buffered; the next
+                // member overflows.
+                assert_eq!(buffered, 3);
+            }
+            other => panic!("expected TxnBufferOverflow, got {other:?}"),
+        }
     }
 }
