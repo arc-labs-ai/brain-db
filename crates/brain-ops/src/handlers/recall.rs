@@ -81,6 +81,24 @@ pub const MAX_RECALL_FILTER_ENTRIES: usize = 1024;
 /// of subjects at most.
 pub const MAX_SUBJECT_CANDIDATES: usize = 8;
 
+/// Upper bound on the number of DISTINCT surfaces mined from a cue that are
+/// handed to the (heavy) entity resolver. `MAX_SUBJECT_CANDIDATES` bounds the
+/// resolver's OUTPUT; this bounds its INVOCATIONS. Without it a cue-only RECALL
+/// (empty `subject_name`) calls `entity_resolve_scored` once per distinct token
+/// — a heavy trigram scan over every entity type — so a multi-megabyte cue of
+/// distinct non-resolving tokens (the wire cap is 16 MiB) would starve the
+/// single-writer shard core with resolver calls even though few or none
+/// resolve. Real cues name a handful of subjects; 32 is generous headroom while
+/// keeping the per-call resolver work strictly bounded.
+pub const MAX_CUE_SURFACES: usize = 32;
+
+/// Upper bound on how many whitespace tokens of the cue are SCANNED while
+/// mining surfaces. Bounds the token walk itself so a cue that is millions of
+/// copies of a handful of distinct tokens (which would never fill
+/// `MAX_CUE_SURFACES` and so never trip that cap) still can't force an O(cue)
+/// scan on the shard core. Far above any real cue length.
+pub const MAX_CUE_TOKENS_SCANNED: usize = 256;
+
 pub async fn handle_recall(
     mut req: RecallRequest,
     ctx: &OpsContext,
@@ -1223,6 +1241,36 @@ fn slot_hit_projectable(slot: Slot, subject: SubjectRef, anchors: &HashSet<Entit
     statement_subject_in_scope(subject, anchors)
 }
 
+/// Whether a statement id belongs to the caller's `(namespace, space)` scope.
+///
+/// The statement-question bridge index probed by the slot-projection path is
+/// shard-GLOBAL — it carries no tenant partition, so a probe with the caller's
+/// cue vector can match a question generated from ANY tenant's fact. Loading the
+/// hit's row via `statement_get` does NOT re-check scope (the `Statement` value
+/// carries no scope), so without this guard a foreign-space statement whose
+/// object/subject-slot question matched could project as a confident answer AND
+/// (worse) flip the abstention gates off (a spurious `Answer` disables both
+/// `apply_anchor_abstention` and `apply_kind_presence_abstention`). The
+/// predicate walk is immune because it reads scope-prefixed secondary indexes;
+/// this restores the same isolation for the global bridge probe by loading the
+/// primary row's stamped scope and comparing it to the caller's.
+///
+/// A missing row is out of scope (`false`) — never fabricate an answer.
+fn statement_in_caller_scope(
+    rtxn: &redb::ReadTransaction,
+    sid: brain_core::StatementId,
+    caller_scope: brain_metadata::RowScope,
+) -> Result<bool, OpError> {
+    use brain_metadata::tables::statement::STATEMENTS_TABLE;
+    let table = rtxn
+        .open_table(STATEMENTS_TABLE)
+        .map_err(|e| OpError::Internal(format!("slot-projection scope open: {e}")))?;
+    let row = table
+        .get(&sid.to_bytes())
+        .map_err(|e| OpError::Internal(format!("slot-projection scope get: {e}")))?;
+    Ok(matches!(row, Some(guard) if guard.value().scope() == caller_scope))
+}
+
 /// Build the cue-scoped OBJECT set for a `Slot::Object` slot-projection match
 /// (FIX A). The set is the DISTINCT objects of the statement-question bridge
 /// hits that (a) probe the Object slot, (b) clear the strong floor against THIS
@@ -1239,6 +1287,7 @@ fn cue_scoped_object_set(
     rtxn: &redb::ReadTransaction,
     hits: &[(brain_core::StatementId, Slot, f32)],
     anchors: &HashSet<EntityId>,
+    caller_scope: brain_metadata::RowScope,
 ) -> Result<Vec<GroundedValue>, OpError> {
     let mut values: Vec<GroundedValue> = Vec::new();
     for &(sid, slot, score) in hits {
@@ -1248,6 +1297,11 @@ fn cue_scoped_object_set(
             break;
         }
         if !matches!(slot, Slot::Object) {
+            continue;
+        }
+        // Tenant isolation for the GLOBAL bridge probe: drop any hit whose
+        // statement is not in the caller's scope before it can become a member.
+        if !statement_in_caller_scope(rtxn, sid, caller_scope)? {
             continue;
         }
         let Some(statement) = brain_metadata::statement_get(rtxn, sid)
@@ -1293,6 +1347,7 @@ fn slot_projection_grounded(
     ctx: &OpsContext,
     cue_vec: &[f32; brain_embed::VECTOR_DIM],
     anchors: &HashSet<EntityId>,
+    caller_scope: brain_metadata::RowScope,
     req: &RecallRequest,
 ) -> Result<Option<GroundedAnswer>, OpError> {
     let hits = ctx
@@ -1313,6 +1368,14 @@ fn slot_projection_grounded(
         // can clear it, so stop rather than scan the tail.
         if score < SLOT_PROJECTION_STRONG_FLOOR {
             break;
+        }
+        // Tenant isolation for the GLOBAL bridge probe: a hit whose statement is
+        // not in the caller's scope must never project — it would both leak a
+        // foreign fact AND, as a spurious `Answer`, disable the abstention gates
+        // (`apply_anchor_abstention` / `apply_kind_presence_abstention`). Checked
+        // BEFORE loading/projecting so a foreign row can produce nothing.
+        if !statement_in_caller_scope(rtxn, sid, caller_scope)? {
+            continue;
         }
         let Some(statement) = brain_metadata::statement_get(rtxn, sid)
             .map_err(|e| OpError::Internal(format!("slot projection statement_get: {e}")))?
@@ -1349,7 +1412,7 @@ fn slot_projection_grounded(
             // distinct object → Single. Time/Subject slots stay Single (a fact has
             // one event time / one subject).
             let answer = if matches!(slot, Slot::Object) {
-                let mut values = cue_scoped_object_set(rtxn, &hits, anchors)?;
+                let mut values = cue_scoped_object_set(rtxn, &hits, anchors, caller_scope)?;
                 // The chosen hit projected, so its object is always a member; keep
                 // it as the sole member if the scan somehow produced nothing.
                 if values.is_empty() {
@@ -1435,7 +1498,9 @@ fn best_grounded_for_cue(
     // projection about the anchor by construction; we keep it as a candidate but
     // do NOT return early, so a genuine multi-hop walk answer can override it
     // below (a shallow slot answer must not short-circuit a real chain).
-    let slot_answer = slot_projection_grounded(&rtxn, ctx, cue_vec, &anchors, req)?;
+    let caller_scope =
+        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
+    let slot_answer = slot_projection_grounded(&rtxn, ctx, cue_vec, &anchors, caller_scope, req)?;
 
     // Captured before the loop consumes `candidates`, for the decision trace.
     let candidate_count = candidates.len();
@@ -1745,22 +1810,10 @@ fn subject_candidates_from_cue(
         &mut seen,
     );
 
-    // The surfaces to resolve against the canonical-name index.
-    let mut surfaces: Vec<String> = Vec::new();
-    let subject = req.subject_name.trim();
-    if subject.is_empty() {
-        // Mine surfaces from the cue when the client gave no subject.
-        surfaces.extend(capitalized_runs(&req.cue_text));
-        surfaces.extend(
-            req.cue_text
-                .split_whitespace()
-                .filter(|t| t.chars().count() >= 2)
-                .map(str::to_string),
-        );
-    } else {
-        // 2. Explicit subject still works.
-        surfaces.push(subject.to_string());
-    }
+    // The surfaces to resolve against the canonical-name index. DISTINCT and
+    // capped at `MAX_CUE_SURFACES` so the resolver (heavy per call) runs a
+    // bounded number of times regardless of cue length (see `mine_cue_surfaces`).
+    let surfaces = mine_cue_surfaces(&req.subject_name, &req.cue_text);
 
     for surface in surfaces {
         if out.len() >= MAX_SUBJECT_CANDIDATES {
@@ -1792,6 +1845,56 @@ fn subject_candidates_from_cue(
     Ok(out)
 }
 
+/// Mine the DISTINCT candidate surfaces to resolve against the canonical-name
+/// index, bounded so the (heavy) entity resolver runs a strictly bounded number
+/// of times regardless of cue length.
+///
+/// When the client passed an explicit `subject_name` it is the sole surface.
+/// Otherwise surfaces are mined from the cue: capitalized proper-noun runs
+/// first (the strongest anchors), then individual whitespace tokens of length
+/// ≥ 2 (CJK single-token names, lowercase entity names). Deduped, the token walk
+/// clamped to `MAX_CUE_TOKENS_SCANNED`, and the whole set capped at
+/// `MAX_CUE_SURFACES`. A normal-length cue is unaffected (it names far fewer than
+/// `MAX_CUE_SURFACES` distinct surfaces); a pathological multi-megabyte cue can
+/// no longer drive an unbounded number of resolver calls on the shard core.
+fn mine_cue_surfaces(subject_name: &str, cue_text: &str) -> Vec<String> {
+    let subject = subject_name.trim();
+    if !subject.is_empty() {
+        // Explicit subject still works — single surface, no mining.
+        return vec![subject.to_string()];
+    }
+
+    let mut surfaces: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    // Capitalized proper-noun runs first — the strongest anchors, so they get
+    // the scarce surface budget before generic tokens.
+    for run in capitalized_runs(cue_text) {
+        if surfaces.len() >= MAX_CUE_SURFACES {
+            return surfaces;
+        }
+        if seen.insert(run.clone()) {
+            surfaces.push(run);
+        }
+    }
+
+    // Then individual tokens, with the token walk itself clamped so a cue that
+    // is millions of copies of a few distinct tokens can't force an O(cue) scan.
+    for tok in cue_text.split_whitespace().take(MAX_CUE_TOKENS_SCANNED) {
+        if surfaces.len() >= MAX_CUE_SURFACES {
+            break;
+        }
+        if tok.chars().count() < 2 {
+            continue;
+        }
+        if seen.insert(tok.to_string()) {
+            surfaces.push(tok.to_string());
+        }
+    }
+
+    surfaces
+}
+
 /// Extract capitalized multi-word (or single-word) runs from the cue —
 /// Latin proper-noun surfaces like "NeuraCorp" or "Web Summit". A run is a
 /// maximal sequence of whitespace-split tokens whose first character is
@@ -1808,7 +1911,9 @@ fn capitalized_runs(cue: &str) -> Vec<String> {
             current.clear();
         }
     };
-    for raw in cue.split_whitespace() {
+    // Bound the token walk (see `MAX_CUE_TOKENS_SCANNED`) so a pathological
+    // multi-megabyte cue can't force an O(cue) scan on the shard core.
+    for raw in cue.split_whitespace().take(MAX_CUE_TOKENS_SCANNED) {
         // Trim leading/trailing punctuation and a trailing possessive so
         // the surface matches the stored canonical name.
         let trimmed = raw
@@ -2491,10 +2596,17 @@ fn overlay_txn_buffer(
                 continue;
             }
         }
-        let score = cosine(&cue_vec, &p.vector);
-        if score < req.confidence_threshold {
+        // `confidence_threshold` is a SALIENCE floor on the committed path
+        // (brain-planner `filter_confidence` gates memory hits by
+        // `salience >= confidence_min`, deliberately — see the owner note there;
+        // the surfaced `confidence` field remains cosine). Apply the SAME
+        // semantic to buffered hits so read-your-writes is consistent: filter by
+        // the pending item's salience, never by cosine. A fresh buffered write
+        // has no decay, so `salience_initial` is its current salience.
+        if !pending_clears_confidence(p.salience_initial, req.confidence_threshold) {
             continue;
         }
+        let score = cosine(&cue_vec, &p.vector);
         merged.push(pending_to_memory_result(p, req, score));
     }
 
@@ -2509,6 +2621,21 @@ fn overlay_txn_buffer(
     // Candidate pool for membership, not the answer cap (applied downstream).
     merged.truncate(RECALL_CANDIDATE_POOL as usize);
     Ok(merged)
+}
+
+/// Whether a buffered (pending) hit clears the `confidence_threshold` gate,
+/// using the SAME semantic as the committed path.
+///
+/// On the committed path `confidence_threshold` becomes `FilterChain::confidence_min`
+/// and gates memory hits as a SALIENCE floor (`salience >= min`), NOT a cosine
+/// floor (intentional; the surfaced `confidence` field is cosine but the FILTER
+/// is salience). The overlay historically applied it as a cosine floor, so the
+/// one wire field filtered committed vs pending on different quantities and
+/// read-your-writes was inconsistent. This makes the pending gate salience-based
+/// too. A zero threshold admits everything (committed leaves `confidence_min`
+/// unset at `0.0`), which `salience >= 0.0` reproduces.
+fn pending_clears_confidence(salience: f32, confidence_threshold: f32) -> bool {
+    salience >= confidence_threshold
 }
 
 fn pending_to_memory_result(p: &BufferedEncode, req: &RecallRequest, score: f32) -> MemoryResult {
@@ -4039,7 +4166,7 @@ mod tests {
             (s_soccer_dup.id, Slot::Object, 0.70),
             (s_chess.id, Slot::Object, 0.40),
         ];
-        let values = cue_scoped_object_set(&rtxn, &hits, &anchors).unwrap();
+        let values = cue_scoped_object_set(&rtxn, &hits, &anchors, scope).unwrap();
         let objs: Vec<String> = values
             .iter()
             .filter_map(|v| match &v.object {
@@ -4052,5 +4179,190 @@ mod tests {
             vec!["soccer".to_string(), "tennis".to_string()],
             "cross-predicate on-cue folds in; off-cue (below floor), wrong-subject, and duplicate excluded"
         );
+    }
+
+    // ── R1: bounded cue-token surface mining (resolver-invocation DoS) ──────
+
+    #[test]
+    fn mine_cue_surfaces_caps_pathological_cue() {
+        // A cue of many DISTINCT non-resolving tokens must not fan out into an
+        // unbounded number of resolver surfaces — each surface is one heavy
+        // `entity_resolve_scored` call on the shard core.
+        let cue: String = (0..10_000)
+            .map(|i| format!("tok{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let surfaces = mine_cue_surfaces("", &cue);
+        assert!(
+            surfaces.len() <= MAX_CUE_SURFACES,
+            "distinct-token cue mined {} surfaces, cap is {}",
+            surfaces.len(),
+            MAX_CUE_SURFACES
+        );
+    }
+
+    #[test]
+    fn mine_cue_surfaces_caps_repeated_token_cue() {
+        // A cue that is millions of copies of a few distinct tokens fills the
+        // dedup set slowly, so the surface cap alone wouldn't stop the scan; the
+        // token-scan clamp keeps it bounded regardless.
+        let cue = "alpha beta ".repeat(1_000_000);
+        let surfaces = mine_cue_surfaces("", &cue);
+        assert!(surfaces.len() <= MAX_CUE_SURFACES);
+        // Only two distinct tokens exist, so we resolve at most two surfaces.
+        assert!(surfaces.contains(&"alpha".to_string()));
+        assert!(surfaces.contains(&"beta".to_string()));
+        assert_eq!(surfaces.len(), 2);
+    }
+
+    #[test]
+    fn mine_cue_surfaces_keeps_normal_cue() {
+        // A realistic cue still yields its named subject as a surface, unchanged.
+        let surfaces = mine_cue_surfaces("", "who does Niraj report to");
+        assert!(
+            surfaces.contains(&"Niraj".to_string()),
+            "normal cue must still surface its named subject: {surfaces:?}"
+        );
+        // Explicit subject_name bypasses mining entirely.
+        assert_eq!(
+            mine_cue_surfaces("Niraj Georgian", "irrelevant cue text"),
+            vec!["Niraj Georgian".to_string()]
+        );
+    }
+
+    // ── R2: slot-projection tenant scoping (cross-space answer leak) ─────────
+
+    #[allow(clippy::type_complexity)]
+    fn scoped_statement_fixture() -> (
+        tempfile::TempDir,
+        brain_metadata::MetadataDb,
+        brain_metadata::RowScope, // scope A (caller)
+        brain_metadata::RowScope, // scope B (foreign)
+        brain_core::StatementId,  // A's statement
+        brain_core::StatementId,  // B's statement
+    ) {
+        use brain_core::{
+            Entity, EntityType, EvidenceRef, Statement, StatementKind, StatementObject,
+            StatementValue, SubjectRef,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = brain_metadata::MetadataDb::open(dir.path().join("m.redb")).unwrap();
+        let scope_a =
+            brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16]);
+        let scope_b =
+            brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xB2; 16]);
+        let subj_a = EntityId::new();
+        let subj_b = EntityId::new();
+        let wtxn = db.write_txn().unwrap();
+        for (scope, id, name) in [(scope_a, subj_a, "Alice"), (scope_b, subj_b, "Bob")] {
+            brain_metadata::entity::ops::entity_put(
+                &wtxn,
+                scope,
+                brain_core::SessionId::DEFAULT,
+                &Entity::new_active(id, EntityType::PERSON_ID, name.into(), name.into(), 1),
+            )
+            .unwrap();
+        }
+        let pid = brain_metadata::schema::predicate::predicate_intern_or_get(
+            &wtxn, "test", "plays", 0, 1,
+        )
+        .unwrap();
+        let mk = |subject: EntityId, obj: &str| {
+            Statement::new_root(
+                brain_core::StatementId::new(),
+                StatementKind::Fact,
+                SubjectRef::Entity(subject),
+                pid,
+                StatementObject::Value(StatementValue::Text(obj.into())),
+                0.9,
+                EvidenceRef::default(),
+                brain_core::ExtractorId::from(0),
+                1,
+                1,
+            )
+        };
+        let s_a = mk(subj_a, "soccer");
+        let s_b = mk(subj_b, "cricket");
+        let (id_a, id_b) = (s_a.id, s_b.id);
+        brain_metadata::statement::crud::statement_create(
+            &wtxn,
+            scope_a,
+            brain_core::SessionId::DEFAULT,
+            &s_a,
+            1,
+        )
+        .unwrap();
+        brain_metadata::statement::crud::statement_create(
+            &wtxn,
+            scope_b,
+            brain_core::SessionId::DEFAULT,
+            &s_b,
+            1,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        (dir, db, scope_a, scope_b, id_a, id_b)
+    }
+
+    #[test]
+    fn statement_in_caller_scope_drops_foreign_and_missing() {
+        let (_dir, db, scope_a, scope_b, id_a, id_b) = scoped_statement_fixture();
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_in_caller_scope(&rtxn, id_a, scope_a).unwrap());
+        assert!(!statement_in_caller_scope(&rtxn, id_b, scope_a).unwrap());
+        assert!(statement_in_caller_scope(&rtxn, id_b, scope_b).unwrap());
+        // A missing row is out of scope, never an answer source.
+        assert!(
+            !statement_in_caller_scope(&rtxn, brain_core::StatementId::new(), scope_a).unwrap()
+        );
+    }
+
+    #[test]
+    fn cue_scoped_object_set_drops_foreign_space_hit_with_empty_anchors() {
+        // The regression: with NO resolved subject (anchors empty) the old
+        // `slot_hit_projectable` let Object hits from ANY tenant through, so a
+        // space-B statement whose object-slot question matched a space-A caller's
+        // cue would project (and, upstream, disable abstention). The row-load
+        // scope check must drop the foreign hit while keeping the same-space one.
+        use brain_core::{StatementObject, StatementValue};
+        let (_dir, db, scope_a, _scope_b, id_a, id_b) = scoped_statement_fixture();
+        let rtxn = db.read_txn().unwrap();
+        let anchors: HashSet<EntityId> = HashSet::new(); // cue resolved no subject
+        let hits = vec![
+            (id_b, Slot::Object, 0.90), // foreign (space B), strongest
+            (id_a, Slot::Object, 0.80), // same space (A)
+        ];
+        let values = cue_scoped_object_set(&rtxn, &hits, &anchors, scope_a).unwrap();
+        let objs: Vec<String> = values
+            .iter()
+            .filter_map(|v| match &v.object {
+                StatementObject::Value(StatementValue::Text(t)) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            objs,
+            vec!["soccer".to_string()],
+            "foreign-space object must be dropped; same-space object still projects"
+        );
+    }
+
+    // ── R4: in-txn read-your-writes confidence semantics ────────────────────
+
+    #[test]
+    fn pending_confidence_gate_matches_committed_salience_semantics() {
+        // Committed path gates memory hits by `salience >= confidence_min`
+        // (brain-planner `filter_confidence`). The overlay must agree: filter
+        // pending hits by salience, never cosine.
+        //
+        // High salience, LOW cosine → committed KEEPS it (salience-based), so the
+        // overlay must keep it too. A cosine floor would have wrongly dropped it.
+        assert!(pending_clears_confidence(0.9, 0.5));
+        // Low salience, (any) cosine → committed DROPS it; overlay must drop it.
+        assert!(!pending_clears_confidence(0.3, 0.5));
+        // Exactly at the floor is kept (>=), matching committed.
+        assert!(pending_clears_confidence(0.5, 0.5));
+        // Zero threshold admits everything (committed leaves confidence_min unset).
+        assert!(pending_clears_confidence(0.0, 0.0));
     }
 }
