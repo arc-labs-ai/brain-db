@@ -182,15 +182,36 @@ where
 
             match result {
                 Ok(resp) => resp,
-                // Escape the message so one containing `"`, `\`, or a
-                // control char can't produce malformed JSON.
-                Err(e) => {
-                    let body = format!("{{\"error\":\"{}\"}}\n", json_escape(&e.to_string()));
-                    canned_json(status_for_error(&e), &body)
-                }
+                Err(e) => error_response(&e),
             }
         })
     }
+}
+
+/// Turn a handler error into the wire response.
+///
+/// The status code comes from [`status_for_error`] (unchanged). The
+/// *body* depends on which side of the 4xx/5xx line the error falls on:
+///
+/// - **4xx (client-actionable):** the error `Display` is echoed to the
+///   caller — these messages are written for the client and carry no
+///   host internals.
+/// - **5xx (internal):** variants like `Io` / `Hyper` / `Http` embed
+///   underlying system detail (paths, socket state) in their `Display`,
+///   so the real error is logged server-side and the client receives a
+///   generic `"internal error"` message instead.
+fn error_response(e: &crate::Error) -> Response<ResponseBody> {
+    let status = status_for_error(e);
+    let message = if status.is_server_error() {
+        tracing::warn!(error = %e, status = status.as_u16(), "handler failed");
+        "internal error"
+    } else {
+        &e.to_string()
+    };
+    // Escape the message so one containing `"`, `\`, or a control char
+    // can't produce malformed JSON.
+    let body = format!("{{\"error\":\"{}\"}}\n", json_escape(message));
+    canned_json(status, &body)
 }
 
 fn wrap<B, H, Fut>(handler: H) -> BoxedAsyncHandler<B>
@@ -340,6 +361,44 @@ mod tests {
         let (status, body) = collect(r.dispatch(req(Method::GET, "/v1/down")).await).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(body.starts_with(b"{\"error\":"));
+    }
+
+    #[tokio::test]
+    async fn internal_error_body_is_generic_and_hides_detail() {
+        // An Io error's Display embeds the underlying system message
+        // (here a fake host path); it must be logged, not echoed. The
+        // status mapping (500) is preserved.
+        async fn explode(_req: Request<Full<Bytes>>) -> crate::Result<Response<ResponseBody>> {
+            Err(crate::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "EACCES /srv/brain/data/shard-0/wal",
+            )))
+        }
+        let r = Router::<Full<Bytes>>::new().get("/v1/io", explode);
+        let (status, body) = collect(r.dispatch(req(Method::GET, "/v1/io")).await).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let text = std::str::from_utf8(&body).expect("utf8");
+        assert!(!text.contains("/srv/brain/data"), "leaked path: {text}");
+        assert!(!text.contains("EACCES"), "leaked io detail: {text}");
+        assert_eq!(text, "{\"error\":\"internal error\"}\n");
+    }
+
+    #[tokio::test]
+    async fn client_error_keeps_actionable_message() {
+        // A 4xx error is meant for the caller — its message is echoed
+        // verbatim (escaped), not replaced with the generic body.
+        async fn explode(_req: Request<Full<Bytes>>) -> crate::Result<Response<ResponseBody>> {
+            Err(crate::Error::Upgrade("bad websocket key".to_string()))
+        }
+        let r = Router::<Full<Bytes>>::new().get("/v1/bad", explode);
+        let (status, body) = collect(r.dispatch(req(Method::GET, "/v1/bad")).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let text = std::str::from_utf8(&body).expect("utf8");
+        assert!(
+            text.contains("bad websocket key"),
+            "client message dropped: {text}"
+        );
+        assert_ne!(text, "{\"error\":\"internal error\"}\n");
     }
 
     #[test]
