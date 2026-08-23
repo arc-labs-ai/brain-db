@@ -123,12 +123,34 @@ impl TierStatus {
     }
 }
 
+/// Upper bound on the number of distinct predicate qnames the
+/// `schema_filtered_total` map will track as their own series. Predicate
+/// qnames are open-vocab, user-text-shaped strings, so on diverse or
+/// adversarial input the distinct-key count would otherwise grow without
+/// limit — a per-shard memory leak and a Prometheus cardinality blow-up.
+///
+/// At the cap, further novel qnames stop minting new keys and fold into
+/// a single [`SCHEMA_FILTERED_OVERFLOW_KEY`] bucket, keeping both memory
+/// and series count bounded while preserving per-predicate detail below
+/// the cap. One slot is reserved for the overflow bucket, so at most
+/// `MAX_TRACKED_PREDICATES - 1` real predicates get their own series and
+/// the map length never exceeds `MAX_TRACKED_PREDICATES`.
+pub const MAX_TRACKED_PREDICATES: usize = 1024;
+
+/// Reserved key that accumulates schema-filtered counts for predicate
+/// qnames beyond the [`MAX_TRACKED_PREDICATES`] cap. Surfaced as a
+/// normal entry in the snapshot so operators still see the aggregate
+/// volume of untracked filtering.
+pub const SCHEMA_FILTERED_OVERFLOW_KEY: &str = "__other__";
+
 /// Metric family for `ExtractorWorker`. Same shared-by-Arc pattern as
 /// [`super::auto_edge::AutoEdgeMetrics`].
 ///
 /// `schema_filtered_total` tracks per-predicate label cardinality via
-/// a `Mutex<HashMap>` because predicate qnames are deployment-shaped
-/// (low cardinality in practice but unbounded in theory). The
+/// a `Mutex<HashMap>` because predicate qnames are deployment-shaped.
+/// The distinct-key count is capped at [`MAX_TRACKED_PREDICATES`]; past
+/// the cap, novel qnames fold into [`SCHEMA_FILTERED_OVERFLOW_KEY`] so
+/// the map stays bounded in memory and exposed series count. The
 /// exposition layer reads the snapshot under a short-lived lock.
 #[derive(Debug)]
 pub struct ExtractorMetrics {
@@ -209,7 +231,23 @@ impl ExtractorMetrics {
     /// fails the active-schema admission check.
     pub fn inc_schema_filtered(&self, predicate_qname: &str) {
         let mut guard = self.schema_filtered_total.lock();
-        *guard.entry(predicate_qname.to_string()).or_insert(0) += 1;
+        // Fast path: an already-tracked key (including the overflow
+        // bucket itself) just increments — no growth.
+        if let Some(count) = guard.get_mut(predicate_qname) {
+            *count += 1;
+            return;
+        }
+        // Novel key: mint its own series only while under the cap,
+        // reserving one slot for the overflow bucket. Past that, fold
+        // into the single overflow bucket so the map length is bounded
+        // by MAX_TRACKED_PREDICATES.
+        if guard.len() < MAX_TRACKED_PREDICATES - 1 {
+            guard.insert(predicate_qname.to_string(), 1);
+        } else {
+            *guard
+                .entry(SCHEMA_FILTERED_OVERFLOW_KEY.to_string())
+                .or_insert(0) += 1;
+        }
     }
 
     /// Bumped by the apply pass when a genuine extracted item (entity,
@@ -398,6 +436,46 @@ mod tests {
         assert_eq!(
             s.resolver_outcome_total[ResolverOutcome::Create as usize],
             1
+        );
+    }
+
+    #[test]
+    fn schema_filtered_cardinality_is_bounded() {
+        let m = ExtractorMetrics::new();
+        // Push far more distinct predicates than the cap.
+        let distinct = MAX_TRACKED_PREDICATES * 3;
+        for i in 0..distinct {
+            m.inc_schema_filtered(&format!("acme:pred_{i}"));
+        }
+        let s = m.snapshot();
+
+        // Map never exceeds the cap, no matter how many novel keys arrive.
+        assert!(
+            s.schema_filtered_total.len() <= MAX_TRACKED_PREDICATES,
+            "tracked map grew past cap: {} > {}",
+            s.schema_filtered_total.len(),
+            MAX_TRACKED_PREDICATES
+        );
+
+        // The overflow bucket must account for every distinct key that
+        // did not get its own series.
+        let real_series = MAX_TRACKED_PREDICATES - 1;
+        let overflow = s
+            .schema_filtered_total
+            .get(SCHEMA_FILTERED_OVERFLOW_KEY)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(overflow, (distinct - real_series) as u64);
+
+        // Every observation is accounted for (one per distinct key here).
+        let total: u64 = s.schema_filtered_total.values().sum();
+        assert_eq!(total, distinct as u64);
+
+        // Below-cap keys keep their own exact per-predicate counts.
+        m.inc_schema_filtered("acme:pred_0");
+        assert_eq!(
+            m.snapshot().schema_filtered_total.get("acme:pred_0"),
+            Some(&2)
         );
     }
 }
