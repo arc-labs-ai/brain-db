@@ -37,6 +37,7 @@ use brain_core::{MemoryId, ShardId, SlotIndex, SlotVersion};
 use brain_index::{SharedHnsw, SpaceVectorSource, VECTOR_DIM};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_ops::memory_artifact::get_artifact_vector;
+use brain_ops::RedbCommittedWatermark;
 use brain_planner::SharedMetadataDb;
 use brain_storage::arena::ArenaFile;
 use brain_storage::wal::payload::{CheckpointBeginPayload, CheckpointEndPayload, WalPayload};
@@ -387,6 +388,13 @@ pub(crate) struct ShardSnapshotSource {
     metadata: SharedMetadataDb,
     hnsw: SharedHnsw,
     next_checkpoint_id: RefCell<u64>,
+    /// The per-shard writer's redb-committed-LSN watermark. The
+    /// checkpoint's `durable_lsn` must be this value (clamped to the
+    /// WAL-durable tail at CHECKPOINT_BEGIN), NOT the WAL-appended tail:
+    /// the WAL tail advances at enqueue time, before the writer's redb
+    /// commit, so stamping it would let recovery skip a WAL-durable
+    /// record whose redb commit had not run at power loss.
+    redb_committed_watermark: RedbCommittedWatermark,
 }
 
 impl ShardSnapshotSource {
@@ -400,6 +408,7 @@ impl ShardSnapshotSource {
         wal: Rc<RefCell<Option<Wal>>>,
         metadata: SharedMetadataDb,
         hnsw: SharedHnsw,
+        redb_committed_watermark: RedbCommittedWatermark,
     ) -> Self {
         // metadata.redb lives at the shard root; the WAL directory is a
         // sibling. Derive it through ShardPaths so the snapshot bundle's
@@ -426,6 +435,7 @@ impl ShardSnapshotSource {
             metadata,
             hnsw,
             next_checkpoint_id: RefCell::new(next_id),
+            redb_committed_watermark,
         }
     }
 
@@ -522,6 +532,20 @@ impl SnapshotSource for ShardSnapshotSource {
                 arena.capacity_slots()
             };
 
+            // The checkpoint's durable_lsn is the redb-committed
+            // watermark, NOT the WAL-appended tail (`target_lsn_hint`).
+            // The watermark only advances after `wtxn.commit()`, so
+            // every record at or below it is durable in metadata; a
+            // record that is WAL-durable but whose redb commit had not
+            // yet run sits strictly above it and is therefore replayed
+            // (not skipped) on recovery. Clamp to `target_lsn_hint` so
+            // the checkpoint never claims a durable_lsn past the WAL
+            // tail bundled with this snapshot — the watermark is always
+            // <= the true WAL tail, but a concurrent commit could push
+            // it past the tail we sampled at CHECKPOINT_BEGIN, and
+            // `min` keeps the checkpoint consistent with the copied WAL.
+            let checkpoint_durable_lsn = self.redb_committed_watermark.load().min(target_lsn_hint);
+
             // Step 6: CHECKPOINT_END.
             {
                 let wal_guard = self.wal.borrow();
@@ -535,7 +559,7 @@ impl SnapshotSource for ShardSnapshotSource {
                 };
                 let payload = WalPayload::CheckpointEnd(CheckpointEndPayload {
                     checkpoint_id: ckpt_id,
-                    durable_lsn: target_lsn_hint,
+                    durable_lsn: checkpoint_durable_lsn,
                     arena_capacity: arena_capacity_at_checkpoint,
                 });
                 let record = WalRecord::from_typed(Lsn(0), 0, now_unix_nanos(), 0, &payload);
@@ -1117,6 +1141,14 @@ mod tests {
                     wal_cell.clone(),
                     metadata,
                     hnsw_shared,
+                    // Watermark seeded past the WAL tail so this
+                    // bundle-completeness test exercises the normal
+                    // (all-committed) checkpoint path.
+                    {
+                        let wm = RedbCommittedWatermark::new();
+                        wm.advance_to(u64::MAX);
+                        wm
+                    },
                 );
 
                 let id = src.take_snapshot().await.expect("take_snapshot");
@@ -1201,6 +1233,7 @@ mod tests {
                     wal_cell,
                     metadata,
                     hnsw_shared,
+                    RedbCommittedWatermark::new(),
                 );
                 src.delete_snapshot(SnapshotId(1))
                     .await
@@ -1263,10 +1296,185 @@ mod tests {
                 wal_cell,
                 metadata,
                 hnsw_shared,
+                RedbCommittedWatermark::new(),
             );
             // The next allocated checkpoint id is 4 → bundle #3 is safe.
             src.next_ckpt_id()
         });
         assert_eq!(next_id, 4);
+    }
+
+    // ---- CORE-DURABILITY: checkpoint durable_lsn vs redb-committed watermark
+
+    /// A minimal Encode WAL record for a given arena slot. Mirrors the
+    /// storage crate's recovery-test fixture: recovery decodes + applies
+    /// it, so it counts toward `records_replayed` / `applied()`.
+    fn encode_record(slot: u64) -> WalRecord {
+        use brain_core::{MemoryId, MemoryKind, NamespaceId, SessionId, SpaceId};
+        use brain_storage::wal::payload::{EncodePayload, WalPayload};
+
+        let p = EncodePayload {
+            memory_id: MemoryId::pack(1, slot, 1),
+            request_id: [0u8; 16].into(),
+            space_id: SpaceId::default(),
+            namespace_id: NamespaceId::SYSTEM,
+            session_id: SessionId(0),
+            kind: MemoryKind::Episodic,
+            salience_initial: 0.5,
+            embedding_model_fp: [0xAB; 16],
+            text: "hello".to_string(),
+            vector: vec![0.5; VECTOR_DIM],
+            edges: vec![],
+            request_hash: [0; 32],
+            response_payload: vec![],
+            deduplicate: false,
+            occurred_at_unix_nanos: None,
+        };
+        WalRecord::from_typed(
+            Lsn(0),
+            0,
+            1_700_000_000_000_000_000,
+            0xCAFE,
+            &WalPayload::Encode(p),
+        )
+    }
+
+    /// Append `n_data` Encode records (LSN `1..=n_data`), set the
+    /// redb-committed watermark to `watermark`, take exactly one
+    /// snapshot, then drain the WAL. Returns `(tempdir, wal_dir, uuid,
+    /// arena_path)` for a subsequent recovery pass. The tempdir is
+    /// returned so the caller keeps it alive.
+    fn snapshot_with_watermark(
+        n_data: u64,
+        watermark: u64,
+    ) -> (TempDir, std::path::PathBuf, [u8; 16], std::path::PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        let arena_path = base.join("arena.bin");
+        let md_path = base.join("metadata.redb");
+        let wal_dir = base.join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let uuid: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+        let md = MetadataDb::open(&md_path).expect("MetadataDb::open");
+        let metadata: SharedMetadataDb = Arc::new(md);
+
+        let wm = RedbCommittedWatermark::new();
+        wm.advance_to(watermark);
+
+        {
+            let arena_path = arena_path.clone();
+            let md_path = md_path.clone();
+            let wal_dir = wal_dir.clone();
+            let snap_root = base.join("snapshots");
+            let metadata = metadata.clone();
+            glommio_run(move || async move {
+                let arena = ArenaFile::open(&arena_path, uuid, 16).expect("ArenaFile::open");
+                let arena_cell = Rc::new(RefCell::new(arena));
+                let wal = Wal::create_with_config(&wal_dir, uuid, WalConfig::default())
+                    .await
+                    .expect("Wal::create_with_config");
+                for slot in 0..n_data {
+                    wal.append(encode_record(slot)).await.expect("wal append");
+                }
+                let wal_cell = Rc::new(RefCell::new(Some(wal)));
+                let (hnsw, _w) =
+                    brain_index::SharedHnsw::new(brain_index::IndexParams::default_v1()).unwrap();
+                let src = ShardSnapshotSource::new(
+                    uuid,
+                    snap_root,
+                    arena_path.clone(),
+                    md_path,
+                    arena_cell,
+                    wal_cell.clone(),
+                    metadata,
+                    hnsw,
+                    wm,
+                );
+                src.take_snapshot().await.expect("take_snapshot");
+                let mut g = wal_cell.borrow_mut();
+                if let Some(w) = g.take() {
+                    w.shutdown().await.expect("Wal::shutdown");
+                }
+            });
+        }
+        (tmp, wal_dir, uuid, arena_path)
+    }
+
+    /// The gap: three writes are WAL-durable (LSN 1,2,3) but only the
+    /// first has been committed to redb (watermark = 1). The periodic
+    /// snapshot stamps CHECKPOINT_END while records 2 and 3 are still
+    /// uncommitted. The checkpoint's `durable_lsn` MUST be the
+    /// redb-committed watermark (1), NOT the WAL tail — otherwise a
+    /// crash-then-recovery would skip LSN 2 and 3 and silently drop
+    /// WAL-durable data.
+    #[test]
+    fn checkpoint_durable_lsn_is_redb_watermark_not_wal_tail() {
+        use brain_storage::recovery::MetadataSink;
+        let (_tmp, wal_dir, uuid, arena_path) = snapshot_with_watermark(3, 1);
+
+        // Pass 1 (fresh sink): reads the CHECKPOINT_END record, which
+        // carries durable_lsn = watermark.
+        let mut arena = ArenaFile::open(&arena_path, uuid, 16).expect("reopen arena");
+        let mut sink = brain_storage::recovery::InMemoryMetadataSink::new();
+        let (report1, _alloc) =
+            brain_storage::recovery::recover(&mut arena, &wal_dir, uuid, &mut sink)
+                .expect("recover pass 1");
+        assert_eq!(
+            sink.durable_lsn(),
+            1,
+            "CHECKPOINT_END.durable_lsn must equal the redb-committed watermark (1), \
+             not the WAL tail",
+        );
+        assert!(
+            sink.durable_lsn() < report1.next_lsn.saturating_sub(1),
+            "durable_lsn ({}) must be strictly below the WAL tail (next_lsn-1 = {})",
+            sink.durable_lsn(),
+            report1.next_lsn.saturating_sub(1),
+        );
+
+        // Pass 2 (sink seeded with the checkpoint's durable_lsn): proves
+        // recovery REPLAYS the WAL-durable-but-redb-uncommitted records
+        // rather than skipping them.
+        let mut arena2 = ArenaFile::open(&arena_path, uuid, 16).expect("reopen arena 2");
+        let mut sink2 =
+            brain_storage::recovery::InMemoryMetadataSink::with_durable_lsn(sink.durable_lsn());
+        let (report2, _alloc2) =
+            brain_storage::recovery::recover(&mut arena2, &wal_dir, uuid, &mut sink2)
+                .expect("recover pass 2");
+        assert!(
+            sink2.applied().contains_key(&2),
+            "LSN 2 (WAL-durable, redb-uncommitted) must be REPLAYED",
+        );
+        assert!(
+            sink2.applied().contains_key(&3),
+            "LSN 3 (WAL-durable, redb-uncommitted) must be REPLAYED",
+        );
+        assert_eq!(
+            report2.records_skipped, 1,
+            "only LSN 1 (at/below the watermark) may be skipped",
+        );
+    }
+
+    /// Normal case: every write has committed to redb (watermark past
+    /// the WAL tail). The checkpoint then advances `durable_lsn` to the
+    /// latest LSN (clamped to the WAL tail sampled at CHECKPOINT_BEGIN),
+    /// so recovery correctly skips the whole already-durable prefix.
+    #[test]
+    fn checkpoint_durable_lsn_advances_when_all_writes_committed() {
+        use brain_storage::recovery::MetadataSink;
+        // watermark = u64::MAX → "everything committed"; durable_lsn is
+        // clamped to the WAL tail (the CHECKPOINT_BEGIN LSN, 4).
+        let (_tmp, wal_dir, uuid, arena_path) = snapshot_with_watermark(3, u64::MAX);
+
+        let mut arena = ArenaFile::open(&arena_path, uuid, 16).expect("reopen arena");
+        let mut sink = brain_storage::recovery::InMemoryMetadataSink::new();
+        brain_storage::recovery::recover(&mut arena, &wal_dir, uuid, &mut sink).expect("recover");
+        // Three data records (1,2,3) + CHECKPOINT_BEGIN (4); the tail
+        // sampled at BEGIN is 4, so the checkpoint advances there.
+        assert_eq!(
+            sink.durable_lsn(),
+            4,
+            "with all writes committed the checkpoint advances durable_lsn to the WAL tail",
+        );
     }
 }

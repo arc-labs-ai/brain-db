@@ -2255,10 +2255,21 @@ pub fn spawn_shard(
                 (memory_dispatcher, statement_dispatcher)
             };
 
+            // Per-shard redb-committed-LSN watermark. The writer advances
+            // it after each successful `wtxn.commit()`; the snapshot
+            // source reads the SAME handle for `CHECKPOINT_END.durable_lsn`
+            // (see `ShardSnapshotSource`). Seed it to the post-recovery
+            // committed tail: recovery replays every WAL record up to
+            // `next_lsn - 1` into redb and commits, so that LSN is durable
+            // in metadata at boot. A fresh shard seeds 0.
+            let redb_committed_watermark = brain_ops::RedbCommittedWatermark::new();
+            redb_committed_watermark.advance_to(next_lsn_after_recovery.saturating_sub(1));
+
             let mut real_writer = RealWriterHandle::new(metadata.clone(), hnsw_writer)
                 .with_shard_id(shard_id)
                 .with_event_bus(event_bus.clone())
-                .with_wal_sink(wal_sink);
+                .with_wal_sink(wal_sink)
+                .with_redb_committed_watermark(redb_committed_watermark.clone());
             // Seed the slot counter from the persisted high-water mark so a
             // restart on a non-empty shard never re-issues a live arena slot.
             // (The counter resets to 1 in-process; without this, restart-reuse
@@ -2771,6 +2782,7 @@ pub fn spawn_shard(
                 wal_cell.clone(),
                 metadata.clone(),
                 hnsw_shared.clone(),
+                redb_committed_watermark.clone(),
             ));
             // CacheEvictionSource stays Disabled* until a
             // real CachingDispatcher is wired per shard.

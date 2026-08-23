@@ -285,7 +285,10 @@ impl RealWriterHandle {
         // multi-phase writes get TxnBegin + N × payloads + TxnCommit.
         let started_at = self.now_unix_nanos_or_zero(write.started_at_unix_nanos);
         let wal_span = tracing::info_span!("brain.wal.append", phases = write.phases.len());
-        let lsn_first = match tracing::Instrument::instrument(
+        // `(first, last)` LSN of this write's WAL records, or `None`
+        // when the write mapped no WAL payloads. `last` drives the
+        // post-commit redb-committed watermark advance below.
+        let wal_lsns = match tracing::Instrument::instrument(
             wal_append_for_write(self, &write, started_at),
             wal_span,
         )
@@ -297,6 +300,8 @@ impl RealWriterHandle {
                 return Err(e);
             }
         };
+        let lsn_first = wal_lsns.map(|(f, _)| f);
+        let lsn_last = wal_lsns.map(|(_, l)| l);
 
         // 3. HNSW side effects. Run before the redb wtxn opens
         // so the wtxn lifetime stays minimal and a HNSW failure
@@ -359,7 +364,7 @@ impl RealWriterHandle {
                 write_id: write.write_id,
                 committed_at_unix_nanos: committed_at,
                 lsn_first: lsn_first.unwrap_or(Lsn(0)),
-                lsn_last: lsn_first.unwrap_or(Lsn(0)),
+                lsn_last: lsn_last.unwrap_or_else(|| lsn_first.unwrap_or(Lsn(0))),
                 phase_acks: acks,
                 pending_stages: Vec::new(),
             };
@@ -381,6 +386,16 @@ impl RealWriterHandle {
             if let Err(e) = wtxn.commit() {
                 record_phase_outcomes(&metrics, &write, SubmitOutcome::Err, start.elapsed());
                 return Err(WriterError::Internal(format!("commit: {e:?}")));
+            }
+            // Redb is now durable for this write. Advance the shared
+            // redb-committed watermark to this write's highest WAL LSN
+            // so the checkpoint path can promise a `durable_lsn` that
+            // metadata has actually committed — never the WAL-appended
+            // tail, which advances before this commit. Writes with no
+            // WAL records (`None`) leave the watermark untouched: there
+            // is nothing for recovery to skip on their behalf.
+            if let Some(last) = lsn_last {
+                self.redb_committed_watermark().advance_to(last.raw());
             }
             durable_ack
         };
@@ -597,8 +612,9 @@ fn record_phase_outcomes(
     }
 }
 
-/// Append a Write to the WAL. Returns the LSN of the first appended
-/// record (event publishing stamps this onto envelopes).
+/// Append a Write to the WAL. Returns the `(first, last)` LSN of the
+/// appended records — the first stamps published-event envelopes, the
+/// last drives the post-commit redb-committed watermark.
 ///
 /// Only phases that map to a `WalPayload` are appended. Unmapped phases
 /// (opaque-body phases persisted via redb; auto-derived phases
@@ -618,7 +634,7 @@ async fn wal_append_for_write(
     writer: &RealWriterHandle,
     write: &Write,
     started_at_unix_nanos: u64,
-) -> Result<Option<Lsn>, WriterError> {
+) -> Result<Option<(Lsn, Lsn)>, WriterError> {
     let Some(sink) = writer.wal_sink_ref() else {
         return Ok(None);
     };
@@ -705,7 +721,10 @@ async fn wal_append_for_write(
         .append_many(records)
         .await
         .map_err(|e| WriterError::Internal(format!("wal append_many: {e}")))?;
-    Ok(lsns.first().copied())
+    Ok(match (lsns.first().copied(), lsns.last().copied()) {
+        (Some(first), Some(last)) => Some((first, last)),
+        _ => None,
+    })
 }
 
 /// HNSW writes per phase. Runs after WAL append and before the

@@ -72,7 +72,8 @@ pub use write::{
 };
 pub use writer::{
     AutoEdgeEnqueue, CausalEdgeEnqueue, ExtractorEnqueue, ForgetCascadeJob, ForgetCascadeKind,
-    ForgetCascadeMode, RealWriterHandle, SchemaFlagSweepJob, TemporalEdgeEnqueue,
+    ForgetCascadeMode, RealWriterHandle, RedbCommittedWatermark, SchemaFlagSweepJob,
+    TemporalEdgeEnqueue,
 };
 
 #[cfg(test)]

@@ -173,6 +173,68 @@ pub struct RealWriterHandle {
     /// present — defaults to a fresh `Arc<WriterMetrics>` on construction;
     /// the server's exposition layer reads the shared snapshot.
     writer_metrics: Arc<crate::metrics::WriterMetrics>,
+    /// Per-shard "last redb-committed LSN" watermark. Advanced by
+    /// [`Self::submit`] to a write's highest WAL LSN **after** that
+    /// write's `wtxn.commit()` succeeds — never at WAL-append time. The
+    /// checkpoint path reads it (via the shared handle) as the
+    /// `CHECKPOINT_END.durable_lsn`, so a snapshot can never promise a
+    /// durable LSN that redb has not committed. Defaults to a fresh
+    /// (zero) handle; the shard shares its own handle in via
+    /// [`Self::with_redb_committed_watermark`].
+    redb_committed_watermark: RedbCommittedWatermark,
+}
+
+/// Per-shard "last redb-committed LSN" watermark.
+///
+/// The writer advances this to a write's highest WAL LSN **after** the
+/// redb `wtxn.commit()` for that write succeeds. It therefore tracks the
+/// LSN up to which every WAL-durable record's redb effect is *also*
+/// durable — strictly at or behind the WAL-appended tail
+/// (`Wal::next_lsn() - 1`), which advances at enqueue time, before the
+/// group-commit fsync and before the later redb commit.
+///
+/// The snapshot / checkpoint path reads this as the checkpoint's
+/// `durable_lsn`: the checkpoint contract promises the LSN is durable in
+/// the arena *and* metadata (= redb), so stamping the WAL tail there
+/// would let recovery skip a record that is WAL-durable but whose redb
+/// commit had not yet run at power loss — silently dropping it.
+///
+/// Lock-free (`Arc<AtomicU64>`): the writer (advance) and the snapshot
+/// source (read) both live on the same shard executor, so there is no
+/// cross-thread contention; the atomic keeps `RealWriterHandle`
+/// `Send + Sync` for the existing trait-object plumbing. Monotonic —
+/// [`Self::advance_to`] uses `fetch_max`, so an out-of-order commit can
+/// never regress it.
+#[derive(Clone, Debug)]
+pub struct RedbCommittedWatermark(Arc<AtomicU64>);
+
+impl Default for RedbCommittedWatermark {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RedbCommittedWatermark {
+    /// Fresh watermark at LSN 0 (nothing committed yet).
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Advance the watermark to `lsn` if it is higher (monotonic).
+    /// Called after a successful `wtxn.commit()`. `Release` so the
+    /// snapshot source's `Acquire` load observes a fully-committed
+    /// value.
+    pub fn advance_to(&self, lsn: u64) {
+        self.0.fetch_max(lsn, Ordering::Release);
+    }
+
+    /// Current committed watermark. `Acquire` pairs with
+    /// [`Self::advance_to`]'s `Release`.
+    #[must_use]
+    pub fn load(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// What the writer pushes into the AutoEdgeWorker's channel after a
@@ -289,7 +351,27 @@ impl RealWriterHandle {
             memory_text_dispatcher: None,
             write_idempotency: Arc::new(submit::WriteIdempotencyCache::new()),
             writer_metrics: Arc::new(crate::metrics::WriterMetrics::new()),
+            redb_committed_watermark: RedbCommittedWatermark::new(),
         }
+    }
+
+    /// Share the per-shard redb-committed-LSN watermark. The shard
+    /// constructs one handle and threads the SAME clone into both this
+    /// writer (which advances it post-commit) and the snapshot source
+    /// (which reads it for `CHECKPOINT_END.durable_lsn`). Without this
+    /// call the writer keeps its private default handle — correct in
+    /// isolation but invisible to the checkpoint path.
+    #[must_use]
+    pub fn with_redb_committed_watermark(mut self, watermark: RedbCommittedWatermark) -> Self {
+        self.redb_committed_watermark = watermark;
+        self
+    }
+
+    /// Accessor for the shared redb-committed watermark. Used by
+    /// [`Self::submit`] to advance it after commit; exposed for tests.
+    #[must_use]
+    pub fn redb_committed_watermark(&self) -> &RedbCommittedWatermark {
+        &self.redb_committed_watermark
     }
 
     /// Seed the in-process slot counter from the persisted high-water mark at
