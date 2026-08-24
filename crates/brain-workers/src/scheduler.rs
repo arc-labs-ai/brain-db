@@ -339,8 +339,9 @@ async fn worker_loop(
             // the feature would silently cease with no metric and no restart,
             // and the panicked `Task` — held in `WorkerHandle` — would re-raise
             // at shutdown join, aborting the rest of clean shutdown. Instead we
-            // treat a caught panic exactly like an `Err`: bump `errors_total`,
-            // log, and continue to the next tick. The `async` wrapper ensures a
+            // treat a caught panic like an `Err` (bump `errors_total`, plus the
+            // distinct `panics_total`), log, and continue to the next tick. The
+            // `async` wrapper ensures a
             // panic during future *construction* is caught too, not only one
             // during polling.
             //
@@ -374,10 +375,13 @@ async fn worker_loop(
                     warn!(worker = name, error = %e, "worker cycle error");
                 }
                 Err(panic) => {
-                    // Caught panic: count it like an error and survive to the
-                    // next tick. The scheduler task must never unwind, so
-                    // shutdown's join can never observe a worker-cycle panic.
+                    // Caught panic: count it and survive to the next tick. The
+                    // scheduler task must never unwind, so shutdown's join can
+                    // never observe a worker-cycle panic. Bump both errors_total
+                    // (the "all failures" series) and the distinct panics_total
+                    // so a panic isn't hidden among ordinary Err cycles.
                     metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    metrics.panics_total.fetch_add(1, Ordering::Relaxed);
                     let payload = panic_message(&panic);
                     error!(
                         worker = name,

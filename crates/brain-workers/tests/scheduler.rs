@@ -550,6 +550,19 @@ fn panic_in_run_cycle_is_isolated_and_shutdown_stays_clean() {
             0,
             "panicking cycles must not count as successful cycles"
         );
+        // Panics are also tracked distinctly, so a silently-ceasing-turned-
+        // isolated worker is visible in its own series (not just errors_total).
+        assert!(
+            panic_metrics.panics_total.load(Ordering::Relaxed) >= 2,
+            "each isolated panic must bump panics_total (got {})",
+            panic_metrics.panics_total.load(Ordering::Relaxed),
+        );
+        // A logical Err worker never bumps panics_total.
+        assert_eq!(
+            healthy_metrics.panics_total.load(Ordering::Relaxed),
+            0,
+            "a healthy worker must never register a panic"
+        );
     });
 }
 
