@@ -344,6 +344,17 @@ pub async fn handle_schema_validate(
     match validate(&schema) {
         Ok(v) => {
             let namespace = v.as_schema().namespace.clone();
+            // Tenant binding, mirroring SCHEMA_UPLOAD: a caller may only
+            // validate a DSL targeting their own namespace. Reject a foreign
+            // namespace before consulting persisted state, so would_be_version
+            // cannot be used as a current-schema-version existence oracle for
+            // another tenant.
+            let caller_name = caller_namespace_name(ctx)?;
+            if namespace != caller_name {
+                return Err(OpError::Unauthorized(format!(
+                    "schema_validate: caller in namespace {caller_name:?} cannot validate schema for namespace {namespace:?}"
+                )));
+            }
             let would_be = current_active(ctx, &namespace)?
                 .unwrap_or(0)
                 .saturating_add(1);
@@ -760,7 +771,9 @@ mod tests {
         use brain_metadata::schema::store::schema_upload;
         use brain_metadata::MetadataDb;
         use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-        use brain_protocol::{SchemaGetRequest, SchemaListRequest, SchemaUploadRequest};
+        use brain_protocol::{
+            SchemaGetRequest, SchemaListRequest, SchemaUploadRequest, SchemaValidateRequest,
+        };
         use std::sync::Arc;
 
         struct MockDispatcher;
@@ -968,6 +981,43 @@ mod tests {
             .await
             .expect("system namespace list readable by any caller");
             assert!(listed.total >= 1);
+        }
+
+        #[tokio::test]
+        async fn cross_namespace_validate_is_rejected() {
+            // Caller bound to `acme`; the DSL targets `other`, which HAS a
+            // schema — so would_be_version would otherwise reveal its version.
+            let (_dir, ctx, metadata) = build_ctx_for("acme");
+            seed_schema(&metadata, OTHER_V1);
+
+            let err = handle_schema_validate(
+                SchemaValidateRequest {
+                    schema_document: OTHER_V1.into(),
+                },
+                &ctx,
+            )
+            .await
+            .expect_err("cross-namespace validate must be rejected");
+            assert!(
+                matches!(err, OpError::Unauthorized(_)),
+                "expected Unauthorized (no would_be_version oracle), got {err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn same_namespace_validate_succeeds() {
+            let (_dir, ctx, _md) = build_ctx_for("acme");
+            let resp = handle_schema_validate(
+                SchemaValidateRequest {
+                    schema_document: ACME_V1.into(),
+                },
+                &ctx,
+            )
+            .await
+            .expect("own-namespace validate");
+            assert!(resp.validation_errors.is_empty());
+            assert_eq!(resp.namespace, "acme");
+            assert!(resp.would_be_version >= 1);
         }
     }
 
