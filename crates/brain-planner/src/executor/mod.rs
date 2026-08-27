@@ -14,7 +14,9 @@ pub mod recall;
 pub mod result;
 pub mod writer;
 
-pub use context::{ExecutorContext, PendingMemorySnapshot, SharedMetadataDb, TxnSnapshot};
+pub use context::{
+    BackfillControl, ExecutorContext, PendingMemorySnapshot, SharedMetadataDb, TxnSnapshot,
+};
 pub use error::ExecError;
 pub use path::{execute_path, execute_path_stream};
 pub use reason::{execute_reason, execute_reason_stream};

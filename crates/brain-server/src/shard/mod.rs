@@ -2388,6 +2388,17 @@ pub fn spawn_shard(
             // sound; the discipline is "drop the borrow before .await", and
             // `arena` isn't touched again before this point.
             let arena_cell = Rc::new(RefCell::new(arena));
+
+            // Construct the resumable BackfillWorker up front so the same
+            // `Arc` can be both threaded onto the executor context (giving
+            // the ADMIN_BACKFILL / ADMIN_BACKFILL_CANCEL dispatch path a
+            // submit/cancel handle) and registered in the scheduler below
+            // (which drives its checkpoint walk). It's a provisioned C2
+            // worker — `run_cycle` no-ops when no run is active — and not
+            // in the C0 always-on set, so it stays controllable.
+            let backfill_worker =
+                Arc::new(brain_workers::workers::backfill::BackfillWorker::new());
+
             let executor_ctx = ExecutorContext::new(
                 dispatcher.clone(),
                 hnsw_shared.clone(),
@@ -2396,7 +2407,10 @@ pub fn spawn_shard(
             )
             // Per-space brute-force retrieval lane: exact cosine scan of a
             // small single-space query's own arena vectors.
-            .with_space_vectors(Rc::new(ArenaSpaceVectorSource::new(arena_cell.clone())));
+            .with_space_vectors(Rc::new(ArenaSpaceVectorSource::new(arena_cell.clone())))
+            // Backfill control handle — same Arc registered in the
+            // scheduler below.
+            .with_backfill_handle(backfill_worker.clone());
 
             // The lexical retriever was constructed alongside the
             // tantivy open above and propagated in here pre-built.
@@ -2912,6 +2926,16 @@ pub fn spawn_shard(
                 summarizer,
             )
             .expect("register Phase-8 workers");
+
+            // BackfillWorker — provisioned unconditionally (C2). It idles
+            // (run_cycle returns 0) until an ADMIN_BACKFILL submits a run
+            // via the handle threaded onto the executor context above; the
+            // scheduler then drives its checkpoint walk. Registering the
+            // same Arc means the dispatch handle and the running worker are
+            // one instance, so submit/cancel/progress see the live run.
+            scheduler
+                .register(backfill_worker.clone(), ops.clone())
+                .expect("register BackfillWorker");
 
             // LLM cache sweeper. Registered when enabled AND the shard
             // actually has an LLM cache — without a cache the worker is a

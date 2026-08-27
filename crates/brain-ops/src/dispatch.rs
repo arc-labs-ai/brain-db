@@ -433,12 +433,52 @@ pub async fn dispatch(
         | RequestBody::AdminRenameSession(_)
         | RequestBody::AdminMoveMemory(_)
         | RequestBody::AdminReclassify(_)
-        | RequestBody::AdminListTombstoned(_)
-        | RequestBody::AdminBackfill(_)
-        | RequestBody::AdminBackfillCancel(_) => Err(OpError::InvalidRequest(
+        | RequestBody::AdminListTombstoned(_) => Err(OpError::InvalidRequest(
             "admin operations are served over the HTTP admin listener, not the wire protocol"
                 .to_owned(),
         )),
+
+        // Backfill control IS a genuine per-shard wire op: the resumable
+        // BackfillWorker lives on the shard and needs a submit / cancel
+        // handle threaded through the executor context. `to_worker_request`
+        // validates the wire payload; a not-provisioned handle (tests /
+        // non-shard callers) returns a clean structured error, never a
+        // panic. Admin-gated by the perm_bits table below.
+        //
+        // (The `POST /v1/extract/backfill` HTTP path remains a separate,
+        // best-effort, non-resumable convenience scan — unifying it with
+        // this durable worker is a documented follow-up, not done here.)
+        RequestBody::AdminBackfill(r) => {
+            let handle = ctx.executor.backfill_handle.as_ref().ok_or_else(|| {
+                OpError::Internal("backfill worker not provisioned on this shard".to_owned())
+            })?;
+            let worker_req = crate::handlers::admin::backfill::to_worker_request(&r)
+                .map_err(|e| OpError::InvalidRequest(e.to_string()))?;
+            let backfill_id = handle.submit(worker_req);
+            let progress = crate::handlers::admin::backfill::progress_to_wire(&handle.progress());
+            Ok(single(ResponseBody::AdminBackfill(
+                brain_protocol::envelope::response::AdminBackfillResponse {
+                    backfill_id: backfill_id.to_bytes(),
+                    progress,
+                },
+            )))
+        }
+
+        RequestBody::AdminBackfillCancel(r) => {
+            let handle = ctx.executor.backfill_handle.as_ref().ok_or_else(|| {
+                OpError::Internal("backfill worker not provisioned on this shard".to_owned())
+            })?;
+            let backfill_id = brain_core::BackfillId::from_bytes(r.backfill_id);
+            let cancelled = handle.cancel(backfill_id);
+            let progress = crate::handlers::admin::backfill::progress_to_wire(&handle.progress());
+            Ok(single(ResponseBody::AdminBackfillCancel(
+                brain_protocol::envelope::response::AdminBackfillCancelResponse {
+                    backfill_id: r.backfill_id,
+                    cancelled,
+                    progress,
+                },
+            )))
+        }
 
         // -----------------------------------------------------------
         // typed-graph phases.

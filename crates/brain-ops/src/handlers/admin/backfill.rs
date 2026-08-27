@@ -5,13 +5,16 @@
 //! the worker (`brain_workers::BackfillWorker`) speaks the domain
 //! types from `brain_core` (`BackfillRequest`, `BackfillRange`,
 //! `BackfillProgress`, `ExtractorId`). This module owns the
-//! conversion both ways so the dispatch handler stays a one-liner
-//! when the worker handle eventually threads into `OpsContext`.
+//! conversion both ways so the dispatch handler stays a one-liner.
 //!
-//! Today the dispatch arm in [`crate::dispatch()`] returns
-//! `NotYetImplemented` for `AdminBackfill` / `AdminBackfillCancel`:
-//! the worker handle isn't on `OpsContext` yet. These adapters are
-//! ready for the wiring pass that follows.
+//! The dispatch arms in [`crate::dispatch()`] use these adapters:
+//! `AdminBackfill` → [`to_worker_request`] → the worker handle's
+//! `submit`; `AdminBackfillCancel` → the handle's `cancel`; both
+//! snapshot progress via [`progress_to_wire`]. The handle threads in
+//! through `ExecutorContext::backfill_handle` (exposed on
+//! `OpsContext.executor`), set by the shard from the registered
+//! `BackfillWorker` `Arc`; a `None` handle yields a clean structured
+//! error rather than a panic.
 
 use brain_core::{
     BackfillId, BackfillRange, BackfillRequest, ExtractorId, MemoryId, WorkerPriority,

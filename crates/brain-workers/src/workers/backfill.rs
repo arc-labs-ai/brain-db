@@ -47,8 +47,14 @@ use crate::worker::Worker;
 /// composite key.
 pub const WORKER_ID: &str = "backfill";
 
-/// Per-request item-failure threshold beyond which the worker
-/// aborts the request (— "bad-extractor abort").
+/// Per-item attempt cap. An item whose checkpoint is `Failed` with
+/// `attempts >= MAX_ATTEMPTS_PER_ITEM` is treated as permanently
+/// failed: it is counted as `failed` in the run's progress and not
+/// retried again, while the rest of the run continues (per-item
+/// resilience — one bad item never aborts the whole backfill). The
+/// worker does **not** abort the request on hitting the cap; the
+/// earlier "bad-extractor abort" doc claim was never wired and has
+/// been dropped in favour of this per-item-failure accounting.
 pub const MAX_ATTEMPTS_PER_ITEM: u32 = 3;
 
 pub struct BackfillWorker {
@@ -140,9 +146,19 @@ impl BackfillWorker {
     /// request. Returns the number of items advanced (matches the
     /// `Worker::run_cycle` contract).
     async fn drive_one_batch(&self, ctx: &WorkerContext) -> Result<usize, WorkerError> {
-        // Acquire current run (or dequeue a new one).
-        let req = match self.state.current.lock().as_ref() {
-            Some(r) => r.request.clone(),
+        // Acquire current run (or dequeue a new one). Clone the request out
+        // and drop the `current` guard *before* calling `dequeue_if_idle` —
+        // the guard must not be held across that call, which re-locks
+        // `current` (parking_lot mutexes are non-reentrant, so holding it
+        // across the match would deadlock).
+        let existing = self
+            .state
+            .current
+            .lock()
+            .as_ref()
+            .map(|r| r.request.clone());
+        let req = match existing {
+            Some(r) => r,
             None => match self.dequeue_if_idle() {
                 Some(r) => r,
                 None => return Ok(0),
@@ -172,16 +188,26 @@ impl BackfillWorker {
                 break;
             };
 
-            // For each extractor in the request, walk the checkpoint.
+            // Process EVERY extractor for this memory before advancing the
+            // cursor. `extractor_ids` is capped at
+            // `MAX_EXTRACTORS_PER_BACKFILL` (4 today), so a single memory is
+            // at most a handful of items; finishing it whole keeps the batch
+            // bound (checked between memories, above) while guaranteeing no
+            // `(memory, extractor)` pair is ever split across a cycle
+            // boundary and left behind — the batch-boundary skip (bug #6).
+            //
+            // Advancing the cursor only after all extractors are checkpointed
+            // also means the in-memory cursor and the durable per-pair
+            // checkpoints never disagree: a mid-memory crash leaves the cursor
+            // un-advanced, so the next run re-visits the memory and the
+            // already-`Completed` pairs short-circuit to `Skipped` (no
+            // duplicate enqueue) while the unfinished ones run.
             for ext_id in &req.extractor_ids {
                 let item_key = item_key_for(memory_id, ext_id.raw());
                 let outcome =
                     self.process_item(ctx, memory_id, *ext_id, &item_key, req.dry_run, now_ns)?;
                 self.record_outcome(outcome);
                 items_processed += 1;
-                if items_processed >= self.config.batch_size {
-                    break;
-                }
             }
             self.advance_cursor(memory_id);
         }
@@ -307,7 +333,11 @@ impl BackfillWorker {
                 return Ok(ItemOutcome::Skipped);
             }
             if row.is_failed() && row.attempts >= MAX_ATTEMPTS_PER_ITEM {
-                return Ok(ItemOutcome::Skipped);
+                // Permanently failed (hit the attempt cap on a prior run):
+                // count it as `failed`, not `skipped_already_completed`, so
+                // progress doesn't mask a bad item as a resume-skip. The
+                // run continues; this item is never retried.
+                return Ok(ItemOutcome::Failed);
             }
         }
 
@@ -380,6 +410,22 @@ impl BackfillWorker {
 impl Default for BackfillWorker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Bridge the worker's inherent submit/cancel/progress onto the
+/// `brain-planner` control trait so the dispatch path can drive it
+/// through `ExecutorContext::backfill_handle` without a back-dependency
+/// on this crate.
+impl brain_planner::BackfillControl for BackfillWorker {
+    fn submit(&self, request: BackfillRequest) -> BackfillId {
+        BackfillWorker::submit(self, request)
+    }
+    fn cancel(&self, request_id: BackfillId) -> bool {
+        BackfillWorker::cancel(self, request_id)
+    }
+    fn progress(&self) -> BackfillProgress {
+        BackfillWorker::progress(self)
     }
 }
 
