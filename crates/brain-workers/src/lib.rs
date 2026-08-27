@@ -73,7 +73,7 @@ pub use workers::consolidation::{
 pub use workers::counter_reconcile::CounterReconcileWorker;
 pub use workers::decay::{
     decayed_salience, half_life_days, DecayWorker, CONSOLIDATED_HALF_LIFE_DAYS,
-    EPISODIC_HALF_LIFE_DAYS, MIN_DELTA_FOR_WRITE, SEMANTIC_HALF_LIFE_DAYS,
+    EPISODIC_HALF_LIFE_DAYS, MIN_DELTA_FOR_WRITE, SALIENCE_FLOOR, SEMANTIC_HALF_LIFE_DAYS,
 };
 pub use workers::edge_scrub::EdgeScrubWorker;
 pub use workers::extractor::{

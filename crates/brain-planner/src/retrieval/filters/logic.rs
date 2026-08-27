@@ -14,9 +14,13 @@
 //!    Relation; `salience ≥ threshold` on Memory (the
 //!    substrate's analog, documented inline).
 //! 4. Tombstone — drop tombstoned rows unless
-//!    `include_tombstoned = true`.
+//!    `include_tombstoned = true`. Exempt: a row tombstoned only
+//!    after an as-of anchor `t` (`record_invalidated_at > t`) is
+//!    retained so the as-of step can select it.
 //! 5. Supersession — drop superseded statements / relations
-//!    unless `include_superseded = true`.
+//!    unless `include_superseded = true`. Same as-of exemption as
+//!    tombstone: a row superseded only after `t` survives to the
+//!    as-of step.
 //! 6. As-of — bi-temporal time-travel. When
 //!    `as_of_record_time_unix_nanos = Some(t)`, keep only
 //!    statements the substrate believed at `t`:
@@ -371,7 +375,12 @@ fn filter_tombstone(
                     }
                     continue;
                 };
+                // A row tombstoned *today* must still survive this
+                // current-state filter when an as-of record-time anchor
+                // asks for a moment at which the row was alive; the final
+                // interval selection is left to `filter_as_of`.
                 !stmt.tombstoned
+                    || as_of_retains_after_drop(chain, stmt.record_invalidated_at_unix_nanos)
             }
             RankedItemId::Relation(id) => relation_tombstoned(rtxn, id)?.is_some_and(|t| !t),
             RankedItemId::Entity(_) => true,
@@ -407,7 +416,12 @@ fn filter_supersession(
                     }
                     continue;
                 };
+                // As with tombstones: a row superseded *today* must still
+                // survive when an as-of anchor asks for a moment at which
+                // it was the current belief. `filter_as_of` then selects
+                // the exact record-window interval.
                 stmt.superseded_by.is_none()
+                    || as_of_retains_after_drop(chain, stmt.record_invalidated_at_unix_nanos)
             }
             RankedItemId::Relation(id) => relation_superseded(rtxn, id)?.is_some_and(|x| !x),
             // Memory / Entity have no supersession concept.
@@ -460,6 +474,25 @@ fn filter_as_of(
         }
     }
     Ok((out, dropped))
+}
+
+/// Whether a statement that is tombstoned or superseded in current state
+/// must nonetheless survive the current-state tombstone / supersession
+/// filters because an as-of record-time anchor is asking for a moment at
+/// which the row was still the substrate's belief.
+///
+/// Returns `true` only when an anchor `t` is set *and* the row's record
+/// window closed strictly after `t` (`record_invalidated_at > t`) — i.e.
+/// the row was current at `t`. With no anchor, or a row whose record
+/// window has no close instant, this returns `false` and the caller drops
+/// the row exactly as it would in normal current-state retrieval. The
+/// final `[extracted_at, record_invalidated_at)` interval selection is
+/// left to [`filter_as_of`].
+fn as_of_retains_after_drop(chain: &FilterChain, record_invalidated_at: Option<u64>) -> bool {
+    match (chain.as_of_record_time_unix_nanos, record_invalidated_at) {
+        (Some(t), Some(inv)) => inv > t,
+        _ => false,
+    }
 }
 
 /// `true` if the substrate believed `stmt` at record-time `record_time`.
@@ -627,11 +660,16 @@ fn statement_temporal_match(stmt: &brain_core::Statement, range: &TimeRange) -> 
             .unwrap_or(stmt.extracted_at_unix_nanos);
         return in_range(range, nanos / 1_000_000);
     }
-    // Fact / Preference: validity window. Open-ended bounds
-    // default to [0, u64::MAX).
-    let vf = stmt.valid_from_unix_nanos.map(|n| n / 1_000_000);
+    // Fact / Preference: validity window. `valid_from` is optional and
+    // defaults to `extracted_at` (not epoch 0) — an unset lower bound
+    // means "true since the substrate learned it", so the window is
+    // [extracted_at, valid_to). `valid_to` stays open-ended when unset.
+    let vf = stmt
+        .valid_from_unix_nanos
+        .unwrap_or(stmt.extracted_at_unix_nanos)
+        / 1_000_000;
     let vt = stmt.valid_to_unix_nanos.map(|n| n / 1_000_000);
-    window_overlaps(vf, vt, range)
+    window_overlaps(Some(vf), vt, range)
 }
 
 #[cfg(test)]
