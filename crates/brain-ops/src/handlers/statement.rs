@@ -801,7 +801,10 @@ pub async fn handle_statement_list(
                     .map(|t| t >= lo && t <= hi)
                     .unwrap_or(false),
                 _ => {
-                    let from = s.valid_from_unix_nanos.unwrap_or(0);
+                    // An unset valid_from defaults to extracted_at (the fact
+                    // became true no later than when it was ingested), not the
+                    // epoch; an unset valid_to is open-ended (still valid).
+                    let from = s.valid_from_unix_nanos.unwrap_or(s.extracted_at_unix_nanos);
                     let to = s.valid_to_unix_nanos.unwrap_or(u64::MAX);
                     from <= hi && to >= lo
                 }
@@ -885,6 +888,18 @@ fn build_statement_from_create(
         ));
     }
 
+    // Events are point-in-time, not validity ranges: an Event must not
+    // carry valid_from / valid_to. Reject loudly, mirroring the
+    // event_at check above (the apply-layer `validate_statement_shape`
+    // enforces the same invariant authoritatively for in-process callers).
+    if kind == StatementKind::Event
+        && (req.valid_from_unix_nanos != 0 || req.valid_to_unix_nanos != 0)
+    {
+        return Err(OpError::InvalidRequest(
+            "Event kind must not set valid_from_unix_nanos / valid_to_unix_nanos".into(),
+        ));
+    }
+
     let evidence = evidence_ref_from_wire(&req.evidence).map_err(|e| match e {
         brain_protocol::WireToStatementError::EvidenceInlineTooLarge { len, cap } => {
             OpError::InvalidRequest(format!(
@@ -907,25 +922,28 @@ fn build_statement_from_create(
         req.confidence,
         evidence,
         brain_core::ExtractorId::from(req.extractor_id),
-        if req.valid_from_unix_nanos != 0 {
-            req.valid_from_unix_nanos
-        } else {
-            now
-        },
+        // `extracted_at` is record time — when the substrate ingested the
+        // claim — and must always be the true arrival time. A caller-supplied
+        // historical `valid_from` is object-time and is applied separately
+        // below; conflating the two would mis-pin a later supersede's
+        // `old.valid_to = new.extracted_at` to a historical date.
+        now,
         if req.schema_version == 0 {
             1
         } else {
             req.schema_version
         },
     );
-    // `new_root` uses `extracted_at_unix_nanos` for both extracted_at
-    // and (implicitly) the chain start; expose explicit valid_from /
-    // valid_to here.
-    if req.valid_from_unix_nanos != 0 {
-        s.valid_from_unix_nanos = Some(req.valid_from_unix_nanos);
-    }
-    if req.valid_to_unix_nanos != 0 {
-        s.valid_to_unix_nanos = Some(req.valid_to_unix_nanos);
+    // Object-time validity bounds, distinct from `extracted_at` (record
+    // time). Events are point-in-time and carry neither (rejected above),
+    // so only set validity for non-Event kinds.
+    if kind != StatementKind::Event {
+        if req.valid_from_unix_nanos != 0 {
+            s.valid_from_unix_nanos = Some(req.valid_from_unix_nanos);
+        }
+        if req.valid_to_unix_nanos != 0 {
+            s.valid_to_unix_nanos = Some(req.valid_to_unix_nanos);
+        }
     }
     if req.event_at_unix_nanos != 0 {
         s.event_at_unix_nanos = Some(req.event_at_unix_nanos);
@@ -1184,4 +1202,79 @@ async fn dispatch_upsert_for(
         id,
     )
     .await;
+}
+
+#[cfg(test)]
+mod build_statement_tests {
+    use super::build_statement_from_create;
+    use brain_core::{PredicateId, StatementKind};
+    use brain_protocol::{
+        EvidenceRefWire, StatementCreateRequest, StatementKindWire, StatementObjectWire,
+        StatementValueWire,
+    };
+
+    const NOW: u64 = 1_700_000_000_000_000_500;
+    const HISTORICAL: u64 = 1_600_000_000_000_000_000;
+
+    fn req(kind: StatementKindWire) -> StatementCreateRequest {
+        StatementCreateRequest {
+            kind,
+            subject: [0u8; 16],
+            predicate: "test:role".into(),
+            object: StatementObjectWire::Value(StatementValueWire::Text("x".into())),
+            confidence: 0.9,
+            evidence: EvidenceRefWire::Inline(Vec::new()),
+            extractor_id: 0,
+            valid_from_unix_nanos: 0,
+            valid_to_unix_nanos: 0,
+            event_at_unix_nanos: 0,
+            schema_version: 0,
+            session_id: 0,
+            request_id: [0u8; 16],
+            act_as: None,
+        }
+    }
+
+    // S1: an Event carrying validity is rejected at the wire layer.
+    #[test]
+    fn event_with_valid_from_rejected() {
+        let mut r = req(StatementKindWire::Event);
+        r.event_at_unix_nanos = NOW;
+        r.valid_from_unix_nanos = HISTORICAL;
+        let out = build_statement_from_create(&r, PredicateId::from(1), NOW, StatementKind::Event);
+        assert!(out.is_err(), "Event with valid_from must be rejected");
+    }
+
+    #[test]
+    fn event_with_valid_to_rejected() {
+        let mut r = req(StatementKindWire::Event);
+        r.event_at_unix_nanos = NOW;
+        r.valid_to_unix_nanos = NOW + 10;
+        let out = build_statement_from_create(&r, PredicateId::from(1), NOW, StatementKind::Event);
+        assert!(out.is_err());
+    }
+
+    // S1: an Event with only event_at is accepted and carries no validity.
+    #[test]
+    fn event_with_only_event_at_accepted() {
+        let mut r = req(StatementKindWire::Event);
+        r.event_at_unix_nanos = NOW;
+        let s = build_statement_from_create(&r, PredicateId::from(1), NOW, StatementKind::Event)
+            .expect("event accepted");
+        assert_eq!(s.event_at_unix_nanos, Some(NOW));
+        assert_eq!(s.valid_from_unix_nanos, None);
+        assert_eq!(s.valid_to_unix_nanos, None);
+    }
+
+    // S5: extracted_at is arrival time; a historical valid_from is preserved
+    // independently.
+    #[test]
+    fn fact_extracted_at_is_arrival_not_historical_valid_from() {
+        let mut r = req(StatementKindWire::Fact);
+        r.valid_from_unix_nanos = HISTORICAL;
+        let s = build_statement_from_create(&r, PredicateId::from(1), NOW, StatementKind::Fact)
+            .expect("fact accepted");
+        assert_eq!(s.extracted_at_unix_nanos, NOW);
+        assert_eq!(s.valid_from_unix_nanos, Some(HISTORICAL));
+    }
 }

@@ -164,19 +164,25 @@ pub fn statement_create(
     if let (StatementKind::Fact, Some(subject_entity)) = (s.kind, subject_entity) {
         let active =
             load_active_facts_for_subject_predicate_wtxn(wtxn, scope, subject_entity, s.predicate)?;
-        let disagrees = active.iter().any(|existing| existing.object != s.object);
-        if disagrees {
+        // A contradiction requires a *different* object AND *overlapping*
+        // validity intervals: sequential facts (old.valid_to < new.valid_from)
+        // describe different periods and are not contradictions.
+        let conflicting: Vec<&Statement> = active
+            .iter()
+            .filter(|existing| existing.object != s.object && fact_intervals_overlap(existing, s))
+            .collect();
+        if !conflicting.is_empty() {
             tracing::warn!(
                 subject = ?subject_entity,
                 predicate = s.predicate.raw(),
                 new_id = ?s.id,
                 "statement_create: Fact contradicts active facts"
             );
-            // Durable audit: the conflicting set is the active Fact(s)
-            // already indexed plus the one being inserted. The insert
-            // still proceeds (coexisting Facts are allowed); operators
-            // reconcile via ADMIN_LIST_PENDING_CONTRADICTIONS.
-            let mut contradicting: Vec<StatementId> = active.iter().map(|a| a.id).collect();
+            // Durable audit: the conflicting set is the overlapping,
+            // disagreeing active Fact(s) plus the one being inserted. The
+            // insert still proceeds (coexisting Facts are allowed);
+            // operators reconcile via ADMIN_LIST_PENDING_CONTRADICTIONS.
+            let mut contradicting: Vec<StatementId> = conflicting.iter().map(|a| a.id).collect();
             contradicting.push(s.id);
             super::contradiction::contradiction_audit_record(
                 wtxn,
@@ -211,6 +217,25 @@ pub fn statement_create(
 // Internal helpers (shared with sibling modules via `pub(super)`).
 // ---------------------------------------------------------------------------
 
+/// Half-open validity interval `[from, to)` for a Fact. An unset
+/// `valid_from` defaults to `extracted_at` (the fact became true no later
+/// than when it was ingested); an unset `valid_to` is open-ended.
+pub(super) fn fact_validity_interval(s: &Statement) -> (u64, u64) {
+    let from = s.valid_from_unix_nanos.unwrap_or(s.extracted_at_unix_nanos);
+    let to = s.valid_to_unix_nanos.unwrap_or(u64::MAX);
+    (from, to)
+}
+
+/// Whether two Facts' validity intervals overlap. Uses half-open
+/// `[from, to)` semantics, so sequential facts (`old.valid_to == new.valid_from`,
+/// or `old.valid_to < new.valid_from`) do not overlap, while a still-open
+/// `valid_to = None` fact overlaps any later fact.
+pub(super) fn fact_intervals_overlap(a: &Statement, b: &Statement) -> bool {
+    let (a_from, a_to) = fact_validity_interval(a);
+    let (b_from, b_to) = fact_validity_interval(b);
+    a_from < b_to && b_from < a_to
+}
+
 /// Per-kind invariants validated before any storage access.
 pub(super) fn validate_statement_shape(s: &Statement) -> Result<(), StatementOpError> {
     if !(0.0..=1.0).contains(&s.confidence) || s.confidence.is_nan() {
@@ -226,7 +251,15 @@ pub(super) fn validate_statement_shape(s: &Statement) -> Result<(), StatementOpE
         // temporal role available so the read answers "when" from the evidence
         // memory's own `occurred_at`, instead of losing the fact by demoting it to
         // a timeless Fact. Only a NON-Event is forbidden a time.
-        StatementKind::Event => {}
+        StatementKind::Event => {
+            // Events are point-in-time, not validity ranges: they carry
+            // event_at (or nothing), never valid_from / valid_to.
+            if s.valid_from_unix_nanos.is_some() || s.valid_to_unix_nanos.is_some() {
+                return Err(StatementOpError::InvalidArgument(
+                    "Event may not set valid_from_unix_nanos / valid_to_unix_nanos",
+                ));
+            }
+        }
         _ => {
             if s.event_at_unix_nanos.is_some() {
                 return Err(StatementOpError::InvalidArgument(
@@ -838,6 +871,9 @@ mod tests {
     use brain_core::{Entity, EntityType, StatementValue, TombstoneReason, INLINE_EVIDENCE_CAP};
     use brain_core::{MemoryId, SessionId};
     use smallvec::SmallVec;
+
+    const T0: u64 = 1_700_000_000_000_000_000;
+
     fn test_scope() -> RowScope {
         RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16])
     }
@@ -2081,5 +2117,144 @@ mod tests {
             crate::statement::statement_embed_queue_len(&rtxn).unwrap(),
             2
         );
+    }
+
+    // -- S1: Event validity invariants (validate_statement_shape) ---------
+
+    #[test]
+    fn event_with_valid_from_rejected() {
+        let subj = EntityId::new();
+        let pred = PredicateId::from(1);
+        let mut s = fresh_event(subj, pred, T0 + 10);
+        s.valid_from_unix_nanos = Some(T0);
+        assert!(
+            matches!(
+                validate_statement_shape(&s),
+                Err(StatementOpError::InvalidArgument(_))
+            ),
+            "an Event carrying valid_from must be rejected"
+        );
+    }
+
+    #[test]
+    fn event_with_valid_to_rejected() {
+        let subj = EntityId::new();
+        let pred = PredicateId::from(1);
+        let mut s = fresh_event(subj, pred, T0 + 10);
+        s.valid_to_unix_nanos = Some(T0 + 20);
+        assert!(matches!(
+            validate_statement_shape(&s),
+            Err(StatementOpError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn event_with_only_event_at_accepted() {
+        let subj = EntityId::new();
+        let pred = PredicateId::from(1);
+        let s = fresh_event(subj, pred, T0 + 10);
+        assert!(validate_statement_shape(&s).is_ok());
+    }
+
+    #[test]
+    fn fact_with_validity_accepted() {
+        let subj = EntityId::new();
+        let obj = EntityId::new();
+        let pred = PredicateId::from(1);
+        let mut s = fresh_fact(subj, pred, obj);
+        s.valid_from_unix_nanos = Some(T0);
+        s.valid_to_unix_nanos = Some(T0 + 100);
+        assert!(validate_statement_shape(&s).is_ok());
+    }
+
+    // -- S5: extracted_at is record time, independent of valid_from -------
+
+    #[test]
+    fn create_preserves_arrival_extracted_at_with_historical_valid_from() {
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "priya");
+        let obj = make_entity(&mut db, "manager-role");
+        let pred = intern_fact_entity_pred(&mut db, "role");
+
+        // Caller supplies a historical valid_from; extracted_at must be the
+        // arrival time passed to statement_create, not the historical date.
+        let historical = 1_600_000_000_000_000_000u64;
+        let arrival = 1_700_000_000_000_000_500u64;
+        let mut s = fresh_fact(subj, pred, obj);
+        s.valid_from_unix_nanos = Some(historical);
+
+        let wtxn = db.write_txn().unwrap();
+        let id = statement_create(&wtxn, test_scope(), SessionId::DEFAULT, &s, arrival).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let stored = statement_get(&rtxn, id).unwrap().unwrap();
+        assert_eq!(stored.valid_from_unix_nanos, Some(historical));
+        // extracted_at is set by Statement::new_root from the value the
+        // caller passed as `extracted_at_unix_nanos` (fresh_fact uses a
+        // fixed base); the point of S5 is the handler always passes arrival
+        // there — this asserts the two fields stay independent in storage.
+        assert_ne!(stored.extracted_at_unix_nanos, historical);
+    }
+
+    // -- S2: contradiction requires overlapping validity -----------------
+
+    #[test]
+    fn sequential_facts_do_not_contradict() {
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "priya");
+        let engineer = make_entity(&mut db, "engineer-role");
+        let manager = make_entity(&mut db, "manager-role");
+        let pred = intern_fact_entity_pred(&mut db, "role");
+
+        // F1 valid until T; F2 valid from T+1 -> non-overlapping.
+        let mut f1 = fresh_fact(subj, pred, engineer);
+        f1.valid_to_unix_nanos = Some(T0 + 100);
+        let mut f2 = fresh_fact(subj, pred, manager);
+        f2.valid_from_unix_nanos = Some(T0 + 200);
+
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), SessionId::DEFAULT, &f1, T0).unwrap();
+        statement_create(&wtxn, test_scope(), SessionId::DEFAULT, &f2, T0).unwrap();
+        wtxn.commit().unwrap();
+
+        let wtxn = db.write_txn().unwrap();
+        let pending =
+            crate::statement::contradiction::contradiction_audit_list_pending(&wtxn, 16, T0 + 1)
+                .unwrap();
+        wtxn.commit().unwrap();
+        assert!(
+            pending.is_empty(),
+            "sequential facts describe different periods, not a contradiction"
+        );
+    }
+
+    #[test]
+    fn overlapping_distinct_facts_contradict() {
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "priya");
+        let engineer = make_entity(&mut db, "engineer-role");
+        let manager = make_entity(&mut db, "manager-role");
+        let pred = intern_fact_entity_pred(&mut db, "role");
+
+        // Overlapping intervals with distinct objects -> contradiction.
+        let mut f1 = fresh_fact(subj, pred, engineer);
+        f1.valid_from_unix_nanos = Some(T0);
+        f1.valid_to_unix_nanos = Some(T0 + 300);
+        let mut f2 = fresh_fact(subj, pred, manager);
+        f2.valid_from_unix_nanos = Some(T0 + 100);
+        f2.valid_to_unix_nanos = Some(T0 + 400);
+
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), SessionId::DEFAULT, &f1, T0).unwrap();
+        statement_create(&wtxn, test_scope(), SessionId::DEFAULT, &f2, T0).unwrap();
+        wtxn.commit().unwrap();
+
+        let wtxn = db.write_txn().unwrap();
+        let pending =
+            crate::statement::contradiction::contradiction_audit_list_pending(&wtxn, 16, T0 + 1)
+                .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(pending.len(), 1, "overlapping distinct facts contradict");
     }
 }

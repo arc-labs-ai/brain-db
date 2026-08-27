@@ -1098,6 +1098,17 @@ const MEMBERSHIP_REL_BAND: f32 = 0.85;
 /// path. Not a ranking knob and not caller intent — the adaptive gap decides the
 /// real set; this only caps a degenerate flat-distribution result so the
 /// response can't balloon.
+/// Whether a memory passes the `age_bound` filter. `age_bound` is an
+/// event-time lower bound: a memory passes iff its event time
+/// (`occurred_at`, falling back to `created_at` when unset) is at or after
+/// the bound. A `None` bound admits everything.
+fn passes_age_bound(bound: Option<u64>, occurred_at: Option<u64>, created_at: u64) -> bool {
+    match bound {
+        None => true,
+        Some(b) => occurred_at.unwrap_or(created_at) >= b,
+    }
+}
+
 fn membership_ceiling(req: &RecallRequest) -> u32 {
     let cap = if req.max_results == 0 {
         DEFAULT_RECALL_RESULTS
@@ -1700,10 +1711,12 @@ fn hydrate_memories_by_id(
         if row.salience < req.salience_floor {
             continue;
         }
-        if let Some(bound) = req.age_bound_unix_nanos {
-            if row.created_at_unix_nanos < bound {
-                continue;
-            }
+        if !passes_age_bound(
+            req.age_bound_unix_nanos,
+            row.occurred_at_unix_nanos,
+            row.created_at_unix_nanos,
+        ) {
+            continue;
         }
 
         let text = if let Some(texts) = texts_table.as_ref() {
@@ -2676,10 +2689,12 @@ fn overlay_txn_buffer(
         if p.salience_initial < req.salience_floor {
             continue;
         }
-        if let Some(bound) = req.age_bound_unix_nanos {
-            if p.created_at_unix_nanos < bound {
-                continue;
-            }
+        if !passes_age_bound(
+            req.age_bound_unix_nanos,
+            p.occurred_at_unix_nanos,
+            p.created_at_unix_nanos,
+        ) {
+            continue;
         }
         // `confidence_threshold` is a SALIENCE floor on the committed path
         // (brain-planner `filter_confidence` gates memory hits by
@@ -3239,10 +3254,12 @@ fn project_memory_results(
         if row.salience < req.salience_floor {
             continue;
         }
-        if let Some(bound) = req.age_bound_unix_nanos {
-            if row.created_at_unix_nanos < bound {
-                continue;
-            }
+        if !passes_age_bound(
+            req.age_bound_unix_nanos,
+            row.occurred_at_unix_nanos,
+            row.created_at_unix_nanos,
+        ) {
+            continue;
         }
 
         let text = if let Some(texts) = texts_table.as_ref() {
@@ -3428,6 +3445,26 @@ fn retriever_to_wire_name(r: brain_planner::retrieval::router::Retriever) -> Ret
 mod tests {
     use super::*;
     use brain_planner::retrieval::router::Retriever;
+
+    #[test]
+    fn age_bound_none_admits_everything() {
+        assert!(passes_age_bound(None, Some(1), 2));
+        assert!(passes_age_bound(None, None, 0));
+    }
+
+    #[test]
+    fn age_bound_filters_on_event_time_not_ingest_time() {
+        let bound = Some(2025);
+        // Ingested in 2026 but the event occurred in 2020: excluded, because
+        // its event time (2020) is before the bound.
+        assert!(!passes_age_bound(bound, Some(2020), 2026));
+        // Back-filled 2026 event with an old created_at: included, because
+        // its event time (2026) is at/after the bound.
+        assert!(passes_age_bound(bound, Some(2026), 1990));
+        // No occurred_at: falls back to created_at.
+        assert!(!passes_age_bound(bound, None, 2020));
+        assert!(passes_age_bound(bound, None, 2025));
+    }
 
     #[test]
     fn memory_ids_wire_keeps_only_memory_variants() {

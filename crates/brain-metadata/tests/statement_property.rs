@@ -143,15 +143,17 @@ proptest! {
             extracted_at,
             1,
         );
-        stmt.valid_from_unix_nanos = valid_from;
-        stmt.valid_to_unix_nanos = valid_to;
-        // `Event` kind MUST carry event_at; Fact MUST NOT.
-        stmt.event_at_unix_nanos = if kind == StatementKind::Event {
-            // Avoid 0 — validate_statement_shape rejects 0 for Event.
-            Some(event_at.max(1))
+        // Events are point-in-time and MUST NOT carry validity intervals;
+        // only Facts do. `event_at` is Event-exclusive.
+        if kind == StatementKind::Event {
+            stmt.valid_from_unix_nanos = None;
+            stmt.valid_to_unix_nanos = None;
+            stmt.event_at_unix_nanos = Some(event_at.max(1));
         } else {
-            None
-        };
+            stmt.valid_from_unix_nanos = valid_from;
+            stmt.valid_to_unix_nanos = valid_to;
+            stmt.event_at_unix_nanos = None;
+        }
 
         // Write inside a wtxn and commit.
         {

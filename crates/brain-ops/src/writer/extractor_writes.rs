@@ -109,13 +109,15 @@ pub fn statement_create_internal(
         payload.extracted_at_unix_nanos,
         payload.schema_version.max(1),
     );
-    s.valid_from_unix_nanos = Some(payload.extracted_at_unix_nanos);
     s.is_stateful = payload.is_stateful;
-    // Event time is only valid on Event-kind rows; the shape validator
-    // rejects it on any other kind. Set it strictly for Events so temporal
-    // events persist (they were dropped when this was never plumbed).
+    // An Event is point-in-time: it carries event_at, never a validity range.
+    // The shape validator rejects an Event with valid_from/valid_to, so only a
+    // non-Event gets the valid_from default (= extracted_at). Event time is set
+    // strictly for Events so temporal events persist.
     if payload.kind == StatementKind::Event {
         s.event_at_unix_nanos = payload.event_at_unix_nanos;
+    } else {
+        s.valid_from_unix_nanos = Some(payload.extracted_at_unix_nanos);
     }
     statement_create(
         wtxn,
