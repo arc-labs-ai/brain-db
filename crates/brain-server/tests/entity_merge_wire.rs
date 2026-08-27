@@ -225,9 +225,23 @@ async fn merge_and_unmerge_round_trip() {
     .await;
     match body {
         ResponseBody::EntityGet(r) => {
-            assert_ne!(r.entity.merged_into, [0u8; 16], "merged_into populated");
-            assert_eq!(r.entity.merged_into, alice);
-            assert_ne!(r.entity.flags & 2, 0, "MERGED flag set");
+            // entity_get follows the merged_into redirect (spec §Multi-hop
+            // merge): a GET on the merged entity returns the SURVIVOR's row,
+            // not the raw merged row. So we observe Alice — whose own
+            // merged_into is empty and which now carries the folded alias.
+            assert_eq!(
+                r.entity.canonical_name, "Alice",
+                "entity_get(merged) redirects to the survivor"
+            );
+            assert_eq!(
+                r.entity.merged_into, [0u8; 16],
+                "survivor's own merged_into is empty"
+            );
+            assert!(
+                r.entity.aliases.contains(&"Alyss".into()),
+                "redirected survivor carries the folded alias: {:?}",
+                r.entity.aliases
+            );
         }
         other => panic!("expected EntityGet, got {other:?}"),
     }
