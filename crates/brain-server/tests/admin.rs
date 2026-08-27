@@ -232,6 +232,44 @@ async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
     (code, body)
 }
 
+/// Admin bearer token configured by `config::Config::for_tests`. Every
+/// `/v1/*` route is gated on it.
+const ADMIN_TOKEN: &str = "test-admin-token";
+
+/// Authed GET against a gated `/v1/*` route. Returns (status_code, body).
+async fn http_get_authed(addr: SocketAddr, path: &str) -> (u16, String) {
+    http_send(addr, "GET", path).await
+}
+
+/// Authed POST with an empty body against a gated `/v1/*` route.
+async fn http_post_authed(addr: SocketAddr, path: &str) -> (u16, String) {
+    http_send(addr, "POST", path).await
+}
+
+/// Single-shot authenticated request with an empty body.
+async fn http_send(addr: SocketAddr, method: &str, path: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {ADMIN_TOKEN}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.expect("send");
+    stream.flush().await.expect("flush");
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read");
+    let response = String::from_utf8_lossy(&buf).into_owned();
+    let first_line = response.lines().next().unwrap_or("");
+    let code = first_line
+        .split(' ')
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_owned())
+        .unwrap_or_default();
+    (code, body)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -377,6 +415,92 @@ async fn metrics_emits_worker_counters() {
         let needle = format!("brain_worker_cycles_total{{shard=\"0\",worker=\"{worker}\"}}");
         assert!(body.contains(&needle), "missing {needle}; body:\n{body}");
     }
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metrics_emits_worker_health_series() {
+    // O7: panics_total / pending_work / cycle_duration_ms must be
+    // rendered on /metrics, not just cycles/processed/errors/last_run.
+    let server = start_admin_with_shards(1).await;
+    let (code, body) = http_get(server.admin_addr, "/metrics").await;
+    assert_eq!(code, 200);
+    // HELP lines for the newly-rendered families.
+    for help in [
+        "# HELP brain_worker_panics_total",
+        "# HELP brain_worker_pending_work",
+        "# HELP brain_worker_cycle_duration_ms",
+    ] {
+        assert!(
+            body.contains(help),
+            "missing HELP line {help}; body:\n{body}"
+        );
+    }
+    // Per-worker series for a well-known worker.
+    for needle in [
+        "brain_worker_panics_total{shard=\"0\",worker=\"decay\"}",
+        "brain_worker_pending_work{shard=\"0\",worker=\"decay\"}",
+        "brain_worker_cycle_duration_ms{shard=\"0\",worker=\"decay\"}",
+    ] {
+        assert!(body.contains(needle), "missing {needle}; body:\n{body}");
+    }
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_list_reports_paused_after_stop() {
+    // O6: after POST /v1/workers/<w>/stop the LIST must report
+    // paused=true for that worker.
+    let server = start_admin_with_shards(1).await;
+
+    let (code, body) = http_get_authed(server.admin_addr, "/v1/workers").await;
+    assert_eq!(code, 200);
+    assert!(
+        body.contains("\"name\":\"decay\"") && body.contains("\"paused\":false"),
+        "decay should start un-paused; body:\n{body}"
+    );
+
+    let (code, body) = http_post_authed(server.admin_addr, "/v1/workers/decay/stop").await;
+    assert_eq!(code, 200, "stop should succeed; body:\n{body}");
+
+    let (code, body) = http_get_authed(server.admin_addr, "/v1/workers").await;
+    assert_eq!(code, 200);
+    // The decay object must now carry paused=true. Parse it out to avoid
+    // matching another worker's paused flag.
+    let decay_obj = body
+        .split("{\"shard\"")
+        .find(|chunk| chunk.contains("\"name\":\"decay\""))
+        .expect("decay object present");
+    assert!(
+        decay_obj.contains("\"paused\":true"),
+        "decay must report paused=true after stop; obj:\n{decay_obj}"
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_control_rejects_c0_and_unknown() {
+    // O4: a C0 always-on worker is rejected (403, C0 reason); an
+    // unregistered name still 400s; a registered C2 worker is accepted.
+    let server = start_admin_with_shards(1).await;
+
+    // C0 worker → 403 with the C0 reason.
+    let (code, body) = http_post_authed(server.admin_addr, "/v1/workers/extractor/stop").await;
+    assert_eq!(code, 403, "extractor is C0; body:\n{body}");
+    assert!(
+        body.contains("C0 always-on"),
+        "rejection must state the C0 reason; body:\n{body}"
+    );
+
+    // Unregistered name → 400.
+    let (code, body) = http_post_authed(server.admin_addr, "/v1/workers/nonesuch/stop").await;
+    assert_eq!(code, 400, "unknown worker must 400; body:\n{body}");
+    assert!(body.contains("unknown worker"), "body:\n{body}");
+
+    // Registered C2 worker → 200.
+    let (code, body) = http_post_authed(server.admin_addr, "/v1/workers/decay/stop").await;
+    assert_eq!(code, 200, "decay is controllable C2; body:\n{body}");
+
     server.stop().await;
 }
 

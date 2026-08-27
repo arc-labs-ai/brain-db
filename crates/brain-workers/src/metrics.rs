@@ -36,6 +36,11 @@ impl WorkerMetrics {
     /// handlers where caller wants a consistent point-in-time view
     /// (each field still loads independently, so the snapshot isn't
     /// a full atomic across fields).
+    /// Read the metric atomics. `paused` is **not** owned by
+    /// `WorkerMetrics` (it lives in `WorkerControls`), so this
+    /// constructor always reports `paused: false`; the scheduler's
+    /// [`crate::scheduler::WorkerScheduler::metrics_snapshot`] overwrites
+    /// it with the worker's live pause state.
     #[must_use]
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -46,6 +51,7 @@ impl WorkerMetrics {
             last_cycle_duration_ms: self.last_cycle_duration_ms.load(Ordering::Relaxed),
             last_run_unix_secs: self.last_run_unix_secs.load(Ordering::Relaxed),
             pending_work_estimate: self.pending_work_estimate.load(Ordering::Relaxed),
+            paused: false,
         }
     }
 }
@@ -59,4 +65,9 @@ pub struct MetricsSnapshot {
     pub last_cycle_duration_ms: u64,
     pub last_run_unix_secs: u64,
     pub pending_work_estimate: u64,
+    /// Live pause state of the worker's loop. Filled by the scheduler's
+    /// `metrics_snapshot` (not by [`WorkerMetrics::snapshot`], which has
+    /// no access to `WorkerControls`). `true` ⇒ the loop is ticking but
+    /// skipping `run_cycle` after a `stop`/pause.
+    pub paused: bool,
 }

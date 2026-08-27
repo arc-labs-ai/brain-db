@@ -197,7 +197,15 @@ impl WorkerScheduler {
     ) -> Vec<(&'static str, WorkerKind, crate::metrics::MetricsSnapshot)> {
         self.handles
             .values()
-            .map(|h| (h.name, h.kind, h.metrics.snapshot()))
+            .map(|h| {
+                let mut snap = h.metrics.snapshot();
+                // `paused` lives in `WorkerControls`, not `WorkerMetrics`,
+                // so stamp it here where both are in scope. This is what
+                // lets the admin `GET /v1/workers` list report paused vs
+                // running.
+                snap.paused = h.controls.paused.load(Ordering::Relaxed);
+                (h.name, h.kind, snap)
+            })
             .collect()
     }
 
@@ -354,7 +362,17 @@ async fn worker_loop(
             // its maintenance worker. A panicked-then-retried cycle is the
             // intended failure mode, not a poisoning one.
             let cycle = AssertUnwindSafe(async { worker.run_cycle(&ctx).await });
-            match futures_util::future::FutureExt::catch_unwind(cycle).await {
+            let outcome = futures_util::future::FutureExt::catch_unwind(cycle).await;
+            // `last_run` tracks the last *attempted* cycle, updated on
+            // every arm (Ok / Err / caught-panic). A worker that errors or
+            // panics every tick is still running — freezing `last_run` to
+            // the last success would make it read as dead. The
+            // errors_total / panics_total counters remain the failure
+            // signal.
+            metrics
+                .last_run_unix_secs
+                .store(now_unix_secs(), Ordering::Relaxed);
+            match outcome {
                 Ok(Ok(processed)) => {
                     metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
                     metrics
@@ -365,9 +383,6 @@ async fn worker_loop(
                     metrics
                         .last_cycle_duration_ms
                         .store(duration_ms, Ordering::Relaxed);
-                    metrics
-                        .last_run_unix_secs
-                        .store(now_unix_secs(), Ordering::Relaxed);
                     debug!(worker = name, processed, duration_ms, "cycle complete");
                 }
                 Ok(Err(e)) => {

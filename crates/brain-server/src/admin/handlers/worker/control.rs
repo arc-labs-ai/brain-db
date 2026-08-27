@@ -10,7 +10,7 @@ use http::{Method, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use tracing::warn;
 
-use crate::admin::handlers::worker::{KNOWN_ACTIONS, KNOWN_WORKERS};
+use crate::admin::handlers::worker::{classify_control, ControlDecision, KNOWN_ACTIONS};
 use crate::admin::util::{json_response, text_response};
 use crate::admin::AdminState;
 use crate::shard::WorkerAction;
@@ -36,11 +36,37 @@ pub async fn control(
     let name = parts.next().unwrap_or("").to_owned();
     let action_slug = parts.next().unwrap_or("");
 
-    if !KNOWN_WORKERS.contains(&name.as_str()) {
-        return Ok(text_response(
-            StatusCode::BAD_REQUEST,
-            &format!("unknown worker `{name}`\n"),
-        ));
+    // Derive the controllable set from the scheduler's live registration
+    // snapshot rather than a hand-maintained list, then apply the
+    // explicit C0 guard. This keeps every provisioned C2 worker
+    // controllable and every C0 always-on worker un-pausable, without
+    // either drifting as the worker set evolves.
+    let mut registered: Vec<&'static str> = Vec::new();
+    for shard in state.shards.iter() {
+        if let Ok(snaps) = shard.scheduler_snapshot().await {
+            for (n, _, _) in snaps {
+                if !registered.contains(&n) {
+                    registered.push(n);
+                }
+            }
+        }
+    }
+    match classify_control(&name, &registered) {
+        ControlDecision::Allow => {}
+        ControlDecision::RejectC0 => {
+            return Ok(text_response(
+                StatusCode::FORBIDDEN,
+                &format!(
+                    "worker `{name}` is C0 always-on and cannot be paused, resumed, or run on demand\n"
+                ),
+            ));
+        }
+        ControlDecision::Unknown => {
+            return Ok(text_response(
+                StatusCode::BAD_REQUEST,
+                &format!("unknown worker `{name}`\n"),
+            ));
+        }
     }
     let action = match action_slug {
         "stop" => WorkerAction::Pause,

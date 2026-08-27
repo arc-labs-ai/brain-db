@@ -40,11 +40,15 @@ pub async fn list(
                     first = false;
                     write!(
                         &mut body,
-                        "{{\"shard\":{idx},\"name\":\"{name}\",\"cycles\":{c},\"processed\":{p},\"errors\":{e},\"last_run_unix\":{lr}}}",
+                        "{{\"shard\":{idx},\"name\":\"{name}\",\"cycles\":{c},\"processed\":{p},\"errors\":{e},\"panics\":{pa},\"pending_work\":{pw},\"last_cycle_duration_ms\":{d},\"last_run_unix\":{lr},\"paused\":{paused}}}",
                         c = snap.cycles_total,
                         p = snap.processed_total,
                         e = snap.errors_total,
+                        pa = snap.panics_total,
+                        pw = snap.pending_work_estimate,
+                        d = snap.last_cycle_duration_ms,
                         lr = snap.last_run_unix_secs,
+                        paused = snap.paused,
                     )
                     .expect("string write");
                 }

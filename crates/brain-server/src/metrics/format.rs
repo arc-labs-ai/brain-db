@@ -332,7 +332,25 @@ async fn emit_worker_counters(out: &mut String, shards: &[ShardHandle]) {
     emit_header(
         out,
         "brain_worker_last_run_unixtime",
-        "Unix-time of the worker's last cycle.",
+        "Unix-time of the worker's last attempted cycle (success, error, or caught panic).",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_worker_panics_total",
+        "Worker cycles that panicked (a subset of errors_total). Nonzero is worth alerting on.",
+        "counter",
+    );
+    emit_header(
+        out,
+        "brain_worker_pending_work",
+        "Worker's last-observed estimate of outstanding work items.",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_worker_cycle_duration_ms",
+        "Duration of the worker's most recent successful cycle, in milliseconds.",
         "gauge",
     );
 
@@ -362,6 +380,21 @@ async fn emit_worker_counters(out: &mut String, shards: &[ShardHandle]) {
                         out,
                         "brain_worker_last_run_unixtime{{shard=\"{shard_id}\",worker=\"{name}\"}} {}",
                         snap.last_run_unix_secs
+                    );
+                    let _ = writeln!(
+                        out,
+                        "brain_worker_panics_total{{shard=\"{shard_id}\",worker=\"{name}\"}} {}",
+                        snap.panics_total
+                    );
+                    let _ = writeln!(
+                        out,
+                        "brain_worker_pending_work{{shard=\"{shard_id}\",worker=\"{name}\"}} {}",
+                        snap.pending_work_estimate
+                    );
+                    let _ = writeln!(
+                        out,
+                        "brain_worker_cycle_duration_ms{{shard=\"{shard_id}\",worker=\"{name}\"}} {}",
+                        snap.last_cycle_duration_ms
                     );
                 }
             }
