@@ -2082,10 +2082,22 @@ fn fold_tier_result(
 ) {
     use brain_core::ExtractorKind;
     let outcome_byte = tier_outcome_for(&result);
+    // Two extractors can share one tier. Combine rather than overwrite so a
+    // later extractor's SKIP never erases an earlier extractor's real outcome
+    // (A=RAN + B=SkippedFilter must record RAN, not SKIPPED). Mirrors the LLM
+    // runner's ABSENT→SKIP guard; among two real outcomes the later wins, so
+    // RAN-vs-FAILED ordering (and the LLM retry decision it feeds) is
+    // unchanged.
+    let current = match tier_kind {
+        ExtractorKind::Pattern => slot.pattern,
+        ExtractorKind::Classifier => slot.classifier,
+        ExtractorKind::Llm => slot.llm,
+    };
+    let combined = combine_tier_status(current, outcome_byte);
     match tier_kind {
-        ExtractorKind::Pattern => slot.pattern = outcome_byte,
-        ExtractorKind::Classifier => slot.classifier = outcome_byte,
-        ExtractorKind::Llm => slot.llm = outcome_byte,
+        ExtractorKind::Pattern => slot.pattern = combined,
+        ExtractorKind::Classifier => slot.classifier = combined,
+        ExtractorKind::Llm => slot.llm = combined,
     }
     // Real provider cost flows from the LLM extractor's result into the
     // per-memory outcome, which the caller sums into the per-cycle spend
@@ -2392,6 +2404,21 @@ fn tier_outcome_for(result: &ExtractionResult) -> u8 {
         | ExtractionStatus::SkippedFilter
         | ExtractionStatus::SkippedDuplicate
         | ExtractionStatus::SkippedDisabled => tier_status::SKIPPED,
+    }
+}
+
+/// Fold a later extractor's tier outcome into the tier's running status byte
+/// when two extractors share one tier. A real outcome (`RAN` / `FAILED`) must
+/// never be clobbered by a `SKIP` (or the initial `ABSENT`); among two real
+/// outcomes the later one wins, preserving the pre-existing RAN-vs-FAILED
+/// behavior the LLM retry path depends on.
+fn combine_tier_status(current: u8, incoming: u8) -> u8 {
+    let current_is_real = matches!(current, tier_status::RAN | tier_status::FAILED);
+    let incoming_is_real = matches!(incoming, tier_status::RAN | tier_status::FAILED);
+    if current_is_real && !incoming_is_real {
+        current
+    } else {
+        incoming
     }
 }
 
@@ -5264,6 +5291,90 @@ mod tests {
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
         }
+    }
+
+    /// Two extractors in one tier: the first succeeds (and yields an item),
+    /// the second skips on its where-clause. The tier byte must record the
+    /// real outcome (RAN), not be clobbered to SKIPPED by the later extractor,
+    /// and the successful extractor's items must be merged (not lost).
+    #[test]
+    fn fold_two_extractors_one_tier_success_then_skip_keeps_success() {
+        use brain_core::ExtractorKind;
+        let mem_id = MemoryId::pack(0, 1, 0);
+        let mut slot = outcome(
+            tier_status::ABSENT,
+            tier_status::ABSENT,
+            tier_status::ABSENT,
+        );
+
+        let item = ExtractedItem::EntityMention(EntityMention {
+            entity_type_qname: "brain:Person".into(),
+            text: "Alice".into(),
+            start: 0,
+            end: 5,
+            confidence: 0.9,
+            extractor_id: 1,
+            extractor_version: 1,
+        });
+        // Extractor A: success with one item.
+        fold_tier_result(
+            &mut slot,
+            ExtractionResult::success(vec![item], 0, 0),
+            ExtractorKind::Pattern,
+            mem_id,
+        );
+        assert_eq!(slot.pattern, tier_status::RAN);
+
+        // Extractor B in the SAME tier: filtered out by its where-clause.
+        fold_tier_result(
+            &mut slot,
+            ExtractionResult::skipped(ExtractionStatus::SkippedFilter, "where-clause", 0),
+            ExtractorKind::Pattern,
+            mem_id,
+        );
+
+        assert_eq!(
+            slot.pattern,
+            tier_status::RAN,
+            "a later SKIP must not clobber an earlier real outcome"
+        );
+        assert_eq!(
+            slot.items.len(),
+            1,
+            "the successful extractor's item is preserved"
+        );
+    }
+
+    /// The reverse order (skip first, success second) must also land on RAN.
+    #[test]
+    fn fold_two_extractors_one_tier_skip_then_success_keeps_success() {
+        use brain_core::ExtractorKind;
+        let mem_id = MemoryId::pack(0, 1, 0);
+        let mut slot = outcome(
+            tier_status::ABSENT,
+            tier_status::ABSENT,
+            tier_status::ABSENT,
+        );
+
+        fold_tier_result(
+            &mut slot,
+            ExtractionResult::skipped(ExtractionStatus::SkippedFilter, "where-clause", 0),
+            ExtractorKind::Classifier,
+            mem_id,
+        );
+        assert_eq!(slot.classifier, tier_status::SKIPPED);
+
+        fold_tier_result(
+            &mut slot,
+            ExtractionResult::success(Vec::new(), 0, 0),
+            ExtractorKind::Classifier,
+            mem_id,
+        );
+        assert_eq!(
+            slot.classifier,
+            tier_status::RAN,
+            "a real outcome upgrades a prior SKIP"
+        );
     }
 
     /// Reproduces the user-visible regression: pattern produces 1

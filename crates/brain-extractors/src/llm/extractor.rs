@@ -1109,11 +1109,30 @@ fn read_str(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(String::from)
 }
 
-fn read_conf(v: &Value) -> f32 {
+/// Confidence assigned to an item when the LLM omits the (required)
+/// `confidence` field. Deliberately low: an unstated confidence is low trust,
+/// so the operator's `confidence_threshold` (default 0.7) decides retention
+/// rather than the model getting the benefit of the doubt. It sits below
+/// `RETRACT_MIN_CONFIDENCE` (0.7, in the worker) so a defaulted confidence can
+/// never, on its own, drive a destructive retraction. Consistent with the
+/// other tiers, which assign fixed conservative confidences (pattern 0.7,
+/// temporal/classifier 0.6) rather than 1.0.
+const DEFAULT_MISSING_CONFIDENCE: f32 = 0.5;
+
+/// The LLM-emitted confidence when the model explicitly stated one, or `None`
+/// when the (required) field is absent. Callers that must not act on an
+/// unstated confidence (e.g. a destructive retraction) branch on the `None`.
+fn read_conf_explicit(v: &Value) -> Option<f32> {
     v.get("confidence")
         .and_then(Value::as_f64)
         .map(|f| f as f32)
-        .unwrap_or(1.0)
+}
+
+/// The item's confidence, falling back to the conservative
+/// [`DEFAULT_MISSING_CONFIDENCE`] when the model omits the field — never 1.0,
+/// which would grant an unstated confidence maximum trust.
+fn read_conf(v: &Value) -> f32 {
+    read_conf_explicit(v).unwrap_or(DEFAULT_MISSING_CONFIDENCE)
 }
 
 /// Whether the LLM marked the statement's object as a referenced entity (vs a
@@ -1192,6 +1211,16 @@ fn project_statement(
         .get("is_stateful")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let retract = read_retract(v);
+    // A retraction is destructive: it tombstones a stored fact. Require the
+    // model to have EXPLICITLY stated a confidence before we let it retire
+    // anything — an omitted confidence must never drive a tombstone on a
+    // default value the model never asserted. Drop the item rather than fall
+    // back to a positive assertion, which would mint a fact from a "no longer
+    // true" statement.
+    if retract && read_conf_explicit(v).is_none() {
+        return None;
+    }
     Some(ExtractedItem::StatementMention(StatementMention {
         kind,
         subject_text: read_str(v, "subject"),
@@ -1205,7 +1234,7 @@ fn project_statement(
         object_is_entity: read_object_is_entity(v),
         event_at_unix_nanos: read_event_at(v),
         subject_is_self: read_subject_is_self(v),
-        retract: read_retract(v),
+        retract,
     }))
 }
 
@@ -1229,6 +1258,14 @@ fn project_statement_open(
     let kind = read_str(v, "kind")
         .map(|s| kind_from_name(&s))
         .unwrap_or_else(|| brain_core::StatementKind::Fact.as_u8() + 1);
+    let retract = read_retract(v);
+    // A retraction is destructive: require an EXPLICIT confidence before we
+    // let it tombstone a stored fact (see `project_statement`). An omitted
+    // confidence drops the item rather than defaulting into a tombstone or a
+    // spurious positive assertion.
+    if retract && read_conf_explicit(v).is_none() {
+        return None;
+    }
     Some(ExtractedItem::StatementMention(StatementMention {
         kind,
         subject_text: read_str(v, "subject"),
@@ -1242,7 +1279,7 @@ fn project_statement_open(
         object_is_entity: read_object_is_entity(v),
         event_at_unix_nanos: read_event_at(v),
         subject_is_self: read_subject_is_self(v),
-        retract: read_retract(v),
+        retract,
     }))
 }
 
@@ -1481,11 +1518,16 @@ impl Extractor for LlmExtractor {
                         let resp2 = match inner.client.complete(request).await {
                             Ok(r) => r,
                             Err(e) => {
+                                // The first call already billed real provider
+                                // spend; carry it onto the failure so the
+                                // worker's per-cycle budget gate counts it
+                                // (§21: both calls counted in cost_micro_usd).
                                 return ExtractionResult::failure(
                                     llm_error_reason(&e),
                                     started,
                                     started,
                                 )
+                                .with_cost(cost_micro)
                                 .with_failure_class(extraction_failure_class(&e));
                             }
                         };
@@ -1500,11 +1542,17 @@ impl Extractor for LlmExtractor {
                                 // validation is a prompt/schema mismatch, not a
                                 // provider blip — retrying the same prompt won't
                                 // help, so it's permanent (terminal, no retry loop).
+                                // Both calls billed real spend; carry the summed
+                                // cost onto the failure so the worker's per-cycle
+                                // budget gate counts it (§21: both calls counted
+                                // in cost_micro_usd) — else a malformed prompt
+                                // burns two API calls every cycle unbounded.
                                 return ExtractionResult::failure(
                                     "schema validation failed twice",
                                     started,
                                     started,
                                 )
+                                .with_cost(cost_micro)
                                 .with_failure_class(ExtractionFailureClass::Permanent);
                             }
                         }

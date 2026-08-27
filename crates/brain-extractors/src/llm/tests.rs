@@ -1370,3 +1370,147 @@ fn system_schema_missing_object_twice_drops_cleanly_never_fabricates() {
         "a twice-invalid response must yield zero items, never a fabricated empty-object statement"
     );
 }
+
+// ----- E1: failed extractions must carry their real provider spend. -----
+
+#[test]
+fn schema_validation_failed_twice_reports_full_cost() {
+    let schema = system_llm_predicate_schema();
+    // Both calls omit "object" → schema fails twice → terminal Failure. Each
+    // `ok_response(_, 100)` bills tokens*2 = 200 µ$, so the two calls that
+    // actually hit the provider spent 400 µ$ total. The failure MUST report
+    // that spend so the worker's per-cycle budget gate counts it — else a
+    // malformed prompt burns two API calls forever.
+    let bad = r#"{"statements": [
+        {"subject": "Priya", "predicate": "brain:manages", "kind": "Relation",
+         "confidence": 0.9, "object_is_entity": false, "event_at": null,
+         "subject_is_self": false, "retract": false, "is_stateful": false}
+    ]}"#;
+    let client = Arc::new(MockClient::new(
+        "gpt-4o-mini",
+        vec![Ok(ok_response(bad, 100)), Ok(ok_response(bad, 100))],
+    ));
+    let ext = build_ext_with_target(client, schema, ExtractorTarget::EntityOrStatement);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(
+        &ctx(&reg),
+        &memory("Priya manages the billing platform team."),
+    ));
+    assert_eq!(r.status, ExtractionStatus::Failure);
+    assert_eq!(
+        r.cost_micro_usd, 400,
+        "both calls' real spend must ride the failure, not default to 0"
+    );
+}
+
+#[test]
+fn retry_transport_error_reports_first_call_cost() {
+    let schema = system_llm_predicate_schema();
+    // First call reaches the provider (bills 200 µ$) but fails schema; the
+    // retry errors at transport. The first call's spend already happened, so
+    // the failure must carry 200 µ$ — not 0.
+    let bad = r#"{"statements": [
+        {"subject": "Priya", "predicate": "brain:manages", "kind": "Relation",
+         "confidence": 0.9, "object_is_entity": false, "event_at": null,
+         "subject_is_self": false, "retract": false, "is_stateful": false}
+    ]}"#;
+    let client = Arc::new(MockClient::new(
+        "gpt-4o-mini",
+        vec![
+            Ok(ok_response(bad, 100)),
+            Err(LlmError::ProviderError {
+                status: 503,
+                message: "upstream down".into(),
+            }),
+        ],
+    ));
+    let ext = build_ext_with_target(client, schema, ExtractorTarget::EntityOrStatement);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(
+        &ctx(&reg),
+        &memory("Priya manages the billing platform team."),
+    ));
+    assert_eq!(r.status, ExtractionStatus::Failure);
+    assert_eq!(
+        r.cost_micro_usd, 200,
+        "the first call already billed real spend; it must ride the failure"
+    );
+}
+
+// ----- E2: missing confidence is conservative; retracts need explicit conf. --
+
+#[test]
+fn missing_confidence_uses_conservative_default_not_max() {
+    // No "confidence" field on the emitted statement. It must NOT default to
+    // 1.0; it gets the conservative 0.5 default, which sits below the 0.7
+    // retract floor so an unstated confidence can never drive a tombstone.
+    let body = r#"{"statements":[{"subject":"Alice","predicate":"brain:likes","object":"tea"}]}"#;
+    let client = Arc::new(MockClient::new(
+        "claude-haiku-4-5",
+        vec![Ok(ok_response(body, 50))],
+    ));
+    // build_ext sets confidence_threshold = 0.5, so the 0.5 default is retained.
+    let ext = build_ext(client, None, None, None);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice likes tea")));
+    assert_eq!(r.status, ExtractionStatus::Success);
+    assert_eq!(r.items.len(), 1);
+    match &r.items[0] {
+        ExtractedItem::StatementMention(m) => {
+            assert!(
+                m.confidence < 1.0,
+                "missing confidence must not default to max"
+            );
+            assert!(
+                (m.confidence - 0.5).abs() < f32::EPSILON,
+                "conservative default should be 0.5, got {}",
+                m.confidence
+            );
+            assert!(m.confidence < 0.7, "must sit below the retract floor");
+        }
+        other => panic!("expected statement mention, got {other:?}"),
+    }
+}
+
+#[test]
+fn retract_without_confidence_is_dropped_never_tombstones() {
+    // A retraction with NO stated confidence must be dropped entirely — never
+    // fall back to a default that fires a destructive tombstone, and never
+    // become a spurious positive assertion.
+    let body = r#"{"statements":[{"subject":"Bob","predicate":"brain:works_at","object":"Google","retract":true}]}"#;
+    let client = Arc::new(MockClient::new(
+        "claude-haiku-4-5",
+        vec![Ok(ok_response(body, 50))],
+    ));
+    let ext = build_ext(client, None, None, None);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Bob no longer at Google")));
+    assert_eq!(r.status, ExtractionStatus::Success);
+    assert!(
+        r.items.is_empty(),
+        "a retract with no explicit confidence must be dropped, never emit a mention"
+    );
+}
+
+#[test]
+fn retract_with_explicit_high_confidence_survives() {
+    // An explicit, high confidence on a retraction still produces the retract
+    // mention so a real negation can retire a stored fact.
+    let body = r#"{"statements":[{"subject":"Bob","predicate":"brain:works_at","object":"Google","retract":true,"confidence":0.9}]}"#;
+    let client = Arc::new(MockClient::new(
+        "claude-haiku-4-5",
+        vec![Ok(ok_response(body, 50))],
+    ));
+    let ext = build_ext(client, None, None, None);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Bob no longer at Google")));
+    assert_eq!(r.status, ExtractionStatus::Success);
+    assert_eq!(r.items.len(), 1);
+    match &r.items[0] {
+        ExtractedItem::StatementMention(m) => {
+            assert!(m.retract, "retract flag must survive");
+            assert!((m.confidence - 0.9).abs() < f32::EPSILON);
+        }
+        other => panic!("expected statement mention, got {other:?}"),
+    }
+}
