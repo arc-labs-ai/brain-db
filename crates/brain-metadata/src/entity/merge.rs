@@ -21,9 +21,12 @@
 //! Callers MUST call `wtxn.commit()` after `merge_entity` /
 //! `unmerge_entity` returns `Ok(_)`.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
-use brain_core::{EntityId, EntityTypeId, MergeId};
+use brain_core::{
+    canonical_pair, EdgeKindRef, EntityId, EntityTypeId, MergeId, NodeRef, RelationId,
+    RelationTypeId, StatementKind, StatementObject,
+};
 use redb::{ReadableTable, WriteTransaction};
 
 use super::ops::{normalize_name, EntityOpError};
@@ -31,10 +34,23 @@ use super::trigram::{
     extract_trigrams, index_entity_trigrams, remove_entity_trigrams, trigrams_of_components,
     TrigramOpError,
 };
+use crate::tables::edge::{
+    self, derived_by, origin, EdgeData, EdgeOpError, EDGES_REVERSE_TABLE, EDGES_TABLE,
+};
 use crate::tables::entity::{
     flags, EntityMetadata, ENTITIES_TABLE, ENTITY_ALIASES_TABLE, ENTITY_BY_CANONICAL_NAME_TABLE,
 };
-use crate::tables::merge::{actor_kind, MergeRecord, MERGE_LOG_TABLE};
+use crate::tables::merge::{
+    actor_kind, conflict_outcome, conflict_policy, AttributeConflictRecord, MergeRecord,
+    RelationReroute, StatementReroute, MERGE_LOG_TABLE,
+};
+use crate::tables::relation::{RelationMetadata, RELATION_METADATA_TABLE};
+use crate::tables::scope::RowScope;
+use crate::tables::statement::{
+    encode_object, StatementMetadata, STATEMENTS_BY_EVENT_TIME_TABLE,
+    STATEMENTS_BY_OBJECT_ENTITY_TABLE, STATEMENTS_BY_SUBJECT_TABLE, STATEMENTS_TABLE,
+    STATEMENT_CHAIN_TABLE,
+};
 
 // ---------------------------------------------------------------------------
 // Public types.
@@ -79,6 +95,12 @@ pub enum EntityMergeOpError {
     #[error("trigram op: {0}")]
     TrigramOp(#[from] TrigramOpError),
 
+    #[error("edge op: {0}")]
+    EdgeOp(#[from] EdgeOpError),
+
+    #[error("edge key decode: {0}")]
+    EdgeKey(#[from] crate::tables::edge::EdgeKeyError),
+
     #[error("entity_ops: {0}")]
     EntityOp(#[from] EntityOpError),
 
@@ -122,13 +144,23 @@ pub const MIN_MERGE_CONFIDENCE: f32 = 0.7;
 /// for tests; production handlers pass `DEFAULT_MERGE_GRACE_NANOS`.
 pub const DEFAULT_MERGE_GRACE_NANOS: u64 = 7 * 24 * 60 * 60 * 1_000_000_000;
 
+/// The result of a successful [`merge_entity`]: the audit id plus the
+/// re-routed graph-row counts (surfaced to the wire event / ack).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MergeOutcome {
+    pub merge_id: MergeId,
+    pub statements_rerouted: u32,
+    pub relations_rerouted: u32,
+}
+
 // ---------------------------------------------------------------------------
 // merge_entity.
 // ---------------------------------------------------------------------------
 
 /// Merge `merged` into `survivor`.
 ///
-/// Returns the freshly allocated `MergeId` for the audit row.
+/// Returns the freshly allocated audit id plus the number of statements
+/// and relations re-routed onto the survivor.
 #[allow(clippy::too_many_arguments)]
 pub fn merge_entity(
     wtxn: &WriteTransaction,
@@ -139,7 +171,7 @@ pub fn merge_entity(
     actor: MergeActor,
     grace_seconds: u64,
     now_unix_nanos: u64,
-) -> Result<MergeId, EntityMergeOpError> {
+) -> Result<MergeOutcome, EntityMergeOpError> {
     // Pre-conditions.
 
     if survivor == merged {
@@ -180,9 +212,6 @@ pub fn merge_entity(
         });
     }
     let scope = survivor_row.scope();
-
-    // Merge mechanics — statement / relation re-routing is skipped;
-    // the lists / counts stay at zero.
 
     let type_id = EntityTypeId(survivor_row.entity_type_id);
 
@@ -232,10 +261,50 @@ pub fn merge_entity(
 
     let mention_count_added = merged_row.mention_count;
 
-    // attribute_conflicts is empty because attributes are opaque
-    // blobs; the schema DSL will decode and produce real conflict
-    // records.
-    let attribute_conflicts = Vec::new();
+    // Step 6 — attribute fold (survivor_wins).
+    //
+    // Entity attributes are an opaque `attributes_blob` (a future
+    // rkyv `BTreeMap<String, Value>` — no keyed codec has landed), so a
+    // per-key union is not yet possible. The fold therefore operates at
+    // whole-blob granularity, which is the faithful degenerate case of
+    // survivor_wins: the survivor keeps its own blob unconditionally; a
+    // survivor that carried no attributes adopts merged's blob (the only
+    // "add what only merged holds" move available without keys). When
+    // both blobs are non-empty and differ, one conflict record is stamped
+    // so the decision is auditable and reversible.
+    let survivor_attributes_before = survivor_row.attributes_blob.clone();
+    let mut attribute_conflicts: Vec<AttributeConflictRecord> = Vec::new();
+    let adopt_merged_attributes =
+        survivor_row.attributes_blob.is_empty() && !merged_row.attributes_blob.is_empty();
+    if !survivor_row.attributes_blob.is_empty()
+        && !merged_row.attributes_blob.is_empty()
+        && survivor_row.attributes_blob != merged_row.attributes_blob
+    {
+        attribute_conflicts.push(AttributeConflictRecord {
+            // Whole-blob sentinel until the keyed attribute codec lands.
+            attribute_key: "*".to_string(),
+            survivor_value_blob: survivor_row.attributes_blob.clone(),
+            merged_value_blob: merged_row.attributes_blob.clone(),
+            policy: conflict_policy::SURVIVOR_WINS,
+            outcome: conflict_outcome::KEPT_SURVIVOR,
+        });
+    }
+
+    // Steps 8 + 9 — re-route statements and relations onto the survivor.
+    // Both run in this same write transaction, so the whole merge is
+    // atomic. Scope-bounded: the enumerations range only within the
+    // merge's `(namespace, space)`.
+    let rerouted_statements =
+        reroute_statements(wtxn, scope, merged, survivor, survivor_row.entity_id_bytes)?;
+    let rerouted_relations = reroute_relations(
+        wtxn,
+        scope,
+        merged,
+        survivor_row.entity_id_bytes,
+        now_unix_nanos,
+    )?;
+    let statements_rerouted = u32::try_from(rerouted_statements.len()).unwrap_or(u32::MAX);
+    let relations_rerouted = u32::try_from(rerouted_relations.len()).unwrap_or(u32::MAX);
 
     // 1. Tear down merged's secondary indexes (canonical_name + aliases).
     {
@@ -285,8 +354,9 @@ pub fn merge_entity(
     // 4. Update survivor's trigrams for the additions.
     index_entity_trigrams(wtxn, scope, type_id, survivor, &trigrams_added_set)?;
 
-    // 5. Mutate survivor row in memory: extend aliases, fold mention_count.
-    //    Attributes are opaque blobs; survivor keeps its blob.
+    // 5. Mutate survivor row in memory: extend aliases, fold mention_count,
+    //    fold attributes (survivor_wins; adopt merged's blob only when the
+    //    survivor carried none).
     let mut survivor_next = survivor_row.clone();
     for a in &aliases_added {
         survivor_next.aliases.push(a.clone());
@@ -294,6 +364,9 @@ pub fn merge_entity(
     survivor_next.mention_count = survivor_next
         .mention_count
         .saturating_add(mention_count_added);
+    if adopt_merged_attributes {
+        survivor_next.attributes_blob = merged_row.attributes_blob.clone();
+    }
     survivor_next.updated_at_unix_nanos = now_unix_nanos;
 
     // 6. Mutate merged row: set merged_into, MERGED flag, updated_at.
@@ -328,21 +401,33 @@ pub fn merge_entity(
     audit.trigrams_added = trigrams_added;
     audit.attribute_conflicts = attribute_conflicts;
     audit.mention_count_added = mention_count_added;
-    // statements_rerouted / relations_rerouted stay at 0.
+    audit.statements_rerouted = statements_rerouted;
+    audit.relations_rerouted = relations_rerouted;
+    audit.rerouted_statements = rerouted_statements;
+    audit.rerouted_relations = rerouted_relations;
+    audit.survivor_attributes_before = survivor_attributes_before;
     {
         let mut t = wtxn.open_table(MERGE_LOG_TABLE)?;
         t.insert(&(now_unix_nanos, audit.merge_id_bytes), &audit)?;
     }
 
-    Ok(merge_id)
+    Ok(MergeOutcome {
+        merge_id,
+        statements_rerouted,
+        relations_rerouted,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // unmerge_entity.
 // ---------------------------------------------------------------------------
 
-/// Reverse a recent merge identified by the `merged` entity. Statement
-/// / relation re-route restoration is not performed here.
+/// Reverse a recent merge identified by the `merged` entity.
+///
+/// Restores the merged entity, strips the survivor of everything the
+/// merge contributed (aliases, mention_count, attributes), and re-points
+/// every re-routed statement / relation back to the merged entity using
+/// the audit's recorded diff.
 ///
 /// Returns the survivor's `EntityId` for caller convenience.
 pub fn unmerge_entity(
@@ -392,8 +477,11 @@ pub fn unmerge_entity(
     survivor_next.mention_count = survivor_next
         .mention_count
         .saturating_sub(audit.mention_count_added);
+    // Restore the survivor's pre-merge attribute blob (survivor_wins fold
+    // either left it untouched or, if the survivor had none, adopted
+    // merged's — either way the recorded snapshot is the exact reversal).
+    survivor_next.attributes_blob = audit.survivor_attributes_before.clone();
     survivor_next.updated_at_unix_nanos = now_unix_nanos;
-    // attribute_conflicts revert is a no-op (always empty).
 
     // 2. Strip survivor's secondary indexes of merged's contribution.
     {
@@ -453,6 +541,11 @@ pub fn unmerge_entity(
         trigrams_of_components(&merged_row.canonical_name, &merged_row.aliases);
     index_entity_trigrams(wtxn, scope, type_id, merged, &merged_full_trigrams)?;
 
+    // 5b. Re-point every re-routed statement / relation back to the merged
+    //     entity (exact reversal driven by the audit's recorded diff).
+    reverse_statement_reroutes(wtxn, scope, &audit.rerouted_statements, merged, survivor)?;
+    reverse_relation_reroutes(wtxn, &audit.rerouted_relations, now_unix_nanos)?;
+
     // 6. Write both rows back.
     {
         let mut t = wtxn.open_table(ENTITIES_TABLE)?;
@@ -471,6 +564,509 @@ pub fn unmerge_entity(
     }
 
     Ok(survivor)
+}
+
+// ---------------------------------------------------------------------------
+// Statement re-routing (step 8) + reversal.
+// ---------------------------------------------------------------------------
+
+/// Re-route every statement that references `merged` onto `survivor`.
+///
+/// Subject-side rows (subject == merged) have their subject re-pointed,
+/// their `version` bumped, and the by-subject / by-event-time / chain
+/// indexes rewritten. Object-side rows (object == `Entity(merged)`) have
+/// their object re-pointed and the by-object-entity index rewritten
+/// (no version bump). A self-referential row gets both.
+///
+/// Version bump discipline: every member of a supersession chain shares
+/// the merged subject, so the whole chain is re-routed. Bumping each
+/// member by `+1` would collide in the version-keyed chain table, so the
+/// chain is shifted by a uniform delta (its current max version) — this
+/// preserves ordering AND leaves every version unique.
+fn reroute_statements(
+    wtxn: &WriteTransaction,
+    scope: RowScope,
+    merged: EntityId,
+    survivor: EntityId,
+    survivor_bytes: [u8; 16],
+) -> Result<Vec<StatementReroute>, EntityMergeOpError> {
+    let ns = scope.namespace_id;
+    let ag = scope.space_id_bytes;
+    let merged_b = merged.to_bytes();
+
+    // Phase A — enumerate subject-side and object-side statement ids.
+    let mut sides: BTreeMap<[u8; 16], (bool, bool)> = BTreeMap::new();
+    {
+        let t = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
+        let lo = (ns, ag, merged_b, 0u8, 0u32, 0u8, [0u8; 16]);
+        let hi = (ns, ag, merged_b, u8::MAX, u32::MAX, 1u8, [0xffu8; 16]);
+        for entry in t.range(lo..=hi)? {
+            let (k, v) = entry?;
+            let (k_ns, k_ag, k_subj, ..) = k.value();
+            if k_ns != ns || k_ag != ag || k_subj != merged_b {
+                continue;
+            }
+            sides.entry(v.value()).or_insert((false, false)).0 = true;
+        }
+    }
+    {
+        let t = wtxn.open_table(STATEMENTS_BY_OBJECT_ENTITY_TABLE)?;
+        let lo = (ns, ag, merged_b, 0u8, [0u8; 16]);
+        let hi = (ns, ag, merged_b, u8::MAX, [0xffu8; 16]);
+        for entry in t.range(lo..=hi)? {
+            let (k, v) = entry?;
+            let (k_ns, k_ag, k_obj, ..) = k.value();
+            if k_ns != ns || k_ag != ag || k_obj != merged_b {
+                continue;
+            }
+            sides.entry(v.value()).or_insert((false, false)).1 = true;
+        }
+    }
+
+    // Phase B — load the affected rows.
+    let mut rows: Vec<(bool, bool, StatementMetadata)> = Vec::with_capacity(sides.len());
+    {
+        let t = wtxn.open_table(STATEMENTS_TABLE)?;
+        for (sid, (subj, obj)) in &sides {
+            let Some(m) = t.get(sid)?.map(|g| g.value()) else {
+                continue;
+            };
+            // Scope wall: the primary table is a flat keyspace; the index
+            // is scoped, but re-confirm on the row.
+            if m.namespace_id != ns || m.space_id_bytes != ag {
+                continue;
+            }
+            rows.push((*subj, *obj, m));
+        }
+    }
+
+    // Phase C — per-chain version-shift delta (subject-changed rows only).
+    let mut chain_delta: BTreeMap<[u8; 16], u32> = BTreeMap::new();
+    {
+        let t = wtxn.open_table(STATEMENT_CHAIN_TABLE)?;
+        for (subj, _obj, m) in &rows {
+            if !*subj {
+                continue;
+            }
+            if chain_delta.contains_key(&m.chain_root_bytes) {
+                continue;
+            }
+            let lo = (ns, ag, m.chain_root_bytes, 0u32);
+            let hi = (ns, ag, m.chain_root_bytes, u32::MAX);
+            let mut max = 0u32;
+            for entry in t.range(lo..=hi)? {
+                let (k, _) = entry?;
+                let (.., ver) = k.value();
+                max = max.max(ver);
+            }
+            chain_delta.insert(m.chain_root_bytes, max);
+        }
+    }
+
+    // Phase D — apply mutations with one handle per table.
+    let mut records: Vec<StatementReroute> = Vec::with_capacity(rows.len());
+    let mut st = wtxn.open_table(STATEMENTS_TABLE)?;
+    let mut bys = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
+    let mut byo = wtxn.open_table(STATEMENTS_BY_OBJECT_ENTITY_TABLE)?;
+    let mut byt = wtxn.open_table(STATEMENTS_BY_EVENT_TIME_TABLE)?;
+    let mut cht = wtxn.open_table(STATEMENT_CHAIN_TABLE)?;
+    for (subj, obj, mut m) in rows {
+        let old_version = m.version;
+        let mut new_version = old_version;
+
+        if obj {
+            byo.remove(&(ns, ag, merged_b, m.kind, m.statement_id_bytes))?;
+            byo.insert(
+                &(ns, ag, survivor_bytes, m.kind, m.statement_id_bytes),
+                &m.statement_id_bytes,
+            )?;
+            m.object_blob = encode_object(&StatementObject::Entity(survivor));
+            // object_discriminant stays Entity (== 1).
+        }
+
+        if subj {
+            let delta = chain_delta.get(&m.chain_root_bytes).copied().unwrap_or(0);
+            new_version = old_version.saturating_add(delta);
+
+            bys.remove(&(
+                ns,
+                ag,
+                merged_b,
+                m.kind,
+                m.predicate_id,
+                m.is_current,
+                m.statement_id_bytes,
+            ))?;
+            bys.insert(
+                &(
+                    ns,
+                    ag,
+                    survivor_bytes,
+                    m.kind,
+                    m.predicate_id,
+                    m.is_current,
+                    m.statement_id_bytes,
+                ),
+                &m.statement_id_bytes,
+            )?;
+
+            if m.kind == StatementKind::Event.as_u8() {
+                if let Some(event_at) = m.event_at_unix_nanos {
+                    byt.remove(&(ns, ag, event_at, merged_b, m.statement_id_bytes))?;
+                    byt.insert(
+                        &(ns, ag, event_at, survivor_bytes, m.statement_id_bytes),
+                        &m.statement_id_bytes,
+                    )?;
+                }
+            }
+
+            if new_version != old_version {
+                cht.remove(&(ns, ag, m.chain_root_bytes, old_version))?;
+                cht.insert(
+                    &(ns, ag, m.chain_root_bytes, new_version),
+                    &m.statement_id_bytes,
+                )?;
+            }
+
+            m.subject_entity_bytes = survivor_bytes;
+            m.version = new_version;
+        }
+
+        st.insert(&m.statement_id_bytes, &m)?;
+        records.push(StatementReroute {
+            statement_id_bytes: m.statement_id_bytes,
+            subject_changed: u8::from(subj),
+            object_changed: u8::from(obj),
+            old_version,
+            new_version,
+            chain_root_bytes: m.chain_root_bytes,
+        });
+    }
+    Ok(records)
+}
+
+/// Reverse [`reroute_statements`] using the recorded diff: re-point each
+/// statement's subject / object back to `merged` and restore the version
+/// + chain-table key.
+fn reverse_statement_reroutes(
+    wtxn: &WriteTransaction,
+    scope: RowScope,
+    records: &[StatementReroute],
+    merged: EntityId,
+    survivor: EntityId,
+) -> Result<(), EntityMergeOpError> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let ns = scope.namespace_id;
+    let ag = scope.space_id_bytes;
+    let merged_b = merged.to_bytes();
+    let survivor_b = survivor.to_bytes();
+
+    let mut st = wtxn.open_table(STATEMENTS_TABLE)?;
+    let mut bys = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
+    let mut byo = wtxn.open_table(STATEMENTS_BY_OBJECT_ENTITY_TABLE)?;
+    let mut byt = wtxn.open_table(STATEMENTS_BY_EVENT_TIME_TABLE)?;
+    let mut cht = wtxn.open_table(STATEMENT_CHAIN_TABLE)?;
+    for r in records {
+        let Some(mut m) = st.get(&r.statement_id_bytes)?.map(|g| g.value()) else {
+            continue;
+        };
+
+        if r.object_changed != 0 {
+            byo.remove(&(ns, ag, survivor_b, m.kind, m.statement_id_bytes))?;
+            byo.insert(
+                &(ns, ag, merged_b, m.kind, m.statement_id_bytes),
+                &m.statement_id_bytes,
+            )?;
+            m.object_blob = encode_object(&StatementObject::Entity(merged));
+        }
+
+        if r.subject_changed != 0 {
+            bys.remove(&(
+                ns,
+                ag,
+                survivor_b,
+                m.kind,
+                m.predicate_id,
+                m.is_current,
+                m.statement_id_bytes,
+            ))?;
+            bys.insert(
+                &(
+                    ns,
+                    ag,
+                    merged_b,
+                    m.kind,
+                    m.predicate_id,
+                    m.is_current,
+                    m.statement_id_bytes,
+                ),
+                &m.statement_id_bytes,
+            )?;
+
+            if m.kind == StatementKind::Event.as_u8() {
+                if let Some(event_at) = m.event_at_unix_nanos {
+                    byt.remove(&(ns, ag, event_at, survivor_b, m.statement_id_bytes))?;
+                    byt.insert(
+                        &(ns, ag, event_at, merged_b, m.statement_id_bytes),
+                        &m.statement_id_bytes,
+                    )?;
+                }
+            }
+
+            if r.new_version != r.old_version {
+                cht.remove(&(ns, ag, r.chain_root_bytes, r.new_version))?;
+                cht.insert(
+                    &(ns, ag, r.chain_root_bytes, r.old_version),
+                    &m.statement_id_bytes,
+                )?;
+            }
+
+            m.subject_entity_bytes = merged_b;
+            m.version = r.old_version;
+        }
+
+        st.insert(&m.statement_id_bytes, &m)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Relation re-routing (step 9) + reversal.
+// ---------------------------------------------------------------------------
+
+/// Re-route every relation with an endpoint on `merged` onto `survivor`.
+///
+/// Rewrites the unified edge rows (forward + reverse, plus the explicit
+/// symmetric mirror) and the sidecar `from` / `to`. Symmetric relations
+/// are re-canonicalised so the stored pair stays ordered by id.
+fn reroute_relations(
+    wtxn: &WriteTransaction,
+    scope: RowScope,
+    merged: EntityId,
+    survivor_bytes: [u8; 16],
+    now_unix_nanos: u64,
+) -> Result<Vec<RelationReroute>, EntityMergeOpError> {
+    let merged_b = merged.to_bytes();
+    let entity_tag = NodeRef::Entity(merged).tag();
+
+    // Phase A — enumerate affected relations (single scoped scan).
+    let mut affected: Vec<(RelationId, RelationMetadata)> = Vec::new();
+    {
+        let t = wtxn.open_table(RELATION_METADATA_TABLE)?;
+        for entry in t.iter()? {
+            let (k, v) = entry?;
+            let m = v.value();
+            if m.namespace_id != scope.namespace_id || m.space_id_bytes != scope.space_id_bytes {
+                continue;
+            }
+            let from_hit = m.from_tag == entity_tag && m.from_bytes == merged_b;
+            let to_hit = m.to_tag == entity_tag && m.to_bytes == merged_b;
+            if from_hit || to_hit {
+                affected.push((RelationId::from(k.value()), m));
+            }
+        }
+    }
+
+    // Phase B — apply.
+    let mut records: Vec<RelationReroute> = Vec::with_capacity(affected.len());
+    let mut edges = wtxn.open_table(EDGES_TABLE)?;
+    let mut reverse = wtxn.open_table(EDGES_REVERSE_TABLE)?;
+    let mut sidecar = wtxn.open_table(RELATION_METADATA_TABLE)?;
+    for (rel_id, m) in affected {
+        let from_changed = m.from_tag == entity_tag && m.from_bytes == merged_b;
+        let to_changed = m.to_tag == entity_tag && m.to_bytes == merged_b;
+        let old_from = m.from_bytes;
+        let old_to = m.to_bytes;
+
+        let mut new_from = if from_changed {
+            survivor_bytes
+        } else {
+            old_from
+        };
+        let mut new_to = if to_changed { survivor_bytes } else { old_to };
+        if m.is_symmetric() {
+            let (a, b) = canonical_pair(EntityId::from(new_from), EntityId::from(new_to));
+            new_from = a.to_bytes();
+            new_to = b.to_bytes();
+        }
+
+        rewrite_relation_edges(
+            &mut edges,
+            &mut reverse,
+            &m,
+            rel_id,
+            old_from,
+            old_to,
+            new_from,
+            new_to,
+            now_unix_nanos,
+        )?;
+
+        let mut nm = m.clone();
+        nm.from_bytes = new_from;
+        nm.to_bytes = new_to;
+        sidecar.insert(&rel_id.to_bytes(), &nm)?;
+
+        // A reroute can collide with an existing current relation of the
+        // same (from, type, to). Edge rows never clash (the disambiguator
+        // is the unique RelationId), so no data is lost, but two current
+        // relations may now violate a One* cardinality. v1 keeps both
+        // pointing at the survivor and logs the collision rather than
+        // tombstoning (which would complicate reversal); a cardinality
+        // sweep is the place to reconcile.
+        if let Some(dupe) = find_current_duplicate(&sidecar, scope, &nm, rel_id)? {
+            tracing::warn!(
+                target: "brain_metadata::merge",
+                relation = ?rel_id,
+                duplicate = ?dupe,
+                "entity merge re-routed a relation onto an endpoint that already has a \
+                 current relation of the same type; both retained"
+            );
+        }
+
+        records.push(RelationReroute {
+            relation_id_bytes: rel_id.to_bytes(),
+            old_from_bytes: old_from,
+            old_to_bytes: old_to,
+            new_from_bytes: new_from,
+            new_to_bytes: new_to,
+            from_changed: u8::from(from_changed),
+            to_changed: u8::from(to_changed),
+        });
+    }
+    Ok(records)
+}
+
+/// Reverse [`reroute_relations`]: unlink the survivor-side edge rows and
+/// relink the original merged-side ones, then restore the sidecar
+/// endpoints.
+fn reverse_relation_reroutes(
+    wtxn: &WriteTransaction,
+    records: &[RelationReroute],
+    now_unix_nanos: u64,
+) -> Result<(), EntityMergeOpError> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let mut edges = wtxn.open_table(EDGES_TABLE)?;
+    let mut reverse = wtxn.open_table(EDGES_REVERSE_TABLE)?;
+    let mut sidecar = wtxn.open_table(RELATION_METADATA_TABLE)?;
+    for r in records {
+        let Some(m) = sidecar.get(&r.relation_id_bytes)?.map(|g| g.value()) else {
+            continue;
+        };
+        let rel_id = RelationId::from(r.relation_id_bytes);
+        // Current endpoints are the post-merge ones; relink to the
+        // recorded originals.
+        rewrite_relation_edges(
+            &mut edges,
+            &mut reverse,
+            &m,
+            rel_id,
+            r.new_from_bytes,
+            r.new_to_bytes,
+            r.old_from_bytes,
+            r.old_to_bytes,
+            now_unix_nanos,
+        )?;
+        let mut nm = m.clone();
+        nm.from_bytes = r.old_from_bytes;
+        nm.to_bytes = r.old_to_bytes;
+        sidecar.insert(&r.relation_id_bytes, &nm)?;
+    }
+    Ok(())
+}
+
+/// Unlink the `(old_from, type, old_to)` edge rows for `rel_id` and link
+/// `(new_from, type, new_to)`, preserving the original [`EdgeData`] and
+/// mirroring symmetric relations explicitly (typed edges are not
+/// auto-mirrored by [`edge::link`]).
+#[allow(clippy::too_many_arguments)]
+fn rewrite_relation_edges(
+    edges: &mut redb::Table<'_, &[u8], EdgeData>,
+    reverse: &mut redb::Table<'_, &[u8], EdgeData>,
+    m: &RelationMetadata,
+    rel_id: RelationId,
+    old_from: [u8; 16],
+    old_to: [u8; 16],
+    new_from: [u8; 16],
+    new_to: [u8; 16],
+    now_unix_nanos: u64,
+) -> Result<(), EntityMergeOpError> {
+    let kind = EdgeKindRef::Typed(RelationTypeId::from(m.relation_type_id));
+    let disamb = rel_id.to_bytes();
+    let old_from_n = NodeRef::Entity(EntityId::from(old_from));
+    let old_to_n = NodeRef::Entity(EntityId::from(old_to));
+
+    // Preserve the existing edge weight/provenance if present. `Table`
+    // (write handle) supports point reads, so no separate read txn.
+    let existing_key = edge::EdgeKey {
+        from: old_from_n,
+        kind,
+        to: old_to_n,
+        disambiguator: disamb,
+    }
+    .encode();
+    let data = edges
+        .get(existing_key.as_slice())?
+        .map(|g| g.value())
+        .unwrap_or_else(|| {
+            EdgeData::new(
+                1.0,
+                origin::AUTO_DERIVED,
+                derived_by::CLIENT,
+                now_unix_nanos,
+            )
+        });
+
+    let symmetric = m.is_symmetric();
+    edge::unlink(edges, reverse, old_from_n, kind, old_to_n, disamb)?;
+    if symmetric && old_from != old_to {
+        edge::unlink(edges, reverse, old_to_n, kind, old_from_n, disamb)?;
+    }
+
+    let new_from_n = NodeRef::Entity(EntityId::from(new_from));
+    let new_to_n = NodeRef::Entity(EntityId::from(new_to));
+    edge::link(edges, reverse, new_from_n, kind, new_to_n, disamb, &data)?;
+    if symmetric && new_from != new_to {
+        edge::link(edges, reverse, new_to_n, kind, new_from_n, disamb, &data)?;
+    }
+    Ok(())
+}
+
+/// Return a current relation that shares `(from, type, to)` with `nm`
+/// but is a different relation id, if one exists — used only to flag a
+/// cardinality collision after a merge reroute.
+fn find_current_duplicate(
+    sidecar: &redb::Table<'_, [u8; 16], RelationMetadata>,
+    scope: RowScope,
+    nm: &RelationMetadata,
+    rel_id: RelationId,
+) -> Result<Option<RelationId>, EntityMergeOpError> {
+    if nm.is_current == 0 {
+        return Ok(None);
+    }
+    for entry in sidecar.iter()? {
+        let (k, v) = entry?;
+        let other_id = RelationId::from(k.value());
+        if other_id == rel_id {
+            continue;
+        }
+        let o = v.value();
+        if o.namespace_id != scope.namespace_id || o.space_id_bytes != scope.space_id_bytes {
+            continue;
+        }
+        if o.is_current != 0
+            && o.relation_type_id == nm.relation_type_id
+            && o.from_bytes == nm.from_bytes
+            && o.to_bytes == nm.to_bytes
+        {
+            return Ok(Some(other_id));
+        }
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -515,10 +1111,24 @@ fn find_active_audit(
 mod tests {
     use super::*;
     use crate::entity::ops::{
-        entity_get, entity_lookup_by_alias, entity_lookup_by_canonical_name, entity_put,
+        entity_get, entity_get_resolved, entity_lookup_by_alias, entity_lookup_by_canonical_name,
+        entity_put,
     };
+    use crate::relation::ops::{
+        relation_create, relation_get, relation_list_from, relation_list_to, RelationListFilter,
+    };
+    use crate::relation::types::relation_type_intern;
+    use crate::schema::predicate::predicate_intern;
+    use crate::statement::crud::statement_create;
+    use crate::statement::list::{statement_list, StatementListFilter};
+    use crate::tables::statement::STATEMENTS_BY_OBJECT_ENTITY_TABLE;
     use crate::MetadataDb;
-    use brain_core::{Entity, EntityType};
+    use brain_core::{
+        Cardinality, Entity, EntityType, EvidenceRef, ExtractorId, PredicateId, Relation,
+        RelationId, RelationTypeId, Statement, StatementId, StatementKind, StatementObject,
+        SubjectRef,
+    };
+    use redb::ReadableTable;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -867,5 +1477,453 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, EntityMergeOpError::Tombstoned(_)));
+    }
+
+    // ----- Statement / relation re-routing -----------------------------
+
+    fn intern_fact_entity_pred(db: &MetadataDb, name: &str) -> PredicateId {
+        let wtxn = db.write_txn().unwrap();
+        let id = predicate_intern(
+            &wtxn,
+            "test",
+            name,
+            Some(StatementKind::Fact),
+            /* object: Entity */ 1,
+            1,
+            "",
+            false,
+            NOW,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn make_fact(
+        db: &MetadataDb,
+        subject: EntityId,
+        predicate: PredicateId,
+        object: EntityId,
+    ) -> StatementId {
+        let s = Statement::new_root(
+            StatementId::new(),
+            StatementKind::Fact,
+            SubjectRef::Entity(subject),
+            predicate,
+            StatementObject::Entity(object),
+            0.9,
+            EvidenceRef::default(),
+            ExtractorId::from(0),
+            NOW,
+            1,
+        );
+        let wtxn = db.write_txn().unwrap();
+        let id =
+            statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, NOW).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn intern_rel_type(db: &MetadataDb, name: &str, symmetric: bool) -> RelationTypeId {
+        let wtxn = db.write_txn().unwrap();
+        let id = relation_type_intern(
+            &wtxn,
+            "test",
+            name,
+            None,
+            None,
+            Cardinality::ManyToMany,
+            symmetric,
+            1,
+            "",
+            NOW,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn make_relation(
+        db: &MetadataDb,
+        rel_type: RelationTypeId,
+        from: EntityId,
+        to: EntityId,
+        symmetric: bool,
+    ) -> RelationId {
+        let r = Relation::new_root(
+            RelationId::new(),
+            rel_type,
+            from,
+            to,
+            0.9,
+            vec![],
+            ExtractorId::from(0),
+            NOW,
+            symmetric,
+        );
+        let wtxn = db.write_txn().unwrap();
+        let id =
+            relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, NOW).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn do_merge(db: &MetadataDb, survivor: EntityId, merged: EntityId) -> MergeOutcome {
+        let wtxn = db.write_txn().unwrap();
+        let out = merge_entity(
+            &wtxn,
+            survivor,
+            merged,
+            0.99,
+            "dup".into(),
+            MergeActor::Space([1; 16]),
+            GRACE_SECS,
+            LATER,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        out
+    }
+
+    #[test]
+    fn merge_reroutes_subject_and_object_statements_reachable_via_survivor() {
+        let dir = TempDir::new().unwrap();
+        let mut db = fresh_db(&dir);
+        let survivor = person("Survivor");
+        let merged = person("Merged");
+        let other = person("Other");
+        put(&mut db, &survivor);
+        put(&mut db, &merged);
+        put(&mut db, &other);
+        let pred = intern_fact_entity_pred(&db, "knows");
+
+        // A fact whose SUBJECT is the merged entity.
+        let subj_fact = make_fact(&db, merged.id, pred, other.id);
+        // A fact whose OBJECT is the merged entity.
+        let obj_fact = make_fact(&db, other.id, pred, merged.id);
+
+        let out = do_merge(&db, survivor.id, merged.id);
+        assert_eq!(out.statements_rerouted, 2, "both subject + object rerouted");
+
+        let rtxn = db.read_txn().unwrap();
+        // The subject-side fact is now reachable via the survivor.
+        let by_subject = statement_list(
+            &rtxn,
+            test_scope(),
+            &StatementListFilter {
+                subject: Some(survivor.id),
+                predicate: None,
+                kind: None,
+                current_only: true,
+                min_confidence: None,
+                limit: 0,
+            },
+        )
+        .unwrap();
+        assert!(
+            by_subject.iter().any(|s| s.id == subj_fact),
+            "subject-merged fact must be reachable via the survivor"
+        );
+        // No statement remains anchored on the merged subject.
+        let stale = statement_list(
+            &rtxn,
+            test_scope(),
+            &StatementListFilter {
+                subject: Some(merged.id),
+                predicate: None,
+                kind: None,
+                current_only: false,
+                min_confidence: None,
+                limit: 0,
+            },
+        )
+        .unwrap();
+        assert!(stale.is_empty(), "merged subject index must be emptied");
+
+        // The object-side fact now points at the survivor via the object
+        // index, and the stored object decodes to the survivor.
+        let byo = rtxn.open_table(STATEMENTS_BY_OBJECT_ENTITY_TABLE).unwrap();
+        let s = test_scope();
+        let lo = (
+            s.namespace_id,
+            s.space_id_bytes,
+            survivor.id.to_bytes(),
+            0u8,
+            [0u8; 16],
+        );
+        let hi = (
+            s.namespace_id,
+            s.space_id_bytes,
+            survivor.id.to_bytes(),
+            u8::MAX,
+            [0xffu8; 16],
+        );
+        let mut found_obj = false;
+        for e in byo.range(lo..=hi).unwrap() {
+            let (_, v) = e.unwrap();
+            if v.value() == obj_fact.to_bytes() {
+                found_obj = true;
+            }
+        }
+        assert!(
+            found_obj,
+            "object-merged fact must index under the survivor"
+        );
+    }
+
+    #[test]
+    fn merge_reroutes_relations_from_and_to() {
+        let dir = TempDir::new().unwrap();
+        let mut db = fresh_db(&dir);
+        let survivor = person("RelSurvivor");
+        let merged = person("RelMerged");
+        let other = person("RelOther");
+        put(&mut db, &survivor);
+        put(&mut db, &merged);
+        put(&mut db, &other);
+        let rt = intern_rel_type(&db, "reports_to", false);
+
+        // merged -> other (from side), other -> merged (to side).
+        let from_rel = make_relation(&db, rt, merged.id, other.id, false);
+        let to_rel = make_relation(&db, rt, other.id, merged.id, false);
+
+        let out = do_merge(&db, survivor.id, merged.id);
+        assert_eq!(out.relations_rerouted, 2);
+
+        let rtxn = db.read_txn().unwrap();
+        let f = RelationListFilter {
+            relation_type: None,
+            current_only: false,
+            limit: 0,
+        };
+        let from_survivor = relation_list_from(&rtxn, test_scope(), survivor.id, &f).unwrap();
+        assert!(
+            from_survivor.iter().any(|r| r.id == from_rel),
+            "from-side relation reachable via survivor"
+        );
+        let to_survivor = relation_list_to(&rtxn, test_scope(), survivor.id, &f).unwrap();
+        assert!(
+            to_survivor.iter().any(|r| r.id == to_rel),
+            "to-side relation reachable via survivor"
+        );
+        // Nothing left anchored on merged.
+        assert!(relation_list_from(&rtxn, test_scope(), merged.id, &f)
+            .unwrap()
+            .is_empty());
+        assert!(relation_list_to(&rtxn, test_scope(), merged.id, &f)
+            .unwrap()
+            .is_empty());
+
+        // The sidecar endpoints reflect the survivor.
+        let fr = relation_get(&rtxn, from_rel).unwrap().unwrap();
+        assert_eq!(fr.from_entity, survivor.id);
+        let tr = relation_get(&rtxn, to_rel).unwrap().unwrap();
+        assert_eq!(tr.to_entity, survivor.id);
+    }
+
+    #[test]
+    fn entity_get_resolved_follows_multi_hop_chain() {
+        let dir = TempDir::new().unwrap();
+        let mut db = fresh_db(&dir);
+        let a = person("HopA");
+        let b = person("HopB");
+        let c = person("HopC");
+        put(&mut db, &a);
+        put(&mut db, &b);
+        put(&mut db, &c);
+
+        // A merged into B, then B merged into C.
+        do_merge(&db, b.id, a.id);
+        do_merge(&db, c.id, b.id);
+
+        let rtxn = db.read_txn().unwrap();
+        // Raw get on A returns the redirect row.
+        assert_eq!(
+            entity_get(&rtxn, a.id).unwrap().unwrap().merged_into,
+            Some(b.id)
+        );
+        // Resolved get on A collapses the chain to C.
+        assert_eq!(entity_get_resolved(&rtxn, a.id).unwrap().unwrap().id, c.id);
+        assert_eq!(entity_get_resolved(&rtxn, b.id).unwrap().unwrap().id, c.id);
+        assert_eq!(entity_get_resolved(&rtxn, c.id).unwrap().unwrap().id, c.id);
+    }
+
+    #[test]
+    fn unmerge_restores_rerouted_statements_and_relations() {
+        let dir = TempDir::new().unwrap();
+        let mut db = fresh_db(&dir);
+        let survivor = person("URSurvivor");
+        let merged = person("URMerged");
+        let other = person("UROther");
+        put(&mut db, &survivor);
+        put(&mut db, &merged);
+        put(&mut db, &other);
+        let pred = intern_fact_entity_pred(&db, "knows");
+        let rt = intern_rel_type(&db, "reports_to", false);
+
+        let subj_fact = make_fact(&db, merged.id, pred, other.id);
+        let obj_fact = make_fact(&db, other.id, pred, merged.id);
+        let from_rel = make_relation(&db, rt, merged.id, other.id, false);
+        let to_rel = make_relation(&db, rt, other.id, merged.id, false);
+
+        do_merge(&db, survivor.id, merged.id);
+
+        // Unmerge within grace.
+        {
+            let wtxn = db.write_txn().unwrap();
+            let restored = unmerge_entity(
+                &wtxn,
+                merged.id,
+                MergeActor::Space([2; 16]),
+                LATER + 1_000_000_000,
+            )
+            .unwrap();
+            assert_eq!(restored, survivor.id);
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        // Merged resolves again (redirect cleared).
+        assert!(!entity_get(&rtxn, merged.id).unwrap().unwrap().is_merged());
+        assert_eq!(
+            entity_get_resolved(&rtxn, merged.id).unwrap().unwrap().id,
+            merged.id
+        );
+
+        // Statements are back on merged.
+        let on_merged = statement_list(
+            &rtxn,
+            test_scope(),
+            &StatementListFilter {
+                subject: Some(merged.id),
+                predicate: None,
+                kind: None,
+                current_only: true,
+                min_confidence: None,
+                limit: 0,
+            },
+        )
+        .unwrap();
+        assert!(on_merged.iter().any(|s| s.id == subj_fact));
+        // And no longer on the survivor.
+        let on_survivor = statement_list(
+            &rtxn,
+            test_scope(),
+            &StatementListFilter {
+                subject: Some(survivor.id),
+                predicate: None,
+                kind: None,
+                current_only: false,
+                min_confidence: None,
+                limit: 0,
+            },
+        )
+        .unwrap();
+        assert!(!on_survivor.iter().any(|s| s.id == subj_fact));
+
+        // Object fact decodes back to merged.
+        let obj = crate::statement::crud::statement_get(&rtxn, obj_fact)
+            .unwrap()
+            .unwrap();
+        assert_eq!(obj.object, StatementObject::Entity(merged.id));
+
+        // Relations are back on merged.
+        let f = RelationListFilter {
+            relation_type: None,
+            current_only: false,
+            limit: 0,
+        };
+        assert!(relation_list_from(&rtxn, test_scope(), merged.id, &f)
+            .unwrap()
+            .iter()
+            .any(|r| r.id == from_rel));
+        assert!(relation_list_to(&rtxn, test_scope(), merged.id, &f)
+            .unwrap()
+            .iter()
+            .any(|r| r.id == to_rel));
+        assert!(relation_list_from(&rtxn, test_scope(), survivor.id, &f)
+            .unwrap()
+            .is_empty());
+        assert!(relation_list_to(&rtxn, test_scope(), survivor.id, &f)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn attribute_fold_survivor_wins_records_conflict() {
+        let dir = TempDir::new().unwrap();
+        let mut db = fresh_db(&dir);
+        let mut survivor = person("AttrSurvivor");
+        survivor.attributes = brain_core::EntityAttributes::from(vec![1, 2, 3]);
+        let mut merged = person("AttrMerged");
+        merged.attributes = brain_core::EntityAttributes::from(vec![9, 9, 9]);
+        put(&mut db, &survivor);
+        put(&mut db, &merged);
+
+        let out = do_merge(&db, survivor.id, merged.id);
+        let merge_id = out.merge_id;
+
+        let rtxn = db.read_txn().unwrap();
+        // Survivor keeps its own blob (survivor_wins).
+        let sv = entity_get(&rtxn, survivor.id).unwrap().unwrap();
+        assert_eq!(sv.attributes.as_bytes(), &[1, 2, 3]);
+
+        // The audit records exactly one conflict, KeptSurvivor.
+        let t = rtxn.open_table(MERGE_LOG_TABLE).unwrap();
+        let mut rec = None;
+        for e in t.iter().unwrap() {
+            let (_, v) = e.unwrap();
+            let r = v.value();
+            if r.merge_id() == merge_id {
+                rec = Some(r);
+            }
+        }
+        let rec = rec.unwrap();
+        assert_eq!(rec.attribute_conflicts.len(), 1);
+        assert_eq!(
+            rec.attribute_conflicts[0].outcome,
+            crate::tables::merge::conflict_outcome::KEPT_SURVIVOR
+        );
+    }
+
+    #[test]
+    fn attribute_fold_empty_survivor_adopts_merged_and_unmerge_restores_empty() {
+        let dir = TempDir::new().unwrap();
+        let mut db = fresh_db(&dir);
+        let survivor = person("EmptyAttrSurvivor"); // no attributes
+        let mut merged = person("HasAttrMerged");
+        merged.attributes = brain_core::EntityAttributes::from(vec![7, 7]);
+        put(&mut db, &survivor);
+        put(&mut db, &merged);
+
+        do_merge(&db, survivor.id, merged.id);
+        {
+            let rtxn = db.read_txn().unwrap();
+            let sv = entity_get(&rtxn, survivor.id).unwrap().unwrap();
+            assert_eq!(
+                sv.attributes.as_bytes(),
+                &[7, 7],
+                "empty survivor adopts merged blob"
+            );
+        }
+
+        // Unmerge restores the survivor to its empty attributes.
+        {
+            let wtxn = db.write_txn().unwrap();
+            unmerge_entity(
+                &wtxn,
+                merged.id,
+                MergeActor::Space([2; 16]),
+                LATER + 1_000_000_000,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.read_txn().unwrap();
+        let sv = entity_get(&rtxn, survivor.id).unwrap().unwrap();
+        assert!(
+            sv.attributes.as_bytes().is_empty(),
+            "attributes restored to empty"
+        );
     }
 }

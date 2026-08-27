@@ -382,6 +382,9 @@ impl From<brain_metadata::entity::ops::EntityOpError> for OpError {
             E::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
             E::Table(e) => OpError::Internal(format!("redb table: {e}")),
             E::TrigramOp(e) => OpError::Internal(format!("trigram op: {e}")),
+            E::MergeRedirectCycle(id) => {
+                OpError::Internal(format!("entity {id:?} merge-redirect chain is a cycle"))
+            }
         }
     }
 }

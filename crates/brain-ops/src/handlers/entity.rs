@@ -17,7 +17,8 @@
 use brain_core::{Entity, EntityAttributes, EntityId, EntityTypeId, RequestId};
 use brain_metadata::entity::merge::MergeActor;
 use brain_metadata::entity::ops::{
-    entity_get, entity_list_by_type, entity_lookup_by_alias, entity_lookup_by_canonical_name,
+    entity_get, entity_get_resolved, entity_list_by_type, entity_lookup_by_alias,
+    entity_lookup_by_canonical_name,
 };
 use brain_metadata::entity::trigram::{
     candidates_for_query, extract_trigrams, jaccard, trigrams_of_components,
@@ -163,7 +164,9 @@ pub async fn handle_entity_get(
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        entity_get(&rtxn, id).map_err(OpError::from)?
+        // Follow the `merged_into` redirect: a GET on a merged entity's id
+        // returns the surviving entity (multi-hop chains collapsed).
+        entity_get_resolved(&rtxn, id).map_err(OpError::from)?
     };
     let entity = entity.ok_or_else(|| OpError::NotFound {
         what: "entity",
@@ -385,8 +388,13 @@ pub async fn handle_entity_merge(
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
-    let audit_id = match ack.single_phase() {
-        PhaseAck::EntityMerged { audit_id, .. } => *audit_id,
+    let (audit_id, statements_rerouted, relations_rerouted) = match ack.single_phase() {
+        PhaseAck::EntityMerged {
+            audit_id,
+            statements_rerouted,
+            relations_rerouted,
+            ..
+        } => (*audit_id, *statements_rerouted, *relations_rerouted),
         other => {
             return Err(OpError::Internal(format!(
                 "unexpected phase ack for ENTITY_MERGE: {other:?}"
@@ -403,8 +411,8 @@ pub async fn handle_entity_merge(
             merged: req.merged,
             audit_id: audit_id.to_bytes(),
             confidence: req.confidence,
-            statements_rerouted: 0,
-            relations_rerouted: 0,
+            statements_rerouted,
+            relations_rerouted,
         }),
         now,
     )

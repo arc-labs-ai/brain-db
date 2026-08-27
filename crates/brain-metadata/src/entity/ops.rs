@@ -52,6 +52,11 @@ pub enum EntityOpError {
     #[error("entity {0:?} not found")]
     NotFound(EntityId),
 
+    /// The `merged_into` redirect chain starting at this entity exceeded
+    /// [`MERGE_REDIRECT_MAX_HOPS`] — a corrupted cycle. Fail-stop.
+    #[error("entity {0:?} merge-redirect chain exceeds the hop cap (cycle?)")]
+    MergeRedirectCycle(EntityId),
+
     #[error("entity type {0:?} is not registered")]
     UnknownEntityType(EntityTypeId),
 
@@ -130,10 +135,49 @@ fn strip_leading_determiner(s: &str) -> &str {
 // ---------------------------------------------------------------------------
 
 /// Fetch an entity by id. Returns `None` if the row doesn't exist.
+///
+/// This is the RAW lookup: a merged entity is returned as-is (with
+/// `merged_into = Some(survivor)`). Callers that want reads to transparently
+/// follow the merge redirect use [`entity_get_resolved`].
 pub fn entity_get(rtxn: &ReadTransaction, id: EntityId) -> Result<Option<Entity>, EntityOpError> {
     let t = rtxn.open_table(ENTITIES_TABLE)?;
     let row: Option<EntityMetadata> = t.get(&id.to_bytes())?.map(|g| g.value());
     Ok(row.as_ref().map(Entity::from))
+}
+
+/// Hop cap for [`entity_get_resolved`]'s merge-chain walk. A merge chain
+/// (`A → B → C → …`) is bounded in practice by the number of merges, but
+/// the walk defends against a malformed cycle by stopping here.
+pub const MERGE_REDIRECT_MAX_HOPS: usize = 16;
+
+/// Fetch an entity by id, transparently following the `merged_into`
+/// redirect to the surviving entity.
+///
+/// After `merge_entity(survivor, merged)`, a read through `merged`'s id
+/// must return the survivor (the merged row is a redirect, not a live
+/// entity). Multi-hop chains (`A → B → C`) are collapsed at read time:
+/// this walks `merged_into` until it reaches a live row and returns that.
+///
+/// Returns `Ok(None)` if the starting id has no row. Returns
+/// [`EntityOpError::MergeRedirectCycle`] if the chain exceeds
+/// [`MERGE_REDIRECT_MAX_HOPS`] (a corrupted cycle) — fail-stop rather than
+/// loop forever or silently return a mid-chain node.
+pub fn entity_get_resolved(
+    rtxn: &ReadTransaction,
+    id: EntityId,
+) -> Result<Option<Entity>, EntityOpError> {
+    let t = rtxn.open_table(ENTITIES_TABLE)?;
+    let mut current = id;
+    for _ in 0..=MERGE_REDIRECT_MAX_HOPS {
+        let Some(row) = t.get(&current.to_bytes())?.map(|g| g.value()) else {
+            return Ok(None);
+        };
+        match row.merged_into() {
+            None => return Ok(Some(Entity::from(&row))),
+            Some(next) => current = next,
+        }
+    }
+    Err(EntityOpError::MergeRedirectCycle(id))
 }
 
 /// Tier-1 exact-match resolver lookup. Returns `Some(EntityId)` if a

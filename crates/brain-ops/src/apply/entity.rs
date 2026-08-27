@@ -160,7 +160,7 @@ pub fn apply_merge_entities(
     // be a foreign tenant's — guard against the caller scope here.
     entity_scope_guard(wtxn, *target, write)?;
     entity_scope_guard(wtxn, *source, write)?;
-    let audit_id = brain_metadata::entity::merge::merge_entity(
+    let outcome = brain_metadata::entity::merge::merge_entity(
         wtxn,
         *target,
         *source,
@@ -174,7 +174,9 @@ pub fn apply_merge_entities(
     Ok(PhaseAck::EntityMerged {
         source: *source,
         target: *target,
-        audit_id,
+        audit_id: outcome.merge_id,
+        statements_rerouted: outcome.statements_rerouted,
+        relations_rerouted: outcome.relations_rerouted,
     })
 }
 
@@ -338,7 +340,8 @@ pub fn apply_approve_merge_with_status(
         grace_seconds,
         at_unix_nanos,
     )
-    .map_err(|e| ApplyError::Metadata(format!("merge_entity: {e}")))?;
+    .map_err(|e| ApplyError::Metadata(format!("merge_entity: {e}")))?
+    .merge_id;
     update_proposal_status(
         wtxn,
         proposal_id,

@@ -481,6 +481,10 @@ pub enum PhaseAck {
         /// (the audit log is keyed by `(timestamp, merge_id)`, not by
         /// survivor/merged, so reverse lookup is awkward).
         audit_id: MergeId,
+        /// Statements re-routed from the merged entity onto the survivor.
+        statements_rerouted: u32,
+        /// Relations re-routed from the merged entity onto the survivor.
+        relations_rerouted: u32,
     },
     /// A merge proposal was promoted: the underlying merge was applied
     /// and the proposal row stamped Approved (or AutoApplied for the

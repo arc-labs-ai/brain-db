@@ -224,11 +224,15 @@ fn write_phase_ack(out: &mut Vec<u8>, pa: &PhaseAck) {
             source,
             target,
             audit_id,
+            statements_rerouted,
+            relations_rerouted,
         } => {
             out.push(tag::ENTITY_MERGED);
             out.extend_from_slice(&source.to_bytes());
             out.extend_from_slice(&target.to_bytes());
             out.extend_from_slice(&audit_id.to_bytes());
+            write_u32(out, *statements_rerouted);
+            write_u32(out, *relations_rerouted);
         }
         PhaseAck::SlotsReclaimed { count } => {
             out.push(tag::SLOTS_RECLAIMED);
@@ -331,10 +335,14 @@ fn read_phase_ack(c: &mut Cursor<'_>) -> Result<PhaseAck, CodecError> {
             let source = EntityId::from_bytes(c.bytes16()?);
             let target = EntityId::from_bytes(c.bytes16()?);
             let audit_id = MergeId::from_bytes(c.bytes16()?);
+            let statements_rerouted = c.u32()?;
+            let relations_rerouted = c.u32()?;
             PhaseAck::EntityMerged {
                 source,
                 target,
                 audit_id,
+                statements_rerouted,
+                relations_rerouted,
             }
         }
         tag::SLOTS_RECLAIMED => {

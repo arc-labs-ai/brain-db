@@ -76,6 +76,53 @@ pub struct AttributeConflictRecord {
 }
 
 // ---------------------------------------------------------------------------
+// Re-route records — the exact per-row diff unmerge replays in reverse.
+// ---------------------------------------------------------------------------
+
+/// One statement re-routed off the merged entity during a merge.
+///
+/// A statement is re-routed on its subject side (subject was the merged
+/// entity), its object side (object was `Entity(merged)`), or both
+/// (a self-referential statement). The subject-side reroute bumps the
+/// row `version`; `old_version` / `new_version` capture that so unmerge
+/// restores the exact prior value and rewrites the chain-table key back.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct StatementReroute {
+    pub statement_id_bytes: [u8; 16],
+    /// `1` iff the subject was re-pointed merged → survivor.
+    pub subject_changed: u8,
+    /// `1` iff the object `Entity(merged)` was re-pointed to survivor.
+    pub object_changed: u8,
+    /// Version before the subject-side bump. Equals `new_version` when
+    /// only the object changed (no bump).
+    pub old_version: u32,
+    /// Version after the subject-side bump.
+    pub new_version: u32,
+    /// Chain root (unchanged by reroute) — needed to rewrite the
+    /// version-keyed chain-table row on unmerge.
+    pub chain_root_bytes: [u8; 16],
+}
+
+/// One relation re-routed off the merged entity during a merge. Stores
+/// both the pre- and post-merge endpoints so unmerge can unlink the
+/// survivor-side edge rows and relink the original merged-side ones
+/// exactly, without recomputing symmetric canonicalisation.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct RelationReroute {
+    pub relation_id_bytes: [u8; 16],
+    pub old_from_bytes: [u8; 16],
+    pub old_to_bytes: [u8; 16],
+    pub new_from_bytes: [u8; 16],
+    pub new_to_bytes: [u8; 16],
+    /// `1` iff the `from` endpoint was re-pointed merged → survivor.
+    pub from_changed: u8,
+    /// `1` iff the `to` endpoint was re-pointed merged → survivor.
+    pub to_changed: u8,
+}
+
+// ---------------------------------------------------------------------------
 // MergeRecord (v2).
 // ---------------------------------------------------------------------------
 
@@ -111,11 +158,24 @@ pub struct MergeRecord {
     pub trigrams_added: Vec<[u8; 3]>,
     pub attribute_conflicts: Vec<AttributeConflictRecord>,
 
-    // Re-routing counts (lists live in the overflow table).
+    // Re-routing counts.
     pub statements_rerouted: u32,
     pub relations_rerouted: u32,
     /// `survivor.mention_count += this` on merge; reversed on unmerge.
     pub mention_count_added: u32,
+
+    /// Per-row statement re-route diff. Inlined (typical mention_count is
+    /// well under 1000, so the row stays far below redb's per-value cap);
+    /// the `entity_merge_audit_overflow` table stays reserved for the
+    /// very-high-degree case.
+    pub rerouted_statements: Vec<StatementReroute>,
+    /// Per-row relation re-route diff.
+    pub rerouted_relations: Vec<RelationReroute>,
+    /// Survivor's `attributes_blob` before the merge folded merged's in.
+    /// Unmerge restores this verbatim (the attribute fold is
+    /// survivor-wins, so this is the survivor's own bytes unless the
+    /// survivor had no attributes and adopted merged's whole blob).
+    pub survivor_attributes_before: Vec<u8>,
 
     // Status.
     /// `0` = reversible (within grace); `1` = finalized (post-grace
@@ -162,6 +222,9 @@ impl MergeRecord {
             statements_rerouted: 0,
             relations_rerouted: 0,
             mention_count_added: 0,
+            rerouted_statements: Vec::new(),
+            rerouted_relations: Vec::new(),
+            survivor_attributes_before: Vec::new(),
             finalized: 0,
             unmerged_at_unix_nanos: 0,
             unmerged_by_actor_kind: 0,
