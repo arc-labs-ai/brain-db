@@ -63,7 +63,9 @@ use support_harness::start;
 
 const FLAG_EOS: u8 = 1 << 7;
 
-const ACME_V1: &str = "namespace acme\n\
+// Declares the caller's own namespace ("test", the default token's namespace):
+// a caller may only upload schema for its own namespace (tenant binding).
+const USER_SCHEMA_V1: &str = "namespace test\n\
                        define entity_type Foo { attributes {} }\n";
 
 // ---------------------------------------------------------------------------
@@ -294,7 +296,7 @@ async fn recall_after_schema_upload_uses_retrieval_path() {
         &mut client,
         1,
         RequestBody::SchemaUpload(SchemaUploadRequest {
-            schema_document: ACME_V1.into(),
+            schema_document: USER_SCHEMA_V1.into(),
             dry_run: false,
             allow_breaking: false,
             request_id: *uuid::Uuid::now_v7().as_bytes(),
@@ -324,7 +326,7 @@ async fn recall_inside_txn_returns_committed_pipeline_hits() {
         &mut client,
         1,
         RequestBody::SchemaUpload(SchemaUploadRequest {
-            schema_document: ACME_V1.into(),
+            schema_document: USER_SCHEMA_V1.into(),
             dry_run: false,
             allow_breaking: false,
             request_id: *uuid::Uuid::now_v7().as_bytes(),
