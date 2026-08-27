@@ -3485,7 +3485,7 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                 }
             }
             ShardRequest::ExtractBackfill { selector, reply_tx } => {
-                let out = run_extract_backfill(&shard, selector);
+                let out = run_extract_backfill(&shard, selector).await;
                 if reply_tx.send_async(out).await.is_err() {
                     warn!(
                         shard_id = shard.shard_id,
@@ -3813,13 +3813,29 @@ fn fold_pending_into(
     combined
 }
 
+/// Rows examined between cooperative yields during a backfill table
+/// scan. A full `MEMORIES_TABLE` walk with per-row redb `get` + enqueue
+/// would otherwise hold the shard core for the whole scan, starving
+/// foreground RECALL/ENCODE on this shard. Yielding every N rows lets
+/// those interleave while keeping the per-yield bookkeeping negligible.
+const BACKFILL_YIELD_INTERVAL: usize = 256;
+
+/// Whether the scan should cooperatively yield after examining
+/// `rows_examined` rows. Yields on every `BACKFILL_YIELD_INTERVAL`-th
+/// row (never on row 0, so a tiny scan does no extra work).
+#[inline]
+fn backfill_should_yield(rows_examined: usize) -> bool {
+    rows_examined != 0 && rows_examined.is_multiple_of(BACKFILL_YIELD_INTERVAL)
+}
+
 /// Walk the per-shard `memories` + `texts` redb tables and push each
 /// matching memory onto the `WriterHandle`'s extractor channel. Runs
-/// inside the shard executor; the metadata read txn is short-lived and
-/// dropped before each enqueue so the writer can take a separate
-/// `try_send`. No `.await` points — the whole sweep is synchronous
-/// against redb + the bounded flume queue.
-fn run_extract_backfill(
+/// inside the shard executor; the metadata read txn is held for the
+/// scan's duration (a stable snapshot) but the loop yields cooperatively
+/// every [`BACKFILL_YIELD_INTERVAL`] rows so foreground ops on this
+/// shard aren't starved by a large scan. Enqueue is still a non-blocking
+/// `try_send` against the bounded flume queue.
+async fn run_extract_backfill(
     shard: &Shard,
     selector: brain_protocol::BackfillSelector,
 ) -> Result<ExtractBackfillReport, String> {
@@ -3895,7 +3911,12 @@ fn run_extract_backfill(
         }
         BackfillSelector::Since { since_unix_nanos } => {
             let cutoff_nanos = since_unix_nanos;
+            let mut examined = 0usize;
             for entry in memories.iter().map_err(|e| format!("memories.iter: {e}"))? {
+                examined += 1;
+                if backfill_should_yield(examined) {
+                    glommio::executor().yield_if_needed().await;
+                }
                 let (k, v) = entry.map_err(|e| format!("memories.entry: {e}"))?;
                 let key = k.value();
                 let row = v.value();
@@ -3909,7 +3930,12 @@ fn run_extract_backfill(
             }
         }
         BackfillSelector::All => {
+            let mut examined = 0usize;
             for entry in memories.iter().map_err(|e| format!("memories.iter: {e}"))? {
+                examined += 1;
+                if backfill_should_yield(examined) {
+                    glommio::executor().yield_if_needed().await;
+                }
                 let (k, v) = entry.map_err(|e| format!("memories.entry: {e}"))?;
                 let key = k.value();
                 let row = v.value();
@@ -4085,6 +4111,24 @@ mod tests {
     #[test]
     fn wal_ready_ok_yields_ok() {
         assert!(interpret_wal_ready(Ok(Ok(()))).is_ok());
+    }
+
+    #[test]
+    fn backfill_yields_on_interval_boundaries_only() {
+        // Never yields on the first row (row 0 → 0 examined) or before a
+        // full interval elapses; yields on each interval boundary so a
+        // large scan can't monopolize the shard core.
+        assert!(!backfill_should_yield(0));
+        assert!(!backfill_should_yield(1));
+        assert!(!backfill_should_yield(BACKFILL_YIELD_INTERVAL - 1));
+        assert!(backfill_should_yield(BACKFILL_YIELD_INTERVAL));
+        assert!(backfill_should_yield(BACKFILL_YIELD_INTERVAL * 2));
+        assert!(!backfill_should_yield(BACKFILL_YIELD_INTERVAL + 1));
+
+        // A scan of `rows` yields floor(rows / interval) times.
+        let rows = BACKFILL_YIELD_INTERVAL * 3 + 7;
+        let yields = (1..=rows).filter(|n| backfill_should_yield(*n)).count();
+        assert_eq!(yields, 3);
     }
 
     #[test]

@@ -218,6 +218,47 @@ pub async fn handle_schema_replace(
     wtxn.commit()
         .map_err(|e| OpError::Internal(format!("commit: {e}")))?;
 
+    // Post-commit: kick off the OUTSIDE_ACTIVE_SCHEMA flag-sweep, exactly
+    // as the additive SCHEMA_UPLOAD path does from `writer::submit`'s
+    // post-commit fan-out. SCHEMA_REPLACE commits its own wtxn above and
+    // never flows through `submit()`, so without this the destructive
+    // drop-then-replace leaves every statement on a just-dropped predicate
+    // carrying its old flag state forever — old-schema statements are
+    // never marked stale, violating the acceptance-suite provenance
+    // guarantee that "statements from old schema are marked stale after
+    // schema update".
+    //
+    // Scope note: re-*extraction* of those statements against the new
+    // vocabulary is deliberately NOT attempted here — that depends on the
+    // EXTRACT_BACKFILL worker machinery (a separate WIP feature). We only
+    // re-align the advisory stale flag; full re-extraction is deferred to
+    // the backfill worker.
+    //
+    // Idempotent on replay: a same-request_id retry short-circuits at the
+    // idempotency check (5a) and never reaches this point, so it can't
+    // double-enqueue. The sweep itself is idempotent regardless — it
+    // converges every row to its correct flag state however many times it
+    // runs.
+    if let Some(real) = ctx
+        .executor
+        .writer
+        .as_any()
+        .downcast_ref::<crate::writer::RealWriterHandle>()
+    {
+        let job = crate::writer::SchemaFlagSweepJob {
+            namespace: response.namespace.clone(),
+            new_version: response.schema_version,
+            enqueued_at_unix_nanos: now,
+        };
+        let enqueued = crate::writer::try_enqueue_schema_flag_sweep(real, job);
+        tracing::debug!(
+            namespace = %response.namespace,
+            new_version = response.schema_version,
+            enqueued,
+            "schema_replace: post-commit schema flag-sweep enqueue attempt",
+        );
+    }
+
     Ok(response)
 }
 
@@ -318,6 +359,43 @@ mod tests {
         build_ctx_for("acme")
     }
 
+    /// Like [`build_ctx_for`] but wires a `schema_flag_sweep` channel onto
+    /// the concrete `RealWriterHandle` before it's Arc-wrapped, and returns
+    /// the receiver so a test can assert the post-commit sweep enqueue.
+    fn build_ctx_with_sweep(
+        caller_ns: &str,
+    ) -> (
+        tempfile::TempDir,
+        OpsContext,
+        SharedMetadataDb,
+        flume::Receiver<crate::writer::SchemaFlagSweepJob>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata: SharedMetadataDb =
+            Arc::new(MetadataDb::open(dir.path().join("meta.redb")).unwrap());
+        let ns_id = {
+            let wtxn = metadata.write_txn().unwrap();
+            let id =
+                brain_metadata::namespace::namespace_intern_or_get(&wtxn, caller_ns, 0).unwrap();
+            wtxn.commit().unwrap();
+            id
+        };
+        let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
+        let (tx, rx) = flume::unbounded::<crate::writer::SchemaFlagSweepJob>();
+        let mut real = crate::writer::RealWriterHandle::new(metadata.clone(), hnsw_writer);
+        real.set_schema_flag_sweep_sender(tx);
+        let writer = Arc::new(real);
+        let executor = ExecutorContext::new(
+            Arc::new(MockDispatcher) as Arc<dyn Dispatcher>,
+            shared,
+            metadata.clone(),
+            writer as Arc<dyn WriterHandle>,
+        )
+        .with_caller_namespace(ns_id);
+        let ctx = crate::test_support::ops_context_for_tests(executor, dir.path());
+        (dir, ctx, metadata, rx)
+    }
+
     /// Seed an initial active schema directly through the storage helper
     /// (bypassing the upload handler) so the replace path has declared
     /// rows to drop.
@@ -396,6 +474,61 @@ mod tests {
             active(&metadata),
             before,
             "a rejected cross-namespace replace must not mutate the foreign schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_enqueues_flag_sweep_for_new_version() {
+        // Mirrors the SCHEMA_UPLOAD sweep test: after a destructive
+        // SCHEMA_REPLACE drops the old predicate, a SchemaFlagSweepJob for
+        // the affected namespace + new version must be enqueued so the
+        // migration worker marks old-schema statements stale.
+        let (_dir, ctx, metadata, rx) = build_ctx_with_sweep("acme");
+        seed_schema(&metadata, V1); // active version 1 (declares `prefers`)
+
+        let resp = handle_schema_replace(replace_req(V2, [11u8; 16]), &ctx)
+            .await
+            .expect("replace");
+        assert_eq!(resp.schema_version, 2);
+        assert!(
+            resp.dropped_count >= 1,
+            "the pre-existing `prefers` predicate must be dropped"
+        );
+
+        let job = rx
+            .try_recv()
+            .expect("SCHEMA_REPLACE must enqueue a flag-sweep job");
+        assert_eq!(job.namespace, "acme");
+        assert_eq!(
+            job.new_version, 2,
+            "sweep must target the version the replace committed"
+        );
+        // Exactly one job — no double-enqueue.
+        assert!(
+            rx.try_recv().is_err(),
+            "a single replace must enqueue exactly one sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_replay_does_not_reenqueue_flag_sweep() {
+        // A same-request_id replay short-circuits at the idempotency check
+        // and must NOT enqueue a second sweep.
+        let (_dir, ctx, metadata, rx) = build_ctx_with_sweep("acme");
+        seed_schema(&metadata, V1);
+        let rid = [12u8; 16];
+
+        handle_schema_replace(replace_req(V2, rid), &ctx)
+            .await
+            .expect("first replace");
+        let _first_job = rx.try_recv().expect("first replace enqueues a sweep");
+
+        handle_schema_replace(replace_req(V2, rid), &ctx)
+            .await
+            .expect("replay");
+        assert!(
+            rx.try_recv().is_err(),
+            "replay must not enqueue a second sweep"
         );
     }
 
