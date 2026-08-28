@@ -50,7 +50,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::workers::hype::{HypeGenOutcome, HypeGenerator};
 use brain_core::{
-    EntityId, ExtractorId, Memory as CoreMemory, MemoryId, MemoryKind, Salience, SessionId, SpaceId,
+    AuditId, EntityId, ExtractorId, Memory as CoreMemory, MemoryId, MemoryKind, Salience,
+    SessionId, SpaceId,
 };
 use brain_core::{StatementKind, StatementObject, StatementValue, SubjectRef};
 use brain_extractors::{
@@ -63,8 +64,10 @@ use brain_extractors::{
     ExtractionStatus, Extractor, ExtractorContext, ExtractorRegistry, MaterializeDeps,
     StatementMention, TemporalExtractor, TierGate, TriggerDecision, SYSTEM_NAMESPACE,
 };
+use brain_metadata::audit_write;
 use brain_metadata::relation::types::relation_type_intern_or_get;
 use brain_metadata::schema::predicate::predicate_intern_or_get;
+use brain_metadata::tables::audit::{extraction_status, ExtractionAudit};
 use brain_metadata::tables::edge::{
     self, derived_by, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
 };
@@ -1869,12 +1872,34 @@ async fn fetch_extractor_context_for_batch(
     out
 }
 
+/// Per-call audit facts for one tier of a pipeline run: which extractor
+/// produced the tier's recorded outcome, its version, the precise
+/// [`extraction_status`] byte, and any non-success reason. Captured
+/// alongside the coarse `tier_status` byte so `run_apply_body` can emit
+/// one historical [`ExtractionAudit`] row per extractor that actually ran
+/// (or was skipped) — `None` means the tier was absent (no extractor
+/// present), which produces no audit row.
+#[derive(Clone)]
+struct TierAudit {
+    extractor_id: u32,
+    extractor_version: u32,
+    /// One of [`extraction_status`] bytes; == `ExtractionStatus::as_u8()`.
+    status: u8,
+    /// `result.status_reason`; empty on Success.
+    reason: String,
+}
+
 /// Aggregate of one pipeline run across all enabled extractors.
 struct PipelineOutcome {
     items: Vec<ExtractedItem>,
     pattern: u8,
     classifier: u8,
     llm: u8,
+    /// Per-call audit facts for the extractor whose outcome each tier's
+    /// status byte reflects. `None` when the tier was absent.
+    pattern_audit: Option<TierAudit>,
+    classifier_audit: Option<TierAudit>,
+    llm_audit: Option<TierAudit>,
     failure_reason: Option<String>,
     /// Set when the LLM tier failed: whether the failure is transient
     /// (retry with backoff) or permanent (terminate). Drives the worker's
@@ -1919,6 +1944,9 @@ async fn run_pipeline_batch(
             pattern: tier_status::ABSENT,
             classifier: tier_status::ABSENT,
             llm: tier_status::ABSENT,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -1997,8 +2025,22 @@ async fn run_pipeline_batch(
         // Cycle-budget gate: skip the LLM tier across the whole batch
         // when prior cycles have eaten the budget. Pattern + classifier
         // already ran so cheap-tier output still lands under load.
+        // Attribute the skip to the first configured LLM extractor so the
+        // per-call audit records a SkippedBudget row rather than dropping
+        // the tier silently.
+        let llm_ident = llm_exts
+            .first()
+            .map(|e| (e.id().raw(), e.extractor_version()));
         for o in &mut outcomes {
             o.llm = tier_status::SKIPPED;
+            if let Some((extractor_id, extractor_version)) = llm_ident {
+                o.llm_audit = Some(TierAudit {
+                    extractor_id,
+                    extractor_version,
+                    status: extraction_status::SKIPPED_BUDGET,
+                    reason: "cycle LLM budget exhausted".to_string(),
+                });
+            }
         }
     } else {
         // Bounded inferential context per memory: top-10 similar
@@ -2059,10 +2101,19 @@ async fn run_tier_into(
     tier_kind: brain_core::ExtractorKind,
 ) {
     for extractor in tier_exts {
+        let ext_id = extractor.id().raw();
+        let ext_version = extractor.extractor_version();
         let results = extractor.run_batch(ctx, mems).await;
         debug_assert_eq!(results.len(), mems.len());
         for (i, result) in results.into_iter().enumerate() {
-            fold_tier_result(&mut outcomes[i], result, tier_kind, mems[i].id);
+            fold_tier_result(
+                &mut outcomes[i],
+                result,
+                tier_kind,
+                mems[i].id,
+                ext_id,
+                ext_version,
+            );
         }
     }
 }
@@ -2079,6 +2130,8 @@ fn fold_tier_result(
     result: ExtractionResult,
     tier_kind: brain_core::ExtractorKind,
     memory_id: MemoryId,
+    ext_id: u32,
+    ext_version: u32,
 ) {
     use brain_core::ExtractorKind;
     let outcome_byte = tier_outcome_for(&result);
@@ -2093,11 +2146,36 @@ fn fold_tier_result(
         ExtractorKind::Classifier => slot.classifier,
         ExtractorKind::Llm => slot.llm,
     };
+    // Whether the incoming outcome wins the combine — recomputed with the
+    // exact predicate `combine_tier_status` uses, so the captured per-call
+    // audit always describes the extractor whose byte we record.
+    let took_incoming = {
+        let cur_real = matches!(current, tier_status::RAN | tier_status::FAILED);
+        let inc_real = matches!(outcome_byte, tier_status::RAN | tier_status::FAILED);
+        !(cur_real && !inc_real)
+    };
     let combined = combine_tier_status(current, outcome_byte);
     match tier_kind {
         ExtractorKind::Pattern => slot.pattern = combined,
         ExtractorKind::Classifier => slot.classifier = combined,
         ExtractorKind::Llm => slot.llm = combined,
+    }
+    if took_incoming {
+        // Precise status byte for the historical audit row: `as_u8()`
+        // is byte-equal to `extraction_status::*` (Success=1 … Disabled=6),
+        // so a SkippedFilter / SkippedDuplicate keeps its exact reason
+        // rather than collapsing to the coarse tier byte.
+        let tier_audit = TierAudit {
+            extractor_id: ext_id,
+            extractor_version: ext_version,
+            status: result.status.as_u8(),
+            reason: result.status_reason.clone(),
+        };
+        match tier_kind {
+            ExtractorKind::Pattern => slot.pattern_audit = Some(tier_audit),
+            ExtractorKind::Classifier => slot.classifier_audit = Some(tier_audit),
+            ExtractorKind::Llm => slot.llm_audit = Some(tier_audit),
+        }
     }
     // Real provider cost flows from the LLM extractor's result into the
     // per-memory outcome, which the caller sums into the per-cycle spend
@@ -2189,6 +2267,8 @@ async fn run_llm_tier_into(
 
     for ext in llm_exts {
         let ext_ns = ext.namespace();
+        let ext_id = ext.id().raw();
+        let ext_version = ext.extractor_version();
         // Build this extractor's sub-batch: the memories it is effective
         // for (namespace rule) AND whose ENCODE trigger fires. Running a
         // per-extractor sub-batch preserves the concurrent-fan-out of
@@ -2216,6 +2296,12 @@ async fn run_llm_tier_into(
                     // a RAN with a SKIPPED).
                     if outcomes[i].llm == tier_status::ABSENT {
                         outcomes[i].llm = tier_status::SKIPPED;
+                        outcomes[i].llm_audit = Some(TierAudit {
+                            extractor_id: ext_id,
+                            extractor_version: ext_version,
+                            status: extraction_status::SKIPPED_FILTER,
+                            reason: "encode trigger where-clause did not match".to_string(),
+                        });
                     }
                     tracing::debug!(
                         target: "brain_debug::extractor",
@@ -2239,7 +2325,14 @@ async fn run_llm_tier_into(
         debug_assert_eq!(results.len(), sub_mems.len());
         for (k, result) in results.into_iter().enumerate() {
             let i = sub_idx[k];
-            fold_tier_result(&mut outcomes[i], result, ExtractorKind::Llm, mems[i].id);
+            fold_tier_result(
+                &mut outcomes[i],
+                result,
+                ExtractorKind::Llm,
+                mems[i].id,
+                ext_id,
+                ext_version,
+            );
         }
     }
 }
@@ -2465,6 +2558,95 @@ const RETRACT_MIN_CONFIDENCE: f32 = 0.7;
 /// memory's anchor carries a wall-clock time-of-day, so the anchor-vs-event
 /// comparison is done at whole-day granularity (`nanos / NANOS_PER_DAY`).
 const NANOS_PER_DAY: u64 = 86_400_000_000_000;
+
+/// BLAKE3 of the memory's source text, read from `TEXTS_TABLE` inside the
+/// open extraction `wtxn`. Feeds `ExtractionAudit::input_hash` so an
+/// operator can tell whether a re-extraction ran over edited text. Returns
+/// the all-zero hash when the text row is missing (shouldn't happen for a
+/// queued memory) rather than failing the audit.
+fn memory_text_hash(wtxn: &redb::WriteTransaction, memory_id: MemoryId) -> [u8; 32] {
+    use brain_metadata::tables::text::TEXTS_TABLE;
+    wtxn.open_table(TEXTS_TABLE)
+        .ok()
+        .and_then(|t| {
+            t.get(&memory_id.to_be_bytes())
+                .ok()
+                .flatten()
+                .map(|g| *blake3::hash(g.value()).as_bytes())
+        })
+        .unwrap_or([0u8; 32])
+}
+
+/// Emit one historical [`ExtractionAudit`] row per extractor tier that ran
+/// (or was skipped) for `memory_id`, into `EXTRACTOR_AUDIT_TABLE` + its
+/// three secondary indexes, inside the caller's extraction `wtxn` so the
+/// audit rows and the extracted graph commit atomically. A tier that was
+/// absent (no extractor present) yields no row — we never audit a call that
+/// didn't happen.
+///
+/// Best-effort observability: a write error is logged and skipped, never
+/// propagated, so a redb hiccup in the audit log can't fail the durable
+/// extraction it describes (matching how the post-commit fan-outs treat
+/// their own failures).
+fn emit_per_call_extraction_audit(
+    wtxn: &redb::WriteTransaction,
+    memory_id: MemoryId,
+    outcome: &PipelineOutcome,
+    now: u64,
+    input_hash: [u8; 32],
+) {
+    // Only the LLM tier carries provider cost; pattern + classifier are free.
+    let tiers = [
+        (&outcome.pattern_audit, 0u64),
+        (&outcome.classifier_audit, 0u64),
+        (&outcome.llm_audit, outcome.llm_cost_micro_usd),
+    ];
+    for (tier_audit, cost_micro_usd) in tiers {
+        let Some(t) = tier_audit else { continue };
+        // `schema_version` is 1: the pipeline runs every tier at
+        // `ExtractionContext { schema_version: 1, .. }`. `outputs` is left
+        // empty — per-tier attribution of committed entity/statement/relation
+        // ids is not tracked at this site (the surface-dedup collapses across
+        // tiers); the aggregate counts live on the per-memory
+        // `extractor_pipeline_audit` state row.
+        let mut row = if t.status == extraction_status::SUCCESS {
+            ExtractionAudit::success(
+                AuditId::new(),
+                memory_id,
+                t.extractor_id,
+                t.extractor_version,
+                1,
+                now,
+                now,
+                Vec::new(),
+                input_hash,
+            )
+        } else {
+            ExtractionAudit::non_success(
+                AuditId::new(),
+                memory_id,
+                t.extractor_id,
+                t.extractor_version,
+                1,
+                now,
+                now,
+                t.status,
+                t.reason.clone(),
+                input_hash,
+            )
+        };
+        row.cost_micro_usd = cost_micro_usd;
+        if let Err(e) = audit_write(wtxn, &row) {
+            warn!(
+                target: "brain_workers::extractor",
+                memory_id = ?memory_id,
+                extractor_id = t.extractor_id,
+                error = %e,
+                "per-call extraction audit write failed (best-effort; extraction unaffected)",
+            );
+        }
+    }
+}
 
 async fn apply_outcome(
     worker: &ExtractorWorker,
@@ -3533,6 +3715,15 @@ fn run_apply_body(
     .with_failure_class(failure_class_byte);
     record_extracted(&wtxn, &audit)
         .map_err(|e| ApplyError::Audit(format!("record_extracted: {e}")))?;
+
+    // Per-call historical audit: one `ExtractionAudit` row per tier that
+    // ran (or was skipped), written into THIS txn so the audit rows and the
+    // extracted graph commit atomically (no extra fsync). Append-only —
+    // each row mints a fresh UUIDv7 id, so a re-extraction adds rows rather
+    // than overwriting. Best-effort inside the helper: a write error is
+    // logged, never propagated, so the audit log can't fail the extraction.
+    let input_hash = memory_text_hash(&wtxn, memory_id);
+    emit_per_call_extraction_audit(&wtxn, memory_id, outcome, now, input_hash);
 
     // Hand the uncommitted txn back to the orchestrator, which commits
     // (or, for a plan pass that discovered ambiguity, rolls back) and then
@@ -5287,6 +5478,9 @@ mod tests {
             pattern,
             classifier,
             llm,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -5322,6 +5516,8 @@ mod tests {
             ExtractionResult::success(vec![item], 0, 0),
             ExtractorKind::Pattern,
             mem_id,
+            1,
+            1,
         );
         assert_eq!(slot.pattern, tier_status::RAN);
 
@@ -5331,6 +5527,8 @@ mod tests {
             ExtractionResult::skipped(ExtractionStatus::SkippedFilter, "where-clause", 0),
             ExtractorKind::Pattern,
             mem_id,
+            1,
+            1,
         );
 
         assert_eq!(
@@ -5361,6 +5559,8 @@ mod tests {
             ExtractionResult::skipped(ExtractionStatus::SkippedFilter, "where-clause", 0),
             ExtractorKind::Classifier,
             mem_id,
+            1,
+            1,
         );
         assert_eq!(slot.classifier, tier_status::SKIPPED);
 
@@ -5369,6 +5569,8 @@ mod tests {
             ExtractionResult::success(Vec::new(), 0, 0),
             ExtractorKind::Classifier,
             mem_id,
+            1,
+            1,
         );
         assert_eq!(
             slot.classifier,
@@ -5868,6 +6070,9 @@ mod tests {
                 pattern: tier_status::ABSENT,
                 classifier: tier_status::ABSENT,
                 llm: tier_status::ABSENT,
+                pattern_audit: None,
+                classifier_audit: None,
+                llm_audit: None,
                 failure_reason: None,
                 llm_failure_class: ExtractionFailureClass::Unclassified,
                 llm_cost_micro_usd: 0,
@@ -6083,6 +6288,9 @@ mod tests {
             pattern: tier_status::ABSENT,
             classifier: tier_status::ABSENT,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -6352,6 +6560,9 @@ mod tests {
             pattern: tier_status::ABSENT,
             classifier: tier_status::ABSENT,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -6584,6 +6795,9 @@ mod tests {
             pattern: tier_status::ABSENT,
             classifier: tier_status::ABSENT,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -6853,6 +7067,9 @@ mod tests {
             pattern: tier_status::RAN,
             classifier: tier_status::RAN,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -7048,6 +7265,9 @@ mod tests {
             pattern: tier_status::RAN,
             classifier: tier_status::RAN,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -7197,6 +7417,9 @@ mod tests {
             pattern: tier_status::ABSENT,
             classifier: tier_status::ABSENT,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -7651,6 +7874,9 @@ mod tests {
             pattern: tier_status::RAN,
             classifier: tier_status::ABSENT,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -7703,6 +7929,110 @@ mod tests {
             "expected exactly one statement for brain:{name}"
         );
         v.into_iter().next().unwrap()
+    }
+
+    /// Per-call extraction audit: applying an outcome writes one
+    /// `ExtractionAudit` row per tier that ran (absent tiers write none),
+    /// each reachable through the by-memory / by-extractor / by-time
+    /// indexes, and a re-apply ADDS rows rather than overwriting (history
+    /// preserved — the whole point of the append-only UUIDv7 log).
+    #[test]
+    fn apply_emits_per_call_extraction_audit_rows() {
+        use brain_metadata::{audit_by_extractor, audit_by_memory, audit_recent};
+
+        let (worker, ctx, metadata) = __join_env();
+        let memory_id = brain_core::MemoryId::pack(0, 7, 1);
+        __seed_memory_row(&metadata, memory_id, __ts());
+
+        // A pattern tier and an LLM tier both ran, attributed to distinct
+        // extractor ids; the classifier tier is absent (no extractor).
+        let mut outcome = __outcome(vec![
+            __alice(),
+            __entity_stmt("brain:likes", "coffee", false, StatementKind::Fact, None),
+        ]);
+        outcome.pattern_audit = Some(TierAudit {
+            extractor_id: 11,
+            extractor_version: 1,
+            status: extraction_status::SUCCESS,
+            reason: String::new(),
+        });
+        outcome.classifier_audit = None;
+        outcome.llm_audit = Some(TierAudit {
+            extractor_id: 22,
+            extractor_version: 3,
+            status: extraction_status::SUCCESS,
+            reason: String::new(),
+        });
+        outcome.llm_cost_micro_usd = 500;
+
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        {
+            let rtxn = metadata.read_txn().unwrap();
+            // Two tiers ran → two rows, reachable by-memory.
+            let by_mem = audit_by_memory(&rtxn, memory_id, 100).unwrap();
+            assert_eq!(by_mem.len(), 2, "one audit row per tier that ran");
+            // by-extractor isolates each tier's extractor.
+            assert_eq!(audit_by_extractor(&rtxn, 11, 100).unwrap().len(), 1);
+            let llm_rows = audit_by_extractor(&rtxn, 22, 100).unwrap();
+            assert_eq!(llm_rows.len(), 1);
+            assert_eq!(llm_rows[0].cost_micro_usd, 500, "LLM cost attributed");
+            // The absent classifier tier wrote nothing.
+            assert!(audit_by_extractor(&rtxn, 33, 100).unwrap().is_empty());
+            // by-time returns both.
+            assert_eq!(audit_recent(&rtxn, 0, 100).unwrap().len(), 2);
+        }
+
+        // A SECOND apply ADDS new rows (append-only history), never overwrites.
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome re-run");
+        {
+            let rtxn = metadata.read_txn().unwrap();
+            assert_eq!(
+                audit_by_memory(&rtxn, memory_id, 100).unwrap().len(),
+                4,
+                "re-extraction ADDS rows; never overwrites",
+            );
+        }
+    }
+
+    /// A failed tier records a Failure row carrying its reason; a
+    /// budget-skipped LLM tier records a SkippedBudget row.
+    #[test]
+    fn apply_emits_failure_and_skip_audit_rows() {
+        use brain_metadata::audit_by_extractor;
+
+        let (worker, ctx, metadata) = __join_env();
+        let memory_id = brain_core::MemoryId::pack(0, 8, 1);
+        __seed_memory_row(&metadata, memory_id, __ts());
+
+        let mut outcome = __outcome(vec![__alice()]);
+        outcome.pattern_audit = Some(TierAudit {
+            extractor_id: 44,
+            extractor_version: 1,
+            status: extraction_status::FAILURE,
+            reason: "boom".to_string(),
+        });
+        outcome.classifier_audit = None;
+        outcome.llm_audit = Some(TierAudit {
+            extractor_id: 55,
+            extractor_version: 1,
+            status: extraction_status::SKIPPED_BUDGET,
+            reason: "cycle LLM budget exhausted".to_string(),
+        });
+
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        let failed = audit_by_extractor(&rtxn, 44, 10).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].status, extraction_status::FAILURE);
+        assert_eq!(failed[0].status_reason, "boom");
+        let skipped = audit_by_extractor(&rtxn, 55, 10).unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].status, extraction_status::SKIPPED_BUDGET);
     }
 
     const D1: u64 = 1_684_540_800_000_000_000; // 2023-05-20

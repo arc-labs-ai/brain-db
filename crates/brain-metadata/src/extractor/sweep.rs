@@ -10,7 +10,10 @@ use brain_core::{StatementKind, StatementObject};
 
 use crate::statement::evidence::reclaim_evidence_overflow;
 use crate::statement::StatementOpError;
-use crate::tables::audit::EXTRACTOR_AUDIT_TABLE;
+use crate::tables::audit::{
+    ENTITY_RESOLUTION_AUDIT_TABLE, EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE,
+    EXTRACTOR_AUDIT_BY_MEMORY_TABLE, EXTRACTOR_AUDIT_BY_TIME_TABLE, EXTRACTOR_AUDIT_TABLE,
+};
 use crate::tables::statement::{
     confidence_bucket, statement_from_metadata, tombstone_reason, StatementMetadata,
     STATEMENTS_BY_EVENT_TIME_TABLE, STATEMENTS_BY_EVIDENCE_TABLE,
@@ -348,10 +351,17 @@ fn overflow_memory_ids(
 // Audit log sweeper.
 // ---------------------------------------------------------------------------
 
-/// Hard-delete audit rows older than `retention_seconds`. Merge/Unmerge
-/// audit rows are exempt (kept forever) — the audit table stores
-/// extraction events only, so the merge-exemption is a no-op until
-/// merge audits land on this table.
+/// Hard-delete historical audit rows older than `retention_seconds` from
+/// both audit logs — `EXTRACTOR_AUDIT_TABLE` (per-call extraction audit)
+/// and `ENTITY_RESOLUTION_AUDIT_TABLE` (entity-resolution audit) — with a
+/// 90 d default. `MERGE_LOG_TABLE` is kept forever and never touched here.
+///
+/// For each expired extraction-audit row the primary row AND its three
+/// secondary index entries (`by_memory` / `by_extractor` / `by_time`) are
+/// removed together in the same txn, so a sweep never leaves a dangling
+/// index row pointing at a deleted primary. `batch_cap` bounds the number
+/// of primary rows deleted per invocation *per table* (index deletes ride
+/// along and don't count against the cap).
 pub fn sweep_audit_log(
     wtxn: &WriteTransaction,
     retention_seconds: u64,
@@ -365,7 +375,16 @@ pub fn sweep_audit_log(
     }
     let cutoff_ns = now_unix_nanos.saturating_sub(retention_seconds * 1_000_000_000);
 
-    let victims: Vec<[u8; 16]> = {
+    // Phase 1 — collect expired extraction-audit victims. Capture the index
+    // coordinates (memory_id, extractor_id, started_at) alongside the primary
+    // key so phase 2 can strip every index entry without re-reading the row.
+    struct ExtractionVictim {
+        audit_id: [u8; 16],
+        memory_id: [u8; 16],
+        extractor_id: u32,
+        started_at: u64,
+    }
+    let extraction_victims: Vec<ExtractionVictim> = {
         let table = wtxn.open_table(EXTRACTOR_AUDIT_TABLE)?;
         let mut out = Vec::new();
         for entry in table.iter()? {
@@ -373,6 +392,31 @@ pub fn sweep_audit_log(
             let row = v.value();
             summary.scanned += 1;
             if row.started_at_unix_nanos > cutoff_ns {
+                continue;
+            }
+            out.push(ExtractionVictim {
+                audit_id: k.value(),
+                memory_id: row.memory_id_bytes,
+                extractor_id: row.extractor_id,
+                started_at: row.started_at_unix_nanos,
+            });
+            if out.len() == batch_cap {
+                break;
+            }
+        }
+        out
+    };
+
+    // Phase 1b — collect expired resolution-audit victims (primary-only table;
+    // keyed by created_at).
+    let resolution_victims: Vec<[u8; 16]> = {
+        let table = wtxn.open_table(ENTITY_RESOLUTION_AUDIT_TABLE)?;
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            let row = v.value();
+            summary.scanned += 1;
+            if row.created_at_unix_nanos > cutoff_ns {
                 continue;
             }
             out.push(k.value());
@@ -384,14 +428,35 @@ pub fn sweep_audit_log(
     };
 
     if dry_run {
-        summary.dry_run_would_delete = victims.len() as u64;
-    } else {
-        let mut t = wtxn.open_table(EXTRACTOR_AUDIT_TABLE)?;
-        for key in &victims {
+        summary.dry_run_would_delete = (extraction_victims.len() + resolution_victims.len()) as u64;
+        return Ok(summary);
+    }
+
+    // Phase 2 — delete each extraction-audit primary row together with its
+    // three index entries, all in this txn.
+    {
+        let mut primary = wtxn.open_table(EXTRACTOR_AUDIT_TABLE)?;
+        let mut by_memory = wtxn.open_table(EXTRACTOR_AUDIT_BY_MEMORY_TABLE)?;
+        let mut by_extractor = wtxn.open_table(EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE)?;
+        let mut by_time = wtxn.open_table(EXTRACTOR_AUDIT_BY_TIME_TABLE)?;
+        for victim in &extraction_victims {
+            primary.remove(&victim.audit_id)?;
+            by_memory.remove(&(victim.memory_id, victim.audit_id))?;
+            by_extractor.remove(&(victim.extractor_id, victim.audit_id))?;
+            by_time.remove(&(victim.started_at, victim.audit_id))?;
+            summary.deleted += 1;
+        }
+    }
+
+    // Phase 2b — delete expired resolution-audit rows (no secondary indexes).
+    {
+        let mut t = wtxn.open_table(ENTITY_RESOLUTION_AUDIT_TABLE)?;
+        for key in &resolution_victims {
             t.remove(key)?;
             summary.deleted += 1;
         }
     }
+
     Ok(summary)
 }
 
@@ -813,5 +878,198 @@ mod reclaim_tests {
         assert_eq!(summary.scanned, 0);
         let rtxn = db.read_txn().unwrap();
         assert!(statement_get(&rtxn, id).unwrap().is_some());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — audit-log retention sweep.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, not(miri)))]
+mod audit_sweep_tests {
+    use super::*;
+    use crate::audit::ops::{audit_write, resolution_audit_write};
+    use crate::tables::audit::{
+        output_kind, resolution_outcome, ExtractionAudit, OutputRef, ResolutionAudit,
+    };
+    use brain_core::{AuditId, EntityId, MemoryId};
+
+    const RETENTION_90D_SECONDS: u64 = 90 * 24 * 60 * 60;
+    const DAY_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000;
+    /// A "now" far enough from the epoch that "100 days ago" doesn't underflow.
+    const NOW: u64 = 1_000 * DAY_NANOS;
+
+    fn open_db() -> (tempfile::TempDir, crate::MetadataDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::MetadataDb::open(dir.path().join("md.redb")).unwrap();
+        (dir, db)
+    }
+
+    fn extraction_row(memory: MemoryId, extractor_id: u32, started_at: u64) -> ExtractionAudit {
+        ExtractionAudit::success(
+            AuditId::new(),
+            memory,
+            extractor_id,
+            1,
+            1,
+            started_at,
+            started_at + 100,
+            vec![OutputRef {
+                kind: output_kind::ENTITY,
+                id: [1u8; 16],
+            }],
+            [0u8; 32],
+        )
+    }
+
+    /// An extraction-audit row older than 90 d is swept along with all three
+    /// of its index entries; a fresh row (and its index entries) survive.
+    #[test]
+    fn sweep_removes_expired_extraction_rows_and_all_index_entries() {
+        let (_d, db) = open_db();
+        let mem_old = MemoryId::pack(0, 1, 1);
+        let mem_fresh = MemoryId::pack(0, 2, 1);
+        let old = extraction_row(mem_old, 7, NOW - 100 * DAY_NANOS);
+        let fresh = extraction_row(mem_fresh, 8, NOW - DAY_NANOS);
+        let old_id = old.audit_id_bytes;
+        let fresh_id = fresh.audit_id_bytes;
+
+        {
+            let wtxn = db.write_txn().unwrap();
+            audit_write(&wtxn, &old).unwrap();
+            audit_write(&wtxn, &fresh).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        {
+            let wtxn = db.write_txn().unwrap();
+            let summary = sweep_audit_log(&wtxn, RETENTION_90D_SECONDS, NOW, 256, false).unwrap();
+            wtxn.commit().unwrap();
+            assert_eq!(summary.deleted, 1, "only the >90d extraction row is swept");
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        // Primary: old gone, fresh survives.
+        let primary = rtxn.open_table(EXTRACTOR_AUDIT_TABLE).unwrap();
+        assert!(primary.get(&old_id).unwrap().is_none());
+        assert!(primary.get(&fresh_id).unwrap().is_some());
+        // by_memory: no dangling entry for the old row; fresh entry present.
+        let by_mem = rtxn.open_table(EXTRACTOR_AUDIT_BY_MEMORY_TABLE).unwrap();
+        assert!(by_mem
+            .get(&(mem_old.to_be_bytes(), old_id))
+            .unwrap()
+            .is_none());
+        assert!(by_mem
+            .get(&(mem_fresh.to_be_bytes(), fresh_id))
+            .unwrap()
+            .is_some());
+        // by_extractor: old (extractor 7) gone; fresh (extractor 8) present.
+        let by_ext = rtxn.open_table(EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE).unwrap();
+        assert!(by_ext.get(&(7u32, old_id)).unwrap().is_none());
+        assert!(by_ext.get(&(8u32, fresh_id)).unwrap().is_some());
+        // by_time: old started_at key gone; fresh present.
+        let by_time = rtxn.open_table(EXTRACTOR_AUDIT_BY_TIME_TABLE).unwrap();
+        assert!(by_time
+            .get(&(NOW - 100 * DAY_NANOS, old_id))
+            .unwrap()
+            .is_none());
+        assert!(by_time.get(&(NOW - DAY_NANOS, fresh_id)).unwrap().is_some());
+    }
+
+    /// The resolution-audit table is swept on the same 90 d cutoff.
+    #[test]
+    fn sweep_removes_expired_resolution_rows() {
+        let (_d, db) = open_db();
+        let mut old = ResolutionAudit::new(
+            AuditId::new(),
+            "Priya".into(),
+            1,
+            resolution_outcome::TIER_2_FUZZY,
+            0.8,
+            NOW - 100 * DAY_NANOS,
+        );
+        old.resolved_entity_bytes = Some(EntityId::new().to_bytes());
+        let fresh = ResolutionAudit::new(
+            AuditId::new(),
+            "Dana".into(),
+            1,
+            resolution_outcome::TIER_1_EXACT,
+            1.0,
+            NOW - DAY_NANOS,
+        );
+        let old_id = old.audit_id_bytes;
+        let fresh_id = fresh.audit_id_bytes;
+
+        {
+            let wtxn = db.write_txn().unwrap();
+            resolution_audit_write(&wtxn, &old).unwrap();
+            resolution_audit_write(&wtxn, &fresh).unwrap();
+            wtxn.commit().unwrap();
+        }
+        {
+            let wtxn = db.write_txn().unwrap();
+            let summary = sweep_audit_log(&wtxn, RETENTION_90D_SECONDS, NOW, 256, false).unwrap();
+            wtxn.commit().unwrap();
+            assert_eq!(summary.deleted, 1, "only the >90d resolution row is swept");
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(ENTITY_RESOLUTION_AUDIT_TABLE).unwrap();
+        assert!(t.get(&old_id).unwrap().is_none());
+        assert!(t.get(&fresh_id).unwrap().is_some());
+    }
+
+    /// A dry run counts victims across both tables without mutating either.
+    #[test]
+    fn sweep_dry_run_counts_without_deleting() {
+        let (_d, db) = open_db();
+        let old_ext = extraction_row(MemoryId::pack(0, 3, 1), 9, NOW - 100 * DAY_NANOS);
+        let old_res = ResolutionAudit::new(
+            AuditId::new(),
+            "Eve".into(),
+            1,
+            resolution_outcome::TIER_1_EXACT,
+            1.0,
+            NOW - 100 * DAY_NANOS,
+        );
+        let ext_id = old_ext.audit_id_bytes;
+        {
+            let wtxn = db.write_txn().unwrap();
+            audit_write(&wtxn, &old_ext).unwrap();
+            resolution_audit_write(&wtxn, &old_res).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let wtxn = db.write_txn().unwrap();
+        let summary = sweep_audit_log(&wtxn, RETENTION_90D_SECONDS, NOW, 256, true).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.dry_run_would_delete, 2);
+        assert_eq!(summary.deleted, 0);
+        let rtxn = db.read_txn().unwrap();
+        let primary = rtxn.open_table(EXTRACTOR_AUDIT_TABLE).unwrap();
+        assert!(
+            primary.get(&ext_id).unwrap().is_some(),
+            "dry run keeps rows"
+        );
+    }
+
+    /// `retention_seconds == 0` disables the sweep entirely.
+    #[test]
+    fn sweep_disabled_is_noop() {
+        let (_d, db) = open_db();
+        let row = extraction_row(MemoryId::pack(0, 4, 1), 1, NOW - 100 * DAY_NANOS);
+        let id = row.audit_id_bytes;
+        {
+            let wtxn = db.write_txn().unwrap();
+            audit_write(&wtxn, &row).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let wtxn = db.write_txn().unwrap();
+        let summary = sweep_audit_log(&wtxn, 0, NOW, 256, false).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.deleted, 0);
+        assert_eq!(summary.scanned, 0);
+        let rtxn = db.read_txn().unwrap();
+        let primary = rtxn.open_table(EXTRACTOR_AUDIT_TABLE).unwrap();
+        assert!(primary.get(&id).unwrap().is_some());
     }
 }
