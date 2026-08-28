@@ -639,7 +639,12 @@ async fn start_admin_with_seeded_audit(count: usize) -> (Bringup, AuditSeed) {
     let data_dir = TempDir::new().expect("tmp");
     let shard0 = data_dir.path().join("0");
     std::fs::create_dir_all(&shard0).expect("mkdir shard0");
-    let memory = brain_core::MemoryId::from_be_bytes([0xAA; 16]);
+    // High 16 bits = owning shard; zero them so `by=memory` routes to
+    // shard 0 (where these rows are seeded).
+    let mut mbytes = [0xAA; 16];
+    mbytes[0] = 0;
+    mbytes[1] = 0;
+    let memory = brain_core::MemoryId::from_be_bytes(mbytes);
     let extractor_id = 7u32;
     // Timestamps must be recent — the audit retention sweeper runs at
     // shard spawn and deletes rows older than the retention window.
@@ -739,7 +744,7 @@ async fn start_admin_with_seeded_audit(count: usize) -> (Bringup, AuditSeed) {
     (
         bringup,
         AuditSeed {
-            memory_hex: hex16(&[0xAA; 16]),
+            memory_hex: hex16(&mbytes),
             extractor_id,
             extraction_count: count,
         },
@@ -897,4 +902,306 @@ async fn audit_query_requires_admin_auth() {
     let (code, _body) = http_get(server.admin_addr, "/v1/audit?by=time").await;
     assert_eq!(code, 401, "unauthed /v1/audit must be rejected");
     server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// /v1/audit — deployment-wide (cross-shard merged) view
+// ---------------------------------------------------------------------------
+
+/// What a multi-shard audit seeding planted.
+struct MultiSeed {
+    extractor_id: u32,
+    /// Total extraction rows across all shards.
+    total: usize,
+    /// Per-shard owning-memory hex — routes `by=memory` to that shard.
+    memory_hex: Vec<String>,
+}
+
+/// The memory a shard's rows are attributed to. High 16 bits = owning
+/// shard, so `by=memory` on this id routes straight to shard `s`.
+fn shard_memory_bytes(s: usize) -> [u8; 16] {
+    let mut b = [0xCD; 16];
+    b[0] = (s >> 8) as u8;
+    b[1] = s as u8;
+    b
+}
+
+/// Seed `total` extraction rows round-robin across `n_shards` shards, plus
+/// one resolution row per shard, then bring up an `n_shards` deployment.
+/// Row `r` lands on shard `r % n_shards` with `audit_id = BE(r + 1)` and
+/// `started_at = base + r`, so the global by-time and by-audit_id orders
+/// both equal `r` order — deterministic for merge assertions.
+async fn start_admin_with_multishard_audit(n_shards: usize, total: usize) -> (Bringup, MultiSeed) {
+    use brain_metadata::tables::audit::{
+        output_kind, resolution_outcome, ExtractionAudit, OutputRef, ResolutionAudit,
+        ENTITY_RESOLUTION_AUDIT_TABLE, EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE,
+        EXTRACTOR_AUDIT_BY_MEMORY_TABLE, EXTRACTOR_AUDIT_BY_TIME_TABLE, EXTRACTOR_AUDIT_TABLE,
+    };
+
+    let data_dir = TempDir::new().expect("tmp");
+    let extractor_id = 7u32;
+    let base = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+
+    for s in 0..n_shards {
+        let shard_dir = data_dir.path().join(s.to_string());
+        std::fs::create_dir_all(&shard_dir).expect("mkdir shard");
+        let mem_bytes = shard_memory_bytes(s);
+        let memory = brain_core::MemoryId::from_be_bytes(mem_bytes);
+
+        let db =
+            brain_metadata::MetadataDb::open(shard_dir.join("metadata.redb")).expect("open md");
+        let wtxn = db.write_txn().expect("wtxn");
+        {
+            let mut primary = wtxn.open_table(EXTRACTOR_AUDIT_TABLE).unwrap();
+            let mut by_mem = wtxn.open_table(EXTRACTOR_AUDIT_BY_MEMORY_TABLE).unwrap();
+            let mut by_ext = wtxn.open_table(EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE).unwrap();
+            let mut by_time = wtxn.open_table(EXTRACTOR_AUDIT_BY_TIME_TABLE).unwrap();
+            for r in (0..total).filter(|r| r % n_shards == s) {
+                let audit_id = brain_core::AuditId::from_bytes((r as u128 + 1).to_be_bytes());
+                let started = base + r as u64;
+                let row = ExtractionAudit::success(
+                    audit_id,
+                    memory,
+                    extractor_id,
+                    1,
+                    3,
+                    started,
+                    started + 5,
+                    vec![OutputRef {
+                        kind: output_kind::ENTITY,
+                        id: [9u8; 16],
+                    }],
+                    [0x42u8; 32],
+                );
+                let aid = row.audit_id_bytes;
+                primary.insert(&aid, &row).unwrap();
+                by_mem.insert(&(row.memory_id_bytes, aid), &()).unwrap();
+                by_ext.insert(&(extractor_id, aid), &()).unwrap();
+                by_time.insert(&(started, aid), &()).unwrap();
+            }
+            // One resolution row per shard so by=resolution merges too.
+            let mut res = wtxn.open_table(ENTITY_RESOLUTION_AUDIT_TABLE).unwrap();
+            let audit_id = brain_core::AuditId::from_bytes([0xB0 + s as u8; 16]);
+            let row = ResolutionAudit::new(
+                audit_id,
+                format!("cand-shard{s}"),
+                1,
+                resolution_outcome::TIER_1_EXACT,
+                0.9,
+                base + 1_000 + s as u64,
+            );
+            res.insert(&row.audit_id_bytes, &row).unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+
+    let mut handles = Vec::with_capacity(n_shards);
+    let mut joiners = Vec::with_capacity(n_shards);
+    for s in 0..n_shards {
+        let cfg = ShardSpawnConfig::new(data_dir.path(), stub_dispatcher());
+        let (h, j) = spawn_shard(s as u16, cfg).expect("spawn shard");
+        handles.push(h);
+        joiners.push(Some(j));
+    }
+    let shards: Arc<Vec<ShardHandle>> = Arc::new(handles.clone());
+
+    let auth_store = {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let p = tmp.path().join("api_keys.redb");
+        let store = Arc::new(crate::auth::AuthStore::open(&p).expect("open auth store"));
+        std::mem::forget(tmp);
+        store
+    };
+    let (trigger, signal) = ShutdownSignal::channel();
+    let state = Arc::new(AdminState::new(
+        shards,
+        Arc::new(ConnectionMetrics::default()),
+        Arc::new(config::Config::for_tests()),
+        Arc::new(metrics::request::RequestMetrics::new()),
+        auth_store,
+    ));
+    let admin = AdminServer::new("127.0.0.1:0".parse().unwrap(), state, signal);
+    let bound_admin = admin.bind().await.expect("bind admin");
+    let admin_addr = bound_admin.local_addr();
+    let admin_handle = tokio::spawn(async move { bound_admin.serve().await });
+
+    let bringup = Bringup {
+        admin_addr,
+        conn_addr: None,
+        trigger,
+        admin_handle,
+        listener_handle: None,
+        handles,
+        joiners,
+        _data_dir: Some(data_dir),
+    };
+    let memory_hex = (0..n_shards)
+        .map(|s| hex16(&shard_memory_bytes(s)))
+        .collect();
+    (
+        bringup,
+        MultiSeed {
+            extractor_id,
+            total,
+            memory_hex,
+        },
+    )
+}
+
+/// The `started_at_unix_nanos` of each row, in order.
+fn started_ats(body: &str) -> Vec<u64> {
+    let v: serde_json::Value = serde_json::from_str(body).expect("valid json");
+    v["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["started_at_unix_nanos"].as_u64().unwrap())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_query_by_time_merges_all_shards_in_global_order() {
+    let (server, seed) = start_admin_with_multishard_audit(3, 9).await;
+    let (code, body) = http_get_authed(server.admin_addr, "/v1/audit?by=time&limit=1000").await;
+    assert_eq!(code, 200, "body:\n{body}");
+    assert_eq!(
+        rows_len(&body),
+        seed.total,
+        "all shards' rows; body:\n{body}"
+    );
+    // Global time order: strictly ascending started_at across shards.
+    let ts = started_ats(&body);
+    assert!(
+        ts.windows(2).all(|w| w[0] < w[1]),
+        "rows not in global time order: {ts:?}"
+    );
+    assert!(next_cursor(&body).is_none(), "single page → null cursor");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_query_deployment_wide_pagination_advances_and_terminates() {
+    let (server, seed) = start_admin_with_multishard_audit(2, 6).await;
+
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let path = match &cursor {
+            Some(c) => format!("/v1/audit?by=time&limit=2&cursor={c}"),
+            None => "/v1/audit?by=time&limit=2".to_string(),
+        };
+        let (code, body) = http_get_authed(server.admin_addr, &path).await;
+        assert_eq!(code, 200, "body:\n{body}");
+        seen.extend(started_ats(&body));
+        pages += 1;
+        assert!(pages <= 10, "pagination failed to terminate");
+        match next_cursor(&body) {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    assert_eq!(seen.len(), seed.total, "every row surfaced exactly once");
+    assert!(
+        seen.windows(2).all(|w| w[0] < w[1]),
+        "cross-page global order broken: {seen:?}"
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_query_by_extractor_merges_all_shards() {
+    let (server, seed) = start_admin_with_multishard_audit(3, 7).await;
+    let (code, body) = http_get_authed(
+        server.admin_addr,
+        &format!(
+            "/v1/audit?by=extractor&extractor={}&limit=1000",
+            seed.extractor_id
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "body:\n{body}");
+    assert_eq!(rows_len(&body), seed.total, "body:\n{body}");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_query_by_resolution_merges_all_shards() {
+    let (server, _seed) = start_admin_with_multishard_audit(3, 3).await;
+    let (code, body) = http_get_authed(server.admin_addr, "/v1/audit?by=resolution").await;
+    assert_eq!(code, 200, "body:\n{body}");
+    assert!(body.contains("\"kind\":\"resolution\""), "body:\n{body}");
+    // One resolution row per shard.
+    assert_eq!(rows_len(&body), 3, "body:\n{body}");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_query_by_memory_hits_owning_shard() {
+    let (server, seed) = start_admin_with_multishard_audit(3, 9).await;
+    // Shard 1's rows: r ∈ {1,4,7} → 3 rows attributed to shard-1's memory.
+    let (code, body) = http_get_authed(
+        server.admin_addr,
+        &format!("/v1/audit?by=memory&memory={}", seed.memory_hex[1]),
+    )
+    .await;
+    assert_eq!(code, 200, "body:\n{body}");
+    assert_eq!(rows_len(&body), 3, "shard-1 memory rows; body:\n{body}");
+    assert!(next_cursor(&body).is_none());
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_query_explicit_shard_slices_one_shard() {
+    let (server, _seed) = start_admin_with_multishard_audit(3, 9).await;
+    // ?shard=0 → only shard 0's rows: r ∈ {0,3,6} = 3 rows.
+    let (code, body) =
+        http_get_authed(server.admin_addr, "/v1/audit?by=time&shard=0&limit=1000").await;
+    assert_eq!(code, 200, "body:\n{body}");
+    assert_eq!(rows_len(&body), 3, "single-shard slice; body:\n{body}");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_export_is_deployment_wide() {
+    let (server, seed) = start_admin_with_multishard_audit(3, 9).await;
+    let (code, body) = http_get_authed(server.admin_addr, "/v1/audit/export?by=time").await;
+    assert_eq!(code, 200, "body:\n{body}");
+    assert_eq!(
+        rows_len(&body),
+        seed.total,
+        "export spans all shards; body:\n{body}"
+    );
+    assert!(next_cursor(&body).is_none(), "not truncated → null");
+    let ts = started_ats(&body);
+    assert!(
+        ts.windows(2).all(|w| w[0] < w[1]),
+        "export not in global order: {ts:?}"
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_query_rejects_compound_cursor_topology_mismatch() {
+    // A cursor minted against a 2-shard deployment replayed here (3 shards).
+    let (server, _seed) = start_admin_with_multishard_audit(3, 6).await;
+    // base64url of ver=1, n=2, two START flags: [1, 0, 2, 2, 2].
+    let bad = base64_url(&[1u8, 0, 2, 2, 2]);
+    let (code, body) = http_get_authed(
+        server.admin_addr,
+        &format!("/v1/audit?by=time&cursor={bad}"),
+    )
+    .await;
+    assert_eq!(code, 400, "topology mismatch must 400; body:\n{body}");
+    server.stop().await;
+}
+
+/// Minimal base64url-no-pad encoder for the malformed-cursor test.
+fn base64_url(bytes: &[u8]) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    URL_SAFE_NO_PAD.encode(bytes)
 }
