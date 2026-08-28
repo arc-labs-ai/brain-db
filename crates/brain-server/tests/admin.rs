@@ -515,3 +515,52 @@ async fn unknown_path_returns_404() {
     assert_eq!(code, 404);
     server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_ann_alias_still_works() {
+    // Back-compat: POST /v1/rebuild-ann rebuilds the memory HNSW and
+    // returns 201 with an entries/elapsed body.
+    let server = start_admin_with_shards(1).await;
+    let (code, body) = http_post_authed(server.admin_addr, "/v1/rebuild-ann").await;
+    assert_eq!(code, 201, "rebuild-ann should succeed; body:\n{body}");
+    assert!(body.contains("\"entries\""), "body:\n{body}");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_index_each_target_returns_201() {
+    let server = start_admin_with_shards(1).await;
+    for target in [
+        "memory_hnsw",
+        "entity_hnsw",
+        "hype_hnsw",
+        "statement_question_hnsw",
+        "all",
+    ] {
+        let path = format!("/v1/rebuild?index={target}");
+        let (code, body) = http_post_authed(server.admin_addr, &path).await;
+        assert_eq!(code, 201, "rebuild {target} should 201; body:\n{body}");
+        assert!(
+            body.contains("\"entries\""),
+            "target {target} body:\n{body}"
+        );
+    }
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_index_unknown_returns_400() {
+    let server = start_admin_with_shards(1).await;
+    let (code, body) = http_post_authed(server.admin_addr, "/v1/rebuild?index=bogus").await;
+    assert_eq!(code, 400, "unknown index must 400; body:\n{body}");
+    assert!(body.contains("unknown index"), "body:\n{body}");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_index_missing_param_returns_400() {
+    let server = start_admin_with_shards(1).await;
+    let (code, body) = http_post_authed(server.admin_addr, "/v1/rebuild").await;
+    assert_eq!(code, 400, "missing ?index= must 400; body:\n{body}");
+    server.stop().await;
+}

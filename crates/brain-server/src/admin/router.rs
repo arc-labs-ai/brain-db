@@ -115,6 +115,15 @@ fn attach_v1_routes(r: Router<Incoming>, state: Arc<AdminState>) -> Router<Incom
         rebuild::handle,
     );
 
+    // ──────── /v1/rebuild ──────────────────────────────────────────────
+    let r = with_state(
+        r,
+        Method::POST,
+        "/v1/rebuild",
+        state.clone(),
+        rebuild::handle_index,
+    );
+
     // ──────── /v1/extract/backfill ─────────────────────────────────────
     let r = with_state(
         r,

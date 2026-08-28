@@ -51,6 +51,7 @@
 
 pub mod adapters;
 pub mod llm_setup;
+pub mod rebuild;
 pub mod restore;
 pub mod snapshot_manifest;
 pub mod tantivy_recovery;
@@ -170,8 +171,18 @@ pub(crate) enum ShardRequest {
         id: u64,
         reply_tx: Sender<Result<(), String>>,
     },
-    /// Trigger an immediate HNSW rebuild on this shard.
+    /// Trigger an immediate memory-HNSW rebuild on this shard. Retained
+    /// as the `/v1/rebuild-ann` back-compat path; equivalent to
+    /// `RebuildIndex { target: MemoryHnsw }`.
     RebuildHnsw {
+        reply_tx: Sender<Result<RebuildReport, String>>,
+    },
+    /// Rebuild a chosen derived index from authoritative redb state
+    /// (admin `POST /v1/rebuild?index=<target>`). Runs on the shard
+    /// executor and shares its implementation with the boot-recovery
+    /// path (`shard::rebuild`).
+    RebuildIndex {
+        target: rebuild::RebuildTarget,
         reply_tx: Sender<Result<RebuildReport, String>>,
     },
     /// Snapshot the HNSW index counts. Used by the admin `/metrics`
@@ -1199,6 +1210,26 @@ impl ShardHandle {
             .map_err(ShardError::Snapshot)
     }
 
+    /// Rebuild a chosen derived index from authoritative redb state.
+    /// Backs the admin `POST /v1/rebuild?index=<target>` route. For
+    /// `RebuildTarget::All` the returned report aggregates the per-target
+    /// entry counts (sum) and total elapsed time.
+    pub(crate) async fn rebuild_index(
+        &self,
+        target: rebuild::RebuildTarget,
+    ) -> Result<RebuildReport, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::RebuildIndex { target, reply_tx })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?
+            .map_err(ShardError::Snapshot)
+    }
+
     /// Dispatch a fully-decoded wire request through the shard's
     /// `OpsContext`. Returns the wire `ResponseBody` (variant chosen by
     /// `brain_ops::dispatch`). The frame-dispatcher's
@@ -1371,6 +1402,15 @@ struct Shard {
     /// The shared HNSW handle. `rebuild-ann` swaps a freshly-
     /// rebuilt index in via `SharedHnsw::swap()`.
     hnsw_shared: SharedHnsw,
+    /// Entity resolver HNSW. Same `Arc` the resolver + boot rebuild
+    /// hold, so an on-demand `RebuildIndex { EntityHnsw }` reinserts in
+    /// place and is immediately visible on the resolve path.
+    entity_hnsw: Arc<parking_lot::RwLock<EntityHnswIndex>>,
+    /// HyPE question pool. Same `Arc` the semantic retriever probes.
+    hype_hnsw: Arc<parking_lot::RwLock<HypeHnswIndex>>,
+    /// Per-statement question-bridge pool. Same `Arc` the retriever
+    /// probes on slot / temporal reads.
+    statement_question_hnsw: Arc<parking_lot::RwLock<StatementQuestionHnswIndex>>,
     /// The per-shard event-fanout task. Held (not detached) so the
     /// drain path can cancel it: it captures its own broadcast
     /// `EventBus` sender clone, so its `recv()` never observes
@@ -1493,6 +1533,111 @@ impl Shard {
             arena_used_bytes,
             arena_slots_used,
             arena_slots_free,
+        }
+    }
+
+    /// Rebuild the memory HNSW from the authoritative redb vector
+    /// snapshot, folding in the pending buffer, and publish atomically
+    /// via `SharedHnsw::flush_with_rebuild` so a failed rebuild leaves
+    /// the prior index intact. Shared by the `RebuildHnsw` and
+    /// `RebuildIndex { MemoryHnsw }` handlers.
+    async fn do_rebuild_memory(&self) -> Result<RebuildReport, String> {
+        let start = std::time::Instant::now();
+        let vectors = self
+            .rebuild_source
+            .snapshot_vectors()
+            .await
+            .map_err(|e| format!("rebuild source: {e}"))?;
+        let params = self.hnsw_shared.params();
+        // Fold the redb snapshot together with the pending buffer and
+        // publish atomically. A raw `swap` would clear pending, discarding
+        // a live vector not yet folded into main — the sole home of a
+        // same-run encode between its ENCODE and the next flush.
+        let flush = self.hnsw_shared.flush_with_rebuild(move |pending| {
+            let combined = fold_pending_into(vectors, pending);
+            let (idx, _) = brain_index::rebuild::rebuild_impl(params, combined)?;
+            Ok(idx)
+        });
+        match flush {
+            Ok(report) => Ok(RebuildReport {
+                entries: report.main_len_after,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            }),
+            Err(e) => Err(format!("rebuild: {e:?}")),
+        }
+    }
+
+    /// Rebuild one derived index from authoritative redb state. The HNSW
+    /// helpers reinsert in place under the index's write lock, so the
+    /// rebuild is immediately visible on the serve path and a failure
+    /// leaves the prior index intact. `All` runs each HNSW target in turn
+    /// and returns an aggregate report (summed entries, total elapsed).
+    async fn do_rebuild_index(
+        &self,
+        target: rebuild::RebuildTarget,
+    ) -> Result<RebuildReport, String> {
+        use rebuild::RebuildTarget as T;
+        let metadata = &self.ops.executor.metadata;
+        let embedder = self.ops.executor.embedder.as_ref();
+        match target {
+            T::MemoryHnsw => self.do_rebuild_memory().await,
+            T::EntityHnsw => {
+                let start = std::time::Instant::now();
+                let entries = rebuild::rebuild_entity_hnsw(
+                    &self.entity_hnsw,
+                    metadata,
+                    embedder,
+                    self.shard_id,
+                )?;
+                Ok(RebuildReport {
+                    entries,
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                })
+            }
+            T::HypeHnsw => {
+                let start = std::time::Instant::now();
+                let entries = rebuild::rebuild_hype_hnsw(&self.hype_hnsw, metadata, self.shard_id)?;
+                Ok(RebuildReport {
+                    entries,
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                })
+            }
+            T::StatementQuestionHnsw => {
+                let start = std::time::Instant::now();
+                let entries = rebuild::rebuild_statement_question_hnsw(
+                    &self.statement_question_hnsw,
+                    metadata,
+                    self.shard_id,
+                )?;
+                Ok(RebuildReport {
+                    entries,
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                })
+            }
+            T::All => {
+                let start = std::time::Instant::now();
+                let mut entries = 0usize;
+                // Memory first (async snapshot), then the in-place HNSW
+                // rebuilds. Any failure short-circuits with the prior
+                // indexes intact (each target swaps atomically).
+                entries += self.do_rebuild_memory().await?.entries;
+                entries += rebuild::rebuild_entity_hnsw(
+                    &self.entity_hnsw,
+                    metadata,
+                    embedder,
+                    self.shard_id,
+                )?;
+                entries += rebuild::rebuild_hype_hnsw(&self.hype_hnsw, metadata, self.shard_id)?;
+                entries += rebuild::rebuild_statement_question_hnsw(
+                    &self.statement_question_hnsw,
+                    metadata,
+                    self.shard_id,
+                )?;
+                Ok(RebuildReport {
+                    entries,
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                })
+            }
         }
     }
 }
@@ -2720,143 +2865,38 @@ pub fn spawn_shard(
                 }
             }
 
-            // Recovery: rebuild the entity HNSW (resolver tier-3 embedding
-            // tie-break) from the metadata store. Like the memory HNSW it's
-            // in-RAM only and not persisted; without this the resolver loses
-            // its embedding tie-break after restart and over-creates
-            // duplicate entities until each surface is re-extracted.
-            //
-            // Prefer the durable vector written at entity-create time:
-            // a stored vector goes
-            // straight into the HNSW with no embedder call. Rows
-            // without a stored vector (pre-feature data, or a partial
-            // write) fall back to re-embedding the canonical name.
-            match metadata.read_txn() {
-                Ok(rtxn) => match brain_metadata::entity::ops::entity_iter_all_live_with_vectors(
-                    &rtxn,
-                ) {
-                    Ok(entities) if !entities.is_empty() => {
-                        let count = entities.len();
-                        let mut pairs: Vec<(brain_core::EntityId, [f32; VECTOR_DIM])> =
-                            Vec::with_capacity(count);
-                        let mut from_stored = 0usize;
-                        let mut from_reembed = 0usize;
-                        let mut embed_failures = 0usize;
-                        for (id, name, stored) in entities {
-                            if let Some(v) = stored {
-                                pairs.push((id, v));
-                                from_stored += 1;
-                            } else {
-                                match dispatcher.embed(&name) {
-                                    Ok(v) => {
-                                        pairs.push((id, v));
-                                        from_reembed += 1;
-                                    }
-                                    Err(_) => embed_failures += 1,
-                                }
-                            }
-                        }
-                        match entity_hnsw_for_shard.write().rebuild(pairs) {
-                            Ok(_) => info!(
-                                shard_id,
-                                rebuilt = count,
-                                from_stored,
-                                from_reembed,
-                                embed_failures,
-                                "entity HNSW rebuilt from metadata on startup"
-                            ),
-                            Err(e) => error!(
-                                shard_id,
-                                error = ?e,
-                                "entity HNSW startup rebuild failed; entity resolution degraded"
-                            ),
-                        }
-                    }
-                    Ok(_) => {
-                        info!(
-                            shard_id,
-                            "no entities to rebuild; entity HNSW starts empty"
-                        );
-                    }
-                    Err(e) => error!(
-                        shard_id,
-                        error = ?e,
-                        "entity HNSW startup rebuild: metadata scan failed"
-                    ),
-                },
-                Err(e) => error!(
+            // Recovery: rebuild the entity / HyPE / statement-question
+            // HNSW indexes from the authoritative redb tables. All three
+            // are in-RAM only (not persisted), so without this they start
+            // empty and the resolver + question-bridge reads degrade until
+            // each surface is re-extracted. Boot and the on-demand admin
+            // `RebuildIndex` route share one implementation in
+            // `shard::rebuild`; boot logs any failure and continues (a
+            // degraded index is better than refusing to start).
+            self::rebuild::log_boot_result(
+                shard_id,
+                "entity HNSW",
+                self::rebuild::rebuild_entity_hnsw(
+                    &entity_hnsw_for_shard,
+                    &metadata,
+                    dispatcher.as_ref(),
                     shard_id,
-                    error = ?e,
-                    "entity HNSW startup rebuild: read_txn failed"
                 ),
-            }
-
-            // HyPE pool rebuild: re-insert every persisted
-            // hypothetical-question vector into the in-RAM index. Unlike
-            // the entity index there is no re-embed fallback — the vectors
-            // are the durable source of truth, so a missing/empty table
-            // just means an empty pool (a fresh shard, or HyPE never
-            // generated). The open_table error on a never-written table is
-            // expected and logged at INFO, not ERROR.
-            match metadata.read_txn() {
-                Ok(rtxn) => match brain_metadata::hype_iter_all_vectors(&rtxn) {
-                    Ok(points) if !points.is_empty() => {
-                        let report = hype_hnsw_for_shard.write().rebuild(points);
-                        info!(
-                            shard_id,
-                            inserted = report.inserted,
-                            memories = report.memories,
-                            "HyPE HNSW rebuilt from metadata on startup"
-                        );
-                    }
-                    Ok(_) => info!(shard_id, "no HyPE vectors to rebuild; pool starts empty"),
-                    Err(e) => info!(
-                        shard_id,
-                        error = ?e,
-                        "HyPE pool empty or table absent; pool starts empty"
-                    ),
-                },
-                Err(e) => error!(
+            );
+            self::rebuild::log_boot_result(
+                shard_id,
+                "HyPE HNSW",
+                self::rebuild::rebuild_hype_hnsw(&hype_hnsw_for_shard, &metadata, shard_id),
+            );
+            self::rebuild::log_boot_result(
+                shard_id,
+                "statement question-bridge",
+                self::rebuild::rebuild_statement_question_hnsw(
+                    &statement_question_hnsw_for_shard,
+                    &metadata,
                     shard_id,
-                    error = ?e,
-                    "HyPE HNSW startup rebuild: read_txn failed"
                 ),
-            }
-
-            // Statement question-bridge rebuild: re-insert every persisted
-            // per-statement question vector. Same durable-source-of-truth
-            // model as the HyPE pool.
-            match metadata.read_txn() {
-                Ok(rtxn) => {
-                    match brain_metadata::statement_question::ops::statement_question_iter_all(
-                        &rtxn,
-                    ) {
-                        Ok(points) if !points.is_empty() => {
-                            let report = statement_question_hnsw_for_shard.write().rebuild(points);
-                            info!(
-                                shard_id,
-                                inserted = report.inserted,
-                                statements = report.statements,
-                                "statement question-bridge rebuilt from metadata on startup"
-                            );
-                        }
-                        Ok(_) => info!(
-                            shard_id,
-                            "no statement question vectors to rebuild; pool starts empty"
-                        ),
-                        Err(e) => info!(
-                            shard_id,
-                            error = ?e,
-                            "statement question-bridge empty or table absent; starts empty"
-                        ),
-                    }
-                }
-                Err(e) => error!(
-                    shard_id,
-                    error = ?e,
-                    "statement question-bridge startup rebuild: read_txn failed"
-                ),
-            }
+            );
 
             // Recovery: re-enqueue every live statement so the
             // StatementEmbedWorker repopulates the (in-RAM, non-persisted)
@@ -3319,6 +3359,9 @@ pub fn spawn_shard(
                 snapshot_source,
                 rebuild_source: rebuild_source_for_shard,
                 hnsw_shared,
+                entity_hnsw: entity_hnsw_for_shard.clone(),
+                hype_hnsw: hype_hnsw_for_shard.clone(),
+                statement_question_hnsw: statement_question_hnsw_for_shard.clone(),
                 fanout_task: __fanout_task,
                 wal_drain_task: Some(__wal_drain_task),
                 memory_text_task: __memory_text_task,
@@ -3518,34 +3561,21 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                 }
             }
             ShardRequest::RebuildHnsw { reply_tx } => {
-                let start = std::time::Instant::now();
-                let result = match shard.rebuild_source.snapshot_vectors().await {
-                    Ok(vectors) => {
-                        let params = shard.hnsw_shared.params();
-                        // Fold the redb snapshot together with the pending
-                        // buffer and publish atomically via flush_with_rebuild.
-                        // A raw `swap` would clear pending, discarding any live
-                        // vector not yet folded into main — the sole home of a
-                        // same-run encode between its ENCODE and the next flush.
-                        let flush = shard.hnsw_shared.flush_with_rebuild(move |pending| {
-                            let combined = fold_pending_into(vectors, pending);
-                            let (idx, _) = brain_index::rebuild::rebuild_impl(params, combined)?;
-                            Ok(idx)
-                        });
-                        match flush {
-                            Ok(report) => Ok(RebuildReport {
-                                entries: report.main_len_after,
-                                elapsed_ms: start.elapsed().as_millis() as u64,
-                            }),
-                            Err(e) => Err(format!("rebuild: {e:?}")),
-                        }
-                    }
-                    Err(e) => Err(format!("rebuild source: {e}")),
-                };
+                let result = shard.do_rebuild_memory().await;
                 if reply_tx.send_async(result).await.is_err() {
                     warn!(
                         shard_id = shard.shard_id,
                         "RebuildHnsw reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::RebuildIndex { target, reply_tx } => {
+                let result = shard.do_rebuild_index(target).await;
+                if reply_tx.send_async(result).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        ?target,
+                        "RebuildIndex reply dropped (caller gone)"
                     );
                 }
             }
