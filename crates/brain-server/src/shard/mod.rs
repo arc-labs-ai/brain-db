@@ -220,6 +220,18 @@ pub(crate) enum ShardRequest {
         connection_id: [u8; 16],
         reply_tx: Sender<usize>,
     },
+    /// Query the historical audit tables (`GET /v1/audit`). Runs on the
+    /// shard executor, which owns the `metadata.redb` handle. Reads one
+    /// index page (`limit` rows, resuming after `cursor`) and returns
+    /// the decoded rows plus the cursor to continue from. Deployment-wide
+    /// operator surface — no tenant scoping (the admin token owns the
+    /// deployment).
+    AuditQuery {
+        selector: AuditSelector,
+        limit: usize,
+        cursor: Option<AuditCursor>,
+        reply_tx: Sender<Result<AuditPage, String>>,
+    },
 }
 
 /// Per-shard counts surfaced by [`ShardRequest::ExtractBackfill`]. The
@@ -308,6 +320,49 @@ pub struct RebuildReport {
     pub entries: usize,
     /// Wall-clock duration of the rebuild, in milliseconds.
     pub elapsed_ms: u64,
+}
+
+/// Which audit index an audit-log query walks. Pure data — crosses the
+/// Tokio↔Glommio channel unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditSelector {
+    /// Extraction-audit rows for one memory (`EXTRACTOR_AUDIT_BY_MEMORY`).
+    Memory([u8; 16]),
+    /// Extraction-audit rows produced by one extractor
+    /// (`EXTRACTOR_AUDIT_BY_EXTRACTOR`).
+    Extractor(u32),
+    /// Extraction-audit rows whose `started_at_unix_nanos` falls in
+    /// `[since, until]` (`EXTRACTOR_AUDIT_BY_TIME`).
+    Time { since: u64, until: u64 },
+    /// Entity-resolution-audit rows whose `created_at_unix_nanos` falls in
+    /// `[since, until]`. The resolution table has no secondary index, so
+    /// the scan walks the primary key (UUIDv7 ≈ creation order) and
+    /// filters on the window.
+    Resolution { since: u64, until: u64 },
+}
+
+/// Opaque pagination position: the last index key returned in the prior
+/// page. `ts` is the leading key component for the `Time` selector; it is
+/// ignored for `Memory` / `Extractor` / `Resolution`, whose scans have a
+/// fixed (or absent) leading component and resume on `audit_id` alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuditCursor {
+    pub ts: u64,
+    pub audit_id: [u8; 16],
+}
+
+/// One page of audit rows plus the cursor to resume after the last row.
+/// `next` is `Some` iff at least one further row exists past this page.
+#[derive(Clone, Debug)]
+pub enum AuditPage {
+    Extraction {
+        rows: Vec<brain_metadata::tables::audit::ExtractionAudit>,
+        next: Option<AuditCursor>,
+    },
+    Resolution {
+        rows: Vec<brain_metadata::tables::audit::ResolutionAudit>,
+        next: Option<AuditCursor>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -718,6 +773,9 @@ pub enum ShardError {
 
     #[error("snapshot operation failed: {0}")]
     Snapshot(String),
+
+    #[error("audit query failed: {0}")]
+    AuditQuery(String),
 
     #[error("failed to open arena: {0}")]
     ArenaOpen(#[from] ArenaOpenError),
@@ -1316,6 +1374,33 @@ impl ShardHandle {
             .await
             .map_err(|_| DispatchError::ShardDisconnected)
     }
+
+    /// Read one page of the historical audit tables. Backs the admin
+    /// `GET /v1/audit` + `/v1/audit/export` routes. `limit` bounds the
+    /// page; `cursor` resumes strictly after a prior page's last row.
+    /// The returned [`AuditPage::next`] is `Some` when more rows remain.
+    pub async fn audit_query(
+        &self,
+        selector: AuditSelector,
+        limit: usize,
+        cursor: Option<AuditCursor>,
+    ) -> Result<AuditPage, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::AuditQuery {
+                selector,
+                limit,
+                cursor,
+                reply_tx,
+            })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?
+            .map_err(ShardError::AuditQuery)
+    }
 }
 
 /// Caller-facing error for [`ShardHandle::alloc_slot`]. Either the shard
@@ -1458,6 +1543,50 @@ struct Shard {
     statement_text_task: Option<(flume::Sender<()>, glommio::Task<()>)>,
 }
 
+/// Load a page of `ExtractionAudit` rows from the primary audit table
+/// given an ascending iterator of candidate `audit_id`s (produced by
+/// walking one of the three extractor-audit indexes). Collects at most
+/// `limit` rows; when a further candidate exists past the page, the
+/// returned cursor points at the last row actually returned so the caller
+/// can resume strictly after it. Dangling index entries (no primary row)
+/// are skipped without consuming page budget.
+fn collect_extraction_page<I, T>(
+    audit_ids: I,
+    primary: &T,
+    limit: usize,
+) -> Result<
+    (
+        Vec<brain_metadata::tables::audit::ExtractionAudit>,
+        Option<AuditCursor>,
+    ),
+    String,
+>
+where
+    I: IntoIterator<Item = Result<[u8; 16], String>>,
+    T: redb::ReadableTable<[u8; 16], brain_metadata::tables::audit::ExtractionAudit>,
+{
+    let mut rows = Vec::new();
+    let mut last: Option<AuditCursor> = None;
+    let mut next = None;
+    for audit_id in audit_ids {
+        let audit_id = audit_id?;
+        if rows.len() >= limit {
+            // One candidate beyond the page → there is a next page.
+            next = last;
+            break;
+        }
+        if let Some(v) = primary.get(&audit_id).map_err(|e| format!("get: {e}"))? {
+            let row = v.value();
+            last = Some(AuditCursor {
+                ts: row.started_at_unix_nanos,
+                audit_id: row.audit_id_bytes,
+            });
+            rows.push(row);
+        }
+    }
+    Ok((rows, next))
+}
+
 impl Shard {
     /// Count the live rows in `MEMORIES_TABLE`. There is exactly one
     /// arena slot per memory row (occupied + tombstoned until reclaimed),
@@ -1516,6 +1645,137 @@ impl Shard {
         let stored = texts.get(memory_id.to_be_bytes()).ok().flatten()?;
         let text = std::str::from_utf8(stored.value()).ok()?;
         self.ops.executor.embedder.embed(text).ok()
+    }
+
+    /// Read one page of the historical audit tables under a single redb
+    /// read transaction. Walks the index matching `selector`, resuming
+    /// strictly after `cursor`, and loads at most `limit` rows. Returns
+    /// [`AuditPage::next`] = `Some` iff at least one further row exists.
+    ///
+    /// Runs on the shard executor (the sole owner of the `metadata.redb`
+    /// handle). Deployment-wide operator surface — no tenant scoping.
+    fn run_audit_query(
+        &self,
+        selector: AuditSelector,
+        limit: usize,
+        cursor: Option<AuditCursor>,
+    ) -> Result<AuditPage, String> {
+        use brain_metadata::tables::audit::{
+            ENTITY_RESOLUTION_AUDIT_TABLE, EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE,
+            EXTRACTOR_AUDIT_BY_MEMORY_TABLE, EXTRACTOR_AUDIT_BY_TIME_TABLE, EXTRACTOR_AUDIT_TABLE,
+        };
+        use std::ops::Bound;
+
+        // A `limit` of 0 would loop forever below (never fills a page yet
+        // never terminates the "one-past" check); the handler caps it, but
+        // guard here too so the executor can never wedge.
+        let limit = limit.max(1);
+        let rtxn = self
+            .ops
+            .executor
+            .metadata
+            .read_txn()
+            .map_err(|e| format!("read txn: {e}"))?;
+
+        // Shared page-accumulation over an extractor-audit index: `entries`
+        // yields `(leading, audit_id)` in ascending key order; each hit is
+        // loaded from the primary table. `next` is set to the last row we
+        // actually returned when a further entry exists past the page.
+        match selector {
+            AuditSelector::Memory(mem) => {
+                let idx = rtxn
+                    .open_table(EXTRACTOR_AUDIT_BY_MEMORY_TABLE)
+                    .map_err(|e| format!("open by-memory index: {e}"))?;
+                let primary = rtxn
+                    .open_table(EXTRACTOR_AUDIT_TABLE)
+                    .map_err(|e| format!("open audit table: {e}"))?;
+                let lo = match cursor {
+                    Some(c) => Bound::Excluded((mem, c.audit_id)),
+                    None => Bound::Included((mem, [0u8; 16])),
+                };
+                let hi = Bound::Included((mem, [0xffu8; 16]));
+                let range = idx.range((lo, hi)).map_err(|e| format!("range: {e}"))?;
+                let (rows, next) = collect_extraction_page(
+                    range.map(|e| e.map(|(k, _)| k.value().1).map_err(|e| format!("row: {e}"))),
+                    &primary,
+                    limit,
+                )?;
+                Ok(AuditPage::Extraction { rows, next })
+            }
+            AuditSelector::Extractor(ext) => {
+                let idx = rtxn
+                    .open_table(EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE)
+                    .map_err(|e| format!("open by-extractor index: {e}"))?;
+                let primary = rtxn
+                    .open_table(EXTRACTOR_AUDIT_TABLE)
+                    .map_err(|e| format!("open audit table: {e}"))?;
+                let lo = match cursor {
+                    Some(c) => Bound::Excluded((ext, c.audit_id)),
+                    None => Bound::Included((ext, [0u8; 16])),
+                };
+                let hi = Bound::Included((ext, [0xffu8; 16]));
+                let range = idx.range((lo, hi)).map_err(|e| format!("range: {e}"))?;
+                let (rows, next) = collect_extraction_page(
+                    range.map(|e| e.map(|(k, _)| k.value().1).map_err(|e| format!("row: {e}"))),
+                    &primary,
+                    limit,
+                )?;
+                Ok(AuditPage::Extraction { rows, next })
+            }
+            AuditSelector::Time { since, until } => {
+                let idx = rtxn
+                    .open_table(EXTRACTOR_AUDIT_BY_TIME_TABLE)
+                    .map_err(|e| format!("open by-time index: {e}"))?;
+                let primary = rtxn
+                    .open_table(EXTRACTOR_AUDIT_TABLE)
+                    .map_err(|e| format!("open audit table: {e}"))?;
+                let lo = match cursor {
+                    Some(c) => Bound::Excluded((c.ts, c.audit_id)),
+                    None => Bound::Included((since, [0u8; 16])),
+                };
+                let hi = Bound::Included((until, [0xffu8; 16]));
+                let range = idx.range((lo, hi)).map_err(|e| format!("range: {e}"))?;
+                let (rows, next) = collect_extraction_page(
+                    range.map(|e| e.map(|(k, _)| k.value().1).map_err(|e| format!("row: {e}"))),
+                    &primary,
+                    limit,
+                )?;
+                Ok(AuditPage::Extraction { rows, next })
+            }
+            AuditSelector::Resolution { since, until } => {
+                let table = rtxn
+                    .open_table(ENTITY_RESOLUTION_AUDIT_TABLE)
+                    .map_err(|e| format!("open resolution table: {e}"))?;
+                let lo = match cursor {
+                    Some(c) => Bound::Excluded(c.audit_id),
+                    None => Bound::Included([0u8; 16]),
+                };
+                let hi = Bound::Included([0xffu8; 16]);
+                let mut rows = Vec::new();
+                let mut last: Option<AuditCursor> = None;
+                let mut next = None;
+                for entry in table.range((lo, hi)).map_err(|e| format!("range: {e}"))? {
+                    let (_k, v) = entry.map_err(|e| format!("row: {e}"))?;
+                    let row = v.value();
+                    // Primary-key scan is creation-ordered (UUIDv7) but the
+                    // window filter is applied in memory since no time index
+                    // exists for the resolution table.
+                    if row.created_at_unix_nanos < since || row.created_at_unix_nanos > until {
+                        continue;
+                    }
+                    if rows.len() >= limit {
+                        next = last;
+                        break;
+                    }
+                    last = Some(AuditCursor {
+                        ts: row.created_at_unix_nanos,
+                        audit_id: row.audit_id_bytes,
+                    });
+                    rows.push(row);
+                }
+                Ok(AuditPage::Resolution { rows, next })
+            }
+        }
     }
 
     /// Sample the shard's on-disk storage footprint for `/metrics`.
@@ -3636,6 +3896,20 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     warn!(
                         shard_id = shard.shard_id,
                         "AbortOrphanedTxns reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::AuditQuery {
+                selector,
+                limit,
+                cursor,
+                reply_tx,
+            } => {
+                let out = shard.run_audit_query(selector, limit, cursor);
+                if reply_tx.send_async(out).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "AuditQuery reply dropped (caller gone)"
                     );
                 }
             }

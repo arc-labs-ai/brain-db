@@ -610,3 +610,291 @@ async fn rebuild_index_missing_param_returns_400() {
     assert_eq!(code, 400, "missing ?index= must 400; body:\n{body}");
     server.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// /v1/audit — historical audit-log query + export
+// ---------------------------------------------------------------------------
+
+/// What the audit-seeding bringup planted, so tests can address it.
+struct AuditSeed {
+    /// Hex of the memory all extraction rows are attributed to.
+    memory_hex: String,
+    /// The extractor id all extraction rows are attributed to.
+    extractor_id: u32,
+    /// Number of extraction rows seeded.
+    extraction_count: usize,
+}
+
+/// Seed `count` extraction-audit rows (+ two resolution rows) into shard
+/// 0's `metadata.redb`, then bring up a 1-shard deployment over that data
+/// dir so the admin `/v1/audit` route reads them back. Audit ids are
+/// `[1;16]..[count;16]` so index order is deterministic for pagination.
+async fn start_admin_with_seeded_audit(count: usize) -> (Bringup, AuditSeed) {
+    use brain_metadata::tables::audit::{
+        output_kind, resolution_outcome, ExtractionAudit, OutputRef, ResolutionAudit,
+        ENTITY_RESOLUTION_AUDIT_TABLE, EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE,
+        EXTRACTOR_AUDIT_BY_MEMORY_TABLE, EXTRACTOR_AUDIT_BY_TIME_TABLE, EXTRACTOR_AUDIT_TABLE,
+    };
+
+    let data_dir = TempDir::new().expect("tmp");
+    let shard0 = data_dir.path().join("0");
+    std::fs::create_dir_all(&shard0).expect("mkdir shard0");
+    let memory = brain_core::MemoryId::from_be_bytes([0xAA; 16]);
+    let extractor_id = 7u32;
+    // Timestamps must be recent — the audit retention sweeper runs at
+    // shard spawn and deletes rows older than the retention window.
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+
+    {
+        let db = brain_metadata::MetadataDb::open(shard0.join("metadata.redb")).expect("open md");
+        let wtxn = db.write_txn().expect("wtxn");
+        {
+            let mut primary = wtxn.open_table(EXTRACTOR_AUDIT_TABLE).unwrap();
+            let mut by_mem = wtxn.open_table(EXTRACTOR_AUDIT_BY_MEMORY_TABLE).unwrap();
+            let mut by_ext = wtxn.open_table(EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE).unwrap();
+            let mut by_time = wtxn.open_table(EXTRACTOR_AUDIT_BY_TIME_TABLE).unwrap();
+            for i in 0..count {
+                let audit_id = brain_core::AuditId::from_bytes([(i as u8) + 1; 16]);
+                let started = now_nanos + i as u64;
+                let row = ExtractionAudit::success(
+                    audit_id,
+                    memory,
+                    extractor_id,
+                    1,
+                    3,
+                    started,
+                    started + 5,
+                    vec![OutputRef {
+                        kind: output_kind::ENTITY,
+                        id: [9u8; 16],
+                    }],
+                    [0x42u8; 32],
+                );
+                let aid = row.audit_id_bytes;
+                primary.insert(&aid, &row).unwrap();
+                by_mem.insert(&(row.memory_id_bytes, aid), &()).unwrap();
+                by_ext.insert(&(extractor_id, aid), &()).unwrap();
+                by_time.insert(&(started, aid), &()).unwrap();
+            }
+
+            let mut res = wtxn.open_table(ENTITY_RESOLUTION_AUDIT_TABLE).unwrap();
+            for i in 0u8..2 {
+                let audit_id = brain_core::AuditId::from_bytes([0xB0 + i; 16]);
+                let row = ResolutionAudit::new(
+                    audit_id,
+                    format!("cand{i}"),
+                    1,
+                    resolution_outcome::TIER_1_EXACT,
+                    0.9,
+                    now_nanos + 1_000 + i as u64,
+                );
+                res.insert(&row.audit_id_bytes, &row).unwrap();
+            }
+        }
+        wtxn.commit().unwrap();
+    }
+
+    // Bring up a single shard over the seeded data dir.
+    let cfg = ShardSpawnConfig::new(data_dir.path(), stub_dispatcher());
+    let (handle, joiner) = spawn_shard(0, cfg).expect("spawn shard");
+    let handles = vec![handle];
+    let shards: Arc<Vec<ShardHandle>> = Arc::new(handles.clone());
+
+    let request_metrics = Arc::new(metrics::request::RequestMetrics::new());
+    let auth_store = {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let p = tmp.path().join("api_keys.redb");
+        let store = Arc::new(crate::auth::AuthStore::open(&p).expect("open auth store"));
+        std::mem::forget(tmp);
+        store
+    };
+    let connections = Arc::new(ConnectionMetrics::default());
+    let (trigger, signal) = ShutdownSignal::channel();
+
+    let state = Arc::new(AdminState::new(
+        shards,
+        connections,
+        Arc::new(config::Config::for_tests()),
+        request_metrics,
+        auth_store,
+    ));
+    let admin = AdminServer::new("127.0.0.1:0".parse().unwrap(), state, signal);
+    let bound_admin = admin.bind().await.expect("bind admin");
+    let admin_addr = bound_admin.local_addr();
+    let admin_handle = tokio::spawn(async move { bound_admin.serve().await });
+
+    let bringup = Bringup {
+        admin_addr,
+        conn_addr: None,
+        trigger,
+        admin_handle,
+        listener_handle: None,
+        handles,
+        joiners: vec![Some(joiner)],
+        _data_dir: Some(data_dir),
+    };
+    (
+        bringup,
+        AuditSeed {
+            memory_hex: hex16(&[0xAA; 16]),
+            extractor_id,
+            extraction_count: count,
+        },
+    )
+}
+
+/// Lowercase hex of a 16-byte id (mirrors the handler's encoding).
+fn hex16(bytes: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(32);
+    for &b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Number of rows in the parsed audit JSON envelope.
+fn rows_len(body: &str) -> usize {
+    let v: serde_json::Value = serde_json::from_str(body).expect("valid json");
+    v["rows"].as_array().map(|a| a.len()).unwrap_or(0)
+}
+
+/// The `next_cursor` string (or `None` when null).
+fn next_cursor(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).expect("valid json");
+    v["next_cursor"].as_str().map(str::to_owned)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_query_by_memory_returns_rows() {
+    let (server, seed) = start_admin_with_seeded_audit(3).await;
+    let (code, body) = http_get_authed(
+        server.admin_addr,
+        &format!("/v1/audit?by=memory&memory={}", seed.memory_hex),
+    )
+    .await;
+    assert_eq!(code, 200, "body:\n{body}");
+    assert_eq!(rows_len(&body), seed.extraction_count, "body:\n{body}");
+    assert!(body.contains("\"kind\":\"extraction\""), "body:\n{body}");
+    assert!(next_cursor(&body).is_none(), "single page → null cursor");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_query_by_extractor_and_time_work() {
+    let (server, seed) = start_admin_with_seeded_audit(3).await;
+    let (code, body) = http_get_authed(
+        server.admin_addr,
+        &format!("/v1/audit?by=extractor&extractor={}", seed.extractor_id),
+    )
+    .await;
+    assert_eq!(code, 200, "body:\n{body}");
+    assert_eq!(rows_len(&body), 3, "by=extractor body:\n{body}");
+
+    let (code, body) = http_get_authed(server.admin_addr, "/v1/audit?by=time&since=0").await;
+    assert_eq!(code, 200, "body:\n{body}");
+    assert_eq!(rows_len(&body), 3, "by=time body:\n{body}");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_query_pagination_advances_and_terminates() {
+    let (server, seed) = start_admin_with_seeded_audit(5).await;
+
+    // Page 1: limit 2 → 2 rows + a cursor.
+    let (code, body) = http_get_authed(
+        server.admin_addr,
+        &format!("/v1/audit?by=memory&memory={}&limit=2", seed.memory_hex),
+    )
+    .await;
+    assert_eq!(code, 200, "body:\n{body}");
+    assert_eq!(rows_len(&body), 2, "page1 body:\n{body}");
+    let c1 = next_cursor(&body).expect("page1 cursor");
+
+    // Page 2: resume → 2 more rows + a cursor.
+    let (code, body) = http_get_authed(
+        server.admin_addr,
+        &format!(
+            "/v1/audit?by=memory&memory={}&limit=2&cursor={c1}",
+            seed.memory_hex
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "body:\n{body}");
+    assert_eq!(rows_len(&body), 2, "page2 body:\n{body}");
+    let c2 = next_cursor(&body).expect("page2 cursor");
+    assert_ne!(c1, c2, "cursor must advance");
+
+    // Page 3: final row, no cursor.
+    let (code, body) = http_get_authed(
+        server.admin_addr,
+        &format!(
+            "/v1/audit?by=memory&memory={}&limit=2&cursor={c2}",
+            seed.memory_hex
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "body:\n{body}");
+    assert_eq!(rows_len(&body), 1, "page3 body:\n{body}");
+    assert!(next_cursor(&body).is_none(), "final page → null cursor");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_query_unknown_by_returns_400() {
+    let (server, _seed) = start_admin_with_seeded_audit(1).await;
+    let (code, body) = http_get_authed(server.admin_addr, "/v1/audit?by=bogus").await;
+    assert_eq!(code, 400, "body:\n{body}");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_query_empty_result_is_200_not_500() {
+    let (server, _seed) = start_admin_with_seeded_audit(3).await;
+    // A memory with no audit rows → empty array, 200.
+    let empty = hex16(&[0x11; 16]);
+    let (code, body) = http_get_authed(
+        server.admin_addr,
+        &format!("/v1/audit?by=memory&memory={empty}"),
+    )
+    .await;
+    assert_eq!(code, 200, "empty result must 200; body:\n{body}");
+    assert_eq!(rows_len(&body), 0, "body:\n{body}");
+    assert!(next_cursor(&body).is_none());
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_query_by_resolution_returns_rows() {
+    let (server, _seed) = start_admin_with_seeded_audit(1).await;
+    let (code, body) = http_get_authed(server.admin_addr, "/v1/audit?by=resolution").await;
+    assert_eq!(code, 200, "body:\n{body}");
+    assert!(body.contains("\"kind\":\"resolution\""), "body:\n{body}");
+    assert_eq!(rows_len(&body), 2, "body:\n{body}");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_export_returns_all_rows_single_array() {
+    let (server, seed) = start_admin_with_seeded_audit(4).await;
+    let (code, body) = http_get_authed(
+        server.admin_addr,
+        &format!("/v1/audit/export?by=memory&memory={}", seed.memory_hex),
+    )
+    .await;
+    assert_eq!(code, 200, "body:\n{body}");
+    assert_eq!(rows_len(&body), 4, "export body:\n{body}");
+    assert!(next_cursor(&body).is_none(), "export not truncated → null");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_query_requires_admin_auth() {
+    let server = start_admin_with_shards(1).await;
+    // No Authorization header → the /v1 gate rejects.
+    let (code, _body) = http_get(server.admin_addr, "/v1/audit?by=time").await;
+    assert_eq!(code, 401, "unauthed /v1/audit must be rejected");
+    server.stop().await;
+}
