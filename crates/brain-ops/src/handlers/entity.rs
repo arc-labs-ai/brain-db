@@ -17,7 +17,7 @@
 use brain_core::{Entity, EntityAttributes, EntityId, EntityTypeId, RequestId};
 use brain_metadata::entity::merge::MergeActor;
 use brain_metadata::entity::ops::{
-    entity_get, entity_get_resolved, entity_list_by_type, entity_lookup_by_alias,
+    entity_get, entity_get_resolved_with_chain, entity_list_by_type, entity_lookup_by_alias,
     entity_lookup_by_canonical_name,
 };
 use brain_metadata::entity::trigram::{
@@ -158,17 +158,18 @@ pub async fn handle_entity_get(
     ctx: &OpsContext,
 ) -> Result<EntityGetResponse, OpError> {
     let id = EntityId::from(req.entity_id);
-    let entity = {
+    let resolved = {
         let rtxn = ctx
             .executor
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
         // Follow the `merged_into` redirect: a GET on a merged entity's id
-        // returns the surviving entity (multi-hop chains collapsed).
-        entity_get_resolved(&rtxn, id).map_err(OpError::from)?
+        // returns the surviving entity (multi-hop chains collapsed), plus the
+        // audit trail of redirect hops walked to reach it.
+        entity_get_resolved_with_chain(&rtxn, id).map_err(OpError::from)?
     };
-    let entity = entity.ok_or_else(|| OpError::NotFound {
+    let (entity, chain) = resolved.ok_or_else(|| OpError::NotFound {
         what: "entity",
         detail: format!("{id:?}"),
     })?;
@@ -185,6 +186,7 @@ pub async fn handle_entity_get(
     }
     Ok(EntityGetResponse {
         entity: entity_to_view(&entity),
+        resolved_from: chain.into_iter().map(|e| e.to_bytes()).collect(),
     })
 }
 

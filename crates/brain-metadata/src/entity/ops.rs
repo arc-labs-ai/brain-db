@@ -166,15 +166,48 @@ pub fn entity_get_resolved(
     rtxn: &ReadTransaction,
     id: EntityId,
 ) -> Result<Option<Entity>, EntityOpError> {
+    // One walk; the chain is discarded here. Callers that need the audit
+    // trail of redirect hops use [`entity_get_resolved_with_chain`].
+    Ok(entity_get_resolved_with_chain(rtxn, id)?.map(|(entity, _chain)| entity))
+}
+
+/// Fetch an entity by id, following the `merged_into` redirect to the
+/// surviving entity, and additionally return the **chain of redirect hops**
+/// traversed to get there — the audit trail the §Multi-hop merge spec
+/// requires (`entity_get(A)` on `A → B → C` returns `C`'s row "with an audit
+/// trail showing both merges").
+///
+/// The returned `Vec<EntityId>` lists the redirect ids walked through, in
+/// order, **excluding** the final survivor:
+///
+/// - live id (no merge): `[]` — the row is returned directly.
+/// - `A → B` (get A): `[A]`.
+/// - `A → B → C` (get A): `[A, B]`.
+///
+/// So the vec is exactly the set of ids that were redirected away; the
+/// survivor's own id is the returned [`Entity`]'s `id`, not in the chain.
+///
+/// Returns `Ok(None)` if the starting id has no row. Returns
+/// [`EntityOpError::MergeRedirectCycle`] if the chain exceeds
+/// [`MERGE_REDIRECT_MAX_HOPS`] (a corrupted cycle) — fail-stop rather than
+/// loop forever or silently return a mid-chain node.
+pub fn entity_get_resolved_with_chain(
+    rtxn: &ReadTransaction,
+    id: EntityId,
+) -> Result<Option<(Entity, Vec<EntityId>)>, EntityOpError> {
     let t = rtxn.open_table(ENTITIES_TABLE)?;
     let mut current = id;
+    let mut chain: Vec<EntityId> = Vec::new();
     for _ in 0..=MERGE_REDIRECT_MAX_HOPS {
         let Some(row) = t.get(&current.to_bytes())?.map(|g| g.value()) else {
             return Ok(None);
         };
         match row.merged_into() {
-            None => return Ok(Some(Entity::from(&row))),
-            Some(next) => current = next,
+            None => return Ok(Some((Entity::from(&row), chain))),
+            Some(next) => {
+                chain.push(current);
+                current = next;
+            }
         }
     }
     Err(EntityOpError::MergeRedirectCycle(id))
@@ -1240,6 +1273,84 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let got = entity_get(&rtxn, id).unwrap().expect("present");
         assert_eq!(got, e);
+    }
+
+    // ----- entity_get_resolved_with_chain (merge audit trail) ------------
+
+    #[test]
+    fn get_resolved_with_chain_returns_redirect_hops() {
+        // A → B → C. get_resolved_with_chain(A) returns C plus the redirect
+        // trail [A, B] (the survivor C's id is NOT in the chain).
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let mut a = person_entity("ChainA");
+        let mut b = person_entity("ChainB");
+        let c = person_entity("ChainC");
+        a.merged_into = Some(b.id);
+        b.merged_into = Some(c.id);
+        let (aid, bid, cid) = (a.id, b.id, c.id);
+
+        let wtxn = db.write_txn().unwrap();
+        for e in [&a, &b, &c] {
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, e).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let (survivor, chain) = entity_get_resolved_with_chain(&rtxn, aid)
+            .unwrap()
+            .expect("present");
+        assert_eq!(survivor.id, cid);
+        assert_eq!(chain, vec![aid, bid]);
+
+        // get on the mid-chain id B yields [B].
+        let (survivor_b, chain_b) = entity_get_resolved_with_chain(&rtxn, bid)
+            .unwrap()
+            .expect("present");
+        assert_eq!(survivor_b.id, cid);
+        assert_eq!(chain_b, vec![bid]);
+    }
+
+    #[test]
+    fn get_resolved_with_chain_empty_for_live_entity() {
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let e = person_entity("LiveOne");
+        let id = e.id;
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let (survivor, chain) = entity_get_resolved_with_chain(&rtxn, id)
+            .unwrap()
+            .expect("present");
+        assert_eq!(survivor.id, id);
+        assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn get_resolved_with_chain_detects_cycle() {
+        // A malformed cycle A → B → A must fail-stop rather than loop.
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let mut a = person_entity("CycleA");
+        let mut b = person_entity("CycleB");
+        a.merged_into = Some(b.id);
+        b.merged_into = Some(a.id);
+        let aid = a.id;
+
+        let wtxn = db.write_txn().unwrap();
+        for e in [&a, &b] {
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, e).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        match entity_get_resolved_with_chain(&rtxn, aid) {
+            Err(EntityOpError::MergeRedirectCycle(id)) => assert_eq!(id, aid),
+            other => panic!("expected MergeRedirectCycle, got {other:?}"),
+        }
     }
 
     #[test]

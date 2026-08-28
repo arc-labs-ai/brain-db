@@ -237,7 +237,7 @@
     "name": "resp_entity_get",
     "opcode": "0x01B1",
     "kind": "response",
-    "payload_len": 282
+    "payload_len": 331
   },
   {
     "name": "resp_entity_list",

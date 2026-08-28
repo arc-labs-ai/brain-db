@@ -570,6 +570,7 @@ fn sample_entity_view() -> EntityView {
 fn sample_entity_get() -> EntityGetResponse {
     EntityGetResponse {
         entity: sample_entity_view(),
+        resolved_from: vec![[7u8; 16], [8u8; 16]],
     }
 }
 

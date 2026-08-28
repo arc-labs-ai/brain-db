@@ -212,6 +212,35 @@ mod tests {
             }));
         }
     }
+
+    #[test]
+    fn entity_get_response_roundtrips_with_resolved_from() {
+        use crate::ops::entity::{EntityGetResponse, EntityView};
+        let view = EntityView {
+            entity_id: sample_uuid(1),
+            entity_type_id: 1,
+            canonical_name: "Alice".to_owned(),
+            normalized_name: "alice".to_owned(),
+            aliases: vec!["Alyss".to_owned()],
+            attributes_blob: Vec::new(),
+            mention_count: 3,
+            created_at_unix_nanos: 1,
+            updated_at_unix_nanos: 2,
+            merged_into: [0; 16],
+            embedding_version: 1,
+            flags: 0,
+        };
+        // Non-empty audit trail: A → B → survivor.
+        resp_round_trip(ResponseBody::EntityGet(EntityGetResponse {
+            entity: view.clone(),
+            resolved_from: vec![sample_uuid(40), sample_uuid(41)],
+        }));
+        // Empty audit trail: direct hit on a live entity.
+        resp_round_trip(ResponseBody::EntityGet(EntityGetResponse {
+            entity: view,
+            resolved_from: Vec::new(),
+        }));
+    }
 }
 
 // ============================================================
@@ -253,6 +282,13 @@ pub struct EntityCreateResponse {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityGetResponse {
     pub entity: EntityView,
+    /// Merge audit trail: the chain of redirect ids the GET walked through
+    /// to reach `entity` (the surviving row), in order, EXCLUDING the
+    /// survivor itself. Empty on a direct hit (the requested id was live).
+    ///
+    /// For `A → B → C`, `ENTITY_GET(A)` returns `entity = C` and
+    /// `resolved_from = [A, B]` — the two merges that were followed.
+    pub resolved_from: Vec<WireUuid>,
 }
 
 /// Reply to `ENTITY_UPDATE`. Carries the post-update view for the

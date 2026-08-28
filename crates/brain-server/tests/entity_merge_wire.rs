@@ -242,6 +242,13 @@ async fn merge_and_unmerge_round_trip() {
                 "redirected survivor carries the folded alias: {:?}",
                 r.entity.aliases
             );
+            // Merge audit trail (spec §Multi-hop merge): the GET on the merged
+            // id reports the redirect chain it walked — here just [Alyss].
+            assert_eq!(
+                r.resolved_from,
+                vec![alyss],
+                "resolved_from carries the merged id the GET redirected from"
+            );
         }
         other => panic!("expected EntityGet, got {other:?}"),
     }
@@ -267,6 +274,12 @@ async fn merge_and_unmerge_round_trip() {
                 r.entity.aliases.contains(&"AL".into()),
                 "Alice gained AL alias: {:?}",
                 r.entity.aliases
+            );
+            // Alice is live — a direct hit, no redirect walked.
+            assert!(
+                r.resolved_from.is_empty(),
+                "direct GET on the survivor has an empty audit trail: {:?}",
+                r.resolved_from
             );
         }
         other => panic!("expected EntityGet, got {other:?}"),
@@ -302,6 +315,11 @@ async fn merge_and_unmerge_round_trip() {
         ResponseBody::EntityGet(r) => {
             assert_eq!(r.entity.merged_into, [0u8; 16], "merged_into cleared");
             assert_eq!(r.entity.flags & 2, 0, "MERGED flag cleared");
+            assert!(
+                r.resolved_from.is_empty(),
+                "unmerged entity is live again — empty audit trail: {:?}",
+                r.resolved_from
+            );
         }
         other => panic!("expected EntityGet, got {other:?}"),
     }
