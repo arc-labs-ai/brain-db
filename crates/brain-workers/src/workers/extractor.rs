@@ -4002,6 +4002,37 @@ fn emit_resolution_audit(
     }
 }
 
+/// Append one resolution audit row for a cross-type exact-reuse resolution:
+/// a coined subject / relation endpoint that bound to an existing entity of a
+/// different type because exactly one entity carries this exact canonical name
+/// (see [`reuse_cross_type_exact`]). That reuse IS a mention→entity derivation
+/// even though it never passed through the tiered resolver, so "all derivations
+/// logged" requires a row. It is a deterministic exact-name match, so the
+/// outcome is `TIER_1_EXACT` at confidence 1.0. The `entity_type_id` is read
+/// back from the reused entity (its real type, not the coined generic), exactly
+/// as the sibling `emit_resolution_audit` call sites do. Best-effort: a failure
+/// is swallowed, never failing the extraction.
+fn emit_cross_type_reuse_audit(
+    wtxn: &redb::WriteTransaction,
+    candidate_name: &str,
+    reused: EntityId,
+    now: u64,
+) {
+    let resolved_type_id = entity_get_inside_wtxn(wtxn, reused)
+        .ok()
+        .flatten()
+        .map_or(0, |e| e.entity_type.raw());
+    emit_resolution_audit(
+        wtxn,
+        candidate_name,
+        resolved_type_id,
+        reused,
+        ResolutionTier::Exact,
+        1.0,
+        now,
+    );
+}
+
 /// Link `memory_id --Mentions--> entity_id`, annotated with the surface form
 /// that produced the entity. Keyed by `(memory, Mentions, entity)`, so a
 /// repeat call for the same pair upserts rather than duplicating.
@@ -5100,6 +5131,13 @@ fn resolve_statement_subject(
         // Concept doesn't permanently split from a correctly-typed entity
         // ("aspirin" the Drug). 0 or >1 matches fall through to the normal
         // type-scoped mint.
+        //
+        // This reuse is a genuine mention→entity derivation (the surface bound
+        // to an existing entity across a type boundary), so log it: an exact
+        // canonical-name match, hence TIER_1_EXACT at full (1.0) confidence.
+        // It runs only on an entity_map miss and then caches `id`, so a repeat
+        // surface this memory hits the cache branch above and never double-logs.
+        emit_cross_type_reuse_audit(wtxn, text, id, now);
         entity_map.insert(text.to_string(), id);
         id
     } else {
@@ -5117,11 +5155,10 @@ fn resolve_statement_subject(
         .map_err(ApplyError::from)?;
         // Coined-subject resolution is a mention→entity derivation not covered
         // by the pass-1 entity-mention loop (this surface was never filed as an
-        // EntityMention), so log it here. The other branches above are an
-        // entity_map cache hit (already audited when first resolved), a
-        // self-entity routing (deterministic, not a tier decision), or a
-        // cross-type exact reuse (deterministic exact-name match) — none is a
-        // fresh tiered resolution.
+        // EntityMention), so log it here. The other unlogged branches above are
+        // an entity_map cache hit (already audited when first resolved) and a
+        // self-entity routing (deterministic, not a tier decision); the
+        // cross-type exact-reuse branch logs its own TIER_1_EXACT row inline.
         let resolved_type_id = entity_get_inside_wtxn(wtxn, res.entity_id)
             .ok()
             .flatten()
@@ -5236,6 +5273,12 @@ fn resolve_relation_endpoint(
     } else if !statement_subject_mintable(text) {
         return Ok(None);
     } else if let Some(id) = reuse_cross_type_exact(wtxn, scope, text)? {
+        // Cross-type exact reuse of an existing entity for this endpoint is a
+        // deterministic exact canonical-name match across a type boundary — a
+        // real mention→entity derivation, logged as TIER_1_EXACT at full (1.0)
+        // confidence (same rationale as `resolve_statement_subject`). Cached
+        // straight after, so a repeat surface hits the cache branch, not here.
+        emit_cross_type_reuse_audit(wtxn, text, id, now);
         entity_map.insert(text.to_string(), id);
         id
     } else {
